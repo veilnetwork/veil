@@ -1166,8 +1166,7 @@ impl FrameDispatcher {
         // Gateway that has internet access. This handles the case where the
         // destination is a global-veil node that is not in the local route
         // cache but reachable through any connected gateway.
-        if self.try_forward_via_gateway(&payload, peer_id, fwd_dst, relay_hops_out, traffic_class)
-        {
+        if self.try_forward_via_gateway(&payload, peer_id, fwd_dst, relay_hops_out, traffic_class) {
             return DispatchResult::NoResponse;
         }
 
@@ -2268,8 +2267,7 @@ mod tests {
         assert!(matches!(r, DispatchResult::NoResponse), "got {r:?}");
         let (priority, bytes) = frame_rx.try_recv().expect("relayed frame expected");
         assert_eq!(priority, veil_proto::header::priority::REALTIME);
-        let relayed =
-            ForwardPayload::decode(&bytes[veil_proto::header::HEADER_SIZE..]).unwrap();
+        let relayed = ForwardPayload::decode(&bytes[veil_proto::header::HEADER_SIZE..]).unwrap();
         assert_eq!(
             relayed.traffic_class,
             Some(veil_proto::header::priority::REALTIME),
@@ -2285,8 +2283,7 @@ mod tests {
         ));
         let (priority, bytes) = frame_rx.try_recv().expect("relayed frame expected");
         assert_eq!(priority, veil_proto::header::priority::INTERACTIVE);
-        let relayed =
-            ForwardPayload::decode(&bytes[veil_proto::header::HEADER_SIZE..]).unwrap();
+        let relayed = ForwardPayload::decode(&bytes[veil_proto::header::HEADER_SIZE..]).unwrap();
         assert_eq!(relayed.traffic_class, None);
     }
 

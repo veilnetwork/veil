@@ -217,6 +217,9 @@ pub struct NatProbeRequestPayload {
     pub target_node_id: [u8; 32],
     /// Random token echoed by the responder to correlate reply with request.
     pub session_token: u32,
+    /// Optional 128-bit token authenticating UDP punch packets. Encoded as a
+    /// trailing extension so pre-Stage-B decoders safely ignore it.
+    pub punch_token: Option<[u8; 16]>,
     /// Each candidate: (atyp=4|6, addr_bytes, port)
     pub candidates: Vec<NatCandidate>,
 }
@@ -327,6 +330,10 @@ impl NatProbeRequestPayload {
         for c in &self.candidates {
             c.encode_into(&mut buf);
         }
+        if let Some(token) = self.punch_token {
+            buf.push(0xB1);
+            buf.extend_from_slice(&token);
+        }
         buf
     }
 
@@ -360,10 +367,12 @@ impl NatProbeRequestPayload {
             offset += n;
             candidates.push(c);
         }
+        let punch_token = decode_punch_token_extension(&buf[offset..])?;
         Ok(Self {
             initiator_node_id,
             target_node_id,
             session_token,
+            punch_token,
             candidates,
         })
     }
@@ -397,6 +406,8 @@ pub struct NatProbeReplyPayload {
     pub final_target_node_id: [u8; 32],
     /// Echo of the request's `session_token`.
     pub session_token: u32,
+    /// Echo of the request's optional UDP punch token.
+    pub punch_token: Option<[u8; 16]>,
     /// Responder's ICE candidates.
     pub candidates: Vec<NatCandidate>,
 }
@@ -413,6 +424,10 @@ impl NatProbeReplyPayload {
         buf.extend_from_slice(&(self.candidates.len() as u16).to_be_bytes());
         for c in &self.candidates {
             c.encode_into(&mut buf);
+        }
+        if let Some(token) = self.punch_token {
+            buf.push(0xB1);
+            buf.extend_from_slice(&token);
         }
         buf
     }
@@ -447,13 +462,27 @@ impl NatProbeReplyPayload {
             offset += n;
             candidates.push(c);
         }
+        let punch_token = decode_punch_token_extension(&buf[offset..])?;
         Ok(Self {
             responder_node_id,
             final_target_node_id,
             session_token,
+            punch_token,
             candidates,
         })
     }
+}
+
+fn decode_punch_token_extension(buf: &[u8]) -> Result<Option<[u8; 16]>, ProtoError> {
+    if buf.is_empty() {
+        return Ok(None);
+    }
+    if buf.len() != 17 || buf[0] != 0xB1 {
+        return Err(ProtoError::TrailingBytes {
+            trailing: buf.len(),
+        });
+    }
+    Ok(Some(super::read_array::<16>(buf, 1)?))
 }
 
 // ── NatRelayRequestPayload ────────────────────────────────────────────────────
@@ -587,6 +616,7 @@ mod tests {
             initiator_node_id: [0x11u8; 32],
             target_node_id: [0u8; 32], // STUN-echo legacy mode
             session_token: 0xDEAD_BEEF,
+            punch_token: None,
             candidates: vec![
                 NatCandidate {
                     atyp: 4,
@@ -615,6 +645,7 @@ mod tests {
             initiator_node_id: [0xA1u8; 32],
             target_node_id: [0xB2u8; 32], // Bob, behind NAT, reachable via coordinator
             session_token: 0x4242_4242,
+            punch_token: Some([0x5Au8; 16]),
             candidates: vec![NatCandidate {
                 atyp: 4,
                 candidate_type: candidate_type::HOST,
@@ -637,6 +668,7 @@ mod tests {
             responder_node_id: [0x22u8; 32],
             final_target_node_id: [0u8; 32], // direct response to sender (legacy)
             session_token: 0xCAFE_BABE,
+            punch_token: None,
             candidates: vec![NatCandidate {
                 atyp: 4,
                 candidate_type: candidate_type::RELAY,
@@ -657,6 +689,7 @@ mod tests {
             responder_node_id: [0xB2u8; 32],    // Bob (responder)
             final_target_node_id: [0xA1u8; 32], // Alice (original initiator)
             session_token: 0x4242_4242,
+            punch_token: Some([0x5Au8; 16]),
             candidates: vec![NatCandidate {
                 atyp: 4,
                 candidate_type: candidate_type::SRFLX,
@@ -690,6 +723,7 @@ mod tests {
             initiator_node_id: [0u8; 32],
             target_node_id: [0u8; 32],
             session_token: 0,
+            punch_token: None,
             candidates: vec![],
         };
         let decoded = NatProbeRequestPayload::decode(&p.encode()).unwrap();
@@ -702,6 +736,7 @@ mod tests {
             initiator_node_id: [0x33u8; 32],
             target_node_id: [0u8; 32],
             session_token: 0xABCD_1234,
+            punch_token: None,
             candidates: vec![NatCandidate {
                 atyp: 6,
                 candidate_type: candidate_type::HOST,

@@ -137,6 +137,11 @@ impl NodeRuntime {
         let dispatcher_for_gossip = Arc::clone(&self.dispatcher);
         let dht_for_tick = Arc::clone(&self.dht);
         let session_tx_registry_for_tick = Arc::clone(&self.session_tx_registry);
+        // Only peers that explicitly advertised ANONYMITY_RELAY during the
+        // authenticated handshake may be probed for relay-directory entries.
+        // Without this filter every ordinary app peer / routing-table contact
+        // becomes a permanent DHT miss on every maintenance tick.
+        let peer_cap_flags_for_relay_warm = Arc::clone(&self.dispatcher.crypto.peer_cap_flags);
         // Whole-services handle so the tick can rebuild hosted onion-service
         // circuits before their TTL lapses (no-op unless this node registered an
         // onion service via `register_onion_circuit`).
@@ -369,6 +374,12 @@ impl NodeRuntime {
                             // session registry / routing table).
                             let me_id = dht_for_publish.local_node_id();
                             relays.retain(|n| *n != me_id);
+                            relays.retain(|n| {
+                                super::service_tasks::peer_advertised_anonymity_relay(
+                                    &peer_cap_flags_for_relay_warm,
+                                    n,
+                                )
+                            });
                             let now_unix = veil_util::unix_secs_now_u64();
                             let outbox: Arc<dyn veil_dht::FrameRouter> =
                                 Arc::clone(&session_outbox_for_remint)

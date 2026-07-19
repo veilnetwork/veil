@@ -41,6 +41,14 @@ class TaskQueueBase;
 
 namespace veil_media {
 
+struct VideoCadenceSnapshot {
+  uint64_t frames = 0;
+  int64_t first_ns = 0;
+  int64_t last_ns = 0;
+  int64_t max_gap_ns = 0;
+  uint64_t holds_75ms = 0;
+};
+
 // Bridges one webrtc::Call to one veil media datagram channel. Construct after
 // the Call exists (needs Call* for OnSentPacket + Receiver()); register the
 // inbound callback via Start().
@@ -95,8 +103,23 @@ class VeilTransportShim : public webrtc::Transport {
   uint64_t inbound_dropped_count() const {
     return inbound_dropped_overload_.load(std::memory_order_relaxed);
   }
+  VideoCadenceSnapshot outbound_video_cadence() const;
+  VideoCadenceSnapshot inbound_video_cadence() const;
+  VideoCadenceSnapshot delivered_video_cadence() const;
 
  private:
+  struct AtomicVideoCadence {
+    std::atomic<uint64_t> frames{0};
+    std::atomic<int64_t> first_ns{0};
+    std::atomic<int64_t> last_ns{0};
+    std::atomic<int64_t> max_gap_ns{0};
+    std::atomic<uint64_t> holds_75ms{0};
+  };
+
+  static void MarkVideoFrame(std::span<const uint8_t> packet,
+                             AtomicVideoCadence* cadence);
+  static VideoCadenceSnapshot Snapshot(const AtomicVideoCadence& cadence);
+
   // C trampoline for veil_media_set_recv_callback(cb(ctx,ptr,len)).
   static void OnVeilDatagram(void* ctx, const uint8_t* ptr, size_t len);
   // Runs on `network_queue_`: demux RTP vs RTCP and deliver into the Call.
@@ -115,6 +138,9 @@ class VeilTransportShim : public webrtc::Transport {
   std::atomic<uint64_t> outbound_packet_count_{0};
   std::atomic<uint64_t> outbound_byte_count_{0};
   std::atomic<uint64_t> outbound_dropped_count_{0};
+  AtomicVideoCadence outbound_video_cadence_;
+  AtomicVideoCadence inbound_video_cadence_;
+  AtomicVideoCadence delivered_video_cadence_;
 };
 
 }  // namespace veil_media

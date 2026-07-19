@@ -96,6 +96,29 @@ pub fn jittered(base: Duration) -> Duration {
 
 // ── spawn_outbound_peers ──────────────────────────────────────────────────────
 
+type ConnectorRefreshSlots = Arc<Mutex<std::collections::HashMap<[u8; 32], watch::Sender<u64>>>>;
+
+/// Claim the sole reconnect loop for `node_id`, or notify its current owner
+/// that the corresponding NodeState entry was refreshed.
+///
+/// A watch generation is used instead of `Notify`: refreshes that arrive while
+/// the task is running a healthy session can be marked observed before a later
+/// reconnect, so they do not leave a stale one-shot permit that cancels that
+/// reconnect.
+fn claim_or_refresh_connector(
+    slots: &ConnectorRefreshSlots,
+    node_id: [u8; 32],
+) -> Option<watch::Receiver<u64>> {
+    let mut slots = lock!(slots);
+    if let Some(tx) = slots.get(&node_id) {
+        tx.send_modify(|generation| *generation = generation.wrapping_add(1));
+        return None;
+    }
+    let (tx, rx) = watch::channel(0_u64);
+    slots.insert(node_id, tx);
+    Some(rx)
+}
+
 /// Spawn one reconnect loop per configured peer.
 ///
 /// Returns handles for all spawned tasks so the caller can abort them on
@@ -107,20 +130,28 @@ pub fn spawn_outbound_peers(
 ) -> Vec<JoinHandle<()>> {
     let mut handles = Vec::with_capacity(peers.len());
     for peer in peers {
-        // per-node-id slot claim. Each connector task owns
-        // its `node_id` until it exits — duplicates from different
+        // Per-node-id slot claim. Each connector task owns its `node_id`
+        // until it exits. A duplicate with the same node_id does not spawn a
+        // second reconnect loop; it wakes the existing one instead. This is
+        // important for app-added endpoint refreshes: BootstrapJoinForwarder
+        // has already replaced the transport in NodeState, so an in-flight
+        // connect to the stale address must be cancelled and retried from the
+        // freshly read entry immediately.
+        //
+        // Duplicates from different
         // `PeerSource` (configured / bootstrap / PEX / gateway-failover /
-        // pinned-relay) silently no-op so we keep exactly one reconnect
+        // pinned-relay) still keep exactly one reconnect
         // loop per peer. Surfaced by 50-node hub-kill stress test:
         // gateway-failover poll spawned a fresh task every 10 s when its
         // peer was offline, accumulating ≥ 20 parallel tasks within 4 min
         // (~290 connect-attempts/sec aggregate across 49 surviving nodes
         // vs ~1.5/sec under correct per-peer exponential backoff).
         let peer_node_id = *peer.node_id.as_bytes();
-        let claimed = lock!(access.outbound_connector_node_ids).insert(peer_node_id);
-        if !claimed {
+        let Some(mut refresh_rx) =
+            claim_or_refresh_connector(&access.outbound_connector_refresh, peer_node_id)
+        else {
             continue;
-        }
+        };
         let access = access.clone();
         let mut shutdown_rx = shutdown_tx.subscribe();
         let handle = tokio::spawn(async move {
@@ -128,16 +159,16 @@ pub fn spawn_outbound_peers(
             // ban, panic). Inlined so the slot lifecycle is visible
             // alongside the task body without crossing a module boundary.
             struct SlotGuard {
-                set: Arc<Mutex<std::collections::HashSet<[u8; 32]>>>,
+                slots: Arc<Mutex<std::collections::HashMap<[u8; 32], watch::Sender<u64>>>>,
                 node_id: [u8; 32],
             }
             impl Drop for SlotGuard {
                 fn drop(&mut self) {
-                    lock!(self.set).remove(&self.node_id);
+                    lock!(self.slots).remove(&self.node_id);
                 }
             }
             let _slot_guard = SlotGuard {
-                set: Arc::clone(&access.outbound_connector_node_ids),
+                slots: Arc::clone(&access.outbound_connector_refresh),
                 node_id: peer_node_id,
             };
             let backoff_min = access.defaults.reconnect_backoff_min;
@@ -176,6 +207,11 @@ pub fn spawn_outbound_peers(
             let we_keep_outbound = access.local_node_id.as_slice() < peer_node_id.as_slice();
 
             loop {
+                // Mark refreshes that arrived while a healthy SessionRunner
+                // owned the task as observed. `watch` retains a generation,
+                // not a one-shot permit, so a stale wake cannot cancel the
+                // first reconnect after that session eventually closes.
+                refresh_rx.borrow_and_update();
                 // Check if this peer was banned.  Audit batch 2026-05-25
                 // phase J: previously `break` exited the entire
                 // outbound_connector task, dropping the slot_guard and
@@ -197,6 +233,9 @@ pub fn spawn_outbound_peers(
                         _ = shutdown_rx.changed() => break,
                         _ = tokio::time::sleep(std::time::Duration::from_secs(30)) => {}
                         _ = access.force_reconnect_notify.notified() => {}
+                        changed = refresh_rx.changed() => {
+                            if changed.is_err() { break; }
+                        }
                     }
                     continue;
                 }
@@ -223,6 +262,9 @@ pub fn spawn_outbound_peers(
                         _ = shutdown_rx.changed() => break,
                         _ = tokio::time::sleep(std::time::Duration::from_secs(30)) => {}
                         _ = access.force_reconnect_notify.notified() => {}
+                        changed = refresh_rx.changed() => {
+                            if changed.is_err() { break; }
+                        }
                     }
                     continue;
                 }
@@ -242,11 +284,24 @@ pub fn spawn_outbound_peers(
                         _ = shutdown_rx.changed() => break,
                         _ = tokio::time::sleep(std::time::Duration::from_secs(30)) => {}
                         _ = access.force_reconnect_notify.notified() => {}
+                        changed = refresh_rx.changed() => {
+                            if changed.is_err() { break; }
+                        }
                     }
                     continue;
                 }
                 tokio::select! {
                     _ = shutdown_rx.changed() => break,
+                    changed = refresh_rx.changed() => {
+                        if changed.is_err() { break; }
+                        // The entry in NodeState now carries a newer endpoint.
+                        // Drop the stale connect future and retry immediately;
+                        // connect_peer_active re-reads the entry on every call.
+                        backoff = backoff_min;
+                        consecutive_failures = 0;
+                        first_failure_at = None;
+                        continue;
+                    }
                     result = access.connect_peer_active(peer.peer_id) => {
                         match result {
                             Ok(session) => {
@@ -360,6 +415,7 @@ pub fn spawn_outbound_peers(
                                 let violation_tracker = Arc::clone(&dispatcher.abuse.violation_tracker);
                                 let mut runner = veil_session::runner::SessionRunner {
                                     stream:                         session.stream,
+                                    quic_datagrams:                 session.quic_datagrams,
                                     peer_id:                        *peer_id.as_bytes(),
                                     dispatcher,
                                     logger:                         Arc::clone(&access.logger),
@@ -504,7 +560,12 @@ pub fn spawn_outbound_peers(
                                         veil_util::redact_addr_for_log(&peer.transport),
                                     ),
                                 );
-                                access.dispatcher.on_session_opened(*peer_id.as_bytes(), session.observed_addr);
+                                access.dispatcher.on_session_opened(
+                                    *peer_id.as_bytes(),
+                                    session.observed_addr,
+                                    session.udp_reflector_port,
+                                    &session.shared_udp_reflectors,
+                                );
                                 //gossip our self-signed
                                 // transport announcement to the new peer (mirror of
                                 // the inbound path) so resolves of `local_node_id`
@@ -700,6 +761,9 @@ pub fn spawn_outbound_peers(
                                     _ = shutdown_rx.changed() => break,
                                     _ = tokio::time::sleep(sleep_dur) => {}
                                     _ = access.force_reconnect_notify.notified() => {}
+                                    changed = refresh_rx.changed() => {
+                                        if changed.is_err() { break; }
+                                    }
                                 }
                                 if is_duplicate {
                                     // Peer is already reachable via the inbound
@@ -733,6 +797,27 @@ mod tests {
         header::HEADER_SIZE,
         session::{AttachPayload, KeepalivePayload},
     };
+
+    #[tokio::test]
+    async fn duplicate_connector_claim_wakes_current_owner() {
+        let slots: ConnectorRefreshSlots = Arc::new(Mutex::new(std::collections::HashMap::new()));
+        let node_id = [0xA5; 32];
+        let mut owner =
+            claim_or_refresh_connector(&slots, node_id).expect("first connector owns the slot");
+        assert_eq!(*owner.borrow(), 0);
+
+        assert!(
+            claim_or_refresh_connector(&slots, node_id).is_none(),
+            "duplicate must refresh rather than spawn a second loop",
+        );
+        owner.changed().await.expect("owner sender remains alive");
+        assert_eq!(*owner.borrow_and_update(), 1);
+
+        assert!(claim_or_refresh_connector(&slots, node_id).is_none());
+        owner.changed().await.expect("second refresh is observable");
+        assert_eq!(*owner.borrow_and_update(), 2);
+        assert_eq!(lock!(slots).len(), 1);
+    }
 
     #[test]
     fn backoff_grows_to_max_and_stops() {

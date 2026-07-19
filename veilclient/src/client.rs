@@ -498,8 +498,10 @@ pub(crate) struct DispatchTable {
         std::collections::VecDeque<(u32, tokio::sync::oneshot::Sender<JoinBootstrapResult>)>,
     /// pending oneshot replies for `CreateBootstrapInvite` (Epic 489.7
     /// generator side).
-    pub pending_create_invite:
-        std::collections::VecDeque<(u32, tokio::sync::oneshot::Sender<CreateBootstrapInviteReply>)>,
+    pub pending_create_invite: std::collections::VecDeque<(
+        u32,
+        tokio::sync::oneshot::Sender<CreateBootstrapInviteReply>,
+    )>,
     /// Offline-mailbox seal replies (`MailboxSealOk`).
     pub pending_mailbox_seal: std::collections::VecDeque<(
         u32,
@@ -562,20 +564,19 @@ pub(crate) struct DispatchTable {
     pub pending_mailbox_fetch:
         std::collections::VecDeque<(u32, tokio::sync::oneshot::Sender<Vec<MailboxBlobInfo>>)>,
     ///.4 P2: pending oneshot replies for `MailboxAck`.
-    pub pending_mailbox_ack:
-        std::collections::VecDeque<(u32, tokio::sync::oneshot::Sender<bool>)>,
+    pub pending_mailbox_ack: std::collections::VecDeque<(u32, tokio::sync::oneshot::Sender<bool>)>,
     ///.4 P4: pending oneshot replies for `OutboxPut`.
-    pub pending_outbox_put:
-        std::collections::VecDeque<(u32, tokio::sync::oneshot::Sender<bool>)>,
+    pub pending_outbox_put: std::collections::VecDeque<(u32, tokio::sync::oneshot::Sender<bool>)>,
     ///.4 P4: pending oneshot replies for `OutboxFindMissing`.
     pub pending_outbox_find_missing:
         std::collections::VecDeque<(u32, tokio::sync::oneshot::Sender<Vec<OutboxEntryInfo>>)>,
     ///.4 P4: pending oneshot replies for `OutboxAck`.
-    pub pending_outbox_ack:
-        std::collections::VecDeque<(u32, tokio::sync::oneshot::Sender<bool>)>,
+    pub pending_outbox_ack: std::collections::VecDeque<(u32, tokio::sync::oneshot::Sender<bool>)>,
     ///.4 P5c: pending oneshot replies for `LookupRendezvousReplicas`.
-    pub pending_lookup_replicas:
-        std::collections::VecDeque<(u32, tokio::sync::oneshot::Sender<Vec<RendezvousReplicaInfo>>)>,
+    pub pending_lookup_replicas: std::collections::VecDeque<(
+        u32,
+        tokio::sync::oneshot::Sender<Vec<RendezvousReplicaInfo>>,
+    )>,
     /// Pending oneshot replies for `LookupRelayKey` (relay X25519 by node_id).
     pub pending_lookup_relay_key:
         std::collections::VecDeque<(u32, tokio::sync::oneshot::Sender<Option<[u8; 32]>>)>,
@@ -1039,7 +1040,11 @@ impl VeilClient {
             envelope,
         };
         self.writer
-            .write_request_frame(LocalAppMsg::SetPushEnvelope as u16, request_id, &payload.encode())
+            .write_request_frame(
+                LocalAppMsg::SetPushEnvelope as u16,
+                request_id,
+                &payload.encode(),
+            )
             .await?;
         match tokio::time::timeout(std::time::Duration::from_secs(5), rx).await {
             Ok(Ok(status)) => Ok(status),
@@ -1084,7 +1089,11 @@ impl VeilClient {
             envelope,
         };
         self.writer
-            .write_request_frame(LocalAppMsg::SetWakeHmacEnvelope as u16, request_id, &payload.encode())
+            .write_request_frame(
+                LocalAppMsg::SetWakeHmacEnvelope as u16,
+                request_id,
+                &payload.encode(),
+            )
             .await?;
         match tokio::time::timeout(std::time::Duration::from_secs(5), rx).await {
             Ok(Ok(status)) => Ok(status),
@@ -1116,7 +1125,11 @@ impl VeilClient {
         }
         let payload = veilcore::proto::RegisterOnionServicePayload { hop_count };
         self.writer
-            .write_request_frame(LocalAppMsg::RegisterOnionService as u16, request_id, &payload.encode())
+            .write_request_frame(
+                LocalAppMsg::RegisterOnionService as u16,
+                request_id,
+                &payload.encode(),
+            )
             .await?;
         match tokio::time::timeout(std::time::Duration::from_secs(10), rx).await {
             Ok(Ok(0)) => Ok(()),
@@ -1156,7 +1169,8 @@ impl VeilClient {
                     "register_rendezvous_publisher queue at cap ({MAX_PENDING_OPS}); daemon may be hung"
                 )));
             }
-            d.pending_register_rendezvous_publisher.push_back((request_id, tx));
+            d.pending_register_rendezvous_publisher
+                .push_back((request_id, tx));
         }
         let payload = veilcore::proto::RegisterRendezvousPublisherPayload {
             rendezvous_node_id,
@@ -1167,7 +1181,8 @@ impl VeilClient {
         };
         self.writer
             .write_request_frame(
-                LocalAppMsg::RegisterRendezvousPublisher as u16, request_id,
+                LocalAppMsg::RegisterRendezvousPublisher as u16,
+                request_id,
                 &payload.encode(),
             )
             .await?;
@@ -1221,7 +1236,11 @@ impl VeilClient {
             data: data.to_vec(),
         };
         self.writer
-            .write_request_frame(LocalAppMsg::SendToOnionService as u16, request_id, &payload.encode())
+            .write_request_frame(
+                LocalAppMsg::SendToOnionService as u16,
+                request_id,
+                &payload.encode(),
+            )
             .await?;
         match tokio::time::timeout(std::time::Duration::from_secs(10), rx).await {
             Ok(Ok(0)) => Ok(()),
@@ -1272,7 +1291,11 @@ impl VeilClient {
             data: data.to_vec(),
         };
         self.writer
-            .write_request_frame(LocalAppMsg::SendToOnionService as u16, request_id, &payload.encode())
+            .write_request_frame(
+                LocalAppMsg::SendToOnionService as u16,
+                request_id,
+                &payload.encode(),
+            )
             .await?;
         match tokio::time::timeout(std::time::Duration::from_secs(10), rx).await {
             Ok(Ok(0)) => Ok(()),
@@ -1326,7 +1349,11 @@ impl VeilClient {
             data: data.to_vec(),
         };
         self.writer
-            .write_request_frame(LocalAppMsg::SendAnonymousDirect as u16, request_id, &payload.encode())
+            .write_request_frame(
+                LocalAppMsg::SendAnonymousDirect as u16,
+                request_id,
+                &payload.encode(),
+            )
             .await?;
         match tokio::time::timeout(std::time::Duration::from_secs(10), rx).await {
             Ok(Ok(0)) => Ok(()),
@@ -1407,7 +1434,11 @@ impl VeilClient {
             wake_hmac_envelope,
         };
         self.writer
-            .write_request_frame(LocalAppMsg::MailboxPut as u16, request_id, &payload.encode())
+            .write_request_frame(
+                LocalAppMsg::MailboxPut as u16,
+                request_id,
+                &payload.encode(),
+            )
             .await?;
         match tokio::time::timeout(std::time::Duration::from_secs(5), rx).await {
             Ok(Ok(reply)) => Ok(reply),
@@ -1445,7 +1476,11 @@ impl VeilClient {
             auth_cookie,
         };
         self.writer
-            .write_request_frame(LocalAppMsg::MailboxFetch as u16, request_id, &payload.encode())
+            .write_request_frame(
+                LocalAppMsg::MailboxFetch as u16,
+                request_id,
+                &payload.encode(),
+            )
             .await?;
         match tokio::time::timeout(std::time::Duration::from_secs(5), rx).await {
             Ok(Ok(blobs)) => Ok(blobs),
@@ -1484,7 +1519,11 @@ impl VeilClient {
             auth_cookie,
         };
         self.writer
-            .write_request_frame(LocalAppMsg::MailboxAck as u16, request_id, &payload.encode())
+            .write_request_frame(
+                LocalAppMsg::MailboxAck as u16,
+                request_id,
+                &payload.encode(),
+            )
             .await?;
         match tokio::time::timeout(std::time::Duration::from_secs(5), rx).await {
             Ok(Ok(removed)) => Ok(removed),
@@ -1563,7 +1602,11 @@ impl VeilClient {
             bloom,
         };
         self.writer
-            .write_request_frame(LocalAppMsg::OutboxFindMissing as u16, request_id, &payload.encode())
+            .write_request_frame(
+                LocalAppMsg::OutboxFindMissing as u16,
+                request_id,
+                &payload.encode(),
+            )
             .await?;
         match tokio::time::timeout(std::time::Duration::from_secs(5), rx).await {
             Ok(Ok(entries)) => Ok(entries),
@@ -1646,7 +1689,8 @@ impl VeilClient {
         };
         self.writer
             .write_request_frame(
-                LocalAppMsg::LookupRendezvousReplicas as u16, request_id,
+                LocalAppMsg::LookupRendezvousReplicas as u16,
+                request_id,
                 &payload.encode(),
             )
             .await?;
@@ -1684,7 +1728,11 @@ impl VeilClient {
         }
         let payload = veilcore::proto::LookupRelayKeyPayload { node_id };
         self.writer
-            .write_request_frame(LocalAppMsg::LookupRelayKey as u16, request_id, &payload.encode())
+            .write_request_frame(
+                LocalAppMsg::LookupRelayKey as u16,
+                request_id,
+                &payload.encode(),
+            )
             .await?;
         match tokio::time::timeout(std::time::Duration::from_secs(5), rx).await {
             Ok(Ok(pk)) => Ok(pk),
@@ -1814,7 +1862,11 @@ impl VeilClient {
             d.pending_pnet_status.push_back((request_id, tx));
         }
         self.writer
-            .write_request_frame(LocalAppMsg::PnetStatusQuery as u16, request_id, peer_node_id)
+            .write_request_frame(
+                LocalAppMsg::PnetStatusQuery as u16,
+                request_id,
+                peer_node_id,
+            )
             .await?;
         await_rpc_reply(rx, "pnet_status reply").await
     }
@@ -1913,7 +1965,11 @@ impl VeilClient {
             d.pending_bootstrap_join.push_back((request_id, tx));
         }
         self.writer
-            .write_request_frame(LocalAppMsg::JoinBootstrapUri as u16, request_id, &payload.encode())
+            .write_request_frame(
+                LocalAppMsg::JoinBootstrapUri as u16,
+                request_id,
+                &payload.encode(),
+            )
             .await?;
         await_rpc_reply(rx, "join_bootstrap_uri reply").await
     }
@@ -1947,7 +2003,11 @@ impl VeilClient {
             d.pending_create_invite.push_back((request_id, tx));
         }
         self.writer
-            .write_request_frame(LocalAppMsg::CreateBootstrapInvite as u16, request_id, &payload.encode())
+            .write_request_frame(
+                LocalAppMsg::CreateBootstrapInvite as u16,
+                request_id,
+                &payload.encode(),
+            )
             .await?;
         await_rpc_reply(rx, "create_bootstrap_invite reply").await
     }
@@ -1983,7 +2043,11 @@ impl VeilClient {
             d.pending_mailbox_seal.push_back((request_id, tx));
         }
         self.writer
-            .write_request_frame(LocalAppMsg::MailboxSeal as u16, request_id, &payload.encode())
+            .write_request_frame(
+                LocalAppMsg::MailboxSeal as u16,
+                request_id,
+                &payload.encode(),
+            )
             .await?;
         let reply = match tokio::time::timeout(DHT_RESOLVE_REQUEST_TIMEOUT, rx).await {
             Ok(Ok(reply)) => reply,
@@ -2031,7 +2095,11 @@ impl VeilClient {
             d.pending_mailbox_open.push_back((request_id, tx));
         }
         self.writer
-            .write_request_frame(LocalAppMsg::MailboxOpen as u16, request_id, &payload.encode())
+            .write_request_frame(
+                LocalAppMsg::MailboxOpen as u16,
+                request_id,
+                &payload.encode(),
+            )
             .await?;
         let reply = await_rpc_reply(rx, "mailbox_open reply").await?;
         match reply.status {
@@ -2072,7 +2140,8 @@ impl VeilClient {
         }
         self.writer
             .write_request_frame(
-                LocalAppMsg::PairSourceCreateInvite as u16, request_id,
+                LocalAppMsg::PairSourceCreateInvite as u16,
+                request_id,
                 &payload.encode(),
             )
             .await?;
@@ -2099,7 +2168,11 @@ impl VeilClient {
             d.pending_pair_source_hello.push_back((request_id, tx));
         }
         self.writer
-            .write_request_frame(LocalAppMsg::PairSourceHandleHello as u16, request_id, &payload.encode())
+            .write_request_frame(
+                LocalAppMsg::PairSourceHandleHello as u16,
+                request_id,
+                &payload.encode(),
+            )
             .await?;
         await_rpc_reply(rx, "pair_source_handle_hello reply").await
     }
@@ -2127,7 +2200,8 @@ impl VeilClient {
         }
         self.writer
             .write_request_frame(
-                LocalAppMsg::PairSourceHandleConfirm as u16, request_id,
+                LocalAppMsg::PairSourceHandleConfirm as u16,
+                request_id,
                 &payload.encode(),
             )
             .await?;
@@ -2163,7 +2237,11 @@ impl VeilClient {
             d.pending_pair_target_consume.push_back((request_id, tx));
         }
         self.writer
-            .write_request_frame(LocalAppMsg::PairTargetConsumeUri as u16, request_id, &payload.encode())
+            .write_request_frame(
+                LocalAppMsg::PairTargetConsumeUri as u16,
+                request_id,
+                &payload.encode(),
+            )
             .await?;
         await_rpc_reply(rx, "pair_target_consume_uri reply").await
     }
@@ -2187,7 +2265,11 @@ impl VeilClient {
             d.pending_pair_target_cert.push_back((request_id, tx));
         }
         self.writer
-            .write_request_frame(LocalAppMsg::PairTargetHandleCert as u16, request_id, &payload.encode())
+            .write_request_frame(
+                LocalAppMsg::PairTargetHandleCert as u16,
+                request_id,
+                &payload.encode(),
+            )
             .await?;
         await_rpc_reply(rx, "pair_target_handle_cert reply").await
     }
@@ -2214,7 +2296,8 @@ impl VeilClient {
         }
         self.writer
             .write_request_frame(
-                LocalAppMsg::PairTargetBuildConfirm as u16, request_id,
+                LocalAppMsg::PairTargetBuildConfirm as u16,
+                request_id,
                 &payload.encode(),
             )
             .await?;
@@ -2779,7 +2862,8 @@ async fn reader_task(
                     && let Ok(status) = veilcore::proto::SetPushEnvelopeStatus::from_wire(body[0])
                 {
                     let mut d = dispatch.lock().await;
-                    if let Some(tx) = take_pending(&mut d.pending_set_push_envelope, hdr.request_id) {
+                    if let Some(tx) = take_pending(&mut d.pending_set_push_envelope, hdr.request_id)
+                    {
                         let _ = tx.send(status);
                     }
                 }
@@ -2791,7 +2875,9 @@ async fn reader_task(
                         veilcore::proto::SetWakeHmacEnvelopeStatus::from_wire(body[0])
                 {
                     let mut d = dispatch.lock().await;
-                    if let Some(tx) = take_pending(&mut d.pending_set_wake_hmac_envelope, hdr.request_id) {
+                    if let Some(tx) =
+                        take_pending(&mut d.pending_set_wake_hmac_envelope, hdr.request_id)
+                    {
                         let _ = tx.send(status);
                     }
                 }
@@ -2799,36 +2885,44 @@ async fn reader_task(
             LocalAppMsg::RegisterOnionServiceResult if body.len() >= 2 => {
                 let status = u16::from_be_bytes([body[0], body[1]]);
                 let mut d = dispatch.lock().await;
-                if let Some(tx) = take_pending(&mut d.pending_register_onion_service, hdr.request_id) {
+                if let Some(tx) =
+                    take_pending(&mut d.pending_register_onion_service, hdr.request_id)
+                {
                     let _ = tx.send(status);
                 }
             }
             LocalAppMsg::RegisterRendezvousPublisherResult if body.len() >= 2 => {
                 let status = u16::from_be_bytes([body[0], body[1]]);
                 let mut d = dispatch.lock().await;
-                if let Some(tx) = take_pending(&mut d.pending_register_rendezvous_publisher, hdr.request_id) {
+                if let Some(tx) =
+                    take_pending(&mut d.pending_register_rendezvous_publisher, hdr.request_id)
+                {
                     let _ = tx.send(status);
                 }
             }
             LocalAppMsg::SendToOnionServiceResult if body.len() >= 2 => {
                 let status = u16::from_be_bytes([body[0], body[1]]);
                 let mut d = dispatch.lock().await;
-                if let Some(tx) = take_pending(&mut d.pending_send_to_onion_service, hdr.request_id) {
+                if let Some(tx) = take_pending(&mut d.pending_send_to_onion_service, hdr.request_id)
+                {
                     let _ = tx.send(status);
                 }
             }
             LocalAppMsg::SendAnonymousDirectResult if body.len() >= 2 => {
                 let status = u16::from_be_bytes([body[0], body[1]]);
                 let mut d = dispatch.lock().await;
-                if let Some(tx) = take_pending(&mut d.pending_send_anonymous_direct, hdr.request_id) {
+                if let Some(tx) = take_pending(&mut d.pending_send_anonymous_direct, hdr.request_id)
+                {
                     let _ = tx.send(status);
                 }
             }
             LocalAppMsg::SendAuthenticatedDirectWithReplyResult if body.len() >= 2 => {
                 let status = u16::from_be_bytes([body[0], body[1]]);
                 let mut d = dispatch.lock().await;
-                if let Some(tx) = take_pending(&mut d.pending_send_authenticated_direct_with_reply, hdr.request_id)
-                {
+                if let Some(tx) = take_pending(
+                    &mut d.pending_send_authenticated_direct_with_reply,
+                    hdr.request_id,
+                ) {
                     let _ = tx.send(status);
                 }
             }
@@ -2890,7 +2984,9 @@ async fn reader_task(
                         })
                         .collect();
                     let mut d = dispatch.lock().await;
-                    if let Some(tx) = take_pending(&mut d.pending_outbox_find_missing, hdr.request_id) {
+                    if let Some(tx) =
+                        take_pending(&mut d.pending_outbox_find_missing, hdr.request_id)
+                    {
                         let _ = tx.send(entries);
                     }
                 }
@@ -2928,7 +3024,8 @@ async fn reader_task(
                 use veilcore::proto::LookupRelayKeyRespPayload;
                 if let Ok(p) = LookupRelayKeyRespPayload::decode(&body) {
                     let mut d = dispatch.lock().await;
-                    if let Some(tx) = take_pending(&mut d.pending_lookup_relay_key, hdr.request_id) {
+                    if let Some(tx) = take_pending(&mut d.pending_lookup_relay_key, hdr.request_id)
+                    {
                         let _ = tx.send(p.relay_x25519);
                     }
                 }
@@ -3004,7 +3101,9 @@ async fn reader_task(
                         detail: String::from_utf8_lossy(&p.detail).into_owned(),
                     };
                     let mut d = dispatch.lock().await;
-                    if let Some(tx) = take_pending(&mut d.pending_pair_source_create, hdr.request_id) {
+                    if let Some(tx) =
+                        take_pending(&mut d.pending_pair_source_create, hdr.request_id)
+                    {
                         let _ = tx.send(reply);
                     }
                 }
@@ -3019,7 +3118,8 @@ async fn reader_task(
                         detail: String::from_utf8_lossy(&p.detail).into_owned(),
                     };
                     let mut d = dispatch.lock().await;
-                    if let Some(tx) = take_pending(&mut d.pending_pair_source_hello, hdr.request_id) {
+                    if let Some(tx) = take_pending(&mut d.pending_pair_source_hello, hdr.request_id)
+                    {
                         let _ = tx.send(reply);
                     }
                 }
@@ -3032,7 +3132,9 @@ async fn reader_task(
                         detail: String::from_utf8_lossy(&p.detail).into_owned(),
                     };
                     let mut d = dispatch.lock().await;
-                    if let Some(tx) = take_pending(&mut d.pending_pair_source_confirm, hdr.request_id) {
+                    if let Some(tx) =
+                        take_pending(&mut d.pending_pair_source_confirm, hdr.request_id)
+                    {
                         let _ = tx.send(reply);
                     }
                 }
@@ -3046,7 +3148,9 @@ async fn reader_task(
                         detail: String::from_utf8_lossy(&p.detail).into_owned(),
                     };
                     let mut d = dispatch.lock().await;
-                    if let Some(tx) = take_pending(&mut d.pending_pair_target_consume, hdr.request_id) {
+                    if let Some(tx) =
+                        take_pending(&mut d.pending_pair_target_consume, hdr.request_id)
+                    {
                         let _ = tx.send(reply);
                     }
                 }
@@ -3061,7 +3165,8 @@ async fn reader_task(
                         detail: String::from_utf8_lossy(&p.detail).into_owned(),
                     };
                     let mut d = dispatch.lock().await;
-                    if let Some(tx) = take_pending(&mut d.pending_pair_target_cert, hdr.request_id) {
+                    if let Some(tx) = take_pending(&mut d.pending_pair_target_cert, hdr.request_id)
+                    {
                         let _ = tx.send(reply);
                     }
                 }
@@ -3075,7 +3180,9 @@ async fn reader_task(
                         detail: String::from_utf8_lossy(&p.detail).into_owned(),
                     };
                     let mut d = dispatch.lock().await;
-                    if let Some(tx) = take_pending(&mut d.pending_pair_target_confirm, hdr.request_id) {
+                    if let Some(tx) =
+                        take_pending(&mut d.pending_pair_target_confirm, hdr.request_id)
+                    {
                         let _ = tx.send(reply);
                     }
                 }
@@ -3422,7 +3529,10 @@ mod tests {
 
         // The id-5 reply lands: waiter is closed → take_pending returns None
         // (discarded), the live id-6 waiter is untouched.
-        assert!(take_pending(&mut q, 5).is_none(), "abandoned id 5 discarded");
+        assert!(
+            take_pending(&mut q, 5).is_none(),
+            "abandoned id 5 discarded"
+        );
         assert_eq!(q.len(), 1, "live id 6 still queued");
         assert!(take_pending(&mut q, 6).is_some(), "id 6 intact");
     }

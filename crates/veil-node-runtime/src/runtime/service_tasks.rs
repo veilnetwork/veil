@@ -317,7 +317,10 @@ pub(crate) type PeerCapFlags = Arc<std::sync::RwLock<std::collections::HashMap<[
 /// rendezvous relay regardless of whether its RD has propagated to our local DHT
 /// shard. `CAN_RELAY` is deliberately insufficient: it is the ordinary transport
 /// forwarding bit, not an opt-in to carry onion anonymity circuits.
-fn peer_advertised_anonymity_relay(cap_flags: &PeerCapFlags, node_id: &[u8; 32]) -> bool {
+pub(crate) fn peer_advertised_anonymity_relay(
+    cap_flags: &PeerCapFlags,
+    node_id: &[u8; 32],
+) -> bool {
     cap_flags
         .read()
         .ok()
@@ -806,6 +809,305 @@ impl NodeRuntime {
         if let Some(handle) = crate::proxy::tasks::spawn_socks5(ctx) {
             lock_tasks(&self.tasks).background.push(handle);
         }
+    }
+
+    /// Bind the fixed-size UDP mapping reflector offered by this node.
+    ///
+    /// Every Core node opts in automatically on the protocol's conventional
+    /// port and advertises the live port to authenticated session peers. This
+    /// removes the central, client-configured reflector list: a new operator
+    /// becomes useful as soon as their normal Veil node is reachable. The old
+    /// `nat.udp_reflector_bind` remains an explicit bind override for unusual
+    /// deployments and retains fail-fast startup semantics.
+    pub async fn spawn_udp_reflector_task(
+        &mut self,
+        config: &veil_cfg::Config,
+    ) -> crate::Result<()> {
+        use std::sync::atomic::Ordering;
+
+        self.dispatcher
+            .local_udp_reflector_port
+            .store(0, Ordering::Release);
+        let explicit = config.nat.udp_reflector_bind.as_deref();
+        let auto_enabled = explicit.is_none()
+            && config
+                .identity
+                .as_ref()
+                .is_some_and(|identity| identity.role == veil_cfg::NodeRole::Core);
+        if explicit.is_none() && !auto_enabled {
+            return Ok(());
+        }
+        let automatic_bind = format!("0.0.0.0:{}", veil_nat::DEFAULT_UDP_REFLECTOR_PORT);
+        let bind = explicit.unwrap_or(&automatic_bind);
+        let addr = bind.parse::<std::net::SocketAddr>().map_err(|error| {
+            crate::error::NodeError::InvalidArgument(format!(
+                "invalid nat.udp_reflector_bind `{bind}`: {error}"
+            ))
+        })?;
+        let socket = match tokio::net::UdpSocket::bind(addr).await {
+            Ok(socket) => socket,
+            Err(error) if explicit.is_none() => {
+                self.logger.warn(
+                    "nat.udp_reflector.auto_bind_failed",
+                    format!("endpoint={addr} error={error}"),
+                );
+                return Ok(());
+            }
+            Err(error) => return Err(error.into()),
+        };
+        let local_addr = socket.local_addr()?;
+        let Some(shutdown_tx) = &self.shutdown_tx else {
+            return Ok(());
+        };
+        let mut shutdown_rx = shutdown_tx.subscribe();
+        let logger = Arc::clone(&self.logger);
+        let advertised_port = Arc::clone(&self.dispatcher.local_udp_reflector_port);
+        advertised_port.store(local_addr.port(), Ordering::Release);
+        logger.info(
+            "nat.udp_reflector.start",
+            format!(
+                "endpoint={local_addr} mode={}",
+                if explicit.is_some() {
+                    "explicit"
+                } else {
+                    "peer-auto"
+                },
+            ),
+        );
+        let handle = supervised_spawn(Arc::clone(&self.logger), "udp_reflector", async move {
+            let shutdown = async move {
+                loop {
+                    match shutdown_rx.changed().await {
+                        Ok(()) if *shutdown_rx.borrow() => break,
+                        Ok(()) => continue,
+                        Err(_) => break,
+                    }
+                }
+            };
+            if let Err(error) = veil_nat::serve_udp_reflector(socket, shutdown).await {
+                logger.warn("nat.udp_reflector.failed", error.to_string());
+            }
+            advertised_port.store(0, Ordering::Release);
+        });
+        lock_tasks(&self.tasks).listeners.push(handle);
+        Ok(())
+    }
+
+    /// Spawn the socket-owning half of token-bearing NAT traversal offers.
+    /// The synchronous dispatcher hands authenticated offers into this bounded
+    /// queue; each attempt discovers, replies, punches, then promotes the same
+    /// socket into an inbound QUIC session.
+    pub fn spawn_udp_punch_responder_task(&mut self, config: &veil_cfg::Config) {
+        *lock!(self.dispatcher.nat_punch_offer_tx) = None;
+        if !config.nat.enabled {
+            return;
+        }
+        let configured_reflectors = config.nat.udp_reflectors.clone();
+        let Some(shutdown_tx) = &self.shutdown_tx else {
+            return;
+        };
+        const OFFER_QUEUE_CAP: usize = 32;
+        const MAX_CONCURRENT_ATTEMPTS: usize = 16;
+        let (offer_tx, mut offer_rx) = tokio::sync::mpsc::channel(OFFER_QUEUE_CAP);
+        *lock!(self.dispatcher.nat_punch_offer_tx) = Some(offer_tx);
+        let mut shutdown_rx = shutdown_tx.subscribe();
+        let timeout = std::time::Duration::from_millis(config.nat.punch_timeout_ms);
+        let access = self.access();
+        let logger = Arc::clone(&self.logger);
+        let handle = supervised_spawn(
+            Arc::clone(&self.logger),
+            "udp_punch_responder",
+            async move {
+                let mut attempts = tokio::task::JoinSet::new();
+                loop {
+                    tokio::select! {
+                        Ok(_) = shutdown_rx.changed() => {
+                            if *shutdown_rx.borrow() {
+                                attempts.abort_all();
+                                break;
+                            }
+                        }
+                        Some(_) = attempts.join_next(), if !attempts.is_empty() => {}
+                        offer = offer_rx.recv() => {
+                            let Some(offer) = offer else { break };
+                            if attempts.len() >= MAX_CONCURRENT_ATTEMPTS {
+                                logger.warn(
+                                    "nat.udp_punch.offer_dropped",
+                                    "concurrent attempt cap reached",
+                                );
+                                continue;
+                            }
+                            let access = access.clone();
+                            let reflectors = access.available_udp_reflectors(
+                                offer.request.initiator_node_id,
+                                &configured_reflectors,
+                            );
+                            let logger = Arc::clone(&logger);
+                            attempts.spawn(async move {
+                                if timeout.is_zero() {
+                                    return;
+                                }
+                                let deadline = tokio::time::Instant::now() + timeout;
+                                let Some(punch_token) = offer.request.punch_token else {
+                                    return;
+                                };
+                                let Some(first_reflector) = reflectors.first().copied() else {
+                                    return;
+                                };
+                                let reflectors = reflectors
+                                    .into_iter()
+                                    .filter(|value| {
+                                        value.is_ipv4() == first_reflector.is_ipv4()
+                                    })
+                                    .collect::<Vec<_>>();
+                                let bind_addr = match first_reflector {
+                                    std::net::SocketAddr::V4(_) => "0.0.0.0:0",
+                                    std::net::SocketAddr::V6(_) => "[::]:0",
+                                };
+                                let socket = match tokio::net::UdpSocket::bind(bind_addr).await {
+                                    Ok(socket) => socket,
+                                    Err(error) => {
+                                        logger.warn("nat.udp_punch.bind_failed", error.to_string());
+                                        return;
+                                    }
+                                };
+                                let discovery_token = {
+                                    use rand_core::RngCore;
+                                    let mut token = [0u8; 16];
+                                    rand_core::OsRng.fill_bytes(&mut token);
+                                    token
+                                };
+                                let mapping = match veil_nat::discover_udp_mapping_any_for_punch(
+                                    &socket,
+                                    &reflectors,
+                                    discovery_token,
+                                    timeout.min(std::time::Duration::from_millis(500)),
+                                )
+                                .await
+                                {
+                                    Ok(Some((mapping, _))) => mapping,
+                                    Ok(None) => {
+                                        logger.debug(
+                                            "nat.udp_punch.discovery_unusable",
+                                            "no non-hairpin UDP mapping from peer-announced reflectors",
+                                        );
+                                        return;
+                                    }
+                                    Err(error) => {
+                                        logger.warn(
+                                            "nat.udp_punch.discovery_failed",
+                                            error.to_string(),
+                                        );
+                                        return;
+                                    }
+                                };
+                                let mut candidate = veil_nat::socket_addr_to_candidate(mapping);
+                                candidate.candidate_type =
+                                    veil_proto::control::candidate_type::SRFLX;
+                                candidate.priority = 1_694_498_815;
+                                let final_target_node_id =
+                                    if offer.reply_via_node_id == offer.request.initiator_node_id {
+                                        [0u8; 32]
+                                    } else {
+                                        offer.request.initiator_node_id
+                                    };
+                                let reply = veil_proto::control::NatProbeReplyPayload {
+                                    responder_node_id: access.local_node_id,
+                                    final_target_node_id,
+                                    session_token: offer.request.session_token,
+                                    punch_token: Some(punch_token),
+                                    candidates: vec![candidate],
+                                };
+                                let body = reply.encode();
+                                let mut header = veil_proto::header::FrameHeader::new(
+                                    veil_proto::family::FrameFamily::Control as u8,
+                                    veil_proto::family::ControlMsg::NatProbeReply as u16,
+                                );
+                                header.body_len = body.len() as u32;
+                                header.set_priority(veil_proto::priority::INTERACTIVE);
+                                let mut frame = veil_proto::codec::encode_header(&header).to_vec();
+                                frame.extend_from_slice(&body);
+                                if !rlock!(access.session_tx_registry).send_to(
+                                    &offer.reply_via_node_id,
+                                    veil_proto::priority::INTERACTIVE,
+                                    frame,
+                                ) {
+                                    return;
+                                }
+                                let peer_candidates = offer
+                                    .request
+                                    .candidates
+                                    .iter()
+                                    .filter(|candidate| {
+                                        candidate.candidate_type
+                                            == veil_proto::control::candidate_type::SRFLX
+                                    })
+                                    .filter_map(veil_nat::candidate_to_socket_addr)
+                                    .filter(|candidate| veil_nat::is_public_punch_addr(*candidate))
+                                    .collect::<Vec<_>>();
+                                let remaining = deadline
+                                    .saturating_duration_since(tokio::time::Instant::now());
+                                let quic_reserve =
+                                    (remaining / 2).min(std::time::Duration::from_millis(750));
+                                let punch_timeout = remaining.saturating_sub(quic_reserve);
+                                if punch_timeout.is_zero() {
+                                    return;
+                                }
+                                let peer = match veil_nat::punch_udp(
+                                    &socket,
+                                    &peer_candidates,
+                                    punch_token,
+                                    punch_timeout,
+                                )
+                                .await
+                                {
+                                    Ok(Some(peer)) => peer,
+                                    _ => return,
+                                };
+                                let remaining = deadline
+                                    .saturating_duration_since(tokio::time::Instant::now());
+                                if remaining.is_zero() {
+                                    return;
+                                }
+                                let promoted = tokio::time::timeout(
+                                    remaining,
+                                    veil_transport::promote_punched_quic(
+                                        socket,
+                                        peer,
+                                        Arc::clone(&access.transport_ctx),
+                                        veil_transport::PunchedQuicRole::Responder,
+                                    ),
+                                )
+                                .await;
+                                match promoted {
+                                    Ok(Ok(connection)) => {
+                                        logger.info(
+                                            "nat.udp_punch.connected",
+                                            format!(
+                                                "peer={} role=responder",
+                                                veil_util::hex_short(
+                                                    &offer.request.initiator_node_id
+                                                )
+                                            ),
+                                        );
+                                        access.spawn_punched_inbound(connection);
+                                    }
+                                    Ok(Err(error)) => logger.warn(
+                                        "nat.udp_punch.quic_failed",
+                                        error.to_string(),
+                                    ),
+                                    Err(_) => logger.warn(
+                                        "nat.udp_punch.quic_failed",
+                                        "overall NAT traversal deadline elapsed",
+                                    ),
+                                }
+                            });
+                        }
+                    }
+                }
+            },
+        );
+        lock_tasks(&self.tasks).background.push(handle);
     }
 
     /// Spawn the exit proxy accept loop if `config.proxy.exit.enabled`.
@@ -1588,6 +1890,7 @@ impl NodeRuntime {
                             // what srflx address you see for me".
                             target_node_id: [0u8; 32],
                             session_token,
+                            punch_token: None,
                             candidates: veil_dispatcher::build_own_host_candidates(
                                 &listen_snapshot,
                             ),
@@ -3918,6 +4221,12 @@ impl veil_types::AnonOnionSender for RuntimeAnonOnionSender {
                 }
                 relays.sort_unstable();
                 relays.dedup();
+                relays.retain(|n| {
+                    peer_advertised_anonymity_relay(
+                        &self.access.dispatcher.crypto.peer_cap_flags,
+                        n,
+                    )
+                });
                 self.access
                     .warm_known_relay_directory(&relays, 6, std::time::Duration::from_secs(5))
                     .await;

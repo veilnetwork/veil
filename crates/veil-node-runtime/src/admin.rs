@@ -1427,9 +1427,7 @@ pub enum AdminEndpoint {
     /// clients consult the siblings.
     NamedPipe {
         /// Full pipe name, e.g. `\\.\pipe\veil-admin-1234`.
-        /// `#[allow(dead_code)]`: only read on Windows; non-Windows code
-        /// paths immediately return `Unsupported` from `bind_admin_endpoint`.
-        #[allow(dead_code)]
+        #[cfg(windows)]
         pipe_name: String,
         /// Directory for `admin.pipe` and `admin.token` files.
         runtime_dir: PathBuf,
@@ -1735,12 +1733,14 @@ pub fn resolve_admin_endpoint(config: &Config, config_dir: Option<&Path>) -> Res
                 "global.admin_socket: pipe:// leaf must be a simple name (got: {admin_socket})"
             )));
         }
+        #[cfg(windows)]
         let pipe_name = format!(r"\\.\pipe\{leaf}");
         let runtime_dir = query_runtime_dir
             .map(PathBuf::from)
             .or_else(|| config_dir.map(|p| p.to_path_buf()))
             .unwrap_or_else(veil_cfg::runtime_veil_dir);
         return Ok(AdminEndpoint::NamedPipe {
+            #[cfg(windows)]
             pipe_name,
             runtime_dir,
         });

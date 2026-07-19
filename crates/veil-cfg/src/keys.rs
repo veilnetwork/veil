@@ -25,6 +25,11 @@ pub enum ConfigKey {
     IdentityPrivateKey,
     IdentityNonce,
     IdentityNodeId,
+    NatEnabled,
+    NatPunchTimeoutMs,
+    NatRelayEnabled,
+    NatUdpReflectors,
+    NatUdpReflectorBind,
     TransportTlsClientConnectTimeoutMs,
 }
 
@@ -51,6 +56,11 @@ impl ConfigKey {
             "identity.private_key" => Ok(Self::IdentityPrivateKey),
             "identity.nonce" => Ok(Self::IdentityNonce),
             "identity.node_id" => Ok(Self::IdentityNodeId),
+            "nat.enabled" => Ok(Self::NatEnabled),
+            "nat.punch_timeout_ms" => Ok(Self::NatPunchTimeoutMs),
+            "nat.relay_enabled" => Ok(Self::NatRelayEnabled),
+            "nat.udp_reflectors" => Ok(Self::NatUdpReflectors),
+            "nat.udp_reflector_bind" => Ok(Self::NatUdpReflectorBind),
             "transport.tls_client.connect_timeout_ms" => {
                 Ok(Self::TransportTlsClientConnectTimeoutMs)
             }
@@ -79,6 +89,11 @@ impl ConfigKey {
             Self::IdentityPrivateKey => "identity.private_key",
             Self::IdentityNonce => "identity.nonce",
             Self::IdentityNodeId => "identity.node_id",
+            Self::NatEnabled => "nat.enabled",
+            Self::NatPunchTimeoutMs => "nat.punch_timeout_ms",
+            Self::NatRelayEnabled => "nat.relay_enabled",
+            Self::NatUdpReflectors => "nat.udp_reflectors",
+            Self::NatUdpReflectorBind => "nat.udp_reflector_bind",
             Self::TransportTlsClientConnectTimeoutMs => "transport.tls_client.connect_timeout_ms",
         }
     }

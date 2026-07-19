@@ -171,6 +171,8 @@ impl NodeRuntime {
                 config.routing.dht_fallback_enabled,
             ),
             S::Bootstrap => self.spawn_bootstrap_task(config),
+            S::UdpReflector => self.spawn_udp_reflector_task(config).await?,
+            S::UdpPunchResponder => self.spawn_udp_punch_responder_task(config),
             S::SrflxProbe => self.spawn_srflx_probe_task(),
             S::BootstrapWatchdog => self.spawn_bootstrap_watchdog_task(config),
             S::SovereignIdentityRepublish => self.spawn_sovereign_identity_republish_task(),
@@ -610,7 +612,7 @@ impl NodeRuntime {
             gateway_failover_notify: Arc::clone(&self.gateway_failover_notify),
             force_reconnect_notify: Arc::clone(&self.force_reconnect_notify),
             event_bus: Arc::clone(&self.event_bus),
-            outbound_connector_node_ids: Arc::clone(&self.outbound_connector_node_ids),
+            outbound_connector_refresh: Arc::clone(&self.outbound_connector_refresh),
             discovered_peers_cache: Arc::clone(&self.discovered_peers_cache),
             anonymity: Arc::clone(&self.anonymity),
             sessions_per_ip: Arc::clone(&self.sessions_per_ip),
@@ -626,6 +628,7 @@ impl NodeRuntime {
             allowed_peer_algos: self.allowed_peer_algos.clone(),
             network_gate: self.network_gate.as_ref().map(Arc::clone),
             verified_peer_certs: Arc::clone(&self.verified_peer_certs),
+            tasks: Arc::clone(&self.tasks),
         }
     }
 

@@ -798,6 +798,46 @@ void _sendWorker(int appAddr, Uint8List dstNodeId, Uint8List dstAppId,
   }
 }
 
+/// Off-isolate body of [AppHandle.sendRealtime]. This is the native
+/// APP_RT_SEND path: it only uses an already-active direct peer session and
+/// fails promptly when none exists, allowing the caller's durable fallback to
+/// proceed without a DHT lookup.
+void _sendRealtimeWorker(int appAddr, Uint8List dstNodeId, Uint8List dstAppId,
+    int dstEndpointId, Uint8List data) {
+  final app = Pointer<ffi.VeilApp>.fromAddress(appAddr);
+  final dstNode = calloc<Uint8>(32);
+  final dstApp = calloc<Uint8>(32);
+  final dataPtr = data.isNotEmpty ? calloc<Uint8>(data.length) : nullptr;
+  final errOut = calloc<Pointer<Utf8>>();
+  try {
+    dstNode.asTypedList(32).setAll(0, dstNodeId);
+    dstApp.asTypedList(32).setAll(0, dstAppId);
+    if (data.isNotEmpty) {
+      dataPtr.asTypedList(data.length).setAll(0, data);
+    }
+    final rc = ffi.veilSendRealtime(
+      app,
+      dstNode,
+      dstApp,
+      dstEndpointId,
+      dataPtr,
+      data.length,
+      errOut,
+    );
+    if (rc != ffi.veilOk) {
+      throw VeilException(
+        'realtime send failed: ${_readErrAndFree(errOut)}',
+        code: rc,
+      );
+    }
+  } finally {
+    calloc.free(dstNode);
+    calloc.free(dstApp);
+    if (dataPtr != nullptr) calloc.free(dataPtr);
+    calloc.free(errOut);
+  }
+}
+
 /// GC-time safety-net: if a Dart `VeilClient` becomes unreachable
 /// without calling [VeilClient.close], the finalizer fires
 /// `veil_close` to release the daemon-side handle.  Explicit close
@@ -2249,6 +2289,25 @@ class AppHandle implements Finalizable {
         () => _sendWorker(appAddr, dstNodeId, dstAppId, dstEndpointId, data));
   }
 
+  /// Send a loss-tolerant datagram over an already-active direct peer session
+  /// at realtime priority. No route discovery or relay fallback is attempted;
+  /// callers should catch failure and keep a durable transport for control
+  /// messages that must eventually arrive.
+  Future<void> sendRealtime({
+    required Uint8List dstNodeId,
+    required Uint8List dstAppId,
+    required int dstEndpointId,
+    required Uint8List data,
+  }) async {
+    _ensureOpen();
+    if (dstNodeId.length != 32 || dstAppId.length != 32) {
+      throw ArgumentError('dst_node_id and dst_app_id must be 32 bytes');
+    }
+    final appAddr = _app.address;
+    return Isolate.run(() =>
+        _sendRealtimeWorker(appAddr, dstNodeId, dstAppId, dstEndpointId, data));
+  }
+
   /// Send [data] as an AUTHENTICATED anonymous message over the
   /// onion/rendezvous transport: the relays don't learn our location while the
   /// recipient cryptographically verifies WHO sent it. Fire-and-forget (no
@@ -2396,14 +2455,41 @@ class AppHandle implements Finalizable {
         appAddr, dstNodeId, dstAppId, dstEndpointId));
   }
 
-  /// Enable/disable audio+RTCP batching on a RELAY media channel opened by
-  /// [openRelayMediaChannel]. Turn on ONLY after call signaling proves the
-  /// peer's protocol version decodes MEDIA_BATCH_MAGIC cells — a batched
-  /// cell is silent noise to an older build. Returns 0 on success, -1 for
-  /// an unknown or non-relay channel.
+  /// Enable/disable batching on a relay media channel. Turn on ONLY
+  /// after call signaling proves the peer decodes MEDIA_BATCH_MAGIC cells — a
+  /// batched cell is silent noise to an older build. Returns 0 on success,
+  /// -1 for an unknown or unsupported channel.
   int setRelayMediaBatching(int chan, bool on) {
     _ensureOpen();
     return ffi.veilMediaChannelSetBatching(chan, on ? 1 : 0);
+  }
+
+  /// Snapshot relay drain timing without touching media payloads. Returns null
+  /// if the channel closed between the caller's state read and this probe.
+  Map<String, int>? mediaChannelStats(int chan) {
+    _ensureOpen();
+    final out = calloc<ffi.VeilMediaChannelStatsStruct>();
+    try {
+      if (ffi.veilMediaChannelGetStats(chan, out) != 0) return null;
+      final stats = out.ref;
+      return {
+        'relay_video_frames_enqueued': stats.videoFramesEnqueued,
+        'relay_video_frames_started': stats.videoFramesStarted,
+        'relay_video_queue_depth': stats.videoQueueDepth,
+        'relay_video_queue_max_depth': stats.videoQueueMaxDepth,
+        'relay_video_queue_age_max_ms': stats.videoQueueAgeMaxMs,
+        'relay_video_queue_holds_75ms': stats.videoQueueHolds75ms,
+        'relay_sender_lock_max_ms': stats.senderLockMaxMs,
+        'relay_sender_lock_holds_16ms': stats.senderLockHolds16ms,
+        'relay_video_frame_ipc_max_ms': stats.videoFrameIpcMaxMs,
+        'relay_video_frame_ipc_holds_33ms': stats.videoFrameIpcHolds33ms,
+        'relay_ipc_cell_max_ms': stats.ipcCellMaxMs,
+        'relay_ipc_cell_holds_16ms': stats.ipcCellHolds16ms,
+        'relay_ipc_send_failures': stats.ipcSendFailures,
+      };
+    } finally {
+      calloc.free(out);
+    }
   }
 
   /// Install the native direct-media receive pump on this endpoint. Incoming

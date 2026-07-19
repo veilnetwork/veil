@@ -207,6 +207,28 @@ impl PriorityQueue {
     pub fn peek_priority(&self) -> Option<u8> {
         (0..4u8).find(|&p| !self.queues[p as usize].is_empty())
     }
+
+    /// Pop the FIFO head of the REALTIME queue only when `predicate` accepts
+    /// it. This does not consume a WRR slot: the frame leaves the ordered
+    /// stream scheduler and is carried by an independent realtime lane.
+    pub fn pop_realtime_if(
+        &mut self,
+        predicate: impl FnOnce(&[u8]) -> bool,
+    ) -> Option<veil_bufpool::PooledShared> {
+        let head = self.queues[REALTIME as usize].front()?;
+        predicate(head).then(|| {
+            self.queues[REALTIME as usize]
+                .pop_front()
+                .expect("REALTIME head checked above")
+        })
+    }
+
+    /// Restore a REALTIME frame after a side-channel send could not complete.
+    /// The caller has just popped this same frame, so reinsertion cannot exceed
+    /// the queue's prior bounded depth.
+    pub fn push_realtime_front(&mut self, frame: veil_bufpool::PooledShared) {
+        self.queues[REALTIME as usize].push_front(frame);
+    }
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -229,6 +251,21 @@ mod tests {
         assert_eq!(pq.pop().unwrap().as_ref(), b"b");
         assert_eq!(pq.pop().unwrap().as_ref(), b"c");
         assert!(pq.pop().is_none());
+    }
+
+    #[test]
+    fn conditional_realtime_pop_preserves_fifo_and_wrr_slots() {
+        let mut pq = PriorityQueue::with_default_weights();
+        pq.push(REALTIME, arc(b"rt-a"));
+        pq.push(REALTIME, arc(b"rt-b"));
+        pq.push(BULK, arc(b"bulk"));
+
+        assert!(pq.pop_realtime_if(|f| f == b"no").is_none());
+        let first = pq.pop_realtime_if(|f| f == b"rt-a").unwrap();
+        assert_eq!(first.as_ref(), b"rt-a");
+        pq.push_realtime_front(first);
+        assert_eq!(pq.pop().unwrap().as_ref(), b"rt-a");
+        assert_eq!(pq.pop().unwrap().as_ref(), b"rt-b");
     }
 
     /// 29.5: REALTIME frames sent before BULK frames when both are enqueued.

@@ -85,6 +85,27 @@ pub(crate) fn clamp_uplink_sndbuf(stream: &TcpStream) {
     let _ = SockRef::from(stream).set_send_buffer_size(bytes);
 }
 
+/// Apply every TCP option that must be set on a newly accepted socket.
+///
+/// Listener options are not a portable substitute: notably, `TCP_NODELAY`
+/// is a per-connected-socket flag and accepted sockets otherwise keep the
+/// kernel default (`false`). Keep this helper shared by plain TCP and obfs4
+/// so their inbound latency posture cannot drift apart again.
+pub(crate) fn configure_accepted_tcp(
+    stream: &TcpStream,
+    nodelay: bool,
+    keepalive_idle: Option<std::time::Duration>,
+) -> Result<()> {
+    stream.set_nodelay(nodelay)?;
+    if let Some(idle) = keepalive_idle {
+        let ka = TcpKeepalive::new().with_time(idle);
+        SockRef::from(stream).set_tcp_keepalive(&ka)?;
+    }
+    clamp_downlink_mss(stream);
+    clamp_uplink_sndbuf(stream);
+    Ok(())
+}
+
 /// Plain TCP `Transport` implementation. No encryption or framing — use a
 /// TLS layer above this transport for confidentiality.
 #[derive(Debug, Default)]
@@ -209,17 +230,20 @@ struct TcpTransportListener {
     listener: TcpListener,
     bind_uri: TransportUri,
     keepalive_idle: Option<std::time::Duration>,
+    nodelay: bool,
 }
 
 fn boxed_tcp_listener(
     listener: TcpListener,
     bind_uri: TransportUri,
     keepalive_idle: Option<std::time::Duration>,
+    nodelay: bool,
 ) -> Box<dyn TransportListener> {
     Box::new(TcpTransportListener {
         listener,
         bind_uri,
         keepalive_idle,
+        nodelay,
     }) as Box<dyn TransportListener>
 }
 
@@ -227,12 +251,12 @@ impl TransportListener for TcpTransportListener {
     fn accept<'a>(&'a self) -> BoxFuture<'a, Result<Box<dyn TransportConnection>>> {
         Box::pin(async move {
             let (stream, remote_addr) = self.listener.accept().await?;
-            if let Some(idle) = self.keepalive_idle {
-                let ka = TcpKeepalive::new().with_time(idle);
-                SockRef::from(&stream).set_tcp_keepalive(&ka)?;
-            }
-            clamp_downlink_mss(&stream);
-            clamp_uplink_sndbuf(&stream);
+            // Accepted sockets do not inherit TCP_NODELAY from the listening
+            // socket. Keep the accept side symmetric with connect_tcp_stream:
+            // otherwise one call direction is exposed to Nagle + delayed ACK
+            // stalls (typically 40-120 ms) even though the peer's outbound
+            // socket is configured for latency-sensitive traffic.
+            configure_accepted_tcp(&stream, self.nodelay, self.keepalive_idle)?;
             let local_addr = stream.local_addr().ok();
             let peer = peer_meta("tcp", self.bind_uri.clone(), local_addr, Some(remote_addr));
             Ok(boxed_stream_connection(peer, stream))
@@ -295,6 +319,7 @@ impl Transport for TcpTransport {
                 listener,
                 uri.clone(),
                 ctx.tcp.keepalive_idle,
+                ctx.tcp.nodelay,
             ))
         })
     }
@@ -348,4 +373,23 @@ fn build_reuseaddr_listener(addr: SocketAddr) -> std::io::Result<TcpListener> {
     socket.listen(1024)?;
     let std_listener: std::net::TcpListener = socket.into();
     TcpListener::from_std(std_listener)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn accepted_socket_honours_configured_nodelay() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = tokio::spawn(async move { TcpStream::connect(addr).await.unwrap() });
+        let (server, _) = listener.accept().await.unwrap();
+        let _client = client.await.unwrap();
+
+        configure_accepted_tcp(&server, true, None).unwrap();
+        assert!(server.nodelay().unwrap());
+        configure_accepted_tcp(&server, false, None).unwrap();
+        assert!(!server.nodelay().unwrap());
+    }
 }

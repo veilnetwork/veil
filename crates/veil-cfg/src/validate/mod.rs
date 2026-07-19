@@ -1319,6 +1319,41 @@ mod tests {
                 "no issue when relay is absent"
             );
         }
+
+        #[test]
+        fn nat_udp_reflector_addresses_are_numeric_and_nonzero() {
+            let mut config = Config::default();
+            config.nat.udp_reflector_bind = Some("0.0.0.0:0".to_owned());
+            config.nat.udp_reflectors = vec!["reflector.example:443".to_owned()];
+            let report = validate(&config);
+            assert!(
+                report
+                    .issues
+                    .iter()
+                    .any(|issue| issue.code == "nat_udp_reflector_bind_invalid")
+            );
+            assert!(
+                report
+                    .issues
+                    .iter()
+                    .any(|issue| issue.code == "nat_udp_reflector_invalid")
+            );
+        }
+
+        #[test]
+        fn nat_udp_reflector_addresses_accept_ipv4_and_ipv6() {
+            let mut config = Config::default();
+            config.nat.udp_reflector_bind = Some("0.0.0.0:39999".to_owned());
+            config.nat.udp_reflectors = vec![
+                "203.0.113.7:39999".to_owned(),
+                "[2001:db8::7]:39999".to_owned(),
+            ];
+            let report = validate(&config);
+            assert!(!report.issues.iter().any(|issue| {
+                issue.code == "nat_udp_reflector_bind_invalid"
+                    || issue.code == "nat_udp_reflector_invalid"
+            }));
+        }
     }
 
     fn broken_signature_identity() -> IdentityConfig {

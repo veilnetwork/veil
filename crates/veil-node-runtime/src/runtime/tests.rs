@@ -936,6 +936,9 @@ pub fn verify_remote_peer_identity_reports_mismatch_readably() {
             session_id: [0u8; 32],
         },
         remote_discovery_mode: veil_cfg::DiscoveryMode::Public,
+        supports_realtime_datagrams: false,
+        udp_reflector_port: None,
+        shared_udp_reflectors: Vec::new(),
     };
     let mismatched_keypair = test_support::ed25519_keypair();
     let expected = ExpectedPeerIdentity {
@@ -973,6 +976,9 @@ pub fn verify_remote_peer_identity_reports_nonce_mismatch_readably() {
             session_id: [0u8; 32],
         },
         remote_discovery_mode: veil_cfg::DiscoveryMode::Public,
+        supports_realtime_datagrams: false,
+        udp_reflector_port: None,
+        shared_udp_reflectors: Vec::new(),
     };
     let expected = ExpectedPeerIdentity {
         peer_id: PeerId::new(8),
@@ -2161,4 +2167,119 @@ async fn reload_with_malformed_peer_pubkey_does_not_zombie() {
 
     runtime.stop().await.expect("stop");
     let _ = fs::remove_file(&path);
+}
+
+#[tokio::test]
+async fn peer_announced_reflectors_are_diverse_ordered_and_need_no_static_config() {
+    let path = save_test_config("dynamic-reflector-selection", runtime_config_with_metrics())
+        .expect("save config");
+    let mut runtime = NodeRuntime::start(&path, true)
+        .await
+        .expect("start runtime");
+    let near = [0x01; 32];
+    let far = [0x80; 32];
+    {
+        let mut announced = runtime.dispatcher.peer_udp_reflectors.write().unwrap();
+        announced.insert(
+            near,
+            vec![
+                "1.1.1.1:39999".parse().unwrap(),
+                "1.0.0.1:39999".parse().unwrap(),
+            ],
+        );
+        announced.insert(far, vec!["8.8.8.8:39999".parse().unwrap()]);
+    }
+
+    let selected = runtime.access().available_udp_reflectors([0u8; 32], &[]);
+    assert_eq!(
+        selected,
+        vec![
+            "1.1.1.1:39999".parse().unwrap(),
+            "8.8.8.8:39999".parse().unwrap(),
+            "1.0.0.1:39999".parse().unwrap(),
+        ],
+        "one announcer must not crowd out independent peers, and no static list is required",
+    );
+
+    runtime.stop().await.expect("stop");
+    let _ = fs::remove_file(path);
+}
+
+#[tokio::test]
+async fn udp_discovery_punch_and_same_socket_quic_roundtrip() {
+    use std::sync::Arc;
+    use tokio::net::UdpSocket;
+    use tokio::sync::oneshot;
+    use veil_transport::{PunchedQuicRole, TransportContext, promote_punched_quic};
+
+    let reflector_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let reflector_addr = reflector_socket.local_addr().unwrap();
+    let (reflector_stop_tx, reflector_stop_rx) = oneshot::channel();
+    let reflector = tokio::spawn(veil_nat::serve_udp_reflector(
+        reflector_socket,
+        reflector_stop_rx,
+    ));
+
+    let left = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let right = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let discovery_token = [0x11; 16];
+    let (left_mapping, right_mapping) = tokio::join!(
+        veil_nat::discover_udp_mapping(
+            &left,
+            reflector_addr,
+            discovery_token,
+            Duration::from_secs(1),
+        ),
+        veil_nat::discover_udp_mapping(
+            &right,
+            reflector_addr,
+            discovery_token,
+            Duration::from_secs(1),
+        ),
+    );
+    let left_mapping = left_mapping.unwrap().unwrap();
+    let right_mapping = right_mapping.unwrap().unwrap();
+
+    let punch_token = [0xA5; 16];
+    let left_candidates = [right_mapping];
+    let right_candidates = [left_mapping];
+    let (left_peer, right_peer) = tokio::join!(
+        veil_nat::punch_udp(&left, &left_candidates, punch_token, Duration::from_secs(1),),
+        veil_nat::punch_udp(
+            &right,
+            &right_candidates,
+            punch_token,
+            Duration::from_secs(1),
+        ),
+    );
+    assert_eq!(left_peer.unwrap(), Some(right_mapping));
+    assert_eq!(right_peer.unwrap(), Some(left_mapping));
+
+    let ctx = Arc::new(TransportContext::for_debug().unwrap());
+    let responder_ctx = Arc::clone(&ctx);
+    let responder = tokio::spawn(async move {
+        promote_punched_quic(
+            right,
+            left_mapping,
+            responder_ctx,
+            PunchedQuicRole::Responder,
+        )
+        .await
+    });
+    let initiator = promote_punched_quic(left, right_mapping, ctx, PunchedQuicRole::Initiator)
+        .await
+        .unwrap();
+    assert_eq!(initiator.peer_meta().local_addr, Some(left_mapping));
+    let mut initiator_stream = initiator.into_stream().unwrap();
+    initiator_stream.write_all(b"stage-b").await.unwrap();
+
+    let responder = responder.await.unwrap().unwrap();
+    assert_eq!(responder.peer_meta().local_addr, Some(right_mapping));
+    let mut responder_stream = responder.into_stream().unwrap();
+    let mut payload = [0u8; 7];
+    responder_stream.read_exact(&mut payload).await.unwrap();
+    assert_eq!(&payload, b"stage-b");
+
+    let _ = reflector_stop_tx.send(());
+    reflector.await.unwrap().unwrap();
 }

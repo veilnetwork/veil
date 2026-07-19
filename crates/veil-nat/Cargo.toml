@@ -10,7 +10,7 @@ veil-proto = { path = "../veil-proto" }
 veil-types = { path = "../veil-types" }
 
 quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-aws-lc-rs"] }
-tokio = { version = "1.42", features = ["net", "sync", "rt", "time", "macros"] }
+tokio = { version = "1.42", features = ["net", "sync", "rt", "time", "macros", "signal"] }
 
 [dev-dependencies]
 rcgen = "0.13"

@@ -1,0 +1,41 @@
+[Unit]
+Description=Veil node with bounded UDP mapping reflector
+Documentation=https://github.com/veil-network/veil
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=veil
+Group=veil
+ExecStart=/usr/local/bin/veil-cli --config /etc/veil/node.toml node run --foreground
+Restart=on-failure
+RestartSec=5s
+
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+PrivateDevices=yes
+PrivateTmp=yes
+ProtectClock=yes
+ProtectControlGroups=yes
+ProtectHome=yes
+ProtectHostname=yes
+ProtectKernelLogs=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectProc=invisible
+ProtectSystem=strict
+ProcSubset=pid
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+UMask=0077
+ReadWritePaths=/var/lib/veil /run/veil
+LimitNOFILE=65536
+LimitMEMLOCK=infinity
+
+[Install]
+WantedBy=multi-user.target

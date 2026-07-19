@@ -823,18 +823,6 @@ pub fn bind_named_pipe(name: &str) -> std::io::Result<(LocalListener, String, Lo
     ))
 }
 
-/// Non-Windows stub so callers can compile on any platform. Returns
-/// `Unsupported`; the endpoint resolver should filter pipe URIs away from
-/// non-Windows hosts before reaching this helper.
-#[cfg(not(windows))]
-#[allow(dead_code)]
-pub fn bind_named_pipe(_name: &str) -> std::io::Result<(LocalListener, String, LocalToken)> {
-    Err(std::io::Error::new(
-        std::io::ErrorKind::Unsupported,
-        "NamedPipe is only supported on Windows",
-    ))
-}
-
 /// 12: connect to a NamedPipe listener and perform the token
 /// handshake. The `token` must match the value the server wrote to its
 /// token file at bind time; on mismatch the server closes the connection
@@ -846,16 +834,6 @@ pub async fn connect_named_pipe(name: &str, token: &LocalToken) -> std::io::Resu
     client.write_all(token.as_bytes()).await?;
     client.flush().await?;
     Ok(LocalStream::NamedPipe(Box::new(client)))
-}
-
-/// Non-Windows stub.
-#[cfg(not(windows))]
-#[allow(dead_code)]
-pub async fn connect_named_pipe(_name: &str, _token: &LocalToken) -> std::io::Result<LocalStream> {
-    Err(std::io::Error::new(
-        std::io::ErrorKind::Unsupported,
-        "NamedPipe is only supported on Windows",
-    ))
 }
 
 // ── Unix peer-uid check ───────────────────────────────────────────────────────
