@@ -735,12 +735,12 @@ uint64_t veil_media_open_relay_channel(VeilApp *app,
 
 #if defined(VEIL_FFI_NODE_EMBEDDED)
 /**
- * Enable/disable audio+RTCP batching on a RELAY media channel. Batched cells
- * amortize the relay path's per-datagram envelope+padding overhead. The host
- * flips this ON only after call signaling proves the remote understands
- * `MEDIA_BATCH_MAGIC` (protocol-version gate) — a batched cell is silent
- * noise to a legacy receiver. Returns 0 on success, -1 for an unknown or
- * non-relay channel.
+ * Enable/disable media batching on a direct or RELAY media channel. Direct
+ * batching amortizes sequential IPC writes; relay batching also amortizes the
+ * per-datagram envelope+padding overhead. The host flips this ON only after
+ * call signaling proves the remote understands `MEDIA_BATCH_MAGIC`
+ * (protocol-version gate) — a batched cell is silent noise to a legacy
+ * receiver. Returns 0 on success, -1 for an unknown/unsupported channel.
  */
  int veil_media_channel_set_batching(uint64_t chan, int on) ;
 #endif
