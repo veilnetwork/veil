@@ -1166,6 +1166,11 @@ where
     if local_mlkem_dk_seed.is_some() {
         caps.flags |= cap_flags::SUPPORTS_HYBRID_KEX;
     }
+    // The session crate implements an authenticated, bounded realtime lane on
+    // QUIC DATAGRAMs. Advertising support is transport-independent; the
+    // runtime additionally requires the selected transport to expose a
+    // negotiated DATAGRAM handle before enabling it.
+    caps.flags |= cap_flags::SUPPORTS_REALTIME_DATAGRAMS;
     let caps_bytes = caps.encode();
     let caps_wire =
         write_frame(stream, family, SessionMsg::Capabilities as u16, &caps_bytes).await?;

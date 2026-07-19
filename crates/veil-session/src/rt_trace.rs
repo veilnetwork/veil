@@ -1,4 +1,4 @@
-//! Slow-inbound-dispatch tracing for the call-RTT-spike investigation.
+//! Bounded session-pipeline tracing for the call-RTT-spike investigation.
 //!
 //! `DispatcherSink::dispatch` runs SYNCHRONOUSLY on the session task, in
 //! the same loop that reads frames off the wire — so every millisecond a
@@ -6,9 +6,12 @@
 //! behind it on the ordered stream, including REALTIME call media. The
 //! 2026-07-16 campaign eliminated the network, the relay session layer,
 //! mailbox drain, every outbound cap and the kernel send buffer; this
-//! trace exists to confirm (or refute) the one remaining suspect —
-//! inbound PROCESSING head-of-line on the session task — and to name the
-//! frame kinds responsible.
+//! Besides inbound read/dispatch, the same gate covers sparse outbound
+//! probes: slow socket writes and intervals where a queued REALTIME frame
+//! cannot enter the already-committed writer channel. This distinguishes
+//! priority-queue delay (still reorderable) from TCP/writer head-of-line
+//! delay (already beyond the scheduler) without adding timestamps to the
+//! protocol or inspecting application payloads.
 //!
 //! Off by default and free when off (one relaxed atomic load per frame,
 //! no `Instant::now`). Enable with `VEIL_RT_TRACE=1` in the environment

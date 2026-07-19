@@ -351,6 +351,12 @@ pub mod cap_flags {
     /// Legacy peers that don't set this bit fall through to the
     /// classical X25519-only path unchanged.
     pub const SUPPORTS_HYBRID_KEX: u8 = 1 << 3;
+    /// Peer understands the authenticated realtime side-channel carried in
+    /// QUIC DATAGRAMs.  The lane is enabled only when BOTH peers advertise
+    /// this bit and the selected transport negotiated DATAGRAM support.
+    /// Legacy peers leave the bit clear and continue to carry `AppRtData` on
+    /// the reliable ordered session stream.
+    pub const SUPPORTS_REALTIME_DATAGRAMS: u8 = 1 << 4;
 }
 
 // c: role_bits moved to veil-types alongside NodeRole.
@@ -461,6 +467,18 @@ impl CapabilitiesPayload {
     /// helper just covers the bit-flag side of the AND.
     pub fn hybrid_kex_negotiated(&self, peer: &CapabilitiesPayload) -> bool {
         self.supports_hybrid_kex() && peer.supports_hybrid_kex()
+    }
+
+    /// Does this peer understand the authenticated QUIC DATAGRAM realtime
+    /// lane?
+    pub fn supports_realtime_datagrams(&self) -> bool {
+        self.flags & cap_flags::SUPPORTS_REALTIME_DATAGRAMS != 0
+    }
+
+    /// Realtime DATAGRAM negotiation succeeds only when both peers advertise
+    /// support. Transport availability is checked separately by the runtime.
+    pub fn realtime_datagrams_negotiated(&self, peer: &CapabilitiesPayload) -> bool {
+        self.supports_realtime_datagrams() && peer.supports_realtime_datagrams()
     }
 }
 
@@ -2808,6 +2826,19 @@ mod tests {
         bob.flags |= cap_flags::SUPPORTS_HYBRID_KEX;
         assert!(alice.hybrid_kex_negotiated(&bob));
         assert!(bob.hybrid_kex_negotiated(&alice));
+    }
+
+    #[test]
+    fn realtime_datagram_negotiation_requires_both_sides() {
+        let mut alice = CapabilitiesPayload::from_node_role(veil_types::NodeRole::Leaf);
+        let mut bob = CapabilitiesPayload::from_node_role(veil_types::NodeRole::Leaf);
+        assert!(!alice.realtime_datagrams_negotiated(&bob));
+        alice.flags |= cap_flags::SUPPORTS_REALTIME_DATAGRAMS;
+        assert!(alice.supports_realtime_datagrams());
+        assert!(!alice.realtime_datagrams_negotiated(&bob));
+        bob.flags |= cap_flags::SUPPORTS_REALTIME_DATAGRAMS;
+        assert!(alice.realtime_datagrams_negotiated(&bob));
+        assert!(bob.realtime_datagrams_negotiated(&alice));
     }
 
     #[test]

@@ -31,6 +31,7 @@ pub mod outbound_batch_coalescer;
 pub mod outbox;
 pub mod pending_response_table;
 pub mod priority_queue;
+pub mod realtime_datagram;
 pub mod rekey_context;
 pub mod rekey_rx_grace_buffer;
 pub mod rendezvous;

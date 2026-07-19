@@ -13,7 +13,7 @@
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::hash::Hash;
-use std::sync::atomic::{AtomicU32, AtomicU64};
+use std::sync::atomic::{AtomicU16, AtomicU32, AtomicU64};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 use veil_cfg::NodeId;
@@ -61,6 +61,17 @@ pub mod pending_ack;
 pub mod routing;
 pub mod session;
 pub mod sink_impl;
+
+/// Relay-signaled request that needs asynchronous UDP mapping discovery and
+/// hole punching on the addressed node. The synchronous dispatcher only
+/// authenticates/routes the control frame; the node runtime owns sockets.
+#[derive(Debug, Clone)]
+pub struct NatPunchOffer {
+    pub request: veil_proto::control::NatProbeRequestPayload,
+    /// Immediate session peer from which the request arrived. The async reply
+    /// is sent back through this peer (coordinator or direct initiator).
+    pub reply_via_node_id: [u8; 32],
+}
 
 // ── build_own_host_candidates ────────────────────────────────────────────────
 //
@@ -999,6 +1010,17 @@ pub struct FrameDispatcher {
     // only on session open/close.
     pub peer_observed_addrs: Arc<RwLock<HashMap<NodeIdBytes, std::net::SocketAddr>>>,
 
+    /// Port of this node's active bounded UDP reflector, or zero when this
+    /// process is not serving one. The handshake snapshots it into an
+    /// authenticated service advertisement; the reflector task owns updates.
+    pub local_udp_reflector_port: Arc<AtomicU16>,
+
+    /// Reflector endpoints announced by currently authenticated direct peers.
+    /// The IP always comes from transport metadata, never from announcement
+    /// bytes; peers only control the UDP port on their own already-connected
+    /// host. Entries are removed with the owning session.
+    pub peer_udp_reflectors: Arc<RwLock<HashMap<NodeIdBytes, Vec<std::net::SocketAddr>>>>,
+
     /// Active relay tunnels: `session_token → (node_a, node_b)`.
     ///
     /// Inserted when core receives a `NatRelayRequest` from an authenticated
@@ -1025,6 +1047,10 @@ pub struct FrameDispatcher {
     #[allow(clippy::type_complexity)]
     pub nat_probe_waiters:
         Arc<Mutex<HashMap<u32, tokio::sync::oneshot::Sender<NatProbeReplyPayload>>>>,
+
+    /// Async handoff for token-bearing NAT probes addressed to this node.
+    /// `None` unless the runtime has at least one configured UDP reflector.
+    pub nat_punch_offer_tx: Arc<Mutex<Option<tokio::sync::mpsc::Sender<NatPunchOffer>>>>,
 
     /// scale-aware adaptive parameters, refreshed on
     /// every `reload` cycle from `estimate_network_size(routing_table_size
@@ -1851,8 +1877,11 @@ pub fn make_test_dispatcher(role: NodeRole) -> FrameDispatcher {
         recursive_reverse_path: Arc::new(Mutex::new(std::collections::HashMap::new())),
         alias_registry: Arc::new(Mutex::new(HashMap::new())),
         peer_observed_addrs: Arc::new(std::sync::RwLock::new(HashMap::new())),
+        local_udp_reflector_port: Arc::new(AtomicU16::new(0)),
+        peer_udp_reflectors: Arc::new(std::sync::RwLock::new(HashMap::new())),
         relay_tunnels: Arc::new(Mutex::new(HashMap::new())),
         nat_probe_waiters: Arc::new(Mutex::new(HashMap::new())),
+        nat_punch_offer_tx: Arc::new(Mutex::new(None)),
         adaptive_params: Arc::new(RwLock::new(veil_cfg::adaptive::AdaptiveParams::default())),
         max_gossip_hops: veil_cfg::RoutingConfig::default().max_gossip_hops,
         congestion_monitor: None,
@@ -2563,8 +2592,11 @@ mod tests {
             recursive_reverse_path: Arc::new(Mutex::new(std::collections::HashMap::new())),
             alias_registry: Arc::new(Mutex::new(HashMap::new())),
             peer_observed_addrs: Arc::new(std::sync::RwLock::new(HashMap::new())),
+            local_udp_reflector_port: Arc::new(AtomicU16::new(0)),
+            peer_udp_reflectors: Arc::new(std::sync::RwLock::new(HashMap::new())),
             relay_tunnels: Arc::new(Mutex::new(HashMap::new())),
             nat_probe_waiters: Arc::new(Mutex::new(HashMap::new())),
+            nat_punch_offer_tx: Arc::new(Mutex::new(None)),
             adaptive_params: Arc::new(RwLock::new(veil_cfg::adaptive::AdaptiveParams::default())),
             max_gossip_hops: veil_cfg::RoutingConfig::default().max_gossip_hops,
             congestion_monitor: None,
@@ -4860,6 +4892,7 @@ mod tests {
             initiator_node_id: initiator_id,
             target_node_id: [0u8; 32], // STUN-echo legacy
             session_token: 0xDEAD_BEEF,
+            punch_token: None,
             candidates: vec![NatCandidate {
                 atyp: 4,
                 candidate_type: candidate_type::HOST,
@@ -4910,6 +4943,7 @@ mod tests {
             initiator_node_id: peer_id,
             target_node_id: [0u8; 32],
             session_token: 0x1234,
+            punch_token: None,
             candidates: vec![NatCandidate {
                 atyp: 4,
                 candidate_type: candidate_type::HOST,
@@ -4935,6 +4969,23 @@ mod tests {
         assert_eq!(srflx.candidate_type, candidate_type::SRFLX);
         assert_eq!(srflx.addr, vec![203, 0, 113, 5]);
         assert_eq!(srflx.port, 12345);
+    }
+
+    #[test]
+    fn authenticated_reflector_announcement_uses_peer_ip_and_follows_session_lifecycle() {
+        let disp = make_test_dispatcher(NodeRole::Core);
+        let peer_id = [0xBC; 32];
+        let transport_addr = "203.0.113.9:5556".parse().unwrap();
+
+        let shared: std::net::SocketAddr = "8.8.8.8:39999".parse().unwrap();
+        disp.on_session_opened(peer_id, Some(transport_addr), Some(39_999), &[shared]);
+        assert_eq!(
+            wlock!(disp.peer_udp_reflectors).get(&peer_id).cloned(),
+            Some(vec!["203.0.113.9:39999".parse().unwrap(), shared,]),
+        );
+
+        disp.on_session_closed(peer_id.into(), false);
+        assert!(!wlock!(disp.peer_udp_reflectors).contains_key(&peer_id));
     }
 
     /// Core registers relay tunnel on `NatRelayRequest` and acks with `NatProbeReply`.
@@ -4996,6 +5047,7 @@ mod tests {
             responder_node_id: echo_peer_id,
             final_target_node_id: [0u8; 32],
             session_token: 0xABCD,
+            punch_token: None,
             candidates: vec![NatCandidate {
                 atyp: 4,
                 candidate_type: candidate_type::SRFLX,
@@ -5029,6 +5081,7 @@ mod tests {
             responder_node_id: [0xCCu8; 32],
             final_target_node_id: [0u8; 32],
             session_token: 0x1111,
+            punch_token: None,
             candidates: vec![NatCandidate {
                 atyp: 4,
                 candidate_type: candidate_type::HOST,
@@ -5087,6 +5140,7 @@ mod tests {
             initiator_node_id: initiator_id,
             target_node_id: local_id,
             session_token: 0xABCD_0001,
+            punch_token: Some([0x42; 16]),
             candidates: vec![NatCandidate {
                 atyp: 4,
                 candidate_type: candidate_type::HOST,
@@ -5132,6 +5186,162 @@ mod tests {
         );
     }
 
+    #[test]
+    fn token_nat_probe_is_handed_to_async_socket_worker() {
+        use veil_proto::control::NatProbeRequestPayload;
+
+        let mut disp = make_test_dispatcher(NodeRole::Core);
+        disp.local_node_id = [0xDD; 32];
+        let coordinator_id = [0xCC; 32];
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        *lock!(disp.nat_punch_offer_tx) = Some(tx);
+        let request = NatProbeRequestPayload {
+            initiator_node_id: [0xAA; 32],
+            target_node_id: disp.local_node_id,
+            session_token: 7,
+            punch_token: Some([0x42; 16]),
+            candidates: vec![],
+        };
+        let header = FrameHeader::new(
+            FrameFamily::Control as u8,
+            ControlMsg::NatProbeRequest as u16,
+        );
+        assert!(matches!(
+            disp.dispatch(&header, &request.encode(), coordinator_id),
+            DispatchResult::NoResponse
+        ));
+        let offer = rx.try_recv().expect("offer queued");
+        assert_eq!(offer.request, request);
+        assert_eq!(offer.reply_via_node_id, coordinator_id);
+    }
+
+    /// Exercise the complete state-free signaling route used before the UDP
+    /// sockets punch: initiator -> coordinator -> target async worker, then
+    /// target -> coordinator -> initiator waiter. Individual branch tests do
+    /// not catch mismatches between `reply_via_node_id`, `final_target_node_id`
+    /// and the waiter token, which would otherwise surface only on devices.
+    #[test]
+    fn token_nat_probe_roundtrips_through_coordinator_and_wakes_initiator() {
+        use crate::control::build_control_frame;
+        use veil_proto::{
+            codec::decode_header,
+            control::{NatCandidate, NatProbeReplyPayload, NatProbeRequestPayload, candidate_type},
+        };
+
+        let initiator_id = [0xAA; 32];
+        let target_id = [0xBB; 32];
+        let coordinator_id = [0xCC; 32];
+        let session_token = 0x1234_5678;
+        let punch_token = [0x42; 16];
+
+        let mut initiator = make_test_dispatcher(NodeRole::Leaf);
+        initiator.local_node_id = initiator_id;
+        let (waiter_tx, mut waiter_rx) = tokio::sync::oneshot::channel();
+        lock!(initiator.nat_probe_waiters).insert(session_token, waiter_tx);
+
+        let mut coordinator = make_test_dispatcher(NodeRole::Core);
+        coordinator.local_node_id = coordinator_id;
+        let coordinator_sessions = Arc::new(RwLock::new(veil_session::SessionTxRegistry::new()));
+        let mut to_target = coordinator_sessions.write().unwrap().register(target_id);
+        let mut to_initiator = coordinator_sessions.write().unwrap().register(initiator_id);
+        coordinator.session_tx_registry = Some(Arc::clone(&coordinator_sessions));
+
+        let mut target = make_test_dispatcher(NodeRole::Leaf);
+        target.local_node_id = target_id;
+        let target_sessions = Arc::new(RwLock::new(veil_session::SessionTxRegistry::new()));
+        let mut to_coordinator = target_sessions.write().unwrap().register(coordinator_id);
+        target.session_tx_registry = Some(Arc::clone(&target_sessions));
+        let (offer_tx, mut offer_rx) = tokio::sync::mpsc::channel(1);
+        *lock!(target.nat_punch_offer_tx) = Some(offer_tx);
+
+        let request = NatProbeRequestPayload {
+            initiator_node_id: initiator_id,
+            target_node_id: target_id,
+            session_token,
+            punch_token: Some(punch_token),
+            candidates: vec![NatCandidate {
+                atyp: 4,
+                candidate_type: candidate_type::SRFLX,
+                priority: 1_694_498_815,
+                addr: vec![8, 8, 8, 8],
+                port: 41000,
+            }],
+        };
+        let request_header = FrameHeader::new(
+            FrameFamily::Control as u8,
+            ControlMsg::NatProbeRequest as u16,
+        );
+        assert!(matches!(
+            coordinator.dispatch(&request_header, &request.encode(), initiator_id),
+            DispatchResult::NoResponse
+        ));
+
+        let (_, forwarded_request) = to_target.try_recv().expect("request forwarded to target");
+        let forwarded_header = decode_header(&forwarded_request[..HEADER_SIZE]).unwrap();
+        assert!(matches!(
+            target.dispatch(
+                &forwarded_header,
+                &forwarded_request[HEADER_SIZE..],
+                coordinator_id,
+            ),
+            DispatchResult::NoResponse
+        ));
+        let offer = offer_rx
+            .try_recv()
+            .expect("target async worker receives offer");
+        assert_eq!(offer.request, request);
+        assert_eq!(offer.reply_via_node_id, coordinator_id);
+
+        // Model the async socket worker after mapping discovery. Socket/punch/
+        // QUIC reuse is covered by veil-node-runtime's closed-loop test; this
+        // test pins the identity routing fields joining the two halves.
+        let reply = NatProbeReplyPayload {
+            responder_node_id: target_id,
+            final_target_node_id: initiator_id,
+            session_token,
+            punch_token: Some(punch_token),
+            candidates: vec![NatCandidate {
+                atyp: 4,
+                candidate_type: candidate_type::SRFLX,
+                priority: 1_694_498_815,
+                addr: vec![1, 1, 1, 1],
+                port: 42000,
+            }],
+        };
+        let reply_frame = build_control_frame(ControlMsg::NatProbeReply as u16, &reply.encode());
+        assert!(target_sessions.read().unwrap().send_to(
+            &coordinator_id,
+            veil_proto::priority::INTERACTIVE,
+            reply_frame,
+        ));
+
+        let (_, target_reply) = to_coordinator
+            .try_recv()
+            .expect("reply reaches coordinator");
+        let target_reply_header = decode_header(&target_reply[..HEADER_SIZE]).unwrap();
+        assert!(matches!(
+            coordinator.dispatch(
+                &target_reply_header,
+                &target_reply[HEADER_SIZE..],
+                target_id,
+            ),
+            DispatchResult::NoResponse
+        ));
+
+        let (_, relayed_reply) = to_initiator.try_recv().expect("reply relayed to initiator");
+        let relayed_reply_header = decode_header(&relayed_reply[..HEADER_SIZE]).unwrap();
+        assert!(matches!(
+            initiator.dispatch(
+                &relayed_reply_header,
+                &relayed_reply[HEADER_SIZE..],
+                coordinator_id,
+            ),
+            DispatchResult::NoResponse
+        ));
+        assert_eq!(waiter_rx.try_recv().expect("initiator waiter wakes"), reply);
+        assert!(!lock!(initiator.nat_probe_waiters).contains_key(&session_token));
+    }
+
     /// bug-fix follow-up: when a NatProbeReply arrives
     /// THROUGH a coordinator (peer_id!= reply.responder_node_id)
     /// the dispatcher MUST NOT update wildcard listen transports
@@ -5162,6 +5372,7 @@ mod tests {
             responder_node_id: responder_id,
             final_target_node_id: local_id,
             session_token: 0xABCD_0002,
+            punch_token: Some([0x42; 16]),
             candidates: vec![NatCandidate {
                 atyp: 4,
                 candidate_type: candidate_type::SRFLX,
@@ -5229,6 +5440,7 @@ mod tests {
                 initiator_node_id: attacker_id,
                 target_node_id: target_id,
                 session_token,
+                punch_token: None,
                 candidates: vec![NatCandidate {
                     atyp: 4,
                     candidate_type: candidate_type::HOST,
@@ -7105,8 +7317,7 @@ mod tests {
         assert_eq!(dispatcher.own_external_addrs_snapshot(), vec![a1, a2]);
         // Bounded: flooding distinct observations keeps only the newest.
         for i in 0..10u8 {
-            dispatcher
-                .record_own_external_addr(format!("198.51.100.{i}:2000").parse().unwrap());
+            dispatcher.record_own_external_addr(format!("198.51.100.{i}:2000").parse().unwrap());
         }
         let snap = dispatcher.own_external_addrs_snapshot();
         assert_eq!(snap.len(), FrameDispatcher::MAX_OWN_EXTERNAL_ADDRS);

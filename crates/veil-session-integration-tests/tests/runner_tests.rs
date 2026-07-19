@@ -283,6 +283,7 @@ async fn runner_ping_pong() {
     let logger = Arc::clone(&dispatcher.logger);
     let mut runner = SessionRunner {
         stream: Box::new(server),
+        quic_datagrams: None,
         peer_id: [1u8; 32],
         dispatcher,
         logger,
@@ -377,6 +378,7 @@ async fn runner_aead_encrypt_decrypt_round_trip() {
     let logger = Arc::clone(&dispatcher.logger);
     let mut runner = SessionRunner {
         stream: Box::new(server),
+        quic_datagrams: None,
         peer_id: [1u8; 32],
         dispatcher,
         logger,
@@ -541,6 +543,7 @@ async fn runner_rekey_grace_recovers_inflight_old_encrypted_frames() {
     let logger = Arc::clone(&dispatcher.logger);
     let mut runner = SessionRunner {
         stream: Box::new(server),
+        quic_datagrams: None,
         peer_id,
         dispatcher: veil_session::dispatcher_sink::arc_sink(&dispatcher),
         logger,
@@ -780,6 +783,7 @@ async fn runner_rekey_emits_observability_counters() {
 
     let mut runner = SessionRunner {
         stream: Box::new(server),
+        quic_datagrams: None,
         peer_id,
         dispatcher: veil_session::dispatcher_sink::arc_sink(&dispatcher),
         logger,
@@ -991,6 +995,7 @@ async fn runner_rekey_storm_triggers_cap_eviction_once_after_four_rekeys() {
 
     let mut runner = SessionRunner {
         stream: Box::new(server),
+        quic_datagrams: None,
         peer_id,
         dispatcher: veil_session::dispatcher_sink::arc_sink(&dispatcher),
         logger,
@@ -1312,6 +1317,7 @@ async fn phase650b_mutual_rekey_collision_kept_init_when_local_node_id_lower() {
 
     let mut runner = SessionRunner {
         stream: Box::new(server),
+        quic_datagrams: None,
         peer_id,
         dispatcher: veil_session::dispatcher_sink::arc_sink(&dispatcher),
         logger,
@@ -1624,6 +1630,7 @@ async fn phase650b_mutual_rekey_collision_aborted_init_when_local_node_id_higher
 
     let mut runner = SessionRunner {
         stream: Box::new(server),
+        quic_datagrams: None,
         peer_id,
         dispatcher: veil_session::dispatcher_sink::arc_sink(&dispatcher),
         logger,
@@ -1891,6 +1898,7 @@ async fn phase650b_rekey_state_survives_transport_swap() {
 
     let mut runner = SessionRunner {
         stream: Box::new(primary_server),
+        quic_datagrams: None,
         peer_id,
         dispatcher: veil_session::dispatcher_sink::arc_sink(&dispatcher),
         logger,
@@ -2163,6 +2171,7 @@ async fn phase650b_rekey_bypasses_low_battery_deferral_window() {
 
     let mut runner = SessionRunner {
         stream: Box::new(server),
+        quic_datagrams: None,
         peer_id,
         dispatcher: veil_session::dispatcher_sink::arc_sink(&dispatcher),
         logger,
@@ -2425,6 +2434,7 @@ async fn phase650b_rekey_state_survives_hot_standby_trigger_firing() {
 
     let mut runner = SessionRunner {
         stream: Box::new(primary_server),
+        quic_datagrams: None,
         peer_id,
         dispatcher: veil_session::dispatcher_sink::arc_sink(&dispatcher),
         logger,
@@ -2680,6 +2690,7 @@ async fn phase650b_idle_timeout_fires_during_awaiting_ack_when_peer_silent() {
 
     let mut runner = SessionRunner {
         stream: Box::new(server),
+        quic_datagrams: None,
         peer_id,
         dispatcher: veil_session::dispatcher_sink::arc_sink(&dispatcher),
         logger,
@@ -2837,6 +2848,7 @@ async fn runner_delivery_forward_relayed_to_next_hop() {
     let logger = Arc::clone(&dispatcher.logger);
     let mut runner = SessionRunner {
         stream: Box::new(server),
+        quic_datagrams: None,
         peer_id: origin_id,
         dispatcher,
         logger,
@@ -2950,6 +2962,7 @@ async fn idle_session_closed_after_timeout() {
     let logger = Arc::clone(&dispatcher.logger);
     let mut runner = SessionRunner {
         stream: Box::new(server),
+        quic_datagrams: None,
         peer_id: [3u8; 32],
         dispatcher,
         logger,
@@ -3031,6 +3044,7 @@ async fn runner_truncated_header_exits_cleanly() {
     let logger = Arc::clone(&dispatcher.logger);
     let mut runner = SessionRunner {
         stream: Box::new(server),
+        quic_datagrams: None,
         peer_id: [2u8; 32],
         dispatcher,
         logger,
@@ -3130,6 +3144,7 @@ async fn rekey_completes_and_subsequent_frames_decrypt() {
     let logger = Arc::clone(&dispatcher.logger);
     let mut responder = SessionRunner {
         stream: Box::new(server_stream),
+        quic_datagrams: None,
         peer_id: local_id,
         dispatcher: veil_session::dispatcher_sink::arc_sink(&dispatcher),
         logger: Arc::clone(&logger),
@@ -3312,6 +3327,7 @@ fn make_mlkem_runner(
     let logger = Arc::clone(&dispatcher.logger);
     SessionRunner {
         stream: Box::new(stream),
+        quic_datagrams: None,
         peer_id,
         dispatcher,
         logger,
@@ -3721,6 +3737,7 @@ fn make_swap_runner(
     let logger = Arc::clone(&dispatcher.logger);
     let mut runner = SessionRunner {
         stream: Box::new(server_stream),
+        quic_datagrams: None,
         peer_id: [1u8; 32],
         dispatcher,
         logger,
@@ -3879,6 +3896,7 @@ async fn swap_preserves_aead_counter_across_transports() {
     let logger = Arc::clone(&dispatcher.logger);
     let mut runner = SessionRunner {
         stream: Box::new(server_a),
+        quic_datagrams: None,
         peer_id: [1u8; 32],
         dispatcher,
         logger,
@@ -4021,6 +4039,7 @@ async fn handoff_init_stashes_registry_and_emits_ack() {
 
     let mut runner = SessionRunner {
         stream: Box::new(server),
+        quic_datagrams: None,
         peer_id,
         dispatcher,
         logger,
@@ -4153,6 +4172,7 @@ async fn handoff_ack_forwards_nonce_to_waiting_initiator() {
 
     let mut runner = SessionRunner {
         stream: Box::new(server),
+        quic_datagrams: None,
         peer_id: [0x77u8; 32],
         dispatcher,
         logger,
@@ -4249,6 +4269,7 @@ async fn handoff_init_with_malformed_body_is_a_violation() {
 
     let mut runner = SessionRunner {
         stream: Box::new(server),
+        quic_datagrams: None,
         peer_id: [0x66u8; 32],
         dispatcher,
         logger,
@@ -4389,6 +4410,7 @@ async fn end_to_end_handoff_pipeline_via_peek_and_dispatch() {
 
     let mut runner = SessionRunner {
         stream: Box::new(primary_server),
+        quic_datagrams: None,
         peer_id,
         dispatcher,
         logger,
@@ -4686,6 +4708,7 @@ async fn auto_trigger_fires_on_primary_write_error() {
 
     let mut runner = SessionRunner {
         stream: Box::new(WriteAlwaysFailsStream),
+        quic_datagrams: None,
         peer_id,
         dispatcher,
         logger,
@@ -4880,6 +4903,7 @@ async fn rx_stall_fires_proactive_trigger_before_idle_timeout() {
 
     let mut runner = SessionRunner {
         stream: Box::new(ReadsBlockForeverStream),
+        quic_datagrams: None,
         peer_id,
         dispatcher,
         logger,
@@ -5016,6 +5040,7 @@ async fn keepalive_probe_timeout_fires_trigger_when_no_ack() {
 
     let mut runner = SessionRunner {
         stream: Box::new(ReadsBlockForeverStream),
+        quic_datagrams: None,
         peer_id,
         dispatcher,
         logger,
@@ -5427,6 +5452,7 @@ async fn q7_rotation_deadline_fires_and_runner_returns_when_no_controller() {
 
     let runner = SessionRunner {
         stream: Box::new(server),
+        quic_datagrams: None,
         peer_id: [0x42u8; 32],
         dispatcher,
         logger,
@@ -5671,6 +5697,7 @@ fn make_migration_test_runner(
     let logger = Arc::clone(&dispatcher.logger);
     SessionRunner {
         stream: Box::new(server),
+        quic_datagrams: None,
         peer_id,
         dispatcher,
         logger,
