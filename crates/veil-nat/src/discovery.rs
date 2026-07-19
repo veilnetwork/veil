@@ -53,6 +53,7 @@ impl ExternalAddrDiscovery {
             initiator_node_id: local_node_id,
             target_node_id: [0u8; 32],
             session_token,
+            punch_token: None,
             candidates: vec![socket_addr_to_candidate(local_addr)],
         }
     }
@@ -145,6 +146,7 @@ mod tests {
             responder_node_id: [0x00u8; 32],
             final_target_node_id: [0u8; 32], // direct response
             session_token: token,
+            punch_token: None,
             candidates: vec![socket_addr_to_candidate(external)],
         };
 
@@ -169,6 +171,7 @@ mod tests {
             responder_node_id: [0u8; 32],
             final_target_node_id: [0u8; 32],
             session_token: 1,
+            punch_token: None,
             candidates: vec![],
         };
         assert!(ExternalAddrDiscovery::parse_reply(&reply).is_none());

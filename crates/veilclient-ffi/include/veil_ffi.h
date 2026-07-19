@@ -436,6 +436,29 @@ typedef struct VeilSovereignSigner VeilSovereignSigner;
  */
 typedef struct VeilStreamFfi VeilStreamFfi;
 
+#if defined(VEIL_FFI_NODE_EMBEDDED)
+/**
+ * Stable C snapshot returned by `veil_media_channel_get_stats`. All fields
+ * are cumulative channel-lifetime counters/maxima except `video_queue_depth`.
+ * Keep this plain-u64 layout in lockstep with Dart's FFI struct.
+ */
+typedef struct {
+  uint64_t video_frames_enqueued;
+  uint64_t video_frames_started;
+  uint64_t video_queue_depth;
+  uint64_t video_queue_max_depth;
+  uint64_t video_queue_age_max_ms;
+  uint64_t video_queue_holds_75ms;
+  uint64_t sender_lock_max_ms;
+  uint64_t sender_lock_holds_16ms;
+  uint64_t video_frame_ipc_max_ms;
+  uint64_t video_frame_ipc_holds_33ms;
+  uint64_t ipc_cell_max_ms;
+  uint64_t ipc_cell_holds_16ms;
+  uint64_t ipc_send_failures;
+} VeilMediaChannelStats;
+#endif
+
 /**
  * Recv callback signature — invoked from a tokio worker thread.
  *
@@ -673,6 +696,14 @@ uint64_t veil_media_open_relay_channel(VeilApp *app,
 
 #if defined(VEIL_FFI_NODE_EMBEDDED)
 /**
+ * Snapshot per-channel relay drain diagnostics. Direct/onion channels return
+ * a zeroed snapshot. Returns -1 for an invalid channel or null output.
+ */
+ int veil_media_channel_get_stats(uint64_t chan, VeilMediaChannelStats *out) ;
+#endif
+
+#if defined(VEIL_FFI_NODE_EMBEDDED)
+/**
  * Request a make-before-break anonymous route refresh for an open media
  * channel. This is deliberately separate from send success: an onion packet
  * can enter the first-hop queue successfully and still be black-holed farther
@@ -682,6 +713,36 @@ uint64_t veil_media_open_relay_channel(VeilApp *app,
  * channel.
  */
  int veil_media_repair_channel(uint64_t chan) ;
+#endif
+
+/**
+ * Runtime toggle for the slow-inbound-dispatch trace
+ * (`veil_session::rt_trace`) — the embedded-node twin of the
+ * `VEIL_RT_TRACE=1` environment gate on CLI deployments. Driven by the
+ * xVeil debug hook during live call-RTT investigations; slow dispatches
+ * surface in the node log as `session.rt_trace.slow_dispatch`. Free when
+ * off; always succeeds.
+ */
+ void veil_debug_set_rt_trace(int on) ;
+
+/**
+ * EXPERIMENT SWITCH (call-RTT-spike investigation): pause/resume the
+ * embedded node's periodic publish machinery (rendezvous-ad refresh, DHT
+ * republish fan-out). Mid-call measurement only — paused ads age toward
+ * their validity horizon; see `veil_session::rt_trace::set_publish_pause`.
+ */
+ void veil_debug_set_publish_pause(int on) ;
+
+#if defined(VEIL_FFI_NODE_EMBEDDED)
+/**
+ * Enable/disable audio+RTCP batching on a RELAY media channel. Batched cells
+ * amortize the relay path's per-datagram envelope+padding overhead. The host
+ * flips this ON only after call signaling proves the remote understands
+ * `MEDIA_BATCH_MAGIC` (protocol-version gate) — a batched cell is silent
+ * noise to a legacy receiver. Returns 0 on success, -1 for an unknown or
+ * non-relay channel.
+ */
+ int veil_media_channel_set_batching(uint64_t chan, int on) ;
 #endif
 
 #if defined(VEIL_FFI_NODE_EMBEDDED)
@@ -899,6 +960,25 @@ int veil_send(VeilApp *app,
               const uint8_t *data,
               size_t len,
               char **err_out)
+;
+
+/**
+ * Send a loss-tolerant datagram over an already-active direct peer session at
+ * REALTIME priority.
+ *
+ * Unlike [`veil_send`], this never performs route discovery and never falls
+ * back to a relay. `VEIL_ERR` therefore means there is no usable direct
+ * session (or the realtime queue rejected the frame); callers that require
+ * durability must retain their ordinary/mailbox fallback.
+ */
+
+int veil_send_realtime(VeilApp *app,
+                       const uint8_t *dst_node_id,
+                       const uint8_t *dst_app_id,
+                       uint32_t dst_endpoint_id,
+                       const uint8_t *data,
+                       size_t len,
+                       char **err_out)
 ;
 
 /**
@@ -1732,6 +1812,50 @@ int veil_join_bootstrap_uri(VeilHandle *handle,
                             uint8_t *out_status,
                             char **err_out)
 ;
+
+/**
+ * Query the daemon's P-Net/session status for a peer (P2P direct-session
+ * epic). `out_admitted` = 1 iff the node currently holds a live, handshaked
+ * direct session to `peer_node_id_32` — the same authoritative gate
+ * `veil_media_open_direct_channel` enforces, exposed so the host can (a) poll
+ * for a just-dialed direct session to come up and (b) decide p2p-vs-relay
+ * BEFORE committing a call route. `out_has_cert` = 1 iff a MembershipCert was
+ * verified for that peer at handshake (P-Net deployments; 0 in public mode).
+ *
+ * Bounded at 2 s (covers a busy shared-client mutex — same rationale as the
+ * media-open probe); a timeout returns `VEIL_ERR` with `err_out` set.
+ *
+ * # Safety
+ * `handle` must be a live connect handle; `peer_node_id_32` must point to 32
+ * readable bytes; `out_admitted`/`out_has_cert` must be writable; `err_out`
+ * (if non-null) must be a writable `*mut c_char` slot.
+ */
+
+int veil_peer_pnet_status(VeilHandle *handle,
+                          const uint8_t *peer_node_id_32,
+                          uint8_t *out_admitted,
+                          uint8_t *out_has_cert,
+                          char **err_out)
+;
+
+/**
+ * Snapshot the daemon's current listener URIs (real-P2P epic, Stage B).
+ * After a server-reflexive NAT probe the daemon rewrites wildcard listener
+ * hosts (`0.0.0.0`) to the observed external IP, so the host can mine this
+ * list for its own external `ip:port` candidates when minting
+ * direct-endpoint URIs. Output is a newline-joined UTF-8 string in a
+ * caller-owned heap allocation returned through `out_uris` — caller MUST
+ * free it via [`veil_free_string`]. An empty list yields an empty string.
+ *
+ * Bounded at 2 s (same rationale as the pnet-status probe); a timeout
+ * returns `VEIL_ERR` with `err_out` set.
+ *
+ * # Safety
+ * `handle` must be a live connect handle; `out_uris` must be a writable
+ * `*mut c_char` slot; `err_out` (if non-null) must be a writable
+ * `*mut c_char` slot.
+ */
+ int veil_listen_transports(VeilHandle *handle, char **out_uris, char **err_out) ;
 
 /**
  * Build a bootstrap-invite URI from the daemon's own identity and

@@ -30,7 +30,7 @@ use veil_observability::{NodeLogger, NodeMetrics};
 use veil_proto::{
     budget::{MLKEM_REKEY_BYTES_THRESHOLD, MLKEM_REKEY_TIME_THRESHOLD_SECS},
     codec::{decode_header, decode_header_with_limit, encode_header},
-    family::{ControlMsg, DiscoveryMsg, FrameFamily, SessionMsg},
+    family::{AppMsg, ControlMsg, DiscoveryMsg, FrameFamily, SessionMsg},
     header::FrameHeader,
     session::{MlKemRekeyEkPayload, RekeyPayload},
 };
@@ -181,6 +181,124 @@ async fn await_next_input(
         // on `await_next_input` waiting for input that never comes).
         _ = wire_tx.closed() => NextInput::WriterClosed,
     }
+}
+
+/// Session-scoped state for the independently encrypted, loss-tolerant media
+/// lane. It exists only after capability AND transport negotiation succeed.
+struct RealtimeDatagramLane {
+    handle: veil_transport::QuicDatagramHandle,
+    tx: crate::realtime_datagram::RealtimeDatagramTx,
+    max_datagram_size: usize,
+    logged_first_send: bool,
+    congestion_drops: u64,
+    last_congestion_log: std::time::Instant,
+}
+
+/// Tokio join handles detach when dropped; realtime receivers must instead be
+/// cancelled with their owning session so they cannot retain a QUIC connection
+/// or key material after stream close/hot-swap.
+struct RealtimeReceiverTask(tokio::task::JoinHandle<()>);
+
+impl Drop for RealtimeReceiverTask {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// Accept only one complete, fixed-header `AppRtData` frame. Datagram payloads
+/// cannot smuggle a second OVL1 frame or route another family around the
+/// ordered stream's normal parser.
+fn decode_realtime_lane_frame(frame: &[u8]) -> Option<(FrameHeader, &[u8])> {
+    use veil_proto::header::HEADER_SIZE;
+    if frame.len() < HEADER_SIZE || frame.len() > crate::realtime_datagram::MAX_REALTIME_FRAME {
+        return None;
+    }
+    let header = decode_header_with_limit(
+        &frame[..HEADER_SIZE],
+        crate::realtime_datagram::MAX_REALTIME_FRAME as u32,
+    )
+    .ok()?;
+    let expected_len = HEADER_SIZE.checked_add(header.body_len as usize)?;
+    if header.header_len as usize != HEADER_SIZE
+        || expected_len != frame.len()
+        || header.family != FrameFamily::App as u8
+        || header.msg_type != AppMsg::AppRtData as u16
+        || header.priority() != veil_proto::priority::REALTIME
+    {
+        return None;
+    }
+    Some((header, &frame[HEADER_SIZE..]))
+}
+
+fn spawn_realtime_receiver(
+    handle: veil_transport::QuicDatagramHandle,
+    mut rx: crate::realtime_datagram::RealtimeDatagramRx,
+    peer_id: NodeIdBytes,
+    dispatcher: Arc<dyn crate::dispatcher_sink::DispatcherSink>,
+    logger: Arc<NodeLogger>,
+    metrics: Option<Arc<NodeMetrics>>,
+    ban_list: Arc<Mutex<BanList>>,
+    violation_tracker: Arc<Mutex<ViolationTracker>>,
+) -> RealtimeReceiverTask {
+    RealtimeReceiverTask(tokio::spawn(async move {
+        let mut logged_first_receive = false;
+        loop {
+            let datagram = match handle.recv().await {
+                Ok(datagram) => datagram,
+                Err(error) => {
+                    logger.debug(
+                        "session.realtime_datagram.receiver_closed",
+                        format!("peer_id={} error={error}", hex_short(&peer_id)),
+                    );
+                    return;
+                }
+            };
+            if let Some(m) = &metrics {
+                m.add_transport_bytes_rx(datagram.len() as u64);
+            }
+            let frame = match rx.decode_datagram(&datagram, std::time::Instant::now()) {
+                Ok(Some(frame)) => frame,
+                Ok(None) | Err(_) => continue,
+            };
+            let Some((header, body)) = decode_realtime_lane_frame(&frame) else {
+                // Authenticated but not an exact AppRtData frame. Keep the
+                // lane lossy: discard this message without tearing down the
+                // reliable session or letting it bypass the normal parser.
+                continue;
+            };
+            if !logged_first_receive {
+                logged_first_receive = true;
+                logger.info(
+                    "session.realtime_datagram.first_receive",
+                    format!("peer_id={} frame_len={}", hex_short(&peer_id), frame.len()),
+                );
+            }
+            match dispatcher.dispatch(&header, body, peer_id) {
+                DispatchResult::NoResponse | DispatchResult::RateLimited => {}
+                DispatchResult::Violation(reason) => {
+                    logger.warn(
+                        "session.realtime_datagram.violation",
+                        format!("peer_id={} reason={reason}", hex_short(&peer_id)),
+                    );
+                    let mut bans = lock!(ban_list);
+                    let mut tracker = lock!(violation_tracker);
+                    tracker.record_with_log(
+                        peer_id,
+                        &mut bans,
+                        &*logger as &dyn veil_abuse::AbuseLogger,
+                    );
+                }
+                DispatchResult::Response(_)
+                | DispatchResult::NotHandled
+                | DispatchResult::SolvePow(_) => {
+                    logger.warn(
+                        "session.realtime_datagram.unexpected_dispatch_result",
+                        format!("peer_id={}", hex_short(&peer_id)),
+                    );
+                }
+            }
+        }
+    }))
 }
 
 // ── SessionRunner ─────────────────────────────────────────────────────────────
@@ -398,6 +516,10 @@ pub struct MobileConfig {
 /// Drives the post-handshake OVL1 message loop for one session.
 pub struct SessionRunner {
     pub stream: BoxIoStream,
+    /// QUIC DATAGRAM handle cloned from the same connection as `stream`.
+    /// The runner uses it only for authenticated AppRtData; other transports
+    /// and hot-swapped streams keep the established ordered fallback.
+    pub quic_datagrams: Option<veil_transport::QuicDatagramHandle>,
     pub peer_id: NodeIdBytes,
     pub dispatcher: Arc<dyn crate::dispatcher_sink::DispatcherSink>,
     pub logger: Arc<NodeLogger>,
@@ -609,8 +731,23 @@ async fn writer_task(
 ) {
     while let Some(bytes) = wire_rx.recv().await {
         let wire_len = bytes.len();
+        let trace_started = crate::rt_trace::rt_trace_enabled().then(std::time::Instant::now);
+        let queued_behind = wire_rx.len();
         match tokio::time::timeout(WRITE_PROGRESS_TIMEOUT, write_half.write_all(&bytes)).await {
-            Ok(Ok(())) => {}
+            Ok(Ok(())) => {
+                if let Some(started) = trace_started {
+                    let elapsed = started.elapsed();
+                    if elapsed.as_millis() >= crate::rt_trace::SLOW_DISPATCH_MS {
+                        logger.info(
+                            "session.rt_trace.slow_wire_write",
+                            format!(
+                                "peer_id={peer_id_short} len={wire_len} elapsed_ms={} queued_behind={queued_behind}",
+                                elapsed.as_millis(),
+                            ),
+                        );
+                    }
+                }
+            }
             Ok(Err(e)) => {
                 // Underlying write failed — peer FIN, RST, etc. Exit.
                 logger.warn(
@@ -2808,6 +2945,49 @@ impl SessionRunner {
         let mut rpc_outbox = self.rpc_outbox.take();
         // hot-standby swap inbox, taken out for the same reason.
         let mut swap_rx = self.hot_standby.swap_rx.take();
+        // Capability filtering happened in node-runtime before the handle was
+        // attached. Raw direction keys are required because the ordered
+        // session cipher's implicit nonce counter cannot safely be shared with
+        // an unordered/lossy transport.
+        let mut realtime_receiver_task = None;
+        let mut realtime_lane = match (self.quic_datagrams.take(), self.raw_session_keys.as_ref()) {
+            (Some(handle), Some((raw_tx_key, raw_rx_key, session_id))) => handle
+                .max_size()
+                // 24-byte lane header + 16-byte Poly1305 tag + ≥1 payload.
+                .filter(|size| *size > 40)
+                .map(|max_datagram_size| {
+                    let rx =
+                        crate::realtime_datagram::RealtimeDatagramRx::new(raw_rx_key, session_id);
+                    realtime_receiver_task = Some(spawn_realtime_receiver(
+                        handle.clone(),
+                        rx,
+                        self.peer_id,
+                        Arc::clone(&self.dispatcher),
+                        Arc::clone(&self.logger),
+                        self.metrics.clone(),
+                        Arc::clone(&self.ban_list),
+                        Arc::clone(&self.violation_tracker),
+                    ));
+                    self.logger.info(
+                        "session.realtime_datagram.enabled",
+                        format!(
+                            "peer_id={} max_datagram_size={max_datagram_size}",
+                            hex_short(&self.peer_id),
+                        ),
+                    );
+                    RealtimeDatagramLane {
+                        handle,
+                        tx: crate::realtime_datagram::RealtimeDatagramTx::new(
+                            raw_tx_key, session_id,
+                        ),
+                        max_datagram_size,
+                        logged_first_send: false,
+                        congestion_drops: 0,
+                        last_congestion_log: std::time::Instant::now(),
+                    }
+                }),
+            _ => None,
+        };
 
         // ── b: reader/writer split ─────────────────────────────────
         // Architectural fix for the symmetric `write_all` deadlock (testnet
@@ -2986,6 +3166,12 @@ impl SessionRunner {
         let mut outbound_coalescer = crate::outbound_batch_coalescer::OutboundBatchCoalescer::new(
             tokio::time::Instant::now(),
         );
+        // Debug-only stopwatch for REALTIME frames waiting behind bytes that
+        // have already crossed from the priority queue into the FIFO writer
+        // channel. Keeping it here (rather than stamping frames on wire)
+        // preserves the protocol and payload privacy while measuring the exact
+        // scheduler boundary implicated by relay-video pauses.
+        let mut realtime_writer_blocked_since: Option<std::time::Instant> = None;
 
         // connection-rotation deadline. Computed once
         // at session start from the global SESSION_MAX_AGE_SECS
@@ -3212,6 +3398,162 @@ impl SessionRunner {
                 self.maybe_initiate_x25519_rekey(&mut rekey, &mut pq);
                 self.maybe_initiate_mlkem_rekey(&mut mlkem_rekey, &mut pq);
                 // ── Step 2: flush priority queue to the wire ─────────────────
+                // AppRtData gets first refusal on QUIC's independent unreliable
+                // lane. This runs BEFORE the ordered writer-capacity gate, so a
+                // queued chat/control/bulk frame cannot head-of-line block a
+                // newer video frame. Any failure restores the complete frame at
+                // the queue head for the existing reliable stream fallback.
+                let mut datagram_drained = 0usize;
+                let mut disable_realtime_sender = false;
+                if let Some(lane) = realtime_lane.as_mut() {
+                    for _ in 0..PQ_DRAIN_FRAMES_PER_PASS {
+                        let Some(outgoing) =
+                            pq.pop_realtime_if(|frame| decode_realtime_lane_frame(frame).is_some())
+                        else {
+                            break;
+                        };
+                        let datagrams =
+                            match lane.tx.encode_frame(&outgoing, lane.max_datagram_size) {
+                                Ok(datagrams) => datagrams,
+                                Err(error) => {
+                                    self.logger.debug(
+                                        "session.realtime_datagram.encode_fallback",
+                                        format!(
+                                            "peer_id={} frame_len={} error={error}",
+                                            hex_short(&self.peer_id),
+                                            outgoing.len(),
+                                        ),
+                                    );
+                                    pq.push_realtime_front(outgoing);
+                                    break;
+                                }
+                            };
+                        let planned_wire_len = datagrams.iter().map(Vec::len).sum::<usize>();
+                        if !self.dispatcher.allow_outbound_bandwidth(planned_wire_len) {
+                            datagram_drained += 1;
+                            continue;
+                        }
+                        self.dispatcher.capture_outbound(self.peer_id, &outgoing);
+                        let mut sent_wire_len = 0usize;
+                        let mut send_error = None;
+                        for datagram in &datagrams {
+                            if lane.handle.send_buffer_space() < datagram.len() {
+                                lane.congestion_drops = lane.congestion_drops.saturating_add(1);
+                                if lane.last_congestion_log.elapsed()
+                                    >= std::time::Duration::from_secs(1)
+                                {
+                                    self.logger.debug(
+                                        "session.realtime_datagram.stale_dropped",
+                                        format!(
+                                            "peer_id={} drops={} queue_cap_bytes={}",
+                                            hex_short(&self.peer_id),
+                                            lane.congestion_drops,
+                                            veil_transport::REALTIME_DATAGRAM_BUFFER_BYTES,
+                                        ),
+                                    );
+                                    lane.congestion_drops = 0;
+                                    lane.last_congestion_log = std::time::Instant::now();
+                                }
+                            }
+                            match lane.handle.send(datagram) {
+                                Ok(()) => sent_wire_len += datagram.len(),
+                                Err(error) => {
+                                    send_error = Some(error);
+                                    break;
+                                }
+                            }
+                        }
+                        if sent_wire_len > 0 {
+                            let sent = sent_wire_len as u64;
+                            if let Some(m) = &self.metrics {
+                                m.add_transport_bytes_tx(sent);
+                            }
+                            rekey.record_bytes(sent);
+                            mlkem_rekey.record_bytes(sent);
+                        }
+                        if let Some(error) = send_error {
+                            if matches!(error, veil_transport::QuicDatagramSendError::TooLarge) {
+                                let previous = lane.max_datagram_size;
+                                if let Some(current) =
+                                    lane.handle.max_size().filter(|size| *size > 40)
+                                {
+                                    lane.max_datagram_size = current;
+                                    self.logger.debug(
+                                        "session.realtime_datagram.mtu_refresh_drop",
+                                        format!(
+                                            "peer_id={} previous={} current={} sent_fragments_bytes={}",
+                                            hex_short(&self.peer_id),
+                                            previous,
+                                            current,
+                                            sent_wire_len,
+                                        ),
+                                    );
+                                    // This frame may already be partially sent. It is
+                                    // loss-tolerant, so discard it and encode the next
+                                    // frame against the refreshed path ceiling instead
+                                    // of duplicating it on the ordered stream.
+                                    datagram_drained += 1;
+                                    continue;
+                                }
+                            }
+                            self.logger.debug(
+                                "session.realtime_datagram.send_fallback",
+                                format!(
+                                    "peer_id={} sent_fragments_bytes={} error={error}",
+                                    hex_short(&self.peer_id),
+                                    sent_wire_len,
+                                ),
+                            );
+                            pq.push_realtime_front(outgoing);
+                            // Quinn's non-blocking send only errors for a lost
+                            // connection, disabled/unsupported DATAGRAMs, or a
+                            // path-MTU shrink. Stop retrying every media frame;
+                            // the independent receiver stays alive so the peer's
+                            // opposite direction is not black-holed.
+                            disable_realtime_sender = true;
+                            break;
+                        }
+                        if !lane.logged_first_send {
+                            lane.logged_first_send = true;
+                            self.logger.info(
+                                "session.realtime_datagram.first_send",
+                                format!(
+                                    "peer_id={} fragments={} wire_bytes={sent_wire_len}",
+                                    hex_short(&self.peer_id),
+                                    datagrams.len(),
+                                ),
+                            );
+                        }
+                        datagram_drained += 1;
+                    }
+                }
+                if disable_realtime_sender {
+                    realtime_lane = None;
+                }
+                if crate::rt_trace::rt_trace_enabled() {
+                    let realtime_blocked = pq.peek_priority()
+                        == Some(veil_proto::priority::REALTIME)
+                        && wire_tx.capacity() == 0;
+                    if realtime_blocked {
+                        realtime_writer_blocked_since.get_or_insert_with(std::time::Instant::now);
+                    } else if let Some(started) = realtime_writer_blocked_since.take() {
+                        let elapsed = started.elapsed();
+                        if elapsed.as_millis() >= crate::rt_trace::SLOW_DISPATCH_MS {
+                            self.logger.info(
+                                "session.rt_trace.realtime_writer_blocked",
+                                format!(
+                                    "peer_id={} elapsed_ms={} pq_depth={} writer_capacity={}",
+                                    hex_short(&self.peer_id),
+                                    elapsed.as_millis(),
+                                    pq.len(),
+                                    wire_tx.capacity(),
+                                ),
+                            );
+                        }
+                    }
+                } else {
+                    realtime_writer_blocked_since = None;
+                }
                 // cap drained frames per pass so a deep pq doesn't
                 // starve the read step (every iteration through this pass blocks
                 // socket reads for the duration; if pq.len > 1000 that's
@@ -3236,7 +3578,7 @@ impl SessionRunner {
                 );
                 let coalesce_until =
                     outbound_coalescer.coalesce_deadline(coalesce_window, pq.peek_priority());
-                let mut drained_this_pass = 0usize;
+                let mut drained_this_pass = datagram_drained;
                 // Encrypt several already-queued OVL1 frames back-to-back and
                 // add ONE padding frame for the whole group. Small circuit-data
                 // frames are ~420 B on this layer, so this packs 3 into the
@@ -3390,6 +3732,12 @@ impl SessionRunner {
                         continue;
                     }
                     NextInput::SwapStream(new_stream) => {
+                        // The replacement API carries only a byte stream, not
+                        // a handle to its QUIC connection. Stop using the old
+                        // connection's datagram plane immediately; queued media
+                        // continues through the ordered fallback.
+                        realtime_lane = None;
+                        drop(realtime_receiver_task.take());
                         // Tear-down + re-spawn lifecycle is mechanical;
                         // rebind locals from the tuple result, reset
                         // timer + trigger, continue.
@@ -3872,8 +4220,7 @@ impl SessionRunner {
             // on the ordered stream — including REALTIME call media. The
             // rt_trace probe names slow handlers on a live stand (the
             // call-RTT-spike investigation); off = one relaxed load.
-            let rt_trace_t0 = crate::rt_trace::rt_trace_enabled()
-                .then(std::time::Instant::now);
+            let rt_trace_t0 = crate::rt_trace::rt_trace_enabled().then(std::time::Instant::now);
             let rt_trace_body_len = body.len();
             let result = self.dispatcher.dispatch(&header, body, self.peer_id);
             if let Some(t0) = rt_trace_t0 {
@@ -4328,6 +4675,41 @@ mod m1_empty_frame_aead_tests {
         assert_eq!(opened[3].0, FrameFamily::Session as u8);
         assert_eq!(opened[3].1, SessionMsg::Padding as u16);
         set_padding_enabled(padding_was_enabled);
+    }
+}
+
+#[cfg(test)]
+mod realtime_lane_frame_tests {
+    use super::*;
+
+    fn frame(family: FrameFamily, msg_type: u16, body: &[u8]) -> Vec<u8> {
+        let mut header = FrameHeader::new(family as u8, msg_type);
+        header.body_len = body.len() as u32;
+        let mut encoded = encode_header(&header).to_vec();
+        encoded.extend_from_slice(body);
+        encoded
+    }
+
+    #[test]
+    fn accepts_one_exact_realtime_app_frame() {
+        let encoded = frame(FrameFamily::App, AppMsg::AppRtData as u16, b"media");
+        let (header, body) = decode_realtime_lane_frame(&encoded).unwrap();
+        assert_eq!(header.msg_type, AppMsg::AppRtData as u16);
+        assert_eq!(body, b"media");
+    }
+
+    #[test]
+    fn rejects_other_families_trailing_frames_and_non_realtime_flags() {
+        let control = frame(FrameFamily::Control, ControlMsg::Keepalive as u16, b"");
+        assert!(decode_realtime_lane_frame(&control).is_none());
+
+        let mut two = frame(FrameFamily::App, AppMsg::AppRtData as u16, b"one");
+        two.extend_from_slice(&frame(FrameFamily::App, AppMsg::AppRtData as u16, b"two"));
+        assert!(decode_realtime_lane_frame(&two).is_none());
+
+        let mut header = FrameHeader::new(FrameFamily::App as u8, AppMsg::AppRtData as u16);
+        header.flags = veil_proto::priority::INTERACTIVE as u16;
+        assert!(decode_realtime_lane_frame(&encode_header(&header)).is_none());
     }
 }
 

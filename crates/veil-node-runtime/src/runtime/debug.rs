@@ -11,6 +11,30 @@ use veil_util::lock;
 use super::{NodeRuntime, Result};
 
 impl NodeRuntime {
+    /// Test/simulation bridge for the production token-bearing signaling
+    /// path. Unlike `attempt_nat_traversal_via`, this supplies the one-time
+    /// token that makes the target hand the request to its asynchronous UDP
+    /// punch responder. Real callers enter through
+    /// `nat_fallback_dial`/`udp_hole_punch_dial` and generate the token there.
+    pub async fn debug_attempt_nat_traversal_via_with_punch_token(
+        &self,
+        target_node_id: [u8; 32],
+        coordinator_node_id: [u8; 32],
+        local_candidates: Vec<veil_proto::control::NatCandidate>,
+        timeout: std::time::Duration,
+        punch_token: [u8; 16],
+    ) -> Option<veil_proto::control::NatProbeReplyPayload> {
+        self.access()
+            .attempt_nat_traversal_via_with_punch_token(
+                target_node_id,
+                coordinator_node_id,
+                local_candidates,
+                timeout,
+                Some(punch_token),
+            )
+            .await
+    }
+
     /// (test-only): force immediate publish of this node's
     /// signed relay-directory entry to the local DHT, bypassing the
     /// 60-second maintenance-tick scheduler. Returns `Ok(true)` when

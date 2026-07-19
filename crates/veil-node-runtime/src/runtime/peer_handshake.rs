@@ -22,7 +22,7 @@
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
-use veil_util::{lock, wlock};
+use veil_util::{lock, rlock, wlock};
 
 use tokio::io::AsyncWriteExt;
 
@@ -55,6 +55,15 @@ pub struct RemoteHandshakeInfo {
     /// Peer's last-known DHT discoverability preference extracted from
     /// `CapabilitiesPayload.discovery_mode`.
     pub remote_discovery_mode: DiscoveryMode,
+    /// Peer explicitly advertised the authenticated realtime DATAGRAM lane.
+    /// False on legacy and fast-resumed handshakes.
+    pub supports_realtime_datagrams: bool,
+    /// Bounded UDP reflector port advertised by this authenticated peer.
+    /// The runtime combines it with transport metadata only after all session
+    /// admission gates pass.
+    pub udp_reflector_port: Option<u16>,
+    /// Public endpoints this peer relayed from other authenticated peers.
+    pub shared_udp_reflectors: Vec<std::net::SocketAddr>,
 }
 
 /// Per-peer identity invariants asserted by outbound dialers — the peer
@@ -358,6 +367,10 @@ pub async fn register_connection_session(
         format!("link_id={} source={}", link_id, source),
     );
 
+    // Clone QUIC's DATAGRAM side channel before consuming the transport into
+    // its primary byte stream. Non-QUIC transports return None and preserve
+    // the ordered-stream-only behavior exactly.
+    let quic_datagrams = connection.quic_datagrams();
     let mut stream = match connection.into_stream() {
         Ok(stream) => stream,
         Err(err) => {
@@ -453,14 +466,27 @@ pub async fn register_connection_session(
         // Outbound: replay any stored ticket for this peer (the initiator mints
         // its own nonce internally). Inbound: offer the issuer so a presented
         // ticket can be verified (the responder mints + returns its nonce).
+        // Fast resumption predates per-session capability persistence and
+        // therefore synthesizes `remote_capabilities.flags = 0`. On QUIC that
+        // would permanently hide the newly negotiated realtime DATAGRAM lane
+        // after the first reconnect. Force the ordinary authenticated
+        // capabilities exchange whenever this transport exposes DATAGRAMs;
+        // TCP/obfs4/TLS keep their existing 1-RTT fast path unchanged. A future
+        // versioned ticket can carry capability flags and remove this gate.
+        let allow_fast_resumption = quic_datagrams.is_none();
         let (resume_ticket, ticket_verifier) = match source {
             SessionSource::Outbound(_) => {
-                let ticket = known_remote_id
-                    .and_then(|id| lock!(runtime.resumption.peer_tickets).get(&id).cloned());
+                let ticket = allow_fast_resumption
+                    .then(|| {
+                        known_remote_id
+                            .and_then(|id| lock!(runtime.resumption.peer_tickets).get(&id).cloned())
+                    })
+                    .flatten();
                 (ticket, None)
             }
             SessionSource::Inbound(_) => {
-                let verifier = Some(Arc::clone(&runtime.resumption.ticket_issuer));
+                let verifier =
+                    allow_fast_resumption.then(|| Arc::clone(&runtime.resumption.ticket_issuer));
                 (None, verifier)
             }
         };
@@ -477,7 +503,7 @@ pub async fn register_connection_session(
                 .unwrap_or(0),
             local_mlkem_dk_seed: None,
         });
-        let local_advertised_transports: Vec<String> = {
+        let listener_advertisements: Vec<String> = {
             let state = lock_state(&runtime.state);
             state
                 .listens
@@ -497,6 +523,39 @@ pub async fn register_connection_session(
                 })
                 .collect()
         };
+        let mut local_advertised_transports = Vec::with_capacity(8);
+        let local_reflector_port = runtime
+            .dispatcher
+            .local_udp_reflector_port
+            .load(std::sync::atomic::Ordering::Acquire);
+        if let Some(advertisement) = veil_nat::udp_reflector_advertisement(local_reflector_port) {
+            // The ATTACH transport list is capped at eight entries. Put the
+            // service advertisement first so a many-listener Core cannot
+            // accidentally trim it; TransportUri parsing deliberately skips
+            // this reserved non-dial scheme in hot-standby selection.
+            local_advertised_transports.push(advertisement);
+        }
+        // Share a small, de-duplicated sample learned from our other live
+        // peers. This lets a reflector-only Core reach clients through their
+        // normal bootstrap Core without putting its address in a seed bundle.
+        // Only numeric public endpoints can be serialized by the helper.
+        for endpoint in rlock!(runtime.dispatcher.peer_udp_reflectors)
+            .values()
+            .flatten()
+            .copied()
+        {
+            let Some(advertisement) = veil_nat::udp_reflector_endpoint_advertisement(endpoint)
+            else {
+                continue;
+            };
+            if !local_advertised_transports.contains(&advertisement) {
+                local_advertised_transports.push(advertisement);
+            }
+            if local_advertised_transports.len() == 4 {
+                break;
+            }
+        }
+        local_advertised_transports.extend(listener_advertisements);
         let discovery_mode = runtime.dispatcher.discovery_mode;
         let anonymity_relay_capable = runtime.anonymity.relay_capable;
         let ban_list_arc = Arc::clone(&runtime.dispatcher.abuse.ban_list);
@@ -574,6 +633,27 @@ pub async fn register_connection_session(
                 }
                 let pending_session_entry = cache_peer_handshake_state(&runtime, &r, &transport);
                 let remote_discovery_mode = r.remote_capabilities.parse_discovery_mode();
+                let mut udp_reflector_port = None;
+                let mut shared_udp_reflectors = Vec::with_capacity(4);
+                for advertisement in r
+                    .remote_advertised_transports
+                    .iter()
+                    .filter_map(|value| veil_nat::parse_udp_reflector_advertisement(value))
+                {
+                    match advertisement {
+                        veil_nat::UdpReflectorAdvertisement::PeerPort(port) => {
+                            udp_reflector_port.get_or_insert(port);
+                        }
+                        veil_nat::UdpReflectorAdvertisement::Endpoint(endpoint) => {
+                            if !shared_udp_reflectors.contains(&endpoint) {
+                                shared_udp_reflectors.push(endpoint);
+                            }
+                            if shared_udp_reflectors.len() == 4 {
+                                break;
+                            }
+                        }
+                    }
+                }
                 (
                     RemoteHandshakeInfo {
                         node_id: r.node_id,
@@ -581,6 +661,11 @@ pub async fn register_connection_session(
                         nonce: r.nonce,
                         session_keys: r.session_keys,
                         remote_discovery_mode,
+                        supports_realtime_datagrams: r
+                            .remote_capabilities
+                            .supports_realtime_datagrams(),
+                        udp_reflector_port,
+                        shared_udp_reflectors,
                     },
                     pending_session_entry,
                 )
@@ -979,10 +1064,16 @@ pub async fn register_connection_session(
         link_id,
         source,
         stream,
+        // Never send media into a side channel an older peer does not read.
+        // Fast-resumed handshakes currently synthesize zero capabilities, so
+        // they also preserve the ordered-stream fallback conservatively.
+        quic_datagrams: quic_datagrams.filter(|_| remote_identity.supports_realtime_datagrams),
         metrics: runtime.metrics.clone(),
         peer_id: remote_identity.node_id,
         session_keys: remote_identity.session_keys,
         observed_addr: peer.remote_addr,
+        udp_reflector_port: remote_identity.udp_reflector_port,
+        shared_udp_reflectors: remote_identity.shared_udp_reflectors,
         public_key: remote_identity.public_key,
         nonce: remote_identity.nonce,
         remote_discovery_mode: remote_identity.remote_discovery_mode,

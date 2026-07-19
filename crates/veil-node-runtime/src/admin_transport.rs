@@ -279,16 +279,6 @@ pub async fn connect_unix(path: &Path) -> Result<AdminStream> {
     Ok(AdminStream(local_transport::connect_unix(path).await?))
 }
 
-/// Non-Unix stub. Returns [`NodeError::Unsupported`] for clean failure on
-/// platforms without Unix sockets.
-#[cfg(not(unix))]
-#[allow(dead_code)]
-pub fn bind_unix(_path: &Path) -> Result<AdminListener> {
-    Err(NodeError::Unsupported(
-        "Unix domain sockets are not supported on this platform".to_owned(),
-    ))
-}
-
 /// Non-Unix stub — see [`bind_unix`].
 #[cfg(not(unix))]
 pub async fn connect_unix(_path: &Path) -> Result<AdminStream> {

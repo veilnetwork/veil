@@ -19,8 +19,7 @@ use crate::handlers::mobile::{
 };
 use crate::handlers::outbox::{handle_outbox_ack, handle_outbox_find_missing, handle_outbox_put};
 use crate::handlers::queries::{
-    handle_get_mobile_status, handle_get_node_identity, handle_get_peers,
-    handle_join_bootstrap_uri,
+    handle_get_mobile_status, handle_get_node_identity, handle_get_peers, handle_join_bootstrap_uri,
 };
 use crate::handlers::send::{IpcSendContext, handle_ipc_send, handle_rt_send};
 use crate::handlers::stream::handle_stream_open;
@@ -215,14 +214,8 @@ where
         Ok(())
     } else {
         let body = job.await;
-        crate::frame_io::write_frame_wh_id(
-            wh,
-            FrameFamily::LocalApp as u8,
-            msg_type,
-            req_id,
-            &body,
-        )
-        .await
+        crate::frame_io::write_frame_wh_id(wh, FrameFamily::LocalApp as u8, msg_type, req_id, &body)
+            .await
     }
 }
 

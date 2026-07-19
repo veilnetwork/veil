@@ -39,7 +39,7 @@
 
 use rand_core::{OsRng, RngCore};
 
-use veil_bufpool::PooledShared;
+use veil_bufpool::{BufferPool, PooledShared};
 use veil_proto::{
     SessionMsg,
     codec::encode_header,
@@ -64,11 +64,15 @@ pub const MAX_COVER_BODY_LEN: usize = 32;
 /// `veil-bufpool` so steady-state cover emission rides the cached
 /// bucket with zero allocator traffic after warmup.
 pub fn build_cover_frame() -> PooledShared {
+    build_cover_frame_with_pool(veil_bufpool::global())
+}
+
+fn build_cover_frame_with_pool(pool: &BufferPool) -> PooledShared {
     let inner_len = MIN_COVER_BODY_LEN
         + (OsRng.next_u32() as usize % (MAX_COVER_BODY_LEN - MIN_COVER_BODY_LEN + 1));
 
     let frame_len = HEADER_SIZE + inner_len;
-    let mut pooled = veil_bufpool::global().acquire(frame_len);
+    let mut pooled = pool.acquire(frame_len);
     let buf = pooled.as_vec_mut();
     debug_assert!(buf.is_empty(), "pool returns empty Vec");
 
@@ -153,21 +157,26 @@ mod tests {
     /// actually engages the bucket reuse path.
     #[test]
     fn cover_frames_hit_pool_after_warmup() {
+        // Never inspect the process-global pool here: Rust runs sibling tests
+        // concurrently and their legitimate first acquisition can increment
+        // fallback_alloc_total between these snapshots. An isolated pool makes
+        // this a deterministic assertion about build_cover_frame itself.
+        let pool = BufferPool::with_capacity(4);
         // Warmup: prime the bucket with a round-trip allocation.
         for _ in 0..16 {
-            drop(build_cover_frame());
+            drop(build_cover_frame_with_pool(&pool));
         }
-        let before = veil_bufpool::global().stats();
+        let before = pool.stats();
 
         // Steady-state: 32 emissions, each dropped immediately so its
         // buffer returns to the bucket.  Cache-hit count must climb;
         // fallback-alloc count must NOT (otherwise the bucket is being
         // skipped, e.g. mis-sized acquire request).
         for _ in 0..32 {
-            drop(build_cover_frame());
+            drop(build_cover_frame_with_pool(&pool));
         }
 
-        let after = veil_bufpool::global().stats();
+        let after = pool.stats();
         assert!(
             after.cache_hit_total > before.cache_hit_total,
             "cover-frame builder must engage pool cache (cache_hit_total stuck at {})",

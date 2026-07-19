@@ -63,10 +63,7 @@ impl SovereignIdentityCell {
 
     /// Current document handle (cheap Arc clone; `None` on legacy nodes).
     pub fn get(&self) -> Option<Arc<SovereignIdentity>> {
-        self.inner
-            .read()
-            .unwrap_or_else(|p| p.into_inner())
-            .clone()
+        self.inner.read().unwrap_or_else(|p| p.into_inner()).clone()
     }
 
     /// Swap in a freshly re-issued / reloaded document.

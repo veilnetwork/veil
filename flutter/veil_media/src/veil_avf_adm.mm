@@ -149,7 +149,7 @@ class VeilAvfAdm : public webrtc::webrtc_impl::AudioDeviceModuleDefault<
   // --- start / stop (called by AudioState on the Call worker queue) --------
   int32_t StartRecording() override {
     if (!initialized_) Init();
-    recording_.store(true);
+    if (recording_.exchange(true)) return 0;
     // dispatch_ASYNC (not sync): StartRecording is invoked synchronously from the
     // FFI caller — the Flutter UI isolate (engine.cc calls adm->StartRecording()
     // straight from veil_media_engine_start_audio). The reconfigure it drives can
@@ -167,7 +167,7 @@ class VeilAvfAdm : public webrtc::webrtc_impl::AudioDeviceModuleDefault<
     return 0;
   }
   int32_t StopRecording() override {
-    recording_.store(false);
+    if (!recording_.exchange(false)) return 0;
     dispatch_sync(engine_queue_, ^{
       audio_device_buffer_.StopRecording();
       ReconfigureLocked();
@@ -178,7 +178,7 @@ class VeilAvfAdm : public webrtc::webrtc_impl::AudioDeviceModuleDefault<
 
   int32_t StartPlayout() override {
     if (!initialized_) Init();
-    playing_.store(true);
+    if (playing_.exchange(true)) return 0;
     // dispatch_ASYNC — same reason as StartRecording: never block the FFI/UI
     // isolate on the CoreAudio engine start (it can wedge when the mic is denied).
     dispatch_async(engine_queue_, ^{
@@ -190,7 +190,7 @@ class VeilAvfAdm : public webrtc::webrtc_impl::AudioDeviceModuleDefault<
     return 0;
   }
   int32_t StopPlayout() override {
-    playing_.store(false);
+    if (!playing_.exchange(false)) return 0;
     dispatch_sync(engine_queue_, ^{
       audio_device_buffer_.StopPlayout();
       ReconfigureLocked();
@@ -205,6 +205,8 @@ class VeilAvfAdm : public webrtc::webrtc_impl::AudioDeviceModuleDefault<
     EnsureEngineLocked();
     if (engine_ == nil) return;
     if (engine_.isRunning) [engine_ stop];
+
+    if (!recording_.load()) CancelMicAuthorizationTimerLocked();
 
     // `engine_.inputNode` is not a harmless getter on macOS: while microphone
     // access is still undetermined it may synchronously bind the HAL input
@@ -230,6 +232,7 @@ class VeilAvfAdm : public webrtc::webrtc_impl::AudioDeviceModuleDefault<
       // state is exactly the blocking HAL path above. Stay playout-only until
       // the user grants access; a later media start/reconfigure will attach it.
       if (mic_auth == AVAuthorizationStatusAuthorized) {
+        CancelMicAuthorizationTimerLocked();
         AVAudioInputNode* input = engine_.inputNode;
         AVAudioFormat* tap_fmt = [input outputFormatForBus:0];
         if (tap_fmt.sampleRate <= 0 || tap_fmt.channelCount <= 0) {
@@ -250,6 +253,11 @@ class VeilAvfAdm : public webrtc::webrtc_impl::AudioDeviceModuleDefault<
       } else {
         alog("avf_adm: mic not authorized (auth=%ld) — playout only, no capture",
              (long)mic_auth);
+        if (mic_auth == AVAuthorizationStatusNotDetermined) {
+          EnsureMicAuthorizationTimerLocked();
+        } else {
+          CancelMicAuthorizationTimerLocked();
+        }
       }
     }
 
@@ -272,6 +280,45 @@ class VeilAvfAdm : public webrtc::webrtc_impl::AudioDeviceModuleDefault<
              e.reason.UTF8String ? e.reason.UTF8String : "?");
       }
     }
+  }
+
+  // A call must not wait indefinitely for the system permission sheet, but an
+  // AVAudioEngine configured while TCC is still undetermined comes up
+  // playout-only. Watch the authorization state on the same serial graph queue
+  // and attach capture as soon as the user answers, without requiring another
+  // call or rebuilding the media route. The timer is owned/cancelled on
+  // engine_queue_, so no delayed block can outlive this ADM.
+  void EnsureMicAuthorizationTimerLocked() {
+    if (mic_auth_timer_ != nil) return;
+    mic_auth_timer_ = dispatch_source_create(
+        DISPATCH_SOURCE_TYPE_TIMER, 0, 0, engine_queue_);
+    if (mic_auth_timer_ == nil) return;
+    dispatch_source_set_timer(
+        mic_auth_timer_, dispatch_time(DISPATCH_TIME_NOW, 250 * NSEC_PER_MSEC),
+        250 * NSEC_PER_MSEC, 25 * NSEC_PER_MSEC);
+    VeilAvfAdm* self = this;
+    dispatch_source_set_event_handler(mic_auth_timer_, ^{
+      if (!self->recording_.load()) {
+        self->CancelMicAuthorizationTimerLocked();
+        return;
+      }
+      const AVAuthorizationStatus status =
+          [AVCaptureDevice authorizationStatusForMediaType:AVMediaTypeAudio];
+      if (status == AVAuthorizationStatusNotDetermined) return;
+      self->CancelMicAuthorizationTimerLocked();
+      if (status == AVAuthorizationStatusAuthorized) {
+        alog("avf_adm: mic permission granted mid-call — attaching capture");
+        self->ReconfigureLocked();
+      }
+    });
+    dispatch_resume(mic_auth_timer_);
+  }
+
+  void CancelMicAuthorizationTimerLocked() {
+    if (mic_auth_timer_ == nil) return;
+    dispatch_source_set_event_handler(mic_auth_timer_, nil);
+    dispatch_source_cancel(mic_auth_timer_);
+    mic_auth_timer_ = nil;
   }
 
   void InstallCaptureTapLocked(AVAudioInputNode* input,
@@ -432,6 +479,7 @@ class VeilAvfAdm : public webrtc::webrtc_impl::AudioDeviceModuleDefault<
   }
 
   void TeardownEngineLocked() {
+    CancelMicAuthorizationTimerLocked();
     if (engine_ == nil) return;
     if (engine_.isRunning) [engine_ stop];
     if (capture_tap_installed_) {
@@ -474,6 +522,7 @@ class VeilAvfAdm : public webrtc::webrtc_impl::AudioDeviceModuleDefault<
   std::atomic<uint64_t> cap_count_{0};
 
   dispatch_queue_t engine_queue_ = nil;
+  dispatch_source_t mic_auth_timer_ = nil;
   AVAudioEngine* engine_ = nil;
   AVAudioSourceNode* source_node_ = nil;
   AVAudioConverter* capture_converter_ = nil;

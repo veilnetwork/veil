@@ -41,6 +41,8 @@ namespace veil_media {
 namespace {
 constexpr size_t kMaxInboundPendingPackets = 256;
 constexpr size_t kMaxInboundPendingBytes = 4 * 1024 * 1024;
+constexpr uint8_t kVp8PayloadType = 96;
+constexpr int64_t kHoldThresholdNs = 75 * 1000 * 1000;
 
 void slog(const char* fmt, ...) {
   FILE* f = fopen("/tmp/veil_media_diag.log", "a");
@@ -60,6 +62,55 @@ VeilTransportShim::VeilTransportShim(uint64_t veil_chan,
     : veil_chan_(veil_chan), call_(call), network_queue_(network_queue) {}
 
 VeilTransportShim::~VeilTransportShim() { Stop(); }
+
+void VeilTransportShim::MarkVideoFrame(std::span<const uint8_t> packet,
+                                       AtomicVideoCadence* cadence) {
+  if (cadence == nullptr || packet.size() < 12 || (packet[0] >> 6) != 2 ||
+      (packet[1] & 0x7f) != kVp8PayloadType || (packet[1] & 0x80) == 0) {
+    return;
+  }
+  const int64_t now_ns = webrtc::TimeMicros() * 1000;
+  int64_t expected_first = 0;
+  cadence->first_ns.compare_exchange_strong(expected_first, now_ns,
+                                             std::memory_order_relaxed);
+  const int64_t previous =
+      cadence->last_ns.exchange(now_ns, std::memory_order_relaxed);
+  if (previous != 0) {
+    const int64_t gap = now_ns - previous;
+    int64_t old_max = cadence->max_gap_ns.load(std::memory_order_relaxed);
+    while (gap > old_max &&
+           !cadence->max_gap_ns.compare_exchange_weak(
+               old_max, gap, std::memory_order_relaxed)) {
+    }
+    if (gap >= kHoldThresholdNs) {
+      cadence->holds_75ms.fetch_add(1, std::memory_order_relaxed);
+    }
+  }
+  cadence->frames.fetch_add(1, std::memory_order_relaxed);
+}
+
+VideoCadenceSnapshot VeilTransportShim::Snapshot(
+    const AtomicVideoCadence& cadence) {
+  return {
+      cadence.frames.load(std::memory_order_relaxed),
+      cadence.first_ns.load(std::memory_order_relaxed),
+      cadence.last_ns.load(std::memory_order_relaxed),
+      cadence.max_gap_ns.load(std::memory_order_relaxed),
+      cadence.holds_75ms.load(std::memory_order_relaxed),
+  };
+}
+
+VideoCadenceSnapshot VeilTransportShim::outbound_video_cadence() const {
+  return Snapshot(outbound_video_cadence_);
+}
+
+VideoCadenceSnapshot VeilTransportShim::inbound_video_cadence() const {
+  return Snapshot(inbound_video_cadence_);
+}
+
+VideoCadenceSnapshot VeilTransportShim::delivered_video_cadence() const {
+  return Snapshot(delivered_video_cadence_);
+}
 
 void VeilTransportShim::Start() {
   bool expected = false;
@@ -86,6 +137,7 @@ void VeilTransportShim::Stop() {
 
 bool VeilTransportShim::SendRtp(std::span<const uint8_t> packet,
                                 const webrtc::PacketOptions& options) {
+  MarkVideoFrame(packet, &outbound_video_cadence_);
   const int rc =
       veil_media_send_datagram(veil_chan_, packet.data(), packet.size());
   {
@@ -137,6 +189,8 @@ void VeilTransportShim::OnVeilDatagram(void* ctx, const uint8_t* ptr,
   auto* self = static_cast<VeilTransportShim*>(ctx);
   if (self == nullptr || ptr == nullptr || len == 0) return;
   if (!self->started_.load(std::memory_order_acquire)) return;
+  MarkVideoFrame(std::span<const uint8_t>(ptr, len),
+                 &self->inbound_video_cadence_);
   const size_t pending_packets =
       self->inbound_pending_packets_.load(std::memory_order_relaxed);
   const size_t pending_bytes =
@@ -174,6 +228,7 @@ void VeilTransportShim::OnVeilDatagram(void* ctx, const uint8_t* ptr,
 
 void VeilTransportShim::DeliverOnNetworkThread(
     std::span<const uint8_t> packet) {
+  MarkVideoFrame(packet, &delivered_video_cadence_);
   webrtc::PacketReceiver* receiver = call_->Receiver();
   if (receiver == nullptr) return;
 

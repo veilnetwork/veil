@@ -1019,6 +1019,8 @@ impl FrameDispatcher {
         &self,
         new_peer: [u8; 32],
         observed_addr: Option<std::net::SocketAddr>,
+        udp_reflector_port: Option<u16>,
+        shared_udp_reflectors: &[std::net::SocketAddr],
     ) {
         if let Some(addr) = observed_addr {
             use veil_proto::budget::MAX_PEER_OBSERVED_ADDRS;
@@ -1038,6 +1040,39 @@ impl FrameDispatcher {
                 }
             }
             map.insert(new_peer, addr);
+        }
+        let mut announced_reflectors = Vec::with_capacity(4);
+        if let (Some(remote_addr), Some(port)) = (observed_addr, udp_reflector_port)
+            && port != 0
+        {
+            announced_reflectors.push(std::net::SocketAddr::new(remote_addr.ip(), port));
+        }
+        for endpoint in shared_udp_reflectors.iter().copied() {
+            if !announced_reflectors.contains(&endpoint) {
+                announced_reflectors.push(endpoint);
+            }
+            if announced_reflectors.len() == 4 {
+                break;
+            }
+        }
+        if !announced_reflectors.is_empty() {
+            use veil_proto::budget::MAX_PEER_OBSERVED_ADDRS;
+            let mut reflectors = wlock!(self.peer_udp_reflectors);
+            if reflectors.len() >= MAX_PEER_OBSERVED_ADDRS
+                && !reflectors.contains_key(&new_peer)
+                && let Some(victim) = reflectors.keys().next().copied()
+            {
+                reflectors.remove(&victim);
+            }
+            reflectors.insert(new_peer, announced_reflectors.clone());
+            self.logger.info(
+                "nat.udp_reflector.peer_discovered",
+                format!(
+                    "peer={} endpoints={:?}",
+                    veil_util::hex_short(&new_peer),
+                    announced_reflectors,
+                ),
+            );
         }
         let Some(ref reg_arc) = self.session_tx_registry else {
             return;
@@ -1269,6 +1304,7 @@ impl FrameDispatcher {
     pub fn on_session_closed(&self, closed_peer: NodeId, was_referral: bool) {
         let closed_peer = *closed_peer.as_bytes();
         wlock!(self.peer_observed_addrs).remove(&closed_peer);
+        wlock!(self.peer_udp_reflectors).remove(&closed_peer);
         // Release any relay tunnels where the closing peer was an endpoint.
         // Leaving stale entries would grow the map unboundedly over peer churn.
         lock!(self.relay_tunnels).retain(|_, (a, b)| *a != closed_peer && *b != closed_peer);

@@ -59,6 +59,12 @@ pub enum RuntimeService {
     DhtRepublish,
     RouteMissHandler,
     Bootstrap,
+    /// Bounded UDP mapping reflector. Core nodes serve the conventional port
+    /// automatically; `nat.udp_reflector_bind` is only an optional override.
+    UdpReflector,
+    /// Async responder for token-bearing UDP punch offers. No-op unless at
+    /// least one `nat.udp_reflectors` address is configured.
+    UdpPunchResponder,
     /// Proactive server-reflexive address probe (real-P2P epic, Stage B).
     /// Periodically fires one sentinel STUN-echo `NatProbeRequest` at a
     /// connected peer with a public remote address so the dispatcher can
@@ -155,6 +161,9 @@ impl RuntimeService {
     pub const ALL: &'static [RuntimeService] = &[
         // Core transport + session plane.
         Self::Listeners,
+        // Bind before any outbound/bootstrap handshake so the live port is
+        // present in the peer's authenticated ATTACH advertisement.
+        Self::UdpReflector,
         Self::OutboundPeers,
         Self::PinnedRelays,
         // Observability.
@@ -174,6 +183,7 @@ impl RuntimeService {
         Self::DhtRepublish,
         Self::RouteMissHandler,
         Self::Bootstrap,
+        Self::UdpPunchResponder,
         Self::SrflxProbe,
         Self::BootstrapWatchdog,
         Self::SovereignIdentityRepublish,

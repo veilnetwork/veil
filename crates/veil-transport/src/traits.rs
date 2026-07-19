@@ -200,6 +200,13 @@ pub trait TransportConnection: Send + Sync {
         None
     }
 
+    /// Cloneable access to QUIC DATAGRAM I/O. Kept separate from
+    /// [`Self::into_stream`] so the session can consume its primary ordered
+    /// stream and still retain an unreliable realtime side channel.
+    fn quic_datagrams(&self) -> Option<super::quic::QuicDatagramHandle> {
+        None
+    }
+
     /// Send a datagram (QUIC only). Default: `Unsupported`.
     fn send_datagram<'a>(&'a self, _payload: &'a [u8]) -> BoxFuture<'a, Result<()>> {
         Box::pin(ready(Err(TransportError::Unsupported(

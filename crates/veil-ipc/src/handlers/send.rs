@@ -969,9 +969,10 @@ pub(crate) async fn handle_ipc_send(
 ///
 /// Decodes the `AppIpcRtSendPayload`, wraps it in an `AppMsg::AppRtData` wire
 /// frame, and dispatches it at `REALTIME` priority via the session registry.
-/// On success the metric counter is incremented and `APP_SEND_OK` is written
-/// back to the client. If no session to the destination exists, `APP_SEND_FAILED`
-/// with error code [`ipc_send_err::NO_SESSION`] is returned.
+/// Success is deliberately fire-and-forget: the client-side API has no reply
+/// waiter and an `APP_SEND_OK` per RTP packet only creates reverse IPC traffic
+/// and reader work. If no session to the destination exists,
+/// `APP_SEND_FAILED` with error code [`ipc_send_err::NO_SESSION`] is returned.
 pub(crate) async fn handle_rt_send(
     wh: &mut crate::transport::IpcWriteHalf,
     body: &[u8],
@@ -1034,8 +1035,7 @@ pub(crate) async fn handle_rt_send(
         if let Some(m) = metrics {
             m.inc_rt_frames_tx();
         }
-        let ok_hdr = FrameHeader::new(FrameFamily::LocalApp as u8, LocalAppMsg::AppSendOk as u16);
-        wh.write_all(&codec::encode_header(&ok_hdr)).await
+        Ok(())
     } else {
         let err_code = ipc_send_err::NO_SESSION.to_be_bytes();
         let mut err_hdr = FrameHeader::new(

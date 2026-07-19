@@ -4614,9 +4614,9 @@ mod tests {
 
     /// prove that the relay-mode NAT_PROBE_REQUEST /
     /// _REPLY signaling actually completes A → C → B → C → A end to
-    /// end. This is the SIGNALING half of NAT traversal — actual UDP
-    /// hole punching is a follow-up slice (the real device-side path
-    /// would feed `reply.candidates` into `NatPuncher::punch`).
+    /// end. This is the legacy host-candidate SIGNALING half of NAT
+    /// traversal; the token-bearing async responder is covered separately
+    /// below, while the same-socket UDP→QUIC promotion has a runtime test.
     ///
     /// Setup: 3-node linear topology A — C — B. A and B have NO
     /// direct session (simulating the "both behind NAT" case). Both
@@ -4728,6 +4728,142 @@ mod tests {
         );
 
         net.stop().await;
+    }
+
+    /// Bridge the two Stage-B regression layers through real runtimes:
+    /// A sends a token-bearing request through coordinator C, target B hands
+    /// it to its asynchronous UDP responder, B discovers a mapping through a
+    /// real fixed-size reflector, and the resulting srflx candidate plus the
+    /// exact one-time token travel B → C → A.
+    ///
+    /// Loopback candidates are intentionally rejected by the subsequent
+    /// public-address punch guard, so this hermetic scenario stops at the
+    /// signaling boundary. `veil-node-runtime` separately proves that two
+    /// accepted mappings converge through punch and promote the same sockets
+    /// into QUIC. Together the tests cover the production seam without ever
+    /// weakening the SSRF/public-range guard for test traffic.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn stage_b_token_bearing_udp_responder_round_trips_srflx_via_coordinator() {
+        use crate::proto::control::candidate_type;
+        use tokio::{net::UdpSocket, sync::oneshot};
+
+        let reflector_socket = UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("bind reflector");
+        let reflector_addr = reflector_socket.local_addr().expect("reflector addr");
+        let (reflector_stop_tx, reflector_stop_rx) = oneshot::channel();
+        let reflector = tokio::spawn(veil_nat::serve_udp_reflector(
+            reflector_socket,
+            reflector_stop_rx,
+        ));
+        // The first reflector intentionally reports its own loopback IP — the
+        // same shape as a VPN exiting on the reflector host. A second scripted
+        // endpoint returns a distinct observation so the production
+        // punch-discovery policy must skip the first and continue within the
+        // same deadline.
+        let independent_socket = UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("bind independent scripted reflector");
+        let independent_addr = independent_socket
+            .local_addr()
+            .expect("independent reflector addr");
+        let independent_mapping_ip = [203, 0, 113, 42];
+        let independent_reflector = tokio::spawn(async move {
+            let mut request = [0u8; veil_nat::UDP_PUNCH_PACKET_LEN];
+            let (len, source) = independent_socket
+                .recv_from(&mut request)
+                .await
+                .expect("scripted reflector receive");
+            assert_eq!(len, veil_nat::UDP_PUNCH_PACKET_LEN);
+            let mut reply = [0u8; veil_nat::UDP_PUNCH_PACKET_LEN];
+            reply[..8].copy_from_slice(b"VEILUDP1");
+            reply[8] = 2; // KIND_DISCOVER_REPLY
+            reply[9] = 4;
+            reply[10..26].copy_from_slice(&request[10..26]);
+            reply[26..30].copy_from_slice(&independent_mapping_ip);
+            reply[42..44].copy_from_slice(&source.port().to_be_bytes());
+            independent_socket
+                .send_to(&reply, source)
+                .await
+                .expect("scripted reflector reply");
+        });
+
+        let mut net = SimNetwork::builder()
+            .nodes(3)
+            .role(NodeRole::Core)
+            .udp_reflectors(vec![
+                reflector_addr.to_string(),
+                independent_addr.to_string(),
+            ])
+            .build()
+            .await;
+        net.wire_star().await;
+        for i in 0..3 {
+            let expected = if i == 0 { 2 } else { 1 };
+            assert!(
+                net.node(i)
+                    .wait_sessions(expected, Duration::from_secs(15))
+                    .await,
+                "pre-punch signaling topology incomplete at node {i}",
+            );
+        }
+
+        let coordinator_id = net.node(0).node_id();
+        let a_id = net.node(1).node_id();
+        let b_id = net.node(2).node_id();
+        let initiator_socket = UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("bind initiator discovery socket");
+        let initiator_mapping = veil_nat::discover_udp_mapping(
+            &initiator_socket,
+            reflector_addr,
+            [0x31; 16],
+            Duration::from_secs(1),
+        )
+        .await
+        .expect("initiator discovery io")
+        .expect("initiator mapping");
+        let mut initiator_candidate = veil_nat::socket_addr_to_candidate(initiator_mapping);
+        initiator_candidate.candidate_type = candidate_type::SRFLX;
+        initiator_candidate.priority = 1_694_498_815;
+        let punch_token = [0xA7; 16];
+
+        let reply = net
+            .node(1)
+            .runtime
+            .debug_attempt_nat_traversal_via_with_punch_token(
+                b_id,
+                coordinator_id,
+                vec![initiator_candidate],
+                Duration::from_secs(5),
+                punch_token,
+            )
+            .await
+            .expect("async UDP responder must reply through the coordinator");
+
+        assert_eq!(reply.responder_node_id, b_id);
+        assert_eq!(reply.final_target_node_id, a_id);
+        assert_eq!(reply.punch_token, Some(punch_token));
+        assert_eq!(reply.candidates.len(), 1);
+        assert_eq!(
+            reply.candidates[0].candidate_type,
+            candidate_type::SRFLX,
+            "token-bearing responder must advertise its discovered UDP mapping, not a stale listener",
+        );
+        let responder_mapping = veil_nat::candidate_to_socket_addr(&reply.candidates[0])
+            .expect("valid responder srflx candidate");
+        assert_eq!(responder_mapping.ip().to_string(), "203.0.113.42");
+        assert_ne!(responder_mapping.port(), 0);
+
+        net.stop().await;
+        let _ = reflector_stop_tx.send(());
+        reflector
+            .await
+            .expect("reflector task")
+            .expect("reflector io");
+        independent_reflector
+            .await
+            .expect("independent reflector task");
     }
 
     /// prove that the client-side `SESSION_TICKET` cache

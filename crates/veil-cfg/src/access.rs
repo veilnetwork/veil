@@ -61,6 +61,21 @@ pub fn get(config: &Config, key: &str) -> Result<String> {
                 |identity| identity.node_id.map(|value| value.to_string()),
             )))
         }
+        ConfigKey::NatEnabled => Ok(config.nat.enabled.to_string()),
+        ConfigKey::NatPunchTimeoutMs => Ok(config.nat.punch_timeout_ms.to_string()),
+        ConfigKey::NatRelayEnabled => Ok(config.nat.relay_enabled.to_string()),
+        ConfigKey::NatUdpReflectors => {
+            serde_json::to_string(&config.nat.udp_reflectors).map_err(|reason| {
+                ConfigError::InvalidValue {
+                    key: key.to_owned(),
+                    value: String::new(),
+                    reason: reason.to_string(),
+                }
+            })
+        }
+        ConfigKey::NatUdpReflectorBind => {
+            Ok(option_to_string(config.nat.udp_reflector_bind.as_deref()))
+        }
         ConfigKey::TransportTlsClientConnectTimeoutMs => Ok(option_to_string(
             config.transport.tls_client.connect_timeout_ms,
         )),
@@ -198,11 +213,58 @@ pub fn set(config: &mut Config, key: &str, value: &str) -> Result<()> {
             };
             Ok(())
         }
+        ConfigKey::NatEnabled => {
+            config.nat.enabled = parse_bool(key, value)?;
+            Ok(())
+        }
+        ConfigKey::NatPunchTimeoutMs => {
+            config.nat.punch_timeout_ms =
+                value
+                    .parse::<u64>()
+                    .map_err(|_| ConfigError::InvalidValue {
+                        key: key.as_str().to_owned(),
+                        value: value.to_owned(),
+                        reason: "expected an unsigned integer".to_owned(),
+                    })?;
+            Ok(())
+        }
+        ConfigKey::NatRelayEnabled => {
+            config.nat.relay_enabled = parse_bool(key, value)?;
+            Ok(())
+        }
+        ConfigKey::NatUdpReflectors => {
+            config.nat.udp_reflectors = if value.trim().is_empty() {
+                Vec::new()
+            } else {
+                serde_json::from_str::<Vec<String>>(value).map_err(|reason| {
+                    ConfigError::InvalidValue {
+                        key: key.as_str().to_owned(),
+                        value: value.to_owned(),
+                        reason: format!("expected a JSON string array: {reason}"),
+                    }
+                })?
+            };
+            Ok(())
+        }
+        ConfigKey::NatUdpReflectorBind => {
+            config.nat.udp_reflector_bind = parse_optional_string(value);
+            Ok(())
+        }
         ConfigKey::TransportTlsClientConnectTimeoutMs => {
             config.transport.tls_client.connect_timeout_ms = parse_optional_u64(key, value)?;
             Ok(())
         }
     }
+}
+
+fn parse_bool(key: ConfigKey, value: &str) -> Result<bool> {
+    value
+        .parse::<bool>()
+        .map_err(|_| ConfigError::InvalidValue {
+            key: key.as_str().to_owned(),
+            value: value.to_owned(),
+            reason: "expected `true` or `false`".to_owned(),
+        })
 }
 
 #[cfg(test)]
@@ -229,5 +291,31 @@ mod tests {
         );
         assert_eq!(get(&config, "global.logs").unwrap(), "file");
         assert_eq!(get(&config, "global.log_file").unwrap(), "/tmp/veil.log");
+    }
+
+    #[test]
+    fn updates_nat_reflector_keys() {
+        let mut config = Config::default();
+        set(&mut config, "nat.udp_reflector_bind", "0.0.0.0:39999").unwrap();
+        set(
+            &mut config,
+            "nat.udp_reflectors",
+            r#"["203.0.113.7:39999","[2001:db8::7]:39999"]"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            get(&config, "nat.udp_reflector_bind").unwrap(),
+            "0.0.0.0:39999",
+        );
+        assert_eq!(
+            get(&config, "nat.udp_reflectors").unwrap(),
+            r#"["203.0.113.7:39999","[2001:db8::7]:39999"]"#,
+        );
+
+        set(&mut config, "nat.udp_reflector_bind", "").unwrap();
+        set(&mut config, "nat.udp_reflectors", "").unwrap();
+        assert_eq!(get(&config, "nat.udp_reflector_bind").unwrap(), "default");
+        assert_eq!(get(&config, "nat.udp_reflectors").unwrap(), "[]");
     }
 }
