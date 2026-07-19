@@ -205,6 +205,19 @@ impl Drop for RealtimeReceiverTask {
     }
 }
 
+/// Session services retained by the independently running realtime receiver.
+/// Keeping them together makes the task's ownership boundary explicit and
+/// prevents its spawn helper from growing a parallel copy of `SessionRunner`'s
+/// argument list as abuse handling and observability evolve.
+struct RealtimeReceiverContext {
+    peer_id: NodeIdBytes,
+    dispatcher: Arc<dyn crate::dispatcher_sink::DispatcherSink>,
+    logger: Arc<NodeLogger>,
+    metrics: Option<Arc<NodeMetrics>>,
+    ban_list: Arc<Mutex<BanList>>,
+    violation_tracker: Arc<Mutex<ViolationTracker>>,
+}
+
 /// Accept only one complete, fixed-header `AppRtData` frame. Datagram payloads
 /// cannot smuggle a second OVL1 frame or route another family around the
 /// ordered stream's normal parser.
@@ -233,14 +246,17 @@ fn decode_realtime_lane_frame(frame: &[u8]) -> Option<(FrameHeader, &[u8])> {
 fn spawn_realtime_receiver(
     handle: veil_transport::QuicDatagramHandle,
     mut rx: crate::realtime_datagram::RealtimeDatagramRx,
-    peer_id: NodeIdBytes,
-    dispatcher: Arc<dyn crate::dispatcher_sink::DispatcherSink>,
-    logger: Arc<NodeLogger>,
-    metrics: Option<Arc<NodeMetrics>>,
-    ban_list: Arc<Mutex<BanList>>,
-    violation_tracker: Arc<Mutex<ViolationTracker>>,
+    context: RealtimeReceiverContext,
 ) -> RealtimeReceiverTask {
     RealtimeReceiverTask(tokio::spawn(async move {
+        let RealtimeReceiverContext {
+            peer_id,
+            dispatcher,
+            logger,
+            metrics,
+            ban_list,
+            violation_tracker,
+        } = context;
         let mut logged_first_receive = false;
         loop {
             let datagram = match handle.recv().await {
@@ -2961,12 +2977,14 @@ impl SessionRunner {
                     realtime_receiver_task = Some(spawn_realtime_receiver(
                         handle.clone(),
                         rx,
-                        self.peer_id,
-                        Arc::clone(&self.dispatcher),
-                        Arc::clone(&self.logger),
-                        self.metrics.clone(),
-                        Arc::clone(&self.ban_list),
-                        Arc::clone(&self.violation_tracker),
+                        RealtimeReceiverContext {
+                            peer_id: self.peer_id,
+                            dispatcher: Arc::clone(&self.dispatcher),
+                            logger: Arc::clone(&self.logger),
+                            metrics: self.metrics.clone(),
+                            ban_list: Arc::clone(&self.ban_list),
+                            violation_tracker: Arc::clone(&self.violation_tracker),
+                        },
                     ));
                     self.logger.info(
                         "session.realtime_datagram.enabled",
