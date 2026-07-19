@@ -1,14 +1,13 @@
 /* SPDX-License-Identifier: MIT
  *
- * veil_avf_adm.h — a custom webrtc::AudioDeviceModule for macOS backed by
- * AVAudioEngine (AVFoundation) instead of the low-level CoreAudio HAL.
+ * veil_avf_adm.h — a custom Apple webrtc::AudioDeviceModule backed by
+ * AVAudioEngine (AVFoundation).
  *
- * The built-in macOS HAL ADM (kPlatformDefaultAudio) reports
- * RecordingIsAvailable=0 / PlayoutIsAvailable=0 and hangs in
- * InitRecording/InitPlayout inside this dylib embed, so no mic audio ever
- * reaches the send stream. AVAudioEngine integrates cleanly with the TCC mic
- * grant and device changes, and is the portable path (the same shape maps to
- * AVAudioEngine on iOS and AAudio/OpenSLES on Android later).
+ * This is the production iOS path because it owns the AVAudioSession voice
+ * posture there. macOS normally uses WebRTC's lower-level CoreAudio HAL ADM:
+ * recent macOS releases can wedge forever while constructing
+ * AVAudioEngine.inputNode, so this implementation is only an explicit
+ * diagnostic fallback on desktop.
  *
  * Pure-C++ header (no ObjC) so veil_media_engine.cc can call the factory; the
  * implementation lives in veil_avf_adm.mm.

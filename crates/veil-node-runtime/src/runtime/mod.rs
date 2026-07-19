@@ -185,7 +185,8 @@ pub struct NodeServices {
     /// all hammering the same dead address (~290 connect-attempts/sec
     /// aggregate across 49 surviving nodes vs. ~1.5/sec under correct
     /// per-node-id backoff).
-    pub outbound_connector_node_ids: Arc<Mutex<std::collections::HashSet<[u8; 32]>>>,
+    pub outbound_connector_refresh:
+        Arc<Mutex<std::collections::HashMap<[u8; 32], watch::Sender<u64>>>>,
     /// same cache as on `NodeRuntime` (see field doc there).
     /// Outbound-connector populates it post-handshake-complete so the
     /// next cold start can use these peers as bootstrap fallbacks.
@@ -247,6 +248,8 @@ pub struct NodeServices {
     /// (gate=None) — IPC queries always reply `has_cert=false`.
     pub verified_peer_certs:
         Arc<std::sync::RwLock<std::collections::HashMap<[u8; 32], veil_types::MembershipCert>>>,
+    /// Runtime task registry used to retain responder-side punched sessions.
+    tasks: Arc<Mutex<RuntimeTasks>>,
 }
 
 #[derive(Clone)]
@@ -342,6 +345,10 @@ pub struct AttachedDebugSession {
     pub link_id: LinkId,
     pub source: SessionSource,
     pub stream: BoxIoStream,
+    /// Unreliable side channel cloned from the same authenticated QUIC
+    /// connection before its primary stream was consumed. `None` for TCP,
+    /// obfs4, TLS and websocket transports.
+    pub quic_datagrams: Option<veil_transport::QuicDatagramHandle>,
     pub metrics: Option<Arc<NodeMetrics>>,
     /// Authenticated peer node_id from the handshake.
     pub peer_id: NodeId,
@@ -350,6 +357,10 @@ pub struct AttachedDebugSession {
     /// Transport-layer observed address of the peer (as seen by our socket).
     /// `None` for stream transports that do not expose a remote address.
     pub observed_addr: Option<std::net::SocketAddr>,
+    /// Reflector port authenticated by the peer's ATTACH advertisement.
+    pub udp_reflector_port: Option<u16>,
+    /// Public reflector endpoints relayed by the authenticated peer.
+    pub shared_udp_reflectors: Vec<std::net::SocketAddr>,
     /// Base64-encoded remote peer public key from the handshake.
     pub public_key: String,
     /// Remote peer nonce string from the handshake.
@@ -580,7 +591,7 @@ pub struct NodeRuntime {
     pub event_bus: Arc<veil_ipc::EventBus>,
     /// per-node-id slot registry for outbound-connector tasks.
     /// Mirrored to `NodeServices` so cross-task spawns dedupe atomically.
-    outbound_connector_node_ids: Arc<Mutex<std::collections::HashSet<[u8; 32]>>>,
+    outbound_connector_refresh: Arc<Mutex<std::collections::HashMap<[u8; 32], watch::Sender<u64>>>>,
     /// cache of peers we've successfully OVL1-handshaked
     /// in a prior run. At cold start, `spawn_bootstrap_task` splices
     /// these into the bootstrap-candidate list AFTER the operator's
@@ -1917,10 +1928,17 @@ impl NodeRuntime {
                     veil_proto::budget::MAX_PEER_OBSERVED_ADDRS,
                 ),
             )),
+            local_udp_reflector_port: Arc::new(std::sync::atomic::AtomicU16::new(0)),
+            peer_udp_reflectors: Arc::new(std::sync::RwLock::new(
+                std::collections::HashMap::with_capacity(
+                    veil_proto::budget::MAX_PEER_OBSERVED_ADDRS,
+                ),
+            )),
             // NAT relay tunnel table (empty; populated by NatRelayRequest dispatch).
             relay_tunnels: Arc::new(Mutex::new(std::collections::HashMap::new())),
             // pending NAT-probe waiters (empty; populated by attempt_nat_traversal).
             nat_probe_waiters: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            nat_punch_offer_tx: Arc::new(Mutex::new(None)),
             // scale-aware adaptive params. Init from
             // `from_network_size(100)` — the hard floor in
             // `estimate_network_size`. Reload tick refreshes this from
@@ -2128,7 +2146,7 @@ impl NodeRuntime {
             // empty registry of node_ids with active
             // outbound-connector tasks; populated atomically inside
             // `spawn_outbound_peers`.
-            outbound_connector_node_ids: Arc::new(Mutex::new(std::collections::HashSet::new())),
+            outbound_connector_refresh: Arc::new(Mutex::new(std::collections::HashMap::new())),
             // load cached discovered peers from disk if
             // configured. Missing/corrupt file → empty cache (no
             // panic — first-run case) so node still boots.
@@ -4934,6 +4952,22 @@ impl NodeServices {
         local_candidates: Vec<veil_proto::control::NatCandidate>,
         per_coordinator_timeout: std::time::Duration,
     ) -> Option<veil_proto::control::NatProbeReplyPayload> {
+        self.try_nat_traversal_with_punch_token(
+            target_node_id,
+            local_candidates,
+            per_coordinator_timeout,
+            None,
+        )
+        .await
+    }
+
+    async fn try_nat_traversal_with_punch_token(
+        &self,
+        target_node_id: [u8; 32],
+        local_candidates: Vec<veil_proto::control::NatCandidate>,
+        per_coordinator_timeout: std::time::Duration,
+        punch_token: Option<[u8; 16]>,
+    ) -> Option<veil_proto::control::NatProbeReplyPayload> {
         let local_node_id = *self.identity.local_identity.node_id.as_bytes();
         let mut candidates: Vec<[u8; 32]> = rlock!(self.session_tx_registry)
             .peer_ids()
@@ -4953,11 +4987,12 @@ impl NodeServices {
         const MAX_COORDINATOR_ATTEMPTS: usize = 4;
         for coordinator in candidates.into_iter().take(MAX_COORDINATOR_ATTEMPTS) {
             if let Some(reply) = self
-                .attempt_nat_traversal_via(
+                .attempt_nat_traversal_via_with_punch_token(
                     target_node_id,
                     coordinator,
                     local_candidates.clone(),
                     per_coordinator_timeout,
+                    punch_token,
                 )
                 .await
             {
@@ -4974,6 +5009,24 @@ impl NodeServices {
         coordinator_node_id: [u8; 32],
         local_candidates: Vec<veil_proto::control::NatCandidate>,
         timeout: std::time::Duration,
+    ) -> Option<veil_proto::control::NatProbeReplyPayload> {
+        self.attempt_nat_traversal_via_with_punch_token(
+            target_node_id,
+            coordinator_node_id,
+            local_candidates,
+            timeout,
+            None,
+        )
+        .await
+    }
+
+    async fn attempt_nat_traversal_via_with_punch_token(
+        &self,
+        target_node_id: [u8; 32],
+        coordinator_node_id: [u8; 32],
+        local_candidates: Vec<veil_proto::control::NatCandidate>,
+        timeout: std::time::Duration,
+        punch_token: Option<[u8; 16]>,
     ) -> Option<veil_proto::control::NatProbeReplyPayload> {
         use veil_proto::codec::encode_header;
         use veil_proto::control::NatProbeRequestPayload;
@@ -5019,6 +5072,7 @@ impl NodeServices {
             initiator_node_id: local_node_id,
             target_node_id,
             session_token,
+            punch_token,
             candidates: local_candidates,
         };
         let body = request.encode();
@@ -5050,6 +5104,59 @@ impl NodeServices {
                 None
             }
         }
+    }
+
+    /// Collect live reflector announcements from authenticated direct peers,
+    /// nearest to the intended destination first. Static config entries are
+    /// appended only as a backward-compatible fallback. A peer's own endpoint
+    /// is bound to its transport IP; transitively shared endpoints are numeric,
+    /// public-only and bounded before they enter this map.
+    fn available_udp_reflectors(
+        &self,
+        target_node_id: [u8; 32],
+        configured: &[String],
+    ) -> Vec<std::net::SocketAddr> {
+        let mut announced = rlock!(self.dispatcher.peer_udp_reflectors)
+            .iter()
+            .map(|(node_id, endpoints)| (*node_id, endpoints.clone()))
+            .collect::<Vec<_>>();
+        announced.sort_by_key(|(node_id, _)| {
+            let mut distance = [0u8; 32];
+            for i in 0..32 {
+                distance[i] = node_id[i] ^ target_node_id[i];
+            }
+            distance
+        });
+
+        let mut out = Vec::with_capacity(8);
+        // Round-robin across independent announcers before accepting a second
+        // endpoint from one peer, so one connected peer cannot eclipse every
+        // other live reflector by filling the eight-entry fan-out.
+        for index in 0..4 {
+            for (_, endpoints) in &announced {
+                let Some(endpoint) = endpoints.get(index).copied() else {
+                    continue;
+                };
+                if !out.contains(&endpoint) {
+                    out.push(endpoint);
+                }
+                if out.len() == 8 {
+                    return out;
+                }
+            }
+        }
+        for endpoint in configured
+            .iter()
+            .filter_map(|value| value.parse::<std::net::SocketAddr>().ok())
+        {
+            if !out.contains(&endpoint) {
+                out.push(endpoint);
+            }
+            if out.len() == 8 {
+                break;
+            }
+        }
+        out
     }
 
     /// signaling + URI promotion — see
@@ -5105,6 +5212,132 @@ impl NodeServices {
     /// peer that advertises 50 host candidates (e.g., a server with
     /// many interfaces) would burn the full backoff window on
     /// fallback attempts and starve the next real backoff cycle.
+    async fn udp_hole_punch_dial(
+        &self,
+        target_node_id: [u8; 32],
+        peer_ctx: Arc<veil_transport::TransportContext>,
+    ) -> Option<Box<dyn TransportConnection>> {
+        let config = veil_cfg::load_config(&self.config_path).ok()?;
+        if !config.nat.enabled {
+            return None;
+        }
+        let mut reflectors =
+            self.available_udp_reflectors(target_node_id, &config.nat.udp_reflectors);
+        let first_reflector = *reflectors.first()?;
+        reflectors.retain(|value| value.is_ipv4() == first_reflector.is_ipv4());
+        let timeout = std::time::Duration::from_millis(config.nat.punch_timeout_ms);
+        if timeout.is_zero() {
+            return None;
+        }
+        let deadline = tokio::time::Instant::now() + timeout;
+        let bind_addr = match first_reflector {
+            std::net::SocketAddr::V4(_) => "0.0.0.0:0",
+            std::net::SocketAddr::V6(_) => "[::]:0",
+        };
+        let socket = tokio::net::UdpSocket::bind(bind_addr).await.ok()?;
+        let (discovery_token, punch_token) = {
+            use rand_core::RngCore;
+            let mut discovery = [0u8; 16];
+            let mut punch = [0u8; 16];
+            rand_core::OsRng.fill_bytes(&mut discovery);
+            rand_core::OsRng.fill_bytes(&mut punch);
+            (discovery, punch)
+        };
+        let discovery_timeout = timeout.min(std::time::Duration::from_millis(500));
+        let mapping = veil_nat::discover_udp_mapping_any_for_punch(
+            &socket,
+            &reflectors,
+            discovery_token,
+            discovery_timeout,
+        )
+        .await
+        .ok()?;
+        let Some((mapping, _)) = mapping else {
+            self.logger.debug(
+                "nat.udp_punch.discovery_unusable",
+                "no non-hairpin UDP mapping from peer-announced reflectors",
+            );
+            return None;
+        };
+        let mut candidate = veil_nat::socket_addr_to_candidate(mapping);
+        candidate.candidate_type = veil_proto::control::candidate_type::SRFLX;
+        candidate.priority = 1_694_498_815;
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return None;
+        }
+        let signaling_timeout = remaining.min(std::time::Duration::from_millis(1_500));
+        let reply = self
+            .try_nat_traversal_with_punch_token(
+                target_node_id,
+                vec![candidate],
+                signaling_timeout,
+                Some(punch_token),
+            )
+            .await?;
+        if reply.punch_token != Some(punch_token) {
+            return None;
+        }
+        let candidates = reply
+            .candidates
+            .iter()
+            .filter(|candidate| {
+                candidate.candidate_type == veil_proto::control::candidate_type::SRFLX
+            })
+            .filter_map(veil_nat::candidate_to_socket_addr)
+            .filter(|candidate| veil_nat::is_public_punch_addr(*candidate))
+            .collect::<Vec<_>>();
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        // Reserve up to 750 ms (and at least half this remaining slice) for
+        // QUIC so a doomed punch cannot consume the entire direct-path budget.
+        let quic_reserve = (remaining / 2).min(std::time::Duration::from_millis(750));
+        let punch_timeout = remaining.saturating_sub(quic_reserve);
+        if punch_timeout.is_zero() {
+            return None;
+        }
+        let peer = veil_nat::punch_udp(&socket, &candidates, punch_token, punch_timeout)
+            .await
+            .ok()??;
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return None;
+        }
+        let promoted = tokio::time::timeout(
+            remaining,
+            veil_transport::promote_punched_quic(
+                socket,
+                peer,
+                peer_ctx,
+                veil_transport::PunchedQuicRole::Initiator,
+            ),
+        )
+        .await;
+        match promoted {
+            Ok(Ok(connection)) => {
+                self.logger.info(
+                    "nat.udp_punch.connected",
+                    format!(
+                        "peer={} role=initiator",
+                        veil_util::hex_short(&target_node_id)
+                    ),
+                );
+                Some(connection)
+            }
+            Ok(Err(error)) => {
+                self.logger
+                    .warn("nat.udp_punch.quic_failed", error.to_string());
+                None
+            }
+            Err(_) => {
+                self.logger.warn(
+                    "nat.udp_punch.quic_failed",
+                    "overall NAT traversal deadline elapsed",
+                );
+                None
+            }
+        }
+    }
+
     async fn nat_fallback_dial(
         &self,
         peer: &crate::types::PeerConfigEntry,
@@ -5124,6 +5357,13 @@ impl NodeServices {
         let connected_peer_count = rlock!(self.session_tx_registry).peer_ids().len();
         if connected_peer_count == 0 {
             return None;
+        }
+
+        if let Some(connection) = self
+            .udp_hole_punch_dial(*peer.node_id.as_bytes(), Arc::clone(&peer_ctx))
+            .await
+        {
+            return Some(connection);
         }
 
         // Build our own host candidates from the dispatcher's known
@@ -5244,6 +5484,21 @@ impl NodeServices {
             network_gate: self.network_gate.as_ref().map(Arc::clone),
             verified_peer_certs: Arc::clone(&self.verified_peer_certs),
         }
+    }
+
+    fn spawn_punched_inbound(&self, connection: Box<dyn veil_transport::TransportConnection>) {
+        let handle = spawn_inbound_session(
+            InboundSessionContext {
+                runtime: self.make_session_context(),
+                // Synthetic source labels: punched QUIC does not originate
+                // from a configured listener, and listener_handle=0 matches no
+                // allowlist entry. Identity/P-Net gates still run normally.
+                listen_id: ListenId::new(0),
+                listener_handle: ListenerHandle::new(0),
+            },
+            connection,
+        );
+        push_session_handle(&self.tasks, handle);
     }
 
     async fn connect_peer_with_state(
@@ -5661,6 +5916,7 @@ pub fn spawn_inbound_session(
                 .register_owned(peer_id, session_id);
             let mut runner = veil_session::runner::SessionRunner {
                 stream: session.stream,
+                quic_datagrams: session.quic_datagrams,
                 peer_id: *peer_id.as_bytes(),
                 dispatcher,
                 logger: Arc::clone(&inbound.runtime.logger),
@@ -5768,10 +6024,12 @@ pub fn spawn_inbound_session(
                     veil_util::redact_addr_for_log(&inbound_transport),
                 ),
             );
-            inbound
-                .runtime
-                .dispatcher
-                .on_session_opened(*peer_id.as_bytes(), session.observed_addr);
+            inbound.runtime.dispatcher.on_session_opened(
+                *peer_id.as_bytes(),
+                session.observed_addr,
+                session.udp_reflector_port,
+                &session.shared_udp_reflectors,
+            );
             //gossip our self-signed transport
             // announcement to the new peer so they can return it to
             // future walkers asking `ResolveTransport(local_node_id)`.
@@ -7233,6 +7491,17 @@ impl NodeServices {
             // Never warm our own RD key (self can appear via routing/sessions).
             let me = self.dht.local_node_id();
             c.retain(|n| *n != me);
+            // The routing table also contains ordinary app endpoints and
+            // transport-only relays. Their relay-directory keys can never
+            // exist; probing them on every circuit retry turns one miss into a
+            // self-sustaining DHT/circuit storm. The authenticated handshake
+            // capability is the authoritative anonymity-relay signal.
+            c.retain(|n| {
+                service_tasks::peer_advertised_anonymity_relay(
+                    &self.dispatcher.crypto.peer_cap_flags,
+                    n,
+                )
+            });
             c
         };
         cached += self
@@ -9787,6 +10056,12 @@ impl NodeServices {
             }
             relays.sort_unstable();
             relays.dedup();
+            relays.retain(|n| {
+                service_tasks::peer_advertised_anonymity_relay(
+                    &self.dispatcher.crypto.peer_cap_flags,
+                    n,
+                )
+            });
             self.warm_known_relay_directory(&relays, 6, RESOLVE_TIMEOUT)
                 .await;
         }

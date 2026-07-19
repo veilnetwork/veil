@@ -849,6 +849,16 @@ pub struct NatConfig {
     /// Enable relay fallback when hole-punching fails. Default: `true`.
     #[serde(default = "NatConfig::default_relay_enabled")]
     pub relay_enabled: bool,
+    /// Legacy static fallback reflectors. Normal nodes discover reflector
+    /// endpoints from authenticated live peers; an empty list (default) keeps
+    /// that decentralized path enabled and merely disables static fallback.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub udp_reflectors: Vec<String>,
+    /// Optional local bind override for the bounded reflector protocol. Core
+    /// nodes otherwise serve the conventional UDP port automatically and
+    /// announce it to authenticated peers; Leaf nodes do not serve by default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub udp_reflector_bind: Option<String>,
 }
 
 impl NatConfig {
@@ -867,6 +877,8 @@ impl NatConfig {
             && self.punch_timeout_ms == Self::default_punch_timeout_ms()
             && self.stun_servers.is_empty()
             && self.relay_enabled == Self::default_relay_enabled()
+            && self.udp_reflectors.is_empty()
+            && self.udp_reflector_bind.is_none()
     }
 }
 
@@ -877,6 +889,8 @@ impl Default for NatConfig {
             punch_timeout_ms: Self::default_punch_timeout_ms(),
             stun_servers: Vec::new(),
             relay_enabled: Self::default_relay_enabled(),
+            udp_reflectors: Vec::new(),
+            udp_reflector_bind: None,
         }
     }
 }

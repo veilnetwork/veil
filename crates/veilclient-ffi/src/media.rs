@@ -222,7 +222,10 @@ pub fn dispatch_inbound(peer: [u8; 32], payload: &[u8]) {
                     let map = RECV.lock().unwrap_or_else(|p| p.into_inner());
                     map.iter()
                         .map(|(p, c)| {
-                            format!("{:02x}{:02x}{:02x}{:02x}@chan{}", p[0], p[1], p[2], p[3], c.chan)
+                            format!(
+                                "{:02x}{:02x}{:02x}{:02x}@chan{}",
+                                p[0], p[1], p[2], p[3], c.chan
+                            )
                         })
                         .collect::<Vec<_>>()
                         .join(",")

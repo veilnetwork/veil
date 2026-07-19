@@ -2785,8 +2785,8 @@ pub use veil_types::PexConfig;
 /// # Flow
 /// 1. Direct connect fails.
 /// 2. If `enabled`: `NatCoordinator` starts.
-/// 3. External address is discovered via the veil (STUN-like) or optionally
-///    via the public `stun_servers` list.
+/// 3. External address is discovered through reflectors announced by current
+///    authenticated Veil peers (with static endpoints as a legacy fallback).
 /// 4. ICE candidates are exchanged with the peer through the veil signalling
 ///    channel.
 /// 5. UDP hole-punch (QUIC) is attempted against all peer candidates, sorted by

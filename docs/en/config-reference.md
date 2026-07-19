@@ -838,9 +838,11 @@ NAT traversal (hole punching, with a relay to fall back on).
 | Key | Type | Default | Description |
 |------|-----|-------------|----------|
 | `enabled` | `bool` | `true` | Turn NAT traversal on. Set `false` only when every peer is directly reachable |
-| `punch_timeout_ms` | `u64` | `3000` | How long to wait for a UDP hole-punch, in ms, before falling back to a relay |
+| `punch_timeout_ms` | `u64` | `3000` | Overall deadline for mapping discovery, signaling, UDP punch and QUIC promotion before falling back to a relay |
 | `stun_servers` | `[string]` | `[]` | External STUN servers (`"host:port"`, RFC 5389). Left empty, the address is found through veil itself — a core node reflects the source |
 | `relay_enabled` | `bool` | `true` | Allow falling back to a relay when the hole-punch fails |
+| `udp_reflectors` | `[string]` | `[]` | Legacy static fallback endpoints. Normally left empty: authenticated live peers announce their reflector ports automatically |
+| `udp_reflector_bind` | `string?` | unset | Optional bind override. A Core node otherwise serves the bounded reflector automatically on `0.0.0.0:39999`; Leaf nodes do not serve it |
 
 **Example:**
 
@@ -851,6 +853,33 @@ punch_timeout_ms = 5000
 relay_enabled    = true
 stun_servers     = ["stun.l.google.com:19302", "stun1.l.google.com:19302"]
 ```
+
+Core nodes host the reflector in the **same node process** and advertise its
+live port in the authenticated session ATTACH. A client combines that port
+with the IP of the peer connection it already authenticated, so an announcement
+cannot redirect probes at an unrelated host. Up to eight live announcements
+are queried together and the first valid response wins; the old static list is
+used only after live announcements. Packaged xVeil builds therefore contain no
+operator-owned reflector address.
+
+The conventional UDP port is `39999`; operators only need to allow it through
+their firewall. An override is available for port conflicts:
+
+```toml
+[[listen]]
+id = "0x00000003"
+transport = "quic://0.0.0.0:39998"
+advertise = "quic://203.0.113.7:39998"
+
+[nat]
+udp_reflector_bind = "0.0.0.0:39999"
+```
+
+The reflector needs a distinct UDP port because Quinn owns the QUIC listener
+socket. It is bounded to fixed 64-byte request/reply packets, globally
+rate-limited, supervised by the node runtime, and has no separate executable.
+Running another reachable Core node automatically adds another independent
+reflector operator to the network.
 
 ---
 

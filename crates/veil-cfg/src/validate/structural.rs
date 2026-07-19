@@ -224,6 +224,20 @@ pub const VALIDATION_RULES: &[ValidationRule] = &[
         check: nat_punch_timeout_zero,
         fix: None,
     },
+    ValidationRule {
+        code: "nat_udp_reflector_bind_invalid",
+        key: "nat.udp_reflector_bind",
+        message: "must be a numeric ip:port socket address with a non-zero port",
+        check: nat_udp_reflector_bind_invalid,
+        fix: None,
+    },
+    ValidationRule {
+        code: "nat_udp_reflector_invalid",
+        key: "nat.udp_reflectors[]",
+        message: "every entry must be a numeric ip:port socket address with a non-zero port",
+        check: nat_udp_reflector_invalid,
+        fix: None,
+    },
     // ── advertise / relay validation ────────────────────────────────
     ValidationRule {
         code: "listen_relay_invalid_node_id",
@@ -760,6 +774,28 @@ fn listen_relay_invalid_node_id(config: &Config) -> bool {
 
 fn nat_punch_timeout_zero(config: &Config) -> bool {
     config.nat.punch_timeout_ms == 0
+}
+
+fn valid_udp_reflector_addr(value: &str) -> bool {
+    value
+        .parse::<std::net::SocketAddr>()
+        .is_ok_and(|addr| addr.port() != 0)
+}
+
+fn nat_udp_reflector_bind_invalid(config: &Config) -> bool {
+    config
+        .nat
+        .udp_reflector_bind
+        .as_deref()
+        .is_some_and(|value| !valid_udp_reflector_addr(value))
+}
+
+fn nat_udp_reflector_invalid(config: &Config) -> bool {
+    config
+        .nat
+        .udp_reflectors
+        .iter()
+        .any(|value| !valid_udp_reflector_addr(value))
 }
 
 fn keepalive_interval_too_large(config: &Config) -> bool {

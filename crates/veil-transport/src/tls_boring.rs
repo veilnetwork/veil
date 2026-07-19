@@ -22,9 +22,7 @@
 //!
 //! # Binding crate: `btls` (not `boring`)
 //!
-//! We use [`btls`] rather than Cloudflare's [`boring`] because the `btls`
-//! ecosystem ships a working [`quinn-btls`] for QUIC, while the corresponding
-//! `quinn-boring` is stuck on a yanked `boring` version. Both crates are
+//! We use [`btls`] rather than Cloudflare's [`boring`]. Both crates are
 //! near-identical bindings to the same BoringSSL C source, but `btls`'s
 //! `tokio-btls` wrapper uses the manual `SslStream::new + pin.connect`
 //! pattern rather than `boring`'s `tokio_boring::connect(...)` helper.

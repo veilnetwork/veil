@@ -212,6 +212,30 @@ impl FrameDispatcher {
                 // `initiator_node_id!= peer_id` (we received it from
                 // someone other than the initiator they claim to be).
                 let is_pure_stun_echo = request.target_node_id == [0u8; 32];
+                if !is_pure_stun_echo && request.punch_token.is_some() {
+                    // Apply the NAT-probe quota again at the addressed node.
+                    // The coordinator already gates forwarding, but this
+                    // independent gate prevents an authenticated/malicious
+                    // coordinator from turning the responder into a sustained
+                    // UDP punch sender toward attacker-selected candidates.
+                    if !lock!(self.abuse.nat_probe_forward_quota).allow(*node_id.as_bytes()) {
+                        return DispatchResult::NoResponse;
+                    }
+                    let punch_tx = lock!(self.nat_punch_offer_tx).clone();
+                    if punch_tx.is_some_and(|tx| {
+                        tx.try_send(crate::NatPunchOffer {
+                            request: request.clone(),
+                            reply_via_node_id: *node_id.as_bytes(),
+                        })
+                        .is_ok()
+                    }) {
+                        // The runtime must first discover the mapping of its
+                        // fresh UDP socket, then reply and punch on that SAME
+                        // socket. A synchronous host-candidate reply here would
+                        // advertise the wrong port and race the async worker.
+                        return DispatchResult::NoResponse;
+                    }
+                }
                 // bugfix: in the relay-
                 // arrived-at-target branch (target == self_node_id AND
                 // initiator!= peer_id), responding with
@@ -283,6 +307,7 @@ impl FrameDispatcher {
                     responder_node_id: self.local_node_id,
                     final_target_node_id,
                     session_token: request.session_token,
+                    punch_token: request.punch_token,
                     candidates,
                 };
                 DispatchResult::Response(encode_response(
@@ -477,6 +502,7 @@ impl FrameDispatcher {
                     responder_node_id: self.local_node_id,
                     final_target_node_id: [0u8; 32],
                     session_token: request.session_token,
+                    punch_token: None,
                     candidates: vec![],
                 };
                 DispatchResult::Response(encode_response(

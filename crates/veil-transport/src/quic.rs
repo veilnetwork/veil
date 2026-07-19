@@ -20,11 +20,141 @@ use super::{
 #[derive(Debug, Default)]
 pub struct QuicTransport;
 
+/// Deterministic role used when promoting a simultaneously-punched UDP socket
+/// into a QUIC connection. Callers derive this from stable node-id ordering so
+/// exactly one peer emits the QUIC Initial while the other accepts it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PunchedQuicRole {
+    Initiator,
+    Responder,
+}
+
+/// A bounded, deliberately small QUIC DATAGRAM queue keeps realtime media
+/// fresh under congestion. Quinn's 1 MiB send / 1.25 MiB receive defaults are
+/// appropriate for throughput-oriented application datagrams, but at a
+/// 900-kbit/s video rate they can retain roughly 9--11 seconds of obsolete
+/// RTP. 64 KiB is about sixteen 30-fps frames at that rate: enough to absorb a
+/// short scheduler hiccup while still preferring a current frame over stale
+/// video.
+pub const REALTIME_DATAGRAM_BUFFER_BYTES: usize = 64 * 1024;
+
+/// Stable transport-level classification of Quinn DATAGRAM send failures.
+/// Session code needs to distinguish a path-MTU change (drop one lossy frame,
+/// refresh the ceiling and continue) from a permanently unavailable lane.
+#[derive(Clone, Debug, thiserror::Error)]
+pub enum QuicDatagramSendError {
+    #[error("datagrams not supported by peer")]
+    UnsupportedByPeer,
+    #[error("datagram support disabled")]
+    Disabled,
+    #[error("datagram too large")]
+    TooLarge,
+    #[error("connection lost: {0}")]
+    ConnectionLost(String),
+}
+
+/// Cloneable access to QUIC's unreliable datagram plane while the primary
+/// OVL1 byte stream remains owned by the session runner.
+///
+/// The handle is intentionally transport-scoped: callers cannot reach Quinn
+/// configuration or open arbitrary streams, but can query the negotiated
+/// datagram ceiling and send/receive one authenticated-session side channel.
+/// Keeping a clone also keeps the underlying connection alive.
+#[derive(Clone)]
+pub struct QuicDatagramHandle {
+    connection: quinn::Connection,
+}
+
+impl QuicDatagramHandle {
+    /// Largest payload accepted by both QUIC endpoints, or `None` when the
+    /// peer disabled DATAGRAM support.
+    pub fn max_size(&self) -> Option<usize> {
+        self.connection.max_datagram_size()
+    }
+
+    /// Queue one unreliable datagram. Success means Quinn accepted the bytes;
+    /// loss after that point is expected and must be handled by the caller.
+    pub fn send(&self, payload: &[u8]) -> std::result::Result<(), QuicDatagramSendError> {
+        self.connection
+            .send_datagram(payload.to_vec().into())
+            .map_err(|error| match error {
+                quinn::SendDatagramError::UnsupportedByPeer => {
+                    QuicDatagramSendError::UnsupportedByPeer
+                }
+                quinn::SendDatagramError::Disabled => QuicDatagramSendError::Disabled,
+                quinn::SendDatagramError::TooLarge => QuicDatagramSendError::TooLarge,
+                quinn::SendDatagramError::ConnectionLost(error) => {
+                    QuicDatagramSendError::ConnectionLost(error.to_string())
+                }
+            })
+    }
+
+    /// Remaining bytes in Quinn's outgoing DATAGRAM queue. A value smaller
+    /// than the next datagram means `send_datagram` will discard older queued
+    /// media to preserve recency.
+    pub fn send_buffer_space(&self) -> usize {
+        self.connection.datagram_send_buffer_space()
+    }
+
+    /// Receive the next unreliable datagram for this connection.
+    pub async fn recv(&self) -> Result<Vec<u8>> {
+        self.connection
+            .read_datagram()
+            .await
+            .map(|bytes| bytes.to_vec())
+            .map_err(Into::into)
+    }
+}
+
 /// Adapter that exposes a QUIC `(SendStream, RecvStream)` pair as a single
 /// duplex stream satisfying `AsyncRead + AsyncWrite`.
 pub struct QuicBidiStream {
     recv: quinn::RecvStream,
     send: quinn::SendStream,
+}
+
+/// Owns the endpoint/connection handles when a `TransportConnection` is
+/// consumed into its primary byte stream. Without this wrapper, consuming the
+/// connection dropped the last Endpoint handle and Quinn immediately closed an
+/// otherwise healthy stream with application code 0.
+struct QuicOwnedStream {
+    inner: BoxIoStream,
+    _endpoint: quinn::Endpoint,
+    _connection: quinn::Connection,
+}
+
+impl tokio::io::AsyncRead for QuicOwnedStream {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut *self.inner).poll_read(cx, buf)
+    }
+}
+
+impl tokio::io::AsyncWrite for QuicOwnedStream {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        std::pin::Pin::new(&mut *self.inner).poll_write(cx, buf)
+    }
+
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut *self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut *self.inner).poll_shutdown(cx)
+    }
 }
 
 impl tokio::io::AsyncRead for QuicBidiStream {
@@ -74,15 +204,24 @@ impl tokio::io::AsyncWrite for QuicBidiStream {
 struct QuicTransportConnection {
     capabilities: TransportCapabilities,
     peer_meta: PeerMeta,
+    // Quinn closes every connection when the last Endpoint handle is dropped.
+    // Keep one beside the promoted/accepted connection for its full lifetime.
+    _endpoint: quinn::Endpoint,
     connection: quinn::Connection,
     stream: Option<BoxIoStream>,
 }
 
 impl QuicTransportConnection {
-    fn new(peer_meta: PeerMeta, connection: quinn::Connection, stream: BoxIoStream) -> Self {
+    fn new(
+        peer_meta: PeerMeta,
+        endpoint: quinn::Endpoint,
+        connection: quinn::Connection,
+        stream: BoxIoStream,
+    ) -> Self {
         Self {
             capabilities: TransportCapabilities::quic_connection(),
             peer_meta,
+            _endpoint: endpoint,
             connection,
             stream: Some(stream),
         }
@@ -91,11 +230,13 @@ impl QuicTransportConnection {
 
 fn boxed_quic_connection(
     peer_meta: PeerMeta,
+    endpoint: quinn::Endpoint,
     connection: quinn::Connection,
     stream: BoxIoStream,
 ) -> Box<dyn TransportConnection> {
-    Box::new(QuicTransportConnection::new(peer_meta, connection, stream))
-        as Box<dyn TransportConnection>
+    Box::new(QuicTransportConnection::new(
+        peer_meta, endpoint, connection, stream,
+    )) as Box<dyn TransportConnection>
 }
 
 fn native_quic_peer(
@@ -184,10 +325,11 @@ fn effective_quic_alpn(alpn: Vec<Vec<u8>>) -> Vec<Vec<u8>> {
 //
 // Reproducing Chrome's exact values closes the QUIC-fingerprint
 // half of #19 (QUIC_UNKNOWN_MARKED) against stateless classifiers.
-// Bit-exact ClientHello mimicry — extensions ordering, point format
-// list, etc. — lives in the `tls-boring` feature (`quinn-btls`
-// backend); this module covers the transport-parameter layer on top
-// of whichever crypto backend is enabled.
+// The TLS crypto is deliberately kept on Quinn's maintained rustls backend.
+// `quinn-btls` 0.1 can panic while deriving application secrets and poison the
+// endpoint mutex, turning a malformed/failed handshake into a process abort.
+// BoringSSL remains available to the TCP-TLS camouflage transports; peer QUIC
+// prioritizes memory safety and keeps the Chrome-like transport parameters.
 //
 // Values sourced from Chromium's net/quic/quic_session_pool.cc
 // (`InitializeSessionConfig`) and net/third_party/quiche/src/
@@ -239,16 +381,82 @@ pub fn chrome_mimic_transport_config() -> quinn::TransportConfig {
         quinn::IdleTimeout::try_from(std::time::Duration::from_millis(CHROME_MAX_IDLE_TIMEOUT_MS))
             .expect("30s is a valid IdleTimeout"),
     ));
+    cfg.datagram_send_buffer_size(REALTIME_DATAGRAM_BUFFER_BYTES);
+    cfg.datagram_receive_buffer_size(Some(REALTIME_DATAGRAM_BUFFER_BYTES));
     cfg
 }
 
-#[cfg(not(feature = "tls-boring"))]
+#[derive(Debug)]
+struct SessionBoundQuicServerVerifier(Arc<rustls::crypto::CryptoProvider>);
+
+impl SessionBoundQuicServerVerifier {
+    fn new() -> Arc<Self> {
+        Arc::new(Self(
+            Arc::new(rustls::crypto::aws_lc_rs::default_provider()),
+        ))
+    }
+}
+
+/// Veil peer QUIC authenticates the remote node in the mandatory signed
+/// session handshake immediately after TLS. The transport certificate is an
+/// ephemeral encryption shell, not a PKI identity, so independently generated
+/// self-signed certs must be accepted here. Signature checks are retained to
+/// prove possession of the presented certificate key. Public HTTPS uses the
+/// separate PKI-verifying path in `tls.rs` and never this verifier.
+impl rustls::client::danger::ServerCertVerifier for SessionBoundQuicServerVerifier {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &rustls_pki_types::CertificateDer<'_>,
+        _intermediates: &[rustls_pki_types::CertificateDer<'_>],
+        _server_name: &rustls_pki_types::ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: rustls_pki_types::UnixTime,
+    ) -> std::result::Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls_pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls12_signature(
+            message,
+            cert,
+            dss,
+            &self.0.signature_verification_algorithms,
+        )
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls_pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(
+            message,
+            cert,
+            dss,
+            &self.0.signature_verification_algorithms,
+        )
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        self.0.signature_verification_algorithms.supported_schemes()
+    }
+}
+
 fn build_quic_client_config(
     ctx: &TransportContext,
     alpn: Vec<Vec<u8>>,
 ) -> Result<quinn::ClientConfig> {
     let mut client_crypto = (*ctx.tls.client_config).clone();
     client_crypto.alpn_protocols = effective_quic_alpn(alpn);
+    client_crypto
+        .dangerous()
+        .set_certificate_verifier(SessionBoundQuicServerVerifier::new());
     let client_crypto =
         quinn::crypto::rustls::QuicClientConfig::try_from(client_crypto).map_err(quic_error)?;
     let mut client_config = quinn::ClientConfig::new(Arc::new(client_crypto));
@@ -258,7 +466,6 @@ fn build_quic_client_config(
     Ok(client_config)
 }
 
-#[cfg(not(feature = "tls-boring"))]
 fn build_quic_server_config(
     ctx: &TransportContext,
     alpn: Vec<Vec<u8>>,
@@ -276,123 +483,108 @@ fn build_quic_server_config(
     Ok(server_config)
 }
 
-// ── BoringSSL-backed QUIC via `quinn-btls` ──────────────────────
-//
-// When `tls-boring` is enabled, replace the rustls crypto provider with
-// `quinn_btls::{client,server}::Config` so QUIC Initial packets carry a
-// Chrome-like TLS ClientHello (JA4 masquerade). Shares the same BoringSSL
-// C source already compiled for TLS via `btls` — no double link.
-
-// Note — Chrome curve order on QUIC:
-// `quinn-btls` exposes the `SslContext` only through the `QuicSslContext`
-// trait, which does NOT include `set_curves_list`. BoringSSL's default
-// QUIC group preferences already place X25519 first (matching Chrome), so
-// skipping this call is acceptable for the JA4 goal; the key-share extension
-// will still advertise X25519 as Chrome does. If bit-exact Chrome JA4
-// matching becomes required, upstream `quinn-btls` needs a patch to expose
-// the curve list setter (or a local fork).
-
-#[cfg(feature = "tls-boring")]
-fn build_quic_client_config(
-    _ctx: &TransportContext,
-    alpn: Vec<Vec<u8>>,
-) -> Result<quinn::ClientConfig> {
-    let mut cfg = quinn_btls::ClientConfig::new()
-        .map_err(|e| quic_error(format!("quinn-btls ClientConfig::new: {e}")))?;
-    // Veil binds trust to node_id at the session layer — disable QUIC TLS
-    // verification (parity with the TCP-TLS path in `tls_boring.rs`).
-    cfg.verify_peer(false);
-
-    cfg.set_alpn(&effective_quic_alpn(alpn))
-        .map_err(|e| quic_error(format!("quinn-btls set_alpn: {e}")))?;
-
-    let mut client_config = quinn::ClientConfig::new(Arc::new(cfg));
-    // Anti-censorship P1 #4: Chrome-mimic transport parameters.
-    client_config.transport_config(Arc::new(chrome_mimic_transport_config()));
-    Ok(client_config)
-}
-
-#[cfg(feature = "tls-boring")]
-fn build_quic_server_config(
-    ctx: &TransportContext,
-    alpn: Vec<Vec<u8>>,
-) -> Result<quinn::ServerConfig> {
-    use btls::pkey::PKey;
-    use btls::x509::X509;
-    use quinn_btls::QuicSslContext;
-
-    let mut cfg = quinn_btls::ServerConfig::new()
-        .map_err(|e| quic_error(format!("quinn-btls ServerConfig::new: {e}")))?;
-    // Mirror TCP-TLS: no client cert verification (veil node-id binds trust).
-    cfg.verify_peer(false);
-
-    // Load cert chain + private key into the SslContext through the
-    // `QuicSslContext` trait (quinn-btls exposes ctx only via this trait
-    // not the full `SslContextBuilder` API). Methods here take ownership
-    // unlike the boring / builder API which takes `&X509Ref` / `&PKeyRef`.
-    let chain = ctx.tls.server_cert_chain_der();
-    let key_der = ctx.tls.server_private_key_der();
-
-    let mut iter = chain.iter();
-    let leaf_der = iter.next().ok_or_else(|| {
-        TransportError::Unsupported("tls-boring: server cert chain is empty".to_owned())
-    })?;
-    let leaf = X509::from_der(leaf_der.as_ref())
-        .map_err(|e| quic_error(format!("quinn-btls X509::from_der(leaf): {e}")))?;
-    cfg.ctx_mut()
-        .set_certificate(leaf)
-        .map_err(|e| quic_error(format!("quinn-btls set_certificate: {e}")))?;
-    for extra in iter {
-        let cert = X509::from_der(extra.as_ref())
-            .map_err(|e| quic_error(format!("quinn-btls X509::from_der(chain): {e}")))?;
-        cfg.ctx_mut()
-            .add_to_cert_chain(cert)
-            .map_err(|e| quic_error(format!("quinn-btls add_to_cert_chain: {e}")))?;
-    }
-    let key = PKey::private_key_from_pkcs8(key_der.secret_der())
-        .or_else(|_| PKey::private_key_from_der(key_der.secret_der()))
-        .map_err(|e| quic_error(format!("quinn-btls private_key_from_{{pkcs8|der}}: {e}")))?;
-    cfg.ctx_mut()
-        .set_private_key(key)
-        .map_err(|e| quic_error(format!("quinn-btls set_private_key: {e}")))?;
-    cfg.ctx_mut().check_private_key().map_err(|e| {
-        quic_error(format!(
-            "quinn-btls check_private_key (cert/key mismatch?): {e}"
-        ))
-    })?;
-
-    cfg.set_alpn(&effective_quic_alpn(alpn))
-        .map_err(|e| quic_error(format!("quinn-btls set_alpn: {e}")))?;
-
-    let mut server_config = quinn_btls::helpers::server_config(Arc::new(cfg))
-        .map_err(|e| quic_error(format!("quinn-btls helpers::server_config: {e}")))?;
-    // Anti-censorship P1 #4: Chrome-mimic transport parameters.
-    server_config.transport_config(Arc::new(chrome_mimic_transport_config()));
-    Ok(server_config)
-}
-
-/// when the btls-backed crypto provider is active, the endpoint
-/// must use btls's HmacKey/EndpointConfig too — quinn's rustls default uses
-/// ring-based HMAC which cannot authenticate tokens minted by btls.
-#[cfg(feature = "tls-boring")]
-fn build_client_endpoint(bind_addr: std::net::SocketAddr) -> Result<quinn::Endpoint> {
-    quinn_btls::helpers::client_endpoint(bind_addr).map_err(Into::into)
-}
-
-#[cfg(not(feature = "tls-boring"))]
 fn build_client_endpoint(bind_addr: std::net::SocketAddr) -> Result<quinn::Endpoint> {
     quinn::Endpoint::client(bind_addr).map_err(Into::into)
 }
 
-#[cfg(feature = "tls-boring")]
-fn build_server_endpoint(
-    config: quinn::ServerConfig,
-    bind_addr: std::net::SocketAddr,
+fn build_punched_endpoint(
+    socket: std::net::UdpSocket,
+    server_config: quinn::ServerConfig,
 ) -> Result<quinn::Endpoint> {
-    quinn_btls::helpers::server_endpoint(config, bind_addr).map_err(Into::into)
+    quinn::Endpoint::new(
+        quinn::EndpointConfig::default(),
+        Some(server_config),
+        socket,
+        Arc::new(quinn::TokioRuntime),
+    )
+    .map_err(Into::into)
 }
 
-#[cfg(not(feature = "tls-boring"))]
+/// Promote the exact UDP socket used for mapping discovery and hole punching
+/// into a native QUIC byte-stream connection.
+///
+/// Consuming the socket is intentional: binding a fresh endpoint would choose
+/// a different local port and invalidate the NAT mapping just opened by the
+/// punch. Both roles install client and server configuration so role selection
+/// remains a signaling policy, not a different transport surface.
+pub async fn promote_punched_quic(
+    socket: tokio::net::UdpSocket,
+    remote_addr: std::net::SocketAddr,
+    ctx: Arc<TransportContext>,
+    role: PunchedQuicRole,
+) -> Result<Box<dyn TransportConnection>> {
+    let alpn = Vec::new();
+    let server_config = build_quic_server_config(&ctx, alpn.clone())?;
+    let std_socket = socket.into_std()?;
+    let mut endpoint = build_punched_endpoint(std_socket, server_config)?;
+    endpoint.set_default_client_config(build_quic_client_config(&ctx, alpn)?);
+
+    let host = remote_addr.ip().to_string();
+    let uri = TransportUri::Quic {
+        host: host.clone(),
+        port: remote_addr.port(),
+        sni: None,
+        alpn: Vec::new(),
+    };
+    let local_addr = endpoint.local_addr().ok();
+
+    let connection = match role {
+        PunchedQuicRole::Initiator => {
+            let connecting = endpoint.connect(remote_addr, ctx.effective_sni(None, &host))?;
+            timeout(ctx.quic.connect_timeout, connecting)
+                .await
+                .map_err(|_| connect_timeout(ctx.quic.connect_timeout))??
+        }
+        PunchedQuicRole::Responder => {
+            let incoming = timeout(ctx.quic.connect_timeout, async {
+                loop {
+                    let incoming = endpoint
+                        .accept()
+                        .await
+                        .ok_or_else(|| quic_error("punched QUIC endpoint closed"))?;
+                    if incoming.remote_address() == remote_addr {
+                        return Ok::<_, TransportError>(incoming);
+                    }
+                    // The punch established one expected peer-reflexive source.
+                    // Ignore unrelated QUIC Initials instead of allowing them to
+                    // consume this one-shot promotion.
+                    incoming.refuse();
+                }
+            })
+            .await
+            .map_err(|_| connect_timeout(ctx.quic.connect_timeout))??;
+            // Convert the one-shot `Incoming` into `Connecting` before it is
+            // wrapped in a cancellable timeout. This is the same ownership
+            // rule as the normal listener paths below: cancellation must drop
+            // a handshake future, never an unconsumed Quinn incoming whose
+            // accept state can be re-entered during unwind.
+            let connecting = incoming.accept().map_err(quic_error)?;
+            timeout(ctx.quic.handshake_timeout, connecting)
+                .await
+                .map_err(|_| handshake_timeout(ctx.quic.handshake_timeout))??
+        }
+    };
+
+    let stream: BoxIoStream = match role {
+        PunchedQuicRole::Initiator => {
+            let (send, recv) = timeout(ctx.quic.handshake_timeout, connection.open_bi())
+                .await
+                .map_err(|_| handshake_timeout(ctx.quic.handshake_timeout))??;
+            Box::new(QuicBidiStream { recv, send })
+        }
+        PunchedQuicRole::Responder => {
+            let (send, recv) = timeout(ctx.quic.handshake_timeout, connection.accept_bi())
+                .await
+                .map_err(|_| handshake_timeout(ctx.quic.handshake_timeout))??;
+            Box::new(QuicBidiStream { recv, send })
+        }
+    };
+    let peer_meta = native_quic_peer(uri, local_addr, Some(remote_addr));
+    Ok(boxed_quic_connection(
+        peer_meta, endpoint, connection, stream,
+    ))
+}
+
 fn build_server_endpoint(
     config: quinn::ServerConfig,
     bind_addr: std::net::SocketAddr,
@@ -446,13 +638,25 @@ impl TransportConnection for QuicTransportConnection {
     }
 
     fn into_stream(mut self: Box<Self>) -> Result<BoxIoStream> {
-        self.stream
+        let stream = self
+            .stream
             .take()
-            .ok_or_else(|| TransportError::Unsupported("stream already taken".to_owned()))
+            .ok_or_else(|| TransportError::Unsupported("stream already taken".to_owned()))?;
+        Ok(Box::new(QuicOwnedStream {
+            inner: stream,
+            _endpoint: self._endpoint.clone(),
+            _connection: self.connection.clone(),
+        }))
     }
 
     fn quic_connection(&self) -> Option<quinn::Connection> {
         Some(self.connection.clone())
+    }
+
+    fn quic_datagrams(&self) -> Option<QuicDatagramHandle> {
+        Some(QuicDatagramHandle {
+            connection: self.connection.clone(),
+        })
     }
 
     fn send_datagram<'a>(&'a self, payload: &'a [u8]) -> BoxFuture<'a, Result<()>> {
@@ -507,7 +711,13 @@ impl TransportListener for QuicTransportListener {
             let local_addr = incoming
                 .local_ip()
                 .map(|ip| std::net::SocketAddr::new(ip, 0));
-            let connection = tokio::time::timeout(QUIC_HANDSHAKE_TIMEOUT, incoming)
+            // Consume `Incoming` exactly once before wrapping the handshake in
+            // a timeout. Passing `Incoming` itself through the generic
+            // `IntoFuture` adapter can re-enter its consuming `accept()` while
+            // unwinding a cancelled accept; quinn then panics on its empty
+            // internal state. `Connecting` is the actual cancellable future.
+            let connecting = incoming.accept().map_err(quic_error)?;
+            let connection = tokio::time::timeout(QUIC_HANDSHAKE_TIMEOUT, connecting)
                 .await
                 .map_err(|_| quic_error("quic handshake timed out"))??;
             let remote_addr = connection.remote_address();
@@ -521,7 +731,12 @@ impl TransportListener for QuicTransportListener {
                 Box::new(QuicBidiStream { recv, send })
             };
 
-            Ok(boxed_quic_connection(peer_meta, connection, stream))
+            Ok(boxed_quic_connection(
+                peer_meta,
+                self.endpoint.clone(),
+                connection,
+                stream,
+            ))
         })
     }
 
@@ -540,9 +755,13 @@ impl TransportListener for QuicTransportListener {
                 .map(|ip| std::net::SocketAddr::new(ip, 0));
             let remote_addr = incoming.remote_address();
             let bind_uri = self.bind_uri.clone();
+            let endpoint = self.endpoint.clone();
             let finish: BoxFuture<'static, Result<Box<dyn TransportConnection>>> =
                 Box::pin(async move {
-                    let connection = tokio::time::timeout(QUIC_HANDSHAKE_TIMEOUT, incoming)
+                    // See `accept()` above: consume Incoming once, then time
+                    // out the resulting handshake future.
+                    let connecting = incoming.accept().map_err(quic_error)?;
+                    let connection = tokio::time::timeout(QUIC_HANDSHAKE_TIMEOUT, connecting)
                         .await
                         .map_err(|_| quic_error("quic handshake timed out"))??;
                     let peer_meta = native_quic_peer(bind_uri, local_addr, Some(remote_addr));
@@ -553,7 +772,9 @@ impl TransportListener for QuicTransportListener {
                                 .map_err(|_| quic_error("quic accept_bi timed out"))??;
                         Box::new(QuicBidiStream { recv, send })
                     };
-                    Ok(boxed_quic_connection(peer_meta, connection, stream))
+                    Ok(boxed_quic_connection(
+                        peer_meta, endpoint, connection, stream,
+                    ))
                 });
             Ok(RawInbound {
                 remote_addr: Some(remote_addr),
@@ -598,7 +819,9 @@ impl Transport for QuicTransport {
                 Box::new(QuicBidiStream { recv, send })
             };
 
-            Ok(boxed_quic_connection(peer_meta, connection, stream))
+            Ok(boxed_quic_connection(
+                peer_meta, endpoint, connection, stream,
+            ))
         })
     }
 
@@ -662,5 +885,67 @@ mod tests {
         let user = vec![b"my-test-proto".to_vec()];
         let effective = effective_quic_alpn(user.clone());
         assert_eq!(effective, user);
+    }
+
+    #[tokio::test]
+    async fn punched_socket_is_reused_for_quic_roundtrip() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let initiator_socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let responder_socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let initiator_addr = initiator_socket.local_addr().unwrap();
+        let responder_addr = responder_socket.local_addr().unwrap();
+        let ctx = Arc::new(TransportContext::for_debug().unwrap());
+
+        let responder_ctx = Arc::clone(&ctx);
+        let responder_task = tokio::spawn(async move {
+            promote_punched_quic(
+                responder_socket,
+                initiator_addr,
+                responder_ctx,
+                PunchedQuicRole::Responder,
+            )
+            .await
+        });
+        let initiator = promote_punched_quic(
+            initiator_socket,
+            responder_addr,
+            Arc::clone(&ctx),
+            PunchedQuicRole::Initiator,
+        )
+        .await
+        .unwrap();
+        assert_eq!(initiator.peer_meta().local_addr, Some(initiator_addr));
+        let initiator_datagrams = initiator.quic_datagrams().unwrap();
+
+        let mut initiator_stream = initiator.into_stream().unwrap();
+        // QUIC bidi streams are advertised lazily on first write. Real session
+        // startup writes its handshake immediately; do the same before awaiting
+        // the responder's `accept_bi`.
+        initiator_stream.write_all(b"veil").await.unwrap();
+        let responder = responder_task.await.unwrap().unwrap();
+        assert_eq!(responder.peer_meta().local_addr, Some(responder_addr));
+        let responder_datagrams = responder.quic_datagrams().unwrap();
+        assert!(initiator_datagrams.max_size().is_some());
+        assert_eq!(
+            initiator_datagrams.send_buffer_space(),
+            REALTIME_DATAGRAM_BUFFER_BYTES,
+        );
+        initiator_datagrams.send(b"rt-datagram").unwrap();
+        assert_eq!(responder_datagrams.recv().await.unwrap(), b"rt-datagram");
+        let mut responder_stream = responder.into_stream().unwrap();
+        let (read_done_tx, read_done_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let mut bytes = [0u8; 4];
+            responder_stream.read_exact(&mut bytes).await.unwrap();
+            responder_stream.write_all(&bytes).await.unwrap();
+            responder_stream.flush().await.unwrap();
+            let _ = read_done_rx.await;
+        });
+        let mut echoed = [0u8; 4];
+        initiator_stream.read_exact(&mut echoed).await.unwrap();
+        assert_eq!(&echoed, b"veil");
+        let _ = read_done_tx.send(());
+        server.await.unwrap();
     }
 }

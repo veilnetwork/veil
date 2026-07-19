@@ -274,6 +274,28 @@ final int Function(
   Pointer<Uint8>,
   int,
   Pointer<Pointer<Utf8>>,
+) veilSendRealtime = nativeLib
+    .lookup<
+        NativeFunction<
+            Int32 Function(
+              Pointer<VeilApp>,
+              Pointer<Uint8>,
+              Pointer<Uint8>,
+              Uint32,
+              Pointer<Uint8>,
+              IntPtr,
+              Pointer<Pointer<Utf8>>,
+            )>>('veil_send_realtime')
+    .asFunction();
+
+final int Function(
+  Pointer<VeilApp>,
+  Pointer<Uint8>,
+  Pointer<Uint8>,
+  int,
+  Pointer<Uint8>,
+  int,
+  Pointer<Pointer<Utf8>>,
 ) veilSendAnonymousAuthenticated = nativeLib
     .lookup<
         NativeFunction<
@@ -1336,6 +1358,37 @@ final class VeilMailboxBlobStruct extends Struct {
   external int reserved;
 }
 
+/// Relay media drain snapshot. Mirrors `VeilMediaChannelStats` in
+/// veilclient-ffi; all values are cumulative/maxima except queue depth.
+final class VeilMediaChannelStatsStruct extends Struct {
+  @Uint64()
+  external int videoFramesEnqueued;
+  @Uint64()
+  external int videoFramesStarted;
+  @Uint64()
+  external int videoQueueDepth;
+  @Uint64()
+  external int videoQueueMaxDepth;
+  @Uint64()
+  external int videoQueueAgeMaxMs;
+  @Uint64()
+  external int videoQueueHolds75ms;
+  @Uint64()
+  external int senderLockMaxMs;
+  @Uint64()
+  external int senderLockHolds16ms;
+  @Uint64()
+  external int videoFrameIpcMaxMs;
+  @Uint64()
+  external int videoFrameIpcHolds33ms;
+  @Uint64()
+  external int ipcCellMaxMs;
+  @Uint64()
+  external int ipcCellHolds16ms;
+  @Uint64()
+  external int ipcSendFailures;
+}
+
 final int Function(
   Pointer<VeilHandle>,
   Pointer<Uint8>, // receiver_id (32 B)
@@ -1831,15 +1884,27 @@ final void Function(int) veilDebugSetRtTrace = nativeLib
 // debug_set_publish_pause(on) — pause/resume the embedded node's periodic
 // publish machinery (RTT-spike experiment; mid-call measurement only).
 final void Function(int) veilDebugSetPublishPause = nativeLib
-    .lookup<NativeFunction<Void Function(Int32)>>('veil_debug_set_publish_pause')
+    .lookup<NativeFunction<Void Function(Int32)>>(
+        'veil_debug_set_publish_pause')
     .asFunction();
 
-// media_channel_set_batching(chan, on) -> 0 ok / -1 unknown or non-relay
+// media_channel_set_batching(chan, on) -> 0 ok / -1 unknown/unsupported route
 // channel. Host-gated by call protocol version (see AppHandle wrapper).
 final int Function(int, int) veilMediaChannelSetBatching = nativeLib
     .lookup<NativeFunction<Int32 Function(Uint64, Int32)>>(
         'veil_media_channel_set_batching')
     .asFunction();
+
+// media_channel_get_stats(chan, out) -> 0 ok / -1 invalid. Direct/onion
+// channels return a zeroed relay snapshot.
+final int Function(int, Pointer<VeilMediaChannelStatsStruct>)
+    veilMediaChannelGetStats = nativeLib
+        .lookup<
+            NativeFunction<
+                Int32 Function(Uint64, Pointer<VeilMediaChannelStatsStruct>)>>(
+          'veil_media_channel_get_stats',
+        )
+        .asFunction();
 
 // dispatch_direct(peer_node32*, ptr, len) -> 0 delivered/accepted, -1 invalid.
 final int Function(Pointer<Uint8>, Pointer<Uint8>, int)
