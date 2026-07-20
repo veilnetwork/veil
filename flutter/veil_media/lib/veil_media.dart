@@ -24,16 +24,18 @@ import 'src/bindings.dart' as ffi;
 /// An enumerated audio device.
 class MediaDevice {
   const MediaDevice(
-      {required this.id, required this.label, required this.kind});
+      {required this.id, required this.label, required this.kind, this.facing});
 
   final String id;
   final String label;
   final String kind; // "input" | "output"
+  final String? facing; // "front" | "back" | "external" for cameras
 
   factory MediaDevice.fromJson(Map<String, dynamic> j) => MediaDevice(
         id: j['id'] as String? ?? '',
         label: j['label'] as String? ?? '',
         kind: j['kind'] as String? ?? '',
+        facing: j['facing'] as String?,
       );
 }
 
@@ -140,9 +142,29 @@ class VeilMediaEngine {
   /// send must already be started). Returns false if this platform has no
   /// camera backend (Android, for now) or the device can't be opened — the
   /// call still runs (receive/render unaffected). Idempotent.
-  bool startCamera({int width = 352, int height = 198, int fps = 15}) {
+  bool startCamera({
+    int width = 352,
+    int height = 198,
+    int fps = 15,
+    String? deviceId,
+  }) {
     _ensure();
-    return ffi.veilMediaEngineStartCamera(_ptr, width, height, fps) == 0;
+    if (deviceId == null || deviceId.isEmpty) {
+      return ffi.veilMediaEngineStartCamera(_ptr, width, height, fps) == 0;
+    }
+    final id = deviceId.toNativeUtf8();
+    try {
+      return ffi.veilMediaEngineStartCameraDevice(
+            _ptr,
+            id,
+            width,
+            height,
+            fps,
+          ) ==
+          0;
+    } finally {
+      calloc.free(id);
+    }
   }
 
   bool stopCamera() {
@@ -350,6 +372,9 @@ class VeilMediaEngine {
 
   List<MediaDevice> listAudioOutputs() =>
       _devices(ffi.veilMediaEngineListAudioOutputs(_ptr));
+
+  List<MediaDevice> listVideoInputs() =>
+      _devices(ffi.veilMediaEngineListVideoInputs(_ptr));
 
   bool selectAudioInput(String id) =>
       _select(id, ffi.veilMediaEngineSelectAudioInput);

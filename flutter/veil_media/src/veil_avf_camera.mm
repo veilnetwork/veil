@@ -20,6 +20,7 @@
 #include <cmath>
 #include <cstdint>
 #include <limits>
+#include <string>
 #include <vector>
 
 #include "third_party/libyuv/include/libyuv/convert.h"  // NV12ToI420
@@ -98,41 +99,79 @@ NSString* PresetFor(int width) {
   return AVCaptureSessionPreset640x480;
 }
 
+NSArray<AVCaptureDevice*>* VideoDevices() {
+  // devicesWithMediaType is intentionally used here: unlike a discovery
+  // session with a hand-maintained device-type list it also includes new
+  // built-in lenses and third-party/virtual cameras introduced by the OS.
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+  return [AVCaptureDevice devicesWithMediaType:AVMediaTypeVideo];
+#pragma clang diagnostic pop
+}
+
+void AppendJsonString(std::string* out, NSString* value) {
+  const char* text = value.UTF8String ? value.UTF8String : "";
+  out->push_back('"');
+  for (const unsigned char* p =
+           reinterpret_cast<const unsigned char*>(text);
+       *p; ++p) {
+    switch (*p) {
+      case '"': *out += "\\\""; break;
+      case '\\': *out += "\\\\"; break;
+      case '\b': *out += "\\b"; break;
+      case '\f': *out += "\\f"; break;
+      case '\n': *out += "\\n"; break;
+      case '\r': *out += "\\r"; break;
+      case '\t': *out += "\\t"; break;
+      default:
+        if (*p < 0x20) {
+          char escaped[7];
+          std::snprintf(escaped, sizeof(escaped), "\\u%04x", *p);
+          *out += escaped;
+        } else {
+          out->push_back(static_cast<char>(*p));
+        }
+    }
+  }
+  out->push_back('"');
+}
+
 class AvfCameraCapturer : public CameraCapturer {
  public:
   explicit AvfCameraCapturer(CameraFrameCb cb) : cb_(std::move(cb)) {}
   ~AvfCameraCapturer() override { Stop(); }
 
-  bool Start(int width, int height, int fps) override {
+  bool Start(int width, int height, int fps,
+             const char* device_id) override {
     (void)height;
     if (session_) return true;
     @autoreleasepool {
-      // Find a video capture device. macOS needs explicit discovery on some
-      // releases; iOS should prefer the front camera for a call.
-#if TARGET_OS_OSX
-      NSMutableArray<AVCaptureDeviceType>* types = [NSMutableArray
-          arrayWithObject:AVCaptureDeviceTypeBuiltInWideAngleCamera];
-      if (@available(macOS 14.0, *)) {
-        [types addObject:AVCaptureDeviceTypeExternal];
-        [types addObject:AVCaptureDeviceTypeContinuityCamera];
-      }
-      AVCaptureDeviceDiscoverySession* ds = [AVCaptureDeviceDiscoverySession
-          discoverySessionWithDeviceTypes:types
-                                mediaType:AVMediaTypeVideo
-                                 position:AVCaptureDevicePositionUnspecified];
       AVCaptureDevice* dev = nil;
-      for (AVCaptureDevice* d in ds.devices) {  // prefer the built-in camera
+      if (device_id != nullptr && *device_id != '\0') {
+        NSString* wanted = [NSString stringWithUTF8String:device_id];
+        for (AVCaptureDevice* d in VideoDevices()) {
+          if ([d.uniqueID isEqualToString:wanted]) {
+            dev = d;
+            break;
+          }
+        }
+      }
+#if TARGET_OS_OSX
+      // With no explicit choice prefer the built-in camera, then the system
+      // default. Explicit but stale ids also degrade to an available camera.
+      for (AVCaptureDevice* d in VideoDevices()) {
+        if (dev != nil) break;
         if ([d.deviceType isEqualToString:AVCaptureDeviceTypeBuiltInWideAngleCamera]) {
           dev = d;
           break;
         }
       }
-      if (dev == nil) dev = ds.devices.firstObject;
+      if (dev == nil) dev = VideoDevices().firstObject;
       if (dev == nil) {
         dev = [AVCaptureDevice defaultDeviceWithMediaType:AVMediaTypeVideo];
       }
 #else
-      AVCaptureDevice* dev = [AVCaptureDevice
+      if (dev == nil) dev = [AVCaptureDevice
           defaultDeviceWithDeviceType:AVCaptureDeviceTypeBuiltInWideAngleCamera
                              mediaType:AVMediaTypeVideo
                               position:AVCaptureDevicePositionFront];
@@ -266,6 +305,30 @@ class AvfCameraCapturer : public CameraCapturer {
 
 CameraCapturer* CreatePlatformCamera(CameraFrameCb cb) {
   return new AvfCameraCapturer(std::move(cb));
+}
+
+std::string ListPlatformCamerasJson() {
+  @autoreleasepool {
+    std::string out = "[";
+    bool first = true;
+    for (AVCaptureDevice* device in VideoDevices()) {
+      if (!first) out.push_back(',');
+      first = false;
+      out += "{\"id\":";
+      AppendJsonString(&out, device.uniqueID);
+      out += ",\"label\":";
+      AppendJsonString(&out, device.localizedName);
+      out += ",\"kind\":\"camera\",\"facing\":\"";
+      switch (device.position) {
+        case AVCaptureDevicePositionFront: out += "front"; break;
+        case AVCaptureDevicePositionBack: out += "back"; break;
+        default: out += "external"; break;
+      }
+      out += "\"}";
+    }
+    out.push_back(']');
+    return out;
+  }
 }
 
 }  // namespace veil_media
