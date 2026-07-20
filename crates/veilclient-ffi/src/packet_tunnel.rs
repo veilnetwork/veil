@@ -18,6 +18,9 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::mpsc;
 use tun2proxy::{ArgDns, ArgProxy, ArgVerbosity, Args, CancellationToken};
 
+#[cfg(target_os = "linux")]
+mod linux_helper;
+
 pub const VEIL_TUNNEL_STOPPED: c_int = 0;
 pub const VEIL_TUNNEL_STARTING: c_int = 1;
 pub const VEIL_TUNNEL_RUNNING: c_int = 2;
@@ -186,7 +189,7 @@ fn cleanup_finished(slot: &mut Option<PacketTunnel>) {
     }
 }
 
-fn tunnel_args(proxy_url: &str, dns_ip: &str, mtu: u16) -> Result<Args, c_int> {
+fn tunnel_args(proxy_url: &str, dns_ip: &str, mtu: u16, route_dns: bool) -> Result<Args, c_int> {
     if !(1280..=9000).contains(&mtu) {
         return Err(crate::VEIL_ERR_INVALID_ARG);
     }
@@ -199,7 +202,16 @@ fn tunnel_args(proxy_url: &str, dns_ip: &str, mtu: u16) -> Result<Args, c_int> {
         .map_err(|_| crate::VEIL_ERR_INVALID_ARG)?;
     Ok(Args {
         proxy,
-        dns: ArgDns::Direct,
+        // `OverTcp` sends DNS to `dns_addr` through the same authenticated
+        // SOCKS5/veil path as application traffic. `Direct` is reserved for
+        // the user's explicit DNS-bypass policy. Keeping this choice inside
+        // the packet engine prevents platform route configuration from
+        // claiming DNS privacy while the userspace stack leaks it directly.
+        dns: if route_dns {
+            ArgDns::OverTcp
+        } else {
+            ArgDns::Direct
+        },
         dns_addr,
         ipv6_enabled: true,
         setup: false,
@@ -285,6 +297,7 @@ pub unsafe extern "C" fn veil_packet_tunnel_start_fd(
     mtu: c_ushort,
     ipv6_enabled: bool,
     packet_information: bool,
+    route_dns: bool,
 ) -> c_int {
     if tun_fd < 0 {
         return crate::VEIL_ERR_INVALID_ARG;
@@ -299,7 +312,7 @@ pub unsafe extern "C" fn veil_packet_tunnel_start_fd(
         Ok(value) => value,
         Err(_) => return crate::VEIL_ERR_INVALID_ARG,
     };
-    let mut args = match tunnel_args(proxy_url, dns_ip, mtu) {
+    let mut args = match tunnel_args(proxy_url, dns_ip, mtu, route_dns) {
         Ok(args) => args,
         Err(code) => return code,
     };
@@ -342,6 +355,7 @@ pub unsafe extern "C" fn veil_packet_tunnel_start_packets(
     dns_ip: *const c_char,
     mtu: c_ushort,
     ipv6_enabled: bool,
+    route_dns: bool,
     write_cb: PacketWriteFn,
     write_ctx: *mut c_void,
 ) -> c_int {
@@ -355,7 +369,7 @@ pub unsafe extern "C" fn veil_packet_tunnel_start_packets(
         Ok(value) => value,
         Err(_) => return crate::VEIL_ERR_INVALID_ARG,
     };
-    let mut args = match tunnel_args(proxy_url, dns_ip, mtu) {
+    let mut args = match tunnel_args(proxy_url, dns_ip, mtu, route_dns) {
         Ok(args) => args,
         Err(code) => return code,
     };
@@ -466,6 +480,37 @@ pub extern "C" fn veil_packet_tunnel_last_error() -> *mut c_char {
         .unwrap_or(std::ptr::null_mut())
 }
 
+/// Run xVeil's privileged Linux desktop packet-tunnel helper.
+///
+/// The normal GUI re-executes the *same xVeil executable* through `pkexec`
+/// with a root-owned helper mode; no separately installed VPN binary or daemon
+/// is required. `config_path` points to a bounded, owner-checked JSON request.
+/// The helper writes one JSON status line to stdout, then remains alive until
+/// stdin closes/receives `stop` or SIGINT/SIGTERM arrives. System routes,
+/// nftables state, resolver settings, and the GUI's temporary cgroup are
+/// restored before the function returns.
+///
+/// On non-Linux targets this always returns `VEIL_ERR_INVALID_ARG`.
+///
+/// # Safety
+/// `config_path` must be a live NUL-terminated UTF-8 string for this call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn veil_packet_tunnel_run_linux_helper(config_path: *const c_char) -> c_int {
+    let config_path = match unsafe { required_str(config_path, "config_path") } {
+        Ok(value) => value,
+        Err(_) => return crate::VEIL_ERR_INVALID_ARG,
+    };
+    #[cfg(target_os = "linux")]
+    {
+        linux_helper::run(config_path)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = config_path;
+        crate::VEIL_ERR_INVALID_ARG
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -491,7 +536,7 @@ mod tests {
         let dns = CString::new("1.1.1.1").unwrap();
         // SAFETY: pointers remain valid for the duration of the call.
         let result = unsafe {
-            veil_packet_tunnel_start_fd(-1, proxy.as_ptr(), dns.as_ptr(), 1280, true, false)
+            veil_packet_tunnel_start_fd(-1, proxy.as_ptr(), dns.as_ptr(), 1280, true, false, true)
         };
         assert_eq!(result, crate::VEIL_ERR_INVALID_ARG);
         assert_eq!(veil_packet_tunnel_status(), VEIL_TUNNEL_STOPPED);
@@ -504,7 +549,7 @@ mod tests {
         // fd is rejected too, but proxy validation happens first and both must
         // stay fail-closed without mutating the singleton.
         let result = unsafe {
-            veil_packet_tunnel_start_fd(0, proxy.as_ptr(), dns.as_ptr(), 1280, true, false)
+            veil_packet_tunnel_start_fd(0, proxy.as_ptr(), dns.as_ptr(), 1280, true, false, true)
         };
         assert_eq!(result, crate::VEIL_ERR_INVALID_ARG);
         assert_eq!(veil_packet_tunnel_status(), VEIL_TUNNEL_STOPPED);
@@ -517,6 +562,17 @@ mod tests {
         assert_eq!(phase_code(2), VEIL_TUNNEL_RUNNING);
         assert_eq!(phase_code(3), VEIL_TUNNEL_ERROR);
         assert_eq!(phase_code(u8::MAX), VEIL_TUNNEL_STOPPED);
+    }
+
+    #[test]
+    fn dns_policy_selects_overlay_or_explicit_bypass() {
+        let through_overlay = tunnel_args("socks5://127.0.0.1:1080", "1.1.1.1", 1280, true)
+            .expect("valid routed-DNS tunnel args");
+        assert_eq!(through_overlay.dns, ArgDns::OverTcp);
+
+        let direct = tunnel_args("socks5://127.0.0.1:1080", "1.1.1.1", 1280, false)
+            .expect("valid bypass-DNS tunnel args");
+        assert_eq!(direct.dns, ArgDns::Direct);
     }
 
     #[test]
