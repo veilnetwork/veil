@@ -306,7 +306,26 @@ impl NodeRuntime {
         let std_socket = match std::net::UdpSocket::bind(addr)
             .or_else(|_| std::net::UdpSocket::bind("0.0.0.0:0"))
         {
-            Ok(s) => Arc::new(s),
+            Ok(socket) => {
+                let family = socket.local_addr().map_or(
+                    veil_util::outbound_interface::SocketFamilies::V4,
+                    |local| {
+                        if local.is_ipv4() {
+                            veil_util::outbound_interface::SocketFamilies::V4
+                        } else {
+                            veil_util::outbound_interface::SocketFamilies::V6
+                        }
+                    },
+                );
+                if let Err(error) =
+                    veil_util::outbound_interface::configure_outbound_socket(&socket, family)
+                {
+                    self.logger
+                        .warn("mesh.beacon.interface_pin_failed", error.to_string());
+                    return;
+                }
+                Arc::new(socket)
+            }
             Err(_) => {
                 self.logger.warn(
                     "mesh.beacon.bind_failed",

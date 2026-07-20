@@ -12,6 +12,10 @@ pub mod mlock;
 /// See [`sensitive_bytes::SensitiveBytes`].
 pub mod sensitive_bytes;
 
+/// Process-wide outbound-interface pin used to keep Veil control sockets out
+/// of an OS full-tunnel route on Windows.
+pub mod outbound_interface;
+
 /// Run `op` with up to 5 attempts when it returns
 /// [`std::io::ErrorKind::PermissionDenied`]. Exponential backoff
 /// 25 / 50 / 100 / 200 ms before retries 2-5; any other error is

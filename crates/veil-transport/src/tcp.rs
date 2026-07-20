@@ -3,9 +3,10 @@ use std::{net::SocketAddr, sync::Arc};
 use futures::future::BoxFuture;
 use socket2::{Domain, Protocol, SockRef, Socket, TcpKeepalive, Type};
 use tokio::{
-    net::{TcpListener, TcpStream},
+    net::{TcpListener, TcpSocket, TcpStream},
     time::timeout,
 };
+use veil_util::outbound_interface::{SocketFamilies, configure_outbound_socket};
 
 use super::{
     TransportContext,
@@ -96,6 +97,18 @@ pub(crate) fn configure_accepted_tcp(
     nodelay: bool,
     keepalive_idle: Option<std::time::Duration>,
 ) -> Result<()> {
+    if let Ok(peer) = stream.peer_addr()
+        && !peer.ip().is_loopback()
+    {
+        configure_outbound_socket(
+            stream,
+            if peer.is_ipv4() {
+                SocketFamilies::V4
+            } else {
+                SocketFamilies::V6
+            },
+        )?;
+    }
     stream.set_nodelay(nodelay)?;
     if let Some(idle) = keepalive_idle {
         let ka = TcpKeepalive::new().with_time(idle);
@@ -185,7 +198,30 @@ pub(crate) async fn connect_tcp_stream(
     let mut last_err = None;
 
     for addr in addrs {
-        match timeout(timeout_duration, TcpStream::connect(addr)).await {
+        let socket = if addr.is_ipv4() {
+            TcpSocket::new_v4()
+        } else {
+            TcpSocket::new_v6()
+        };
+        let socket = match socket {
+            Ok(socket) => socket,
+            Err(error) => {
+                last_err = Some(error);
+                continue;
+            }
+        };
+        let family = if addr.is_ipv4() {
+            SocketFamilies::V4
+        } else {
+            SocketFamilies::V6
+        };
+        if !addr.ip().is_loopback()
+            && let Err(error) = configure_outbound_socket(&socket, family)
+        {
+            last_err = Some(error);
+            continue;
+        }
+        match timeout(timeout_duration, socket.connect(addr)).await {
             Ok(Ok(stream)) => {
                 stream.set_nodelay(ctx.tcp.nodelay)?;
                 if let Some(idle) = ctx.tcp.keepalive_idle {

@@ -1033,6 +1033,14 @@ impl NodeRuntime {
 
         let logger = Arc::new(veil_cfg::observability_glue::logger_from_config(&config)?);
 
+        #[cfg(windows)]
+        if let Err(error) = veil_util::outbound_interface::pin_current_default_interfaces() {
+            logger.warn(
+                "network.outbound_interface_pin_failed",
+                format!("error={error}"),
+            );
+        }
+
         // Pin the process address space in RAM against swap-out before
         // loading any key material. `mlockall(MCL_CURRENT | MCL_FUTURE)`
         // covers ALL future allocations, including key bytes inside
@@ -5235,6 +5243,15 @@ impl NodeServices {
             std::net::SocketAddr::V6(_) => "[::]:0",
         };
         let socket = tokio::net::UdpSocket::bind(bind_addr).await.ok()?;
+        veil_util::outbound_interface::configure_outbound_socket(
+            &socket,
+            if first_reflector.is_ipv4() {
+                veil_util::outbound_interface::SocketFamilies::V4
+            } else {
+                veil_util::outbound_interface::SocketFamilies::V6
+            },
+        )
+        .ok()?;
         let (discovery_token, punch_token) = {
             use rand_core::RngCore;
             let mut discovery = [0u8; 16];

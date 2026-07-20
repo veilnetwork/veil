@@ -8,6 +8,7 @@ license = "AGPL-3.0-or-later"
 [dependencies]
 veil-proto = { path = "../veil-proto" }
 veil-types = { path = "../veil-types" }
+veil-util = { path = "../veil-util" }
 
 async-trait = "0.1"
 log = "0.4"
