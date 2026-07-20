@@ -111,6 +111,11 @@ int veil_media_group_engine_start_camera(VeilGroupMediaEngine *engine,
 int veil_media_group_engine_stop_camera(VeilGroupMediaEngine *engine);
 int veil_media_group_engine_start_screen(VeilGroupMediaEngine *engine,
                                          int width, int fps);
+/* Source-aware additive variant. `source_id` comes from
+ * veil_media_list_screen_inputs; NULL/empty selects the main display. */
+int veil_media_group_engine_start_screen_source(VeilGroupMediaEngine *engine,
+                                                const char *source_id,
+                                                int width, int fps);
 int veil_media_group_engine_stop_screen(VeilGroupMediaEngine *engine);
 int veil_media_group_engine_push_video_frame(
     VeilGroupMediaEngine *engine, const uint8_t *y, const uint8_t *u,
@@ -176,6 +181,11 @@ int veil_media_engine_stop_camera(VeilMediaEngine *engine);
  * consent prompt (no frames until granted + app restart). Idempotent. */
 int veil_media_engine_start_screen(VeilMediaEngine *engine, int width,
                                    int fps);
+/* Source-aware additive variant. `source_id` comes from
+ * veil_media_list_screen_inputs; NULL/empty selects the main display. */
+int veil_media_engine_start_screen_source(VeilMediaEngine *engine,
+                                          const char *source_id, int width,
+                                          int fps);
 int veil_media_engine_stop_screen(VeilMediaEngine *engine);
 
 /* Push one captured I420 frame into the video send stream (platform camera /
@@ -221,6 +231,9 @@ int veil_media_engine_get_local_video_frame(VeilMediaEngine *engine,
 char *veil_media_engine_list_audio_inputs(VeilMediaEngine *engine);
 char *veil_media_engine_list_audio_outputs(VeilMediaEngine *engine);
 char *veil_media_engine_list_video_inputs(VeilMediaEngine *engine);
+/* Platform screen sources. This list is process-global rather than tied to an
+ * engine so 1:1 and group call UIs share the same IDs. */
+char *veil_media_list_screen_inputs(void);
 int veil_media_engine_select_audio_input(VeilMediaEngine *engine,
                                          const char *id);
 int veil_media_engine_select_audio_output(VeilMediaEngine *engine,
