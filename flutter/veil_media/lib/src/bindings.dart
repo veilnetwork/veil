@@ -59,6 +59,16 @@ final int Function(Pointer<VeilMediaEngineHandle>) veilMediaEngineStopVideo =
             'veil_media_engine_stop_video')
         .asFunction();
 
+// set_max_rtp_packet_size(engine*, bytes int) -> int; must precede video send
+final int Function(Pointer<VeilMediaEngineHandle>, int)
+    veilMediaEngineSetMaxRtpPacketSize = nativeLib
+        .lookup<
+            NativeFunction<
+                Int32 Function(Pointer<VeilMediaEngineHandle>, Int32)>>(
+          'veil_media_engine_set_max_rtp_packet_size',
+        )
+        .asFunction();
+
 // set_video_bitrate(engine*, max_bitrate_kbps int, max_fps int) -> int
 final int Function(Pointer<VeilMediaEngineHandle>, int, int)
     veilMediaEngineSetVideoBitrate = nativeLib
