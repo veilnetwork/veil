@@ -23,6 +23,7 @@ tls-webpki-roots = []
 
 [dependencies]
 veil-error = { path = "../veil-error" }
+veil-util = { path = "../veil-util" }
 
 futures = "0.3"
 # Stage 10 slice 3: HTTPS RR (RFC 9460) lookups for real ECH config

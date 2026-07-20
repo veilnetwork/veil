@@ -484,7 +484,36 @@ fn build_quic_server_config(
 }
 
 fn build_client_endpoint(bind_addr: std::net::SocketAddr) -> Result<quinn::Endpoint> {
-    quinn::Endpoint::client(bind_addr).map_err(Into::into)
+    use socket2::{Domain, Protocol, Socket, Type};
+    use veil_util::outbound_interface::{SocketFamilies, configure_outbound_socket};
+
+    let socket = Socket::new(
+        Domain::for_address(bind_addr),
+        Type::DGRAM,
+        Some(Protocol::UDP),
+    )?;
+    let families = if bind_addr.is_ipv6() {
+        match socket.set_only_v6(false) {
+            Ok(()) => SocketFamilies::Dual,
+            Err(error) => {
+                log::debug!("failed to enable QUIC dual-stack socket: {error}");
+                SocketFamilies::V6
+            }
+        }
+    } else {
+        SocketFamilies::V4
+    };
+    configure_outbound_socket(&socket, families)?;
+    socket.bind(&bind_addr.into())?;
+    let socket: std::net::UdpSocket = socket.into();
+    socket.set_nonblocking(true)?;
+    quinn::Endpoint::new(
+        quinn::EndpointConfig::default(),
+        None,
+        socket,
+        Arc::new(quinn::TokioRuntime),
+    )
+    .map_err(Into::into)
 }
 
 fn build_punched_endpoint(
@@ -516,6 +545,14 @@ pub async fn promote_punched_quic(
     let alpn = Vec::new();
     let server_config = build_quic_server_config(&ctx, alpn.clone())?;
     let std_socket = socket.into_std()?;
+    veil_util::outbound_interface::configure_outbound_socket(
+        &std_socket,
+        if remote_addr.is_ipv4() {
+            veil_util::outbound_interface::SocketFamilies::V4
+        } else {
+            veil_util::outbound_interface::SocketFamilies::V6
+        },
+    )?;
     let mut endpoint = build_punched_endpoint(std_socket, server_config)?;
     endpoint.set_default_client_config(build_quic_client_config(&ctx, alpn)?);
 
