@@ -455,7 +455,7 @@ fn decode_pem(pem: &str) -> Option<Vec<u8>> {
 // [12..92] ciphertext+tag (DK seed 64 + Poly1305 tag 16)
 // ```
 //
-// **v2 (current, 113 bytes blob)** — random 16-byte salt per file +
+// **v2 (current, 121 bytes blob)** — random 16-byte salt per file +
 // in-band Argon2id params (so future tuning doesn't break old files).
 // Defaults: `m=32 MiB, t=3, p=1` — ~50-100 ms on typical hardware,
 // rainbow-table-resistant, per-file unique derivation.
@@ -467,13 +467,17 @@ fn decode_pem(pem: &str) -> Option<Vec<u8>> {
 // [21..25] t_cost     (u32 BE)
 // [25..29] p_cost     (u32 BE)
 // [29..41] nonce (12 random bytes)
-// [41..113] ciphertext+tag (80 bytes)
+// [41..121] ciphertext+tag (80 bytes)
 // ```
 //
-// Loader detection: first decoded byte == `0x02` → v2 path; else v1.
+// Loader detection uses both the version byte and the exact wire size.  A v1
+// blob starts with a random nonce, so its first byte alone is not a safe
+// discriminator (it equals `0x02` with probability 1/256).
 
 /// v2 encrypted-PEM version byte.
 const ENC_PEM_V2: u8 = 0x02;
+const ENC_PEM_V1_BLOB_BYTES: usize = 12 + DK_SEED_BYTES + 16;
+const ENC_PEM_V2_BLOB_BYTES: usize = 1 + 16 + 4 + 4 + 4 + 12 + DK_SEED_BYTES + 16;
 
 /// v2 default Argon2id memory cost in KiB. 32 MiB strikes a balance between
 /// startup time (~50-100 ms typical) and offline-attack resistance.
@@ -606,12 +610,9 @@ fn decode_pem_encrypted(pem: &str, passphrase: &str) -> Option<Vec<u8>> {
         .decode(&b64)
         .ok()?;
 
-    // v2 path: first byte version marker, in-band salt + params.
-    if blob.first() == Some(&ENC_PEM_V2) {
-        // v2: 1 + 16 + 4 + 4 + 4 + 12 + ≥16 (Poly1305 tag) = ≥57
-        if blob.len() < 41 + 16 {
-            return None;
-        }
+    // v2 path: version marker plus the exact fixed-size wire layout.  The
+    // length check is required because a legacy v1 nonce may begin with 0x02.
+    if blob.len() == ENC_PEM_V2_BLOB_BYTES && blob.first() == Some(&ENC_PEM_V2) {
         let salt: &[u8] = &blob[1..17];
         let m_cost = u32::from_be_bytes(blob[17..21].try_into().ok()?);
         let t_cost = u32::from_be_bytes(blob[21..25].try_into().ok()?);
@@ -646,7 +647,7 @@ fn decode_pem_encrypted(pem: &str, passphrase: &str) -> Option<Vec<u8>> {
     }
 
     // v1 path (legacy, no version byte): fixed-salt 256 KiB Argon2id.
-    if blob.len() < 12 + 16 {
+    if blob.len() != ENC_PEM_V1_BLOB_BYTES {
         return None;
     }
     let key = derive_key_v1(passphrase);
@@ -675,9 +676,7 @@ fn is_v2_encrypted_pem(pem: &str) -> bool {
     }
     base64::engine::general_purpose::STANDARD
         .decode(&b64)
-        .ok()
-        .and_then(|b| b.first().copied())
-        == Some(ENC_PEM_V2)
+        .is_ok_and(|blob| blob.len() == ENC_PEM_V2_BLOB_BYTES && blob.first() == Some(&ENC_PEM_V2))
 }
 
 /// Load ML-KEM key with optional passphrase encryption.
@@ -1069,16 +1068,17 @@ mod tests {
     /// Helper: encode a DK seed in legacy v1 format (fixed BLAKE3 salt,
     /// 256 KiB Argon2id). Used to verify that v1 files written by
     /// pre-audit binaries still decode and auto-upgrade.
-    fn encode_pem_encrypted_v1(seed: &[u8; DK_SEED_BYTES], passphrase: &str) -> String {
+    fn encode_pem_encrypted_v1_with_nonce(
+        seed: &[u8; DK_SEED_BYTES],
+        passphrase: &str,
+        nonce_bytes: [u8; 12],
+    ) -> String {
         use chacha20poly1305::{
             ChaCha20Poly1305, Key, Nonce,
             aead::{Aead, KeyInit},
         };
-        use rand_core::{OsRng, RngCore};
         let key = derive_key_v1(passphrase);
         let cipher = ChaCha20Poly1305::new(Key::from_slice(key.as_array()));
-        let mut nonce_bytes = [0u8; 12];
-        OsRng.fill_bytes(&mut nonce_bytes);
         let nonce = Nonce::from_slice(&nonce_bytes);
         let ciphertext = cipher.encrypt(nonce, seed.as_slice()).unwrap();
         let mut blob = Vec::with_capacity(12 + ciphertext.len());
@@ -1086,6 +1086,13 @@ mod tests {
         blob.extend_from_slice(&ciphertext);
         let b64 = base64::engine::general_purpose::STANDARD.encode(&blob);
         format!("{PEM_ENC_HEADER}\n{b64}\n{PEM_ENC_FOOTER}\n")
+    }
+
+    fn encode_pem_encrypted_v1(seed: &[u8; DK_SEED_BYTES], passphrase: &str) -> String {
+        use rand_core::{OsRng, RngCore};
+        let mut nonce_bytes = [0u8; 12];
+        OsRng.fill_bytes(&mut nonce_bytes);
+        encode_pem_encrypted_v1_with_nonce(seed, passphrase, nonce_bytes)
     }
 
     #[test]
@@ -1125,6 +1132,18 @@ mod tests {
     }
 
     #[test]
+    fn v1_nonce_leading_with_v2_marker_is_not_misclassified() {
+        let (_, dk_seed) = generate_keypair();
+        let mut nonce = [0xA5; 12];
+        nonce[0] = ENC_PEM_V2;
+        let pem = encode_pem_encrypted_v1_with_nonce(&dk_seed, "collision-pass", nonce);
+
+        assert!(!is_v2_encrypted_pem(&pem));
+        let decoded = decode_pem_encrypted(&pem, "collision-pass").unwrap();
+        assert_eq!(decoded.as_slice(), dk_seed.as_slice());
+    }
+
+    #[test]
     fn v1_wrong_passphrase_returns_none() {
         let (_, dk_seed) = generate_keypair();
         let v1_pem = encode_pem_encrypted_v1(&dk_seed, "correct-v1");
@@ -1135,9 +1154,13 @@ mod tests {
     fn loader_auto_upgrades_v1_to_v2() {
         let path = tmp_path("v1_v2_upgrade");
         let _ = std::fs::remove_file(&path);
-        // Write a v1-format encrypted file directly.
+        // Write a v1-format encrypted file whose nonce starts with the v2
+        // marker.  Detection must use the wire size too, otherwise this
+        // valid legacy file is misclassified with probability 1/256.
         let (_, dk_seed) = generate_keypair();
-        let v1_pem = encode_pem_encrypted_v1(&dk_seed, "shared-pass");
+        let mut nonce = [0x5A; 12];
+        nonce[0] = ENC_PEM_V2;
+        let v1_pem = encode_pem_encrypted_v1_with_nonce(&dk_seed, "shared-pass", nonce);
         std::fs::write(&path, v1_pem.as_bytes()).unwrap();
         // Sanity: file is v1 format.
         let read_back = std::fs::read_to_string(&path).unwrap();
@@ -1205,7 +1228,11 @@ mod tests {
             .decode(&b64)
             .unwrap();
         // v2: 1 + 16 + 4 + 4 + 4 + 12 + 80 (DK 64 + tag 16) = 121 bytes.
-        assert_eq!(blob.len(), 121, "v2 wire size must be 121 bytes");
+        assert_eq!(
+            blob.len(),
+            ENC_PEM_V2_BLOB_BYTES,
+            "v2 wire size must remain fixed"
+        );
         assert_eq!(blob[0], ENC_PEM_V2, "version byte must be 0x02");
     }
 
