@@ -7,11 +7,15 @@
 
 use std::ffi::{CStr, CString};
 use std::net::IpAddr;
-use std::os::raw::{c_char, c_int, c_ushort};
+use std::os::raw::{c_char, c_int, c_ushort, c_void};
+use std::pin::Pin;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
+use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use tokio::sync::mpsc;
 use tun2proxy::{ArgDns, ArgProxy, ArgVerbosity, Args, CancellationToken};
 
 pub const VEIL_TUNNEL_STOPPED: c_int = 0;
@@ -20,12 +24,122 @@ pub const VEIL_TUNNEL_RUNNING: c_int = 2;
 pub const VEIL_TUNNEL_ERROR: c_int = 3;
 
 const STOP_TIMEOUT: Duration = Duration::from_secs(2);
+const PACKET_QUEUE_CAPACITY: usize = 64;
+
+/// Host callback for one raw IP packet emitted by the userspace stack.
+///
+/// `data` is borrowed only for the duration of the callback. The callback may
+/// run on the tunnel's Rust worker thread and must copy/enqueue the packet
+/// without blocking. `ctx` must remain valid until
+/// [`veil_packet_tunnel_stop`] returns.
+pub type PacketWriteFn = extern "C" fn(*mut c_void, *const u8, usize);
 
 struct PacketTunnel {
     cancel: CancellationToken,
     phase: Arc<AtomicU8>,
     error: Arc<Mutex<Option<String>>>,
+    packet_tx: Option<mpsc::Sender<Vec<u8>>>,
+    mtu: u16,
     thread: Option<std::thread::JoinHandle<()>>,
+}
+
+/// Packet-oriented host bridge presented as a byte stream to `ipstack`.
+///
+/// Network Extension owns packet boundaries, while `tun2proxy::run` consumes
+/// an `AsyncRead + AsyncWrite`. Reads therefore concatenate queued packets and
+/// retain any unread suffix when the caller supplies a smaller `ReadBuf`.
+/// Writes are emitted immediately as one raw IP packet; `ipstack` issues one
+/// write per packet on its TUN-facing side.
+struct CallbackDevice {
+    packet_rx: mpsc::Receiver<Vec<u8>>,
+    pending: Option<Vec<u8>>,
+    pending_offset: usize,
+    write_cb: PacketWriteFn,
+    write_ctx: usize,
+    mtu: usize,
+}
+
+impl CallbackDevice {
+    fn new(
+        packet_rx: mpsc::Receiver<Vec<u8>>,
+        write_cb: PacketWriteFn,
+        write_ctx: *mut c_void,
+        mtu: u16,
+    ) -> Self {
+        Self {
+            packet_rx,
+            pending: None,
+            pending_offset: 0,
+            write_cb,
+            // Raw pointers are not Send. The host guarantees that the opaque
+            // context remains valid until stop completes, so store its bits as
+            // an integer and restore the pointer only at callback time.
+            write_ctx: write_ctx as usize,
+            mtu: usize::from(mtu),
+        }
+    }
+}
+
+impl AsyncRead for CallbackDevice {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        loop {
+            if let Some(packet) = self.pending.as_ref() {
+                let packet_len = packet.len();
+                let copied = {
+                    let available = &packet[self.pending_offset..];
+                    let copied = available.len().min(buf.remaining());
+                    buf.put_slice(&available[..copied]);
+                    copied
+                };
+                self.pending_offset += copied;
+                if self.pending_offset == packet_len {
+                    self.pending = None;
+                    self.pending_offset = 0;
+                }
+                return Poll::Ready(Ok(()));
+            }
+
+            match Pin::new(&mut self.packet_rx).poll_recv(cx) {
+                Poll::Ready(Some(packet)) => {
+                    self.pending = Some(packet);
+                }
+                Poll::Ready(None) => return Poll::Ready(Ok(())),
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+    }
+}
+
+impl AsyncWrite for CallbackDevice {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        if buf.is_empty() {
+            return Poll::Ready(Ok(0));
+        }
+        if buf.len() > self.mtu {
+            return Poll::Ready(Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "userspace stack emitted packet larger than tunnel MTU",
+            )));
+        }
+        (self.write_cb)(self.write_ctx as *mut c_void, buf.as_ptr(), buf.len());
+        Poll::Ready(Ok(buf.len()))
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
 }
 
 fn tunnel_slot() -> &'static Mutex<Option<PacketTunnel>> {
@@ -72,50 +186,35 @@ fn cleanup_finished(slot: &mut Option<PacketTunnel>) {
     }
 }
 
-/// Start a packet engine over an OS-owned TUN file descriptor.
-///
-/// The host remains responsible for creating/configuring the interface and for
-/// keeping the descriptor alive until [`veil_packet_tunnel_stop`] returns.
-/// `proxy_url` must be a loopback SOCKS5 URL; accepting a remote/plain proxy
-/// here would bypass veil and make the VPN indicator misleading.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn veil_packet_tunnel_start_fd(
-    tun_fd: c_int,
-    proxy_url: *const c_char,
-    dns_ip: *const c_char,
-    mtu: c_ushort,
-    ipv6_enabled: bool,
-    packet_information: bool,
-) -> c_int {
-    if tun_fd < 0 || !(1280..=9000).contains(&mtu) {
-        return crate::VEIL_ERR_INVALID_ARG;
+fn tunnel_args(proxy_url: &str, dns_ip: &str, mtu: u16) -> Result<Args, c_int> {
+    if !(1280..=9000).contains(&mtu) {
+        return Err(crate::VEIL_ERR_INVALID_ARG);
     }
-    // SAFETY: validated and copied before this call returns.
-    let proxy_url = match unsafe { required_str(proxy_url, "proxy_url") } {
-        Ok(value) => value,
-        Err(_) => return crate::VEIL_ERR_INVALID_ARG,
-    };
-    // SAFETY: validated and copied before this call returns.
-    let dns_ip = match unsafe { required_str(dns_ip, "dns_ip") } {
-        Ok(value) => value,
-        Err(_) => return crate::VEIL_ERR_INVALID_ARG,
-    };
     let proxy = match ArgProxy::try_from(proxy_url) {
         Ok(value) if value.addr.ip().is_loopback() => value,
-        _ => return crate::VEIL_ERR_INVALID_ARG,
+        _ => return Err(crate::VEIL_ERR_INVALID_ARG),
     };
-    let dns_addr = match dns_ip.parse::<IpAddr>() {
-        Ok(value) => value,
-        Err(_) => return crate::VEIL_ERR_INVALID_ARG,
-    };
+    let dns_addr = dns_ip
+        .parse::<IpAddr>()
+        .map_err(|_| crate::VEIL_ERR_INVALID_ARG)?;
+    Ok(Args {
+        proxy,
+        dns: ArgDns::Direct,
+        dns_addr,
+        ipv6_enabled: true,
+        setup: false,
+        mtu,
+        verbosity: ArgVerbosity::Warn,
+        ..Args::default()
+    })
+}
 
-    // Reject stale/closed descriptors before starting the worker. This check is
-    // intentionally non-owning: the platform service remains the fd owner.
-    // SAFETY: F_GETFD does not dereference memory and accepts any integer fd.
-    if unsafe { libc::fcntl(tun_fd, libc::F_GETFD) } < 0 {
-        return crate::VEIL_ERR_INVALID_ARG;
-    }
-
+fn launch_tunnel<F>(packet_tx: Option<mpsc::Sender<Vec<u8>>>, mtu: u16, run: F) -> c_int
+where
+    F: FnOnce(tokio::runtime::Runtime, CancellationToken) -> std::io::Result<usize>
+        + Send
+        + 'static,
+{
     let mut slot = tunnel_slot()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -135,6 +234,7 @@ pub unsafe extern "C" fn veil_packet_tunnel_start_fd(
         .name("veil-packet-tunnel".to_owned())
         .spawn(move || {
             let runtime = match tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
                 .enable_all()
                 .build()
             {
@@ -145,25 +245,8 @@ pub unsafe extern "C" fn veil_packet_tunnel_start_fd(
                     return;
                 }
             };
-            let mut args = Args {
-                proxy,
-                dns: ArgDns::Direct,
-                dns_addr,
-                ipv6_enabled,
-                setup: false,
-                mtu,
-                verbosity: ArgVerbosity::Warn,
-                ..Args::default()
-            };
-            args.tun_fd(Some(tun_fd)).close_fd_on_drop(false);
-
             worker_phase.store(VEIL_TUNNEL_RUNNING as u8, Ordering::Release);
-            let result = runtime.block_on(tun2proxy::general_run_async(
-                args,
-                mtu,
-                packet_information,
-                worker_cancel.clone(),
-            ));
+            let result = run(runtime, worker_cancel.clone());
             if worker_cancel.is_cancelled() {
                 worker_phase.store(VEIL_TUNNEL_STOPPED as u8, Ordering::Release);
             } else if let Err(error) = result {
@@ -181,9 +264,143 @@ pub unsafe extern "C" fn veil_packet_tunnel_start_fd(
         cancel,
         phase,
         error,
+        packet_tx,
+        mtu,
         thread: Some(thread),
     });
     crate::VEIL_OK
+}
+
+/// Start a packet engine over an OS-owned TUN file descriptor.
+///
+/// The host remains responsible for creating/configuring the interface and for
+/// keeping the descriptor alive until [`veil_packet_tunnel_stop`] returns.
+/// `proxy_url` must be a loopback SOCKS5 URL; accepting a remote/plain proxy
+/// here would bypass veil and make the VPN indicator misleading.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn veil_packet_tunnel_start_fd(
+    tun_fd: c_int,
+    proxy_url: *const c_char,
+    dns_ip: *const c_char,
+    mtu: c_ushort,
+    ipv6_enabled: bool,
+    packet_information: bool,
+) -> c_int {
+    if tun_fd < 0 {
+        return crate::VEIL_ERR_INVALID_ARG;
+    }
+    // SAFETY: validated and copied before this call returns.
+    let proxy_url = match unsafe { required_str(proxy_url, "proxy_url") } {
+        Ok(value) => value,
+        Err(_) => return crate::VEIL_ERR_INVALID_ARG,
+    };
+    // SAFETY: validated and copied before this call returns.
+    let dns_ip = match unsafe { required_str(dns_ip, "dns_ip") } {
+        Ok(value) => value,
+        Err(_) => return crate::VEIL_ERR_INVALID_ARG,
+    };
+    let mut args = match tunnel_args(proxy_url, dns_ip, mtu) {
+        Ok(args) => args,
+        Err(code) => return code,
+    };
+    args.ipv6_enabled = ipv6_enabled;
+
+    // Reject stale/closed descriptors before starting the worker. This check is
+    // intentionally non-owning: the platform service remains the fd owner.
+    // SAFETY: F_GETFD does not dereference memory and accepts any integer fd.
+    if unsafe { libc::fcntl(tun_fd, libc::F_GETFD) } < 0 {
+        return crate::VEIL_ERR_INVALID_ARG;
+    }
+
+    launch_tunnel(None, mtu, move |runtime, cancel| {
+        args.tun_fd(Some(tun_fd)).close_fd_on_drop(false);
+        runtime.block_on(tun2proxy::general_run_async(
+            args,
+            mtu,
+            packet_information,
+            cancel,
+        ))
+    })
+}
+
+/// Start a packet engine over a host-owned packet callback.
+///
+/// This is the public Network Extension path for iOS/macOS: the provider feeds
+/// each raw IP packet with [`veil_packet_tunnel_send_packet`], while `write_cb`
+/// receives each raw IP packet that must be returned through
+/// `NEPacketTunnelFlow.writePackets`. It deliberately avoids private access to
+/// Network Extension's underlying socket/file descriptor.
+///
+/// The ingress queue is bounded to 64 packets. A full queue returns
+/// `VEIL_ERR`; the provider should stop reading briefly and retry instead of
+/// accumulating unbounded packet memory. The callback context must remain live
+/// until [`veil_packet_tunnel_stop`] returns. `write_cb` is required and must
+/// not be null (a null C function pointer violates this FFI contract).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn veil_packet_tunnel_start_packets(
+    proxy_url: *const c_char,
+    dns_ip: *const c_char,
+    mtu: c_ushort,
+    ipv6_enabled: bool,
+    write_cb: PacketWriteFn,
+    write_ctx: *mut c_void,
+) -> c_int {
+    // SAFETY: validated and copied before this call returns.
+    let proxy_url = match unsafe { required_str(proxy_url, "proxy_url") } {
+        Ok(value) => value,
+        Err(_) => return crate::VEIL_ERR_INVALID_ARG,
+    };
+    // SAFETY: validated and copied before this call returns.
+    let dns_ip = match unsafe { required_str(dns_ip, "dns_ip") } {
+        Ok(value) => value,
+        Err(_) => return crate::VEIL_ERR_INVALID_ARG,
+    };
+    let mut args = match tunnel_args(proxy_url, dns_ip, mtu) {
+        Ok(args) => args,
+        Err(code) => return code,
+    };
+    args.ipv6_enabled = ipv6_enabled;
+
+    let (packet_tx, packet_rx) = mpsc::channel(PACKET_QUEUE_CAPACITY);
+    let device = CallbackDevice::new(packet_rx, write_cb, write_ctx, mtu);
+    launch_tunnel(Some(packet_tx), mtu, move |runtime, cancel| {
+        let sessions = runtime.block_on(tun2proxy::run(device, mtu, args, cancel))?;
+        Ok(sessions)
+    })
+}
+
+/// Queue one raw IP packet read from the host packet-flow API.
+///
+/// Returns `VEIL_OK` when accepted, `VEIL_ERR` when the bounded queue is full,
+/// `VEIL_ERR_CLOSED` when no callback-backed tunnel is running, or
+/// `VEIL_ERR_INVALID_ARG` for null/empty/over-MTU input. The function copies
+/// `data` before returning; the host may release its buffer immediately.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn veil_packet_tunnel_send_packet(data: *const u8, len: usize) -> c_int {
+    if data.is_null() || len == 0 {
+        return crate::VEIL_ERR_INVALID_ARG;
+    }
+    let mut slot = tunnel_slot()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    cleanup_finished(&mut slot);
+    let Some(tunnel) = slot.as_ref() else {
+        return crate::VEIL_ERR_CLOSED;
+    };
+    let Some(packet_tx) = tunnel.packet_tx.as_ref() else {
+        return crate::VEIL_ERR_CLOSED;
+    };
+    if len > usize::from(tunnel.mtu) {
+        return crate::VEIL_ERR_INVALID_ARG;
+    }
+    // SAFETY: pointer/length are caller-owned and promised live for this call;
+    // the length was bounded by the validated tunnel MTU before allocation.
+    let packet = unsafe { std::slice::from_raw_parts(data, len) }.to_vec();
+    match packet_tx.try_send(packet) {
+        Ok(()) => crate::VEIL_OK,
+        Err(mpsc::error::TrySendError::Full(_)) => crate::VEIL_ERR,
+        Err(mpsc::error::TrySendError::Closed(_)) => crate::VEIL_ERR_CLOSED,
+    }
 }
 
 #[unsafe(no_mangle)]
@@ -252,6 +469,21 @@ pub extern "C" fn veil_packet_tunnel_last_error() -> *mut c_char {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex as StdMutex;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    extern "C" fn collect_packet(ctx: *mut c_void, data: *const u8, len: usize) {
+        // SAFETY: tests pass a live `StdMutex<Vec<Vec<u8>>>` for the whole
+        // callback invocation, and the device guarantees a live packet slice.
+        let packets = unsafe { &*(ctx.cast::<StdMutex<Vec<Vec<u8>>>>()) };
+        // SAFETY: callback contract guarantees a non-null pointer valid for
+        // exactly `len` bytes during this call.
+        let packet = unsafe { std::slice::from_raw_parts(data, len) }.to_vec();
+        packets
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(packet);
+    }
 
     #[test]
     fn invalid_inputs_fail_before_creating_global_tunnel() {
@@ -285,5 +517,57 @@ mod tests {
         assert_eq!(phase_code(2), VEIL_TUNNEL_RUNNING);
         assert_eq!(phase_code(3), VEIL_TUNNEL_ERROR);
         assert_eq!(phase_code(u8::MAX), VEIL_TUNNEL_STOPPED);
+    }
+
+    #[test]
+    fn callback_device_preserves_ingress_and_egress_packets() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let (packet_tx, packet_rx) = mpsc::channel(2);
+        let output = StdMutex::new(Vec::<Vec<u8>>::new());
+        let output_ctx = (&output as *const StdMutex<Vec<Vec<u8>>>) as *mut c_void;
+        let mut device = CallbackDevice::new(packet_rx, collect_packet, output_ctx, 1280);
+
+        packet_tx.try_send(vec![0x45, 1, 2, 3, 4]).unwrap();
+        runtime.block_on(async {
+            let mut prefix = [0_u8; 2];
+            device.read_exact(&mut prefix).await.unwrap();
+            assert_eq!(prefix, [0x45, 1]);
+            let mut suffix = [0_u8; 3];
+            device.read_exact(&mut suffix).await.unwrap();
+            assert_eq!(suffix, [2, 3, 4]);
+
+            device.write_all(&[0x60, 9, 8, 7]).await.unwrap();
+        });
+        assert_eq!(
+            *output
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+            vec![vec![0x60, 9, 8, 7]],
+        );
+    }
+
+    #[test]
+    fn callback_device_rejects_over_mtu_output() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let (_packet_tx, packet_rx) = mpsc::channel(1);
+        let output = StdMutex::new(Vec::<Vec<u8>>::new());
+        let output_ctx = (&output as *const StdMutex<Vec<Vec<u8>>>) as *mut c_void;
+        let mut device = CallbackDevice::new(packet_rx, collect_packet, output_ctx, 1280);
+        let error = runtime
+            .block_on(device.write_all(&vec![0_u8; 1281]))
+            .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(
+            output
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .is_empty()
+        );
     }
 }
