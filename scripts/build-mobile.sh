@@ -117,6 +117,13 @@ build_one() {
         export BINDGEN_EXTRA_CLANG_ARGS_x86_64_apple_ios="--target=x86_64-apple-ios-simulator"
         ;;
     esac
+    # Rust/clang otherwise inherit the CURRENT SDK version as the minimum for
+    # C/C++ build-script objects (notably BoringSSL and PQClean). The archive
+    # still links, but Xcode emits one warning per object and the resulting app
+    # can fail to launch on older supported devices. Keep the native archive in
+    # lockstep with veil_flutter's iOS 13.0 deployment contract; callers may
+    # explicitly raise it, never silently lower it.
+    export IPHONEOS_DEPLOYMENT_TARGET="${IPHONEOS_DEPLOYMENT_TARGET:-13.0}"
     cd "$REPO_ROOT" && cargo rustc "${cargo_args[@]}" --crate-type staticlib
   else
     cd "$REPO_ROOT" && cargo build "${cargo_args[@]}"

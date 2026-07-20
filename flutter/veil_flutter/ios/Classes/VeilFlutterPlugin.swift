@@ -35,6 +35,7 @@
 import Flutter
 import UIKit
 import Security
+import NetworkExtension
 #if canImport(BackgroundTasks)
 import BackgroundTasks
 #endif
@@ -43,6 +44,7 @@ public class VeilFlutterPlugin: NSObject, FlutterPlugin {
 
     private static let LIFECYCLE_CHANNEL = "veil_flutter/lifecycle"
     private static let PUSH_CHANNEL      = "veil_flutter/push"
+    private static let VPN_CHANNEL       = "network.veil.xveil/vpn"
     private static let BG_TASK_IDENTIFIER = "com.veil.veil_flutter.refresh"
 
     // Keychain coordinates for the APNs device token.  Service identifier
@@ -88,6 +90,10 @@ public class VeilFlutterPlugin: NSObject, FlutterPlugin {
             name: PUSH_CHANNEL, binaryMessenger: registrar.messenger(),
         )
         registrar.addMethodCallDelegate(instance, channel: pushChannel)
+        let vpnChannel = FlutterMethodChannel(
+            name: VPN_CHANNEL, binaryMessenger: registrar.messenger(),
+        )
+        registrar.addMethodCallDelegate(instance, channel: vpnChannel)
 
         // Register the BGProcessingTask handler at plugin init.  iOS
         // refuses to schedule a task whose identifier isn't registered
@@ -174,8 +180,190 @@ public class VeilFlutterPlugin: NSObject, FlutterPlugin {
             } else {
                 result(nil)
             }
+        case "probe", "status", "confirmRunning":
+            vpnStatus(result)
+        case "start":
+            vpnStart(call.arguments, result: result)
+        case "stop", "abort":
+            vpnStop(result)
         default:
             result(FlutterMethodNotImplemented)
+        }
+    }
+
+    // MARK: - System packet tunnel
+
+    private static var packetTunnelBundleIdentifier: String? {
+        Bundle.main.bundleIdentifier.map { "\($0).PacketTunnel" }
+    }
+
+    private static func vpnState(_ phase: String, detail: String? = nil) -> [String: Any] {
+        var state: [String: Any] = ["phase": phase]
+        if let detail { state["detail"] = detail }
+        return state
+    }
+
+    private static func vpnPhase(_ status: NEVPNStatus) -> String {
+        switch status {
+        case .connected:
+            return "running"
+        case .connecting, .reasserting:
+            return "starting"
+        case .disconnecting:
+            return "stopping"
+        case .invalid, .disconnected:
+            return "stopped"
+        @unknown default:
+            return "error"
+        }
+    }
+
+    private func finish(_ result: @escaping FlutterResult, _ value: Any?) {
+        if Thread.isMainThread {
+            result(value)
+        } else {
+            DispatchQueue.main.async { result(value) }
+        }
+    }
+
+    private func loadPacketTunnelManager(
+        completion: @escaping (NETunnelProviderManager?, Error?) -> Void
+    ) {
+        guard let providerBundleIdentifier = Self.packetTunnelBundleIdentifier else {
+            completion(nil, NSError(
+                domain: "VeilVPN", code: 1,
+                userInfo: [NSLocalizedDescriptionKey: "host bundle identifier is unavailable"]
+            ))
+            return
+        }
+        NETunnelProviderManager.loadAllFromPreferences { managers, error in
+            let manager = managers?.first { candidate in
+                (candidate.protocolConfiguration as? NETunnelProviderProtocol)?
+                    .providerBundleIdentifier == providerBundleIdentifier
+            }
+            completion(manager, error)
+        }
+    }
+
+    private func vpnStatus(_ result: @escaping FlutterResult) {
+        loadPacketTunnelManager { manager, error in
+            if let error {
+                self.finish(result, Self.vpnState("error", detail: error.localizedDescription))
+                return
+            }
+            guard let manager else {
+                self.finish(result, Self.vpnState("stopped"))
+                return
+            }
+            self.finish(result, Self.vpnState(Self.vpnPhase(manager.connection.status)))
+        }
+    }
+
+    private func vpnStart(_ arguments: Any?, result: @escaping FlutterResult) {
+        guard let arguments = arguments as? [String: Any],
+              let policy = arguments["policy"] as? [String: Any],
+              let socks5Listen = arguments["socks5Listen"] as? String,
+              !socks5Listen.isEmpty,
+              let providerBundleIdentifier = Self.packetTunnelBundleIdentifier
+        else {
+            finish(result, Self.vpnState("error", detail: "invalid VPN arguments"))
+            return
+        }
+
+        loadPacketTunnelManager { existing, loadError in
+            if let loadError {
+                self.finish(result, Self.vpnState("error", detail: loadError.localizedDescription))
+                return
+            }
+            let manager = existing ?? NETunnelProviderManager()
+            let tunnelProtocol = NETunnelProviderProtocol()
+            tunnelProtocol.providerBundleIdentifier = providerBundleIdentifier
+            tunnelProtocol.serverAddress = "xVeil local SOCKS5"
+            var providerConfiguration = policy
+            providerConfiguration["socks5Listen"] = socks5Listen
+            tunnelProtocol.providerConfiguration = providerConfiguration
+            manager.protocolConfiguration = tunnelProtocol
+            manager.localizedDescription = "xVeil"
+            manager.isEnabled = true
+            manager.saveToPreferences { saveError in
+                if let saveError {
+                    self.finish(result, Self.vpnState("error", detail: saveError.localizedDescription))
+                    return
+                }
+                // Apple requires a reload after the first save; starting the
+                // stale in-memory manager can otherwise fail with configurationInvalid.
+                manager.loadFromPreferences { reloadError in
+                    if let reloadError {
+                        self.finish(result, Self.vpnState("error", detail: reloadError.localizedDescription))
+                        return
+                    }
+                    do {
+                        try manager.connection.startVPNTunnel()
+                    } catch {
+                        self.finish(result, Self.vpnState("error", detail: error.localizedDescription))
+                        return
+                    }
+                    self.waitForVPN(
+                        manager.connection,
+                        targetRunning: true,
+                        deadline: .now() + .seconds(12),
+                        result: result
+                    )
+                }
+            }
+        }
+    }
+
+    private func vpnStop(_ result: @escaping FlutterResult) {
+        loadPacketTunnelManager { manager, error in
+            if let error {
+                self.finish(result, Self.vpnState("error", detail: error.localizedDescription))
+                return
+            }
+            guard let manager else {
+                self.finish(result, Self.vpnState("stopped"))
+                return
+            }
+            manager.connection.stopVPNTunnel()
+            self.waitForVPN(
+                manager.connection,
+                targetRunning: false,
+                deadline: .now() + .seconds(5),
+                result: result
+            )
+        }
+    }
+
+    private func waitForVPN(
+        _ connection: NEVPNConnection,
+        targetRunning: Bool,
+        deadline: DispatchTime,
+        result: @escaping FlutterResult
+    ) {
+        let phase = Self.vpnPhase(connection.status)
+        if targetRunning && phase == "running" {
+            finish(result, Self.vpnState("running"))
+            return
+        }
+        if !targetRunning && phase == "stopped" {
+            finish(result, Self.vpnState("stopped"))
+            return
+        }
+        if .now() >= deadline {
+            let expected = targetRunning ? "start" : "stop"
+            finish(result, Self.vpnState(
+                "error",
+                detail: "VPN did not \(expected) before timeout (\(phase))"
+            ))
+            return
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(100)) {
+            self.waitForVPN(
+                connection,
+                targetRunning: targetRunning,
+                deadline: deadline,
+                result: result
+            )
         }
     }
 
