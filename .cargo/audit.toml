@@ -11,4 +11,17 @@ ignore = [
     "RUSTSEC-2026-0162", # pqcrypto-traits unmaintained
     "RUSTSEC-2026-0163", # pqcrypto-internals unmaintained
     "RUSTSEC-2026-0165", # pqcrypto-falcon unmaintained
+
+    # tun2proxy 0.8.2 currently declares daemonize for its optional CLI
+    # behaviour even when embedded through the library API. xVeil never calls
+    # that path. The advisory is maintenance-only, not a vulnerability; keep
+    # the exact tun2proxy pin and remove this exception when upstream replaces
+    # or feature-gates daemonize.
+    "RUSTSEC-2025-0069", # daemonize unmaintained
+
+    # paste is a compile-time macro dependency of the Linux-only
+    # tproxy-config -> rtnetlink path pulled by tun2proxy. The advisory is
+    # maintenance-only and reports no vulnerability. Track upstream
+    # netlink-packet-core and remove this exception once it drops paste.
+    "RUSTSEC-2024-0436", # paste unmaintained
 ]

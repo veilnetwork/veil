@@ -26,6 +26,17 @@ ignore = [
     "RUSTSEC-2026-0162", # pqcrypto-traits   — unmaintained (PQClean archived)
     "RUSTSEC-2026-0163", # pqcrypto-internals — unmaintained (PQClean archived)
     "RUSTSEC-2026-0165", # pqcrypto-falcon   — unmaintained (PQClean archived)
+    # tun2proxy's embedded library path does not use its daemonize CLI helper.
+    # Upstream 0.8.2 nevertheless declares it unconditionally for Unix. This
+    # is a maintenance-only advisory, not an active vulnerability; retain the
+    # exact tun2proxy pin and remove the exception once upstream feature-gates
+    # or replaces daemonize.
+    "RUSTSEC-2025-0069", # daemonize — unmaintained (tun2proxy CLI-only path)
+    # Linux-only transitive compile-time macro dependency:
+    # tun2proxy -> tproxy-config -> rtnetlink -> netlink-packet-core -> paste.
+    # The advisory is maintenance-only. Remove when netlink-packet-core drops
+    # paste; no runtime vulnerability is being accepted here.
+    "RUSTSEC-2024-0436", # paste — unmaintained (netlink macro dependency)
 ]
 
 [licenses]
@@ -56,6 +67,13 @@ allow = [
     "CDLA-Permissive-2.0",
     "Unlicense",
     "WTFPL",
+]
+# xVeil and veil are AGPL-3.0-or-later, so this narrowly-scoped GPL-3.0+
+# dependency is license-compatible with the distributed work. Keep GPL out of
+# the global allow-list: only tun2proxy's pinned SOCKS protocol implementation
+# is accepted, and a second GPL dependency will still fail the gate.
+exceptions = [
+    { crate = "socks5-impl@0.8.7", allow = ["GPL-3.0-or-later"] },
 ]
 
 [bans]

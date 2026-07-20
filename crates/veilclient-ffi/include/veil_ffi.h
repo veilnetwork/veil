@@ -372,6 +372,14 @@
 #define NICKNAME_FREE 1
 #endif
 
+#define VEIL_TUNNEL_STOPPED 0
+
+#define VEIL_TUNNEL_STARTING 1
+
+#define VEIL_TUNNEL_RUNNING 2
+
+#define VEIL_TUNNEL_ERROR 3
+
 typedef struct Option_MediaRecvFn Option_MediaRecvFn;
 
 #if defined(VEIL_FFI_NODE_EMBEDDED)
@@ -2709,6 +2717,33 @@ int veil_node_apply_config(const VeilNode *node,
  */
  void veil_node_stop(VeilNode *node) ;
 #endif
+
+/**
+ * Start a packet engine over an OS-owned TUN file descriptor.
+ *
+ * The host remains responsible for creating/configuring the interface and for
+ * keeping the descriptor alive until [`veil_packet_tunnel_stop`] returns.
+ * `proxy_url` must be a loopback SOCKS5 URL; accepting a remote/plain proxy
+ * here would bypass veil and make the VPN indicator misleading.
+ */
+
+int veil_packet_tunnel_start_fd(int tun_fd,
+                                const char *proxy_url,
+                                const char *dns_ip,
+                                unsigned short mtu,
+                                bool ipv6_enabled,
+                                bool packet_information)
+;
+
+ int veil_packet_tunnel_status(void) ;
+
+ int veil_packet_tunnel_stop(void) ;
+
+/**
+ * Latest engine error, allocated with `CString::into_raw`. Free with the
+ * existing `veil_free_string` ABI. Returns null when no error is recorded.
+ */
+ char *veil_packet_tunnel_last_error(void) ;
 
 #ifdef __cplusplus
 }  // extern "C"
