@@ -17,6 +17,7 @@ int32_t veil_packet_tunnel_start_packets(const char *proxy_url,
                                          const char *dns_ip,
                                          uint16_t mtu,
                                          bool ipv6_enabled,
+                                         bool route_dns,
                                          VeilPacketWriteFn write_callback,
                                          void *write_context);
 int32_t veil_packet_tunnel_send_packet(const uint8_t *data, uintptr_t length);
