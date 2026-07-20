@@ -19,7 +19,11 @@ import android.content.Context
 import android.content.Intent
 import android.content.SharedPreferences
 import android.net.Uri
+import android.net.VpnService
 import android.os.Build
+import android.os.Handler
+import android.os.Looper
+import android.os.SystemClock
 import android.os.PowerManager
 import android.provider.Settings
 import androidx.security.crypto.EncryptedSharedPreferences
@@ -31,12 +35,16 @@ import io.flutter.plugin.common.MethodCall
 import io.flutter.plugin.common.MethodChannel
 import io.flutter.plugin.common.MethodChannel.MethodCallHandler
 import io.flutter.plugin.common.MethodChannel.Result
+import io.flutter.plugin.common.PluginRegistry
 
-class VeilFlutterPlugin : FlutterPlugin, MethodCallHandler, ActivityAware {
+class VeilFlutterPlugin : FlutterPlugin, MethodCallHandler, ActivityAware,
+    PluginRegistry.ActivityResultListener {
 
     companion object {
         private const val LIFECYCLE_CHANNEL = "veil_flutter/lifecycle"
         private const val PUSH_CHANNEL = "veil_flutter/push"
+        private const val VPN_CHANNEL = "network.veil.xveil/vpn"
+        private const val VPN_PERMISSION_REQUEST = 0x5645
         // Legacy plain-text prefs file — read-once-then-delete migration
         // target.  Existing installs may have a cleartext token here;
         // we move it to the encrypted store on first read so older app
@@ -60,8 +68,11 @@ class VeilFlutterPlugin : FlutterPlugin, MethodCallHandler, ActivityAware {
 
     private lateinit var lifecycleChannel: MethodChannel
     private lateinit var pushChannel: MethodChannel
+    private lateinit var vpnChannel: MethodChannel
     private var appContext: Context? = null
     private var activity: Activity? = null
+    private var activityBinding: ActivityPluginBinding? = null
+    private var pendingVpnStart: Pair<Map<*, *>, Result>? = null
 
     override fun onAttachedToEngine(binding: FlutterPlugin.FlutterPluginBinding) {
         appContext = binding.applicationContext
@@ -69,25 +80,54 @@ class VeilFlutterPlugin : FlutterPlugin, MethodCallHandler, ActivityAware {
         lifecycleChannel.setMethodCallHandler(this)
         pushChannel = MethodChannel(binding.binaryMessenger, PUSH_CHANNEL)
         pushChannel.setMethodCallHandler(this)
+        vpnChannel = MethodChannel(binding.binaryMessenger, VPN_CHANNEL)
+        vpnChannel.setMethodCallHandler(this)
     }
 
     override fun onDetachedFromEngine(binding: FlutterPlugin.FlutterPluginBinding) {
         lifecycleChannel.setMethodCallHandler(null)
         pushChannel.setMethodCallHandler(null)
+        vpnChannel.setMethodCallHandler(null)
+        pendingVpnStart?.second?.error("DETACHED", "VPN request was interrupted", null)
+        pendingVpnStart = null
         appContext = null
     }
 
     override fun onAttachedToActivity(binding: ActivityPluginBinding) {
         activity = binding.activity
+        activityBinding = binding
+        binding.addActivityResultListener(this)
     }
 
-    override fun onDetachedFromActivity() { activity = null }
+    override fun onDetachedFromActivity() {
+        activityBinding?.removeActivityResultListener(this)
+        activityBinding = null
+        activity = null
+    }
 
     override fun onReattachedToActivityForConfigChanges(b: ActivityPluginBinding) {
         activity = b.activity
+        activityBinding = b
+        b.addActivityResultListener(this)
     }
 
-    override fun onDetachedFromActivityForConfigChanges() { activity = null }
+    override fun onDetachedFromActivityForConfigChanges() {
+        activityBinding?.removeActivityResultListener(this)
+        activityBinding = null
+        activity = null
+    }
+
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?): Boolean {
+        if (requestCode != VPN_PERMISSION_REQUEST) return false
+        val pending = pendingVpnStart ?: return true
+        pendingVpnStart = null
+        if (resultCode != Activity.RESULT_OK) {
+            pending.second.success(mapOf("phase" to "error", "detail" to "VPN permission denied"))
+            return true
+        }
+        launchVpnInterface(pending.first, pending.second)
+        return true
+    }
 
     override fun onMethodCall(call: MethodCall, result: Result) {
         val ctx = appContext
@@ -96,6 +136,39 @@ class VeilFlutterPlugin : FlutterPlugin, MethodCallHandler, ActivityAware {
             return
         }
         when (call.method) {
+            "probe", "status" -> {
+                result.success(vpnStateMap())
+            }
+            "start" -> {
+                val args = call.arguments as? Map<*, *>
+                val act = activity
+                if (args == null || act == null) {
+                    result.success(mapOf("phase" to "error", "detail" to "VPN requires an active window"))
+                    return
+                }
+                if (pendingVpnStart != null) {
+                    result.success(mapOf("phase" to "error", "detail" to "VPN permission request already active"))
+                    return
+                }
+                val permission = VpnService.prepare(act)
+                if (permission == null) {
+                    launchVpnInterface(args, result)
+                } else {
+                    pendingVpnStart = args to result
+                    act.startActivityForResult(permission, VPN_PERMISSION_REQUEST)
+                }
+            }
+            "confirmRunning" -> {
+                VeilVpnService.confirmRunning()
+                result.success(vpnStateMap())
+            }
+            "abort", "stop" -> {
+                val intent = Intent(ctx, VeilVpnService::class.java).apply {
+                    action = VeilVpnService.ACTION_STOP
+                }
+                ctx.startService(intent)
+                result.success(mapOf("phase" to "stopped"))
+            }
             "startBackgroundService" -> {
                 val title = call.argument<String>("title")
                 val text  = call.argument<String>("text")
@@ -258,6 +331,58 @@ class VeilFlutterPlugin : FlutterPlugin, MethodCallHandler, ActivityAware {
             }
             else -> result.notImplemented()
         }
+    }
+
+    private fun vpnStateMap(): Map<String, Any?> = mapOf(
+        "phase" to VeilVpnService.phase,
+        "detail" to VeilVpnService.detail,
+        "tunFd" to VeilVpnService.tunFd,
+    )
+
+    private fun launchVpnInterface(arguments: Map<*, *>, result: Result) {
+        val ctx = appContext ?: run {
+            result.success(mapOf("phase" to "error", "detail" to "Plugin detached"))
+            return
+        }
+        val policy = arguments["policy"] as? Map<*, *> ?: emptyMap<Any, Any>()
+        val intent = Intent(ctx, VeilVpnService::class.java).apply {
+            action = VeilVpnService.ACTION_START
+            putExtra(VeilVpnService.EXTRA_ROUTE_MODE, policy["routeMode"] as? String ?: "allTraffic")
+            putStringArrayListExtra(
+                VeilVpnService.EXTRA_INCLUDED,
+                ArrayList((policy["includedCidrs"] as? List<*>)?.filterIsInstance<String>() ?: emptyList()),
+            )
+            putStringArrayListExtra(
+                VeilVpnService.EXTRA_EXCLUDED,
+                ArrayList((policy["excludedCidrs"] as? List<*>)?.filterIsInstance<String>() ?: emptyList()),
+            )
+            putExtra(VeilVpnService.EXTRA_ROUTE_DNS, policy["routeDns"] as? Boolean ?: true)
+            putStringArrayListExtra(
+                VeilVpnService.EXTRA_DNS,
+                ArrayList((policy["dnsServers"] as? List<*>)?.filterIsInstance<String>() ?: listOf("1.1.1.1")),
+            )
+            putExtra(VeilVpnService.EXTRA_ALLOW_LAN, policy["allowLan"] as? Boolean ?: true)
+            putExtra(VeilVpnService.EXTRA_MTU, (policy["mtu"] as? Number)?.toInt() ?: 1280)
+        }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            ctx.startForegroundService(intent)
+        } else {
+            ctx.startService(intent)
+        }
+        awaitVpnInterface(result, SystemClock.uptimeMillis() + 3000L)
+    }
+
+    private fun awaitVpnInterface(result: Result, deadline: Long) {
+        val state = VeilVpnService.phase
+        if (state == VeilVpnService.PHASE_ERROR || VeilVpnService.tunFd != null) {
+            result.success(vpnStateMap())
+            return
+        }
+        if (SystemClock.uptimeMillis() >= deadline) {
+            result.success(mapOf("phase" to "error", "detail" to "Timed out creating VPN interface"))
+            return
+        }
+        Handler(Looper.getMainLooper()).postDelayed({ awaitVpnInterface(result, deadline) }, 25L)
     }
 
     /// Open the EncryptedSharedPreferences store, migrating any
