@@ -20,6 +20,7 @@
  */
 
 #include "veil_audio_record.h"
+#include "veil_diag_log.h"
 
 #include <atomic>
 #include <cstring>
@@ -29,7 +30,6 @@
 
 #if defined(VEIL_MEDIA_HAVE_WEBRTC)
 #include <cstdarg>
-#include <cstdio>
 
 #include "api/audio/audio_device.h"
 #include "api/audio/audio_device_defines.h"
@@ -65,14 +65,10 @@ constexpr int kMaxDurationMs = 6 * 60 * 1000;
 constexpr size_t kMaxWaveformPeaks = 64 * 1024;  // ~10 min of 10 ms peaks
 
 void rlog(const char* fmt, ...) {
-  FILE* f = fopen("/tmp/veil_media_diag.log", "a");
-  if (!f) return;
   va_list ap;
   va_start(ap, fmt);
-  vfprintf(f, fmt, ap);
+  veil_media::diag::vlog(fmt, ap);
   va_end(ap);
-  fputc('\n', f);
-  fclose(f);
 }
 
 void put_u16le(std::vector<uint8_t>& v, uint16_t x) {

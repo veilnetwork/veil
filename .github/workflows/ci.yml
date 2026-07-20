@@ -103,6 +103,13 @@ jobs:
         # vector). See scripts/check-cyrillic-runtime-strings.sh.
         run: ./scripts/check-cyrillic-runtime-strings.sh
 
+      - name: Native media diagnostics are explicit opt-in
+        run: |
+          c++ -std=c++17 -Wall -Wextra -Werror \
+            flutter/veil_media/test/diag_log_smoke.cc \
+            -o "${RUNNER_TEMP}/veil-media-diag-smoke"
+          "${RUNNER_TEMP}/veil-media-diag-smoke"
+
       - name: Install cargo-audit
         # Phase 6.50.b audit-A2: `cargo audit` gates against the RustSec
         # advisory DB on every push to main.  Pinned minor (^0.22) for
