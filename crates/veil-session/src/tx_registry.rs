@@ -364,10 +364,10 @@ impl SessionTxRegistry {
     /// exact post-restart delivery blackout the reconnect eviction was meant to
     /// solve.
     pub fn unregister_owned(&mut self, peer_id: &NodeIdBytes, owner: &SessionTxOwner) -> bool {
-        if !self
+        if self
             .senders
             .get(peer_id)
-            .is_some_and(|entry| entry.owner.as_ref() == Some(owner))
+            .is_none_or(|entry| entry.owner.as_ref() != Some(owner))
         {
             return false;
         }
