@@ -27,6 +27,7 @@ plugin glue for push-notification wake (Epic 489.10).
   s.source_files     = 'Classes/**/*'
   s.public_header_files = 'Classes/**/*.h'
   s.dependency 'Flutter'
+  s.frameworks = 'NetworkExtension'
   s.platform = :ios, '13.0'
 
   # Vendored static lib produced by scripts/build-mobile.sh.
