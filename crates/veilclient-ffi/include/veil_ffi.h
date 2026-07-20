@@ -2742,7 +2742,8 @@ int veil_packet_tunnel_start_fd(int tun_fd,
                                 const char *dns_ip,
                                 unsigned short mtu,
                                 bool ipv6_enabled,
-                                bool packet_information)
+                                bool packet_information,
+                                bool route_dns)
 ;
 
 /**
@@ -2765,6 +2766,7 @@ int veil_packet_tunnel_start_packets(const char *proxy_url,
                                      const char *dns_ip,
                                      unsigned short mtu,
                                      bool ipv6_enabled,
+                                     bool route_dns,
                                      PacketWriteFn write_cb,
                                      void *write_ctx)
 ;
@@ -2788,6 +2790,24 @@ int veil_packet_tunnel_start_packets(const char *proxy_url,
  * existing `veil_free_string` ABI. Returns null when no error is recorded.
  */
  char *veil_packet_tunnel_last_error(void) ;
+
+/**
+ * Run xVeil's privileged Linux desktop packet-tunnel helper.
+ *
+ * The normal GUI re-executes the *same xVeil executable* through `pkexec`
+ * with a root-owned helper mode; no separately installed VPN binary or daemon
+ * is required. `config_path` points to a bounded, owner-checked JSON request.
+ * The helper writes one JSON status line to stdout, then remains alive until
+ * stdin closes/receives `stop` or SIGINT/SIGTERM arrives. System routes,
+ * nftables state, resolver settings, and the GUI's temporary cgroup are
+ * restored before the function returns.
+ *
+ * On non-Linux targets this always returns `VEIL_ERR_INVALID_ARG`.
+ *
+ * # Safety
+ * `config_path` must be a live NUL-terminated UTF-8 string for this call.
+ */
+ int veil_packet_tunnel_run_linux_helper(const char *config_path) ;
 
 #ifdef __cplusplus
 }  // extern "C"

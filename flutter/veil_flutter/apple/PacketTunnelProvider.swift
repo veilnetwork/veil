@@ -259,6 +259,7 @@ public final class PacketTunnelProvider: NEPacketTunnelProvider {
                     dns,
                     configuration.mtu,
                     true,
+                    configuration.routeDNS,
                     veilApplePacketWrite,
                     context
                 )
