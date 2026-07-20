@@ -519,7 +519,8 @@ int veil_media_vnote_recorder_start(VeilVnoteRecorder* rec) {
             int sy, int su, int sv, int64_t /*ts_us*/) {
         encode_i420(rec, y, u, v, w, h, sy, su, sv);
       }));
-  if (rec->camera && !rec->camera->Start(rec->square, rec->square, rec->fps)) {
+  if (rec->camera &&
+      !rec->camera->Start(rec->square, rec->square, rec->fps, nullptr)) {
     vnlog("vnote: camera start failed (frames only from push)");
     rec->camera.reset();
   }

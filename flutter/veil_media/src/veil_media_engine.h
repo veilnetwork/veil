@@ -152,6 +152,12 @@ int veil_media_engine_set_video_bitrate(VeilMediaEngine *engine,
  * or the device can't be opened. Idempotent. */
 int veil_media_engine_start_camera(VeilMediaEngine *engine, int width,
                                    int height, int fps);
+/* Device-aware variant. `device_id` is an opaque id returned by
+ * veil_media_engine_list_video_inputs; NULL/empty selects the platform
+ * default. Kept separate so existing native consumers retain ABI. */
+int veil_media_engine_start_camera_device(VeilMediaEngine *engine,
+                                          const char *device_id, int width,
+                                          int height, int fps);
 int veil_media_engine_stop_camera(VeilMediaEngine *engine);
 
 /* Screen share: capture the main display into the SAME VP8 send source the
@@ -207,6 +213,7 @@ int veil_media_engine_get_local_video_frame(VeilMediaEngine *engine,
  * that behind the same API.) */
 char *veil_media_engine_list_audio_inputs(VeilMediaEngine *engine);
 char *veil_media_engine_list_audio_outputs(VeilMediaEngine *engine);
+char *veil_media_engine_list_video_inputs(VeilMediaEngine *engine);
 int veil_media_engine_select_audio_input(VeilMediaEngine *engine,
                                          const char *id);
 int veil_media_engine_select_audio_output(VeilMediaEngine *engine,

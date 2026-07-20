@@ -102,6 +102,19 @@ class VeilAAudioAdm : public webrtc::webrtc_impl::AudioDeviceModuleDefault<
     return 0;
   }
 
+  // Android supplies real AudioDeviceInfo ids through the app MethodChannel.
+  // The WebRTC ADM interface only carries uint16 ids, which is sufficient for
+  // Android's session-local device identifiers; AAudio applies them when the
+  // stream is reopened by the engine's stop/select/restart sequence.
+  int32_t SetRecordingDevice(uint16_t index) override {
+    recording_device_id_.store(index);
+    return 0;
+  }
+  int32_t SetPlayoutDevice(uint16_t index) override {
+    playout_device_id_.store(index);
+    return 0;
+  }
+
   int32_t InitPlayout() override {
     playout_initialized_ = true;
     return 0;
@@ -166,6 +179,8 @@ class VeilAAudioAdm : public webrtc::webrtc_impl::AudioDeviceModuleDefault<
     AAudioStreamBuilder_setSharingMode(b, AAUDIO_SHARING_MODE_SHARED);
     AAudioStreamBuilder_setPerformanceMode(b,
                                            AAUDIO_PERFORMANCE_MODE_LOW_LATENCY);
+    const int32_t device_id = recording_device_id_.load();
+    if (device_id > 0) AAudioStreamBuilder_setDeviceId(b, device_id);
     AAudioStreamBuilder_setDataCallback(b, &VeilAAudioAdm::RecordCallback, this);
     const aaudio_result_t r = AAudioStreamBuilder_openStream(b, &rec_stream_);
     AAudioStreamBuilder_delete(b);
@@ -200,6 +215,8 @@ class VeilAAudioAdm : public webrtc::webrtc_impl::AudioDeviceModuleDefault<
     AAudioStreamBuilder_setSharingMode(b, AAUDIO_SHARING_MODE_SHARED);
     AAudioStreamBuilder_setPerformanceMode(b,
                                            AAUDIO_PERFORMANCE_MODE_LOW_LATENCY);
+    const int32_t device_id = playout_device_id_.load();
+    if (device_id > 0) AAudioStreamBuilder_setDeviceId(b, device_id);
     AAudioStreamBuilder_setDataCallback(b, &VeilAAudioAdm::PlayCallback, this);
     const aaudio_result_t r = AAudioStreamBuilder_openStream(b, &play_stream_);
     AAudioStreamBuilder_delete(b);
@@ -264,6 +281,8 @@ class VeilAAudioAdm : public webrtc::webrtc_impl::AudioDeviceModuleDefault<
   bool recording_initialized_ = false;
   std::atomic<bool> recording_{false};
   std::atomic<bool> playing_{false};
+  std::atomic<int32_t> recording_device_id_{0};
+  std::atomic<int32_t> playout_device_id_{0};
   AAudioStream* rec_stream_ = nullptr;
   AAudioStream* play_stream_ = nullptr;
   int32_t rec_channels_ = kChannels;
