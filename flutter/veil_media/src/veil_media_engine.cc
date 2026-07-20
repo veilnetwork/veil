@@ -828,7 +828,13 @@ struct WebrtcState {
   std::unique_ptr<veil_media::CameraCapturer> camera;  // real capture source
   std::unique_ptr<veil_media::ScreenCapturer> screen;  // screen-share source
   int video_target_bitrate_bps = 0;
-  int video_max_fps = 0;
+  std::atomic<int> video_max_fps{0};
+  // Camera2/AVFoundation are external sources. Reconfiguring libwebrtc's
+  // encoder advertises a lower max_framerate but does not reliably make those
+  // sources shed frames, so a congested relay kept emitting at the physical
+  // camera's 30 fps. Gate only the encoder handoff; local preview remains at
+  // capture/display cadence.
+  std::atomic<int64_t> video_last_encoded_frame_us{0};
 #if defined(__ANDROID__)
   // Camera2's ImageReader callback must not be held by hidden work in the
   // native push. Split the synchronous JNI duration into pixel conversion and
@@ -839,6 +845,40 @@ struct WebrtcState {
   std::unique_ptr<Android420FrameDispatcher> android420_dispatcher;
 #endif
 };
+
+bool should_encode_video_frame(WebrtcState* ws) {
+  if (ws == nullptr) return false;
+  const int fps = ws->video_max_fps.load(std::memory_order_relaxed);
+  if (fps <= 0) return true;
+  const int64_t now_us = webrtc::TimeMicros();
+  const int64_t min_interval_us = 1'000'000 / fps;
+  // Keep an ideal send timeline instead of storing the wall-clock time of the
+  // last accepted frame.  A plain `now - last >= interval` gate turns a 60 Hz
+  // source into 30 fps for every target between 31 and 59 because the first
+  // 16 ms frame misses the threshold and the next accepted frame restarts the
+  // interval. Advancing by exactly one interval preserves the fractional
+  // credit and converges on targets such as 45 or 18 fps without bursts.
+  const int64_t timing_tolerance_us =
+      std::min<int64_t>(2'000, min_interval_us / 20);
+  int64_t previous =
+      ws->video_last_encoded_frame_us.load(std::memory_order_relaxed);
+  for (;;) {
+    if (previous > 0 && now_us >= previous &&
+        now_us - previous + timing_tolerance_us < min_interval_us) {
+      return false;
+    }
+    int64_t next = now_us;
+    if (previous > 0 && now_us >= previous &&
+        now_us - previous <= min_interval_us * 4) {
+      next = previous + min_interval_us;
+    }
+    if (ws->video_last_encoded_frame_us.compare_exchange_weak(
+            previous, next, std::memory_order_relaxed,
+            std::memory_order_relaxed)) {
+      return true;
+    }
+  }
+}
 
 struct GroupPeerState {
   uint64_t chan = 0;
@@ -1864,7 +1904,8 @@ int veil_media_engine_start_video(VeilMediaEngine* engine, int send, int recv,
       const int fps = std::clamp(max_fps > 0 ? max_fps : 15, 5, 60);
       const int bps = kbps * 1000;
       ws->video_target_bitrate_bps = bps;
-      ws->video_max_fps = fps;
+      ws->video_max_fps.store(fps, std::memory_order_relaxed);
+      ws->video_last_encoded_frame_us.store(0, std::memory_order_relaxed);
       // Anchor the Call's bandwidth estimate to the route budget. Without
       // this the BWE starts at webrtc's 300 kbps default and — on the veil
       // datagram channel, where no transport feedback ever raises it — the
@@ -1980,7 +2021,8 @@ int veil_media_engine_set_video_bitrate(VeilMediaEngine* engine,
     kbps = std::clamp(kbps, 30, 2500);
     const int fps = std::clamp(max_fps > 0 ? max_fps : 15, 5, 60);
     const int bps = kbps * 1000;
-    if (bps == ws->video_target_bitrate_bps && fps == ws->video_max_fps) {
+    if (bps == ws->video_target_bitrate_bps &&
+        fps == ws->video_max_fps.load(std::memory_order_relaxed)) {
       rc = VEIL_MEDIA_OK;
       return;
     }
@@ -2011,7 +2053,8 @@ int veil_media_engine_set_video_bitrate(VeilMediaEngine* engine,
       ws->call->SetClientBitratePreferences(bs);
     }
     ws->video_target_bitrate_bps = bps;
-    ws->video_max_fps = fps;
+    ws->video_max_fps.store(fps, std::memory_order_relaxed);
+    ws->video_last_encoded_frame_us.store(0, std::memory_order_relaxed);
     vlog("video: retuned to %d kbps @ %d fps", kbps, fps);
     rc = VEIL_MEDIA_OK;
   });
@@ -2074,11 +2117,13 @@ int veil_media_engine_start_camera(VeilMediaEngine* engine, int width,
   webrtc::VideoBroadcaster* src = ws->video_source.get();
   VeilVideoSink* local_sink = ws->local_video_sink.get();
   ws->camera.reset(veil_media::CreatePlatformCamera(
-      [src, local_sink](const uint8_t* y, const uint8_t* u, const uint8_t* v,
-                        int w, int h, int sy, int su, int sv, int64_t ts_us) {
+      [ws, src, local_sink](const uint8_t* y, const uint8_t* u,
+                            const uint8_t* v, int w, int h, int sy, int su,
+                            int sv, int64_t ts_us) {
         if (local_sink)
           local_sink->store_i420(y, u, v, w, h, sy, su, sv);
-        push_i420(src, y, u, v, w, h, sy, su, sv, ts_us);
+        if (should_encode_video_frame(ws))
+          push_i420(src, y, u, v, w, h, sy, su, sv, ts_us);
       }));
   if (!ws->camera) return VEIL_MEDIA_ERR_STATE;
   if (!ws->camera->Start(width, height, fps)) {
@@ -2125,11 +2170,13 @@ int veil_media_engine_start_screen(VeilMediaEngine* engine, int width,
   webrtc::VideoBroadcaster* src = ws->video_source.get();
   VeilVideoSink* local_sink = ws->local_video_sink.get();
   ws->screen.reset(veil_media::CreatePlatformScreen(
-      [src, local_sink](const uint8_t* y, const uint8_t* u, const uint8_t* v,
-                        int w, int h, int sy, int su, int sv, int64_t ts_us) {
+      [ws, src, local_sink](const uint8_t* y, const uint8_t* u,
+                            const uint8_t* v, int w, int h, int sy, int su,
+                            int sv, int64_t ts_us) {
         if (local_sink)
           local_sink->store_i420(y, u, v, w, h, sy, su, sv);
-        push_i420(src, y, u, v, w, h, sy, su, sv, ts_us);
+        if (should_encode_video_frame(ws))
+          push_i420(src, y, u, v, w, h, sy, su, sv, ts_us);
       }));
   if (!ws->screen) return VEIL_MEDIA_ERR_STATE;
   if (!ws->screen->Start(width, fps)) {
@@ -2169,6 +2216,7 @@ int veil_media_engine_push_video_frame(VeilMediaEngine* engine,
   if (engine->ws->local_video_sink)
     engine->ws->local_video_sink->store_i420(y, u, v, width, height, stride_y,
                                              stride_u, stride_v);
+  if (!should_encode_video_frame(engine->ws.get())) return VEIL_MEDIA_OK;
   push_i420(engine->ws->video_source.get(), y, u, v, width, height, stride_y,
             stride_u, stride_v, ts_us);
   return VEIL_MEDIA_OK;
@@ -2193,6 +2241,7 @@ int veil_media_engine_push_android420_frame(
   WebrtcState* ws = engine->ws.get();
 #if defined(__ANDROID__)
   if (!ws->android420_dispatcher) return VEIL_MEDIA_ERR_STATE;
+  if (!should_encode_video_frame(ws)) return VEIL_MEDIA_OK;
   return ws->android420_dispatcher->Submit(
              ws->video_source.get(), y, u, v, width, height, stride_y,
              stride_u, stride_v, pixel_stride_uv, rotation, ts_us)
@@ -2551,7 +2600,8 @@ char* veil_media_engine_get_stats(VeilMediaEngine* engine) {
         static_cast<unsigned long long>(android420_submitted),
         static_cast<unsigned long long>(android420_processed),
         static_cast<unsigned long long>(android420_replaced),
-        ws->video_target_bitrate_bps, ws->video_max_fps);
+        ws->video_target_bitrate_bps,
+        ws->video_max_fps.load(std::memory_order_relaxed));
     return dup_cstr(json);
   }
 #endif
