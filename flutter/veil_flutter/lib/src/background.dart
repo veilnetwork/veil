@@ -57,7 +57,7 @@ const MethodChannel _channel = MethodChannel('veil_flutter/lifecycle');
 /// can `VeilBackground.start(...)` rather than worrying about
 /// import collisions.
 class VeilBackground {
-  VeilBackground._();  // not instantiable
+  VeilBackground._(); // not instantiable
 
   /// Start the foreground service.  Returns immediately; the service
   /// itself takes over keeping the process alive.
@@ -65,6 +65,9 @@ class VeilBackground {
   /// [title] and [text] populate the persistent notification visible
   /// in the status bar.  When omitted, the plugin uses defaults
   /// suitable for a connection-maintaining service ("Veil running").
+  /// [microphone] and [camera] must describe capture that is active now;
+  /// Android 14+ rejects foreground-service media types when their runtime
+  /// permission is absent or the corresponding device is disabled.
   ///
   /// Idempotent — calling start when the service is already running
   /// just refreshes the notification text.
@@ -73,13 +76,18 @@ class VeilBackground {
     String? text,
     bool hangupAction = false,
     bool ringing = false,
+    bool microphone = false,
+    bool camera = false,
   }) async {
     if (!Platform.isAndroid) return;
-    await _channel.invokeMethod<void>('startBackgroundService', <String, dynamic>{
+    await _channel
+        .invokeMethod<void>('startBackgroundService', <String, dynamic>{
       if (title != null) 'title': title,
-      if (text  != null) 'text':  text,
+      if (text != null) 'text': text,
       if (hangupAction) 'hangupAction': true,
       if (ringing) 'ringing': true,
+      if (microphone) 'microphone': true,
+      if (camera) 'camera': true,
     });
   }
 
