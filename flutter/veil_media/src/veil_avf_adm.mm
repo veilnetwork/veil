@@ -16,17 +16,23 @@
 #import <AVFoundation/AVFoundation.h>
 #import <Foundation/Foundation.h>
 #import <TargetConditionals.h>
+#if TARGET_OS_OSX
+#import <CoreAudio/CoreAudio.h>
+#endif
 
 #include "veil_avf_adm.h"
 #include "veil_diag_log.h"
 
 #if defined(VEIL_MEDIA_HAVE_WEBRTC)
+#include <algorithm>
 #include <atomic>
 #include <cstdarg>
 #include <cstdint>
 #include <cstdio>
 #include <memory>
+#include <mutex>
 #include <span>
+#include <string>
 #include <vector>
 
 #include "api/audio/audio_device_defines.h"
@@ -43,6 +49,114 @@ constexpr size_t kChannels = 1;
 constexpr int kRecordDelayMs = 10;
 constexpr int kPlayoutDelayMs = 40;
 constexpr size_t kPlayTmpSamples = 8192;  // render blocks are ~512-4096 frames
+
+#if TARGET_OS_OSX
+struct CoreAudioDeviceInfo {
+  AudioDeviceID id = kAudioObjectUnknown;
+  std::string name;
+  std::string uid;
+};
+
+std::string CfStringUtf8(CFStringRef value) {
+  if (value == nullptr) return {};
+  const CFIndex size = CFStringGetMaximumSizeForEncoding(
+                           CFStringGetLength(value), kCFStringEncodingUTF8) +
+                       1;
+  std::vector<char> text(static_cast<size_t>(size), 0);
+  if (!CFStringGetCString(value, text.data(), size, kCFStringEncodingUTF8)) {
+    return {};
+  }
+  return text.data();
+}
+
+std::vector<CoreAudioDeviceInfo> CoreAudioDevices(bool input) {
+  AudioObjectPropertyAddress all_addr = {
+      kAudioHardwarePropertyDevices, kAudioObjectPropertyScopeGlobal,
+      kAudioObjectPropertyElementMain};
+  UInt32 size = 0;
+  if (AudioObjectGetPropertyDataSize(kAudioObjectSystemObject, &all_addr, 0,
+                                     nullptr, &size) != noErr ||
+      size == 0) {
+    return {};
+  }
+  std::vector<AudioDeviceID> ids(size / sizeof(AudioDeviceID));
+  if (AudioObjectGetPropertyData(kAudioObjectSystemObject, &all_addr, 0,
+                                 nullptr, &size, ids.data()) != noErr) {
+    return {};
+  }
+
+  const AudioObjectPropertyScope scope = input
+      ? kAudioDevicePropertyScopeInput
+      : kAudioDevicePropertyScopeOutput;
+  std::vector<CoreAudioDeviceInfo> result;
+  for (AudioDeviceID id : ids) {
+    AudioObjectPropertyAddress stream_addr = {
+        kAudioDevicePropertyStreamConfiguration, scope,
+        kAudioObjectPropertyElementMain};
+    UInt32 stream_size = 0;
+    if (AudioObjectGetPropertyDataSize(id, &stream_addr, 0, nullptr,
+                                       &stream_size) != noErr ||
+        stream_size < sizeof(AudioBufferList)) {
+      continue;
+    }
+    std::vector<uint8_t> stream_bytes(stream_size);
+    auto* streams = reinterpret_cast<AudioBufferList*>(stream_bytes.data());
+    if (AudioObjectGetPropertyData(id, &stream_addr, 0, nullptr, &stream_size,
+                                   streams) != noErr) {
+      continue;
+    }
+    UInt32 channels = 0;
+    for (UInt32 i = 0; i < streams->mNumberBuffers; ++i) {
+      channels += streams->mBuffers[i].mNumberChannels;
+    }
+    if (channels == 0) continue;
+
+    CFStringRef name = nullptr;
+    UInt32 string_size = sizeof(name);
+    AudioObjectPropertyAddress name_addr = {
+        kAudioObjectPropertyName, kAudioObjectPropertyScopeGlobal,
+        kAudioObjectPropertyElementMain};
+    AudioObjectGetPropertyData(id, &name_addr, 0, nullptr, &string_size, &name);
+    CFStringRef uid = nullptr;
+    string_size = sizeof(uid);
+    AudioObjectPropertyAddress uid_addr = {
+        kAudioDevicePropertyDeviceUID, kAudioObjectPropertyScopeGlobal,
+        kAudioObjectPropertyElementMain};
+    AudioObjectGetPropertyData(id, &uid_addr, 0, nullptr, &string_size, &uid);
+    CoreAudioDeviceInfo info;
+    info.id = id;
+    info.name = CfStringUtf8(name);
+    info.uid = CfStringUtf8(uid);
+    if (name != nullptr) CFRelease(name);
+    if (uid != nullptr) CFRelease(uid);
+    if (info.name.empty()) info.name = input ? "Audio input" : "Audio output";
+    // AVAudioEngine creates a private aggregate around its selected device.
+    // CoreAudio exposes that aggregate globally while the call is running;
+    // offering it back to the user produces a recursive/unstable route and a
+    // duplicate-looking microphone. Only enumerate physical/system routes.
+    if (info.name.rfind("CADefaultDeviceAggregate-", 0) == 0) continue;
+    result.push_back(std::move(info));
+  }
+
+  AudioDeviceID default_id = kAudioObjectUnknown;
+  UInt32 default_size = sizeof(default_id);
+  AudioObjectPropertyAddress default_addr = {
+      input ? kAudioHardwarePropertyDefaultInputDevice
+            : kAudioHardwarePropertyDefaultOutputDevice,
+      kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain};
+  if (AudioObjectGetPropertyData(kAudioObjectSystemObject, &default_addr, 0,
+                                 nullptr, &default_size, &default_id) == noErr) {
+    const auto it = std::find_if(result.begin(), result.end(),
+                                 [default_id](const auto& item) {
+                                   return item.id == default_id;
+                                 });
+    if (it != result.end() && it != result.begin()) {
+      std::rotate(result.begin(), it, it + 1);
+    }
+  }
+  return result;
+}
+#endif
 
 void alog(const char* fmt, ...) {
   va_list ap;
@@ -103,9 +217,25 @@ class VeilAvfAdm : public webrtc::webrtc_impl::AudioDeviceModuleDefault<
     return 0;
   }
 
-  // --- availability / device enumeration (single virtual device) ----------
-  int16_t PlayoutDevices() override { return 1; }
-  int16_t RecordingDevices() override { return 1; }
+  // --- availability / device enumeration ----------------------------------
+  int16_t PlayoutDevices() override {
+#if TARGET_OS_OSX
+    std::lock_guard<std::mutex> lock(devices_mu_);
+    playout_devices_ = CoreAudioDevices(false);
+    return static_cast<int16_t>(playout_devices_.size());
+#else
+    return 1;
+#endif
+  }
+  int16_t RecordingDevices() override {
+#if TARGET_OS_OSX
+    std::lock_guard<std::mutex> lock(devices_mu_);
+    recording_devices_ = CoreAudioDevices(true);
+    return static_cast<int16_t>(recording_devices_.size());
+#else
+    return 1;
+#endif
+  }
   int32_t PlayoutIsAvailable(bool* available) override {
     *available = true;
     return 0;
@@ -114,19 +244,61 @@ class VeilAvfAdm : public webrtc::webrtc_impl::AudioDeviceModuleDefault<
     *available = true;
     return 0;
   }
-  int32_t RecordingDeviceName(uint16_t /*index*/,
+  int32_t RecordingDeviceName(uint16_t index,
                               char name[webrtc::kAdmMaxDeviceNameSize],
                               char guid[webrtc::kAdmMaxGuidSize]) override {
+#if TARGET_OS_OSX
+    std::lock_guard<std::mutex> lock(devices_mu_);
+    if (index >= recording_devices_.size()) return -1;
+    std::snprintf(name, webrtc::kAdmMaxDeviceNameSize, "%s",
+                  recording_devices_[index].name.c_str());
+    std::snprintf(guid, webrtc::kAdmMaxGuidSize, "%s",
+                  recording_devices_[index].uid.c_str());
+#else
+    (void)index;
     std::snprintf(name, webrtc::kAdmMaxDeviceNameSize, "AVAudioEngine Input");
     guid[0] = '\0';
+#endif
     return 0;
   }
-  int32_t PlayoutDeviceName(uint16_t /*index*/,
+  int32_t PlayoutDeviceName(uint16_t index,
                             char name[webrtc::kAdmMaxDeviceNameSize],
                             char guid[webrtc::kAdmMaxGuidSize]) override {
+#if TARGET_OS_OSX
+    std::lock_guard<std::mutex> lock(devices_mu_);
+    if (index >= playout_devices_.size()) return -1;
+    std::snprintf(name, webrtc::kAdmMaxDeviceNameSize, "%s",
+                  playout_devices_[index].name.c_str());
+    std::snprintf(guid, webrtc::kAdmMaxGuidSize, "%s",
+                  playout_devices_[index].uid.c_str());
+#else
+    (void)index;
     std::snprintf(name, webrtc::kAdmMaxDeviceNameSize, "AVAudioEngine Output");
     guid[0] = '\0';
+#endif
     return 0;
+  }
+
+  int32_t SetRecordingDevice(uint16_t index) override {
+#if TARGET_OS_OSX
+    std::lock_guard<std::mutex> lock(devices_mu_);
+    if (index >= recording_devices_.size()) return -1;
+    recording_device_id_.store(recording_devices_[index].id);
+    return 0;
+#else
+    return index == 0 ? 0 : -1;
+#endif
+  }
+
+  int32_t SetPlayoutDevice(uint16_t index) override {
+#if TARGET_OS_OSX
+    std::lock_guard<std::mutex> lock(devices_mu_);
+    if (index >= playout_devices_.size()) return -1;
+    playout_device_id_.store(playout_devices_[index].id);
+    return 0;
+#else
+    return index == 0 ? 0 : -1;
+#endif
   }
 
   int32_t InitPlayout() override {
@@ -228,6 +400,18 @@ class VeilAvfAdm : public webrtc::webrtc_impl::AudioDeviceModuleDefault<
       if (mic_auth == AVAuthorizationStatusAuthorized) {
         CancelMicAuthorizationTimerLocked();
         AVAudioInputNode* input = engine_.inputNode;
+#if TARGET_OS_OSX
+        const AudioDeviceID requested = recording_device_id_.load();
+        if (requested != kAudioObjectUnknown) {
+          NSError* device_error = nil;
+          if (![input.AUAudioUnit setDeviceID:requested error:&device_error]) {
+            alog("avf_adm: input device switch failed: %s",
+                 device_error
+                     ? device_error.localizedDescription.UTF8String
+                     : "?");
+          }
+        }
+#endif
         AVAudioFormat* tap_fmt = [input outputFormatForBus:0];
         if (tap_fmt.sampleRate <= 0 || tap_fmt.channelCount <= 0) {
           alog("avf_adm: input format not ready (sr=%.0f ch=%u)",
@@ -423,6 +607,17 @@ class VeilAvfAdm : public webrtc::webrtc_impl::AudioDeviceModuleDefault<
     }
 #endif
     engine_ = [[AVAudioEngine alloc] init];
+#if TARGET_OS_OSX
+    const AudioDeviceID requested_output = playout_device_id_.load();
+    if (requested_output != kAudioObjectUnknown) {
+      NSError* device_error = nil;
+      if (![engine_.outputNode.AUAudioUnit setDeviceID:requested_output
+                                                error:&device_error]) {
+        alog("avf_adm: output device switch failed: %s",
+             device_error ? device_error.localizedDescription.UTF8String : "?");
+      }
+    }
+#endif
     AVAudioFormat* src_fmt = [[AVAudioFormat alloc]
         initWithCommonFormat:AVAudioPCMFormatFloat32
                   sampleRate:kSampleRate
@@ -522,6 +717,13 @@ class VeilAvfAdm : public webrtc::webrtc_impl::AudioDeviceModuleDefault<
   AVAudioConverter* capture_converter_ = nil;
   AVAudioFormat* int16_format_ = nil;
   bool capture_tap_installed_ = false;
+#if TARGET_OS_OSX
+  std::mutex devices_mu_;
+  std::vector<CoreAudioDeviceInfo> recording_devices_;
+  std::vector<CoreAudioDeviceInfo> playout_devices_;
+  std::atomic<AudioDeviceID> recording_device_id_{kAudioObjectUnknown};
+  std::atomic<AudioDeviceID> playout_device_id_{kAudioObjectUnknown};
+#endif
 };
 
 }  // namespace
