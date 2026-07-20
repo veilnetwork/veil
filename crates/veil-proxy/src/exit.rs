@@ -19,16 +19,28 @@
 //! initiator consumes this protocol byte before it reports SOCKS5 success; it
 //! is never part of the proxied application's byte stream.
 
-use std::net::IpAddr;
+use std::collections::HashMap;
+use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
 
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
-    net::{TcpStream, lookup_host},
+    net::{TcpStream, UdpSocket, lookup_host},
+    sync::mpsc,
     time::timeout,
 };
 
 use veil_types::NodeRole;
+
+const EXTENDED_HEADER_MARKER: u16 = u16::MAX;
+const EXTENDED_HEADER_VERSION: u8 = 1;
+const EXTENDED_COMMAND_UDP_ASSOCIATE: u8 = 1;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProxyRequest {
+    Tcp { host: String, port: u16 },
+    UdpAssociation,
+}
 
 /// Connection timeout for the outgoing TCP leg.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -138,6 +150,39 @@ pub async fn read_proxy_header<R: AsyncReadExt + Unpin>(
     let mut host_len_buf = [0u8; 2];
     reader.read_exact(&mut host_len_buf).await?;
     let host_len = u16::from_be_bytes(host_len_buf) as usize;
+    read_tcp_header_after_len(reader, host_len).await
+}
+
+pub async fn read_proxy_request<R: AsyncReadExt + Unpin>(
+    reader: &mut R,
+) -> std::io::Result<ProxyRequest> {
+    let marker = reader.read_u16().await?;
+    if marker != EXTENDED_HEADER_MARKER {
+        let (host, port) = read_tcp_header_after_len(reader, marker as usize).await?;
+        return Ok(ProxyRequest::Tcp { host, port });
+    }
+
+    let version = reader.read_u8().await?;
+    let command = reader.read_u8().await?;
+    if version != EXTENDED_HEADER_VERSION {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "unsupported proxy header version",
+        ));
+    }
+    match command {
+        EXTENDED_COMMAND_UDP_ASSOCIATE => Ok(ProxyRequest::UdpAssociation),
+        _ => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "unsupported proxy header command",
+        )),
+    }
+}
+
+async fn read_tcp_header_after_len<R: AsyncReadExt + Unpin>(
+    reader: &mut R,
+    host_len: usize,
+) -> std::io::Result<(String, u16)> {
     if host_len > 255 {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
@@ -165,6 +210,17 @@ pub fn encode_proxy_header(host: &str, port: u16) -> Vec<u8> {
     buf.extend_from_slice(&(host_bytes.len() as u16).to_be_bytes());
     buf.extend_from_slice(host_bytes);
     buf.extend_from_slice(&port.to_be_bytes());
+    buf
+}
+
+/// Extended, collision-free command header. Legacy TCP headers can only use
+/// host lengths 0..=255, so 0xFFFF is rejected by old exits and cannot be
+/// confused with a destination chosen by the user.
+pub fn encode_udp_associate_header() -> Vec<u8> {
+    let mut buf = Vec::with_capacity(4);
+    buf.extend_from_slice(&EXTENDED_HEADER_MARKER.to_be_bytes());
+    buf.push(EXTENDED_HEADER_VERSION);
+    buf.push(EXTENDED_COMMAND_UDP_ASSOCIATE);
     buf
 }
 
@@ -215,11 +271,18 @@ where
 
     // Read the destination header from the veil stream, bounded by
     // HEADER_TIMEOUT so a silent peer cannot hold an exit slot forever.
-    let (host, port) = timeout(HEADER_TIMEOUT, read_proxy_header(&mut veil_r))
+    let request = timeout(HEADER_TIMEOUT, read_proxy_request(&mut veil_r))
         .await
         .map_err(|_| {
             std::io::Error::new(std::io::ErrorKind::TimedOut, "proxy header read timed out")
         })??;
+
+    let (host, port) = match request {
+        ProxyRequest::Tcp { host, port } => (host, port),
+        ProxyRequest::UdpAssociation => {
+            return handle_udp_association(allow_private, metrics, veil_r, veil_w).await;
+        }
+    };
 
     // resolve host → IPs and pick the first non-forbidden one.
     // Resolving explicitly (rather than deferring to `TcpStream::connect`)
@@ -283,6 +346,152 @@ where
     Ok(())
 }
 
+const MAX_UDP_TARGETS_PER_ASSOCIATION: usize = 64;
+const UDP_TARGET_QUEUE: usize = 32;
+const UDP_RESPONSE_QUEUE: usize = 128;
+const UDP_ASSOCIATION_IDLE: Duration = Duration::from_secs(120);
+const UDP_RESPONSE_CREDIT_BASE: usize = 4096;
+const UDP_RESPONSE_CREDIT_MULTIPLIER: usize = 4;
+const UDP_RESPONSE_CREDIT_CAP: usize = 256 * 1024;
+
+fn grant_udp_response_credit(current: usize, request_len: usize) -> usize {
+    current
+        .saturating_add(UDP_RESPONSE_CREDIT_BASE)
+        .saturating_add(request_len.saturating_mul(UDP_RESPONSE_CREDIT_MULTIPLIER))
+        .min(UDP_RESPONSE_CREDIT_CAP)
+}
+
+async fn handle_udp_association<R, W>(
+    allow_private: bool,
+    metrics: Option<std::sync::Arc<dyn crate::ProxyMetrics>>,
+    mut veil_r: R,
+    mut veil_w: W,
+) -> std::io::Result<()>
+where
+    R: tokio::io::AsyncRead + Unpin + Send + 'static,
+    W: tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    use crate::udp::{ProxyDatagram, encode_datagram, read_datagram};
+
+    // The association is ready before SOCKS5 publishes its local UDP relay.
+    veil_w.write_all(&[0x00]).await?;
+
+    let (response_tx, mut response_rx) = mpsc::channel::<ProxyDatagram>(UDP_RESPONSE_QUEUE);
+    let writer = tokio::spawn(async move {
+        while let Some(datagram) = response_rx.recv().await {
+            let frame = encode_datagram(&datagram)?;
+            veil_w.write_all(&frame).await?;
+        }
+        veil_w.shutdown().await
+    });
+
+    let mut targets = HashMap::<SocketAddr, mpsc::Sender<Vec<u8>>>::new();
+    loop {
+        targets.retain(|_, sender| !sender.is_closed());
+        let datagram = match timeout(UDP_ASSOCIATION_IDLE, read_datagram(&mut veil_r)).await {
+            Ok(Ok(datagram)) => datagram,
+            Ok(Err(error)) if error.kind() == std::io::ErrorKind::UnexpectedEof => break,
+            Ok(Err(error)) => return Err(error),
+            Err(_) => break,
+        };
+
+        let candidates: Vec<SocketAddr> = timeout(
+            CONNECT_TIMEOUT,
+            lookup_host((
+                datagram.destination.host.as_str(),
+                datagram.destination.port,
+            )),
+        )
+        .await
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "UDP resolve timeout"))?
+        .map_err(|error| {
+            std::io::Error::new(
+                error.kind(),
+                format!("UDP destination resolve failed: {error}"),
+            )
+        })?
+        .collect();
+        let picked = candidates
+            .into_iter()
+            .find(|addr| allow_private || !is_forbidden_destination(addr.ip()));
+        let Some(target) = picked else {
+            if let Some(metrics) = &metrics {
+                metrics.inc_exit_proxy_dest_denied();
+            }
+            continue;
+        };
+
+        if !targets.contains_key(&target) {
+            if targets.len() >= MAX_UDP_TARGETS_PER_ASSOCIATION {
+                continue;
+            }
+            let sender = spawn_udp_target(target, response_tx.clone()).await?;
+            targets.insert(target, sender);
+        }
+        if let Some(sender) = targets.get(&target) {
+            // A congested target loses datagrams instead of back-pressuring all
+            // destinations in the association or growing memory without bound.
+            let _ = sender.try_send(datagram.payload);
+        }
+    }
+
+    drop(targets);
+    drop(response_tx);
+    writer
+        .await
+        .map_err(|error| std::io::Error::other(format!("UDP response writer failed: {error}")))?
+}
+
+async fn spawn_udp_target(
+    target: SocketAddr,
+    response_tx: mpsc::Sender<crate::udp::ProxyDatagram>,
+) -> std::io::Result<mpsc::Sender<Vec<u8>>> {
+    let bind = match target {
+        SocketAddr::V4(_) => "0.0.0.0:0",
+        SocketAddr::V6(_) => "[::]:0",
+    };
+    let socket = UdpSocket::bind(bind).await?;
+    socket.connect(target).await?;
+    let (request_tx, mut request_rx) = mpsc::channel::<Vec<u8>>(UDP_TARGET_QUEUE);
+
+    tokio::spawn(async move {
+        let mut response_credit = 0usize;
+        let mut buffer = vec![0u8; crate::udp::MAX_UDP_PAYLOAD];
+        loop {
+            tokio::select! {
+                request = request_rx.recv() => {
+                    let Some(payload) = request else { break; };
+                    response_credit = grant_udp_response_credit(response_credit, payload.len());
+                    if socket.send(&payload).await.is_err() {
+                        break;
+                    }
+                }
+                response = socket.recv(&mut buffer) => {
+                    let Ok(length) = response else { break; };
+                    // Bound UDP reflection amplification even for an abusive,
+                    // authenticated exit user. Connected sockets also ensure
+                    // responses can only come from the requested target.
+                    if length > response_credit {
+                        continue;
+                    }
+                    response_credit -= length;
+                    let datagram = crate::udp::ProxyDatagram {
+                        destination: crate::socks5::ProxyDestination::tcp(
+                            target.ip().to_string(),
+                            target.port(),
+                        ),
+                        payload: buffer[..length].to_vec(),
+                    };
+                    if response_tx.send(datagram).await.is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+    });
+    Ok(request_tx)
+}
+
 /// Exit proxy service handle.
 pub struct ExitProxy {
     pub role: NodeRole,
@@ -323,6 +532,35 @@ mod tests {
         let (host, port) = read_proxy_header(&mut cursor).await.unwrap();
         assert_eq!(host, "example.com");
         assert_eq!(port, 8080);
+    }
+
+    #[tokio::test]
+    async fn extended_udp_header_is_distinct_from_legacy_tcp() {
+        let header = encode_udp_associate_header();
+        let request = read_proxy_request(&mut header.as_slice()).await.unwrap();
+        assert_eq!(request, ProxyRequest::UdpAssociation);
+
+        let legacy = encode_proxy_header("example.com", 443);
+        let request = read_proxy_request(&mut legacy.as_slice()).await.unwrap();
+        assert_eq!(
+            request,
+            ProxyRequest::Tcp {
+                host: "example.com".to_owned(),
+                port: 443,
+            }
+        );
+    }
+
+    #[test]
+    fn udp_amplification_credit_is_bounded() {
+        assert_eq!(
+            grant_udp_response_credit(0, 1),
+            UDP_RESPONSE_CREDIT_BASE + UDP_RESPONSE_CREDIT_MULTIPLIER,
+        );
+        assert_eq!(
+            grant_udp_response_credit(UDP_RESPONSE_CREDIT_CAP, usize::MAX),
+            UDP_RESPONSE_CREDIT_CAP,
+        );
     }
 
     // ── 33.3: exit node bridges data to target TCP ────────────────────────────

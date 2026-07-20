@@ -45,8 +45,8 @@ use veil_proto::{
 };
 use veil_types::FrameBroadcaster;
 
-use crate::exit::encode_proxy_header;
-use crate::socks5::{BiStream, ProxyConnector, ProxyDestination, Socks5Error};
+use crate::exit::{encode_proxy_header, encode_udp_associate_header};
+use crate::socks5::{BiStream, ProxyConnector, ProxyDestination, ProxyTransport, Socks5Error};
 
 // ── Type aliases ─────────────────────────────────────────────────────────────
 
@@ -275,7 +275,10 @@ impl ProxyConnector for VeilConnector {
         let (mut user_half, inner_half) = tokio::io::duplex(DUPLEX_BUF_SIZE);
 
         // Send the proxy-connect header as the first outbound APP_DATA.
-        let proxy_header = encode_proxy_header(&destination.host, destination.port);
+        let proxy_header = match destination.transport {
+            ProxyTransport::Tcp => encode_proxy_header(&destination.host, destination.port),
+            ProxyTransport::UdpAssociation => encode_udp_associate_header(),
+        };
 
         // Spawn the bridge task that connects the duplex to the veil frame stream.
         let broadcaster = Arc::clone(&self.broadcaster);
@@ -747,10 +750,7 @@ mod tests {
             Arc::clone(&rx),
             Arc::new(AtomicU32::new(0)),
         );
-        let dest = crate::socks5::ProxyDestination {
-            host: "example.com".to_owned(),
-            port: 443,
-        };
+        let dest = crate::socks5::ProxyDestination::tcp("example.com", 443);
         let res = conn.connect([2u8; 32], &dest).await;
         assert!(res.is_err(), "send failure must error");
         assert!(
