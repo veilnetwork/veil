@@ -1,13 +1,12 @@
 //! SOCKS5 ingress proxy.
 //!
 //! Listens on a local TCP address (default `127.0.0.1:1080`) and speaks the
-//! SOCKS5 protocol (RFC 1928). On a `CONNECT` request the server opens an
-//! veil stream to an exit node and bridges the TCP connection through it.
+//! SOCKS5 protocol (RFC 1928). `CONNECT` bridges TCP; `UDP ASSOCIATE` exposes
+//! a loopback datagram relay and carries bounded frames over a veil stream.
 //!
 //! # Current limitations
 //!
-//! Only `CONNECT` (TCP relay) is supported; `BIND` and `UDP ASSOCIATE` are
-//! rejected with `COMMAND_NOT_SUPPORTED`.
+//! `BIND` and fragmented SOCKS5 UDP datagrams are not supported.
 //! Only the `NO_AUTH` authentication method is supported.
 //! The exit node is currently a fixed parameter (`exit_node_id`); future
 //! versions will select it via the DHT.
@@ -16,7 +15,7 @@ use std::sync::Arc;
 
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
-    net::{TcpListener, TcpStream},
+    net::{TcpListener, TcpStream, UdpSocket},
     sync::{Semaphore, watch},
 };
 
@@ -32,6 +31,7 @@ const SOCKS_VERSION: u8 = 5;
 const METHOD_NO_AUTH: u8 = 0x00;
 const METHOD_NO_ACCEPTABLE: u8 = 0xFF;
 const CMD_CONNECT: u8 = 0x01;
+const CMD_UDP_ASSOCIATE: u8 = 0x03;
 const ATYP_IPV4: u8 = 0x01;
 const ATYP_DOMAIN: u8 = 0x03;
 /// Maximum time to complete the SOCKS5 handshake (auth + CONNECT header).
@@ -53,7 +53,7 @@ pub enum Socks5Error {
     Io(std::io::Error),
     /// The veil connector could not open a stream to the exit node.
     ConnectFailed(String),
-    /// The requested SOCKS5 command is not supported (only CONNECT is).
+    /// The requested SOCKS5 command is not supported.
     UnsupportedCommand(u8),
     /// The address type (ATYP) in the CONNECT request is not supported.
     UnsupportedAtyp(u8),
@@ -87,11 +87,37 @@ impl From<std::io::Error> for Socks5Error {
 
 // ── ProxyDestination ──────────────────────────────────────────────────────────
 
-/// Parsed destination from a SOCKS5 CONNECT request.
-#[derive(Debug, Clone)]
+/// Transport kind requested through the exit stream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProxyTransport {
+    Tcp,
+    UdpAssociation,
+}
+
+/// Parsed destination plus its exit transport kind.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProxyDestination {
     pub host: String,
     pub port: u16,
+    pub transport: ProxyTransport,
+}
+
+impl ProxyDestination {
+    pub fn tcp(host: impl Into<String>, port: u16) -> Self {
+        Self {
+            host: host.into(),
+            port,
+            transport: ProxyTransport::Tcp,
+        }
+    }
+
+    pub fn udp_association() -> Self {
+        Self {
+            host: String::new(),
+            port: 0,
+            transport: ProxyTransport::UdpAssociation,
+        }
+    }
 }
 
 // ── Socks5Proxy ───────────────────────────────────────────────────────────────
@@ -214,6 +240,11 @@ pub trait BiStream: Send + Unpin {
     );
 }
 
+enum SocksRequest {
+    Connect(ProxyDestination),
+    UdpAssociation,
+}
+
 // ── SOCKS5 handshake + bridge ─────────────────────────────────────────────────
 
 /// Handle one accepted SOCKS5 client connection.
@@ -224,7 +255,7 @@ pub async fn handle_connection(
 ) -> std::io::Result<()> {
     // Wrap the entire handshake in a timeout to prevent slow-read DoS attacks
     // where a client trickles bytes and holds a file descriptor open indefinitely.
-    let dst = tokio::time::timeout(HANDSHAKE_TIMEOUT, async {
+    let request = tokio::time::timeout(HANDSHAKE_TIMEOUT, async {
         // ── auth negotiation ─────────────────────────────────────────
         let mut hdr = [0u8; 2];
         client.read_exact(&mut hdr).await?;
@@ -257,20 +288,25 @@ pub async fn handle_connection(
                 "not SOCKS5 request",
             ));
         }
-        if req_hdr[1] != CMD_CONNECT {
-            // Reject unsupported commands.
-            send_reply(
-                &mut client,
-                REP_CMD_NOT_SUPPORTED,
-                std::net::Ipv4Addr::UNSPECIFIED,
-                0,
-            )
-            .await?;
-            return Err(std::io::Error::other("unsupported command"));
-        }
         // req_hdr[2] is RSV, req_hdr[3] is ATYP.
         match parse_destination(&mut client, req_hdr[3]).await {
-            Ok(d) => Ok(d),
+            Ok(destination) => match req_hdr[1] {
+                CMD_CONNECT => Ok(SocksRequest::Connect(destination)),
+                // RFC 1928 requires the client-supplied address to be parsed,
+                // but xVeil learns and pins the actual loopback UDP endpoint
+                // from the first datagram instead of trusting this hint.
+                CMD_UDP_ASSOCIATE => Ok(SocksRequest::UdpAssociation),
+                _ => {
+                    send_reply(
+                        &mut client,
+                        REP_CMD_NOT_SUPPORTED,
+                        std::net::Ipv4Addr::UNSPECIFIED,
+                        0,
+                    )
+                    .await?;
+                    Err(std::io::Error::other("unsupported command"))
+                }
+            },
             Err(_) => {
                 send_reply(
                     &mut client,
@@ -290,6 +326,10 @@ pub async fn handle_connection(
     .map_err(|_| {
         std::io::Error::new(std::io::ErrorKind::TimedOut, "SOCKS5 handshake timed out")
     })??;
+
+    let SocksRequest::Connect(dst) = request else {
+        return handle_udp_association(client, exit_node_id, connector).await;
+    };
 
     // ── open veil stream to exit node ─────────────────────────────
     let stream = match connector.connect(exit_node_id, &dst).await {
@@ -331,6 +371,93 @@ pub async fn handle_connection(
     Ok(())
 }
 
+async fn handle_udp_association(
+    mut control: TcpStream,
+    exit_node_id: [u8; 32],
+    connector: &dyn ProxyConnector,
+) -> std::io::Result<()> {
+    use crate::udp::{
+        MAX_UDP_PAYLOAD, encode_datagram, encode_socks5_datagram, parse_socks5_datagram,
+        read_datagram,
+    };
+
+    let peer = control.peer_addr()?;
+    let local = control.local_addr()?;
+    let stream = match connector
+        .connect(exit_node_id, &ProxyDestination::udp_association())
+        .await
+    {
+        Ok(stream) => stream,
+        Err(_) => {
+            send_reply(
+                &mut control,
+                REP_GENERAL_FAILURE,
+                std::net::Ipv4Addr::UNSPECIFIED,
+                0,
+            )
+            .await?;
+            return Ok(());
+        }
+    };
+
+    let relay = UdpSocket::bind(std::net::SocketAddr::new(local.ip(), 0)).await?;
+    let relay_addr = relay.local_addr()?;
+    send_reply_addr(&mut control, REP_SUCCESS, relay_addr).await?;
+
+    let (mut exit_r, mut exit_w) = stream.split();
+    let mut learned_client = None;
+    let mut udp_buffer = vec![0u8; MAX_UDP_PAYLOAD + 512];
+    let mut control_byte = [0u8; 1];
+
+    loop {
+        tokio::select! {
+            control_read = control.read(&mut control_byte) => {
+                match control_read {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => continue,
+                }
+            }
+            received = relay.recv_from(&mut udp_buffer) => {
+                let Ok((length, source)) = received else { break; };
+                // The TCP control peer owns the association. Pin the exact UDP
+                // endpoint on its first loopback datagram so another local
+                // process cannot inject traffic into an established tunnel.
+                if source.ip() != peer.ip() {
+                    continue;
+                }
+                if let Some(expected) = learned_client {
+                    if source != expected {
+                        continue;
+                    }
+                } else {
+                    learned_client = Some(source);
+                }
+                let Ok(datagram) = parse_socks5_datagram(&udp_buffer[..length]) else {
+                    continue;
+                };
+                let Ok(frame) = encode_datagram(&datagram) else {
+                    continue;
+                };
+                if exit_w.write_all(&frame).await.is_err() {
+                    break;
+                }
+            }
+            response = read_datagram(&mut exit_r) => {
+                let Ok(datagram) = response else { break; };
+                let Some(client) = learned_client else { continue; };
+                let Ok(packet) = encode_socks5_datagram(&datagram) else {
+                    continue;
+                };
+                if relay.send_to(&packet, client).await.is_err() {
+                    break;
+                }
+            }
+        }
+    }
+    let _ = exit_w.shutdown().await;
+    Ok(())
+}
+
 /// Send a SOCKS5 reply with IPv4 bound address.
 async fn send_reply(
     client: &mut TcpStream,
@@ -338,9 +465,31 @@ async fn send_reply(
     bnd_addr: std::net::Ipv4Addr,
     bnd_port: u16,
 ) -> std::io::Result<()> {
-    let mut reply = vec![SOCKS_VERSION, rep, 0x00, ATYP_IPV4];
-    reply.extend_from_slice(&bnd_addr.octets());
-    reply.extend_from_slice(&bnd_port.to_be_bytes());
+    send_reply_addr(
+        client,
+        rep,
+        std::net::SocketAddr::new(std::net::IpAddr::V4(bnd_addr), bnd_port),
+    )
+    .await
+}
+
+async fn send_reply_addr(
+    client: &mut TcpStream,
+    rep: u8,
+    bound: std::net::SocketAddr,
+) -> std::io::Result<()> {
+    let mut reply = vec![SOCKS_VERSION, rep, 0x00];
+    match bound.ip() {
+        std::net::IpAddr::V4(address) => {
+            reply.push(ATYP_IPV4);
+            reply.extend_from_slice(&address.octets());
+        }
+        std::net::IpAddr::V6(address) => {
+            reply.push(ATYP_IPV6);
+            reply.extend_from_slice(&address.octets());
+        }
+    }
+    reply.extend_from_slice(&bound.port().to_be_bytes());
     client.write_all(&reply).await
 }
 
@@ -378,7 +527,7 @@ async fn parse_destination(client: &mut TcpStream, atyp: u8) -> std::io::Result<
     client.read_exact(&mut port_buf).await?;
     let port = u16::from_be_bytes(port_buf);
 
-    Ok(ProxyDestination { host, port })
+    Ok(ProxyDestination::tcp(host, port))
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -636,5 +785,95 @@ mod tests {
         .unwrap();
 
         assert_eq!(&buf, msg, "echo data should match sent data");
+    }
+
+    struct UdpExitConnector;
+
+    #[async_trait::async_trait]
+    impl ProxyConnector for UdpExitConnector {
+        async fn connect(
+            &self,
+            _exit_node_id: [u8; 32],
+            destination: &ProxyDestination,
+        ) -> Result<Box<dyn BiStream>, Socks5Error> {
+            assert_eq!(destination.transport, ProxyTransport::UdpAssociation);
+            let (mut client_half, server_half) = tokio::io::duplex(64 * 1024);
+            tokio::spawn(async move {
+                crate::exit::handle_proxy_connect_stream(
+                    veil_types::NodeRole::Core,
+                    true,
+                    true,
+                    server_half,
+                )
+                .await
+                .unwrap();
+            });
+            // Match VeilConnector's contract: the connector, not the SOCKS
+            // client, consumes exit readiness.
+            client_half
+                .write_all(&crate::exit::encode_udp_associate_header())
+                .await
+                .unwrap();
+            let mut ack = [0u8; 1];
+            client_half.read_exact(&mut ack).await.unwrap();
+            assert_eq!(ack, [0x00]);
+            Ok(Box::new(DuplexBiStream(client_half)))
+        }
+    }
+
+    #[tokio::test]
+    async fn e2e_socks5_udp_associate_through_exit_to_udp_echo() {
+        let echo = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let echo_addr = echo.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut buffer = [0u8; 2048];
+            let (length, peer) = echo.recv_from(&mut buffer).await.unwrap();
+            echo.send_to(&buffer[..length], peer).await.unwrap();
+        });
+
+        let socks_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let socks_addr = socks_listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (stream, _) = socks_listener.accept().await.unwrap();
+            let _ = handle_connection(stream, [0u8; 32], &UdpExitConnector).await;
+        });
+
+        let mut control = TcpStream::connect(socks_addr).await.unwrap();
+        assert_eq!(socks5_greet(&mut control).await, METHOD_NO_AUTH);
+        control
+            .write_all(&[5, CMD_UDP_ASSOCIATE, 0, ATYP_IPV4, 0, 0, 0, 0, 0, 0])
+            .await
+            .unwrap();
+        let mut reply = [0u8; 10];
+        control.read_exact(&mut reply).await.unwrap();
+        assert_eq!(reply[1], REP_SUCCESS);
+        let relay = std::net::SocketAddr::new(
+            std::net::IpAddr::V4(std::net::Ipv4Addr::new(
+                reply[4], reply[5], reply[6], reply[7],
+            )),
+            u16::from_be_bytes([reply[8], reply[9]]),
+        );
+
+        let udp_client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let expected = crate::udp::ProxyDatagram {
+            destination: ProxyDestination::tcp(echo_addr.ip().to_string(), echo_addr.port()),
+            payload: b"veil udp".to_vec(),
+        };
+        let packet = crate::udp::encode_socks5_datagram(&expected).unwrap();
+        udp_client.send_to(&packet, relay).await.unwrap();
+
+        let mut buffer = [0u8; 2048];
+        let (length, source) = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            udp_client.recv_from(&mut buffer),
+        )
+        .await
+        .expect("timeout waiting for UDP echo")
+        .unwrap();
+        assert_eq!(source, relay);
+        assert_eq!(
+            crate::udp::parse_socks5_datagram(&buffer[..length]).unwrap(),
+            expected,
+        );
     }
 }
