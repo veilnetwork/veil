@@ -854,7 +854,6 @@ async fn ipc_stream_open_remote_without_bridge_returns_not_implemented() {
 // dst=C goes via next_hop=B. Node A has a live session to B (but
 // not to C). When the IPC client asks A to send to C, A should
 // enqueue a DELIVERY_FORWARD frame in B's outbox (not return NO_ROUTE).
-#[cfg(feature = "veilcore-internals-test")]
 #[tokio::test]
 async fn ipc_send_relay_via_route_cache() {
     use veil_proto::delivery::ForwardPayload;
@@ -863,13 +862,17 @@ async fn ipc_send_relay_via_route_cache() {
 
     let sock = temp_socket_path();
 
-    // Build a SessionTxRegistry with a registered channel for B.
+    // Use the public broadcaster seam so this regression runs in the normal
+    // veil-ipc suite instead of depending on veilcore's internal registry.
     let b_id = [0x0Bu8; 32];
     let c_id = [0x0Cu8; 32];
     let a_id = [0x0Au8; 32];
 
-    let session_reg = Arc::new(RwLock::new(SessionTxRegistry::new()));
-    let mut b_rx = veil_util::wlock!(session_reg).register(b_id);
+    let (b_tx, mut b_rx) = tokio::sync::mpsc::unbounded_channel();
+    let session_reg: Arc<dyn FrameBroadcaster> = Arc::new(CapturingPeerBroadcaster {
+        peer_id: b_id,
+        tx: b_tx,
+    });
 
     // Build a RouteCache with dst=C → next_hop=B.
     let route_cache = Arc::new(RwLock::new(RouteCache::new(Duration::from_secs(60))));
@@ -928,17 +931,8 @@ async fn ipc_send_relay_via_route_cache() {
     };
     send_ipc_frame(&mut client, LocalAppMsg::AppIpcSend as u16, &send.encode()).await;
 
-    // The server should respond with APP_SEND_OK (relay succeeded).
-    let (hdr, _) = tokio::time::timeout(Duration::from_millis(500), recv_ipc_frame(&mut client))
-        .await
-        .expect("timeout waiting for AppSendOk");
-    assert_eq!(
-        hdr.msg_type,
-        LocalAppMsg::AppSendOk as u16,
-        "expected AppSendOk after relay"
-    );
-
-    // B's outbox should contain a DELIVERY_FORWARD frame destined for C.
+    // Fire-and-forget sends deliberately have no reverse success ACK. B's
+    // outbox is the authoritative proof that the frame was accepted locally.
     let (prio, frame_bytes) = tokio::time::timeout(Duration::from_millis(500), b_rx.recv())
         .await
         .expect("timeout waiting for frame at B's outbox")
@@ -972,6 +966,43 @@ async fn ipc_send_relay_via_route_cache() {
         "final recipient should be C"
     );
     assert_eq!(fwd.envelope.payload, b"hello relay");
+
+    // A v3 media cell is already symmetrically E2E-sealed by the local media
+    // FFI. The additive flags must preserve those exact bytes instead of
+    // wrapping a fresh ~1.1 KiB ML-KEM ciphertext around every RTP packet.
+    let mut sealed = veil_proto::ipc::RELAY_MEDIA_SEALED_MAGIC.to_vec();
+    sealed.extend_from_slice(&[0x5au8; 96]);
+    let compact_send = AppIpcSendPayload {
+        src_app_id,
+        dst_node_id: c_id,
+        app_id,
+        endpoint_id: 1,
+        data: veil_bufpool::pooled_shared_from_vec(sealed.clone()),
+        require_ack: false,
+        anonymous: false,
+        anonymous_authenticated: false,
+        expect_reply: false,
+        is_reply: false,
+        reply_id: 0,
+        reply_endpoint_id: 0,
+    };
+    let mut compact_body = compact_send.encode();
+    let compact_flags = veil_proto::ipc::IPC_SEND_FLAG_RELAY_REALTIME
+        | veil_proto::ipc::IPC_SEND_FLAG_RELAY_MEDIA_SEALED;
+    compact_body[100..104].copy_from_slice(&compact_flags.to_be_bytes());
+    send_ipc_frame(&mut client, LocalAppMsg::AppIpcSend as u16, &compact_body).await;
+
+    let (prio, frame_bytes) = tokio::time::timeout(Duration::from_millis(500), b_rx.recv())
+        .await
+        .expect("timeout waiting for compact frame at B's outbox")
+        .expect("B outbox channel closed unexpectedly");
+    assert_eq!(prio, veil_proto::header::priority::REALTIME);
+    let compact_body = &frame_bytes[veil_proto::HEADER_SIZE..];
+    assert!(ForwardPayload::is_realtime_datagram_eligible(compact_body));
+    let compact_fwd = ForwardPayload::decode(compact_body).unwrap();
+    assert_eq!(compact_fwd.envelope.payload, sealed);
+    assert_eq!(compact_fwd.envelope.ttl_secs, 30);
+    assert!(!compact_fwd.envelope.require_ack);
 
     drop(client);
     let _ = shutdown_tx.send(true);

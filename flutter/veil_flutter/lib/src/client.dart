@@ -2455,13 +2455,36 @@ class AppHandle implements Finalizable {
         appAddr, dstNodeId, dstAppId, dstEndpointId));
   }
 
-  /// Enable/disable batching on a relay media channel. Turn on ONLY
-  /// after call signaling proves the peer decodes MEDIA_BATCH_MAGIC cells — a
-  /// batched cell is silent noise to an older build. Returns 0 on success,
-  /// -1 for an unknown or unsupported channel.
-  int setRelayMediaBatching(int chan, bool on) {
+  /// Select negotiated batching on a direct/relay media channel. [compact]
+  /// uses audio-only batching and is valid only after relay E2E keys have been
+  /// configured; legacy peers retain the former audio+video batching.
+  int setRelayMediaBatching(int chan, bool on, {bool compact = false}) {
     _ensureOpen();
-    return ffi.veilMediaChannelSetBatching(chan, on ? 1 : 0);
+    return ffi.veilMediaChannelSetBatching(chan, on ? (compact ? 2 : 1) : 0);
+  }
+
+  /// Copy directional call-media keys into a relay channel. The temporary
+  /// native buffers are wiped before free; callers should drop their Dart key
+  /// lists promptly after configuration.
+  int configureRelayMediaCipher(
+    int chan, {
+    required Uint8List txKey,
+    required Uint8List rxKey,
+  }) {
+    _ensureOpen();
+    if (txKey.length != 32 || rxKey.length != 32) {
+      throw ArgumentError('relay media keys must be 32 bytes');
+    }
+    final tx = calloc<Uint8>(32)..asTypedList(32).setAll(0, txKey);
+    final rx = calloc<Uint8>(32)..asTypedList(32).setAll(0, rxKey);
+    try {
+      return ffi.veilMediaChannelSetE2eKeys(chan, tx, rx);
+    } finally {
+      zeroizeNative(tx, 32);
+      zeroizeNative(rx, 32);
+      calloc.free(tx);
+      calloc.free(rx);
+    }
   }
 
   /// Snapshot relay drain timing without touching media payloads. Returns null

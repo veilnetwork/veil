@@ -137,6 +137,13 @@ int veil_media_engine_start_video(VeilMediaEngine *engine, int send, int recv,
                                   int max_bitrate_kbps, int max_fps);
 int veil_media_engine_stop_video(VeilMediaEngine *engine);
 
+/* Set a route-specific RTP packet ceiling before starting video send. Zero
+ * restores libwebrtc's default; nonzero values are clamped to 576..1460.
+ * Compact relay mode uses 1000 so one sealed Delivery frame fits one QUIC
+ * DATAGRAM. Returns VEIL_MEDIA_ERR_STATE after video send has started. */
+int veil_media_engine_set_max_rtp_packet_size(VeilMediaEngine *engine,
+                                              int max_packet_size);
+
 /* Retune the running video send stream to a new bitrate/fps budget without
  * restarting it (encoder reconfigure; the route stays untouched). Used by the
  * app-side link-quality adaptation. Same clamps and VEIL_MEDIA_VIDEO_KBPS

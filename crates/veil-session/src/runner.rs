@@ -30,7 +30,7 @@ use veil_observability::{NodeLogger, NodeMetrics};
 use veil_proto::{
     budget::{MLKEM_REKEY_BYTES_THRESHOLD, MLKEM_REKEY_TIME_THRESHOLD_SECS},
     codec::{decode_header, decode_header_with_limit, encode_header},
-    family::{AppMsg, ControlMsg, DiscoveryMsg, FrameFamily, SessionMsg},
+    family::{AppMsg, ControlMsg, DeliveryMsg, DiscoveryMsg, FrameFamily, SessionMsg},
     header::FrameHeader,
     session::{MlKemRekeyEkPayload, RekeyPayload},
 };
@@ -189,7 +189,7 @@ struct RealtimeDatagramLane {
     handle: veil_transport::QuicDatagramHandle,
     tx: crate::realtime_datagram::RealtimeDatagramTx,
     max_datagram_size: usize,
-    logged_first_send: bool,
+    logged_send_kinds: u8,
     congestion_drops: u64,
     last_congestion_log: std::time::Instant,
 }
@@ -218,10 +218,34 @@ struct RealtimeReceiverContext {
     violation_tracker: Arc<Mutex<ViolationTracker>>,
 }
 
-/// Accept only one complete, fixed-header `AppRtData` frame. Datagram payloads
-/// cannot smuggle a second OVL1 frame or route another family around the
-/// ordered stream's normal parser.
-fn decode_realtime_lane_frame(frame: &[u8]) -> Option<(FrameHeader, &[u8])> {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RealtimeLaneFrameKind {
+    DirectApp,
+    RelayForward,
+}
+
+impl RealtimeLaneFrameKind {
+    fn label(self) -> &'static str {
+        match self {
+            Self::DirectApp => "app_rt_data",
+            Self::RelayForward => "relay_forward",
+        }
+    }
+
+    fn bit(self) -> u8 {
+        match self {
+            Self::DirectApp => 1,
+            Self::RelayForward => 2,
+        }
+    }
+}
+
+/// Accept one complete loss-tolerant frame. Besides direct `AppRtData`, the
+/// lane admits only the canonical, unacknowledged, short-TTL REALTIME
+/// `Delivery::Forward` form. Everything else stays on the ordered stream, so
+/// unknown extensions and reliable traffic cannot silently acquire lossy
+/// semantics or bypass its normal parser.
+fn decode_realtime_lane_frame(frame: &[u8]) -> Option<(FrameHeader, &[u8], RealtimeLaneFrameKind)> {
     use veil_proto::header::HEADER_SIZE;
     if frame.len() < HEADER_SIZE || frame.len() > crate::realtime_datagram::MAX_REALTIME_FRAME {
         return None;
@@ -234,13 +258,23 @@ fn decode_realtime_lane_frame(frame: &[u8]) -> Option<(FrameHeader, &[u8])> {
     let expected_len = HEADER_SIZE.checked_add(header.body_len as usize)?;
     if header.header_len as usize != HEADER_SIZE
         || expected_len != frame.len()
-        || header.family != FrameFamily::App as u8
-        || header.msg_type != AppMsg::AppRtData as u16
         || header.priority() != veil_proto::priority::REALTIME
     {
         return None;
     }
-    Some((header, &frame[HEADER_SIZE..]))
+    let body = &frame[HEADER_SIZE..];
+    let kind =
+        if header.family == FrameFamily::App as u8 && header.msg_type == AppMsg::AppRtData as u16 {
+            RealtimeLaneFrameKind::DirectApp
+        } else if header.family == FrameFamily::Delivery as u8
+            && header.msg_type == DeliveryMsg::Forward as u16
+            && veil_proto::delivery::ForwardPayload::is_realtime_datagram_eligible(body)
+        {
+            RealtimeLaneFrameKind::RelayForward
+        } else {
+            return None;
+        };
+    Some((header, body, kind))
 }
 
 fn spawn_realtime_receiver(
@@ -257,7 +291,7 @@ fn spawn_realtime_receiver(
             ban_list,
             violation_tracker,
         } = context;
-        let mut logged_first_receive = false;
+        let mut logged_receive_kinds = 0u8;
         loop {
             let datagram = match handle.recv().await {
                 Ok(datagram) => datagram,
@@ -276,17 +310,22 @@ fn spawn_realtime_receiver(
                 Ok(Some(frame)) => frame,
                 Ok(None) | Err(_) => continue,
             };
-            let Some((header, body)) = decode_realtime_lane_frame(&frame) else {
-                // Authenticated but not an exact AppRtData frame. Keep the
-                // lane lossy: discard this message without tearing down the
-                // reliable session or letting it bypass the normal parser.
+            let Some((header, body, kind)) = decode_realtime_lane_frame(&frame) else {
+                // Authenticated but not an exact eligible realtime frame. Keep
+                // the lane lossy: discard it without tearing down the reliable
+                // session or letting it bypass the normal parser.
                 continue;
             };
-            if !logged_first_receive {
-                logged_first_receive = true;
+            if logged_receive_kinds & kind.bit() == 0 {
+                logged_receive_kinds |= kind.bit();
                 logger.info(
                     "session.realtime_datagram.first_receive",
-                    format!("peer_id={} frame_len={}", hex_short(&peer_id), frame.len()),
+                    format!(
+                        "peer_id={} kind={} frame_len={}",
+                        hex_short(&peer_id),
+                        kind.label(),
+                        frame.len(),
+                    ),
                 );
             }
             match dispatcher.dispatch(&header, body, peer_id) {
@@ -2999,7 +3038,7 @@ impl SessionRunner {
                             raw_tx_key, session_id,
                         ),
                         max_datagram_size,
-                        logged_first_send: false,
+                        logged_send_kinds: 0,
                         congestion_drops: 0,
                         last_congestion_log: std::time::Instant::now(),
                     }
@@ -3430,6 +3469,8 @@ impl SessionRunner {
                         else {
                             break;
                         };
+                        let (_, _, lane_kind) = decode_realtime_lane_frame(&outgoing)
+                            .expect("realtime queue predicate accepted this frame");
                         let datagrams =
                             match lane.tx.encode_frame(&outgoing, lane.max_datagram_size) {
                                 Ok(datagrams) => datagrams,
@@ -3531,13 +3572,14 @@ impl SessionRunner {
                             disable_realtime_sender = true;
                             break;
                         }
-                        if !lane.logged_first_send {
-                            lane.logged_first_send = true;
+                        if lane.logged_send_kinds & lane_kind.bit() == 0 {
+                            lane.logged_send_kinds |= lane_kind.bit();
                             self.logger.info(
                                 "session.realtime_datagram.first_send",
                                 format!(
-                                    "peer_id={} fragments={} wire_bytes={sent_wire_len}",
+                                    "peer_id={} kind={} fragments={} wire_bytes={sent_wire_len}",
                                     hex_short(&self.peer_id),
+                                    lane_kind.label(),
                                     datagrams.len(),
                                 ),
                             );
@@ -4699,6 +4741,10 @@ mod m1_empty_frame_aead_tests {
 #[cfg(test)]
 mod realtime_lane_frame_tests {
     use super::*;
+    use veil_proto::{
+        delivery::{DeliveryEnvelope, FORWARD_REALTIME_MAX_PAYLOAD, ForwardPayload},
+        recipient::Recipient,
+    };
 
     fn frame(family: FrameFamily, msg_type: u16, body: &[u8]) -> Vec<u8> {
         let mut header = FrameHeader::new(family as u8, msg_type);
@@ -4708,12 +4754,101 @@ mod realtime_lane_frame_tests {
         encoded
     }
 
+    fn relay_forward() -> ForwardPayload {
+        ForwardPayload {
+            next_hop_node_id: [2u8; 32],
+            envelope: DeliveryEnvelope {
+                recipient: Recipient::any([3u8; 32]),
+                sender_node_id: [4u8; 32],
+                src_app_id: [5u8; 32],
+                app_id: [6u8; 32],
+                endpoint_id: 7,
+                content_id: [8u8; 32],
+                created_at: 1,
+                ttl_secs: 30,
+                payload: vec![veil_proto::E2E_MARKER, 9, 10, 11],
+                trace_id: 0,
+                require_ack: false,
+            },
+            relay_hops: 0,
+            delivery_attempt: None,
+            traffic_class: Some(veil_proto::priority::REALTIME),
+        }
+    }
+
     #[test]
     fn accepts_one_exact_realtime_app_frame() {
         let encoded = frame(FrameFamily::App, AppMsg::AppRtData as u16, b"media");
-        let (header, body) = decode_realtime_lane_frame(&encoded).unwrap();
+        let (header, body, kind) = decode_realtime_lane_frame(&encoded).unwrap();
         assert_eq!(header.msg_type, AppMsg::AppRtData as u16);
         assert_eq!(body, b"media");
+        assert_eq!(kind, RealtimeLaneFrameKind::DirectApp);
+    }
+
+    #[test]
+    fn accepts_canonical_loss_tolerant_relay_forward() {
+        let encoded = frame(
+            FrameFamily::Delivery,
+            DeliveryMsg::Forward as u16,
+            &relay_forward().encode(),
+        );
+        let (header, _, kind) = decode_realtime_lane_frame(&encoded).unwrap();
+        assert_eq!(header.msg_type, DeliveryMsg::Forward as u16);
+        assert_eq!(kind, RealtimeLaneFrameKind::RelayForward);
+    }
+
+    #[test]
+    fn compact_relay_media_fits_one_physical_quic_datagram() {
+        const NEGOTIATED_DATAGRAM_SIZE: usize = 1382;
+        const MEDIA_CELL_MAX: usize = 1000;
+        const MEDIA_SEAL_OVERHEAD: usize = 4 + 8 + 8 + 16;
+
+        let mut forward = relay_forward();
+        forward.envelope.payload = vec![0u8; MEDIA_CELL_MAX + MEDIA_SEAL_OVERHEAD];
+        forward.envelope.payload[..4].copy_from_slice(&veil_proto::ipc::RELAY_MEDIA_SEALED_MAGIC);
+        let encoded = frame(
+            FrameFamily::Delivery,
+            DeliveryMsg::Forward as u16,
+            &forward.encode(),
+        );
+        assert_eq!(encoded.len(), 1300, "wire budget changed unexpectedly");
+        assert!(decode_realtime_lane_frame(&encoded).is_some());
+
+        let mut tx = crate::realtime_datagram::RealtimeDatagramTx::new(&[1u8; 32], &[2u8; 32]);
+        let datagrams = tx.encode_frame(&encoded, NEGOTIATED_DATAGRAM_SIZE).unwrap();
+        assert_eq!(datagrams.len(), 1, "compact media must not fragment");
+        assert_eq!(datagrams[0].len(), encoded.len() + 24 + 16);
+        assert!(datagrams[0].len() <= NEGOTIATED_DATAGRAM_SIZE);
+    }
+
+    #[test]
+    fn rejects_reliable_oversized_and_noncanonical_relay_forwards() {
+        let mut forward = relay_forward();
+        forward.envelope.require_ack = true;
+        let reliable = frame(
+            FrameFamily::Delivery,
+            DeliveryMsg::Forward as u16,
+            &forward.encode(),
+        );
+        assert!(decode_realtime_lane_frame(&reliable).is_none());
+
+        forward = relay_forward();
+        forward.envelope.payload = vec![0u8; FORWARD_REALTIME_MAX_PAYLOAD + 1];
+        let oversized = frame(
+            FrameFamily::Delivery,
+            DeliveryMsg::Forward as u16,
+            &forward.encode(),
+        );
+        assert!(decode_realtime_lane_frame(&oversized).is_none());
+
+        forward = relay_forward();
+        forward.traffic_class = None;
+        let unmarked = frame(
+            FrameFamily::Delivery,
+            DeliveryMsg::Forward as u16,
+            &forward.encode(),
+        );
+        assert!(decode_realtime_lane_frame(&unmarked).is_none());
     }
 
     #[test]
