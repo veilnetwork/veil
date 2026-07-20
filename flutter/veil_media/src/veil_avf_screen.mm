@@ -23,7 +23,9 @@
 
 #include "veil_screen.h"
 
+#include <cstdlib>
 #include <cstdint>
+#include <string>
 #include <vector>
 
 #include "third_party/libyuv/include/libyuv/convert.h"  // NV12ToI420, ARGBToI420
@@ -112,7 +114,8 @@ namespace {
 
 class AvfScreenCapturer : public ScreenCapturer {
  public:
-  explicit AvfScreenCapturer(CameraFrameCb cb) : cb_(std::move(cb)) {}
+  AvfScreenCapturer(CameraFrameCb cb, CGDirectDisplayID display_id)
+      : cb_(std::move(cb)), display_id_(display_id) {}
   ~AvfScreenCapturer() override { Stop(); }
 
   bool Start(int width, int fps) override {
@@ -120,7 +123,7 @@ class AvfScreenCapturer : public ScreenCapturer {
     if (fps <= 0) fps = 10;
     @autoreleasepool {
       AVCaptureScreenInput* input = [[AVCaptureScreenInput alloc]
-          initWithDisplayID:CGMainDisplayID()];
+          initWithDisplayID:display_id_];
       if (input == nil) return false;
       input.minFrameDuration = CMTimeMake(1, fps);
       input.capturesCursor = YES;
@@ -192,6 +195,7 @@ class AvfScreenCapturer : public ScreenCapturer {
 
  private:
   CameraFrameCb cb_;
+  CGDirectDisplayID display_id_ = 0;
   AVCaptureSession* session_ = nil;
   AVCaptureVideoDataOutput* output_ = nil;
   VeilScreenDelegate* delegate_ = nil;
@@ -200,8 +204,37 @@ class AvfScreenCapturer : public ScreenCapturer {
 
 }  // namespace
 
-ScreenCapturer* CreatePlatformScreen(CameraFrameCb cb) {
-  return new AvfScreenCapturer(std::move(cb));
+ScreenCapturer* CreatePlatformScreen(CameraFrameCb cb, const char* source_id) {
+  CGDirectDisplayID display_id = CGMainDisplayID();
+  if (source_id != nullptr && source_id[0] != '\0') {
+    char* end = nullptr;
+    const unsigned long parsed = std::strtoul(source_id, &end, 10);
+    if (end == source_id || *end != '\0' || parsed > UINT32_MAX)
+      return nullptr;
+    display_id = static_cast<CGDirectDisplayID>(parsed);
+    if (!CGDisplayIsActive(display_id)) return nullptr;
+  }
+  return new AvfScreenCapturer(std::move(cb), display_id);
+}
+
+std::string ListPlatformScreensJson() {
+  CGDirectDisplayID displays[32] = {};
+  uint32_t count = 0;
+  const CGError rc = CGGetActiveDisplayList(32, displays, &count);
+  if (rc != kCGErrorSuccess) return "[]";
+  std::string json = "[";
+  for (uint32_t i = 0; i < count; ++i) {
+    const CGDirectDisplayID id = displays[i];
+    if (i != 0) json += ',';
+    const CGRect bounds = CGDisplayBounds(id);
+    json += "{\"id\":\"" + std::to_string(id) + "\",\"label\":\"";
+    json += CGDisplayIsMain(id) ? "Main display" : "Display " + std::to_string(i + 1);
+    json += " (" + std::to_string(static_cast<int>(bounds.size.width)) +
+            "x" + std::to_string(static_cast<int>(bounds.size.height)) +
+            ")\",\"kind\":\"screen\"}";
+  }
+  json += ']';
+  return json;
 }
 
 }  // namespace veil_media
