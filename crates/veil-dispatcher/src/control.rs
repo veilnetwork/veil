@@ -140,6 +140,20 @@ impl FrameDispatcher {
                 let is_relay_target = request.target_node_id != [0u8; 32]
                     && request.target_node_id != self.local_node_id;
                 if is_relay_target {
+                    // A NAT coordinator is only the first signalling hop. In
+                    // a real sparse overlay it is not guaranteed to hold a
+                    // direct session to the target (the initiator and target
+                    // commonly attach to different DHT neighbours). Suppress
+                    // duplicate/looped copies before following route_cache;
+                    // the cache is intentionally the floodable relay-domain
+                    // cache, isolated from payload replay-critical entries.
+                    let mut key_hasher = blake3::Hasher::new();
+                    key_hasher.update(b"veil:nat-probe-request-forward:v1");
+                    key_hasher.update(body);
+                    let forward_key = *key_hasher.finalize().as_bytes();
+                    if lock!(self.forward_seen_set).check_and_insert(forward_key) {
+                        return DispatchResult::NoResponse;
+                    }
                     //round 7 / : per-peer rate limit on
                     // relay forwards. Without this, a peer firing unique
                     // `query_id`s at line rate gets us to forward each
@@ -160,13 +174,14 @@ impl FrameDispatcher {
                         );
                         return DispatchResult::NoResponse;
                     }
-                    // Forward request unchanged to target. Greedy: only
-                    // direct-session forward (no recursive walk yet —
-                    // matches the dispatcher's RecursiveQuery direct-
-                    // session-first policy). If the target isn't a
-                    // session peer, drop the request silently — the
-                    // initiator will time out and try a different
-                    // coordinator.
+                    // Forward request unchanged, preferring a direct target
+                    // session and otherwise following the bounded route-cache
+                    // next hop. Every intermediate dispatcher evaluates the
+                    // embedded final target again; the dedup key above breaks
+                    // stale route-cache cycles without adding a wire field.
+                    // Snapshot the cache before the session registry to keep
+                    // the canonical route_cache -> registry lock order.
+                    let cached_hop = rlock!(self.route_cache).lookup(&request.target_node_id);
                     if let Some(ref reg_arc) = self.session_tx_registry {
                         let guard = wlock!(reg_arc);
                         let frame = build_control_frame(
@@ -174,14 +189,21 @@ impl FrameDispatcher {
                             &request.encode(),
                         );
                         let prio = veil_proto::header::priority::INTERACTIVE;
-                        if guard.send_to(&request.target_node_id, prio, frame) {
+                        let direct = guard.send_to(&request.target_node_id, prio, frame.clone());
+                        let routed_hop = cached_hop.filter(|hop| {
+                            *hop != *node_id.as_bytes() && *hop != self.local_node_id
+                        });
+                        let routed = !direct
+                            && routed_hop.is_some_and(|hop| guard.send_to(&hop, prio, frame));
+                        if direct || routed {
                             self.logger.info(
                                 "nat.probe.forwarded",
                                 format!(
-                                    "target={} initiator={} session_token=0x{:08x}",
+                                    "target={} initiator={} session_token=0x{:08x} path={}",
                                     veil_util::hex_short(&request.target_node_id),
                                     veil_util::hex_short(&request.initiator_node_id),
                                     request.session_token,
+                                    if direct { "direct" } else { "route_cache" },
                                 ),
                             );
                         } else {
@@ -337,6 +359,13 @@ impl FrameDispatcher {
                     let is_relay_target = reply.final_target_node_id != [0u8; 32]
                         && reply.final_target_node_id != self.local_node_id;
                     if is_relay_target {
+                        let mut key_hasher = blake3::Hasher::new();
+                        key_hasher.update(b"veil:nat-probe-reply-forward:v1");
+                        key_hasher.update(body);
+                        let forward_key = *key_hasher.finalize().as_bytes();
+                        if lock!(self.forward_seen_set).check_and_insert(forward_key) {
+                            return DispatchResult::NoResponse;
+                        }
                         //round 7 / : per-peer rate limit
                         // on reply-relay forwards. Symmetric with the
                         // request-side gate above — closes the second
@@ -355,6 +384,8 @@ impl FrameDispatcher {
                             );
                             return DispatchResult::NoResponse;
                         }
+                        let cached_hop =
+                            rlock!(self.route_cache).lookup(&reply.final_target_node_id);
                         if let Some(ref reg_arc) = self.session_tx_registry {
                             let guard = wlock!(reg_arc);
                             let frame = build_control_frame(
@@ -362,14 +393,22 @@ impl FrameDispatcher {
                                 &reply.encode(),
                             );
                             let prio = veil_proto::header::priority::INTERACTIVE;
-                            if guard.send_to(&reply.final_target_node_id, prio, frame) {
+                            let direct =
+                                guard.send_to(&reply.final_target_node_id, prio, frame.clone());
+                            let routed_hop = cached_hop.filter(|hop| {
+                                *hop != *node_id.as_bytes() && *hop != self.local_node_id
+                            });
+                            let routed = !direct
+                                && routed_hop.is_some_and(|hop| guard.send_to(&hop, prio, frame));
+                            if direct || routed {
                                 self.logger.info(
                                     "nat.probe.reply_forwarded",
                                     format!(
-                                        "to_initiator={} responder={} session_token=0x{:08x}",
+                                        "to_initiator={} responder={} session_token=0x{:08x} path={}",
                                         veil_util::hex_short(&reply.final_target_node_id),
                                         veil_util::hex_short(&reply.responder_node_id),
                                         reply.session_token,
+                                        if direct { "direct" } else { "route_cache" },
                                     ),
                                 );
                             } else {
