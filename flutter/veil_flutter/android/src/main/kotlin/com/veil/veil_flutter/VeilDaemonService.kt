@@ -44,6 +44,7 @@ import android.os.Build
 import android.os.IBinder
 import android.os.PowerManager
 import android.provider.Settings
+import android.util.Log
 import androidx.core.app.NotificationCompat
 
 class VeilDaemonService : Service() {
@@ -55,6 +56,8 @@ class VeilDaemonService : Service() {
         const val EXTRA_NOTIFICATION_TEXT  = "notification_text"
         const val EXTRA_HANGUP_ACTION = "hangup_action"
         const val EXTRA_RINGING = "ringing"
+        const val EXTRA_MICROPHONE = "microphone"
+        const val EXTRA_CAMERA = "camera"
 
         private const val CHANNEL_ID = "veil_daemon"
         private const val CALL_INCOMING_CHANNEL_ID = "veil_call_incoming_v2"
@@ -66,6 +69,7 @@ class VeilDaemonService : Service() {
         private const val WAKE_LOCK_TAG = "veil:daemon"
         private const val APP_ACTION_HANGUP = "network.veil.xveil.action.HANGUP_CALL"
         private const val APP_ACTION_ACCEPT = "network.veil.xveil.action.ACCEPT_CALL"
+        private const val TAG = "VeilDaemonService"
     }
 
     // Partial wake lock held for the service's lifetime. A foreground service
@@ -87,7 +91,8 @@ class VeilDaemonService : Service() {
         // receives the actual title / body via Intent extras.
         startForegroundCompat(
             buildNotification(getString(R.string.veil_default_title), null),
-            callMedia = false,
+            microphone = false,
+            camera = false,
         )
     }
 
@@ -105,9 +110,12 @@ class VeilDaemonService : Service() {
                 val text = intent?.getStringExtra(EXTRA_NOTIFICATION_TEXT)
                 val hangupAction = intent?.getBooleanExtra(EXTRA_HANGUP_ACTION, false) ?: false
                 val ringing = intent?.getBooleanExtra(EXTRA_RINGING, false) ?: false
+                val microphone = intent?.getBooleanExtra(EXTRA_MICROPHONE, false) ?: false
+                val camera = intent?.getBooleanExtra(EXTRA_CAMERA, false) ?: false
                 startForegroundCompat(
                     buildNotification(title, text, hangupAction, ringing),
-                    callMedia = hangupAction,
+                    microphone = microphone,
+                    camera = camera,
                 )
                 acquireWakeLock()
             }
@@ -248,7 +256,11 @@ class VeilDaemonService : Service() {
         return builder.build()
     }
 
-    private fun startForegroundCompat(notification: Notification, callMedia: Boolean) {
+    private fun startForegroundCompat(
+        notification: Notification,
+        microphone: Boolean,
+        camera: Boolean,
+    ) {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
             // Android 14+ requires a foregroundServiceType matching
             // the service's actual purpose.  REMOTE_MESSAGING fits
@@ -257,14 +269,23 @@ class VeilDaemonService : Service() {
             // to maintain network connections in the background
             // without the user-visible CONNECTED_DEVICE / DATA_SYNC
             // restrictions.
-            val type = if (callMedia) {
-                ServiceInfo.FOREGROUND_SERVICE_TYPE_REMOTE_MESSAGING or
-                    ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE or
-                    ServiceInfo.FOREGROUND_SERVICE_TYPE_CAMERA
-            } else {
-                ServiceInfo.FOREGROUND_SERVICE_TYPE_REMOTE_MESSAGING
+            var type = ServiceInfo.FOREGROUND_SERVICE_TYPE_REMOTE_MESSAGING
+            if (microphone) type = type or ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE
+            if (camera) type = type or ServiceInfo.FOREGROUND_SERVICE_TYPE_CAMERA
+            try {
+                startForeground(NOTIFICATION_ID, notification, type)
+            } catch (error: SecurityException) {
+                // Runtime capture permissions and Android's foreground-only
+                // eligibility can change while a call is entering PiP.  A
+                // rejected media type must degrade to process/network
+                // retention, never crash the entire application.
+                Log.w(TAG, "Media foreground-service type rejected; using remoteMessaging", error)
+                startForeground(
+                    NOTIFICATION_ID,
+                    notification,
+                    ServiceInfo.FOREGROUND_SERVICE_TYPE_REMOTE_MESSAGING,
+                )
             }
-            startForeground(NOTIFICATION_ID, notification, type)
         } else {
             startForeground(NOTIFICATION_ID, notification)
         }
