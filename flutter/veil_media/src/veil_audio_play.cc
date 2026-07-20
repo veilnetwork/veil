@@ -10,6 +10,7 @@
  */
 
 #include "veil_audio_play.h"
+#include "veil_diag_log.h"
 
 #include <atomic>
 #include <cstdlib>
@@ -19,7 +20,6 @@
 
 #if defined(VEIL_MEDIA_HAVE_WEBRTC)
 #include <cstdarg>
-#include <cstdio>
 
 #include "api/audio/audio_device.h"
 #include "api/audio/audio_device_defines.h"
@@ -45,14 +45,10 @@ constexpr int kSampleRate = 48000;
 constexpr int kOpusSdpChannels = 2;  // SDP convention (see recorder)
 
 void plog(const char* fmt, ...) {
-  FILE* f = fopen("/tmp/veil_media_diag.log", "a");
-  if (!f) return;
   va_list ap;
   va_start(ap, fmt);
-  vfprintf(f, fmt, ap);
+  veil_media::diag::vlog(fmt, ap);
   va_end(ap);
-  fputc('\n', f);
-  fclose(f);
 }
 
 uint32_t rd_u32le(const uint8_t* p) {

@@ -18,6 +18,7 @@
 #import <TargetConditionals.h>
 
 #include "veil_avf_adm.h"
+#include "veil_diag_log.h"
 
 #if defined(VEIL_MEDIA_HAVE_WEBRTC)
 #include <atomic>
@@ -46,7 +47,7 @@ constexpr size_t kPlayTmpSamples = 8192;  // render blocks are ~512-4096 frames
 void alog(const char* fmt, ...) {
   va_list ap;
   va_start(ap, fmt);
-#if TARGET_OS_IPHONE
+#if TARGET_OS_IPHONE && !defined(NDEBUG)
   // iOS has no process-global writable /tmp. Keep diagnostics in the unified
   // device log; values are structural only (permission/state/frame counts),
   // never PCM or identity material.
@@ -54,14 +55,7 @@ void alog(const char* fmt, ...) {
   vsnprintf(line, sizeof(line), fmt, ap);
   NSLog(@"veil_media: %s", line);
 #else
-  FILE* f = fopen("/tmp/veil_media_diag.log", "a");
-  if (!f) {
-    va_end(ap);
-    return;
-  }
-  vfprintf(f, fmt, ap);
-  fputc('\n', f);
-  fclose(f);
+  veil_media::diag::vlog(fmt, ap);
 #endif
   va_end(ap);
 }
