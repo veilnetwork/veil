@@ -855,6 +855,14 @@ impl NodeRuntime {
             }
             Err(error) => return Err(error.into()),
         };
+        veil_util::outbound_interface::configure_outbound_socket(
+            &socket,
+            if addr.is_ipv4() {
+                veil_util::outbound_interface::SocketFamilies::V4
+            } else {
+                veil_util::outbound_interface::SocketFamilies::V6
+            },
+        )?;
         let local_addr = socket.local_addr()?;
         let Some(shutdown_tx) = &self.shutdown_tx else {
             return Ok(());
@@ -971,6 +979,22 @@ impl NodeRuntime {
                                         return;
                                     }
                                 };
+                                if let Err(error) =
+                                    veil_util::outbound_interface::configure_outbound_socket(
+                                        &socket,
+                                        if first_reflector.is_ipv4() {
+                                            veil_util::outbound_interface::SocketFamilies::V4
+                                        } else {
+                                            veil_util::outbound_interface::SocketFamilies::V6
+                                        },
+                                    )
+                                {
+                                    logger.warn(
+                                        "nat.udp_punch.interface_pin_failed",
+                                        error.to_string(),
+                                    );
+                                    return;
+                                }
                                 let discovery_token = {
                                     use rand_core::RngCore;
                                     let mut token = [0u8; 16];

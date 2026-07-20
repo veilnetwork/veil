@@ -31,7 +31,12 @@ libc = "0.2"
 # Narrow feature gate — only the `Memory` namespace from Win32,
 # ≈ 30 KB extra compile time.  Matches the rust-msrv windows-sys
 # baseline (0.59 is stable as of 2026-Q2).
-windows-sys = { version = "0.59", features = ["Win32_System_Memory", "Win32_Foundation"] }
+windows-sys = { version = "0.59", features = [
+    "Win32_System_Memory",
+    "Win32_Foundation",
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_Networking_WinSock",
+] }
 
 [dev-dependencies]
 tempfile = "3"

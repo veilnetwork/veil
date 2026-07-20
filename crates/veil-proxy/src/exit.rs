@@ -25,7 +25,7 @@ use std::time::Duration;
 
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
-    net::{TcpStream, UdpSocket, lookup_host},
+    net::{TcpSocket, UdpSocket, lookup_host},
     sync::mpsc,
     time::timeout,
 };
@@ -316,8 +316,25 @@ where
         ));
     };
 
-    // Open an outgoing TCP connection to the filtered target.
-    let tcp = timeout(CONNECT_TIMEOUT, TcpStream::connect(addr))
+    // Open an outgoing TCP connection to the filtered target. On Windows the
+    // socket must be pinned before connect so an xVeil full-tunnel route does
+    // not recursively feed an exit node's own egress back into its SOCKS.
+    let socket = if addr.is_ipv4() {
+        TcpSocket::new_v4()
+    } else {
+        TcpSocket::new_v6()
+    }?;
+    if !addr.ip().is_loopback() {
+        veil_util::outbound_interface::configure_outbound_socket(
+            &socket,
+            if addr.is_ipv4() {
+                veil_util::outbound_interface::SocketFamilies::V4
+            } else {
+                veil_util::outbound_interface::SocketFamilies::V6
+            },
+        )?;
+    }
+    let tcp = timeout(CONNECT_TIMEOUT, socket.connect(addr))
         .await
         .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "connect timeout"))?
         .map_err(|e| std::io::Error::new(e.kind(), format!("tcp connect to {addr}: {e}")))?;
@@ -451,6 +468,16 @@ async fn spawn_udp_target(
         SocketAddr::V6(_) => "[::]:0",
     };
     let socket = UdpSocket::bind(bind).await?;
+    if !target.ip().is_loopback() {
+        veil_util::outbound_interface::configure_outbound_socket(
+            &socket,
+            if target.is_ipv4() {
+                veil_util::outbound_interface::SocketFamilies::V4
+            } else {
+                veil_util::outbound_interface::SocketFamilies::V6
+            },
+        )?;
+    }
     socket.connect(target).await?;
     let (request_tx, mut request_rx) = mpsc::channel::<Vec<u8>>(UDP_TARGET_QUEUE);
 

@@ -5072,6 +5072,7 @@ dependencies = [
  "tokio",
  "veil-proto",
  "veil-types",
+ "veil-util",
 ]
 
 [[package]]
@@ -5195,6 +5196,7 @@ dependencies = [
  "url",
  "veil-error",
  "veil-obfs4",
+ "veil-util",
  "veil-webtunnel",
  "webpki-roots 0.26.11",
 ]

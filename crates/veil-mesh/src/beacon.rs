@@ -498,6 +498,14 @@ impl BeaconSender {
         interval: Duration,
     ) -> std::io::Result<Self> {
         let socket = UdpSocket::bind(bind_addr).await?;
+        veil_util::outbound_interface::configure_outbound_socket(
+            &socket,
+            if broadcast_addr.is_ipv4() {
+                veil_util::outbound_interface::SocketFamilies::V4
+            } else {
+                veil_util::outbound_interface::SocketFamilies::V6
+            },
+        )?;
         Ok(Self {
             realm_id,
             local_node_id,

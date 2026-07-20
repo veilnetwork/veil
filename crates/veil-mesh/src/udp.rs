@@ -295,6 +295,14 @@ impl UdpRealm {
     ) -> std::io::Result<Self> {
         // Bind as std socket first so we can clone for UdpLink (sync send).
         let std_raw = std::net::UdpSocket::bind(addr)?;
+        veil_util::outbound_interface::configure_outbound_socket(
+            &std_raw,
+            if addr.is_ipv4() {
+                veil_util::outbound_interface::SocketFamilies::V4
+            } else {
+                veil_util::outbound_interface::SocketFamilies::V6
+            },
+        )?;
         let std_socket = std_raw.try_clone()?;
         // Both sockets are non-blocking: the async socket for recv, the std
         // socket for sync send in UdpLink. A blocking send_to would stall
