@@ -130,8 +130,8 @@ cargoTargetMap.each { abi, triple ->
         // Re-enable with `-PveilTlsBoring=true` if a build ever needs it.
         def tlsBoring = (project.findProperty('veilTlsBoring') ?: 'false').toString() == 'true'
         def featureArgs = tlsBoring
-            ? ['--features', "${seedFeature},node-embedded"]
-            : ['--no-default-features', '--features', "${seedFeature},node-embedded"]
+            ? ['--features', "${seedFeature},node-embedded,packet-tunnel"]
+            : ['--no-default-features', '--features', "${seedFeature},node-embedded,packet-tunnel"]
         commandLine(['cargo', 'ndk', '-t', abi, '--',
                      'build', '--release', '-p', 'veilclient-ffi'] + featureArgs)
         // Capture stderr/stdout to gradle's log so build failures
