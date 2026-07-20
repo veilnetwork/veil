@@ -48,6 +48,7 @@ members = [
     "crates/veil-udp-obfs",
     "crates/veil-update",
     "crates/veil-util",
+    "crates/veil-vpn-helper",
     "crates/veil-webtunnel",
     "veilcore",
     "veilclient",
