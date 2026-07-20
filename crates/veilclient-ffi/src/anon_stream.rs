@@ -52,6 +52,10 @@ fn diag_node(node: &[u8; 32], msg: &str) {
     diag(&format!("onion-stream[{}]: {msg}", short_node(node)));
 }
 
+fn diag_node_debug(node: &[u8; 32], msg: &str) {
+    log::debug!("onion-stream[{}]: {msg}", short_node(node));
+}
+
 /// Well-known endpoint the onion-stream cells ride (distinct from the chat
 /// inbox). Both peers bind it; a peer's app id is `deriveAppId(peer_node,
 /// STREAM_NAMESPACE, STREAM_NAME)` — the caller supplies it (mirrors how the
@@ -3756,13 +3760,24 @@ async fn open_inbound_circuits(
                     Ok((circuit, rx)) => opened.push((Some(relay), circuit, rx)),
                     Err(e) => {
                         last_err = e;
-                        diag_node(
-                            &me,
-                            &format!(
-                                "inbound published R={} open failed: {last_err:?}",
-                                short_node(&relay)
-                            ),
+                        let message = format!(
+                            "inbound published R={} open failed: {last_err:?}",
+                            short_node(&relay)
                         );
+                        if matches!(
+                            last_err,
+                            AnonOnionSendError::NoRelays
+                                | AnonOnionSendError::NoRendezvous
+                        ) {
+                            // A freshly started mobile node knows the signed
+                            // rendezvous ads before its relay directory has
+                            // converged. Retrying is intentional; warning on
+                            // every relay every eight seconds only heats the
+                            // device and obscures actionable failures.
+                            diag_node_debug(&me, &message);
+                        } else {
+                            diag_node(&me, &message);
+                        }
                     }
                 }
             }
