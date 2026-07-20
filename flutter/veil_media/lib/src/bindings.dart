@@ -157,6 +157,22 @@ final int Function(Pointer<VeilMediaEngineHandle>, int, int)
                     Int32)>>('veil_media_engine_start_screen')
         .asFunction();
 
+final int Function(
+  Pointer<VeilMediaEngineHandle>,
+  Pointer<Utf8>,
+  int,
+  int,
+) veilMediaEngineStartScreenSource = nativeLib
+    .lookup<
+        NativeFunction<
+            Int32 Function(
+              Pointer<VeilMediaEngineHandle>,
+              Pointer<Utf8>,
+              Int32,
+              Int32,
+            )>>('veil_media_engine_start_screen_source')
+    .asFunction();
+
 // stop_screen(engine*) -> int
 final int Function(Pointer<VeilMediaEngineHandle>) veilMediaEngineStopScreen =
     nativeLib
@@ -234,6 +250,12 @@ final Pointer<Utf8> Function(Pointer<VeilMediaEngineHandle>)
                     Pointer<Utf8> Function(Pointer<VeilMediaEngineHandle>)>>(
             'veil_media_engine_list_video_inputs')
         .asFunction();
+
+final Pointer<Utf8> Function() veilMediaListScreenInputs = nativeLib
+    .lookup<NativeFunction<Pointer<Utf8> Function()>>(
+      'veil_media_list_screen_inputs',
+    )
+    .asFunction();
 
 // select_audio_input(engine*, id char*) -> int
 final int Function(Pointer<VeilMediaEngineHandle>, Pointer<Utf8>)
@@ -400,6 +422,22 @@ final int Function(Pointer<VeilGroupMediaEngineHandle>, int, int)
                   Int32,
                 )>>('veil_media_group_engine_start_screen')
         .asFunction();
+
+final int Function(
+  Pointer<VeilGroupMediaEngineHandle>,
+  Pointer<Utf8>,
+  int,
+  int,
+) veilMediaGroupEngineStartScreenSource = nativeLib
+    .lookup<
+        NativeFunction<
+            Int32 Function(
+              Pointer<VeilGroupMediaEngineHandle>,
+              Pointer<Utf8>,
+              Int32,
+              Int32,
+            )>>('veil_media_group_engine_start_screen_source')
+    .asFunction();
 
 final int Function(Pointer<VeilGroupMediaEngineHandle>)
     veilMediaGroupEngineStopScreen = nativeLib

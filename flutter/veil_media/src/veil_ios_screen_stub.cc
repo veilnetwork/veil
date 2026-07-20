@@ -9,9 +9,12 @@
 
 namespace veil_media {
 
-ScreenCapturer* CreatePlatformScreen(CameraFrameCb cb) {
+ScreenCapturer* CreatePlatformScreen(CameraFrameCb cb, const char* source_id) {
   (void)cb;
+  (void)source_id;
   return nullptr;
 }
+
+std::string ListPlatformScreensJson() { return "[]"; }
 
 }  // namespace veil_media

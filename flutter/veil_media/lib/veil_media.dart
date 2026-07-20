@@ -39,6 +39,21 @@ class MediaDevice {
       );
 }
 
+List<MediaDevice> _decodeDevices(Pointer<Utf8> json) {
+  if (json == nullptr) return const [];
+  try {
+    final decoded = jsonDecode(json.toDartString());
+    if (decoded is! List) return const [];
+    return decoded
+        .whereType<Map<String, dynamic>>()
+        .map(MediaDevice.fromJson)
+        .where((device) => device.id.isNotEmpty)
+        .toList(growable: false);
+  } finally {
+    ffi.veilMediaFreeString(json);
+  }
+}
+
 /// A decoded remote video frame: tightly-packed RGBA (width*height*4 bytes).
 class VeilVideoFrame {
   const VeilVideoFrame(
@@ -186,8 +201,16 @@ class VeilMediaEngine {
   /// has no screen backend (macOS only for now) or capture can't start. The
   /// first ever use triggers the OS Screen Recording consent prompt; until
   /// granted (plus an app restart) the share runs black. Idempotent.
-  bool startScreen({int width = 640, int fps = 10}) {
+  bool startScreen({int width = 640, int fps = 10, String? sourceId}) {
     _ensure();
+    if (sourceId != null && sourceId.isNotEmpty) {
+      final id = sourceId.toNativeUtf8();
+      try {
+        return ffi.veilMediaEngineStartScreenSource(_ptr, id, width, fps) == 0;
+      } finally {
+        calloc.free(id);
+      }
+    }
     return ffi.veilMediaEngineStartScreen(_ptr, width, fps) == 0;
   }
 
@@ -384,6 +407,11 @@ class VeilMediaEngine {
   List<MediaDevice> listVideoInputs() =>
       _devices(ffi.veilMediaEngineListVideoInputs(_ptr));
 
+  List<MediaDevice> listScreenInputs() {
+    _ensure();
+    return _decodeDevices(ffi.veilMediaListScreenInputs());
+  }
+
   bool selectAudioInput(String id) =>
       _select(id, ffi.veilMediaEngineSelectAudioInput);
 
@@ -445,19 +473,7 @@ class VeilMediaEngine {
     }
   }
 
-  List<MediaDevice> _devices(Pointer<Utf8> json) {
-    if (json == nullptr) return const [];
-    try {
-      final decoded = jsonDecode(json.toDartString());
-      if (decoded is! List) return const [];
-      return decoded
-          .whereType<Map<String, dynamic>>()
-          .map(MediaDevice.fromJson)
-          .toList(growable: false);
-    } finally {
-      ffi.veilMediaFreeString(json);
-    }
-  }
+  List<MediaDevice> _devices(Pointer<Utf8> json) => _decodeDevices(json);
 }
 
 /// One native N-party audio engine: a single mic/Opus send stream is fanned out
@@ -538,9 +554,28 @@ class VeilGroupMediaEngine {
     return ffi.veilMediaGroupEngineStopCamera(_ptr) == 0;
   }
 
-  bool startScreen({int width = 640, int fps = 10}) {
+  bool startScreen({int width = 640, int fps = 10, String? sourceId}) {
     _ensure();
+    if (sourceId != null && sourceId.isNotEmpty) {
+      final id = sourceId.toNativeUtf8();
+      try {
+        return ffi.veilMediaGroupEngineStartScreenSource(
+              _ptr,
+              id,
+              width,
+              fps,
+            ) ==
+            0;
+      } finally {
+        calloc.free(id);
+      }
+    }
     return ffi.veilMediaGroupEngineStartScreen(_ptr, width, fps) == 0;
+  }
+
+  List<MediaDevice> listScreenInputs() {
+    _ensure();
+    return _decodeDevices(ffi.veilMediaListScreenInputs());
   }
 
   bool stopScreen() {
