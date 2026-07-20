@@ -15,7 +15,9 @@
 //! ```
 //!
 //! The exit node reads this header, connects to `host:port`, sends a one-byte
-//! success acknowledgement (`0x00`) and then bridges bidirectionally.
+//! success acknowledgement (`0x00`) and then bridges bidirectionally. The
+//! initiator consumes this protocol byte before it reports SOCKS5 success; it
+//! is never part of the proxied application's byte stream.
 
 use std::net::IpAddr;
 use std::time::Duration;
