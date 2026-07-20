@@ -9,6 +9,10 @@ import NetworkExtension
 /// operating-system packet flow.
 public class VeilFlutterPlugin: NSObject, FlutterPlugin {
   private static let vpnChannel = "network.veil.xveil/vpn"
+  // The full-tunnel route also captures the host app's overlay sockets. Keep
+  // start fail-closed until veil/SOCKS is owned by PacketTunnel rather than by
+  // the containing Flutter process.
+  private static let hasExtensionOwnedUpstream = false
 
   public static func register(with registrar: FlutterPluginRegistrar) {
     let channel = FlutterMethodChannel(
@@ -89,14 +93,30 @@ public class VeilFlutterPlugin: NSObject, FlutterPlugin {
         return
       }
       guard let manager else {
-        self.finish(result, Self.state("stopped"))
+        self.finish(result, Self.state(
+          Self.hasExtensionOwnedUpstream ? "stopped" : "unsupported",
+          detail: Self.hasExtensionOwnedUpstream
+            ? nil : "Apple VPN awaits an extension-owned veil upstream"))
         return
       }
-      self.finish(result, Self.state(Self.phase(manager.connection.status)))
+      let current = Self.phase(manager.connection.status)
+      if !Self.hasExtensionOwnedUpstream && current == "stopped" {
+        self.finish(result, Self.state(
+          "unsupported",
+          detail: "Apple VPN awaits an extension-owned veil upstream"))
+        return
+      }
+      self.finish(result, Self.state(current))
     }
   }
 
   private func vpnStart(_ arguments: Any?, result: @escaping FlutterResult) {
+    guard Self.hasExtensionOwnedUpstream else {
+      finish(result, Self.state(
+        "unsupported",
+        detail: "Apple VPN awaits an extension-owned veil upstream"))
+      return
+    }
     guard let arguments = arguments as? [String: Any],
           let policy = arguments["policy"] as? [String: Any],
           let socks5Listen = arguments["socks5Listen"] as? String,
