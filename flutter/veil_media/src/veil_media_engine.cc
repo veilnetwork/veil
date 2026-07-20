@@ -1616,8 +1616,9 @@ int veil_media_group_engine_stop_camera(VeilGroupMediaEngine* engine) {
   return VEIL_MEDIA_OK;
 }
 
-int veil_media_group_engine_start_screen(VeilGroupMediaEngine* engine,
-                                         int width, int fps) {
+int veil_media_group_engine_start_screen_source(VeilGroupMediaEngine* engine,
+                                                const char* source_id,
+                                                int width, int fps) {
   if (engine == nullptr) return VEIL_MEDIA_ERR_ARG;
 #if defined(VEIL_MEDIA_HAVE_WEBRTC) && defined(__APPLE__)
   GroupWebrtcState* ws = engine->ws.get();
@@ -1639,17 +1640,25 @@ int veil_media_group_engine_start_screen(VeilGroupMediaEngine* engine,
         if (local_sink)
           local_sink->store_i420(y, u, v, w, h, sy, su, sv);
         push_i420(source, y, u, v, w, h, sy, su, sv, ts_us);
-      }));
+      },
+      source_id));
   if (!ws->screen || !ws->screen->Start(width, fps)) {
     ws->screen.reset();
     return VEIL_MEDIA_ERR_STATE;
   }
   return VEIL_MEDIA_OK;
 #else
+  (void)source_id;
   (void)width;
   (void)fps;
   return VEIL_MEDIA_ERR_STATE;
 #endif
+}
+
+int veil_media_group_engine_start_screen(VeilGroupMediaEngine* engine,
+                                         int width, int fps) {
+  return veil_media_group_engine_start_screen_source(engine, nullptr, width,
+                                                     fps);
 }
 
 int veil_media_group_engine_stop_screen(VeilGroupMediaEngine* engine) {
@@ -2184,8 +2193,9 @@ int veil_media_engine_stop_camera(VeilMediaEngine* engine) {
   return VEIL_MEDIA_OK;
 }
 
-int veil_media_engine_start_screen(VeilMediaEngine* engine, int width,
-                                   int fps) {
+int veil_media_engine_start_screen_source(VeilMediaEngine* engine,
+                                          const char* source_id, int width,
+                                          int fps) {
   if (engine == nullptr) return VEIL_MEDIA_ERR_ARG;
 #if defined(VEIL_MEDIA_HAVE_WEBRTC) && defined(__APPLE__)
   WebrtcState* ws = engine->ws.get();
@@ -2210,7 +2220,8 @@ int veil_media_engine_start_screen(VeilMediaEngine* engine, int width,
           local_sink->store_i420(y, u, v, w, h, sy, su, sv);
         if (should_encode_video_frame(ws))
           push_i420(src, y, u, v, w, h, sy, su, sv, ts_us);
-      }));
+      },
+      source_id));
   if (!ws->screen) return VEIL_MEDIA_ERR_STATE;
   if (!ws->screen->Start(width, fps)) {
     ws->screen.reset();
@@ -2219,10 +2230,16 @@ int veil_media_engine_start_screen(VeilMediaEngine* engine, int width,
   vlog("screen: started w<=%d@%d", width, fps);
   return VEIL_MEDIA_OK;
 #else
+  (void)source_id;
   (void)width;
   (void)fps;
   return VEIL_MEDIA_ERR_STATE;  // no screen backend on this platform yet
 #endif
+}
+
+int veil_media_engine_start_screen(VeilMediaEngine* engine, int width,
+                                   int fps) {
+  return veil_media_engine_start_screen_source(engine, nullptr, width, fps);
 }
 
 int veil_media_engine_stop_screen(VeilMediaEngine* engine) {
@@ -2442,6 +2459,14 @@ char* veil_media_engine_list_video_inputs(VeilMediaEngine* engine) {
 #if defined(VEIL_MEDIA_HAVE_WEBRTC) && \
     (defined(__APPLE__) || (defined(__linux__) && !defined(__ANDROID__)))
   return dup_cstr(veil_media::ListPlatformCamerasJson());
+#else
+  return dup_cstr("[]");
+#endif
+}
+
+char* veil_media_list_screen_inputs(void) {
+#if defined(VEIL_MEDIA_HAVE_WEBRTC) && defined(__APPLE__)
+  return dup_cstr(veil_media::ListPlatformScreensJson());
 #else
   return dup_cstr("[]");
 #endif
