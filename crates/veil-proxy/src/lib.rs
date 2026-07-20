@@ -1,12 +1,13 @@
 //! Veil proxy subsystem — extraction.
 //!
 //! Three modules:
-//! [`socks5`] — RFC 1928 ingress proxy (CONNECT only). Pure protocol +
-//! socket plumbing — no veil-specific deps; [`ProxyConnector`] is the
-//! abstraction over "open a stream to the exit node".
+//! [`socks5`] — RFC 1928 ingress proxy (CONNECT + bounded UDP ASSOCIATE).
+//! Pure protocol + socket plumbing — no veil-specific deps; [`ProxyConnector`]
+//! is the abstraction over "open a stream to the exit node".
 //! [`exit`] — exit proxy: reads `[host_len][host][port]` header from an
-//! veil stream, opens TCP to the destination, bridges duplex. RFC1918
-//! / link-local destinations are denied unless `allow_private` is set.
+//! veil stream, opens TCP or connected UDP sockets to the destination and
+//! bridges them. RFC1918 / link-local destinations are denied unless
+//! `allow_private` is set; UDP fan-out, queues and amplification are bounded.
 //! [`veil_connector`] — `ProxyConnector` impl that opens an OVL1 app
 //! stream (APP_OPEN / APP_DATA / APP_CLOSE) to the exit node via the
 //! [`veil_types::FrameBroadcaster`] trait.
@@ -17,6 +18,7 @@
 
 pub mod exit;
 pub mod socks5;
+pub mod udp;
 pub mod veil_connector;
 
 pub use exit::ExitProxy;
