@@ -2,11 +2,11 @@
  *
  * veil_screen.h — a platform screen capturer that emits I420 frames.
  *
- * The screen-share twin of veil_camera.h: opens the main display and delivers
- * each captured frame as strided I420 via the same CameraFrameCb shape, on the
- * capture queue. veil_media_engine.cc feeds the planes into the SAME VP8 send
- * source the camera uses — screen share is a source switch, not a new track,
- * so the receiving side needs nothing new to render it.
+ * The screen-share twin of veil_camera.h: opens a selected display and
+ * delivers each captured frame as strided I420 via the same CameraFrameCb
+ * shape, on the capture queue. veil_media_engine.cc feeds the planes into the
+ * SAME VP8 send source the camera uses — screen share is a source switch, not
+ * a new track, so the receiving side needs nothing new to render it.
  *
  * macOS backs this with AVCaptureSession + AVCaptureScreenInput
  * (veil_avf_screen.mm); other platforms return null from the factory until
@@ -36,8 +36,15 @@ class ScreenCapturer {
 };
 
 // Creates the platform screen capturer, or null if this platform has none.
-// The callback is retained for the capturer's lifetime.
-ScreenCapturer* CreatePlatformScreen(CameraFrameCb cb);
+// `source_id` is an opaque id returned by ListPlatformScreensJson; null/empty
+// selects the main display. The callback is retained for the capturer's
+// lifetime.
+ScreenCapturer* CreatePlatformScreen(CameraFrameCb cb, const char* source_id);
+
+// JSON array compatible with the Dart MediaDevice shape:
+// [{"id":"...","label":"...","kind":"screen"}].
+// Returns "[]" where the platform has no native screen backend.
+std::string ListPlatformScreensJson();
 
 }  // namespace veil_media
 
