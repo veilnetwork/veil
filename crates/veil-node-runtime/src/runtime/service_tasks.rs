@@ -4249,10 +4249,18 @@ impl veil_types::AnonOnionSender for RuntimeAnonOnionSender {
                     // before the coarse AnonOnionSendError→u16 collapse the
                     // client reports as "status 2" — log the real SenderError
                     // so failure bursts are diagnosable.
-                    log::warn!(
-                        "mailbox.fetch.send_failed relay={} err={e:?}",
-                        veil_util::hex_short(&target_node_id),
-                    );
+                    match &e {
+                        veil_anonymity::sender::SenderError::InsufficientRelayCandidates {
+                            ..
+                        } => log::debug!(
+                            "mailbox.fetch.route_unavailable relay={} err={e:?}",
+                            veil_util::hex_short(&target_node_id),
+                        ),
+                        _ => log::warn!(
+                            "mailbox.fetch.send_failed relay={} err={e:?}",
+                            veil_util::hex_short(&target_node_id),
+                        ),
+                    }
                     super::map_sender_err(e)
                 })
         })

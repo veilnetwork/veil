@@ -7054,7 +7054,7 @@ impl NodeServices {
             )
             .is_err()
         {
-            log::warn!(
+            log::debug!(
                 "build_onion_circuit_once NoRelays: CircuitBuild send to first hop {} failed (no live session)",
                 veil_util::hex_short(&first_hop),
             );
@@ -7777,7 +7777,7 @@ impl NodeServices {
             // Which of the NoRelays conditions actually fired — needed to
             // diagnose the bursty reply-path failures (all concurrent sends
             // share this state, so one lapse fails a whole drain pass).
-            log::warn!(
+            log::debug!(
                 "anonymity.reply_path.no_rendezvous_relay live_active={} pinned={}",
                 lock!(self.live_sessions)
                     .values()
@@ -7808,7 +7808,7 @@ impl NodeServices {
 
         let hop_count = hop_count.max(2);
         if self.dht.get_local(&relay_directory_dht_key(&r)).is_none() {
-            log::warn!(
+            log::debug!(
                 "anonymity.reply_path.r_directory_missing r={}",
                 veil_util::hex_short(&r),
             );
@@ -9097,10 +9097,17 @@ impl NodeServices {
                     // See reply_path_failed above — keep the real circuit-build
                     // error visible instead of the generic NO_ROUTE it becomes
                     // at the IPC boundary.
-                    log::warn!(
-                        "mailbox.fetch.reply_circuit_failed relay={} err={e:?}",
-                        veil_util::hex_short(relay_path.last().unwrap_or(&[0u8; 32])),
-                    );
+                    if e == veil_types::AnonOnionSendError::NoRelays {
+                        log::debug!(
+                            "mailbox.fetch.reply_circuit_unavailable relay={} err={e:?}",
+                            veil_util::hex_short(relay_path.last().unwrap_or(&[0u8; 32])),
+                        );
+                    } else {
+                        log::warn!(
+                            "mailbox.fetch.reply_circuit_failed relay={} err={e:?}",
+                            veil_util::hex_short(relay_path.last().unwrap_or(&[0u8; 32])),
+                        );
+                    }
                     veil_anonymity::sender::SenderError::InsufficientRelayCandidates {
                         need: REPLY_CIRCUIT_HOPS,
                         have: 0,
@@ -9722,7 +9729,7 @@ impl NodeServices {
             // relay pool (or the target itself is the first hop) — this send
             // rides the old sessionless-first-hop odds and may be lost until
             // an app-layer retry.
-            log::warn!(
+            log::debug!(
                 "anonymity.first_hop.guard_fallback path=onion first_hop={} \
                  live_sessions={} usable={}",
                 veil_util::hex_short(&first_hop_node_id),
@@ -9779,10 +9786,16 @@ impl NodeServices {
                 // record the failure so the picker downweights this relay.
                 // Still fire-and-forget (return Ok): a synchronous error
                 // would leak first-hop reachability to a sender-side observer.
-                log::warn!(
-                    "anonymity.first_hop.send_failed path=onion reason={e:?} first_hop={}",
-                    veil_util::hex_short(&first_hop_node_id),
-                );
+                match e {
+                    veil_session::SendToError::Missing => log::debug!(
+                        "anonymity.first_hop.session_missing path=onion first_hop={}",
+                        veil_util::hex_short(&first_hop_node_id),
+                    ),
+                    _ => log::warn!(
+                        "anonymity.first_hop.send_failed path=onion reason={e:?} first_hop={}",
+                        veil_util::hex_short(&first_hop_node_id),
+                    ),
+                }
                 self.anonymity
                     .relay_reputation
                     .record_failure(first_hop_node_id);
@@ -10273,7 +10286,7 @@ impl NodeServices {
         if !live_first_hops.contains(&first_hop_node_id) {
             // Guard fallback: no live-session candidate in the pool — this
             // introduce rides the old sessionless-first-hop odds.
-            log::warn!(
+            log::debug!(
                 "anonymity.first_hop.guard_fallback path=introduce first_hop={} \
                  live_sessions={} usable={}",
                 veil_util::hex_short(&first_hop_node_id),
@@ -10319,10 +10332,16 @@ impl NodeServices {
                 // reason + record the failure; still fire-and-forget (see
                 // send_anonymous — a synchronous error would leak first-hop
                 // reachability).
-                log::warn!(
-                    "anonymity.first_hop.send_failed path=introduce reason={e:?} first_hop={}",
-                    veil_util::hex_short(&first_hop_node_id),
-                );
+                match e {
+                    veil_session::SendToError::Missing => log::debug!(
+                        "anonymity.first_hop.session_missing path=introduce first_hop={}",
+                        veil_util::hex_short(&first_hop_node_id),
+                    ),
+                    _ => log::warn!(
+                        "anonymity.first_hop.send_failed path=introduce reason={e:?} first_hop={}",
+                        veil_util::hex_short(&first_hop_node_id),
+                    ),
+                }
                 self.anonymity
                     .relay_reputation
                     .record_failure(first_hop_node_id);
