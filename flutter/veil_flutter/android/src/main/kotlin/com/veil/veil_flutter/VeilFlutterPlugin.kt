@@ -8,7 +8,8 @@
 // not exposed via NDK.
 //
 // MethodChannel surface:
-//   * `startBackgroundService` — args: { title?, text? } → null
+//   * `startBackgroundService` — args:
+//       { title?, text?, hangupAction?, ringing?, microphone?, camera? } → null
 //   * `stopBackgroundService`  — args: {}                 → null
 
 package com.veil.veil_flutter
@@ -100,12 +101,16 @@ class VeilFlutterPlugin : FlutterPlugin, MethodCallHandler, ActivityAware {
                 val text  = call.argument<String>("text")
                 val hangupAction = call.argument<Boolean>("hangupAction") ?: false
                 val ringing = call.argument<Boolean>("ringing") ?: false
+                val microphone = call.argument<Boolean>("microphone") ?: false
+                val camera = call.argument<Boolean>("camera") ?: false
                 val intent = Intent(ctx, VeilDaemonService::class.java).apply {
                     action = VeilDaemonService.ACTION_START
                     if (title != null) putExtra(VeilDaemonService.EXTRA_NOTIFICATION_TITLE, title)
                     if (text  != null) putExtra(VeilDaemonService.EXTRA_NOTIFICATION_TEXT, text)
                     putExtra(VeilDaemonService.EXTRA_HANGUP_ACTION, hangupAction)
                     putExtra(VeilDaemonService.EXTRA_RINGING, ringing)
+                    putExtra(VeilDaemonService.EXTRA_MICROPHONE, microphone)
+                    putExtra(VeilDaemonService.EXTRA_CAMERA, camera)
                 }
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
                     ctx.startForegroundService(intent)
