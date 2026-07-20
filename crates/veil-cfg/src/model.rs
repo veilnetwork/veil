@@ -243,12 +243,13 @@ impl PriorityWeights {
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 pub struct ProxyConfig {
     /// SOCKS5 ingress proxy. When `enabled`, the node accepts SOCKS5 CONNECT
-    /// requests on `listen` and tunnels the resulting TCP streams through the
-    /// veil to an exit node.
+    /// and UDP ASSOCIATE requests on `listen` and tunnels them through veil to
+    /// an exit node.
     #[serde(default)]
     pub socks5: Socks5Config,
-    /// Exit proxy. When `enabled`, the node accepts veil proxy-connect
-    /// streams and establishes outgoing TCP connections on the client's behalf.
+    /// Exit proxy. When `enabled`, the node accepts veil proxy-connect streams
+    /// and establishes outgoing TCP or bounded UDP associations on the
+    /// client's behalf.
     #[serde(default)]
     pub exit: ExitProxyConfig,
 }
