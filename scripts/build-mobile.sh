@@ -39,7 +39,7 @@ readonly REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # identity-bearing written to a config.toml). It pulls veil-node-runtime with
 # NO default features, so the heavy C++ RocksDB cold store stays OFF mobile
 # (in-memory DHT); add `node-embedded-rocksdb` only for desktop/server.
-readonly DEFAULT_FEATURES="production-seeds,node-embedded"
+readonly DEFAULT_FEATURES="production-seeds,node-embedded,packet-tunnel"
 
 # Targets supported by the Flutter plugin.  iOS / macOS targets require
 # a macOS host toolchain — script just invokes cargo, no platform check

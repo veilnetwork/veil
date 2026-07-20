@@ -94,6 +94,15 @@ mod identity_sign;
 mod nickname_net;
 #[cfg(feature = "node-embedded")]
 mod node;
+#[cfg(feature = "packet-tunnel")]
+mod packet_tunnel;
+
+#[cfg(feature = "packet-tunnel")]
+pub use packet_tunnel::{
+    VEIL_TUNNEL_ERROR, VEIL_TUNNEL_RUNNING, VEIL_TUNNEL_STARTING, VEIL_TUNNEL_STOPPED,
+    veil_packet_tunnel_last_error, veil_packet_tunnel_start_fd, veil_packet_tunnel_status,
+    veil_packet_tunnel_stop,
+};
 
 use libc::{size_t, ssize_t};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
