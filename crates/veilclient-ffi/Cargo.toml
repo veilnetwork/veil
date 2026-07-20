@@ -29,7 +29,7 @@ tls-boring = ["veilclient/tls-boring"]
 allow-empty-seeds = ["veilclient/allow-empty-seeds"]
 production-seeds  = ["veilclient/production-seeds"]
 test-low-difficulty = ["veilclient/test-low-difficulty"]
-packet-tunnel = ["dep:tun2proxy"]
+packet-tunnel = ["dep:tun2proxy", "dep:tun", "dep:serde", "dep:serde_json"]
 
 # Embed a full veil node IN-PROCESS (no `veil-cli` subprocess) — for sandboxed
 # desktop + mobile (iOS) hosts that cannot spawn a child process. Pulls
@@ -93,6 +93,12 @@ log = "0.4"
 # the embedding Flutter process. UDP goes through veil's bounded SOCKS5
 # UDP-ASSOCIATE path; the optional public udpgw feature stays disabled.
 tun2proxy = { version = "=0.8.2", default-features = false, optional = true }
+# The Linux desktop helper creates the privileged TUN itself, while Android
+# passes an OS-owned fd and Apple uses packet callbacks. Keep this behind the
+# same packet-tunnel feature so non-VPN builds do not pull platform glue.
+tun = { version = "=0.8.13", features = ["async"], optional = true }
+serde = { version = "1", features = ["derive"], optional = true }
+serde_json = { version = "1", optional = true }
 
 # Android: route the embedded node's `log` output to logcat so the in-process
 # node is debuggable on-device (Rust stderr is NOT captured by logcat).
