@@ -5342,6 +5342,112 @@ mod tests {
         assert!(!lock!(initiator.nat_probe_waiters).contains_key(&session_token));
     }
 
+    /// A randomly selected authenticated coordinator is not necessarily a
+    /// common neighbour of both punch participants. The request must follow
+    /// the coordinator's existing overlay route instead of requiring a direct
+    /// target session; a byte-identical loop is suppressed locally.
+    #[test]
+    fn token_nat_probe_request_follows_route_cache_without_common_neighbor() {
+        use veil_proto::{codec::decode_header, control::NatProbeRequestPayload};
+
+        let initiator_id = [0xAA; 32];
+        let target_id = [0xBB; 32];
+        let coordinator_id = [0xCC; 32];
+        let next_hop_id = [0xDD; 32];
+
+        let mut coordinator = make_test_dispatcher(NodeRole::Core);
+        coordinator.local_node_id = coordinator_id;
+        let sessions = Arc::new(RwLock::new(veil_session::SessionTxRegistry::new()));
+        let mut to_next_hop = sessions.write().unwrap().register(next_hop_id);
+        coordinator.session_tx_registry = Some(Arc::clone(&sessions));
+        wlock!(coordinator.route_cache).insert(target_id, next_hop_id, 1, 2);
+
+        let request = NatProbeRequestPayload {
+            initiator_node_id: initiator_id,
+            target_node_id: target_id,
+            session_token: 0xCAFE_BABE,
+            punch_token: Some([0x42; 16]),
+            candidates: vec![],
+        };
+        let header = FrameHeader::new(
+            FrameFamily::Control as u8,
+            ControlMsg::NatProbeRequest as u16,
+        );
+        assert!(matches!(
+            coordinator.dispatch(&header, &request.encode(), initiator_id),
+            DispatchResult::NoResponse
+        ));
+
+        let (_, forwarded) = to_next_hop
+            .try_recv()
+            .expect("route-cache next hop receives request");
+        let forwarded_header = decode_header(&forwarded[..HEADER_SIZE]).unwrap();
+        assert_eq!(
+            forwarded_header.msg_type,
+            ControlMsg::NatProbeRequest as u16
+        );
+        assert_eq!(
+            NatProbeRequestPayload::decode(&forwarded[HEADER_SIZE..]).unwrap(),
+            request
+        );
+
+        // A stale route cycle returning the exact probe cannot circulate it.
+        assert!(matches!(
+            coordinator.dispatch(&header, &request.encode(), next_hop_id),
+            DispatchResult::NoResponse
+        ));
+        assert!(to_next_hop.try_recv().is_err());
+    }
+
+    /// The response is independently routable to the initiator. It must use a
+    /// cached next hop when the responder-side coordinator does not have a
+    /// direct initiator session, with the same loop suppression as requests.
+    #[test]
+    fn token_nat_probe_reply_follows_route_cache_without_common_neighbor() {
+        use veil_proto::{codec::decode_header, control::NatProbeReplyPayload};
+
+        let initiator_id = [0xAA; 32];
+        let responder_id = [0xBB; 32];
+        let coordinator_id = [0xCC; 32];
+        let next_hop_id = [0xDD; 32];
+
+        let mut coordinator = make_test_dispatcher(NodeRole::Core);
+        coordinator.local_node_id = coordinator_id;
+        let sessions = Arc::new(RwLock::new(veil_session::SessionTxRegistry::new()));
+        let mut to_next_hop = sessions.write().unwrap().register(next_hop_id);
+        coordinator.session_tx_registry = Some(Arc::clone(&sessions));
+        wlock!(coordinator.route_cache).insert(initiator_id, next_hop_id, 1, 2);
+
+        let reply = NatProbeReplyPayload {
+            responder_node_id: responder_id,
+            final_target_node_id: initiator_id,
+            session_token: 0xCAFE_BABE,
+            punch_token: Some([0x42; 16]),
+            candidates: vec![],
+        };
+        let header = FrameHeader::new(FrameFamily::Control as u8, ControlMsg::NatProbeReply as u16);
+        assert!(matches!(
+            coordinator.dispatch(&header, &reply.encode(), responder_id),
+            DispatchResult::NoResponse
+        ));
+
+        let (_, forwarded) = to_next_hop
+            .try_recv()
+            .expect("route-cache next hop receives reply");
+        let forwarded_header = decode_header(&forwarded[..HEADER_SIZE]).unwrap();
+        assert_eq!(forwarded_header.msg_type, ControlMsg::NatProbeReply as u16);
+        assert_eq!(
+            NatProbeReplyPayload::decode(&forwarded[HEADER_SIZE..]).unwrap(),
+            reply
+        );
+
+        assert!(matches!(
+            coordinator.dispatch(&header, &reply.encode(), next_hop_id),
+            DispatchResult::NoResponse
+        ));
+        assert!(to_next_hop.try_recv().is_err());
+    }
+
     /// bug-fix follow-up: when a NatProbeReply arrives
     /// THROUGH a coordinator (peer_id!= reply.responder_node_id)
     /// the dispatcher MUST NOT update wildcard listen transports
