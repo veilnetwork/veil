@@ -313,15 +313,32 @@ pub(crate) async fn handle_ipc_send(
     // This additive flag is intentionally read from the stable raw flags word:
     // AppIpcSendPayload ignores unknown bits, so old clients/servers remain
     // compatible without growing its public struct and every literal user.
-    let relay_realtime = body
+    let raw_flags = body
         .get(100..104)
         .and_then(|v| <[u8; 4]>::try_from(v).ok())
         .map(u32::from_be_bytes)
-        .is_some_and(|flags| flags & veil_proto::ipc::IPC_SEND_FLAG_RELAY_REALTIME != 0);
+        .unwrap_or(0);
+    let relay_realtime = raw_flags & veil_proto::ipc::IPC_SEND_FLAG_RELAY_REALTIME != 0;
+    let relay_media_sealed = raw_flags & veil_proto::ipc::IPC_SEND_FLAG_RELAY_MEDIA_SEALED != 0;
     let send = match AppIpcSendPayload::decode(body) {
         Ok(s) => s,
         Err(_) => return Ok(()), // drop malformed
     };
+
+    // PRESEALED is deliberately a narrow call-media optimization, not a
+    // general "skip E2E" switch. Requiring the realtime relay flag, no ACK,
+    // and a versioned ciphertext marker makes malformed/miscombined local IPC
+    // fail closed before routing. An old daemon ignores the additive flag and
+    // safely adds its ordinary ML-KEM envelope instead.
+    if relay_media_sealed
+        && (!relay_realtime
+            || send.require_ack
+            || !send
+                .data
+                .starts_with(&veil_proto::ipc::RELAY_MEDIA_SEALED_MAGIC))
+    {
+        return Ok(());
+    }
 
     // explicit application-payload size cap before
     // any E2E encryption / fragmentation work. Frame body is already
@@ -511,7 +528,14 @@ pub(crate) async fn handle_ipc_send(
                 // stored in the pending-ack entry so the originator can verify
                 // the recipient's DELIVERED MAC and a forged ACK earns nothing.
                 let mut ack_key = [0u8; 32];
-                let final_payload = if let Some(keys) = peer_mlkem_keys {
+                let final_payload = if relay_media_sealed {
+                    // The call-media codec already authenticated and encrypted
+                    // this payload under a per-call directional key delivered
+                    // inside the normal ML-KEM-protected call signaling.
+                    // Preserve the compact cell verbatim so a single RTP
+                    // packet can fit one hop-level QUIC DATAGRAM.
+                    (*send.data).to_vec()
+                } else if let Some(keys) = peer_mlkem_keys {
                     let mut recipient_ek = rlock!(keys)
                         .get(&send.dst_node_id)
                         .map(|(ek, _)| ek.clone());
@@ -666,7 +690,11 @@ pub(crate) async fn handle_ipc_send(
                     endpoint_id: if send.anonymous { 0 } else { send.endpoint_id },
                     content_id,
                     created_at: now,
-                    ttl_secs: 30,
+                    ttl_secs: if relay_realtime {
+                        veil_proto::delivery::FORWARD_REALTIME_TTL_SECS
+                    } else {
+                        30
+                    },
                     payload: final_payload,
                     trace_id,
                     require_ack: send.require_ack,

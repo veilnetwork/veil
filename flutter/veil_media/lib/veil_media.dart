@@ -129,6 +129,14 @@ class VeilMediaEngine {
     return ffi.veilMediaEngineStopVideo(_ptr) == 0;
   }
 
+  /// Set the route-specific RTP packet ceiling before [startVideo]. Passing
+  /// zero restores libwebrtc's default. Returns false after video send starts.
+  bool setMaxRtpPacketSize(int bytes) {
+    _ensure();
+    if (bytes < 0) throw ArgumentError.value(bytes, 'bytes');
+    return ffi.veilMediaEngineSetMaxRtpPacketSize(_ptr, bytes) == 0;
+  }
+
   /// Retune the running video send stream to a new bitrate/fps budget without
   /// restarting it (link-quality adaptation). Returns false when video send
   /// isn't running.

@@ -15,9 +15,16 @@
 //! [`crate::anon_stream::CircuitCells::send_datagram`]; the per-channel FFI
 //! (open / send / set-callback / close) lives in `lib.rs`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::os::raw::c_void;
-use std::sync::{LazyLock, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
+
+use chacha20poly1305::{
+    ChaCha20Poly1305, Nonce,
+    aead::{Aead, KeyInit, Payload},
+};
+use rand_core::{OsRng, RngCore};
+use zeroize::{Zeroize, Zeroizing};
 
 /// First byte of every media cell. Distinct from
 /// `veil_onion_stream::wire::PROTO_VER` (= 1), so a media cell is already an
@@ -30,6 +37,235 @@ pub const MEDIA_MAGIC: u8 = 0x4d; // 'M'
 /// distinct top-level magic makes old receivers drop the unknown cell instead
 /// of passing a batch envelope to WebRTC as if it were RTP.
 pub const MEDIA_BATCH_MAGIC: u8 = 0x42; // 'B'
+
+/// Symmetrically sealed relay-media cell. The same marker is validated by the
+/// local IPC daemon before it permits the compact presealed delivery path.
+pub const MEDIA_SEALED_MAGIC: [u8; 4] = *b"VME1";
+const MEDIA_SEALED_HEADER_LEN: usize = 4 + 8 + 8; // magic + epoch salt + sequence
+const MEDIA_SEALED_TAG_LEN: usize = 16;
+const MEDIA_SEALED_MAX_EPOCHS: usize = 4;
+const MEDIA_SEALED_KDF_CONTEXT: &str = "xveil/call-media/channel-epoch/v1";
+
+fn media_nonce(sequence: u64) -> Nonce {
+    let mut nonce = [0u8; 12];
+    nonce[4..].copy_from_slice(&sequence.to_be_bytes());
+    nonce.into()
+}
+
+fn media_epoch_key(master: &[u8; 32], salt: u64) -> [u8; 32] {
+    let mut material = [0u8; 40];
+    material[..32].copy_from_slice(master);
+    material[32..].copy_from_slice(&salt.to_be_bytes());
+    let key = blake3::derive_key(MEDIA_SEALED_KDF_CONTEXT, &material);
+    material.zeroize();
+    key
+}
+
+#[derive(Default)]
+struct MediaReplayWindow {
+    highest: u64,
+    bitmap: u128,
+}
+
+impl MediaReplayWindow {
+    fn accepts(&self, sequence: u64) -> bool {
+        if sequence == 0 {
+            return false;
+        }
+        if sequence > self.highest {
+            return true;
+        }
+        let delta = self.highest - sequence;
+        delta < u128::BITS as u64 && self.bitmap & (1u128 << delta) == 0
+    }
+
+    fn commit(&mut self, sequence: u64) {
+        if sequence > self.highest {
+            let shift = sequence - self.highest;
+            self.bitmap = if shift >= u128::BITS as u64 {
+                1
+            } else {
+                (self.bitmap << shift) | 1
+            };
+            self.highest = sequence;
+        } else {
+            self.bitmap |= 1u128 << (self.highest - sequence);
+        }
+    }
+}
+
+struct MediaCipherTx {
+    cipher: ChaCha20Poly1305,
+    salt: u64,
+    next_sequence: u64,
+}
+
+impl MediaCipherTx {
+    fn new(master: &[u8; 32]) -> Self {
+        let mut rng = OsRng;
+        let mut salt = rng.next_u64();
+        if salt == 0 {
+            salt = 1;
+        }
+        let mut key = media_epoch_key(master, salt);
+        let cipher = ChaCha20Poly1305::new((&key).into());
+        key.zeroize();
+        Self {
+            cipher,
+            salt,
+            next_sequence: 1,
+        }
+    }
+
+    fn seal(&mut self, plaintext: &[u8]) -> Option<Vec<u8>> {
+        if plaintext.is_empty() {
+            return None;
+        }
+        let sequence = self.next_sequence;
+        self.next_sequence = self.next_sequence.checked_add(1)?;
+        let mut header = [0u8; MEDIA_SEALED_HEADER_LEN];
+        header[..4].copy_from_slice(&MEDIA_SEALED_MAGIC);
+        header[4..12].copy_from_slice(&self.salt.to_be_bytes());
+        header[12..20].copy_from_slice(&sequence.to_be_bytes());
+        let ciphertext = self
+            .cipher
+            .encrypt(
+                &media_nonce(sequence),
+                Payload {
+                    msg: plaintext,
+                    aad: &header,
+                },
+            )
+            .ok()?;
+        let mut sealed = Vec::with_capacity(header.len() + ciphertext.len());
+        sealed.extend_from_slice(&header);
+        sealed.extend_from_slice(&ciphertext);
+        Some(sealed)
+    }
+}
+
+struct MediaRxEpoch {
+    salt: u64,
+    cipher: ChaCha20Poly1305,
+    replay: MediaReplayWindow,
+}
+
+struct MediaCipherRx {
+    master: Zeroizing<[u8; 32]>,
+    epochs: VecDeque<MediaRxEpoch>,
+}
+
+impl MediaCipherRx {
+    fn new(master: &[u8; 32]) -> Self {
+        Self {
+            master: Zeroizing::new(*master),
+            epochs: VecDeque::new(),
+        }
+    }
+
+    fn open(&mut self, sealed: &[u8]) -> Option<Vec<u8>> {
+        if sealed.len() <= MEDIA_SEALED_HEADER_LEN + MEDIA_SEALED_TAG_LEN
+            || !sealed.starts_with(&MEDIA_SEALED_MAGIC)
+        {
+            return None;
+        }
+        let salt = u64::from_be_bytes(sealed[4..12].try_into().ok()?);
+        let sequence = u64::from_be_bytes(sealed[12..20].try_into().ok()?);
+        if salt == 0 || sequence == 0 {
+            return None;
+        }
+        if let Some(epoch_index) = self.epochs.iter().position(|e| e.salt == salt) {
+            if epoch_index != 0 {
+                let epoch = self.epochs.remove(epoch_index)?;
+                self.epochs.push_front(epoch);
+            }
+            let epoch = self.epochs.front_mut()?;
+            if !epoch.replay.accepts(sequence) {
+                return None;
+            }
+            let plaintext = epoch
+                .cipher
+                .decrypt(
+                    &media_nonce(sequence),
+                    Payload {
+                        msg: &sealed[MEDIA_SEALED_HEADER_LEN..],
+                        aad: &sealed[..MEDIA_SEALED_HEADER_LEN],
+                    },
+                )
+                .ok()?;
+            epoch.replay.commit(sequence);
+            return Some(plaintext);
+        }
+
+        // Authenticate a new epoch before it consumes one of the bounded RX
+        // slots. Otherwise unauthenticated random salts could evict every live
+        // epoch without knowing the media key.
+        let mut key = media_epoch_key(&self.master, salt);
+        let cipher = ChaCha20Poly1305::new((&key).into());
+        key.zeroize();
+        let plaintext = cipher
+            .decrypt(
+                &media_nonce(sequence),
+                Payload {
+                    msg: &sealed[MEDIA_SEALED_HEADER_LEN..],
+                    aad: &sealed[..MEDIA_SEALED_HEADER_LEN],
+                },
+            )
+            .ok()?;
+        let mut replay = MediaReplayWindow::default();
+        replay.commit(sequence);
+        if self.epochs.len() >= MEDIA_SEALED_MAX_EPOCHS {
+            self.epochs.pop_back();
+        }
+        self.epochs.push_front(MediaRxEpoch {
+            salt,
+            cipher,
+            replay,
+        });
+        Some(plaintext)
+    }
+}
+
+/// Per-channel directional call-media cipher. A fresh random epoch salt is
+/// mixed into the TX sub-key, so rebuilding a route during the same call can
+/// safely restart its sequence at one without nonce reuse. RX retains only a
+/// tiny bounded set of recent epochs for make-before-break overlap.
+#[derive(Default)]
+pub(crate) struct MediaCipher {
+    tx: Mutex<Option<MediaCipherTx>>,
+    rx: Mutex<Option<MediaCipherRx>>,
+}
+
+impl MediaCipher {
+    pub(crate) fn configure(&self, mut tx_key: [u8; 32], mut rx_key: [u8; 32]) {
+        let tx = MediaCipherTx::new(&tx_key);
+        let rx = MediaCipherRx::new(&rx_key);
+        tx_key.zeroize();
+        rx_key.zeroize();
+        *self.tx.lock().unwrap_or_else(|p| p.into_inner()) = Some(tx);
+        *self.rx.lock().unwrap_or_else(|p| p.into_inner()) = Some(rx);
+    }
+
+    pub(crate) fn enabled(&self) -> bool {
+        self.tx.lock().unwrap_or_else(|p| p.into_inner()).is_some()
+    }
+
+    pub(crate) fn seal(&self, plaintext: &[u8]) -> Option<Vec<u8>> {
+        self.tx
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .as_mut()?
+            .seal(plaintext)
+    }
+
+    fn open(&self, sealed: &[u8]) -> Option<Vec<u8>> {
+        self.rx
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .as_mut()?
+            .open(sealed)
+    }
+}
 
 /// Encode multiple datagrams behind [`MEDIA_BATCH_MAGIC`]. Layout:
 /// `[count u16][len u16][packet]...`. Returns `None` for an empty batch, an
@@ -97,6 +333,9 @@ struct RecvCb {
     /// "the window was registered yet delivered nothing" — the discriminator
     /// between a registry-side and an engine-side silent drop.
     hits: u64,
+    /// Optional per-call E2E media cipher. Disabled channels retain the legacy
+    /// ML-KEM-per-envelope/direct/onion ingress unchanged.
+    cipher: Arc<MediaCipher>,
 }
 
 /// Inbound recv callbacks keyed by PEER node id. The circuit feed resolves the
@@ -113,7 +352,13 @@ static RECV_COUNT: LazyLock<Mutex<HashMap<[u8; 32], u64>>> =
 
 /// Register (or replace) the recv callback for media datagrams arriving from
 /// `peer`.
-pub fn set_recv_callback(peer: [u8; 32], chan: u64, cb: MediaRecvFn, ctx: *mut c_void) {
+pub fn set_recv_callback(
+    peer: [u8; 32],
+    chan: u64,
+    cb: MediaRecvFn,
+    ctx: *mut c_void,
+    cipher: Arc<MediaCipher>,
+) {
     let replaced = RECV.lock().unwrap_or_else(|p| p.into_inner()).insert(
         peer,
         RecvCb {
@@ -121,6 +366,7 @@ pub fn set_recv_callback(peer: [u8; 32], chan: u64, cb: MediaRecvFn, ctx: *mut c
             ctx: ctx as usize,
             chan,
             hits: 0,
+            cipher,
         },
     );
     diag(format_args!(
@@ -214,7 +460,7 @@ pub fn dispatch_inbound(peer: [u8; 32], payload: &[u8]) {
             use std::sync::atomic::{AtomicU64, Ordering};
             static MISSES: AtomicU64 = AtomicU64::new(0);
             let n = MISSES.fetch_add(1, Ordering::Relaxed);
-            if n < 5 || n % 500 == 0 {
+            if n < 5 || n.is_multiple_of(500) {
                 // Snapshot who IS registered: an entry under a different peer
                 // key at MISS time is a key-mismatch smoking gun; an empty
                 // registry is the plain rebuild gap.
@@ -294,6 +540,22 @@ pub fn dispatch_inbound_batch(peer: [u8; 32], body: &[u8]) {
 /// batching small audio/RTCP datagrams into one envelope, and this is where
 /// the batch unfolds on the receiving endpoint.
 pub fn dispatch_inbound_auto(peer: [u8; 32], payload: &[u8]) {
+    let plaintext;
+    let payload = if payload.starts_with(&MEDIA_SEALED_MAGIC) {
+        let Some(cipher) = ({
+            let map = RECV.lock().unwrap_or_else(|p| p.into_inner());
+            map.get(&peer).map(|entry| Arc::clone(&entry.cipher))
+        }) else {
+            return;
+        };
+        let Some(opened) = cipher.open(payload) else {
+            return;
+        };
+        plaintext = opened;
+        plaintext.as_slice()
+    } else {
+        payload
+    };
     if payload.first() == Some(&MEDIA_BATCH_MAGIC) {
         dispatch_inbound_batch(peer, &payload[1..]);
     } else {
@@ -334,7 +596,13 @@ mod tests {
         RX_CALLS.store(0, Ordering::SeqCst);
         RX_BYTES.store(0, Ordering::SeqCst);
 
-        set_recv_callback(peer_a, 1, record, std::ptr::null_mut());
+        set_recv_callback(
+            peer_a,
+            1,
+            record,
+            std::ptr::null_mut(),
+            Arc::new(MediaCipher::default()),
+        );
         // Registered peer → delivered (magic already stripped by the caller).
         dispatch_inbound(peer_a, &[0u8; 100]);
         // Unregistered peer → dropped (no channel open for it).
@@ -358,8 +626,20 @@ mod tests {
         // Old channel registers, then a NEWER channel to the same peer
         // replaces the registration (failed direct attempt → relay switch,
         // or a session rebuild).
-        set_recv_callback(peer, 1, record, std::ptr::null_mut());
-        set_recv_callback(peer, 2, record, std::ptr::null_mut());
+        set_recv_callback(
+            peer,
+            1,
+            record,
+            std::ptr::null_mut(),
+            Arc::new(MediaCipher::default()),
+        );
+        set_recv_callback(
+            peer,
+            2,
+            record,
+            std::ptr::null_mut(),
+            Arc::new(MediaCipher::default()),
+        );
         // The old channel's straggling teardown must be a no-op...
         clear_recv_callback(peer, 1);
         dispatch_inbound(peer, &[0u8; 60]);
@@ -379,13 +659,25 @@ mod tests {
         // The host closed the channel before the engine unregistered: the
         // peer key is no longer resolvable, so teardown must sweep by chan —
         // otherwise the stale registration swallows the peer's media forever.
-        set_recv_callback(peer, 9, record, std::ptr::null_mut());
+        set_recv_callback(
+            peer,
+            9,
+            record,
+            std::ptr::null_mut(),
+            Arc::new(MediaCipher::default()),
+        );
         clear_recv_callback_by_chan(9);
         dispatch_inbound(peer, &[0u8; 40]);
         assert_eq!(RX_CALLS.load(Ordering::SeqCst), 0, "swept registration");
 
         // ...and it must NOT touch a registration owned by another channel.
-        set_recv_callback(peer, 10, record, std::ptr::null_mut());
+        set_recv_callback(
+            peer,
+            10,
+            record,
+            std::ptr::null_mut(),
+            Arc::new(MediaCipher::default()),
+        );
         clear_recv_callback_by_chan(9);
         dispatch_inbound(peer, &[0u8; 40]);
         assert_eq!(RX_CALLS.load(Ordering::SeqCst), 1, "live chan survives");
@@ -399,6 +691,66 @@ mod tests {
         assert_ne!(MEDIA_MAGIC, veil_onion_stream::wire::PROTO_VER);
         assert_ne!(MEDIA_BATCH_MAGIC, veil_onion_stream::wire::PROTO_VER);
         assert_ne!(MEDIA_BATCH_MAGIC, MEDIA_MAGIC);
+        assert_eq!(
+            MEDIA_SEALED_MAGIC,
+            veil_proto::ipc::RELAY_MEDIA_SEALED_MAGIC,
+            "FFI and daemon compact-media markers must stay identical"
+        );
+    }
+
+    #[test]
+    fn media_cipher_roundtrip_reorders_and_rejects_replay() {
+        let key = [0x31u8; 32];
+        let mut tx = MediaCipherTx::new(&key);
+        let mut rx = MediaCipherRx::new(&key);
+        let first = tx.seal(b"first").unwrap();
+        let second = tx.seal(b"second").unwrap();
+
+        assert_eq!(rx.open(&second).as_deref(), Some(b"second".as_slice()));
+        assert_eq!(rx.open(&first).as_deref(), Some(b"first".as_slice()));
+        assert!(rx.open(&first).is_none(), "replay must be rejected");
+    }
+
+    #[test]
+    fn unauthenticated_epoch_cannot_evict_receive_state() {
+        let key = [0x42u8; 32];
+        let mut tx = MediaCipherTx::new(&key);
+        let mut rx = MediaCipherRx::new(&key);
+        let valid = tx.seal(b"authenticated").unwrap();
+        let mut forged = valid.clone();
+        forged[4..12].copy_from_slice(&0xfeed_beefu64.to_be_bytes());
+
+        assert!(rx.open(&forged).is_none());
+        assert!(
+            rx.epochs.is_empty(),
+            "failed AEAD must not allocate an epoch"
+        );
+        assert_eq!(
+            rx.open(&valid).as_deref(),
+            Some(b"authenticated".as_slice())
+        );
+        assert_eq!(rx.epochs.len(), 1);
+    }
+
+    #[test]
+    fn sealed_auto_dispatch_opens_once_before_routing() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let peer = [8u8; 32];
+        let tx_key = [0x51u8; 32];
+        let rx_key = [0x52u8; 32];
+        let cipher = Arc::new(MediaCipher::default());
+        cipher.configure(tx_key, rx_key);
+        set_recv_callback(peer, 11, record, std::ptr::null_mut(), cipher);
+        RX_CALLS.store(0, Ordering::SeqCst);
+        RX_BYTES.store(0, Ordering::SeqCst);
+
+        let mut remote_tx = MediaCipherTx::new(&rx_key);
+        let sealed = remote_tx.seal(&[0x80u8; 120]).unwrap();
+        dispatch_inbound_auto(peer, &sealed);
+        dispatch_inbound_auto(peer, &sealed);
+        assert_eq!(RX_CALLS.load(Ordering::SeqCst), 1, "replay is dropped");
+        assert_eq!(RX_BYTES.load(Ordering::SeqCst), 120);
+        clear_recv_callback(peer, 11);
     }
 
     #[test]
@@ -407,7 +759,13 @@ mod tests {
         let peer = [3u8; 32];
         RX_CALLS.store(0, Ordering::SeqCst);
         RX_BYTES.store(0, Ordering::SeqCst);
-        set_recv_callback(peer, 1, record, std::ptr::null_mut());
+        set_recv_callback(
+            peer,
+            1,
+            record,
+            std::ptr::null_mut(),
+            Arc::new(MediaCipher::default()),
+        );
         let packets = vec![vec![1u8; 120], vec![2u8; 130], vec![3u8; 140]];
         let encoded = encode_batch(&packets, 1024).unwrap();
         dispatch_inbound_batch(peer, &encoded);
@@ -421,7 +779,13 @@ mod tests {
         let _guard = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let peer = [4u8; 32];
         RX_CALLS.store(0, Ordering::SeqCst);
-        set_recv_callback(peer, 1, record, std::ptr::null_mut());
+        set_recv_callback(
+            peer,
+            1,
+            record,
+            std::ptr::null_mut(),
+            Arc::new(MediaCipher::default()),
+        );
         let mut encoded = encode_batch(&[vec![1u8; 10], vec![2u8; 10]], 128).unwrap();
         encoded.pop();
         dispatch_inbound_batch(peer, &encoded);
@@ -438,7 +802,13 @@ mod tests {
         // packet is never mis-parsed as a batch and a batch is always unfolded.
         let _guard = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let peer = [7u8; 32];
-        set_recv_callback(peer, 1, record, std::ptr::null_mut());
+        set_recv_callback(
+            peer,
+            1,
+            record,
+            std::ptr::null_mut(),
+            Arc::new(MediaCipher::default()),
+        );
 
         // A batch cell → each inner packet delivered.
         RX_CALLS.store(0, Ordering::SeqCst);
