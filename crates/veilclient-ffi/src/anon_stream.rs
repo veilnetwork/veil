@@ -3766,8 +3766,7 @@ async fn open_inbound_circuits(
                         );
                         if matches!(
                             last_err,
-                            AnonOnionSendError::NoRelays
-                                | AnonOnionSendError::NoRendezvous
+                            AnonOnionSendError::NoRelays | AnonOnionSendError::NoRendezvous
                         ) {
                             // A freshly started mobile node knows the signed
                             // rendezvous ads before its relay directory has
