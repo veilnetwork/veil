@@ -1888,12 +1888,22 @@ final void Function(int) veilDebugSetPublishPause = nativeLib
         'veil_debug_set_publish_pause')
     .asFunction();
 
-// media_channel_set_batching(chan, on) -> 0 ok / -1 unknown/unsupported route
-// channel. Host-gated by call protocol version (see AppHandle wrapper).
+// media_channel_set_batching(chan, mode) -> 0 ok / -1 unknown/unsupported.
+// Modes: 0 off, 1 legacy audio+video batch, 2 compact relay audio-only.
 final int Function(int, int) veilMediaChannelSetBatching = nativeLib
     .lookup<NativeFunction<Int32 Function(Uint64, Int32)>>(
         'veil_media_channel_set_batching')
     .asFunction();
+
+// media_channel_set_e2e_keys(chan, tx32, rx32) -> 0 ok / -1 invalid/non-relay
+final int Function(int, Pointer<Uint8>, Pointer<Uint8>)
+    veilMediaChannelSetE2eKeys = nativeLib
+        .lookup<
+            NativeFunction<
+                Int32 Function(Uint64, Pointer<Uint8>, Pointer<Uint8>)>>(
+          'veil_media_channel_set_e2e_keys',
+        )
+        .asFunction();
 
 // media_channel_get_stats(chan, out) -> 0 ok / -1 invalid. Direct/onion
 // channels return a zeroed relay snapshot.

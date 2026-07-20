@@ -1042,6 +1042,21 @@ pub const IPC_SEND_FLAG_IS_REPLY: u32 = 0x0000_0010;
 /// flag bits are ignored by older nodes, which preserves wire compatibility.
 pub const IPC_SEND_FLAG_RELAY_REALTIME: u32 = 0x0000_0020;
 
+/// The application payload is already end-to-end encrypted with an
+/// ephemeral call-media key and must not be wrapped in a fresh ML-KEM
+/// envelope by the local node. Valid only together with
+/// [`IPC_SEND_FLAG_RELAY_REALTIME`]; the daemon additionally requires the
+/// fixed [`RELAY_MEDIA_SEALED_MAGIC`] prefix before accepting this fast path.
+///
+/// This avoids repeating the 1088-byte ML-KEM ciphertext on every RTP packet.
+/// The ordinary ML-KEM path remains the backward-compatible fallback for old
+/// call peers and every non-media application message.
+pub const IPC_SEND_FLAG_RELAY_MEDIA_SEALED: u32 = 0x0000_0040;
+
+/// Versioned prefix of a symmetrically sealed relay-media cell. Shared by the
+/// local IPC gate and the media endpoint codec; relays never interpret it.
+pub const RELAY_MEDIA_SEALED_MAGIC: [u8; 4] = *b"VME1";
+
 /// Sent by the IPC client to dispatch a datagram into the veil network.
 ///
 /// Wire layout:

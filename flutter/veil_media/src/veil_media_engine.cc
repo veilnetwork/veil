@@ -826,6 +826,10 @@ struct WebrtcState {
   std::unique_ptr<veil_media::ScreenCapturer> screen;  // screen-share source
   int video_target_bitrate_bps = 0;
   std::atomic<int> video_max_fps{0};
+  // Route-specific RTP packet ceiling configured before the send stream is
+  // created. Relay compact mode uses 1000 so the symmetrically sealed Delivery
+  // frame remains one QUIC DATAGRAM instead of a loss-amplifying fragment pair.
+  int video_max_rtp_packet_size = 0;
   // Camera2/AVFoundation are external sources. Reconfiguring libwebrtc's
   // encoder advertises a lower max_framerate but does not reliably make those
   // sources shed frames, so a congested relay kept emitting at the physical
@@ -1848,6 +1852,28 @@ int veil_media_engine_stop_audio(VeilMediaEngine* engine) {
   return VEIL_MEDIA_OK;
 }
 
+int veil_media_engine_set_max_rtp_packet_size(VeilMediaEngine* engine,
+                                              int max_packet_size) {
+  if (engine == nullptr || max_packet_size < 0) return VEIL_MEDIA_ERR_ARG;
+#if defined(VEIL_MEDIA_HAVE_WEBRTC)
+  if (!engine->ws || !engine->ws->call) return VEIL_MEDIA_ERR_STATE;
+  WebrtcState* ws = engine->ws.get();
+  int result = VEIL_MEDIA_OK;
+  run_on(ws->worker_tq.get(), [&]() {
+    if (ws->video_send_stream != nullptr) {
+      result = VEIL_MEDIA_ERR_STATE;
+      return;
+    }
+    ws->video_max_rtp_packet_size =
+        max_packet_size == 0 ? 0 : std::clamp(max_packet_size, 576, 1460);
+  });
+  return result;
+#else
+  (void)max_packet_size;
+  return VEIL_MEDIA_ERR_STATE;
+#endif
+}
+
 int veil_media_engine_start_video(VeilMediaEngine* engine, int send, int recv,
                                   int max_bitrate_kbps, int max_fps) {
   if (engine == nullptr) return VEIL_MEDIA_ERR_ARG;
@@ -1881,6 +1907,8 @@ int veil_media_engine_start_video(VeilMediaEngine* engine, int send, int recv,
       sc.rtp.ssrcs = {local_v};                            // NOTE: vector
       sc.rtp.payload_name = "VP8";
       sc.rtp.payload_type = kVp8Pt;
+      if (ws->video_max_rtp_packet_size > 0)
+        sc.rtp.max_packet_size = ws->video_max_rtp_packet_size;
       sc.rtp.nack.rtp_history_ms = kVideoNackHistoryMs;
       sc.rtp.extensions.emplace_back(
           webrtc::RtpExtension::kTransportSequenceNumberUri,

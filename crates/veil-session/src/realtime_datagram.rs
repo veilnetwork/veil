@@ -1,5 +1,7 @@
 //! Encrypted, loss-tolerant wire codec for realtime frames carried in QUIC
-//! DATAGRAMs alongside an authenticated OVL1 session.
+//! DATAGRAMs alongside an authenticated OVL1 session. The session runner
+//! admits direct `AppRtData` and strictly canonical unacknowledged REALTIME
+//! relay forwards; reliable delivery always remains on the ordered stream.
 //!
 //! The main session cipher uses an implicit ordered nonce counter and therefore
 //! cannot be shared with an unordered/lossy lane. This module derives a
@@ -22,7 +24,7 @@ const TAG_LEN: usize = 16;
 const MIN_DATAGRAM_LEN: usize = HEADER_LEN + TAG_LEN + 1;
 const KDF_CONTEXT: &str = "veil/session/realtime-datagram/v1";
 
-/// App realtime frames are capped well below the ordinary session ceiling.
+/// Realtime app/relay frames are capped well below the ordinary session ceiling.
 pub const MAX_REALTIME_FRAME: usize = 16 * 1024;
 /// A large batched media cell still fits without unbounded fragment fan-out.
 pub const MAX_FRAGMENTS: usize = 32;
@@ -143,7 +145,7 @@ impl RealtimeDatagramTx {
         }
     }
 
-    /// Encrypt one complete OVL1 realtime frame into bounded datagrams.
+    /// Encrypt one complete loss-tolerant OVL1 frame into bounded datagrams.
     pub fn encode_frame(
         &mut self,
         frame: &[u8],
