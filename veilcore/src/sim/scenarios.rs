@@ -6675,22 +6675,41 @@ mod tests {
             .runtime
             .register_onion_service(2)
             .expect("register_onion_service must succeed");
-        let n_ads = tokio::time::timeout(Duration::from_secs(5), async {
+
+        // The service identity exists synchronously, while the circuit
+        // confirmation and publisher registration complete asynchronously.
+        // Wait for the observable contract (the pseudo-keyed ad in DHT), not
+        // for debug_force_publish_rendezvous_ads() to report a fresh write:
+        // the background task may win that race and make every forced refresh
+        // return 0 because the already-published ad is still fresh.
+        let pseudo = {
+            let svc = net.node(4).runtime.access();
+            let svcs = svc.anonymity.onion_services.lock().unwrap();
+            let kp = &svcs.first().expect("one registered service").reg_keypair;
+            veil_anonymity::rendezvous::EphemeralAdIdentity::from_b64_keypair(
+                kp.public_key.clone(),
+                kp.private_key.clone(),
+                veil_types::SignatureAlgorithm::Ed25519,
+            )
+            .expect("derive pseudo")
+            .pseudo_node_id
+        };
+        let ad_key = crate::node::anonymity::rendezvous::rendezvous_ad_dht_key(&pseudo);
+        let ad_bytes = tokio::time::timeout(Duration::from_secs(5), async {
             loop {
-                let published = net
+                let _ = net
                     .node(4)
                     .runtime
                     .debug_force_publish_rendezvous_ads()
                     .await;
-                if published == 1 {
-                    break published;
+                if let Some(bytes) = net.node(4).runtime.dht_get_local(&ad_key) {
+                    break bytes;
                 }
                 tokio::time::sleep(Duration::from_millis(25)).await;
             }
         })
         .await
-        .expect("service publisher registered after circuit confirmation");
-        assert_eq!(n_ads, 1, "service publishes one ad");
+        .expect("service ad published after circuit confirmation");
         tokio::time::sleep(Duration::from_millis(250)).await;
 
         // Δ2-c: the onion-service ad is keyed under a per-service PSEUDO node_id,
@@ -6708,24 +6727,6 @@ mod tests {
                 .is_none(),
             "ad must NOT be published under the sovereign node_id (Δ2-c)",
         );
-        let pseudo = {
-            let svc = net.node(4).runtime.access();
-            let svcs = svc.anonymity.onion_services.lock().unwrap();
-            let kp = &svcs.first().expect("one registered service").reg_keypair;
-            veil_anonymity::rendezvous::EphemeralAdIdentity::from_b64_keypair(
-                kp.public_key.clone(),
-                kp.private_key.clone(),
-                veil_types::SignatureAlgorithm::Ed25519,
-            )
-            .expect("derive pseudo")
-            .pseudo_node_id
-        };
-        let ad_key = crate::node::anonymity::rendezvous::rendezvous_ad_dht_key(&pseudo);
-        let ad_bytes = net
-            .node(4)
-            .runtime
-            .dht_get_local(&ad_key)
-            .expect("service ad locally");
         net.node(0).runtime.dht_put_local(ad_key, ad_bytes.clone());
         let ad = crate::node::anonymity::rendezvous::decode_rendezvous_ad(&ad_bytes).unwrap();
 
