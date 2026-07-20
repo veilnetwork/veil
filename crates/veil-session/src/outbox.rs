@@ -142,9 +142,9 @@ impl SessionOutbox {
     pub fn unregister_owned(&self, peer_id: impl Into<NodeId>, owner: &[u8; 32]) -> bool {
         let peer_id: NodeId = peer_id.into();
         let mut senders = lock!(self.senders);
-        if !senders
+        if senders
             .get(peer_id.as_bytes())
-            .is_some_and(|entry| entry.owner.as_ref() == Some(owner))
+            .is_none_or(|entry| entry.owner.as_ref() != Some(owner))
         {
             return false;
         }
