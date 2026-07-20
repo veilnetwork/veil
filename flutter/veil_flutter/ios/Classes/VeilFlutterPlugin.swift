@@ -45,6 +45,10 @@ public class VeilFlutterPlugin: NSObject, FlutterPlugin {
     private static let LIFECYCLE_CHANNEL = "veil_flutter/lifecycle"
     private static let PUSH_CHANNEL      = "veil_flutter/push"
     private static let VPN_CHANNEL       = "network.veil.xveil/vpn"
+    // A full-tunnel default route also captures the containing app's overlay
+    // sockets. Keep start fail-closed until the veil node/SOCKS upstream runs
+    // inside PacketTunnel (which also survives iOS host-app suspension).
+    private static let VPN_HAS_EXTENSION_OWNED_UPSTREAM = false
     private static let BG_TASK_IDENTIFIER = "com.veil.veil_flutter.refresh"
 
     // Keychain coordinates for the APNs device token.  Service identifier
@@ -252,14 +256,33 @@ public class VeilFlutterPlugin: NSObject, FlutterPlugin {
                 return
             }
             guard let manager else {
-                self.finish(result, Self.vpnState("stopped"))
+                self.finish(result, Self.vpnState(
+                    Self.VPN_HAS_EXTENSION_OWNED_UPSTREAM ? "stopped" : "unsupported",
+                    detail: Self.VPN_HAS_EXTENSION_OWNED_UPSTREAM ? nil
+                        : "Apple VPN awaits an extension-owned veil upstream"
+                ))
                 return
             }
-            self.finish(result, Self.vpnState(Self.vpnPhase(manager.connection.status)))
+            let phase = Self.vpnPhase(manager.connection.status)
+            if !Self.VPN_HAS_EXTENSION_OWNED_UPSTREAM && phase == "stopped" {
+                self.finish(result, Self.vpnState(
+                    "unsupported",
+                    detail: "Apple VPN awaits an extension-owned veil upstream"
+                ))
+                return
+            }
+            self.finish(result, Self.vpnState(phase))
         }
     }
 
     private func vpnStart(_ arguments: Any?, result: @escaping FlutterResult) {
+        guard Self.VPN_HAS_EXTENSION_OWNED_UPSTREAM else {
+            finish(result, Self.vpnState(
+                "unsupported",
+                detail: "Apple VPN awaits an extension-owned veil upstream"
+            ))
+            return
+        }
         guard let arguments = arguments as? [String: Any],
               let policy = arguments["policy"] as? [String: Any],
               let socks5Listen = arguments["socks5Listen"] as? String,
