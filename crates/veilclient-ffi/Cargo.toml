@@ -29,6 +29,7 @@ tls-boring = ["veilclient/tls-boring"]
 allow-empty-seeds = ["veilclient/allow-empty-seeds"]
 production-seeds  = ["veilclient/production-seeds"]
 test-low-difficulty = ["veilclient/test-low-difficulty"]
+packet-tunnel = ["dep:tun2proxy"]
 
 # Embed a full veil node IN-PROCESS (no `veil-cli` subprocess) — for sandboxed
 # desktop + mobile (iOS) hosts that cannot spawn a child process. Pulls
@@ -87,6 +88,11 @@ rand_core = { version = "0.6", features = ["getrandom"] }
 # (below); desktop/iOS bridge it to stderr (see node.rs StderrLogBridge) so the
 # embedded node's `log` diagnostics (onion-stream relay-pick &c.) are visible.
 log = "0.4"
+# Cross-platform userspace TCP/IP stack. We call the async library API directly
+# (never its process-oriented C wrapper), so stopping a tunnel cannot terminate
+# the embedding Flutter process. UDP goes through veil's bounded SOCKS5
+# UDP-ASSOCIATE path; the optional public udpgw feature stays disabled.
+tun2proxy = { version = "=0.8.2", default-features = false, optional = true }
 
 # Android: route the embedded node's `log` output to logcat so the in-process
 # node is debuggable on-device (Rust stderr is NOT captured by logcat).
