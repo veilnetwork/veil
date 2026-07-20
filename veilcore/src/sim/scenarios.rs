@@ -495,13 +495,12 @@ mod tests {
             .build()
             .await;
 
-        // Backbone: Core ↔ Core
-        let ok = net.connect(0, 1).await;
-        assert!(ok, "Gateway ↔ Core backbone should establish");
-
-        // Attachment: Gateway ↔ Leaf
-        let ok = net.connect(0, 2).await;
-        assert!(ok, "Gateway ↔ Leaf session should establish");
+        // Bring up both edges in one convergence pass. Incremental `connect()`
+        // reloads the whole existing topology per edge; under suite load the
+        // second reload can strand the canonical dialer in its 30 s reconnect
+        // sleep even though this scenario only cares about the final topology.
+        let ok = net.connect_all(&[(0, 1), (0, 2)]).await;
+        assert!(ok, "Gateway backbone + Leaf attachment should establish");
 
         // Gateway: 2 sessions (to Core and to Leaf)
         let ok = net.node(0).wait_sessions(2, Duration::from_secs(10)).await;
