@@ -19,6 +19,7 @@
 
 #include <cstdint>
 #include <functional>
+#include <string>
 
 namespace veil_media {
 
@@ -35,7 +36,8 @@ class CameraCapturer {
   // Start delivering frames near width x height at fps. The camera picks the
   // closest supported format; frames may differ in size. Returns false if the
   // camera can't be opened (no device, permission denied). Idempotent.
-  virtual bool Start(int width, int height, int fps) = 0;
+  virtual bool Start(int width, int height, int fps,
+                     const char* device_id = nullptr) = 0;
   // Stop delivering frames and release the device. Idempotent.
   virtual void Stop() = 0;
 };
@@ -43,6 +45,10 @@ class CameraCapturer {
 // Creates the platform camera capturer, or null if this platform has none.
 // The callback is retained for the capturer's lifetime.
 CameraCapturer* CreatePlatformCamera(CameraFrameCb cb);
+
+// Enumerate platform video inputs as a JSON array of MediaDevice-compatible
+// objects. Device ids are opaque and may be passed back to Start().
+std::string ListPlatformCamerasJson();
 
 }  // namespace veil_media
 

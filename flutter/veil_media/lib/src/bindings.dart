@@ -118,6 +118,19 @@ final int Function(Pointer<VeilMediaEngineHandle>, int, int, int)
                     Int32)>>('veil_media_engine_start_camera')
         .asFunction();
 
+// start_camera_device(engine*, device_id, width, height, fps) -> int
+final int Function(Pointer<VeilMediaEngineHandle>, Pointer<Utf8>, int, int, int)
+    veilMediaEngineStartCameraDevice = nativeLib
+        .lookup<
+            NativeFunction<
+                Int32 Function(
+                    Pointer<VeilMediaEngineHandle>,
+                    Pointer<Utf8>,
+                    Int32,
+                    Int32,
+                    Int32)>>('veil_media_engine_start_camera_device')
+        .asFunction();
+
 // stop_camera(engine*) -> int
 final int Function(Pointer<VeilMediaEngineHandle>) veilMediaEngineStopCamera =
     nativeLib
@@ -202,6 +215,14 @@ final Pointer<Utf8> Function(Pointer<VeilMediaEngineHandle>)
                 NativeFunction<
                     Pointer<Utf8> Function(Pointer<VeilMediaEngineHandle>)>>(
             'veil_media_engine_list_audio_outputs')
+        .asFunction();
+
+final Pointer<Utf8> Function(Pointer<VeilMediaEngineHandle>)
+    veilMediaEngineListVideoInputs = nativeLib
+        .lookup<
+                NativeFunction<
+                    Pointer<Utf8> Function(Pointer<VeilMediaEngineHandle>)>>(
+            'veil_media_engine_list_video_inputs')
         .asFunction();
 
 // select_audio_input(engine*, id char*) -> int

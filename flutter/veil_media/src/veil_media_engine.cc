@@ -2100,6 +2100,13 @@ int veil_media_engine_stop_video(VeilMediaEngine* engine) {
 
 int veil_media_engine_start_camera(VeilMediaEngine* engine, int width,
                                    int height, int fps) {
+  return veil_media_engine_start_camera_device(engine, nullptr, width, height,
+                                               fps);
+}
+
+int veil_media_engine_start_camera_device(VeilMediaEngine* engine,
+                                          const char* device_id, int width,
+                                          int height, int fps) {
   if (engine == nullptr) return VEIL_MEDIA_ERR_ARG;
 #if defined(VEIL_MEDIA_HAVE_WEBRTC) && \
     (defined(__APPLE__) || (defined(__linux__) && !defined(__ANDROID__)))
@@ -2123,7 +2130,7 @@ int veil_media_engine_start_camera(VeilMediaEngine* engine, int width,
           push_i420(src, y, u, v, w, h, sy, su, sv, ts_us);
       }));
   if (!ws->camera) return VEIL_MEDIA_ERR_STATE;
-  if (!ws->camera->Start(width, height, fps)) {
+  if (!ws->camera->Start(width, height, fps, device_id)) {
     ws->camera.reset();
     return VEIL_MEDIA_ERR_STATE;
   }
@@ -2133,6 +2140,7 @@ int veil_media_engine_start_camera(VeilMediaEngine* engine, int width,
   (void)width;
   (void)height;
   (void)fps;
+  (void)device_id;
   return VEIL_MEDIA_ERR_STATE;  // no camera backend on this platform yet
 #endif
 }
@@ -2401,6 +2409,16 @@ char* veil_media_engine_list_audio_outputs(VeilMediaEngine* engine) {
 #endif
 }
 
+char* veil_media_engine_list_video_inputs(VeilMediaEngine* engine) {
+  if (engine == nullptr) return nullptr;
+#if defined(VEIL_MEDIA_HAVE_WEBRTC) && \
+    (defined(__APPLE__) || (defined(__linux__) && !defined(__ANDROID__)))
+  return dup_cstr(veil_media::ListPlatformCamerasJson());
+#else
+  return dup_cstr("[]");
+#endif
+}
+
 int veil_media_engine_select_audio_input(VeilMediaEngine* engine,
                                          const char* id) {
   if (engine == nullptr || id == nullptr) return VEIL_MEDIA_ERR_ARG;
@@ -2409,10 +2427,11 @@ int veil_media_engine_select_audio_input(VeilMediaEngine* engine,
   const uint16_t idx = static_cast<uint16_t>(std::atoi(id));
   // Stop -> switch -> restart so the change takes effect mid-call.
   webrtc::AudioDeviceModule* adm = engine->ws->adm.get();
+  const bool was_recording = adm->Recording();
   adm->StopRecording();
   if (adm->SetRecordingDevice(idx) != 0) return VEIL_MEDIA_ERR_DEVICE;
   adm->InitRecording();
-  adm->StartRecording();
+  if (was_recording) adm->StartRecording();
 #endif
   return VEIL_MEDIA_OK;
 }
@@ -2424,10 +2443,11 @@ int veil_media_engine_select_audio_output(VeilMediaEngine* engine,
   if (!engine->ws || !engine->ws->adm) return VEIL_MEDIA_ERR_DEVICE;
   const uint16_t idx = static_cast<uint16_t>(std::atoi(id));
   webrtc::AudioDeviceModule* adm = engine->ws->adm.get();
+  const bool was_playing = adm->Playing();
   adm->StopPlayout();
   if (adm->SetPlayoutDevice(idx) != 0) return VEIL_MEDIA_ERR_DEVICE;
   adm->InitPlayout();
-  adm->StartPlayout();
+  if (was_playing) adm->StartPlayout();
 #endif
   return VEIL_MEDIA_OK;
 }

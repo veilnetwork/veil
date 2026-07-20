@@ -27,6 +27,7 @@
 #include <sys/mman.h>
 #include <sys/select.h>
 #include <unistd.h>
+#include <glob.h>
 
 #include <time.h>
 
@@ -34,6 +35,7 @@
 #include <cstdarg>
 #include <cstdint>
 #include <cstdlib>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -75,14 +77,16 @@ class V4l2CameraCapturer : public CameraCapturer {
   explicit V4l2CameraCapturer(CameraFrameCb cb) : cb_(std::move(cb)) {}
   ~V4l2CameraCapturer() override { Stop(); }
 
-  bool Start(int width, int height, int fps) override {
+  bool Start(int width, int height, int fps,
+             const char* device_id) override {
     if (running_.load()) return true;
     if (width <= 0) width = 352;
     if (height <= 0) height = 288;
     if (fps <= 0) fps = 15;
     target_w_ = width;
 
-    const char* dev = getenv("VEIL_MEDIA_CAMERA");
+    const char* dev = device_id;
+    if (dev == nullptr || *dev == '\0') dev = getenv("VEIL_MEDIA_CAMERA");
     if (dev == nullptr || *dev == '\0') dev = "/dev/video0";
 
     fd_ = open(dev, O_RDWR | O_CLOEXEC, 0);
@@ -306,6 +310,45 @@ class V4l2CameraCapturer : public CameraCapturer {
 
 CameraCapturer* CreatePlatformCamera(CameraFrameCb cb) {
   return new V4l2CameraCapturer(std::move(cb));
+}
+
+std::string ListPlatformCamerasJson() {
+  glob_t paths{};
+  if (glob("/dev/video*", 0, nullptr, &paths) != 0) return "[]";
+  std::string out = "[";
+  bool first = true;
+  for (size_t i = 0; i < paths.gl_pathc; ++i) {
+    const char* path = paths.gl_pathv[i];
+    int fd = open(path, O_RDONLY | O_CLOEXEC, 0);
+    if (fd < 0) continue;
+    v4l2_capability cap{};
+    const bool usable = xioctl(fd, VIDIOC_QUERYCAP, &cap) == 0 &&
+        (((cap.capabilities & V4L2_CAP_DEVICE_CAPS) ? cap.device_caps
+                                                   : cap.capabilities) &
+         V4L2_CAP_VIDEO_CAPTURE);
+    close(fd);
+    if (!usable) continue;
+    if (!first) out.push_back(',');
+    first = false;
+    // Kernel device paths/card names cannot contain JSON control characters;
+    // still escape quotes/backslashes defensively for virtual drivers.
+    auto append = [&out](const char* value) {
+      out.push_back('"');
+      for (const char* p = value; *p; ++p) {
+        if (*p == '"' || *p == '\\') out.push_back('\\');
+        out.push_back(*p);
+      }
+      out.push_back('"');
+    };
+    out += "{\"id\":";
+    append(path);
+    out += ",\"label\":";
+    append(reinterpret_cast<const char*>(cap.card));
+    out += ",\"kind\":\"camera\",\"facing\":\"external\"}";
+  }
+  globfree(&paths);
+  out.push_back(']');
+  return out;
 }
 
 }  // namespace veil_media
