@@ -7,12 +7,12 @@
  */
 
 #include "veil_transport_shim.h"
+#include "veil_diag_log.h"
 
 #include <atomic>
 #include <chrono>
 #include <cstdarg>
 #include <cstddef>
-#include <cstdio>
 #include <span>
 #include <thread>
 #include <utility>
@@ -45,14 +45,10 @@ constexpr uint8_t kVp8PayloadType = 96;
 constexpr int64_t kHoldThresholdNs = 75 * 1000 * 1000;
 
 void slog(const char* fmt, ...) {
-  FILE* f = fopen("/tmp/veil_media_diag.log", "a");
-  if (!f) return;
   va_list ap;
   va_start(ap, fmt);
-  vfprintf(f, fmt, ap);
+  veil_media::diag::vlog(fmt, ap);
   va_end(ap);
-  fputc('\n', f);
-  fclose(f);
 }
 }  // namespace
 
@@ -140,7 +136,8 @@ bool VeilTransportShim::SendRtp(std::span<const uint8_t> packet,
   MarkVideoFrame(packet, &outbound_video_cadence_);
   const int rc =
       veil_media_send_datagram(veil_chan_, packet.data(), packet.size());
-  {
+  static const bool diagnostics_enabled = diag::enabled();
+  if (diagnostics_enabled) {
     static std::atomic<uint64_t> n{0};
     const uint64_t c = n.fetch_add(1);
     if (c % 100 == 0)

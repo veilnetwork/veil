@@ -118,3 +118,12 @@ both ways, with AEC3/NetEQ, over the 2-hop onion media channel. Drive from
 - Screen (Phase 5): macOS ScreenCaptureKit / Android MediaProjection.
 - SRTP: media rides the already-E2E-sealed onion channel, so relays never see
   plaintext; SRTP (keys from the call offer) is defense-in-depth, add later.
+
+## Native diagnostics
+
+Native media diagnostics are disabled by default, including file output from
+release builds. For an explicit stand run, set `VEIL_MEDIA_DIAG_PATH` to a
+writable file before launching the process, for example
+`VEIL_MEDIA_DIAG_PATH=/tmp/veil_media_diag.log`. The transport's periodic RTP
+sampling is also inactive when the variable is unset, so ordinary calls do not
+pay its counter or file-I/O cost.

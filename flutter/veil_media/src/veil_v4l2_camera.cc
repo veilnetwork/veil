@@ -17,6 +17,7 @@
  * local video source (receive/render is unaffected — see start_camera).
  */
 #include "veil_camera.h"
+#include "veil_diag_log.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -32,7 +33,6 @@
 #include <atomic>
 #include <cstdarg>
 #include <cstdint>
-#include <cstdio>
 #include <cstdlib>
 #include <thread>
 #include <vector>
@@ -46,9 +46,7 @@ namespace {
 void vcam_log(const char* fmt, ...) {
   va_list ap;
   va_start(ap, fmt);
-  fprintf(stderr, "[veil_v4l2] ");
-  vfprintf(stderr, fmt, ap);
-  fprintf(stderr, "\n");
+  veil_media::diag::vlog(fmt, ap);
   va_end(ap);
 }
 

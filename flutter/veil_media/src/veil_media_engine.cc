@@ -99,6 +99,7 @@
 #include "veil_aaudio_adm.h"
 #endif
 #include "veil_camera.h"
+#include "veil_diag_log.h"
 #include "veil_screen.h"
 #include "veil_transport_shim.h"
 #endif
@@ -140,17 +141,13 @@ resilient_vp8_settings() {
 }
 #endif
 
-// Diagnostic log to a file (a GUI app's stderr is not captured by the unified
-// log). Best-effort; append.
+// Best-effort diagnostic log. File I/O is fail-closed unless the operator
+// explicitly sets VEIL_MEDIA_DIAG_PATH; see veil_diag_log.h.
 void vlog(const char* fmt, ...) {
-  FILE* f = fopen("/tmp/veil_media_diag.log", "a");
-  if (!f) return;
   va_list ap;
   va_start(ap, fmt);
-  vfprintf(f, fmt, ap);
+  veil_media::diag::vlog(fmt, ap);
   va_end(ap);
-  fputc('\n', f);
-  fclose(f);
 }
 
 char* dup_cstr(const std::string& s) {
