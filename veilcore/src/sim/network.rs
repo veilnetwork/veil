@@ -1206,7 +1206,14 @@ fn make_core_config_with_optional_grind(role: NodeRole, grind: Option<([u8; 32],
             key_passphrase: None,
             key_passphrase_file: None,
             key_passphrase_prompt: false,
-            lazy_mining: true,
+            // Simulation scenarios exercise topology/session semantics, not
+            // background identity upgrades. One miner uses every available
+            // core; a 3-node scenario therefore spawned three all-core miners
+            // inside each nextest process and could starve the Tokio workers
+            // long enough for otherwise-correct multi-edge convergence to hit
+            // its timeout under the full suite. Tests that need PoW strength
+            // construct it explicitly; keep the shared network fixture quiet.
+            lazy_mining: false,
             max_lazy_difficulty: 64,
         }),
         listen: vec![ListenConfig {
