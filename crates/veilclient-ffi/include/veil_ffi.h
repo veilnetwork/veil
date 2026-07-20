@@ -598,6 +598,16 @@ typedef void (*VeilPeerCb)(void *user,
  */
 typedef void (*VeilEventCb)(void *user, uint8_t kind, const uint8_t *payload, size_t payload_len);
 
+/**
+ * Host callback for one raw IP packet emitted by the userspace stack.
+ *
+ * `data` is borrowed only for the duration of the callback. The callback may
+ * run on the tunnel's Rust worker thread and must copy/enqueue the packet
+ * without blocking. `ctx` must remain valid until
+ * [`veil_packet_tunnel_stop`] returns.
+ */
+typedef void (*PacketWriteFn)(void*, const uint8_t*, uintptr_t);
+
 #ifdef __cplusplus
 extern "C" {
 #endif // __cplusplus
@@ -2734,6 +2744,40 @@ int veil_packet_tunnel_start_fd(int tun_fd,
                                 bool ipv6_enabled,
                                 bool packet_information)
 ;
+
+/**
+ * Start a packet engine over a host-owned packet callback.
+ *
+ * This is the public Network Extension path for iOS/macOS: the provider feeds
+ * each raw IP packet with [`veil_packet_tunnel_send_packet`], while `write_cb`
+ * receives each raw IP packet that must be returned through
+ * `NEPacketTunnelFlow.writePackets`. It deliberately avoids private access to
+ * Network Extension's underlying socket/file descriptor.
+ *
+ * The ingress queue is bounded to 64 packets. A full queue returns
+ * `VEIL_ERR`; the provider should stop reading briefly and retry instead of
+ * accumulating unbounded packet memory. The callback context must remain live
+ * until [`veil_packet_tunnel_stop`] returns. `write_cb` is required and must
+ * not be null (a null C function pointer violates this FFI contract).
+ */
+
+int veil_packet_tunnel_start_packets(const char *proxy_url,
+                                     const char *dns_ip,
+                                     unsigned short mtu,
+                                     bool ipv6_enabled,
+                                     PacketWriteFn write_cb,
+                                     void *write_ctx)
+;
+
+/**
+ * Queue one raw IP packet read from the host packet-flow API.
+ *
+ * Returns `VEIL_OK` when accepted, `VEIL_ERR` when the bounded queue is full,
+ * `VEIL_ERR_CLOSED` when no callback-backed tunnel is running, or
+ * `VEIL_ERR_INVALID_ARG` for null/empty/over-MTU input. The function copies
+ * `data` before returning; the host may release its buffer immediately.
+ */
+ int veil_packet_tunnel_send_packet(const uint8_t *data, uintptr_t len) ;
 
  int veil_packet_tunnel_status(void) ;
 
