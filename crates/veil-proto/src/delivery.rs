@@ -288,7 +288,10 @@ pub const FORWARD_DELIVERY_ATTEMPT_MARKER: u8 = 0xA7;
 /// bulk delivery chatter — the frame header's 2-bit priority field is unset
 /// (0 = REALTIME) by every legacy sender, so it cannot be trusted — and
 /// relays used to re-queue everything at one class, adding seconds of queue
-/// delay to live call media on a busy hop.
+/// delay to live call media on a busy hop. Updated QUIC sessions additionally
+/// use this marker to move the canonical unacknowledged short-TTL form onto
+/// their independent loss-tolerant DATAGRAM lane; every other form retains
+/// ordered-stream semantics.
 pub const FORWARD_TRAFFIC_CLASS_MARKER: u8 = 0xA8;
 
 /// A REALTIME class hint is honored by relays only for payloads at or below
@@ -296,6 +299,11 @@ pub const FORWARD_TRAFFIC_CLASS_MARKER: u8 = 0xA8;
 /// E2E envelope overhead); anything larger claiming REALTIME is demoted to
 /// INTERACTIVE so bulk transfers cannot jump the media lane.
 pub const FORWARD_REALTIME_MAX_PAYLOAD: usize = 8192;
+
+/// Maximum lifetime of a loss-tolerant relay frame. Keeping this beside the
+/// payload cap makes the sender and zero-copy QUIC-lane classifier share one
+/// wire contract instead of relying on matching literals.
+pub const FORWARD_REALTIME_TTL_SECS: u32 = 30;
 
 /// Request to forward an envelope to the next hop.
 ///
@@ -334,6 +342,76 @@ pub struct ForwardPayload {
 }
 
 impl ForwardPayload {
+    /// Return whether the wire body is safe to carry on the lossy QUIC
+    /// realtime lane without allocating or decrypting its envelope.
+    ///
+    /// This is deliberately stricter than [`Self::decode`]. The ordinary
+    /// ordered stream remains the compatibility path for unknown extensions,
+    /// acknowledged delivery, long-lived messages, oversized payloads, and
+    /// retry attempts. Only the canonical `traffic_class=REALTIME` form
+    /// emitted by `IPC_SEND_FLAG_RELAY_REALTIME` is eligible to be dropped or
+    /// reordered hop-by-hop.
+    pub fn is_realtime_datagram_eligible(buf: &[u8]) -> bool {
+        const NEXT_HOP_LEN: usize = 32;
+        const FORWARD_FIXED_SUFFIX_LEN: usize = 8 + 1; // trace_id + relay_hops
+        const REALTIME_EXTENSION_LEN: usize = 2;
+
+        let payload_len_offset = NEXT_HOP_LEN + OFFSET_PAYLOAD_LEN;
+        let ttl_offset = NEXT_HOP_LEN + OFFSET_TTL_SECS;
+        let Some(payload_len_end) = payload_len_offset.checked_add(4) else {
+            return false;
+        };
+        let Some(ttl_end) = ttl_offset.checked_add(4) else {
+            return false;
+        };
+        if buf.len() < payload_len_end || buf.len() < ttl_end {
+            return false;
+        }
+
+        let Ok(payload_len_bytes) = <[u8; 4]>::try_from(&buf[payload_len_offset..payload_len_end])
+        else {
+            return false;
+        };
+        let payload_len = u32::from_be_bytes(payload_len_bytes) as usize;
+        if payload_len == 0 || payload_len > FORWARD_REALTIME_MAX_PAYLOAD {
+            return false;
+        }
+
+        let Ok(ttl_bytes) = <[u8; 4]>::try_from(&buf[ttl_offset..ttl_end]) else {
+            return false;
+        };
+        let ttl_wire = u32::from_be_bytes(ttl_bytes);
+        if ttl_wire & DELIVERY_FLAG_REQUIRE_ACK != 0
+            || ttl_wire == 0
+            || ttl_wire > FORWARD_REALTIME_TTL_SECS
+        {
+            return false;
+        }
+
+        let Some(envelope_end) = NEXT_HOP_LEN
+            .checked_add(OFFSET_PAYLOAD)
+            .and_then(|fixed| fixed.checked_add(payload_len))
+        else {
+            return false;
+        };
+        let Some(extension_start) = envelope_end.checked_add(FORWARD_FIXED_SUFFIX_LEN) else {
+            return false;
+        };
+        let Some(expected_len) = extension_start.checked_add(REALTIME_EXTENSION_LEN) else {
+            return false;
+        };
+        if buf.len() != expected_len {
+            return false;
+        }
+
+        let relay_hops = buf[envelope_end + 8];
+        if relay_hops >= crate::budget::MAX_RELAY_HOPS {
+            return false;
+        }
+        buf[extension_start] == FORWARD_TRAFFIC_CLASS_MARKER
+            && buf[extension_start + 1] == crate::header::priority::REALTIME
+    }
+
     /// Encode to wire bytes. Always appends `trace_id` (8 bytes) and
     /// `relay_hops` (1 byte) after the envelope.
     pub fn encode(&self) -> Vec<u8> {
@@ -1311,6 +1389,70 @@ mod tests {
         assert_eq!(payload.relay_traffic_class(), priority::INTERACTIVE);
         payload.traffic_class = None;
         assert_eq!(payload.relay_traffic_class(), priority::INTERACTIVE);
+    }
+
+    #[test]
+    fn realtime_datagram_eligibility_accepts_only_canonical_lossy_forward() {
+        use crate::header::priority;
+        let mut payload = ForwardPayload {
+            next_hop_node_id: [7u8; 32],
+            envelope: sample_envelope(),
+            relay_hops: 0,
+            delivery_attempt: None,
+            traffic_class: Some(priority::REALTIME),
+        };
+        payload.envelope.ttl_secs = FORWARD_REALTIME_TTL_SECS;
+        payload.envelope.require_ack = false;
+        assert!(ForwardPayload::is_realtime_datagram_eligible(
+            &payload.encode()
+        ));
+
+        payload.envelope.require_ack = true;
+        assert!(!ForwardPayload::is_realtime_datagram_eligible(
+            &payload.encode()
+        ));
+        payload.envelope.require_ack = false;
+        payload.delivery_attempt = Some(1);
+        assert!(!ForwardPayload::is_realtime_datagram_eligible(
+            &payload.encode()
+        ));
+        payload.delivery_attempt = None;
+        payload.traffic_class = None;
+        assert!(!ForwardPayload::is_realtime_datagram_eligible(
+            &payload.encode()
+        ));
+    }
+
+    #[test]
+    fn realtime_datagram_eligibility_rejects_stale_bulk_and_extended_forms() {
+        use crate::header::priority;
+        let mut payload = ForwardPayload {
+            next_hop_node_id: [7u8; 32],
+            envelope: sample_envelope(),
+            relay_hops: 0,
+            delivery_attempt: None,
+            traffic_class: Some(priority::REALTIME),
+        };
+        payload.envelope.ttl_secs = 31;
+        assert!(!ForwardPayload::is_realtime_datagram_eligible(
+            &payload.encode()
+        ));
+        payload.envelope.ttl_secs = FORWARD_REALTIME_TTL_SECS;
+        payload.envelope.payload = vec![0u8; FORWARD_REALTIME_MAX_PAYLOAD + 1];
+        assert!(!ForwardPayload::is_realtime_datagram_eligible(
+            &payload.encode()
+        ));
+        payload.envelope.payload = vec![1u8; 32];
+        payload.relay_hops = crate::budget::MAX_RELAY_HOPS;
+        assert!(!ForwardPayload::is_realtime_datagram_eligible(
+            &payload.encode()
+        ));
+        payload.relay_hops = 0;
+        let mut unknown_extension = payload.encode();
+        unknown_extension.extend_from_slice(&[0xEE, 0]);
+        assert!(!ForwardPayload::is_realtime_datagram_eligible(
+            &unknown_extension
+        ));
     }
 
     #[test]

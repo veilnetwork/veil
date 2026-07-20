@@ -200,6 +200,30 @@ impl AppHandle {
             .await
     }
 
+    /// Send call media that was already sealed with an ephemeral E2E media
+    /// key. The node preserves the compact ciphertext instead of adding a
+    /// per-packet ML-KEM envelope; only the loss-tolerant relay path accepts
+    /// this flag combination.
+    pub async fn send_relay_media_sealed_owned(
+        &self,
+        dst_node_id: [u8; 32],
+        dst_app_id: [u8; 32],
+        dst_endpoint_id: u32,
+        data: Vec<u8>,
+    ) -> Result<(), ClientError> {
+        self.writer
+            .write_app_ipc_send_owned(
+                &dst_node_id,
+                &self.app_id,
+                &dst_app_id,
+                dst_endpoint_id,
+                veil_proto::ipc::IPC_SEND_FLAG_RELAY_REALTIME
+                    | veil_proto::ipc::IPC_SEND_FLAG_RELAY_MEDIA_SEALED,
+                &data,
+            )
+            .await
+    }
+
     /// Send `data` as an AUTHENTICATED anonymous message over the
     /// onion/rendezvous transport. Unlike a plain send, the onion hides the
     /// sender's network location from every relay while the recipient
@@ -583,6 +607,27 @@ impl AppSender {
                 &dst_app_id,
                 dst_endpoint_id,
                 veil_proto::ipc::IPC_SEND_FLAG_RELAY_REALTIME,
+                &data,
+            )
+            .await
+    }
+
+    /// Split-handle variant of [`AppHandle::send_relay_media_sealed_owned`].
+    pub async fn send_relay_media_sealed_owned(
+        &self,
+        dst_node_id: [u8; 32],
+        dst_app_id: [u8; 32],
+        dst_endpoint_id: u32,
+        data: Vec<u8>,
+    ) -> Result<(), ClientError> {
+        self.writer
+            .write_app_ipc_send_owned(
+                &dst_node_id,
+                &self.app_id,
+                &dst_app_id,
+                dst_endpoint_id,
+                veil_proto::ipc::IPC_SEND_FLAG_RELAY_REALTIME
+                    | veil_proto::ipc::IPC_SEND_FLAG_RELAY_MEDIA_SEALED,
                 &data,
             )
             .await

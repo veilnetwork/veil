@@ -121,6 +121,14 @@ int veil_media_start_direct_receiver(VeilApp *app,
  */
 int veil_media_send_datagram(uint64_t chan, const uint8_t *ptr, size_t len);
 
+/* Select negotiated batching: 0 off, 1 legacy audio+video, 2 compact relay
+ * audio-only. Mode 2 requires directional E2E keys configured first. */
+int veil_media_channel_set_batching(uint64_t chan, int mode);
+
+/* Copy directional 32-byte call-media keys into a relay channel. */
+int veil_media_channel_set_e2e_keys(uint64_t chan, const uint8_t *tx_key,
+                                    const uint8_t *rx_key);
+
 /* Snapshot local relay queue/IPC timing. Direct/onion channels return zeros.
  * Returns 0 on success or -1 for an invalid channel/output pointer. */
 int veil_media_channel_get_stats(uint64_t chan,

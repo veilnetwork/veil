@@ -735,14 +735,24 @@ uint64_t veil_media_open_relay_channel(VeilApp *app,
 
 #if defined(VEIL_FFI_NODE_EMBEDDED)
 /**
- * Enable/disable media batching on a direct or RELAY media channel. Direct
- * batching amortizes sequential IPC writes; relay batching also amortizes the
- * per-datagram envelope+padding overhead. The host flips this ON only after
- * call signaling proves the remote understands `MEDIA_BATCH_MAGIC`
- * (protocol-version gate) — a batched cell is silent noise to a legacy
- * receiver. Returns 0 on success, -1 for an unknown/unsupported channel.
+ * Select media batching for a direct or relay channel: 0 = off, 1 = legacy
+ * audio+video batching, 2 = compact relay audio-only batching. Mode 2 requires
+ * call-key sealing to be configured first and is rejected for non-relay
+ * channels. The host selects a nonzero mode only after call signaling proves
+ * the remote understands the corresponding wire format.
+ * Returns 0 on success, -1 for an unknown/unsupported channel or mode.
  */
- int veil_media_channel_set_batching(uint64_t chan, int on) ;
+ int veil_media_channel_set_batching(uint64_t chan, int mode) ;
+#endif
+
+#if defined(VEIL_FFI_NODE_EMBEDDED)
+/**
+ * Configure directional 32-byte call-media keys for a relay channel. Key
+ * material is copied immediately into zeroizing native state; the caller may
+ * erase/free its buffers as soon as this function returns. This does not turn
+ * compact mode on by itself, so setup can complete before the first packet.
+ */
+ int veil_media_channel_set_e2e_keys(uint64_t chan, const uint8_t *tx_key, const uint8_t *rx_key) ;
 #endif
 
 #if defined(VEIL_FFI_NODE_EMBEDDED)

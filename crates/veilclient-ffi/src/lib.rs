@@ -712,7 +712,11 @@ struct MediaChannel {
     /// call signaling proves the peer's protocol version understands
     /// MEDIA_BATCH_MAGIC on this path. `None` on onion channels (their own
     /// transport already batches).
-    batching: Option<Arc<std::sync::atomic::AtomicBool>>,
+    batching: Option<Arc<std::sync::atomic::AtomicU8>>,
+    /// Relay channels can opt into compact call-key sealing. The shared object
+    /// is also installed with the receive callback, so route rebuilds do not
+    /// race separate TX/RX cipher ownership.
+    cipher: Arc<media::MediaCipher>,
     /// Relay-only drain telemetry. Atomics keep the real-time ingress ABI
     /// non-blocking while letting the host distinguish a local queue stall
     /// from delay after the frame has entered the node/session path.
@@ -927,6 +931,17 @@ const RELAY_VIDEO_FRAME_MAX_BYTES: usize = 512 * 1024;
 const RELAY_VIDEO_BATCH_MAX_PACKETS: usize = 4;
 #[cfg(feature = "node-embedded")]
 const RELAY_VIDEO_BATCH_BODY_MAX: usize = 7168;
+#[cfg(feature = "node-embedded")]
+const MEDIA_BATCHING_OFF: u8 = 0;
+#[cfg(feature = "node-embedded")]
+const MEDIA_BATCHING_LEGACY: u8 = 1;
+#[cfg(feature = "node-embedded")]
+const MEDIA_BATCHING_COMPACT_RELAY: u8 = 2;
+/// Maximum plaintext media cell in compact relay mode. After the 36-byte
+/// symmetric seal and fixed Delivery/session framing this remains below the
+/// negotiated 1382-byte QUIC DATAGRAM ceiling, with margin for extensions.
+#[cfg(feature = "node-embedded")]
+const COMPACT_RELAY_MEDIA_CELL_MAX: usize = 1000;
 
 #[cfg(feature = "node-embedded")]
 #[derive(Default)]
@@ -1324,6 +1339,7 @@ pub unsafe extern "C" fn veil_media_open_channel(
                 peer,
                 task,
                 batching: None,
+                cipher: Arc::new(media::MediaCipher::default()),
                 relay_stats: None,
             },
         );
@@ -1453,7 +1469,7 @@ pub unsafe extern "C" fn veil_media_open_direct_channel(
     let (tx_hi, mut rx_hi) = mpsc::channel::<Vec<u8>>(MEDIA_TX_HI_QUEUE);
     let (tx_video, mut rx_video) = mpsc::channel::<Vec<u8>>(MEDIA_TX_VIDEO_QUEUE);
     let sender = Arc::clone(&app_ref.sender);
-    let batching = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let batching = Arc::new(std::sync::atomic::AtomicU8::new(MEDIA_BATCHING_OFF));
     let batching_task = Arc::clone(&batching);
     let task = app_ref.bundle.runtime.spawn(async move {
         let started = std::time::Instant::now();
@@ -1509,7 +1525,7 @@ pub unsafe extern "C" fn veil_media_open_direct_channel(
             // whose call protocol version advertises batch decoding.
             let cells = media_wire_cells(
                 burst,
-                batching_task.load(std::sync::atomic::Ordering::Relaxed),
+                batching_task.load(std::sync::atomic::Ordering::Relaxed) != MEDIA_BATCHING_OFF,
             );
             let guard = sender.lock().await;
             let Some(sender) = guard.as_ref() else {
@@ -1551,6 +1567,7 @@ pub unsafe extern "C" fn veil_media_open_direct_channel(
                 peer,
                 task,
                 batching: Some(batching),
+                cipher: Arc::new(media::MediaCipher::default()),
                 relay_stats: None,
             },
         );
@@ -1590,18 +1607,23 @@ pub unsafe extern "C" fn veil_media_open_relay_channel(
     let (tx_video_frames, mut rx_video_frames) =
         mpsc::channel::<RelayVideoFrame>(RELAY_VIDEO_FRAME_QUEUE);
     let sender = Arc::clone(&app_ref.sender);
-    let batching = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let batching = Arc::new(std::sync::atomic::AtomicU8::new(MEDIA_BATCHING_OFF));
     let batching_task = Arc::clone(&batching);
+    let cipher = Arc::new(media::MediaCipher::default());
+    let cipher_task = Arc::clone(&cipher);
     let relay_stats = Arc::new(RelayMediaStats::default());
     let relay_stats_task = Arc::clone(&relay_stats);
     let task = app_ref.bundle.runtime.spawn(async move {
         let mut prefer_video = false;
+        let mut pending_high = None;
         loop {
             enum Work {
                 High(Vec<u8>),
                 VideoFrame(RelayVideoFrame),
             }
-            let work = if prefer_video {
+            let work = if let Some(pkt) = pending_high.take() {
+                Work::High(pkt)
+            } else if prefer_video {
                 match rx_video_frames.try_recv() {
                     Ok(frame) => Work::VideoFrame(frame),
                     Err(_) => tokio::select! {
@@ -1625,12 +1647,13 @@ pub unsafe extern "C" fn veil_media_open_relay_channel(
             // device-measured ~24× inflation that saturated a last-mile link
             // and stalled the whole ordered stream (ROADMAP section S). When
             // the peer understands MEDIA_BATCH_MAGIC (host-gated by call
-            // protocol version), gather the audio/RTCP packets that arrive
-            // within one frame interval and ship them as ONE envelope. The
-            // ~20 ms hold is one Opus frame — inside any jitter buffer —
-            // and only ever delays audio behind audio.
+            // protocol version), legacy v2 gathers audio/RTCP packets within
+            // one frame interval and ships one envelope. Compact v3 no longer
+            // pays per-cell KEM overhead, so it coalesces only packets already
+            // queued and never adds a gather delay.
+            let batching_mode = batching_task.load(std::sync::atomic::Ordering::Relaxed);
             let work = match work {
-                Work::High(first) if batching_task.load(std::sync::atomic::Ordering::Relaxed) => {
+                Work::High(first) if batching_mode != MEDIA_BATCHING_OFF => {
                     const RELAY_BATCH_MAX_PKTS: usize = 6;
                     // GATHER byte budget: stop pulling once the running body
                     // estimate crosses this. The last packet may overshoot,
@@ -1638,34 +1661,67 @@ pub unsafe extern "C" fn veil_media_open_relay_channel(
                     // this budget stays well under the ENCODE ceiling below —
                     // so the gathered set ALWAYS encodes and no packet that
                     // was already dequeued is ever dropped.
-                    const RELAY_BATCH_SOFT_BYTES: usize = 3072;
+                    let relay_batch_soft_bytes = if batching_mode == MEDIA_BATCHING_COMPACT_RELAY {
+                        COMPACT_RELAY_MEDIA_CELL_MAX - 1
+                    } else {
+                        3072
+                    };
                     // ENCODE ceiling: comfortably above the gather budget +
                     // one overshoot packet, and still under the relay's 8 KiB
                     // REALTIME classing cap (post-envelope) so a batched cell
                     // never demotes to Interactive.
-                    const RELAY_BATCH_BODY_MAX: usize = 7168;
+                    let relay_batch_body_max = if batching_mode == MEDIA_BATCHING_COMPACT_RELAY {
+                        COMPACT_RELAY_MEDIA_CELL_MAX - 1
+                    } else {
+                        7168
+                    };
                     // Running estimate of encode_batch's body: 2-byte count
                     // header + per packet a 2-byte length prefix + payload.
                     let mut body_est = 2 + 2 + first.len();
                     let mut pkts = vec![first];
-                    let deadline =
-                        tokio::time::Instant::now() + std::time::Duration::from_millis(20);
-                    while pkts.len() < RELAY_BATCH_MAX_PKTS && body_est < RELAY_BATCH_SOFT_BYTES {
-                        tokio::select! {
-                            biased;
-                            more = rx_hi.recv() => match more {
-                                Some(p) => {
-                                    body_est += 2 + p.len();
-                                    pkts.push(p);
-                                }
-                                None => break,
-                            },
-                            _ = tokio::time::sleep_until(deadline) => break,
+                    if batching_mode == MEDIA_BATCHING_COMPACT_RELAY {
+                        // Compact sealing removed the per-packet KEM cost, so
+                        // never hold the first Opus packet waiting for another.
+                        // Coalesce only packets already queued at this instant.
+                        while pkts.len() < RELAY_BATCH_MAX_PKTS && body_est < relay_batch_soft_bytes
+                        {
+                            let Ok(p) = rx_hi.try_recv() else {
+                                break;
+                            };
+                            let next_est = body_est.saturating_add(2 + p.len());
+                            if next_est > relay_batch_body_max {
+                                pending_high = Some(p);
+                                break;
+                            }
+                            body_est = next_est;
+                            pkts.push(p);
+                        }
+                    } else {
+                        let deadline =
+                            tokio::time::Instant::now() + std::time::Duration::from_millis(20);
+                        while pkts.len() < RELAY_BATCH_MAX_PKTS && body_est < relay_batch_soft_bytes
+                        {
+                            tokio::select! {
+                                biased;
+                                more = rx_hi.recv() => match more {
+                                    Some(p) => {
+                                        let next_est = body_est.saturating_add(2 + p.len());
+                                        if next_est > relay_batch_body_max {
+                                            pending_high = Some(p);
+                                            break;
+                                        }
+                                        body_est = next_est;
+                                        pkts.push(p);
+                                    }
+                                    None => break,
+                                },
+                                _ = tokio::time::sleep_until(deadline) => break,
+                            }
                         }
                     }
                     Work::High(if pkts.len() == 1 {
                         pkts.pop().expect("one packet")
-                    } else if let Some(body) = media::encode_batch(&pkts, RELAY_BATCH_BODY_MAX) {
+                    } else if let Some(body) = media::encode_batch(&pkts, relay_batch_body_max) {
                         let mut cell = Vec::with_capacity(1 + body.len());
                         cell.push(media::MEDIA_BATCH_MAGIC);
                         cell.extend_from_slice(&body);
@@ -1689,10 +1745,16 @@ pub unsafe extern "C" fn veil_media_open_relay_channel(
             match work {
                 Work::High(pkt) => {
                     let ipc_started = std::time::Instant::now();
-                    let failed = sender
-                        .send_relay_realtime_owned(peer, peer_app, peer_endpoint_id, pkt)
-                        .await
-                        .is_err();
+                    let result = if let Some(sealed) = cipher_task.seal(&pkt) {
+                        sender
+                            .send_relay_media_sealed_owned(peer, peer_app, peer_endpoint_id, sealed)
+                            .await
+                    } else {
+                        sender
+                            .send_relay_realtime_owned(peer, peer_app, peer_endpoint_id, pkt)
+                            .await
+                    };
+                    let failed = result.is_err();
                     relay_stats_task.observe_ipc_cell(ipc_started.elapsed(), failed);
                 }
                 Work::VideoFrame(frame) => {
@@ -1701,23 +1763,51 @@ pub unsafe extern "C" fn veil_media_open_relay_channel(
                     // The frame is complete, so batching adds no gather delay:
                     // it only removes repeated relay envelopes and lets the
                     // receiver assemble the frame with less arrival jitter.
-                    let batching_enabled = batching_task.load(std::sync::atomic::Ordering::Relaxed);
+                    let batching_enabled = batching_task.load(std::sync::atomic::Ordering::Relaxed)
+                        == MEDIA_BATCHING_LEGACY;
                     for cell in media_wire_cells(frame.packets, batching_enabled) {
                         // One batch contains at most four video packets, so this
                         // preserves the former one-audio-slot-per-four cadence.
                         if let Ok(high) = rx_hi.try_recv() {
                             let ipc_started = std::time::Instant::now();
-                            let failed = sender
-                                .send_relay_realtime_owned(peer, peer_app, peer_endpoint_id, high)
-                                .await
-                                .is_err();
+                            let result = if let Some(sealed) = cipher_task.seal(&high) {
+                                sender
+                                    .send_relay_media_sealed_owned(
+                                        peer,
+                                        peer_app,
+                                        peer_endpoint_id,
+                                        sealed,
+                                    )
+                                    .await
+                            } else {
+                                sender
+                                    .send_relay_realtime_owned(
+                                        peer,
+                                        peer_app,
+                                        peer_endpoint_id,
+                                        high,
+                                    )
+                                    .await
+                            };
+                            let failed = result.is_err();
                             relay_stats_task.observe_ipc_cell(ipc_started.elapsed(), failed);
                         }
                         let ipc_started = std::time::Instant::now();
-                        let failed = sender
-                            .send_relay_realtime_owned(peer, peer_app, peer_endpoint_id, cell)
-                            .await
-                            .is_err();
+                        let result = if let Some(sealed) = cipher_task.seal(&cell) {
+                            sender
+                                .send_relay_media_sealed_owned(
+                                    peer,
+                                    peer_app,
+                                    peer_endpoint_id,
+                                    sealed,
+                                )
+                                .await
+                        } else {
+                            sender
+                                .send_relay_realtime_owned(peer, peer_app, peer_endpoint_id, cell)
+                                .await
+                        };
+                        let failed = result.is_err();
                         relay_stats_task.observe_ipc_cell(ipc_started.elapsed(), failed);
                     }
                     relay_stats_task.observe_frame_ipc(frame_ipc_started.elapsed());
@@ -1742,6 +1832,7 @@ pub unsafe extern "C" fn veil_media_open_relay_channel(
                 peer,
                 task,
                 batching: Some(batching),
+                cipher,
                 relay_stats: Some(relay_stats),
             },
         );
@@ -1872,15 +1963,15 @@ pub extern "C" fn veil_debug_set_publish_pause(on: c_int) {
     veil_session::rt_trace::set_publish_pause(on != 0);
 }
 
-/// Enable/disable media batching on a direct or RELAY media channel. Direct
-/// batching amortizes sequential IPC writes; relay batching also amortizes the
-/// per-datagram envelope+padding overhead. The host flips this ON only after
-/// call signaling proves the remote understands `MEDIA_BATCH_MAGIC`
-/// (protocol-version gate) — a batched cell is silent noise to a legacy
-/// receiver. Returns 0 on success, -1 for an unknown/unsupported channel.
+/// Select media batching for a direct or relay channel: 0 = off, 1 = legacy
+/// audio+video batching, 2 = compact relay audio-only batching. Mode 2 requires
+/// call-key sealing to be configured first and is rejected for non-relay
+/// channels. The host selects a nonzero mode only after call signaling proves
+/// the remote understands the corresponding wire format.
+/// Returns 0 on success, -1 for an unknown/unsupported channel or mode.
 #[cfg(feature = "node-embedded")]
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn veil_media_channel_set_batching(chan: u64, on: c_int) -> c_int {
+pub unsafe extern "C" fn veil_media_channel_set_batching(chan: u64, mode: c_int) -> c_int {
     let map = MEDIA_CHANNELS.lock().unwrap_or_else(|p| p.into_inner());
     let Some(ch) = map.get(&chan) else {
         return -1;
@@ -1888,7 +1979,65 @@ pub unsafe extern "C" fn veil_media_channel_set_batching(chan: u64, on: c_int) -
     let Some(b) = ch.batching.as_ref() else {
         return -1;
     };
-    b.store(on != 0, std::sync::atomic::Ordering::Relaxed);
+    let Ok(mode) = u8::try_from(mode) else {
+        return -1;
+    };
+    if !matches!(
+        mode,
+        MEDIA_BATCHING_OFF | MEDIA_BATCHING_LEGACY | MEDIA_BATCHING_COMPACT_RELAY
+    ) {
+        return -1;
+    }
+    if mode == MEDIA_BATCHING_COMPACT_RELAY && (ch.relay_stats.is_none() || !ch.cipher.enabled()) {
+        return -1;
+    }
+    b.store(mode, std::sync::atomic::Ordering::Relaxed);
+    0
+}
+
+/// Configure directional 32-byte call-media keys for a relay channel. Key
+/// material is copied immediately into zeroizing native state; the caller may
+/// erase/free its buffers as soon as this function returns. This does not turn
+/// compact mode on by itself, so setup can complete before the first packet.
+#[cfg(feature = "node-embedded")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn veil_media_channel_set_e2e_keys(
+    chan: u64,
+    tx_key: *const u8,
+    rx_key: *const u8,
+) -> c_int {
+    if chan == 0 || tx_key.is_null() || rx_key.is_null() {
+        return -1;
+    }
+    let mut tx = [0u8; 32];
+    let mut rx = [0u8; 32];
+    unsafe {
+        ptr::copy_nonoverlapping(tx_key, tx.as_mut_ptr(), tx.len());
+        ptr::copy_nonoverlapping(rx_key, rx.as_mut_ptr(), rx.len());
+    }
+    if tx == rx || tx.iter().all(|byte| *byte == 0) || rx.iter().all(|byte| *byte == 0) {
+        use zeroize::Zeroize;
+        tx.zeroize();
+        rx.zeroize();
+        return -1;
+    }
+    let cipher = {
+        let map = MEDIA_CHANNELS.lock().unwrap_or_else(|p| p.into_inner());
+        let Some(ch) = map.get(&chan) else {
+            use zeroize::Zeroize;
+            tx.zeroize();
+            rx.zeroize();
+            return -1;
+        };
+        if ch.relay_stats.is_none() {
+            use zeroize::Zeroize;
+            tx.zeroize();
+            rx.zeroize();
+            return -1;
+        }
+        Arc::clone(&ch.cipher)
+    };
+    cipher.configure(tx, rx);
     0
 }
 
@@ -2023,15 +2172,15 @@ pub unsafe extern "C" fn veil_media_set_recv_callback(
     cb: Option<media::MediaRecvFn>,
     ctx: *mut c_void,
 ) -> c_int {
-    let peer = {
+    let channel = {
         let map = MEDIA_CHANNELS.lock().unwrap_or_else(|p| p.into_inner());
-        map.get(&chan).map(|ch| ch.peer)
+        map.get(&chan).map(|ch| (ch.peer, Arc::clone(&ch.cipher)))
     };
-    match (cb, peer) {
-        (Some(cb), Some(peer)) => media::set_recv_callback(peer, chan, cb, ctx),
+    match (cb, channel) {
+        (Some(cb), Some((peer, cipher))) => media::set_recv_callback(peer, chan, cb, ctx, cipher),
         // Registering on an unknown channel has nowhere to route — error out.
         (Some(_), None) => return -1,
-        (None, Some(peer)) => media::clear_recv_callback(peer, chan),
+        (None, Some((peer, _))) => media::clear_recv_callback(peer, chan),
         // Clearing must ALWAYS land: when the host closed the channel before
         // the engine unregistered, the peer key can't be resolved anymore, yet
         // leaving the stale registration would keep swallowing the peer's
