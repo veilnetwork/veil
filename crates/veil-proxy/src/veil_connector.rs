@@ -82,6 +82,11 @@ const OPEN_RECEIPT_TIMEOUT: Duration = Duration::from_secs(10);
 /// sizing — one APP_DATA chunk fits in the pipe with headroom.
 const DUPLEX_BUF_SIZE: usize = veil_proto::budget::PROXY_DUPLEX_BUF_SIZE;
 
+/// Exit-side DNS + TCP connect is bounded by 10 seconds. Give the encrypted
+/// stream a little extra scheduling margin, but never report SOCKS success
+/// before the exit confirms that its outbound socket actually exists.
+const EXIT_READY_TIMEOUT: Duration = Duration::from_secs(15);
+
 // ── VeilConnector ──────────────────────────────────────────────────────────
 
 /// Connects SOCKS5 clients to exit nodes via veil application streams.
@@ -267,7 +272,7 @@ impl ProxyConnector for VeilConnector {
         }
 
         // Create the bidirectional pipe.
-        let (user_half, inner_half) = tokio::io::duplex(DUPLEX_BUF_SIZE);
+        let (mut user_half, inner_half) = tokio::io::duplex(DUPLEX_BUF_SIZE);
 
         // Send the proxy-connect header as the first outbound APP_DATA.
         let proxy_header = encode_proxy_header(&destination.host, destination.port);
@@ -287,11 +292,45 @@ impl ProxyConnector for VeilConnector {
             proxy_header,
         ));
 
+        // APP_OPEN acceptance only means the remote endpoint admitted the
+        // stream. The exit still has to resolve the destination, enforce its
+        // SSRF policy and connect the outbound TCP socket. Historically the
+        // connector returned here immediately, so SOCKS5 replied SUCCESS too
+        // early and the exit's 0x00 readiness byte leaked into application
+        // payload. Consume that byte here and fail the SOCKS request if the
+        // exit closes or times out before becoming ready.
+        if let Err(error) = await_exit_ready(&mut user_half).await {
+            cleanup_regs();
+            return Err(error);
+        }
+
         Ok(Box::new(VeilBiStream {
             inner: user_half,
             _slot: bridge_slot,
         }))
     }
+}
+
+async fn await_exit_ready<R>(stream: &mut R) -> Result<(), Socks5Error>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    let mut status = [0u8; 1];
+    timeout(EXIT_READY_TIMEOUT, stream.read_exact(&mut status))
+        .await
+        .map_err(|_| Socks5Error::ConnectFailed("exit connect timeout".to_owned()))?
+        .map_err(|error| {
+            Socks5Error::ConnectFailed(format!(
+                "exit closed before connect acknowledgement: {error}"
+            ))
+        })?;
+    if status[0] != 0x00 {
+        return Err(Socks5Error::ConnectFailed(format!(
+            "exit rejected destination (status=0x{:02x})",
+            status[0]
+        )));
+    }
+    Ok(())
 }
 
 // ── VeilBiStream ───────────────────────────────────────────────────────────
@@ -518,6 +557,36 @@ mod tests {
     use veil_proto::HEADER_SIZE;
     use veil_proto::codec::decode_header;
     use veil_proto::family::{AppMsg, FrameFamily};
+
+    #[tokio::test]
+    async fn exit_ready_ack_is_consumed_before_application_payload() {
+        let (mut client, mut exit) = tokio::io::duplex(64);
+        exit.write_all(&[0x00]).await.unwrap();
+        exit.write_all(b"payload").await.unwrap();
+
+        await_exit_ready(&mut client).await.unwrap();
+        let mut payload = [0u8; 7];
+        client.read_exact(&mut payload).await.unwrap();
+        assert_eq!(&payload, b"payload");
+    }
+
+    #[tokio::test]
+    async fn exit_ready_rejection_never_becomes_socks_success() {
+        let (mut client, mut exit) = tokio::io::duplex(8);
+        exit.write_all(&[0x01]).await.unwrap();
+
+        let error = await_exit_ready(&mut client).await.unwrap_err();
+        assert!(error.to_string().contains("rejected destination"));
+    }
+
+    #[tokio::test]
+    async fn exit_eof_before_ack_never_becomes_socks_success() {
+        let (mut client, exit) = tokio::io::duplex(8);
+        drop(exit);
+
+        let error = await_exit_ready(&mut client).await.unwrap_err();
+        assert!(error.to_string().contains("closed before connect"));
+    }
 
     /// In-process `FrameBroadcaster` that records every `send_to` call
     /// and exposes the recorded frames for assertion.
