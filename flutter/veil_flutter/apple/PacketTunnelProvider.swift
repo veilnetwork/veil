@@ -12,6 +12,7 @@ private let maxPlatformRoutes = 12_000
 
 private enum VeilPacketTunnelError: LocalizedError {
     case invalidConfiguration(String)
+    case upstreamStart(String)
     case engineStart(Int32, String)
     case engineStopped(String)
     case ingress(Int32)
@@ -20,6 +21,8 @@ private enum VeilPacketTunnelError: LocalizedError {
         switch self {
         case let .invalidConfiguration(detail):
             return "Invalid VPN configuration: \(detail)"
+        case let .upstreamStart(detail):
+            return "Veil VPN upstream failed to start: \(detail)"
         case let .engineStart(code, detail):
             return "Packet engine failed to start (\(code)): \(detail)"
         case let .engineStopped(detail):
@@ -76,7 +79,8 @@ private enum ParsedRoute {
 }
 
 private struct VeilTunnelConfiguration {
-    let socks5Listen: String
+    let exitNodeId: String
+    let obfs4Psk: String
     let routeMode: String
     let includedRoutes: [ParsedRoute]
     let excludedRoutes: [ParsedRoute]
@@ -86,12 +90,19 @@ private struct VeilTunnelConfiguration {
     let mtu: UInt16
 
     init(_ raw: [String: Any]) throws {
-        guard let socks5Listen = raw["socks5Listen"] as? String,
-              !socks5Listen.isEmpty
+        guard let exitNodeId = raw["exitNodeId"] as? String,
+              exitNodeId.count == 64,
+              exitNodeId.allSatisfy({ $0.isHexDigit })
         else {
-            throw VeilPacketTunnelError.invalidConfiguration("missing SOCKS5 listener")
+            throw VeilPacketTunnelError.invalidConfiguration("invalid exit node ID")
         }
-        self.socks5Listen = socks5Listen
+        self.exitNodeId = exitNodeId
+        guard let obfs4Psk = raw["obfs4Psk"] as? String,
+              !obfs4Psk.isEmpty
+        else {
+            throw VeilPacketTunnelError.invalidConfiguration("missing obfs4 PSK")
+        }
+        self.obfs4Psk = obfs4Psk
 
         let routeMode = raw["routeMode"] as? String ?? "allTraffic"
         guard ["allTraffic", "includeOnly", "excludeOnly"].contains(routeMode) else {
@@ -172,6 +183,7 @@ public final class PacketTunnelProvider: NEPacketTunnelProvider {
     private var acceptingPackets = false
     private var pendingIngress: [Data] = []
     private var configuredMTU = 1280
+    private var upstreamNode: OpaquePointer?
 
     public override func startTunnel(
         options: [String: NSObject]? = nil,
@@ -185,15 +197,24 @@ public final class PacketTunnelProvider: NEPacketTunnelProvider {
                     throw VeilPacketTunnelError.invalidConfiguration("provider configuration missing")
                 }
                 let configuration = try VeilTunnelConfiguration(raw)
+                let socks5Listen = try self.startUpstream(
+                    configuration.exitNodeId,
+                    obfs4Psk: configuration.obfs4Psk
+                )
                 self.configuredMTU = Int(configuration.mtu)
                 let settings = self.networkSettings(configuration)
                 self.setTunnelNetworkSettings(settings) { error in
                     self.packetQueue.async {
                         if let error {
+                            self.stopUpstream()
                             completionHandler(error)
                             return
                         }
-                        self.startEngine(configuration, completionHandler: completionHandler)
+                        self.startEngine(
+                            configuration,
+                            socks5Listen: socks5Listen,
+                            completionHandler: completionHandler
+                        )
                     }
                 }
             } catch {
@@ -210,6 +231,7 @@ public final class PacketTunnelProvider: NEPacketTunnelProvider {
             self.acceptingPackets = false
             self.pendingIngress.removeAll(keepingCapacity: false)
             _ = veil_packet_tunnel_stop()
+            self.stopUpstream()
             completionHandler()
         }
     }
@@ -247,9 +269,10 @@ public final class PacketTunnelProvider: NEPacketTunnelProvider {
 
     private func startEngine(
         _ configuration: VeilTunnelConfiguration,
+        socks5Listen: String,
         completionHandler: @escaping (Error?) -> Void
     ) {
-        let proxyURL = "socks5://\(configuration.socks5Listen)"
+        let proxyURL = "socks5://\(socks5Listen)"
         let dnsIP = configuration.dnsServers.first ?? "1.1.1.1"
         let context = Unmanaged.passUnretained(self).toOpaque()
         let code = proxyURL.withCString { proxy in
@@ -266,6 +289,7 @@ public final class PacketTunnelProvider: NEPacketTunnelProvider {
             }
         }
         guard code == veilOK else {
+            stopUpstream()
             completionHandler(
                 VeilPacketTunnelError.engineStart(code, Self.lastEngineError())
             )
@@ -288,6 +312,7 @@ public final class PacketTunnelProvider: NEPacketTunnelProvider {
         }
         if phase == veilTunnelError || phase == veilTunnelStopped || .now() >= deadline {
             _ = veil_packet_tunnel_stop()
+            stopUpstream()
             completionHandler(
                 VeilPacketTunnelError.engineStopped(Self.lastEngineError())
             )
@@ -364,7 +389,44 @@ public final class PacketTunnelProvider: NEPacketTunnelProvider {
         acceptingPackets = false
         pendingIngress.removeAll(keepingCapacity: false)
         _ = veil_packet_tunnel_stop()
+        stopUpstream()
         cancelTunnelWithError(error)
+    }
+
+    private func startUpstream(_ exitNodeId: String, obfs4Psk: String) throws -> String {
+        var listenPointer: UnsafeMutablePointer<CChar>?
+        var errorPointer: UnsafeMutablePointer<CChar>?
+        let bytes = Array(exitNodeId.utf8)
+        let pskBytes = Array(obfs4Psk.utf8)
+        let node = bytes.withUnsafeBufferPointer { buffer in
+            pskBytes.withUnsafeBufferPointer { pskBuffer in
+                veil_vpn_upstream_start(
+                    buffer.baseAddress,
+                    UInt(buffer.count),
+                    pskBuffer.baseAddress,
+                    UInt(pskBuffer.count),
+                    &listenPointer,
+                    &errorPointer
+                )
+            }
+        }
+        guard let node, let listenPointer else {
+            let detail = errorPointer.map { String(cString: $0) } ?? "unknown error"
+            if let errorPointer { veil_free_string(errorPointer) }
+            if let listenPointer { veil_free_string(listenPointer) }
+            throw VeilPacketTunnelError.upstreamStart(detail)
+        }
+        if let errorPointer { veil_free_string(errorPointer) }
+        upstreamNode = node
+        let listen = String(cString: listenPointer)
+        veil_free_string(listenPointer)
+        return listen
+    }
+
+    private func stopUpstream() {
+        guard let node = upstreamNode else { return }
+        upstreamNode = nil
+        veil_node_stop(node)
     }
 
     private func networkSettings(
