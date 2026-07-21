@@ -7,6 +7,7 @@
 
 use std::ffi::{CStr, CString};
 use std::net::IpAddr;
+use std::os::fd::{FromRawFd, IntoRawFd, OwnedFd};
 use std::os::raw::{c_char, c_int, c_ushort, c_void};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU8, Ordering};
@@ -285,8 +286,9 @@ where
 
 /// Start a packet engine over an OS-owned TUN file descriptor.
 ///
-/// The host remains responsible for creating/configuring the interface and for
-/// keeping the descriptor alive until [`veil_packet_tunnel_stop`] returns.
+/// The host remains responsible for creating/configuring the interface. The
+/// engine duplicates the descriptor before starting its worker, so Android's
+/// `ParcelFileDescriptor` and Rust never race over one descriptor lifetime.
 /// `proxy_url` must be a loopback SOCKS5 URL; accepting a remote/plain proxy
 /// here would bypass veil and make the VPN indicator misleading.
 #[unsafe(no_mangle)]
@@ -318,15 +320,22 @@ pub unsafe extern "C" fn veil_packet_tunnel_start_fd(
     };
     args.ipv6_enabled = ipv6_enabled;
 
-    // Reject stale/closed descriptors before starting the worker. This check is
-    // intentionally non-owning: the platform service remains the fd owner.
-    // SAFETY: F_GETFD does not dereference memory and accepts any integer fd.
-    if unsafe { libc::fcntl(tun_fd, libc::F_GETFD) } < 0 {
+    // Own a separate close-on-exec descriptor. In particular, Android keeps the
+    // original in ParcelFileDescriptor; sharing that exact fd with the async
+    // Rust worker lets service abort/restart invalidate an in-flight read.
+    // Keeping an OwnedFd until the worker consumes it also closes the duplicate
+    // if thread creation fails.
+    // SAFETY: F_DUPFD_CLOEXEC does not dereference memory and accepts any fd.
+    let duplicated_fd = unsafe { libc::fcntl(tun_fd, libc::F_DUPFD_CLOEXEC, 0) };
+    if duplicated_fd < 0 {
         return crate::VEIL_ERR_INVALID_ARG;
     }
+    // SAFETY: F_DUPFD_CLOEXEC returned a new descriptor owned by this function.
+    let duplicated_fd = unsafe { OwnedFd::from_raw_fd(duplicated_fd) };
 
     launch_tunnel(None, mtu, move |runtime, cancel| {
-        args.tun_fd(Some(tun_fd)).close_fd_on_drop(false);
+        args.tun_fd(Some(duplicated_fd.into_raw_fd()))
+            .close_fd_on_drop(true);
         runtime.block_on(tun2proxy::general_run_async(
             args,
             mtu,

@@ -74,6 +74,7 @@ class VeilVpnService : VpnService() {
         detail = null
         closeDescriptor()
         startVpnForeground()
+        var stage = "read VPN policy"
         try {
             val routeMode = intent.getStringExtra(EXTRA_ROUTE_MODE) ?: "allTraffic"
             val included = intent.getStringArrayListExtra(EXTRA_INCLUDED) ?: arrayListOf()
@@ -84,6 +85,7 @@ class VeilVpnService : VpnService() {
             val mtu = intent.getIntExtra(EXTRA_MTU, 1280)
 
             if (mtu !in 1280..9000) error("MTU must be between 1280 and 9000")
+            stage = "configure tunnel addresses"
             val builder = Builder()
                 .setSession("xVeil")
                 .setMtu(mtu)
@@ -95,6 +97,7 @@ class VeilVpnService : VpnService() {
             // the TUN. Other apps remain eligible for the VPN.
             builder.addDisallowedApplication(packageName)
 
+            stage = "configure VPN routes"
             if (routeMode == "includeOnly") {
                 if (included.isEmpty()) error("At least one included subnet is required")
                 if (included.size > MAX_PLATFORM_ROUTES) error("Too many included VPN routes")
@@ -103,7 +106,11 @@ class VeilVpnService : VpnService() {
                 val effectiveExcluded = ArrayList(excluded)
                 if (allowLan) {
                     effectiveExcluded.addAll(listOf(
-                        "10.0.0.0/8", "127.0.0.0/8", "169.254.0.0/16",
+                        // Loopback is always resolved locally by Android and
+                        // HyperOS rejects excludeRoute(127.0.0.0/8) with
+                        // EFAULT/"Bad address". Do not feed that redundant
+                        // prefix to VpnService.Builder.
+                        "10.0.0.0/8", "169.254.0.0/16",
                         "172.16.0.0/12", "192.168.0.0/16", "fc00::/7", "fe80::/10",
                     ))
                 }
@@ -111,9 +118,9 @@ class VeilVpnService : VpnService() {
                     error("Too many excluded VPN routes")
                 }
                 if (Build.VERSION.SDK_INT >= 33) {
-                    builder.addRoute("0.0.0.0", 0)
-                    builder.addRoute("::", 0)
-                    effectiveExcluded.distinct().forEach { builder.excludeRoute(parsePrefix(it)) }
+                    addRoute(builder, "0.0.0.0/0")
+                    addRoute(builder, "::/0")
+                    effectiveExcluded.distinct().forEach { excludeRoute(builder, it) }
                 } else {
                     // Android 12 and older have no Builder.excludeRoute. Build
                     // the exact complement as positive routes so exclusions
@@ -122,6 +129,7 @@ class VeilVpnService : VpnService() {
                 }
             }
 
+            stage = "configure VPN DNS"
             if (routeDns) {
                 if (dnsServers.isEmpty()) error("At least one DNS server is required")
                 dnsServers.forEach { server ->
@@ -132,6 +140,7 @@ class VeilVpnService : VpnService() {
                 }
             }
 
+            stage = "establish VPN interface"
             descriptor = builder.establish() ?: error("Android declined VPN interface creation")
             tunFd = descriptor!!.fd
             // Rust must confirm packet forwarding before the plugin promotes
@@ -139,13 +148,25 @@ class VeilVpnService : VpnService() {
             phase = PHASE_STARTING
         } catch (error: Exception) {
             closeDescriptor()
-            fail(error.message ?: error.javaClass.simpleName)
+            fail("$stage: ${error.message ?: error.javaClass.simpleName}")
         }
     }
 
     private fun addRoute(builder: Builder, cidr: String) {
-        val prefix = parsePrefix(cidr)
-        builder.addRoute(prefix.address, prefix.prefixLength)
+        try {
+            val prefix = parsePrefix(cidr)
+            builder.addRoute(prefix.address, prefix.prefixLength)
+        } catch (error: Exception) {
+            throw IllegalArgumentException("could not add route $cidr: ${error.message}", error)
+        }
+    }
+
+    private fun excludeRoute(builder: Builder, cidr: String) {
+        try {
+            builder.excludeRoute(parsePrefix(cidr))
+        } catch (error: Exception) {
+            throw IllegalArgumentException("could not exclude route $cidr: ${error.message}", error)
+        }
     }
 
     private fun parsePrefix(cidr: String): IpPrefix {
@@ -158,7 +179,22 @@ class VeilVpnService : VpnService() {
             ?: error("Invalid CIDR prefix: $cidr")
         val maximum = if (address.address.size == 4) 32 else 128
         if (prefixLength !in 0..maximum) error("Invalid CIDR prefix: $cidr")
-        return IpPrefix(address, prefixLength)
+
+        // IpPrefix requires a canonical network address and throws the opaque
+        // "Bad address" error when a syntactically valid CIDR retains host
+        // bits. GeoIP feeds and user-entered routes do not always arrive
+        // canonicalised (for example 10.1.2.3/8), so mask them here instead of
+        // aborting the whole VPN interface build.
+        val network = address.address.clone()
+        val wholeBytes = prefixLength / 8
+        val remainingBits = prefixLength % 8
+        if (remainingBits != 0) {
+            val mask = (0xff shl (8 - remainingBits)) and 0xff
+            network[wholeBytes] = (network[wholeBytes].toInt() and mask).toByte()
+        }
+        val hostStart = wholeBytes + if (remainingBits == 0) 0 else 1
+        for (index in hostStart until network.size) network[index] = 0
+        return IpPrefix(InetAddress.getByAddress(network), prefixLength)
     }
 
     private fun addComplementRoutes(builder: Builder, excluded: List<String>) {
