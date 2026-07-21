@@ -59,15 +59,28 @@ final int Function(Pointer<VeilMediaEngineHandle>) veilMediaEngineStopVideo =
             'veil_media_engine_stop_video')
         .asFunction();
 
-// set_max_rtp_packet_size(engine*, bytes int) -> int; must precede video send
-final int Function(Pointer<VeilMediaEngineHandle>, int)
-    veilMediaEngineSetMaxRtpPacketSize = nativeLib
+// set_max_rtp_packet_size(engine*, bytes int) -> int; must precede video send.
+// Optional for ABI compatibility with already-deployed mobile media engines:
+// callers can fall back to the legacy relay envelope when the native library
+// predates compact RTP packet sizing instead of aborting the whole call.
+int Function(Pointer<VeilMediaEngineHandle>, int)?
+    _lookupMediaEngineSetMaxRtpPacketSize() {
+  try {
+    return nativeLib
         .lookup<
             NativeFunction<
                 Int32 Function(Pointer<VeilMediaEngineHandle>, Int32)>>(
           'veil_media_engine_set_max_rtp_packet_size',
         )
         .asFunction();
+  } on ArgumentError {
+    return null;
+  }
+}
+
+final int Function(Pointer<VeilMediaEngineHandle>, int)?
+    veilMediaEngineSetMaxRtpPacketSize =
+    _lookupMediaEngineSetMaxRtpPacketSize();
 
 // set_video_bitrate(engine*, max_bitrate_kbps int, max_fps int) -> int
 final int Function(Pointer<VeilMediaEngineHandle>, int, int)
