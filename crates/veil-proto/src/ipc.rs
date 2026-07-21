@@ -1053,6 +1053,14 @@ pub const IPC_SEND_FLAG_RELAY_REALTIME: u32 = 0x0000_0020;
 /// call peers and every non-media application message.
 pub const IPC_SEND_FLAG_RELAY_MEDIA_SEALED: u32 = 0x0000_0040;
 
+/// Force the Delivery relay path and its local REALTIME queue without adding
+/// the optional traffic-class suffix to the inter-node `Forward` frame.
+/// Call-control uses this compatibility mode while public relays may still run
+/// a decoder that rejects trailing `Forward` extensions. Media keeps using
+/// [`IPC_SEND_FLAG_RELAY_REALTIME`] so upgraded relays preserve its class on
+/// every hop.
+pub const IPC_SEND_FLAG_RELAY_CONTROL_COMPAT: u32 = 0x0000_0080;
+
 /// Versioned prefix of a symmetrically sealed relay-media cell. Shared by the
 /// local IPC gate and the media endpoint codec; relays never interpret it.
 pub const RELAY_MEDIA_SEALED_MAGIC: [u8; 4] = *b"VME1";
@@ -1068,7 +1076,9 @@ pub const RELAY_MEDIA_SEALED_MAGIC: [u8; 4] = *b"VME1";
 /// [100..104] flags u32 BE (bit 0 = REQUIRE_ACK, bit 1 = ANONYMOUS,
 ///                           bit 2 = ANONYMOUS_AUTHENTICATED,
 ///                           bit 3 = EXPECT_REPLY, bit 4 = IS_REPLY,
-///                           bit 5 = RELAY_REALTIME)
+///                           bit 5 = RELAY_REALTIME,
+///                           bit 6 = RELAY_MEDIA_SEALED,
+///                           bit 7 = RELAY_CONTROL_COMPAT)
 /// [104..108] data_len u32 BE
 /// [108..108+data_len] data bytes
 /// [D..D+8]   reply_id u64 BE     (trailing; optional — 0 if absent)
