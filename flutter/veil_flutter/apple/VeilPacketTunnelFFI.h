@@ -12,6 +12,7 @@ extern "C" {
 typedef void (*VeilPacketWriteFn)(void *context,
                                   const uint8_t *data,
                                   uintptr_t length);
+typedef struct VeilNode VeilNode;
 
 int32_t veil_packet_tunnel_start_packets(const char *proxy_url,
                                          const char *dns_ip,
@@ -24,6 +25,13 @@ int32_t veil_packet_tunnel_send_packet(const uint8_t *data, uintptr_t length);
 int32_t veil_packet_tunnel_status(void);
 int32_t veil_packet_tunnel_stop(void);
 char *veil_packet_tunnel_last_error(void);
+VeilNode *veil_vpn_upstream_start(const uint8_t *exit_node_id,
+                                  uintptr_t exit_node_id_len,
+                                  const uint8_t *obfs4_psk,
+                                  uintptr_t obfs4_psk_len,
+                                  char **listen_out,
+                                  char **error_out);
+void veil_node_stop(VeilNode *node);
 void veil_free_string(char *value);
 
 #ifdef __cplusplus
