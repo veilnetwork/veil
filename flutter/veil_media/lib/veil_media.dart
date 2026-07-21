@@ -67,6 +67,11 @@ class VeilVideoFrame {
 class VeilMediaEngine {
   VeilMediaEngine._(this._ptr);
 
+  /// Whether the loaded native engine supports compact relay-media packet
+  /// sizing. Older mobile binaries remain usable through the v2 relay path.
+  static bool get supportsMaxRtpPacketSize =>
+      ffi.veilMediaEngineSetMaxRtpPacketSize != null;
+
   final Pointer<ffi.VeilMediaEngineHandle> _ptr;
   bool _disposed = false;
   Pointer<Uint8>? _frameBuf; // reused RGBA pull buffer
@@ -149,7 +154,8 @@ class VeilMediaEngine {
   bool setMaxRtpPacketSize(int bytes) {
     _ensure();
     if (bytes < 0) throw ArgumentError.value(bytes, 'bytes');
-    return ffi.veilMediaEngineSetMaxRtpPacketSize(_ptr, bytes) == 0;
+    final setPacketSize = ffi.veilMediaEngineSetMaxRtpPacketSize;
+    return setPacketSize != null && setPacketSize(_ptr, bytes) == 0;
   }
 
   /// Retune the running video send stream to a new bitrate/fps budget without
