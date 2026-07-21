@@ -129,6 +129,9 @@ pub enum RuntimeService {
 
     // ── Proxy / IPC / discovery ──────────────────────────────────────────
     DiscoveryInitiator,
+    /// Terminates E2E DHT-routed raw APP frames used when a selected proxy
+    /// exit is not a direct session neighbour.
+    RoutedAppFrames,
     Socks5,
     ExitProxy,
     IpcServer,
@@ -194,6 +197,7 @@ impl RuntimeService {
         Self::UpdateCheck,
         // Proxy / IPC / discovery.
         Self::DiscoveryInitiator,
+        Self::RoutedAppFrames,
         Self::Socks5,
         Self::ExitProxy,
         Self::IpcServer,

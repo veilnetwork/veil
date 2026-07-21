@@ -5,6 +5,7 @@
 //! Existing call sites use `crate::proxy::Socks5Proxy` etc. — these
 //! are re-exported from `veil_proxy` via the same path.
 
+pub mod routed_frames;
 pub mod tasks;
 
 pub use veil_proxy::{EXIT_PROXY_APP_ID, EXIT_PROXY_ENDPOINT_ID, Socks5Proxy, VeilConnector};
