@@ -6,7 +6,7 @@
 //! cancellation token and exposes one process-wide VPN instance to Flutter.
 
 use std::ffi::{CStr, CString};
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::os::fd::{FromRawFd, IntoRawFd, OwnedFd};
 use std::os::raw::{c_char, c_int, c_ushort, c_void};
 use std::pin::Pin;
@@ -17,7 +17,7 @@ use std::time::{Duration, Instant};
 
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::mpsc;
-use tun2proxy::{ArgDns, ArgProxy, ArgVerbosity, Args, CancellationToken};
+use tun2proxy::{ArgDns, ArgProxy, ArgVerbosity, Args, CancellationToken, ProxySelectorConfig};
 
 #[cfg(target_os = "linux")]
 mod linux_helper;
@@ -301,6 +301,81 @@ pub unsafe extern "C" fn veil_packet_tunnel_start_fd(
     packet_information: bool,
     route_dns: bool,
 ) -> c_int {
+    unsafe {
+        start_fd_impl(
+            tun_fd,
+            proxy_url,
+            dns_ip,
+            mtu,
+            ipv6_enabled,
+            packet_information,
+            route_dns,
+            None,
+        )
+    }
+}
+
+/// Start a TUN engine whose SOCKS5 listener is selected per flow by an
+/// authenticated loopback service (Android VpnService UID ownership lookup).
+/// A selector failure rejects the new flow instead of leaking it through the
+/// default exit.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn veil_packet_tunnel_start_fd_routed(
+    tun_fd: c_int,
+    proxy_url: *const c_char,
+    dns_ip: *const c_char,
+    mtu: c_ushort,
+    ipv6_enabled: bool,
+    packet_information: bool,
+    route_dns: bool,
+    selector_addr: *const c_char,
+    selector_token: *const c_char,
+) -> c_int {
+    let address = match unsafe { required_str(selector_addr, "selector_addr") }.and_then(|value| {
+        value
+            .parse::<SocketAddr>()
+            .map_err(|_| "selector_addr is not a socket address".to_owned())
+    }) {
+        Ok(value) if value.ip().is_loopback() => value,
+        _ => return crate::VEIL_ERR_INVALID_ARG,
+    };
+    let token = match unsafe { required_str(selector_token, "selector_token") } {
+        Ok(value)
+            if (32..=128).contains(&value.len())
+                && value.bytes().all(|byte| byte.is_ascii_hexdigit()) =>
+        {
+            value.to_owned()
+        }
+        _ => return crate::VEIL_ERR_INVALID_ARG,
+    };
+    unsafe {
+        start_fd_impl(
+            tun_fd,
+            proxy_url,
+            dns_ip,
+            mtu,
+            ipv6_enabled,
+            packet_information,
+            route_dns,
+            Some(ProxySelectorConfig {
+                addr: address,
+                token,
+            }),
+        )
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+unsafe fn start_fd_impl(
+    tun_fd: c_int,
+    proxy_url: *const c_char,
+    dns_ip: *const c_char,
+    mtu: c_ushort,
+    ipv6_enabled: bool,
+    packet_information: bool,
+    route_dns: bool,
+    proxy_selector: Option<ProxySelectorConfig>,
+) -> c_int {
     if tun_fd < 0 {
         return crate::VEIL_ERR_INVALID_ARG;
     }
@@ -319,6 +394,7 @@ pub unsafe extern "C" fn veil_packet_tunnel_start_fd(
         Err(code) => return code,
     };
     args.ipv6_enabled = ipv6_enabled;
+    args.proxy_selector = proxy_selector;
 
     // Own a separate close-on-exec descriptor. In particular, Android keeps the
     // original in ParcelFileDescriptor; sharing that exact fd with the async

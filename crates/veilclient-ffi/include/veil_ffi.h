@@ -2777,6 +2777,24 @@ int veil_packet_tunnel_start_fd(int tun_fd,
 ;
 
 /**
+ * Start a TUN engine whose SOCKS5 listener is selected per flow by an
+ * authenticated loopback service (Android VpnService UID ownership lookup).
+ * A selector failure rejects the new flow instead of leaking it through the
+ * default exit.
+ */
+
+int veil_packet_tunnel_start_fd_routed(int tun_fd,
+                                       const char *proxy_url,
+                                       const char *dns_ip,
+                                       unsigned short mtu,
+                                       bool ipv6_enabled,
+                                       bool packet_information,
+                                       bool route_dns,
+                                       const char *selector_addr,
+                                       const char *selector_token)
+;
+
+/**
  * Start a packet engine over a host-owned packet callback.
  *
  * This is the public Network Extension path for iOS/macOS: the provider feeds

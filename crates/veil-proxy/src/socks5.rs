@@ -126,8 +126,9 @@ impl ProxyDestination {
 /// [`handle_connection`] in a separate task.
 pub struct Socks5Proxy {
     listen_addr: String,
-    /// ID of the veil exit node to route through.
-    exit_node_id: [u8; 32],
+    /// Ordered Veil exits. New requests fail over without moving established
+    /// streams, so a recovered primary is picked up naturally by later flows.
+    exit_node_ids: Vec<[u8; 32]>,
     /// Outbound stream opener — abstracted so tests can inject a mock.
     connector: Arc<dyn ProxyConnector>,
     /// optional metrics for throttle-counter. `None` when
@@ -143,7 +144,23 @@ impl Socks5Proxy {
     ) -> Self {
         Self {
             listen_addr: listen_addr.into(),
-            exit_node_id,
+            exit_node_ids: vec![exit_node_id],
+            connector,
+            metrics: None,
+        }
+    }
+
+    /// Create a listener with an ordered primary/fallback exit chain.
+    /// Callers must validate that the chain is non-empty.
+    pub fn new_with_exits(
+        listen_addr: impl Into<String>,
+        exit_node_ids: Vec<[u8; 32]>,
+        connector: Arc<dyn ProxyConnector>,
+    ) -> Self {
+        assert!(!exit_node_ids.is_empty(), "SOCKS5 exit chain is empty");
+        Self {
+            listen_addr: listen_addr.into(),
+            exit_node_ids,
             connector,
             metrics: None,
         }
@@ -195,7 +212,12 @@ impl Socks5Proxy {
                             };
                             let proxy = Arc::clone(&self);
                             tokio::spawn(async move {
-                                let _ = handle_connection(stream, proxy.exit_node_id, &*proxy.connector).await;
+                                let _ = handle_connection_with_exits(
+                                    stream,
+                                    &proxy.exit_node_ids,
+                                    &*proxy.connector,
+                                )
+                                .await;
                                 // Permit released on drop once handler returns.
                                 drop(permit);
                             });
@@ -249,10 +271,25 @@ enum SocksRequest {
 
 /// Handle one accepted SOCKS5 client connection.
 pub async fn handle_connection(
-    mut client: TcpStream,
+    client: TcpStream,
     exit_node_id: [u8; 32],
     connector: &dyn ProxyConnector,
 ) -> std::io::Result<()> {
+    handle_connection_with_exits(client, std::slice::from_ref(&exit_node_id), connector).await
+}
+
+/// Handle one SOCKS connection using an ordered primary/fallback exit chain.
+pub async fn handle_connection_with_exits(
+    mut client: TcpStream,
+    exit_node_ids: &[[u8; 32]],
+    connector: &dyn ProxyConnector,
+) -> std::io::Result<()> {
+    if exit_node_ids.is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "SOCKS5 exit chain is empty",
+        ));
+    }
     // Wrap the entire handshake in a timeout to prevent slow-read DoS attacks
     // where a client trickles bytes and holds a file descriptor open indefinitely.
     let request = tokio::time::timeout(HANDSHAKE_TIMEOUT, async {
@@ -328,14 +365,35 @@ pub async fn handle_connection(
     })??;
 
     let SocksRequest::Connect(dst) = request else {
-        return handle_udp_association(client, exit_node_id, connector).await;
+        return handle_udp_association(client, exit_node_ids, connector).await;
     };
 
     // ── open veil stream to exit node ─────────────────────────────
-    let stream = match connector.connect(exit_node_id, &dst).await {
-        Ok(s) => s,
-        Err(e) => {
-            log::warn!("proxy.socks5.connect_failed destination={dst:?} error={e}");
+    let mut stream = None;
+    let mut last_error = None;
+    for (index, exit_node_id) in exit_node_ids.iter().copied().enumerate() {
+        match connector.connect(exit_node_id, &dst).await {
+            Ok(connected) => {
+                if index > 0 {
+                    log::info!("proxy.socks5.failover destination={dst:?} fallback_index={index}");
+                }
+                stream = Some(connected);
+                break;
+            }
+            Err(error) => {
+                log::warn!(
+                    "proxy.socks5.connect_failed destination={dst:?} candidate_index={index} error={error}"
+                );
+                last_error = Some(error);
+            }
+        }
+    }
+    let stream = match stream {
+        Some(stream) => stream,
+        None => {
+            if let Some(error) = last_error {
+                log::warn!("proxy.socks5.all_exits_failed destination={dst:?} error={error}");
+            }
             send_reply(
                 &mut client,
                 REP_GENERAL_FAILURE,
@@ -374,7 +432,7 @@ pub async fn handle_connection(
 
 async fn handle_udp_association(
     mut control: TcpStream,
-    exit_node_id: [u8; 32],
+    exit_node_ids: &[[u8; 32]],
     connector: &dyn ProxyConnector,
 ) -> std::io::Result<()> {
     use crate::udp::{
@@ -384,12 +442,25 @@ async fn handle_udp_association(
 
     let peer = control.peer_addr()?;
     let local = control.local_addr()?;
-    let stream = match connector
-        .connect(exit_node_id, &ProxyDestination::udp_association())
-        .await
-    {
-        Ok(stream) => stream,
-        Err(_) => {
+    let destination = ProxyDestination::udp_association();
+    let mut stream = None;
+    for (index, exit_node_id) in exit_node_ids.iter().copied().enumerate() {
+        match connector.connect(exit_node_id, &destination).await {
+            Ok(connected) => {
+                if index > 0 {
+                    log::info!("proxy.socks5.udp_failover fallback_index={index}");
+                }
+                stream = Some(connected);
+                break;
+            }
+            Err(error) => {
+                log::warn!("proxy.socks5.udp_connect_failed candidate_index={index} error={error}")
+            }
+        }
+    }
+    let stream = match stream {
+        Some(stream) => stream,
+        None => {
             send_reply(
                 &mut control,
                 REP_GENERAL_FAILURE,
@@ -675,6 +746,49 @@ mod tests {
         use tokio::io::AsyncReadExt;
         server_side.read_exact(&mut buf).await.unwrap();
         assert_eq!(&buf, b"GET / HTTP/1.0\r\n\r\n");
+    }
+
+    struct FailoverConnector {
+        attempts: tokio::sync::Mutex<Vec<[u8; 32]>>,
+    }
+
+    #[async_trait::async_trait]
+    impl ProxyConnector for FailoverConnector {
+        async fn connect(
+            &self,
+            exit_node_id: [u8; 32],
+            _destination: &ProxyDestination,
+        ) -> Result<Box<dyn BiStream>, Socks5Error> {
+            self.attempts.lock().await.push(exit_node_id);
+            if exit_node_id == [1u8; 32] {
+                return Err(Socks5Error::ConnectFailed("primary offline".into()));
+            }
+            let (client_half, _server_half) = tokio::io::duplex(64);
+            Ok(Box::new(DuplexBiStream(client_half)))
+        }
+    }
+
+    #[tokio::test]
+    async fn connect_tries_ordered_fallback_exit() {
+        let connector = Arc::new(FailoverConnector {
+            attempts: tokio::sync::Mutex::new(Vec::new()),
+        });
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server_connector = Arc::clone(&connector);
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let exits = [[1u8; 32], [2u8; 32]];
+            let _ = handle_connection_with_exits(stream, &exits, &*server_connector).await;
+        });
+
+        let mut client = TcpStream::connect(address).await.unwrap();
+        assert_eq!(socks5_greet(&mut client).await, METHOD_NO_AUTH);
+        assert_eq!(
+            socks5_connect_domain(&mut client, "example.com", 443).await,
+            REP_SUCCESS,
+        );
+        assert_eq!(*connector.attempts.lock().await, vec![[1u8; 32], [2u8; 32]],);
     }
 
     // ── 33.6: end-to-end SOCKS5 → exit proxy → TCP echo ─────────────────────

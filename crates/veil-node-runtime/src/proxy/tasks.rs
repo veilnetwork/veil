@@ -42,23 +42,16 @@ pub(crate) struct Socks5SpawnCtx<'a> {
     pub metrics: Option<Arc<veil_observability::NodeMetrics>>,
 }
 
-/// Spawn the SOCKS5 listener task. Returns `None` when disabled in config
-/// or when `exit_node_id` is not set (a warning is logged in that case).
-pub(crate) fn spawn_socks5(ctx: Socks5SpawnCtx<'_>) -> Option<JoinHandle<()>> {
-    if !ctx.config.proxy.socks5.enabled {
-        return None;
+/// Spawn every enabled SOCKS5 listener. The legacy singular profile remains
+/// first; additional profiles let one node serve independent VPN app routes.
+pub(crate) fn spawn_socks5(ctx: Socks5SpawnCtx<'_>) -> Vec<JoinHandle<()>> {
+    let profiles = std::iter::once(&ctx.config.proxy.socks5)
+        .chain(ctx.config.proxy.socks5_profiles.iter())
+        .filter(|profile| profile.enabled)
+        .collect::<Vec<_>>();
+    if profiles.is_empty() {
+        return Vec::new();
     }
-
-    let exit_node_id = match ctx.config.proxy.socks5.exit_node_id_bytes() {
-        Some(id) => id,
-        None => {
-            ctx.logger.warn(
-                "proxy.socks5.no_exit_node",
-                "SOCKS5 proxy enabled but exit_node_id is not configured — not starting",
-            );
-            return None;
-        }
-    };
 
     // Prefer a direct authenticated session and transparently fall back to an
     // E2E-protected DHT-routed APP frame when the exit is not our neighbour.
@@ -67,34 +60,63 @@ pub(crate) fn spawn_socks5(ctx: Socks5SpawnCtx<'_>) -> Option<JoinHandle<()>> {
         ctx.dispatcher,
         ctx.mlkem_ek_resolver,
     ));
-    let connector = Arc::new(veil_proxy::VeilConnector::new(
-        broadcaster,
-        exit_node_id,
-        *ctx.local_node_id.as_bytes(),
-        ctx.pending_stream_receipts,
-        ctx.veil_stream_rx,
-        ctx.wire_stream_counter,
-    ));
     let proxy_metrics: Option<Arc<dyn veil_proxy::ProxyMetrics>> = ctx
         .metrics
         .clone()
         .map(|m| m as Arc<dyn veil_proxy::ProxyMetrics>);
-    let proxy = Arc::new(
-        veil_proxy::Socks5Proxy::new(
-            &ctx.config.proxy.socks5.listen,
-            exit_node_id,
-            connector as Arc<dyn veil_proxy::socks5::ProxyConnector>,
-        )
-        .with_metrics(proxy_metrics),
-    );
-
-    let listen = ctx.config.proxy.socks5.listen.clone();
-    ctx.logger.info(
-        "proxy.socks5.start",
-        format!("SOCKS5 proxy listening on {listen}"),
-    );
-
-    Some(tokio::spawn(proxy.run(ctx.shutdown_tx.subscribe())))
+    let mut seen_listens = std::collections::HashSet::new();
+    let mut handles = Vec::with_capacity(profiles.len());
+    // VeilConnector owns the global active-bridge budget. Reuse it across all
+    // listeners so adding profiles cannot multiply that resource cap.
+    let mut shared_connector: Option<Arc<veil_proxy::VeilConnector>> = None;
+    for profile in profiles {
+        if !seen_listens.insert(profile.listen.clone()) {
+            ctx.logger.warn(
+                "proxy.socks5.duplicate_listen",
+                format!(
+                    "duplicate SOCKS5 listen {} — profile skipped",
+                    profile.listen
+                ),
+            );
+            continue;
+        }
+        let exit_node_ids = profile.exit_node_ids_bytes();
+        let Some(first_exit) = exit_node_ids.first().copied() else {
+            ctx.logger.warn(
+                "proxy.socks5.no_exit_node",
+                format!(
+                    "SOCKS5 profile {} has no valid exit candidates — not starting",
+                    profile.listen
+                ),
+            );
+            continue;
+        };
+        let connector = Arc::clone(shared_connector.get_or_insert_with(|| {
+            Arc::new(veil_proxy::VeilConnector::new(
+                Arc::clone(&broadcaster),
+                first_exit,
+                *ctx.local_node_id.as_bytes(),
+                Arc::clone(&ctx.pending_stream_receipts),
+                Arc::clone(&ctx.veil_stream_rx),
+                Arc::clone(&ctx.wire_stream_counter),
+            ))
+        }));
+        let proxy = Arc::new(
+            veil_proxy::Socks5Proxy::new_with_exits(
+                &profile.listen,
+                exit_node_ids,
+                connector as Arc<dyn veil_proxy::socks5::ProxyConnector>,
+            )
+            .with_metrics(proxy_metrics.clone()),
+        );
+        let listen = profile.listen.clone();
+        ctx.logger.info(
+            "proxy.socks5.start",
+            format!("SOCKS5 proxy listening on {listen}"),
+        );
+        handles.push(tokio::spawn(proxy.run(ctx.shutdown_tx.subscribe())));
+    }
+    handles
 }
 
 /// References the exit proxy spawn needs.

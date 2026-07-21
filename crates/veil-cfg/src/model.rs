@@ -247,6 +247,11 @@ pub struct ProxyConfig {
     /// an exit node.
     #[serde(default)]
     pub socks5: Socks5Config,
+    /// Additional named/isolated SOCKS ingress profiles. Each listener may
+    /// carry an ordered exit list, allowing one embedded node to serve several
+    /// application-routing policies without spawning extra Veil identities.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub socks5_profiles: Vec<Socks5Config>,
     /// Exit proxy. When `enabled`, the node accepts veil proxy-connect streams
     /// and establishes outgoing TCP or bounded UDP associations on the
     /// client's behalf.
@@ -257,7 +262,7 @@ pub struct ProxyConfig {
 impl ProxyConfig {
     /// `is_default` — see impl.
     pub fn is_default(&self) -> bool {
-        !self.socks5.enabled && !self.exit.enabled
+        !self.socks5.enabled && self.socks5_profiles.is_empty() && !self.exit.enabled
     }
 }
 
@@ -275,6 +280,11 @@ pub struct Socks5Config {
     /// Format: 64-character hex string (32 bytes). Required when `enabled = true`.
     #[serde(default)]
     pub exit_node_id: Option<String>,
+    /// Ordered exit candidates. A new SOCKS request tries them in order and
+    /// keeps existing streams on the exit that accepted them. The singular
+    /// `exit_node_id` remains the backwards-compatible first candidate.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub exit_node_ids: Vec<String>,
 }
 
 impl Socks5Config {
@@ -285,7 +295,57 @@ impl Socks5Config {
     /// Parse `exit_node_id` hex string into 32 bytes. Returns `None` if
     /// `exit_node_id` is absent or malformed.
     pub fn exit_node_id_bytes(&self) -> Option<[u8; 32]> {
-        veil_util::hex_to_array::<32>(self.exit_node_id.as_deref()?).ok()
+        self.exit_node_ids_bytes().into_iter().next()
+    }
+
+    /// Parse and de-duplicate all configured exit candidates. A malformed
+    /// candidate makes the whole profile invalid instead of weakening the
+    /// requested fallback order silently.
+    pub fn exit_node_ids_bytes(&self) -> Vec<[u8; 32]> {
+        let values = self
+            .exit_node_id
+            .iter()
+            .chain(self.exit_node_ids.iter())
+            .map(String::as_str);
+        let mut parsed = Vec::with_capacity(self.exit_node_ids.len() + 1);
+        for value in values {
+            let Ok(id) = veil_util::hex_to_array::<32>(value) else {
+                return Vec::new();
+            };
+            if !parsed.contains(&id) {
+                parsed.push(id);
+            }
+        }
+        parsed
+    }
+}
+
+#[cfg(test)]
+mod socks5_config_tests {
+    use super::*;
+
+    #[test]
+    fn singular_exit_stays_primary_and_candidates_are_deduplicated() {
+        let primary = "11".repeat(32);
+        let fallback = "22".repeat(32);
+        let config = Socks5Config {
+            exit_node_id: Some(primary.clone()),
+            exit_node_ids: vec![primary, fallback],
+            ..Socks5Config::default()
+        };
+
+        assert_eq!(config.exit_node_ids_bytes(), vec![[0x11; 32], [0x22; 32]]);
+    }
+
+    #[test]
+    fn malformed_fallback_invalidates_the_whole_chain() {
+        let config = Socks5Config {
+            exit_node_id: Some("11".repeat(32)),
+            exit_node_ids: vec!["not-a-node-id".to_owned()],
+            ..Socks5Config::default()
+        };
+
+        assert!(config.exit_node_ids_bytes().is_empty());
     }
 }
 
@@ -295,6 +355,7 @@ impl Default for Socks5Config {
             enabled: false,
             listen: Self::default_listen(),
             exit_node_id: None,
+            exit_node_ids: Vec::new(),
         }
     }
 }
