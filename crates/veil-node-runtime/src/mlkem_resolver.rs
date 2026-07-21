@@ -799,6 +799,80 @@ where
 }
 
 impl MlKemEkResolver for DhtMlKemEkResolver {
+    fn resolve_ek_cached(&self, target_node_id: NodeIdBytes) -> Option<Vec<u8>> {
+        let now_unix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()?
+            .as_secs();
+
+        if let Some((cert, ts)) = rlock!(self.cert_cache).get(&target_node_id)
+            && ts.elapsed() < self.cert_ttl
+        {
+            return Some(cert.mlkem_pubkey.clone());
+        }
+
+        // Reconstruct the same signed document -> registry -> certificate
+        // chain as fetch_verified_cert, but touch only the persistent local
+        // DHT mirror. Never accept structurally-valid but unsigned cache data.
+        let doc = IdentityDocument::decode(
+            &self
+                .dht
+                .get_local(&IdentityDocument::dht_key(&target_node_id))?,
+        )
+        .ok()?;
+        if doc.node_id != target_node_id || verify_identity_document(&doc, now_unix).is_err() {
+            return None;
+        }
+
+        let registry = InstanceRegistry::decode(
+            &self
+                .dht
+                .get_local(&InstanceRegistry::dht_key(&target_node_id))?,
+        )
+        .ok()?;
+        if registry.node_id != target_node_id || !verify_instance_registry_sig(&registry, &doc) {
+            return None;
+        }
+        let instance = registry
+            .instances
+            .iter()
+            .max_by_key(|instance| instance.last_seen_unix_ms)?;
+        let cert = MlKemKeyCert::decode(&self.dht.get_local(&MlKemKeyCert::dht_key(
+            &target_node_id,
+            &instance.instance_id,
+        ))?)
+        .ok()?;
+        let verified = verify_mlkem_cert(&cert, &doc, now_unix).ok()?;
+        let ek = verified.mlkem_pubkey.clone();
+
+        {
+            let mut cache = wlock!(self.peer_mlkem_keys);
+            if cache.len() >= veil_proto::budget::MAX_PEER_MLKEM_CACHE
+                && let Some(oldest) = cache
+                    .iter()
+                    .min_by_key(|(_, (_, ts))| *ts)
+                    .map(|(id, _)| *id)
+            {
+                cache.remove(&oldest);
+            }
+            cache.insert(target_node_id, (ek.clone(), std::time::Instant::now()));
+        }
+        {
+            let mut cache = wlock!(self.cert_cache);
+            if cache.len() >= veil_proto::budget::MAX_PEER_MLKEM_CACHE
+                && let Some(oldest) = cache
+                    .iter()
+                    .min_by_key(|(_, (_, ts))| *ts)
+                    .map(|(id, _)| *id)
+            {
+                cache.remove(&oldest);
+            }
+            cache.insert(target_node_id, (verified, std::time::Instant::now()));
+        }
+        self.log_dbg("mlkem_resolver.cert.local_hit", &target_node_id, "");
+        Some(ek)
+    }
+
     fn resolve_ek(
         &self,
         target_node_id: NodeIdBytes,
@@ -952,6 +1026,18 @@ mod tests {
             Some(dummy_cert(target)),
             "a fresh cached cert must short-circuit the DHT walk"
         );
+    }
+
+    #[test]
+    fn resolve_ek_cached_returns_only_a_fresh_verified_cache_entry() {
+        let dht = Arc::new(KademliaService::new([1u8; 32]));
+        let target = [9u8; 32];
+        let cert_cache = Arc::new(RwLock::new(PeerMlKemCertCache::new()));
+        wlock!(cert_cache).insert(target, (dummy_cert(target), std::time::Instant::now()));
+        let resolver = make_test_resolver_with_cert_cache(dht, cert_cache);
+
+        assert_eq!(resolver.resolve_ek_cached(target), Some(vec![0x42; 32]));
+        assert_eq!(resolver.resolve_ek_cached([8u8; 32]), None);
     }
 
     // TTL gate: with TTL = 0 even a just-inserted entry is stale, so the fast

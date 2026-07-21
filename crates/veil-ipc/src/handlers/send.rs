@@ -318,7 +318,9 @@ pub(crate) async fn handle_ipc_send(
         .and_then(|v| <[u8; 4]>::try_from(v).ok())
         .map(u32::from_be_bytes)
         .unwrap_or(0);
-    let relay_realtime = raw_flags & veil_proto::ipc::IPC_SEND_FLAG_RELAY_REALTIME != 0;
+    let relay_wire_realtime = raw_flags & veil_proto::ipc::IPC_SEND_FLAG_RELAY_REALTIME != 0;
+    let relay_control_compat = raw_flags & veil_proto::ipc::IPC_SEND_FLAG_RELAY_CONTROL_COMPAT != 0;
+    let relay_realtime = relay_wire_realtime || relay_control_compat;
     let relay_media_sealed = raw_flags & veil_proto::ipc::IPC_SEND_FLAG_RELAY_MEDIA_SEALED != 0;
     let send = match AppIpcSendPayload::decode(body) {
         Ok(s) => s,
@@ -331,7 +333,7 @@ pub(crate) async fn handle_ipc_send(
     // fail closed before routing. An old daemon ignores the additive flag and
     // safely adds its ordinary ML-KEM envelope instead.
     if relay_media_sealed
-        && (!relay_realtime
+        && (!relay_wire_realtime
             || send.require_ack
             || !send
                 .data
@@ -550,9 +552,20 @@ pub(crate) async fn handle_ipc_send(
                     // preserved).
                     if recipient_ek.is_none()
                         && let Some(resolver) = ctx.mlkem_ek_resolver
-                        && let Some(ek) = resolver.resolve_ek(send.dst_node_id).await
                     {
-                        recipient_ek = Some(ek);
+                        // Call control cannot sit behind the resolver's three
+                        // multi-replica DHT freshness rounds (up to 9 s after
+                        // every node restart). Its compatibility relay copy is
+                        // best-effort and deduplicated, so a locally stored,
+                        // signature-verified, unexpired cert is safe: if it is
+                        // stale after key rotation this copy merely fails to
+                        // decrypt, while the parallel ordinary/durable lane
+                        // performs the full fresh resolve and retries.
+                        recipient_ek = if relay_control_compat {
+                            resolver.resolve_ek_cached(send.dst_node_id)
+                        } else {
+                            resolver.resolve_ek(send.dst_node_id).await
+                        };
                     }
 
                     if let Some(ek) = recipient_ek {
@@ -871,7 +884,7 @@ pub(crate) async fn handle_ipc_send(
                     // path re-queues it in the REALTIME lane instead of
                     // behind bulk delivery chatter (legacy relays ignore the
                     // optional tail and forward unchanged).
-                    let class_suffix_len = if relay_realtime { 2 } else { 0 };
+                    let class_suffix_len = if relay_wire_realtime { 2 } else { 0 };
                     let body_len =
                         32 + env_bytes.len() + 8 + 1 + attempt_suffix_len + class_suffix_len;
                     let mut hdr = FrameHeader::new(
@@ -888,7 +901,7 @@ pub(crate) async fn handle_ipc_send(
                         frame.push(veil_proto::delivery::FORWARD_DELIVERY_ATTEMPT_MARKER);
                         frame.push(1); // initial delivery attempt
                     }
-                    if relay_realtime {
+                    if relay_wire_realtime {
                         frame.push(veil_proto::delivery::FORWARD_TRAFFIC_CLASS_MARKER);
                         frame.push(veil_proto::header::priority::REALTIME);
                     }
@@ -910,7 +923,13 @@ pub(crate) async fn handle_ipc_send(
                     v
                 };
                 let mut any_send_failed = false;
+                let mut any_compat_sent = false;
+                let mut compat_attempts = 0usize;
                 for next_hop in hops_to_try {
+                    if relay_control_compat && compat_attempts >= 3 {
+                        break;
+                    }
+                    compat_attempts += 1;
                     let fwd_frame = make_fwd_frame(next_hop);
                     let relayed = reg.send_to(
                         &next_hop,
@@ -922,6 +941,16 @@ pub(crate) async fn handle_ipc_send(
                         fwd_frame.clone(),
                     );
                     if relayed {
+                        // Call lifecycle frames are tiny and rare. Fan them to
+                        // up to three independently-operated legacy relays so
+                        // one stale route/overloaded operator cannot add a
+                        // whole retry interval. Stable content_id dedup at the
+                        // recipient makes the copies harmless. ACK-mode keeps
+                        // its existing single-hop tracker semantics.
+                        if relay_control_compat && !send.require_ack {
+                            any_compat_sent = true;
+                            continue;
+                        }
                         // register for ACK tracking if requested.
                         // Pass `next_hop` (the direct relay peer) so that
                         // retransmits use the same session path, not the final
@@ -954,6 +983,9 @@ pub(crate) async fn handle_ipc_send(
                         wlock!(cache).invalidate_hop(&send.dst_node_id, &next_hop);
                     }
                     any_send_failed = true;
+                }
+                if any_compat_sent {
+                    return Ok(());
                 }
                 // All cached hops were dead. Flush the entire dst bucket so
                 // that the next try_lookup_or_discover call finds nothing and

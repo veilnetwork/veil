@@ -288,6 +288,46 @@ final int Function(
             )>>('veil_send_realtime')
     .asFunction();
 
+int Function(
+  Pointer<VeilApp>,
+  Pointer<Uint8>,
+  Pointer<Uint8>,
+  int,
+  Pointer<Uint8>,
+  int,
+  Pointer<Pointer<Utf8>>,
+)? _lookupVeilSendRelayRealtime() {
+  try {
+    return nativeLib
+        .lookup<
+            NativeFunction<
+                Int32 Function(
+                  Pointer<VeilApp>,
+                  Pointer<Uint8>,
+                  Pointer<Uint8>,
+                  Uint32,
+                  Pointer<Uint8>,
+                  IntPtr,
+                  Pointer<Pointer<Utf8>>,
+                )>>('veil_send_relay_realtime')
+        .asFunction();
+  } on ArgumentError {
+    return null;
+  }
+}
+
+/// Optional for compatibility with mobile packages carrying an older native
+/// veilclient ABI. Callers retain the ordinary durable fallback when absent.
+final int Function(
+  Pointer<VeilApp>,
+  Pointer<Uint8>,
+  Pointer<Uint8>,
+  int,
+  Pointer<Uint8>,
+  int,
+  Pointer<Pointer<Utf8>>,
+)? veilSendRelayRealtime = _lookupVeilSendRelayRealtime();
+
 final int Function(
   Pointer<VeilApp>,
   Pointer<Uint8>,
