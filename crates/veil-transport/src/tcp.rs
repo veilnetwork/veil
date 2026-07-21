@@ -66,11 +66,13 @@ pub(crate) fn clamp_downlink_mss(stream: &TcpStream) {
 /// measuring after every in-process frame/queue cap (the caps moved the
 /// bound to the wire channel, but the kernel buffer below it stayed
 /// unbounded). Clamping the buffer moves backpressure up into the process,
-/// where the priority queue can actually act on it. 256 KiB still allows
-/// ~5 MiB/s on a 50 ms leg — above any single relay leg observed on this
-/// overlay — and bulk swarms fan out across circuits/sessions, so file
+/// where the priority queue can actually act on it. 64 KiB still allows
+/// ~2.8 Mbit/s on the observed 180 ms mobile-relay leg (well above one
+/// 900 kbit/s call direction), while bounding already-committed media below
+/// the multi-second backlog produced by the former 256 KiB request (Linux may
+/// double SO_SNDBUF). Bulk swarms fan out across circuits/sessions, so file
 /// throughput is not gated by one socket's clamp.
-pub(crate) const UPLINK_SNDBUF_CLAMP: usize = 256 * 1024;
+pub(crate) const UPLINK_SNDBUF_CLAMP: usize = 64 * 1024;
 
 /// Best-effort `SO_SNDBUF` clamp (see [`UPLINK_SNDBUF_CLAMP`]). A failure is
 /// a missed optimisation, never a correctness problem, so the `Err` is
