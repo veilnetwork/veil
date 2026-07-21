@@ -3084,6 +3084,88 @@ pub unsafe extern "C" fn veil_send_realtime(
     }
 }
 
+/// Send a loss-tolerant datagram through the non-onion Delivery relay path at
+/// REALTIME priority. Unlike [`veil_send_realtime`], this does not require a
+/// direct session to the destination: the daemon selects an already-active
+/// overlay peer as the first relay hop. The call is fire-and-forget; callers
+/// that need eventual delivery must retain their durable fallback.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn veil_send_relay_realtime(
+    app: *mut VeilApp,
+    dst_node_id: *const u8,
+    dst_app_id: *const u8,
+    dst_endpoint_id: u32,
+    data: *const u8,
+    len: size_t,
+    err_out: *mut *mut c_char,
+) -> c_int {
+    if let Err(rc) = unsafe { guard::ffi_prelude(err_out, "veil_send_relay_realtime") } {
+        return rc;
+    }
+    null_check!(err_out,
+        "app" => app,
+        "dst_node_id" => dst_node_id,
+        "dst_app_id" => dst_app_id,
+    );
+    if data.is_null() && len > 0 {
+        unsafe {
+            write_err(err_out, "data is NULL but len > 0");
+        }
+        return VEIL_ERR_INVALID_ARG;
+    }
+    if len > VEIL_MAX_DATA_LEN {
+        unsafe {
+            write_err(
+                err_out,
+                format!("data len {len} exceeds VEIL_MAX_DATA_LEN ({VEIL_MAX_DATA_LEN})"),
+            );
+        }
+        return VEIL_ERR_INVALID_ARG;
+    }
+    get_or_return!(
+        app_ref,
+        app_table(),
+        app,
+        err_out,
+        VEIL_ERR_INVALID_ARG,
+        "VeilApp"
+    );
+    let mut dst_node = [0u8; 32];
+    let mut dst_app = [0u8; 32];
+    unsafe {
+        ptr::copy_nonoverlapping(dst_node_id, dst_node.as_mut_ptr(), 32);
+        ptr::copy_nonoverlapping(dst_app_id, dst_app.as_mut_ptr(), 32);
+    }
+    let payload = if len == 0 {
+        Vec::new()
+    } else {
+        unsafe { std::slice::from_raw_parts(data, len) }.to_vec()
+    };
+    let send_res: Result<(), ClientError> = app_ref.bundle.runtime.block_on(async {
+        let inner_guard = app_ref.sender.lock().await;
+        let Some(sender) = inner_guard.as_ref() else {
+            return Err(ClientError::Protocol("app already closed".to_string()));
+        };
+        sender
+            .send_relay_control_owned(dst_node, dst_app, dst_endpoint_id, payload)
+            .await
+    });
+    match send_res {
+        Ok(()) => VEIL_OK,
+        Err(e) => {
+            let s = e.to_string();
+            unsafe {
+                write_err(err_out, format!("relay realtime send failed: {s}"));
+            }
+            if s.contains("app already closed") {
+                VEIL_ERR_CLOSED
+            } else {
+                VEIL_ERR
+            }
+        }
+    }
+}
+
 /// Send an AUTHENTICATED anonymous datagram from `app` to
 /// `(dst_node_id, dst_app_id, dst_endpoint_id)`.
 ///
@@ -9418,6 +9500,29 @@ mod tests {
         let mut err: *mut c_char = ptr::null_mut();
         let rc = unsafe {
             veil_send_realtime(
+                ptr::null_mut(),
+                dst_node.as_ptr(),
+                dst_app.as_ptr(),
+                0,
+                ptr::null(),
+                0,
+                &mut err,
+            )
+        };
+        assert_eq!(rc, VEIL_ERR_INVALID_ARG);
+        assert!(!err.is_null());
+        unsafe {
+            veil_free_string(err);
+        }
+    }
+
+    #[test]
+    fn null_app_relay_realtime_send_returns_invalid_arg() {
+        let dst_node = [0u8; 32];
+        let dst_app = [0u8; 32];
+        let mut err: *mut c_char = ptr::null_mut();
+        let rc = unsafe {
+            veil_send_relay_realtime(
                 ptr::null_mut(),
                 dst_node.as_ptr(),
                 dst_app.as_ptr(),

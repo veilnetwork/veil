@@ -111,6 +111,16 @@ pub trait FrameBroadcaster: Send + Sync {
 // matches the existing `BroadcastFn` trait in `veil-transport::rotation`
 // (also for the same reason) and keeps the trait object-safe.
 pub trait MlKemEkResolver: Send + Sync {
+    /// Resolve from already-local, cryptographically verified records only.
+    ///
+    /// Latency-critical best-effort traffic can use this before starting the
+    /// full multi-replica DHT freshness walk. A stale-but-still-valid key can
+    /// only make that copy undecryptable; it cannot expose or forge payloads.
+    /// Implementations without a local cache keep the conservative miss.
+    fn resolve_ek_cached(&self, _target_node_id: [u8; 32]) -> Option<Vec<u8>> {
+        None
+    }
+
     /// Reactively fetch + verify the recipient's ML-KEM-768 encapsulation
     /// key from the DHT.  Returns `None` on any failure (no document, no
     /// instance, no cert, signature invalid, timeout).  Callers should

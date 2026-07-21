@@ -200,6 +200,27 @@ impl AppHandle {
             .await
     }
 
+    /// Relay call-control at REALTIME priority using the legacy-compatible
+    /// `Delivery::Forward` wire shape (no optional traffic-class suffix).
+    pub async fn send_relay_control_owned(
+        &self,
+        dst_node_id: [u8; 32],
+        dst_app_id: [u8; 32],
+        dst_endpoint_id: u32,
+        data: Vec<u8>,
+    ) -> Result<(), ClientError> {
+        self.writer
+            .write_app_ipc_send_owned(
+                &dst_node_id,
+                &self.app_id,
+                &dst_app_id,
+                dst_endpoint_id,
+                veil_proto::ipc::IPC_SEND_FLAG_RELAY_CONTROL_COMPAT,
+                &data,
+            )
+            .await
+    }
+
     /// Send call media that was already sealed with an ephemeral E2E media
     /// key. The node preserves the compact ciphertext instead of adding a
     /// per-packet ML-KEM envelope; only the loss-tolerant relay path accepts
@@ -607,6 +628,26 @@ impl AppSender {
                 &dst_app_id,
                 dst_endpoint_id,
                 veil_proto::ipc::IPC_SEND_FLAG_RELAY_REALTIME,
+                &data,
+            )
+            .await
+    }
+
+    /// Split-handle variant of [`AppHandle::send_relay_control_owned`].
+    pub async fn send_relay_control_owned(
+        &self,
+        dst_node_id: [u8; 32],
+        dst_app_id: [u8; 32],
+        dst_endpoint_id: u32,
+        data: Vec<u8>,
+    ) -> Result<(), ClientError> {
+        self.writer
+            .write_app_ipc_send_owned(
+                &dst_node_id,
+                &self.app_id,
+                &dst_app_id,
+                dst_endpoint_id,
+                veil_proto::ipc::IPC_SEND_FLAG_RELAY_CONTROL_COMPAT,
                 &data,
             )
             .await
