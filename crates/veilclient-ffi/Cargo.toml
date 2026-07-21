@@ -108,6 +108,10 @@ android_logger = "0.13"
 
 [dev-dependencies]
 veil-proto = { path = "../veil-proto" }
+# Unit tests use temporary directories even when the optional embedded-node
+# feature is disabled. Keep the production dependency feature-gated above,
+# while making it unconditionally available to test targets.
+tempfile = "3"
 
 [lints]
 workspace = true
