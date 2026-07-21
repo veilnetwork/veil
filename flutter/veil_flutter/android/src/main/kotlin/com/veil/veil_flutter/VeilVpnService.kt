@@ -29,6 +29,7 @@ class VeilVpnService : VpnService() {
         const val PHASE_STOPPED = "stopped"
         const val PHASE_STARTING = "starting"
         const val PHASE_RUNNING = "running"
+        const val PHASE_STOPPING = "stopping"
         const val PHASE_ERROR = "error"
         private const val MAX_PLATFORM_ROUTES = 12_000
 
@@ -47,25 +48,32 @@ class VeilVpnService : VpnService() {
             detail = message
             phase = PHASE_ERROR
         }
+
+        fun beginStopping() {
+            phase = PHASE_STOPPING
+            detail = null
+        }
     }
 
     private var descriptor: ParcelFileDescriptor? = null
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         when (intent?.action) {
-            ACTION_STOP -> stopTunnel()
+            ACTION_STOP -> stopTunnel(startId)
             ACTION_START -> startTunnel(intent)
         }
         return Service.START_NOT_STICKY
     }
 
     override fun onRevoke() {
-        stopTunnel()
+        stopTunnel(null)
         super.onRevoke()
     }
 
     override fun onDestroy() {
         closeDescriptor()
+        phase = PHASE_STOPPED
+        detail = null
         super.onDestroy()
     }
 
@@ -266,12 +274,12 @@ class VeilVpnService : VpnService() {
         }
     }
 
-    private fun stopTunnel() {
+    private fun stopTunnel(startId: Int?) {
         closeDescriptor()
         phase = PHASE_STOPPED
         detail = null
         stopForeground(STOP_FOREGROUND_REMOVE)
-        stopSelf()
+        if (startId == null) stopSelf() else stopSelfResult(startId)
     }
 
     private fun closeDescriptor() {
