@@ -78,7 +78,7 @@ const OPEN_RECEIPT_TIMEOUT: Duration = Duration::from_secs(10);
 /// A cold DHT route/key lookup is initiated by the routed broadcaster's first
 /// failed send. Retry APP_OPEN while that lookup converges instead of failing
 /// SOCKS immediately merely because the exit is not a direct neighbour.
-const OPEN_ROUTE_RETRY_ATTEMPTS: usize = 50;
+const OPEN_ROUTE_RETRY_ATTEMPTS: usize = 120;
 const OPEN_ROUTE_RETRY_INTERVAL: Duration = Duration::from_millis(100);
 
 /// per-bridge duplex buffer size — pulled from
