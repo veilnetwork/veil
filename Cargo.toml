@@ -56,6 +56,13 @@ members = [
     "crates/ogate",
     "crates/oproxy",
 ]
+exclude = ["third_party/tun2proxy"]
+
+[patch.crates-io]
+# Local, narrowly extended 0.8.2: an optional authenticated loopback selector
+# chooses a SOCKS listener per accepted flow. The default path is byte-for-byte
+# compatible with upstream and remains used by desktop helpers.
+tun2proxy = { path = "third_party/tun2proxy" }
 
 [workspace.lints.clippy]
 # Mutex/RwLock guards must not be held across .await — guard is held while
