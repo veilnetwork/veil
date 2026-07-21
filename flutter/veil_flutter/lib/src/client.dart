@@ -838,6 +838,50 @@ void _sendRealtimeWorker(int appAddr, Uint8List dstNodeId, Uint8List dstAppId,
   }
 }
 
+/// Off-isolate relay-realtime path for latency-critical control when the
+/// destination has no admitted direct session. Older native packages do not
+/// expose the symbol; surface that as an ordinary failure so callers can keep
+/// their contact/mailbox fallback.
+void _sendRelayRealtimeWorker(int appAddr, Uint8List dstNodeId,
+    Uint8List dstAppId, int dstEndpointId, Uint8List data) {
+  final sendRelayRealtime = ffi.veilSendRelayRealtime;
+  if (sendRelayRealtime == null) {
+    throw UnsupportedError('native veilclient has no relay realtime ABI');
+  }
+  final app = Pointer<ffi.VeilApp>.fromAddress(appAddr);
+  final dstNode = calloc<Uint8>(32);
+  final dstApp = calloc<Uint8>(32);
+  final dataPtr = data.isNotEmpty ? calloc<Uint8>(data.length) : nullptr;
+  final errOut = calloc<Pointer<Utf8>>();
+  try {
+    dstNode.asTypedList(32).setAll(0, dstNodeId);
+    dstApp.asTypedList(32).setAll(0, dstAppId);
+    if (data.isNotEmpty) {
+      dataPtr.asTypedList(data.length).setAll(0, data);
+    }
+    final rc = sendRelayRealtime(
+      app,
+      dstNode,
+      dstApp,
+      dstEndpointId,
+      dataPtr,
+      data.length,
+      errOut,
+    );
+    if (rc != ffi.veilOk) {
+      throw VeilException(
+        'relay realtime send failed: ${_readErrAndFree(errOut)}',
+        code: rc,
+      );
+    }
+  } finally {
+    calloc.free(dstNode);
+    calloc.free(dstApp);
+    if (dataPtr != nullptr) calloc.free(dataPtr);
+    calloc.free(errOut);
+  }
+}
+
 /// GC-time safety-net: if a Dart `VeilClient` becomes unreachable
 /// without calling [VeilClient.close], the finalizer fires
 /// `veil_close` to release the daemon-side handle.  Explicit close
@@ -2306,6 +2350,24 @@ class AppHandle implements Finalizable {
     final appAddr = _app.address;
     return Isolate.run(() =>
         _sendRealtimeWorker(appAddr, dstNodeId, dstAppId, dstEndpointId, data));
+  }
+
+  /// Send a loss-tolerant datagram over the non-onion Delivery relay path at
+  /// realtime priority. This is the low-latency fallback for control traffic
+  /// when no direct peer session has been admitted.
+  Future<void> sendRelayRealtime({
+    required Uint8List dstNodeId,
+    required Uint8List dstAppId,
+    required int dstEndpointId,
+    required Uint8List data,
+  }) async {
+    _ensureOpen();
+    if (dstNodeId.length != 32 || dstAppId.length != 32) {
+      throw ArgumentError('dst_node_id and dst_app_id must be 32 bytes');
+    }
+    final appAddr = _app.address;
+    return Isolate.run(() => _sendRelayRealtimeWorker(
+        appAddr, dstNodeId, dstAppId, dstEndpointId, data));
   }
 
   /// Send [data] as an AUTHENTICATED anonymous message over the

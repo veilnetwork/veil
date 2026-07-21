@@ -1010,6 +1010,21 @@ int veil_send_realtime(VeilApp *app,
 ;
 
 /**
+ * Send a loss-tolerant datagram through the non-onion Delivery relay path at
+ * REALTIME priority. This does not require a direct destination session; the
+ * daemon selects an already-active overlay peer as the first relay hop.
+ */
+
+int veil_send_relay_realtime(VeilApp *app,
+                             const uint8_t *dst_node_id,
+                             const uint8_t *dst_app_id,
+                             uint32_t dst_endpoint_id,
+                             const uint8_t *data,
+                             size_t len,
+                             char **err_out)
+;
+
+/**
  * Send an AUTHENTICATED anonymous datagram from `app` to
  * `(dst_node_id, dst_app_id, dst_endpoint_id)`.
  *

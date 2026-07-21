@@ -1004,6 +1004,41 @@ async fn ipc_send_relay_via_route_cache() {
     assert_eq!(compact_fwd.envelope.ttl_secs, 30);
     assert!(!compact_fwd.envelope.require_ack);
 
+    // Call control must still force a REALTIME first-hop queue while keeping
+    // the legacy Forward wire shape. Public relays can lag the endpoint
+    // rollout and some old decoders reject optional trailing extensions.
+    let compat_payload = b"call-control".to_vec();
+    let compat_send = AppIpcSendPayload {
+        src_app_id,
+        dst_node_id: c_id,
+        app_id,
+        endpoint_id: 1,
+        data: veil_bufpool::pooled_shared_from_vec(compat_payload.clone()),
+        require_ack: false,
+        anonymous: false,
+        anonymous_authenticated: false,
+        expect_reply: false,
+        is_reply: false,
+        reply_id: 0,
+        reply_endpoint_id: 0,
+    };
+    let mut compat_body = compat_send.encode();
+    compat_body[100..104]
+        .copy_from_slice(&veil_proto::ipc::IPC_SEND_FLAG_RELAY_CONTROL_COMPAT.to_be_bytes());
+    send_ipc_frame(&mut client, LocalAppMsg::AppIpcSend as u16, &compat_body).await;
+
+    let (prio, frame_bytes) = tokio::time::timeout(Duration::from_millis(500), b_rx.recv())
+        .await
+        .expect("timeout waiting for compatible control frame")
+        .expect("B outbox channel closed unexpectedly");
+    assert_eq!(prio, veil_proto::header::priority::REALTIME);
+    let compat_body = &frame_bytes[veil_proto::HEADER_SIZE..];
+    assert!(!ForwardPayload::is_realtime_datagram_eligible(compat_body));
+    let compat_fwd = ForwardPayload::decode(compat_body).unwrap();
+    assert_eq!(compat_fwd.envelope.payload, compat_payload);
+    assert_eq!(compat_fwd.traffic_class, None);
+    assert_eq!(compat_fwd.envelope.ttl_secs, 30);
+
     drop(client);
     let _ = shutdown_tx.send(true);
     let _ = sh.await;
