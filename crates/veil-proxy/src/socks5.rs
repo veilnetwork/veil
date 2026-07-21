@@ -334,7 +334,8 @@ pub async fn handle_connection(
     // ── open veil stream to exit node ─────────────────────────────
     let stream = match connector.connect(exit_node_id, &dst).await {
         Ok(s) => s,
-        Err(_e) => {
+        Err(e) => {
+            log::warn!("proxy.socks5.connect_failed destination={dst:?} error={e}");
             send_reply(
                 &mut client,
                 REP_GENERAL_FAILURE,
