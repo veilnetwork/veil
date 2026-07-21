@@ -27,6 +27,7 @@ class VeilVpnService : VpnService() {
         const val EXTRA_MTU = "mtu"
         const val EXTRA_APPLICATION_MODE = "applicationMode"
         const val EXTRA_APPLICATION_IDS = "applicationIds"
+        const val EXTRA_APPLICATION_PROXY_ROUTES = "applicationProxyRoutes"
 
         const val PHASE_STOPPED = "stopped"
         const val PHASE_STARTING = "starting"
@@ -40,6 +41,10 @@ class VeilVpnService : VpnService() {
         @Volatile var detail: String? = null
             private set
         @Volatile var tunFd: Int? = null
+            private set
+        @Volatile var selectorListen: String? = null
+            private set
+        @Volatile var selectorToken: String? = null
             private set
 
         fun confirmRunning() {
@@ -58,6 +63,7 @@ class VeilVpnService : VpnService() {
     }
 
     private var descriptor: ParcelFileDescriptor? = null
+    private var flowSelector: VpnFlowSelector? = null
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         when (intent?.action) {
@@ -97,6 +103,19 @@ class VeilVpnService : VpnService() {
                 ?: "allApplications"
             val applicationIds = intent.getStringArrayListExtra(EXTRA_APPLICATION_IDS)
                 ?: arrayListOf()
+            val applicationProxyRoutes = intent
+                .getStringArrayListExtra(EXTRA_APPLICATION_PROXY_ROUTES)
+                .orEmpty()
+                .associate { encoded ->
+                    val separator = encoded.indexOf('\t')
+                    if (separator <= 0 || separator == encoded.lastIndex) {
+                        error("Invalid application oproxy route")
+                    }
+                    encoded.substring(0, separator) to encoded.substring(separator + 1)
+                }
+            if (applicationProxyRoutes.isNotEmpty() && Build.VERSION.SDK_INT < 29) {
+                error("Per-application oproxy routing requires Android 10 or newer")
+            }
 
             if (mtu !in 1280..9000) error("MTU must be between 1280 and 9000")
             stage = "configure tunnel addresses"
@@ -179,6 +198,14 @@ class VeilVpnService : VpnService() {
 
             stage = "establish VPN interface"
             descriptor = builder.establish() ?: error("Android declined VPN interface creation")
+            if (applicationProxyRoutes.isNotEmpty()) {
+                stage = "start per-application flow selector"
+                flowSelector = VpnFlowSelector(this, applicationProxyRoutes)
+                selectorListen = flowSelector!!.listen
+                selectorToken = flowSelector!!.token
+            }
+            // Publish readiness last: the plugin completes start as soon as it
+            // sees tunFd, and routed starts must already expose selector data.
             tunFd = descriptor!!.fd
             // Rust must confirm packet forwarding before the plugin promotes
             // this to PHASE_RUNNING.
@@ -312,6 +339,10 @@ class VeilVpnService : VpnService() {
     }
 
     private fun closeDescriptor() {
+        try { flowSelector?.close() } catch (_: Exception) {}
+        flowSelector = null
+        selectorListen = null
+        selectorToken = null
         try { descriptor?.close() } catch (_: Exception) {}
         descriptor = null
         tunFd = null

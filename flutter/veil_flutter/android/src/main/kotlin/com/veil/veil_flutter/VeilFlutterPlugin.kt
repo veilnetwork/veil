@@ -375,6 +375,8 @@ class VeilFlutterPlugin : FlutterPlugin, MethodCallHandler, ActivityAware,
         "phase" to VeilVpnService.phase,
         "detail" to VeilVpnService.detail,
         "tunFd" to VeilVpnService.tunFd,
+        "selectorListen" to VeilVpnService.selectorListen,
+        "selectorToken" to VeilVpnService.selectorToken,
     )
 
     private fun launchVpnInterface(arguments: Map<*, *>, result: Result) {
@@ -383,6 +385,8 @@ class VeilFlutterPlugin : FlutterPlugin, MethodCallHandler, ActivityAware,
             return
         }
         val policy = arguments["policy"] as? Map<*, *> ?: emptyMap<Any, Any>()
+        val applicationProxyListens = arguments["applicationProxyListens"] as? Map<*, *>
+            ?: emptyMap<Any, Any>()
         val intent = Intent(ctx, VeilVpnService::class.java).apply {
             action = VeilVpnService.ACTION_START
             putExtra(VeilVpnService.EXTRA_ROUTE_MODE, policy["routeMode"] as? String ?: "allTraffic")
@@ -408,6 +412,12 @@ class VeilFlutterPlugin : FlutterPlugin, MethodCallHandler, ActivityAware,
             putStringArrayListExtra(
                 VeilVpnService.EXTRA_APPLICATION_IDS,
                 ArrayList((policy["applicationIds"] as? List<*>)?.filterIsInstance<String>() ?: emptyList()),
+            )
+            putStringArrayListExtra(
+                VeilVpnService.EXTRA_APPLICATION_PROXY_ROUTES,
+                ArrayList(applicationProxyListens.entries.mapNotNull { (applicationId, listen) ->
+                    if (applicationId is String && listen is String) "$applicationId\t$listen" else null
+                }),
             )
         }
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
