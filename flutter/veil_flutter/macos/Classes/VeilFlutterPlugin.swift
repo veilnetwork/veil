@@ -139,6 +139,7 @@ public class VeilFlutterPlugin: NSObject, FlutterPlugin {
       tunnelProtocol.serverAddress = "xVeil extension-owned upstream"
       var providerConfiguration = policy
       providerConfiguration["exitNodeId"] = exitNodeId
+      providerConfiguration["exitNodeIds"] = arguments["exitNodeIds"] ?? [exitNodeId]
       providerConfiguration["obfs4Psk"] = obfs4Psk
       tunnelProtocol.providerConfiguration = providerConfiguration
       manager.protocolConfiguration = tunnelProtocol
