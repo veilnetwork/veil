@@ -25,6 +25,8 @@ class VeilVpnService : VpnService() {
         const val EXTRA_DNS = "dnsServers"
         const val EXTRA_ALLOW_LAN = "allowLan"
         const val EXTRA_MTU = "mtu"
+        const val EXTRA_APPLICATION_MODE = "applicationMode"
+        const val EXTRA_APPLICATION_IDS = "applicationIds"
 
         const val PHASE_STOPPED = "stopped"
         const val PHASE_STARTING = "starting"
@@ -91,6 +93,10 @@ class VeilVpnService : VpnService() {
             val dnsServers = intent.getStringArrayListExtra(EXTRA_DNS) ?: arrayListOf("1.1.1.1")
             val allowLan = intent.getBooleanExtra(EXTRA_ALLOW_LAN, true)
             val mtu = intent.getIntExtra(EXTRA_MTU, 1280)
+            val applicationMode = intent.getStringExtra(EXTRA_APPLICATION_MODE)
+                ?: "allApplications"
+            val applicationIds = intent.getStringArrayListExtra(EXTRA_APPLICATION_IDS)
+                ?: arrayListOf()
 
             if (mtu !in 1280..9000) error("MTU must be between 1280 and 9000")
             stage = "configure tunnel addresses"
@@ -100,10 +106,33 @@ class VeilVpnService : VpnService() {
                 .addAddress("198.18.0.1", 30)
                 .addAddress("fd00:7665:696c::1", 126)
 
-            // The embedded node and the tunnel's own local SOCKS connection
-            // must use the physical network, otherwise they recursively enter
-            // the TUN. Other apps remain eligible for the VPN.
-            builder.addDisallowedApplication(packageName)
+            stage = "configure VPN applications"
+            when (applicationMode) {
+                "allApplications" -> {
+                    // The embedded node and local SOCKS connection must use
+                    // the physical network, otherwise they re-enter the TUN.
+                    builder.addDisallowedApplication(packageName)
+                }
+                "onlySelected" -> {
+                    val selected = applicationIds.distinct()
+                    if (selected.isEmpty()) error("Select at least one application")
+                    if (selected.size > 256) error("Too many selected applications")
+                    if (selected.contains(packageName)) {
+                        error("xVeil itself cannot be routed through its VPN")
+                    }
+                    selected.forEach { applicationId ->
+                        try {
+                            builder.addAllowedApplication(applicationId)
+                        } catch (error: Exception) {
+                            throw IllegalArgumentException(
+                                "application is unavailable: $applicationId",
+                                error,
+                            )
+                        }
+                    }
+                }
+                else -> error("Unknown application routing mode")
+            }
 
             stage = "configure VPN routes"
             if (routeMode == "includeOnly") {
