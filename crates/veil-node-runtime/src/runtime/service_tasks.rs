@@ -800,6 +800,7 @@ impl NodeRuntime {
             shutdown_tx,
             logger: &self.logger,
             session_tx_registry: Arc::clone(&self.session_tx_registry),
+            dispatcher: Arc::clone(&self.dispatcher),
             local_node_id: self.identity.local_identity.node_id,
             pending_stream_receipts: Arc::clone(&self.dispatcher.pending_stream_receipts),
             veil_stream_rx: Arc::clone(&self.dispatcher.veil_stream_rx),
@@ -1140,13 +1141,26 @@ impl NodeRuntime {
         let ctx = crate::proxy::tasks::ExitProxySpawnCtx {
             config,
             logger: &self.logger,
-            dispatcher: &self.dispatcher,
+            dispatcher: Arc::clone(&self.dispatcher),
             app_registry: Arc::clone(&self.app_registry),
             session_tx_registry: Arc::clone(&self.session_tx_registry),
         };
         if let Some(handle) = crate::proxy::tasks::spawn_exit_proxy(ctx) {
             lock_tasks(&self.tasks).background.push(handle);
         }
+    }
+
+    /// Spawn the always-available endpoint that terminates E2E DHT-routed
+    /// proxy APP frames. Both ingress-only and exit-only nodes need it because
+    /// receipts and stream data travel in both directions.
+    pub fn spawn_routed_app_frames_task(&mut self) {
+        let handle = crate::proxy::routed_frames::spawn_routed_app_frame_endpoint(
+            Arc::clone(&self.dispatcher),
+            Arc::clone(&self.app_registry),
+            Arc::clone(&self.session_tx_registry),
+            Arc::clone(&self.logger),
+        );
+        lock_tasks(&self.tasks).background.push(handle);
     }
 
     /// Spawn the bootstrap task.
