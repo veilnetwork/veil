@@ -45,10 +45,9 @@ public class VeilFlutterPlugin: NSObject, FlutterPlugin {
     private static let LIFECYCLE_CHANNEL = "veil_flutter/lifecycle"
     private static let PUSH_CHANNEL      = "veil_flutter/push"
     private static let VPN_CHANNEL       = "network.veil.xveil/vpn"
-    // A full-tunnel default route also captures the containing app's overlay
-    // sockets. Keep start fail-closed until the veil node/SOCKS upstream runs
-    // inside PacketTunnel (which also survives iOS host-app suspension).
-    private static let VPN_HAS_EXTENSION_OWNED_UPSTREAM = false
+    // PacketTunnel owns a separate ephemeral Veil/SOCKS node. It survives host
+    // suspension and its provider-owned sockets stay outside the default route.
+    private static let VPN_HAS_EXTENSION_OWNED_UPSTREAM = true
     private static let BG_TASK_IDENTIFIER = "com.veil.veil_flutter.refresh"
 
     // Keychain coordinates for the APNs device token.  Service identifier
@@ -285,8 +284,10 @@ public class VeilFlutterPlugin: NSObject, FlutterPlugin {
         }
         guard let arguments = arguments as? [String: Any],
               let policy = arguments["policy"] as? [String: Any],
-              let socks5Listen = arguments["socks5Listen"] as? String,
-              !socks5Listen.isEmpty,
+              let exitNodeId = arguments["exitNodeId"] as? String,
+              exitNodeId.count == 64,
+              let obfs4Psk = arguments["obfs4Psk"] as? String,
+              !obfs4Psk.isEmpty,
               let providerBundleIdentifier = Self.packetTunnelBundleIdentifier
         else {
             finish(result, Self.vpnState("error", detail: "invalid VPN arguments"))
@@ -301,9 +302,10 @@ public class VeilFlutterPlugin: NSObject, FlutterPlugin {
             let manager = existing ?? NETunnelProviderManager()
             let tunnelProtocol = NETunnelProviderProtocol()
             tunnelProtocol.providerBundleIdentifier = providerBundleIdentifier
-            tunnelProtocol.serverAddress = "xVeil local SOCKS5"
+            tunnelProtocol.serverAddress = "xVeil extension-owned upstream"
             var providerConfiguration = policy
-            providerConfiguration["socks5Listen"] = socks5Listen
+            providerConfiguration["exitNodeId"] = exitNodeId
+            providerConfiguration["obfs4Psk"] = obfs4Psk
             tunnelProtocol.providerConfiguration = providerConfiguration
             manager.protocolConfiguration = tunnelProtocol
             manager.localizedDescription = "xVeil"

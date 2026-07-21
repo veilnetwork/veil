@@ -36,7 +36,7 @@ packet-tunnel = ["dep:tun2proxy", "dep:tun", "dep:serde", "dep:serde_json"]
 # veil-node-runtime with NO default features (in-memory DHT) to keep the heavy
 # C++ RocksDB cold store off mobile. Add `node-embedded-rocksdb` for a
 # persistent DHT on desktop/server.
-node-embedded = ["dep:veil-node-runtime", "dep:veil-cfg", "dep:veil-util"]
+node-embedded = ["dep:veil-node-runtime", "dep:veil-cfg", "dep:veil-util", "dep:tempfile"]
 node-embedded-rocksdb = ["node-embedded", "veil-node-runtime/rocksdb-cold"]
 
 [dependencies]
@@ -99,6 +99,7 @@ tun2proxy = { version = "=0.8.2", default-features = false, optional = true }
 tun = { version = "=0.8.13", features = ["async"], optional = true }
 serde = { version = "1", features = ["derive"], optional = true }
 serde_json = { version = "1", optional = true }
+tempfile = { version = "3", optional = true }
 
 # Android: route the embedded node's `log` output to logcat so the in-process
 # node is debuggable on-device (Rust stderr is NOT captured by logcat).
@@ -106,7 +107,6 @@ serde_json = { version = "1", optional = true }
 android_logger = "0.13"
 
 [dev-dependencies]
-tempfile = "3"
 veil-proto = { path = "../veil-proto" }
 
 [lints]

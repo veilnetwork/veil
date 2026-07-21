@@ -9,10 +9,9 @@ import NetworkExtension
 /// operating-system packet flow.
 public class VeilFlutterPlugin: NSObject, FlutterPlugin {
   private static let vpnChannel = "network.veil.xveil/vpn"
-  // The full-tunnel route also captures the host app's overlay sockets. Keep
-  // start fail-closed until veil/SOCKS is owned by PacketTunnel rather than by
-  // the containing Flutter process.
-  private static let hasExtensionOwnedUpstream = false
+  // PacketTunnel owns a separate ephemeral Veil/SOCKS node, so its overlay
+  // sockets remain outside the default route and do not depend on the host.
+  private static let hasExtensionOwnedUpstream = true
 
   public static func register(with registrar: FlutterPluginRegistrar) {
     let channel = FlutterMethodChannel(
@@ -119,8 +118,10 @@ public class VeilFlutterPlugin: NSObject, FlutterPlugin {
     }
     guard let arguments = arguments as? [String: Any],
           let policy = arguments["policy"] as? [String: Any],
-          let socks5Listen = arguments["socks5Listen"] as? String,
-          !socks5Listen.isEmpty,
+          let exitNodeId = arguments["exitNodeId"] as? String,
+          exitNodeId.count == 64,
+          let obfs4Psk = arguments["obfs4Psk"] as? String,
+          !obfs4Psk.isEmpty,
           let providerBundleIdentifier = Self.packetTunnelBundleIdentifier
     else {
       finish(result, Self.state("error", detail: "invalid VPN arguments"))
@@ -135,9 +136,10 @@ public class VeilFlutterPlugin: NSObject, FlutterPlugin {
       let manager = existing ?? NETunnelProviderManager()
       let tunnelProtocol = NETunnelProviderProtocol()
       tunnelProtocol.providerBundleIdentifier = providerBundleIdentifier
-      tunnelProtocol.serverAddress = "xVeil local SOCKS5"
+      tunnelProtocol.serverAddress = "xVeil extension-owned upstream"
       var providerConfiguration = policy
-      providerConfiguration["socks5Listen"] = socks5Listen
+      providerConfiguration["exitNodeId"] = exitNodeId
+      providerConfiguration["obfs4Psk"] = obfs4Psk
       tunnelProtocol.providerConfiguration = providerConfiguration
       manager.protocolConfiguration = tunnelProtocol
       manager.localizedDescription = "xVeil"
