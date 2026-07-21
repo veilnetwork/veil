@@ -2695,6 +2695,35 @@ VeilNode *veil_node_start_deferred(const uint8_t *admin_socket_ptr,
 
 #if defined(VEIL_FFI_NODE_EMBEDDED)
 /**
+ * Start a dedicated, ephemeral Veil node that owns the SOCKS5 upstream for an
+ * Apple Packet Tunnel extension.
+ *
+ * The messaging identity is deliberately not accepted by this API. A fresh
+ * leaf identity lives only in a mode-0700 temporary runtime directory; the
+ * already-bundled deployment-wide obfs4 key is copied there mode 0600.
+ * Persistence is disabled and the directory is removed on stop. This keeps
+ * iOS host suspension from killing the upstream
+ * and keeps the extension's own overlay sockets outside its default route.
+ * `listen_out` receives the selected loopback `host:port` and must be freed
+ * with [`crate::veil_free_string`].
+ *
+ * # Safety
+ * The node-id and PSK pointers must point to their respective readable UTF-8
+ * byte lengths; `listen_out` and `err_out` must be writable pointer slots when
+ * non-null.
+ */
+
+VeilNode *veil_vpn_upstream_start(const uint8_t *exit_node_id_ptr,
+                                  size_t exit_node_id_len,
+                                  const uint8_t *obfs4_psk_ptr,
+                                  size_t obfs4_psk_len,
+                                  char **listen_out,
+                                  char **err_out)
+;
+#endif
+
+#if defined(VEIL_FFI_NODE_EMBEDDED)
+/**
  * Promote a deferred-init node to its real identity by applying `config_toml`
  * (`(ptr, len)`, UTF-8 — e.g. the bytes returned by `veil_config_init` and
  * kept in the host's deniable storage) over the node's admin socket, IN MEMORY

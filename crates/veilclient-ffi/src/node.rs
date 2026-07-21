@@ -57,6 +57,19 @@ pub struct VeilNode {
     /// deferred node to its real (host-supplied) identity. `None` for nodes
     /// started from a config file (their admin socket lives in that config).
     admin_socket: Option<PathBuf>,
+    /// Optional caller-owned runtime directory. The Apple VPN upstream keeps
+    /// its ephemeral config, identity-derived runtime files and obfs4 key here
+    /// for exactly as long as the node handle is alive.
+    owned_runtime_dir: Option<tempfile::TempDir>,
+}
+
+fn provision_identity() -> Result<veil_cfg::IdentityConfig, String> {
+    use veil_cfg::identity_ops::{IdentityPowParams, IdentityProvisionParams, IdentityUseCases};
+
+    let defaults = IdentityProvisionParams::default();
+    IdentityUseCases::new(IdentityPowParams::default())
+        .provision(defaults.algo, None)
+        .map_err(|error| format!("identity provisioning failed: {error}"))
 }
 
 /// Write an owned error string into `*err_out` (freed by `veil_free_string`).
@@ -92,19 +105,20 @@ pub unsafe extern "C" fn veil_config_init(
 ) -> *mut c_char {
     use veil_cfg::identity_ops::{IdentityPowParams, IdentityProvisionParams, IdentityUseCases};
 
-    let defaults = IdentityProvisionParams::default();
-    let pow = if difficulty == 0 {
-        IdentityPowParams::default()
+    let identity = match if difficulty == 0 {
+        provision_identity()
     } else {
-        IdentityPowParams {
+        let defaults = IdentityProvisionParams::default();
+        IdentityUseCases::new(IdentityPowParams {
             difficulty,
             ..IdentityPowParams::default()
-        }
-    };
-    let identity = match IdentityUseCases::new(pow).provision(defaults.algo, None) {
+        })
+        .provision(defaults.algo, None)
+        .map_err(|error| format!("identity provisioning failed: {error}"))
+    } {
         Ok(id) => id,
         Err(e) => {
-            unsafe { set_err(err_out, &format!("identity provisioning failed: {e}")) };
+            unsafe { set_err(err_out, &e) };
             return std::ptr::null_mut();
         }
     };
@@ -581,12 +595,229 @@ fn start_thread(
             shutdown: Mutex::new(Some(tx)),
             thread: Mutex::new(Some(thread)),
             admin_socket,
+            owned_runtime_dir: None,
         })),
         Err(e) => {
             unsafe { set_err(err_out, &format!("failed to spawn node thread: {e}")) };
             std::ptr::null_mut()
         }
     }
+}
+
+/// Start a dedicated, ephemeral Veil node that owns the SOCKS5 upstream for an
+/// Apple Packet Tunnel extension.
+///
+/// The messaging identity is deliberately not accepted by this API. A fresh
+/// leaf identity lives only in a mode-0700 temporary runtime directory; the
+/// already-bundled deployment-wide obfs4 key is copied there mode 0600.
+/// Persistence is disabled and the directory is removed on stop. This keeps
+/// iOS host suspension from killing the upstream
+/// and keeps the extension's own overlay sockets outside its default route.
+/// `listen_out` receives the selected loopback `host:port` and must be freed
+/// with [`crate::veil_free_string`].
+///
+/// # Safety
+/// The node-id and PSK pointers must point to their respective readable UTF-8
+/// byte lengths; `listen_out` and `err_out` must be writable pointer slots when
+/// non-null.
+#[cfg(feature = "packet-tunnel")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn veil_vpn_upstream_start(
+    exit_node_id_ptr: *const u8,
+    exit_node_id_len: size_t,
+    obfs4_psk_ptr: *const u8,
+    obfs4_psk_len: size_t,
+    listen_out: *mut *mut c_char,
+    err_out: *mut *mut c_char,
+) -> *mut VeilNode {
+    if !listen_out.is_null() {
+        unsafe { *listen_out = std::ptr::null_mut() };
+    }
+    let Some(exit_node_id) =
+        (unsafe { read_arg(exit_node_id_ptr, exit_node_id_len, "exit_node_id", err_out) })
+    else {
+        return std::ptr::null_mut();
+    };
+    if veil_util::hex_to_array::<32>(&exit_node_id).is_err() {
+        unsafe { set_err(err_out, "exit_node_id must be 64 hexadecimal characters") };
+        return std::ptr::null_mut();
+    }
+    let Some(obfs4_psk) = (unsafe { read_arg(obfs4_psk_ptr, obfs4_psk_len, "obfs4_psk", err_out) })
+    else {
+        return std::ptr::null_mut();
+    };
+    use base64::Engine as _;
+    let obfs4_psk = obfs4_psk.trim();
+    match base64::engine::general_purpose::STANDARD.decode(obfs4_psk) {
+        Ok(value) if value.len() == 32 => {}
+        Ok(value) => {
+            unsafe {
+                set_err(
+                    err_out,
+                    &format!("obfs4_psk must decode to 32 bytes, got {}", value.len()),
+                )
+            };
+            return std::ptr::null_mut();
+        }
+        Err(error) => {
+            unsafe { set_err(err_out, &format!("obfs4_psk is invalid base64: {error}")) };
+            return std::ptr::null_mut();
+        }
+    }
+    if listen_out.is_null() {
+        unsafe { set_err(err_out, "listen_out is null") };
+        return std::ptr::null_mut();
+    }
+
+    let reservation = match std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)) {
+        Ok(listener) => listener,
+        Err(error) => {
+            unsafe { set_err(err_out, &format!("reserve SOCKS5 listener failed: {error}")) };
+            return std::ptr::null_mut();
+        }
+    };
+    let listen = match reservation.local_addr() {
+        Ok(address) => address.to_string(),
+        Err(error) => {
+            unsafe { set_err(err_out, &format!("read SOCKS5 listener failed: {error}")) };
+            return std::ptr::null_mut();
+        }
+    };
+
+    let runtime_dir = match tempfile::Builder::new().prefix("veil-vpn-").tempdir() {
+        Ok(directory) => directory,
+        Err(error) => {
+            unsafe {
+                set_err(
+                    err_out,
+                    &format!("create VPN runtime directory failed: {error}"),
+                )
+            };
+            return std::ptr::null_mut();
+        }
+    };
+    let psk_path = runtime_dir.path().join("obfs4_psk.b64");
+    use std::io::Write as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+    let psk_write = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&psk_path)
+        .and_then(|mut file| file.write_all(obfs4_psk.as_bytes()));
+    if let Err(error) = psk_write {
+        unsafe { set_err(err_out, &format!("write VPN obfs4 PSK failed: {error}")) };
+        return std::ptr::null_mut();
+    }
+    let mut identity = match provision_identity() {
+        Ok(identity) => identity,
+        Err(error) => {
+            unsafe { set_err(err_out, &error) };
+            return std::ptr::null_mut();
+        }
+    };
+    identity.role = veil_types::NodeRole::Leaf;
+    identity.lazy_mining = false;
+    identity.max_lazy_difficulty = 0;
+
+    let mut config = veil_cfg::Config {
+        identity: Some(identity),
+        persist_enabled: false,
+        ..veil_cfg::Config::default()
+    };
+    config.transport.obfs4_psk_file = Some(psk_path);
+    config.proxy.socks5.enabled = true;
+    config.proxy.socks5.listen = listen.clone();
+    config.proxy.socks5.exit_node_id = Some(exit_node_id);
+    let config_toml = match veil_cfg::render_config_to_string(&config) {
+        Ok(toml) => toml,
+        Err(error) => {
+            unsafe {
+                set_err(
+                    err_out,
+                    &format!("render VPN upstream config failed: {error}"),
+                )
+            };
+            return std::ptr::null_mut();
+        }
+    };
+
+    let config_path = runtime_dir.path().join("node.toml");
+    let config_write = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&config_path)
+        .and_then(|mut file| file.write_all(config_toml.as_bytes()));
+    if let Err(error) = config_write {
+        unsafe { set_err(err_out, &format!("write VPN node config failed: {error}")) };
+        return std::ptr::null_mut();
+    }
+    let Some(config_path_utf8) = config_path.to_str() else {
+        unsafe { set_err(err_out, "VPN node config path is not valid UTF-8") };
+        return std::ptr::null_mut();
+    };
+
+    // Release the reservation immediately before the runtime binds the chosen
+    // address. If another process wins the tiny race, start fails closed.
+    drop(reservation);
+    let mut start_error = std::ptr::null_mut();
+    let node = unsafe {
+        veil_node_start(
+            config_path_utf8.as_ptr(),
+            config_path_utf8.len(),
+            &mut start_error,
+        )
+    };
+    if node.is_null() {
+        let detail = if start_error.is_null() {
+            "unknown error".to_owned()
+        } else {
+            unsafe { CString::from_raw(start_error) }
+                .to_string_lossy()
+                .into_owned()
+        };
+        unsafe { set_err(err_out, &format!("start VPN upstream failed: {detail}")) };
+        return std::ptr::null_mut();
+    }
+    unsafe { (*node).owned_runtime_dir = Some(runtime_dir) };
+
+    let address = match listen.parse::<std::net::SocketAddr>() {
+        Ok(address) => address,
+        Err(error) => {
+            unsafe { veil_node_stop(node) };
+            unsafe {
+                set_err(
+                    err_out,
+                    &format!("invalid selected SOCKS5 address: {error}"),
+                )
+            };
+            return std::ptr::null_mut();
+        }
+    };
+    let ready = (0..200).any(|_| {
+        if std::net::TcpStream::connect_timeout(&address, Duration::from_millis(100)).is_ok() {
+            true
+        } else {
+            std::thread::sleep(Duration::from_millis(50));
+            false
+        }
+    });
+    if !ready {
+        unsafe { veil_node_stop(node) };
+        unsafe { set_err(err_out, "VPN SOCKS5 upstream did not become ready") };
+        return std::ptr::null_mut();
+    }
+
+    match CString::new(listen) {
+        Ok(value) => unsafe { *listen_out = value.into_raw() },
+        Err(_) => {
+            unsafe { veil_node_stop(node) };
+            unsafe { set_err(err_out, "selected SOCKS5 address contained NUL") };
+            return std::ptr::null_mut();
+        }
+    }
+    node
 }
 
 /// Promote a deferred-init node to its real identity by applying `config_toml`
@@ -715,6 +946,73 @@ pub unsafe extern "C" fn veil_node_stop(node: *mut VeilNode) {
 mod tests {
     use super::*;
     use std::ffi::CStr;
+
+    #[cfg(feature = "packet-tunnel")]
+    #[test]
+    fn vpn_upstream_rejects_non_node_id_before_starting_runtime() {
+        let invalid = b"not-a-node-id";
+        let mut listen: *mut c_char = std::ptr::null_mut();
+        let mut err: *mut c_char = std::ptr::null_mut();
+        let node = unsafe {
+            veil_vpn_upstream_start(
+                invalid.as_ptr(),
+                invalid.len(),
+                std::ptr::null(),
+                0,
+                &mut listen,
+                &mut err,
+            )
+        };
+        assert!(node.is_null());
+        assert!(listen.is_null());
+        assert!(!err.is_null());
+        let detail = unsafe { CStr::from_ptr(err) }.to_string_lossy();
+        assert!(detail.contains("64 hexadecimal"));
+        unsafe { crate::veil_free_string(err) };
+    }
+
+    #[cfg(feature = "packet-tunnel")]
+    #[test]
+    #[ignore = "spawns a full embedded node; run in the Apple VPN build profile"]
+    fn vpn_upstream_owns_a_ready_loopback_socks_lifecycle() {
+        use base64::Engine as _;
+        let exit_node_id = b"0000000000000000000000000000000000000000000000000000000000000000";
+        let obfs4_psk = base64::engine::general_purpose::STANDARD.encode([0x42; 32]);
+        let mut listen: *mut c_char = std::ptr::null_mut();
+        let mut err: *mut c_char = std::ptr::null_mut();
+        let node = unsafe {
+            veil_vpn_upstream_start(
+                exit_node_id.as_ptr(),
+                exit_node_id.len(),
+                obfs4_psk.as_ptr(),
+                obfs4_psk.len(),
+                &mut listen,
+                &mut err,
+            )
+        };
+        let detail = if err.is_null() {
+            String::new()
+        } else {
+            unsafe { CStr::from_ptr(err) }
+                .to_string_lossy()
+                .into_owned()
+        };
+        assert!(!node.is_null(), "{detail}");
+        assert!(!listen.is_null(), "{detail}");
+        let address = unsafe { CStr::from_ptr(listen) }
+            .to_str()
+            .unwrap()
+            .parse::<std::net::SocketAddr>()
+            .unwrap();
+        assert!(std::net::TcpStream::connect(address).is_ok());
+        unsafe {
+            crate::veil_free_string(listen);
+            if !err.is_null() {
+                crate::veil_free_string(err);
+            }
+            veil_node_stop(node);
+        }
+    }
 
     /// Onboarding-phrase epic P2: the identity config is DETERMINISTIC in the
     /// phrase (same public_key + node_id across calls — a later restore lands
@@ -947,6 +1245,7 @@ mod tests {
             shutdown: Mutex::new(None),
             thread: Mutex::new(None),
             admin_socket: None,
+            owned_runtime_dir: None,
         };
         let mut err: *mut c_char = std::ptr::null_mut();
         let toml = b"[global]\n";
