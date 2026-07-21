@@ -139,6 +139,36 @@ class VeilFlutterPlugin : FlutterPlugin, MethodCallHandler, ActivityAware,
             "probe", "status" -> {
                 result.success(vpnStateMap())
             }
+            "listApplications" -> {
+                try {
+                    val launcherIntent = Intent(Intent.ACTION_MAIN).apply {
+                        addCategory(Intent.CATEGORY_LAUNCHER)
+                    }
+                    val applications = ctx.packageManager
+                        .queryIntentActivities(launcherIntent, 0)
+                        .asSequence()
+                        .map { info ->
+                            val id = info.activityInfo.packageName
+                            mapOf(
+                                "id" to id,
+                                "label" to info.loadLabel(ctx.packageManager).toString(),
+                            )
+                        }
+                        // xVeil's own overlay and SOCKS sockets must remain on
+                        // the physical network to avoid recursive capture.
+                        .filter { it["id"] != ctx.packageName }
+                        .distinctBy { it["id"] }
+                        .sortedWith(compareBy(String.CASE_INSENSITIVE_ORDER) { it["label"] ?: "" })
+                        .toList()
+                    result.success(applications)
+                } catch (error: Exception) {
+                    result.error(
+                        "VPN_APPLICATIONS",
+                        error.message ?: "Could not list installed applications",
+                        null,
+                    )
+                }
+            }
             "start" -> {
                 val args = call.arguments as? Map<*, *>
                 val act = activity
@@ -371,6 +401,14 @@ class VeilFlutterPlugin : FlutterPlugin, MethodCallHandler, ActivityAware,
             )
             putExtra(VeilVpnService.EXTRA_ALLOW_LAN, policy["allowLan"] as? Boolean ?: true)
             putExtra(VeilVpnService.EXTRA_MTU, (policy["mtu"] as? Number)?.toInt() ?: 1280)
+            putExtra(
+                VeilVpnService.EXTRA_APPLICATION_MODE,
+                policy["applicationMode"] as? String ?: "allApplications",
+            )
+            putStringArrayListExtra(
+                VeilVpnService.EXTRA_APPLICATION_IDS,
+                ArrayList((policy["applicationIds"] as? List<*>)?.filterIsInstance<String>() ?: emptyList()),
+            )
         }
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             ctx.startForegroundService(intent)
