@@ -32,6 +32,7 @@ pub(crate) struct Socks5SpawnCtx<'a> {
     pub logger: &'a Arc<NodeLogger>,
     pub session_tx_registry: Arc<StdRwLock<SessionTxRegistry>>,
     pub dispatcher: Arc<FrameDispatcher>,
+    pub mlkem_ek_resolver: Arc<dyn veil_types::MlKemEkResolver>,
     pub local_node_id: NodeId,
     pub pending_stream_receipts: PendingReceiptMap,
     pub veil_stream_rx: VeilStreamRxMap,
@@ -64,6 +65,7 @@ pub(crate) fn spawn_socks5(ctx: Socks5SpawnCtx<'_>) -> Option<JoinHandle<()>> {
     let broadcaster: Arc<dyn veil_types::FrameBroadcaster> = Arc::new(RoutedFrameBroadcaster::new(
         ctx.session_tx_registry,
         ctx.dispatcher,
+        ctx.mlkem_ek_resolver,
     ));
     let connector = Arc::new(veil_proxy::VeilConnector::new(
         broadcaster,
@@ -102,6 +104,7 @@ pub(crate) struct ExitProxySpawnCtx<'a> {
     pub dispatcher: Arc<FrameDispatcher>,
     pub app_registry: Arc<AppEndpointRegistry>,
     pub session_tx_registry: Arc<StdRwLock<SessionTxRegistry>>,
+    pub mlkem_ek_resolver: Arc<dyn veil_types::MlKemEkResolver>,
 }
 
 /// Spawn the exit-proxy accept loop. Registers the well-known
@@ -126,6 +129,7 @@ pub(crate) fn spawn_exit_proxy(ctx: ExitProxySpawnCtx<'_>) -> Option<JoinHandle<
     let broadcaster: Arc<dyn veil_types::FrameBroadcaster> = Arc::new(RoutedFrameBroadcaster::new(
         ctx.session_tx_registry,
         Arc::clone(&ctx.dispatcher),
+        ctx.mlkem_ek_resolver,
     ));
     let exit_enabled = ctx.config.proxy.exit.enabled;
     let allow_private = ctx.config.proxy.exit.allow_private;

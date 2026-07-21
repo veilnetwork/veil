@@ -7,7 +7,10 @@
 //! authenticated original sender, preserving the `(node_id, stream_id)` keys
 //! used by APP_OPEN / APP_DATA / APP_RECEIPT / APP_CLOSE.
 
-use std::sync::{Arc, RwLock};
+use std::{
+    collections::HashSet,
+    sync::{Arc, Mutex, RwLock},
+};
 
 use rand_core::RngCore;
 use veil_app::AppMessage;
@@ -77,17 +80,53 @@ fn build_routed_envelope(
 pub struct RoutedFrameBroadcaster {
     direct: SessionTxBroadcaster,
     dispatcher: Arc<FrameDispatcher>,
+    mlkem_ek_resolver: Arc<dyn veil_types::MlKemEkResolver>,
+    pending_key_lookups: Arc<Mutex<HashSet<[u8; 32]>>>,
 }
 
 impl RoutedFrameBroadcaster {
     pub fn new(
         session_tx_registry: Arc<RwLock<SessionTxRegistry>>,
         dispatcher: Arc<FrameDispatcher>,
+        mlkem_ek_resolver: Arc<dyn veil_types::MlKemEkResolver>,
     ) -> Self {
         Self {
             direct: SessionTxBroadcaster::new(session_tx_registry),
             dispatcher,
+            mlkem_ek_resolver,
+            pending_key_lookups: Arc::new(Mutex::new(HashSet::new())),
         }
+    }
+
+    fn resolve_key_once(&self, destination: [u8; 32]) {
+        {
+            let mut pending = self
+                .pending_key_lookups
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            if !pending.insert(destination) {
+                return;
+            }
+        }
+        let resolver = Arc::clone(&self.mlkem_ek_resolver);
+        let pending = Arc::clone(&self.pending_key_lookups);
+        tokio::spawn(async move {
+            if resolver.resolve_ek(destination).await.is_some() {
+                log::info!(
+                    "proxy.routed.key_resolved destination={}",
+                    veil_util::hex_short(&destination),
+                );
+            } else {
+                log::warn!(
+                    "proxy.routed.key_resolution_failed destination={}",
+                    veil_util::hex_short(&destination),
+                );
+            }
+            pending
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .remove(&destination);
+        });
     }
 
     fn signal_route_discovery(&self, destination: [u8; 32], priority: u8) {
@@ -108,11 +147,13 @@ impl RoutedFrameBroadcaster {
         // it must never become a generic bypass around family-specific relay
         // admission and abuse controls.
         let Ok(header) = decode_header(&frame) else {
+            log::warn!("proxy.routed.invalid_app_frame reason=header");
             return false;
         };
         if header.family != FrameFamily::App as u8
             || frame.len() != HEADER_SIZE.saturating_add(header.body_len as usize)
         {
+            log::warn!("proxy.routed.invalid_app_frame reason=shape");
             return false;
         }
 
@@ -123,6 +164,11 @@ impl RoutedFrameBroadcaster {
             .get(destination)
             .map(|(key, _)| key.clone());
         let Some(recipient_ek) = recipient_ek else {
+            // Route discovery carries the next hop, but it does not by itself
+            // populate the recipient's verified ML-KEM key. Start the same DHT
+            // identity/certificate walk used by IPC sends and let the caller's
+            // bounded retry observe the write-through cache on completion.
+            self.resolve_key_once(*destination);
             self.signal_route_discovery(*destination, priority);
             return false;
         };
@@ -196,6 +242,7 @@ pub fn spawn_routed_app_frame_endpoint(
     dispatcher: Arc<FrameDispatcher>,
     app_registry: Arc<veil_app::AppEndpointRegistry>,
     session_tx_registry: Arc<RwLock<SessionTxRegistry>>,
+    mlkem_ek_resolver: Arc<dyn veil_types::MlKemEkResolver>,
     logger: Arc<veil_observability::NodeLogger>,
 ) -> tokio::task::JoinHandle<()> {
     let (endpoint_handle, mut receiver) =
@@ -203,6 +250,7 @@ pub fn spawn_routed_app_frame_endpoint(
     let broadcaster = Arc::new(RoutedFrameBroadcaster::new(
         session_tx_registry,
         Arc::clone(&dispatcher),
+        mlkem_ek_resolver,
     ));
     let response_slots = Arc::new(tokio::sync::Semaphore::new(MAX_PENDING_RESPONSES));
 
