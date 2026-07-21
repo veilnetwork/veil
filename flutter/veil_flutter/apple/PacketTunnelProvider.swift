@@ -79,7 +79,7 @@ private enum ParsedRoute {
 }
 
 private struct VeilTunnelConfiguration {
-    let exitNodeId: String
+    let exitNodeIds: [String]
     let obfs4Psk: String
     let routeMode: String
     let includedRoutes: [ParsedRoute]
@@ -90,13 +90,20 @@ private struct VeilTunnelConfiguration {
     let mtu: UInt16
 
     init(_ raw: [String: Any]) throws {
-        guard let exitNodeId = raw["exitNodeId"] as? String,
-              exitNodeId.count == 64,
-              exitNodeId.allSatisfy({ $0.isHexDigit })
+        let configuredExitNodeIds = Self.strings(raw["exitNodeIds"])
+        let legacyExitNodeId = raw["exitNodeId"] as? String
+        let exitNodeIds = configuredExitNodeIds.isEmpty
+            ? legacyExitNodeId.map { [$0] } ?? []
+            : configuredExitNodeIds
+        guard !exitNodeIds.isEmpty,
+              exitNodeIds.count <= 32,
+              exitNodeIds.allSatisfy({
+                  $0.count == 64 && $0.allSatisfy(\.isHexDigit)
+              })
         else {
-            throw VeilPacketTunnelError.invalidConfiguration("invalid exit node ID")
+            throw VeilPacketTunnelError.invalidConfiguration("invalid exit node chain")
         }
-        self.exitNodeId = exitNodeId
+        self.exitNodeIds = exitNodeIds
         guard let obfs4Psk = raw["obfs4Psk"] as? String,
               !obfs4Psk.isEmpty
         else {
@@ -198,7 +205,7 @@ public final class PacketTunnelProvider: NEPacketTunnelProvider {
                 }
                 let configuration = try VeilTunnelConfiguration(raw)
                 let socks5Listen = try self.startUpstream(
-                    configuration.exitNodeId,
+                    configuration.exitNodeIds,
                     obfs4Psk: configuration.obfs4Psk
                 )
                 self.configuredMTU = Int(configuration.mtu)
@@ -393,10 +400,10 @@ public final class PacketTunnelProvider: NEPacketTunnelProvider {
         cancelTunnelWithError(error)
     }
 
-    private func startUpstream(_ exitNodeId: String, obfs4Psk: String) throws -> String {
+    private func startUpstream(_ exitNodeIds: [String], obfs4Psk: String) throws -> String {
         var listenPointer: UnsafeMutablePointer<CChar>?
         var errorPointer: UnsafeMutablePointer<CChar>?
-        let bytes = Array(exitNodeId.utf8)
+        let bytes = Array(exitNodeIds.joined(separator: ",").utf8)
         let pskBytes = Array(obfs4Psk.utf8)
         let node = bytes.withUnsafeBufferPointer { buffer in
             pskBytes.withUnsafeBufferPointer { pskBuffer in

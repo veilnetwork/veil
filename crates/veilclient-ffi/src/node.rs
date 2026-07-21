@@ -604,6 +604,25 @@ fn start_thread(
     }
 }
 
+#[cfg(feature = "packet-tunnel")]
+fn parse_vpn_exit_node_ids(value: &str) -> Result<Vec<String>, &'static str> {
+    let exit_node_ids = value
+        .split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .collect::<Vec<_>>();
+    if exit_node_ids.is_empty() || exit_node_ids.len() > 32 {
+        return Err("exit_node_id chain must contain 1..32 node IDs");
+    }
+    if exit_node_ids
+        .iter()
+        .any(|node_id| veil_util::hex_to_array::<32>(node_id).is_err())
+    {
+        return Err("every exit_node_id must be 64 hexadecimal characters");
+    }
+    Ok(exit_node_ids.into_iter().map(str::to_owned).collect())
+}
+
 /// Start a dedicated, ephemeral Veil node that owns the SOCKS5 upstream for an
 /// Apple Packet Tunnel extension.
 ///
@@ -617,9 +636,10 @@ fn start_thread(
 /// with [`crate::veil_free_string`].
 ///
 /// # Safety
-/// The node-id and PSK pointers must point to their respective readable UTF-8
-/// byte lengths; `listen_out` and `err_out` must be writable pointer slots when
-/// non-null.
+/// `exit_node_id_ptr` accepts either one node ID or a comma-separated ordered
+/// failover chain. The node-id chain and PSK pointers must point to their
+/// respective readable UTF-8 byte lengths; `listen_out` and `err_out` must be
+/// writable pointer slots when non-null.
 #[cfg(feature = "packet-tunnel")]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn veil_vpn_upstream_start(
@@ -633,15 +653,18 @@ pub unsafe extern "C" fn veil_vpn_upstream_start(
     if !listen_out.is_null() {
         unsafe { *listen_out = std::ptr::null_mut() };
     }
-    let Some(exit_node_id) =
+    let Some(exit_node_id_chain) =
         (unsafe { read_arg(exit_node_id_ptr, exit_node_id_len, "exit_node_id", err_out) })
     else {
         return std::ptr::null_mut();
     };
-    if veil_util::hex_to_array::<32>(&exit_node_id).is_err() {
-        unsafe { set_err(err_out, "exit_node_id must be 64 hexadecimal characters") };
-        return std::ptr::null_mut();
-    }
+    let exit_node_ids = match parse_vpn_exit_node_ids(&exit_node_id_chain) {
+        Ok(value) => value,
+        Err(detail) => {
+            unsafe { set_err(err_out, detail) };
+            return std::ptr::null_mut();
+        }
+    };
     let Some(obfs4_psk) = (unsafe { read_arg(obfs4_psk_ptr, obfs4_psk_len, "obfs4_psk", err_out) })
     else {
         return std::ptr::null_mut();
@@ -728,7 +751,8 @@ pub unsafe extern "C" fn veil_vpn_upstream_start(
     config.transport.obfs4_psk_file = Some(psk_path);
     config.proxy.socks5.enabled = true;
     config.proxy.socks5.listen = listen.clone();
-    config.proxy.socks5.exit_node_id = Some(exit_node_id);
+    config.proxy.socks5.exit_node_id = exit_node_ids.first().cloned();
+    config.proxy.socks5.exit_node_ids = exit_node_ids;
     let config_toml = match veil_cfg::render_config_to_string(&config) {
         Ok(toml) => toml,
         Err(error) => {
@@ -946,6 +970,17 @@ pub unsafe extern "C" fn veil_node_stop(node: *mut VeilNode) {
 mod tests {
     use super::*;
     use std::ffi::CStr;
+
+    #[cfg(feature = "packet-tunnel")]
+    #[test]
+    fn vpn_upstream_accepts_an_ordered_exit_chain() {
+        let first = "11".repeat(32);
+        let second = "22".repeat(32);
+        assert_eq!(
+            parse_vpn_exit_node_ids(&format!("{first},{second}")),
+            Ok(vec![first, second])
+        );
+    }
 
     #[cfg(feature = "packet-tunnel")]
     #[test]
