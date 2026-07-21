@@ -101,8 +101,8 @@ mod packet_tunnel;
 pub use packet_tunnel::{
     PacketWriteFn, VEIL_TUNNEL_ERROR, VEIL_TUNNEL_RUNNING, VEIL_TUNNEL_STARTING,
     VEIL_TUNNEL_STOPPED, veil_packet_tunnel_last_error, veil_packet_tunnel_send_packet,
-    veil_packet_tunnel_start_fd, veil_packet_tunnel_start_packets, veil_packet_tunnel_status,
-    veil_packet_tunnel_stop,
+    veil_packet_tunnel_start_fd, veil_packet_tunnel_start_fd_routed,
+    veil_packet_tunnel_start_packets, veil_packet_tunnel_status, veil_packet_tunnel_stop,
 };
 
 use libc::{size_t, ssize_t};

@@ -820,7 +820,7 @@ impl NodeRuntime {
             wire_stream_counter: Arc::clone(&self.wire_stream_counter),
             metrics: self.metrics.clone(),
         };
-        if let Some(handle) = crate::proxy::tasks::spawn_socks5(ctx) {
+        for handle in crate::proxy::tasks::spawn_socks5(ctx) {
             lock_tasks(&self.tasks).background.push(handle);
         }
     }
