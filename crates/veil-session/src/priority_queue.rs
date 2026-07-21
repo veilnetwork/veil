@@ -20,6 +20,7 @@ use std::sync::{
     Arc,
     atomic::{AtomicU64, Ordering},
 };
+use std::time::{Duration, Instant};
 
 // ── Public priority constants ─────────────────────────────────────────────────
 
@@ -50,6 +51,25 @@ pub const DEFAULT_WEIGHTS: [u32; 4] = [8, 4, 2, 1];
 /// up to 256 per pass, so steady state is well below this.
 pub const DEFAULT_MAX_DEPTH: usize = 4096;
 
+/// A loss-tolerant media frame is useful only while it is fresh.  Keeping a
+/// large FIFO here turns TCP fallback congestion into seconds of video replay
+/// after the link recovers.  This cap is deliberately independent of the
+/// aggregate queue cap: roughly 64 relay cells cover a few video frames while
+/// bounding the amount of stale realtime work retained per session.
+pub const LOSSY_REALTIME_MAX_DEPTH: usize = 64;
+
+/// Maximum time a loss-tolerant realtime frame may wait in the reorderable
+/// priority queue. Bytes already committed to the socket cannot be recalled,
+/// so dropping here is the last point where newest-wins media semantics can be
+/// preserved on transports without a QUIC DATAGRAM lane.
+pub const LOSSY_REALTIME_MAX_AGE: Duration = Duration::from_millis(500);
+
+struct QueuedFrame {
+    frame: veil_bufpool::PooledShared,
+    enqueued_at: Option<Instant>,
+    lossy_realtime: bool,
+}
+
 // ── PriorityQueue ─────────────────────────────────────────────────────────────
 
 /// In-process WRR priority queue for outgoing OVL1 frames.
@@ -57,7 +77,7 @@ pub const DEFAULT_MAX_DEPTH: usize = 4096;
 /// Frames are stored as `veil_bufpool::PooledShared` so that broadcast callers can share the
 /// same backing buffer across sessions without extra copies.
 pub struct PriorityQueue {
-    queues: [VecDeque<veil_bufpool::PooledShared>; 4],
+    queues: [VecDeque<QueuedFrame>; 4],
     weights: [u32; 4],
     /// Remaining slots in the current WRR round for each priority.
     slots: [u32; 4],
@@ -67,6 +87,7 @@ pub struct PriorityQueue {
     /// `NodeMetrics::priority_queue_drops_total` so overflow surfaces
     /// in Prometheus the same scrape cycle it happens.
     drops_total: Arc<AtomicU64>,
+    lossy_realtime_len: usize,
 }
 
 impl PriorityQueue {
@@ -99,6 +120,7 @@ impl PriorityQueue {
             slots: weights,
             max_depth,
             drops_total,
+            lossy_realtime_len: 0,
         }
     }
 
@@ -116,6 +138,35 @@ impl PriorityQueue {
     /// expense of BULK/BACKGROUND. Drops increment `drops_total` so the
     /// runner can forward them to Prometheus.
     pub fn push(&mut self, priority: u8, frame: veil_bufpool::PooledShared) {
+        self.push_entry(priority, frame, false);
+    }
+
+    /// Enqueue a canonical loss-tolerant realtime frame. When its dedicated
+    /// budget is full, discard the oldest media frame rather than letting a
+    /// reliable-stream fallback replay obsolete RTP after congestion clears.
+    pub fn push_lossy_realtime(&mut self, priority: u8, frame: veil_bufpool::PooledShared) {
+        if priority.min(3) != REALTIME {
+            self.push(priority, frame);
+            return;
+        }
+        if self.lossy_realtime_len >= LOSSY_REALTIME_MAX_DEPTH
+            && let Some(index) = self.queues[REALTIME as usize]
+                .iter()
+                .position(|queued| queued.lossy_realtime)
+        {
+            self.queues[REALTIME as usize].remove(index);
+            self.lossy_realtime_len -= 1;
+            self.drops_total.fetch_add(1, Ordering::Relaxed);
+        }
+        self.push_entry(priority, frame, true);
+    }
+
+    fn push_entry(
+        &mut self,
+        priority: u8,
+        frame: veil_bufpool::PooledShared,
+        lossy_realtime: bool,
+    ) {
         let p = priority.min(3) as usize;
         if self.len() >= self.max_depth {
             // Shed one frame from the lowest priority that has any queued —
@@ -130,7 +181,12 @@ impl PriorityQueue {
             let mut shed = false;
             for shed_p in (p..4).rev() {
                 if !self.queues[shed_p].is_empty() {
-                    self.queues[shed_p].pop_front();
+                    if self.queues[shed_p]
+                        .pop_front()
+                        .is_some_and(|queued| queued.lossy_realtime)
+                    {
+                        self.lossy_realtime_len -= 1;
+                    }
                     self.drops_total.fetch_add(1, Ordering::Relaxed);
                     shed = true;
                     break;
@@ -142,7 +198,14 @@ impl PriorityQueue {
                 return;
             }
         }
-        self.queues[p].push_back(frame);
+        self.queues[p].push_back(QueuedFrame {
+            frame,
+            enqueued_at: lossy_realtime.then(Instant::now),
+            lossy_realtime,
+        });
+        if lossy_realtime {
+            self.lossy_realtime_len += 1;
+        }
     }
 
     /// g: snapshot the cumulative drop count. Caller
@@ -172,9 +235,25 @@ impl PriorityQueue {
 
     fn try_pop_with_current_slots(&mut self) -> Option<veil_bufpool::PooledShared> {
         for p in 0..4 {
-            if self.slots[p] > 0 && !self.queues[p].is_empty() {
+            if self.slots[p] == 0 {
+                continue;
+            }
+            while self.queues[p].front().is_some_and(|queued| {
+                queued.lossy_realtime
+                    && queued
+                        .enqueued_at
+                        .is_some_and(|at| at.elapsed() > LOSSY_REALTIME_MAX_AGE)
+            }) {
+                self.queues[p].pop_front();
+                self.lossy_realtime_len -= 1;
+                self.drops_total.fetch_add(1, Ordering::Relaxed);
+            }
+            if let Some(queued) = self.queues[p].pop_front() {
                 self.slots[p] -= 1;
-                return self.queues[p].pop_front();
+                if queued.lossy_realtime {
+                    self.lossy_realtime_len -= 1;
+                }
+                return Some(queued.frame);
             }
         }
         None
@@ -215,11 +294,28 @@ impl PriorityQueue {
         &mut self,
         predicate: impl FnOnce(&[u8]) -> bool,
     ) -> Option<veil_bufpool::PooledShared> {
+        while self.queues[REALTIME as usize]
+            .front()
+            .is_some_and(|queued| {
+                queued.lossy_realtime
+                    && queued
+                        .enqueued_at
+                        .is_some_and(|at| at.elapsed() > LOSSY_REALTIME_MAX_AGE)
+            })
+        {
+            self.queues[REALTIME as usize].pop_front();
+            self.lossy_realtime_len -= 1;
+            self.drops_total.fetch_add(1, Ordering::Relaxed);
+        }
         let head = self.queues[REALTIME as usize].front()?;
-        predicate(head).then(|| {
-            self.queues[REALTIME as usize]
+        predicate(&head.frame).then(|| {
+            let queued = self.queues[REALTIME as usize]
                 .pop_front()
-                .expect("REALTIME head checked above")
+                .expect("REALTIME head checked above");
+            if queued.lossy_realtime {
+                self.lossy_realtime_len -= 1;
+            }
+            queued.frame
         })
     }
 
@@ -227,7 +323,12 @@ impl PriorityQueue {
     /// The caller has just popped this same frame, so reinsertion cannot exceed
     /// the queue's prior bounded depth.
     pub fn push_realtime_front(&mut self, frame: veil_bufpool::PooledShared) {
-        self.queues[REALTIME as usize].push_front(frame);
+        self.queues[REALTIME as usize].push_front(QueuedFrame {
+            frame,
+            enqueued_at: Some(Instant::now()),
+            lossy_realtime: true,
+        });
+        self.lossy_realtime_len += 1;
     }
 }
 
@@ -266,6 +367,38 @@ mod tests {
         pq.push_realtime_front(first);
         assert_eq!(pq.pop().unwrap().as_ref(), b"rt-a");
         assert_eq!(pq.pop().unwrap().as_ref(), b"rt-b");
+    }
+
+    #[test]
+    fn lossy_realtime_queue_keeps_newest_frames() {
+        let drops = Arc::new(AtomicU64::new(0));
+        let mut pq = PriorityQueue::with_capacity_and_drop_counter(
+            DEFAULT_WEIGHTS,
+            LOSSY_REALTIME_MAX_DEPTH + 8,
+            Arc::clone(&drops),
+        );
+        for i in 0..=LOSSY_REALTIME_MAX_DEPTH {
+            pq.push_lossy_realtime(REALTIME, arc(&(i as u16).to_be_bytes()));
+        }
+        assert_eq!(pq.lossy_realtime_len, LOSSY_REALTIME_MAX_DEPTH);
+        assert_eq!(drops.load(Ordering::Relaxed), 1);
+        assert_eq!(pq.pop().unwrap().as_ref(), 1u16.to_be_bytes());
+    }
+
+    #[test]
+    fn stale_lossy_realtime_is_dropped_before_reliable_control() {
+        let drops = Arc::new(AtomicU64::new(0));
+        let mut pq =
+            PriorityQueue::with_capacity_and_drop_counter(DEFAULT_WEIGHTS, 8, Arc::clone(&drops));
+        pq.push_lossy_realtime(REALTIME, arc(b"old-media"));
+        pq.queues[REALTIME as usize]
+            .front_mut()
+            .unwrap()
+            .enqueued_at = Some(Instant::now() - LOSSY_REALTIME_MAX_AGE - Duration::from_millis(1));
+        pq.push(REALTIME, arc(b"control"));
+        assert_eq!(pq.pop().unwrap().as_ref(), b"control");
+        assert_eq!(drops.load(Ordering::Relaxed), 1);
+        assert_eq!(pq.lossy_realtime_len, 0);
     }
 
     /// 29.5: REALTIME frames sent before BULK frames when both are enqueued.

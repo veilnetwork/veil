@@ -277,6 +277,18 @@ fn decode_realtime_lane_frame(frame: &[u8]) -> Option<(FrameHeader, &[u8], Realt
     Some((header, body, kind))
 }
 
+/// Preserve lossy semantics even when the current transport has no QUIC
+/// DATAGRAM lane. Canonical realtime frames get a small newest-wins budget in
+/// the ordered-stream priority queue; control/keepalive frames retain normal
+/// reliable FIFO behaviour.
+fn enqueue_outbox_frame(pq: &mut PriorityQueue, priority: u8, frame: veil_bufpool::PooledShared) {
+    if priority == veil_proto::priority::REALTIME && decode_realtime_lane_frame(&frame).is_some() {
+        pq.push_lossy_realtime(priority, frame);
+    } else {
+        pq.push(priority, frame);
+    }
+}
+
 fn spawn_realtime_receiver(
     handle: veil_transport::QuicDatagramHandle,
     mut rx: crate::realtime_datagram::RealtimeDatagramRx,
@@ -1704,7 +1716,7 @@ impl SessionRunner {
                 Ok((prio, frame)) => {
                     // chunking is always supported (single protocol version),
                     // so no CHUNK-flag gating is needed here.
-                    pq.push(prio, frame);
+                    enqueue_outbox_frame(pq, prio, frame);
                 }
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => {
@@ -3648,7 +3660,16 @@ impl SessionRunner {
                 // are grouped, so interactive latency does not increase.
                 const ENCRYPTED_BATCH_FRAMES: usize = PQ_DRAIN_FRAMES_PER_PASS;
                 let encrypted_pass = self.crypto.tx_cipher.is_some();
-                let drain_cap = if encrypted_pass {
+                // On a stream-only transport, never weld a large run of
+                // loss-tolerant media into one irrevocable wire blob. Two
+                // frames per blob keeps the post-priority FIFO shallow while
+                // retaining most TLS-padding efficiency. Bulk/interactive
+                // traffic keeps the high-throughput batching path.
+                let realtime_stream_fallback =
+                    encrypted_pass && pq.peek_priority() == Some(veil_proto::priority::REALTIME);
+                let drain_cap = if realtime_stream_fallback {
+                    drained_this_pass.saturating_add(2)
+                } else if encrypted_pass {
                     ENCRYPTED_BATCH_FRAMES
                 } else {
                     PQ_DRAIN_FRAMES_PER_PASS
@@ -3788,7 +3809,7 @@ impl SessionRunner {
                         break;
                     }
                     NextInput::OutboxFrame((prio, frame)) => {
-                        pq.push(prio, frame);
+                        enqueue_outbox_frame(&mut pq, prio, frame);
                         continue;
                     }
                     NextInput::SwapStream(new_stream) => {
