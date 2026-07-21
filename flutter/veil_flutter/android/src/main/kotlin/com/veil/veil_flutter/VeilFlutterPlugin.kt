@@ -163,11 +163,19 @@ class VeilFlutterPlugin : FlutterPlugin, MethodCallHandler, ActivityAware,
                 result.success(vpnStateMap())
             }
             "abort", "stop" -> {
+                VeilVpnService.beginStopping()
                 val intent = Intent(ctx, VeilVpnService::class.java).apply {
                     action = VeilVpnService.ACTION_STOP
                 }
-                ctx.startService(intent)
-                result.success(mapOf("phase" to "stopped"))
+                try {
+                    ctx.startService(intent)
+                    awaitVpnStopped(result, SystemClock.uptimeMillis() + 3000L)
+                } catch (error: Exception) {
+                    result.success(mapOf(
+                        "phase" to "error",
+                        "detail" to (error.message ?: "Could not stop Android VPN service"),
+                    ))
+                }
             }
             "startBackgroundService" -> {
                 val title = call.argument<String>("title")
@@ -383,6 +391,22 @@ class VeilFlutterPlugin : FlutterPlugin, MethodCallHandler, ActivityAware,
             return
         }
         Handler(Looper.getMainLooper()).postDelayed({ awaitVpnInterface(result, deadline) }, 25L)
+    }
+
+    private fun awaitVpnStopped(result: Result, deadline: Long) {
+        if (VeilVpnService.phase == VeilVpnService.PHASE_STOPPED &&
+            VeilVpnService.tunFd == null) {
+            result.success(vpnStateMap())
+            return
+        }
+        if (SystemClock.uptimeMillis() >= deadline) {
+            result.success(mapOf(
+                "phase" to "error",
+                "detail" to "Timed out stopping Android VPN interface",
+            ))
+            return
+        }
+        Handler(Looper.getMainLooper()).postDelayed({ awaitVpnStopped(result, deadline) }, 25L)
     }
 
     /// Open the EncryptedSharedPreferences store, migrating any
