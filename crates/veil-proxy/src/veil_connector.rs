@@ -75,6 +75,12 @@ pub const EXIT_PROXY_ENDPOINT_ID: u32 = 0;
 /// Timeout for the APP_RECEIPT_ACCEPTED handshake.
 const OPEN_RECEIPT_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// A cold DHT route/key lookup is initiated by the routed broadcaster's first
+/// failed send. Retry APP_OPEN while that lookup converges instead of failing
+/// SOCKS immediately merely because the exit is not a direct neighbour.
+const OPEN_ROUTE_RETRY_ATTEMPTS: usize = 50;
+const OPEN_ROUTE_RETRY_INTERVAL: Duration = Duration::from_millis(100);
+
 /// per-bridge duplex buffer size — pulled from
 /// `veil_proto::budget::PROXY_DUPLEX_BUF_SIZE`. Was 256 KiB locally;
 /// reduced to 64 KiB to bound aggregate memory at 256 × 64 KiB = 16 MiB
@@ -241,13 +247,23 @@ impl ProxyConnector for VeilConnector {
         let mut frame = encode_header(&hdr).to_vec();
         frame.extend_from_slice(&body);
 
-        let sent = self
-            .broadcaster
-            .send_to(&exit_node_id, priority::INTERACTIVE, frame);
+        let mut sent = false;
+        for attempt in 0..OPEN_ROUTE_RETRY_ATTEMPTS {
+            if self
+                .broadcaster
+                .send_to(&exit_node_id, priority::INTERACTIVE, frame.clone())
+            {
+                sent = true;
+                break;
+            }
+            if attempt + 1 < OPEN_ROUTE_RETRY_ATTEMPTS {
+                tokio::time::sleep(OPEN_ROUTE_RETRY_INTERVAL).await;
+            }
+        }
         if !sent {
             cleanup_regs();
             return Err(Socks5Error::ConnectFailed(
-                "no session to exit node".to_owned(),
+                "no route to exit node".to_owned(),
             ));
         }
 
