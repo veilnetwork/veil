@@ -2760,8 +2760,9 @@ int veil_node_apply_config(const VeilNode *node,
 /**
  * Start a packet engine over an OS-owned TUN file descriptor.
  *
- * The host remains responsible for creating/configuring the interface and for
- * keeping the descriptor alive until [`veil_packet_tunnel_stop`] returns.
+ * The host remains responsible for creating/configuring the interface. The
+ * engine duplicates the descriptor before starting its worker, so Android's
+ * `ParcelFileDescriptor` and Rust never race over one descriptor lifetime.
  * `proxy_url` must be a loopback SOCKS5 URL; accepting a remote/plain proxy
  * here would bypass veil and make the VPN indicator misleading.
  */
