@@ -22,6 +22,8 @@ use veil_session::SessionTxRegistry;
 
 use veil_proxy::veil_connector::{PendingReceiptMap, VeilStreamRxMap};
 
+use super::routed_frames::RoutedFrameBroadcaster;
+
 /// References the SOCKS5 spawn needs from `NodeRuntime`. Grouping them
 /// here keeps the caller site short.
 pub(crate) struct Socks5SpawnCtx<'a> {
@@ -29,6 +31,7 @@ pub(crate) struct Socks5SpawnCtx<'a> {
     pub shutdown_tx: &'a watch::Sender<bool>,
     pub logger: &'a Arc<NodeLogger>,
     pub session_tx_registry: Arc<StdRwLock<SessionTxRegistry>>,
+    pub dispatcher: Arc<FrameDispatcher>,
     pub local_node_id: NodeId,
     pub pending_stream_receipts: PendingReceiptMap,
     pub veil_stream_rx: VeilStreamRxMap,
@@ -56,11 +59,12 @@ pub(crate) fn spawn_socks5(ctx: Socks5SpawnCtx<'_>) -> Option<JoinHandle<()>> {
         }
     };
 
-    // bridge SessionTxRegistry through the FrameBroadcaster trait
-    // adapter; the proxy crate only sees `Arc<dyn FrameBroadcaster>`.
-    let broadcaster: Arc<dyn veil_types::FrameBroadcaster> = Arc::new(
-        veil_session::glue::SessionTxBroadcaster::new(ctx.session_tx_registry),
-    );
+    // Prefer a direct authenticated session and transparently fall back to an
+    // E2E-protected DHT-routed APP frame when the exit is not our neighbour.
+    let broadcaster: Arc<dyn veil_types::FrameBroadcaster> = Arc::new(RoutedFrameBroadcaster::new(
+        ctx.session_tx_registry,
+        ctx.dispatcher,
+    ));
     let connector = Arc::new(veil_proxy::VeilConnector::new(
         broadcaster,
         exit_node_id,
@@ -95,7 +99,7 @@ pub(crate) fn spawn_socks5(ctx: Socks5SpawnCtx<'_>) -> Option<JoinHandle<()>> {
 pub(crate) struct ExitProxySpawnCtx<'a> {
     pub config: &'a cfg::Config,
     pub logger: &'a Arc<NodeLogger>,
-    pub dispatcher: &'a FrameDispatcher,
+    pub dispatcher: Arc<FrameDispatcher>,
     pub app_registry: Arc<AppEndpointRegistry>,
     pub session_tx_registry: Arc<StdRwLock<SessionTxRegistry>>,
 }
@@ -119,10 +123,10 @@ pub(crate) fn spawn_exit_proxy(ctx: ExitProxySpawnCtx<'_>) -> Option<JoinHandle<
         ctx.app_registry
             .register(EXIT_PROXY_APP_ID, EXIT_PROXY_ENDPOINT_ID, 256);
 
-    // bridge SessionTxRegistry through FrameBroadcaster trait.
-    let broadcaster: Arc<dyn veil_types::FrameBroadcaster> = Arc::new(
-        veil_session::glue::SessionTxBroadcaster::new(ctx.session_tx_registry),
-    );
+    let broadcaster: Arc<dyn veil_types::FrameBroadcaster> = Arc::new(RoutedFrameBroadcaster::new(
+        ctx.session_tx_registry,
+        Arc::clone(&ctx.dispatcher),
+    ));
     let exit_enabled = ctx.config.proxy.exit.enabled;
     let allow_private = ctx.config.proxy.exit.allow_private;
     let logger = Arc::clone(ctx.logger);

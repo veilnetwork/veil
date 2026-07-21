@@ -184,6 +184,7 @@ impl NodeRuntime {
 
             // ── Proxy / IPC / discovery ──────────────────────────────────
             S::DiscoveryInitiator => self.spawn_discovery_initiator_task(),
+            S::RoutedAppFrames => self.spawn_routed_app_frames_task(),
             S::Socks5 => self.spawn_socks5_task(config),
             S::ExitProxy => self.spawn_exit_proxy_task(config),
             S::IpcServer => self.spawn_ipc_server(config),
