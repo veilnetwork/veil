@@ -786,6 +786,18 @@ pub(crate) async fn rendezvous_recipient_recheck(
 impl NodeRuntime {
     // ── proxy runtime wiring ───────────────────────────────────────
 
+    fn proxy_mlkem_ek_resolver(&self) -> Arc<dyn veil_types::MlKemEkResolver> {
+        Arc::new(crate::mlkem_resolver::DhtMlKemEkResolver::new(
+            Arc::clone(&self.dht),
+            Arc::clone(&self.session_tx_registry),
+            Arc::clone(&self.dispatcher.pending_recursive),
+            *self.identity.local_identity.node_id.as_bytes(),
+            Arc::clone(&self.identity.peer_mlkem_keys),
+            Arc::clone(&self.identity.peer_mlkem_certs),
+            Arc::clone(&self.logger),
+        ))
+    }
+
     /// Spawn the SOCKS5 ingress proxy if `config.proxy.socks5.enabled`.
     ///
     /// Creates an `VeilConnector` backed by the shared `session_tx_registry`
@@ -801,6 +813,7 @@ impl NodeRuntime {
             logger: &self.logger,
             session_tx_registry: Arc::clone(&self.session_tx_registry),
             dispatcher: Arc::clone(&self.dispatcher),
+            mlkem_ek_resolver: self.proxy_mlkem_ek_resolver(),
             local_node_id: self.identity.local_identity.node_id,
             pending_stream_receipts: Arc::clone(&self.dispatcher.pending_stream_receipts),
             veil_stream_rx: Arc::clone(&self.dispatcher.veil_stream_rx),
@@ -1144,6 +1157,7 @@ impl NodeRuntime {
             dispatcher: Arc::clone(&self.dispatcher),
             app_registry: Arc::clone(&self.app_registry),
             session_tx_registry: Arc::clone(&self.session_tx_registry),
+            mlkem_ek_resolver: self.proxy_mlkem_ek_resolver(),
         };
         if let Some(handle) = crate::proxy::tasks::spawn_exit_proxy(ctx) {
             lock_tasks(&self.tasks).background.push(handle);
@@ -1158,6 +1172,7 @@ impl NodeRuntime {
             Arc::clone(&self.dispatcher),
             Arc::clone(&self.app_registry),
             Arc::clone(&self.session_tx_registry),
+            self.proxy_mlkem_ek_resolver(),
             Arc::clone(&self.logger),
         );
         lock_tasks(&self.tasks).background.push(handle);
