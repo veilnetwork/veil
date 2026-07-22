@@ -21,7 +21,7 @@ dependencies:
   # functionality standpoint — the bare PairingDialog widget falls back
   # to a paste field if camera init fails — but shipping by default
   # gives one-line wiring for the common case.
-  mobile_scanner: ^5.2.3
+  mobile_scanner: ^7.4.0
   # QR generation (Epic 489.7 generator side).  Renders a bootstrap-
   # invite URI as a scannable QR code for "share my invite" flow.
   # Pure-Dart — no platform deps.
