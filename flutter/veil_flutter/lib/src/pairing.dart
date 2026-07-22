@@ -234,12 +234,15 @@ class _VeilPairingDialogState extends State<VeilPairingDialog>
       borderRadius: BorderRadius.circular(8),
       child: MobileScanner(
         onDetect: _onBarcodeDetect,
-        errorBuilder: (context, error, _) {
+        tapToFocus: true,
+        errorBuilder: (context, error) {
           // Cache the error To surface a fallback hint; the widget will
           // rebuild with the error variant of this tab.
           WidgetsBinding.instance.addPostFrameCallback((_) {
             if (!mounted) return;
-            setState(() => _scanError = error.errorDetails?.message ?? 'unknown');
+            setState(() {
+              _scanError = error.errorDetails?.message ?? 'unknown';
+            });
           });
           return const Center(child: CircularProgressIndicator());
         },
