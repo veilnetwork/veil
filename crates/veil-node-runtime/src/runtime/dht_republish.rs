@@ -90,6 +90,27 @@ impl NodeRuntime {
             // and the name silently un-resolves (this IS the auto-renewal
             // path: holders and the owner alike keep re-fanning the record).
             || magic == &veil_crypto::nickname::NICKNAME_DHT_MAGIC[..]
+            // Public Space discovery carrier ("XS"): short-lived,
+            // holder-signed and canonical-key-bound at the dispatcher. The
+            // application still verifies the strict descriptor/holder payload.
+            || magic == &veil_crypto::space_discovery::SPACE_DISCOVERY_DHT_MAGIC[..]
+    }
+
+    /// Republish only records that are still valid at the current wall clock.
+    ///
+    /// Most self-authenticating DHT types carry their own longer-lived
+    /// lifecycle checks on resolve. `XS` is deliberately short-lived: sending
+    /// an expired cached sample would make a correct peer classify a benign
+    /// stale cache entry as an invalid STORE.
+    pub fn is_republishable_dht_value_at(value: &[u8], now_unix_ms: u64) -> bool {
+        if !Self::is_self_authenticating_dht_value(value) {
+            return false;
+        }
+        if value.get(..2) == Some(&veil_crypto::space_discovery::SPACE_DISCOVERY_DHT_MAGIC[..]) {
+            return veil_crypto::space_discovery::SpaceDiscoveryRecord::from_bytes(value)
+                .is_some_and(|record| record.verify_at(now_unix_ms).is_ok());
+        }
+        true
     }
 
     pub fn spawn_dht_republish_task(&mut self, republish_interval: std::time::Duration) {
@@ -158,7 +179,11 @@ impl NodeRuntime {
                             // records). Anything else (legacy unsigned `encode_for_dht`
                             // intermediate local state, future record types
                             // without signed wire format) is not propagated.
-                            if !Self::is_self_authenticating_dht_value(&value) {
+                            let now_unix_ms = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .map(|duration| duration.as_millis().min(u64::MAX as u128) as u64)
+                                .unwrap_or(0);
+                            if !Self::is_republishable_dht_value_at(&value, now_unix_ms) {
                                 continue;
                             }
                             // audit follow-up: capture the fan-out count for
@@ -198,5 +223,29 @@ impl NodeRuntime {
             }
         });
         lock_tasks(&self.tasks).sessions.push(handle);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use ed25519_dalek::SigningKey;
+    use veil_crypto::space_discovery::{SpaceDiscoveryRecord, SpaceDiscoveryRoute};
+
+    use super::NodeRuntime;
+
+    #[test]
+    fn expired_space_discovery_records_are_not_republished() {
+        let key = SigningKey::from_bytes(&[9; 32]);
+        let valid = SpaceDiscoveryRecord::sign(
+            SpaceDiscoveryRoute::Direct([3; 32]),
+            [3; 32],
+            &key,
+            1_000,
+            2_000,
+            vec![1],
+        )
+        .to_bytes();
+        assert!(NodeRuntime::is_republishable_dht_value_at(&valid, 1_500));
+        assert!(!NodeRuntime::is_republishable_dht_value_at(&valid, 2_000));
     }
 }

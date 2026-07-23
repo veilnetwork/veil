@@ -2459,3 +2459,45 @@ final int Function(
               Pointer<Pointer<Utf8>>,
             )>>('veil_nickname_resolve')
     .asFunction();
+
+// Publish an already-signed public-Space discovery carrier through the
+// in-process embedded node.
+final int Function(
+  Pointer<Uint8>, // self_node_id (32 B)
+  Pointer<Uint8>, // XS record
+  int, // record_len
+  Pointer<Pointer<Utf8>>, // err_out
+) veilSpaceDiscoveryPublish = nativeLib
+    .lookup<
+        NativeFunction<
+            Int32 Function(
+              Pointer<Uint8>,
+              Pointer<Uint8>,
+              IntPtr,
+              Pointer<Pointer<Utf8>>,
+            )>>('veil_space_discovery_publish')
+    .asFunction();
+
+// Resolve a bounded contested replica set. Output is count:u32 LE followed by
+// record_len:u32 LE | record bytes; free with veilFreeBuf.
+final int Function(
+  Pointer<Uint8>, // self_node_id (32 B)
+  int, // route_kind: 0 direct, 1 search-token hash
+  Pointer<Uint8>, // route_body (32 B)
+  int, // timeout_ms
+  Pointer<Pointer<Uint8>>, // out_buf
+  Pointer<IntPtr>, // out_len
+  Pointer<Pointer<Utf8>>, // err_out
+) veilSpaceDiscoveryResolve = nativeLib
+    .lookup<
+        NativeFunction<
+            Int32 Function(
+              Pointer<Uint8>,
+              Uint8,
+              Pointer<Uint8>,
+              Uint64,
+              Pointer<Pointer<Uint8>>,
+              Pointer<IntPtr>,
+              Pointer<Pointer<Utf8>>,
+            )>>('veil_space_discovery_resolve')
+    .asFunction();

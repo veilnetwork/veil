@@ -36,6 +36,14 @@ export 'src/sovereign_signer.dart'
         exportSovereignRecoveryCertificate,
         generateSovereignRecoveryCode,
         verifySovereignSignature;
+export 'src/space_discovery.dart'
+    show
+        SpaceDiscoveryRouteKind,
+        decodeSpaceDiscoveryReplicaBuffer,
+        publishSpaceDiscoveryRecord,
+        publishSpaceDiscoveryRecordAsync,
+        resolveSpaceDiscoveryRecords,
+        resolveSpaceDiscoveryRecordsAsync;
 export 'src/stream.dart' show VeilStream, VeilAnonStream;
 export 'src/types.dart'
     show
