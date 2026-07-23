@@ -1011,8 +1011,10 @@ int veil_send_realtime(VeilApp *app,
 
 /**
  * Send a loss-tolerant datagram through the non-onion Delivery relay path at
- * REALTIME priority. This does not require a direct destination session; the
- * daemon selects an already-active overlay peer as the first relay hop.
+ * REALTIME priority. Unlike [`veil_send_realtime`], this does not require a
+ * direct session to the destination: the daemon selects an already-active
+ * overlay peer as the first relay hop. The call is fire-and-forget; callers
+ * that need eventual delivery must retain their durable fallback.
  */
 
 int veil_send_relay_realtime(VeilApp *app,
@@ -2723,9 +2725,10 @@ VeilNode *veil_node_start_deferred(const uint8_t *admin_socket_ptr,
  * with [`crate::veil_free_string`].
  *
  * # Safety
- * The node-id and PSK pointers must point to their respective readable UTF-8
- * byte lengths; `listen_out` and `err_out` must be writable pointer slots when
- * non-null.
+ * `exit_node_id_ptr` accepts either one node ID or a comma-separated ordered
+ * failover chain. The node-id chain and PSK pointers must point to their
+ * respective readable UTF-8 byte lengths; `listen_out` and `err_out` must be
+ * writable pointer slots when non-null.
  */
 
 VeilNode *veil_vpn_upstream_start(const uint8_t *exit_node_id_ptr,
@@ -2871,6 +2874,52 @@ int veil_packet_tunnel_start_packets(const char *proxy_url,
  * `config_path` must be a live NUL-terminated UTF-8 string for this call.
  */
  int veil_packet_tunnel_run_linux_helper(const char *config_path) ;
+
+#if defined(VEIL_FFI_NODE_EMBEDDED)
+/**
+ * Publish one already-signed `XS` public-Space discovery carrier through the
+ * embedded node. The record is verified, must name `self_node_id` as holder,
+ * is stored under its canonical direct/search route key and replicated to the
+ * K closest DHT peers.
+ *
+ * # Safety
+ * `self_node_id` must point to exactly 32 readable bytes; `record` must point
+ * to `record_len` readable bytes. `err_out`, when non-null, must be a writable
+ * pointer slot and its returned string must be freed with `veil_free_string`.
+ */
+
+int veil_space_discovery_publish(const uint8_t *self_node_id,
+                                 const uint8_t *record,
+                                 size_t record_len,
+                                 char **err_out)
+;
+#endif
+
+#if defined(VEIL_FFI_NODE_EMBEDDED)
+/**
+ * Resolve an exact-Space (`route_kind=0`) or search-token (`route_kind=1`)
+ * route. On success returns a boxed length-prefixed buffer:
+ *
+ * `count:u32 LE`, followed by `count × (record_len:u32 LE | record bytes)`.
+ *
+ * Free the exact `out_buf/out_len` pair with `veil_free_buf`.
+ *
+ * # Safety
+ * `self_node_id` and `route_body` must each point to exactly 32 readable
+ * bytes. `out_buf` and `out_len` must be writable pointer slots. `err_out`,
+ * when non-null, must be writable and its returned string must be freed with
+ * `veil_free_string`.
+ */
+
+int veil_space_discovery_resolve(const uint8_t *self_node_id,
+                                 uint8_t route_kind,
+                                 const uint8_t *route_body,
+                                 uint64_t timeout_ms,
+                                 uint8_t **out_buf,
+                                 size_t *out_len,
+                                 char **err_out)
+;
+#endif
 
 #ifdef __cplusplus
 }  // extern "C"

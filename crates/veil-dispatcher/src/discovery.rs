@@ -382,6 +382,26 @@ impl FrameDispatcher {
                             }
                             return DispatchResult::NoResponse;
                         }
+                        if payload.key != self_key
+                            && payload.value.get(..2)
+                                == Some(
+                                    &veil_crypto::space_discovery::SPACE_DISCOVERY_DHT_MAGIC[..],
+                                )
+                        {
+                            let origin = match self
+                                .space_discovery_store_gate(&payload.key, &payload.value)
+                            {
+                                Ok(origin) => origin,
+                                Err(disposition) => return disposition,
+                            };
+                            if !self
+                                .dht
+                                .store_with_origin(payload.key, payload.value, origin)
+                            {
+                                return DispatchResult::RateLimited;
+                            }
+                            return DispatchResult::NoResponse;
+                        }
                         let origin = if payload.key == self_key {
                             // Peer's own routing record — attribute to the peer.
                             *node_id.as_bytes()
@@ -635,6 +655,7 @@ impl FrameDispatcher {
         let is_ra = magic == Some(&veil_anonymity::rendezvous::MAGIC[..]);
         let is_rd = magic == Some(&veil_anonymity::directory::RELAY_DIRECTORY_DHT_MAGIC[..]);
         let is_nk = magic == Some(&veil_crypto::nickname::NICKNAME_DHT_MAGIC[..]);
+        let is_xs = magic == Some(&veil_crypto::space_discovery::SPACE_DISCOVERY_DHT_MAGIC[..]);
 
         if is_sb {
             // Signed operator bootstrap bundle (cf. `veil-bootstrap::
@@ -901,6 +922,36 @@ impl FrameDispatcher {
                 return Err(DispatchResult::NoResponse);
             }
             rec.owner_node_id
+        } else if is_xs {
+            let record =
+                match veil_crypto::space_discovery::SpaceDiscoveryRecord::from_bytes(payload_value)
+                {
+                    Some(record) => record,
+                    None => {
+                        return Err(DispatchResult::Violation(
+                            "Store: malformed SpaceDiscoveryRecord".to_owned(),
+                        ));
+                    }
+                };
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|duration| duration.as_millis().min(u64::MAX as u128) as u64)
+                .unwrap_or(0);
+            if record.verify_at(now).is_err() {
+                return Err(DispatchResult::Violation(
+                    "Store: SpaceDiscoveryRecord failed verification".to_owned(),
+                ));
+            }
+            if !already_present
+                && !self
+                    .abuse
+                    .identity_write_quota
+                    .try_allow(&record.holder_node_id)
+                    .is_allowed()
+            {
+                return Err(DispatchResult::NoResponse);
+            }
+            record.holder_node_id
         } else {
             return Err(DispatchResult::Violation(
                 "Store: unrecognised payload magic — recursive plane requires a signed-record magic prefix"
@@ -972,6 +1023,11 @@ impl FrameDispatcher {
                     veil_crypto::nickname::nickname_dht_key(&rec.name) == Some(*target_key)
                 }
                 _ => false,
+            }
+        } else if magic == &veil_crypto::space_discovery::SPACE_DISCOVERY_DHT_MAGIC[..] {
+            match veil_crypto::space_discovery::SpaceDiscoveryRecord::from_bytes(payload) {
+                Some(record) => record.route.dht_key() == *target_key,
+                None => false,
             }
         } else {
             // nc / id / ir / mc: caching left unchanged (returns true). The
@@ -1070,6 +1126,104 @@ impl FrameDispatcher {
         matches!(
             veil_crypto::nickname::nickname_store_decision(existing.as_deref(), value),
             veil_crypto::nickname::StoreDecision::Accept
+        )
+    }
+
+    /// STORE/mirror conflict gate for the multi-writer public-Space index.
+    ///
+    /// Each DHT node retains one deterministic rendezvous sample for a search
+    /// token; a K-replica contested read therefore returns a bounded diverse
+    /// set instead of converging on a last-writer-wins singleton.
+    #[allow(clippy::result_large_err)]
+    pub fn space_discovery_store_gate(
+        &self,
+        key: &[u8; 32],
+        value: &[u8],
+    ) -> Result<[u8; 32], DispatchResult> {
+        use veil_crypto::space_discovery::{
+            SpaceDiscoveryError, SpaceDiscoveryRecord, SpaceDiscoveryStoreDecision,
+            space_discovery_store_decision,
+        };
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_millis().min(u64::MAX as u128) as u64)
+            .unwrap_or(0);
+        let Some(record) = SpaceDiscoveryRecord::from_bytes(value) else {
+            return Err(DispatchResult::Violation(
+                "Store: malformed SpaceDiscoveryRecord".to_owned(),
+            ));
+        };
+        if record.route.dht_key() != *key {
+            return Err(DispatchResult::Violation(
+                "Store: SpaceDiscoveryRecord stored under non-canonical DHT key".to_owned(),
+            ));
+        }
+        match record.verify_at(now) {
+            Err(SpaceDiscoveryError::Expired) => {
+                return Err(DispatchResult::NoResponse);
+            }
+            Err(_) => {
+                return Err(DispatchResult::Violation(
+                    "Store: invalid SpaceDiscoveryRecord".to_owned(),
+                ));
+            }
+            Ok(()) => {}
+        }
+        let existing = self.dht.get_local(key);
+        let same_holder_refresh = existing
+            .as_deref()
+            .and_then(SpaceDiscoveryRecord::from_bytes)
+            .is_some_and(|current| {
+                current.route == record.route
+                    && current.space_id == record.space_id
+                    && current.holder_node_id == record.holder_node_id
+            });
+        // A common search-token key is intentionally multi-writer. Only a
+        // refresh of the exact same holder+Space sample is quota-exempt;
+        // otherwise an already-present key would give every competing writer
+        // a free unbounded signature/rendezvous work loop.
+        if !same_holder_refresh
+            && !self
+                .abuse
+                .identity_write_quota
+                .try_allow(&record.holder_node_id)
+                .is_allowed()
+        {
+            return Err(DispatchResult::NoResponse);
+        }
+        match space_discovery_store_decision(existing.as_deref(), value, now, &self.local_node_id) {
+            SpaceDiscoveryStoreDecision::RejectInvalid => Err(DispatchResult::Violation(
+                "Store: invalid SpaceDiscoveryRecord".to_owned(),
+            )),
+            SpaceDiscoveryStoreDecision::RejectKeepExisting => Err(DispatchResult::NoResponse),
+            SpaceDiscoveryStoreDecision::Accept => Ok(record.holder_node_id),
+        }
+    }
+
+    pub fn space_discovery_mirror_ok(&self, key: &[u8; 32], value: &[u8]) -> bool {
+        if value.get(..2) != Some(&veil_crypto::space_discovery::SPACE_DISCOVERY_DHT_MAGIC[..]) {
+            return true;
+        }
+        let Some(record) = veil_crypto::space_discovery::SpaceDiscoveryRecord::from_bytes(value)
+        else {
+            return false;
+        };
+        if record.route.dht_key() != *key {
+            return false;
+        }
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_millis().min(u64::MAX as u128) as u64)
+            .unwrap_or(0);
+        let existing = self.dht.get_local(key);
+        matches!(
+            veil_crypto::space_discovery::space_discovery_store_decision(
+                existing.as_deref(),
+                value,
+                now,
+                &self.local_node_id,
+            ),
+            veil_crypto::space_discovery::SpaceDiscoveryStoreDecision::Accept
         )
     }
 }

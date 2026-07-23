@@ -39,6 +39,7 @@ pub mod services;
 mod session_defaults;
 mod session_guard;
 mod sovereign_republish;
+mod space_discovery;
 mod update_check;
 mod uri_helpers;
 // Phase 2 pre-work (veilcore extraction): `handoff` + `hot_standby`
