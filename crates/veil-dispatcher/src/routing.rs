@@ -2140,6 +2140,25 @@ impl FrameDispatcher {
                         }
                         return DispatchResult::NoResponse;
                     }
+                    if q.payload.get(..2)
+                        == Some(&veil_crypto::space_discovery::SPACE_DISCOVERY_DHT_MAGIC[..])
+                    {
+                        let origin =
+                            match self.space_discovery_store_gate(&q.target_key, &q.payload) {
+                                Ok(origin) => origin,
+                                Err(disposition) => return disposition,
+                            };
+                        if !self
+                            .dht
+                            .store_with_origin(q.target_key, q.payload.clone(), origin)
+                        {
+                            return DispatchResult::NoResponse;
+                        }
+                        if let Some(resp) = build_signed(vec![1]) {
+                            send_response(resp);
+                        }
+                        return DispatchResult::NoResponse;
+                    }
                     // A STORE for a key we ALREADY hold is a TTL/content refresh
                     // (republication), not new-state growth — exempt it from the
                     // per-identity write quota so a node can keep its own
@@ -2628,7 +2647,10 @@ impl FrameDispatcher {
                         // replace-on-heavier rule so a lighter (but valid)
                         // record in a response can never clobber a heavier
                         // incumbent in the local cache.
-                        && self.nickname_mirror_ok(&p.target_key, &resp.payload) =>
+                        && self.nickname_mirror_ok(&p.target_key, &resp.payload)
+                        // …AND apply the per-replica rendezvous sample rule for
+                        // multi-writer public-Space discovery records.
+                        && self.space_discovery_mirror_ok(&p.target_key, &resp.payload) =>
                 {
                     // payload = raw value bytes; mirror into the local DHT so
                     // subsequent lookups resolve without another round-trip.

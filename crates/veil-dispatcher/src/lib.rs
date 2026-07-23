@@ -6120,6 +6120,87 @@ mod tests {
         );
     }
 
+    // ── Public Space discovery STORE gate ("XS") ─────────────────────────────
+
+    fn signed_space_discovery(
+        route: veil_crypto::space_discovery::SpaceDiscoveryRoute,
+        space_id: [u8; 32],
+        holder_seed: u8,
+        issued_at: u64,
+    ) -> veil_crypto::space_discovery::SpaceDiscoveryRecord {
+        let key = ed25519_dalek::SigningKey::from_bytes(&[holder_seed; 32]);
+        veil_crypto::space_discovery::SpaceDiscoveryRecord::sign(
+            route,
+            space_id,
+            &key,
+            issued_at,
+            issued_at + 3_600_000,
+            br#"{"descriptor":"strict-app-payload"}"#.to_vec(),
+        )
+    }
+
+    #[test]
+    fn space_discovery_store_accepts_canonical_signed_record() {
+        use veil_proto::discovery::StorePayload;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let route = veil_crypto::space_discovery::SpaceDiscoveryRoute::Search([0x31; 32]);
+        let record = signed_space_discovery(route, [0x41; 32], 0x51, now);
+        let key = route.dht_key();
+        let dispatcher = make_test_dispatcher(veil_cfg::NodeRole::Core);
+        let (header, body) = make_store_frame(&StorePayload::unsigned(key, record.to_bytes()));
+        let result = dispatcher.dispatch(&header, &body, [0x01; 32]);
+        assert!(
+            matches!(result, DispatchResult::NoResponse),
+            "valid discovery sample must be accepted, got {result:?}",
+        );
+        assert_eq!(
+            dispatcher.dht.get_local(&key).as_deref(),
+            Some(&record.to_bytes()[..]),
+        );
+    }
+
+    #[test]
+    fn space_discovery_store_rejects_wrong_key_tamper_and_soft_drops_expiry() {
+        use veil_proto::discovery::StorePayload;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let route = veil_crypto::space_discovery::SpaceDiscoveryRoute::Direct([0x61; 32]);
+        let record = signed_space_discovery(route, [0x61; 32], 0x71, now);
+        let dispatcher = make_test_dispatcher(veil_cfg::NodeRole::Core);
+
+        let wrong_key =
+            veil_crypto::space_discovery::SpaceDiscoveryRoute::Direct([0x62; 32]).dht_key();
+        let (header, body) =
+            make_store_frame(&StorePayload::unsigned(wrong_key, record.to_bytes()));
+        assert!(matches!(
+            dispatcher.dispatch(&header, &body, [0x01; 32]),
+            DispatchResult::Violation(_)
+        ));
+        assert!(dispatcher.dht.get_local(&wrong_key).is_none());
+
+        let mut tampered = record.to_bytes();
+        tampered[140] ^= 1;
+        let (header, body) = make_store_frame(&StorePayload::unsigned(route.dht_key(), tampered));
+        assert!(matches!(
+            dispatcher.dispatch(&header, &body, [0x01; 32]),
+            DispatchResult::Violation(_)
+        ));
+
+        let expired = signed_space_discovery(route, [0x61; 32], 0x71, now - 7_200_000);
+        let (header, body) =
+            make_store_frame(&StorePayload::unsigned(route.dht_key(), expired.to_bytes()));
+        assert!(matches!(
+            dispatcher.dispatch(&header, &body, [0x01; 32]),
+            DispatchResult::NoResponse
+        ));
+        assert!(dispatcher.dht.get_local(&route.dht_key()).is_none());
+    }
+
     /// c: signed STORE with valid signature and key == BLAKE3(pubkey) → accepted.
     #[test]
     fn store_signed_valid_accepted() {

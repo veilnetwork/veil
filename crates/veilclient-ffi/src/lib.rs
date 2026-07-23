@@ -96,6 +96,8 @@ mod nickname_net;
 mod node;
 #[cfg(feature = "packet-tunnel")]
 mod packet_tunnel;
+#[cfg(feature = "node-embedded")]
+mod space_discovery_net;
 
 #[cfg(feature = "packet-tunnel")]
 pub use packet_tunnel::{

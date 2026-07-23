@@ -14,6 +14,7 @@ pub mod pow;
 pub mod session_cipher;
 pub mod session_kdf;
 pub mod signature;
+pub mod space_discovery;
 pub mod types;
 pub mod wake_hmac;
 pub mod x3dh;
