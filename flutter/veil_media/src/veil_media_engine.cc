@@ -1356,15 +1356,25 @@ int veil_media_group_engine_start_audio(VeilGroupMediaEngine* engine) {
     }
   });
   if (ws->send_stream == nullptr) return VEIL_MEDIA_ERR_STATE;
+  bool capture_failed = false;
   if (ws->adm) {
     if (!engine->mic_muted) {
-      ws->adm->InitRecording();
-      ws->adm->StartRecording();
+      // Align with set_mic_muted: a capture device that cannot start must be
+      // loud, not a silently dead microphone. Playout still comes up below so
+      // the room stays audible while the caller decides what to do.
+      const int32_t init_rc = ws->adm->InitRecording();
+      const int32_t start_rc = init_rc == 0 ? ws->adm->StartRecording() : -1;
+      if (init_rc != 0 || start_rc != 0) {
+        capture_failed = true;
+        vlog("group audio: capture start FAILED init=%d start=%d",
+             (int)init_rc, (int)start_rc);
+      }
     }
     ws->adm->InitPlayout();
     ws->adm->StartPlayout();
   }
   engine->audio_running.store(true);
+  if (capture_failed) return VEIL_MEDIA_ERR_DEVICE;
   vlog("group audio: started peers=%zu", ws->peers.size());
   return VEIL_MEDIA_OK;
 #else
@@ -1798,10 +1808,18 @@ int veil_media_engine_start_audio(VeilMediaEngine* engine, int send, int recv) {
   // AVAudioEngine ADM's start is non-blocking + idempotent (all engine work is
   // serialized on its own GCD queue), so this is safe on the calling thread and
   // AudioState toggling it too on the worker queue just no-ops.
+  bool capture_failed = false;
   if (ws->adm) {
     if (send && !engine->mic_muted) {
-      ws->adm->InitRecording();
-      ws->adm->StartRecording();
+      // Same contract as set_mic_muted/group start: surface a capture device
+      // that refuses to start instead of silently sending nothing.
+      const int32_t init_rc = ws->adm->InitRecording();
+      const int32_t start_rc = init_rc == 0 ? ws->adm->StartRecording() : -1;
+      if (init_rc != 0 || start_rc != 0) {
+        capture_failed = true;
+        vlog("adm start: capture start FAILED init=%d start=%d",
+             (int)init_rc, (int)start_rc);
+      }
     }
     if (recv) {
       ws->adm->InitPlayout();
@@ -1824,6 +1842,7 @@ int veil_media_engine_start_audio(VeilMediaEngine* engine, int send, int recv) {
         webrtc::TimeDelta::Seconds(3));
   }
   engine->audio_running.store(true);
+  if (capture_failed) return VEIL_MEDIA_ERR_DEVICE;
   return VEIL_MEDIA_OK;
 #else
   (void)send;
