@@ -92,6 +92,29 @@ pub(crate) async fn lookup_relay_key_reply_body(
     LookupRelayKeyRespPayload { relay_x25519 }.encode()
 }
 
+/// Slow half of `AttemptHolePunch` — one bounded explicit hole-punch
+/// attempt (mapping discovery + signaling + punch + QUIC + registration;
+/// several seconds worst-case, driver-enforced budget). Touches only the
+/// `Arc` driver so it can run in a task spawned off the connection loop
+/// (request-id concurrency); sync validation (rate limit, 32-byte body)
+/// stays with the caller. Without a wired driver the reply is the
+/// explicit `UNSUPPORTED` status — never a fake punch failure.
+pub(crate) async fn attempt_hole_punch_reply_body(
+    hole_punch_driver: Option<Arc<dyn crate::HolePunchDriver>>,
+    peer_node_id: [u8; 32],
+) -> Vec<u8> {
+    let status = match hole_punch_driver {
+        Some(driver) => driver.attempt_hole_punch(peer_node_id).await.wire_status(),
+        None => veil_proto::hole_punch_status::UNSUPPORTED,
+    };
+    veil_proto::AttemptHolePunchResultPayload {
+        status,
+        peer_node_id,
+    }
+    .encode()
+    .to_vec()
+}
+
 pub(crate) async fn handle_get_node_identity(
     wh: &mut IpcWriteHalf,
     client_state: &mut IpcClientState,
@@ -868,4 +891,63 @@ pub(crate) async fn handle_pair_target_build_confirm(
         &payload.encode(),
     )
     .await
+}
+
+#[cfg(test)]
+mod attempt_hole_punch_tests {
+    use std::sync::Arc;
+
+    use veil_proto::{AttemptHolePunchResultPayload, hole_punch_status};
+
+    use crate::{HolePunchDriver, HolePunchOutcome};
+
+    struct StubDriver {
+        outcome: HolePunchOutcome,
+    }
+
+    impl HolePunchDriver for StubDriver {
+        fn attempt_hole_punch<'a>(
+            &'a self,
+            _peer_node_id: [u8; 32],
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = HolePunchOutcome> + Send + 'a>>
+        {
+            let outcome = self.outcome;
+            Box::pin(async move { outcome })
+        }
+    }
+
+    #[tokio::test]
+    async fn unwired_driver_reports_unsupported_and_echoes_peer() {
+        let peer = [0x5A; 32];
+        let body = super::attempt_hole_punch_reply_body(None, peer).await;
+        let decoded = AttemptHolePunchResultPayload::decode(&body).unwrap();
+        assert_eq!(decoded.status, hole_punch_status::UNSUPPORTED);
+        assert_eq!(decoded.peer_node_id, peer);
+    }
+
+    #[tokio::test]
+    async fn wired_driver_outcome_is_threaded_through() {
+        let peer = [0x11; 32];
+        for (outcome, wire) in [
+            (HolePunchOutcome::Connected, hole_punch_status::CONNECTED),
+            (
+                HolePunchOutcome::RefusedAnonymous,
+                hole_punch_status::REFUSED_ANONYMOUS,
+            ),
+            (
+                HolePunchOutcome::PunchTimeout,
+                hole_punch_status::PUNCH_TIMEOUT,
+            ),
+            (
+                HolePunchOutcome::UnknownPeer,
+                hole_punch_status::UNKNOWN_PEER,
+            ),
+        ] {
+            let driver: Arc<dyn HolePunchDriver> = Arc::new(StubDriver { outcome });
+            let body = super::attempt_hole_punch_reply_body(Some(driver), peer).await;
+            let decoded = AttemptHolePunchResultPayload::decode(&body).unwrap();
+            assert_eq!(decoded.status, wire);
+            assert_eq!(decoded.peer_node_id, peer);
+        }
+    }
 }

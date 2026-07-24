@@ -370,6 +370,60 @@ enum JoinBootstrapStatus {
   }
 }
 
+/// Structured outcome of one explicit call-path hole-punch attempt
+/// ([VeilClient.attemptP2PHolePunch], real-P2P epic Stage B).  Mirrors
+/// `veil_proto::hole_punch_status`; every value names the exact stage
+/// that ended the attempt so the transport badge and logs can show the
+/// real reason instead of a generic failure.
+enum VeilHolePunchStatus {
+  /// A live direct session to the peer exists (it already did —
+  /// idempotent success — or the punched QUIC session just registered).
+  /// `peerPnetStatus().admitted` flips the standard way.
+  connected(ffi.veilHolePunchConnected),
+
+  /// NAT traversal disabled or no usable UDP reflector endpoint known.
+  noReflector(ffi.veilHolePunchNoReflector),
+
+  /// Candidate/token exchange through the Veil coordinator did not
+  /// complete inside the budget.
+  signalingTimeout(ffi.veilHolePunchSignalingTimeout),
+
+  /// No usable local UDP mapping, or the peer offered no public
+  /// server-reflexive candidate.
+  mappingUnusable(ffi.veilHolePunchMappingUnusable),
+
+  /// Simultaneous punch packets never converged before the deadline.
+  punchTimeout(ffi.veilHolePunchPunchTimeout),
+
+  /// Punch converged but same-socket QUIC promotion or the session
+  /// handshake on the punched connection failed.
+  quicFailed(ffi.veilHolePunchQuicFailed),
+
+  /// Refused: the daemon runs under an anonymity posture (onion-service
+  /// boot) — a punch would disclose its real external address.
+  refusedAnonymous(ffi.veilHolePunchRefusedAnonymous),
+
+  /// The node_id is not a registered peer of the daemon — exchange
+  /// endpoints (bootstrap join) before attempting a punch.
+  unknownPeer(ffi.veilHolePunchUnknownPeer),
+
+  /// The daemon has no hole-punch driver wired (older/partial build).
+  unsupported(ffi.veilHolePunchUnsupported),
+
+  /// Forward-compat: daemon returned a status byte we don't recognise.
+  unknown(-1);
+
+  const VeilHolePunchStatus(this.wireByte);
+  final int wireByte;
+
+  static VeilHolePunchStatus fromWire(int b) {
+    for (final s in values) {
+      if (s.wireByte == b) return s;
+    }
+    return VeilHolePunchStatus.unknown;
+  }
+}
+
 /// Status return from [VeilClient.createBootstrapInvite] (Epic
 /// 489.7 generator side).  Mirrors `veil_proto::create_invite_status`.
 enum CreateBootstrapInviteStatus {

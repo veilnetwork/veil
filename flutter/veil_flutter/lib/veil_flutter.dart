@@ -88,6 +88,7 @@ export 'src/types.dart'
         VeilEvent,
         VeilEventKind,
         VeilException,
+        VeilHolePunchStatus,
         VeilPeer,
         VeilPeerState,
         VeilPeerDirection,

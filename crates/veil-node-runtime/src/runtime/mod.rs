@@ -255,6 +255,15 @@ pub struct NodeServices {
         Arc<std::sync::RwLock<std::collections::HashMap<[u8; 32], veil_types::MembershipCert>>>,
     /// Runtime task registry used to retain responder-side punched sessions.
     tasks: Arc<Mutex<RuntimeTasks>>,
+    /// Single-flight registry for explicit call-path hole-punch attempts.
+    /// Shared with `NodeRuntime.hole_punch_inflight`.
+    hole_punch_inflight: HolePunchInflightMap,
+    /// Count of exclusive (slot-holding) punch attempts actually STARTED
+    /// through this `NodeServices` — bumped once per non-joining attempt.
+    /// Created fresh per `access()` and shared across its clones; lets a
+    /// test prove that a concurrent second call for the same peer joined
+    /// the in-flight attempt instead of starting a second punch.
+    hole_punch_run_count: Arc<AtomicU64>,
 }
 
 #[derive(Clone)]
@@ -805,10 +814,80 @@ pub struct NodeRuntime {
     /// read by `PnetStatusProvider` for IPC consumer queries.
     pub verified_peer_certs:
         Arc<std::sync::RwLock<std::collections::HashMap<[u8; 32], veil_types::MembershipCert>>>,
+    /// Single-flight registry for explicit call-path hole-punch attempts
+    /// (real-P2P Stage B): peer node_id → broadcast sender of the
+    /// in-flight attempt's outcome. A second `attempt_p2p_hole_punch`
+    /// for the same peer subscribes and awaits instead of racing a
+    /// parallel punch. Entries are removed by the running attempt's
+    /// drop-guard, so a cancelled attempt can never leak a slot.
+    hole_punch_inflight: HolePunchInflightMap,
     /// audit log for mutating admin commands. `None`
     /// when the on-disk file couldn't be opened (warned at startup);
     /// admin handlers fall back to no-op auditing in that case.
     pub admin_audit: Option<Arc<crate::admin_audit::AdminAuditLog>>,
+}
+
+/// Shared single-flight map for [`NodeServices::attempt_p2p_hole_punch`].
+type HolePunchInflightMap = Arc<
+    Mutex<
+        std::collections::HashMap<
+            [u8; 32],
+            tokio::sync::broadcast::Sender<veil_ipc::HolePunchOutcome>,
+        >,
+    >,
+>;
+
+/// Failure stage of one initiator-side UDP hole-punch dial
+/// (`udp_hole_punch_dial_stages`). Maps 1:1 onto the wire outcomes of
+/// the explicit call-path API; the legacy auto-fallback path collapses
+/// it back to `Option` and keeps its historical behaviour.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HolePunchDialFailure {
+    /// NAT traversal disabled or no reflector endpoint sendable.
+    NoReflector,
+    /// Local socket/mapping unusable, or the peer offered no public
+    /// srflx candidate.
+    MappingUnusable,
+    /// Coordinator candidate/token exchange did not complete.
+    SignalingTimeout,
+    /// Simultaneous punch never converged inside its deadline.
+    PunchTimeout,
+    /// Same-socket QUIC promotion failed or ran out of budget.
+    QuicFailed,
+}
+
+impl From<HolePunchDialFailure> for veil_ipc::HolePunchOutcome {
+    fn from(failure: HolePunchDialFailure) -> Self {
+        match failure {
+            HolePunchDialFailure::NoReflector => Self::NoReflector,
+            HolePunchDialFailure::MappingUnusable => Self::MappingUnusable,
+            HolePunchDialFailure::SignalingTimeout => Self::SignalingTimeout,
+            HolePunchDialFailure::PunchTimeout => Self::PunchTimeout,
+            HolePunchDialFailure::QuicFailed => Self::QuicFailed,
+        }
+    }
+}
+
+/// Drop-guard owned by the single in-flight `attempt_p2p_hole_punch`
+/// runner for a peer: releases the single-flight slot and broadcasts the
+/// outcome to every joiner, even if the running future is cancelled
+/// (runtime shutdown) — joiners then observe `PunchTimeout` instead of a
+/// closed channel and the slot can never leak.
+struct HolePunchInflightGuard {
+    map: HolePunchInflightMap,
+    peer_node_id: [u8; 32],
+    tx: tokio::sync::broadcast::Sender<veil_ipc::HolePunchOutcome>,
+    outcome: Option<veil_ipc::HolePunchOutcome>,
+}
+
+impl Drop for HolePunchInflightGuard {
+    fn drop(&mut self) {
+        lock!(self.map).remove(&self.peer_node_id);
+        let _ = self.tx.send(
+            self.outcome
+                .unwrap_or(veil_ipc::HolePunchOutcome::PunchTimeout),
+        );
+    }
 }
 
 impl Drop for NodeRuntime {
@@ -2405,6 +2484,9 @@ impl NodeRuntime {
             // when an IPC consumer (ogate/oproxy) queries a peer's
             // admission state.
             verified_peer_certs: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
+            // real-P2P Stage B: single-flight registry for explicit
+            // call-path hole-punch attempts (peer → in-flight outcome).
+            hole_punch_inflight: Arc::new(Mutex::new(std::collections::HashMap::new())),
             // open the admin audit log next to the config
             // file (typically <veil-dir>/admin-audit.log). A
             // failure to open is logged and the runtime continues
@@ -5249,23 +5331,49 @@ impl NodeServices {
         peer_ctx: Arc<veil_transport::TransportContext>,
     ) -> Option<Box<dyn TransportConnection>> {
         let config = veil_cfg::load_config(&self.config_path).ok()?;
-        if !config.nat.enabled {
+        let budget = std::time::Duration::from_millis(config.nat.punch_timeout_ms);
+        if budget.is_zero() {
             return None;
+        }
+        self.udp_hole_punch_dial_stages(target_node_id, peer_ctx, &config, budget)
+            .await
+            .ok()
+    }
+
+    /// Staged core of the initiator-side UDP hole punch. Same orchestration
+    /// as the historical `udp_hole_punch_dial`, but every early exit names
+    /// the stage that ended the attempt so the explicit call-path API
+    /// (`attempt_p2p_hole_punch`) can surface a structured outcome instead
+    /// of a bare miss. Strict stage order: reflector selection → mapping
+    /// discovery → coordinator signaling (candidate + one-time punch token)
+    /// → simultaneous punch → same-socket QUIC promotion.
+    async fn udp_hole_punch_dial_stages(
+        &self,
+        target_node_id: [u8; 32],
+        peer_ctx: Arc<veil_transport::TransportContext>,
+        config: &veil_cfg::Config,
+        budget: std::time::Duration,
+    ) -> std::result::Result<Box<dyn TransportConnection>, HolePunchDialFailure> {
+        if !config.nat.enabled {
+            return Err(HolePunchDialFailure::NoReflector);
         }
         let mut reflectors =
             self.available_udp_reflectors(target_node_id, &config.nat.udp_reflectors);
-        let first_reflector = *reflectors.first()?;
+        let Some(first_reflector) = reflectors.first().copied() else {
+            return Err(HolePunchDialFailure::NoReflector);
+        };
         reflectors.retain(|value| value.is_ipv4() == first_reflector.is_ipv4());
-        let timeout = std::time::Duration::from_millis(config.nat.punch_timeout_ms);
-        if timeout.is_zero() {
-            return None;
+        if budget.is_zero() {
+            return Err(HolePunchDialFailure::PunchTimeout);
         }
-        let deadline = tokio::time::Instant::now() + timeout;
+        let deadline = tokio::time::Instant::now() + budget;
         let bind_addr = match first_reflector {
             std::net::SocketAddr::V4(_) => "0.0.0.0:0",
             std::net::SocketAddr::V6(_) => "[::]:0",
         };
-        let socket = tokio::net::UdpSocket::bind(bind_addr).await.ok()?;
+        let socket = tokio::net::UdpSocket::bind(bind_addr)
+            .await
+            .map_err(|_| HolePunchDialFailure::MappingUnusable)?;
         veil_util::outbound_interface::configure_outbound_socket(
             &socket,
             if first_reflector.is_ipv4() {
@@ -5274,7 +5382,7 @@ impl NodeServices {
                 veil_util::outbound_interface::SocketFamilies::V6
             },
         )
-        .ok()?;
+        .map_err(|_| HolePunchDialFailure::MappingUnusable)?;
         let (discovery_token, punch_token) = {
             use rand_core::RngCore;
             let mut discovery = [0u8; 16];
@@ -5283,7 +5391,7 @@ impl NodeServices {
             rand_core::OsRng.fill_bytes(&mut punch);
             (discovery, punch)
         };
-        let discovery_timeout = timeout.min(std::time::Duration::from_millis(500));
+        let discovery_timeout = budget.min(std::time::Duration::from_millis(500));
         let mapping = veil_nat::discover_udp_mapping_any_for_punch(
             &socket,
             &reflectors,
@@ -5291,20 +5399,22 @@ impl NodeServices {
             discovery_timeout,
         )
         .await
-        .ok()?;
+        // An I/O error here means no reflector was even sendable — a
+        // reflector-availability failure, not a mapping verdict.
+        .map_err(|_| HolePunchDialFailure::NoReflector)?;
         let Some((mapping, _)) = mapping else {
             self.logger.debug(
                 "nat.udp_punch.discovery_unusable",
                 "no non-hairpin UDP mapping from peer-announced reflectors",
             );
-            return None;
+            return Err(HolePunchDialFailure::MappingUnusable);
         };
         let mut candidate = veil_nat::socket_addr_to_candidate(mapping);
         candidate.candidate_type = veil_proto::control::candidate_type::SRFLX;
         candidate.priority = 1_694_498_815;
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         if remaining.is_zero() {
-            return None;
+            return Err(HolePunchDialFailure::SignalingTimeout);
         }
         let signaling_timeout = remaining.min(std::time::Duration::from_millis(1_500));
         let reply = self
@@ -5314,9 +5424,17 @@ impl NodeServices {
                 signaling_timeout,
                 Some(punch_token),
             )
-            .await?;
+            .await
+            .ok_or(HolePunchDialFailure::SignalingTimeout)?;
         if reply.punch_token != Some(punch_token) {
-            return None;
+            // Reply came back without our one-time token — an older peer
+            // build that cannot run the punch responder. Signaling-stage
+            // failure; the log carries the precise cause.
+            self.logger.debug(
+                "nat.udp_punch.signaling_no_token",
+                "NAT probe reply lacks our punch token (peer build too old?)",
+            );
+            return Err(HolePunchDialFailure::SignalingTimeout);
         }
         let candidates = reply
             .candidates
@@ -5327,20 +5445,33 @@ impl NodeServices {
             .filter_map(veil_nat::candidate_to_socket_addr)
             .filter(|candidate| veil_nat::is_public_punch_addr(*candidate))
             .collect::<Vec<_>>();
+        if candidates.is_empty() {
+            // The peer answered but could not offer any public
+            // server-reflexive candidate — its mapping is unusable, so a
+            // punch can never converge. Distinct from our own mapping
+            // failure only in the log line.
+            self.logger.debug(
+                "nat.udp_punch.peer_mapping_unusable",
+                "peer reply carried no public srflx candidate",
+            );
+            return Err(HolePunchDialFailure::MappingUnusable);
+        }
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         // Reserve up to 750 ms (and at least half this remaining slice) for
         // QUIC so a doomed punch cannot consume the entire direct-path budget.
         let quic_reserve = (remaining / 2).min(std::time::Duration::from_millis(750));
         let punch_timeout = remaining.saturating_sub(quic_reserve);
         if punch_timeout.is_zero() {
-            return None;
+            return Err(HolePunchDialFailure::PunchTimeout);
         }
         let peer = veil_nat::punch_udp(&socket, &candidates, punch_token, punch_timeout)
             .await
-            .ok()??;
+            .ok()
+            .flatten()
+            .ok_or(HolePunchDialFailure::PunchTimeout)?;
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         if remaining.is_zero() {
-            return None;
+            return Err(HolePunchDialFailure::PunchTimeout);
         }
         let promoted = tokio::time::timeout(
             remaining,
@@ -5361,21 +5492,375 @@ impl NodeServices {
                         veil_util::hex_short(&target_node_id)
                     ),
                 );
-                Some(connection)
+                Ok(connection)
             }
             Ok(Err(error)) => {
                 self.logger
                     .warn("nat.udp_punch.quic_failed", error.to_string());
-                None
+                Err(HolePunchDialFailure::QuicFailed)
             }
             Err(_) => {
                 self.logger.warn(
                     "nat.udp_punch.quic_failed",
                     "overall NAT traversal deadline elapsed",
                 );
-                None
+                Err(HolePunchDialFailure::QuicFailed)
             }
         }
+    }
+
+    /// Explicit, bounded call-path hole-punch attempt toward a registered
+    /// peer (real-P2P epic, Stage B; exposed over IPC as
+    /// `LocalAppMsg::AttemptHolePunch`).
+    ///
+    /// Contract (mirrors [`veil_ipc::HolePunchDriver`]):
+    /// * **Anonymity posture never enters this path** — a node booted with
+    ///   `[anonymity].onion_service` refuses immediately
+    ///   ([`veil_ipc::HolePunchOutcome::RefusedAnonymous`]) before any
+    ///   socket, reflector, or signaling side effect.
+    /// * **Idempotent** — an existing live direct session short-circuits to
+    ///   `Connected` without network work; a repeat call after a successful
+    ///   punch takes the same short-circuit.
+    /// * **Single-flight per peer** — a call that finds an attempt already
+    ///   in flight subscribes to its outcome instead of racing a second
+    ///   socket/punch toward the same peer.
+    /// * **One shared budget** ([`veil_proto::budget::
+    ///   HOLE_PUNCH_ATTEMPT_BUDGET_MS`], 5 s) covers every stage including
+    ///   the session handshake on the punched QUIC connection.
+    ///
+    /// On `Connected` the punched session is registered through the normal
+    /// outbound path (`register_connection_session` + session runner), so
+    /// `peer_pnet_status().admitted` flips the standard way and REALTIME
+    /// media rides the session's QUIC DATAGRAM lane exactly like any other
+    /// admitted direct QUIC session.
+    pub async fn attempt_p2p_hole_punch(
+        &self,
+        peer_node_id: [u8; 32],
+    ) -> veil_ipc::HolePunchOutcome {
+        use veil_ipc::HolePunchOutcome as Outcome;
+        // Anonymity gate FIRST: `onion_service_hops` is `Some` iff the node
+        // was booted with `[anonymity].onion_service = true` (pinned at
+        // boot; reloads cannot flip it), which is exactly the posture whose
+        // real external address must never be disclosed by a punch.
+        if self.anonymity.onion_service_hops.is_some() {
+            self.logger.debug(
+                "nat.udp_punch.refused_anonymous",
+                format!(
+                    "explicit punch refused under onion-service posture peer={}",
+                    veil_util::hex_short(&peer_node_id)
+                ),
+            );
+            return Outcome::RefusedAnonymous;
+        }
+        // Idempotent short-circuit: a live direct session already exists
+        // (same registry signal `PnetStatusProvider` derives `admitted`
+        // from — sessions appear there only after a completed handshake).
+        if self.has_live_session(&peer_node_id) {
+            return Outcome::Connected;
+        }
+        // Single-flight: either claim the peer's slot (initiator) or join
+        // the attempt already in flight. The map lock is confined to this
+        // block — never held across an await.
+        enum Flight {
+            Join(tokio::sync::broadcast::Receiver<veil_ipc::HolePunchOutcome>),
+            Run(HolePunchInflightGuard),
+        }
+        let flight = {
+            let mut inflight = lock!(self.hole_punch_inflight);
+            match inflight.get(&peer_node_id) {
+                Some(tx) => Flight::Join(tx.subscribe()),
+                None => {
+                    let (tx, _rx) = tokio::sync::broadcast::channel(1);
+                    inflight.insert(peer_node_id, tx.clone());
+                    Flight::Run(HolePunchInflightGuard {
+                        map: Arc::clone(&self.hole_punch_inflight),
+                        peer_node_id,
+                        tx,
+                        outcome: None,
+                    })
+                }
+            }
+        };
+        match flight {
+            Flight::Join(mut rx) => match rx.recv().await {
+                Ok(outcome) => outcome,
+                // Initiator dropped without broadcasting: the drop-guard
+                // normally sends PunchTimeout, so this arm is
+                // belt-and-braces for a torn-down runtime.
+                Err(_) => Outcome::PunchTimeout,
+            },
+            Flight::Run(mut guard) => {
+                let outcome = self.attempt_p2p_hole_punch_run(peer_node_id).await;
+                guard.outcome = Some(outcome);
+                drop(guard); // releases the slot + broadcasts to joiners
+                outcome
+            }
+        }
+    }
+
+    /// Number of exclusive punch attempts started through this
+    /// `NodeServices` (single-flight joiners do not count). Test hook for
+    /// asserting that a concurrent second call joined instead of starting
+    /// a second punch.
+    pub fn hole_punch_run_count(&self) -> u64 {
+        self.hole_punch_run_count
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// The staged body of one exclusive (slot-holding) punch attempt.
+    async fn attempt_p2p_hole_punch_run(
+        &self,
+        peer_node_id: [u8; 32],
+    ) -> veil_ipc::HolePunchOutcome {
+        use veil_ipc::HolePunchOutcome as Outcome;
+        self.hole_punch_run_count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let budget =
+            std::time::Duration::from_millis(veil_proto::budget::HOLE_PUNCH_ATTEMPT_BUDGET_MS);
+        let deadline = tokio::time::Instant::now() + budget;
+        // The target must be a registered peer: endpoint exchange
+        // (bootstrap join) both authenticates the pubkey/nonce we hand to
+        // the QUIC context below and bounds who can make this node punch.
+        let Some(peer) = lock_state(&self.state)
+            .peers
+            .values()
+            .find(|entry| entry.node_id.as_bytes() == &peer_node_id)
+            .cloned()
+        else {
+            return Outcome::UnknownPeer;
+        };
+        let config = match veil_cfg::load_config(&self.config_path) {
+            Ok(config) => config,
+            Err(error) => {
+                self.logger.warn(
+                    "nat.udp_punch.config_unavailable",
+                    format!("explicit punch cannot load config: {error}"),
+                );
+                return Outcome::NoReflector;
+            }
+        };
+        let peer_ctx = match peer_transport_context(&self.transport_ctx, &peer) {
+            Ok(ctx) => Arc::new(ctx),
+            Err(error) => {
+                self.logger.warn(
+                    "nat.udp_punch.peer_ctx_failed",
+                    format!("peer={} error={error}", peer.peer_id),
+                );
+                return Outcome::QuicFailed;
+            }
+        };
+        // Reserve a slice of the shared budget for the OVL1 handshake on
+        // the punched connection so a slow punch cannot leave registration
+        // with a zero deadline.
+        const HANDSHAKE_RESERVE: std::time::Duration = std::time::Duration::from_millis(1_000);
+        let dial_budget = budget.saturating_sub(HANDSHAKE_RESERVE);
+        let connection = match self
+            .udp_hole_punch_dial_stages(peer_node_id, peer_ctx, &config, dial_budget)
+            .await
+        {
+            Ok(connection) => connection,
+            Err(failure) => return failure.into(),
+        };
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let session_ctx = self.make_session_context();
+        if let Some(metrics) = &session_ctx.metrics {
+            metrics.inc_outbound_connect_attempts();
+        }
+        // E20: a punched dial is a one-sided no-glare recovery dial — the
+        // primary URI was undialable and the peer is not reciprocally
+        // dialing this exact socket — so bypass directional dedup like the
+        // other NAT-traversal recovery paths.
+        let registered = tokio::time::timeout(
+            remaining,
+            register_connection_session(
+                session_ctx,
+                SessionSource::Outbound(peer.peer_id),
+                Some(ExpectedPeerIdentity {
+                    peer_id: peer.peer_id,
+                    public_key: peer.public_key.clone(),
+                    node_id: peer.node_id,
+                    nonce: peer.nonce.clone(),
+                }),
+                None,
+                SessionState::Active,
+                connection,
+                true,
+            ),
+        )
+        .await;
+        match registered {
+            Ok(Ok(Some(session))) => {
+                self.logger.info(
+                    "nat.udp_punch.session_registered",
+                    format!("peer={} via=explicit_call_path", peer.peer_id),
+                );
+                self.spawn_punched_outbound(session, &peer);
+                Outcome::Connected
+            }
+            Ok(Ok(None)) => {
+                // Handoff-binding is an inbound-only branch; reaching it on
+                // an outbound register would be a runtime bug. Surface as
+                // the QUIC/session stage failing rather than lying about
+                // success.
+                self.logger.warn(
+                    "nat.udp_punch.session_register_anomaly",
+                    "outbound punched register returned handoff-bound (impossible)",
+                );
+                Outcome::QuicFailed
+            }
+            Ok(Err(error)) => {
+                self.logger.warn(
+                    "nat.udp_punch.session_register_failed",
+                    format!("peer={} error={error}", peer.peer_id),
+                );
+                Outcome::QuicFailed
+            }
+            Err(_) => {
+                self.logger.warn(
+                    "nat.udp_punch.session_register_failed",
+                    "punched session handshake exceeded the attempt budget",
+                );
+                Outcome::QuicFailed
+            }
+        }
+    }
+
+    /// Spawn the session runner for an initiator-side punched session —
+    /// the outbound analog of [`Self::spawn_punched_inbound`]. Mirrors the
+    /// outbound-connector runner wiring minus the connector-loop concerns
+    /// (no gateway ATTACH/keepalive, no bootstrap FIND_NODE burst) and
+    /// with `primary_uri: None`: the punched mapping is ephemeral, so
+    /// rotation/handoff must not try to re-dial it — recovery of a dead
+    /// punched session belongs to the standard outbound connector via the
+    /// SessionGuard refresh bump (mobility slice).
+    fn spawn_punched_outbound(
+        &self,
+        session: AttachedDebugSession,
+        peer: &crate::types::PeerConfigEntry,
+    ) {
+        let access = self.clone();
+        let peer = peer.clone();
+        let handle = tokio::spawn(async move {
+            let dispatcher = Arc::clone(&access.dispatcher);
+            let ban_list = Arc::clone(&dispatcher.abuse.ban_list);
+            let violation_tracker = Arc::clone(&dispatcher.abuse.violation_tracker);
+            let (tx_cipher, rx_cipher, session_id, raw_tx_key, raw_rx_key) = {
+                let keys = session.session_keys;
+                let tx = keys.tx_key;
+                let rx = keys.rx_key;
+                (
+                    Some(veil_crypto::session_cipher::SessionCipher::new(&tx, true)),
+                    Some(veil_crypto::session_cipher::SessionCipher::new(&rx, true)),
+                    keys.session_id,
+                    tx,
+                    rx,
+                )
+            };
+            let peer_id = session.peer_id;
+            let outbox_rx = session.reserved_outbox_rx;
+            let rpc_rx = access.session_outbox.register_owned(peer_id, session_id);
+            let mut runner = veil_session::runner::SessionRunner {
+                stream: session.stream,
+                quic_datagrams: session.quic_datagrams,
+                peer_id: *peer_id.as_bytes(),
+                dispatcher,
+                logger: Arc::clone(&access.logger),
+                metrics: access.metrics.clone(),
+                ban_list,
+                violation_tracker,
+                crypto: veil_session::runner::CryptoState {
+                    tx_cipher,
+                    rx_cipher,
+                    peer_mlkem_keys: Some(Arc::clone(&access.identity.peer_mlkem_keys)),
+                    per_session_mlkem_dk: Some(Arc::clone(&access.identity.per_session_mlkem_dk)),
+                },
+                outbox: Some(outbox_rx),
+                rpc_outbox: Some(rpc_rx),
+                keepalive_interval: access.defaults.keepalive_interval,
+                idle_timeout: access.defaults.idle_timeout,
+                max_pending_responses: access.defaults.max_pending_responses,
+                pending_response_ttl: access.defaults.pending_response_ttl,
+                max_frame_body: access.defaults.max_frame_body,
+                rekey: veil_session::runner::RekeyConfig {
+                    bytes_threshold: access.defaults.rekey_bytes_threshold,
+                    time_threshold_secs: access.defaults.rekey_time_threshold_secs,
+                },
+                qos_weights: access.defaults.qos_weights,
+                session_id,
+                local_node_id: access.local_node_id,
+                mobile: veil_session::runner::MobileConfig {
+                    base_keepalive_interval: access.defaults.keepalive_interval,
+                    battery_keepalive_scale_low: access.mobile.battery_keepalive_scale_low,
+                    battery_keepalive_scale_medium: access.mobile.battery_keepalive_scale_medium,
+                    battery_threshold_low: access.mobile.battery_threshold_low,
+                    battery_threshold_medium: access.mobile.battery_threshold_medium,
+                },
+                // Client role — the responder issues the ticket; we store it.
+                ticket_to_send: None,
+                peer_tickets: Some(Arc::clone(&access.resumption.peer_tickets)),
+                raw_session_keys: Some((raw_tx_key, raw_rx_key, session_id)),
+                peer_public_key: Some(session.public_key.clone()),
+                peer_nonce: Some(session.nonce.clone()),
+                hot_standby: veil_session::runner::HotStandbyState {
+                    swap_rx: None,
+                    handoff_registry: Some(Arc::clone(&access.handoff.registry)),
+                    handoff_ack_waiters: Some(Arc::clone(&access.handoff.ack_waiters)),
+                    controller: Some(Arc::clone(&access.handoff.controller)),
+                    auto_trigger_after_write_errors: access.handoff.auto_trigger_after_write_errors,
+                },
+                primary_uri: None,
+            };
+            // Same post-handshake bookkeeping as the outbound connector: the
+            // peer joins the DHT routing table (proved key ownership), the
+            // dispatcher learns the session + reflector advertisements, and
+            // the mobility-slice connectivity-gain hook fires (an outbound
+            // handshake completing is fresh evidence of working egress).
+            access
+                .dht
+                .add_contact_trusted(veil_dht::routing::Contact::with_mode(
+                    *peer.node_id.as_bytes(),
+                    &peer.transport,
+                    session.remote_discovery_mode,
+                ));
+            let _ = access
+                .dht
+                .promote_contact_if_pending(peer.node_id.as_bytes());
+            access.dispatcher.on_session_opened(
+                *peer_id.as_bytes(),
+                session.observed_addr,
+                session.udp_reflector_port,
+                &session.shared_udp_reflectors,
+            );
+            access.connectivity_gain.on_outbound_session_established();
+            crate::runtime::send_local_announcement(
+                &access.dht,
+                &access.session_outbox,
+                *peer_id.as_bytes(),
+            );
+            access
+                .session_tx_registry
+                .write()
+                .unwrap_or_else(|p| p.into_inner())
+                .send_to(
+                    peer_id.as_bytes(),
+                    veil_proto::priority::INTERACTIVE,
+                    crate::outbound_connector::build_startup_route_probe_frame(),
+                );
+            let _swap_guard = runner.register_swap_channel(&access.handoff.swap_registry);
+            runner.run().await;
+            drop(_swap_guard);
+            access.dispatcher.on_session_closed(peer_id, false);
+            wlock!(access.identity.peer_mlkem_keys).remove(peer_id.as_bytes());
+            lock!(access.identity.per_session_mlkem_dk).remove(peer_id.as_bytes());
+            access
+                .session_tx_registry
+                .write()
+                .unwrap_or_else(|p| p.into_inner())
+                .unregister_owned(peer_id.as_bytes(), &session_id);
+            access.session_outbox.unregister_owned(peer_id, &session_id);
+            let _ = runner.stream.shutdown().await;
+        });
+        push_session_handle(&self.tasks, handle);
     }
 
     async fn nat_fallback_dial(
