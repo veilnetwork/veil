@@ -2472,6 +2472,22 @@ char* veil_media_list_screen_inputs(void) {
 #endif
 }
 
+int veil_media_screen_capture_access(void) {
+#if defined(VEIL_MEDIA_HAVE_WEBRTC) && defined(__APPLE__)
+  return veil_media::PlatformScreenAccessGranted() ? 1 : 0;
+#else
+  return -1;
+#endif
+}
+
+int veil_media_request_screen_capture_access(void) {
+#if defined(VEIL_MEDIA_HAVE_WEBRTC) && defined(__APPLE__)
+  return veil_media::RequestPlatformScreenAccess() ? 1 : 0;
+#else
+  return -1;
+#endif
+}
+
 int veil_media_engine_select_audio_input(VeilMediaEngine* engine,
                                          const char* id) {
   if (engine == nullptr || id == nullptr) return VEIL_MEDIA_ERR_ARG;

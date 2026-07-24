@@ -8,6 +8,7 @@ import 'package:flutter/foundation.dart';
 // DynamicLibrary.open does NOT expose the loaded lib's symbols to later loads.
 const int _rtldNow = 0x00002;
 const int _rtldGlobal = 0x00100;
+const int _darwinRtldGlobal = 0x00008;
 String? _androidNativeLibraryDir() {
   try {
     final lines = File('/proc/self/maps').readAsLinesSync();
@@ -37,6 +38,29 @@ Pointer<Void> _dlopenGlobalAndroidPath(String path) {
   final name = path.toNativeUtf8();
   try {
     final handle = dlopen(name, _rtldNow | _rtldGlobal);
+    if (handle == nullptr) {
+      final err = dlerror();
+      final msg = err == nullptr ? 'unknown error' : err.toDartString();
+      debugPrint('veil_media: dlopen $path global failed: $msg');
+    }
+    return handle;
+  } finally {
+    malloc.free(name);
+  }
+}
+
+Pointer<Void> _dlopenGlobalMacOSPath(String path) {
+  final proc = DynamicLibrary.process();
+  final dlopen = proc.lookupFunction<
+      Pointer<Void> Function(Pointer<Utf8>, Int32),
+      Pointer<Void> Function(Pointer<Utf8>, int)>('dlopen');
+  final dlerror =
+      proc.lookupFunction<Pointer<Utf8> Function(), Pointer<Utf8> Function()>(
+    'dlerror',
+  );
+  final name = path.toNativeUtf8();
+  try {
+    final handle = dlopen(name, _rtldNow | _darwinRtldGlobal);
     if (handle == nullptr) {
       final err = dlerror();
       final msg = err == nullptr ? 'unknown error' : err.toDartString();
@@ -93,6 +117,12 @@ DynamicLibrary _openAndroid() {
 DynamicLibrary _open() {
   final override = Platform.environment['VEIL_MEDIA_DYLIB'];
   if (override != null && override.isNotEmpty) {
+    if (Platform.isMacOS) {
+      final veilOverride = Platform.environment['VEIL_FFI_DYLIB'];
+      if (veilOverride != null && veilOverride.isNotEmpty) {
+        _dlopenGlobalMacOSPath(veilOverride);
+      }
+    }
     return DynamicLibrary.open(override);
   }
   if (Platform.isMacOS) {

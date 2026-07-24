@@ -54,6 +54,19 @@ List<MediaDevice> _decodeDevices(Pointer<Utf8> json) {
   }
 }
 
+/// Process-global macOS display/window sources.
+///
+/// Unlike camera/audio enumeration this does not require a live engine. IDs
+/// remain local and must be passed back only to `startScreen(sourceId: ...)`.
+List<MediaDevice> listPlatformScreenInputs() =>
+    _decodeDevices(ffi.veilMediaListScreenInputs());
+
+bool get platformScreenCaptureAccessGranted =>
+    ffi.veilMediaScreenCaptureAccess?.call() == 1;
+
+bool requestPlatformScreenCaptureAccess() =>
+    ffi.veilMediaRequestScreenCaptureAccess?.call() == 1;
+
 /// A decoded remote video frame: tightly-packed RGBA (width*height*4 bytes).
 class VeilVideoFrame {
   const VeilVideoFrame(
@@ -201,12 +214,11 @@ class VeilMediaEngine {
     return ffi.veilMediaEngineStopCamera(_ptr) == 0;
   }
 
-  /// Share the main display into the video send stream (video send must be
-  /// started). Replaces a running camera as the single video source — the
-  /// receiver renders it with no changes. Returns false where this platform
-  /// has no screen backend (macOS only for now) or capture can't start. The
-  /// first ever use triggers the OS Screen Recording consent prompt; until
-  /// granted (plus an app restart) the share runs black. Idempotent.
+  /// Share a selected macOS display or window into the video send stream
+  /// (video send must be started). Replaces a running camera as the single
+  /// video source — the receiver renders it with no changes. Returns false
+  /// where this platform has no screen backend or capture cannot start,
+  /// including while OS Screen Recording permission is missing. Idempotent.
   bool startScreen({int width = 640, int fps = 10, String? sourceId}) {
     _ensure();
     if (sourceId != null && sourceId.isNotEmpty) {
@@ -415,7 +427,7 @@ class VeilMediaEngine {
 
   List<MediaDevice> listScreenInputs() {
     _ensure();
-    return _decodeDevices(ffi.veilMediaListScreenInputs());
+    return listPlatformScreenInputs();
   }
 
   bool selectAudioInput(String id) =>
@@ -581,7 +593,7 @@ class VeilGroupMediaEngine {
 
   List<MediaDevice> listScreenInputs() {
     _ensure();
-    return _decodeDevices(ffi.veilMediaListScreenInputs());
+    return listPlatformScreenInputs();
   }
 
   bool stopScreen() {
