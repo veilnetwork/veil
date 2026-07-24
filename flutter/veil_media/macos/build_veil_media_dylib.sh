@@ -59,7 +59,16 @@ compile_tu "$SRCDIR/veil_audio_record.cc" "$TMP/record.o"
 compile_tu "$SRCDIR/veil_audio_play.cc" "$TMP/play.o"
 compile_tu "$SRCDIR/veil_video_note.cc" "$TMP/vnote.o"
 
-printf '_veil_media_*\n' > "$TMP/exported.txt"
+# The export list must contain only symbols DEFINED here. A `_veil_media_*`
+# wildcard also matches the two symbols this dylib IMPORTS via
+# -undefined dynamic_lookup (veil_media_send_datagram /
+# veil_media_set_recv_callback live in veilclient-ffi); listing an undefined
+# symbol as exported makes ld64 record it as a re-export with the
+# dynamic-lookup ordinal (-2), and modern dyld then rejects the whole image
+# on dlopen ("re-export ordinal -2 out of range"), breaking the native
+# voice/video players. ld64 refuses -unexported_symbols_list next to an
+# export list, so the defined set is discovered with a first filterless link
+# pass and fed to the final link explicitly (see below).
 
 cd "$WEBRTC_SRC/$WEBRTC_OUT"
 CXX_OBJS="$(find obj/buildtools/third_party/libc++ obj/buildtools/third_party/libc++abi -name '*.o')"
@@ -71,18 +80,28 @@ SDK="sdk/xcode_links/$(ls sdk/xcode_links | grep -iE 'MacOSX[0-9].*\.sdk$' | hea
 # to link the whole reachable graph while diagnosing that.
 DEADSTRIP="-Wl,-dead_strip"
 [ -n "${VEIL_MEDIA_NO_DEADSTRIP:-}" ] && DEADSTRIP=""
-echo "==> linking libveil_media.dylib (sdk=$SDK, deadstrip='${DEADSTRIP}')"
-# shellcheck disable=SC2086
-"$CLANGXX" -dynamiclib -o "$DEST/libveil_media.dylib" \
-  "$TMP/engine.o" "$TMP/shim.o" "$TMP/avf_adm.o" "$TMP/avf_camera.o" "$TMP/avf_screen.o" "$TMP/record.o" "$TMP/play.o" "$TMP/vnote.o" obj/libwebrtc.a $CXX_OBJS \
-  $DEADSTRIP -Wl,-undefined,dynamic_lookup \
-  -Wl,-exported_symbols_list,"$TMP/exported.txt" \
-  -install_name @rpath/libveil_media.dylib \
-  --target=arm64-apple-macos -isysroot "$SDK" \
-  -framework Foundation -framework CoreFoundation -framework CoreAudio -framework AudioToolbox \
-  -framework AudioUnit -framework CoreServices -framework IOKit -framework SystemConfiguration \
-  -framework Security -framework CoreMedia -framework CoreVideo -framework AVFoundation -framework ApplicationServices \
-  -framework CoreGraphics -weak_framework ScreenCaptureKit
+
+link_dylib() {
+  # $1 = output path, remaining args = extra linker flags
+  local out="$1"; shift
+  # shellcheck disable=SC2086
+  "$CLANGXX" -dynamiclib -o "$out" \
+    "$TMP/engine.o" "$TMP/shim.o" "$TMP/avf_adm.o" "$TMP/avf_camera.o" "$TMP/avf_screen.o" "$TMP/record.o" "$TMP/play.o" "$TMP/vnote.o" obj/libwebrtc.a $CXX_OBJS \
+    $DEADSTRIP -Wl,-undefined,dynamic_lookup \
+    "$@" \
+    -install_name @rpath/libveil_media.dylib \
+    --target=arm64-apple-macos -isysroot "$SDK" \
+    -framework Foundation -framework CoreFoundation -framework CoreAudio -framework AudioToolbox \
+    -framework AudioUnit -framework CoreServices -framework IOKit -framework SystemConfiguration \
+    -framework Security -framework CoreMedia -framework CoreVideo -framework AVFoundation -framework ApplicationServices \
+    -framework CoreGraphics -weak_framework ScreenCaptureKit
+}
+
+echo "==> link pass 1: discover defined veil_media_* exports (sdk=$SDK)"
+link_dylib "$TMP/probe.dylib"
+nm -gU "$TMP/probe.dylib" | awk '{print $3}' | grep '^_veil_media_' > "$TMP/exported.txt"
+echo "==> link pass 2: final dylib with $(wc -l < "$TMP/exported.txt" | xargs) defined exports (deadstrip='${DEADSTRIP}')"
+link_dylib "$DEST/libveil_media.dylib" -Wl,-exported_symbols_list,"$TMP/exported.txt"
 
 echo "==> done: $DEST/libveil_media.dylib ($(du -h "$DEST/libveil_media.dylib" | cut -f1))"
 nm -gU "$DEST/libveil_media.dylib" | grep -c "T _veil_media_" | xargs echo "exported veil_media_* symbols:"
