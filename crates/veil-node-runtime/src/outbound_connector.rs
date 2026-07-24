@@ -566,6 +566,13 @@ pub fn spawn_outbound_peers(
                                     session.udp_reflector_port,
                                     &session.shared_udp_reflectors,
                                 );
+                                // P2P mobility slice: an outbound session
+                                // completing is fresh evidence that egress on
+                                // the CURRENT network works — kick the srflx
+                                // re-probe and (debounced) wake sleeping
+                                // connector loops so peers unreachable on the
+                                // old path get re-dialed promptly.
+                                access.connectivity_gain.on_outbound_session_established();
                                 //gossip our self-signed
                                 // transport announcement to the new peer (mirror of
                                 // the inbound path) so resolves of `local_node_id`
@@ -757,15 +764,29 @@ pub fn spawn_outbound_peers(
                                 // a forced reconnect after WiFi → 4G flip
                                 // doesn't wait out (typically multi-second)
                                 // exponential backoff sleep.
+                                let mut woken_by_connectivity = false;
                                 tokio::select! {
                                     _ = shutdown_rx.changed() => break,
                                     _ = tokio::time::sleep(sleep_dur) => {}
-                                    _ = access.force_reconnect_notify.notified() => {}
+                                    _ = access.force_reconnect_notify.notified() => {
+                                        woken_by_connectivity = true;
+                                    }
                                     changed = refresh_rx.changed() => {
                                         if changed.is_err() { break; }
+                                        woken_by_connectivity = true;
                                     }
                                 }
-                                if is_duplicate {
+                                if woken_by_connectivity {
+                                    // P2P mobility slice: a network-change /
+                                    // connectivity-gain / session-close wake
+                                    // means the failure streak belonged to the
+                                    // OLD network path. Retry immediately with
+                                    // a fresh backoff — riding out a grown
+                                    // (up to 300 s) delay after the device
+                                    // returned to a working network is exactly
+                                    // the latency this slice removes.
+                                    backoff = backoff_min;
+                                } else if is_duplicate {
                                     // Peer is already reachable via the inbound
                                     // that won the race; don't grow backoff.
                                     backoff = backoff_min;
