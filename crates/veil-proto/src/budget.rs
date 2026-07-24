@@ -568,6 +568,16 @@ pub const MAX_BIND_DECODE_FAILURES: u32 = 16;
 /// from forcing O(N²) sort-and-fan-out on every punch attempt.
 pub const MAX_HOLE_PUNCH_CANDIDATES: usize = 10;
 
+/// Overall wall-clock budget for one EXPLICIT call-path hole-punch
+/// attempt (`LocalAppMsg::AttemptHolePunch`): reflector mapping
+/// discovery + coordinator signaling + simultaneous punch + same-socket
+/// QUIC promotion + session registration all share this one deadline.
+/// Call setup waits on this result before committing to relay, so the
+/// budget must stay inside the app's call-signaling window (5 s in
+/// xVeil) — a longer punch would not make the call direct, it would
+/// only delay the honest relay fallback.
+pub const HOLE_PUNCH_ATTEMPT_BUDGET_MS: u64 = 5_000;
+
 /// maximum contacts from the same /16 IPv4
 /// (or /32 IPv6) "AS-proxy" prefix allowed in a single k-bucket.
 ///

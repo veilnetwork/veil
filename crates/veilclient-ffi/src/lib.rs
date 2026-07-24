@@ -6602,6 +6602,90 @@ pub unsafe extern "C" fn veil_listen_transports(
     }
 }
 
+/// Explicit hole-punch outcome codes (real-P2P epic, Stage B).
+/// Mirror `veil_proto::hole_punch_status`.
+pub const VEIL_HOLE_PUNCH_CONNECTED: u8 = 0;
+pub const VEIL_HOLE_PUNCH_NO_REFLECTOR: u8 = 1;
+pub const VEIL_HOLE_PUNCH_SIGNALING_TIMEOUT: u8 = 2;
+pub const VEIL_HOLE_PUNCH_MAPPING_UNUSABLE: u8 = 3;
+pub const VEIL_HOLE_PUNCH_PUNCH_TIMEOUT: u8 = 4;
+pub const VEIL_HOLE_PUNCH_QUIC_FAILED: u8 = 5;
+pub const VEIL_HOLE_PUNCH_REFUSED_ANONYMOUS: u8 = 6;
+pub const VEIL_HOLE_PUNCH_UNKNOWN_PEER: u8 = 7;
+pub const VEIL_HOLE_PUNCH_UNSUPPORTED: u8 = 8;
+
+/// Run one explicit, bounded UDP hole-punch attempt toward a registered
+/// peer (real-P2P epic, Stage B: punch in the call path). The daemon
+/// drives reflector mapping discovery + coordinator signaling +
+/// token-authenticated simultaneous punch + same-socket QUIC promotion +
+/// normal session registration under one 5-second budget
+/// (`HOLE_PUNCH_ATTEMPT_BUDGET_MS`); on `VEIL_HOLE_PUNCH_CONNECTED` the
+/// direct session is registered and `veil_peer_pnet_status` flips
+/// `admitted` the standard way. Repeat calls are idempotent; concurrent
+/// calls for the same peer join the in-flight attempt daemon-side.
+///
+/// Returns [`VEIL_OK`] iff the IPC round-trip itself succeeded; the
+/// structured outcome lives in `out_status` (one of `VEIL_HOLE_PUNCH_*`).
+/// Bounded at 10 s total (8 s client RPC budget + shared-client mutex
+/// slack); a timeout returns `VEIL_ERR` with `err_out` set. The RPC
+/// holds this handle's shared client mutex for the attempt's duration —
+/// callers should use a handle whose mutex is not on a latency-critical
+/// path (xVeil calls it from the endpoint-service client, sequenced
+/// before its admitted-polls).
+///
+/// # Safety
+/// `handle` must be a live connect handle; `peer_node_id_32` must point
+/// to 32 readable bytes; `out_status` must be writable; `err_out` (if
+/// non-null) must be a writable `*mut c_char` slot.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn veil_attempt_p2p_hole_punch(
+    handle: *mut VeilHandle,
+    peer_node_id_32: *const u8,
+    out_status: *mut u8,
+    err_out: *mut *mut c_char,
+) -> c_int {
+    if let Err(rc) = unsafe { guard::ffi_prelude(err_out, "veil_attempt_p2p_hole_punch") } {
+        return rc;
+    }
+    null_check!(err_out,
+        "handle" => handle,
+        "peer_node_id_32" => peer_node_id_32,
+        "out_status" => out_status,
+    );
+    let mut peer = [0u8; 32];
+    unsafe { ptr::copy_nonoverlapping(peer_node_id_32, peer.as_mut_ptr(), 32) };
+    get_or_return!(
+        handle_live,
+        handle_table(),
+        handle,
+        err_out,
+        VEIL_ERR_INVALID_ARG,
+        "VeilHandle"
+    );
+    let bundle = Arc::clone(&handle_live.bundle);
+    let res = bundle.runtime.block_on(async {
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            let client = bundle.client.lock().await;
+            client.attempt_hole_punch(&peer).await
+        })
+        .await
+    });
+    match res {
+        Ok(Ok(status)) => {
+            unsafe { *out_status = status };
+            VEIL_OK
+        }
+        Ok(Err(e)) => {
+            unsafe { write_err(err_out, format!("attempt_hole_punch failed: {e}")) };
+            VEIL_ERR
+        }
+        Err(_) => {
+            unsafe { write_err(err_out, "attempt_hole_punch timed out (10s)") };
+            VEIL_ERR
+        }
+    }
+}
+
 /// Create-bootstrap-invite status codes (Epic 489.7 generator side).
 /// Mirror `veil_proto::create_invite_status`.
 pub const VEIL_CREATE_INVITE_OK: u8 = 0;

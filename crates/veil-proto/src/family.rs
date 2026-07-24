@@ -838,6 +838,21 @@ pub enum LocalAppMsg {
     /// `u16 count`, then per URI `u16 len + utf8 bytes`
     /// (see `ListenTransportsResultPayload`).
     ListenTransportsResult = 90,
+
+    /// **Explicit call-path hole punch: app → daemon** (real-P2P epic,
+    /// Stage B).  Asks the daemon to run one bounded UDP hole-punch
+    /// attempt toward a registered peer: reflector mapping discovery +
+    /// token-authenticated simultaneous punch + same-socket QUIC
+    /// promotion + normal session registration.  Payload: 32-byte
+    /// `peer_node_id`.  Seconds-class arc (overall budget
+    /// [`crate::budget::HOLE_PUNCH_ATTEMPT_BUDGET_MS`]) — daemon runs it
+    /// off the connection loop when `request_id != 0` and replies with
+    /// [`Self::AttemptHolePunchResult`].
+    AttemptHolePunch = 91,
+    /// Reply to [`Self::AttemptHolePunch`].  Payload:
+    /// [`crate::ipc::AttemptHolePunchResultPayload`] (1-byte structured
+    /// `hole_punch_status` + echoed 32-byte peer_node_id).
+    AttemptHolePunchResult = 92,
 }
 
 impl TryFrom<u16> for LocalAppMsg {
@@ -935,6 +950,8 @@ impl TryFrom<u16> for LocalAppMsg {
             88 => Ok(LocalAppMsg::SendAuthenticatedDirectWithReplyResult),
             89 => Ok(LocalAppMsg::ListenTransportsQuery),
             90 => Ok(LocalAppMsg::ListenTransportsResult),
+            91 => Ok(LocalAppMsg::AttemptHolePunch),
+            92 => Ok(LocalAppMsg::AttemptHolePunchResult),
             _ => Err(ProtoError::UnknownMsgType {
                 family: FrameFamily::LocalApp as u8,
                 msg_type: v,

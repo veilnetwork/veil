@@ -493,6 +493,11 @@ pub(crate) struct DispatchTable {
     /// epic, Stage B: external-address candidates for endpoint exchange).
     pub pending_listen_transports:
         std::collections::VecDeque<(u32, tokio::sync::oneshot::Sender<Vec<String>>)>,
+    /// pending oneshot replies for `AttemptHolePunch` (real-P2P epic,
+    /// Stage B: explicit call-path punch). Carries the raw
+    /// `hole_punch_status` wire byte.
+    pub pending_attempt_hole_punch:
+        std::collections::VecDeque<(u32, tokio::sync::oneshot::Sender<u8>)>,
     /// pending oneshot replies for `JoinBootstrapUri`.
     pub pending_bootstrap_join:
         std::collections::VecDeque<(u32, tokio::sync::oneshot::Sender<JoinBootstrapResult>)>,
@@ -676,6 +681,7 @@ impl DispatchTable {
             pending_peers_list: std::collections::VecDeque::new(),
             pending_pnet_status: std::collections::VecDeque::new(),
             pending_listen_transports: std::collections::VecDeque::new(),
+            pending_attempt_hole_punch: std::collections::VecDeque::new(),
             pending_bootstrap_join: std::collections::VecDeque::new(),
             pending_create_invite: std::collections::VecDeque::new(),
             pending_mailbox_seal: std::collections::VecDeque::new(),
@@ -1897,6 +1903,53 @@ impl VeilClient {
         await_rpc_reply(rx, "listen_transports reply").await
     }
 
+    /// Run one explicit, bounded UDP hole-punch attempt toward a
+    /// registered peer (real-P2P epic, Stage B: punch in the call path).
+    ///
+    /// The daemon drives its full orchestration — reflector mapping
+    /// discovery, coordinator signaling, token-authenticated simultaneous
+    /// punch, same-socket QUIC promotion, normal session registration —
+    /// under one wall-clock budget
+    /// (`veilcore::proto::budget::HOLE_PUNCH_ATTEMPT_BUDGET_MS`, 5 s).
+    /// Returns the raw `veilcore::proto::hole_punch_status` byte:
+    /// `CONNECTED` means a live direct session now exists (and
+    /// `peer_pnet_status().admitted` flips the standard way); every other
+    /// value names the exact stage that ended the attempt. Repeat calls
+    /// are idempotent and concurrent calls for the same peer join the
+    /// in-flight attempt daemon-side.
+    pub async fn attempt_hole_punch(&self, peer_node_id: &[u8; 32]) -> Result<u8, ClientError> {
+        // Daemon-side budget is 5 s; allow queueing + serialization slack
+        // so a full-budget attempt still reports its real outcome instead
+        // of racing the client-side timer.
+        const HOLE_PUNCH_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(8);
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let request_id = self.writer.alloc_request_id();
+        {
+            let mut d = self.dispatch.lock().await;
+            prune_closed(&mut d.pending_attempt_hole_punch);
+            if d.pending_attempt_hole_punch.len() >= MAX_PENDING_OPS {
+                return Err(ClientError::Protocol(format!(
+                    "attempt_hole_punch queue at cap ({MAX_PENDING_OPS}); daemon may be hung"
+                )));
+            }
+            d.pending_attempt_hole_punch.push_back((request_id, tx));
+        }
+        self.writer
+            .write_request_frame(
+                LocalAppMsg::AttemptHolePunch as u16,
+                request_id,
+                peer_node_id,
+            )
+            .await?;
+        match tokio::time::timeout(HOLE_PUNCH_REQUEST_TIMEOUT, rx).await {
+            Ok(Ok(status)) => Ok(status),
+            Ok(Err(_)) => Err(ClientError::ConnectionClosed),
+            Err(_) => Err(ClientError::Protocol(
+                "timeout waiting for attempt_hole_punch reply".into(),
+            )),
+        }
+    }
+
     /// Snapshot the daemon's current mobile/battery state.
     ///
     /// Returns the current background tier (Foreground/Active/LowPower)
@@ -2853,6 +2906,17 @@ async fn reader_task(
                     if let Some(tx) = take_pending(&mut d.pending_listen_transports, hdr.request_id)
                     {
                         let _ = tx.send(p.uris);
+                    }
+                }
+            }
+            LocalAppMsg::AttemptHolePunchResult => {
+                use veilcore::proto::AttemptHolePunchResultPayload;
+                if let Ok(p) = AttemptHolePunchResultPayload::decode(&body) {
+                    let mut d = dispatch.lock().await;
+                    if let Some(tx) =
+                        take_pending(&mut d.pending_attempt_hole_punch, hdr.request_id)
+                    {
+                        let _ = tx.send(p.status);
                     }
                 }
             }

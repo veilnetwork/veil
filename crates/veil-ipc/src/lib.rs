@@ -608,6 +608,90 @@ impl<T: ListenTransportsProvider + ?Sized> ListenTransportsProvider for std::syn
     }
 }
 
+// ── HolePunchDriver ──────────────────────────────────────────────────
+
+/// Structured outcome of one explicit call-path hole-punch attempt
+/// ([`HolePunchDriver::attempt_hole_punch`]).  Wire mapping lives in
+/// [`veil_proto::hole_punch_status`]; every variant names the exact
+/// stage that ended the attempt so app-side transport badges and logs
+/// can show the real reason instead of a generic failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HolePunchOutcome {
+    /// A live direct session to the peer exists (either it already did —
+    /// idempotent success — or the punched QUIC session just registered).
+    Connected,
+    /// NAT traversal disabled or no usable UDP reflector endpoint known.
+    NoReflector,
+    /// Candidate/token exchange through the coordinator did not complete.
+    SignalingTimeout,
+    /// No usable local mapping, or the peer offered no public candidate.
+    MappingUnusable,
+    /// Simultaneous punch never converged before the deadline.
+    PunchTimeout,
+    /// QUIC promotion or the session handshake on the punched socket failed.
+    QuicFailed,
+    /// Refused: this node runs under an anonymity posture (onion-service
+    /// boot) — a punch would disclose its real external address.
+    RefusedAnonymous,
+    /// The node_id is not a registered peer of this daemon.
+    UnknownPeer,
+}
+
+impl HolePunchOutcome {
+    /// Wire byte for [`veil_proto::AttemptHolePunchResultPayload::status`].
+    pub fn wire_status(self) -> u8 {
+        use veil_proto::hole_punch_status as s;
+        match self {
+            Self::Connected => s::CONNECTED,
+            Self::NoReflector => s::NO_REFLECTOR,
+            Self::SignalingTimeout => s::SIGNALING_TIMEOUT,
+            Self::MappingUnusable => s::MAPPING_UNUSABLE,
+            Self::PunchTimeout => s::PUNCH_TIMEOUT,
+            Self::QuicFailed => s::QUIC_FAILED,
+            Self::RefusedAnonymous => s::REFUSED_ANONYMOUS,
+            Self::UnknownPeer => s::UNKNOWN_PEER,
+        }
+    }
+}
+
+/// Hook the IPC server calls when an app issues
+/// [`veil_proto::family::LocalAppMsg::AttemptHolePunch`] (real-P2P epic,
+/// Stage B: explicit hole punch in the call path).
+///
+/// Implemented by the veil runtime on top of its UDP hole-punch
+/// orchestration: reflector mapping discovery + coordinator signaling +
+/// token-authenticated simultaneous punch + same-socket QUIC promotion +
+/// normal session registration.  Contract:
+/// * One overall wall-clock budget of
+///   [`veil_proto::budget::HOLE_PUNCH_ATTEMPT_BUDGET_MS`] per attempt.
+/// * Single-flight per peer — a second call while an attempt is running
+///   must join the in-flight attempt's result, not start another.
+/// * Idempotent — an existing live direct session short-circuits to
+///   [`HolePunchOutcome::Connected`].
+/// * Never runs under an anonymity posture
+///   ([`HolePunchOutcome::RefusedAnonymous`]).
+///
+/// Seconds-class: the server runs it off the connection loop when the
+/// request carries a non-zero `request_id` (same arc pattern as
+/// `MailboxSeal` / `LookupRelayKey`).
+pub trait HolePunchDriver: Send + Sync {
+    /// Run (or join) one bounded hole-punch attempt toward `peer_node_id`.
+    fn attempt_hole_punch<'a>(
+        &'a self,
+        peer_node_id: [u8; 32],
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = HolePunchOutcome> + Send + 'a>>;
+}
+
+/// `Arc<T>` proxy [`HolePunchDriver`].
+impl<T: HolePunchDriver + ?Sized> HolePunchDriver for std::sync::Arc<T> {
+    fn attempt_hole_punch<'a>(
+        &'a self,
+        peer_node_id: [u8; 32],
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = HolePunchOutcome> + Send + 'a>> {
+        (**self).attempt_hole_punch(peer_node_id)
+    }
+}
+
 // ── Bootstrap-URI join sink ────────────────────────────────────
 
 /// Outcome of a bootstrap-URI join request, returned by

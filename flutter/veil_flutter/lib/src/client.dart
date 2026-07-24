@@ -366,6 +366,31 @@ Uint8List _nodeIdWorker(int handleAddr) {
   }
 }
 
+/// Off-isolate body of [VeilClient.attemptP2PHolePunch]. Bounded at 10 s
+/// natively (5 s daemon budget + IPC slack) and holds the shared client
+/// mutex the whole time — must stay off the UI thread.
+int _attemptHolePunchWorker(int handleAddr, Uint8List peerNodeId) {
+  final handle = Pointer<ffi.VeilHandle>.fromAddress(handleAddr);
+  final peerC = calloc<Uint8>(32);
+  final outStatus = calloc<Uint8>();
+  final errOut = calloc<Pointer<Utf8>>();
+  try {
+    peerC.asTypedList(32).setAll(0, peerNodeId);
+    final rc = ffi.veilAttemptP2PHolePunch(handle, peerC, outStatus, errOut);
+    if (rc != ffi.veilOk) {
+      throw VeilException(
+        'attempt_p2p_hole_punch failed: ${_readErrAndFree(errOut)}',
+        code: rc,
+      );
+    }
+    return outStatus.value;
+  } finally {
+    calloc.free(peerC);
+    calloc.free(outStatus);
+    calloc.free(errOut);
+  }
+}
+
 /// Off-isolate body of [VeilClient.listenTransports]. Bounded at 2 s natively,
 /// but the shared client mutex can hold it for that whole window — keep it off
 /// the UI thread.
@@ -1556,6 +1581,34 @@ class VeilClient implements Finalizable {
     _ensureOpen();
     final handleAddr = _handle.address;
     return Isolate.run(() => _listenTransportsWorker(handleAddr));
+  }
+
+  /// Run one explicit, bounded UDP hole-punch attempt toward a registered
+  /// peer (real-P2P epic, Stage B: punch in the call path). The daemon
+  /// drives reflector mapping discovery, coordinator signaling, the
+  /// token-authenticated simultaneous punch, same-socket QUIC promotion
+  /// and normal session registration under one 5-second budget. Returns a
+  /// [VeilHolePunchStatus]: [VeilHolePunchStatus.connected] means a live
+  /// direct session now exists (and [peerPnetStatus] reports
+  /// `admitted: true` the standard way); every other value names the exact
+  /// stage that ended the attempt. Repeat calls are idempotent; concurrent
+  /// calls for the same peer join the in-flight attempt daemon-side.
+  ///
+  /// The native call is bounded at 10 s and HOLDS the shared client mutex
+  /// for the attempt's duration — sequence it before/after other control
+  /// RPCs on this client (do not poll [peerPnetStatus] concurrently) and
+  /// keep it off the UI thread (runs off-isolate like [peerPnetStatus]).
+  Future<VeilHolePunchStatus> attemptP2PHolePunch(Uint8List peerNodeId) async {
+    _ensureOpen();
+    if (peerNodeId.length != 32) {
+      throw ArgumentError.value(
+          peerNodeId.length, 'peerNodeId', 'must be 32 bytes');
+    }
+    final handleAddr = _handle.address;
+    final peerCopy = Uint8List.fromList(peerNodeId);
+    final wire =
+        await Isolate.run(() => _attemptHolePunchWorker(handleAddr, peerCopy));
+    return VeilHolePunchStatus.fromWire(wire);
   }
 
   /// Ask the daemon to assemble a bootstrap-invite URI from its own

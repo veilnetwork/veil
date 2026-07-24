@@ -5565,6 +5565,131 @@ impl ListenTransportsResultPayload {
     }
 }
 
+// ── AttemptHolePunch / AttemptHolePunchResult ──────────────────────────────
+
+/// Structured outcomes of an explicit call-path hole-punch attempt
+/// ([`crate::family::LocalAppMsg::AttemptHolePunch`]).  One byte on the
+/// wire; every value names the exact stage that ended the attempt so
+/// `/p2p_status`, the transport badge, and logs can show the real reason
+/// instead of a generic failure.
+pub mod hole_punch_status {
+    /// Punched QUIC session is up and registered — direct media may go
+    /// over the QUIC DATAGRAM lane. Also returned when a live direct
+    /// session already existed (idempotent success).
+    pub const CONNECTED: u8 = 0;
+    /// No usable UDP reflector: NAT traversal disabled by config, or no
+    /// peer-announced/static reflector endpoint is known/sendable.
+    pub const NO_REFLECTOR: u8 = 1;
+    /// Candidate/token exchange through the Veil coordinator did not
+    /// complete inside the budget (no coordinator peer, no reply, or a
+    /// reply without our punch token).
+    pub const SIGNALING_TIMEOUT: u8 = 2;
+    /// The local UDP mapping was not usable for a punch (socket setup
+    /// failed, only hairpin observations, discovery timed out) or the
+    /// peer's reply carried no public server-reflexive candidate.
+    pub const MAPPING_UNUSABLE: u8 = 3;
+    /// Simultaneous punch packets never converged before the deadline.
+    pub const PUNCH_TIMEOUT: u8 = 4;
+    /// Punch converged but same-socket QUIC promotion or the session
+    /// handshake/registration on the punched connection failed.
+    pub const QUIC_FAILED: u8 = 5;
+    /// The daemon refuses explicit hole punching under an anonymity
+    /// posture (onion-service / location-anonymous boot): a punch would
+    /// hand the peer this node's real external address.
+    pub const REFUSED_ANONYMOUS: u8 = 6;
+    /// The queried node_id is not a registered peer of this daemon —
+    /// exchange endpoints (bootstrap join) before attempting a punch.
+    pub const UNKNOWN_PEER: u8 = 7;
+    /// The daemon has no hole-punch driver wired (feature not built /
+    /// not a full runtime). Distinct from `NO_REFLECTOR` so an unwired
+    /// daemon is never mistaken for a reflector outage.
+    pub const UNSUPPORTED: u8 = 8;
+}
+
+/// Reply to [`crate::family::LocalAppMsg::AttemptHolePunch`].
+///
+/// Wire layout (fixed 33 bytes):
+/// ```text
+/// [0]       status        u8 (`hole_punch_status`)
+/// [1..33]   peer_node_id  [u8; 32] (echoes the query for correlation)
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AttemptHolePunchResultPayload {
+    /// One of [`hole_punch_status`].
+    pub status: u8,
+    /// Echoed peer_node_id from the query (correlation in pipelined IPC).
+    pub peer_node_id: [u8; 32],
+}
+
+impl AttemptHolePunchResultPayload {
+    pub const WIRE_SIZE: usize = 1 + 32;
+
+    pub fn encode(&self) -> [u8; Self::WIRE_SIZE] {
+        let mut buf = [0u8; Self::WIRE_SIZE];
+        buf[0] = self.status;
+        buf[1..33].copy_from_slice(&self.peer_node_id);
+        buf
+    }
+
+    pub fn decode(buf: &[u8]) -> Result<Self, ProtoError> {
+        if buf.len() != Self::WIRE_SIZE {
+            return Err(ProtoError::BufferTooShort {
+                need: Self::WIRE_SIZE,
+                got: buf.len(),
+            });
+        }
+        let mut peer_node_id = [0u8; 32];
+        peer_node_id.copy_from_slice(&buf[1..33]);
+        Ok(Self {
+            status: buf[0],
+            peer_node_id,
+        })
+    }
+}
+
+#[cfg(test)]
+mod attempt_hole_punch_payload_tests {
+    use super::AttemptHolePunchResultPayload;
+    use super::hole_punch_status;
+
+    #[test]
+    fn roundtrip_every_status() {
+        for status in [
+            hole_punch_status::CONNECTED,
+            hole_punch_status::NO_REFLECTOR,
+            hole_punch_status::SIGNALING_TIMEOUT,
+            hole_punch_status::MAPPING_UNUSABLE,
+            hole_punch_status::PUNCH_TIMEOUT,
+            hole_punch_status::QUIC_FAILED,
+            hole_punch_status::REFUSED_ANONYMOUS,
+            hole_punch_status::UNKNOWN_PEER,
+            hole_punch_status::UNSUPPORTED,
+        ] {
+            let p = AttemptHolePunchResultPayload {
+                status,
+                peer_node_id: [0xAB; 32],
+            };
+            let encoded = p.encode();
+            assert_eq!(encoded.len(), AttemptHolePunchResultPayload::WIRE_SIZE);
+            assert_eq!(AttemptHolePunchResultPayload::decode(&encoded).unwrap(), p,);
+        }
+    }
+
+    #[test]
+    fn rejects_truncated_and_oversized() {
+        let p = AttemptHolePunchResultPayload {
+            status: hole_punch_status::CONNECTED,
+            peer_node_id: [7; 32],
+        };
+        let enc = p.encode();
+        assert!(AttemptHolePunchResultPayload::decode(&enc[..enc.len() - 1]).is_err());
+        assert!(AttemptHolePunchResultPayload::decode(&[]).is_err());
+        let mut oversized = enc.to_vec();
+        oversized.push(0);
+        assert!(AttemptHolePunchResultPayload::decode(&oversized).is_err());
+    }
+}
+
 #[cfg(test)]
 mod listen_transports_payload_tests {
     use super::ListenTransportsResultPayload;
