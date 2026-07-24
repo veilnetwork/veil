@@ -406,6 +406,192 @@ async fn runtime_creates_outbound_session_for_configured_peer() {
     let _ = fs::remove_file(path);
 }
 
+// ── P2P Stage B mobility slice: reap → instant re-dial loop ─────────
+//
+// The veil-level shape of the epic scenario «сессия admitted → адрес
+// сменился → relay → новый адрес → re-exchange → снова admitted»:
+//
+//   1. an app-added (bootstrap-only, dedup-exempt — exactly how
+//      P2PEndpointService registers direct peers) session is live
+//      → `live_sessions` non-empty ⇒ peer_pnet_status().admitted=true;
+//   2. the peer's address silently dies (scripted peer never responds
+//      after the handshake; socket stays open — no FIN/RST, the NAT
+//      black-hole shape) → the keepalive probe reaps the session
+//      within a few keepalive intervals → `admitted` flips false and
+//      call media falls back to relay;
+//   3. connectivity returns (same listener accepts again) → the
+//      outbound connector re-dials WITHOUT waiting out a poll interval
+//      → fresh handshake → session re-registered ⇒ admitted=true again.
+//
+// Deterministic against Phase E20 directional dedup: bootstrap-only
+// peers bypass the lexicographic keep-inbound policy, so the dial
+// always happens regardless of the random sovereign identity.
+#[tokio::test(flavor = "current_thread")]
+async fn mobility_black_holed_bootstrap_session_reaps_and_redials() {
+    use veil_cfg::{BootstrapPeer, default_nonce_base64};
+
+    // Scripted peer identity — distinct from the runtime's own.
+    let peer_keys = test_support::ed25519_keypair();
+    let peer_identity = HandshakeIdentity {
+        algo: SignatureAlgorithm::Ed25519,
+        public_key: peer_keys.public_key.clone(),
+        private_key: peer_keys.private_key.clone(),
+        nonce: default_nonce_base64(),
+        node_id: NodeId::from_public_key(SignatureAlgorithm::Ed25519, &peer_keys.public_key)
+            .expect("peer node id"),
+    };
+    let peer_node_id = peer_identity.node_id;
+
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("peer listener");
+    let peer_addr = listener.local_addr().expect("peer addr");
+
+    let mut config = runtime_config_with_listen();
+    // No configured peers — the app-added path registers via
+    // bootstrap_peers (bootstrap_only=true, directional-dedup exempt).
+    config.peers.clear();
+    config.bootstrap_peers = vec![BootstrapPeer {
+        transport: format!("tcp://{peer_addr}"),
+        public_key: peer_keys.public_key.clone(),
+        nonce: default_nonce_base64(),
+        algo: Default::default(),
+        tls_cert: None,
+        tls_ca_cert: None,
+    }];
+    // Compressed liveness timeline so the test runs in seconds. The
+    // realtime acceleration itself is pinned by the veil-session suite
+    // (production 30 s constants); here 1 s ≤ the 2 s accel constant so
+    // the base machinery drives the reap.
+    config.session.keepalive_interval_secs = 1;
+    config.session.idle_timeout_secs = 3;
+
+    let path = save_test_config("mobility-reap-redial", config).unwrap();
+    let mut runtime = NodeRuntime::start(&path, true)
+        .await
+        .expect("runtime starts");
+
+    // Phase 1 — admitted: the bootstrap dial lands, we complete the
+    // scripted handshake, the session registers.
+    let (mut first_stream, _) = listener.accept().await.expect("first accept");
+    let _ = perform_ovl1_handshake(
+        &mut first_stream,
+        &peer_identity,
+        veil_cfg::NodeRole::Core,
+        veil_cfg::DiscoveryMode::Public,
+        None,
+        None,
+        None,
+        Some([0u8; 32]),
+        None,
+        None,
+        None,
+        &[],
+        false,
+        None,
+        None,
+        None,
+    )
+    .await
+    .expect("first scripted handshake");
+
+    let first_link_id = timeout(Duration::from_secs(10), async {
+        loop {
+            if let Some(s) = runtime
+                .sessions()
+                .iter()
+                .find(|s| s.node_id == Some(peer_node_id))
+            {
+                return s.link_id;
+            }
+            sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("session must register after handshake (admitted=true)");
+
+    // Phase 2 — black hole: the scripted peer never sends another byte
+    // (socket held open — no FIN). The keepalive probe machinery must
+    // reap the session within a few 1 s intervals, flipping the
+    // admitted-equivalent (live session presence) to false.
+    let reap_started = std::time::Instant::now();
+    timeout(Duration::from_secs(10), async {
+        loop {
+            if runtime
+                .sessions()
+                .iter()
+                .all(|s| s.node_id != Some(peer_node_id))
+            {
+                return;
+            }
+            sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("black-holed session must be reaped (admitted flips false)");
+    let reap_elapsed = reap_started.elapsed();
+
+    // Phase 3 — connectivity returns: the connector re-dials without an
+    // extra poll-interval wait; a fresh handshake re-registers the
+    // session (admitted=true again).
+    let redial_started = std::time::Instant::now();
+    let (mut second_stream, _) = timeout(Duration::from_secs(10), listener.accept())
+        .await
+        .expect("connector must re-dial promptly after the reap")
+        .expect("second accept");
+    let redial_elapsed = redial_started.elapsed();
+    let _ = perform_ovl1_handshake(
+        &mut second_stream,
+        &peer_identity,
+        veil_cfg::NodeRole::Core,
+        veil_cfg::DiscoveryMode::Public,
+        None,
+        None,
+        None,
+        Some([0u8; 32]),
+        None,
+        None,
+        None,
+        &[],
+        false,
+        None,
+        None,
+        None,
+    )
+    .await
+    .expect("second scripted handshake");
+
+    timeout(Duration::from_secs(10), async {
+        loop {
+            if runtime
+                .sessions()
+                .iter()
+                .any(|s| s.node_id == Some(peer_node_id) && s.link_id != first_link_id)
+            {
+                return;
+            }
+            sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("re-dialed session must re-register (admitted=true again)");
+
+    // Envelope assertions: the reap rides the compressed keepalive
+    // machinery (not a 30 s+ poll), and the re-dial is prompt.
+    assert!(
+        reap_elapsed <= Duration::from_secs(8),
+        "reap took {reap_elapsed:?} — must ride the keepalive probe, not long polls"
+    );
+    assert!(
+        redial_elapsed <= Duration::from_secs(8),
+        "re-dial took {redial_elapsed:?} — must not wait out a backoff/poll interval"
+    );
+
+    drop(first_stream);
+    runtime.stop().await.expect("runtime stops");
+    let _ = fs::remove_file(path);
+}
+
 // Audit batch 2026-05-24: same Phase E20 dedup interaction as
 // [`runtime_creates_outbound_session_for_configured_peer`] — flaky
 // on ~50% of runs depending on lex order of randomly-generated
@@ -1912,6 +2098,7 @@ pub fn session_guard_drop_publishes_sessions_changed() {
         )),
         None,
         Arc::clone(&bus),
+        None,
     );
     drop(guard);
 
@@ -1971,6 +2158,7 @@ pub fn session_guard_drop_removes_only_its_owned_tx_sender() {
             Arc::clone(tx_reg),
             None,
             Arc::new(EventBus::new()),
+            None,
         )
     }
 
@@ -2018,6 +2206,56 @@ pub fn session_guard_drop_removes_only_its_owned_tx_sender() {
             "a replacement sender with a different owner must NOT be evicted"
         );
     }
+}
+
+// ── SessionGuard wakes the peer's outbound-connector on drop ───────
+// P2P mobility slice: when a session dies, a connector loop parked in its
+// 30 s `has_session` pre-check sleep must be woken instantly (per-peer
+// refresh generation bump) so the direct session is re-dialed within
+// seconds of `admitted` flipping false — not after the poll interval.
+#[test]
+pub fn session_guard_drop_bumps_peer_connector_refresh() {
+    use std::collections::{BTreeMap, HashMap};
+    use std::sync::{Arc, Mutex};
+    use tokio::sync::watch;
+    use veil_ipc::EventBus;
+
+    let node = [9u8; 32];
+    let other = [8u8; 32];
+    let (tx, rx) = watch::channel(0u64);
+    let (other_tx, other_rx) = watch::channel(0u64);
+    let refresh: Arc<Mutex<HashMap<[u8; 32], watch::Sender<u64>>>> =
+        Arc::new(Mutex::new(HashMap::from([(node, tx), (other, other_tx)])));
+
+    let guard = SessionGuard::new(
+        Arc::new(Mutex::new(BTreeMap::new())),
+        LinkId::new(77),
+        Arc::new(veil_observability::NodeLogger::new_noop()),
+        None,
+        [0u8; 32],
+        Arc::new(Mutex::new(veil_session::SessionRegistry::default())),
+        None,
+        Arc::new(super::ip_slot::IpSlotTable::new()),
+        node,
+        Arc::new(std::sync::RwLock::new(
+            veil_session::SessionTxRegistry::new(),
+        )),
+        None,
+        Arc::new(EventBus::new()),
+        Some(Arc::clone(&refresh)),
+    );
+    assert_eq!(*rx.borrow(), 0);
+    drop(guard);
+    assert_eq!(
+        *rx.borrow(),
+        1,
+        "guard drop must bump the closing peer's refresh generation"
+    );
+    assert_eq!(
+        *other_rx.borrow(),
+        0,
+        "unrelated peers' connectors must NOT be woken"
+    );
 }
 
 // ── sim hot-standby template-URI fix ───────────────────────

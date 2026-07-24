@@ -281,11 +281,21 @@ fn decode_realtime_lane_frame(frame: &[u8]) -> Option<(FrameHeader, &[u8], Realt
 /// DATAGRAM lane. Canonical realtime frames get a small newest-wins budget in
 /// the ordered-stream priority queue; control/keepalive frames retain normal
 /// reliable FIFO behaviour.
-fn enqueue_outbox_frame(pq: &mut PriorityQueue, priority: u8, frame: veil_bufpool::PooledShared) {
+///
+/// Returns `true` when the frame took the lossy realtime lane — the caller
+/// feeds this into `SessionTimers::note_realtime_activity` so an active
+/// media flow arms the accelerated liveness cadence (mobility slice).
+fn enqueue_outbox_frame(
+    pq: &mut PriorityQueue,
+    priority: u8,
+    frame: veil_bufpool::PooledShared,
+) -> bool {
     if priority == veil_proto::priority::REALTIME && decode_realtime_lane_frame(&frame).is_some() {
         pq.push_lossy_realtime(priority, frame);
+        true
     } else {
         pq.push(priority, frame);
+        false
     }
 }
 
@@ -1708,15 +1718,17 @@ impl SessionRunner {
         &self,
         outbox: &mut mpsc::Receiver<crate::tx_registry::PriorityFrame>,
         pq: &mut crate::priority_queue::PriorityQueue,
+        timers: &mut crate::timers::SessionTimers,
     ) -> std::ops::ControlFlow<()> {
         use std::ops::ControlFlow;
         use tokio::sync::mpsc::error::TryRecvError;
+        let mut any_realtime = false;
         loop {
             match outbox.try_recv() {
                 Ok((prio, frame)) => {
                     // chunking is always supported (single protocol version),
                     // so no CHUNK-flag gating is needed here.
-                    enqueue_outbox_frame(pq, prio, frame);
+                    any_realtime |= enqueue_outbox_frame(pq, prio, frame);
                 }
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => {
@@ -1727,6 +1739,11 @@ impl SessionRunner {
                     return ControlFlow::Break(());
                 }
             }
+        }
+        if any_realtime {
+            // Outbound media in flight — arm/refresh the accelerated
+            // liveness cadence (P2P mobility slice).
+            timers.note_realtime_activity(tokio::time::Instant::now());
         }
         ControlFlow::Continue(())
     }
@@ -3123,6 +3140,11 @@ impl SessionRunner {
         // block, which beat the 2 × 10s = 20s probe by a few seconds
         // — we want the probe to fire EARLIER than the OS's TCP close
         // so HandoffInit can still travel on the live primary.
+        //
+        // Mobility slice: this is the BASE value. Every evaluation site
+        // asks `timers.effective_keepalive_probe_timeout(base, now)` so
+        // a session actively carrying realtime media detects a black-
+        // holed path on the accelerated (≈5 s) deadline instead.
         let keepalive_probe_timeout = self.keepalive_interval;
 
         // ── Backpressure state ────────────────────────────────────
@@ -3277,7 +3299,7 @@ impl SessionRunner {
                 // was dropped — that means run must exit.
                 if let Some(ref mut outbox) = outbox
                     && let std::ops::ControlFlow::Break(()) =
-                        self.drain_outbox_into_pq(outbox, &mut pq)
+                        self.drain_outbox_into_pq(outbox, &mut pq, &mut timers)
                 {
                     return;
                 }
@@ -3403,11 +3425,18 @@ impl SessionRunner {
                     // Stage A: FIRST probe-timeout fire of the episode — arm the
                     // trigger, attempt the first warm-probe spawn, count it. Do
                     // NOT return here (re-eval below decides reap).
+                    //
+                    // Mobility slice: the probe deadline is evaluated through
+                    // the realtime-aware effective value — an active media
+                    // flow tightens it to ~5 s so a black-holed direct
+                    // session is detected in seconds, not minutes.
+                    let probe_timeout_now =
+                        timers.effective_keepalive_probe_timeout(keepalive_probe_timeout, now);
                     if keepalive_enabled
                         && !keepalive_probe_trigger.has_fired()
-                        && keepalive_probe_timeout > std::time::Duration::ZERO
+                        && probe_timeout_now > std::time::Duration::ZERO
                         && let Some(t) = pending_keepalive_probe.oldest()
-                        && now.duration_since(t) >= keepalive_probe_timeout
+                        && now.duration_since(t) >= probe_timeout_now
                         && keepalive_probe_trigger.try_fire()
                     {
                         let spawned = self.fire_hot_standby_trigger("keepalive_probe_timeout");
@@ -3429,17 +3458,17 @@ impl SessionRunner {
                     // tick until an ack clears it or the helper says reap.
                     else if keepalive_enabled
                         && keepalive_probe_trigger.has_fired()
-                        && keepalive_probe_timeout > std::time::Duration::ZERO
+                        && probe_timeout_now > std::time::Duration::ZERO
                         && let Some(t) = pending_keepalive_probe.oldest()
                     {
                         let probe_age = now.duration_since(t);
-                        if probe_age >= keepalive_probe_timeout {
+                        if probe_age >= probe_timeout_now {
                             let spawned = self.fire_hot_standby_trigger("keepalive_probe_timeout");
                             keepalive_swap_attempts = keepalive_swap_attempts.saturating_add(1);
                             let genuine_age = timers.genuine_rx_age(now);
                             if should_reeval_teardown(
                                 probe_age,
-                                keepalive_probe_timeout,
+                                probe_timeout_now,
                                 keepalive_swap_attempts,
                                 KEEPALIVE_SWAP_ATTEMPT_CEILING,
                                 genuine_age,
@@ -3788,7 +3817,12 @@ impl SessionRunner {
                     timer_enabled,
                     keepalive_enabled,
                     keepalive_probe_trigger.has_fired(),
-                    keepalive_probe_timeout,
+                    // Mobility slice: wake at the realtime-accelerated probe
+                    // deadline while media is flowing, base deadline otherwise.
+                    timers.effective_keepalive_probe_timeout(
+                        keepalive_probe_timeout,
+                        tokio::time::Instant::now(),
+                    ),
                     pending_keepalive_probe.oldest(),
                     stall_trigger.has_fired(),
                     coalesce_until,
@@ -3809,7 +3843,11 @@ impl SessionRunner {
                         break;
                     }
                     NextInput::OutboxFrame((prio, frame)) => {
-                        enqueue_outbox_frame(&mut pq, prio, frame);
+                        if enqueue_outbox_frame(&mut pq, prio, frame) {
+                            // Outbound media in flight — arm/refresh the
+                            // accelerated liveness cadence (mobility slice).
+                            timers.note_realtime_activity(tokio::time::Instant::now());
+                        }
                         continue;
                     }
                     NextInput::SwapStream(new_stream) => {
@@ -4009,7 +4047,23 @@ impl SessionRunner {
             // fires or (with a timer band-aid) fires on the healthy loaded
             // session. See timers.rs module doc.
             if !is_liveness_frame(header.family, header.msg_type) {
-                timers.note_frame_received(tokio::time::Instant::now());
+                let now = tokio::time::Instant::now();
+                timers.note_frame_received(now);
+                // Inbound direct media (AppRtData) also arms the accelerated
+                // liveness cadence: a receive-mostly call participant must
+                // detect a black-holed path as fast as the sender does.
+                // Deliberately matched by frame TYPE, not the 2-bit priority
+                // class: `FrameHeader::new` leaves flags at 0, which decodes
+                // as REALTIME, so a priority check would arm the accelerated
+                // cadence for every default-flagged frame on every session.
+                // Relay-Forward media is also excluded on RX: the relay
+                // session's liveness is not the black-holed direct path this
+                // acceleration exists to reap.
+                if header.family == FrameFamily::App as u8
+                    && header.msg_type == AppMsg::AppRtData as u16
+                {
+                    timers.note_realtime_activity(now);
+                }
             }
 
             // ── Read body ────────────────────────────────────────────────────

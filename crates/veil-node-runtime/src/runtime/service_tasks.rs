@@ -1872,6 +1872,11 @@ impl NodeRuntime {
     pub fn spawn_srflx_probe_task(&mut self) {
         const SRFLX_PROBE_INITIAL_DELAY: std::time::Duration = std::time::Duration::from_secs(20);
         const SRFLX_PROBE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(300);
+        // P2P mobility slice: minimum spacing between wake-driven probes.
+        // A network flip produces a burst of outbound session-opens (seeds,
+        // gateways, app peers) — the burst coalesces into ONE prompt probe;
+        // the 300 s periodic tick stays the steady-state ceiling.
+        const SRFLX_PROBE_MIN_GAP: std::time::Duration = std::time::Duration::from_secs(10);
 
         let Some(shutdown_tx) = &self.shutdown_tx else {
             return;
@@ -1881,6 +1886,7 @@ impl NodeRuntime {
         let session_tx_registry = Arc::clone(&self.session_tx_registry);
         let live_sessions = Arc::clone(&self.live_sessions);
         let logger = Arc::clone(&self.logger);
+        let connectivity_gain = Arc::clone(&self.connectivity_gain);
         let local_node_id = *self.identity.local_identity.node_id.as_bytes();
         let handle = supervised_spawn(Arc::clone(&self.logger), "srflx_probe", async move {
             fn is_public_ip(ip: &std::net::IpAddr) -> bool {
@@ -1901,14 +1907,19 @@ impl NodeRuntime {
                 }
             }
 
-            // Let the startup dials land a session before the first probe.
+            // Let the startup dials land a session before the first probe —
+            // or start immediately when the first outbound session lands
+            // (connectivity-gain wake), whichever comes first.
             tokio::select! {
                 Ok(_) = shutdown_rx.changed() => return,
                 _ = tokio::time::sleep(SRFLX_PROBE_INITIAL_DELAY) => {}
+                _ = connectivity_gain.srflx_wake() => {}
             }
             let mut interval = tokio::time::interval(SRFLX_PROBE_INTERVAL);
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             interval.tick().await; // consume the immediate first tick
+            // Instant of the last ACTUALLY-SENT probe (wake-driven min-gap).
+            let mut last_probe_sent: Option<tokio::time::Instant> = None;
             loop {
                 // Refresh every tick: `record_own_external_addr` rotates a
                 // CHANGED external IP (DHCP lease, network switch) in as the
@@ -1963,6 +1974,7 @@ impl NodeRuntime {
                             frame,
                         );
                         if sent {
+                            last_probe_sent = Some(tokio::time::Instant::now());
                             logger.debug(
                                 "nat.srflx_probe.sent",
                                 format!(
@@ -1976,6 +1988,25 @@ impl NodeRuntime {
                 tokio::select! {
                     Ok(_) = shutdown_rx.changed() => break,
                     _ = interval.tick() => {}
+                    // P2P mobility slice: a fresh outbound session (post
+                    // network-flip reconnection) re-observes our external
+                    // address NOW instead of waiting out the 300 s tick —
+                    // `record_own_external_addr` rotates a CHANGED external
+                    // IP in as the freshest observation, so the app's next
+                    // direct-endpoint exchange mints the NEW srflx URI.
+                    _ = connectivity_gain.srflx_wake() => {
+                        // Enforce the min gap: sleep out the remainder so a
+                        // burst of session-opens produces one probe.
+                        if let Some(t) = last_probe_sent {
+                            let since = tokio::time::Instant::now().duration_since(t);
+                            if since < SRFLX_PROBE_MIN_GAP {
+                                tokio::select! {
+                                    Ok(_) = shutdown_rx.changed() => break,
+                                    _ = tokio::time::sleep(SRFLX_PROBE_MIN_GAP - since) => {}
+                                }
+                            }
+                        }
+                    }
                 }
             }
         });

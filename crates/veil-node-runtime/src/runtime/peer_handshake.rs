@@ -1093,6 +1093,7 @@ pub async fn register_connection_session(
             runtime.session_tx_registry.clone(),
             runtime.dispatcher.reputation.clone(),
             runtime.event_bus,
+            Some(runtime.outbound_connector_refresh),
         ),
     };
     // SessionGuard now owns the slot — disarm our IpSlotGuard so its

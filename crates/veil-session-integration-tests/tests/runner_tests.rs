@@ -5968,3 +5968,164 @@ fn phase5e_transport_migration_notify_no_pubkey_silent_drop() {
         "without peer_public_key, cache cannot be safely updated",
     );
 }
+
+// ── P2P Stage B mobility slice: black-holed direct-session detection ─────
+//
+// Scenario these tests pin: a direct (admitted) session is carrying live
+// call media (REALTIME AppRtData frames) when the peer's address silently
+// dies — Wi-Fi → LTE flip behind a NAT that drops packets without RST.
+// Locally, TCP writes keep "succeeding" into the send buffer; the only
+// observable signal is total inbound silence. `peer_pnet_status().admitted`
+// stays true until the SessionRunner reaps the session, so direct media
+// black-holes for exactly as long as detection takes.
+
+/// Build an `AppRtData` frame at REALTIME priority — the exact shape
+/// direct call media takes on the ordered-stream fallback lane.
+fn realtime_media_frame() -> Vec<u8> {
+    use veil_proto::family::AppMsg;
+    let body = [0xEEu8; 48];
+    let mut hdr = FrameHeader::new(FrameFamily::App as u8, AppMsg::AppRtData as u16);
+    hdr.body_len = body.len() as u32;
+    hdr.set_priority(veil_proto::priority::REALTIME);
+    let mut frame = encode_header(&hdr).to_vec();
+    frame.extend_from_slice(&body);
+    frame
+}
+
+/// Runner over a black-hole stream (writes succeed, reads never yield)
+/// with PRODUCTION keepalive/idle defaults (30 s / 90 s).
+fn make_mobility_blackhole_runner(outbox_rx: mpsc::Receiver<PriorityFrame>) -> SessionRunner {
+    let dispatcher = Arc::new(make_test_dispatcher(NodeRole::Core));
+    let ban_list = Arc::clone(&dispatcher.abuse.ban_list);
+    let violation_tracker = Arc::clone(&dispatcher.abuse.violation_tracker);
+    let logger = Arc::clone(&dispatcher.logger);
+    let defaults = veil_cfg::SessionConfig::default();
+    SessionRunner {
+        stream: Box::new(ReadsBlockForeverStream),
+        quic_datagrams: None,
+        peer_id: [0xB7u8; 32],
+        dispatcher,
+        logger,
+        metrics: None,
+        ban_list,
+        violation_tracker,
+        crypto: veil_session::runner::CryptoState {
+            tx_cipher: None,
+            rx_cipher: None,
+            peer_mlkem_keys: None,
+            per_session_mlkem_dk: None,
+        },
+        outbox: Some(outbox_rx),
+        rpc_outbox: None,
+        // PRODUCTION defaults on purpose: the point is the real-world
+        // detection latency, not a scaled-down toy timeline.
+        keepalive_interval: std::time::Duration::from_secs(defaults.keepalive_interval_secs),
+        idle_timeout: std::time::Duration::from_secs(defaults.idle_timeout_secs),
+        max_pending_responses: defaults.max_pending_responses,
+        pending_response_ttl: std::time::Duration::from_millis(defaults.pending_response_ttl_ms),
+        max_frame_body: defaults.max_frame_body_bytes,
+        rekey: veil_session::runner::RekeyConfig {
+            bytes_threshold: u64::MAX,
+            time_threshold_secs: u64::MAX,
+        },
+        qos_weights: veil_session::priority_queue::DEFAULT_WEIGHTS,
+        session_id: [0xB8u8; 32],
+        local_node_id: [0u8; 32],
+        mobile: veil_session::runner::MobileConfig {
+            base_keepalive_interval: std::time::Duration::from_secs(
+                defaults.keepalive_interval_secs,
+            ),
+            battery_keepalive_scale_low: 4.0,
+            battery_keepalive_scale_medium: 2.0,
+            battery_threshold_low: 20,
+            battery_threshold_medium: 50,
+        },
+        ticket_to_send: None,
+        raw_session_keys: None,
+        peer_tickets: None,
+        peer_public_key: None,
+        peer_nonce: None,
+        hot_standby: veil_session::runner::HotStandbyState {
+            swap_rx: None,
+            handoff_registry: None,
+            handoff_ack_waiters: None,
+            // No hot-standby controller — matches an app/direct session
+            // without an alt transport: the probe path cannot swap, it
+            // can only conclude the session is dead.
+            controller: None,
+            auto_trigger_after_write_errors: 0,
+        },
+        primary_uri: None,
+    }
+}
+
+/// Feed one realtime media frame into the outbox every 500 ms — a live
+/// call keeps transmitting even while the peer is a black hole.
+fn spawn_realtime_feeder(outbox_tx: mpsc::Sender<PriorityFrame>) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            let frame = (
+                veil_proto::priority::REALTIME,
+                veil_bufpool::pooled_shared_from_vec(realtime_media_frame()),
+            );
+            if outbox_tx.send(frame).await.is_err() {
+                return;
+            }
+        }
+    })
+}
+
+/// P2P mobility slice, fast-detect half: a black-holed session ACTIVELY
+/// carrying realtime media is reaped on the accelerated timeline —
+/// keepalive tightens to ~2 s, the unacked-probe deadline to ~5 s, and
+/// the Stage-B re-eval tears the session down at ~7-10 s. The moment
+/// the runner exits, `SessionGuard` clears `live_sessions` (admitted
+/// flips false → app media falls back to relay) and bumps the peer's
+/// outbound-connector refresh (instant re-dial).
+///
+/// BEFORE this slice the same scenario lingered ≥ 20 s (captured on the
+/// unmodified tree by `mobility_before_realtime_black_hole_lingers_past_20s`,
+/// run 2026-07-24: `ok ... finished in 20.00s` — the runner was still
+/// alive at +20 s of total silence, with the reap only at ~60-90 s).
+#[tokio::test(flavor = "current_thread")]
+async fn mobility_realtime_black_hole_reaped_fast() {
+    let (outbox_tx, outbox_rx) = mpsc::channel::<PriorityFrame>(64);
+    let mut runner = make_mobility_blackhole_runner(outbox_rx);
+    let feeder = spawn_realtime_feeder(outbox_tx);
+
+    let started = std::time::Instant::now();
+    let handle = tokio::spawn(async move { runner.run().await });
+
+    tokio::time::timeout(std::time::Duration::from_secs(16), handle)
+        .await
+        .expect("realtime-active black-holed session must be reaped within seconds")
+        .unwrap();
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed >= std::time::Duration::from_secs(5),
+        "reap must ride the accelerated probe (arm ~2 s + probe ~5 s), \
+         not a hair trigger; got {elapsed:?}"
+    );
+    feeder.abort();
+}
+
+/// Scope guard: WITHOUT realtime traffic the pre-slice timeline is
+/// untouched — a silent session (chat/relay/mesh) still waits out the
+/// 30 s-interval keepalive probe machinery exactly as before the slice.
+/// Bounded at +16 s (comfortably past the accelerated reap window) so
+/// the suite doesn't pay the full 60-90 s.
+#[tokio::test(flavor = "current_thread")]
+async fn mobility_non_realtime_black_hole_keeps_pre_slice_timeline() {
+    // Keep the outbox sender alive but idle: no realtime frames, so the
+    // accelerated cadence must never arm.
+    let (_outbox_tx, outbox_rx) = mpsc::channel::<PriorityFrame>(64);
+    let mut runner = make_mobility_blackhole_runner(outbox_rx);
+
+    let handle = tokio::spawn(async move { runner.run().await });
+    let after_16s = tokio::time::timeout(std::time::Duration::from_secs(16), handle).await;
+    assert!(
+        after_16s.is_err(),
+        "a non-realtime silent session must NOT be reaped on the accelerated timeline"
+    );
+}
