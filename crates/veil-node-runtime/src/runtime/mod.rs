@@ -5109,6 +5109,23 @@ impl NodeServices {
                 )
                 .await
             {
+                // Mixed-version resilience: a coordinator built before the
+                // punch-token wire extension decodes-then-re-encodes the
+                // frames and strips the token in flight, so the reply comes
+                // back without it. Such a reply cannot authenticate a punch —
+                // it must not poison the whole attempt while a newer
+                // coordinator later in the ladder would preserve the token.
+                if punch_token.is_some() && reply.punch_token != punch_token {
+                    self.logger.debug(
+                        "nat.udp_punch.signaling_no_token",
+                        format!(
+                            "reply via coordinator {} lacks our punch token \
+                             (coordinator or peer build too old?) — trying next",
+                            veil_util::hex_short(&coordinator),
+                        ),
+                    );
+                    continue;
+                }
                 return Some(reply);
             }
         }
