@@ -82,7 +82,7 @@ echo "==> linking libveil_media.dylib (sdk=$SDK, deadstrip='${DEADSTRIP}')"
   -framework Foundation -framework CoreFoundation -framework CoreAudio -framework AudioToolbox \
   -framework AudioUnit -framework CoreServices -framework IOKit -framework SystemConfiguration \
   -framework Security -framework CoreMedia -framework CoreVideo -framework AVFoundation -framework ApplicationServices \
-  -framework CoreGraphics
+  -framework CoreGraphics -weak_framework ScreenCaptureKit
 
 echo "==> done: $DEST/libveil_media.dylib ($(du -h "$DEST/libveil_media.dylib" | cut -f1))"
 nm -gU "$DEST/libveil_media.dylib" | grep -c "T _veil_media_" | xargs echo "exported veil_media_* symbols:"
