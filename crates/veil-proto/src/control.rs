@@ -477,12 +477,19 @@ fn decode_punch_token_extension(buf: &[u8]) -> Result<Option<[u8; 16]>, ProtoErr
     if buf.is_empty() {
         return Ok(None);
     }
-    if buf.len() != 17 || buf[0] != 0xB1 {
-        return Err(ProtoError::TrailingBytes {
-            trailing: buf.len(),
-        });
+    // Tolerant tail policy: recognize OUR extension when it leads the tail
+    // and IGNORE any other trailing bytes instead of rejecting the frame.
+    // A strict `TrailingBytes` error here would make every current build
+    // drop frames from a future build that appends the next extension —
+    // exactly the mixed-version breakage the punch token itself hit against
+    // pre-Stage-B coordinators (they stripped it; strict peers would have
+    // dropped it). Frame bodies are already size-bounded by the transport,
+    // so an ignored tail cannot grow unchecked. Coordinators forward the
+    // ORIGINAL body bytes, so ignored-here does not mean lost-in-transit.
+    if buf.len() >= 17 && buf[0] == 0xB1 {
+        return Ok(Some(super::read_array::<16>(buf, 1)?));
     }
-    Ok(Some(super::read_array::<16>(buf, 1)?))
+    Ok(None)
 }
 
 // ── NatRelayRequestPayload ────────────────────────────────────────────────────
@@ -539,6 +546,50 @@ impl NatRelayRequestPayload {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Mixed-version forward-compatibility: a FUTURE build may append the
+    /// next trailing extension after (or instead of) the punch token. This
+    /// build must keep decoding such frames — recognizing its own extension
+    /// when present and ignoring the unknown remainder — instead of
+    /// rejecting them with `TrailingBytes` (which would repeat the stale-
+    /// coordinator breakage of 2026-07-24 one protocol revision later).
+    #[test]
+    fn nat_probe_payloads_tolerate_unknown_trailing_extensions() {
+        let request = NatProbeRequestPayload {
+            initiator_node_id: [0xAA; 32],
+            target_node_id: [0xBB; 32],
+            session_token: 7,
+            punch_token: Some([0x42; 16]),
+            candidates: vec![],
+        };
+        // Token followed by an unknown future extension: token survives.
+        let mut with_future = request.encode();
+        with_future.extend_from_slice(&[0xC2, 0xDE, 0xAD]);
+        let decoded = NatProbeRequestPayload::decode(&with_future).unwrap();
+        assert_eq!(decoded.punch_token, Some([0x42; 16]));
+
+        // Unknown extension INSTEAD of the token: ignored, no token, no error.
+        let tokenless = NatProbeRequestPayload {
+            punch_token: None,
+            ..request.clone()
+        };
+        let mut unknown_only = tokenless.encode();
+        unknown_only.extend_from_slice(&[0xC2, 0xDE, 0xAD, 0xBE, 0xEF]);
+        let decoded = NatProbeRequestPayload::decode(&unknown_only).unwrap();
+        assert_eq!(decoded.punch_token, None);
+
+        let reply = NatProbeReplyPayload {
+            responder_node_id: [0xBB; 32],
+            final_target_node_id: [0xAA; 32],
+            session_token: 7,
+            punch_token: Some([0x42; 16]),
+            candidates: vec![],
+        };
+        let mut reply_future = reply.encode();
+        reply_future.extend_from_slice(&[0xF7; 9]);
+        let decoded = NatProbeReplyPayload::decode(&reply_future).unwrap();
+        assert_eq!(decoded.punch_token, Some([0x42; 16]));
+    }
 
     #[test]
     fn neighbor_offer_roundtrip_with_addr() {
