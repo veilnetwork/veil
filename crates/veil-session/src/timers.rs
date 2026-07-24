@@ -60,6 +60,47 @@ use crate::runner::{COVER_TRAFFIC_INTERVAL, jitter_cover_interval, jitter_keepal
 /// `keepalive_interval` ≤ idle_timeout), so only a truly dead session trips it.
 const LIVENESS_CEILING_MULTIPLE: u32 = 3;
 
+// ── Realtime-aware liveness acceleration (P2P Stage B mobility slice) ──
+//
+// A direct (admitted) session that is actively carrying call media must
+// notice a silently-dead path FAST: when a mobile peer hops Wi-Fi → LTE
+// behind a NAT that drops without RST, our TCP writes keep "succeeding"
+// into the send buffer while inbound goes totally silent. With the
+// default 30 s keepalive the probe ledger arms at ~30 s and the re-eval
+// reap lands at ~60-90 s — for that whole window `peer_pnet_status().
+// admitted` stays true and direct media black-holes (the app-side
+// repair path keeps rebuilding the same dead direct route because the
+// admission gate still says "session alive").
+//
+// While REALTIME frames flow (media is being sent and/or received), the
+// session tightens its keepalive cadence and probe deadline so a black-
+// holed path is detected and reaped in ~7-10 s instead. Scope guard: a
+// session with no recent realtime traffic keeps the exact pre-slice
+// timeline — chat/relay/mesh sessions see zero behaviour change.
+//
+// Fingerprint note: during a call the wire already carries a constant
+// media stream, so a 2 s keepalive adds no observable new signature;
+// once the activity window decays the cadence returns to base.
+
+/// Keepalive send interval while realtime traffic is active (upper
+/// bound — an operator-configured interval SHORTER than this wins).
+pub const REALTIME_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(2);
+
+/// Keepalive-probe (unacked → TX considered broken) deadline while
+/// realtime traffic is active. With the 2 s accelerated cadence this
+/// yields: probe armed ≤ 2 s after silence starts, Stage A fire at
+/// ~7 s, Stage B re-eval reap at ~9 s — vs ~60-90 s at the 30 s
+/// default. Reap additionally requires `genuine_rx` staleness and
+/// exhausted failover (see `should_reeval_teardown`), so a healthy
+/// loaded session is never reaped by acceleration alone.
+pub const REALTIME_KEEPALIVE_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How long after the last REALTIME frame (either direction) the
+/// accelerated cadence stays armed. Must comfortably exceed the whole
+/// accelerated detection budget (~9-10 s) so the window cannot decay
+/// mid-detection after the peer's media stops arriving.
+pub const REALTIME_ACTIVITY_WINDOW: Duration = Duration::from_secs(20);
+
 pub struct SessionTimers {
     last_rx: Instant,
     /// Last GENUINE peer frame (advanced only by `note_frame_received`, never by
@@ -68,6 +109,11 @@ pub struct SessionTimers {
     /// lets a doomed swap-loop mask a dead peer forever. `last_genuine_rx` ignores
     /// swaps, so [`Self::liveness_ceiling_elapsed`] can reap that zombie.
     last_genuine_rx: Instant,
+    /// Last REALTIME-priority frame seen in EITHER direction (media TX
+    /// enqueue or media RX on the ordered stream). `None` until the
+    /// first realtime frame — plain sessions never enter accelerated
+    /// mode. See the realtime-acceleration module notes above.
+    last_realtime: Option<Instant>,
     next_keepalive: Instant,
     next_cover: Instant,
     keepalive_interval: Duration,
@@ -89,6 +135,7 @@ impl SessionTimers {
         Self {
             last_rx: now,
             last_genuine_rx: now,
+            last_realtime: None,
             next_keepalive: now + jitter_keepalive_interval(keepalive_interval),
             next_cover: now + jitter_cover_interval(COVER_TRAFFIC_INTERVAL),
             keepalive_interval,
@@ -210,6 +257,59 @@ impl SessionTimers {
         self.last_rx = now;
     }
 
+    /// Mark a REALTIME-priority frame event (media TX enqueue or media RX)
+    /// — arms/refreshes the accelerated liveness cadence. On the rising
+    /// edge (inactive → active) the next scheduled keepalive is pulled in
+    /// to the accelerated interval: it may otherwise sit a full base
+    /// interval (30 s) away, which would delay the whole accelerated
+    /// detection pipeline by that much.
+    pub fn note_realtime_activity(&mut self, now: Instant) {
+        let was_active = self.realtime_active(now);
+        self.last_realtime = Some(now);
+        if !self.keepalive_enabled || was_active {
+            return;
+        }
+        let accel_deadline = now + jitter_keepalive_interval(self.accel_keepalive_interval());
+        if accel_deadline < self.next_keepalive {
+            self.next_keepalive = accel_deadline;
+        }
+    }
+
+    /// Is the accelerated (realtime) liveness cadence currently armed?
+    pub fn realtime_active(&self, now: Instant) -> bool {
+        self.last_realtime
+            .is_some_and(|t| now.duration_since(t) < REALTIME_ACTIVITY_WINDOW)
+    }
+
+    /// Accelerated keepalive interval — an operator interval SHORTER than
+    /// the realtime constant wins (never slow a fast config down).
+    fn accel_keepalive_interval(&self) -> Duration {
+        self.keepalive_interval.min(REALTIME_KEEPALIVE_INTERVAL)
+    }
+
+    /// Keepalive interval to use RIGHT NOW: accelerated while realtime
+    /// traffic is active, the configured base otherwise.
+    pub fn effective_keepalive_interval(&self, now: Instant) -> Duration {
+        if self.realtime_active(now) {
+            self.accel_keepalive_interval()
+        } else {
+            self.keepalive_interval
+        }
+    }
+
+    /// Keepalive-probe timeout to use RIGHT NOW. `base` is the runner's
+    /// configured probe timeout (1 × keepalive_interval); while realtime
+    /// traffic is active it is capped at [`REALTIME_KEEPALIVE_PROBE_TIMEOUT`].
+    /// A zero base (keepalive disabled) stays zero — acceleration never
+    /// turns the probe machinery ON for sessions that opted out.
+    pub fn effective_keepalive_probe_timeout(&self, base: Duration, now: Instant) -> Duration {
+        if base.is_zero() || !self.realtime_active(now) {
+            base
+        } else {
+            base.min(REALTIME_KEEPALIVE_PROBE_TIMEOUT)
+        }
+    }
+
     /// Test + reschedule for keepalive-due check. Returns `true`
     /// if caller must emit a Keepalive frame; in that case
     /// `next_keepalive` has already been advanced to the next
@@ -219,7 +319,11 @@ impl SessionTimers {
         if !self.keepalive_enabled || now < self.next_keepalive {
             return false;
         }
-        self.next_keepalive = now + jitter_keepalive_interval(self.keepalive_interval);
+        // Accel-aware reschedule: while realtime traffic is active the
+        // next keepalive lands on the accelerated cadence; once the
+        // activity window decays this naturally returns to base.
+        self.next_keepalive =
+            now + jitter_keepalive_interval(self.effective_keepalive_interval(now));
         true
     }
 
@@ -237,9 +341,15 @@ impl SessionTimers {
     /// Update the keepalive interval (e.g. called by
     /// `BatteryAdjustedKeepalive::maybe_recompute` with a scaled
     /// interval) and immediately reschedule `next_keepalive`.
+    ///
+    /// Accel-aware: a battery/background stretch applied mid-call must
+    /// not push the next keepalive a full stretched interval away —
+    /// realtime activity (a live call) trumps power saving for the
+    /// duration of the activity window.
     pub fn update_keepalive_interval(&mut self, new_interval: Duration, now: Instant) {
         self.keepalive_interval = new_interval;
-        self.next_keepalive = now + jitter_keepalive_interval(new_interval);
+        self.next_keepalive =
+            now + jitter_keepalive_interval(self.effective_keepalive_interval(now));
     }
 }
 
@@ -433,5 +543,98 @@ mod tests {
             !timers.idle_timeout_elapsed(swap_time + Duration::from_secs(20)),
             "swap counts as activity — idle ticker resets"
         );
+    }
+
+    // ── realtime-aware liveness acceleration (P2P mobility slice) ──────
+
+    #[tokio::test]
+    async fn realtime_activity_arms_and_decays() {
+        let mut timers = SessionTimers::new(Duration::from_secs(30), Duration::from_secs(90));
+        let t0 = timers.last_rx();
+        assert!(
+            !timers.realtime_active(t0),
+            "no realtime frame yet — accel must be off"
+        );
+        timers.note_realtime_activity(t0);
+        assert!(timers.realtime_active(t0 + REALTIME_ACTIVITY_WINDOW / 2));
+        assert!(
+            !timers.realtime_active(t0 + REALTIME_ACTIVITY_WINDOW),
+            "accel must decay once the activity window elapses"
+        );
+    }
+
+    #[tokio::test]
+    async fn realtime_activity_accelerates_keepalive_interval_and_probe() {
+        let mut timers = SessionTimers::new(Duration::from_secs(30), Duration::from_secs(90));
+        let t0 = timers.last_rx();
+        let base = Duration::from_secs(30);
+        // Inactive: base values pass through untouched.
+        assert_eq!(timers.effective_keepalive_interval(t0), base);
+        assert_eq!(timers.effective_keepalive_probe_timeout(base, t0), base);
+        // Active: capped at the realtime constants.
+        timers.note_realtime_activity(t0);
+        assert_eq!(
+            timers.effective_keepalive_interval(t0),
+            REALTIME_KEEPALIVE_INTERVAL
+        );
+        assert_eq!(
+            timers.effective_keepalive_probe_timeout(base, t0),
+            REALTIME_KEEPALIVE_PROBE_TIMEOUT
+        );
+        // Decayed: back to base.
+        let later = t0 + REALTIME_ACTIVITY_WINDOW + Duration::from_secs(1);
+        assert_eq!(timers.effective_keepalive_interval(later), base);
+        assert_eq!(timers.effective_keepalive_probe_timeout(base, later), base);
+    }
+
+    #[tokio::test]
+    async fn realtime_activity_never_slows_a_faster_config() {
+        // Operator configured a 1 s keepalive — faster than the accel
+        // constant. Acceleration must keep 1 s, not stretch to 2 s.
+        let mut timers = SessionTimers::new(Duration::from_secs(1), Duration::from_secs(3));
+        let t0 = timers.last_rx();
+        timers.note_realtime_activity(t0);
+        assert_eq!(
+            timers.effective_keepalive_interval(t0),
+            Duration::from_secs(1)
+        );
+        assert_eq!(
+            timers.effective_keepalive_probe_timeout(Duration::from_secs(1), t0),
+            Duration::from_secs(1)
+        );
+    }
+
+    #[tokio::test]
+    async fn realtime_activity_zero_keepalive_stays_disabled() {
+        let mut timers = SessionTimers::new(Duration::ZERO, Duration::from_secs(10));
+        let t0 = Instant::now();
+        timers.note_realtime_activity(t0);
+        assert_eq!(
+            timers.effective_keepalive_probe_timeout(Duration::ZERO, t0),
+            Duration::ZERO,
+            "keepalive-disabled sessions must not grow a probe timeout"
+        );
+        assert!(!timers.keepalive_due_and_reschedule(t0 + Duration::from_secs(3600)));
+    }
+
+    #[tokio::test]
+    async fn realtime_rising_edge_pulls_next_keepalive_in() {
+        let mut timers = SessionTimers::new(Duration::from_secs(30), Duration::from_secs(90));
+        let t0 = timers.last_rx();
+        let scheduled_far = timers.next_keepalive();
+        // The base schedule sits ~30 s out (jittered ±30%).
+        assert!(scheduled_far > t0 + Duration::from_secs(15));
+        timers.note_realtime_activity(t0);
+        // Rising edge must clamp the deadline into the accelerated
+        // cadence (jitter caps at +30% of 2 s).
+        assert!(
+            timers.next_keepalive() <= t0 + REALTIME_KEEPALIVE_INTERVAL * 2,
+            "first accel keepalive must be pulled in from the base schedule"
+        );
+        // A second frame while already active must NOT keep re-clamping
+        // (the reschedule cadence owns the deadline now).
+        let after_fire = timers.next_keepalive();
+        timers.note_realtime_activity(t0 + Duration::from_millis(20));
+        assert_eq!(timers.next_keepalive(), after_fire);
     }
 }

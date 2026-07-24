@@ -172,6 +172,10 @@ pub struct NodeServices {
     /// (causes session-runners to exit on channel-closed branch).
     /// Recovery latency on network change drops from ~30-90 s to ~1-3 s.
     pub force_reconnect_notify: Arc<tokio::sync::Notify>,
+    /// P2P mobility slice: connectivity-gain hook (see
+    /// `connectivity_gain.rs`) — the outbound connector fires it after
+    /// every completed session registration.
+    pub connectivity_gain: Arc<crate::connectivity_gain::ConnectivityGain>,
     /// shared push-event bus, mirrored from `NodeRuntime` so
     /// service-task spawn paths (inbound listeners) can publish on it.
     pub event_bus: Arc<veil_ipc::EventBus>,
@@ -326,6 +330,11 @@ pub struct SessionRuntimeContext {
     /// `network_gate.verify_peer()`.
     pub verified_peer_certs:
         Arc<std::sync::RwLock<std::collections::HashMap<[u8; 32], veil_types::MembershipCert>>>,
+    /// P2P mobility slice: outbound-connector refresh slots, cloned (Arc)
+    /// from `NodeRuntime.outbound_connector_refresh`. Handed into every
+    /// `SessionGuard` so a session close instantly wakes the closing
+    /// peer's connector loop (see `session_guard.rs`).
+    outbound_connector_refresh: Arc<Mutex<std::collections::HashMap<[u8; 32], watch::Sender<u64>>>>,
 }
 
 #[derive(Clone)]
@@ -581,6 +590,10 @@ pub struct NodeRuntime {
     gateway_failover_notify: Arc<tokio::sync::Notify>,
     /// see `NodeServices::force_reconnect_notify`.
     pub force_reconnect_notify: Arc<tokio::sync::Notify>,
+    /// P2P mobility slice: connectivity-gain hook — outbound session
+    /// establishment fans out to the srflx probe task + (debounced)
+    /// `force_reconnect_notify`. See `connectivity_gain.rs`.
+    pub connectivity_gain: Arc<crate::connectivity_gain::ConnectivityGain>,
     /// shared push-event bus. IPC server subscribes one
     /// receiver per connected client and emits `LocalAppMsg::Event`
     /// frames on every publish; runtime publishes
@@ -2107,6 +2120,10 @@ impl NodeRuntime {
                 hot_standby_controller_arc.set_alt_uri(node_id, uri.clone());
             }
         }
+        // Built before the literal because the connectivity-gain hook
+        // (mobility slice) shares the same Notify with the
+        // `force_reconnect_notify` field below.
+        let force_reconnect_notify_arc = Arc::new(tokio::sync::Notify::new());
         let mut runtime = Self {
             config_path,
             foreground_mode,
@@ -2145,7 +2162,12 @@ impl NodeRuntime {
             // periodic poll. Drives the < 1 s failover acceptance bar.
             gateway_failover_notify: Arc::new(tokio::sync::Notify::new()),
             // see field doc comment.
-            force_reconnect_notify: Arc::new(tokio::sync::Notify::new()),
+            force_reconnect_notify: Arc::clone(&force_reconnect_notify_arc),
+            // mobility slice: outbound-session-established fan-out
+            // (srflx re-probe + debounced force_reconnect wake).
+            connectivity_gain: Arc::new(crate::connectivity_gain::ConnectivityGain::new(
+                force_reconnect_notify_arc,
+            )),
             // shared push-event bus. Default capacity (256)
             // — fast subscribers consume events in microseconds; only
             // pathologically slow consumers (Flutter UI mid-paint) ever
@@ -5501,6 +5523,7 @@ impl NodeServices {
             allowed_peer_algos: self.allowed_peer_algos.clone(),
             network_gate: self.network_gate.as_ref().map(Arc::clone),
             verified_peer_certs: Arc::clone(&self.verified_peer_certs),
+            outbound_connector_refresh: Arc::clone(&self.outbound_connector_refresh),
         }
     }
 

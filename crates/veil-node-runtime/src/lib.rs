@@ -6,6 +6,7 @@ pub mod admin_transport;
 pub mod bootstrap_invite_create;
 pub mod bootstrap_join;
 pub mod builtin;
+pub mod connectivity_gain;
 pub mod dht_fallback;
 pub mod dht_glue;
 pub mod error;

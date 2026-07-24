@@ -612,6 +612,7 @@ impl NodeRuntime {
             session_outbox: Arc::clone(&self.session_outbox),
             gateway_failover_notify: Arc::clone(&self.gateway_failover_notify),
             force_reconnect_notify: Arc::clone(&self.force_reconnect_notify),
+            connectivity_gain: Arc::clone(&self.connectivity_gain),
             event_bus: Arc::clone(&self.event_bus),
             outbound_connector_refresh: Arc::clone(&self.outbound_connector_refresh),
             discovered_peers_cache: Arc::clone(&self.discovered_peers_cache),
@@ -712,6 +713,7 @@ impl NodeRuntime {
             let state = Arc::clone(&self.state);
             let live_sessions = Arc::clone(&self.live_sessions);
             let session_close_generations = Arc::clone(&self.session_close_generations);
+            let outbound_connector_refresh = Arc::clone(&self.outbound_connector_refresh);
             let event_bus = Arc::clone(&self.event_bus);
             let tasks = Arc::clone(&self.tasks);
             // cleanup: bundle replaces 7 individual Arc clones.
@@ -888,6 +890,7 @@ impl NodeRuntime {
                                         allowed_peer_algos:             allowed_peer_algos_for_listener.clone(),
                                         network_gate:           network_gate_for_listener.as_ref().map(Arc::clone),
                                         verified_peer_certs:    Arc::clone(&verified_peer_certs_for_listener),
+                                        outbound_connector_refresh: Arc::clone(&outbound_connector_refresh),
                                     },
                                     listen_id,
                                     listener_handle,
@@ -1303,6 +1306,7 @@ impl NodeRuntime {
             allowed_peer_algos: self.allowed_peer_algos.clone(),
             network_gate: self.network_gate.as_ref().map(Arc::clone),
             verified_peer_certs: Arc::clone(&self.verified_peer_certs),
+            outbound_connector_refresh: Arc::clone(&self.outbound_connector_refresh),
         };
         let accept_bundle = AcceptBundle {
             ctx: session_ctx_template,

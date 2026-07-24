@@ -23,6 +23,7 @@
 use std::collections::BTreeMap;
 use std::net::IpAddr;
 use std::sync::{Arc, Mutex, RwLock};
+use tokio::sync::watch;
 use veil_util::{lock, wlock};
 
 use crate::types::{LinkId, SessionInfo};
@@ -31,6 +32,12 @@ use veil_session::{SessionRegistry, SessionTxRegistry};
 
 use super::ip_slot::IpSlotTable;
 use super::{NodeLogger, NodeMetrics};
+
+/// Per-node-id outbound-connector refresh slots (the map
+/// `spawn_outbound_peers` claims from) — aliased for the guard's
+/// optional handle below.
+pub type ConnectorRefreshMap =
+    Arc<Mutex<std::collections::HashMap<[u8; 32], watch::Sender<u64>>>>;
 
 pub struct SessionGuard {
     live_sessions: Arc<Mutex<BTreeMap<LinkId, SessionInfo>>>,
@@ -59,6 +66,15 @@ pub struct SessionGuard {
     /// Shared push-event bus — publish `SESSIONS_CHANGED` on drop so
     /// connected apps see live counts decrement in real time.
     event_bus: Arc<veil_ipc::EventBus>,
+    /// P2P mobility slice: per-node-id outbound-connector refresh slots
+    /// (same map `spawn_outbound_peers` claims from). On drop, if a
+    /// connector loop exists for this peer we bump its refresh
+    /// generation — a loop parked in its 30 s `has_session` pre-check
+    /// sleep (its session was inbound-owned) re-evaluates IMMEDIATELY
+    /// and re-dials, instead of riding out the poll interval while the
+    /// peer's `admitted` status sits false. `watch` coalesces repeated
+    /// closes into one wake. `None` in unit fixtures.
+    connector_refresh: Option<ConnectorRefreshMap>,
 }
 
 impl SessionGuard {
@@ -76,6 +92,7 @@ impl SessionGuard {
         session_tx_registry: Arc<RwLock<SessionTxRegistry>>,
         reputation: Option<Arc<Mutex<ReputationTracker>>>,
         event_bus: Arc<veil_ipc::EventBus>,
+        connector_refresh: Option<ConnectorRefreshMap>,
     ) -> Self {
         Self {
             live_sessions,
@@ -90,6 +107,7 @@ impl SessionGuard {
             session_tx_registry,
             reputation,
             event_bus,
+            connector_refresh,
         }
     }
 }
@@ -157,6 +175,18 @@ impl Drop for SessionGuard {
             kind: veil_proto::event_kind::SESSIONS_CHANGED,
             payload: count_u16.to_be_bytes().to_vec(),
         });
+
+        // P2P mobility slice: wake this peer's outbound-connector loop
+        // (if one is claimed) so it re-evaluates `has_session` NOW and
+        // re-dials immediately — this is the fast half of the
+        // "admitted flips false → direct session re-established" loop
+        // on the side that did not own the session task. Placed with
+        // the side-effects (no session-state locks held).
+        if let Some(map) = &self.connector_refresh
+            && let Some(tx) = lock!(map).get(&self.peer_node_id)
+        {
+            tx.send_modify(|generation| *generation = generation.wrapping_add(1));
+        }
 
         // Reputation tracker keys on sovereign node_id (rotation-stable).
         // Last so a panic inside `session_closed` poisons only the
