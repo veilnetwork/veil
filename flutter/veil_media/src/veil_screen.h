@@ -8,8 +8,9 @@
  * SAME VP8 send source the camera uses — screen share is a source switch, not
  * a new track, so the receiving side needs nothing new to render it.
  *
- * macOS backs this with AVCaptureSession + AVCaptureScreenInput
- * (veil_avf_screen.mm); other platforms return null from the factory until
+ * macOS 12.3+ backs this with ScreenCaptureKit for displays and individual
+ * windows; 10.15–12.2 keeps the AVCaptureScreenInput display fallback
+ * (veil_avf_screen.mm). Other platforms return null from the factory until
  * their capturer lands (Android needs the MediaProjection consent flow, which
  * lives app-side — see the engine's push_video_frame path).
  *
@@ -36,15 +37,22 @@ class ScreenCapturer {
 };
 
 // Creates the platform screen capturer, or null if this platform has none.
-// `source_id` is an opaque id returned by ListPlatformScreensJson; null/empty
-// selects the main display. The callback is retained for the capturer's
-// lifetime.
+// `source_id` is an opaque `display:*` / `window:*` id returned by
+// ListPlatformScreensJson; null/empty selects the main display. Numeric
+// display ids from the previous ABI remain accepted. The callback is retained
+// for the capturer's lifetime.
 ScreenCapturer* CreatePlatformScreen(CameraFrameCb cb, const char* source_id);
 
 // JSON array compatible with the Dart MediaDevice shape:
 // [{"id":"...","label":"...","kind":"screen"}].
 // Returns "[]" where the platform has no native screen backend.
 std::string ListPlatformScreensJson();
+
+// Local Screen Recording permission posture. Enumeration deliberately remains
+// available before consent so the UI can explain what will be shared; capture
+// itself must fail until the user grants the OS permission.
+bool PlatformScreenAccessGranted();
+bool RequestPlatformScreenAccess();
 
 }  // namespace veil_media
 

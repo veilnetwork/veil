@@ -16,5 +16,7 @@ ScreenCapturer* CreatePlatformScreen(CameraFrameCb cb, const char* source_id) {
 }
 
 std::string ListPlatformScreensJson() { return "[]"; }
+bool PlatformScreenAccessGranted() { return false; }
+bool RequestPlatformScreenAccess() { return false; }
 
 }  // namespace veil_media

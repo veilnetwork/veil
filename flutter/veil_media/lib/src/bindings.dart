@@ -270,6 +270,21 @@ final Pointer<Utf8> Function() veilMediaListScreenInputs = nativeLib
     )
     .asFunction();
 
+int Function()? _lookupOptionalNoArgInt(String symbol) {
+  try {
+    return nativeLib
+        .lookup<NativeFunction<Int32 Function()>>(symbol)
+        .asFunction();
+  } on ArgumentError {
+    return null;
+  }
+}
+
+final int Function()? veilMediaScreenCaptureAccess =
+    _lookupOptionalNoArgInt('veil_media_screen_capture_access');
+final int Function()? veilMediaRequestScreenCaptureAccess =
+    _lookupOptionalNoArgInt('veil_media_request_screen_capture_access');
+
 // select_audio_input(engine*, id char*) -> int
 final int Function(Pointer<VeilMediaEngineHandle>, Pointer<Utf8>)
     veilMediaEngineSelectAudioInput = nativeLib

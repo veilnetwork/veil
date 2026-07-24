@@ -112,7 +112,7 @@ int veil_media_group_engine_stop_camera(VeilGroupMediaEngine *engine);
 int veil_media_group_engine_start_screen(VeilGroupMediaEngine *engine,
                                          int width, int fps);
 /* Source-aware additive variant. `source_id` comes from
- * veil_media_list_screen_inputs; NULL/empty selects the main display. */
+ * veil_media_list_screen_inputs; NULL/empty selects the default display. */
 int veil_media_group_engine_start_screen_source(VeilGroupMediaEngine *engine,
                                                 const char *source_id,
                                                 int width, int fps);
@@ -172,17 +172,17 @@ int veil_media_engine_start_camera_device(VeilMediaEngine *engine,
                                           int height, int fps);
 int veil_media_engine_stop_camera(VeilMediaEngine *engine);
 
-/* Screen share: capture the main display into the SAME VP8 send source the
- * camera uses (frames downscaled to <= width, at fps) — a source switch, not
- * a new track, so the peer renders it with no changes. Starting the screen
- * stops a running camera (one source at a time); the app layer restores the
- * camera when the share ends. macOS backend only for now; other platforms
- * return VEIL_MEDIA_ERR_STATE. The first use triggers the OS Screen Recording
- * consent prompt (no frames until granted + app restart). Idempotent. */
+/* Screen share: capture a display into the SAME VP8 send source the camera
+ * uses (frames downscaled to <= width, at fps) — a source switch, not a new
+ * track, so the peer renders it with no changes. Starting the screen stops a
+ * running camera (one source at a time); the app layer restores the camera
+ * when the share ends. macOS backend only for now; other platforms return
+ * VEIL_MEDIA_ERR_STATE. Capture fails until OS Screen Recording permission is
+ * granted. Idempotent. */
 int veil_media_engine_start_screen(VeilMediaEngine *engine, int width,
                                    int fps);
 /* Source-aware additive variant. `source_id` comes from
- * veil_media_list_screen_inputs; NULL/empty selects the main display. */
+ * veil_media_list_screen_inputs; NULL/empty selects the default display. */
 int veil_media_engine_start_screen_source(VeilMediaEngine *engine,
                                           const char *source_id, int width,
                                           int fps);
@@ -234,6 +234,10 @@ char *veil_media_engine_list_video_inputs(VeilMediaEngine *engine);
 /* Platform screen sources. This list is process-global rather than tied to an
  * engine so 1:1 and group call UIs share the same IDs. */
 char *veil_media_list_screen_inputs(void);
+/* 1 = granted, 0 = denied/not-yet-granted, -1 = unsupported platform. */
+int veil_media_screen_capture_access(void);
+/* Requests OS consent after an explicit user action; same return contract. */
+int veil_media_request_screen_capture_access(void);
 int veil_media_engine_select_audio_input(VeilMediaEngine *engine,
                                          const char *id);
 int veil_media_engine_select_audio_output(VeilMediaEngine *engine,
