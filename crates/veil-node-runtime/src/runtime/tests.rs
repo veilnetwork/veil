@@ -2521,3 +2521,151 @@ async fn udp_discovery_punch_and_same_socket_quic_roundtrip() {
     let _ = reflector_stop_tx.send(());
     reflector.await.unwrap().unwrap();
 }
+
+// ── Explicit call-path hole punch (real-P2P Stage B) ───────────────────────
+
+/// The dial-stage failure enum maps 1:1 onto the wire outcomes so an
+/// early exit never loses its stage identity crossing the API boundary.
+#[test]
+fn hole_punch_dial_failure_maps_to_every_wire_outcome() {
+    use super::HolePunchDialFailure as F;
+    use veil_ipc::HolePunchOutcome as O;
+    assert_eq!(O::from(F::NoReflector), O::NoReflector);
+    assert_eq!(O::from(F::MappingUnusable), O::MappingUnusable);
+    assert_eq!(O::from(F::SignalingTimeout), O::SignalingTimeout);
+    assert_eq!(O::from(F::PunchTimeout), O::PunchTimeout);
+    assert_eq!(O::from(F::QuicFailed), O::QuicFailed);
+    // Outcomes with no dial-stage source still carry distinct wire bytes.
+    assert_eq!(
+        O::RefusedAnonymous.wire_status(),
+        veil_proto::hole_punch_status::REFUSED_ANONYMOUS
+    );
+    assert_eq!(
+        O::UnknownPeer.wire_status(),
+        veil_proto::hole_punch_status::UNKNOWN_PEER
+    );
+    assert_eq!(
+        O::Connected.wire_status(),
+        veil_proto::hole_punch_status::CONNECTED
+    );
+}
+
+/// A node booted under an anonymity posture (onion-service armed) MUST
+/// refuse the explicit punch before any socket / reflector / signaling
+/// side effect — a punch would disclose its real external address. The
+/// refusal is a dedicated outcome, not a masked failure.
+#[tokio::test(flavor = "current_thread")]
+async fn attempt_hole_punch_refuses_under_anonymity_posture() {
+    let anon = save_test_config(
+        "punch-anon",
+        veil_cfg::build_stub_config_with_ephemeral_identity(true).unwrap(),
+    )
+    .unwrap();
+    let mut rt = NodeRuntime::start(&anon, true)
+        .await
+        .expect("anonymous stub starts");
+    assert!(
+        rt.anonymity.onion_service_hops.is_some(),
+        "precondition: anonymous stub arms the onion service",
+    );
+    let services = rt.access();
+    // Gate fires before peer lookup, so any node_id triggers it.
+    let outcome = services.attempt_p2p_hole_punch([0x42; 32]).await;
+    assert_eq!(outcome, veil_ipc::HolePunchOutcome::RefusedAnonymous);
+    // Refusal must be pure — no single-flight slot, no attempt started.
+    assert_eq!(services.hole_punch_run_count(), 0);
+    rt.stop().await.expect("stop");
+    let _ = fs::remove_file(anon);
+}
+
+/// A node_id that is not a registered peer yields the explicit
+/// `UnknownPeer` outcome; sequential repeats are idempotent (same
+/// outcome, no leaked single-flight slot — proven by each call starting a
+/// fresh attempt).
+#[tokio::test(flavor = "current_thread")]
+async fn attempt_hole_punch_unknown_peer_is_idempotent() {
+    let path = save_test_config("punch-unknown-peer", runtime_config_with_listen()).unwrap();
+    let mut rt = NodeRuntime::start(&path, true).await.expect("start");
+    let services = rt.access();
+    let unknown = [0xEE; 32];
+    let first = services.attempt_p2p_hole_punch(unknown).await;
+    let second = services.attempt_p2p_hole_punch(unknown).await;
+    assert_eq!(first, veil_ipc::HolePunchOutcome::UnknownPeer);
+    assert_eq!(second, veil_ipc::HolePunchOutcome::UnknownPeer);
+    // Two SEQUENTIAL calls each ran a fresh attempt (the first released its
+    // slot on completion, so the second did not join a stale entry).
+    assert_eq!(services.hole_punch_run_count(), 2);
+    rt.stop().await.expect("stop");
+    let _ = fs::remove_file(path);
+}
+
+/// With NAT enabled by default but no reflector known, a registered peer
+/// yields `NoReflector` — the attempt reaches the dial ladder (peer
+/// lookup + config load succeed) and stops at the first stage.
+#[tokio::test(flavor = "current_thread")]
+async fn attempt_hole_punch_registered_peer_without_reflector() {
+    let path = save_test_config("punch-no-reflector", runtime_config_with_listen()).unwrap();
+    let mut rt = NodeRuntime::start(&path, true).await.expect("start");
+    let services = rt.access();
+    // The config peer's pubkey equals the local identity's, so its node_id
+    // equals `local_node_id` — a genuinely registered peer entry.
+    let peer = services.local_node_id;
+    let outcome = services.attempt_p2p_hole_punch(peer).await;
+    assert_eq!(outcome, veil_ipc::HolePunchOutcome::NoReflector);
+    assert_eq!(services.hole_punch_run_count(), 1);
+    rt.stop().await.expect("stop");
+    let _ = fs::remove_file(path);
+}
+
+/// Two concurrent attempts for the SAME peer collapse into one: the second
+/// caller joins the in-flight attempt and observes its outcome instead of
+/// starting a second punch. Uses a silent local reflector so the shared
+/// attempt stays inside its discovery window while both callers race, and
+/// asserts the whole thing finishes well inside the 5 s budget.
+#[tokio::test(flavor = "current_thread")]
+async fn attempt_hole_punch_is_single_flight_per_peer() {
+    // A bound-but-silent UDP socket: discovery sends here and never gets a
+    // reply, so the attempt spends its ~500 ms discovery window before
+    // returning `MappingUnusable` — long enough for the second caller to
+    // observe the in-flight slot.
+    let silent = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let silent_addr = silent.local_addr().unwrap();
+
+    let mut config = runtime_config_with_listen();
+    config.nat.enabled = true;
+    config.nat.udp_reflectors = vec![silent_addr.to_string()];
+    let path = save_test_config("punch-single-flight", config).unwrap();
+    let mut rt = NodeRuntime::start(&path, true).await.expect("start");
+    let services = rt.access();
+    let peer = services.local_node_id;
+
+    let started = std::time::Instant::now();
+    // Poll both on ONE task: the first poll of `a` inserts the single-flight
+    // slot before yielding into discovery; `b` is then polled, sees the slot
+    // and joins.
+    let (a, b) = tokio::join!(
+        services.attempt_p2p_hole_punch(peer),
+        services.attempt_p2p_hole_punch(peer),
+    );
+    let elapsed = started.elapsed();
+
+    assert_eq!(a, veil_ipc::HolePunchOutcome::MappingUnusable);
+    assert_eq!(
+        b,
+        veil_ipc::HolePunchOutcome::MappingUnusable,
+        "joiner sees same outcome"
+    );
+    assert_eq!(
+        services.hole_punch_run_count(),
+        1,
+        "second concurrent call must join, not start a second punch",
+    );
+    assert!(
+        elapsed < std::time::Duration::from_secs(5),
+        "attempt must finish inside the 5 s budget (took {elapsed:?})",
+    );
+
+    drop(silent);
+    rt.stop().await.expect("stop");
+    let _ = fs::remove_file(path);
+}

@@ -1361,6 +1361,34 @@ final int Function(
             )>>('veil_listen_transports')
     .asFunction();
 
+// Explicit hole-punch outcome wire bytes (veil_proto::hole_punch_status,
+// mirrors veilclient-ffi's VEIL_HOLE_PUNCH_*).
+const int veilHolePunchConnected = 0;
+const int veilHolePunchNoReflector = 1;
+const int veilHolePunchSignalingTimeout = 2;
+const int veilHolePunchMappingUnusable = 3;
+const int veilHolePunchPunchTimeout = 4;
+const int veilHolePunchQuicFailed = 5;
+const int veilHolePunchRefusedAnonymous = 6;
+const int veilHolePunchUnknownPeer = 7;
+const int veilHolePunchUnsupported = 8;
+
+final int Function(
+  Pointer<VeilHandle>,
+  Pointer<Uint8>, // peer_node_id_32
+  Pointer<Uint8>, // out_status (veilHolePunch*)
+  Pointer<Pointer<Utf8>>,
+) veilAttemptP2PHolePunch = nativeLib
+    .lookup<
+        NativeFunction<
+            Int32 Function(
+              Pointer<VeilHandle>,
+              Pointer<Uint8>,
+              Pointer<Uint8>,
+              Pointer<Pointer<Utf8>>,
+            )>>('veil_attempt_p2p_hole_punch')
+    .asFunction();
+
 // ── Mailbox (Epic 489.3) ────────────────────────────────────────────────────
 
 // MailboxPutStatus wire bytes (veil_proto::MailboxPutStatus).

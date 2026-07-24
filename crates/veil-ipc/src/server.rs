@@ -890,6 +890,12 @@ pub struct IpcServer {
     /// IP after a NAT probe).  Without it, the handler replies with an
     /// empty list so apps can detect "feature not wired" cleanly.
     listen_transports_provider: Option<Arc<dyn crate::ListenTransportsProvider>>,
+    /// Hole-punch driver — answers `LocalAppMsg::AttemptHolePunch`
+    /// (explicit call-path hole punch, real-P2P Stage B) by running one
+    /// bounded punch attempt on the runtime's NAT orchestration.
+    /// Without it, the handler replies the explicit `UNSUPPORTED`
+    /// status so apps can detect "feature not wired" cleanly.
+    hole_punch_driver: Option<Arc<dyn crate::HolePunchDriver>>,
     /// Bootstrap-URI join sink — handles
     /// `LocalAppMsg::JoinBootstrapUri` requests by decoding the URI
     /// and registering the resulting peer. Without it, the handler
@@ -1016,6 +1022,7 @@ impl IpcServer {
             peer_list_provider: None,
             pnet_status_provider: None,
             listen_transports_provider: None,
+            hole_punch_driver: None,
             bootstrap_join_sink: None,
             mobile_status_provider: None,
             event_bus: None,
@@ -1305,6 +1312,16 @@ impl IpcServer {
         provider: Arc<dyn crate::ListenTransportsProvider>,
     ) -> Self {
         self.listen_transports_provider = Some(provider);
+        self
+    }
+
+    /// Attach a hole-punch driver. When set
+    /// `LocalAppMsg::AttemptHolePunch` is dispatched to the driver for
+    /// one bounded explicit punch attempt (real-P2P Stage B call path).
+    /// Without it, the reply is the explicit `UNSUPPORTED` status so
+    /// apps can detect "feature not wired" cleanly.
+    pub fn with_hole_punch_driver(mut self, driver: Arc<dyn crate::HolePunchDriver>) -> Self {
+        self.hole_punch_driver = Some(driver);
         self
     }
 
@@ -1601,6 +1618,7 @@ impl IpcServer {
                         let peer_list_provider = self.peer_list_provider.clone();
                         let pnet_status_provider = self.pnet_status_provider.clone();
                         let listen_transports_provider = self.listen_transports_provider.clone();
+                        let hole_punch_driver = self.hole_punch_driver.clone();
                         let bootstrap_join_sink = self.bootstrap_join_sink.clone();
                         let mobile_status_provider = self.mobile_status_provider.clone();
                         let event_bus = self.event_bus.clone();
@@ -1631,7 +1649,7 @@ impl IpcServer {
                             // operators can diagnose IPC disconnects without
                             // strace. Tracing is wired in at log-level WARN
                             // by the daemon binary.
-                            if let Err(e) = handle_ipc_client(stream, registry, streams, node_id, max_rate, tx_reg, route_cache, route_updated, peer_mlkem_keys, mlkem_ek_resolver, anon_onion_sender, capture_tx, trace_sample_rate, pending_ack, pending_recursive, app_socket_dir, metrics, anycast_service, hint_registry, mobile_event_sink, local_identity_algo, local_identity_pubkey, local_relay_x25519_pubkey, peer_list_provider, bootstrap_join_sink, mobile_status_provider, event_bus, push_envelope_sink, mailbox_backend, mailbox_crypto_sink, outbox_backend, rendezvous_resolver, relay_key_resolver, bootstrap_invite_create_sink, pair_source_sink, pair_target_sink, pnet_status_provider, listen_transports_provider, stream_bridge).await {
+                            if let Err(e) = handle_ipc_client(stream, registry, streams, node_id, max_rate, tx_reg, route_cache, route_updated, peer_mlkem_keys, mlkem_ek_resolver, anon_onion_sender, capture_tx, trace_sample_rate, pending_ack, pending_recursive, app_socket_dir, metrics, anycast_service, hint_registry, mobile_event_sink, local_identity_algo, local_identity_pubkey, local_relay_x25519_pubkey, peer_list_provider, bootstrap_join_sink, mobile_status_provider, event_bus, push_envelope_sink, mailbox_backend, mailbox_crypto_sink, outbox_backend, rendezvous_resolver, relay_key_resolver, bootstrap_invite_create_sink, pair_source_sink, pair_target_sink, pnet_status_provider, listen_transports_provider, hole_punch_driver, stream_bridge).await {
                                 eprintln!("[veil-ipc] client disconnected: {e} (kind={:?})", e.kind());
                             }
                         });
@@ -1749,6 +1767,7 @@ async fn handle_ipc_client(
     pair_target_sink: Option<Arc<dyn crate::PairTargetSink>>,
     pnet_status_provider: Option<Arc<dyn crate::PnetStatusProvider>>,
     listen_transports_provider: Option<Arc<dyn crate::ListenTransportsProvider>>,
+    hole_punch_driver: Option<Arc<dyn crate::HolePunchDriver>>,
     stream_bridge: Option<crate::bridge::IpcStreamBridge>,
 ) -> std::io::Result<()> {
     // ── Step 1: read APP_HELLO ──────────────────────────────────────────
@@ -2713,6 +2732,35 @@ async fn handle_ipc_client(
                             listen_transports_provider.as_ref(),
                         )
                         .await?;
+                    }
+                    Ok(LocalAppMsg::AttemptHolePunch) => {
+                        // Seconds-class arc (real-P2P Stage B): one explicit
+                        // punch attempt holds its full budget
+                        // (HOLE_PUNCH_ATTEMPT_BUDGET_MS). Rate limit + body
+                        // validation stay inline (silent drop, same as the
+                        // other query-class messages); the attempt runs
+                        // off-loop when req_id != 0 so it cannot HOL-block
+                        // the connection.
+                        if client_state.allow_query()
+                            && let Ok(peer_node_id) = <[u8; 32]>::try_from(&body[..])
+                        {
+                            let driver = hole_punch_driver.clone();
+                            dispatch_reply_job(
+                                &mut wh,
+                                req_id,
+                                LocalAppMsg::AttemptHolePunchResult as u16,
+                                &spawn_sem,
+                                &reply_tx,
+                                async move {
+                                    crate::handlers::queries::attempt_hole_punch_reply_body(
+                                        driver,
+                                        peer_node_id,
+                                    )
+                                    .await
+                                },
+                            )
+                            .await?;
+                        }
                     }
                     Ok(LocalAppMsg::GetMobileStatus) => {
                         handle_get_mobile_status(

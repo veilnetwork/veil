@@ -631,6 +631,8 @@ impl NodeRuntime {
             network_gate: self.network_gate.as_ref().map(Arc::clone),
             verified_peer_certs: Arc::clone(&self.verified_peer_certs),
             tasks: Arc::clone(&self.tasks),
+            hole_punch_inflight: Arc::clone(&self.hole_punch_inflight),
+            hole_punch_run_count: Arc::new(AtomicU64::new(0)),
         }
     }
 

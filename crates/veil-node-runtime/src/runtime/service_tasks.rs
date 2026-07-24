@@ -2684,6 +2684,25 @@ impl NodeRuntime {
         let listen_transports: Arc<dyn veil_ipc::ListenTransportsProvider> =
             Arc::new(DispatcherListenTransports(Arc::clone(&self.dispatcher)));
         server = server.with_listen_transports_provider(listen_transports);
+        // Explicit call-path hole-punch driver (real-P2P Stage B). The IPC
+        // `AttemptHolePunch` request runs one bounded punch attempt on the
+        // runtime's NAT orchestration; contract (budget / single-flight /
+        // idempotency / anonymity refusal) lives in
+        // `NodeServices::attempt_p2p_hole_punch`.
+        struct RuntimeHolePunchDriver(crate::runtime::NodeServices);
+        impl veil_ipc::HolePunchDriver for RuntimeHolePunchDriver {
+            fn attempt_hole_punch<'a>(
+                &'a self,
+                peer_node_id: [u8; 32],
+            ) -> std::pin::Pin<
+                Box<dyn std::future::Future<Output = veil_ipc::HolePunchOutcome> + Send + 'a>,
+            > {
+                Box::pin(self.0.attempt_p2p_hole_punch(peer_node_id))
+            }
+        }
+        let hole_punch: Arc<dyn veil_ipc::HolePunchDriver> =
+            Arc::new(RuntimeHolePunchDriver(self.access()));
+        server = server.with_hole_punch_driver(hole_punch);
         // bootstrap-URI join sink — handles `JoinBootstrapUri`
         // requests by decoding the URI and registering the resulting
         // peer for outbound dial. Critical for Flutter onboarding —
