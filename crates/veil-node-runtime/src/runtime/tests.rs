@@ -2617,6 +2617,90 @@ async fn attempt_hole_punch_registered_peer_without_reflector() {
     let _ = fs::remove_file(path);
 }
 
+/// Mixed-version network: a coordinator built before the punch-token wire
+/// extension strips the token in flight, so the initiator's reply comes back
+/// without it. Such a reply must NOT terminate the coordinator ladder — the
+/// initiator skips it and completes through the next coordinator whose path
+/// preserves the token. Regression test for the live LTE↔wired failure where
+/// one stale seed poisoned every punch attempt it coordinated.
+#[tokio::test(flavor = "current_thread")]
+async fn nat_signaling_skips_tokenless_reply_and_uses_next_coordinator() {
+    use veil_proto::codec::decode_header;
+    use veil_proto::control::{NatProbeReplyPayload, NatProbeRequestPayload};
+    use veil_proto::family::ControlMsg;
+    use veil_proto::header::HEADER_SIZE;
+
+    let path = save_test_config("punch-tokenless-retry", runtime_config_with_listen()).unwrap();
+    let mut rt = NodeRuntime::start(&path, true).await.expect("start");
+    let services = rt.access();
+
+    let target = [0xBB; 32];
+    let punch_token = [0x42; 16];
+    // XOR distance to `target` orders the coordinator ladder: `stale` differs
+    // only in the last byte (tried first), `fresh` in the first byte (second).
+    let mut stale = target;
+    stale[31] ^= 0x01;
+    let mut fresh = target;
+    fresh[0] ^= 0xF0;
+
+    let (mut stale_rx, mut fresh_rx) = {
+        let mut guard = services.session_tx_registry.write().unwrap();
+        (guard.register(stale), guard.register(fresh))
+    };
+
+    // Model both coordinators' end-to-end behaviour by answering the frames
+    // the initiator actually queues to their sessions. The stale one echoes a
+    // reply WITHOUT the punch token (extension lost to its old re-encode);
+    // the fresh one preserves the token.
+    let waiters = Arc::clone(&services.dispatcher.nat_probe_waiters);
+    let responder = tokio::spawn(async move {
+        let answer = |frame: Vec<u8>, responder_id: [u8; 32], echo_token: bool| {
+            let header = decode_header(&frame[..HEADER_SIZE]).unwrap();
+            assert_eq!(header.msg_type, ControlMsg::NatProbeRequest as u16);
+            let request = NatProbeRequestPayload::decode(&frame[HEADER_SIZE..]).unwrap();
+            assert_eq!(request.punch_token, Some(punch_token));
+            let reply = NatProbeReplyPayload {
+                responder_node_id: responder_id,
+                final_target_node_id: request.initiator_node_id,
+                session_token: request.session_token,
+                punch_token: echo_token.then_some(punch_token),
+                candidates: request.candidates.clone(),
+            };
+            let waiter = lock!(waiters)
+                .remove(&request.session_token)
+                .expect("waiter registered before the frame was sent");
+            waiter.send(reply).unwrap();
+        };
+        let (_, stale_frame) = stale_rx.recv().await.expect("stale coordinator receives");
+        answer(stale_frame.to_vec(), stale, false);
+        let (_, fresh_frame) = fresh_rx.recv().await.expect("fresh coordinator receives");
+        answer(fresh_frame.to_vec(), fresh, true);
+    });
+
+    let reply = services
+        .try_nat_traversal_with_punch_token(
+            target,
+            Vec::new(),
+            Duration::from_millis(500),
+            Some(punch_token),
+        )
+        .await
+        .expect("tokenless first reply must not poison the ladder");
+    assert_eq!(
+        reply.punch_token,
+        Some(punch_token),
+        "accepted reply must carry the initiator's punch token"
+    );
+    assert_eq!(
+        reply.responder_node_id, fresh,
+        "reply must come from the second (token-preserving) coordinator"
+    );
+    responder.await.expect("both coordinators were consulted");
+
+    rt.stop().await.expect("stop");
+    let _ = fs::remove_file(path);
+}
+
 /// Two concurrent attempts for the SAME peer collapse into one: the second
 /// caller joins the in-flight attempt and observes its outcome instead of
 /// starting a second punch. Uses a silent local reflector so the shared

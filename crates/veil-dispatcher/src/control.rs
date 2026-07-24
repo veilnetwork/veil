@@ -184,10 +184,14 @@ impl FrameDispatcher {
                     let cached_hop = rlock!(self.route_cache).lookup(&request.target_node_id);
                     if let Some(ref reg_arc) = self.session_tx_registry {
                         let guard = wlock!(reg_arc);
-                        let frame = build_control_frame(
-                            ControlMsg::NatProbeRequest as u16,
-                            &request.encode(),
-                        );
+                        // Forward the ORIGINAL body bytes, not a re-encode of
+                        // our decoded view: a coordinator built before a
+                        // trailing extension (e.g. the 0xB1 punch token) would
+                        // otherwise silently strip it from the initiator's
+                        // request and break the end-to-end punch handshake for
+                        // every newer pair it coordinates.
+                        let frame =
+                            build_control_frame(ControlMsg::NatProbeRequest as u16, body);
                         let prio = veil_proto::header::priority::INTERACTIVE;
                         let direct = guard.send_to(&request.target_node_id, prio, frame.clone());
                         let routed_hop = cached_hop.filter(|hop| {
@@ -388,10 +392,12 @@ impl FrameDispatcher {
                             rlock!(self.route_cache).lookup(&reply.final_target_node_id);
                         if let Some(ref reg_arc) = self.session_tx_registry {
                             let guard = wlock!(reg_arc);
-                            let frame = build_control_frame(
-                                ControlMsg::NatProbeReply as u16,
-                                &reply.encode(),
-                            );
+                            // Same raw-bytes rule as the request forward: a
+                            // re-encode by an older coordinator build would
+                            // drop the responder's punch-token echo and the
+                            // initiator would abort the punch as unauthenticated.
+                            let frame =
+                                build_control_frame(ControlMsg::NatProbeReply as u16, body);
                             let prio = veil_proto::header::priority::INTERACTIVE;
                             let direct =
                                 guard.send_to(&reply.final_target_node_id, prio, frame.clone());
