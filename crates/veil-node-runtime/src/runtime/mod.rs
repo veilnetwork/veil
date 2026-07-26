@@ -8345,7 +8345,7 @@ impl NodeServices {
         hop_count: usize,
     ) -> std::result::Result<Vec<[u8; 32]>, veil_types::AnonOnionSendError> {
         use veil_anonymity::directory::{
-            DEFAULT_FRESHNESS_WINDOW_SECS, discover_relay_hops, relay_directory_dht_key,
+            DEFAULT_FRESHNESS_WINDOW_SECS, discover_relay_hops_cached, relay_directory_dht_key,
         };
         use veil_types::AnonOnionSendError;
 
@@ -8385,11 +8385,12 @@ impl NodeServices {
         let me = self.dht.local_node_id();
         candidates.retain(|n| *n != r && *n != me);
         let dht = std::sync::Arc::clone(&self.dht);
-        let mut discovered: Vec<[u8; 32]> = discover_relay_hops(
+        let mut discovered: Vec<[u8; 32]> = discover_relay_hops_cached(
             &candidates,
             |n| dht.get_local(&relay_directory_dht_key(n)),
             now_unix,
             DEFAULT_FRESHNESS_WINDOW_SECS,
+            &self.anonymity.relay_entry_verify_cache,
         )
         .into_iter()
         .map(|d| d.hop.node_id)
@@ -10171,7 +10172,7 @@ impl NodeServices {
     ) -> std::result::Result<(), veil_anonymity::sender::SenderError> {
         use veil_anonymity::{
             directory::{
-                DEFAULT_FRESHNESS_WINDOW_SECS, discover_relay_hops, relay_directory_dht_key,
+                DEFAULT_FRESHNESS_WINDOW_SECS, discover_relay_hops_cached, relay_directory_dht_key,
             },
             sender::{DiversityOutcome, build_outbound_anonymous_cell_guarded},
         };
@@ -10203,11 +10204,12 @@ impl NodeServices {
             .map(|d| d.as_secs())
             .unwrap_or(0);
         let dht = Arc::clone(&self.dht);
-        let usable_relays = discover_relay_hops(
+        let usable_relays = discover_relay_hops_cached(
             &candidate_node_ids,
             |node_id| dht.get_local(&relay_directory_dht_key(node_id)),
             now_unix,
             DEFAULT_FRESHNESS_WINDOW_SECS,
+            &self.anonymity.relay_entry_verify_cache,
         );
 
         // Step 4: build the cell. RTT estimator pulls from Vivaldi
@@ -10855,7 +10857,7 @@ impl NodeServices {
         // its directory entry (shipped in).
         use veil_anonymity::{
             directory::{
-                DEFAULT_FRESHNESS_WINDOW_SECS, discover_relay_hops, relay_directory_dht_key,
+                DEFAULT_FRESHNESS_WINDOW_SECS, discover_relay_hops_cached, relay_directory_dht_key,
             },
             sender::{DiversityOutcome, build_outbound_anonymous_cell_guarded},
         };
@@ -10866,11 +10868,12 @@ impl NodeServices {
         // Resolve rendezvous's directory entry to fetch its x25519_pk.
         let dht = Arc::clone(&self.dht);
         let candidates = vec![ad.rendezvous_node_id];
-        let resolved = discover_relay_hops(
+        let resolved = discover_relay_hops_cached(
             &candidates,
             |node_id| dht.get_local(&relay_directory_dht_key(node_id)),
             now_unix,
             DEFAULT_FRESHNESS_WINDOW_SECS,
+            &self.anonymity.relay_entry_verify_cache,
         );
         let rendezvous_relay = match resolved.into_iter().next() {
             Some(r) => r,
@@ -10910,11 +10913,12 @@ impl NodeServices {
         candidate_node_ids.sort_unstable();
         candidate_node_ids.dedup();
         candidate_node_ids.retain(|nid| *nid != ad.rendezvous_node_id);
-        let usable_relays = discover_relay_hops(
+        let usable_relays = discover_relay_hops_cached(
             &candidate_node_ids,
             |node_id| dht.get_local(&relay_directory_dht_key(node_id)),
             now_unix,
             DEFAULT_FRESHNESS_WINDOW_SECS,
+            &self.anonymity.relay_entry_verify_cache,
         );
 
         // Vivaldi-based RTT estimator (same shape as send_anonymous).

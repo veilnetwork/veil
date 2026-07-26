@@ -142,6 +142,11 @@ impl NodeRuntime {
         // Without this filter every ordinary app peer / routing-table contact
         // becomes a permanent DHT miss on every maintenance tick.
         let peer_cap_flags_for_relay_warm = Arc::clone(&self.dispatcher.crypto.peer_cap_flags);
+        // Shared with the send path on purpose. This tick already decodes and
+        // verifies the SAME entries a send would, over the same candidate set,
+        // so warming here means a send finds the verdicts already made instead
+        // of paying for a cold walk on whatever unlucky message comes first.
+        let relay_entry_verify_cache = Arc::clone(&self.anonymity.relay_entry_verify_cache);
         // Whole-services handle so the tick can rebuild hosted onion-service
         // circuits before their TTL lapses (no-op unless this node registered an
         // onion service via `register_onion_circuit`).
@@ -352,8 +357,8 @@ impl NodeRuntime {
                         // skips relays already cached; only the connected set.
                         {
                             use veil_anonymity::directory::{
-                                DEFAULT_FRESHNESS_WINDOW_SECS, decode_entry, discover_relay_hops,
-                                relay_directory_dht_key, verify_entry,
+                                DEFAULT_FRESHNESS_WINDOW_SECS, decode_entry,
+                                discover_relay_hops_cached, relay_directory_dht_key, verify_entry,
                             };
                             // Mirror the onion middle-selector's FULL candidate set
                             // (connected sessions ∪ routing table): every relay a
@@ -397,11 +402,12 @@ impl NodeRuntime {
                                 // stale entry is filtered out by every circuit-building
                                 // consumer (`discover_relay_hops`), so it must be
                                 // re-fetched, not treated as a hit.
-                                let fresh = !discover_relay_hops(
+                                let fresh = !discover_relay_hops_cached(
                                     std::slice::from_ref(&relay),
                                     |n| dht_for_publish.get_local(&relay_directory_dht_key(n)),
                                     now_unix,
                                     DEFAULT_FRESHNESS_WINDOW_SECS,
+                                    &relay_entry_verify_cache,
                                 )
                                 .is_empty();
                                 if fresh {
