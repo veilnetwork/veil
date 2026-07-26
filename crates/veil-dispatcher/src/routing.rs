@@ -2165,11 +2165,15 @@ impl FrameDispatcher {
                     // self-authenticating records (rendezvous ad, relay key, …)
                     // alive at the K-closest. NEW keys still pay the quota.
                     let already_present = self.dht.get_local(&q.target_key).is_some();
-                    let origin =
-                        match self.validate_store_value_by_magic_ex(&q.payload, already_present) {
-                            Ok(origin) => origin,
-                            Err(violation) => return violation,
-                        };
+                    let mut canonical = None;
+                    let origin = match self.validate_store_value_capturing_key(
+                        &q.payload,
+                        already_present,
+                        &mut canonical,
+                    ) {
+                        Ok(origin) => origin,
+                        Err(violation) => return violation,
+                    };
                     // audit cycle-7 (HIGH — DHT key-binding): same canonical-key
                     // binding as the direct STORE arm (dispatch_discovery). An
                     // owner-verified AP/AT/SB record may only be written under its
@@ -2177,7 +2181,10 @@ impl FrameDispatcher {
                     // else a valid record of the attacker's identity poisons the
                     // victim key. `mirror_cache_key_ok` passes nc/id/ir/mc through
                     // (re-verified on the resolver read path).
-                    if !self.mirror_cache_key_ok(&q.payload, &q.target_key) {
+                    // Uses the key the validation above already derived from the
+                    // content it verified, so this costs a comparison, not a
+                    // second verify of the same bytes.
+                    if !self.canonical_key_binds(canonical, &q.payload, &q.target_key) {
                         return DispatchResult::Violation(
                             "Store: self-authenticating record stored under non-canonical DHT key"
                                 .to_owned(),
@@ -2634,7 +2641,6 @@ impl FrameDispatcher {
                         // an attacker-chosen key.  Apply the same magic-prefix
                         // authenticator gate that direct STORE uses so only
                         // self-authenticating record types are mirror-cached…
-                        && self.validate_store_value_by_magic(&resp.payload).is_ok()
                         // …AND (audit cycle-6 A8) verify the record's CANONICAL
                         // DHT key equals `target_key` for derivable record types
                         // (AppEndpoint / Attachment / SignedBundle), closing the
@@ -2642,7 +2648,9 @@ impl FrameDispatcher {
                         // responder's OWN can no longer be cached under a victim's
                         // key. (Structurally-decoded nc/id/ir/mc keep prior
                         // behaviour; they are re-verified on the resolver path.)
-                        && self.mirror_cache_key_ok(&resp.payload, &p.target_key)
+                        // Both gates in one call so the key binding reuses the
+                        // signature the authenticator gate just checked.
+                        && self.mirror_cache_admissible(&resp.payload, &p.target_key)
                         // …AND for nickname records ("NK") apply the
                         // replace-on-heavier rule so a lighter (but valid)
                         // record in a response can never clobber a heavier
