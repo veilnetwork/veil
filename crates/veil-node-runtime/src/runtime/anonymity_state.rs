@@ -604,6 +604,16 @@ pub struct AnonymityState {
     /// (relay, cookie) makes every introduce vanish silently.
     pub onion_resolve_cache: Arc<RendezvousResolveCache>,
 
+    /// Verdicts for relay-directory entries already decoded and verified.
+    ///
+    /// Relay selection re-verified every candidate on every anonymous send,
+    /// and measurement put that at 14.6x the cost of building the onion at 50
+    /// candidates, growing linearly to 98.5x at 500 — where it is 9.4 ms per
+    /// send. The candidates barely change between sends, so nearly all of it
+    /// is the same signature checked again. Keyed by the published bytes, so
+    /// a republished entry is a different key; freshness is never cached.
+    pub relay_entry_verify_cache: Arc<veil_anonymity::directory::VerifiedEntryCache>,
+
     /// Single-flight guard for cold relay-directory warming on stream circuit
     /// open. A file download can start several parallel stream workers; without
     /// coalescing, each worker probes the same relay-directory DHT keys at once
@@ -730,6 +740,9 @@ impl AnonymityState {
             rendezvous_publisher_entries: Arc::new(Mutex::new(Vec::new())),
             rendezvous_resolve_cache: Arc::new(RendezvousResolveCache::new()),
             onion_resolve_cache: Arc::new(RendezvousResolveCache::new()),
+            relay_entry_verify_cache: Arc::new(
+                veil_anonymity::directory::VerifiedEntryCache::new(),
+            ),
             stream_relay_directory_warm_lock: Arc::new(tokio::sync::Mutex::new(())),
             relay_reputation: Arc::new(RelayReputation::new()),
             reply_block_store: Arc::new(ReplyBlockStore::new()),
