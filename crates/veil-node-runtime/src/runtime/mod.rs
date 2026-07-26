@@ -10031,6 +10031,16 @@ impl NodeServices {
         if candidates.is_empty() {
             return Err(veil_types::AnonOnionSendError::NoRendezvous);
         }
+        if enqueued == 0 {
+            // Nothing got out over any candidate, so the cached route set is
+            // the prime suspect — drop it rather than re-firing into it for the
+            // rest of the TTL. (A route that accepts sends but silently eats
+            // them is a different problem: the receiver-addressed path detects
+            // that with a stall counter, which this path does not yet have.)
+            self.anonymity
+                .onion_resolve_cache
+                .remove(&service_identity_vk);
+        }
         match (enqueued, first_error) {
             (0, Some(error)) => Err(map_sender_err(error)),
             (0, None) => Err(veil_types::AnonOnionSendError::NoRendezvous),
@@ -10375,6 +10385,13 @@ impl NodeServices {
             .collect()
     }
 
+    /// How long the remaining slot lookups may still join after the first one
+    /// has answered. Long enough for a peer that is merely a little slower to be
+    /// counted — the fan-out picks up to three providers and wants the choice —
+    /// short enough that a service publishing one slot no longer pays the full
+    /// timeout for the eight it left empty.
+    const SLOT_GRACE: std::time::Duration = std::time::Duration::from_millis(400);
+
     async fn resolve_onion_service_period_bodies(
         &self,
         service_identity_vk: &[u8; 32],
@@ -10390,21 +10407,51 @@ impl NodeServices {
         let lookups = provider_lookups
             .map(|(slot, key)| (Some(slot), key))
             .chain(bd::descriptor_dht_key(service_identity_vk, period).map(|key| (None, key)));
-        let results = futures::future::join_all(lookups.map(|(slot, key)| async move {
-            let bytes = self.dht_recursive_get(key, timeout).await?;
-            let body = match slot {
-                Some(slot) => {
-                    bd::open_provider_descriptor(service_identity_vk, period, slot, &bytes)
+        // Every key is still QUERIED — the lookup shape must not reveal how many
+        // provider slots are occupied, and that invariant is about what goes out
+        // on the wire. It is not about how long we sit here: a service normally
+        // fills one slot, so the other eight have nothing to find and each runs
+        // its full timeout. Waiting for all of them made every resolve cost
+        // exactly `timeout`, measured at 5003/5003/5002/5002/5003/5002/5003/5004
+        // ms across one 8 KiB pull while the answer itself was already in hand.
+        //
+        // So: collect as they land, and once something HAS landed, give the rest
+        // a short grace to join before returning. A resolve that finds nothing
+        // still waits the whole budget, because there the wait is the search.
+        use futures::stream::StreamExt;
+        let mut pending: futures::stream::FuturesUnordered<_> = lookups
+            .map(|(slot, key)| async move {
+                let bytes = self.dht_recursive_get(key, timeout).await?;
+                let body = match slot {
+                    Some(slot) => {
+                        bd::open_provider_descriptor(service_identity_vk, period, slot, &bytes)
+                    }
+                    None => bd::open_descriptor(service_identity_vk, period, &bytes),
+                }?;
+                Some(body)
+            })
+            .collect();
+
+        let mut bodies: Vec<bd::BlindedDescriptorBody> = Vec::new();
+        let mut grace_deadline: Option<tokio::time::Instant> = None;
+        loop {
+            let next = match grace_deadline {
+                None => pending.next().await,
+                Some(deadline) => match tokio::time::timeout_at(deadline, pending.next()).await {
+                    Ok(item) => item,
+                    // The stragglers are still in flight and their answers still
+                    // reach the local store through the dispatcher, so the next
+                    // resolve benefits from them even though this one moved on.
+                    Err(_) => break,
+                },
+            };
+            let Some(found) = next else { break };
+            if let Some(body) = found {
+                if !bodies.contains(&body) {
+                    bodies.push(body);
                 }
-                None => bd::open_descriptor(service_identity_vk, period, &bytes),
-            }?;
-            Some(body)
-        }))
-        .await;
-        let mut bodies = Vec::new();
-        for body in results.into_iter().flatten() {
-            if !bodies.contains(&body) {
-                bodies.push(body);
+                grace_deadline
+                    .get_or_insert_with(|| tokio::time::Instant::now() + Self::SLOT_GRACE);
             }
         }
         bodies
@@ -10426,7 +10473,37 @@ impl NodeServices {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
+
+        // A resolve ran on EVERY send. A member content pull issues one send
+        // per 256-byte chunk, so a single file paid a whole DHT fan-out — nine
+        // slot lookups against a multi-second budget — for every chunk of it.
+        // The receiver-addressed path was given this cache long ago; the
+        // identity-addressed one was simply never wired to it.
+        if let Some(ads) = self
+            .anonymity
+            .onion_resolve_cache
+            .get(service_identity_vk, now)
+        {
+            return Ok(ads);
+        }
+        // Coalesce the burst. Without this a window of chunk requests all miss
+        // the cold cache together and each launches its own fan-out before the
+        // first one has anything to share.
+        let _refresh = self
+            .anonymity
+            .onion_resolve_cache
+            .lock_refresh(*service_identity_vk)
+            .await;
+        // Whoever held the lock has published by now.
+        if let Some(ads) = self
+            .anonymity
+            .onion_resolve_cache
+            .get(service_identity_vk, now)
+        {
+            return Ok(ads);
+        }
         let cur = bd::current_period(now);
+        let resolve_started = std::time::Instant::now();
 
         // Query every fixed slot, not "until missing": the lookup shape must
         // not reveal the provider count. Legacy `od` participates as a ninth
@@ -10541,6 +10618,24 @@ impl NodeServices {
         for (relay_key, bytes) in resolved.into_iter().flatten() {
             self.dht.store_local(relay_key, bytes);
         }
+        // Short-lived on purpose, and the TTL is the whole safety argument: a
+        // descriptor stays cryptographically valid after the service reconnects
+        // onto a different rendezvous relay, and the old relay no longer holds
+        // the cookie, so every introduce sent to it disappears without a word.
+        self.anonymity
+            .onion_resolve_cache
+            .put(*service_identity_vk, ads.clone());
+        // What a cache miss actually costs, so the value of caching it is a
+        // measurement rather than an inference from the timeout constant.
+        self.logger.info(
+            "anonymity.onion_resolve.cold",
+            format!(
+                "service={} took_ms={} ads={}",
+                veil_util::hex_short(service_identity_vk),
+                resolve_started.elapsed().as_millis(),
+                ads.len(),
+            ),
+        );
         Ok(ads)
     }
 

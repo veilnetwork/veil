@@ -590,6 +590,20 @@ pub struct AnonymityState {
     /// so neither can get pinned to a still-valid but no-longer-live local ad.
     pub rendezvous_resolve_cache: Arc<RendezvousResolveCache>,
 
+    /// The same cache for services addressed by IDENTITY rather than by
+    /// receiver node id — the blinded-descriptor path. A separate instance
+    /// rather than a shared map: the keys are different namespaces (a service
+    /// verifying key vs a node id) and nothing good comes of letting one
+    /// occupy the other's slot.
+    ///
+    /// Wired for the same reason the receiver path was: a resolve ran on EVERY
+    /// send, and a member content pull sends one request per 256-byte chunk, so
+    /// a file's worth of chunks each paid a full DHT fan-out. The short TTL is
+    /// the point — a descriptor stays cryptographically valid across a service
+    /// moving to a different rendezvous relay, and pinning to the old
+    /// (relay, cookie) makes every introduce vanish silently.
+    pub onion_resolve_cache: Arc<RendezvousResolveCache>,
+
     /// Single-flight guard for cold relay-directory warming on stream circuit
     /// open. A file download can start several parallel stream workers; without
     /// coalescing, each worker probes the same relay-directory DHT keys at once
@@ -715,6 +729,7 @@ impl AnonymityState {
             x25519_sk,
             rendezvous_publisher_entries: Arc::new(Mutex::new(Vec::new())),
             rendezvous_resolve_cache: Arc::new(RendezvousResolveCache::new()),
+            onion_resolve_cache: Arc::new(RendezvousResolveCache::new()),
             stream_relay_directory_warm_lock: Arc::new(tokio::sync::Mutex::new(())),
             relay_reputation: Arc::new(RelayReputation::new()),
             reply_block_store: Arc::new(ReplyBlockStore::new()),
