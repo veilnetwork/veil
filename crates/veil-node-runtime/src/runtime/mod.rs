@@ -10480,6 +10480,51 @@ impl NodeServices {
             })
             .collect();
 
+        // Drop our OWN registrations for this service. A node can be both a
+        // provider and a client of the same service — member content is exactly
+        // that: adopting bytes makes a member a servable replica, and every
+        // member derives the same service identity. Our own ad is then one of
+        // the candidates, an anonymous send can pick it, and we answer our own
+        // request holding nothing it asked for. Denials there are silent by
+        // design, so the fetch could only ever time out.
+        //
+        // Matched on (rendezvous relay, cookie) like `withdraw_ephemeral_onion_
+        // service` does, and scoped to THIS service identity so a legitimate
+        // send to some other locally hosted service is untouched.
+        let ads: Vec<_> = {
+            let mine: Vec<([u8; 32], [u8; 16])> = {
+                let services = lock!(self.anonymity.onion_services);
+                services
+                    .iter()
+                    .filter(|entry| {
+                        entry
+                            .descriptor_identity_seed
+                            .as_deref()
+                            .map(|seed| {
+                                veil_crypto::key_blinding::ed25519_public_from_seed(seed)
+                                    == *service_identity_vk
+                            })
+                            .unwrap_or(false)
+                    })
+                    .filter_map(|entry| entry.relay_path.last().map(|r| (*r, entry.cookie)))
+                    .collect()
+            };
+            ads.into_iter()
+                .filter(|ad| {
+                    !mine
+                        .iter()
+                        .any(|(relay, cookie)| {
+                            *relay == ad.rendezvous_node_id && *cookie == ad.auth_cookie
+                        })
+                })
+                .collect()
+        };
+        // Being the only provider is not "no service" — but there is nobody
+        // else to ask, and saying so at once beats a silent self-timeout.
+        if ads.is_empty() {
+            return Err(AnonOnionSendError::NoRendezvous);
+        }
+
         let relay_keys: Vec<_> = ads
             .iter()
             .map(|ad| veil_anonymity::directory::relay_directory_dht_key(&ad.rendezvous_node_id))
