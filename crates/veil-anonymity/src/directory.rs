@@ -333,6 +333,73 @@ pub struct DiscoveredRelay {
     pub last_published_unix: u64,
 }
 
+/// Remembers the decode+verify verdict for entry bytes already seen.
+///
+/// Every anonymous send re-walks the same candidate relays and re-verifies
+/// signatures that have not changed since the last send. The work is real —
+/// selection outgrows onion construction by two orders of magnitude as the
+/// routing table fills — and it is repeated work, not necessary work.
+///
+/// Safe by construction rather than by policy. The key is a hash of ALL the
+/// bytes, and [`verify_entry`] is a pure function of those bytes: it checks
+/// the node_id↔issuer binding and the signature, and consults no clock. Every
+/// time-dependent judgement lives in [`is_fresh`], which is deliberately a
+/// separate function and still runs on every use. So a cached verdict cannot
+/// keep a stale entry alive: republishing changes `last_published_unix`,
+/// which changes the bytes, which changes the key.
+///
+/// Failures are remembered too. A candidate publishing bytes that do not
+/// verify would otherwise cost a full signature check on every send, which is
+/// a cheap thing for someone else to make this node do repeatedly.
+#[derive(Debug, Default)]
+pub struct VerifiedEntryCache {
+    /// `None` records "these exact bytes do not decode+verify".
+    entries: std::sync::Mutex<std::collections::HashMap<[u8; 32], Option<RelayDirectoryEntry>>>,
+}
+
+impl VerifiedEntryCache {
+    /// Above this many distinct entries the cache is emptied rather than
+    /// evicted one by one. The set it tracks is the routing table's relays,
+    /// so exceeding this means churn far beyond a healthy table — and under
+    /// churn a partial cache is worth little anyway. Cheap and bounded beats
+    /// clever: an LRU here would add machinery to a hot lock for no benefit.
+    const CAPACITY: usize = 4096;
+
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Decode+verify `bytes`, reusing an earlier verdict for the same bytes.
+    /// Returns `None` when the entry is malformed or its signature is bad.
+    pub fn decode_and_verify(&self, bytes: &[u8]) -> Option<RelayDirectoryEntry> {
+        let key = *blake3::hash(bytes).as_bytes();
+        if let Ok(map) = self.entries.lock() {
+            if let Some(hit) = map.get(&key) {
+                return hit.clone();
+            }
+        }
+        let verdict = decode_entry(bytes)
+            .ok()
+            .filter(|entry| verify_entry(entry).is_ok());
+        if let Ok(mut map) = self.entries.lock() {
+            if map.len() >= Self::CAPACITY {
+                map.clear();
+            }
+            map.insert(key, verdict.clone());
+        }
+        verdict
+    }
+
+    /// Number of remembered verdicts. Exposed for tests and diagnostics.
+    pub fn len(&self) -> usize {
+        self.entries.lock().map(|m| m.len()).unwrap_or(0)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
 /// Sender-side relay discovery: walk `candidate_node_ids`, fetch
 /// each one's relay-directory entry via `fetch`, decode + verify +
 /// freshness-check, return the surviving usable [`DiscoveredRelay`]s.
@@ -366,12 +433,54 @@ pub fn discover_relay_hops<F>(
 where
     F: Fn(&[u8; NODE_ID_LEN]) -> Option<Vec<u8>>,
 {
+    discover_relay_hops_with(candidate_node_ids, fetch, now_unix, freshness_window, None)
+}
+
+/// [`discover_relay_hops`] that reuses verdicts from `cache` for candidates
+/// whose published bytes have not changed. Identical filters and identical
+/// output — freshness is still evaluated against `now_unix` on every call,
+/// so a cache hit shortens the signature check and nothing else.
+pub fn discover_relay_hops_cached<F>(
+    candidate_node_ids: &[[u8; NODE_ID_LEN]],
+    fetch: F,
+    now_unix: u64,
+    freshness_window: u64,
+    cache: &VerifiedEntryCache,
+) -> Vec<DiscoveredRelay>
+where
+    F: Fn(&[u8; NODE_ID_LEN]) -> Option<Vec<u8>>,
+{
+    discover_relay_hops_with(
+        candidate_node_ids,
+        fetch,
+        now_unix,
+        freshness_window,
+        Some(cache),
+    )
+}
+
+fn discover_relay_hops_with<F>(
+    candidate_node_ids: &[[u8; NODE_ID_LEN]],
+    fetch: F,
+    now_unix: u64,
+    freshness_window: u64,
+    cache: Option<&VerifiedEntryCache>,
+) -> Vec<DiscoveredRelay>
+where
+    F: Fn(&[u8; NODE_ID_LEN]) -> Option<Vec<u8>>,
+{
     candidate_node_ids
         .iter()
         .filter_map(|node_id| {
             let bytes = fetch(node_id)?;
-            let entry = decode_entry(&bytes).ok()?;
-            verify_entry(&entry).ok()?;
+            let entry = match cache {
+                Some(cache) => cache.decode_and_verify(&bytes)?,
+                None => {
+                    let entry = decode_entry(&bytes).ok()?;
+                    verify_entry(&entry).ok()?;
+                    entry
+                }
+            };
             is_fresh(&entry, now_unix, freshness_window).ok()?;
             // Anti-impersonation: the entry's claimed node_id must
             // match the candidate node_id under which we fetched it.
@@ -491,6 +600,114 @@ mod tests {
     const T0: u64 = 1_700_000_000;
     const BPS: u32 = 1_000_000;
 
+    /// The property the whole cache rests on: it remembers a SIGNATURE
+    /// verdict, never a freshness one. An entry that verified an hour ago
+    /// and has since aged out must still be rejected.
+    #[test]
+    fn a_cached_verdict_never_keeps_a_stale_entry_alive() {
+        use std::collections::HashMap;
+        let (ipk, isk, node_id, x25519_pk) = fresh_relay();
+        let bytes = sign_entry(
+            node_id,
+            x25519_pk,
+            BPS,
+            T0,
+            &ipk,
+            &isk,
+            SignatureAlgorithm::Ed25519,
+        )
+        .expect("sign");
+        let store: HashMap<[u8; NODE_ID_LEN], Vec<u8>> =
+            HashMap::from([(node_id, bytes.clone())]);
+        let cache = VerifiedEntryCache::new();
+        let window = DEFAULT_FRESHNESS_WINDOW_SECS;
+
+        let fresh = discover_relay_hops_cached(
+            &[node_id],
+            |nid| store.get(nid).cloned(),
+            T0 + 10,
+            window,
+            &cache,
+        );
+        assert_eq!(fresh.len(), 1, "a fresh entry is usable");
+        assert_eq!(cache.len(), 1, "and its verdict was remembered");
+
+        let stale = discover_relay_hops_cached(
+            &[node_id],
+            |nid| store.get(nid).cloned(),
+            T0 + window + 1,
+            window,
+            &cache,
+        );
+        assert!(
+            stale.is_empty(),
+            "the same bytes, now past the window, must be rejected — freshness \
+             is evaluated per call and is never what the cache stores"
+        );
+    }
+
+    /// Republishing changes `last_published_unix`, so it changes the bytes,
+    /// so it changes the key. There is no way for an old verdict to answer
+    /// for a new publication.
+    #[test]
+    fn republishing_is_a_different_key() {
+        let (ipk, isk, node_id, x25519_pk) = fresh_relay();
+        let cache = VerifiedEntryCache::new();
+        for published in [T0, T0 + 1] {
+            let bytes = sign_entry(
+                node_id,
+                x25519_pk,
+                BPS,
+                published,
+                &ipk,
+                &isk,
+                SignatureAlgorithm::Ed25519,
+            )
+            .expect("sign");
+            let entry = cache.decode_and_verify(&bytes).expect("verifies");
+            assert_eq!(entry.last_published_unix, published);
+        }
+        assert_eq!(cache.len(), 2, "each publication is remembered separately");
+    }
+
+    /// A candidate publishing bytes that do not verify would otherwise cost a
+    /// full signature check on every send — cheap for someone else to inflict
+    /// repeatedly. The refusal is remembered exactly like an acceptance.
+    #[test]
+    fn a_refusal_is_remembered_too() {
+        let (ipk, isk, node_id, x25519_pk) = fresh_relay();
+        let mut bytes = sign_entry(
+            node_id,
+            x25519_pk,
+            BPS,
+            T0,
+            &ipk,
+            &isk,
+            SignatureAlgorithm::Ed25519,
+        )
+        .expect("sign");
+        let last = bytes.len() - 1;
+        bytes[last] ^= 0xFF; // break the signature
+        let cache = VerifiedEntryCache::new();
+        assert!(cache.decode_and_verify(&bytes).is_none());
+        assert!(cache.decode_and_verify(&bytes).is_none());
+        assert_eq!(cache.len(), 1, "remembered once, not re-verified");
+    }
+
+    /// Bounded: the cache is emptied rather than growing without limit.
+    #[test]
+    fn the_cache_is_bounded() {
+        let cache = VerifiedEntryCache::new();
+        for i in 0..=VerifiedEntryCache::CAPACITY {
+            cache.decode_and_verify(&(i as u64).to_be_bytes());
+        }
+        assert!(
+            cache.len() <= VerifiedEntryCache::CAPACITY,
+            "len {} exceeded the cap",
+            cache.len()
+        );
+    }
+
     /// W0 measurement (anonymity-preserving plan): quantify the per-send
     /// SELECTION cost (`discover_relay_hops` — decode + signature verify per
     /// candidate) vs the BUILD cost (pick + onion wrap) for realistic candidate
@@ -543,6 +760,24 @@ mod tests {
             let select_us = t.elapsed().as_micros() / reps;
             assert_eq!(discovered.len(), n, "all entries should verify");
 
+            // SELECTION with the verdict cache: same filters, same output,
+            // but a candidate whose published bytes have not changed is not
+            // re-verified. The first rep pays full price; the rest do not.
+            let cache = VerifiedEntryCache::new();
+            let t = Instant::now();
+            let mut cached_out = Vec::new();
+            for _ in 0..reps {
+                cached_out = discover_relay_hops_cached(
+                    &node_ids,
+                    |nid| store.get(nid).cloned(),
+                    now,
+                    DEFAULT_FRESHNESS_WINDOW_SECS,
+                    &cache,
+                );
+            }
+            let select_cached_us = t.elapsed().as_micros() / reps;
+            assert_eq!(cached_out, discovered, "the cache must not change output");
+
             // BUILD: pick (latency sort) + onion wrap for a 3-hop circuit.
             let target_sk = x25519_dalek::StaticSecret::random_from_rng(rand_core::OsRng);
             let target_pk = x25519_dalek::PublicKey::from(&target_sk).to_bytes();
@@ -562,9 +797,12 @@ mod tests {
             let build_us = t.elapsed().as_micros() / reps;
 
             println!(
-                "  N={n:4}  select_us={select_us:6}  build_us={build_us:5}  \
-                 selection/build = {:.1}x",
+                "  N={n:4}  select_us={select_us:6}  cached_us={select_cached_us:6}  \
+                 build_us={build_us:5}  selection/build = {:.1}x  \
+                 cached/build = {:.1}x  speedup = {:.1}x",
                 select_us as f64 / build_us.max(1) as f64,
+                select_cached_us as f64 / build_us.max(1) as f64,
+                select_us as f64 / select_cached_us.max(1) as f64,
             );
         }
         println!();
