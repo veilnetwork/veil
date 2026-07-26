@@ -415,9 +415,12 @@ impl FrameDispatcher {
                             // …) stay alive at the K-closest. NEW keys still pay the
                             // quota. Mirrors the recursive STORE plane.
                             let already_present = self.dht.get_local(&payload.key).is_some();
-                            let origin = match self
-                                .validate_store_value_by_magic_ex(&payload.value, already_present)
-                            {
+                            let mut canonical = None;
+                            let origin = match self.validate_store_value_capturing_key(
+                                &payload.value,
+                                already_present,
+                                &mut canonical,
+                            ) {
                                 Ok(origin) => origin,
                                 Err(violation) => return violation,
                             };
@@ -439,7 +442,10 @@ impl FrameDispatcher {
                             // path. Legitimate cross-DHT replication by intermediate
                             // nodes is unaffected: it stores under the record's own
                             // canonical key.
-                            if !self.mirror_cache_key_ok(&payload.value, &payload.key) {
+                            // The validation above already derived this key from
+                            // the content whose signature it verified, so the
+                            // binding costs a comparison rather than a re-verify.
+                            if !self.canonical_key_binds(canonical, &payload.value, &payload.key) {
                                 return DispatchResult::Violation(
                                     "Store: self-authenticating record stored under non-canonical DHT key".to_owned(),
                                 );
@@ -640,6 +646,36 @@ impl FrameDispatcher {
         payload_value: &[u8],
         already_present: bool,
     ) -> Result<[u8; 32], DispatchResult> {
+        let mut canonical = None;
+        self.validate_store_value_capturing_key(payload_value, already_present, &mut canonical)
+    }
+
+    /// As [`Self::validate_store_value_by_magic_ex`], but also reports the
+    /// record's canonical DHT key in `canonical_out` — for the types whose
+    /// signature THIS call verified and whose key is a pure function of that
+    /// verified content (AP / AT / blinded + provider descriptors).
+    ///
+    /// Every plane that stores or mirror-caches a value follows validation with
+    /// a canonical-key binding check, and deriving that key is the whole reason
+    /// [`Self::mirror_cache_key_ok`] verifies the signature again. Handing the
+    /// key back makes the binding a comparison instead of a second Ed25519
+    /// verify of bytes this call just verified. The repeat ran on all three
+    /// planes — direct STORE, recursive STORE, FIND_VALUE mirror cache — and
+    /// showed up as a measurable share of an idle node's signature work.
+    ///
+    /// `None` for every other type, which must keep going through
+    /// `mirror_cache_key_ok` unchanged: either the canonical key is not a
+    /// function of the value, or this gate only decodes the record structurally
+    /// (nc/id/ir/mc) and the resolver read path is the real bound. Only a key
+    /// this call derived from content it verified is ever reported, so a caller
+    /// cannot use `canonical_out` to weaken the binding.
+    #[allow(clippy::result_large_err)]
+    pub(crate) fn validate_store_value_capturing_key(
+        &self,
+        payload_value: &[u8],
+        already_present: bool,
+        canonical_out: &mut Option<[u8; 32]>,
+    ) -> Result<[u8; 32], DispatchResult> {
         let magic = payload_value.get(..2);
         let is_app_ep = magic == Some(&veil_discovery::directory::APP_ENDPOINT_DHT_MAGIC[..]);
         let is_attach = magic == Some(&veil_discovery::directory::ATTACHMENT_DHT_MAGIC[..]);
@@ -684,7 +720,14 @@ impl FrameDispatcher {
             match veil_discovery::directory::AppEndpointEntry::decode_and_verify_signed_from_dht_status(
                 payload_value,
             ) {
-                Ok(entry) => entry.node_id,
+                Ok(entry) => {
+                    *canonical_out = Some(veil_proto::discovery::app_endpoint_key(
+                        &entry.node_id,
+                        &entry.app_id,
+                        entry.endpoint_id,
+                    ));
+                    entry.node_id
+                }
                 // Stale (validly signed but past expires_at): a peer
                 // republishing its cached copy is NOT misbehaving — drop the
                 // store WITHOUT a violation (same disposition as a quota hit).
@@ -703,7 +746,10 @@ impl FrameDispatcher {
             match veil_discovery::directory::decode_and_verify_signed_attachment_status(
                 payload_value,
             ) {
-                Ok(record) => record.node_id,
+                Ok(record) => {
+                    *canonical_out = Some(veil_proto::discovery::attachment_key(&record.node_id));
+                    record.node_id
+                }
                 // Stale (validly signed but expired): benign republish of a
                 // cached copy — drop without a violation (cf. the AP arm).
                 Err(veil_discovery::directory::SignedDhtReject::Expired) => {
@@ -804,19 +850,25 @@ impl FrameDispatcher {
             // victim's key. Blinded keys are cheap to grind (per-period,
             // unlinkable), so attribute bytes to the shared aggregate bucket
             // rather than a per-key bucket an attacker could multiply.
-            if veil_anonymity::blinded_descriptor::verify_descriptor_self(payload_value).is_none() {
-                return Err(DispatchResult::Violation(
-                    "Store: blinded descriptor failed self-verification".to_owned(),
-                ));
+            match veil_anonymity::blinded_descriptor::verify_descriptor_self(payload_value) {
+                // H(domain ‖ blinded_pub) — the very key the binding below needs.
+                Some(canonical) => *canonical_out = Some(canonical),
+                None => {
+                    return Err(DispatchResult::Violation(
+                        "Store: blinded descriptor failed self-verification".to_owned(),
+                    ));
+                }
             }
             veil_dht::store::ORIGIN_RECURSIVE_BUNDLE
         } else if is_provider_desc {
-            if veil_anonymity::blinded_descriptor::verify_provider_descriptor_self(payload_value)
-                .is_none()
+            match veil_anonymity::blinded_descriptor::verify_provider_descriptor_self(payload_value)
             {
-                return Err(DispatchResult::Violation(
-                    "Store: provider descriptor failed self-verification".to_owned(),
-                ));
+                Some(canonical) => *canonical_out = Some(canonical),
+                None => {
+                    return Err(DispatchResult::Violation(
+                        "Store: provider descriptor failed self-verification".to_owned(),
+                    ));
+                }
             }
             veil_dht::store::ORIGIN_RECURSIVE_BUNDLE
         } else if is_rk {
@@ -959,6 +1011,35 @@ impl FrameDispatcher {
             ));
         };
         Ok(origin)
+    }
+
+    /// Canonical-key binding for a record that was just validated. `canonical`
+    /// is whatever [`Self::validate_store_value_capturing_key`] reported for the
+    /// SAME payload: present only when that call verified the signature and
+    /// derived the key from the verified content, so comparing it is exactly the
+    /// check [`Self::mirror_cache_key_ok`] would make — minus a second verify.
+    /// Absent, the record falls through to `mirror_cache_key_ok` unchanged.
+    pub(crate) fn canonical_key_binds(
+        &self,
+        canonical: Option<[u8; 32]>,
+        payload: &[u8],
+        target_key: &[u8; 32],
+    ) -> bool {
+        match canonical {
+            Some(key) => key == *target_key,
+            None => self.mirror_cache_key_ok(payload, target_key),
+        }
+    }
+
+    /// Both mirror-cache admission gates in one call, in the same order the
+    /// callers apply them: the magic-prefix authenticator, then the
+    /// canonical-key binding. Exists so the FIND_VALUE guard — an expression,
+    /// with nowhere to bind a local — can also spend one verify instead of two.
+    pub(crate) fn mirror_cache_admissible(&self, payload: &[u8], target_key: &[u8; 32]) -> bool {
+        let mut canonical = None;
+        self.validate_store_value_capturing_key(payload, false, &mut canonical)
+            .is_ok()
+            && self.canonical_key_binds(canonical, payload, target_key)
     }
 
     /// audit cycle-6 (A8): for the recursive FIND_VALUE mirror-cache, verify a

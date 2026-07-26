@@ -6443,6 +6443,71 @@ mod tests {
         assert!(!dispatcher.mirror_cache_key_ok(&tampered, &canonical_key));
     }
 
+    /// The STORE planes no longer re-derive the canonical key by verifying the
+    /// signature a second time — they bind against the key
+    /// `validate_store_value_capturing_key` reported from the verification it
+    /// already did. That makes `canonical_key_binds` the gate that actually
+    /// stops key poisoning on those planes, so pin it to the SAME verdicts as
+    /// `mirror_cache_key_ok`: identical on a derivable owner-verified type, and
+    /// still delegating for a pass-through type.
+    #[test]
+    fn capturing_key_binding_matches_mirror_cache_verdicts() {
+        use veil_anonymity::blinded_descriptor::{BlindedDescriptorBody, seal_descriptor};
+
+        let dispatcher = make_test_dispatcher(veil_cfg::NodeRole::Core);
+        let id_sk = [0x42u8; 32];
+        let body = BlindedDescriptorBody {
+            receiver_node_id: [0x10u8; 32],
+            rendezvous_node_id: [0x20u8; 32],
+            auth_cookie: [0x30u8; 16],
+            receiver_x25519_pk: [0x40u8; 32],
+        };
+        let (canonical_key, signed) = seal_descriptor(&id_sk, 11u64, &body).expect("seal");
+        let victim_key = [0xFFu8; 32];
+
+        // Validation reports the key it derived from the content it verified.
+        let mut canonical = None;
+        assert!(
+            dispatcher
+                .validate_store_value_capturing_key(&signed, false, &mut canonical)
+                .is_ok(),
+        );
+        assert_eq!(
+            canonical,
+            Some(canonical_key),
+            "a verified descriptor must hand back its canonical key",
+        );
+        // Binding on that key agrees with the re-verifying gate, both ways.
+        assert!(dispatcher.canonical_key_binds(canonical, &signed, &canonical_key));
+        assert!(
+            !dispatcher.canonical_key_binds(canonical, &signed, &victim_key),
+            "poisoning must still be refused when the key came from validation",
+        );
+        assert_eq!(
+            dispatcher.canonical_key_binds(canonical, &signed, &victim_key),
+            dispatcher.mirror_cache_key_ok(&signed, &victim_key),
+        );
+        // Both admission gates together, as the FIND_VALUE guard applies them.
+        assert!(dispatcher.mirror_cache_admissible(&signed, &canonical_key));
+        assert!(!dispatcher.mirror_cache_admissible(&signed, &victim_key));
+
+        // A pass-through type reports no key, so the binding must fall back to
+        // `mirror_cache_key_ok` and keep its documented pass-through verdict.
+        let mut nc_payload = veil_proto::name_claim_v2::NAME_CLAIM_MAGIC.to_vec();
+        nc_payload.extend_from_slice(&[0u8; 32]);
+        let mut nc_canonical = None;
+        let _ =
+            dispatcher.validate_store_value_capturing_key(&nc_payload, false, &mut nc_canonical);
+        assert_eq!(
+            nc_canonical, None,
+            "structurally-decoded records must not report a canonical key",
+        );
+        assert_eq!(
+            dispatcher.canonical_key_binds(nc_canonical, &nc_payload, &victim_key),
+            dispatcher.mirror_cache_key_ok(&nc_payload, &victim_key),
+        );
+    }
+
     #[test]
     fn mirror_cache_key_binding_for_provider_descriptor() {
         use veil_anonymity::blinded_descriptor::{BlindedDescriptorBody, seal_provider_descriptor};
