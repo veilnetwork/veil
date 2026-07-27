@@ -113,23 +113,6 @@ pub enum ApplyError {
         current: String,
         min_compatible: String,
     },
-    /// C-08 hardening: the keyed installed-version store holds a record with NO
-    /// mac (legacy, pre-authentication). Auto-adopting it is a downgrade vector
-    /// — a local writer who can reach the state file but not the HMAC key can
-    /// strip the mac to re-open the anti-downgrade window — so the apply path
-    /// refuses it by default. A genuine one-time migration from a pre-C-08
-    /// install must be authorized explicitly
-    /// (`ApplyOptions::allow_legacy_state_migration`, surfaced as the CLI
-    /// `--allow-legacy-state-migration` flag).
-    #[error(
-        "installed-version state is unauthenticated (legacy, no MAC): refusing \
-         automatically, because a stripped MAC can re-open the anti-downgrade \
-         window. ONLY if this host has a GENUINE pre-authentication state file, \
-         re-run on a trusted host with --allow-legacy-state-migration — and \
-         prefer --migrate-min-release-unix <unix> to assert the anti-downgrade \
-         floor, because the unauthenticated file's own value is NOT trusted"
-    )]
-    LegacyStateMigrationRequired,
     /// cycle-7 hardening: the manifest's `min_compatible_version` is present but
     /// is not valid semver. Fail closed rather than silently treating a
     /// malformed constraint as "no constraint".
@@ -246,36 +229,8 @@ pub struct ApplyOutcome {
     /// startup") and the next-startup `cleanup_stale_update_artifacts`
     /// removes the leftover.
     pub previous_binary_relocated_to: Option<PathBuf>,
-    /// C-08: `true` when the apply adopted a LEGACY (unauthenticated, no-mac)
-    /// installed-version file and re-wrote it MAC-authenticated — a one-time
-    /// trust-on-first-use migration. The CLI surfaces this so a repeated no-mac
-    /// downgrade attempt is visible rather than silent. Always `false` for an
-    /// unkeyed store or a fresh install (no prior state file).
-    pub migrated_legacy_state: bool,
 }
 
-/// Optional knobs for [`apply_update_with_options`]. `Default` is the safe
-/// posture — every field off — so plain [`apply_update`] never relaxes a
-/// security gate.
-#[derive(Debug, Clone, Default)]
-pub struct ApplyOptions {
-    /// Authorize a one-time migration from a LEGACY (pre-C-08, no-MAC)
-    /// installed-version file to the MAC-authenticated form. Default `false`:
-    /// a keyed store that finds an unauthenticated record is REFUSED
-    /// ([`ApplyError::LegacyStateMigrationRequired`]) rather than adopted,
-    /// because a stripped MAC would otherwise re-open the anti-downgrade
-    /// window. Set `true` only for the deliberate operator-driven migration.
-    pub allow_legacy_state_migration: bool,
-    /// Operator-asserted anti-downgrade floor (unix seconds) for an AUTHORIZED
-    /// legacy migration. During such a migration the on-disk `release_unix` is
-    /// UNAUTHENTICATED (no MAC) and is therefore NOT trusted; the anti-downgrade
-    /// check uses THIS value instead (default `0` = accept the signature-,
-    /// freshness-, platform-verified manifest as the new baseline). Lets the
-    /// operator vouch for a minimum so a stripped/lowered state file cannot wave
-    /// through an older but still-validly-signed manifest. Ignored on the normal
-    /// (authenticated / fresh-install) path.
-    pub legacy_migration_floor: Option<u64>,
-}
 
 /// Apply a fetched + verified update. Steps in order:
 ///
@@ -296,34 +251,14 @@ pub struct ApplyOptions {
 /// `CARGO_PKG_VERSION` so the gate never compares against the wrong crate's
 /// version once the product is versioned independently of `veil-update`
 /// (C-07).
+
+
 pub fn apply_update(
     manifest: &VerifiedManifest,
     binary_bytes: &[u8],
     install_path: &Path,
     store: &InstalledVersionStore,
     current_version: &str,
-) -> Result<ApplyOutcome, ApplyError> {
-    apply_update_with_options(
-        manifest,
-        binary_bytes,
-        install_path,
-        store,
-        current_version,
-        &ApplyOptions::default(),
-    )
-}
-
-/// Like [`apply_update`] but takes explicit [`ApplyOptions`]. Plain
-/// `apply_update` is the safe-default wrapper (`ApplyOptions::default()`, so
-/// legacy no-MAC state migration is DISABLED). Use this variant only on the
-/// deliberate operator-authorized migration path.
-pub fn apply_update_with_options(
-    manifest: &VerifiedManifest,
-    binary_bytes: &[u8],
-    install_path: &Path,
-    store: &InstalledVersionStore,
-    current_version: &str,
-    opts: &ApplyOptions,
 ) -> Result<ApplyOutcome, ApplyError> {
     // Step 1: recompute SHA-256 (defence in depth).
     let mut hasher = Sha256::new();
@@ -339,34 +274,11 @@ pub fn apply_update_with_options(
     // Step 2: anti-downgrade. Read current installed release_unix;
     // missing state file → 0 (fresh install — any positive
     // release_unix is "newer").
-    let (installed_opt, migrated_legacy_state) = store.read_release_unix_for_apply()?;
-    // C-08 hardening: a keyed store that finds an UNAUTHENTICATED (no-MAC,
-    // legacy) record must not silently adopt it. A local writer who can reach
-    // the state file but not the HMAC key could strip the MAC, lower the
-    // recorded floor, and re-open the anti-downgrade window (then replay an
-    // older, still-validly-signed manifest). Refuse by default; a genuine
-    // one-time migration from a pre-C-08 install is an explicit opt-in
-    // (`ApplyOptions::allow_legacy_state_migration`).
-    if migrated_legacy_state && !opts.allow_legacy_state_migration {
-        return Err(ApplyError::LegacyStateMigrationRequired);
-    }
-    // Anti-downgrade floor. Normal (authenticated / fresh-install) apply uses the
-    // trusted recorded value. On an AUTHORIZED legacy migration the on-disk value
-    // is UNAUTHENTICATED (no MAC) and could have been stripped + lowered by a
-    // local writer, so we DO NOT use it — we use the operator-asserted floor
-    // (`legacy_migration_floor`, default 0). `store.write(manifest.release_unix)`
-    // below records the new floor MAC-authenticated, so normal anti-downgrade
-    // resumes on the very next apply.
-    // `previous` is informational only (recorded in the outcome). The
-    // anti-downgrade GATE uses `previous` on the normal path, but on an
-    // authorized legacy migration it uses the operator-asserted floor instead —
-    // the on-disk `previous` is unauthenticated and must not gate.
+    let installed_opt = store.read_release_unix_for_apply()?;
+    // Anti-downgrade floor: the recorded value, which under a keyed store is
+    // MAC-authenticated or the read above would have failed closed.
     let previous = installed_opt.unwrap_or(0);
-    let anti_downgrade_floor = if migrated_legacy_state {
-        opts.legacy_migration_floor.unwrap_or(0)
-    } else {
-        previous
-    };
+    let anti_downgrade_floor = previous;
     if manifest.release_unix <= anti_downgrade_floor {
         return Err(ApplyError::AntiDowngrade {
             manifest: manifest.release_unix,
@@ -493,7 +405,6 @@ pub fn apply_update_with_options(
         install_path: install_path.to_path_buf(),
         binary_marked_executable,
         previous_binary_relocated_to,
-        migrated_legacy_state,
     })
 }
 
@@ -587,7 +498,7 @@ fn with_tmp_suffix(path: &Path) -> PathBuf {
 
 // Executable staging (write + fsync + chmod-before-rename) moved to the
 // hardened `veil_util::write_executable_staged` (unpredictable name +
-// `O_EXCL`/`O_NOFOLLOW`) — see Step 3 of `apply_update_with_options`.
+// `O_EXCL`/`O_NOFOLLOW`) — see Step 3 of `apply_update`.
 
 // local `bytes_hex` removed — use `veil_util::bytes_to_hex`.
 
@@ -1183,72 +1094,6 @@ mod tests {
     }
 
     #[test]
-    fn c08_apply_migrates_legacy_unauthenticated_state() {
-        // A node that applied an update before C-08 has a legacy (no-mac)
-        // installed.json. The first KEYED apply, WHEN EXPLICITLY AUTHORIZED via
-        // `allow_legacy_state_migration`, must adopt it once (migration), flag
-        // `migrated_legacy_state`, and re-write it authenticated. (Without the
-        // opt-in the apply refuses — see
-        // `c08_apply_refuses_legacy_state_without_optin`.)
-        let dir = unique_dir("c08-migrate");
-        let install = dir.join("veil");
-        let state = dir.join("installed.json");
-
-        // Pre-C-08 state file: written by the unkeyed store.
-        InstalledVersionStore::new(state.clone())
-            .write(1_900_000_000)
-            .unwrap();
-        assert!(
-            !std::fs::read_to_string(&state).unwrap().contains("\"mac\""),
-            "precondition: legacy file has no mac"
-        );
-
-        let keyed = InstalledVersionStore::with_hmac_key(state.clone(), [0x5Au8; 32]);
-        let payload = b"new authenticated binary";
-        let manifest = fixture_manifest(2_000_000_000, sha256_of(payload));
-        let outcome = apply_update_with_options(
-            &manifest,
-            payload,
-            &install,
-            &keyed,
-            env!("CARGO_PKG_VERSION"),
-            &ApplyOptions {
-                allow_legacy_state_migration: true,
-                legacy_migration_floor: None,
-            },
-        )
-        .unwrap();
-
-        assert!(
-            outcome.migrated_legacy_state,
-            "first authorized keyed apply over a legacy file must flag the migration"
-        );
-        assert_eq!(outcome.previous_release_unix, 1_900_000_000);
-        assert_eq!(outcome.new_release_unix, 2_000_000_000);
-        assert!(
-            std::fs::read_to_string(&state).unwrap().contains("\"mac\""),
-            "post-migration file must carry a mac"
-        );
-
-        // A second keyed apply over the now-authenticated file is NOT a migration.
-        let payload2 = b"even newer binary";
-        let manifest2 = fixture_manifest(2_100_000_000, sha256_of(payload2));
-        let outcome2 = apply_update(
-            &manifest2,
-            payload2,
-            &install,
-            &keyed,
-            env!("CARGO_PKG_VERSION"),
-        )
-        .unwrap();
-        assert!(
-            !outcome2.migrated_legacy_state,
-            "steady-state apply over an authenticated file is not a migration"
-        );
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
     fn c08_apply_rejects_tampered_authenticated_state() {
         // Once authenticated, an attacker who edits release_unix in place (mac
         // present but invalid) must be fail-closed by the apply — never silently
@@ -1288,11 +1133,12 @@ mod tests {
     }
 
     #[test]
-    fn c08_apply_refuses_legacy_state_without_optin() {
-        // A keyed store that finds a legacy (no-mac) file must REFUSE by default
-        // — silently adopting it is the strip-MAC downgrade vector. Migration is
-        // an explicit opt-in (`allow_legacy_state_migration`), not automatic.
-        let dir = unique_dir("c08-refuse-legacy");
+    fn c08_apply_refuses_unauthenticated_state() {
+        // A keyed store that finds an unauthenticated (no-mac) file must
+        // REFUSE. Adopting it is the strip-MAC downgrade vector, and there is
+        // no migration opt-in any more: pre-authentication state files are not
+        // a thing this build has to meet.
+        let dir = unique_dir("c08-refuse-unauthenticated");
         let install = dir.join("veil");
         let state = dir.join("installed.json");
         InstalledVersionStore::new(state.clone())
@@ -1310,12 +1156,15 @@ mod tests {
         )
         .unwrap_err();
         assert!(
-            matches!(err, ApplyError::LegacyStateMigrationRequired),
-            "default apply over a legacy no-mac keyed file must fail closed, got {err:?}"
+            matches!(
+                err,
+                ApplyError::InstalledVersion(InstalledVersionError::MacFailure)
+            ),
+            "apply over a no-mac keyed file must fail closed, got {err:?}"
         );
         assert!(
             !install.exists(),
-            "no binary may be written on the legacy-refusal path"
+            "no binary may be written on the refusal path"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1323,9 +1172,9 @@ mod tests {
     #[test]
     fn c08_apply_rejects_stripped_mac_downgrade() {
         // Regression (audit): write an AUTHENTICATED record at a high floor,
-        // then an attacker STRIPS the mac and lowers release_unix to re-open the
-        // migration window. The default apply must reject this rather than
-        // adopting the lowered floor and accepting a replayed older manifest.
+        // then an attacker STRIPS the mac and lowers release_unix. The apply
+        // must reject this rather than adopting the lowered floor and accepting
+        // a replayed older manifest.
         let dir = unique_dir("c08-strip-mac");
         let install = dir.join("veil");
         let state = dir.join("installed.json");
@@ -1357,7 +1206,10 @@ mod tests {
         )
         .unwrap_err();
         assert!(
-            matches!(err, ApplyError::LegacyStateMigrationRequired),
+            matches!(
+                err,
+                ApplyError::InstalledVersion(InstalledVersionError::MacFailure)
+            ),
             "stripped-mac lowered floor must be rejected, got {err:?}"
         );
         assert!(
@@ -1367,41 +1219,4 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    #[test]
-    fn c08_migration_ignores_unauthenticated_file_floor() {
-        // M-1 (audit): during an AUTHORIZED legacy migration the unauthenticated
-        // file's own release_unix must NOT gate anti-downgrade. An attacker who
-        // stripped the MAC and lowered the floor to 0 must not wave through an
-        // older signed manifest — the operator-asserted floor is used instead.
-        let dir = unique_dir("c08-migrate-floor");
-        let install = dir.join("veil");
-        let state = dir.join("installed.json");
-        // Attacker leaves a no-mac file with a LOWERED floor (0).
-        InstalledVersionStore::new(state.clone()).write(0).unwrap();
-        let keyed = InstalledVersionStore::with_hmac_key(state.clone(), [0x5Au8; 32]);
-        let payload = b"older replayed binary";
-        let manifest = fixture_manifest(1_500_000_000, sha256_of(payload));
-        // Operator vouches the host legitimately reached >= 2_000_000_000.
-        let err = apply_update_with_options(
-            &manifest,
-            payload,
-            &install,
-            &keyed,
-            env!("CARGO_PKG_VERSION"),
-            &ApplyOptions {
-                allow_legacy_state_migration: true,
-                legacy_migration_floor: Some(2_000_000_000),
-            },
-        )
-        .unwrap_err();
-        assert!(
-            matches!(err, ApplyError::AntiDowngrade { .. }),
-            "older manifest must be rejected against the OPERATOR floor, not the file's 0; got {err:?}"
-        );
-        assert!(
-            !install.exists(),
-            "no binary written on the rejected migration"
-        );
-        let _ = std::fs::remove_dir_all(&dir);
-    }
 }
