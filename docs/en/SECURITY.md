@@ -38,7 +38,7 @@ few terms used in the table:
 | **DHT seed exhaustion** | HashSet-based O(1) dedup in iterative lookups | Implemented |
 | **DHT enumeration** | FIND_NODE V2 + FIND_VALUE return node-ids only (transports re-resolved per-hop via `ResolveTransport`); Public-only + half-cap filter on closest-node responses | Implemented (C-06) |
 | **Gateway Spoofing (session)** | `peer_roles` cache verified against handshake capabilities | Implemented |
-| **Mesh-beacon spoofing (on-link)** | Unsigned beacons dropped by default (`require_signed_beacons=true`); role flags not advertised unless `advertise_role_in_beacon` is set | Implemented (C-03) |
+| **Mesh-beacon spoofing (on-link)** | Unsigned beacons dropped unconditionally (C-03`); role flags not advertised unless `advertise_role_in_beacon` is set | Implemented (C-03) |
 | **Rate flood** | Per-peer token bucket → violation tracker (5 strikes / 5 min) → ban list | Implemented |
 | **Connection flood** | `MAX_SESSIONS_PER_IP=32`; optional PoW challenge at handshake | Implemented |
 | **Congestion** | Backpressure at >78% load; adaptive fan-out halved at >50% | Implemented |
