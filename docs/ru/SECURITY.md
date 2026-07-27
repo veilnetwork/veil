@@ -39,7 +39,7 @@
 | **DHT seed exhaustion** | HashSet-based O(1) dedup в iterative lookups | Реализовано |
 | **DHT enumeration** | FIND_NODE V2 + FIND_VALUE отдают только node_id (транспорты до-разрешаются per-hop через `ResolveTransport`); Public-only + half-cap фильтр на closest-node ответах | Реализовано (C-06) |
 | **Gateway spoofing (session)** | `peer_roles` кэш сверяется с handshake capabilities | Реализовано |
-| **Mesh-beacon spoofing (on-link)** | Неподписанные beacon'ы отбрасываются по умолчанию (`require_signed_beacons=true`); role-флаги не анонсируются, пока не задан `advertise_role_in_beacon` | Реализовано (C-03) |
+| **Mesh-beacon spoofing (on-link)** | Неподписанные beacon'ы отбрасываются безусловно (C-03); role-флаги не анонсируются, пока не задан `advertise_role_in_beacon` | Реализовано (C-03) |
 | **Rate flood** | Per-peer token bucket → violation tracker (5 strikes / 5 мин) → ban list | Реализовано |
 | **Connection flood** | `MAX_SESSIONS_PER_IP=32`; опциональный PoW challenge на handshake | Реализовано |
 | **Congestion** | Backpressure при >78% load; adaptive fan-out режется вдвое при >50% | Реализовано |

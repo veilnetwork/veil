@@ -339,9 +339,6 @@ impl NodeRuntime {
             crate::mesh_glue::RttBatterySink::new(Arc::clone(&self.routing.rtt_table)),
         );
         let beacon_dedup_window = std::time::Duration::from_secs(mesh_cfg.beacon_dedup_window_secs);
-        // SECURITY (audit 2026-05-29, A5): propagate the require-signed-beacons
-        // policy into the receiver (default false = legacy interop).
-        let require_signed_beacons = mesh_cfg.require_signed_beacons;
         let mut recv_shutdown = shutdown_tx.subscribe();
         let handle = tokio::spawn(async move {
             let mut receiver = {
@@ -352,8 +349,7 @@ impl NodeRuntime {
                     beacon_obfs,
                 )
                 .with_rtt_table(beacon_rtt_table)
-                .with_dedup_window(beacon_dedup_window)
-                .with_require_signed(require_signed_beacons);
+                .with_dedup_window(beacon_dedup_window);
                 if autodiscover_enabled {
                     r.with_autodiscovery(autodiscovered_recv)
                 } else {
