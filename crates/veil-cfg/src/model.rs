@@ -2374,28 +2374,6 @@ pub struct SessionConfig {
     #[serde(default = "SessionConfig::default_idle_timeout_secs")]
     pub idle_timeout_secs: u64,
 
-    /// **DEPRECATED** — superseded by [`transport.rotation`] which
-    /// supports a min/max range (the new default 1800-3600 s).  This
-    /// single-value knob is preserved for back-compat and used **only**
-    /// when `transport.rotation` is set to `-1`/`-1` (explicit disable
-    /// of the new section).  Operators upgrading from older configs
-    /// don't need to touch this field — leave `None` and use the
-    /// `[transport.rotation]` section instead.
-    ///
-    /// Legacy semantics: maximum session age in seconds before forced
-    /// graceful close (connection-rotation interval). `None` (default)
-    /// disables rotation — sessions live indefinitely subject only
-    /// to idle_timeout.
-    ///
-    /// **Why this exists:** see [`crate::TransportRotationConfig`] —
-    /// the rationale (censor-evasion via periodic TCP rotation) is
-    /// now centralised there.
-    ///
-    /// **Validation:** must be ≥ 60 (rotating faster than once-a-
-    /// minute is itself anomalous + would dominate connection cost).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub max_age_secs: Option<u64>,
-
     /// Maximum number of concurrent OVL1 sessions (per-node hard ceiling).
     /// Default 1000; override in node.toml as `[session] max_concurrent = N`
     /// (or `config set session.max_concurrent N`). A node at the ceiling
@@ -2654,15 +2632,14 @@ impl SessionConfig {
             && self.rekey_bytes_threshold == Self::default_rekey_bytes_threshold()
             && self.rekey_time_threshold_secs == Self::default_rekey_time_threshold_secs()
             && self.allowed_peer_algos.is_empty()
-            // NB: `max_per_subnet` and `max_age_secs` were previously omitted
+            // NB: `max_per_subnet` was previously omitted
             // here. Because `Config.session` is skipped on serialize when
             // `is_default()` is true, a config whose only non-default value
-            // was one of these (e.g. a tightened eclipse cap `max_per_subnet`
-            // or a `max_age_secs` rotation window) had the entire `[session]`
-            // block dropped on save and silently reverted to the default on
-            // reload. Both MUST be part of the equality check.
+            // was one of these (e.g. a tightened eclipse cap `max_per_subnet`)
+            // had the entire `[session]` block dropped on save and silently
+            // reverted to the default on reload. It MUST be part of the
+            // equality check.
             && self.max_per_subnet == Self::default_max_per_subnet()
-            && self.max_age_secs.is_none()
     }
 }
 
@@ -2671,7 +2648,6 @@ impl Default for SessionConfig {
         Self {
             keepalive_interval_secs: Self::default_keepalive_interval_secs(),
             idle_timeout_secs: Self::default_idle_timeout_secs(),
-            max_age_secs: None,
             max_concurrent: Self::default_max_concurrent(),
             referral_headroom: Self::default_referral_headroom(),
             max_per_ip: Self::default_max_per_ip(),
@@ -5078,7 +5054,6 @@ mod config_knobs_tests {
         let custom = SessionConfig {
             keepalive_interval_secs: 10,
             idle_timeout_secs: 45,
-            max_age_secs: None,
             max_concurrent: SessionConfig::default().max_concurrent,
             referral_headroom: SessionConfig::default().referral_headroom,
             max_per_ip: SessionConfig::default().max_per_ip,
@@ -5110,7 +5085,7 @@ mod config_knobs_tests {
     }
 
     /// Regression for the `is_default()` round-trip bug: it must account
-    /// for `max_per_subnet` and `max_age_secs`. Previously omitting them
+    /// for `max_per_subnet`. Previously omitting it
     /// meant a config whose only non-default value was one of these was
     /// judged "default", so the whole `[session]` block (including the
     /// eclipse-protection cap) was dropped on serialize and silently
@@ -5126,15 +5101,6 @@ mod config_knobs_tests {
         assert!(
             !only_subnet.is_default(),
             "tightened max_per_subnet must survive serialization, not be dropped as default"
-        );
-
-        let only_age = SessionConfig {
-            max_age_secs: Some(3600),
-            ..SessionConfig::default()
-        };
-        assert!(
-            !only_age.is_default(),
-            "a set max_age_secs must survive serialization, not be dropped as default"
         );
     }
 

@@ -972,7 +972,7 @@ async fn chaos_sim_compressed_time_rotation_fires() {
     use std::sync::Mutex;
     static LOCK: Mutex<()> = Mutex::new(());
     let _g = LOCK.lock().unwrap_or_else(|p| p.into_inner());
-    crate::node::session::runner::set_session_max_age_secs(60);
+    crate::node::session::runner::set_session_rotation_range(0, 60);
 
     let rotation = crate::node::session::rotation_deadline::SessionRotationDeadline::compute(
         tokio::time::Instant::now(),
@@ -998,7 +998,7 @@ async fn chaos_sim_compressed_time_rotation_fires() {
     );
 
     // Cleanup
-    crate::node::session::runner::set_session_max_age_secs(0);
+    crate::node::session::runner::set_session_rotation_range(0, 0);
 }
 
 // ── V2-C: hot-standby swap injection ────────────────────────────────────────

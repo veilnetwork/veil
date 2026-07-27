@@ -307,13 +307,6 @@ pub const VALIDATION_RULES: &[ValidationRule] = &[
     },
     // ── connection-rotation interval ────────────────────────────
     ValidationRule {
-        code: "session_max_age_too_short",
-        key: "session.max_age_secs",
-        message: "must be at least 60 seconds — rotating connections faster than once-a-minute is itself anomalous (real HTTPS sessions don't rotate that fast) AND would dominate connection cost",
-        check: session_max_age_too_short,
-        fix: None,
-    },
-    ValidationRule {
         code: "transport_rotation_min_too_short",
         key: "transport.rotation.min_lifetime_secs",
         message: "must be at least 60 seconds (or -1 to disable rotation) — rotating connections faster than once-a-minute is itself anomalous + dominates handshake cost",
@@ -848,10 +841,6 @@ fn mailbox_push_apns_partial_config(config: &Config) -> bool {
     // 0 = APNs intentionally absent (fine); 4 = fully configured (fine);
     // anything in between is a partial config that silently no-ops.
     count != 0 && count != 4
-}
-
-fn session_max_age_too_short(config: &Config) -> bool {
-    matches!(config.session.max_age_secs, Some(n) if n < 60)
 }
 
 fn transport_rotation_min_too_short(config: &Config) -> bool {

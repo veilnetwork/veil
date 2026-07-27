@@ -691,72 +691,9 @@ mod tests {
             );
         }
 
-        #[test]
-        fn epic488_1_session_max_age_below_60s_flagged() {
-            // Misconfig (or malicious config push) with too-short
-            // rotation interval would force connection-storm
-            // (~once-a-second handshakes) — itself anomalous and
-            // would dominate CPU/network cost. Floor matches
-            // the runtime clamp in MIN_SESSION_MAX_AGE_SECS.
-            let mut config = Config::default();
-            config.session.max_age_secs = Some(30);
-            let report = validate(&config);
-            assert!(
-                report
-                    .issues
-                    .iter()
-                    .any(|i| i.code == "session_max_age_too_short"),
-                "must flag sub-60s rotation interval: {:?}",
-                report.issues,
-            );
-        }
-
-        #[test]
-        fn epic488_1_session_max_age_60s_or_more_passes() {
-            let mut config = Config::default();
-            config.session.max_age_secs = Some(60);
-            let report = validate(&config);
-            assert!(
-                !report
-                    .issues
-                    .iter()
-                    .any(|i| i.code == "session_max_age_too_short"),
-                "exactly-60s must be accepted: {:?}",
-                report.issues,
-            );
-            config.session.max_age_secs = Some(1_800);
-            let report = validate(&config);
-            assert!(
-                !report
-                    .issues
-                    .iter()
-                    .any(|i| i.code == "session_max_age_too_short"),
-                "30 min must be accepted: {:?}",
-                report.issues,
-            );
-        }
-
-        #[test]
-        fn epic488_1_session_max_age_none_passes() {
-            // Default (rotation disabled) must NOT trigger the
-            // too-short rule — None is the intended "rotation
-            // off" sentinel, not a misconfig.
-            let config = Config::default();
-            assert!(config.session.max_age_secs.is_none());
-            let report = validate(&config);
-            assert!(
-                !report
-                    .issues
-                    .iter()
-                    .any(|i| i.code == "session_max_age_too_short"),
-                "None (default) must NOT trigger too-short: {:?}",
-                report.issues,
-            );
-        }
-
         // ── [transport.rotation] validation ────────────────────────
         //
-        // Mirrors the session.max_age_secs rules above, but for the
+        // Mirrors the connection-rotation floor rule, but for the
         // new range-based knobs (Q.7 audit batch — censor-evasion via
         // periodic TCP rotation).
 
@@ -830,7 +767,7 @@ mod tests {
 
         #[test]
         fn transport_rotation_below_60s_flagged() {
-            // Same rationale as session.max_age_secs — sub-minute
+            // Same rationale as the rotation floor — sub-minute
             // rotation is itself anomalous.
             let mut config = Config::default();
             config.transport.rotation.min_lifetime_secs = 30;

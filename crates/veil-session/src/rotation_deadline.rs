@@ -3,7 +3,7 @@
 //!
 //! Was inline in `SessionRunner::run`:
 //! * computed-once initialization with ±10 % jitter
-//! * `rotation_enabled` flag derived as `current_session_max_age_secs > 0`
+//! * `rotation_enabled` flag derived as `current_session_max_age_secs() > 0`
 //! * Timer-arm `if let Some(deadline) = session_rotate_at && now >= deadline { return; }`
 //!
 //! Background — connection-rotation: defeats long-lived
@@ -29,7 +29,7 @@ pub struct SessionRotationDeadline {
 
 impl SessionRotationDeadline {
     /// Compute a rotation deadline.  Reads the globals set by
-    /// `set_session_rotation_range` / `set_session_max_age_secs` in
+    /// `set_session_rotation_range` in
     /// runner.rs (managed by admin/config reload paths).  Returns a
     /// deadline of `None` if rotation is disabled (both bounds 0).
     ///
@@ -38,10 +38,10 @@ impl SessionRotationDeadline {
     ///   uniformly from `[min, max]` seconds.  Set by the new
     ///   `[transport.rotation]` config section — wider entropy hides
     ///   the rotation cadence from per-fleet correlation attacks.
-    /// * **Point + jitter mode** (only `max > 0`, `min == 0`): legacy
-    ///   `±10 %` jitter around `max`.  Backed by the deprecated
-    ///   `session.max_age_secs` knob — preserved for back-compat but
-    ///   the new range mode is strictly more flexible.
+    /// * **Point + jitter mode** (only `max > 0`, `min == 0`): `±10 %`
+    ///   jitter around `max`.  Reached by passing `min = 0` to
+    ///   [`crate::runner::set_session_rotation_range`]; the range mode is
+    ///   strictly more flexible and is what config produces.
     pub fn compute(now: Instant) -> Self {
         let (min_secs, max_secs) = crate::runner::current_session_rotation_range();
         if max_secs == 0 {
@@ -105,8 +105,8 @@ impl SessionRotationDeadline {
 mod tests {
     use super::*;
 
-    /// Lock used by the existing `set_session_max_age_secs_pct` tests
-    /// in runner.rs's tests module. Re-grabbing the same lock here
+    /// Lock used by the rotation tests in runner.rs's tests module.
+    /// Re-grabbing the same lock here
     /// keeps slice-7 unit tests serialised with those.
     fn rotation_lock() -> std::sync::MutexGuard<'static, ()> {
         use std::sync::OnceLock;
@@ -120,11 +120,7 @@ mod tests {
     impl Drop for RotationRestore {
         fn drop(&mut self) {
             // Clear both globals — `set_session_rotation_range(0, 0)`
-            // resets max AND min in one call, vs the legacy single-
-            // value setter which only touches max (and the runner-
-            // level `set_session_max_age_secs` further zeros min as
-            // a side-effect — see its doc).  Be explicit to keep the
-            // teardown reasoning robust if either setter changes.
+            // resets max AND min in one call.
             crate::runner::set_session_rotation_range(0, 0);
         }
     }
@@ -133,7 +129,7 @@ mod tests {
     async fn disabled_when_max_age_zero() {
         let _g = rotation_lock();
         let _r = RotationRestore;
-        crate::runner::set_session_max_age_secs(0);
+        crate::runner::set_session_rotation_range(0, 0);
         let r = SessionRotationDeadline::compute(Instant::now());
         assert!(!r.enabled());
         assert_eq!(r.deadline(), None);
@@ -147,7 +143,7 @@ mod tests {
     async fn enabled_with_positive_max_age() {
         let _g = rotation_lock();
         let _r = RotationRestore;
-        crate::runner::set_session_max_age_secs(1_800);
+        crate::runner::set_session_rotation_range(0, 1_800);
         let now = Instant::now();
         let r = SessionRotationDeadline::compute(now);
         assert!(r.enabled());
@@ -161,7 +157,7 @@ mod tests {
     async fn is_due_only_after_deadline() {
         let _g = rotation_lock();
         let _r = RotationRestore;
-        crate::runner::set_session_max_age_secs(60);
+        crate::runner::set_session_rotation_range(0, 60);
         let start = Instant::now();
         let r = SessionRotationDeadline::compute(start);
         // Should NOT be due immediately.
