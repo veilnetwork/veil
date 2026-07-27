@@ -72,14 +72,14 @@ pub enum InstalledVersionError {
 /// `mac` field — a BLAKE3 keyed-hash over the canonical body
 /// `{"release_unix": N}`. A local FS-write attacker can no longer
 /// silently rewrite `release_unix` to bypass anti-downgrade because
-/// the MAC won't verify. Legacy (no-key) stores still read the
-/// unauthenticated form for backwards compatibility.
+/// the MAC won't verify. An unkeyed store still reads the plain form,
+/// which is what the read-only inspect and check paths use.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct InstalledVersionRecord {
     /// release_unix of the manifest that produced the installed binary.
     pub release_unix: u64,
     /// BLAKE3 keyed-hash over `serde_json::to_vec(SignedBody { release_unix })`.
-    /// Hex-encoded. Absence = legacy / unauthenticated record.
+    /// Hex-encoded. Absent only for an unkeyed store's own writes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mac: Option<String>,
 }
@@ -103,9 +103,9 @@ pub struct InstalledVersionStore {
 }
 
 impl InstalledVersionStore {
-    /// Legacy unauthenticated store. Kept for tests and tools that
-    /// haven't been updated to thread an HMAC key. Production callers
-    /// should use [`Self::with_hmac_key`] instead.
+    /// Unauthenticated store, for read-only callers (inspect, the update
+    /// checker) and tests. Anything that gates anti-downgrade must use
+    /// [`Self::with_hmac_key`] instead.
     pub fn new(path: PathBuf) -> Self {
         Self {
             path,
@@ -184,54 +184,29 @@ impl InstalledVersionStore {
         Ok(self.read()?.map(|r| r.release_unix))
     }
 
-    /// Anti-downgrade read for the apply path, tolerant of a one-time
-    /// migration from a legacy (unauthenticated) state file.
+    /// Anti-downgrade read for the apply path.
     ///
-    /// Returns `(release_unix, was_legacy)`:
-    /// * unkeyed store, OR keyed store with a VALID mac → `(Some(v), false)`.
-    /// * keyed store, record carries NO mac (written before C-08 enabled
-    ///   authentication) → `(Some(v), true)`: the caller adopts the value once
-    ///   (trust-on-first-use) and the subsequent [`Self::write`] re-writes it
-    ///   authenticated, so later reads are `Ok` or `MacFailure`.
-    /// * keyed store, record carries a PRESENT-but-INVALID mac →
-    ///   `Err(MacFailure)`: tampering with an already-authenticated record is
-    ///   never silently accepted (fail-closed).
-    /// * no file → `(None, false)`.
-    ///
-    /// **SECURITY (C-08):** the legacy (no-mac) branch is trust-on-first-use.
-    /// An attacker who rewrites the still-unauthenticated file before the first
-    /// authenticated write can seed a lowered floor — no worse than the pre-C-08
-    /// fully-unauthenticated state, and only in that one migration window. After
-    /// the first authenticated write, any change to the recorded value is
-    /// detected. Because a no-mac file is always treated as legacy, a writer who
-    /// can also strip the mac can re-enter the migration window; the apply path
-    /// therefore surfaces the migration to the operator (see
-    /// `ApplyOutcome::migrated_legacy_state`) so a repeated no-mac downgrade is
-    /// visible rather than silent.
+    /// * unkeyed store → `Some(v)` (the value is simply not authenticated).
+    /// * keyed store with a VALID mac → `Some(v)`.
+    /// * keyed store, record carries NO mac, or a PRESENT-but-INVALID one →
+    ///   `Err(MacFailure)`. Both are fail-closed: an unauthenticated record
+    ///   under a keyed store means someone stripped the mac, and adopting it
+    ///   would re-open the anti-downgrade window.
+    /// * no file → `None` (fresh install).
     pub fn read_release_unix_for_apply(
         &self,
-    ) -> Result<(Option<u64>, bool), InstalledVersionError> {
+    ) -> Result<Option<u64>, InstalledVersionError> {
         match std::fs::read(&self.path) {
             Ok(bytes) => {
                 let rec: InstalledVersionRecord = serde_json::from_slice(&bytes)
                     .map_err(|e| InstalledVersionError::Malformed(e.to_string()))?;
                 match self.hmac_key {
-                    // Unauthenticated store: behaves exactly as before.
-                    None => Ok((Some(rec.release_unix), false)),
-                    Some(key) => {
-                        if rec.mac.is_none() {
-                            // Legacy record predating authentication → migrate.
-                            Ok((Some(rec.release_unix), true))
-                        } else if verify_record_mac(&rec, &key) {
-                            Ok((Some(rec.release_unix), false))
-                        } else {
-                            // mac present but wrong → active tampering.
-                            Err(InstalledVersionError::MacFailure)
-                        }
-                    }
+                    None => Ok(Some(rec.release_unix)),
+                    Some(key) if verify_record_mac(&rec, &key) => Ok(Some(rec.release_unix)),
+                    Some(_) => Err(InstalledVersionError::MacFailure),
                 }
             }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok((None, false)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(e) => Err(InstalledVersionError::Io(e)),
         }
     }
@@ -423,7 +398,7 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
-    /// HMAC-aware read of a legacy file (no `mac` field) must
+    /// HMAC-aware read of a file with no `mac` field must
     /// also be rejected — the apply path should fail-safe rather than
     /// dial-down the floor based on an unauthenticated input.
     #[test]
@@ -437,7 +412,7 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
-    /// legacy `new` constructor stays unauthenticated and
+    /// the unkeyed `new` constructor stays unauthenticated and
     /// reads/writes the no-mac form (backwards compat path).
     #[test]
     fn phase647_h15_legacy_constructor_writes_no_mac_field() {
@@ -447,63 +422,63 @@ mod tests {
         let raw = std::fs::read_to_string(&path).unwrap();
         assert!(
             !raw.contains("\"mac\""),
-            "legacy unauthenticated write must NOT emit a mac field: {raw}"
+            "an unkeyed write must NOT emit a mac field: {raw}"
         );
         let r = store.read().unwrap().unwrap();
         assert_eq!(r.release_unix, 1_700_000_000);
         let _ = std::fs::remove_file(&path);
     }
 
-    // ── C-08: read_release_unix_for_apply migration semantics ──────────────
+    // ── C-08: read_release_unix_for_apply semantics ────────────────────────
 
-    /// Unkeyed store behaves exactly as the plain read: value, never "legacy".
+    /// Unkeyed store behaves exactly as the plain read.
     #[test]
-    fn c08_apply_read_unkeyed_is_never_legacy() {
+    fn c08_apply_read_unkeyed_returns_the_value() {
         let path = unique_path("c08-unkeyed");
         let store = InstalledVersionStore::new(path.clone());
         store.write(1_700_000_000).unwrap();
         assert_eq!(
             store.read_release_unix_for_apply().unwrap(),
-            (Some(1_700_000_000), false)
+            Some(1_700_000_000)
         );
         let _ = std::fs::remove_file(&path);
     }
 
-    /// Keyed store reading its own authenticated record: value, not legacy.
+    /// Keyed store reading its own authenticated record.
     #[test]
-    fn c08_apply_read_keyed_valid_mac_is_not_legacy() {
+    fn c08_apply_read_keyed_valid_mac_returns_the_value() {
         let path = unique_path("c08-keyed-valid");
         let store = InstalledVersionStore::with_hmac_key(path.clone(), [0x5Au8; 32]);
         store.write(1_750_000_000).unwrap();
         assert_eq!(
             store.read_release_unix_for_apply().unwrap(),
-            (Some(1_750_000_000), false)
+            Some(1_750_000_000)
         );
         let _ = std::fs::remove_file(&path);
     }
 
-    /// Keyed store reading a LEGACY (no-mac) file written before C-08: accepted
-    /// once, flagged `was_legacy = true` so the caller migrates; the subsequent
-    /// authenticated write clears the flag.
+    /// Keyed store reading a record with NO mac: fail-closed. There is no
+    /// migration path any more, so a stripped mac cannot re-open the
+    /// anti-downgrade window even once.
     #[test]
-    fn c08_apply_read_keyed_legacy_no_mac_is_migration() {
-        let path = unique_path("c08-legacy-migrate");
-        // File as written by a pre-C-08 (unkeyed) apply.
+    fn c08_apply_read_keyed_no_mac_is_rejected() {
+        let path = unique_path("c08-no-mac-rejected");
         InstalledVersionStore::new(path.clone())
             .write(1_700_000_000)
             .unwrap();
         let keyed = InstalledVersionStore::with_hmac_key(path.clone(), [0x5Au8; 32]);
-        assert_eq!(
-            keyed.read_release_unix_for_apply().unwrap(),
-            (Some(1_700_000_000), true),
-            "legacy no-mac file must be accepted once as a migration"
+        assert!(
+            matches!(
+                keyed.read_release_unix_for_apply(),
+                Err(InstalledVersionError::MacFailure)
+            ),
+            "an unauthenticated record under a keyed store must fail closed"
         );
-        // After the apply re-writes it, the next read is authenticated, not legacy.
+        // A properly authenticated write is readable again.
         keyed.write(1_800_000_000).unwrap();
         assert_eq!(
             keyed.read_release_unix_for_apply().unwrap(),
-            (Some(1_800_000_000), false),
-            "re-written record is authenticated, no longer a migration"
+            Some(1_800_000_000)
         );
         let _ = std::fs::remove_file(&path);
     }
@@ -524,16 +499,16 @@ mod tests {
                 store.read_release_unix_for_apply(),
                 Err(InstalledVersionError::MacFailure)
             ),
-            "a present-but-invalid mac must fail closed, not migrate"
+            "a present-but-invalid mac must fail closed"
         );
         let _ = std::fs::remove_file(&path);
     }
 
-    /// No state file → fresh install: (None, not-legacy).
+    /// No state file → fresh install.
     #[test]
     fn c08_apply_read_missing_file_is_fresh() {
         let path = unique_path("c08-missing");
         let store = InstalledVersionStore::with_hmac_key(path, [0u8; 32]);
-        assert_eq!(store.read_release_unix_for_apply().unwrap(), (None, false));
+        assert_eq!(store.read_release_unix_for_apply().unwrap(), None);
     }
 }

@@ -175,11 +175,11 @@ impl UpdateChecker {
             // M16: authenticate the read like the apply path. A present-but-wrong
             // mac surfaces as `MacFailure` (→ CheckerError) rather than a forged
             // release_unix, so local tampering can't fabricate a downgrade
-            // notification. A legacy (no-mac) file is adopted trust-on-first-use,
-            // identical to the apply path's migration behaviour.
+            // notification. A record with NO mac fails closed the same way the
+            // apply path does.
             Some(key) => {
                 let store = InstalledVersionStore::with_hmac_key(path.clone(), key);
-                let (v, _migrated) = store.read_release_unix_for_apply()?;
+                let v = store.read_release_unix_for_apply()?;
                 Ok(v.unwrap_or(0))
             }
             None => {

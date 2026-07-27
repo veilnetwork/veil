@@ -18,7 +18,7 @@
 use tokio::runtime::Builder;
 
 use veil_cfg;
-use veil_update::apply::{ApplyError, ApplyOptions, apply_update_with_options};
+use veil_update::apply::{ApplyError, apply_update};
 use veil_update::checker::{CheckerError, UpdateChecker};
 use veil_update::fetch::{FetchError, UpdateAvailability, fetch_binary_via_https};
 use veil_update::installed_version::InstalledVersionStore;
@@ -36,12 +36,10 @@ pub fn handle_update_command<I: CommandIo, O: ConfigOps>(
     match args.command {
         UpdateCommand::Check => update_check(&mut context),
         UpdateCommand::Apply {
-            allow_legacy_state_migration,
-            migrate_min_release_unix,
+            allow_unauthenticated_state,
         } => update_apply(
             &mut context,
-            allow_legacy_state_migration,
-            migrate_min_release_unix,
+            allow_unauthenticated_state,
         ),
         UpdateCommand::SignManifest(args) => update_sign_manifest(&mut context, args),
     }
@@ -291,8 +289,7 @@ fn installed_version_mac_key() -> Option<[u8; 32]> {
 
 fn update_apply<I: CommandIo, O: ConfigOps>(
     context: &mut CommandContext<'_, I, O>,
-    allow_legacy_state_migration: bool,
-    migrate_min_release_unix: Option<u64>,
+    allow_unauthenticated_state: bool,
 ) -> veil_cfg::Result<()> {
     let (_, config) = context.config().load_existing()?;
 
@@ -339,11 +336,9 @@ fn update_apply<I: CommandIo, O: ConfigOps>(
             // Fail-closed: without an Ed25519 identity the anti-downgrade
             // state file cannot be MAC-authenticated, so a local attacker
             // who can rewrite it could lower the floor and replay an older
-            // (legitimately-signed) release. Refuse to run an
-            // unauthenticated store unless the operator explicitly opts in
-            // via --allow-legacy-state-migration (the same flag that already
-            // gates accepting a pre-C-08 no-MAC file).
-            if !allow_legacy_state_migration {
+            // (legitimately-signed) release. A host that genuinely has no
+            // identity yet can still update, but has to say so.
+            if !allow_unauthenticated_state {
                 return Err(veil_cfg::ConfigError::CommandFailed(
                     "refusing to apply an update with an UNAUTHENTICATED \
                      anti-downgrade state file: no Ed25519 identity was found \
@@ -352,13 +347,13 @@ fn update_apply<I: CommandIo, O: ConfigOps>(
                      could lower the anti-downgrade floor to replay an older \
                      signed release. Run `veil-cli identity create` (or restore \
                      one) to enable authentication, OR pass \
-                     --allow-legacy-state-migration to explicitly accept an \
+                     --allow-unauthenticated-state to explicitly accept an \
                      unauthenticated state file."
                         .to_owned(),
                 ));
             }
             context.io.emit(OutputEvent::message(
-                "warning: --allow-legacy-state-migration set: the anti-downgrade \
+                "warning: --allow-unauthenticated-state set: the anti-downgrade \
                  state file will NOT be MAC-authenticated (no Ed25519 identity \
                  found), so a local attacker able to rewrite it could lower the \
                  anti-downgrade floor. Run `veil-cli identity create` to enable \
@@ -418,30 +413,14 @@ fn update_apply<I: CommandIo, O: ConfigOps>(
     // its CARGO_PKG_VERSION is the authoritative installed version) for the
     // manifest's min_compatible_version gate — not the veil-update library
     // crate's own version.
-    let outcome = apply_update_with_options(
+    let outcome = apply_update(
         &manifest,
         &binary_bytes,
         &install_path,
         &store,
         env!("CARGO_PKG_VERSION"),
-        &ApplyOptions {
-            allow_legacy_state_migration,
-            legacy_migration_floor: migrate_min_release_unix,
-        },
     )
     .map_err(map_apply_err)?;
-
-    if outcome.migrated_legacy_state {
-        // C-08 trust-on-first-use migration: surfaced so a repeated no-mac
-        // downgrade attempt (an attacker stripping the MAC to re-enter this
-        // path) is visible to the operator rather than silent.
-        context.io.emit(OutputEvent::message(
-            "note: migrated a legacy unauthenticated installed-version file to \
-             the MAC-authenticated form; subsequent tampering with the recorded \
-             release_unix will be detected."
-                .to_owned(),
-        ));
-    }
 
     let prev_date = format_unix_date(outcome.previous_release_unix);
     let new_date = format_unix_date(outcome.new_release_unix);
@@ -593,8 +572,7 @@ mod tests {
         let context = ctx_with_config(cfg);
         let args = UpdateArgs {
             command: UpdateCommand::Apply {
-                allow_legacy_state_migration: false,
-                migrate_min_release_unix: None,
+                allow_unauthenticated_state: false,
             },
         };
         let err = handle_update_command(context, args).unwrap_err();
@@ -621,8 +599,7 @@ mod tests {
         let context = ctx_with_config(Config::default());
         let args = UpdateArgs {
             command: UpdateCommand::Apply {
-                allow_legacy_state_migration: false,
-                migrate_min_release_unix: None,
+                allow_unauthenticated_state: false,
             },
         };
         let err = handle_update_command(context, args).unwrap_err();
