@@ -272,16 +272,15 @@ pub(crate) fn apply_profile_defaults(
             // 100+ peers via PEX) could grow session count past
             // what budget hardware can sustain → OOM-kill.
             loaded.session.max_concurrent = 64;
-            // rotate sessions every 30 min to defeat
-            // long-lived-connection DPI fingerprint. Normal HTTPS
-            // browser sessions live for seconds-to-minutes; an
-            // veil session lasting hours stands out. At 30
-            // min cadence rotation cost = 48 fresh handshakes/day
-            // per active session — small overhead vs censor-evasion
-            // win. Desktop / relay nodes (where long-lived
-            // connections aren't censored) can leave None via
-            // explicit `[session].max_age_secs = 0` override.
-            loaded.session.max_age_secs = Some(1_800);
+            // Connection rotation is NOT set here: `[transport.rotation]`
+            // already defaults to 30-60 min, which is the cadence mobile
+            // wants to defeat the long-lived-connection DPI fingerprint —
+            // a normal HTTPS session lives seconds to minutes, an veil
+            // session lasting hours stands out. The range form is strictly
+            // better than the single value this profile used to set,
+            // because the per-session jitter also defeats fleet
+            // correlation. A node that does not want rotation disables it
+            // with `-1` on both `[transport.rotation]` bounds.
             // b: per-peer byte-rate cap. Composes
             // orthogonally with node-aggregate `capacity.max_inbound_
             // bandwidth_kbps` — node-aggregate prevents
@@ -1536,17 +1535,15 @@ mod tests {
             "mobile must not touch [[bootstrap_peers]]"
         );
 
-        // Session: only `max_concurrent` and
-        // `max_age_secs` may differ. Every OTHER
+        // Session: only `max_concurrent` may differ. Every OTHER
         // [session] knob must match baseline — keepalive, idle
         // timeout, queue depths, rekey thresholds etc.
         let mut session_baseline_with_mobile_tweaks = baseline.session.clone();
         session_baseline_with_mobile_tweaks.max_concurrent = 64;
-        session_baseline_with_mobile_tweaks.max_age_secs = Some(1_800);
         assert_eq!(
             config.session, session_baseline_with_mobile_tweaks,
-            "mobile profile may ONLY tweak session.max_concurrent and \
-             session.max_age_secs; every other [session] knob must match baseline"
+            "mobile profile may ONLY tweak session.max_concurrent; every \
+             other [session] knob must match baseline"
         );
 
         // Capacity: only the two bandwidth caps may differ
@@ -1599,18 +1596,25 @@ mod tests {
         );
     }
 
-    /// mobile profile sets connection-rotation interval
-    /// to defeat long-lived-connection DPI fingerprint. Lock in
-    /// the 30-min cadence so a future edit doesn't silently drift
-    /// and lose the censorship-resistance property.
+    /// A mobile node must rotate connections to defeat the
+    /// long-lived-connection DPI fingerprint. The profile no longer sets a
+    /// single-value interval of its own — the property now comes from the
+    /// `[transport.rotation]` defaults — so this pins the resolved range
+    /// instead, and still fails if a future edit lets rotation drift off or
+    /// past the 30-minute cadence.
     #[test]
     fn epic488_1_mobile_profile_sets_session_rotation_interval() {
         let mut config = veil_cfg::Config::default();
         super::apply_profile_defaults(&mut config, crate::cmd::cli::ConfigProfile::Mobile);
+        let (min, max) = config
+            .transport
+            .rotation
+            .resolved_range()
+            .expect("mobile must not disable connection rotation");
         assert_eq!(
-            config.session.max_age_secs,
-            Some(1_800),
-            "mobile profile must rotate sessions every 30 min for DPI evasion"
+            (min, max),
+            (1_800, 3_600),
+            "mobile must rotate every 30-60 min for DPI evasion"
         );
     }
 

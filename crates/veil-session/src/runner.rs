@@ -2482,7 +2482,7 @@ static MOBILE_BACKGROUND_KEEPALIVE_MULTIPLIER: AtomicU32 = AtomicU32::new(1);
 /// connection-rotation **maximum** lifetime (seconds). `0` means
 /// rotation disabled (sessions live indefinitely subject only to
 /// idle_timeout). Set from `cfg.transport.rotation.max_lifetime_secs`
-/// (or legacy `cfg.session.max_age_secs`) at runtime startup + reload.
+/// at runtime startup + reload.
 /// Same global-static pattern as the mobile background-mode signals
 /// above — avoids threading a new field through 22+ SessionRunner
 /// construction sites.
@@ -2663,31 +2663,6 @@ pub fn current_outbound_batch_window(battery_pct: u8) -> Option<std::time::Durat
     Some(std::time::Duration::from_millis(ms as u64))
 }
 
-/// set the session-rotation **point** interval (seconds). `0`
-/// disables rotation. Values 1..60 are clamped UP to
-/// `MIN_SESSION_MAX_AGE_SECS` (the validation rule mirror — defends
-/// against bypass). Called from runtime startup + reload with
-/// the value from `cfg.session.max_age_secs`.
-///
-/// **Range-aware variant:** [`set_session_rotation_range`] — pass a
-/// `(min, max)` pair (sampled uniformly per session).  This single-
-/// value form is preserved for back-compat with the deprecated
-/// `cfg.session.max_age_secs`; internally it sets `min = 0` so the
-/// rotation-deadline computer falls to its legacy `±10 %` jitter path.
-pub fn set_session_max_age_secs(secs: u64) {
-    let stored = if secs == 0 {
-        0
-    } else {
-        secs.max(MIN_SESSION_MAX_AGE_SECS)
-    };
-    SESSION_MAX_AGE_SECS.store(stored, Ordering::Relaxed);
-    // Single-value mode: clear the min so SessionRotationDeadline
-    // takes the legacy ±10 % jitter codepath.  Callers using the
-    // range form must call `set_session_rotation_range` (which
-    // overrides both atomics atomically-enough — we accept a brief
-    // observable transient since this is a config-reload-time call).
-    SESSION_MIN_AGE_SECS.store(0, Ordering::Relaxed);
-}
 
 /// Set the session-rotation **range** (seconds).  Each new session
 /// draws a deadline uniformly from `[min, max]`.  Passing `(0, 0)`

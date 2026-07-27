@@ -5278,7 +5278,7 @@ fn epic488_1_lock() -> std::sync::MutexGuard<'static, ()> {
 struct Epic488Restore;
 impl Drop for Epic488Restore {
     fn drop(&mut self) {
-        runner::set_session_max_age_secs(0);
+        runner::set_session_rotation_range(0, 0);
     }
 }
 
@@ -5286,7 +5286,7 @@ impl Drop for Epic488Restore {
 fn epic488_1_zero_disables_rotation() {
     let _g = epic488_1_lock();
     let _r = Epic488Restore;
-    runner::set_session_max_age_secs(0);
+    runner::set_session_rotation_range(0, 0);
     assert_eq!(
         runner::current_session_max_age_secs(),
         0,
@@ -5298,7 +5298,7 @@ fn epic488_1_zero_disables_rotation() {
 fn epic488_1_normal_value_passes_through() {
     let _g = epic488_1_lock();
     let _r = Epic488Restore;
-    runner::set_session_max_age_secs(1_800);
+    runner::set_session_rotation_range(0, 1_800);
     assert_eq!(runner::current_session_max_age_secs(), 1_800);
 }
 
@@ -5309,7 +5309,7 @@ fn epic488_1_below_floor_clamps_up_to_minimum() {
     // reconnect storm.
     let _g = epic488_1_lock();
     let _r = Epic488Restore;
-    runner::set_session_max_age_secs(30);
+    runner::set_session_rotation_range(0, 30);
     assert_eq!(
         runner::current_session_max_age_secs(),
         runner::MIN_SESSION_MAX_AGE_SECS,
@@ -5325,7 +5325,7 @@ fn epic488_1_zero_is_distinct_from_clamped_minimum() {
     // load by default.
     let _g = epic488_1_lock();
     let _r = Epic488Restore;
-    runner::set_session_max_age_secs(0);
+    runner::set_session_rotation_range(0, 0);
     assert_eq!(
         runner::current_session_max_age_secs(),
         0,
@@ -5396,13 +5396,13 @@ fn q7_range_mode_min_above_max_clamps_min_down() {
 
 #[test]
 fn q7_legacy_setter_clears_min_so_falls_to_point_mode() {
-    // `set_session_max_age_secs` (legacy single-value setter) must
+    // the single-value form `set_session_rotation_range(0, max)` must
     // zero the min so SessionRotationDeadline takes the legacy
     // ±10 % jitter codepath.
     let _g = epic488_1_lock();
     let _r = Epic488Restore;
     runner::set_session_rotation_range(1_800, 3_600);
-    runner::set_session_max_age_secs(1_200);
+    runner::set_session_rotation_range(0, 1_200);
     let (min, max) = runner::current_session_rotation_range();
     assert_eq!(min, 0, "legacy setter must clear min");
     assert_eq!(max, 1_200);
