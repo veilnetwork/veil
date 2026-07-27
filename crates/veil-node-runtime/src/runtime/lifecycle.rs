@@ -483,36 +483,10 @@ impl NodeRuntime {
         // applied gradually as old sessions rotate naturally —
         // not a sync-storm from admin reload.
         //
-        // Precedence (Q.7 audit batch — censor-evasion):
-        //   1. `[transport.rotation]` range knob (new) — preferred.
-        //   2. `session.max_age_secs` (deprecated single-value) —
-        //      back-compat fallback only when rotation is disabled
-        //      at the new section AND set at the legacy field.
-        if let Some((min, max)) = config.transport.rotation.resolved_range() {
-            veil_session::runner::set_session_rotation_range(min, max);
-            // Quiet the deprecation noise if the operator is using the
-            // modern knob — but if they ALSO set the legacy field, warn
-            // that we're ignoring it (so they don't think it's active).
-            if config.session.max_age_secs.is_some() {
-                self.logger.warn(
-                    "config.session.max_age_secs.shadowed",
-                    "session.max_age_secs is set but [transport.rotation] takes precedence — \
-                     remove session.max_age_secs from the config to silence this warning",
-                );
-            }
-        } else if let Some(secs) = config.session.max_age_secs {
-            self.logger.warn(
-                "config.session.max_age_secs.deprecated",
-                format!(
-                    "session.max_age_secs={secs} is DEPRECATED — migrate to the \
-                     [transport.rotation] section (min_lifetime_secs + max_lifetime_secs, \
-                     -1 on both to disable) for range-based jitter that defeats \
-                     fleet-correlation DPI fingerprinting"
-                ),
-            );
-            veil_session::runner::set_session_max_age_secs(secs);
-        } else {
-            veil_session::runner::set_session_rotation_range(0, 0);
+        // `[transport.rotation]` is the only knob; `-1`/`-1` disables.
+        match config.transport.rotation.resolved_range() {
+            Some((min, max)) => veil_session::runner::set_session_rotation_range(min, max),
+            None => veil_session::runner::set_session_rotation_range(0, 0),
         }
         self.metrics = veil_cfg::observability_glue::metrics_from_config(&config)
             .map(|(metrics, _)| Arc::new(metrics));

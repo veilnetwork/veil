@@ -190,7 +190,7 @@ max_lifetime_secs = 1200   # 20 min
 
 **Interaction with #29-31:** rotation cuts the long-flow signal; padding (Option B / Epic 488) cuts the throughput-shape signal.  Both work independently and compose.
 
-**Status:** ✅ code-side, default-on.  Operators using the **deprecated** `session.max_age_secs` (single point-value, ±10 % jitter) get a runtime WARN log on daemon start nudging migration to the range knob — both work, but the legacy field doesn't have the fleet-correlation entropy.
+**Status:** ✅ code-side, default-on.  `[transport.rotation]` is the only knob; the old `session.max_age_secs` point-value has been removed, so every node gets the range-based jitter that defeats fleet correlation.
 
 ## Auto-update channel hardening
 

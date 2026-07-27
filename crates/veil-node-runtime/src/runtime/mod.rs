@@ -2534,33 +2534,10 @@ impl NodeRuntime {
         // < 60 gets pushed up to the floor, defending against
         // misconfig OR validation bypass.
         //
-        // Precedence (mirrors the reload path in lifecycle.rs):
-        //   1. `[transport.rotation]` range knob (new) — preferred.
-        //   2. `session.max_age_secs` (deprecated single-value) —
-        //      back-compat fallback only when the new section is
-        //      disabled (`-1`/`-1`) AND legacy field is set.
-        if let Some((min, max)) = config.transport.rotation.resolved_range() {
-            veil_session::runner::set_session_rotation_range(min, max);
-            if config.session.max_age_secs.is_some() {
-                runtime.logger.warn(
-                    "config.session.max_age_secs.shadowed",
-                    "session.max_age_secs is set but [transport.rotation] takes precedence — \
-                     remove session.max_age_secs from the config to silence this warning",
-                );
-            }
-        } else if let Some(secs) = config.session.max_age_secs {
-            runtime.logger.warn(
-                "config.session.max_age_secs.deprecated",
-                format!(
-                    "session.max_age_secs={secs} is DEPRECATED — migrate to the \
-                     [transport.rotation] section (min_lifetime_secs + max_lifetime_secs, \
-                     -1 on both for disable) for range-based jitter that defeats \
-                     fleet-correlation DPI fingerprinting"
-                ),
-            );
-            veil_session::runner::set_session_max_age_secs(secs);
-        } else {
-            veil_session::runner::set_session_rotation_range(0, 0);
+        // `[transport.rotation]` is the only knob; `-1`/`-1` disables.
+        match config.transport.rotation.resolved_range() {
+            Some((min, max)) => veil_session::runner::set_session_rotation_range(min, max),
+            None => veil_session::runner::set_session_rotation_range(0, 0),
         }
         // cleanup: hot_standby_controller + per-peer
         // alt_uri now built before the runtime literal (see. above).
