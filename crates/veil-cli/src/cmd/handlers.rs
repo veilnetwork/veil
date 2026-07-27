@@ -203,12 +203,12 @@ pub(crate) fn apply_profile_defaults(
                 autodiscover_max_concurrent: 3,
                 beacon_dedup_window_secs: 3,
                 autodiscover_persist_path: None,
-                // Secure posture (C-03): reject unsigned beacons, and -- since
-                // this profile explicitly sets up beacon-based gateway
-                // discovery -- opt into advertising the gateway role (the
+                // Since this profile explicitly sets up beacon-based gateway
+                // discovery, opt into advertising the gateway role (the
                 // global default keeps role_flags off so non-gateway nodes
                 // don't reveal their role to a passive on-link observer).
-                require_signed_beacons: true,
+                // Unsigned beacons are rejected unconditionally now, so there
+                // is nothing to set for C-03 here.
                 advertise_role_in_beacon: true,
             });
         }
@@ -249,12 +249,12 @@ pub(crate) fn apply_profile_defaults(
                 autodiscover_max_concurrent: 3,
                 beacon_dedup_window_secs: 3,
                 autodiscover_persist_path: None,
-                // Secure posture (C-03): reject unsigned beacons, and -- since
-                // this profile explicitly sets up beacon-based gateway
-                // discovery -- opt into advertising the gateway role (the
+                // Since this profile explicitly sets up beacon-based gateway
+                // discovery, opt into advertising the gateway role (the
                 // global default keeps role_flags off so non-gateway nodes
                 // don't reveal their role to a passive on-link observer).
-                require_signed_beacons: true,
+                // Unsigned beacons are rejected unconditionally now, so there
+                // is nothing to set for C-03 here.
                 advertise_role_in_beacon: true,
             });
             // Persist handshake-confirmed peers across restarts

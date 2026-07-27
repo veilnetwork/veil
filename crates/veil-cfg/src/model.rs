@@ -425,22 +425,6 @@ pub struct MeshConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub autodiscover_persist_path: Option<String>,
 
-    /// **SECURITY (audit 2026-05-29, A5)** — when `true`, the beacon
-    /// receiver DROPS unsigned beacons instead of accepting them as
-    /// "legacy".  An unsigned beacon lets an on-link attacker register
-    /// or redirect neighbor links and inject `IS_GATEWAY` entries without any
-    /// key.  Recommended `true` for any non-loopback / hostile-LAN realm.
-    ///
-    /// **Default `true` (C-03):** unsigned beacons are rejected, closing the
-    /// on-link injection vector by default. Set `false` only for legacy interop
-    /// with deployments still emitting unsigned beacons (flipping signed-on
-    /// across a live unsigned network partitions those nodes — roll signed
-    /// beacons out fleet-wide first).
-    #[serde(
-        default = "MeshConfig::default_require_signed_beacons",
-        skip_serializing_if = "MeshConfig::is_default_require_signed_beacons"
-    )]
-    pub require_signed_beacons: bool,
 
     /// **SECURITY (C-03)** — when `true`, the node advertises its role
     /// (`IS_GATEWAY` / `IS_RELAY` / `HAS_INTERNET`) in its mesh beacon so
@@ -460,13 +444,6 @@ pub struct MeshConfig {
 impl MeshConfig {
     fn default_autodiscover_gateway() -> bool {
         true
-    }
-    fn default_require_signed_beacons() -> bool {
-        true
-    }
-    #[allow(clippy::trivially_copy_pass_by_ref)]
-    fn is_default_require_signed_beacons(v: &bool) -> bool {
-        *v
     }
     fn default_advertise_role_in_beacon() -> bool {
         false
@@ -5184,15 +5161,13 @@ mod config_knobs_tests {
         );
     }
 
-    /// C-03: mesh beacon is secure-by-default — unsigned beacons are rejected,
-    /// and the node's role is NOT advertised (no cleartext gateway/relay
-    /// targeting signal broadcast to a passive on-link observer by default).
+    /// C-03: the node's role is NOT advertised in the beacon (no cleartext
+    /// gateway/relay targeting signal broadcast to a passive on-link
+    /// observer). Rejecting unsigned beacons is no longer a default but an
+    /// invariant — the config cannot ask for anything else, so the assertion
+    /// for it lives with the receiver.
     #[test]
     fn mesh_config_c03_secure_defaults() {
-        assert!(
-            MeshConfig::default_require_signed_beacons(),
-            "C-03: unsigned beacons must be rejected by default"
-        );
         assert!(
             !MeshConfig::default_advertise_role_in_beacon(),
             "C-03: node role must not be advertised in the beacon by default"

@@ -19,7 +19,7 @@
 //!
 //! Mitigations: mesh is opt-in (a default node never beacons), role
 //! advertisement is opt-in and **off by default** (C-03), and the receiver
-//! rejects unsigned beacons by default (`require_signed_beacons`, C-03).
+//! rejects unsigned beacons (C-03); the config cannot ask for anything else.
 //!
 //! **Closing the node_id exposure (C-03, option A):** when a realm shares a
 //! secret via `[mesh] realm_psk`, [`BeaconSender::send_once`] AEAD-seals each
@@ -679,11 +679,9 @@ pub struct BeaconReceiver {
     /// carry no signature instead of accepting them as "legacy".  An
     /// unsigned beacon lets an on-link attacker register/redirect
     /// neighbor links and inject IS_GATEWAY entries.  Default `true`
-    /// (rejects unsigned beacons) — pass `with_require_signed(false)` (or
-    /// `[mesh] require_signed_beacons = false`) ONLY for legacy interop with
-    /// deployments still emitting unsigned beacons (roll signed beacons out
-    /// fleet-wide first; flipping on across a live unsigned network partitions
-    /// those nodes).
+    /// Always `true` in production: the config knob that used to relax this
+    /// for interop with unsigned-beacon deployments is gone. `with_require_signed`
+    /// survives for tests that exercise registration without minting a key.
     require_signed: bool,
     /// Per-source deduplication window.
     ///
@@ -718,11 +716,8 @@ impl BeaconReceiver {
             dedup_seen: std::collections::HashMap::new(),
             dedup_window: std::time::Duration::from_secs(3), // default 3 s
             beacon_count: 0,
-            // Safe-by-default (audit hardening): reject unsigned beacons unless
-            // a caller explicitly opts into legacy interop via
-            // `with_require_signed(false)`. The production wiring
-            // (`mesh_gateway`) already passes `[mesh] require_signed_beacons`,
-            // which itself defaults `true`.
+            // Reject unsigned beacons. Production has no way to turn this
+            // off any more; `with_require_signed(false)` is a test affordance.
             require_signed: true,
         }
     }
@@ -730,8 +725,8 @@ impl BeaconReceiver {
     /// SECURITY (audit 2026-05-29, A5): require every accepted beacon to
     /// carry a valid signature.  When enabled, unsigned beacons are
     /// dropped (logged at `warn`) rather than accepted as "legacy".
-    /// Recommended on for non-loopback realms; ON by default — pass
-    /// `false` only for back-compat with existing unsigned-beacon deployments.
+    /// ON by default and not configurable in production — `false` is for
+    /// tests that register a neighbour without minting a signing key.
     #[must_use]
     pub fn with_require_signed(mut self, require: bool) -> Self {
         self.require_signed = require;
@@ -806,7 +801,7 @@ impl BeaconReceiver {
             // neighbor links or inject IS_GATEWAY entries without a key.
             log::warn!(
                 "mesh.beacon: unsigned beacon from {sender_addr} dropped \
-                 (require_signed_beacons=true)"
+                 (unsigned beacons are never accepted)"
             );
             return false;
         } else {
