@@ -443,19 +443,7 @@ fn decode_pem(pem: &str) -> Option<Vec<u8>> {
 
 // ── Encrypted PEM ───────────────────────────────────────────────
 //
-// Two wire formats coexist:
-//
-// **v1 (legacy, 92 bytes blob)** — fixed BLAKE3-derived salt, Argon2id
-// `m_cost=256 KiB, t=3, p=1`. Same passphrase across nodes → same
-// derived key → rainbow-table risk and cross-node compromise scope. Kept
-// for read-back compat only; **never written** by post-audit builds.
-//
-// ```text
-// [0..12]  nonce
-// [12..92] ciphertext+tag (DK seed 64 + Poly1305 tag 16)
-// ```
-//
-// **v2 (current, 121 bytes blob)** — random 16-byte salt per file +
+// **v2 (the only format, 121 bytes blob)** — random 16-byte salt per file +
 // in-band Argon2id params (so future tuning doesn't break old files).
 // Defaults: `m=32 MiB, t=3, p=1` — ~50-100 ms on typical hardware,
 // rainbow-table-resistant, per-file unique derivation.
@@ -470,13 +458,12 @@ fn decode_pem(pem: &str) -> Option<Vec<u8>> {
 // [41..121] ciphertext+tag (80 bytes)
 // ```
 //
-// Loader detection uses both the version byte and the exact wire size.  A v1
-// blob starts with a random nonce, so its first byte alone is not a safe
-// discriminator (it equals `0x02` with probability 1/256).
+// Detection uses both the version byte and the exact wire size. The size check
+// is not redundant: a blob carrying the marker at the wrong length must be
+// refused rather than parsed at offsets it does not have.
 
 /// v2 encrypted-PEM version byte.
 const ENC_PEM_V2: u8 = 0x02;
-const ENC_PEM_V1_BLOB_BYTES: usize = 12 + DK_SEED_BYTES + 16;
 const ENC_PEM_V2_BLOB_BYTES: usize = 1 + 16 + 4 + 4 + 4 + 12 + DK_SEED_BYTES + 16;
 
 /// v2 default Argon2id memory cost in KiB. 32 MiB strikes a balance between
@@ -484,12 +471,6 @@ const ENC_PEM_V2_BLOB_BYTES: usize = 1 + 16 + 4 + 4 + 4 + 12 + DK_SEED_BYTES + 1
 const ENC_PEM_V2_M_COST_KIB: u32 = 32 * 1024;
 const ENC_PEM_V2_T_COST: u32 = 3;
 const ENC_PEM_V2_P_COST: u32 = 1;
-
-/// v1 (legacy) Argon2id params. Reproduce the original derivation
-/// exactly so existing on-disk files still decrypt.
-const ENC_PEM_V1_M_COST_KIB: u32 = 256;
-const ENC_PEM_V1_T_COST: u32 = 3;
-const ENC_PEM_V1_P_COST: u32 = 1;
 
 /// Derive a 32-byte AEAD key from a passphrase using Argon2id with
 /// caller-supplied salt and cost params.
@@ -522,18 +503,6 @@ fn derive_key_from_passphrase(
         .hash_password_into(passphrase.as_bytes(), salt, key.as_mut_slice())
         .expect("argon2 hash infallible");
     key
-}
-
-/// v1-compat derivation: fixed BLAKE3-derived salt + legacy 256 KiB params.
-fn derive_key_v1(passphrase: &str) -> veil_util::sensitive_bytes::SensitiveBytesN<32> {
-    let salt = blake3::hash(b"ovl1_dk_seed_encryption_salt_v1");
-    derive_key_from_passphrase(
-        passphrase,
-        &salt.as_bytes()[..16],
-        ENC_PEM_V1_M_COST_KIB,
-        ENC_PEM_V1_T_COST,
-        ENC_PEM_V1_P_COST,
-    )
 }
 
 /// Encrypt DK seed → v2 PEM with random salt and embedded KDF params.
@@ -577,10 +546,9 @@ fn encode_pem_encrypted(seed: &[u8; DK_SEED_BYTES], passphrase: &str) -> String 
     format!("{PEM_ENC_HEADER}\n{b64}\n{PEM_ENC_FOOTER}\n")
 }
 
-/// Decrypt DK seed from encrypted PEM. Auto-detects v1 / v2 by first
-/// decoded byte. v1 returns the seed but the caller (loader) re-writes
-/// in v2 on success → see auto-upgrade path in
-/// `load_or_generate_mlkem_key_encrypted`.
+/// Decrypt DK seed from an encrypted PEM. Only the v2 layout is accepted;
+/// anything else yields `None`, which the loader treats as "wrong passphrase
+/// or corrupt file" and refuses rather than replacing the key.
 fn decode_pem_encrypted(pem: &str, passphrase: &str) -> Option<Vec<u8>> {
     use chacha20poly1305::{
         ChaCha20Poly1305, Key, Nonce,
@@ -610,8 +578,9 @@ fn decode_pem_encrypted(pem: &str, passphrase: &str) -> Option<Vec<u8>> {
         .decode(&b64)
         .ok()?;
 
-    // v2 path: version marker plus the exact fixed-size wire layout.  The
-    // length check is required because a legacy v1 nonce may begin with 0x02.
+    // The only accepted layout: version marker plus the exact fixed size. The
+    // length check is not redundant — the marker byte alone must never be
+    // enough to make the parser read at offsets the blob does not have.
     if blob.len() == ENC_PEM_V2_BLOB_BYTES && blob.first() == Some(&ENC_PEM_V2) {
         let salt: &[u8] = &blob[1..17];
         let m_cost = u32::from_be_bytes(blob[17..21].try_into().ok()?);
@@ -646,37 +615,11 @@ fn decode_pem_encrypted(pem: &str, passphrase: &str) -> Option<Vec<u8>> {
         return cipher.decrypt(nonce, ct).ok();
     }
 
-    // v1 path (legacy, no version byte): fixed-salt 256 KiB Argon2id.
-    if blob.len() != ENC_PEM_V1_BLOB_BYTES {
-        return None;
-    }
-    let key = derive_key_v1(passphrase);
-    let cipher = ChaCha20Poly1305::new(Key::from_slice(key.as_array()));
-    let nonce = Nonce::from_slice(&blob[..12]);
-    cipher.decrypt(nonce, &blob[12..]).ok()
-}
-
-/// `true` if the encrypted PEM uses v2 wire format. Used by the loader
-/// to decide whether to re-write a freshly-decoded file in the new format.
-fn is_v2_encrypted_pem(pem: &str) -> bool {
-    let mut inside = false;
-    let mut b64 = String::new();
-    for line in pem.lines() {
-        let line = line.trim();
-        if line == PEM_ENC_HEADER {
-            inside = true;
-            continue;
-        }
-        if line == PEM_ENC_FOOTER {
-            break;
-        }
-        if inside {
-            b64.push_str(line);
-        }
-    }
-    base64::engine::general_purpose::STANDARD
-        .decode(&b64)
-        .is_ok_and(|blob| blob.len() == ENC_PEM_V2_BLOB_BYTES && blob.first() == Some(&ENC_PEM_V2))
+    // Anything that is not the exact v2 layout is refused. The caller treats
+    // that as "wrong passphrase or corrupt blob" and stops — it never falls
+    // through to regenerating a key, so an unreadable file costs an error
+    // message, not an identity.
+    None
 }
 
 /// Load ML-KEM key with optional passphrase encryption.
@@ -720,18 +663,6 @@ pub fn load_or_generate_mlkem_key_encrypted(
                     let dk = parse_dk(&seed).expect("seed just validated");
                     let ek_arr = dk.encapsulation_key().to_bytes();
                     let ek: [u8; EK_BYTES] = ek_arr.as_slice().try_into().expect("EK size");
-
-                    // v1 → v2 auto-upgrade. v1 used a fixed BLAKE3-derived salt and
-                    // 256 KiB Argon2id — rainbow-table risk + cross-file
-                    // attack-amortisation. v2 uses random per-file salt and
-                    // 32 MiB Argon2id with embedded params. Re-write atomically;
-                    // failure is non-fatal (key still in memory, retry next start).
-                    if !is_v2_encrypted_pem(&pem) {
-                        let seed_arr: [u8; DK_SEED_BYTES] =
-                            seed.clone().try_into().expect("DK_SEED_BYTES");
-                        let new_pem = encode_pem_encrypted(&seed_arr, pass);
-                        let _ = veil_util::atomic_write(path, new_pem.as_bytes());
-                    }
 
                     return Ok((ek, seed.try_into().expect("DK_SEED_BYTES")));
                 }
@@ -1065,34 +996,23 @@ mod tests {
 
     // ── v2 encrypted PEM format tests ─────────────────────────────────────
 
-    /// Helper: encode a DK seed in legacy v1 format (fixed BLAKE3 salt,
-    /// 256 KiB Argon2id). Used to verify that v1 files written by
-    /// pre-audit binaries still decode and auto-upgrade.
-    fn encode_pem_encrypted_v1_with_nonce(
-        seed: &[u8; DK_SEED_BYTES],
-        passphrase: &str,
-        nonce_bytes: [u8; 12],
-    ) -> String {
-        use chacha20poly1305::{
-            ChaCha20Poly1305, Key, Nonce,
-            aead::{Aead, KeyInit},
-        };
-        let key = derive_key_v1(passphrase);
-        let cipher = ChaCha20Poly1305::new(Key::from_slice(key.as_array()));
-        let nonce = Nonce::from_slice(&nonce_bytes);
-        let ciphertext = cipher.encrypt(nonce, seed.as_slice()).unwrap();
-        let mut blob = Vec::with_capacity(12 + ciphertext.len());
-        blob.extend_from_slice(&nonce_bytes);
-        blob.extend_from_slice(&ciphertext);
-        let b64 = base64::engine::general_purpose::STANDARD.encode(&blob);
+    /// Re-encode an encrypted PEM around a caller-supplied blob, so a test can
+    /// hand `decode_pem_encrypted` a shape it would never produce itself.
+    fn pem_around(blob: &[u8]) -> String {
+        let b64 = base64::engine::general_purpose::STANDARD.encode(blob);
         format!("{PEM_ENC_HEADER}\n{b64}\n{PEM_ENC_FOOTER}\n")
     }
 
-    fn encode_pem_encrypted_v1(seed: &[u8; DK_SEED_BYTES], passphrase: &str) -> String {
-        use rand_core::{OsRng, RngCore};
-        let mut nonce_bytes = [0u8; 12];
-        OsRng.fill_bytes(&mut nonce_bytes);
-        encode_pem_encrypted_v1_with_nonce(seed, passphrase, nonce_bytes)
+    /// The base64 body of an encrypted PEM.
+    fn pem_blob(pem: &str) -> Vec<u8> {
+        let b64: String = pem
+            .lines()
+            .filter(|l| !l.starts_with("-----"))
+            .collect::<Vec<_>>()
+            .join("");
+        base64::engine::general_purpose::STANDARD
+            .decode(b64.trim())
+            .unwrap()
     }
 
     #[test]
@@ -1117,72 +1037,44 @@ mod tests {
         assert!(decode_pem_encrypted(&pem, "wrong").is_none());
     }
 
+    /// A blob that is not the exact v2 layout is refused outright. The v1
+    /// format this used to accept is gone, and the refusal matters more than
+    /// the format did: the loader treats a failed decode as "wrong passphrase
+    /// or corrupt file" and stops, so nothing silently regenerates a key.
     #[test]
-    fn v1_backcompat_decodes() {
+    fn a_non_v2_blob_is_refused() {
         let (_, dk_seed) = generate_keypair();
-        let v1_pem = encode_pem_encrypted_v1(&dk_seed, "legacy-pass");
-        // is_v2 should return false for v1 blob.
-        assert!(
-            !is_v2_encrypted_pem(&v1_pem),
-            "v1 must not be detected as v2"
-        );
-        // Decode should still work through the v1 fallback path.
-        let decoded = decode_pem_encrypted(&v1_pem, "legacy-pass").unwrap();
+        // 92 bytes, no version marker — the shape v1 used to have.
+        let legacy_shaped = pem_around(&[0xA5u8; 92]);
+        assert!(decode_pem_encrypted(&legacy_shaped, "any-pass").is_none());
+        // And the real thing still round-trips.
+        let pem = encode_pem_encrypted(&dk_seed, "any-pass");
+        let decoded = decode_pem_encrypted(&pem, "any-pass").unwrap();
         assert_eq!(decoded.as_slice(), dk_seed.as_slice());
     }
 
+    /// The marker byte alone must never be enough to claim a blob is v2. This
+    /// used to matter because a v1 nonce could begin with 0x02; v1 is gone,
+    /// but the guard is the same one — a blob carrying the marker at the wrong
+    /// length is refused, not parsed at offsets it does not have.
     #[test]
-    fn v1_nonce_leading_with_v2_marker_is_not_misclassified() {
+    fn v2_marker_without_the_v2_length_is_refused() {
         let (_, dk_seed) = generate_keypair();
-        let mut nonce = [0xA5; 12];
-        nonce[0] = ENC_PEM_V2;
-        let pem = encode_pem_encrypted_v1_with_nonce(&dk_seed, "collision-pass", nonce);
+        let real = pem_blob(&encode_pem_encrypted(&dk_seed, "collision-pass"));
+        assert_eq!(real[0], ENC_PEM_V2, "precondition: real v2 carries the marker");
 
-        assert!(!is_v2_encrypted_pem(&pem));
-        let decoded = decode_pem_encrypted(&pem, "collision-pass").unwrap();
-        assert_eq!(decoded.as_slice(), dk_seed.as_slice());
-    }
+        // Short enough that the fixed-offset reads would run off the end. This
+        // is the case the length check actually guards: without it the parser
+        // indexes past the blob and panics. A merely truncated blob would not
+        // prove anything, because the AEAD would reject it either way.
+        let stub = vec![ENC_PEM_V2; 20];
+        assert!(decode_pem_encrypted(&pem_around(&stub), "collision-pass").is_none());
 
-    #[test]
-    fn v1_wrong_passphrase_returns_none() {
-        let (_, dk_seed) = generate_keypair();
-        let v1_pem = encode_pem_encrypted_v1(&dk_seed, "correct-v1");
-        assert!(decode_pem_encrypted(&v1_pem, "wrong-v1").is_none());
-    }
-
-    #[test]
-    fn loader_auto_upgrades_v1_to_v2() {
-        let path = tmp_path("v1_v2_upgrade");
-        let _ = std::fs::remove_file(&path);
-        // Write a v1-format encrypted file whose nonce starts with the v2
-        // marker.  Detection must use the wire size too, otherwise this
-        // valid legacy file is misclassified with probability 1/256.
-        let (_, dk_seed) = generate_keypair();
-        let mut nonce = [0x5A; 12];
-        nonce[0] = ENC_PEM_V2;
-        let v1_pem = encode_pem_encrypted_v1_with_nonce(&dk_seed, "shared-pass", nonce);
-        std::fs::write(&path, v1_pem.as_bytes()).unwrap();
-        // Sanity: file is v1 format.
-        let read_back = std::fs::read_to_string(&path).unwrap();
-        assert!(
-            !is_v2_encrypted_pem(&read_back),
-            "test fixture must start as v1"
-        );
-        // Now load with the correct passphrase — should decrypt and auto-upgrade.
-        let (_, dk_loaded) =
-            load_or_generate_mlkem_key_encrypted(&path, Some("shared-pass")).unwrap();
-        assert_eq!(dk_loaded, dk_seed, "key must round-trip across upgrade");
-        // File must now be in v2 format.
-        let after = std::fs::read_to_string(&path).unwrap();
-        assert!(
-            is_v2_encrypted_pem(&after),
-            "loader must auto-upgrade v1 → v2"
-        );
-        // Re-load to confirm v2 path also works.
-        let (_, dk_reloaded) =
-            load_or_generate_mlkem_key_encrypted(&path, Some("shared-pass")).unwrap();
-        assert_eq!(dk_reloaded, dk_seed);
-        let _ = std::fs::remove_file(&path);
+        // Longer than the layout, marker intact: also refused rather than
+        // parsed at the offsets that happen to line up.
+        let mut padded = real.clone();
+        padded.push(0);
+        assert!(decode_pem_encrypted(&pem_around(&padded), "collision-pass").is_none());
     }
 
     #[test]
@@ -1278,19 +1170,27 @@ mod tests {
         );
     }
 
-    /// `derive_key_v1` legacy path also round-trips through the new
-    /// storage type — guards against accidental regression in the
-    /// v1-compatibility path which uses different cost params.
+    /// Derivation through the `SensitiveBytesN` storage type must stay
+    /// deterministic: the same passphrase and params have to reproduce the
+    /// same key, or an existing file stops opening.
     #[test]
-    fn etap6_slice6f_v1_legacy_path_still_decrypts() {
-        // We can't easily synthesize a v1 PEM here without duplicating
-        // the encoder logic, so verify the SensitiveBytesN-backed
-        // `derive_key_v1` produces deterministic bytes via a
-        // double-derive equality check (instead of byte-comparison
-        // which the type doesn't expose directly).
-        let passphrase = "etap6-slice6f-legacy";
-        let key_a = derive_key_v1(passphrase);
-        let key_b = derive_key_v1(passphrase);
+    fn etap6_slice6f_derivation_is_deterministic() {
+        let passphrase = "etap6-slice6f";
+        let salt = [0x11u8; 16];
+        let key_a = derive_key_from_passphrase(
+            passphrase,
+            &salt,
+            ENC_PEM_V2_M_COST_KIB,
+            ENC_PEM_V2_T_COST,
+            ENC_PEM_V2_P_COST,
+        );
+        let key_b = derive_key_from_passphrase(
+            passphrase,
+            &salt,
+            ENC_PEM_V2_M_COST_KIB,
+            ENC_PEM_V2_T_COST,
+            ENC_PEM_V2_P_COST,
+        );
         assert_eq!(
             key_a.as_array(),
             key_b.as_array(),
