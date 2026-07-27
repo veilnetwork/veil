@@ -17,8 +17,7 @@ use super::ProtoError;
 ///
 /// Sized to `crate::delivery::MAX_RELAY_PATH_HOPS` (= 64), the network's
 /// relay-path anti-amplification ceiling, so any legitimate diagnostic path
-/// still completes. Also used as the back-compat default when decoding a
-/// legacy frame that predates the `hop_limit` field.
+/// still completes. Senders that do not care about the budget encode it.
 pub const DIAG_DEFAULT_HOP_LIMIT: u8 = 64;
 
 // ── DiagPingPayload ───────────────────────────────────────────────────────────
@@ -29,8 +28,7 @@ pub const DIAG_DEFAULT_HOP_LIMIT: u8 = 64;
 // [36..44] ts_us u64 BE — sender wall-clock µs (for display only)
 // [44..76] target [u8; 32] — final destination; relays forward toward it
 // [76] hop_limit u8 — forwarding budget; relays decrement, drop at 0 (loop
-//      guard). Trailing/optional: legacy 76-byte frames decode with the
-//      default budget, so adding it is back-compatible across versions.
+//      guard). Required: a frame that stops before it is refused.
 
 /// Ping probe sent by the initiating node.
 /// Relays forward the probe toward `target`; only the target replies with Pong.
@@ -54,9 +52,9 @@ impl DiagPingPayload {
     pub const SIZE: usize = 4 + 32 + 8 + 32 + 1;
     /// Legacy wire size before the `hop_limit` byte was appended. Frames of
     /// exactly this length are accepted for back-compat (hop_limit defaults).
-    pub const LEGACY_SIZE: usize = 4 + 32 + 8 + 32;
+    const HOP_LIMIT_OFFSET: usize = 4 + 32 + 8 + 32;
 
-    /// Encode to the 77-byte layout (76 legacy bytes + `hop_limit`).
+    /// Encode to the full 77-byte layout.
     pub fn encode(&self) -> Vec<u8> {
         let mut buf = Vec::with_capacity(Self::SIZE);
         buf.extend_from_slice(&self.seq.to_be_bytes());
@@ -67,12 +65,11 @@ impl DiagPingPayload {
         buf
     }
 
-    /// Parse a ping payload. Accepts both the current 77-byte layout and the
-    /// legacy 76-byte layout (hop_limit ⇒ [`DIAG_DEFAULT_HOP_LIMIT`]).
+    /// Parse a ping payload. The full layout is required.
     pub fn decode(b: &[u8]) -> Result<Self, ProtoError> {
-        if b.len() < Self::LEGACY_SIZE {
+        if b.len() < Self::SIZE {
             return Err(ProtoError::BufferTooShort {
-                need: Self::LEGACY_SIZE,
+                need: Self::SIZE,
                 got: b.len(),
             });
         }
@@ -80,11 +77,7 @@ impl DiagPingPayload {
         let sender: [u8; 32] = super::read_array::<32>(b, 4)?;
         let ts_us = super::read_u64_be(b, 36)?;
         let target: [u8; 32] = super::read_array::<32>(b, 44)?;
-        let hop_limit = if b.len() > Self::LEGACY_SIZE {
-            b[Self::LEGACY_SIZE]
-        } else {
-            DIAG_DEFAULT_HOP_LIMIT
-        };
+        let hop_limit = b[Self::HOP_LIMIT_OFFSET];
         Ok(Self {
             seq,
             sender,
@@ -103,8 +96,7 @@ impl DiagPingPayload {
 // [36..44] echo_ts_us u64 BE — copy of DiagPingPayload.ts_us
 // [44..76] dest [u8; 32] — original sender; used for relay forwarding
 // [76] hop_limit u8 — forwarding budget; relays decrement, drop at 0 (loop
-//      guard). Trailing/optional: legacy 76-byte frames decode with the
-//      default budget, so adding it is back-compatible across versions.
+//      guard). Required: a frame that stops before it is refused.
 
 /// Pong reply sent by the target back to the initiating node.
 /// Relays forward the pong toward `dest`.
@@ -128,9 +120,9 @@ impl DiagPongPayload {
     pub const SIZE: usize = 4 + 32 + 8 + 32 + 1;
     /// Legacy wire size before the `hop_limit` byte was appended. Frames of
     /// exactly this length are accepted for back-compat (hop_limit defaults).
-    pub const LEGACY_SIZE: usize = 4 + 32 + 8 + 32;
+    const HOP_LIMIT_OFFSET: usize = 4 + 32 + 8 + 32;
 
-    /// Encode to the 77-byte layout (76 legacy bytes + `hop_limit`).
+    /// Encode to the full 77-byte layout.
     pub fn encode(&self) -> Vec<u8> {
         let mut buf = Vec::with_capacity(Self::SIZE);
         buf.extend_from_slice(&self.seq.to_be_bytes());
@@ -141,12 +133,11 @@ impl DiagPongPayload {
         buf
     }
 
-    /// Parse a pong payload. Accepts both the current 77-byte layout and the
-    /// legacy 76-byte layout (hop_limit ⇒ [`DIAG_DEFAULT_HOP_LIMIT`]).
+    /// Parse a pong payload. The full layout is required.
     pub fn decode(b: &[u8]) -> Result<Self, ProtoError> {
-        if b.len() < Self::LEGACY_SIZE {
+        if b.len() < Self::SIZE {
             return Err(ProtoError::BufferTooShort {
-                need: Self::LEGACY_SIZE,
+                need: Self::SIZE,
                 got: b.len(),
             });
         }
@@ -154,11 +145,7 @@ impl DiagPongPayload {
         let responder: [u8; 32] = super::read_array::<32>(b, 4)?;
         let echo_ts_us = super::read_u64_be(b, 36)?;
         let dest: [u8; 32] = super::read_array::<32>(b, 44)?;
-        let hop_limit = if b.len() > Self::LEGACY_SIZE {
-            b[Self::LEGACY_SIZE]
-        } else {
-            DIAG_DEFAULT_HOP_LIMIT
-        };
+        let hop_limit = b[Self::HOP_LIMIT_OFFSET];
         Ok(Self {
             seq,
             responder,
@@ -253,8 +240,7 @@ impl DiagTraceProbePayload {
 // [37..45] echo_ts_us u64 BE — copy of probe ts_us
 // [45..77] dest [u8; 32] — final destination (= original sender); used for relay forwarding
 // [77] hop_limit u8 — forwarding budget; relays decrement, drop at 0 (loop
-//      guard). Trailing/optional: legacy 77-byte frames decode with the
-//      default budget, so adding it is back-compatible across versions.
+//      guard). Required: a frame that stops before it is refused.
 
 /// Sent back to the original `sender` by the relay whose TTL hit zero.
 ///
@@ -283,9 +269,9 @@ impl DiagTraceHopPayload {
     pub const SIZE: usize = 4 + 32 + 1 + 8 + 32 + 1;
     /// Legacy wire size before the `hop_limit` byte was appended. Frames of
     /// exactly this length are accepted for back-compat (hop_limit defaults).
-    pub const LEGACY_SIZE: usize = 4 + 32 + 1 + 8 + 32;
+    const HOP_LIMIT_OFFSET: usize = 4 + 32 + 1 + 8 + 32;
 
-    /// Encode to the 78-byte layout (77 legacy bytes + `hop_limit`).
+    /// Encode to the full 78-byte layout.
     pub fn encode(&self) -> Vec<u8> {
         let mut buf = Vec::with_capacity(Self::SIZE);
         buf.extend_from_slice(&self.seq.to_be_bytes());
@@ -298,11 +284,11 @@ impl DiagTraceHopPayload {
     }
 
     /// Parse a trace-hop payload. Accepts both the current 78-byte layout and
-    /// the legacy 77-byte layout (hop_limit ⇒ [`DIAG_DEFAULT_HOP_LIMIT`]).
+    /// Parse a trace-hop payload. The full layout is required.
     pub fn decode(b: &[u8]) -> Result<Self, ProtoError> {
-        if b.len() < Self::LEGACY_SIZE {
+        if b.len() < Self::SIZE {
             return Err(ProtoError::BufferTooShort {
-                need: Self::LEGACY_SIZE,
+                need: Self::SIZE,
                 got: b.len(),
             });
         }
@@ -311,11 +297,7 @@ impl DiagTraceHopPayload {
         let hop_idx = b[36];
         let echo_ts_us = super::read_u64_be(b, 37)?;
         let dest: [u8; 32] = super::read_array::<32>(b, 45)?;
-        let hop_limit = if b.len() > Self::LEGACY_SIZE {
-            b[Self::LEGACY_SIZE]
-        } else {
-            DIAG_DEFAULT_HOP_LIMIT
-        };
+        let hop_limit = b[Self::HOP_LIMIT_OFFSET];
         Ok(Self {
             seq,
             hop_node_id,
@@ -348,7 +330,7 @@ mod tests {
     }
 
     #[test]
-    fn ping_legacy_decode_defaults_hop_limit() {
+    fn ping_frame_without_hop_limit_is_refused() {
         // A peer that predates the hop_limit byte sends a 76-byte frame.
         // Decoding must succeed and apply the default budget (no version break).
         let p = DiagPingPayload {
@@ -358,9 +340,17 @@ mod tests {
             target: [0x11; 32],
             hop_limit: 17,
         };
-        let legacy = &p.encode()[..DiagPingPayload::LEGACY_SIZE];
-        let decoded = DiagPingPayload::decode(legacy).unwrap();
-        assert_eq!(decoded.hop_limit, DIAG_DEFAULT_HOP_LIMIT);
+        // A frame that stops before `hop_limit` is the pre-hop-limit shape.
+        // It is refused now, not defaulted: nothing has emitted it in six
+        // weeks, and silently inventing a forwarding budget for an unknown
+        // sender is exactly the loop guard this byte exists to provide.
+        let truncated = &p.encode()[..DiagPingPayload::SIZE - 1];
+        assert!(matches!(
+            DiagPingPayload::decode(truncated),
+            Err(ProtoError::BufferTooShort { .. })
+        ));
+        let decoded = DiagPingPayload::decode(&p.encode()).unwrap();
+        assert_eq!(decoded.hop_limit, p.hop_limit);
         assert_eq!(decoded.seq, p.seq);
         assert_eq!(decoded.sender, p.sender);
         assert_eq!(decoded.target, p.target);
@@ -381,7 +371,7 @@ mod tests {
     }
 
     #[test]
-    fn pong_legacy_decode_defaults_hop_limit() {
+    fn pong_frame_without_hop_limit_is_refused() {
         let p = DiagPongPayload {
             seq: 7,
             responder: [0xBB; 32],
@@ -389,9 +379,17 @@ mod tests {
             dest: [0x22; 32],
             hop_limit: 5,
         };
-        let legacy = &p.encode()[..DiagPongPayload::LEGACY_SIZE];
-        let decoded = DiagPongPayload::decode(legacy).unwrap();
-        assert_eq!(decoded.hop_limit, DIAG_DEFAULT_HOP_LIMIT);
+        // A frame that stops before `hop_limit` is the pre-hop-limit shape.
+        // It is refused now, not defaulted: nothing has emitted it in six
+        // weeks, and silently inventing a forwarding budget for an unknown
+        // sender is exactly the loop guard this byte exists to provide.
+        let truncated = &p.encode()[..DiagPongPayload::SIZE - 1];
+        assert!(matches!(
+            DiagPongPayload::decode(truncated),
+            Err(ProtoError::BufferTooShort { .. })
+        ));
+        let decoded = DiagPongPayload::decode(&p.encode()).unwrap();
+        assert_eq!(decoded.hop_limit, p.hop_limit);
         assert_eq!(decoded.dest, p.dest);
     }
 
@@ -425,7 +423,7 @@ mod tests {
     }
 
     #[test]
-    fn trace_hop_legacy_decode_defaults_hop_limit() {
+    fn trace_hop_frame_without_hop_limit_is_refused() {
         let p = DiagTraceHopPayload {
             seq: 2,
             hop_node_id: [0xCC; 32],
@@ -434,9 +432,17 @@ mod tests {
             dest: [0xDD; 32],
             hop_limit: 9,
         };
-        let legacy = &p.encode()[..DiagTraceHopPayload::LEGACY_SIZE];
-        let decoded = DiagTraceHopPayload::decode(legacy).unwrap();
-        assert_eq!(decoded.hop_limit, DIAG_DEFAULT_HOP_LIMIT);
+        // A frame that stops before `hop_limit` is the pre-hop-limit shape.
+        // It is refused now, not defaulted: nothing has emitted it in six
+        // weeks, and silently inventing a forwarding budget for an unknown
+        // sender is exactly the loop guard this byte exists to provide.
+        let truncated = &p.encode()[..DiagTraceHopPayload::SIZE - 1];
+        assert!(matches!(
+            DiagTraceHopPayload::decode(truncated),
+            Err(ProtoError::BufferTooShort { .. })
+        ));
+        let decoded = DiagTraceHopPayload::decode(&p.encode()).unwrap();
+        assert_eq!(decoded.hop_limit, p.hop_limit);
         assert_eq!(decoded.dest, p.dest);
         assert_eq!(decoded.hop_idx, p.hop_idx);
     }
