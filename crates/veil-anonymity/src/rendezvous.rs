@@ -44,7 +44,7 @@
 //!
 //! ```text
 //! magic : 2 B ("RA" — Rendezvous Ad)
-//! version : 1 B (1..=5; see "Version compatibility" below)
+//! version : 1 B (always 5; see "Version" below)
 //! sig_algo: 1 B (0=Ed25519, 1=Falcon-512, 2=Hybrid)
 //! receiver_node_id : 32 B (BLAKE3 of receiver's identity pubkey)
 //! rendezvous_node_id : 32 B (third-party meeting point, operator's choice)
@@ -79,14 +79,11 @@
 //! Typical Ed25519 ad: ~190 B. Typical Falcon-512: ~1.6 KiB. Hard
 //! cap: 8 KiB ([`MAX_RENDEZVOUS_AD_BYTES`]).
 //!
-//! Version compatibility: the decoder accepts v1..=v5 — each version is an
-//! additive superset of the prior, so a field is present iff
-//! `version >= the version that introduced it` (v2: push_envelope, v3:
-//! capability_token, v4: wake_hmac_envelope, v5: rendezvous_kem_*). Older ads
-//! decode with the newer fields empty. The encoder always emits v5; legacy ads
-//! stored in the DHT re-sign as v5 on the receiver's next maintenance-tick
-//! refresh. Each version has a DISJOINT signing domain (`:vN\0`) so a captured
-//! ad cannot be replayed or downgraded across versions.
+//! Version: v5 only, encoded and decoded. v1..v4 were accepted while the
+//! network still carried ads from a transition period; ads are short-lived and
+//! re-signed on every maintenance tick, so nothing publishes them any more.
+//! The signing domain is version-tagged (`:vN\0`) so a captured ad cannot be
+//! replayed or downgraded if a v6 is ever added.
 //!
 //! # Anti-tamper
 //!
@@ -111,10 +108,6 @@ use veil_types::SignatureAlgorithm;
 /// accept ad replication (the ad is structurally decoded + re-verified on the
 /// resolver read path, like the other identity-family records).
 pub const MAGIC: &[u8; 2] = b"RA";
-const VERSION_LEGACY: u8 = 1;
-const VERSION_V2: u8 = 2;
-const VERSION_V3: u8 = 3;
-const VERSION_V4: u8 = 4;
 /// Current wire-format version.  v5 adds the relay's KEM public key
 /// (`rendezvous_kem_algo` + `rendezvous_kem_pk`) so a sender can anonymously
 /// deposit a mailbox PUT directly at the rendezvous relay without a second
@@ -133,10 +126,6 @@ const VERSION: u8 = 5;
 // wake_hmac_envelope length + bytes, and v3's signing domain locks
 // `:v3\0`.  Same disjoint-domain invariant as pre-existing v1→v2 and
 // v2→v3 bumps.
-const SIG_DOMAIN_V1: &[u8] = b"veil-rendezvous-ad:v1\0";
-const SIG_DOMAIN_V2: &[u8] = b"veil-rendezvous-ad:v2\0";
-const SIG_DOMAIN_V3: &[u8] = b"veil-rendezvous-ad:v3\0";
-const SIG_DOMAIN_V4: &[u8] = b"veil-rendezvous-ad:v4\0";
 // Domain bumped v4 → v5 alongside the wire bump: a censor that captured an
 // old v4 ad cannot forge a v5 by appending an arbitrary KEM key, since v5
 // canonical-message construction binds `rendezvous_kem_algo` + the
@@ -328,13 +317,9 @@ pub struct RendezvousAd {
     /// fall back to the live rendezvous path). Cap
     /// [`MAX_RENDEZVOUS_KEM_PK_LEN`].
     pub rendezvous_kem_pk: Vec<u8>,
-    /// Wire-format version this ad was decoded from (or freshly signed
-    /// at). Preserved across decode → verify so verify can pick the
-    /// matching canonical-message domain (v1 ads signed pre-push don't
-    /// include push_envelope; v2 don't include capability_token; v3
-    /// don't include wake_hmac_envelope).  Encoder always emits v4;
-    /// decoder tolerates v1 / v2 / v3 for backward-compat reads of
-    /// DHT entries from a transition-period network.
+    /// Wire-format version this ad was decoded from (or freshly signed at).
+    /// Always [`VERSION`]; kept as a field so verify can pick the matching
+    /// canonical-message domain if a later version is ever added.
     pub wire_version: u8,
 }
 
@@ -602,12 +587,7 @@ pub fn decode_rendezvous_ad(blob: &[u8]) -> Result<RendezvousAd, RendezvousError
         return Err(RendezvousError::Malformed(format!("bad magic: {magic:?}")));
     }
     let version = read(blob, &mut p, 1)?[0];
-    if version != VERSION
-        && version != VERSION_V4
-        && version != VERSION_V3
-        && version != VERSION_V2
-        && version != VERSION_LEGACY
-    {
+    if version != VERSION {
         return Err(RendezvousError::Malformed(format!(
             "unsupported version {version}",
         )));
@@ -630,37 +610,27 @@ pub fn decode_rendezvous_ad(blob: &[u8]) -> Result<RendezvousAd, RendezvousError
     receiver_x25519_pk.copy_from_slice(read(blob, &mut p, X25519_PK_LEN)?);
     let valid_from_unix = u64::from_be_bytes(read(blob, &mut p, 8)?.try_into().unwrap());
     let valid_until_unix = u64::from_be_bytes(read(blob, &mut p, 8)?.try_into().unwrap());
-    // Versions are additive supersets (v1 ⊂ v2 ⊂ v3 ⊂ v4 ⊂ v5), so each field
-    // is present iff `version >= the version that introduced it`.
-    // push_envelope: v2+ (v1 skips it; field defaults to empty).
-    let push_envelope = if version >= VERSION_V2 {
+    // Every field below is unconditional: v5 is the only accepted version.
+    let push_envelope = {
         let env_len = u16::from_be_bytes(read(blob, &mut p, 2)?.try_into().unwrap()) as usize;
         if env_len > MAX_PUSH_ENVELOPE_LEN {
             return Err(RendezvousError::PushEnvelopeTooLarge { got: env_len });
         }
         read(blob, &mut p, env_len)?.to_vec()
-    } else {
-        Vec::new()
     };
-    // capability_token: v3+ (pre-v3 ads yield empty).
-    let capability_token = if version >= VERSION_V3 {
+    let capability_token = {
         let cap_len = u16::from_be_bytes(read(blob, &mut p, 2)?.try_into().unwrap()) as usize;
         if cap_len > MAX_CAPABILITY_TOKEN_LEN {
             return Err(RendezvousError::CapabilityTokenTooLarge { got: cap_len });
         }
         read(blob, &mut p, cap_len)?.to_vec()
-    } else {
-        Vec::new()
     };
-    // wake_hmac_envelope: v4+ (Epic 489.10 slice 4.3.2). Pre-v4 ads yield empty.
-    let wake_hmac_envelope = if version >= VERSION_V4 {
+    let wake_hmac_envelope = {
         let env_len = u16::from_be_bytes(read(blob, &mut p, 2)?.try_into().unwrap()) as usize;
         if env_len > MAX_WAKE_HMAC_ENVELOPE_LEN {
             return Err(RendezvousError::WakeHmacEnvelopeTooLarge { got: env_len });
         }
         read(blob, &mut p, env_len)?.to_vec()
-    } else {
-        Vec::new()
     };
     // rendezvous_kem_algo + rendezvous_kem_pk: v5+ (the relay's KEM key for
     // anonymous mailbox deposit). Pre-v5 ads yield `algo = 0`, `pk = []`.
@@ -742,44 +712,6 @@ pub fn verify_rendezvous_ad(ad: &RendezvousAd) -> Result<(), RendezvousError> {
         return Err(RendezvousError::Verify);
     }
     let canonical = match ad.wire_version {
-        VERSION_LEGACY => canonical_message_v1(
-            &ad.receiver_node_id,
-            &ad.rendezvous_node_id,
-            &ad.auth_cookie,
-            &ad.receiver_x25519_pk,
-            ad.valid_from_unix,
-            ad.valid_until_unix,
-        ),
-        VERSION_V2 => canonical_message_v2(
-            &ad.receiver_node_id,
-            &ad.rendezvous_node_id,
-            &ad.auth_cookie,
-            &ad.receiver_x25519_pk,
-            ad.valid_from_unix,
-            ad.valid_until_unix,
-            &ad.push_envelope,
-        ),
-        VERSION_V3 => canonical_message_v3(
-            &ad.receiver_node_id,
-            &ad.rendezvous_node_id,
-            &ad.auth_cookie,
-            &ad.receiver_x25519_pk,
-            ad.valid_from_unix,
-            ad.valid_until_unix,
-            &ad.push_envelope,
-            &ad.capability_token,
-        ),
-        VERSION_V4 => canonical_message_v4(
-            &ad.receiver_node_id,
-            &ad.rendezvous_node_id,
-            &ad.auth_cookie,
-            &ad.receiver_x25519_pk,
-            ad.valid_from_unix,
-            ad.valid_until_unix,
-            &ad.push_envelope,
-            &ad.capability_token,
-            &ad.wake_hmac_envelope,
-        ),
         VERSION => canonical_message_v5(
             &ad.receiver_node_id,
             &ad.rendezvous_node_id,
@@ -826,334 +758,12 @@ pub fn is_currently_valid(ad: &RendezvousAd, now_unix: u64) -> Result<(), Rendez
 
 // ── Internal helpers ──────────────────────────────────────────────────
 
-/// Legacy v1 canonical-message form (no `push_envelope`). Used by
-/// [`verify_rendezvous_ad`] when reading a legacy v1 ad from the DHT
-/// during the transition period. Encoder NEVER produces
-/// v1 form anymore — once a receiver runs maintenance-tick, the next
-/// re-sign emits v2.
-#[allow(clippy::too_many_arguments)]
-fn canonical_message_v1(
-    receiver_node_id: &[u8; NODE_ID_LEN],
-    rendezvous_node_id: &[u8; NODE_ID_LEN],
-    auth_cookie: &[u8; AUTH_COOKIE_LEN],
-    receiver_x25519_pk: &[u8; X25519_PK_LEN],
-    valid_from_unix: u64,
-    valid_until_unix: u64,
-) -> Vec<u8> {
-    let mut buf = Vec::with_capacity(
-        SIG_DOMAIN_V1.len() + NODE_ID_LEN * 2 + AUTH_COOKIE_LEN + X25519_PK_LEN + 16,
-    );
-    buf.extend_from_slice(SIG_DOMAIN_V1);
-    buf.extend_from_slice(receiver_node_id);
-    buf.extend_from_slice(rendezvous_node_id);
-    buf.extend_from_slice(auth_cookie);
-    buf.extend_from_slice(receiver_x25519_pk);
-    buf.extend_from_slice(&valid_from_unix.to_be_bytes());
-    buf.extend_from_slice(&valid_until_unix.to_be_bytes());
-    buf
-}
 
-/// Current v2 canonical-message form (— includes
-/// `push_envelope`). Length-prefix on the envelope ensures the
-/// signature binds BOTH the envelope contents AND the operator's
-/// intent to publish a push hint at all (length=0 still signs). A
-/// censor cannot strip / replace / append the envelope without breaking
-/// the signature.
-#[allow(clippy::too_many_arguments)]
-fn canonical_message_v2(
-    receiver_node_id: &[u8; NODE_ID_LEN],
-    rendezvous_node_id: &[u8; NODE_ID_LEN],
-    auth_cookie: &[u8; AUTH_COOKIE_LEN],
-    receiver_x25519_pk: &[u8; X25519_PK_LEN],
-    valid_from_unix: u64,
-    valid_until_unix: u64,
-    push_envelope: &[u8],
-) -> Vec<u8> {
-    let mut buf = Vec::with_capacity(
-        SIG_DOMAIN_V2.len()
-            + NODE_ID_LEN * 2
-            + AUTH_COOKIE_LEN
-            + X25519_PK_LEN
-            + 16
-            + 2
-            + push_envelope.len(),
-    );
-    buf.extend_from_slice(SIG_DOMAIN_V2);
-    buf.extend_from_slice(receiver_node_id);
-    buf.extend_from_slice(rendezvous_node_id);
-    buf.extend_from_slice(auth_cookie);
-    buf.extend_from_slice(receiver_x25519_pk);
-    buf.extend_from_slice(&valid_from_unix.to_be_bytes());
-    buf.extend_from_slice(&valid_until_unix.to_be_bytes());
-    buf.extend_from_slice(&(push_envelope.len() as u16).to_be_bytes());
-    buf.extend_from_slice(push_envelope);
-    buf
-}
 
-// superseded by encode_body_v3 (signer always
-// emits v3). Retained for symmetry with canonical_message_v2 (still needed
-// by verify dispatch over existing-on-DHT v2 ads) and for cfg(test) callers
-// that construct synthetic v2 wire to exercise backward-compat decode.
-#[allow(clippy::too_many_arguments)]
-#[cfg(test)]
-fn encode_body_v2(
-    receiver_node_id: &[u8; NODE_ID_LEN],
-    rendezvous_node_id: &[u8; NODE_ID_LEN],
-    auth_cookie: &[u8; AUTH_COOKIE_LEN],
-    receiver_x25519_pk: &[u8; X25519_PK_LEN],
-    valid_from_unix: u64,
-    valid_until_unix: u64,
-    push_envelope: &[u8],
-    issuer_pk_bytes: &[u8],
-    issuer_algo: SignatureAlgorithm,
-    signature: &[u8],
-) -> Result<Vec<u8>, RendezvousError> {
-    let mut out = Vec::with_capacity(
-        2 + 1
-            + 1
-            + NODE_ID_LEN * 2
-            + AUTH_COOKIE_LEN
-            + X25519_PK_LEN
-            + 16
-            + 2
-            + push_envelope.len()
-            + 2
-            + issuer_pk_bytes.len()
-            + 2
-            + signature.len(),
-    );
-    out.extend_from_slice(MAGIC);
-    out.push(VERSION_V2);
-    out.push(match issuer_algo {
-        SignatureAlgorithm::Ed25519 => 0,
-        SignatureAlgorithm::Falcon512 => 1,
-        SignatureAlgorithm::Ed25519Falcon512Hybrid => 2,
-        SignatureAlgorithm::Ed25519Falcon1024Hybrid => 3,
-    });
-    out.extend_from_slice(receiver_node_id);
-    out.extend_from_slice(rendezvous_node_id);
-    out.extend_from_slice(auth_cookie);
-    out.extend_from_slice(receiver_x25519_pk);
-    out.extend_from_slice(&valid_from_unix.to_be_bytes());
-    out.extend_from_slice(&valid_until_unix.to_be_bytes());
-    out.extend_from_slice(&(push_envelope.len() as u16).to_be_bytes());
-    out.extend_from_slice(push_envelope);
-    out.extend_from_slice(&(issuer_pk_bytes.len() as u16).to_be_bytes());
-    out.extend_from_slice(issuer_pk_bytes);
-    out.extend_from_slice(&(signature.len() as u16).to_be_bytes());
-    out.extend_from_slice(signature);
-    Ok(out)
-}
 
-/// v3 canonical-message form. Adds
-/// `capability_token` length + bytes after the v2 push_envelope tail.
-/// Same length-prefix-inclusion invariant as v2: censor cannot strip
-/// or replace the cap token without invalidating the v3 signature.
-#[allow(clippy::too_many_arguments)]
-fn canonical_message_v3(
-    receiver_node_id: &[u8; NODE_ID_LEN],
-    rendezvous_node_id: &[u8; NODE_ID_LEN],
-    auth_cookie: &[u8; AUTH_COOKIE_LEN],
-    receiver_x25519_pk: &[u8; X25519_PK_LEN],
-    valid_from_unix: u64,
-    valid_until_unix: u64,
-    push_envelope: &[u8],
-    capability_token: &[u8],
-) -> Vec<u8> {
-    let mut buf = Vec::with_capacity(
-        SIG_DOMAIN_V3.len()
-            + NODE_ID_LEN * 2
-            + AUTH_COOKIE_LEN
-            + X25519_PK_LEN
-            + 16
-            + 2
-            + push_envelope.len()
-            + 2
-            + capability_token.len(),
-    );
-    buf.extend_from_slice(SIG_DOMAIN_V3);
-    buf.extend_from_slice(receiver_node_id);
-    buf.extend_from_slice(rendezvous_node_id);
-    buf.extend_from_slice(auth_cookie);
-    buf.extend_from_slice(receiver_x25519_pk);
-    buf.extend_from_slice(&valid_from_unix.to_be_bytes());
-    buf.extend_from_slice(&valid_until_unix.to_be_bytes());
-    buf.extend_from_slice(&(push_envelope.len() as u16).to_be_bytes());
-    buf.extend_from_slice(push_envelope);
-    buf.extend_from_slice(&(capability_token.len() as u16).to_be_bytes());
-    buf.extend_from_slice(capability_token);
-    buf
-}
 
-// superseded by encode_body_v4 (signer always emits v4).  Retained
-// for symmetry with canonical_message_v3 (still needed by verify
-// dispatch over existing-on-DHT v3 ads) and for cfg(test) callers
-// that construct synthetic v3 wire to exercise backward-compat decode.
-#[allow(clippy::too_many_arguments)]
-#[cfg(test)]
-fn encode_body_v3(
-    receiver_node_id: &[u8; NODE_ID_LEN],
-    rendezvous_node_id: &[u8; NODE_ID_LEN],
-    auth_cookie: &[u8; AUTH_COOKIE_LEN],
-    receiver_x25519_pk: &[u8; X25519_PK_LEN],
-    valid_from_unix: u64,
-    valid_until_unix: u64,
-    push_envelope: &[u8],
-    capability_token: &[u8],
-    issuer_pk_bytes: &[u8],
-    issuer_algo: SignatureAlgorithm,
-    signature: &[u8],
-) -> Result<Vec<u8>, RendezvousError> {
-    let mut out = Vec::with_capacity(
-        2 + 1
-            + 1
-            + NODE_ID_LEN * 2
-            + AUTH_COOKIE_LEN
-            + X25519_PK_LEN
-            + 16
-            + 2
-            + push_envelope.len()
-            + 2
-            + capability_token.len()
-            + 2
-            + issuer_pk_bytes.len()
-            + 2
-            + signature.len(),
-    );
-    out.extend_from_slice(MAGIC);
-    out.push(VERSION_V3);
-    out.push(match issuer_algo {
-        SignatureAlgorithm::Ed25519 => 0,
-        SignatureAlgorithm::Falcon512 => 1,
-        SignatureAlgorithm::Ed25519Falcon512Hybrid => 2,
-        SignatureAlgorithm::Ed25519Falcon1024Hybrid => 3,
-    });
-    out.extend_from_slice(receiver_node_id);
-    out.extend_from_slice(rendezvous_node_id);
-    out.extend_from_slice(auth_cookie);
-    out.extend_from_slice(receiver_x25519_pk);
-    out.extend_from_slice(&valid_from_unix.to_be_bytes());
-    out.extend_from_slice(&valid_until_unix.to_be_bytes());
-    out.extend_from_slice(&(push_envelope.len() as u16).to_be_bytes());
-    out.extend_from_slice(push_envelope);
-    out.extend_from_slice(&(capability_token.len() as u16).to_be_bytes());
-    out.extend_from_slice(capability_token);
-    out.extend_from_slice(&(issuer_pk_bytes.len() as u16).to_be_bytes());
-    out.extend_from_slice(issuer_pk_bytes);
-    out.extend_from_slice(&(signature.len() as u16).to_be_bytes());
-    out.extend_from_slice(signature);
-    Ok(out)
-}
 
-/// v4 canonical-message form (Epic 489.10 slice 4.3.2).  Adds
-/// `wake_hmac_envelope` length + bytes after the v3 capability_token
-/// tail.  Same length-prefix-inclusion invariant: censor cannot strip
-/// or replace the wake HMAC envelope without invalidating the v4 signature.
-#[allow(clippy::too_many_arguments)]
-fn canonical_message_v4(
-    receiver_node_id: &[u8; NODE_ID_LEN],
-    rendezvous_node_id: &[u8; NODE_ID_LEN],
-    auth_cookie: &[u8; AUTH_COOKIE_LEN],
-    receiver_x25519_pk: &[u8; X25519_PK_LEN],
-    valid_from_unix: u64,
-    valid_until_unix: u64,
-    push_envelope: &[u8],
-    capability_token: &[u8],
-    wake_hmac_envelope: &[u8],
-) -> Vec<u8> {
-    let mut buf = Vec::with_capacity(
-        SIG_DOMAIN_V4.len()
-            + NODE_ID_LEN * 2
-            + AUTH_COOKIE_LEN
-            + X25519_PK_LEN
-            + 16
-            + 2
-            + push_envelope.len()
-            + 2
-            + capability_token.len()
-            + 2
-            + wake_hmac_envelope.len(),
-    );
-    buf.extend_from_slice(SIG_DOMAIN_V4);
-    buf.extend_from_slice(receiver_node_id);
-    buf.extend_from_slice(rendezvous_node_id);
-    buf.extend_from_slice(auth_cookie);
-    buf.extend_from_slice(receiver_x25519_pk);
-    buf.extend_from_slice(&valid_from_unix.to_be_bytes());
-    buf.extend_from_slice(&valid_until_unix.to_be_bytes());
-    buf.extend_from_slice(&(push_envelope.len() as u16).to_be_bytes());
-    buf.extend_from_slice(push_envelope);
-    buf.extend_from_slice(&(capability_token.len() as u16).to_be_bytes());
-    buf.extend_from_slice(capability_token);
-    buf.extend_from_slice(&(wake_hmac_envelope.len() as u16).to_be_bytes());
-    buf.extend_from_slice(wake_hmac_envelope);
-    buf
-}
 
-// superseded by encode_body_v5 (signer always emits v5).  Retained for
-// symmetry with canonical_message_v4 (still needed by verify dispatch over
-// existing-on-DHT v4 ads) and for cfg(test) callers that construct synthetic
-// v4 wire to exercise backward-compat decode.
-#[allow(clippy::too_many_arguments)]
-#[cfg(test)]
-fn encode_body_v4(
-    receiver_node_id: &[u8; NODE_ID_LEN],
-    rendezvous_node_id: &[u8; NODE_ID_LEN],
-    auth_cookie: &[u8; AUTH_COOKIE_LEN],
-    receiver_x25519_pk: &[u8; X25519_PK_LEN],
-    valid_from_unix: u64,
-    valid_until_unix: u64,
-    push_envelope: &[u8],
-    capability_token: &[u8],
-    wake_hmac_envelope: &[u8],
-    issuer_pk_bytes: &[u8],
-    issuer_algo: SignatureAlgorithm,
-    signature: &[u8],
-) -> Result<Vec<u8>, RendezvousError> {
-    let mut out = Vec::with_capacity(
-        2 + 1
-            + 1
-            + NODE_ID_LEN * 2
-            + AUTH_COOKIE_LEN
-            + X25519_PK_LEN
-            + 16
-            + 2
-            + push_envelope.len()
-            + 2
-            + capability_token.len()
-            + 2
-            + wake_hmac_envelope.len()
-            + 2
-            + issuer_pk_bytes.len()
-            + 2
-            + signature.len(),
-    );
-    out.extend_from_slice(MAGIC);
-    out.push(VERSION_V4);
-    out.push(match issuer_algo {
-        SignatureAlgorithm::Ed25519 => 0,
-        SignatureAlgorithm::Falcon512 => 1,
-        SignatureAlgorithm::Ed25519Falcon512Hybrid => 2,
-        SignatureAlgorithm::Ed25519Falcon1024Hybrid => 3,
-    });
-    out.extend_from_slice(receiver_node_id);
-    out.extend_from_slice(rendezvous_node_id);
-    out.extend_from_slice(auth_cookie);
-    out.extend_from_slice(receiver_x25519_pk);
-    out.extend_from_slice(&valid_from_unix.to_be_bytes());
-    out.extend_from_slice(&valid_until_unix.to_be_bytes());
-    out.extend_from_slice(&(push_envelope.len() as u16).to_be_bytes());
-    out.extend_from_slice(push_envelope);
-    out.extend_from_slice(&(capability_token.len() as u16).to_be_bytes());
-    out.extend_from_slice(capability_token);
-    out.extend_from_slice(&(wake_hmac_envelope.len() as u16).to_be_bytes());
-    out.extend_from_slice(wake_hmac_envelope);
-    out.extend_from_slice(&(issuer_pk_bytes.len() as u16).to_be_bytes());
-    out.extend_from_slice(issuer_pk_bytes);
-    out.extend_from_slice(&(signature.len() as u16).to_be_bytes());
-    out.extend_from_slice(signature);
-    Ok(out)
-}
 
 /// v5 canonical-message form. Adds `rendezvous_kem_algo` (1 B) +
 /// length-prefixed `rendezvous_kem_pk` after the v4 wake_hmac_envelope tail.
@@ -2753,19 +2363,32 @@ mod tests {
 
     #[test]
     fn epic482_5_canonical_message_includes_domain_separator() {
-        let canonical =
-            canonical_message_v2(&[0u8; 32], &[0u8; 32], &[0u8; 16], &[0u8; 32], 0, 0, &[]);
+        let canonical = canonical_message_v5(
+            &[0u8; 32], &[0u8; 32], &[0u8; 16], &[0u8; 32], 0, 0, &[], &[], &[], 0, &[],
+        );
         assert!(
-            canonical.starts_with(SIG_DOMAIN_V2),
+            canonical.starts_with(SIG_DOMAIN_V5),
             "canonical message must start with domain separator for cross-protocol replay protection"
         );
-        assert!(canonical.starts_with(b"veil-rendezvous-ad:v2\0"));
+        assert!(canonical.starts_with(b"veil-rendezvous-ad:v5\0"));
+    }
 
-        // v1 (legacy) form retains its own domain so signatures don't
-        // replay between v1 and v2 ads even if all other fields match.
-        let v1 = canonical_message_v1(&[0u8; 32], &[0u8; 32], &[0u8; 16], &[0u8; 32], 0, 0);
-        assert!(v1.starts_with(b"veil-rendezvous-ad:v1\0"));
-        assert_ne!(v1, canonical, "v1 and v2 canonical messages must differ");
+    /// v1..v4 were accepted while the DHT still held ads from a transition
+    /// period. They are refused now, and this pins that: without it the
+    /// version gate could be widened back to any of them and the whole suite
+    /// would stay green, because nothing else constructs a pre-v5 ad.
+    #[test]
+    fn pre_v5_wire_version_is_refused() {
+        let (bytes, _ad, _pk) = fixture_ed25519();
+        for stale in [1u8, 2, 3, 4] {
+            let mut blob = bytes.clone();
+            blob[2] = stale; // [0..2] magic, [2] version
+            let err = decode_rendezvous_ad(&blob).unwrap_err();
+            assert!(
+                matches!(err, RendezvousError::Malformed(ref m) if m.contains("unsupported version")),
+                "wire version {stale} must be refused, got {err:?}"
+            );
+        }
     }
 
     #[test]
@@ -3479,102 +3102,6 @@ mod tests {
             bytes.len() < MAX_RENDEZVOUS_AD_BYTES,
             "max-envelope ad still under total cap; got {}",
             bytes.len()
-        );
-    }
-
-    #[test]
-    fn epic489_10_v1_legacy_decode_yields_empty_envelope() {
-        // Construct a v1 wire-format blob by hand (no push_envelope
-        // field). Decoder must accept it and set push_envelope = vec![].
-        let kp = generate_keypair(SignatureAlgorithm::Ed25519);
-
-        // Build v1 canonical and sign.
-        let canonical = canonical_message_v1(
-            &coherent_node_id(&kp.public_key),
-            &[0xBB; 32],
-            &[0xCC; 16],
-            &[0xDD; 32],
-            1_700_000_000,
-            1_700_000_000 + 86_400,
-        );
-        let signature = sign_message(
-            SignatureAlgorithm::Ed25519,
-            &kp.public_key,
-            &kp.private_key,
-            &canonical,
-        )
-        .unwrap();
-
-        // Manually emit v1 wire format.
-        let mut out = Vec::new();
-        out.extend_from_slice(MAGIC);
-        out.push(VERSION_LEGACY);
-        out.push(0u8); // sig_algo Ed25519
-        out.extend_from_slice(&coherent_node_id(&kp.public_key));
-        out.extend_from_slice(&[0xBB; 32]);
-        out.extend_from_slice(&[0xCC; 16]);
-        out.extend_from_slice(&[0xDD; 32]);
-        out.extend_from_slice(&1_700_000_000u64.to_be_bytes());
-        out.extend_from_slice(&(1_700_000_000u64 + 86_400).to_be_bytes());
-        let pk_bytes = kp.public_key.as_bytes();
-        out.extend_from_slice(&(pk_bytes.len() as u16).to_be_bytes());
-        out.extend_from_slice(pk_bytes);
-        out.extend_from_slice(&(signature.len() as u16).to_be_bytes());
-        out.extend_from_slice(&signature);
-
-        let ad = decode_rendezvous_ad(&out).unwrap();
-        assert_eq!(ad.wire_version, VERSION_LEGACY);
-        assert!(
-            ad.push_envelope.is_empty(),
-            "v1 ad has no push_envelope field; decoder must default to empty"
-        );
-        verify_rendezvous_ad(&ad).expect("v1 signature must verify under v1 canonical");
-    }
-
-    #[test]
-    fn epic489_10_v1_v2_canonical_messages_disjoint() {
-        // Cross-version replay protection: an Ed25519 signature on a v1
-        // canonical message MUST NOT verify against the same fields in
-        // v2 form (with empty envelope), even though the data fields match.
-        // Otherwise a censor could swap version bytes mid-flight and
-        // confuse the receiver about whether push is registered.
-        let kp = generate_keypair(SignatureAlgorithm::Ed25519);
-
-        let v1_canonical = canonical_message_v1(
-            &[0xAA; 32],
-            &[0xBB; 32],
-            &[0xCC; 16],
-            &[0xDD; 32],
-            1_700_000_000,
-            1_700_000_000 + 86_400,
-        );
-        let v1_sig = sign_message(
-            SignatureAlgorithm::Ed25519,
-            &kp.public_key,
-            &kp.private_key,
-            &v1_canonical,
-        )
-        .unwrap();
-
-        let v2_canonical = canonical_message_v2(
-            &[0xAA; 32],
-            &[0xBB; 32],
-            &[0xCC; 16],
-            &[0xDD; 32],
-            1_700_000_000,
-            1_700_000_000 + 86_400,
-            &[],
-        );
-        // Cross-verify: v1 sig on v2 canonical fails.
-        assert!(
-            verify_message(
-                SignatureAlgorithm::Ed25519,
-                &kp.public_key,
-                &v2_canonical,
-                &v1_sig,
-            )
-            .is_err(),
-            "v1 signature must NOT verify against v2 canonical"
         );
     }
 
@@ -4343,219 +3870,4 @@ mod tests {
         assert_eq!(ad.wire_version, VERSION);
     }
 
-    #[test]
-    fn epic489_10_v3_legacy_decode_under_v4_yields_empty_wake_hmac_envelope() {
-        // Construct a v3 wire blob via encode_body_v3 + canonical_message_v3
-        // then decode under the new v4 decoder.  Verify must succeed
-        // using the v3 canonical, and wake_hmac_envelope must be empty —
-        // matches the symmetric v1-under-v2 and v2-under-v3 cases.
-        let kp = generate_keypair(SignatureAlgorithm::Ed25519);
-        let push_env = vec![0xEE; 64];
-        let cap_tok = vec![0xCC; 50];
-        let receiver_node_id = coherent_node_id(&kp.public_key);
-        let rendezvous_node_id = [0xBBu8; 32];
-        let auth_cookie = [0xCCu8; 16];
-        let receiver_x25519_pk = [0xDDu8; 32];
-        let valid_from = 1_700_000_000;
-        let valid_until = valid_from + 86_400;
-        let canonical = canonical_message_v3(
-            &receiver_node_id,
-            &rendezvous_node_id,
-            &auth_cookie,
-            &receiver_x25519_pk,
-            valid_from,
-            valid_until,
-            &push_env,
-            &cap_tok,
-        );
-        let signature = sign_message(
-            SignatureAlgorithm::Ed25519,
-            &kp.public_key,
-            &kp.private_key,
-            &canonical,
-        )
-        .unwrap();
-        let bytes = encode_body_v3(
-            &receiver_node_id,
-            &rendezvous_node_id,
-            &auth_cookie,
-            &receiver_x25519_pk,
-            valid_from,
-            valid_until,
-            &push_env,
-            &cap_tok,
-            kp.public_key.as_bytes(),
-            SignatureAlgorithm::Ed25519,
-            &signature,
-        )
-        .unwrap();
-        let ad = decode_rendezvous_ad(&bytes).unwrap();
-        assert_eq!(ad.wire_version, VERSION_V3);
-        assert_eq!(ad.push_envelope, push_env);
-        assert_eq!(ad.capability_token, cap_tok);
-        assert!(
-            ad.wake_hmac_envelope.is_empty(),
-            "v3 ads must decode to empty wake_hmac_envelope under v4 decoder"
-        );
-        verify_rendezvous_ad(&ad).expect("v3 sig must verify under v4 verifier dispatch");
-    }
-
-    #[test]
-    fn epic489_10_v3_v4_canonical_messages_disjoint() {
-        // Cross-version replay protection: an Ed25519 signature on a v3
-        // canonical message MUST NOT verify against the same fields in v4
-        // form (with empty wake_hmac_envelope).  Otherwise a censor could
-        // bump the version byte mid-flight and trick a v4 receiver into
-        // accepting an old-style v3 ad as if it were authenticated for
-        // HMAC wakeup.
-        let kp = generate_keypair(SignatureAlgorithm::Ed25519);
-
-        let v3_canonical = canonical_message_v3(
-            &[0xAA; 32],
-            &[0xBB; 32],
-            &[0xCC; 16],
-            &[0xDD; 32],
-            1_700_000_000,
-            1_700_000_000 + 86_400,
-            &[],
-            &[],
-        );
-        let v3_sig = sign_message(
-            SignatureAlgorithm::Ed25519,
-            &kp.public_key,
-            &kp.private_key,
-            &v3_canonical,
-        )
-        .unwrap();
-
-        let v4_canonical = canonical_message_v4(
-            &[0xAA; 32],
-            &[0xBB; 32],
-            &[0xCC; 16],
-            &[0xDD; 32],
-            1_700_000_000,
-            1_700_000_000 + 86_400,
-            &[],
-            &[],
-            &[],
-        );
-        assert!(
-            verify_message(
-                SignatureAlgorithm::Ed25519,
-                &kp.public_key,
-                &v4_canonical,
-                &v3_sig,
-            )
-            .is_err(),
-            "v3 signature must NOT verify against v4 canonical"
-        );
-    }
-
-    #[test]
-    fn phase650b_316_v2_legacy_decode_under_v3_yields_empty_cap_token() {
-        // Construct a v2 wire blob via encode_body_v2 + canonical_message_v2
-        // then decode under the new decoder. Verify must
-        // succeed using the v2 canonical, and cap_token must be empty.
-        let kp = generate_keypair(SignatureAlgorithm::Ed25519);
-        let envelope = vec![0xEE; 64];
-        let receiver_node_id = coherent_node_id(&kp.public_key);
-        let rendezvous_node_id = [0xBBu8; 32];
-        let auth_cookie = [0xCCu8; 16];
-        let receiver_x25519_pk = [0xDDu8; 32];
-        let valid_from = 1_700_000_000;
-        let valid_until = valid_from + 86_400;
-        let canonical = canonical_message_v2(
-            &receiver_node_id,
-            &rendezvous_node_id,
-            &auth_cookie,
-            &receiver_x25519_pk,
-            valid_from,
-            valid_until,
-            &envelope,
-        );
-        let signature = sign_message(
-            SignatureAlgorithm::Ed25519,
-            &kp.public_key,
-            &kp.private_key,
-            &canonical,
-        )
-        .unwrap();
-        let bytes = encode_body_v2(
-            &receiver_node_id,
-            &rendezvous_node_id,
-            &auth_cookie,
-            &receiver_x25519_pk,
-            valid_from,
-            valid_until,
-            &envelope,
-            kp.public_key.as_bytes(),
-            SignatureAlgorithm::Ed25519,
-            &signature,
-        )
-        .unwrap();
-        let ad = decode_rendezvous_ad(&bytes).unwrap();
-        assert_eq!(ad.wire_version, VERSION_V2);
-        assert!(
-            ad.capability_token.is_empty(),
-            "v2 ads must decode to empty cap_token under slice-2 decoder"
-        );
-        verify_rendezvous_ad(&ad).expect("v2 sig must still verify under slice-2 verifier");
-    }
-
-    #[test]
-    fn v5_v4_legacy_decode_under_v5_yields_empty_kem() {
-        // Construct genuine v4 wire (encode_body_v4 + canonical_message_v4),
-        // then decode under the v5 decoder: verify must succeed via the v4
-        // canonical, and the relay-KEM fields must be empty (no key advertised).
-        let kp = generate_keypair(SignatureAlgorithm::Ed25519);
-        let wake_env = vec![0xEE; 64];
-        let receiver_node_id = coherent_node_id(&kp.public_key);
-        let rendezvous_node_id = [0xBBu8; 32];
-        let auth_cookie = [0xCCu8; 16];
-        let receiver_x25519_pk = [0xDDu8; 32];
-        let valid_from = 1_700_000_000;
-        let valid_until = valid_from + 86_400;
-        let canonical = canonical_message_v4(
-            &receiver_node_id,
-            &rendezvous_node_id,
-            &auth_cookie,
-            &receiver_x25519_pk,
-            valid_from,
-            valid_until,
-            &[],
-            &[],
-            &wake_env,
-        );
-        let signature = sign_message(
-            SignatureAlgorithm::Ed25519,
-            &kp.public_key,
-            &kp.private_key,
-            &canonical,
-        )
-        .unwrap();
-        let bytes = encode_body_v4(
-            &receiver_node_id,
-            &rendezvous_node_id,
-            &auth_cookie,
-            &receiver_x25519_pk,
-            valid_from,
-            valid_until,
-            &[],
-            &[],
-            &wake_env,
-            kp.public_key.as_bytes(),
-            SignatureAlgorithm::Ed25519,
-            &signature,
-        )
-        .unwrap();
-        let ad = decode_rendezvous_ad(&bytes).unwrap();
-        assert_eq!(ad.wire_version, VERSION_V4);
-        assert_eq!(ad.wake_hmac_envelope, wake_env);
-        assert_eq!(ad.rendezvous_kem_algo, RENDEZVOUS_KEM_ALGO_X25519);
-        assert!(
-            ad.rendezvous_kem_pk.is_empty(),
-            "v4 ads must decode to empty relay-KEM under the v5 decoder"
-        );
-        verify_rendezvous_ad(&ad).expect("v4 sig must still verify under the v5 verifier");
-    }
 }
