@@ -364,12 +364,7 @@ pub use veil_types::role_bits;
 
 impl CapabilitiesPayload {
     /// Fixed wire size: 1 byte roles + 1 byte flags + 1 byte discovery_mode.
-    /// Pre-peers send `LEGACY_WIRE_SIZE` (2 bytes); decoder
-    /// defaults the missing `discovery_mode` byte to `Public`.
     pub const WIRE_SIZE: usize = 3;
-    /// backward-compat: pre-474.4 peers send 2 bytes (no
-    /// `discovery_mode`). Decoder accepts both lengths.
-    pub const LEGACY_WIRE_SIZE: usize = 2;
 
     /// Build a capabilities advertisement from a configured `NodeRole`.
     ///
@@ -420,23 +415,18 @@ impl CapabilitiesPayload {
         [self.roles_supported, self.flags, self.discovery_mode]
     }
 
-    /// Parse from a 2- or 3-byte buffer. Pre-peers send 2
-    /// bytes; the missing `discovery_mode` byte defaults to `0` (Public).
+    /// Parse from a 3-byte buffer.
     pub fn decode(buf: &[u8]) -> Result<Self, ProtoError> {
-        if buf.len() < Self::LEGACY_WIRE_SIZE {
+        if buf.len() < Self::WIRE_SIZE {
             return Err(ProtoError::BufferTooShort {
-                need: Self::LEGACY_WIRE_SIZE,
+                need: Self::WIRE_SIZE,
                 got: buf.len(),
             });
         }
         Ok(Self {
             roles_supported: buf[0],
             flags: buf[1],
-            discovery_mode: if buf.len() >= Self::WIRE_SIZE {
-                buf[2]
-            } else {
-                0
-            },
+            discovery_mode: buf[2],
         })
     }
 
@@ -1694,10 +1684,9 @@ pub struct ClientTicketEntry {
 /// so that if two instances of the same sovereign identity (laptop
 /// phone) both hold a resumption ticket, the server can tell them
 /// apart and avoid AEAD nonce reuse when they both reconnect.
-/// Legacy (pre-462.17) tickets carry a 144-byte plaintext; new
-/// tickets carry 160. The decoder accepts both and defaults
-/// `peer_instance_id` to `[0; 16]` on the legacy shape — same
-/// "unspecified" sentinel as the 462.19 mailbox path.
+/// The plaintext is a fixed 160 bytes; a shorter buffer is rejected.
+/// `[0; 16]` remains the "unspecified" sentinel for a single-device
+/// peer — same sentinel as the mailbox path.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionTicket {
     /// Session identifier derived during the handshake.
@@ -1713,7 +1702,7 @@ pub struct SessionTicket {
     /// Unix timestamp (seconds) after which the ticket must not be accepted.
     pub valid_until: u64,
     /// which instance of `peer_id` this ticket was issued
-    /// to. `[0; 16]` = legacy / unspecified (single-device peer).
+    /// to. `[0; 16]` = unspecified (single-device peer).
     /// Non-zero binds the ticket to that specific instance so two
     /// devices under the same identity cannot collide on AEAD nonces
     /// at resumption time.
@@ -2183,20 +2172,6 @@ mod tests {
             discovery_mode: 1, // ContactsOnly
         };
         assert_eq!(CapabilitiesPayload::decode(&p.encode()).unwrap(), p);
-    }
-
-    /// pre-474.4 peers send 2 bytes; decoder defaults
-    /// the missing `discovery_mode` byte to `0` (Public).
-    #[test]
-    fn capabilities_legacy_2byte_decodes_as_public() {
-        let legacy = [role_bits::CORE, cap_flags::CAN_RELAY];
-        let decoded = CapabilitiesPayload::decode(&legacy).unwrap();
-        assert_eq!(decoded.roles_supported, role_bits::CORE);
-        assert_eq!(decoded.flags, cap_flags::CAN_RELAY);
-        assert_eq!(
-            decoded.discovery_mode, 0,
-            "missing byte must default to Public"
-        );
     }
 
     /// (Variant C): unknown `discovery_mode` byte must
