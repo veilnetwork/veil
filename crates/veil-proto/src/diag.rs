@@ -283,7 +283,6 @@ impl DiagTraceHopPayload {
         buf
     }
 
-    /// Parse a trace-hop payload. Accepts both the current 78-byte layout and
     /// Parse a trace-hop payload. The full layout is required.
     pub fn decode(b: &[u8]) -> Result<Self, ProtoError> {
         if b.len() < Self::SIZE {
