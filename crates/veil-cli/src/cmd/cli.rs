@@ -1228,24 +1228,15 @@ pub enum UpdateCommand {
     /// `veil-cli node restart`, or stop-and-respawn) — the new binary takes
     /// effect on the next start. Does nothing if no update is available.
     Apply {
-        /// Authorize a one-time migration from a LEGACY (pre-authentication,
-        /// no-MAC) installed-version file to the MAC-authenticated form.
+        /// Apply the update even though the anti-downgrade state file cannot
+        /// be MAC-authenticated, because this host has no Ed25519 identity.
         ///
-        /// Off by default: a keyed store that finds an unauthenticated record
-        /// now refuses to adopt it, because a local writer who can reach the
-        /// state file but not your identity key could strip the MAC to re-open
-        /// the anti-downgrade window. Pass this flag once, on a host you trust,
-        /// to upgrade a genuine pre-existing legacy file.
+        /// Off by default: without a key a local writer who can reach the
+        /// state file could lower the anti-downgrade floor and replay an older
+        /// signed release. Prefer creating an identity; pass this only on a
+        /// host that genuinely has none.
         #[arg(long)]
-        allow_legacy_state_migration: bool,
-        /// Operator-asserted anti-downgrade floor (unix seconds) for the legacy
-        /// migration above. The unauthenticated state file's OWN value is NOT
-        /// trusted; pass the lowest release_unix you know this host legitimately
-        /// reached, so a tampered/lowered file cannot wave through an older
-        /// signed manifest. Omit to accept the verified manifest as the new
-        /// baseline.
-        #[arg(long)]
-        migrate_min_release_unix: Option<u64>,
+        allow_unauthenticated_state: bool,
     },
     /// Build and sign an update manifest for a freshly built binary.
     ///
