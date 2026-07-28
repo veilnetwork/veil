@@ -1,5 +1,93 @@
 # Changelog
 
+## v0.4.0 — 2026-07-28
+
+Feature release with security fixes. Two API changes make this a minor bump on
+the 0.x line rather than a patch.
+
+### Security
+
+An audit of the transport, session and mesh layers found six defects. All are
+fixed here, each with a regression test verified against the broken code.
+
+- **Media injected into an encrypted call.** `dispatch_inbound_auto` decided
+  whether a leg was encrypted from the packet's own leading bytes: anything not
+  carrying the seal took the legacy passthrough straight to the receive
+  callback. The relay path deliberately does not re-wrap media in a fresh
+  ML-KEM envelope, so on that leg the seal is the only thing authenticating the
+  sender, and the sender id on the Forward frame is not authenticated — anyone
+  on the call path could drop raw RTP into a live call, past both the AEAD and
+  the replay window. The cipher is now resolved from the registry before the
+  branch, so the decision comes from our own state. Channels with no keys keep
+  the legacy ingress unchanged.
+- **Unbounded broadcast dedup set.** `BROADCAST_SEEN_CAP` gated the TTL sweep
+  but never the insert, so a peer minting distinct keys faster than the 10 s TTL
+  expired them grew the map without limit — and the O(n) sweep then ran on every
+  frame while holding the dispatcher's route-cache write lock. The cap now
+  evicts, batched so the scan amortises to O(1) per frame.
+- **Reassembly fairness quota defeated two ways.** The per-sender caps were
+  checked only when a transfer was created, so a sender could open its full slot
+  allowance with 1-byte chunks and then grow each transfer until it owned the
+  whole 64 MiB budget; and the quota was keyed on `sender_node_id`, a cleartext
+  field of a relayed envelope. Byte quotas now bind on every insertion, and a
+  second, deliberately looser quota is keyed on the authenticated previous hop.
+- **Signed beacons were replayable for the skew window.** Accepting a beacon
+  ends in an unconditional re-register of the source's link at the datagram's
+  source address, and the only guard was a per-source rate window. A
+  byte-identical capture re-sent from another address repointed the victim's
+  link at the replayer for up to 120 s. Signed beacons now carry their
+  authenticated content in a replay set for exactly that window.
+- **Beacon per-subnet slot cap could stay stuck.** It refused a new address
+  without first sweeping expired slots, unlike the global cap beside it, so an
+  attacker holding 64 addresses in one /24 locked out every new address from
+  that subnet — on a LAN mesh, that is the legitimate neighbours.
+- **FFI handle generation escaped its field.** The slot counter is a `u32` but
+  the token carries only 16 generation bits on 32-bit hosts, so after 65535
+  reuses of one slot every token that slot issued failed validation for good.
+
+### Added
+
+- Anonymous sends spread a fragmented by-identity transfer across a service's
+  own provider slots, and `AuthAppDeliver` can carry several reply blocks so a
+  fragmented reply can spread too. Together these lift the single-relay ceiling
+  on shared-folder throughput.
+- Managed packet tunnels for Android, Apple, Windows and Linux, per-application
+  VPN routing on Android, and oproxy failover preserved through the Apple
+  tunnel.
+- Explicit call-path hole punching with typed outcomes, direct-session
+  re-establishment on network change, and tolerance for coordinators that
+  predate punch tokens.
+- Signed public-space DHT records; macOS window sharing; mid-call video bitrate
+  retuning with sender-leg metrics.
+
+### Changed
+
+- **Breaking:** `AuthAppDeliver.reply_block: Option<ReplyBlock>` is now
+  `reply_blocks: Vec<ReplyBlock>`. The presence byte became a count, so the
+  encodings for zero and one block are byte-identical to before; only a genuine
+  multi-block envelope differs. Capped at decode.
+- **Breaking:** `EnvelopeChunkReassembler::add` takes the authenticated peer id.
+- Relay entry verification and anonymous-send resolution are cached, and a
+  stored record's signature is no longer verified twice.
+- The Linux VPN helper validates its config by open handle rather than by path,
+  and `O_NOFOLLOW` refuses a symlink at that path. It runs as root under pkexec
+  while the path lives in a directory the invoking user controls, so the
+  previous stat-then-read let that user swap what the two calls saw.
+
+### Fixed
+
+- SOCKS dialing is bounded so a silent proxy cannot wedge peer dialing, and the
+  RTT probe table is bounded against growth from inbound frames.
+- The Falcon private key is kept out of logs and freed memory.
+- A service no longer resolves its own registration when it is the host.
+- Assorted media and mobile-lifecycle fixes: ADM capture start failures are
+  surfaced on both paths, stale realtime stream fallback is bounded, older
+  packet-sizing ABIs are tolerated, dynamic-lookup imports stay out of the macOS
+  dylib exports, and the QR scanner moved to Apple Vision.
+
+`veilclient-ffi` remains on its independent 0.4.x ABI line, `veil-onion-stream`
+on its 0.1.x line and `veil-vpn-helper` on its 0.1.x line.
+
 ## v0.3.1 — 2026-07-16
 
 Corrective release. The v0.3.0 tag accidentally omitted a signed feature tail
