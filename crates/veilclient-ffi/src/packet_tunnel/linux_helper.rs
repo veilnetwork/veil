@@ -9,9 +9,9 @@
 
 use std::ffi::OsStr;
 use std::fs;
-use std::io::{self, BufRead, Write};
+use std::io::{self, BufRead, Read, Write};
 use std::net::IpAddr;
-use std::os::unix::fs::MetadataExt;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::str::FromStr;
@@ -307,8 +307,21 @@ fn invoked_uid() -> Result<u32, String> {
 
 fn load_config(path: &Path) -> Result<HelperConfig, String> {
     let uid = invoked_uid()?;
-    let metadata =
-        fs::symlink_metadata(path).map_err(|error| format!("read config metadata: {error}"))?;
+    // Validate the OPEN FILE, not the path. This helper runs as root via
+    // pkexec while `path` sits in a directory the invoking (unprivileged) user
+    // controls, so checking `symlink_metadata(path)` and then reading `path`
+    // again let that user swap what the two calls saw: the ownership, type,
+    // size and mode gate applied to one file while a different one was read.
+    // One `open` plus `fstat` on the resulting handle closes the window, and
+    // `O_NOFOLLOW` refuses a symlink planted at the path itself.
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+        .map_err(|error| format!("open helper config: {error}"))?;
+    let metadata = file
+        .metadata()
+        .map_err(|error| format!("read config metadata: {error}"))?;
     if !metadata.file_type().is_file()
         || metadata.len() > MAX_CONFIG_BYTES
         || metadata.uid() != uid
@@ -316,7 +329,15 @@ fn load_config(path: &Path) -> Result<HelperConfig, String> {
     {
         return Err("unsafe helper config ownership, type, size, or mode".to_owned());
     }
-    let bytes = fs::read(path).map_err(|error| format!("read helper config: {error}"))?;
+    // Bound the read by the same limit rather than trusting the size we just
+    // stat'ed: the file is still writable by its owner while we hold it open.
+    let mut bytes = Vec::new();
+    file.take(MAX_CONFIG_BYTES.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .map_err(|error| format!("read helper config: {error}"))?;
+    if bytes.len() as u64 > MAX_CONFIG_BYTES {
+        return Err("unsafe helper config ownership, type, size, or mode".to_owned());
+    }
     let _ = fs::remove_file(path);
     serde_json::from_slice(&bytes).map_err(|error| format!("parse helper config: {error}"))
 }
