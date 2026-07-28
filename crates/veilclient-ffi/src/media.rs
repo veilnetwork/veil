@@ -541,11 +541,15 @@ pub fn dispatch_inbound_batch(peer: [u8; 32], body: &[u8]) {
 /// the batch unfolds on the receiving endpoint.
 pub fn dispatch_inbound_auto(peer: [u8; 32], payload: &[u8]) {
     let plaintext;
+    // Resolve the channel's cipher BEFORE looking at the packet, so the
+    // decision "is this leg encrypted" comes from OUR state and not from
+    // bytes the sender chose.
+    let cipher = {
+        let map = RECV.lock().unwrap_or_else(|p| p.into_inner());
+        map.get(&peer).map(|entry| Arc::clone(&entry.cipher))
+    };
     let payload = if payload.starts_with(&MEDIA_SEALED_MAGIC) {
-        let Some(cipher) = ({
-            let map = RECV.lock().unwrap_or_else(|p| p.into_inner());
-            map.get(&peer).map(|entry| Arc::clone(&entry.cipher))
-        }) else {
+        let Some(cipher) = cipher else {
             return;
         };
         let Some(opened) = cipher.open(payload) else {
@@ -553,7 +557,19 @@ pub fn dispatch_inbound_auto(peer: [u8; 32], payload: &[u8]) {
         };
         plaintext = opened;
         plaintext.as_slice()
+    } else if cipher.as_deref().is_some_and(MediaCipher::enabled) {
+        // FAIL CLOSED once E2E keys are configured for this peer. The relay
+        // path deliberately does NOT re-wrap the payload in a fresh ML-KEM
+        // envelope (IPC_SEND_FLAG_RELAY_MEDIA_SEALED), so the seal is the
+        // ONLY thing authenticating the sender on this leg — and the
+        // `sender_node_id` carried by the Forward frame is not authenticated.
+        // Branching on the magic alone let anyone on the path drop a raw RTP
+        // datagram into a live call, past both the AEAD and the replay
+        // window.
+        return;
     } else {
+        // No keys on this channel: the legacy ML-KEM-per-envelope / direct /
+        // onion ingress stays exactly as before.
         payload
     };
     if payload.first() == Some(&MEDIA_BATCH_MAGIC) {
@@ -682,6 +698,66 @@ mod tests {
         dispatch_inbound(peer, &[0u8; 40]);
         assert_eq!(RX_CALLS.load(Ordering::SeqCst), 1, "live chan survives");
         clear_recv_callback(peer, 10);
+    }
+
+    #[test]
+    fn encrypted_channel_drops_unsealed_media() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let sealed_peer = [0x71u8; 32];
+        let clear_peer = [0x72u8; 32];
+        RX_CALLS.store(0, Ordering::SeqCst);
+
+        // A channel that HAS negotiated media keys.
+        let cipher = Arc::new(MediaCipher::default());
+        cipher.configure([0x41u8; 32], [0x41u8; 32]);
+        set_recv_callback(
+            sealed_peer,
+            1,
+            record,
+            std::ptr::null_mut(),
+            Arc::clone(&cipher),
+        );
+
+        // The sender id on a relayed Forward frame is NOT authenticated, and
+        // the relay path does not re-wrap media in an ML-KEM envelope, so the
+        // seal is the only thing proving who sent this. Branching on the magic
+        // alone would let anyone on the path inject raw RTP into a live call,
+        // past both the AEAD and the replay window.
+        dispatch_inbound_auto(sealed_peer, &[0u8; 100]);
+        assert_eq!(
+            RX_CALLS.load(Ordering::SeqCst),
+            0,
+            "unsealed payload must not reach an encrypted channel"
+        );
+
+        // Injection that merely LOOKS sealed is refused by the AEAD.
+        let mut forged = MEDIA_SEALED_MAGIC.to_vec();
+        forged.extend_from_slice(&[0u8; 100]);
+        dispatch_inbound_auto(sealed_peer, &forged);
+        assert_eq!(RX_CALLS.load(Ordering::SeqCst), 0, "forged seal refused");
+
+        // ...and the genuine sealed path still delivers.
+        let good = cipher.seal(&[7u8; 100]).expect("cipher is configured");
+        dispatch_inbound_auto(sealed_peer, &good);
+        assert_eq!(RX_CALLS.load(Ordering::SeqCst), 1, "sealed media delivers");
+        clear_recv_callback(sealed_peer, 1);
+
+        // A channel with NO keys keeps the legacy ML-KEM-per-envelope /
+        // direct / onion ingress: fail-closed must not break it.
+        set_recv_callback(
+            clear_peer,
+            2,
+            record,
+            std::ptr::null_mut(),
+            Arc::new(MediaCipher::default()),
+        );
+        dispatch_inbound_auto(clear_peer, &[0u8; 100]);
+        assert_eq!(
+            RX_CALLS.load(Ordering::SeqCst),
+            2,
+            "channel without keys still accepts cleartext media"
+        );
+        clear_recv_callback(clear_peer, 2);
     }
 
     #[test]
