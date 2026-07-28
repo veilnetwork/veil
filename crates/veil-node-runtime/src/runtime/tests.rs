@@ -46,6 +46,53 @@ fn provider_test_ad(tag: u8) -> veil_anonymity::rendezvous::RendezvousAd {
 }
 
 #[test]
+fn spread_never_mixes_ads_from_different_providers() {
+    // The killer case: a fragmented message round-robined across ads belonging
+    // to DIFFERENT nodes would scatter its fragments, and no node would ever
+    // hold the whole thing. Only slots of the SAME node are introduction
+    // points to one service instance.
+    let mine = provider_test_ad(7);
+    let mut my_second_slot = provider_test_ad(7);
+    my_second_slot.rendezvous_node_id = [0x99; 32];
+    let other_provider = provider_test_ad(40);
+
+    let ads = vec![mine.clone(), other_provider.clone(), my_second_slot.clone()];
+    let extras = NodeServices::same_node_extra_ads(&ads, &mine);
+
+    assert_eq!(extras.len(), 1, "only the same node's other slot");
+    assert_eq!(extras[0].rendezvous_node_id, my_second_slot.rendezvous_node_id);
+    assert!(
+        !extras
+            .iter()
+            .any(|e| e.receiver_node_id == other_provider.receiver_node_id),
+        "another provider must never become a spread target",
+    );
+}
+
+#[test]
+fn spread_skips_the_primary_relay_and_duplicate_relays() {
+    // The primary is already the send's own target, and two ads naming one
+    // relay are one introduction point — counting either again would inflate
+    // the relay list without adding an independent path.
+    let primary = provider_test_ad(3);
+    let duplicate_relay = primary.clone();
+    let mut second_slot = provider_test_ad(3);
+    second_slot.rendezvous_node_id = [0x55; 32];
+    let mut third_slot_same_relay = provider_test_ad(3);
+    third_slot_same_relay.rendezvous_node_id = [0x55; 32];
+
+    let ads = vec![
+        primary.clone(),
+        duplicate_relay,
+        second_slot,
+        third_slot_same_relay,
+    ];
+    let extras = NodeServices::same_node_extra_ads(&ads, &primary);
+    assert_eq!(extras.len(), 1);
+    assert_eq!(extras[0].rendezvous_node_id, [0x55; 32]);
+}
+
+#[test]
 fn capability_provider_candidates_are_bounded_and_nonce_rotated() {
     let ads: Vec<_> = (0..6).map(provider_test_ad).collect();
     let selected = NodeServices::select_rendezvous_candidates(&ads, b"request-a", 3);
