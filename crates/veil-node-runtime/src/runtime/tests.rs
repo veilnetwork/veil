@@ -60,7 +60,10 @@ fn spread_never_mixes_ads_from_different_providers() {
     let extras = NodeServices::same_node_extra_ads(&ads, &mine);
 
     assert_eq!(extras.len(), 1, "only the same node's other slot");
-    assert_eq!(extras[0].rendezvous_node_id, my_second_slot.rendezvous_node_id);
+    assert_eq!(
+        extras[0].rendezvous_node_id,
+        my_second_slot.rendezvous_node_id
+    );
     assert!(
         !extras
             .iter()

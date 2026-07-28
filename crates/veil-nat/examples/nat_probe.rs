@@ -55,7 +55,8 @@ async fn sweep(
     // Re-query the first reflector to confirm the mapping is stable in time,
     // not merely identical across destinations.
     if let Some(first) = reflectors.first() {
-        let again = discover_udp_mapping(&socket, *first, token(0xEE), Duration::from_secs(2)).await?;
+        let again =
+            discover_udp_mapping(&socket, *first, token(0xEE), Duration::from_secs(2)).await?;
         match again {
             Some(mapped) => println!("{label} recheck reflector={first} mapped={mapped}"),
             None => println!("{label} recheck reflector={first} mapped=NONE"),

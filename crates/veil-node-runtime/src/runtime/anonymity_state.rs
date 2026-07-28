@@ -745,9 +745,7 @@ impl AnonymityState {
             rendezvous_publisher_entries: Arc::new(Mutex::new(Vec::new())),
             rendezvous_resolve_cache: Arc::new(RendezvousResolveCache::new()),
             onion_resolve_cache: Arc::new(RendezvousResolveCache::new()),
-            relay_entry_verify_cache: Arc::new(
-                veil_anonymity::directory::VerifiedEntryCache::new(),
-            ),
+            relay_entry_verify_cache: Arc::new(veil_anonymity::directory::VerifiedEntryCache::new()),
             stream_relay_directory_warm_lock: Arc::new(tokio::sync::Mutex::new(())),
             relay_reputation: Arc::new(RelayReputation::new()),
             reply_block_store: Arc::new(ReplyBlockStore::new()),

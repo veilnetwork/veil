@@ -2663,7 +2663,6 @@ pub fn current_outbound_batch_window(battery_pct: u8) -> Option<std::time::Durat
     Some(std::time::Duration::from_millis(ms as u64))
 }
 
-
 /// Set the session-rotation **range** (seconds).  Each new session
 /// draws a deadline uniformly from `[min, max]`.  Passing `(0, 0)`
 /// disables rotation entirely.  Both values are clamped UP to

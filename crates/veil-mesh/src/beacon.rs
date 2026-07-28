@@ -866,8 +866,7 @@ impl BeaconReceiver {
             // Bound the map the same way `dedup_seen` is bounded: sweep by TTL
             // at capacity, then evict the single oldest if that frees nothing.
             if self.replay_seen.len() >= veil_proto::budget::MAX_BEACON_DEDUP_ENTRIES {
-                self.replay_seen
-                    .retain(|_, t| now.duration_since(*t) < ttl);
+                self.replay_seen.retain(|_, t| now.duration_since(*t) < ttl);
                 if self.replay_seen.len() >= veil_proto::budget::MAX_BEACON_DEDUP_ENTRIES
                     && let Some(oldest) = self
                         .replay_seen
