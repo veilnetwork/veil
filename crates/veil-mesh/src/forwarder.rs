@@ -60,6 +60,26 @@ impl BroadcastSeenSet {
         if self.entries.len() >= BROADCAST_SEEN_CAP {
             let ttl = BROADCAST_SEEN_TTL.as_duration();
             self.entries.retain(|_, t| now.duration_since(*t) < ttl);
+            if self.entries.len() >= BROADCAST_SEEN_CAP {
+                // The TTL sweep frees NOTHING while a peer mints distinct keys
+                // faster than they expire, and the insert below is
+                // unconditional — so the cap was advisory and the real bound
+                // was "distinct frames per TTL", which the peer picks. Both
+                // halves of the key (`src_node_id`, `payload`) are raw wire
+                // fields the forwarder never binds to the session identity.
+                // Evict the oldest eighth in ONE pass so the scan amortises to
+                // O(1) per frame instead of re-running the full retain on every
+                // frame while saturated (this runs under the dispatcher's
+                // route-cache write lock).
+                let drop_count = (BROADCAST_SEEN_CAP / 8).max(1);
+                let mut times: Vec<Instant> = self.entries.values().copied().collect();
+                // `cutoff` is the drop_count-th oldest; dropping everything at
+                // or below it removes at least `drop_count` entries, so this
+                // always makes progress even if the clock ties.
+                times.select_nth_unstable(drop_count - 1);
+                let cutoff = times[drop_count - 1];
+                self.entries.retain(|_, t| *t > cutoff);
+            }
         }
         if let Some(t) = self.entries.get(&key)
             && now.duration_since(*t) < BROADCAST_SEEN_TTL.as_duration()
@@ -500,6 +520,41 @@ mod tests {
             ForwardResult::Dropped,
             "duplicate broadcast must be dropped"
         );
+    }
+
+    /// The dedup set is bounded even when nothing in it has expired.
+    #[test]
+    fn broadcast_seen_set_is_bounded_under_fresh_floods() {
+        use veil_proto::mesh::BROADCAST_NODE_ID;
+        let mut seen = BroadcastSeenSet::default();
+        // Every frame is distinct and none of them expires during the loop, so
+        // the TTL sweep can free nothing — the cap has to do the bounding.
+        for i in 0..(BROADCAST_SEEN_CAP + BROADCAST_SEEN_CAP / 4) {
+            let f = MeshFrame::new(
+                RealmId([0u8; 16]),
+                [0xAAu8; 32],
+                BROADCAST_NODE_ID,
+                2,
+                i.to_le_bytes().to_vec(),
+            );
+            assert!(!seen.check_and_insert(&f), "distinct frames are not dupes");
+        }
+        assert!(
+            seen.entries.len() <= BROADCAST_SEEN_CAP,
+            "seen set grew past its cap: {}",
+            seen.entries.len()
+        );
+        // Eviction must not have cost the set its actual job: a frame inserted
+        // after the last eviction is still recognised as a duplicate.
+        let recent = MeshFrame::new(
+            RealmId([0u8; 16]),
+            [0xAAu8; 32],
+            BROADCAST_NODE_ID,
+            2,
+            b"recent".to_vec(),
+        );
+        assert!(!seen.check_and_insert(&recent), "first sighting is new");
+        assert!(seen.check_and_insert(&recent), "second sighting is a dupe");
     }
 
     /// Different broadcasts from same source are NOT deduped.
