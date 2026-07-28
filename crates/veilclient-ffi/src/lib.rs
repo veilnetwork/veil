@@ -242,8 +242,8 @@ impl Drop for RuntimeBundle {
 //
 // Residual: the generation is `u32` on 64-bit hosts (16-bit on 32-bit hosts,
 // where the token itself is only 32 bits wide). After 2^32 (resp. 2^16) reuses
-// of the SAME slot the generation wraps and ABA could in principle recur for
-// that one slot. On 64-bit this is unreachable in practice; on legacy 32-bit
+// of the SAME slot the generation wraps WITHIN ITS FIELD (see
+// `bump_generation`) and ABA could in principle recur for that one slot. On 64-bit this is unreachable in practice; on legacy 32-bit
 // hosts it is a far smaller window than the unconditional address-reuse ABA it
 // replaces. Modern iOS/Android are 64-bit.
 
@@ -255,6 +255,21 @@ const HANDLE_INDEX_BITS: u32 = 32;
 #[cfg(not(target_pointer_width = "64"))]
 const HANDLE_INDEX_BITS: u32 = 16;
 const HANDLE_INDEX_MASK: usize = (1usize << HANDLE_INDEX_BITS) - 1;
+/// Widest generation the TOKEN can carry. On 64-bit this is the full `u32`, so
+/// nothing changes; on 32-bit the field is only 16 bits wide while the slot's
+/// counter is a `u32`, and bumping the counter at full `u32` width pushed it
+/// past what a token can express — the token a fresh insert handed out then
+/// carried `generation & 0xFFFF` while validation compared the full counter,
+/// so every handle from that slot failed for good. That is a functional break
+/// of the slot, not the ABA residual documented above.
+const HANDLE_GENERATION_MASK: u32 = u32::MAX >> (32 - (usize::BITS - HANDLE_INDEX_BITS));
+
+/// Next generation for a slot, kept inside the token's field and never zero
+/// (an all-zero token would collide with NULL).
+const fn bump_generation(current: u32, mask: u32) -> u32 {
+    let next = current.wrapping_add(1) & mask;
+    if next == 0 { 1 } else { next }
+}
 
 struct HandleSlot<T> {
     /// Generation of the value CURRENTLY occupying this slot. Bumped on every
@@ -338,13 +353,10 @@ impl<T> HandleTable<T> {
             return None;
         }
         let taken = slot.value.take();
-        // Bump generation, keeping it nonzero so encoded tokens never collide
-        // with NULL. wrapping_add handles the (practically unreachable on
-        // 64-bit) overflow; skip 0 on wrap.
-        slot.generation = slot.generation.wrapping_add(1);
-        if slot.generation == 0 {
-            slot.generation = 1;
-        }
+        // Bump generation, keeping it nonzero (so encoded tokens never collide
+        // with NULL) and inside the token's generation field (so the token a
+        // later insert hands out can still match this slot).
+        slot.generation = bump_generation(slot.generation, HANDLE_GENERATION_MASK);
         t.free.push(index);
         taken
     }
@@ -9347,6 +9359,37 @@ mod tests {
     /// must NOT let the old (stale) token address the new handle. The bumped
     /// per-slot generation makes the two tokens distinct and the stale one
     /// invalid — the property the prior address-keyed registry could not give.
+    /// A bumped generation must always still fit the token that carries it.
+    ///
+    /// This host is 64-bit, where the token splits 32/32 and the counter and
+    /// the field are the same width — so the end-to-end path CANNOT be
+    /// exercised here. The 32-bit split (16/16) is the broken one: bumping the
+    /// `u32` counter at full width walked it past the 16-bit field, and from
+    /// then on every token that slot handed out carried `generation & 0xFFFF`
+    /// while validation compared the whole counter, so the slot's handles
+    /// failed permanently. The rule is checked at BOTH splits.
+    #[test]
+    fn a_bumped_generation_always_fits_the_token_field() {
+        for &mask in &[0xFFFFu32, u32::MAX] {
+            let mut generation = 1u32;
+            for _ in 0..4 {
+                generation = bump_generation(generation, mask);
+                assert!(generation <= mask, "generation {generation} left field {mask:#x}");
+                assert_ne!(generation, 0, "an all-zero token would look like NULL");
+            }
+            // At the top of the field it must wrap back INSIDE the field.
+            let wrapped = bump_generation(mask, mask);
+            assert!(wrapped <= mask, "wrap left the field: {wrapped:#x} > {mask:#x}");
+            assert_ne!(wrapped, 0);
+        }
+        // On this target the mask must leave the index bits alone.
+        assert_eq!(
+            HANDLE_GENERATION_MASK as usize & HANDLE_INDEX_MASK,
+            HANDLE_INDEX_MASK.min(HANDLE_GENERATION_MASK as usize),
+            "generation field and index field must not be mis-sized"
+        );
+    }
+
     #[test]
     fn handle_table_generation_defeats_aba() {
         let table = StdMutex::new(HandleTable::<u64>::new());
