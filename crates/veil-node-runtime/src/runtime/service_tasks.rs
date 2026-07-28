@@ -4946,12 +4946,7 @@ mod tests {
             let fwd = ForwardPayload::decode(&retried[veil_proto::HEADER_SIZE..]).unwrap();
             assert_ne!(fwd.envelope.content_id, [index as u8 + 1; 32]);
             let chunk = ChunkedEnvelopePayload::decode(&fwd.envelope.payload).unwrap();
-            match reassembler.add(
-                &fwd.envelope,
-                fwd.envelope.sender_node_id,
-                chunk,
-                101,
-            ) {
+            match reassembler.add(&fwd.envelope, fwd.envelope.sender_node_id, chunk, 101) {
                 AddChunkResult::Complete(envelope) => {
                     completed += 1;
                     assert_eq!(envelope.content_id, original_id);

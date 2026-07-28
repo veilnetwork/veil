@@ -190,8 +190,7 @@ impl FrameDispatcher {
                         // otherwise silently strip it from the initiator's
                         // request and break the end-to-end punch handshake for
                         // every newer pair it coordinates.
-                        let frame =
-                            build_control_frame(ControlMsg::NatProbeRequest as u16, body);
+                        let frame = build_control_frame(ControlMsg::NatProbeRequest as u16, body);
                         let prio = veil_proto::header::priority::INTERACTIVE;
                         let direct = guard.send_to(&request.target_node_id, prio, frame.clone());
                         let routed_hop = cached_hop.filter(|hop| {
@@ -396,8 +395,7 @@ impl FrameDispatcher {
                             // re-encode by an older coordinator build would
                             // drop the responder's punch-token echo and the
                             // initiator would abort the punch as unauthenticated.
-                            let frame =
-                                build_control_frame(ControlMsg::NatProbeReply as u16, body);
+                            let frame = build_control_frame(ControlMsg::NatProbeReply as u16, body);
                             let prio = veil_proto::header::priority::INTERACTIVE;
                             let direct =
                                 guard.send_to(&reply.final_target_node_id, prio, frame.clone());

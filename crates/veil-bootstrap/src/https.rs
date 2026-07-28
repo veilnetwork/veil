@@ -232,7 +232,6 @@ impl BootstrapHttpsPolicy {
             trusted_issuer_pubkey: None,
         }
     }
-
 }
 
 /// Fetch and parse bootstrap peers from `url`, applying `policy` to
@@ -1025,7 +1024,7 @@ mod tests {
         let raw_json = crate::seeds::encode_bootstrap_bundle(&peers).unwrap();
         for policy in [
             BootstrapHttpsPolicy::signed_preferred(),
-            BootstrapHttpsPolicy::signed_required("00" .repeat(32).as_str()),
+            BootstrapHttpsPolicy::signed_required("00".repeat(32).as_str()),
         ] {
             assert!(matches!(
                 decode_with_policy(&raw_json, &policy),
@@ -1035,8 +1034,7 @@ mod tests {
         // A signed bundle still decodes under the unpinned policy.
         let (signed_body, _) = fresh_signed_bundle(&peers);
         assert_eq!(
-            decode_with_policy(&signed_body, &BootstrapHttpsPolicy::signed_preferred())
-                .unwrap(),
+            decode_with_policy(&signed_body, &BootstrapHttpsPolicy::signed_preferred()).unwrap(),
             peers
         );
     }

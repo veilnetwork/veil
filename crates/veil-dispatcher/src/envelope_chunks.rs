@@ -660,7 +660,12 @@ mod tests {
             // MAX_TRANSFERS_PER_SENDER permanently out of reach.
             assert!(
                 matches!(
-                    r.add(&carrier_from([i as u8; 32]), peer, chunk(tid, 0, 2, 4, vec![1, 2]), 0),
+                    r.add(
+                        &carrier_from([i as u8; 32]),
+                        peer,
+                        chunk(tid, 0, 2, 4, vec![1, 2]),
+                        0
+                    ),
                     AddChunkResult::Pending
                 ),
                 "transfer {i} must be admitted below the per-peer cap"

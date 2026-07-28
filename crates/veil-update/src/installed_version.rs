@@ -193,9 +193,7 @@ impl InstalledVersionStore {
     ///   under a keyed store means someone stripped the mac, and adopting it
     ///   would re-open the anti-downgrade window.
     /// * no file → `None` (fresh install).
-    pub fn read_release_unix_for_apply(
-        &self,
-    ) -> Result<Option<u64>, InstalledVersionError> {
+    pub fn read_release_unix_for_apply(&self) -> Result<Option<u64>, InstalledVersionError> {
         match std::fs::read(&self.path) {
             Ok(bytes) => {
                 let rec: InstalledVersionRecord = serde_json::from_slice(&bytes)

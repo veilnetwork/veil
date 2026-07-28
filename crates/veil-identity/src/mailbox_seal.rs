@@ -480,8 +480,15 @@ mod tests {
         let sender_id = *sov.node_id();
         let (cert, recipient_id, instance, dk_seed) = recipient();
 
-        let auth =
-            sov.sign_auth_deliver(recipient_id, [0xCCu8; 32], 9, NOW, 7, b"x".to_vec(), Vec::new());
+        let auth = sov.sign_auth_deliver(
+            recipient_id,
+            [0xCCu8; 32],
+            9,
+            NOW,
+            7,
+            b"x".to_vec(),
+            Vec::new(),
+        );
         let mut blob =
             seal_mailbox_blob(&auth, &cert, &sender_id, &recipient_id, &sov.document).unwrap();
         // Flip a byte well inside the sidecar fan-out blob's interior.
@@ -503,8 +510,15 @@ mod tests {
         let sender_id = *sov.node_id();
         let (cert, recipient_id, instance, dk_seed) = recipient();
 
-        let auth =
-            sov.sign_auth_deliver(recipient_id, [0xCCu8; 32], 9, NOW, 1, b"x".to_vec(), Vec::new());
+        let auth = sov.sign_auth_deliver(
+            recipient_id,
+            [0xCCu8; 32],
+            9,
+            NOW,
+            1,
+            b"x".to_vec(),
+            Vec::new(),
+        );
         let blob =
             seal_mailbox_blob(&auth, &cert, &sender_id, &recipient_id, &sov.document).unwrap();
 
@@ -530,8 +544,15 @@ mod tests {
         let sender_id = *sov.node_id();
         let (cert, recipient_id, _instance, dk_seed) = recipient();
 
-        let auth =
-            sov.sign_auth_deliver(recipient_id, [0xCCu8; 32], 9, NOW, 1, b"x".to_vec(), Vec::new());
+        let auth = sov.sign_auth_deliver(
+            recipient_id,
+            [0xCCu8; 32],
+            9,
+            NOW,
+            1,
+            b"x".to_vec(),
+            Vec::new(),
+        );
         let blob =
             seal_mailbox_blob(&auth, &cert, &sender_id, &recipient_id, &sov.document).unwrap();
 
@@ -556,8 +577,15 @@ mod tests {
         let sender_id = *sov.node_id();
         let (cert, recipient_id, instance, dk_seed) = recipient();
 
-        let auth =
-            sov.sign_auth_deliver(recipient_id, [0xCCu8; 32], 9, NOW, 1, b"x".to_vec(), Vec::new());
+        let auth = sov.sign_auth_deliver(
+            recipient_id,
+            [0xCCu8; 32],
+            9,
+            NOW,
+            1,
+            b"x".to_vec(),
+            Vec::new(),
+        );
         let mut blob =
             seal_mailbox_blob(&auth, &cert, &sender_id, &recipient_id, &sov.document).unwrap();
         // Flip a byte at the tail (inside the AEAD ciphertext) → AEAD auth fails.
@@ -588,8 +616,15 @@ mod tests {
         let sender_id = *sov.node_id();
         let (cert, recipient_id, instance, dk_seed) = recipient();
 
-        let auth =
-            sov.sign_auth_deliver(recipient_id, [0xCCu8; 32], 9, NOW, 5, b"hi".to_vec(), Vec::new());
+        let auth = sov.sign_auth_deliver(
+            recipient_id,
+            [0xCCu8; 32],
+            9,
+            NOW,
+            5,
+            b"hi".to_vec(),
+            Vec::new(),
+        );
         let blob =
             seal_mailbox_blob(&auth, &cert, &sender_id, &recipient_id, &sov.document).unwrap();
 
@@ -637,8 +672,15 @@ mod tests {
         let sender_id = *sov.node_id();
         let (cert, recipient_id, instance, dk_seed) = recipient();
 
-        let auth =
-            sov.sign_auth_deliver(recipient_id, [0xCCu8; 32], 9, NOW, 6, b"x".to_vec(), Vec::new());
+        let auth = sov.sign_auth_deliver(
+            recipient_id,
+            [0xCCu8; 32],
+            9,
+            NOW,
+            6,
+            b"x".to_vec(),
+            Vec::new(),
+        );
         let mut blob =
             seal_mailbox_blob(&auth, &cert, &sender_id, &recipient_id, &sov.document).unwrap();
 
@@ -671,8 +713,15 @@ mod tests {
         let sender_id = *sov.node_id();
         let (cert, recipient_id, _instance, dk_seed) = recipient();
 
-        let auth =
-            sov.sign_auth_deliver(recipient_id, [0xCCu8; 32], 9, NOW, 7, b"x".to_vec(), Vec::new());
+        let auth = sov.sign_auth_deliver(
+            recipient_id,
+            [0xCCu8; 32],
+            9,
+            NOW,
+            7,
+            b"x".to_vec(),
+            Vec::new(),
+        );
         let blob =
             seal_mailbox_blob(&auth, &cert, &sender_id, &recipient_id, &sov.document).unwrap();
 

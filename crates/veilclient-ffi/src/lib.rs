@@ -9374,12 +9374,18 @@ mod tests {
             let mut generation = 1u32;
             for _ in 0..4 {
                 generation = bump_generation(generation, mask);
-                assert!(generation <= mask, "generation {generation} left field {mask:#x}");
+                assert!(
+                    generation <= mask,
+                    "generation {generation} left field {mask:#x}"
+                );
                 assert_ne!(generation, 0, "an all-zero token would look like NULL");
             }
             // At the top of the field it must wrap back INSIDE the field.
             let wrapped = bump_generation(mask, mask);
-            assert!(wrapped <= mask, "wrap left the field: {wrapped:#x} > {mask:#x}");
+            assert!(
+                wrapped <= mask,
+                "wrap left the field: {wrapped:#x} > {mask:#x}"
+            );
             assert_ne!(wrapped, 0);
         }
         // On this target the mask must leave the index bits alone.
