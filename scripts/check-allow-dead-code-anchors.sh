@@ -57,7 +57,13 @@ while IFS= read -r match; do
     echo "  OR ensure the item already has #[cfg(...)] within 3 lines above."
     echo ""
     violations=$((violations + 1))
-done < <(grep -rn '#\[allow(dead_code)\]' --include='*.rs' "$ROOT" 2>/dev/null || true)
+# `third_party/` is VENDORED upstream source. The policy is about the
+# reasons WE leave a symbol behind, and an anchor comment pointing at our
+# TASKS.md inside someone else's crate would be both wrong and lost on the
+# next re-vendor. (tun2proxy was vendored 2026-07-21; because CI is
+# tag-only, this gate first saw it at release time.)
+done < <(grep -rn '#\[allow(dead_code)\]' --include='*.rs' \
+    --exclude-dir=third_party "$ROOT" 2>/dev/null || true)
 
 if [ "$violations" -gt 0 ]; then
     echo "===================================================="

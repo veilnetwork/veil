@@ -924,12 +924,10 @@ pub(crate) async fn handle_ipc_send(
                 };
                 let mut any_send_failed = false;
                 let mut any_compat_sent = false;
-                let mut compat_attempts = 0usize;
-                for next_hop in hops_to_try {
+                for (compat_attempts, next_hop) in hops_to_try.into_iter().enumerate() {
                     if relay_control_compat && compat_attempts >= 3 {
                         break;
                     }
-                    compat_attempts += 1;
                     let fwd_frame = make_fwd_frame(next_hop);
                     let relayed = reg.send_to(
                         &next_hop,
