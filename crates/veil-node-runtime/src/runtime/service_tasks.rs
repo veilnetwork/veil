@@ -173,14 +173,15 @@ async fn process_auth_deliver(
     let endpoint_id = auth.endpoint_id;
     let sender_node_id = auth.sender_node_id;
     let app_id = auth.app_id;
-    let reply_id = match auth.reply_block {
-        // D3: the reply block is owned by the app that received this message
-        // (`app_id`); only that app may later reply through it.
-        Some(rb) => access
+    let reply_id = if auth.reply_blocks.is_empty() {
+        0
+    } else {
+        // D3: the reply blocks are owned by the app that received this message
+        // (`app_id`); only that app may later reply through them.
+        access
             .anonymity
             .reply_block_store
-            .store(rb, app_id, now_unix),
-        None => 0,
+            .store(auth.reply_blocks, app_id, now_unix)
     };
     let delivered = access.dispatcher.app_registry.route_ipc_deliver_with_reply(
         sender_node_id,

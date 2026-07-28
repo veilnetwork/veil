@@ -440,7 +440,7 @@ struct ReplyStoreState {
     /// handed this `reply_id`); only that app may reply through it (diff-audit
     /// D3) — without the binding, any local app that guessed/observed a reply_id
     /// (a small monotonic u64) could reply through another app's channel.
-    map: std::collections::HashMap<u64, (veil_proto::ReplyBlock, u64, [u8; 32])>,
+    map: std::collections::HashMap<u64, (Vec<veil_proto::ReplyBlock>, u64, [u8; 32])>,
     /// Insertion order (front = oldest) for TTL-GC + FIFO cap-evict.
     order: std::collections::VecDeque<u64>,
     /// Monotonic id allocator; never hands out 0 (0 = "no reply").
@@ -479,12 +479,15 @@ impl ReplyBlockStore {
         }
     }
 
-    /// Store `block` owned by `owner_app_id` (the app that received the message),
-    /// returning a fresh non-zero `reply_id`. Only `owner_app_id` may later
-    /// [`peek`](Self::peek) it (diff-audit D3).
+    /// Store `blocks` owned by `owner_app_id` (the app that received the
+    /// message), returning a fresh non-zero `reply_id`. Only `owner_app_id` may
+    /// later [`peek`](Self::peek) them (diff-audit D3).
+    ///
+    /// Several blocks name DISTINCT rendezvous relays for the same sender; the
+    /// reply path spreads its fragments across them.
     pub fn store(
         &self,
-        block: veil_proto::ReplyBlock,
+        blocks: Vec<veil_proto::ReplyBlock>,
         owner_app_id: [u8; 32],
         now_unix: u64,
     ) -> u64 {
@@ -503,7 +506,7 @@ impl ReplyBlockStore {
         s.next_id = if next == 0 { 1 } else { next };
         s.map.insert(
             id,
-            (block, now_unix.saturating_add(self.ttl_secs), owner_app_id),
+            (blocks, now_unix.saturating_add(self.ttl_secs), owner_app_id),
         );
         s.order.push_back(id);
         id
@@ -525,17 +528,19 @@ impl ReplyBlockStore {
         reply_id: u64,
         requester_app_id: [u8; 32],
         now_unix: u64,
-    ) -> Option<veil_proto::ReplyBlock> {
+    ) -> Option<Vec<veil_proto::ReplyBlock>> {
         if reply_id == 0 {
             return None;
         }
         let mut s = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         Self::gc(&mut s, now_unix);
-        let (block, exp, owner) = s.map.get(&reply_id)?;
-        if now_unix >= *exp || *owner != requester_app_id {
+        let (blocks, exp, owner) = s.map.get(&reply_id)?;
+        // An entry with no blocks is not a reply channel: returning `Some(vec![])`
+        // would hand the caller an empty relay list to route over.
+        if now_unix >= *exp || *owner != requester_app_id || blocks.is_empty() {
             None
         } else {
-            Some(block.clone())
+            Some(blocks.clone())
         }
     }
 }
@@ -861,11 +866,11 @@ mod tests {
     #[test]
     fn store_peek_is_non_consuming() {
         let s = ReplyBlockStore::new();
-        let id = s.store(rb(1), OWNER, 1000);
+        let id = s.store(vec![rb(1)], OWNER, 1000);
         assert_ne!(id, 0);
         // NON-consuming (1b): repeated peeks keep returning the block (retry).
-        assert_eq!(s.peek(id, OWNER, 1000), Some(rb(1)));
-        assert_eq!(s.peek(id, OWNER, 1000), Some(rb(1)));
+        assert_eq!(s.peek(id, OWNER, 1000), Some(vec![rb(1)]));
+        assert_eq!(s.peek(id, OWNER, 1000), Some(vec![rb(1)]));
         // reply_id 0 is never valid.
         assert_eq!(s.peek(0, OWNER, 1000), None);
     }
@@ -874,19 +879,19 @@ mod tests {
     fn peek_rejects_wrong_owner_d3() {
         // diff-audit D3: a different local app cannot reply through this block.
         let s = ReplyBlockStore::new();
-        let id = s.store(rb(1), OWNER, 1000);
+        let id = s.store(vec![rb(1)], OWNER, 1000);
         let other_app = [0x99u8; 32];
         assert_eq!(s.peek(id, other_app, 1000), None, "non-owner rejected");
         // The legitimate owner still resolves it.
-        assert_eq!(s.peek(id, OWNER, 1000), Some(rb(1)));
+        assert_eq!(s.peek(id, OWNER, 1000), Some(vec![rb(1)]));
     }
 
     #[test]
     fn store_expires_after_ttl() {
         let s = ReplyBlockStore::with_params(300, 16);
-        let id = s.store(rb(2), OWNER, 1000);
-        assert_eq!(s.peek(id, OWNER, 1000 + 299), Some(rb(2)));
-        let id2 = s.store(rb(3), OWNER, 2000);
+        let id = s.store(vec![rb(2)], OWNER, 1000);
+        assert_eq!(s.peek(id, OWNER, 1000 + 299), Some(vec![rb(2)]));
+        let id2 = s.store(vec![rb(3)], OWNER, 2000);
         assert_eq!(
             s.peek(id2, OWNER, 2000 + 300),
             None,
@@ -897,9 +902,9 @@ mod tests {
     #[test]
     fn store_cap_evicts_oldest() {
         let s = ReplyBlockStore::with_params(10_000, 2);
-        let id1 = s.store(rb(1), OWNER, 0);
-        let _id2 = s.store(rb(2), OWNER, 0);
-        let _id3 = s.store(rb(3), OWNER, 0); // over cap → evicts id1
+        let id1 = s.store(vec![rb(1)], OWNER, 0);
+        let _id2 = s.store(vec![rb(2)], OWNER, 0);
+        let _id3 = s.store(vec![rb(3)], OWNER, 0); // over cap → evicts id1
         assert_eq!(s.peek(id1, OWNER, 0), None, "oldest evicted");
     }
 
