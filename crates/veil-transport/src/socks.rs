@@ -1,11 +1,13 @@
 use std::sync::Arc;
+use std::time::Duration;
 
 use futures::future::BoxFuture;
+use tokio::time::timeout;
 use tokio_socks::tcp::Socks5Stream;
 
 use super::{
     TransportContext,
-    error::{Result, TransportError},
+    error::{Result, TransportError, connect_timeout},
     tcp::{boxed_stream_connection, peer_meta},
     traits::{Transport, TransportCapabilities, TransportConnection, TransportListener},
     uri::TransportUri,
@@ -87,17 +89,32 @@ fn socks_connect_parts<'a>(uri: &'a TransportUri) -> Result<SocksConnectParts<'a
     }
 }
 
+/// Fallback dial timeout when no caller-supplied budget is threaded in (the
+/// bare `connect_socks5_stream` entrypoint). Generous because a SOCKS hop
+/// through Tor is legitimately slower than a direct TCP connect.
+const DEFAULT_SOCKS_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+
 async fn connect_socks_stream(
     proxy_host: &str,
     proxy_port: u16,
     target_host: &str,
     target_port: u16,
+    connect_timeout_duration: Duration,
 ) -> Result<tokio::net::TcpStream> {
-    Ok(
-        Socks5Stream::connect((proxy_host, proxy_port), (target_host, target_port))
-            .await?
-            .into_inner(),
+    // Bound the dial: `tokio_socks` otherwise blocks forever if the proxy
+    // accepts the TCP connection but never answers the SOCKS handshake (a
+    // down/misconfigured/DROP-firewalled local Tor), wedging the peer-dial
+    // task. Every sibling transport bounds `connect` the same way, and this
+    // path must not rely on an outer caller timeout.
+    match timeout(
+        connect_timeout_duration,
+        Socks5Stream::connect((proxy_host, proxy_port), (target_host, target_port)),
     )
+    .await
+    {
+        Ok(result) => Ok(result?.into_inner()),
+        Err(_) => Err(connect_timeout(connect_timeout_duration)),
+    }
 }
 
 /// Parse a SOCKS5 proxy endpoint URL into `(host, port)`.
@@ -161,7 +178,14 @@ pub async fn connect_socks5_stream(
     target_port: u16,
 ) -> Result<tokio::net::TcpStream> {
     let (proxy_host, proxy_port) = parse_socks_proxy_url(proxy_url)?;
-    connect_socks_stream(&proxy_host, proxy_port, target_host, target_port).await
+    connect_socks_stream(
+        &proxy_host,
+        proxy_port,
+        target_host,
+        target_port,
+        DEFAULT_SOCKS_CONNECT_TIMEOUT,
+    )
+    .await
 }
 
 fn unsupported_listen_error(uri: &TransportUri) -> TransportError {
@@ -190,9 +214,14 @@ impl Transport for SocksTransport {
                     target_host,
                     target_port,
                 } => {
-                    let stream =
-                        connect_socks_stream(proxy_host, proxy_port, target_host, target_port)
-                            .await?;
+                    let stream = connect_socks_stream(
+                        proxy_host,
+                        proxy_port,
+                        target_host,
+                        target_port,
+                        ctx.tcp.connect_timeout,
+                    )
+                    .await?;
                     let local_addr = stream.local_addr().ok();
                     let remote_addr = stream.peer_addr().ok();
                     let peer = peer_meta("socks", uri.clone(), local_addr, remote_addr);
@@ -206,9 +235,14 @@ impl Transport for SocksTransport {
                     sni,
                     alpn,
                 } => {
-                    let stream =
-                        connect_socks_stream(proxy_host, proxy_port, target_host, target_port)
-                            .await?;
+                    let stream = connect_socks_stream(
+                        proxy_host,
+                        proxy_port,
+                        target_host,
+                        target_port,
+                        ctx.tcp.connect_timeout,
+                    )
+                    .await?;
                     let tls_stream =
                         connect_tls_over_socks(stream, target_host, sni, alpn, &ctx).await?;
                     let peer = peer_meta("sockstls", uri.clone(), None, None);
@@ -277,6 +311,44 @@ mod tests {
         assert_eq!(
             parse_socks_proxy_url("127.0.0.1:9050").unwrap(),
             ("127.0.0.1".to_owned(), 9050)
+        );
+    }
+
+    #[tokio::test]
+    async fn socks_dial_times_out_against_a_silent_proxy() {
+        // A proxy that accepts the TCP connection but never speaks the SOCKS5
+        // handshake models a down/DROP-firewalled local Tor. Without the dial
+        // timeout the connect blocks forever and wedges the peer-dial task.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = listener.local_addr().unwrap();
+        // Hold accepted sockets open and silent for the duration of the test.
+        let _accept = tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((sock, _)) = listener.accept().await {
+                held.push(sock);
+            }
+        });
+
+        let budget = Duration::from_millis(200);
+        let started = std::time::Instant::now();
+        let result = connect_socks_stream(
+            &proxy_addr.ip().to_string(),
+            proxy_addr.port(),
+            "example.invalid",
+            443,
+            budget,
+        )
+        .await;
+
+        assert!(
+            matches!(result, Err(TransportError::ConnectTimeout(_))),
+            "silent proxy must surface a connect timeout, got {result:?}"
+        );
+        // It must return promptly on the bounded budget, not hang.
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "dial should time out near the budget, took {:?}",
+            started.elapsed()
         );
     }
 
