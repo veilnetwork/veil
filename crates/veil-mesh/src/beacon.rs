@@ -142,9 +142,17 @@ impl BeaconRateLimiter {
         // from evicting legitimate gateway entries via time-based stale-eviction
         // while staying under the per-IP rate threshold. Only checked for new IPs;
         // already-tracked IPs continue working irrespective of subnet count.
-        if is_new_ip {
-            let subnet_count = self.per_subnet.get(&subnet).copied().unwrap_or(0);
-            if subnet_count >= MAX_PER_SUBNET {
+        if is_new_ip && self.per_subnet.get(&subnet).copied().unwrap_or(0) >= MAX_PER_SUBNET {
+            // Sweep before refusing, exactly as the global cap below does.
+            // Without it a subnet's slots stay claimed by addresses whose
+            // window expired long ago, and housekeeping only runs every 256
+            // beacons — so an attacker holding MAX_PER_SUBNET addresses in one
+            // /24 and re-beaconing them keeps the slots permanently non-stale
+            // and NO new address from that subnet is ever admitted. On a LAN
+            // mesh the legitimate neighbours share that /24, so this locks out
+            // real neighbour discovery.
+            self.evict_stale();
+            if self.per_subnet.get(&subnet).copied().unwrap_or(0) >= MAX_PER_SUBNET {
                 return false;
             }
         }
@@ -690,6 +698,19 @@ pub struct BeaconReceiver {
     /// `Duration::ZERO` disables deduplication.
     dedup_seen: std::collections::HashMap<[u8; 32], std::time::Instant>,
     dedup_window: std::time::Duration,
+    /// Value-based replay guard for SIGNED beacons: `(node_id, BLAKE3(signable
+    /// body)[..16]) -> first seen`.
+    ///
+    /// `dedup_seen` above is a per-source RATE window, not a replay guard — a
+    /// captured beacon re-sent more than `dedup_window` later passes it. That
+    /// matters because acceptance ends in an unconditional re-register of the
+    /// source's link at `sender_addr` (see the end of `handle_beacon`), so a
+    /// verbatim replay from another address repoints the victim's link at the
+    /// replayer. The signature covers only a 1-second-granularity timestamp
+    /// and no per-beacon nonce, so the same bytes stay valid for the whole
+    /// `MAX_BEACON_SKEW_SECS` window. Remember the authenticated content for
+    /// exactly that long and drop repeats.
+    replay_seen: std::collections::HashMap<([u8; 32], [u8; 16]), std::time::Instant>,
     /// Beacon counter for amortised rate-limiter housekeeping.
     ///
     /// `BeaconRateLimiter::evict_stale` is called every 256 beacons so the
@@ -714,6 +735,7 @@ impl BeaconReceiver {
             autodiscover_disabled: false,
             rtt_table: None,
             dedup_seen: std::collections::HashMap::new(),
+            replay_seen: std::collections::HashMap::new(),
             dedup_window: std::time::Duration::from_secs(3), // default 3 s
             beacon_count: 0,
             // Reject unsigned beacons. Production has no way to turn this
@@ -824,6 +846,39 @@ impl BeaconReceiver {
                 );
                 return false;
             }
+            // Same bytes twice inside that window = replay, not a re-beacon:
+            // an honest sender restamps `timestamp` every beacon, and beacons
+            // closer together than one second are already dropped by the rate
+            // window below.
+            let mut digest = [0u8; 16];
+            digest.copy_from_slice(&blake3::hash(&beacon.signable_body()).as_bytes()[..16]);
+            let replay_key = (beacon.node_id, digest);
+            let now = std::time::Instant::now();
+            let ttl = std::time::Duration::from_secs(veil_proto::budget::MAX_BEACON_SKEW_SECS);
+            if let Some(&first_seen) = self.replay_seen.get(&replay_key)
+                && now.duration_since(first_seen) < ttl
+            {
+                log::warn!(
+                    "mesh.beacon: replayed signed beacon from {sender_addr} — dropped                      (would have rebound the link address)"
+                );
+                return false;
+            }
+            // Bound the map the same way `dedup_seen` is bounded: sweep by TTL
+            // at capacity, then evict the single oldest if that frees nothing.
+            if self.replay_seen.len() >= veil_proto::budget::MAX_BEACON_DEDUP_ENTRIES {
+                self.replay_seen
+                    .retain(|_, t| now.duration_since(*t) < ttl);
+                if self.replay_seen.len() >= veil_proto::budget::MAX_BEACON_DEDUP_ENTRIES
+                    && let Some(oldest) = self
+                        .replay_seen
+                        .iter()
+                        .min_by_key(|&(_, t)| *t)
+                        .map(|(&k, _)| k)
+                {
+                    self.replay_seen.remove(&oldest);
+                }
+            }
+            self.replay_seen.insert(replay_key, now);
         }
 
         // per-source deduplication window.
@@ -995,6 +1050,100 @@ mod tests {
             "default mode must drop an unsigned beacon"
         );
         assert_eq!(table.len(), 0);
+    }
+
+    /// The per-subnet cap must not outlive the slots that filled it.
+    #[test]
+    fn subnet_cap_sweeps_expired_slots_before_refusing() {
+        use std::net::{IpAddr, Ipv4Addr};
+        let window = std::time::Duration::from_millis(5);
+        let mut rl = BeaconRateLimiter::new(10, window);
+        for i in 0..MAX_PER_SUBNET {
+            let ip = IpAddr::V4(Ipv4Addr::new(10, 0, 0, i as u8));
+            assert!(rl.allow(ip), "slot {i} is within the subnet cap");
+        }
+        let newcomer = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 200));
+        assert!(
+            !rl.allow(newcomer),
+            "the cap holds while those slots are live"
+        );
+        // Once the windows expire the slots are stale. A newcomer must not stay
+        // locked out until the every-256-beacons housekeeping happens to run.
+        std::thread::sleep(window * 4);
+        assert!(
+            rl.allow(newcomer),
+            "expired subnet slots must be swept before refusing"
+        );
+    }
+
+    /// Build a genuinely signed beacon frame for the replay tests.
+    fn signed_beacon_frame(realm: RealmId, seed: [u8; 32]) -> (MeshFrame, [u8; 32]) {
+        use base64::{Engine as _, engine::general_purpose::STANDARD};
+        let kp = veil_crypto::ed25519_keypair_from_seed(&seed);
+        let public_key = STANDARD.decode(&kp.public_key).expect("pubkey b64");
+        let node_id: [u8; 32] = *blake3::hash(&public_key).as_bytes();
+        let mut beacon = MeshBeaconPayload {
+            node_id,
+            realm_id: realm,
+            role_flags: 0,
+            veil_addr: None,
+            battery_level: 0,
+            timestamp: crate::udp::now_secs(),
+            algo: 1,
+            public_key,
+            signature: vec![],
+        };
+        beacon.signature = veil_crypto::sign_message(
+            veil_types::SignatureAlgorithm::Ed25519,
+            &kp.public_key,
+            &kp.private_key,
+            &beacon.signable_body(),
+        )
+        .expect("sign");
+        let frame = MeshFrame::new(realm, node_id, BROADCAST_NODE_ID, 1, beacon.encode());
+        (frame, node_id)
+    }
+
+    /// A byte-identical signed beacon must not be replayable, because
+    /// acceptance repoints the source's link at whatever address sent it.
+    #[test]
+    fn replayed_signed_beacon_cannot_rebind_the_link_address() {
+        use crate::neighbor::NeighborTable;
+        let realm = RealmId([2u8; 16]);
+        let table = NeighborTable::new();
+        let std_sock = Arc::new(std::net::UdpSocket::bind("127.0.0.1:0").unwrap());
+        // Rate window disabled so the probe targets the REPLAY guard and not
+        // the per-source throttle that would mask it.
+        let mut receiver = BeaconReceiver::new(realm, table.clone(), std_sock, None)
+            .with_dedup_window(std::time::Duration::ZERO);
+
+        let (frame, _node_id) = signed_beacon_frame(realm, [0x11u8; 32]);
+        let honest: SocketAddr = "127.0.0.1:7001".parse().unwrap();
+        assert!(
+            receiver.handle_beacon(&frame, honest),
+            "the genuine beacon is accepted"
+        );
+        assert_eq!(table.len(), 1, "the honest link is registered");
+
+        // Same bytes, different source: the capture-and-resend. Acceptance
+        // would remove the neighbour and re-add it pointing at `attacker`, so
+        // reaching the registration at all is the failure — and it reports
+        // itself, because the re-add of a just-removed entry returns true.
+        let attacker: SocketAddr = "127.0.0.1:7002".parse().unwrap();
+        assert!(
+            !receiver.handle_beacon(&frame, attacker),
+            "a verbatim replay must be dropped before the link is re-registered"
+        );
+
+        // A genuine NAT rebind (fresh beacon, new timestamp/signature) still
+        // works — the guard is value-based, not address-pinning.
+        let (fresh, _) = signed_beacon_frame(realm, [0x11u8; 32]);
+        if fresh.payload != frame.payload {
+            assert!(
+                receiver.handle_beacon(&fresh, attacker),
+                "a fresh signed beacon must still be accepted"
+            );
+        }
     }
 
     /// With the explicit legacy opt-out (`with_require_signed(false)`) an
