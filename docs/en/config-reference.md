@@ -69,7 +69,6 @@ Tokio runtime and logging.
 | `bootstrap_https_urls` | `[string]` | `[]` | HTTPS (and `.onion`) URLs that serve a **signed** seed bundle — the last resort when clearnet seeds are blocked |
 | `bootstrap_tor_socks_proxy` | `string` or absent | unset | SOCKS5 proxy (e.g. `"socks5://127.0.0.1:9050"`) for fetching `.onion` `bootstrap_https_urls` over Tor |
 | `trusted_bundle_issuer_pubkey` | `string` or absent | unset | Pinned issuer pubkey that every signed seed bundle must verify against |
-| `legacy_allow_unsigned_bootstrap` | `bool` | `false` | Accept unsigned bootstrap bundles (legacy). Default `false`; `.onion` sources are always force-signed regardless |
 | `discovered_peers_cache_path` | `string` or absent | unset | Cache of peers found in earlier runs — a fallback for joining if the known seed IPs are down |
 
 **Example:**

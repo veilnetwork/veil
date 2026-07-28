@@ -69,7 +69,6 @@ transport  = "tls://gateway.example.com:9443"
 | `bootstrap_https_urls` | `[string]` | `[]` | HTTPS- (и `.onion`-) URL с **подписанным** seed-бандлом — последний резерв, когда clearnet-сиды заблокированы |
 | `bootstrap_tor_socks_proxy` | `string` или отсутствует | не задано | SOCKS5-прокси (например `"socks5://127.0.0.1:9050"`) для загрузки `.onion`-`bootstrap_https_urls` через Tor |
 | `trusted_bundle_issuer_pubkey` | `string` или отсутствует | не задано | Запиненный открытый ключ издателя, против которого должен проверяться каждый подписанный seed-бандл |
-| `legacy_allow_unsigned_bootstrap` | `bool` | `false` | Принимать неподписанные bootstrap-бандлы (устаревшее). По умолчанию `false`; `.onion`-источники всегда требуют подписи, независимо от флага |
 | `discovered_peers_cache_path` | `string` или отсутствует | не задано | Кэш пиров из прошлых запусков — запасной путь для входа в сеть, если известные seed-IP лягут |
 
 **Пример:**

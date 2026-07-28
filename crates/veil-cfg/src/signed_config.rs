@@ -27,7 +27,7 @@
 //! the operator's disk.  Anyone with filesystem write access (a container
 //! escape, a compromised SSH key, a disgruntled admin) could tamper
 //! the config: redirect bootstrap peers to a malicious bundle issuer,
-//! flip `legacy_allow_unsigned_bootstrap = true`, lower the rendezvous
+//! flip `allow_unpinned_signed_bootstrap = true`, lower the rendezvous
 //! anycast policy from `signed_only` to `best_effort`, etc.  None of
 //! these changes need a daemon restart — the next `node reload` picks
 //! them up.

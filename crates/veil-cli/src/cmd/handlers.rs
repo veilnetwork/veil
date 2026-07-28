@@ -818,18 +818,15 @@ impl ConfigCommandService {
         }
 
         // H-2: refuse to persist unauthenticated peers (no pin, issuer != our
-        // identity) unless the operator explicitly opted into unsigned bootstrap
-        // — mirrors the runtime BootstrapHttpsPolicy gate (service_tasks.rs).
-        // Dry-run already returned above, so inspection still works without the
-        // opt-in (an operator can dry-run to read the issuer, then pin it).
-        if is_no_anchor && !loaded.global.legacy_allow_unsigned_bootstrap {
+        // identity) — mirrors the runtime BootstrapHttpsPolicy gate
+        // (service_tasks.rs). Dry-run already returned above, so inspection
+        // still works: an operator can dry-run to read the issuer, then pin it.
+        if is_no_anchor {
             return Err(veil_cfg::ConfigError::CommandFailed(format!(
                 "bootstrap fetch: bundle issuer {issuer_short}… is not pinned and \
                  does not match this node's identity — refusing to merge \
                  unauthenticated bootstrap peers. Set `trusted_bundle_issuer_pubkey` \
-                 to pin the operator's pubkey, or set \
-                 `legacy_allow_unsigned_bootstrap = true` to opt into unsigned \
-                 bootstrap (dev/testnet only).",
+                 to pin the operator's pubkey.",
             )));
         }
 

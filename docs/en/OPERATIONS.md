@@ -192,8 +192,8 @@ public key — connecting to it proves (via Tor's rendezvous) you reached its
 holder, and the Tor circuit is already encrypted. There is no public-CA
 certificate to verify, so TLS would add nothing. Authenticity comes instead
 from the **signed bundle**, which the `.onion` path requires
-**unconditionally**: raw JSON is rejected even when
-`legacy_allow_unsigned_bootstrap = true`. (`https://…onion` URLs are rejected.)
+**unconditionally** — as it now is on every path: no setting accepts raw
+JSON. (`https://…onion` URLs are rejected.)
 
 **Setup.**
 1. Run Tor (`apt install tor`; default client SOCKS at `127.0.0.1:9050`). On the
@@ -323,7 +323,7 @@ covering most key allocations.
 
 Since Stage 11 slice 11a, the daemon supports operator-signed config
 files.  Pre-signing, anyone with filesystem write access could flip
-`legacy_allow_unsigned_bootstrap = true`, lower
+`allow_unpinned_signed_bootstrap = true`, lower
 `anycast.resolve_policy` from `signed_only` to `best_effort`, redirect
 bootstrap peers, etc. — without restarting the daemon.  A signed
 config makes byte-level tamper surface as a structured WARN log; a

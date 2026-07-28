@@ -177,8 +177,8 @@ pub enum HttpsBootstrapError {
     /// Signed bundles defend against this class compromise.
     #[error(
         "policy requires signed bundle but endpoint returned raw JSON; \
-         configure `trusted_bundle_issuer_pubkey` to enable signed bundles, \
-         or set `legacy_allow_unsigned_bootstrap = true` for dev/testnet"
+         configure `trusted_bundle_issuer_pubkey` to pin the issuer, or \
+         `allow_unpinned_signed_bootstrap = true` for dev/testnet"
     )]
     SignedBundleRequired,
     /// Signed-envelope decode/verify failed (wrong issuer pubkey,
@@ -200,9 +200,9 @@ pub enum HttpsBootstrapError {
 /// attacker can serve their own validly-signed bundle and it is accepted. It
 /// adds nothing over plain TLS against an origin compromise; the node therefore
 /// fails closed on unpinned bootstrap unless explicitly opted in
-/// (`allow_unpinned_signed_bootstrap` / `legacy_allow_unsigned_bootstrap`).
+/// (`allow_unpinned_signed_bootstrap`).
 /// Raw-JSON fallback is opt-in via
-/// [`BootstrapHttpsPolicy::legacy_allow_unsigned`] for dev/testnet
+/// [`BootstrapHttpsPolicy::signed_preferred`] for dev/testnet
 /// builds that haven't yet provisioned a signed bundle.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct BootstrapHttpsPolicy {
@@ -212,12 +212,6 @@ pub struct BootstrapHttpsPolicy {
     /// tamper-proof but not authenticated WHO signed it — same degraded
     /// mode as `verify_signed_bundle(.., None, ..)`).
     pub trusted_issuer_pubkey: Option<String>,
-    /// If the fetched body is raw JSON (no signed-bundle magic),
-    /// accept it?  Default `false`.  Set to `true` ONLY for dev/testnet
-    /// configs that haven't yet provisioned a signed bundle.  Production
-    /// builds should reject unsigned bodies to close the TLS-endpoint-
-    /// compromise vector.
-    pub legacy_allow_unsigned: bool,
 }
 
 impl BootstrapHttpsPolicy {
@@ -226,7 +220,6 @@ impl BootstrapHttpsPolicy {
     pub fn signed_required(issuer_pubkey: impl Into<String>) -> Self {
         Self {
             trusted_issuer_pubkey: Some(issuer_pubkey.into()),
-            legacy_allow_unsigned: false,
         }
     }
 
@@ -237,21 +230,9 @@ impl BootstrapHttpsPolicy {
     pub fn signed_preferred() -> Self {
         Self {
             trusted_issuer_pubkey: None,
-            legacy_allow_unsigned: false,
         }
     }
 
-    /// LEGACY policy: accept raw JSON without any signature.  TLS gives
-    /// channel auth only — compromised CDN, CA, hosting account, or
-    /// mirror endpoint can substitute a malicious peer list and the
-    /// fetcher will accept it.  Use ONLY for dev/testnet builds that
-    /// haven't yet provisioned a signed bundle.
-    pub fn legacy_unsigned() -> Self {
-        Self {
-            trusted_issuer_pubkey: None,
-            legacy_allow_unsigned: true,
-        }
-    }
 }
 
 /// Fetch and parse bootstrap peers from `url`, applying `policy` to
@@ -260,7 +241,7 @@ impl BootstrapHttpsPolicy {
 /// `url` must be `https://host[:port]/path`; `http://` is intentionally
 /// rejected.  Body is detected as signed (magic `"SB"` prefix) or raw
 /// JSON; signed bundles are verified against `policy.trusted_issuer_pubkey`
-/// when set.  Raw JSON is accepted only when `policy.legacy_allow_unsigned`
+/// when set.  Raw JSON is never accepted
 /// is `true`.
 ///
 /// Bounded by [`DEFAULT_FETCH_TIMEOUT`] and [`MAX_RESPONSE_BYTES`].
@@ -306,10 +287,7 @@ pub fn decode_with_policy(
         )
         .map_err(HttpsBootstrapError::SignedBundleVerify);
     }
-    if !policy.legacy_allow_unsigned {
-        return Err(HttpsBootstrapError::SignedBundleRequired);
-    }
-    super::seeds::decode_bootstrap_bundle(body).map_err(HttpsBootstrapError::ParseBundle)
+    Err(HttpsBootstrapError::SignedBundleRequired)
 }
 
 /// Fetch a JSON-bundle [`BootstrapPeer`] from `url` and return the
@@ -319,18 +297,15 @@ pub fn decode_with_policy(
 ///
 /// Bounded by [`DEFAULT_FETCH_TIMEOUT`] and [`MAX_RESPONSE_BYTES`].
 ///
-/// **Legacy unsigned mode** — accepts raw JSON without a signed envelope.
-/// Use [`fetch_seeds_https_with_policy`] in new code so production
-/// builds can require signed bundles (closes the TLS-endpoint-
-/// compromise vector — see [`BootstrapHttpsPolicy`]).  Kept for
-/// existing call sites + tests; service-task wiring switches to the
-/// policy-aware version once `legacy_allow_unsigned_bootstrap` config
-/// is in place.
+/// A signed envelope is always required. Without a pinned issuer the
+/// envelope's self-embedded key is verified but its AUTHOR is not, so callers
+/// that can pin should use [`fetch_seeds_https_with_policy`] with
+/// [`BootstrapHttpsPolicy::signed_required`].
 pub async fn fetch_seeds_https(
     url: &str,
     ctx: &TransportContext,
 ) -> Result<Vec<BootstrapPeer>, HttpsBootstrapError> {
-    fetch_seeds_https_with_policy(url, ctx, &BootstrapHttpsPolicy::legacy_unsigned()).await
+    fetch_seeds_https_with_policy(url, ctx, &BootstrapHttpsPolicy::signed_preferred()).await
 }
 
 /// Fetch + verify a bootstrap seed bundle from an `http://<host>.onion/path`
@@ -347,7 +322,7 @@ pub async fn fetch_seeds_https(
 ///    and the circuit is encrypted end-to-end. No TLS / public-CA cert exists
 ///    or is needed — that's why the URL is `http://`, not `https://`.
 /// 2. **Signed bundle**: this path **always requires a signed envelope** and
-///    never accepts raw JSON, regardless of any `legacy_allow_unsigned`
+///    never accepts raw JSON, and neither does any other policy
 ///    setting elsewhere — the signature binds the seed list to the trusted
 ///    issuer independently of which `.onion` served it.
 /// 3. **Issuer pinning**: when `trusted_issuer_pubkey` is `Some`, the bundle's
@@ -1041,16 +1016,29 @@ mod tests {
         assert!(matches!(err, HttpsBootstrapError::SignedBundleRequired));
     }
 
-    /// legacy_unsigned policy (testnet/dev) accepts BOTH signed and raw.
+    /// Raw JSON is refused under EVERY policy now — there is no longer a
+    /// setting that accepts an unsigned bundle, so a compromised CDN, CA,
+    /// hosting account or mirror cannot substitute a peer list.
     #[test]
-    fn decode_legacy_unsigned_accepts_signed_and_raw() {
+    fn decode_raw_json_is_refused_under_every_policy() {
         let peers = policy_test_peer();
-        let (signed_body, _) = fresh_signed_bundle(&peers);
-        let policy = BootstrapHttpsPolicy::legacy_unsigned();
-        assert_eq!(decode_with_policy(&signed_body, &policy).unwrap(), peers);
-
         let raw_json = crate::seeds::encode_bootstrap_bundle(&peers).unwrap();
-        assert_eq!(decode_with_policy(&raw_json, &policy).unwrap(), peers);
+        for policy in [
+            BootstrapHttpsPolicy::signed_preferred(),
+            BootstrapHttpsPolicy::signed_required("00" .repeat(32).as_str()),
+        ] {
+            assert!(matches!(
+                decode_with_policy(&raw_json, &policy),
+                Err(HttpsBootstrapError::SignedBundleRequired)
+            ));
+        }
+        // A signed bundle still decodes under the unpinned policy.
+        let (signed_body, _) = fresh_signed_bundle(&peers);
+        assert_eq!(
+            decode_with_policy(&signed_body, &BootstrapHttpsPolicy::signed_preferred())
+                .unwrap(),
+            peers
+        );
     }
 
     // ── parse_https_url ────────────────────────────────────────────────
