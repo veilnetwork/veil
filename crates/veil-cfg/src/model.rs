@@ -425,7 +425,6 @@ pub struct MeshConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub autodiscover_persist_path: Option<String>,
 
-
     /// **SECURITY (C-03)** — when `true`, the node advertises its role
     /// (`IS_GATEWAY` / `IS_RELAY` / `HAS_INTERNET`) in its mesh beacon so
     /// neighbours can auto-discover it. **Default `false`:** the beacon carries

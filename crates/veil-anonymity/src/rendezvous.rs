@@ -758,13 +758,6 @@ pub fn is_currently_valid(ad: &RendezvousAd, now_unix: u64) -> Result<(), Rendez
 
 // ── Internal helpers ──────────────────────────────────────────────────
 
-
-
-
-
-
-
-
 /// v5 canonical-message form. Adds `rendezvous_kem_algo` (1 B) +
 /// length-prefixed `rendezvous_kem_pk` after the v4 wake_hmac_envelope tail.
 /// Same length-prefix-inclusion invariant: a censor cannot strip, replace, or
@@ -2364,7 +2357,17 @@ mod tests {
     #[test]
     fn epic482_5_canonical_message_includes_domain_separator() {
         let canonical = canonical_message_v5(
-            &[0u8; 32], &[0u8; 32], &[0u8; 16], &[0u8; 32], 0, 0, &[], &[], &[], 0, &[],
+            &[0u8; 32],
+            &[0u8; 32],
+            &[0u8; 16],
+            &[0u8; 32],
+            0,
+            0,
+            &[],
+            &[],
+            &[],
+            0,
+            &[],
         );
         assert!(
             canonical.starts_with(SIG_DOMAIN_V5),
@@ -3869,5 +3872,4 @@ mod tests {
         assert_eq!(ad.wake_hmac_envelope, wake_env);
         assert_eq!(ad.wire_version, VERSION);
     }
-
 }

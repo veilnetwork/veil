@@ -36,8 +36,7 @@ use super::{NodeLogger, NodeMetrics};
 /// Per-node-id outbound-connector refresh slots (the map
 /// `spawn_outbound_peers` claims from) — aliased for the guard's
 /// optional handle below.
-pub type ConnectorRefreshMap =
-    Arc<Mutex<std::collections::HashMap<[u8; 32], watch::Sender<u64>>>>;
+pub type ConnectorRefreshMap = Arc<Mutex<std::collections::HashMap<[u8; 32], watch::Sender<u64>>>>;
 
 pub struct SessionGuard {
     live_sessions: Arc<Mutex<BTreeMap<LinkId, SessionInfo>>>,

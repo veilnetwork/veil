@@ -6268,7 +6268,9 @@ mod tests {
         // The count is attacker-controlled, so the cap must be enforced on
         // DECODE and not merely respected by our own encoder.
         let mut ok = sample_auth_deliver();
-        ok.reply_blocks = (0..MAX_REPLY_BLOCKS).map(|_| sample_reply_block()).collect();
+        ok.reply_blocks = (0..MAX_REPLY_BLOCKS)
+            .map(|_| sample_reply_block())
+            .collect();
         assert!(
             AuthAppDeliver::decode(&ok.encode()).is_ok(),
             "exactly the cap must still decode, or the test proves nothing",
@@ -6279,7 +6281,9 @@ mod tests {
         // for a SHORT BUFFER and the test stayed green with the cap check
         // deleted. Verified by breaking.
         let mut over = sample_auth_deliver();
-        over.reply_blocks = (0..=MAX_REPLY_BLOCKS).map(|_| sample_reply_block()).collect();
+        over.reply_blocks = (0..=MAX_REPLY_BLOCKS)
+            .map(|_| sample_reply_block())
+            .collect();
         let err = AuthAppDeliver::decode(&over.encode()).unwrap_err();
         assert!(
             format!("{err:?}").contains("cap"),

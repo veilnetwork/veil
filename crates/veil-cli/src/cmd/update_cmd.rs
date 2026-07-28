@@ -37,10 +37,7 @@ pub fn handle_update_command<I: CommandIo, O: ConfigOps>(
         UpdateCommand::Check => update_check(&mut context),
         UpdateCommand::Apply {
             allow_unauthenticated_state,
-        } => update_apply(
-            &mut context,
-            allow_unauthenticated_state,
-        ),
+        } => update_apply(&mut context, allow_unauthenticated_state),
         UpdateCommand::SignManifest(args) => update_sign_manifest(&mut context, args),
     }
 }

@@ -10615,11 +10615,9 @@ impl NodeServices {
             };
             ads.into_iter()
                 .filter(|ad| {
-                    !mine
-                        .iter()
-                        .any(|(relay, cookie)| {
-                            *relay == ad.rendezvous_node_id && *cookie == ad.auth_cookie
-                        })
+                    !mine.iter().any(|(relay, cookie)| {
+                        *relay == ad.rendezvous_node_id && *cookie == ad.auth_cookie
+                    })
                 })
                 .collect()
         };

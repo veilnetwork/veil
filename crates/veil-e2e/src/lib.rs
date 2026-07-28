@@ -1061,7 +1061,10 @@ mod tests {
     fn v2_marker_without_the_v2_length_is_refused() {
         let (_, dk_seed) = generate_keypair();
         let real = pem_blob(&encode_pem_encrypted(&dk_seed, "collision-pass"));
-        assert_eq!(real[0], ENC_PEM_V2, "precondition: real v2 carries the marker");
+        assert_eq!(
+            real[0], ENC_PEM_V2,
+            "precondition: real v2 carries the marker"
+        );
 
         // Short enough that the fixed-offset reads would run off the end. This
         // is the case the length check actually guards: without it the parser
