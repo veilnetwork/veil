@@ -3594,7 +3594,7 @@ pub struct GlobalConfig {
     ///
     /// `.onion` URLs in the list are dialed through this proxy (the host is
     /// resolved by Tor, never locally) and **always require a signed bundle**
-    /// regardless of [`legacy_allow_unsigned_bootstrap`](Self::legacy_allow_unsigned_bootstrap):
+    /// regardless of any other bootstrap opt-in:
     /// `.onion` is self-authenticating + Tor-encrypted, so the URL is plain
     /// `http://` and the bundle signature provides authenticity (issuer pinned
     /// via [`trusted_bundle_issuer_pubkey`](Self::trusted_bundle_issuer_pubkey)
@@ -3626,24 +3626,6 @@ pub struct GlobalConfig {
     /// pubkey bytes themselves.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub trusted_bundle_issuer_pubkey: Option<String>,
-    /// LEGACY escape hatch — when `true`, the HTTPS bootstrap fetcher
-    /// accepts raw JSON bundles (no signature envelope) instead of
-    /// rejecting them.  Default `false`.
-    ///
-    /// TLS gives channel auth ("bytes came from the CDN endpoint without
-    /// on-path tampering") but NOT endpoint auth.  If CDN, CA,
-    /// hosting account or mirror endpoint is compromised, attacker
-    /// swaps the JSON for own peer list and raw-JSON mode merges those
-    /// directly into the seed set.  Signed bundles (operator-signed,
-    /// pinned issuer pubkey) close this class of compromise.
-    ///
-    /// Production deployments should leave this `false` and provision a
-    /// signed bundle (see `sign_bundle` CLI).  Set `true` ONLY for
-    /// dev/testnet builds that haven't yet generated and published a
-    /// signed bundle.  Flag will be removed after a migration window
-    /// once production operators have migrated.
-    #[serde(default, skip_serializing_if = "is_default_legacy_allow")]
-    pub legacy_allow_unsigned_bootstrap: bool,
     /// Opt into UNPINNED signed-bundle bootstrap (audit cycle-9). When HTTPS /
     /// `.onion` bootstrap URLs are configured WITHOUT
     /// [`trusted_bundle_issuer_pubkey`](Self::trusted_bundle_issuer_pubkey),
@@ -3772,7 +3754,6 @@ impl Default for GlobalConfig {
             allow_unpinned_signed_bootstrap: false,
             require_signed_config: false,
             strict_config_validation: false,
-            legacy_allow_unsigned_bootstrap: false,
             tls_ech_grease: Self::default_tls_ech_grease(),
         }
     }

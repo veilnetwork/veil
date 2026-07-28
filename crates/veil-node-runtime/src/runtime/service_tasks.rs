@@ -1239,11 +1239,11 @@ impl NodeRuntime {
         // it. A pin is the only author authentication. Refuse to fetch
         // unpinned bootstrap unless an operator explicitly opts in
         // (production → trusted_bundle_issuer_pubkey; dev/testnet →
-        // allow_unpinned_signed_bootstrap / legacy_allow_unsigned_bootstrap).
+        // allow_unpinned_signed_bootstrap). A signed envelope is always
+        // required; the knob that accepted raw JSON is gone.
         let https_urls_present = !config.global.bootstrap_https_urls.is_empty();
         let https_pinned_or_opted_in = config.global.trusted_bundle_issuer_pubkey.is_some()
-            || config.global.allow_unpinned_signed_bootstrap
-            || config.global.legacy_allow_unsigned_bootstrap;
+            || config.global.allow_unpinned_signed_bootstrap;
         if https_urls_present && !https_pinned_or_opted_in {
             self.logger.error(
                 "bootstrap.https.fail_closed",
@@ -1267,23 +1267,18 @@ impl NodeRuntime {
             let urls = config.global.bootstrap_https_urls.clone();
             let transport_ctx = self.transport_ctx.clone();
             // Policy (the unpinned-without-opt-in case already failed closed
-            // above): pinned issuer → signed-required + pin (authenticates the
-            // bundle author); else `legacy_allow_unsigned_bootstrap` → accept raw
-            // JSON; else (`allow_unpinned_signed_bootstrap`) → signed_preferred,
-            // which verifies the envelope's self-embedded key only (NO author
-            // authentication — dev/testnet opt-in, gated above).
+            // above): pinned issuer → signed-required + pin, which authenticates
+            // the bundle author; otherwise signed_preferred, which verifies the
+            // envelope's self-embedded key only (NO author authentication —
+            // dev/testnet opt-in, gated above).
             let bootstrap_policy = match config.global.trusted_bundle_issuer_pubkey.as_deref() {
                 Some(pk) => veil_bootstrap::https::BootstrapHttpsPolicy::signed_required(pk),
-                None if config.global.legacy_allow_unsigned_bootstrap => {
-                    veil_bootstrap::https::BootstrapHttpsPolicy::legacy_unsigned()
-                }
                 None => veil_bootstrap::https::BootstrapHttpsPolicy::signed_preferred(),
             };
             // 481.4: `.onion` URLs in the list are routed through this Tor
             // SOCKS proxy (plaintext HTTP over the Tor circuit); clearnet URLs
             // ignore it.  The issuer pin (if any) is reused for `.onion`
-            // signature verification, which is ALWAYS required regardless of
-            // `legacy_allow_unsigned_bootstrap`.
+            // signature verification, which is always required.
             let bootstrap_tor_proxy = config.global.bootstrap_tor_socks_proxy.clone();
             let bootstrap_issuer_pk = config.global.trusted_bundle_issuer_pubkey.clone();
             let state = Arc::clone(&self.state);
