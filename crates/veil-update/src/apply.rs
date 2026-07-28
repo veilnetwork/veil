@@ -231,7 +231,6 @@ pub struct ApplyOutcome {
     pub previous_binary_relocated_to: Option<PathBuf>,
 }
 
-
 /// Apply a fetched + verified update. Steps in order:
 ///
 /// 1. Recompute SHA-256 of `binary_bytes` and verify against
@@ -251,8 +250,6 @@ pub struct ApplyOutcome {
 /// `CARGO_PKG_VERSION` so the gate never compares against the wrong crate's
 /// version once the product is versioned independently of `veil-update`
 /// (C-07).
-
-
 pub fn apply_update(
     manifest: &VerifiedManifest,
     binary_bytes: &[u8],
@@ -1218,5 +1215,4 @@ mod tests {
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
-
 }
