@@ -423,7 +423,7 @@ impl SovereignIdentity {
         timestamp: u64,
         nonce: u64,
         data: Vec<u8>,
-        reply_block: Option<veil_proto::ReplyBlock>,
+        reply_blocks: Vec<veil_proto::ReplyBlock>,
     ) -> veil_proto::AuthAppDeliver {
         let mut p = veil_proto::AuthAppDeliver {
             version: veil_proto::AuthAppDeliver::VERSION,
@@ -435,9 +435,10 @@ impl SovereignIdentity {
             app_id,
             endpoint_id,
             data,
-            // Optional one-time reply path — signed so a relay can't forge it.
-            // `None` for one-way sends.
-            reply_block,
+            // One-time reply paths — signed so a relay can neither forge one
+            // nor drop one to force the reply onto a single endpoint. Empty for
+            // one-way sends.
+            reply_blocks,
             signature: Vec::new(),
         };
         p.signature = self.identity_sk.sign(&p.signing_bytes());
@@ -1026,7 +1027,7 @@ mod tests {
             now,
             0x1234,
             b"hi from alice".to_vec(),
-            None,
+            Vec::new(),
         );
         assert_eq!(p.sender_node_id, *sov.node_id());
         assert_eq!(p.sig_key_idx, sov.sig_key_idx);
@@ -1082,11 +1083,11 @@ mod tests {
             now,
             0x1234,
             b"hi + reply path".to_vec(),
-            Some(rb.clone()),
+            vec![rb.clone()],
         );
         // The signed reply block survives a wire round-trip.
         let decoded = veil_proto::AuthAppDeliver::decode(&p.encode()).unwrap();
-        assert_eq!(decoded.reply_block, Some(rb));
+        assert_eq!(decoded.reply_blocks, vec![rb]);
         // It verifies as-is.
         assert_eq!(
             verify_auth_deliver(
@@ -1100,7 +1101,7 @@ mod tests {
         );
         // Tampering the reply block breaks the signature.
         let mut bad = decoded.clone();
-        bad.reply_block.as_mut().unwrap().rendezvous_node_id = [0xEE; 32];
+        bad.reply_blocks[0].rendezvous_node_id = [0xEE; 32];
         assert!(
             verify_auth_deliver(
                 &bad,

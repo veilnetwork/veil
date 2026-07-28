@@ -133,7 +133,7 @@ impl RuntimeMailboxCrypto {
             now,
             nonce,
             data.to_vec(),
-            None,
+            Vec::new(),
         );
         // Sealing to ourselves is a normal first-document operation. Never
         // depend on a DHT round-trip for our own certificate: the runtime owns

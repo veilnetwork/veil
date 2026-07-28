@@ -3394,7 +3394,7 @@ impl NodeRuntime {
             now_unix,
             nonce,
             data.to_vec(),
-            None, // direct onion path: no reply block (r3 wires rendezvous replies)
+            Vec::new(), // direct onion path: no reply blocks (r3 wires rendezvous replies)
         );
         let auth_bytes = auth.encode();
         // Final-hop tag byte: kind = APP_DELIVER_AUTH tells the receiver
@@ -9335,7 +9335,7 @@ impl NodeServices {
             now_unix,
             nonce,
             data.to_vec(),
-            reply_block,
+            reply_block.into_iter().collect(),
         );
         let auth_bytes = auth.encode();
         if auth_bytes.len() > veil_proto::MAX_AUTH_DELIVER_MSG_BYTES {
@@ -9403,7 +9403,15 @@ impl NodeServices {
                 relays.push(e);
             }
         }
-        let parallel = relays.len() > 1;
+        // Spreading pays ONLY for a message that actually fragments. A
+        // single-fragment message round-robins to exactly ONE relay at
+        // redundancy 1 (see the send loop), which is strictly fewer copies than
+        // the caller's redundant retransmit down one relay. On the reply path —
+        // fire-and-forget, no end-to-end ack — that would trade reliability for
+        // a throughput win that a one-fragment message cannot even collect.
+        // `frag_count` is known here, so gate on it rather than on relay count
+        // alone.
+        let parallel = relays.len() > 1 && frag_count >= BULK_FRAGMENT_THRESHOLD;
 
         // Reliability vs parallelism. With ONE relay, a multi-fragment (bulk)
         // message needs redundant retransmit to survive cell loss (reassembly is
@@ -9597,7 +9605,7 @@ impl NodeServices {
             now_unix,
             nonce,
             data.to_vec(),
-            reply_block,
+            reply_block.into_iter().collect(),
         );
         let auth_bytes = auth.encode();
         if auth_bytes.len() > veil_proto::MAX_AUTH_DELIVER_MSG_BYTES {
@@ -10656,13 +10664,15 @@ impl NodeServices {
         // reply path.
         // D3: only the app that received the original message (and was handed
         // this reply_id) may reply through it — peek enforces the owner binding.
-        let Some(block) = self
+        let Some(blocks) = self
             .anonymity
             .reply_block_store
             .peek(reply_id, src_app_id, now)
         else {
             return Err(AnonOnionSendError::NoRendezvous);
         };
+        // `peek` never yields an empty list, so `blocks[0]` is sound below.
+        let primary = &blocks[0];
 
         // Reconstruct the original sender's rendezvous path as a synthetic ad.
         // Only the four routing fields are read downstream
@@ -10670,7 +10680,7 @@ impl NodeServices {
         // signed-ad fields are irrelevant here because the path came from a
         // signature-bound reply block, not a DHT lookup, so it needs no
         // re-verification. Validity bounds are set wide-open for the same reason.
-        let ad = veil_anonymity::rendezvous::RendezvousAd {
+        let synthetic = |block: &veil_proto::ReplyBlock| veil_anonymity::rendezvous::RendezvousAd {
             receiver_node_id: block.receiver_node_id,
             rendezvous_node_id: block.rendezvous_node_id,
             auth_cookie: block.auth_cookie,
@@ -10688,15 +10698,42 @@ impl NodeServices {
             // Inert: the synthetic ad is never re-encoded or verified.
             wire_version: 0,
         };
-
-        // Pre-resolve the reply relay's directory entry into our local shard so
-        // the onion build can reach it (same fix as `send_anonymous_*_to`).
-        let relay_key = veil_anonymity::directory::relay_directory_dht_key(&ad.rendezvous_node_id);
-        if self.dht.get_local(&relay_key).is_none()
-            && let Some(bytes) = self.dht_recursive_get(relay_key, RESOLVE_TIMEOUT).await
-        {
-            self.dht.store_local(relay_key, bytes);
+        // One ad per DISTINCT rendezvous relay the original sender registered
+        // under. `send_via_rendezvous_authenticated` round-robins a fragmented
+        // reply across them, so the reply's aggregate throughput stops being one
+        // relay's — duplicates would just funnel it back onto one endpoint.
+        let mut ads: Vec<veil_anonymity::rendezvous::RendezvousAd> = Vec::new();
+        for block in &blocks {
+            if !ads
+                .iter()
+                .any(|a| a.rendezvous_node_id == block.rendezvous_node_id)
+            {
+                ads.push(synthetic(block));
+            }
         }
+
+        // Pre-resolve EVERY reply relay's directory entry into our local shard
+        // so the onion build can reach it (same fix as `send_anonymous_*_to`).
+        // A relay whose entry cannot be resolved is dropped rather than left to
+        // fail the build: the remaining relays still carry the reply, and
+        // keeping it would hand round-robin a hop it cannot route.
+        let mut resolved: Vec<veil_anonymity::rendezvous::RendezvousAd> = Vec::new();
+        for ad in ads {
+            let relay_key =
+                veil_anonymity::directory::relay_directory_dht_key(&ad.rendezvous_node_id);
+            if self.dht.get_local(&relay_key).is_none()
+                && let Some(bytes) = self.dht_recursive_get(relay_key, RESOLVE_TIMEOUT).await
+            {
+                self.dht.store_local(relay_key, bytes);
+            }
+            if self.dht.get_local(&relay_key).is_some() || resolved.is_empty() {
+                // The first relay is kept even unresolved: it is the one the
+                // pre-multi-block path always used, so dropping it would turn a
+                // previously-working single-relay reply into `NoRendezvous`.
+                resolved.push(ad);
+            }
+        }
+        let ads = resolved;
 
         // Reverse-leg RD-staleness fix: the introduce cell `send_via_rendezvous_
         // authenticated` builds needs several DISTINCT relays whose RD is fresh
@@ -10742,10 +10779,12 @@ impl NodeServices {
         }
 
         self.send_via_rendezvous_authenticated(
-            &ad,
-            &[], // a reply targets the one relay in the reply block
-            block.reply_app_id,
-            block.reply_endpoint_id,
+            &ads[0],
+            // Every extra relay the sender registered under. Empty on a
+            // single-block reply, which is then byte-for-byte the old path.
+            &ads[1..],
+            primary.reply_app_id,
+            primary.reply_endpoint_id,
             data,
             hop_count,
             None,
