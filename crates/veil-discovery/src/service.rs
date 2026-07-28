@@ -11,6 +11,7 @@ use std::{
     time::{Instant, SystemTime, UNIX_EPOCH},
 };
 use veil_util::lock;
+use zeroize::Zeroizing;
 
 use veil_dht::KademliaService;
 use veil_proto::discovery::{
@@ -68,13 +69,25 @@ pub struct DiscoveryService {
 /// per-node Falcon-512 key material used to sign DHT records.
 ///
 /// Stored as base64 strings so the signer plugs directly into
-/// [`veil_crypto::sign_message`] without extra decoding.
-#[derive(Clone, Debug)]
+/// [`veil_crypto::sign_message`] without extra decoding. The private key is
+/// held in [`Zeroizing`] so its heap buffer is scrubbed on drop (and on
+/// `clone` replacement) rather than lingering in freed memory / swap.
+#[derive(Clone)]
 pub struct FalconSigner {
     /// Raw (non-base64) public-key bytes — 897 bytes for Falcon-512.
     pub public_key: Vec<u8>,
     /// Base64-encoded private key, as emitted by `crypto::generate_keypair`.
-    pub private_key_b64: String,
+    pub private_key_b64: Zeroizing<String>,
+}
+
+impl core::fmt::Debug for FalconSigner {
+    /// Redacted: never prints the private key.
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("FalconSigner")
+            .field("public_key", &self.public_key)
+            .field("private_key_b64", &"<redacted>")
+            .finish()
+    }
 }
 
 impl DiscoveryService {

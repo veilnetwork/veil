@@ -41,7 +41,7 @@ pub fn load_falcon_signer(config: &Config) -> Option<Arc<FalconSigner>> {
     let pubkey_bytes = STANDARD.decode(&identity.public_key).ok()?;
     Some(Arc::new(FalconSigner {
         public_key: pubkey_bytes,
-        private_key_b64: identity.private_key.clone(),
+        private_key_b64: zeroize::Zeroizing::new(identity.private_key.clone()),
     }))
 }
 
