@@ -9946,9 +9946,22 @@ impl NodeServices {
             .next()
             .ok_or(AnonOnionSendError::NoRendezvous)?;
 
+        // Other provider slots published by the SAME node are additional
+        // introduction points to one service instance, so a FRAGMENTED message
+        // can be round-robined across them instead of funnelling redundant
+        // copies of every fragment through one relay — which is what caps bulk
+        // throughput here, since reassembly is all-or-nothing. (A single-
+        // fragment message is unaffected: the spread is gated on frag_count.)
+        //
+        // Ads from OTHER providers are DIFFERENT NODES holding the same
+        // content. They must never be mixed in: each fragment would go to
+        // whichever node the round-robin landed on, and no node would ever
+        // hold the whole message.
+        let extra_ads = Self::same_node_extra_ads(&ads, ad);
+
         self.send_via_rendezvous_authenticated(
             ad,
-            &[], // by-identity resolves a single descriptor → one relay, no spread
+            &extra_ads,
             target_app_id,
             target_endpoint_id,
             data,
@@ -10352,6 +10365,33 @@ impl NodeServices {
     /// a wrong-period attempt simply fails to open). Also pre-resolves the
     /// rendezvous relay's directory entry into our local shard so the onion build
     /// finds it. `NoRendezvous` if no descriptor resolves/decrypts.
+    /// The other introduction points of the SAME service instance as
+    /// `primary`: ads that name the same receiver node at a different
+    /// rendezvous relay, deduplicated by relay.
+    ///
+    /// A service may publish into several provider slots, and ads from OTHER
+    /// providers are DIFFERENT NODES holding the same content. Those must never
+    /// be mixed in: round-robin would send each fragment to whichever node it
+    /// landed on, and no node would ever hold the whole message.
+    fn same_node_extra_ads(
+        ads: &[veil_anonymity::rendezvous::RendezvousAd],
+        primary: &veil_anonymity::rendezvous::RendezvousAd,
+    ) -> Vec<veil_anonymity::rendezvous::RendezvousAd> {
+        let mut extras: Vec<veil_anonymity::rendezvous::RendezvousAd> = Vec::new();
+        for candidate in ads {
+            if candidate.receiver_node_id != primary.receiver_node_id
+                || candidate.rendezvous_node_id == primary.rendezvous_node_id
+                || extras
+                    .iter()
+                    .any(|e| e.rendezvous_node_id == candidate.rendezvous_node_id)
+            {
+                continue;
+            }
+            extras.push(candidate.clone());
+        }
+        extras
+    }
+
     fn select_rendezvous_candidates<'a>(
         ads: &'a [veil_anonymity::rendezvous::RendezvousAd],
         request_bytes: &[u8],
