@@ -31,6 +31,14 @@ name: release
 #   * `CARGO_INCREMENTAL=0` so no per-machine state leaks in.
 
 on:
+  # A tag builds the artifacts. That is the whole point of tagging a release,
+  # and doing it by hand meant the binaries lagged the tag — or, worse, were
+  # built from a commit a later history rewrite had already orphaned.
+  # The heavy test matrix does NOT run here: ci.yml is manual by design, and
+  # hygiene is enforced by the local pre-tag gate.
+  push:
+    tags:
+      - 'v[0-9]+.[0-9]+.[0-9]+'
   workflow_dispatch:
     inputs:
       version:
@@ -49,6 +57,16 @@ on:
 
 permissions:
   contents: write  # for release-attach
+
+env:
+  # A dispatch passes the bare semver ('0.4.1'); a tag push gives the ref name
+  # ('v0.4.1'). Normalise both ways once, here, so no step has to care which
+  # trigger it is running under.
+  RELEASE_TAG: ${{ inputs.version && format('v{0}', inputs.version) || github.ref_name }}
+  # Attaching to an existing Release is an explicit dispatch choice; a tag push
+  # always produces a DRAFT, because publishing is a decision a person makes
+  # after looking at the artifacts.
+  RELEASE_DRAFT: ${{ github.event_name != 'workflow_dispatch' || !inputs.release_existing }}
 
 jobs:
   build:
@@ -196,14 +214,32 @@ jobs:
       - name: Sign manifest (host build only — has signing key)
         if: steps.identity.outputs.path != ''
         run: |
+          set -euo pipefail
+          # A tag push hands us 'v0.4.1'; build-release.sh wants bare semver.
+          VERSION="${VERSION#v}"
+          # No automatic value for min-compatible is defensible in general, so
+          # fall back to the .0 of this minor line: 0.4.1 accepts updates from
+          # 0.4.0 up. Override with a dispatch when a release needs different
+          # reach.
+          if [ -z "$MIN_COMPAT" ]; then
+            MIN_COMPAT="${VERSION%.*}.0"
+          fi
+          echo "version=$VERSION min-compatible=$MIN_COMPAT"
           ./scripts/build-release.sh \
             --target ${{ matrix.triple }} \
             --source-date-epoch ${{ steps.epoch.outputs.value }} \
             --sign \
             --identity ${{ steps.identity.outputs.path }} \
-            --version ${{ inputs.version }} \
-            --min-compatible-version ${{ inputs.min_compatible_version }} \
-            --binary-url 'https://github.com/${{ github.repository }}/releases/download/v${{ inputs.version }}/veil-cli-${{ matrix.triple }}'
+            --version "$VERSION" \
+            --min-compatible-version "$MIN_COMPAT" \
+            --binary-url "https://github.com/${{ github.repository }}/releases/download/$RELEASE_TAG/veil-cli-${{ matrix.triple }}"
+        env:
+          # `min_compatible_version` has no sane automatic value, so a tag push
+          # defaults to the .0 of its own minor line: 0.4.1 accepts updates
+          # from 0.4.0 and up. Widen or narrow it with a dispatch when a
+          # release needs different reach.
+          VERSION: ${{ inputs.version || github.ref_name }}
+          MIN_COMPAT: ${{ inputs.min_compatible_version }}
 
       - name: Upload artifact
         uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
@@ -297,9 +333,9 @@ jobs:
       - name: Attach to Release
         uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
-          tag_name: v${{ inputs.version }}
-          name: Release v${{ inputs.version }}
-          draft: ${{ !inputs.release_existing }}
+          tag_name: ${{ env.RELEASE_TAG }}
+          name: Release ${{ env.RELEASE_TAG }}
+          draft: ${{ env.RELEASE_DRAFT }}
           files: out/*
           fail_on_unmatched_files: true
           generate_release_notes: true
