@@ -1,10 +1,15 @@
 name: CI
 
 on:
-  push:
-    tags:
-      - 'v[0-9]+.[0-9]+.[0-9]+'
   workflow_dispatch:
+
+# 2026-07-28: the tag trigger is gone. Tag-time CI cost over an hour of runner
+# time per release while re-proving what the local pre-tag gate had already
+# proven minutes earlier — and the gate is not optional, it is how hygiene is
+# enforced here (see the note below). What a tag still starts is artifact
+# building only: mobile-build.yml on 'v*', and release.yml by hand. Run this
+# workflow with `gh workflow run ci.yml` when a change deserves the full
+# multi-OS matrix.
 
 # Audit batch 2026-05-27 Phase Q.6: reverted to tag-only triggering
 # after PR/branch-push runs exhausted the org's GitHub Actions
