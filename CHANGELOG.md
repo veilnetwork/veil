@@ -1,5 +1,20 @@
 # Changelog
 
+## Unreleased
+
+### Documentation
+
+- **The deferred obfuscated-UDP transport is written down** (`TASKS.md`). It
+  was parked by operator decision on 2026-07-05 and then disappeared: the
+  design note lived in a session scratchpad, no backlog row was ever added, and
+  the only trace left is the `veil-udp-obfs` crate — which looks like a
+  finished feature because it is used, just for something far smaller than what
+  was intended. The row states what the crate is (a per-datagram AEAD wrapper
+  for mesh realm DATA), what it is not (no handshake, listener, stream or
+  reliability layer), what completing it would cost, why it was parked (the
+  failure that prompted it was a PMTU blackhole, not DPI), and what re-opens it.
+
+
 ## v0.4.1 — 2026-07-28
 
 macOS call audio. No Rust code changed: the fix is in the `veil_media` Flutter
