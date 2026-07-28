@@ -1,5 +1,44 @@
 # Changelog
 
+## v0.4.1 — 2026-07-28
+
+macOS call audio. No Rust code changed: the fix is in the `veil_media` Flutter
+plugin, which is built by its own script rather than by cargo.
+
+### Fixed
+
+- **Calls on macOS had no audio in either direction.** The audio device module
+  applies the app's stored microphone preference with `setDeviceID:` on the
+  input node's `AUAudioUnit`. That property is only settable while the unit
+  holds no render resources, and merely READING `engine_.inputNode` a few lines
+  earlier already allocates them — so the setter returned -10851
+  (`kAudioUnitErr_InvalidPropertyValue`) every single time. The failure was
+  logged and ignored, but it left the input unit unable to initialise, and
+  because the node stays in the graph the whole engine then failed to start
+  with -10875 (`kAudioUnitErr_FailedInitialization`). Playout died with it,
+  though playout does not depend on the input device at all, and every API
+  still reported success: `mic permission=true`, `startAudio=true`.
+
+  Measured on a Mac↔Android p2p call: 0.2 packets/s of 32-byte DTX comfort
+  noise from the Mac against the 50 packets/s of real Opus the phone was
+  sending, with the Mac's jitter buffer growing past four seconds. After the
+  fix both directions carry 50.6 and 50.7 packets/s with buffers steady at
+  53 ms and 49 ms.
+
+  Three parts: deallocate the input unit's render resources before setting the
+  device; on failure fall back to the system default rather than insisting on a
+  device the unit refused; and if the engine still will not start, rebuild it
+  once from scratch, because a poisoned input unit stays in the graph and
+  restarting the same engine fails identically.
+
+### Note for macOS builders
+
+`libveil_media.dylib` is gitignored and bundled from
+`flutter/veil_media/macos/Frameworks/`, so a checkout that never runs
+`macos/build_veil_media_dylib.sh` keeps whatever binary is already sitting
+there. The copy on the machine where this was found was four days older than
+the sources, and nothing in the build output said so.
+
 ## v0.4.0 — 2026-07-28
 
 Feature release with security fixes. Two API changes make this a minor bump on
