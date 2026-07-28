@@ -366,6 +366,9 @@ class VeilAvfAdm : public webrtc::webrtc_impl::AudioDeviceModuleDefault<
   bool Playing() const override { return playing_.load(); }
 
  private:
+  // Guards the single engine rebuild attempted after a failed start.
+  int rebuild_depth_ = 0;
+
   // Rebuild engine run-state to match recording_/playing_. Runs on engine_queue_.
   void ReconfigureLocked() {
     EnsureEngineLocked();
@@ -404,11 +407,31 @@ class VeilAvfAdm : public webrtc::webrtc_impl::AudioDeviceModuleDefault<
         const AudioDeviceID requested = recording_device_id_.load();
         if (requested != kAudioObjectUnknown) {
           NSError* device_error = nil;
-          if (![input.AUAudioUnit setDeviceID:requested error:&device_error]) {
+          AUAudioUnit* input_au = input.AUAudioUnit;
+          // `deviceID` is only settable while the unit holds no render
+          // resources, and merely READING `engine_.inputNode` above already
+          // allocates them on macOS. Without this the setter always returned
+          // -10851 (kAudioUnitErr_InvalidPropertyValue), which then left the
+          // input AU unable to initialise and took `[engine_ start]` down with
+          // -10875 (kAudioUnitErr_FailedInitialization) — killing PLAYOUT too,
+          // though playout does not depend on the input device at all.
+          // Symptom: both call directions silent while every API reported
+          // success.
+          @try {
+            [input_au deallocateRenderResources];
+          } @catch (NSException* e) {
+            alog("avf_adm: deallocateRenderResources threw (%s)",
+                 e.reason.UTF8String ? e.reason.UTF8String : "?");
+          }
+          if (![input_au setDeviceID:requested error:&device_error]) {
             alog("avf_adm: input device switch failed: %s",
                  device_error
                      ? device_error.localizedDescription.UTF8String
                      : "?");
+            // Fall back to the system default instead of insisting on a device
+            // the unit refused: a device preference must never cost the call
+            // its audio.
+            recording_device_id_.store(kAudioObjectUnknown);
           }
         }
 #endif
@@ -449,6 +472,37 @@ class VeilAvfAdm : public webrtc::webrtc_impl::AudioDeviceModuleDefault<
         if (![engine_ startAndReturnError:&err]) {
           alog("avf_adm: engine start FAILED: %s",
                err ? err.localizedDescription.UTF8String : "?");
+          // Losing capture must not also lose playout — the far side's voice
+          // does not travel through the input graph. Once the input AU has
+          // failed to initialise it stays in the graph and every restart of
+          // THIS engine fails the same way, so rebuild from scratch on the
+          // system default instead of retrying the poisoned one. Bounded to a
+          // single rebuild so a genuinely broken output cannot loop.
+          if (rebuild_depth_ == 0) {
+            rebuild_depth_ = 1;
+            alog("avf_adm: rebuilding the engine after a failed start");
+            recording_device_id_.store(kAudioObjectUnknown);
+            if (capture_tap_installed_) {
+              @try {
+                [engine_.inputNode removeTapOnBus:0];
+              } @catch (NSException* e) {
+                alog("avf_adm: rebuild removeTapOnBus threw (%s)",
+                     e.reason.UTF8String ? e.reason.UTF8String : "?");
+              }
+              capture_tap_installed_ = false;
+            }
+            @try {
+              [engine_ stop];
+            } @catch (NSException* e) {
+              alog("avf_adm: rebuild stop threw (%s)",
+                   e.reason.UTF8String ? e.reason.UTF8String : "?");
+            }
+            engine_ = nil;
+            source_node_ = nil;
+            ReconfigureLocked();
+            rebuild_depth_ = 0;
+            return;
+          }
         } else {
           alog("avf_adm: engine running (rec=%d play=%d)",
                (int)recording_.load(), (int)playing_.load());
