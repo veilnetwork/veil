@@ -534,7 +534,7 @@ mod tests {
             app_id: [0xCC; 32],
             endpoint_id: 7,
             data: b"authentic hello".to_vec(),
-            reply_block: None,
+            reply_blocks: Vec::new(),
             signature: Vec::new(),
         };
         p.signature = sign_message(

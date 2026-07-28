@@ -604,8 +604,8 @@ pub const AUTH_APP_DELIVER_DOMAIN: &[u8] = b"veil-auth-onion-deliver:v1\0";
 /// [83..87]   endpoint_id u32 BE
 /// [87..91]   data_len u32 BE
 /// [91..91+data_len] data
-/// [..]       has_reply u8         (1 = a ReplyBlock follows, 0 = none)
-/// [..]       reply_block          (ReplyBlock::WIRE_SIZE B, only if has_reply)
+/// [..]       reply_count u8       (number of ReplyBlocks that follow, 0 = none)
+/// [..]       reply_blocks         (reply_count * ReplyBlock::WIRE_SIZE B)
 /// [..+2]     sig_len u16 BE
 /// [..]       signature            (Ed25519 = 64 B in v1)
 /// ```
@@ -635,13 +635,24 @@ pub struct AuthAppDeliver {
     pub endpoint_id: u32,
     /// Application payload.
     pub data: Vec<u8>,
-    /// Optional one-time reply path (Mixminion-style reply block). When present
-    /// the recipient can reply WITHOUT the sender publishing a public
-    /// `RendezvousAd` — the sender embeds a sealed reply path here and registers
-    /// R-locally with the named rendezvous relay. Signed (part of
-    /// [`Self::signing_bytes`]) so a relay cannot forge/alter it. `None` =
+    /// One-time reply paths (Mixminion-style reply blocks). When non-empty the
+    /// recipient can reply WITHOUT the sender publishing a public
+    /// `RendezvousAd` — the sender embeds sealed reply paths here and registers
+    /// R-locally with each named rendezvous relay. Signed (part of
+    /// [`Self::signing_bytes`]) so a relay cannot forge/alter them. Empty =
     /// one-way (no reply).
-    pub reply_block: Option<ReplyBlock>,
+    ///
+    /// SEVERAL blocks name DISTINCT rendezvous relays for the same sender, which
+    /// is what lets the replier round-robin the reply's fragments across
+    /// independent endpoints instead of funnelling redundant copies of every
+    /// fragment through one relay. Reassembly is all-or-nothing, so a reply big
+    /// enough to fragment is otherwise forced to buy reliability with redundancy
+    /// — which is exactly what caps bulk reply throughput.
+    ///
+    /// No new exposure per extra block: each names a relay the sender itself
+    /// registered the SAME cookie with, and the whole list is signature-bound.
+    /// Bounded by [`MAX_REPLY_BLOCKS`] so the envelope cannot be inflated.
+    pub reply_blocks: Vec<ReplyBlock>,
     /// Signature over [`Self::signing_bytes`] by the sender's subkey.
     pub signature: Vec<u8>,
 }
@@ -750,14 +761,13 @@ impl AuthAppDeliver {
         b.extend_from_slice(&self.app_id);
         b.extend_from_slice(&self.endpoint_id.to_be_bytes());
         b.extend_from_slice(&self.data);
-        // Optional reply block — a presence byte then its bytes (so the
-        // signature binds both whether a reply path exists AND its contents).
-        match &self.reply_block {
-            Some(rb) => {
-                b.push(1);
-                rb.write_into(&mut b);
-            }
-            None => b.push(0),
+        // Reply blocks — a count byte then their bytes (so the signature binds
+        // both HOW MANY reply paths exist and each one's contents; a relay can
+        // therefore neither add a relay of its own nor drop one to force the
+        // reply back onto a single endpoint it watches).
+        b.push(self.reply_blocks.len() as u8);
+        for rb in &self.reply_blocks {
+            rb.write_into(&mut b);
         }
         b
     }
@@ -783,14 +793,11 @@ impl AuthAppDeliver {
         buf.extend_from_slice(&self.endpoint_id.to_be_bytes());
         buf.extend_from_slice(&(self.data.len() as u32).to_be_bytes());
         buf.extend_from_slice(&self.data);
-        // Optional reply block (presence byte + bytes) — between data and the
-        // signature, matching `signing_bytes` so the sig covers it.
-        match &self.reply_block {
-            Some(rb) => {
-                buf.push(1);
-                rb.write_into(&mut buf);
-            }
-            None => buf.push(0),
+        // Reply blocks (count byte + bytes) — between data and the signature,
+        // matching `signing_bytes` so the sig covers them.
+        buf.push(self.reply_blocks.len() as u8);
+        for rb in &self.reply_blocks {
+            rb.write_into(&mut buf);
         }
         buf.extend_from_slice(&(self.signature.len() as u16).to_be_bytes());
         buf.extend_from_slice(&self.signature);
@@ -836,30 +843,34 @@ impl AuthAppDeliver {
                 got: buf.len(),
             });
         }
-        let (reply_block, reply_end) = match buf[data_end] {
-            0 => (None, data_end + 1),
-            1 => {
-                let rb_start = data_end + 1;
-                let rb_end = rb_start.checked_add(ReplyBlock::WIRE_SIZE).ok_or(
-                    ProtoError::BufferTooShort {
+        let count = buf[data_end] as usize;
+        // Bounded BEFORE any arithmetic on it: the count is attacker-controlled
+        // and an unbounded one would let a single byte demand a huge read.
+        if count > MAX_REPLY_BLOCKS {
+            return Err(ProtoError::Malformed(format!(
+                "AuthAppDeliver: {count} reply blocks exceeds the {MAX_REPLY_BLOCKS} cap"
+            )));
+        }
+        let mut reply_blocks = Vec::with_capacity(count);
+        let mut cursor = data_end + 1;
+        for _ in 0..count {
+            let rb_end =
+                cursor
+                    .checked_add(ReplyBlock::WIRE_SIZE)
+                    .ok_or(ProtoError::BufferTooShort {
                         need: usize::MAX,
                         got: buf.len(),
-                    },
-                )?;
-                if buf.len() < rb_end {
-                    return Err(ProtoError::BufferTooShort {
-                        need: rb_end,
-                        got: buf.len(),
-                    });
-                }
-                (Some(ReplyBlock::decode(&buf[rb_start..rb_end])?), rb_end)
+                    })?;
+            if buf.len() < rb_end {
+                return Err(ProtoError::BufferTooShort {
+                    need: rb_end,
+                    got: buf.len(),
+                });
             }
-            other => {
-                return Err(ProtoError::Malformed(format!(
-                    "AuthAppDeliver: invalid reply-presence byte {other}"
-                )));
-            }
-        };
+            reply_blocks.push(ReplyBlock::decode(&buf[cursor..rb_end])?);
+            cursor = rb_end;
+        }
+        let reply_end = cursor;
         // sig_len (u16) follows the (optional) reply block.
         let sig_len_end = reply_end.checked_add(2).ok_or(ProtoError::BufferTooShort {
             need: usize::MAX,
@@ -901,7 +912,7 @@ impl AuthAppDeliver {
             app_id,
             endpoint_id,
             data: buf[Self::HEADER_SIZE..data_end].to_vec(),
-            reply_block,
+            reply_blocks,
             signature: buf[sig_len_end..total].to_vec(),
         })
     }
@@ -912,6 +923,14 @@ impl AuthAppDeliver {
 /// Max fragments a single authenticated rendezvous message may be split into.
 /// Bounds the receiver's per-message reassembly buffer count.
 pub const MAX_AUTH_DELIVER_FRAGMENTS: u16 = 64;
+
+/// Most reply paths one [`AuthAppDeliver`] may carry.
+///
+/// Each block is [`ReplyBlock::WIRE_SIZE`] on the wire and inside the signed
+/// bytes, so the cap is what stops a sender inflating every envelope; four is
+/// enough spread to keep a fragmented reply off a single endpoint without the
+/// blocks starting to dominate a small message.
+pub const MAX_REPLY_BLOCKS: usize = 4;
 
 /// Max reassembled `AuthAppDeliver` wire size (across all fragments). Bounds
 /// receiver memory per message; the sender enforces the matching application
@@ -6102,7 +6121,7 @@ mod tests {
             app_id: [0xCC; 32],
             endpoint_id: 42,
             data: b"hi bob, it's authentically alice".to_vec(),
-            reply_block: None,
+            reply_blocks: Vec::new(),
             signature: vec![0x5A; 64], // Ed25519-sized
         }
     }
@@ -6199,25 +6218,103 @@ mod tests {
     #[test]
     fn auth_app_deliver_with_reply_block_roundtrips() {
         let mut p = sample_auth_deliver();
-        p.reply_block = Some(sample_reply_block());
+        p.reply_blocks = vec![sample_reply_block()];
         let decoded = AuthAppDeliver::decode(&p.encode()).expect("decode");
         // Only dst_node_id is dropped on the wire; the reply block survives.
         let mut expected = p.clone();
         expected.dst_node_id = [0u8; 32];
         assert_eq!(decoded, expected);
-        assert_eq!(decoded.reply_block, Some(sample_reply_block()));
+        assert_eq!(decoded.reply_blocks, vec![sample_reply_block()]);
+    }
+
+    #[test]
+    fn auth_app_deliver_carries_several_reply_blocks() {
+        let mut p = sample_auth_deliver();
+        p.reply_blocks = (1..=3).map(|_| sample_reply_block()).collect();
+        let decoded = AuthAppDeliver::decode(&p.encode()).expect("decode");
+        assert_eq!(decoded.reply_blocks.len(), 3);
+        assert_eq!(decoded.reply_blocks, p.reply_blocks);
+    }
+
+    #[test]
+    fn auth_app_deliver_signing_binds_the_reply_block_count() {
+        // `signing_bytes` writes `data` with NO length prefix and the blocks
+        // straight after it, so without a count byte the boundary between them
+        // is ambiguous: "data ending in block bytes, zero blocks" and "shorter
+        // data, one block" would produce the SAME signed string. One signature
+        // would then authenticate both readings, and a relay could re-cut the
+        // envelope to strip the reply path — or invent one.
+        //
+        // Comparing 3 blocks against 1 does NOT test this: blocks are fixed
+        // size, so those two already differ in length whether or not the count
+        // is signed. Verified by breaking — that version stayed green.
+        let block = sample_reply_block();
+        let mut with_block = sample_auth_deliver();
+        with_block.reply_blocks = vec![block.clone()];
+
+        let mut absorbed = sample_auth_deliver();
+        absorbed.data.extend_from_slice(&block.encode());
+        absorbed.reply_blocks.clear();
+
+        assert_ne!(
+            with_block.signing_bytes(),
+            absorbed.signing_bytes(),
+            "the count must separate the payload from the reply blocks",
+        );
+    }
+
+    #[test]
+    fn auth_app_deliver_refuses_more_reply_blocks_than_the_cap() {
+        // The count is attacker-controlled, so the cap must be enforced on
+        // DECODE and not merely respected by our own encoder.
+        let mut ok = sample_auth_deliver();
+        ok.reply_blocks = (0..MAX_REPLY_BLOCKS).map(|_| sample_reply_block()).collect();
+        assert!(
+            AuthAppDeliver::decode(&ok.encode()).is_ok(),
+            "exactly the cap must still decode, or the test proves nothing",
+        );
+
+        // FULLY FORMED over-cap envelope: an earlier version only bumped the
+        // count byte without supplying the extra block, so decode refused it
+        // for a SHORT BUFFER and the test stayed green with the cap check
+        // deleted. Verified by breaking.
+        let mut over = sample_auth_deliver();
+        over.reply_blocks = (0..=MAX_REPLY_BLOCKS).map(|_| sample_reply_block()).collect();
+        let err = AuthAppDeliver::decode(&over.encode()).unwrap_err();
+        assert!(
+            format!("{err:?}").contains("cap"),
+            "must be refused BY THE CAP, not incidentally: {err:?}",
+        );
+    }
+
+    #[test]
+    fn one_reply_block_encodes_exactly_as_the_old_single_block_form() {
+        // The count byte replaced a 0/1 presence byte, so 0 and 1 must stay
+        // byte-identical: only a genuinely multi-block envelope differs.
+        let mut p = sample_auth_deliver();
+        p.reply_blocks = vec![sample_reply_block()];
+        let encoded = p.encode();
+        let count_at = AuthAppDeliver::HEADER_SIZE + p.data.len();
+        assert_eq!(encoded[count_at], 1);
+        assert_eq!(
+            &encoded[count_at + 1..count_at + 1 + ReplyBlock::WIRE_SIZE],
+            &sample_reply_block().encode()[..],
+        );
+        let mut none = sample_auth_deliver();
+        none.reply_blocks.clear();
+        assert_eq!(none.encode()[count_at], 0);
     }
 
     #[test]
     fn auth_app_deliver_signing_binds_reply_block() {
-        let none = sample_auth_deliver(); // reply_block: None
+        let none = sample_auth_deliver(); // reply_blocks: empty
         let mut some = none.clone();
-        some.reply_block = Some(sample_reply_block());
+        some.reply_blocks = vec![sample_reply_block()];
         // Presence of a reply block changes the signed bytes.
         assert_ne!(none.signing_bytes(), some.signing_bytes());
         // Altering the block's contents changes the signed bytes (unforgeable).
         let mut other = some.clone();
-        other.reply_block.as_mut().unwrap().auth_cookie = [0xFF; 16];
+        other.reply_blocks[0].auth_cookie = [0xFF; 16];
         assert_ne!(some.signing_bytes(), other.signing_bytes());
     }
 
