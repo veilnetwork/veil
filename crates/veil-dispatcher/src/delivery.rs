@@ -1460,7 +1460,7 @@ impl FrameDispatcher {
             }
         };
         let now = veil_util::unix_secs_now_u64();
-        let result = lock!(self.chunk_reassembler).add(&envelope, chunk, now);
+        let result = lock!(self.chunk_reassembler).add(&envelope, *peer_id.as_bytes(), chunk, now);
         match result {
             AddChunkResult::Complete(reassembled) => {
                 if let Some(m) = &self.metrics {

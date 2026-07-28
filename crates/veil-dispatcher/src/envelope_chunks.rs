@@ -37,6 +37,19 @@ pub const MAX_TRANSFERS_PER_SENDER: usize = MAX_CONCURRENT_TRANSFERS / 4;
 /// [`MAX_TRANSFERS_PER_SENDER`].
 pub const MAX_REASSEMBLY_BYTES_PER_SENDER: usize = MAX_REASSEMBLY_BYTES / 4;
 
+/// Same fairness quota, keyed on the AUTHENTICATED previous hop instead of the
+/// envelope's `sender_node_id`. The per-sender quota above reads a cleartext
+/// wire field of a relayed envelope, so one hostile peer defeats it completely
+/// by varying `sender_node_id` per transfer — it would still open every slot
+/// and take the whole global budget, which is exactly what
+/// [`MAX_TRANSFERS_PER_SENDER`] exists to prevent. Deliberately LOOSER than the
+/// per-sender bound: a legitimate relay carries many senders' transfers on one
+/// session and must not be squeezed to a single sender's allowance.
+pub const MAX_TRANSFERS_PER_PEER: usize = MAX_CONCURRENT_TRANSFERS / 2;
+
+/// Per-peer cap on buffered reassembly bytes — see [`MAX_TRANSFERS_PER_PEER`].
+pub const MAX_REASSEMBLY_BYTES_PER_PEER: usize = MAX_REASSEMBLY_BYTES / 2;
+
 /// Recently completed transfer ids retained to suppress the tail of a whole-
 /// batch retransmit. Without this, the chunk that fills the final hole removes
 /// the active state and later duplicate indices in the same retry open a new
@@ -70,6 +83,9 @@ struct TransferState {
     // across all chunks of one transfer; used to rebuild the original envelope.
     recipient: veil_proto::recipient::Recipient,
     sender_node_id: [u8; 32],
+    /// Authenticated previous hop that opened this transfer. Unlike
+    /// `sender_node_id` this cannot be chosen by the peer.
+    peer_id: [u8; 32],
     src_app_id: [u8; 32],
     app_id: [u8; 32],
     endpoint_id: u32,
@@ -118,6 +134,7 @@ impl EnvelopeChunkReassembler {
     pub fn add(
         &mut self,
         envelope: &DeliveryEnvelope,
+        peer_id: [u8; 32],
         chunk: ChunkedEnvelopePayload,
         now: u64,
     ) -> AddChunkResult {
@@ -132,8 +149,7 @@ impl EnvelopeChunkReassembler {
             };
         }
 
-        let entry = self.transfers.get_mut(&chunk.transfer_id);
-        if entry.is_none() {
+        if !self.transfers.contains_key(&chunk.transfer_id) {
             // New transfer — enforce concurrency + global byte caps before
             // allocating the per-chunk vector.
             if self.transfers.len() >= MAX_CONCURRENT_TRANSFERS {
@@ -150,18 +166,19 @@ impl EnvelopeChunkReassembler {
             // others. Computed on the fly from the (≤64) in-flight transfers so
             // there is no per-sender counter to keep in sync.
             let sender = envelope.sender_node_id;
-            let (sender_transfers, sender_bytes) = self
-                .transfers
-                .values()
-                .filter(|s| s.sender_node_id == sender)
-                .fold((0usize, 0usize), |(c, b), s| {
-                    (c + 1, b.saturating_add(s.received_bytes))
-                });
+            let (sender_transfers, sender_bytes) = self.usage(|s| s.sender_node_id == sender);
             if sender_transfers >= MAX_TRANSFERS_PER_SENDER {
                 return AddChunkResult::Rejected("per-sender transfer quota exceeded");
             }
             if sender_bytes.saturating_add(chunk.data.len()) > MAX_REASSEMBLY_BYTES_PER_SENDER {
                 return AddChunkResult::Rejected("per-sender reassembly byte quota exceeded");
+            }
+            let (peer_transfers, peer_bytes) = self.usage(|s| s.peer_id == peer_id);
+            if peer_transfers >= MAX_TRANSFERS_PER_PEER {
+                return AddChunkResult::Rejected("per-peer transfer quota exceeded");
+            }
+            if peer_bytes.saturating_add(chunk.data.len()) > MAX_REASSEMBLY_BYTES_PER_PEER {
+                return AddChunkResult::Rejected("per-peer reassembly byte quota exceeded");
             }
             let mut received = vec![None; chunk.chunk_count as usize];
             let data_len = chunk.data.len();
@@ -176,6 +193,7 @@ impl EnvelopeChunkReassembler {
                     require_ack: chunk.require_ack,
                     recipient: envelope.recipient,
                     sender_node_id: envelope.sender_node_id,
+                    peer_id,
                     src_app_id: envelope.src_app_id,
                     app_id: envelope.app_id,
                     endpoint_id: envelope.endpoint_id,
@@ -189,7 +207,10 @@ impl EnvelopeChunkReassembler {
             return self.try_complete(&chunk.transfer_id);
         }
 
-        let state = entry.expect("checked Some above");
+        let state = self
+            .transfers
+            .get(&chunk.transfer_id)
+            .expect("checked present above");
         // Reject chunks whose framing disagrees with the established transfer —
         // a confused or malicious relay must not be able to corrupt reassembly.
         if chunk.chunk_count != state.chunk_count
@@ -208,12 +229,60 @@ impl EnvelopeChunkReassembler {
         if self.total_buffered.saturating_add(chunk.data.len()) > MAX_REASSEMBLY_BYTES {
             return AddChunkResult::Rejected("global reassembly budget exceeded");
         }
+        // The per-sender and per-peer byte quotas have to hold on EVERY
+        // insertion, not just the one that creates the transfer. Checking them
+        // only at admission let a sender open its full slot allowance with
+        // 1-byte chunks and then grow each transfer until it owned the entire
+        // global budget — the sub-quota never fired again. (Same shape the
+        // realtime datagram assembler already guards against.)
+        let owner = self
+            .transfers
+            .get(&chunk.transfer_id)
+            .map(|s| (s.sender_node_id, s.peer_id))
+            .expect("checked present above");
         let data_len = chunk.data.len();
+        let (_, sender_bytes) = self.usage(|s| s.sender_node_id == owner.0);
+        if sender_bytes.saturating_add(data_len) > MAX_REASSEMBLY_BYTES_PER_SENDER {
+            return AddChunkResult::Rejected("per-sender reassembly byte quota exceeded");
+        }
+        let (_, peer_bytes) = self.usage(|s| s.peer_id == owner.1);
+        if peer_bytes.saturating_add(data_len) > MAX_REASSEMBLY_BYTES_PER_PEER {
+            return AddChunkResult::Rejected("per-peer reassembly byte quota exceeded");
+        }
+        let state = self
+            .transfers
+            .get_mut(&chunk.transfer_id)
+            .expect("checked present above");
         state.received[idx] = Some(chunk.data);
         state.received_count += 1;
         state.received_bytes += data_len;
         self.total_buffered += data_len;
         self.try_complete(&chunk.transfer_id)
+    }
+
+    /// Test shim for the same-hop case where the carrying peer IS the sender,
+    /// which is what every pre-existing test models.
+    #[cfg(test)]
+    fn add_direct(
+        &mut self,
+        envelope: &DeliveryEnvelope,
+        chunk: ChunkedEnvelopePayload,
+        now: u64,
+    ) -> AddChunkResult {
+        let peer = envelope.sender_node_id;
+        self.add(envelope, peer, chunk, now)
+    }
+
+    /// (transfer count, buffered bytes) over the in-flight transfers matching
+    /// `pick`. Computed on the fly from the (≤64) live transfers so there is no
+    /// per-sender counter to keep in sync.
+    fn usage(&self, pick: impl Fn(&TransferState) -> bool) -> (usize, usize) {
+        self.transfers
+            .values()
+            .filter(|s| pick(s))
+            .fold((0usize, 0usize), |(c, b), s| {
+                (c + 1, b.saturating_add(s.received_bytes))
+            })
     }
 
     /// If `transfer_id` has all chunks, concatenate them, validate the total
@@ -349,14 +418,14 @@ mod tests {
         let tid = [1u8; 16];
         let total = 6;
         assert!(matches!(
-            r.add(&carrier([0; 32]), chunk(tid, 0, 3, total, vec![1, 2]), 100),
+            r.add_direct(&carrier([0; 32]), chunk(tid, 0, 3, total, vec![1, 2]), 100),
             AddChunkResult::Pending
         ));
         assert!(matches!(
-            r.add(&carrier([1; 32]), chunk(tid, 1, 3, total, vec![3, 4]), 100),
+            r.add_direct(&carrier([1; 32]), chunk(tid, 1, 3, total, vec![3, 4]), 100),
             AddChunkResult::Pending
         ));
-        match r.add(&carrier([2; 32]), chunk(tid, 2, 3, total, vec![5, 6]), 100) {
+        match r.add_direct(&carrier([2; 32]), chunk(tid, 2, 3, total, vec![5, 6]), 100) {
             AddChunkResult::Complete(env) => {
                 assert_eq!(env.payload, vec![1, 2, 3, 4, 5, 6]);
                 assert_eq!(env.content_id, [0xAAu8; 32]); // orig_content_id
@@ -375,14 +444,14 @@ mod tests {
         let mut r = EnvelopeChunkReassembler::new();
         let tid = [2u8; 16];
         assert!(matches!(
-            r.add(&carrier([0; 32]), chunk(tid, 2, 3, 6, vec![5, 6]), 0),
+            r.add_direct(&carrier([0; 32]), chunk(tid, 2, 3, 6, vec![5, 6]), 0),
             AddChunkResult::Pending
         ));
         assert!(matches!(
-            r.add(&carrier([0; 32]), chunk(tid, 0, 3, 6, vec![1, 2]), 0),
+            r.add_direct(&carrier([0; 32]), chunk(tid, 0, 3, 6, vec![1, 2]), 0),
             AddChunkResult::Pending
         ));
-        match r.add(&carrier([0; 32]), chunk(tid, 1, 3, 6, vec![3, 4]), 0) {
+        match r.add_direct(&carrier([0; 32]), chunk(tid, 1, 3, 6, vec![3, 4]), 0) {
             AddChunkResult::Complete(env) => assert_eq!(env.payload, vec![1, 2, 3, 4, 5, 6]),
             other => panic!("expected Complete, got {other:?}"),
         }
@@ -392,9 +461,9 @@ mod tests {
     fn duplicate_chunk_rejected() {
         let mut r = EnvelopeChunkReassembler::new();
         let tid = [3u8; 16];
-        r.add(&carrier([0; 32]), chunk(tid, 0, 2, 4, vec![1, 2]), 0);
+        r.add_direct(&carrier([0; 32]), chunk(tid, 0, 2, 4, vec![1, 2]), 0);
         assert!(matches!(
-            r.add(&carrier([0; 32]), chunk(tid, 0, 2, 4, vec![9, 9]), 0),
+            r.add_direct(&carrier([0; 32]), chunk(tid, 0, 2, 4, vec![9, 9]), 0),
             AddChunkResult::Rejected(_)
         ));
     }
@@ -403,10 +472,10 @@ mod tests {
     fn inconsistent_metadata_rejected() {
         let mut r = EnvelopeChunkReassembler::new();
         let tid = [4u8; 16];
-        r.add(&carrier([0; 32]), chunk(tid, 0, 3, 6, vec![1, 2]), 0);
+        r.add_direct(&carrier([0; 32]), chunk(tid, 0, 3, 6, vec![1, 2]), 0);
         // Same transfer_id but different chunk_count → reject.
         assert!(matches!(
-            r.add(&carrier([0; 32]), chunk(tid, 1, 4, 6, vec![3, 4]), 0),
+            r.add_direct(&carrier([0; 32]), chunk(tid, 1, 4, 6, vec![3, 4]), 0),
             AddChunkResult::Rejected(_)
         ));
     }
@@ -416,9 +485,9 @@ mod tests {
         let mut r = EnvelopeChunkReassembler::new();
         let tid = [5u8; 16];
         // total advertised 6 but pieces sum to 5 → reject on completion.
-        r.add(&carrier([0; 32]), chunk(tid, 0, 2, 6, vec![1, 2]), 0);
+        r.add_direct(&carrier([0; 32]), chunk(tid, 0, 2, 6, vec![1, 2]), 0);
         assert!(matches!(
-            r.add(&carrier([0; 32]), chunk(tid, 1, 2, 6, vec![3, 4, 5]), 0),
+            r.add_direct(&carrier([0; 32]), chunk(tid, 1, 2, 6, vec![3, 4, 5]), 0),
             AddChunkResult::Rejected("reassembled size != total_size")
         ));
         assert_eq!(r.transfer_count(), 0);
@@ -428,11 +497,11 @@ mod tests {
     fn ttl_eviction() {
         let mut r = EnvelopeChunkReassembler::new();
         let tid = [6u8; 16];
-        r.add(&carrier([0; 32]), chunk(tid, 0, 2, 4, vec![1, 2]), 1000);
+        r.add_direct(&carrier([0; 32]), chunk(tid, 0, 2, 4, vec![1, 2]), 1000);
         assert_eq!(r.transfer_count(), 1);
         // Advance past TTL on the next add of a different transfer.
         let tid2 = [7u8; 16];
-        r.add(
+        r.add_direct(
             &carrier([0; 32]),
             chunk(tid2, 0, 2, 4, vec![1, 2]),
             1000 + CHUNK_REASSEMBLY_TTL_SECS + 1,
@@ -446,7 +515,7 @@ mod tests {
     fn single_chunk_completes_immediately() {
         let mut r = EnvelopeChunkReassembler::new();
         let tid = [8u8; 16];
-        match r.add(&carrier([0; 32]), chunk(tid, 0, 1, 3, vec![1, 2, 3]), 0) {
+        match r.add_direct(&carrier([0; 32]), chunk(tid, 0, 1, 3, vec![1, 2, 3]), 0) {
             AddChunkResult::Complete(env) => assert_eq!(env.payload, vec![1, 2, 3]),
             other => panic!("expected Complete, got {other:?}"),
         }
@@ -457,15 +526,15 @@ mod tests {
         let mut r = EnvelopeChunkReassembler::new();
         let tid = [0x81; 16];
         assert!(matches!(
-            r.add(&carrier([1; 32]), chunk(tid, 0, 2, 4, vec![1, 2]), 100),
+            r.add_direct(&carrier([1; 32]), chunk(tid, 0, 2, 4, vec![1, 2]), 100),
             AddChunkResult::Pending
         ));
         assert!(matches!(
-            r.add(&carrier([2; 32]), chunk(tid, 1, 2, 4, vec![3, 4]), 100),
+            r.add_direct(&carrier([2; 32]), chunk(tid, 1, 2, 4, vec![3, 4]), 100),
             AddChunkResult::Complete(_)
         ));
         assert!(matches!(
-            r.add(&carrier([3; 32]), chunk(tid, 1, 2, 4, vec![3, 4]), 101),
+            r.add_direct(&carrier([3; 32]), chunk(tid, 1, 2, 4, vec![3, 4]), 101),
             AddChunkResult::CompletedReplay(id) if id == [0xAA; 32]
         ));
         assert_eq!(r.transfer_count(), 0);
@@ -474,7 +543,7 @@ mod tests {
         let mut collision = chunk(tid, 0, 2, 4, vec![1, 2]);
         collision.orig_content_id = [0xBB; 32];
         assert!(matches!(
-            r.add(&carrier([4; 32]), collision, 101),
+            r.add_direct(&carrier([4; 32]), collision, 101),
             AddChunkResult::Rejected("completed transfer metadata mismatch")
         ));
 
@@ -482,7 +551,7 @@ mod tests {
         // the id (128-bit random collision is theoretical, but lifecycle stays finite).
         r.evict_expired(100 + CHUNK_REASSEMBLY_TTL_SECS + 1);
         assert!(matches!(
-            r.add(
+            r.add_direct(
                 &carrier([5; 32]),
                 chunk(tid, 0, 2, 4, vec![1, 2]),
                 100 + CHUNK_REASSEMBLY_TTL_SECS + 1,
@@ -498,7 +567,7 @@ mod tests {
             let mut tid = [0u8; 16];
             tid[..8].copy_from_slice(&(index as u64).to_le_bytes());
             assert!(matches!(
-                r.add(&carrier([index as u8; 32]), chunk(tid, 0, 1, 1, vec![1]), 0),
+                r.add_direct(&carrier([index as u8; 32]), chunk(tid, 0, 1, 1, vec![1]), 0),
                 AddChunkResult::Complete(_)
             ));
         }
@@ -518,7 +587,7 @@ mod tests {
             let sender = [i as u8; 32];
             // multi-chunk so each stays pending and occupies a slot
             assert!(matches!(
-                r.add(&carrier_from(sender), chunk(tid, 0, 2, 4, vec![1, 2]), 0),
+                r.add_direct(&carrier_from(sender), chunk(tid, 0, 2, 4, vec![1, 2]), 0),
                 AddChunkResult::Pending
             ));
         }
@@ -526,12 +595,95 @@ mod tests {
         // global cap.
         let tid = [0xFFu8; 16];
         assert!(matches!(
-            r.add(
+            r.add_direct(
                 &carrier_from([0xFE; 32]),
                 chunk(tid, 0, 2, 4, vec![1, 2]),
                 0
             ),
             AddChunkResult::Rejected("too many concurrent transfers")
+        ));
+    }
+
+    /// The per-sender BYTE quota has to bind while a transfer grows, not only
+    /// when it is admitted.
+    #[test]
+    fn per_sender_byte_quota_binds_while_a_transfer_grows() {
+        let mut r = EnvelopeChunkReassembler::new();
+        let sender = [9u8; 32];
+        let tid = [3u8; 16];
+        let big = veil_proto::budget::MAX_CHUNK_PAYLOAD;
+        let count = (MAX_REASSEMBLY_BYTES_PER_SENDER / big) as u32 + 2;
+        // Admission is cheap — a single 1-byte chunk clears every quota.
+        assert!(matches!(
+            r.add_direct(&carrier_from(sender), chunk(tid, 0, count, 4, vec![1]), 0),
+            AddChunkResult::Pending
+        ));
+        // Then grow it. If the sub-quota is only evaluated at admission this
+        // one sender walks straight through its own bound and on into the
+        // global budget.
+        let mut rejected = None;
+        for idx in 1..count {
+            let res = r.add_direct(
+                &carrier_from(sender),
+                chunk(tid, idx, count, 4, vec![7u8; big]),
+                0,
+            );
+            if let AddChunkResult::Rejected(why) = res {
+                rejected = Some(why);
+                break;
+            }
+        }
+        assert_eq!(
+            rejected,
+            Some("per-sender reassembly byte quota exceeded"),
+            "growth must hit the per-sender byte quota"
+        );
+        assert!(
+            r.buffered_bytes() <= MAX_REASSEMBLY_BYTES_PER_SENDER,
+            "one sender held {} bytes, quota is {}",
+            r.buffered_bytes(),
+            MAX_REASSEMBLY_BYTES_PER_SENDER
+        );
+    }
+
+    /// A hostile peer varies the (unauthenticated) `sender_node_id` per
+    /// transfer, so the per-sender quota never binds. The per-peer quota is
+    /// what stops it from taking every slot.
+    #[test]
+    fn spoofed_sender_ids_still_hit_the_per_peer_quota() {
+        let mut r = EnvelopeChunkReassembler::new();
+        let peer = [0xC0u8; 32];
+        for i in 0..MAX_TRANSFERS_PER_PEER {
+            let mut tid = [0u8; 16];
+            tid[0] = i as u8;
+            // Fresh forged sender each time: one transfer per "sender" keeps
+            // MAX_TRANSFERS_PER_SENDER permanently out of reach.
+            assert!(
+                matches!(
+                    r.add(&carrier_from([i as u8; 32]), peer, chunk(tid, 0, 2, 4, vec![1, 2]), 0),
+                    AddChunkResult::Pending
+                ),
+                "transfer {i} must be admitted below the per-peer cap"
+            );
+        }
+        assert!(matches!(
+            r.add(
+                &carrier_from([0xAB; 32]),
+                peer,
+                chunk([0xFFu8; 16], 0, 2, 4, vec![1, 2]),
+                0
+            ),
+            AddChunkResult::Rejected("per-peer transfer quota exceeded")
+        ));
+        // ...and an honest peer is untouched by the hostile one's usage.
+        assert!(matches!(
+            r.add(
+                &carrier_from([0xAB; 32]),
+                [0xD0u8; 32],
+                chunk([0xFEu8; 16], 0, 2, 4, vec![1, 2]),
+                0
+            ),
+            AddChunkResult::Pending
         ));
     }
 
@@ -544,13 +696,13 @@ mod tests {
             let mut tid = [0u8; 16];
             tid[0] = i as u8;
             assert!(matches!(
-                r.add(&carrier_from(sender), chunk(tid, 0, 2, 4, vec![1, 2]), 0),
+                r.add_direct(&carrier_from(sender), chunk(tid, 0, 2, 4, vec![1, 2]), 0),
                 AddChunkResult::Pending
             ));
         }
         // One more from the SAME sender → per-sender rejection.
         assert!(matches!(
-            r.add(
+            r.add_direct(
                 &carrier_from(sender),
                 chunk([0xAAu8; 16], 0, 2, 4, vec![1, 2]),
                 0
@@ -559,7 +711,7 @@ mod tests {
         ));
         // A DIFFERENT sender is unaffected (no global starvation).
         assert!(matches!(
-            r.add(
+            r.add_direct(
                 &carrier_from([8u8; 32]),
                 chunk([0xBBu8; 16], 0, 2, 4, vec![1, 2]),
                 0
