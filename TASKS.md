@@ -14,6 +14,31 @@ Each epic ends by transitioning to the next via a re-analysis task.
 
 ---
 
+## Deferred — obfuscated UDP as a real transport
+
+**Status:** deferred by operator decision (2026-07-05), still deferred, and no
+longer written down anywhere else — the design note lived in a session
+scratchpad and is gone.
+
+`veil-udp-obfs` exists and is used, but only as a per-datagram AEAD wrapper for
+mesh realm DATA (`realm_psk` in the realm config, beacons stay plaintext so
+discovery still works). It was intended to become a full transport alongside
+`obfs4-tcp`, and it is not one: there is no handshake, no listener, no stream,
+no reliability layer. Reaching a session `Transport` means roughly 1000+ LOC of
+reliable UDP (ARQ), which is why it was parked.
+
+**Why it was parked rather than built:** the failure that prompted it turned
+out not to be DPI at all. The reverse-leg deadlock was a PMTU/full-MSS downlink
+blackhole on cellular, fixed by clamping MSS to 1200. QUIC already provides a
+UDP transport in the tree.
+
+**Re-open trigger:** evidence of active DPI that obfs4-tcp cannot pass, or a
+network where TCP is throttled hard enough that UDP is the only usable path.
+The design has to be re-derived; treat the LOC estimate above as the only
+surviving artefact of it.
+
+---
+
 ## Epic 483 — Mobile / battery / NAT
 
 ✅ done (483.1 + 483.3 + 483.4 + 483.5 (3 slices, last 2 opt-in default-off) + 483.6 + 483.6b shipped; 483.2 push-notification → Epic 489 Flutter scope, needs an FCM/APNs backend out of veilcore).  Full description moved to [`TASKS_ARCHIVE.md`](TASKS_ARCHIVE.md).  Acceptance bar (8h background on 4G + battery < 5%/h, recovery < 3s) hits — recovery measured ~100ms; battery target gate to be validated on real Android via Epic 489.
