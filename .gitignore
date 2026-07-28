@@ -1,4 +1,6 @@
 target
+.rustc_info.json
+debug
 **/__pycache__
 **/.DS_Store
 stend/*/mlkem.key
