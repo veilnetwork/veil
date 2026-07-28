@@ -338,6 +338,13 @@ pub struct RttTable {
 }
 
 impl RttTable {
+    /// Hard cap on live probes, mirroring `LossTracker::DEFAULT_MAX_ENTRIES`.
+    /// Every sibling routing table (loss tracker, route cache, lookup cache,
+    /// discovery forwarder) bounds its map; the probe table must too, or an
+    /// attacker who can get RTT frames attributed to many distinct claimed
+    /// node ids grows it without bound between `evict_stale` ticks.
+    pub const MAX_ENTRIES: usize = 4096;
+
     pub fn new(max_age: Duration) -> Self {
         Self {
             probes: HashMap::new(),
@@ -368,6 +375,19 @@ impl RttTable {
         if let Some(probe) = self.probes.get_mut(&node_id) {
             probe.update(rtt_ms, congestion);
         } else {
+            // Bound the table: when at capacity and inserting a new peer, evict
+            // the probe with the oldest `sampled_at` (deterministic, maps to
+            // "whoever we've heard from least recently"), matching
+            // `LossTracker::bump`.
+            if self.probes.len() >= Self::MAX_ENTRIES
+                && let Some(oldest) = self
+                    .probes
+                    .iter()
+                    .min_by_key(|(_, p)| p.sampled_at)
+                    .map(|(k, _)| *k)
+            {
+                self.probes.remove(&oldest);
+            }
             let mut probe = RttProbe::new(node_id, rtt_ms, congestion);
             // Carry forward the restored count so the probe history is coherent.
             if restored > 1 {
@@ -673,6 +693,32 @@ mod tests {
         table.record([2u8; 32], PeerReportedRtt::from_raw_ms(77), 0);
         let p = table.get(&[2u8; 32]).unwrap();
         assert_eq!(p.rtt_smoothed, 77, "first sample: smoothed must equal raw");
+    }
+
+    #[test]
+    fn record_caps_table_and_evicts_oldest() {
+        let mut table = RttTable::new(Duration::from_secs(60));
+        // Fill exactly to capacity; each id is distinct.
+        for i in 0..RttTable::MAX_ENTRIES {
+            let mut id = [0u8; 32];
+            id[..8].copy_from_slice(&(i as u64).to_le_bytes());
+            table.record(id, PeerReportedRtt::from_raw_ms(50), 0);
+        }
+        assert_eq!(table.len(), RttTable::MAX_ENTRIES);
+        let oldest = {
+            let mut id = [0u8; 32];
+            id[..8].copy_from_slice(&0u64.to_le_bytes());
+            id
+        };
+        assert!(table.get(&oldest).is_some());
+
+        // One more distinct peer must not grow the table past the cap, and it
+        // must evict the least-recently-sampled entry (the first inserted).
+        let newcomer = [0xFFu8; 32];
+        table.record(newcomer, PeerReportedRtt::from_raw_ms(50), 0);
+        assert_eq!(table.len(), RttTable::MAX_ENTRIES, "cap must hold");
+        assert!(table.get(&newcomer).is_some(), "newcomer inserted");
+        assert!(table.get(&oldest).is_none(), "oldest evicted");
     }
 
     #[test]
