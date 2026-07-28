@@ -4650,6 +4650,7 @@ dependencies = [
  "veil-proto",
  "veil-types",
  "veil-util",
+ "zeroize",
 ]
 
 [[package]]
