@@ -206,6 +206,28 @@
 #define VEIL_JOIN_ALREADY_REGISTERED 6
 
 /**
+ * Explicit hole-punch outcome codes (real-P2P epic, Stage B).
+ * Mirror `veil_proto::hole_punch_status`.
+ */
+#define VEIL_HOLE_PUNCH_CONNECTED 0
+
+#define VEIL_HOLE_PUNCH_NO_REFLECTOR 1
+
+#define VEIL_HOLE_PUNCH_SIGNALING_TIMEOUT 2
+
+#define VEIL_HOLE_PUNCH_MAPPING_UNUSABLE 3
+
+#define VEIL_HOLE_PUNCH_PUNCH_TIMEOUT 4
+
+#define VEIL_HOLE_PUNCH_QUIC_FAILED 5
+
+#define VEIL_HOLE_PUNCH_REFUSED_ANONYMOUS 6
+
+#define VEIL_HOLE_PUNCH_UNKNOWN_PEER 7
+
+#define VEIL_HOLE_PUNCH_UNSUPPORTED 8
+
+/**
  * Create-bootstrap-invite status codes (Epic 489.7 generator side).
  * Mirror `veil_proto::create_invite_status`.
  */
@@ -1901,6 +1923,38 @@ int veil_peer_pnet_status(VeilHandle *handle,
  * `*mut c_char` slot.
  */
  int veil_listen_transports(VeilHandle *handle, char **out_uris, char **err_out) ;
+
+/**
+ * Run one explicit, bounded UDP hole-punch attempt toward a registered
+ * peer (real-P2P epic, Stage B: punch in the call path). The daemon
+ * drives reflector mapping discovery + coordinator signaling +
+ * token-authenticated simultaneous punch + same-socket QUIC promotion +
+ * normal session registration under one 5-second budget
+ * (`HOLE_PUNCH_ATTEMPT_BUDGET_MS`); on `VEIL_HOLE_PUNCH_CONNECTED` the
+ * direct session is registered and `veil_peer_pnet_status` flips
+ * `admitted` the standard way. Repeat calls are idempotent; concurrent
+ * calls for the same peer join the in-flight attempt daemon-side.
+ *
+ * Returns [`VEIL_OK`] iff the IPC round-trip itself succeeded; the
+ * structured outcome lives in `out_status` (one of `VEIL_HOLE_PUNCH_*`).
+ * Bounded at 10 s total (8 s client RPC budget + shared-client mutex
+ * slack); a timeout returns `VEIL_ERR` with `err_out` set. The RPC
+ * holds this handle's shared client mutex for the attempt's duration —
+ * callers should use a handle whose mutex is not on a latency-critical
+ * path (xVeil calls it from the endpoint-service client, sequenced
+ * before its admitted-polls).
+ *
+ * # Safety
+ * `handle` must be a live connect handle; `peer_node_id_32` must point
+ * to 32 readable bytes; `out_status` must be writable; `err_out` (if
+ * non-null) must be a writable `*mut c_char` slot.
+ */
+
+int veil_attempt_p2p_hole_punch(VeilHandle *handle,
+                                const uint8_t *peer_node_id_32,
+                                uint8_t *out_status,
+                                char **err_out)
+;
 
 /**
  * Build a bootstrap-invite URI from the daemon's own identity and

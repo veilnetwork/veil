@@ -373,10 +373,10 @@ impl VerifiedEntryCache {
     /// Returns `None` when the entry is malformed or its signature is bad.
     pub fn decode_and_verify(&self, bytes: &[u8]) -> Option<RelayDirectoryEntry> {
         let key = *blake3::hash(bytes).as_bytes();
-        if let Ok(map) = self.entries.lock() {
-            if let Some(hit) = map.get(&key) {
-                return hit.clone();
-            }
+        if let Ok(map) = self.entries.lock()
+            && let Some(hit) = map.get(&key)
+        {
+            return hit.clone();
         }
         let verdict = decode_entry(bytes)
             .ok()
@@ -617,8 +617,7 @@ mod tests {
             SignatureAlgorithm::Ed25519,
         )
         .expect("sign");
-        let store: HashMap<[u8; NODE_ID_LEN], Vec<u8>> =
-            HashMap::from([(node_id, bytes.clone())]);
+        let store: HashMap<[u8; NODE_ID_LEN], Vec<u8>> = HashMap::from([(node_id, bytes.clone())]);
         let cache = VerifiedEntryCache::new();
         let window = DEFAULT_FRESHNESS_WINDOW_SECS;
 
