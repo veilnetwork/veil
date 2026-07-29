@@ -105,6 +105,11 @@ try {
     # real implementation; -I<src> finds veil_camera.h and friends.
     $cmd = $cmd -replace '^(\S+)', ('$1 -DVEIL_MEDIA_HAVE_WEBRTC=1 -I"' + $srcDirFwd + '"')
 
+    # WebRTC compiles with /showIncludes so ninja can track header
+    # dependencies. We are not ninja, and it buries the one line that matters
+    # under about nine hundred header names per translation unit.
+    $cmd = $cmd -replace '(?i)\s/showIncludes(:\S+)?(?=\s|$)', ' '
+
     # A WebRTC compile command runs well past cmd.exe's 8191-character line
     # limit once the include paths and defines are in it, and passing it as one
     # string also re-parses every embedded quote. Both go away with a response
