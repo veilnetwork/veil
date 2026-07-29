@@ -11,11 +11,17 @@ project(veil_media LANGUAGES C)
 # via <plugin>_bundled_libraries so it lands next to the executable; the Dart
 # FFI layer LoadLibrary's it by name at call time.
 #
-# Unlike the ELF platforms there is no DT_NEEDED to arrange: veilclient_ffi.dll
-# exports veil_media_send_datagram / veil_media_set_recv_callback and Windows
-# resolves an import by DLL name from the application directory, where
-# veil_flutter already bundles it. The import table is written at link time by
-# the build script, which links against veilclient_ffi.lib.
+# Unlike the ELF platforms there is no DT_NEEDED to arrange, and no import
+# either: veil_media.dll does NOT link against veilclient_ffi.lib. Doing so
+# would make this build depend on a Rust artifact produced on another machine
+# by another toolchain, for two function pointers, so the two datagram entry
+# points are resolved at runtime instead - GetProcAddress against the already
+# loaded veilclient_ffi.dll. See src/veil_win_datagram_thunk.cc.
+#
+# That module is present because builder.py copies it next to xveil.exe after
+# the Flutter build, not because a plugin bundles it: veil_flutter declares no
+# windows platform at all. Dart opens it by that exact name, which is what
+# makes GetModuleHandleW find it.
 #
 # Reached via flutter/ephemeral/.plugin_symlinks/veil_media, so resolve our real
 # location first (REALPATH follows the symlink); the .dll sits next to this file.
