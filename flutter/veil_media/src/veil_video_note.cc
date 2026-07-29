@@ -49,7 +49,8 @@
 #include "rtc_base/buffer.h"
 #include "third_party/libyuv/include/libyuv/convert_argb.h"  // I420ToABGR
 
-#if defined(__APPLE__) || (defined(__linux__) && !defined(__ANDROID__))
+#if defined(__APPLE__) || (defined(__linux__) && !defined(__ANDROID__)) || \
+    defined(_WIN32)
 #define VEIL_VNOTE_HAVE_NATIVE_CAMERA 1
 #include "veil_camera.h"
 #endif
