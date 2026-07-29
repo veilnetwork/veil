@@ -1627,11 +1627,16 @@ int veil_media_group_engine_stop_camera(VeilGroupMediaEngine* engine) {
   return VEIL_MEDIA_OK;
 }
 
+// The five screen entry points below are macOS + Windows, not the camera's
+// macOS + Linux + Windows. That asymmetry is real: this tree has no X11
+// capturer, so CreatePlatformScreen has no definition to link against on
+// Linux. Widening these to __linux__ produces an unresolved symbol, not a
+// working share.
 int veil_media_group_engine_start_screen_source(VeilGroupMediaEngine* engine,
                                                 const char* source_id,
                                                 int width, int fps) {
   if (engine == nullptr) return VEIL_MEDIA_ERR_ARG;
-#if defined(VEIL_MEDIA_HAVE_WEBRTC) && defined(__APPLE__)
+#if defined(VEIL_MEDIA_HAVE_WEBRTC) && (defined(__APPLE__) || defined(_WIN32))
   GroupWebrtcState* ws = engine->ws.get();
   if (!ws || !ws->video_source || !engine->video_running.load())
     return VEIL_MEDIA_ERR_STATE;
@@ -2218,7 +2223,7 @@ int veil_media_engine_start_screen_source(VeilMediaEngine* engine,
                                           const char* source_id, int width,
                                           int fps) {
   if (engine == nullptr) return VEIL_MEDIA_ERR_ARG;
-#if defined(VEIL_MEDIA_HAVE_WEBRTC) && defined(__APPLE__)
+#if defined(VEIL_MEDIA_HAVE_WEBRTC) && (defined(__APPLE__) || defined(_WIN32))
   WebrtcState* ws = engine->ws.get();
   if (!ws || !ws->video_source) return VEIL_MEDIA_ERR_STATE;
   if (ws->screen) return VEIL_MEDIA_OK;  // already sharing
@@ -2487,7 +2492,7 @@ char* veil_media_engine_list_video_inputs(VeilMediaEngine* engine) {
 }
 
 char* veil_media_list_screen_inputs(void) {
-#if defined(VEIL_MEDIA_HAVE_WEBRTC) && defined(__APPLE__)
+#if defined(VEIL_MEDIA_HAVE_WEBRTC) && (defined(__APPLE__) || defined(_WIN32))
   return dup_cstr(veil_media::ListPlatformScreensJson());
 #else
   return dup_cstr("[]");
@@ -2495,7 +2500,7 @@ char* veil_media_list_screen_inputs(void) {
 }
 
 int veil_media_screen_capture_access(void) {
-#if defined(VEIL_MEDIA_HAVE_WEBRTC) && defined(__APPLE__)
+#if defined(VEIL_MEDIA_HAVE_WEBRTC) && (defined(__APPLE__) || defined(_WIN32))
   return veil_media::PlatformScreenAccessGranted() ? 1 : 0;
 #else
   return -1;
@@ -2503,7 +2508,7 @@ int veil_media_screen_capture_access(void) {
 }
 
 int veil_media_request_screen_capture_access(void) {
-#if defined(VEIL_MEDIA_HAVE_WEBRTC) && defined(__APPLE__)
+#if defined(VEIL_MEDIA_HAVE_WEBRTC) && (defined(__APPLE__) || defined(_WIN32))
   return veil_media::RequestPlatformScreenAccess() ? 1 : 0;
 #else
   return -1;
