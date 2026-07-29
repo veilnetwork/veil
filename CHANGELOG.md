@@ -2,6 +2,33 @@
 
 ## Unreleased
 
+## v0.4.2 — 2026-07-29
+
+No Rust code changed: `cargo` builds nothing new here. The work is in the
+`veil_media` Flutter plugin, which each platform builds with its own script.
+
+### Added
+
+- **A Windows port of the call media engine** (`veil_media/windows/`), the one
+  platform it never had — android, ios, linux and macos were all present, so a
+  Windows build started, looked healthy and threw at the first voice message.
+  Audio needed no new code: `create_audio_device` already falls through to
+  WebRTC's Core Audio ADM, so voice messages and audio calls were one build
+  away. What was missing is a camera (`veil_mf_camera.cc`, Media Foundation),
+  a screen capturer (`veil_gdi_screen.cc`, deliberately GDI rather than DXGI —
+  correctness first), a way to reach the two veilclient datagram symbols
+  without linking a Rust artifact (`veil_win_datagram_thunk.cc`, GetProcAddress
+  rather than an import), and the plugin plus build script to produce the DLL.
+
+  ⚠️ **None of it has ever been compiled.** It was written on a host that
+  cannot build it, and the first compile will be the `webrtc-windows` workflow.
+  Expect to fix it before a DLL comes out; the file headers say so too. It
+  ships in this tag because it is source-only and outside the cargo workspace —
+  nothing in a veil build touches it — so a release carries it without carrying
+  any risk to the binaries.
+
+### Documentation
+
 ### Documentation
 
 - **The deferred obfuscated-UDP transport is written down** (`TASKS.md`). It
