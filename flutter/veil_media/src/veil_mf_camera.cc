@@ -32,6 +32,12 @@
 #endif
 #include <windows.h>
 
+// WIN32_LEAN_AND_MEAN is what drops the OLE half of windows.h, and that is
+// where CoInitializeEx, CoTaskMemFree and IID_PPV_ARGS live. The Media
+// Foundation headers happen to pull parts of COM in transitively, but that is
+// an accident of their include graph rather than a promise.
+#include <objbase.h>
+
 #include <mfapi.h>
 #include <mferror.h>
 #include <mfidl.h>
@@ -276,7 +282,10 @@ class MfCameraCapturer : public CameraCapturer {
                                             &got))) {
       return false;
     }
-    GUID subtype = GUID_NULL;
+    // Not GUID_NULL: that name is an extern defined in uuid.lib, and pulling a
+    // library in for a zeroed struct is a link error waiting for the one build
+    // that does not happen to already carry it.
+    GUID subtype = {};
     if (FAILED(got->GetGUID(MF_MT_SUBTYPE, &subtype))) return false;
     if (subtype == MFVideoFormat_NV12) {
       fmt_ = Fmt::kNv12;
@@ -302,10 +311,14 @@ class MfCameraCapturer : public CameraCapturer {
     // packed default is right for a contiguous buffer, which is what
     // ConvertToContiguousBuffer hands us. Negative strides mean bottom-up
     // RGB — handled at conversion time, so keep the sign.
-    INT32 stride = 0;
-    if (SUCCEEDED(got->GetINT32(MF_MT_DEFAULT_STRIDE, &stride)) &&
-        stride != 0) {
-      cap_stride_ = static_cast<int>(stride);
+    //
+    // The attribute is stored as UINT32 holding a signed value, and
+    // IMFAttributes has no GetINT32 at all — the round-trip through UINT32 is
+    // the documented way to read it, not a shortcut.
+    UINT32 stride_bits = 0;
+    if (SUCCEEDED(got->GetUINT32(MF_MT_DEFAULT_STRIDE, &stride_bits)) &&
+        stride_bits != 0) {
+      cap_stride_ = static_cast<int>(static_cast<INT32>(stride_bits));
     } else {
       cap_stride_ = fmt_ == Fmt::kYuy2   ? cap_w_ * 2
                     : fmt_ == Fmt::kRgb32 ? cap_w_ * 4
