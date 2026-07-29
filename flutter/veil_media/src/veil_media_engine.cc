@@ -1584,7 +1584,8 @@ int veil_media_group_engine_start_camera(VeilGroupMediaEngine* engine,
                                          int width, int height, int fps) {
   if (engine == nullptr) return VEIL_MEDIA_ERR_ARG;
 #if defined(VEIL_MEDIA_HAVE_WEBRTC) && \
-    (defined(__APPLE__) || (defined(__linux__) && !defined(__ANDROID__)))
+    (defined(__APPLE__) || (defined(__linux__) && !defined(__ANDROID__)) || \
+     defined(_WIN32))
   GroupWebrtcState* ws = engine->ws.get();
   if (!ws || !ws->video_source || !engine->video_running.load())
     return VEIL_MEDIA_ERR_STATE;
@@ -2165,7 +2166,8 @@ int veil_media_engine_start_camera_device(VeilMediaEngine* engine,
                                           int height, int fps) {
   if (engine == nullptr) return VEIL_MEDIA_ERR_ARG;
 #if defined(VEIL_MEDIA_HAVE_WEBRTC) && \
-    (defined(__APPLE__) || (defined(__linux__) && !defined(__ANDROID__)))
+    (defined(__APPLE__) || (defined(__linux__) && !defined(__ANDROID__)) || \
+     defined(_WIN32))
   WebrtcState* ws = engine->ws.get();
   if (!ws || !ws->video_source) return VEIL_MEDIA_ERR_STATE;
   if (ws->camera) return VEIL_MEDIA_OK;  // already capturing
@@ -2476,7 +2478,8 @@ char* veil_media_engine_list_audio_outputs(VeilMediaEngine* engine) {
 char* veil_media_engine_list_video_inputs(VeilMediaEngine* engine) {
   if (engine == nullptr) return nullptr;
 #if defined(VEIL_MEDIA_HAVE_WEBRTC) && \
-    (defined(__APPLE__) || (defined(__linux__) && !defined(__ANDROID__)))
+    (defined(__APPLE__) || (defined(__linux__) && !defined(__ANDROID__)) || \
+     defined(_WIN32))
   return dup_cstr(veil_media::ListPlatformCamerasJson());
 #else
   return dup_cstr("[]");

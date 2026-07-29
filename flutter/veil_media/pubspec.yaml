@@ -41,3 +41,10 @@ flutter:
       # bundled via linux/CMakeLists.txt. Audio uses WebRTC's builtin linux ADM.
       linux:
         ffiPlugin: true
+      # Windows desktop — veil_media.dll (from-source win-x64 WebRTC + the Media
+      # Foundation camera and the GDI screen capturer) is built by
+      # windows/build_veil_media_dll_windows.ps1 and bundled via
+      # windows/CMakeLists.txt. Audio uses WebRTC's builtin Core Audio ADM, so
+      # voice messages and audio calls need no Windows-specific engine code.
+      windows:
+        ffiPlugin: true

@@ -1,0 +1,7 @@
+# Prebuilt native engine — a build artifact (like linux/libveil_media.so),
+# produced by build_veil_media_dll_windows.ps1 and delivered out-of-band, not
+# committed. The build script + CMakeLists here are the tracked recipe.
+*.dll
+*.lib
+*.exp
+*.pdb
