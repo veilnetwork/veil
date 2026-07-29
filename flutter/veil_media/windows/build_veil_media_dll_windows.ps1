@@ -132,9 +132,17 @@ try {
     }
   }
 
+  # Every TU the Linux recipe builds, plus the three Windows-only ones. The
+  # audio recorder and player are NOT Linux-specific - they are the voice
+  # message ABI (veil_media_recorder_create / veil_media_player_create) and
+  # they take WebRTC's built-in ADM through the same #else branch Windows
+  # uses. Leaving them out builds a DLL that links and loads and has no voice
+  # messages in it.
   $tus = @(
     'veil_media_engine.cc',
     'veil_transport_shim.cc',
+    'veil_audio_record.cc',
+    'veil_audio_play.cc',
     'veil_video_note.cc',
     'veil_mf_camera.cc',
     'veil_gdi_screen.cc',
@@ -178,6 +186,12 @@ try {
     (Join-Path $outDir 'obj\buildtools\third_party\libc++'), `
     (Join-Path $outDir 'obj\buildtools\third_party\libc++abi') `
     -ErrorAction SilentlyContinue | ForEach-Object { $_.FullName }
+  # The Linux recipe fails loudly here for a reason: with the paths silently
+  # empty the link still runs and dies in a wall of unresolved std:: symbols
+  # that reads like the veil sources are broken.
+  if (-not $cxxObjs) {
+    throw "no libc++ objects under $outDir\obj\buildtools\third_party - build webrtc.lib first"
+  }
 
   $webrtcLib = Join-Path $outDir 'obj\webrtc.lib'
   if (-not (Test-Path $webrtcLib)) { throw "no $webrtcLib - run ninja -C $WebrtcOut webrtc" }
