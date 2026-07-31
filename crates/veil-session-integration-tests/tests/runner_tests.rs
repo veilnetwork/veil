@@ -250,12 +250,11 @@ fn coalesce_pads_to_bucket_size() {
     // Audit batch 2026-05-24: `coalesce_with_padding` is a no-op when
     // `PADDING_ENABLED` is `false` (default after the iperf-throughput
     // regression fix — see static doc on `PADDING_ENABLED`).  Enable
-    // explicitly for the duration of this test; restore on exit so
-    // other tests aren't affected.
-    let prev = runner::padding_enabled();
-    runner::set_padding_enabled(true);
+    // explicitly for the duration of this test; the guard restores it and,
+    // unlike the hand-rolled save/restore this replaces, also keeps concurrent
+    // tests out while it is held.
+    let _padding = PaddingGuard::set(true);
     let coalesced = runner::coalesce_with_padding(&enc, Some(&mut cipher2));
-    runner::set_padding_enabled(prev);
     // Must land on one of the bucket sizes.
     assert!(
         runner::TLS_BUCKET_SIZES.contains(&coalesced.len()),
@@ -1286,14 +1285,16 @@ async fn phase650b_mutual_rekey_collision_kept_init_when_local_node_id_lower() {
     use veil_observability::NodeMetrics;
     use veil_proto::session::RekeyPayload;
 
-    // Audit batch 2026-05-24: test asserts a trailing Padding frame
-    // after each rekey wire write, but `coalesce_with_padding` is a
-    // no-op when `PADDING_ENABLED` is `false` (default after iperf-
-    // throughput regression).  Enable explicitly.  Global state —
-    // intentionally NOT restored so concurrent rekey tests share the
-    // same enabled flag; standalone tests `coalesce_pads_to_bucket_size`
-    // restores the prior value for isolation.
-    veil_session::runner::set_padding_enabled(true);
+    // Audit batch 2026-05-24: test asserts a trailing Padding frame after each
+    // rekey wire write, but `coalesce_with_padding` is a no-op when
+    // `PADDING_ENABLED` is `false` (default after the iperf-throughput
+    // regression).  Enable explicitly.
+    //
+    // This used to be left set on purpose, so concurrent rekey tests would
+    // share the enabled flag. It also leaked into every test that wanted the
+    // default, which is how mlkem_rekey_triggered_by_byte_threshold came to
+    // pass or fail on scheduling order.
+    let _padding = PaddingGuard::set(true);
 
     let initial_tx = [0xC0u8; 32];
     let initial_rx = [0xC1u8; 32];
@@ -2144,7 +2145,7 @@ async fn phase650b_rekey_bypasses_low_battery_deferral_window() {
     // Audit batch 2026-05-24: trailing-padding drain in test fixtures
     // requires `PADDING_ENABLED=true`; default flipped to `false` for
     // throughput.  See note in phase650b_mutual_rekey_collision_*.
-    veil_session::runner::set_padding_enabled(true);
+    let _padding = PaddingGuard::set(true);
 
     // Engage deferral: threshold 255 ⇒ 100 ≤ 255 ⇒ low-battery
     // window=1s = MAX_MOBILE_OUTBOUND_BATCH_WINDOW_MS.
@@ -3389,6 +3390,13 @@ async fn mlkem_rekey_triggered_by_byte_threshold() {
     use tokio::io::AsyncReadExt;
     use veil_proto::budget::MLKEM_REKEY_BYTES_THRESHOLD;
     use veil_proto::family::SessionMsg;
+
+    // This test counts bytes on the wire, so it needs the padding flag at its
+    // default and needs it to stay there for the duration. Taking the guard
+    // both pins the value and excludes the rekey tests that set it, which is
+    // what used to make this one fail in a parallel run and pass in a serial
+    // one.
+    let _padding = PaddingGuard::set(false);
 
     let peer_id = [0xAAu8; 32];
     let (peer_mlkem_keys, per_session_mlkem_dk) = make_mlkem_state();
@@ -5545,6 +5553,49 @@ async fn q7_rotation_deadline_fires_and_runner_returns_when_no_controller() {
 }
 
 // ── deferred : outbound-batch global signals ────
+
+/// Serialises every test that depends on the process-global padding flag, and
+/// puts back whatever was there on the way out.
+///
+/// `PADDING_ENABLED` is one `AtomicBool` for the whole process. Two sites here
+/// set it to `true` and deliberately left it that way, reasoning that the
+/// rekey tests all wanted it enabled anyway. That holds right up until a test
+/// wants the default: `mlkem_rekey_triggered_by_byte_threshold` counts bytes
+/// on the wire, and padding changes what those bytes are, so it passed or
+/// failed depending on which test cargo happened to schedule alongside it.
+/// A serial run was green and a parallel run was not, which reads like a flaky
+/// test rather than like shared mutable state, and gets treated accordingly.
+fn padding_lock() -> std::sync::MutexGuard<'static, ()> {
+    use std::sync::OnceLock;
+    static LOCK: OnceLock<std::sync::Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| std::sync::Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+}
+
+/// Holds the padding flag at `on` for as long as the guard lives. Bind it to a
+/// named local: dropping it immediately releases the lock and restores the
+/// flag before the test body runs.
+#[must_use]
+struct PaddingGuard {
+    _lock: std::sync::MutexGuard<'static, ()>,
+    prev: bool,
+}
+
+impl PaddingGuard {
+    fn set(on: bool) -> Self {
+        let lock = padding_lock();
+        let prev = veil_session::runner::padding_enabled();
+        veil_session::runner::set_padding_enabled(on);
+        Self { _lock: lock, prev }
+    }
+}
+
+impl Drop for PaddingGuard {
+    fn drop(&mut self) {
+        veil_session::runner::set_padding_enabled(self.prev);
+    }
+}
 
 /// Distinct lock from epic483_1 / epic488_1 so tests can run in
 /// parallel across feature groups. Each group serialises its OWN
