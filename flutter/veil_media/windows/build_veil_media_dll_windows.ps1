@@ -95,8 +95,28 @@ try {
   Write-Host "==> template output flag: $outFlag"
 
   # The compiler is the first token; keep it, it is the checkout's own clang-cl.
+  #
+  # Resolve it to a real path before taking the directory. The token is
+  # relative and full of ../.., and Test-Path against the unnormalised mix of
+  # separators fails - which is not loud, it just silently falls back to
+  # whatever llvm-nm and lld-link are on PATH. Run 30493115568 linked its
+  # symbol dump against C:\Program Files\LLVM, not the checkout. Reading
+  # objects that way is harmless; linking Chromium objects with a different
+  # LLVM than the one that produced them is not something to discover at the
+  # end of a four-hour build.
   $compiler = ($templateCmd -split '\s+')[0]
-  $compilerDir = Split-Path -Parent (Join-Path $template.directory $compiler)
+  $compilerFull = if ([System.IO.Path]::IsPathRooted($compiler)) {
+    $compiler
+  } else {
+    Join-Path $template.directory $compiler
+  }
+  $compilerResolved = Resolve-Path -LiteralPath $compilerFull -ErrorAction SilentlyContinue
+  $compilerDir = if ($compilerResolved) {
+    Split-Path -Parent $compilerResolved.Path
+  } else {
+    Split-Path -Parent $compilerFull
+  }
+  Write-Host "==> toolchain: $compilerDir"
 
   # Forward slashes throughout: these paths go into a clang response file,
   # where a backslash immediately before a closing quote escapes it.
