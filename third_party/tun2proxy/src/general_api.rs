@@ -10,6 +10,12 @@ use std::os::raw::{c_char, c_int, c_ushort};
 /// - packet_information: Whether exists packet information in packet from TUN device
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn tun2proxy_run_with_cli_args(cli_args: *const c_char, tun_mtu: c_ushort, packet_information: bool) -> c_int {
+    // A C caller can pass NULL, and CStr::from_ptr on NULL is undefined
+    // behaviour rather than an error you get to return.
+    if cli_args.is_null() {
+        log::error!("cli_args is NULL");
+        return -7;
+    }
     let Ok(cli_args) = unsafe { std::ffi::CStr::from_ptr(cli_args) }.to_str() else {
         log::error!("Failed to convert CLI arguments to string");
         return -5;
@@ -18,7 +24,16 @@ pub unsafe extern "C" fn tun2proxy_run_with_cli_args(cli_args: *const c_char, tu
         log::error!("Failed to split CLI arguments");
         return -6;
     };
-    let args = <Args as ::clap::Parser>::parse_from(args);
+    // try_parse_from, not parse_from: parse_from writes to stderr and calls
+    // process::exit on anything it dislikes, including --help. That turns one
+    // bad argument string from a C caller into a dead host process.
+    let args = match <Args as ::clap::Parser>::try_parse_from(args) {
+        Ok(args) => args,
+        Err(err) => {
+            log::error!("Failed to parse CLI arguments: {err}");
+            return -8;
+        }
+    };
     general_run_for_api(args, tun_mtu, packet_information)
 }
 
@@ -57,19 +72,20 @@ pub fn general_run_for_api(args: Args, tun_mtu: u16, packet_information: bool) -
         return -3;
     };
     let args_clone = args.clone();
-    let res = rt.block_on(async move {
-        let ret = general_run_async(args_clone, tun_mtu, packet_information, shutdown_token).await;
-        // Spawn a std thread to force exit after timeout so it isn't cancelled
-        // when the tokio runtime is dropped.
-        let _h = std::thread::spawn(move || {
-            // Delay some seconds then try to exit current process if not exited yet, normally this case should not happen
-            std::thread::sleep(crate::FORCE_EXIT_TIMEOUT);
-            log::info!("Forcing exit now.");
-            std::process::exit(-1);
-        });
-        tokio::time::sleep(std::time::Duration::from_micros(100)).await;
-        ret
-    });
+    let res = rt.block_on(general_run_async(args_clone, tun_mtu, packet_information, shutdown_token));
+
+    // Upstream spawned a detached thread here that slept FORCE_EXIT_TIMEOUT and
+    // then called std::process::exit(-1) unconditionally - on every call,
+    // including the ones that returned Ok. Anything embedding this library died
+    // two seconds after the tunnel stopped, with an exit code it never chose and
+    // no chance to run a destructor. A library does not get to end its host.
+    //
+    // What that thread was reaching for is real: dropping a tokio runtime blocks
+    // until its blocking tasks finish, and one that never finishes would hang
+    // here instead. shutdown_timeout is the bounded form - it waits, then
+    // returns and leaks whatever refused to stop. The caller stays alive either
+    // way and decides for itself what to do about it.
+    rt.shutdown_timeout(crate::FORCE_EXIT_TIMEOUT);
 
     let res = match res {
         Ok(sessions) => {
@@ -210,4 +226,61 @@ pub async fn general_run_async(
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn tun2proxy_stop() -> c_int {
     tun2proxy_stop_internal()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Bad input to the C entry point must come back as a return code, not as
+    /// a dead host process.
+    ///
+    /// This runs the assertion in a child on purpose. The defect it guards
+    /// against is unobservable in-process: `clap::parse_from` calls
+    /// `process::exit`, so before the fix this test would have taken the whole
+    /// test runner down with it and reported nothing at all - the failure and
+    /// the thing that reports failures were the same process.
+    #[test]
+    fn bad_cli_args_return_instead_of_exiting_the_host() {
+        const MARKER: &str = "HOST-STILL-ALIVE";
+        const CHILD_ENV: &str = "TUN2PROXY_HOST_EXIT_CHILD";
+
+        if std::env::var(CHILD_ENV).is_ok() {
+            let bad = std::ffi::CString::new("tun2proxy --definitely-not-a-flag").unwrap();
+            let rc = unsafe { tun2proxy_run_with_cli_args(bad.as_ptr(), 1500, false) };
+            assert_eq!(rc, -8, "unparseable arguments should be reported, not fatal");
+
+            let nul = unsafe { tun2proxy_run_with_cli_args(std::ptr::null(), 1500, false) };
+            assert_eq!(nul, -7, "a NULL argument string should be refused, not dereferenced");
+
+            println!("{MARKER}");
+            return;
+        }
+
+        // --exact wants the full test path, and hardcoding it means the filter
+        // silently matches nothing the day this module moves - the child then
+        // runs 0 tests and reports success, which looks exactly like the child
+        // dying. Derive it instead; module_path! carries the crate name, which
+        // the test filter does not use.
+        let module = module_path!();
+        let filter = format!(
+            "{}::bad_cli_args_return_instead_of_exiting_the_host",
+            module.split_once("::").map(|(_, rest)| rest).unwrap_or(module)
+        );
+
+        let exe = std::env::current_exe().expect("test executable path");
+        let out = std::process::Command::new(exe)
+            .args([filter.as_str(), "--exact", "--nocapture"])
+            .env(CHILD_ENV, "1")
+            .output()
+            .expect("re-running this test as a child should work");
+
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            stdout.contains(MARKER),
+            "the child never got past the call; status {:?}\nstdout:\n{stdout}\nstderr:\n{}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
 }
