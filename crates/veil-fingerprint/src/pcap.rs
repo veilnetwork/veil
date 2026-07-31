@@ -105,12 +105,12 @@ fn process_block(
         PcapBlockOwned::LegacyHeader(hdr) => {
             // Legacy PCAP file header carries the linktype for all
             // following frames in the file.
-            *linktype = Some(hdr.network.0 as i32);
+            *linktype = Some(hdr.network.0);
             return;
         }
         PcapBlockOwned::Legacy(blk) => (blk.data, linktype.unwrap_or(LINKTYPE_ETHERNET)),
         PcapBlockOwned::NG(Block::InterfaceDescription(idb)) => {
-            *linktype = Some(idb.linktype.0 as i32);
+            *linktype = Some(idb.linktype.0);
             return;
         }
         PcapBlockOwned::NG(Block::EnhancedPacket(epb)) => {
@@ -134,11 +134,7 @@ const LINKTYPE_LINUX_SLL: i32 = 113;
 /// Strip Ethernet/Linux-cooked + IPv4/v6 + TCP/UDP headers, returning
 /// the application-layer payload or None if the frame couldn't be
 /// fully decoded (truncated, unsupported transport, filter mismatch).
-fn strip_link_ip_transport<'a>(
-    frame: &'a [u8],
-    linktype: i32,
-    port_filter: Option<u16>,
-) -> Option<&'a [u8]> {
+fn strip_link_ip_transport(frame: &[u8], linktype: i32, port_filter: Option<u16>) -> Option<&[u8]> {
     let (after_link, ethertype) = strip_link_layer(frame, linktype)?;
 
     // EtherType: 0x0800 = IPv4, 0x86dd = IPv6.  Drop anything else
@@ -217,7 +213,7 @@ fn strip_ipv6(packet: &[u8]) -> Option<(&[u8], u8)> {
     Some((&packet[40..], next_header))
 }
 
-fn strip_tcp<'a>(packet: &'a [u8], port_filter: Option<u16>) -> Option<&'a [u8]> {
+fn strip_tcp(packet: &[u8], port_filter: Option<u16>) -> Option<&[u8]> {
     if packet.len() < 20 {
         return None;
     }
@@ -237,7 +233,7 @@ fn strip_tcp<'a>(packet: &'a [u8], port_filter: Option<u16>) -> Option<&'a [u8]>
     Some(&packet[data_offset..])
 }
 
-fn strip_udp<'a>(packet: &'a [u8], port_filter: Option<u16>) -> Option<&'a [u8]> {
+fn strip_udp(packet: &[u8], port_filter: Option<u16>) -> Option<&[u8]> {
     if packet.len() < 8 {
         return None;
     }

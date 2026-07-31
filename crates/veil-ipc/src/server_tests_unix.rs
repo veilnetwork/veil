@@ -1530,7 +1530,8 @@ async fn anonymous_send_payload_starts_with_meta_e2e_marker() {
     use veil_proto::META_E2E_MARKER;
     use veil_proto::delivery::ForwardPayload;
     use veil_routing::RouteCache;
-    use veil_types::FrameBroadcaster;
+    use veil_session::glue::SessionTxBroadcaster;
+    use veil_session::tx_registry::SessionTxRegistry;
 
     let sock = temp_socket_path();
     let a_id = [0x0Au8; 32]; // local (server) node
@@ -1563,7 +1564,15 @@ async fn anonymous_send_payload_starts_with_meta_e2e_marker() {
         Arc::clone(&registry),
         a_id,
     )
-    .with_session_tx_registry(Arc::clone(&session_reg))
+    // The builder took Arc<RwLock<SessionTxRegistry>> when this test was
+    // written and now takes Arc<dyn FrameBroadcaster>; SessionTxBroadcaster is
+    // the adapter veil-session provides for exactly that. Nothing caught the
+    // drift because the feature gating this test is off in every build that
+    // runs - the other call sites in this file were carried forward, these two
+    // were not.
+    .with_session_tx_registry(Arc::new(SessionTxBroadcaster::new(Arc::clone(
+        &session_reg,
+    ))))
     .with_route_cache(Arc::clone(&route_cache))
     .with_e2e_keys(Arc::clone(&mlkem_cache));
     let sh = tokio::spawn(async move { server.run().await });
@@ -1597,15 +1606,13 @@ async fn anonymous_send_payload_starts_with_meta_e2e_marker() {
     };
     send_ipc_frame(&mut client, LocalAppMsg::AppIpcSend as u16, &send.encode()).await;
 
-    let (resp_hdr, _) =
-        tokio::time::timeout(Duration::from_millis(500), recv_ipc_frame(&mut client))
-            .await
-            .expect("timeout waiting for AppSendOk");
-    assert_eq!(
-        resp_hdr.msg_type,
-        LocalAppMsg::AppSendOk as u16,
-        "expected AppSendOk"
-    );
+    // No AppSendOk to wait for: with require_ack=false the server deliberately
+    // writes nothing back (handlers/send.rs, Phase E24 - the per-send ack cost
+    // an IPC syscall round trip per packet and capped a single stream at about
+    // 150 Mbps). This test asked for the ack anyway and had been doing so ever
+    // since, unnoticed, because the feature gating it is off in every build
+    // that runs. The assertion it exists for is the relayed frame below, which
+    // is its own synchronisation.
 
     // Inspect the frame that arrived at B's outbox.
     let (_prio, frame_bytes) = tokio::time::timeout(Duration::from_millis(500), b_rx.recv())
@@ -2014,7 +2021,7 @@ async fn transport_hint_query_returns_ranked_entries() {
 #[cfg(feature = "veilcore-internals-test")]
 #[tokio::test]
 async fn anycast_advertise_then_resolve_returns_self() {
-    use veil_anycast::AnycastService;
+    use veil_anycast::{AnycastResolvePolicy, AnycastService};
     use veil_dht::KademliaService;
     use veil_proto::anycast::{
         AnycastAdvertisePayload, AnycastResolvePayload, AnycastResultPayload,
@@ -2022,7 +2029,18 @@ async fn anycast_advertise_then_resolve_returns_self() {
 
     let sock = temp_socket_path();
     let dht = Arc::new(KademliaService::new(node_id()));
-    let svc = Arc::new(AnycastService::new(Arc::clone(&dht), node_id()));
+    // BestEffort explicitly. The IPC advertise wire format is unsigned, and a
+    // daemon with no signing key wired publishes a v1 record, so under the
+    // default SignedBound policy this roundtrip correctly resolves to nothing.
+    // That default arrived in audit cycle-6 and this test kept asserting the
+    // old one for as long as the feature gating it stayed off in every build.
+    // The legacy discovery path is still what this test is about; the default
+    // is pinned by anycast_default_policy_drops_the_unsigned_ipc_advertise
+    // below.
+    let svc = Arc::new(
+        AnycastService::new(Arc::clone(&dht), node_id())
+            .with_policy(AnycastResolvePolicy::BestEffort),
+    );
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let registry = Arc::new(AppEndpointRegistry::new());
     let mut server = IpcServer::new(
@@ -2081,6 +2099,72 @@ async fn anycast_advertise_then_resolve_returns_self() {
     assert!(
         result.node_ids.is_empty(),
         "node_ids should be empty after withdraw"
+    );
+
+    drop(client);
+    let _ = shutdown_tx.send(true);
+    let _ = sh.await;
+}
+
+/// The secure-by-default posture, pinned from the IPC side.
+///
+/// `AnycastAdvertise` has no signature field on the wire, so an app talking to
+/// a daemon that has no signing key wired publishes an unsigned v1 record. The
+/// default resolve policy is `SignedBound`, which drops exactly those - and
+/// that is the point of it, not a gap. Without this test the default could be
+/// relaxed back to `BestEffort` and every test in this file would still pass,
+/// because the only other one that touches anycast now opts down explicitly.
+#[cfg(feature = "veilcore-internals-test")]
+#[tokio::test]
+async fn anycast_default_policy_drops_the_unsigned_ipc_advertise() {
+    use veil_anycast::AnycastService;
+    use veil_dht::KademliaService;
+    use veil_proto::anycast::{
+        AnycastAdvertisePayload, AnycastResolvePayload, AnycastResultPayload,
+    };
+
+    let sock = temp_socket_path();
+    let dht = Arc::new(KademliaService::new(node_id()));
+    // No with_policy: this is the shipped default.
+    let svc = Arc::new(AnycastService::new(Arc::clone(&dht), node_id()));
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let registry = Arc::new(AppEndpointRegistry::new());
+    let mut server = IpcServer::new(
+        IpcEndpoint::Unix(sock.clone()),
+        shutdown_rx,
+        Arc::clone(&registry),
+        node_id(),
+    )
+    .with_anycast_service(svc);
+    let sh = tokio::spawn(async move { server.run().await });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let mut client = connect_and_hello(&sock).await;
+    let adv = AnycastAdvertisePayload {
+        service_tag: *b"mbox",
+        score: 0, // the value a sybil would claim to win every resolve
+        ttl_secs: 3600,
+    };
+    send_ipc_frame(
+        &mut client,
+        LocalAppMsg::AnycastAdvertise as u16,
+        &adv.encode(),
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let q = AnycastResolvePayload {
+        service_tag: *b"mbox",
+        max_results: 8,
+    };
+    send_ipc_frame(&mut client, LocalAppMsg::AnycastResolve as u16, &q.encode()).await;
+    let (hdr, body) = recv_ipc_frame(&mut client).await;
+    assert_eq!(hdr.msg_type, LocalAppMsg::AnycastResult as u16);
+    let result = AnycastResultPayload::decode(&body).unwrap();
+    assert!(
+        result.node_ids.is_empty(),
+        "an unsigned record resolved under the default policy: {:?}",
+        result.node_ids
     );
 
     drop(client);
