@@ -925,8 +925,10 @@ mod tests {
         assert_eq!(r.node_ids[0], [0xDD; 32]);
     }
 
-    /// `with_policy(BestEffort)` retains default behaviour — both
-    /// signed and unsigned records returned.
+    /// `with_policy(BestEffort)` opts DOWN from the default — both signed and
+    /// unsigned records are returned. This said "retains default behaviour"
+    /// until audit cycle-6 moved the default to `SignedBound`, and reading it
+    /// afterwards told you the opposite of what the enum does.
     #[test]
     fn resolve_with_best_effort_policy_returns_all() {
         let svc = make_service(0xCC).with_policy(AnycastResolvePolicy::BestEffort);

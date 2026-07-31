@@ -6,11 +6,14 @@ description = "Local IPC server for the Veil node (Epic 451): authenticated `APP
 license = "AGPL-3.0-or-later"
 
 [features]
-# Enables 4 integration tests that construct veilcore-internal
-# `SessionTxRegistry` / `KademliaService` directly.  Off by default —
-# those tests will be migrated to veilcore/tests/ in a follow-up so
-# veil-ipc can run its own `cargo test` without cycling back into
-# veilcore.
+# Enables integration tests that construct `SessionTxRegistry` /
+# `KademliaService` directly.  Off by default so `cargo test -p veil-ipc`
+# stays free of those crates; the feature pulls them in optionally rather
+# than leaving the tests referencing crates nobody links, which is what made
+# `--all-features` fail to compile while every default build stayed green.
+#
+# There is no dependency cycle to avoid here: neither veil-session nor
+# veil-dht depends on veil-ipc.
 veilcore-internals-test = []
 
 [dependencies]
@@ -34,6 +37,15 @@ log = "0.4"
 rand_core = { version = "0.6", features = ["getrandom"] }
 thiserror = "2.0"
 tokio = { version = "1.42", features = ["sync", "rt", "macros", "time", "io-util", "net"] }
+
+[dev-dependencies]
+# Only the tests behind veilcore-internals-test touch these, and only as
+# dev-dependencies can they be here at all: veil-session pulls veil-cfg, which
+# reaches veil-observability, which depends back on veil-ipc. Cargo permits a
+# cycle that passes through a dev-dependency edge and refuses one that does
+# not, so a normal dependency - optional or otherwise - is not an option.
+veil-dht = { path = "../veil-dht" }
+veil-session = { path = "../veil-session" }
 
 [lints]
 workspace = true
