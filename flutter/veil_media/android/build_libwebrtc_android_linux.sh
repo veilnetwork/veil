@@ -48,10 +48,20 @@ done
 
 OUT="out/android-arm64"
 ARGS='target_os="android" target_cpu="arm64" is_debug=false is_component_build=false symbol_level=0 rtc_include_tests=false rtc_build_examples=false rtc_build_tools=false rtc_enable_protobuf=false rtc_use_h264=false enable_libaom=false rtc_include_opus=true treat_warnings_as_errors=false'
-gn gen "$OUT" --args="$ARGS" || exit 1
+# --export-compile-commands is load-bearing, exactly as on the other targets:
+# build_veil_media_so.sh reads call.cc's exact command out of
+# compile_commands.json rather than reinventing the two dozen flags WebRTC
+# compiles with. Without the flag gn writes no such file, and this script went
+# on to print its path anyway - so the next step failed on a missing input
+# after being told it was there.
+gn gen "$OUT" --args="$ARGS" --export-compile-commands || exit 1
 ninja -C "$OUT" webrtc || exit 1
 
 echo "DONE: $WEBRTC_BUILD/src/$OUT/obj/libwebrtc.a"
 ls -la "$OUT/obj/libwebrtc.a"
+[ -f "$OUT/compile_commands.json" ] || {
+  echo "FATAL: gn wrote no compile_commands.json — build_veil_media_so.sh has nothing to read" >&2
+  exit 1
+}
 echo "compile_commands.json: $WEBRTC_BUILD/src/$OUT/compile_commands.json"
 echo "Next: build_veil_media_so.sh (cross-compile the .so against this libwebrtc.a)."

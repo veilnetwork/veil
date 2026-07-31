@@ -112,6 +112,8 @@ DynamicLibrary _openAndroid() {
 ///   * macOS: `<app>/Contents/Frameworks/libveil_media.dylib` (absolute, via
 ///     the resolved executable) — falls back to a bare name / process().
 ///   * Android/Linux: `libveil_media.so` from the loader path.
+///   * Windows: `veil_media.dll`, which the loader takes from the directory
+///     xveil.exe sits in — the same one veilclient_ffi.dll is staged into.
 ///   * iOS: statically embedded → `process()`.
 /// `VEIL_MEDIA_DYLIB` overrides for tests.
 DynamicLibrary _open() {
