@@ -249,10 +249,33 @@ try {
   if (-not (Test-Path $linker)) { $linker = 'lld-link.exe' }
   $dll = Join-Path $Dest 'veil_media.dll'
 
+  # Chromium's libc++ implements std::exception_ptr by calling MSVC's
+  # __ExceptionPtr* helpers, which live in the MSVC C++ runtime and not in
+  # libc++ itself - exception.obj references ten of them and defines none.
+  # Which import library carries them depends on the CRT the objects were
+  # compiled against, and mixing the static and dynamic runtimes is its own
+  # distinct failure, so read the flavour off the same template command the
+  # rest of this script derives everything else from rather than guessing.
+  $crt = if ($templateCmd -match '(?i)(^|\s)[/-]MT(d?)(\s|$)') {
+    if ($Matches[2]) { 'static-debug' } else { 'static' }
+  } elseif ($templateCmd -match '(?i)(^|\s)[/-]MD(d?)(\s|$)') {
+    if ($Matches[2]) { 'dynamic-debug' } else { 'dynamic' }
+  } else {
+    'dynamic'
+  }
+  $cxxRuntimeLib = switch ($crt) {
+    'static'        { 'libcpmt.lib' }
+    'static-debug'  { 'libcpmtd.lib' }
+    'dynamic-debug' { 'msvcprtd.lib' }
+    default         { 'msvcprt.lib' }
+  }
+  Write-Host "==> CRT: $crt -> $cxxRuntimeLib"
+
   # mf*/dmo*/strmiids: Media Foundation capture. gdi32/user32: the screen
   # capturer. ole32/oleaut32: COM for both. The rest is what WebRTC's own
   # win-x64 target links.
   $systemLibs = @(
+    $cxxRuntimeLib,
     'mfplat.lib', 'mf.lib', 'mfreadwrite.lib', 'mfuuid.lib',
     'gdi32.lib', 'user32.lib', 'ole32.lib', 'oleaut32.lib',
     'advapi32.lib', 'winmm.lib', 'ws2_32.lib', 'secur32.lib', 'shell32.lib',
