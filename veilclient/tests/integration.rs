@@ -22,13 +22,35 @@ fn node_id() -> [u8; 32] {
     [0x42u8; 32]
 }
 
+/// A socket path no other test in this process will pick.
+///
+/// This used to be pid + `as_nanos()`, which reads as unique and is not: the
+/// wall clock on a macOS host advances in microseconds, so the bottom three
+/// digits are always zero and two tests that start within the same microsecond
+/// get the SAME path. The second server then fails to bind, the client
+/// connects to the first one, and the assertion fails on whatever that server
+/// happens to answer - a stub identity of zeroes instead of the 0xCD one this
+/// test wired.
+///
+/// It only showed up in a full workspace run, because that is when enough CPU
+/// contention exists to bunch test startups into the same microsecond, and it
+/// read as flakiness. `veil-ipc`'s temp_socket_path already did the right
+/// thing; this is the same counter.
 fn temp_socket() -> PathBuf {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
     let id = std::process::id();
-    let ts = std::time::SystemTime::now()
-        .duration_since(std::time::SystemTime::UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    std::env::temp_dir().join(format!("veil-client-test-{}-{}.sock", id, ts))
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    std::env::temp_dir().join(format!("veil-client-test-{}-{}.sock", id, n))
+}
+
+/// The helper above must not hand the same path to two callers, however fast
+/// they ask. A timestamp-based version passes this only when the clock happens
+/// to tick between calls, which on this host it does not.
+#[test]
+fn temp_socket_paths_are_unique_within_a_process() {
+    let paths: std::collections::HashSet<_> = (0..1000).map(|_| temp_socket()).collect();
+    assert_eq!(paths.len(), 1000, "temp_socket() handed out a duplicate path");
 }
 
 async fn start_server(sock: PathBuf) -> (watch::Sender<bool>, tokio::task::JoinHandle<()>) {
