@@ -83,6 +83,17 @@ try {
   $templateCmd = if ($template.command) { $template.command } else { $template.arguments -join ' ' }
   $templateFile = $template.file
 
+  # Report the form the toolchain currently writes the output flag in. This is
+  # the one thing about the template that has silently changed under us, and
+  # the failure it produces (a clean compile that emits no object) points
+  # nowhere near it.
+  $outFlag = if ($templateCmd -match '(?i)(\s/Fo\s*(?:"[^"]*"|\S+)|\s-o\s+(?:"[^"]*"|\S+))') {
+    $Matches[1].Trim()
+  } else {
+    'NONE FOUND'
+  }
+  Write-Host "==> template output flag: $outFlag"
+
   # The compiler is the first token; keep it, it is the checkout's own clang-cl.
   $compiler = ($templateCmd -split '\s+')[0]
   $compilerDir = Split-Path -Parent (Join-Path $template.directory $compiler)
@@ -99,8 +110,17 @@ try {
     # everything else - defines, includes, sysroot, warning flags - is kept
     # exactly as WebRTC compiled its own translation unit.
     $cmd = $cmd -replace [regex]::Escape($templateFile), ($Source -replace '\\', '/')
-    $cmd = $cmd -replace '(?i)/Fo\S+', ('/Fo"' + $objFwd + '"')
-    $cmd = $cmd -replace '(?i)-o\s+\S+', ('-o "' + $objFwd + '"')
+
+    # Strip EVERY form of the output flag and append ours, rather than matching
+    # the form that happens to be current. Run 30493115568 compiled all eight
+    # translation units, reported no error, and produced not one object: the
+    # template writes the flag with a space in it, so a pattern anchored on
+    # /Fo<path> matched nothing, /Fo was left with no value, the object path
+    # became a bare input ("linker input unused"), and clang defaulted the
+    # output into the WebRTC out directory.
+    $cmd = $cmd -replace '(?i)\s/Fo\s*("[^"]*"|\S+)', ' '
+    $cmd = $cmd -replace '(?i)\s-o\s+("[^"]*"|\S+)', ' '
+    $cmd = $cmd + ' /Fo"' + $objFwd + '"'
     # VEIL_MEDIA_HAVE_WEBRTC switches the engine from the ABI-only stub to the
     # real implementation; -I<src> finds veil_camera.h and friends.
     $cmd = $cmd -replace '^(\S+)', ('$1 -DVEIL_MEDIA_HAVE_WEBRTC=1 -I"' + $srcDirFwd + '"')
@@ -129,6 +149,15 @@ try {
       if ($LASTEXITCODE -ne 0) { throw "compile failed: $Source" }
     } finally {
       Pop-Location
+    }
+    # Exit code 0 is not evidence that an object exists. It was not, once: the
+    # compiler ran, warned about an unused input, wrote the object somewhere
+    # else entirely and returned success, and the build only noticed eight
+    # translation units later when llvm-nm had nothing to read.
+    if (-not (Test-Path -LiteralPath $Object)) {
+      throw ("compiled $Source without error but no object at $Object - the " +
+             "output flag was not rewritten; check the template output flag " +
+             "reported above")
     }
   }
 
