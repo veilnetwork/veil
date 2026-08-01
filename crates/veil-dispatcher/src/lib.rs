@@ -200,66 +200,37 @@ pub struct CryptoContext {
     /// Ed25519 signing key for ROUTE_ANNOUNCE / ROUTE_WITHDRAW frames.
     /// `None` in tests that do not need gossip signing.
     pub local_signing_key: Option<Arc<SigningKey>>,
-    /// ML-KEM-768 encapsulation key (public, 1184 bytes) for this node.
-    /// Included in `RouteResponsePayload` so remote nodes can encrypt for us.
-    pub mlkem_ek: Arc<[u8; veil_e2e::EK_BYTES]>,
-    /// ML-KEM-768 decapsulation-key seed (64 bytes) for this node.
+    /// This node's ML-KEM-768 mailbox keypair — the public encapsulation key
+    /// published in `RouteResponsePayload` and the signed `MlKemCert`, the
+    /// secret decapsulation seed that opens what was sealed to it, and the
+    /// retired seeds still inside their overlap window.
     ///
-    /// **Forward-secrecy limitation:** This seed is loaded at
-    /// node start and held in memory for the lifetime of the process. Unlike
-    /// ephemeral session keys, it is *not* rotated per-session — any historical
-    /// ciphertext captured before the seed was changed can be decrypted by an
-    /// attacker who later exfiltrates the seed. The practical impact is
-    /// bounded by TLS-style "break-then-decrypt": an attacker must both
-    /// (a) record the ciphertext *and* (b) compromise the node later.
+    /// # Forward secrecy
     ///
-    /// Mitigation options (not yet implemented). The ticket key next door got
-    /// its rotation + overlap slot (see `veil_session::ticket`); this one did
-    /// not, because its key is PUBLISHED and the overlap window therefore has
-    /// to outlive everyone else's copy of the old EK. Measured constraints, so
-    /// the next attempt does not have to re-derive them:
+    /// The seed lives in process memory for as long as it is current, so a leak
+    /// of those 64 bytes (a swap page, a core dump) is retroactive over
+    /// everything sealed to the matching EK. Rotation bounds that window; it
+    /// does not close it, and the bound is deliberately generous because the
+    /// key is PUBLISHED — see [`veil_e2e::MLKEM_SEED_MIN_OVERLAP_SECS`] for why
+    /// a retired seed has to keep working for over a week rather than the few
+    /// hours the live path alone would suggest.
     ///
-    /// * a peer caches an EK for `IpcConfig::e2e_key_ttl_secs` (default 1h);
-    /// * the signed `MlKemCert` is refreshed on the sovereign republish tick
-    ///   (6h), so a rotated EK can take that long to reach the DHT;
-    /// * worst case is a peer that cached just before a republish, i.e. the
-    ///   old seed must stay decrypt-capable for **≥ 7h**; a rotation interval
-    ///   below that silently drops mail rather than failing loudly.
-    ///
-    /// A previous-seed slot with trial decryption (current, then previous)
-    /// avoids any wire change — no key ID needed. The DECRYPT side is small:
-    /// exactly one site resolves a seed, `delivery.rs`'s
-    /// `deliver_forward_envelope`, which already prefers a per-session
-    /// ephemeral seed over this one; adding "then try the previous long-term
-    /// seed" is a third arm on that same choice.
-    ///
-    /// What is NOT small is making the seed swappable at all. `mlkem_dk_seed`
-    /// and `mlkem_ek` are plain `Arc<T>` — read, not locked — from ~102 places
-    /// across a dozen crates, so rotation means turning both into guarded
-    /// state everywhere before anything can move. Adding a parallel "epoch"
-    /// field instead would be cheaper and wrong: two sources of truth for
-    /// which key is current is exactly how a node ends up publishing one EK
-    /// and decrypting with another.
-    ///
-    /// Rotation must also force an immediate republish rather than waiting out
-    /// the 6h tick, or the ≥7h window above has to grow to cover it.
-    ///
-    /// * Rotate `mlkem_dk_seed` on a configurable schedule and re-derive EK.
-    /// * Use ephemeral ML-KEM per session (requires a second round-trip).
+    /// What rotation does NOT protect against: an attacker holding the identity
+    /// seed derives every epoch (the mailbox seed is a PRF of it — see
+    /// [`veil_crypto::identity::derive_mlkem_dk_seed_epoch`]). That is the price
+    /// of a scheme that survives a restart with nothing persisted, which this
+    /// node needs because xVeil clients recreate their runtime dir every
+    /// session. The identity seed is read off disk and dropped, so it is the
+    /// mailbox seed — not the identity — that is exposed to a memory leak, and
+    /// that is the one this bounds. Live sessions are separately covered by the
+    /// per-session ephemeral seeds in `per_session_mlkem_dk`.
     ///
     /// # Memory hygiene (Phase 6 slice 6g)
     ///
-    /// Backed by [`veil_util::sensitive_bytes::SensitiveBytesN<64>`] —
-    /// the 64-byte DK seed is pinned via `mlock(2)` when `RLIMIT_MEMLOCK`
-    /// permits, falls back to a zeroize-on-drop `Zeroizing<Vec<u8>>`
-    /// otherwise.  Closing the swap-to-disk vector matters more here than
-    /// for any session-scoped key: the DK seed is **process-lifetime**
-    /// (rotation is a manual operator action — see mitigation note
-    /// above), so if pages holding it land on disk under sustained
-    /// memory pressure, **every E2E ciphertext ever sent to this node**
-    /// becomes recoverable by anyone with read access to the swap partition.
-    pub mlkem_dk_seed:
-        Arc<veil_util::sensitive_bytes::SensitiveBytesN<{ veil_e2e::DK_SEED_BYTES }>>,
+    /// Each seed in the ring is a [`veil_util::sensitive_bytes::SensitiveBytesN<64>`]
+    /// — pinned via `mlock(2)` when `RLIMIT_MEMLOCK` permits, zeroize-on-drop
+    /// otherwise — and a retired seed is zeroized when its window closes.
+    pub mlkem_keys: Arc<veil_e2e::MlKemSeedRing>,
     /// Peer ML-KEM-768 encapsulation-key cache: `peer_id → (ek_bytes, cached_at)`.
     pub peer_mlkem_keys: Arc<std::sync::RwLock<veil_e2e::PeerMlKemCache>>,
     /// Maps `peer_id → (algo_byte, raw_pubkey_bytes)`. Populated when a
@@ -1789,10 +1760,11 @@ pub fn make_test_dispatcher(role: NodeRole) -> FrameDispatcher {
         ),
         crypto: Arc::new(CryptoContext {
             local_signing_key: None,
-            mlkem_ek: Arc::new([0u8; veil_e2e::EK_BYTES]),
-            mlkem_dk_seed: Arc::new(veil_util::sensitive_bytes::SensitiveBytesN::<
-                { veil_e2e::DK_SEED_BYTES },
-            >::new()),
+            mlkem_keys: Arc::new(veil_e2e::MlKemSeedRing::new(
+                0,
+                [0u8; veil_e2e::DK_SEED_BYTES],
+                [0u8; veil_e2e::EK_BYTES],
+            )),
             peer_mlkem_keys: Arc::new(std::sync::RwLock::new(veil_e2e::PeerMlKemCache::new())),
             peer_pubkeys: Arc::new(Mutex::new(veil_types::PeerLruCache::with_capacity(64))),
             peer_roles: Arc::new(Mutex::new(veil_types::PeerLruCache::with_capacity(64))),
@@ -2501,10 +2473,11 @@ mod tests {
             ),
             crypto: Arc::new(CryptoContext {
                 local_signing_key: Some(signing_key),
-                mlkem_ek: Arc::new([0u8; veil_e2e::EK_BYTES]),
-                mlkem_dk_seed: Arc::new(veil_util::sensitive_bytes::SensitiveBytesN::<
-                    { veil_e2e::DK_SEED_BYTES },
-                >::new()),
+                mlkem_keys: Arc::new(veil_e2e::MlKemSeedRing::new(
+                    0,
+                    [0u8; veil_e2e::DK_SEED_BYTES],
+                    [0u8; veil_e2e::EK_BYTES],
+                )),
                 peer_mlkem_keys: Arc::new(std::sync::RwLock::new(veil_e2e::PeerMlKemCache::new())),
                 peer_pubkeys: Arc::new(Mutex::new(peer_map)),
                 peer_roles: Arc::new(Mutex::new(veil_types::PeerLruCache::with_capacity(64))),
@@ -3449,6 +3422,103 @@ mod tests {
 
     // ── tests ────────────────────────────────────────────────────────
 
+    /// A message sealed to the key we published BEFORE a rotation still opens
+    /// after it.
+    ///
+    /// This is the entire point of keeping retired seeds, and nothing else
+    /// covers it: a break that decrypts under the current seed only leaves every
+    /// other test green, while in the field it silently drops a week of mail
+    /// from anyone whose cached copy of our encapsulation key had not refreshed.
+    #[test]
+    fn a_message_sealed_to_a_retired_key_still_decrypts() {
+        use veil_e2e::generate_keypair;
+        use veil_proto::{E2E_MARKER, delivery::DeliveryEnvelope};
+
+        let sender_id = [0xAAu8; 32];
+        let me = [0xCCu8; 32];
+
+        // The key we published, then the one we rotated to.
+        let (old_ek, old_dk) = generate_keypair();
+        let (new_ek, new_dk) = generate_keypair();
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+
+        let mut disp = make_test_dispatcher(NodeRole::Core);
+        disp.local_node_id = me;
+        let ring = Arc::new(veil_e2e::MlKemSeedRing::new(0, old_dk, old_ek));
+        ring.rotate(
+            now,
+            1,
+            new_dk,
+            new_ek,
+            veil_e2e::MLKEM_SEED_MIN_OVERLAP_SECS,
+        )
+        .expect("rotation with a full overlap");
+        disp.crypto = Arc::new(CryptoContext {
+            mlkem_keys: Arc::clone(&ring),
+            ..(*disp.crypto).clone()
+        });
+
+        // A sender whose cached EK is the pre-rotation one seals to it.
+        let plaintext = b"sealed before the rotation";
+        let e2e_env = veil_e2e::encrypt(&old_ek, &sender_id, &me, plaintext).expect("encrypt");
+        let mut payload = vec![E2E_MARKER];
+        payload.extend_from_slice(&e2e_env.encode());
+
+        let envelope = DeliveryEnvelope {
+            recipient: veil_proto::recipient::Recipient::any(me),
+            sender_node_id: sender_id,
+            src_app_id: [0u8; 32],
+            app_id: [0u8; 32],
+            endpoint_id: 0,
+            content_id: [0u8; 32],
+            created_at: 0,
+            ttl_secs: u32::MAX,
+            payload,
+            trace_id: 0,
+            require_ack: false,
+        };
+
+        let seeds = ring.decrypt_seeds(now);
+        assert_eq!(seeds.len(), 2, "current key plus the retired one");
+
+        let (mut snd, mut src_app, mut app, mut eid) = ([0u8; 32], [0u8; 32], [0u8; 32], 0u32);
+        let opened = disp.decrypt_forward_payload(
+            Some(E2E_MARKER),
+            &seeds,
+            &envelope,
+            &mut snd,
+            &mut src_app,
+            &mut app,
+            &mut eid,
+        );
+        assert_eq!(
+            opened.map(|(p, _)| p).as_deref(),
+            Some(&plaintext[..]),
+            "a blob sealed to the retired key must still open"
+        );
+
+        // …and the current seed alone is NOT enough, which is what makes the
+        // assertion above about trial decryption rather than about luck.
+        let current_only = [*ring.current_seed()];
+        assert!(
+            disp.decrypt_forward_payload(
+                Some(E2E_MARKER),
+                &current_only,
+                &envelope,
+                &mut snd,
+                &mut src_app,
+                &mut app,
+                &mut eid,
+            )
+            .is_none(),
+            "test premise: the message is not addressed to the current key"
+        );
+    }
+
     /// 62.8: A → B(relay) → C — A encrypts for C; B cannot decrypt; C decrypts.
     #[test]
     fn e2e_relay_encrypt_decrypt_roundtrip() {
@@ -3521,9 +3591,11 @@ mod tests {
         // Give C its real DK seed so the dispatcher can decrypt.
         let c_dk_arr: [u8; DK_SEED_BYTES] = c_dk_seed;
         disp_c.crypto = Arc::new(CryptoContext {
-            mlkem_dk_seed: Arc::new(veil_util::sensitive_bytes::SensitiveBytesN::<
-                { DK_SEED_BYTES },
-            >::from_bytes(c_dk_arr)),
+            mlkem_keys: Arc::new(veil_e2e::MlKemSeedRing::new(
+                0,
+                c_dk_arr,
+                [0u8; veil_e2e::EK_BYTES],
+            )),
             ..(*disp_c.crypto).clone()
         });
         disp_c.local_node_id = c_id;
@@ -7510,22 +7582,27 @@ mod tests {
         );
     }
 
-    // ── Phase 6 slice 6g: mlkem_dk_seed SensitiveBytesN<64> migration ──
+    // ── Phase 6 slice 6g: the persistent ML-KEM DK seed ────────────────
 
-    /// Verifies the persistent ML-KEM DK seed field correctly uses
-    /// `SensitiveBytesN<64>` storage and exposes a `&[u8; 64]` view to
-    /// downstream readers (delivery.rs decap path uses `.as_array()`).
-    /// Guards against accidental regression to a plain `[u8; 64]` field
-    /// that would silently lose the mlock-when-possible guarantee.
+    /// The persistent ML-KEM keypair is reachable as a 64-byte seed and a
+    /// 1184-byte EK from ONE holder.
+    ///
+    /// The mlock-when-possible guarantee this used to assert here moved with
+    /// the storage into [`veil_e2e::MlKemSeedRing`], which pins it directly
+    /// (`ring_stores_the_seed_in_mlockable_storage`). What is worth asserting
+    /// from the dispatcher's side is that both halves come off the same object,
+    /// so no future edit can reintroduce an EK field that drifts from the seed
+    /// beside it.
     #[test]
-    fn etap6_slice6g_mlkem_dk_seed_is_sensitive_bytes_n() {
+    fn etap6_slice6g_mlkem_keys_expose_a_matched_pair() {
         let dispatcher = make_test_dispatcher(NodeRole::Core);
-        // SensitiveBytesN<64> exposes a 64-byte array view — any other
-        // storage type would fail this signature at compile time.
-        let view: &[u8; veil_e2e::DK_SEED_BYTES] = dispatcher.crypto.mlkem_dk_seed.as_array();
-        assert_eq!(view.len(), 64);
-        // Test fixture initialises with zero seed (SensitiveBytesN::new).
-        assert!(view.iter().all(|&b| b == 0));
+        let seed: [u8; veil_e2e::DK_SEED_BYTES] = *dispatcher.crypto.mlkem_keys.current_seed();
+        let ek: [u8; veil_e2e::EK_BYTES] = dispatcher.crypto.mlkem_keys.current_ek();
+        assert_eq!(seed.len(), 64);
+        assert_eq!(ek.len(), 1184);
+        // Test fixture initialises at the genesis epoch with a zero keypair.
+        assert_eq!(dispatcher.crypto.mlkem_keys.epoch(), 0);
+        assert!(seed.iter().all(|&b| b == 0));
     }
 
     // ── Phase 6 slice 6h: per_session_mlkem_dk SensitiveBytesN<64> ─────

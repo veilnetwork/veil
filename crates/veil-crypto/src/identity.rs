@@ -137,12 +137,60 @@ pub const MLKEM_DK_SEED_DERIVATION_INFO: &[u8] = b"veil/mlkem-dk-seed/v1";
 /// SAME seed. Per-identity isolation is automatic: master and each decoy load
 /// their OWN `device_identity_sk.bin`, so they derive DISTINCT keys.
 ///
-/// Rotation (future, operator-initiated): bump the info string to `…/v2` AND the
-/// published `cert_version`, with a grace window — do not rotate silently.
+/// Rotation: see [`derive_mlkem_dk_seed_epoch`], which supersedes the "bump the
+/// info string to `…/v2`" note that stood here. Rotation is scheduled, not
+/// operator-initiated, and the grace window is enforced by the seed ring rather
+/// than by an operator remembering it.
 pub fn derive_mlkem_dk_seed(identity_sk_seed: &[u8; 32]) -> Zeroizing<[u8; 64]> {
     let hk = Hkdf::<Sha256>::new(None, identity_sk_seed);
     let mut out = Zeroizing::new([0u8; 64]);
     hk.expand(MLKEM_DK_SEED_DERIVATION_INFO, out.as_mut())
+        .expect("64 bytes < 255 * hash_len");
+    out
+}
+
+/// Info string for a ROTATED ML-KEM mailbox seed. The rotation `epoch` (8 LE
+/// bytes) is appended before expansion. Deliberately a DIFFERENT label from
+/// [`MLKEM_DK_SEED_DERIVATION_INFO`] rather than that label plus a suffix, so
+/// there is no argument to have about whether some epoch encoding could collide
+/// with the un-suffixed genesis input.
+pub const MLKEM_DK_SEED_EPOCH_DERIVATION_INFO: &[u8] = b"veil/mlkem-dk-seed-epoch/v1";
+
+/// Derive the node's ML-KEM-768 mailbox decapsulation seed for rotation `epoch`.
+///
+/// ```text
+/// epoch == 0 → exactly derive_mlkem_dk_seed (the genesis key)
+/// epoch  > 0 → HKDF(ikm = identity_sk_seed,
+///                   info = "veil/mlkem-dk-seed-epoch/v1" ‖ epoch.to_le_bytes())
+/// ```
+///
+/// Epoch 0 reproducing the genesis derivation byte-for-byte is not cosmetic: a
+/// node with rotation switched off must publish the SAME encapsulation key it
+/// published before this function existed, or upgrading would invalidate every
+/// peer's cached EK and every mailbox blob already sealed to it. The equality
+/// is pinned by a test.
+///
+/// Rotation is time-derived (`epoch = now / interval`), which is what makes it
+/// survive a restart with no persisted state: any process that comes back
+/// inside the same epoch re-derives the same key, and one that comes back later
+/// can still derive its predecessors. That is only possible because the seed is
+/// a PRF of the identity seed. The cost of that is stated plainly: an attacker
+/// holding the identity seed derives every epoch, so rotation bounds the damage
+/// from a leak of *this* seed (it is the one that lives in process memory for
+/// hours — see the ring's rustdoc), not from a compromise of the identity.
+///
+/// Anonymity: unchanged from the genesis derivation — the epoch is a purely
+/// local counter, never transmitted; peers only ever see the resulting public
+/// EK inside the signed cert they already fetch.
+pub fn derive_mlkem_dk_seed_epoch(identity_sk_seed: &[u8; 32], epoch: u64) -> Zeroizing<[u8; 64]> {
+    if epoch == 0 {
+        return derive_mlkem_dk_seed(identity_sk_seed);
+    }
+    let hk = Hkdf::<Sha256>::new(None, identity_sk_seed);
+    let mut info = MLKEM_DK_SEED_EPOCH_DERIVATION_INFO.to_vec();
+    info.extend_from_slice(&epoch.to_le_bytes());
+    let mut out = Zeroizing::new([0u8; 64]);
+    hk.expand(&info, out.as_mut())
         .expect("64 bytes < 255 * hash_len");
     out
 }
@@ -400,6 +448,67 @@ mod tests {
         assert_ne!(
             *derive_mlkem_dk_seed(&[0x42u8; 32]),
             *derive_mlkem_dk_seed(&[0x43u8; 32])
+        );
+    }
+
+    #[test]
+    fn mlkem_epoch_zero_is_byte_identical_to_genesis() {
+        // The upgrade guarantee. A node with rotation off derives epoch 0, and
+        // epoch 0 MUST reproduce the pre-rotation key exactly — otherwise
+        // shipping this code republishes a different EK, invalidating every
+        // peer's cache and every mailbox blob already sealed to the old one.
+        for byte in [0x00u8, 0x42, 0xff] {
+            let seed = [byte; 32];
+            assert_eq!(
+                *derive_mlkem_dk_seed_epoch(&seed, 0),
+                *derive_mlkem_dk_seed(&seed)
+            );
+        }
+    }
+
+    #[test]
+    fn mlkem_epochs_are_independent_keys() {
+        // Rotation is only worth anything if a leaked epoch key says nothing
+        // about its neighbours: adjacent epochs must not share bytes, and the
+        // genesis key must not reappear at any later epoch.
+        let seed = [0x42u8; 32];
+        let genesis = derive_mlkem_dk_seed_epoch(&seed, 0);
+        let mut seen = vec![*genesis];
+        for epoch in 1..=4u64 {
+            let k = derive_mlkem_dk_seed_epoch(&seed, epoch);
+            assert!(
+                !seen.contains(&*k),
+                "epoch {epoch} collided with an earlier one"
+            );
+            seen.push(*k);
+        }
+    }
+
+    #[test]
+    fn mlkem_epoch_is_deterministic_and_identity_isolated() {
+        // Determinism is what lets rotation survive a restart with nothing
+        // persisted: the same (identity, epoch) re-derives the same key.
+        let a = derive_mlkem_dk_seed_epoch(&[0x42u8; 32], 7);
+        let b = derive_mlkem_dk_seed_epoch(&[0x42u8; 32], 7);
+        assert_eq!(*a, *b);
+        // Master and decoy must not share a rotated key either.
+        let other = derive_mlkem_dk_seed_epoch(&[0x43u8; 32], 7);
+        assert_ne!(*a, *other);
+    }
+
+    #[test]
+    fn mlkem_epoch_known_answer_vector() {
+        // KAT on the wire-visible derivation, same reasoning as the anonymity
+        // key's: a refactor that quietly changes the label or the epoch encoding
+        // would rotate every node's published EK on upgrade. That is a
+        // coordinated migration, not a silent one.
+        let okm = derive_mlkem_dk_seed_epoch(&[0u8; 32], 1);
+        let hex: String = okm.iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(
+            hex,
+            "094957b12257612aa65e84b24b0aa7931a670f327ac068ac67167db2f98dfd26\
+             09f7905e29f6bacd8f453c239388033a274ab90f3f2836dabd815ab1402ad04a",
+            "ML-KEM epoch KDF output changed — coordinated rotation only"
         );
     }
 

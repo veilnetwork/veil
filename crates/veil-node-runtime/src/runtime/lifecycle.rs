@@ -452,7 +452,7 @@ impl NodeRuntime {
             Arc::clone(&self.identity.peer_pubkeys),
             Arc::clone(&self.identity.peer_sovereign_identities),
             Arc::clone(&self.identity.peer_roles),
-            Arc::clone(&self.identity.mlkem_ek),
+            Arc::clone(&self.identity.mlkem_keys),
             Arc::clone(&self.identity.peer_mlkem_keys),
             Arc::clone(&self.identity.peer_mlkem_certs),
             Arc::clone(&self.identity.per_session_mlkem_dk),
@@ -844,8 +844,7 @@ impl NodeRuntime {
             logger: Arc::clone(&self.logger),
             crypto: Arc::new(veil_dispatcher::CryptoContext {
                 local_signing_key: reload_signing_key,
-                mlkem_ek: Arc::clone(&self.identity.mlkem_ek),
-                mlkem_dk_seed: Arc::clone(&self.mlkem_dk_seed),
+                mlkem_keys: Arc::clone(&self.identity.mlkem_keys),
                 peer_mlkem_keys: Arc::clone(&self.identity.peer_mlkem_keys),
                 peer_pubkeys: Arc::clone(&self.identity.peer_pubkeys),
                 peer_roles: Arc::clone(&self.identity.peer_roles),

@@ -1871,6 +1871,163 @@ impl NodeRuntime {
     /// outgoing one as decrypt-only for one further interval — long enough for
     /// tickets minted just before the swap to live out their TTL, which is why
     /// the interval is pinned at or above `SESSION_TICKET_TTL_SECS`.
+    /// Install a rotated ML-KEM keypair and, only if it took, ask the sovereign
+    /// republish to fire now.
+    ///
+    /// Split out of the rotation tick so the pairing is testable. Announcing
+    /// unconditionally would publish a cert around a key the ring refused —
+    /// advertising an encapsulation key the node cannot decrypt for — and
+    /// announcing never would leave the node advertising the key it just
+    /// replaced until the 6h tick came round. Neither is visible from inside
+    /// the spawned task.
+    #[allow(clippy::too_many_arguments)]
+    fn rotate_and_announce(
+        keys: &veil_e2e::MlKemSeedRing,
+        republish_now: &tokio::sync::Notify,
+        now_unix: u64,
+        epoch: u64,
+        dk: [u8; veil_e2e::DK_SEED_BYTES],
+        ek: [u8; veil_e2e::EK_BYTES],
+        overlap_secs: u64,
+    ) -> Result<(), veil_e2e::RotateRejected> {
+        keys.rotate(now_unix, epoch, dk, ek, overlap_secs)?;
+        republish_now.notify_waiters();
+        Ok(())
+    }
+
+    /// Replace the node's long-term ML-KEM mailbox key once per configured
+    /// interval, keeping the outgoing one decrypt-capable for its overlap.
+    ///
+    /// Three ways this declines to run, all logged rather than silent:
+    ///
+    /// * `mlkem_rotation_secs == 0` — the operator turned it off.
+    /// * the interval is under [`veil_e2e::MLKEM_SEED_MIN_OVERLAP_SECS`] — see
+    ///   that constant for why the floor is over a week. Refused, not clamped:
+    ///   a value that low means the caller is modelling this as a session key.
+    /// * this node's key is not derivable (a persisted `mlkem.key`), so there is
+    ///   no epoch sequence to walk.
+    ///
+    /// The tick POLLS the epoch rather than counting intervals. A phone
+    /// suspends, a laptop sleeps, and a timer that assumes it fired on schedule
+    /// would drift out of step with the key a restart would derive. Comparing
+    /// `rotation_epoch(now)` against the ring's epoch is correct across any gap.
+    pub fn spawn_mlkem_rotation_task(&mut self, config: &veil_cfg::Config) {
+        let Some(shutdown_tx) = &self.shutdown_tx else {
+            return;
+        };
+        let rotation_secs = config.global.mlkem_rotation_secs;
+        let logger = Arc::clone(&self.logger);
+        if rotation_secs == 0 {
+            logger.info(
+                "node.mlkem_dk.rotation_disabled",
+                "mlkem_rotation_secs=0 — the mailbox key is never replaced, so a leak of it \
+                 stays retroactive over the node's whole history",
+            );
+            return;
+        }
+        if rotation_secs < veil_e2e::MLKEM_SEED_MIN_OVERLAP_SECS {
+            logger.warn(
+                "node.mlkem_dk.rotation_interval_too_short",
+                format!(
+                    "mlkem_rotation_secs={rotation_secs} is under the {}s a sealed mailbox blob \
+                     can outlive a rotation — refusing to rotate rather than dropping mail",
+                    veil_e2e::MLKEM_SEED_MIN_OVERLAP_SECS,
+                ),
+            );
+            return;
+        }
+        let veil_dir = self
+            .config_path
+            .parent()
+            .unwrap_or(std::path::Path::new("."))
+            .to_path_buf();
+        let mlkem_key_path = veil_dir.join("mlkem.key");
+        if crate::identity_local::mlkem_dk::derive_for_epoch(&mlkem_key_path, &veil_dir, 0)
+            .is_none()
+        {
+            logger.info(
+                "node.mlkem_dk.rotation_unavailable",
+                "this node's mailbox key is not derived from its identity (persisted or \
+                 identity-less), so it has no epoch sequence to rotate along",
+            );
+            return;
+        }
+
+        let mut shutdown_rx = shutdown_tx.subscribe();
+        let mlkem_keys = Arc::clone(&self.identity.mlkem_keys);
+        let republish_now = Arc::clone(&self.mlkem_republish_now);
+        let handle = supervised_spawn(Arc::clone(&self.logger), "mlkem_key_rotation", async move {
+            // Poll far more often than the interval: the cost is an integer
+            // division, and it bounds how long a resumed-from-suspend node
+            // publishes a key its own clock says is stale.
+            const POLL: std::time::Duration = std::time::Duration::from_secs(60);
+            let mut interval = tokio::time::interval(POLL);
+            loop {
+                tokio::select! {
+                    _ = interval.tick() => {
+                        let now = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_secs())
+                            .unwrap_or(0);
+                        let want = crate::identity_local::mlkem_dk::rotation_epoch(
+                            now,
+                            rotation_secs,
+                        );
+                        if want <= mlkem_keys.epoch() {
+                            // Also the first tick, which fires immediately:
+                            // startup already derived this epoch's key.
+                            mlkem_keys.prune(now);
+                            continue;
+                        }
+                        let Some((ek, dk)) = crate::identity_local::mlkem_dk::derive_for_epoch(
+                            &mlkem_key_path,
+                            &veil_dir,
+                            want,
+                        ) else {
+                            // The identity file went away mid-session (an
+                            // identity switch, a wiped runtime dir). Keep the
+                            // current key rather than inventing one.
+                            logger.warn(
+                                "node.mlkem_dk.rotation_derive_failed",
+                                format!("could not derive the epoch-{want} mailbox key — \
+                                         keeping the current one"),
+                            );
+                            continue;
+                        };
+                        match Self::rotate_and_announce(
+                            &mlkem_keys,
+                            &republish_now,
+                            now,
+                            want,
+                            dk,
+                            ek,
+                            rotation_secs,
+                        ) {
+                            Ok(()) => logger.info(
+                                "node.mlkem_dk.rotated",
+                                format!(
+                                    "mailbox key now at epoch {want}; the previous one \
+                                     stays decrypt-capable for {rotation_secs}s so mail \
+                                     already sealed to it still opens",
+                                ),
+                            ),
+                            Err(e) => logger.warn(
+                                "node.mlkem_dk.rotation_refused",
+                                format!("seed ring refused the rotation: {e}"),
+                            ),
+                        }
+                    }
+                    Ok(_) = shutdown_rx.changed() => {
+                        if *shutdown_rx.borrow() {
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+        lock_tasks(&self.tasks).background.push(handle);
+    }
+
     pub fn spawn_ticket_key_rotation_task(&mut self) {
         let Some(shutdown_tx) = &self.shutdown_tx else {
             return;
@@ -4912,6 +5069,77 @@ pub fn evaluate_watchdog_tick(
 mod tests {
     use super::*;
     use veil_cfg::{BootstrapPeer, SignatureAlgorithm};
+
+    /// A rotation that took must pull the republish forward; one the ring
+    /// refused must not.
+    ///
+    /// The second half is the one worth a test. Announcing after a refusal
+    /// publishes a cert around the key the node still holds — harmless-looking,
+    /// and it hides the refusal behind a republish that appears to have worked.
+    #[tokio::test]
+    async fn only_a_rotation_that_took_pulls_the_republish_forward() {
+        let keys = veil_e2e::MlKemSeedRing::new(
+            1,
+            [0x11; veil_e2e::DK_SEED_BYTES],
+            [0x11; veil_e2e::EK_BYTES],
+        );
+        let notify = tokio::sync::Notify::new();
+        let overlap = veil_e2e::MLKEM_SEED_MIN_OVERLAP_SECS;
+
+        // A waiter must already be parked: `notify_waiters` wakes whoever is
+        // waiting NOW and stores nothing, which is the behaviour the republish
+        // loop relies on (it is always parked in its select). The first poll
+        // both parks it and shows nothing has fired yet.
+        let mut announced = Box::pin(notify.notified());
+        assert!(
+            futures_lite_ready(&mut announced).is_none(),
+            "nothing has rotated yet"
+        );
+
+        // Refused: the epoch does not advance.
+        let refused = NodeRuntime::rotate_and_announce(
+            &keys,
+            &notify,
+            2_000,
+            1,
+            [0x22; veil_e2e::DK_SEED_BYTES],
+            [0x22; veil_e2e::EK_BYTES],
+            overlap,
+        );
+        assert!(refused.is_err(), "epoch 1 does not advance on epoch 1");
+        assert_eq!(keys.current_ek(), [0x11u8; veil_e2e::EK_BYTES]);
+        assert!(
+            futures_lite_ready(&mut announced).is_none(),
+            "a refused rotation must not announce a key that never changed"
+        );
+
+        // Accepted: the epoch advances.
+        NodeRuntime::rotate_and_announce(
+            &keys,
+            &notify,
+            2_000,
+            2,
+            [0x33; veil_e2e::DK_SEED_BYTES],
+            [0x33; veil_e2e::EK_BYTES],
+            overlap,
+        )
+        .expect("epoch 2 advances");
+        assert_eq!(keys.current_ek(), [0x33u8; veil_e2e::EK_BYTES]);
+        assert!(
+            futures_lite_ready(&mut announced).is_some(),
+            "a rotation that took must publish the new key rather than wait out the 6h tick"
+        );
+    }
+
+    /// Poll a parked future once without awaiting it.
+    fn futures_lite_ready<F: std::future::Future<Output = ()> + Unpin>(f: &mut F) -> Option<()> {
+        let waker = std::task::Waker::noop();
+        let mut cx = std::task::Context::from_waker(waker);
+        match std::pin::Pin::new(f).poll(&mut cx) {
+            std::task::Poll::Ready(()) => Some(()),
+            std::task::Poll::Pending => None,
+        }
+    }
 
     #[test]
     fn ordinary_retransmit_advances_attempt_without_changing_terminal_content_id() {

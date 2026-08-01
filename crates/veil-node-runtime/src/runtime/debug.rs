@@ -172,7 +172,7 @@ impl NodeRuntime {
             .map(|d| d.as_secs())
             .unwrap_or(0);
         if let Ok(cert) = sov.sign_mlkem_cert(
-            self.identity.mlkem_ek.as_slice().to_vec(),
+            self.identity.mlkem_keys.current_ek().to_vec(),
             cert_valid_from,
             cert_valid_from + 30 * 86_400,
             1,

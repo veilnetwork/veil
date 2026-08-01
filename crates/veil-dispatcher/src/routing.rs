@@ -479,7 +479,7 @@ impl FrameDispatcher {
             request_id,
             transports,
             relay_ids: self.relay_node_ids.clone(),
-            mlkem_pubkey: Some(self.crypto.mlkem_ek.as_ref().to_vec()),
+            mlkem_pubkey: Some(self.crypto.mlkem_keys.current_ek().to_vec()),
             signature: [0u8; 64],
             ed25519_pubkey,
             target_labels: self.target_labels.clone(),
@@ -1974,7 +1974,7 @@ impl FrameDispatcher {
                     // direct session.
                     if let Some(ref key) = self.crypto.local_signing_key {
                         use ed25519_dalek::Signer as _;
-                        let ek_bytes = self.crypto.mlkem_ek.as_ref().to_vec();
+                        let ek_bytes = self.crypto.mlkem_keys.current_ek().to_vec();
                         let has_ek = ek_bytes.iter().any(|b| *b != 0);
                         if has_ek {
                             let request_id =

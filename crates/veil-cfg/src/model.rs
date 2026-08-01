@@ -3669,6 +3669,31 @@ pub struct GlobalConfig {
     /// operator's other hosts when they are not.
     #[serde(default)]
     pub builtin_seed_policy: BuiltinSeedPolicy,
+    /// How often the node's long-term ML-KEM mailbox key is replaced, in
+    /// seconds. `0` disables rotation.
+    ///
+    /// The key's secret half sits in process memory for as long as it is
+    /// current, so a leak of it (a swap page, a core dump) is retroactive over
+    /// everything sealed to the matching published key. Rotating bounds that to
+    /// roughly two intervals — the current key plus the retired one still
+    /// inside its overlap window.
+    ///
+    /// The floor is not a preference. A retired key must keep working for
+    /// `veil_e2e::MLKEM_SEED_MIN_OVERLAP_SECS` (a week and change, dominated by
+    /// how long a relay holds an undelivered mailbox blob), and rotating faster
+    /// than the overlap would stack up retired keys until the ring's bound
+    /// evicts one that mail still needs. A value under the floor is refused at
+    /// startup rather than clamped, because a caller that asked for a two-hour
+    /// rotation has a wrong model of what the key is, not an off-by-one.
+    ///
+    /// Only a node whose key is DERIVED from its identity seed can rotate: the
+    /// scheme re-derives each epoch on demand, which is what lets it survive a
+    /// restart with nothing persisted. A node running a random persisted
+    /// `mlkem.key` (operator/seed daemons) stays on that key and logs that it
+    /// is doing so — rotating it would mean minting a key that dies at the next
+    /// restart, black-holing everything sealed to it.
+    #[serde(default = "GlobalConfig::default_mlkem_rotation_secs")]
+    pub mlkem_rotation_secs: u64,
     /// **Phase-2 Phase 11 slice 11d** enforcement flag.  When `true`,
     /// `load_config` REFUSES to load configs that:
     ///   * Carry no `# VEIL_CONFIG_SIGNATURE_V1: …` header, OR
@@ -3740,6 +3765,15 @@ impl GlobalConfig {
         32
     }
 
+    /// Eight days — comfortably over `veil_e2e::MLKEM_SEED_MIN_OVERLAP_SECS`
+    /// (7d 7h), so at most one retired key is ever live and the exposure of a
+    /// leaked mailbox seed is bounded to roughly a fortnight instead of the
+    /// node's whole history. `spawn_mlkem_rotation_task` pins the relationship
+    /// between this default and that floor in a test.
+    pub(crate) fn default_mlkem_rotation_secs() -> u64 {
+        8 * 24 * 3600
+    }
+
     /// Etap 10 slice 2c — default flipped to `true`.  Operators on
     /// TLS 1.2-only public CDNs can override to `false`.
     pub(crate) fn default_tls_ech_grease() -> bool {
@@ -3783,6 +3817,7 @@ impl Default for GlobalConfig {
             trusted_bundle_issuer_pubkey: None,
             allow_unpinned_signed_bootstrap: false,
             builtin_seed_policy: BuiltinSeedPolicy::default(),
+            mlkem_rotation_secs: Self::default_mlkem_rotation_secs(),
             require_signed_config: false,
             strict_config_validation: false,
             tls_ech_grease: Self::default_tls_ech_grease(),

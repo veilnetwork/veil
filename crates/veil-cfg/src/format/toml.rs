@@ -111,6 +111,11 @@ fn update_document(document: &mut DocumentMut, config: &Config) -> Result<()> {
         "builtin_seed_policy",
         &g.builtin_seed_policy.to_string(),
     );
+    set_integer(
+        global,
+        "mlkem_rotation_secs",
+        Some(g.mlkem_rotation_secs as i64),
+    );
 
     set_transport(document, &config.transport)?;
 
@@ -940,6 +945,41 @@ mod tests {
         assert_eq!(
             back.global.builtin_seed_policy,
             crate::BuiltinSeedPolicy::Always
+        );
+    }
+
+    #[test]
+    fn mlkem_rotation_secs_survives_save() {
+        // Same MANUALLY_OWNED trap as above, with a worse failure: an operator
+        // who disabled rotation (0) or lengthened it would find the value
+        // reverted to the default on the next save, and the node would start
+        // replacing its published mailbox key on a schedule they had opted out
+        // of. Silent, and only visible as mail that stops opening.
+        let mut document = DocumentMut::new();
+        let mut config = Config::default();
+        config.global.mlkem_rotation_secs = 0;
+
+        update_document(&mut document, &config).unwrap();
+
+        let rendered = document.to_string();
+        assert!(
+            rendered.contains("mlkem_rotation_secs = 0"),
+            "mlkem_rotation_secs must survive a save, got: {rendered}"
+        );
+        let back: Config = toml::from_str(&rendered).unwrap();
+        assert_eq!(back.global.mlkem_rotation_secs, 0);
+    }
+
+    #[test]
+    fn mlkem_rotation_secs_defaults_when_absent() {
+        // An existing on-disk config predates the field. It must come back as
+        // the default rather than 0, or upgrading a node would silently leave
+        // rotation off on exactly the nodes that never opted out of it.
+        let config: Config = toml::from_str("[global]\n").unwrap();
+        assert_eq!(config.global.mlkem_rotation_secs, 8 * 24 * 3600);
+        assert!(
+            config.global.mlkem_rotation_secs >= veil_e2e::MLKEM_SEED_MIN_OVERLAP_SECS,
+            "the default must clear the overlap floor it will be checked against"
         );
     }
 
