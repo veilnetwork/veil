@@ -2803,3 +2803,31 @@ async fn attempt_hole_punch_is_single_flight_per_peer() {
     rt.stop().await.expect("stop");
     let _ = fs::remove_file(path);
 }
+
+/// P3-27: the leaf byte quota was fully built — guard, adapter, builder — and
+/// then never attached to the production `GatewayBridge`, so a greedy leaf was
+/// counted and never throttled. The throttling logic itself was correct and
+/// tested; what nothing covered was the *attachment*, because a missing builder
+/// call is invisible to the type system. Assert it directly, at construction
+/// and again after a reload rebuilds the bridge.
+#[tokio::test(flavor = "current_thread")]
+async fn leaf_bandwidth_quota_is_attached_to_the_mesh_bridge() {
+    let path = save_test_config("node-runtime-leaf-quota", runtime_config_with_metrics()).unwrap();
+    let mut runtime = NodeRuntime::start(&path, true)
+        .await
+        .expect("runtime starts");
+
+    assert!(
+        runtime.mesh_bridge.has_leaf_bandwidth_quota(),
+        "the initial constructor must attach the leaf quota",
+    );
+
+    runtime.reload().await.expect("runtime reloads");
+    assert!(
+        runtime.mesh_bridge.has_leaf_bandwidth_quota(),
+        "reload rebuilds the bridge — it must not drop the quota on the way",
+    );
+
+    runtime.stop().await.expect("runtime stops");
+    let _ = fs::remove_file(path);
+}

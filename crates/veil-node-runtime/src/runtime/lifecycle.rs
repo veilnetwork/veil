@@ -570,11 +570,21 @@ impl NodeRuntime {
             Arc::new(NeighborTable::new()),
         ));
         self.mesh_bridge = Arc::new(
-            GatewayBridge::new(reload_node_id, role).with_metrics(
-                self.metrics
-                    .as_ref()
-                    .map(|m| Arc::clone(m) as Arc<dyn veil_mesh::MeshMetrics>),
-            ),
+            GatewayBridge::new(reload_node_id, role)
+                .with_metrics(
+                    self.metrics
+                        .as_ref()
+                        .map(|m| Arc::clone(m) as Arc<dyn veil_mesh::MeshMetrics>),
+                )
+                // Same attachment as the initial constructor — a bridge rebuilt
+                // by reload must not silently lose the quota. The limiter's
+                // contents are replaced in place above, so cloning the Arc here
+                // hands the fresh config to the guard.
+                .with_leaf_bandwidth_quota(Arc::new(
+                    crate::mesh_glue::LeafBandwidthGuard::from_limiter(Arc::clone(
+                        &self.rate_limiter,
+                    )),
+                )),
         );
         // Audit M-D: release the OLD mesh socket BEFORE rebinding. The previous
         // `self.mesh_realm = init_mesh_realm(..)` evaluated the new bind while

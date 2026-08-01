@@ -2227,11 +2227,26 @@ impl NodeRuntime {
             mesh_forwarder,
             // metrics is moved into the field below, so clone here first.
             mesh_bridge: Arc::new(
-                GatewayBridge::new(local_node_id, role).with_metrics(
-                    metrics
-                        .as_ref()
-                        .map(|m| Arc::clone(m) as Arc<dyn veil_mesh::MeshMetrics>),
-                ),
+                GatewayBridge::new(local_node_id, role)
+                    .with_metrics(
+                        metrics
+                            .as_ref()
+                            .map(|m| Arc::clone(m) as Arc<dyn veil_mesh::MeshMetrics>),
+                    )
+                    // The leaf byte quota was built end to end — guard, adapter,
+                    // builder — and then never attached here, so a greedy leaf
+                    // was only ever counted, never throttled. Share the runtime's
+                    // per-peer limiter: it enforces bytes ONLY when the operator
+                    // sets `abuse.per_peer_bytes_per_sec`, so an unconfigured node
+                    // keeps today's no-enforcement posture and a configured one
+                    // finally gets the quota it asked for. `reload` swaps the
+                    // limiter's contents behind this same Arc, so the guard picks
+                    // up a new config without rebuilding.
+                    .with_leaf_bandwidth_quota(Arc::new(
+                        crate::mesh_glue::LeafBandwidthGuard::from_limiter(Arc::clone(
+                            &rate_limiter,
+                        )),
+                    )),
             ),
             mesh_realm,
             autodiscovered_peers: Arc::new(veil_mesh::AutoDiscoveredPeers::new()),
