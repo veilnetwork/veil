@@ -722,18 +722,20 @@ pub struct NodeRuntime {
     /// handshakes, so reload warns when `session.max_concurrent` changes the
     /// target rather than silently ignoring it.
     pub inbound_handshake_sem_target: usize,
-    /// ML-KEM-768 decapsulation-key seed (private, 64 bytes).
-    /// (Stays outside the IdentityState bundle: it's the local-only
-    /// secret half of mlkem_ek and has different access patterns —
-    /// only the dispatcher reads it, never cloned into per-session
-    /// contexts.)
+    // The ML-KEM decapsulation seed used to be a field here, deliberately kept
+    // outside the `IdentityState` bundle that held its public half — the note
+    // said it had "different access patterns". Rotation made that split a
+    // liability rather than a tidiness question: the seed and the EK have to
+    // move together or the node publishes one and decrypts with the other. Both
+    // now live in `identity.mlkem_keys` (a `veil_e2e::MlKemSeedRing`).
+    /// Poked when the ML-KEM key rotates, to pull the sovereign republish
+    /// forward instead of letting the new EK wait out the 6h tick.
     ///
-    /// Phase 6 slice 6g — backed by `SensitiveBytesN<64>` (mlocked when
-    /// `RLIMIT_MEMLOCK` permits, zeroize-on-drop fallback otherwise).
-    /// See `FrameDispatcher::mlkem_dk_seed` rustdoc for threat model
-    /// and why pinning matters more here than for session-scoped keys.
-    pub mlkem_dk_seed:
-        Arc<veil_util::sensitive_bytes::SensitiveBytesN<{ veil_e2e::DK_SEED_BYTES }>>,
+    /// Without this the retired key would have to stay decrypt-capable for that
+    /// extra 6h on top of everything else, and — worse — for those hours the
+    /// node would be publishing an EK it had already replaced. The rotation task
+    /// only rotates; the republish task owns publishing, and this is the seam.
+    pub mlkem_republish_now: Arc<tokio::sync::Notify>,
     /// Pending diagnostic reply channels: `seq → Sender<DiagEvent>`.
     /// Shared with `FrameDispatcher` so admin handlers can register waiters.
     pub pending_diag: Arc<
@@ -1265,23 +1267,35 @@ impl NodeRuntime {
         // Passphrase cascade: prompt > env > file > inline. Zeroizing<String>
         // wipes the heap contents when it drops just below.
         let key_passphrase = crate::key_passphrase::resolve_key_passphrase(&config, &logger)?;
+        let mlkem_epoch = crate::identity_local::mlkem_dk::rotation_epoch(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0),
+            config.global.mlkem_rotation_secs,
+        );
         let (mlkem_ek_arr, mlkem_dk_arr, mlkem_key_src) =
             crate::identity_local::mlkem_dk::load_or_derive(
                 &mlkem_key_path,
                 &veil_dir_path,
                 key_passphrase.as_deref().map(|p| p.as_str()),
+                mlkem_epoch,
             )?;
         logger.info(
             "node.mlkem_dk.source",
             format!("mlkem dk_seed source={}", mlkem_key_src.as_str()),
         );
         drop(key_passphrase);
-        let mlkem_ek = Arc::new(mlkem_ek_arr);
-        // mlock-pin the long-lived DK seed for the process lifetime (or
-        // zeroize-on-drop fallback); the source array drops at end of statement.
-        let mlkem_dk_seed = Arc::new(veil_util::sensitive_bytes::SensitiveBytesN::<
-            { veil_e2e::DK_SEED_BYTES },
-        >::from_bytes(mlkem_dk_arr));
+        // One holder for the keypair, from here down. The seed inside is
+        // mlock-pinned (or zeroize-on-drop); the source arrays drop at the end
+        // of this statement. The ring starts at the epoch currently in force,
+        // not at 0, so a restart resumes the key this node was already
+        // publishing; `spawn_mlkem_rotation_task` moves it on from there.
+        let mlkem_keys = Arc::new(veil_e2e::MlKemSeedRing::new(
+            mlkem_epoch,
+            mlkem_dk_arr,
+            mlkem_ek_arr,
+        ));
 
         // d removed the persistent RevocationCache; document
         // freshness now relies on `valid_until_unix` alone.
@@ -1646,7 +1660,7 @@ impl NodeRuntime {
                 .unwrap_or(0);
             let cert_valid_until = cert_valid_from + 30 * 86_400;
             match sov.sign_mlkem_cert(
-                mlkem_ek.as_slice().to_vec(),
+                mlkem_keys.current_ek().to_vec(),
                 cert_valid_from,
                 cert_valid_until,
                 1,
@@ -1908,8 +1922,7 @@ impl NodeRuntime {
             logger: Arc::clone(&logger),
             crypto: Arc::new(veil_dispatcher::CryptoContext {
                 local_signing_key: local_signing_key.clone(),
-                mlkem_ek: Arc::clone(&mlkem_ek),
-                mlkem_dk_seed: Arc::clone(&mlkem_dk_seed),
+                mlkem_keys: Arc::clone(&mlkem_keys),
                 peer_mlkem_keys: Arc::clone(&shared_peer_mlkem_keys),
                 peer_pubkeys: Arc::clone(&peer_pubkeys),
                 peer_roles: Arc::clone(&peer_roles),
@@ -2382,7 +2395,7 @@ impl NodeRuntime {
                 Arc::clone(&peer_pubkeys),
                 Arc::clone(&peer_sovereign_identities),
                 Arc::clone(&peer_roles),
-                Arc::clone(&mlkem_ek),
+                Arc::clone(&mlkem_keys),
                 Arc::clone(&shared_peer_mlkem_keys),
                 Arc::clone(&shared_peer_mlkem_certs),
                 Arc::clone(&shared_per_session_mlkem_dk),
@@ -2398,7 +2411,7 @@ impl NodeRuntime {
                 config.session.max_concurrent.saturating_mul(4).max(1024),
             )),
             inbound_handshake_sem_target: config.session.max_concurrent.saturating_mul(4).max(1024),
-            mlkem_dk_seed,
+            mlkem_republish_now: Arc::new(tokio::sync::Notify::new()),
             pending_diag: Arc::clone(&shared_pending_diag),
             // H10 stage-B (4/N): 16 session-config knobs collapsed
             // into one `Arc<SessionDefaults>`. Same Arc is cloned into

@@ -15,9 +15,10 @@
 //! exercised in an in-process unit test, so the live behaviour is UNVALIDATED —
 //! needs an integration test on a real node + `/code-review ultra`.
 //!
-//! Key-handling invariant: `mlkem_dk_seed` and the sovereign signing key never
-//! leave the runtime — `open` borrows the seed via `as_array()` and the
-//! recovered inner plaintext is zeroized inside `open_mailbox_blob`.
+//! Key-handling invariant: the ML-KEM seeds and the sovereign signing key never
+//! leave the runtime — `open` lifts candidates out of the seed ring into a
+//! `Zeroizing` buffer that is wiped when the call returns, and the recovered
+//! inner plaintext is zeroized inside `open_mailbox_blob`.
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -91,7 +92,7 @@ pub struct RuntimeMailboxCrypto {
     peer_mlkem_keys: Arc<RwLock<PeerMlKemCache>>,
     peer_mlkem_certs: Arc<RwLock<PeerMlKemCertCache>>,
     sovereign: Option<Arc<SovereignIdentity>>,
-    mlkem_dk_seed: Arc<veil_util::sensitive_bytes::SensitiveBytesN<{ veil_e2e::DK_SEED_BYTES }>>,
+    mlkem_keys: Arc<veil_e2e::MlKemSeedRing>,
     logger: Arc<NodeLogger>,
 }
 
@@ -142,7 +143,7 @@ impl RuntimeMailboxCrypto {
             local_verified_cert(
                 self.local_node_id,
                 sovereign.active_instance_id(),
-                self.mlkem_dk_seed.as_array(),
+                &self.mlkem_keys.current_seed(),
             )?
         } else {
             self.mlkem_resolver()
@@ -180,14 +181,47 @@ impl RuntimeMailboxCrypto {
         // deposit carries no usable wire sender), then resolve + verify against
         // its document. A forged sidecar yields a wrong id → the main-blob open
         // below fails closed.
-        let sender_node_id = mailbox_seal::recover_sender_node_id(
-            blob,
-            &our_instance,
-            &self.local_node_id,
-            self.mlkem_dk_seed.as_array(),
-            our_cert_version,
-        )
-        .map_err(OfflineSealError::Open)?;
+        //
+        // This is also where the blob's ERA is decided. A relay holds a mailbox
+        // blob for a week (`veil_mailbox::DEFAULT_TTL_SECS`), so one deposited
+        // before a key rotation is routinely fetched after it — the sidecar is
+        // tried against each seed still inside its overlap window, and the seed
+        // that opens it is the one the remaining two decrypts must use. Mixing
+        // eras across the three would fail in a way that reads like a forged
+        // blob rather than a stale key.
+        let candidates = self.mlkem_keys.decrypt_seeds(now);
+        let mut recovered = None;
+        let mut last_err = None;
+        for dk_seed in candidates.iter() {
+            match mailbox_seal::recover_sender_node_id(
+                blob,
+                &our_instance,
+                &self.local_node_id,
+                dk_seed,
+                our_cert_version,
+            ) {
+                Ok(id) => {
+                    recovered = Some((id, *dk_seed));
+                    break;
+                }
+                Err(e) => last_err = Some(e),
+            }
+        }
+        // No candidate opened it. Report the LAST failure rather than a synthetic
+        // one, so the "wrong EK era" class the module doc calls out stays
+        // distinguishable in the log. `last_err` is empty only if the ring held
+        // nothing at all, which cannot happen (it always yields the current
+        // seed) — but saying so beats inventing a `MailboxSealError` that did
+        // not occur.
+        let (sender_node_id, dk_seed) = match recovered {
+            Some(pair) => pair,
+            None => {
+                return Err(match last_err {
+                    Some(e) => OfflineSealError::Open(e),
+                    None => OfflineSealError::LocalKey("seed ring held no candidates".into()),
+                });
+            }
+        };
         // Prefer the sender's OWN document embedded in the blob (v3): it is
         // self-authenticating, so we verify it locally and open with NO DHT
         // round-trip — the reachability proof that lets a NAT'd / cold-routing-
@@ -200,7 +234,7 @@ impl RuntimeMailboxCrypto {
             &our_instance,
             &self.local_node_id,
             &sender_node_id,
-            self.mlkem_dk_seed.as_array(),
+            &dk_seed,
             our_cert_version,
         )
         .filter(|doc| doc.node_id == sender_node_id && verify_identity_document(doc, now).is_ok());
@@ -219,7 +253,7 @@ impl RuntimeMailboxCrypto {
             &our_instance,
             &self.local_node_id,
             &sender_node_id,
-            self.mlkem_dk_seed.as_array(),
+            &dk_seed,
             our_cert_version,
             &sender_doc,
             now,
@@ -303,7 +337,7 @@ impl super::NodeRuntime {
             peer_mlkem_keys: Arc::clone(&self.identity.peer_mlkem_keys),
             peer_mlkem_certs: Arc::clone(&self.identity.peer_mlkem_certs),
             sovereign: self.identity.sovereign_identity.get(),
-            mlkem_dk_seed: Arc::clone(&self.mlkem_dk_seed),
+            mlkem_keys: Arc::clone(&self.identity.mlkem_keys),
             logger: Arc::clone(&self.logger),
         }
     }
@@ -341,6 +375,117 @@ fn now_unix() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Assemble a `RuntimeMailboxCrypto` over a real standalone identity and an
+    /// empty DHT. Every path this test takes is in-process: sealing to OURSELVES
+    /// skips the recipient-cert resolve (`local_verified_cert`), and opening a
+    /// v3 blob uses the sender document embedded in it. So the DHT is present to
+    /// satisfy the type and is never consulted.
+    fn crypto_over(
+        dir: &std::path::Path,
+        ring: Arc<veil_e2e::MlKemSeedRing>,
+    ) -> RuntimeMailboxCrypto {
+        let seed = veil_util::sensitive_bytes::SensitiveBytesN::<32>::from_bytes([0x5Au8; 32]);
+        let now = now_unix();
+        veil_identity::sovereign_flow::save_standalone_identity_to_dir(
+            dir,
+            &seed,
+            now - 3600,
+            now + 3 * 86_400,
+        )
+        .expect("persist standalone identity");
+        let sov = Arc::new(
+            veil_identity::sovereign::SovereignIdentity::load_from_dir(dir)
+                .expect("load standalone identity"),
+        );
+        let local_node_id = *sov.node_id();
+        RuntimeMailboxCrypto {
+            dht: Arc::new(KademliaService::new(local_node_id)),
+            session_tx_registry: Arc::new(RwLock::new(SessionTxRegistry::new())),
+            pending_recursive: Arc::new(Mutex::new(HashMap::new())),
+            local_node_id,
+            peer_mlkem_keys: Arc::new(RwLock::new(PeerMlKemCache::new())),
+            peer_mlkem_certs: Arc::new(RwLock::new(PeerMlKemCertCache::new())),
+            sovereign: Some(sov),
+            mlkem_keys: ring,
+            logger: Arc::new(NodeLogger::new_noop()),
+        }
+    }
+
+    /// A mailbox blob sealed BEFORE a key rotation still opens after it.
+    ///
+    /// The blob's era has to be picked once and then used for all three
+    /// decrypts — the sidecar that names the sender, the embedded sender
+    /// document, and the main body. Nothing else covers that: using the current
+    /// seed for any of them leaves every other test green while, in the field,
+    /// a week of store-and-forward mail stops opening the moment a node rotates.
+    #[tokio::test]
+    async fn a_mailbox_blob_sealed_before_a_rotation_still_opens() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (old_ek, old_dk) = veil_e2e::generate_keypair();
+        let ring = Arc::new(veil_e2e::MlKemSeedRing::new(0, old_dk, old_ek));
+        let crypto = crypto_over(tmp.path(), Arc::clone(&ring));
+
+        let app_id = [0x77u8; 32];
+        let payload = b"deposited before the rotation";
+        let blob = crypto
+            .seal(crypto.local_node_id, app_id, 9, payload)
+            .await
+            .expect("self-seal needs no DHT");
+
+        // Rotate. The blob is now addressed to a key we no longer publish.
+        let (new_ek, new_dk) = veil_e2e::generate_keypair();
+        let now = now_unix();
+        ring.rotate(
+            now,
+            1,
+            new_dk,
+            new_ek,
+            veil_e2e::MLKEM_SEED_MIN_OVERLAP_SECS,
+        )
+        .expect("rotation with a full overlap");
+        assert_ne!(ring.current_ek(), old_ek, "test premise: the key moved");
+
+        let auth = crypto
+            .open(&blob, LOCAL_MLKEM_CERT_VERSION)
+            .await
+            .expect("a blob sealed to the retired key must still open");
+        assert_eq!(auth.data, payload);
+        assert_eq!(auth.app_id, app_id);
+        assert_eq!(auth.endpoint_id, 9);
+    }
+
+    /// Past the overlap the retired seed is gone, and the blob fails CLOSED —
+    /// an error, never a partially-verified message.
+    #[tokio::test]
+    async fn past_the_overlap_the_blob_no_longer_opens() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (old_ek, old_dk) = veil_e2e::generate_keypair();
+        let ring = Arc::new(veil_e2e::MlKemSeedRing::new(0, old_dk, old_ek));
+        let crypto = crypto_over(tmp.path(), Arc::clone(&ring));
+
+        let blob = crypto
+            .seal(crypto.local_node_id, [0x77u8; 32], 9, b"too old")
+            .await
+            .expect("self-seal");
+
+        // Rotate far enough in the PAST that the overlap has already lapsed.
+        let long_ago = now_unix() - 2 * veil_e2e::MLKEM_SEED_MIN_OVERLAP_SECS;
+        let (new_ek, new_dk) = veil_e2e::generate_keypair();
+        ring.rotate(
+            long_ago,
+            1,
+            new_dk,
+            new_ek,
+            veil_e2e::MLKEM_SEED_MIN_OVERLAP_SECS,
+        )
+        .expect("rotation");
+
+        assert!(
+            crypto.open(&blob, LOCAL_MLKEM_CERT_VERSION).await.is_err(),
+            "an expired era must fail closed, not open under some other key"
+        );
+    }
 
     #[test]
     fn local_recipient_cert_is_derived_without_dht() {
