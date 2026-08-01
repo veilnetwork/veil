@@ -2,6 +2,31 @@
 
 ## Unreleased
 
+### Breaking
+
+- **`CircuitBuilt` ACKs now carry a terminus proof and grew from 4 to 36 bytes**
+  (audit VL-01). The ACK's only field was a circuit id, and every hop knows the
+  id of the link it sits on — including the first hop, which knows the very id
+  the originator matches on. Any hop could therefore synthesise the ACK and
+  have the originator mark a circuit CONFIRMED and freeze that path, without a
+  byte having reached the terminus: a black hole that looks healthy.
+
+  The originator already generates a fresh `circuit_key` per hop and delivers
+  each one sealed to that hop's X25519 key inside the setup envelope, so the
+  terminus key is known to exactly two parties and to nobody in between. The
+  ACK now carries `blake3::derive_key(<context>, terminus_circuit_key)`, which
+  proves both "this came from the terminus" and "this is that circuit" — the
+  key is fresh per circuit — and the originator confirms only on a match,
+  compared in constant time so a forwarding hop gets no prefix oracle.
+  Intermediate hops re-tag the circuit id and pass the token through untouched.
+
+  There is no version negotiation on relay-chain messages and the decode is
+  exact-length, so **this is an unnegotiated wire break**: a node of the old
+  shape drops these frames and confirms nothing. That is the pre-existing safe
+  state — an unconfirmed circuit is re-selected by path maintenance rather than
+  frozen — but it does mean circuits do not confirm across a version boundary.
+  **Roll relays before clients.**
+
 ### Fixed
 
 - **Inbound frame bodies now share a node-wide memory budget.** The 16 MiB
