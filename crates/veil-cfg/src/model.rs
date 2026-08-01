@@ -148,6 +148,24 @@ pub struct Config {
         skip_serializing_if = "Config::is_default_persist_enabled"
     )]
     pub persist_enabled: bool,
+    /// The `[identity]` in this config is a throwaway placeholder, not the
+    /// node's real one.
+    ///
+    /// Set only by [`build_stub_config_with_ephemeral_identity`](crate::store::build_stub_config_with_ephemeral_identity)
+    /// for the deferred boot, where a node has to satisfy the config schema
+    /// before its real identity exists. Everything downstream that would
+    /// otherwise treat the `[identity]` keypair as the root of this node's
+    /// long-lived key material has to check this and refuse: the placeholder is
+    /// a FIXED constant compiled into the binary, so anything derived from it
+    /// is derivable by anyone holding the source.
+    ///
+    /// `#[serde(skip)]` on purpose — never read from a config file and never
+    /// written to one. An ephemeral identity exists only inside the process
+    /// that minted it, so there is nothing for a file on disk to say about it,
+    /// and no way for someone editing one to claim a node's real identity is a
+    /// throwaway (which would make it stop persisting its keys).
+    #[serde(skip)]
+    pub ephemeral_identity: bool,
 }
 
 impl Config {
@@ -193,6 +211,7 @@ impl Default for Config {
             capacity: NodeCapacityConfig::default(),
             pex: PexConfig::default(),
             persist_enabled: true,
+            ephemeral_identity: false,
         }
     }
 }

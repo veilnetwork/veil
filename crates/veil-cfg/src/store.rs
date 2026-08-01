@@ -389,6 +389,11 @@ pub fn build_stub_config_with_ephemeral_identity(anonymous: bool) -> Result<Conf
     // default snapshot path doesn't exist on the deferred path). Nothing the
     // messenger needs depends on it: it bootstraps via invites + live sessions.
     config.persist_enabled = false;
+    // The `[identity]` above is a compiled-in constant, so ANY key derived from
+    // it is derivable by anyone with the source. Mark it, and let the runtime
+    // refuse to build long-lived identity-bound material out of it — see
+    // `Config::ephemeral_identity`.
+    config.ephemeral_identity = true;
     // `receive_anonymous` = plain rendezvous RECEIVE = REACHABILITY, NOT
     // anonymity. It runs `spawn_rendezvous_recipient_task`, which registers a
     // subscriber at a relay (over our DIRECT node_id-keyed session) so the relay
@@ -514,6 +519,32 @@ fn normalize_init_path(path: &Path) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
+    /// The deferred stub MUST mark itself, and the marker must not be
+    /// something a config file can set.
+    ///
+    /// Everything that refuses to derive long-lived key material from the
+    /// placeholder hangs off this one flag. If it silently stopped being set,
+    /// the node would go back to deriving its mailbox and rendezvous keys from
+    /// a constant that ships in the source — and nothing else would look wrong.
+    #[test]
+    fn the_deferred_stub_marks_its_identity_as_a_placeholder() {
+        let stub = super::build_stub_config_with_ephemeral_identity(false).unwrap();
+        assert!(stub.ephemeral_identity);
+        assert!(!stub.persist_enabled);
+
+        // A real config never carries it, and cannot acquire it from TOML —
+        // otherwise editing a file would make a node stop persisting its keys.
+        assert!(!super::super::Config::default().ephemeral_identity);
+        // Root-level key, BEFORE any table header — putting it under [global]
+        // would land it in a different struct and prove nothing.
+        let from_disk: super::super::Config =
+            toml::from_str("ephemeral_identity = true\n[global]\n").unwrap();
+        assert!(
+            !from_disk.ephemeral_identity,
+            "the marker must not be settable from a config file"
+        );
+    }
+
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::*;
