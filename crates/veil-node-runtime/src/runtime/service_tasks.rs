@@ -1466,22 +1466,40 @@ impl NodeRuntime {
             lock_tasks(&self.tasks).sessions.push(handle);
         }
 
-        // if both peers and bootstrap_peers are empty, try
-        // builtin seeds and DNS discovery as fallback.
+        // Splice in whatever the builtin-seed policy contributes. Under `Auto`
+        // this reproduces the historical either/or (seeds only when nothing is
+        // configured); under `Always` the seeds ride ALONGSIDE the operator's
+        // own entry points instead of being switched off by them, which is the
+        // only way a node can hold both a seed set and an alternative to it.
+        //
+        // Terminates because `resolve_bootstrap_candidates` is a fixed point:
+        // on the recursive call its output already IS `bootstrap_peers`, so
+        // the length stops growing and we fall through. Pinned by
+        // `resolving_twice_is_a_fixed_point`.
+        let resolved = resolve_bootstrap_candidates(config, &my_pubkey);
+        if resolved.len() > config.bootstrap_peers.len() {
+            self.logger.info(
+                "bootstrap.builtin",
+                format!(
+                    "dialing {} entry point(s): {} configured + {} builtin seed(s) \
+                     (policy={})",
+                    resolved.len(),
+                    config.bootstrap_peers.len(),
+                    resolved.len() - config.bootstrap_peers.len(),
+                    config.global.builtin_seed_policy,
+                ),
+            );
+            let mut patched = config.clone();
+            // Assignment is safe ONLY because `resolved` already carries the
+            // configured entries; the previous code assigned the builtin list
+            // alone, which is what dropped them.
+            patched.bootstrap_peers = resolved;
+            return self.spawn_bootstrap_task(&patched);
+        }
+
+        // if both peers and bootstrap_peers are empty, try DNS discovery as
+        // the last fallback.
         if config.bootstrap_peers.is_empty() && config.peers.is_empty() {
-            let builtin = filter_self_seeds(veil_bootstrap::builtin_seeds(), &my_pubkey);
-            if !builtin.is_empty() {
-                self.logger.info(
-                    "bootstrap.builtin",
-                    format!(
-                        "using {} builtin seed(s) (no peers/bootstrap_peers configured)",
-                        builtin.len()
-                    ),
-                );
-                let mut patched = config.clone();
-                patched.bootstrap_peers = builtin;
-                return self.spawn_bootstrap_task(&patched);
-            }
             // No builtin seeds — try DNS discovery asynchronously.
             let logger = self.logger.clone();
             let domain = config
@@ -1687,16 +1705,26 @@ impl NodeRuntime {
     /// A `COOLDOWN` between retries prevents a thundering herd if the
     /// bootstrap hosts themselves are temporarily unreachable.
     ///
-    /// Only the operator-curated `bootstrap_peers` list is re-dialed —
-    /// DNS / HTTPS / cache fallbacks are deliberately skipped here
-    /// because they're discovery mechanisms for *initial* bootstrap;
-    /// they belong in startup, not in steady-state partition recovery.
+    /// Only the *statically known* entry points are re-dialed: the
+    /// operator-curated `bootstrap_peers` plus whatever the builtin-seed
+    /// policy contributes ([`resolve_bootstrap_candidates`]). DNS / HTTPS /
+    /// cache fallbacks are deliberately skipped here because they're
+    /// discovery mechanisms for *initial* bootstrap; they belong in startup,
+    /// not in steady-state partition recovery.
     pub fn spawn_bootstrap_watchdog_task(&mut self, config: &veil_cfg::Config) {
         let Some(shutdown_tx) = &self.shutdown_tx else {
             return;
         };
-        if config.bootstrap_peers.is_empty() {
-            // No operator-curated bootstrap list — nothing to retry.
+        // Resolve the same candidate set `spawn_bootstrap_task` dials rather
+        // than reading `config.bootstrap_peers` directly. A node running on
+        // builtin seeds has that field EMPTY — the seeds are spliced into a
+        // local clone that never reaches here — so the old early-return
+        // disabled partition recovery for exactly the nodes that had no other
+        // way back: every stock install with no operator-curated list.
+        let bootstrap_peers =
+            resolve_bootstrap_candidates(config, &self.identity.local_identity.public_key);
+        if bootstrap_peers.is_empty() {
+            // Nothing to retry — no operator list and no builtin contribution.
             return;
         }
 
@@ -1710,7 +1738,6 @@ impl NodeRuntime {
         let tasks = Arc::clone(&self.tasks);
         let metrics = self.metrics.clone();
         let my_pubkey = self.identity.local_identity.public_key.clone();
-        let bootstrap_peers = config.bootstrap_peers.clone();
 
         let handle = supervised_spawn(Arc::clone(&self.logger), "bootstrap_watchdog", async move {
             let mut interval = tokio::time::interval(BOOTSTRAP_WATCHDOG_CHECK_INTERVAL);
@@ -4729,6 +4756,54 @@ pub fn filter_already_known(
         .collect()
 }
 
+/// Which builtin seeds the configured [`BuiltinSeedPolicy`] lets this node
+/// dial. Pure so the policy can be exercised without standing up a runtime.
+///
+/// `nothing_configured` is "neither `peers` nor `[[bootstrap_peers]]` is set"
+/// — the condition the historical either/or was written against, and the only
+/// thing [`Auto`](veil_cfg::BuiltinSeedPolicy::Auto) still consults.
+pub fn builtin_seed_contribution(
+    policy: veil_cfg::BuiltinSeedPolicy,
+    nothing_configured: bool,
+    builtin: Vec<veil_cfg::BootstrapPeer>,
+) -> Vec<veil_cfg::BootstrapPeer> {
+    match policy {
+        veil_cfg::BuiltinSeedPolicy::Never => Vec::new(),
+        veil_cfg::BuiltinSeedPolicy::Always => builtin,
+        veil_cfg::BuiltinSeedPolicy::Auto if nothing_configured => builtin,
+        veil_cfg::BuiltinSeedPolicy::Auto => Vec::new(),
+    }
+}
+
+/// Every bootstrap peer this node may dial: the operator's `[[bootstrap_peers]]`
+/// plus whatever the builtin-seed policy contributes, self dropped and
+/// deduplicated by public key (operator-curated entries win the position).
+///
+/// This is the set the partition watchdog re-dials. It exists because reading
+/// `config.bootstrap_peers` alone answers a different question: a node running
+/// on builtin seeds has that list EMPTY — the seeds are spliced into a local
+/// clone inside `spawn_bootstrap_task` and never reach the config the watchdog
+/// sees. Consulting the raw field there left precisely the nodes with no
+/// operator list — every stock app install — without partition recovery.
+pub fn resolve_bootstrap_candidates(
+    config: &veil_cfg::Config,
+    my_pubkey: &str,
+) -> Vec<veil_cfg::BootstrapPeer> {
+    let contributed = builtin_seed_contribution(
+        config.global.builtin_seed_policy,
+        config.bootstrap_peers.is_empty() && config.peers.is_empty(),
+        veil_bootstrap::builtin_seeds(),
+    );
+    let mut out = filter_self_seeds(config.bootstrap_peers.clone(), my_pubkey);
+    let known: std::collections::HashSet<String> =
+        out.iter().map(|p| p.public_key.clone()).collect();
+    out.extend(filter_already_known(
+        filter_self_seeds(contributed, my_pubkey),
+        &known,
+    ));
+    out
+}
+
 // ── BootstrapWatchdog tunables + decision logic ──────────────────────────────
 //
 // Sampled by `spawn_bootstrap_watchdog_task`. Exposed at module scope (instead
@@ -5182,6 +5257,165 @@ mod tests {
         let kept = filter_self_seeds(peers, "ME");
         assert_eq!(kept.len(), 2);
         assert!(kept.iter().all(|p| p.public_key != "ME"));
+    }
+
+    // ── builtin-seed policy: alternative entry points ────────────────────
+    //
+    // The seeds are the only entry points a stock binary knows. When they are
+    // blocked the operator's answer is to name other hosts — but naming them
+    // used to switch the seeds OFF, so the node swapped one single point of
+    // failure for another. These pin the policy that lets it hold both.
+
+    fn config_with(
+        bootstrap: Vec<BootstrapPeer>,
+        policy: veil_cfg::BuiltinSeedPolicy,
+    ) -> veil_cfg::Config {
+        let mut c = veil_cfg::Config::default();
+        c.bootstrap_peers = bootstrap;
+        c.global.builtin_seed_policy = policy;
+        c
+    }
+
+    #[test]
+    fn auto_keeps_the_historical_either_or() {
+        let builtin = vec![peer("SEED1"), peer("SEED2")];
+        // Nothing configured → seeds contribute.
+        assert_eq!(
+            builtin_seed_contribution(veil_cfg::BuiltinSeedPolicy::Auto, true, builtin.clone())
+                .len(),
+            2,
+        );
+        // Something configured → seeds stay out, exactly as before.
+        assert!(
+            builtin_seed_contribution(veil_cfg::BuiltinSeedPolicy::Auto, false, builtin).is_empty(),
+        );
+    }
+
+    #[test]
+    fn always_contributes_alongside_a_configured_alternative() {
+        let builtin = vec![peer("SEED1"), peer("SEED2")];
+        // The point of the knob: seeds contribute even though the operator
+        // has named their own entry points.
+        assert_eq!(
+            builtin_seed_contribution(veil_cfg::BuiltinSeedPolicy::Always, false, builtin).len(),
+            2,
+        );
+    }
+
+    #[test]
+    fn never_is_an_off_switch_that_does_not_depend_on_build_features() {
+        let builtin = vec![peer("SEED1")];
+        assert!(
+            builtin_seed_contribution(veil_cfg::BuiltinSeedPolicy::Never, true, builtin).is_empty(),
+        );
+    }
+
+    #[test]
+    fn a_configured_alternative_no_longer_disables_the_builtin_seeds() {
+        // The defect this closes: `bootstrap_peers` REPLACED the builtin list,
+        // so one non-seed entry point silently cost the node every seed.
+        let seeds = veil_bootstrap::builtin_seeds();
+        assert!(
+            !seeds.is_empty(),
+            "test needs a non-empty builtin seed list to be meaningful",
+        );
+        let cfg = config_with(vec![peer("ALT")], veil_cfg::BuiltinSeedPolicy::Always);
+        let resolved = resolve_bootstrap_candidates(&cfg, "ME");
+
+        assert_eq!(
+            resolved.len(),
+            seeds.len() + 1,
+            "expected the alternative AND every builtin seed",
+        );
+        assert!(resolved.iter().any(|p| p.public_key == "ALT"));
+        for s in &seeds {
+            assert!(
+                resolved.iter().any(|p| p.public_key == s.public_key),
+                "builtin seed {} was dropped by the configured alternative",
+                s.public_key,
+            );
+        }
+    }
+
+    #[test]
+    fn a_seed_only_node_has_a_non_empty_watchdog_retry_set() {
+        // The defect this closes: the partition watchdog early-returned on
+        // `config.bootstrap_peers.is_empty()`, which is the state of every
+        // stock install — the seeds live in a local clone it never sees. Those
+        // nodes got no partition recovery at all.
+        assert!(
+            !veil_bootstrap::builtin_seeds().is_empty(),
+            "test needs a non-empty builtin seed list to be meaningful",
+        );
+        let cfg = config_with(Vec::new(), veil_cfg::BuiltinSeedPolicy::Auto);
+        assert!(
+            cfg.bootstrap_peers.is_empty(),
+            "precondition: the raw field the watchdog used to read is empty",
+        );
+        assert!(
+            !resolve_bootstrap_candidates(&cfg, "ME").is_empty(),
+            "watchdog would have nothing to re-dial for a seed-only node",
+        );
+    }
+
+    #[test]
+    fn resolve_dedups_a_peer_that_is_both_configured_and_builtin() {
+        let seeds = veil_bootstrap::builtin_seeds();
+        assert!(
+            !seeds.is_empty(),
+            "test needs a non-empty builtin seed list"
+        );
+        // Pin the first builtin seed in `bootstrap_peers` too — the operator
+        // curating a host that is also a seed must not double-dial it.
+        let cfg = config_with(vec![seeds[0].clone()], veil_cfg::BuiltinSeedPolicy::Always);
+        let resolved = resolve_bootstrap_candidates(&cfg, "ME");
+
+        assert_eq!(resolved.len(), seeds.len(), "duplicate was dialed twice");
+        let occurrences = resolved
+            .iter()
+            .filter(|p| p.public_key == seeds[0].public_key)
+            .count();
+        assert_eq!(occurrences, 1);
+    }
+
+    #[test]
+    fn resolving_twice_is_a_fixed_point() {
+        // `spawn_bootstrap_task` splices the resolved set back into a config
+        // clone and recurses while `resolved.len() > configured.len()`. If
+        // resolution were not idempotent that recursion would never bottom
+        // out — the node would blow its stack at startup instead of dialing
+        // anyone. Checked for both policies that contribute anything.
+        for policy in [
+            veil_cfg::BuiltinSeedPolicy::Always,
+            veil_cfg::BuiltinSeedPolicy::Auto,
+        ] {
+            let cfg = config_with(vec![peer("ALT")], policy);
+            let once = resolve_bootstrap_candidates(&cfg, "ME");
+            let mut next = cfg.clone();
+            next.bootstrap_peers = once.clone();
+            let twice = resolve_bootstrap_candidates(&next, "ME");
+            assert_eq!(
+                twice.len(),
+                once.len(),
+                "policy={policy}: resolution is not a fixed point, \
+                 spawn_bootstrap_task would recurse forever",
+            );
+        }
+    }
+
+    #[test]
+    fn resolve_drops_our_own_key_from_both_sources() {
+        let seeds = veil_bootstrap::builtin_seeds();
+        assert!(
+            !seeds.is_empty(),
+            "test needs a non-empty builtin seed list"
+        );
+        // A seed host bootstrapping itself: its own key appears in the builtin
+        // list, and must not be dialed from either source.
+        let me = seeds[0].public_key.clone();
+        let cfg = config_with(vec![peer("ALT")], veil_cfg::BuiltinSeedPolicy::Always);
+        let resolved = resolve_bootstrap_candidates(&cfg, &me);
+        assert!(resolved.iter().all(|p| p.public_key != me));
     }
 
     // ── deterministic rendezvous cookie + relay anchor ────────────────────

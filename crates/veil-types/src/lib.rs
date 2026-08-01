@@ -526,6 +526,37 @@ pub enum LogsConfig {
     File,
 }
 
+/// How the compile-time builtin seed list takes part in bootstrap.
+///
+/// The builtin seeds are the only entry points a stock binary knows, so when
+/// they are blocked the node has nowhere to go. An operator's answer is to
+/// name alternative, non-seed entry points — but under [`Auto`] listing even
+/// one of them in `[[bootstrap_peers]]` turns the builtin seeds OFF, trading
+/// one single point of failure for another. This knob is what lets a node
+/// hold both sets at once.
+///
+/// [`Auto`]: BuiltinSeedPolicy::Auto
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum BuiltinSeedPolicy {
+    /// Builtin seeds are used ONLY when neither `peers` nor `bootstrap_peers`
+    /// is configured — the historical behaviour, kept as the default so a
+    /// devnet built with `debug_assertions` (where `builtin_seeds()` still
+    /// returns the production list) does not start dialing production seeds
+    /// the moment it configures its own peers.
+    #[default]
+    Auto,
+    /// Builtin seeds are merged into the candidate set ALONGSIDE the
+    /// configured peers. This is the setting for a node that wants
+    /// alternative entry points without giving up the seeds.
+    Always,
+    /// Builtin seeds are never dialed. A build-feature-independent off
+    /// switch for testnet deployments that must not touch production
+    /// infrastructure even when built from a binary that has seeds compiled
+    /// in.
+    Never,
+}
+
 impl std::fmt::Display for LogsConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -542,6 +573,28 @@ impl std::str::FromStr for LogsConfig {
             "stderr" => Ok(Self::Stderr),
             "file" => Ok(Self::File),
             _ => Err(ParseEnumError::new("logs config", value)),
+        }
+    }
+}
+
+impl std::fmt::Display for BuiltinSeedPolicy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Auto => f.write_str("auto"),
+            Self::Always => f.write_str("always"),
+            Self::Never => f.write_str("never"),
+        }
+    }
+}
+
+impl std::str::FromStr for BuiltinSeedPolicy {
+    type Err = ParseEnumError;
+    fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
+        match value {
+            "auto" => Ok(Self::Auto),
+            "always" => Ok(Self::Always),
+            "never" => Ok(Self::Never),
+            _ => Err(ParseEnumError::new("builtin seed policy", value)),
         }
     }
 }

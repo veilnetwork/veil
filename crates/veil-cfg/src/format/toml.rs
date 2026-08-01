@@ -102,6 +102,15 @@ fn update_document(document: &mut DocumentMut, config: &Config) -> Result<()> {
         g.trusted_bundle_issuer_pubkey.as_deref(),
     );
     set_string_array(global, "bootstrap_https_urls", &g.bootstrap_https_urls);
+    // `[global]` is in MANUALLY_OWNED below, so the serde render is NOT
+    // spliced over it — a field that is not patched here is dropped the
+    // first time anything re-saves the config. See the comment above
+    // `bootstrap_dns_domain` for the last time that bit someone.
+    set_string(
+        global,
+        "builtin_seed_policy",
+        &g.builtin_seed_policy.to_string(),
+    );
 
     set_transport(document, &config.transport)?;
 
@@ -906,6 +915,43 @@ mod tests {
         );
         assert!(rendered.contains("mode = \"pinned\""));
         assert!(rendered.contains("profile = \"firefox\""));
+    }
+
+    #[test]
+    fn builtin_seed_policy_survives_save() {
+        // `[global]` is MANUALLY_OWNED, so the serde render is not spliced
+        // over it: a field nobody patches into `set_global` is silently
+        // dropped the first time anything re-saves the config. For this field
+        // that would revert an operator who chose `always` back to `auto` —
+        // switching the builtin seeds back off behind their alternative entry
+        // points, which is the exact failure the knob exists to prevent.
+        let mut document = DocumentMut::new();
+        let mut config = Config::default();
+        config.global.builtin_seed_policy = crate::BuiltinSeedPolicy::Always;
+
+        update_document(&mut document, &config).unwrap();
+
+        let rendered = document.to_string();
+        assert!(
+            rendered.contains("builtin_seed_policy = \"always\""),
+            "builtin_seed_policy must survive a save, got: {rendered}"
+        );
+        let back: Config = toml::from_str(&rendered).unwrap();
+        assert_eq!(
+            back.global.builtin_seed_policy,
+            crate::BuiltinSeedPolicy::Always
+        );
+    }
+
+    #[test]
+    fn builtin_seed_policy_defaults_to_auto_when_absent() {
+        // Absent from an existing on-disk config → the historical either/or,
+        // so upgrading a binary never changes who a node dials.
+        let config: Config = toml::from_str("[global]\n").unwrap();
+        assert_eq!(
+            config.global.builtin_seed_policy,
+            crate::BuiltinSeedPolicy::Auto
+        );
     }
 
     #[test]
