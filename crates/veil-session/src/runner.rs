@@ -733,6 +733,28 @@ impl Drop for SessionRunner {
 /// earlier band-aid, but now without ALSO blocking the read path.
 pub const WRITE_PROGRESS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// How long the reader waits for a frame body it has already reserved
+/// memory for.
+///
+/// Slow-loris hardening: an authenticated peer that announces a
+/// `body_len` and then stops sending must not pin a pool buffer and this
+/// task indefinitely. 30 s is far above the 95th-percentile body-arrival
+/// latency on any realistic link and bounds the worst-case memory
+/// exposure per session.
+pub const BODY_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// How long the reader waits for room in the node-wide inbound body
+/// budget before shedding the session.
+///
+/// Every holder of that budget is itself bounded by [`BODY_DEADLINE`],
+/// so the budget always drains and this wait always resolves; the
+/// deadline exists so saturation surfaces as a closed session rather
+/// than an invisible stall. It is deliberately longer than
+/// `BODY_DEADLINE` — a waiter should outlast one full turnover of the
+/// holders ahead of it rather than give up while they are still
+/// legitimately draining.
+pub const BODY_BUDGET_DEADLINE: std::time::Duration = std::time::Duration::from_secs(45);
+
 /// cap how many priority-queue frames the runner pushes to
 /// the writer task per outer-loop iteration. Without this cap, a deep
 /// pq fed by chat-node-style burst load monopolises the loop iteration
@@ -4053,6 +4075,43 @@ impl SessionRunner {
             // `Pooled` handle drops at the end of this scope iteration —
             // returning the buffer to the pool's cache OR freeing it to heap.
             let body_len = header.body_len as usize;
+            // Reserve node-wide body memory BEFORE allocating. The 16 MiB
+            // per-frame cap and the deadline below are both per session;
+            // nothing summed them, so N sessions admitted N × 16 MiB of
+            // simultaneous reservations — and a body that never arrives
+            // costs the sender nothing. See `rx_body_budget`.
+            //
+            // The permit is bound to the loop iteration, so it is returned
+            // at exactly the point `raw_body` is dropped.
+            let _body_budget = if body_len > 0 {
+                match tokio::time::timeout(
+                    BODY_BUDGET_DEADLINE,
+                    crate::rx_body_budget::reserve(body_len),
+                )
+                .await
+                {
+                    Ok(permit) => Some(permit),
+                    Err(_) => {
+                        // Saturation is OUR condition, not this peer's
+                        // misbehaviour — deliberately not `record_violation`,
+                        // which feeds the ban list. Shedding one session
+                        // under memory pressure is fine; banning peers for
+                        // our own congestion turns it into a mesh-wide
+                        // disconnect storm.
+                        self.logger.warn(
+                            "session.rx_body_budget_timeout",
+                            format!(
+                                "peer_id={} body_len={body_len} — node-wide inbound body \
+                                 budget stayed exhausted; shedding this session",
+                                hex_short(&self.peer_id),
+                            ),
+                        );
+                        break;
+                    }
+                }
+            } else {
+                None
+            };
             let mut raw_body = veil_bufpool::global().acquire(body_len);
             raw_body.as_vec_mut().resize(body_len, 0);
             // slow-loris hardening: authenticated peer that
@@ -4061,7 +4120,6 @@ impl SessionRunner {
             // far above the 95-th percentile body-arrival latency on any
             // realistic link and bounds the worst-case memory exposure.
             if header.body_len > 0 {
-                const BODY_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
                 // rt_trace probe: a frame whose BODY takes whole seconds to
                 // arrive pins this loop — no dispatch, no PQ drain — for the
                 // duration. Name any oversized frame BEFORE the read and any
