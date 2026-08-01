@@ -2,6 +2,62 @@
 
 ## Unreleased
 
+### Fixed
+
+- **A late-exiting session runner tore down the state of the session that
+  replaced it.** A session owns two kinds of state. Its registrations are
+  keyed by `session_id`, so removing them is unambiguous. Everything else it
+  installs is keyed by *peer*: the peer's ML-KEM key and per-session DK, its
+  observed address and UDP reflectors, its relay tunnels, its rendezvous
+  subscriptions, and the routes that run through it — one set per peer, no
+  matter how many sessions have come and gone. The teardown removed the second
+  kind unconditionally.
+
+  That is fine until a peer reconnects. A NAT'd client re-dialing evicts the
+  stale session's tx entry, installs its own, and repopulates the peer-wide
+  state through `on_session_opened`. The *old* runner then notices its channel
+  closed and exits — and deleted the live session's ML-KEM key, dropped its
+  rendezvous subscriptions and reflectors, and broadcast
+  `ROUTE_WITHDRAW`/`RouteUpdate(REMOVE)` to the whole mesh for a peer that was
+  at that moment connected. The peer stayed reachable while looking
+  unreachable, until something re-announced it.
+
+  All three runner-exit paths (inbound, punched-outbound, outbound connector)
+  now go through one `session_guard::release_session`, which runs the
+  peer-wide half only after a compare-and-remove of the current owner. The
+  predicate is "does anyone still hold this peer after we removed ourselves",
+  not "did we remove anything" — the latter also reports true after
+  `prune_closed` or `force_reconnect_all_peers` cleared the entry with no
+  successor, which would strand exactly the state this is meant to reclaim.
+  Two of those paths also notified the dispatcher *before* unregistering the
+  tx channel, the ordering the inbound path fixed long ago; they now match.
+
+- **The session-close generation bumps on every runner exit, as documented.**
+  It is the signal a long-lived circuit handle samples at open time to notice
+  its first-hop relay churned. Only the inbound path bumped it, so a circuit
+  whose first hop was an outbound session never learned that session had
+  ended and kept enqueueing onto a dead route. It now bumps on all three
+  paths — and deliberately outside the owner check above: a replacement is
+  precisely the churn the handle is asking about, since the old session's keys
+  are gone even though the peer is reachable again through the new one.
+
+- **A rejected peer no longer writes to, or evicts from, the per-peer caches.**
+  Completing a handshake proves key ownership; it does not mean the session
+  will be kept. The expected-peer check, the listener allowlist, the ban list,
+  the concurrency cap, directional dedup and the over-cap re-check all run
+  afterwards. The seven per-peer caches were written at handshake completion,
+  before any of them — so a peer that every gate rejected still got its
+  pubkey, roles, cap-flags, ML-KEM key, battery, Vivaldi coordinate, alt-URI
+  and membership cert into node-wide state, and, because each cache is capped,
+  evicted an entry belonging to a peer we did accept. An authenticated Sybil
+  cannot forge another node's `node_id`, but it can handshake in a loop and
+  churn the caches of the nodes we actually talk to. `cache_peer_handshake_state`
+  is now split into a `prepare_peer_handshake_state` that mutates nothing and a
+  `PendingPeerState::commit` that takes `self` by value — so a reject path
+  cannot have committed, because committing consumes the value it drops — with
+  the single call sitting past the last gate, beside the session-registry
+  insert it already guarded.
+
 ## v0.4.2 — 2026-07-29
 
 No Rust code changed: `cargo` builds nothing new here. The work is in the
