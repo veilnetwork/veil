@@ -144,23 +144,83 @@ impl CircuitTeardownPayload {
     }
 }
 
+/// Domain separator for [`circuit_built_token`]. Distinct context string ⇒ the
+/// token cannot collide with any other use of the same circuit key (notably the
+/// data-cell keystream in `circuit_data`).
+const CIRCUIT_BUILT_CONTEXT: &str = "veil.anonymity.circuit_built.v1 terminus ack token";
+
+/// Proof that the sender of a `CircuitBuilt` ACK holds the **terminus** hop key
+/// of this circuit.
+///
+/// ## What it is for
+///
+/// The ACK's only other field is a circuit id, and every hop knows the id of
+/// the link it sits on — including the first hop, which knows the very id the
+/// originator matches on. So any hop could synthesise the ACK and have the
+/// originator mark a circuit CONFIRMED (and freeze that path) without a single
+/// byte having reached the terminus: a black hole that looks healthy.
+///
+/// The originator picks a fresh random `circuit_key` per hop and delivers each
+/// one sealed to that hop's X25519 public key inside the setup envelope. The
+/// terminus key is therefore known to exactly two parties — the originator and
+/// the node the originator chose as terminus — and to nobody in between. A
+/// token derived from it proves both that the ACK came from the terminus and
+/// that it belongs to *this* circuit, because the key is fresh per circuit.
+/// There is nothing variable left to bind, so the token is the derivation
+/// itself rather than a MAC over a message.
+///
+/// Replaying a captured token only re-confirms the circuit it was minted for,
+/// which is already confirmed; it carries no authority anywhere else.
+#[must_use]
+pub fn circuit_built_token(circuit_key: &[u8; crate::circuit_setup::CIRCUIT_KEY_LEN]) -> [u8; 32] {
+    blake3::derive_key(CIRCUIT_BUILT_CONTEXT, circuit_key)
+}
+
+/// Constant-time compare of two ACK tokens.
+///
+/// Variable-time comparison here would leak a prefix oracle to whichever hop
+/// forwards the ACK: it could bisect a valid token one byte at a time by
+/// watching how long the originator takes to reject.
+#[must_use]
+pub fn circuit_built_token_matches(a: &[u8; 32], b: &[u8; 32]) -> bool {
+    let mut diff = 0u8;
+    for i in 0..32 {
+        diff |= a[i] ^ b[i];
+    }
+    diff == 0
+}
+
 /// Terminus → originator circuit-establishment ACK (diff-audit Δ2-d). Routed
 /// back down the return path; each hop re-tags `circuit_id` (like a return data
 /// cell) so the originator matches it against its origin circuit and marks the
-/// circuit CONFIRMED. Carries no payload beyond the per-link circuit id.
+/// circuit CONFIRMED.
 ///
-/// Wire: `[circuit_id u32 BE]`.
+/// Wire: `[circuit_id u32 BE][token 32]`.
+///
+/// **Breaking wire change.** The ACK used to be the bare circuit id, which any
+/// hop could forge — see [`circuit_built_token`]. There is no version
+/// negotiation on relay-chain messages, so a node of the old shape drops these
+/// frames (exact-length decode) and confirms nothing: circuits stay
+/// unconfirmed, which is the pre-existing safe state, and path maintenance
+/// re-selects as it already does for an unconfirmed circuit. Roll relays before
+/// clients.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CircuitBuiltPayload {
     /// Circuit id on the link this ACK arrived on.
     pub circuit_id: CircuitId,
+    /// Terminus proof-of-key token; see [`circuit_built_token`]. Forwarded
+    /// unchanged by intermediate hops, which re-tag only `circuit_id`.
+    pub token: [u8; 32],
 }
 
 impl CircuitBuiltPayload {
-    pub const WIRE_LEN: usize = 4;
+    pub const WIRE_LEN: usize = 4 + 32;
 
     pub fn encode(&self) -> [u8; Self::WIRE_LEN] {
-        self.circuit_id.to_be_bytes()
+        let mut out = [0u8; Self::WIRE_LEN];
+        out[..4].copy_from_slice(&self.circuit_id.to_be_bytes());
+        out[4..].copy_from_slice(&self.token);
+        out
     }
 
     pub fn decode(blob: &[u8]) -> Result<Self, CircuitError> {
@@ -171,8 +231,11 @@ impl CircuitBuiltPayload {
                 Self::WIRE_LEN
             )));
         }
+        let mut token = [0u8; 32];
+        token.copy_from_slice(&blob[4..]);
         Ok(Self {
             circuit_id: u32::from_be_bytes([blob[0], blob[1], blob[2], blob[3]]),
+            token,
         })
     }
 }
@@ -185,9 +248,55 @@ mod tests {
     fn circuit_built_roundtrip() {
         let p = CircuitBuiltPayload {
             circuit_id: 0x1234_5678,
+            token: [0xA5; 32],
         };
         assert_eq!(CircuitBuiltPayload::decode(&p.encode()).unwrap(), p);
         assert!(CircuitBuiltPayload::decode(&[0u8; 3]).is_err());
+    }
+
+    /// The old bare-circuit-id ACK is exactly the forgeable shape this
+    /// change removes; it must not decode into an ACK whose token would
+    /// then be compared against something.
+    #[test]
+    fn the_legacy_bare_circuit_id_ack_no_longer_decodes() {
+        let legacy = 0x1234_5678u32.to_be_bytes();
+        assert!(CircuitBuiltPayload::decode(&legacy).is_err());
+    }
+
+    /// The token is a function of the terminus key alone, so two circuits
+    /// never share one and a hop that lacks the key cannot produce it.
+    #[test]
+    fn the_token_is_bound_to_its_circuit_key() {
+        let key_a = [7u8; crate::circuit_setup::CIRCUIT_KEY_LEN];
+        let mut key_b = key_a;
+        key_b[0] ^= 1;
+
+        let tok_a = circuit_built_token(&key_a);
+        assert_eq!(tok_a, circuit_built_token(&key_a), "must be deterministic");
+        assert_ne!(
+            tok_a,
+            circuit_built_token(&key_b),
+            "a one-bit different circuit key must give a different token"
+        );
+        assert_ne!(
+            tok_a.as_slice(),
+            key_a.as_slice(),
+            "the token must not be the raw key — it travels the wire in clear"
+        );
+    }
+
+    #[test]
+    fn token_compare_accepts_equal_and_rejects_near_miss() {
+        let a = circuit_built_token(&[3u8; crate::circuit_setup::CIRCUIT_KEY_LEN]);
+        assert!(circuit_built_token_matches(&a, &a));
+        for flip in [0usize, 15, 31] {
+            let mut b = a;
+            b[flip] ^= 1;
+            assert!(
+                !circuit_built_token_matches(&a, &b),
+                "a single flipped bit at byte {flip} must not match"
+            );
+        }
     }
 
     #[test]
@@ -277,8 +386,11 @@ mod tests {
             "CircuitDataPayload must reject trailing bytes"
         );
 
-        // CircuitBuiltPayload: 4-byte payload + trailing.
-        let built = CircuitBuiltPayload { circuit_id: 1 };
+        // CircuitBuiltPayload: exact-length payload + trailing.
+        let built = CircuitBuiltPayload {
+            circuit_id: 1,
+            token: [0u8; 32],
+        };
         let mut b = built.encode().to_vec();
         b.push(0xFF);
         assert!(
