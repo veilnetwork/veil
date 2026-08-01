@@ -227,10 +227,22 @@ pub struct CryptoContext {
     ///   below that silently drops mail rather than failing loudly.
     ///
     /// A previous-seed slot with trial decryption (current, then previous)
-    /// avoids any wire change — no key ID needed — but `mlkem_dk_seed` and
-    /// `mlkem_ek` are plain `Arc<T>` read from 13 files (~135 references), so
-    /// making them swappable is a real refactor, and rotation must also
-    /// trigger an immediate republish instead of waiting out the 6h tick.
+    /// avoids any wire change — no key ID needed. The DECRYPT side is small:
+    /// exactly one site resolves a seed, `delivery.rs`'s
+    /// `deliver_forward_envelope`, which already prefers a per-session
+    /// ephemeral seed over this one; adding "then try the previous long-term
+    /// seed" is a third arm on that same choice.
+    ///
+    /// What is NOT small is making the seed swappable at all. `mlkem_dk_seed`
+    /// and `mlkem_ek` are plain `Arc<T>` — read, not locked — from ~102 places
+    /// across a dozen crates, so rotation means turning both into guarded
+    /// state everywhere before anything can move. Adding a parallel "epoch"
+    /// field instead would be cheaper and wrong: two sources of truth for
+    /// which key is current is exactly how a node ends up publishing one EK
+    /// and decrypting with another.
+    ///
+    /// Rotation must also force an immediate republish rather than waiting out
+    /// the 6h tick, or the ≥7h window above has to grow to cover it.
     ///
     /// * Rotate `mlkem_dk_seed` on a configurable schedule and re-derive EK.
     /// * Use ephemeral ML-KEM per session (requires a second round-trip).
