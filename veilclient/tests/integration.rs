@@ -50,7 +50,11 @@ fn temp_socket() -> PathBuf {
 #[test]
 fn temp_socket_paths_are_unique_within_a_process() {
     let paths: std::collections::HashSet<_> = (0..1000).map(|_| temp_socket()).collect();
-    assert_eq!(paths.len(), 1000, "temp_socket() handed out a duplicate path");
+    assert_eq!(
+        paths.len(),
+        1000,
+        "temp_socket() handed out a duplicate path"
+    );
 }
 
 async fn start_server(sock: PathBuf) -> (watch::Sender<bool>, tokio::task::JoinHandle<()>) {
