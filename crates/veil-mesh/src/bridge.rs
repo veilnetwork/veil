@@ -128,6 +128,19 @@ impl GatewayBridge {
         self
     }
 
+    /// Whether a leaf byte quota is attached.
+    ///
+    /// Exists because the interesting failure was never the throttling logic —
+    /// that was correct and tested — but the *attachment*: the guard, the
+    /// adapter and the builder were all written and then never wired into the
+    /// production constructors, so a greedy leaf was counted and never
+    /// throttled. Nothing in a type signature catches a missing builder call,
+    /// so the runtime asserts on this instead (audit P3-27).
+    #[must_use]
+    pub fn has_leaf_bandwidth_quota(&self) -> bool {
+        self.leaf_bandwidth.is_some()
+    }
+
     /// chainable builder so production paths attach metrics
     /// without changing the bare `new` signature used by every existing
     /// test. Returns `self` for chaining after construction.
