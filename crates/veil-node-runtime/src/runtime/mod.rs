@@ -8726,15 +8726,37 @@ impl NodeServices {
         // worker's queue to other threads so the ACK is processed DURING the
         // wait (~100-250ms typical) and the poll returns early — the race is
         // actually closed now, and the 1s ceiling is the rare-case bound, not
-        // the common cost. Fallback for non-runtime / current-thread contexts
-        // (e.g. the FFI admin client): the old plain sleep, unchanged.
-        let on_multi_thread_runtime = tokio::runtime::Handle::try_current()
-            .map(|h| h.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread)
-            .unwrap_or(false);
-        if on_multi_thread_runtime {
-            tokio::task::block_in_place(wait);
-        } else {
-            wait();
+        // the common cost.
+        //
+        // Off a runtime entirely (the FFI admin client, a plain thread) the
+        // sleep is harmless: the ACK is dispatched by another thread and
+        // arrives while we sleep.
+        //
+        // ON a CURRENT-THREAD runtime it is worse than useless. There is one
+        // worker; sleeping on it parks the executor, and with it the inbound
+        // dispatch that would deliver the very ACK being waited for. The wait
+        // cannot succeed by construction, and costs the whole runtime a full
+        // second of frozen networking to fail. Returning immediately loses
+        // nothing — the confirmation could not have arrived in that window —
+        // and keeps the executor live so the ACK lands as soon as it can. The
+        // unregistered-cookie race stays open on that flavour exactly as it
+        // already was; closing it there needs this wait to be awaited rather
+        // than blocked, which needs an async caller path.
+        //
+        // An unrecognised future flavour takes the same non-blocking path:
+        // blocking is only known-safe where the executor is known to survive
+        // it.
+        match tokio::runtime::Handle::try_current().map(|h| h.runtime_flavor()) {
+            Ok(tokio::runtime::RuntimeFlavor::MultiThread) => tokio::task::block_in_place(wait),
+            Ok(_) => {
+                self.logger.debug(
+                    "anonymity.reply_circuit.wait_skipped",
+                    "current-thread runtime: blocking here would park the only worker and \
+                     with it the dispatch that delivers the ACK — proceeding unconfirmed",
+                );
+                return;
+            }
+            Err(_) => wait(),
         }
         if !confirmed.load(std::sync::atomic::Ordering::Relaxed) {
             self.logger.info(
