@@ -1246,6 +1246,27 @@ impl NodeRuntime {
                         None
                     }
                 }
+            } else if config.ephemeral_identity {
+                // The deferred boot's `[identity]` is a compiled-in constant.
+                // Building a standalone sovereign out of it would write that
+                // constant to `device_identity_sk.bin` — and the ML-KEM and
+                // X25519 resolves immediately below read exactly that file, so
+                // the node's receive keys would be a pure function of a value
+                // published in the source tree. Worse, the onion auth-cookie
+                // and registration key derive from the same seed, so EVERY
+                // deferred node would register at a relay under one shared,
+                // world-known cookie.
+                //
+                // So: no sovereign here. Both key resolves below fall through
+                // to their in-memory random branch, and the real identity — the
+                // one that arrives with `apply_config` — is what
+                // `apply_reload_after_stop` derives from.
+                logger.info(
+                    "node.sovereign_identity.deferred_skipped",
+                    "deferred boot: no sovereign identity built from the placeholder \
+                     [identity] — real keys are derived when the identity is applied",
+                );
+                None
             } else {
                 // no document on disk — try the standalone
                 // branch. We need an Ed25519 device SK; the config's
@@ -1280,6 +1301,7 @@ impl NodeRuntime {
                 &veil_dir_path,
                 key_passphrase.as_deref().map(|p| p.as_str()),
                 mlkem_epoch,
+                config.ephemeral_identity,
             )?;
         logger.info(
             "node.mlkem_dk.source",
@@ -1813,6 +1835,7 @@ impl NodeRuntime {
                 let (sk, src) = crate::identity_local::anonymity_x25519::load_or_derive(
                     &veil_dir_path,
                     sovereign_identity.is_some(),
+                    config.ephemeral_identity,
                 )?;
                 logger.info(
                     "node.anonymity_x25519.source",
