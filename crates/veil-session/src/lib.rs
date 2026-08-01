@@ -38,6 +38,7 @@ pub mod rendezvous;
 pub mod rotation_deadline;
 pub mod rt_trace;
 pub mod runner;
+pub mod rx_body_budget;
 pub mod session_alias_guard;
 pub mod ticket;
 pub mod timers;

@@ -4,6 +4,41 @@
 
 ### Fixed
 
+- **Inbound frame bodies now share a node-wide memory budget.** The 16 MiB
+  per-frame cap and the 30-second slow-loris deadline are both *per frame, per
+  session*; nothing summed them. Every authenticated session is an independent
+  reader that announces a length, allocates a buffer that big, and waits for
+  the bytes — so a node holding a thousand sessions, ordinary for a relay,
+  admitted a thousand simultaneous reservations of up to 16 MiB each. The
+  peers need not be malicious; a synchronised burst of large legitimate
+  transfers has the same shape. What makes it cheap to provoke is that the
+  body need never arrive: the header alone reserves the memory. A session now
+  reserves against `rx_body_budget` (64 MiB default, `VEIL_RX_BODY_BUDGET`)
+  before allocating and holds the reservation until the body is consumed, so
+  in-flight body memory is bounded regardless of session count. Demand above
+  the budget queues rather than allocating, and cannot deadlock because every
+  holder is itself bounded by the body deadline. A configured budget below one
+  whole frame is raised to it — otherwise a `MAX_FRAME_BODY` frame would wait
+  forever on permits that cannot exist. Giving up on the wait sheds the
+  session but deliberately does **not** record a violation: saturation is this
+  node's condition, and banning peers for our own congestion would turn memory
+  pressure into a mesh-wide disconnect storm.
+
+- **The reply-circuit confirmation wait no longer freezes a current-thread
+  runtime.** On a multi-thread runtime the wait runs under `block_in_place`,
+  which hands the worker's queue to other threads so the `CircuitBuilt` ACK is
+  processed during it. On a current-thread runtime the same wait slept on the
+  only worker — parking the executor and with it the inbound dispatch that
+  would deliver the very ACK being waited for. It could not succeed by
+  construction, and cost a full second of frozen networking to fail. That
+  flavour now returns immediately: nothing is lost, since the confirmation
+  could not have arrived, and the executor stays live so the ACK lands as soon
+  as it can. Off a runtime entirely (the FFI admin client) the sleep is
+  harmless and unchanged. The unregistered-cookie race remains open on
+  current-thread exactly as it already was — closing it there requires the
+  wait to be awaited rather than blocked, i.e. an async caller path, which is
+  not done here.
+
 - **A late-exiting session runner tore down the state of the session that
   replaced it.** A session owns two kinds of state. Its registrations are
   keyed by `session_id`, so removing them is unambiguous. Everything else it
