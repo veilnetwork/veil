@@ -316,3 +316,66 @@ impl NodeRuntime {
         peer_id
     }
 }
+
+impl NodeRuntime {
+    /// Test/sim-only — names of the per-peer caches currently holding an entry
+    /// for `peer`.
+    ///
+    /// Handshake completion proves key ownership, not admission: the
+    /// expected-peer check, the listener allowlist, the ban list, the
+    /// concurrency cap, directional dedup and the over-cap re-check all run
+    /// afterwards. These caches used to be written before any of them, so a
+    /// peer every gate rejected still landed in node-wide state and — because
+    /// each cache is capped — evicted an entry belonging to a peer that WAS
+    /// accepted. Read-only; the name list rather than a bool so a failure says
+    /// which cache leaked.
+    pub fn debug_cached_peer_state(&self, peer: &[u8; 32]) -> Vec<&'static str> {
+        let mut held = Vec::new();
+        if lock!(self.identity.peer_pubkeys).contains_key(peer) {
+            held.push("peer_pubkeys");
+        }
+        if lock!(self.identity.peer_roles).contains_key(peer) {
+            held.push("peer_roles");
+        }
+        if lock!(self.identity.peer_sovereign_identities).contains_key(peer) {
+            held.push("peer_sovereign_identities");
+        }
+        if self
+            .identity
+            .peer_mlkem_keys
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .contains_key(peer)
+        {
+            held.push("peer_mlkem_keys");
+        }
+        if self
+            .dispatcher
+            .crypto
+            .peer_cap_flags
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .contains_key(peer)
+        {
+            held.push("peer_cap_flags");
+        }
+        if self
+            .dispatcher
+            .peer_vivaldi
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .contains_key(peer)
+        {
+            held.push("peer_vivaldi");
+        }
+        if self
+            .verified_peer_certs
+            .read()
+            .map(|g| g.contains_key(peer))
+            .unwrap_or(false)
+        {
+            held.push("verified_peer_certs");
+        }
+        held
+    }
+}
