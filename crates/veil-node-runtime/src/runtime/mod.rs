@@ -37,7 +37,7 @@ mod routing_state;
 mod service_tasks;
 pub mod services;
 mod session_defaults;
-mod session_guard;
+pub(crate) mod session_guard;
 mod sovereign_republish;
 mod space_discovery;
 mod update_check;
@@ -146,7 +146,7 @@ pub struct NodeServices {
     /// Monotonic per-peer session-close generation. Incremented when a session
     /// runner exits, so higher layers with long-lived handles can notice that a
     /// relay session they were using has churned since the handle was opened.
-    session_close_generations: Arc<Mutex<std::collections::HashMap<[u8; 32], u64>>>,
+    pub(crate) session_close_generations: Arc<Mutex<std::collections::HashMap<[u8; 32], u64>>>,
     next_link_id: Arc<AtomicU64>,
     pending_accepts: Arc<Mutex<AcceptWaiters>>,
     pub logger: Arc<NodeLogger>,
@@ -278,7 +278,7 @@ pub struct SessionRuntimeContext {
     /// live-session metadata, co-located with `NodeRuntime.live_sessions`.
     live_sessions: Arc<Mutex<std::collections::BTreeMap<LinkId, SessionInfo>>>,
     /// Shared close-generation map; see [`NodeServices::session_close_generation`].
-    session_close_generations: Arc<Mutex<std::collections::HashMap<[u8; 32], u64>>>,
+    pub(crate) session_close_generations: Arc<Mutex<std::collections::HashMap<[u8; 32], u64>>>,
     /// shared push-event bus, mirrored from `NodeRuntime` so
     /// `register_connection_session` can publish `SESSIONS_CHANGED`
     /// on every fresh insert. Cheap to clone (`Arc`).
@@ -564,7 +564,7 @@ pub struct NodeRuntime {
     pub live_sessions: Arc<Mutex<std::collections::BTreeMap<LinkId, SessionInfo>>>,
     /// Monotonic per-peer session-close generation, shared with service handles
     /// and session runtime contexts.
-    session_close_generations: Arc<Mutex<std::collections::HashMap<[u8; 32], u64>>>,
+    pub(crate) session_close_generations: Arc<Mutex<std::collections::HashMap<[u8; 32], u64>>>,
     /// OVL1 session registry — tracks fully handshaken sessions keyed by
     /// `SessionId` (derived from `SESSION_CONFIRM`). Carries
     /// sovereign-identity outputs (identity proof, capabilities, role)
@@ -5843,15 +5843,24 @@ impl NodeServices {
             let _swap_guard = runner.register_swap_channel(&access.handoff.swap_registry);
             runner.run().await;
             drop(_swap_guard);
-            access.dispatcher.on_session_closed(peer_id, false);
-            wlock!(access.identity.peer_mlkem_keys).remove(peer_id.as_bytes());
-            lock!(access.identity.per_session_mlkem_dk).remove(peer_id.as_bytes());
-            access
-                .session_tx_registry
-                .write()
-                .unwrap_or_else(|p| p.into_inner())
-                .unregister_owned(peer_id.as_bytes(), &session_id);
-            access.session_outbox.unregister_owned(peer_id, &session_id);
+            // Owner-aware teardown — same contract as the inbound path:
+            // never tear down peer-wide state a reconnect now owns. This
+            // path also used to notify the dispatcher BEFORE unregistering
+            // the tx channel, the ordering the inbound path fixed long ago.
+            session_guard::release_session(
+                session_guard::SessionRelease {
+                    session_tx_registry: &access.session_tx_registry,
+                    session_outbox: &access.session_outbox,
+                    session_close_generations: &access.session_close_generations,
+                    identity: &access.identity,
+                    dispatcher: &access.dispatcher,
+                    logger: &access.logger,
+                },
+                peer_id,
+                &session_id,
+                // Outbound sessions are never capacity-referral.
+                false,
+            );
             let _ = runner.stream.shutdown().await;
         });
         push_session_handle(&self.tasks, handle);
@@ -6586,42 +6595,23 @@ pub fn spawn_inbound_session(
                 runner.run().await;
             }
             drop(_swap_guard);
-            // oncurrency-unregister tx-channel
-            // BEFORE notifying the dispatcher. The previous order
-            // (`on_session_closed` → unregister) left a window where
-            // dispatcher hooks could look up `session_tx_registry` for
-            // the closing peer and find a still-live channel that would
-            // never be drained — frames silently dropped. New order
-            // ensures the channel is gone before any close-handler runs.
-            wlock!(inbound.runtime.session_tx_registry)
-                .unregister_owned(peer_id.as_bytes(), &session_id);
-            inbound
-                .runtime
-                .session_outbox
-                .unregister_owned(peer_id, &session_id);
-            {
-                let mut generations = lock!(inbound.runtime.session_close_generations);
-                if generations.len() >= 4096 && !generations.contains_key(peer_id.as_bytes()) {
-                    generations.clear();
-                }
-                let next = generations
-                    .get(peer_id.as_bytes())
-                    .copied()
-                    .unwrap_or(0)
-                    .wrapping_add(1)
-                    .max(1);
-                generations.insert(*peer_id.as_bytes(), next);
-            }
-            // Evict ML-KEM key for this peer so stale keys don't persist.
-            wlock!(inbound.runtime.identity.peer_mlkem_keys).remove(peer_id.as_bytes());
-            // Evict per-session ephemeral DK so stale keys don't persist.
-            lock!(inbound.runtime.identity.per_session_mlkem_dk).remove(peer_id.as_bytes());
-            // Now safe to notify dispatcher: any `session_tx_registry`
-            // lookups in the close-handler path will return None.
-            inbound
-                .runtime
-                .dispatcher
-                .on_session_closed(peer_id, is_referral);
+            // Owner-aware teardown: our own registrations go
+            // unconditionally, the peer-wide state only if this session
+            // is still the peer's owner. A reconnect that replaced us
+            // owns that state now. See `session_guard::release_session`.
+            session_guard::release_session(
+                session_guard::SessionRelease {
+                    session_tx_registry: &inbound.runtime.session_tx_registry,
+                    session_outbox: &inbound.runtime.session_outbox,
+                    session_close_generations: &inbound.runtime.session_close_generations,
+                    identity: &inbound.runtime.identity,
+                    dispatcher: &inbound.runtime.dispatcher,
+                    logger: &inbound.runtime.logger,
+                },
+                peer_id,
+                &session_id,
+                is_referral,
+            );
             let _ = runner.stream.shutdown().await;
         }
     })

@@ -10,8 +10,10 @@
 //!   verifies expected-peer invariants when applicable, and yields an
 //!   `AttachedDebugSession`.  Drives RAII slot tracking via `IpSlotGuard`
 //!   and delegates teardown to `SessionGuard`.
-//! - [`cache_peer_handshake_state`][] — synchronous "commit" of one
-//!   completed `OvlHandshakeResult` into the seven per-peer caches.
+//! - [`prepare_peer_handshake_state`][] / [`PendingPeerState::commit`][]
+//!   — the derive-then-publish pair for one completed
+//!   `OvlHandshakeResult`. `prepare` mutates nothing; `commit` writes the
+//!   per-peer caches and is called only past the admission gates.
 //! - [`peer_transport_context`][] — TLS-context fork-and-augment helper
 //!   used at outbound dial time.
 //!
@@ -83,243 +85,301 @@ pub enum PeerVerificationError {
     NonceMismatch,
 }
 
-/// commit per-peer state from a completed OVL1 handshake.
+/// Everything one completed OVL1 handshake wants to publish about its
+/// peer, held until the session has cleared every admission gate.
 ///
-/// Extracted from `register_connection_session`.  Populates the session
-/// registry entry and seven per-peer caches (pubkey, role bits with
-/// reputation-aware role downgrade, cap-flags, ML-KEM EK, battery,
-/// Vivaldi, hot-standby alt URI) from a single handshake result.  All work
-/// is synchronous — the caller remains responsible for any `await` points.
-/// Populate the bounded per-peer caches (pubkeys, roles, cap-flags, ML-KEM,
-/// battery, vivaldi, sovereign bindings) from a completed handshake and BUILD
-/// the [`veil_session::SessionEntry`] for the session — but do NOT insert it
-/// into `session_registry`. The caller registers the returned entry only after
-/// the accept gates pass (audit cycle-9 CRIT-6).
+/// ## Why this is not written straight through
+///
+/// Completing a handshake proves the peer holds the private key for the
+/// `node_id` it claims. It does **not** mean we will keep the session:
+/// the expected-peer check, the listener allowlist, the ban list, the
+/// concurrency cap, directional dedup and the over-cap re-check all run
+/// afterwards, and each can reject. Writing the per-peer caches at
+/// handshake completion meant a peer that every one of those gates
+/// rejected still got its pubkey, roles, cap-flags, ML-KEM key, battery,
+/// Vivaldi coordinate, alt-URI and membership cert into node-wide state
+/// — and, because each of those caches is capped, evicted an entry
+/// belonging to a peer we *did* accept. An authenticated Sybil could not
+/// forge another node's `node_id`, but it could handshake in a loop and
+/// churn the caches of the nodes we actually talk to.
+///
+/// So the derivation is separated from the publish:
+/// [`prepare_peer_handshake_state`] reads and computes, mutating
+/// nothing; [`PendingPeerState::commit`] writes, and the caller invokes
+/// it at exactly one point — past the last gate. A reject path simply
+/// drops this value.
+pub struct PendingPeerState {
+    /// The registry entry, handed back by [`Self::commit`] so the caller
+    /// registers it in the same post-admission step.
+    entry: veil_session::SessionEntry,
+    /// The sovereign binding to publish. `Some` only on the full-handshake
+    /// path — the resumption path reads the cache (in `prepare`) but has
+    /// nothing new to write.
+    sovereign_to_cache: Option<veil_identity::verify::ValidatedIdentity>,
+    /// Battery level from the ATTACH TLV.
+    battery: Option<u8>,
+    /// Raw Vivaldi triple as advertised; validated at commit time.
+    vivaldi: Option<(f64, f64, f64)>,
+    /// Transport URIs the peer advertised, for hot-standby alt-URI pickup.
+    advertised_transports: Vec<String>,
+    /// URI this session came in on, the alt-URI picker's reference point.
+    primary_uri: String,
+    /// Verified P-Net membership cert, for IPC status consumers.
+    membership_cert: Option<veil_types::MembershipCert>,
+    /// The address the peer says it saw us as (STUN-style discovery).
+    observed_addr: Option<std::net::SocketAddr>,
+}
+
+/// Derive [`PendingPeerState`] from a completed OVL1 handshake **without
+/// mutating any shared state**.
+///
+/// The one lock taken here is a read of `peer_sovereign_identities`, and
+/// only on the resumption path, where the binding this session should
+/// carry was recorded by an earlier full handshake.
+///
+/// Extracted from `register_connection_session`. Its counterpart is
+/// [`PendingPeerState::commit`]; all work in both is synchronous — the
+/// caller remains responsible for any `await` points.
 #[must_use]
-pub fn cache_peer_handshake_state(
+pub fn prepare_peer_handshake_state(
     runtime: &SessionRuntimeContext,
     r: &OvlHandshakeResult,
     primary_uri: &str,
-) -> veil_session::SessionEntry {
+) -> PendingPeerState {
     let peer_id = r.remote_identity_payload.node_id;
     // LOCK ORDER: canonical workspace-wide order (see session_guard.rs) is
-    // `session_registry` (#3) → `peer_sovereign_identities` (#5).  However
-    // the SessionEntry insert needs the `validated` value computed from
-    // the sovereign cache, and holding both locks simultaneously in inverted
-    // order would create a deadlock cycle against future code that takes
-    // them in canonical order.
+    // `session_registry` (#3) → `peer_sovereign_identities` (#5).  The
+    // SessionEntry needs the `validated` value computed from the sovereign
+    // cache, and holding both locks simultaneously in inverted order would
+    // create a deadlock cycle against code that takes them in canonical
+    // order.
     //
-    // We split the work into two sequential critical sections instead:
-    //   (1) take `peer_sovereign_identities`, compute `validated`, drop.
-    //   (2) take `session_registry`, insert SessionEntry with `validated`.
-    //
-    // A reader racing between (1) and (2) sees either old-registry +
-    // old-sovereign OR new-registry + new-sovereign — never a cross-
-    // generation pair, because `validated` snapshot is captured at (1)
-    // and applied at (2).
-    let validated = {
-        use veil_proto::budget::MAX_PEER_SOVEREIGN_IDENTITIES;
-        let mut sovereign_g = lock!(runtime.identity.peer_sovereign_identities);
-        match r.validated_sovereign_identity.clone() {
-            Some(v) => {
-                // Full handshake completed — update the cache for future
-                // resumption events.  Cap unbounded HashMap growth.
-                // Random eviction (HashMap iter is non-deterministic) is
-                // acceptable here — cache hit/miss only affects resumption
-                // fast-path; missed entries trigger a full handshake.
-                if sovereign_g.len() >= MAX_PEER_SOVEREIGN_IDENTITIES
-                    && !sovereign_g.contains_key(&peer_id)
-                    && let Some(k) = sovereign_g.keys().next().copied()
-                {
-                    sovereign_g.remove(&k);
-                }
-                sovereign_g.insert(peer_id, v.clone());
-                Some(v)
-            }
-            None => {
-                // Resumption path — look up the cached binding if we
-                // recorded one earlier.  Cached sovereign bindings from the
-                // resumption fast path are trusted unconditionally; a
-                // compromised subkey is mitigated by the document's short
-                // `valid_until_unix` window.
-                sovereign_g.get(&peer_id).cloned()
-            }
+    // The two are never held together: `validated` is resolved here, the
+    // sovereign cache is written in `commit`, and `session_registry` is
+    // written by the caller — three sequential critical sections. A reader
+    // racing between them sees either old-registry + old-sovereign OR
+    // new-registry + new-sovereign, never a cross-generation pair, because
+    // the `validated` snapshot is captured here and applied throughout.
+    let (validated, sovereign_to_cache) = match r.validated_sovereign_identity.clone() {
+        // Full handshake completed — this binding is both what the session
+        // carries and what the cache should learn for future resumptions.
+        Some(v) => (Some(v.clone()), Some(v)),
+        None => {
+            // Resumption path — look up the cached binding if we recorded
+            // one earlier.  Cached sovereign bindings from the resumption
+            // fast path are trusted unconditionally; a compromised subkey
+            // is mitigated by the document's short `valid_until_unix`
+            // window. Read-only: nothing to publish back.
+            let cached = lock!(runtime.identity.peer_sovereign_identities)
+                .get(&peer_id)
+                .cloned();
+            (cached, None)
         }
-        // sovereign_g released here.
     };
-    // NOTE (audit cycle-9 CRIT-6): the SessionEntry is BUILT here (and returned
-    // at the end) but NOT inserted into `session_registry` yet. The caller
-    // inserts it only AFTER the accept gates (identity-mismatch / allowlist /
-    // banned / at-limit / dedup / over-cap) pass. Previously the insert happened
-    // here, before those gates — so every handshake-then-reject leaked a
-    // ~1 KB SessionEntry into the unbounded `sessions` map (no SessionGuard is
-    // created on a reject path), and the pre-dedup insert clobbered `by_peer`
-    // for a peer that still had a live session. Deferring the insert past the
-    // gates fixes both.
-    // Cache the peer's raw public key for signature verification.  Skip
-    // if public_key is empty — this happens during session resumption
-    // (fast-path reconnect via ticket) where the synthetic IdentityPayload
-    // has no key.  Overwriting with empty would break routing-sig verify.
-    if !r.remote_identity_payload.public_key.is_empty() {
-        lock!(runtime.identity.peer_pubkeys).insert_lru(
-            r.remote_identity_payload.node_id,
-            (
-                r.remote_identity_payload.algo,
-                r.remote_identity_payload.public_key.clone(),
-            ),
-            veil_proto::budget::MAX_PEER_PUBKEYS_CACHE,
-        );
+
+    PendingPeerState {
+        entry: veil_session::SessionEntry {
+            session_id: r.session_keys.session_id,
+            remote_node_id: peer_id,
+            remote_identity: r.remote_identity_payload.clone(),
+            remote_capabilities: r.remote_capabilities.clone(),
+            remote_attach: r.remote_attach.clone(),
+            remote_role: r.remote_role,
+            validated_sovereign_identity: validated,
+        },
+        sovereign_to_cache,
+        battery: r.remote_battery,
+        vivaldi: r.remote_vivaldi,
+        advertised_transports: r.remote_advertised_transports.clone(),
+        primary_uri: primary_uri.to_string(),
+        membership_cert: r.verified_membership_cert.clone(),
+        observed_addr: r.remote_observed_addr,
     }
-    // Cache peer's role bits.
-    {
-        let role_bits = r.remote_capabilities.roles_supported;
-        lock!(runtime.identity.peer_roles).insert_lru(
-            r.remote_identity_payload.node_id,
-            role_bits,
-            veil_proto::budget::MAX_PEER_PUBKEYS_CACHE,
-        );
-    }
-    // Cache peer capability flags for relay filtering.
-    {
-        let mut flags_cache = runtime
-            .dispatcher
-            .crypto
-            .peer_cap_flags
-            .write()
-            .unwrap_or_else(|p| p.into_inner());
-        // Only evict when inserting a NEW peer (matches the sibling caches), so
-        // an existing peer re-handshaking can't churn out a different live
-        // peer's flags.
-        if flags_cache.len() >= veil_proto::budget::MAX_PEER_PUBKEYS_CACHE
-            && !flags_cache.contains_key(&r.remote_identity_payload.node_id)
-            && let Some(evict_key) = flags_cache.keys().next().copied()
-        {
-            flags_cache.remove(&evict_key);
-        }
-        flags_cache.insert(
-            r.remote_identity_payload.node_id,
-            r.remote_capabilities.flags,
-        );
-    }
-    // Cache the peer's ML-KEM-768 encapsulation key.  Enforce
-    // `MAX_PEER_MLKEM_CACHE` hard-cap with oldest-entry LRU eviction to
-    // prevent unbounded growth under peer-churn flood (TTL-only eviction
-    // could let the map reach ~12 MiB with a 1-hour TTL).
-    if let Some(ref ek) = r.remote_identity_payload.mlkem_pubkey {
-        let mut cache = wlock!(runtime.identity.peer_mlkem_keys);
-        if cache.len() >= veil_proto::budget::MAX_PEER_MLKEM_CACHE
-            && let Some(oldest) = cache
-                .iter()
-                .min_by_key(|(_, (_, ts))| *ts)
-                .map(|(id, _)| *id)
-        {
-            cache.remove(&oldest);
-        }
-        cache.insert(
-            r.remote_identity_payload.node_id,
-            (ek.clone(), std::time::Instant::now()),
-        );
-    }
-    // Update peer battery level from ATTACH TLV.
-    if let Some(bat) = r.remote_battery {
-        lock!(runtime.rtt_table).update_battery(r.remote_identity_payload.node_id, bat);
-    }
-    // Store the peer's Vivaldi coordinate for RTT-aware routing.  Reject
-    // non-finite coordinates — a malicious peer could send NaN/∞ to poison
-    // the local Vivaldi estimate and corrupt routing.
-    if let Some((vx, vy, vh)) = r.remote_vivaldi {
-        if vx.is_finite() && vy.is_finite() && vh.is_finite() && vh >= 0.0 {
-            let now = std::time::Instant::now();
-            let mut viv = wlock!(runtime.dispatcher.peer_vivaldi);
-            // LRU eviction of the oldest-used entry.
-            if viv.len() >= veil_proto::budget::MAX_PEER_VIVALDI_CACHE
-                && let Some(evict_key) = viv
-                    .iter()
-                    .min_by_key(|(_, (_, last_used))| *last_used)
-                    .map(|(k, _)| *k)
+}
+
+impl PendingPeerState {
+    /// Publish the per-peer caches (sovereign binding, pubkey, role bits,
+    /// cap-flags, ML-KEM EK, battery, Vivaldi, hot-standby alt URI,
+    /// membership cert) and hand back the [`veil_session::SessionEntry`]
+    /// for the caller to register.
+    ///
+    /// **Call this only once every admission gate has passed.** Taking
+    /// `self` by value is the enforcement: a reject path cannot have
+    /// committed, because committing consumes the value it would have had
+    /// to drop.
+    ///
+    /// The `SessionEntry` is returned rather than inserted so the caller
+    /// keeps `session_registry` in its own critical section — see the
+    /// lock-order note in [`prepare_peer_handshake_state`], and audit
+    /// cycle-9 CRIT-6 for why the insert is post-admission at all.
+    #[must_use]
+    pub fn commit(self, runtime: &SessionRuntimeContext) -> veil_session::SessionEntry {
+        let peer_id = self.entry.remote_node_id;
+        // Publish the sovereign binding learned by a full handshake, so a
+        // later resumption can key the peer by it.
+        if let Some(v) = self.sovereign_to_cache {
+            use veil_proto::budget::MAX_PEER_SOVEREIGN_IDENTITIES;
+            let mut sovereign_g = lock!(runtime.identity.peer_sovereign_identities);
+            // Cap unbounded HashMap growth. Random eviction (HashMap iter
+            // is non-deterministic) is acceptable here — cache hit/miss
+            // only affects the resumption fast-path; missed entries
+            // trigger a full handshake.
+            if sovereign_g.len() >= MAX_PEER_SOVEREIGN_IDENTITIES
+                && !sovereign_g.contains_key(&peer_id)
+                && let Some(k) = sovereign_g.keys().next().copied()
             {
-                viv.remove(&evict_key);
+                sovereign_g.remove(&k);
             }
-            viv.insert(
-                r.remote_identity_payload.node_id,
+            sovereign_g.insert(peer_id, v);
+        }
+        // Cache the peer's raw public key for signature verification.  Skip
+        // if public_key is empty — this happens during session resumption
+        // (fast-path reconnect via ticket) where the synthetic IdentityPayload
+        // has no key.  Overwriting with empty would break routing-sig verify.
+        if !self.entry.remote_identity.public_key.is_empty() {
+            lock!(runtime.identity.peer_pubkeys).insert_lru(
+                peer_id,
                 (
-                    VivaldiCoord {
-                        x: vx,
-                        y: vy,
-                        height: vh,
-                        error: 1.0,
-                    },
-                    now,
+                    self.entry.remote_identity.algo,
+                    self.entry.remote_identity.public_key.clone(),
+                ),
+                veil_proto::budget::MAX_PEER_PUBKEYS_CACHE,
+            );
+        }
+        // Cache peer's role bits.
+        lock!(runtime.identity.peer_roles).insert_lru(
+            peer_id,
+            self.entry.remote_capabilities.roles_supported,
+            veil_proto::budget::MAX_PEER_PUBKEYS_CACHE,
+        );
+        // Cache peer capability flags for relay filtering.
+        {
+            let mut flags_cache = runtime
+                .dispatcher
+                .crypto
+                .peer_cap_flags
+                .write()
+                .unwrap_or_else(|p| p.into_inner());
+            // Only evict when inserting a NEW peer (matches the sibling caches), so
+            // an existing peer re-handshaking can't churn out a different live
+            // peer's flags.
+            if flags_cache.len() >= veil_proto::budget::MAX_PEER_PUBKEYS_CACHE
+                && !flags_cache.contains_key(&peer_id)
+                && let Some(evict_key) = flags_cache.keys().next().copied()
+            {
+                flags_cache.remove(&evict_key);
+            }
+            flags_cache.insert(peer_id, self.entry.remote_capabilities.flags);
+        }
+        // Cache the peer's ML-KEM-768 encapsulation key.  Enforce
+        // `MAX_PEER_MLKEM_CACHE` hard-cap with oldest-entry LRU eviction to
+        // prevent unbounded growth under peer-churn flood (TTL-only eviction
+        // could let the map reach ~12 MiB with a 1-hour TTL).
+        if let Some(ref ek) = self.entry.remote_identity.mlkem_pubkey {
+            let mut cache = wlock!(runtime.identity.peer_mlkem_keys);
+            if cache.len() >= veil_proto::budget::MAX_PEER_MLKEM_CACHE
+                && let Some(oldest) = cache
+                    .iter()
+                    .min_by_key(|(_, (_, ts))| *ts)
+                    .map(|(id, _)| *id)
+            {
+                cache.remove(&oldest);
+            }
+            cache.insert(peer_id, (ek.clone(), std::time::Instant::now()));
+        }
+        // Update peer battery level from ATTACH TLV.
+        if let Some(bat) = self.battery {
+            lock!(runtime.rtt_table).update_battery(peer_id, bat);
+        }
+        // Store the peer's Vivaldi coordinate for RTT-aware routing.  Reject
+        // non-finite coordinates — a malicious peer could send NaN/∞ to poison
+        // the local Vivaldi estimate and corrupt routing.
+        if let Some((vx, vy, vh)) = self.vivaldi {
+            if vx.is_finite() && vy.is_finite() && vh.is_finite() && vh >= 0.0 {
+                let now = std::time::Instant::now();
+                let mut viv = wlock!(runtime.dispatcher.peer_vivaldi);
+                // LRU eviction of the oldest-used entry.
+                if viv.len() >= veil_proto::budget::MAX_PEER_VIVALDI_CACHE
+                    && let Some(evict_key) = viv
+                        .iter()
+                        .min_by_key(|(_, (_, last_used))| *last_used)
+                        .map(|(k, _)| *k)
+                {
+                    viv.remove(&evict_key);
+                }
+                viv.insert(
+                    peer_id,
+                    (
+                        VivaldiCoord {
+                            x: vx,
+                            y: vy,
+                            height: vh,
+                            error: 1.0,
+                        },
+                        now,
+                    ),
+                );
+            } else {
+                log::warn!(
+                    "peer {} sent non-finite Vivaldi coord ({vx}, {vy}, {vh}) — ignored",
+                    veil_util::hex_short(&peer_id),
+                );
+            }
+        }
+        // Hot-standby: record an auto-discovered alt URI from the peer's
+        // advertised-transports AttachPayload TLV.  Only used by `alt_uri_for`
+        // when no operator-configured alt_uri exists — explicit config always
+        // wins.
+        if !self.advertised_transports.is_empty()
+            && let Some(picked) = runtime.handoff.controller.auto_set_alt_uri_from_transports(
+                peer_id.into(),
+                &self.advertised_transports,
+                &self.primary_uri,
+            )
+        {
+            runtime.logger.debug(
+                "session.hot_standby.alt_uri_auto_discovered",
+                format!(
+                    "peer={} picked={picked} primary_uri={}",
+                    veil_util::hex_short(&peer_id),
+                    self.primary_uri,
                 ),
             );
-        } else {
-            log::warn!(
-                "peer {} sent non-finite Vivaldi coord ({vx}, {vy}, {vh}) — ignored",
-                veil_util::hex_short(&r.remote_identity_payload.node_id),
+        }
+        // S2.A part 3: stash the verified MembershipCert (if any) so
+        // PnetStatusProvider can surface it to IPC consumers (ogate / oproxy).
+        // Hard-cap with arbitrary eviction (matching the sibling peer caches
+        // above) so the map can't grow unbounded across the process lifetime —
+        // it was previously never reclaimed, a slow leak on long-lived P-Net
+        // relays. Best-effort status: evicting a still-live peer only drops it
+        // from IPC status until its next handshake re-populates the entry.
+        if let Some(cert) = self.membership_cert
+            && let Ok(mut g) = runtime.verified_peer_certs.write()
+        {
+            if g.len() >= veil_proto::budget::MAX_VERIFIED_PEER_CERTS
+                && !g.contains_key(&peer_id)
+                && let Some(evict) = g.keys().next().copied()
+            {
+                g.remove(&evict);
+            }
+            g.insert(peer_id, cert);
+        }
+        // S3: surface the remote-side's observation of our public address
+        // (STUN-style auto-IP-discovery).  Logged at info so operators
+        // running behind NAT can copy-paste this into their `advertise = "..."`
+        // config without external STUN.  `None` ⇒ peer is legacy / didn't
+        // emit the TLV.
+        if let Some(addr) = self.observed_addr {
+            runtime.logger.info(
+                "session.observed_addr",
+                format!(
+                    "peer={} reported our public address as {addr}",
+                    veil_util::hex_short(&peer_id),
+                ),
             );
         }
-    }
-    // Hot-standby: record an auto-discovered alt URI from the peer's
-    // advertised-transports AttachPayload TLV.  Only used by `alt_uri_for`
-    // when no operator-configured alt_uri exists — explicit config always
-    // wins.
-    if !r.remote_advertised_transports.is_empty()
-        && let Some(picked) = runtime.handoff.controller.auto_set_alt_uri_from_transports(
-            r.remote_identity_payload.node_id.into(),
-            &r.remote_advertised_transports,
-            primary_uri,
-        )
-    {
-        runtime.logger.debug(
-            "session.hot_standby.alt_uri_auto_discovered",
-            format!(
-                "peer={} picked={picked} primary_uri={primary_uri}",
-                veil_util::hex_short(&r.remote_identity_payload.node_id),
-            ),
-        );
-    }
-    // S2.A part 3: stash the verified MembershipCert (if any) so
-    // PnetStatusProvider can surface it to IPC consumers (ogate / oproxy).
-    // Hard-cap with arbitrary eviction (matching the sibling peer caches
-    // above) so the map can't grow unbounded across the process lifetime —
-    // it was previously never reclaimed, a slow leak on long-lived P-Net
-    // relays. Best-effort status: evicting a still-live peer only drops it
-    // from IPC status until its next handshake re-populates the entry.
-    if let Some(cert) = &r.verified_membership_cert
-        && let Ok(mut g) = runtime.verified_peer_certs.write()
-    {
-        if g.len() >= veil_proto::budget::MAX_VERIFIED_PEER_CERTS
-            && !g.contains_key(&peer_id)
-            && let Some(evict) = g.keys().next().copied()
-        {
-            g.remove(&evict);
-        }
-        g.insert(peer_id, cert.clone());
-    }
-    // S3: surface the remote-side's observation of our public address
-    // (STUN-style auto-IP-discovery).  Logged at info so operators
-    // running behind NAT can copy-paste this into their `advertise = "..."`
-    // config without external STUN.  `None` ⇒ peer is legacy / didn't
-    // emit the TLV.
-    if let Some(addr) = r.remote_observed_addr {
-        runtime.logger.info(
-            "session.observed_addr",
-            format!(
-                "peer={} reported our public address as {addr}",
-                veil_util::hex_short(&r.remote_identity_payload.node_id),
-            ),
-        );
-    }
 
-    // Built here, inserted by the caller only after the accept gates pass.
-    veil_session::SessionEntry {
-        session_id: r.session_keys.session_id,
-        remote_node_id: peer_id,
-        remote_identity: r.remote_identity_payload.clone(),
-        remote_capabilities: r.remote_capabilities.clone(),
-        remote_attach: r.remote_attach.clone(),
-        remote_role: r.remote_role,
-        validated_sovereign_identity: validated,
+        self.entry
     }
 }
 
@@ -418,12 +478,10 @@ pub async fn register_connection_session(
         }
     }
 
-    // `pending_session_entry` is built during the handshake but inserted into
-    // `session_registry` only after the accept gates pass (audit cycle-9 CRIT-6).
-    let (remote_identity, pending_session_entry): (
-        RemoteHandshakeInfo,
-        veil_session::SessionEntry,
-    ) = {
+    // `pending_peer_state` is derived during the handshake but published —
+    // per-peer caches and the `session_registry` entry alike — only after the
+    // accept gates pass (audit cycle-9 CRIT-6, and the caches likewise).
+    let (remote_identity, pending_peer_state): (RemoteHandshakeInfo, PendingPeerState) = {
         let role = runtime.dispatcher.role;
         let mlkem_ek_bytes: Vec<u8> = runtime.identity.mlkem_ek.as_ref().to_vec();
         let capture_tx = Arc::clone(&runtime.dispatcher.capture_tx);
@@ -631,7 +689,9 @@ pub async fn register_connection_session(
                         )));
                     }
                 }
-                let pending_session_entry = cache_peer_handshake_state(&runtime, &r, &transport);
+                // Derived only — nothing reaches a shared cache until
+                // `commit` below the accept gates.
+                let pending_peer_state = prepare_peer_handshake_state(&runtime, &r, &transport);
                 let remote_discovery_mode = r.remote_capabilities.parse_discovery_mode();
                 let mut udp_reflector_port = None;
                 let mut shared_udp_reflectors = Vec::with_capacity(4);
@@ -667,7 +727,7 @@ pub async fn register_connection_session(
                         udp_reflector_port,
                         shared_udp_reflectors,
                     },
-                    pending_session_entry,
+                    pending_peer_state,
                 )
             }
             Err(err) => {
@@ -1029,11 +1089,14 @@ pub async fn register_connection_session(
         )
     };
     // All accept gates (identity-mismatch / allowlist / banned / at-limit /
-    // dedup / over-cap) have passed — NOW register the session in
-    // `session_registry` (audit cycle-9 CRIT-6). The matching SessionGuard
-    // below removes it on session end; a reject path above this point simply
-    // drops `pending_session_entry` without ever inserting it.
-    lock!(runtime.session_registry).insert(pending_session_entry);
+    // dedup / over-cap) have passed — NOW publish everything this handshake
+    // learned about the peer, and register the session in `session_registry`
+    // (audit cycle-9 CRIT-6). Every reject path above this point drops
+    // `pending_peer_state` without committing, so a rejected peer leaves no
+    // trace in the per-peer caches and evicts nothing from them. The matching
+    // SessionGuard below removes the registry entry on session end.
+    let session_entry = pending_peer_state.commit(&runtime);
+    lock!(runtime.session_registry).insert(session_entry);
     runtime.logger.info(
         "session.open",
         format!(
