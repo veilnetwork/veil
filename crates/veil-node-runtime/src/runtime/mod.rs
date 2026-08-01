@@ -8718,61 +8718,47 @@ impl NodeServices {
     /// enqueue, and the typical wait is one relay round-trip (~40–100 ms).
     /// After 1 s proceed anyway (old behavior): the ACK may still land before
     /// the receiver answers, and a dead relay path shouldn't stall the send.
-    fn wait_reply_circuit_confirmed(&self, confirmed: &std::sync::atomic::AtomicBool) {
+    pub(crate) async fn wait_reply_circuit_confirmed(
+        &self,
+        confirmed: &std::sync::atomic::AtomicBool,
+    ) {
         const TIMEOUT_MS: u64 = 1_000;
         const POLL_MS: u64 = 10;
-        let wait = || {
-            let mut waited_ms = 0u64;
-            while !confirmed.load(std::sync::atomic::Ordering::Relaxed) && waited_ms < TIMEOUT_MS {
-                std::thread::sleep(std::time::Duration::from_millis(POLL_MS));
-                waited_ms += POLL_MS;
-            }
-        };
+
         // This wait runs ON a tokio worker: the async send path (IPC handler
-        // task) calls the sync sender inline. A plain thread::sleep PARKS that
-        // worker together with its task queue — and the inbound dispatch that
-        // would process the very CircuitBuilt ACK we are waiting for sits in
-        // that queue. Device-log evidence: only 15/1148 confirmations landed
-        // inside a wait window, while 791/938 landed within 200ms AFTER the
-        // timeout expired — i.e. the wait essentially NEVER succeeded, every
-        // reply-expecting send (chat message, mailbox FETCH) paid the full
-        // 1000ms, and the introduce still fired with an unregistered reply
-        // cookie (the exact race this wait exists to close; the receiver's
-        // delivery-ACK then died as cookie_unknown). block_in_place hands the
-        // worker's queue to other threads so the ACK is processed DURING the
-        // wait (~100-250ms typical) and the poll returns early — the race is
-        // actually closed now, and the 1s ceiling is the rare-case bound, not
-        // the common cost.
+        // task) reaches it inline. It used to be a blocking `thread::sleep`,
+        // which PARKS that worker together with its task queue — and the
+        // inbound dispatch that would process the very `CircuitBuilt` ACK we
+        // are waiting for sits in that queue. Device-log evidence: only
+        // 15/1148 confirmations landed inside a wait window, while 791/938
+        // landed within 200 ms AFTER the timeout expired. The wait essentially
+        // never succeeded, every reply-expecting send (chat message, mailbox
+        // FETCH) paid the full 1000 ms, and the introduce still fired with an
+        // unregistered reply cookie — the exact race this wait exists to
+        // close.
         //
-        // Off a runtime entirely (the FFI admin client, a plain thread) the
-        // sleep is harmless: the ACK is dispatched by another thread and
-        // arrives while we sleep.
+        // `block_in_place` fixed that on multi-thread runtimes by handing the
+        // worker's queue to another thread, but it PANICS on a current-thread
+        // runtime, so that flavour was left skipping the wait entirely and
+        // keeping the race open. Awaiting instead of blocking works on every
+        // flavour: each poll yields, the dispatch task runs, the ACK lands and
+        // the loop returns early — typically one relay round-trip (~40-100 ms).
         //
-        // ON a CURRENT-THREAD runtime it is worse than useless. There is one
-        // worker; sleeping on it parks the executor, and with it the inbound
-        // dispatch that would deliver the very ACK being waited for. The wait
-        // cannot succeed by construction, and costs the whole runtime a full
-        // second of frozen networking to fail. Returning immediately loses
-        // nothing — the confirmation could not have arrived in that window —
-        // and keeps the executor live so the ACK lands as soon as it can. The
-        // unregistered-cookie race stays open on that flavour exactly as it
-        // already was; closing it there needs this wait to be awaited rather
-        // than blocked, which needs an async caller path.
-        //
-        // An unrecognised future flavour takes the same non-blocking path:
-        // blocking is only known-safe where the executor is known to survive
-        // it.
-        match tokio::runtime::Handle::try_current().map(|h| h.runtime_flavor()) {
-            Ok(tokio::runtime::RuntimeFlavor::MultiThread) => tokio::task::block_in_place(wait),
-            Ok(_) => {
-                self.logger.debug(
-                    "anonymity.reply_circuit.wait_skipped",
-                    "current-thread runtime: blocking here would park the only worker and \
-                     with it the dispatch that delivers the ACK — proceeding unconfirmed",
-                );
-                return;
+        // Polling rather than a `Notify`: the confirmation flag lives on
+        // `OriginCircuit` in `veil-anonymity`, where tokio is only a
+        // dev-dependency. An event-driven wake would promote tokio to a
+        // library dependency of a crate deliberately kept to crypto + codec
+        // deps, to save ~5 ms and ≤100 timer wakeups on a user-message-rate
+        // path. The polling loop keeps that crate lean; revisit if the flag
+        // ever moves somewhere that already has tokio.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(TIMEOUT_MS);
+        while !confirmed.load(std::sync::atomic::Ordering::Relaxed) {
+            let now = tokio::time::Instant::now();
+            if now >= deadline {
+                break;
             }
-            Err(_) => wait(),
+            let step = std::time::Duration::from_millis(POLL_MS).min(deadline - now);
+            tokio::time::sleep(step).await;
         }
         if !confirmed.load(std::sync::atomic::Ordering::Relaxed) {
             self.logger.info(
@@ -9300,7 +9286,7 @@ impl NodeServices {
     /// introduces (`AuthDeliverFragment`); the recipient reassembles + verifies
     /// once. Requires a loaded sovereign identity. One-way (sender → recipient).
     #[allow(clippy::too_many_arguments)]
-    pub fn send_via_rendezvous_authenticated(
+    pub async fn send_via_rendezvous_authenticated(
         &self,
         ad: &veil_anonymity::rendezvous::RendezvousAd,
         // Additional DISTINCT-relay ads for the SAME recipient (it registered on
@@ -9528,7 +9514,7 @@ impl NodeServices {
                         have: 0,
                     },
                 )?;
-            self.wait_reply_circuit_confirmed(&confirmed);
+            self.wait_reply_circuit_confirmed(&confirmed).await;
         }
 
         let mut msg_id = [0u8; 16];
@@ -9597,7 +9583,7 @@ impl NodeServices {
     /// FETCH `data` is empty, so the signed `AuthAppDeliver` is a single onion
     /// cell — no fragmentation loop (unlike the rendezvous path).
     #[allow(clippy::too_many_arguments)]
-    pub fn send_anonymous_authenticated_direct_with_reply(
+    pub async fn send_anonymous_authenticated_direct_with_reply(
         &self,
         target_node_id: [u8; 32],
         target_x25519_pk: [u8; 32],
@@ -9718,7 +9704,7 @@ impl NodeServices {
                         have: 0,
                     }
                 })?;
-            self.wait_reply_circuit_confirmed(&confirmed);
+            self.wait_reply_circuit_confirmed(&confirmed).await;
         }
 
         let mut payload_bytes = Vec::with_capacity(1 + auth_bytes.len());
@@ -9973,6 +9959,7 @@ impl NodeServices {
             1,     // forward sends: no redundancy (the recipient is reachable via its ad)
             false, // by-node_id: recipient may be session-backed → keep real id (L3)
         )
+        .await
         .map_err(|e| match e {
             veil_anonymity::sender::SenderError::MissingSenderIdentity => {
                 AnonOnionSendError::NoIdentity
@@ -10046,6 +10033,7 @@ impl NodeServices {
             1,
             true, // by-identity → circuit-backed: pseudo cleartext receiver id (L3)
         )
+        .await
         .map_err(map_sender_err)
     }
 
@@ -10908,6 +10896,7 @@ impl NodeServices {
             REPLY_SEND_REDUNDANCY,
             true, // reply goes over the original sender's circuit-backed cookie (L3)
         )
+        .await
         .map_err(|e| match e {
             veil_anonymity::sender::SenderError::MissingSenderIdentity => {
                 AnonOnionSendError::NoIdentity
