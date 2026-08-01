@@ -78,6 +78,10 @@ pub enum MlKemKeySource {
     /// No persisted key and no usable identity seed — a fresh random key was
     /// generated and persisted (legacy / identity-less seed daemons).
     FallbackRandom,
+    /// The node is booting under a placeholder identity: a random key held in
+    /// memory only, never written and never derived from the placeholder. It is
+    /// replaced outright when the real identity is applied.
+    EphemeralStub,
 }
 
 impl MlKemKeySource {
@@ -86,6 +90,7 @@ impl MlKemKeySource {
             Self::Persisted => "persisted",
             Self::IdentityDerived => "identity_derived",
             Self::FallbackRandom => "fallback_random",
+            Self::EphemeralStub => "ephemeral_stub",
         }
     }
 }
@@ -112,7 +117,17 @@ pub fn load_or_derive(
     veil_dir: &Path,
     passphrase: Option<&str>,
     epoch: u64,
+    ephemeral_identity: bool,
 ) -> Result<([u8; EK_BYTES], [u8; DK_SEED_BYTES], MlKemKeySource), NodeError> {
+    // 0. Placeholder identity: a random in-memory key, persisted NOWHERE.
+    //    Not derived, because the placeholder is a compiled-in constant; and not
+    //    written, because a file here would win branch 1 forever — the node
+    //    would keep this throwaway key after its real identity arrived, publish
+    //    it under that identity, and derive a DIFFERENT key on the next restart.
+    if ephemeral_identity {
+        let (ek, dk) = veil_e2e::generate_keypair();
+        return Ok((ek, dk, MlKemKeySource::EphemeralStub));
+    }
     // 1. An existing persisted key wins — never rotate a node that already has one.
     if mlkem_key_path.exists() {
         let (ek, dk) = load_or_generate_mlkem_key_encrypted(mlkem_key_path, passphrase)
@@ -163,7 +178,7 @@ mod tests {
         // Also drop an identity seed so the derive branch WOULD be eligible.
         save_seed(tmp.path(), 0x11);
 
-        let (ek, _dk, src) = load_or_derive(&key_path, tmp.path(), None, 0).unwrap();
+        let (ek, _dk, src) = load_or_derive(&key_path, tmp.path(), None, 0, false).unwrap();
         assert_eq!(src, MlKemKeySource::Persisted);
         assert_eq!(
             ek, ek_file,
@@ -180,7 +195,7 @@ mod tests {
         let key_path = tmp.path().join("mlkem.key");
         save_seed(tmp.path(), 0x22);
 
-        let (ek, dk, src) = load_or_derive(&key_path, tmp.path(), None, 0).unwrap();
+        let (ek, dk, src) = load_or_derive(&key_path, tmp.path(), None, 0, false).unwrap();
         assert_eq!(src, MlKemKeySource::IdentityDerived);
         // Matches the standalone derive helpers.
         let want_seed = derive_mlkem_dk_seed_epoch(&[0x22u8; 32], 0);
@@ -195,7 +210,7 @@ mod tests {
         let tmp2 = tempfile::tempdir().unwrap();
         save_seed(tmp2.path(), 0x22);
         let (ek2, _dk2, _src2) =
-            load_or_derive(&tmp2.path().join("mlkem.key"), tmp2.path(), None, 0).unwrap();
+            load_or_derive(&tmp2.path().join("mlkem.key"), tmp2.path(), None, 0, false).unwrap();
         assert_eq!(
             ek, ek2,
             "same identity seed across sessions must give the same EK"
@@ -209,8 +224,10 @@ mod tests {
         let b = tempfile::tempdir().unwrap();
         save_seed(a.path(), 0x01);
         save_seed(b.path(), 0x02);
-        let (ek_a, _, _) = load_or_derive(&a.path().join("mlkem.key"), a.path(), None, 0).unwrap();
-        let (ek_b, _, _) = load_or_derive(&b.path().join("mlkem.key"), b.path(), None, 0).unwrap();
+        let (ek_a, _, _) =
+            load_or_derive(&a.path().join("mlkem.key"), a.path(), None, 0, false).unwrap();
+        let (ek_b, _, _) =
+            load_or_derive(&b.path().join("mlkem.key"), b.path(), None, 0, false).unwrap();
         assert_ne!(ek_a, ek_b);
     }
 
@@ -233,6 +250,37 @@ mod tests {
             want,
             "the overlap must equal mailbox retention + peer EK cache + republish lag"
         );
+    }
+
+    /// A placeholder identity yields a key that is neither derived from it nor
+    /// written anywhere.
+    ///
+    /// Both halves matter. DERIVING would make this node's mailbox key a pure
+    /// function of a constant compiled into the binary. WRITING would let the
+    /// persisted-key branch win at the next resolve, so the node would keep the
+    /// throwaway key after its real identity arrived — publishing it under that
+    /// identity and deriving a different one on the next restart.
+    #[test]
+    fn a_placeholder_identity_neither_derives_nor_persists() {
+        let tmp = tempfile::tempdir().unwrap();
+        let key_path = tmp.path().join("mlkem.key");
+        save_seed(tmp.path(), 0x99);
+
+        let (ek, _dk, src) = load_or_derive(&key_path, tmp.path(), None, 0, true).unwrap();
+        assert_eq!(src, MlKemKeySource::EphemeralStub);
+        assert!(
+            !key_path.exists(),
+            "a placeholder must leave nothing on disk"
+        );
+
+        // NOT the key the seed on disk would derive — even though that seed is
+        // sitting right there and the non-ephemeral path would use it.
+        let (derived_ek, _) = derive_for_epoch(&key_path, tmp.path(), 0).unwrap();
+        assert_ne!(ek, derived_ek);
+
+        // And random per call, so two deferred nodes never share one.
+        let (ek2, _, _) = load_or_derive(&key_path, tmp.path(), None, 0, true).unwrap();
+        assert_ne!(ek, ek2);
     }
 
     /// Rotation off pins epoch 0, and epoch 0 is the pre-rotation key — so
@@ -265,7 +313,7 @@ mod tests {
             "a persisted key must not be rotated out from under its published cert"
         );
         // The same node's startup agrees — both go through one branch.
-        let (_ek, _dk, src) = load_or_derive(&key_path, tmp.path(), None, 5).unwrap();
+        let (_ek, _dk, src) = load_or_derive(&key_path, tmp.path(), None, 5, false).unwrap();
         assert_eq!(src, MlKemKeySource::Persisted);
     }
 
@@ -283,7 +331,8 @@ mod tests {
         assert_ne!(ek0, ek5, "an epoch step must actually change the key");
 
         // Restart inside epoch 5: startup derives the key already published.
-        let (ek_restart, dk_restart, src) = load_or_derive(&key_path, tmp.path(), None, 5).unwrap();
+        let (ek_restart, dk_restart, src) =
+            load_or_derive(&key_path, tmp.path(), None, 5, false).unwrap();
         assert_eq!(src, MlKemKeySource::IdentityDerived);
         assert_eq!(ek_restart, ek5);
         assert_eq!(dk_restart, dk5);
@@ -297,7 +346,7 @@ mod tests {
     fn fallback_random_when_no_identity() {
         let tmp = tempfile::tempdir().unwrap();
         let key_path = tmp.path().join("mlkem.key");
-        let (_ek, _dk, src) = load_or_derive(&key_path, tmp.path(), None, 0).unwrap();
+        let (_ek, _dk, src) = load_or_derive(&key_path, tmp.path(), None, 0, false).unwrap();
         assert_eq!(src, MlKemKeySource::FallbackRandom);
         assert!(key_path.exists(), "fallback must persist the random key");
     }

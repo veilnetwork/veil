@@ -446,13 +446,45 @@ impl NodeRuntime {
         if let Some(sov) = new_sovereign {
             sovereign_cell.set(sov);
         }
+
+        // ── Identity-bound receive keys must not outlive the identity ──────
+        //
+        // The deferred boot runs under a placeholder `[identity]`, so the
+        // ML-KEM mailbox keypair and the anonymity X25519 keypair it resolved
+        // belong to a node that is about to stop existing. Cloning them forward
+        // — which is what this did — published their PUBLIC halves under the
+        // REAL identity while their private halves stayed bound to the
+        // placeholder. Two things go wrong with that, and only one is obvious:
+        //
+        //  * confidentiality — a placeholder derived from a compiled-in
+        //    constant makes those private keys derivable by anyone with the
+        //    source (that path is closed separately, at the resolve site);
+        //  * delivery — the promotion writes the REAL key to
+        //    `device_identity_sk.bin`, so the NEXT start derives a different
+        //    keypair than the one this session published. Every blob a peer
+        //    sealed in between stops opening after a restart. That is the
+        //    store-and-forward black hole the identity-derived scheme exists
+        //    to prevent, reintroduced by the clone.
+        //
+        // So when the identity actually changes, re-derive. The order matters:
+        // this runs AFTER `sovereign_cell.set`, because the standalone build
+        // above is what writes the new `device_identity_sk.bin` these derive
+        // from. An ordinary reload (same identity) still clones, which is what
+        // keeps already-published directory entries valid.
+        let identity_changed = new_local_identity.node_id != self.identity.local_identity.node_id;
+        let (promoted_mlkem, promoted_anonymity) = if identity_changed {
+            self.rederive_identity_bound_keys(&config)
+        } else {
+            (None, None)
+        };
+
         self.identity = Arc::new(super::identity_state::IdentityState::new(
             new_local_identity,
             sovereign_cell,
             Arc::clone(&self.identity.peer_pubkeys),
             Arc::clone(&self.identity.peer_sovereign_identities),
             Arc::clone(&self.identity.peer_roles),
-            Arc::clone(&self.identity.mlkem_keys),
+            promoted_mlkem.unwrap_or_else(|| Arc::clone(&self.identity.mlkem_keys)),
             Arc::clone(&self.identity.peer_mlkem_keys),
             Arc::clone(&self.identity.peer_mlkem_certs),
             Arc::clone(&self.identity.per_session_mlkem_dk),
@@ -671,8 +703,13 @@ impl NodeRuntime {
         };
         // Rebuild the dispatcher to pick up the new service Arcs.
         let reload_node_id = *self.identity.local_identity.node_id.as_bytes();
-        self.dispatcher =
-            Arc::new(self.build_reload_dispatcher(&config, role, reload_node_id, pex_event_tx));
+        self.dispatcher = Arc::new(self.build_reload_dispatcher(
+            &config,
+            role,
+            reload_node_id,
+            pex_event_tx,
+            promoted_anonymity,
+        ));
         {
             let mut state = self.lock_state();
             let started_at = state.started_at;
@@ -806,6 +843,41 @@ impl NodeRuntime {
     /// (routing limits, thresholds, etc.) is read out of `config`; per-reload
     /// singletons (route-seen set, announce seq, discovery forwarder, PoW
     /// challenge limiter) are built fresh here.
+    /// Re-derive the two identity-bound receive keypairs for a CHANGED identity.
+    ///
+    /// Returns `(mlkem_ring, anonymity_x25519)`, each `None` only when the
+    /// existing value is already correct to keep.
+    ///
+    /// When the new identity has an Ed25519 seed on disk, both come out of it —
+    /// byte-identical to what the next cold start will derive, which is the
+    /// whole point. When it does not (a Falcon node, or a persisted operator
+    /// `mlkem.key` that must never be rotated out from under its published
+    /// cert), the fallback is deliberately asymmetric:
+    ///
+    ///  * a persisted `mlkem.key` is KEPT — it is this node's real long-term
+    ///    key, not a placeholder's, and replacing it would invalidate the cert
+    ///    peers already resolved;
+    ///  * anything else is replaced with a FRESH RANDOM key rather than kept.
+    ///    Churning a key costs reachability until the next republish; keeping
+    ///    one bound to the previous identity costs confidentiality, and that is
+    ///    not a trade worth making silently.
+    fn rederive_identity_bound_keys(
+        &self,
+        config: &veil_cfg::Config,
+    ) -> (
+        Option<Arc<veil_e2e::MlKemSeedRing>>,
+        Option<Arc<x25519_dalek::StaticSecret>>,
+    ) {
+        rederive_identity_bound_keys(
+            self.config_path
+                .parent()
+                .unwrap_or(std::path::Path::new(".")),
+            config.global.mlkem_rotation_secs,
+            self.dispatcher.anonymity_x25519_sk.is_some(),
+            &self.logger,
+        )
+    }
+
     pub fn build_reload_dispatcher(
         &self,
         config: &veil_cfg::Config,
@@ -816,6 +888,10 @@ impl NodeRuntime {
         // respawned initiator (which holds the new receiver) actually receives
         // inbound PEX events after a reload.
         pex_event_tx: Option<tokio::sync::mpsc::Sender<veil_pex::PexEvent>>,
+        // `Some` only when the identity CHANGED and the key was re-derived for
+        // it; `None` means "keep what the previous dispatcher held", which is
+        // the ordinary-reload case that must not rotate a published key.
+        promoted_anonymity_sk: Option<Arc<x25519_dalek::StaticSecret>>,
     ) -> FrameDispatcher {
         let reload_signing_key = load_signing_key(config);
         let reload_listen_transports =
@@ -992,11 +1068,16 @@ impl NodeRuntime {
                 )
             }),
             pex_state: self.dispatcher.pex_state.as_ref().map(Arc::clone),
-            // reload preserves the same anonymity SK so
+            // An ordinary reload preserves the same anonymity SK so
             // already-published directory entries (which advertise this
-            // pubkey) keep working through the reload. An operator who
-            // wants a fresh SK should do a full restart, not a reload.
-            anonymity_x25519_sk: self.dispatcher.anonymity_x25519_sk.clone(),
+            // pubkey) keep working through it. An operator who wants a fresh
+            // SK should do a full restart, not a reload.
+            //
+            // A reload that CHANGES the identity is not ordinary: keeping the
+            // key would advertise a pubkey whose secret belongs to the previous
+            // identity. `promoted_anonymity_sk` carries the re-derived one.
+            anonymity_x25519_sk: promoted_anonymity_sk
+                .or_else(|| self.dispatcher.anonymity_x25519_sk.clone()),
             anonymity_relay_capable: self.dispatcher.anonymity_relay_capable,
             // reload preserves the Introduce
             // replay cache so reload doesn't open a window in which
@@ -1071,5 +1152,187 @@ impl NodeRuntime {
         // persist master switch used by readers across the
         // runtime (previously only refreshed inside restart_persist_tasks).
         self.persist_enabled = config.persist_enabled;
+    }
+}
+
+/// Free-function core of [`NodeRuntime::rederive_identity_bound_keys`].
+///
+/// Takes what it needs rather than `&self` so the promotion invariant — a
+/// changed identity never keeps the previous one's receive keys — is reachable
+/// from a test without standing up a whole runtime.
+pub(crate) fn rederive_identity_bound_keys(
+    veil_dir: &std::path::Path,
+    mlkem_rotation_secs: u64,
+    wants_anonymity_key: bool,
+    logger: &Arc<veil_observability::NodeLogger>,
+) -> (
+    Option<Arc<veil_e2e::MlKemSeedRing>>,
+    Option<Arc<x25519_dalek::StaticSecret>>,
+) {
+    let mlkem_key_path = veil_dir.join("mlkem.key");
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let epoch = crate::identity_local::mlkem_dk::rotation_epoch(now, mlkem_rotation_secs);
+
+    // ── ML-KEM ─────────────────────────────────────────────────────────
+    let mlkem = if mlkem_key_path.exists() {
+        logger.info(
+            "node.mlkem_dk.promotion_kept_persisted",
+            "identity changed but a persisted mlkem.key is this node's real \
+             long-term key — keeping it rather than rotating out from under \
+             its published cert",
+        );
+        None
+    } else {
+        match crate::identity_local::mlkem_dk::derive_for_epoch(&mlkem_key_path, veil_dir, epoch) {
+            Some((ek, dk)) => {
+                logger.info(
+                    "node.mlkem_dk.promotion_rederived",
+                    format!("mailbox keypair re-derived for the applied identity at epoch {epoch}"),
+                );
+                Some(Arc::new(veil_e2e::MlKemSeedRing::new(epoch, dk, ek)))
+            }
+            None => {
+                // No Ed25519 seed for the new identity. A random key at
+                // least is not the previous identity's.
+                let (ek, dk) = veil_e2e::generate_keypair();
+                logger.warn(
+                    "node.mlkem_dk.promotion_random",
+                    "identity changed but the new one has no Ed25519 seed to derive \
+                     from — minted a random mailbox keypair. It will NOT survive a \
+                     restart; expect store-and-forward mail sealed to it to fail \
+                     after one.",
+                );
+                Some(Arc::new(veil_e2e::MlKemSeedRing::new(epoch, dk, ek)))
+            }
+        }
+    };
+
+    // ── anonymity X25519 ───────────────────────────────────────────────
+    // Only relay/rendezvous-capable nodes hold one; leave `None` alone.
+    let anonymity = wants_anonymity_key.then(|| {
+        match veil_identity::sovereign_flow::load_identity_sk(veil_dir) {
+            Ok(seed) => {
+                logger.info(
+                    "node.anonymity_x25519.promotion_rederived",
+                    "anonymity keypair re-derived for the applied identity",
+                );
+                Arc::new(crate::identity_local::anonymity_x25519::derive_from_identity_seed(&seed))
+            }
+            Err(_) => {
+                logger.warn(
+                    "node.anonymity_x25519.promotion_random",
+                    "identity changed but the new one has no Ed25519 seed to derive \
+                     from — minted a random anonymity keypair rather than keeping the \
+                     previous identity's",
+                );
+                Arc::new(x25519_dalek::StaticSecret::random_from_rng(
+                    rand_core::OsRng,
+                ))
+            }
+        }
+    });
+
+    (mlkem, anonymity)
+}
+
+#[cfg(test)]
+mod promotion_tests {
+    use super::*;
+
+    fn logger() -> Arc<veil_observability::NodeLogger> {
+        Arc::new(veil_observability::NodeLogger::new_noop())
+    }
+
+    fn save_identity(dir: &std::path::Path, byte: u8) {
+        let seed = veil_util::sensitive_bytes::SensitiveBytesN::<32>::from_bytes([byte; 32]);
+        veil_identity::sovereign_flow::save_identity_sk(dir, &seed).unwrap();
+    }
+
+    /// Promotion re-derives both receive keys from the APPLIED identity, and the
+    /// result is byte-identical to what the next cold start will derive.
+    ///
+    /// The second half is the part that is easy to lose: a key that is merely
+    /// "not the placeholder's" still black-holes store-and-forward mail if it
+    /// does not match what a restart reproduces.
+    #[test]
+    fn promotion_derives_the_keys_a_restart_would_reproduce() {
+        let tmp = tempfile::tempdir().unwrap();
+        save_identity(tmp.path(), 0x51);
+
+        let (ring, anon) = rederive_identity_bound_keys(tmp.path(), 0, true, &logger());
+        let ring = ring.expect("a derivable identity must yield a mailbox keypair");
+        let anon = anon.expect("a relay-capable node must yield an anonymity key");
+
+        let (want_ek, want_dk) = crate::identity_local::mlkem_dk::derive_for_epoch(
+            &tmp.path().join("mlkem.key"),
+            tmp.path(),
+            0,
+        )
+        .expect("cold start derives the same way");
+        assert_eq!(ring.current_ek(), want_ek);
+        assert_eq!(*ring.current_seed(), want_dk);
+
+        let seed = veil_identity::sovereign_flow::load_identity_sk(tmp.path()).unwrap();
+        let want_anon = crate::identity_local::anonymity_x25519::derive_from_identity_seed(&seed);
+        assert_eq!(anon.to_bytes(), want_anon.to_bytes());
+    }
+
+    /// The promoted ring carries NO retired seeds.
+    ///
+    /// Retired seeds exist so mail sealed to a key we published still opens.
+    /// Nothing was ever legitimately sealed to the placeholder's key, and it is
+    /// derivable from a compiled-in constant — carrying it forward as a decrypt
+    /// candidate would let anyone who knows that constant have their ciphertext
+    /// accepted under the real identity.
+    #[test]
+    fn the_promoted_ring_cannot_decrypt_anything_from_before() {
+        let tmp = tempfile::tempdir().unwrap();
+        save_identity(tmp.path(), 0x52);
+
+        let (ring, _) = rederive_identity_bound_keys(tmp.path(), 0, false, &logger());
+        let ring = ring.unwrap();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        assert_eq!(
+            ring.decrypt_seeds(now).len(),
+            1,
+            "only the applied identity's own seed may open anything"
+        );
+        assert_eq!(ring.retired_len(), 0);
+    }
+
+    /// An identity with no Ed25519 seed gets a RANDOM key, not the previous
+    /// identity's. `None` here would mean "keep what you had", which is the bug.
+    #[test]
+    fn an_underivable_identity_still_replaces_the_old_keys() {
+        let tmp = tempfile::tempdir().unwrap();
+        // No identity seed on disk at all.
+        let (ring, anon) = rederive_identity_bound_keys(tmp.path(), 0, true, &logger());
+        assert!(
+            ring.is_some(),
+            "must mint a fresh key rather than keep the previous identity's"
+        );
+        assert!(anon.is_some());
+        // Two calls must differ — proving it is random, not some fixed fallback.
+        let (ring2, _) = rederive_identity_bound_keys(tmp.path(), 0, true, &logger());
+        assert_ne!(ring.unwrap().current_ek(), ring2.unwrap().current_ek());
+    }
+
+    /// A persisted operator `mlkem.key` is this node's REAL long-term key, not a
+    /// placeholder's — it must survive, or its already-published cert breaks.
+    #[test]
+    fn a_persisted_operator_key_is_kept() {
+        let tmp = tempfile::tempdir().unwrap();
+        save_identity(tmp.path(), 0x53);
+        veil_e2e::load_or_generate_mlkem_key_encrypted(&tmp.path().join("mlkem.key"), None)
+            .unwrap();
+
+        let (ring, _) = rederive_identity_bound_keys(tmp.path(), 0, false, &logger());
+        assert!(ring.is_none(), "a persisted key must not be replaced");
     }
 }

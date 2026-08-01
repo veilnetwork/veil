@@ -119,6 +119,10 @@ pub enum AnonymityKeySource {
     /// No persisted key and no usable identity seed — a fresh random key was
     /// generated and persisted (legacy / identity-less seed daemons).
     FallbackRandom,
+    /// The node is booting under a placeholder identity: a random key held in
+    /// memory only, never written and never derived from the placeholder. It is
+    /// replaced outright when the real identity is applied.
+    EphemeralStub,
 }
 
 impl AnonymityKeySource {
@@ -127,6 +131,7 @@ impl AnonymityKeySource {
             Self::Persisted => "persisted",
             Self::IdentityDerived => "identity_derived",
             Self::FallbackRandom => "fallback_random",
+            Self::EphemeralStub => "ephemeral_stub",
         }
     }
 }
@@ -150,7 +155,19 @@ impl AnonymityKeySource {
 pub fn load_or_derive(
     veil_dir: &Path,
     sovereign_present: bool,
+    ephemeral_identity: bool,
 ) -> std::io::Result<(x25519_dalek::StaticSecret, AnonymityKeySource)> {
+    // 0. Placeholder identity: a random in-memory key, persisted NOWHERE — same
+    //    reasoning as the ML-KEM seed's ephemeral branch. Deriving it from the
+    //    placeholder would make this node's rendezvous receive key a published
+    //    constant; writing it would make branch 1 keep the throwaway key after
+    //    the real identity arrived.
+    if ephemeral_identity {
+        return Ok((
+            x25519_dalek::StaticSecret::random_from_rng(rand_core::OsRng),
+            AnonymityKeySource::EphemeralStub,
+        ));
+    }
     // 1. An existing persisted key wins — never rotate a node that already has one.
     if let Some(sk) = load(veil_dir)? {
         return Ok((sk, AnonymityKeySource::Persisted));
@@ -180,6 +197,32 @@ pub fn load_or_derive(
 mod tests {
     use super::*;
     use x25519_dalek::PublicKey;
+
+    /// Placeholder identity: neither derived from it nor written. Same reasoning
+    /// as the ML-KEM seed's — and here the stakes include the onion auth-cookie,
+    /// which derives from the SAME seed, so a shared placeholder would put every
+    /// deferred node on one relay cookie.
+    #[test]
+    fn a_placeholder_identity_neither_derives_nor_persists() {
+        let tmp = tempfile::tempdir().unwrap();
+        let seed = veil_util::sensitive_bytes::SensitiveBytesN::<32>::from_bytes([0x98u8; 32]);
+        veil_identity::sovereign_flow::save_identity_sk(tmp.path(), &seed).unwrap();
+
+        let (sk, src) = load_or_derive(tmp.path(), true, true).unwrap();
+        assert_eq!(src, AnonymityKeySource::EphemeralStub);
+        assert!(
+            load(tmp.path()).unwrap().is_none(),
+            "a placeholder must leave nothing on disk"
+        );
+        assert_ne!(
+            sk.to_bytes(),
+            derive_from_identity_seed(&seed).to_bytes(),
+            "must not derive from the placeholder even though a seed is right there"
+        );
+
+        let (sk2, _) = load_or_derive(tmp.path(), true, true).unwrap();
+        assert_ne!(sk.to_bytes(), sk2.to_bytes(), "random per boot");
+    }
 
     #[test]
     fn t1_4_p0_load_returns_none_when_file_absent() {
@@ -255,7 +298,7 @@ mod tests {
         let seed = veil_util::sensitive_bytes::SensitiveBytesN::<32>::from_bytes([0x11u8; 32]);
         veil_identity::sovereign_flow::save_identity_sk(tmp.path(), &seed).unwrap();
 
-        let (sk, src) = load_or_derive(tmp.path(), true).unwrap();
+        let (sk, src) = load_or_derive(tmp.path(), true, false).unwrap();
         assert_eq!(src, AnonymityKeySource::Persisted);
         assert_eq!(
             PublicKey::from(&sk).to_bytes(),
@@ -273,7 +316,7 @@ mod tests {
         let seed = veil_util::sensitive_bytes::SensitiveBytesN::<32>::from_bytes([0x22u8; 32]);
         veil_identity::sovereign_flow::save_identity_sk(tmp.path(), &seed).unwrap();
 
-        let (sk, src) = load_or_derive(tmp.path(), true).unwrap();
+        let (sk, src) = load_or_derive(tmp.path(), true, false).unwrap();
         assert_eq!(src, AnonymityKeySource::IdentityDerived);
         assert_eq!(
             PublicKey::from(&sk).to_bytes(),
@@ -288,7 +331,7 @@ mod tests {
         );
         let tmp2 = tempfile::tempdir().unwrap();
         veil_identity::sovereign_flow::save_identity_sk(tmp2.path(), &seed).unwrap();
-        let (sk2, _) = load_or_derive(tmp2.path(), true).unwrap();
+        let (sk2, _) = load_or_derive(tmp2.path(), true, false).unwrap();
         assert_eq!(
             PublicKey::from(&sk).to_bytes(),
             PublicKey::from(&sk2).to_bytes(),
@@ -301,7 +344,7 @@ mod tests {
     #[test]
     fn load_or_derive_falls_back_to_random_without_identity() {
         let tmp = tempfile::tempdir().unwrap();
-        let (_sk, src) = load_or_derive(tmp.path(), false).unwrap();
+        let (_sk, src) = load_or_derive(tmp.path(), false, false).unwrap();
         assert_eq!(src, AnonymityKeySource::FallbackRandom);
         assert!(
             key_path(tmp.path()).exists(),
