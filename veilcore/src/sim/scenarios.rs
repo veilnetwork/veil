@@ -7353,4 +7353,74 @@ mod tests {
 
         net.stop().await;
     }
+
+    /// P1-11: completing a handshake proves key ownership, not admission. The
+    /// listener allowlist, the ban list, the concurrency cap, dedup and the
+    /// over-cap re-check all run afterwards, and the seven per-peer caches used
+    /// to be written before any of them — so a peer every gate rejected still
+    /// landed in node-wide state and, because each cache is capped, evicted an
+    /// entry belonging to a peer that WAS accepted.
+    ///
+    /// Differential by construction: the SAME node rejects one dialer and
+    /// accepts another. Without the accepted half this would pass just as well
+    /// on a node nothing ever reached, which is the trap an "assert it is
+    /// empty" test walks into.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_rejected_peer_leaves_nothing_in_the_per_peer_caches() {
+        let mut net = SimNetwork::builder()
+            .nodes(3)
+            .role(NodeRole::Core)
+            .build()
+            .await;
+
+        let rejected_id = net.node(0).node_id();
+        let gatekeeper_id = net.node(1).node_id();
+        let admitted_id = net.node(2).node_id();
+        let admitted_hex: String = admitted_id.iter().map(|b| format!("{b:02x}")).collect();
+
+        // Node 1 accepts ONLY node 2 on its listener; node 0 is turned away
+        // after its handshake completes.
+        let mut cfg = net.node(1).config.clone();
+        cfg.listen[0].allowlist_node_ids = vec![admitted_hex];
+        net.node_mut(1)
+            .reload_with(cfg)
+            .await
+            .expect("gatekeeper reloads with an allowlist");
+
+        // The rejected dial: the handshake runs to completion, then the
+        // allowlist turns it away.
+        let established = net.connect(0, 1).await;
+        assert!(
+            !established,
+            "node 0 is not on the allowlist — the session must not establish",
+        );
+        assert_eq!(
+            net.node(1).runtime.debug_cached_peer_state(&rejected_id),
+            Vec::<&str>::new(),
+            "a rejected peer must leave NOTHING in the per-peer caches",
+        );
+
+        // The control: same gatekeeper, a dialer that IS allowed. This is what
+        // makes the assertion above mean something.
+        assert!(
+            net.connect(2, 1).await,
+            "node 2 is on the allowlist — this session must establish",
+        );
+        assert!(
+            !net.node(1)
+                .runtime
+                .debug_cached_peer_state(&admitted_id)
+                .is_empty(),
+            "an ADMITTED peer must populate the caches — otherwise the \
+             emptiness asserted above proves only that nothing happened",
+        );
+        assert_eq!(
+            net.node(1).runtime.debug_cached_peer_state(&rejected_id),
+            Vec::<&str>::new(),
+            "admitting one peer must not resurrect the rejected one",
+        );
+        let _ = gatekeeper_id;
+
+        net.stop().await;
+    }
 }
