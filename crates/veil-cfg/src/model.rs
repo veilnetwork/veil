@@ -3656,6 +3656,19 @@ pub struct GlobalConfig {
     /// instead. Default `false`.
     #[serde(default, skip_serializing_if = "is_default_legacy_allow")]
     pub allow_unpinned_signed_bootstrap: bool,
+    /// How the compile-time builtin seed list takes part in bootstrap.
+    ///
+    /// Default [`BuiltinSeedPolicy::Auto`] preserves the historical
+    /// either/or: builtin seeds are dialed only when neither `peers` nor
+    /// `[[bootstrap_peers]]` is set. That default is what makes alternative
+    /// entry points unusable — naming one non-seed peer in
+    /// `[[bootstrap_peers]]` silently drops the seeds, so the node ends up
+    /// depending on the alternative alone. Set
+    /// [`Always`](BuiltinSeedPolicy::Always) to dial both sets, which is what
+    /// a node behind a censor wants: the seeds when they are reachable, the
+    /// operator's other hosts when they are not.
+    #[serde(default)]
+    pub builtin_seed_policy: BuiltinSeedPolicy,
     /// **Phase-2 Phase 11 slice 11d** enforcement flag.  When `true`,
     /// `load_config` REFUSES to load configs that:
     ///   * Carry no `# VEIL_CONFIG_SIGNATURE_V1: …` header, OR
@@ -3769,6 +3782,7 @@ impl Default for GlobalConfig {
             bootstrap_tor_socks_proxy: None,
             trusted_bundle_issuer_pubkey: None,
             allow_unpinned_signed_bootstrap: false,
+            builtin_seed_policy: BuiltinSeedPolicy::default(),
             require_signed_config: false,
             strict_config_validation: false,
             tls_ech_grease: Self::default_tls_ech_grease(),
@@ -4185,7 +4199,7 @@ impl PinnedRelay {
 
 // BootstrapPeer moved to veil-types so veil-bootstrap can
 // consume it without depending on cfg. Re-exported below.
-pub use veil_types::BootstrapPeer;
+pub use veil_types::{BootstrapPeer, BuiltinSeedPolicy};
 
 #[derive(Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
 /// Peer config (see field docs for details).

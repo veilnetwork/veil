@@ -34,16 +34,16 @@ pub use identity::{DomainIdentity, require_identity};
 pub use keys::ConfigKey;
 pub use locate::{default_admin_socket_uri, default_init_path, locate_config, runtime_veil_dir};
 pub use model::{
-    AnonymityConfig, AnycastConfig, AnycastResolvePolicyKind, BootstrapPeer, Config,
-    ConnectionConfig, DhtConfig, DiscoveryMode, EphemeralConfig, ExitProxyConfig, FriendList,
-    GatewayConfig, GlobalConfig, HotStandbyConfig, IdentityConfig, IpcConfig, ListenConfig,
-    ListenId, LogFormat, LogLevel, LogsConfig, MEMBERSHIP_CERT_VERSION, MailboxConfig,
-    MailboxPushConfig, MembershipCert, MeshConfig, MetricsConfig, MobileConfig, NatConfig,
-    NetworkConfig, NetworkMode, NodeCapacityConfig, NodeId, NodeRole, OnDemandListenConfig,
-    PaddingMode, PaddingPolicy, PeerConfig, PeerId, PexConfig, PinnedRelay, PowConfig,
-    PriorityWeights, ProxyConfig, RoutingConfig, RuntimeFlavor, SessionConfig, SignatureAlgorithm,
-    Socks5Config, TlsClientConfig, TlsFingerprintConfig, TransportConfig, TransportRotationConfig,
-    UpdateConfig, Visibility, default_nonce_base64,
+    AnonymityConfig, AnycastConfig, AnycastResolvePolicyKind, BootstrapPeer, BuiltinSeedPolicy,
+    Config, ConnectionConfig, DhtConfig, DiscoveryMode, EphemeralConfig, ExitProxyConfig,
+    FriendList, GatewayConfig, GlobalConfig, HotStandbyConfig, IdentityConfig, IpcConfig,
+    ListenConfig, ListenId, LogFormat, LogLevel, LogsConfig, MEMBERSHIP_CERT_VERSION,
+    MailboxConfig, MailboxPushConfig, MembershipCert, MeshConfig, MetricsConfig, MobileConfig,
+    NatConfig, NetworkConfig, NetworkMode, NodeCapacityConfig, NodeId, NodeRole,
+    OnDemandListenConfig, PaddingMode, PaddingPolicy, PeerConfig, PeerId, PexConfig, PinnedRelay,
+    PowConfig, PriorityWeights, ProxyConfig, RoutingConfig, RuntimeFlavor, SessionConfig,
+    SignatureAlgorithm, Socks5Config, TlsClientConfig, TlsFingerprintConfig, TransportConfig,
+    TransportRotationConfig, UpdateConfig, Visibility, default_nonce_base64,
 };
 pub use runtime::{RuntimeConfig, build_tokio_runtime};
 pub use store::{
