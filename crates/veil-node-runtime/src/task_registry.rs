@@ -99,6 +99,16 @@ pub enum RuntimeService {
     /// every session ticket the process ever issued.
     TicketKeyRotation,
 
+    /// Replaces the node's long-term ML-KEM mailbox key once per
+    /// `global.mlkem_rotation_secs`, keeping the outgoing one decrypt-capable
+    /// for its overlap window and pulling the sovereign republish forward so
+    /// the new encapsulation key reaches the DHT in minutes rather than hours.
+    ///
+    /// Declines (with a log line) on a node whose key is not derived from its
+    /// identity, or when the configured interval is under the overlap a sealed
+    /// mailbox blob needs. See `spawn_mlkem_rotation_task`.
+    MlKemKeyRotation,
+
     /// Authenticated-onion final-hop verify+deliver task (Epic 482 v1).
     /// Drains `auth_deliver_tx`: resolves the sender's identity document,
     /// runs `verify_auth_deliver` + the per-sender replay check, and delivers
@@ -199,6 +209,7 @@ impl RuntimeService {
         Self::BootstrapWatchdog,
         Self::SovereignIdentityRepublish,
         Self::TicketKeyRotation,
+        Self::MlKemKeyRotation,
         Self::AuthDeliverHandler,
         Self::RendezvousRecipient,
         Self::RendezvousResolveRefresh,

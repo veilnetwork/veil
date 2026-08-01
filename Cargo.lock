@@ -4508,6 +4508,7 @@ dependencies = [
  "toml_edit 0.22.27",
  "veil-adaptive",
  "veil-crypto",
+ "veil-e2e",
  "veil-error",
  "veil-identity",
  "veil-observability",

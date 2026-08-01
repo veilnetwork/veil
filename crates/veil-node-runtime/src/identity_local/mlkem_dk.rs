@@ -17,12 +17,53 @@
 
 use std::path::Path;
 
-use veil_crypto::identity::derive_mlkem_dk_seed;
+use veil_crypto::identity::derive_mlkem_dk_seed_epoch;
 use veil_e2e::{
     DK_SEED_BYTES, EK_BYTES, keypair_from_dk_seed, load_or_generate_mlkem_key_encrypted,
 };
 
 use crate::error::NodeError;
+
+/// The rotation epoch in force at `now_unix`.
+///
+/// `rotation_secs == 0` (rotation off) pins epoch 0, which
+/// [`derive_mlkem_dk_seed_epoch`] defines as the pre-rotation key — so a node
+/// with the knob off publishes exactly what it always published.
+///
+/// Deriving the epoch from the wall clock rather than counting rotations is
+/// what makes this survive a restart with nothing persisted: a process that
+/// comes back inside the same epoch re-derives the same key, and one that comes
+/// back later lands on the right epoch instead of restarting the sequence.
+pub fn rotation_epoch(now_unix: u64, rotation_secs: u64) -> u64 {
+    if rotation_secs == 0 {
+        return 0;
+    }
+    now_unix / rotation_secs
+}
+
+/// The ML-KEM keypair for `epoch`, or `None` if this node's key is not one that
+/// can be re-derived.
+///
+/// The `None` case is not a failure: a node running a persisted `mlkem.key`
+/// (operator/seed daemons) holds a random key that exists only in that file, so
+/// there is no epoch sequence to move along. Rotating it would mean minting a
+/// key that vanishes at the next restart, black-holing everything sealed to it.
+///
+/// This is also the single place that decides "is this node's key derivable" —
+/// [`load_or_derive`] takes the same branch through here, so a startup and a
+/// rotation can never disagree about it.
+pub fn derive_for_epoch(
+    mlkem_key_path: &Path,
+    veil_dir: &Path,
+    epoch: u64,
+) -> Option<([u8; EK_BYTES], [u8; DK_SEED_BYTES])> {
+    if mlkem_key_path.exists() {
+        return None;
+    }
+    let seed = veil_identity::sovereign_flow::load_identity_sk(veil_dir).ok()?;
+    let dk_seed = derive_mlkem_dk_seed_epoch(seed.as_array(), epoch);
+    keypair_from_dk_seed(&dk_seed).ok()
+}
 
 /// Where the node's ML-KEM mailbox seed came from — surfaced at the call site
 /// for field diagnosis (`node.mlkem_dk.source`).
@@ -70,6 +111,7 @@ pub fn load_or_derive(
     mlkem_key_path: &Path,
     veil_dir: &Path,
     passphrase: Option<&str>,
+    epoch: u64,
 ) -> Result<([u8; EK_BYTES], [u8; DK_SEED_BYTES], MlKemKeySource), NodeError> {
     // 1. An existing persisted key wins — never rotate a node that already has one.
     if mlkem_key_path.exists() {
@@ -77,10 +119,13 @@ pub fn load_or_derive(
             .map_err(|e| NodeError::InvalidArgument(format!("{e}")))?;
         return Ok((ek, dk, MlKemKeySource::Persisted));
     }
-    // 2. Ephemeral-dir node with an identity: derive deterministically.
+    // 2. Ephemeral-dir node with an identity: derive deterministically, at the
+    //    epoch currently in force. Starting at `epoch` rather than at 0 matters:
+    //    a restart must land on the key the node was already publishing, not
+    //    walk back to genesis and rotate forward again on every launch.
     match veil_identity::sovereign_flow::load_identity_sk(veil_dir) {
         Ok(seed) => {
-            let dk_seed = derive_mlkem_dk_seed(seed.as_array());
+            let dk_seed = derive_mlkem_dk_seed_epoch(seed.as_array(), epoch);
             let (ek, dk) = keypair_from_dk_seed(&dk_seed)
                 .map_err(|e| NodeError::InvalidArgument(format!("{e}")))?;
             return Ok((ek, dk, MlKemKeySource::IdentityDerived));
@@ -118,7 +163,7 @@ mod tests {
         // Also drop an identity seed so the derive branch WOULD be eligible.
         save_seed(tmp.path(), 0x11);
 
-        let (ek, _dk, src) = load_or_derive(&key_path, tmp.path(), None).unwrap();
+        let (ek, _dk, src) = load_or_derive(&key_path, tmp.path(), None, 0).unwrap();
         assert_eq!(src, MlKemKeySource::Persisted);
         assert_eq!(
             ek, ek_file,
@@ -135,10 +180,10 @@ mod tests {
         let key_path = tmp.path().join("mlkem.key");
         save_seed(tmp.path(), 0x22);
 
-        let (ek, dk, src) = load_or_derive(&key_path, tmp.path(), None).unwrap();
+        let (ek, dk, src) = load_or_derive(&key_path, tmp.path(), None, 0).unwrap();
         assert_eq!(src, MlKemKeySource::IdentityDerived);
         // Matches the standalone derive helpers.
-        let want_seed = derive_mlkem_dk_seed(&[0x22u8; 32]);
+        let want_seed = derive_mlkem_dk_seed_epoch(&[0x22u8; 32], 0);
         let (want_ek, want_dk) = keypair_from_dk_seed(&want_seed).unwrap();
         assert_eq!(ek, want_ek);
         assert_eq!(dk, want_dk);
@@ -150,7 +195,7 @@ mod tests {
         let tmp2 = tempfile::tempdir().unwrap();
         save_seed(tmp2.path(), 0x22);
         let (ek2, _dk2, _src2) =
-            load_or_derive(&tmp2.path().join("mlkem.key"), tmp2.path(), None).unwrap();
+            load_or_derive(&tmp2.path().join("mlkem.key"), tmp2.path(), None, 0).unwrap();
         assert_eq!(
             ek, ek2,
             "same identity seed across sessions must give the same EK"
@@ -164,9 +209,86 @@ mod tests {
         let b = tempfile::tempdir().unwrap();
         save_seed(a.path(), 0x01);
         save_seed(b.path(), 0x02);
-        let (ek_a, _, _) = load_or_derive(&a.path().join("mlkem.key"), a.path(), None).unwrap();
-        let (ek_b, _, _) = load_or_derive(&b.path().join("mlkem.key"), b.path(), None).unwrap();
+        let (ek_a, _, _) = load_or_derive(&a.path().join("mlkem.key"), a.path(), None, 0).unwrap();
+        let (ek_b, _, _) = load_or_derive(&b.path().join("mlkem.key"), b.path(), None, 0).unwrap();
         assert_ne!(ek_a, ek_b);
+    }
+
+    /// The overlap constant is arithmetic over values that live in other
+    /// crates, so it is asserted HERE — the one place that can see all of them.
+    ///
+    /// `veil-e2e` sits below `veil-mailbox` and cannot name its retention
+    /// constant, so it restates the number. Restated numbers drift. If someone
+    /// lengthens how long a relay holds an undelivered blob, this fails instead
+    /// of the window quietly becoming too short — which would show up only as
+    /// week-old mail that no longer opens.
+    #[test]
+    fn overlap_window_covers_the_real_mailbox_and_cache_lifetimes() {
+        let republish_interval = 6 * 3600;
+        let want = veil_mailbox::DEFAULT_TTL_SECS
+            + veil_types::IpcConfig::default().e2e_key_ttl_secs
+            + republish_interval;
+        assert_eq!(
+            veil_e2e::MLKEM_SEED_MIN_OVERLAP_SECS,
+            want,
+            "the overlap must equal mailbox retention + peer EK cache + republish lag"
+        );
+    }
+
+    /// Rotation off pins epoch 0, and epoch 0 is the pre-rotation key — so
+    /// upgrading a binary without touching the config republishes nothing.
+    #[test]
+    fn rotation_off_pins_the_genesis_epoch() {
+        assert_eq!(rotation_epoch(1_800_000_000, 0), 0);
+        // …and with rotation on, the epoch advances once per interval and is a
+        // pure function of the clock, so a restart lands where it left off.
+        let interval = 8 * 24 * 3600;
+        let t = 1_800_000_000u64;
+        assert_eq!(rotation_epoch(t, interval), rotation_epoch(t + 5, interval));
+        assert_eq!(
+            rotation_epoch(t + interval, interval),
+            rotation_epoch(t, interval) + 1
+        );
+    }
+
+    /// A node whose key came from a persisted file has no epoch sequence: the
+    /// key is random and lives only in that file, so `derive_for_epoch` must
+    /// decline rather than hand back a key that dies at the next restart.
+    #[test]
+    fn persisted_key_cannot_be_rotated() {
+        let tmp = tempfile::tempdir().unwrap();
+        let key_path = tmp.path().join("mlkem.key");
+        load_or_generate_mlkem_key_encrypted(&key_path, None).unwrap();
+        save_seed(tmp.path(), 0x33);
+        assert!(
+            derive_for_epoch(&key_path, tmp.path(), 5).is_none(),
+            "a persisted key must not be rotated out from under its published cert"
+        );
+        // The same node's startup agrees — both go through one branch.
+        let (_ek, _dk, src) = load_or_derive(&key_path, tmp.path(), None, 5).unwrap();
+        assert_eq!(src, MlKemKeySource::Persisted);
+    }
+
+    /// An identity-derived node rotates, and a restart mid-epoch comes back to
+    /// the SAME key rather than to genesis — the property that lets rotation
+    /// persist nothing.
+    #[test]
+    fn derived_key_rotates_and_survives_restart() {
+        let tmp = tempfile::tempdir().unwrap();
+        let key_path = tmp.path().join("mlkem.key");
+        save_seed(tmp.path(), 0x44);
+
+        let (ek0, _) = derive_for_epoch(&key_path, tmp.path(), 0).unwrap();
+        let (ek5, dk5) = derive_for_epoch(&key_path, tmp.path(), 5).unwrap();
+        assert_ne!(ek0, ek5, "an epoch step must actually change the key");
+
+        // Restart inside epoch 5: startup derives the key already published.
+        let (ek_restart, dk_restart, src) = load_or_derive(&key_path, tmp.path(), None, 5).unwrap();
+        assert_eq!(src, MlKemKeySource::IdentityDerived);
+        assert_eq!(ek_restart, ek5);
+        assert_eq!(dk_restart, dk5);
+        // And still no on-disk artifact — the key stays reproducible.
+        assert!(!key_path.exists());
     }
 
     /// Identity-less node with no key file: fall back to a fresh random key that
@@ -175,7 +297,7 @@ mod tests {
     fn fallback_random_when_no_identity() {
         let tmp = tempfile::tempdir().unwrap();
         let key_path = tmp.path().join("mlkem.key");
-        let (_ek, _dk, src) = load_or_derive(&key_path, tmp.path(), None).unwrap();
+        let (_ek, _dk, src) = load_or_derive(&key_path, tmp.path(), None, 0).unwrap();
         assert_eq!(src, MlKemKeySource::FallbackRandom);
         assert!(key_path.exists(), "fallback must persist the random key");
     }

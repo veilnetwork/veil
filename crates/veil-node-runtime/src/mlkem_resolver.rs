@@ -62,14 +62,19 @@ use veil_util::{lock, rlock, wlock};
 /// at ~9 sec in the worst case.
 const DEFAULT_STEP_TIMEOUT: Duration = Duration::from_secs(3);
 
-/// TTL for the verified-cert fast-path cache. A recipient's ML-KEM EK is
-/// **stable for the lifetime of its instance** — `mlkem_dk_seed` is fixed and
-/// the 6-hourly `MlKemKeyCert` republish only refreshes the signature +
-/// timestamp, not the EK — so a previously-verified [`VerifiedMlkemCert`] stays
-/// valid until the recipient rotates to a *new* instance (fresh install /
-/// identity reset). A 30-min TTL bounds that rare rotation window while letting
-/// an active conversation reuse a single DHT walk across **all** its live-E2E
-/// encrypts AND offline mailbox seals, instead of re-walking on every call.
+/// TTL for the verified-cert fast-path cache. A recipient's ML-KEM EK changes
+/// rarely: on a new instance (fresh install / identity reset), or on the
+/// recipient's scheduled mailbox-key rotation, which defaults to once every
+/// eight days. Between those, the 6-hourly `MlKemKeyCert` republish only
+/// refreshes the signature + timestamp, so a previously-verified
+/// [`VerifiedMlkemCert`] stays usable.
+///
+/// Sealing to a stale entry is safe rather than merely likely-safe: the
+/// recipient keeps each retired key decrypt-capable for
+/// [`veil_e2e::MLKEM_SEED_MIN_OVERLAP_SECS`] (over a week), which this 30-min
+/// window sits far inside. So the TTL is a freshness/bandwidth trade — one DHT
+/// walk shared across an active conversation's live-E2E encrypts AND its
+/// offline mailbox seals — not a correctness boundary.
 const CERT_CACHE_TTL: Duration = Duration::from_secs(30 * 60);
 
 /// `node_id → (verified cert, when-resolved)`. Shared across the live-E2E and

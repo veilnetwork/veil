@@ -38,7 +38,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use crate::local_identity::HandshakeIdentity;
 use crate::mlkem_resolver::PeerMlKemCertCache;
 use crate::types::NodeIdBytes;
-use veil_e2e::{DK_SEED_BYTES, EK_BYTES, PeerMlKemCache};
+use veil_e2e::{DK_SEED_BYTES, PeerMlKemCache};
 use veil_identity::sovereign::SovereignIdentity;
 use veil_identity::verify::ValidatedIdentity;
 use veil_types::PeerLruCache;
@@ -121,9 +121,15 @@ pub struct IdentityState {
     /// Gateway-role spoofing.
     pub peer_roles: Arc<Mutex<PeerLruCache<u8>>>,
 
-    /// Local ML-KEM-768 encapsulation key — sent to remotes during
-    /// handshake so peers can encrypt payloads for this node.
-    pub mlkem_ek: Arc<[u8; EK_BYTES]>,
+    /// This node's ML-KEM-768 mailbox keypair, and the retired seeds still
+    /// inside their overlap window.
+    ///
+    /// One holder for both halves. They used to be two fields in two structs —
+    /// the public EK here, the secret seed on `NodeRuntime` — which was fine
+    /// only while neither could ever change. Rotation makes "which key is
+    /// current" a question with a wrong answer available, so the pair lives
+    /// behind one lock. See [`veil_e2e::MlKemSeedRing`].
+    pub mlkem_keys: Arc<veil_e2e::MlKemSeedRing>,
 
     /// Peer ML-KEM-768 key cache — populated after each handshake.
     /// Shared with `FrameDispatcher` so the relay-send path can encrypt E2E.
@@ -161,7 +167,7 @@ impl IdentityState {
             Mutex<std::collections::HashMap<NodeIdBytes, ValidatedIdentity>>,
         >,
         peer_roles: Arc<Mutex<PeerLruCache<u8>>>,
-        mlkem_ek: Arc<[u8; EK_BYTES]>,
+        mlkem_keys: Arc<veil_e2e::MlKemSeedRing>,
         peer_mlkem_keys: Arc<RwLock<PeerMlKemCache>>,
         peer_mlkem_certs: Arc<RwLock<PeerMlKemCertCache>>,
         per_session_mlkem_dk: Arc<
@@ -179,7 +185,7 @@ impl IdentityState {
             peer_pubkeys,
             peer_sovereign_identities,
             peer_roles,
-            mlkem_ek,
+            mlkem_keys,
             peer_mlkem_keys,
             peer_mlkem_certs,
             per_session_mlkem_dk,

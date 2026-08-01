@@ -27,6 +27,9 @@ use sha2::Sha256;
 
 use veil_proto::{E2eEnvelope, ProtoError};
 
+pub mod seed_ring;
+pub use seed_ring::{MLKEM_SEED_MIN_OVERLAP_SECS, MlKemSeedRing, RotateRejected};
+
 // ── Key sizes ─────────────────────────────────────────────────────────────────
 
 /// Size of a serialised ML-KEM-768 encapsulation key (public key), in bytes.

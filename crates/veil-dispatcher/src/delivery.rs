@@ -1372,19 +1372,36 @@ impl FrameDispatcher {
         }
         let first_byte = envelope.payload.first().copied();
 
-        // Resolve the decapsulation-key seed once (used by both E2E branches).
-        // prefer per-session ephemeral DK seed over long-term seed.
-        let dk_seed: [u8; veil_e2e::DK_SEED_BYTES] = {
-            // Phase 6 slice 6h: per-session DK seeds are
-            // SensitiveBytesN<64> not Copy, so dereference the `.as_array()`
-            // view to get a `[u8; 64]` value off the mlocked storage.  The
-            // resulting stack copy lives only through the ml-kem decap call
-            // below — short enough that swap exposure is bounded to single-
-            // digit microseconds under normal load.
-            let map = lock!(self.crypto.per_session_mlkem_dk);
-            map.get(&envelope.sender_node_id)
-                .map(|s| *s.as_array())
-                .unwrap_or_else(|| *self.crypto.mlkem_dk_seed.as_array())
+        // Every decapsulation seed this envelope could legitimately be sealed
+        // to, in descending likelihood: the per-session ephemeral seed
+        // negotiated with this sender, then our current long-term mailbox seed,
+        // then the retired ones still inside their overlap window.
+        //
+        // The per-session seed used to REPLACE the long-term one rather than
+        // precede it, which quietly meant a peer we happened to hold an
+        // ephemeral seed for could not reach us with anything sealed to our
+        // published EK — an offline blob deposited before the session opened,
+        // say. Ordering instead of replacing costs nothing on the hot path (the
+        // first candidate wins) and only ever widens what opens.
+        //
+        // Phase 6 slice 6h: per-session DK seeds are SensitiveBytesN<64>, not
+        // Copy, so `.as_array()` is dereferenced to lift a `[u8; 64]` off the
+        // mlocked storage. The copies live in a `Zeroizing` vec that is wiped
+        // when this call returns.
+        let dk_seeds = {
+            let session_seed = {
+                let map = lock!(self.crypto.per_session_mlkem_dk);
+                map.get(&envelope.sender_node_id).map(|s| *s.as_array())
+            };
+            let now_unix = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            let mut seeds = self.crypto.mlkem_keys.decrypt_seeds(now_unix);
+            if let Some(s) = session_seed {
+                seeds.insert(0, s);
+            }
+            seeds
         };
 
         // Fields that may be overridden by meta-E2E decryption.
@@ -1395,7 +1412,7 @@ impl FrameDispatcher {
 
         let Some((app_payload, ack_key)) = self.decrypt_forward_payload(
             first_byte,
-            &dk_seed,
+            &dk_seeds,
             &envelope,
             &mut deliver_sender_node_id,
             &mut deliver_src_app_id,
@@ -1505,10 +1522,20 @@ impl FrameDispatcher {
     /// meta-E2E, updates the sender/app/endpoint out-params with the values
     /// recovered from the ciphertext.
     #[allow(clippy::too_many_arguments)]
-    fn decrypt_forward_payload(
+    /// Decrypt under the first of `dk_seeds` that works.
+    ///
+    /// ML-KEM decapsulation does not report a wrong key — implicit rejection
+    /// hands back a different shared secret — so a candidate that is not the one
+    /// the sender used surfaces as an AEAD failure and we move on. A message
+    /// sealed to our current key therefore costs exactly one attempt; the extra
+    /// attempts are spent only on a message that was going to fail anyway. The
+    /// failure metric is incremented ONCE, after every candidate is exhausted,
+    /// not per candidate — otherwise adding a retired seed to the ring would
+    /// multiply the operator's decrypt-failure rate with no change in behaviour.
+    pub(crate) fn decrypt_forward_payload(
         &self,
         first_byte: Option<u8>,
-        dk_seed: &[u8; veil_e2e::DK_SEED_BYTES],
+        dk_seeds: &[[u8; veil_e2e::DK_SEED_BYTES]],
         envelope: &DeliveryEnvelope,
         deliver_sender_node_id: &mut [u8; 32],
         deliver_src_app_id: &mut [u8; 32],
@@ -1517,25 +1544,26 @@ impl FrameDispatcher {
     ) -> Option<(Vec<u8>, [u8; 32])> {
         // META_E2E_MARKER (0xE3): onion — sender identity is inside ciphertext.
         if first_byte == Some(veil_proto::META_E2E_MARKER) {
-            match veil_e2e::meta_decrypt(dk_seed, &self.local_node_id, &envelope.payload) {
-                Ok((snd, src_app, app, eid, plain)) => {
-                    *deliver_sender_node_id = snd;
-                    *deliver_src_app_id = src_app;
-                    *deliver_app_id = app;
-                    *deliver_endpoint_id = eid;
-                    // meta-E2E: no ACK key wired on this path yet — DELIVERED
-                    // for an anonymous message clears the pending entry but
-                    // earns no reputation (C-09 scoping; full meta-E2E ACK auth
-                    // is a follow-up).
-                    return Some((plain, [0u8; 32]));
-                }
-                Err(_) => {
-                    if let Some(m) = &self.metrics {
-                        m.inc_decrypt_failures();
-                    }
-                    return None;
-                }
+            for dk_seed in dk_seeds {
+                let Ok((snd, src_app, app, eid, plain)) =
+                    veil_e2e::meta_decrypt(dk_seed, &self.local_node_id, &envelope.payload)
+                else {
+                    continue;
+                };
+                *deliver_sender_node_id = snd;
+                *deliver_src_app_id = src_app;
+                *deliver_app_id = app;
+                *deliver_endpoint_id = eid;
+                // meta-E2E: no ACK key wired on this path yet — DELIVERED
+                // for an anonymous message clears the pending entry but
+                // earns no reputation (C-09 scoping; full meta-E2E ACK auth
+                // is a follow-up).
+                return Some((plain, [0u8; 32]));
             }
+            if let Some(m) = &self.metrics {
+                m.inc_decrypt_failures();
+            }
+            return None;
         }
         // E2E_MARKER (0xE2): standard E2E — sender in outer envelope.
         if first_byte == Some(veil_proto::E2E_MARKER) {
@@ -1549,25 +1577,26 @@ impl FrameDispatcher {
                     return None;
                 }
             };
-            return match veil_e2e::decrypt_with_ack(
-                dk_seed,
-                &envelope.sender_node_id,
-                &self.local_node_id,
-                &e2e_env,
-            ) {
+            for dk_seed in dk_seeds {
                 // C-09: the per-message ACK key flows out so the recipient can
                 // MAC `content_id` in the DELIVERED frame.
-                Ok((plain, ack_key)) => Some((plain, ack_key)),
-                Err(_) => {
-                    // Drop — decrypt failure is not a peer protocol violation
-                    // (e.g. key-rotation race), but count it so operators can
-                    // detect misconfiguration or active key-mismatch attacks.
-                    if let Some(m) = &self.metrics {
-                        m.inc_decrypt_failures();
-                    }
-                    None
+                if let Ok((plain, ack_key)) = veil_e2e::decrypt_with_ack(
+                    dk_seed,
+                    &envelope.sender_node_id,
+                    &self.local_node_id,
+                    &e2e_env,
+                ) {
+                    return Some((plain, ack_key));
                 }
-            };
+            }
+            // Drop — decrypt failure is not a peer protocol violation
+            // (e.g. a sender still using an EK we retired past its window), but
+            // count it so operators can detect misconfiguration or active
+            // key-mismatch attacks.
+            if let Some(m) = &self.metrics {
+                m.inc_decrypt_failures();
+            }
+            return None;
         }
         // No E2E marker — plaintext envelope (legitimate inter-app traffic).
         // No ACK key (non-E2E): DELIVERED clears the entry but earns no reputation.

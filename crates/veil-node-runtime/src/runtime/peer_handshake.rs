@@ -483,7 +483,7 @@ pub async fn register_connection_session(
     // accept gates pass (audit cycle-9 CRIT-6, and the caches likewise).
     let (remote_identity, pending_peer_state): (RemoteHandshakeInfo, PendingPeerState) = {
         let role = runtime.dispatcher.role;
-        let mlkem_ek_bytes: Vec<u8> = runtime.identity.mlkem_ek.as_ref().to_vec();
+        let mlkem_ek_bytes: Vec<u8> = runtime.identity.mlkem_keys.current_ek().to_vec();
         let capture_tx = Arc::clone(&runtime.dispatcher.capture_tx);
         let local_id: [u8; 32] = *runtime.identity.local_identity.node_id.as_bytes();
         let hs_capture =

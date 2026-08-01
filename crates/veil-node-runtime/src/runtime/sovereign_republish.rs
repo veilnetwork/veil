@@ -85,7 +85,9 @@ impl NodeRuntime {
         let logger = Arc::clone(&self.logger);
         // MlKemCert republish needs the node's own ML-KEM ek to re-sign
         // with a fresh validity window each tick.
-        let mlkem_ek = Arc::clone(&self.identity.mlkem_ek);
+        let mlkem_keys = Arc::clone(&self.identity.mlkem_keys);
+        // Poked by `spawn_mlkem_rotation_task`; see the select arm below.
+        let mlkem_republish_now = Arc::clone(&self.mlkem_republish_now);
         // RelayKeyRecord republish: only relay-capable nodes have an anonymity
         // X25519 keypair to advertise (`None` for non-relays — we skip the
         // record entirely so we never publish a key the dispatcher can't
@@ -236,6 +238,16 @@ impl NodeRuntime {
                     tokio::select! {
                         Ok(_) = shutdown_rx.changed() => {
                             if *shutdown_rx.borrow() { break; }
+                        }
+                        // The ML-KEM mailbox key just rotated. Every branch that
+                        // republishes the `MlKemCert` lives in the interval arm
+                        // below, so rather than duplicate it, pull that arm
+                        // forward — the next loop turn takes it immediately and
+                        // re-signs the cert around whatever `mlkem_keys` now
+                        // holds. Until it does, the node is advertising an EK it
+                        // has already replaced.
+                        _ = mlkem_republish_now.notified() => {
+                            interval.reset_immediately();
                         }
                         // topology-driven republish. When a new
                         // peer joins / leaves, the K-closest set for our
@@ -403,7 +415,7 @@ impl NodeRuntime {
                                 .map(|d| d.as_secs())
                                 .unwrap_or(0);
                             match sov.sign_mlkem_cert(
-                                mlkem_ek.as_slice().to_vec(),
+                                mlkem_keys.current_ek().to_vec(),
                                 cert_valid_from,
                                 cert_valid_from + 30 * 86_400,
                                 1,
