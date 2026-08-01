@@ -908,6 +908,24 @@ pub struct MailboxPushConfig {
     /// sending an unauthenticated wake. Default `false` for backward compat
     /// (receivers that haven't opted into wake-HMAC still get woken); operators
     /// who control their client fleet should set it `true` in production.
+    ///
+    /// ## Precondition before flipping the default (audit 2026-08-01)
+    ///
+    /// This is a **receiver-side** opt-in that the relay merely enforces, so
+    /// turning it on is only safe once the clients actually upload a
+    /// `WakeHmacKey` envelope. The audit recommended making `true` the shipped
+    /// default; that was **declined** for now because the xVeil client encodes
+    /// `wake_hmac_envelope: absent` on every mailbox PUT
+    /// (`lib/data/transport/veil_mailbox_network.dart`), so a `true` default
+    /// would drop the wake push for *every* device in the fleet — messages
+    /// would stop waking phones until the app is foregrounded. For a messenger
+    /// that is a worse failure than the nuisance wake it prevents.
+    ///
+    /// The enforcement path is fully built and waiting: the structural
+    /// validator raises a production-posture advisory whenever a push relay
+    /// runs with this `false`, and `production_hardening = true` promotes that
+    /// advisory to a fatal config error. Flip this default in the same release
+    /// that ships client-side envelope upload — not before.
     #[serde(default, skip_serializing_if = "is_false")]
     pub require_wake_hmac: bool,
 }
