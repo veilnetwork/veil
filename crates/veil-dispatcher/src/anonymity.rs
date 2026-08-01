@@ -2042,10 +2042,10 @@ mod tests {
         d.circuit_table = Some(std::sync::Arc::new(CircuitTable::new()));
         d.circuit_rendezvous = Some(std::sync::Arc::new(CircuitRendezvousRegistry::new()));
 
-        // Signed registration for a cookie.
-        let cookie = [0x5A; 16];
+        // Signed registration for the one cookie this key may claim.
         let kp = generate_keypair(SignatureAlgorithm::Ed25519);
         let reg_pk: [u8; 32] = STANDARD.decode(&kp.public_key).unwrap().try_into().unwrap();
+        let cookie = veil_anonymity::circuit_register::cookie_for_reg_pk(&reg_pk);
         let epoch = 1u64;
         let msg = CircuitRegisterPayload::signing_bytes(&cookie, &reg_pk, epoch);
         let sig = sign_message(
@@ -2142,9 +2142,12 @@ mod tests {
             let mut rx = reg_tx.register(NodeId::from(prev));
             d.session_tx_registry = Some(std::sync::Arc::new(std::sync::RwLock::new(reg_tx)));
 
-            let cookie = [0x5B; 16];
             let kp = generate_keypair(SignatureAlgorithm::Ed25519);
             let reg_pk: [u8; 32] = STANDARD.decode(&kp.public_key).unwrap().try_into().unwrap();
+            // The cookie is the one this registration key may claim; a
+            // free-form cookie is refused before the signature is even the
+            // question (VL-01 anti-squat binding).
+            let cookie = veil_anonymity::circuit_register::cookie_for_reg_pk(&reg_pk);
             let epoch = 1u64;
             let msg = CircuitRegisterPayload::signing_bytes(&cookie, &reg_pk, epoch);
             let mut sig = sign_message(
@@ -2389,10 +2392,10 @@ mod tests {
 
         // (1) RECEIVER's circuit at R: a terminus build whose payload registers a
         //     cookie, arriving from recv_hop → binds cookie → this return circuit.
-        let cookie = [0x5A; 16];
         let recv_cid = 77u32;
         let kp = generate_keypair(SignatureAlgorithm::Ed25519);
         let reg_pk: [u8; 32] = STANDARD.decode(&kp.public_key).unwrap().try_into().unwrap();
+        let cookie = veil_anonymity::circuit_register::cookie_for_reg_pk(&reg_pk);
         let epoch = 1u64;
         let msg = CircuitRegisterPayload::signing_bytes(&cookie, &reg_pk, epoch);
         let sig = sign_message(

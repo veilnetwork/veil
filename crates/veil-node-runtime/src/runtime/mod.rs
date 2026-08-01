@@ -8504,8 +8504,6 @@ impl NodeServices {
         ephemeral: bool,
         descriptor_provider_slot: Option<u8>,
     ) -> std::result::Result<([u8; 16], Option<[u8; 32]>), veil_types::AnonOnionSendError> {
-        use rand_core::{OsRng, RngCore};
-
         // Keep the existing hard work cap, but NEVER evict an older live
         // capability silently: that would turn an apparently-valid public link
         // into a black hole. Re-registering the same identity is allowed.
@@ -8586,19 +8584,22 @@ impl NodeServices {
         let identity_vk = identity_seed
             .as_deref()
             .map(|seed| veil_crypto::key_blinding::ed25519_public_from_seed(seed));
-        let cookie: [u8; 16] = match identity_seed.as_deref() {
-            Some(seed) => Self::onion_auth_cookie_for_seed(seed, period, descriptor_provider_slot),
-            None => {
-                let mut c = [0u8; 16];
-                OsRng.fill_bytes(&mut c);
-                c
-            }
-        };
+        // The cookie is whatever this service's registration key may claim —
+        // the relay checks the pairing, so the two can no longer be minted
+        // apart. `register_onion_circuit_with_identity` re-derives the same
+        // key from the same inputs, and for the seedless case mints its own
+        // random one; either way the cookie below is the one that key claims.
+        let (reg_keypair, cookie) = Self::onion_reg_pair(
+            identity_seed.as_deref().map(|s| &**s),
+            period,
+            descriptor_provider_slot,
+        );
 
         // Build + register the circuit (no session register — that is the leak),
         // then publish the ad so clients can find us.
         self.register_onion_circuit_with_identity(
             &relay_path,
+            reg_keypair,
             cookie,
             identity_seed.clone(),
             ephemeral,
@@ -8893,18 +8894,59 @@ impl NodeServices {
         })
     }
 
-    fn onion_auth_cookie_for_seed(
-        identity_seed: &[u8; 32],
+    /// The cookie a registration keypair may claim at the rendezvous.
+    ///
+    /// The cookie is no longer derived from the identity seed directly: the
+    /// rendezvous relay has to be able to *check* the pairing, and the only
+    /// thing it holds is the registration payload — it never learns who we are
+    /// and never sees our ad. Deriving from `reg_pk` moves the answer into its
+    /// reach without telling it anything more. See
+    /// [`veil_anonymity::circuit_register::cookie_for_reg_pk`].
+    ///
+    /// The rotation cadence is unchanged: `reg_pk` was already derived from
+    /// `(identity_seed, period, slot)`, so the cookie still rotates per period
+    /// and per provider slot, and is still stable across process restarts
+    /// inside a period.
+    fn onion_auth_cookie_for_keypair(
+        reg_keypair: &veil_crypto::GeneratedKeyPair,
+    ) -> Option<[u8; 16]> {
+        use base64::Engine as _;
+        let raw = base64::engine::general_purpose::STANDARD
+            .decode(&reg_keypair.public_key)
+            .ok()?;
+        let pk: [u8; 32] = raw.try_into().ok()?;
+        Some(veil_anonymity::circuit_register::cookie_for_reg_pk(&pk))
+    }
+
+    /// The `(registration keypair, cookie)` pair for a service.
+    ///
+    /// Minted together and only together: the relay now rejects a registration
+    /// whose cookie is not the one its key may claim, so any path that mints
+    /// the two independently would produce a service that cannot register.
+    /// Seed-derived when a sovereign identity exists (stable across restarts
+    /// within a period), random otherwise — random still pairs, because the
+    /// cookie comes from whichever key was minted.
+    fn onion_reg_pair(
+        identity_seed: Option<&[u8; 32]>,
         period: u64,
         provider_slot: Option<u8>,
-    ) -> [u8; 16] {
-        match provider_slot {
-            Some(slot) => veil_crypto::identity::derive_onion_provider_auth_cookie(
-                identity_seed,
-                period,
-                slot,
-            ),
-            None => veil_crypto::identity::derive_onion_auth_cookie(identity_seed, period),
+    ) -> (veil_crypto::GeneratedKeyPair, [u8; 16]) {
+        loop {
+            let kp = Self::onion_reg_keypair_for_seed(identity_seed, period, provider_slot)
+                .unwrap_or_else(|| {
+                    veil_crypto::generate_keypair(veil_types::SignatureAlgorithm::Ed25519)
+                });
+            if let Some(cookie) = Self::onion_auth_cookie_for_keypair(&kp) {
+                return (kp, cookie);
+            }
+            // A key whose public half does not decode to 32 bytes cannot be
+            // used. Deterministic derivation never produces one, so this can
+            // only be a malformed random mint; retrying costs nothing and
+            // beats handing back a service that can never register.
+            debug_assert!(
+                identity_seed.is_none(),
+                "seed-derived registration key must always decode",
+            );
         }
     }
 
@@ -8915,50 +8957,62 @@ impl NodeServices {
     /// separately publishes a `RendezvousAd` at (R, cookie, our x25519) — this
     /// does NOT session-register (the location leak it avoids). See the
     /// onion-registration design doc.
+    /// Returns the cookie the service registered under — derived from its
+    /// registration key, so the caller must publish THIS cookie in the ad.
     pub fn register_onion_circuit(
         &self,
         relay_path: &[[u8; 32]],
-        cookie: [u8; 16],
-    ) -> std::result::Result<(), veil_types::AnonOnionSendError> {
-        self.register_onion_circuit_with_identity(
-            relay_path,
-            cookie,
-            self.sovereign_onion_identity_seed(),
-            false,
-            None,
-        )
-    }
-
-    fn register_onion_circuit_with_identity(
-        &self,
-        relay_path: &[[u8; 32]],
-        cookie: [u8; 16],
-        descriptor_identity_seed: Option<std::sync::Arc<zeroize::Zeroizing<[u8; 32]>>>,
-        ephemeral: bool,
-        descriptor_provider_slot: Option<u8>,
-    ) -> std::result::Result<(), veil_types::AnonOnionSendError> {
-        // Registration keypair: seed-derived per blinded-descriptor period, like
-        // the cookie itself (L1 kept it stable across REBUILDS; deriving it makes
-        // it stable across PROCESS RESTARTS too). R's registry is first-wins
-        // anti-squat, so a random per-process key meant an abrupt restart within
-        // one period came back with the same derived cookie but a foreign reg_pk
-        // and was rejected (CookieClaimed) until the dead subscription aged out
-        // (600 s GC) — a live-path black hole on a small-relay topology. With the
-        // derived key the restart is a same-key refresh; `next_monotonic_epoch`
-        // tracks wall-clock, so the fresh registration's epoch is already above
-        // the relay's stored one. No sovereign identity → random cookie AND
-        // random key (nothing to be stable against).
+    ) -> std::result::Result<[u8; 16], veil_types::AnonOnionSendError> {
+        let seed = self.sovereign_onion_identity_seed();
         let now_unix = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
         let period = veil_anonymity::blinded_descriptor::current_period(now_unix);
-        let reg_keypair = Self::onion_reg_keypair_for_seed(
-            descriptor_identity_seed.as_deref().map(|seed| &**seed),
-            period,
-            descriptor_provider_slot,
-        )
-        .unwrap_or_else(|| veil_crypto::generate_keypair(veil_types::SignatureAlgorithm::Ed25519));
+        let (reg_keypair, cookie) =
+            Self::onion_reg_pair(seed.as_deref().map(|s| &**s), period, None);
+        self.register_onion_circuit_with_identity(
+            relay_path,
+            reg_keypair,
+            cookie,
+            seed,
+            false,
+            None,
+        )?;
+        Ok(cookie)
+    }
+
+    /// `reg_keypair` and `cookie` MUST be a pair minted by
+    /// [`Self::onion_reg_pair`]: the relay rejects a registration whose cookie
+    /// is not the one its key may claim, so the two cannot be chosen
+    /// independently any more. Taking the keypair rather than deriving it here
+    /// is what makes the seedless (random) case pair at all — a second random
+    /// mint would not match the caller's cookie.
+    fn register_onion_circuit_with_identity(
+        &self,
+        relay_path: &[[u8; 32]],
+        reg_keypair: veil_crypto::GeneratedKeyPair,
+        cookie: [u8; 16],
+        descriptor_identity_seed: Option<std::sync::Arc<zeroize::Zeroizing<[u8; 32]>>>,
+        ephemeral: bool,
+        descriptor_provider_slot: Option<u8>,
+    ) -> std::result::Result<(), veil_types::AnonOnionSendError> {
+        // Registration keypair: seed-derived per blinded-descriptor period, and
+        // the cookie is derived from it (L1 kept the key stable across REBUILDS;
+        // deriving it from the seed makes it stable across PROCESS RESTARTS
+        // too). R's registry is first-wins anti-squat, so a random per-process
+        // key meant an abrupt restart within one period came back with the same
+        // derived cookie but a foreign reg_pk and was rejected (CookieClaimed)
+        // until the dead subscription aged out (600 s GC) — a live-path black
+        // hole on a small-relay topology. With the derived key the restart is a
+        // same-key refresh; `next_monotonic_epoch` tracks wall-clock, so the
+        // fresh registration's epoch is already above the relay's stored one.
+        // No sovereign identity → a random key, and the cookie follows it.
+        debug_assert_eq!(
+            Some(cookie),
+            Self::onion_auth_cookie_for_keypair(&reg_keypair),
+            "cookie must be the one this registration key claims",
+        );
         // B2: per-service monotonic registration-epoch counter, reused on every
         // rebuild so re-registrations strictly increase even within one second.
         let registration_epoch = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
@@ -9094,24 +9148,20 @@ impl NodeServices {
             // re-registration AND the descriptor re-publish so they cannot diverge;
             // the in-memory entry is re-keyed to the new cookie on a successful build.
             let period_now = veil_anonymity::blinded_descriptor::current_period(now_unix);
-            let cookie_now = descriptor_identity_seed
-                .as_deref()
-                .map(|seed| {
-                    Self::onion_auth_cookie_for_seed(seed, period_now, descriptor_provider_slot)
-                })
-                .unwrap_or(cookie);
-            // The registration keypair rotates WITH the cookie's period (same
-            // derivation cadence): re-deriving here keeps the pair the relay
-            // holds equal to what a crash-restarted process would derive, so a
-            // restart right after a period boundary still lands on the same-key
-            // refresh path instead of CookieClaimed. Random-fallback entries
-            // keep their minted keypair (their cookie never rotates either).
-            let reg_keypair = Self::onion_reg_keypair_for_seed(
-                descriptor_identity_seed.as_deref().map(|seed| &**seed),
-                period_now,
-                descriptor_provider_slot,
-            )
-            .unwrap_or(reg_keypair);
+            // The registration keypair rotates WITH the cookie's period (they
+            // are one derivation now: the cookie IS a function of the key), so
+            // re-deriving here keeps the pair the relay holds equal to what a
+            // crash-restarted process would derive, and a restart right after a
+            // period boundary still lands on the same-key refresh path instead
+            // of CookieClaimed. Random-fallback entries (no sovereign identity)
+            // keep the keypair and cookie they were minted with — theirs never
+            // rotates, and re-minting would be a fresh unrelated service.
+            let (reg_keypair, cookie_now) = match descriptor_identity_seed.as_deref() {
+                Some(seed) => {
+                    Self::onion_reg_pair(Some(seed), period_now, descriptor_provider_slot)
+                }
+                None => (reg_keypair, cookie),
+            };
             // diff-audit Δ2-d: if the terminus never ACK'd the current circuit
             // (CircuitBuilt), its path is suspect — a hop is likely dead. Pick a
             // FRESH path rather than rebuilding the same frozen one. A confirmed
@@ -9309,13 +9359,13 @@ impl NodeServices {
                             }
                         })?;
                 let relay = *relay_path.last().expect("non-empty relay path");
-                let mut cookie = [0u8; 16];
-                rand_core::OsRng.fill_bytes(&mut cookie);
                 // Ephemeral one-shot reply circuit (build-once, no maintenance
                 // rebuild), so a fresh registration key is fine — no CookieClaimed
                 // concern (L1 only matters for the rebuilt hosted-service circuits).
-                let reply_reg_kp =
-                    veil_crypto::generate_keypair(veil_types::SignatureAlgorithm::Ed25519);
+                // The cookie is derived from that key rather than drawn
+                // independently: the relay checks the pairing, so an unpaired
+                // cookie would simply be refused.
+                let (reply_reg_kp, cookie) = Self::onion_reg_pair(None, 0, None);
                 let block = veil_proto::ReplyBlock {
                     rendezvous_node_id: relay,
                     auth_cookie: cookie,
@@ -9587,10 +9637,9 @@ impl NodeServices {
                         }
                     })?;
                 let relay = *relay_path.last().expect("non-empty relay path");
-                let mut cookie = [0u8; 16];
-                rand_core::OsRng.fill_bytes(&mut cookie);
-                let reply_reg_kp =
-                    veil_crypto::generate_keypair(veil_types::SignatureAlgorithm::Ed25519);
+                // Cookie derived from the one-shot reply key — see the sibling
+                // reply path; the relay refuses an unpaired cookie.
+                let (reply_reg_kp, cookie) = Self::onion_reg_pair(None, 0, None);
                 let block = veil_proto::ReplyBlock {
                     rendezvous_node_id: relay,
                     auth_cookie: cookie,
