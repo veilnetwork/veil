@@ -965,8 +965,15 @@ impl FrameDispatcher {
                 };
 
                 if usable {
+                    // Prove to the originator that the ACK came from the
+                    // terminus and not from a hop in between: only the two of
+                    // us hold this circuit's terminus key (it arrived sealed
+                    // to our X25519 key inside the setup envelope).
                     let ack = veil_anonymity::circuit_wire::CircuitBuiltPayload {
                         circuit_id: circuit_id_in,
+                        token: veil_anonymity::circuit_wire::circuit_built_token(
+                            &install.circuit_key,
+                        ),
                     };
                     self.send_relay_chain_msg(
                         &NodeId::from(prev_link),
@@ -1213,8 +1220,12 @@ impl FrameDispatcher {
         if let Some(table) = &self.circuit_table
             && let Some(state) = table.lookup_backward(&link, p.circuit_id)
         {
+            // Re-tag the id for the previous link and pass the terminus's
+            // token through untouched — we could not produce a valid one and
+            // must not be able to substitute our own.
             let out = CircuitBuiltPayload {
                 circuit_id: state.circuit_id_in,
+                token: p.token,
             };
             self.send_relay_chain_msg(
                 &NodeId::from(state.prev_link),
@@ -1232,6 +1243,24 @@ impl FrameDispatcher {
             .as_ref()
             .and_then(|t| t.lookup(&link, p.circuit_id))
         {
+            // Confirm ONLY on a token derived from the terminus hop key. The
+            // ACK arrives from the first hop, which knows the circuit id we
+            // match on and could otherwise mint this message itself — freezing
+            // us onto a path it never actually built.
+            let Some(terminus_key) = origin.circuit_keys.last() else {
+                return DispatchResult::NoResponse;
+            };
+            let expected = veil_anonymity::circuit_wire::circuit_built_token(terminus_key);
+            if !veil_anonymity::circuit_wire::circuit_built_token_matches(&expected, &p.token) {
+                // Anti-leak: say nothing on the wire. A hop that tried this
+                // learns only that nothing happened.
+                self.logger.warn(
+                    "anonymity.circuit.built_token_invalid",
+                    "CircuitBuilt ACK failed the terminus proof — a hop short of \
+                     the terminus tried to confirm this circuit; ignoring",
+                );
+                return DispatchResult::NoResponse;
+            }
             origin.mark_confirmed();
             self.logger.info(
                 "anonymity.circuit.confirmed",
@@ -2499,9 +2528,11 @@ mod tests {
             }));
         assert!(!confirmed.load(std::sync::atomic::Ordering::Relaxed));
 
-        // The terminus ACK arrives from the first hop tagged our origin id.
+        // The terminus ACK arrives from the first hop tagged our origin id,
+        // carrying the token only the terminus hop key can produce.
         let body = CircuitBuiltPayload {
             circuit_id: origin_cid,
+            token: veil_anonymity::circuit_wire::circuit_built_token(&[0x33u8; 32]),
         }
         .encode();
         let mut hdr = FrameHeader::new(
@@ -2515,6 +2546,63 @@ mod tests {
             confirmed.load(std::sync::atomic::Ordering::Relaxed),
             "CircuitBuilt ACK must confirm the origin circuit",
         );
+    }
+
+    /// VL-01: the ACK arrives FROM the first hop, which knows the circuit id
+    /// the originator matches on. Without the terminus proof it could mint this
+    /// message itself and freeze the originator onto a path it never built —
+    /// a black hole that looks healthy. A token it cannot derive must not
+    /// confirm anything.
+    #[test]
+    fn circuit_built_ack_without_the_terminus_token_does_not_confirm() {
+        use veil_anonymity::circuit_origin::{OriginCircuit, OriginCircuitTable};
+        use veil_anonymity::circuit_wire::CircuitBuiltPayload;
+
+        let terminus_key = [0x33u8; 32];
+        let origin_cid = 555u32;
+        let r_id = [0x9C; 32];
+
+        // Everything a malicious first hop could plausibly put in the field:
+        // zeroes, its own guess, and the raw key it does not have anyway.
+        let forged_tokens: [[u8; 32]; 3] = [
+            [0u8; 32],
+            [0xAB; 32],
+            veil_anonymity::circuit_wire::circuit_built_token(&[0x34u8; 32]),
+        ];
+
+        for forged in forged_tokens {
+            let mut d = crate::make_test_dispatcher(veil_cfg::NodeRole::Core);
+            d.circuit_origin = Some(std::sync::Arc::new(OriginCircuitTable::new()));
+            let confirmed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            d.circuit_origin
+                .as_ref()
+                .unwrap()
+                .insert(std::sync::Arc::new(OriginCircuit {
+                    circuit_keys: vec![terminus_key],
+                    first_hop: r_id,
+                    origin_circuit_id: origin_cid,
+                    created_unix: 0,
+                    confirmed: std::sync::Arc::clone(&confirmed),
+                    is_reply: false,
+                }));
+
+            let body = CircuitBuiltPayload {
+                circuit_id: origin_cid,
+                token: forged,
+            }
+            .encode();
+            let mut hdr = FrameHeader::new(
+                FrameFamily::RelayChain as u8,
+                RelayChainMsg::CircuitBuilt as u16,
+            );
+            hdr.body_len = body.len() as u32;
+            d.dispatch_relay_chain(&hdr, &body, NodeId::from(r_id));
+
+            assert!(
+                !confirmed.load(std::sync::atomic::Ordering::Relaxed),
+                "a forged CircuitBuilt token must never confirm the circuit",
+            );
+        }
     }
 
     /// A non-circuit-capable node (no SK / table) silently drops CircuitBuild.
