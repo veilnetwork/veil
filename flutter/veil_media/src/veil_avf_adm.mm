@@ -481,7 +481,14 @@ class VeilAvfAdm : public webrtc::webrtc_impl::AudioDeviceModuleDefault<
           if (rebuild_depth_ == 0) {
             rebuild_depth_ = 1;
             alog("avf_adm: rebuilding the engine after a failed start");
+#if TARGET_OS_OSX
+            // Drop the device preference so the rebuild comes up on the system
+            // default rather than the one that just refused to start. Guarded
+            // because `recording_device_id_` is itself macOS-only — iOS has no
+            // input-device selection, and building this line for iOS is what
+            // broke that target.
             recording_device_id_.store(kAudioObjectUnknown);
+#endif
             if (capture_tap_installed_) {
               @try {
                 [engine_.inputNode removeTapOnBus:0];
