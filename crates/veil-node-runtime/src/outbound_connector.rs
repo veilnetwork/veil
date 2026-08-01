@@ -7,7 +7,7 @@
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use veil_util::{lock, rlock, wlock};
+use veil_util::{lock, rlock};
 
 use rand_core::{OsRng, RngCore};
 
@@ -618,20 +618,25 @@ pub fn spawn_outbound_peers(
                                 let _swap_guard = runner.register_swap_channel(&access.handoff.swap_registry);
                                 runner.run().await;
                                 drop(_swap_guard);
-                                // Outbound sessions are never capacity-referral
-                                // (referral admission is inbound-only).
-                                access.dispatcher.on_session_closed(peer_id, false);
-                                // Evict ML-KEM key for this peer.
-                                wlock!(access.identity.peer_mlkem_keys).remove(peer_id.as_bytes());
-                                // Evict per-session ephemeral DK.
-                                lock!(access.identity.per_session_mlkem_dk).remove(peer_id.as_bytes());
-                                access.session_tx_registry
-                                    .write()
-                                    .unwrap_or_else(|p| p.into_inner())
-                                    .unregister_owned(peer_id.as_bytes(), &session_id);
-                                access
-                                    .session_outbox
-                                    .unregister_owned(peer_id, &session_id);
+                                // Owner-aware teardown: our own registrations
+                                // always, the peer-wide state only if no
+                                // reconnect has taken this peer over. See
+                                // `session_guard::release_session`.
+                                crate::runtime::session_guard::release_session(
+                                    crate::runtime::session_guard::SessionRelease {
+                                        session_tx_registry: &access.session_tx_registry,
+                                        session_outbox: &access.session_outbox,
+                                        session_close_generations: &access.session_close_generations,
+                                        identity: &access.identity,
+                                        dispatcher: &access.dispatcher,
+                                        logger: &access.logger,
+                                    },
+                                    peer_id,
+                                    &session_id,
+                                    // Outbound sessions are never capacity-referral
+                                    // (referral admission is inbound-only).
+                                    false,
+                                );
                                 let _ = runner.stream.shutdown().await;
 
                                 // trip the gateway-failover notify
