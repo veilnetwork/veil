@@ -40,6 +40,44 @@ pub const REG_PK_LEN: usize = 32;
 /// Max signature bytes accepted on the wire.
 const MAX_SIG_LEN: usize = 128;
 
+/// Domain separation for [`cookie_for_reg_pk`].
+const COOKIE_BINDING_CONTEXT: &str = "veil.circuit.register.v1 cookie from reg_pk";
+
+/// The one cookie a given registration key may claim.
+///
+/// ## Why the cookie is not free-form
+///
+/// First-registration-wins is only a defence while the legitimate service holds
+/// the entry. It does not survive the service losing it — R restarts, or the
+/// 600-second TTL reaps a subscription during an outage — and the cookie is
+/// public: it rides in the DHT ad so senders can find the service. Whoever
+/// registers first after that moment owns the cookie, and the real service is
+/// then rejected as the squatter (`CookieClaimed`) on its own name.
+///
+/// R cannot tell the two apart from anything it holds. It never learns the
+/// receiver's node_id — that is the property the whole design exists for — so
+/// it has no identity to check the claim against, and it never sees the ad, so
+/// it cannot look up which key the service published. Everything R knows is in
+/// the registration payload.
+///
+/// Deriving the cookie from the registration key puts the answer there. R
+/// recomputes it from `reg_pk` and rejects any pairing that does not match, so
+/// claiming a cookie now requires the key that hashes to it — a preimage
+/// problem — rather than merely being early. R still learns nothing about who
+/// the service is.
+///
+/// This costs nothing in key lifetime: for a sovereign service both the cookie
+/// and `reg_pk` were already derived from `(identity_seed, period, slot)` and
+/// so already rotated together. This makes that pairing checkable instead of
+/// merely conventional.
+#[must_use]
+pub fn cookie_for_reg_pk(reg_pk: &[u8; REG_PK_LEN]) -> [u8; COOKIE_LEN] {
+    let full = blake3::derive_key(COOKIE_BINDING_CONTEXT, reg_pk);
+    let mut cookie = [0u8; COOKIE_LEN];
+    cookie.copy_from_slice(&full[..COOKIE_LEN]);
+    cookie
+}
+
 /// Default cap on circuit-backed subscriptions at one relay (mirrors the
 /// rendezvous registry's `MAX_REGISTRATIONS`).
 pub const MAX_CIRCUIT_SUBSCRIPTIONS: usize = 10_000;
@@ -143,6 +181,10 @@ pub enum RegisterError {
     /// (diff-audit M2) — a replayed/stale registration. The legitimate holder
     /// always mints a fresher epoch on each rebuild.
     StaleEpoch,
+    /// The cookie is not the one this `reg_pk` may claim
+    /// ([`cookie_for_reg_pk`]) — a squat attempt on a public cookie, or a
+    /// producer that minted the two independently.
+    CookieNotBoundToKey,
 }
 
 struct Subscription {
@@ -184,6 +226,13 @@ impl CircuitRendezvousRegistry {
     ) -> Result<(), RegisterError> {
         if !payload.verify() {
             return Err(RegisterError::BadSignature);
+        }
+        // The signature proves possession of `reg_sk`; it says nothing about
+        // whether this key is entitled to THIS cookie. Without the binding a
+        // squatter signs its own key over any public cookie and wins the race
+        // the moment the real service loses its entry. See `cookie_for_reg_pk`.
+        if payload.cookie != cookie_for_reg_pk(&payload.reg_pk) {
+            return Err(RegisterError::CookieNotBoundToKey);
         }
         let mut g = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         match g.get(&payload.cookie) {
@@ -262,19 +311,30 @@ mod tests {
     use crate::circuit_table::CircuitTable;
     use veil_crypto::{generate_keypair, sign_message};
 
-    /// Make a signed registration for `cookie` under a fresh Ed25519 key at
-    /// `epoch`; return (payload, reg_pk_bytes).
-    fn signed_at(
-        cookie: [u8; COOKIE_LEN],
-        epoch: u64,
-    ) -> (CircuitRegisterPayload, [u8; REG_PK_LEN]) {
+    /// Make a signed registration under a fresh Ed25519 key at `epoch`.
+    /// The cookie is the one that key may claim, so every fresh key yields a
+    /// distinct cookie. Returns (payload, reg_pk_bytes).
+    fn signed_at(epoch: u64) -> (CircuitRegisterPayload, [u8; REG_PK_LEN]) {
         let kp = generate_keypair(SignatureAlgorithm::Ed25519);
-        signed_with(cookie, epoch, &kp)
+        signed_with(epoch, &kp)
     }
 
-    /// Sign for `cookie`/`epoch` under a SPECIFIC keypair (so a refresh can reuse
-    /// the same reg_pk with a fresher epoch, as the real service does).
+    /// Sign at `epoch` under a SPECIFIC keypair (so a refresh can reuse the
+    /// same reg_pk with a fresher epoch, as the real service does). The cookie
+    /// follows the key.
     fn signed_with(
+        epoch: u64,
+        kp: &veil_crypto::GeneratedKeyPair,
+    ) -> (CircuitRegisterPayload, [u8; REG_PK_LEN]) {
+        let reg_pk_bytes: [u8; REG_PK_LEN] =
+            STANDARD.decode(&kp.public_key).unwrap().try_into().unwrap();
+        let cookie = cookie_for_reg_pk(&reg_pk_bytes);
+        signed_pairing(cookie, epoch, kp)
+    }
+
+    /// Sign an ARBITRARY (cookie, key) pairing — used only to build the
+    /// mispaired claims the binding is there to refuse.
+    fn signed_pairing(
         cookie: [u8; COOKIE_LEN],
         epoch: u64,
         kp: &veil_crypto::GeneratedKeyPair,
@@ -300,9 +360,9 @@ mod tests {
         )
     }
 
-    /// Back-compat shim for tests that don't care about epoch: epoch = 1.
-    fn signed(cookie: [u8; COOKIE_LEN]) -> (CircuitRegisterPayload, [u8; REG_PK_LEN]) {
-        signed_at(cookie, 1)
+    /// Shim for tests that don't care about epoch: epoch = 1, fresh key.
+    fn signed() -> (CircuitRegisterPayload, [u8; REG_PK_LEN]) {
+        signed_at(1)
     }
 
     fn a_circuit() -> Arc<CircuitState> {
@@ -322,7 +382,7 @@ mod tests {
 
     #[test]
     fn payload_roundtrip_and_verify() {
-        let (p, _) = signed([0xC1; COOKIE_LEN]);
+        let (p, _) = signed();
         assert!(p.verify());
         let d = CircuitRegisterPayload::decode(&p.encode()).unwrap();
         assert_eq!(d, p);
@@ -334,7 +394,7 @@ mod tests {
         // Exact-length: the registration is the exact innermost circuit-setup
         // payload (unpadded), so trailing bytes after the signature are wire
         // malleability with no legitimate producer and must be rejected.
-        let (p, _) = signed([0xC2; COOKIE_LEN]);
+        let (p, _) = signed();
         let mut enc = p.encode();
         assert!(CircuitRegisterPayload::decode(&enc).is_some());
         enc.push(0x00); // trailing garbage
@@ -346,7 +406,7 @@ mod tests {
 
     #[test]
     fn tampered_signature_or_cookie_fails_verify() {
-        let (mut p, _) = signed([0x01; COOKIE_LEN]);
+        let (mut p, _) = signed();
         p.cookie[0] ^= 0xFF; // signature no longer covers this cookie
         assert!(!p.verify());
     }
@@ -354,16 +414,17 @@ mod tests {
     #[test]
     fn register_then_lookup() {
         let reg = CircuitRendezvousRegistry::new();
-        let (p, _) = signed([0xAB; COOKIE_LEN]);
+        let (p, _) = signed();
+        let cookie = p.cookie;
         reg.register(&p, a_circuit(), 1000).unwrap();
-        assert!(reg.lookup(&[0xAB; COOKIE_LEN]).is_some());
+        assert!(reg.lookup(&cookie).is_some());
         assert!(reg.lookup(&[0x00; COOKIE_LEN]).is_none());
     }
 
     #[test]
     fn rejects_bad_signature() {
         let reg = CircuitRendezvousRegistry::new();
-        let (mut p, _) = signed([0x02; COOKIE_LEN]);
+        let (mut p, _) = signed();
         p.signature[0] ^= 0xFF;
         assert_eq!(
             reg.register(&p, a_circuit(), 0),
@@ -375,20 +436,31 @@ mod tests {
     #[test]
     fn first_wins_blocks_squatter_but_allows_refresh() {
         let reg = CircuitRendezvousRegistry::new();
-        let cookie = [0x07; COOKIE_LEN];
         let kp = generate_keypair(SignatureAlgorithm::Ed25519);
-        let (legit, _) = signed_with(cookie, 10, &kp);
+        let cookie =
+            cookie_for_reg_pk(&STANDARD.decode(&kp.public_key).unwrap().try_into().unwrap());
+        let (legit, _) = signed_with(10, &kp);
         reg.register(&legit, a_circuit(), 0).unwrap();
 
-        // Squatter: same cookie, DIFFERENT reg_pk → rejected.
-        let (squat, _) = signed_at(cookie, 999);
+        // Squatter: same cookie, DIFFERENT reg_pk. It is now refused one step
+        // EARLIER than first-wins — the claim is malformed on its face, so the
+        // squatter loses even against an empty registry (the restart / TTL-reap
+        // window that first-wins never covered).
+        let (squat, _) =
+            signed_pairing(cookie, 999, &generate_keypair(SignatureAlgorithm::Ed25519));
         assert_eq!(
             reg.register(&squat, a_circuit(), 0),
-            Err(RegisterError::CookieClaimed)
+            Err(RegisterError::CookieNotBoundToKey)
+        );
+        let empty = CircuitRendezvousRegistry::new();
+        assert_eq!(
+            empty.register(&squat, a_circuit(), 0),
+            Err(RegisterError::CookieNotBoundToKey),
+            "an unheld cookie must not be claimable by a foreign key either",
         );
 
         // Legit owner refreshes (same reg_pk, FRESHER epoch) → ok.
-        let (refresh, _) = signed_with(cookie, 11, &kp);
+        let (refresh, _) = signed_with(11, &kp);
         reg.register(&refresh, a_circuit(), 100).unwrap();
         assert_eq!(reg.len(), 1);
     }
@@ -398,9 +470,8 @@ mod tests {
         // diff-audit M2: a captured registration cannot be replayed to re-bind
         // the cookie to a different circuit — its epoch is not strictly fresher.
         let reg = CircuitRendezvousRegistry::new();
-        let cookie = [0x55; COOKIE_LEN];
         let kp = generate_keypair(SignatureAlgorithm::Ed25519);
-        let (first, _) = signed_with(cookie, 100, &kp);
+        let (first, _) = signed_with(100, &kp);
         reg.register(&first, a_circuit(), 0).unwrap();
 
         // Replay of the SAME payload (same epoch) → rejected.
@@ -409,22 +480,22 @@ mod tests {
             Err(RegisterError::StaleEpoch)
         );
         // An OLDER epoch (same key) → rejected.
-        let (older, _) = signed_with(cookie, 50, &kp);
+        let (older, _) = signed_with(50, &kp);
         assert_eq!(
             reg.register(&older, a_circuit(), 1),
             Err(RegisterError::StaleEpoch)
         );
         // A strictly-fresher epoch from the legitimate holder → accepted.
-        let (fresher, _) = signed_with(cookie, 101, &kp);
+        let (fresher, _) = signed_with(101, &kp);
         reg.register(&fresher, a_circuit(), 2).unwrap();
     }
 
     #[test]
     fn cap_and_gc() {
         let reg = CircuitRendezvousRegistry::with_params(1, 300);
-        let (p1, _) = signed([0x10; COOKIE_LEN]);
+        let (p1, _) = signed();
         reg.register(&p1, a_circuit(), 0).unwrap();
-        let (p2, _) = signed([0x11; COOKIE_LEN]);
+        let (p2, _) = signed();
         assert_eq!(reg.register(&p2, a_circuit(), 0), Err(RegisterError::Full));
         // GC frees the first after TTL, making room.
         assert_eq!(reg.gc(300), 1);
