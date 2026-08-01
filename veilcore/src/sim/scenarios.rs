@@ -6533,13 +6533,16 @@ mod tests {
         // S registers a LOCATION-anonymous service: a 2-hop circuit S→N1→N3,
         // registering `cookie` AT N3 over that circuit (NO session register), and
         // publishes a rendezvous ad pointing at (N3, cookie, S's x25519).
-        let cookie = [0xC7u8; 16];
+        // The cookie is no longer the caller's to choose: R rejects any cookie
+        // that is not the one the service's registration key may claim, so the
+        // registration mints the pair and hands the cookie back.
         let r_id = net.node(3).node_id();
         let mid_id = net.node(1).node_id();
-        net.node(4)
+        let cookie = net
+            .node(4)
             .runtime
             .access()
-            .register_onion_circuit(&[mid_id, r_id], cookie)
+            .register_onion_circuit(&[mid_id, r_id])
             .expect("register_onion_circuit must succeed");
         net.node(4)
             .runtime
