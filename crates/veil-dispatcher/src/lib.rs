@@ -213,7 +213,25 @@ pub struct CryptoContext {
     /// bounded by TLS-style "break-then-decrypt": an attacker must both
     /// (a) record the ciphertext *and* (b) compromise the node later.
     ///
-    /// Mitigation options (not yet implemented):
+    /// Mitigation options (not yet implemented). The ticket key next door got
+    /// its rotation + overlap slot (see `veil_session::ticket`); this one did
+    /// not, because its key is PUBLISHED and the overlap window therefore has
+    /// to outlive everyone else's copy of the old EK. Measured constraints, so
+    /// the next attempt does not have to re-derive them:
+    ///
+    /// * a peer caches an EK for `IpcConfig::e2e_key_ttl_secs` (default 1h);
+    /// * the signed `MlKemCert` is refreshed on the sovereign republish tick
+    ///   (6h), so a rotated EK can take that long to reach the DHT;
+    /// * worst case is a peer that cached just before a republish, i.e. the
+    ///   old seed must stay decrypt-capable for **≥ 7h**; a rotation interval
+    ///   below that silently drops mail rather than failing loudly.
+    ///
+    /// A previous-seed slot with trial decryption (current, then previous)
+    /// avoids any wire change — no key ID needed — but `mlkem_dk_seed` and
+    /// `mlkem_ek` are plain `Arc<T>` read from 13 files (~135 references), so
+    /// making them swappable is a real refactor, and rotation must also
+    /// trigger an immediate republish instead of waiting out the 6h tick.
+    ///
     /// * Rotate `mlkem_dk_seed` on a configurable schedule and re-derive EK.
     /// * Use ephemeral ML-KEM per session (requires a second round-trip).
     ///

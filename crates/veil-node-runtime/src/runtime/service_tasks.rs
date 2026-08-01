@@ -1862,6 +1862,61 @@ impl NodeRuntime {
         lock_tasks(&self.tasks).sessions.push(handle);
     }
 
+    /// Spawn the ticket-key rotation task.
+    ///
+    /// The host ticket key used to be generated once at startup and kept for
+    /// the process lifetime, so a host compromised weeks into a run yielded a
+    /// key that decrypts every session ticket the process ever issued. Every
+    /// `TICKET_KEY_ROTATION_SECS` the issuer moves to a fresh key and keeps the
+    /// outgoing one as decrypt-only for one further interval — long enough for
+    /// tickets minted just before the swap to live out their TTL, which is why
+    /// the interval is pinned at or above `SESSION_TICKET_TTL_SECS`.
+    pub fn spawn_ticket_key_rotation_task(&mut self) {
+        let Some(shutdown_tx) = &self.shutdown_tx else {
+            return;
+        };
+        let mut shutdown_rx = shutdown_tx.subscribe();
+        let issuer = Arc::clone(&self.resumption.ticket_issuer);
+        let logger = Arc::clone(&self.logger);
+        let handle = supervised_spawn(
+            Arc::clone(&self.logger),
+            "ticket_key_rotation",
+            async move {
+                let mut interval = tokio::time::interval(std::time::Duration::from_secs(
+                    veil_session::ticket::TICKET_KEY_ROTATION_SECS,
+                ));
+                // The first tick fires immediately and the startup key is
+                // already fresh; rotating here would throw away a key nothing
+                // has used yet and open an overlap window for no reason.
+                interval.tick().await;
+                loop {
+                    tokio::select! {
+                        _ = interval.tick() => {
+                            match issuer.lock() {
+                                Ok(mut g) => g.rotate_fresh(),
+                                Err(p) => p.into_inner().rotate_fresh(),
+                            }
+                            logger.info(
+                                "ticket.key.rotated",
+                                format!(
+                                    "new host ticket key; previous kept for one more \
+                                     {}s window so live tickets still resume",
+                                    veil_session::ticket::TICKET_KEY_ROTATION_SECS,
+                                ),
+                            );
+                        }
+                        Ok(_) = shutdown_rx.changed() => {
+                            if *shutdown_rx.borrow() {
+                                break;
+                            }
+                        }
+                    }
+                }
+            },
+        );
+        lock_tasks(&self.tasks).background.push(handle);
+    }
+
     /// Spawn the route-miss handler.
     ///
     /// When `FrameDispatcher` can't forward a `DELIVERY_FORWARD` frame (no

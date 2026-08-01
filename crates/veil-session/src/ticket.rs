@@ -39,21 +39,44 @@ pub const AAD: &[u8] = b"ovl1-ticket-v1";
 /// is `SESSION_TICKET_TTL_SECS` ≈ 1 hour).
 pub const MAX_CONSUMED_TICKETS: usize = 8192;
 
+/// How often the host ticket key is replaced.
+///
+/// A ticket must stay decryptable for its whole life, so the outgoing key is
+/// retained as decrypt-only for one further interval. Two consequences fix the
+/// value:
+///
+/// * it must be **at least** [`SESSION_TICKET_TTL_SECS`], or a ticket issued
+///   just before a rotation would outlive the key that can read it and
+///   resumption would break for every peer holding one;
+/// * any single key can therefore decrypt at most a
+///   `2 × TICKET_KEY_ROTATION_SECS` window, which is what bounds the damage
+///   from a late host compromise.
+pub const TICKET_KEY_ROTATION_SECS: u64 = SESSION_TICKET_TTL_SECS;
+
+// The overlap argument above is a precondition, not a preference: a shorter
+// interval than the TTL silently breaks resumption rather than failing loudly,
+// so it is checked where a typo would be caught — at compile time.
+//
+// Tautological *today* because the interval is defined as the TTL, which is
+// exactly what clippy objects to. It is kept because the day someone gives
+// rotation its own value is the day it stops being tautological, and that is
+// the edit this needs to catch.
+#[allow(clippy::assertions_on_constants)]
+const _: () = assert!(
+    TICKET_KEY_ROTATION_SECS >= SESSION_TICKET_TTL_SECS,
+    "ticket rotation faster than the ticket TTL orphans live tickets",
+);
+
 // ── TicketKey ─────────────────────────────────────────────────────────────────
 
 /// A 256-bit host ticket key used to AEAD-encrypt/decrypt session tickets.
 ///
-/// The key is generated fresh at node startup and used for the node's
-/// lifetime.
-///
-/// NOTE: periodic key rotation — with a previous-key decrypt window to cover
-/// the transition — is the intended design but is **not yet wired**. There is
-/// no `TICKET_KEY_ROTATION_SECS` constant and no rotation task today, and
-/// [`TicketIssuer`] holds a single key (no previous-key slot). Consequently a
-/// ticket stays decryptable by this one key for the whole process lifetime;
-/// the `SESSION_TICKET_TTL_SECS` ceiling and the single-use `consumed_tickets`
-/// cache are what bound the actual exposure. When rotation lands, give
-/// `TicketIssuer` a `prev_key` and try it in `decrypt` before failing.
+/// Rotated on [`TICKET_KEY_ROTATION_SECS`]. [`TicketIssuer`] keeps the
+/// outgoing key in a decrypt-only previous slot for one further interval, so
+/// a ticket issued moments before a rotation is still readable for its whole
+/// life. Before this landed the key was generated once at startup and lived
+/// for the whole process, which meant a host compromised on day thirty
+/// yielded a key that decrypts every ticket ever issued by that process.
 ///
 /// # Memory hygiene (Phase 6 slice 6e)
 ///
@@ -133,10 +156,19 @@ impl TicketKey {
 /// break**. Single-use semantics close the window.
 pub struct TicketIssuer {
     key: TicketKey,
+    /// The previous key, kept for DECRYPT ONLY across the overlap window so a
+    /// ticket issued just before [`Self::rotate`] survives to its own expiry.
+    /// Never used to issue: a rotation must actually stop producing tickets
+    /// under the old key, or it buys nothing.
+    prev_key: Option<TicketKey>,
     /// replay-protection cache keyed by the
     /// AEAD nonce of every ticket that has been successfully
     /// decrypted. Each entry stores the ticket's `valid_until` so
     /// expired entries can be reclaimed lazily.
+    ///
+    /// Deliberately shared across both key slots: it is keyed by nonce, not by
+    /// key, so rotating cannot hand an attacker a second use of a ticket the
+    /// old key already spent.
     consumed_tickets: Mutex<HashMap<[u8; 12], u64>>,
 }
 
@@ -144,8 +176,31 @@ impl TicketIssuer {
     pub fn new(key: TicketKey) -> Self {
         Self {
             key,
+            prev_key: None,
             consumed_tickets: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Install [`next`] as the issuing key and demote the current one to the
+    /// decrypt-only slot.
+    ///
+    /// Ownership transfer, so the key being displaced out of `prev_key` is
+    /// dropped here — and `TicketKey` zeroizes on drop, which is the point:
+    /// after two rotations the oldest key is not merely unused, it is gone.
+    pub fn rotate(&mut self, next: TicketKey) {
+        let outgoing = std::mem::replace(&mut self.key, next);
+        self.prev_key = Some(outgoing);
+    }
+
+    /// [`Self::rotate`] onto a freshly generated key.
+    pub fn rotate_fresh(&mut self) {
+        self.rotate(TicketKey::generate());
+    }
+
+    /// Whether a previous key is currently held (the overlap window is open).
+    #[cfg(test)]
+    pub fn has_previous_key(&self) -> bool {
+        self.prev_key.is_some()
     }
 
     /// Encrypt a `SessionTicket` and return the opaque `EncryptedTicket` bytes.
@@ -257,16 +312,24 @@ impl TicketIssuer {
         let nonce = GenericArray::from_slice(&nonce_bytes);
         let ciphertext = &blob[12..]; // 160 + 16 bytes
 
-        let cipher = ChaCha20Poly1305::new(GenericArray::from_slice(self.key.key.as_array()));
-        let plaintext = cipher
-            .decrypt(
-                nonce,
-                chacha20poly1305::aead::Payload {
-                    msg: ciphertext,
-                    aad: AAD,
-                },
-            )
-            .ok()?;
+        // Current key first, then the overlap slot. Order matters only for
+        // cost: after a rotation the freshest tickets are the common case, and
+        // a forgery decrypts under neither.
+        let open = |k: &TicketKey| {
+            ChaCha20Poly1305::new(GenericArray::from_slice(k.key.as_array()))
+                .decrypt(
+                    nonce,
+                    chacha20poly1305::aead::Payload {
+                        msg: ciphertext,
+                        aad: AAD,
+                    },
+                )
+                .ok()
+        };
+        let plaintext = match open(&self.key) {
+            Some(p) => p,
+            None => open(self.prev_key.as_ref()?)?,
+        };
 
         let ticket = SessionTicket::decode(&plaintext).ok()?;
 
@@ -385,6 +448,81 @@ mod tests {
             ticket.issued_at + SESSION_TICKET_TTL_SECS
         );
     }
+
+    // ── key rotation + overlap window ────────────────────────────────────
+    //
+    // The property: rotating must shorten how long any one key is useful to a
+    // late attacker WITHOUT dropping tickets that are still live. Both halves
+    // matter — a rotation that orphans live tickets breaks resumption for
+    // every peer holding one, which is why it never shipped as a bare swap.
+
+    #[test]
+    fn a_ticket_issued_before_rotation_still_resumes_after_it() {
+        let mut issuer = make_issuer();
+        let blob = issuer.issue([1; 32], [2; 32], [3; 32], [4; 32]);
+
+        issuer.rotate(TicketKey::from_bytes([0x11; 32]));
+
+        assert!(issuer.has_previous_key());
+        let ticket = issuer
+            .decrypt(&blob)
+            .expect("the overlap window is what keeps a live ticket usable");
+        assert_eq!(ticket.session_id, [1; 32]);
+    }
+
+    #[test]
+    fn a_key_two_rotations_old_can_no_longer_read_its_tickets() {
+        // The whole point of rotating: the window has to actually close, or
+        // the previous slot is just a slower version of keeping every key.
+        let mut issuer = make_issuer();
+        let blob = issuer.issue([1; 32], [2; 32], [3; 32], [4; 32]);
+
+        issuer.rotate(TicketKey::from_bytes([0x11; 32]));
+        issuer.rotate(TicketKey::from_bytes([0x22; 32]));
+
+        assert!(
+            issuer.decrypt(&blob).is_none(),
+            "a key displaced out of the previous slot must be gone, not merely unused",
+        );
+    }
+
+    #[test]
+    fn rotation_issues_under_the_new_key_only() {
+        // A rotation that kept issuing under the old key would buy nothing:
+        // the compromise window would never stop growing.
+        let mut issuer = make_issuer();
+        issuer.rotate(TicketKey::from_bytes([0x11; 32]));
+        let blob = issuer.issue([9; 32], [8; 32], [7; 32], [6; 32]);
+
+        // The pre-rotation key alone cannot read what was issued after it.
+        let old_only = make_issuer();
+        assert!(old_only.decrypt(&blob).is_none());
+
+        // The new key alone can.
+        let new_only = TicketIssuer::new(TicketKey::from_bytes([0x11; 32]));
+        assert!(new_only.decrypt(&blob).is_some());
+    }
+
+    #[test]
+    fn a_ticket_spent_before_rotation_cannot_be_replayed_after_it() {
+        // The replay cache is keyed by nonce and shared across both slots, so
+        // rotating must not hand back a second use of a spent ticket.
+        let mut issuer = make_issuer();
+        let blob = issuer.issue([1; 32], [2; 32], [3; 32], [4; 32]);
+        assert!(issuer.decrypt(&blob).is_some(), "first use consumes it");
+
+        issuer.rotate(TicketKey::from_bytes([0x11; 32]));
+
+        assert!(
+            issuer.decrypt(&blob).is_none(),
+            "rotation must not resurrect a consumed ticket",
+        );
+    }
+
+    // NOTE: the "rotation interval covers a full ticket lifetime" precondition
+    // is NOT tested here — the `const _: () = assert!(...)` above it fails the
+    // BUILD, which is strictly stronger than failing a test, and a runtime copy
+    // would only be a second place to update.
 
     #[test]
     fn wrong_key_fails_to_decrypt() {

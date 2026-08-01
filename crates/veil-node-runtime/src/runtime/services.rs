@@ -176,6 +176,7 @@ impl NodeRuntime {
             S::SrflxProbe => self.spawn_srflx_probe_task(),
             S::BootstrapWatchdog => self.spawn_bootstrap_watchdog_task(config),
             S::SovereignIdentityRepublish => self.spawn_sovereign_identity_republish_task(),
+            S::TicketKeyRotation => self.spawn_ticket_key_rotation_task(),
             S::AuthDeliverHandler => self.spawn_auth_deliver_handler(),
             S::RendezvousRecipient => self.spawn_rendezvous_recipient_task(config),
             S::RendezvousResolveRefresh => self.spawn_rendezvous_resolve_refresh_task(),

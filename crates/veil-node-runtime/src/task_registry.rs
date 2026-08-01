@@ -91,6 +91,14 @@ pub enum RuntimeService {
     /// No-op on nodes without a loaded sovereign identity.
     SovereignIdentityRepublish,
 
+    /// Replaces the host ticket key every `TICKET_KEY_ROTATION_SECS`, keeping
+    /// the outgoing one as decrypt-only for one further interval.
+    ///
+    /// Without it the key is generated at startup and lives for the whole
+    /// process, so a host compromised weeks in surrenders a key that decrypts
+    /// every session ticket the process ever issued.
+    TicketKeyRotation,
+
     /// Authenticated-onion final-hop verify+deliver task (Epic 482 v1).
     /// Drains `auth_deliver_tx`: resolves the sender's identity document,
     /// runs `verify_auth_deliver` + the per-sender replay check, and delivers
@@ -190,6 +198,7 @@ impl RuntimeService {
         Self::SrflxProbe,
         Self::BootstrapWatchdog,
         Self::SovereignIdentityRepublish,
+        Self::TicketKeyRotation,
         Self::AuthDeliverHandler,
         Self::RendezvousRecipient,
         Self::RendezvousResolveRefresh,
