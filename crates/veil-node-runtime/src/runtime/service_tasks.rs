@@ -4343,6 +4343,7 @@ impl veil_types::AnonOnionSender for RuntimeAnonOnionSender {
                     self.hop_count,
                     Some((reply_app_id, reply_endpoint_id)),
                 )
+                .await
                 .map_err(|e| {
                     // Every daemon-side FETCH rejection funnels through here
                     // before the coarse AnonOnionSendError→u16 collapse the
