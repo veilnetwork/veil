@@ -147,12 +147,10 @@ pub struct TlsContext {
     pub cert_der: CertificateDer<'static>,
     /// Active client fingerprint mode.
     pub client_fingerprint: TlsClientFingerprint,
-    /// include Mozilla's webpki-roots in the client
-    /// trust store. When the binary lacks the `tls-webpki-roots`
-    /// feature, the flag has no effect. Preserved through
-    /// `with_trusted_certificates` / `with_server_identity` / etc.
-    /// so successive builder calls don't silently disable system
-    /// roots the operator asked for.
+    /// Include Mozilla's webpki-roots in the client trust store.
+    /// Preserved through `with_trusted_certificates` /
+    /// `with_server_identity` / etc. so successive builder calls don't
+    /// silently disable system roots the operator asked for.
     use_system_roots: bool,
 }
 
@@ -626,17 +624,14 @@ fn build_client_config(
             .add(cert)
             .map_err(|err| TransportError::Tls(err.to_string()))?;
     }
-    // bundle Mozilla's CA roots
-    // when the operator opts in via config. Was originally gated on
-    // the `tls-webpki-roots` feature, but `webpki-roots` is now always
-    // a direct dependency of `veil-transport` (the HTTPS-bootstrap
-    // and signed-update fetch paths require Web PKI verification
-    // regardless of feature flags). Keeping the cfg-gate was a silent
-    // config footgun — operators setting `use_system_roots = true`
-    // got nothing without the build flag and only a warn log. Now
-    // the config knob unconditionally controls behaviour; the
-    // `tls-webpki-roots` feature is a semver-stable no-op kept for
-    // existing build configs (scheduled for removal in a semver-major).
+    // Bundle Mozilla's CA roots when the operator opts in via config.
+    // This was originally gated on a `tls-webpki-roots` build feature,
+    // which was a silent footgun — an operator setting
+    // `use_system_roots = true` got nothing without the flag, and only a
+    // warn log to say so. `webpki-roots` is a direct dependency either
+    // way (the HTTPS-bootstrap and signed-update paths need Web PKI
+    // verification regardless), so the gate bought nothing. The feature
+    // stood as a no-op for a while and is now gone.
     if include_system_roots {
         roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
     }

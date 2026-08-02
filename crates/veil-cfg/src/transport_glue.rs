@@ -78,10 +78,10 @@ pub fn context_from_config(config: &Config) -> Result<TransportContext> {
         .with_tls_fingerprint(fingerprint_policy);
 
     // apply TLS trust-store config knobs.
-    // closed the build-flag footgun — `use_system_roots = true`
-    // is now respected unconditionally (webpki-roots is a direct dep
-    // either way). The `tls-webpki-roots` feature is now a no-op kept
-    // for existing build configs; scheduled for removal in semver-major.
+    // `use_system_roots = true` is respected unconditionally —
+    // webpki-roots is a direct dep either way. (The `tls-webpki-roots`
+    // build feature that used to gate this became a no-op and has now
+    // been removed outright.)
     let tls_cfg = &config.transport.tls_client;
     if tls_cfg.use_system_roots {
         ctx.tls = ctx.tls.with_system_roots(true)?;

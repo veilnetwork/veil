@@ -3516,10 +3516,10 @@ pub struct TlsClientConfig {
     /// bundle in the rustls client trust store. Default `false`:
     /// veil trusts only operator-pinned CAs via `trusted_ca_file`.
     /// Flip to `true` for mesh nodes connecting to publicly-certified
-    /// seeds (Let's Encrypt, etc.). : this used
-    /// to require the `tls-webpki-roots` build feature; that gate is
-    /// gone (webpki-roots is now an unconditional dep), so this knob
-    /// works in every build.
+    /// seeds (Let's Encrypt, etc.). This used to require a
+    /// `tls-webpki-roots` build feature; that gate is gone
+    /// (webpki-roots is an unconditional dep), so the knob works in
+    /// every build.
     #[serde(default, skip_serializing_if = "is_false")]
     pub use_system_roots: bool,
 

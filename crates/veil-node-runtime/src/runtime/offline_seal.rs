@@ -1,19 +1,20 @@
-//! DORMANT runtime entry points for offline (store-and-forward mailbox)
-//! delivery: seal a message into a mailbox blob, and open one fetched for us.
+//! Offline (store-and-forward mailbox) delivery: seal a message into a mailbox
+//! blob, and open one fetched for us.
 //!
 //! The seal/open logic lives on [`RuntimeMailboxCrypto`], a handle holding the
-//! cloned `Arc` components it needs. `NodeRuntime` exposes thin
-//! [`seal_offline_blob`](super::NodeRuntime::seal_offline_blob) /
-//! [`open_offline_blob`](super::NodeRuntime::open_offline_blob) wrappers, and
-//! `RuntimeMailboxCrypto` ALSO implements [`veil_ipc::MailboxCryptoSink`] so the
-//! IPC server can call it — `NodeRuntime` itself can't be `Arc`-wrapped (circular
-//! reference) and the IPC server only gets `Arc<dyn>` sinks, so the logic is
-//! parameterised over the components rather than over `&NodeRuntime`.
+//! cloned `Arc` components it needs. It implements [`veil_ipc::MailboxCryptoSink`]
+//! and `service_tasks` installs it on the IPC server, which is how the app layer
+//! reaches it — `NodeRuntime` itself can't be `Arc`-wrapped (circular reference)
+//! and the IPC server only gets `Arc<dyn>` sinks, so the logic is parameterised
+//! over the components rather than over `&NodeRuntime`.
 //!
-//! NOTHING wires this into a send/receive path yet (the app-layer orchestration
-//! and the IPC dispatch are still to build), and the DHT resolution can't be
-//! exercised in an in-process unit test, so the live behaviour is UNVALIDATED —
-//! needs an integration test on a real node + `/code-review ultra`.
+//! This header used to open with "DORMANT" and "NOTHING wires this into a
+//! send/receive path yet". Both stopped being true once the sink was installed;
+//! two thin `NodeRuntime::{seal,open}_offline_blob` wrappers stayed genuinely
+//! uncalled and have been removed rather than kept as evidence for a claim
+//! about the whole module. The DHT resolution still cannot be exercised
+//! in-process, so that part of the path is covered by live testing, not by the
+//! unit tests below.
 //!
 //! Key-handling invariant: the ML-KEM seeds and the sovereign signing key never
 //! leave the runtime — `open` lifts candidates out of the seed ring into a
@@ -340,28 +341,6 @@ impl super::NodeRuntime {
             mlkem_keys: Arc::clone(&self.identity.mlkem_keys),
             logger: Arc::clone(&self.logger),
         }
-    }
-
-    /// DORMANT. See [`RuntimeMailboxCrypto::seal`].
-    pub async fn seal_offline_blob(
-        &self,
-        recipient_node_id: [u8; 32],
-        app_id: [u8; 32],
-        endpoint_id: u32,
-        data: &[u8],
-    ) -> Result<Vec<u8>, OfflineSealError> {
-        self.mailbox_crypto()
-            .seal(recipient_node_id, app_id, endpoint_id, data)
-            .await
-    }
-
-    /// DORMANT. See [`RuntimeMailboxCrypto::open`].
-    pub async fn open_offline_blob(
-        &self,
-        blob: &[u8],
-        our_cert_version: u64,
-    ) -> Result<AuthAppDeliver, OfflineSealError> {
-        self.mailbox_crypto().open(blob, our_cert_version).await
     }
 }
 

@@ -51,14 +51,6 @@ test-low-difficulty = [
 # Quinn's rustls provider because quinn-btls 0.1 panics during otherwise valid
 # application-secret transitions and can abort the whole embedded process.
 tls-boring = ["dep:btls", "dep:tokio-btls", "veil-transport/tls-boring", "veil-bootstrap/tls-boring", "veil-update/tls-boring"]
-# Phase 6.50.b audit-C2: `tls-webpki-roots` is now a semver-stable
-# no-op kept for existing build configs (see veil-transport's feature
-# definition for the full history).  `use_system_roots = true` in
-# `transport.tls_client` config is now respected unconditionally —
-# webpki-roots is always present in the binary because
-# `veil-transport` needs it for the HTTPS bootstrap path.
-# Scheduled for removal in the next semver-major.
-tls-webpki-roots = ["veil-transport/tls-webpki-roots"]
 
 # Phase 5 (veilcore extraction): `veil-cli` binary moved to veil-cli crate.
 

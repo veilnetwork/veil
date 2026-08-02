@@ -16,7 +16,6 @@ test-low-difficulty = [
 # Pass-through for TLS-boring (cfg's TLS-context glue reads bootstrap features).
 tls-boring = ["veil-transport/tls-boring"]
 # Backwards-compat no-op.
-tls-webpki-roots = ["veil-transport/tls-webpki-roots"]
 
 [dependencies]
 veil-adaptive = { path = "../veil-adaptive" }
