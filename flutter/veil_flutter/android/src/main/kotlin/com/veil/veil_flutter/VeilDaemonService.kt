@@ -220,7 +220,14 @@ class VeilDaemonService : Service() {
             if (ringing) {
                 val acceptIntent = Intent(openIntent).apply {
                     action = APP_ACTION_ACCEPT
-                    putExtra("xveil_call_action", "accept")
+                    putExtra(CallActionCapability.EXTRA_CALL_ACTION, "accept")
+                    // Without this the extra above is a request any installed
+                    // app can make of the exported launcher activity. See
+                    // CallActionCapability.
+                    putExtra(
+                        CallActionCapability.EXTRA_CALL_TOKEN,
+                        CallActionCapability.mint("accept"),
+                    )
                 }
                 val acceptPendingIntent = PendingIntent.getActivity(
                     this,
@@ -236,7 +243,11 @@ class VeilDaemonService : Service() {
             }
             val endIntent = Intent(openIntent).apply {
                 action = APP_ACTION_HANGUP
-                putExtra("xveil_call_action", "hangup")
+                putExtra(CallActionCapability.EXTRA_CALL_ACTION, "hangup")
+                putExtra(
+                    CallActionCapability.EXTRA_CALL_TOKEN,
+                    CallActionCapability.mint("hangup"),
+                )
             }
             val endPendingIntent = PendingIntent.getActivity(
                 this,
@@ -292,6 +303,11 @@ class VeilDaemonService : Service() {
     }
 
     private fun stopForegroundCompat() {
+        // The notification carrying the accept / hangup buttons is going away,
+        // so the capabilities it handed out must go with it. Without this a
+        // PendingIntent the system still holds — or one already delivered and
+        // re-delivered — could act on a call that has ended.
+        CallActionCapability.revokeAll()
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
             stopForeground(STOP_FOREGROUND_REMOVE)
         } else {
