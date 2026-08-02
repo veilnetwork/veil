@@ -10,16 +10,6 @@ license = "AGPL-3.0-or-later"
 # Mirrors veilcore's `tls-boring` feature so downstream binaries can
 # enable it via `veil-transport = { …, features = ["tls-boring"] }`.
 tls-boring = ["dep:btls", "dep:tokio-btls"]
-# Phase 6.50.b audit-C2: `tls-webpki-roots` is now a semver-stable
-# no-op kept for existing build configs.  Originally gated a cfg-block
-# in `context.rs` that decided whether `use_system_roots = true` actually
-# applied Mozilla roots; that gate was a silent footgun (operator says
-# "yes, use Mozilla roots", build flag not set → silent fall-through to
-# pinned-CAs-only with only a warn log).  `webpki-roots` is now a direct
-# dep either way (the HTTPS-bootstrap and signed-update fetch paths
-# require it unconditionally), so the build-flag/runtime-flag split
-# served no purpose.  Scheduled for removal in the next semver-major.
-tls-webpki-roots = []
 
 [dependencies]
 veil-error = { path = "../veil-error" }

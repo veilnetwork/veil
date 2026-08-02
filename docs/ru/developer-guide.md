@@ -688,7 +688,6 @@ registry.register("bt", Box::new(BluetoothTransportFactory));
 |------|-------|--------|
 | `rocksdb-cold` (default) | `veilcore`, `veil-cli` | Включает бэкенд RocksDB для холодных хранилищ (mailbox, холодный уровень DHT). Требует `librocksdb`. |
 | `tls-boring` (default у `veil-cli`) | `veilcore`, `veil-cli` | Заменяет `rustls` на BoringSSL (`btls`/`tokio-btls`/`quinn-btls`); даёт Chrome-подобный отпечаток ClientHello JA3/JA4 + ротацию (базовый путь обхода DPI). У `veilcore` выключен по умолчанию, у `veil-cli` — включён. |
-| `tls-webpki-roots` | `veilcore`, `veil-cli` | Semver-стабильная пустышка (no-op) для существующих конфигов сборки (webpki-roots всегда есть в бинарнике для первичного подключения по HTTPS). |
 | `production-seeds` | `veilcore`, `veil-cli` | Встраивает боевые seed-узлы (узлы первичного входа) в бинарник. |
 | `allow-empty-seeds` | `veilcore`, `veil-cli` | Разрешает запуск без seed-узлов (только для разработки и тестов). |
 | `test-low-difficulty` | `veilcore`, `veil-cli` | Снижает PoW-сложность личности до 16 бит для devnet и тестов (в продакшене — 24 бита). |

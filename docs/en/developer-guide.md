@@ -685,7 +685,6 @@ straight: the **library crate** `veilcore` and the **user-facing binary**
 |------|-------|--------|
 | `rocksdb-cold` (default) | `veilcore`, `veil-cli` | Enables the RocksDB backend for cold stores (mailbox, DHT cold tier). Requires `librocksdb`. |
 | `tls-boring` (default for `veil-cli`) | `veilcore`, `veil-cli` | Replaces `rustls` with BoringSSL (`btls`/`tokio-btls`/`quinn-btls`); provides a Chrome-like JA3/JA4 ClientHello fingerprint + rotation (the basic DPI-evasion path). Off by default for `veilcore`, on for `veil-cli`. |
-| `tls-webpki-roots` | `veilcore`, `veil-cli` | A semver-stable no-op for existing build configs (webpki-roots is always present in the binary for HTTPS bootstrap). |
 | `production-seeds` | `veilcore`, `veil-cli` | Embeds production seed nodes into the binary. |
 | `allow-empty-seeds` | `veilcore`, `veil-cli` | Allows starting without seeds (for dev/test only). |
 | `test-low-difficulty` | `veilcore`, `veil-cli` | Lowers the identity PoW difficulty to 16 bits for devnet/tests (in production it is 24 bits). |
