@@ -1234,16 +1234,46 @@ impl NodeRuntime {
                         );
                         Some(Arc::new(sov))
                     }
-                    Err(e) => {
-                        // Log and continue as legacy — a corrupt identity
-                        // file should not block node startup. Operator
-                        // intervention required to re-provision via
-                        // `veil-cli identity create`.
+                    Err(e) if config.global.allow_identity_fallback => {
+                        // Explicitly permitted: the operator asked for a node
+                        // that comes up even with a broken document, e.g. to
+                        // reach `veil-cli identity restore` on a host they
+                        // cannot otherwise log into.
                         logger.warn(
                             "node.sovereign_identity.load_failed",
-                            format!("{e} — running as legacy node_id-keyed"),
+                            format!(
+                                "{e} — running as legacy node_id-keyed \
+                                 (allow_identity_fallback = true)"
+                            ),
                         );
                         None
+                    }
+                    Err(e) => {
+                        // Fail closed. A MISSING document is ordinary and still
+                        // starts the node as legacy — that path is untouched.
+                        // A document that exists and does not load is a
+                        // different thing: the operator provisioned an
+                        // identity, it is on disk, and it is broken.
+                        //
+                        // Continuing ran the node under a DIFFERENT identity
+                        // binding than the one its operator installed — peers
+                        // see an unrelated legacy node, multi-device pairing
+                        // does not apply, and one warning line was the only
+                        // trace of the downgrade (audit V-07).
+                        logger.error(
+                            "node.sovereign_identity.load_failed",
+                            format!("{e} — refusing to start as a legacy node"),
+                        );
+                        return Err(NodeError::Config(
+                            veil_cfg::ConfigError::ValidationFailed(format!(
+                            "sovereign identity at {} exists but cannot be \
+                             loaded: {e}. Re-provision with `veil-cli identity \
+                             create`/`restore`, or set \
+                             [global].allow_identity_fallback = true to start \
+                             as an unrelated legacy node on purpose.",
+                                doc_path.display()
+                            )),
+                        ));
                     }
                 }
             } else if config.ephemeral_identity {

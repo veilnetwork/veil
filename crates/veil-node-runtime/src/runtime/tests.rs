@@ -2878,3 +2878,75 @@ async fn the_reply_circuit_wait_yields_to_the_single_worker() {
     runtime.stop().await.expect("runtime stops");
     let _ = fs::remove_file(path);
 }
+
+/// An `identity_document.bin` that exists but does not load must stop the node.
+///
+/// A MISSING document is ordinary: a node is required to start without a
+/// sovereign identity, and that path is deliberately unchanged. A document
+/// that is PRESENT and unreadable is a different thing — the operator
+/// provisioned an identity, it is on disk, and it is broken. Starting anyway
+/// ran the node under a different identity binding than the one its operator
+/// installed (peers see an unrelated legacy node, multi-device pairing does
+/// not apply), with one warning line as the only trace (audit V-07).
+#[tokio::test(flavor = "current_thread")]
+async fn a_corrupt_identity_document_refuses_to_start_unless_allowed() {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
+    // Its own directory: the document sits NEXT TO the config, and a shared
+    // temp dir would leak it into every other runtime test.
+    let dir = std::env::temp_dir().join(format!("v07-identity-{unique}"));
+    // A previous FAILED run leaves its corrupt document behind, and the
+    // counter restarts at 0 in a fresh process — reusing that directory made
+    // the no-document control fail for the previous run's reason.
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("node.toml");
+
+    let mut config = runtime_config_with_listen();
+    config.global.allow_identity_fallback = false;
+    veil_cfg::save_config(&path, &config).unwrap();
+
+    // Control FIRST: with no document at all the node still starts. This is
+    // the invariant the fix must not break.
+    {
+        let mut runtime = NodeRuntime::start(&path, true)
+            .await
+            .expect("a node with NO sovereign identity must still start");
+        runtime.stop().await.expect("runtime stops");
+    }
+
+    // Now a document that exists and is not a valid one.
+    let doc = dir.join(veil_identity::sovereign::IDENTITY_DOCUMENT_FILE);
+    fs::write(&doc, b"not an identity document").unwrap();
+
+    let err = NodeRuntime::start(&path, true)
+        .await
+        .err()
+        .expect("a present-but-unloadable document must refuse to start");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("cannot be loaded"),
+        "the error must say WHAT is wrong, not just fail: {msg}"
+    );
+
+    // Opting in explicitly brings it up as legacy, which is the recovery path.
+    config.global.allow_identity_fallback = true;
+    // Written fresh, not patched: `save_config` PATCHES an existing file, and
+    // the patcher only rewrites keys the file already carries — a flag absent
+    // from it stays absent. An operator sets this by editing the file, which
+    // is the same full-file path.
+    let _ = fs::remove_file(&path);
+    veil_cfg::save_config(&path, &config).unwrap();
+    let reloaded = veil_cfg::load_config(&path).unwrap();
+    assert!(
+        reloaded.global.allow_identity_fallback,
+        "precondition: the opt-in must survive a save/load round-trip"
+    );
+    let mut runtime = NodeRuntime::start(&path, true)
+        .await
+        .expect("allow_identity_fallback = true must start as legacy");
+    runtime.stop().await.expect("runtime stops");
+
+    let _ = fs::remove_dir_all(&dir);
+}
