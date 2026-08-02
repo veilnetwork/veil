@@ -62,10 +62,19 @@ object CallActionCapability {
      */
     fun consume(action: String?, token: String?): Boolean {
         if (action == null || token == null) return false
-        val expected = synchronized(lock) { live[action] } ?: return false
-        if (!constantTimeEquals(expected, token)) return false
-        synchronized(lock) { if (live[action] == expected) live.remove(action) }
-        return true
+        // ONE critical section: compare AND remove (audit V-12). Split across
+        // two `synchronized` blocks, two concurrent callers both read the same
+        // `expected`, both matched, and both returned true — the second one's
+        // removal was a no-op it had already been paid for. "One-shot" then
+        // rested on the main looper serialising callers rather than on this
+        // code, which is the kind of guarantee that evaporates the first time
+        // an action is dispatched from anywhere else.
+        synchronized(lock) {
+            val expected = live[action] ?: return false
+            if (!constantTimeEquals(expected, token)) return false
+            live.remove(action)
+            return true
+        }
     }
 
     /** Drop every outstanding capability — the call is over, nothing may act. */
