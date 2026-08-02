@@ -98,6 +98,37 @@ pub const DEFAULT_QUOTA_PER_SENDER_BYTES: u64 = 10 * 1024 * 1024;
 /// Default global per-relay quota in bytes (10 GiB).
 pub const DEFAULT_QUOTA_GLOBAL_BYTES: u64 = 10 * 1024 * 1024 * 1024;
 
+/// What one stored record costs the relay BEYOND its payload.
+///
+/// The quota used to charge the payload and nothing else, and a 1-byte blob is
+/// legal ([`MIN_BLOB_BYTES`] = 1). A record is not 1 byte on disk: it is a
+/// primary key, a 44-byte record header, a 64-byte blobs key, a 72-byte
+/// eviction key, and the page overhead redb adds around all of it. So a byte
+/// quota sized for payload ran out of DISK and I/O long before it ran out of
+/// quota — millions of one-byte records fit inside a cap that believed it was
+/// holding megabytes (audit V-05).
+///
+/// Charged on every record, so the configured quotas now mean roughly what an
+/// operator reads them to mean: physical bytes. It also bounds the record
+/// COUNT, which is the amplification's actual lever — `quota / 256` records,
+/// rather than `quota / 1`.
+///
+/// 256 rather than the ~180 the pieces add up to: page overhead is not exactly
+/// countable, and a floor that is slightly generous is the safe direction for a
+/// limit whose job is to stop a disk filling.
+pub const RECORD_OVERHEAD_BYTES: u64 = 256;
+
+/// The quota cost of storing a blob of `payload_len` bytes.
+///
+/// Used at EVERY site that adds to or subtracts from a quota counter. That
+/// symmetry is the whole safety property here: charge on the way in and refund
+/// something else on the way out, and the counters drift until the relay
+/// believes it is full of blobs it no longer holds.
+#[inline]
+pub fn billable_bytes(payload_len: u64) -> u64 {
+    payload_len.saturating_add(RECORD_OVERHEAD_BYTES)
+}
+
 /// Default TTL for individual blobs (7 days).
 pub const DEFAULT_TTL_SECS: u64 = 7 * 24 * 60 * 60;
 
@@ -685,19 +716,22 @@ impl Mailbox {
         blob: Vec<u8>,
         trust_class: TrustClass,
     ) -> Result<PutOutcome, MailboxError> {
-        let blob_size = blob.len() as u64;
-        if blob_size > MAX_BLOB_BYTES {
+        let payload_len = blob.len() as u64;
+        // Quota accounting is in BILLABLE bytes from here on; the raw payload
+        // length is what the MIN/MAX blob checks below are about.
+        let blob_size = billable_bytes(payload_len);
+        if payload_len > MAX_BLOB_BYTES {
             return Err(MailboxError::BlobTooLarge {
-                actual: blob_size,
+                actual: payload_len,
                 max: MAX_BLOB_BYTES,
             });
         }
         // audit: reject empty / below-minimum blobs. See
         // `MIN_BLOB_BYTES` doc-comment for why — empty puts bypass
         // the byte-counted quota and accumulate redb row overhead.
-        if blob_size < MIN_BLOB_BYTES {
+        if payload_len < MIN_BLOB_BYTES {
             return Err(MailboxError::BlobTooSmall {
-                actual: blob_size,
+                actual: payload_len,
                 min: MIN_BLOB_BYTES,
             });
         }
@@ -845,7 +879,8 @@ impl Mailbox {
                             // record header overhead; saturating so a malformed
                             // sub-44-byte record can never underflow-panic here
                             // (decode_record_header above already enforces ≥ 44).
-                            let victim_size = (victim_record.len() as u64).saturating_sub(44);
+                            let victim_size =
+                                billable_bytes((victim_record.len() as u64).saturating_sub(44));
                             // Remove from blobs + correct eviction index +
                             // adjust counters (receiver, sender, global).
                             blobs.remove(victim_blob_key.as_slice())?;
@@ -1007,7 +1042,8 @@ impl Mailbox {
                 None => false,
                 Some(record_bytes) => {
                     let (sender, deposited_at, blob) = decode_record(&record_bytes)?;
-                    let blob_size = blob.len() as u64;
+                    // Billable, matching what the put charged (audit V-05).
+                    let blob_size = billable_bytes(blob.len() as u64);
                     blobs.remove(key.as_slice())?;
                     let evict_key = make_eviction_key(deposited_at, &receiver, &content_id);
                     // ack does not know which
@@ -1111,7 +1147,8 @@ impl Mailbox {
                 let record_bytes_opt = blobs.get(blob_key.as_slice())?.map(|g| g.value().to_vec());
                 if let Some(record_bytes) = record_bytes_opt {
                     let (sender, _ts, blob) = decode_record(&record_bytes)?;
-                    let blob_size = blob.len() as u64;
+                    // Billable, matching what the put charged (audit V-05).
+                    let blob_size = billable_bytes(blob.len() as u64);
                     blobs.remove(blob_key.as_slice())?;
                     let recv_total = bytes_per_receiver
                         .get(recv.as_slice())?

@@ -54,28 +54,35 @@ fn t1_4_p1_duplicate_put_is_noop() {
 
 #[test]
 fn t1_4_p1_per_receiver_quota_rejects_when_exceeded() {
-    // Tiny per-receiver cap: 100 bytes.
+    // Room for exactly one 80-byte record.
+    //
+    // Quotas are charged in BILLABLE bytes — the payload plus the overhead a
+    // stored row actually costs (audit V-05) — so the cap is expressed the
+    // same way. Charging payload alone let a byte quota admit millions of
+    // one-byte records and run the relay out of disk long before it ran out
+    // of quota.
     let cfg = MailboxConfig {
-        quota_per_receiver_bytes: 100,
+        quota_per_receiver_bytes: crate::billable_bytes(80),
         rate_limit_per_minute: 0, // disable to focus on quota
         ..MailboxConfig::default()
     };
     let (mb, _tmp, _clk) = fresh(cfg);
     let recv = [1u8; 32];
 
-    // 80 bytes — fits.
+    // Exactly fills the cap.
     let out = mb.put(recv, [1u8; 32], [9u8; 32], vec![0u8; 80]).unwrap();
     assert!(matches!(out, PutOutcome::Stored { .. }));
 
-    // Next 30 bytes — would push to 110 > 100. Reject.
+    // Nothing else fits, however small — which is the point: a 30-byte
+    // payload is not a 30-byte record.
     let out = mb.put(recv, [2u8; 32], [9u8; 32], vec![0u8; 30]).unwrap();
     match out {
         PutOutcome::QuotaPerReceiverExceeded {
             current_bytes,
             cap_bytes,
         } => {
-            assert_eq!(current_bytes, 80);
-            assert_eq!(cap_bytes, 100);
+            assert_eq!(current_bytes, crate::billable_bytes(80));
+            assert_eq!(cap_bytes, crate::billable_bytes(80));
         }
         other => panic!("expected QuotaPerReceiverExceeded, got {:?}", other),
     }
@@ -90,10 +97,12 @@ fn t1_4_p1_per_receiver_quota_rejects_when_exceeded() {
 
 #[test]
 fn t1_4_p1_global_quota_evicts_oldest_first() {
-    // Global cap 200 bytes, no per-receiver cap (set very high), no rate limit.
+    // Global cap: room for exactly TWO 80-byte records, so the third has to
+    // evict one. Sized in billable bytes — payload plus per-record overhead
+    // (audit V-05) — because that is what the quota now charges.
     let cfg = MailboxConfig {
         quota_per_receiver_bytes: u64::MAX,
-        quota_global_bytes: 200,
+        quota_global_bytes: 2 * crate::billable_bytes(80),
         rate_limit_per_minute: 0,
         require_capability_token: false,
         quota_per_sender_bytes: u64::MAX,
@@ -142,7 +151,7 @@ fn t1_4_p1_global_quota_evicts_oldest_first() {
 fn phase650b_recent_blobs_protected_from_eviction_under_flood() {
     let cfg = MailboxConfig {
         quota_per_receiver_bytes: u64::MAX,
-        quota_global_bytes: 200,
+        quota_global_bytes: crate::billable_bytes(200),
         rate_limit_per_minute: 0,
         require_capability_token: false,
         quota_per_sender_bytes: u64::MAX,
@@ -189,7 +198,7 @@ fn phase650b_recent_blobs_protected_from_eviction_under_flood() {
 fn t1_4_p1_global_quota_smaller_than_blob_rejects() {
     let cfg = MailboxConfig {
         quota_per_receiver_bytes: u64::MAX,
-        quota_global_bytes: 50,
+        quota_global_bytes: crate::billable_bytes(50),
         rate_limit_per_minute: 0,
         require_capability_token: false,
         quota_per_sender_bytes: u64::MAX,
@@ -205,8 +214,10 @@ fn t1_4_p1_global_quota_smaller_than_blob_rejects() {
             blob_size,
             cap_bytes,
         } => {
-            assert_eq!(blob_size, 100);
-            assert_eq!(cap_bytes, 50);
+            // Both in billable bytes: the outcome reports what the put would
+            // have COST, not the payload it carried (audit V-05).
+            assert_eq!(blob_size, crate::billable_bytes(100));
+            assert_eq!(cap_bytes, crate::billable_bytes(50));
         }
         other => panic!("expected QuotaGlobalExceeded, got {:?}", other),
     }
@@ -215,7 +226,7 @@ fn t1_4_p1_global_quota_smaller_than_blob_rejects() {
 #[test]
 fn t1_4_p1_ack_removes_blob_and_frees_quota() {
     let cfg = MailboxConfig {
-        quota_per_receiver_bytes: 100,
+        quota_per_receiver_bytes: crate::billable_bytes(100),
         rate_limit_per_minute: 0,
         require_capability_token: false,
         quota_per_sender_bytes: u64::MAX,
@@ -227,10 +238,16 @@ fn t1_4_p1_ack_removes_blob_and_frees_quota() {
     let cid = [2u8; 32];
 
     mb.put(recv, cid, [9u8; 32], vec![0u8; 80]).unwrap();
-    assert_eq!(mb.receiver_bytes(recv).unwrap(), 80);
+    // Billable: payload plus the per-record overhead the quota now charges
+    // (audit V-05).
+    assert_eq!(mb.receiver_bytes(recv).unwrap(), crate::billable_bytes(80));
 
     let removed = mb.ack(recv, cid).unwrap();
     assert!(removed);
+    // Back to EXACTLY zero, which is the property that matters most about
+    // that change: charge one amount on the way in and refund a different one
+    // on the way out, and the counters drift until the relay believes it is
+    // full of blobs it no longer holds.
     assert_eq!(mb.receiver_bytes(recv).unwrap(), 0);
     assert!(mb.fetch(recv).unwrap().is_empty());
 
@@ -377,12 +394,17 @@ fn t1_4_p1_stats_tracks_global_total() {
     mb.put([2u8; 32], [2u8; 32], [9u8; 32], vec![0u8; 200])
         .unwrap();
     let s = mb.stats().unwrap();
-    assert_eq!(s.total_blob_bytes, 300);
+    // Billable: what the two records COST the relay, not the payload they
+    // carried (audit V-05). `blob_count` is the unchanged record count.
+    assert_eq!(
+        s.total_blob_bytes,
+        crate::billable_bytes(100) + crate::billable_bytes(200)
+    );
     assert_eq!(s.blob_count, 2);
 
     mb.ack([1u8; 32], [1u8; 32]).unwrap();
     let s = mb.stats().unwrap();
-    assert_eq!(s.total_blob_bytes, 200);
+    assert_eq!(s.total_blob_bytes, crate::billable_bytes(200));
     assert_eq!(s.blob_count, 1);
 }
 
@@ -585,23 +607,29 @@ fn phase650b_316_capability_default_still_validates_provided_token() {
 fn phase650b_316_per_sender_quota_blocks_when_exceeded() {
     let cfg = MailboxConfig {
         rate_limit_per_minute: 0,
-        quota_per_sender_bytes: 100,
+        // Room for exactly one 60-byte record, in billable bytes — payload
+        // plus the overhead the quota now charges (audit V-05).
+        quota_per_sender_bytes: crate::billable_bytes(60),
         local_node_id: [0u8; 32], // tight cap
         ..MailboxConfig::default()
     };
     let (mb, _tmp, _clk) = fresh(cfg);
     let sender = [0xABu8; 32];
-    // Two 60-byte puts from same sender → second exceeds 100 cap.
+    // Two 60-byte puts from the same sender → the second does not fit.
     let r1 = mb.put([1u8; 32], [b'A'; 32], sender, vec![0; 60]).unwrap();
     assert!(matches!(r1, PutOutcome::Stored { .. }));
     let r2 = mb.put([2u8; 32], [b'B'; 32], sender, vec![0; 60]).unwrap();
-    assert!(matches!(
-        r2,
-        PutOutcome::QuotaPerSenderExceeded {
-            current_bytes: 60,
-            cap_bytes: 100
-        }
-    ));
+    let billed = crate::billable_bytes(60);
+    assert!(
+        matches!(
+            r2,
+            PutOutcome::QuotaPerSenderExceeded {
+                current_bytes,
+                cap_bytes,
+            } if current_bytes == billed && cap_bytes == billed
+        ),
+        "expected the sender cap to be full at one record, got {r2:?}"
+    );
     // Different sender — accepted independently.
     let r3 = mb
         .put([3u8; 32], [b'C'; 32], [0xCDu8; 32], vec![0; 60])
@@ -613,7 +641,7 @@ fn phase650b_316_per_sender_quota_blocks_when_exceeded() {
 fn phase650b_316_per_sender_quota_decremented_on_ack() {
     let cfg = MailboxConfig {
         rate_limit_per_minute: 0,
-        quota_per_sender_bytes: 100,
+        quota_per_sender_bytes: crate::billable_bytes(100),
         local_node_id: [0u8; 32],
         ..MailboxConfig::default()
     };
@@ -663,7 +691,10 @@ fn phase650b_316_anon_pool_evicted_before_identified_under_global_pressure() {
 
     let cfg = MailboxConfig {
         rate_limit_per_minute: 0,
-        quota_global_bytes: 250,
+        // Room for exactly two 100-byte records, so the third has to displace
+        // one — and the anon pool must go first. Sized in billable bytes,
+        // which is what the quota charges (audit V-05).
+        quota_global_bytes: 2 * crate::billable_bytes(100),
         ..MailboxConfig::default()
     };
     let (mb, _tmp, clk) = fresh(cfg);
@@ -743,7 +774,7 @@ fn phase650b_316_identified_pool_evicted_when_anon_empty() {
     // not anon-only).
     let cfg = MailboxConfig {
         rate_limit_per_minute: 0,
-        quota_global_bytes: 150,
+        quota_global_bytes: crate::billable_bytes(150),
         ..MailboxConfig::default()
     };
     let (mb, _tmp, clk) = fresh(cfg);
@@ -773,7 +804,10 @@ fn c13_fresh_anon_flood_falls_through_to_old_identified_victim() {
     // through from the too-young anon head to the old identified head.
     let cfg = MailboxConfig {
         rate_limit_per_minute: 0,
-        quota_global_bytes: 250,
+        // Exactly two 100-byte records, so the third forces the eviction loop
+        // to choose. Billable bytes, matching what the quota charges
+        // (audit V-05).
+        quota_global_bytes: 2 * crate::billable_bytes(100),
         ..MailboxConfig::default()
     };
     let (mb, _tmp, clk) = fresh(cfg);
@@ -835,7 +869,7 @@ fn phase650b_316_capability_required_uses_identified_pool() {
 
     let cfg = MailboxConfig {
         rate_limit_per_minute: 0,
-        quota_global_bytes: 150,
+        quota_global_bytes: crate::billable_bytes(150),
         require_capability_token: true,
         ..MailboxConfig::default()
     };
@@ -888,4 +922,58 @@ fn phase650b_316_capability_required_uses_identified_pool() {
     let surviving = mb.fetch(receiver_id).unwrap();
     assert_eq!(surviving.len(), 1);
     assert_eq!(surviving[0].content_id, [b'B'; 32]);
+}
+
+/// A byte quota must bound the RECORD count, not just the payload total.
+///
+/// It used to charge the payload and nothing else, and a 1-byte blob is legal.
+/// A record is not 1 byte on disk — it is a primary key, a 44-byte record
+/// header, a 64-byte blobs key, a 72-byte eviction key and redb's page
+/// overhead around all of it. So a quota sized in payload bytes admitted
+/// roughly as many records as it had bytes, and the relay ran out of DISK and
+/// I/O long before it ran out of quota (audit V-05).
+///
+/// Pinned as a RATIO rather than an exact number: the point is the order of
+/// magnitude between "one record per byte of quota" and "one record per
+/// couple of hundred", not the precise overhead constant.
+#[test]
+fn a_byte_quota_bounds_the_record_count_not_only_the_payload() {
+    // Small enough that the loop is quick even when the accounting is WRONG
+    // (payload-only admits one record per byte), which matters: a probe that
+    // reverts the fix must fail fast rather than run for minutes.
+    const CAP: u64 = 4 * 1024;
+    let cfg = MailboxConfig {
+        quota_per_receiver_bytes: CAP,
+        rate_limit_per_minute: 0,
+        quota_per_sender_bytes: u64::MAX,
+        quota_global_bytes: u64::MAX,
+        ..MailboxConfig::default()
+    };
+    let (mb, _tmp, _clk) = fresh(cfg);
+    let recv = [7u8; 32];
+
+    // Deposit one-byte blobs under distinct content ids until the cap says no.
+    let mut stored = 0u64;
+    for i in 0..(CAP + 16) {
+        // Bounded independently of the cap so a broken accounting cannot turn
+        // this test into a long-running one.
+        if stored > 512 {
+            break;
+        }
+        let mut cid = [0u8; 32];
+        cid[..8].copy_from_slice(&i.to_be_bytes());
+        match mb.put(recv, cid, [9u8; 32], vec![0u8; 1]).unwrap() {
+            PutOutcome::Stored { .. } => stored += 1,
+            _ => break,
+        }
+    }
+
+    let payload_only_would_admit = CAP; // 1 byte charged per record
+    assert!(
+        stored * 8 < payload_only_would_admit,
+        "a {CAP}-byte cap admitted {stored} one-byte records — payload-only \
+         accounting would have admitted about {payload_only_would_admit}, and \
+         that is the amplification"
+    );
+    assert!(stored > 0, "the cap must still admit SOME records");
 }
