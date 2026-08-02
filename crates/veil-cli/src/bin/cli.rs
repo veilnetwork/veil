@@ -10,6 +10,16 @@
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
 fn main() {
+    // This is a real process entry point: nothing has spawned a thread yet, so
+    // rewriting the environment here is sound. Declaring it is what lets the
+    // runtime erase the passphrase variable after reading it, so a later
+    // fork/exec cannot inherit the secret.
+    //
+    // An EMBEDDED host does not and must not declare this: by the time it
+    // calls in, its own threads are already running, and an environment write
+    // racing a `getenv` from any of them is undefined behaviour (audit V-06).
+    veil_node_runtime::process_env::allow_env_writes();
+
     // Initialise the `log` facade so all `log::debug!()` / `log::info!()` /
     // `log::warn!()` / `log::error!()` events across the workspace (and the
     // dependency graph) reach stderr.  Audit batch 2026-05-23: pre-fix no

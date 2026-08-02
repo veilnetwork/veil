@@ -73,11 +73,35 @@ pub fn resolve_key_passphrase(
     //    doesn't inherit it. Same-uid /proc/PID/environ window is tiny but
     //    nonzero — document as a known caveat (see module-level doc).
     if let Ok(raw) = std::env::var(ENV_VAR_NAME) {
-        // SAFETY: remove_var is unsafe in newer Rust because mutating the
-        // process environment is not thread-safe; we call it during startup
-        // before tokio runtime spawns any task, so no other thread reads env.
-        unsafe {
-            std::env::remove_var(ENV_VAR_NAME);
+        // Erasing the variable stops a later fork/exec inheriting it — worth
+        // having, but not at any price. Mutating the environment is not
+        // thread-safe, and the old comment ("before tokio spawns any task")
+        // was true of the DAEMON and false of the embedded host: a Flutter app
+        // has had threads running since before the library was loaded, and a
+        // `getenv` from any of them during the write is undefined behaviour
+        // (audit V-06).
+        //
+        // So it is done only where an entry point has declared the process
+        // still single-threaded. Where it has not, the variable stays — the
+        // same exposure that existed before the erase was added, which the
+        // module header already documents, rather than UB in a host we do not
+        // control.
+        if crate::process_env::env_writes_allowed() {
+            // SAFETY: an entry point called `allow_env_writes`, which only a
+            // still-single-threaded one may do.
+            unsafe {
+                std::env::remove_var(ENV_VAR_NAME);
+            }
+        } else {
+            logger.warn(
+                "key_passphrase.env_var_retained",
+                format!(
+                    "{ENV_VAR_NAME} left in the environment: this process is \
+                     embedded and may be multi-threaded, so erasing it is not \
+                     safe. A fork/exec from this process would inherit it — \
+                     prefer key_passphrase_file or key_passphrase_prompt here."
+                ),
+            );
         }
         logger.info("key_passphrase.source", format!("env_var={ENV_VAR_NAME}"));
         if raw.is_empty() {
