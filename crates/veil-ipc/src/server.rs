@@ -918,6 +918,8 @@ pub struct IpcServer {
     /// → multi-GiB transient memory. At cap, new connections drop
     /// immediately (no queue — queue would itself be unbounded).
     client_semaphore: Arc<tokio::sync::Semaphore>,
+    /// Slots for clients that have not yet completed the handshake (V-06).
+    preauth_semaphore: Arc<tokio::sync::Semaphore>,
     ///.2: hook the IPC handler calls when an app sets/clears
     /// a sealed push envelope on a rendezvous-publisher entry. When `None`
     /// the handler responds with status `NoMatchingRendezvous` (feature off
@@ -962,6 +964,15 @@ pub struct IpcServer {
 /// veil simultaneously; 256 leaves slack for test harnesses and edge cases
 /// like a browser extension with many tabs each holding a separate handle.
 pub const MAX_IPC_CONCURRENT_CLIENTS: usize = 256;
+
+/// Concurrent IPC clients that have not yet completed the handshake (V-06).
+///
+/// Much smaller than [`MAX_IPC_CONCURRENT_CLIENTS`] because it bounds a
+/// different thing: not "how many apps may be connected" but "how many may be
+/// mid-handshake". A real client presents itself immediately, so a slot is
+/// held for a round trip. Exhausting this pool costs an attacker nothing and
+/// now buys them nothing either — the authenticated pool is untouched.
+pub const MAX_IPC_PREAUTH_CLIENTS: usize = 16;
 
 /// Inter-session idle timeout for an established IPC connection (audit U3).
 ///
@@ -1027,6 +1038,7 @@ impl IpcServer {
             mobile_status_provider: None,
             event_bus: None,
             client_semaphore: Arc::new(tokio::sync::Semaphore::new(MAX_IPC_CONCURRENT_CLIENTS)),
+            preauth_semaphore: Arc::new(tokio::sync::Semaphore::new(MAX_IPC_PREAUTH_CLIENTS)),
             push_envelope_sink: None,
             mailbox_backend: None,
             mailbox_crypto_sink: None,
@@ -1585,13 +1597,26 @@ impl IpcServer {
                         // 16 MiB on HELLO body read → multi-GiB transient OOM.
                         // try_acquire_owned drops the new connection if cap
                         // reached (queue would itself be unbounded).
-                        let permit = match self.client_semaphore.clone().try_acquire_owned() {
+                        //
+                        // audit V-06: that cap is for AUTHENTICATED clients and
+                        // is taken after the handshake. Taken before, a series
+                        // of connections that never say anything held the whole
+                        // pool for the handshake timeout and locked out every
+                        // legitimate app. Unauthenticated arrivals are charged
+                        // to a separate, much smaller pool they can exhaust
+                        // without touching the real one.
+                        let preauth_permit = match self
+                            .preauth_semaphore
+                            .clone()
+                            .try_acquire_owned()
+                        {
                             Ok(p) => p,
                             Err(_) => {
                                 drop(pending);
                                 continue;
                             }
                         };
+                        let main_semaphore = Arc::clone(&self.client_semaphore);
                         let registry = Arc::clone(&self.app_registry);
                         let streams = Arc::clone(&self.stream_table);
                         let node_id = self.node_id;
@@ -1633,10 +1658,11 @@ impl IpcServer {
                         let pair_source_sink = self.pair_source_sink.clone();
                         let pair_target_sink = self.pair_target_sink.clone();
                         tokio::spawn(async move {
-                            // Hold the M6 semaphore permit for the lifetime of
-                            // the client task — drops automatically when task
-                            // exits, releasing the slot for the next accept.
-                            let _permit = permit;
+                            // The pre-auth permit covers the handshake only,
+                            // and is handed back the moment the client proves
+                            // itself — a slow-but-legitimate app must not sit
+                            // in a pre-auth slot for its whole session.
+                            let preauth_permit = preauth_permit;
                             // complete the token-handshake step
                             // here (off the accept loop). Failures (timeout
                             // mismatch, EOF) drop the connection silently —
@@ -1645,6 +1671,13 @@ impl IpcServer {
                                 Ok(s) => s,
                                 Err(_) => return,
                             };
+                            // Authenticated. Now charge the real pool (M6),
+                            // held for the lifetime of the client task.
+                            let Ok(permit) = main_semaphore.try_acquire_owned() else {
+                                return;
+                            };
+                            drop(preauth_permit);
+                            let _permit = permit;
                             // Surface errors that ended the client task so
                             // operators can diagnose IPC disconnects without
                             // strace. Tracing is wired in at log-level WARN

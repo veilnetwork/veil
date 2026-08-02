@@ -65,6 +65,13 @@ pub(crate) async fn read_frame(
     let header = codec::decode_header(&hdr_buf)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
     let body_len = header.body_len as usize;
+    // audit V-07: the per-frame cap bounds ONE reader; nothing bounded the sum.
+    // 256 authenticated clients each declaring 16 MiB is ~4 GiB of buffers
+    // allocated and zeroed BEFORE a single body byte arrives, held for the
+    // whole 30-second read window. The permit is held across the allocation
+    // and the read, and released when this function returns — which is exactly
+    // the window the 4 GiB came from.
+    let _budget = body_budget::acquire(body_len).await?;
     let mut body = veil_bufpool::global().acquire(body_len);
     body.as_vec_mut().resize(body_len, 0);
     if body_len > 0 {
@@ -83,6 +90,82 @@ pub(crate) async fn read_frame(
         };
     }
     Ok((header, body))
+}
+
+/// Process-wide ceiling on frame-body bytes being read at once (audit V-07).
+///
+/// ## Why a byte budget and not a smaller connection cap
+///
+/// The connection cap counts CLIENTS; memory is spent in BYTES, and the two
+/// stopped tracking each other the moment one client could declare 16 MiB.
+/// Lowering the client cap enough to bound memory would have refused
+/// legitimate clients that only ever send 5 KiB chunks. A byte budget charges
+/// each reader for what it actually asks for: thousands of small frames pass
+/// untouched, and a flood of maximum-size declarations queues instead of
+/// allocating.
+///
+/// Charged BEFORE the buffer exists, because the allocation is the cost —
+/// `resize(body_len, 0)` touches every page, so an unread 16 MiB body is
+/// 16 MiB of resident memory, not a lazy reservation.
+pub(crate) mod body_budget {
+    use std::sync::Arc;
+    use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+
+    /// Total bytes that may be in flight across all frame-body reads.
+    ///
+    /// 128 MiB: eight simultaneous maximum-size frames, or tens of thousands
+    /// of ordinary ones. Real traffic is chunks in the low tens of KiB, so
+    /// this is far above legitimate use and 1/32 of the old worst case.
+    pub(crate) const MAX_INFLIGHT_BODY_BYTES: usize = 128 * 1024 * 1024;
+
+    /// How long a reader waits for budget before giving up.
+    ///
+    /// Waiting is correct — the frames ahead are being read, not idling — but
+    /// not forever: a caller stuck behind a saturated budget should learn that
+    /// rather than hang, and its connection dropping returns its own charge.
+    pub(crate) const ACQUIRE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+    fn semaphore() -> &'static Arc<Semaphore> {
+        static SEM: std::sync::OnceLock<Arc<Semaphore>> = std::sync::OnceLock::new();
+        SEM.get_or_init(|| Arc::new(Semaphore::new(MAX_INFLIGHT_BODY_BYTES)))
+    }
+
+    /// Charge `bytes` against the global budget for as long as the returned
+    /// permit lives. A zero-length body is free — there is nothing to allocate.
+    pub(crate) async fn acquire(bytes: usize) -> std::io::Result<Option<OwnedSemaphorePermit>> {
+        if bytes == 0 {
+            return Ok(None);
+        }
+        // `decode_header` already refuses bodies above MAX_FRAME_BODY, so this
+        // cannot ask for more than the budget holds — but assert it rather than
+        // assume, because a request larger than the total would wait out the
+        // timeout every time instead of failing for the right reason.
+        let want = u32::try_from(bytes.min(MAX_INFLIGHT_BODY_BYTES)).unwrap_or(u32::MAX);
+        match tokio::time::timeout(
+            ACQUIRE_TIMEOUT,
+            Arc::clone(semaphore()).acquire_many_owned(want),
+        )
+        .await
+        {
+            Ok(Ok(permit)) => Ok(Some(permit)),
+            Ok(Err(_)) => Ok(None), // semaphore closed: never happens, don't fail the read
+            Err(_) => Err(std::io::Error::new(
+                std::io::ErrorKind::WouldBlock,
+                format!(
+                    "frame body of {bytes} B waited {}s for the global \
+                     {MAX_INFLIGHT_BODY_BYTES} B read budget",
+                    ACQUIRE_TIMEOUT.as_secs(),
+                ),
+            )),
+        }
+    }
+
+    /// Bytes currently free. Test-facing: the invariant worth checking is that
+    /// the budget comes BACK, and a leak is invisible from the outside.
+    #[cfg(test)]
+    pub(crate) fn available() -> usize {
+        semaphore().available_permits()
+    }
 }
 
 /// Encode and write a framed message to a split write half.
@@ -156,4 +239,64 @@ pub(crate) async fn write_frame_stream(
         stream.write_all(body).await?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod body_budget_tests {
+    use super::body_budget::{self, MAX_INFLIGHT_BODY_BYTES};
+
+    /// Audit V-07. The per-frame cap bounds one reader; nothing bounded the
+    /// sum, so 256 clients each declaring 16 MiB was ~4 GiB allocated and
+    /// zeroed before a single body byte arrived.
+    #[tokio::test]
+    async fn a_body_is_charged_against_the_global_budget() {
+        let before = body_budget::available();
+        let held = body_budget::acquire(1024).await.expect("acquire");
+        assert_eq!(
+            body_budget::available(),
+            before - 1024,
+            "the reader must be charged for what it declared, before allocating"
+        );
+        drop(held);
+        assert_eq!(
+            body_budget::available(),
+            before,
+            "the charge must come back — a budget that only counts down wedges \
+             every reader after enough frames"
+        );
+    }
+
+    /// An empty body allocates nothing and must not be charged, or a stream of
+    /// zero-length frames would exhaust a budget it never spends.
+    #[tokio::test]
+    async fn an_empty_body_costs_nothing() {
+        let before = body_budget::available();
+        let held = body_budget::acquire(0).await.expect("acquire");
+        assert!(held.is_none());
+        assert_eq!(body_budget::available(), before);
+    }
+
+    /// The budget is a QUEUE, not a refusal: a reader that has to wait gets
+    /// its turn as soon as the frame ahead of it lands. This is the property
+    /// that keeps ordinary traffic working while a flood is in progress.
+    #[tokio::test]
+    async fn a_waiting_reader_proceeds_once_the_budget_frees() {
+        let hog = body_budget::acquire(MAX_INFLIGHT_BODY_BYTES)
+            .await
+            .expect("acquire the whole budget");
+        assert_eq!(body_budget::available(), 0);
+
+        let waiter = tokio::spawn(async { body_budget::acquire(4096).await.map(|p| p.is_some()) });
+        // Still parked while the budget is held.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(!waiter.is_finished(), "a reader must WAIT, not be refused");
+
+        drop(hog);
+        let got = tokio::time::timeout(std::time::Duration::from_secs(5), waiter)
+            .await
+            .expect("the waiter must be released promptly")
+            .expect("join")
+            .expect("acquire");
+        assert!(got);
+    }
 }

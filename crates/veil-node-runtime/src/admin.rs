@@ -24,6 +24,18 @@ pub const ADMIN_PROTOCOL_VERSION: u32 = 1;
 /// `truncated` flag when the store exceeds this.
 pub const MAX_ADMIN_DHT_LIST: usize = 10_000;
 
+/// Concurrent admin connections that have not yet proved they hold the token
+/// (audit V-06).
+///
+/// Separate from `global.admin_max_connections`, and much smaller, because the
+/// two bound different things. The operator's cap answers "how many admin
+/// sessions may run at once"; this one answers "how many strangers may be
+/// mid-handshake", and the honest answer is a handful — a real operator tool
+/// presents its token immediately, so a slot is held for a round trip, not for
+/// a session. Set at the old handshake concurrency an unauthenticated flood
+/// could reach WITHOUT being able to touch the authenticated pool.
+pub const ADMIN_MAX_PREAUTH_CONNECTIONS: usize = 8;
+
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct AdminRequest {
     pub version: u32,
@@ -1208,12 +1220,19 @@ where
     // task slot relative to the pre-cap behaviour).
     let admin_max_connections = config.global.admin_max_connections;
     let admin_connection_semaphore = Arc::new(tokio::sync::Semaphore::new(admin_max_connections));
+    // audit V-06: unauthenticated connections get their own, much smaller pool
+    // (see the accept loop). Deliberately not operator-tunable — it bounds a
+    // handshake window, not a workload, and an operator raising it would only
+    // be widening the very hole the split closes.
+    let admin_preauth_semaphore =
+        Arc::new(tokio::sync::Semaphore::new(ADMIN_MAX_PREAUTH_CONNECTIONS));
 
     let admin_runtime = Arc::clone(&runtime);
     let anchor_path_clone = anchor_path.clone();
     let config_path_clone = config_path.clone();
     let accept_shutdown_tx = shutdown_tx.clone();
     let semaphore_clone = Arc::clone(&admin_connection_semaphore);
+    let preauth_semaphore_clone = Arc::clone(&admin_preauth_semaphore);
     let mut admin_server = tokio::spawn(async move {
         loop {
             tokio::select! {
@@ -1254,17 +1273,28 @@ where
                     if !peer_info.uid_matches_local {
                         continue;
                     }
-                    // followup: connection cap. `try_acquire_owned`
-                    // on a full semaphore returns Err immediately (no blocking
-                    // on the accept loop). Drop the connection and log.
-                    let permit = match Arc::clone(&semaphore_clone).try_acquire_owned() {
+                    // audit V-06: the connection cap is for AUTHENTICATED
+                    // clients, and is taken after the handshake. Taken before,
+                    // a series of connections that say nothing at all — no
+                    // token, no bytes — held the full pool for the handshake
+                    // timeout and locked out every legitimate operator,
+                    // including the one trying to push a config.
+                    //
+                    // Unauthenticated connections are charged to a separate,
+                    // much smaller pool that they can exhaust without touching
+                    // the real one. `try_acquire_owned` on a full semaphore
+                    // returns Err immediately (no blocking on the accept loop).
+                    let preauth_permit = match Arc::clone(&preauth_semaphore_clone)
+                        .try_acquire_owned()
+                    {
                         Ok(p) => p,
                         Err(_) => {
                             admin_runtime.lock().await.log_info(
-                                "admin.accept_refused",
+                                "admin.preauth_refused",
                                 format!(
-                                    "cap={admin_max_connections} concurrent admin connections \
-                                     reached — refusing"
+                                    "cap={ADMIN_MAX_PREAUTH_CONNECTIONS} concurrent \
+                                     unauthenticated admin connections reached — refusing \
+                                     (authenticated clients are unaffected)"
                                 ),
                             );
                             continue;
@@ -1275,12 +1305,13 @@ where
                     let anchor = anchor_path_clone.clone();
                     let config_path = config_path_clone.clone();
                     let logger = Arc::clone(&admin_runtime);
+                    let main_semaphore = Arc::clone(&semaphore_clone);
                     tokio::spawn(async move {
-                        // Permit moves into the spawned task; its drop on
-                        // task exit releases the slot. Dropping early
-                        // (e.g. on handshake failure) is fine — task ends
-                        // immediately and slot frees.
-                        let _permit = permit;
+                        // The pre-auth permit covers the handshake only. It is
+                        // dropped the moment the client proves it holds the
+                        // token, so a slow-but-legitimate operator does not
+                        // occupy a pre-auth slot for the rest of its session.
+                        let preauth_permit = preauth_permit;
                         // complete the token-handshake step
                         // here (off the accept loop). Failures (timeout
                         // mismatch) are logged at info level and drop the
@@ -1296,6 +1327,24 @@ where
                                 return;
                             }
                         };
+                        // Authenticated. Now charge the real pool, and hand the
+                        // pre-auth slot back to the next arrival.
+                        let permit = match main_semaphore.try_acquire_owned() {
+                            Ok(p) => p,
+                            Err(_) => {
+                                logger.lock().await.log_info(
+                                    "admin.accept_refused",
+                                    format!(
+                                        "cap={admin_max_connections} concurrent admin \
+                                         connections reached — refusing"
+                                    ),
+                                );
+                                return;
+                            }
+                        };
+                        drop(preauth_permit);
+                        // Permit drops on task exit and releases the slot.
+                        let _permit = permit;
                         let _ = handle_admin_connection(stream, runtime, shutdown_tx, anchor, config_path).await;
                     });
                 }
