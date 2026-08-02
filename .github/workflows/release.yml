@@ -55,8 +55,12 @@ on:
         type: boolean
         default: false
 
+# LEAST PRIVILEGE, per job (audit V-03). This was workflow-wide, so the matrix
+# BUILD jobs held a token that can push to the repository and create releases —
+# while running cargo, which executes every dependency's `build.rs`. Only the
+# publish job attaches anything.
 permissions:
-  contents: write  # for release-attach
+  contents: read  # for release-attach
 
 env:
   # A dispatch passes the bare semver ('0.4.1'); a tag push gives the ref name
@@ -144,17 +148,6 @@ jobs:
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
           echo "VEIL_CARGO_CMD=zigbuild" >> "$GITHUB_ENV"
 
-      - name: Write release-signing identity (Linux host job only)
-        id: identity
-        if: matrix.runner == 'ubuntu-latest' && matrix.triple == 'x86_64-unknown-linux-gnu'
-        env:
-          IDENTITY_TOML: ${{ secrets.VEIL_RELEASE_IDENTITY_TOML }}
-        run: |
-          mkdir -p $RUNNER_TEMP/release-key
-          umask 077
-          printf '%s' "$IDENTITY_TOML" > $RUNNER_TEMP/release-key/identity.toml
-          echo "path=$RUNNER_TEMP/release-key/identity.toml" >> "$GITHUB_OUTPUT"
-
       - name: Build release binaries (Unix)
         if: matrix.is_windows != true
         env:
@@ -211,6 +204,24 @@ jobs:
             sha256sum "$stage/${b}.exe" | awk -v n="${b}.exe" '{print $1"  "n}' >> "$stage/sha256.txt"
           done
 
+      # WRITTEN AFTER THE BUILD (audit V-02). The update-signing identity used
+      # to land on disk BEFORE `cargo build`, and cargo runs every dependency's
+      # `build.rs` with full filesystem access — so any package in the tree, at
+      # any depth, could read the key that signs updates for every user. The
+      # secret was already step-scoped; the FILE was not, and the file is what a
+      # build script reads. Nothing between the build and the signature needs
+      # it, so it now exists only for the step that uses it.
+      - name: Write release-signing identity (Linux host job only)
+        id: identity
+        if: matrix.runner == 'ubuntu-latest' && matrix.triple == 'x86_64-unknown-linux-gnu'
+        env:
+          IDENTITY_TOML: ${{ secrets.VEIL_RELEASE_IDENTITY_TOML }}
+        run: |
+          mkdir -p $RUNNER_TEMP/release-key
+          umask 077
+          printf '%s' "$IDENTITY_TOML" > $RUNNER_TEMP/release-key/identity.toml
+          echo "path=$RUNNER_TEMP/release-key/identity.toml" >> "$GITHUB_OUTPUT"
+
       - name: Sign manifest (host build only — has signing key)
         if: steps.identity.outputs.path != ''
         run: |
@@ -251,12 +262,9 @@ jobs:
   publish:
     needs: build
     runs-on: ubuntu-latest
-    env:
-      # F2: Ed25519 private key (openssl PEM) that signs the per-triple sha256
-      # manifests for the shell installer (scripts/install.sh). OPTIONAL — when
-      # the secret is unset, no `.sig` is produced and install.sh falls back to
-      # sha256-only with a warning (no regression). See docs/en/release-signing.md.
-      RELEASE_INSTALLER_ED25519_SK: ${{ secrets.RELEASE_INSTALLER_ED25519_SK }}
+    # The ONE job that writes: it attaches the artifacts to the release.
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
 
@@ -289,7 +297,20 @@ jobs:
           done
           ls -la out/
 
+      # SECRET SCOPED TO THIS STEP (audit V-02). It used to sit in the job's
+      # `env:`, so every step — checkout, the artifact download, the release
+      # upload action — ran with the installer's long-lived signing key in its
+      # environment. Only the step that signs needs it, and a key that signs
+      # what users install is worth the two extra lines.
       - name: Sign sha256 manifests for the installer (Ed25519) — F2
+        env:
+          # F2: Ed25519 private key (openssl PEM) that signs the per-triple
+          # sha256 manifests for the shell installer (scripts/install.sh).
+          # OPTIONAL — when the secret is unset, no `.sig` is produced. NOTE
+          # (audit V-01): install.sh now REFUSES to install without a verifiable
+          # signature unless the user passes --skip-signature, so an unset
+          # secret is no longer a silent downgrade for anyone who runs it.
+          RELEASE_INSTALLER_ED25519_SK: ${{ secrets.RELEASE_INSTALLER_ED25519_SK }}
         # Detached Ed25519 signature over each per-triple sha256 manifest, so
         # scripts/install.sh can authenticate the manifest against a pinned key
         # BEFORE trusting any hash it lists (closes the "compromised release
