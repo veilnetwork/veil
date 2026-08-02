@@ -64,6 +64,17 @@ pub struct RuntimeState {
     /// PoW nonce for this node's own identity, as upgraded by the lazy miner.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub identity_nonce: Option<String>,
+    /// The public key [`identity_nonce`] was mined FOR.
+    ///
+    /// A PoW nonce is only meaningful against one keypair — the score is over
+    /// `(public_key, nonce)`. Without this, a config whose identity was
+    /// replaced picked up the previous identity's nonce from the sidecar and
+    /// failed validation with "must produce at least 16 leading zero bits",
+    /// which reads as a corrupt config rather than as stale cache. Worse, it is
+    /// the same shape as the bug the ML-KEM/X25519 work was about: key material
+    /// derived for one identity surviving into another.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity_public_key: Option<String>,
     /// Peer public key (base64, exactly as it appears in `[[peers]]`) → the
     /// nonce last seen from that peer. Keyed by public key rather than
     /// `peer_id` so reordering the peer list in the config does not silently
@@ -110,6 +121,10 @@ pub fn load(config_path: &Path) -> RuntimeState {
 /// are the ones that got verified, and this is not part of them.
 pub fn apply(config: &mut Config, state: &RuntimeState) {
     if let (Some(nonce), Some(identity)) = (state.identity_nonce.as_ref(), config.identity.as_mut())
+        // Only for the key it was mined for. A nonce from a previous identity
+        // is not merely useless against a new one — it FAILS the PoW floor and
+        // takes the whole config down with it.
+        && state.identity_public_key.as_deref() == Some(identity.public_key.as_str())
     {
         identity.nonce = nonce.clone();
     }
@@ -145,10 +160,15 @@ fn update(config_path: &Path, f: impl FnOnce(&mut RuntimeState)) -> Result<()> {
     Ok(())
 }
 
-/// Persist an upgraded identity PoW nonce.
-pub fn record_identity_nonce(config_path: &Path, nonce_b64: &str) -> Result<()> {
+/// Persist an upgraded identity PoW nonce, bound to the key it was mined for.
+pub fn record_identity_nonce(
+    config_path: &Path,
+    identity_public_key: &str,
+    nonce_b64: &str,
+) -> Result<()> {
     update(config_path, |state| {
         state.identity_nonce = Some(nonce_b64.to_owned());
+        state.identity_public_key = Some(identity_public_key.to_owned());
     })
 }
 
@@ -196,8 +216,48 @@ mod tests {
     #[test]
     fn a_recorded_identity_nonce_survives_a_reload() {
         let cfg = scratch("identity");
-        record_identity_nonce(&cfg, "bm9uY2U=").expect("record");
-        assert_eq!(load(&cfg).identity_nonce.as_deref(), Some("bm9uY2U="));
+        record_identity_nonce(&cfg, "PK", "bm9uY2U=").expect("record");
+        let state = load(&cfg);
+        assert_eq!(state.identity_nonce.as_deref(), Some("bm9uY2U="));
+        assert_eq!(state.identity_public_key.as_deref(), Some("PK"));
+    }
+
+    /// A PoW nonce is only valid against the key it was mined for. Carried onto
+    /// a different identity it does not merely fail to help — it fails the
+    /// difficulty floor, and the config then refuses to load with
+    /// "identity.nonce: must produce at least 16 leading zero bits", which
+    /// reads as a corrupt config rather than as stale cache.
+    ///
+    /// This is not hypothetical: the first version of this module had no
+    /// binding, and `pex_survives_reload_m2` — whose config path is stable
+    /// across runs, so the sidecar outlived the identity beside it — went red
+    /// on exactly that message.
+    #[test]
+    fn a_nonce_mined_for_another_identity_is_not_applied() {
+        let cfg = scratch("rebound");
+        record_identity_nonce(&cfg, "OLD-PK", "bm9uY2U=").expect("record");
+        let state = load(&cfg);
+
+        let mut config = Config {
+            identity: Some(crate::IdentityConfig {
+                public_key: "NEW-PK".to_owned(),
+                nonce: "fresh".to_owned(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        apply(&mut config, &state);
+        assert_eq!(
+            config.identity.as_ref().expect("identity").nonce,
+            "fresh",
+            "a nonce from a different identity must be ignored, not applied"
+        );
+
+        // And it IS applied when the key matches — the binding must not turn
+        // the whole sidecar into a no-op.
+        config.identity.as_mut().expect("identity").public_key = "OLD-PK".to_owned();
+        apply(&mut config, &state);
+        assert_eq!(config.identity.expect("identity").nonce, "bm9uY2U=");
     }
 
     #[test]
@@ -254,6 +314,7 @@ mod tests {
 
         let state = RuntimeState {
             identity_nonce: Some("x".to_owned()),
+            identity_public_key: Some("PK".to_owned()),
             peer_nonces: BTreeMap::from([("PK".to_owned(), "y".to_owned())]),
         };
         apply(&mut config, &state);

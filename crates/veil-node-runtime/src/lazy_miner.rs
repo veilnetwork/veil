@@ -94,6 +94,9 @@ pub(crate) async fn spawn_lazy_miner(
         }
     };
 
+    // Kept so the persisted nonce can be bound to the key it was mined for.
+    let identity_pk_b64 = identity.public_key.clone();
+
     let mut best_difficulty = current_difficulty;
     let mut candidate = start_nonce;
     // Total candidate nonces examined this run. The identity nonce is a u32
@@ -173,7 +176,7 @@ pub(crate) async fn spawn_lazy_miner(
                 format!("difficulty={best_difficulty} nonce={nonce_b64}"),
             );
 
-            upgrade_nonce_in_config(&config_path, &nonce_b64, &logger);
+            upgrade_nonce_in_config(&config_path, &identity_pk_b64, &nonce_b64, &logger);
 
             if best_difficulty >= max_difficulty {
                 logger.info("lazy_miner.done", format!("reached cap {max_difficulty}"));
@@ -206,6 +209,7 @@ pub(crate) async fn spawn_lazy_miner(
 
 fn upgrade_nonce_in_config(
     config_path: &std::path::Path,
+    identity_public_key: &str,
     new_nonce_b64: &str,
     logger: &NodeLogger,
 ) {
@@ -215,8 +219,13 @@ fn upgrade_nonce_in_config(
     // boot under `require_signed_config` refuse to start — the miner bricking
     // the node on a timer. `node_id` is derived from the public key alone, so
     // nothing else here needed to move.
-    let result = cfg::runtime_state::record_identity_nonce(config_path, new_nonce_b64)
-        .map_err(|e| e.to_string());
+    // Bound to the public key it was mined for: a PoW score is over
+    // `(public_key, nonce)`, so a nonce carried onto a DIFFERENT identity does
+    // not merely fail to help — it fails the difficulty floor and takes the
+    // whole config down with it on the next load.
+    let result =
+        cfg::runtime_state::record_identity_nonce(config_path, identity_public_key, new_nonce_b64)
+            .map_err(|e| e.to_string());
     if let Err(e) = result {
         logger.warn("lazy_miner.config_write_err", format!("err={e}"));
     }
