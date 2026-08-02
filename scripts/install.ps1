@@ -31,6 +31,9 @@ param(
     [switch]   $NoModifyPath,
     [switch]   $NoVerify,
     [switch]   $RequireSignature,
+    # Install even when the release signature CANNOT be verified (no OpenSSL
+    # >= 3.0 on PATH). sha256 alone does not detect a replaced release.
+    [switch]   $SkipSignature,
     [switch]   $Quickstart,
     [switch]   $Help
 )
@@ -83,10 +86,15 @@ function Get-Ed25519Openssl {
     return $null
 }
 
-# Verify the detached Ed25519 signature over the sha256 manifest. Fail-closed
-# when a key is pinned and the signature is missing/invalid AND
-# -RequireSignature is set (or always on a verify FAILURE); warn-and-continue
-# when no key is pinned or no capable openssl is present.
+# Verify the detached Ed25519 signature over the sha256 manifest.
+#
+# A PINNED KEY MEANS VERIFICATION IS MANDATORY (audit V-01). This used to warn
+# and continue on sha256 alone whenever no OpenSSL >= 3 was on PATH — which on
+# Windows is the common case, since nothing ships one by default. The fallback
+# is not a smaller guarantee but none: the manifest ships from the SAME release
+# as the binaries, so anyone who can replace the artifacts replaces the manifest
+# with them and the hashes match perfectly. It catches a corrupted download and
+# nothing else, while the pinned key exists to catch a compromised release.
 function Verify-ManifestSignature ($shaPath, $base, $triple, $tmp) {
     $pem = Get-PinnedReleasePubkey
     if (-not ($pem -replace '\s', '')) {
@@ -96,8 +104,20 @@ function Verify-ManifestSignature ($shaPath, $base, $triple, $tmp) {
     }
     $ossl = Get-Ed25519Openssl
     if (-not $ossl) {
-        if ($RequireSignature) { Die "-RequireSignature needs OpenSSL >= 3.0 on PATH to verify the Ed25519 release signature (none found)." }
-        Warn "cannot verify release signature: OpenSSL >= 3.0 not found on PATH. Falling back to sha256-only. Install OpenSSL 3.x or pass -RequireSignature to enforce."
+        if (-not $SkipSignature) {
+            Die @"
+cannot verify the release signature: this installer pins a release key, but
+Ed25519 verification needs OpenSSL >= 3.0 on PATH (none found).
+
+Install one, e.g.:
+    winget install ShiningLight.OpenSSL.Light
+or use the OpenSSL that ships with Git for Windows.
+
+To install ANYWAY without verifying the signature, re-run with
+-SkipSignature — sha256 alone cannot detect a replaced release.
+"@
+        }
+        Warn "SIGNATURE CHECK SKIPPED at your request. sha256 alone proves only that the download was not corrupted in transit — the manifest ships from the same release as the binaries, so it cannot detect a replaced release. You are trusting the download host."
         return
     }
     $sigPath = Join-Path $tmp 'sha256.txt.sig'
@@ -124,6 +144,10 @@ veil installer (Windows)
   -Repo <owner/repo>   Source repo (default: veilnetwork/veil)
   -NoModifyPath        Don't touch the user PATH
   -NoVerify            Skip sha256 verification (not recommended)
+  -SkipSignature       Install even when the release signature CANNOT be
+                       verified (no OpenSSL >= 3.0 on PATH). sha256 alone does
+                       not detect a replaced release — it ships from the same
+                       place as the binaries. Prefer installing openssl 3.x.
   -RequireSignature    Hard-fail unless the release manifest carries a valid
                        Ed25519 signature (needs openssl 3.x on PATH)
   -Quickstart          Init + start a node after install
