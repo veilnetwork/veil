@@ -176,7 +176,10 @@ fn host_matches_platform_target(target: &str) -> bool {
     let t = target.to_ascii_lowercase();
     let has = |toks: &[&str]| toks.iter().any(|k| t.contains(k));
     const WIN: &[&str] = &["windows", "win32", "win64", "-pc-windows", "msvc", "mingw"];
-    const MAC: &[&str] = &["macos", "darwin", "-apple-", "osx", "ios"];
+    // NOT "ios", and not the bare "-apple-" that matched it (audit V-15):
+    // iOS and macOS are different targets, and an iOS binary landing on a Mac
+    // is exactly the wrong-binary brick this gate exists to stop.
+    const MAC: &[&str] = &["macos", "darwin", "osx"];
     const LIN: &[&str] = &["linux"];
     const BSD: &[&str] = &["freebsd", "netbsd", "openbsd"];
     const X64: &[&str] = &["x86_64", "amd64", "x64"];
@@ -187,20 +190,27 @@ fn host_matches_platform_target(target: &str) -> bool {
     // (previously an unrecognized string was accepted — fail-open — which let a
     // signed manifest with a mistyped/novel `platform_target` install the wrong
     // binary and brick the host). The signature + sha256 gates still apply; this
-    // adds a fail-closed platform gate on top. Unknown HOST os/arch (a rustc
-    // target this build was not taught to classify) still accepts, since we
-    // cannot positively match what we cannot name.
+    // adds a fail-closed platform gate on top. An unknown HOST os/arch is
+    // REJECTED too (audit V-15): a host we cannot classify is exactly the one
+    // where we cannot tell a matching binary from a foreign one.
     let os_ok = match std::env::consts::OS {
         "windows" => has(WIN),
         "macos" => has(MAC),
         "linux" => has(LIN),
         "freebsd" => has(BSD),
-        _ => true, // unknown host OS — cannot gate
+        // FAIL-CLOSED on an unclassified host (audit V-15). This used to
+        // accept, reasoning that we cannot positively match what we cannot
+        // name — but "cannot name" is precisely when a foreign binary is
+        // indistinguishable from a matching one, and the cost of guessing
+        // wrong is overwriting a working install with something that will not
+        // run. An unclassified host gets no automatic updates, which is
+        // recoverable; the wrong binary is not.
+        _ => false,
     };
     let arch_ok = match std::env::consts::ARCH {
         "x86_64" => has(X64),
         "aarch64" => has(ARM64),
-        _ => true, // unknown host arch — cannot gate
+        _ => false, // same reasoning as the OS arm
     };
     os_ok && arch_ok
 }
@@ -570,6 +580,34 @@ mod tests {
         ));
         // the actual running binary clears a permissive floor
         assert!(min_compatible_satisfied(env!("CARGO_PKG_VERSION"), "0.0.1").is_ok());
+    }
+
+    /// Audit V-15. Two fail-open holes in the platform gate.
+    #[test]
+    fn v15_platform_gate_is_fail_closed() {
+        // 1. An iOS target must NOT satisfy a macOS host. `"ios"` was in the
+        //    macOS token list, so an iOS binary passed the gate on a Mac —
+        //    exactly the wrong-binary brick the gate exists to stop.
+        if std::env::consts::OS == "macos" {
+            assert!(
+                !host_matches_platform_target("aarch64-apple-ios"),
+                "an iOS binary must not be installable on macOS"
+            );
+            // The real macOS triples still pass, or the gate would block every
+            // legitimate update.
+            assert!(host_matches_platform_target(&format!(
+                "{}-apple-darwin",
+                std::env::consts::ARCH
+            )));
+        }
+
+        // 2. A target naming an OS this build cannot classify is rejected.
+        //    It used to be ACCEPTED on the reasoning that we cannot match what
+        //    we cannot name — but that is precisely when a foreign binary is
+        //    indistinguishable from a matching one.
+        assert!(!host_matches_platform_target("x86_64-unknown-haiku"));
+        assert!(!host_matches_platform_target("totally-made-up"));
+        assert!(!host_matches_platform_target(""));
     }
 
     #[test]

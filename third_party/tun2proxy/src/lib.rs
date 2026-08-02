@@ -727,6 +727,14 @@ async fn handle_udp_associate_session(
 
     Ok(())
 }
+/// Ceiling on un-framed DNS-over-TCP bytes held between reads.
+///
+/// A frame's length prefix is a `u16`, so one maximal message is 65535 + 2
+/// bytes. Holding more than that means the peer is not speaking the protocol —
+/// a broken resolver or a hostile one — and the session is dropped rather than
+/// buffered indefinitely (audit V-06/V-07 share this shape).
+const MAX_DNS_TCP_PENDING: usize = (u16::MAX as usize) + 2;
+
 
 async fn handle_dns_over_tcp_session(
     mut udp_stack: IpStackUdpStream,
@@ -748,6 +756,9 @@ async fn handle_dns_over_tcp_session(
 
     let mut buf1 = [0_u8; 4096];
     let mut buf2 = [0_u8; 4096];
+    // Carries the incomplete tail of a DNS-over-TCP frame between reads
+    // (audit V-06). Sized on demand; bounded by MAX_DNS_TCP_PENDING below.
+    let mut pending: Vec<u8> = Vec::new();
     loop {
         tokio::select! {
             len = udp_stack.read(&mut buf1) => {
@@ -774,12 +785,31 @@ async fn handle_dns_over_tcp_session(
                 if len == 0 {
                     break;
                 }
-                let mut buf = buf2[..len].to_vec();
-
                 crate::traffic_status::traffic_status_update(0, len)?;
 
+                // TCP IS A STREAM, NOT A FRAME (audit V-06). This used to build
+                // a fresh buffer from each `read()` and drop whatever did not
+                // form a whole message: a response split across segments — an
+                // ordinary MTU boundary, and the norm for anything over ~1400
+                // bytes — lost its tail, and a length prefix that landed split
+                // across two reads lost the message entirely. Coalesced
+                // responses already worked, which is why this looked fine on a
+                // LAN resolver and failed on a real one.
+                //
+                // The leftover is carried across reads instead.
+                pending.extend_from_slice(&buf2[..len]);
+                // A frame's length is a u16, so anything beyond one maximal
+                // frame means the peer is not speaking DNS-over-TCP. Bound it
+                // rather than grow forever on a hostile or broken resolver.
+                if pending.len() > MAX_DNS_TCP_PENDING {
+                    log::warn!("DNS over TCP: peer sent {} unframed bytes, dropping session", pending.len());
+                    break;
+                }
+
                 let mut to_send: VecDeque<Vec<u8>> = VecDeque::new();
+                let mut consumed = 0usize;
                 loop {
+                    let buf = &pending[consumed..];
                     if buf.len() < 2 {
                         break;
                     }
@@ -802,10 +832,12 @@ async fn handle_dns_over_tcp_session(
                     }
 
                     to_send.push_back(message.to_vec()?);
-                    if len + 2 == buf.len() {
-                        break;
-                    }
-                    buf = buf[len + 2..].to_vec();
+                    consumed += len + 2;
+                }
+                // Keep exactly the incomplete tail; a fully-drained buffer
+                // costs nothing to clear.
+                if consumed > 0 {
+                    pending.drain(..consumed);
                 }
 
                 while let Some(packet) = to_send.pop_front() {

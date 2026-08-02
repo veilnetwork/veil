@@ -79,6 +79,20 @@ fn basic_auth_header_value(credentials: &UserKey) -> String {
 fn is_digest_scheme(auth_data: &[u8]) -> bool {
     auth_data.get(..6).is_some_and(|p| p.eq_ignore_ascii_case(b"digest"))
 }
+/// Ceiling on the proxy's response HEADER block during the CONNECT handshake.
+///
+/// 64 KiB is far above any real proxy response and bounds what an unresponsive
+/// or hostile one can make us buffer before the tunnel is even established
+/// (audit V-07).
+const MAX_PROXY_HEADER_BYTES: usize = 64 * 1024;
+
+/// Ceiling on the body a proxy may declare for us to skip.
+///
+/// The handshake response's body is discarded, so a legitimate one is tiny; a
+/// huge declared length is either a broken proxy or an attempt to desynchronise
+/// the parser.
+const MAX_PROXY_SKIP_BYTES: usize = 16 * 1024 * 1024;
+
 
 impl HttpConnection {
     async fn new(
@@ -177,6 +191,15 @@ impl HttpConnection {
     async fn state_change(&mut self) -> Result<()> {
         match self.state {
             HttpState::ExpectResponseHeaders => {
+                // BOUND THE HEADER BLOCK (audit V-07). `server_inbuf` grew
+                // until a `\r\n\r\n` arrived, so a proxy that never sends one
+                // — misconfigured, or hostile, and this runs against a proxy
+                // the user CONFIGURED but does not necessarily control — pushed
+                // the process to OOM one read at a time, during the handshake,
+                // before anything was authenticated.
+                if self.server_inbuf.len() > MAX_PROXY_HEADER_BYTES {
+                    return Err("proxy response headers exceed the size limit".into());
+                }
                 while self.counter < self.server_inbuf.len() {
                     let b = self.server_inbuf[self.counter];
                     if b == b'\n' {
@@ -320,7 +343,16 @@ impl HttpConnection {
 
                 // Handshake state
                 self.state = HttpState::ExpectResponse;
-                self.skip = content_length + len;
+                // CHECKED (audit V-07): both operands come off the wire, and a
+                // `Content-Length` near `usize::MAX` wrapped this to a small
+                // number — so the body the proxy declared was never skipped and
+                // the parser resumed mid-body, reading attacker-chosen bytes as
+                // the next response. A declared body that cannot be represented
+                // is a malformed response, not an arithmetic result.
+                self.skip = match content_length.checked_add(len) {
+                    Some(total) if total <= MAX_PROXY_SKIP_BYTES => total,
+                    _ => return Err("proxy response declares an unusable Content-Length".into()),
+                };
 
                 return Box::pin(self.state_change()).await;
             }

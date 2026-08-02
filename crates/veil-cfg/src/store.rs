@@ -616,7 +616,9 @@ mod signed_config_gate_tests {
         );
         // An empty pin is an unset pin. `FOO=` in a unit file is a normal way to
         // "clear" a variable, and it must not read as "pinned to the empty key".
-        assert!(enforce_signed_config(true, Some(""), &SignedConfigStatus::Verified, "cfg").is_err());
+        assert!(
+            enforce_signed_config(true, Some(""), &SignedConfigStatus::Verified, "cfg").is_err()
+        );
     }
 
     /// The gate must not become "a node needs an operator CA to start" — the
@@ -637,10 +639,15 @@ mod signed_config_gate_tests {
 
     #[test]
     fn a_pinned_but_unverified_config_is_still_refused() {
-        for status in [SignedConfigStatus::Unsigned, SignedConfigStatus::VerifyFailed] {
+        for status in [
+            SignedConfigStatus::Unsigned,
+            SignedConfigStatus::VerifyFailed,
+        ] {
             assert!(enforce_signed_config(true, Some("PK"), &status, "cfg").is_err());
         }
-        assert!(enforce_signed_config(true, Some("PK"), &SignedConfigStatus::Verified, "cfg").is_ok());
+        assert!(
+            enforce_signed_config(true, Some("PK"), &SignedConfigStatus::Verified, "cfg").is_ok()
+        );
     }
 
     /// Audit V-05. Stripping a signature the writer cannot reproduce is a
@@ -666,7 +673,8 @@ mod signed_config_gate_tests {
 
         let mut config = Config::default();
         config.global.require_signed_config = true;
-        let err = save_config(&path, &config).expect_err("must refuse to unsign an enforced config");
+        let err =
+            save_config(&path, &config).expect_err("must refuse to unsign an enforced config");
         assert!(
             err.to_string().contains("refusing to rewrite"),
             "unexpected error: {err}"
@@ -680,13 +688,18 @@ mod signed_config_gate_tests {
         // With enforcement off the phase-1 grace window still applies: strip and
         // warn, so an operator mid-rollout is not blocked.
         config.global.require_signed_config = false;
-        fs::write(&path, crate::signed_config::sign_config(
-            "[global]\n",
-            &kp.public_key,
-            &kp.private_key,
-            kp.algo,
-            1_700_000_000,
-        ).expect("sign")).expect("reseed");
+        fs::write(
+            &path,
+            crate::signed_config::sign_config(
+                "[global]\n",
+                &kp.public_key,
+                &kp.private_key,
+                kp.algo,
+                1_700_000_000,
+            )
+            .expect("sign"),
+        )
+        .expect("reseed");
         save_config(&path, &config).expect("unenforced save still works");
         assert!(!crate::signed_config::has_signature_header(
             &fs::read_to_string(&path).expect("read back")

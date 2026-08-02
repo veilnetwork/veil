@@ -347,6 +347,9 @@ mod tests {
         // An UPDATE to a peer already known still lands — the cap is on new
         // entries, not on keeping the existing ones current.
         record_peer_nonce(&cfg, "PK-0", "fresh").expect("update");
-        assert_eq!(load(&cfg).peer_nonces.get("PK-0").map(String::as_str), Some("fresh"));
+        assert_eq!(
+            load(&cfg).peer_nonces.get("PK-0").map(String::as_str),
+            Some("fresh")
+        );
     }
 }

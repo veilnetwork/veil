@@ -359,7 +359,9 @@ impl ConfigCommandService {
                 issued_at,
                 stdout,
             } => Self::sign(&mut context, &signer_key, issued_at, stdout),
-            ConfigCommand::SignerKey { path, force } => Self::signer_key(&mut context, &path, force),
+            ConfigCommand::SignerKey { path, force } => {
+                Self::signer_key(&mut context, &path, force)
+            }
         }
     }
 
@@ -603,7 +605,8 @@ impl ConfigCommandService {
                 path.display()
             )));
         }
-        let key = veil_cfg::signed_config::generate_signer_key(veil_cfg::SignatureAlgorithm::default());
+        let key =
+            veil_cfg::signed_config::generate_signer_key(veil_cfg::SignatureAlgorithm::default());
         let rendered = veil_cfg::signed_config::render_signer_key(&key)
             .map_err(|e| veil_cfg::ConfigError::CommandFailed(format!("{e}")))?;
         // `atomic_write` creates mode 0600 and never follows a symlink into

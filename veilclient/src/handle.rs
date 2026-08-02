@@ -456,6 +456,36 @@ impl AppHandle {
     }
 }
 
+impl AppHandle {
+    /// Release the binding and wait for it, instead of hoping `Drop` can.
+    ///
+    /// `Drop` cannot await, so it spawns — and a spawn needs a Tokio runtime in
+    /// TLS. Dropped from a sync FFI teardown or a panic handler there is none,
+    /// so the local dispatch entry survived and `AppUnbind` never went out: the
+    /// next bind of the same endpoint then landed on a stale registration and
+    /// received nothing, until the daemon's keepalive eventually GC'd it (audit
+    /// V-08). A caller that CAN await should say so rather than depend on where
+    /// the value happens to be dropped.
+    ///
+    /// Idempotent: a later `Drop` finds the endpoint already gone and the
+    /// second `AppUnbind` is a no-op on the daemon side.
+    pub async fn close(&self) {
+        {
+            let mut d = self.dispatch.lock().await;
+            d.endpoints.remove(&self.endpoint_id);
+            d.inbound_streams.remove(&self.endpoint_id);
+        }
+        let payload = AppUnbindPayload {
+            app_id: self.app_id,
+            endpoint_id: self.endpoint_id,
+        };
+        let _ = self
+            .writer
+            .write_frame(LocalAppMsg::AppUnbind as u16, &payload.encode())
+            .await;
+    }
+}
+
 impl Drop for AppHandle {
     fn drop(&mut self) {
         // `tokio::spawn` from `Drop` panics
@@ -467,6 +497,11 @@ impl Drop for AppHandle {
         // still GCs the binding via its keepalive timeout) instead of
         // crashing the host process.
         if tokio::runtime::Handle::try_current().is_err() {
+            // Nothing further is possible here: the unbind must await and there
+            // is no executor. The binding stays registered until the daemon's
+            // keepalive reaps it, and a re-bind before then gets the stale
+            // entry. Callers that can await should use [`AppHandle::close`]
+            // (audit V-08) — this path is the fallback, not the contract.
             return;
         }
         let dispatch = Arc::clone(&self.dispatch);
