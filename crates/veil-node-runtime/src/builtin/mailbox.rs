@@ -45,7 +45,8 @@ use veil_mailbox::{
     MAILBOX_PUT_ENDPOINT_CAPACITY, MAILBOX_PUT_ENDPOINT_ID, Mailbox,
 };
 use veil_proto::{
-    MAX_MAILBOX_FETCH_ENTRIES, MAX_MAILBOX_PUT_CHUNKS, MailboxBlobWire, MailboxFetchRespPayload,
+    MAILBOX_PUT_CHUNK_DATA_BYTES, MAX_MAILBOX_FETCH_ENTRIES, MAX_MAILBOX_PUT_CHUNKS,
+    MailboxBlobWire, MailboxFetchRespPayload,
     MailboxPutChunkPayload, MailboxPutPayload,
 };
 use veil_types::AnonOnionSender;
@@ -127,6 +128,14 @@ impl PutChunkReassembler {
             return None;
         }
         if c.chunk_index >= c.chunk_total {
+            return None;
+        }
+        // Independently of the decoder's cap: this is the code that ALLOCATES,
+        // and `MAX_MAILBOX_PUT_CHUNKS` only bounds the chunk count. Without a
+        // byte cap here, 128 concurrent reassemblies x 256 chunks is bounded by
+        // the frame size (16 MiB), not by the ~60 KB the doc-comment claims —
+        // and a deposit needs no authentication to send.
+        if c.chunk_data.len() > MAILBOX_PUT_CHUNK_DATA_BYTES {
             return None;
         }
         // Drop idle partial deposits before doing anything else (memory bound).
@@ -520,6 +529,9 @@ pub fn handle_put_message(
             return;
         }
     };
+    // Kept across the move into `accept`: the reassembly key must match the id
+    // the assembled payload claims for itself (checked below).
+    let chunk_content_id = chunk.content_id;
     let assembled = match reassembler.accept(chunk, Instant::now()) {
         Some(bytes) => bytes,
         None => return, // incomplete (or dropped) — await the remaining chunks
@@ -535,6 +547,26 @@ pub fn handle_put_message(
             return;
         }
     };
+    // The deposit is keyed for reassembly by the CHUNK's content_id, but stored,
+    // deduped and ACKed by the id inside the assembled payload. Nothing tied the
+    // two together, so a depositor could reassemble under one id and have the
+    // relay file the blob under another — and deposits are sender-anonymous, so
+    // there is no identity to hold responsible for the discrepancy.
+    //
+    // That splits the relay's view of one message in two: dedup and ACK act on
+    // an id the reassembly never saw. Reject rather than pick a side; an honest
+    // depositor writes the same value in both places, because it only ever has
+    // one.
+    if req.content_id != chunk_content_id {
+        log::warn!(
+            "veil-mailbox: PUT rejected (chunk cid={} != payload cid={}, src={})",
+            hex_short(&chunk_content_id),
+            hex_short(&req.content_id),
+            hex_short(&src_node_id),
+        );
+        return;
+    }
+
     // Soft-warn if the envelope blob in the payload claims a different
     // sender than the OVL1 session source. We don't reject — a node
     // running multiple identities could legitimately spoof its own
@@ -761,11 +793,50 @@ mod tests {
             wake_hmac_envelope: None,
         }
         .encode();
-        MailboxPutChunkPayload {
+        mk_chunks(content_id, &inner)
+            .pop()
+            .expect("mk_payload is only used where the deposit fits one chunk")
+    }
+
+    /// Split an encoded `MailboxPutPayload` the way a real depositor does.
+    ///
+    /// `MAILBOX_PUT_CHUNK_DATA_BYTES` is the protocol, not a suggestion — the
+    /// decoder enforces it, so a test helper that stuffs a whole multi-KB
+    /// payload into one chunk gets rejected at the door and every assertion
+    /// downstream of that rejection passes for the wrong reason.
+    fn mk_chunks(content_id: [u8; 32], inner: &[u8]) -> Vec<Vec<u8>> {
+        let total = inner.len().div_ceil(MAILBOX_PUT_CHUNK_DATA_BYTES).max(1);
+        (0..total)
+            .map(|i| {
+                let start = i * MAILBOX_PUT_CHUNK_DATA_BYTES;
+                let end = ((i + 1) * MAILBOX_PUT_CHUNK_DATA_BYTES).min(inner.len());
+                MailboxPutChunkPayload {
+                    content_id,
+                    chunk_index: i as u16,
+                    chunk_total: total as u16,
+                    chunk_data: inner[start..end].to_vec(),
+                }
+                .encode()
+            })
+            .collect()
+    }
+
+    /// The encoded `MailboxPutPayload` bytes, unchunked — for tests that need
+    /// to split a deposit across several chunks themselves.
+    fn mk_inner(
+        receiver_id: [u8; 32],
+        content_id: [u8; 32],
+        sender_id: [u8; 32],
+        blob: Vec<u8>,
+    ) -> Vec<u8> {
+        MailboxPutPayload {
+            receiver_id,
             content_id,
-            chunk_index: 0,
-            chunk_total: 1,
-            chunk_data: inner,
+            sender_id,
+            blob,
+            push_envelope: None,
+            capability_token: None,
+            wake_hmac_envelope: None,
         }
         .encode()
     }
@@ -1461,33 +1532,110 @@ mod tests {
     }
 
     #[test]
+    fn put_chunk_bytes_are_capped_and_the_two_content_ids_must_agree() {
+        let (mb, _tmp) = fresh_mailbox();
+        let recv = [0x77u8; 32];
+        let cid = [0x88u8; 32];
+
+        // 1. An oversized chunk never reaches the reassembler's allocation.
+        //    MAX_MAILBOX_PUT_CHUNKS bounds the chunk COUNT; without a byte cap
+        //    128 concurrent reassemblies x 256 chunks is bounded by the frame
+        //    size (16 MiB), not the ~60 KB the design assumes — from deposits
+        //    that need no authentication to send.
+        let mut ra = PutChunkReassembler::default();
+        let fat = MailboxPutChunkPayload {
+            content_id: cid,
+            chunk_index: 0,
+            chunk_total: 1,
+            chunk_data: vec![0xEE; MAILBOX_PUT_CHUNK_DATA_BYTES + 1],
+        };
+        assert!(
+            MailboxPutChunkPayload::decode(&fat.encode()).is_err(),
+            "the decoder must refuse a chunk past the per-chunk cap"
+        );
+        assert!(
+            ra.accept(fat, Instant::now()).is_none(),
+            "the reassembler allocates, so it must refuse it independently"
+        );
+
+        // 2. The reassembly key and the id the payload claims must be the same
+        //    value. Nothing tied them together, so a deposit could reassemble
+        //    under one id and be stored, deduped and ACKed under another — and
+        //    deposits are sender-anonymous, so no identity answers for it.
+        let inner = mk_inner(recv, [0x99u8; 32], [0x33u8; 32], b"mismatched".to_vec());
+        for chunk in mk_chunks(cid, &inner) {
+            handle_put_message(
+                &mb,
+                None,
+                None,
+                &mut ra,
+                AppMessage::Deliver {
+                    src_node_id: [0x33u8; 32],
+                    src_app_id: [0u8; 32],
+                    app_id: MAILBOX_APP_ID,
+                    endpoint_id: MAILBOX_PUT_ENDPOINT_ID,
+                    data: veil_bufpool::pooled_shared_from_vec(chunk),
+                    reply_id: 0,
+                },
+            );
+        }
+        assert!(
+            mb.fetch(recv).unwrap().is_empty(),
+            "a deposit whose two content_ids disagree must not be stored"
+        );
+
+        // 3. Control: the same deposit with both ids equal DOES land, so the
+        //    check above is rejecting the mismatch and not the shape.
+        let agreed = mk_inner(recv, cid, [0x33u8; 32], b"agreed".to_vec());
+        for chunk in mk_chunks(cid, &agreed) {
+            handle_put_message(
+                &mb,
+                None,
+                None,
+                &mut ra,
+                AppMessage::Deliver {
+                    src_node_id: [0x33u8; 32],
+                    src_app_id: [0u8; 32],
+                    app_id: MAILBOX_APP_ID,
+                    endpoint_id: MAILBOX_PUT_ENDPOINT_ID,
+                    data: veil_bufpool::pooled_shared_from_vec(chunk),
+                    reply_id: 0,
+                },
+            );
+        }
+        let stored = mb.fetch(recv).unwrap();
+        assert_eq!(stored.len(), 1, "the agreeing deposit must land");
+        assert_eq!(stored[0].blob, b"agreed");
+    }
+
+    #[test]
     fn put_endpoint_rejects_unfetchable_oversized_blob() {
         let (mb, _tmp) = fresh_mailbox();
         let recv = [0x55u8; 32];
         let mut ra = PutChunkReassembler::default();
         // Blob big enough that blob + per-entry wire header exceeds one FETCH
         // reply — storing it would make it permanently unfetchable.
-        let payload = mk_payload(
-            recv,
-            [0xC9; 32],
-            [0x33; 32],
-            vec![0xEE; fetch_reply_budget()],
-            None,
-        );
-        handle_put_message(
-            &mb,
-            None,
-            None,
-            &mut ra,
-            AppMessage::Deliver {
-                src_node_id: [0x33u8; 32],
-                src_app_id: [0u8; 32],
-                app_id: MAILBOX_APP_ID,
-                endpoint_id: MAILBOX_PUT_ENDPOINT_ID,
-                data: veil_bufpool::pooled_shared_from_vec(payload),
-                reply_id: 0,
-            },
-        );
+        // A ~5.6 KB blob does not fit one chunk, and must not be made to: the
+        // decoder caps chunk_data at 240 B, so a single oversized chunk would
+        // be rejected there and this test would pass without the fetch-budget
+        // gate below ever running.
+        let inner = mk_inner(recv, [0xC9; 32], [0x33; 32], vec![0xEE; fetch_reply_budget()]);
+        for chunk in mk_chunks([0xC9; 32], &inner) {
+            handle_put_message(
+                &mb,
+                None,
+                None,
+                &mut ra,
+                AppMessage::Deliver {
+                    src_node_id: [0x33u8; 32],
+                    src_app_id: [0u8; 32],
+                    app_id: MAILBOX_APP_ID,
+                    endpoint_id: MAILBOX_PUT_ENDPOINT_ID,
+                    data: veil_bufpool::pooled_shared_from_vec(chunk),
+                    reply_id: 0,
+                },
+            );
+        }
         assert!(
             mb.fetch(recv).unwrap().is_empty(),
             "unfetchable deposit must be rejected at the door"
