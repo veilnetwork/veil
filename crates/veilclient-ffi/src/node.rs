@@ -471,11 +471,16 @@ pub unsafe extern "C" fn veil_node_start_deferred(
     // dir, so point TMPDIR (which temp_dir() honours) at its parent. This fixes
     // every temp_dir() user in the embedded node at once, not just the deferred
     // working dir.
+    //
+    // Recorded as process state, NOT written into the environment. The old
+    // `set_var("TMPDIR", ..)` claimed it ran "before the node thread is
+    // spawned" — true of OUR thread, and irrelevant: this is an FFI entry
+    // point in a Flutter host that has had threads running since before the
+    // library was loaded, and `getenv` from any of them during the write is
+    // undefined behaviour (audit V-06).
     #[cfg(target_os = "android")]
     if let Some(parent) = anchor.parent() {
-        // Safety: set once at boot, before the node thread (the env reader) is
-        // spawned, so there is no concurrent env access.
-        unsafe { std::env::set_var("TMPDIR", parent) };
+        veil_node_runtime::process_env::set_deferred_work_dir(parent);
     }
     start_thread(None, Some(endpoint), Some(anchor), anonymous, err_out)
 }

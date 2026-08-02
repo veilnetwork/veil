@@ -23,6 +23,24 @@ use std::time::Instant;
 /// type-complexity budget (audit cycle-8).
 type ValuePredicate<'a> = dyn Fn(&[u8]) -> bool + 'a;
 
+/// What happened to a value handed to the cold tier.
+///
+/// The trait used to return `Option<evicted>`, which cannot say "I did not
+/// store it". `RocksDbCold` handles a disk-full write by logging and returning
+/// `None` — indistinguishable from "stored, nothing evicted" — so the caller
+/// believed the value was safe. Worse, demotion removed the entry from the hot
+/// tier BEFORE the cold write, so a failure lost the value from both tiers and
+/// left `total_bytes` counting something that no longer existed (audit V-08).
+#[derive(Debug)]
+pub enum ColdPut {
+    /// Stored. Carries whatever the backend evicted to make room, if any, so
+    /// the caller can keep its byte and per-origin counters in step.
+    Stored(Option<([u8; 32], Vec<u8>)>),
+    /// NOT stored. The value is handed back rather than dropped, so a caller
+    /// that had already taken it out of the hot tier can put it back.
+    Failed(Vec<u8>),
+}
+
 /// Trait for the cold storage tier.
 ///
 /// Default: `InMemoryCold` (HashMap).
@@ -36,7 +54,7 @@ pub trait ColdBackend: Send + Sync + std::fmt::Debug {
     /// available, OR the backend evicts asynchronously /
     /// compaction-driven — RocksDB).  Audit batch 2026-05-23: signature
     /// expanded to return the evicted entry for byte-cap bookkeeping.
-    fn put(&mut self, key: [u8; 32], value: Vec<u8>) -> Option<([u8; 32], Vec<u8>)>;
+    fn put(&mut self, key: [u8; 32], value: Vec<u8>) -> ColdPut;
     fn remove(&mut self, key: &[u8; 32]);
     fn contains(&self, key: &[u8; 32]) -> bool;
     fn len(&self) -> usize;
@@ -129,7 +147,9 @@ impl ColdBackend for InMemoryCold {
         self.entries.get(key).map(|(v, _)| v.clone())
     }
 
-    fn put(&mut self, key: [u8; 32], value: Vec<u8>) -> Option<([u8; 32], Vec<u8>)> {
+    fn put(&mut self, key: [u8; 32], value: Vec<u8>) -> ColdPut {
+        // An in-memory insert has nothing to fail at, so this is always
+        // `Stored` — the outcome type exists for the backends that do.
         let ts = Instant::now();
         // Evict if at capacity (return evicted entry for byte-cap bookkeeping).
         let mut evicted: Option<([u8; 32], Vec<u8>)> = None;
@@ -147,7 +167,7 @@ impl ColdBackend for InMemoryCold {
         }
         self.entries.insert(key, (value, ts));
         self.order.insert((ts, key), ());
-        evicted
+        ColdPut::Stored(evicted)
     }
 
     fn remove(&mut self, key: &[u8; 32]) {
@@ -226,7 +246,7 @@ impl ColdBackend for InMemoryCold {
 /// O(1) point lookups. For production deployments with > 1M DHT entries.
 #[cfg(feature = "rocksdb-cold")]
 pub mod rocks {
-    use super::ColdBackend;
+    use super::{ColdBackend, ColdPut};
     use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
     /// Side column-family: `ts_be(8) ‖ key(32)` → `[]`. Ordered by insert
@@ -393,17 +413,20 @@ pub mod rocks {
             self.db.get(key).ok().flatten()
         }
 
-        fn put(&mut self, key: [u8; 32], value: Vec<u8>) -> Option<([u8; 32], Vec<u8>)> {
+        fn put(&mut self, key: [u8; 32], value: Vec<u8>) -> ColdPut {
             let byte_len = value.len() as u64;
             // Write the value FIRST and bail on failure WITHOUT touching the
             // index or count (audit cycle-8: previously `let _ = db.put(...)`
             // ignored disk-full/IO errors, then bumped `count` and wrote index
             // entries for a value that never landed — drifting count vs data).
             if let Err(e) = self.db.put(key, &value) {
-                log::warn!(
-                    "dht.cold.rocksdb: value write failed ({e}); entry dropped, counters unchanged"
-                );
-                return None;
+                // Hand the value BACK rather than dropping it. Returning
+                // `None` here was indistinguishable from "stored, nothing
+                // evicted", so a disk-full write silently lost a DHT value
+                // that demotion had already taken out of the hot tier
+                // (audit V-08).
+                log::warn!("dht.cold.rocksdb: value write failed ({e}); not stored");
+                return ColdPut::Failed(value);
             }
             // Value is durable; now (re)index. Drop any stale (old_ts, key)
             // index entry on overwrite, then write the fresh ts‖len + ts-index.
@@ -431,9 +454,9 @@ pub mod rocks {
                 // `key`, and the oldest is strictly older).
                 && ev_key != key
             {
-                return Some((ev_key, ev_val));
+                return ColdPut::Stored(Some((ev_key, ev_val)));
             }
-            None
+            ColdPut::Stored(None)
         }
 
         fn remove(&mut self, key: &[u8; 32]) {
@@ -1164,6 +1187,13 @@ impl TieredStore {
     }
 
     /// Insert into hot, demoting oldest to cold if full.
+    ///
+    /// Demotion is attempted ONCE. If the cold tier refuses (a failing disk),
+    /// the demoted value goes back to hot and this insert takes the tier one
+    /// entry over its soft capacity — which is the right way round: an
+    /// over-full hot tier is a bounded overshoot that the next successful
+    /// demotion corrects, and a dropped DHT value is not recoverable at all
+    /// (audit V-08).
     fn insert_hot(&mut self, key: [u8; 32], value: Vec<u8>, ts: Instant) {
         if self.hot.len() >= self.hot_capacity {
             self.demote_oldest_hot();
@@ -1187,9 +1217,27 @@ impl TieredStore {
             && let Some(entry) = self.hot.remove(&key)
         {
             self.hot_order.remove(&(ts, key));
-            let evicted = self.cold.put(key, entry.0);
-            if let Some((evicted_key, evicted_val)) = evicted {
-                self.account_eviction(&evicted_key, evicted_val.len() as u64);
+            match self.cold.put(key, entry.0) {
+                ColdPut::Stored(evicted) => {
+                    if let Some((evicted_key, evicted_val)) = evicted {
+                        self.account_eviction(&evicted_key, evicted_val.len() as u64);
+                    }
+                }
+                ColdPut::Failed(value) => {
+                    // The cold tier did not take it, so it goes back where it
+                    // came from. Removing from hot BEFORE the cold write meant
+                    // a failed write lost the value from both tiers, while
+                    // `total_bytes` went on counting it (audit V-08).
+                    //
+                    // Restored under its ORIGINAL timestamp: it is not a new
+                    // entry, and re-dating it would make it the last thing
+                    // demotion tries again rather than the first.
+                    log::warn!(
+                        "dht.demote: cold tier refused the value; keeping it hot"
+                    );
+                    self.hot.insert(key, (value, ts));
+                    self.hot_order.insert((ts, key), ());
+                }
             }
         }
     }
@@ -1782,5 +1830,74 @@ mod tests {
         assert_eq!(removed[0].0, [1u8; 32]);
         assert_eq!(cold.len(), 0);
         assert!(!cold.contains(&[1u8; 32]));
+    }
+}
+
+#[cfg(test)]
+mod v08_tests {
+    use super::*;
+
+    /// A cold tier that refuses everything, the way a full disk does.
+    #[derive(Debug, Default)]
+    struct RefusingCold {
+        refusals: usize,
+    }
+
+    impl ColdBackend for RefusingCold {
+        fn get(&self, _key: &[u8; 32]) -> Option<Vec<u8>> {
+            None
+        }
+        fn put(&mut self, _key: [u8; 32], value: Vec<u8>) -> ColdPut {
+            self.refusals += 1;
+            ColdPut::Failed(value)
+        }
+        fn remove(&mut self, _key: &[u8; 32]) {}
+        fn contains(&self, _key: &[u8; 32]) -> bool {
+            false
+        }
+        fn len(&self) -> usize {
+            0
+        }
+        fn iter_keys(&self) -> Vec<[u8; 32]> {
+            Vec::new()
+        }
+        fn iter_entries(&self) -> Vec<([u8; 32], Vec<u8>)> {
+            Vec::new()
+        }
+        fn retain(&mut self, _f: &dyn Fn(&[u8; 32], &[u8]) -> bool) -> Vec<([u8; 32], u64)> {
+            Vec::new()
+        }
+    }
+
+    /// A cold tier that cannot take the value must not cost us the value.
+    ///
+    /// Demotion removed the entry from hot and THEN wrote to cold. The trait
+    /// could not report a failure — `RocksDbCold` logged a disk-full write and
+    /// returned `None`, which reads as "stored, nothing evicted" — so the
+    /// value was gone from both tiers while `total_bytes` went on counting it
+    /// (audit V-08).
+    #[test]
+    fn a_cold_tier_that_refuses_does_not_lose_the_value() {
+        let mut store = TieredStore::with_cold(1, Box::new(RefusingCold::default()));
+
+        store.insert_hot([1u8; 32], b"first".to_vec(), Instant::now());
+        // Forces a demotion attempt, which the cold tier refuses.
+        store.insert_hot([2u8; 32], b"second".to_vec(), Instant::now());
+
+        assert_eq!(
+            store.hot.get(&[1u8; 32]).map(|(v, _)| v.as_slice()),
+            Some(&b"first"[..]),
+            "the refused value must stay hot, not vanish"
+        );
+        assert_eq!(
+            store.hot.get(&[2u8; 32]).map(|(v, _)| v.as_slice()),
+            Some(&b"second"[..]),
+            "and the new one still lands"
+        );
+        assert_eq!(
+            store.hot_order.len(),
+            store.hot.len(),
+            "the ordering index must not drift from the map"
+        );
     }
 }

@@ -12,6 +12,7 @@ pub mod dht_glue;
 pub mod error;
 pub mod identity_local;
 pub mod key_passphrase;
+pub mod process_env;
 pub mod lazy_miner;
 pub mod listener_supervisor;
 pub mod local_identity;
