@@ -25,7 +25,6 @@ allow-empty-seeds = ["veilcore/allow-empty-seeds"]
 slow-sim-tests = ["veilcore/slow-sim-tests"]
 test-low-difficulty = ["veilcore/test-low-difficulty"]
 tls-boring = ["veilcore/tls-boring"]
-tls-webpki-roots = ["veilcore/tls-webpki-roots"]
 
 [dependencies]
 veil-abuse = { path = "../veil-abuse" }

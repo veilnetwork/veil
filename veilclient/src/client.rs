@@ -59,27 +59,6 @@ pub(crate) fn prune_closed<T>(
     queue.retain(|(_, tx)| !tx.is_closed());
 }
 
-/// Pop the next non-closed waiter from a pending FIFO. Dispatcher-side
-/// counterpart to [`prune_closed`]: ensures a late reply lands on a
-/// still-listening caller rather than being silently discarded into an
-/// abandoned slot, leaving subsequent legitimate callers waiting on the
-/// reply that already passed them by.
-///
-/// Retained after the `request_id` correlation migration (dispatcher now uses
-/// [`take_pending`]); still exercised by tests and kept for the legacy
-/// strict-FIFO path.
-#[allow(dead_code)]
-pub(crate) fn pop_next_open<T>(
-    queue: &mut std::collections::VecDeque<tokio::sync::oneshot::Sender<T>>,
-) -> Option<tokio::sync::oneshot::Sender<T>> {
-    while let Some(tx) = queue.pop_front() {
-        if !tx.is_closed() {
-            return Some(tx);
-        }
-    }
-    None
-}
-
 /// Take the waiter a reply belongs to from an id-keyed pending queue.
 ///
 /// Every request now stamps `FrameHeader.request_id` (non-zero) and enqueues

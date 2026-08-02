@@ -63,13 +63,6 @@ impl AdminToken {
         Self(local_transport::LocalToken::from_bytes(bytes))
     }
 
-    /// Borrow the raw byte representation. Symmetric with `from_bytes`;
-    /// no tests read it back yet but the pair is kept together for API
-    /// clarity.
-    #[allow(dead_code)]
-    pub fn as_bytes(&self) -> &[u8; ADMIN_TOKEN_BYTES] {
-        self.0.as_bytes()
-    }
 
     /// Encode as lowercase hex (64 chars).
     pub fn to_hex(&self) -> String {
@@ -169,17 +162,6 @@ impl AdminListener {
                 uid_matches_local: peer_info.uid_matches_local,
             },
         ))
-    }
-
-    /// Return the locally-bound TCP address, if this is a TCP listener.
-    ///
-    /// ANCHOR (audit cycle-3, dead-code policy): currently uncalled — kept as
-    /// the symmetric accessor to `AdminListener`'s inner transport for when a
-    /// TCP admin endpoint writes its bound port to a discovery file (the Unix
-    /// path already exposes its socket path). Remove if that never lands.
-    #[allow(dead_code)]
-    pub fn local_tcp_addr(&self) -> Option<std::net::SocketAddr> {
-        self.0.local_tcp_addr()
     }
 }
 
