@@ -191,14 +191,18 @@ mod tests {
         // Build a matching pair: encrypt c sealing cipher, decrypt with
         // matching opening cipher. Place opening cipher in slot 0
         // (newest); add unrelated ciphers behind it.
-        use veil_crypto::session_cipher::frame_aad;
+        use veil_proto::codec::frame_aad;
         use veil_proto::family::{ControlMsg, FrameFamily};
+        use veil_proto::header::FrameHeader;
 
         let key = [0x42u8; 32];
         let mut sealer = SessionCipher::new(&key, true);
         let opener = SessionCipher::new(&key, true);
 
-        let aad = frame_aad(FrameFamily::Control as u8, ControlMsg::Ping as u16);
+        let aad = frame_aad(&FrameHeader::new(
+            FrameFamily::Control as u8,
+            ControlMsg::Ping as u16,
+        ));
         let plaintext = b"hello".to_vec();
         let ciphertext = sealer.seal(&plaintext, &aad).unwrap();
 

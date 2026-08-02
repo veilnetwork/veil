@@ -27,7 +27,7 @@ pub type SessionAlias = [u8; 8];
 ///
 /// Wire layout:
 /// ```text
-/// [0..2] ovl1_major u16 BE (major protocol version; always 1 for OVL1)
+/// [0..2] ovl1_major u16 BE (major protocol version; see `header::VERSION`)
 /// [2..34] node_id [u8; 32]
 /// [34..] TLV entries (optional; ignored by legacy peers that stop at byte 34)
 /// ```

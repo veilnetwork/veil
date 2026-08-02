@@ -427,6 +427,7 @@ where
         let (_, body) = read_frame(stream).await?;
         let remote_hello = HelloPayload::decode(&body)
             .map_err(|e| HandshakeError(format!("OVL1 HELLO decode: {e}")))?;
+        reject_incompatible_major(remote_hello.ovl1_major)?;
         remote_id = remote_hello.node_id;
         if let Some(f) = capture {
             f(true, family, SessionMsg::Hello as u16, &body, remote_id);
@@ -478,6 +479,7 @@ where
         let (_, body) = read_frame(stream).await?;
         let remote_hello = HelloPayload::decode(&body)
             .map_err(|e| HandshakeError(format!("OVL1 HELLO decode: {e}")))?;
+        reject_incompatible_major(remote_hello.ovl1_major)?;
         remote_id = remote_hello.node_id;
         if let Some(f) = capture {
             f(true, family, SessionMsg::Hello as u16, &body, remote_id);
@@ -1749,6 +1751,31 @@ pub fn node_id_from_bytes(bytes: [u8; 32]) -> Result<veil_cfg::NodeId> {
 }
 
 // ── tests ─────────────────────────────────────────────────────────────────────
+
+/// Refuse a peer speaking a different OVL1 major version.
+///
+/// The field has been on the wire since the first HELLO and nothing ever read
+/// it — the frame header's own version byte was doing the whole job, and it
+/// still is: a peer on another major is rejected at `decode_header` before its
+/// HELLO is ever parsed.
+///
+/// Checked anyway, for two reasons. It makes the negotiation the payload
+/// claims to carry actually happen, and it names the problem in the handshake
+/// error rather than leaving the operator to work out why a frame "failed to
+/// decode". Version 1 → 2 was the AAD change (audit V-01), and a v1 peer
+/// hitting a v2 node should read "speaks OVL1 v1, we speak v2", not a codec
+/// error.
+fn reject_incompatible_major(remote_major: u16) -> Result<()> {
+    if remote_major != VERSION as u16 {
+        return Err(HandshakeError(format!(
+            "peer speaks OVL1 v{remote_major}, we speak v{} — incompatible \
+             frame authentication, both sides must be upgraded together",
+            VERSION
+        )));
+    }
+    Ok(())
+}
+
 
 #[cfg(test)]
 #[allow(deprecated)] // a few fixtures use the legacy `TicketIssuer::issue` shim
