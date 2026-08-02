@@ -90,41 +90,22 @@ pub fn resolve_key_passphrase(
 
     // 3. File path.
     if let Some(path) = &identity.key_passphrase_file {
-        let raw = std::fs::read_to_string(path).map_err(|e| {
-            NodeError::InvalidArgument(format!(
-                "failed to read key_passphrase_file {}: {e}",
-                path.display()
-            ))
-        })?;
+        let raw = read_passphrase_file(path)?;
         // Read first non-empty line, trim whitespace (trailing newline).
-        let pass = raw.lines().next().unwrap_or("").trim().to_string();
+        //
+        // `raw` is zeroizing, and the slice below borrows from it rather than
+        // building a second plain String — the old code went through
+        // `read_to_string` and `to_string`, leaving two un-wiped copies of the
+        // passphrase on the heap for the process's lifetime (audit V-11).
+        let pass = Zeroizing::new(raw.lines().next().unwrap_or("").trim().to_string());
         if pass.is_empty() {
             return Err(NodeError::InvalidArgument(format!(
                 "key_passphrase_file {} is empty or contains only whitespace",
                 path.display()
             )));
         }
-        // Warn if file permissions are too open (Unix only).
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::MetadataExt as _;
-            if let Ok(meta) = std::fs::metadata(path) {
-                let mode = meta.mode() & 0o777;
-                if mode & 0o077 != 0 {
-                    logger.warn(
-                        "key_passphrase.file_mode_too_open",
-                        format!(
-                            "key_passphrase_file {} has mode {:o}; expected 0o600 — \
-                             group/other readers can leak the passphrase",
-                            path.display(),
-                            mode,
-                        ),
-                    );
-                }
-            }
-        }
         logger.info("key_passphrase.source", format!("file={}", path.display()));
-        return Ok(Some(Zeroizing::new(pass)));
+        return Ok(Some(pass));
     }
 
     // 4. Inline config. WARN — least secure.
@@ -159,6 +140,122 @@ pub fn read_passphrase_from<R: BufRead>(reader: &mut R) -> Result<Zeroizing<Stri
     Ok(Zeroizing::new(trimmed))
 }
 
+/// Read a passphrase file into a buffer that wipes itself, refusing anything
+/// that would make the secret readable by someone else.
+///
+/// The old path called `read_to_string` and then `metadata`, which was wrong
+/// three ways (audit V-11):
+///
+/// * the contents landed in a plain `String` that was never zeroized, and the
+///   first line was copied into a second one;
+/// * a too-open mode was WARNED about and then read anyway — a world-readable
+///   passphrase file is a leak, not a style issue;
+/// * `metadata` follows symlinks and was a SEPARATE call from the read, so the
+///   thing checked and the thing read were not necessarily the same file.
+///
+/// Now the open carries `O_NOFOLLOW` and every check runs against `fstat` on
+/// that same descriptor, so there is no window to swap the target.
+#[cfg(unix)]
+fn read_passphrase_file(path: &std::path::Path) -> Result<Zeroizing<String>> {
+    use std::io::Read as _;
+    use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
+
+    let bad = |msg: String| NodeError::InvalidArgument(msg);
+
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+        .map_err(|e| {
+            bad(format!(
+                "failed to open key_passphrase_file {}: {e} (a symlink is \
+                 refused on purpose — point the config at the real path)",
+                path.display()
+            ))
+        })?;
+
+    // Everything below inspects the OPEN descriptor, not the path.
+    let meta = file.metadata().map_err(|e| {
+        bad(format!(
+            "failed to stat key_passphrase_file {}: {e}",
+            path.display()
+        ))
+    })?;
+
+    if !meta.is_file() {
+        return Err(bad(format!(
+            "key_passphrase_file {} is not a regular file",
+            path.display()
+        )));
+    }
+
+    let mode = meta.mode() & 0o777;
+    if mode & 0o077 != 0 {
+        return Err(bad(format!(
+            "key_passphrase_file {} has mode {mode:o}; group or other can read \
+             it. Run `chmod 600 {}` and start again.",
+            path.display(),
+            path.display()
+        )));
+    }
+
+    // SAFETY: `geteuid` reads process state and cannot fail.
+    let euid = unsafe { libc::geteuid() };
+    if meta.uid() != euid && meta.uid() != 0 {
+        return Err(bad(format!(
+            "key_passphrase_file {} is owned by uid {} — expected this process \
+             (uid {euid}) or root. A file someone else owns can be replaced \
+             under us at any time.",
+            path.display(),
+            meta.uid()
+        )));
+    }
+
+    // Bounded: a passphrase file is a line, and an unbounded read of whatever
+    // the path happens to point at is its own problem.
+    const MAX_PASSPHRASE_FILE_BYTES: u64 = 64 * 1024;
+    if meta.len() > MAX_PASSPHRASE_FILE_BYTES {
+        return Err(bad(format!(
+            "key_passphrase_file {} is {} bytes; expected a single line",
+            path.display(),
+            meta.len()
+        )));
+    }
+
+    let mut buf = Zeroizing::new(Vec::with_capacity(meta.len() as usize));
+    file.read_to_end(&mut buf).map_err(|e| {
+        bad(format!(
+            "failed to read key_passphrase_file {}: {e}",
+            path.display()
+        ))
+    })?;
+
+    let text = std::str::from_utf8(&buf)
+        .map_err(|_| bad(format!("key_passphrase_file {} is not UTF-8", path.display())))?;
+    Ok(Zeroizing::new(text.to_string()))
+}
+
+/// Windows has no mode bits and no `O_NOFOLLOW`; checking an ACL properly is a
+/// different piece of work, and pretending otherwise would be worse than
+/// saying so. The contents are still read into a zeroizing buffer.
+#[cfg(not(unix))]
+fn read_passphrase_file(path: &std::path::Path) -> Result<Zeroizing<String>> {
+    let raw = std::fs::read(path).map_err(|e| {
+        NodeError::InvalidArgument(format!(
+            "failed to read key_passphrase_file {}: {e}",
+            path.display()
+        ))
+    })?;
+    let buf = Zeroizing::new(raw);
+    let text = std::str::from_utf8(&buf).map_err(|_| {
+        NodeError::InvalidArgument(format!(
+            "key_passphrase_file {} is not UTF-8",
+            path.display()
+        ))
+    })?;
+    Ok(Zeroizing::new(text.to_string()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -183,5 +280,57 @@ mod tests {
         let mut input = Cursor::new(b"".to_vec());
         let pass = read_passphrase_from(&mut input).unwrap();
         assert_eq!(pass.as_str(), "");
+    }
+
+    /// A passphrase file readable by anyone else must be REFUSED, not warned
+    /// about and read anyway, and the file that gets checked must be the file
+    /// that gets read (audit V-11).
+    #[cfg(unix)]
+    #[test]
+    fn a_passphrase_file_anyone_can_read_is_refused() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = std::env::temp_dir().join(format!("v11-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("pass");
+        std::fs::write(&path, b"hunter2\n").unwrap();
+
+        // Owner-only: accepted, and the value comes back intact.
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(
+            read_passphrase_file(&path).unwrap().lines().next(),
+            Some("hunter2")
+        );
+
+        // Group- or world-readable: refused. The old code logged a warning and
+        // used it, which is the leak the warning was describing.
+        for mode in [0o640, 0o604, 0o644] {
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+            let err = read_passphrase_file(&path)
+                .err()
+                .unwrap_or_else(|| panic!("mode {mode:o} must be refused"));
+            let msg = format!("{err}");
+            assert!(
+                msg.contains("chmod 600"),
+                "the error must say how to fix it: {msg}"
+            );
+        }
+
+        // A symlink is refused even when it points at a well-permissioned file:
+        // checking the path and reading the path were two separate operations,
+        // so the target could change in between.
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let link = dir.join("link");
+        std::os::unix::fs::symlink(&path, &link).unwrap();
+        assert!(
+            read_passphrase_file(&link).is_err(),
+            "O_NOFOLLOW must refuse a symlinked passphrase file"
+        );
+
+        // A directory is not a passphrase.
+        assert!(read_passphrase_file(&dir).is_err());
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
