@@ -209,18 +209,14 @@ fn upgrade_nonce_in_config(
     new_nonce_b64: &str,
     logger: &NodeLogger,
 ) {
-    let result = (|| -> Result<(), String> {
-        // audit cycle-8 H5: hold the process-wide config-write guard across the
-        // whole load-modify-save so a concurrent peer-nonce persist cannot load
-        // the same baseline and clobber this identity-nonce upgrade.
-        let _guard = cfg::config_write_guard();
-        let mut config = cfg::load_config(config_path).map_err(|e| e.to_string())?;
-        let identity = config.identity.as_mut().ok_or("no identity section")?;
-        identity.nonce = new_nonce_b64.to_owned();
-        identity.node_id = cfg::NodeId::from_public_key(identity.algo, &identity.public_key).ok();
-        cfg::save_config(config_path, &config).map_err(|e| e.to_string())?;
-        Ok(())
-    })();
+    // audit V-03/V-05: the upgraded nonce goes to the runtime-state sidecar, not
+    // into `config.toml`. Writing it back into the config rewrote a file the
+    // operator may have signed, which stripped the signature and made the NEXT
+    // boot under `require_signed_config` refuse to start — the miner bricking
+    // the node on a timer. `node_id` is derived from the public key alone, so
+    // nothing else here needed to move.
+    let result = cfg::runtime_state::record_identity_nonce(config_path, new_nonce_b64)
+        .map_err(|e| e.to_string());
     if let Err(e) = result {
         logger.warn("lazy_miner.config_write_err", format!("err={e}"));
     }

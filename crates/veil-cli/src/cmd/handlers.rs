@@ -354,9 +354,12 @@ impl ConfigCommandService {
             ConfigCommand::Set { key, value } => Self::set(&mut context, &key, &value),
             ConfigCommand::Publish => Self::publish_bundle(&mut context),
             ConfigCommand::Fetch { dry_run } => Self::fetch_bundle(&mut context, dry_run),
-            ConfigCommand::Sign { issued_at, stdout } => {
-                Self::sign(&mut context, issued_at, stdout)
-            }
+            ConfigCommand::Sign {
+                signer_key,
+                issued_at,
+                stdout,
+            } => Self::sign(&mut context, &signer_key, issued_at, stdout),
+            ConfigCommand::SignerKey { path, force } => Self::signer_key(&mut context, &path, force),
         }
     }
 
@@ -587,50 +590,85 @@ impl ConfigCommandService {
         Ok(())
     }
 
-    /// Sign the active config file in place using the operator's
-    /// `[identity]` keypair (slice 11b).  Calls
-    /// `veil_cfg::signed_config::sign_config` with the raw file
-    /// content + identity keys and writes the result back atomically
-    /// (or prints to stdout if `--stdout`).
+    /// Mint an offline config-signing keypair (audit V-03).
+    pub(crate) fn signer_key<I: CommandIo, O: ConfigOps>(
+        context: &mut CommandContext<'_, I, O>,
+        path: &Path,
+        force: bool,
+    ) -> veil_cfg::Result<()> {
+        if path.exists() && !force {
+            return Err(veil_cfg::ConfigError::CommandFailed(format!(
+                "{} already exists. Overwriting a signer key orphans every config \
+                 signed with the old one — pass --force only if that is what you mean.",
+                path.display()
+            )));
+        }
+        let key = veil_cfg::signed_config::generate_signer_key(veil_cfg::SignatureAlgorithm::default());
+        let rendered = veil_cfg::signed_config::render_signer_key(&key)
+            .map_err(|e| veil_cfg::ConfigError::CommandFailed(format!("{e}")))?;
+        // `atomic_write` creates mode 0600 and never follows a symlink into
+        // somebody else's file — the same primitive the node uses for keys.
+        veil_util::atomic_write(path, rendered.as_bytes())
+            .map_err(|e| veil_cfg::ConfigError::CommandFailed(format!("write signer key: {e}")))?;
+        context.io.emit(OutputEvent::message(format!(
+            "wrote offline signer key to {} (mode 0600).\n\
+             Pin it on every node that enforces signed configs:\n  \
+             VEIL_CONFIG_TRUSTED_ISSUER_PUBKEY={}\n\
+             Keep the private half OFF those nodes.",
+            path.display(),
+            key.public_key,
+        )));
+        Ok(())
+    }
+
+    /// Sign the active config file with an OFFLINE signer key (audit V-03).
     ///
-    /// Pre-conditions:
-    /// * `[identity].public_key` / `[identity].private_key` must both be
-    ///   present (the active config — same keys used for bootstrap-bundle
-    ///   signing).
-    /// * If `issued_at_unix` is None, defaults to `SystemTime::now()`.
+    /// The key comes from `--signer-key`, never from the config's own
+    /// `[identity]`. Signing a file with a private key stored inside that file
+    /// is self-certification: whoever can rewrite the config also holds the
+    /// key that "authenticates" it, so verification reported `Verified` on
+    /// tampered bytes. The command now refuses that combination outright.
     ///
     /// Re-signing an already-signed config replaces the previous
     /// signature header (the canonical-message stripping is idempotent).
     pub(crate) fn sign<I: CommandIo, O: ConfigOps>(
         context: &mut CommandContext<'_, I, O>,
+        signer_key_path: &Path,
         issued_at_override: Option<u64>,
         to_stdout: bool,
     ) -> veil_cfg::Result<()> {
-        // Step 1 — load the parsed config to extract the identity keys.
-        // Note: this implicitly verifies any existing signature (warn-
-        // only) — operators get a chance to see "current signature is
-        // OK" before re-signing.
+        // Step 1 — load the signer keypair from OUTSIDE the config.
+        let signer = veil_cfg::signed_config::read_signer_key(signer_key_path)
+            .map_err(|e| veil_cfg::ConfigError::CommandFailed(format!("{e}")))?;
+
+        // Step 2 — load the parsed config. This implicitly verifies any
+        // existing signature (warn-only), so operators see "current signature
+        // is OK" before re-signing.
         let (config_path, loaded) = context.config().load_existing()?;
-        let identity = loaded.identity.as_ref().ok_or_else(|| {
-            veil_cfg::ConfigError::CommandFailed(
-                "config.identity is empty — `config sign` needs a keypair \
-                 to sign with.  Run `veil-cli identity create` first."
-                    .to_owned(),
-            )
-        })?;
-        if identity.public_key.is_empty() || identity.private_key.is_empty() {
-            return Err(veil_cfg::ConfigError::CommandFailed(
-                "config.identity.{public_key,private_key} must both be \
-                 non-empty to sign — partial keypair detected."
-                    .to_owned(),
-            ));
+
+        // Step 3 — refuse to sign with the node's own key even if the operator
+        // copied it into the signer file. The check is on the KEY, not on where
+        // it was read from, because the hole is the key being present on the
+        // node — the file path is just how it usually gets there.
+        if let Some(identity) = loaded.identity.as_ref()
+            && !identity.public_key.is_empty()
+            && identity.public_key == signer.public_key
+        {
+            return Err(veil_cfg::ConfigError::CommandFailed(format!(
+                "refusing to sign {} with the key from its own [identity]. That key \
+                 sits in the file being signed, so anyone who can rewrite the config \
+                 can re-sign it and the signature proves nothing. Mint a separate \
+                 offline key with `veil-cli config signer-key <path>` and keep the \
+                 private half off this host.",
+                config_path.display()
+            )));
         }
 
-        // Step 2 — read the raw file content (preserves any existing
+        // Step 4 — read the raw file content (preserves any existing
         // signature header so the sign helper can strip + replace it).
         let raw = context.ops.read_raw_config(&config_path)?;
 
-        // Step 3 — derive issued_at (now() if override is None).
+        // Step 5 — derive issued_at (now() if override is None).
         let issued_at = issued_at_override.unwrap_or_else(|| {
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -638,29 +676,32 @@ impl ConfigCommandService {
                 .unwrap_or(0)
         });
 
-        // Step 4 — sign.  Fails fast on key-pair / algorithm mismatch
+        // Step 6 — sign.  Fails fast on key-pair / algorithm mismatch
         // before any write happens.
         let signed = veil_cfg::signed_config::sign_config(
             &raw,
-            &identity.public_key,
-            &identity.private_key,
-            identity.algo,
+            &signer.public_key,
+            &signer.private_key,
+            signer.algo,
             issued_at,
         )
         .map_err(|e| veil_cfg::ConfigError::CommandFailed(format!("sign config: {e}")))?;
 
-        // Step 5 — emit OR write atomically back to the file.
+        // Step 7 — emit OR write atomically back to the file.
         if to_stdout {
             context.io.emit(OutputEvent::config_contents(signed));
         } else {
             context.ops.write_raw_config(&config_path, &signed)?;
             context.io.emit(OutputEvent::message(format!(
                 "signed config at {} (algo={:?}, issued_at_unix={issued_at}, \
-                 issuer_pk={}…); subsequent loads will verify the signature \
-                 and WARN on failure — see veil_cfg.signed_config logs",
+                 issuer_pk={}…). Pin it with \
+                 VEIL_CONFIG_TRUSTED_ISSUER_PUBKEY={} — without a pin, enforcement \
+                 refuses to start, because an unpinned signature only says SOMEONE \
+                 signed the file.",
                 config_path.display(),
-                identity.algo,
-                &identity.public_key[..identity.public_key.len().min(16)],
+                signer.algo,
+                &signer.public_key[..signer.public_key.len().min(16)],
+                signer.public_key,
             )));
         }
         Ok(())
@@ -1683,8 +1724,18 @@ mod tests {
             },
         };
 
-        ConfigCommandService::sign(&mut context, Some(1_700_000_000), /* stdout */ true)
-            .expect("sign must succeed on a well-formed config");
+        // Audit V-03: the signer key comes from OUTSIDE the config now. A
+        // separate keypair, written to its own file.
+        let signer = veil_cfg::signed_config::generate_signer_key(SignatureAlgorithm::Ed25519);
+        let signer_path = write_signer_key_file("sign-ok", &signer);
+
+        ConfigCommandService::sign(
+            &mut context,
+            &signer_path,
+            Some(1_700_000_000),
+            /* stdout */ true,
+        )
+        .expect("sign must succeed on a well-formed config");
 
         let signed = context.io.output.clone();
         assert!(
@@ -1693,7 +1744,7 @@ mod tests {
             &signed[..signed.len().min(80)],
         );
         let verified =
-            veil_cfg::signed_config::verify_signed_config(&signed, Some(&keypair.public_key))
+            veil_cfg::signed_config::verify_signed_config(&signed, Some(&signer.public_key))
                 .expect("re-verify roundtrip");
         assert_eq!(verified.issued_at_unix, 1_700_000_000);
         assert!(
@@ -1701,27 +1752,127 @@ mod tests {
                 .unsigned_toml
                 .contains("runtime_flavor = \"multi_thread\"")
         );
+        // And NOT by the node's own key — the distinction is the whole point.
+        assert!(
+            veil_cfg::signed_config::verify_signed_config(&signed, Some(&keypair.public_key))
+                .is_err(),
+            "the config must not verify against the identity in the file"
+        );
+        let _ = std::fs::remove_file(&signer_path);
     }
 
-    /// Missing `[identity]` block surfaces a structured error before
-    /// any write happens — protects operators against accidentally
-    /// trashing an unsigned-by-design config.
+    /// Write a signer key to a scratch file at mode 0600, the way
+    /// `config signer-key` does. Returns the path.
+    fn write_signer_key_file(
+        tag: &str,
+        key: &veil_cfg::signed_config::SignerKey,
+    ) -> std::path::PathBuf {
+        let path = std::env::temp_dir().join(format!("veil-signer-{tag}.toml"));
+        let _ = std::fs::remove_file(&path);
+        let rendered = veil_cfg::signed_config::render_signer_key(key).expect("render");
+        veil_util::atomic_write(&path, rendered.as_bytes()).expect("write signer key");
+        path
+    }
+
+    /// Audit V-03. `config sign` used to sign with `[identity].private_key` —
+    /// the node's own key, sitting in plaintext in the file being signed.
+    /// Anyone able to rewrite the config also held the key that "authenticated"
+    /// it, so verification reported `Verified` on tampered bytes. Signing with
+    /// that key is now refused outright, whatever file it was read from.
     #[test]
-    fn epic11b_config_sign_refuses_when_identity_missing() {
+    fn config_sign_refuses_the_configs_own_identity_key() {
+        let keypair = veil_crypto::generate_keypair(SignatureAlgorithm::Ed25519);
+        let loaded = veil_cfg::Config {
+            identity: Some(veil_cfg::IdentityConfig {
+                algo: SignatureAlgorithm::Ed25519,
+                role: Default::default(),
+                public_key: keypair.public_key.clone(),
+                private_key: keypair.private_key.clone(),
+                nonce: "AAAAAA==".to_owned(),
+                node_id: None,
+                key_passphrase: None,
+                key_passphrase_file: None,
+                key_passphrase_prompt: false,
+                lazy_mining: false,
+                max_lazy_difficulty: 0,
+            }),
+            ..veil_cfg::Config::default()
+        };
+        let mut context = CommandContext {
+            config_arg: None,
+            io: BufferIo::default(),
+            ops: MockConfigOps {
+                locate_path: std::path::PathBuf::from("/tmp/config.toml"),
+                raw_config: "[global]\n".to_owned(),
+                loaded_config: loaded,
+            },
+        };
+
+        // The operator copied the node key into a signer file — the obvious
+        // way to "satisfy" the new flag without changing anything real. The
+        // check is on the KEY, not on where it was read from, precisely so
+        // that does not work.
+        let smuggled = veil_cfg::signed_config::SignerKey {
+            algo: SignatureAlgorithm::Ed25519,
+            public_key: keypair.public_key.clone(),
+            private_key: keypair.private_key.clone(),
+        };
+        let path = write_signer_key_file("smuggled", &smuggled);
+        let err = ConfigCommandService::sign(&mut context, &path, None, true)
+            .expect_err("signing with the config's own identity must be refused");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("its own [identity]") || msg.contains("signer-key"),
+            "the refusal must explain what to do instead; got: {msg}",
+        );
+        assert!(
+            context.io.output.is_empty(),
+            "nothing may be emitted for a refused signature"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A signer key readable beyond its owner authenticates nothing.
+    #[test]
+    #[cfg(unix)]
+    fn a_world_readable_signer_key_is_refused() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let signer = veil_cfg::signed_config::generate_signer_key(SignatureAlgorithm::Ed25519);
+        let path = write_signer_key_file("loose", &signer);
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).expect("chmod");
+
+        let mut context = CommandContext {
+            config_arg: None,
+            io: BufferIo::default(),
+            ops: MockConfigOps {
+                locate_path: std::path::PathBuf::from("/tmp/config.toml"),
+                raw_config: "[global]\n".to_owned(),
+                loaded_config: veil_cfg::Config::default(),
+            },
+        };
+        let err = ConfigCommandService::sign(&mut context, &path, None, true)
+            .expect_err("a group/other-readable signer key must be refused");
+        assert!(format!("{err}").contains("readable beyond its owner"));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A missing signer key file fails before anything is written.
+    #[test]
+    fn config_sign_refuses_without_a_signer_key_file() {
         let mut context = CommandContext {
             config_arg: None,
             io: BufferIo::default(),
             ops: MockConfigOps {
                 locate_path: std::path::PathBuf::from("/tmp/config.toml"),
                 raw_config: "[global]\nruntime_flavor = \"multi_thread\"\n".to_owned(),
-                loaded_config: veil_cfg::Config::default(), // no identity
+                loaded_config: veil_cfg::Config::default(),
             },
         };
-        let err = ConfigCommandService::sign(&mut context, None, true).expect_err("must fail-fast");
-        let msg = format!("{err}");
-        assert!(
-            msg.contains("config.identity is empty") || msg.contains("identity create"),
-            "error must direct operator to `identity create`; got: {msg}",
-        );
+        let missing = std::env::temp_dir().join("veil-signer-does-not-exist.toml");
+        let _ = std::fs::remove_file(&missing);
+        let err = ConfigCommandService::sign(&mut context, &missing, None, true)
+            .expect_err("must fail-fast");
+        assert!(format!("{err}").contains("read signer key"));
     }
 }

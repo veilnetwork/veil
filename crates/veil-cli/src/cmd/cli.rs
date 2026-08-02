@@ -885,18 +885,23 @@ pub enum ConfigCommand {
         #[arg(long)]
         dry_run: bool,
     },
-    /// Sign the config file with your `[identity]` key so tampering can be
+    /// Sign the config file with an OFFLINE signer key so tampering can be
     /// detected.
     ///
     /// Signing adds a `# VEIL_CONFIG_SIGNATURE_V1: <base64>` comment line at
     /// the top of the file. From then on, loading the config checks that
     /// signature and logs a warning if it no longer matches.
     ///
+    /// The signing key must come from `--signer-key`, not from the config's
+    /// own `[identity]`: signing a file with a key stored inside that same
+    /// file proves nothing, because anyone who can rewrite the file can
+    /// re-sign it. Mint one with `config signer-key`.
+    ///
     /// Signing a file that is already signed replaces the old signature line.
-    /// Your `[identity].private_key` must be present and match the file's
-    /// `[identity].public_key`, or the command stops without writing
-    /// anything.
     Sign {
+        /// Path to the offline signer keypair (see `config signer-key`).
+        #[arg(long, value_name = "PATH")]
+        signer_key: std::path::PathBuf,
         /// Unix timestamp to record inside the signature. Defaults to the
         /// current time, so re-signing always moves this forward.
         #[arg(long, value_name = "UNIX_SECS")]
@@ -905,6 +910,20 @@ pub enum ConfigCommand {
         /// the file. Useful for a dry run or piping into secure storage.
         #[arg(long)]
         stdout: bool,
+    },
+    /// Mint an offline config-signing keypair and print the pubkey to pin.
+    ///
+    /// Keep the resulting file OFF the nodes it signs for — an operator
+    /// laptop, a secrets manager, an air-gapped box. Nodes only ever need the
+    /// public half, via `VEIL_CONFIG_TRUSTED_ISSUER_PUBKEY`.
+    SignerKey {
+        /// Where to write the keypair. Created mode 0600.
+        #[arg(value_name = "PATH")]
+        path: std::path::PathBuf,
+        /// Overwrite an existing file. Off by default — silently replacing a
+        /// signer key would orphan every config signed with the old one.
+        #[arg(long)]
+        force: bool,
     },
 }
 

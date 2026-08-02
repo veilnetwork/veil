@@ -258,6 +258,93 @@ pub fn verify_signed_config(
     })
 }
 
+// ── Offline signer key (audit V-03) ─────────────────────────────────────────
+
+/// An operator signing keypair that lives OUTSIDE the config it signs.
+///
+/// ## Why it cannot be `[identity]`
+///
+/// `config sign` used to sign with `config.identity.private_key` — the node's
+/// own key, stored in plaintext in the very file being signed. Anyone able to
+/// rewrite the config could therefore also re-sign it, and verification would
+/// report `Verified` on the attacker's bytes. That is self-certification: the
+/// signature proved the file had been signed by whoever last held the file.
+///
+/// A signer key is a separate keypair whose private half is meant to live
+/// somewhere the node does not: an operator laptop, a HSM-backed host, a
+/// sealed secret. The node only ever sees the PUBLIC half, pinned through
+/// `VEIL_CONFIG_TRUSTED_ISSUER_PUBKEY` — which is what makes a verified
+/// signature mean "the operator issued this" instead of "someone did".
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct SignerKey {
+    #[serde(default)]
+    pub algo: SignatureAlgorithm,
+    pub public_key: String,
+    pub private_key: String,
+}
+
+/// Mint a fresh offline signer keypair. Never touches the config.
+pub fn generate_signer_key(algo: SignatureAlgorithm) -> SignerKey {
+    let kp = veil_crypto::generate_keypair(algo);
+    SignerKey {
+        algo: kp.algo,
+        public_key: kp.public_key,
+        private_key: kp.private_key,
+    }
+}
+
+/// Render a signer key for storage, with the operator instructions inline —
+/// the file is the only place they will reliably be read.
+pub fn render_signer_key(key: &SignerKey) -> Result<String, SignedConfigError> {
+    let body = toml::to_string_pretty(key)
+        .map_err(|e| SignedConfigError::Sign(format!("render signer key: {e}")))?;
+    Ok(format!(
+        "# veil offline config-signing key. KEEP THE PRIVATE HALF OFF THE NODE.\n\
+         #\n\
+         # Pin the public half on every node that enforces signed configs:\n\
+         #   VEIL_CONFIG_TRUSTED_ISSUER_PUBKEY={}\n\
+         # (in the systemd unit / compose file — NOT in config.toml, which is\n\
+         # exactly the file this key exists to authenticate.)\n\
+         {body}",
+        key.public_key,
+    ))
+}
+
+/// Read a signer key from disk.
+///
+/// On unix, refuses a file any group or other can read. A signing key that the
+/// whole box can read is the problem this type exists to solve, and the check
+/// costs one `stat` at the only moment anyone would notice.
+pub fn read_signer_key(path: &std::path::Path) -> Result<SignerKey, SignedConfigError> {
+    let raw = std::fs::read_to_string(path)
+        .map_err(|e| SignedConfigError::Sign(format!("read signer key {}: {e}", path.display())))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let mode = std::fs::metadata(path)
+            .map_err(|e| SignedConfigError::Sign(format!("stat signer key: {e}")))?
+            .permissions()
+            .mode();
+        if mode & 0o077 != 0 {
+            return Err(SignedConfigError::Sign(format!(
+                "signer key {} is mode {:o}: readable beyond its owner. \
+                 `chmod 600` it — a signing key everyone on the host can read \
+                 authenticates nothing.",
+                path.display(),
+                mode & 0o777,
+            )));
+        }
+    }
+    let key: SignerKey = toml::from_str(&raw)
+        .map_err(|e| SignedConfigError::Sign(format!("parse signer key: {e}")))?;
+    if key.public_key.is_empty() || key.private_key.is_empty() {
+        return Err(SignedConfigError::Sign(
+            "signer key file needs both public_key and private_key".to_owned(),
+        ));
+    }
+    Ok(key)
+}
+
 /// Quick check: does the content carry a signature header at all?
 /// Used by the loader to decide between the verify path and the
 /// "unsigned config" warn-and-accept path.
