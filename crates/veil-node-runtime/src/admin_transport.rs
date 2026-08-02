@@ -63,7 +63,6 @@ impl AdminToken {
         Self(local_transport::LocalToken::from_bytes(bytes))
     }
 
-
     /// Encode as lowercase hex (64 chars).
     pub fn to_hex(&self) -> String {
         self.0.to_hex()
