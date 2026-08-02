@@ -40,6 +40,7 @@ ASSUME_YES=0
 QUICKSTART="auto"          # auto|yes|no — offer to init+run a node at the end
 NO_VERIFY=0                # escape hatch; verification is ON by default
 REQUIRE_SIGNATURE=0        # --require-signature: hard-fail if manifest sig absent
+SKIP_SIGNATURE=0           # --skip-signature: proceed without a usable verifier
 SIG_VERIFIED=0             # set to 1 once the release-manifest signature verifies
 ALL_COMPONENTS="veil-cli ogate oproxy-client oproxy-server"
 
@@ -81,6 +82,10 @@ OPTIONS:
     -y, --yes             Assume "yes" to prompts (non-interactive).
     --no-verify           Skip ALL verification — sha256 AND signature
                           (NOT recommended).
+    --skip-signature      Install even when the release signature CANNOT be
+                          verified (no OpenSSL >= 3.0). sha256 alone does not
+                          detect a replaced release — it ships from the same
+                          place as the binaries. Prefer installing openssl 3.x.
     --require-signature   Hard-fail unless the release manifest carries a valid
                           Ed25519 signature under the pinned release key.
                           Default: verify the signature when a key is pinned and
@@ -120,6 +125,7 @@ while [ $# -gt 0 ]; do
         -y|--yes) ASSUME_YES=1; shift ;;
         --no-verify) NO_VERIFY=1; shift ;;
         --require-signature) REQUIRE_SIGNATURE=1; shift ;;
+        --skip-signature) SKIP_SIGNATURE=1; shift ;;
         -h|--help) usage; exit 0 ;;
         *) err "unknown option '$1' (try --help)" ;;
     esac
@@ -203,10 +209,24 @@ openssl_can_ed25519() {
 }
 
 # Verify the detached Ed25519 signature over the sha256 manifest ($1). Sets
-# SIG_VERIFIED=1 on success. Fail-closed when a key is pinned and the signature
-# is missing or invalid; warn-and-continue (no regression vs channel trust)
-# when no key is pinned or no capable openssl is present, unless
-# --require-signature forces a hard failure.
+# SIG_VERIFIED=1 on success.
+#
+# A PINNED KEY MEANS VERIFICATION IS MANDATORY (audit V-01). This used to warn
+# and continue on sha256 alone whenever no OpenSSL >= 3 was present — which is
+# the DEFAULT on macOS, where `openssl` is LibreSSL, and on any older Linux. So
+# the platforms most likely to hit the weak path were the ones that took it
+# silently, and the strong path was opt-in behind --require-signature.
+#
+# That fallback is not a smaller guarantee, it is none: the manifest and the
+# binaries come from the SAME release, so anyone who can replace the artifacts
+# can replace the manifest with them, and the sha256 then matches perfectly.
+# It defends against a corrupted download and nothing else — while the pinned
+# key exists precisely to defend against a compromised release.
+#
+# No verifier is bundled. Ed25519 verification is ~60 lines of modular
+# arithmetic and getting it subtly wrong fails OPEN; shipping hand-rolled
+# crypto inside an installer to avoid asking for OpenSSL is the worse trade.
+# The escape hatch is explicit and named for what it does.
 verify_manifest_signature() { # <sha256-manifest-file>
     _sha="$1"
     _pem="${VEIL_RELEASE_PUBKEY_PEM:-$(pinned_release_pubkey)}"
@@ -221,14 +241,24 @@ verify_manifest_signature() { # <sha256-manifest-file>
         return 0
     fi
     if ! openssl_can_ed25519; then
-        if [ "$REQUIRE_SIGNATURE" -eq 1 ]; then
-            err "--require-signature needs OpenSSL >= 3.0 to verify the Ed25519
-       release signature (found: $(openssl version 2>/dev/null || echo none))."
+        if [ "$SKIP_SIGNATURE" -eq 1 ]; then
+            warn "SIGNATURE CHECK SKIPPED at your request. sha256 alone proves
+       only that the download was not corrupted in transit — the manifest ships
+       from the same release as the binaries, so it cannot detect a replaced
+       release. You are trusting the download host."
+            return 0
         fi
-        warn "cannot verify release signature: need OpenSSL >= 3.0 (found
-       $(openssl version 2>/dev/null || echo 'no openssl')). Falling back to
-       sha256-only. Install OpenSSL 3.x or pass --require-signature to enforce."
-        return 0
+        err "cannot verify the release signature: this installer pins a release
+       key, but Ed25519 verification needs OpenSSL >= 3.0 (found:
+       $(openssl version 2>/dev/null || echo 'no openssl')).
+
+       On macOS the system \`openssl\` is LibreSSL, which cannot do this:
+           brew install openssl@3 && export PATH=\"\$(brew --prefix openssl@3)/bin:\$PATH\"
+
+       On older Linux, install the distribution's openssl 3.x package.
+
+       To install ANYWAY without verifying the signature, re-run with
+       --skip-signature — sha256 alone cannot detect a replaced release."
     fi
     fetch "${_base}/sha256-${TRIPLE}.txt.sig" "${TMP}/sha256.txt.sig" \
         || err "a release key is pinned but no sha256-${TRIPLE}.txt.sig was
