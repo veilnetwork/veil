@@ -23,7 +23,7 @@ use tokio::{
 use veil_abuse::{BanList, ViolationTracker};
 use veil_crypto::{
     kex,
-    session_cipher::{SessionCipher, frame_aad},
+    session_cipher::SessionCipher,
     session_kdf,
 };
 use veil_observability::{NodeLogger, NodeMetrics};
@@ -1382,8 +1382,7 @@ impl SessionRunner {
     fn decrypt_frame_body_in_place(
         &mut self,
         raw_body: &mut Vec<u8>,
-        header_family: u8,
-        header_msg_type: u16,
+        header: &veil_proto::header::FrameHeader,
         rekey: &crate::rekey_context::RekeyContext,
         rx_cipher_prev: &mut crate::rekey_rx_grace_buffer::RekeyRxGraceBuffer,
     ) -> std::ops::ControlFlow<(), DecryptInPlaceOutcome> {
@@ -1406,7 +1405,10 @@ impl SessionRunner {
             );
             return ControlFlow::Break(());
         }
-        let aad = frame_aad(header_family, header_msg_type);
+        // The whole header, re-encoded from what was decoded off the wire.
+        // Every one of the 24 bytes is covered by a field, so this reproduces
+        // the sender's bytes exactly (audit V-01).
+        let aad = veil_proto::codec::frame_aad(header);
         let now = tokio::time::Instant::now();
         rx_cipher_prev.prune_expired(now);
 
@@ -2805,7 +2807,6 @@ pub fn apply_tx_cipher(
     // nodes together — see `decrypt_frame_body_in_place`.
     let plaintext_body = &frame[HEADER_SIZE..];
     let h = decode_header(frame).ok()?;
-    let aad = frame_aad(h.family, h.msg_type);
     // i: encrypt directly into the pool buffer instead of
     // allocating a fresh `Vec<u8>` via `cipher.seal(...)`. At 15 k frames/sec
     // on a bootstrap that path produced ~900 MiB/sec of small-arena churn —
@@ -2817,6 +2818,11 @@ pub fn apply_tx_cipher(
     let ct_total = plaintext_len + veil_crypto::session_cipher::AEAD_OVERHEAD;
     let mut out_hdr = h;
     out_hdr.body_len = ct_total as u32;
+    // AAD is the FINAL header, so it has to be built here — after `body_len`
+    // became the ciphertext length. Built from the earlier header it would not
+    // match what the receiver computes from the bytes on the wire, and every
+    // frame would fail to open (audit V-01).
+    let aad = veil_proto::codec::frame_aad(&out_hdr);
     let mut out_pooled = veil_bufpool::global().acquire(HEADER_SIZE + ct_total);
     out_pooled
         .as_vec_mut()
@@ -4189,8 +4195,7 @@ impl SessionRunner {
             let (body_owned, body_slice_from_raw): (Option<Vec<u8>>, bool) = {
                 match self.decrypt_frame_body_in_place(
                     raw_body.as_vec_mut(),
-                    header.family,
-                    header.msg_type,
+                    &header,
                     &rekey,
                     &mut rx_cipher_prev,
                 ) {
@@ -4791,7 +4796,7 @@ mod m1_empty_frame_aead_tests {
 
         // Round-trip: a peer cipher with the same key opens it to empty plaintext.
         let mut rx = SessionCipher::new(&key, true);
-        let aad = frame_aad(out_hdr.family, out_hdr.msg_type);
+        let aad = veil_proto::codec::frame_aad(&out_hdr);
         let pt = rx
             .open(&bytes[HEADER_SIZE..], &aad)
             .expect("sealed empty frame must open");
@@ -4827,7 +4832,7 @@ mod m1_empty_frame_aead_tests {
             let frame_len = HEADER_SIZE + hdr.body_len as usize;
             let body_start = cursor + HEADER_SIZE;
             let body_end = cursor + frame_len;
-            let aad = frame_aad(hdr.family, hdr.msg_type);
+            let aad = veil_proto::codec::frame_aad(&hdr);
             let plaintext = rx
                 .open(&wire[body_start..body_end], &aad)
                 .expect("open concatenated frame in cipher order");

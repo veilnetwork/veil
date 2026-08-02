@@ -45,7 +45,8 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
 use crate::cfg::NodeRole;
-use crate::crypto::session_cipher::{SessionCipher, frame_aad};
+use crate::crypto::session_cipher::SessionCipher;
+use veil_proto::codec::frame_aad;
 use crate::crypto::{kex, session_kdf};
 use crate::node::dispatcher::make_test_dispatcher;
 use crate::node::observability::NodeMetrics;
@@ -200,7 +201,7 @@ struct ChaosDriver {
 impl ChaosDriver {
     /// Seal a Ping and write it onto the wire.
     async fn send_ping(&mut self) {
-        let aad = frame_aad(FrameFamily::Control as u8, ControlMsg::Ping as u16);
+        let aad = chaos_aad_plaintext(FrameFamily::Control as u8, ControlMsg::Ping as u16, 0);
         let body = self.client_tx.seal(&[], &aad).expect("seal Ping");
         let mut hdr = FrameHeader::new(FrameFamily::Control as u8, ControlMsg::Ping as u16);
         hdr.body_len = body.len() as u32;
@@ -242,7 +243,7 @@ impl ChaosDriver {
             ephemeral_pubkey: kp.public_key,
         }
         .encode();
-        let aad = frame_aad(FrameFamily::Session as u8, SessionMsg::RekeyInit as u16);
+        let aad = chaos_aad_plaintext(FrameFamily::Session as u8, SessionMsg::RekeyInit as u16, body.len());
         let enc = self
             .client_tx
             .seal(&body, &aad)
@@ -295,7 +296,7 @@ impl ChaosDriver {
         // Padding: discard but advance counter (
         // coalesce-with-padding: each pad consumes a cipher slot).
         if hdr.family == FrameFamily::Session as u8 && hdr.msg_type == SessionMsg::Padding as u16 {
-            let aad = frame_aad(FrameFamily::Session as u8, SessionMsg::Padding as u16);
+            let aad = frame_aad(hdr); // the header as received (audit V-01)
             let _ = self
                 .client_rx
                 .open(body, &aad)
@@ -306,7 +307,7 @@ impl ChaosDriver {
         if hdr.family == FrameFamily::Control as u8 && hdr.msg_type == ControlMsg::Pong as u16 {
             self.outcome.pong_received += 1;
             if hdr.body_len > 0 {
-                let aad = frame_aad(FrameFamily::Control as u8, ControlMsg::Pong as u16);
+                let aad = frame_aad(hdr); // the header as received (audit V-01)
                 self.client_rx.open(body, &aad).expect("decrypt Pong");
             }
             return pending_init_kp;
@@ -315,7 +316,7 @@ impl ChaosDriver {
         // generated a fresh ephemeral, sent us a RekeyAck containing it.
         // Decrypt, derive new keys, mirror cipher swap.
         if hdr.family == FrameFamily::Session as u8 && hdr.msg_type == SessionMsg::RekeyAck as u16 {
-            let aad = frame_aad(FrameFamily::Session as u8, SessionMsg::RekeyAck as u16);
+            let aad = frame_aad(hdr); // the header as received (audit V-01)
             let plain = self.client_rx.open(body, &aad).expect("decrypt RekeyAck");
             let server_responder_pubkey = RekeyPayload::decode(&plain)
                 .expect("decode RekeyAck")
@@ -1414,4 +1415,31 @@ async fn chaos_sim_p2p_full_stress() {
         violations, 0,
         "chaos-sim p2p full: {violations} iteration(s) with violations"
     );
+}
+
+/// AAD for a frame this simulation is about to send: the FINAL wire header
+/// (audit V-01). `body_len` is part of it, so the ciphertext length has to be
+/// known first — it is: `plaintext + AEAD_OVERHEAD`.
+fn chaos_aad_plaintext(
+    family: u8,
+    msg_type: u16,
+    plaintext_len: usize,
+) -> [u8; veil_proto::header::HEADER_SIZE] {
+    chaos_aad_ciphertext(
+        family,
+        msg_type,
+        plaintext_len + crate::crypto::session_cipher::AEAD_OVERHEAD,
+    )
+}
+
+/// Same, from a ciphertext length — the receiving side, where `body_len` IS
+/// the length that arrived.
+fn chaos_aad_ciphertext(
+    family: u8,
+    msg_type: u16,
+    ciphertext_len: usize,
+) -> [u8; veil_proto::header::HEADER_SIZE] {
+    let mut h = veil_proto::header::FrameHeader::new(family, msg_type);
+    h.body_len = ciphertext_len as u32;
+    frame_aad(&h)
 }

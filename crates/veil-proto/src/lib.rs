@@ -339,7 +339,10 @@ mod tests {
     #[test]
     fn header_roundtrip_all_fields() {
         let hdr = FrameHeader {
-            version: 1,
+            // `encode_header` always writes the CURRENT version, so a struct
+            // claiming another one does not round-trip. Pinned to the constant
+            // rather than a literal so the next bump does not rediscover this.
+            version: VERSION,
             family: FrameFamily::Control as u8,
             msg_type: 3,
             flags: 0xAB_CD,

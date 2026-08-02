@@ -21,6 +21,12 @@ mod golden {
     ///
     /// Layout (24 bytes):
     /// `[magic=4][version=1][family=1][msg_type=2][flags=2][header_len=2][body_len=4][stream_id=4][request_id=4]`
+    ///
+    /// ⚠️ The version byte went 1 → 2 when the AEAD associated data grew from
+    /// three bytes to the whole header (audit V-01). This test did exactly its
+    /// job — it is here to make a wire-breaking change impossible to make by
+    /// accident, and this one was on purpose. The v1 vector is kept below, as
+    /// a REJECTION case: a peer on the old major must be refused by name.
     #[test]
     fn golden_frame_header() {
         use crate::{codec::decode_header, header::MAGIC};
@@ -28,7 +34,7 @@ mod golden {
         // Build the expected golden bytes manually.
         let mut golden = [0u8; 24];
         golden[..4].copy_from_slice(&MAGIC); // magic
-        golden[4] = 1; // version
+        golden[4] = 2; // version
         golden[5] = 2; // family = Discovery
         golden[6..8].copy_from_slice(&5u16.to_be_bytes()); // msg_type = AnnounceAttachment
         golden[8..10].copy_from_slice(&0u16.to_be_bytes()); // flags = 0
@@ -38,7 +44,7 @@ mod golden {
         golden[20..24].copy_from_slice(&0x0102_0304u32.to_be_bytes()); // request_id
 
         let decoded = decode_header(&golden).expect("golden FrameHeader must decode");
-        assert_eq!(decoded.version, 1);
+        assert_eq!(decoded.version, 2);
         assert_eq!(decoded.family, 2);
         assert_eq!(decoded.msg_type, 5);
         assert_eq!(decoded.stream_id, 0xDEAD_BEEF);
@@ -47,6 +53,17 @@ mod golden {
         // Roundtrip: re-encode and compare bytes.
         let re_encoded = crate::codec::encode_header(&decoded);
         assert_eq!(re_encoded.as_slice(), &golden);
+
+        // The previous major, byte for byte, must now be REFUSED — and refused
+        // by name. A v1 peer computes a 3-byte AAD and cannot open our frames;
+        // telling it so at the header beats letting every AEAD open fail with
+        // something that reads like corruption or an attack.
+        let mut v1 = golden;
+        v1[4] = 1;
+        match decode_header(&v1) {
+            Err(crate::ProtoError::UnsupportedVersion(v)) => assert_eq!(v, 1),
+            other => panic!("a v1 header must be rejected by version, got {other:?}"),
+        }
     }
 
     /// Golden `AttachPayload` (session.rs) — 9 fixed bytes.
