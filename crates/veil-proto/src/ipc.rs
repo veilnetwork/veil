@@ -2460,6 +2460,30 @@ impl MailboxPutChunkPayload {
         let chunk_index = super::read_u16_be(buf, 32)?;
         let chunk_total = super::read_u16_be(buf, 34)?;
         let chunk_data = buf[Self::HEADER_SIZE..].to_vec();
+        // The 240-byte cap is the PROTOCOL, not just what our own depositor
+        // happens to emit — every reasoning about relay memory downstream
+        // assumes it. `MAX_MAILBOX_PUT_CHUNKS` bounds the chunk COUNT; without
+        // this it bounded nothing in bytes, because a chunk could carry as much
+        // as the frame allows (16 MiB). 128 concurrent reassemblies x 256
+        // chunks then sizes to gigabytes on a relay that never agreed to hold
+        // them, from deposits that need no authentication to send.
+        if chunk_data.len() > MAILBOX_PUT_CHUNK_DATA_BYTES {
+            return Err(ProtoError::Malformed(format!(
+                "MailboxPutChunk: chunk_data {} B exceeds the {} B per-chunk cap",
+                chunk_data.len(),
+                MAILBOX_PUT_CHUNK_DATA_BYTES
+            )));
+        }
+        if chunk_total == 0 || chunk_total > MAX_MAILBOX_PUT_CHUNKS {
+            return Err(ProtoError::Malformed(format!(
+                "MailboxPutChunk: chunk_total {chunk_total} outside 1..={MAX_MAILBOX_PUT_CHUNKS}"
+            )));
+        }
+        if chunk_index >= chunk_total {
+            return Err(ProtoError::Malformed(format!(
+                "MailboxPutChunk: chunk_index {chunk_index} outside 0..{chunk_total}"
+            )));
+        }
         Ok(Self {
             content_id,
             chunk_index,
