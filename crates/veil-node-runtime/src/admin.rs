@@ -1173,9 +1173,19 @@ where
     // into an attacker-owned, world-readable dir. `tempfile` instead fails if
     // the path exists and sets 0700 in the mkdir itself (no umask window, no
     // ignored error).
-    let tmp_dir = tempfile::Builder::new()
-        .prefix("veil-deferred-")
-        .tempdir()?;
+    //
+    // The parent directory comes from `process_env` rather than `TMPDIR`. The
+    // embedded FFI entry used to `set_var("TMPDIR", ..)` so this call would
+    // land somewhere an Android app can actually write — a process-wide
+    // environment write, performed in a host that already has threads running,
+    // which is undefined behaviour (audit V-06). One directory did not need
+    // the whole process's idea of "temp" rewritten.
+    let mut builder = tempfile::Builder::new();
+    builder.prefix("veil-deferred-");
+    let tmp_dir = match crate::process_env::deferred_work_dir() {
+        Some(parent) => builder.tempdir_in(parent)?,
+        None => builder.tempdir()?,
+    };
 
     let config_path = tmp_dir.path().join("node.toml");
     veil_cfg::save_config(&config_path, &stub_config).map_err(crate::error::NodeError::Config)?;
