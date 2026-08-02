@@ -24,6 +24,23 @@ pub const ADMIN_PROTOCOL_VERSION: u32 = 1;
 /// `truncated` flag when the store exceeds this.
 pub const MAX_ADMIN_DHT_LIST: usize = 10_000;
 
+/// Slots inside `global.admin_max_connections` an ordinary command may not
+/// take, so `apply-config` always has somewhere to land (audit V-06).
+///
+/// The cap protects the node from a bug or mis-tooling spawning hundreds of
+/// admin clients. But when it is reached, the command an operator most needs is
+/// exactly the one that fixes the situation — pushing a corrected config — and
+/// with a single undifferentiated pool that command queued behind whatever
+/// filled it.
+///
+/// The type of a request is not known when the connection is accepted, so the
+/// reservation cannot be enforced at accept time. It is enforced where the
+/// answer is known: an ordinary command takes a slot only while more than this
+/// many remain, and a connection that could not get one is allowed to read its
+/// FIRST request; if that request is `ApplyConfig` it may use the reserve, and
+/// anything else is refused there.
+pub const ADMIN_SLOTS_RESERVED_FOR_APPLY: usize = 2;
+
 /// Concurrent admin connections that have not yet proved they hold the token
 /// (audit V-06).
 ///
@@ -1329,23 +1346,37 @@ where
                         };
                         // Authenticated. Now charge the real pool, and hand the
                         // pre-auth slot back to the next arrival.
-                        let permit = match main_semaphore.try_acquire_owned() {
-                            Ok(p) => p,
-                            Err(_) => {
-                                logger.lock().await.log_info(
-                                    "admin.accept_refused",
-                                    format!(
-                                        "cap={admin_max_connections} concurrent admin \
-                                         connections reached — refusing"
-                                    ),
-                                );
-                                return;
-                            }
+                        //
+                        // An ordinary command may only take a slot while more
+                        // than `ADMIN_SLOTS_RESERVED_FOR_APPLY` remain. Below
+                        // that we do NOT refuse yet: the connection is let
+                        // through without a permit, and
+                        // `handle_admin_connection` decides once it has read
+                        // the request — `apply-config` gets the reserve,
+                        // everything else is turned away there. Refusing here
+                        // is what starved the one command that fixes a node.
+                        let permit = if main_semaphore.available_permits()
+                            > ADMIN_SLOTS_RESERVED_FOR_APPLY
+                        {
+                            main_semaphore.clone().try_acquire_owned().ok()
+                        } else {
+                            None
                         };
                         drop(preauth_permit);
                         // Permit drops on task exit and releases the slot.
-                        let _permit = permit;
-                        let _ = handle_admin_connection(stream, runtime, shutdown_tx, anchor, config_path).await;
+                        let _ = handle_admin_connection(
+                            stream,
+                            runtime,
+                            shutdown_tx,
+                            anchor,
+                            config_path,
+                            AdminSlot {
+                                permit,
+                                semaphore: main_semaphore,
+                                max_connections: admin_max_connections,
+                            },
+                        )
+                        .await;
                     });
                 }
             }
@@ -1954,13 +1985,42 @@ where
     Ok(String::from_utf8(raw).ok())
 }
 
+/// True when `command` is the one the reserve exists for.
+///
+/// Deliberately just `ApplyConfig`. Every other command either does not fix a
+/// wedged node or has a cheaper path (`stop`, `restart`), and widening this is
+/// how a reserve stops being one.
+fn may_use_reserved_slot(command: &AdminCommand) -> bool {
+    matches!(command, AdminCommand::ApplyConfig { .. })
+}
+
+/// The connection's claim on the admin pool (audit V-06).
+///
+/// Carried as one value because the three parts only mean anything together:
+/// whether this connection already holds a slot, where to get one if it does
+/// not, and what to tell the caller when it cannot.
+struct AdminSlot {
+    /// `None` when the pool was down to its reserve. The connection is still
+    /// read, and keeps going only if its request turns out to be the one the
+    /// reserve is for.
+    permit: Option<tokio::sync::OwnedSemaphorePermit>,
+    semaphore: Arc<tokio::sync::Semaphore>,
+    max_connections: usize,
+}
+
 async fn handle_admin_connection(
     stream: AdminStream,
     runtime: Arc<Mutex<NodeRuntime>>,
     shutdown_tx: watch::Sender<bool>,
     admin_socket: PathBuf,
     config_path: PathBuf,
+    slot: AdminSlot,
 ) -> Result<()> {
+    let AdminSlot {
+        permit: _permit,
+        semaphore: connection_semaphore,
+        max_connections: admin_max_connections,
+    } = slot;
     let mut reader = BufReader::new(stream);
 
     // Peek at the first byte to detect binary IPC clients that accidentally
@@ -1992,6 +2052,42 @@ async fn handle_admin_connection(
     };
 
     let request: AdminRequest = serde_json::from_str(line.trim_end())?;
+
+    // V-06: this connection arrived while the pool was down to its reserve. Now
+    // that the request is parsed, the reserve can be spent on what it is for.
+    let _reserved_permit = if _permit.is_none() {
+        if !may_use_reserved_slot(&request.command) {
+            let response = AdminResponse::err(format!(
+                "cap={admin_max_connections} concurrent admin connections reached; the \
+                 last {ADMIN_SLOTS_RESERVED_FOR_APPLY} slots are held for apply-config \
+                 so a wedged node can always be given a corrected config. Retry, or \
+                 close an idle admin client."
+            ));
+            let mut out = serde_json::to_vec(&response)?;
+            out.push(b'\n');
+            reader.get_mut().write_all(&out).await?;
+            return Ok(());
+        }
+        match connection_semaphore.try_acquire_owned() {
+            Ok(p) => Some(p),
+            Err(_) => {
+                // Even the reserve is gone: several applies are already in
+                // flight. Say that, rather than the generic cap message.
+                let response = AdminResponse::err(
+                    "every reserved apply-config slot is in use; another apply is \
+                     already running"
+                        .to_owned(),
+                );
+                let mut out = serde_json::to_vec(&response)?;
+                out.push(b'\n');
+                reader.get_mut().write_all(&out).await?;
+                return Ok(());
+            }
+        }
+    } else {
+        None
+    };
+
     let outcome = if request.version != ADMIN_PROTOCOL_VERSION {
         AdminConnectionOutcome::Response(AdminResponse::err(format!(
             "unsupported admin protocol version `{}`",
@@ -4823,5 +4919,78 @@ mod tests {
             event.args
         );
         assert!(event.args.contains("value_len="));
+    }
+}
+
+#[cfg(test)]
+mod reserved_apply_slot_tests {
+    use super::*;
+
+    /// Audit V-06. The connection cap protects the node from a bug or
+    /// mis-tooling spawning hundreds of admin clients — but when it is reached,
+    /// the command an operator most needs is the one that FIXES the situation,
+    /// and with a single undifferentiated pool it queued behind whatever filled
+    /// it.
+    #[test]
+    fn only_apply_config_may_take_the_reserve() {
+        assert!(may_use_reserved_slot(&AdminCommand::ApplyConfig {
+            toml_content: String::new(),
+            persist: false,
+        }));
+        // Everything else, including the commands that look adjacent. A reserve
+        // that anything may spend is not a reserve.
+        for cmd in [
+            AdminCommand::Reload,
+            AdminCommand::Restart,
+            AdminCommand::Stop,
+            AdminCommand::Run,
+            AdminCommand::Show,
+        ] {
+            assert!(
+                !may_use_reserved_slot(&cmd),
+                "{cmd:?} must not be able to spend the apply reserve"
+            );
+        }
+    }
+
+    /// The accept-loop rule, isolated: an ordinary connection may take a slot
+    /// only while more than the reserve remains.
+    #[test]
+    fn ordinary_connections_stop_short_of_the_reserve() {
+        let total = 8usize;
+        let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(total));
+        let mut held = Vec::new();
+        // Ordinary clients take slots until the reserve is all that is left.
+        while sem.available_permits() > ADMIN_SLOTS_RESERVED_FOR_APPLY {
+            held.push(
+                sem.clone()
+                    .try_acquire_owned()
+                    .expect("a slot above the reserve must be available"),
+            );
+        }
+        assert_eq!(held.len(), total - ADMIN_SLOTS_RESERVED_FOR_APPLY);
+        assert_eq!(sem.available_permits(), ADMIN_SLOTS_RESERVED_FOR_APPLY);
+
+        // An apply-config connection can still get one — this is the whole
+        // point, and the state in which the old code answered "cap reached".
+        let apply = sem
+            .clone()
+            .try_acquire_owned()
+            .expect("apply-config must still find a slot");
+        drop(apply);
+        drop(held);
+        assert_eq!(sem.available_permits(), total);
+    }
+
+    /// The reserve must be smaller than any cap an operator can set, or a low
+    /// `admin_max_connections` would leave ordinary commands unable to run at
+    /// all.
+    #[test]
+    fn the_reserve_leaves_room_for_ordinary_commands() {
+        let smallest_sane_cap = 4usize;
+        assert!(
+            ADMIN_SLOTS_RESERVED_FOR_APPLY < smallest_sane_cap,
+            "the reserve must not swallow a small operator cap"
+        );
     }
 }
