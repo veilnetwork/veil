@@ -30,6 +30,39 @@ pub fn encode_header(header: &FrameHeader) -> [u8; HEADER_SIZE] {
     buf
 }
 
+/// The AEAD associated data for one OVL1 frame: its ENTIRE final wire header.
+///
+/// The AAD used to be three bytes — `family` and `msg_type` — which left
+/// `flags`, `header_len`, `body_len`, `stream_id` and `request_id` outside the
+/// Poly1305 tag. On `tcp://`, `ws://` and `socks://`, which are registered
+/// transports and carry no outer authentication of their own, an on-path
+/// attacker could take an authentic frame and rewrite those fields
+/// (audit V-01):
+///
+/// * move a valid `AppData`/`AppClose` onto a DIFFERENT stream;
+/// * change `request_id` so a DHT response is delivered to the wrong waiter;
+/// * change `body_len` so the peer waits for bytes that never come, allocates
+///   for them, or tears the session down.
+///
+/// The ciphertext was authentic in every case. Only its placement was forged,
+/// and placement is where the meaning lives.
+///
+/// Binding the whole header fixes that, and it costs nothing on the wire: the
+/// AAD is not transmitted, it is the header the receiver already has. The
+/// header passed here MUST be the final one — on the send path that means
+/// AFTER `body_len` has been set to the ciphertext length, or the receiver
+/// computes different bytes and every frame fails to open.
+///
+/// ⚠️ Wire-breaking. A peer computing the old 3-byte AAD cannot open these
+/// frames and vice versa, which is why [`crate::header::VERSION`] went to 2 in
+/// the same change: a mismatched peer is refused at `decode_header` with
+/// `UnsupportedVersion`, which says what is wrong, instead of failing every
+/// AEAD open with a decrypt error that looks like corruption or an attack.
+#[inline]
+pub fn frame_aad(header: &FrameHeader) -> [u8; HEADER_SIZE] {
+    encode_header(header)
+}
+
 /// encode a full frame (header + body) into a single `Vec<u8>`
 /// with exactly one allocation.
 ///
@@ -127,4 +160,105 @@ fn decode_header_inner(buf: &[u8], max_body: u32) -> Result<FrameHeader, ProtoEr
         stream_id,
         request_id,
     })
+}
+
+#[cfg(test)]
+mod v01_tests {
+    use super::*;
+    use crate::header::HEADER_SIZE;
+
+    fn hdr() -> FrameHeader {
+        let mut h = FrameHeader::new(3, 3); // App family, AppData
+        h.body_len = 100;
+        h.stream_id = 7;
+        h.request_id = 42;
+        h.flags = 1;
+        h
+    }
+
+    /// Every byte of the header is inside the tag.
+    ///
+    /// The AAD used to be `[family, msg_type_hi, msg_type_lo]`, which left
+    /// `flags`, `header_len`, `body_len`, `stream_id` and `request_id` outside
+    /// it. On a transport with no outer authentication — `tcp://`, `ws://`,
+    /// `socks://`, all registered — an on-path attacker could take an
+    /// AUTHENTIC frame and change any of them: move an `AppData` to another
+    /// stream, redirect a DHT response by rewriting `request_id`, or change
+    /// `body_len` so the peer waits for bytes that never arrive (audit V-01).
+    ///
+    /// The ciphertext stayed valid in every one of those. Only its placement
+    /// was forged, and placement is where the meaning is.
+    #[test]
+    fn every_header_field_changes_the_aad() {
+        let base = frame_aad(&hdr());
+        assert_eq!(base.len(), HEADER_SIZE, "the AAD is the whole header");
+
+        let mut moved_stream = hdr();
+        moved_stream.stream_id = 8;
+        assert_ne!(
+            frame_aad(&moved_stream),
+            base,
+            "a frame moved to another stream must not authenticate"
+        );
+
+        let mut other_waiter = hdr();
+        other_waiter.request_id = 43;
+        assert_ne!(
+            frame_aad(&other_waiter),
+            base,
+            "a response redirected to another waiter must not authenticate"
+        );
+
+        let mut lied_length = hdr();
+        lied_length.body_len = 101;
+        assert_ne!(
+            frame_aad(&lied_length),
+            base,
+            "a rewritten body_len must not authenticate"
+        );
+
+        let mut reprioritised = hdr();
+        reprioritised.flags = 2;
+        assert_ne!(frame_aad(&reprioritised), base, "flags are covered");
+
+        let mut wider_header = hdr();
+        wider_header.header_len = 32;
+        assert_ne!(frame_aad(&wider_header), base, "header_len is covered");
+
+        // ...and the two fields the old AAD did cover are still covered.
+        let mut other_family = hdr();
+        other_family.family = 4;
+        assert_ne!(frame_aad(&other_family), base);
+        let mut other_type = hdr();
+        other_type.msg_type = 4;
+        assert_ne!(frame_aad(&other_type), base);
+    }
+
+    /// The receiver rebuilds the AAD from a DECODED header, the sender builds
+    /// it from the one it is about to encode. Those must be the same bytes, or
+    /// nothing opens.
+    #[test]
+    fn the_aad_survives_an_encode_decode_round_trip() {
+        let sent = hdr();
+        let wire = encode_header(&sent);
+        let received = decode_header(&wire).expect("decode our own header");
+        assert_eq!(
+            frame_aad(&received),
+            frame_aad(&sent),
+            "sender and receiver must compute identical AAD"
+        );
+        assert_eq!(frame_aad(&sent), wire, "the AAD IS the wire header");
+    }
+
+    /// A peer on the old major is refused by NAME, not by a decrypt failure
+    /// that looks like corruption.
+    #[test]
+    fn a_previous_major_version_is_rejected_at_decode() {
+        let mut wire = encode_header(&hdr());
+        wire[4] = 1; // the version this change replaced
+        match decode_header(&wire) {
+            Err(ProtoError::UnsupportedVersion(v)) => assert_eq!(v, 1),
+            other => panic!("expected UnsupportedVersion, got {other:?}"),
+        }
+    }
 }

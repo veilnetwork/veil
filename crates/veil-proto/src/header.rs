@@ -1,7 +1,16 @@
 /// Four-byte fixed header preamble: ASCII `"OVL1"`.
 pub const MAGIC: [u8; 4] = *b"OVL1";
 /// Wire-protocol major version.
-pub const VERSION: u8 = 1;
+///
+/// Went 1 → 2 when the AEAD associated data grew from three bytes to the whole
+/// 24-byte header (audit V-01, see [`crate::codec::frame_aad`]). The two are
+/// not interoperable, and the version byte is what says so: a peer on the
+/// other side is refused at `decode_header` with `UnsupportedVersion`, which
+/// names the problem, rather than failing every AEAD open with a decrypt error
+/// indistinguishable from corruption or an attack.
+///
+/// ⚠️ FLAG DAY. Roll every node — clients, relays and seeds — together.
+pub const VERSION: u8 = 2;
 /// Size of the fixed portion of the frame header, in bytes.
 pub const HEADER_SIZE: usize = 24;
 

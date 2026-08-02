@@ -1235,7 +1235,22 @@ pub fn save_test_config(prefix: &str, config: Config) -> veil_cfg::Result<PathBu
     use std::sync::atomic::{AtomicU64, Ordering};
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let path = std::env::temp_dir().join(format!("{prefix}-{unique}.toml"));
+    // Its OWN directory, not a unique filename in the shared one.
+    //
+    // The node treats the config's PARENT as its veil dir and writes
+    // `identity_document.bin` and `device_identity_sk.bin` next to it. With
+    // every test sharing `temp_dir()`, one test's identity files were read by
+    // the next — and a document from one run paired with a secret key from
+    // another does not load. That used to be swallowed with a warning, so the
+    // tests passed while quietly running as legacy; now it is refused
+    // (audit V-07), which is what made the leak visible.
+    //
+    // Per-test directories are the actual fix: the isolation was missing all
+    // along, the old behaviour just hid it.
+    let dir = std::env::temp_dir().join(format!("{prefix}-{unique}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).map_err(veil_cfg::ConfigError::Io)?;
+    let path = dir.join(format!("{prefix}.toml"));
     veil_cfg::save_config(&path, &config)?;
     Ok(path)
 }

@@ -260,17 +260,18 @@ impl SessionCipher {
     }
 }
 
-// ── frame_aad helper ─────────────────────────────────────────────────────────
-
-/// Build the 3-byte AAD value `[family, msg_type_hi, msg_type_lo]` to be passed
-/// [`SessionCipher::seal`] / [`SessionCipher::open`].
-///
-/// Binding the frame family and message type into the Poly1305 tag prevents a
-/// relay from transplanting a valid ciphertext from one frame slot to another.
-#[inline]
-pub fn frame_aad(family: u8, msg_type: u16) -> [u8; 3] {
-    [family, (msg_type >> 8) as u8, msg_type as u8]
-}
+// ── frame_aad ────────────────────────────────────────────────────────────────
+//
+// REMOVED. It built a 3-byte AAD from `family` and `msg_type` only, leaving
+// `flags`, `header_len`, `body_len`, `stream_id` and `request_id` outside the
+// Poly1305 tag — so an authentic frame could be moved to another stream, have
+// its `request_id` rewritten, or have its `body_len` changed, on any transport
+// without outer authentication (audit V-01).
+//
+// The replacement lives in `veil_proto::codec::frame_aad`, where the header
+// type is, and binds all 24 bytes. Deleted rather than deprecated on purpose:
+// a caller still building the short AAD would compile and then fail every open
+// at runtime, which is a far worse way to find out.
 
 // ── tests ─────────────────────────────────────────────────────────────────────
 
@@ -390,22 +391,22 @@ mod tests {
         let mut enc = SessionCipher::new(&key, true);
         let mut dec = SessionCipher::new(&key, true);
 
-        let aad_app_data: [u8; 3] = frame_aad(3, 3); // APP family, APP_DATA
-        let aad_route_ann: [u8; 3] = frame_aad(4, 1); // ROUTING family, ROUTE_ANNOUNCE
+        // Two headers differing in ONE field. This crate does not know the
+        // header type — `veil_proto::codec::frame_aad` builds these — so the
+        // bytes are written out literally, which is also the point: the AAD is
+        // the wire header, so any byte of it changing must break the open.
+        //
+        // `OVL1 | v2 | family | msg_type | flags | header_len | body_len |
+        //  stream_id | request_id`
+        let mut aad_stream_7 = *b"OVL1\x02\x03\x00\x03\x00\x00\x00\x18\x00\x00\x00\x07\x00\x00\x00\x07\x00\x00\x00\x00";
+        let ct = enc.seal(b"payload", &aad_stream_7).unwrap();
 
-        let ct = enc.seal(b"payload", &aad_app_data).unwrap();
-        // Decrypting with a different frame type must fail.
+        // Same frame, moved to another stream — the transplant V-01 is about.
+        aad_stream_7[19] = 0x08;
         assert!(
-            dec.open(&ct, &aad_route_ann).is_err(),
-            "wrong frame-type AAD must fail authentication",
+            dec.open(&ct, &aad_stream_7).is_err(),
+            "a frame moved to another stream must fail authentication",
         );
-    }
-
-    #[test]
-    fn frame_aad_helper_encodes_correctly() {
-        assert_eq!(frame_aad(3, 0x0102), [3, 1, 2]);
-        assert_eq!(frame_aad(0xFF, 0xFFFF), [0xFF, 0xFF, 0xFF]);
-        assert_eq!(frame_aad(0, 0), [0, 0, 0]);
     }
 
     // ── nonce-counter accessor ────────────────────────────────

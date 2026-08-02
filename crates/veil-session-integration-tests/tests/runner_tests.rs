@@ -357,7 +357,7 @@ async fn runner_ping_pong() {
 #[tokio::test]
 async fn runner_aead_encrypt_decrypt_round_trip() {
     use tokio::io::AsyncReadExt;
-    use veil_crypto::session_cipher::{SessionCipher, frame_aad};
+    use veil_crypto::session_cipher::SessionCipher;
     use veil_proto::{
         codec::decode_header, family::RoutingMsg, header::HEADER_SIZE, routing::RouteRequestPayload,
     };
@@ -432,7 +432,7 @@ async fn runner_aead_encrypt_decrypt_round_trip() {
 
     // ── Step 1: send an encrypted Ping (tests rx_cipher) ──────────────
     // Ping body is empty; encrypt an empty slice so the cipher's counter advances.
-    let ping_aad = frame_aad(FrameFamily::Control as u8, ControlMsg::Ping as u16);
+    let ping_aad = aad_for_plaintext(FrameFamily::Control as u8, ControlMsg::Ping as u16, 0);
     let enc_ping_body = client_tx.seal(&[], &ping_aad).expect("seal empty body");
     {
         let mut hdr = FrameHeader::new(FrameFamily::Control as u8, ControlMsg::Ping as u16);
@@ -450,7 +450,7 @@ async fn runner_aead_encrypt_decrypt_round_trip() {
         let pong_hdr = decode_header(&hdr_buf).unwrap();
         let mut pong_body = vec![0u8; pong_hdr.body_len as usize];
         client.read_exact(&mut pong_body).await.unwrap();
-        let pong_aad = frame_aad(pong_hdr.family, pong_hdr.msg_type);
+        let pong_aad = veil_proto::codec::frame_aad(&pong_hdr);
         let pong_plain = client_rx
             .open(&pong_body, &pong_aad)
             .expect("sealed empty Pong must open");
@@ -467,7 +467,7 @@ async fn runner_aead_encrypt_decrypt_round_trip() {
         signature: [0u8; 64],
     };
     let req_bytes = req.encode();
-    let rr_aad = frame_aad(FrameFamily::Routing as u8, RoutingMsg::RouteRequest as u16);
+    let rr_aad = aad_for_plaintext(FrameFamily::Routing as u8, RoutingMsg::RouteRequest as u16, req_bytes.len());
     let enc_req = client_tx.seal(&req_bytes, &rr_aad).expect("seal req body");
     {
         let mut hdr = FrameHeader::new(FrameFamily::Routing as u8, RoutingMsg::RouteRequest as u16);
@@ -485,7 +485,7 @@ async fn runner_aead_encrypt_decrypt_round_trip() {
     client.read_exact(&mut enc_body).await.unwrap();
 
     // Decrypt using client_rx — must succeed (proves server used tx_cipher).
-    let resp_aad = frame_aad(resp_hdr.family, resp_hdr.msg_type);
+    let resp_aad = veil_proto::codec::frame_aad(&resp_hdr);
     let plain = client_rx
         .open(&enc_body, &resp_aad)
         .expect("response body must decrypt");
@@ -513,7 +513,7 @@ async fn runner_aead_encrypt_decrypt_round_trip() {
 #[tokio::test]
 async fn runner_rekey_grace_recovers_inflight_old_encrypted_frames() {
     use tokio::io::AsyncReadExt;
-    use veil_crypto::session_cipher::{SessionCipher, frame_aad};
+    use veil_crypto::session_cipher::SessionCipher;
     use veil_crypto::{kex, session_kdf};
     use veil_proto::codec::decode_header;
     use veil_proto::header::HEADER_SIZE;
@@ -604,7 +604,7 @@ async fn runner_rekey_grace_recovers_inflight_old_encrypted_frames() {
         ephemeral_pubkey: client_pubkey,
     }
     .encode();
-    let init_aad = frame_aad(FrameFamily::Session as u8, SessionMsg::RekeyInit as u16);
+    let init_aad = aad_for_plaintext(FrameFamily::Session as u8, SessionMsg::RekeyInit as u16, init_body.len());
     let enc_init = client_tx
         .seal(&init_body, &init_aad)
         .expect("seal RekeyInit");
@@ -631,7 +631,7 @@ async fn runner_rekey_grace_recovers_inflight_old_encrypted_frames() {
         .read_exact(&mut enc_ack_body)
         .await
         .expect("read Ack body");
-    let ack_aad = frame_aad(FrameFamily::Session as u8, SessionMsg::RekeyAck as u16);
+    let ack_aad = veil_proto::codec::frame_aad(&ack_hdr);
     let plain_ack = client_rx
         .open(&enc_ack_body, &ack_aad)
         .expect("decrypt Ack with OLD rx");
@@ -657,7 +657,7 @@ async fn runner_rekey_grace_recovers_inflight_old_encrypted_frames() {
     // → record_violation → close session.
     // Post-fix: server tries NEW rx → fail → falls back to rx_cipher_prev (OLD)
     // → succeeds → enqueues Pong → drains Pong with NEW tx.
-    let ping_aad = frame_aad(FrameFamily::Control as u8, ControlMsg::Ping as u16);
+    let ping_aad = aad_for_plaintext(FrameFamily::Control as u8, ControlMsg::Ping as u16, 0);
     let enc_stale_ping = client_tx.seal(&[], &ping_aad).expect("seal stale Ping");
     {
         let mut hdr = FrameHeader::new(FrameFamily::Control as u8, ControlMsg::Ping as u16);
@@ -692,7 +692,7 @@ async fn runner_rekey_grace_recovers_inflight_old_encrypted_frames() {
     if pong_hdr.body_len > 0 {
         let mut enc_pong_body = vec![0u8; pong_hdr.body_len as usize];
         client.read_exact(&mut enc_pong_body).await.unwrap();
-        let pong_aad = frame_aad(FrameFamily::Control as u8, ControlMsg::Pong as u16);
+        let pong_aad = veil_proto::codec::frame_aad(&pong_hdr);
         client_rx_new
             .open(&enc_pong_body, &pong_aad)
             .expect("decrypt Pong with NEW rx — server's tx must have switched");
@@ -725,7 +725,7 @@ async fn runner_rekey_grace_recovers_inflight_old_encrypted_frames() {
     if pong2_hdr.body_len > 0 {
         let mut enc_pong2_body = vec![0u8; pong2_hdr.body_len as usize];
         client.read_exact(&mut enc_pong2_body).await.unwrap();
-        let pong_aad = frame_aad(FrameFamily::Control as u8, ControlMsg::Pong as u16);
+        let pong_aad = veil_proto::codec::frame_aad(&pong2_hdr);
         client_rx_new
             .open(&enc_pong2_body, &pong_aad)
             .expect("post-rekey Pong must decrypt with NEW rx");
@@ -754,7 +754,7 @@ async fn runner_rekey_grace_recovers_inflight_old_encrypted_frames() {
 #[tokio::test]
 async fn runner_rekey_emits_observability_counters() {
     use tokio::io::AsyncReadExt;
-    use veil_crypto::session_cipher::{SessionCipher, frame_aad};
+    use veil_crypto::session_cipher::SessionCipher;
     use veil_crypto::{kex, session_kdf};
     use veil_observability::NodeMetrics;
     use veil_proto::codec::decode_header;
@@ -841,7 +841,7 @@ async fn runner_rekey_emits_observability_counters() {
         ephemeral_pubkey: client_pubkey,
     }
     .encode();
-    let init_aad = frame_aad(FrameFamily::Session as u8, SessionMsg::RekeyInit as u16);
+    let init_aad = aad_for_plaintext(FrameFamily::Session as u8, SessionMsg::RekeyInit as u16, init_body.len());
     let enc_init = client_tx
         .seal(&init_body, &init_aad)
         .expect("seal RekeyInit");
@@ -864,7 +864,7 @@ async fn runner_rekey_emits_observability_counters() {
         .read_exact(&mut enc_ack_body)
         .await
         .expect("read Ack body");
-    let ack_aad = frame_aad(FrameFamily::Session as u8, SessionMsg::RekeyAck as u16);
+    let ack_aad = veil_proto::codec::frame_aad(&ack_hdr);
     let plain_ack = client_rx
         .open(&enc_ack_body, &ack_aad)
         .expect("decrypt Ack");
@@ -883,7 +883,7 @@ async fn runner_rekey_emits_observability_counters() {
     // the rx_cipher_prev fallback path on the server (decrypt_fallback
     // counter must inc; decrypt_failures counter must NOT).
     use veil_proto::family::ControlMsg;
-    let ping_aad = frame_aad(FrameFamily::Control as u8, ControlMsg::Ping as u16);
+    let ping_aad = aad_for_plaintext(FrameFamily::Control as u8, ControlMsg::Ping as u16, 0);
     let enc_stale_ping = client_tx.seal(&[], &ping_aad).expect("seal stale Ping");
     {
         let mut hdr = FrameHeader::new(FrameFamily::Control as u8, ControlMsg::Ping as u16);
@@ -966,7 +966,7 @@ async fn runner_rekey_emits_observability_counters() {
 #[tokio::test]
 async fn runner_rekey_storm_triggers_cap_eviction_once_after_four_rekeys() {
     use tokio::io::AsyncReadExt;
-    use veil_crypto::session_cipher::{SessionCipher, frame_aad};
+    use veil_crypto::session_cipher::SessionCipher;
     use veil_crypto::{kex, session_kdf};
     use veil_observability::NodeMetrics;
     use veil_proto::codec::decode_header;
@@ -1059,7 +1059,7 @@ async fn runner_rekey_storm_triggers_cap_eviction_once_after_four_rekeys() {
             ephemeral_pubkey: client_pubkey,
         }
         .encode();
-        let init_aad = frame_aad(FrameFamily::Session as u8, SessionMsg::RekeyInit as u16);
+        let init_aad = aad_for_plaintext(FrameFamily::Session as u8, SessionMsg::RekeyInit as u16, init_body.len());
         let enc_init = client_tx
             .seal(&init_body, &init_aad)
             .unwrap_or_else(|_| panic!("seal RekeyInit round={round}"));
@@ -1090,7 +1090,7 @@ async fn runner_rekey_storm_triggers_cap_eviction_once_after_four_rekeys() {
             .read_exact(&mut enc_ack_body)
             .await
             .unwrap_or_else(|_| panic!("read Ack body round={round}"));
-        let ack_aad = frame_aad(FrameFamily::Session as u8, SessionMsg::RekeyAck as u16);
+        let ack_aad = veil_proto::codec::frame_aad(&ack_hdr);
         let plain_ack = client_rx
             .open(&enc_ack_body, &ack_aad)
             .unwrap_or_else(|_| panic!("decrypt Ack round={round}"));
@@ -1172,7 +1172,6 @@ async fn read_non_padding_header<R: tokio::io::AsyncRead + Unpin>(
     what: &str,
 ) -> veil_proto::header::FrameHeader {
     use tokio::io::AsyncReadExt;
-    use veil_crypto::session_cipher::frame_aad;
     use veil_proto::codec::decode_header;
     use veil_proto::header::HEADER_SIZE;
     loop {
@@ -1187,7 +1186,7 @@ async fn read_non_padding_header<R: tokio::io::AsyncRead + Unpin>(
             let mut pad = vec![0u8; hdr.body_len as usize];
             client.read_exact(&mut pad).await.unwrap();
             // Advance rx counter to mirror server's tx_cipher counter.
-            let aad = frame_aad(FrameFamily::Session as u8, SessionMsg::Padding as u16);
+            let aad = veil_proto::codec::frame_aad(&hdr);
             let _ = client_rx
                 .open(&pad, &aad)
                 .unwrap_or_else(|e| panic!("{what}: open Padding {e:?}"));
@@ -1217,7 +1216,6 @@ async fn drain_trailing_padding<R: tokio::io::AsyncRead + Unpin>(
     what: &str,
 ) {
     use tokio::io::AsyncReadExt;
-    use veil_crypto::session_cipher::frame_aad;
     use veil_proto::codec::decode_header;
     use veil_proto::header::HEADER_SIZE;
     let mut hdr_buf = [0u8; HEADER_SIZE];
@@ -1240,7 +1238,7 @@ async fn drain_trailing_padding<R: tokio::io::AsyncRead + Unpin>(
     );
     let mut pad = vec![0u8; hdr.body_len as usize];
     client.read_exact(&mut pad).await.unwrap();
-    let aad = frame_aad(FrameFamily::Session as u8, SessionMsg::Padding as u16);
+    let aad = veil_proto::codec::frame_aad(&hdr);
     let _ = client_rx
         .open(&pad, &aad)
         .unwrap_or_else(|e| panic!("{what}: open trailing Padding {e:?}"));
@@ -1280,7 +1278,7 @@ async fn drain_trailing_padding<R: tokio::io::AsyncRead + Unpin>(
 #[tokio::test]
 async fn phase650b_mutual_rekey_collision_kept_init_when_local_node_id_lower() {
     use tokio::io::AsyncReadExt;
-    use veil_crypto::session_cipher::{SessionCipher, frame_aad};
+    use veil_crypto::session_cipher::SessionCipher;
     use veil_crypto::{kex, session_kdf};
     use veil_observability::NodeMetrics;
     use veil_proto::session::RekeyPayload;
@@ -1374,7 +1372,7 @@ async fn phase650b_mutual_rekey_collision_kept_init_when_local_node_id_lower() {
     // ── Step 1: Client sends Ping → server processes (rx_bytes++)
     // sends Pong (tx_bytes++). Both byte counters cross 1 → next loop
     // iteration server initiates rekey.
-    let ping_aad = frame_aad(FrameFamily::Control as u8, ControlMsg::Ping as u16);
+    let ping_aad = aad_for_plaintext(FrameFamily::Control as u8, ControlMsg::Ping as u16, 0);
     let enc_ping = client_tx.seal(&[], &ping_aad).expect("seal Ping");
     let mut ping_hdr = FrameHeader::new(FrameFamily::Control as u8, ControlMsg::Ping as u16);
     ping_hdr.body_len = enc_ping.len() as u32;
@@ -1393,7 +1391,7 @@ async fn phase650b_mutual_rekey_collision_kept_init_when_local_node_id_lower() {
     if pong_hdr.body_len > 0 {
         let mut enc_pong_body = vec![0u8; pong_hdr.body_len as usize];
         client.read_exact(&mut enc_pong_body).await.unwrap();
-        let pong_aad = frame_aad(FrameFamily::Control as u8, ControlMsg::Pong as u16);
+        let pong_aad = veil_proto::codec::frame_aad(&pong_hdr);
         client_rx
             .open(&enc_pong_body, &pong_aad)
             .expect("decrypt Pong with current rx");
@@ -1415,7 +1413,7 @@ async fn phase650b_mutual_rekey_collision_kept_init_when_local_node_id_lower() {
     );
     let mut enc_init_body = vec![0u8; init_hdr.body_len as usize];
     client.read_exact(&mut enc_init_body).await.unwrap();
-    let init_aad = frame_aad(FrameFamily::Session as u8, SessionMsg::RekeyInit as u16);
+    let init_aad = veil_proto::codec::frame_aad(&init_hdr);
     let plain_init = client_rx
         .open(&enc_init_body, &init_aad)
         .expect("decrypt server RekeyInit with current rx");
@@ -1486,7 +1484,7 @@ async fn phase650b_mutual_rekey_collision_kept_init_when_local_node_id_lower() {
     if kept_hdr.body_len > 0 {
         let mut enc_kept_body = vec![0u8; kept_hdr.body_len as usize];
         client.read_exact(&mut enc_kept_body).await.unwrap();
-        let kept_aad = frame_aad(FrameFamily::Session as u8, SessionMsg::RekeyKeptInit as u16);
+        let kept_aad = veil_proto::codec::frame_aad(&kept_hdr);
         client_rx
             .open(&enc_kept_body, &kept_aad)
             .expect("decrypt RekeyKeptInit with OLD client_rx");
@@ -1506,7 +1504,7 @@ async fn phase650b_mutual_rekey_collision_kept_init_when_local_node_id_lower() {
         ephemeral_pubkey: our_pubkey,
     }
     .encode();
-    let ack_aad = frame_aad(FrameFamily::Session as u8, SessionMsg::RekeyAck as u16);
+    let ack_aad = aad_for_plaintext(FrameFamily::Session as u8, SessionMsg::RekeyAck as u16, ack_body.len());
     let enc_ack = client_tx.seal(&ack_body, &ack_aad).expect("seal RekeyAck");
     let mut ack_hdr = FrameHeader::new(FrameFamily::Session as u8, SessionMsg::RekeyAck as u16);
     ack_hdr.body_len = enc_ack.len() as u32;
@@ -1549,7 +1547,7 @@ async fn phase650b_mutual_rekey_collision_kept_init_when_local_node_id_lower() {
     if new_pong_hdr.body_len > 0 {
         let mut enc_new_pong_body = vec![0u8; new_pong_hdr.body_len as usize];
         client.read_exact(&mut enc_new_pong_body).await.unwrap();
-        let pong_aad = frame_aad(FrameFamily::Control as u8, ControlMsg::Pong as u16);
+        let pong_aad = veil_proto::codec::frame_aad(&new_pong_hdr);
         client_rx_new
             .open(&enc_new_pong_body, &pong_aad)
             .expect("post-collision Pong must decrypt with new client_rx");
@@ -1604,7 +1602,7 @@ async fn phase650b_mutual_rekey_collision_kept_init_when_local_node_id_lower() {
 #[tokio::test]
 async fn phase650b_mutual_rekey_collision_aborted_init_when_local_node_id_higher() {
     use tokio::io::AsyncReadExt;
-    use veil_crypto::session_cipher::{SessionCipher, frame_aad};
+    use veil_crypto::session_cipher::SessionCipher;
     use veil_crypto::{kex, session_kdf};
     use veil_observability::NodeMetrics;
     use veil_proto::session::RekeyPayload;
@@ -1684,7 +1682,7 @@ async fn phase650b_mutual_rekey_collision_aborted_init_when_local_node_id_higher
     let server_task = tokio::spawn(async move { runner.run().await });
 
     // Steps 1-3: drive server to send its own RekeyInit.
-    let ping_aad = frame_aad(FrameFamily::Control as u8, ControlMsg::Ping as u16);
+    let ping_aad = aad_for_plaintext(FrameFamily::Control as u8, ControlMsg::Ping as u16, 0);
     let enc_ping = client_tx.seal(&[], &ping_aad).expect("seal Ping");
     let mut ping_hdr = FrameHeader::new(FrameFamily::Control as u8, ControlMsg::Ping as u16);
     ping_hdr.body_len = enc_ping.len() as u32;
@@ -1702,7 +1700,7 @@ async fn phase650b_mutual_rekey_collision_aborted_init_when_local_node_id_higher
     if pong_hdr.body_len > 0 {
         let mut buf = vec![0u8; pong_hdr.body_len as usize];
         client.read_exact(&mut buf).await.unwrap();
-        let pong_aad = frame_aad(FrameFamily::Control as u8, ControlMsg::Pong as u16);
+        let pong_aad = veil_proto::codec::frame_aad(&pong_hdr);
         client_rx
             .open(&buf, &pong_aad)
             .expect("decrypt Pong with current rx");
@@ -1718,7 +1716,7 @@ async fn phase650b_mutual_rekey_collision_aborted_init_when_local_node_id_higher
     assert_eq!(init_hdr.msg_type, SessionMsg::RekeyInit as u16);
     let mut enc_init_body = vec![0u8; init_hdr.body_len as usize];
     client.read_exact(&mut enc_init_body).await.unwrap();
-    let init_aad = frame_aad(FrameFamily::Session as u8, SessionMsg::RekeyInit as u16);
+    let init_aad = veil_proto::codec::frame_aad(&init_hdr);
     let _ = client_rx
         .open(&enc_init_body, &init_aad)
         .expect("decrypt server RekeyInit");
@@ -1762,7 +1760,7 @@ async fn phase650b_mutual_rekey_collision_aborted_init_when_local_node_id_higher
     );
     let mut enc_ack_body = vec![0u8; ack_hdr.body_len as usize];
     client.read_exact(&mut enc_ack_body).await.unwrap();
-    let ack_aad = frame_aad(FrameFamily::Session as u8, SessionMsg::RekeyAck as u16);
+    let ack_aad = veil_proto::codec::frame_aad(&ack_hdr);
     let plain_ack = client_rx
         .open(&enc_ack_body, &ack_aad)
         .expect("decrypt RekeyAck with current rx");
@@ -1798,7 +1796,7 @@ async fn phase650b_mutual_rekey_collision_aborted_init_when_local_node_id_higher
     if new_pong_hdr.body_len > 0 {
         let mut buf = vec![0u8; new_pong_hdr.body_len as usize];
         client.read_exact(&mut buf).await.unwrap();
-        let pong_aad = frame_aad(FrameFamily::Control as u8, ControlMsg::Pong as u16);
+        let pong_aad = veil_proto::codec::frame_aad(&new_pong_hdr);
         client_rx_new
             .open(&buf, &pong_aad)
             .expect("post-collision Pong must decrypt with new client_rx");
@@ -1871,7 +1869,7 @@ async fn phase650b_mutual_rekey_collision_aborted_init_when_local_node_id_higher
 #[tokio::test]
 async fn phase650b_rekey_state_survives_transport_swap() {
     use tokio::io::AsyncReadExt;
-    use veil_crypto::session_cipher::{SessionCipher, frame_aad};
+    use veil_crypto::session_cipher::SessionCipher;
     use veil_crypto::{kex, session_kdf};
     use veil_observability::NodeMetrics;
     use veil_proto::session::RekeyPayload;
@@ -1953,7 +1951,7 @@ async fn phase650b_rekey_state_survives_transport_swap() {
     let server_task = tokio::spawn(async move { runner.run().await });
 
     // ── Step 1: Ping → drives server to both Pong + own RekeyInit.
-    let ping_aad = frame_aad(FrameFamily::Control as u8, ControlMsg::Ping as u16);
+    let ping_aad = aad_for_plaintext(FrameFamily::Control as u8, ControlMsg::Ping as u16, 0);
     let enc_ping = client_tx.seal(&[], &ping_aad).expect("seal Ping");
     let mut ping_hdr = FrameHeader::new(FrameFamily::Control as u8, ControlMsg::Ping as u16);
     ping_hdr.body_len = enc_ping.len() as u32;
@@ -1975,7 +1973,7 @@ async fn phase650b_rekey_state_survives_transport_swap() {
     if pong_hdr.body_len > 0 {
         let mut buf = vec![0u8; pong_hdr.body_len as usize];
         primary_client.read_exact(&mut buf).await.unwrap();
-        let pong_aad = frame_aad(FrameFamily::Control as u8, ControlMsg::Pong as u16);
+        let pong_aad = veil_proto::codec::frame_aad(&pong_hdr);
         client_rx
             .open(&buf, &pong_aad)
             .expect("decrypt Pong on PRIMARY");
@@ -1992,7 +1990,7 @@ async fn phase650b_rekey_state_survives_transport_swap() {
     assert_eq!(init_hdr.msg_type, SessionMsg::RekeyInit as u16);
     let mut enc_init_body = vec![0u8; init_hdr.body_len as usize];
     primary_client.read_exact(&mut enc_init_body).await.unwrap();
-    let init_aad = frame_aad(FrameFamily::Session as u8, SessionMsg::RekeyInit as u16);
+    let init_aad = veil_proto::codec::frame_aad(&init_hdr);
     let plain_init = client_rx
         .open(&enc_init_body, &init_aad)
         .expect("decrypt server RekeyInit on PRIMARY");
@@ -2021,7 +2019,7 @@ async fn phase650b_rekey_state_survives_transport_swap() {
         ephemeral_pubkey: our_pubkey,
     }
     .encode();
-    let ack_aad = frame_aad(FrameFamily::Session as u8, SessionMsg::RekeyAck as u16);
+    let ack_aad = aad_for_plaintext(FrameFamily::Session as u8, SessionMsg::RekeyAck as u16, ack_body.len());
     let enc_ack = client_tx.seal(&ack_body, &ack_aad).expect("seal RekeyAck");
     let mut ack_hdr = FrameHeader::new(FrameFamily::Session as u8, SessionMsg::RekeyAck as u16);
     ack_hdr.body_len = enc_ack.len() as u32;
@@ -2067,7 +2065,7 @@ async fn phase650b_rekey_state_survives_transport_swap() {
     if new_pong_hdr.body_len > 0 {
         let mut buf = vec![0u8; new_pong_hdr.body_len as usize];
         warm_client.read_exact(&mut buf).await.unwrap();
-        let pong_aad = frame_aad(FrameFamily::Control as u8, ControlMsg::Pong as u16);
+        let pong_aad = veil_proto::codec::frame_aad(&new_pong_hdr);
         client_rx_new
             .open(&buf, &pong_aad)
             .expect("post-swap NEW Pong must decrypt with NEW client_rx");
@@ -2133,7 +2131,7 @@ async fn phase650b_rekey_state_survives_transport_swap() {
 // tree blocks on the same global lock.
 async fn phase650b_rekey_bypasses_low_battery_deferral_window() {
     use tokio::io::AsyncReadExt;
-    use veil_crypto::session_cipher::{SessionCipher, frame_aad};
+    use veil_crypto::session_cipher::SessionCipher;
     use veil_crypto::{kex, session_kdf};
     use veil_observability::NodeMetrics;
     use veil_proto::session::RekeyPayload;
@@ -2226,7 +2224,7 @@ async fn phase650b_rekey_bypasses_low_battery_deferral_window() {
 
     // Ping triggers Pong (response) + threshold-cross → RekeyInit.
     let t_send_ping = std::time::Instant::now();
-    let ping_aad = frame_aad(FrameFamily::Control as u8, ControlMsg::Ping as u16);
+    let ping_aad = aad_for_plaintext(FrameFamily::Control as u8, ControlMsg::Ping as u16, 0);
     let enc_ping = client_tx.seal(&[], &ping_aad).expect("seal Ping");
     let mut ping_hdr = FrameHeader::new(FrameFamily::Control as u8, ControlMsg::Ping as u16);
     ping_hdr.body_len = enc_ping.len() as u32;
@@ -2246,7 +2244,7 @@ async fn phase650b_rekey_bypasses_low_battery_deferral_window() {
     if pong_hdr.body_len > 0 {
         let mut buf = vec![0u8; pong_hdr.body_len as usize];
         client.read_exact(&mut buf).await.unwrap();
-        let pong_aad = frame_aad(FrameFamily::Control as u8, ControlMsg::Pong as u16);
+        let pong_aad = veil_proto::codec::frame_aad(&pong_hdr);
         client_rx.open(&buf, &pong_aad).expect("decrypt Pong");
     }
 
@@ -2269,7 +2267,7 @@ async fn phase650b_rekey_bypasses_low_battery_deferral_window() {
 
     let mut enc_init_body = vec![0u8; init_hdr.body_len as usize];
     client.read_exact(&mut enc_init_body).await.unwrap();
-    let init_aad = frame_aad(FrameFamily::Session as u8, SessionMsg::RekeyInit as u16);
+    let init_aad = veil_proto::codec::frame_aad(&init_hdr);
     let plain_init = client_rx
         .open(&enc_init_body, &init_aad)
         .expect("decrypt server RekeyInit");
@@ -2294,7 +2292,7 @@ async fn phase650b_rekey_bypasses_low_battery_deferral_window() {
         ephemeral_pubkey: our_pubkey,
     }
     .encode();
-    let ack_aad = frame_aad(FrameFamily::Session as u8, SessionMsg::RekeyAck as u16);
+    let ack_aad = aad_for_plaintext(FrameFamily::Session as u8, SessionMsg::RekeyAck as u16, ack_body.len());
     let enc_ack = client_tx.seal(&ack_body, &ack_aad).expect("seal RekeyAck");
     let mut ack_hdr = FrameHeader::new(FrameFamily::Session as u8, SessionMsg::RekeyAck as u16);
     ack_hdr.body_len = enc_ack.len() as u32;
@@ -2332,7 +2330,7 @@ async fn phase650b_rekey_bypasses_low_battery_deferral_window() {
     if new_pong_hdr.body_len > 0 {
         let mut buf = vec![0u8; new_pong_hdr.body_len as usize];
         client.read_exact(&mut buf).await.unwrap();
-        let pong_aad = frame_aad(FrameFamily::Control as u8, ControlMsg::Pong as u16);
+        let pong_aad = veil_proto::codec::frame_aad(&new_pong_hdr);
         client_rx_new
             .open(&buf, &pong_aad)
             .expect("post-rekey Pong must decrypt with NEW client_rx");
@@ -2376,7 +2374,7 @@ async fn phase650b_rekey_bypasses_low_battery_deferral_window() {
 #[tokio::test]
 async fn phase650b_rekey_state_survives_hot_standby_trigger_firing() {
     use tokio::io::AsyncReadExt;
-    use veil_crypto::session_cipher::{SessionCipher, frame_aad};
+    use veil_crypto::session_cipher::SessionCipher;
     use veil_crypto::{kex, session_kdf};
     use veil_observability::NodeMetrics;
     use veil_proto::session::RekeyPayload;
@@ -2491,7 +2489,7 @@ async fn phase650b_rekey_state_survives_hot_standby_trigger_firing() {
     let server_task = tokio::spawn(async move { runner.run().await });
 
     // Step 1: Ping → drive Pong + RekeyInit.
-    let ping_aad = frame_aad(FrameFamily::Control as u8, ControlMsg::Ping as u16);
+    let ping_aad = aad_for_plaintext(FrameFamily::Control as u8, ControlMsg::Ping as u16, 0);
     let enc_ping = client_tx.seal(&[], &ping_aad).expect("seal Ping");
     let mut ping_hdr = FrameHeader::new(FrameFamily::Control as u8, ControlMsg::Ping as u16);
     ping_hdr.body_len = enc_ping.len() as u32;
@@ -2513,7 +2511,7 @@ async fn phase650b_rekey_state_survives_hot_standby_trigger_firing() {
     if pong_hdr.body_len > 0 {
         let mut buf = vec![0u8; pong_hdr.body_len as usize];
         primary_client.read_exact(&mut buf).await.unwrap();
-        let pong_aad = frame_aad(FrameFamily::Control as u8, ControlMsg::Pong as u16);
+        let pong_aad = veil_proto::codec::frame_aad(&pong_hdr);
         client_rx.open(&buf, &pong_aad).expect("decrypt Pong");
     }
 
@@ -2528,7 +2526,7 @@ async fn phase650b_rekey_state_survives_hot_standby_trigger_firing() {
     assert_eq!(init_hdr.msg_type, SessionMsg::RekeyInit as u16);
     let mut enc_init_body = vec![0u8; init_hdr.body_len as usize];
     primary_client.read_exact(&mut enc_init_body).await.unwrap();
-    let init_aad = frame_aad(FrameFamily::Session as u8, SessionMsg::RekeyInit as u16);
+    let init_aad = veil_proto::codec::frame_aad(&init_hdr);
     let plain_init = client_rx
         .open(&enc_init_body, &init_aad)
         .expect("decrypt RekeyInit");
@@ -2562,7 +2560,7 @@ async fn phase650b_rekey_state_survives_hot_standby_trigger_firing() {
         ephemeral_pubkey: our_pubkey,
     }
     .encode();
-    let ack_aad = frame_aad(FrameFamily::Session as u8, SessionMsg::RekeyAck as u16);
+    let ack_aad = aad_for_plaintext(FrameFamily::Session as u8, SessionMsg::RekeyAck as u16, ack_body.len());
     let enc_ack = client_tx.seal(&ack_body, &ack_aad).expect("seal RekeyAck");
     let mut ack_hdr = FrameHeader::new(FrameFamily::Session as u8, SessionMsg::RekeyAck as u16);
     ack_hdr.body_len = enc_ack.len() as u32;
@@ -2606,7 +2604,7 @@ async fn phase650b_rekey_state_survives_hot_standby_trigger_firing() {
     if new_pong_hdr.body_len > 0 {
         let mut buf = vec![0u8; new_pong_hdr.body_len as usize];
         warm_client.read_exact(&mut buf).await.unwrap();
-        let pong_aad = frame_aad(FrameFamily::Control as u8, ControlMsg::Pong as u16);
+        let pong_aad = veil_proto::codec::frame_aad(&new_pong_hdr);
         client_rx_new
             .open(&buf, &pong_aad)
             .expect("decrypt NEW Pong");
@@ -2668,7 +2666,7 @@ async fn phase650b_rekey_state_survives_hot_standby_trigger_firing() {
 #[tokio::test]
 async fn phase650b_idle_timeout_fires_during_awaiting_ack_when_peer_silent() {
     use tokio::io::AsyncReadExt;
-    use veil_crypto::session_cipher::{SessionCipher, frame_aad};
+    use veil_crypto::session_cipher::SessionCipher;
     use veil_observability::NodeMetrics;
 
     let initial_tx = [0xB0u8; 32];
@@ -2745,7 +2743,7 @@ async fn phase650b_idle_timeout_fires_during_awaiting_ack_when_peer_silent() {
 
     // Step 1: Ping → drive Pong + RekeyInit; last_rx = ~now on
     // server side when Ping's first byte lands.
-    let ping_aad = frame_aad(FrameFamily::Control as u8, ControlMsg::Ping as u16);
+    let ping_aad = aad_for_plaintext(FrameFamily::Control as u8, ControlMsg::Ping as u16, 0);
     let enc_ping = client_tx.seal(&[], &ping_aad).expect("seal Ping");
     let mut ping_hdr = FrameHeader::new(FrameFamily::Control as u8, ControlMsg::Ping as u16);
     ping_hdr.body_len = enc_ping.len() as u32;
@@ -2765,7 +2763,7 @@ async fn phase650b_idle_timeout_fires_during_awaiting_ack_when_peer_silent() {
     if pong_hdr.body_len > 0 {
         let mut buf = vec![0u8; pong_hdr.body_len as usize];
         client.read_exact(&mut buf).await.unwrap();
-        let pong_aad = frame_aad(FrameFamily::Control as u8, ControlMsg::Pong as u16);
+        let pong_aad = veil_proto::codec::frame_aad(&pong_hdr);
         client_rx.open(&buf, &pong_aad).expect("decrypt Pong");
     }
 
@@ -2779,7 +2777,7 @@ async fn phase650b_idle_timeout_fires_during_awaiting_ack_when_peer_silent() {
     assert_eq!(init_hdr.msg_type, SessionMsg::RekeyInit as u16);
     let mut enc_init_body = vec![0u8; init_hdr.body_len as usize];
     client.read_exact(&mut enc_init_body).await.unwrap();
-    let init_aad = frame_aad(FrameFamily::Session as u8, SessionMsg::RekeyInit as u16);
+    let init_aad = veil_proto::codec::frame_aad(&init_hdr);
     client_rx
         .open(&enc_init_body, &init_aad)
         .expect("decrypt server RekeyInit (advances client_rx counter)");
@@ -3112,7 +3110,7 @@ async fn runner_truncated_header_exits_cleanly() {
 #[tokio::test]
 async fn rekey_completes_and_subsequent_frames_decrypt() {
     use tokio::io::AsyncReadExt;
-    use veil_crypto::session_cipher::{SessionCipher, frame_aad};
+    use veil_crypto::session_cipher::SessionCipher;
     use veil_crypto::{kex, session_kdf};
     use veil_proto::{codec::decode_header, header::HEADER_SIZE};
 
@@ -3206,7 +3204,7 @@ async fn rekey_completes_and_subsequent_frames_decrypt() {
     let mut client = client_stream;
 
     // Step 1: send an encrypted Ping to verify initial cipher works.
-    let ping_aad = frame_aad(FrameFamily::Control as u8, ControlMsg::Ping as u16);
+    let ping_aad = aad_for_plaintext(FrameFamily::Control as u8, ControlMsg::Ping as u16, 0);
     let enc_ping = client_tx.seal(&[], &ping_aad).unwrap();
     {
         let mut hdr = FrameHeader::new(FrameFamily::Control as u8, ControlMsg::Ping as u16);
@@ -3223,7 +3221,7 @@ async fn rekey_completes_and_subsequent_frames_decrypt() {
         let pong_hdr = decode_header(&hdr_buf).unwrap();
         let mut pong_body = vec![0u8; pong_hdr.body_len as usize];
         client.read_exact(&mut pong_body).await.unwrap();
-        let pong_aad = frame_aad(pong_hdr.family, pong_hdr.msg_type);
+        let pong_aad = veil_proto::codec::frame_aad(&pong_hdr);
         client_rx
             .open(&pong_body, &pong_aad)
             .expect("sealed empty Pong must open");
@@ -3236,7 +3234,7 @@ async fn rekey_completes_and_subsequent_frames_decrypt() {
         ephemeral_pubkey: rekey_pub,
     }
     .encode();
-    let rekey_aad = frame_aad(FrameFamily::Session as u8, SessionMsg::RekeyInit as u16);
+    let rekey_aad = aad_for_plaintext(FrameFamily::Session as u8, SessionMsg::RekeyInit as u16, rekey_body.len());
     let enc_rekey_init = client_tx.seal(&rekey_body, &rekey_aad).unwrap();
     {
         let mut hdr = FrameHeader::new(FrameFamily::Session as u8, SessionMsg::RekeyInit as u16);
@@ -3257,7 +3255,7 @@ async fn rekey_completes_and_subsequent_frames_decrypt() {
     client.read_exact(&mut enc_ack_body).await.unwrap();
     // Decrypt RekeyAck with the OLD rx cipher.
     let ack_body_plain = {
-        let ack_aad = frame_aad(FrameFamily::Session as u8, SessionMsg::RekeyAck as u16);
+        let ack_aad = veil_proto::codec::frame_aad(&ack_hdr);
         client_rx
             .open(&enc_ack_body, &ack_aad)
             .expect("RekeyAck must decrypt with old key")
@@ -3272,7 +3270,7 @@ async fn rekey_completes_and_subsequent_frames_decrypt() {
     let _ = SessionCipher::new(&new_keys.rx_key, true); // new rx_key acknowledged; test only verifies tx path
 
     // Step 5: send another encrypted Ping using the NEW keys — responder must decrypt it.
-    let ping2_aad = frame_aad(FrameFamily::Control as u8, ControlMsg::Ping as u16);
+    let ping2_aad = aad_for_plaintext(FrameFamily::Control as u8, ControlMsg::Ping as u16, 0);
     let enc_ping2 = client_tx.seal(&[], &ping2_aad).unwrap();
     {
         let mut hdr = FrameHeader::new(FrameFamily::Control as u8, ControlMsg::Ping as u16);
@@ -3884,7 +3882,7 @@ async fn swap_redirects_runner_to_new_stream_without_reset() {
 #[tokio::test(flavor = "current_thread")]
 async fn swap_preserves_aead_counter_across_transports() {
     use tokio::io::AsyncReadExt as _;
-    use veil_crypto::session_cipher::{SessionCipher, frame_aad};
+    use veil_crypto::session_cipher::SessionCipher;
     use veil_proto::{codec::decode_header, header::HEADER_SIZE};
 
     let key = [0xDEu8; 32];
@@ -3972,9 +3970,13 @@ async fn swap_preserves_aead_counter_across_transports() {
     // transport. Advances `peer_tx` counter by one seal.
     async fn send_encrypted_ping(client: &mut DuplexStream, peer_tx: &mut SessionCipher) {
         let mut hdr = FrameHeader::new(FrameFamily::Control as u8, ControlMsg::Ping as u16);
-        let aad = frame_aad(hdr.family, hdr.msg_type);
+        // body_len FIRST: it is part of the AAD, and the receiver computes it
+        // from the wire. Built before this line the AAD says `body_len = 0`
+        // while the header on the wire says 16, and nothing opens (audit V-01).
+        hdr.body_len = veil_crypto::session_cipher::AEAD_OVERHEAD as u32;
+        let aad = veil_proto::codec::frame_aad(&hdr);
         let ct = peer_tx.seal(&[], &aad).expect("seal Ping");
-        hdr.body_len = ct.len() as u32;
+        assert_eq!(ct.len() as u32, hdr.body_len);
         client.write_all(&encode_header(&hdr)).await.unwrap();
         client.write_all(&ct).await.unwrap();
 
@@ -6179,4 +6181,48 @@ async fn mobility_non_realtime_black_hole_keeps_pre_slice_timeline() {
         after_16s.is_err(),
         "a non-realtime silent session must NOT be reaped on the accelerated timeline"
     );
+}
+
+/// The AAD for a frame these tests are about to SEND: the FINAL wire header,
+/// which is what the receiver reconstructs from the bytes it read.
+///
+/// The AAD used to be three bytes (`family`, `msg_type`), leaving `flags`,
+/// `body_len`, `stream_id` and `request_id` unauthenticated — so an authentic
+/// frame could be moved to another stream or have its length rewritten on any
+/// transport without outer authentication (audit V-01).
+///
+/// `body_len` is therefore part of it, which means the AAD cannot be built
+/// before the ciphertext length is known. It is known in advance:
+/// `plaintext + AEAD_OVERHEAD`.
+///
+/// ⚠️ Only valid where the test writes a header built the same way —
+/// `FrameHeader::new(family, msg_type)` plus `body_len`. A test that also sets
+/// `flags`, `stream_id` or `request_id` must build its AAD from THAT header.
+///
+/// On the RECEIVING side never use this: use `frame_aad(&received_header)`.
+/// A reconstruction has `flags = 0`, and a real control frame carries priority
+/// bits there — which is precisely the kind of divergence V-01 is about, and
+/// precisely how these tests caught it.
+fn aad_for_plaintext(
+    family: u8,
+    msg_type: u16,
+    plaintext_len: usize,
+) -> [u8; veil_proto::header::HEADER_SIZE] {
+    aad_for_ciphertext(
+        family,
+        msg_type,
+        plaintext_len + veil_crypto::session_cipher::AEAD_OVERHEAD,
+    )
+}
+
+/// Same, from a ciphertext length — for the receiving side, where `body_len`
+/// IS the ciphertext length that arrived.
+fn aad_for_ciphertext(
+    family: u8,
+    msg_type: u16,
+    ciphertext_len: usize,
+) -> [u8; veil_proto::header::HEADER_SIZE] {
+    let mut h = veil_proto::header::FrameHeader::new(family, msg_type);
+    h.body_len = ciphertext_len as u32;
+    veil_proto::codec::frame_aad(&h)
 }
