@@ -1,5 +1,13 @@
-//! PoW-gated rendezvous initiator client — Slice 4 of the PoW-Gated
-//! Rendezvous epic ([`docs/internal/PLAN_POW_GATED_RENDEZVOUS.md`]).
+//! **EXPERIMENTAL — no production caller.** PoW-gated rendezvous initiator
+//! client, Slice 4 of the PoW-Gated Rendezvous epic
+//! ([`docs/internal/PLAN_POW_GATED_RENDEZVOUS.md`]).
+//!
+//! Nothing in this workspace calls it. The primitives below are complete and
+//! tested at the wire level, but a complete-looking public API on a security
+//! mechanism reads as a shipped defence — so say it here rather than leave a
+//! reader to infer it from the Scope section further down. Until Slice 5 wires
+//! the transport half, treat this module as a specification with an
+//! implementation attached, not as a protection anything currently has.
 //!
 //! This module provides the **client-side** primitives for one
 //! rendezvous exchange:
