@@ -1272,11 +1272,37 @@ impl ForwardIntroducePayload {
 // ── Sealed-box style sender → receiver encryption ────────────────────────────
 
 /// Encrypt `plaintext` to the recipient's X25519 pubkey. Generates a
-/// fresh ephemeral keypair for this call (forward secrecy: leaking
-/// the ciphertext + later compromise of the recipient's long-term
-/// X25519 sk does NOT reveal the plaintext if the ephemeral SK was
-/// truly random — `OsRng` here). Output is `[32B eph_pk][12B nonce]
-/// [AEAD ciphertext + 16B tag]`.
+/// fresh ephemeral keypair for this call. Output is `[32B eph_pk]
+/// [12B nonce][AEAD ciphertext + 16B tag]`.
+///
+/// ## What the ephemeral key does and does not buy
+///
+/// It is NOT forward secrecy against the recipient. `eph_pk` travels in
+/// the clear at the head of every blob, so anyone who records a
+/// ciphertext and later obtains the recipient's long-term X25519 sk
+/// recomputes the same shared secret and decrypts it. A stored
+/// introduce is retroactively readable for as long as that key lives.
+/// (An earlier version of this comment claimed the opposite; it was
+/// wrong.)
+///
+/// What it does buy is narrower and still worth having:
+///
+///   * compromise of the SENDER buys nothing retroactively — `eph_sk` is
+///     an `EphemeralSecret`, consumed by the DH and never stored, so
+///     there is no sender-side key to seize afterwards;
+///   * each blob gets an independent key, so a shared secret recovered
+///     by any other means opens exactly one message;
+///   * the sender contributes no long-term identity to the handshake,
+///     which is what lets an introduce be unlinkable to its author.
+///
+/// Bounding the retroactive window is therefore the recipient key's job,
+/// not this function's — see the ML-KEM seed ring for the shape that
+/// solves it: rotate on a schedule with an overlap named out loud and
+/// wide enough to cover mailbox retention. One-time prekeys are the
+/// textbook answer and are deliberately NOT used here: a published,
+/// consumable pool signals liveness, has an exhaustion point, and hands
+/// an attacker a cheap way to drain it — all three work against
+/// unlinkability and against offline-first delivery.
 ///
 /// AEAD: ChaCha20-Poly1305 with key = BLAKE3 of the X25519 shared
 /// secret and AAD = `INTRODUCE_DOMAIN` + ephemeral_pk + nonce. AAD
