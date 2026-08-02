@@ -96,16 +96,34 @@ pub const PUSH_TRIGGER_QUEUE_CAP: usize = 512;
 /// ~7.5 MB — and stale ones are evicted, so steady-state is far lower.
 const MAX_INFLIGHT_PUT_REASSEMBLIES: usize = 128;
 
-/// A partially-received deposit idle longer than this is evicted, so a hostile
-/// depositor cannot pin relay memory with half-sent deposits. A real deposit's
-/// chunks all arrive within a few seconds, so this never drops honest traffic.
+/// A partially-received deposit that has made no PROGRESS for this long is
+/// evicted. A real deposit's chunks all arrive within a few seconds, so this
+/// never drops honest traffic.
 const PUT_REASSEMBLY_STALE: Duration = Duration::from_secs(30);
+
+/// Hard ceiling on a reassembly's life, measured from when its first chunk
+/// arrived and NOT renewable by anything.
+///
+/// The idle timer alone was renewable: re-sending a chunk already held pushed
+/// `last_activity` forward without adding a single byte, so 128 slots could be
+/// held open forever by replaying the first chunk of each every 29 seconds —
+/// and every honest deposit was refused for as long as the attacker cared to
+/// keep it up (audit V-02). A deadline that no incoming packet can move puts
+/// an end to that regardless of what arrives.
+///
+/// Generous next to the seconds an honest deposit takes, so it only ever fires
+/// on something that was never going to complete.
+const PUT_REASSEMBLY_MAX_LIFETIME: Duration = Duration::from_secs(120);
 
 struct PutReassembly {
     chunk_total: u16,
     chunks: Vec<Option<Vec<u8>>>,
     received: u16,
-    last_activity: Instant,
+    /// Last time a chunk we did not already hold arrived. A duplicate does not
+    /// move this — replaying is not progress.
+    last_progress: Instant,
+    /// When the first chunk arrived. Never updated.
+    created: Instant,
 }
 
 /// Reassembles chunked network deposits ([`MailboxPutChunkPayload`]) keyed by the
@@ -138,9 +156,14 @@ impl PutChunkReassembler {
         if c.chunk_data.len() > MAILBOX_PUT_CHUNK_DATA_BYTES {
             return None;
         }
-        // Drop idle partial deposits before doing anything else (memory bound).
-        self.inflight
-            .retain(|_, r| now.duration_since(r.last_activity) < PUT_REASSEMBLY_STALE);
+        // Drop partial deposits before doing anything else (memory bound): the
+        // ones that have stopped making progress, AND the ones that have simply
+        // been here too long. The second condition is the one that cannot be
+        // gamed — no arriving packet moves `created`.
+        self.inflight.retain(|_, r| {
+            now.duration_since(r.last_progress) < PUT_REASSEMBLY_STALE
+                && now.duration_since(r.created) < PUT_REASSEMBLY_MAX_LIFETIME
+        });
 
         // A conflicting chunk_total for an existing key = corruption / an injected
         // chunk under a guessed content_id → restart that reassembly.
@@ -151,12 +174,30 @@ impl PutChunkReassembler {
         {
             self.inflight.remove(&c.content_id);
         }
-        // Refuse a NEW key when full — never evict an in-progress honest deposit
-        // (they complete in seconds; the depositor's outbox retries on drop).
+        // Full, and this is a NEW key: make room rather than turn it away.
+        //
+        // Refusing was the old policy, on the reasoning that an in-progress
+        // honest deposit should never be sacrificed. But the sacrifice happened
+        // anyway — to whoever arrived second — and an attacker holding all 128
+        // slots turned "never evict" into "never accept anyone else". Something
+        // has to give; the question is only what.
+        //
+        // The least-advanced reassembly gives. An attacker's slots hold one
+        // chunk each because sending more would complete them; an honest
+        // deposit part-way through holds many. Ties break on age, so the oldest
+        // of the equally-stalled goes first. The evicted depositor's outbox
+        // retries, which is the same cost the refused one used to pay.
         if !self.inflight.contains_key(&c.content_id)
             && self.inflight.len() >= MAX_INFLIGHT_PUT_REASSEMBLIES
         {
-            return None;
+            // `?` on purpose: an empty table cannot be over the cap, so this
+            // never fires — but returning beats inserting past the bound.
+            let victim = *self
+                .inflight
+                .iter()
+                .min_by_key(|(_, r)| (r.received, r.created))
+                .map(|(k, _)| k)?;
+            self.inflight.remove(&victim);
         }
 
         let complete = {
@@ -167,13 +208,17 @@ impl PutChunkReassembler {
                     chunk_total: c.chunk_total,
                     chunks: vec![None; c.chunk_total as usize],
                     received: 0,
-                    last_activity: now,
+                    last_progress: now,
+                    created: now,
                 });
-            r.last_activity = now;
             let idx = c.chunk_index as usize;
             if r.chunks[idx].is_none() {
                 r.received += 1;
                 r.chunks[idx] = Some(c.chunk_data);
+                // ONLY here. Re-sending a chunk we already hold used to push the
+                // idle timer forward too, which is what let one attacker keep a
+                // slot alive indefinitely by replaying its first chunk.
+                r.last_progress = now;
             } // duplicate index (relay redundancy / retry) → idempotent no-op
             r.received == r.chunk_total
         };
@@ -1529,6 +1574,135 @@ mod tests {
         let left = mailbox.fetch(recv).unwrap();
         assert_eq!(left.len(), 1, "oversized blob gone from the store");
         assert_eq!(left[0].content_id, [0xC2; 32]);
+    }
+
+    #[test]
+    fn a_replayed_chunk_cannot_hold_a_reassembly_slot_open() {
+        // 128 slots, and re-sending a chunk already held used to push the idle
+        // timer forward. An attacker filled every slot with a first-of-N chunk
+        // and replayed them every 29 seconds; honest deposits were refused for
+        // as long as they cared to keep it up, and the capability check never
+        // ran because it only happens after full reassembly (audit V-02).
+        let mut ra = PutChunkReassembler::default();
+        let t0 = Instant::now();
+
+        fn first_of_two(id: u8) -> MailboxPutChunkPayload {
+            MailboxPutChunkPayload {
+                content_id: [id; 32],
+                chunk_index: 0,
+                chunk_total: 2,
+                chunk_data: vec![0xAA; 16],
+            }
+        }
+
+        // Fill every slot with a deposit that will never be finished.
+        for id in 0..MAX_INFLIGHT_PUT_REASSEMBLIES {
+            assert!(ra.accept(first_of_two(id as u8), t0).is_none());
+        }
+        assert_eq!(ra.inflight.len(), MAX_INFLIGHT_PUT_REASSEMBLIES);
+
+        // 1. A NEW deposit still gets in, by displacing the least-advanced
+        //    squatter rather than being turned away.
+        let honest = [0xEE; 32];
+        assert!(
+            ra.accept(
+                MailboxPutChunkPayload {
+                    content_id: honest,
+                    chunk_index: 0,
+                    chunk_total: 2,
+                    chunk_data: vec![0xBB; 16],
+                },
+                t0,
+            )
+            .is_none(),
+            "first of two chunks — not complete yet"
+        );
+        assert!(
+            ra.inflight.contains_key(&honest),
+            "a full table must not lock every newcomer out"
+        );
+        assert_eq!(
+            ra.inflight.len(),
+            MAX_INFLIGHT_PUT_REASSEMBLIES,
+            "still bounded — one in, one out"
+        );
+
+        // ...and it completes normally.
+        let assembled = ra.accept(
+            MailboxPutChunkPayload {
+                content_id: honest,
+                chunk_index: 1,
+                chunk_total: 2,
+                chunk_data: vec![0xCC; 16],
+            },
+            t0,
+        );
+        assert!(assembled.is_some(), "the honest deposit must reassemble");
+
+        // 2. Replaying a chunk we already hold is not progress, so it cannot
+        //    carry accumulated state across the idle window. Re-sending it can
+        //    only ever start a fresh reassembly — never preserve the old one's
+        //    chunks — which is what stops an attacker from banking progress and
+        //    what keeps their slots the least-advanced, hence first evicted.
+        let mut ra = PutChunkReassembler::default();
+        let squatter = [0x11; 32];
+        assert!(ra.accept(first_of_two(0x11), t0).is_none());
+        // A replay half-way through the idle window. Under the old rule this
+        // pushed the timer to here and chunk 0 survived to meet chunk 1 below.
+        assert!(
+            ra.accept(first_of_two(0x11), t0 + PUT_REASSEMBLY_STALE / 2).is_none()
+        );
+
+        let past_idle = t0 + PUT_REASSEMBLY_STALE + Duration::from_secs(1);
+        let finishing = MailboxPutChunkPayload {
+            content_id: squatter,
+            chunk_index: 1,
+            chunk_total: 2,
+            chunk_data: vec![0xAA; 16],
+        };
+        assert!(
+            ra.accept(finishing, past_idle).is_none(),
+            "chunk 0 was replayed, not re-sent as progress, so it must have \
+             aged out — the deposit cannot complete off a banked chunk"
+        );
+
+        // 3. Even a deposit that keeps making REAL progress cannot outlive the
+        //    hard deadline — nothing arriving can move `created`.
+        let mut ra = PutChunkReassembler::default();
+        let slow = [0x33; 32];
+        assert!(
+            ra.accept(
+                MailboxPutChunkPayload {
+                    content_id: slow,
+                    chunk_index: 0,
+                    chunk_total: 200,
+                    chunk_data: vec![0xDD; 16],
+                },
+                t0,
+            )
+            .is_none()
+        );
+        // A genuinely new chunk every 10s keeps the idle timer alive — and
+        // stays inside the hard deadline, so the entry is never re-created and
+        // `created` really is t0 when the deadline is checked below.
+        for i in 1..11u16 {
+            let t = t0 + Duration::from_secs(10 * i as u64);
+            ra.accept(
+                MailboxPutChunkPayload {
+                    content_id: slow,
+                    chunk_index: i,
+                    chunk_total: 200,
+                    chunk_data: vec![0xDD; 16],
+                },
+                t,
+            );
+        }
+        let past_lifetime = t0 + PUT_REASSEMBLY_MAX_LIFETIME + Duration::from_secs(1);
+        ra.accept(first_of_two(0x44), past_lifetime);
+        assert!(
+            !ra.inflight.contains_key(&slow),
+            "the hard deadline must fire even on a reassembly still progressing"
+        );
     }
 
     #[test]
