@@ -3745,6 +3745,23 @@ pub struct GlobalConfig {
     #[serde(default, skip_serializing_if = "is_default_legacy_allow")]
     pub strict_config_validation: bool,
 
+    /// Start as a legacy `node_id`-keyed node even when an
+    /// `identity_document.bin` IS present but cannot be loaded.
+    ///
+    /// Default `false`, and that default is fail-closed on purpose. A missing
+    /// document is ordinary — a node is required to run without a sovereign
+    /// identity, and that path is untouched. A document that EXISTS and does
+    /// not load is different: the operator provisioned an identity, it is on
+    /// disk, and it is broken. Continuing silently ran the node under a
+    /// DIFFERENT identity binding than the one its operator installed, with a
+    /// single warning line as the only trace (audit V-07).
+    ///
+    /// Set `true` only to bring a node up for recovery — e.g. to reach
+    /// `veil-cli identity restore` on a host you cannot otherwise log into —
+    /// knowing that peers will see it as an unrelated legacy node.
+    #[serde(default, skip_serializing_if = "is_default_legacy_allow")]
+    pub allow_identity_fallback: bool,
+
     /// **Phase 10 slice 2c** — TLS ECH GREASE on outbound public-PKI
     /// HTTPS connections (currently the bootstrap fetch path).  When
     /// `true`, the client adds an Encrypted Client Hello GREASE
@@ -3830,6 +3847,7 @@ impl Default for GlobalConfig {
             log_level: LogLevel::default(),
             log_format: LogFormat::default(),
             bootstrap_dns_domain: None,
+            allow_identity_fallback: false,
             discovered_peers_cache_path: None,
             bootstrap_https_urls: Vec::new(),
             bootstrap_tor_socks_proxy: None,
