@@ -44,27 +44,88 @@ pub fn prepare_init_path(path: &Path, force: bool) -> Result<PathBuf> {
 ///   the unsigned-config OR the verify-failed branch.  Operators flip
 ///   this after every machine in the fleet has been signed AND verified.
 pub fn load_config(path: &Path) -> Result<Config> {
+    let pinned = std::env::var(TRUSTED_CONFIG_ISSUER_PUBKEY_ENV).ok();
+    load_config_with_policy(path, pinned.as_deref(), external_require_signed_config())
+}
+
+/// `load_config` with the two external signals injected explicitly.
+///
+/// Production goes through the env-var wrapper above; tests pass concrete
+/// values so they don't mutate process-global env state (same pattern as
+/// `load_config_str_with_policy`).
+fn load_config_with_policy(
+    path: &Path,
+    pinned: Option<&str>,
+    external_require: bool,
+) -> Result<Config> {
     let format = FileFormat::from_path(path)?;
     let content = fs::read_to_string(path)?;
-    let (toml_body, sig_status) = preprocess_signed_config(&content, path);
-    let parsed = format::backend(format).load(&toml_body)?;
+    let (toml_body, sig_status) =
+        preprocess_signed_config_with_pin(&content, path, pinned, external_min_issued_at());
+    let mut parsed = format::backend(format).load(&toml_body)?;
     // Phase-2 enforcement check: enforcement is demanded by EITHER the in-body
     // `global.require_signed_config = true` OR the external, tamper-proof
     // `VEIL_CONFIG_REQUIRE_SIGNED` env-var (F3) — so a config tampered to clear
     // the in-body flag cannot self-disable the signature requirement.
-    let require_signed = parsed.global.require_signed_config || external_require_signed_config();
-    if require_signed && !matches!(sig_status, SignedConfigStatus::Verified) {
+    let require_signed = parsed.global.require_signed_config || external_require;
+    enforce_signed_config(
+        require_signed,
+        pinned,
+        &sig_status,
+        &format!("config '{}'", path.display()),
+    )?;
+    // Learned state (identity PoW nonce, per-peer nonces) lives in a sidecar,
+    // NOT in the signed bytes — see `runtime_state`. Overlaid here, after
+    // verification, so what got verified is exactly what the operator signed.
+    crate::runtime_state::apply(&mut parsed, &crate::runtime_state::load(path));
+    Ok(parsed)
+}
+
+/// The signed-config gate, in one place for both loaders.
+///
+/// Two refusals, and the second is the one the audit found missing.
+///
+/// 1. Enforcement is on and the file did not verify — the original check.
+/// 2. Enforcement is on and NO issuer is pinned. Without a pin, "verified"
+///    means only "somebody signed this", and the signing key an attacker
+///    reaches for is the node's own `[identity].private_key`, which sits in
+///    the very file they just rewrote. Self-certification is not
+///    authentication, so an unpinned enforced config was enforcing nothing
+///    while reporting that it was. Fail closed and say which env-var is
+///    missing.
+///
+/// This does NOT make a pin a precondition for starting a node: enforcement
+/// is opt-in, and a node with neither the flag nor the env-var set boots
+/// unsigned exactly as before. It only refuses the combination that claims a
+/// guarantee it does not have.
+fn enforce_signed_config(
+    require_signed: bool,
+    pinned: Option<&str>,
+    sig_status: &SignedConfigStatus,
+    subject: &str,
+) -> Result<()> {
+    if !require_signed {
+        return Ok(());
+    }
+    if pinned.is_none_or(str::is_empty) {
         return Err(crate::ConfigError::CommandFailed(format!(
-            "config '{}' requires a valid signature (global.require_signed_config = true) \
-             but verification surfaced a non-Verified state ({:?}).  Sign the file via \
-             `veil-cli config sign`, ensure {} env-var matches the operator's pubkey \
-             if pinning is desired, AND restart.",
-            path.display(),
-            sig_status,
-            TRUSTED_CONFIG_ISSUER_PUBKEY_ENV,
+            "{subject} demands a signed config but no issuer is pinned. An unpinned \
+             signature only proves that SOMEONE signed the file — including whoever \
+             rewrote it, using the `[identity].private_key` stored in that same file. \
+             Set {TRUSTED_CONFIG_ISSUER_PUBKEY_ENV} to the offline signer's public key \
+             (in the systemd unit / compose file, NOT in the config), or clear the \
+             enforcement flag and {REQUIRE_SIGNED_CONFIG_ENV}."
         )));
     }
-    Ok(parsed)
+    if !matches!(sig_status, SignedConfigStatus::Verified) {
+        return Err(crate::ConfigError::CommandFailed(format!(
+            "{subject} requires a valid signature but verification surfaced a \
+             non-Verified state ({sig_status:?}). Re-sign with the pinned offline \
+             signer via `veil-cli config sign --signer-key <path>`, confirm \
+             {TRUSTED_CONFIG_ISSUER_PUBKEY_ENV} matches it, AND restart."
+        )));
+    }
+    Ok(())
 }
 
 /// Like [`load_config`] but for config bytes supplied as a STRING — the admin
@@ -77,7 +138,13 @@ pub fn load_config(path: &Path) -> Result<Config> {
 /// daemon would refuse to boot on the next start. `path` is used only for the
 /// signature-pin lookup + error context (TOML format assumed for the IPC apply).
 pub fn load_config_str(content: &str, path: &Path) -> Result<Config> {
-    load_config_str_with_policy(content, path, external_require_signed_config())
+    let pinned = std::env::var(TRUSTED_CONFIG_ISSUER_PUBKEY_ENV).ok();
+    load_config_str_with_policy(
+        content,
+        path,
+        external_require_signed_config(),
+        pinned.as_deref(),
+    )
 }
 
 /// `load_config_str` with the external enforcement signal injected explicitly
@@ -88,18 +155,13 @@ fn load_config_str_with_policy(
     content: &str,
     path: &Path,
     external_require: bool,
+    pinned: Option<&str>,
 ) -> Result<Config> {
-    let (toml_body, sig_status) = preprocess_signed_config(content, path);
+    let (toml_body, sig_status) =
+        preprocess_signed_config_with_pin(content, path, pinned, external_min_issued_at());
     let parsed = format::backend(FileFormat::Toml).load(&toml_body)?;
     let require_signed = parsed.global.require_signed_config || external_require;
-    if require_signed && !matches!(sig_status, SignedConfigStatus::Verified) {
-        return Err(crate::ConfigError::CommandFailed(format!(
-            "applied config requires a valid signature (global.require_signed_config = true \
-             OR {REQUIRE_SIGNED_CONFIG_ENV} set) but verification surfaced a non-Verified \
-             state ({sig_status:?}); sign it via `veil-cli config sign` (set \
-             {TRUSTED_CONFIG_ISSUER_PUBKEY_ENV} to pin the issuer)",
-        )));
-    }
+    enforce_signed_config(require_signed, pinned, &sig_status, "the applied config")?;
     Ok(parsed)
 }
 
@@ -194,10 +256,10 @@ fn external_min_issued_at() -> Option<u64> {
 /// runs in pinned mode (signature must match the pinned pubkey OR fall
 /// to branch 3); otherwise it runs in unpinned mode (envelope integrity
 /// only).
-fn preprocess_signed_config(content: &str, path: &Path) -> (String, SignedConfigStatus) {
-    let pinned = std::env::var(TRUSTED_CONFIG_ISSUER_PUBKEY_ENV).ok();
-    preprocess_signed_config_with_pin(content, path, pinned.as_deref(), external_min_issued_at())
-}
+/// (Both loaders now read the pin themselves so they can pass it to
+/// [`enforce_signed_config`] as well; the old env-reading wrapper would have
+/// read it twice and could not have told the gate what it found.)
+fn _preprocess_signed_config_doc_anchor() {}
 
 /// Testable inner: same as [`preprocess_signed_config`] but accepts
 /// the trusted-issuer pubkey and anti-rollback floor explicitly instead of
@@ -467,6 +529,24 @@ pub fn save_config(path: &Path, config: &Config) -> Result<()> {
         // that won't verify, strip the now-stale header and warn the operator
         // to re-sign.
         if crate::signed_config::has_signature_header(&patched) {
+            // Stripping is only tolerable while enforcement is OFF (the phase-1
+            // grace window): the operator gets a warning and a config that still
+            // loads. Under enforcement the same strip is a self-brick — the next
+            // boot refuses a config the daemon itself unsigned — so refuse the
+            // WRITE instead of the boot. Nothing legitimate is lost: the node's
+            // own mutable state moved to the `runtime_state` sidecar, and an
+            // operator edit under enforcement has to go back through the offline
+            // signer anyway.
+            if config.global.require_signed_config || external_require_signed_config() {
+                return Err(crate::ConfigError::CommandFailed(format!(
+                    "refusing to rewrite the signed config at {}: this write cannot \
+                     reproduce the signature, and enforcement is ON \
+                     (global.require_signed_config or {REQUIRE_SIGNED_CONFIG_ENV}), so \
+                     stripping it would leave a config the next boot refuses. Edit and \
+                     re-sign offline, then deploy the signed file.",
+                    path.display()
+                )));
+            }
             log::warn!(
                 "config at {} was signed; saving changes INVALIDATED the signature — \
                  stripped the now-stale signature header. Re-run `config sign` to re-sign \
@@ -514,6 +594,122 @@ fn normalize_init_path(path: &Path) -> PathBuf {
         path.join("config.toml")
     } else {
         path.to_path_buf()
+    }
+}
+
+#[cfg(test)]
+mod signed_config_gate_tests {
+    use super::*;
+
+    /// Audit V-04. Without a pinned issuer, `Verified` means "somebody signed
+    /// this" — and the key the attacker reaches for is `[identity].private_key`
+    /// sitting in the file they just rewrote. An enforced config with no pin was
+    /// therefore enforcing nothing while logging that it was.
+    #[test]
+    fn enforcement_without_a_pinned_issuer_is_refused() {
+        let err = enforce_signed_config(true, None, &SignedConfigStatus::Verified, "cfg")
+            .expect_err("a verified-but-unpinned config must not satisfy enforcement");
+        let msg = err.to_string();
+        assert!(
+            msg.contains(TRUSTED_CONFIG_ISSUER_PUBKEY_ENV),
+            "the refusal must name the env-var that fixes it: {msg}"
+        );
+        // An empty pin is an unset pin. `FOO=` in a unit file is a normal way to
+        // "clear" a variable, and it must not read as "pinned to the empty key".
+        assert!(enforce_signed_config(true, Some(""), &SignedConfigStatus::Verified, "cfg").is_err());
+    }
+
+    /// The gate must not become "a node needs an operator CA to start" — the
+    /// 2026-07-28 decision requires booting with no sovereign identity at all.
+    #[test]
+    fn an_unenforced_config_still_loads_with_no_pin_and_no_signature() {
+        for status in [
+            SignedConfigStatus::Unsigned,
+            SignedConfigStatus::Verified,
+            SignedConfigStatus::VerifyFailed,
+        ] {
+            assert!(
+                enforce_signed_config(false, None, &status, "cfg").is_ok(),
+                "enforcement is opt-in; {status:?} must load when it is off"
+            );
+        }
+    }
+
+    #[test]
+    fn a_pinned_but_unverified_config_is_still_refused() {
+        for status in [SignedConfigStatus::Unsigned, SignedConfigStatus::VerifyFailed] {
+            assert!(enforce_signed_config(true, Some("PK"), &status, "cfg").is_err());
+        }
+        assert!(enforce_signed_config(true, Some("PK"), &SignedConfigStatus::Verified, "cfg").is_ok());
+    }
+
+    /// Audit V-05. Stripping a signature the writer cannot reproduce is a
+    /// self-brick under enforcement: the daemon unsigns its own config and the
+    /// next boot refuses it. Refuse the WRITE instead of the boot.
+    #[test]
+    fn saving_over_a_signed_config_is_refused_under_enforcement() {
+        let kp = veil_crypto::generate_keypair(crate::SignatureAlgorithm::Ed25519);
+        let signed = crate::signed_config::sign_config(
+            "[global]\nrequire_signed_config = true\n",
+            &kp.public_key,
+            &kp.private_key,
+            kp.algo,
+            1_700_000_000,
+        )
+        .expect("sign");
+
+        let dir = std::env::temp_dir().join("veil-v05-save-refusal");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("scratch");
+        let path = dir.join("config.toml");
+        fs::write(&path, &signed).expect("seed signed config");
+
+        let mut config = Config::default();
+        config.global.require_signed_config = true;
+        let err = save_config(&path, &config).expect_err("must refuse to unsign an enforced config");
+        assert!(
+            err.to_string().contains("refusing to rewrite"),
+            "unexpected error: {err}"
+        );
+        assert_eq!(
+            fs::read_to_string(&path).expect("read back"),
+            signed,
+            "the refused write must leave the signed bytes untouched"
+        );
+
+        // With enforcement off the phase-1 grace window still applies: strip and
+        // warn, so an operator mid-rollout is not blocked.
+        config.global.require_signed_config = false;
+        fs::write(&path, crate::signed_config::sign_config(
+            "[global]\n",
+            &kp.public_key,
+            &kp.private_key,
+            kp.algo,
+            1_700_000_000,
+        ).expect("sign")).expect("reseed");
+        save_config(&path, &config).expect("unenforced save still works");
+        assert!(!crate::signed_config::has_signature_header(
+            &fs::read_to_string(&path).expect("read back")
+        ));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Audit V-03: `config sign` must not sign with the key stored in the file
+    /// it is signing. The CLI enforces it; this pins the property the CLI check
+    /// relies on — a signer key is a distinct keypair, not a view of the
+    /// identity.
+    #[test]
+    fn a_minted_signer_key_is_not_the_node_identity() {
+        let a = crate::signed_config::generate_signer_key(crate::SignatureAlgorithm::Ed25519);
+        let b = crate::signed_config::generate_signer_key(crate::SignatureAlgorithm::Ed25519);
+        assert_ne!(a.public_key, b.public_key);
+        assert!(!a.public_key.is_empty() && !a.private_key.is_empty());
+        assert!(
+            crate::signed_config::render_signer_key(&a)
+                .expect("render")
+                .contains(TRUSTED_CONFIG_ISSUER_PUBKEY_ENV),
+            "the file must tell the operator what to pin"
+        );
     }
 }
 
@@ -777,11 +973,13 @@ mod tests {
         let path = Path::new("/tmp/f3-config.toml");
         // No external enforcement → loads (phase-1 grace).
         assert!(
-            load_config_str_with_policy(raw, path, false).is_ok(),
+            load_config_str_with_policy(raw, path, false, None).is_ok(),
             "unsigned config must load when neither in-body flag nor env demands signing"
         );
         // External enforcement ON → refused despite the absent in-body flag.
-        let err = load_config_str_with_policy(raw, path, true)
+        // Pinned, so the refusal is about the missing signature and not about
+        // the missing pin (V-04 covers that case separately).
+        let err = load_config_str_with_policy(raw, path, true, Some("PINNED-PK"))
             .expect_err("external require-signed must refuse an unsigned config");
         let msg = format!("{err}");
         assert!(
@@ -796,7 +994,7 @@ mod tests {
         let raw = "[global]\nruntime_flavor = \"multi_thread\"\nrequire_signed_config = true\n";
         let path = Path::new("/tmp/f3-config2.toml");
         assert!(
-            load_config_str_with_policy(raw, path, false).is_err(),
+            load_config_str_with_policy(raw, path, false, Some("PINNED-PK")).is_err(),
             "in-body require_signed_config=true must still refuse an unsigned config"
         );
     }
@@ -934,10 +1132,11 @@ mod tests {
         let raw = "[global]\nrequire_signed_config = true\n";
         fs::write(&path, raw).expect("seed config");
 
-        let err = load_config(&path).expect_err("must refuse unsigned config");
+        let err = load_config_with_policy(&path, Some("PINNED-PK"), false)
+            .expect_err("must refuse unsigned config");
         let msg = format!("{err}");
         assert!(
-            msg.contains("requires a valid signature") || msg.contains("Sign the file"),
+            msg.contains("requires a valid signature") || msg.contains("Re-sign"),
             "error must direct operator to sign + restart; got: {msg}",
         );
 
@@ -946,7 +1145,16 @@ mod tests {
     }
 
     /// Opposite path: a require_signed_config-true config that IS
-    /// properly signed loads cleanly.
+    /// properly signed loads cleanly — **when the issuer is pinned**.
+    ///
+    /// The pin is not decoration. This test used to run unpinned, with a
+    /// comment calling that "the production deployment mode where some
+    /// operators sign but don't pin" — and it passed, because unpinned
+    /// verification accepts any self-consistent envelope. The config it signs
+    /// with is the one below: `[identity].private_key` is IN the file. So the
+    /// old assertion was "a config signed by whoever holds the file is
+    /// accepted", which is what audit V-04 named. Pinning is now required for
+    /// enforcement, and the unpinned case is asserted to fail.
     #[test]
     fn epic11d_require_signed_config_accepts_properly_signed_load() {
         let unique = SystemTime::now()
@@ -974,12 +1182,23 @@ mod tests {
         .expect("sign");
         fs::write(&path, &signed).expect("seed signed config");
 
-        // Note: load_config reads VEIL_CONFIG_TRUSTED_ISSUER_PUBKEY
-        // env-var.  We don't set it here so verification runs unpinned —
-        // matches the production deployment mode where some operators
-        // sign but don't pin.  Verified status is still produced.
-        let loaded = load_config(&path).expect("signed config must load");
+        let loaded = load_config_with_policy(&path, Some(&kp.public_key), false)
+            .expect("a signed config from the pinned issuer must load");
         assert!(loaded.global.require_signed_config);
+
+        // Same bytes, same valid signature, no pin — refused. "Verified"
+        // without a pin only says the envelope is self-consistent.
+        let err = load_config_with_policy(&path, None, false)
+            .expect_err("enforcement without a pinned issuer must fail closed");
+        assert!(
+            err.to_string().contains(TRUSTED_CONFIG_ISSUER_PUBKEY_ENV),
+            "the refusal must name the pin: {err}"
+        );
+
+        // And a DIFFERENT issuer is refused even though its signature is
+        // perfectly valid — the substitution the pin exists to catch.
+        let other = veil_crypto::generate_keypair(crate::SignatureAlgorithm::Ed25519);
+        assert!(load_config_with_policy(&path, Some(&other.public_key), false).is_err());
 
         let _ = fs::remove_file(&path);
         let _ = fs::remove_dir_all(&root);
