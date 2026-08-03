@@ -1603,8 +1603,8 @@ mod tests {
         let token =
             MailboxCapabilityToken::decode(&ad.capability_token).expect("cap_token must decode");
         assert_eq!(
-            token.relay_node_id,
-            Some(rendezvous_node_id),
+            token.binding,
+            veil_mailbox::capability::TokenBinding::Relay(rendezvous_node_id),
             "v2 token must carry the rendezvous_node_id as relay binding"
         );
 

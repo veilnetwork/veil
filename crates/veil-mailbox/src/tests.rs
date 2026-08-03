@@ -438,7 +438,7 @@ fn t1_4_p1_fetch_filters_by_receiver() {
 /// the receiver_id as the PUT target.
 fn mint_test_token(valid_from: u64, valid_until: u64) -> ([u8; 32], Vec<u8>) {
     use crate::capability::{
-        ALGO_ED25519, MailboxCapabilityToken, TOKEN_VERSION, signed_message_for,
+        ALGO_ED25519, MailboxCapabilityToken, TOKEN_VERSION, TokenBinding, signed_message_for,
     };
     use ed25519_dalek::{Signer, SigningKey};
     let mut seed = [0u8; 32];
@@ -449,11 +449,10 @@ fn mint_test_token(valid_from: u64, valid_until: u64) -> ([u8; 32], Vec<u8>) {
     let msg = signed_message_for(TOKEN_VERSION, ALGO_ED25519, valid_from, valid_until, &pk);
     let sig = sk.sign(&msg).to_bytes().to_vec();
     let token = MailboxCapabilityToken {
-        version: TOKEN_VERSION,
+        binding: TokenBinding::Unbound,
         issuer_algo: ALGO_ED25519,
         valid_from_unix: valid_from,
         valid_until_unix: valid_until,
-        relay_node_id: None,
         issuer_pk: pk,
         sig,
     };
@@ -685,7 +684,7 @@ fn phase650b_316_anon_pool_evicted_before_identified_under_global_pressure() {
     // identified sender; anonymous sender uses no token. Hit the global
     // cap; next put must displace the anon-pool entry first.
     use crate::capability::{
-        ALGO_ED25519, MailboxCapabilityToken, TOKEN_VERSION, signed_message_for,
+        ALGO_ED25519, MailboxCapabilityToken, TOKEN_VERSION, TokenBinding, signed_message_for,
     };
     use ed25519_dalek::{Signer, SigningKey};
 
@@ -717,11 +716,10 @@ fn phase650b_316_anon_pool_evicted_before_identified_under_global_pressure() {
     let msg = signed_message_for(TOKEN_VERSION, ALGO_ED25519, valid_from, valid_until, &pk);
     let sig = sk.sign(&msg).to_bytes().to_vec();
     let token = MailboxCapabilityToken {
-        version: TOKEN_VERSION,
+        binding: TokenBinding::Unbound,
         issuer_algo: ALGO_ED25519,
         valid_from_unix: valid_from,
         valid_until_unix: valid_until,
-        relay_node_id: None,
         issuer_pk: pk.clone(),
         sig,
     };
@@ -863,7 +861,7 @@ fn phase650b_316_capability_required_uses_identified_pool() {
     // by exhausting global quota and verifying eviction comes from
     // Identified (anon would be empty in this scenario).
     use crate::capability::{
-        ALGO_ED25519, MailboxCapabilityToken, TOKEN_VERSION, signed_message_for,
+        ALGO_ED25519, MailboxCapabilityToken, TOKEN_VERSION, TokenBinding, signed_message_for,
     };
     use ed25519_dalek::{Signer, SigningKey};
 
@@ -884,11 +882,10 @@ fn phase650b_316_capability_required_uses_identified_pool() {
     let msg = signed_message_for(TOKEN_VERSION, ALGO_ED25519, valid_from, valid_until, &pk);
     let sig = sk.sign(&msg).to_bytes().to_vec();
     let token_bytes = MailboxCapabilityToken {
-        version: TOKEN_VERSION,
+        binding: TokenBinding::Unbound,
         issuer_algo: ALGO_ED25519,
         valid_from_unix: valid_from,
         valid_until_unix: valid_until,
-        relay_node_id: None,
         issuer_pk: pk.clone(),
         sig,
     }
