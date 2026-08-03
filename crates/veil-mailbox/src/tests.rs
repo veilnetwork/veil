@@ -977,3 +977,203 @@ fn a_byte_quota_bounds_the_record_count_not_only_the_payload() {
     );
     assert!(stored > 0, "the cap must still admit SOME records");
 }
+
+// ── Anonymous ingress budget (audit V-04) ───────────────────────────────────
+//
+// An anonymous deposit reaches the relay with `src_node_id == [0u8; 32]` — the
+// transport zeroes it precisely so the relay CANNOT know who sent it — and the
+// relay handed that marker to the per-sender byte quota as if it were a sender.
+// So every anonymous depositor on the network shared one bucket.
+//
+// The helper below floods a receiver anonymously, the way the transport
+// actually presents such deposits, and reports how far it got.
+
+/// Deposit anonymous 64-byte blobs at `recv` until the relay refuses one.
+///
+/// Returns `(stored, refused)`. The iteration count is bounded well below any
+/// cap these tests configure so that a regression which lets anonymous ingress
+/// run away fails FAST instead of running for minutes.
+fn flood_anonymously(mb: &Mailbox, recv: [u8; 32], tag: u8) -> (u64, bool) {
+    let mut stored = 0u64;
+    for i in 0..256u64 {
+        let mut cid = [tag; 32];
+        cid[..8].copy_from_slice(&i.to_be_bytes());
+        // `[0u8; 32]`: not a choice the depositor makes, and not an identity —
+        // it is what an anonymous delivery carries in place of one.
+        match mb
+            .put_classified(recv, cid, [0u8; 32], vec![0u8; 64], TrustClass::Anonymous)
+            .unwrap()
+        {
+            PutOutcome::Stored { .. } => stored += 1,
+            _ => return (stored, true),
+        }
+    }
+    (stored, false)
+}
+
+/// Saturating anonymous ingress must not close the door on an identified sender.
+///
+/// This is the guarantee, stated without reference to how the budget is sized:
+/// whatever anonymous depositors do to a receiver, a sender that identified
+/// itself can still reach that same receiver. Before the fix the two shared the
+/// receiver's whole window, so filling it anonymously — which needs no identity,
+/// no capability token and no invitation — locked the identified sender out.
+#[test]
+fn anon_saturation_does_not_block_an_identified_sender() {
+    // 8 KiB window: big enough to hold many records, small enough that the
+    // flood terminates immediately even when the budget is (wrongly) the
+    // receiver's entire window.
+    const CAP: u64 = 8 * 1024;
+    let cfg = MailboxConfig {
+        quota_per_receiver_bytes: CAP,
+        rate_limit_per_minute: 0,
+        // Deliberately DISABLED. The per-sender quota is what used to bound
+        // anonymous ingress — by accident, through the `[0u8; 32]` marker.
+        // Switching it off leaves the anonymous budget itself as the only
+        // thing that can stop the flood, which is what this test is about.
+        quota_per_sender_bytes: u64::MAX,
+        quota_global_bytes: u64::MAX,
+        ..MailboxConfig::default()
+    };
+    let (mb, _tmp, _clk) = fresh(cfg);
+    let recv = [7u8; 32];
+
+    let (anon_stored, anon_refused) = flood_anonymously(&mb, recv, 0xA0);
+    assert!(anon_stored > 0, "anonymous ingress must admit SOME deposits");
+    assert!(
+        anon_refused,
+        "anonymous ingress ran to the iteration bound without ever being \
+         refused — it has no ceiling of its own"
+    );
+
+    // The point of the whole change: this must still succeed.
+    let out = mb
+        .put_classified(
+            recv,
+            [0xEEu8; 32],
+            [0xABu8; 32],
+            vec![0u8; 64],
+            TrustClass::Identified,
+        )
+        .unwrap();
+    assert!(
+        matches!(out, PutOutcome::Stored { .. }),
+        "an identified sender was turned away by a receiver whose window had \
+         been filled ANONYMOUSLY — the two must not share one budget: got {out:?}"
+    );
+}
+
+/// The anonymous entrance is not one bucket for the whole network.
+///
+/// Anonymous deposits have no sender, so charging them to a per-SENDER quota
+/// charged them all to the same row, and one depositor's traffic — at any
+/// receiver — spent the entire network's anonymous allowance. Anonymous bytes
+/// are now counted per RECEIVER, which is the only axis that exists when there
+/// is no sender to count by, so a flood aimed at one receiver stays there.
+#[test]
+fn anon_flood_at_one_receiver_does_not_close_the_door_at_another() {
+    let cfg = MailboxConfig {
+        quota_per_receiver_bytes: 8 * 1024,
+        rate_limit_per_minute: 0,
+        // Tight: room for about four 64-byte records. This is the bucket the
+        // `[0u8; 32]` marker used to land in, shared by every anonymous
+        // depositor on the network.
+        quota_per_sender_bytes: crate::billable_bytes(64) * 4,
+        quota_global_bytes: u64::MAX,
+        ..MailboxConfig::default()
+    };
+    let (mb, _tmp, _clk) = fresh(cfg);
+    let victim = [1u8; 32];
+    let bystander = [2u8; 32];
+
+    let (stored, refused) = flood_anonymously(&mb, victim, 0xB0);
+    assert!(stored > 0 && refused, "the flood must fill and then be refused");
+
+    // A different receiver's anonymous slice is untouched by that flood.
+    let out = mb
+        .put_classified(
+            bystander,
+            [0xCCu8; 32],
+            [0u8; 32],
+            vec![0u8; 64],
+            TrustClass::Anonymous,
+        )
+        .unwrap();
+    assert!(
+        matches!(out, PutOutcome::Stored { .. }),
+        "an anonymous deposit to an UNRELATED receiver was refused because a \
+         different receiver had been flooded — the anonymous entrance is still \
+         one shared bucket: got {out:?}"
+    );
+    assert_eq!(
+        mb.receiver_anon_bytes(bystander).unwrap(),
+        crate::billable_bytes(64),
+        "the bystander's anonymous slice should hold exactly that one record"
+    );
+}
+
+/// The anonymous budget is a boundary that RELEASES — acking gives it back.
+///
+/// The counter is incremented in one place and decremented in three (ack, TTL
+/// prune, eviction), and a budget that is charged but never refunded is a
+/// slower version of the same denial of service: the anonymous entrance shuts
+/// permanently and the relay never notices, because the blobs it thinks it is
+/// holding are gone. Pinned as behaviour — refused, then ack, then accepted
+/// again — and as the exact-zero counter after everything is drained.
+#[test]
+fn anon_budget_is_refunded_on_ack_and_reopens_the_entrance() {
+    let cfg = MailboxConfig {
+        quota_per_receiver_bytes: 8 * 1024,
+        rate_limit_per_minute: 0,
+        quota_per_sender_bytes: u64::MAX,
+        quota_global_bytes: u64::MAX,
+        ..MailboxConfig::default()
+    };
+    let (mb, _tmp, _clk) = fresh(cfg);
+    let recv = [3u8; 32];
+
+    let (stored, refused) = flood_anonymously(&mb, recv, 0xD0);
+    assert!(stored > 0 && refused, "the flood must fill and then be refused");
+    let saturated = mb.receiver_anon_bytes(recv).unwrap();
+    assert!(saturated > 0, "the anonymous slice must be accounted");
+
+    // Confirm the entrance really is shut before acking anything.
+    let mut blocked_cid = [0xD0u8; 32];
+    blocked_cid[..8].copy_from_slice(&999u64.to_be_bytes());
+    let out = mb
+        .put_classified(recv, blocked_cid, [0u8; 32], vec![0u8; 64], TrustClass::Anonymous)
+        .unwrap();
+    assert!(
+        !matches!(out, PutOutcome::Stored { .. }),
+        "the anonymous slice was supposed to be full: got {out:?}"
+    );
+
+    // Take one blob off the receiver's hands; the room must come back.
+    let mut first_cid = [0xD0u8; 32];
+    first_cid[..8].copy_from_slice(&0u64.to_be_bytes());
+    assert!(mb.ack(recv, first_cid).unwrap(), "the first blob must exist");
+    assert_eq!(
+        mb.receiver_anon_bytes(recv).unwrap(),
+        saturated - crate::billable_bytes(64),
+        "ack must refund exactly what the put charged"
+    );
+    let out = mb
+        .put_classified(recv, blocked_cid, [0u8; 32], vec![0u8; 64], TrustClass::Anonymous)
+        .unwrap();
+    assert!(
+        matches!(out, PutOutcome::Stored { .. }),
+        "acking a blob did not reopen the anonymous entrance: got {out:?}"
+    );
+
+    // Drain everything: the slice must return to EXACTLY zero. A budget that
+    // settles at a nonzero floor loses a little capacity on every cycle.
+    for blob in mb.fetch(recv).unwrap() {
+        assert!(mb.ack(recv, blob.content_id).unwrap());
+    }
+    assert_eq!(
+        mb.receiver_anon_bytes(recv).unwrap(),
+        0,
+        "the anonymous slice must be empty once every blob has been acked"
+    );
+    assert_eq!(mb.receiver_bytes(recv).unwrap(), 0);
+}
