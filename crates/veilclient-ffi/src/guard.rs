@@ -126,6 +126,19 @@
 //!    flips).
 //! 3. A category-2 fn signature changes to add an err_out parameter
 //!    (then prelude makes sense).
+//! 4. A fn in **ANY** category — not just category 4 — gains a
+//!    `block_on`, a `blocking_lock`, or a `JoinHandle::await` on the
+//!    handle's own runtime. This is the criterion whose absence let
+//!    `veil_app_close` drift: it is filed under category 1
+//!    (destructors, no `err_out`), and category 1 says nothing about
+//!    blocking, so nobody re-read the row when the fn acquired a
+//!    `runtime.block_on` — a reentrant caller would have deadlocked
+//!    the worker with no diagnostic (audit V-02). A category-1 fn has
+//!    no `err_out` to report `VEIL_ERR_REENTRANT` through, so the
+//!    remedy is not the prelude but an explicit
+//!    [`crate::in_tokio_runtime`] branch that DEFERS the blocking work
+//!    onto the runtime; `veil_close` / `veil_app_close` are the
+//!    reference applications.
 
 use std::ffi::c_char;
 use std::os::raw::c_int;
