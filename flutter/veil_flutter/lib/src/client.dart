@@ -2306,13 +2306,19 @@ class VeilClient implements Finalizable {
   /// Close the connection.  Aborts any active event subscription and
   /// releases the C handle.  Safe to call multiple times.
   ///
-  /// Order matters: the native handle is closed FIRST so the daemon-
-  /// side event task is signalled to stop emitting callbacks before
-  /// the `NativeCallable` trampoline is deallocated.  Otherwise a
-  /// late-firing trampoline call lands in freed memory (use-after-free,
-  /// audit-flagged race).  Two microtask yields give any in-flight
-  /// Rust-side trampoline call a chance to post its message before
-  /// the listener is torn down.
+  /// Order matters: the native handle is closed FIRST, and `veil_close` does
+  /// not return until the native event task has actually stopped — it retires
+  /// the callback slot, aborts the task and then JOINS it (audit V-01).  So by
+  /// the time this line completes the trampoline is provably unreachable and
+  /// deallocating it is safe.
+  ///
+  /// This used to be followed by two `await Future.delayed(Duration.zero)`
+  /// yields, on the theory that giving the isolate a couple of turns let any
+  /// in-flight Rust-side call land first.  That was a timing guess, not a
+  /// guarantee — nothing bounded how long a native dispatch already past the
+  /// callback-pointer read would take, and the docstring said as much by
+  /// calling the situation an audit-flagged race.  With the native side
+  /// synchronising properly the yields prove nothing, so they are gone.
   Future<void> close() async {
     if (_closed) return;
     _closed = true;
@@ -2322,8 +2328,6 @@ class VeilClient implements Finalizable {
     _eventController = null;
     _veilClientFinalizer.detach(this);
     ffi.veilClose(_handle);
-    await Future<void>.delayed(Duration.zero);
-    await Future<void>.delayed(Duration.zero);
     if (ec != null) ec.close();
     if (ctl != null) await ctl.close();
   }
@@ -2746,10 +2750,12 @@ class AppHandle implements Finalizable {
   /// Close the endpoint.  Aborts any active recv loop and releases the
   /// C-side AppHandle.  Safe to call multiple times.
   ///
-  /// Same close-ordering as `VeilClient.close` — native handle
-  /// first, then `NativeCallable` trampoline — to avoid the
-  /// audit-flagged use-after-free race when the Rust runtime fires
-  /// one more recv callback between abort-signal and trampoline drop.
+  /// Same close-ordering as `VeilClient.close` — native handle first, then
+  /// `NativeCallable` trampoline.  `veil_app_close` retires the recv-callback
+  /// slot, aborts the recv task and joins it before returning, so the
+  /// trampoline is unreachable by the time it is dropped; the two microtask
+  /// yields that used to stand in for that synchronisation are gone (audit
+  /// V-01, see `VeilClient.close`).
   Future<void> close() async {
     if (_closed) return;
     _closed = true;
@@ -2759,8 +2765,6 @@ class AppHandle implements Finalizable {
     _msgController = null;
     _appHandleFinalizer.detach(this);
     ffi.veilAppClose(_app);
-    await Future<void>.delayed(Duration.zero);
-    await Future<void>.delayed(Duration.zero);
     if (cb != null) cb.close();
     if (ctl != null) await ctl.close();
   }
