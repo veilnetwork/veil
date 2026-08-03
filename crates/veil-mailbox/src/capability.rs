@@ -152,23 +152,59 @@ const FIXED_HEADER_SIZE_V2: usize = FIXED_HEADER_SIZE + 32;
 /// rejection (NTP drift in low-end mobile clients).
 pub const SKEW_SECS: u64 = 60;
 
+/// Where a token may be presented — the wire version and the relay it names
+/// are ONE fact, so they are one field.
+///
+/// Previously the token carried `version: u8` and
+/// `relay_node_id: Option<[u8; 32]>` independently, which made
+/// `(version: 1, relay_node_id: Some(_))` expressible. Nothing rejected it:
+/// `encode` skipped the relay bytes (they are written only for v2) and
+/// `signed_message` skipped them too, so the token round-tripped as a
+/// perfectly valid v1 — a token whose author meant to bind it to one replica
+/// silently VERIFYING everywhere. A silent downgrade, where a refusal was
+/// wanted. Folding the two fields together makes the state unrepresentable
+/// rather than merely unreachable-if-you-only-use-the-constructors.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TokenBinding {
+    /// v1: valid at ANY replica of the receiver. A malicious relay observing a
+    /// v1 PUT can replay the token to the receiver's other replicas.
+    Unbound,
+    /// v2: valid ONLY at this relay `node_id`, which is covered by the
+    /// signature. Closes the cross-replica replay vector.
+    Relay([u8; 32]),
+}
+
+impl TokenBinding {
+    /// The wire version byte this binding is encoded as.
+    pub fn version(&self) -> u8 {
+        match self {
+            Self::Unbound => TOKEN_VERSION,
+            Self::Relay(_) => TOKEN_VERSION_V2,
+        }
+    }
+
+    /// The bound relay's `node_id`, or `None` for an unbound (v1) token.
+    pub fn relay_node_id(&self) -> Option<&[u8; 32]> {
+        match self {
+            Self::Unbound => None,
+            Self::Relay(id) => Some(id),
+        }
+    }
+}
+
 /// Decoded capability token.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MailboxCapabilityToken {
-    /// Either [`TOKEN_VERSION`] (v1, unbound) or [`TOKEN_VERSION_V2`]
-    /// (v2, relay-bound).
-    pub version: u8,
+    /// Unbound (v1) or bound to one relay (v2). Determines both the wire
+    /// version byte and the signing context — see [`TokenBinding`] for why
+    /// these are not two fields.
+    pub binding: TokenBinding,
     /// One [`ALGO_ED25519`] / [`ALGO_FALCON512`].
     pub issuer_algo: u8,
     /// Unix-seconds; relay rejects tokens with `now + SKEW_SECS < valid_from`.
     pub valid_from_unix: u64,
     /// Unix-seconds; relay rejects tokens with `now > valid_until + SKEW_SECS`.
     pub valid_until_unix: u64,
-    /// **v2 only**: the receiver-chosen relay node_id this token is valid
-    /// at. `None` for v1 (unbound) tokens; `Some(...)` for v2 (relay-bound).
-    /// Verifier rejects v2 tokens whose `relay_node_id` doesn't match the
-    /// local relay's own node_id — closes the cross-replica replay vector.
-    pub relay_node_id: Option<[u8; 32]>,
     /// Raw issuer public key bytes. Length depends on `issuer_algo`.
     pub issuer_pk: Vec<u8>,
     /// Detached signature over [`signed_message_for`] using `issuer_pk`.
@@ -272,16 +308,27 @@ pub enum CapTokenError {
 }
 
 impl MailboxCapabilityToken {
+    /// The wire version byte: [`TOKEN_VERSION`] (v1, unbound) or
+    /// [`TOKEN_VERSION_V2`] (v2, relay-bound). Derived from [`Self::binding`],
+    /// so it can never disagree with the relay field.
+    pub fn version(&self) -> u8 {
+        self.binding.version()
+    }
+
+    /// The relay `node_id` this token is bound to, or `None` for v1.
+    pub fn relay_node_id(&self) -> Option<&[u8; 32]> {
+        self.binding.relay_node_id()
+    }
+
     /// Build the canonical signed-message bytes. The signer signs these
     /// the verifier reconstructs the same bytes from the decoded token
     /// fields and checks the signature against `issuer_pk`.
     pub fn signed_message(&self) -> Vec<u8> {
         signed_message_for_versioned(
-            self.version,
+            self.binding,
             self.issuer_algo,
             self.valid_from_unix,
             self.valid_until_unix,
-            self.relay_node_id.as_ref(),
             &self.issuer_pk,
         )
     }
@@ -292,21 +339,18 @@ impl MailboxCapabilityToken {
     pub fn encode(&self) -> Vec<u8> {
         let pk_len = self.issuer_pk.len();
         let sig_len = self.sig.len();
-        let header_size = match self.version {
-            TOKEN_VERSION_V2 => FIXED_HEADER_SIZE_V2,
-            _ => FIXED_HEADER_SIZE,
+        let header_size = match self.binding {
+            TokenBinding::Relay(_) => FIXED_HEADER_SIZE_V2,
+            TokenBinding::Unbound => FIXED_HEADER_SIZE,
         };
         let mut buf = Vec::with_capacity(header_size + pk_len + 2 + sig_len);
-        buf.push(self.version);
+        buf.push(self.version());
         buf.push(self.issuer_algo);
         buf.extend_from_slice(&self.valid_from_unix.to_be_bytes());
         buf.extend_from_slice(&self.valid_until_unix.to_be_bytes());
-        // v2 only: relay_node_id slot.  If version==2 the field MUST be
-        // Some — encode without value would corrupt downstream sig offset
-        // verification.  v1 skips this entirely.
-        if self.version == TOKEN_VERSION_V2
-            && let Some(relay_id) = &self.relay_node_id
-        {
+        // The relay slot exists iff the binding names a relay, and the version
+        // byte above came from the same value — the two can no longer disagree.
+        if let TokenBinding::Relay(relay_id) = &self.binding {
             buf.extend_from_slice(relay_id);
         }
         buf.extend_from_slice(&(pk_len as u16).to_be_bytes());
@@ -333,8 +377,8 @@ impl MailboxCapabilityToken {
             });
         }
         let version = buf[0];
-        let (header_size, relay_node_id) = match version {
-            TOKEN_VERSION => (FIXED_HEADER_SIZE, None),
+        let (header_size, binding) = match version {
+            TOKEN_VERSION => (FIXED_HEADER_SIZE, TokenBinding::Unbound),
             TOKEN_VERSION_V2 => {
                 if buf.len() < FIXED_HEADER_SIZE_V2 {
                     return Err(CapTokenError::TooShort {
@@ -344,7 +388,7 @@ impl MailboxCapabilityToken {
                 }
                 let mut id = [0u8; 32];
                 id.copy_from_slice(&buf[18..50]);
-                (FIXED_HEADER_SIZE_V2, Some(id))
+                (FIXED_HEADER_SIZE_V2, TokenBinding::Relay(id))
             }
             _ => return Err(CapTokenError::BadVersion { version }),
         };
@@ -403,13 +447,23 @@ impl MailboxCapabilityToken {
                 got: buf.len(),
             });
         }
+        // Exact length, not "at least". Every field is length-prefixed, so a
+        // well-formed token ends precisely at `sig_end`; anything past it was
+        // silently ignored, which made the wire form non-canonical — the same
+        // authorisation could be presented under unboundedly many distinct byte
+        // strings, each one a fresh miss in any dedup or audit keyed on the
+        // token bytes.
+        if buf.len() != sig_end {
+            return Err(CapTokenError::Malformed {
+                reason: "trailing bytes after signature",
+            });
+        }
         let sig = buf[pk_end + 2..sig_end].to_vec();
         Ok(Self {
-            version,
+            binding,
             issuer_algo,
             valid_from_unix,
             valid_until_unix,
-            relay_node_id,
             issuer_pk,
             sig,
         })
@@ -454,16 +508,15 @@ impl MailboxCapabilityToken {
         // be told its own node_id and that id MUST match. Closes the
         // malicious-relay-replay vector where R captures a valid token
         // observed during legitimate deposit and replays it to other replicas.
-        match (self.relay_node_id.as_ref(), expected_relay_id) {
-            (Some(token_relay), Some(local_relay)) if token_relay != local_relay => {
+        match (self.binding, expected_relay_id) {
+            (TokenBinding::Relay(token_relay), Some(local_relay)) if &token_relay != local_relay => {
                 return Err(CapTokenError::RelayMismatch {
-                    token_hex: hex_short(token_relay),
+                    token_hex: hex_short(&token_relay),
                     expected_hex: hex_short(local_relay),
                 });
             }
-            (Some(_), None) => return Err(CapTokenError::RelayBindingRequired),
-            // (Some, Some) matching, or (None, _) — accept (v1 unbound or
-            // v2 bound with matching local id).
+            (TokenBinding::Relay(_), None) => return Err(CapTokenError::RelayBindingRequired),
+            // Bound-and-matching, or unbound (v1) — accept.
             _ => {}
         }
         // Signature verify.
@@ -575,11 +628,10 @@ pub fn sign_token(
     );
     let sig = sign_fn(&msg);
     let token = MailboxCapabilityToken {
-        version: TOKEN_VERSION,
+        binding: TokenBinding::Unbound,
         issuer_algo,
         valid_from_unix,
         valid_until_unix,
-        relay_node_id: None,
         issuer_pk: issuer_pk.to_vec(),
         sig,
     };
@@ -622,21 +674,20 @@ pub fn sign_token_v2(
             reason: "valid_from_unix > valid_until_unix",
         });
     }
+    let binding = TokenBinding::Relay(relay_node_id);
     let msg = signed_message_for_versioned(
-        TOKEN_VERSION_V2,
+        binding,
         issuer_algo,
         valid_from_unix,
         valid_until_unix,
-        Some(&relay_node_id),
         issuer_pk,
     );
     let sig = sign_fn(&msg);
     let token = MailboxCapabilityToken {
-        version: TOKEN_VERSION_V2,
+        binding,
         issuer_algo,
         valid_from_unix,
         valid_until_unix,
-        relay_node_id: Some(relay_node_id),
         issuer_pk: issuer_pk.to_vec(),
         sig,
     };
@@ -650,31 +701,31 @@ pub fn sign_token_v2(
     Ok(bytes)
 }
 
-/// Build canonical signed-message bytes, version-aware. Picks
-/// [`SIGN_CONTEXT_V2`] for v2 tokens (different domain so v1↔v2 byte
+/// Build canonical signed-message bytes for a [`TokenBinding`]. Picks
+/// [`SIGN_CONTEXT_V2`] for bound tokens (different domain so v1↔v2 byte
 /// overlap can't enable cross-version replay), else [`SIGN_CONTEXT`].
+///
+/// Taking the binding rather than a `(version, Option<relay>)` pair is what
+/// makes "v1 that names a relay" — a token that signs as unbound and so
+/// verifies at every replica — impossible to ask for.
 pub fn signed_message_for_versioned(
-    version: u8,
+    binding: TokenBinding,
     issuer_algo: u8,
     valid_from_unix: u64,
     valid_until_unix: u64,
-    relay_node_id: Option<&[u8; 32]>,
     issuer_pk: &[u8],
 ) -> Vec<u8> {
-    let context: &[u8] = if version == TOKEN_VERSION_V2 {
-        SIGN_CONTEXT_V2
-    } else {
-        SIGN_CONTEXT
+    let context: &[u8] = match binding {
+        TokenBinding::Relay(_) => SIGN_CONTEXT_V2,
+        TokenBinding::Unbound => SIGN_CONTEXT,
     };
     let mut msg = Vec::with_capacity(context.len() + 64 + issuer_pk.len());
     msg.extend_from_slice(context);
-    msg.push(version);
+    msg.push(binding.version());
     msg.push(issuer_algo);
     msg.extend_from_slice(&valid_from_unix.to_be_bytes());
     msg.extend_from_slice(&valid_until_unix.to_be_bytes());
-    if version == TOKEN_VERSION_V2
-        && let Some(rid) = relay_node_id
-    {
+    if let TokenBinding::Relay(rid) = &binding {
         msg.extend_from_slice(rid);
     }
     msg.extend_from_slice(issuer_pk);
@@ -748,11 +799,10 @@ mod tests {
         );
         let sig = sk.sign(&msg).to_bytes().to_vec();
         let token = MailboxCapabilityToken {
-            version: TOKEN_VERSION,
+            binding: TokenBinding::Unbound,
             issuer_algo: ALGO_ED25519,
             valid_from_unix,
             valid_until_unix,
-            relay_node_id: None,
             issuer_pk: pk.clone(),
             sig,
         };
@@ -776,11 +826,10 @@ mod tests {
         // Force-pad/truncate the SK on stack as in identity::signing_key.
         let _: &[u8] = sk.as_bytes();
         let token = MailboxCapabilityToken {
-            version: TOKEN_VERSION,
+            binding: TokenBinding::Unbound,
             issuer_algo: ALGO_FALCON512,
             valid_from_unix,
             valid_until_unix,
-            relay_node_id: None,
             issuer_pk: pk_bytes.clone(),
             sig: <falcon512::DetachedSignature as pqcrypto_traits::sign::DetachedSignature>::as_bytes(&sig).to_vec(),
         };
@@ -1041,8 +1090,8 @@ mod tests {
         let bytes = MailboxCapabilityToken::mint_unbound_ed25519(&sk, 1000, 2000)
             .expect("mint_unbound_ed25519");
         let decoded = MailboxCapabilityToken::decode(&bytes).expect("decode");
-        assert_eq!(decoded.version, TOKEN_VERSION);
-        assert!(decoded.relay_node_id.is_none());
+        assert_eq!(decoded.version(), TOKEN_VERSION);
+        assert!(decoded.relay_node_id().is_none());
         let rid = receiver_id_of(&decoded.issuer_pk);
         decoded
             .verify(&rid, None, 1500)
@@ -1059,8 +1108,8 @@ mod tests {
         let bytes = MailboxCapabilityToken::mint_bound_ed25519(&sk, relay, 1000, 2000)
             .expect("mint_bound_ed25519");
         let decoded = MailboxCapabilityToken::decode(&bytes).expect("decode");
-        assert_eq!(decoded.version, TOKEN_VERSION_V2);
-        assert_eq!(decoded.relay_node_id, Some(relay));
+        assert_eq!(decoded.version(), TOKEN_VERSION_V2);
+        assert_eq!(decoded.relay_node_id(), Some(&relay));
         let rid = receiver_id_of(&decoded.issuer_pk);
         decoded
             .verify(&rid, Some(&relay), 1500)
@@ -1100,11 +1149,10 @@ mod tests {
         let relay = [0xEEu8; 32];
         let v1 = signed_message_for(TOKEN_VERSION, ALGO_ED25519, 1000, 2000, &pk);
         let v2 = signed_message_for_versioned(
-            TOKEN_VERSION_V2,
+            TokenBinding::Relay(relay),
             ALGO_ED25519,
             1000,
             2000,
-            Some(&relay),
             &pk,
         );
         assert_ne!(v1, v2);
@@ -1147,9 +1195,81 @@ mod tests {
         let rid = receiver_id_of(&decoded.issuer_pk);
         // The decoded relay_id has the flipped byte; verify w/ that exact id
         // passes the equality check but fails signature verify.
-        let local = decoded.relay_node_id.unwrap();
+        let local = *decoded.relay_node_id().unwrap();
         let err = decoded.verify(&rid, Some(&local), 1500).unwrap_err();
         assert_eq!(err, CapTokenError::BadSignature);
+    }
+
+    /// Audit V-06: `(version: 1, relay_node_id: Some(_))` used to be a
+    /// constructible state that produced a token verifying at EVERY replica —
+    /// a silent downgrade of the relay binding the author asked for, where a
+    /// refusal was wanted. There is no test that "rejects" it now, because
+    /// there is nothing to reject: `TokenBinding` makes it unrepresentable,
+    /// and this pins the pairing so a refactor cannot split the fields apart
+    /// again without failing here.
+    #[test]
+    fn binding_and_wire_version_cannot_disagree() {
+        assert_eq!(TokenBinding::Unbound.version(), TOKEN_VERSION);
+        assert_eq!(TokenBinding::Unbound.relay_node_id(), None);
+        let relay = [0x3Cu8; 32];
+        assert_eq!(TokenBinding::Relay(relay).version(), TOKEN_VERSION_V2);
+        assert_eq!(TokenBinding::Relay(relay).relay_node_id(), Some(&relay));
+
+        // A named relay is on the wire, in the signed bytes, and survives the
+        // round trip — the three places the old split could disagree.
+        let sk = signing_key(0x3C);
+        let bytes = MailboxCapabilityToken::mint_bound_ed25519(&sk, relay, 1000, 2000).unwrap();
+        let decoded = MailboxCapabilityToken::decode(&bytes).expect("decode");
+        assert_eq!(decoded.binding, TokenBinding::Relay(relay));
+        assert!(
+            decoded.signed_message().windows(32).any(|w| w == relay),
+            "a bound token must cover its relay id in the signed bytes"
+        );
+        let rid = receiver_id_of(&decoded.issuer_pk);
+        // Presented at the named relay: accepted. At another: refused, not
+        // silently downgraded to "valid anywhere".
+        decoded.verify(&rid, Some(&relay), 1500).expect("bound relay");
+        assert!(matches!(
+            decoded.verify(&rid, Some(&[0x99u8; 32]), 1500),
+            Err(CapTokenError::RelayMismatch { .. })
+        ));
+        assert_eq!(
+            decoded.verify(&rid, None, 1500),
+            Err(CapTokenError::RelayBindingRequired)
+        );
+    }
+
+    /// Decode must consume the buffer EXACTLY. Every field is
+    /// length-prefixed, so a well-formed token ends at the signature; bytes
+    /// past it were silently ignored, which made the wire form non-canonical
+    /// — one authorisation, unboundedly many byte strings, each a fresh miss
+    /// for anything keyed on the token bytes.
+    #[test]
+    fn decode_rejects_trailing_bytes_after_the_signature() {
+        let sk = signing_key(0x4D);
+        let bytes = MailboxCapabilityToken::mint_unbound_ed25519(&sk, 1000, 2000).unwrap();
+        // Control: the exact-length token still decodes and verifies.
+        let decoded = MailboxCapabilityToken::decode(&bytes).expect("exact length decodes");
+        let rid = receiver_id_of(&decoded.issuer_pk);
+        decoded.verify(&rid, None, 1500).expect("control must verify");
+
+        for extra in [1usize, 7, 64] {
+            let mut padded = bytes.clone();
+            padded.extend(std::iter::repeat_n(0u8, extra));
+            assert_eq!(
+                MailboxCapabilityToken::decode(&padded),
+                Err(CapTokenError::Malformed {
+                    reason: "trailing bytes after signature",
+                }),
+                "{extra} trailing byte(s) must be refused, not ignored"
+            );
+        }
+        // Still short-circuits as TooShort when bytes are MISSING, so the new
+        // check did not swallow the truncation diagnostic.
+        assert!(matches!(
+            MailboxCapabilityToken::decode(&bytes[..bytes.len() - 1]),
+            Err(CapTokenError::TooShort { .. })
+        ));
     }
 
     #[test]
@@ -1163,11 +1283,10 @@ mod tests {
         let wrong_msg = signed_message_for(TOKEN_VERSION, ALGO_ED25519, 1000, 2000, &pk);
         let sig = sk.sign(&wrong_msg).to_bytes().to_vec();
         let forged = MailboxCapabilityToken {
-            version: TOKEN_VERSION_V2,
+            binding: TokenBinding::Relay(relay),
             issuer_algo: ALGO_ED25519,
             valid_from_unix: 1000,
             valid_until_unix: 2000,
-            relay_node_id: Some(relay),
             issuer_pk: pk.clone(),
             sig,
         };

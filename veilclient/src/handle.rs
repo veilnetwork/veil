@@ -101,10 +101,25 @@ impl AppHandle {
     /// fixed `DELIVERY_CHANNEL_CAP` and disconnects clients that
     /// fail to drain).
     ///
-    /// Returns `(AppSender, AppReceiver)`.  Both halves remain
-    /// associated with the original endpoint binding; dropping either
-    /// does NOT unbind (the binding lives until BOTH halves are
-    /// dropped, plus any unbind frame the daemon expects).
+    /// Returns `(AppSender, AppReceiver)`.  The unbind lease goes with the
+    /// SENDER, and only the sender:
+    ///
+    /// * Dropping (or [closing](AppSender::close)) the **sender** releases the
+    ///   binding — the endpoint leaves the local dispatch table and an
+    ///   APP_UNBIND goes to the daemon — **even while the receiver is still
+    ///   alive**. That receiver then simply stops being fed.
+    /// * Dropping the **receiver** does nothing to the binding at all;
+    ///   `AppReceiver` has no `Drop`. The endpoint stays bound and inbound
+    ///   frames are dropped by the dispatcher for want of a queue.
+    ///
+    /// This doc used to say the binding lived until BOTH halves were dropped.
+    /// It never did, and no caller depended on the difference: all seven
+    /// production split sites hold the sender for at least as long as the
+    /// receiver. Documented as it behaves rather than made to match, because
+    /// the alternative (a shared lease released when the last half drops)
+    /// would make the moment of unbinding depend on which task happened to
+    /// finish last — nondeterministic teardown to fix a defect with zero
+    /// callers.
     ///
     /// Audit batch 2026-05-25 phase M (cross-audit closure):
     /// `AppReceiver` carries both the datagram `rx` AND the inbound-
@@ -1114,6 +1129,90 @@ mod tests {
         );
         let frame = rx.try_recv().expect("APP_UNBIND frame must be queued");
         assert!(!frame.is_empty());
+    }
+
+    /// Build a bound `AppHandle` over a live dispatch table, ready to split.
+    async fn bound_handle_async() -> (Arc<Mutex<DispatchTable>>, AppHandle, mpsc::Receiver<Vec<u8>>)
+    {
+        let (tx, rx) = mpsc::channel::<Vec<u8>>(8);
+        let dispatch = Arc::new(Mutex::new(DispatchTable::new()));
+        let (mtx, mrx) = mpsc::channel::<IncomingMessage>(1);
+        let (stx, srx) = mpsc::channel::<IncomingStream>(1);
+        {
+            let mut d = dispatch.lock().await;
+            d.endpoints.insert(9, mtx);
+            d.inbound_streams.insert(9, stx);
+        }
+        let handle = AppHandle::new(
+            [7u8; 32],
+            9,
+            SharedWriter::new(tx),
+            Arc::clone(&dispatch),
+            mrx,
+            srx,
+        );
+        (dispatch, handle, rx)
+    }
+
+    /// `into_split`'s doc claimed the binding lived until BOTH halves were
+    /// dropped. The unbind lease belongs to the SENDER alone: dropping it
+    /// releases the endpoint even while the receiver is alive. Pins the real
+    /// behaviour so the doc and the code cannot drift apart again.
+    #[tokio::test]
+    async fn dropping_the_sender_unbinds_while_the_receiver_is_still_alive() {
+        let (dispatch, handle, mut wire) = bound_handle_async().await;
+        let (sender, receiver) = handle.into_split();
+
+        drop(sender);
+        // `AppSender::drop` does its cleanup on a spawned task.
+        let mut released = false;
+        for _ in 0..1000 {
+            if !dispatch.lock().await.endpoints.contains_key(&9) {
+                released = true;
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            released,
+            "dropping the sender must release the endpoint even though the \
+             receiver half is still held"
+        );
+        assert!(
+            wire.try_recv().is_ok(),
+            "an APP_UNBIND must have been queued for the daemon"
+        );
+        // Held across the assertions on purpose: the receiver's liveness is
+        // exactly what the old doc claimed would keep the binding.
+        drop(receiver);
+    }
+
+    /// The other half of the same correction: `AppReceiver` has no `Drop`, so
+    /// dropping it alone changes nothing about the binding.
+    #[tokio::test]
+    async fn dropping_the_receiver_alone_leaves_the_binding_untouched() {
+        let (dispatch, handle, mut wire) = bound_handle_async().await;
+        let (sender, receiver) = handle.into_split();
+
+        drop(receiver);
+        for _ in 0..100 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            dispatch.lock().await.endpoints.contains_key(&9),
+            "dropping the receiver must NOT unbind"
+        );
+        assert!(
+            wire.try_recv().is_err(),
+            "dropping the receiver must not emit an APP_UNBIND"
+        );
+        // And the sender still works against the live binding.
+        sender
+            .send([1u8; 32], [2u8; 32], 3, b"still bound")
+            .await
+            .expect("send on a still-bound endpoint");
+        assert!(wire.try_recv().is_ok(), "the datagram reached the writer");
+        drop(sender);
     }
 
     /// The endpoint must leave the local dispatch table on close even when the
