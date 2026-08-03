@@ -1,6 +1,7 @@
 //! Per-endpoint application handle.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use veilcore::proto::{AppIpcRtSendPayload, AppUnbindPayload, LocalAppMsg, StreamOpenPayload};
 
@@ -573,27 +574,57 @@ impl Drop for AppSender {
     }
 }
 
+/// Upper bound on how long [`AppSender::close`] may spend releasing an
+/// endpoint.
+///
+/// `close` is on a UI-blocking path: `veil_app_close` calls it under
+/// `runtime.block_on` from the host's FFI thread (Dart's isolate thread), and
+/// the `NativeFinalizer` reaches it during GC. Both the dispatch-table lock
+/// and the writer's bounded frame channel can stall unboundedly — a wedged
+/// daemon that stops draining the socket backs the channel up and
+/// `write_frame` parks forever — so an untimed close freezes the app in a
+/// completely routine failure mode.
+///
+/// Degrading to best-effort is safe: an un-sent APP_UNBIND leaves the binding
+/// registered until the daemon's keepalive reaps it, which is exactly the
+/// fallback [`AppHandle::drop`] already relies on when there is no runtime to
+/// spawn on. Two seconds is far above any healthy close (a channel `send` that
+/// isn't backed up completes in microseconds) and far below a human noticing a
+/// hang.
+pub const APP_UNBIND_DEADLINE: Duration = Duration::from_secs(2);
+
 impl AppSender {
     /// Reliably release this endpoint and its local dispatch slots.
     ///
     /// Unlike Drop, this works when the caller originated outside Tokio (the
     /// FFI close path): the caller enters a runtime and awaits the APP_UNBIND
     /// write instead of relying on a spawned best-effort cleanup task.
+    ///
+    /// Bounded by [`APP_UNBIND_DEADLINE`] — see there for why a close that
+    /// cannot complete must degrade rather than block. Both awaited steps are
+    /// cancel-safe: the dispatch mutex is a plain `tokio::sync::Mutex`, and the
+    /// frame write is a single `mpsc::send` of one already-encoded buffer, so a
+    /// cancelled close can never leave a half-written frame on the wire.
     pub async fn close(mut self) {
         self.unbind_on_drop = false;
-        {
-            let mut d = self.dispatch.lock().await;
-            d.endpoints.remove(&self.endpoint_id);
-            d.inbound_streams.remove(&self.endpoint_id);
-        }
         let payload = AppUnbindPayload {
             app_id: self.app_id,
             endpoint_id: self.endpoint_id,
         };
-        let _ = self
-            .writer
-            .write_frame(LocalAppMsg::AppUnbind as u16, &payload.encode())
-            .await;
+        let dispatch = Arc::clone(&self.dispatch);
+        let writer = self.writer.clone();
+        let endpoint_id = self.endpoint_id;
+        let _ = tokio::time::timeout(APP_UNBIND_DEADLINE, async move {
+            {
+                let mut d = dispatch.lock().await;
+                d.endpoints.remove(&endpoint_id);
+                d.inbound_streams.remove(&endpoint_id);
+            }
+            let _ = writer
+                .write_frame(LocalAppMsg::AppUnbind as u16, &payload.encode())
+                .await;
+        })
+        .await;
     }
 
     /// Returns this endpoint's numeric ID.
@@ -1009,5 +1040,99 @@ impl AppReceiver {
         mpsc::Receiver<IncomingStream>,
     ) {
         (self.rx, self.inbound_streams_rx)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::client::{DispatchTable, SharedWriter};
+
+    /// Build an `AppSender` whose IPC frame channel is ALREADY FULL and whose
+    /// receiver is never drained — the shape a wedged daemon presents, and the
+    /// one that made an untimed `close` park forever.
+    fn sender_on_a_wedged_writer() -> (AppSender, mpsc::Receiver<Vec<u8>>) {
+        let (tx, rx) = mpsc::channel::<Vec<u8>>(1);
+        tx.try_send(vec![0u8; 4]).expect("prime the single slot");
+        (
+            AppSender {
+                app_id: [7u8; 32],
+                endpoint_id: 9,
+                writer: SharedWriter::new(tx),
+                dispatch: Arc::new(Mutex::new(DispatchTable::new())),
+                unbind_on_drop: true,
+            },
+            rx,
+        )
+    }
+
+    /// `AppSender::close` is on a UI-blocking path: `veil_app_close` drives it
+    /// under `runtime.block_on` from the host's FFI thread, and the Dart
+    /// `NativeFinalizer` reaches it during GC. It must therefore never
+    /// out-wait its own deadline, no matter what the daemon is doing.
+    ///
+    /// Time is paused, so the deadline elapses instantly in wall-clock; the
+    /// OUTER timeout is the failure detector — without an inner deadline
+    /// `close` never completes and the outer one fires instead of hanging the
+    /// suite.
+    #[tokio::test(start_paused = true)]
+    async fn close_degrades_to_best_effort_on_a_wedged_writer() {
+        let (sender, _rx_never_drained) = sender_on_a_wedged_writer();
+        let started = tokio::time::Instant::now();
+        let outcome = tokio::time::timeout(APP_UNBIND_DEADLINE * 4, sender.close()).await;
+        assert!(
+            outcome.is_ok(),
+            "close outlived 4x its own deadline against a wedged writer — the \
+             host UI thread is blocked on this call"
+        );
+        assert!(
+            started.elapsed() <= APP_UNBIND_DEADLINE * 2,
+            "close should give up at its deadline, took {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// CONTROL for the above: with a writer that CAN accept the frame, close
+    /// completes on its own — so the green result there is the deadline
+    /// firing, not `close` short-circuiting for some unrelated reason. Also
+    /// pins that the unbind is still actually emitted on the healthy path.
+    #[tokio::test(start_paused = true)]
+    async fn close_emits_the_unbind_when_the_writer_is_healthy() {
+        let (tx, mut rx) = mpsc::channel::<Vec<u8>>(4);
+        let sender = AppSender {
+            app_id: [7u8; 32],
+            endpoint_id: 9,
+            writer: SharedWriter::new(tx),
+            dispatch: Arc::new(Mutex::new(DispatchTable::new())),
+            unbind_on_drop: true,
+        };
+        let started = tokio::time::Instant::now();
+        sender.close().await;
+        assert!(
+            started.elapsed() < APP_UNBIND_DEADLINE,
+            "a healthy close must not wait on the deadline at all"
+        );
+        let frame = rx.try_recv().expect("APP_UNBIND frame must be queued");
+        assert!(!frame.is_empty());
+    }
+
+    /// The endpoint must leave the local dispatch table on close even when the
+    /// wire write is the part that gets abandoned — otherwise a rebind of the
+    /// same endpoint_id on this connection would still collide.
+    #[tokio::test(start_paused = true)]
+    async fn close_clears_local_dispatch_even_when_the_write_is_abandoned() {
+        let (sender, _rx_never_drained) = sender_on_a_wedged_writer();
+        let dispatch = Arc::clone(&sender.dispatch);
+        let endpoint_id = sender.endpoint_id;
+        {
+            let (etx, _erx) = mpsc::channel::<IncomingMessage>(1);
+            dispatch.lock().await.endpoints.insert(endpoint_id, etx);
+        }
+        let _ = tokio::time::timeout(APP_UNBIND_DEADLINE * 4, sender.close()).await;
+        assert!(
+            !dispatch.lock().await.endpoints.contains_key(&endpoint_id),
+            "a close that abandoned the wire write still owes the local table \
+             its cleanup"
+        );
     }
 }

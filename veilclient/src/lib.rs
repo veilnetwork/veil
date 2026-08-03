@@ -82,6 +82,10 @@ pub use client::{
     CreateBootstrapInviteReply, JoinBootstrapResult, MailboxBlobInfo, MailboxPutReply,
     MobileStatus, NodeIdentity, OutboxEntryInfo, PairCreateInviteReply, PairFrameReply,
     PairOobReply, PairStatusReply, PeerEntry, RendezvousReplicaInfo, VeilClient,
+    // `VeilClient::events()` hands back a `Receiver<VeilEvent>`, so the item
+    // type belongs on the public surface — it was reachable only by inference
+    // before, which meant no consumer could name it in a signature.
+    VeilEvent,
 };
 pub use error::ClientError;
 #[cfg(unix)]

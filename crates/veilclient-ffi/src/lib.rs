@@ -431,10 +431,20 @@ macro_rules! get_or_return {
 pub struct VeilHandle {
     bundle: Arc<RuntimeBundle>,
     /// `Some` once a push-event handler is installed via
-    /// [`veil_set_event_handler`]. Aborted on
+    /// [`veil_set_event_handler`]. Aborted AND JOINED on
     /// [`veil_close`] or replaced on subsequent
     /// `set_event_handler` calls.
     event_task: StdMutex<Option<tokio::task::JoinHandle<()>>>,
+    /// Swappable push-event callback the event task dispatches to. `None`
+    /// means "no handler currently installed" → events are dropped before a
+    /// callee-owned payload buffer is even allocated.
+    ///
+    /// Audit V-01: retiring this slot is the FIRST thing [`veil_close`] does.
+    /// An event the task has picked up but not yet dispatched then takes the
+    /// `continue` arm instead of calling a trampoline the host is about to
+    /// free — and, because the buffer is handed over as callee-owned, instead
+    /// of leaking that buffer. Mirrors [`VeilApp::recv_cb`].
+    event_cb: Arc<StdMutex<Option<EventCbSlot>>>,
     /// Node-wide anonymous-stream multiplexer, built lazily on the first
     /// `veil_anon_stream_open`/`veil_anon_stream_accept` (binds a dedicated
     /// onion-stream endpoint + spawns the demux).
@@ -2532,6 +2542,73 @@ fn in_tokio_runtime() -> bool {
     tokio::runtime::Handle::try_current().is_ok()
 }
 
+/// Steps 1 + 2a of the callback-quiescence protocol shared by [`veil_close`]
+/// and [`veil_app_close`] (audit V-01), in the one order that is correct:
+///
+/// 1. **Retire the callback slot.** From this instant the dispatch loop can no
+///    longer reach the host: a message it dequeues next reads `None` and takes
+///    its `continue` arm, before any callee-owned buffer is allocated.
+/// 2. **Take and abort the task.** `abort()` is only a request — the dispatch
+///    sections of both loops (slot read → buffer alloc → C call) contain no
+///    `.await`, so a cancellation that arrives inside one lands only at the
+///    following await point, i.e. *after* the callback has already run.
+///
+/// Returned is the `JoinHandle` the caller must still await (step 2b) — that
+/// await is the observation which proves the task has actually stopped.
+/// Splitting there is deliberate: the two callers await it differently (inline
+/// `block_on` vs deferred `spawn`, see [`in_tokio_runtime`]), but neither may
+/// vary the order above, so the order lives here rather than at the call sites.
+fn retire_dispatch_callback<T>(
+    cb_slot: &StdMutex<Option<T>>,
+    task_slot: &StdMutex<Option<tokio::task::JoinHandle<()>>>,
+) -> Option<tokio::task::JoinHandle<()>> {
+    *cb_slot.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    let task = task_slot.lock().unwrap_or_else(|e| e.into_inner()).take();
+    if let Some(task) = &task {
+        task.abort();
+    }
+    task
+}
+
+/// Step 2b of the same protocol: wait for the retired task to have actually
+/// stopped, then run `tail` (the remaining close work, e.g. the APP_UNBIND).
+///
+/// Awaiting an aborted `JoinHandle` resolves precisely when the task is no
+/// longer running — including when the cancellation arrived while the task was
+/// inside a dispatch section it could not be interrupted in. That observation,
+/// not the `abort()` before it, is what lets the host free its trampoline the
+/// moment the close call returns.
+///
+/// Returns `true` when the wait completed synchronously. A caller already
+/// inside a Tokio runtime cannot wait — `block_on` on the runtime driving the
+/// caller deadlocks the worker — so for that caller the join and `tail` are
+/// deferred onto the runtime and `false` is returned. Callers on that path get
+/// only the step-1 guarantee (no NEW dispatch), never the quiescence one; no
+/// supported host reaches it (Dart calls FFI on its isolate thread, never a
+/// tokio worker) and it exists so misuse degrades instead of hanging.
+fn await_retired_task(
+    runtime: &tokio::runtime::Runtime,
+    task: Option<tokio::task::JoinHandle<()>>,
+    tail: impl std::future::Future<Output = ()> + Send + 'static,
+) -> bool {
+    let body = async move {
+        if let Some(task) = task {
+            // `Err` here is the expected `JoinError::Cancelled` from the abort
+            // in step 2a (or a panic the task already reported); either way
+            // the task has stopped, which is the only thing being awaited for.
+            let _ = task.await;
+        }
+        tail.await;
+    };
+    if in_tokio_runtime() {
+        runtime.spawn(body);
+        false
+    } else {
+        runtime.block_on(body);
+        true
+    }
+}
+
 /// Build a tokio multi-threaded runtime sized for mobile/desktop hosts.
 ///
 /// Worker threads = `min(cpu_count, 4)` — small enough to keep RSS low
@@ -2643,6 +2720,7 @@ pub unsafe extern "C" fn veil_connect(
         VeilHandle {
             bundle,
             event_task: StdMutex::new(None),
+            event_cb: Arc::new(StdMutex::new(None)),
             #[cfg(feature = "node-embedded")]
             anon_hub: TokioMutex::new(None),
         },
@@ -2656,6 +2734,32 @@ pub unsafe extern "C" fn veil_connect(
 /// Defends against double-free. A NULL / already-freed / garbage / wrong-type
 /// token is absent from the generational handle table → safe no-op; the
 /// (opaque, non-pointer) token is never dereferenced (see [`HandleTable`]).
+///
+/// # Callback quiescence (audit V-01)
+///
+/// On return from a non-reentrant call this function guarantees that the
+/// event trampoline will NEVER be entered again, so the host is free to
+/// deallocate it immediately. Two steps, in this order, are what buy that:
+///
+/// 1. **Retire the callback slot.** An event the task has already dequeued but
+///    not yet dispatched reads `None` and drops the event — no call, and no
+///    orphaned callee-owned payload buffer.
+/// 2. **Abort, then JOIN.** `abort()` alone is a *request*: the recv/event
+///    loops run whole dispatch sections (slot copy → buffer alloc → C call)
+///    with no `.await` in them, so a cancellation landing inside such a
+///    section takes effect only at the NEXT await point — after the callback
+///    has already run. Awaiting the aborted `JoinHandle` resolves exactly when
+///    the task has actually stopped, which is the only observation that closes
+///    the window. The two `await Future.delayed(Duration.zero)` yields the
+///    Dart wrapper used to paper over this are removed accordingly.
+///
+/// The join is skipped when called from inside a Tokio runtime — joining a
+/// task of the very runtime driving the caller would deadlock. That path
+/// defers abort+join+drop onto the runtime instead; step 1 has already run
+/// synchronously, so no NEW dispatch can start, but a dispatch already past
+/// the slot copy may still complete after this returns. No supported host
+/// takes that path (Dart runs FFI on its isolate thread, never a tokio
+/// worker); it exists so a misuse degrades instead of deadlocking.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn veil_close(handle: *mut VeilHandle) {
     if handle.is_null() {
@@ -2667,12 +2771,14 @@ pub unsafe extern "C" fn veil_close(handle: *mut VeilHandle) {
     let Some(h) = HandleTable::remove(handle_table(), handle as usize) else {
         return;
     };
-    if let Ok(mut guard) = h.event_task.lock()
-        && let Some(task) = guard.take()
-    {
-        task.abort();
-    }
+    // Steps 1 + 2a — retire the callback slot, then abort the task.
+    let task = retire_dispatch_callback(&h.event_cb, &h.event_task);
+    // Step 2b — wait for the task to actually be gone. Nothing the join needs
+    // lives in `h` (the runtime is `ManuallyDrop` and outlives every handle),
+    // so the entry itself can go now on either path.
+    let bundle = Arc::clone(&h.bundle);
     drop(h);
+    await_retired_task(&bundle.runtime, task, std::future::ready(()));
 }
 
 // ── App binding ──────────────────────────────────────────────────────────────
@@ -2871,6 +2977,13 @@ pub unsafe extern "C" fn veil_app_get_endpoint_id(app: *const VeilApp) -> u32 {
 
 /// Close an app endpoint. Aborts any active recv loop and releases
 /// resources. Safe to call on NULL.
+///
+/// Same callback-quiescence contract as [`veil_close`] (audit V-01), applied
+/// to the recv trampoline: the `recv_cb` slot is retired first, then the recv
+/// task is aborted AND JOINED, so on return no further recv callback can fire
+/// and no callee-owned `[node_id|app_id|data]` buffer is left unfreed. See
+/// [`veil_close`] for why the join — not the abort — is the part that closes
+/// the window, and for the reentrant-caller fallback.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn veil_app_close(app: *mut VeilApp) {
     if app.is_null() {
@@ -2881,24 +2994,31 @@ pub unsafe extern "C" fn veil_app_close(app: *mut VeilApp) {
     let Some(app_box) = HandleTable::remove(app_table(), app as usize) else {
         return;
     };
-    if let Ok(mut guard) = app_box.recv_task.lock()
-        && let Some(task) = guard.take()
-    {
-        task.abort();
-    }
+    // Steps 1 + 2a — retire the callback slot, then abort the recv task, so a
+    // datagram dequeued from here on is dropped instead of dispatched.
+    let task = retire_dispatch_callback(&app_box.recv_cb, &app_box.recv_task);
     // `AppSender::Drop` is deliberately best-effort when no Tokio runtime is
     // entered, which is exactly the normal Dart/FFI close context. Before this
     // explicit close the local dispatch table and daemon binding survived
     // until the whole VeilClient disconnected, so rebinding a retired public-
     // capability endpoint failed with "already bound on this connection".
+    //
+    // The unbind runs as the JOIN's tail — quiescence first, wire courtesy
+    // second — and is itself deadline-bounded (`AppSender::close`), so a
+    // wedged daemon cannot turn this close into a UI freeze.
+    //
+    // audit V-02: this destructor performs `block_on`, so it carries the same
+    // reentrancy hazard as every `ffi_prelude` entry point. It has no `err_out`
+    // to report through (category-1 destructor), so `await_retired_task`
+    // defers the whole shutdown onto the runtime instead of failing.
     let bundle = Arc::clone(&app_box.bundle);
     let sender = Arc::clone(&app_box.sender);
-    bundle.runtime.block_on(async move {
+    drop(app_box);
+    await_retired_task(&bundle.runtime, task, async move {
         if let Some(sender) = sender.lock().await.take() {
             sender.close().await;
         }
     });
-    drop(app_box);
 }
 
 // ── Datagram I/O ─────────────────────────────────────────────────────────────
@@ -3688,7 +3808,7 @@ pub unsafe extern "C" fn veil_app_set_recv_handler(
     let mut receiver_guard = app_ref.msg_rx.blocking_lock();
     let mut task_guard = app_ref.recv_task.lock().unwrap_or_else(|e| e.into_inner());
     if task_guard.is_none() {
-        let mut msg_rx = match receiver_guard.take() {
+        let msg_rx = match receiver_guard.take() {
             Some(r) => r,
             None => {
                 // App already closed before the first handler install. Clear the
@@ -3702,76 +3822,99 @@ pub unsafe extern "C" fn veil_app_set_recv_handler(
             }
         };
         let cb_cell = Arc::clone(&app_ref.recv_cb);
-        let task = app_ref.bundle.runtime.spawn(async move {
-            while let Some(IncomingMessage {
-                src_node_id,
-                src_app_id,
-                data,
-                reply_id,
-                ..
-            }) = msg_rx.recv().await
-            {
-                // Copy the current callback out of the slot; never hold the
-                // lock across the C callback.
-                let Some(RecvCbSlot { cb, user_addr }) =
-                    *cb_cell.lock().unwrap_or_else(|e| e.into_inner())
-                else {
-                    continue; // no handler currently installed — drop the frame
-                };
-                let user_ptr = user_addr as *mut std::ffi::c_void;
-                // Best-effort catch_unwind around the host callback. NOTE: this
-                // only intercepts a panic raised on the RUST side of this
-                // closure — a panic/exception propagating OUT of the host `cb`
-                // across the C-ABI frame is undefined behaviour that catch_unwind
-                // cannot catch; the host callback MUST NOT unwind (contract).
-                // Under the release `panic=abort` profile a Rust panic aborts
-                // regardless, so the guard is meaningful only in unwinding
-                // (dev/test) builds, where it logs + drops the message and keeps
-                // the recv loop alive instead of poisoning it.
-                // cycle-7 H6: the host callback may read these pointers AFTER
-                // this Rust frame returns (e.g. Dart `NativeCallable.listener`
-                // marshals the args to the isolate and copies them later). The
-                // `data` Vec and the stack `src_*` arrays would be gone by then —
-                // a use-after-free. Hand the callee ONE owned heap buffer laid
-                // out `[node_id(32) | app_id(32) | data]`; the three pointers are
-                // offsets into it and it stays valid until the callee calls
-                // `veil_free_buf(node_id_ptr, 64 + data_len)`.
-                let data_len = data.len();
-                let total_len = 64 + data_len;
-                let mut combined: Vec<u8> = Vec::with_capacity(total_len);
-                combined.extend_from_slice(&src_node_id);
-                combined.extend_from_slice(&src_app_id);
-                combined.extend_from_slice(&data);
-                let base: *mut u8 = Box::into_raw(combined.into_boxed_slice()).cast();
-                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
-                    cb(
-                        user_ptr,
-                        base.cast_const(),         // src_node_id (32 bytes)
-                        base.add(32).cast_const(), // src_app_id  (32 bytes)
-                        reply_id,                  // 0 = not repliable
-                        base.add(64).cast_const(), // data        (data_len bytes)
-                        data_len,
-                    );
-                }));
-                if result.is_err() {
-                    // The callee panicked before it could take ownership / free —
-                    // reclaim the buffer so it doesn't leak on the dev/test
-                    // unwinding path (release `panic=abort` never reaches here).
-                    unsafe {
-                        drop(Box::from_raw(std::ptr::slice_from_raw_parts_mut(
-                            base, total_len,
-                        )));
-                    }
-                    ffi_diag(
-                        "[veilclient-ffi] recv-handler callback panicked; \
-                         frame dropped, channel kept open",
-                    );
-                }
-            }
-        });
+        let task = app_ref
+            .bundle
+            .runtime
+            .spawn(run_recv_dispatch_loop(msg_rx, cb_cell));
         *task_guard = Some(task);
     }
     VEIL_OK
+}
+
+/// The persistent recv dispatch loop: drain `msg_rx`, hand each datagram to
+/// whatever callback currently sits in `cb_cell`.
+///
+/// A standalone fn rather than an inline `async move` block so the close
+/// protocol it pairs with ([`retire_dispatch_callback`]) can be tested against
+/// the real loop instead of a copy of it.
+async fn run_recv_dispatch_loop(
+    mut msg_rx: mpsc::Receiver<IncomingMessage>,
+    cb_cell: Arc<StdMutex<Option<RecvCbSlot>>>,
+) {
+    while let Some(IncomingMessage {
+        src_node_id,
+        src_app_id,
+        data,
+        reply_id,
+        ..
+    }) = msg_rx.recv().await
+    {
+        // Copy the current callback out of the slot; never hold the
+        // lock across the C callback.
+        //
+        // audit V-01: this read is also the close protocol's first line of
+        // defence. `veil_app_close` retires the slot BEFORE it aborts this
+        // task, so a datagram dequeued after close began takes the `continue`
+        // arm — no call into a trampoline the host is about to free, and no
+        // callee-owned buffer allocated for a callee that no longer exists.
+        // Note what this does NOT cover, and why the close ALSO joins the
+        // task: from here to the `cb(...)` below there is no `.await`, so a
+        // cancellation arriving mid-dispatch takes effect only afterwards.
+        let Some(RecvCbSlot { cb, user_addr }) =
+            *cb_cell.lock().unwrap_or_else(|e| e.into_inner())
+        else {
+            continue; // no handler currently installed — drop the frame
+        };
+        let user_ptr = user_addr as *mut std::ffi::c_void;
+        // Best-effort catch_unwind around the host callback. NOTE: this
+        // only intercepts a panic raised on the RUST side of this
+        // closure — a panic/exception propagating OUT of the host `cb`
+        // across the C-ABI frame is undefined behaviour that catch_unwind
+        // cannot catch; the host callback MUST NOT unwind (contract).
+        // Under the release `panic=abort` profile a Rust panic aborts
+        // regardless, so the guard is meaningful only in unwinding
+        // (dev/test) builds, where it logs + drops the message and keeps
+        // the recv loop alive instead of poisoning it.
+        // cycle-7 H6: the host callback may read these pointers AFTER
+        // this Rust frame returns (e.g. Dart `NativeCallable.listener`
+        // marshals the args to the isolate and copies them later). The
+        // `data` Vec and the stack `src_*` arrays would be gone by then —
+        // a use-after-free. Hand the callee ONE owned heap buffer laid
+        // out `[node_id(32) | app_id(32) | data]`; the three pointers are
+        // offsets into it and it stays valid until the callee calls
+        // `veil_free_buf(node_id_ptr, 64 + data_len)`.
+        let data_len = data.len();
+        let total_len = 64 + data_len;
+        let mut combined: Vec<u8> = Vec::with_capacity(total_len);
+        combined.extend_from_slice(&src_node_id);
+        combined.extend_from_slice(&src_app_id);
+        combined.extend_from_slice(&data);
+        let base: *mut u8 = Box::into_raw(combined.into_boxed_slice()).cast();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+            cb(
+                user_ptr,
+                base.cast_const(),         // src_node_id (32 bytes)
+                base.add(32).cast_const(), // src_app_id  (32 bytes)
+                reply_id,                  // 0 = not repliable
+                base.add(64).cast_const(), // data        (data_len bytes)
+                data_len,
+            );
+        }));
+        if result.is_err() {
+            // The callee panicked before it could take ownership / free —
+            // reclaim the buffer so it doesn't leak on the dev/test
+            // unwinding path (release `panic=abort` never reaches here).
+            unsafe {
+                drop(Box::from_raw(std::ptr::slice_from_raw_parts_mut(
+                    base, total_len,
+                )));
+            }
+            ffi_diag(
+                "[veilclient-ffi] recv-handler callback panicked; \
+                 frame dropped, channel kept open",
+            );
+        }
+    }
 }
 
 // ── Streams ──────────────────────────────────────────────────────────────────
@@ -7562,6 +7705,19 @@ pub type VeilEventCb = Option<
     ),
 >;
 
+/// A currently-installed event callback plus its opaque `user` pointer,
+/// transported as `usize` so the slot is `Send`. Event analogue of
+/// [`RecvCbSlot`]: the event task re-reads it per event so [`veil_close`] can
+/// retire the handler by clearing the slot BEFORE it aborts the task (audit
+/// V-01). Capturing `cb_fn` directly in the task — as this loop used to — left
+/// no way to retire it, so the only tool close had was an `abort()` that does
+/// not land inside a dispatch section.
+#[derive(Clone, Copy)]
+struct EventCbSlot {
+    cb: unsafe extern "C" fn(*mut std::ffi::c_void, u8, *const u8, size_t),
+    user_addr: usize,
+}
+
 /// Install a push-event handler on this veil connection
 ///. The handler runs on a private tokio task and is
 /// torn down when the handle is closed or `set_event_handler` is
@@ -7612,6 +7768,17 @@ pub unsafe extern "C" fn veil_set_event_handler(
         VEIL_ERR_INVALID_ARG,
         "VeilHandle"
     );
+    // Install/replace the callback by swapping the shared slot the task reads
+    // per event (audit V-01) — the same shape `veil_app_set_recv_handler`
+    // uses. It is also what `veil_close` retires before aborting the task.
+    {
+        let mut slot = h_ref.event_cb.lock().unwrap_or_else(|e| e.into_inner());
+        *slot = Some(EventCbSlot {
+            // FFI pointers are not Send — transport `user` as `usize`.
+            cb: cb_fn,
+            user_addr: user as usize,
+        });
+    }
     // Cancel any previous handler before subscribing again. A second
     // subscriber would replace the SDK-side mpsc sink anyway, but we
     // also want to drop the old task so it stops holding the runtime
@@ -7623,8 +7790,7 @@ pub unsafe extern "C" fn veil_set_event_handler(
     }
     let bundle = Arc::clone(&h_ref.bundle);
     let bundle_for_task = Arc::clone(&bundle);
-    // FFI pointers are not Send — transport `user` as `usize`.
-    let user_addr = user as usize;
+    let cb_cell = Arc::clone(&h_ref.event_cb);
     let task = bundle.runtime.spawn(async move {
         let bundle = bundle_for_task;
         // Subscribe inside the task so the SDK-side mpsc sender is
@@ -7633,52 +7799,76 @@ pub unsafe extern "C" fn veil_set_event_handler(
         // says single-subscriber, so racing would already be UB on
         // the consumer side, but this keeps the daemon-side behaviour
         // deterministic).
-        let mut events = {
+        let events = {
             let client = bundle.client.lock().await;
             client.events().await
         };
-        while let Some(ev) = events.recv().await {
-            let user_ptr = user_addr as *mut std::ffi::c_void;
-            let kind = ev.kind;
-            let payload_len = ev.payload.len();
-            // cycle-7 H6: same use-after-free hazard as the recv loop — the host
-            // callback may read `payload_ptr` after this frame returns (Dart
-            // `NativeCallable.listener`). For a non-empty payload, hand the callee
-            // an OWNED heap copy it frees via `veil_free_buf(payload_ptr,
-            // payload_len)`; an empty payload passes NULL (nothing to free).
-            let base: *mut u8 = if payload_len == 0 {
-                std::ptr::null_mut()
-            } else {
-                Box::into_raw(ev.payload.into_boxed_slice()).cast()
-            };
-            // catch_unwind around the callback so
-            // a panic doesn't unwind across the C-ABI frame
-            // (UB). Logged and the event-stream stays alive.
-            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
-                cb_fn(user_ptr, kind, base.cast_const(), payload_len);
-            }));
-            if result.is_err() {
-                // Reclaim on the unwinding (dev/test) path so we don't leak.
-                if !base.is_null() {
-                    unsafe {
-                        drop(Box::from_raw(std::ptr::slice_from_raw_parts_mut(
-                            base,
-                            payload_len,
-                        )));
-                    }
-                }
-                ffi_diag(
-                    "[veilclient-ffi] event-handler callback panicked; \
-                     event dropped, stream kept open",
-                );
-            }
-            // Loop continues until channel closes (None from recv).
-        }
+        run_event_dispatch_loop(events, cb_cell).await;
     });
     if let Ok(mut guard) = h_ref.event_task.lock() {
         *guard = Some(task);
     }
     VEIL_OK
+}
+
+/// The persistent push-event dispatch loop: drain `events`, hand each one to
+/// whatever callback currently sits in `cb_cell`.
+///
+/// Standalone (rather than inline in the spawned task) for the same reason as
+/// [`run_recv_dispatch_loop`] — so the close protocol is tested against the
+/// real loop.
+async fn run_event_dispatch_loop(
+    mut events: mpsc::Receiver<veilclient::VeilEvent>,
+    cb_cell: Arc<StdMutex<Option<EventCbSlot>>>,
+) {
+    while let Some(ev) = events.recv().await {
+        // Copy the current callback out of the slot; never hold the lock
+        // across the C callback. A retired slot (`veil_close` step 1)
+        // drops the event BEFORE the callee-owned buffer below is even
+        // allocated — no dangling trampoline call, no orphaned buffer.
+        let Some(EventCbSlot {
+            cb: cb_fn,
+            user_addr,
+        }) = *cb_cell.lock().unwrap_or_else(|e| e.into_inner())
+        else {
+            continue;
+        };
+        let user_ptr = user_addr as *mut std::ffi::c_void;
+        let kind = ev.kind;
+        let payload_len = ev.payload.len();
+        // cycle-7 H6: same use-after-free hazard as the recv loop — the host
+        // callback may read `payload_ptr` after this frame returns (Dart
+        // `NativeCallable.listener`). For a non-empty payload, hand the callee
+        // an OWNED heap copy it frees via `veil_free_buf(payload_ptr,
+        // payload_len)`; an empty payload passes NULL (nothing to free).
+        let base: *mut u8 = if payload_len == 0 {
+            std::ptr::null_mut()
+        } else {
+            Box::into_raw(ev.payload.into_boxed_slice()).cast()
+        };
+        // catch_unwind around the callback so
+        // a panic doesn't unwind across the C-ABI frame
+        // (UB). Logged and the event-stream stays alive.
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+            cb_fn(user_ptr, kind, base.cast_const(), payload_len);
+        }));
+        if result.is_err() {
+            // Reclaim on the unwinding (dev/test) path so we don't leak.
+            if !base.is_null() {
+                unsafe {
+                    drop(Box::from_raw(std::ptr::slice_from_raw_parts_mut(
+                        base,
+                        payload_len,
+                    )));
+                }
+            }
+            ffi_diag(
+                "[veilclient-ffi] event-handler callback panicked; \
+                 event dropped, stream kept open",
+            );
+        }
+        // Loop continues until channel closes (None from recv).
+    }
 }
 
 // ── Identity restore ────────────────────────────────────────────
@@ -10718,5 +10908,386 @@ mod tests {
         assert_eq!(seed, [0u8; 32], "invalid slot still scrubs caller seed");
         assert!(!error.is_null());
         unsafe { veil_free_string(error) };
+    }
+}
+
+/// Audit V-01: closing the native side must leave the host's callback
+/// trampolines provably unreachable *before* it returns, because the host
+/// deallocates them on the very next line.
+///
+/// These exercise the REAL dispatch loops (`run_recv_dispatch_loop` /
+/// `run_event_dispatch_loop`) and the REAL close protocol
+/// (`retire_dispatch_callback` + join) that `veil_close` / `veil_app_close`
+/// are now two-line wrappers around — not re-implementations of them.
+///
+/// The proof asked for is positive: a frame in flight at close time is
+/// *carried to completion*, and a frame behind it is *deterministically
+/// dropped*. "Didn't crash" is not evidence — a use-after-free on a freed
+/// trampoline is exactly the kind of bug that usually doesn't.
+#[cfg(test)]
+mod v01_close_quiescence {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::{Duration, Instant};
+
+    /// Stand-in for a host trampoline. Reached through the `user` pointer the
+    /// dispatch loops carry, so nothing here is global state shared between
+    /// tests.
+    struct CbProbe {
+        /// Dispatches that entered the callback.
+        entered: AtomicUsize,
+        /// Dispatches that ran to completion (entered AND returned).
+        completed: AtomicUsize,
+        /// Callee-owned buffers reclaimed. Must equal `entered`, else the
+        /// loop handed out a buffer nobody owns any more.
+        freed: AtomicUsize,
+        /// How long the callback occupies the dispatch section — the stretch
+        /// from the slot read to the return which contains no `.await` and so
+        /// cannot be interrupted by `abort()`.
+        dwell: Duration,
+    }
+
+    impl CbProbe {
+        fn new(dwell: Duration) -> Self {
+            Self {
+                entered: AtomicUsize::new(0),
+                completed: AtomicUsize::new(0),
+                freed: AtomicUsize::new(0),
+                dwell,
+            }
+        }
+        fn spin(&self) {
+            let t0 = Instant::now();
+            while t0.elapsed() < self.dwell {
+                std::hint::spin_loop();
+            }
+        }
+    }
+
+    unsafe extern "C" fn probe_recv_cb(
+        user: *mut std::ffi::c_void,
+        node_id: *const u8,
+        _app_id: *const u8,
+        _reply_id: u64,
+        _data: *const u8,
+        data_len: size_t,
+    ) {
+        let probe = unsafe { &*(user as *const CbProbe) };
+        probe.entered.fetch_add(1, Ordering::SeqCst);
+        probe.spin();
+        // Callee owns the `[node_id(32)|app_id(32)|data]` buffer.
+        unsafe { veil_free_buf(node_id as *mut u8, 64 + data_len) };
+        probe.freed.fetch_add(1, Ordering::SeqCst);
+        probe.completed.fetch_add(1, Ordering::SeqCst);
+    }
+
+    unsafe extern "C" fn probe_event_cb(
+        user: *mut std::ffi::c_void,
+        _kind: u8,
+        payload: *const u8,
+        payload_len: size_t,
+    ) {
+        let probe = unsafe { &*(user as *const CbProbe) };
+        probe.entered.fetch_add(1, Ordering::SeqCst);
+        probe.spin();
+        unsafe { veil_free_buf(payload as *mut u8, payload_len) };
+        probe.freed.fetch_add(1, Ordering::SeqCst);
+        probe.completed.fetch_add(1, Ordering::SeqCst);
+    }
+
+    fn frame(n: u8) -> IncomingMessage {
+        IncomingMessage {
+            src_node_id: [n; 32],
+            src_app_id: [n; 32],
+            data: vec![n; 8],
+            reply_id: 0,
+        }
+    }
+
+    /// CONTROL probe for the two "nothing was dispatched" tests below: with a
+    /// LIVE slot the very same harness DOES observe dispatches, so a green
+    /// result there is the retire arm working, not the harness being blind.
+    #[test]
+    fn v01_control_live_slot_dispatches_every_frame() {
+        let rt = build_runtime().expect("runtime");
+        let probe = Box::new(CbProbe::new(Duration::ZERO));
+        let cb_cell = Arc::new(StdMutex::new(Some(RecvCbSlot {
+            cb: probe_recv_cb,
+            user_addr: (&*probe as *const CbProbe) as usize,
+        })));
+        let (tx, rx) = mpsc::channel::<IncomingMessage>(8);
+        let task = rt.spawn(run_recv_dispatch_loop(rx, Arc::clone(&cb_cell)));
+        rt.block_on(async move {
+            for i in 0..4u8 {
+                tx.send(frame(i)).await.expect("send");
+            }
+            drop(tx);
+            let _ = task.await;
+        });
+        assert_eq!(probe.entered.load(Ordering::SeqCst), 4);
+        assert_eq!(
+            probe.freed.load(Ordering::SeqCst),
+            4,
+            "every callee-owned buffer must be reclaimed"
+        );
+    }
+
+    /// Close must not RETURN while a host callback is still executing.
+    ///
+    /// `abort()` alone cannot deliver that: the dispatch section has no
+    /// `.await`, so cancellation lands only at the next one — after the
+    /// callback already ran. Awaiting the aborted `JoinHandle` is the
+    /// observation that the task has actually stopped.
+    ///
+    /// Frame 1 is deliberately mid-callback when the close runs; frame 2 is
+    /// queued behind it. Post-conditions: frame 1 completed (not abandoned
+    /// mid-flight), frame 2 dropped (not dispatched after close), and the
+    /// buffer ledger balances.
+    #[test]
+    fn v01_close_does_not_return_while_a_dispatch_is_in_flight() {
+        // Long enough that "close returned early" is unmistakable, short
+        // enough not to slow the suite.
+        const DWELL: Duration = Duration::from_millis(400);
+
+        let rt = build_runtime().expect("runtime");
+        let probe = Box::new(CbProbe::new(DWELL));
+        let cb_cell = Arc::new(StdMutex::new(Some(RecvCbSlot {
+            cb: probe_recv_cb,
+            user_addr: (&*probe as *const CbProbe) as usize,
+        })));
+        let (tx, rx) = mpsc::channel::<IncomingMessage>(8);
+        let task_slot: StdMutex<Option<tokio::task::JoinHandle<()>>> =
+            StdMutex::new(Some(rt.spawn(run_recv_dispatch_loop(rx, Arc::clone(&cb_cell)))));
+
+        rt.block_on(async {
+            tx.send(frame(1)).await.expect("send 1");
+            tx.send(frame(2)).await.expect("send 2");
+        });
+
+        // Park until the loop is INSIDE frame 1's dispatch — past the slot
+        // read, inside the uninterruptible section.
+        let t0 = Instant::now();
+        while probe.entered.load(Ordering::SeqCst) == 0 {
+            assert!(
+                t0.elapsed() < Duration::from_secs(10),
+                "recv loop never entered a dispatch — harness broken"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(
+            probe.completed.load(Ordering::SeqCst),
+            0,
+            "the dispatch already finished before close ran — dwell too short \
+             to observe the window this test exists for"
+        );
+
+        // ── The production close protocol — the exact two calls that
+        // `veil_close` / `veil_app_close` are now built out of. ──
+        let task = retire_dispatch_callback(&cb_cell, &task_slot);
+        assert!(
+            cb_cell.lock().unwrap().is_none(),
+            "step 1 must retire the callback slot"
+        );
+        let synchronous = await_retired_task(&rt, task, std::future::ready(()));
+        assert!(
+            synchronous,
+            "a caller outside any runtime must join synchronously, not defer"
+        );
+
+        assert_eq!(
+            probe.completed.load(Ordering::SeqCst),
+            1,
+            "close returned while a host callback was still running: the host \
+             frees the trampoline on the next line, so this is a jump into \
+             freed executable memory"
+        );
+        assert_eq!(
+            probe.entered.load(Ordering::SeqCst),
+            1,
+            "the frame queued behind the in-flight one must be dropped, not \
+             dispatched"
+        );
+        assert_eq!(
+            probe.freed.load(Ordering::SeqCst),
+            probe.entered.load(Ordering::SeqCst),
+            "a buffer was handed out as callee-owned but never reclaimed"
+        );
+
+        // Give the runtime real time to misbehave after close returned.
+        std::thread::sleep(Duration::from_millis(250));
+        assert_eq!(
+            probe.entered.load(Ordering::SeqCst),
+            1,
+            "a dispatch started AFTER close returned"
+        );
+        drop(tx);
+    }
+
+    /// Step 1 in isolation: once the slot is retired the recv loop drops every
+    /// frame it dequeues without entering the trampoline — and therefore
+    /// without allocating the callee-owned buffer that a retired trampoline
+    /// would never free.
+    ///
+    /// Deliberately run with NO task registered, so `abort()` contributes
+    /// nothing and the retire is the only thing under test. That is also the
+    /// exact shape of the deferred (reentrant-caller) close path, where the
+    /// join is skipped and the retire is all the protection there is.
+    #[test]
+    fn v01_retired_slot_drops_frames_without_entering_the_trampoline() {
+        let rt = build_runtime().expect("runtime");
+        let probe = Box::new(CbProbe::new(Duration::ZERO));
+        let cb_cell = Arc::new(StdMutex::new(Some(RecvCbSlot {
+            cb: probe_recv_cb,
+            user_addr: (&*probe as *const CbProbe) as usize,
+        })));
+        let (tx, rx) = mpsc::channel::<IncomingMessage>(8);
+        let task = rt.spawn(run_recv_dispatch_loop(rx, Arc::clone(&cb_cell)));
+
+        let no_task: StdMutex<Option<tokio::task::JoinHandle<()>>> = StdMutex::new(None);
+        assert!(retire_dispatch_callback(&cb_cell, &no_task).is_none());
+
+        rt.block_on(async move {
+            for i in 0..4u8 {
+                tx.send(frame(i)).await.expect("send");
+            }
+            // Closing the channel makes the loop drain then exit, so the join
+            // below proves every frame was CONSUMED, not merely still queued.
+            drop(tx);
+            let _ = task.await;
+        });
+
+        assert_eq!(
+            probe.entered.load(Ordering::SeqCst),
+            0,
+            "a frame reached the trampoline after the slot was retired"
+        );
+        assert_eq!(probe.freed.load(Ordering::SeqCst), 0);
+    }
+
+    /// Same property on the EVENT loop — `veil_close`'s side of the finding.
+    /// Without its own coverage the event loop's `continue` arm could be
+    /// deleted with the recv-side tests still green.
+    #[test]
+    fn v01_retired_slot_drops_events_without_entering_the_trampoline() {
+        let rt = build_runtime().expect("runtime");
+        let probe = Box::new(CbProbe::new(Duration::ZERO));
+        let cb_cell = Arc::new(StdMutex::new(Some(EventCbSlot {
+            cb: probe_event_cb,
+            user_addr: (&*probe as *const CbProbe) as usize,
+        })));
+        let (tx, rx) = mpsc::channel::<veilclient::VeilEvent>(8);
+        let task = rt.spawn(run_event_dispatch_loop(rx, Arc::clone(&cb_cell)));
+
+        // Control first: a live slot DOES dispatch through this harness.
+        rt.block_on(async {
+            tx.send(veilclient::VeilEvent {
+                kind: 1,
+                payload: vec![7u8; 16],
+            })
+            .await
+            .expect("send");
+        });
+        let t0 = Instant::now();
+        while probe.entered.load(Ordering::SeqCst) == 0 {
+            assert!(
+                t0.elapsed() < Duration::from_secs(10),
+                "event loop never dispatched — harness broken"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+
+        let no_task: StdMutex<Option<tokio::task::JoinHandle<()>>> = StdMutex::new(None);
+        retire_dispatch_callback(&cb_cell, &no_task);
+
+        rt.block_on(async move {
+            for _ in 0..4 {
+                tx.send(veilclient::VeilEvent {
+                    kind: 2,
+                    payload: vec![9u8; 16],
+                })
+                .await
+                .expect("send");
+            }
+            drop(tx);
+            let _ = task.await;
+        });
+
+        assert_eq!(
+            probe.entered.load(Ordering::SeqCst),
+            1,
+            "an event reached the trampoline after the slot was retired"
+        );
+        assert_eq!(
+            probe.freed.load(Ordering::SeqCst),
+            1,
+            "buffer ledger must balance across the retire boundary"
+        );
+    }
+
+    /// Audit V-02 / `guard.rs` re-evaluation criterion 4: the close path grew a
+    /// `block_on`, so a caller that is ALREADY inside the runtime must be
+    /// detected and deferred. Waiting there would park a worker on a task that
+    /// same worker is meant to drive — a hang with no diagnostic, in a
+    /// destructor that has no `err_out` to report one through.
+    ///
+    /// This asserts the DECISION at the call site (`await_retired_task`
+    /// returns `false` = deferred), not merely that `in_tokio_runtime()`
+    /// answers correctly, and that the call still returns promptly rather than
+    /// wedging the test.
+    #[test]
+    fn v01_reentrant_caller_defers_instead_of_deadlocking() {
+        let rt = build_runtime().expect("runtime");
+        let probe = Box::new(CbProbe::new(Duration::ZERO));
+        let cb_cell = Arc::new(StdMutex::new(Some(RecvCbSlot {
+            cb: probe_recv_cb,
+            user_addr: (&*probe as *const CbProbe) as usize,
+        })));
+        let (tx, rx) = mpsc::channel::<IncomingMessage>(8);
+        let task_slot: StdMutex<Option<tokio::task::JoinHandle<()>>> =
+            StdMutex::new(Some(rt.spawn(run_recv_dispatch_loop(rx, Arc::clone(&cb_cell)))));
+
+        // Control: outside a runtime the same inputs join synchronously — so
+        // the `false` below is the reentrancy branch, not a broken harness.
+        assert!(!in_tokio_runtime());
+
+        let done = std::sync::Arc::new(AtomicUsize::new(0));
+        let done_probe = std::sync::Arc::clone(&done);
+        // `block_on` puts this thread inside the runtime, which is exactly the
+        // situation a recv-callback re-entering the FFI would create.
+        rt.block_on(async {
+            assert!(in_tokio_runtime());
+            let task = retire_dispatch_callback(&cb_cell, &task_slot);
+            let synchronous = await_retired_task(
+                &rt,
+                task,
+                async move {
+                    done_probe.fetch_add(1, Ordering::SeqCst);
+                },
+            );
+            assert!(
+                !synchronous,
+                "a reentrant caller must DEFER the join; joining here parks the \
+                 worker on a task it is itself responsible for driving"
+            );
+        });
+
+        // The deferred work still runs — deferral is a degradation, not a drop.
+        let t0 = Instant::now();
+        while done.load(Ordering::SeqCst) == 0 {
+            assert!(
+                t0.elapsed() < Duration::from_secs(10),
+                "deferred close tail never ran"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        // Step 1 still applied synchronously on the deferred path — that is
+        // the whole reason it comes first.
+        assert_eq!(
+            probe.entered.load(Ordering::SeqCst),
+            0,
+            "the retire must take effect synchronously even when the join is \
+             deferred"
+        );
+        drop(tx);
     }
 }

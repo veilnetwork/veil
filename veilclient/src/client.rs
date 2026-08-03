@@ -649,7 +649,7 @@ pub(crate) const STREAM_OPEN_TIMEOUT: std::time::Duration = std::time::Duration:
 pub(crate) const BIND_TIMEOUT_DEFAULT: std::time::Duration = std::time::Duration::from_secs(30);
 
 impl DispatchTable {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             endpoints: Default::default(),
             streams: Default::default(),
