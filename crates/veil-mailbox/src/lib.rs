@@ -129,6 +129,41 @@ pub fn billable_bytes(payload_len: u64) -> u64 {
     payload_len.saturating_add(RECORD_OVERHEAD_BYTES)
 }
 
+/// How small a slice of one receiver's window anonymous ingress may occupy.
+///
+/// An anonymous deposit has no sender. The transport delivers it with
+/// `src_node_id == [0u8; 32]` — a marker, not an identity — and the relay used
+/// that marker as the key of the per-sender byte quota. So every anonymous
+/// depositor on the network shared ONE 10 MiB bucket, and the first one to fill
+/// it closed the anonymous entrance for all of the others (audit V-04). The
+/// per-sender quota was answering a question anonymous ingress cannot be asked.
+///
+/// Anonymous bytes are therefore counted on the only axis that survives without
+/// a sender identity: the RECEIVER they are addressed to. The cap is DERIVED
+/// from [`MailboxConfig::quota_per_receiver_bytes`] rather than configured
+/// separately, and that is the point — it makes the reservation impossible to
+/// misconfigure. Two independent knobs could be set so that the anonymous cap
+/// met or exceeded the receiver's own cap, which would silently void the
+/// guarantee below.
+///
+/// The guarantee: anonymous deposits can occupy at most `1/N` of any receiver's
+/// window, so an identified sender always retains the other `(N-1)/N` no matter
+/// how saturated anonymous ingress is. Eight leaves 87.5 % of every receiver's
+/// window untouchable by anonymous traffic while still admitting the anonymous
+/// path xVeil uses by default.
+pub const ANON_RECEIVER_SHARE_DIVISOR: u64 = 8;
+
+/// The ceiling on anonymous-class bytes held for a single receiver.
+///
+/// See [`ANON_RECEIVER_SHARE_DIVISOR`]. Note this is a RESERVATION carved out
+/// of the receiver's window, not an allowance added to it: anonymous bytes are
+/// still counted against [`MailboxConfig::quota_per_receiver_bytes`] as well,
+/// so a receiver's total never exceeds what the operator configured.
+#[inline]
+pub fn anon_receiver_cap(quota_per_receiver_bytes: u64) -> u64 {
+    quota_per_receiver_bytes / ANON_RECEIVER_SHARE_DIVISOR
+}
+
 /// Default TTL for individual blobs (7 days).
 pub const DEFAULT_TTL_SECS: u64 = 7 * 24 * 60 * 60;
 
@@ -197,6 +232,23 @@ const GLOBAL_BYTES_KEY: &str = "total";
 /// (audit L-17: default is `DEFAULT_QUOTA_PER_SENDER_BYTES` = 10 MiB, NOT
 /// `u64::MAX` — `u64::MAX` is the explicit opt-out value).
 const TABLE_SENDER_BYTES: TableDefinition<&[u8], u64> = TableDefinition::new("sender_bytes_v1");
+
+/// anonymous-ingress byte tracking. Maps `receiver_id[32]` → bytes currently
+/// held for that receiver by [`TrustClass::Anonymous`] deposits. Capped by
+/// [`anon_receiver_cap`]; decremented on ack / TTL prune / eviction exactly
+/// like [`TABLE_SENDER_BYTES`] is for identified deposits.
+///
+/// This is the budget anonymous deposits are charged INSTEAD of the per-sender
+/// one — they have no sender to charge, and pretending the `[0u8; 32]` marker
+/// was one gave the whole network a single shared bucket (audit V-04).
+///
+/// Existing DBs upgrade with this table empty, so anonymous deposits made
+/// before the upgrade are not counted here and their bytes stay in the stale
+/// `sender_bytes[[0u8; 32]]` row. That row is now read by nothing — anonymous
+/// puts no longer consult the per-sender quota — so a stale value is inert, and
+/// starting the anonymous slice at zero is the conservative direction.
+const TABLE_ANON_RECEIVER_BYTES: TableDefinition<&[u8], u64> =
+    TableDefinition::new("anon_receiver_bytes_v1");
 
 /// secondary eviction index keyed only by
 /// **anonymous-pool** blobs (puts arriving without a valid capability
@@ -576,6 +628,7 @@ impl Mailbox {
             // a write transaction; idempotent on existing DBs.
             let _ = txn.open_table(TABLE_SENDER_BYTES)?;
             let _ = txn.open_table(TABLE_EVICTION_INDEX_ANON)?;
+            let _ = txn.open_table(TABLE_ANON_RECEIVER_BYTES)?;
         }
         txn.commit()?;
         Ok(Self {
@@ -763,6 +816,7 @@ impl Mailbox {
             let mut eviction_index_anon = txn.open_table(TABLE_EVICTION_INDEX_ANON)?;
             let mut global_bytes = txn.open_table(TABLE_GLOBAL_BYTES)?;
             let mut sender_bytes = txn.open_table(TABLE_SENDER_BYTES)?;
+            let mut anon_receiver_bytes = txn.open_table(TABLE_ANON_RECEIVER_BYTES)?;
 
             let key = make_key(&receiver, &content_id);
 
@@ -781,18 +835,56 @@ impl Mailbox {
                         cap_bytes: self.config.quota_per_receiver_bytes,
                     }
                 } else {
-                    // per-sender quota check.
-                    // Audit L-17: default cap = DEFAULT_QUOTA_PER_SENDER_BYTES
-                    // (10 MiB), NOT u64::MAX. u64::MAX is the explicit opt-out.
+                    // ── Ingress budget gate ───────────────────────────────
+                    // Which budget a deposit is charged to is decided by its
+                    // TRUST CLASS, never by the sender bytes it carries.
+                    //
+                    // An anonymous deposit arrives with `src_node_id ==
+                    // [0u8; 32]`. That is a marker meaning "no sender", and
+                    // charging the per-sender quota to it gave every anonymous
+                    // depositor on the network one shared 10 MiB bucket — the
+                    // first to fill it locked out all the rest (audit V-04).
+                    // Anonymous ingress is instead charged to its own budget,
+                    // keyed on the receiver, capped at a fraction of that
+                    // receiver's window (see `ANON_RECEIVER_SHARE_DIVISOR`) so
+                    // that saturating it cannot reach an identified sender.
+                    //
+                    // Identified deposits keep the per-sender quota unchanged:
+                    // audit L-17 default DEFAULT_QUOTA_PER_SENDER_BYTES
+                    // (10 MiB), NOT u64::MAX; u64::MAX is the explicit opt-out.
                     let sender_total = sender_bytes
                         .get(sender.as_slice())?
                         .map(|v| v.value())
                         .unwrap_or(0);
-                    if sender_total.saturating_add(blob_size) > self.config.quota_per_sender_bytes {
-                        PutOutcome::QuotaPerSenderExceeded {
-                            current_bytes: sender_total,
-                            cap_bytes: self.config.quota_per_sender_bytes,
-                        }
+                    let anon_recv_total = anon_receiver_bytes
+                        .get(receiver.as_slice())?
+                        .map(|v| v.value())
+                        .unwrap_or(0);
+                    let anon_cap = anon_receiver_cap(self.config.quota_per_receiver_bytes);
+                    let ingress_full = match trust_class {
+                        // Reported as QuotaPerReceiverExceeded rather than a
+                        // dedicated outcome on purpose: it IS the receiver's
+                        // quota that is full, just the anonymous slice of it,
+                        // the caller's remedy is identical (retry later or fall
+                        // back to peer-sync), and an anonymous depositor
+                        // learning precisely which of the relay's limits it hit
+                        // is a probing side-channel — the same reasoning that
+                        // keeps `CapabilityInvalid` deliberately unspecific.
+                        TrustClass::Anonymous => (anon_recv_total.saturating_add(blob_size)
+                            > anon_cap)
+                            .then_some(PutOutcome::QuotaPerReceiverExceeded {
+                                current_bytes: anon_recv_total,
+                                cap_bytes: anon_cap,
+                            }),
+                        TrustClass::Identified => (sender_total.saturating_add(blob_size)
+                            > self.config.quota_per_sender_bytes)
+                            .then_some(PutOutcome::QuotaPerSenderExceeded {
+                                current_bytes: sender_total,
+                                cap_bytes: self.config.quota_per_sender_bytes,
+                            }),
+                    };
+                    if let Some(rejected) = ingress_full {
+                        rejected
                     } else {
                         // Global quota: evict oldest until the new blob fits.
                         // scan anonymous pool
@@ -903,20 +995,21 @@ impl Mailbox {
                                 bytes_per_receiver
                                     .insert(victim_receiver.as_slice(), victim_recv_after)?;
                             }
-                            // per-sender counter
-                            // bookkeeping on eviction.
-                            let victim_sender_total = sender_bytes
-                                .get(victim_sender.as_slice())?
-                                .map(|v| v.value())
-                                .unwrap_or(0);
-                            let victim_sender_after =
-                                victim_sender_total.saturating_sub(victim_size);
-                            if victim_sender_after == 0 {
-                                sender_bytes.remove(victim_sender.as_slice())?;
-                            } else {
-                                sender_bytes
-                                    .insert(victim_sender.as_slice(), victim_sender_after)?;
-                            }
+                            // Refund the ingress budget the victim was CHARGED,
+                            // chosen by the pool it was found in — the same
+                            // decision the put made on the way in. Refunding by
+                            // the victim's stored sender bytes instead would
+                            // credit `sender_bytes[[0u8; 32]]` for an anonymous
+                            // record that never paid into it, and leave the
+                            // anonymous slice permanently spent.
+                            refund_ingress(
+                                victim_class,
+                                &victim_sender,
+                                &victim_receiver,
+                                victim_size,
+                                &mut sender_bytes,
+                                &mut anon_receiver_bytes,
+                            )?;
                             global_total = global_total.saturating_sub(victim_size);
                             evicted = evicted.saturating_add(1);
                         }
@@ -924,10 +1017,40 @@ impl Mailbox {
                         // Now there is room. Insert.
                         let record = encode_record(&sender, now, &blob);
                         blobs.insert(key.as_slice(), record.as_slice())?;
-                        let new_recv_total = receiver_total.saturating_add(blob_size);
-                        bytes_per_receiver.insert(receiver.as_slice(), new_recv_total)?;
-                        let new_sender_total = sender_total.saturating_add(blob_size);
-                        sender_bytes.insert(sender.as_slice(), new_sender_total)?;
+                        // Re-read before charging. The eviction loop above may
+                        // have refunded THIS receiver or THIS sender — the
+                        // globally-oldest victim is free to be either — and the
+                        // totals read before the loop are stale in exactly that
+                        // case. Adding to a stale total would silently undo the
+                        // refund and leave the counter believing the relay
+                        // holds blobs it just evicted.
+                        let recv_base = bytes_per_receiver
+                            .get(receiver.as_slice())?
+                            .map(|v| v.value())
+                            .unwrap_or(0);
+                        bytes_per_receiver
+                            .insert(receiver.as_slice(), recv_base.saturating_add(blob_size))?;
+                        // Charge the ingress budget matching the trust class,
+                        // mirroring `refund_ingress` above. Anonymous deposits
+                        // never touch the per-sender quota: they have no sender.
+                        match trust_class {
+                            TrustClass::Anonymous => {
+                                let base = anon_receiver_bytes
+                                    .get(receiver.as_slice())?
+                                    .map(|v| v.value())
+                                    .unwrap_or(0);
+                                anon_receiver_bytes
+                                    .insert(receiver.as_slice(), base.saturating_add(blob_size))?;
+                            }
+                            TrustClass::Identified => {
+                                let base = sender_bytes
+                                    .get(sender.as_slice())?
+                                    .map(|v| v.value())
+                                    .unwrap_or(0);
+                                sender_bytes
+                                    .insert(sender.as_slice(), base.saturating_add(blob_size))?;
+                            }
+                        }
                         let evict_key = make_eviction_key(now, &receiver, &content_id);
                         match trust_class {
                             TrustClass::Anonymous => {
@@ -1033,6 +1156,7 @@ impl Mailbox {
             let mut eviction_index_anon = txn.open_table(TABLE_EVICTION_INDEX_ANON)?;
             let mut global_bytes = txn.open_table(TABLE_GLOBAL_BYTES)?;
             let mut sender_bytes = txn.open_table(TABLE_SENDER_BYTES)?;
+            let mut anon_receiver_bytes = txn.open_table(TABLE_ANON_RECEIVER_BYTES)?;
 
             let key = make_key(&receiver, &content_id);
             // Materialise the record bytes before touching mutable APIs so
@@ -1048,9 +1172,17 @@ impl Mailbox {
                     let evict_key = make_eviction_key(deposited_at, &receiver, &content_id);
                     // ack does not know which
                     // index the entry lives in — try both (remove on missing
-                    // is a no-op). At most one will fire.
+                    // is a no-op). At most one will fire, and WHICH one fired
+                    // is the record's trust class: the only durable trace of
+                    // the budget the put charged, and so of the budget this
+                    // ack has to give back.
+                    let was_anon = eviction_index_anon.remove(evict_key.as_slice())?.is_some();
                     eviction_index.remove(evict_key.as_slice())?;
-                    eviction_index_anon.remove(evict_key.as_slice())?;
+                    let trust_class = if was_anon {
+                        TrustClass::Anonymous
+                    } else {
+                        TrustClass::Identified
+                    };
                     let recv_total = bytes_per_receiver
                         .get(receiver.as_slice())?
                         .map(|v| v.value())
@@ -1061,17 +1193,15 @@ impl Mailbox {
                     } else {
                         bytes_per_receiver.insert(receiver.as_slice(), recv_total)?;
                     }
-                    // per-sender counter bookkeeping.
-                    let sender_total = sender_bytes
-                        .get(sender.as_slice())?
-                        .map(|v| v.value())
-                        .unwrap_or(0)
-                        .saturating_sub(blob_size);
-                    if sender_total == 0 {
-                        sender_bytes.remove(sender.as_slice())?;
-                    } else {
-                        sender_bytes.insert(sender.as_slice(), sender_total)?;
-                    }
+                    // Ingress-budget bookkeeping, per trust class.
+                    refund_ingress(
+                        trust_class,
+                        &sender,
+                        &receiver,
+                        blob_size,
+                        &mut sender_bytes,
+                        &mut anon_receiver_bytes,
+                    )?;
                     let new_global = global_bytes
                         .get(GLOBAL_BYTES_KEY)?
                         .map(|v| v.value())
@@ -1104,6 +1234,7 @@ impl Mailbox {
             let mut eviction_index_anon = txn.open_table(TABLE_EVICTION_INDEX_ANON)?;
             let mut global_bytes = txn.open_table(TABLE_GLOBAL_BYTES)?;
             let mut sender_bytes = txn.open_table(TABLE_SENDER_BYTES)?;
+            let mut anon_receiver_bytes = txn.open_table(TABLE_ANON_RECEIVER_BYTES)?;
 
             // Range walk on eviction_index: keys with deposited_at < cutoff.
             let cutoff_be = cutoff.to_be_bytes();
@@ -1160,17 +1291,20 @@ impl Mailbox {
                     } else {
                         bytes_per_receiver.insert(recv.as_slice(), recv_total)?;
                     }
-                    // per-sender bookkeeping.
-                    let sender_total = sender_bytes
-                        .get(sender.as_slice())?
-                        .map(|v| v.value())
-                        .unwrap_or(0)
-                        .saturating_sub(blob_size);
-                    if sender_total == 0 {
-                        sender_bytes.remove(sender.as_slice())?;
-                    } else {
-                        sender_bytes.insert(sender.as_slice(), sender_total)?;
-                    }
+                    // Ingress-budget bookkeeping, per trust class — `is_anon`
+                    // is which index this victim came out of.
+                    refund_ingress(
+                        if is_anon {
+                            TrustClass::Anonymous
+                        } else {
+                            TrustClass::Identified
+                        },
+                        &sender,
+                        &recv,
+                        blob_size,
+                        &mut sender_bytes,
+                        &mut anon_receiver_bytes,
+                    )?;
                     global_total = global_total.saturating_sub(blob_size);
                     pruned = pruned.saturating_add(1);
                 }
@@ -1209,6 +1343,56 @@ impl Mailbox {
         let t = txn.open_table(TABLE_RECEIVER_BYTES)?;
         Ok(t.get(receiver.as_slice())?.map(|v| v.value()).unwrap_or(0))
     }
+
+    /// Of [`Self::receiver_bytes`], how many are held by ANONYMOUS deposits.
+    ///
+    /// Bounded by [`anon_receiver_cap`]; the difference between this and
+    /// [`MailboxConfig::quota_per_receiver_bytes`] is the room identified
+    /// senders are guaranteed no matter how saturated anonymous ingress is
+    /// (audit V-04).
+    pub fn receiver_anon_bytes(&self, receiver: [u8; 32]) -> Result<u64, MailboxError> {
+        let txn = self.db.begin_read()?;
+        let t = txn.open_table(TABLE_ANON_RECEIVER_BYTES)?;
+        Ok(t.get(receiver.as_slice())?.map(|v| v.value()).unwrap_or(0))
+    }
+}
+
+/// Give back the ingress budget a record was charged when it was stored.
+///
+/// One function for all three removal paths (ack, TTL prune, eviction) because
+/// the charge and the refund have to agree about WHICH budget, exactly as they
+/// have to agree about how many bytes (see [`billable_bytes`]). Anonymous
+/// records paid into the receiver-keyed anonymous slice and identified records
+/// into the per-sender quota; crediting the wrong one leaves a budget
+/// permanently spent and closes an entrance that is actually empty.
+///
+/// `trust_class` must come from the eviction index the record was found in —
+/// that is the only durable record of the decision the put made. The stored
+/// `sender_id` cannot stand in for it: an anonymous record carries the
+/// `[0u8; 32]` marker, which is not a sender.
+fn refund_ingress<'a>(
+    trust_class: TrustClass,
+    sender: &[u8; 32],
+    receiver: &[u8; 32],
+    blob_size: u64,
+    sender_bytes: &mut redb::Table<'a, &'static [u8], u64>,
+    anon_receiver_bytes: &mut redb::Table<'a, &'static [u8], u64>,
+) -> Result<(), MailboxError> {
+    let (table, key): (&mut redb::Table<'a, &'static [u8], u64>, &[u8]) = match trust_class {
+        TrustClass::Anonymous => (anon_receiver_bytes, receiver.as_slice()),
+        TrustClass::Identified => (sender_bytes, sender.as_slice()),
+    };
+    let after = table
+        .get(key)?
+        .map(|v| v.value())
+        .unwrap_or(0)
+        .saturating_sub(blob_size);
+    if after == 0 {
+        table.remove(key)?;
+    } else {
+        table.insert(key, after)?;
+    }
+    Ok(())
 }
 
 fn split_eviction_key(k: &[u8]) -> Result<([u8; 32], [u8; 32]), MailboxError> {
