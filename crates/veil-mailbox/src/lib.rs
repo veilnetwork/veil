@@ -630,6 +630,9 @@ impl Mailbox {
             let _ = txn.open_table(TABLE_EVICTION_INDEX_ANON)?;
             let _ = txn.open_table(TABLE_ANON_RECEIVER_BYTES)?;
         }
+        // Same transaction: rebuild the anonymous-ingress counter from the
+        // records that actually exist (audit V-05).
+        rebuild_anon_receiver_bytes(&txn)?;
         txn.commit()?;
         Ok(Self {
             db: Arc::new(db),
@@ -769,6 +772,27 @@ impl Mailbox {
         blob: Vec<u8>,
         trust_class: TrustClass,
     ) -> Result<PutOutcome, MailboxError> {
+        // `Identified` means "there is a sender to charge". `[0u8; 32]` is the
+        // marker the transport uses for "there is not" — an anonymous deposit
+        // arrives with `src_node_id == [0u8; 32]`, and the runtime passes that
+        // authenticated source through as `sender`.
+        //
+        // The pair was reachable: an anonymous deposit carrying a VALID
+        // capability token verified, so `put_with_capability` classified it
+        // `Identified`, and the charge went to `sender_bytes[[0u8; 32]]` — the
+        // single network-wide bucket whose removal is the entire point of the
+        // receiver-keyed anonymous budget (audit V-04). One depositor filling it
+        // would close that door for every other tokened anonymous sender, and
+        // the deposit would sit in the identified eviction pool it has no claim
+        // to. A token proves the RECEIVER authorised the deposit; it says
+        // nothing about who sent it, so it cannot conjure a sender identity.
+        //
+        // Normalised here rather than at the entry point so no future caller of
+        // this (public) method can express the state either.
+        let trust_class = match (trust_class, sender == [0u8; 32]) {
+            (TrustClass::Identified, true) => TrustClass::Anonymous,
+            (class, _) => class,
+        };
         let payload_len = blob.len() as u64;
         // Quota accounting is in BILLABLE bytes from here on; the raw payload
         // length is what the MIN/MAX blob checks below are about.
@@ -1391,6 +1415,102 @@ fn refund_ingress<'a>(
         table.remove(key)?;
     } else {
         table.insert(key, after)?;
+    }
+    Ok(())
+}
+
+/// Rebuild [`TABLE_ANON_RECEIVER_BYTES`] from the records that actually exist,
+/// and drop the obsolete all-zero-sender row from [`TABLE_SENDER_BYTES`].
+///
+/// The anonymous-ingress counter is created idempotently at open, but until now
+/// it was never RECONCILED. A database written by a build that predates the
+/// table carries anonymous blobs whose bytes were counted nowhere (their charge
+/// went into the shared `sender_bytes[[0u8; 32]]` bucket that this whole
+/// mechanism exists to replace), so the first open under the new build starts
+/// their receivers' anonymous slices at zero while the blobs are still held —
+/// up to 32.5 MiB of a 100 MiB window unaccounted for, self-healing only as the
+/// blobs age out over the TTL.
+///
+/// [`TABLE_EVICTION_INDEX_ANON`] is the right source: it is the ONLY durable
+/// record of a deposit's trust class (`ack` already relies on exactly that to
+/// decide which budget to refund), and it holds precisely the anonymous set.
+///
+/// Deliberately UNCONDITIONAL rather than gated on a schema-version marker.
+/// A version gate would fire once, for one known cause; a full pass is cheap
+/// (one scan of the anonymous index at open), needs no version to be stored and
+/// kept honest, and catches any future drift from any cause at all — including
+/// bugs not yet written.
+///
+/// The report's own remedy — fail closed on new anonymous ingress until the
+/// counter is reconciled — is deliberately NOT taken: the anonymous path is
+/// xVeil's default send path, so a fail-closed window is an outage for
+/// everybody, in exchange for a drift that is bounded, transient and only ever
+/// permissive.
+fn rebuild_anon_receiver_bytes(txn: &redb::WriteTransaction) -> Result<(), MailboxError> {
+    // Pass 1 — total the anonymous pool per receiver. Table handles are scoped
+    // so they are closed before the counter table is opened for writing (redb
+    // refuses to open the same table twice in one write transaction, and
+    // holding an unrelated read handle across the write is needless).
+    let mut totals: std::collections::HashMap<[u8; 32], u64> = std::collections::HashMap::new();
+    {
+        let blobs = txn.open_table(TABLE_BLOBS)?;
+        let anon_index = txn.open_table(TABLE_EVICTION_INDEX_ANON)?;
+        for entry in anon_index.iter()? {
+            let (k, _) = entry?;
+            let (receiver, content_id) = split_eviction_key(k.value())?;
+            let Some(record) = blobs.get(make_key(&receiver, &content_id).as_slice())? else {
+                // Index row with no blob behind it. `put`'s eviction loop treats
+                // this as corruption because it is mid-transaction there; here it
+                // just means the row contributes nothing, and refusing to open the
+                // mailbox over one stale index row would be a far worse outcome
+                // than a counter that ignores it.
+                continue;
+            };
+            // Billable bytes, the same arithmetic every charge/refund site uses
+            // (`RECORD_OVERHEAD_BYTES` on top of the payload). 44 = the record
+            // header `encode_record` writes; saturating so a short record can
+            // never underflow-panic here.
+            let size = billable_bytes((record.value().len() as u64).saturating_sub(44));
+            *totals.entry(receiver).or_insert(0) = totals
+                .get(&receiver)
+                .copied()
+                .unwrap_or(0)
+                .saturating_add(size);
+        }
+    }
+
+    // Pass 2 — make the table equal `totals` exactly: rows for receivers that
+    // no longer hold anonymous bytes are removed, not merely left stale.
+    {
+        let mut anon_receiver_bytes = txn.open_table(TABLE_ANON_RECEIVER_BYTES)?;
+        let existing: Vec<Vec<u8>> = anon_receiver_bytes
+            .iter()?
+            .map(|e| e.map(|(k, _)| k.value().to_vec()))
+            .collect::<Result<_, _>>()?;
+        for key in existing {
+            let still_held = key
+                .as_slice()
+                .try_into()
+                .ok()
+                .and_then(|k: [u8; 32]| totals.get(&k).copied())
+                .unwrap_or(0);
+            if still_held == 0 {
+                anon_receiver_bytes.remove(key.as_slice())?;
+            }
+        }
+        for (receiver, total) in &totals {
+            anon_receiver_bytes.insert(receiver.as_slice(), *total)?;
+        }
+    }
+
+    // The all-zero "sender" is the no-sender MARKER, never an identity. Its
+    // per-sender row is what anonymous deposits used to be charged to, and
+    // nothing reads it any more — but leaving it in place keeps a row that
+    // reads like a real sender's quota state and would silently start counting
+    // again if some future path charged the marker. Drop it.
+    {
+        let mut sender_bytes = txn.open_table(TABLE_SENDER_BYTES)?;
+        sender_bytes.remove([0u8; 32].as_slice())?;
     }
     Ok(())
 }

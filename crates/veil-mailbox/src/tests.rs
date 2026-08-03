@@ -1177,3 +1177,260 @@ fn anon_budget_is_refunded_on_ack_and_reopens_the_entrance() {
     );
     assert_eq!(mb.receiver_bytes(recv).unwrap(), 0);
 }
+
+// ── audit V-05: the anonymous-ingress counter is reconciled at open ────────
+
+/// Read `sender_bytes[sender]` straight out of the DB — no accessor exists
+/// because production code has no reason to read it outside a put.
+fn sender_bytes_row(mb: &Mailbox, sender: [u8; 32]) -> u64 {
+    let txn = mb.db.begin_read().unwrap();
+    let t = txn.open_table(TABLE_SENDER_BYTES).unwrap();
+    t.get(sender.as_slice())
+        .unwrap()
+        .map(|v| v.value())
+        .unwrap_or(0)
+}
+
+/// Overwrite the anonymous counter behind the mailbox's back, reproducing what
+/// a database written by a build without `anon_receiver_bytes_v1` looks like
+/// when a build that HAS the table opens it: anonymous blobs are held, the
+/// counter says otherwise.
+fn scribble_anon_counter(dir: &std::path::Path, rows: &[([u8; 32], u64)], wipe_first: bool) {
+    let db = Database::create(dir.join("mailbox").join("blobs.db")).unwrap();
+    let txn = db.begin_write().unwrap();
+    {
+        let mut t = txn.open_table(TABLE_ANON_RECEIVER_BYTES).unwrap();
+        if wipe_first {
+            let keys: Vec<Vec<u8>> = t
+                .iter()
+                .unwrap()
+                .map(|e| e.unwrap().0.value().to_vec())
+                .collect();
+            for k in keys {
+                t.remove(k.as_slice()).unwrap();
+            }
+        }
+        for (recv, bytes) in rows {
+            t.insert(recv.as_slice(), *bytes).unwrap();
+        }
+    }
+    txn.commit().unwrap();
+}
+
+fn reopen(dir: &std::path::Path, cfg: MailboxConfig) -> Mailbox {
+    Mailbox::open(dir, cfg).unwrap()
+}
+
+/// A counter that under-reports (the pre-fix state for any DB written before
+/// the table existed) must come back to the truth at open, not stay wrong
+/// until the blobs age out over the TTL. Under-reporting is the direction that
+/// matters: it lets anonymous ingress overshoot the slice carved out of the
+/// receiver's window.
+#[test]
+fn v05_anon_counter_under_reporting_is_rebuilt_at_open() {
+    let cfg = MailboxConfig {
+        rate_limit_per_minute: 0,
+        ..MailboxConfig::default()
+    };
+    let (mb, tmp, _clk) = fresh(cfg.clone());
+    let recv = [0xA1u8; 32];
+    let other = [0xA2u8; 32];
+    for i in 0..3u8 {
+        let mut cid = [0u8; 32];
+        cid[0] = i;
+        mb.put_classified(recv, cid, [0u8; 32], vec![0u8; 64], TrustClass::Anonymous)
+            .unwrap();
+    }
+    mb.put_classified(other, [9u8; 32], [0u8; 32], vec![0u8; 32], TrustClass::Anonymous)
+        .unwrap();
+    let truth_recv = mb.receiver_anon_bytes(recv).unwrap();
+    let truth_other = mb.receiver_anon_bytes(other).unwrap();
+    assert_eq!(truth_recv, billable_bytes(64) * 3);
+    assert_eq!(truth_other, billable_bytes(32));
+    drop(mb);
+
+    // Every anonymous byte now uncounted, exactly as a pre-table DB presents.
+    scribble_anon_counter(tmp.path(), &[], true);
+    {
+        let mb = reopen(tmp.path(), cfg.clone());
+        assert_eq!(
+            mb.receiver_anon_bytes(recv).unwrap(),
+            truth_recv,
+            "opening a mailbox whose anonymous counter was written by a build \
+             without the table must rebuild it from the records actually held"
+        );
+        assert_eq!(mb.receiver_anon_bytes(other).unwrap(), truth_other);
+    }
+}
+
+/// Drift in the OTHER direction — a row claiming bytes for a receiver that
+/// holds no anonymous records at all — must be removed, not merely left. A
+/// leftover row silently spends that receiver's anonymous slice forever.
+#[test]
+fn v05_anon_counter_over_reporting_and_orphan_rows_are_cleared() {
+    let cfg = MailboxConfig {
+        rate_limit_per_minute: 0,
+        ..MailboxConfig::default()
+    };
+    let (mb, tmp, _clk) = fresh(cfg.clone());
+    let recv = [0xB1u8; 32];
+    let ghost = [0xB2u8; 32];
+    mb.put_classified(recv, [1u8; 32], [0u8; 32], vec![0u8; 64], TrustClass::Anonymous)
+        .unwrap();
+    let truth = mb.receiver_anon_bytes(recv).unwrap();
+    drop(mb);
+
+    scribble_anon_counter(
+        tmp.path(),
+        &[(recv, 99_999_999), (ghost, 12_345)],
+        false,
+    );
+    let mb = reopen(tmp.path(), cfg);
+    assert_eq!(
+        mb.receiver_anon_bytes(recv).unwrap(),
+        truth,
+        "an inflated row must be corrected down to what is actually held"
+    );
+    assert_eq!(
+        mb.receiver_anon_bytes(ghost).unwrap(),
+        0,
+        "a row for a receiver holding no anonymous records must be REMOVED, \
+         not left to spend its slice forever"
+    );
+}
+
+/// The rebuild must not disturb the identified pool: a real sender's row is
+/// untouched, and only the all-zero MARKER row is dropped.
+#[test]
+fn v05_rebuild_drops_only_the_zero_sender_marker_row() {
+    let cfg = MailboxConfig {
+        rate_limit_per_minute: 0,
+        ..MailboxConfig::default()
+    };
+    let (mb, tmp, _clk) = fresh(cfg.clone());
+    let real_sender = [0xC7u8; 32];
+    mb.put([0xC1u8; 32], [1u8; 32], real_sender, vec![0u8; 64])
+        .unwrap();
+    let real_row = sender_bytes_row(&mb, real_sender);
+    assert!(real_row > 0);
+    drop(mb);
+
+    // Plant the legacy shared-bucket row an older build would have left.
+    {
+        let db = Database::create(tmp.path().join("mailbox").join("blobs.db")).unwrap();
+        let txn = db.begin_write().unwrap();
+        {
+            let mut t = txn.open_table(TABLE_SENDER_BYTES).unwrap();
+            t.insert([0u8; 32].as_slice(), 7_000_000u64).unwrap();
+        }
+        txn.commit().unwrap();
+    }
+
+    let mb = reopen(tmp.path(), cfg);
+    assert_eq!(
+        sender_bytes_row(&mb, [0u8; 32]),
+        0,
+        "the no-sender marker's per-sender row is obsolete and must be dropped"
+    );
+    assert_eq!(
+        sender_bytes_row(&mb, real_sender),
+        real_row,
+        "a real sender's quota state must survive the rebuild untouched"
+    );
+}
+
+/// CONTROL: the rebuild is unconditional, so it must be a no-op on a healthy
+/// database. Without this, the three tests above would pass just as well if it
+/// zeroed everything or double-counted.
+#[test]
+fn v05_control_rebuild_is_a_noop_on_a_consistent_database() {
+    let cfg = MailboxConfig {
+        rate_limit_per_minute: 0,
+        ..MailboxConfig::default()
+    };
+    let (mb, tmp, _clk) = fresh(cfg.clone());
+    let recv = [0xD1u8; 32];
+    for i in 0..4u8 {
+        let mut cid = [0u8; 32];
+        cid[0] = i;
+        mb.put_classified(recv, cid, [0u8; 32], vec![0u8; 48], TrustClass::Anonymous)
+            .unwrap();
+    }
+    mb.put([0xD2u8; 32], [7u8; 32], [0xD3u8; 32], vec![0u8; 48])
+        .unwrap();
+    let anon_before = mb.receiver_anon_bytes(recv).unwrap();
+    let ident_before = sender_bytes_row(&mb, [0xD3u8; 32]);
+    drop(mb);
+
+    // Reopen twice: idempotence, not just correctness on the first pass.
+    let mb = reopen(tmp.path(), cfg.clone());
+    assert_eq!(mb.receiver_anon_bytes(recv).unwrap(), anon_before);
+    drop(mb);
+    let mb = reopen(tmp.path(), cfg);
+    assert_eq!(
+        mb.receiver_anon_bytes(recv).unwrap(),
+        anon_before,
+        "the rebuild must be idempotent, not accumulate on each open"
+    );
+    assert_eq!(sender_bytes_row(&mb, [0xD3u8; 32]), ident_before);
+}
+
+// ── audit V-05 (adjacent): a valid token cannot conjure a sender ───────────
+
+/// An anonymous deposit (`sender == [0u8; 32]`, the transport's no-sender
+/// MARKER) carrying a VALID capability token used to verify, be classified
+/// `Identified`, and be charged to `sender_bytes[[0u8; 32]]` — the single
+/// network-wide bucket the receiver-keyed anonymous budget exists to replace.
+/// One depositor filling it would close the door for every other tokened
+/// anonymous sender.
+#[test]
+fn v05_zero_sender_cannot_be_charged_to_the_shared_marker_bucket() {
+    let cfg = MailboxConfig {
+        rate_limit_per_minute: 0,
+        ..MailboxConfig::default()
+    };
+    let (mb, _tmp, _clk) = fresh(cfg);
+    let recv = [0xE1u8; 32];
+
+    // The classification a verified token produces, with no sender to charge.
+    let out = mb
+        .put_classified(recv, [1u8; 32], [0u8; 32], vec![0u8; 64], TrustClass::Identified)
+        .unwrap();
+    assert!(matches!(out, PutOutcome::Stored { .. }));
+
+    assert_eq!(
+        sender_bytes_row(&mb, [0u8; 32]),
+        0,
+        "the no-sender marker must never be charged as if it were a sender — \
+         that is the shared bucket every anonymous depositor used to contend for"
+    );
+    assert_eq!(
+        mb.receiver_anon_bytes(recv).unwrap(),
+        billable_bytes(64),
+        "with no sender to charge, the deposit belongs to the receiver-keyed \
+         anonymous budget"
+    );
+}
+
+/// CONTROL: a deposit that DOES carry a sender is still identified — charged
+/// per-sender and parked in the identified eviction pool. Otherwise the guard
+/// above could be reclassifying everything.
+#[test]
+fn v05_control_a_real_sender_is_still_identified() {
+    let cfg = MailboxConfig {
+        rate_limit_per_minute: 0,
+        ..MailboxConfig::default()
+    };
+    let (mb, _tmp, _clk) = fresh(cfg);
+    let recv = [0xF1u8; 32];
+    let sender = [0xF2u8; 32];
+
+    mb.put_classified(recv, [1u8; 32], sender, vec![0u8; 64], TrustClass::Identified)
+        .unwrap();
+    assert_eq!(sender_bytes_row(&mb, sender), billable_bytes(64));
+    assert_eq!(
+        mb.receiver_anon_bytes(recv).unwrap(),
+        0,
+        "an identified deposit must not spend the receiver's anonymous slice"
+    );
+}
