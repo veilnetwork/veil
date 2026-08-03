@@ -111,7 +111,7 @@ pub(crate) async fn handle_stream_open(
                             &p,
                             delivery_tx,
                             &stream_table,
-                            broadcaster,
+                            Arc::clone(&broadcaster),
                             &bridge,
                         )
                         .await
@@ -128,6 +128,22 @@ pub(crate) async fn handle_stream_open(
                                         req_id,
                                         &ok.encode(),
                                     ),
+                                    // The remote has ACCEPTED and the table slot
+                                    // is reserved, but nothing OWNS the stream
+                                    // until the loop claims it — and the
+                                    // disconnect sweep only walks claimed ids.
+                                    // Ship the teardown with the message so
+                                    // every way the message can go unacted-on
+                                    // (send error, or still buffered when the
+                                    // loop exits) closes the stream instead of
+                                    // orphaning it for 300-360 s. See
+                                    // `RemoteStreamGuard`.
+                                    guard: crate::server::RemoteStreamGuard::new(
+                                        ipc_stream_id,
+                                        stream_table.clone(),
+                                        Some(broadcaster),
+                                        Some(bridge.clone()),
+                                    ),
                                 }
                             }
                             Err(code) => crate::server::LoopReply::Frame(
@@ -138,6 +154,10 @@ pub(crate) async fn handle_stream_open(
                                 ),
                             ),
                         };
+                        // Deliberately not checking the return code: the error
+                        // case drops `msg`, and dropping the guard inside it is
+                        // exactly the teardown. Checking would cover only this
+                        // one of the two ways the reply can be lost.
                         let _ = reply_tx.send(msg).await;
                     });
                     Ok(())

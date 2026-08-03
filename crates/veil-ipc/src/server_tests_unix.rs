@@ -2428,3 +2428,183 @@ async fn request_id_same_arc_replies_out_of_order_by_id() {
     let _ = shutdown_tx.send(true);
     let _ = server_handle.await;
 }
+
+// ── audit V-04 (adjacent hole): the disconnect sweep vs. `?` error-exits ──
+
+/// The per-connection stream sweep used to be trailing statements after the
+/// `select!` loop, so it ran only on the loop's `break`s. Every `?` in the
+/// frame dispatcher — ~40 handler calls, `handle_stream_open` among them —
+/// returns straight out of `handle_ipc_client` and jumped clean over it, so a
+/// client whose connection ended that way leaked EVERY stream it owned: each
+/// keeps a `MAX_TOTAL_STREAMS` slot and (for remote-bound ones) a parked bridge
+/// task plus wire state on the peer, until the idle reaper eventually notices.
+///
+/// Forced here through the bind decode-failure cap, which is a real `?` exit
+/// with a real trigger a local app can reach. As a `Drop` guard the sweep no
+/// longer distinguishes the exit paths.
+#[tokio::test]
+async fn ipc_client_error_exit_still_closes_its_streams() {
+    let sock = temp_socket_path();
+    let (mut server, shutdown_tx, _) = make_server(sock.clone());
+    let table = Arc::clone(&server.stream_table);
+    let sh = tokio::spawn(async move { server.run().await });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    // B binds the acceptor endpoint; A opens a stream to it, so A owns a live
+    // stream at the moment its connection dies.
+    let mut client_b = connect_and_hello(&sock).await;
+    let bind = AppBindPayload {
+        endpoint_id: 7,
+        flags: 0,
+        namespace: b"v04_error_exit".to_vec(),
+        name: b"svc".to_vec(),
+    };
+    send_ipc_frame(&mut client_b, LocalAppMsg::AppBind as u16, &bind.encode()).await;
+    let (hdr, body) = recv_ipc_frame(&mut client_b).await;
+    assert_eq!(hdr.msg_type, LocalAppMsg::AppBindOk as u16);
+    let target_app_id = AppBindOkPayload::decode(&body).unwrap().app_id;
+
+    let mut client_a = connect_and_hello(&sock).await;
+    let open = StreamOpenPayload {
+        dst_node_id: node_id(),
+        app_id: target_app_id,
+        endpoint_id: 7,
+        initial_window: STREAM_INITIAL_WINDOW,
+    };
+    send_ipc_frame(
+        &mut client_a,
+        LocalAppMsg::StreamOpen as u16,
+        &open.encode(),
+    )
+    .await;
+    let (hdr, _) = tokio::time::timeout(Duration::from_millis(500), recv_ipc_frame(&mut client_a))
+        .await
+        .expect("timeout waiting for STREAM_OPEN_OK");
+    assert_eq!(hdr.msg_type, LocalAppMsg::StreamOpenOk as u16);
+    assert_eq!(table.len(), 1, "the stream must be live before the fault");
+
+    // Drive A's connection into a `?` exit: malformed APP_BIND payloads until
+    // the decode-failure cap trips and the handler returns an io::Error.
+    for _ in 0..=veil_proto::budget::MAX_BIND_DECODE_FAILURES {
+        send_ipc_frame(&mut client_a, LocalAppMsg::AppBind as u16, &[0xFFu8]).await;
+    }
+
+    // The stream A owned must be gone. Poll so the assertion fails cleanly
+    // (rather than hanging) if the sweep is skipped again.
+    let mut closed = false;
+    for _ in 0..2000 {
+        if table.is_empty() {
+            closed = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+    assert!(
+        closed,
+        "a connection that ended by `?` left its stream in the table — the \
+         disconnect sweep only covered the loop's `break` exits"
+    );
+
+    drop(client_a);
+    drop(client_b);
+    let _ = shutdown_tx.send(true);
+    let _ = sh.await;
+}
+
+/// CONTROL for the V-04 teardown guard, driven through the REAL connection
+/// loop: when the loop does act on `RemoteStreamOpened` — claims ownership and
+/// disarms — the stream must survive and the peer must NOT be sent an
+/// `AppClose`.
+///
+/// Deleting the `guard.disarm()` at that call site would tear down every
+/// successfully-opened remote stream the instant the client learned its id;
+/// that is a far worse bug than the orphan the guard exists to prevent, and
+/// this is the test that would catch it.
+#[tokio::test]
+async fn remote_stream_open_survives_the_teardown_guard_once_claimed() {
+    use std::collections::HashMap;
+    use std::sync::Mutex as StdMutex;
+    use std::sync::atomic::AtomicU32;
+    use veil_proto::app::receipt_status;
+    use veil_proto::family::AppMsg;
+
+    let sock = temp_socket_path();
+    let remote = [0xEEu8; 32];
+    assert_ne!(remote, node_id(), "fixture must be a REMOTE node");
+
+    let (wire_tx, mut wire_rx) = tokio::sync::mpsc::unbounded_channel();
+    let bcast: Arc<dyn veil_types::FrameBroadcaster> = Arc::new(CapturingPeerBroadcaster {
+        peer_id: remote,
+        tx: wire_tx,
+    });
+    let bridge = crate::bridge::IpcStreamBridge {
+        veil_stream_rx: Arc::new(StdMutex::new(HashMap::new())),
+        pending_receipts: Arc::new(StdMutex::new(HashMap::new())),
+        wire_stream_counter: Arc::new(AtomicU32::new(1)),
+    };
+
+    let (server, shutdown_tx, _) = make_server(sock.clone());
+    let mut server = server
+        .with_session_tx_registry(bcast)
+        .with_stream_bridge(bridge.clone());
+    let table = Arc::clone(&server.stream_table);
+    let sh = tokio::spawn(async move { server.run().await });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let mut client = connect_and_hello(&sock).await;
+    let open = StreamOpenPayload {
+        dst_node_id: remote,
+        app_id: [0xAAu8; 32],
+        endpoint_id: 1,
+        initial_window: STREAM_INITIAL_WINDOW,
+    };
+    send_ipc_frame_id(&mut client, LocalAppMsg::StreamOpen as u16, 42, &open.encode()).await;
+
+    // The peer ACCEPTS.
+    let mut accepted = false;
+    for _ in 0..2000 {
+        if let Some(tx) = bridge.pending_receipts.lock().unwrap().remove(&(remote, 1)) {
+            let _ = tx.send(receipt_status::ACCEPTED);
+            accepted = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+    assert!(accepted, "the handler never registered a receipt waiter");
+
+    let (hdr, body) = tokio::time::timeout(Duration::from_secs(2), recv_ipc_frame(&mut client))
+        .await
+        .expect("timeout waiting for STREAM_OPEN_OK")
+        ;
+    assert_eq!(hdr.msg_type, LocalAppMsg::StreamOpenOk as u16);
+    assert_eq!(hdr.request_id, 42, "the reply must echo the request id");
+    let stream_id = StreamOpenOkPayload::decode(&body).unwrap().stream_id;
+    assert!(stream_id > 0);
+
+    // Give a mis-armed guard time to fire before asserting it did not.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(
+        table.len(),
+        1,
+        "a claimed remote stream must stay in the table"
+    );
+    let mut saw_open = false;
+    while let Ok((_, frame)) = wire_rx.try_recv() {
+        let h = codec::decode_header(&frame).unwrap();
+        if h.msg_type == AppMsg::AppOpen as u16 {
+            saw_open = true;
+        }
+        assert_ne!(
+            h.msg_type,
+            AppMsg::AppClose as u16,
+            "the teardown guard fired on a stream the loop had CLAIMED — every \
+             successful remote open would be closed the moment the client \
+             learned its id"
+        );
+    }
+    assert!(saw_open, "the AppOpen must have gone out");
+
+    drop(client);
+    let _ = shutdown_tx.send(true);
+    let _ = sh.await;
+}

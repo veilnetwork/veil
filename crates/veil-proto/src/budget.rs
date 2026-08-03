@@ -902,11 +902,16 @@ pub const FORWARD_SEEN_SET_TTL_SECS: u64 = 60;
 /// and node memory by calling APP_BIND in a tight loop.
 pub const MAX_IPC_ENDPOINTS_PER_CLIENT: usize = 64;
 
-/// Maximum concurrent locally-originated streams per IPC client connection.
+/// Maximum locally-originated stream opens per IPC client CONNECTION.
 /// The global cap is `MAX_TOTAL_STREAMS = 65_536`; without a per-client cap a
 /// single misbehaving local app can open all of them and starve other clients.
-/// Counter is decremented when the client receives `STREAM_CLOSE` for one of
-/// its opens; resets to zero on reconnect.
+///
+/// CUMULATIVE, not concurrent: the counter is incremented on every open
+/// attempt and never decremented — closing a stream does not give the budget
+/// back. (This doc used to claim a `STREAM_CLOSE` decremented it; nothing ever
+/// did, and no caller behaved as if it had.) It resets to zero on reconnect,
+/// which is inherent to per-connection state; the global cap plus the
+/// disconnect sweep are what bound a reconnect loop's footprint.
 pub const MAX_IPC_STREAMS_PER_CLIENT: usize = 256;
 
 // ── Route cache / origin-seq sybil mitigation ─────────────────────
