@@ -180,7 +180,74 @@ pub(crate) enum LoopReply {
     /// A remote STREAM_OPEN completed: the loop must claim opener ownership
     /// for `ipc_stream_id` on its `IpcClientState` BEFORE writing `frame`
     /// (the client may reference the stream the moment it learns the id).
-    RemoteStreamOpened { ipc_stream_id: u32, frame: Vec<u8> },
+    ///
+    /// `guard` carries the stream's teardown with the message. Between the
+    /// remote's ACCEPTED and the loop claiming ownership the stream exists in
+    /// the global table but belongs to nobody, so the disconnect sweep — which
+    /// walks only CLAIMED ids — cannot see it; it would sit there holding a
+    /// `MAX_TOTAL_STREAMS` slot, a parked bridge task and the peer's wire-side
+    /// state until the idle reaper noticed, 300-360 s later. Ownership is
+    /// transferred here so every way this message can fail to be acted on —
+    /// `send` erroring, or the message sitting in the channel buffer when the
+    /// loop exits — drops the guard and tears the stream down. Checking the
+    /// `send` return code would close only the first of those.
+    RemoteStreamOpened {
+        ipc_stream_id: u32,
+        frame: Vec<u8>,
+        guard: RemoteStreamGuard,
+    },
+}
+
+/// Teardown-on-drop for a reserved-but-not-yet-owned remote IPC stream.
+///
+/// Disarmed by [`Self::disarm`] the instant the connection loop claims
+/// ownership; from then on the ordinary close paths (explicit `STREAM_CLOSE`,
+/// or [`ClientStreamCleanup`] at disconnect) are responsible for it. Until
+/// then, dropping it runs the same synchronous
+/// [`close_owned_stream`] the explicit path uses.
+pub(crate) struct RemoteStreamGuard {
+    ipc_stream_id: u32,
+    stream_table: IpcStreamTable,
+    session_tx_registry: Option<Arc<dyn FrameBroadcaster>>,
+    stream_bridge: Option<crate::bridge::IpcStreamBridge>,
+    armed: bool,
+}
+
+impl RemoteStreamGuard {
+    pub(crate) fn new(
+        ipc_stream_id: u32,
+        stream_table: IpcStreamTable,
+        session_tx_registry: Option<Arc<dyn FrameBroadcaster>>,
+        stream_bridge: Option<crate::bridge::IpcStreamBridge>,
+    ) -> Self {
+        Self {
+            ipc_stream_id,
+            stream_table,
+            session_tx_registry,
+            stream_bridge,
+            armed: true,
+        }
+    }
+
+    /// Ownership has been claimed — the stream now has an owner who will close
+    /// it, so this guard must not.
+    pub(crate) fn disarm(mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for RemoteStreamGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        close_owned_stream(
+            self.ipc_stream_id,
+            &self.stream_table,
+            self.session_tx_registry.as_deref(),
+            self.stream_bridge.as_ref(),
+        );
+    }
 }
 
 /// Run a slow reply job either OFF-loop (spawned task; requires a non-zero
@@ -270,7 +337,12 @@ pub struct IpcClientState {
     /// `owned_streams_acceptor` — without such a check, any local IPC client
     /// could push bytes into / close another client's stream by simply
     /// guessing the `stream_id`.
-    owned_streams_opener: std::collections::HashSet<u32>,
+    ///
+    /// Behind `Arc<Mutex<_>>` (like the acceptor set below) so
+    /// [`ClientStreamCleanup`] can own a handle to it and run the
+    /// disconnect sweep from `Drop` — see that type for why the sweep cannot
+    /// stay as trailing statements after the connection loop.
+    owned_streams_opener: Arc<std::sync::Mutex<std::collections::HashSet<u32>>>,
     /// Streams this client is the acceptor (this client is the **B
     /// side**) of, populated by the per-endpoint forwarder task when it
     /// translates an `AppMessage::StreamOpen` into a `STREAM_OPEN_INBOUND`
@@ -331,7 +403,9 @@ impl IpcClientState {
             client_token,
             streams_opened: 0,
             bind_decode_failures: 0,
-            owned_streams_opener: std::collections::HashSet::new(),
+            owned_streams_opener: Arc::new(std::sync::Mutex::new(
+                std::collections::HashSet::new(),
+            )),
             owned_streams_acceptor: Arc::new(std::sync::Mutex::new(
                 std::collections::HashSet::new(),
             )),
@@ -389,12 +463,18 @@ impl IpcClientState {
     /// `STREAM_WINDOW` frames bearing the same id can then be authorised
     /// and routed via `route_data_from_a` (A → B direction).
     pub(super) fn claim_stream_opener(&mut self, stream_id: u32) {
-        self.owned_streams_opener.insert(stream_id);
+        self.owned_streams_opener
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(stream_id);
     }
 
     /// Returns true iff this client opened `stream_id`.
     pub(super) fn owns_stream_as_opener(&self, stream_id: u32) -> bool {
-        self.owned_streams_opener.contains(&stream_id)
+        self.owned_streams_opener
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .contains(&stream_id)
     }
 
     /// Returns true iff this client is the acceptor (B side) of `stream_id`
@@ -414,7 +494,10 @@ impl IpcClientState {
     /// only ever be one side of any given stream_id, and the lookup is
     /// O(1) anyway.
     pub(super) fn release_stream(&mut self, stream_id: u32) {
-        self.owned_streams_opener.remove(&stream_id);
+        self.owned_streams_opener
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(&stream_id);
         self.owned_streams_acceptor
             .lock()
             .unwrap_or_else(|p| p.into_inner())
@@ -453,17 +536,23 @@ impl IpcClientState {
     /// peer keeps its wire-side state. Deduplicated via a set: a connection is
     /// normally only one side of a given id, but a loopback open could place the
     /// id in both sets and closing twice must not double-emit a wire `AppClose`.
-    pub(super) fn owned_stream_ids(&self) -> Vec<u32> {
-        let mut ids: std::collections::HashSet<u32> =
-            self.owned_streams_opener.iter().copied().collect();
-        ids.extend(
-            self.owned_streams_acceptor
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .iter()
-                .copied(),
-        );
-        ids.into_iter().collect()
+    /// RAII form of the disconnect sweep. Hold the returned value for the
+    /// lifetime of the connection loop; it closes every stream this client
+    /// still owns when it drops, on EVERY exit path.
+    pub(super) fn stream_cleanup_guard(
+        &self,
+        stream_table: Arc<IpcStreamTable>,
+        session_tx_registry: Option<Arc<dyn FrameBroadcaster>>,
+        stream_bridge: Option<crate::bridge::IpcStreamBridge>,
+    ) -> ClientStreamCleanup {
+        ClientStreamCleanup {
+            opener: Arc::clone(&self.owned_streams_opener),
+            acceptor: Arc::clone(&self.owned_streams_acceptor),
+            acceptor_routes: Arc::clone(&self.owned_streams_acceptor_routes),
+            stream_table,
+            session_tx_registry,
+            stream_bridge,
+        }
     }
 
     /// Clone the acceptor-side ownership handle for a forwarder task.
@@ -1758,6 +1847,93 @@ fn close_owned_stream(
     }
 }
 
+/// Snapshot of every stream id a client owns (opener ∪ acceptor), deduplicated
+/// — a loopback open can place the same id in both sets and closing twice must
+/// not double-emit a wire `AppClose`.
+fn owned_stream_ids_of(
+    opener: &std::sync::Mutex<std::collections::HashSet<u32>>,
+    acceptor: &std::sync::Mutex<std::collections::HashSet<u32>>,
+) -> Vec<u32> {
+    let mut ids: std::collections::HashSet<u32> = opener
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .iter()
+        .copied()
+        .collect();
+    ids.extend(
+        acceptor
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .iter()
+            .copied(),
+    );
+    ids.into_iter().collect()
+}
+
+/// Closes every stream a departing IPC client still owns, when it drops.
+///
+/// This sweep used to be trailing statements after the connection loop, which
+/// meant it ran only on the `break`-driven exits. Every `?` in the frame
+/// dispatcher — `handle_stream_open(...).await?` among ~40 others — returns
+/// straight out of `handle_ipc_client` and skipped it entirely, so a client
+/// that vanished while a handler was mid-write leaked ALL of its streams,
+/// correctly-claimed ones included: each keeps a `MAX_TOTAL_STREAMS` slot, a
+/// bridge task parked on `data_rx`, and wire-side state on the peer, until the
+/// idle reaper eventually notices. As a `Drop` it runs on every path there is,
+/// including a panic unwinding out of the loop.
+///
+/// Declared AFTER `IpcClientState` so it drops BEFORE it — the endpoints must
+/// still be registered while the sweep notifies them.
+pub(crate) struct ClientStreamCleanup {
+    opener: Arc<std::sync::Mutex<std::collections::HashSet<u32>>>,
+    acceptor: Arc<std::sync::Mutex<std::collections::HashSet<u32>>>,
+    acceptor_routes: Arc<std::sync::Mutex<std::collections::HashMap<u32, AcceptorRemoteRoute>>>,
+    stream_table: Arc<IpcStreamTable>,
+    session_tx_registry: Option<Arc<dyn FrameBroadcaster>>,
+    stream_bridge: Option<crate::bridge::IpcStreamBridge>,
+}
+
+impl Drop for ClientStreamCleanup {
+    fn drop(&mut self) {
+        // EOF / idle / write-error / `?` exits never send STREAM_CLOSE, so
+        // without this a remote-bound stream leaks: its inbound bridge stays
+        // parked on `data_rx`, its slot is held against MAX_TOTAL_STREAMS, and
+        // the peer keeps wire-side state. Local pairs notify both endpoints;
+        // remotes emit a wire `AppClose` + drop the bridge registration (see
+        // `close_owned_stream`). Idempotent, so it is harmless for streams the
+        // client already closed explicitly.
+        for stream_id in owned_stream_ids_of(&self.opener, &self.acceptor) {
+            // Acceptor of a REMOTE-opened stream: notify the opener's node so
+            // it doesn't leak its wire-side stream (`close_owned_stream` only
+            // covers opener-side remote routes + local pairs). Mirrors the
+            // explicit-close path.
+            let route = self
+                .acceptor_routes
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .get(&stream_id)
+                .copied();
+            if let Some(route) = route
+                && let Some(b) = self.session_tx_registry.as_deref()
+            {
+                crate::handlers::stream::send_app_close(
+                    b,
+                    &route.opener_node_id,
+                    stream_id,
+                    route.app_id,
+                    route.endpoint_id,
+                );
+            }
+            close_owned_stream(
+                stream_id,
+                &self.stream_table,
+                self.session_tx_registry.as_deref(),
+                self.stream_bridge.as_ref(),
+            );
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn handle_ipc_client(
     mut stream: IpcStream,
@@ -1944,6 +2120,18 @@ async fn handle_ipc_client(
     let mut event_rx: Option<tokio::sync::broadcast::Receiver<veil_proto::EventPayload>> =
         event_bus.as_ref().map(|bus| bus.subscribe());
 
+    // Close any streams this client still owns but never explicitly closed, on
+    // EVERY exit path of this function — the `break`s below AND the `?` on any
+    // of the ~40 handler calls in the dispatcher. Declared here (after
+    // `client_state`, so it drops before it, while the endpoints it notifies
+    // are still registered) rather than run as trailing statements, which the
+    // `?` paths skipped entirely. See [`ClientStreamCleanup`].
+    let _stream_cleanup = client_state.stream_cleanup_guard(
+        Arc::clone(&stream_table),
+        session_tx_registry.clone(),
+        stream_bridge.clone(),
+    );
+
     // Bidirectional idle timeout (audit U3): reset on any activity in either
     // direction; fires only when the connection is fully silent both ways for
     // IPC_SESSION_IDLE_TIMEOUT, at which point we close it to release the M6
@@ -1970,11 +2158,16 @@ async fn handle_ipc_client(
                 idle.as_mut().reset(bump());
                 let frame = match reply {
                     LoopReply::Frame(frame) => frame,
-                    LoopReply::RemoteStreamOpened { ipc_stream_id, frame } => {
+                    LoopReply::RemoteStreamOpened { ipc_stream_id, frame, guard } => {
                         // Claim ownership BEFORE the client learns the stream
                         // id from the ok-frame below; quota was reserved at
                         // spawn time (see handle_stream_open).
                         client_state.claim_stream_opener(ipc_stream_id);
+                        // Owned now, so `_stream_cleanup` covers it from here
+                        // on and the in-flight guard must stand down. Disarm
+                        // strictly AFTER the claim: the guard is the only
+                        // thing holding this stream in the meantime.
+                        guard.disarm();
                         frame
                     }
                 };
@@ -2892,37 +3085,11 @@ async fn handle_ipc_client(
     // returns — on this `break`-driven path AND on any earlier `?` error-exit,
     // so a lingering read half never keeps the socket fd open (audit M4 / U3).
 
-    // Close any streams this client still owns but never explicitly closed.
-    // EOF / idle / write-error exits skip STREAM_CLOSE, so without this a
-    // remote-bound stream leaks: its inbound bridge stays parked on `data_rx`,
-    // its slot is held against MAX_TOTAL_STREAMS, and the peer keeps wire-side
-    // state. Local pairs notify both endpoints; remotes emit a wire `AppClose`
-    // + drop the bridge registration (see `close_owned_stream`). Idempotent, so
-    // it is harmless for streams the client already closed explicitly.
-    for stream_id in client_state.owned_stream_ids() {
-        // Acceptor of a REMOTE-opened stream: notify the opener's node so it
-        // doesn't leak its wire-side stream (close_owned_stream only covers
-        // opener-side remote routes + local pairs). Mirrors the explicit-close
-        // path above.
-        if let Some(route) = client_state.acceptor_remote_route(stream_id)
-            && let Some(b) = session_tx_registry.as_deref()
-        {
-            crate::handlers::stream::send_app_close(
-                b,
-                &route.opener_node_id,
-                stream_id,
-                route.app_id,
-                route.endpoint_id,
-            );
-        }
-        close_owned_stream(
-            stream_id,
-            &stream_table,
-            session_tx_registry.as_deref(),
-            stream_bridge.as_ref(),
-        );
-    }
-
+    // `_stream_cleanup` (declared before the loop) closes any streams this
+    // client still owns but never explicitly closed. It fires from `Drop`, so
+    // unlike the trailing loop it replaced it also covers the `?` error-exits
+    // out of the frame dispatcher.
+    //
     // client_state dropped here → all handles dropped → endpoints unregistered
     Ok(())
 }
@@ -3274,6 +3441,260 @@ mod remote_stream_open_tests {
         assert_eq!(
             hdr.stream_id, wire_id,
             "AppClose carries the wire stream id"
+        );
+    }
+
+    // ── audit V-04: the window between the remote's ACCEPTED and the loop
+    //    claiming ownership ────────────────────────────────────────────────
+    //
+    // In that window the stream is reserved in the global table but belongs to
+    // nobody, and the disconnect sweep walks only CLAIMED ids — so nothing
+    // sees it. Two ways the claim never happens: the reply `send` fails, or it
+    // succeeds and the reply sits in the channel buffer when the loop exits.
+    // Checking the `send` return code would cover only the first, which is why
+    // the teardown travels WITH the message as a guard instead.
+
+    /// Poll `cond` up to ~3 s. Returns its final value, so a caller asserts on
+    /// it and gets a clean failure rather than a hang when the fix is absent.
+    async fn eventually(mut cond: impl FnMut() -> bool) -> bool {
+        for _ in 0..3000 {
+            if cond() {
+                return true;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+        cond()
+    }
+
+    /// Drive a remote `STREAM_OPEN` through the SPAWNED (request-id
+    /// concurrency) path — the one that hands the reply back through
+    /// `LoopReply` — and give the caller the reply receiver so it can decide
+    /// what befalls the `RemoteStreamOpened` message.
+    ///
+    /// `kill_reply_rx_first` drops the receiver before the spawned task can
+    /// send (trigger a: `send` errors); otherwise the receiver is returned
+    /// alive and the message lands in its buffer (trigger b).
+    async fn run_spawned_open(
+        kill_reply_rx_first: bool,
+    ) -> (
+        IpcStreamTable,
+        IpcStreamBridge,
+        Arc<CapturingBroadcaster>,
+        UnixStream,
+        Option<mpsc::Receiver<LoopReply>>,
+    ) {
+        let src = [0u8; 32];
+        let dst = [9u8; 32];
+        let table = IpcStreamTable::new();
+        let bridge = fresh_bridge();
+        let bc = Arc::new(CapturingBroadcaster::default());
+        let registry = Arc::new(AppEndpointRegistry::new());
+        let (delivery_tx, _delivery_rx) = mpsc::channel(8);
+        let body = StreamOpenPayload {
+            dst_node_id: dst,
+            app_id: [5u8; 32],
+            endpoint_id: 7,
+            initial_window: 1024,
+        }
+        .encode();
+        let (client, server) = UnixStream::pair().unwrap();
+        let (_rh, wh) = veil_local_transport::LocalStream::Unix(server).into_split();
+
+        let (reply_tx, reply_rx) = mpsc::channel::<LoopReply>(REPLY_CHANNEL_CAP);
+        let reply_rx = if kill_reply_rx_first {
+            drop(reply_rx);
+            None
+        } else {
+            Some(reply_rx)
+        };
+
+        let mut cs = IpcClientState::new(delivery_tx, src, [0u8; 16], None);
+        let mut wh = wh;
+        let spawn_sem = Arc::new(tokio::sync::Semaphore::new(
+            MAX_SPAWNED_HANDLERS_PER_CONNECTION,
+        ));
+        // req_id != 0 + a free permit → the OFF-loop path. This returns as soon
+        // as the worker is spawned; the open itself happens on that worker.
+        handle_stream_open(
+            &mut wh,
+            &body,
+            42,
+            &mut cs,
+            &registry,
+            &table,
+            &src,
+            Some(Arc::clone(&bc) as Arc<dyn veil_types::FrameBroadcaster>),
+            Some(&bridge),
+            &spawn_sem,
+            &reply_tx,
+        )
+        .await
+        .unwrap();
+
+        // ACCEPT the open, the way the peer's AppReceipt would.
+        for _ in 0..10_000 {
+            if let Some(tx) = bridge.pending_receipts.lock().unwrap().remove(&(dst, 1)) {
+                let _ = tx.send(receipt_status::ACCEPTED);
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        // Wait for the spawned worker to finish: it holds a semaphore permit
+        // for exactly its lifetime, so a full permit count is the completion
+        // signal. Without this the assertions would race the worker.
+        assert!(
+            eventually(|| spawn_sem.available_permits() == MAX_SPAWNED_HANDLERS_PER_CONNECTION)
+                .await,
+            "the spawned stream-open worker never finished"
+        );
+        drop(reply_tx);
+        (table, bridge, bc, client, reply_rx)
+    }
+
+    /// Trigger (a): the reply `send` fails because the connection loop is
+    /// already gone. The stream the remote ACCEPTED must not survive as an
+    /// orphan — nobody would ever close it, and the idle reaper is 300-360 s
+    /// away.
+    #[tokio::test]
+    async fn v04_accepted_stream_is_torn_down_when_the_reply_cannot_be_sent() {
+        let (table, bridge, bc, _client, _rx) = run_spawned_open(true).await;
+
+        assert!(
+            eventually(|| table.is_empty()).await,
+            "an ACCEPTED stream whose reply could not be delivered stayed in \
+             the table with no owner: it holds a MAX_TOTAL_STREAMS slot, a \
+             parked bridge task and the peer's wire-side state"
+        );
+        assert!(
+            bridge.veil_stream_rx.lock().unwrap().is_empty(),
+            "the inbound bridge registration must be dropped too"
+        );
+        let saw_close = bc.sent.lock().unwrap().iter().any(|(_, bytes)| {
+            veil_proto::codec::decode_header(bytes).unwrap().msg_type == AppMsg::AppClose as u16
+        });
+        assert!(
+            saw_close,
+            "the peer that ACCEPTED must be told to release its half"
+        );
+    }
+
+    /// Trigger (b): the `send` SUCCEEDS, then the loop exits before reading the
+    /// reply. This is the trigger a `send`-return-code check cannot see — the
+    /// send reported success — and the reason the teardown rides with the
+    /// message instead.
+    #[tokio::test]
+    async fn v04_accepted_stream_is_torn_down_when_the_reply_is_never_read() {
+        let (table, bridge, bc, _client, reply_rx) = run_spawned_open(false).await;
+        let reply_rx = reply_rx.expect("receiver kept alive");
+
+        // The reply really did get through — otherwise this test would be
+        // silently re-testing trigger (a).
+        assert_eq!(reply_rx.len(), 1, "the reply must be buffered, not lost");
+        assert_eq!(table.len(), 1, "and the stream is live while it is queued");
+
+        // The connection loop exits without draining: buffered messages drop.
+        drop(reply_rx);
+
+        assert!(
+            eventually(|| table.is_empty()).await,
+            "a reply that was delivered but never acted on left the stream \
+             orphaned"
+        );
+        assert!(bridge.veil_stream_rx.lock().unwrap().is_empty());
+        let saw_close = bc.sent.lock().unwrap().iter().any(|(_, bytes)| {
+            veil_proto::codec::decode_header(bytes).unwrap().msg_type == AppMsg::AppClose as u16
+        });
+        assert!(saw_close, "the peer must be told to release its half");
+    }
+
+    /// CONTROL: when the loop DOES act on the reply — claim ownership, then
+    /// disarm — the stream survives. Without this the two tests above would
+    /// pass just as well if the guard tore every stream down unconditionally.
+    #[tokio::test]
+    async fn v04_control_claimed_stream_survives_the_guard() {
+        let (table, bridge, bc, _client, reply_rx) = run_spawned_open(false).await;
+        let mut reply_rx = reply_rx.expect("receiver kept alive");
+
+        let (tx, _rx) = mpsc::channel::<veil_bufpool::PooledShared>(1);
+        let mut cs = IpcClientState::new(tx, [0u8; 32], [0u8; 16], None);
+        match reply_rx.try_recv().expect("the reply is queued") {
+            LoopReply::RemoteStreamOpened {
+                ipc_stream_id,
+                frame: _,
+                guard,
+            } => {
+                cs.claim_stream_opener(ipc_stream_id);
+                guard.disarm();
+                assert!(cs.owns_stream_as_opener(ipc_stream_id));
+            }
+            LoopReply::Frame(_) => panic!("expected RemoteStreamOpened"),
+        }
+        drop(reply_rx);
+
+        // Nothing should tear it down now — give the disarmed guard's drop a
+        // chance to misbehave before asserting.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert_eq!(
+            table.len(),
+            1,
+            "a stream whose ownership WAS claimed must not be torn down"
+        );
+        assert!(!bridge.veil_stream_rx.lock().unwrap().is_empty());
+        let saw_close = bc.sent.lock().unwrap().iter().any(|(_, bytes)| {
+            veil_proto::codec::decode_header(bytes).unwrap().msg_type == AppMsg::AppClose as u16
+        });
+        assert!(!saw_close, "no AppClose for a stream that is still in use");
+    }
+
+    /// The disconnect sweep is now a `Drop` guard, so it runs on the `?`
+    /// error-exits out of the frame dispatcher too — not only the `break`s.
+    /// Pre-fix a client that vanished mid-handler leaked EVERY stream it
+    /// owned, correctly-claimed ones included.
+    #[test]
+    fn v04_cleanup_guard_closes_every_owned_stream_when_it_drops() {
+        let table = Arc::new(IpcStreamTable::new());
+        let bridge = fresh_bridge();
+        let bc = Arc::new(CapturingBroadcaster::default());
+        let dst = [9u8; 32];
+
+        let (tx, _rx) = mpsc::channel::<veil_bufpool::PooledShared>(1);
+        let mut cs = IpcClientState::new(tx, [0u8; 32], [0u8; 16], None);
+        for wire_id in 1..=3u32 {
+            let ipc_id = table
+                .open_remote(dst, wire_id, [5u8; 32], 7)
+                .expect("open_remote");
+            let (data_tx, _data_rx) = mpsc::channel::<Vec<u8>>(1);
+            bridge
+                .veil_stream_rx
+                .lock()
+                .unwrap()
+                .insert((dst, wire_id), data_tx);
+            cs.claim_stream_opener(ipc_id);
+        }
+        assert_eq!(table.len(), 3);
+
+        let guard = cs.stream_cleanup_guard(
+            Arc::clone(&table),
+            Some(Arc::clone(&bc) as Arc<dyn veil_types::FrameBroadcaster>),
+            Some(bridge.clone()),
+        );
+        // Simulates `handle_ipc_client` returning — by `?` or by `break`, the
+        // guard cannot tell the difference, which is the whole point.
+        drop(guard);
+
+        assert_eq!(
+            table.len(),
+            0,
+            "every stream the departing client owned must be closed"
+        );
+        assert!(
+            bridge.veil_stream_rx.lock().unwrap().is_empty(),
+            "every inbound bridge registration must be dropped"
+        );
+        assert_eq!(
+            bc.sent.lock().unwrap().len(),
+            3,
+            "each remote peer must get an AppClose"
         );
     }
 }
