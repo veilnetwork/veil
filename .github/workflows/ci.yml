@@ -141,6 +141,20 @@ jobs:
         # tracking issue/Epic.
         run: cargo audit --deny warnings
 
+      - name: cargo audit (fuzz lockfile)
+        # report5: `fuzz/Cargo.toml` declares an empty `[workspace]` so
+        # cargo-fuzz can manage it, which also takes it out of the workspace
+        # lockfile — the audit above walks `Cargo.lock` and never sees a single
+        # fuzz dependency.  Nothing in CI builds the crate either, so the lock
+        # simply rots: it had 5 advisories against a clean production lock,
+        # unreachable ones (the targets are pure decoders) that nobody would
+        # have noticed becoming reachable.  `--locked` on the metadata resolve
+        # is what keeps this honest — auditing a lockfile that has drifted away
+        # from its manifest audits nothing.
+        run: |
+          cargo metadata --manifest-path fuzz/Cargo.toml --locked --format-version 1 > /dev/null
+          cargo audit --deny warnings --file fuzz/Cargo.lock
+
       - name: Install cargo-deny
         run: cargo install cargo-deny --version "^0.19" --locked
 
