@@ -262,6 +262,11 @@ pub mod rocks {
     /// entries (8-byte, ts-only) are read back compatibly: missing len ⇒ 0.
     const CF_KEY_TS: &str = "key_ts_v1";
 
+    /// The entry `evict_oldest` settled on: its ts-index row (kept so the row
+    /// can be deleted by its own key), the 32-byte store key, and the value.
+    /// Aliased to keep the local inside clippy's type-complexity budget.
+    type Victim = (Box<[u8]>, [u8; 32], Vec<u8>);
+
     #[derive(Debug)]
     pub struct RocksDbCold {
         db: rocksdb::DB,
@@ -405,6 +410,28 @@ pub mod rocks {
             } else {
                 false
             }
+        }
+
+        /// Test-only fixture: plant a ts-index row pointing at `key` while
+        /// leaving no value and no reverse-map row — the exact state left
+        /// behind when a value delete lands but its index delete does not.
+        /// A small `ts` makes it the OLDEST row, which is the case that used
+        /// to stop `evict_oldest` dead.
+        #[cfg(test)]
+        pub fn plant_dangling_index_row(&self, ts: u64, key: &[u8; 32]) {
+            self.db
+                .put_cf(self.cf_ix(), Self::ix_key(ts, key), [])
+                .expect("test fixture: ts-index write");
+        }
+
+        /// Test-only observation: number of rows in the ts-index CF. Lets a
+        /// test assert positively that a dangling row was actually removed,
+        /// rather than merely stepped over.
+        #[cfg(test)]
+        pub fn ts_index_row_count(&self) -> usize {
+            self.db
+                .iterator_cf(self.cf_ix(), rocksdb::IteratorMode::Start)
+                .count()
         }
     }
 
@@ -569,20 +596,55 @@ pub mod rocks {
         }
 
         fn evict_oldest(&mut self) -> Option<([u8; 32], Vec<u8>)> {
-            // Smallest ts_index key = oldest entry.
-            let oldest = self
+            // Walk the ts-index oldest-first. A row whose value is already
+            // gone — a torn write, or a value delete whose index delete failed
+            // — must be DROPPED AND SKIPPED, never read as "there is nothing
+            // to evict". Such a row is by construction the SMALLEST index key,
+            // so bailing out on it (the old `?` on the value lookup) stopped
+            // eviction for the whole cold tier permanently: the entry cap and
+            // the cold half of `TieredStore`'s byte-cap loop stayed frozen
+            // while the loop chewed through the hot tier on every put, until
+            // the node degenerated to an almost-empty hot tier in front of a
+            // frozen, over-full cold one — with no recovery short of deleting
+            // the database (audit report5).
+            let mut victim: Option<Victim> = None;
+            let mut dangling: Vec<Box<[u8]>> = Vec::new();
+            for item in self
                 .db
                 .iterator_cf(self.cf_ix(), rocksdb::IteratorMode::Start)
-                .next()?
-                .ok()?;
-            let (ix_key, _) = oldest;
-            if ix_key.len() < 40 {
-                return None;
+            {
+                let Ok((ix_key, _)) = item else { break };
+                // Row layout is `ts_be(8) ‖ key(32)`; a short row is corrupt
+                // and is treated exactly like a dangling one.
+                let live = <[u8; 32]>::try_from(ix_key.get(8..40).unwrap_or_default())
+                    .ok()
+                    .and_then(|key| self.db.get(key).ok().flatten().map(|v| (key, v)));
+                match live {
+                    Some((key, value)) => {
+                        victim = Some((ix_key, key, value));
+                        break;
+                    }
+                    None => dangling.push(ix_key),
+                }
             }
-            let key: [u8; 32] = <[u8; 32]>::try_from(&ix_key[8..40]).ok()?;
-            let value = self.db.get(key).ok().flatten()?;
+            // Drop every dangling row walked past, so the next call does not
+            // pay for them again. `unindex` cannot do this: it locates the
+            // ts-index row THROUGH the reverse map, which is precisely what a
+            // dangling row is missing.
+            for ix_key in dangling {
+                if let Err(e) = self.db.delete_cf(self.cf_ix(), &ix_key) {
+                    log::warn!("dht.cold.rocksdb: dangling ts-index delete failed: {e}");
+                }
+            }
+            let (ix_key, key, value) = victim?;
             if self.unindex(&key) {
                 self.count = self.count.saturating_sub(1);
+            }
+            // Also delete THIS row directly: `unindex` reaches the ts-index
+            // through the reverse map's ts, so a missing or drifted reverse
+            // map would otherwise leave the row behind as a fresh dangler.
+            if let Err(e) = self.db.delete_cf(self.cf_ix(), &ix_key) {
+                log::warn!("dht.cold.rocksdb: ts-index delete failed: {e}");
             }
             let _ = self.db.delete(key);
             Some((key, value))
@@ -1793,6 +1855,92 @@ mod tests {
         assert!(cold.evict_oldest().is_some());
         assert_eq!(cold.len(), 0);
         assert!(cold.evict_oldest().is_none(), "empty store evicts nothing");
+    }
+
+    /// audit report5: a SINGLE dangling ts-index row — index row present, its
+    /// value gone — used to switch eviction off for the whole cold tier. The
+    /// dangling row sorts oldest, and `evict_oldest` answered `None` on it
+    /// (the `?` on the value lookup) instead of stepping over it, so every
+    /// later call re-read the same row and gave up again.
+    ///
+    /// Asserted positively: eviction must PROCEED and hand back exactly the
+    /// entries it owes, oldest-first — "no error" would pass on the bug,
+    /// whose whole signature is doing nothing quietly.
+    #[cfg(feature = "rocksdb-cold")]
+    #[test]
+    fn rocksdb_cold_evict_oldest_steps_over_a_dangling_index_row() {
+        use super::ColdBackend;
+        let dir = tempfile::tempdir().unwrap();
+        let mut cold = super::rocks::RocksDbCold::open(dir.path().join("c"), 0).unwrap();
+        cold.put([1u8; 32], b"one".to_vec());
+        cold.put([2u8; 32], b"two".to_vec());
+        cold.put([3u8; 32], b"three".to_vec());
+        // ts = 1 (1970) sorts strictly ahead of every real row's wall clock.
+        cold.plant_dangling_index_row(1, &[9u8; 32]);
+        assert_eq!(
+            cold.ts_index_row_count(),
+            4,
+            "fixture: 3 live rows + 1 dangling"
+        );
+
+        assert_eq!(
+            cold.evict_oldest(),
+            Some(([1u8; 32], b"one".to_vec())),
+            "eviction must step over the dangling row and return the real oldest"
+        );
+        assert_eq!(cold.len(), 2, "the maintained count follows the eviction");
+        assert!(!cold.contains(&[1u8; 32]), "the evicted value is gone");
+        // Deleted, not merely walked past: 4 − 1 dangling − 1 evicted = 2.
+        assert_eq!(
+            cold.ts_index_row_count(),
+            2,
+            "the dangling row must be removed, not re-walked on every call"
+        );
+
+        // The rest of the tier still drains, in order, to empty.
+        assert_eq!(cold.evict_oldest(), Some(([2u8; 32], b"two".to_vec())));
+        assert_eq!(cold.evict_oldest(), Some(([3u8; 32], b"three".to_vec())));
+        assert_eq!(cold.evict_oldest(), None, "drained tier evicts nothing");
+        assert_eq!(cold.len(), 0);
+        assert_eq!(cold.ts_index_row_count(), 0, "index drained with the tier");
+    }
+
+    /// audit report5, the same defect seen where it hurts: with cold eviction
+    /// frozen by one dangling index row, `TieredStore`'s byte-cap loop falls
+    /// straight through to the hot tier and drops a hot entry on every put,
+    /// while the over-full cold tier sits untouched. The node degenerates into
+    /// an almost-empty hot tier in front of a frozen cold one.
+    #[cfg(feature = "rocksdb-cold")]
+    #[test]
+    fn dangling_index_row_does_not_make_the_byte_cap_eat_the_hot_tier() {
+        use super::ColdBackend;
+        let dir = tempfile::tempdir().unwrap();
+        let mut cold = super::rocks::RocksDbCold::open(dir.path().join("c"), 0).unwrap();
+        for i in 1u8..=4 {
+            cold.put([i; 32], vec![i; 10]);
+        }
+        cold.plant_dangling_index_row(1, &[9u8; 32]);
+
+        // hot_capacity 8 → no demotion; cap 25 → the third 10-byte put must
+        // free room, and the cold tier is where it has to come from.
+        let mut store = TieredStore::with_cold(8, Box::new(cold)).with_max_bytes(25);
+        store.put([100u8; 32], vec![0u8; 10]);
+        store.put([101u8; 32], vec![0u8; 10]);
+        store.put([102u8; 32], vec![0u8; 10]);
+
+        assert_eq!(
+            store.hot_len(),
+            3,
+            "all three hot entries survive — the bytes come out of cold"
+        );
+        assert_eq!(store.cold_len(), 3, "exactly one cold entry was evicted");
+        assert!(
+            !store.contains(&[1u8; 32]),
+            "and it is the OLDEST cold entry, not an arbitrary one"
+        );
+        for i in 2u8..=4 {
+            assert!(store.contains(&[i; 32]), "younger cold entries stay");
+        }
     }
 
     /// audit cycle-6 (T5-B): overwriting a key re-indexes it (drops the stale
