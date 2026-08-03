@@ -278,11 +278,13 @@ pub mod rocks {
         /// is unreliable (reads 0 before memtable flush), so a maintained count
         /// is what lets the entry cap actually fire.
         count: usize,
-        /// Sum of indexed value byte-lengths seen at `open` (audit cycle-8),
-        /// used once to seed `TieredStore::total_bytes` so the byte/origin caps
-        /// account for an already-populated disk tier across restarts. `None`
-        /// if the index carried no length info (all-legacy-v1 DB).
-        seed_bytes: Option<u64>,
+        /// Sum of value byte-lengths on disk at `open` (audit cycle-8), used
+        /// once to seed `TieredStore::total_bytes` so the byte/origin caps
+        /// account for an already-populated disk tier across restarts. Summed
+        /// from the ACTUAL values by [`Self::reconcile`], not from the lengths
+        /// recorded in the reverse map — a recorded length that has drifted
+        /// away from its value is one of the states reconciliation repairs.
+        seed_bytes: u64,
     }
 
     impl RocksDbCold {
@@ -290,12 +292,21 @@ pub mod rocks {
             path: impl AsRef<std::path::Path>,
             capacity: usize,
         ) -> Result<Self, rocksdb::Error> {
+            let path = path.as_ref();
+            // ASK BEFORE OPENING whether the side CFs already exist. This is
+            // the one signal that separates a grandfathered legacy value from
+            // a ghost, and opening destroys it — `create_missing_column_families`
+            // makes the CFs exist either way. See [`Self::reconcile`].
+            let side_cfs_existed = rocksdb::DB::list_cf(&rocksdb::Options::default(), path)
+                .map(|cfs| cfs.iter().any(|name| name == CF_KEY_TS))
+                .unwrap_or(false);
             let mut opts = rocksdb::Options::default();
             opts.create_if_missing(true);
             // Legacy DBs (pre-T5-B) have only the default CF; create the new
-            // side CFs on open. Legacy values stay in the default CF and remain
-            // readable; they carry no index entry, so they are grandfathered
-            // (never age/cap-evicted) until overwritten or owner-DELETE'd.
+            // side CFs on open. Their values stay in the default CF and remain
+            // readable; `reconcile` adopts them into the index on this same
+            // open, which is what ends the old grandfathering (they used to be
+            // unreachable by TTL and by every cap until overwritten).
             opts.create_missing_column_families(true);
             opts.set_compression_type(rocksdb::DBCompressionType::Lz4);
             // Memory-footprint caps (audit: RSS reduction on the small nodes).
@@ -327,36 +338,200 @@ pub mod rocks {
                 rocksdb::ColumnFamilyDescriptor::new(CF_KEY_TS, cf_opts),
             ];
             let db = rocksdb::DB::open_cf_descriptors(&opts, path, cfs)?;
-            // One-time O(n) startup scan of the reverse-map CF (keys + small
-            // fixed values — cheap relative to the value set): seed both the
-            // exact entry count AND (audit cycle-8) the sum of per-key value
-            // byte-lengths so the store can re-seed `total_bytes` for the
-            // already-persisted disk tier. A v2 value is `ts(8)‖len(8)`; a
-            // legacy v1 value is `ts(8)` only (len treated as 0, so a fully
-            // legacy DB yields `seed_bytes = None`).
-            let (count, summed_bytes, any_len) = {
-                let cf = db.cf_handle(CF_KEY_TS).expect("CF_KEY_TS just created");
-                let mut count = 0usize;
-                let mut summed: u64 = 0;
-                let mut any_len = false;
-                for item in db.iterator_cf(cf, rocksdb::IteratorMode::Start) {
-                    let Ok((_k, v)) = item else { continue };
-                    count += 1;
-                    if v.len() >= 16 {
-                        let mut len_arr = [0u8; 8];
-                        len_arr.copy_from_slice(&v[8..16]);
-                        summed = summed.saturating_add(u64::from_be_bytes(len_arr));
-                        any_len = true;
-                    }
-                }
-                (count, summed, any_len)
-            };
+            let (count, seed_bytes) = Self::reconcile(&db, side_cfs_existed);
             Ok(Self {
                 db,
                 capacity,
                 count,
-                seed_bytes: if any_len { Some(summed_bytes) } else { None },
+                seed_bytes,
             })
+        }
+
+        /// Test-only: reopen an existing store READ-ONLY. Every write against
+        /// the returned handle fails at the RocksDB level, which is the only
+        /// honest way to observe what a failed write leaves behind.
+        #[cfg(test)]
+        pub fn open_read_only(
+            path: impl AsRef<std::path::Path>,
+            capacity: usize,
+        ) -> Result<Self, rocksdb::Error> {
+            let opts = rocksdb::Options::default();
+            let cf_opts = rocksdb::Options::default();
+            let cfs = vec![
+                rocksdb::ColumnFamilyDescriptor::new(CF_TS_INDEX, cf_opts.clone()),
+                rocksdb::ColumnFamilyDescriptor::new(CF_KEY_TS, cf_opts),
+            ];
+            let db = rocksdb::DB::open_cf_descriptors_read_only(&opts, path, cfs, false)?;
+            let (count, seed_bytes) = Self::reconcile(&db, true);
+            Ok(Self {
+                db,
+                capacity,
+                count,
+                seed_bytes,
+            })
+        }
+
+        /// One-time open-time reconciliation across the three column families,
+        /// returning the exact `(entry count, total value bytes)` of the tier.
+        ///
+        /// A stored entry is three rows: the value in the default CF, a reverse
+        /// map `key → ts‖len` in `CF_KEY_TS`, and a ts-index row in
+        /// `CF_TS_INDEX`. The scan this replaces walked `CF_KEY_TS` ONLY and
+        /// never enumerated the default CF, so it could not see a single one of
+        /// the states a torn write leaves — it summed the lengths the index
+        /// claimed and trusted them. It already paid for a full pass; checking
+        /// the other two families against it is a bounded addition, and it is
+        /// what turns the pass from bookkeeping into repair:
+        ///
+        /// * reverse map row whose value is gone — ORPHAN; both index rows go.
+        /// * recorded length that disagrees with the value — rewritten, so the
+        ///   next open's byte seed matches what is really on disk.
+        /// * value with no reverse map row — ADOPTED (see below).
+        /// * ts-index row with no matching reverse map row (or a drifted ts) —
+        ///   dangling; it goes. Such a row is what used to freeze eviction for
+        ///   the entire cold tier.
+        ///
+        /// # Telling a ghost from a grandfathered legacy value
+        ///
+        /// A value with no index rows has two possible histories, and the bytes
+        /// on disk do not distinguish them:
+        ///
+        /// * it was written by a pre-T5-B binary, which had only the default CF
+        ///   — the class `open`'s header calls grandfathered; or
+        /// * a post-T5-B write was torn between the value and its index rows —
+        ///   a GHOST: `get` serves it, `iter_entries` publishes it, no eviction
+        ///   path can reach it and no byte counter knows about it.
+        ///
+        /// What separates them is not the row, it is WHEN we look. A pre-T5-B
+        /// database has no `CF_KEY_TS` at all until this very open creates it,
+        /// so `side_cfs_existed == false` proves every unindexed value is
+        /// legacy, and `true` proves every unindexed value is a ghost. That
+        /// signal exists exactly once per database, which is why `open`
+        /// captures it BEFORE opening.
+        ///
+        /// Both are then treated identically, and neither is deleted: the value
+        /// is live data that `get` is already serving, and deleting it would
+        /// lose a DHT record to repair a bookkeeping fault. They are ADOPTED —
+        /// indexed at the current wall clock — which counts their bytes and
+        /// brings them under the ordinary TTL/cap lifecycle. For a ghost that
+        /// is the repair.
+        ///
+        /// ⚠️ For a legacy value adoption ENDS the grandfathering, deliberately.
+        /// An unbounded class of values that no cap and no TTL can ever reach
+        /// is itself the leak this audit is closing; the values are kept, they
+        /// merely stop being exempt. It is also what makes the signal above
+        /// one-shot: after this pass no unindexed value exists, so any that
+        /// appears later is unambiguously a ghost.
+        fn reconcile(db: &rocksdb::DB, side_cfs_existed: bool) -> (usize, u64) {
+            let cf_kt = db.cf_handle(CF_KEY_TS).expect("CF_KEY_TS just created");
+            let cf_ix = db.cf_handle(CF_TS_INDEX).expect("CF_TS_INDEX just created");
+
+            let mut batch = rocksdb::WriteBatch::default();
+            let mut count = 0usize;
+            let mut summed = 0u64;
+            let (mut orphans, mut adopted, mut dangling, mut relengths) = (0usize, 0, 0, 0);
+
+            // Pass 1 — reverse map against the values.
+            for item in db.iterator_cf(cf_kt, rocksdb::IteratorMode::Start) {
+                let Ok((k, kt)) = item else { break };
+                let Ok(key) = <[u8; 32]>::try_from(k.as_ref()) else {
+                    batch.delete_cf(cf_kt, &k);
+                    continue;
+                };
+                let ts = kt
+                    .get(..8)
+                    .and_then(|s| <[u8; 8]>::try_from(s).ok())
+                    .map(u64::from_be_bytes);
+                match db.get_pinned(key) {
+                    Ok(Some(value)) => {
+                        let actual = value.len() as u64;
+                        count += 1;
+                        summed = summed.saturating_add(actual);
+                        let recorded = kt
+                            .get(8..16)
+                            .and_then(|s| <[u8; 8]>::try_from(s).ok())
+                            .map(u64::from_be_bytes);
+                        // Also upgrades a legacy v1 row (`ts(8)`, no length).
+                        if recorded != Some(actual)
+                            && let Some(ts) = ts
+                        {
+                            batch.put_cf(cf_kt, key, Self::kt_value(ts, actual));
+                            relengths += 1;
+                        }
+                    }
+                    _ => {
+                        if let Some(ts) = ts {
+                            batch.delete_cf(cf_ix, Self::ix_key(ts, &key));
+                        }
+                        batch.delete_cf(cf_kt, key);
+                        orphans += 1;
+                    }
+                }
+            }
+
+            // Pass 2 — values with no reverse map row: ghost or legacy, adopted
+            // either way. Staged deletes from pass 1 are not visible here, but
+            // they cannot collide: an orphan is by definition a key whose value
+            // this iteration does not produce.
+            let now = Self::now_secs();
+            for item in db.iterator(rocksdb::IteratorMode::Start) {
+                let Ok((k, value)) = item else { break };
+                let Ok(key) = <[u8; 32]>::try_from(k.as_ref()) else {
+                    continue;
+                };
+                if matches!(db.get_pinned_cf(cf_kt, key), Ok(Some(_))) {
+                    continue; // already accounted for in pass 1
+                }
+                let len = value.len() as u64;
+                batch.put_cf(cf_kt, key, Self::kt_value(now, len));
+                batch.put_cf(cf_ix, Self::ix_key(now, &key), []);
+                count += 1;
+                summed = summed.saturating_add(len);
+                adopted += 1;
+            }
+
+            // Pass 3 — ts-index rows the reverse map does not vouch for. Rows
+            // adopted in pass 2 are still only in the batch, so they are not
+            // seen here and cannot be mistaken for dangling.
+            for item in db.iterator_cf(cf_ix, rocksdb::IteratorMode::Start) {
+                let Ok((ix, _)) = item else { break };
+                let vouched = <[u8; 32]>::try_from(ix.get(8..40).unwrap_or_default())
+                    .ok()
+                    .is_some_and(|key| match db.get_pinned_cf(cf_kt, key) {
+                        // The ts prefix must agree, or this row is a leftover
+                        // from an overwrite whose delete never landed.
+                        Ok(Some(kt)) => kt.get(..8) == ix.get(..8),
+                        _ => false,
+                    });
+                if !vouched {
+                    batch.delete_cf(cf_ix, &ix);
+                    dangling += 1;
+                }
+            }
+
+            let repairs = orphans + adopted + dangling + relengths;
+            if repairs > 0 {
+                if let Err(e) = db.write(batch) {
+                    log::error!(
+                        "dht.cold.rocksdb: open-time reconciliation could not be written ({e}); \
+                         the tier stays inconsistent and the next open will retry"
+                    );
+                } else if side_cfs_existed {
+                    log::warn!(
+                        "dht.cold.rocksdb: repaired a torn cold tier on open — {orphans} orphaned \
+                         index entries dropped, {dangling} dangling ts-index rows dropped, \
+                         {adopted} ghost values (written without their index) adopted into the \
+                         index, {relengths} byte-length records corrected"
+                    );
+                } else {
+                    log::info!(
+                        "dht.cold.rocksdb: upgraded a pre-index database — {adopted} legacy \
+                         values adopted into the index; they are no longer exempt from TTL and \
+                         cap eviction"
+                    );
+                }
+            }
+            (count, summed)
         }
 
         /// Build the `CF_KEY_TS` value (`ts_be(8) ‖ len_be(8)`).
@@ -388,10 +563,16 @@ pub mod rocks {
             k
         }
 
-        /// Drop the index entries for `key` (reverse-map + ts-index), returning
-        /// `true` if an index entry existed (i.e. the key was an indexed entry,
-        /// not a grandfathered legacy value).
-        fn unindex(&mut self, key: &[u8; 32]) -> bool {
+        /// STAGE the removal of `key`'s index rows (reverse map + ts-index)
+        /// into `batch`, returning `true` if an index entry existed.
+        ///
+        /// Staging rather than writing is the point: this used to issue two
+        /// independent `delete_cf` calls whose failures were reported by
+        /// nothing but a `log::warn!`, so a caller could believe the entry was
+        /// unindexed while one row survived. Its four callers now fold it into
+        /// the same `WriteBatch` as the value write/delete, which is what makes
+        /// a logical operation all-or-nothing.
+        fn stage_unindex(&self, batch: &mut rocksdb::WriteBatch, key: &[u8; 32]) -> bool {
             if let Ok(Some(old_kt)) = self.db.get_cf(self.cf_kt(), key) {
                 // Value is `ts(8)` (legacy v1) or `ts(8)‖len(8)` (v2); the ts
                 // prefix is what locates the stale ts-index entry.
@@ -399,17 +580,31 @@ pub mod rocks {
                     let mut ts_arr = [0u8; 8];
                     ts_arr.copy_from_slice(&old_kt[..8]);
                     let old_ts = u64::from_be_bytes(ts_arr);
-                    if let Err(e) = self.db.delete_cf(self.cf_ix(), Self::ix_key(old_ts, key)) {
-                        log::warn!("dht.cold.rocksdb: delete ts-index failed: {e}");
-                    }
+                    batch.delete_cf(self.cf_ix(), Self::ix_key(old_ts, key));
                 }
-                if let Err(e) = self.db.delete_cf(self.cf_kt(), key) {
-                    log::warn!("dht.cold.rocksdb: delete key-ts failed: {e}");
-                }
+                batch.delete_cf(self.cf_kt(), key);
                 true
             } else {
                 false
             }
+        }
+
+        /// Delete an entry — value and both index rows — in ONE batch, and
+        /// move the maintained count only if the write landed. Returns whether
+        /// it did: a caller that credits bytes back for a delete that failed
+        /// drifts its byte counter DOWN against a value that is still on disk.
+        fn delete_entry(&mut self, key: &[u8; 32]) -> bool {
+            let mut batch = rocksdb::WriteBatch::default();
+            let was_indexed = self.stage_unindex(&mut batch, key);
+            batch.delete(key);
+            if let Err(e) = self.db.write(batch) {
+                log::warn!("dht.cold.rocksdb: entry delete failed: {e}");
+                return false;
+            }
+            if was_indexed {
+                self.count = self.count.saturating_sub(1);
+            }
+            true
         }
 
         /// Test-only fixture: plant a ts-index row pointing at `key` while
@@ -422,6 +617,39 @@ pub mod rocks {
             self.db
                 .put_cf(self.cf_ix(), Self::ix_key(ts, key), [])
                 .expect("test fixture: ts-index write");
+        }
+
+        /// Test-only fixture: write a value into the default CF and NOTHING
+        /// else — the state a torn put leaves when the value lands and its two
+        /// index rows do not. Indistinguishable on disk from a grandfathered
+        /// pre-T5-B value, which is the whole point of `reconcile`'s
+        /// `side_cfs_existed` signal.
+        #[cfg(test)]
+        pub fn plant_unindexed_value(&self, key: &[u8; 32], value: &[u8]) {
+            self.db.put(key, value).expect("test fixture: value write");
+        }
+
+        /// Test-only fixture: write the two index rows for `key` with a
+        /// recorded length of `recorded_len`. With no value present this is an
+        /// ORPHAN (a torn delete, or a torn put whose value never landed);
+        /// with a value present and a wrong length it is the recorded-length
+        /// drift that made the restart byte seed lie.
+        #[cfg(test)]
+        pub fn plant_index_rows(&self, ts: u64, key: &[u8; 32], recorded_len: u64) {
+            self.db
+                .put_cf(self.cf_kt(), key, Self::kt_value(ts, recorded_len))
+                .expect("test fixture: reverse-map write");
+            self.db
+                .put_cf(self.cf_ix(), Self::ix_key(ts, key), [])
+                .expect("test fixture: ts-index write");
+        }
+
+        /// Test-only observation: number of rows in the reverse-map CF.
+        #[cfg(test)]
+        pub fn reverse_map_row_count(&self) -> usize {
+            self.db
+                .iterator_cf(self.cf_kt(), rocksdb::IteratorMode::Start)
+                .count()
         }
 
         /// Test-only observation: number of rows in the ts-index CF. Lets a
@@ -442,32 +670,37 @@ pub mod rocks {
 
         fn put(&mut self, key: [u8; 32], value: Vec<u8>) -> ColdPut {
             let byte_len = value.len() as u64;
-            // Write the value FIRST and bail on failure WITHOUT touching the
-            // index or count (audit cycle-8: previously `let _ = db.put(...)`
-            // ignored disk-full/IO errors, then bumped `count` and wrote index
-            // entries for a value that never landed — drifting count vs data).
-            if let Err(e) = self.db.put(key, &value) {
+            let ts = Self::now_secs();
+            // ONE batch per logical put. A stored entry is three rows — the
+            // value, the reverse map, the ts-index — and they used to go to
+            // disk as three independent writes of which only the FIRST was
+            // checked; the other two reported failure with a `log::warn!` and
+            // the count was then bumped regardless. Every durable state that
+            // leaves is reachable that way and none of them is recoverable at
+            // runtime: a value with no index rows is a GHOST (served by `get`,
+            // published by `iter_entries`, reachable by no eviction path and
+            // uncounted after restart), and index rows with no value are what
+            // used to freeze eviction for the whole tier (audit report5).
+            // RocksDB applies a WriteBatch atomically across column families,
+            // so the only two outcomes now are all three rows or none.
+            let mut batch = rocksdb::WriteBatch::default();
+            // Drop any stale (old_ts, key) row first. Same batch, applied in
+            // insertion order, so an overwrite within the same wall-clock
+            // second still ends with the fresh rows rather than deleting them.
+            let was_indexed = self.stage_unindex(&mut batch, &key);
+            batch.put(key, &value);
+            batch.put_cf(self.cf_kt(), key, Self::kt_value(ts, byte_len));
+            batch.put_cf(self.cf_ix(), Self::ix_key(ts, &key), []);
+            if let Err(e) = self.db.write(batch) {
                 // Hand the value BACK rather than dropping it. Returning
                 // `None` here was indistinguishable from "stored, nothing
                 // evicted", so a disk-full write silently lost a DHT value
                 // that demotion had already taken out of the hot tier
                 // (audit V-08).
-                log::warn!("dht.cold.rocksdb: value write failed ({e}); not stored");
+                log::warn!("dht.cold.rocksdb: put failed ({e}); not stored");
                 return ColdPut::Failed(value);
             }
-            // Value is durable; now (re)index. Drop any stale (old_ts, key)
-            // index entry on overwrite, then write the fresh ts‖len + ts-index.
-            let was_indexed = self.unindex(&key);
-            let ts = Self::now_secs();
-            if let Err(e) = self
-                .db
-                .put_cf(self.cf_kt(), key, Self::kt_value(ts, byte_len))
-            {
-                log::warn!("dht.cold.rocksdb: key-ts index write failed: {e}");
-            }
-            if let Err(e) = self.db.put_cf(self.cf_ix(), Self::ix_key(ts, &key), []) {
-                log::warn!("dht.cold.rocksdb: ts-index write failed: {e}");
-            }
+            // The entry is real only now, so only now does it count.
             if !was_indexed {
                 self.count += 1;
             }
@@ -487,12 +720,7 @@ pub mod rocks {
         }
 
         fn remove(&mut self, key: &[u8; 32]) {
-            if self.unindex(key) {
-                self.count = self.count.saturating_sub(1);
-            }
-            if let Err(e) = self.db.delete(key) {
-                log::warn!("dht.cold.rocksdb: value delete failed: {e}");
-            }
+            let _ = self.delete_entry(key);
         }
 
         fn contains(&self, key: &[u8; 32]) -> bool {
@@ -504,7 +732,7 @@ pub mod rocks {
         }
 
         fn cold_total_bytes(&self) -> Option<u64> {
-            self.seed_bytes
+            Some(self.seed_bytes)
         }
 
         fn is_durable(&self) -> bool {
@@ -535,19 +763,22 @@ pub mod rocks {
         }
 
         fn retain(&mut self, f: &dyn Fn(&[u8; 32], &[u8]) -> bool) -> Vec<([u8; 32], u64)> {
-            let to_delete: Vec<([u8; 32], u64)> = self
+            let condemned: Vec<([u8; 32], u64)> = self
                 .iter_entries()
                 .into_iter()
                 .filter(|(k, v)| !f(k, v))
                 .map(|(k, v)| (k, v.len() as u64))
                 .collect();
-            for (key, _) in &to_delete {
-                if self.unindex(key) {
-                    self.count = self.count.saturating_sub(1);
+            // Report only what actually left. The removed list is the caller's
+            // byte-counter delta, so a delete that failed must not appear in
+            // it — those bytes are still on disk.
+            let mut removed = Vec::with_capacity(condemned.len());
+            for (key, bytes) in condemned {
+                if self.delete_entry(&key) {
+                    removed.push((key, bytes));
                 }
-                let _ = self.db.delete(key);
             }
-            to_delete
+            removed
         }
 
         fn retain_newer_than(&mut self, cutoff: Instant) -> Vec<([u8; 32], u64)> {
@@ -586,11 +817,10 @@ pub mod rocks {
                     .flatten()
                     .map(|v| v.len())
                     .unwrap_or(0) as u64;
-                if self.unindex(&key) {
-                    self.count = self.count.saturating_sub(1);
+                // Same rule as `retain`: only what really left is reported.
+                if self.delete_entry(&key) {
+                    removed.push((key, byte_len));
                 }
-                let _ = self.db.delete(key);
-                removed.push((key, byte_len));
             }
             removed
         }
@@ -631,22 +861,33 @@ pub mod rocks {
             // pay for them again. `unindex` cannot do this: it locates the
             // ts-index row THROUGH the reverse map, which is precisely what a
             // dangling row is missing.
-            for ix_key in dangling {
-                if let Err(e) = self.db.delete_cf(self.cf_ix(), &ix_key) {
-                    log::warn!("dht.cold.rocksdb: dangling ts-index delete failed: {e}");
+            if !dangling.is_empty() {
+                let mut repair = rocksdb::WriteBatch::default();
+                for ix_key in &dangling {
+                    repair.delete_cf(self.cf_ix(), ix_key);
+                }
+                if let Err(e) = self.db.write(repair) {
+                    log::warn!("dht.cold.rocksdb: dangling ts-index cleanup failed: {e}");
                 }
             }
             let (ix_key, key, value) = victim?;
-            if self.unindex(&key) {
+            // One batch again: the value and both index rows leave together
+            // or the eviction did not happen and must not be reported.
+            let mut batch = rocksdb::WriteBatch::default();
+            let was_indexed = self.stage_unindex(&mut batch, &key);
+            // Delete THIS row directly as well: `stage_unindex` reaches the
+            // ts-index through the reverse map's ts, so a missing or drifted
+            // reverse map would otherwise leave the row behind as a fresh
+            // dangler.
+            batch.delete_cf(self.cf_ix(), &ix_key);
+            batch.delete(key);
+            if let Err(e) = self.db.write(batch) {
+                log::warn!("dht.cold.rocksdb: eviction of the oldest entry failed: {e}");
+                return None;
+            }
+            if was_indexed {
                 self.count = self.count.saturating_sub(1);
             }
-            // Also delete THIS row directly: `unindex` reaches the ts-index
-            // through the reverse map's ts, so a missing or drifted reverse
-            // map would otherwise leave the row behind as a fresh dangler.
-            if let Err(e) = self.db.delete_cf(self.cf_ix(), &ix_key) {
-                log::warn!("dht.cold.rocksdb: ts-index delete failed: {e}");
-            }
-            let _ = self.db.delete(key);
             Some((key, value))
         }
     }
@@ -1069,10 +1310,18 @@ impl TieredStore {
         }
         // Cold doesn't return the removed value from its `remove` API.
         // Get the value first so we can subtract its bytes from the total.
-        if let Some(val) = self.cold.get(key) {
-            removed_bytes = removed_bytes.saturating_add(val.len() as u64);
-        }
+        let cold_bytes = self.cold.get(key).map(|v| v.len() as u64).unwrap_or(0);
         self.cold.remove(key);
+        // Credit the cold bytes back ONLY once the value is really gone. A
+        // backend delete can fail (a disk error is reported by the trait as
+        // nothing at all), and subtracting bytes for a value still on disk
+        // drifts `total_bytes` DOWN — then the next put of the same key
+        // reaches this same line and subtracts them a second time. Two failed
+        // deletes of a large value buy unlimited room under the global cap
+        // (audit report5).
+        if cold_bytes > 0 && !self.cold.contains(key) {
+            removed_bytes = removed_bytes.saturating_add(cold_bytes);
+        }
         if removed_bytes > 0 {
             self.total_bytes = self.total_bytes.saturating_sub(removed_bytes);
             if let Some(origin) = self.entry_origin.remove(key)
@@ -1960,6 +2209,176 @@ mod tests {
         assert_eq!(cold.len(), 0);
     }
 
+    /// audit report5: a torn put leaves a GHOST — the value landed, its two
+    /// index rows did not. `get` serves it and `iter_entries` publishes it,
+    /// but no eviction path can reach it and no byte counter knows about it,
+    /// because the open scan only ever walked the reverse map and never
+    /// enumerated the values. Reconciliation adopts it.
+    ///
+    /// The side CFs exist before this value is planted, which is exactly what
+    /// makes it a ghost rather than a grandfathered pre-index value.
+    #[cfg(feature = "rocksdb-cold")]
+    #[test]
+    fn rocksdb_cold_open_adopts_a_ghost_value() {
+        use super::ColdBackend;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("c");
+        {
+            let mut cold = super::rocks::RocksDbCold::open(&path, 0).unwrap();
+            cold.put([1u8; 32], b"indexed".to_vec()); // 7 bytes
+            cold.plant_unindexed_value(&[2u8; 32], b"ghost-value"); // 11 bytes
+            assert_eq!(cold.len(), 1, "fixture: the ghost is invisible to the count");
+        }
+
+        let mut cold = super::rocks::RocksDbCold::open(&path, 0).unwrap();
+        assert_eq!(cold.len(), 2, "the ghost must be adopted into the index");
+        assert_eq!(
+            cold.cold_total_bytes(),
+            Some(18),
+            "and its bytes must reach the restart byte seed"
+        );
+        assert_eq!(cold.reverse_map_row_count(), 2);
+        assert_eq!(cold.ts_index_row_count(), 2);
+
+        // The point of adoption: the value becomes reachable by eviction at
+        // all. Drain the tier and require the ghost among the evicted.
+        let mut evicted: Vec<[u8; 32]> = Vec::new();
+        while let Some((key, _)) = cold.evict_oldest() {
+            evicted.push(key);
+        }
+        assert_eq!(evicted.len(), 2, "the whole tier drains");
+        assert!(
+            evicted.contains(&[2u8; 32]),
+            "the adopted ghost is evictable now"
+        );
+        assert_eq!(cold.len(), 0);
+    }
+
+    /// audit report5: the mirror state — index rows for a value that is not
+    /// there. A reverse-map row whose value is gone made the open scan count a
+    /// non-existent entry and add its CLAIMED byte length to the restart seed;
+    /// a bare ts-index row is what used to freeze eviction for the whole tier.
+    /// Reconciliation drops both.
+    #[cfg(feature = "rocksdb-cold")]
+    #[test]
+    fn rocksdb_cold_open_drops_orphaned_and_dangling_index_rows() {
+        use super::ColdBackend;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("c");
+        {
+            let mut cold = super::rocks::RocksDbCold::open(&path, 0).unwrap();
+            cold.put([1u8; 32], b"real".to_vec()); // 4 bytes
+            // A torn delete: the value went, both index rows stayed, and the
+            // reverse map claims 999 bytes for it.
+            cold.plant_index_rows(1, &[2u8; 32], 999);
+            // A half-torn delete: only the ts-index row survived.
+            cold.plant_dangling_index_row(2, &[3u8; 32]);
+            assert_eq!(cold.reverse_map_row_count(), 2);
+            assert_eq!(cold.ts_index_row_count(), 3);
+        }
+
+        let cold = super::rocks::RocksDbCold::open(&path, 0).unwrap();
+        assert_eq!(cold.len(), 1, "an orphan is not an entry and must not count");
+        assert_eq!(
+            cold.cold_total_bytes(),
+            Some(4),
+            "and its claimed 999 bytes must not reach the byte seed"
+        );
+        assert_eq!(
+            cold.reverse_map_row_count(),
+            1,
+            "the orphaned reverse-map row is deleted"
+        );
+        assert_eq!(
+            cold.ts_index_row_count(),
+            1,
+            "and so are both leftover ts-index rows"
+        );
+    }
+
+    /// audit report5: the open scan summed the byte lengths the reverse map
+    /// CLAIMED, so a recorded length that had drifted away from its value —
+    /// or a legacy v1 row, which records no length at all — seeded the global
+    /// byte cap with a number that was simply wrong. Reconciliation sums the
+    /// actual values and rewrites the record, and drops the ts-index row the
+    /// superseded reverse-map row used to point at.
+    #[cfg(feature = "rocksdb-cold")]
+    #[test]
+    fn rocksdb_cold_open_repairs_a_drifted_length_and_its_stale_index_row() {
+        use super::ColdBackend;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("c");
+        {
+            let mut cold = super::rocks::RocksDbCold::open(&path, 0).unwrap();
+            cold.put([1u8; 32], b"four".to_vec()); // really 4 bytes
+            // Re-point the reverse map at ts 7 and claim 4096 bytes. The
+            // original ts-index row is left behind, superseded.
+            cold.plant_index_rows(7, &[1u8; 32], 4096);
+            assert_eq!(cold.ts_index_row_count(), 2, "fixture: one row superseded");
+        }
+
+        for pass in 1..=2 {
+            let cold = super::rocks::RocksDbCold::open(&path, 0).unwrap();
+            assert_eq!(cold.len(), 1, "pass {pass}");
+            assert_eq!(
+                cold.cold_total_bytes(),
+                Some(4),
+                "pass {pass}: the seed comes from the value, not from the claim"
+            );
+            assert_eq!(
+                cold.ts_index_row_count(),
+                1,
+                "pass {pass}: the superseded ts-index row is dropped"
+            );
+        }
+    }
+
+    /// audit report5: a logical put is three rows in three column families,
+    /// and they used to be three independent writes of which only the first
+    /// was checked — the other two warned to the log and the count was bumped
+    /// regardless. They are one `WriteBatch` now, so "one of the three failed"
+    /// is not a reachable state and what has to be proven is the remaining
+    /// one: a failed write leaves NOTHING — no value, no index row, no count.
+    ///
+    /// The failure is real, not simulated: a read-only handle makes RocksDB
+    /// itself refuse the write.
+    #[cfg(feature = "rocksdb-cold")]
+    #[test]
+    fn rocksdb_cold_a_failed_write_leaves_no_ghost_and_no_count_drift() {
+        use super::ColdBackend;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("c");
+        {
+            let mut cold = super::rocks::RocksDbCold::open(&path, 0).unwrap();
+            cold.put([1u8; 32], b"stored".to_vec()); // 6 bytes
+        }
+        {
+            let mut cold = super::rocks::RocksDbCold::open_read_only(&path, 0).unwrap();
+            assert_eq!(cold.len(), 1);
+            let outcome = cold.put([2u8; 32], b"never".to_vec());
+            assert!(
+                matches!(&outcome, ColdPut::Failed(v) if v.as_slice() == b"never"),
+                "a failed write must hand the value back, not report success: {outcome:?}"
+            );
+            assert_eq!(cold.len(), 1, "and must not bump the count");
+            // The delete path is the same batch and the same rule.
+            cold.remove(&[1u8; 32]);
+            assert_eq!(cold.len(), 1, "a failed delete must not move the count");
+        }
+
+        let cold = super::rocks::RocksDbCold::open(&path, 0).unwrap();
+        assert_eq!(
+            cold.len(),
+            1,
+            "nothing was adopted on reopen, so the failed put left no ghost"
+        );
+        assert!(!cold.contains(&[2u8; 32]), "and no value");
+        assert!(cold.contains(&[1u8; 32]), "the failed delete kept its value");
+        assert_eq!(cold.reverse_map_row_count(), 1);
+        assert_eq!(cold.ts_index_row_count(), 1);
+        assert_eq!(cold.cold_total_bytes(), Some(6));
+    }
+
     /// audit cycle-6 (T5-B): TTL eviction works end-to-end on the disk tier —
     /// `retain_newer_than` drops entries older than the cutoff. Uses a real
     /// wait of ~1.1s because the index stores wall-clock SECONDS (the only
@@ -2015,6 +2434,74 @@ mod v08_tests {
         fn retain(&mut self, _f: &dyn Fn(&[u8; 32], &[u8]) -> bool) -> Vec<([u8; 32], u64)> {
             Vec::new()
         }
+    }
+
+    /// A cold tier whose deletes fail: `remove` does nothing and `contains`
+    /// goes on saying yes — which is exactly what a RocksDB whose `delete`
+    /// returned an error looks like from above, because the trait has no way
+    /// to report it.
+    #[derive(Debug, Default)]
+    struct UndeletableCold {
+        entries: HashMap<[u8; 32], Vec<u8>>,
+    }
+
+    impl ColdBackend for UndeletableCold {
+        fn get(&self, key: &[u8; 32]) -> Option<Vec<u8>> {
+            self.entries.get(key).cloned()
+        }
+        fn put(&mut self, key: [u8; 32], value: Vec<u8>) -> ColdPut {
+            self.entries.insert(key, value);
+            ColdPut::Stored(None)
+        }
+        fn remove(&mut self, _key: &[u8; 32]) {}
+        fn contains(&self, key: &[u8; 32]) -> bool {
+            self.entries.contains_key(key)
+        }
+        fn len(&self) -> usize {
+            self.entries.len()
+        }
+        fn iter_entries(&self) -> Vec<([u8; 32], Vec<u8>)> {
+            self.entries.iter().map(|(k, v)| (*k, v.clone())).collect()
+        }
+        fn retain(&mut self, _f: &dyn Fn(&[u8; 32], &[u8]) -> bool) -> Vec<([u8; 32], u64)> {
+            Vec::new()
+        }
+    }
+
+    /// audit report5: `TieredStore::remove` measured the cold value, told the
+    /// backend to delete it, and subtracted the bytes — without ever asking
+    /// whether the delete happened. It can fail, and the trait reports that
+    /// with nothing at all, so the bytes came off `total_bytes` while the
+    /// value stayed on disk. The next put of the same key reaches the same
+    /// line and subtracts them AGAIN: repeat, and arbitrary room opens up
+    /// under a global byte cap whose whole job is to bound the node's disk.
+    #[test]
+    fn a_cold_delete_that_failed_must_not_credit_its_bytes_back() {
+        let mut store = TieredStore::with_cold(1, Box::new(UndeletableCold::default()));
+        store.put([1u8; 32], vec![0u8; 100]);
+        store.put([2u8; 32], vec![0u8; 10]); // demotes [1] into the cold tier
+        assert_eq!(store.total_bytes(), 110);
+
+        store.remove(&[1u8; 32]);
+        assert!(
+            store.contains(&[1u8; 32]),
+            "the delete failed — the value is still there"
+        );
+        assert_eq!(
+            store.total_bytes(),
+            110,
+            "bytes still on disk must still be counted"
+        );
+
+        // The compounding half: each further attempt used to shave off another
+        // 100 until the counter hit zero with 110 bytes still stored.
+        store.remove(&[1u8; 32]);
+        store.remove(&[1u8; 32]);
+        assert_eq!(
+            store.total_bytes(),
+            110,
+            "and repeated attempts must not compound the total downward"
+        );
     }
 
     /// A cold tier that cannot take the value must not cost us the value.
