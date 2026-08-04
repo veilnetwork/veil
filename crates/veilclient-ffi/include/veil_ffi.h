@@ -388,6 +388,40 @@
 #define VEIL_PAIR_OOB_CODE_LEN 6
 
 #if defined(VEIL_FFI_NODE_EMBEDDED)
+/**
+ * Byte length of a conversation key.
+ */
+#define VEIL_RATCHET_KEY_LEN 64
+#endif
+
+#if defined(VEIL_FFI_NODE_EMBEDDED)
+/**
+ * Upper bound on one conversation's exported state.
+ *
+ * An established session is about 1.4 kB; the rest is the skipped-message-key
+ * cache, at 68 bytes per key banked for a frame that has not arrived yet, and
+ * the ratchet caps that. A host sizing a buffer to this never sees a short
+ * write.
+ */
+#define VEIL_RATCHET_MAX_STATE_LEN (256 * 1024)
+#endif
+
+#if defined(VEIL_FFI_NODE_EMBEDDED)
+/**
+ * Returned when a conversation key names nothing this node holds.
+ */
+#define VEIL_ERR_RATCHET_NO_CONVERSATION -20
+#endif
+
+#if defined(VEIL_FFI_NODE_EMBEDDED)
+/**
+ * Returned when the caller's buffer is too small for the conversation's state.
+ * Nothing was written and nothing was consumed; retry with a larger buffer.
+ */
+#define VEIL_ERR_RATCHET_BUFFER_TOO_SMALL -21
+#endif
+
+#if defined(VEIL_FFI_NODE_EMBEDDED)
 #define STREAM_ENDPOINT_ID 12
 #endif
 
@@ -2631,6 +2665,149 @@ int veil_pair_target_build_confirm(VeilHandle *handle,
                                    size_t *out_confirm_len,
                                    char **err_out)
 ;
+
+#if defined(VEIL_FFI_NODE_EMBEDDED)
+/**
+ * How many ratchet operations this node has committed since it started.
+ *
+ * Monotonic, never reset, and moved only by work that actually completed — a
+ * forged frame that failed its tag moves nothing. A host that samples this
+ * can tell "no conversation changed" from "one changed and I read it twice",
+ * which a dirty list alone cannot say.
+ *
+ * # Safety
+ *
+ * `handle` must be a live handle. `out_version` MUST be writable.
+ */
+ int veil_ratchet_state_version(VeilHandle *handle, uint64_t *out_version, char **err_out) ;
+#endif
+
+#if defined(VEIL_FFI_NODE_EMBEDDED)
+/**
+ * Take up to `out_buf_cap / VEIL_RATCHET_KEY_LEN` conversations that have
+ * changed since the last call, and clear their marks.
+ *
+ * `*out_written` receives how many keys were written; `*out_remaining`
+ * receives how many are still waiting, so a host with a small buffer loops
+ * until it reads zero. Whatever did not fit stays marked — losing the notice
+ * for a conversation would mean losing its keys the next time the process
+ * stops.
+ *
+ * The host's contract: export and persist each of these BEFORE it treats the
+ * send or receive that produced them as complete.
+ *
+ * # Safety
+ *
+ * `handle` must be live. `out_buf` MUST be writable for `out_buf_cap` bytes.
+ * `out_written` and `out_remaining` MUST be writable.
+ */
+
+int veil_ratchet_take_dirty(VeilHandle *handle,
+                            uint8_t *out_buf,
+                            size_t out_buf_cap,
+                            size_t *out_written,
+                            size_t *out_remaining,
+                            char **err_out)
+;
+#endif
+
+#if defined(VEIL_FFI_NODE_EMBEDDED)
+/**
+ * List the conversations this node holds, for a full save at shutdown.
+ *
+ * `*out_total` receives the TOTAL number held, which may exceed what fit in
+ * `out_buf`; nothing is consumed, so a host may call this as often as it
+ * likes.
+ *
+ * # Safety
+ *
+ * `handle` must be live. `out_buf` MUST be writable for `out_buf_cap` bytes.
+ * `out_total` MUST be writable.
+ */
+
+int veil_ratchet_list(VeilHandle *handle,
+                      uint8_t *out_buf,
+                      size_t out_buf_cap,
+                      size_t *out_total,
+                      char **err_out)
+;
+#endif
+
+#if defined(VEIL_FFI_NODE_EMBEDDED)
+/**
+ * Export one conversation's whole state.
+ *
+ * EVERY BYTE IS KEY MATERIAL. The host must store it encrypted and must not
+ * log, copy to temporary files, or transmit it. In this project that store is
+ * the hidden volume.
+ *
+ * Returns [`VEIL_ERR_RATCHET_NO_CONVERSATION`] when the key names nothing
+ * held, and [`VEIL_ERR_RATCHET_BUFFER_TOO_SMALL`] when the buffer cannot take
+ * the state — in which case `*out_len` receives the length required and
+ * nothing was written or consumed.
+ *
+ * # Safety
+ *
+ * `handle` must be live. `key_64` MUST point to exactly
+ * [`VEIL_RATCHET_KEY_LEN`] readable bytes. `out_buf` MUST be writable for
+ * `out_buf_cap` bytes. `out_len` MUST be writable.
+ */
+
+int veil_ratchet_export(VeilHandle *handle,
+                        const uint8_t *key_64,
+                        uint8_t *out_buf,
+                        size_t out_buf_cap,
+                        size_t *out_len,
+                        char **err_out)
+;
+#endif
+
+#if defined(VEIL_FFI_NODE_EMBEDDED)
+/**
+ * Restore one conversation from bytes [`veil_ratchet_export`] produced.
+ *
+ * Called for every stored conversation at startup, BEFORE traffic flows: a
+ * frame that arrives for a conversation not yet restored cannot be opened,
+ * and — unlike a lost network packet — the sender has already advanced its
+ * chain, so nothing will re-send it in a form this node can read.
+ *
+ * Replaces whatever is held under that key. Rejects a blob it does not fully
+ * understand rather than salvaging part of one: a partially-understood
+ * session is a session with the wrong keys.
+ *
+ * # Safety
+ *
+ * `handle` must be live. `key_64` MUST point to exactly
+ * [`VEIL_RATCHET_KEY_LEN`] readable bytes. `blob` MUST point to `blob_len`
+ * readable bytes.
+ */
+
+int veil_ratchet_import(VeilHandle *handle,
+                        const uint8_t *key_64,
+                        const uint8_t *blob,
+                        size_t blob_len,
+                        char **err_out)
+;
+#endif
+
+#if defined(VEIL_FFI_NODE_EMBEDDED)
+/**
+ * Drop one conversation.
+ *
+ * Irreversible: nothing public can rebuild the chain, so every message the
+ * peer has already sealed to it is unreadable from here on. For when the host
+ * deletes a chat or removes a device — not for eviction, which would cost
+ * every message that peer sends afterwards.
+ *
+ * Returns [`VEIL_ERR_RATCHET_NO_CONVERSATION`] if nothing was held.
+ *
+ * # Safety
+ *
+ * `handle` must be live. `key_64` MUST point to exactly
+ * [`VEIL_RATCHET_KEY_LEN`] readable bytes.
+ */
+ int veil_ratchet_forget(VeilHandle *handle, const uint8_t *key_64, char **err_out) ;
+#endif
 
 #if defined(VEIL_FFI_NODE_EMBEDDED)
 /**

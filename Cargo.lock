@@ -5348,6 +5348,7 @@ dependencies = [
  "veil-bufpool",
  "veil-cfg",
  "veil-crypto",
+ "veil-e2e",
  "veil-identity",
  "veil-ipc",
  "veil-node-runtime",
