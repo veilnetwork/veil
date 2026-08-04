@@ -87,6 +87,7 @@ fn bench_voice_streams(c: &mut Criterion) {
                 for _ in 0..PACKETS_PER_STREAM {
                     let delivered = registry.route_ipc_deliver(
                         node_id,
+                        veil_app::registry::SenderProvenance::SessionPeer,
                         [0u8; 32], // src_app_id
                         app_id,
                         endpoint_id,

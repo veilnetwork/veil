@@ -29,6 +29,9 @@ use tokio::sync::mpsc;
 use veil_util::lock;
 
 use veil_discovery::{directory::AppEndpointEntry, service::DiscoveryService};
+/// Re-exported so every consumer of [`AppMessage::Deliver`] can name the trust
+/// level of `src_node_id` without depending on `veil-proto` directly.
+pub use veil_proto::SenderProvenance;
 use veil_proto::app::{AppDataPayload, AppRtDataPayload, AppSendPayload};
 
 use crate::AppMetrics;
@@ -53,6 +56,11 @@ pub enum AppMessage {
     /// d: pool-backed for chat_node-style high-throughput IPC.
     Deliver {
         src_node_id: [u8; 32],
+        /// What the node KNOWS about `src_node_id` (X/V-01): whether it was
+        /// authenticated by the carrying session / a signature / local origin,
+        /// or is merely what the frame claimed. Consult this before treating
+        /// `src_node_id` as an identity — see [`SenderProvenance`].
+        provenance: SenderProvenance,
         src_app_id: [u8; 32],
         app_id: [u8; 32],
         endpoint_id: u32,
@@ -361,25 +369,42 @@ impl AppEndpointRegistry {
     ///
     /// Used by the IPC data plane when a local or remote app sends a datagram
     /// to an endpoint registered by an IPC client.
+    ///
+    /// `provenance` is NOT optional and has no default: whichever path is
+    /// delivering must state, at the call site, what it actually knows about
+    /// `src_node_id` (X/V-01 — a path that silently inherited "authenticated"
+    /// is exactly how a spoofable claim reached apps as an identity). A new
+    /// delivery path therefore cannot compile without making that decision.
     pub fn route_ipc_deliver(
         &self,
         src_node_id: [u8; 32],
+        provenance: SenderProvenance,
         src_app_id: [u8; 32],
         app_id: [u8; 32],
         endpoint_id: u32,
         data: veil_bufpool::PooledShared,
     ) -> bool {
         // No reply path on the generic delivery path.
-        self.route_ipc_deliver_with_reply(src_node_id, src_app_id, app_id, endpoint_id, data, 0)
+        self.route_ipc_deliver_with_reply(
+            src_node_id,
+            provenance,
+            src_app_id,
+            app_id,
+            endpoint_id,
+            data,
+            0,
+        )
     }
 
     /// Like [`Self::route_ipc_deliver`] but carries a reply handle
     /// (reply-channel): non-zero `reply_id` ⇒ the recipient app may reply via
     /// it. Used by the authenticated-delivery task when the message embedded a
     /// one-time reply path.
+    #[allow(clippy::too_many_arguments)]
     pub fn route_ipc_deliver_with_reply(
         &self,
         src_node_id: [u8; 32],
+        provenance: SenderProvenance,
         src_app_id: [u8; 32],
         app_id: [u8; 32],
         endpoint_id: u32,
@@ -394,6 +419,7 @@ impl AppEndpointRegistry {
             key,
             AppMessage::Deliver {
                 src_node_id,
+                provenance,
                 src_app_id,
                 app_id,
                 endpoint_id,

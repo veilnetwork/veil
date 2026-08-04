@@ -472,6 +472,74 @@ impl AppUnbindPayload {
 
 // ── AppDeliverPayload ─────────────────────────────────────────────────────── // STABLE v1
 
+/// How much this node actually KNOWS about the `src_node_id` it hands to an
+/// application — as opposed to what the frame merely claimed.
+///
+/// Every delivery path puts a 32-byte sender in front of the app, but the paths
+/// differ enormously in what stands behind those bytes:
+///
+/// * the OVL1 session that carried the frame is authenticated and its peer id
+///   equals the claim — the peer is speaking for itself ([`Self::SessionPeer`]);
+/// * a signature over this very message verifies the sender ([`Self::Signed`],
+///   the `APP_DELIVER_AUTH` / [`AuthAppDeliver`] flow);
+/// * the message never left this node ([`Self::LocalIpc`]);
+/// * nothing corroborates the claim at all ([`Self::Claimed`]) — a frame that
+///   reached us through a relay, or an anonymous meta-E2E envelope. ML-KEM
+///   seals to our *published* EK, so it buys confidentiality and never origin:
+///   anyone can name anyone.
+///
+/// All four used to reach the app as the same untyped 32 bytes, so an app could
+/// not tell a contact's message from a stranger's frame that merely named the
+/// contact (X/V-01). The distinction is a type now, and it travels to the app.
+///
+/// Carried on the IPC wire as the trailing byte of [`AppDeliverPayload`].
+/// Unknown byte values decode to [`Self::Claimed`]: the fail-closed direction —
+/// a reader that does not understand some future level must treat the identity
+/// as unverified, never as proven.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(u8)]
+pub enum SenderProvenance {
+    /// `src_node_id` is an unverified CLAIM. Never a basis for authorization;
+    /// display only once the app has authenticated it by its own means.
+    Claimed = 0,
+    /// The message originated on this node and arrived over the local IPC
+    /// socket; `src_node_id` is our own node id.
+    LocalIpc = 1,
+    /// `src_node_id` is the authenticated OVL1 session peer that handed us the
+    /// frame — the sender is the peer we are talking to, not a claim carried
+    /// through it.
+    SessionPeer = 2,
+    /// `src_node_id` is proven by a signature over this message, verified
+    /// against the sender's identity document.
+    Signed = 3,
+}
+
+impl SenderProvenance {
+    /// `true` when the node verified `src_node_id` by some means, so an app may
+    /// base an authorization decision on it. `false` for [`Self::Claimed`].
+    #[must_use]
+    pub const fn is_authenticated(self) -> bool {
+        !matches!(self, Self::Claimed)
+    }
+
+    /// Wire byte.
+    #[must_use]
+    pub const fn as_u8(self) -> u8 {
+        self as u8
+    }
+
+    /// Parse a wire byte. Unrecognised values fail closed to [`Self::Claimed`].
+    #[must_use]
+    pub const fn from_wire(byte: u8) -> Self {
+        match byte {
+            1 => Self::LocalIpc,
+            2 => Self::SessionPeer,
+            3 => Self::Signed,
+            _ => Self::Claimed,
+        }
+    }
+}
+
 /// Sent by the node to deliver an incoming veil datagram to the IPC client.
 ///
 /// Wire layout:
@@ -482,6 +550,8 @@ impl AppUnbindPayload {
 /// [96..100] endpoint_id u32 BE (destination endpoint)
 /// [100..104] data_len u32 BE
 /// [104..104+data_len] data bytes
+/// [.. +8] reply_id u64 BE
+/// [.. +1] provenance u8 ([`SenderProvenance`])
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AppDeliverPayload {
@@ -502,6 +572,10 @@ pub struct AppDeliverPayload {
     /// path (plain / meta-E2E / one-way auth deliveries). Appended LAST on the
     /// wire so existing field offsets are unchanged.
     pub reply_id: u64,
+    /// What the node knows about `src_node_id` (X/V-01). The delivering path
+    /// decides this; the app must consult it before treating `src_node_id` as
+    /// an identity rather than a claim.
+    pub provenance: SenderProvenance,
 }
 
 impl AppDeliverPayload {
@@ -517,9 +591,10 @@ impl AppDeliverPayload {
         buf.extend_from_slice(&self.endpoint_id.to_be_bytes());
         buf.extend_from_slice(&(data.len() as u32).to_be_bytes());
         buf.extend_from_slice(data);
-        // reply_id appended LAST (trailing u64) so header/data offsets are
-        // unchanged for the plain path.
+        // reply_id and provenance are appended LAST (trailing u64 + u8) so
+        // header/data offsets are unchanged for the plain path.
         buf.extend_from_slice(&self.reply_id.to_be_bytes());
+        buf.push(self.provenance.as_u8());
         buf
     }
 
@@ -537,14 +612,15 @@ impl AppDeliverPayload {
         let endpoint_id = super::read_u32_be(buf, 96)?;
         let data_len = super::read_u32_be(buf, 100)? as usize;
         // checked_add — 32-bit overflow defence.
-        // total = header + data; the trailing reply_id (u64) follows.
+        // total = header + data; the trailing reply_id (u64) + provenance (u8)
+        // follow.
         let total = Self::FIXED_SIZE
             .checked_add(data_len)
             .ok_or(ProtoError::BufferTooShort {
                 need: usize::MAX,
                 got: buf.len(),
             })?;
-        let end = total.checked_add(8).ok_or(ProtoError::BufferTooShort {
+        let end = total.checked_add(9).ok_or(ProtoError::BufferTooShort {
             need: usize::MAX,
             got: buf.len(),
         })?;
@@ -557,6 +633,8 @@ impl AppDeliverPayload {
         let mut pooled = veil_bufpool::global().acquire(data_len);
         pooled.as_vec_mut().extend_from_slice(&buf[104..total]);
         let reply_id = super::read_u64_be(buf, total)?;
+        // Unknown levels fail closed to `Claimed` — never up.
+        let provenance = SenderProvenance::from_wire(buf[end - 1]);
         Ok(Self {
             src_node_id,
             src_app_id,
@@ -564,6 +642,7 @@ impl AppDeliverPayload {
             endpoint_id,
             data: pooled.into_shared(),
             reply_id,
+            provenance,
         })
     }
 }
@@ -6555,10 +6634,81 @@ mod tests {
             endpoint_id: 5,
             data: veil_bufpool::pooled_shared_from_vec(b"hello veil".to_vec()),
             reply_id: 0,
+            provenance: SenderProvenance::SessionPeer,
         };
         let buf = p.encode();
         let d = AppDeliverPayload::decode(&buf).unwrap();
         assert_eq!(d, p);
+    }
+
+    /// X/V-01: the trust level of `src_node_id` is wire state, not something
+    /// the reader may assume. Every level must survive the round trip, and an
+    /// unknown byte must fail CLOSED — down to `Claimed`, never up.
+    #[test]
+    fn deliver_provenance_roundtrips_and_unknown_fails_closed() {
+        for level in [
+            SenderProvenance::Claimed,
+            SenderProvenance::LocalIpc,
+            SenderProvenance::SessionPeer,
+            SenderProvenance::Signed,
+        ] {
+            let p = AppDeliverPayload {
+                src_node_id: [0x01; 32],
+                src_app_id: [0xAA; 32],
+                app_id: [0x02; 32],
+                endpoint_id: 5,
+                data: veil_bufpool::pooled_shared_from_vec(b"payload".to_vec()),
+                reply_id: 7,
+                provenance: level,
+            };
+            let d = AppDeliverPayload::decode(&p.encode()).expect("decode");
+            assert_eq!(d.provenance, level, "provenance must survive the wire");
+            assert_eq!(d.data.as_ref(), b"payload");
+            assert_eq!(d.reply_id, 7);
+        }
+
+        // A byte from some future (or hostile) writer must not read as proof.
+        let mut wire = AppDeliverPayload {
+            src_node_id: [0x01; 32],
+            src_app_id: [0xAA; 32],
+            app_id: [0x02; 32],
+            endpoint_id: 5,
+            data: veil_bufpool::pooled_shared_from_vec(b"payload".to_vec()),
+            reply_id: 0,
+            provenance: SenderProvenance::Signed,
+        }
+        .encode();
+        let last = wire.len() - 1;
+        for byte in [4u8, 9, 0x7F, 0xFF] {
+            wire[last] = byte;
+            let d = AppDeliverPayload::decode(&wire).expect("decode");
+            assert_eq!(
+                d.provenance,
+                SenderProvenance::Claimed,
+                "unknown provenance byte {byte:#04X} must fail closed to Claimed",
+            );
+            assert!(!d.provenance.is_authenticated());
+        }
+    }
+
+    /// A payload truncated to exactly the pre-provenance length must be
+    /// REJECTED, not silently read as `Claimed` off the reply_id's last byte.
+    #[test]
+    fn deliver_rejects_a_payload_missing_the_provenance_byte() {
+        let wire = AppDeliverPayload {
+            src_node_id: [0x01; 32],
+            src_app_id: [0xAA; 32],
+            app_id: [0x02; 32],
+            endpoint_id: 5,
+            data: veil_bufpool::pooled_shared_from_vec(b"payload".to_vec()),
+            reply_id: 0,
+            provenance: SenderProvenance::Signed,
+        }
+        .encode();
+        assert!(
+            AppDeliverPayload::decode(&wire[..wire.len() - 1]).is_err(),
+            "a frame with no provenance byte must not decode",
+        );
     }
 
     #[test]
@@ -6571,6 +6721,7 @@ mod tests {
             endpoint_id: 5,
             data: veil_bufpool::pooled_shared_from_vec(b"reply please".to_vec()),
             reply_id: 0xDEAD_BEEF_0000_0001,
+            provenance: SenderProvenance::Signed,
         };
         let d = AppDeliverPayload::decode(&p.encode()).unwrap();
         assert_eq!(d, p);
@@ -6587,6 +6738,7 @@ mod tests {
             endpoint_id: 0,
             data: veil_bufpool::pooled_shared_from_vec(vec![]),
             reply_id: 0,
+            provenance: SenderProvenance::Claimed,
         };
         let d = AppDeliverPayload::decode(&p.encode()).unwrap();
         assert_eq!(d, p);

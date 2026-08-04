@@ -185,6 +185,9 @@ async fn process_auth_deliver(
     };
     let delivered = access.dispatcher.app_registry.route_ipc_deliver_with_reply(
         sender_node_id,
+        // The signature over this message was verified against the sender's
+        // identity document just above — the strongest provenance there is.
+        veil_app::registry::SenderProvenance::Signed,
         [0u8; 32], // AuthAppDeliver carries no src_app_id in v1
         app_id,
         endpoint_id,
@@ -233,6 +236,9 @@ fn process_anonymous_deliver(
     let endpoint_id = deliver.endpoint_id;
     let delivered = access.dispatcher.app_registry.route_ipc_deliver(
         [0u8; 32],
+        // Attribution is forced to the anonymous zero id — there is nothing to
+        // authenticate, and saying so is the point.
+        veil_app::registry::SenderProvenance::Claimed,
         deliver.src_app_id,
         deliver.app_id,
         endpoint_id,

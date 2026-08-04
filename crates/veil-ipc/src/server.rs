@@ -709,6 +709,8 @@ async fn forward_endpoint(
             AppMessage::Send(p) => {
                 let deliver = AppDeliverPayload {
                     src_node_id: local_node_id,
+                    // Never left this node.
+                    provenance: veil_proto::SenderProvenance::LocalIpc,
                     src_app_id: p.src_app_id,
                     app_id: p.app_id,
                     endpoint_id: p.endpoint_id,
@@ -719,6 +721,7 @@ async fn forward_endpoint(
             }
             AppMessage::Deliver {
                 src_node_id,
+                provenance,
                 src_app_id,
                 app_id,
                 endpoint_id,
@@ -727,6 +730,10 @@ async fn forward_endpoint(
             } => {
                 let deliver = AppDeliverPayload {
                     src_node_id,
+                    // Carried through verbatim from whichever delivery path
+                    // produced this message — the node decided it there, at the
+                    // only place that knows (X/V-01).
+                    provenance,
                     src_app_id,
                     app_id,
                     endpoint_id,
@@ -739,6 +746,8 @@ async fn forward_endpoint(
                 // Bridge: AppDataPayload still carries Vec (stream path not horizontal-pool yet).
                 let deliver = AppDeliverPayload {
                     src_node_id: local_node_id,
+                    // Never left this node.
+                    provenance: veil_proto::SenderProvenance::LocalIpc,
                     src_app_id: [0u8; 32], // AppDataPayload is an older path without src_app_id
                     app_id: p.app_id,
                     endpoint_id: p.endpoint_id,
@@ -828,6 +837,9 @@ async fn forward_endpoint(
                 // bytes plus trusted node/app identity, not a second RT API.
                 let deliver = AppDeliverPayload {
                     src_node_id,
+                    // `RtData.src_node_id` is documented as the authenticated
+                    // node id of the session that carried the media frame.
+                    provenance: veil_proto::SenderProvenance::SessionPeer,
                     src_app_id: payload.src_app_id,
                     app_id: payload.app_id,
                     endpoint_id: payload.endpoint_id,

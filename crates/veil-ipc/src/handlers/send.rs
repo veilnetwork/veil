@@ -443,9 +443,12 @@ pub(crate) async fn handle_ipc_send(
     }
 
     if send.dst_node_id == *local_node_id {
-        // Local delivery — route directly through the app registry.
+        // Local delivery — route directly through the app registry. The
+        // message never left this node: it came in over the local IPC socket
+        // and `src_node_id` is our own id.
         app_registry.route_ipc_deliver(
             *local_node_id,
+            veil_app::registry::SenderProvenance::LocalIpc,
             send.src_app_id,
             send.app_id,
             send.endpoint_id,
