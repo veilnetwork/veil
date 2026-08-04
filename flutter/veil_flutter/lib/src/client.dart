@@ -124,13 +124,19 @@ int _openStreamWorker(int appAddr, Uint8List dstNode, Uint8List dstApp,
 /// runs here so an accept loop never freezes the UI. Returns null on timeout,
 /// throws on a fatal error, or the accepted stream's raw pointer address + the
 /// initiator node_id (re-wrapped on the main isolate via the global handle table).
-({int streamAddr, Uint8List src})? _acceptStreamWorker(
+({int streamAddr, Uint8List src, int provenance})? _acceptStreamWorker(
     int appAddr, int timeoutMs) {
   final app = Pointer<ffi.VeilApp>.fromAddress(appAddr);
   final outNode = calloc<Uint8>(32);
+  // Pre-set to the fail-closed value: if the native call ever returned without
+  // writing it, the caller must read "unverified", not whatever the allocator
+  // left behind (X/V-01).
+  final outProvenance = calloc<Uint8>(1)
+    ..value = ffi.veilProvenanceClaimed;
   final errOut = calloc<Pointer<Utf8>>();
   try {
-    final ptr = ffi.veilStreamAccept(app, timeoutMs, outNode, errOut);
+    final ptr =
+        ffi.veilStreamAccept(app, timeoutMs, outNode, outProvenance, errOut);
     if (ptr == nullptr) {
       if (errOut.value == nullptr) return null; // timeout
       throw VeilException('stream accept failed: ${_readErrAndFree(errOut)}');
@@ -138,9 +144,11 @@ int _openStreamWorker(int appAddr, Uint8List dstNode, Uint8List dstApp,
     return (
       streamAddr: ptr.address,
       src: Uint8List.fromList(outNode.asTypedList(32)),
+      provenance: outProvenance.value,
     );
   } finally {
     calloc.free(outNode);
+    calloc.free(outProvenance);
     calloc.free(errOut);
   }
 }
@@ -2675,10 +2683,22 @@ class AppHandle implements Finalizable {
   }
 
   /// Wait up to [timeout] for a remote peer to open an inbound byte-stream to
-  /// this endpoint. Returns the [VeilStream] + the initiator's 32-byte node_id,
-  /// or `null` on TIMEOUT (so a server loop can poll/abort). The receive-side
-  /// counterpart to [openStream]; used for any-size file transfer.
-  Future<({VeilStream stream, Uint8List srcNodeId})?> acceptStream({
+  /// this endpoint. Returns the [VeilStream], the initiator's 32-byte node_id
+  /// and what this device KNOWS about that id ([SenderProvenance]), or `null`
+  /// on TIMEOUT (so a server loop can poll/abort). The receive-side counterpart
+  /// to [openStream]; used for any-size file transfer.
+  ///
+  /// X/V-01: both of veil's open paths authenticate the initiator today, so
+  /// `provenance` is normally [SenderProvenance.sessionPeer] or
+  /// [SenderProvenance.localIpc]. Gate on it rather than on `srcNodeId` alone —
+  /// "the comment said it was authenticated" is exactly how the datagram path
+  /// stayed spoofable.
+  Future<
+      ({
+        VeilStream stream,
+        Uint8List srcNodeId,
+        SenderProvenance provenance
+      })?> acceptStream({
     Duration timeout = const Duration(seconds: 2),
   }) async {
     _ensureOpen();
@@ -2694,6 +2714,7 @@ class AppHandle implements Finalizable {
       stream: VeilStream.fromFfi(
           Pointer<ffi.VeilStreamFfi>.fromAddress(r.streamAddr)),
       srcNodeId: r.src,
+      provenance: SenderProvenance.fromWire(r.provenance),
     );
   }
 
@@ -2707,7 +2728,7 @@ class AppHandle implements Finalizable {
     final controller = StreamController<IncomingMessage>.broadcast();
     final callable = NativeCallable<ffi.VeilRecvCbNative>.listener(
       (Pointer<Void> _, Pointer<Uint8> srcNode, Pointer<Uint8> srcApp,
-          int replyId, Pointer<Uint8> dataPtr, int len) {
+          int provenanceByte, int replyId, Pointer<Uint8> dataPtr, int len) {
         final src = Uint8List.fromList(srcNode.asTypedList(32));
         final app = Uint8List.fromList(srcApp.asTypedList(32));
         final data = len > 0
@@ -2716,12 +2737,21 @@ class AppHandle implements Finalizable {
         // cycle-7 H6: srcNode/srcApp/dataPtr are offsets into ONE callee-owned
         // buffer ([nodeId(32) | appId(32) | data]); free it via the base
         // pointer (srcNode) with the total length, after copying all three.
-        // `replyId` is a by-value scalar (not in the buffer) — nothing to free.
+        // `replyId` and `provenanceByte` are by-value scalars (not in the
+        // buffer) — nothing to free.
         // This callback runs on the isolate AFTER the Rust frame returned, so
         // reading these pointers was a use-after-free before they became owned.
         ffi.veilFreeBuf(srcNode, 64 + len);
         controller.add(IncomingMessage(
-            srcNodeId: src, srcAppId: app, data: data, replyId: replyId));
+          srcNodeId: src,
+          srcAppId: app,
+          data: data,
+          replyId: replyId,
+          // X/V-01: what the node knows about `src`. `fromWire` fails closed,
+          // so a byte this build does not recognise arrives as
+          // `SenderProvenance.claimed` — never as a level it cannot vouch for.
+          provenance: SenderProvenance.fromWire(provenanceByte),
+        ));
       },
     );
     final errOut = calloc<Pointer<Utf8>>();

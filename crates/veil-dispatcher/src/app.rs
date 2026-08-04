@@ -165,7 +165,11 @@ impl FrameDispatcher {
                     payload.app_id,
                     payload.endpoint_id,
                     stream_id,
+                    // The opener is the authenticated OVL1 session peer this
+                    // APP_OPEN arrived on — read from the session, never from
+                    // the frame body, so it is an identity and not a claim.
                     *node_id.as_bytes(),
+                    veil_app::registry::SenderProvenance::SessionPeer,
                     veil_app::APP_STREAM_INITIAL_WINDOW,
                 );
                 let receipt = AppReceiptPayload {
@@ -288,6 +292,61 @@ impl FrameDispatcher {
                 }
                 DispatchResult::NoResponse
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use veil_app::registry::{AppMessage, SenderProvenance};
+    use veil_proto::app::AppOpenPayload;
+    use veil_proto::family::{AppMsg, FrameFamily};
+    use veil_proto::header::FrameHeader;
+
+    /// X/V-01, the stream half. A byte-stream initiator reaches the app as the
+    /// same raw 32 bytes a datagram sender did, so it carries a trust level
+    /// too — and this is the one path that can legitimately claim
+    /// `SessionPeer`, because the id comes from the authenticated OVL1 session
+    /// the `APP_OPEN` arrived on rather than from anything in the frame body.
+    ///
+    /// Asserted on the message the ENDPOINT receives, not on the argument
+    /// passed to `route_stream_open`: what matters is what the app is told.
+    #[test]
+    fn app_open_labels_the_initiator_as_the_authenticated_session_peer() {
+        let opener = [0xAAu8; 32];
+        let app_id = [0xCCu8; 32];
+        let endpoint_id = 0xC0DE;
+
+        let disp = crate::make_test_dispatcher(veil_cfg::NodeRole::Core);
+        let (_handle, mut rx) = disp.app_registry.register(app_id, endpoint_id, 16);
+
+        let body = AppOpenPayload {
+            app_id,
+            endpoint_id,
+            flags: 0,
+        }
+        .encode();
+        let mut hdr = FrameHeader::new(FrameFamily::App as u8, AppMsg::AppOpen as u16);
+        hdr.body_len = body.len() as u32;
+        hdr.stream_id = 9;
+        disp.dispatch(&hdr, &body, opener);
+
+        match rx.try_recv() {
+            Ok(AppMessage::StreamOpen {
+                src_node_id,
+                provenance,
+                ..
+            }) => {
+                assert_eq!(src_node_id, opener);
+                assert_eq!(
+                    provenance,
+                    SenderProvenance::SessionPeer,
+                    "the opener IS the authenticated session peer — the app \
+                     must be told that, not left to assume it",
+                );
+                assert!(provenance.is_authenticated());
+            }
+            other => panic!("expected a StreamOpen, got {other:?}"),
         }
     }
 }

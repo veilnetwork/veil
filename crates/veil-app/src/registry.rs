@@ -99,6 +99,11 @@ pub enum AppMessage {
     StreamOpen {
         stream_id: u32,
         src_node_id: [u8; 32],
+        /// What the node KNOWS about `src_node_id` — same contract as
+        /// [`Self::Deliver`]'s field of the same name (X/V-01). A stream
+        /// initiator reaches the app as a raw 32 bytes exactly like a datagram
+        /// sender did, so it carries the same label.
+        provenance: SenderProvenance,
         initial_window: u32,
     },
     /// Incoming stream data segment.
@@ -490,12 +495,18 @@ impl AppEndpointRegistry {
     /// Called by the frame dispatcher when a remote peer successfully opens a
     /// stream to this node's app endpoint. The endpoint can then allocate a
     /// bridge and start exchanging stream data.
+    ///
+    /// `provenance` is required and has no default, for the same reason
+    /// [`Self::route_ipc_deliver`]'s is: a future stream-open path must state
+    /// what it knows about `src_node_id` instead of inheriting a trust level
+    /// nobody re-examined.
     pub fn route_stream_open(
         &self,
         app_id: [u8; 32],
         endpoint_id: u32,
         stream_id: u32,
         src_node_id: [u8; 32],
+        provenance: SenderProvenance,
         initial_window: u32,
     ) -> bool {
         let key = EndpointKey {
@@ -507,6 +518,7 @@ impl AppEndpointRegistry {
             AppMessage::StreamOpen {
                 stream_id,
                 src_node_id,
+                provenance,
                 initial_window,
             },
         )
