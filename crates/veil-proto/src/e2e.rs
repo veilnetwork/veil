@@ -45,6 +45,46 @@ pub const E2E_MARKER: u8 = 0xE2;
 /// meta-E2E envelopes — the true sender identity lives inside the ciphertext.
 pub const META_E2E_MARKER: u8 = 0xE3;
 
+/// First byte of `DeliveryEnvelope.payload` when the message is a **ratchet**
+/// frame — the hybrid Double Ratchet of `veil-ratchet`, spliced in by
+/// `veil_e2e::ratchet`.
+///
+/// The difference from [`E2E_MARKER`] is not the cipher, it is what the bytes
+/// prove. A `0xE2` envelope is one ML-KEM encapsulation to the recipient's
+/// published key: anyone who has read that key can produce one, so it carries
+/// confidentiality and says nothing at all about who wrote it. A `0xE4` frame
+/// opens only under a session root that both parties derived from key material
+/// only they hold, so opening it *is* the sender check — which is why this
+/// marker, and only this marker, can reach an application as
+/// [`SenderProvenance::Signed`](crate::SenderProvenance::Signed).
+///
+/// Deliberately NOT a version bump of the `0xE2` body. The two are different
+/// answers to "who sent this", and a recipient must be able to tell them apart
+/// on the first byte rather than by how far it got parsing.
+///
+/// `0xE5`, not the `0xE4` that follows the other two: that byte is already
+/// [`CHUNKED_ENVELOPE_MARKER`](crate::delivery::CHUNKED_ENVELOPE_MARKER), which
+/// the terminal path tests on the same first byte and *before* either of these.
+/// Taking it would have routed every chunked envelope into the ratchet opener.
+///
+/// # Wire layout (the whole `DeliveryEnvelope.payload`)
+///
+/// ```text
+/// [0]      0xE5
+/// [1]      version u8 = 1
+/// [2]      kind u8 — 0 = PQXDH prologue + frame, 1 = bare ratchet frame
+/// [3..19]  sender instance_id [u8; 16]
+/// [19..35] recipient instance_id [u8; 16]
+/// [35..]   opaque blob (veil-ratchet `InitialMessage::encode` or a frame)
+/// ```
+///
+/// Both instance ids are needed and neither is redundant. The recipient's says
+/// *which of the recipient's devices* the sender keyed to — a device that is
+/// not that one must refuse rather than fail to decrypt. The sender's is what
+/// makes the conversation key exact: two devices of one contact are two
+/// independent ratchets, and merging them would deliver each other's replays.
+pub const RATCHET_E2E_MARKER: u8 = 0xE5;
+
 /// E2E encryption envelope placed inside `DeliveryEnvelope.payload`.
 ///
 /// The full payload stored on wire is `[E2E_MARKER] ++ E2eEnvelope::encode`.
@@ -222,5 +262,23 @@ mod tests {
     #[test]
     fn marker_byte_is_0xe2() {
         assert_eq!(E2E_MARKER, 0xE2);
+    }
+
+    #[test]
+    fn the_three_payload_markers_are_distinct() {
+        // Every receive path branches on this one byte, so two markers
+        // colliding would silently route ratchet frames into the ML-KEM
+        // opener — which would fail to decrypt and be counted as a key
+        // mismatch rather than as the protocol error it is.
+        assert_eq!(RATCHET_E2E_MARKER, 0xE5);
+        let all = [E2E_MARKER, META_E2E_MARKER, RATCHET_E2E_MARKER];
+        for (i, a) in all.iter().enumerate() {
+            for b in &all[i + 1..] {
+                assert_ne!(a, b, "payload markers must not collide");
+            }
+        }
+        // And none of them may collide with the chunk-envelope marker, which
+        // is tested on the same first byte before any of these.
+        assert!(!all.contains(&crate::delivery::CHUNKED_ENVELOPE_MARKER));
     }
 }

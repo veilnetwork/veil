@@ -95,6 +95,14 @@ pub struct DhtMlKemEkResolver {
     pending_recursive: Arc<Mutex<std::collections::HashMap<[u8; 16], PendingRecursive>>>,
     local_node_id: [u8; 32],
     peer_mlkem_keys: Arc<RwLock<PeerMlKemCache>>,
+    /// `peer → device X25519 key`, the ratchet counterpart of
+    /// `peer_mlkem_keys`.
+    ///
+    /// Written here because this is the only place a certificate is verified,
+    /// and read by the frame dispatcher, which decides sender provenance on a
+    /// synchronous path that cannot walk a DHT. Two maps rather than one
+    /// because the dispatcher must not depend on this crate.
+    peer_ratchet_keys: Arc<RwLock<veil_e2e::PeerRatchetKeyCache>>,
     /// Verified-cert fast-path cache (see [`PeerMlKemCertCache`]). Shared with
     /// the other resolver instance over `self.identity` so live + seal paths
     /// warm each other.
@@ -111,12 +119,14 @@ impl DhtMlKemEkResolver {
     /// applies to each of the three DHT walks individually — total budget
     /// is at most `3 × step_timeout`.
     #[must_use]
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         dht: Arc<KademliaService>,
         session_tx_registry: Arc<RwLock<SessionTxRegistry>>,
         pending_recursive: Arc<Mutex<std::collections::HashMap<[u8; 16], PendingRecursive>>>,
         local_node_id: [u8; 32],
         peer_mlkem_keys: Arc<RwLock<PeerMlKemCache>>,
+        peer_ratchet_keys: Arc<RwLock<veil_e2e::PeerRatchetKeyCache>>,
         cert_cache: Arc<RwLock<PeerMlKemCertCache>>,
         logger: Arc<NodeLogger>,
     ) -> Self {
@@ -126,11 +136,55 @@ impl DhtMlKemEkResolver {
             pending_recursive,
             local_node_id,
             peer_mlkem_keys,
+            peer_ratchet_keys,
             cert_cache,
             logger,
             step_timeout: DEFAULT_STEP_TIMEOUT,
             cert_ttl: CERT_CACHE_TTL,
         }
+    }
+
+    /// Publish a freshly-verified certificate to the two per-peer caches the
+    /// synchronous paths read: the encapsulation key the E2E sealer needs, and
+    /// the device Diffie-Hellman key the receive path needs to tell an
+    /// authenticated sender from a claimed one.
+    ///
+    /// One function so the two cannot fall out of step — a peer whose EK is
+    /// cached and whose ratchet key is not would seal fine and then be
+    /// delivered as unauthenticated, which looks like a protocol failure and
+    /// is really a missing write.
+    fn cache_verified(&self, target_node_id: [u8; 32], cert: &VerifiedMlkemCert) {
+        lru_insert(
+            &self.peer_mlkem_keys,
+            target_node_id,
+            (cert.mlkem_pubkey.clone(), std::time::Instant::now()),
+        );
+        lru_insert(
+            &self.cert_cache,
+            target_node_id,
+            (cert.clone(), std::time::Instant::now()),
+        );
+        self.publish_ratchet_key(target_node_id, cert);
+    }
+
+    /// Publish just the device Diffie-Hellman key.
+    ///
+    /// Separate from [`cache_verified`](Self::cache_verified) so the
+    /// verified-cert fast path can call it too. That path returns without
+    /// re-verifying anything, and it must not refresh the certificate cache's
+    /// timestamp (that would make a fresh entry immortal) — but it must still
+    /// leave the receive path able to authenticate the peer, because the two
+    /// maps are bounded independently and this one can have been evicted while
+    /// the certificate is still cached.
+    fn publish_ratchet_key(&self, target_node_id: [u8; 32], cert: &VerifiedMlkemCert) {
+        let mut keys = wlock!(self.peer_ratchet_keys);
+        if keys.len() >= veil_proto::budget::MAX_PEER_MLKEM_CACHE
+            && !keys.contains_key(&target_node_id)
+            && let Some(victim) = keys.keys().next().copied()
+        {
+            keys.remove(&victim);
+        }
+        keys.insert(target_node_id, cert.ratchet_x25519_pubkey);
     }
 
     /// Override the per-step DHT timeout.  Useful for tests +
@@ -254,8 +308,11 @@ impl DhtMlKemEkResolver {
         if let Some((cert, ts)) = rlock!(self.cert_cache).get(&target_node_id)
             && ts.elapsed() < self.cert_ttl
         {
+            let cert = cert.clone();
             self.log_dbg("mlkem_resolver.cert.cache_hit", &target_node_id, "");
-            return Some(cert.clone());
+            // A different lock from the one the `if let` still holds.
+            self.publish_ratchet_key(target_node_id, &cert);
+            return Some(cert);
         }
         // ── Step 1: IdentityDocument ────────────────────────────────
         // ML-KEM resolves can target any third party (not necessarily a
@@ -339,39 +396,11 @@ impl DhtMlKemEkResolver {
             .ok()?;
 
         // ── Step 4: cache writeback ────────────────────────────────
-        // PeerMlKemCache uses [`MAX_PEER_MLKEM_CACHE`]-bounded LRU
-        // eviction — same policy as the handshake-time insert site in
+        // Every per-peer cache is [`MAX_PEER_MLKEM_CACHE`]-bounded LRU — same
+        // policy as the handshake-time insert site in
         // `peer_handshake.rs:191-204`.  Mirror it here so cache growth
         // under cold-start traffic stays bounded.
-        {
-            let mut cache = wlock!(self.peer_mlkem_keys);
-            if cache.len() >= veil_proto::budget::MAX_PEER_MLKEM_CACHE
-                && let Some(oldest) = cache
-                    .iter()
-                    .min_by_key(|(_, (_, ts))| *ts)
-                    .map(|(id, _)| *id)
-            {
-                cache.remove(&oldest);
-            }
-            cache.insert(
-                target_node_id,
-                (verified.mlkem_pubkey.clone(), std::time::Instant::now()),
-            );
-        }
-        // Verified-cert cache writeback (same LRU policy) — feeds the Step 0
-        // fast path above for every subsequent live encrypt + offline seal.
-        {
-            let mut cc = wlock!(self.cert_cache);
-            if cc.len() >= veil_proto::budget::MAX_PEER_MLKEM_CACHE
-                && let Some(oldest) = cc.iter().min_by_key(|(_, (_, ts))| *ts).map(|(id, _)| *id)
-            {
-                cc.remove(&oldest);
-            }
-            cc.insert(
-                target_node_id,
-                (verified.clone(), std::time::Instant::now()),
-            );
-        }
+        self.cache_verified(target_node_id, &verified);
         self.logger.debug(
             "mlkem_resolver.resolved",
             format!(
@@ -381,14 +410,6 @@ impl DhtMlKemEkResolver {
             ),
         );
         Some(verified)
-    }
-
-    /// EK-only resolution — the [`MlKemEkResolver`] trait surface used by the
-    /// live `veil_e2e::encrypt` path. Thin wrapper over [`fetch_verified_cert`]
-    /// (which already does the cache writeback), so both layers share one
-    /// resolution + verification path.
-    async fn fetch_inner(&self, target_node_id: [u8; 32]) -> Option<Vec<u8>> {
-        Some(self.fetch_verified_cert(target_node_id).await?.mlkem_pubkey)
     }
 
     /// Resolve + verify a node's relay X25519 KEM public key from the DHT:
@@ -803,8 +824,28 @@ where
     out
 }
 
-impl MlKemEkResolver for DhtMlKemEkResolver {
-    fn resolve_ek_cached(&self, target_node_id: NodeIdBytes) -> Option<Vec<u8>> {
+/// A per-peer cache keyed by node id, whose values carry when they were
+/// written so the bound can evict the oldest.
+type TimestampedPeerCache<V> =
+    Arc<RwLock<std::collections::HashMap<[u8; 32], (V, std::time::Instant)>>>;
+
+/// Insert into a `MAX_PEER_MLKEM_CACHE`-bounded map, evicting the oldest entry
+/// by its recorded timestamp when full.
+fn lru_insert<V>(cache: &TimestampedPeerCache<V>, key: [u8; 32], value: (V, std::time::Instant)) {
+    let mut c = wlock!(cache);
+    if c.len() >= veil_proto::budget::MAX_PEER_MLKEM_CACHE
+        && !c.contains_key(&key)
+        && let Some(oldest) = c.iter().min_by_key(|(_, (_, ts))| *ts).map(|(id, _)| *id)
+    {
+        c.remove(&oldest);
+    }
+    c.insert(key, value);
+}
+
+impl DhtMlKemEkResolver {
+    /// The whole verified certificate from local records only — the sync
+    /// counterpart of [`fetch_verified_cert`](Self::fetch_verified_cert).
+    fn cached_cert(&self, target_node_id: [u8; 32]) -> Option<VerifiedMlkemCert> {
         let now_unix = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .ok()?
@@ -813,7 +854,9 @@ impl MlKemEkResolver for DhtMlKemEkResolver {
         if let Some((cert, ts)) = rlock!(self.cert_cache).get(&target_node_id)
             && ts.elapsed() < self.cert_ttl
         {
-            return Some(cert.mlkem_pubkey.clone());
+            let cert = cert.clone();
+            self.publish_ratchet_key(target_node_id, &cert);
+            return Some(cert);
         }
 
         // Reconstruct the same signed document -> registry -> certificate
@@ -848,41 +891,35 @@ impl MlKemEkResolver for DhtMlKemEkResolver {
         ))?)
         .ok()?;
         let verified = verify_mlkem_cert(&cert, &doc, now_unix).ok()?;
-        let ek = verified.mlkem_pubkey.clone();
-
-        {
-            let mut cache = wlock!(self.peer_mlkem_keys);
-            if cache.len() >= veil_proto::budget::MAX_PEER_MLKEM_CACHE
-                && let Some(oldest) = cache
-                    .iter()
-                    .min_by_key(|(_, (_, ts))| *ts)
-                    .map(|(id, _)| *id)
-            {
-                cache.remove(&oldest);
-            }
-            cache.insert(target_node_id, (ek.clone(), std::time::Instant::now()));
-        }
-        {
-            let mut cache = wlock!(self.cert_cache);
-            if cache.len() >= veil_proto::budget::MAX_PEER_MLKEM_CACHE
-                && let Some(oldest) = cache
-                    .iter()
-                    .min_by_key(|(_, (_, ts))| *ts)
-                    .map(|(id, _)| *id)
-            {
-                cache.remove(&oldest);
-            }
-            cache.insert(target_node_id, (verified, std::time::Instant::now()));
-        }
+        self.cache_verified(target_node_id, &verified);
         self.log_dbg("mlkem_resolver.cert.local_hit", &target_node_id, "");
-        Some(ek)
+        Some(verified)
+    }
+}
+
+/// A verified certificate, restated in the Tier-0 shape the send path takes.
+fn to_peer_cert(cert: VerifiedMlkemCert) -> veil_types::VerifiedPeerCert {
+    veil_types::VerifiedPeerCert {
+        node_id: cert.node_id,
+        instance_id: cert.instance_id,
+        mlkem_ek: cert.mlkem_pubkey,
+        ratchet_x25519_pk: cert.ratchet_x25519_pubkey,
+        cert_version: cert.cert_version,
+    }
+}
+
+impl MlKemEkResolver for DhtMlKemEkResolver {
+    fn resolve_cert_cached(&self, target_node_id: NodeIdBytes) -> Option<veil_types::VerifiedPeerCert> {
+        self.cached_cert(target_node_id).map(to_peer_cert)
     }
 
-    fn resolve_ek(
+    fn resolve_cert(
         &self,
         target_node_id: NodeIdBytes,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<Vec<u8>>> + Send + '_>> {
-        Box::pin(self.fetch_inner(target_node_id))
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Option<veil_types::VerifiedPeerCert>> + Send + '_>,
+    > {
+        Box::pin(async move { self.fetch_verified_cert(target_node_id).await.map(to_peer_cert) })
     }
 }
 
@@ -983,6 +1020,7 @@ mod tests {
             Arc::new(Mutex::new(std::collections::HashMap::new())),
             [1u8; 32],
             Arc::new(RwLock::new(PeerMlKemCache::new())),
+            Arc::new(RwLock::new(veil_e2e::PeerRatchetKeyCache::new())),
             Arc::new(RwLock::new(PeerMlKemCertCache::new())),
             Arc::new(NodeLogger::new_noop()),
         )
@@ -994,12 +1032,27 @@ mod tests {
         dht: Arc<KademliaService>,
         cert_cache: Arc<RwLock<PeerMlKemCertCache>>,
     ) -> DhtMlKemEkResolver {
+        make_test_resolver_with_ratchet_keys(
+            dht,
+            cert_cache,
+            Arc::new(RwLock::new(veil_e2e::PeerRatchetKeyCache::new())),
+        )
+    }
+
+    /// A resolver whose peer-ratchet-key map the caller keeps a handle to, so a
+    /// test can watch the write-through the receive path depends on.
+    fn make_test_resolver_with_ratchet_keys(
+        dht: Arc<KademliaService>,
+        cert_cache: Arc<RwLock<PeerMlKemCertCache>>,
+        peer_ratchet_keys: Arc<RwLock<veil_e2e::PeerRatchetKeyCache>>,
+    ) -> DhtMlKemEkResolver {
         DhtMlKemEkResolver::new(
             dht,
             Arc::new(RwLock::new(SessionTxRegistry::new())),
             Arc::new(Mutex::new(std::collections::HashMap::new())),
             [1u8; 32],
             Arc::new(RwLock::new(PeerMlKemCache::new())),
+            peer_ratchet_keys,
             cert_cache,
             Arc::new(NodeLogger::new_noop()),
         )
@@ -1044,6 +1097,55 @@ mod tests {
 
         assert_eq!(resolver.resolve_ek_cached(target), Some(vec![0x42; 32]));
         assert_eq!(resolver.resolve_ek_cached([8u8; 32]), None);
+    }
+
+    // The whole certificate, not just the key inside it: key agreement needs
+    // the device Diffie-Hellman key and the instance id, and taking either from
+    // anywhere other than the verified structure would undo the verification.
+    #[test]
+    fn resolve_cert_cached_carries_the_ratchet_key_and_instance_through() {
+        let dht = Arc::new(KademliaService::new([1u8; 32]));
+        let target = [9u8; 32];
+        let cert_cache = Arc::new(RwLock::new(PeerMlKemCertCache::new()));
+        wlock!(cert_cache).insert(target, (dummy_cert(target), std::time::Instant::now()));
+        let resolver = make_test_resolver_with_cert_cache(dht, cert_cache);
+
+        let got = resolver.resolve_cert_cached(target).expect("cached");
+        assert_eq!(got.node_id, target);
+        assert_eq!(got.instance_id, [0xab; 16]);
+        assert_eq!(got.ratchet_x25519_pk, [0x5A; 32]);
+        assert_eq!(got.mlkem_ek, vec![0x42; 32]);
+        assert_eq!(got.cert_version, 7);
+        assert_eq!(resolver.resolve_cert_cached([8u8; 32]), None);
+    }
+
+    // The receive path decides sender provenance synchronously and cannot walk
+    // a DHT, so it reads the peer's device key out of this map. Nothing else
+    // writes it: a verification that forgot to would leave every message from
+    // that peer delivered as merely claimed.
+    #[tokio::test]
+    async fn a_verified_certificate_publishes_its_ratchet_key_to_the_receive_path() {
+        let dht = Arc::new(KademliaService::new([1u8; 32]));
+        let target = [9u8; 32];
+        let cert_cache = Arc::new(RwLock::new(PeerMlKemCertCache::new()));
+        wlock!(cert_cache).insert(target, (dummy_cert(target), std::time::Instant::now()));
+        let ratchet_keys = Arc::new(RwLock::new(veil_e2e::PeerRatchetKeyCache::new()));
+        let resolver = make_test_resolver_with_ratchet_keys(
+            Arc::clone(&dht),
+            cert_cache,
+            Arc::clone(&ratchet_keys),
+        );
+
+        assert!(
+            rlock!(ratchet_keys).is_empty(),
+            "nothing verified yet, nothing published"
+        );
+        resolver.resolve_cert(target).await.expect("cached cert");
+        assert_eq!(
+            rlock!(ratchet_keys).get(&target).copied(),
+            Some([0x5A; 32]),
+            "the verified device key must reach the map the receive path reads"
+        );
     }
 
     // TTL gate: with TTL = 0 even a just-inserted entry is stale, so the fast

@@ -103,7 +103,7 @@ pub use discovery::{
     ResolveTransportResponse, SignedTransportAnnouncement, StorePayload, app_endpoint_key,
     attachment_key, dht_value_kind,
 };
-pub use e2e::{E2E_MARKER, E2eEnvelope, META_E2E_MARKER};
+pub use e2e::{E2E_MARKER, E2eEnvelope, META_E2E_MARKER, RATCHET_E2E_MARKER};
 pub use epidemic::EpidemicPayload;
 pub use family::{
     AppMsg, ControlMsg, DeliveryMsg, DiagMsg, DiscoveryMsg, FrameFamily, LocalAppMsg, MeshMsg,
