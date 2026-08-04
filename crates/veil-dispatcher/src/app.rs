@@ -115,9 +115,14 @@ impl FrameDispatcher {
                     Ok(p) => p,
                     Err(e) => return DispatchResult::Violation(format!("bad AppSend: {e}")),
                 };
-                // Use the session node_id as src_node_id so the recipient can reply correctly.
+                // Use the session node_id as src_node_id so the recipient can
+                // reply correctly. That id came from the authenticated OVL1
+                // session this frame arrived on, not from the frame body, so
+                // it is a real identity — the one case that earns
+                // `SessionPeer` outright.
                 self.app_registry.route_ipc_deliver(
                     *node_id.as_bytes(),
+                    veil_app::registry::SenderProvenance::SessionPeer,
                     payload.src_app_id,
                     payload.app_id,
                     payload.endpoint_id,

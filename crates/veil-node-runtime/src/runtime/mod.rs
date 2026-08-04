@@ -3577,6 +3577,11 @@ impl NodeRuntime {
             endpoint_id: target_endpoint_id,
             data: veil_bufpool::pooled_shared_from_vec(data.to_vec()),
             reply_id: 0,
+            // Sender-written, therefore worthless as a trust signal: the
+            // receiver's final-hop handler decides provenance itself and
+            // ignores this byte. Stated as `Claimed` so the wire never carries
+            // a claim of proof.
+            provenance: veil_proto::SenderProvenance::Claimed,
         };
         // Tag the sealed plaintext so the receiver can distinguish a plain
         // delivery from an authenticated one (`send_via_rendezvous_authenticated`
@@ -10129,6 +10134,8 @@ impl NodeServices {
             endpoint_id: target_endpoint_id,
             data: veil_bufpool::pooled_shared_from_vec(data.to_vec()),
             reply_id: 0,
+            // Sender-written; the receiver decides provenance itself.
+            provenance: veil_proto::SenderProvenance::Claimed,
         };
         let app_deliver_bytes = app_deliver.encode();
 
@@ -10276,6 +10283,8 @@ impl NodeServices {
             endpoint_id: target_endpoint_id,
             data: veil_bufpool::pooled_shared_from_vec(data.to_vec()),
             reply_id: 0,
+            // Sender-written; the receiver decides provenance itself.
+            provenance: veil_proto::SenderProvenance::Claimed,
         };
         let deliver_bytes = deliver_payload.encode();
         let mut payload_bytes = Vec::with_capacity(1 + deliver_bytes.len());
