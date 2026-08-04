@@ -206,6 +206,12 @@ impl IpcStreamTable {
             .try_send(AppMessage::StreamOpen {
                 stream_id,
                 src_node_id,
+                // `open_local`: both ends are endpoints on THIS node and the
+                // opener came in over the local IPC socket, so `src_node_id` is
+                // our own id and nothing crossed the network to claim it. The
+                // remote counterpart is `route_stream_open`, which decides for
+                // itself (X/V-01).
+                provenance: veil_proto::SenderProvenance::LocalIpc,
                 initial_window,
             })
             .is_err()

@@ -759,6 +759,7 @@ async fn forward_endpoint(
             AppMessage::StreamOpen {
                 stream_id,
                 src_node_id,
+                provenance,
                 initial_window,
             } => {
                 // Notify the bound app that a remote peer opened a stream to
@@ -804,6 +805,10 @@ async fn forward_endpoint(
                     endpoint_id,
                     src_node_id,
                     initial_window,
+                    // Carried through verbatim from whichever open path produced
+                    // this message — decided there, at the only place that
+                    // knows (X/V-01).
+                    provenance,
                 };
                 encode_ipc_frame(LocalAppMsg::StreamOpenInbound as u16, &payload.encode())
             }

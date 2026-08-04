@@ -1443,13 +1443,14 @@ impl StreamOpenOkPayload {
 /// by this IPC client.  The SDK uses `app_id` + `endpoint_id` to route
 /// the notification to the right `AppHandle`'s inbound queue.
 ///
-/// Wire layout (fixed 76 bytes):
+/// Wire layout (fixed 77 bytes):
 /// ```text
 /// [0..4]   stream_id u32 BE
 /// [4..36]  app_id [u8; 32]
 /// [36..40] endpoint_id u32 BE
 /// [40..72] src_node_id [u8; 32]
 /// [72..76] initial_window u32 BE
+/// [76]     provenance u8 ([`SenderProvenance`])
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StreamOpenInboundPayload {
@@ -1463,13 +1464,19 @@ pub struct StreamOpenInboundPayload {
     pub src_node_id: [u8; 32],
     /// Initiator's initial receive window (us → them).
     pub initial_window: u32,
+    /// What the node knows about `src_node_id` (X/V-01), decided by whichever
+    /// path produced the open. Both of today's producers authenticate it (an
+    /// `APP_OPEN` over an OVL1 session, or a local IPC client) — but that was
+    /// true of the datagram path's comments too, right up until it wasn't, so
+    /// the app is told rather than left to assume.
+    pub provenance: SenderProvenance,
 }
 
 impl StreamOpenInboundPayload {
-    /// Fixed wire size: 4 + 32 + 4 + 32 + 4.
-    pub const WIRE_SIZE: usize = 4 + 32 + 4 + 32 + 4;
+    /// Fixed wire size: 4 + 32 + 4 + 32 + 4 + 1.
+    pub const WIRE_SIZE: usize = 4 + 32 + 4 + 32 + 4 + 1;
 
-    /// Encode to the fixed 76-byte layout.
+    /// Encode to the fixed 77-byte layout.
     pub fn encode(&self) -> [u8; Self::WIRE_SIZE] {
         let mut buf = [0u8; Self::WIRE_SIZE];
         buf[0..4].copy_from_slice(&self.stream_id.to_be_bytes());
@@ -1477,10 +1484,11 @@ impl StreamOpenInboundPayload {
         buf[36..40].copy_from_slice(&self.endpoint_id.to_be_bytes());
         buf[40..72].copy_from_slice(&self.src_node_id);
         buf[72..76].copy_from_slice(&self.initial_window.to_be_bytes());
+        buf[76] = self.provenance.as_u8();
         buf
     }
 
-    /// Parse from a 76-byte buffer.
+    /// Parse from a 77-byte buffer.
     pub fn decode(buf: &[u8]) -> Result<Self, ProtoError> {
         if buf.len() < Self::WIRE_SIZE {
             return Err(ProtoError::BufferTooShort {
@@ -1495,12 +1503,15 @@ impl StreamOpenInboundPayload {
         let mut src_node_id = [0u8; 32];
         src_node_id.copy_from_slice(&buf[40..72]);
         let initial_window = super::read_u32_be(buf, 72)?;
+        // Unknown levels fail closed to `Claimed` — never up.
+        let provenance = SenderProvenance::from_wire(buf[76]);
         Ok(Self {
             stream_id,
             app_id,
             endpoint_id,
             src_node_id,
             initial_window,
+            provenance,
         })
     }
 }

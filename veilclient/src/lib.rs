@@ -117,6 +117,12 @@ pub use veilcore::proto::budget::MAX_CLOCK_SKEW_SECS;
 /// Re-exported [`veilcore::proto::budget::MAX_STREAM_SEND_WINDOW`].
 pub use veilcore::proto::budget::MAX_STREAM_SEND_WINDOW;
 
+/// What the node knows about a delivery's `src_node_id` — the trust level
+/// carried by `IncomingMessage::provenance` / `IncomingStream::provenance`
+/// (X/V-01). Re-exported so an SDK consumer can name it without depending on
+/// `veilcore` directly.
+pub use veilcore::proto::SenderProvenance;
+
 /// Mobile-lifecycle tier reported via
 /// [`VeilClient::set_mobile_background_mode`].
 pub use veilcore::proto::MobileBackgroundMode;

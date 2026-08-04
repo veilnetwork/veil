@@ -65,10 +65,15 @@ final class VeilSovereignSigner extends Opaque {}
 
 // ── Callback typedefs ────────────────────────────────────────────────────────
 
+// `provenance` (X/V-01) is what the node KNOWS about `srcNodeId`, as one of the
+// veilProvenance* bytes below. It rides next to the 32 bytes it qualifies
+// because it is a property OF them: without it a contact's message and a
+// stranger's frame that merely NAMED that contact reach Dart identically.
 typedef VeilRecvCbNative = Void Function(
   Pointer<Void> user,
   Pointer<Uint8> srcNodeId,
   Pointer<Uint8> srcAppId,
+  Uint8 provenance,
   Uint64 replyId,
   Pointer<Uint8> data,
   IntPtr len,
@@ -77,10 +82,21 @@ typedef VeilRecvCb = void Function(
   Pointer<Void> user,
   Pointer<Uint8> srcNodeId,
   Pointer<Uint8> srcAppId,
+  int provenance,
   int replyId,
   Pointer<Uint8> data,
   int len,
 );
+
+// ── Sender provenance wire bytes (X/V-01) ───────────────────────────────────
+// Mirror of veil's `SenderProvenance` discriminants and of the
+// `VEIL_PROVENANCE_*` constants in veil_ffi.h. `SenderProvenance.fromWire`
+// (types.dart) is the only thing that should read these directly; anything
+// unrecognised must fail closed to [veilProvenanceClaimed].
+const int veilProvenanceClaimed = 0;
+const int veilProvenanceLocalIpc = 1;
+const int veilProvenanceSessionPeer = 2;
+const int veilProvenanceSigned = 3;
 
 typedef VeilEventCbNative = Void Function(
   Pointer<Void> user,
@@ -1791,11 +1807,13 @@ final void Function(Pointer<VeilStreamFfi>) veilStreamClose = nativeLib
 
 // Block up to `timeout_ms` for a remote peer to open an inbound stream to a
 // bound endpoint. Returns a stream handle + writes the initiator's node_id to
-// `out_src_node_id` (32 B). NULL on timeout (no err) so the caller polls; NULL
-// with err on a fatal condition.
+// `out_src_node_id` (32 B) and what the node knows about it to
+// `out_provenance` (1 B, a veilProvenance* value). NULL on timeout (no err) so
+// the caller polls; NULL with err on a fatal condition.
 final Pointer<VeilStreamFfi> Function(
   Pointer<VeilApp>,
   int,
+  Pointer<Uint8>,
   Pointer<Uint8>,
   Pointer<Pointer<Utf8>>,
 ) veilStreamAccept = nativeLib
@@ -1804,6 +1822,7 @@ final Pointer<VeilStreamFfi> Function(
             Pointer<VeilStreamFfi> Function(
               Pointer<VeilApp>,
               Uint64,
+              Pointer<Uint8>,
               Pointer<Uint8>,
               Pointer<Pointer<Utf8>>,
             )>>('veil_stream_accept')

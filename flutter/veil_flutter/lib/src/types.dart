@@ -644,6 +644,61 @@ class JoinBootstrapResult {
       'detail=${detail ?? "<none>"})';
 }
 
+/// How much this device actually KNOWS about a delivery's [IncomingMessage
+/// .srcNodeId], as opposed to what the frame merely claimed.
+///
+/// Mirrors veil's `SenderProvenance`: the node decides this where the claim
+/// turns into an identity (audit X/V-01) and carries it to the app as the
+/// trailing byte of `AppDeliverPayload` and as the `provenance` argument of the
+/// recv callback. Before it existed, every delivery path put the same untyped
+/// 32 bytes in front of the app, so a contact's message and a stranger's frame
+/// that merely NAMED that contact were indistinguishable — and there is no peer
+/// allow-list, so any node on the network could send the latter.
+///
+/// The levels are a hierarchy of evidence, not of importance. Only [claimed]
+/// means "nothing at all stands behind this name".
+enum SenderProvenance {
+  /// Nothing corroborates the claim. NEVER a basis for an authorization
+  /// decision — and not a synonym for "hostile": this is the normal, correct
+  /// level for the anonymous meta-E2E path and for anything relayed. ML-KEM
+  /// seals to a PUBLISHED key, so it buys confidentiality and never origin;
+  /// anyone can name anyone. An anonymous message from a stranger is a
+  /// supported thing. A stranger wearing a contact's name is not.
+  claimed(ffi.veilProvenanceClaimed),
+
+  /// The message never left this device; `srcNodeId` is our own node id.
+  localIpc(ffi.veilProvenanceLocalIpc),
+
+  /// `srcNodeId` is the authenticated session peer that handed us the frame —
+  /// the sender speaking for itself, not a name carried through it.
+  sessionPeer(ffi.veilProvenanceSessionPeer),
+
+  /// `srcNodeId` is proven by a signature over this very message, checked
+  /// against the sender's identity document.
+  signed(ffi.veilProvenanceSigned);
+
+  const SenderProvenance(this.wireByte);
+
+  /// The byte veil puts on the wire / passes across the FFI boundary.
+  final int wireByte;
+
+  /// Parse veil's wire byte. Anything unrecognised reads as [claimed] — the
+  /// fail-closed direction, and the only safe one: a reader that does not
+  /// understand some future level must treat the identity as unverified, never
+  /// as proven. There is deliberately no `unknown` value; "I could not read
+  /// the evidence" and "there was no evidence" must lead to the same decision.
+  static SenderProvenance fromWire(int byte) => switch (byte) {
+        ffi.veilProvenanceLocalIpc => localIpc,
+        ffi.veilProvenanceSessionPeer => sessionPeer,
+        ffi.veilProvenanceSigned => signed,
+        _ => claimed,
+      };
+
+  /// Whether something the sender could not choose backs the name up, so a
+  /// decision may rest on it. False for [claimed] alone.
+  bool get isAuthenticated => this != SenderProvenance.claimed;
+}
+
 /// Inbound datagram delivered to a bound [AppHandle].
 class IncomingMessage {
   const IncomingMessage({
@@ -651,10 +706,20 @@ class IncomingMessage {
     required this.srcAppId,
     required this.data,
     this.replyId = 0,
+    this.provenance = SenderProvenance.claimed,
   });
 
   /// 32-byte BLAKE3 hash of the originating node's signing pubkey.
+  ///
+  /// A NAME, not yet an identity — read [provenance] before treating it as
+  /// one.
   final Uint8List srcNodeId;
+
+  /// What this device knows about [srcNodeId] (audit X/V-01). Defaults to
+  /// [SenderProvenance.claimed] on purpose: a construction site that says
+  /// nothing has, by definition, verified nothing, and the default must be the
+  /// one that cannot be mistaken for proof.
+  final SenderProvenance provenance;
 
   /// 32-byte deterministic identifier of the originating endpoint.
   final Uint8List srcAppId;
