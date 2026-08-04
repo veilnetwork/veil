@@ -52,13 +52,30 @@ use veil_types::PeerLruCache;
 #[derive(Clone)]
 pub struct SovereignIdentityCell {
     inner: Arc<RwLock<Option<Arc<SovereignIdentity>>>>,
+    /// A mirror of `active_instance_id()`, kept in step by this cell.
+    ///
+    /// The frame dispatcher has to know which of our devices it is in order to
+    /// key a ratchet conversation, and it cannot reach `SovereignIdentity` —
+    /// veil-identity sits above it. Mirroring the id here rather than
+    /// snapshotting it into the dispatcher is what keeps an identity swap from
+    /// leaving the receive path answering for a device that is no longer us.
+    active_instance: Arc<RwLock<Option<[u8; 16]>>>,
 }
 
 impl SovereignIdentityCell {
     pub fn new(initial: Option<Arc<SovereignIdentity>>) -> Self {
+        let instance = initial.as_ref().map(|s| s.active_instance_id());
         Self {
             inner: Arc::new(RwLock::new(initial)),
+            active_instance: Arc::new(RwLock::new(instance)),
         }
+    }
+
+    /// A handle on the active instance id that holders outside this crate can
+    /// read. Always the instance of whatever document [`get`](Self::get)
+    /// would return.
+    pub fn active_instance_handle(&self) -> Arc<RwLock<Option<[u8; 16]>>> {
+        Arc::clone(&self.active_instance)
     }
 
     /// Current document handle (cheap Arc clone; `None` on legacy nodes).
@@ -68,7 +85,16 @@ impl SovereignIdentityCell {
 
     /// Swap in a freshly re-issued / reloaded document.
     pub fn set(&self, doc: Arc<SovereignIdentity>) {
+        let instance = doc.active_instance_id();
         *self.inner.write().unwrap_or_else(|p| p.into_inner()) = Some(doc);
+        // After, not before: a reader that catches the two writes apart must
+        // see the OLD instance for the new document rather than an instance
+        // for a document that is not installed yet. Both orders are wrong for
+        // one instant; this one cannot name a device we have never published.
+        *self
+            .active_instance
+            .write()
+            .unwrap_or_else(|p| p.into_inner()) = Some(instance);
     }
 
     pub fn is_none(&self) -> bool {

@@ -1604,6 +1604,21 @@ impl NodeRuntime {
                     veil_proto::budget::MAX_PEER_MLKEM_CACHE,
                 ),
             ));
+        // Built here rather than beside `IdentityState` below, because the
+        // frame dispatcher is constructed first and needs the same cell: the
+        // ratchet's two ends are a send path in veil-ipc and a receive path in
+        // veil-dispatcher, and a conversation only works if both agree which
+        // of our devices they are speaking as.
+        let sovereign_cell = identity_state::SovereignIdentityCell::new(sovereign_identity.clone());
+        // One-to-one ratchet conversations. Empty at start: the state is the
+        // host's, and xVeil restores it over the FFI before traffic flows.
+        let ratchet_runtime = veil_e2e::RatchetRuntime {
+            store: Arc::new(veil_e2e::RatchetStore::new()),
+            seed_ring: Arc::clone(&mlkem_keys),
+            local_node_id,
+            local_instance_id: sovereign_cell.active_instance_handle(),
+            peer_ratchet_keys: Arc::clone(&shared_peer_ratchet_keys),
+        };
         // per-session ephemeral ML-KEM DK seeds (key = peer_id, value =
         // SensitiveBytesN<64>-wrapped dk_seed).  Phase 6 slice 6h —
         // values are mlocked while the session is open.
@@ -1991,6 +2006,7 @@ impl NodeRuntime {
                 peer_roles: Arc::clone(&peer_roles),
                 peer_cap_flags: Arc::clone(&peer_cap_flags),
                 per_session_mlkem_dk: Arc::clone(&shared_per_session_mlkem_dk),
+                ratchet: Some(ratchet_runtime.clone()),
             }),
             abuse: Arc::new(veil_dispatcher::AbuseContext {
                 rate_limiter: Arc::clone(&rate_limiter),
@@ -2454,7 +2470,7 @@ impl NodeRuntime {
             // bundle identity-domain fields into one Arc.
             identity: Arc::new(identity_state::IdentityState::new(
                 Arc::clone(&local_identity),
-                identity_state::SovereignIdentityCell::new(sovereign_identity.clone()),
+                sovereign_cell,
                 Arc::clone(&peer_pubkeys),
                 Arc::clone(&peer_sovereign_identities),
                 Arc::clone(&peer_roles),

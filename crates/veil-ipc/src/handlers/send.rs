@@ -291,6 +291,61 @@ pub(crate) struct IpcSendContext<'a> {
     pub(crate) trace_sample_rate: f64,
     /// Pending-ACK tracker.
     pub(crate) pending_ack: Option<&'a Mutex<veil_pending_ack::PendingAckTracker>>,
+    /// One-to-one ratchet conversations, shared with the frame dispatcher.
+    ///
+    /// `None` on a node with no sovereign device identity (a supported
+    /// configuration) and in fixtures without a full runtime; both keep the
+    /// pre-existing ML-KEM behaviour exactly.
+    pub(crate) ratchet: Option<&'a veil_e2e::RatchetRuntime>,
+}
+
+/// Seal `data` through the ratchet, if everything it needs is in hand.
+///
+/// Returns the payload and its per-message delivery-ACK key, or `None` when
+/// this node has no device identity, no resolver, or the recipient publishes no
+/// certificate that verifies. `None` is not a downgrade of anything the ratchet
+/// was doing — it is the message taking the path it took before this existed,
+/// which is still an ML-KEM seal to a published key. What the recipient loses
+/// is the sender proof, and it loses it visibly: the message arrives as
+/// `Claimed` rather than `Signed`.
+///
+/// Failing closed instead was considered and rejected: a node may legitimately
+/// run with no sovereign identity, and a recipient may legitimately have no
+/// certificate published yet, and refusing to talk to either would break
+/// first contact for exactly the people who need it.
+async fn try_ratchet_seal(
+    ctx: &IpcSendContext<'_>,
+    dst_node_id: &[u8; 32],
+    data: &[u8],
+) -> Option<(Vec<u8>, [u8; 32])> {
+    let ratchet = ctx.ratchet?;
+    // Cheap gate before anything expensive: no device identity, no ratchet.
+    ratchet.identity()?;
+    let resolver = ctx.mlkem_ek_resolver?;
+
+    // Local records first. The full walk is three DHT rounds and this is the
+    // ordinary send path; the 30-minute verified-cert cache above it means a
+    // peer costs that walk once, not once per message.
+    let cert = match resolver.resolve_cert_cached(*dst_node_id) {
+        Some(c) => c,
+        None => resolver.resolve_cert(*dst_node_id).await?,
+    };
+
+    match ratchet.seal_for(
+        veil_e2e::PeerRatchetKeys {
+            node_id: &cert.node_id,
+            instance_id: &cert.instance_id,
+            mlkem_ek: &cert.mlkem_ek,
+            ratchet_pk: &cert.ratchet_x25519_pk,
+        },
+        data,
+    ) {
+        Ok(sealed) => Some(sealed),
+        Err(e) => {
+            log::debug!("ratchet.seal_failed dst={} {e}", veil_util::bytes_to_hex(&dst_node_id[..4]));
+            None
+        }
+    }
 }
 
 pub(crate) async fn handle_ipc_send(
@@ -442,6 +497,33 @@ pub(crate) async fn handle_ipc_send(
         return Ok(());
     }
 
+    // ── Ratchet, once, for whichever path this message ends up taking ────────
+    //
+    // Sealed here rather than inside each branch because the direct-session
+    // send is tried first and falls through to the relay path when there is no
+    // live session. Sealing in both places would advance the chain twice for
+    // one message: harmless (the skipped key is cached) but it would mean the
+    // recipient banking a key nothing will ever arrive for, on every fallback.
+    //
+    // Excluded, and each for its own reason:
+    //
+    // * `anonymous` — the meta-E2E path is the ANONYMOUS one, and it is
+    //   supposed to work. A ratchet is a named two-party object; running one
+    //   would put both device identities in front of the recipient and destroy
+    //   the property the path exists for.
+    // * `relay_realtime` / `relay_control_compat` — call media and call
+    //   signalling, which are already sealed under their own per-call keys and
+    //   cannot afford a certificate resolve on the packet path.
+    // * `relay_media_sealed` — already authenticated and encrypted end to end
+    //   by the media codec; the whole point of that flag is to pass the cell
+    //   through untouched.
+    let ratchet_ok = !send.anonymous && !relay_realtime && !relay_media_sealed;
+    let sealed = if ratchet_ok && send.dst_node_id != *local_node_id {
+        try_ratchet_seal(ctx, &send.dst_node_id, &send.data).await
+    } else {
+        None
+    };
+
     if send.dst_node_id == *local_node_id {
         // Local delivery — route directly through the app registry. The
         // message never left this node: it came in over the local IPC socket
@@ -457,11 +539,30 @@ pub(crate) async fn handle_ipc_send(
     } else if let Some(reg) = session_tx_registry {
         // Remote delivery — encode an OVL1 APP_SEND frame and push it to
         // the outbox of the session that leads to dst_node_id.
+        //
+        // With a ratchet payload this becomes an APP_SEND_SEALED, a distinct
+        // frame type rather than the same one carrying different bytes. It has
+        // to be: `data` is whatever the application put there, so no marker
+        // byte inside it could be reserved without stealing a byte some app
+        // legitimately sends.
+        //
+        // Before this, a message to an online peer left the node with NO
+        // end-to-end sealing whatsoever — the session's hop cipher was the
+        // whole of its confidentiality, and it stopped at the far end of that
+        // one link. The relay path was E2E-sealed and this one was not, which
+        // is the opposite of where the traffic is.
+        let app_msg_type = match &sealed {
+            Some(_) => veil_proto::family::AppMsg::AppSendSealed,
+            None => veil_proto::family::AppMsg::AppSend,
+        };
         let ovl1_payload = AppSendPayload {
             src_app_id: send.src_app_id,
             app_id: send.app_id,
             endpoint_id: send.endpoint_id,
-            data: send.data.clone(),
+            data: match &sealed {
+                Some((payload, _)) => veil_bufpool::pooled_shared_from_vec(payload.clone()),
+                None => send.data.clone(),
+            },
         };
         let payload_bytes = ovl1_payload.encode();
         // before fragmenting large payloads, the session's
@@ -471,7 +572,7 @@ pub(crate) async fn handle_ipc_send(
         // This guard will be enforced here once introduces fragmentation.
         let mut hdr = FrameHeader::new(
             veil_proto::family::FrameFamily::App as u8,
-            veil_proto::family::AppMsg::AppSend as u16,
+            app_msg_type as u16,
         );
         hdr.body_len = payload_bytes.len() as u32;
         let mut frame = codec::encode_header(&hdr).to_vec();
@@ -483,6 +584,9 @@ pub(crate) async fn handle_ipc_send(
                 veil_proto::header::priority::INTERACTIVE,
                 frame,
             );
+        if sent && sealed.is_some() {
+            emit_e2e_plaintext_capture(capture_tx, local_node_id, &send.dst_node_id, &send.data);
+        }
 
         if !sent {
             // No direct session. Try relay via RouteCache next-hop.
@@ -533,7 +637,22 @@ pub(crate) async fn handle_ipc_send(
                 // stored in the pending-ack entry so the originator can verify
                 // the recipient's DELIVERED MAC and a forged ACK earns nothing.
                 let mut ack_key = [0u8; 32];
-                let final_payload = if relay_media_sealed {
+                let final_payload = if let Some((payload, key)) = sealed {
+                    // Already sealed above, marker byte and all, so nothing is
+                    // prepended here. The ACK key came out of the same seal:
+                    // it is 32 random bytes carried INSIDE the ciphertext
+                    // rather than derived from a key-encapsulation secret, so
+                    // it survives a later compromise of our decapsulation seed
+                    // and a relay still cannot forge a DELIVERED with it.
+                    ack_key = key;
+                    emit_e2e_plaintext_capture(
+                        capture_tx,
+                        local_node_id,
+                        &send.dst_node_id,
+                        &send.data,
+                    );
+                    payload
+                } else if relay_media_sealed {
                     // The call-media codec already authenticated and encrypted
                     // this payload under a per-call directional key delivered
                     // inside the normal ML-KEM-protected call signaling.
@@ -1283,5 +1402,369 @@ mod relay_hop_tests {
             relay_hops_to_try(&dst, None, &peers),
             vec![nearest, farther]
         );
+    }
+}
+
+// ── The ratchet on the send path ─────────────────────────────────────────────
+//
+// These drive the real `handle_ipc_send`, not a helper beside it, because
+// everything interesting here is a decision that function makes: which of the
+// two transports the message takes, whether the ratchet applies to it at all,
+// and — for the anonymous flag — that it deliberately does not.
+
+#[cfg(all(test, unix))]
+mod ratchet_send_tests {
+    use super::*;
+    use std::sync::Arc;
+    use veil_proto::AppIpcSendPayload;
+
+    const ME: [u8; 32] = [0xA0u8; 32];
+    const PEER: [u8; 32] = [0xB0u8; 32];
+    const RELAY: [u8; 32] = [0xE0u8; 32];
+    const PEER_INSTANCE: [u8; 16] = [0xB1u8; 16];
+    const MY_INSTANCE: [u8; 16] = [0xA1u8; 16];
+
+    /// Captures everything the handler hands to a session.
+    #[derive(Default)]
+    struct Outbox {
+        live: Vec<[u8; 32]>,
+        sent: Mutex<Vec<([u8; 32], Vec<u8>)>>,
+    }
+
+    impl FrameBroadcaster for Outbox {
+        fn send_to(&self, peer_id: &[u8; 32], _priority: u8, bytes: Vec<u8>) -> bool {
+            if !self.live.contains(peer_id) {
+                return false;
+            }
+            lock!(self.sent).push((*peer_id, bytes));
+            true
+        }
+        fn send_to_all_with_priority(&self, _priority: u8, _bytes: Arc<[u8]>) {}
+        fn active_node_ids(&self) -> Vec<[u8; 32]> {
+            self.live.clone()
+        }
+    }
+
+    /// A resolver that already holds the peer's verified certificate — the
+    /// steady state after one DHT walk.
+    struct Certs(veil_types::VerifiedPeerCert);
+
+    impl veil_types::MlKemEkResolver for Certs {
+        fn resolve_cert_cached(&self, target: [u8; 32]) -> Option<veil_types::VerifiedPeerCert> {
+            (target == self.0.node_id).then(|| self.0.clone())
+        }
+        fn resolve_cert(
+            &self,
+            target: [u8; 32],
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = Option<veil_types::VerifiedPeerCert>> + Send + '_,
+            >,
+        > {
+            let out = self.resolve_cert_cached(target);
+            Box::pin(async move { out })
+        }
+    }
+
+    struct Fixture {
+        outbox: Arc<Outbox>,
+        route_cache: RwLock<veil_routing::RouteCache>,
+        peer_mlkem: std::sync::RwLock<veil_e2e::PeerMlKemCache>,
+        certs: Certs,
+        registry: veil_app::registry::AppEndpointRegistry,
+        me: veil_e2e::RatchetRuntime,
+        /// The peer's side, for opening what we sealed.
+        peer: veil_e2e::RatchetRuntime,
+    }
+
+    fn ratchet_runtime(
+        node_id: [u8; 32],
+        instance: [u8; 16],
+        ring: Arc<veil_e2e::MlKemSeedRing>,
+    ) -> veil_e2e::RatchetRuntime {
+        veil_e2e::RatchetRuntime {
+            store: Arc::new(veil_e2e::RatchetStore::new()),
+            seed_ring: ring,
+            local_node_id: node_id,
+            local_instance_id: Arc::new(std::sync::RwLock::new(Some(instance))),
+            peer_ratchet_keys: Arc::new(std::sync::RwLock::new(
+                veil_e2e::PeerRatchetKeyCache::new(),
+            )),
+        }
+    }
+
+    fn ring(tag: u8) -> Arc<veil_e2e::MlKemSeedRing> {
+        let seed = [tag; veil_e2e::DK_SEED_BYTES];
+        let (ek, _) = veil_e2e::keypair_from_dk_seed(&seed).expect("keypair");
+        Arc::new(veil_e2e::MlKemSeedRing::new(0, seed, ek))
+    }
+
+    /// `live_peers` decides which transport the handler picks: with PEER live
+    /// it takes the direct session, with only RELAY live it falls through to
+    /// the relay path.
+    fn fixture(live_peers: Vec<[u8; 32]>) -> Fixture {
+        let my_ring = ring(0xA5);
+        let peer_ring = ring(0xB5);
+        let cert = veil_types::VerifiedPeerCert {
+            node_id: PEER,
+            instance_id: PEER_INSTANCE,
+            mlkem_ek: peer_ring.current_ek().to_vec(),
+            ratchet_x25519_pk: peer_ring.current_ratchet_pk(),
+            cert_version: 1,
+        };
+        let route_cache =
+            RwLock::new(veil_routing::RouteCache::new(std::time::Duration::from_secs(60)));
+        wlock!(route_cache).insert(PEER, RELAY, 10_000, 2);
+        let peer_mlkem = std::sync::RwLock::new(veil_e2e::PeerMlKemCache::new());
+        wlock!(peer_mlkem).insert(
+            PEER,
+            (peer_ring.current_ek().to_vec(), std::time::Instant::now()),
+        );
+        // The peer knows our device key, as it would after resolving us.
+        let peer_rt = ratchet_runtime(PEER, PEER_INSTANCE, peer_ring);
+        wlock!(peer_rt.peer_ratchet_keys).insert(ME, my_ring.current_ratchet_pk());
+        Fixture {
+            outbox: Arc::new(Outbox {
+                live: live_peers,
+                sent: Mutex::new(Vec::new()),
+            }),
+            route_cache,
+            peer_mlkem,
+            certs: Certs(cert),
+            registry: veil_app::registry::AppEndpointRegistry::new(),
+            me: ratchet_runtime(ME, MY_INSTANCE, my_ring),
+            peer: peer_rt,
+        }
+    }
+
+    impl Fixture {
+        fn ctx(&self, with_ratchet: bool) -> IpcSendContext<'_> {
+            IpcSendContext {
+                app_registry: &self.registry,
+                local_node_id: &ME,
+                session_tx_registry: Some(self.outbox.as_ref()),
+                route_cache: Some(&self.route_cache),
+                route_updated: None,
+                peer_mlkem_keys: Some(&self.peer_mlkem),
+                mlkem_ek_resolver: Some(&self.certs),
+                anon_onion_sender: None,
+                capture_tx: None,
+                pending_recursive: None,
+                trace_sample_rate: 0.0,
+                pending_ack: None,
+                ratchet: with_ratchet.then_some(&self.me),
+            }
+        }
+
+        fn taken(&self) -> Vec<([u8; 32], Vec<u8>)> {
+            std::mem::take(&mut lock!(self.outbox.sent))
+        }
+    }
+
+    fn payload(anonymous: bool, data: &[u8]) -> Vec<u8> {
+        AppIpcSendPayload {
+            src_app_id: [0x11u8; 32],
+            dst_node_id: PEER,
+            app_id: [0x22u8; 32],
+            endpoint_id: 7,
+            data: veil_bufpool::pooled_shared_from_vec(data.to_vec()),
+            require_ack: false,
+            anonymous,
+            anonymous_authenticated: false,
+            expect_reply: false,
+            is_reply: false,
+            reply_id: 0,
+            reply_endpoint_id: 0,
+        }
+        .encode()
+    }
+
+    /// A write half over a socket pair — the handler writes status frames to
+    /// it and nothing here reads them back.
+    async fn sink() -> crate::transport::IpcWriteHalf {
+        let (a, b) = tokio::net::UnixStream::pair().expect("socketpair");
+        // Keep the far end alive for the length of the test so writes do not
+        // fail with EPIPE and mask a real assertion.
+        Box::leak(Box::new(b));
+        let (_r, w) = a.into_split();
+        veil_local_transport::LocalWriteHalf::Unix(w)
+    }
+
+    /// The blocker this slice existed for: a message to an ONLINE peer used to
+    /// leave the node with no end-to-end sealing at all — the session's own hop
+    /// cipher was the whole of it. Most one-to-one traffic goes this way, so
+    /// ratcheting the relay path alone would have ratcheted the minority.
+    ///
+    /// Positive assertion: the frame on the wire is an APP_SEND_SEALED whose
+    /// payload the peer opens through the ratchet.
+    #[tokio::test]
+    async fn a_direct_session_send_goes_out_through_the_ratchet() {
+        let fx = fixture(vec![PEER, RELAY]);
+        let mut wh = sink().await;
+        let mut rl = None;
+        handle_ipc_send(&mut wh, &payload(false, b"hello over a session"), &fx.ctx(true), &mut rl)
+            .await
+            .expect("send");
+
+        let sent = fx.taken();
+        assert_eq!(sent.len(), 1);
+        let (peer, frame) = &sent[0];
+        assert_eq!(peer, &PEER, "the direct session, not a relay");
+
+        let hdr = veil_proto::codec::decode_header(frame).expect("header");
+        assert_eq!(
+            hdr.msg_type,
+            veil_proto::family::AppMsg::AppSendSealed as u16,
+            "a sealed send must be its own frame type — `data` is whatever the \
+             app put there, so no byte inside it could have been reserved"
+        );
+        let body = veil_proto::app::AppSendPayload::decode(&frame[veil_proto::HEADER_SIZE..])
+            .expect("body");
+        assert_eq!(
+            body.data.first().copied(),
+            Some(veil_proto::RATCHET_E2E_MARKER)
+        );
+
+        // And it really is readable by the peer, as the peer.
+        let opened = fx
+            .peer
+            .open_payload(&ME, &body.data, veil_util::unix_secs_now_u64())
+            .expect("the peer opens it");
+        assert_eq!(opened.plaintext, b"hello over a session");
+        assert!(
+            opened.authenticated,
+            "and knows who wrote it, which an unsealed APP_SEND never told it"
+        );
+    }
+
+    /// Without the ratchet wired the same send is the plaintext APP_SEND it
+    /// always was. Stated so the assertion above is about the ratchet and not
+    /// about the fixture.
+    #[tokio::test]
+    async fn without_the_ratchet_a_direct_session_send_is_unchanged() {
+        let fx = fixture(vec![PEER, RELAY]);
+        let mut wh = sink().await;
+        let mut rl = None;
+        handle_ipc_send(&mut wh, &payload(false, b"plain"), &fx.ctx(false), &mut rl)
+            .await
+            .expect("send");
+
+        let sent = fx.taken();
+        assert_eq!(sent.len(), 1);
+        let hdr = veil_proto::codec::decode_header(&sent[0].1).expect("header");
+        assert_eq!(hdr.msg_type, veil_proto::family::AppMsg::AppSend as u16);
+        let body = veil_proto::app::AppSendPayload::decode(&sent[0].1[veil_proto::HEADER_SIZE..])
+            .expect("body");
+        assert_eq!(&*body.data, b"plain", "in the clear, exactly as before");
+    }
+
+    /// The relay path carries the same payload, under the delivery envelope.
+    #[tokio::test]
+    async fn a_relayed_send_carries_the_ratchet_payload() {
+        let fx = fixture(vec![RELAY]); // no direct session to PEER
+        let mut wh = sink().await;
+        let mut rl = None;
+        handle_ipc_send(&mut wh, &payload(false, b"through a relay"), &fx.ctx(true), &mut rl)
+            .await
+            .expect("send");
+
+        let sent = fx.taken();
+        assert_eq!(sent.len(), 1);
+        let (hop, frame) = &sent[0];
+        assert_eq!(hop, &RELAY);
+        let fwd = veil_proto::delivery::ForwardPayload::decode(&frame[veil_proto::HEADER_SIZE..])
+            .expect("forward");
+        assert_eq!(
+            fwd.envelope.payload.first().copied(),
+            Some(veil_proto::RATCHET_E2E_MARKER),
+            "not the 0xE2 encapsulation-to-a-published-key envelope"
+        );
+        let opened = fx
+            .peer
+            .open_payload(&ME, &fwd.envelope.payload, veil_util::unix_secs_now_u64())
+            .expect("the peer opens it");
+        assert_eq!(opened.plaintext, b"through a relay");
+        assert!(opened.authenticated);
+    }
+
+    /// The anonymous path is standard traffic and must keep working. Gating it
+    /// behind the ratchet would have been the easy mistake: a ratchet is a
+    /// NAMED two-party object, so running one here would put both device
+    /// identities in front of the recipient and destroy the property the path
+    /// exists for.
+    #[tokio::test]
+    async fn an_anonymous_send_stays_on_the_anonymous_path_and_stays_anonymous() {
+        let fx = fixture(vec![RELAY]);
+        let mut wh = sink().await;
+        let mut rl = None;
+        handle_ipc_send(&mut wh, &payload(true, b"anonymously yours"), &fx.ctx(true), &mut rl)
+            .await
+            .expect("send");
+
+        let sent = fx.taken();
+        assert_eq!(sent.len(), 1);
+        let fwd =
+            veil_proto::delivery::ForwardPayload::decode(&sent[0].1[veil_proto::HEADER_SIZE..])
+                .expect("forward");
+        assert_eq!(
+            fwd.envelope.payload.first().copied(),
+            Some(veil_proto::META_E2E_MARKER),
+            "the anonymous path must not have been rerouted through the ratchet"
+        );
+        assert_eq!(fwd.envelope.sender_node_id, [0u8; 32]);
+        assert_eq!(fwd.envelope.src_app_id, [0u8; 32]);
+        assert_eq!(fwd.envelope.app_id, [0u8; 32]);
+        assert_eq!(fwd.envelope.endpoint_id, 0);
+        assert!(
+            fx.me.store.is_empty(),
+            "and must not have opened a named conversation on the way past"
+        );
+    }
+
+    /// One message, one chain step, whichever transport it took. The direct
+    /// send is tried first and falls through to the relay when there is no
+    /// session; sealing inside each branch instead would advance the chain
+    /// twice and leave the recipient banking a key nothing ever arrives for.
+    #[tokio::test]
+    async fn a_fallback_from_direct_to_relay_seals_once() {
+        let fx = fixture(vec![RELAY]);
+        let mut wh = sink().await;
+        let mut rl = None;
+        handle_ipc_send(&mut wh, &payload(false, b"once"), &fx.ctx(true), &mut rl)
+            .await
+            .expect("send");
+        assert_eq!(
+            fx.me.store.version(),
+            1,
+            "exactly one committed ratchet operation for one message"
+        );
+    }
+
+    /// The host's cue to write. A send it does not persist is a message key it
+    /// cannot rebuild, so the store names the conversation on every committed
+    /// operation and clears the notice only when it is read.
+    #[tokio::test]
+    async fn every_send_names_the_conversation_the_host_must_persist() {
+        let fx = fixture(vec![PEER]);
+        let mut wh = sink().await;
+        let mut rl = None;
+        assert_eq!(fx.me.store.version(), 0);
+        assert!(fx.me.store.drain_dirty().is_empty());
+
+        handle_ipc_send(&mut wh, &payload(false, b"one"), &fx.ctx(true), &mut rl)
+            .await
+            .expect("send");
+        assert_eq!(fx.me.store.version(), 1);
+        let dirty = fx.me.store.drain_dirty();
+        assert_eq!(dirty.len(), 1);
+        assert_eq!(dirty[0].peer_node_id, PEER);
+        assert_eq!(dirty[0].peer_instance_id, PEER_INSTANCE);
+        assert_eq!(dirty[0].local_instance_id, MY_INSTANCE);
+
+        handle_ipc_send(&mut wh, &payload(false, b"two"), &fx.ctx(true), &mut rl)
+            .await
+            .expect("send");
+        assert_eq!(fx.me.store.version(), 2);
+        assert_eq!(fx.me.store.drain_dirty().len(), 1, "named again");
     }
 }

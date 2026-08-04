@@ -4688,6 +4688,7 @@ dependencies = [
  "veil-pex",
  "veil-proto",
  "veil-proxy",
+ "veil-ratchet",
  "veil-reputation",
  "veil-routing",
  "veil-session",

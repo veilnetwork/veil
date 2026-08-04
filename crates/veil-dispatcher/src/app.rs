@@ -131,6 +131,57 @@ impl FrameDispatcher {
                 DispatchResult::NoResponse
             }
 
+            // The same datagram, with the ratchet under it.
+            //
+            // This is the branch that matters for anyone actually online. An
+            // ordinary `AppSend` over a direct session carries NO end-to-end
+            // sealing at all: the session's own hop cipher is the only thing
+            // protecting it, so the payload is in the clear the moment it
+            // leaves that one link, and the sender is only as good as the
+            // session peer id. Most one-to-one traffic goes this way, so
+            // ratcheting only the relay path would have ratcheted the minority.
+            AppMsg::AppSendSealed => {
+                let payload = match AppSendPayload::decode(body) {
+                    Ok(p) => p,
+                    Err(e) => return DispatchResult::Violation(format!("bad AppSendSealed: {e}")),
+                };
+                let Some(ratchet) = &self.crypto.ratchet else {
+                    // No device identity: nothing could have been keyed to us.
+                    return DispatchResult::NoResponse;
+                };
+                let now_unix = veil_util::unix_secs_now_u64();
+                match ratchet.open_payload(node_id.as_bytes(), &payload.data, now_unix) {
+                    Ok(opened) => {
+                        // `SessionPeer` is the floor, not the answer: the frame
+                        // did arrive on an authenticated session with this
+                        // peer, so even an unmatched device key leaves us
+                        // knowing that much. Opening under a session keyed to
+                        // the key that peer published is strictly more.
+                        let provenance = if opened.authenticated {
+                            veil_app::registry::SenderProvenance::Signed
+                        } else {
+                            veil_app::registry::SenderProvenance::SessionPeer
+                        };
+                        self.app_registry.route_ipc_deliver(
+                            *node_id.as_bytes(),
+                            provenance,
+                            payload.src_app_id,
+                            payload.app_id,
+                            payload.endpoint_id,
+                            veil_bufpool::pooled_shared_from_vec(opened.plaintext),
+                        );
+                    }
+                    Err(e) => {
+                        // Not a violation: a conversation the host has not
+                        // restored yet looks exactly like this, and so does a
+                        // frame for another of our devices.
+                        self.logger
+                            .debug("app.ratchet.open_failed", format!("{e}"));
+                    }
+                }
+                DispatchResult::NoResponse
+            }
+
             AppMsg::AppOpen => {
                 let payload = match AppOpenPayload::decode(body) {
                     Ok(p) => p,
