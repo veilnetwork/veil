@@ -53,7 +53,8 @@ use std::sync::Mutex;
 
 use veil_proto::RATCHET_E2E_MARKER;
 use veil_ratchet::{
-    InitialMessage, OsRatchetRng, PQXDH_PROLOGUE_LEN, RatchetError, RatchetSession, pqxdh,
+    InitialMessage, OsRatchetRng, PQXDH_PROLOGUE_LEN, RatchetError, RatchetRng, RatchetSession,
+    pqxdh,
 };
 use zeroize::Zeroizing;
 
@@ -169,6 +170,12 @@ pub enum RatchetSpliceError {
     #[error("peer certificate carries no ratchet key")]
     NoRatchetKey,
 
+    /// This node has no sovereign device identity, so it has no instance a
+    /// peer could address and no ratchet key it could have published. Running
+    /// without one is a supported configuration, not a fault.
+    #[error("no local device identity")]
+    NoLocalInstance,
+
     /// The primitive refused. Includes
     /// [`PqDowngrade`](veil_ratchet::RatchetError::PqDowngrade) — a frame that
     /// dropped its post-quantum leg is refused here exactly as it is there,
@@ -198,12 +205,16 @@ pub struct PeerRatchetKeys<'a> {
 }
 
 /// Our own half: who we are and what we can decrypt with.
+///
+/// The two identifiers are held by value, not borrowed: the instance id lives
+/// behind a lock in [`RatchetRuntime`] because a device identity can be swapped
+/// while the node runs, and 48 bytes is not worth a lifetime.
 #[derive(Clone, Copy)]
 pub struct RatchetIdentity<'a> {
     /// Our node id.
-    pub local_node_id: &'a [u8; 32],
+    pub local_node_id: [u8; 32],
     /// Which of our devices is speaking.
-    pub local_instance_id: &'a [u8; 16],
+    pub local_instance_id: [u8; 16],
     /// The ring holding the current mailbox seed and its still-usable
     /// predecessors. Both halves of a certificate come out of it, in matched
     /// order, so a sender working from a week-old certificate still finds the
@@ -214,7 +225,10 @@ pub struct RatchetIdentity<'a> {
 impl std::fmt::Debug for RatchetIdentity<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("RatchetIdentity")
-            .field("local_node_id", &veil_util::bytes_to_hex(&self.local_node_id[..4]))
+            .field(
+                "local_node_id",
+                &veil_util::bytes_to_hex(&self.local_node_id[..4]),
+            )
             .finish_non_exhaustive()
     }
 }
@@ -501,15 +515,42 @@ fn encode_payload(
     out
 }
 
+/// Length of the delivery-ACK key carried in front of the application payload,
+/// inside the ciphertext.
+pub const ACK_KEY_LEN: usize = 32;
+
 /// Seal one message for `peer`, opening the conversation if this is the first.
 ///
-/// The whole return value is the `DeliveryEnvelope.payload` (or the direct
-/// session's app payload) — marker byte included, so a caller never prepends
-/// anything and cannot forget to.
+/// The whole first return value is the `DeliveryEnvelope.payload` (or the
+/// direct session's app payload) — marker byte included, so a caller never
+/// prepends anything and cannot forget to.
+///
+/// The second is the per-message delivery-ACK key, the counterpart of
+/// [`encrypt_with_ack`](crate::encrypt_with_ack)'s. It is not derived from
+/// anything: it is 32 random bytes carried *inside* the ciphertext, in front of
+/// the application payload. That is strictly stronger than deriving it from a
+/// key-encapsulation secret, because a party who later learns the recipient's
+/// decapsulation seed still cannot reconstruct it — and it is what keeps a
+/// relay from forging a DELIVERED and stopping a retransmit for a message it
+/// never delivered.
 ///
 /// First contact needs nothing online from the recipient: everything read here
 /// is out of the certificate they already published and already signed.
 pub fn seal(
+    store: &RatchetStore,
+    me: &RatchetIdentity<'_>,
+    peer: PeerRatchetKeys<'_>,
+    app_payload: &[u8],
+) -> Result<(Vec<u8>, [u8; ACK_KEY_LEN]), RatchetSpliceError> {
+    let mut ack_key = [0u8; ACK_KEY_LEN];
+    OsRatchetRng.fill_bytes(&mut ack_key);
+    let mut plaintext = Zeroizing::new(Vec::with_capacity(ACK_KEY_LEN + app_payload.len()));
+    plaintext.extend_from_slice(&ack_key);
+    plaintext.extend_from_slice(app_payload);
+    seal_inner(store, me, peer, &plaintext).map(|payload| (payload, ack_key))
+}
+
+fn seal_inner(
     store: &RatchetStore,
     me: &RatchetIdentity<'_>,
     peer: PeerRatchetKeys<'_>,
@@ -523,13 +564,13 @@ pub fn seal(
         return Err(RatchetSpliceError::NoRatchetKey);
     }
     let key = ConversationKey {
-        local_instance_id: *me.local_instance_id,
+        local_instance_id: me.local_instance_id,
         peer_node_id: *peer.node_id,
         peer_instance_id: *peer.instance_id,
     };
     let ad = associated_data(
-        me.local_node_id,
-        me.local_instance_id,
+        &me.local_node_id,
+        &me.local_instance_id,
         peer.node_id,
         peer.instance_id,
     );
@@ -561,7 +602,7 @@ pub fn seal(
             let (message, session) = pqxdh::initiate(
                 &our_ik_sk,
                 pqxdh::Peers {
-                    initiator_node_id: me.local_node_id,
+                    initiator_node_id: &me.local_node_id,
                     responder_node_id: peer.node_id,
                     responder_instance_id: peer.instance_id,
                 },
@@ -594,7 +635,7 @@ pub fn seal(
 
     Ok(encode_payload(
         kind,
-        me.local_instance_id,
+        &me.local_instance_id,
         peer.instance_id,
         &blob,
     ))
@@ -607,6 +648,9 @@ pub fn seal(
 pub struct Opened {
     /// The application payload.
     pub plaintext: Vec<u8>,
+    /// The per-message delivery-ACK key the sender put inside the ciphertext.
+    /// Only the two endpoints hold it, so a relay cannot forge a DELIVERED.
+    pub ack_key: [u8; ACK_KEY_LEN],
     /// The conversation it belongs to — what the host persists.
     pub key: ConversationKey,
     /// Whether the sender is cryptographically proven, not merely claimed.
@@ -642,6 +686,28 @@ pub fn open(
     published_peer_ik: Option<&[u8; 32]>,
     now_unix: u64,
 ) -> Result<Opened, RatchetSpliceError> {
+    let mut opened = open_inner(store, me, sender_node_id, payload, published_peer_ik, now_unix)?;
+    if opened.plaintext.len() < ACK_KEY_LEN {
+        // Authenticated, so it came from the peer — but the peer built a
+        // payload this version does not understand. Refuse rather than hand a
+        // truncated application payload upward.
+        return Err(RatchetSpliceError::Malformed("plaintext shorter than its ack key"));
+    }
+    let rest = opened.plaintext.split_off(ACK_KEY_LEN);
+    opened
+        .ack_key
+        .copy_from_slice(&std::mem::replace(&mut opened.plaintext, rest));
+    Ok(opened)
+}
+
+fn open_inner(
+    store: &RatchetStore,
+    me: &RatchetIdentity<'_>,
+    sender_node_id: &[u8; 32],
+    payload: &[u8],
+    published_peer_ik: Option<&[u8; 32]>,
+    now_unix: u64,
+) -> Result<Opened, RatchetSpliceError> {
     if payload.len() <= HEADER_LEN {
         return Err(RatchetSpliceError::Malformed("shorter than a header"));
     }
@@ -656,21 +722,21 @@ pub fn open(
     sender_instance_id.copy_from_slice(&payload[3..19]);
     let mut recipient_instance_id = [0u8; 16];
     recipient_instance_id.copy_from_slice(&payload[19..35]);
-    if &recipient_instance_id != me.local_instance_id {
+    if recipient_instance_id != me.local_instance_id {
         return Err(RatchetSpliceError::NotForThisDevice);
     }
     let blob = &payload[HEADER_LEN..];
 
     let key = ConversationKey {
-        local_instance_id: *me.local_instance_id,
+        local_instance_id: me.local_instance_id,
         peer_node_id: *sender_node_id,
         peer_instance_id: sender_instance_id,
     };
     let ad = associated_data(
         sender_node_id,
         &sender_instance_id,
-        me.local_node_id,
-        me.local_instance_id,
+        &me.local_node_id,
+        &me.local_instance_id,
     );
     let mut rng = OsRatchetRng;
 
@@ -701,6 +767,7 @@ pub fn open(
         g.dirty.insert(key);
         return Ok(Opened {
             plaintext,
+            ack_key: [0u8; ACK_KEY_LEN],
             key,
             authenticated,
         });
@@ -726,8 +793,8 @@ pub fn open(
             mlkem_seed,
             pqxdh::Peers {
                 initiator_node_id: sender_node_id,
-                responder_node_id: me.local_node_id,
-                responder_instance_id: me.local_instance_id,
+                responder_node_id: &me.local_node_id,
+                responder_instance_id: &me.local_instance_id,
             },
             &message,
             &ad,
@@ -749,6 +816,7 @@ pub fn open(
                 g.dirty.insert(key);
                 return Ok(Opened {
                     plaintext,
+                    ack_key: [0u8; ACK_KEY_LEN],
                     key,
                     authenticated,
                 });
@@ -780,6 +848,107 @@ pub fn open(
 /// that one message, never readability.
 pub type PeerRatchetKeyCache = std::collections::HashMap<[u8; 32], [u8; 32]>;
 
+// ── The handle both paths hold ───────────────────────────────────────────────
+
+/// Everything a send or a receive path needs to run the ratchet.
+///
+/// One type rather than five loose fields on two contexts, because the five
+/// are only ever useful together: a node missing any of them cannot ratchet at
+/// all, and the shape makes that a single `Option` instead of a combination
+/// that has to be checked consistently in two crates.
+///
+/// Cheap to clone — every field is an `Arc` or an identifier.
+#[derive(Clone)]
+pub struct RatchetRuntime {
+    /// The conversations, which the host persists.
+    pub store: std::sync::Arc<RatchetStore>,
+    /// Our mailbox keys, current and still-usable retired.
+    pub seed_ring: std::sync::Arc<MlKemSeedRing>,
+    /// Our node id.
+    pub local_node_id: [u8; 32],
+    /// Which of our devices we are, mirroring the active sovereign identity.
+    ///
+    /// Behind a lock and optional because both are true of the thing it
+    /// mirrors: a node can run with no sovereign identity at all (and must —
+    /// that is a standing decision), and an identity can be swapped while the
+    /// node runs. Reading it per message is what keeps a swap from leaving one
+    /// path addressing a device that is no longer us.
+    pub local_instance_id: std::sync::Arc<std::sync::RwLock<Option<[u8; 16]>>>,
+    /// Peers' device keys, from their verified certificates.
+    pub peer_ratchet_keys: std::sync::Arc<std::sync::RwLock<PeerRatchetKeyCache>>,
+}
+
+impl std::fmt::Debug for RatchetRuntime {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RatchetRuntime")
+            .field("conversations", &self.store.len())
+            .field("has_instance", &self.identity().is_some())
+            .finish_non_exhaustive()
+    }
+}
+
+impl RatchetRuntime {
+    /// Our half of a conversation, or `None` when this node has no device
+    /// identity to speak as and therefore nothing a peer could address.
+    #[must_use]
+    pub fn identity(&self) -> Option<RatchetIdentity<'_>> {
+        let instance = (*self
+            .local_instance_id
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner))?;
+        Some(RatchetIdentity {
+            local_node_id: self.local_node_id,
+            local_instance_id: instance,
+            seed_ring: &self.seed_ring,
+        })
+    }
+
+    /// The device key `peer` published, if a verified certificate for them has
+    /// been resolved. `None` costs authentication for one message, never
+    /// readability.
+    #[must_use]
+    pub fn published_ik(&self, peer_node_id: &[u8; 32]) -> Option<[u8; 32]> {
+        self.peer_ratchet_keys
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(peer_node_id)
+            .copied()
+    }
+
+    /// Seal for a peer whose certificate the caller has verified. See [`seal`].
+    pub fn seal_for(
+        &self,
+        peer: PeerRatchetKeys<'_>,
+        app_payload: &[u8],
+    ) -> Result<(Vec<u8>, [u8; ACK_KEY_LEN]), RatchetSpliceError> {
+        let me = self
+            .identity()
+            .ok_or(RatchetSpliceError::NoLocalInstance)?;
+        seal(&self.store, &me, peer, app_payload)
+    }
+
+    /// Open a payload from `sender_node_id`. See [`open`].
+    pub fn open_payload(
+        &self,
+        sender_node_id: &[u8; 32],
+        payload: &[u8],
+        now_unix: u64,
+    ) -> Result<Opened, RatchetSpliceError> {
+        let me = self
+            .identity()
+            .ok_or(RatchetSpliceError::NoLocalInstance)?;
+        let published = self.published_ik(sender_node_id);
+        open(
+            &self.store,
+            &me,
+            sender_node_id,
+            payload,
+            published.as_ref(),
+            now_unix,
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -808,8 +977,8 @@ mod tests {
     impl Device {
         fn me(&self) -> RatchetIdentity<'_> {
             RatchetIdentity {
-                local_node_id: &self.node_id,
-                local_instance_id: &self.instance_id,
+                local_node_id: self.node_id,
+                local_instance_id: self.instance_id,
                 seed_ring: &self.ring,
             }
         }
@@ -833,7 +1002,7 @@ mod tests {
     /// Alice seals to Bob; Bob opens it. Returns Bob's result.
     fn a_to_b(a: &Device, b: &Device, msg: &[u8]) -> Result<Opened, RatchetSpliceError> {
         let (ek, pk) = (b.ek(), b.ratchet_pk());
-        let payload = seal(&a.store, &a.me(), keys(b, &ek, &pk), msg).expect("seal");
+        let payload = seal(&a.store, &a.me(), keys(b, &ek, &pk), msg).expect("seal").0;
         let a_pk = a.ratchet_pk();
         open(
             &b.store,
@@ -865,7 +1034,7 @@ mod tests {
         a_to_b(&a, &b, b"one").expect("open");
         for i in 0..4u8 {
             let (ek, pk) = (a.ek(), a.ratchet_pk());
-            let back = seal(&b.store, &b.me(), keys(&a, &ek, &pk), &[i; 9]).expect("seal");
+            let back = seal(&b.store, &b.me(), keys(&a, &ek, &pk), &[i; 9]).expect("seal").0;
             let b_pk = b.ratchet_pk();
             let got = open(&a.store, &a.me(), &b.node_id, &back, Some(&b_pk), NOW).expect("open");
             assert_eq!(got.plaintext, vec![i; 9]);
@@ -880,12 +1049,12 @@ mod tests {
     fn the_first_payload_carries_a_prologue_and_later_ones_do_not() {
         let (a, b) = (device(0xA3), device(0xB3));
         let (ek, pk) = (b.ek(), b.ratchet_pk());
-        let first = seal(&a.store, &a.me(), keys(&b, &ek, &pk), b"1").expect("seal");
+        let first = seal(&a.store, &a.me(), keys(&b, &ek, &pk), b"1").expect("seal").0;
         assert_eq!(first[2], KIND_PROLOGUE);
 
         // Still no answer from Bob, so the prologue is repeated — a lost first
         // transmission must not strand the conversation.
-        let second = seal(&a.store, &a.me(), keys(&b, &ek, &pk), b"2").expect("seal");
+        let second = seal(&a.store, &a.me(), keys(&b, &ek, &pk), b"2").expect("seal").0;
         assert_eq!(second[2], KIND_PROLOGUE);
         assert_eq!(
             &second[HEADER_LEN..HEADER_LEN + PQXDH_PROLOGUE_LEN],
@@ -898,11 +1067,11 @@ mod tests {
         let a_pk = a.ratchet_pk();
         open(&b.store, &b.me(), &a.node_id, &second, Some(&a_pk), NOW).expect("open");
         let (aek, apk) = (a.ek(), a.ratchet_pk());
-        let reply = seal(&b.store, &b.me(), keys(&a, &aek, &apk), b"got it").expect("seal");
+        let reply = seal(&b.store, &b.me(), keys(&a, &aek, &apk), b"got it").expect("seal").0;
         let b_pk = b.ratchet_pk();
         open(&a.store, &a.me(), &b.node_id, &reply, Some(&b_pk), NOW).expect("open");
 
-        let third = seal(&a.store, &a.me(), keys(&b, &ek, &pk), b"3").expect("seal");
+        let third = seal(&a.store, &a.me(), keys(&b, &ek, &pk), b"3").expect("seal").0;
         assert_eq!(third[2], KIND_FRAME, "the prologue must stop once answered");
     }
 
@@ -910,8 +1079,8 @@ mod tests {
     fn a_lost_first_message_is_recovered_by_the_repeated_prologue() {
         let (a, b) = (device(0xA4), device(0xB4));
         let (ek, pk) = (b.ek(), b.ratchet_pk());
-        let lost = seal(&a.store, &a.me(), keys(&b, &ek, &pk), b"lost").expect("seal");
-        let kept = seal(&a.store, &a.me(), keys(&b, &ek, &pk), b"kept").expect("seal");
+        let lost = seal(&a.store, &a.me(), keys(&b, &ek, &pk), b"lost").expect("seal").0;
+        let kept = seal(&a.store, &a.me(), keys(&b, &ek, &pk), b"kept").expect("seal").0;
         drop(lost);
         let a_pk = a.ratchet_pk();
         let got = open(&b.store, &b.me(), &a.node_id, &kept, Some(&a_pk), NOW).expect("open");
@@ -922,7 +1091,7 @@ mod tests {
     fn an_unknown_sender_key_opens_but_is_not_authenticated() {
         let (a, b) = (device(0xA5), device(0xB5));
         let (ek, pk) = (b.ek(), b.ratchet_pk());
-        let payload = seal(&a.store, &a.me(), keys(&b, &ek, &pk), b"who am i").expect("seal");
+        let payload = seal(&a.store, &a.me(), keys(&b, &ek, &pk), b"who am i").expect("seal").0;
         // Bob has not resolved Alice's certificate yet.
         let got = open(&b.store, &b.me(), &a.node_id, &payload, None, NOW).expect("open");
         assert_eq!(got.plaintext, b"who am i");
@@ -932,7 +1101,7 @@ mod tests {
         );
 
         // It settles the moment the certificate is in hand.
-        let next = seal(&a.store, &a.me(), keys(&b, &ek, &pk), b"still me").expect("seal");
+        let next = seal(&a.store, &a.me(), keys(&b, &ek, &pk), b"still me").expect("seal").0;
         let a_pk = a.ratchet_pk();
         let got = open(&b.store, &b.me(), &a.node_id, &next, Some(&a_pk), NOW).expect("open");
         assert!(got.authenticated);
@@ -942,7 +1111,7 @@ mod tests {
     fn a_sender_announcing_the_wrong_key_is_not_authenticated() {
         let (a, b) = (device(0xA6), device(0xB6));
         let (ek, pk) = (b.ek(), b.ratchet_pk());
-        let payload = seal(&a.store, &a.me(), keys(&b, &ek, &pk), b"impostor").expect("seal");
+        let payload = seal(&a.store, &a.me(), keys(&b, &ek, &pk), b"impostor").expect("seal").0;
         // Anyone can seal to Bob's published key and name any sender. Handing
         // Bob a DIFFERENT certificate for that name must not authenticate it.
         let someone_else = device(0xC6).ratchet_pk();
@@ -971,8 +1140,9 @@ mod tests {
         impostor.node_id = a.node_id;
         impostor.instance_id = a.instance_id;
         let (ek, pk) = (b.ek(), b.ratchet_pk());
-        let forged =
-            seal(&impostor.store, &impostor.me(), keys(&b, &ek, &pk), b"reset").expect("seal");
+        let forged = seal(&impostor.store, &impostor.me(), keys(&b, &ek, &pk), b"reset")
+            .expect("seal")
+            .0;
         let a_pk = a.ratchet_pk();
         assert!(
             open(&b.store, &b.me(), &a.node_id, &forged, Some(&a_pk), NOW).is_err(),
@@ -988,11 +1158,11 @@ mod tests {
     fn a_payload_for_another_device_is_refused_before_any_key_work() {
         let (a, b) = (device(0xA8), device(0xB8));
         let (ek, pk) = (b.ek(), b.ratchet_pk());
-        let payload = seal(&a.store, &a.me(), keys(&b, &ek, &pk), b"x").expect("seal");
+        let payload = seal(&a.store, &a.me(), keys(&b, &ek, &pk), b"x").expect("seal").0;
         let other = device(0xD8);
         let me = RatchetIdentity {
-            local_node_id: &b.node_id,
-            local_instance_id: &other.instance_id,
+            local_node_id: b.node_id,
+            local_instance_id: other.instance_id,
             seed_ring: &b.ring,
         };
         assert_eq!(
@@ -1023,7 +1193,7 @@ mod tests {
         // downgrade this protocol exists to rule out.
         let (a, b) = (device(0xA9), device(0xB9));
         let (ek, pk) = (b.ek(), b.ratchet_pk());
-        let good = seal(&a.store, &a.me(), keys(&b, &ek, &pk), b"downgrade me").expect("seal");
+        let good = seal(&a.store, &a.me(), keys(&b, &ek, &pk), b"downgrade me").expect("seal").0;
         assert_eq!(good[2], KIND_PROLOGUE);
 
         let a_pk = a.ratchet_pk();
@@ -1063,7 +1233,7 @@ mod tests {
         let (a, b) = (device(0xB1), device(0xC1));
         a_to_b(&a, &b, b"establish").expect("open");
         let (ek, pk) = (b.ek(), b.ratchet_pk());
-        let good = seal(&a.store, &a.me(), keys(&b, &ek, &pk), b"downgrade me").expect("seal");
+        let good = seal(&a.store, &a.me(), keys(&b, &ek, &pk), b"downgrade me").expect("seal").0;
         let key = b.store.keys()[0];
         let before = b.store.export(&key).expect("held");
 
@@ -1096,10 +1266,10 @@ mod tests {
         let (ek, pk) = (b.ek(), b.ratchet_pk());
         // Establish so Alice stops repeating the prologue.
         let (aek, apk) = (a.ek(), a.ratchet_pk());
-        let reply = seal(&b.store, &b.me(), keys(&a, &aek, &apk), b"hi").expect("seal");
+        let reply = seal(&b.store, &b.me(), keys(&a, &aek, &apk), b"hi").expect("seal").0;
         let b_pk = b.ratchet_pk();
         open(&a.store, &a.me(), &b.node_id, &reply, Some(&b_pk), NOW).expect("open");
-        let bare = seal(&a.store, &a.me(), keys(&b, &ek, &pk), b"two").expect("seal");
+        let bare = seal(&a.store, &a.me(), keys(&b, &ek, &pk), b"two").expect("seal").0;
         assert_eq!(bare[2], KIND_FRAME);
 
         // A peer that lost its state cannot read it.
@@ -1115,7 +1285,7 @@ mod tests {
         let (a, b) = (device(0xAB), device(0xBB));
         a_to_b(&a, &b, b"one").expect("open");
         let (ek, pk) = (b.ek(), b.ratchet_pk());
-        let good = seal(&a.store, &a.me(), keys(&b, &ek, &pk), b"two").expect("seal");
+        let good = seal(&a.store, &a.me(), keys(&b, &ek, &pk), b"two").expect("seal").0;
 
         let before_version = b.store.version();
         let before_blob = b
@@ -1164,7 +1334,7 @@ mod tests {
         // load-bearing rather than decorative.
         let (a, b) = (device(0xAC), device(0xBC));
         let (ek, pk) = (b.ek(), b.ratchet_pk());
-        let payload = seal(&a.store, &a.me(), keys(&b, &ek, &pk), b"x").expect("seal");
+        let payload = seal(&a.store, &a.me(), keys(&b, &ek, &pk), b"x").expect("seal").0;
         let lied_about = [0x77u8; 32];
         assert!(open(&b.store, &b.me(), &lied_about, &payload, None, NOW).is_err());
     }
@@ -1187,14 +1357,14 @@ mod tests {
         }
 
         // The conversation continues from exactly where it was.
-        let third = seal(&a.store, &a.me(), keys(&b, &ek, &pk), b"three").expect("seal");
+        let third = seal(&a.store, &a.me(), keys(&b, &ek, &pk), b"three").expect("seal").0;
         let a_pk = a.ratchet_pk();
         let got = open(&b.store, &b.me(), &a.node_id, &third, Some(&a_pk), NOW).expect("open");
         assert_eq!(got.plaintext, b"three");
         assert!(got.authenticated, "the authenticated flag must survive too");
 
         let (aek, apk) = (a.ek(), a.ratchet_pk());
-        let back = seal(&b.store, &b.me(), keys(&a, &aek, &apk), b"four").expect("seal");
+        let back = seal(&b.store, &b.me(), keys(&a, &aek, &apk), b"four").expect("seal").0;
         let b_pk = b.ratchet_pk();
         assert_eq!(
             open(&a.store, &a.me(), &b.node_id, &back, Some(&b_pk), NOW)
@@ -1212,7 +1382,7 @@ mod tests {
         // gets a root and every later frame is undecryptable.
         let (a, b) = (device(0xAE), device(0xBE));
         let (ek, pk) = (b.ek(), b.ratchet_pk());
-        let lost = seal(&a.store, &a.me(), keys(&b, &ek, &pk), b"lost").expect("seal");
+        let lost = seal(&a.store, &a.me(), keys(&b, &ek, &pk), b"lost").expect("seal").0;
         drop(lost);
 
         let key = a.store.keys()[0];
@@ -1220,7 +1390,7 @@ mod tests {
         let restarted = RatchetStore::new();
         restarted.import(&key, &blob).expect("import");
 
-        let again = seal(&restarted, &a.me(), keys(&b, &ek, &pk), b"again").expect("seal");
+        let again = seal(&restarted, &a.me(), keys(&b, &ek, &pk), b"again").expect("seal").0;
         assert_eq!(again[2], KIND_PROLOGUE);
         let a_pk = a.ratchet_pk();
         assert_eq!(
@@ -1238,7 +1408,7 @@ mod tests {
         assert!(a.store.drain_dirty().is_empty());
 
         let (ek, pk) = (b.ek(), b.ratchet_pk());
-        let payload = seal(&a.store, &a.me(), keys(&b, &ek, &pk), b"x").expect("seal");
+        let payload = seal(&a.store, &a.me(), keys(&b, &ek, &pk), b"x").expect("seal").0;
         assert_eq!(a.store.version(), 1);
         let dirty = a.store.drain_dirty();
         assert_eq!(dirty.len(), 1);
@@ -1261,7 +1431,7 @@ mod tests {
         // same black hole the mailbox seed overlap exists to prevent.
         let (a, b) = (device(0xB0), device(0xC0));
         let (ek, pk) = (b.ek(), b.ratchet_pk());
-        let payload = seal(&a.store, &a.me(), keys(&b, &ek, &pk), b"pre-rotation").expect("seal");
+        let payload = seal(&a.store, &a.me(), keys(&b, &ek, &pk), b"pre-rotation").expect("seal").0;
 
         let (new_ek, _) = crate::keypair_from_dk_seed(&[0xEE; DK_SEED_BYTES]).expect("keypair");
         b.ring
@@ -1293,6 +1463,33 @@ mod tests {
             seal(&a.store, &a.me(), keys(&b, &ek, &zero), b"x").unwrap_err(),
             RatchetSpliceError::NoRatchetKey
         );
+    }
+
+    #[test]
+    fn the_delivery_ack_key_reaches_the_recipient_and_nobody_else() {
+        // Without this the DELIVERED acknowledgement for a ratcheted message
+        // would be unauthenticated, and a relay could forge one to stop a
+        // retransmit for a message it never delivered.
+        let (a, b) = (device(0xB6), device(0xC6));
+        let (ek, pk) = (b.ek(), b.ratchet_pk());
+        let (payload, sent_key) =
+            seal(&a.store, &a.me(), keys(&b, &ek, &pk), b"deliver me").expect("seal");
+        assert_ne!(sent_key, [0u8; ACK_KEY_LEN]);
+        assert!(
+            !payload
+                .windows(ACK_KEY_LEN)
+                .any(|w| w == sent_key.as_slice()),
+            "the ack key must be INSIDE the ciphertext, not beside it"
+        );
+
+        let a_pk = a.ratchet_pk();
+        let got = open(&b.store, &b.me(), &a.node_id, &payload, Some(&a_pk), NOW).expect("open");
+        assert_eq!(got.ack_key, sent_key);
+        assert_eq!(got.plaintext, b"deliver me", "and must not leak into it");
+
+        // Every message gets its own.
+        let (_, second_key) = seal(&a.store, &a.me(), keys(&b, &ek, &pk), b"again").expect("seal");
+        assert_ne!(second_key, sent_key);
     }
 
     #[test]
@@ -1346,7 +1543,7 @@ mod tests {
     fn malformed_payloads_are_refused() {
         let (a, b) = (device(0xB4), device(0xC4));
         let (ek, pk) = (b.ek(), b.ratchet_pk());
-        let good = seal(&a.store, &a.me(), keys(&b, &ek, &pk), b"z").expect("seal");
+        let good = seal(&a.store, &a.me(), keys(&b, &ek, &pk), b"z").expect("seal").0;
         let a_pk = a.ratchet_pk();
 
         let cases: Vec<(&str, Vec<u8>)> = vec![
@@ -1386,9 +1583,10 @@ mod tests {
         let (a, b) = (device(0xB5), device(0xC5));
         let (ek, pk) = (b.ek(), b.ratchet_pk());
         let plaintext = b"the entire message";
-        let first = seal(&a.store, &a.me(), keys(&b, &ek, &pk), plaintext).expect("seal");
-        // 44 header + 1184 encapsulation key + 16 tag, per the primitive.
-        const FRAME_OVERHEAD: usize = 44 + 1184 + 16;
+        let first = seal(&a.store, &a.me(), keys(&b, &ek, &pk), plaintext).expect("seal").0;
+        // 44 header + 1184 encapsulation key + 16 tag, per the primitive, and
+        // the 32-byte delivery-ACK key that rides inside the ciphertext.
+        const FRAME_OVERHEAD: usize = 44 + 1184 + 16 + ACK_KEY_LEN;
         assert_eq!(
             first.len(),
             HEADER_LEN + PQXDH_PROLOGUE_LEN + FRAME_OVERHEAD + plaintext.len()
@@ -1396,10 +1594,10 @@ mod tests {
         let a_pk = a.ratchet_pk();
         open(&b.store, &b.me(), &a.node_id, &first, Some(&a_pk), NOW).expect("open");
         let (aek, apk) = (a.ek(), a.ratchet_pk());
-        let reply = seal(&b.store, &b.me(), keys(&a, &aek, &apk), b"r").expect("seal");
+        let reply = seal(&b.store, &b.me(), keys(&a, &aek, &apk), b"r").expect("seal").0;
         let b_pk = b.ratchet_pk();
         open(&a.store, &a.me(), &b.node_id, &reply, Some(&b_pk), NOW).expect("open");
-        let second = seal(&a.store, &a.me(), keys(&b, &ek, &pk), plaintext).expect("seal");
+        let second = seal(&a.store, &a.me(), keys(&b, &ek, &pk), plaintext).expect("seal").0;
         // A bare frame answering an outstanding ciphertext: 1088 more.
         assert_eq!(
             second.len(),

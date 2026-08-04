@@ -2743,6 +2743,10 @@ impl NodeRuntime {
         ));
         let mlkem_ek_resolver: Arc<dyn veil_types::MlKemEkResolver> =
             Arc::clone(&dht_key_resolver) as Arc<dyn veil_types::MlKemEkResolver>;
+        // The dispatcher already holds this; the send path needs the same one.
+        let Some(ratchet_runtime) = self.dispatcher.crypto.ratchet.clone() else {
+            unreachable!("the dispatcher is always built with a ratchet runtime")
+        };
         let relay_key_resolver: Arc<dyn veil_types::RelayKeyResolver> =
             dht_key_resolver as Arc<dyn veil_types::RelayKeyResolver>;
         // Authenticated anonymous (onion/rendezvous) sender for the IPC
@@ -2768,6 +2772,10 @@ impl NodeRuntime {
             .with_e2e_keys(Arc::clone(&self.identity.peer_mlkem_keys))
             .with_mlkem_ek_resolver(mlkem_ek_resolver)
             .with_relay_key_resolver(relay_key_resolver)
+            // The SAME conversations the frame dispatcher opens with. Two
+            // stores would mean a session advanced on send and not on receive:
+            // the peer's reply would arrive for a chain that never moved.
+            .with_ratchet(ratchet_runtime)
             .with_anon_onion_sender(anon_onion_sender)
             // Offline-mailbox seal/open (node-side E2E crypto). DORMANT — no app
             // sends MailboxSeal/Open yet; wired so the path is live once an app

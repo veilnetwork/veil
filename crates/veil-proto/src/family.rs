@@ -459,6 +459,16 @@ pub enum AppMsg {
     AppReceipt = 4,
     AppWindowUpdate = 5,
     AppRtData = 6,
+    /// An `AppSend` whose `data` is a ratchet payload rather than the
+    /// application's bytes.
+    ///
+    /// A separate message type, not a marker byte inside `data`: `data` is
+    /// whatever the application put there, so any first byte it could carry is
+    /// a byte some application legitimately sends. Getting that wrong would
+    /// mean handing an ordinary payload to the ratchet opener, or worse,
+    /// handing a ratchet payload to an application. The frame type cannot
+    /// collide with anything.
+    AppSendSealed = 7,
 }
 
 impl TryFrom<u16> for AppMsg {
@@ -472,6 +482,7 @@ impl TryFrom<u16> for AppMsg {
             4 => Ok(AppMsg::AppReceipt),
             5 => Ok(AppMsg::AppWindowUpdate),
             6 => Ok(AppMsg::AppRtData),
+            7 => Ok(AppMsg::AppSendSealed),
             _ => Err(ProtoError::UnknownMsgType {
                 family: FrameFamily::App as u8,
                 msg_type: v,

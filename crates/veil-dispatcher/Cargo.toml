@@ -64,6 +64,9 @@ x25519-dalek = { version = "2", features = ["static_secrets"] }
 # veil-identity / veil-dht / veil-node-runtime already use.
 veil-crypto = { path = "../veil-crypto", features = ["test-low-difficulty"] }
 veil-proto = { path = "../veil-proto", features = ["test-low-difficulty"] }
+# Only the terminal-path ratchet tests need it, and only for the frame layout
+# constant a post-quantum-downgrade probe has to cut at.
+veil-ratchet = { path = "../veil-ratchet" }
 
 [lints]
 workspace = true
