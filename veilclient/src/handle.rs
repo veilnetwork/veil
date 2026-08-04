@@ -3,7 +3,9 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use veilcore::proto::{AppIpcRtSendPayload, AppUnbindPayload, LocalAppMsg, StreamOpenPayload};
+use veilcore::proto::{
+    AppIpcRtSendPayload, AppUnbindPayload, LocalAppMsg, SenderProvenance, StreamOpenPayload,
+};
 
 use crate::client::{DispatchTable, SharedWriter, StreamEvent};
 use crate::error::ClientError;
@@ -13,7 +15,16 @@ use tokio::sync::{Mutex, mpsc};
 /// A single incoming datagram delivered to this endpoint.
 pub struct IncomingMessage {
     /// Node ID of the sender (32 bytes).
+    ///
+    /// A NAME, not yet an identity — read [`Self::provenance`] before treating
+    /// it as one.
     pub src_node_id: [u8; 32],
+    /// What the node knows about [`Self::src_node_id`] (X/V-01): the trust
+    /// level the delivering path decided, carried on the IPC wire as the
+    /// trailing byte of `AppDeliverPayload`. [`SenderProvenance::Claimed`]
+    /// means nothing corroborates the name — the normal, correct level for the
+    /// anonymous path, and never a basis for authorization.
+    pub provenance: SenderProvenance,
     /// App ID of the sender on the originating node (32 bytes).
     pub src_app_id: [u8; 32],
     /// Raw payload bytes.
@@ -34,6 +45,12 @@ pub struct IncomingStream {
     pub stream: crate::stream::VeilStream,
     /// 32-byte node_id of the peer that initiated the stream.
     pub src_node_id: [u8; 32],
+    /// What the node knows about [`Self::src_node_id`] (X/V-01) — same
+    /// contract as [`IncomingMessage::provenance`]. Both of today's open paths
+    /// authenticate the initiator, so this is normally
+    /// [`SenderProvenance::SessionPeer`] or [`SenderProvenance::LocalIpc`];
+    /// an allow-list check belongs on this field, not on `src_node_id` alone.
+    pub provenance: SenderProvenance,
 }
 
 /// RAII handle for a bound veil application endpoint.

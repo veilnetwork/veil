@@ -108,6 +108,15 @@ android_logger = "0.13"
 
 [dev-dependencies]
 veil-proto = { path = "../veil-proto" }
+# The REAL daemon-side IPC server, for the end-to-end provenance test
+# (`xv01_ffi_edge`): it drives an actual `IpcServer` + `AppEndpointRegistry` on a
+# real socket so the assertion at the FFI edge is made against the whole
+# production chain — registry → IPC wire → veilclient → recv dispatch loop —
+# rather than a re-implementation of any leg of it. Test-only; no cycle
+# (`veil-ipc` knows nothing of this crate).
+veil-ipc = { path = "../veil-ipc" }
+# Same test: `route_ipc_deliver` takes the daemon's pooled buffer type.
+veil-bufpool = { path = "../veil-bufpool" }
 # Unit tests use temporary directories even when the optional embedded-node
 # feature is disabled. Keep the production dependency feature-gated above,
 # while making it unconditionally available to test targets.

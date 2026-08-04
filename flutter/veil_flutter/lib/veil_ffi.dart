@@ -57,6 +57,7 @@ export 'src/types.dart'
         MailboxPutStatus,
         MobileBackgroundMode,
         NetworkKind,
+        SenderProvenance,
         VeilEvent,
         VeilEventKind,
         VeilException,

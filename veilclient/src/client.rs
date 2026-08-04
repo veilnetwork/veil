@@ -2664,6 +2664,13 @@ async fn reader_task(
                         // when the application thread can't drain in time.
                         let _ = tx.try_send(crate::handle::IncomingMessage {
                             src_node_id: p.src_node_id,
+                            // X/V-01: the trust level the daemon decided for
+                            // `src_node_id` rides the last wire byte. Dropping
+                            // it here is what left the SDK — and every app
+                            // above it — unable to tell a contact's message
+                            // from a stranger's frame that named the contact.
+                            // Unknown byte values already decoded to `Claimed`.
+                            provenance: p.provenance,
                             src_app_id: p.src_app_id,
                             // d: wire payload is `PooledShared` (refcounted
                             // pool buffer); SDK boundary copies into owned `Vec<u8>`
@@ -2726,6 +2733,8 @@ async fn reader_task(
                         let incoming = crate::handle::IncomingStream {
                             stream: veil_stream,
                             src_node_id: p.src_node_id,
+                            // Same contract as the datagram path above.
+                            provenance: p.provenance,
                         };
                         // `try_send` (not `send().await`) so a slow
                         // `accept_stream` consumer cannot block the

@@ -137,5 +137,53 @@ void main() {
       expect(NetworkKind.ethernet.wireByte, 3);
       expect(NetworkKind.unknown.wireByte, 255);
     });
+
+    test('SenderProvenance wire bytes match veil_proto', () {
+      expect(SenderProvenance.claimed.wireByte, 0);
+      expect(SenderProvenance.localIpc.wireByte, 1);
+      expect(SenderProvenance.sessionPeer.wireByte, 2);
+      expect(SenderProvenance.signed.wireByte, 3);
+    });
+  });
+
+  // Audit X/V-01. veil now tells the app what stands behind a delivery's
+  // `srcNodeId`; these pin the two properties an app's trust decisions rest on.
+  group('SenderProvenance', () {
+    test('fromWire maps known bytes', () {
+      expect(SenderProvenance.fromWire(0), SenderProvenance.claimed);
+      expect(SenderProvenance.fromWire(1), SenderProvenance.localIpc);
+      expect(SenderProvenance.fromWire(2), SenderProvenance.sessionPeer);
+      expect(SenderProvenance.fromWire(3), SenderProvenance.signed);
+    });
+
+    test('an unrecognised byte fails CLOSED to claimed, never up', () {
+      // Deliberately not an `unknown` member: "I could not read the evidence"
+      // and "there was no evidence" must lead to the same decision, or a
+      // future level would arrive at an old build as something it can trust.
+      for (final b in [4, 5, 42, 127, 128, 254, 255]) {
+        expect(SenderProvenance.fromWire(b), SenderProvenance.claimed,
+            reason: 'byte $b must read as claimed');
+        expect(SenderProvenance.fromWire(b).isAuthenticated, isFalse);
+      }
+    });
+
+    test('isAuthenticated is false for claimed alone', () {
+      expect(SenderProvenance.claimed.isAuthenticated, isFalse);
+      expect(SenderProvenance.localIpc.isAuthenticated, isTrue);
+      expect(SenderProvenance.sessionPeer.isAuthenticated, isTrue);
+      expect(SenderProvenance.signed.isAuthenticated, isTrue);
+    });
+
+    test('IncomingMessage defaults to claimed when nothing says otherwise', () {
+      // A construction site that says nothing has verified nothing. The
+      // default must be the one value that cannot be mistaken for proof.
+      final msg = IncomingMessage(
+        srcNodeId: Uint8List(32),
+        srcAppId: Uint8List(32),
+        data: Uint8List(0),
+      );
+      expect(msg.provenance, SenderProvenance.claimed);
+      expect(msg.provenance.isAuthenticated, isFalse);
+    });
   });
 }

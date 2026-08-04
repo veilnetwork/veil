@@ -502,6 +502,13 @@ typedef struct {
  * that a deferred host (Dart `NativeCallable.listener`) could not honour
  * without a use-after-free.
  *
+ * `provenance` (X/V-01) is what the node KNOWS about `src_node_id`, as one of
+ * the `VEIL_PROVENANCE_*` values below. It sits next to `src_node_id` because
+ * it is a property OF those 32 bytes, not a separate fact: without it a
+ * contact's message and a stranger's frame that merely NAMED that contact
+ * arrive identically. Anything the host does not recognise MUST be read as
+ * `VEIL_PROVENANCE_CLAIMED` — fail closed, never up.
+ *
  * `reply_id` is a by-value scalar (NOT part of the owned buffer — it has no
  * lifetime to manage): non-zero when this message arrived over the
  * authenticated anonymous transport WITH a one-time reply block. Pass it to
@@ -518,9 +525,24 @@ typedef struct {
 typedef void (*VeilRecvCb)(void *user,
                            const uint8_t *src_node_id,
                            const uint8_t *src_app_id,
+                           uint8_t provenance,
                            uint64_t reply_id,
                            const uint8_t *data,
                            size_t len);
+
+/**
+ * Sender provenance (X/V-01) — what the node knows about a delivery's
+ * `src_node_id`. Values match veil's `SenderProvenance` discriminants.
+ *
+ * `CLAIMED` means nothing corroborates the name: never a basis for an
+ * authorization decision, and not a synonym for "hostile" — it is the normal,
+ * correct level for the anonymous path. It is also the value a host MUST
+ * substitute for any byte it does not recognise.
+ */
+#define VEIL_PROVENANCE_CLAIMED 0
+#define VEIL_PROVENANCE_LOCAL_IPC 1
+#define VEIL_PROVENANCE_SESSION_PEER 2
+#define VEIL_PROVENANCE_SIGNED 3
 
 /**
  * Mailbox blob descriptor returned by [`veil_mailbox_fetch_into`].
@@ -1176,16 +1198,24 @@ VeilStreamFfi *veil_stream_open(VeilApp *app,
  * Block up to `timeout_ms` for a remote peer to open an inbound byte-stream to
  * a bound endpoint. On success returns an owned stream handle (drive it with
  * `veil_stream_read`/`veil_stream_write`/`veil_stream_close`) and writes the
- * initiator's 32-byte node_id into `out_src_node_id` (caller-allocated, 32 B).
+ * initiator's 32-byte node_id into `out_src_node_id` (caller-allocated, 32 B)
+ * plus what the node KNOWS about it into `out_provenance` (caller-allocated,
+ * 1 B — one of the `VEIL_PROVENANCE_*` values).
  * Returns NULL on TIMEOUT with NO error written, so the caller can poll in a
  * loop; returns NULL WITH an error on a fatal condition (app closed / the
  * inbound-stream channel went away). This is the receive-side counterpart to
  * `veil_stream_open` — without it an inbound stream is stranded in the SDK.
+ *
+ * X/V-01: both of today's open paths authenticate the initiator, so this
+ * normally reports `VEIL_PROVENANCE_SESSION_PEER` or
+ * `VEIL_PROVENANCE_LOCAL_IPC`. It is reported rather than assumed — a caller
+ * that gates on the initiator must read it, not `out_src_node_id` alone.
  */
 
 VeilStreamFfi *veil_stream_accept(VeilApp *app,
                                   uint64_t timeout_ms,
                                   uint8_t *out_src_node_id,
+                                  uint8_t *out_provenance,
                                   char **err_out)
 ;
 
