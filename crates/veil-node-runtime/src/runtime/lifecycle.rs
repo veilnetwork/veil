@@ -927,6 +927,10 @@ impl NodeRuntime {
                 peer_roles: Arc::clone(&self.identity.peer_roles),
                 peer_cap_flags: Arc::clone(&self.dispatcher.crypto.peer_cap_flags),
                 per_session_mlkem_dk: Arc::clone(&self.identity.per_session_mlkem_dk),
+                // The same conversations: a config reload rebuilds the
+                // dispatcher, and dropping the store here would lose every
+                // live session's keys without a single error anywhere.
+                ratchet: self.dispatcher.crypto.ratchet.clone(),
             }),
             abuse: Arc::new(veil_dispatcher::AbuseContext {
                 rate_limiter: Arc::clone(&self.rate_limiter),

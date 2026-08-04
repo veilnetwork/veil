@@ -70,6 +70,34 @@ pub(crate) fn terminal_sender_provenance(
     }
 }
 
+/// One decrypted terminal payload, plus the two things the caller has to know
+/// about it that the bytes alone do not say.
+pub(crate) struct DecryptedForward {
+    /// The application payload.
+    pub(crate) payload: Vec<u8>,
+    /// Per-message DELIVERED-ACK MAC key; all-zero when the path has none.
+    pub(crate) ack_key: [u8; 32],
+    /// Whether the payload proved who sent it.
+    ///
+    /// True for exactly one branch — the ratchet. Everything else establishes
+    /// confidentiality and stops there: an ML-KEM envelope seals to our
+    /// published key, so anyone who read that key can produce one naming
+    /// anyone.
+    pub(crate) sender_proven: bool,
+}
+
+impl DecryptedForward {
+    /// A payload whose sender is a claim as far as the ciphertext is concerned.
+    /// The caller may still know something about it from the transport.
+    fn unproven(payload: Vec<u8>, ack_key: [u8; 32]) -> Self {
+        Self {
+            payload,
+            ack_key,
+            sender_proven: false,
+        }
+    }
+}
+
 /// Encode the Forward trailer shared by direct-sovereign, route-cache and
 /// gateway forwarding. Keeping the optional delivery-attempt and traffic-
 /// class extensions here prevents a fallback path from silently downgrading
@@ -1464,7 +1492,7 @@ impl FrameDispatcher {
         let mut deliver_app_id = envelope.app_id;
         let mut deliver_endpoint_id = envelope.endpoint_id;
 
-        let Some((app_payload, ack_key)) = self.decrypt_forward_payload(
+        let Some(decrypted) = self.decrypt_forward_payload(
             first_byte,
             &dk_seeds,
             &envelope,
@@ -1475,12 +1503,28 @@ impl FrameDispatcher {
         ) else {
             return; // decrypt failed — metric already incremented.
         };
+        let (app_payload, ack_key) = (decrypted.payload, decrypted.ack_key);
 
         // What do we actually know about the sender we are about to name to the
-        // app? Exactly one thing can make it more than a claim: it is the
-        // authenticated peer of the session this frame arrived on.
+        // app? Two independent things can make it more than a claim, and they
+        // answer different questions:
+        //
+        // * the frame arrived on an authenticated session whose peer id equals
+        //   the claim — the peer is speaking for itself. This is what the
+        //   delivery plane has always had, and it says nothing once a relay is
+        //   in the middle.
+        // * the payload opened under a ratchet session — the sender is proven
+        //   by the ciphertext itself, and however many relays it crossed does
+        //   not matter. This is the case `SenderProvenance::Signed` was
+        //   reserved for and never used.
         let is_meta_e2e = first_byte == Some(veil_proto::META_E2E_MARKER);
-        let provenance = terminal_sender_provenance(&deliver_sender_node_id, peer_id, is_meta_e2e);
+        let transport_provenance =
+            terminal_sender_provenance(&deliver_sender_node_id, peer_id, is_meta_e2e);
+        let provenance = if decrypted.sender_proven {
+            SenderProvenance::Signed
+        } else {
+            transport_provenance
+        };
 
         // Cache reverse route: sender → peer_id (direct hop). ONLY once the
         // sender is authenticated.
@@ -1500,7 +1544,14 @@ impl FrameDispatcher {
         // frame proves who sent it, and a route learned from an unprovable
         // claim is a route an attacker chooses. Reverse routing for such
         // senders falls back to DHT / mailbox discovery.
-        if provenance.is_authenticated()
+        //
+        // Deliberately the TRANSPORT verdict, not the one the app is told. A
+        // ratchet frame proves who WROTE it; it proves nothing about the relay
+        // that handed it over, and that relay is what would go in the cache.
+        // Any peer on the path can forward a genuine frame, so trusting the
+        // ratchet here would hand route selection back to whoever relayed —
+        // the same hole, re-opened through the new door.
+        if transport_provenance.is_authenticated()
             && deliver_sender_node_id != self.local_node_id
             && deliver_sender_node_id != [0u8; 32]
         {
@@ -1594,6 +1645,10 @@ impl FrameDispatcher {
     #[allow(clippy::too_many_arguments)]
     /// Decrypt under the first of `dk_seeds` that works.
     ///
+    /// The ratchet branch takes none of them: a ratchet frame is opened by a
+    /// session key, and the seeds only come into it inside
+    /// [`veil_e2e::ratchet::open`], which reaches the same ring itself.
+    ///
     /// ML-KEM decapsulation does not report a wrong key — implicit rejection
     /// hands back a different shared secret — so a candidate that is not the one
     /// the sender used surfaces as an AEAD failure and we move on. A message
@@ -1611,7 +1666,42 @@ impl FrameDispatcher {
         deliver_src_app_id: &mut [u8; 32],
         deliver_app_id: &mut [u8; 32],
         deliver_endpoint_id: &mut u32,
-    ) -> Option<(Vec<u8>, [u8; 32])> {
+    ) -> Option<DecryptedForward> {
+        // RATCHET_E2E_MARKER (0xE5): the hybrid ratchet — the only inbound
+        // payload that carries its own proof of who wrote it. Tested first
+        // because it is the only branch whose success means something the
+        // others cannot: the two below establish confidentiality and stop.
+        if first_byte == Some(veil_proto::RATCHET_E2E_MARKER) {
+            let Some(ratchet) = &self.crypto.ratchet else {
+                // No device identity, so no peer can have keyed a conversation
+                // to us and this cannot be for us.
+                if let Some(m) = &self.metrics {
+                    m.inc_decrypt_failures();
+                }
+                return None;
+            };
+            let now_unix = veil_util::unix_secs_now_u64();
+            match ratchet.open_payload(&envelope.sender_node_id, &envelope.payload, now_unix) {
+                Ok(opened) => {
+                    return Some(DecryptedForward {
+                        payload: opened.plaintext,
+                        ack_key: opened.ack_key,
+                        sender_proven: opened.authenticated,
+                    });
+                }
+                Err(e) => {
+                    // Not a peer protocol violation: a conversation whose state
+                    // the host has not restored yet, or a device of ours the
+                    // frame was not addressed to, look exactly like this.
+                    self.logger
+                        .debug("delivery.ratchet.open_failed", format!("{e}"));
+                    if let Some(m) = &self.metrics {
+                        m.inc_decrypt_failures();
+                    }
+                    return None;
+                }
+            }
+        }
         // META_E2E_MARKER (0xE3): onion — sender identity is inside ciphertext.
         if first_byte == Some(veil_proto::META_E2E_MARKER) {
             for dk_seed in dk_seeds {
@@ -1628,7 +1718,7 @@ impl FrameDispatcher {
                 // for an anonymous message clears the pending entry but
                 // earns no reputation (C-09 scoping; full meta-E2E ACK auth
                 // is a follow-up).
-                return Some((plain, [0u8; 32]));
+                return Some(DecryptedForward::unproven(plain, [0u8; 32]));
             }
             if let Some(m) = &self.metrics {
                 m.inc_decrypt_failures();
@@ -1656,7 +1746,7 @@ impl FrameDispatcher {
                     &self.local_node_id,
                     &e2e_env,
                 ) {
-                    return Some((plain, ack_key));
+                    return Some(DecryptedForward::unproven(plain, ack_key));
                 }
             }
             // Drop — decrypt failure is not a peer protocol violation
@@ -1670,7 +1760,7 @@ impl FrameDispatcher {
         }
         // No E2E marker — plaintext envelope (legitimate inter-app traffic).
         // No ACK key (non-E2E): DELIVERED clears the entry but earns no reputation.
-        Some((envelope.payload.clone(), [0u8; 32]))
+        Some(DecryptedForward::unproven(envelope.payload.clone(), [0u8; 32]))
     }
 
     /// originating IPC app of the delivery-stage transition.
@@ -3721,5 +3811,447 @@ mod tests {
                 current_body = body_slice.to_vec();
             }
         }
+    }
+}
+
+// ── The ratchet on the terminal path ─────────────────────────────────────────
+//
+// What these pin is the one thing the ratchet buys that the ML-KEM envelope
+// never could: a message that says who wrote it, and keeps saying so however
+// many relays it crossed. Everything else here — confidentiality, the ACK key,
+// the seed ring — the old path already had in some form.
+
+#[cfg(test)]
+mod ratchet_terminal_tests {
+    use super::*;
+    use std::sync::{Arc, RwLock};
+    use veil_app::registry::{AppMessage, SenderProvenance};
+
+    const BOB: [u8; 32] = [0xB0u8; 32];
+    const ALICE: [u8; 32] = [0xA0u8; 32];
+    const RELAY: [u8; 32] = [0xEEu8; 32];
+    const APP: [u8; 32] = [0xCCu8; 32];
+    const ENDPOINT: u32 = 0xC0DE;
+
+    /// One end of a conversation: a device identity, its published keys, and
+    /// the conversation store the host would persist.
+    struct Party {
+        node_id: [u8; 32],
+        instance_id: [u8; 16],
+        ring: Arc<veil_e2e::MlKemSeedRing>,
+        runtime: veil_e2e::RatchetRuntime,
+    }
+
+    fn party(node_id: [u8; 32], tag: u8) -> Party {
+        let seed = [tag; veil_e2e::DK_SEED_BYTES];
+        let (ek, _) = veil_e2e::keypair_from_dk_seed(&seed).expect("keypair");
+        let ring = Arc::new(veil_e2e::MlKemSeedRing::new(0, seed, ek));
+        let instance_id = [tag; 16];
+        Party {
+            node_id,
+            instance_id,
+            ring: Arc::clone(&ring),
+            runtime: veil_e2e::RatchetRuntime {
+                store: Arc::new(veil_e2e::RatchetStore::new()),
+                seed_ring: ring,
+                local_node_id: node_id,
+                local_instance_id: Arc::new(RwLock::new(Some(instance_id))),
+                peer_ratchet_keys: Arc::new(RwLock::new(veil_e2e::PeerRatchetKeyCache::new())),
+            },
+        }
+    }
+
+    /// Teach `who` the device key `peer` published — what the certificate
+    /// resolver's write-through does in production.
+    fn learn(who: &Party, peer: &Party) {
+        wlock!(who.runtime.peer_ratchet_keys).insert(peer.node_id, peer.ring.current_ratchet_pk());
+    }
+
+    fn seal(from: &Party, to: &Party, plaintext: &[u8]) -> Vec<u8> {
+        let (ek, pk) = (to.ring.current_ek(), to.ring.current_ratchet_pk());
+        from.runtime
+            .seal_for(
+                veil_e2e::PeerRatchetKeys {
+                    node_id: &to.node_id,
+                    instance_id: &to.instance_id,
+                    mlkem_ek: &ek,
+                    ratchet_pk: &pk,
+                },
+                plaintext,
+            )
+            .expect("seal")
+            .0
+    }
+
+    /// A dispatcher that IS `bob`, with the destination endpoint bound.
+    fn dispatcher_for(
+        bob: &Party,
+    ) -> (
+        crate::FrameDispatcher,
+        veil_app::registry::EndpointHandle,
+        tokio::sync::mpsc::Receiver<AppMessage>,
+    ) {
+        let mut disp = crate::make_test_dispatcher(veil_cfg::NodeRole::Core);
+        disp.local_node_id = bob.node_id;
+        disp.crypto = Arc::new(crate::CryptoContext {
+            mlkem_keys: Arc::clone(&bob.ring),
+            ratchet: Some(bob.runtime.clone()),
+            ..(*disp.crypto).clone()
+        });
+        let (handle, rx) = disp.app_registry.register(APP, ENDPOINT, 16);
+        (disp, handle, rx)
+    }
+
+    /// A terminal `DELIVERY_FORWARD` for Bob, claiming Alice, carrying `payload`.
+    fn forward_frame(
+        content_id: [u8; 32],
+        payload: Vec<u8>,
+    ) -> (veil_proto::header::FrameHeader, Vec<u8>) {
+        use veil_proto::delivery::{DeliveryEnvelope, ForwardPayload};
+        use veil_proto::family::{DeliveryMsg, FrameFamily};
+        use veil_proto::header::FrameHeader;
+
+        let envelope = DeliveryEnvelope {
+            recipient: veil_proto::recipient::Recipient::any(BOB),
+            sender_node_id: ALICE,
+            src_app_id: [0xA1u8; 32],
+            app_id: APP,
+            endpoint_id: ENDPOINT,
+            content_id,
+            created_at: veil_util::unix_secs_now_u64(),
+            ttl_secs: 3600,
+            payload,
+            trace_id: 0,
+            require_ack: false,
+        };
+        let body = ForwardPayload {
+            next_hop_node_id: BOB,
+            envelope,
+            relay_hops: 1,
+            delivery_attempt: None,
+            traffic_class: None,
+        }
+        .encode();
+        let mut hdr = FrameHeader::new(FrameFamily::Delivery as u8, DeliveryMsg::Forward as u16);
+        hdr.body_len = body.len() as u32;
+        (hdr, body)
+    }
+
+    fn take(
+        rx: &mut tokio::sync::mpsc::Receiver<AppMessage>,
+    ) -> Option<([u8; 32], SenderProvenance, Vec<u8>)> {
+        match rx.try_recv() {
+            Ok(AppMessage::Deliver {
+                src_node_id,
+                provenance,
+                data,
+                ..
+            }) => Some((src_node_id, provenance, data.as_ref().to_vec())),
+            Ok(other) => panic!("expected a Deliver, got {other:?}"),
+            Err(_) => None,
+        }
+    }
+
+    /// The whole point, on the relay path: a message that crossed a relay
+    /// reaches the app as CRYPTOGRAPHICALLY AUTHENTICATED. Before this, the
+    /// same message could only ever be `Claimed` — an ML-KEM envelope seals to
+    /// a published key, so any node that read that key could have written it.
+    #[test]
+    fn a_relayed_ratchet_message_reaches_the_app_as_signed() {
+        let (alice, bob) = (party(ALICE, 0xA1), party(BOB, 0xB1));
+        learn(&bob, &alice);
+        let payload = seal(&alice, &bob, b"authenticated over a relay");
+
+        let (disp, _h, mut rx) = dispatcher_for(&bob);
+        let (hdr, body) = forward_frame([0x01u8; 32], payload);
+        // Handed over by RELAY, which is not Alice — the case where the
+        // transport knows nothing about who wrote this.
+        disp.dispatch(&hdr, &body, NodeId::from(RELAY));
+
+        let (src, provenance, data) = take(&mut rx).expect("delivered");
+        assert_eq!(src, ALICE);
+        assert_eq!(data, b"authenticated over a relay");
+        assert_eq!(
+            provenance,
+            SenderProvenance::Signed,
+            "the ciphertext itself proves the sender, so the relay in the \
+             middle is irrelevant to the verdict"
+        );
+        assert!(provenance.is_authenticated());
+    }
+
+    /// …and it still teaches no route. The ratchet proves who WROTE the
+    /// message; it proves nothing about the relay that handed it over, and the
+    /// relay is what would go in the cache. Any peer on the path can forward a
+    /// genuine frame, so trusting the ratchet here would re-open X/V-01 through
+    /// the new door.
+    #[test]
+    fn a_relayed_ratchet_message_teaches_no_route_to_its_sender() {
+        let (alice, bob) = (party(ALICE, 0xA2), party(BOB, 0xB2));
+        learn(&bob, &alice);
+        let payload = seal(&alice, &bob, b"x");
+
+        let (disp, _h, mut rx) = dispatcher_for(&bob);
+        let (hdr, body) = forward_frame([0x02u8; 32], payload);
+        disp.dispatch(&hdr, &body, NodeId::from(RELAY));
+
+        assert_eq!(take(&mut rx).expect("delivered").1, SenderProvenance::Signed);
+        assert_eq!(
+            rlock!(disp.route_cache).lookup(&ALICE),
+            None,
+            "a proven AUTHOR is not a proven ROUTE"
+        );
+    }
+
+    /// The flag is load-bearing, not decorative: with the sender's certificate
+    /// not yet resolved the message still arrives — it is genuine ciphertext
+    /// addressed to this device — but the name on it is unconfirmed and must
+    /// be reported as a claim.
+    #[test]
+    fn an_unresolved_sender_certificate_downgrades_the_verdict_not_the_delivery() {
+        let (alice, bob) = (party(ALICE, 0xA3), party(BOB, 0xB3));
+        // Deliberately no `learn(&bob, &alice)`.
+        let payload = seal(&alice, &bob, b"who am i");
+
+        let (disp, _h, mut rx) = dispatcher_for(&bob);
+        let (hdr, body) = forward_frame([0x03u8; 32], payload);
+        disp.dispatch(&hdr, &body, NodeId::from(RELAY));
+
+        let (_src, provenance, data) = take(&mut rx).expect("delivered anyway");
+        assert_eq!(data, b"who am i");
+        assert_eq!(provenance, SenderProvenance::Claimed);
+    }
+
+    /// A frame that dropped its post-quantum leg is not delivered at all.
+    /// Refused, never accepted with a classical-only derivation — which is the
+    /// entire reason the leg is mandatory rather than negotiated.
+    #[test]
+    fn a_post_quantum_downgrade_is_not_delivered() {
+        let (alice, bob) = (party(ALICE, 0xA4), party(BOB, 0xB4));
+        learn(&bob, &alice);
+        let good = seal(&alice, &bob, b"downgrade me");
+
+        // Cut the ML-KEM encapsulation key out of the frame behind the
+        // prologue and clear its presence flags.
+        const PAYLOAD_HEADER: usize = 1 + 1 + 1 + 16 + 16;
+        const FRAME_FIXED: usize = 2 + 1 + 1 + 32 + 4 + 4;
+        const EK_LEN: usize = 1184;
+        let frame_at = PAYLOAD_HEADER + veil_ratchet::PQXDH_PROLOGUE_LEN;
+        let mut stripped = good[..frame_at + FRAME_FIXED].to_vec();
+        stripped[frame_at + 3] = 0;
+        stripped.extend_from_slice(&good[frame_at + FRAME_FIXED + EK_LEN..]);
+        assert_ne!(stripped, good, "the probe must actually change the frame");
+
+        let (disp, _h, mut rx) = dispatcher_for(&bob);
+        let (hdr, body) = forward_frame([0x04u8; 32], stripped);
+        disp.dispatch(&hdr, &body, NodeId::from(RELAY));
+        assert!(
+            take(&mut rx).is_none(),
+            "a frame with no post-quantum leg must not reach the app"
+        );
+
+        // The unmangled one does, so the refusal was about the missing leg.
+        let (hdr, body) = forward_frame([0x05u8; 32], good);
+        disp.dispatch(&hdr, &body, NodeId::from(RELAY));
+        assert_eq!(
+            take(&mut rx).expect("delivered").2,
+            b"downgrade me",
+            "the genuine frame still opens"
+        );
+    }
+
+    /// The host's half of the contract: state goes out, the process restarts,
+    /// state comes back, and the conversation carries on from where it was.
+    /// Everything about this design rests on that round trip working — veil
+    /// keeps nothing.
+    #[test]
+    fn a_conversation_survives_the_host_persisting_and_restoring_it() {
+        let (alice, bob) = (party(ALICE, 0xA5), party(BOB, 0xB5));
+        learn(&bob, &alice);
+
+        let (disp, _h, mut rx) = dispatcher_for(&bob);
+        let (hdr, body) = forward_frame([0x06u8; 32], seal(&alice, &bob, b"first"));
+        disp.dispatch(&hdr, &body, NodeId::from(RELAY));
+        assert_eq!(take(&mut rx).expect("delivered").2, b"first");
+
+        // Bob answers, so Alice stops re-attaching the prologue and her next
+        // message is a bare frame. Until that happens a wiped store simply
+        // re-keys off the repeated prologue, which is the recovery the repeat
+        // exists for and would hide the thing this test is about.
+        let reply = seal(&bob, &alice, b"got it");
+        alice
+            .runtime
+            .open_payload(&BOB, &reply, veil_util::unix_secs_now_u64())
+            .expect("Alice opens Bob's reply");
+        let bare = seal(&alice, &bob, b"second");
+        assert_eq!(bare[2], 1, "a bare frame, no prologue to fall back on");
+
+        // What the host would write out, and what it names.
+        let dirty = bob.runtime.store.drain_dirty();
+        assert_eq!(dirty.len(), 1, "exactly one conversation to persist");
+        let key = dirty[0];
+        let blob = bob.runtime.store.export(&key).expect("held");
+        assert_eq!(key.peer_node_id, ALICE);
+        assert_eq!(key.peer_instance_id, alice.instance_id);
+        assert_eq!(key.local_instance_id, bob.instance_id);
+
+        // The process goes away and comes back with an empty store.
+        assert!(bob.runtime.store.forget(&key));
+        assert!(bob.runtime.store.is_empty());
+        let (hdr, body) = forward_frame([0x07u8; 32], bare.clone());
+        disp.dispatch(&hdr, &body, NodeId::from(RELAY));
+        assert!(
+            take(&mut rx).is_none(),
+            "without its state the conversation cannot open — which is exactly \
+             why the host must persist after every operation"
+        );
+
+        // Restored, the very same frame opens: the failed attempt consumed
+        // nothing, because there was nothing to consume.
+        bob.runtime.store.import(&key, &blob).expect("restore");
+        let (hdr, body) = forward_frame([0x08u8; 32], bare);
+        disp.dispatch(&hdr, &body, NodeId::from(RELAY));
+        let (_src, provenance, data) = take(&mut rx).expect("delivered after restore");
+        assert_eq!(data, b"second");
+        assert_eq!(
+            provenance,
+            SenderProvenance::Signed,
+            "and it is still the same authenticated conversation"
+        );
+
+        // And it carries on from there rather than from the beginning.
+        let (hdr, body) = forward_frame([0x09u8; 32], seal(&alice, &bob, b"third"));
+        disp.dispatch(&hdr, &body, NodeId::from(RELAY));
+        assert_eq!(take(&mut rx).expect("delivered").2, b"third");
+    }
+
+    /// The anonymous path is STANDARD traffic, not an attack, and gating it
+    /// behind the ratchet would have broken it. A meta-E2E envelope must still
+    /// open, and must still arrive anonymous — a named ratchet conversation is
+    /// the one thing that path cannot become.
+    #[test]
+    fn the_anonymous_path_still_works_and_is_still_anonymous() {
+        let bob = party(BOB, 0xB6);
+        let ek = bob.ring.current_ek();
+        let wire = veil_e2e::meta_encrypt(
+            &ek,
+            &ALICE,
+            &[0xA1u8; 32],
+            &APP,
+            ENDPOINT,
+            &BOB,
+            b"anonymously yours",
+        )
+        .expect("meta_encrypt");
+
+        let (disp, _h, mut rx) = dispatcher_for(&bob);
+        // Anonymity is the outer envelope's zeroed sender; the real one is
+        // inside the ciphertext.
+        use veil_proto::delivery::{DeliveryEnvelope, ForwardPayload};
+        use veil_proto::family::{DeliveryMsg, FrameFamily};
+        let envelope = DeliveryEnvelope {
+            recipient: veil_proto::recipient::Recipient::any(BOB),
+            sender_node_id: [0u8; 32],
+            src_app_id: [0u8; 32],
+            app_id: [0u8; 32],
+            endpoint_id: 0,
+            content_id: [0x09u8; 32],
+            created_at: veil_util::unix_secs_now_u64(),
+            ttl_secs: 3600,
+            payload: wire,
+            trace_id: 0,
+            require_ack: false,
+        };
+        let body = ForwardPayload {
+            next_hop_node_id: BOB,
+            envelope,
+            relay_hops: 1,
+            delivery_attempt: None,
+            traffic_class: None,
+        }
+        .encode();
+        let mut hdr =
+            veil_proto::header::FrameHeader::new(FrameFamily::Delivery as u8, DeliveryMsg::Forward as u16);
+        hdr.body_len = body.len() as u32;
+        disp.dispatch(&hdr, &body, NodeId::from(RELAY));
+
+        let (src, provenance, data) = take(&mut rx).expect("the anonymous path must still deliver");
+        assert_eq!(data, b"anonymously yours");
+        assert_eq!(src, ALICE, "the inner sender is recovered as before");
+        assert_eq!(
+            provenance,
+            SenderProvenance::Claimed,
+            "and stays a claim: ML-KEM to a published key proves nothing about \
+             origin, so anyone could have named Alice here"
+        );
+        assert!(
+            bob.runtime.store.is_empty(),
+            "an anonymous message must not open a named conversation"
+        );
+    }
+
+    /// The direct-session path, which is where most one-to-one traffic goes.
+    /// Positive assertion: an `APP_SEND_SEALED` from a live session peer opens
+    /// through the ratchet and reaches the app as authenticated — not as the
+    /// `SessionPeer` an unsealed `APP_SEND` over the same session would give.
+    #[test]
+    fn a_direct_session_message_goes_through_the_ratchet_and_is_signed() {
+        use veil_proto::app::AppSendPayload;
+        use veil_proto::family::{AppMsg, FrameFamily};
+
+        let (alice, bob) = (party(ALICE, 0xA7), party(BOB, 0xB7));
+        learn(&bob, &alice);
+        let sealed = seal(&alice, &bob, b"over a live session");
+        assert_eq!(
+            sealed.first().copied(),
+            Some(veil_proto::RATCHET_E2E_MARKER),
+            "the direct path carries the same payload format as the relay path"
+        );
+
+        let (disp, _h, mut rx) = dispatcher_for(&bob);
+        let payload = AppSendPayload {
+            src_app_id: [0xA1u8; 32],
+            app_id: APP,
+            endpoint_id: ENDPOINT,
+            data: veil_bufpool::pooled_shared_from_vec(sealed),
+        }
+        .encode();
+        let mut hdr = veil_proto::header::FrameHeader::new(
+            FrameFamily::App as u8,
+            AppMsg::AppSendSealed as u16,
+        );
+        hdr.body_len = payload.len() as u32;
+        disp.dispatch(&hdr, &payload, NodeId::from(ALICE));
+
+        let (src, provenance, data) = take(&mut rx).expect("delivered");
+        assert_eq!(src, ALICE);
+        assert_eq!(data, b"over a live session");
+        assert_eq!(
+            provenance,
+            SenderProvenance::Signed,
+            "an unsealed APP_SEND over the same session would be SessionPeer; \
+             this is strictly more, and it is the whole reason the direct \
+             branch was changed"
+        );
+    }
+
+    /// A node with no device identity keeps working. It published no ratchet
+    /// key, so nothing can be keyed to it — but it must not choke on a frame
+    /// that names it, and its ML-KEM paths must be untouched.
+    #[test]
+    fn a_node_without_a_device_identity_drops_a_ratchet_frame_and_survives() {
+        let (alice, bob) = (party(ALICE, 0xA8), party(BOB, 0xB8));
+        let payload = seal(&alice, &bob, b"nobody home");
+        *wlock!(bob.runtime.local_instance_id) = None;
+
+        let (disp, _h, mut rx) = dispatcher_for(&bob);
+        let (hdr, body) = forward_frame([0x0Au8; 32], payload);
+        disp.dispatch(&hdr, &body, NodeId::from(RELAY));
+        assert!(take(&mut rx).is_none());
+
+        // And an ordinary plaintext envelope still lands.
+        let (hdr, body) = forward_frame([0x0Bu8; 32], b"plain".to_vec());
+        disp.dispatch(&hdr, &body, NodeId::from(RELAY));
+        assert_eq!(take(&mut rx).expect("delivered").2, b"plain");
     }
 }

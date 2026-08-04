@@ -233,6 +233,13 @@ pub struct CryptoContext {
     pub mlkem_keys: Arc<veil_e2e::MlKemSeedRing>,
     /// Peer ML-KEM-768 encapsulation-key cache: `peer_id → (ek_bytes, cached_at)`.
     pub peer_mlkem_keys: Arc<std::sync::RwLock<veil_e2e::PeerMlKemCache>>,
+    /// One-to-one ratchet conversations, when this node has a device identity.
+    ///
+    /// `None` on a node with no sovereign identity, which is a supported
+    /// configuration: such a node published no device key, so no peer could
+    /// have keyed a conversation to it, and there is nothing for it to open.
+    /// The two ML-KEM paths above keep working exactly as before.
+    pub ratchet: Option<veil_e2e::RatchetRuntime>,
     /// Maps `peer_id → (algo_byte, raw_pubkey_bytes)`. Populated when a
     /// session is established, cleared when it closes.
     pub peer_pubkeys: veil_types::PeerPubkeysCache,
@@ -1770,6 +1777,7 @@ pub fn make_test_dispatcher(role: NodeRole) -> FrameDispatcher {
             peer_roles: Arc::new(Mutex::new(veil_types::PeerLruCache::with_capacity(64))),
             peer_cap_flags: Arc::new(RwLock::new(HashMap::new())),
             per_session_mlkem_dk: Arc::new(Mutex::new(HashMap::new())),
+            ratchet: None,
         }),
         abuse: Arc::new(AbuseContext {
             rate_limiter: Arc::new(Mutex::new(PerPeerLimiter::new(
@@ -2483,6 +2491,7 @@ mod tests {
                 peer_roles: Arc::new(Mutex::new(veil_types::PeerLruCache::with_capacity(64))),
                 peer_cap_flags: Arc::new(RwLock::new(HashMap::new())),
                 per_session_mlkem_dk: Arc::new(Mutex::new(HashMap::new())),
+                ratchet: None,
             }),
             abuse: Arc::new(AbuseContext {
                 rate_limiter: Arc::new(Mutex::new(PerPeerLimiter::new(
@@ -3496,7 +3505,7 @@ mod tests {
             &mut eid,
         );
         assert_eq!(
-            opened.map(|(p, _)| p).as_deref(),
+            opened.map(|d| d.payload).as_deref(),
             Some(&plaintext[..]),
             "a blob sealed to the retired key must still open"
         );
