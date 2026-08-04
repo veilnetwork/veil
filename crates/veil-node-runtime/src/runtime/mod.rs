@@ -1595,6 +1595,15 @@ impl NodeRuntime {
                 veil_proto::budget::MAX_PEER_MLKEM_CACHE,
             ),
         ));
+        // The device Diffie-Hellman half of the same certificates, kept apart
+        // so the frame dispatcher can read it: the dispatcher decides sender
+        // provenance synchronously and cannot reach this crate's cert type.
+        let shared_peer_ratchet_keys: Arc<std::sync::RwLock<veil_e2e::PeerRatchetKeyCache>> =
+            Arc::new(std::sync::RwLock::new(
+                veil_e2e::PeerRatchetKeyCache::with_capacity(
+                    veil_proto::budget::MAX_PEER_MLKEM_CACHE,
+                ),
+            ));
         // per-session ephemeral ML-KEM DK seeds (key = peer_id, value =
         // SensitiveBytesN<64>-wrapped dk_seed).  Phase 6 slice 6h —
         // values are mlocked while the session is open.
@@ -2452,6 +2461,7 @@ impl NodeRuntime {
                 Arc::clone(&mlkem_keys),
                 Arc::clone(&shared_peer_mlkem_keys),
                 Arc::clone(&shared_peer_mlkem_certs),
+                Arc::clone(&shared_peer_ratchet_keys),
                 Arc::clone(&shared_per_session_mlkem_dk),
             )),
             sessions_per_ip: Arc::new(ip_slot::IpSlotTable::new()),

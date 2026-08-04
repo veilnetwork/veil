@@ -8,6 +8,7 @@ license = "AGPL-3.0-or-later"
 [dependencies]
 veil-crypto = { path = "../veil-crypto" }
 veil-proto = { path = "../veil-proto" }
+veil-ratchet = { path = "../veil-ratchet" }
 veil-util = { path = "../veil-util" }
 
 argon2 = "0.5"

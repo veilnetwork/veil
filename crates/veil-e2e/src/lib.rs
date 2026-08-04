@@ -27,7 +27,12 @@ use sha2::Sha256;
 
 use veil_proto::{E2eEnvelope, ProtoError};
 
+pub mod ratchet;
 pub mod seed_ring;
+pub use ratchet::{
+    CONVERSATION_KEY_LEN, ConversationKey, Opened, PeerRatchetKeyCache, PeerRatchetKeys,
+    RatchetIdentity, RatchetSpliceError, RatchetStore, is_ratchet_payload,
+};
 pub use seed_ring::{MLKEM_SEED_MIN_OVERLAP_SECS, MlKemSeedRing, RotateRejected};
 
 // ── Key sizes ─────────────────────────────────────────────────────────────────
