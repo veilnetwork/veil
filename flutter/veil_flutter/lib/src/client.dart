@@ -197,33 +197,42 @@ void _anonStreamWarmPeerWorker(int handleAddr, Uint8List dstNode) {
 /// Off-isolate body of [VeilClient.openMediaChannel] — the first call may
 /// lazily bind the stream hub, so keep it off the UI isolate. Returns the
 /// opaque channel id (0 on error → thrown here).
-int _mediaOpenChannelWorker(int handleAddr, Uint8List peerNode) {
+int _mediaOpenChannelWorker(
+    int handleAddr, Uint8List peerNode, Uint8List txKey, Uint8List rxKey) {
   final handle = Pointer<ffi.VeilHandle>.fromAddress(handleAddr);
   final pn = calloc<Uint8>(32)..asTypedList(32).setAll(0, peerNode);
+  final tx = calloc<Uint8>(32)..asTypedList(32).setAll(0, txKey);
+  final rx = calloc<Uint8>(32)..asTypedList(32).setAll(0, rxKey);
   final errOut = calloc<Pointer<Utf8>>();
   try {
-    final chan = ffi.veilMediaOpenChannel(handle, pn, errOut);
+    final chan = ffi.veilMediaOpenChannel(handle, pn, tx, rx, errOut);
     if (chan == 0) {
       throw VeilException('media open failed: ${_readErrAndFree(errOut)}');
     }
     return chan;
   } finally {
     calloc.free(pn);
+    zeroizeNative(tx, 32);
+    zeroizeNative(rx, 32);
+    calloc.free(tx);
+    calloc.free(rx);
     calloc.free(errOut);
   }
 }
 
 /// Off-isolate body of [AppHandle.openDirectMediaChannel]. The native media
 /// channel keeps the app sender and pumps RTP/RTCP over direct app datagrams.
-int _directMediaOpenChannelWorker(
-    int appAddr, Uint8List peerNode, Uint8List peerApp, int peerEndpoint) {
+int _directMediaOpenChannelWorker(int appAddr, Uint8List peerNode,
+    Uint8List peerApp, int peerEndpoint, Uint8List txKey, Uint8List rxKey) {
   final app = Pointer<ffi.VeilApp>.fromAddress(appAddr);
   final pn = calloc<Uint8>(32)..asTypedList(32).setAll(0, peerNode);
   final pa = calloc<Uint8>(32)..asTypedList(32).setAll(0, peerApp);
+  final tx = calloc<Uint8>(32)..asTypedList(32).setAll(0, txKey);
+  final rx = calloc<Uint8>(32)..asTypedList(32).setAll(0, rxKey);
   final errOut = calloc<Pointer<Utf8>>();
   try {
-    final chan =
-        ffi.veilMediaOpenDirectChannel(app, pn, pa, peerEndpoint, errOut);
+    final chan = ffi.veilMediaOpenDirectChannel(
+        app, pn, pa, peerEndpoint, tx, rx, errOut);
     if (chan == 0) {
       throw VeilException(
           'direct media open failed: ${_readErrAndFree(errOut)}');
@@ -232,20 +241,26 @@ int _directMediaOpenChannelWorker(
   } finally {
     calloc.free(pn);
     calloc.free(pa);
+    zeroizeNative(tx, 32);
+    zeroizeNative(rx, 32);
+    calloc.free(tx);
+    calloc.free(rx);
     calloc.free(errOut);
   }
 }
 
 /// Off-isolate body of [AppHandle.openRelayMediaChannel].
-int _relayMediaOpenChannelWorker(
-    int appAddr, Uint8List peerNode, Uint8List peerApp, int peerEndpoint) {
+int _relayMediaOpenChannelWorker(int appAddr, Uint8List peerNode,
+    Uint8List peerApp, int peerEndpoint, Uint8List txKey, Uint8List rxKey) {
   final app = Pointer<ffi.VeilApp>.fromAddress(appAddr);
   final pn = calloc<Uint8>(32)..asTypedList(32).setAll(0, peerNode);
   final pa = calloc<Uint8>(32)..asTypedList(32).setAll(0, peerApp);
+  final tx = calloc<Uint8>(32)..asTypedList(32).setAll(0, txKey);
+  final rx = calloc<Uint8>(32)..asTypedList(32).setAll(0, rxKey);
   final errOut = calloc<Pointer<Utf8>>();
   try {
-    final chan =
-        ffi.veilMediaOpenRelayChannel(app, pn, pa, peerEndpoint, errOut);
+    final chan = ffi.veilMediaOpenRelayChannel(
+        app, pn, pa, peerEndpoint, tx, rx, errOut);
     if (chan == 0) {
       throw VeilException(
           'relay media open failed: ${_readErrAndFree(errOut)}');
@@ -254,6 +269,10 @@ int _relayMediaOpenChannelWorker(
   } finally {
     calloc.free(pn);
     calloc.free(pa);
+    zeroizeNative(tx, 32);
+    zeroizeNative(rx, 32);
+    calloc.free(tx);
+    calloc.free(rx);
     calloc.free(errOut);
   }
 }
@@ -1099,13 +1118,27 @@ class VeilClient implements Finalizable {
   /// background. Returns an opaque channel id for [sendMediaDatagram] /
   /// [closeMediaChannel]. Bind may lazily create the hub, so run off the UI
   /// isolate like the anon-stream entry points.
-  Future<int> openMediaChannel({required Uint8List dstNodeId}) async {
+  ///
+  /// [txKey] / [rxKey] are the 32-byte directional call-media keys and are
+  /// REQUIRED: every cell is sealed with them, on this and on every other
+  /// transport, and there is no unsealed mode to fall back to. Derive them from
+  /// E2E-authenticated call material; drop your Dart copies once this returns
+  /// (the native buffers are wiped before free).
+  Future<int> openMediaChannel({
+    required Uint8List dstNodeId,
+    required Uint8List txKey,
+    required Uint8List rxKey,
+  }) async {
     _ensureOpen();
     if (dstNodeId.length != 32) {
       throw ArgumentError('dstNodeId must be 32 bytes');
     }
+    if (txKey.length != 32 || rxKey.length != 32) {
+      throw ArgumentError('call-media keys must be 32 bytes');
+    }
     final handleAddr = _handle.address;
-    return Isolate.run(() => _mediaOpenChannelWorker(handleAddr, dstNodeId));
+    return Isolate.run(
+        () => _mediaOpenChannelWorker(handleAddr, dstNodeId, txKey, rxKey));
   }
 
   /// Enqueue one media datagram on [chan]. NON-BLOCKING (returns immediately);
@@ -2551,67 +2584,57 @@ class AppHandle implements Finalizable {
   }
 
   /// Open a media channel whose outgoing RTP/RTCP is sent as direct app
-  /// datagrams from this endpoint to the peer's media endpoint.
+  /// datagrams from this endpoint to the peer's media endpoint, sealed with the
+  /// required directional call-media keys (see [VeilClient.openMediaChannel]).
   Future<int> openDirectMediaChannel({
     required Uint8List dstNodeId,
     required Uint8List dstAppId,
     required int dstEndpointId,
+    required Uint8List txKey,
+    required Uint8List rxKey,
   }) async {
     _ensureOpen();
     if (dstNodeId.length != 32 || dstAppId.length != 32) {
       throw ArgumentError('dst_node_id and dst_app_id must be 32 bytes');
     }
+    if (txKey.length != 32 || rxKey.length != 32) {
+      throw ArgumentError('call-media keys must be 32 bytes');
+    }
     final appAddr = _app.address;
     return Isolate.run(() => _directMediaOpenChannelWorker(
-        appAddr, dstNodeId, dstAppId, dstEndpointId));
+        appAddr, dstNodeId, dstAppId, dstEndpointId, txKey, rxKey));
   }
 
-  /// Open a media channel over the non-onion Delivery relay path. This is the
-  /// fallback for calls where both identities are direct but P2P is unavailable.
+  /// Open a media channel over the non-onion Delivery relay path, sealed with
+  /// the required directional call-media keys (see
+  /// [VeilClient.openMediaChannel]). This is the fallback for calls where both
+  /// identities are direct but P2P is unavailable.
   Future<int> openRelayMediaChannel({
     required Uint8List dstNodeId,
     required Uint8List dstAppId,
     required int dstEndpointId,
+    required Uint8List txKey,
+    required Uint8List rxKey,
   }) async {
     _ensureOpen();
     if (dstNodeId.length != 32 || dstAppId.length != 32) {
       throw ArgumentError('dst_node_id and dst_app_id must be 32 bytes');
     }
+    if (txKey.length != 32 || rxKey.length != 32) {
+      throw ArgumentError('call-media keys must be 32 bytes');
+    }
     final appAddr = _app.address;
     return Isolate.run(() => _relayMediaOpenChannelWorker(
-        appAddr, dstNodeId, dstAppId, dstEndpointId));
+        appAddr, dstNodeId, dstAppId, dstEndpointId, txKey, rxKey));
   }
 
-  /// Select negotiated batching on a direct/relay media channel. [compact]
-  /// uses audio-only batching and is valid only after relay E2E keys have been
-  /// configured; legacy peers retain the former audio+video batching.
+  /// Select the batching wire format on a direct/relay media channel.
+  /// [compact] uses audio-only batching and is valid on relay channels only.
+  /// This is a wire-format choice, not a security one: every mode seals
+  /// identically and the batch envelope travels inside the seal.
   int setRelayMediaBatching(int chan, bool on, {bool compact = false}) {
     _ensureOpen();
     return ffi.veilMediaChannelSetBatching(chan, on ? (compact ? 2 : 1) : 0);
-  }
-
-  /// Copy directional call-media keys into a relay channel. The temporary
-  /// native buffers are wiped before free; callers should drop their Dart key
-  /// lists promptly after configuration.
-  int configureRelayMediaCipher(
-    int chan, {
-    required Uint8List txKey,
-    required Uint8List rxKey,
-  }) {
-    _ensureOpen();
-    if (txKey.length != 32 || rxKey.length != 32) {
-      throw ArgumentError('relay media keys must be 32 bytes');
-    }
-    final tx = calloc<Uint8>(32)..asTypedList(32).setAll(0, txKey);
-    final rx = calloc<Uint8>(32)..asTypedList(32).setAll(0, rxKey);
-    try {
-      return ffi.veilMediaChannelSetE2eKeys(chan, tx, rx);
-    } finally {
-      zeroizeNative(tx, 32);
-      zeroizeNative(rx, 32);
-      calloc.free(tx);
-      calloc.free(rx);
-    }
   }
 
   /// Snapshot relay drain timing without touching media payloads. Returns null

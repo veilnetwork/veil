@@ -79,10 +79,15 @@ pub(crate) mod guard;
 // `node-embedded` cargo feature so the default client-only build stays slim.
 #[cfg(feature = "node-embedded")]
 mod anon_stream;
-// Lossy media-datagram side channel (calls: RTP/RTCP) over the anonymous
-// circuit. Rides the embedded node's circuit pool, so it shares anon_stream's
-// gating.
-#[cfg(feature = "node-embedded")]
+// Call-media plane: the end-to-end seal, the wire cell format, and the inbound
+// registry every media transport dispatches through. Deliberately NOT gated on
+// `node-embedded`, unlike the channel FFI in this file that drives it: this is
+// the code that decides whether a stranger's bytes reach a live call, and a
+// security decision that the project's own test gate does not even compile is a
+// security decision nobody is checking. The module is dead weight in a
+// client-only build (a few KiB, no dependencies of its own beyond crypto that
+// is already linked) — a fair price for having its tests run every time.
+#[cfg_attr(not(feature = "node-embedded"), allow(dead_code))]
 mod media;
 // Opt-in message-authorship signature FFI (needs veil-cfg to parse the caller's
 // identity TOML — enabled by node-embedded).
@@ -747,9 +752,10 @@ struct MediaChannel {
     /// MEDIA_BATCH_MAGIC on this path. `None` on onion channels (their own
     /// transport already batches).
     batching: Option<Arc<std::sync::atomic::AtomicU8>>,
-    /// Relay channels can opt into compact call-key sealing. The shared object
-    /// is also installed with the receive callback, so route rebuilds do not
-    /// race separate TX/RX cipher ownership.
+    /// The channel's end-to-end media cipher — required, on every transport.
+    /// The same object is installed with the receive callback, so route
+    /// rebuilds do not race separate TX/RX cipher ownership, and there is no
+    /// state in which a channel exists but its media is in the clear.
     cipher: Arc<media::MediaCipher>,
     /// Relay-only drain telemetry. Atomics keep the real-time ingress ABI
     /// non-blocking while letting the host distinguish a local queue stall
@@ -1242,16 +1248,58 @@ mod media_priority_tests {
     }
 }
 
+/// Copy the two 32-byte directional call-media keys out of caller memory and
+/// build the channel's cipher from them.
+///
+/// Every media channel takes these at OPEN, as required arguments with no
+/// default. There used to be a separate `veil_media_channel_set_e2e_keys`, it
+/// accepted only relay channels, and the host called it only when call
+/// signalling claimed the peer spoke a new enough protocol — so "no keys" was
+/// both a reachable state and a state an attacker could steer the host into by
+/// editing an unauthenticated signal. Taking the keys here deletes that state:
+/// a channel that cannot be keyed is a channel that never opens, and there is
+/// nothing left to downgrade to.
+///
+/// Key material is copied immediately into zeroizing native state; the caller
+/// may erase/free its buffers as soon as this returns.
+#[cfg(feature = "node-embedded")]
+unsafe fn media_cipher_from_keys(
+    peer: &[u8; 32],
+    tx_key: *const u8,
+    rx_key: *const u8,
+    err_out: *mut *mut c_char,
+) -> Option<Arc<media::MediaCipher>> {
+    use zeroize::Zeroize;
+    let mut tx = [0u8; 32];
+    let mut rx = [0u8; 32];
+    unsafe {
+        ptr::copy_nonoverlapping(tx_key, tx.as_mut_ptr(), tx.len());
+        ptr::copy_nonoverlapping(rx_key, rx.as_mut_ptr(), rx.len());
+    }
+    let cipher = media::MediaCipher::new(peer, &tx, &rx).map(Arc::new);
+    tx.zeroize();
+    rx.zeroize();
+    if cipher.is_none() {
+        unsafe { write_err(err_out, "media keys must be two distinct non-zero keys") };
+    }
+    cipher
+}
+
 /// Open a lossy MEDIA datagram channel to `peer` over the anonymous circuit
 /// (reuses the reliable stream's rendezvous/pool and warms the circuit in the
 /// background). Per-packet RTP/RTCP then flows native↔native via
-/// [`veil_media_send_datagram`] / [`veil_media_set_recv_callback`]. Returns an
+/// [`veil_media_send_datagram`] / [`veil_media_set_recv_callback`], sealed
+/// end-to-end with `tx_key`/`rx_key`: two distinct, non-zero 32-byte
+/// directional call-media keys, required, copied into zeroizing native state
+/// (the caller may wipe its buffers as soon as this returns). Returns an
 /// opaque channel id (> 0), or 0 on error.
 #[cfg(feature = "node-embedded")]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn veil_media_open_channel(
     handle: *mut VeilHandle,
     peer_node_id: *const u8,
+    tx_key: *const u8,
+    rx_key: *const u8,
     err_out: *mut *mut c_char,
 ) -> u64 {
     if unsafe { guard::ffi_prelude(err_out, "veil_media_open_channel") }.is_err() {
@@ -1260,6 +1308,8 @@ pub unsafe extern "C" fn veil_media_open_channel(
     null_check_with_default!(err_out, 0u64,
         "handle" => handle,
         "peer_node_id" => peer_node_id,
+        "tx_key" => tx_key,
+        "rx_key" => rx_key,
     );
     get_or_return!(
         handle_live,
@@ -1273,6 +1323,10 @@ pub unsafe extern "C" fn veil_media_open_channel(
     unsafe {
         ptr::copy_nonoverlapping(peer_node_id, peer.as_mut_ptr(), 32);
     }
+    let Some(cipher) = (unsafe { media_cipher_from_keys(&peer, tx_key, rx_key, err_out) }) else {
+        return 0;
+    };
+    let cipher_task = Arc::clone(&cipher);
     let hub = match ensure_anon_hub(&handle_live.bundle, &handle_live.anon_hub) {
         Ok(h) => h,
         Err(e) => {
@@ -1350,7 +1404,22 @@ pub unsafe extern "C" fn veil_media_open_channel(
                 body_len = next_len;
                 packets.push(pkt);
             }
-            if send_hub.media_send_datagrams(peer, &packets).await {
+            // Fold to ONE cell and seal it. A cell that will not seal (the
+            // sequence space is exhausted) is dropped, never sent in the
+            // clear — the splice relay reads whatever goes down this circuit.
+            // Not a route problem either, so it must not arm the re-warm.
+            let Some(cell) = media::media_cell(packets, anon_stream::MEDIA_BATCH_BODY_MAX) else {
+                continue;
+            };
+            let Some(sealed) = cipher_task.seal(&cell) else {
+                continue;
+            };
+            // The plaintext is MOVED out of scope the moment it is sealed. No
+            // unit test can reach this drain (it needs a live embedded node),
+            // so the guarantee has to be one the compiler makes: a future edit
+            // that sends `cell` instead of `sealed` does not build.
+            drop(cell);
+            if send_hub.media_send_datagram(peer, &sealed).await {
                 consecutive_drops = 0;
             } else {
                 consecutive_drops += 1;
@@ -1373,7 +1442,7 @@ pub unsafe extern "C" fn veil_media_open_channel(
                 peer,
                 task,
                 batching: None,
-                cipher: Arc::new(media::MediaCipher::default()),
+                cipher,
                 relay_stats: None,
             },
         );
@@ -1381,10 +1450,15 @@ pub unsafe extern "C" fn veil_media_open_channel(
 }
 
 /// Open a lossy MEDIA datagram channel to `peer` over a direct app endpoint.
-/// Outbound RTP/RTCP is sent from `app` to `(peer_node_id, peer_app_id,
-/// peer_endpoint_id)`. Inbound direct media datagrams must be received by the
-/// host on the same app endpoint and fed to
+/// Outbound RTP/RTCP is sealed with the required `tx_key`/`rx_key` (see
+/// [`veil_media_open_channel`]) and sent from `app` to `(peer_node_id,
+/// peer_app_id, peer_endpoint_id)`. Inbound direct media datagrams must be
+/// received by the host on the same app endpoint and fed to
 /// [`veil_media_dispatch_direct_datagram`].
+///
+/// The session under a "direct" channel is encrypted hop-to-hop to whatever
+/// node terminates it, which is not the same thing as end-to-end, so this path
+/// seals exactly like the other two.
 #[cfg(feature = "node-embedded")]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn veil_media_open_direct_channel(
@@ -1392,6 +1466,8 @@ pub unsafe extern "C" fn veil_media_open_direct_channel(
     peer_node_id: *const u8,
     peer_app_id: *const u8,
     peer_endpoint_id: u32,
+    tx_key: *const u8,
+    rx_key: *const u8,
     err_out: *mut *mut c_char,
 ) -> u64 {
     if unsafe { guard::ffi_prelude(err_out, "veil_media_open_direct_channel") }.is_err() {
@@ -1401,6 +1477,8 @@ pub unsafe extern "C" fn veil_media_open_direct_channel(
         "app" => app,
         "peer_node_id" => peer_node_id,
         "peer_app_id" => peer_app_id,
+        "tx_key" => tx_key,
+        "rx_key" => rx_key,
     );
     get_or_return!(app_ref, app_table(), app, err_out, 0u64, "VeilApp");
     let mut peer = [0u8; 32];
@@ -1409,6 +1487,10 @@ pub unsafe extern "C" fn veil_media_open_direct_channel(
         ptr::copy_nonoverlapping(peer_node_id, peer.as_mut_ptr(), 32);
         ptr::copy_nonoverlapping(peer_app_id, peer_app.as_mut_ptr(), 32);
     }
+    let Some(cipher) = (unsafe { media_cipher_from_keys(&peer, tx_key, rx_key, err_out) }) else {
+        return 0;
+    };
+    let cipher_task = Arc::clone(&cipher);
 
     // Opening an AppSender does not prove that the embedded node currently has
     // a direct session to the peer. REALTIME frames intentionally have no
@@ -1566,11 +1648,24 @@ pub unsafe extern "C" fn veil_media_open_direct_channel(
                 break;
             };
             for pkt in cells {
+                // Read the realtime-class hints off the PLAINTEXT, before the
+                // seal hides them. They ride the RT_DATA header exactly as
+                // before — the local daemon needs them to class the frame —
+                // so sealing costs no scheduling quality and leaks nothing the
+                // header did not already carry.
                 let (marker, payload_type) = if pkt.len() >= 2 && (pkt[0] >> 6) == 2 {
                     ((pkt[1] >> 7) & 1, u32::from(pkt[1] & 0x7f))
                 } else {
                     (0, 0)
                 };
+                // Unsealable cell → drop it. There is no cleartext fallback.
+                let Some(sealed) = cipher_task.seal(&pkt) else {
+                    continue;
+                };
+                // Plaintext MOVED out of scope: sending `pkt` below would not
+                // compile. See the onion drain for why this is a `drop` and not
+                // a comment.
+                drop(pkt);
                 let timestamp_us = started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
                 let _ = sender
                     .send_rt_data(
@@ -1581,7 +1676,7 @@ pub unsafe extern "C" fn veil_media_open_direct_channel(
                         timestamp_us,
                         marker,
                         payload_type,
-                        &pkt,
+                        sealed.as_bytes(),
                     )
                     .await;
                 transport_seq = transport_seq.wrapping_add(1);
@@ -1601,7 +1696,7 @@ pub unsafe extern "C" fn veil_media_open_direct_channel(
                 peer,
                 task,
                 batching: Some(batching),
-                cipher: Arc::new(media::MediaCipher::default()),
+                cipher,
                 relay_stats: None,
             },
         );
@@ -1609,9 +1704,10 @@ pub unsafe extern "C" fn veil_media_open_direct_channel(
 }
 
 /// Open a lossy MEDIA channel forced through the ordinary Delivery relay path
-/// (no onion circuit). The daemon E2E-encrypts each datagram for `peer`; relay
-/// nodes see addressing metadata but never RTP/RTCP bytes. Intended only for
-/// direct-identity calls when the preferred P2P route is unavailable.
+/// (no onion circuit), sealed end-to-end with the required `tx_key`/`rx_key`
+/// (see [`veil_media_open_channel`]). Relay nodes see addressing metadata but
+/// never RTP/RTCP bytes. Intended only for direct-identity calls when the
+/// preferred P2P route is unavailable.
 #[cfg(feature = "node-embedded")]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn veil_media_open_relay_channel(
@@ -1619,6 +1715,8 @@ pub unsafe extern "C" fn veil_media_open_relay_channel(
     peer_node_id: *const u8,
     peer_app_id: *const u8,
     peer_endpoint_id: u32,
+    tx_key: *const u8,
+    rx_key: *const u8,
     err_out: *mut *mut c_char,
 ) -> u64 {
     if unsafe { guard::ffi_prelude(err_out, "veil_media_open_relay_channel") }.is_err() {
@@ -1628,6 +1726,8 @@ pub unsafe extern "C" fn veil_media_open_relay_channel(
         "app" => app,
         "peer_node_id" => peer_node_id,
         "peer_app_id" => peer_app_id,
+        "tx_key" => tx_key,
+        "rx_key" => rx_key,
     );
     get_or_return!(app_ref, app_table(), app, err_out, 0u64, "VeilApp");
     let mut peer = [0u8; 32];
@@ -1636,6 +1736,9 @@ pub unsafe extern "C" fn veil_media_open_relay_channel(
         ptr::copy_nonoverlapping(peer_node_id, peer.as_mut_ptr(), 32);
         ptr::copy_nonoverlapping(peer_app_id, peer_app.as_mut_ptr(), 32);
     }
+    let Some(cipher) = (unsafe { media_cipher_from_keys(&peer, tx_key, rx_key, err_out) }) else {
+        return 0;
+    };
 
     let (tx_hi, mut rx_hi) = mpsc::channel::<Vec<u8>>(MEDIA_TX_HI_QUEUE);
     let (tx_video_frames, mut rx_video_frames) =
@@ -1643,7 +1746,6 @@ pub unsafe extern "C" fn veil_media_open_relay_channel(
     let sender = Arc::clone(&app_ref.sender);
     let batching = Arc::new(std::sync::atomic::AtomicU8::new(MEDIA_BATCHING_OFF));
     let batching_task = Arc::clone(&batching);
-    let cipher = Arc::new(media::MediaCipher::default());
     let cipher_task = Arc::clone(&cipher);
     let relay_stats = Arc::new(RelayMediaStats::default());
     let relay_stats_task = Arc::clone(&relay_stats);
@@ -1778,16 +1880,24 @@ pub unsafe extern "C" fn veil_media_open_relay_channel(
             };
             match work {
                 Work::High(pkt) => {
-                    let ipc_started = std::time::Instant::now();
-                    let result = if let Some(sealed) = cipher_task.seal(&pkt) {
-                        sender
-                            .send_relay_media_sealed_owned(peer, peer_app, peer_endpoint_id, sealed)
-                            .await
-                    } else {
-                        sender
-                            .send_relay_realtime_owned(peer, peer_app, peer_endpoint_id, pkt)
-                            .await
+                    // No unsealed fallback. The ML-KEM-per-envelope path this
+                    // used to fall back to hid the bytes from the relay but
+                    // proved nothing about who wrote them — anyone may encrypt
+                    // to a public key — so falling back was a downgrade, not a
+                    // safety net. A cell that will not seal is dropped.
+                    let Some(sealed) = cipher_task.seal(&pkt) else {
+                        continue;
                     };
+                    drop(pkt); // plaintext moved out of scope; see the onion drain
+                    let ipc_started = std::time::Instant::now();
+                    let result = sender
+                        .send_relay_media_sealed_owned(
+                            peer,
+                            peer_app,
+                            peer_endpoint_id,
+                            sealed.into_vec(),
+                        )
+                        .await;
                     let failed = result.is_err();
                     relay_stats_task.observe_ipc_cell(ipc_started.elapsed(), failed);
                 }
@@ -1802,45 +1912,34 @@ pub unsafe extern "C" fn veil_media_open_relay_channel(
                     for cell in media_wire_cells(frame.packets, batching_enabled) {
                         // One batch contains at most four video packets, so this
                         // preserves the former one-audio-slot-per-four cadence.
-                        if let Ok(high) = rx_hi.try_recv() {
+                        if let Some(sealed) =
+                            rx_hi.try_recv().ok().and_then(|high| cipher_task.seal(&high))
+                        {
                             let ipc_started = std::time::Instant::now();
-                            let result = if let Some(sealed) = cipher_task.seal(&high) {
-                                sender
-                                    .send_relay_media_sealed_owned(
-                                        peer,
-                                        peer_app,
-                                        peer_endpoint_id,
-                                        sealed,
-                                    )
-                                    .await
-                            } else {
-                                sender
-                                    .send_relay_realtime_owned(
-                                        peer,
-                                        peer_app,
-                                        peer_endpoint_id,
-                                        high,
-                                    )
-                                    .await
-                            };
-                            let failed = result.is_err();
-                            relay_stats_task.observe_ipc_cell(ipc_started.elapsed(), failed);
-                        }
-                        let ipc_started = std::time::Instant::now();
-                        let result = if let Some(sealed) = cipher_task.seal(&cell) {
-                            sender
+                            let result = sender
                                 .send_relay_media_sealed_owned(
                                     peer,
                                     peer_app,
                                     peer_endpoint_id,
-                                    sealed,
+                                    sealed.into_vec(),
                                 )
-                                .await
-                        } else {
-                            sender
-                                .send_relay_realtime_owned(peer, peer_app, peer_endpoint_id, cell)
-                                .await
+                                .await;
+                            let failed = result.is_err();
+                            relay_stats_task.observe_ipc_cell(ipc_started.elapsed(), failed);
+                        }
+                        let Some(sealed) = cipher_task.seal(&cell) else {
+                            continue;
                         };
+                        drop(cell); // plaintext moved out of scope; see the onion drain
+                        let ipc_started = std::time::Instant::now();
+                        let result = sender
+                            .send_relay_media_sealed_owned(
+                                peer,
+                                peer_app,
+                                peer_endpoint_id,
+                                sealed.into_vec(),
+                            )
+                            .await;
                         let failed = result.is_err();
                         relay_stats_task.observe_ipc_cell(ipc_started.elapsed(), failed);
                     }
@@ -1998,10 +2097,10 @@ pub extern "C" fn veil_debug_set_publish_pause(on: c_int) {
 }
 
 /// Select media batching for a direct or relay channel: 0 = off, 1 = legacy
-/// audio+video batching, 2 = compact relay audio-only batching. Mode 2 requires
-/// call-key sealing to be configured first and is rejected for non-relay
-/// channels. The host selects a nonzero mode only after call signaling proves
-/// the remote understands the corresponding wire format.
+/// audio+video batching, 2 = compact relay audio-only batching. Mode 2 is
+/// rejected for non-relay channels. This is a WIRE-FORMAT selector, not a
+/// security one — every mode seals identically, and the batch envelope now
+/// travels inside the seal, so a peer on the path cannot see or rewrite it.
 /// Returns 0 on success, -1 for an unknown/unsupported channel or mode.
 #[cfg(feature = "node-embedded")]
 #[unsafe(no_mangle)]
@@ -2022,62 +2121,17 @@ pub unsafe extern "C" fn veil_media_channel_set_batching(chan: u64, mode: c_int)
     ) {
         return -1;
     }
-    if mode == MEDIA_BATCHING_COMPACT_RELAY && (ch.relay_stats.is_none() || !ch.cipher.enabled()) {
+    if mode == MEDIA_BATCHING_COMPACT_RELAY && ch.relay_stats.is_none() {
         return -1;
     }
     b.store(mode, std::sync::atomic::Ordering::Relaxed);
     0
 }
 
-/// Configure directional 32-byte call-media keys for a relay channel. Key
-/// material is copied immediately into zeroizing native state; the caller may
-/// erase/free its buffers as soon as this function returns. This does not turn
-/// compact mode on by itself, so setup can complete before the first packet.
-#[cfg(feature = "node-embedded")]
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn veil_media_channel_set_e2e_keys(
-    chan: u64,
-    tx_key: *const u8,
-    rx_key: *const u8,
-) -> c_int {
-    if chan == 0 || tx_key.is_null() || rx_key.is_null() {
-        return -1;
-    }
-    let mut tx = [0u8; 32];
-    let mut rx = [0u8; 32];
-    unsafe {
-        ptr::copy_nonoverlapping(tx_key, tx.as_mut_ptr(), tx.len());
-        ptr::copy_nonoverlapping(rx_key, rx.as_mut_ptr(), rx.len());
-    }
-    if tx == rx || tx.iter().all(|byte| *byte == 0) || rx.iter().all(|byte| *byte == 0) {
-        use zeroize::Zeroize;
-        tx.zeroize();
-        rx.zeroize();
-        return -1;
-    }
-    let cipher = {
-        let map = MEDIA_CHANNELS.lock().unwrap_or_else(|p| p.into_inner());
-        let Some(ch) = map.get(&chan) else {
-            use zeroize::Zeroize;
-            tx.zeroize();
-            rx.zeroize();
-            return -1;
-        };
-        if ch.relay_stats.is_none() {
-            use zeroize::Zeroize;
-            tx.zeroize();
-            rx.zeroize();
-            return -1;
-        }
-        Arc::clone(&ch.cipher)
-    };
-    cipher.configure(tx, rx);
-    0
-}
-
 /// Feed one direct-P2P media datagram received by the host on the media app
-/// endpoint into the shared native media callback registry. The host is
-/// responsible for authenticating/filtering the source app id before calling.
+/// endpoint into the shared native media ingress. Whatever the host believes
+/// about the source, the cell is opened with the channel's own key before a
+/// byte of it reaches the engine.
 #[cfg(feature = "node-embedded")]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn veil_media_dispatch_direct_datagram(
@@ -2116,12 +2170,12 @@ fn direct_media_source_app(node_id: &[u8; 32], namespace: &str, name: &str) -> [
 /// authenticated session `src_node_id`" and nothing here checks it: the derived
 /// app id is a function OF `src_node_id`, so anyone who can claim a node id can
 /// also compute its media app id. This demux is not, and never was, a sender
-/// gate. `provenance` is deliberately NOT consulted here — media legitimately
-/// arrives over anonymous ingress (onion / ML-KEM-per-envelope), which is
-/// `Claimed` by design, so refusing it would break calls rather than secure
-/// them. What actually authenticates a media sender is the per-channel
-/// `MediaCipher` seal, and once keys exist for a channel `dispatch_inbound_auto`
-/// fails closed on anything unsealed.
+/// gate. `provenance` is deliberately NOT consulted here either — media
+/// legitimately arrives over anonymous ingress, which is `Claimed` by design, so
+/// refusing it would break calls rather than secure them. What authenticates a
+/// media sender is the per-channel `MediaCipher` seal, which every channel now
+/// has and which [`media::dispatch_inbound_auto`] applies to every cell on every
+/// transport.
 ///
 /// This function takes exclusive ownership of the app's datagram receiver. It
 /// must be called before [`veil_app_set_recv_handler`].
