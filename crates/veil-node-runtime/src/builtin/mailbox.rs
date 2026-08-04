@@ -394,20 +394,31 @@ pub async fn handle_fetch_message(
     reply_sender: Option<&Arc<dyn AnonOnionSender>>,
     msg: AppMessage,
 ) {
-    let (src_node_id, reply_id) = match msg {
+    let (src_node_id, provenance, reply_id) = match msg {
         AppMessage::Deliver {
             src_node_id,
+            provenance,
             reply_id,
             ..
-        } => (src_node_id, reply_id),
+        } => (src_node_id, provenance, reply_id),
         other => {
             log::debug!("veil-mailbox: ignoring non-Deliver on FETCH endpoint: {other:?}");
             return;
         }
     };
-    // An UNAUTHENTICATED request (src_node_id == 0, the anonymous-send marker)
-    // or one with no reply path can't be served: we'd have no verified receiver
-    // to key the mailbox on, and nowhere to send the answer.
+    // The doc above says the requester is authenticated. ASK, rather than
+    // assume it from the shape of the message (X/V-01): `src_node_id` is the
+    // key this whole handler reads a mailbox by, so serving one that was never
+    // verified hands a stranger someone else's mail. A zero id (the
+    // anonymous-send marker) and a missing reply path are still refused —
+    // there would be no receiver to key on and nowhere to send the answer.
+    if !provenance.is_authenticated() {
+        log::debug!(
+            "veil-mailbox: FETCH dropped (src {} is {provenance:?}, not an authenticated identity)",
+            hex_short(&src_node_id),
+        );
+        return;
+    }
     if src_node_id == [0u8; 32] || reply_id == 0 {
         log::debug!("veil-mailbox: FETCH dropped (unauthenticated src or no reply path)");
         return;
@@ -501,17 +512,28 @@ pub async fn handle_fetch_message(
 /// cadence the whole time. All paths fail-safe: malformed/unauthenticated
 /// requests are logged + discarded.
 pub fn handle_ack_message(mailbox: &Mailbox, msg: AppMessage) {
-    let (src_node_id, data) = match msg {
+    let (src_node_id, provenance, data) = match msg {
         AppMessage::Deliver {
-            src_node_id, data, ..
-        } => (src_node_id, data),
+            src_node_id,
+            provenance,
+            data,
+            ..
+        } => (src_node_id, provenance, data),
         other => {
             log::debug!("veil-mailbox: ignoring non-Deliver on ACK endpoint: {other:?}");
             return;
         }
     };
-    // Unauthenticated (src == 0 = anonymous-send marker) acks could drop OTHER
-    // receivers' mail — reject, exactly like FETCH.
+    // Unauthenticated acks could drop OTHER receivers' mail — reject, exactly
+    // like FETCH, and on the same evidence: what the node knows about
+    // `src_node_id`, not merely that it is non-zero (X/V-01).
+    if !provenance.is_authenticated() {
+        log::debug!(
+            "veil-mailbox: ACK dropped (src {} is {provenance:?}, not an authenticated identity)",
+            hex_short(&src_node_id),
+        );
+        return;
+    }
     if src_node_id == [0u8; 32] {
         log::debug!("veil-mailbox: ACK dropped (unauthenticated src)");
         return;
@@ -811,6 +833,7 @@ pub fn hex_short(node_id: &[u8; 32]) -> String {
 mod tests {
     use super::*;
     use veil_app::AppEndpointRegistry;
+    use veil_app::registry::SenderProvenance;
 
     fn fresh_mailbox() -> (Arc<Mailbox>, tempfile::TempDir) {
         let tmp = tempfile::tempdir().unwrap();
@@ -890,6 +913,7 @@ mod tests {
     fn ack_deliver(src_node_id: [u8; 32], data: Vec<u8>) -> AppMessage {
         AppMessage::Deliver {
             src_node_id,
+            provenance: SenderProvenance::Signed,
             src_app_id: [0u8; 32],
             app_id: MAILBOX_APP_ID,
             endpoint_id: MAILBOX_ACK_ENDPOINT_ID,
@@ -1063,6 +1087,7 @@ mod tests {
         sender
             .try_send(AppMessage::Deliver {
                 src_node_id: [33u8; 32],
+                provenance: SenderProvenance::Claimed,
                 src_app_id: [0u8; 32],
                 app_id: MAILBOX_APP_ID,
                 endpoint_id: MAILBOX_PUT_ENDPOINT_ID,
@@ -1109,6 +1134,7 @@ mod tests {
         sender
             .try_send(AppMessage::Deliver {
                 src_node_id: [33u8; 32],
+                provenance: SenderProvenance::Claimed,
                 src_app_id: [0u8; 32],
                 app_id: MAILBOX_APP_ID,
                 endpoint_id: MAILBOX_PUT_ENDPOINT_ID,
@@ -1126,6 +1152,7 @@ mod tests {
         sender2
             .try_send(AppMessage::Deliver {
                 src_node_id: [33u8; 32],
+                provenance: SenderProvenance::Claimed,
                 src_app_id: [0u8; 32],
                 app_id: MAILBOX_APP_ID,
                 endpoint_id: MAILBOX_PUT_ENDPOINT_ID,
@@ -1153,6 +1180,7 @@ mod tests {
         sender
             .try_send(AppMessage::Deliver {
                 src_node_id: [44u8; 32],
+                provenance: SenderProvenance::Claimed,
                 src_app_id: [0u8; 32],
                 app_id: MAILBOX_APP_ID,
                 endpoint_id: veil_mailbox::MAILBOX_WAKE_ENDPOINT_ID,
@@ -1201,6 +1229,7 @@ mod tests {
         sender
             .try_send(AppMessage::Deliver {
                 src_node_id: [33u8; 32],
+                provenance: SenderProvenance::Claimed,
                 src_app_id: [0u8; 32],
                 app_id: MAILBOX_APP_ID,
                 endpoint_id: MAILBOX_PUT_ENDPOINT_ID,
@@ -1249,6 +1278,7 @@ mod tests {
         sender
             .try_send(AppMessage::Deliver {
                 src_node_id: [3u8; 32],
+                provenance: SenderProvenance::Claimed,
                 src_app_id: [0u8; 32],
                 app_id: MAILBOX_APP_ID,
                 endpoint_id: MAILBOX_PUT_ENDPOINT_ID,
@@ -1281,6 +1311,7 @@ mod tests {
         sender
             .try_send(AppMessage::Deliver {
                 src_node_id: [3u8; 32],
+                provenance: SenderProvenance::Claimed,
                 src_app_id: [0u8; 32],
                 app_id: MAILBOX_APP_ID,
                 endpoint_id: MAILBOX_PUT_ENDPOINT_ID,
@@ -1294,6 +1325,7 @@ mod tests {
         sender
             .try_send(AppMessage::Deliver {
                 src_node_id: [9u8; 32],
+                provenance: SenderProvenance::Claimed,
                 src_app_id: [0u8; 32],
                 app_id: MAILBOX_APP_ID,
                 endpoint_id: MAILBOX_PUT_ENDPOINT_ID,
@@ -1332,6 +1364,7 @@ mod tests {
         sender
             .try_send(AppMessage::Deliver {
                 src_node_id: [3u8; 32],
+                provenance: SenderProvenance::Claimed,
                 src_app_id: [0u8; 32],
                 app_id: MAILBOX_APP_ID,
                 endpoint_id: MAILBOX_PUT_ENDPOINT_ID,
@@ -1477,6 +1510,7 @@ mod tests {
         // Authenticated delivery: src_node_id == recv, non-zero reply_id.
         let msg = AppMessage::Deliver {
             src_node_id: recv,
+            provenance: SenderProvenance::Signed,
             src_app_id: [0u8; 32],
             app_id: MAILBOX_APP_ID,
             endpoint_id: MAILBOX_FETCH_ENDPOINT_ID,
@@ -1509,6 +1543,7 @@ mod tests {
         // Anonymous source (src_node_id == 0): no verified receiver → drop.
         let anon = AppMessage::Deliver {
             src_node_id: [0u8; 32],
+            provenance: SenderProvenance::Claimed,
             src_app_id: [0u8; 32],
             app_id: MAILBOX_APP_ID,
             endpoint_id: MAILBOX_FETCH_ENDPOINT_ID,
@@ -1519,6 +1554,7 @@ mod tests {
         // No reply path (reply_id == 0): nowhere to answer → drop.
         let noreply = AppMessage::Deliver {
             src_node_id: [0x77u8; 32],
+            provenance: SenderProvenance::Signed,
             src_app_id: [0u8; 32],
             app_id: MAILBOX_APP_ID,
             endpoint_id: MAILBOX_FETCH_ENDPOINT_ID,
@@ -1529,6 +1565,88 @@ mod tests {
         assert!(
             captured.lock().unwrap().is_empty(),
             "no reply for either drop case"
+        );
+    }
+
+    /// X/V-01 at a consumer: FETCH keys a mailbox by `src_node_id`, so it must
+    /// refuse a request whose sender was never verified — even one that is
+    /// otherwise perfectly well-formed (non-zero id, valid reply path). The
+    /// two pre-existing shape checks (`src != 0`, `reply_id != 0`) both pass
+    /// here; only the provenance decides, which is the point.
+    #[tokio::test]
+    async fn network_fetch_refuses_a_well_formed_but_unauthenticated_requester() {
+        let (mailbox, _tmp) = fresh_mailbox();
+        let victim = [0x77u8; 32];
+        mailbox
+            .put(victim, [0xC1; 32], [0xAA; 32], b"victims-mail".to_vec())
+            .unwrap();
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sender: Arc<dyn veil_types::AnonOnionSender> = Arc::new(MockReplySender {
+            captured: std::sync::Arc::clone(&captured),
+        });
+
+        let spoofed = AppMessage::Deliver {
+            src_node_id: victim,
+            provenance: SenderProvenance::Claimed,
+            src_app_id: [0u8; 32],
+            app_id: MAILBOX_APP_ID,
+            endpoint_id: MAILBOX_FETCH_ENDPOINT_ID,
+            data: veil_bufpool::pooled_shared_from_vec(Vec::new()),
+            reply_id: 42,
+        };
+        handle_fetch_message(&mailbox, Some(&sender), spoofed).await;
+        assert!(
+            captured.lock().unwrap().is_empty(),
+            "an unverified requester must not be handed the victim's mail",
+        );
+    }
+
+    /// Same for ACK, which can DELETE mail: an unverified sender naming the
+    /// victim must not be able to drop the victim's blobs.
+    #[test]
+    fn network_ack_refuses_a_well_formed_but_unauthenticated_requester() {
+        let (mailbox, _tmp) = fresh_mailbox();
+        let victim = [0x77u8; 32];
+        let content_id = [0xC1u8; 32];
+        mailbox
+            .put(victim, content_id, [0xAA; 32], b"victims-mail".to_vec())
+            .unwrap();
+
+        handle_ack_message(
+            &mailbox,
+            AppMessage::Deliver {
+                src_node_id: victim,
+                provenance: SenderProvenance::Claimed,
+                src_app_id: [0u8; 32],
+                app_id: MAILBOX_APP_ID,
+                endpoint_id: MAILBOX_ACK_ENDPOINT_ID,
+                data: veil_bufpool::pooled_shared_from_vec(content_id.to_vec()),
+                reply_id: 0,
+            },
+        );
+        assert_eq!(
+            mailbox.fetch(victim).unwrap().len(),
+            1,
+            "an unverified ACK must not drop the victim's mail",
+        );
+
+        // The verified form of the very same request DOES drop it — otherwise
+        // "ACK never works" would pass the assertion above.
+        handle_ack_message(
+            &mailbox,
+            AppMessage::Deliver {
+                src_node_id: victim,
+                provenance: SenderProvenance::Signed,
+                src_app_id: [0u8; 32],
+                app_id: MAILBOX_APP_ID,
+                endpoint_id: MAILBOX_ACK_ENDPOINT_ID,
+                data: veil_bufpool::pooled_shared_from_vec(content_id.to_vec()),
+                reply_id: 0,
+            },
+        );
+        assert!(
+            mailbox.fetch(victim).unwrap().is_empty(),
+            "a verified ACK must still drop the blob",
         );
     }
 
@@ -1555,6 +1673,7 @@ mod tests {
         });
         let msg = AppMessage::Deliver {
             src_node_id: recv,
+            provenance: SenderProvenance::Signed,
             src_app_id: [0u8; 32],
             app_id: MAILBOX_APP_ID,
             endpoint_id: MAILBOX_FETCH_ENDPOINT_ID,
@@ -1745,6 +1864,7 @@ mod tests {
                 &mut ra,
                 AppMessage::Deliver {
                     src_node_id: [0x33u8; 32],
+                    provenance: SenderProvenance::Claimed,
                     src_app_id: [0u8; 32],
                     app_id: MAILBOX_APP_ID,
                     endpoint_id: MAILBOX_PUT_ENDPOINT_ID,
@@ -1769,6 +1889,7 @@ mod tests {
                 &mut ra,
                 AppMessage::Deliver {
                     src_node_id: [0x33u8; 32],
+                    provenance: SenderProvenance::Claimed,
                     src_app_id: [0u8; 32],
                     app_id: MAILBOX_APP_ID,
                     endpoint_id: MAILBOX_PUT_ENDPOINT_ID,
@@ -1802,6 +1923,7 @@ mod tests {
                 &mut ra,
                 AppMessage::Deliver {
                     src_node_id: [0x33u8; 32],
+                    provenance: SenderProvenance::Claimed,
                     src_app_id: [0u8; 32],
                     app_id: MAILBOX_APP_ID,
                     endpoint_id: MAILBOX_PUT_ENDPOINT_ID,
@@ -1824,6 +1946,7 @@ mod tests {
             &mut ra,
             AppMessage::Deliver {
                 src_node_id: [0x33u8; 32],
+                provenance: SenderProvenance::Claimed,
                 src_app_id: [0u8; 32],
                 app_id: MAILBOX_APP_ID,
                 endpoint_id: MAILBOX_PUT_ENDPOINT_ID,

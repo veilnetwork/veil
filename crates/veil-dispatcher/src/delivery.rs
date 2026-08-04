@@ -1,4 +1,5 @@
 use super::{DispatchResult, FrameDispatcher};
+use veil_app::registry::SenderProvenance;
 use veil_cfg::NodeId;
 use veil_proto::{
     codec::encode_header,
@@ -26,6 +27,47 @@ pub fn rand_seed_for_pick(trace_id: u64) -> u64 {
     x ^= x >> 7;
     x ^= x << 17;
     x
+}
+
+/// Decide what this node actually KNOWS about the `sender_node_id` a frame
+/// claims, at the moment that frame is about to be delivered terminally.
+///
+/// This is THE sender-binding gate for the delivery plane (X/V-01). It lives
+/// here, on the terminal path, because that is where the claim turns into an
+/// identity in front of an application — the relay path never sees the
+/// decision it was previously (and only) making.
+///
+/// The single origin proof the delivery plane has is transport-level: the OVL1
+/// session that handed us this frame is authenticated, so a claimed sender
+/// equal to that session's peer id is the peer speaking for itself. Everything
+/// else is a claim:
+///
+/// * a frame that reached us through one or more relays — the last hop can
+///   write any `sender_node_id` it likes into the envelope;
+/// * a meta-E2E envelope — anonymous BY DESIGN. Its inner sender is encrypted
+///   but not authenticated (ML-KEM seals to our published EK: confidentiality,
+///   never origin), so anyone who knows that EK can name anyone. This path
+///   must keep working; it must simply never be mistaken for an authenticated
+///   one.
+///
+/// Deliberately takes NO `relay_hops`. That field is an ordinary u8 written by
+/// whoever sent the frame — the previous gate ran only `if relay_hops == 0`,
+/// so an attacker skipped the whole check by stamping `relay_hops = 1`. The
+/// decision here rests on the authenticated peer id of the session the frame
+/// arrived on, which the attacker cannot choose.
+pub(crate) fn terminal_sender_provenance(
+    claimed_sender: &[u8; 32],
+    peer_id: NodeId,
+    anonymous: bool,
+) -> SenderProvenance {
+    if anonymous {
+        return SenderProvenance::Claimed;
+    }
+    if claimed_sender == peer_id.as_bytes() {
+        SenderProvenance::SessionPeer
+    } else {
+        SenderProvenance::Claimed
+    }
 }
 
 /// Encode the Forward trailer shared by direct-sovereign, route-cache and
@@ -289,8 +331,12 @@ impl FrameDispatcher {
                     if lock!(self.forward_seen_set).check_and_insert(dedup_key) {
                         return DispatchResult::NoResponse;
                     }
+                    // `src_node_id` here IS the authenticated last hop (see the
+                    // note above — RelayPath carries no originator field), so
+                    // the id handed to the app is exactly the session peer.
                     self.app_registry.route_ipc_deliver(
                         *peer_id.as_bytes(),
+                        SenderProvenance::SessionPeer,
                         send.src_app_id,
                         send.app_id,
                         send.endpoint_id,
@@ -371,8 +417,9 @@ impl FrameDispatcher {
     /// gate a FORWARD frame against all pre-routing invariants.
     ///
     /// Extracted from `relay_forward`. Runs (in order): congestion
-    /// backpressure, sender-identity spoof check (
-    /// with a meta-E2E exception), hop-limit
+    /// backpressure, a self-declared-hop-0 sanity check (defence-in-depth
+    /// only — see the note at that block; the load-bearing sender gate is
+    /// [`terminal_sender_provenance`] on the terminal path), hop-limit,
     /// TTL + clock-skew sanity (overflow-safe via `saturating_add`), and
     /// content-id dedup (zero-id rejected outright).
     ///
@@ -403,9 +450,16 @@ impl FrameDispatcher {
             return Err(DispatchResult::RateLimited);
         }
 
-        // SEC: verify the envelope's sender_node_id matches the authenticated peer
-        // when this peer is the originator. Meta-E2E envelopes
-        // intentionally carry zero outer sender_node_id.
+        // Sanity check on a SELF-DECLARED hop counter, and nothing more.
+        //
+        // `relay_hops` is an ordinary wire byte the sender writes; a peer that
+        // wants to skip this block simply stamps `relay_hops = 1`. So this
+        // catches only a careless liar, and it is NOT what protects the
+        // recipient — that is `terminal_sender_provenance`, on the terminal
+        // path, where the claim actually turns into an identity (X/V-01). Kept
+        // as cheap defence-in-depth: a peer that says "I am the originator"
+        // and then names someone else is provably misbehaving, and a relay is
+        // the right place to say so.
         let is_meta_e2e = payload.envelope.payload.first() == Some(&veil_proto::META_E2E_MARKER);
         if payload.relay_hops == 0 {
             if is_meta_e2e {
@@ -1422,17 +1476,32 @@ impl FrameDispatcher {
             return; // decrypt failed — metric already incremented.
         };
 
-        // Cache reverse route: sender → peer_id (direct hop). ONLY for an
-        // AUTHENTICATED sender. The meta-E2E (anonymous) path carries an inner
-        // sender_node_id that is encrypted but NOT authenticated (ML-KEM gives
-        // confidentiality, not origin proof — anyone who knows our published EK
-        // can claim any sender). Caching it would let such a peer poison the
-        // route cache with a bogus node_id→peer mapping, redirecting our later
-        // traffic for that node_id. (audit cycle-4 M2.)
+        // What do we actually know about the sender we are about to name to the
+        // app? Exactly one thing can make it more than a claim: it is the
+        // authenticated peer of the session this frame arrived on.
         let is_meta_e2e = first_byte == Some(veil_proto::META_E2E_MARKER);
-        if !is_meta_e2e
+        let provenance = terminal_sender_provenance(&deliver_sender_node_id, peer_id, is_meta_e2e);
+
+        // Cache reverse route: sender → peer_id (direct hop). ONLY once the
+        // sender is authenticated.
+        //
+        // The comment that used to sit here claimed this was already the case.
+        // It was not: the whole binding check lived in `check_relay_preconditions`,
+        // which only ever runs on the RELAY path — a Forward addressed to us
+        // goes straight to `deliver_forward_locally` and never touches it. So
+        // any peer could hand us a frame naming any third party and have us
+        // record `third_party → that peer`, redirecting our later traffic for
+        // that node id through it (X/V-01; the meta-E2E half of the reasoning,
+        // audit cycle-4 M2, was sound — it just was not the only anonymous
+        // case). `is_authenticated()` now decides, so the two agree.
+        //
+        // Consequence, deliberately accepted: a relayed frame teaches us
+        // nothing about how to reach its sender. It cannot — nothing in the
+        // frame proves who sent it, and a route learned from an unprovable
+        // claim is a route an attacker chooses. Reverse routing for such
+        // senders falls back to DHT / mailbox discovery.
+        if provenance.is_authenticated()
             && deliver_sender_node_id != self.local_node_id
-            && &deliver_sender_node_id != peer_id.as_bytes()
             && deliver_sender_node_id != [0u8; 32]
         {
             wlock!(self.route_cache).insert(deliver_sender_node_id, *peer_id.as_bytes(), 1_000, 1);
@@ -1440,6 +1509,7 @@ impl FrameDispatcher {
 
         self.app_registry.route_ipc_deliver(
             deliver_sender_node_id,
+            provenance,
             deliver_src_app_id,
             deliver_app_id,
             deliver_endpoint_id,
@@ -1726,8 +1796,18 @@ impl FrameDispatcher {
             if let Ok((envelope, _)) = veil_proto::delivery::DeliveryEnvelope::decode(&tf.payload)
                 && envelope.recipient_node_id() == self.local_node_id
             {
+                // Same gate as the Forward terminal path (X/V-01): a transit
+                // frame is relayed by construction, so its `sender_node_id` is
+                // only ever an identity when the frame came straight from that
+                // sender's own session. Nothing here decrypts or verifies it.
+                let provenance = terminal_sender_provenance(
+                    &envelope.sender_node_id,
+                    peer_id,
+                    envelope.payload.first() == Some(&veil_proto::META_E2E_MARKER),
+                );
                 self.app_registry.route_ipc_deliver(
                     envelope.sender_node_id,
+                    provenance,
                     envelope.src_app_id,
                     envelope.app_id,
                     envelope.endpoint_id,
@@ -1831,8 +1911,18 @@ impl FrameDispatcher {
         // (a) Destination reached — unwrap inner ForwardPayload and deliver.
         if rr.dst_node_id == self.local_node_id {
             if let Ok(fwd) = veil_proto::delivery::ForwardPayload::decode(&rr.payload) {
+                // Same gate as the Forward terminal path (X/V-01). A recursive
+                // relay is DHT-routed through arbitrary intermediates, so the
+                // inner envelope's `sender_node_id` is an identity only in the
+                // degenerate case where the originator handed it to us itself.
+                let provenance = terminal_sender_provenance(
+                    &fwd.envelope.sender_node_id,
+                    peer_id,
+                    fwd.envelope.payload.first() == Some(&veil_proto::META_E2E_MARKER),
+                );
                 self.app_registry.route_ipc_deliver(
                     fwd.envelope.sender_node_id,
+                    provenance,
                     fwd.envelope.src_app_id,
                     fwd.envelope.app_id,
                     fwd.envelope.endpoint_id,
@@ -2538,6 +2628,349 @@ mod tests {
         assert!(
             endpoint_rx.try_recv().is_err(),
             "chunked transfer must deliver exactly once",
+        );
+    }
+
+    // ── X/V-01: sender binding, checked WHERE THE DECISION IS MADE ──────────
+    //
+    // The defect these cover was never a missing predicate — the binding check
+    // existed, in `check_relay_preconditions`. It was that the terminal path
+    // (a Forward addressed to US, i.e. the normal chat path) never calls it,
+    // and that the one gate it did guard keyed off `relay_hops`, a byte the
+    // sender writes. So every assertion below is made on the OUTCOME at the
+    // endpoint: what the app was told about the sender, and what the route
+    // cache learned. A test that only exercised the helper would pass against
+    // the vulnerable build.
+
+    const XV01_RECIPIENT: [u8; 32] = [0xBBu8; 32];
+    const XV01_APP: [u8; 32] = [0xCCu8; 32];
+    const XV01_ENDPOINT: u32 = 0xC0DE;
+
+    /// A dispatcher that IS `XV01_RECIPIENT`, with the destination endpoint
+    /// bound so terminal deliveries land somewhere we can drain.
+    fn xv01_dispatcher() -> (
+        crate::FrameDispatcher,
+        veil_app::registry::EndpointHandle,
+        tokio::sync::mpsc::Receiver<veil_app::registry::AppMessage>,
+    ) {
+        let mut disp = crate::make_test_dispatcher(veil_cfg::NodeRole::Core);
+        disp.local_node_id = XV01_RECIPIENT;
+        let (handle, rx) = disp.app_registry.register(XV01_APP, XV01_ENDPOINT, 16);
+        (disp, handle, rx)
+    }
+
+    /// One terminal `DELIVERY_FORWARD`: an envelope addressed to us that
+    /// CLAIMS `claimed_sender` and stamps itself with `relay_hops`.
+    fn xv01_terminal_frame(
+        claimed_sender: [u8; 32],
+        relay_hops: u8,
+        content_id: [u8; 32],
+        payload: Vec<u8>,
+    ) -> (veil_proto::header::FrameHeader, Vec<u8>) {
+        use veil_proto::delivery::{DeliveryEnvelope, ForwardPayload};
+        use veil_proto::family::{DeliveryMsg, FrameFamily};
+        use veil_proto::header::FrameHeader;
+
+        let envelope = DeliveryEnvelope {
+            recipient: veil_proto::recipient::Recipient::any(XV01_RECIPIENT),
+            sender_node_id: claimed_sender,
+            src_app_id: [0xA1u8; 32],
+            app_id: XV01_APP,
+            endpoint_id: XV01_ENDPOINT,
+            content_id,
+            created_at: veil_util::unix_secs_now_u64(),
+            ttl_secs: 3600,
+            payload,
+            trace_id: 0,
+            require_ack: false,
+        };
+        let body = ForwardPayload {
+            next_hop_node_id: XV01_RECIPIENT,
+            envelope,
+            relay_hops,
+            delivery_attempt: None,
+            traffic_class: None,
+        }
+        .encode();
+        let mut hdr = FrameHeader::new(FrameFamily::Delivery as u8, DeliveryMsg::Forward as u16);
+        hdr.body_len = body.len() as u32;
+        (hdr, body)
+    }
+
+    /// Drain the single `Deliver` a terminal arrival must produce and return
+    /// `(src_node_id, provenance, payload)`.
+    fn xv01_take_delivery(
+        rx: &mut tokio::sync::mpsc::Receiver<veil_app::registry::AppMessage>,
+    ) -> ([u8; 32], veil_app::registry::SenderProvenance, Vec<u8>) {
+        match rx.try_recv() {
+            Ok(veil_app::registry::AppMessage::Deliver {
+                src_node_id,
+                provenance,
+                data,
+                ..
+            }) => (src_node_id, provenance, data.as_ref().to_vec()),
+            other => panic!("expected exactly one Deliver, got {other:?}"),
+        }
+    }
+
+    /// X/V-01, the attack itself: any node on the network hands the victim a
+    /// Forward naming one of the victim's accepted contacts. It must NOT reach
+    /// the app as that contact's authenticated message, and it must NOT teach
+    /// the route cache that the contact lives behind the attacker (which would
+    /// route all of the victim's later traffic for that contact through them).
+    #[test]
+    fn spoofed_terminal_sender_is_not_authenticated_and_teaches_no_route() {
+        use veil_app::registry::SenderProvenance;
+
+        let contact = [0xAAu8; 32]; // a contact the victim already accepted
+        let attacker = [0xEEu8; 32]; // any node; there is no peer allow-list
+
+        let (disp, _handle, mut rx) = xv01_dispatcher();
+        let (hdr, body) = xv01_terminal_frame(contact, 0, [0x71u8; 32], vec![0x01, 0x02, 0x03]);
+        disp.dispatch(&hdr, &body, attacker);
+
+        let (src, provenance, payload) = xv01_take_delivery(&mut rx);
+        assert_eq!(src, contact, "the frame's claim is still what it claimed");
+        assert_eq!(payload, vec![0x01, 0x02, 0x03]);
+        assert_eq!(
+            provenance,
+            SenderProvenance::Claimed,
+            "a sender the frame merely NAMED must reach the app as a claim, \
+             not as an authenticated identity",
+        );
+        assert!(!provenance.is_authenticated());
+
+        assert_eq!(
+            rlock!(disp.route_cache).lookup(&contact),
+            None,
+            "an unauthenticated terminal frame must not teach a route to the \
+             node it names (route-cache poisoning)",
+        );
+    }
+
+    /// X/V-01 part two: `relay_hops` is attacker-chosen wire data. The old gate
+    /// ran only `if relay_hops == 0`, so stamping `1` skipped it entirely. The
+    /// decision must not consult that byte at all — same spoof, same verdict.
+    #[test]
+    fn relay_hops_cannot_launder_a_spoofed_terminal_sender() {
+        use veil_app::registry::SenderProvenance;
+
+        let contact = [0xAAu8; 32];
+        let attacker = [0xEEu8; 32];
+
+        for relay_hops in [1u8, 2, 7] {
+            let (disp, _handle, mut rx) = xv01_dispatcher();
+            let mut content_id = [0x72u8; 32];
+            content_id[0] = relay_hops;
+            let (hdr, body) = xv01_terminal_frame(contact, relay_hops, content_id, vec![0xFF]);
+            disp.dispatch(&hdr, &body, attacker);
+
+            let (src, provenance, _) = xv01_take_delivery(&mut rx);
+            assert_eq!(src, contact);
+            assert_eq!(
+                provenance,
+                SenderProvenance::Claimed,
+                "relay_hops={relay_hops} must not launder a spoofed sender",
+            );
+            assert_eq!(
+                rlock!(disp.route_cache).lookup(&contact),
+                None,
+                "relay_hops={relay_hops} must not unlock route learning either",
+            );
+        }
+    }
+
+    /// The other half: a legitimate sender talking to us over its own session
+    /// must still arrive as an authenticated identity, and must still teach the
+    /// reverse route. Without this, "no message is ever authenticated" would
+    /// pass the two tests above.
+    #[test]
+    fn honest_terminal_delivery_stays_session_authenticated() {
+        use veil_app::registry::SenderProvenance;
+
+        let sender = [0xAAu8; 32];
+
+        let (disp, _handle, mut rx) = xv01_dispatcher();
+        let (hdr, body) = xv01_terminal_frame(sender, 0, [0x73u8; 32], vec![0x09, 0x08]);
+        // The frame arrives over the session with `sender` itself.
+        disp.dispatch(&hdr, &body, sender);
+
+        let (src, provenance, payload) = xv01_take_delivery(&mut rx);
+        assert_eq!(src, sender);
+        assert_eq!(payload, vec![0x09, 0x08]);
+        assert_eq!(
+            provenance,
+            SenderProvenance::SessionPeer,
+            "a sender that IS the authenticated session peer must stay authenticated",
+        );
+        assert!(provenance.is_authenticated());
+        assert_eq!(
+            rlock!(disp.route_cache).lookup(&sender),
+            Some(sender),
+            "an authenticated sender must still teach its reverse route",
+        );
+    }
+
+    /// The anonymous path must keep working — it is anonymous BY DESIGN and
+    /// closing it was explicitly rejected. A meta-E2E envelope carries a zero
+    /// outer sender and its real (unauthenticated) sender inside the
+    /// ciphertext; it must decrypt, deliver the inner sender and payload, and
+    /// be labelled a claim. Guards against "fixing" X/V-01 by demanding
+    /// authentication everywhere, which would break anonymity outright.
+    #[test]
+    fn meta_e2e_terminal_delivery_still_works_and_stays_anonymous() {
+        use veil_app::registry::SenderProvenance;
+
+        let inner_sender = [0xAAu8; 32]; // named inside the ciphertext only
+        let relay = [0xEEu8; 32]; // whoever handed us the frame
+
+        let (mut disp, _handle, mut rx) = xv01_dispatcher();
+
+        // Give the node a real ML-KEM keypair so meta-E2E actually decrypts.
+        let (ek, dk) = veil_e2e::generate_keypair();
+        disp.crypto = std::sync::Arc::new(crate::CryptoContext {
+            mlkem_keys: std::sync::Arc::new(veil_e2e::MlKemSeedRing::new(0, dk, ek)),
+            ..(*disp.crypto).clone()
+        });
+
+        let plaintext = b"anonymous but delivered".to_vec();
+        let sealed = veil_e2e::meta_encrypt(
+            &ek,
+            &inner_sender,
+            &[0xA1u8; 32],
+            &XV01_APP,
+            XV01_ENDPOINT,
+            &XV01_RECIPIENT,
+            &plaintext,
+        )
+        .expect("meta_encrypt");
+
+        // Outer sender is ZERO — the inner one can only come from decryption.
+        let (hdr, body) = xv01_terminal_frame([0u8; 32], 0, [0x74u8; 32], sealed);
+        disp.dispatch(&hdr, &body, relay);
+
+        let (src, provenance, payload) = xv01_take_delivery(&mut rx);
+        assert_eq!(payload, plaintext, "the anonymous path must still deliver");
+        assert_eq!(
+            src, inner_sender,
+            "the inner sender must survive decryption",
+        );
+        assert_eq!(
+            provenance,
+            SenderProvenance::Claimed,
+            "meta-E2E names a sender it cannot prove — always a claim",
+        );
+        assert_eq!(
+            rlock!(disp.route_cache).lookup(&inner_sender),
+            None,
+            "an anonymous sender must not teach a route",
+        );
+    }
+
+    /// The two other terminal entry points reached the app registry with a raw
+    /// `envelope.sender_node_id` and no gate of any kind. A transit frame is
+    /// relayed by construction, so a claim that is not the session peer stays
+    /// a claim there too.
+    #[test]
+    fn transit_terminal_delivery_labels_a_relayed_sender_as_a_claim() {
+        use veil_app::registry::SenderProvenance;
+        use veil_proto::family::{DeliveryMsg, FrameFamily};
+        use veil_proto::header::FrameHeader;
+
+        let contact = [0xAAu8; 32];
+        let attacker = [0xEEu8; 32];
+
+        let (disp, _handle, mut rx) = xv01_dispatcher();
+        let envelope = veil_proto::delivery::DeliveryEnvelope {
+            recipient: veil_proto::recipient::Recipient::any(XV01_RECIPIENT),
+            sender_node_id: contact,
+            src_app_id: [0xA1u8; 32],
+            app_id: XV01_APP,
+            endpoint_id: XV01_ENDPOINT,
+            content_id: [0x75u8; 32],
+            created_at: veil_util::unix_secs_now_u64(),
+            ttl_secs: 3600,
+            payload: vec![0x11, 0x22],
+            trace_id: 0,
+            require_ack: false,
+        };
+        let inner = envelope.encode();
+        let tf = veil_proto::delivery::TransitFramePayload {
+            dst_node_id: XV01_RECIPIENT,
+            src_node_id: contact,
+            ttl: 10,
+            content_hash: veil_proto::delivery::TransitFramePayload::compute_content_hash(&inner),
+            payload: inner,
+        };
+        let body = tf.encode();
+        let hdr = FrameHeader::new(FrameFamily::Delivery as u8, DeliveryMsg::Transit as u16);
+        disp.dispatch(&hdr, &body, attacker);
+
+        let (src, provenance, payload) = xv01_take_delivery(&mut rx);
+        assert_eq!(src, contact);
+        assert_eq!(payload, vec![0x11, 0x22]);
+        assert_eq!(
+            provenance,
+            SenderProvenance::Claimed,
+            "a relayed transit sender must not reach the app as an identity",
+        );
+    }
+
+    /// Same for the DHT-routed recursive relay: it is routed through arbitrary
+    /// intermediates, so its inner `sender_node_id` is a claim unless the
+    /// originator handed the frame to us itself.
+    #[test]
+    fn recursive_relay_terminal_delivery_labels_a_relayed_sender_as_a_claim() {
+        use veil_app::registry::SenderProvenance;
+        use veil_proto::delivery::{DeliveryEnvelope, ForwardPayload, RecursiveRelayPayload};
+        use veil_proto::family::{DeliveryMsg, FrameFamily};
+        use veil_proto::header::FrameHeader;
+
+        let contact = [0xAAu8; 32];
+        let attacker = [0xEEu8; 32];
+
+        let (disp, _handle, mut rx) = xv01_dispatcher();
+        let envelope = DeliveryEnvelope {
+            recipient: veil_proto::recipient::Recipient::any(XV01_RECIPIENT),
+            sender_node_id: contact,
+            src_app_id: [0xA1u8; 32],
+            app_id: XV01_APP,
+            endpoint_id: XV01_ENDPOINT,
+            content_id: [0x76u8; 32],
+            created_at: veil_util::unix_secs_now_u64(),
+            ttl_secs: 3600,
+            payload: vec![0x33, 0x44],
+            trace_id: 0,
+            require_ack: false,
+        };
+        let fwd = ForwardPayload {
+            next_hop_node_id: XV01_RECIPIENT,
+            envelope,
+            relay_hops: 0,
+            delivery_attempt: None,
+            traffic_class: None,
+        };
+        let rr = RecursiveRelayPayload {
+            dst_node_id: XV01_RECIPIENT,
+            originator_pseudonym: RecursiveRelayPayload::make_pseudonym(&contact, 1),
+            query_id: 1,
+            hop_count: 5,
+            payload: fwd.encode(),
+        };
+        let body = rr.encode();
+        let hdr = FrameHeader::new(
+            FrameFamily::Delivery as u8,
+            DeliveryMsg::RecursiveRelay as u16,
+        );
+        disp.dispatch(&hdr, &body, attacker);
+
+        let (src, provenance, payload) = xv01_take_delivery(&mut rx);
+        assert_eq!(src, contact);
+        assert_eq!(payload, vec![0x33, 0x44]);
+        assert_eq!(
+            provenance,
+            SenderProvenance::Claimed,
+            "a DHT-relayed sender must not reach the app as an identity",
         );
     }
 

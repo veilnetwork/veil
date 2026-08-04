@@ -1488,6 +1488,7 @@ async fn full_delivery_channel_drops_frame_and_increments_counter() {
         app_tx
             .send(AppMessage::Deliver {
                 src_node_id: [i; 32],
+                provenance: veil_proto::SenderProvenance::SessionPeer,
                 src_app_id: [0u8; 32],
                 app_id: [0u8; 32],
                 endpoint_id: 1,

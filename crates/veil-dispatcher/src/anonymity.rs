@@ -341,8 +341,13 @@ impl FrameDispatcher {
         };
         let data_len = p.data.len();
         let endpoint_id = p.endpoint_id;
+        // `src_node_id` here is whatever the onion payload wrote — the plain
+        // (unauthenticated) rendezvous kind. Nothing verifies it, by design:
+        // this is the anonymous path. Hand it over labelled as a claim rather
+        // than closing the path (X/V-01).
         let delivered = self.app_registry.route_ipc_deliver(
             p.src_node_id,
+            veil_app::registry::SenderProvenance::Claimed,
             p.src_app_id,
             p.app_id,
             endpoint_id,
@@ -790,8 +795,12 @@ impl FrameDispatcher {
                 };
                 let data_len = app_deliver.data.len();
                 let endpoint_id = app_deliver.endpoint_id;
+                // Plain rendezvous kind — the sender is anonymous by design and
+                // `src_node_id` is an unverified claim (the verified flow is
+                // APP_DELIVER_AUTH, below).
                 let delivered = self.app_registry.route_ipc_deliver(
                     app_deliver.src_node_id,
+                    veil_app::registry::SenderProvenance::Claimed,
                     app_deliver.src_app_id,
                     app_deliver.app_id,
                     endpoint_id,
@@ -1663,6 +1672,7 @@ mod tests {
             endpoint_id,
             data: veil_bufpool::pooled_shared_from_vec(inner_data.clone()),
             reply_id: 0,
+            provenance: veil_proto::SenderProvenance::Claimed,
         };
         // Final-hop payload now starts with a kind tag.
         let mut onion_payload = vec![final_hop_kind::APP_DELIVER];
@@ -2254,6 +2264,7 @@ mod tests {
             endpoint_id,
             data: veil_bufpool::pooled_shared_from_vec(payload.clone()),
             reply_id: 0,
+            provenance: veil_proto::SenderProvenance::Claimed,
         };
         let mut introduce_plain = vec![final_hop_kind::APP_DELIVER];
         introduce_plain.extend_from_slice(&deliver.encode());
@@ -2746,6 +2757,7 @@ mod tests {
             endpoint_id: 7,
             data: veil_bufpool::pooled_shared_from_vec(b"never-arrives".to_vec()),
             reply_id: 0,
+            provenance: veil_proto::SenderProvenance::Claimed,
         };
         let mut onion_payload = vec![final_hop_kind::APP_DELIVER];
         onion_payload.extend_from_slice(&deliver.encode());
