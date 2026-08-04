@@ -1,0 +1,20 @@
+[package]
+name = "veil-ratchet"
+version = "0.4.2"
+edition = "2024"
+description = "Hybrid (X25519 + ML-KEM-768) Double Ratchet and PQXDH key agreement for one-to-one messaging: forward secrecy, post-compromise recovery, deniability (no signatures in the transcript), and asynchronous first contact against pre-published keys."
+license = "AGPL-3.0-or-later"
+
+[dependencies]
+chacha20poly1305 = "0.10"
+hkdf = "0.12"
+ml-kem = { version = "0.3.0-rc.1", features = ["getrandom"] }
+rand_core = { version = "0.6", features = ["getrandom"] }
+sha2 = "0.10"
+subtle = "2"
+thiserror = "2.0"
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+zeroize = "1"
+
+[lints]
+workspace = true

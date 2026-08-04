@@ -37,6 +37,7 @@ members = [
     "crates/veil-pending-ack",
     "crates/veil-pex",
     "crates/veil-proxy",
+    "crates/veil-ratchet",
     "crates/veil-reputation",
     "crates/veil-push",
     "crates/veil-routing",
