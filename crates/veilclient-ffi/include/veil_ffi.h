@@ -83,6 +83,31 @@
 #define VEIL_MAX_DATA_LEN (((16 * 1024) * 1024) - 256)
 
 /**
+ * Nothing corroborates `src_node_id`; it is a CLAIM the frame carried. Never a
+ * basis for an authorization decision. This is the normal, correct level for
+ * the anonymous meta-E2E path and for anything relayed — not a synonym for
+ * "hostile". It is also the value a host MUST substitute for any byte it does
+ * not recognise.
+ */
+#define VEIL_PROVENANCE_CLAIMED 0
+
+/**
+ * The message never left this device; `src_node_id` is our own node id.
+ */
+#define VEIL_PROVENANCE_LOCAL_IPC 1
+
+/**
+ * `src_node_id` is the authenticated session peer that handed us the frame —
+ * the sender speaking for itself, not a name carried through it.
+ */
+#define VEIL_PROVENANCE_SESSION_PEER 2
+
+/**
+ * `src_node_id` is proven by a signature over this very message.
+ */
+#define VEIL_PROVENANCE_SIGNED 3
+
+/**
  * Background-mode tier values [`veil_set_background_mode`].
  * Mirrors `MobileBackgroundMode` on the wire (0/1/2 byte).
  */
@@ -366,25 +391,23 @@
 #define STREAM_ENDPOINT_ID 12
 #endif
 
-#if defined(VEIL_FFI_NODE_EMBEDDED)
 /**
- * First byte of every media cell. Distinct from
+ * First byte of every media cell on the onion transport. Distinct from
  * `veil_onion_stream::wire::PROTO_VER` (= 1), so a media cell is already an
  * invalid stream frame (`Frame::decode` → `None`) and the reliable demux would
  * reject it outright — media and stream coexist on one circuit with zero
  * collision, separated only by this byte.
  */
 #define MEDIA_MAGIC 77
-#endif
 
-#if defined(VEIL_FFI_NODE_EMBEDDED)
 /**
- * First byte of a media cell containing several RTP/RTCP datagrams. Keeping a
- * distinct top-level magic makes old receivers drop the unknown cell instead
- * of passing a batch envelope to WebRTC as if it were RTP.
+ * First byte of a *plaintext* media cell containing several RTP/RTCP
+ * datagrams. It lives INSIDE the seal: a batch envelope is media content, not
+ * routing, so no one on the path may see it, rewrite it, or fan it out.
+ * Distinct from the 0x80..0xBF range that opens a real RTP/RTCP packet, so the
+ * receiver can tell a batch from a lone datagram by this byte alone.
  */
 #define MEDIA_BATCH_MAGIC 66
-#endif
 
 #if defined(VEIL_FFI_NODE_EMBEDDED)
 /**
@@ -503,11 +526,12 @@ typedef struct {
  * without a use-after-free.
  *
  * `provenance` (X/V-01) is what the node KNOWS about `src_node_id`, as one of
- * the `VEIL_PROVENANCE_*` values below. It sits next to `src_node_id` because
- * it is a property OF those 32 bytes, not a separate fact: without it a
- * contact's message and a stranger's frame that merely NAMED that contact
- * arrive identically. Anything the host does not recognise MUST be read as
- * `VEIL_PROVENANCE_CLAIMED` — fail closed, never up.
+ * the [`VEIL_PROVENANCE_*`](VEIL_PROVENANCE_CLAIMED) bytes. It sits next to
+ * `src_node_id` because it is a property OF those 32 bytes, not a separate
+ * fact: without it a contact's message and a stranger's frame that merely
+ * NAMED that contact arrive identically, which is exactly the defect this
+ * parameter closes. Anything the host does not recognise MUST be read as
+ * [`VEIL_PROVENANCE_CLAIMED`] — fail closed, never up.
  *
  * `reply_id` is a by-value scalar (NOT part of the owned buffer — it has no
  * lifetime to manage): non-zero when this message arrived over the
@@ -529,20 +553,6 @@ typedef void (*VeilRecvCb)(void *user,
                            uint64_t reply_id,
                            const uint8_t *data,
                            size_t len);
-
-/**
- * Sender provenance (X/V-01) — what the node knows about a delivery's
- * `src_node_id`. Values match veil's `SenderProvenance` discriminants.
- *
- * `CLAIMED` means nothing corroborates the name: never a basis for an
- * authorization decision, and not a synonym for "hostile" — it is the normal,
- * correct level for the anonymous path. It is also the value a host MUST
- * substitute for any byte it does not recognise.
- */
-#define VEIL_PROVENANCE_CLAIMED 0
-#define VEIL_PROVENANCE_LOCAL_IPC 1
-#define VEIL_PROVENANCE_SESSION_PEER 2
-#define VEIL_PROVENANCE_SIGNED 3
 
 /**
  * Mailbox blob descriptor returned by [`veil_mailbox_fetch_into`].
@@ -707,25 +717,41 @@ int32_t veil_anon_stream_warm_peer(VeilHandle *handle,
  * Open a lossy MEDIA datagram channel to `peer` over the anonymous circuit
  * (reuses the reliable stream's rendezvous/pool and warms the circuit in the
  * background). Per-packet RTP/RTCP then flows native↔native via
- * [`veil_media_send_datagram`] / [`veil_media_set_recv_callback`]. Returns an
+ * [`veil_media_send_datagram`] / [`veil_media_set_recv_callback`], sealed
+ * end-to-end with `tx_key`/`rx_key`: two distinct, non-zero 32-byte
+ * directional call-media keys, required, copied into zeroizing native state
+ * (the caller may wipe its buffers as soon as this returns). Returns an
  * opaque channel id (> 0), or 0 on error.
  */
- uint64_t veil_media_open_channel(VeilHandle *handle, const uint8_t *peer_node_id, char **err_out) ;
+
+uint64_t veil_media_open_channel(VeilHandle *handle,
+                                 const uint8_t *peer_node_id,
+                                 const uint8_t *tx_key,
+                                 const uint8_t *rx_key,
+                                 char **err_out)
+;
 #endif
 
 #if defined(VEIL_FFI_NODE_EMBEDDED)
 /**
  * Open a lossy MEDIA datagram channel to `peer` over a direct app endpoint.
- * Outbound RTP/RTCP is sent from `app` to `(peer_node_id, peer_app_id,
- * peer_endpoint_id)`. Inbound direct media datagrams must be received by the
- * host on the same app endpoint and fed to
+ * Outbound RTP/RTCP is sealed with the required `tx_key`/`rx_key` (see
+ * [`veil_media_open_channel`]) and sent from `app` to `(peer_node_id,
+ * peer_app_id, peer_endpoint_id)`. Inbound direct media datagrams must be
+ * received by the host on the same app endpoint and fed to
  * [`veil_media_dispatch_direct_datagram`].
+ *
+ * The session under a "direct" channel is encrypted hop-to-hop to whatever
+ * node terminates it, which is not the same thing as end-to-end, so this path
+ * seals exactly like the other two.
  */
 
 uint64_t veil_media_open_direct_channel(VeilApp *app,
                                         const uint8_t *peer_node_id,
                                         const uint8_t *peer_app_id,
                                         uint32_t peer_endpoint_id,
+                                        const uint8_t *tx_key,
+                                        const uint8_t *rx_key,
                                         char **err_out)
 ;
 #endif
@@ -733,15 +759,18 @@ uint64_t veil_media_open_direct_channel(VeilApp *app,
 #if defined(VEIL_FFI_NODE_EMBEDDED)
 /**
  * Open a lossy MEDIA channel forced through the ordinary Delivery relay path
- * (no onion circuit). The daemon E2E-encrypts each datagram for `peer`; relay
- * nodes see addressing metadata but never RTP/RTCP bytes. Intended only for
- * direct-identity calls when the preferred P2P route is unavailable.
+ * (no onion circuit), sealed end-to-end with the required `tx_key`/`rx_key`
+ * (see [`veil_media_open_channel`]). Relay nodes see addressing metadata but
+ * never RTP/RTCP bytes. Intended only for direct-identity calls when the
+ * preferred P2P route is unavailable.
  */
 
 uint64_t veil_media_open_relay_channel(VeilApp *app,
                                        const uint8_t *peer_node_id,
                                        const uint8_t *peer_app_id,
                                        uint32_t peer_endpoint_id,
+                                       const uint8_t *tx_key,
+                                       const uint8_t *rx_key,
                                        char **err_out)
 ;
 #endif
@@ -798,10 +827,10 @@ uint64_t veil_media_open_relay_channel(VeilApp *app,
 #if defined(VEIL_FFI_NODE_EMBEDDED)
 /**
  * Select media batching for a direct or relay channel: 0 = off, 1 = legacy
- * audio+video batching, 2 = compact relay audio-only batching. Mode 2 requires
- * call-key sealing to be configured first and is rejected for non-relay
- * channels. The host selects a nonzero mode only after call signaling proves
- * the remote understands the corresponding wire format.
+ * audio+video batching, 2 = compact relay audio-only batching. Mode 2 is
+ * rejected for non-relay channels. This is a WIRE-FORMAT selector, not a
+ * security one — every mode seals identically, and the batch envelope now
+ * travels inside the seal, so a peer on the path cannot see or rewrite it.
  * Returns 0 on success, -1 for an unknown/unsupported channel or mode.
  */
  int veil_media_channel_set_batching(uint64_t chan, int mode) ;
@@ -809,19 +838,10 @@ uint64_t veil_media_open_relay_channel(VeilApp *app,
 
 #if defined(VEIL_FFI_NODE_EMBEDDED)
 /**
- * Configure directional 32-byte call-media keys for a relay channel. Key
- * material is copied immediately into zeroizing native state; the caller may
- * erase/free its buffers as soon as this function returns. This does not turn
- * compact mode on by itself, so setup can complete before the first packet.
- */
- int veil_media_channel_set_e2e_keys(uint64_t chan, const uint8_t *tx_key, const uint8_t *rx_key) ;
-#endif
-
-#if defined(VEIL_FFI_NODE_EMBEDDED)
-/**
  * Feed one direct-P2P media datagram received by the host on the media app
- * endpoint into the shared native media callback registry. The host is
- * responsible for authenticating/filtering the source app id before calling.
+ * endpoint into the shared native media ingress. Whatever the host believes
+ * about the source, the cell is opened with the channel's own key before a
+ * byte of it reaches the engine.
  */
 
 int veil_media_dispatch_direct_datagram(const uint8_t *peer_node_id,
@@ -836,11 +856,22 @@ int veil_media_dispatch_direct_datagram(const uint8_t *peer_node_id,
  * registry, bypassing the host language's event loop entirely.
  *
  * `source_namespace` + `source_name` identify the well-known named app that a
- * remote media sender must use. The authenticated session `src_node_id` is
- * combined with those names to derive the only accepted `src_app_id`; frames
- * from another app on the same peer are silently dropped. This preserves the
- * source-app check previously performed in Dart without copying every RTP
- * packet through the UI isolate.
+ * remote media sender must use. The delivery's `src_node_id` is combined with
+ * those names to derive the only accepted `src_app_id`; frames from another
+ * app on the same peer are silently dropped. This preserves the source-app
+ * check previously performed in Dart without copying every RTP packet through
+ * the UI isolate.
+ *
+ * X/V-01, stated plainly because the sentence above used to call that id "the
+ * authenticated session `src_node_id`" and nothing here checks it: the derived
+ * app id is a function OF `src_node_id`, so anyone who can claim a node id can
+ * also compute its media app id. This demux is not, and never was, a sender
+ * gate. `provenance` is deliberately NOT consulted here either — media
+ * legitimately arrives over anonymous ingress, which is `Claimed` by design, so
+ * refusing it would break calls rather than secure them. What authenticates a
+ * media sender is the per-channel `MediaCipher` seal, which every channel now
+ * has and which [`media::dispatch_inbound_auto`] applies to every cell on every
+ * transport.
  *
  * This function takes exclusive ownership of the app's datagram receiver. It
  * must be called before [`veil_app_set_recv_handler`].
@@ -960,6 +991,32 @@ int veil_anon_stream_write(VeilAnonStreamFfi *stream,
  * Defends against double-free. A NULL / already-freed / garbage / wrong-type
  * token is absent from the generational handle table → safe no-op; the
  * (opaque, non-pointer) token is never dereferenced (see [`HandleTable`]).
+ *
+ * # Callback quiescence (audit V-01)
+ *
+ * On return from a non-reentrant call this function guarantees that the
+ * event trampoline will NEVER be entered again, so the host is free to
+ * deallocate it immediately. Two steps, in this order, are what buy that:
+ *
+ * 1. **Retire the callback slot.** An event the task has already dequeued but
+ *    not yet dispatched reads `None` and drops the event — no call, and no
+ *    orphaned callee-owned payload buffer.
+ * 2. **Abort, then JOIN.** `abort()` alone is a *request*: the recv/event
+ *    loops run whole dispatch sections (slot copy → buffer alloc → C call)
+ *    with no `.await` in them, so a cancellation landing inside such a
+ *    section takes effect only at the NEXT await point — after the callback
+ *    has already run. Awaiting the aborted `JoinHandle` resolves exactly when
+ *    the task has actually stopped, which is the only observation that closes
+ *    the window. The two `await Future.delayed(Duration.zero)` yields the
+ *    Dart wrapper used to paper over this are removed accordingly.
+ *
+ * The join is skipped when called from inside a Tokio runtime — joining a
+ * task of the very runtime driving the caller would deadlock. That path
+ * defers abort+join+drop onto the runtime instead; step 1 has already run
+ * synchronously, so no NEW dispatch can start, but a dispatch already past
+ * the slot copy may still complete after this returns. No supported host
+ * takes that path (Dart runs FFI on its isolate thread, never a tokio
+ * worker); it exists so a misuse degrades instead of deadlocking.
  */
  void veil_close(VeilHandle *handle) ;
 
@@ -1018,6 +1075,13 @@ VeilApp *veil_bind_capability(VeilHandle *handle,
 /**
  * Close an app endpoint. Aborts any active recv loop and releases
  * resources. Safe to call on NULL.
+ *
+ * Same callback-quiescence contract as [`veil_close`] (audit V-01), applied
+ * to the recv trampoline: the `recv_cb` slot is retired first, then the recv
+ * task is aborted AND JOINED, so on return no further recv callback can fire
+ * and no callee-owned `[node_id|app_id|data]` buffer is left unfreed. See
+ * [`veil_close`] for why the join — not the abort — is the part that closes
+ * the window, and for the reentrant-caller fallback.
  */
  void veil_app_close(VeilApp *app) ;
 
@@ -1200,16 +1264,18 @@ VeilStreamFfi *veil_stream_open(VeilApp *app,
  * `veil_stream_read`/`veil_stream_write`/`veil_stream_close`) and writes the
  * initiator's 32-byte node_id into `out_src_node_id` (caller-allocated, 32 B)
  * plus what the node KNOWS about it into `out_provenance` (caller-allocated,
- * 1 B — one of the `VEIL_PROVENANCE_*` values).
+ * 1 B — one of the `VEIL_PROVENANCE_*` values; see [`VeilRecvCb`]).
  * Returns NULL on TIMEOUT with NO error written, so the caller can poll in a
  * loop; returns NULL WITH an error on a fatal condition (app closed / the
  * inbound-stream channel went away). This is the receive-side counterpart to
  * `veil_stream_open` — without it an inbound stream is stranded in the SDK.
  *
  * X/V-01: both of today's open paths authenticate the initiator, so this
- * normally reports `VEIL_PROVENANCE_SESSION_PEER` or
- * `VEIL_PROVENANCE_LOCAL_IPC`. It is reported rather than assumed — a caller
- * that gates on the initiator must read it, not `out_src_node_id` alone.
+ * normally reports `VEIL_PROVENANCE_SESSION_PEER` (a remote `APP_OPEN` over an
+ * authenticated session) or `VEIL_PROVENANCE_LOCAL_IPC` (an opener on this
+ * device). It is reported rather than assumed because "the comment said it was
+ * authenticated" is precisely how the datagram path stayed spoofable: a caller
+ * that gates on the initiator must read this, not `out_src_node_id` alone.
  */
 
 VeilStreamFfi *veil_stream_accept(VeilApp *app,

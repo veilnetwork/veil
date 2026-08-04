@@ -32,6 +32,8 @@ use veil_onion_stream::wire::Frame;
 use veil_onion_stream::{Addr, CellSender, Config, End, OnionStream, StreamMux};
 use veilclient::{AppSender, IncomingMessage};
 
+use crate::media::SealedMediaCell;
+
 /// Emit a one-line diagnostic that NEVER panics. `eprintln!` PANICS if the
 /// underlying stderr write fails — and under `flutter run` the desktop app's
 /// stderr is a pipe that can break, so an `eprintln!` mid-stream panicked and,
@@ -248,12 +250,15 @@ const CIRCUIT_INTRO_PLAINTEXT_LEN: usize = 16 + CIRCUIT_PEER_TAG_LEN + 32;
 const CIRCUIT_INTRO_LEN: usize =
     veil_anonymity::rendezvous::INTRODUCE_OVERHEAD + CIRCUIT_INTRO_PLAINTEXT_LEN;
 /// Maximum batch body that still fits the worst-case protected-intro envelope:
-/// cookie + peer tag + intro marker/seal + media-batch magic + body.
+/// cookie + peer tag + intro marker/seal + MEDIA_MAGIC + the end-to-end seal +
+/// the batch magic that now lives INSIDE that seal + body.
 pub(crate) const MEDIA_BATCH_BODY_MAX: usize = veil_onion_stream::wire::MAX_CELL
     - COOKIE_LEN
     - CIRCUIT_PEER_TAG_LEN
     - 1
     - CIRCUIT_INTRO_LEN
+    - 1
+    - crate::media::MEDIA_SEAL_OVERHEAD
     - 1;
 const CIRCUIT_HOPS: usize = 2;
 // How long a pinned INBOUND circuit may sit idle (no received data) before it is
@@ -1398,25 +1403,23 @@ impl CircuitCells {
     /// Send one lossy MEDIA datagram over the SAME outbound circuit pool as the
     /// reliable stream, bypassing the `Frame`/ARQ/pacing machinery entirely.
     ///
-    /// The payload is prefixed with [`crate::media::MEDIA_MAGIC`] (a byte
+    /// Takes a [`SealedMediaCell`] rather than bytes, and that is the whole
+    /// point: the relay that splices this circuit to the peer's must read the
+    /// cell to route it, so nothing goes down here that the peer's call key did
+    /// not seal. The only prefix added is [`crate::media::MEDIA_MAGIC`] (a byte
     /// distinct from `PROTO_VER`, so the peer's [`spawn_circuit_feed`] peels it
-    /// off before the stream demux). There is no retransmit, no ACK copies, and
-    /// no pacing: on no-route / stale-route / `QueueFull` the datagram is
-    /// silently dropped — the media codec's PLC/FEC absorbs the gap, and a
-    /// late packet is worthless. Reuses the outbound pool + make-before-break
-    /// refill that `circuit_for` already drives.
+    /// off before the stream demux); batching now lives inside the seal.
+    ///
+    /// There is no retransmit, no ACK copies, and no pacing: on no-route /
+    /// stale-route / `QueueFull` the datagram is silently dropped — the media
+    /// codec's PLC/FEC absorbs the gap, and a late packet is worthless. Reuses
+    /// the outbound pool + make-before-break refill that `circuit_for` already
+    /// drives.
     ///
     /// Returns `true` if the cell entered the first-hop TX queue, `false` if it
     /// was dropped.
-    async fn send_datagram(&self, dst_node: [u8; 32], payload: &[u8]) -> bool {
-        self.send_framed_datagram(dst_node, crate::media::MEDIA_MAGIC, payload)
-            .await
-    }
-
-    /// Send one cell containing several RTP/RTCP packets. The caller keeps the
-    /// body below the envelope limit; malformed/oversized batches are dropped.
-    async fn send_datagram_batch(&self, dst_node: [u8; 32], body: &[u8]) -> bool {
-        self.send_framed_datagram(dst_node, crate::media::MEDIA_BATCH_MAGIC, body)
+    async fn send_datagram(&self, dst_node: [u8; 32], sealed: &SealedMediaCell) -> bool {
+        self.send_framed_datagram(dst_node, crate::media::MEDIA_MAGIC, sealed.as_bytes())
             .await
     }
 
@@ -3268,29 +3271,15 @@ impl AnonStreamHub {
         }
     }
 
-    /// Send one lossy media datagram to `peer`. Returns `true` if it entered the
-    /// first-hop TX queue, `false` if dropped (no route yet / stale route /
-    /// `QueueFull` / datagram-fallback backend without a lossy path).
-    pub async fn media_send_datagram(&self, peer: [u8; 32], payload: &[u8]) -> bool {
+    /// Send one sealed media cell to `peer` (several RTP/RTCP packets may ride
+    /// inside it — the caller folds them with `media::media_cell` before
+    /// sealing, so the batch envelope is call content rather than something the
+    /// path can read or rewrite). Returns `true` if it entered the first-hop TX
+    /// queue, `false` if dropped (no route yet / stale route / `QueueFull` /
+    /// datagram-fallback backend without a lossy path).
+    pub async fn media_send_datagram(&self, peer: [u8; 32], sealed: &SealedMediaCell) -> bool {
         if let HubCells::Circuit(c) = self.cells.as_ref() {
-            c.send_datagram(peer, payload).await
-        } else {
-            false
-        }
-    }
-
-    /// Send several media datagrams in one padded circuit cell. This is a
-    /// bandwidth optimization for the onion path: VP8/Opus remain compressed
-    /// once, while per-cell padding and onion overhead are amortized.
-    pub async fn media_send_datagrams(&self, peer: [u8; 32], packets: &[Vec<u8>]) -> bool {
-        if packets.len() == 1 {
-            return self.media_send_datagram(peer, &packets[0]).await;
-        }
-        let Some(body) = crate::media::encode_batch(packets, MEDIA_BATCH_BODY_MAX) else {
-            return false;
-        };
-        if let HubCells::Circuit(c) = self.cells.as_ref() {
-            c.send_datagram_batch(peer, &body).await
+            c.send_datagram(peer, sealed).await
         } else {
             false
         }
@@ -4370,15 +4359,18 @@ fn spawn_circuit_feed(
                 }
                 // Lossy MEDIA datagram? A leading MEDIA_MAGIC (distinct from the
                 // stream `PROTO_VER`) means this cell bypasses the reliable
-                // demux: peel the magic and hand the payload to the media recv
-                // sink, then skip the stream path entirely. Stream and media
-                // coexist on one circuit, cleanly split by this first byte.
-                if framed.get(cell_offset) == Some(&crate::media::MEDIA_MAGIC) {
-                    crate::media::dispatch_inbound(node, &framed[cell_offset + 1..]);
-                    continue;
-                }
-                if framed.get(cell_offset) == Some(&crate::media::MEDIA_BATCH_MAGIC) {
-                    crate::media::dispatch_inbound_batch(node, &framed[cell_offset + 1..]);
+                // demux: hand it to the media ingress, which opens it with the
+                // channel's own key before anything reaches the engine, then
+                // skip the stream path entirely. Stream and media coexist on
+                // one circuit, cleanly split by this first byte.
+                //
+                // `node` above is NOT a proof of who sent this: on the legacy
+                // clear-sender envelope it is simply the first 32 wire bytes,
+                // and the receive cookie is a function of a public node id, so
+                // the splice relay — or anyone who can reach it — can arrive
+                // under any name it likes. That is why the seal, and not this
+                // id, decides what plays.
+                if crate::media::dispatch_onion_cell(node, &framed[cell_offset..]) {
                     continue;
                 }
                 let app = veil_app::address::app_id(&node, STREAM_NAMESPACE, STREAM_NAME);

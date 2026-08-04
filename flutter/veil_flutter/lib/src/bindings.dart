@@ -1874,9 +1874,14 @@ final int Function(
 // drive control + a diagnostic recv counter for the Phase 2 two-node probe.
 // See veil_media_abi.h.
 
-// open_channel(handle, peer_node32*, err) -> chan id (u64; 0 on error).
+// open_channel(handle, peer_node32*, tx_key32*, rx_key32*, err)
+// -> chan id (u64; 0 on error). The directional call-media keys are REQUIRED:
+// every cell on every transport is sealed with them and there is no unsealed
+// mode, so a channel that cannot be keyed does not open.
 final int Function(
   Pointer<VeilHandle>,
+  Pointer<Uint8>,
+  Pointer<Uint8>,
   Pointer<Uint8>,
   Pointer<Pointer<Utf8>>,
 ) veilMediaOpenChannel = nativeLib
@@ -1885,17 +1890,21 @@ final int Function(
             Uint64 Function(
               Pointer<VeilHandle>,
               Pointer<Uint8>,
+              Pointer<Uint8>,
+              Pointer<Uint8>,
               Pointer<Pointer<Utf8>>,
             )>>('veil_media_open_channel')
     .asFunction();
 
-// open_direct_channel(app, peer_node32*, peer_app32*, peer_endpoint, err)
-// -> chan id (u64; 0 on error).
+// open_direct_channel(app, peer_node32*, peer_app32*, peer_endpoint,
+// tx_key32*, rx_key32*, err) -> chan id (u64; 0 on error).
 final int Function(
   Pointer<VeilApp>,
   Pointer<Uint8>,
   Pointer<Uint8>,
   int,
+  Pointer<Uint8>,
+  Pointer<Uint8>,
   Pointer<Pointer<Utf8>>,
 ) veilMediaOpenDirectChannel = nativeLib
     .lookup<
@@ -1905,17 +1914,22 @@ final int Function(
               Pointer<Uint8>,
               Pointer<Uint8>,
               Uint32,
+              Pointer<Uint8>,
+              Pointer<Uint8>,
               Pointer<Pointer<Utf8>>,
             )>>('veil_media_open_direct_channel')
     .asFunction();
 
-// open_relay_channel(app, peer_node32*, peer_app32*, peer_endpoint, err)
-// -> chan id (u64; 0 on error). Uses Delivery relay routing, not onion.
+// open_relay_channel(app, peer_node32*, peer_app32*, peer_endpoint,
+// tx_key32*, rx_key32*, err) -> chan id (u64; 0 on error). Uses Delivery relay
+// routing, not onion.
 final int Function(
   Pointer<VeilApp>,
   Pointer<Uint8>,
   Pointer<Uint8>,
   int,
+  Pointer<Uint8>,
+  Pointer<Uint8>,
   Pointer<Pointer<Utf8>>,
 ) veilMediaOpenRelayChannel = nativeLib
     .lookup<
@@ -1925,6 +1939,8 @@ final int Function(
               Pointer<Uint8>,
               Pointer<Uint8>,
               Uint32,
+              Pointer<Uint8>,
+              Pointer<Uint8>,
               Pointer<Pointer<Utf8>>,
             )>>('veil_media_open_relay_channel')
     .asFunction();
@@ -1977,20 +1993,11 @@ final void Function(int) veilDebugSetPublishPause = nativeLib
 
 // media_channel_set_batching(chan, mode) -> 0 ok / -1 unknown/unsupported.
 // Modes: 0 off, 1 legacy audio+video batch, 2 compact relay audio-only.
+// A wire-format selector only: every mode seals identically.
 final int Function(int, int) veilMediaChannelSetBatching = nativeLib
     .lookup<NativeFunction<Int32 Function(Uint64, Int32)>>(
         'veil_media_channel_set_batching')
     .asFunction();
-
-// media_channel_set_e2e_keys(chan, tx32, rx32) -> 0 ok / -1 invalid/non-relay
-final int Function(int, Pointer<Uint8>, Pointer<Uint8>)
-    veilMediaChannelSetE2eKeys = nativeLib
-        .lookup<
-            NativeFunction<
-                Int32 Function(Uint64, Pointer<Uint8>, Pointer<Uint8>)>>(
-          'veil_media_channel_set_e2e_keys',
-        )
-        .asFunction();
 
 // media_channel_get_stats(chan, out) -> 0 ok / -1 invalid. Direct/onion
 // channels return a zeroed relay snapshot.
