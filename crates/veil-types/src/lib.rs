@@ -117,8 +117,8 @@ pub trait MlKemEkResolver: Send + Sync {
     /// full multi-replica DHT freshness walk. A stale-but-still-valid key can
     /// only make that copy undecryptable; it cannot expose or forge payloads.
     /// Implementations without a local cache keep the conservative miss.
-    fn resolve_ek_cached(&self, _target_node_id: [u8; 32]) -> Option<Vec<u8>> {
-        None
+    fn resolve_ek_cached(&self, target_node_id: [u8; 32]) -> Option<Vec<u8>> {
+        Some(self.resolve_cert_cached(target_node_id)?.mlkem_ek)
     }
 
     /// Reactively fetch + verify the recipient's ML-KEM-768 encapsulation
@@ -129,7 +129,62 @@ pub trait MlKemEkResolver: Send + Sync {
     fn resolve_ek(
         &self,
         target_node_id: [u8; 32],
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<Vec<u8>>> + Send + '_>>;
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<Vec<u8>>> + Send + '_>> {
+        Box::pin(async move { Some(self.resolve_cert(target_node_id).await?.mlkem_ek) })
+    }
+
+    /// The **whole** verified certificate, local records only.
+    ///
+    /// See [`resolve_cert`](Self::resolve_cert). Implementations without a
+    /// local cache keep the conservative miss.
+    fn resolve_cert_cached(&self, _target_node_id: [u8; 32]) -> Option<VerifiedPeerCert> {
+        None
+    }
+
+    /// Reactively fetch + verify the recipient's **whole** certificate.
+    ///
+    /// This, not [`resolve_ek`](Self::resolve_ek), is the primitive: the two
+    /// EK-shaped methods above are derived from it, so there is exactly one
+    /// resolution and verification path and no way for the two to disagree
+    /// about what a peer published.
+    ///
+    /// The EK-only surface was enough while a message was one encapsulation to
+    /// a published key. Key *agreement* needs three more fields that shape
+    /// alone discards: the ratchet Diffie-Hellman key (the one that
+    /// authenticates — an encapsulation key authenticates nobody), the
+    /// instance id (which device of the recipient's, and part of both the
+    /// PQXDH transcript binding and the conversation key), and the node id the
+    /// certificate was actually verified for. Reaching back to unverified wire
+    /// bytes for any of them would undo the verification this returns.
+    fn resolve_cert(
+        &self,
+        target_node_id: [u8; 32],
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<VerifiedPeerCert>> + Send + '_>>;
+}
+
+/// A peer's signature-verified per-device certificate, as far as anything
+/// outside `veil-identity` needs to know it.
+///
+/// The restatement exists because `veil-types` is a Tier-0 leaf crate and
+/// `veil_identity::mlkem_fanout::VerifiedMlkemCert` lives four tiers up; the
+/// resolver implementation converts. Nothing here is a claim — every field was
+/// read out of bytes whose signature chain to the peer's identity document was
+/// checked before this value was constructed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifiedPeerCert {
+    /// The node the certificate was verified for.
+    pub node_id: [u8; 32],
+    /// Which of that node's devices published it.
+    pub instance_id: [u8; 16],
+    /// ML-KEM-768 encapsulation key (1184 bytes). Confidentiality only.
+    pub mlkem_ek: Vec<u8>,
+    /// Rotating device X25519 public key — the half that authenticates.
+    ///
+    /// All-zero means the peer published a certificate without one, which the
+    /// verifier refuses, so a value that reaches here is a usable key.
+    pub ratchet_x25519_pk: [u8; 32],
+    /// Monotonic rotation counter, for choosing between replicas.
+    pub cert_version: u64,
 }
 
 /// Reactively resolve a node's relay X25519 KEM public key by `node_id` over

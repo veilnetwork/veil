@@ -78,7 +78,7 @@ const HKDF_SALT: &[u8] = b"veil.pqxdh.v1.salt";
 const HKDF_INFO: &[u8] = b"veil.pqxdh.v1";
 
 /// `magic(2) ‖ version(1) ‖ ik_a(32) ‖ ek_a(32) ‖ kem_ct(1088)`
-const PROLOGUE_LEN: usize = 2 + 1 + 32 + 32 + ML_KEM_768_CT_LEN;
+pub const PROLOGUE_LEN: usize = 2 + 1 + 32 + 32 + ML_KEM_768_CT_LEN;
 
 /// The initiator's first transmission: the prologue plus the first ratchet
 /// frame, as one opaque blob.
@@ -116,6 +116,19 @@ impl InitialMessage {
     /// unauthenticated, which is precisely the state this work exists to end.
     pub fn initiator_ik(&self) -> &[u8; 32] {
         &self.initiator_ik
+    }
+
+    /// The ratchet frame riding behind the prologue.
+    ///
+    /// Exposed because a prologue has to be *repeatable*. The initiator cannot
+    /// know whether the first transmission arrived until the responder answers,
+    /// and re-running [`initiate`] would derive a second, unrelated root — so
+    /// the caller keeps the first [`PROLOGUE_LEN`] bytes and re-attaches them to
+    /// each later frame until it hears back. [`accept`] does not care which
+    /// frame it is handed: the root comes from the prologue and the ratchet's
+    /// own skipped-key handling covers the gap.
+    pub fn first_frame(&self) -> &[u8] {
+        &self.first_frame
     }
 
     /// Serialize for transmission.

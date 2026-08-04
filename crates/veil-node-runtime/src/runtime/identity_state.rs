@@ -141,6 +141,15 @@ pub struct IdentityState {
     /// deposit time out / `PeerUnresolved`. See [`PeerMlKemCertCache`].
     pub peer_mlkem_certs: Arc<RwLock<PeerMlKemCertCache>>,
 
+    /// `peer → device X25519 key`, taken from that peer's verified certificate.
+    ///
+    /// The ratchet counterpart of `peer_mlkem_keys`, and shared with
+    /// `CryptoContext` for the same reason: the receive path decides whether a
+    /// sender is proven or merely claimed, it runs synchronously inside the
+    /// frame dispatcher, and it cannot walk a DHT to find out. Written only
+    /// where a certificate is actually verified.
+    pub peer_ratchet_keys: Arc<RwLock<veil_e2e::PeerRatchetKeyCache>>,
+
     /// per-session ephemeral ML-KEM DK seeds shared with
     /// `CryptoContext`. Maps `peer_id → dk_seed`; shared with
     /// `FrameDispatcher` for E2E decryption.
@@ -170,6 +179,7 @@ impl IdentityState {
         mlkem_keys: Arc<veil_e2e::MlKemSeedRing>,
         peer_mlkem_keys: Arc<RwLock<PeerMlKemCache>>,
         peer_mlkem_certs: Arc<RwLock<PeerMlKemCertCache>>,
+        peer_ratchet_keys: Arc<RwLock<veil_e2e::PeerRatchetKeyCache>>,
         per_session_mlkem_dk: Arc<
             Mutex<
                 std::collections::HashMap<
@@ -188,6 +198,7 @@ impl IdentityState {
             mlkem_keys,
             peer_mlkem_keys,
             peer_mlkem_certs,
+            peer_ratchet_keys,
             per_session_mlkem_dk,
         }
     }

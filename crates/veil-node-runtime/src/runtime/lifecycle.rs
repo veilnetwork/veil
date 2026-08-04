@@ -487,6 +487,7 @@ impl NodeRuntime {
             promoted_mlkem.unwrap_or_else(|| Arc::clone(&self.identity.mlkem_keys)),
             Arc::clone(&self.identity.peer_mlkem_keys),
             Arc::clone(&self.identity.peer_mlkem_certs),
+            Arc::clone(&self.identity.peer_ratchet_keys),
             Arc::clone(&self.identity.per_session_mlkem_dk),
         ));
         // re-prime global mobile background-mode
