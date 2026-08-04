@@ -405,6 +405,23 @@ impl RatchetStore {
         std::mem::take(&mut g.dirty).into_iter().collect()
     }
 
+    /// Take at most `max` of the conversations waiting to be persisted,
+    /// leaving the rest marked.
+    ///
+    /// The bounded form exists for callers that copy into a fixed buffer — a
+    /// host that asked for the whole set, got more than it could hold, and
+    /// dropped the remainder would have lost the only notice it will get for
+    /// those conversations until they change again.
+    #[must_use]
+    pub fn take_dirty(&self, max: usize) -> Vec<ConversationKey> {
+        let mut g = self.lock();
+        let taken: Vec<_> = g.dirty.iter().take(max).copied().collect();
+        for key in &taken {
+            g.dirty.remove(key);
+        }
+        taken
+    }
+
     /// How many conversations are waiting to be persisted.
     #[must_use]
     pub fn dirty_len(&self) -> usize {
@@ -1422,6 +1439,34 @@ mod tests {
         open(&b.store, &b.me(), &a.node_id, &payload, Some(&a_pk), NOW).expect("open");
         assert_eq!(b.store.version(), 1);
         assert_eq!(b.store.drain_dirty().len(), 1);
+    }
+
+    #[test]
+    fn a_bounded_drain_leaves_what_it_could_not_take() {
+        // A host copying into a fixed buffer must not lose the notice for the
+        // conversations that did not fit — that notice is the only one it gets
+        // until those conversations change again.
+        let a = device(0xC8);
+        let peers: Vec<_> = (0..5u8).map(|i| device(0xD0 + i)).collect();
+        for b in &peers {
+            let (ek, pk) = (b.ek(), b.ratchet_pk());
+            seal(&a.store, &a.me(), keys(b, &ek, &pk), b"x").expect("seal");
+        }
+        assert_eq!(a.store.dirty_len(), 5);
+
+        let first = a.store.take_dirty(2);
+        assert_eq!(first.len(), 2);
+        assert_eq!(a.store.dirty_len(), 3);
+        let rest = a.store.take_dirty(99);
+        assert_eq!(rest.len(), 3);
+        assert_eq!(a.store.dirty_len(), 0);
+        assert!(a.store.take_dirty(99).is_empty());
+
+        // Every conversation was named exactly once across the two calls.
+        let mut all: Vec<_> = first.into_iter().chain(rest).collect();
+        all.sort();
+        all.dedup();
+        assert_eq!(all.len(), 5);
     }
 
     #[test]

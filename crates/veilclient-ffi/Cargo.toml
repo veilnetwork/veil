@@ -36,7 +36,13 @@ packet-tunnel = ["dep:tun2proxy", "dep:tun", "dep:serde", "dep:serde_json"]
 # veil-node-runtime with NO default features (in-memory DHT) to keep the heavy
 # C++ RocksDB cold store off mobile. Add `node-embedded-rocksdb` for a
 # persistent DHT on desktop/server.
-node-embedded = ["dep:veil-node-runtime", "dep:veil-cfg", "dep:veil-util", "dep:tempfile"]
+node-embedded = [
+    "dep:veil-node-runtime",
+    "dep:veil-cfg",
+    "dep:veil-util",
+    "dep:veil-e2e",
+    "dep:tempfile",
+]
 node-embedded-rocksdb = ["node-embedded", "veil-node-runtime/rocksdb-cold"]
 
 [dependencies]
@@ -52,6 +58,9 @@ veil-session = { path = "../veil-session" }
 veil-node-runtime = { path = "../veil-node-runtime", default-features = false, optional = true }
 veil-cfg = { path = "../veil-cfg", optional = true }
 veil-util = { path = "../veil-util", optional = true }
+# Ratchet conversation state — the half of a one-to-one conversation veil
+# cannot keep, exported here so the host can put it in the hidden volume.
+veil-e2e = { path = "../veil-e2e", optional = true }
 # Audit L-15: wrap the in-flight password copy in `Zeroizing` so the
 # `_zeroize_with_password` restore path scrubs every copy on drop.
 zeroize = "1"

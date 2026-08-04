@@ -11037,6 +11037,419 @@ mod tests {
     }
 }
 
+// ── Ratchet state: the half of the conversation veil does not keep ──────────
+//
+// A one-to-one conversation is a Double Ratchet, and a Double Ratchet is
+// state: chain keys that advance one way, message keys banked for frames that
+// arrived out of order, an outstanding key encapsulation. None of it can be
+// rebuilt from anything public — that is the point of forward secrecy — and
+// none of it can be kept by veil, whose only database belongs to the mailbox
+// and is reachable from neither the send path nor the frame dispatcher.
+//
+// So the host keeps it, and in this project the host is xVeil and the store is
+// the hidden volume. That makes durability a contract with a silent failure
+// mode: a write the host skips is a message key nobody has, and the message
+// that needed it never opens and never says why. Hence the shape of this API —
+// a version that advances on every committed operation, and a list that names
+// exactly which conversations changed. The host writes what the list names
+// before it treats a send or a receive as done.
+//
+// The addressing is [`VEIL_RATCHET_KEY_LEN`] bytes:
+// `local_instance_id(16) ‖ peer_node_id(32) ‖ peer_instance_id(16)`. Flat and
+// reversible on purpose: a host removing a device or forgetting a contact
+// decides what to drop by reading the key, with no side table mapping opaque
+// digests back to peers. Nothing in it is secret — all three identifiers
+// already travel on the wire.
+
+/// Byte length of a conversation key.
+#[cfg(feature = "node-embedded")]
+pub const VEIL_RATCHET_KEY_LEN: size_t = 64;
+
+/// Upper bound on one conversation's exported state.
+///
+/// An established session is about 1.4 kB; the rest is the skipped-message-key
+/// cache, at 68 bytes per key banked for a frame that has not arrived yet, and
+/// the ratchet caps that. A host sizing a buffer to this never sees a short
+/// write.
+#[cfg(feature = "node-embedded")]
+pub const VEIL_RATCHET_MAX_STATE_LEN: size_t = 256 * 1024;
+
+/// Returned when a conversation key names nothing this node holds.
+#[cfg(feature = "node-embedded")]
+pub const VEIL_ERR_RATCHET_NO_CONVERSATION: c_int = -20;
+
+/// Returned when the caller's buffer is too small for the conversation's state.
+/// Nothing was written and nothing was consumed; retry with a larger buffer.
+#[cfg(feature = "node-embedded")]
+pub const VEIL_ERR_RATCHET_BUFFER_TOO_SMALL: c_int = -21;
+
+#[cfg(feature = "node-embedded")]
+fn ratchet_for_bundle(bundle: &Arc<RuntimeBundle>) -> Result<veil_e2e::RatchetRuntime, String> {
+    let services = embedded_services_for_bundle(bundle)?;
+    services
+        .dispatcher
+        .crypto
+        .ratchet
+        .clone()
+        .ok_or_else(|| "this node runs no ratchet".to_string())
+}
+
+/// Read a caller-supplied conversation key.
+#[cfg(feature = "node-embedded")]
+unsafe fn ratchet_key_from(key_64: *const u8) -> veil_e2e::ConversationKey {
+    let mut raw = [0u8; 64];
+    unsafe { ptr::copy_nonoverlapping(key_64, raw.as_mut_ptr(), 64) };
+    veil_e2e::ConversationKey::from_storage_key(&raw)
+}
+
+/// Write conversation keys into `out_buf`, returning how many were written.
+#[cfg(feature = "node-embedded")]
+unsafe fn write_conversation_keys(
+    keys: &[veil_e2e::ConversationKey],
+    out_buf: *mut u8,
+    out_buf_cap: size_t,
+) -> size_t {
+    let room = out_buf_cap / VEIL_RATCHET_KEY_LEN;
+    let n = room.min(keys.len());
+    for (i, key) in keys.iter().take(n).enumerate() {
+        let bytes = key.storage_key();
+        unsafe {
+            ptr::copy_nonoverlapping(bytes.as_ptr(), out_buf.add(i * VEIL_RATCHET_KEY_LEN), 64);
+        }
+    }
+    n
+}
+
+/// How many ratchet operations this node has committed since it started.
+///
+/// Monotonic, never reset, and moved only by work that actually completed — a
+/// forged frame that failed its tag moves nothing. A host that samples this
+/// can tell "no conversation changed" from "one changed and I read it twice",
+/// which a dirty list alone cannot say.
+///
+/// # Safety
+///
+/// `handle` must be a live handle. `out_version` MUST be writable.
+#[unsafe(no_mangle)]
+#[cfg(feature = "node-embedded")]
+pub unsafe extern "C" fn veil_ratchet_state_version(
+    handle: *mut VeilHandle,
+    out_version: *mut u64,
+    err_out: *mut *mut c_char,
+) -> c_int {
+    if let Err(rc) = unsafe { guard::ffi_prelude(err_out, "veil_ratchet_state_version") } {
+        return rc;
+    }
+    null_check!(err_out, "handle" => handle, "out_version" => out_version);
+    get_or_return!(
+        handle_live,
+        handle_table(),
+        handle,
+        err_out,
+        VEIL_ERR_INVALID_ARG,
+        "VeilHandle"
+    );
+    match ratchet_for_bundle(&handle_live.bundle) {
+        Ok(ratchet) => {
+            unsafe { *out_version = ratchet.store.version() };
+            VEIL_OK
+        }
+        Err(e) => {
+            unsafe { write_err(err_out, e) };
+            VEIL_ERR
+        }
+    }
+}
+
+/// Take up to `out_buf_cap / VEIL_RATCHET_KEY_LEN` conversations that have
+/// changed since the last call, and clear their marks.
+///
+/// `*out_written` receives how many keys were written; `*out_remaining`
+/// receives how many are still waiting, so a host with a small buffer loops
+/// until it reads zero. Whatever did not fit stays marked — losing the notice
+/// for a conversation would mean losing its keys the next time the process
+/// stops.
+///
+/// The host's contract: export and persist each of these BEFORE it treats the
+/// send or receive that produced them as complete.
+///
+/// # Safety
+///
+/// `handle` must be live. `out_buf` MUST be writable for `out_buf_cap` bytes.
+/// `out_written` and `out_remaining` MUST be writable.
+#[unsafe(no_mangle)]
+#[cfg(feature = "node-embedded")]
+pub unsafe extern "C" fn veil_ratchet_take_dirty(
+    handle: *mut VeilHandle,
+    out_buf: *mut u8,
+    out_buf_cap: size_t,
+    out_written: *mut size_t,
+    out_remaining: *mut size_t,
+    err_out: *mut *mut c_char,
+) -> c_int {
+    if let Err(rc) = unsafe { guard::ffi_prelude(err_out, "veil_ratchet_take_dirty") } {
+        return rc;
+    }
+    null_check!(err_out,
+        "handle" => handle,
+        "out_buf" => out_buf,
+        "out_written" => out_written,
+        "out_remaining" => out_remaining,
+    );
+    get_or_return!(
+        handle_live,
+        handle_table(),
+        handle,
+        err_out,
+        VEIL_ERR_INVALID_ARG,
+        "VeilHandle"
+    );
+    let ratchet = match ratchet_for_bundle(&handle_live.bundle) {
+        Ok(r) => r,
+        Err(e) => {
+            unsafe { write_err(err_out, e) };
+            return VEIL_ERR;
+        }
+    };
+    // Bounded, so a buffer that cannot hold everything leaves the remainder
+    // marked rather than dropping it on the floor.
+    let taken = ratchet.store.take_dirty(out_buf_cap / VEIL_RATCHET_KEY_LEN);
+    let written = unsafe { write_conversation_keys(&taken, out_buf, out_buf_cap) };
+    unsafe {
+        *out_written = written;
+        *out_remaining = ratchet.store.dirty_len();
+    }
+    VEIL_OK
+}
+
+/// List the conversations this node holds, for a full save at shutdown.
+///
+/// `*out_total` receives the TOTAL number held, which may exceed what fit in
+/// `out_buf`; nothing is consumed, so a host may call this as often as it
+/// likes.
+///
+/// # Safety
+///
+/// `handle` must be live. `out_buf` MUST be writable for `out_buf_cap` bytes.
+/// `out_total` MUST be writable.
+#[unsafe(no_mangle)]
+#[cfg(feature = "node-embedded")]
+pub unsafe extern "C" fn veil_ratchet_list(
+    handle: *mut VeilHandle,
+    out_buf: *mut u8,
+    out_buf_cap: size_t,
+    out_total: *mut size_t,
+    err_out: *mut *mut c_char,
+) -> c_int {
+    if let Err(rc) = unsafe { guard::ffi_prelude(err_out, "veil_ratchet_list") } {
+        return rc;
+    }
+    null_check!(err_out,
+        "handle" => handle,
+        "out_buf" => out_buf,
+        "out_total" => out_total,
+    );
+    get_or_return!(
+        handle_live,
+        handle_table(),
+        handle,
+        err_out,
+        VEIL_ERR_INVALID_ARG,
+        "VeilHandle"
+    );
+    let ratchet = match ratchet_for_bundle(&handle_live.bundle) {
+        Ok(r) => r,
+        Err(e) => {
+            unsafe { write_err(err_out, e) };
+            return VEIL_ERR;
+        }
+    };
+    let keys = ratchet.store.keys();
+    let _ = unsafe { write_conversation_keys(&keys, out_buf, out_buf_cap) };
+    unsafe { *out_total = keys.len() };
+    VEIL_OK
+}
+
+/// Export one conversation's whole state.
+///
+/// EVERY BYTE IS KEY MATERIAL. The host must store it encrypted and must not
+/// log, copy to temporary files, or transmit it. In this project that store is
+/// the hidden volume.
+///
+/// Returns [`VEIL_ERR_RATCHET_NO_CONVERSATION`] when the key names nothing
+/// held, and [`VEIL_ERR_RATCHET_BUFFER_TOO_SMALL`] when the buffer cannot take
+/// the state — in which case `*out_len` receives the length required and
+/// nothing was written or consumed.
+///
+/// # Safety
+///
+/// `handle` must be live. `key_64` MUST point to exactly
+/// [`VEIL_RATCHET_KEY_LEN`] readable bytes. `out_buf` MUST be writable for
+/// `out_buf_cap` bytes. `out_len` MUST be writable.
+#[unsafe(no_mangle)]
+#[cfg(feature = "node-embedded")]
+pub unsafe extern "C" fn veil_ratchet_export(
+    handle: *mut VeilHandle,
+    key_64: *const u8,
+    out_buf: *mut u8,
+    out_buf_cap: size_t,
+    out_len: *mut size_t,
+    err_out: *mut *mut c_char,
+) -> c_int {
+    if let Err(rc) = unsafe { guard::ffi_prelude(err_out, "veil_ratchet_export") } {
+        return rc;
+    }
+    null_check!(err_out,
+        "handle" => handle,
+        "key_64" => key_64,
+        "out_buf" => out_buf,
+        "out_len" => out_len,
+    );
+    get_or_return!(
+        handle_live,
+        handle_table(),
+        handle,
+        err_out,
+        VEIL_ERR_INVALID_ARG,
+        "VeilHandle"
+    );
+    let ratchet = match ratchet_for_bundle(&handle_live.bundle) {
+        Ok(r) => r,
+        Err(e) => {
+            unsafe { write_err(err_out, e) };
+            return VEIL_ERR;
+        }
+    };
+    let key = unsafe { ratchet_key_from(key_64) };
+    let Some(blob) = ratchet.store.export(&key) else {
+        unsafe { write_err(err_out, "no conversation under that key") };
+        return VEIL_ERR_RATCHET_NO_CONVERSATION;
+    };
+    unsafe { *out_len = blob.len() };
+    if out_buf_cap < blob.len() {
+        unsafe {
+            write_err(
+                err_out,
+                format!("out_buf_cap {out_buf_cap} < required {}", blob.len()),
+            );
+        }
+        return VEIL_ERR_RATCHET_BUFFER_TOO_SMALL;
+    }
+    unsafe { ptr::copy_nonoverlapping(blob.as_ptr(), out_buf, blob.len()) };
+    VEIL_OK
+}
+
+/// Restore one conversation from bytes [`veil_ratchet_export`] produced.
+///
+/// Called for every stored conversation at startup, BEFORE traffic flows: a
+/// frame that arrives for a conversation not yet restored cannot be opened,
+/// and — unlike a lost network packet — the sender has already advanced its
+/// chain, so nothing will re-send it in a form this node can read.
+///
+/// Replaces whatever is held under that key. Rejects a blob it does not fully
+/// understand rather than salvaging part of one: a partially-understood
+/// session is a session with the wrong keys.
+///
+/// # Safety
+///
+/// `handle` must be live. `key_64` MUST point to exactly
+/// [`VEIL_RATCHET_KEY_LEN`] readable bytes. `blob` MUST point to `blob_len`
+/// readable bytes.
+#[unsafe(no_mangle)]
+#[cfg(feature = "node-embedded")]
+pub unsafe extern "C" fn veil_ratchet_import(
+    handle: *mut VeilHandle,
+    key_64: *const u8,
+    blob: *const u8,
+    blob_len: size_t,
+    err_out: *mut *mut c_char,
+) -> c_int {
+    if let Err(rc) = unsafe { guard::ffi_prelude(err_out, "veil_ratchet_import") } {
+        return rc;
+    }
+    null_check!(err_out,
+        "handle" => handle,
+        "key_64" => key_64,
+        "blob" => blob,
+    );
+    if blob_len == 0 || blob_len > VEIL_RATCHET_MAX_STATE_LEN {
+        unsafe { write_err(err_out, format!("implausible state length {blob_len}")) };
+        return VEIL_ERR_INVALID_ARG;
+    }
+    get_or_return!(
+        handle_live,
+        handle_table(),
+        handle,
+        err_out,
+        VEIL_ERR_INVALID_ARG,
+        "VeilHandle"
+    );
+    let ratchet = match ratchet_for_bundle(&handle_live.bundle) {
+        Ok(r) => r,
+        Err(e) => {
+            unsafe { write_err(err_out, e) };
+            return VEIL_ERR;
+        }
+    };
+    let key = unsafe { ratchet_key_from(key_64) };
+    let bytes = unsafe { std::slice::from_raw_parts(blob, blob_len) };
+    match ratchet.store.import(&key, bytes) {
+        Ok(()) => VEIL_OK,
+        Err(e) => {
+            unsafe { write_err(err_out, format!("ratchet state rejected: {e}")) };
+            VEIL_ERR_INVALID_ARG
+        }
+    }
+}
+
+/// Drop one conversation.
+///
+/// Irreversible: nothing public can rebuild the chain, so every message the
+/// peer has already sealed to it is unreadable from here on. For when the host
+/// deletes a chat or removes a device — not for eviction, which would cost
+/// every message that peer sends afterwards.
+///
+/// Returns [`VEIL_ERR_RATCHET_NO_CONVERSATION`] if nothing was held.
+///
+/// # Safety
+///
+/// `handle` must be live. `key_64` MUST point to exactly
+/// [`VEIL_RATCHET_KEY_LEN`] readable bytes.
+#[unsafe(no_mangle)]
+#[cfg(feature = "node-embedded")]
+pub unsafe extern "C" fn veil_ratchet_forget(
+    handle: *mut VeilHandle,
+    key_64: *const u8,
+    err_out: *mut *mut c_char,
+) -> c_int {
+    if let Err(rc) = unsafe { guard::ffi_prelude(err_out, "veil_ratchet_forget") } {
+        return rc;
+    }
+    null_check!(err_out, "handle" => handle, "key_64" => key_64);
+    get_or_return!(
+        handle_live,
+        handle_table(),
+        handle,
+        err_out,
+        VEIL_ERR_INVALID_ARG,
+        "VeilHandle"
+    );
+    let ratchet = match ratchet_for_bundle(&handle_live.bundle) {
+        Ok(r) => r,
+        Err(e) => {
+            unsafe { write_err(err_out, e) };
+            return VEIL_ERR;
+        }
+    };
+    let key = unsafe { ratchet_key_from(key_64) };
+    if ratchet.store.forget(&key) {
+        VEIL_OK
+    } else {
+        unsafe { write_err(err_out, "no conversation under that key") };
+        VEIL_ERR_RATCHET_NO_CONVERSATION
+    }
+}
+
 /// Audit V-01: closing the native side must leave the host's callback
 /// trampolines provably unreachable *before* it returns, because the host
 /// deallocates them on the very next line.
