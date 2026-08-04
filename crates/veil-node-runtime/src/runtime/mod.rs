@@ -1713,6 +1713,7 @@ impl NodeRuntime {
             let cert_valid_until = cert_valid_from + 30 * 86_400;
             match sov.sign_mlkem_cert(
                 mlkem_keys.current_ek().to_vec(),
+                mlkem_keys.current_ratchet_pk(),
                 cert_valid_from,
                 cert_valid_until,
                 1,

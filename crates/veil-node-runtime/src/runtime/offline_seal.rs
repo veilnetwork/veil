@@ -56,11 +56,18 @@ fn local_verified_cert(
 ) -> Result<VerifiedMlkemCert, OfflineSealError> {
     let (ek, _) = veil_e2e::keypair_from_dk_seed(dk_seed)
         .map_err(|error| OfflineSealError::LocalKey(error.to_string()))?;
+    // Our own certificate, rebuilt locally rather than fetched. The ratchet
+    // key comes from the same seed by the same derivation the ring publishes,
+    // so a self-addressed seal and a peer-addressed one agree.
+    let ratchet_sk = veil_crypto::identity::derive_ratchet_x25519_sk(dk_seed);
+    let ratchet_x25519_pubkey =
+        *x25519_dalek::PublicKey::from(&x25519_dalek::StaticSecret::from(*ratchet_sk)).as_bytes();
     Ok(VerifiedMlkemCert {
         node_id,
         instance_id,
         mlkem_algo: veil_proto::prekey_bundle::ALGO_ML_KEM_768,
         mlkem_pubkey: ek.to_vec(),
+        ratchet_x25519_pubkey,
         cert_version: LOCAL_MLKEM_CERT_VERSION,
     })
 }

@@ -94,6 +94,11 @@ pub enum PublishError {
     },
     #[error("name normalization: {0}")]
     NameNormalization(#[from] veil_proto::name_claim_v2::NameError),
+    #[error(
+        "ratchet_x25519_pubkey is the all-zero low-order point — a certificate \
+         carrying it authenticates nobody"
+    )]
+    RatchetKeyNotContributory,
 }
 
 // ── InstanceRegistry ─────────────────────────────────────────────────────────
@@ -234,6 +239,7 @@ pub fn sign_mlkem_cert(
     node_id: [u8; 32],
     instance_id: [u8; 16],
     mlkem_pubkey: Vec<u8>,
+    ratchet_x25519_pubkey: [u8; 32],
     valid_from_unix: u64,
     valid_until_unix: u64,
     cert_version: u64,
@@ -261,11 +267,20 @@ pub fn sign_mlkem_cert(
         });
     }
 
+    // The all-zero point makes every Diffie-Hellman against it output a
+    // constant, so a certificate carrying one authenticates nobody. Refuse it
+    // at the signing side too: the decoder rejects it, but a node should not
+    // be able to publish a certificate its own peers will throw away.
+    if ratchet_x25519_pubkey == [0u8; 32] {
+        return Err(PublishError::RatchetKeyNotContributory);
+    }
+
     let mut cert = MlKemKeyCert {
         node_id,
         instance_id,
         mlkem_algo: ALGO_ML_KEM_768,
         mlkem_pubkey,
+        ratchet_x25519_pubkey,
         valid_from_unix,
         valid_until_unix,
         cert_version,
@@ -830,6 +845,7 @@ mod tests {
             out.node_id,
             out.instance.instance_id,
             ek,
+            [0x5A; 32],
             1_700_000_000 - 60,
             1_700_000_000 + 30 * 86_400,
             1,
@@ -851,6 +867,7 @@ mod tests {
             out.node_id,
             out.instance.instance_id,
             ek,
+            [0x5A; 32],
             0,
             1_700_000_000,
             1,
@@ -873,6 +890,7 @@ mod tests {
             out.node_id,
             out.instance.instance_id,
             ek,
+            [0x5A; 32],
             2_000_000_000,
             1_900_000_000, // earlier than valid_from
             1,
@@ -1000,6 +1018,7 @@ mod tests {
             out.node_id,
             out.instance.instance_id,
             ek,
+            [0x5A; 32],
             now_unix_secs - 60,
             now_unix_secs + 30 * 86_400,
             1,
@@ -1116,6 +1135,7 @@ mod tests {
             out.node_id,
             out.instance.instance_id,
             ek2,
+            [0x5A; 32],
             now - 60,
             now + 30 * 86_400,
             2,

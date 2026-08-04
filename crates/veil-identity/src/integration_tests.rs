@@ -164,6 +164,7 @@ fn build_test_identity(seed_byte: u8, n_instances: usize) -> TestIdentity {
             instance_id: *instance_id,
             mlkem_algo: ALGO_ML_KEM_768,
             mlkem_pubkey: ek.clone(),
+            ratchet_x25519_pubkey: [0x5A; 32],
             valid_from_unix: now() - 60,
             valid_until_unix: now() + 30 * 86_400,
             cert_version: 1,

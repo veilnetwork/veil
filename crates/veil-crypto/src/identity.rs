@@ -195,6 +195,62 @@ pub fn derive_mlkem_dk_seed_epoch(identity_sk_seed: &[u8; 32], epoch: u64) -> Ze
     out
 }
 
+/// Info string for the device's **ratchet X25519 secret**. See
+/// [`derive_ratchet_x25519_sk`].
+///
+/// Deliberately distinct from [`ANONYMITY_X25519_DERIVATION_INFO`]: the
+/// anonymity key is what peers seal rendezvous introductions to, and the two
+/// must never coincide. Sharing a key between an unauthenticated relay-plane
+/// operation and the authenticating leg of a key agreement would let anyone
+/// who can get us to run the former contribute to the latter.
+pub const RATCHET_X25519_DERIVATION_INFO: &[u8] = b"veil/device-ratchet-x25519/v1";
+
+/// Derive the device's **ratchet X25519 secret** from its ML-KEM mailbox seed.
+///
+/// ```text
+/// salt = None
+/// ikm  = mlkem_dk_seed (64 B, the seed for this rotation epoch)
+/// info = "veil/device-ratchet-x25519/v1"
+/// okm  = 32 B → x25519_dalek::StaticSecret::from
+/// ```
+///
+/// Why this exists: one-to-one key agreement needs something the initiator can
+/// prove possession of without an interactive challenge and without a
+/// signature — a Diffie-Hellman key. Until now a device published only an
+/// ML-KEM encapsulation key, and *anyone* can encapsulate to one of those, so
+/// the store-and-forward path could not authenticate a sender at all.
+///
+/// Why it does not add an identifier: the public half rides in the device's
+/// **existing** signed ML-KEM certificate, at the same DHT slot, republished
+/// on the same schedule. No new record, no new name; the device is exactly as
+/// identifiable as it was.
+///
+/// Why the input is the mailbox seed rather than the identity seed directly:
+/// the mailbox seed is already `derive_mlkem_dk_seed_epoch(identity_seed,
+/// epoch)`, so this is still a one-way function of the device secret — but
+/// chaining it means the two published halves of the certificate rotate in
+/// exact lockstep **by construction** instead of by two call sites agreeing on
+/// an epoch. The seed ring's overlap window then covers the ratchet key for
+/// free, which is the difference between a peer holding a slightly-stale
+/// certificate completing the key agreement and silently failing it.
+///
+/// The coupling this accepts, stated plainly: whoever holds the mailbox seed
+/// for an epoch also holds the ratchet secret for that epoch. Both are device
+/// secrets for the same epoch, live in the same process for the same
+/// lifetime, and are derived from the same `device_identity_sk.bin`, so the
+/// coupling adds no reachable state an attacker did not already have.
+///
+/// Anonymity: unchanged. HKDF never reveals the seed, and per-identity
+/// isolation is automatic because master and each decoy load their own
+/// `device_identity_sk.bin` and so derive distinct mailbox seeds.
+pub fn derive_ratchet_x25519_sk(mlkem_dk_seed: &[u8; 64]) -> Zeroizing<[u8; 32]> {
+    let hk = Hkdf::<Sha256>::new(None, mlkem_dk_seed);
+    let mut out = Zeroizing::new([0u8; 32]);
+    hk.expand(RATCHET_X25519_DERIVATION_INFO, out.as_mut())
+        .expect("32 bytes < 255 * hash_len");
+    out
+}
+
 /// Info string for an onion service's rendezvous auth-cookie. The current
 /// blinded-descriptor period (`now / PERIOD_SECS`, 8 LE bytes) is appended to
 /// this constant before expansion. See [`derive_onion_auth_cookie`].
@@ -521,6 +577,78 @@ mod tests {
         let mlkem = derive_mlkem_dk_seed(&seed);
         let anon = derive_anonymity_x25519_sk(&seed);
         assert_ne!(mlkem[..32], *anon);
+    }
+
+    #[test]
+    fn ratchet_x25519_is_stable_within_an_epoch_and_rotates_across_them() {
+        // Stability is what makes the key publishable at all: the certificate
+        // carries the public half, and a peer holding a slightly-stale copy
+        // must still complete the key agreement. Rotation is what bounds the
+        // damage when the device secret leaks, since a first message to a
+        // device is only as forward-secret as that key.
+        let seed = [0x42u8; 32];
+        let e5 = derive_mlkem_dk_seed_epoch(&seed, 5);
+        assert_eq!(
+            *derive_ratchet_x25519_sk(&e5),
+            *derive_ratchet_x25519_sk(&e5),
+            "the same epoch must re-derive the same key after a restart"
+        );
+
+        let mut seen = std::collections::HashSet::new();
+        for epoch in 0..8u64 {
+            let mailbox = derive_mlkem_dk_seed_epoch(&seed, epoch);
+            let k = derive_ratchet_x25519_sk(&mailbox);
+            assert!(seen.insert(*k), "epoch {epoch} reused an earlier key");
+            assert_ne!(*k, [0u8; 32]);
+        }
+    }
+
+    #[test]
+    fn ratchet_x25519_is_per_identity() {
+        // Master and each decoy load their own device_identity_sk.bin, so the
+        // ratchet key must not be shared between them — otherwise a decoy and
+        // its master would authenticate as one another.
+        assert_ne!(
+            *derive_ratchet_x25519_sk(&derive_mlkem_dk_seed_epoch(&[0x42u8; 32], 3)),
+            *derive_ratchet_x25519_sk(&derive_mlkem_dk_seed_epoch(&[0x43u8; 32], 3))
+        );
+    }
+
+    #[test]
+    fn ratchet_x25519_is_domain_separated_from_every_other_key_from_the_same_seed() {
+        // The device seed feeds four derivations. If any two coincided, an
+        // operation that legitimately exposes one would silently expose the
+        // other — and the ratchet key is the one that authenticates a sender.
+        let seed = [0x42u8; 32];
+        let mailbox = derive_mlkem_dk_seed(&seed);
+        let ratchet = derive_ratchet_x25519_sk(&mailbox);
+        let anon = derive_anonymity_x25519_sk(&seed);
+        let master = derive_master_sk_ed25519(&seed);
+
+        assert_ne!(*ratchet, *anon, "ratchet key collided with the anonymity key");
+        assert_ne!(
+            *ratchet,
+            mailbox[..32],
+            "ratchet key collided with its own input"
+        );
+        assert_ne!(
+            *ratchet,
+            mailbox[32..],
+            "ratchet key collided with its own input"
+        );
+        assert_ne!(*ratchet, *master, "ratchet key collided with the master key");
+    }
+
+    #[test]
+    fn ratchet_x25519_known_answer() {
+        // Pinned so a change to the info label, the hash, or the input layout
+        // fails loudly instead of silently re-keying every device and
+        // stranding every peer holding a published certificate.
+        let hex = |b: &[u8]| -> String { b.iter().map(|x| format!("{x:02x}")).collect() };
+        assert_eq!(
+            hex(&*derive_ratchet_x25519_sk(&[0u8; 64])),
+            "265661e44b0a94fe1d03eae47564fcb75a6460217056dce8b308c58609264ddd"
+        );
     }
 
     #[test]

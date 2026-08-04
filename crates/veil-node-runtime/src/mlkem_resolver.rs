@@ -1011,6 +1011,7 @@ mod tests {
             instance_id: [0xab; 16],
             mlkem_algo: 1,
             mlkem_pubkey: vec![0x42; 32],
+            ratchet_x25519_pubkey: [0x5A; 32],
             cert_version: 7,
         }
     }

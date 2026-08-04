@@ -177,6 +177,50 @@ impl MlKemSeedRing {
         Zeroizing::new(*self.read().seed.as_array())
     }
 
+    /// The device's ratchet X25519 **secret** for the current epoch.
+    ///
+    /// An encapsulation key authenticates nobody — anyone can encapsulate to
+    /// one. This is the Diffie-Hellman key that lets a recipient tell who
+    /// wrote to them, and it is derived from the mailbox seed rather than
+    /// stored beside it so that the two cannot drift: whatever epoch's seed is
+    /// current, this is that epoch's ratchet key, under one lock, with no
+    /// second field to forget to update on rotation.
+    pub fn current_ratchet_sk(&self) -> Zeroizing<[u8; 32]> {
+        veil_crypto::identity::derive_ratchet_x25519_sk(self.read().seed.as_array())
+    }
+
+    /// The device's ratchet X25519 **public** key for the current epoch — the
+    /// value published in the ML-KEM certificate.
+    pub fn current_ratchet_pk(&self) -> [u8; 32] {
+        let sk = self.current_ratchet_sk();
+        *x25519_dalek::PublicKey::from(&x25519_dalek::StaticSecret::from(*sk)).as_bytes()
+    }
+
+    /// Every ratchet secret a peer could still have addressed a first message
+    /// to, current first, then retired newest-first.
+    ///
+    /// The exact counterpart of [`decrypt_seeds`](Self::decrypt_seeds), and for
+    /// the same reason: a sender holding a certificate we published a week ago
+    /// derived the root key from the ratchet key in it, and if we have already
+    /// discarded that key their message is silently undecryptable. Sharing the
+    /// ring's retirement deadlines means the two halves of a certificate expire
+    /// together instead of one outliving the other.
+    pub fn ratchet_secrets(&self, now_unix: u64) -> Zeroizing<Vec<[u8; 32]>> {
+        let st = self.read();
+        let mut out = Vec::with_capacity(1 + st.retired.len());
+        out.push(*veil_crypto::identity::derive_ratchet_x25519_sk(
+            st.seed.as_array(),
+        ));
+        for r in &st.retired {
+            if r.usable_until >= now_unix {
+                out.push(*veil_crypto::identity::derive_ratchet_x25519_sk(
+                    r.seed.as_array(),
+                ));
+            }
+        }
+        Zeroizing::new(out)
+    }
+
     /// Every seed a correctly-sealed ciphertext could be addressed to, current
     /// first, then retired newest-first.
     ///
@@ -296,6 +340,80 @@ mod tests {
         assert_eq!(seeds.len(), 1);
         assert_eq!(seeds[0], [0x11u8; DK_SEED_BYTES]);
         assert_eq!(r.epoch(), 0);
+    }
+
+    #[test]
+    fn the_ratchet_key_belongs_to_the_current_seed() {
+        // The whole reason the ratchet key is derived rather than stored: it
+        // cannot disagree with the mailbox seed, because it is a function of
+        // it. Publishing one epoch's encapsulation key beside another epoch's
+        // ratchet key would make first contact fail silently.
+        let r = ring(0x11);
+        let want = veil_crypto::identity::derive_ratchet_x25519_sk(&r.current_seed());
+        assert_eq!(*r.current_ratchet_sk(), *want);
+        assert_eq!(
+            r.current_ratchet_pk(),
+            *x25519_dalek::PublicKey::from(&x25519_dalek::StaticSecret::from(*want)).as_bytes()
+        );
+        assert_ne!(r.current_ratchet_pk(), [0u8; 32]);
+    }
+
+    #[test]
+    fn the_ratchet_key_rotates_with_the_seed_and_keeps_its_predecessor() {
+        // A sender holding a week-old certificate derived the root key from
+        // the ratchet key in it. Discarding that key the moment we rotate
+        // would make their message undecryptable with no error anywhere — the
+        // same black hole the seed overlap exists to prevent, which is why the
+        // two share one retirement deadline instead of having two.
+        let r = ring(0x11);
+        let before_pk = r.current_ratchet_pk();
+        let before_sk = *r.current_ratchet_sk();
+
+        r.rotate(
+            1_000,
+            1,
+            [0x22; DK_SEED_BYTES],
+            [0x22; EK_BYTES],
+            OVERLAP,
+        )
+        .expect("rotate");
+
+        assert_ne!(r.current_ratchet_pk(), before_pk, "the key must turn over");
+
+        let usable = r.ratchet_secrets(1_000);
+        assert_eq!(usable.len(), 2, "current plus the one still in its window");
+        assert_eq!(usable[0], *r.current_ratchet_sk());
+        assert_eq!(usable[1], before_sk, "the predecessor must still be offered");
+
+        // And it drops out exactly when the mailbox seed does.
+        let past = 1_000 + OVERLAP + 1;
+        assert_eq!(r.ratchet_secrets(past).len(), 1);
+        assert_eq!(r.decrypt_seeds(past).len(), 1);
+    }
+
+    #[test]
+    fn ratchet_secrets_track_decrypt_seeds_one_for_one() {
+        // Stated as an invariant rather than left to inspection: any seed a
+        // ciphertext could be addressed to has a ratchet secret a first
+        // message could be addressed to, and vice versa.
+        let r = ring(0x11);
+        for (i, byte) in [0x22u8, 0x33, 0x44].into_iter().enumerate() {
+            r.rotate(
+                1_000,
+                i as u64 + 1,
+                [byte; DK_SEED_BYTES],
+                [byte; EK_BYTES],
+                OVERLAP,
+            )
+            .expect("rotate");
+        }
+        for now in [1_000, 1_000 + OVERLAP, 1_000 + OVERLAP + 1] {
+            assert_eq!(
+                r.ratchet_secrets(now).len(),
+                r.decrypt_seeds(now).len(),
+                "the two halves diverged at {now}"
+            );
+        }
     }
 
     #[test]

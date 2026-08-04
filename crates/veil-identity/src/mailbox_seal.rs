@@ -345,6 +345,7 @@ mod tests {
             instance_id,
             mlkem_algo: ALGO_ML_KEM_768,
             mlkem_pubkey: ek,
+            ratchet_x25519_pubkey: [0x5A; 32],
             cert_version: 1,
         };
         (cert, node_id, instance_id, dk_seed)
