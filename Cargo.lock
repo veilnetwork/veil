@@ -4717,8 +4717,10 @@ dependencies = [
  "rand_core 0.6.4",
  "sha2",
  "thiserror 2.0.18",
+ "veil-crypto",
  "veil-proto",
  "veil-util",
+ "x25519-dalek",
  "zeroize",
 ]
 

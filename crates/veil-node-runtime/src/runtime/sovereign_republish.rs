@@ -416,6 +416,7 @@ impl NodeRuntime {
                                 .unwrap_or(0);
                             match sov.sign_mlkem_cert(
                                 mlkem_keys.current_ek().to_vec(),
+                                mlkem_keys.current_ratchet_pk(),
                                 cert_valid_from,
                                 cert_valid_from + 30 * 86_400,
                                 1,
