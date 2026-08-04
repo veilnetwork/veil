@@ -10,10 +10,23 @@
  *
  * Model
  * -----
- * Media rides the SAME anonymous 2-hop onion circuit as the reliable byte
- * stream, but through a lossy path: each datagram is one circuit cell, dropped
- * (never retransmitted) on loss. Ordering is best-effort; the media codec's
- * PLC/FEC absorbs gaps. There is no ARQ, no ACKs, and no pacing.
+ * Media rides one of three transports — the anonymous 2-hop onion circuit, a
+ * direct P2P app datagram, or the ordinary Delivery relay — always through a
+ * lossy path: each datagram is one cell, dropped (never retransmitted) on loss.
+ * Ordering is best-effort; the media codec's PLC/FEC absorbs gaps. There is no
+ * ARQ, no ACKs, and no pacing.
+ *
+ * End-to-end seal
+ * ---------------
+ * EVERY channel is opened with two 32-byte directional call-media keys, and
+ * every cell on every transport is sealed with them (ChaCha20-Poly1305, with a
+ * per-epoch salt and a sequence number bound in as AAD and checked against a
+ * replay window). There is no unsealed mode and no way to add keys later: a
+ * channel that cannot be keyed does not open. None of the three transports is
+ * end-to-end on its own — the onion path's splice relay reads the cell to route
+ * it and its receive cookie is derived from a PUBLIC node id, a "direct"
+ * session is encrypted only hop-to-hop, and an ML-KEM relay envelope proves
+ * confidentiality but never origin.
  *
  * Threading / safety
  * ------------------
@@ -78,6 +91,8 @@ typedef struct VeilMediaChannelStats {
  */
 uint64_t veil_media_open_channel(VeilHandle *handle,
                                  const uint8_t *peer_node_id,
+                                 const uint8_t *tx_key,
+                                 const uint8_t *rx_key,
                                  char **err_out);
 
 /*
@@ -91,6 +106,8 @@ uint64_t veil_media_open_direct_channel(VeilApp *app,
                                         const uint8_t *peer_node_id,
                                         const uint8_t *peer_app_id,
                                         uint32_t peer_endpoint_id,
+                                        const uint8_t *tx_key,
+                                        const uint8_t *rx_key,
                                         char **err_out);
 
 /* Open a non-onion Delivery-relay media channel for direct identities. */
@@ -98,12 +115,15 @@ uint64_t veil_media_open_relay_channel(VeilApp *app,
                                        const uint8_t *peer_node_id,
                                        const uint8_t *peer_app_id,
                                        uint32_t peer_endpoint_id,
+                                       const uint8_t *tx_key,
+                                       const uint8_t *rx_key,
                                        char **err_out);
 
 /*
  * Drain inbound datagrams from `app` directly into the native media registry.
- * The authenticated source node plus (`source_namespace`, `source_name`) must
- * derive the frame's source app_id; mismatches are silently dropped. This takes
+ * The claimed source node plus (`source_namespace`, `source_name`) must derive
+ * the frame's source app_id; mismatches are silently dropped. That is a demux,
+ * not a sender gate — the seal is what authenticates a sender. This takes
  * exclusive ownership of the app receiver and must precede any generic handler.
  */
 int veil_media_start_direct_receiver(VeilApp *app,
@@ -121,13 +141,10 @@ int veil_media_start_direct_receiver(VeilApp *app,
  */
 int veil_media_send_datagram(uint64_t chan, const uint8_t *ptr, size_t len);
 
-/* Select negotiated batching: 0 off, 1 legacy audio+video, 2 compact relay
- * audio-only. Mode 2 requires directional E2E keys configured first. */
+/* Select the batching wire format: 0 off, 1 legacy audio+video, 2 compact
+ * relay audio-only (relay channels only). Not a security switch — every mode
+ * seals identically, and the batch envelope travels inside the seal. */
 int veil_media_channel_set_batching(uint64_t chan, int mode);
-
-/* Copy directional 32-byte call-media keys into a relay channel. */
-int veil_media_channel_set_e2e_keys(uint64_t chan, const uint8_t *tx_key,
-                                    const uint8_t *rx_key);
 
 /* Snapshot local relay queue/IPC timing. Direct/onion channels return zeros.
  * Returns 0 on success or -1 for an invalid channel/output pointer. */
@@ -142,9 +159,9 @@ int veil_media_channel_get_stats(uint64_t chan,
 int veil_media_repair_channel(uint64_t chan);
 
 /*
- * Feed one already-authenticated direct-P2P media datagram from `peer_node_id`
- * into the native media receive callback registry. The host is responsible for
- * checking that the datagram arrived from the expected media app_id.
+ * Feed one direct-P2P media datagram from `peer_node_id` into the native media
+ * ingress. Whatever the host believes about the source, the cell is opened with
+ * the channel's own key before a byte of it reaches the engine.
  */
 int veil_media_dispatch_direct_datagram(const uint8_t *peer_node_id,
                                         const uint8_t *ptr,
@@ -164,9 +181,10 @@ int veil_media_set_recv_callback(uint64_t chan, VeilMediaRecvFn cb, void *ctx);
 void veil_media_close_channel(uint64_t chan);
 
 /*
- * Diagnostic: number of inbound media datagrams received from `peer_node_id`
- * (32 bytes) since process start. Lets a host confirm receipt without wiring a
- * recv callback. Returns 0 on a NULL pointer.
+ * Diagnostic: number of inbound media datagrams from `peer_node_id` (32 bytes)
+ * that OPENED against the channel key since process start. Lets a host confirm
+ * receipt without wiring a recv callback; a stranger cannot advance it.
+ * Returns 0 on a NULL pointer.
  */
 uint64_t veil_media_recv_count(const uint8_t *peer_node_id);
 
