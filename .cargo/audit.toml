@@ -6,8 +6,18 @@ ignore = [
     # pqcrypto-{traits,internals,falcon}: the upstream PQClean project is being
     # archived, so RustSec flagged these as unmaintained. Informational only —
     # not an exploitable vulnerability; the crates remain functionally correct.
-    # They back the Falcon post-quantum signature path. Migrating to a
-    # maintained Falcon implementation is tracked separately; revisit then.
+    # They back the Falcon post-quantum signature path — all three are pulled
+    # in for it and nothing else, so one migration clears all three.
+    #
+    # RUSTSEC-2026-0165 recommends `fn-dsa` (pure Rust, 0.4.0 on 2026-07-22).
+    # It is real and maintained, but pre-standard: its README says no FN-DSA
+    # draft has been published, 0.4.0 is a "best guess" at the FIPS 206 draft,
+    # and backward compatibility is explicitly NOT maintained before 1.0. Its
+    # fixed-size signatures also differ from the round-3 Falcon encoding these
+    # bindings emit, so the swap is a wire break. Not taken yet; interim
+    # mitigation is the verifier-side length cap in `veil-crypto::signature`.
+    # Tracked in TASKS.md, "Deferred large-scope backlog" — row
+    # "Falcon / `pqcrypto-*` → `fn-dsa` migration". See deny.toml for detail.
     "RUSTSEC-2026-0162", # pqcrypto-traits unmaintained
     "RUSTSEC-2026-0163", # pqcrypto-internals unmaintained
     "RUSTSEC-2026-0165", # pqcrypto-falcon unmaintained
