@@ -112,6 +112,10 @@ pub struct VerifiedMlkemCert {
     pub instance_id: [u8; 16],
     pub mlkem_algo: u8,
     pub mlkem_pubkey: Vec<u8>,
+    /// The device's rotating ratchet X25519 public key, carried through from
+    /// the certificate so a caller doing key agreement gets it from the
+    /// *verified* structure rather than re-parsing unverified wire bytes.
+    pub ratchet_x25519_pubkey: [u8; 32],
     pub cert_version: u64,
 }
 
@@ -180,6 +184,7 @@ pub fn verify_mlkem_cert(
         instance_id: cert.instance_id,
         mlkem_algo: cert.mlkem_algo,
         mlkem_pubkey: cert.mlkem_pubkey.clone(),
+        ratchet_x25519_pubkey: cert.ratchet_x25519_pubkey,
         cert_version: cert.cert_version,
     })
 }
@@ -729,6 +734,7 @@ mod tests {
             instance_id: [0x77u8; 16],
             mlkem_algo: ALGO_ML_KEM_768,
             mlkem_pubkey: env.mlkem_ek.clone(),
+            ratchet_x25519_pubkey: [0x5A; 32],
             valid_from_unix: env.now_unix_secs - 60,
             valid_until_unix: env.now_unix_secs + 24 * 3600,
             cert_version: 1,
@@ -836,6 +842,32 @@ mod tests {
         assert_eq!(verified.mlkem_algo, ALGO_ML_KEM_768);
         assert_eq!(verified.mlkem_pubkey.len(), ML_KEM_768_EK_LEN);
         assert_eq!(verified.cert_version, 1);
+    }
+
+    #[test]
+    fn verified_cert_carries_the_ratchet_key() {
+        // A caller doing key agreement must take the peer's X25519 key from
+        // the *verified* structure. If it dropped out here, the caller would
+        // have to go back to the unverified wire bytes for it — and a key
+        // taken from unverified bytes authenticates whoever supplied them.
+        let env = build_env();
+        assert_doc_verifies(&env);
+        let cert = build_cert(&env);
+        let verified = verify_mlkem_cert(&cert, &env.doc, env.now_unix_secs).unwrap();
+        assert_eq!(verified.ratchet_x25519_pubkey, cert.ratchet_x25519_pubkey);
+        assert_ne!(verified.ratchet_x25519_pubkey, [0u8; 32]);
+    }
+
+    #[test]
+    fn a_swapped_ratchet_key_fails_the_signature() {
+        // The reason it is safe to trust the verified copy: the key is inside
+        // the signed bytes, so a relay that swaps it invalidates the
+        // certificate instead of silently redirecting the authentication.
+        let env = build_env();
+        let mut cert = build_cert(&env);
+        cert.ratchet_x25519_pubkey[0] ^= 0x01;
+        let err = verify_mlkem_cert(&cert, &env.doc, env.now_unix_secs).unwrap_err();
+        assert!(matches!(err, MlkemFanoutError::SigInvalid), "{err}");
     }
 
     #[test]
@@ -1008,6 +1040,7 @@ mod tests {
                 instance_id: *instance_id,
                 mlkem_algo: ALGO_ML_KEM_768,
                 mlkem_pubkey: mlkem_keys[idx].0.clone(),
+                ratchet_x25519_pubkey: [0x5A; 32],
                 valid_from_unix: now - 60,
                 valid_until_unix: now + 24 * 3600,
                 cert_version: 1,

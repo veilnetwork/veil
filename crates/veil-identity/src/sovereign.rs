@@ -602,9 +602,16 @@ impl SovereignIdentity {
     /// `cert_version` is monotonic across key rotations; `valid_from` /
     /// `valid_until` are usually `now` and `now + 30 days` per the
     /// spec — callers set them to pin clock expectations.
+    ///
+    /// `ratchet_x25519_pubkey` is the public half of the device's rotating
+    /// key-agreement secret (`derive_device_x25519_sk_epoch`). It rides in the
+    /// same certificate, at the same slot, on the same schedule as the ML-KEM
+    /// key, because a device must not acquire a second published identifier
+    /// just to become authenticable.
     pub fn sign_mlkem_cert(
         &self,
         mlkem_pubkey: Vec<u8>,
+        ratchet_x25519_pubkey: [u8; 32],
         valid_from_unix: u64,
         valid_until_unix: u64,
         cert_version: u64,
@@ -613,6 +620,7 @@ impl SovereignIdentity {
             self.document.node_id,
             self.active_instance_id(),
             mlkem_pubkey,
+            ratchet_x25519_pubkey,
             valid_from_unix,
             valid_until_unix,
             cert_version,
@@ -1186,7 +1194,7 @@ mod tests {
 
         let (ek, _dk_seed) = generate_prekey();
         let cert = sov
-            .sign_mlkem_cert(ek, now - 60, now + 30 * 86_400, 1)
+            .sign_mlkem_cert(ek, [0x5A; 32], now - 60, now + 30 * 86_400, 1)
             .unwrap();
 
         assert_eq!(cert.node_id, *sov.node_id());

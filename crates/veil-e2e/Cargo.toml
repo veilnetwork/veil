@@ -6,6 +6,7 @@ description = "End-to-end encrypted envelope wrapping for veil payloads: ML-KEM-
 license = "AGPL-3.0-or-later"
 
 [dependencies]
+veil-crypto = { path = "../veil-crypto" }
 veil-proto = { path = "../veil-proto" }
 veil-util = { path = "../veil-util" }
 
@@ -18,6 +19,7 @@ ml-kem = { version = "0.3.0-rc.1", features = ["getrandom"] }
 rand_core = { version = "0.6", features = ["getrandom"] }
 sha2 = "0.10"
 thiserror = "2.0"
+x25519-dalek = { version = "2", features = ["static_secrets"] }
 zeroize = "1.8"
 
 [lints]
