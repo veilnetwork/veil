@@ -4043,6 +4043,22 @@ mod ratchet_terminal_tests {
         assert_ne!(stripped, good, "the probe must actually change the frame");
 
         let (disp, _h, mut rx) = dispatcher_for(&bob);
+
+        // Refused for the RIGHT reason, asserted through the same handle the
+        // dispatcher opens with. Non-delivery alone does not say this: the
+        // encapsulation key also sits inside the frame's authenticated header,
+        // so cutting it out breaks the tag as well — and a build that had
+        // quietly made the post-quantum leg optional would still fail the tag
+        // and still not deliver. A break-check probe that did exactly that
+        // walked straight through the delivery assertion below.
+        assert_eq!(
+            bob.runtime
+                .open_payload(&ALICE, &stripped, veil_util::unix_secs_now_u64())
+                .unwrap_err(),
+            veil_e2e::RatchetSpliceError::Ratchet(veil_ratchet::RatchetError::PqDowngrade),
+            "the missing leg must be refused BEFORE the tag is ever reached"
+        );
+
         let (hdr, body) = forward_frame([0x04u8; 32], stripped);
         disp.dispatch(&hdr, &body, NodeId::from(RELAY));
         assert!(
