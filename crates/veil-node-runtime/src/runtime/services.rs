@@ -413,15 +413,19 @@ impl NodeRuntime {
                 }
             }
             S::PersistDhtValues => {
-                if config.persist_enabled {
-                    let path = config.dht.values_persist_path.clone().unwrap_or_else(|| {
-                        let dir = self
-                            .config_path
-                            .parent()
-                            .unwrap_or(std::path::Path::new("."));
-                        dir.join("dht_values.json").to_string_lossy().into_owned()
-                    });
-                    self.spawn_dht_values_persist_task(path, std::time::Duration::from_secs(120));
+                // `values_persist_path = None` disables value persistence — as
+                // documented, as the stop flush in `lifecycle.rs` has always
+                // done, and as every sibling branch here does. This one used to
+                // derive `<config_dir>/dht_values.json` instead, writing DHT
+                // records to an undocumented file on operators who had not
+                // asked for it.
+                if config.persist_enabled
+                    && let Some(ref path) = config.dht.values_persist_path
+                {
+                    self.spawn_dht_values_persist_task(
+                        path.clone(),
+                        std::time::Duration::from_secs(120),
+                    );
                 }
             }
             S::PersistAutodiscover => {
