@@ -35,3 +35,16 @@ echo "OK: regenerated crates/veilclient-ffi/include/veil_ffi.h"
 # sides compare, and the numeric constants the Dart bindings expose. See
 # scripts/gen-ffi-abi-contract.py for why a hash rather than a version counter.
 python3 scripts/gen-ffi-abi-contract.py
+
+# Third pass, and it is not cosmetic: the generated Rust is checked by
+# `cargo fmt --all --check` like any other source file, while THIS script's
+# output is checked by `git diff --exit-code`. Leave it unformatted and the
+# two gates pull against each other -- rustfmt wraps the long hash constant,
+# the next regeneration unwraps it, and whichever ran last fails the other.
+#
+# Formatting here rather than teaching the generator to emit pre-wrapped text:
+# the wrapping rustfmt wants is a property of the rustfmt in use, and baking
+# today's answer into a template is how the drift got in.
+rustfmt --edition 2024 crates/veilclient-ffi/src/abi_contract.rs
+
+echo "OK: formatted the generated ABI contract"
