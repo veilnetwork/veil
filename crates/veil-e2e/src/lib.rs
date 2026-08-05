@@ -631,6 +631,63 @@ fn decode_pem_encrypted(pem: &str, passphrase: &str) -> Option<Vec<u8>> {
     None
 }
 
+/// How the key on disk relates to the configuration it was loaded under.
+///
+/// The loader can return a perfectly usable key while leaving the FILE in a
+/// state the operator did not ask for, and that gap used to be invisible: the
+/// auto-upgrade write was `let _ = atomic_write(...)` under a comment claiming
+/// the error was logged, and nothing logged it anywhere (audit report7 V-02).
+/// A read-only directory, a full disk, or the wrong owner all produced a node
+/// that started, worked, and kept its decapsulation seed in PLAINTEXT while
+/// the operator who had just turned a passphrase on believed otherwise.
+///
+/// Reported rather than fatal, deliberately: the key in memory is correct and
+/// the node is fully functional. Refusing to start over a directory that
+/// happens to be read-only would trade a silent posture problem for a node
+/// that is definitely down.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MlKemKeyAtRest {
+    /// The stored form is the one the configuration asks for.
+    AsConfigured,
+    /// A plaintext key was found with a passphrase configured, and it has been
+    /// re-encrypted in place. The file is now encrypted.
+    UpgradedToEncrypted,
+    /// A plaintext key was found with a passphrase configured and the
+    /// re-encryption could NOT be written. The returned key works; the file is
+    /// **still plaintext**, and will be retried at the next start.
+    PlaintextUpgradeFailed {
+        /// Why the write failed, for the operator-facing warning.
+        reason: String,
+    },
+}
+
+impl MlKemKeyAtRest {
+    /// Whether the on-disk form differs from what the configuration asks for.
+    pub fn is_degraded(&self) -> bool {
+        matches!(self, Self::PlaintextUpgradeFailed { .. })
+    }
+
+    /// Stable tag for logs and diagnostics.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::AsConfigured => "as_configured",
+            Self::UpgradedToEncrypted => "upgraded_to_encrypted",
+            Self::PlaintextUpgradeFailed { .. } => "plaintext_upgrade_failed",
+        }
+    }
+}
+
+/// A loaded ML-KEM keypair plus what the loader left on disk.
+#[derive(Debug, Clone)]
+pub struct MlKemKeyLoad {
+    /// Encapsulation key (public half).
+    pub ek: [u8; EK_BYTES],
+    /// Decapsulation seed (private half).
+    pub dk_seed: [u8; DK_SEED_BYTES],
+    /// The at-rest state of the file the key came from.
+    pub at_rest: MlKemKeyAtRest,
+}
+
 /// Load ML-KEM key with optional passphrase encryption.
 ///
 /// Semantics (fail-closed):
@@ -651,11 +708,14 @@ fn decode_pem_encrypted(pem: &str, passphrase: &str) -> Option<Vec<u8>> {
 ///
 /// I/O errors during read or atomic write are returned as
 /// [`E2eError::MlKemKeyIo`] — startup should bail rather than continue
-/// without persistent identity.
+/// without persistent identity. The ONE write that is not fatal is the
+/// plaintext→encrypted auto-upgrade, and its failure is reported through
+/// [`MlKemKeyLoad::at_rest`]; see [`MlKemKeyAtRest`] for why it is reported
+/// rather than raised, and why silently dropping it was wrong.
 pub fn load_or_generate_mlkem_key_encrypted(
     path: &Path,
     passphrase: Option<&str>,
-) -> Result<([u8; EK_BYTES], [u8; DK_SEED_BYTES]), E2eError> {
+) -> Result<MlKemKeyLoad, E2eError> {
     // Read existing file. Distinguish "not found" (→ generate) from other
     // I/O errors (→ propagate) to avoid silent regeneration on transient
     // failures (e.g. EACCES from a too-restrictive parent dir, EIO from
@@ -673,7 +733,11 @@ pub fn load_or_generate_mlkem_key_encrypted(
                     let ek_arr = dk.encapsulation_key().to_bytes();
                     let ek: [u8; EK_BYTES] = ek_arr.as_slice().try_into().expect("EK size");
 
-                    return Ok((ek, seed.try_into().expect("DK_SEED_BYTES")));
+                    return Ok(MlKemKeyLoad {
+                        ek,
+                        dk_seed: seed.try_into().expect("DK_SEED_BYTES"),
+                        at_rest: MlKemKeyAtRest::AsConfigured,
+                    });
                 }
                 // Encrypted header found but decode failed → wrong passphrase
                 // or corrupt blob. DO NOT fall through to plaintext attempt
@@ -693,17 +757,30 @@ pub fn load_or_generate_mlkem_key_encrypted(
 
                 // Auto-upgrade: if passphrase is set and file is plaintext →
                 // re-encrypt in-place via atomic_write. Failure to re-encrypt
-                // is non-fatal: we still have the key in memory; the
-                // upgrade can be retried at next startup. Logged via Result
-                // discard since this function doesn't have a logger handle.
+                // is non-fatal — the key in memory is correct and the upgrade
+                // retries at the next start — but it is NOT nothing: the seed
+                // stays on disk in plaintext under an operator who just asked
+                // for it to be encrypted. This function has no logger handle,
+                // so the outcome travels back to a caller that does, rather
+                // than being dropped on the floor (audit report7 V-02).
+                let mut at_rest = MlKemKeyAtRest::AsConfigured;
                 if let Some(pass) = passphrase {
                     let seed_arr: [u8; DK_SEED_BYTES] =
                         seed.clone().try_into().expect("DK_SEED_BYTES");
                     let enc_pem = encode_pem_encrypted(&seed_arr, pass);
-                    let _ = veil_util::atomic_write(path, enc_pem.as_bytes());
+                    at_rest = match veil_util::atomic_write(path, enc_pem.as_bytes()) {
+                        Ok(()) => MlKemKeyAtRest::UpgradedToEncrypted,
+                        Err(e) => MlKemKeyAtRest::PlaintextUpgradeFailed {
+                            reason: e.to_string(),
+                        },
+                    };
                 }
 
-                return Ok((ek, seed.try_into().expect("DK_SEED_BYTES")));
+                return Ok(MlKemKeyLoad {
+                    ek,
+                    dk_seed: seed.try_into().expect("DK_SEED_BYTES"),
+                    at_rest,
+                });
             }
             // File exists but neither encrypted-with-passphrase nor
             // plaintext PEM parse worked → corrupt or unknown format.
@@ -726,7 +803,11 @@ pub fn load_or_generate_mlkem_key_encrypted(
                     source,
                 }
             })?;
-            Ok((ek, dk_seed))
+            Ok(MlKemKeyLoad {
+                ek,
+                dk_seed,
+                at_rest: MlKemKeyAtRest::AsConfigured,
+            })
         }
         Err(source) => Err(E2eError::MlKemKeyIo {
             path: path.to_path_buf(),
@@ -926,13 +1007,14 @@ mod tests {
     fn loader_generates_when_file_missing() {
         let path = tmp_path("generates");
         let _ = std::fs::remove_file(&path);
-        let (ek1, dk1) = load_or_generate_mlkem_key_encrypted(&path, None).unwrap();
+        let k1 = load_or_generate_mlkem_key_encrypted(&path, None).unwrap();
         // File must now exist.
         assert!(path.exists());
         // Re-load must return the SAME keys (no regeneration).
-        let (ek2, dk2) = load_or_generate_mlkem_key_encrypted(&path, None).unwrap();
-        assert_eq!(ek1, ek2, "EK must round-trip from disk");
-        assert_eq!(dk1, dk2, "DK seed must round-trip from disk");
+        let k2 = load_or_generate_mlkem_key_encrypted(&path, None).unwrap();
+        assert_eq!(k1.ek, k2.ek, "EK must round-trip from disk");
+        assert_eq!(k1.dk_seed, k2.dk_seed, "DK seed must round-trip from disk");
+        assert_eq!(k2.at_rest, MlKemKeyAtRest::AsConfigured);
         let _ = std::fs::remove_file(&path);
     }
 
@@ -941,8 +1023,7 @@ mod tests {
         let path = tmp_path("wrong_pass");
         let _ = std::fs::remove_file(&path);
         // Encrypt under "correct" passphrase.
-        let (_ek_orig, _dk_orig) =
-            load_or_generate_mlkem_key_encrypted(&path, Some("correct-pass")).unwrap();
+        let _orig = load_or_generate_mlkem_key_encrypted(&path, Some("correct-pass")).unwrap();
         let saved = std::fs::read_to_string(&path).unwrap();
         // Now attempt load with WRONG passphrase.
         let err = load_or_generate_mlkem_key_encrypted(&path, Some("wrong-pass")).unwrap_err();
@@ -992,15 +1073,97 @@ mod tests {
         let path = tmp_path("auto_upgrade");
         let _ = std::fs::remove_file(&path);
         // Generate as plaintext first.
-        let (ek1, _dk1) = load_or_generate_mlkem_key_encrypted(&path, None).unwrap();
+        let k1 = load_or_generate_mlkem_key_encrypted(&path, None).unwrap();
         let plain_pem = std::fs::read_to_string(&path).unwrap();
         assert!(plain_pem.contains(PEM_HEADER));
         // Now re-load with passphrase — should auto-upgrade in-place.
-        let (ek2, _dk2) = load_or_generate_mlkem_key_encrypted(&path, Some("upgraded")).unwrap();
-        assert_eq!(ek1, ek2, "key must be preserved across auto-upgrade");
+        let k2 = load_or_generate_mlkem_key_encrypted(&path, Some("upgraded")).unwrap();
+        assert_eq!(k1.ek, k2.ek, "key must be preserved across auto-upgrade");
+        assert_eq!(
+            k2.at_rest,
+            MlKemKeyAtRest::UpgradedToEncrypted,
+            "a successful upgrade must SAY it upgraded"
+        );
         let upgraded_pem = std::fs::read_to_string(&path).unwrap();
         assert!(upgraded_pem.contains(PEM_ENC_HEADER));
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// An auto-upgrade that CANNOT be written must say so.
+    ///
+    /// The operator turned a passphrase on for the first time; the node starts,
+    /// works, and the seed is still sitting on disk in the clear. Before this,
+    /// the write was `let _ = atomic_write(...)` under a comment claiming the
+    /// error was logged, and no logging existed anywhere in the tree — so the
+    /// only difference between "encrypted at rest" and "not" was invisible from
+    /// both the node's behaviour and its logs (audit report7 V-02).
+    ///
+    /// Read-only parent directory stands in for the whole family the comment
+    /// swallowed: EACCES, ENOSPC, wrong owner.
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_plaintext_upgrade_is_reported_not_swallowed() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mlkem.key");
+
+        // Plaintext key first, while the directory is still writable.
+        let plain = load_or_generate_mlkem_key_encrypted(&path, None).unwrap();
+        assert_eq!(plain.at_rest, MlKemKeyAtRest::AsConfigured);
+        assert!(
+            std::fs::read_to_string(&path).unwrap().contains(PEM_HEADER),
+            "precondition: the file is plaintext"
+        );
+
+        // Now nothing can be created in it, so the upgrade's temp file cannot
+        // be written and the rename never happens.
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o500)).unwrap();
+        let writable_anyway = std::fs::File::create(dir.path().join(".probe")).is_ok();
+        if writable_anyway {
+            // Running as a user the mode bits do not bind (root). The scenario
+            // cannot be built here; say so rather than assert something weaker.
+            let _ = std::fs::remove_file(dir.path().join(".probe"));
+            std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+            eprintln!("SKIP: this user can write into a 0o500 directory (root?)");
+            return;
+        }
+
+        let loaded = load_or_generate_mlkem_key_encrypted(&path, Some("first-passphrase")).unwrap();
+
+        // The node keeps running: the key it holds is the same working key.
+        assert_eq!(loaded.ek, plain.ek, "the in-memory key must still be usable");
+        assert_eq!(loaded.dk_seed, plain.dk_seed);
+        // And the file is still plaintext, which is the part that must reach
+        // the operator.
+        match &loaded.at_rest {
+            MlKemKeyAtRest::PlaintextUpgradeFailed { reason } => {
+                assert!(!reason.is_empty(), "the reason must name the I/O failure");
+            }
+            other => panic!("a failed upgrade must be reported, got {other:?}"),
+        }
+        assert!(loaded.at_rest.is_degraded());
+        assert!(
+            std::fs::read_to_string(&path).unwrap().contains(PEM_HEADER),
+            "the file really is still plaintext — that is what makes the \
+             silence dangerous"
+        );
+
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
+    /// CONTROL: loading a plaintext key with NO passphrase configured is not
+    /// degraded — the file is exactly what was asked for. A probe that simply
+    /// reported every plaintext file as degraded would pass the test above and
+    /// fail here.
+    #[test]
+    fn plaintext_without_a_passphrase_is_as_configured() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mlkem.key");
+        let first = load_or_generate_mlkem_key_encrypted(&path, None).unwrap();
+        assert_eq!(first.at_rest, MlKemKeyAtRest::AsConfigured);
+        let second = load_or_generate_mlkem_key_encrypted(&path, None).unwrap();
+        assert_eq!(second.at_rest, MlKemKeyAtRest::AsConfigured);
+        assert!(!second.at_rest.is_degraded());
     }
 
     // ── v2 encrypted PEM format tests ─────────────────────────────────────

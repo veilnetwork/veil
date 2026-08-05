@@ -1325,18 +1325,38 @@ impl NodeRuntime {
                 .unwrap_or(0),
             config.global.mlkem_rotation_secs,
         );
-        let (mlkem_ek_arr, mlkem_dk_arr, mlkem_key_src) =
-            crate::identity_local::mlkem_dk::load_or_derive(
-                &mlkem_key_path,
-                &veil_dir_path,
-                key_passphrase.as_deref().map(|p| p.as_str()),
-                mlkem_epoch,
-                config.ephemeral_identity,
-            )?;
+        let mlkem_key = crate::identity_local::mlkem_dk::load_or_derive(
+            &mlkem_key_path,
+            &veil_dir_path,
+            key_passphrase.as_deref().map(|p| p.as_str()),
+            mlkem_epoch,
+            config.ephemeral_identity,
+        )?;
+        let (mlkem_ek_arr, mlkem_dk_arr) = (mlkem_key.ek, mlkem_key.dk_seed);
         logger.info(
             "node.mlkem_dk.source",
-            format!("mlkem dk_seed source={}", mlkem_key_src.as_str()),
+            format!("mlkem dk_seed source={}", mlkem_key.source.as_str()),
         );
+        // The key is usable either way, so this is a warning and not a refusal
+        // to start — a node down because its config directory is read-only is
+        // worse than a node up with a posture problem it has just named. What
+        // it must not be is silent: the loader used to discard this error
+        // entirely, so an operator who had just turned on a passphrase got a
+        // node that started, worked, and kept the seed in plaintext with
+        // nothing anywhere saying so (audit report7 V-02).
+        if let veil_e2e::MlKemKeyAtRest::PlaintextUpgradeFailed { reason } = &mlkem_key.at_rest {
+            logger.warn(
+                "node.mlkem_dk.at_rest",
+                format!(
+                    "a passphrase is configured but {} could NOT be re-encrypted \
+                     ({reason}) — the ML-KEM decapsulation seed is still stored in \
+                     PLAINTEXT. The node is running on the correct key; fix the \
+                     path and restart to complete the upgrade.",
+                    mlkem_key_path.display(),
+                ),
+            );
+        }
+        let mlkem_key_at_rest = mlkem_key.at_rest.clone();
         drop(key_passphrase);
         // One holder for the keypair, from here down. The seed inside is
         // mlock-pinned (or zeroize-on-drop); the source arrays drop at the end
@@ -1379,6 +1399,10 @@ impl NodeRuntime {
             config.metrics.is_some(),
             None,
         )?));
+        // Recorded, not merely logged: whether the key is actually encrypted at
+        // rest is a standing property of this node, and a warning scrolled past
+        // at startup leaves an operator no way to ask about it later.
+        lock_state(&state).mlkem_key_at_rest = mlkem_key_at_rest;
 
         let local_node_id = *local_identity.node_id.as_bytes();
         let mesh_realm = Self::init_mesh_realm(&config).await;
