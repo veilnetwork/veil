@@ -4717,6 +4717,7 @@ dependencies = [
  "ml-kem",
  "rand_core 0.6.4",
  "sha2",
+ "tempfile",
  "thiserror 2.0.18",
  "veil-crypto",
  "veil-proto",

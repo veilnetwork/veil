@@ -15,6 +15,21 @@ pub struct NodeState {
     pub metrics_endpoint: Option<String>,
     pub peers: BTreeMap<PeerId, PeerConfigEntry>,
     pub listens: BTreeMap<ListenId, ListenConfigEntry>,
+    /// Whether the ML-KEM key on disk is stored in the form the configuration
+    /// asks for.
+    ///
+    /// Set at startup from the loader's outcome (see
+    /// `identity_local::mlkem_dk::load_or_derive`), and NOT a constructor
+    /// argument because a node that never loads a key file — a fresh install
+    /// before identity resolution, or the bootstrap-join helper — is
+    /// `AsConfigured` by definition: nothing is stored, so nothing is stored
+    /// wrongly.
+    ///
+    /// It lives in node state rather than only in a log line because the thing
+    /// it records is a lasting property of the node, not an event. An operator
+    /// who missed one warning at startup would otherwise have no way to ask
+    /// whether their key is actually encrypted at rest (audit report7 V-02).
+    pub mlkem_key_at_rest: veil_e2e::MlKemKeyAtRest,
 }
 
 impl NodeState {
@@ -46,6 +61,7 @@ impl NodeState {
                 .into_iter()
                 .map(|entry| (entry.listen_id, entry))
                 .collect(),
+            mlkem_key_at_rest: veil_e2e::MlKemKeyAtRest::AsConfigured,
         }
     }
 
