@@ -508,6 +508,53 @@ impl FrameDispatcher {
             }
         }
         if p.target_node_id == self.local_node_id {
+            // ── Requester attribution ───────────────────────
+            //
+            // Checked HERE and only here. A relay does not hold the requester's
+            // key — the request travels through nodes that have never met it —
+            // so verifying en route would fail on honest traffic; and making it
+            // mandatory anywhere would cut nodes without a sovereign identity
+            // out of discovery altogether, which the project does not allow.
+            //
+            // Three outcomes:
+            //   * verifies against a key we hold      → attributable, served;
+            //   * a real signature that does NOT verify against a key we hold
+            //                                         → forgery, violation;
+            //   * no signature (or signer unknown to us)
+            //                                         → unattributable, served
+            //                                           out of the recipient's
+            //                                           own bounded budget.
+            let unsigned = p.signature == [0u8; 64];
+            if !unsigned {
+                match self.check_routing_sig(
+                    &p.requester_node_id,
+                    &p.signable_bytes(),
+                    &p.signature,
+                ) {
+                    SigResult::Valid => {}
+                    SigResult::Invalid => {
+                        return DispatchResult::Violation(
+                            "RouteRequest: invalid requester signature".to_owned(),
+                        );
+                    }
+                    // We have never handshaked with the requester, so we cannot
+                    // tell a good signature from a bad one. Treat as
+                    // unattributable rather than guessing either way.
+                    SigResult::UnknownKey => {
+                        if !lock!(self.abuse.unsigned_route_request_budget)
+                            .allow_at(Instant::now())
+                        {
+                            return DispatchResult::NoResponse;
+                        }
+                    }
+                }
+            } else if !lock!(self.abuse.unsigned_route_request_budget).allow_at(Instant::now()) {
+                // Silently, not as a violation: an unsigned request is a
+                // legitimate shape, and a distinguishable refusal would answer
+                // "does this node exist" for free.
+                return DispatchResult::NoResponse;
+            }
+
             // ── Level 2: contacts-only discovery filter ─────
             // In `ContactsOnly` mode, silently drop probes from peers
             // we have no prior handshake with — no PowChallenge, no
@@ -590,7 +637,15 @@ impl FrameDispatcher {
             ));
         }
         // Forward if TTL allows.
-        if p.ttl > 0 {
+        //
+        // The hop budget is clamped on ingress. `ttl` is attacker-chosen and
+        // cannot be authenticated — every forwarder decrements it, so no
+        // signature can cover it — and the flooder only ever emits 7. Without
+        // the clamp a single frame carrying `ttl = 255` bought 255 rounds of
+        // fan-out-to-all-peers off one send. Clamping does not depend on
+        // trusting anybody.
+        let ttl = p.ttl.min(veil_proto::budget::MAX_ROUTE_REQUEST_TTL);
+        if ttl > 0 {
             // Rate-limit fan-out: a peer that sends RouteRequests faster than
             // MAX_DHT_OPS_PER_PEER_PER_WINDOW cannot amplify traffic to all peers.
             // Audit batch 2026-05-24: emit Violation instead of silent drop so
@@ -600,7 +655,7 @@ impl FrameDispatcher {
                 return DispatchResult::Violation("RouteRequest DHT quota exceeded".to_string());
             }
             let fwd = RouteRequestPayload {
-                ttl: p.ttl - 1,
+                ttl: ttl - 1,
                 ..p
             };
             let frame = encode_routing_frame(RoutingMsg::RouteRequest, &fwd.encode());

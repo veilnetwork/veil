@@ -2025,6 +2025,12 @@ impl NodeRuntime {
                     config.pow.challenge_burst,
                     std::time::Duration::from_secs(config.pow.challenge_window_secs),
                 ))),
+                unsigned_route_request_budget: Arc::new(Mutex::new(
+                    veil_abuse::rate_limiter::TokenBucket::new(
+                        veil_proto::budget::UNSIGNED_ROUTE_REQUEST_BURST as f64,
+                        1.0 / veil_proto::budget::UNSIGNED_ROUTE_REQUEST_REFILL_SECS as f64,
+                    ),
+                )),
                 // per-peer quota on new route insertions from RouteResponse.
                 dht_contact_quota: Arc::new(Mutex::new(veil_abuse::DhtQuota::new(
                     veil_proto::budget::MAX_NEW_ROUTES_PER_PEER_PER_WINDOW,
