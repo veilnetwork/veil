@@ -234,7 +234,7 @@ The remaining bits are reserved and must be 0. Older docs list `encrypted` and `
 | 5 | Mesh | Forward, Beacon, Ack |
 | 6 | LocalApp | 79 types of IPC messages (AppHello=0 … SendAnonymousDirectResult=78; see §18) |
 | 7 | Tunnel | IpPacket — TUN/TAP encapsulation |
-| 8 | Routing | RouteAnnounce/Withdraw, RouteRequest/Response, PowChallenge/Response/Accept, RouteAnnounceAliased/WithdrawAliased, RouteDiscover/Offer, RecursiveQuery/Response(0x10/0x11), RouteUpdate(0x12), VersionVectorSync(0x13) |
+| 8 | Routing | RouteAnnounce/Withdraw, RouteRequest/Response, PowChallenge/Response/Accept, RouteAnnounceAliased/WithdrawAliased, RouteDiscover/Offer, RecursiveQuery/Response(0x10/0x11) |
 | 9 | Diag | Ping/Pong, TraceProbe, TraceHop |
 | 10 | RelayChain | Hop(0) — onion-encrypted chain, RegisterRendezvous(1), UnregisterRendezvous(2), ForwardIntroduce(3), CircuitBuild(4)/CircuitData(5)/CircuitTeardown(6)/CircuitBuilt(7) |
 | 11 | PeerExchange | Walk, Challenge, Response, Result |
@@ -752,8 +752,15 @@ mlkem_pk, ed25519_pk, signature
 
 ### 10.9 Event-driven updates
 
-- `RouteUpdate` (0x12) — pushed whenever a neighbor connects or disconnects.
-- `VersionVectorSync` (0x13) — a periodic version-vector (VV) sync that reconciles state.
+Connecting and disconnecting a neighbor is announced on the gossip plane
+itself: `RouteAnnounce` on session open, `ROUTE_WITHDRAW` on session close,
+plus the periodic refresh.
+
+A second, event-driven plane (`RouteUpdate` 0x12 and `VersionVectorSync` 0x13)
+used to carry the same two events in parallel. It was removed: it duplicated
+the gossip plane while carrying none of its protections — no timestamp
+freshness, no dedup, no sequence monotonicity, no hop-aware scoring, and an
+ungated fan-out. The message codes are retired and must not be reused.
 
 ---
 

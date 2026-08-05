@@ -14,8 +14,8 @@ use veil_proto::{
     routing::{
         PowAcceptPayload, PowChallengePayload, PowResponsePayload, RecursiveQueryPayload,
         RecursiveResponsePayload, RouteAnnounceAliasedPayload, RouteAnnouncePayload,
-        RouteRequestPayload, RouteResponsePayload, RouteUpdatePayload, RouteWithdrawAliasedPayload,
-        RouteWithdrawPayload, VersionVectorSyncPayload, recursive_query_type, route_update_action,
+        RouteRequestPayload, RouteResponsePayload, RouteWithdrawAliasedPayload,
+        RouteWithdrawPayload, recursive_query_type,
     },
 };
 
@@ -192,9 +192,6 @@ impl FrameDispatcher {
             // recursive DHT routing
             RoutingMsg::RecursiveQuery => self.handle_recursive_query(body, peer_id),
             RoutingMsg::RecursiveResponse => self.handle_recursive_response(body, peer_id),
-            // event-driven route sync
-            RoutingMsg::RouteUpdate => self.handle_route_update_event(body, peer_id),
-            RoutingMsg::VersionVectorSync => self.handle_version_vector_sync(body, peer_id),
         }
     }
 
@@ -1105,23 +1102,6 @@ impl FrameDispatcher {
                 veil_proto::header::priority::BACKGROUND,
                 veil_bufpool::pooled_shared_from_vec(frame),
             );
-
-            // also send RouteUpdate(ADD) for event-driven sync.
-            let mut ru = RouteUpdatePayload {
-                origin_node_id: new_peer,
-                via_node_id: self.local_node_id,
-                action: route_update_action::ADD,
-                version: seq as u64,
-                hop_count: 1,
-                signature: [0u8; 64],
-            };
-            ru.signature = key.sign(&ru.signable_bytes()).to_bytes();
-            let ru_frame = encode_routing_frame(RoutingMsg::RouteUpdate, &ru.encode());
-            wlock!(reg_arc).send_to_all_except_with_priority(
-                &new_peer,
-                veil_proto::header::priority::BACKGROUND,
-                veil_bufpool::pooled_shared_from_vec(ru_frame),
-            );
         }
 
         // 2. Tell new_peer about all existing DIRECT peers.
@@ -1388,25 +1368,6 @@ impl FrameDispatcher {
             veil_bufpool::pooled_shared_from_vec(frame),
         );
 
-        // also send RouteUpdate(REMOVE) for event-driven sync.
-        {
-            let mut ru = RouteUpdatePayload {
-                origin_node_id: closed_peer,
-                via_node_id: self.local_node_id,
-                action: route_update_action::REMOVE,
-                version: seq as u64,
-                hop_count: 0,
-                signature: [0u8; 64],
-            };
-            ru.signature = key.sign(&ru.signable_bytes()).to_bytes();
-            let ru_frame = encode_routing_frame(RoutingMsg::RouteUpdate, &ru.encode());
-            wlock!(reg_arc).send_to_all_except_with_priority(
-                &closed_peer,
-                veil_proto::header::priority::BACKGROUND,
-                veil_bufpool::pooled_shared_from_vec(ru_frame),
-            );
-        }
-
         // Remove from our own RouteCache too.
         // Use invalidate_all_via so that every destination previously routed
         // through `closed_peer` is evicted immediately — the old call to
@@ -1653,62 +1614,6 @@ impl FrameDispatcher {
         };
         let full_bytes = full.encode();
         self.handle_route_withdraw(&full_bytes, peer_id)
-    }
-
-    // ── Version vector reconciliation ────────────────────────────
-    fn handle_version_vector_sync(&self, body: &[u8], peer_id: NodeId) -> DispatchResult {
-        let vv = match VersionVectorSyncPayload::decode(body) {
-            Ok(v) => v,
-            Err(e) => return DispatchResult::Violation(format!("bad VersionVectorSync: {e}")),
-        };
-
-        // per-peer rate limit. Drop if this peer already triggered
-        // a VVSync response within `VVSYNC_MIN_INTERVAL_SECS` — their previous
-        // RouteUpdate fan-out is still in flight. Prevents amplification loops
-        // where a compromised peer repeatedly asks for a full catch-up.
-        if lock!(self.vvsync_seen).check_and_insert(*peer_id.as_bytes()) {
-            return DispatchResult::NoResponse;
-        }
-
-        // Compare received versions with our local route_versions.
-        // For each origin where our version > received, send a RouteUpdate with
-        // current route info so the peer can catch up.
-        let local_versions = rlock!(self.route_cache).version_summary();
-        let received: std::collections::HashMap<NodeIdBytes, u64> =
-            vv.entries.into_iter().collect();
-
-        let Some(ref key) = self.crypto.local_signing_key else {
-            return DispatchResult::NoResponse;
-        };
-        let Some(ref reg_arc) = self.session_tx_registry else {
-            return DispatchResult::NoResponse;
-        };
-
-        for (origin, local_ver) in &local_versions {
-            let peer_ver = received.get(origin).copied().unwrap_or(0);
-            if *local_ver > peer_ver {
-                // We have newer info — send a RouteUpdate(ADD) to bring peer up to date.
-                if let Some(_hop) = rlock!(self.route_cache).lookup(origin) {
-                    let mut ru = RouteUpdatePayload {
-                        origin_node_id: *origin,
-                        via_node_id: self.local_node_id,
-                        action: route_update_action::ADD,
-                        version: *local_ver,
-                        hop_count: 1,
-                        signature: [0u8; 64],
-                    };
-                    ru.signature = key.sign(&ru.signable_bytes()).to_bytes();
-                    let frame = encode_routing_frame(RoutingMsg::RouteUpdate, &ru.encode());
-                    wlock!(reg_arc).send_to(
-                        peer_id.as_bytes(),
-                        veil_proto::header::priority::BACKGROUND,
-                        frame,
-                    );
-                }
-            }
-        }
-
-        DispatchResult::NoResponse
     }
 
     pub fn check_routing_sig(
@@ -2808,131 +2713,6 @@ impl FrameDispatcher {
         DispatchResult::NoResponse
     }
 
-    // ── Event-driven route update ─────────────────────────────────
-
-    fn handle_route_update_event(&self, body: &[u8], peer_id: NodeId) -> DispatchResult {
-        let p = match RouteUpdatePayload::decode(body) {
-            Ok(p) => p,
-            Err(e) => return DispatchResult::Violation(format!("bad RouteUpdate: {e}")),
-        };
-
-        // Signature verification: via_node_id must be the direct peer.
-        if &p.via_node_id == peer_id.as_bytes() {
-            match self.check_routing_sig(peer_id.as_bytes(), &p.signable_bytes(), &p.signature) {
-                SigResult::Valid => {}
-                SigResult::UnknownKey => return DispatchResult::NoResponse,
-                SigResult::Invalid => {
-                    return DispatchResult::Violation("RouteUpdate: invalid signature".to_owned());
-                }
-            }
-        } else {
-            // Gossip-relayed update: verify origin signature.
-            match self.check_routing_sig(&p.origin_node_id, &p.signable_bytes(), &p.signature) {
-                SigResult::Valid => {}
-                SigResult::Invalid => {
-                    return DispatchResult::Violation(
-                        "RouteUpdate: invalid origin signature".to_owned(),
-                    );
-                }
-                SigResult::UnknownKey => {
-                    // Unknown origin: forward but don't apply.
-                    return DispatchResult::NoResponse;
-                }
-            }
-        }
-
-        // audit cycle-6 (A7) — analysis, intentionally NOT version-gated/deduped:
-        // The audit flagged that REMOVE applies before any version check and that
-        // (unlike RouteAnnounce/RouteWithdraw) there is no dedup. Both candidate
-        // fixes are unsafe here:
-        //  * A version-MONOTONICITY gate (reject `version <=` the per-origin max)
-        //    is wrong because `version` carries the ANNOUNCER's `announce_seq`
-        //    (a per-node counter), NOT a per-origin authenticated sequence — two
-        //    different nodes announcing routes to the same origin carry
-        //    independent, non-comparable versions, so gating on origin-max would
-        //    drop a second announcer's legitimate update.
-        //  * Reusing `route_seen_set` is wrong because its per-(origin, seq)
-        //    replay layer is shared with RouteAnnounce, and the emit path uses
-        //    the SAME `announce_seq` for the RouteAnnounce and its paired
-        //    RouteUpdate (see ~routing.rs:976/996) — so every legitimate
-        //    RouteUpdate would be dropped as a "replay" of its own announce.
-        // The residual is LOW and partly by-design: a peer can only REMOVE
-        // routes where it is itself the `via` (suppressing its own reachability),
-        // not arbitrary routes through other peers. A correct dedup would need a
-        // dedicated (origin, via, version) seen-set distinct from RouteAnnounce's;
-        // deferred as not worth the added hot-path state for this residual.
-
-        // h: demoted to DEBUG. Under chaos-ban-style
-        // network churn this fires 40k+ times per second per bootstrap
-        // (5.5 M lines in 2 h on b1), spamming /var/log/veil/ at
-        // ~630 MiB per hourly rotation and contributing measurable
-        // alloc/free churn in the daemon's hot path. Operational
-        // visibility is preserved via metrics gauges (route_cache
-        // destinations/routes) and via the `RouteUpdate` action counter
-        // — both bounded and diff-able by Prometheus.
-        self.logger.debug(
-            "route_update",
-            format!(
-                "action={} origin={} via={} hop={}",
-                if p.action == route_update_action::ADD {
-                    "ADD"
-                } else {
-                    "REMOVE"
-                },
-                veil_util::hex_short(&p.origin_node_id),
-                veil_util::hex_short(&p.via_node_id),
-                p.hop_count,
-            ),
-        );
-
-        // Apply to route cache.
-        match p.action {
-            route_update_action::ADD => {
-                wlock!(self.route_cache).insert(
-                    p.origin_node_id,
-                    p.via_node_id,
-                    20_000, // default score for gossip-learned routes
-                    p.hop_count.saturating_add(1),
-                );
-            }
-            route_update_action::REMOVE => {
-                wlock!(self.route_cache).invalidate_hop(&p.origin_node_id, &p.via_node_id);
-            }
-            _ => {
-                return DispatchResult::Violation(format!(
-                    "unknown RouteUpdate action {}",
-                    p.action
-                ));
-            }
-        }
-
-        // Track version for reconciliation.
-        wlock!(self.route_cache).update_version(p.origin_node_id, p.version);
-
-        // Re-forward if hop_count allows (bounded propagation).
-        if p.hop_count < self.max_gossip_hops
-            && let Some(ref key) = self.crypto.local_signing_key
-            && let Some(reg) = &self.session_tx_registry
-        {
-            let mut fwd = RouteUpdatePayload {
-                origin_node_id: p.origin_node_id,
-                via_node_id: self.local_node_id,
-                action: p.action,
-                version: p.version,
-                hop_count: p.hop_count.saturating_add(1),
-                signature: [0u8; 64],
-            };
-            fwd.signature = key.sign(&fwd.signable_bytes()).to_bytes();
-            let frame = encode_routing_frame(RoutingMsg::RouteUpdate, &fwd.encode());
-            wlock!(reg).send_to_all_except_with_priority(
-                peer_id.as_bytes(),
-                veil_proto::header::priority::BACKGROUND,
-                veil_bufpool::pooled_shared_from_vec(frame),
-            );
-        }
-
-        DispatchResult::NoResponse
-    }
 }
 
 // ── SigResult ────────────────────────────────────────────────────────────────

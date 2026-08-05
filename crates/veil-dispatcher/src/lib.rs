@@ -996,12 +996,6 @@ pub struct FrameDispatcher {
     /// Recursive query dedup: prevents loops in recursive DHT routing.
     pub recursive_query_seen: Arc<Mutex<ExpiryCache<[u8; 16]>>>,
 
-    /// Per-peer rate limit for VersionVectorSync: each peer may
-    /// trigger a VVSync response at most once per `VVSYNC_MIN_INTERVAL_SECS`.
-    /// Excess requests are dropped silently — the peer already has a pending
-    /// update in flight.
-    pub vvsync_seen: Arc<Mutex<ExpiryCache<[u8; 32]>>>,
-
     /// Pending recursive queries: `query_id → PendingRecursive`.
     /// When a RecursiveResponse arrives, the response handler parses its
     /// payload (per `query_type`) to update `route_cache` / DHT cache, then
@@ -1904,10 +1898,6 @@ pub fn make_test_dispatcher(role: NodeRole) -> FrameDispatcher {
             Duration::from_secs(30),
             65536,
         ))),
-        vvsync_seen: Arc::new(Mutex::new(ExpiryCache::new(
-            Duration::from_secs(veil_proto::budget::VVSYNC_MIN_INTERVAL_SECS),
-            veil_proto::budget::MAX_VVSYNC_SEEN_SIZE,
-        ))),
         pending_recursive: Arc::new(Mutex::new(std::collections::HashMap::new())),
         recursive_reverse_path: Arc::new(Mutex::new(std::collections::HashMap::new())),
         alias_registry: Arc::new(Mutex::new(HashMap::new())),
@@ -2620,10 +2610,6 @@ mod tests {
             recursive_query_seen: Arc::new(Mutex::new(ExpiryCache::new(
                 Duration::from_secs(30),
                 65536,
-            ))),
-            vvsync_seen: Arc::new(Mutex::new(ExpiryCache::new(
-                Duration::from_secs(veil_proto::budget::VVSYNC_MIN_INTERVAL_SECS),
-                veil_proto::budget::MAX_VVSYNC_SEEN_SIZE,
             ))),
             pending_recursive: Arc::new(Mutex::new(std::collections::HashMap::new())),
             recursive_reverse_path: Arc::new(Mutex::new(std::collections::HashMap::new())),
@@ -3393,6 +3379,67 @@ mod tests {
         assert!(
             rx_stranger.try_recv().is_err(),
             "ContactsOnly: nothing should be enqueued — even PowChallenge would confirm existence",
+        );
+    }
+
+    /// report6 V-H2: the event-driven route-update plane is gone, and a
+    /// retired `RouteUpdate` (0x12) frame must not move the route cache.
+    ///
+    /// That plane duplicated `RouteAnnounce` / `RouteWithdraw` — both emitted
+    /// in the same blocks — while carrying none of their protections: no
+    /// timestamp freshness, no dedup of any kind, no `hop_count == 0`
+    /// self-contradiction check, no sequence monotonicity, and a flat score of
+    /// 20 000 regardless of the claimed hop count, which is exactly what the
+    /// announce plane's relay-hop clamp exists to prevent. Its fan-out was
+    /// ungated too.
+    ///
+    /// The frame built here is one the removed handler would have ACCEPTED:
+    /// `via == peer`, signed by that peer with a key the dispatcher knows.
+    #[test]
+    fn report6_retired_route_update_frame_is_refused() {
+        use ed25519_dalek::{Signer as _, SigningKey};
+
+        let relay = [0x11u8; 32];
+        let origin = [0x77u8; 32];
+        let peer = [0xAAu8; 32];
+        let peer_sk = SigningKey::from_bytes(&[0xAAu8; 32]);
+        let relay_sk = Arc::new(SigningKey::from_bytes(&[0x11u8; 32]));
+
+        let tx_reg = Arc::new(RwLock::new(veil_session::SessionTxRegistry::new()));
+        let disp = make_gossip_dispatcher(
+            relay,
+            Arc::clone(&relay_sk),
+            Arc::clone(&tx_reg),
+            vec![(peer, peer_sk.verifying_key())],
+        );
+
+        // The retired 138-byte layout: origin, via, action(ADD=1),
+        // version u64 BE, hop_count, signature over the first 73 bytes.
+        const ACTION_ADD: u8 = 1;
+        let mut signable = Vec::with_capacity(73);
+        signable.extend_from_slice(&origin);
+        signable.extend_from_slice(&peer);
+        signable.push(ACTION_ADD);
+        signable.extend_from_slice(&7u64.to_be_bytes());
+        let sig = peer_sk.sign(&signable).to_bytes();
+
+        let mut body = Vec::with_capacity(138);
+        body.extend_from_slice(&signable);
+        body.push(9); // hop_count — the plane scored this at a flat 20_000
+        body.extend_from_slice(&sig);
+        assert_eq!(body.len(), 138);
+
+        let hdr = FrameHeader::new(FrameFamily::Routing as u8, 0x12);
+        let result = disp.dispatch(&hdr, &body, peer);
+
+        assert!(
+            matches!(result, DispatchResult::Violation(_)),
+            "a retired routing msg_type must be refused outright, got {result:?}",
+        );
+        assert_eq!(
+            disp.route_cache.read().unwrap().lookup(&origin),
+            None,
+            "a RouteUpdate frame still installed a route — the plane is back",
         );
     }
 

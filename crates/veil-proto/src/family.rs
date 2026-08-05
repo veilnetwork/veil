@@ -1002,10 +1002,10 @@ pub enum RoutingMsg {
     RecursiveQuery = 0x10,
     /// Recursive DHT response: direct reply to initiator.
     RecursiveResponse = 0x11,
-    /// Event-driven route update: push on connect/disconnect.
-    RouteUpdate = 0x12,
-    /// Version vector exchange for periodic route reconciliation.
-    VersionVectorSync = 0x13,
+    // 0x12 RouteUpdate and 0x13 VersionVectorSync were an event-driven second
+    // route-gossip plane. Removed (report6 V-H2): they duplicated
+    // RouteAnnounce / RouteWithdraw, which are emitted in the same code blocks,
+    // while carrying none of that plane's protections. Do not reuse the codes.
 }
 
 impl TryFrom<u16> for RoutingMsg {
@@ -1025,8 +1025,6 @@ impl TryFrom<u16> for RoutingMsg {
             10 => Ok(RoutingMsg::RouteDiscoverOffer),
             0x10 => Ok(RoutingMsg::RecursiveQuery),
             0x11 => Ok(RoutingMsg::RecursiveResponse),
-            0x12 => Ok(RoutingMsg::RouteUpdate),
-            0x13 => Ok(RoutingMsg::VersionVectorSync),
             _ => Err(ProtoError::UnknownMsgType {
                 family: FrameFamily::Routing as u8,
                 msg_type: v,

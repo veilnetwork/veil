@@ -197,7 +197,7 @@ fn bump_close_generation(
 /// runner then notices its channel is gone and exits — and its teardown
 /// used to run unconditionally, deleting the live session's ML-KEM key,
 /// dropping its rendezvous subscriptions and its reflectors, and
-/// broadcasting `ROUTE_WITHDRAW`/`RouteUpdate(REMOVE)` to the whole mesh
+/// broadcasting `ROUTE_WITHDRAW` to the whole mesh
 /// for a peer that was, at that moment, connected. The peer stayed
 /// reachable but unreachable-looking, until something re-announced it.
 ///

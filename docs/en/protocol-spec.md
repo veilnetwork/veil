@@ -126,7 +126,7 @@ A *family* groups related message types. The `Family` byte in the header picks t
 | Mesh | 5 | Local UDP network (beacons, forward) |
 | LocalApp | 6 | IPC for local applications |
 | Tunnel | 7 | TUN/TAP IP tunnel |
-| Routing | 8 | RouteAnnounce/Withdraw, RouteRequest/Response, PoW, Recursive*, VersionVectorSync |
+| Routing | 8 | RouteAnnounce/Withdraw, RouteRequest/Response, PoW, Recursive* |
 | Diag | 9 | Diagnostics: DiagPing, DiagPong, TraceProbe, TraceHop |
 | RelayChain | 10 | Onion-encrypted relay chain hop |
 | PeerExchange | 11 | PEX random-walk: Walk, Challenge, Response, Result |

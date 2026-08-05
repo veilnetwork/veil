@@ -890,7 +890,7 @@ mod tests {
     // ── 274.2: Churn convergence with event-driven sync ──────────────────────
 
     /// 12-node ring: disconnect 3 nodes, reconnect, verify reconvergence.
-    /// Tests that RouteUpdate(ADD/REMOVE) events propagate correctly.
+    /// Tests that ROUTE_ANNOUNCE / ROUTE_WITHDRAW propagate correctly.
     ///
     /// Currently `#[ignore]`'d for the same reason as
     /// `gateway_failure_spokes_lose_hub` above: hot-standby auto-swap
@@ -924,10 +924,10 @@ mod tests {
 
         // replace `sleep(2s)` with edge-triggered polling — the
         // disconnected ring nodes (3/6/9) lose both their neighbors, so
-        // session count must drop to 0. Once that's true the RouteUpdate
-        // (REMOVE) frames are guaranteed to have been emitted (sessions go
-        // away through the dispatcher's session-close path that emits the
-        // REMOVE). Reconnect can proceed immediately.
+        // session count must drop to 0. Once that's true the ROUTE_WITHDRAW
+        // frames are guaranteed to have been emitted (sessions go away through
+        // the dispatcher's session-close path that emits the withdraw).
+        // Reconnect can proceed immediately.
         for &node in &[3usize, 6, 9] {
             let ok = net
                 .node(node)
