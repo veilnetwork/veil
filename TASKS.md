@@ -6,10 +6,10 @@ Each epic ends by transitioning to the next via a re-analysis task.
 > Completed epics (0–446, 447, 450, 452, 453, 454, 458, 460, 461, **462 (multi-device identity, code + acceptance fully closed), 476 (Sovereign Identity simplification — S3 absorbed by Epic 477), 479 (Latency-aware routing — absorbed by 137/142/144), 481 (Out-of-band bootstrap — 5 items shipped; in-band-introducer + .onion parked in deferred-backlog), 482 (Optional anonymity — 7 items + integration tests + AS diversity shipped; anti-loop TTL ✅ done 2026-05-09; stateful-circuit return-path subset ✅ shipped 2026-06 via the onion-registration epic — forward-circuit reuse still parked, see the 482.7 backlog row), 483 (Mobile / battery / NAT — 6/7 sub-tasks shipped + 2 deferred slices opt-in default-off 2026-05-06; 483.2 push-notification → Epic 489), 484 (Operational deployment — 484.1 + 484.3 + 484.5 shipped; 484.6 dropped as architecturally incompatible with the anti-censorship goal), 485 (Adversary validation — 485.2 + 485.3 + 485.4 + 485.5 shipped; 485.1 partial closure (3 sub-scenarios shipped, ID-grinding/bucket-pollution/churn extensions parked in deferred-backlog); 485.6 skipped per operator decision), 486 (Post-quantum readiness — all 4 sub-tasks shipped + cross-host stand-verified GA), 487, 488, 489.1, 489.4, 489.5, scanner-shield 6.30, Phase 6.47 internal audit, Phase 6.45 closed findings (incl. H9 verified + H12 shipped 2026-05-06), Phase 6.48 closed (5 batches + final A2 caller-wiring 2026-05-06; R1-R4 + X1-X2 cleanup parked, A1+A8 deferred to a future epic), Epic 462.44 quota wire-up, **PoW-Gated Rendezvous epic** (stealth listeners, closed 2026-05-20), **Phase 6.50.d.6** consolidated audit follow-up (2026-05-14), **Audit batch 2026-05-21**, **Cross-audit batch 2026-05-23** (9 findings), the **Audit remediation batch 2026-06-14** (12 findings; 4 deferred-with-proposal preserved in the backlog table), **Onion-registration / location-anonymous service** (shipped 2026-06)**) have been moved to [`TASKS_ARCHIVE.md`](TASKS_ARCHIVE.md).
 >
 > The epics remaining in this file have **open items** (deferred / backlog).  State as of 2026-06-14 (post audit-remediation batch):
-> * Remainder of **Epic 489 (Flutter mobile)**: 489.10 HMAC-auth wakeup + drainMailbox helper + push-relay reference impl + iOS BG "drained" signal hook (see row).  The other 489.x are ✅ closed.  iOS APNs token storage upgraded to Keychain (2026-05-23).
+> * Remainder of **Epic 489 (Flutter mobile)**: drainMailbox helper + push-relay reference impl + iOS BG "drained" signal hook (see row).  489.10 HMAC-auth wakeup shipped on the daemon side (see T3).  The other 489.x are ✅ closed.  iOS APNs token storage upgraded to Keychain (2026-05-23).
 > * Remainder of the **anti-censorship roadmap**: bandwidth-mimicry (landing-pad ready, fail-closed, awaiting a pcap fixture from the operator — now tracked in the deferred backlog table); frame-timing-jitter, HTTP/2-shape padding, WebRTC-snowflake transport (new layers, not blocking).
 > * **Deferred large-scope backlog** (re-open triggers defined): see the table below (now includes the 4 deferred-with-proposal items from the 2026-06-14 audit batch — anycast first-use Sybil, CircuitBuilt ACK MAC, bandwidth-mimicry impl, pqcrypto migration).
-> * **Audit cycles 4–6 deferred tasks** (T1–T7): T1 handoff anti-replay, T2 anycast/relay reputation feedback, T3 push-relay wake-HMAC minting, T4 remote IPC stream forwarding remain open; T5/T6/T7 done.  See the sections below.
+> * **Audit cycles 4–6 deferred tasks** (T1–T7): T1 handoff anti-replay and T4 remote IPC stream forwarding remain open; T2 remains open as a design item; T3/T5/T6/T7 done.  See the sections below.
 > * **Operator-triggered actions**: stealth-canary on node1 active (see row); the reverted stress-soak overrides were archived to [`TASKS_ARCHIVE.md`](TASKS_ARCHIVE.md).
 
 ---
@@ -475,11 +475,24 @@ existing row "`AnycastService::resolve` signed records / reputation" above;
   default for sensitive use. **Re-open:** a trust-sensitive anycast use case, or
   observed Sybil ranking-capture in a real deployment.
 
-**T3 — Push-relay wake-HMAC minting (N4).** Priority medium. Refs: Epic 489.10
-slice 4.4 (push notifications); `veil-push/src/lib.rs` (relay sends wake-only,
-does NOT mint); receiver verify `VeilPush.handleWakeup` + primitive
-`veil_crypto::wake_hmac` (shipped; verify hot-path optimised this cycle, L-1).
-- *What:* FCM/APNs dispatch sends `wake=1` with an empty payload; it does not
+**T3 — Push-relay wake-HMAC minting (N4). — CLOSED (design B2/A: relay mints).**
+Refs: `mint_wake_payload` in `crates/veil-node-runtime/src/runtime/service_tasks.rs`;
+`PushDispatcher::dispatch(token, wake_payload)` in `crates/veil-push/src/lib.rs`;
+`veil_crypto::wake_hmac` primitive; `[mailbox.push].require_wake_hmac` in
+`crates/veil-cfg/src/model.rs`.
+- *What shipped:* `MailboxPutPayload.wake_hmac_envelope` is forwarded onto the
+  `PushTrigger`; the push-dispatch task unseals it with the relay's X25519 sk,
+  mints `wake_hmac(ts, content_id, receiver_id)` and ships the 72-byte payload
+  in the provider `data` map. An absent or unsealable envelope falls back to the
+  legacy wake-only push, and `require_wake_hmac = true` turns that fallback into
+  a rejection. The key material is zeroized on both the heap and the stack copy.
+- *What is deliberately NOT done:* `require_wake_hmac` still defaults to `false`,
+  because the xVeil client sends `wake_hmac_envelope: absent` on every PUT, so a
+  `true` default would stop waking every device in the fleet. The reasoning and
+  the flip condition are recorded on the field itself. The structural validator
+  raises a production-posture advisory while a push relay runs with it off, and
+  `[global].strict_config_validation = true` promotes that advisory to fatal.
+- *Historical description of the finding, kept for the reasoning:* FCM/APNs dispatch sends `wake=1` with an empty payload; it does not
   mint a wake-HMAC, so absent app-supplied `wakePayload/wakeHmacKey/receiverId`
   the wake is rate-limit-only → a leaked push token enables battery-DoS /
   presence-oracle.
