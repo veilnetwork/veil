@@ -13,7 +13,7 @@
 //! On cold full — evict oldest entry entirely.
 
 use std::collections::{BTreeMap, HashMap};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 // ── ColdBackend trait ───────────────────────────────────────────
 
@@ -63,6 +63,21 @@ pub trait ColdBackend: Send + Sync + std::fmt::Debug {
     }
     /// Iterate all entries (for snapshot/migration).
     fn iter_entries(&self) -> Vec<([u8; 32], Vec<u8>)>;
+    /// Like [`Self::iter_entries`] but also reports when each entry was
+    /// inserted, so a snapshot can preserve remaining lifetime instead of
+    /// handing every restored entry a fresh full TTL.
+    ///
+    /// The default answers `now` for every entry, i.e. "age unknown". Only
+    /// backends that are VOLATILE need to override it — a durable backend is
+    /// never part of the JSON value snapshot (it survives restart by itself,
+    /// see [`TieredStore::cold_is_durable`]), so the default is never the
+    /// answer anyone acts on.
+    fn iter_entries_with_ts(&self, now: Instant) -> Vec<([u8; 32], Vec<u8>, Instant)> {
+        self.iter_entries()
+            .into_iter()
+            .map(|(k, v)| (k, v, now))
+            .collect()
+    }
     /// Iterate all KEYS without materializing values. Backends that can
     /// enumerate keys without copying values out of RAM/disk pages MUST
     /// override this — the default falls back to `iter_entries`, which
@@ -188,6 +203,13 @@ impl ColdBackend for InMemoryCold {
         self.entries
             .iter()
             .map(|(k, (v, _))| (*k, v.clone()))
+            .collect()
+    }
+
+    fn iter_entries_with_ts(&self, _now: Instant) -> Vec<([u8; 32], Vec<u8>, Instant)> {
+        self.entries
+            .iter()
+            .map(|(k, (v, ts))| (*k, v.clone(), *ts))
             .collect()
     }
 
@@ -990,6 +1012,23 @@ pub const ORIGIN_UNSIGNED: [u8; 32] = [0xFFu8; 32];
 /// owner instead, matching the direct STORE path's per-signer accounting.
 pub const ORIGIN_RECURSIVE_BUNDLE: [u8; 32] = [0xEEu8; 32];
 
+/// One stored entry together with the two facts a `(key, value)` pair drops on
+/// the floor: the origin that authorised the write, and how long the entry has
+/// already lived.
+///
+/// Both matter on restore. Without the origin every restored entry re-enters as
+/// [`ORIGIN_INTERNAL`], which is exempt from the per-origin byte cap, so a
+/// restart launders a capped origin's bytes into the uncapped bucket. Without
+/// the age every restored entry gets a fresh full TTL, so a value that should
+/// have expired can be kept alive indefinitely by restarting.
+#[derive(Debug, Clone)]
+pub struct StoredEntry {
+    pub key: [u8; 32],
+    pub value: Vec<u8>,
+    pub origin: [u8; 32],
+    pub age: Duration,
+}
+
 /// Tiered key-value store for DHT entries.
 #[derive(Debug)]
 pub struct TieredStore {
@@ -1391,6 +1430,69 @@ impl TieredStore {
         result
     }
 
+    /// One stored entry plus the metadata a persisted snapshot must carry.
+    ///
+    /// A snapshot of `(key, value)` alone loses two things the store knows and
+    /// cannot re-derive on restore: WHO put the entry there, and HOW LONG it
+    /// has already lived. See [`StoredEntry`].
+    fn entry_meta(&self, key: &[u8; 32], inserted_at: Instant, now: Instant) -> ([u8; 32], Duration) {
+        let origin = self
+            .entry_origin
+            .get(key)
+            .copied()
+            .unwrap_or(ORIGIN_INTERNAL);
+        (origin, now.saturating_duration_since(inserted_at))
+    }
+
+    /// [`Self::iter_hot`] with provenance and age attached.
+    pub fn iter_hot_with_meta(&self, now: Instant) -> Vec<StoredEntry> {
+        self.hot
+            .iter()
+            .map(|(k, (v, inserted_at))| {
+                let (origin, age) = self.entry_meta(k, *inserted_at, now);
+                StoredEntry {
+                    key: *k,
+                    value: v.clone(),
+                    origin,
+                    age,
+                }
+            })
+            .collect()
+    }
+
+    /// [`Self::iter`] with provenance and age attached.
+    pub fn iter_with_meta(&self, now: Instant) -> Vec<StoredEntry> {
+        let mut out = self.iter_hot_with_meta(now);
+        out.extend(self.cold.iter_entries_with_ts(now).into_iter().map(
+            |(k, v, inserted_at)| {
+                let (origin, age) = self.entry_meta(&k, inserted_at, now);
+                StoredEntry {
+                    key: k,
+                    value: v,
+                    origin,
+                    age,
+                }
+            },
+        ));
+        out
+    }
+
+    /// Insert an entry that has ALREADY lived for `age`, attributed to
+    /// `origin`. The restore-from-snapshot counterpart of
+    /// [`Self::put_with_origin`]: a value that was 59 minutes into its hour
+    /// must come back with one minute left, not with a fresh hour.
+    pub fn put_restored(
+        &mut self,
+        key: [u8; 32],
+        value: Vec<u8>,
+        origin: [u8; 32],
+        age: Duration,
+        now: Instant,
+    ) -> bool {
+        let inserted_at = now.checked_sub(age).unwrap_or(now);
+        self.put_with_origin_at(key, value, origin, inserted_at)
+    }
+
     /// Iterate **only the volatile HOT tier** `(key, value)` pairs (no cold
     /// tier). Used by the values snapshot when the cold tier is durable
     /// (`cold_is_durable()`): the cold set persists via its own backend, so
@@ -1621,6 +1723,72 @@ mod tests {
         store.get(&[1u8; 32]); // promote [1] back to hot, demote [2]
         assert_eq!(store.hot_len(), 1);
         assert!(store.hot.contains_key(&[1u8; 32]));
+    }
+
+    /// report6 V-M1: a snapshot must carry provenance and remaining lifetime
+    /// across both tiers, and a restore must honour both.
+    ///
+    /// `(key, value)` alone loses two facts the store knows and cannot
+    /// re-derive. Everything used to come back as `ORIGIN_INTERNAL` — which is
+    /// exempt from the per-origin byte cap — with a full fresh TTL, so a
+    /// restart laundered a capped origin's bytes into the uncapped bucket and
+    /// reset the clock on values that were one minute from expiring.
+    #[test]
+    fn snapshot_meta_carries_origin_and_age_and_restore_honours_them() {
+        let origin_a = [0xA1u8; 32];
+        let origin_b = [0xB2u8; 32];
+        // hot_capacity 1 so the first entry is demoted into the cold tier —
+        // the snapshot must describe BOTH tiers, not just the hot one.
+        let mut store = TieredStore::new(1, 8);
+        let t0 = Instant::now();
+        assert!(store.put_with_origin_at([1u8; 32], vec![1u8; 40], origin_a, t0));
+        assert!(store.put_with_origin_at([2u8; 32], vec![2u8; 40], origin_b, t0));
+        assert_eq!(store.cold_len(), 1, "fixture: one entry demoted to cold");
+
+        // Snapshot taken two hours later. Ages come out at ~7200 s: the cold
+        // entry's clock starts at DEMOTION rather than at the original put, so
+        // it lags by the microseconds between the two — which is exactly the
+        // age the store itself uses to evict it, and therefore the age the
+        // snapshot must report.
+        let snap_at = t0 + Duration::from_secs(7200);
+        let snap = store.iter_with_meta(snap_at);
+        assert_eq!(snap.len(), 2, "both tiers must appear in the snapshot");
+        for e in &snap {
+            let expected = if e.key == [1u8; 32] { origin_a } else { origin_b };
+            assert_eq!(e.origin, expected, "provenance lost for {:?}", e.key);
+            assert!(
+                (7199..=7200).contains(&e.age.as_secs()),
+                "age lost for {:?} ({:?}) — a restore would hand it a fresh TTL",
+                e.key,
+                e.age,
+            );
+        }
+
+        // Restore into a fresh store at the moment the snapshot was taken.
+        let mut restored = TieredStore::new(1, 8);
+        let restore_at = snap_at;
+        for e in &snap {
+            assert!(restored.put_restored(e.key, e.value.clone(), e.origin, e.age, restore_at));
+        }
+
+        // Provenance: the bytes land under the recorded origins, not in the
+        // uncapped internal bucket.
+        assert_eq!(restored.origin_bytes.get(&origin_a).copied(), Some(40));
+        assert_eq!(restored.origin_bytes.get(&origin_b).copied(), Some(40));
+        assert!(
+            !restored.origin_bytes.contains_key(&ORIGIN_INTERNAL),
+            "restored entries were laundered into the uncapped internal origin",
+        );
+
+        // Lifetime: with a one-hour TTL both entries are already two hours old
+        // at `restore_at`, so the very next cleanup must drop them. Under the
+        // old behaviour they would have come back with a full hour left.
+        restored.retain_fresh_age_only(restore_at, Duration::from_secs(3600));
+        assert_eq!(
+            restored.len(),
+            0,
+            "restored entries kept a fresh TTL — restarting resets the clock",
+        );
     }
 
     /// audit cycle-7 M4: `iter_keys` returns every key from both tiers without

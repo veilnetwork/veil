@@ -432,16 +432,31 @@ impl NodeRuntime {
         let Ok(data) = std::fs::read_to_string(path) else {
             return Vec::new();
         };
-        match serde_json::from_str(&data) {
+        let file: veil_dht::kademlia::DhtValuesSnapshotFile = match serde_json::from_str(&data) {
             Ok(v) => v,
             Err(e) => {
+                // Includes the unversioned v1 array, which carried neither
+                // origin nor age. Ignored rather than guessed at — see
+                // `DhtValuesSnapshotFile`.
                 logger.warn(
                     "dht.values.persist.parse_err",
-                    format!("DHT values snapshot parse failed ({e})"),
+                    format!("DHT values snapshot parse failed ({e}) — ignoring it"),
                 );
-                Vec::new()
+                return Vec::new();
             }
+        };
+        if file.version != veil_dht::kademlia::DhtValuesSnapshotFile::VERSION {
+            logger.warn(
+                "dht.values.persist.version",
+                format!(
+                    "DHT values snapshot is schema v{}, this build writes v{} — ignoring it",
+                    file.version,
+                    veil_dht::kademlia::DhtValuesSnapshotFile::VERSION,
+                ),
+            );
+            return Vec::new();
         }
+        file.entries
     }
 
     pub fn restore_dht_values_snapshot(&self, config: &veil_cfg::Config) {
@@ -463,7 +478,8 @@ impl NodeRuntime {
         logger: Arc<NodeLogger>,
     ) {
         let detail = format!("{} DHT values", entries.len());
-        flush_json_snapshot_sync(&path, &entries, &logger, "dht.values.persist", &detail);
+        let file = veil_dht::kademlia::DhtValuesSnapshotFile::new(entries);
+        flush_json_snapshot_sync(&path, &file, &logger, "dht.values.persist", &detail);
     }
 
     pub fn spawn_dht_values_persist_task(&mut self, path: String, interval: std::time::Duration) {
@@ -771,10 +787,14 @@ mod dht_values_path_tests {
 
     fn snapshot_json() -> String {
         // One entry, in the on-disk shape the flusher writes.
-        serde_json::to_string(&vec![veil_dht::kademlia::DhtValueSnapshot {
-            key: [7u8; 32],
-            value: b"restored".to_vec(),
-        }])
+        serde_json::to_string(&veil_dht::kademlia::DhtValuesSnapshotFile::new(vec![
+            veil_dht::kademlia::DhtValueSnapshot {
+                key: [7u8; 32],
+                value: b"restored".to_vec(),
+                origin: [9u8; 32],
+                age_secs: 42,
+            },
+        ]))
         .expect("encode snapshot")
     }
 
@@ -821,5 +841,54 @@ mod dht_values_path_tests {
         assert_eq!(entries.len(), 1, "a configured path must still restore");
         assert_eq!(entries[0].key, [7u8; 32]);
         assert_eq!(entries[0].value, b"restored");
+        assert_eq!(entries[0].origin, [9u8; 32], "provenance must survive");
+        assert_eq!(entries[0].age_secs, 42, "lifetime must survive");
+    }
+
+    /// report6 V-M1: the snapshot schema is versioned, and a file that is not
+    /// this version is IGNORED rather than guessed at.
+    ///
+    /// The old format was a bare, unversioned array of `{key, value}`: neither
+    /// provenance nor age was representable. Reading one now would mean
+    /// inventing both — an origin (which decides per-origin byte accounting)
+    /// and an age (which decides expiry) — i.e. reintroducing the two lies the
+    /// format exists to stop.
+    #[test]
+    fn legacy_unversioned_snapshot_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("values.json");
+        // Exactly what the previous build wrote.
+        std::fs::write(
+            &path,
+            r#"[{"key":"0707070707070707070707070707070707070707070707070707070707070707","value":"cmVzdG9yZWQ="}]"#,
+        )
+        .unwrap();
+
+        let mut config = veil_cfg::Config::default();
+        config.dht.values_persist_path = Some(path.to_string_lossy().into_owned());
+
+        assert!(
+            NodeRuntime::load_dht_values_snapshot(&config, &logger()).is_empty(),
+            "an unversioned snapshot must be ignored, not restored with \
+             invented origin and age",
+        );
+    }
+
+    /// A future schema version is refused for the same reason.
+    #[test]
+    fn future_schema_version_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("values.json");
+        let mut file: serde_json::Value = serde_json::from_str(&snapshot_json()).unwrap();
+        file["version"] = serde_json::json!(veil_dht::kademlia::DhtValuesSnapshotFile::VERSION + 1);
+        std::fs::write(&path, serde_json::to_string(&file).unwrap()).unwrap();
+
+        let mut config = veil_cfg::Config::default();
+        config.dht.values_persist_path = Some(path.to_string_lossy().into_owned());
+
+        assert!(
+            NodeRuntime::load_dht_values_snapshot(&config, &logger()).is_empty(),
+            "a snapshot from a newer schema must be ignored",
+        );
     }
 }
