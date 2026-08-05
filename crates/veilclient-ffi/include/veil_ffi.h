@@ -480,7 +480,8 @@
 
 #if defined(VEIL_FFI_NODE_EMBEDDED)
 /**
- * Most conversations one device holds at once.
+ * Most conversations one device holds at once, and so the most
+ * [`veil_ratchet_list_page`] can ever walk.
  *
  * Spelled as a literal because cbindgen emits `#define`s only for literals: a
  * `= veil_e2e::MAX_CONVERSATIONS` here compiles perfectly well and then simply
@@ -2876,6 +2877,45 @@ int veil_ratchet_list(VeilHandle *handle,
                       size_t out_buf_cap,
                       size_t *out_total,
                       char **err_out)
+;
+#endif
+
+#if defined(VEIL_FFI_NODE_EMBEDDED)
+/**
+ * One page of the conversations this node holds, in key order, resuming
+ * strictly after `after_key_64`.
+ *
+ * Pass `NULL` for `after_key_64` to start the walk, then pass the LAST key of
+ * the page just returned to continue it. A page shorter than
+ * `out_buf_cap / VEIL_RATCHET_KEY_LEN` is the end; a page of zero keys is the
+ * end with nothing in it. `*out_written` receives the count of keys written.
+ *
+ * This is what [`veil_ratchet_list`] cannot do. That call writes as many keys
+ * as fit and reports the total, so a host whose buffer is smaller than the
+ * store can never reach the tail — it can only allocate for the whole set and
+ * try again. Here the cost of a page is the page: the walk seeks in
+ * logarithmic time and holds the store's lock for the length of the page
+ * rather than the length of the store, so a full save streams instead of
+ * stopping every other send and receive while it copies.
+ *
+ * The cursor is a key rather than an offset because the store moves between
+ * pages — a conversation opens, another is evicted by the quota — and an
+ * offset would then skip or repeat whatever crossed it. Resuming at a key is
+ * well-defined whether or not that key is still held.
+ *
+ * # Safety
+ *
+ * `handle` must be live. `after_key_64`, when not NULL, MUST point to exactly
+ * [`VEIL_RATCHET_KEY_LEN`] readable bytes. `out_buf` MUST be writable for
+ * `out_buf_cap` bytes. `out_written` MUST be writable.
+ */
+
+int veil_ratchet_list_page(VeilHandle *handle,
+                           const uint8_t *after_key_64,
+                           uint8_t *out_buf,
+                           size_t out_buf_cap,
+                           size_t *out_written,
+                           char **err_out)
 ;
 #endif
 

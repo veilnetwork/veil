@@ -643,10 +643,42 @@ impl RatchetStore {
 
     /// Every conversation held, in key order.
     ///
-    /// Bounded by [`MAX_CONVERSATIONS`], so this cannot grow without limit.
+    /// Bounded by [`MAX_CONVERSATIONS`], so this cannot grow without limit —
+    /// but it is still the whole set in one allocation, and a host that walks
+    /// it to save state holds the lock for the length of the walk. Prefer
+    /// [`keys_after`](Self::keys_after), which costs the page and not the
+    /// store.
     #[must_use]
     pub fn keys(&self) -> Vec<ConversationKey> {
         self.lock().entries.keys().copied().collect()
+    }
+
+    /// One page of conversation keys, in key order, starting strictly after
+    /// `after`. `None` starts at the beginning.
+    ///
+    /// The cursor is the last key of the previous page, and it is a *key*
+    /// rather than an offset for the reason offsets are wrong here: the store
+    /// mutates between pages — a conversation is opened, another is evicted —
+    /// and an offset would then skip or repeat whatever moved across it. A key
+    /// cursor cannot: the walk resumes at the same point in the ordering
+    /// whether or not the entry it names is still held. A page shorter than
+    /// `max` is the end of the walk.
+    ///
+    /// Costs `O(log n + page)`, so a full pass is linear in the store rather
+    /// than quadratic, and each page holds the lock only for its own length.
+    #[must_use]
+    pub fn keys_after(&self, after: Option<&ConversationKey>, max: usize) -> Vec<ConversationKey> {
+        use std::ops::Bound;
+        let g = self.lock();
+        match after {
+            Some(cursor) => g
+                .entries
+                .range((Bound::Excluded(*cursor), Bound::Unbounded))
+                .map(|(k, _)| *k)
+                .take(max)
+                .collect(),
+            None => g.entries.keys().take(max).copied().collect(),
+        }
     }
 
     /// Drop every unproven conversation idle for longer than
@@ -2946,6 +2978,77 @@ mod tests {
             .import(&proven[0], &blob, NOW)
             .expect("re-importing a conversation already held must fit");
         assert_eq!(store.len(), 1_024);
+    }
+
+    #[test]
+    fn a_paginated_walk_names_every_conversation_exactly_once() {
+        let store = RatchetStore::new();
+        let mut planted = plant(&store, 37, false, NOW, 0xAC);
+        planted.sort();
+
+        for page_size in [1usize, 2, 5, 36, 37, 38, 1_000] {
+            let mut seen = Vec::new();
+            let mut cursor: Option<ConversationKey> = None;
+            let mut rounds = 0usize;
+            loop {
+                let page = store.keys_after(cursor.as_ref(), page_size);
+                assert!(page.len() <= page_size, "a page overran {page_size}");
+                if page.is_empty() {
+                    break;
+                }
+                cursor = page.last().copied();
+                seen.extend(page);
+                rounds += 1;
+                // A cursor that does not ADVANCE past the key it names walks
+                // forever rather than failing an assertion, and a test that
+                // hangs is a test that reports nothing.
+                assert!(
+                    rounds <= planted.len() + 1,
+                    "page size {page_size}: the walk did not advance past its cursor"
+                );
+            }
+            assert_eq!(
+                seen, planted,
+                "page size {page_size} did not walk the store in key order, once each"
+            );
+        }
+    }
+
+    #[test]
+    fn a_page_costs_the_page_and_not_the_store() {
+        // The point of the cursor. A host with a small buffer must be able to
+        // reach the tail; `keys()` only ever hands back the front of the store
+        // and a host that could not hold it all had no way to see the rest.
+        let store = RatchetStore::new();
+        let mut planted = plant(&store, 500, false, NOW, 0xAD);
+        planted.sort();
+
+        let front = store.keys_after(None, 4);
+        assert_eq!(front, planted[..4]);
+        // The tail, reached without ever materialising the middle.
+        let mut cursor = planted[planted.len() - 3];
+        let tail = store.keys_after(Some(&cursor), 4);
+        assert_eq!(
+            tail,
+            planted[planted.len() - 2..],
+            "the tail was unreachable"
+        );
+
+        // A cursor naming a conversation that has since gone still resumes at
+        // the right place — which is why it is a key and not an offset.
+        assert!(store.forget(&cursor));
+        assert_eq!(
+            store.keys_after(Some(&cursor), 4),
+            planted[planted.len() - 2..]
+        );
+
+        // And a cursor past the end is the end.
+        cursor = ConversationKey {
+            local_instance_id: [0xFF; 16],
+            peer_node_id: [0xFF; 32],
+            peer_instance_id: [0xFF; 16],
+        };
+        assert!(store.keys_after(Some(&cursor), 4).is_empty());
     }
 
     #[test]
