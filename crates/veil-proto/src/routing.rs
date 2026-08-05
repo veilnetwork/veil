@@ -180,9 +180,9 @@ impl RouteWithdrawPayload {
 /// [0..32] target_node_id [u8; 32]
 /// [32..64] requester_node_id [u8; 32]
 /// [64..68] request_id u32 BE — random, used to match the response
-/// [68] ttl u8 — remaining forward hops
-/// [69..133] signature [u8; 64] — ed25519(requester_privkey
-/// target||requester||req_id||ttl)
+/// [68] ttl u8 — remaining forward hops, NOT covered by the signature
+/// [69..133] signature [u8; 64] — ed25519(requester_privkey,
+/// target||requester||req_id)
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RouteRequestPayload {
@@ -203,12 +203,20 @@ impl RouteRequestPayload {
     pub const WIRE_SIZE: usize = 32 + 32 + 4 + 1 + 64; // 133
 
     /// Bytes covered by the signature.
+    ///
+    /// `ttl` is deliberately NOT covered. Every forwarder decrements it, so a
+    /// signature over it verifies at the first hop and nowhere else — which
+    /// made the signature unusable as an authenticator the moment the request
+    /// travelled, and left it looking like one. The stable triple
+    /// `(target, requester, request_id)` is what the target needs in order to
+    /// attribute the request; the hop budget is bounded on ingress instead
+    /// ([`veil_proto::budget::MAX_ROUTE_REQUEST_TTL`]), which does not depend
+    /// on trusting the sender.
     pub fn signable_bytes(&self) -> Vec<u8> {
-        let mut buf = Vec::with_capacity(69);
+        let mut buf = Vec::with_capacity(68);
         buf.extend_from_slice(&self.target_node_id);
         buf.extend_from_slice(&self.requester_node_id);
         buf.extend_from_slice(&self.request_id.to_be_bytes());
-        buf.push(self.ttl);
         buf
     }
 

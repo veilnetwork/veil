@@ -317,6 +317,15 @@ pub struct AbuseContext {
     pub outbound_bandwidth: Arc<Mutex<veil_abuse::BandwidthGate>>,
     /// Separate per-peer token bucket for incoming `PowChallenge` frames.
     pub pow_challenge_limiter: Arc<Mutex<PerPeerLimiter>>,
+    /// Budget for answering `RouteRequest`s we cannot attribute to a signer.
+    ///
+    /// Held by the RECIPIENT, not keyed by peer: an unattributable requester
+    /// has no identity to key on, and the forwarding peer is not the requester.
+    /// Nodes without a sovereign identity must keep working — refusing unsigned
+    /// requests would cut them out of route discovery — so they are served,
+    /// just out of a bounded pot. See
+    /// [`veil_proto::budget::UNSIGNED_ROUTE_REQUEST_BURST`].
+    pub unsigned_route_request_budget: Arc<Mutex<veil_abuse::rate_limiter::TokenBucket>>,
     /// Per-peer quota for new route insertions from RouteResponse.
     ///
     /// Limits how many distinct destinations a single peer may contribute to the
@@ -1831,6 +1840,12 @@ pub fn make_test_dispatcher(role: NodeRole) -> FrameDispatcher {
                 1000.0,
                 std::time::Duration::from_secs(300),
             ))),
+            unsigned_route_request_budget: Arc::new(Mutex::new(
+                veil_abuse::rate_limiter::TokenBucket::new(
+                    veil_proto::budget::UNSIGNED_ROUTE_REQUEST_BURST as f64,
+                    1.0 / veil_proto::budget::UNSIGNED_ROUTE_REQUEST_REFILL_SECS as f64,
+                ),
+            )),
             dht_contact_quota: Arc::new(Mutex::new(veil_abuse::DhtQuota::new(
                 1_000_000,
                 Duration::from_secs(60),
@@ -2543,6 +2558,12 @@ mod tests {
                     1000.0,
                     std::time::Duration::from_secs(300),
                 ))),
+                unsigned_route_request_budget: Arc::new(Mutex::new(
+                    veil_abuse::rate_limiter::TokenBucket::new(
+                        veil_proto::budget::UNSIGNED_ROUTE_REQUEST_BURST as f64,
+                        1.0 / veil_proto::budget::UNSIGNED_ROUTE_REQUEST_REFILL_SECS as f64,
+                    ),
+                )),
                 dht_contact_quota: Arc::new(Mutex::new(veil_abuse::DhtQuota::new(
                     1_000_000,
                     Duration::from_secs(60),
@@ -3379,6 +3400,214 @@ mod tests {
         assert!(
             rx_stranger.try_recv().is_err(),
             "ContactsOnly: nothing should be enqueued — even PowChallenge would confirm existence",
+        );
+    }
+
+    /// report6 V-H1: `ttl` is clamped on ingress.
+    ///
+    /// It is attacker-chosen and cannot be authenticated — every forwarder
+    /// decrements it, so no signature can cover it — and the flooder only ever
+    /// emits 7. Unclamped, one frame carrying `ttl = 255` bought 255 rounds of
+    /// fan-out-to-all-peers off a single send.
+    #[test]
+    fn report6_route_request_ttl_is_clamped_on_ingress() {
+        use ed25519_dalek::SigningKey;
+        use veil_proto::routing::RouteRequestPayload;
+
+        let relay = [0x11u8; 32];
+        let target = [0x22u8; 32];
+        let requester = [0xBBu8; 32];
+        let onward = [0xDDu8; 32];
+        let relay_sk = Arc::new(SigningKey::from_bytes(&[0x11u8; 32]));
+
+        let tx_reg = Arc::new(RwLock::new(veil_session::SessionTxRegistry::new()));
+        let _rx_req = tx_reg.write().unwrap().register(requester);
+        let mut rx_onward = tx_reg.write().unwrap().register(onward);
+
+        let disp =
+            make_gossip_dispatcher(relay, Arc::clone(&relay_sk), Arc::clone(&tx_reg), vec![]);
+        let hdr = FrameHeader::new(FrameFamily::Routing as u8, RoutingMsg::RouteRequest as u16);
+
+        let req = RouteRequestPayload {
+            target_node_id: target,
+            requester_node_id: requester,
+            request_id: 0x1234,
+            ttl: 255,
+            signature: [0u8; 64],
+        };
+        disp.dispatch(&hdr, &req.encode(), requester);
+
+        let (_prio, frame) = rx_onward.try_recv().expect("the request is forwarded");
+        let fwd = RouteRequestPayload::decode(&frame[veil_proto::header::HEADER_SIZE..])
+            .expect("decode forwarded RouteRequest");
+        assert_eq!(
+            fwd.ttl,
+            veil_proto::budget::MAX_ROUTE_REQUEST_TTL - 1,
+            "ttl was forwarded unclamped — one frame buys 255 rounds of fan-out",
+        );
+    }
+
+    /// report6 V-H1: the requester signature is checked at the TARGET, and only
+    /// there.
+    ///
+    /// Relays are the wrong place: a request travels through nodes that have
+    /// never met the requester and therefore hold no key for it, so verifying
+    /// en route would drop honest traffic — and making verification mandatory
+    /// anywhere would cut nodes without a sovereign identity out of discovery,
+    /// which the project does not allow.
+    #[test]
+    fn report6_route_request_signature_is_checked_only_at_the_target() {
+        use ed25519_dalek::SigningKey;
+        use veil_proto::routing::RouteRequestPayload;
+
+        let node = [0x11u8; 32];
+        let requester = [0xBBu8; 32];
+        let requester_sk = SigningKey::from_bytes(&[0xBBu8; 32]);
+        let onward = [0xDDu8; 32];
+        let node_sk = Arc::new(SigningKey::from_bytes(&[0x11u8; 32]));
+
+        let tx_reg = Arc::new(RwLock::new(veil_session::SessionTxRegistry::new()));
+        let _rx_req = tx_reg.write().unwrap().register(requester);
+        let mut rx_onward = tx_reg.write().unwrap().register(onward);
+
+        // The requester's key IS known here, so "the relay could have checked".
+        let mut disp = make_gossip_dispatcher(
+            node,
+            Arc::clone(&node_sk),
+            Arc::clone(&tx_reg),
+            vec![(requester, requester_sk.verifying_key())],
+        );
+        disp.pow_difficulty = 0; // answer directly so the body is assertable
+        let hdr = FrameHeader::new(FrameFamily::Routing as u8, RoutingMsg::RouteRequest as u16);
+
+        // Garbage signature, request addressed to somebody else: relayed anyway.
+        let mut forged = RouteRequestPayload {
+            target_node_id: [0x22u8; 32],
+            requester_node_id: requester,
+            request_id: 1,
+            ttl: 7,
+            signature: [0x5Au8; 64],
+        };
+        disp.dispatch(&hdr, &forged.encode(), requester);
+        assert!(
+            rx_onward.try_recv().is_ok(),
+            "a relay must forward without holding the requester's key",
+        );
+
+        // Same garbage signature, now addressed to US: forgery, refused.
+        forged.target_node_id = node;
+        forged.request_id = 2;
+        let r = disp.dispatch(&hdr, &forged.encode(), requester);
+        assert!(
+            matches!(r, DispatchResult::Violation(_)),
+            "the target must reject a forged requester signature, got {r:?}",
+        );
+
+        // A genuine signature over the stable triple is accepted — note the
+        // request carries a DIFFERENT ttl than the flooder's default, proving
+        // ttl is outside the signed bytes.
+        let mut good = RouteRequestPayload {
+            target_node_id: node,
+            requester_node_id: requester,
+            request_id: 3,
+            ttl: 7,
+            signature: [0u8; 64],
+        };
+        use ed25519_dalek::Signer as _;
+        good.signature = requester_sk.sign(&good.signable_bytes()).to_bytes();
+        good.ttl = 4; // mutated after signing, as a forwarder would
+        let r = disp.dispatch(&hdr, &good.encode(), requester);
+        assert!(
+            matches!(r, DispatchResult::Response(_)),
+            "a signed request must be answered even after a hop changed ttl, got {r:?}",
+        );
+    }
+
+    /// report6 V-H1: an unattributable `RouteRequest` is still served — nodes
+    /// without a sovereign identity must keep finding routes — but out of the
+    /// RECIPIENT's own bounded budget, and exhausting that budget must not
+    /// silence requesters we CAN attribute.
+    #[test]
+    fn report6_unsigned_route_requests_come_out_of_the_recipient_budget() {
+        use ed25519_dalek::{Signer as _, SigningKey};
+        use veil_proto::routing::RouteRequestPayload;
+
+        let node = [0x11u8; 32];
+        let anon = [0xAAu8; 32];
+        let known = [0xBBu8; 32];
+        let known_sk = SigningKey::from_bytes(&[0xBBu8; 32]);
+        let node_sk = Arc::new(SigningKey::from_bytes(&[0x11u8; 32]));
+
+        let tx_reg = Arc::new(RwLock::new(veil_session::SessionTxRegistry::new()));
+        let mut disp = make_gossip_dispatcher(
+            node,
+            Arc::clone(&node_sk),
+            Arc::clone(&tx_reg),
+            vec![(known, known_sk.verifying_key())],
+        );
+        disp.pow_difficulty = 0;
+        *disp.listen_transports.write().unwrap() = vec!["tcp://10.0.0.1:9000".to_string()];
+        let hdr = FrameHeader::new(FrameFamily::Routing as u8, RoutingMsg::RouteRequest as u16);
+
+        let unsigned = |id: u32| RouteRequestPayload {
+            target_node_id: node,
+            requester_node_id: anon,
+            request_id: id,
+            ttl: 7,
+            signature: [0u8; 64],
+        };
+
+        // A stranger we have never handshaked with signs its request, but we
+        // hold no key for it. We cannot tell a good signature from a bad one,
+        // so it is unattributable — NOT a forgery. Rejecting it would cut every
+        // node we have not met out of route discovery.
+        let stranger = [0xCCu8; 32];
+        let stranger_sk = SigningKey::from_bytes(&[0xCCu8; 32]);
+        let mut from_stranger = RouteRequestPayload {
+            target_node_id: node,
+            requester_node_id: stranger,
+            request_id: 0xF00D,
+            ttl: 7,
+            signature: [0u8; 64],
+        };
+        from_stranger.signature = stranger_sk.sign(&from_stranger.signable_bytes()).to_bytes();
+        let r = disp.dispatch(&hdr, &from_stranger.encode(), stranger);
+        assert!(
+            matches!(r, DispatchResult::Response(_)),
+            "a requester whose key we do not hold must still be served, got {r:?}",
+        );
+
+        // The budget is real but not zero: an identity-less node gets answered.
+        // One token already went to the stranger above.
+        let burst = veil_proto::budget::UNSIGNED_ROUTE_REQUEST_BURST - 1;
+        for i in 0..burst {
+            let r = disp.dispatch(&hdr, &unsigned(i).encode(), anon);
+            assert!(
+                matches!(r, DispatchResult::Response(_)),
+                "unsigned request {i} within the burst must be answered, got {r:?}",
+            );
+        }
+        // Past the burst it goes quiet — silently, so refusal is not an
+        // existence oracle.
+        let r = disp.dispatch(&hdr, &unsigned(burst).encode(), anon);
+        assert!(
+            matches!(r, DispatchResult::NoResponse),
+            "unsigned requests past the burst must be dropped silently, got {r:?}",
+        );
+
+        // And a requester we CAN attribute is unaffected by that exhaustion.
+        let mut good = RouteRequestPayload {
+            target_node_id: node,
+            requester_node_id: known,
+            request_id: 0xFFFF,
+            ttl: 7,
+            signature: [0u8; 64],
+        };
+        good.signature = known_sk.sign(&good.signable_bytes()).to_bytes();
+        let r = disp.dispatch(&hdr, &good.encode(), known);
+        assert!(
+            matches!(r, DispatchResult::Response(_)),
+            "an attributable requester must not share the anonymous budget, got {r:?}",
         );
     }
 

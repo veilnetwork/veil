@@ -944,6 +944,11 @@ impl NodeRuntime {
                     config.pow.challenge_burst,
                     std::time::Duration::from_secs(config.pow.challenge_window_secs),
                 ))),
+                // Reused across reloads: a fresh bucket on every reload would
+                // hand an attacker a full burst per reload.
+                unsigned_route_request_budget: Arc::clone(
+                    &self.dispatcher.abuse.unsigned_route_request_budget,
+                ),
                 // reuse across reloads for the same reason.
                 dht_contact_quota: Arc::clone(&self.dispatcher.abuse.dht_contact_quota),
                 // reuse across reloads to preserve in-flight rate state.

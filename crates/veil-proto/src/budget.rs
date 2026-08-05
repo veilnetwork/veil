@@ -801,6 +801,27 @@ pub const ROUTE_DISCOVERY_INITIAL_TTL: u8 = 16;
 /// Default PoW difficulty for route discovery packets.
 pub const ROUTE_DISCOVERY_POW_DIFFICULTY: u8 = 16;
 
+/// Largest `RouteRequest.ttl` a node will act on.
+///
+/// The flooder emits 7. The field is attacker-chosen and cannot be signed (each
+/// forwarder decrements it), so it is clamped on ingress rather than trusted:
+/// without a clamp a single frame with `ttl = 255` buys 255 rounds of
+/// fan-out-to-all-peers off one send.
+pub const MAX_ROUTE_REQUEST_TTL: u8 = 8;
+
+/// Requests-per-window a node will answer for requesters it cannot attribute.
+///
+/// A `RouteRequest` whose signature does not verify against a key we hold is
+/// still served — nodes without a sovereign identity must stay able to find
+/// routes, and refusing them would cut them out of discovery entirely. But an
+/// unattributable request is also the cheapest probe there is, so answering it
+/// comes out of a bounded budget held by the RECIPIENT rather than out of the
+/// requester's (which, being unattributable, does not exist).
+pub const UNSIGNED_ROUTE_REQUEST_BURST: u32 = 32;
+
+/// Refill period for [`UNSIGNED_ROUTE_REQUEST_BURST`], in seconds.
+pub const UNSIGNED_ROUTE_REQUEST_REFILL_SECS: u64 = 60;
+
 /// Per-source rate limit burst for discovery packet forwarding.
 pub const DISCOVERY_RATE_BURST: u32 = 3;
 
