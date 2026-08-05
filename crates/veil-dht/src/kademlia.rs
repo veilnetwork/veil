@@ -41,12 +41,56 @@ use crate::traits::{CoordinateOracle, DhtMetrics, DhtRuntimeConfig, FrameRouter,
 // ── DhtValueSnapshot ─────────────────────────────────────────────────────────
 
 /// One stored DHT key-value pair, serialisable for persistence.
+///
+/// Carries the two facts a bare `(key, value)` pair loses — see
+/// [`super::store::StoredEntry`]. Both are mandatory in the file format; the
+/// schema is versioned by [`DhtValuesSnapshotFile`] rather than by optional
+/// fields, so a reader can tell "old format" from "field happened to be
+/// absent".
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct DhtValueSnapshot {
     #[serde(with = "hex_array")]
     pub key: [u8; 32],
     #[serde(with = "serde_bytes_base64")]
     pub value: Vec<u8>,
+    /// Signer id that authorised the STORE, as tracked by the store's
+    /// per-origin byte accounting.
+    #[serde(with = "hex_array")]
+    pub origin: [u8; 32],
+    /// Seconds this entry had already lived when the snapshot was taken.
+    pub age_secs: u64,
+}
+
+/// On-disk envelope for the DHT-values snapshot.
+///
+/// The previous format was a bare JSON array of `{key, value}` with no version
+/// marker, so provenance and remaining lifetime were simply not representable:
+/// every restored entry came back as [`super::store::ORIGIN_INTERNAL`] (exempt
+/// from the per-origin byte cap) with a full fresh TTL. A restart therefore
+/// laundered a capped origin's bytes into the uncapped bucket and could keep an
+/// expired value alive forever.
+///
+/// Version 2 is the first versioned form and the only one written. A file that
+/// is not version 2 — including the unversioned v1 array — is ignored rather
+/// than guessed at: inventing an origin and an age for legacy rows would
+/// reintroduce exactly the two lies this format exists to stop. The cost of
+/// ignoring is one republish interval of a cache.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct DhtValuesSnapshotFile {
+    pub version: u32,
+    pub entries: Vec<DhtValueSnapshot>,
+}
+
+impl DhtValuesSnapshotFile {
+    /// Schema version written by this build.
+    pub const VERSION: u32 = 2;
+
+    pub fn new(entries: Vec<DhtValueSnapshot>) -> Self {
+        Self {
+            version: Self::VERSION,
+            entries,
+        }
+    }
 }
 
 // c: serde helpers moved to `proto::serde_base64` so wire-format
@@ -1372,14 +1416,20 @@ impl KademliaService {
         // store. When the cold tier is in-memory (no path / no rocksdb-cold) it
         // is volatile, so the snapshot must include BOTH tiers or cold entries
         // would be lost on restart.
+        let now = Instant::now();
         let entries = if inner.store.cold_is_durable() {
-            inner.store.iter_hot()
+            inner.store.iter_hot_with_meta(now)
         } else {
-            inner.store.iter()
+            inner.store.iter_with_meta(now)
         };
         entries
             .into_iter()
-            .map(|(k, v)| DhtValueSnapshot { key: k, value: v })
+            .map(|e| DhtValueSnapshot {
+                key: e.key,
+                value: e.value,
+                origin: e.origin,
+                age_secs: e.age.as_secs(),
+            })
             .collect()
     }
 
@@ -1387,14 +1437,28 @@ impl KademliaService {
     ///
     /// Skips if `self.participate` is `false`. Does not overwrite existing
     /// entries so live values always win over restored ones.
+    ///
+    /// Restores each entry under its recorded origin and with the age it had
+    /// when the snapshot was taken. Both used to be dropped: everything came
+    /// back as `ORIGIN_INTERNAL` — which is exempt from the per-origin byte cap
+    /// — with a fresh full TTL, so a restart laundered a capped origin's bytes
+    /// into the uncapped bucket and reset the clock on values that were about
+    /// to expire.
     pub fn restore_values(&self, entries: Vec<DhtValueSnapshot>) {
         if !self.participate {
             return;
         }
+        let now = Instant::now();
         let mut inner = lock!(self.inner);
         for e in entries {
             if !inner.store.contains(&e.key) {
-                inner.store_insert(e.key, e.value);
+                inner.store.put_restored(
+                    e.key,
+                    e.value,
+                    e.origin,
+                    Duration::from_secs(e.age_secs),
+                    now,
+                );
             }
         }
     }
@@ -2442,6 +2506,8 @@ mod tests {
         let stale = vec![DhtValueSnapshot {
             key,
             value: b"stale".to_vec(),
+            origin: crate::store::ORIGIN_UNSIGNED,
+            age_secs: 0,
         }];
         svc.restore_values(stale);
 
@@ -2459,6 +2525,8 @@ mod tests {
         let snap = vec![DhtValueSnapshot {
             key: [0x44u8; 32],
             value: b"v".to_vec(),
+            origin: crate::store::ORIGIN_UNSIGNED,
+            age_secs: 0,
         }];
         svc.restore_values(snap);
         assert_eq!(
