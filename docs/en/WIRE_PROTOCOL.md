@@ -64,7 +64,7 @@ parentheses below are the `msg_type` values. The source of truth is
 | 5 | Mesh | Forward(0), Beacon(1), Ack(2) |
 | 6 | LocalApp | 79 IPC message types (AppHello=0 … SendAnonymousDirectResult=78); see [`family.rs`](../../crates/veil-proto/src/family.rs) for the full list |
 | 7 | Tunnel | IpPacket(0) — TUN/TAP |
-| 8 | Routing | RouteAnnounce(0), RouteWithdraw(1), RouteRequest(2), RouteResponse(3), PowChallenge(4), PowResponse(5), PowAccept(6), RouteAnnounceAliased(7), RouteWithdrawAliased(8), RouteDiscover(9), RouteDiscoverOffer(10), RecursiveQuery(0x10), RecursiveResponse(0x11), RouteUpdate(0x12), VersionVectorSync(0x13) |
+| 8 | Routing | RouteAnnounce(0), RouteWithdraw(1), RouteRequest(2), RouteResponse(3), PowChallenge(4), PowResponse(5), PowAccept(6), RouteAnnounceAliased(7), RouteWithdrawAliased(8), RouteDiscover(9), RouteDiscoverOffer(10), RecursiveQuery(0x10), RecursiveResponse(0x11) |
 | 9 | Diag | Ping(1), Pong(2), TraceProbe(3), TraceHop(4) |
 | 10 | RelayChain | Hop(0) — onion-encrypted relay chain; RegisterRendezvous(1), UnregisterRendezvous(2), ForwardIntroduce(3) — plain control payloads over an established session (not onion-encrypted) |
 | 11 | PeerExchange | Walk(0), Challenge(1), Response(2), Result(3) |

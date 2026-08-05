@@ -171,8 +171,6 @@ pub struct RouteCache {
     via_to_dsts: HashMap<[u8; 32], HashSet<[u8; 32]>>,
     ttl: Duration,
     /// Per-origin version counter for event-driven sync.
-    /// Tracks the latest version seen for each origin to produce version vectors.
-    route_versions: HashMap<[u8; 32], u64>,
     /// Maximum number of destination entries (0 = unlimited).
     /// configurable capacity; insert evicts LRU when full.
     max_destinations: usize,
@@ -185,7 +183,6 @@ impl RouteCache {
             via_counts: HashMap::new(),
             via_to_dsts: HashMap::new(),
             ttl,
-            route_versions: HashMap::new(),
             max_destinations: 0, // unlimited
         }
     }
@@ -231,7 +228,6 @@ impl RouteCache {
                         Self::idx_remove(&mut self.via_to_dsts, &r.next_hop, &dst);
                     }
                 }
-                self.route_versions.remove(&dst);
             }
         }
         // Defensive idempotent-tail block (kept for symmetry with old code
@@ -245,45 +241,10 @@ impl RouteCache {
                         Self::idx_remove(&mut self.via_to_dsts, &r.next_hop, &dst);
                     }
                 }
-                self.route_versions.remove(&dst);
             } else {
                 break;
             }
         }
-    }
-
-    /// Update the version for an origin.
-    pub fn update_version(&mut self, origin: [u8; 32], version: u64) {
-        // Audit M-C: bound `route_versions` so it cannot grow without limit on
-        // origin churn (previously it was pruned ONLY inside `resize()`, never
-        // on the LRU-evict / invalidate / expire paths). On the direct route
-        // plane the immediate peer self-signs the RouteUpdate, so it controls
-        // `origin_node_id` freely — a stream of distinct origins would add a
-        // permanent entry each, leaking memory AND, past 10_000 entries, making
-        // this node's periodic `version_summary()` broadcast undecodable by
-        // every receiver (`VersionVectorSyncPayload::decode` rejects
-        // count > 10_000). Cap at `MAX_ROUTE_CACHE_SIZE` (same bound as
-        // `entries`), evicting the lowest-version (most stale) origin when full
-        // before inserting a new one — the same policy as `route_origin_seq`.
-        if !self.route_versions.contains_key(&origin)
-            && self.route_versions.len() >= MAX_ROUTE_CACHE_SIZE
-            && let Some(evict) = self
-                .route_versions
-                .iter()
-                .min_by_key(|(_, v)| **v)
-                .map(|(k, _)| *k)
-        {
-            self.route_versions.remove(&evict);
-        }
-        let entry = self.route_versions.entry(origin).or_insert(0);
-        if version > *entry {
-            *entry = version;
-        }
-    }
-
-    /// Return a summary of all known origin→version pairs for version-vector exchange.
-    pub fn version_summary(&self) -> Vec<([u8; 32], u64)> {
-        self.route_versions.iter().map(|(k, v)| (*k, *v)).collect()
     }
 
     // ── insert ────────────────────────────────────────────────────────────
@@ -876,26 +837,6 @@ mod tests {
         let mut cache = RouteCache::new(Duration::from_secs(60));
         cache.insert([1u8; 32], [2u8; 32], 5_000, 1);
         assert_eq!(cache.lookup(&[1u8; 32]), Some([2u8; 32]));
-    }
-
-    /// Audit M-C: `route_versions` must stay bounded at `MAX_ROUTE_CACHE_SIZE`
-    /// under origin churn (a peer streaming distinct self-signed origins), so it
-    /// neither leaks memory nor grows the version_summary() broadcast past the
-    /// 10_000-entry VV-sync decode limit.
-    #[test]
-    fn update_version_is_bounded_m_c() {
-        let mut cache = RouteCache::new(Duration::from_secs(60));
-        for i in 0..(MAX_ROUTE_CACHE_SIZE + 500) {
-            let mut origin = [0u8; 32];
-            origin[..8].copy_from_slice(&(i as u64).to_be_bytes());
-            cache.update_version(origin, i as u64 + 1);
-        }
-        assert!(
-            cache.version_summary().len() <= MAX_ROUTE_CACHE_SIZE,
-            "route_versions must be bounded at MAX_ROUTE_CACHE_SIZE ({}), got {}",
-            MAX_ROUTE_CACHE_SIZE,
-            cache.version_summary().len()
-        );
     }
 
     #[test]

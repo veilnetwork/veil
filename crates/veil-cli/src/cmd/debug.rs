@@ -506,8 +506,6 @@ fn msg_type_name(family: u8, msg_type: u16) -> &'static str {
         (8, 7) => "AnnounceAliased",
         (8, 8) => "WithdrawAliased",
         (8, 0x10) => "RecursiveQuery",
-        (8, 0x12) => "RouteUpdate",
-        (8, 0x13) => "VersionVectorSync",
         // Diag
         (9, 1) => "Ping",
         (9, 2) => "Pong",
