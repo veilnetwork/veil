@@ -27,7 +27,13 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
+
+// Deliberately outside the VEIL_MEDIA_HAVE_WEBRTC block: the lifetime rule it
+// carries is about closures, not about media, and keeping it WebRTC-free is
+// what lets test/run_on_smoke.cc check it on any host in under a second.
+#include "veil_run_on.h"
 
 #if defined(__APPLE__)
 #include <TargetConditionals.h>
@@ -58,7 +64,6 @@
 #include "api/task_queue/task_queue_base.h"
 #include "api/task_queue/task_queue_factory.h"
 #include "api/units/time_delta.h"
-#include "rtc_base/event.h"
 #include "call/audio_receive_stream.h"
 #include "call/audio_send_stream.h"
 #include "call/audio_state.h"
@@ -169,18 +174,29 @@ void update_atomic_max(std::atomic<int64_t>* target, int64_t value) {
 // Run `f` synchronously on `tq` and block until it finishes. webrtc::Call and
 // its streams must be created/destroyed on the worker task queue (they call
 // TaskQueueBase::Current(), which is null on the FFI caller thread → crash).
+//
+// Returns false if the queue never scheduled the task within the deadline. In
+// that case `f` did NOT run and never will -- see veil_run_on.h for why that
+// guarantee, and not the deadline, is the point.
+//
+// Every caller below passes a `[&]` lambda over its own frame, and a closure
+// temporary dies at the semicolon of the call that created it. The shape this
+// replaces -- post, wait ten seconds, return regardless -- therefore left the
+// queue holding a reference to a dead closure over a dead frame, and the
+// engine writing stream pointers into freed memory whenever the worker queue
+// was wedged or already shut down (audit report8 H-07; ASan calls it
+// stack-use-after-scope).
 template <typename F>
-void run_on(webrtc::TaskQueueBase* tq, F f) {
-  if (tq == nullptr || tq->IsCurrent()) {
-    f();
-    return;
+bool run_on(webrtc::TaskQueueBase* tq, F&& f) {
+  const bool ran = veil_media::run_on_with_timeout(tq, std::forward<F>(f),
+                                                   std::chrono::seconds(10));
+  if (!ran) {
+    // Not a diagnostic nicety: the operation the caller asked for did not
+    // happen, and every callsite here is written as though it did.
+    vlog("media: worker task queue did not schedule within 10s; "
+         "operation skipped");
   }
-  webrtc::Event done;
-  tq->PostTask([&f, &done]() mutable {
-    f();
-    done.Set();
-  });
-  done.Wait(webrtc::TimeDelta::Seconds(10));
+  return ran;
 }
 
 // SSRC from the first 4 bytes of a node id (never 0 — 0 is an invalid SSRC).
