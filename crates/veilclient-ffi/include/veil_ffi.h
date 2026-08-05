@@ -466,6 +466,35 @@
 
 #if defined(VEIL_FFI_NODE_EMBEDDED)
 /**
+ * Returned when the store is at [`VEIL_RATCHET_MAX_CONVERSATIONS`] and every
+ * conversation held is one this device has spoken on, so none can be dropped
+ * without permanently stranding it and its peer.
+ *
+ * Distinct from a malformed argument because the remedy is different and
+ * belongs to the host: forget conversations the user no longer wants. It is
+ * not reachable by a peer — everything a stranger can plant is unproven, and
+ * unproven conversations are exactly what the quota evicts on its own.
+ */
+#define VEIL_ERR_RATCHET_STORE_FULL -22
+#endif
+
+#if defined(VEIL_FFI_NODE_EMBEDDED)
+/**
+ * Most conversations one device holds at once.
+ *
+ * Spelled as a literal because cbindgen emits `#define`s only for literals: a
+ * `= veil_e2e::MAX_CONVERSATIONS` here compiles perfectly well and then simply
+ * does not appear in the header, which is the same "header drifts from
+ * lib.rs" failure the regeneration gate exists to stop — except that a
+ * MISSING constant produces no diff for the gate to catch. The assertion
+ * below is what keeps the literal honest: move the store's ceiling without
+ * moving this and the build stops here rather than shipping two numbers.
+ */
+#define VEIL_RATCHET_MAX_CONVERSATIONS 1024
+#endif
+
+#if defined(VEIL_FFI_NODE_EMBEDDED)
+/**
  * Most conversation keys one [`veil_ratchet_ack_dirty`] call may name.
  *
  * A host acknowledges what it peeked, so this is far above any real batch. It
@@ -2848,6 +2877,35 @@ int veil_ratchet_list(VeilHandle *handle,
                       size_t *out_total,
                       char **err_out)
 ;
+#endif
+
+#if defined(VEIL_FFI_NODE_EMBEDDED)
+/**
+ * Drop every unproven conversation that has gone unused for longer than the
+ * ratchet's time-to-live, and mark each so the host deletes its stored blob.
+ * `*out_dropped` receives how many went.
+ *
+ * For a host to call on a timer, or when it comes back to the foreground.
+ * Without it the sweep only runs when the store is full, so a device that has
+ * been flooded once keeps carrying the wreckage until something else needs
+ * the room.
+ *
+ * "Unproven" means a conversation this device has never sent a message on:
+ * somebody opened it, and nothing has confirmed they are who they named. Only
+ * those are aged out. A conversation that has carried traffic is never
+ * dropped by time, at any age — the peer's copy of it cannot be restarted by
+ * anything on the wire, so aging one out would wedge both ends for good. The
+ * host decides those with [`veil_ratchet_forget`].
+ *
+ * The clock is this device's own, read here. There is no parameter for it,
+ * because there must be no way for a value that came off the network to
+ * decide which conversations are old enough to disappear.
+ *
+ * # Safety
+ *
+ * `handle` must be live. `out_dropped` MUST be writable.
+ */
+ int veil_ratchet_expire(VeilHandle *handle, size_t *out_dropped, char **err_out) ;
 #endif
 
 #if defined(VEIL_FFI_NODE_EMBEDDED)

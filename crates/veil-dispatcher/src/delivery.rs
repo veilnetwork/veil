@@ -3878,6 +3878,7 @@ mod ratchet_terminal_tests {
                     ratchet_pk: &pk,
                 },
                 plaintext,
+                veil_util::unix_secs_now_u64(),
             )
             .expect("seal")
             .0
@@ -4124,7 +4125,10 @@ mod ratchet_terminal_tests {
 
         // Restored, the very same frame opens: the failed attempt consumed
         // nothing, because there was nothing to consume.
-        bob.runtime.store.import(&key, &blob).expect("restore");
+        bob.runtime
+            .store
+            .import(&key, &blob, veil_util::unix_secs_now_u64())
+            .expect("restore");
         let (hdr, body) = forward_frame([0x08u8; 32], bare);
         disp.dispatch(&hdr, &body, NodeId::from(RELAY));
         let (_src, provenance, data) = take(&mut rx).expect("delivered after restore");
