@@ -84,7 +84,13 @@ must_use = "VEIL_NODISCARD"
 
 [export]
 include = []
-exclude = []
+# `VEIL_ABI_CONTRACT_HASH` is the SHA-256 OF THIS HEADER (see
+# `scripts/gen-ffi-abi-contract.py`). Emitting it here would make the header
+# contain its own hash, and regeneration would chase a moving target forever
+# instead of reaching a fixed point. Foreign callers reach the value through
+# the exported `veil_abi_contract_hash()` accessor, whose signature — and
+# therefore this header — does not change when the hash does.
+exclude = ["VEIL_ABI_CONTRACT_HASH"]
 
 # Phase 6.50.b audit-B4: cbindgen has no per-config "primitive type
 # rename" — `[export.rename]` only applies to struct/enum/fn symbols.

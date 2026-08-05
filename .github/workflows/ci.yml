@@ -81,7 +81,7 @@ jobs:
       - name: Install cbindgen
         run: cargo install cbindgen --version "^0.29" --locked
 
-      - name: FFI header is up-to-date (cbindgen)
+      - name: FFI header + ABI contract are up-to-date (cbindgen)
         # Phase 6.50.b-followup: regenerate `veil_ffi.h` from Rust source
         # and diff against committed copy.  Closes the "header drifts from
         # lib.rs" bug class (e.g. NetworkKind.unknown = 4 vs 255 Dart
@@ -89,9 +89,19 @@ jobs:
         # hand-maintained and nobody noticed missing exports).  PRs that
         # touch FFI signatures must regenerate (`./scripts/regen-ffi-header.sh`)
         # and commit the updated header.
+        #
+        # The same script now also derives the ABI contract hash and the Dart
+        # constants FROM that header, and they are diffed by the same gate:
+        # the hand-written Dart bindings had no link to the native side at all
+        # (report7 V-05), and the one number they restated had already drifted
+        # 256 bytes (V-07).  Whatever this gate covers cannot be forgotten;
+        # whatever it does not, will be.
         run: |
           ./scripts/regen-ffi-header.sh
-          git diff --exit-code crates/veilclient-ffi/include/veil_ffi.h
+          git diff --exit-code \
+            crates/veilclient-ffi/include/veil_ffi.h \
+            crates/veilclient-ffi/src/abi_contract.rs \
+            flutter/veil_flutter/lib/src/abi_contract.dart
 
       - name: Mutex poison-recovery policy
         # Phase 6.50.b-followup: enforce that production code uses the

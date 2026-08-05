@@ -29,3 +29,9 @@ cbindgen \
     --output crates/veilclient-ffi/include/veil_ffi.h
 
 echo "OK: regenerated crates/veilclient-ffi/include/veil_ffi.h"
+
+# Second pass, and it must stay second: everything that has to agree with the
+# C ABI is derived from the header cbindgen just wrote — the contract hash both
+# sides compare, and the numeric constants the Dart bindings expose. See
+# scripts/gen-ffi-abi-contract.py for why a hash rather than a version counter.
+python3 scripts/gen-ffi-abi-contract.py
