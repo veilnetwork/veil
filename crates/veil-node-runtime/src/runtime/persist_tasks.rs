@@ -404,34 +404,51 @@ impl NodeRuntime {
 
     // ── DHT values persistence ─────────────────────────────────────
 
-    pub fn restore_dht_values_snapshot(&self, config: &veil_cfg::Config) {
-        // Auto-derive path from config directory when not explicitly set.
-        let auto_path;
-        let path = match config.dht.values_persist_path.as_ref() {
-            Some(p) => p,
-            None => {
-                let dir = self
-                    .config_path
-                    .parent()
-                    .unwrap_or(std::path::Path::new("."));
-                auto_path = dir.join("dht_values.json").to_string_lossy().into_owned();
-                &auto_path
-            }
+    /// Read the persisted DHT-values snapshot, or nothing when value
+    /// persistence is off.
+    ///
+    /// `dht.values_persist_path = None` is documented as "disables", and the
+    /// stop flush in `lifecycle.rs` has always honoured that, as does every
+    /// neighbouring persist path (route cache, RTT, Vivaldi, DHT routing,
+    /// autodiscover, gateway list, peer pubkeys, transport announcements) —
+    /// each is a plain `if let Some(path)`.
+    ///
+    /// This path used to disagree, silently deriving
+    /// `<config_dir>/dht_values.json`. On an operator who had not asked for
+    /// value persistence that wrote DHT records — including other people's
+    /// replicated ones — to an undocumented file next to the config, and read
+    /// them back on the next start. And because the stop flush did honour
+    /// `None`, the file it restored from was always up to one write interval
+    /// stale, so a node resurrected values it had already dropped while losing
+    /// the ones it had just accepted. Takes no directory now, so it structurally
+    /// cannot read anything but the configured path.
+    pub fn load_dht_values_snapshot(
+        config: &veil_cfg::Config,
+        logger: &NodeLogger,
+    ) -> Vec<veil_dht::kademlia::DhtValueSnapshot> {
+        let Some(path) = config.dht.values_persist_path.as_ref() else {
+            return Vec::new();
         };
-        let data = match std::fs::read_to_string(path) {
-            Ok(s) => s,
-            Err(_) => return,
+        let Ok(data) = std::fs::read_to_string(path) else {
+            return Vec::new();
         };
-        let entries: Vec<veil_dht::kademlia::DhtValueSnapshot> = match serde_json::from_str(&data) {
+        match serde_json::from_str(&data) {
             Ok(v) => v,
             Err(e) => {
-                self.logger.warn(
+                logger.warn(
                     "dht.values.persist.parse_err",
                     format!("DHT values snapshot parse failed ({e})"),
                 );
-                return;
+                Vec::new()
             }
-        };
+        }
+    }
+
+    pub fn restore_dht_values_snapshot(&self, config: &veil_cfg::Config) {
+        let entries = Self::load_dht_values_snapshot(config, &self.logger);
+        if entries.is_empty() {
+            return;
+        }
         let total = entries.len();
         self.dht.restore_values(entries);
         self.logger.info(
@@ -740,5 +757,69 @@ impl NodeRuntime {
                 )
             },
         );
+    }
+}
+
+#[cfg(test)]
+mod dht_values_path_tests {
+    use super::*;
+
+    fn logger() -> NodeLogger {
+        veil_cfg::observability_glue::logger_from_config(&veil_cfg::Config::default())
+            .expect("default logger")
+    }
+
+    fn snapshot_json() -> String {
+        // One entry, in the on-disk shape the flusher writes.
+        serde_json::to_string(&vec![veil_dht::kademlia::DhtValueSnapshot {
+            key: [7u8; 32],
+            value: b"restored".to_vec(),
+        }])
+        .expect("encode snapshot")
+    }
+
+    /// report6 V-H6a: `dht.values_persist_path = None` disables value
+    /// persistence.
+    ///
+    /// The docs say so, the stop flush has always obeyed it, and so does every
+    /// neighbouring persist path. Restore-on-start disagreed: it derived
+    /// `<config_dir>/dht_values.json` and read whatever was there, on an
+    /// operator who never asked for value persistence — and, because the stop
+    /// flush DID obey `None`, from a file that was always up to one write
+    /// interval stale.
+    #[test]
+    fn unset_values_persist_path_reads_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        // The file the derive used to invent, sitting exactly where it looked.
+        std::fs::write(dir.path().join("dht_values.json"), snapshot_json()).unwrap();
+
+        let mut config = veil_cfg::Config::default();
+        config.dht.values_persist_path = None;
+        // Bait: point another DHT directory knob at the same dir, so ANY
+        // "invent a path from a configured directory" fallback lands on the
+        // planted file rather than on nothing.
+        config.dht.cold_store_path = Some(dir.path().to_string_lossy().into_owned());
+
+        let entries = NodeRuntime::load_dht_values_snapshot(&config, &logger());
+        assert!(
+            entries.is_empty(),
+            "an unset path must disable value persistence, not derive one",
+        );
+    }
+
+    /// Control: a configured path is still read.
+    #[test]
+    fn configured_values_persist_path_is_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("values.json");
+        std::fs::write(&path, snapshot_json()).unwrap();
+
+        let mut config = veil_cfg::Config::default();
+        config.dht.values_persist_path = Some(path.to_string_lossy().into_owned());
+
+        let entries = NodeRuntime::load_dht_values_snapshot(&config, &logger());
+        assert_eq!(entries.len(), 1, "a configured path must still restore");
+        assert_eq!(entries[0].key, [7u8; 32]);
+        assert_eq!(entries[0].value, b"restored");
     }
 }
