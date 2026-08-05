@@ -3,70 +3,83 @@
 // Mirrors `crates/veilclient-ffi/src/lib.rs` — keep in lockstep when the
 // C surface evolves.  Higher-level Dart wrappers in `client.dart` build on
 // these typedefs and avoid surfacing raw `Pointer<…>` types to consumers.
+//
+// The SIGNATURES below are still hand-written and still have to be kept in
+// lockstep by hand — but the library refuses to load at all unless its ABI
+// contract hash matches what these bindings were generated against, so a
+// signature that has drifted fails at load rather than at the first call
+// (see `native.dart`).  The VALUES below are no longer hand-written: every
+// numeric constant comes from `abi_contract.dart`, which is generated from
+// the same header, because a restated number drifts silently — this file
+// carried a payload ceiling 256 bytes above the native one for exactly that
+// reason (report7 V-07).
 
 import 'dart:ffi';
 
 import 'package:ffi/ffi.dart' show Utf8, Utf8Pointer;
 
+import 'abi_contract.dart' as abi;
 import 'native.dart';
 
 // ── Status codes ─────────────────────────────────────────────────────────────
 
-const int veilOk = 0;
-const int veilErr = -1;
-const int veilErrInvalidArg = -2;
-const int veilErrClosed = -3;
-const int veilErrReentrant = -4;
+const int veilOk = abi.veilOk;
+const int veilErr = abi.veilErr;
+const int veilErrInvalidArg = abi.veilErrInvalidArg;
+const int veilErrClosed = abi.veilErrClosed;
+const int veilErrReentrant = abi.veilErrReentrant;
 
 /// Per-call payload cap shared by datagram + stream write/read primitives.
-/// Mirrors `VEIL_MAX_DATA_LEN` in `crates/veilclient-ffi/src/lib.rs`.
-const int veilMaxDataLen = 16 * 1024 * 1024;
+/// `VEIL_MAX_DATA_LEN` — note this is 16 MiB MINUS 256 bytes of IPC framing
+/// headroom, not a round 16 MiB.  Hand-written as the round number here, it
+/// accepted 256 bytes that a dozen Rust checks then rejected.
+const int veilMaxDataLen = abi.veilMaxDataLen;
 
-// ── Mailbox ceilings (mirror the VEIL_MAILBOX_* constants) ──────────────────
+// ── Mailbox ceilings ────────────────────────────────────────────────────────
 
 /// Total payload bytes one mailbox fetch batch can return — the size of the
 /// `blob_buf` [veilMailboxFetchInto] needs.  The daemon cuts a batch here, so
 /// a buffer of exactly this size is correct for every backlog; sizing it from
 /// anything else is a guess, and the guess used to be short (report7 V-01).
-const int veilMailboxMaxFetchBytes = 8 * 1024 * 1024;
+const int veilMailboxMaxFetchBytes = abi.veilMailboxMaxFetchBytes;
 
 /// Records one mailbox fetch batch can return — the descriptor-slot count.
-const int veilMailboxMaxFetchCount = 1024;
+const int veilMailboxMaxFetchCount = abi.veilMailboxMaxFetchCount;
 
 /// Largest blob the relay accepts in a single PUT.  NOT [veilMaxDataLen],
 /// which is sixteen times larger and bounds a different surface.
-const int veilMailboxMaxBlobBytes = 1024 * 1024;
+const int veilMailboxMaxBlobBytes = abi.veilMailboxMaxBlobBytes;
 
 // ── Network kind enum (veil_proto::NetworkKind wire bytes) ────────────────
 
-const int veilNetOffline = 0;
-const int veilNetWifi = 1;
-const int veilNetCellular = 2;
-const int veilNetEthernet = 3;
-const int veilNetUnknown = 255;
+const int veilNetOffline = abi.veilNetOffline;
+const int veilNetWifi = abi.veilNetWifi;
+const int veilNetCellular = abi.veilNetCellular;
+const int veilNetEthernet = abi.veilNetEthernet;
+const int veilNetUnknown = abi.veilNetUnknown;
 
 // ── Mobile background tier (MobileBackgroundMode wire bytes) ─────────────────
 
-const int veilBgForeground = 0;
-const int veilBgActive = 1;
-const int veilBgLowPower = 2;
+const int veilBgForeground = abi.veilBgForeground;
+const int veilBgActive = abi.veilBgActive;
+const int veilBgLowPower = abi.veilBgLowpower;
 
 // ── Push-event kind constants (mirror veil_proto::event_kind) ─────────────
 
-const int veilEventSessionsChanged = 0;
-const int veilEventMobileTierChanged = 1;
-const int veilEventIdentityRotated = 2;
-const int veilEventMailboxDrained = 3;
-const int veilEventMailboxWake = 5;
+const int veilEventSessionsChanged = abi.veilEventSessionsChanged;
+const int veilEventMobileTierChanged = abi.veilEventMobileTierChanged;
+const int veilEventIdentityRotated = abi.veilEventIdentityRotated;
+const int veilEventMailboxDrained = abi.veilEventMailboxDrained;
+const int veilEventMailboxWake = abi.veilEventMailboxWake;
 
 // ── Wake-HMAC constants + verdict codes (Epic 489.10 slice 4.3.3) ────────────
 
-const int veilWakeVerdictValid = 0;
-const int veilWakeVerdictTampered = 1;
-const int veilWakeVerdictExpired = 2;
-const int veilWakeVerdictMalformed = 3;
-const int veilWakeHmacKeyLen = 32;
-const int veilWakePayloadLen = 72;
+const int veilWakeVerdictValid = abi.veilWakeVerdictValid;
+const int veilWakeVerdictTampered = abi.veilWakeVerdictTampered;
+const int veilWakeVerdictExpired = abi.veilWakeVerdictExpired;
+const int veilWakeVerdictMalformed = abi.veilWakeVerdictMalformed;
+const int veilWakeHmacKeyLen = abi.veilWakeHmacKeyLen;
+const int veilWakePayloadLen = abi.veilWakePayloadLen;
 
 // ── Opaque pointer types ─────────────────────────────────────────────────────
 
@@ -108,10 +121,10 @@ typedef VeilRecvCb = void Function(
 // `VEIL_PROVENANCE_*` constants in veil_ffi.h. `SenderProvenance.fromWire`
 // (types.dart) is the only thing that should read these directly; anything
 // unrecognised must fail closed to [veilProvenanceClaimed].
-const int veilProvenanceClaimed = 0;
-const int veilProvenanceLocalIpc = 1;
-const int veilProvenanceSessionPeer = 2;
-const int veilProvenanceSigned = 3;
+const int veilProvenanceClaimed = abi.veilProvenanceClaimed;
+const int veilProvenanceLocalIpc = abi.veilProvenanceLocalIpc;
+const int veilProvenanceSessionPeer = abi.veilProvenanceSessionPeer;
+const int veilProvenanceSigned = abi.veilProvenanceSigned;
 
 typedef VeilEventCbNative = Void Function(
   Pointer<Void> user,
@@ -148,14 +161,14 @@ typedef VeilPeerCb = void Function(
 );
 
 // Wire-byte session-state values for VeilPeerCb.state (mirrors veil_ffi.h).
-const int veilPeerStateConnecting = 0;
-const int veilPeerStateActive = 1;
-const int veilPeerStateClosed = 2;
-const int veilPeerStateUnknown = 255;
+const int veilPeerStateConnecting = abi.veilPeerStateConnecting;
+const int veilPeerStateActive = abi.veilPeerStateActive;
+const int veilPeerStateClosed = abi.veilPeerStateClosed;
+const int veilPeerStateUnknown = abi.veilPeerStateUnknown;
 
 // Wire-byte direction values for VeilPeerCb.direction.
-const int veilPeerDirInbound = 0;
-const int veilPeerDirOutbound = 1;
+const int veilPeerDirInbound = abi.veilPeerDirInbound;
+const int veilPeerDirOutbound = abi.veilPeerDirOutbound;
 
 // ── C-function lookups ───────────────────────────────────────────────────────
 
@@ -535,7 +548,7 @@ final int Function(Pointer<VeilHandle>,
 
 /// Daemon is not relay-capable — `veil_get_relay_x25519_pubkey` returns this
 /// (mirrors `VEIL_RELAY_X25519_UNAVAILABLE` in veilclient-ffi).
-const int veilRelayX25519Unavailable = -10;
+const int veilRelayX25519Unavailable = abi.veilRelayX25519Unavailable;
 
 /// Read the daemon's relay-side X25519 public key (32 bytes) into the
 /// out-buffer. Returns `veilOk` when populated, or
@@ -1140,18 +1153,18 @@ final int Function(
 
 /// Per-envelope wire overhead (eph_pk + nonce + tag).  Mirrors
 /// `VEIL_PUSH_ENVELOPE_OVERHEAD` in `crates/veilclient-ffi`.
-const int veilPushEnvelopeOverhead = 60;
+const int veilPushEnvelopeOverhead = abi.veilPushEnvelopeOverhead;
 
 /// Hard cap on inner token length.
-const int veilMaxPushTokenLen = 384;
+const int veilMaxPushTokenLen = abi.veilMaxPushTokenLen;
 
 /// Hard cap on sealed envelope length.
-const int veilMaxPushEnvelopeLen = 512;
+const int veilMaxPushEnvelopeLen = abi.veilMaxPushEnvelopeLen;
 
 /// Push-envelope status codes (veilclient-ffi VEIL_PUSH_*).
-const int veilPushOk = 0;
-const int veilPushNoRendezvous = 1;
-const int veilPushTooLarge = 2;
+const int veilPushOk = abi.veilPushOk;
+const int veilPushNoRendezvous = abi.veilPushNoRendezvous;
+const int veilPushTooLarge = abi.veilPushTooLarge;
 
 final int Function(
   Pointer<Uint8>, // token
@@ -1258,21 +1271,21 @@ final int Function(
 // ── Pairing / bootstrap-invite consume (Epic 489.7) ─────────────────────────
 
 // JoinBootstrap status wire bytes (veil_proto::JoinBootstrapStatus).
-const int veilJoinOk = 0;
-const int veilJoinInvalidUri = 1;
-const int veilJoinPasswordRequired = 2;
-const int veilJoinPasswordWrong = 3;
-const int veilJoinSignatureInvalid = 4;
-const int veilJoinInternalError = 5;
-const int veilJoinAlreadyRegistered = 6;
+const int veilJoinOk = abi.veilJoinOk;
+const int veilJoinInvalidUri = abi.veilJoinInvalidUri;
+const int veilJoinPasswordRequired = abi.veilJoinPasswordRequired;
+const int veilJoinPasswordWrong = abi.veilJoinPasswordWrong;
+const int veilJoinSignatureInvalid = abi.veilJoinSignatureInvalid;
+const int veilJoinInternalError = abi.veilJoinInternalError;
+const int veilJoinAlreadyRegistered = abi.veilJoinAlreadyRegistered;
 
 // CreateBootstrapInvite status wire bytes
 // (veil_proto::create_invite_status, mirrors veilclient-ffi's
 // VEIL_CREATE_INVITE_*).
-const int veilCreateInviteOk = 0;
-const int veilCreateInviteNotConfigured = 1;
-const int veilCreateInviteBadPassword = 2;
-const int veilCreateInviteInternalError = 3;
+const int veilCreateInviteOk = abi.veilCreateInviteOk;
+const int veilCreateInviteNotConfigured = abi.veilCreateInviteNotConfigured;
+const int veilCreateInviteBadPassword = abi.veilCreateInviteBadPassword;
+const int veilCreateInviteInternalError = abi.veilCreateInviteInternalError;
 
 final int Function(
   Pointer<VeilHandle>,
@@ -1394,15 +1407,15 @@ final int Function(
 
 // Explicit hole-punch outcome wire bytes (veil_proto::hole_punch_status,
 // mirrors veilclient-ffi's VEIL_HOLE_PUNCH_*).
-const int veilHolePunchConnected = 0;
-const int veilHolePunchNoReflector = 1;
-const int veilHolePunchSignalingTimeout = 2;
-const int veilHolePunchMappingUnusable = 3;
-const int veilHolePunchPunchTimeout = 4;
-const int veilHolePunchQuicFailed = 5;
-const int veilHolePunchRefusedAnonymous = 6;
-const int veilHolePunchUnknownPeer = 7;
-const int veilHolePunchUnsupported = 8;
+const int veilHolePunchConnected = abi.veilHolePunchConnected;
+const int veilHolePunchNoReflector = abi.veilHolePunchNoReflector;
+const int veilHolePunchSignalingTimeout = abi.veilHolePunchSignalingTimeout;
+const int veilHolePunchMappingUnusable = abi.veilHolePunchMappingUnusable;
+const int veilHolePunchPunchTimeout = abi.veilHolePunchPunchTimeout;
+const int veilHolePunchQuicFailed = abi.veilHolePunchQuicFailed;
+const int veilHolePunchRefusedAnonymous = abi.veilHolePunchRefusedAnonymous;
+const int veilHolePunchUnknownPeer = abi.veilHolePunchUnknownPeer;
+const int veilHolePunchUnsupported = abi.veilHolePunchUnsupported;
 
 final int Function(
   Pointer<VeilHandle>,
@@ -1423,15 +1436,15 @@ final int Function(
 // ── Mailbox (Epic 489.3) ────────────────────────────────────────────────────
 
 // MailboxPutStatus wire bytes (veil_proto::MailboxPutStatus).
-const int veilMailboxPutStored = 0;
-const int veilMailboxPutDuplicate = 1;
-const int veilMailboxPutQuotaPerReceiver = 2;
-const int veilMailboxPutQuotaGlobal = 3;
-const int veilMailboxPutRateLimited = 4;
-const int veilMailboxPutNotRelay = 5;
-const int veilMailboxPutCapabilityRequired = 6;
-const int veilMailboxPutCapabilityInvalid = 7;
-const int veilMailboxPutQuotaPerSender = 8;
+const int veilMailboxPutStored = abi.veilMailboxPutStored;
+const int veilMailboxPutDuplicate = abi.veilMailboxPutDuplicate;
+const int veilMailboxPutQuotaPerReceiver = abi.veilMailboxPutQuotaPerReceiver;
+const int veilMailboxPutQuotaGlobal = abi.veilMailboxPutQuotaGlobal;
+const int veilMailboxPutRateLimited = abi.veilMailboxPutRateLimited;
+const int veilMailboxPutNotRelay = abi.veilMailboxPutNotRelay;
+const int veilMailboxPutCapabilityRequired = abi.veilMailboxPutCapabilityRequired;
+const int veilMailboxPutCapabilityInvalid = abi.veilMailboxPutCapabilityInvalid;
+const int veilMailboxPutQuotaPerSender = abi.veilMailboxPutQuotaPerSender;
 
 /// Mirror of C `VeilMailboxBlob` (repr(C)).  Mirrors
 /// `crates/veilclient-ffi/src/lib.rs::VeilMailboxBlob`.
@@ -2201,30 +2214,30 @@ final Pointer<NativeFunction<Void Function(Pointer<Void>)>>
 // ── Multi-device pairing (Epic 489.8) ───────────────────────────────────────
 
 // Source-side status codes (mirror VEIL_PAIR_SOURCE_* in veilclient-ffi).
-const int veilPairSourceOk = 0;
-const int veilPairSourceNotConfigured = 1;
-const int veilPairSourceAlreadyInProgress = 2;
-const int veilPairSourceInternalError = 3;
-const int veilPairSourceWrongState = 4;
-const int veilPairSourceBadHello = 5;
-const int veilPairSourceUserAborted = 6;
-const int veilPairSourceBadConfirm = 7;
+const int veilPairSourceOk = abi.veilPairSourceOk;
+const int veilPairSourceNotConfigured = abi.veilPairSourceNotConfigured;
+const int veilPairSourceAlreadyInProgress = abi.veilPairSourceAlreadyInProgress;
+const int veilPairSourceInternalError = abi.veilPairSourceInternalError;
+const int veilPairSourceWrongState = abi.veilPairSourceWrongState;
+const int veilPairSourceBadHello = abi.veilPairSourceBadHello;
+const int veilPairSourceUserAborted = abi.veilPairSourceUserAborted;
+const int veilPairSourceBadConfirm = abi.veilPairSourceBadConfirm;
 
 // Target-side status codes (mirror VEIL_PAIR_TARGET_*).
-const int veilPairTargetOk = 0;
-const int veilPairTargetBadUri = 1;
-const int veilPairTargetExpired = 2;
-const int veilPairTargetAlreadyInProgress = 3;
-const int veilPairTargetBadCert = 4;
-const int veilPairTargetWrongState = 5;
-const int veilPairTargetInternalError = 6;
+const int veilPairTargetOk = abi.veilPairTargetOk;
+const int veilPairTargetBadUri = abi.veilPairTargetBadUri;
+const int veilPairTargetExpired = abi.veilPairTargetExpired;
+const int veilPairTargetAlreadyInProgress = abi.veilPairTargetAlreadyInProgress;
+const int veilPairTargetBadCert = abi.veilPairTargetBadCert;
+const int veilPairTargetWrongState = abi.veilPairTargetWrongState;
+const int veilPairTargetInternalError = abi.veilPairTargetInternalError;
 
 /// Max ceremony frame size (64 KiB) — recommended caller buffer size
 /// for Hello / Cert / Confirm byte transfers.
-const int veilMaxPairCeremonyBytes = 64 * 1024;
+const int veilMaxPairCeremonyBytes = abi.veilMaxPairCeremonyBytes;
 
 /// OOB code length (6 ASCII digits).
-const int veilPairOobCodeLen = 6;
+const int veilPairOobCodeLen = abi.veilPairOobCodeLen;
 
 final int Function(
   Pointer<VeilHandle>,
@@ -2392,7 +2405,7 @@ final int Function(
 // in as `priorSeeds`, and cancels by simply not calling again.
 
 /// `veil_nickname_resolve` verdict: the name has no valid owner (available).
-const int veilNicknameFree = 1;
+const int veilNicknameFree = abi.veilNicknameFree;
 
 // Normalize a candidate nickname. Writes normalized ASCII bytes to *out_buf
 // (free with [veilFreeBuf]). VEIL_OK, or VEIL_ERR_INVALID_ARG on a bad name.
