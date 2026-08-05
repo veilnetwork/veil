@@ -1168,7 +1168,10 @@ mod tests {
         let loaded = load_or_generate_mlkem_key_encrypted(&path, Some("first-passphrase")).unwrap();
 
         // The node keeps running: the key it holds is the same working key.
-        assert_eq!(loaded.ek, plain.ek, "the in-memory key must still be usable");
+        assert_eq!(
+            loaded.ek, plain.ek,
+            "the in-memory key must still be usable"
+        );
         assert_eq!(loaded.dk_seed, plain.dk_seed);
         // And the file is still plaintext, which is the part that must reach
         // the operator.

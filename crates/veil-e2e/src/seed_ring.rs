@@ -369,21 +369,18 @@ mod tests {
         let before_pk = r.current_ratchet_pk();
         let before_sk = *r.current_ratchet_sk();
 
-        r.rotate(
-            1_000,
-            1,
-            [0x22; DK_SEED_BYTES],
-            [0x22; EK_BYTES],
-            OVERLAP,
-        )
-        .expect("rotate");
+        r.rotate(1_000, 1, [0x22; DK_SEED_BYTES], [0x22; EK_BYTES], OVERLAP)
+            .expect("rotate");
 
         assert_ne!(r.current_ratchet_pk(), before_pk, "the key must turn over");
 
         let usable = r.ratchet_secrets(1_000);
         assert_eq!(usable.len(), 2, "current plus the one still in its window");
         assert_eq!(usable[0], *r.current_ratchet_sk());
-        assert_eq!(usable[1], before_sk, "the predecessor must still be offered");
+        assert_eq!(
+            usable[1], before_sk,
+            "the predecessor must still be offered"
+        );
 
         // And it drops out exactly when the mailbox seed does.
         let past = 1_000 + OVERLAP + 1;

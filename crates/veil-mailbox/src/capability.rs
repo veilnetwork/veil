@@ -509,7 +509,9 @@ impl MailboxCapabilityToken {
         // malicious-relay-replay vector where R captures a valid token
         // observed during legitimate deposit and replays it to other replicas.
         match (self.binding, expected_relay_id) {
-            (TokenBinding::Relay(token_relay), Some(local_relay)) if &token_relay != local_relay => {
+            (TokenBinding::Relay(token_relay), Some(local_relay))
+                if &token_relay != local_relay =>
+            {
                 return Err(CapTokenError::RelayMismatch {
                     token_hex: hex_short(&token_relay),
                     expected_hex: hex_short(local_relay),
@@ -1148,13 +1150,8 @@ mod tests {
         let pk = vec![0u8; 32];
         let relay = [0xEEu8; 32];
         let v1 = signed_message_for(TOKEN_VERSION, ALGO_ED25519, 1000, 2000, &pk);
-        let v2 = signed_message_for_versioned(
-            TokenBinding::Relay(relay),
-            ALGO_ED25519,
-            1000,
-            2000,
-            &pk,
-        );
+        let v2 =
+            signed_message_for_versioned(TokenBinding::Relay(relay), ALGO_ED25519, 1000, 2000, &pk);
         assert_ne!(v1, v2);
     }
 
@@ -1228,7 +1225,9 @@ mod tests {
         let rid = receiver_id_of(&decoded.issuer_pk);
         // Presented at the named relay: accepted. At another: refused, not
         // silently downgraded to "valid anywhere".
-        decoded.verify(&rid, Some(&relay), 1500).expect("bound relay");
+        decoded
+            .verify(&rid, Some(&relay), 1500)
+            .expect("bound relay");
         assert!(matches!(
             decoded.verify(&rid, Some(&[0x99u8; 32]), 1500),
             Err(CapTokenError::RelayMismatch { .. })
@@ -1251,7 +1250,9 @@ mod tests {
         // Control: the exact-length token still decodes and verifies.
         let decoded = MailboxCapabilityToken::decode(&bytes).expect("exact length decodes");
         let rid = receiver_id_of(&decoded.issuer_pk);
-        decoded.verify(&rid, None, 1500).expect("control must verify");
+        decoded
+            .verify(&rid, None, 1500)
+            .expect("control must verify");
 
         for extra in [1usize, 7, 64] {
             let mut padded = bytes.clone();

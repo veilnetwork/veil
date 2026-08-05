@@ -1149,8 +1149,11 @@ mod tests {
     }
 
     /// Build a bound `AppHandle` over a live dispatch table, ready to split.
-    async fn bound_handle_async() -> (Arc<Mutex<DispatchTable>>, AppHandle, mpsc::Receiver<Vec<u8>>)
-    {
+    async fn bound_handle_async() -> (
+        Arc<Mutex<DispatchTable>>,
+        AppHandle,
+        mpsc::Receiver<Vec<u8>>,
+    ) {
         let (tx, rx) = mpsc::channel::<Vec<u8>>(8);
         let dispatch = Arc::new(Mutex::new(DispatchTable::new()));
         let (mtx, mrx) = mpsc::channel::<IncomingMessage>(1);

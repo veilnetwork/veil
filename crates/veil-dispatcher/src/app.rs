@@ -175,8 +175,7 @@ impl FrameDispatcher {
                         // Not a violation: a conversation the host has not
                         // restored yet looks exactly like this, and so does a
                         // frame for another of our devices.
-                        self.logger
-                            .debug("app.ratchet.open_failed", format!("{e}"));
+                        self.logger.debug("app.ratchet.open_failed", format!("{e}"));
                     }
                 }
                 DispatchResult::NoResponse

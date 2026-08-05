@@ -1776,7 +1776,6 @@ fn reject_incompatible_major(remote_major: u16) -> Result<()> {
     Ok(())
 }
 
-
 #[cfg(test)]
 #[allow(deprecated)] // a few fixtures use the legacy `TicketIssuer::issue` shim
 mod tests {

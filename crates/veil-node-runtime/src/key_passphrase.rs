@@ -254,8 +254,12 @@ fn read_passphrase_file(path: &std::path::Path) -> Result<Zeroizing<String>> {
         ))
     })?;
 
-    let text = std::str::from_utf8(&buf)
-        .map_err(|_| bad(format!("key_passphrase_file {} is not UTF-8", path.display())))?;
+    let text = std::str::from_utf8(&buf).map_err(|_| {
+        bad(format!(
+            "key_passphrase_file {} is not UTF-8",
+            path.display()
+        ))
+    })?;
     Ok(Zeroizing::new(text.to_string()))
 }
 

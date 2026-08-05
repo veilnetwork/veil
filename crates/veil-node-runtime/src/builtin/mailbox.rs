@@ -57,8 +57,7 @@ use veil_mailbox::{
 };
 use veil_proto::{
     MAILBOX_PUT_CHUNK_DATA_BYTES, MAX_MAILBOX_FETCH_ENTRIES, MAX_MAILBOX_PUT_CHUNKS,
-    MailboxBlobWire, MailboxFetchRespPayload,
-    MailboxPutChunkPayload, MailboxPutPayload,
+    MailboxBlobWire, MailboxFetchRespPayload, MailboxPutChunkPayload, MailboxPutPayload,
 };
 use veil_types::AnonOnionSender;
 
@@ -1990,7 +1989,8 @@ mod tests {
         // A replay half-way through the idle window. Under the old rule this
         // pushed the timer to here and chunk 0 survived to meet chunk 1 below.
         assert!(
-            ra.accept(first_of_two(0x11), t0 + PUT_REASSEMBLY_STALE / 2).is_none()
+            ra.accept(first_of_two(0x11), t0 + PUT_REASSEMBLY_STALE / 2)
+                .is_none()
         );
 
         let past_idle = t0 + PUT_REASSEMBLY_STALE + Duration::from_secs(1);
@@ -2135,7 +2135,12 @@ mod tests {
         // decoder caps chunk_data at 240 B, so a single oversized chunk would
         // be rejected there and this test would pass without the fetch-budget
         // gate below ever running.
-        let inner = mk_inner(recv, [0xC9; 32], [0x33; 32], vec![0xEE; fetch_reply_budget()]);
+        let inner = mk_inner(
+            recv,
+            [0xC9; 32],
+            [0x33; 32],
+            vec![0xEE; fetch_reply_budget()],
+        );
         for chunk in mk_chunks([0xC9; 32], &inner) {
             handle_put_message(
                 &mb,

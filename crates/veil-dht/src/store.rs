@@ -1435,7 +1435,12 @@ impl TieredStore {
     /// A snapshot of `(key, value)` alone loses two things the store knows and
     /// cannot re-derive on restore: WHO put the entry there, and HOW LONG it
     /// has already lived. See [`StoredEntry`].
-    fn entry_meta(&self, key: &[u8; 32], inserted_at: Instant, now: Instant) -> ([u8; 32], Duration) {
+    fn entry_meta(
+        &self,
+        key: &[u8; 32],
+        inserted_at: Instant,
+        now: Instant,
+    ) -> ([u8; 32], Duration) {
         let origin = self
             .entry_origin
             .get(key)
@@ -1463,17 +1468,20 @@ impl TieredStore {
     /// [`Self::iter`] with provenance and age attached.
     pub fn iter_with_meta(&self, now: Instant) -> Vec<StoredEntry> {
         let mut out = self.iter_hot_with_meta(now);
-        out.extend(self.cold.iter_entries_with_ts(now).into_iter().map(
-            |(k, v, inserted_at)| {
-                let (origin, age) = self.entry_meta(&k, inserted_at, now);
-                StoredEntry {
-                    key: k,
-                    value: v,
-                    origin,
-                    age,
-                }
-            },
-        ));
+        out.extend(
+            self.cold
+                .iter_entries_with_ts(now)
+                .into_iter()
+                .map(|(k, v, inserted_at)| {
+                    let (origin, age) = self.entry_meta(&k, inserted_at, now);
+                    StoredEntry {
+                        key: k,
+                        value: v,
+                        origin,
+                        age,
+                    }
+                }),
+        );
         out
     }
 
@@ -1659,9 +1667,7 @@ impl TieredStore {
                     // Restored under its ORIGINAL timestamp: it is not a new
                     // entry, and re-dating it would make it the last thing
                     // demotion tries again rather than the first.
-                    log::warn!(
-                        "dht.demote: cold tier refused the value; keeping it hot"
-                    );
+                    log::warn!("dht.demote: cold tier refused the value; keeping it hot");
                     self.hot.insert(key, (value, ts));
                     self.hot_order.insert((ts, key), ());
                 }
@@ -1754,7 +1760,11 @@ mod tests {
         let snap = store.iter_with_meta(snap_at);
         assert_eq!(snap.len(), 2, "both tiers must appear in the snapshot");
         for e in &snap {
-            let expected = if e.key == [1u8; 32] { origin_a } else { origin_b };
+            let expected = if e.key == [1u8; 32] {
+                origin_a
+            } else {
+                origin_b
+            };
             assert_eq!(e.origin, expected, "provenance lost for {:?}", e.key);
             assert!(
                 (7199..=7200).contains(&e.age.as_secs()),
@@ -2417,7 +2427,11 @@ mod tests {
         cold.plant_unindexed_value(&[3u8; 32], b"value-cf-only");
 
         let keys = cold.iter_keys();
-        assert_eq!(keys.len(), 2, "iter_keys must report the indexed set: {keys:?}");
+        assert_eq!(
+            keys.len(),
+            2,
+            "iter_keys must report the indexed set: {keys:?}"
+        );
         assert!(keys.contains(&[1u8; 32]) && keys.contains(&[2u8; 32]));
         assert!(
             !keys.contains(&[3u8; 32]),
@@ -2451,7 +2465,11 @@ mod tests {
             let mut cold = super::rocks::RocksDbCold::open(&path, 0).unwrap();
             cold.put([1u8; 32], b"indexed".to_vec()); // 7 bytes
             cold.plant_unindexed_value(&[2u8; 32], b"ghost-value"); // 11 bytes
-            assert_eq!(cold.len(), 1, "fixture: the ghost is invisible to the count");
+            assert_eq!(
+                cold.len(),
+                1,
+                "fixture: the ghost is invisible to the count"
+            );
         }
 
         let mut cold = super::rocks::RocksDbCold::open(&path, 0).unwrap();
@@ -2502,7 +2520,11 @@ mod tests {
         }
 
         let cold = super::rocks::RocksDbCold::open(&path, 0).unwrap();
-        assert_eq!(cold.len(), 1, "an orphan is not an entry and must not count");
+        assert_eq!(
+            cold.len(),
+            1,
+            "an orphan is not an entry and must not count"
+        );
         assert_eq!(
             cold.cold_total_bytes(),
             Some(4),
@@ -2597,7 +2619,10 @@ mod tests {
             "nothing was adopted on reopen, so the failed put left no ghost"
         );
         assert!(!cold.contains(&[2u8; 32]), "and no value");
-        assert!(cold.contains(&[1u8; 32]), "the failed delete kept its value");
+        assert!(
+            cold.contains(&[1u8; 32]),
+            "the failed delete kept its value"
+        );
         assert_eq!(cold.reverse_map_row_count(), 1);
         assert_eq!(cold.ts_index_row_count(), 1);
         assert_eq!(cold.cold_total_bytes(), Some(6));

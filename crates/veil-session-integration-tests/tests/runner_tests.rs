@@ -467,7 +467,11 @@ async fn runner_aead_encrypt_decrypt_round_trip() {
         signature: [0u8; 64],
     };
     let req_bytes = req.encode();
-    let rr_aad = aad_for_plaintext(FrameFamily::Routing as u8, RoutingMsg::RouteRequest as u16, req_bytes.len());
+    let rr_aad = aad_for_plaintext(
+        FrameFamily::Routing as u8,
+        RoutingMsg::RouteRequest as u16,
+        req_bytes.len(),
+    );
     let enc_req = client_tx.seal(&req_bytes, &rr_aad).expect("seal req body");
     {
         let mut hdr = FrameHeader::new(FrameFamily::Routing as u8, RoutingMsg::RouteRequest as u16);
@@ -604,7 +608,11 @@ async fn runner_rekey_grace_recovers_inflight_old_encrypted_frames() {
         ephemeral_pubkey: client_pubkey,
     }
     .encode();
-    let init_aad = aad_for_plaintext(FrameFamily::Session as u8, SessionMsg::RekeyInit as u16, init_body.len());
+    let init_aad = aad_for_plaintext(
+        FrameFamily::Session as u8,
+        SessionMsg::RekeyInit as u16,
+        init_body.len(),
+    );
     let enc_init = client_tx
         .seal(&init_body, &init_aad)
         .expect("seal RekeyInit");
@@ -841,7 +849,11 @@ async fn runner_rekey_emits_observability_counters() {
         ephemeral_pubkey: client_pubkey,
     }
     .encode();
-    let init_aad = aad_for_plaintext(FrameFamily::Session as u8, SessionMsg::RekeyInit as u16, init_body.len());
+    let init_aad = aad_for_plaintext(
+        FrameFamily::Session as u8,
+        SessionMsg::RekeyInit as u16,
+        init_body.len(),
+    );
     let enc_init = client_tx
         .seal(&init_body, &init_aad)
         .expect("seal RekeyInit");
@@ -1059,7 +1071,11 @@ async fn runner_rekey_storm_triggers_cap_eviction_once_after_four_rekeys() {
             ephemeral_pubkey: client_pubkey,
         }
         .encode();
-        let init_aad = aad_for_plaintext(FrameFamily::Session as u8, SessionMsg::RekeyInit as u16, init_body.len());
+        let init_aad = aad_for_plaintext(
+            FrameFamily::Session as u8,
+            SessionMsg::RekeyInit as u16,
+            init_body.len(),
+        );
         let enc_init = client_tx
             .seal(&init_body, &init_aad)
             .unwrap_or_else(|_| panic!("seal RekeyInit round={round}"));
@@ -1504,7 +1520,11 @@ async fn phase650b_mutual_rekey_collision_kept_init_when_local_node_id_lower() {
         ephemeral_pubkey: our_pubkey,
     }
     .encode();
-    let ack_aad = aad_for_plaintext(FrameFamily::Session as u8, SessionMsg::RekeyAck as u16, ack_body.len());
+    let ack_aad = aad_for_plaintext(
+        FrameFamily::Session as u8,
+        SessionMsg::RekeyAck as u16,
+        ack_body.len(),
+    );
     let enc_ack = client_tx.seal(&ack_body, &ack_aad).expect("seal RekeyAck");
     let mut ack_hdr = FrameHeader::new(FrameFamily::Session as u8, SessionMsg::RekeyAck as u16);
     ack_hdr.body_len = enc_ack.len() as u32;
@@ -2019,7 +2039,11 @@ async fn phase650b_rekey_state_survives_transport_swap() {
         ephemeral_pubkey: our_pubkey,
     }
     .encode();
-    let ack_aad = aad_for_plaintext(FrameFamily::Session as u8, SessionMsg::RekeyAck as u16, ack_body.len());
+    let ack_aad = aad_for_plaintext(
+        FrameFamily::Session as u8,
+        SessionMsg::RekeyAck as u16,
+        ack_body.len(),
+    );
     let enc_ack = client_tx.seal(&ack_body, &ack_aad).expect("seal RekeyAck");
     let mut ack_hdr = FrameHeader::new(FrameFamily::Session as u8, SessionMsg::RekeyAck as u16);
     ack_hdr.body_len = enc_ack.len() as u32;
@@ -2292,7 +2316,11 @@ async fn phase650b_rekey_bypasses_low_battery_deferral_window() {
         ephemeral_pubkey: our_pubkey,
     }
     .encode();
-    let ack_aad = aad_for_plaintext(FrameFamily::Session as u8, SessionMsg::RekeyAck as u16, ack_body.len());
+    let ack_aad = aad_for_plaintext(
+        FrameFamily::Session as u8,
+        SessionMsg::RekeyAck as u16,
+        ack_body.len(),
+    );
     let enc_ack = client_tx.seal(&ack_body, &ack_aad).expect("seal RekeyAck");
     let mut ack_hdr = FrameHeader::new(FrameFamily::Session as u8, SessionMsg::RekeyAck as u16);
     ack_hdr.body_len = enc_ack.len() as u32;
@@ -2560,7 +2588,11 @@ async fn phase650b_rekey_state_survives_hot_standby_trigger_firing() {
         ephemeral_pubkey: our_pubkey,
     }
     .encode();
-    let ack_aad = aad_for_plaintext(FrameFamily::Session as u8, SessionMsg::RekeyAck as u16, ack_body.len());
+    let ack_aad = aad_for_plaintext(
+        FrameFamily::Session as u8,
+        SessionMsg::RekeyAck as u16,
+        ack_body.len(),
+    );
     let enc_ack = client_tx.seal(&ack_body, &ack_aad).expect("seal RekeyAck");
     let mut ack_hdr = FrameHeader::new(FrameFamily::Session as u8, SessionMsg::RekeyAck as u16);
     ack_hdr.body_len = enc_ack.len() as u32;
@@ -3234,7 +3266,11 @@ async fn rekey_completes_and_subsequent_frames_decrypt() {
         ephemeral_pubkey: rekey_pub,
     }
     .encode();
-    let rekey_aad = aad_for_plaintext(FrameFamily::Session as u8, SessionMsg::RekeyInit as u16, rekey_body.len());
+    let rekey_aad = aad_for_plaintext(
+        FrameFamily::Session as u8,
+        SessionMsg::RekeyInit as u16,
+        rekey_body.len(),
+    );
     let enc_rekey_init = client_tx.seal(&rekey_body, &rekey_aad).unwrap();
     {
         let mut hdr = FrameHeader::new(FrameFamily::Session as u8, SessionMsg::RekeyInit as u16);

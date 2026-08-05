@@ -2559,7 +2559,13 @@ async fn remote_stream_open_survives_the_teardown_guard_once_claimed() {
         endpoint_id: 1,
         initial_window: STREAM_INITIAL_WINDOW,
     };
-    send_ipc_frame_id(&mut client, LocalAppMsg::StreamOpen as u16, 42, &open.encode()).await;
+    send_ipc_frame_id(
+        &mut client,
+        LocalAppMsg::StreamOpen as u16,
+        42,
+        &open.encode(),
+    )
+    .await;
 
     // The peer ACCEPTS.
     let mut accepted = false;
@@ -2575,8 +2581,7 @@ async fn remote_stream_open_survives_the_teardown_guard_once_claimed() {
 
     let (hdr, body) = tokio::time::timeout(Duration::from_secs(2), recv_ipc_frame(&mut client))
         .await
-        .expect("timeout waiting for STREAM_OPEN_OK")
-        ;
+        .expect("timeout waiting for STREAM_OPEN_OK");
     assert_eq!(hdr.msg_type, LocalAppMsg::StreamOpenOk as u16);
     assert_eq!(hdr.request_id, 42, "the reply must echo the request id");
     let stream_id = StreamOpenOkPayload::decode(&body).unwrap().stream_id;

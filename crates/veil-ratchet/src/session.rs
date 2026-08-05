@@ -605,10 +605,16 @@ mod tests {
                 v
             }),
             ("truncated body", good[..good.len() - 20].to_vec()),
-            ("no ciphertext", good[..FRAME_FIXED_LEN + ML_KEM_768_EK_LEN].to_vec()),
+            (
+                "no ciphertext",
+                good[..FRAME_FIXED_LEN + ML_KEM_768_EK_LEN].to_vec(),
+            ),
         ];
         for (name, frame) in cases {
-            assert!(b.decrypt(&frame, AD, &mut br).is_err(), "{name} was accepted");
+            assert!(
+                b.decrypt(&frame, AD, &mut br).is_err(),
+                "{name} was accepted"
+            );
         }
         assert_eq!(b.decrypt(&good, AD, &mut br).expect("open"), b"z");
     }

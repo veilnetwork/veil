@@ -1053,12 +1053,21 @@ pub fn open(
     published_peer_ik: Option<&[u8; 32]>,
     now_unix: u64,
 ) -> Result<Opened, RatchetSpliceError> {
-    let mut opened = open_inner(store, me, sender_node_id, payload, published_peer_ik, now_unix)?;
+    let mut opened = open_inner(
+        store,
+        me,
+        sender_node_id,
+        payload,
+        published_peer_ik,
+        now_unix,
+    )?;
     if opened.plaintext.len() < ACK_KEY_LEN {
         // Authenticated, so it came from the peer — but the peer built a
         // payload this version does not understand. Refuse rather than hand a
         // truncated application payload upward.
-        return Err(RatchetSpliceError::Malformed("plaintext shorter than its ack key"));
+        return Err(RatchetSpliceError::Malformed(
+            "plaintext shorter than its ack key",
+        ));
     }
     let rest = opened.plaintext.split_off(ACK_KEY_LEN);
     opened
@@ -1285,7 +1294,8 @@ fn open_inner(
             // failure of the last seed in the ring.
             Err(e) => {
                 let e = RatchetSpliceError::Ratchet(e);
-                if first_err.is_none() || matches!(e, RatchetSpliceError::Ratchet(RatchetError::PqDowngrade))
+                if first_err.is_none()
+                    || matches!(e, RatchetSpliceError::Ratchet(RatchetError::PqDowngrade))
                 {
                     first_err = Some(e);
                 }
@@ -1379,9 +1389,7 @@ impl RatchetRuntime {
         app_payload: &[u8],
         now_unix: u64,
     ) -> Result<(Vec<u8>, [u8; ACK_KEY_LEN]), RatchetSpliceError> {
-        let me = self
-            .identity()
-            .ok_or(RatchetSpliceError::NoLocalInstance)?;
+        let me = self.identity().ok_or(RatchetSpliceError::NoLocalInstance)?;
         seal(&self.store, &me, peer, app_payload, now_unix)
     }
 
@@ -1392,9 +1400,7 @@ impl RatchetRuntime {
         payload: &[u8],
         now_unix: u64,
     ) -> Result<Opened, RatchetSpliceError> {
-        let me = self
-            .identity()
-            .ok_or(RatchetSpliceError::NoLocalInstance)?;
+        let me = self.identity().ok_or(RatchetSpliceError::NoLocalInstance)?;
         let published = self.published_ik(sender_node_id);
         open(
             &self.store,
@@ -2671,13 +2677,19 @@ mod tests {
         assert!(
             store
                 .export(&outstanding[0])
-                .map(|b| Entry::decode(&b).expect("decode").pending_prologue.is_some())
+                .map(|b| Entry::decode(&b)
+                    .expect("decode")
+                    .pending_prologue
+                    .is_some())
                 .unwrap_or(false),
             "the outstanding prologue did not survive"
         );
         assert_eq!(store.len(), 1_024);
         for (i, key) in proven.iter().enumerate() {
-            assert!(store.has_session(key), "proven conversation {i} was evicted");
+            assert!(
+                store.has_session(key),
+                "proven conversation {i} was evicted"
+            );
         }
 
         // Time does not take it either: it is not in the class the sweep can

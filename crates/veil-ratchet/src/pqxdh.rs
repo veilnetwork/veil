@@ -380,15 +380,8 @@ mod tests {
         let received = InitialMessage::decode(&wire).expect("decode");
         assert_eq!(received, msg);
 
-        let (plaintext, mut bob_session) = accept(
-            &bob.ik_sk,
-            &bob.seed,
-            peers(),
-            &received,
-            AD,
-            &mut brng,
-        )
-        .expect("accept");
+        let (plaintext, mut bob_session) =
+            accept(&bob.ik_sk, &bob.seed, peers(), &received, AD, &mut brng).expect("accept");
         assert_eq!(plaintext, b"hello from the void");
 
         // And the conversation continues in both directions.
@@ -624,15 +617,8 @@ mod tests {
         )
         .expect("initiate");
 
-        let (plaintext, _) = accept(
-            &bob.ik_sk,
-            &bob.seed,
-            peers(),
-            &forged,
-            AD,
-            &mut brng,
-        )
-        .expect("accept");
+        let (plaintext, _) =
+            accept(&bob.ik_sk, &bob.seed, peers(), &forged, AD, &mut brng).expect("accept");
         assert_eq!(plaintext, b"Alice never wrote this");
 
         // And there is no signature anywhere in it to distinguish the forgery

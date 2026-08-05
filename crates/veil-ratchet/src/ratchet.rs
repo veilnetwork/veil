@@ -176,9 +176,7 @@ impl RatchetCore {
 
 impl RatchetCore {
     /// Advance the sending chain by one and hand back the header and key.
-    pub(crate) fn send_step(
-        &mut self,
-    ) -> Result<(Header, Zeroizing<[u8; KEY_LEN]>), RatchetError> {
+    pub(crate) fn send_step(&mut self) -> Result<(Header, Zeroizing<[u8; KEY_LEN]>), RatchetError> {
         let cks = self.cks.as_mut().ok_or(RatchetError::NoSendingChain)?;
         let (next, mk) = kdf_ck(cks);
         *cks = next;
@@ -234,7 +232,10 @@ impl RatchetCore {
         }
         self.skip_message_keys(header.n)?;
 
-        let ckr = self.ckr.as_mut().ok_or(RatchetError::MessageKeyUnavailable)?;
+        let ckr = self
+            .ckr
+            .as_mut()
+            .ok_or(RatchetError::MessageKeyUnavailable)?;
         let (next, mk) = kdf_ck(ckr);
         *ckr = next;
         self.nr = self.nr.saturating_add(1);
@@ -466,9 +467,17 @@ mod tests {
         let (mut alice, mut bob, mut ar, mut br) = pair();
         for turn in 0..12u32 {
             let (h, mk_a) = alice.send_step().expect("chain");
-            assert_eq!(*mk_a, *bob.recv_step(&h, &mut br).expect("a→b"), "turn {turn}");
+            assert_eq!(
+                *mk_a,
+                *bob.recv_step(&h, &mut br).expect("a→b"),
+                "turn {turn}"
+            );
             let (h, mk_b) = bob.send_step().expect("chain");
-            assert_eq!(*mk_b, *alice.recv_step(&h, &mut ar).expect("b→a"), "turn {turn}");
+            assert_eq!(
+                *mk_b,
+                *alice.recv_step(&h, &mut ar).expect("b→a"),
+                "turn {turn}"
+            );
         }
     }
 
@@ -592,8 +601,14 @@ mod tests {
         let (h_new, mk_new) = alice.send_step().expect("chain");
 
         // The stragglers from the old epoch still open.
-        assert_eq!(*bob.recv_step(&a[2].0, &mut br).expect("straggler"), *a[2].1);
-        assert_eq!(*bob.recv_step(&a[1].0, &mut br).expect("straggler"), *a[1].1);
+        assert_eq!(
+            *bob.recv_step(&a[2].0, &mut br).expect("straggler"),
+            *a[2].1
+        );
+        assert_eq!(
+            *bob.recv_step(&a[1].0, &mut br).expect("straggler"),
+            *a[1].1
+        );
         // And so does the new epoch.
         assert_eq!(*bob.recv_step(&h_new, &mut br).expect("new epoch"), *mk_new);
     }
@@ -702,7 +717,8 @@ mod tests {
         }
         assert_eq!(
             *mk_real,
-            *bob.recv_step(&ha2, &mut br).expect("live session still works"),
+            *bob.recv_step(&ha2, &mut br)
+                .expect("live session still works"),
         );
     }
 
