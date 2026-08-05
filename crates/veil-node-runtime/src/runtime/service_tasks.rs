@@ -3076,6 +3076,12 @@ impl NodeRuntime {
         // — an inbound wake datagram from a relay becomes a MAILBOX_WAKE event
         // the client SDK turns into an immediate drain. Nodes older than this
         // endpoint simply have nothing bound and drop the wake silently.
+        //
+        // Because the binding is unconditional the SENDER is any session peer,
+        // not necessarily a relay holding a deposit for us, and the per-receiver
+        // `WAKE_DEBOUNCE` below is on the wrong side of the wire to help. The
+        // listener therefore keeps its own per-sender debounce
+        // (`builtin::mailbox::WAKE_RECV_DEBOUNCE`).
         if let Some(host) = self.builtin_app_host.as_mut() {
             let wake_ctx = host.make_context(
                 *self.identity.local_identity.node_id.as_bytes(),

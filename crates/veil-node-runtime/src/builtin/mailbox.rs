@@ -317,14 +317,116 @@ pub fn spawn_mailbox_app_service(
     });
 }
 
+/// Minimum interval between two `MAILBOX_WAKE` events published for the SAME
+/// sender. Mirrors the relay-side `WAKE_DEBOUNCE` in `service_tasks.rs`.
+///
+/// The relay-side debounce is per RECEIVER and lives inside the
+/// `mailbox.enabled` block, so it constrains only a well-behaved relay's own
+/// fan-out. It does nothing here: the wake endpoint is bound on every node,
+/// and any session peer — relay or not — can send an empty datagram to it.
+/// Each one used to publish an event, and each event makes the client app
+/// drain its mailbox: radio up, battery down, at whatever rate the peer likes.
+pub const WAKE_RECV_DEBOUNCE: Duration = Duration::from_secs(2);
+
+/// Cap on distinct senders tracked by [`WakeDebounce`]. Reached only under a
+/// Sybil-ish fan of session peers; the map is compacted before it grows past
+/// this, so the listener's memory is bounded by construction.
+const MAX_WAKE_RECV_DEBOUNCE_ENTRIES: usize = 1024;
+
+/// Per-sender receive-side wake debounce.
+///
+/// Keyed by sender rather than kept as one global timestamp on purpose: a
+/// single global gate would let ONE noisy peer suppress a real relay's wake,
+/// turning a battery fix into a delivery-latency bug.
+pub struct WakeDebounce {
+    last: HashMap<[u8; 32], Instant>,
+}
+
+impl WakeDebounce {
+    pub fn new() -> Self {
+        Self {
+            last: HashMap::new(),
+        }
+    }
+
+    /// `true` when a wake from `src` may be published now; records the time if
+    /// so. A suppressed wake costs nothing but latency — the app's own poll
+    /// schedule still drains the mailbox.
+    pub fn admit(&mut self, src: &[u8; 32], now: Instant) -> bool {
+        if self
+            .last
+            .get(src)
+            .is_some_and(|t| now.duration_since(*t) < WAKE_RECV_DEBOUNCE)
+        {
+            return false;
+        }
+        if self.last.len() >= MAX_WAKE_RECV_DEBOUNCE_ENTRIES {
+            self.last
+                .retain(|_, t| now.duration_since(*t) < WAKE_RECV_DEBOUNCE);
+            // Compaction alone is not a bound: a fan of distinct senders
+            // arriving inside one window leaves every entry fresh and nothing
+            // to retain away. Evict the oldest so the cap holds unconditionally
+            // — the evicted sender simply gets one un-debounced wake later.
+            if self.last.len() >= MAX_WAKE_RECV_DEBOUNCE_ENTRIES
+                && let Some(oldest) = self.last.iter().min_by_key(|(_, t)| **t).map(|(k, _)| *k)
+            {
+                self.last.remove(&oldest);
+            }
+        }
+        self.last.insert(*src, now);
+        true
+    }
+}
+
+impl Default for WakeDebounce {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Handle one datagram that landed on the wake endpoint. Returns whether a
+/// `MAILBOX_WAKE` event was published.
+///
+/// Split out of the select! loop so the debounce can be exercised at the point
+/// where the event is actually published, not merely next to it.
+pub fn handle_wake_message(
+    msg: AppMessage,
+    debounce: &mut WakeDebounce,
+    now: Instant,
+    event_bus: &veil_ipc::EventBus,
+) -> bool {
+    let AppMessage::Deliver { src_node_id, .. } = msg else {
+        return false;
+    };
+    if !debounce.admit(&src_node_id, now) {
+        log::trace!(
+            "veil-mailbox: deposit wake from {} debounced",
+            hex_short(&src_node_id),
+        );
+        return false;
+    }
+    log::debug!(
+        "veil-mailbox: deposit wake from relay {} — publishing event",
+        hex_short(&src_node_id),
+    );
+    event_bus.publish(veil_proto::EventPayload {
+        kind: veil_proto::event_kind::MAILBOX_WAKE,
+        payload: Vec::new(),
+    });
+    true
+}
+
 /// Spawn the receiver-side WAKE listener: binds
 /// `(MAILBOX_APP_ID, MAILBOX_WAKE_ENDPOINT_ID)` and, for every datagram that
 /// lands there, publishes a `MAILBOX_WAKE` event on the daemon event bus so
 /// the client app drains its mailbox promptly (the payload is ignored — the
 /// wake is a pure hint). Runs on EVERY node (not just mailbox relays): any
-/// node may be a mailbox RECEIVER. The sender is a directly-connected session
-/// peer; a spoofed/spammy wake can only cause a bounded early drain (the app
-/// debounces), never data loss — same threat class as any live inbound frame.
+/// node may be a mailbox RECEIVER.
+///
+/// Because it is bound unconditionally, the sender is any directly-connected
+/// session peer — not necessarily a relay holding a deposit for us. Wakes are
+/// therefore debounced per sender ([`WAKE_RECV_DEBOUNCE`]) so a peer cannot
+/// keep the client's radio awake by repeating an empty datagram.
 pub fn spawn_mailbox_wake_listener(
     host: &mut BuiltinAppHost,
     ctx: ServiceContext,
@@ -341,19 +443,11 @@ pub fn spawn_mailbox_wake_listener(
     };
     host.spawn(ctx, spec, move |mut ctx, mut rxs| async move {
         let mut wake_rx = rxs.remove(0);
+        let mut debounce = WakeDebounce::new();
         loop {
             tokio::select! {
                 Some(msg) = wake_rx.recv() => {
-                    if let AppMessage::Deliver { src_node_id, .. } = msg {
-                        log::debug!(
-                            "veil-mailbox: deposit wake from relay {} — publishing event",
-                            hex_short(&src_node_id),
-                        );
-                        event_bus.publish(veil_proto::EventPayload {
-                            kind: veil_proto::event_kind::MAILBOX_WAKE,
-                            payload: Vec::new(),
-                        });
-                    }
+                    handle_wake_message(msg, &mut debounce, Instant::now(), &event_bus);
                 }
                 _ = ctx.shutdown.changed() => {
                     log::info!("veil-mailbox: wake listener stopping");
@@ -907,6 +1001,122 @@ mod tests {
             wake_hmac_envelope: None,
         }
         .encode()
+    }
+
+    /// A Deliver addressed to the WAKE endpoint, as the dispatcher would form
+    /// it for an inbound empty datagram from a session peer.
+    fn wake_deliver(src_node_id: [u8; 32]) -> AppMessage {
+        AppMessage::Deliver {
+            src_node_id,
+            provenance: SenderProvenance::Signed,
+            src_app_id: [0u8; 32],
+            app_id: MAILBOX_APP_ID,
+            endpoint_id: veil_mailbox::MAILBOX_WAKE_ENDPOINT_ID,
+            data: veil_bufpool::pooled_shared_from_vec(Vec::new()),
+            reply_id: 0,
+        }
+    }
+
+    /// The wake endpoint is bound on EVERY node, whether or not the mailbox is
+    /// enabled, so its sender is any session peer — not necessarily a relay
+    /// holding a deposit. The relay-side 2 s debounce is per RECEIVER and lives
+    /// inside the `mailbox.enabled` block, so it does not constrain this side
+    /// at all: every inbound datagram used to publish a MAILBOX_WAKE, and every
+    /// MAILBOX_WAKE makes the client app drain its mailbox.
+    ///
+    /// Asserts on the published events, not on the predicate, so the debounce
+    /// has to be wired into the path that actually publishes.
+    #[test]
+    fn wake_listener_debounces_per_sender() {
+        let bus = veil_ipc::EventBus::new();
+        let mut rx = bus.subscribe();
+        let mut deb = WakeDebounce::new();
+        let t0 = Instant::now();
+        let noisy = [0x01u8; 32];
+        let relay = [0x02u8; 32];
+
+        assert!(
+            handle_wake_message(wake_deliver(noisy), &mut deb, t0, &bus),
+            "the first wake from a peer must always go through",
+        );
+        // A burst from the SAME peer inside the window publishes nothing more.
+        for i in 1..50u64 {
+            assert!(
+                !handle_wake_message(
+                    wake_deliver(noisy),
+                    &mut deb,
+                    t0 + Duration::from_millis(i * 10),
+                    &bus,
+                ),
+                "wake #{i} from the same peer inside the window must be dropped",
+            );
+        }
+        // ... but a DIFFERENT peer is not collateral damage: a per-sender gate,
+        // not one global timestamp, or a noisy peer would mute the real relay.
+        assert!(
+            handle_wake_message(
+                wake_deliver(relay),
+                &mut deb,
+                t0 + Duration::from_millis(10),
+                &bus,
+            ),
+            "a different sender must not be suppressed by the noisy one",
+        );
+        // Once the window elapses the same peer is admitted again.
+        assert!(
+            handle_wake_message(wake_deliver(noisy), &mut deb, t0 + WAKE_RECV_DEBOUNCE, &bus),
+            "the debounce must reopen after WAKE_RECV_DEBOUNCE",
+        );
+
+        let mut published = 0usize;
+        while let Ok(ev) = rx.try_recv() {
+            assert_eq!(ev.kind, veil_proto::event_kind::MAILBOX_WAKE);
+            published += 1;
+        }
+        assert_eq!(
+            published, 3,
+            "52 inbound wake datagrams must publish exactly 3 events",
+        );
+    }
+
+    /// Non-Deliver traffic on the endpoint must never publish, and must not
+    /// consume a debounce slot either.
+    #[test]
+    fn wake_listener_ignores_non_deliver() {
+        let bus = veil_ipc::EventBus::new();
+        let mut deb = WakeDebounce::new();
+        let t0 = Instant::now();
+        assert!(!handle_wake_message(
+            AppMessage::DeliveryFailed {
+                content_id: [0u8; 32]
+            },
+            &mut deb,
+            t0,
+            &bus,
+        ));
+        assert!(
+            deb.last.is_empty(),
+            "a non-Deliver must not occupy a debounce slot",
+        );
+    }
+
+    /// The tracking map is bounded even when every tracked sender is fresh —
+    /// the case plain TTL compaction cannot handle.
+    #[test]
+    fn wake_debounce_map_is_bounded_under_a_sender_fan() {
+        let mut deb = WakeDebounce::new();
+        let t0 = Instant::now();
+        for i in 0..(MAX_WAKE_RECV_DEBOUNCE_ENTRIES as u64 * 3) {
+            let mut src = [0u8; 32];
+            src[..8].copy_from_slice(&i.to_le_bytes());
+            // All inside one debounce window: nothing is ever stale.
+            deb.admit(&src, t0 + Duration::from_millis(i % 1000));
+        }
+        assert!(
+            deb.last.len() <= MAX_WAKE_RECV_DEBOUNCE_ENTRIES,
+            "debounce map grew to {} entries, cap is {MAX_WAKE_RECV_DEBOUNCE_ENTRIES}",
+            deb.last.len(),
+        );
     }
 
     /// A Deliver addressed to the ACK endpoint, as the dispatcher would form it.
