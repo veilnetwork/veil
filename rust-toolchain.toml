@@ -1,0 +1,19 @@
+# Pin the toolchain, because an unpinned one silently rewrites the tree.
+#
+# CI installed a bare `stable`, so a rustfmt release -- not a commit -- could
+# turn `cargo fmt --all --check` red on files nobody had touched. That is what
+# happened on 2026-08-05: 104 hunks across 34 files, on a tree whose last
+# change was unrelated. A gate that fails for reasons outside the repository
+# teaches people to ignore it.
+#
+# Bump this deliberately: change the channel, run `cargo fmt --all`, and commit
+# the reformat as its own change. That way the reformat is reviewable and dated
+# rather than arriving mixed into someone else's pull request.
+#
+# `targets` lists only what is CROSS-compiled by the gates. Host targets come
+# with the toolchain, and the release matrix installs its own per runner.
+[toolchain]
+channel = "1.97.1"
+profile = "minimal"
+components = ["rustfmt", "clippy"]
+targets = ["x86_64-pc-windows-gnu"]
