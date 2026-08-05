@@ -227,6 +227,10 @@ pub struct KademliaService {
     /// which rejects all PBAN-prefixed STOREs as
     /// `KademliaError::InvalidNetworkRecord`.
     network_auth_gate: Option<Arc<dyn super::traits::NetworkAuthGate>>,
+    /// Guard-rail counter for [`Self::stored_entries`] — see
+    /// [`Self::full_store_materializations`]. `Arc` so a cloned handle counts
+    /// into the same place as the service it was cloned from.
+    full_store_materializations: Arc<std::sync::atomic::AtomicU64>,
 }
 
 /// backlog: optional source material for re-minting the
@@ -400,6 +404,7 @@ impl KademliaService {
             local_announcement: Arc::new(Mutex::new(None)),
             local_announcement_source: Arc::new(Mutex::new(None)),
             network_auth_gate: None,
+            full_store_materializations: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         }
     }
 
@@ -1070,7 +1075,12 @@ impl KademliaService {
     /// this materializes the entire store (incl. a RocksDB cold tier) into
     /// RAM; the republish driver uses [`Self::stored_keys`] +
     /// [`Self::peek_value`] instead to avoid that per-tick cost (cycle-7 M4).
+    ///
+    /// Counted in [`Self::full_store_materializations`]. No path reachable from
+    /// an inbound frame may call this.
     pub fn stored_entries(&self) -> Vec<([u8; 32], Vec<u8>)> {
+        self.full_store_materializations
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         lock!(self.inner).store.iter().into_iter().collect()
     }
 
@@ -1337,6 +1347,19 @@ impl KademliaService {
 
     pub fn stored_keys(&self) -> usize {
         lock!(self.inner).store.len()
+    }
+
+    /// How many times the whole store has been materialized into RAM by
+    /// [`Self::stored_entries`] since start.
+    ///
+    /// Snapshot / migration paths may move this. Anything a remote peer can
+    /// trigger must not: a caller that can be driven from the network has to
+    /// stream via [`Self::stored_key_ids`] + [`Self::peek_value`], so that at
+    /// most one value is resident at a time. Exposed so that property can be
+    /// asserted at the call site instead of by reading the code.
+    pub fn full_store_materializations(&self) -> u64 {
+        self.full_store_materializations
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Return all stored (key, value) pairs as a snapshot for persistence.

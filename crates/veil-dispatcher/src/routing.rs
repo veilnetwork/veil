@@ -1223,6 +1223,16 @@ impl FrameDispatcher {
     /// for AppEndpointEntry, "AT" for AnnounceAttachmentPayload) and STORE
     /// each one on the freshly connected peer at `BACKGROUND` priority so
     /// routine traffic is never delayed.
+    ///
+    /// Streams key-by-key. This runs on every session open — including every
+    /// INBOUND one, so a remote peer decides when it happens and how often —
+    /// and `stored_entries()` would clone the whole store, RocksDB cold tier
+    /// included, into RAM to find the handful of records we own. Two magic
+    /// bytes decide the vast majority of them. `stored_key_ids()` +
+    /// `peek_value()` keep at most one value resident and leave the cold tier
+    /// on disk; `peek` is the non-promoting read, so walking every key does not
+    /// churn the hot/cold boundary either. Same pattern as the republish driver
+    /// and the ban-sync tick.
     fn push_owned_dht_records(
         &self,
         new_peer: [u8; 32],
@@ -1240,9 +1250,13 @@ impl FrameDispatcher {
         };
 
         let local_id = self.local_node_id;
-        let entries = self.dht.stored_entries();
+        let keys = self.dht.stored_key_ids();
         let mut pushed = 0usize;
-        for (key, value) in entries {
+        for key in keys {
+            // The key may have been evicted between the key scan and here.
+            let Some(value) = self.dht.peek_value(&key) else {
+                continue;
+            };
             // Only self-authenticating records are safe to propagate unsigned.
             let is_ap = value.get(..2) == Some(&APP_ENDPOINT_DHT_MAGIC[..]);
             let is_at = value.get(..2) == Some(&ATTACHMENT_DHT_MAGIC[..]);
@@ -3023,6 +3037,87 @@ mod push_owned_tests {
         assert_eq!(sp.key, key);
         assert_eq!(&sp.value[..2], &APP_ENDPOINT_DHT_MAGIC[..]);
         assert_eq!(sp.value, value);
+    }
+
+    /// report6 V-H5: the session-open push must STREAM the store, not clone it.
+    ///
+    /// This runs on every session open, inbound ones included, so a remote peer
+    /// chooses when it happens and how often. `stored_entries()` pulled every
+    /// value — RocksDB cold tier and all — into RAM to find the handful of
+    /// records we own, when two magic bytes reject most of them.
+    ///
+    /// Asserts the guard-rail counter on the expensive API, so the property is
+    /// checked where the decision is made rather than inferred from the code.
+    #[test]
+    fn session_open_push_streams_instead_of_materializing_the_store() {
+        let (sk, _pk, local_id) = new_signer();
+        let mut disp = make_test_dispatcher(NodeRole::Core);
+        disp.local_node_id = local_id;
+        let dht = Arc::new(KademliaService::with_config(
+            local_id,
+            veil_dht::DhtRuntimeConfig {
+                allow_unsigned_store: true,
+                ..Default::default()
+            },
+        ));
+        disp.dht = Arc::clone(&dht);
+
+        // One record we own …
+        let entry = AppEndpointEntry {
+            node_id: local_id,
+            app_id: [0x5Au8; 32],
+            endpoint_id: 3,
+            gateway_node_id: None,
+            epoch: 1,
+            expires_at: u64::MAX / 2,
+            max_concurrent_streams: 4,
+            protocol_version: 1,
+            bandwidth_hint_kbps: 64,
+        };
+        let key = app_endpoint_key(&entry.node_id, &entry.app_id, entry.endpoint_id);
+        let value = entry.encode_for_dht_signed(&sk);
+        dht.handle_store(StorePayload::unsigned(key, value.clone()))
+            .expect("store owned record");
+
+        // … among a pile of replicated records that are none of our business,
+        // which is what a real node's store is mostly made of.
+        for i in 0..16u8 {
+            let mut k = [0u8; 32];
+            k[0] = 0xF0;
+            k[1] = i;
+            dht.handle_store(StorePayload::unsigned(k, vec![i; 512]))
+                .expect("store foreign record");
+        }
+
+        let reg = Arc::new(RwLock::new(SessionTxRegistry::new()));
+        let peer: [u8; 32] = [0x33; 32];
+        let mut rx = reg.write().unwrap().register(peer);
+        disp.session_tx_registry = Some(Arc::clone(&reg));
+
+        assert_eq!(
+            dht.full_store_materializations(),
+            0,
+            "fixture setup itself must not materialize the store",
+        );
+
+        Arc::new(disp).push_owned_dht_records(peer, &reg);
+
+        let (_prio, frame) = rx.try_recv().expect("the owned record is still pushed");
+        let body = &frame[veil_proto::header::HEADER_SIZE..];
+        let sp = StorePayload::decode(body).expect("decode StorePayload");
+        assert_eq!(sp.key, key, "the pushed record must be the owned one");
+        assert_eq!(sp.value, value);
+        assert!(
+            rx.try_recv().is_err(),
+            "records we do not own must not be pushed",
+        );
+
+        assert_eq!(
+            dht.full_store_materializations(),
+            0,
+            "a session-open push cloned the whole store into RAM — that is a \
+             remotely triggered full materialization",
+        );
     }
 
     /// Signed attachment record owned by this node is pushed to the new peer.
