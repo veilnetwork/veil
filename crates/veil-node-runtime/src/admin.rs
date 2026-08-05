@@ -2465,9 +2465,19 @@ async fn execute_admin_command(
                 Ok(id) => id,
                 Err(e) => return AdminConnectionOutcome::Response(AdminResponse::err(e)),
             };
-            runtime.lock().await.ban_node(id.into());
+            // The ban applies in memory regardless, so this is an Ack either
+            // way — but an Ack that does not distinguish "banned" from "banned
+            // until you restart" is the answer that made a lost ban invisible
+            // (audit report7 V-03).
+            let outcome = runtime.lock().await.ban_node(id.into());
             Ok(AdminResult::Ack {
-                message: format!("banned {node_id}"),
+                message: match outcome.reason() {
+                    None => format!("banned {node_id}"),
+                    Some(why) => format!(
+                        "banned {node_id} IN MEMORY ONLY — the ban list could not be \
+                         persisted ({why}); it will be lost on restart"
+                    ),
+                },
             })
         }
         AdminCommand::UnbanNode { node_id } => {
@@ -2475,9 +2485,15 @@ async fn execute_admin_command(
                 Ok(id) => id,
                 Err(e) => return AdminConnectionOutcome::Response(AdminResponse::err(e)),
             };
-            runtime.lock().await.unban_node(id.into());
+            let outcome = runtime.lock().await.unban_node(id.into());
             Ok(AdminResult::Ack {
-                message: format!("unbanned {node_id}"),
+                message: match outcome.reason() {
+                    None => format!("unbanned {node_id}"),
+                    Some(why) => format!(
+                        "unbanned {node_id} IN MEMORY ONLY — the ban list could not be \
+                         persisted ({why}); the ban returns on restart"
+                    ),
+                },
             })
         }
         AdminCommand::PNetBan { node_id, reason } => {

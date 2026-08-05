@@ -1710,7 +1710,11 @@ async fn bans_survive_reload_crit4() {
 
     let victim = [0x42u8; 32];
     veil_util::lock!(runtime.ban_list).ban_manual(victim, "audit-test");
-    super::persistence::persist_bans(&runtime.ban_list, &path);
+    assert!(
+        super::persistence::persist_bans(&runtime.ban_list, &path).is_durable(),
+        "precondition: the ban must actually reach disk before a reload can \
+         restore it"
+    );
     assert!(
         veil_util::lock!(runtime.ban_list).is_banned(&victim),
         "peer banned before reload"

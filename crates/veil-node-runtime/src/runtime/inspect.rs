@@ -19,7 +19,7 @@ use veil_util::lock;
 use crate::types::{ListenConfigEntry, NodeId, NodeSummary, PeerConfigEntry, SessionInfo};
 
 use super::NodeRuntime;
-use super::persistence::persist_bans;
+use super::persistence::{PersistOutcome, persist_bans};
 
 impl NodeRuntime {
     pub fn summary(&self) -> NodeSummary {
@@ -85,7 +85,12 @@ impl NodeRuntime {
     /// while existing sessions (both inbound and outbound) kept running —
     /// so `peers ban` felt silent, and the banned peer kept exchanging
     /// frames until the TCP connection died on its own.
-    pub fn ban_node(&self, node_id: NodeId) {
+    /// Returns whether the ban reached disk. A caller that discards this is
+    /// telling its operator the ban is permanent when it may not survive the
+    /// next restart — which is what the admin path did before it had anything
+    /// to discard (audit report7 V-03).
+    #[must_use = "the caller must tell the operator whether the ban is durable"]
+    pub fn ban_node(&self, node_id: NodeId) -> PersistOutcome {
         // Tear-down first so (manual, persistent) ban entry installed
         // below isn't overwritten by `kill_session`'s 30s auto-ban entry.
         // Both operations touch `BanList::entries` by key — last writer wins.
@@ -97,7 +102,7 @@ impl NodeRuntime {
         if let Some(m) = &self.metrics {
             m.inc_ban_actions();
         }
-        persist_bans(&self.ban_list, &self.config_path);
+        persist_bans(&self.ban_list, &self.config_path)
     }
 
     /// Force-close every active session to `node_id` (both inbound and
@@ -116,12 +121,16 @@ impl NodeRuntime {
     }
 
     /// Lift a runtime ban previously applied by [`ban_node`](Self::ban_node).
-    pub fn unban_node(&self, node_id: NodeId) {
+    ///
+    /// Same reporting contract, and the same stakes in reverse: an unban that
+    /// did not reach disk comes back as a ban after the next restart.
+    #[must_use = "the caller must tell the operator whether the unban is durable"]
+    pub fn unban_node(&self, node_id: NodeId) -> PersistOutcome {
         self.ban_list
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .unban(node_id.as_bytes());
-        persist_bans(&self.ban_list, &self.config_path);
+        persist_bans(&self.ban_list, &self.config_path)
     }
 
     /// Toggle the mobile background-mode flag.
