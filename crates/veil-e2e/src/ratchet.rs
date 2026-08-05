@@ -176,6 +176,19 @@ pub enum RatchetSpliceError {
     #[error("no local device identity")]
     NoLocalInstance,
 
+    /// The store is at [`MAX_CONVERSATIONS`] and every conversation in it is
+    /// one this device has spoken on, so there is nothing that can be dropped
+    /// without stranding a live conversation and its peer for good.
+    ///
+    /// Not reachable by a stranger: everything a stranger can plant is
+    /// unproven, and unproven conversations are exactly what the quota
+    /// evicts. Reaching this takes a genuine contact list larger than the
+    /// ceiling, and the answer is for the host to forget conversations it no
+    /// longer wants — refusing one send is recoverable, silently breaking one
+    /// of the thousand already held is not.
+    #[error("ratchet store is full ({MAX_CONVERSATIONS} conversations, none droppable)")]
+    StoreFull,
+
     /// The primitive refused. Includes
     /// [`PqDowngrade`](veil_ratchet::RatchetError::PqDowngrade) — a frame that
     /// dropped its post-quantum leg is refused here exactly as it is there,
@@ -239,7 +252,35 @@ impl std::fmt::Debug for RatchetIdentity<'_> {
 /// own `VSR1` because this wrapper carries fields the primitive does not know
 /// about, and feeding one to the other's parser must fail on the tag.
 pub const CONVERSATION_BLOB_MAGIC: [u8; 4] = *b"VRC1";
-const CONVERSATION_BLOB_V1: u8 = 1;
+/// Blob version. `2` carries the last-used timestamp `1` had no room for;
+/// there is no shim, because nothing has shipped.
+const CONVERSATION_BLOB_V2: u8 = 2;
+
+/// The largest number of conversations one device holds at once.
+///
+/// A ceiling is required because the *inbound* side of this store is driven by
+/// strangers: a prologue is sealed to keys we publish, so anyone who can reach
+/// this node can make it hold a session, and nothing about that costs the
+/// sender more than one encapsulation. Without a ceiling the only bound on our
+/// memory is how long an attacker cares to keep sending.
+///
+/// Sized for the legitimate case with room to spare: the store is per device,
+/// and one conversation is one *device* of one contact, so a thousand covers a
+/// contact list far larger than a person has, times several devices each.
+pub const MAX_CONVERSATIONS: usize = 1_024;
+
+/// How long an UNPROVEN conversation may go unused before it is dropped.
+///
+/// Measured from last use, not from creation: a conversation that is still
+/// carrying traffic is not stale however old it is. Longer than the mailbox's
+/// store-and-forward window, so a peer whose prologue is still being
+/// retransmitted through the mail is never aged out from under a message that
+/// is genuinely in flight.
+///
+/// It applies to unproven conversations only. See
+/// [`RatchetStore::expire`](RatchetStore::expire) for why a proven one has no
+/// expiry at all.
+pub const UNPROVEN_TTL_SECS: u64 = 14 * 24 * 60 * 60;
 
 struct Entry {
     session: RatchetSession,
@@ -255,17 +296,48 @@ struct Entry {
     /// The PQXDH prologue to re-attach to outgoing frames until the peer
     /// answers. `None` once anything of theirs has opened.
     pending_prologue: Option<Vec<u8>>,
+    /// Local unix seconds at the last message this conversation carried, in
+    /// either direction. Persisted, so a restart does not make every stale
+    /// conversation look fresh — on a phone that would mean the sweep below
+    /// never fires at all.
+    ///
+    /// Only *successful* work moves it. A forged frame aimed at a conversation
+    /// must not be able to keep it alive, or the eviction order becomes
+    /// something an attacker writes.
+    last_used_at: u64,
 }
 
 impl Entry {
+    /// Whether the quota and the sweep may take this conversation.
+    ///
+    /// The rule is one bit wide on purpose, and it is not "least recently
+    /// used". What makes an entry safe to drop is that **we have never sent a
+    /// message on it**, and `authenticated` is exactly that fact: every path
+    /// that seals into a conversation settles it against a verified
+    /// certificate first, so a conversation we have spoken on is proven, and a
+    /// conversation that is not proven is one we have never answered.
+    ///
+    /// That matters because the peer's copy is then still holding its PQXDH
+    /// prologue — it stops re-attaching it only when something of ours opens —
+    /// so the peer re-opens the conversation on its very next message and
+    /// nothing is stranded. Drop a *proven* one and the opposite happens: the
+    /// peer's side is proven and answered, [`open`]'s displacement rule
+    /// (correctly) refuses to let any prologue re-key it, and both ends are
+    /// stuck for good with no message on the wire that could recover them.
+    fn droppable(&self) -> bool {
+        !self.authenticated
+    }
+
     fn encode(&self) -> Zeroizing<Vec<u8>> {
         let session = self.session.export_state();
         let prologue = self.pending_prologue.as_deref().unwrap_or(&[]);
-        let mut out = Vec::with_capacity(4 + 1 + 32 + 1 + 1 + 2 + prologue.len() + 4 + session.len());
+        let mut out =
+            Vec::with_capacity(4 + 1 + 32 + 1 + 8 + 1 + 2 + prologue.len() + 4 + session.len());
         out.extend_from_slice(&CONVERSATION_BLOB_MAGIC);
-        out.push(CONVERSATION_BLOB_V1);
+        out.push(CONVERSATION_BLOB_V2);
         out.extend_from_slice(&self.peer_ik);
         out.push(u8::from(self.authenticated));
+        out.extend_from_slice(&self.last_used_at.to_be_bytes());
         match &self.pending_prologue {
             Some(p) => {
                 out.push(1);
@@ -296,7 +368,7 @@ impl Entry {
             return Err(RatchetSpliceError::Malformed("bad conversation blob magic"));
         }
         let version = take(1)?[0];
-        if version != CONVERSATION_BLOB_V1 {
+        if version != CONVERSATION_BLOB_V2 {
             return Err(RatchetSpliceError::UnsupportedVersion(version));
         }
         let mut peer_ik = [0u8; 32];
@@ -306,6 +378,11 @@ impl Entry {
             1 => true,
             _ => return Err(RatchetSpliceError::Malformed("bad boolean")),
         };
+        let last_used_at = u64::from_be_bytes(
+            take(8)?
+                .try_into()
+                .map_err(|_| RatchetSpliceError::Malformed("last-used timestamp"))?,
+        );
         let pending_prologue = match take(1)?[0] {
             0 => None,
             1 => {
@@ -334,6 +411,7 @@ impl Entry {
             peer_ik,
             authenticated,
             pending_prologue,
+            last_used_at,
         })
     }
 }
@@ -355,6 +433,76 @@ impl Inner {
         self.version = self.version.wrapping_add(1);
         self.dirty.insert(key, self.version);
     }
+
+    /// Drop every unproven conversation idle for longer than the TTL.
+    ///
+    /// Idleness is `now_unix - last_used_at` under a saturating subtraction, so
+    /// a clock that steps backwards makes conversations look *younger* and
+    /// nothing is dropped. That is the safe direction: the cost of aging one
+    /// out early is a message the peer has to resend, and the cost of keeping
+    /// one too long is a slot the quota below will reclaim anyway.
+    fn expire(&mut self, now_unix: u64) -> usize {
+        let stale: Vec<ConversationKey> = self
+            .entries
+            .iter()
+            .filter(|(_, e)| {
+                e.droppable() && now_unix.saturating_sub(e.last_used_at) > UNPROVEN_TTL_SECS
+            })
+            .map(|(k, _)| *k)
+            .collect();
+        for key in &stale {
+            self.entries.remove(key);
+            // Marked, not silently dropped: the host is holding a blob for
+            // this conversation and has to be told to delete it, or the next
+            // launch imports exactly what we just aged out.
+            self.commit_change(*key);
+        }
+        stale.len()
+    }
+
+    /// Make room for one more conversation. `false` when there is none.
+    ///
+    /// Aging out comes first and eviction second, so a store that is merely
+    /// stale loses nothing that is still in use. Eviction takes the
+    /// least-recently-used *droppable* entry and only ever one, and both
+    /// steps are confined to conversations we have never sent on — see
+    /// [`Entry::droppable`]. That is what keeps the quota from becoming a
+    /// weapon: a stranger's conversations are unproven by construction (they
+    /// cannot make us seal to them, and they cannot produce a prologue that
+    /// announces the key a contact published and still opens), so however many
+    /// a flood creates, every one of them is in the class the next admission
+    /// evicts, and not one proven conversation moves.
+    fn make_room(&mut self, now_unix: u64) -> bool {
+        if self.entries.len() < MAX_CONVERSATIONS {
+            return true;
+        }
+        self.expire(now_unix);
+        if self.entries.len() < MAX_CONVERSATIONS {
+            return true;
+        }
+        // `min_by_key` over `(last_used_at, key)` rather than `last_used_at`
+        // alone: two conversations can share a second, and which one goes has
+        // to be a property of the store and not of the map's traversal.
+        let victim = self
+            .entries
+            .iter()
+            .filter(|(_, e)| e.droppable())
+            .min_by_key(|(k, e)| (e.last_used_at, **k))
+            .map(|(k, _)| *k);
+        match victim {
+            Some(key) => {
+                self.entries.remove(&key);
+                self.commit_change(key);
+                true
+            }
+            // Every conversation held is one we have spoken on. Refusing is
+            // the only safe answer left: taking one would strand it and its
+            // peer permanently, and there is no attacker-reachable path to
+            // this state — only a user with more live conversations than the
+            // ceiling allows.
+            None => false,
+        }
+    }
 }
 
 /// Every ratchet conversation this node currently holds, in memory.
@@ -362,8 +510,21 @@ impl Inner {
 /// The store is the thing the host persists. It is deliberately *not* a cache:
 /// evicting an entry does not cost a round trip, it costs every message the
 /// peer sends afterwards, because the chain cannot be rebuilt from anything
-/// public. Entries leave only when the host says so
-/// ([`forget`](Self::forget)).
+/// public.
+///
+/// Which is why it holds two classes of entry and treats them as different
+/// things. A conversation this device has **spoken on** leaves only when the
+/// host says so ([`forget`](Self::forget)) — nothing here drops one, at any
+/// age, under any pressure, because the peer's side cannot be restarted by
+/// anything on the wire and dropping ours would strand both. A conversation
+/// somebody opened that we have **never answered** is the other class, and it
+/// is the one an attacker can create at will: a prologue is sealed to keys we
+/// publish, so anyone who can reach this node can make it hold state. Those
+/// age out ([`expire`](Self::expire)) and are evicted under the
+/// [`MAX_CONVERSATIONS`] ceiling, and losing one costs nothing, because the
+/// peer is still holding the prologue that re-opens it.
+///
+/// [`Entry::droppable`] is where that line is drawn and why it lands there.
 pub struct RatchetStore {
     inner: Mutex<Inner>,
 }
@@ -481,9 +642,40 @@ impl RatchetStore {
     }
 
     /// Every conversation held, in key order.
+    ///
+    /// Bounded by [`MAX_CONVERSATIONS`], so this cannot grow without limit.
     #[must_use]
     pub fn keys(&self) -> Vec<ConversationKey> {
         self.lock().entries.keys().copied().collect()
+    }
+
+    /// Drop every unproven conversation idle for longer than
+    /// [`UNPROVEN_TTL_SECS`], and mark each so the host deletes its blob.
+    /// Returns how many went.
+    ///
+    /// `now_unix` must come from the local clock. Nothing a peer says about
+    /// the time reaches this decision, and nothing should be made to: a value
+    /// from the wire would let whoever supplied it choose which of our
+    /// conversations are old enough to disappear.
+    ///
+    /// **A proven conversation has no expiry, at any age.** Not an oversight
+    /// and not a tuning choice — there is no safe way to age one out. Dropping
+    /// it leaves the peer holding a proven, answered session, and [`open`]'s
+    /// displacement rule refuses to let any prologue re-key one of those,
+    /// precisely so a stranger cannot reset a live conversation by replaying
+    /// or forging one. So our fresh prologue is refused, their next frame
+    /// arrives at a store that has nothing to open it with, and the two ends
+    /// are wedged with no message either could send to recover. What bounds
+    /// the proven class is the ceiling and the host's own
+    /// [`forget`](Self::forget), which knows what the user still wants.
+    pub fn expire(&self, now_unix: u64) -> usize {
+        self.lock().expire(now_unix)
+    }
+
+    /// The ceiling this store enforces, for a host sizing its own buffers.
+    #[must_use]
+    pub fn capacity(&self) -> usize {
+        MAX_CONVERSATIONS
     }
 
     /// How many conversations are held.
@@ -514,9 +706,27 @@ impl RatchetStore {
     /// conversation dirty — the host just read it, so writing it straight back
     /// would be pointless — but it does advance
     /// [`version`](Self::version), because the store's contents changed.
-    pub fn import(&self, key: &ConversationKey, blob: &[u8]) -> Result<(), RatchetSpliceError> {
+    ///
+    /// Subject to the same quota as everything else, and for the same reason:
+    /// a host's own on-disk set is not trustworthy input either — it is where
+    /// yesterday's flood was persisted to. Hydrating a store that outgrew the
+    /// ceiling ages out and evicts by the rules in
+    /// [`Entry::droppable`], and returns [`StoreFull`](RatchetSpliceError::StoreFull)
+    /// only when every conversation held is one this device has spoken on.
+    /// Restoring over a key already held always fits: nothing grows.
+    ///
+    /// `now_unix` is the local clock, and is used only to decide what is stale.
+    pub fn import(
+        &self,
+        key: &ConversationKey,
+        blob: &[u8],
+        now_unix: u64,
+    ) -> Result<(), RatchetSpliceError> {
         let entry = Entry::decode(blob)?;
         let mut g = self.lock();
+        if !g.entries.contains_key(key) && !g.make_room(now_unix) {
+            return Err(RatchetSpliceError::StoreFull);
+        }
         g.entries.insert(*key, entry);
         g.version = g.version.wrapping_add(1);
         Ok(())
@@ -604,18 +814,22 @@ pub const ACK_KEY_LEN: usize = 32;
 ///
 /// First contact needs nothing online from the recipient: everything read here
 /// is out of the certificate they already published and already signed.
+///
+/// `now_unix` is the local clock. It is what this conversation's last-use
+/// stamp is set to, and nothing a peer sends contributes to it.
 pub fn seal(
     store: &RatchetStore,
     me: &RatchetIdentity<'_>,
     peer: PeerRatchetKeys<'_>,
     app_payload: &[u8],
+    now_unix: u64,
 ) -> Result<(Vec<u8>, [u8; ACK_KEY_LEN]), RatchetSpliceError> {
     let mut ack_key = [0u8; ACK_KEY_LEN];
     OsRatchetRng.fill_bytes(&mut ack_key);
     let mut plaintext = Zeroizing::new(Vec::with_capacity(ACK_KEY_LEN + app_payload.len()));
     plaintext.extend_from_slice(&ack_key);
     plaintext.extend_from_slice(app_payload);
-    seal_inner(store, me, peer, &plaintext).map(|payload| (payload, ack_key))
+    seal_inner(store, me, peer, &plaintext, now_unix).map(|payload| (payload, ack_key))
 }
 
 fn seal_inner(
@@ -623,6 +837,7 @@ fn seal_inner(
     me: &RatchetIdentity<'_>,
     peer: PeerRatchetKeys<'_>,
     plaintext: &[u8],
+    now_unix: u64,
 ) -> Result<Vec<u8>, RatchetSpliceError> {
     if peer.ratchet_pk == &[0u8; 32] {
         // The canonical low-order point: every Diffie-Hellman against it is a
@@ -684,6 +899,7 @@ fn seal_inner(
     let (kind, blob) = match g.entries.get_mut(&key) {
         Some(entry) => {
             let frame = entry.session.encrypt(plaintext, &ad)?;
+            entry.last_used_at = now_unix;
             match &entry.pending_prologue {
                 // Still no answer: re-attach the original prologue so a lost
                 // first transmission does not strand the conversation. The
@@ -698,6 +914,12 @@ fn seal_inner(
             }
         }
         None => {
+            // Room before work: the key agreement below is the expensive part,
+            // and a store with nothing droppable in it is not going to hold the
+            // result anyway.
+            if !g.make_room(now_unix) {
+                return Err(RatchetSpliceError::StoreFull);
+            }
             let mut rng = OsRatchetRng;
             let our_ik_sk = me.seed_ring.current_ratchet_sk();
             let mlkem_ek: &[u8; veil_ratchet::ML_KEM_768_EK_LEN] = peer
@@ -729,6 +951,7 @@ fn seal_inner(
                     // caller verified, so the peer is proven from the reply on.
                     authenticated: true,
                     pending_prologue: Some(blob[..PQXDH_PROLOGUE_LEN].to_vec()),
+                    last_used_at: now_unix,
                 },
             );
             (KIND_PROLOGUE, blob)
@@ -912,6 +1135,11 @@ fn open_inner(
                     // Something of theirs opened, so they have our half of the
                     // exchange and the prologue has done its job.
                     entry.pending_prologue = None;
+                    // Only here, after the tag verified. A frame that failed
+                    // moved nothing else and must not move this either, or the
+                    // eviction order becomes something an attacker writes by
+                    // aiming garbage at whichever conversation it wants kept.
+                    entry.last_used_at = now_unix;
                     if !entry.authenticated
                         && (published_peer_ik == Some(&entry.peer_ik) || proves_authorship)
                     {
@@ -982,7 +1210,23 @@ fn open_inner(
                 // regardless, so it is genuine and still goes up — it is only
                 // the session that is dropped, in favour of the one already
                 // held.
-                if g.entries.get(&key).is_none_or(displaceable) {
+                // Displacing an existing entry needs no room — the count does
+                // not move — so the quota is asked only when this would be a
+                // new conversation. A store with nothing droppable left simply
+                // does not keep the session: the message opened and still goes
+                // up, because refusing to *read* a genuine message would be a
+                // worse answer than refusing to remember the conversation.
+                let admit = match g.entries.get(&key) {
+                    // Replacing one we hold: allowed, and costs no room.
+                    Some(e) if displaceable(e) => Some(true),
+                    // Proven and answered. Untouchable, as it was before.
+                    Some(_) => None,
+                    // A conversation we do not have. This one has to fit.
+                    None => Some(false),
+                };
+                if let Some(replaces) = admit
+                    && (replaces || g.make_room(now_unix))
+                {
                     g.entries.insert(
                         key,
                         Entry {
@@ -990,6 +1234,7 @@ fn open_inner(
                             peer_ik,
                             authenticated,
                             pending_prologue: None,
+                            last_used_at: now_unix,
                         },
                     );
                     g.commit_change(key);
@@ -1100,11 +1345,12 @@ impl RatchetRuntime {
         &self,
         peer: PeerRatchetKeys<'_>,
         app_payload: &[u8],
+        now_unix: u64,
     ) -> Result<(Vec<u8>, [u8; ACK_KEY_LEN]), RatchetSpliceError> {
         let me = self
             .identity()
             .ok_or(RatchetSpliceError::NoLocalInstance)?;
-        seal(&self.store, &me, peer, app_payload)
+        seal(&self.store, &me, peer, app_payload, now_unix)
     }
 
     /// Open a payload from `sender_node_id`. See [`open`].
@@ -1182,16 +1428,11 @@ mod tests {
     /// Alice seals to Bob; Bob opens it. Returns Bob's result.
     fn a_to_b(a: &Device, b: &Device, msg: &[u8]) -> Result<Opened, RatchetSpliceError> {
         let (ek, pk) = (b.ek(), b.ratchet_pk());
-        let payload = seal(&a.store, &a.me(), keys(b, &ek, &pk), msg).expect("seal").0;
+        let payload = seal(&a.store, &a.me(), keys(b, &ek, &pk), msg, NOW)
+            .expect("seal")
+            .0;
         let a_pk = a.ratchet_pk();
-        open(
-            &b.store,
-            &b.me(),
-            &a.node_id,
-            &payload,
-            Some(&a_pk),
-            NOW,
-        )
+        open(&b.store, &b.me(), &a.node_id, &payload, Some(&a_pk), NOW)
     }
 
     #[test]
@@ -1214,7 +1455,9 @@ mod tests {
         a_to_b(&a, &b, b"one").expect("open");
         for i in 0..4u8 {
             let (ek, pk) = (a.ek(), a.ratchet_pk());
-            let back = seal(&b.store, &b.me(), keys(&a, &ek, &pk), &[i; 9]).expect("seal").0;
+            let back = seal(&b.store, &b.me(), keys(&a, &ek, &pk), &[i; 9], NOW)
+                .expect("seal")
+                .0;
             let b_pk = b.ratchet_pk();
             let got = open(&a.store, &a.me(), &b.node_id, &back, Some(&b_pk), NOW).expect("open");
             assert_eq!(got.plaintext, vec![i; 9]);
@@ -1229,12 +1472,16 @@ mod tests {
     fn the_first_payload_carries_a_prologue_and_later_ones_do_not() {
         let (a, b) = (device(0xA3), device(0xB3));
         let (ek, pk) = (b.ek(), b.ratchet_pk());
-        let first = seal(&a.store, &a.me(), keys(&b, &ek, &pk), b"1").expect("seal").0;
+        let first = seal(&a.store, &a.me(), keys(&b, &ek, &pk), b"1", NOW)
+            .expect("seal")
+            .0;
         assert_eq!(first[2], KIND_PROLOGUE);
 
         // Still no answer from Bob, so the prologue is repeated — a lost first
         // transmission must not strand the conversation.
-        let second = seal(&a.store, &a.me(), keys(&b, &ek, &pk), b"2").expect("seal").0;
+        let second = seal(&a.store, &a.me(), keys(&b, &ek, &pk), b"2", NOW)
+            .expect("seal")
+            .0;
         assert_eq!(second[2], KIND_PROLOGUE);
         assert_eq!(
             &second[HEADER_LEN..HEADER_LEN + PQXDH_PROLOGUE_LEN],
@@ -1247,11 +1494,15 @@ mod tests {
         let a_pk = a.ratchet_pk();
         open(&b.store, &b.me(), &a.node_id, &second, Some(&a_pk), NOW).expect("open");
         let (aek, apk) = (a.ek(), a.ratchet_pk());
-        let reply = seal(&b.store, &b.me(), keys(&a, &aek, &apk), b"got it").expect("seal").0;
+        let reply = seal(&b.store, &b.me(), keys(&a, &aek, &apk), b"got it", NOW)
+            .expect("seal")
+            .0;
         let b_pk = b.ratchet_pk();
         open(&a.store, &a.me(), &b.node_id, &reply, Some(&b_pk), NOW).expect("open");
 
-        let third = seal(&a.store, &a.me(), keys(&b, &ek, &pk), b"3").expect("seal").0;
+        let third = seal(&a.store, &a.me(), keys(&b, &ek, &pk), b"3", NOW)
+            .expect("seal")
+            .0;
         assert_eq!(third[2], KIND_FRAME, "the prologue must stop once answered");
     }
 
@@ -1259,8 +1510,12 @@ mod tests {
     fn a_lost_first_message_is_recovered_by_the_repeated_prologue() {
         let (a, b) = (device(0xA4), device(0xB4));
         let (ek, pk) = (b.ek(), b.ratchet_pk());
-        let lost = seal(&a.store, &a.me(), keys(&b, &ek, &pk), b"lost").expect("seal").0;
-        let kept = seal(&a.store, &a.me(), keys(&b, &ek, &pk), b"kept").expect("seal").0;
+        let lost = seal(&a.store, &a.me(), keys(&b, &ek, &pk), b"lost", NOW)
+            .expect("seal")
+            .0;
+        let kept = seal(&a.store, &a.me(), keys(&b, &ek, &pk), b"kept", NOW)
+            .expect("seal")
+            .0;
         drop(lost);
         let a_pk = a.ratchet_pk();
         let got = open(&b.store, &b.me(), &a.node_id, &kept, Some(&a_pk), NOW).expect("open");
@@ -1271,7 +1526,9 @@ mod tests {
     fn an_unknown_sender_key_opens_but_is_not_authenticated() {
         let (a, b) = (device(0xA5), device(0xB5));
         let (ek, pk) = (b.ek(), b.ratchet_pk());
-        let payload = seal(&a.store, &a.me(), keys(&b, &ek, &pk), b"who am i").expect("seal").0;
+        let payload = seal(&a.store, &a.me(), keys(&b, &ek, &pk), b"who am i", NOW)
+            .expect("seal")
+            .0;
         // Bob has not resolved Alice's certificate yet.
         let got = open(&b.store, &b.me(), &a.node_id, &payload, None, NOW).expect("open");
         assert_eq!(got.plaintext, b"who am i");
@@ -1281,7 +1538,9 @@ mod tests {
         );
 
         // It settles the moment the certificate is in hand.
-        let next = seal(&a.store, &a.me(), keys(&b, &ek, &pk), b"still me").expect("seal").0;
+        let next = seal(&a.store, &a.me(), keys(&b, &ek, &pk), b"still me", NOW)
+            .expect("seal")
+            .0;
         let a_pk = a.ratchet_pk();
         let got = open(&b.store, &b.me(), &a.node_id, &next, Some(&a_pk), NOW).expect("open");
         assert!(got.authenticated);
@@ -1291,7 +1550,9 @@ mod tests {
     fn a_sender_announcing_the_wrong_key_is_not_authenticated() {
         let (a, b) = (device(0xA6), device(0xB6));
         let (ek, pk) = (b.ek(), b.ratchet_pk());
-        let payload = seal(&a.store, &a.me(), keys(&b, &ek, &pk), b"impostor").expect("seal").0;
+        let payload = seal(&a.store, &a.me(), keys(&b, &ek, &pk), b"impostor", NOW)
+            .expect("seal")
+            .0;
         // Anyone can seal to Bob's published key and name any sender. Handing
         // Bob a DIFFERENT certificate for that name must not authenticate it.
         let someone_else = device(0xC6).ratchet_pk();
@@ -1320,9 +1581,15 @@ mod tests {
         impostor.node_id = a.node_id;
         impostor.instance_id = a.instance_id;
         let (ek, pk) = (b.ek(), b.ratchet_pk());
-        let forged = seal(&impostor.store, &impostor.me(), keys(&b, &ek, &pk), b"reset")
-            .expect("seal")
-            .0;
+        let forged = seal(
+            &impostor.store,
+            &impostor.me(),
+            keys(&b, &ek, &pk),
+            b"reset",
+            NOW,
+        )
+        .expect("seal")
+        .0;
         let a_pk = a.ratchet_pk();
         assert!(
             open(&b.store, &b.me(), &a.node_id, &forged, Some(&a_pk), NOW).is_err(),
@@ -1363,6 +1630,7 @@ mod tests {
             &squatter.me(),
             keys(&b, &bek, &bpk),
             b"i am alice",
+            NOW,
         )
         .expect("seal")
         .0;
@@ -1380,6 +1648,7 @@ mod tests {
             &b.me(),
             keys(&a, &aek, &apk),
             b"the account number is",
+            NOW,
         )
         .expect("seal")
         .0;
@@ -1419,6 +1688,7 @@ mod tests {
             &squatter.me(),
             keys(&b, &bek, &bpk),
             b"i am alice",
+            NOW,
         )
         .expect("seal")
         .0;
@@ -1435,6 +1705,7 @@ mod tests {
             &squatter.me(),
             keys(&b, &bek, &bpk),
             b"still here",
+            NOW,
         )
         .expect("seal")
         .0;
@@ -1460,7 +1731,7 @@ mod tests {
         // would arrive at a chain that never saw it.
         let (a, b) = (device(0x70), device(0x71));
         let (bek, bpk) = (b.ek(), b.ratchet_pk());
-        let payload = seal(&a.store, &a.me(), keys(&b, &bek, &bpk), b"race")
+        let payload = seal(&a.store, &a.me(), keys(&b, &bek, &bpk), b"race", NOW)
             .expect("seal")
             .0;
         let a_pk = a.ratchet_pk();
@@ -1502,7 +1773,7 @@ mod tests {
         // answered conversation is therefore untouchable no matter who asks.
         let (a, b) = (device(0x6E), device(0x6F));
         let (bek, bpk) = (b.ek(), b.ratchet_pk());
-        let opening = seal(&a.store, &a.me(), keys(&b, &bek, &bpk), b"hello")
+        let opening = seal(&a.store, &a.me(), keys(&b, &bek, &bpk), b"hello", NOW)
             .expect("seal")
             .0;
         let a_pk = a.ratchet_pk();
@@ -1534,7 +1805,7 @@ mod tests {
         // a stranger cannot produce one that announces her key AND opens.
         let (a, b) = (device(0x6B), device(0x6C));
         let (bek, bpk) = (b.ek(), b.ratchet_pk());
-        let first = seal(&a.store, &a.me(), keys(&b, &bek, &bpk), b"hello")
+        let first = seal(&a.store, &a.me(), keys(&b, &bek, &bpk), b"hello", NOW)
             .expect("seal")
             .0;
         let got = open(&b.store, &b.me(), &a.node_id, &first, None, NOW).expect("open");
@@ -1546,6 +1817,7 @@ mod tests {
             &squatter.me(),
             keys(&b, &bek, &bpk),
             b"me instead",
+            NOW,
         )
         .expect("seal")
         .0;
@@ -1557,7 +1829,7 @@ mod tests {
 
         // Alice's conversation is untouched, and settles the moment she speaks
         // again against the certificate Bob now holds.
-        let next = seal(&a.store, &a.me(), keys(&b, &bek, &bpk), b"still me")
+        let next = seal(&a.store, &a.me(), keys(&b, &bek, &bpk), b"still me", NOW)
             .expect("seal")
             .0;
         let got = open(&b.store, &b.me(), &a.node_id, &next, Some(&a_pk), NOW).expect("open");
@@ -1587,9 +1859,15 @@ mod tests {
             .expect("rotate");
 
         let (aek, apk) = (a.ek(), a.ratchet_pk());
-        let reply = seal(&b.store, &b.me(), keys(&a, &aek, &apk), b"still talking")
-            .expect("seal")
-            .0;
+        let reply = seal(
+            &b.store,
+            &b.me(),
+            keys(&a, &aek, &apk),
+            b"still talking",
+            NOW,
+        )
+        .expect("seal")
+        .0;
         assert_eq!(
             reply[2], KIND_FRAME,
             "a rotation must not replace the conversation"
@@ -1613,19 +1891,32 @@ mod tests {
         // other's frames and nothing on the wire would ever change that.
         let (a, b) = (device(0x69), device(0x6A));
         let (bek, bpk) = (b.ek(), b.ratchet_pk());
-        seal(&a.store, &a.me(), keys(&b, &bek, &bpk), b"anyone there").expect("seal");
+        seal(
+            &a.store,
+            &a.me(),
+            keys(&b, &bek, &bpk),
+            b"anyone there",
+            NOW,
+        )
+        .expect("seal");
 
         let (aek, apk) = (a.ek(), a.ratchet_pk());
-        let fresh = seal(&b.store, &b.me(), keys(&a, &aek, &apk), b"starting over")
-            .expect("seal")
-            .0;
+        let fresh = seal(
+            &b.store,
+            &b.me(),
+            keys(&a, &aek, &apk),
+            b"starting over",
+            NOW,
+        )
+        .expect("seal")
+        .0;
         let b_pk = b.ratchet_pk();
         let got = open(&a.store, &a.me(), &b.node_id, &fresh, Some(&b_pk), NOW).expect("open");
         assert_eq!(got.plaintext, b"starting over");
         assert!(got.authenticated);
 
         // And the conversation now runs on the session the peer opened.
-        let back = seal(&a.store, &a.me(), keys(&b, &bek, &bpk), b"here now")
+        let back = seal(&a.store, &a.me(), keys(&b, &bek, &bpk), b"here now", NOW)
             .expect("seal")
             .0;
         assert_eq!(back[2], KIND_FRAME);
@@ -1642,7 +1933,9 @@ mod tests {
     fn a_payload_for_another_device_is_refused_before_any_key_work() {
         let (a, b) = (device(0xA8), device(0xB8));
         let (ek, pk) = (b.ek(), b.ratchet_pk());
-        let payload = seal(&a.store, &a.me(), keys(&b, &ek, &pk), b"x").expect("seal").0;
+        let payload = seal(&a.store, &a.me(), keys(&b, &ek, &pk), b"x", NOW)
+            .expect("seal")
+            .0;
         let other = device(0xD8);
         let me = RatchetIdentity {
             local_node_id: b.node_id,
@@ -1677,7 +1970,9 @@ mod tests {
         // downgrade this protocol exists to rule out.
         let (a, b) = (device(0xA9), device(0xB9));
         let (ek, pk) = (b.ek(), b.ratchet_pk());
-        let good = seal(&a.store, &a.me(), keys(&b, &ek, &pk), b"downgrade me").expect("seal").0;
+        let good = seal(&a.store, &a.me(), keys(&b, &ek, &pk), b"downgrade me", NOW)
+            .expect("seal")
+            .0;
         assert_eq!(good[2], KIND_PROLOGUE);
 
         let a_pk = a.ratchet_pk();
@@ -1717,7 +2012,9 @@ mod tests {
         let (a, b) = (device(0xB1), device(0xC1));
         a_to_b(&a, &b, b"establish").expect("open");
         let (ek, pk) = (b.ek(), b.ratchet_pk());
-        let good = seal(&a.store, &a.me(), keys(&b, &ek, &pk), b"downgrade me").expect("seal").0;
+        let good = seal(&a.store, &a.me(), keys(&b, &ek, &pk), b"downgrade me", NOW)
+            .expect("seal")
+            .0;
         let key = b.store.keys()[0];
         let before = b.store.export(&key).expect("held");
 
@@ -1750,10 +2047,14 @@ mod tests {
         let (ek, pk) = (b.ek(), b.ratchet_pk());
         // Establish so Alice stops repeating the prologue.
         let (aek, apk) = (a.ek(), a.ratchet_pk());
-        let reply = seal(&b.store, &b.me(), keys(&a, &aek, &apk), b"hi").expect("seal").0;
+        let reply = seal(&b.store, &b.me(), keys(&a, &aek, &apk), b"hi", NOW)
+            .expect("seal")
+            .0;
         let b_pk = b.ratchet_pk();
         open(&a.store, &a.me(), &b.node_id, &reply, Some(&b_pk), NOW).expect("open");
-        let bare = seal(&a.store, &a.me(), keys(&b, &ek, &pk), b"two").expect("seal").0;
+        let bare = seal(&a.store, &a.me(), keys(&b, &ek, &pk), b"two", NOW)
+            .expect("seal")
+            .0;
         assert_eq!(bare[2], KIND_FRAME);
 
         // A peer that lost its state cannot read it.
@@ -1769,7 +2070,9 @@ mod tests {
         let (a, b) = (device(0xAB), device(0xBB));
         a_to_b(&a, &b, b"one").expect("open");
         let (ek, pk) = (b.ek(), b.ratchet_pk());
-        let good = seal(&a.store, &a.me(), keys(&b, &ek, &pk), b"two").expect("seal").0;
+        let good = seal(&a.store, &a.me(), keys(&b, &ek, &pk), b"two", NOW)
+            .expect("seal")
+            .0;
 
         let before_version = b.store.version();
         let before_blob = b
@@ -1818,7 +2121,9 @@ mod tests {
         // load-bearing rather than decorative.
         let (a, b) = (device(0xAC), device(0xBC));
         let (ek, pk) = (b.ek(), b.ratchet_pk());
-        let payload = seal(&a.store, &a.me(), keys(&b, &ek, &pk), b"x").expect("seal").0;
+        let payload = seal(&a.store, &a.me(), keys(&b, &ek, &pk), b"x", NOW)
+            .expect("seal")
+            .0;
         let lied_about = [0x77u8; 32];
         assert!(open(&b.store, &b.me(), &lied_about, &payload, None, NOW).is_err());
     }
@@ -1836,19 +2141,23 @@ mod tests {
                 let blob = dev.store.export(&key).expect("held");
                 dev.store.forget(&key);
                 assert!(!dev.store.has_session(&key));
-                dev.store.import(&key, &blob).expect("import");
+                dev.store.import(&key, &blob, NOW).expect("import");
             }
         }
 
         // The conversation continues from exactly where it was.
-        let third = seal(&a.store, &a.me(), keys(&b, &ek, &pk), b"three").expect("seal").0;
+        let third = seal(&a.store, &a.me(), keys(&b, &ek, &pk), b"three", NOW)
+            .expect("seal")
+            .0;
         let a_pk = a.ratchet_pk();
         let got = open(&b.store, &b.me(), &a.node_id, &third, Some(&a_pk), NOW).expect("open");
         assert_eq!(got.plaintext, b"three");
         assert!(got.authenticated, "the authenticated flag must survive too");
 
         let (aek, apk) = (a.ek(), a.ratchet_pk());
-        let back = seal(&b.store, &b.me(), keys(&a, &aek, &apk), b"four").expect("seal").0;
+        let back = seal(&b.store, &b.me(), keys(&a, &aek, &apk), b"four", NOW)
+            .expect("seal")
+            .0;
         let b_pk = b.ratchet_pk();
         assert_eq!(
             open(&a.store, &a.me(), &b.node_id, &back, Some(&b_pk), NOW)
@@ -1866,15 +2175,19 @@ mod tests {
         // gets a root and every later frame is undecryptable.
         let (a, b) = (device(0xAE), device(0xBE));
         let (ek, pk) = (b.ek(), b.ratchet_pk());
-        let lost = seal(&a.store, &a.me(), keys(&b, &ek, &pk), b"lost").expect("seal").0;
+        let lost = seal(&a.store, &a.me(), keys(&b, &ek, &pk), b"lost", NOW)
+            .expect("seal")
+            .0;
         drop(lost);
 
         let key = a.store.keys()[0];
         let blob = a.store.export(&key).expect("held");
         let restarted = RatchetStore::new();
-        restarted.import(&key, &blob).expect("import");
+        restarted.import(&key, &blob, NOW).expect("import");
 
-        let again = seal(&restarted, &a.me(), keys(&b, &ek, &pk), b"again").expect("seal").0;
+        let again = seal(&restarted, &a.me(), keys(&b, &ek, &pk), b"again", NOW)
+            .expect("seal")
+            .0;
         assert_eq!(again[2], KIND_PROLOGUE);
         let a_pk = a.ratchet_pk();
         assert_eq!(
@@ -1892,7 +2205,9 @@ mod tests {
         assert!(a.store.drain_dirty().is_empty());
 
         let (ek, pk) = (b.ek(), b.ratchet_pk());
-        let payload = seal(&a.store, &a.me(), keys(&b, &ek, &pk), b"x").expect("seal").0;
+        let payload = seal(&a.store, &a.me(), keys(&b, &ek, &pk), b"x", NOW)
+            .expect("seal")
+            .0;
         assert_eq!(a.store.version(), 1);
         let dirty = a.store.drain_dirty();
         assert_eq!(dirty.len(), 1);
@@ -1917,7 +2232,7 @@ mod tests {
         let peers: Vec<_> = (0..5u8).map(|i| device(0xD0 + i)).collect();
         for b in &peers {
             let (ek, pk) = (b.ek(), b.ratchet_pk());
-            seal(&a.store, &a.me(), keys(b, &ek, &pk), b"x").expect("seal");
+            seal(&a.store, &a.me(), keys(b, &ek, &pk), b"x", NOW).expect("seal");
         }
         assert_eq!(a.store.dirty_len(), 5);
 
@@ -1945,7 +2260,7 @@ mod tests {
         let peers: Vec<_> = (0..3u8).map(|i| device(0xE1 + i)).collect();
         for b in &peers {
             let (ek, pk) = (b.ek(), b.ratchet_pk());
-            seal(&a.store, &a.me(), keys(b, &ek, &pk), b"x").expect("seal");
+            seal(&a.store, &a.me(), keys(b, &ek, &pk), b"x", NOW).expect("seal");
         }
 
         let (first, gen_first) = a.store.peek_dirty(99);
@@ -1967,7 +2282,7 @@ mod tests {
         let peers: Vec<_> = (0..3u8).map(|i| device(0xF1 + i)).collect();
         for b in &peers {
             let (ek, pk) = (b.ek(), b.ratchet_pk());
-            seal(&a.store, &a.me(), keys(b, &ek, &pk), b"x").expect("seal");
+            seal(&a.store, &a.me(), keys(b, &ek, &pk), b"x", NOW).expect("seal");
         }
 
         let (batch, generation) = a.store.peek_dirty(2);
@@ -1993,13 +2308,13 @@ mod tests {
         // be the one from before it, which is a message key used twice.
         let (a, b) = (device(0x40), device(0x41));
         let (ek, pk) = (b.ek(), b.ratchet_pk());
-        seal(&a.store, &a.me(), keys(&b, &ek, &pk), b"first").expect("seal");
+        seal(&a.store, &a.me(), keys(&b, &ek, &pk), b"first", NOW).expect("seal");
 
         let (batch, generation) = a.store.peek_dirty(99);
         assert_eq!(batch.len(), 1);
 
         // The send that lands while the write for the previous one is in flight.
-        seal(&a.store, &a.me(), keys(&b, &ek, &pk), b"second").expect("seal");
+        seal(&a.store, &a.me(), keys(&b, &ek, &pk), b"second", NOW).expect("seal");
 
         assert_eq!(
             a.store.ack_dirty(&batch, generation),
@@ -2023,7 +2338,7 @@ mod tests {
         // already been forgotten about — along with the rest of its batch.
         let (a, b) = (device(0x50), device(0x51));
         let (ek, pk) = (b.ek(), b.ratchet_pk());
-        seal(&a.store, &a.me(), keys(&b, &ek, &pk), b"x").expect("seal");
+        seal(&a.store, &a.me(), keys(&b, &ek, &pk), b"x", NOW).expect("seal");
 
         let (batch, _) = a.store.peek_dirty(99);
         assert_eq!(batch.len(), 1);
@@ -2042,7 +2357,9 @@ mod tests {
         // same black hole the mailbox seed overlap exists to prevent.
         let (a, b) = (device(0xB0), device(0xC0));
         let (ek, pk) = (b.ek(), b.ratchet_pk());
-        let payload = seal(&a.store, &a.me(), keys(&b, &ek, &pk), b"pre-rotation").expect("seal").0;
+        let payload = seal(&a.store, &a.me(), keys(&b, &ek, &pk), b"pre-rotation", NOW)
+            .expect("seal")
+            .0;
 
         let (new_ek, _) = crate::keypair_from_dk_seed(&[0xEE; DK_SEED_BYTES]).expect("keypair");
         b.ring
@@ -2071,7 +2388,7 @@ mod tests {
         let ek = b.ek();
         let zero = [0u8; 32];
         assert_eq!(
-            seal(&a.store, &a.me(), keys(&b, &ek, &zero), b"x").unwrap_err(),
+            seal(&a.store, &a.me(), keys(&b, &ek, &zero), b"x", NOW).unwrap_err(),
             RatchetSpliceError::NoRatchetKey
         );
     }
@@ -2084,7 +2401,7 @@ mod tests {
         let (a, b) = (device(0xB6), device(0xC6));
         let (ek, pk) = (b.ek(), b.ratchet_pk());
         let (payload, sent_key) =
-            seal(&a.store, &a.me(), keys(&b, &ek, &pk), b"deliver me").expect("seal");
+            seal(&a.store, &a.me(), keys(&b, &ek, &pk), b"deliver me", NOW).expect("seal");
         assert_ne!(sent_key, [0u8; ACK_KEY_LEN]);
         assert!(
             !payload
@@ -2099,8 +2416,536 @@ mod tests {
         assert_eq!(got.plaintext, b"deliver me", "and must not leak into it");
 
         // Every message gets its own.
-        let (_, second_key) = seal(&a.store, &a.me(), keys(&b, &ek, &pk), b"again").expect("seal");
+        let (_, second_key) =
+            seal(&a.store, &a.me(), keys(&b, &ek, &pk), b"again", NOW).expect("seal");
         assert_ne!(second_key, sent_key);
+    }
+
+    // ── Quota, expiry, pagination ────────────────────────────────────────────
+
+    /// Put `n` conversations into `store` directly, at `last_used_at = stamp`.
+    ///
+    /// Built by hand rather than by running `seal`/`open` a thousand times:
+    /// filling the store through the real paths costs a PQXDH per entry and
+    /// minutes per test. The entries are the real type and the admission rules
+    /// are exercised separately by the tests that drive `seal` and `open`.
+    fn plant(
+        store: &RatchetStore,
+        n: usize,
+        authenticated: bool,
+        stamp: u64,
+        tag: u8,
+    ) -> Vec<ConversationKey> {
+        let (a, b) = (device(0x01), device(0x02));
+        let (ek, pk) = (b.ek(), b.ratchet_pk());
+        let blob = {
+            seal(&a.store, &a.me(), keys(&b, &ek, &pk), b"x", NOW).expect("seal");
+            a.store.export(&a.store.keys()[0]).expect("held")
+        };
+        let mut planted = Vec::with_capacity(n);
+        let mut g = store.lock();
+        for i in 0..n {
+            // `tag` namespaces one call's keys away from another's, so a test
+            // that plants two groups gets two groups and not one overwritten
+            // by the other.
+            let mut key = ConversationKey {
+                local_instance_id: [0x11; 16],
+                peer_node_id: [0x22; 32],
+                peer_instance_id: [tag; 16],
+            };
+            key.peer_node_id[..8].copy_from_slice(&(i as u64).to_be_bytes());
+            let mut entry = Entry::decode(&blob).expect("decode");
+            entry.authenticated = authenticated;
+            entry.pending_prologue = None;
+            entry.last_used_at = stamp;
+            g.entries.insert(key, entry);
+            planted.push(key);
+        }
+        drop(g);
+        planted
+    }
+
+    #[test]
+    fn a_flood_of_unproven_conversations_cannot_grow_past_the_ceiling() {
+        // The reason the ceiling exists. A prologue is sealed to keys this
+        // device published, so anyone who can reach it can make it hold a
+        // session, and the sender pays one encapsulation for each.
+        // The literals here are deliberate. A test that compared against the
+        // constant would move whenever the constant moved, so raising the
+        // ceiling — or the window — would keep it green while the bound it is
+        // supposed to pin quietly went somewhere else.
+        assert_eq!(MAX_CONVERSATIONS, 1_024, "the documented ceiling");
+        assert_eq!(
+            UNPROVEN_TTL_SECS,
+            14 * 24 * 60 * 60,
+            "the documented window, and it must stay longer than the mailbox's \
+             seven-day store-and-forward reach"
+        );
+
+        let store = RatchetStore::new();
+        plant(&store, MAX_CONVERSATIONS, false, NOW, 0xA0);
+        assert_eq!(store.len(), 1_024, "the ceiling, spelled out");
+        assert_eq!(
+            store.len(),
+            store.capacity(),
+            "the fixture must have filled it exactly"
+        );
+
+        // One more, through the real inbound path.
+        let (a, b) = (device(0x80), device(0x81));
+        let (bek, bpk) = (b.ek(), b.ratchet_pk());
+        let payload = seal(&a.store, &a.me(), keys(&b, &bek, &bpk), b"one more", NOW)
+            .expect("seal")
+            .0;
+        let me = RatchetIdentity {
+            local_node_id: b.node_id,
+            local_instance_id: b.instance_id,
+            seed_ring: &b.ring,
+        };
+        let a_pk = a.ratchet_pk();
+        open(&store, &me, &a.node_id, &payload, Some(&a_pk), NOW).expect("open");
+
+        // Held, and the store did not grow: one of the planted entries went.
+        assert_eq!(store.len(), 1_024, "the store grew past its ceiling");
+        assert!(
+            store.has_session(&ConversationKey {
+                local_instance_id: b.instance_id,
+                peer_node_id: a.node_id,
+                peer_instance_id: a.instance_id,
+            }),
+            "the newcomer was not admitted"
+        );
+    }
+
+    #[test]
+    fn eviction_never_takes_a_conversation_this_device_has_spoken_on() {
+        // H-03's lesson as a test. Evicting a proven conversation does not
+        // cost a round trip — it wedges that conversation permanently, because
+        // the peer's side is proven and answered and `open` refuses to let any
+        // prologue re-key one of those. So a full store must take the unproven
+        // entry and leave every proven one where it is, and when there is no
+        // unproven entry left it must refuse rather than choose a victim.
+        let store = RatchetStore::new();
+        let proven = plant(&store, MAX_CONVERSATIONS - 1, true, NOW, 0xA1);
+        // The single unproven entry, made the NEWEST so that a plain
+        // least-recently-used rule would pass over it and take a proven one.
+        let unproven = plant(&store, 1, false, NOW + 9_999, 0xA2);
+        assert_eq!(store.len(), 1_024);
+
+        let (a, b) = (device(0x82), device(0x83));
+        let (bek, bpk) = (b.ek(), b.ratchet_pk());
+        let payload = seal(&a.store, &a.me(), keys(&b, &bek, &bpk), b"admit me", NOW)
+            .expect("seal")
+            .0;
+        let me = RatchetIdentity {
+            local_node_id: b.node_id,
+            local_instance_id: b.instance_id,
+            seed_ring: &b.ring,
+        };
+        let a_pk = a.ratchet_pk();
+        open(&store, &me, &a.node_id, &payload, Some(&a_pk), NOW).expect("open");
+
+        assert!(
+            !store.has_session(&unproven[0]),
+            "the unproven conversation should have been the one to go"
+        );
+        for (i, key) in proven.iter().enumerate() {
+            assert!(
+                store.has_session(key),
+                "proven conversation {i} was evicted; its peer is now unreachable forever"
+            );
+        }
+    }
+
+    #[test]
+    fn a_full_store_of_proven_conversations_refuses_rather_than_evicts() {
+        // The end of the line: nothing droppable left. Refusing one new
+        // conversation is recoverable — the host forgets something, or the
+        // user does. Silently breaking one of the thousand already running is
+        // not, and it would be indistinguishable from data loss.
+        let store = RatchetStore::new();
+        let proven = plant(&store, MAX_CONVERSATIONS, true, NOW, 0xA3);
+
+        let (a, b) = (device(0x84), device(0x85));
+        let (bek, bpk) = (b.ek(), b.ratchet_pk());
+        let me = RatchetIdentity {
+            local_node_id: a.node_id,
+            local_instance_id: a.instance_id,
+            seed_ring: &a.ring,
+        };
+        assert_eq!(
+            seal(&store, &me, keys(&b, &bek, &bpk), b"no room", NOW).unwrap_err(),
+            RatchetSpliceError::StoreFull,
+        );
+        assert_eq!(store.len(), 1_024);
+        for (i, key) in proven.iter().enumerate() {
+            assert!(
+                store.has_session(key),
+                "proven conversation {i} was evicted"
+            );
+        }
+
+        // And forgetting one makes room again, so the refusal is a full store
+        // and not a dead store.
+        assert!(store.forget(&proven[0]));
+        seal(&store, &me, keys(&b, &bek, &bpk), b"room now", NOW).expect("seal");
+    }
+
+    #[test]
+    fn a_first_contact_still_waiting_for_its_answer_is_never_evicted() {
+        // The case that looks droppable and is the worst one to drop. We have
+        // opened a conversation and heard nothing back, so there is no traffic
+        // on it and it is the obvious thing for a cache to discard — and
+        // discarding it wedges the contact permanently. The peer receives our
+        // prologue, answers, and their side is proven and answered from that
+        // moment. Our replacement prologue then meets `open`'s displacement
+        // rule, which refuses to re-key a proven answered conversation, and
+        // their reply meets a store that has nothing to open it with. Neither
+        // end can send anything that recovers the other.
+        //
+        // So "we have spoken on it" is the test, not "it has carried traffic",
+        // and this pins the difference: `pending_prologue` being outstanding
+        // makes an entry DISPLACEABLE by the peer who can prove it is theirs,
+        // and still not DROPPABLE by us.
+        let store = RatchetStore::new();
+        let proven = plant(&store, MAX_CONVERSATIONS - 1, true, NOW + 500, 0xB0);
+        let outstanding = plant(&store, 1, true, NOW, 0xB1);
+        // Make it exactly what an unanswered first contact is, and the oldest
+        // entry in the store, so any age-based rule would take it first.
+        {
+            let mut g = store.lock();
+            let entry = g.entries.get_mut(&outstanding[0]).expect("held");
+            entry.pending_prologue = Some(vec![0u8; PQXDH_PROLOGUE_LEN]);
+        }
+
+        let (a, b) = (device(0x8C), device(0x8D));
+        let (bek, bpk) = (b.ek(), b.ratchet_pk());
+        let me = RatchetIdentity {
+            local_node_id: a.node_id,
+            local_instance_id: a.instance_id,
+            seed_ring: &a.ring,
+        };
+        assert_eq!(
+            seal(&store, &me, keys(&b, &bek, &bpk), b"someone new", NOW).unwrap_err(),
+            RatchetSpliceError::StoreFull,
+            "an unanswered first contact was treated as spare room"
+        );
+        assert!(
+            store.has_session(&outstanding[0]),
+            "the conversation waiting for its answer was evicted; both ends are \
+             now wedged with nothing on the wire that can recover them"
+        );
+        // And it is still what it was, prologue and all.
+        assert!(
+            store
+                .export(&outstanding[0])
+                .map(|b| Entry::decode(&b).expect("decode").pending_prologue.is_some())
+                .unwrap_or(false),
+            "the outstanding prologue did not survive"
+        );
+        assert_eq!(store.len(), 1_024);
+        for (i, key) in proven.iter().enumerate() {
+            assert!(store.has_session(key), "proven conversation {i} was evicted");
+        }
+
+        // Time does not take it either: it is not in the class the sweep can
+        // touch, however long it waits.
+        assert_eq!(store.expire(NOW + 100 * UNPROVEN_TTL_SECS), 0);
+        assert!(store.has_session(&outstanding[0]));
+    }
+
+    #[test]
+    fn a_full_store_still_reads_an_inbound_message_it_cannot_remember() {
+        // The inbound half of "nothing droppable left", and the one place the
+        // two answers differ. On the send path a refusal is the whole answer.
+        // Here the message has ALREADY decrypted under a root only its author
+        // could have agreed, so refusing to hand it up would discard a genuine
+        // message to protect a memory bound — the wrong trade twice over. So
+        // the plaintext goes up and only the session is dropped, and the store
+        // neither grows past its ceiling nor gives up a proven conversation to
+        // make room for one it was never asked to keep.
+        let store = RatchetStore::new();
+        let proven = plant(&store, MAX_CONVERSATIONS, true, NOW, 0xAE);
+
+        let (a, b) = (device(0x8E), device(0x8F));
+        let (bek, bpk) = (b.ek(), b.ratchet_pk());
+        let payload = seal(&a.store, &a.me(), keys(&b, &bek, &bpk), b"read me", NOW)
+            .expect("seal")
+            .0;
+        let me = RatchetIdentity {
+            local_node_id: b.node_id,
+            local_instance_id: b.instance_id,
+            seed_ring: &b.ring,
+        };
+        let a_pk = a.ratchet_pk();
+        let got = open(&store, &me, &a.node_id, &payload, Some(&a_pk), NOW)
+            .expect("a genuine message was dropped because the store was full");
+        assert_eq!(got.plaintext, b"read me");
+
+        assert_eq!(store.len(), 1_024, "the store grew past its ceiling");
+        assert!(
+            !store.has_session(&ConversationKey {
+                local_instance_id: b.instance_id,
+                peer_node_id: a.node_id,
+                peer_instance_id: a.instance_id,
+            }),
+            "there was nothing droppable, so the session must not have been kept"
+        );
+        for (i, key) in proven.iter().enumerate() {
+            assert!(
+                store.has_session(key),
+                "proven conversation {i} was evicted to store one we were not asked to keep"
+            );
+        }
+    }
+
+    #[test]
+    fn a_flood_cannot_deny_the_user_a_new_conversation() {
+        // The property that makes the quota safe to have at all, stated end to
+        // end: whatever a stranger plants is unproven, so however much of it
+        // there is, the user's next outgoing conversation still gets a slot.
+        // A quota that could be filled by an attacker would be a denial of
+        // service with a different name.
+        let store = RatchetStore::new();
+        plant(&store, MAX_CONVERSATIONS, false, NOW, 0xA4);
+
+        let a = device(0x86);
+        let me = RatchetIdentity {
+            local_node_id: a.node_id,
+            local_instance_id: a.instance_id,
+            seed_ring: &a.ring,
+        };
+        for i in 0..4u8 {
+            let peer = device(0x88 + i);
+            let (pek, ppk) = (peer.ek(), peer.ratchet_pk());
+            seal(&store, &me, keys(&peer, &pek, &ppk), b"hello", NOW)
+                .unwrap_or_else(|e| panic!("a flood denied outgoing conversation {i}: {e}"));
+            assert!(store.len() <= 1_024);
+        }
+    }
+
+    #[test]
+    fn an_unproven_conversation_ages_out_and_a_proven_one_never_does() {
+        // TTL is measured from last USE. A conversation that carried a message
+        // an hour ago is not stale however long ago it was opened, and a quiet
+        // one that is proven is not stale at all — there is no way to restart
+        // it, so aging it out would strand both ends.
+        let store = RatchetStore::new();
+        let stale = plant(&store, 3, false, NOW, 0xA5);
+        let fresh = plant(&store, 1, false, NOW + 1, 0xA6);
+        let proven = plant(&store, 1, true, NOW, 0xA7);
+
+        // One second inside the window: nothing is stale yet.
+        assert_eq!(store.expire(NOW + UNPROVEN_TTL_SECS), 0);
+        assert_eq!(store.len(), 5);
+
+        // One second past it.
+        let dropped = store.expire(NOW + UNPROVEN_TTL_SECS + 1);
+        assert_eq!(dropped, 3, "the three idle unproven conversations must go");
+        for key in &stale {
+            assert!(!store.has_session(key));
+        }
+        assert!(
+            store.has_session(&proven[0]),
+            "a proven conversation has no expiry"
+        );
+        assert!(
+            store.has_session(&fresh[0]),
+            "a conversation used one second later is not yet stale"
+        );
+
+        // Far in the future the proven one is still there, and the unproven
+        // one is not.
+        store.expire(NOW + 100 * UNPROVEN_TTL_SECS);
+        assert!(store.has_session(&proven[0]));
+        assert!(!store.has_session(&fresh[0]));
+    }
+
+    #[test]
+    fn traffic_keeps_a_conversation_alive_and_a_forgery_does_not() {
+        // Two halves of "measured from last use". Carrying a message must
+        // refresh the stamp, or a long quiet dialogue dies mid-life. A frame
+        // that fails to open must NOT, or an attacker aiming garbage at a
+        // conversation decides what the sweep spares.
+        let (a, b) = (device(0x90), device(0x91));
+        let (bek, bpk) = (b.ek(), b.ratchet_pk());
+        let first = seal(&a.store, &a.me(), keys(&b, &bek, &bpk), b"hello", NOW)
+            .expect("seal")
+            .0;
+        // Opened WITHOUT Alice's certificate, so Bob's entry stays unproven —
+        // the only class the sweep can touch.
+        open(&b.store, &b.me(), &a.node_id, &first, None, NOW).expect("open");
+        let key = b.store.keys()[0];
+
+        // Most of the way through the window, a genuine message lands.
+        let later = NOW + UNPROVEN_TTL_SECS - 10;
+        let second = seal(&a.store, &a.me(), keys(&b, &bek, &bpk), b"still here", NOW)
+            .expect("seal")
+            .0;
+        open(&b.store, &b.me(), &a.node_id, &second, None, later).expect("open");
+
+        // The window measured from the ORIGINAL contact has now passed. A
+        // conversation stamped at creation would die here.
+        assert_eq!(
+            b.store.expire(NOW + UNPROVEN_TTL_SECS + 1),
+            0,
+            "a conversation that carried a message ten seconds ago was aged out"
+        );
+        assert!(b.store.has_session(&key));
+
+        // A forgery aimed at it, well past the window.
+        let third = seal(&a.store, &a.me(), keys(&b, &bek, &bpk), b"forge me", NOW)
+            .expect("seal")
+            .0;
+        let mut forged = third.clone();
+        let last = forged.len() - 1;
+        forged[last] ^= 0xFF;
+        let much_later = later + UNPROVEN_TTL_SECS;
+        assert!(open(&b.store, &b.me(), &a.node_id, &forged, None, much_later).is_err());
+
+        // It moved nothing, so the conversation is exactly as stale as the
+        // last message it really carried, and now ages out.
+        assert_eq!(
+            b.store.expire(later + UNPROVEN_TTL_SECS + 1),
+            1,
+            "a forged frame refreshed the conversation it was aimed at"
+        );
+        assert!(!b.store.has_session(&key));
+    }
+
+    fn stamp_of(store: &RatchetStore, key: &ConversationKey) -> u64 {
+        store.lock().entries.get(key).expect("held").last_used_at
+    }
+
+    #[test]
+    fn sending_marks_a_conversation_used_and_the_stamp_survives_a_restart() {
+        // Two things nothing else reaches. `last_used_at` is the last message
+        // in EITHER direction, so the send path has to write it — otherwise it
+        // is a received-at stamp wearing the wrong name, and any later rule
+        // that reads it inherits the lie.
+        //
+        // And it is persisted rather than reset on import, which is the part
+        // that decides whether the sweep ever fires at all: this store lives
+        // on a phone, the process restarts many times a day, and a stamp
+        // refreshed by hydration would make every conversation permanently
+        // one restart old.
+        let (a, b) = (device(0x96), device(0x97));
+        let (ek, pk) = (b.ek(), b.ratchet_pk());
+        seal(&a.store, &a.me(), keys(&b, &ek, &pk), b"one", NOW).expect("seal");
+        let key = a.store.keys()[0];
+        assert_eq!(stamp_of(&a.store, &key), NOW);
+
+        seal(&a.store, &a.me(), keys(&b, &ek, &pk), b"two", NOW + 1_000).expect("seal");
+        assert_eq!(
+            stamp_of(&a.store, &key),
+            NOW + 1_000,
+            "sending did not mark the conversation used"
+        );
+
+        // Out to the host's store and back, a long time later.
+        let blob = a.store.export(&key).expect("held");
+        let restarted = RatchetStore::new();
+        restarted
+            .import(&key, &blob, NOW + 10_000_000)
+            .expect("import");
+        assert_eq!(
+            stamp_of(&restarted, &key),
+            NOW + 1_000,
+            "hydrating the store reset the staleness clock"
+        );
+    }
+
+    #[test]
+    fn a_clock_that_steps_backwards_drops_nothing() {
+        // `now - last_used` under a saturating subtraction. The safe direction
+        // is for a backwards jump to make everything look young: dropping
+        // state because a clock resynchronised would be a way to lose mail.
+        let store = RatchetStore::new();
+        let planted = plant(&store, 2, false, NOW, 0xA8);
+        assert_eq!(store.expire(NOW - 10 * UNPROVEN_TTL_SECS), 0);
+        assert_eq!(store.expire(0), 0);
+        for key in &planted {
+            assert!(store.has_session(key));
+        }
+    }
+
+    #[test]
+    fn an_aged_out_conversation_is_named_for_the_host_to_delete() {
+        // The store is in memory and the blobs are on the host's disk. A sweep
+        // that dropped an entry without saying so would free nothing: the next
+        // launch imports exactly what was just aged out.
+        let store = RatchetStore::new();
+        let planted = plant(&store, 2, false, NOW, 0xA9);
+        let before = store.version();
+        assert_eq!(store.drain_dirty().len(), 0, "planting marks nothing");
+
+        assert_eq!(store.expire(NOW + UNPROVEN_TTL_SECS + 1), 2);
+        assert!(store.version() > before, "a sweep is committed work");
+        let named = store.drain_dirty();
+        assert_eq!(named.len(), 2);
+        for key in &planted {
+            assert!(named.contains(key), "an aged-out conversation went unnamed");
+            assert!(
+                store.export(key).is_none(),
+                "and the host must find nothing to write for it"
+            );
+        }
+    }
+
+    #[test]
+    fn the_quota_ages_out_before_it_evicts() {
+        // Order matters: a store that is merely stale must lose only stale
+        // entries, not the least-recently-used live one. Here everything is
+        // droppable, so a plain eviction would take exactly one and leave 1023
+        // dead conversations behind.
+        let store = RatchetStore::new();
+        plant(&store, MAX_CONVERSATIONS, false, NOW, 0xAA);
+
+        let (a, b) = (device(0x94), device(0x95));
+        let (bek, bpk) = (b.ek(), b.ratchet_pk());
+        let me = RatchetIdentity {
+            local_node_id: a.node_id,
+            local_instance_id: a.instance_id,
+            seed_ring: &a.ring,
+        };
+        seal(
+            &store,
+            &me,
+            keys(&b, &bek, &bpk),
+            b"much later",
+            NOW + UNPROVEN_TTL_SECS + 1,
+        )
+        .expect("seal");
+        assert_eq!(
+            store.len(),
+            1,
+            "admission evicted one stale conversation instead of sweeping them"
+        );
+    }
+
+    #[test]
+    fn a_conversation_import_respects_the_ceiling() {
+        // The host's own disk is not a trusted source of counts either: it is
+        // where yesterday's flood was persisted to.
+        let store = RatchetStore::new();
+        let proven = plant(&store, MAX_CONVERSATIONS, true, NOW, 0xAB);
+        let blob = store.export(&proven[0]).expect("held");
+
+        let newcomer = ConversationKey {
+            local_instance_id: [0xEE; 16],
+            peer_node_id: [0xEE; 32],
+            peer_instance_id: [0xEE; 16],
+        };
+        assert_eq!(
+            store.import(&newcomer, &blob, NOW).unwrap_err(),
+            RatchetSpliceError::StoreFull
+        );
+        assert_eq!(store.len(), 1_024);
+        // Restoring one already held is not growth, so it always fits.
+        store
+            .import(&proven[0], &blob, NOW)
+            .expect("re-importing a conversation already held must fit");
+        assert_eq!(store.len(), 1_024);
     }
 
     #[test]
@@ -2128,25 +2973,33 @@ mod tests {
         let good = b.store.export(&key).expect("held");
 
         let fresh = RatchetStore::new();
-        assert!(fresh.import(&key, &[]).is_err(), "empty accepted");
+        assert!(fresh.import(&key, &[], NOW).is_err(), "empty accepted");
         assert!(
-            fresh.import(&key, &good[..good.len() - 1]).is_err(),
+            fresh.import(&key, &good[..good.len() - 1], NOW).is_err(),
             "truncated accepted"
         );
         let mut trailing = good.to_vec();
         trailing.push(0);
-        assert!(fresh.import(&key, &trailing).is_err(), "trailing accepted");
+        assert!(
+            fresh.import(&key, &trailing, NOW).is_err(),
+            "trailing accepted"
+        );
         let mut bad_magic = good.to_vec();
         bad_magic[0] = b'X';
-        assert!(fresh.import(&key, &bad_magic).is_err(), "bad magic accepted");
+        assert!(
+            fresh.import(&key, &bad_magic, NOW).is_err(),
+            "bad magic accepted"
+        );
         let mut bad_version = good.to_vec();
         bad_version[4] = 9;
         assert!(
-            fresh.import(&key, &bad_version).is_err(),
+            fresh.import(&key, &bad_version, NOW).is_err(),
             "bad version accepted"
         );
         assert!(fresh.is_empty(), "no refusal may leave a partial entry");
-        fresh.import(&key, &good).expect("the genuine blob imports");
+        fresh
+            .import(&key, &good, NOW)
+            .expect("the genuine blob imports");
         assert_eq!(fresh.len(), 1);
     }
 
@@ -2154,7 +3007,9 @@ mod tests {
     fn malformed_payloads_are_refused() {
         let (a, b) = (device(0xB4), device(0xC4));
         let (ek, pk) = (b.ek(), b.ratchet_pk());
-        let good = seal(&a.store, &a.me(), keys(&b, &ek, &pk), b"z").expect("seal").0;
+        let good = seal(&a.store, &a.me(), keys(&b, &ek, &pk), b"z", NOW)
+            .expect("seal")
+            .0;
         let a_pk = a.ratchet_pk();
 
         let cases: Vec<(&str, Vec<u8>)> = vec![
@@ -2194,7 +3049,9 @@ mod tests {
         let (a, b) = (device(0xB5), device(0xC5));
         let (ek, pk) = (b.ek(), b.ratchet_pk());
         let plaintext = b"the entire message";
-        let first = seal(&a.store, &a.me(), keys(&b, &ek, &pk), plaintext).expect("seal").0;
+        let first = seal(&a.store, &a.me(), keys(&b, &ek, &pk), plaintext, NOW)
+            .expect("seal")
+            .0;
         // 44 header + 1184 encapsulation key + 16 tag, per the primitive, and
         // the 32-byte delivery-ACK key that rides inside the ciphertext.
         const FRAME_OVERHEAD: usize = 44 + 1184 + 16 + ACK_KEY_LEN;
@@ -2205,10 +3062,14 @@ mod tests {
         let a_pk = a.ratchet_pk();
         open(&b.store, &b.me(), &a.node_id, &first, Some(&a_pk), NOW).expect("open");
         let (aek, apk) = (a.ek(), a.ratchet_pk());
-        let reply = seal(&b.store, &b.me(), keys(&a, &aek, &apk), b"r").expect("seal").0;
+        let reply = seal(&b.store, &b.me(), keys(&a, &aek, &apk), b"r", NOW)
+            .expect("seal")
+            .0;
         let b_pk = b.ratchet_pk();
         open(&a.store, &a.me(), &b.node_id, &reply, Some(&b_pk), NOW).expect("open");
-        let second = seal(&a.store, &a.me(), keys(&b, &ek, &pk), plaintext).expect("seal").0;
+        let second = seal(&a.store, &a.me(), keys(&b, &ek, &pk), plaintext, NOW)
+            .expect("seal")
+            .0;
         // A bare frame answering an outstanding ciphertext: 1088 more.
         assert_eq!(
             second.len(),

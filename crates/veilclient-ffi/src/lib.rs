@@ -11225,6 +11225,35 @@ pub const VEIL_ERR_RATCHET_NO_CONVERSATION: c_int = -20;
 #[cfg(feature = "node-embedded")]
 pub const VEIL_ERR_RATCHET_BUFFER_TOO_SMALL: c_int = -21;
 
+/// Returned when the store is at [`VEIL_RATCHET_MAX_CONVERSATIONS`] and every
+/// conversation held is one this device has spoken on, so none can be dropped
+/// without permanently stranding it and its peer.
+///
+/// Distinct from a malformed argument because the remedy is different and
+/// belongs to the host: forget conversations the user no longer wants. It is
+/// not reachable by a peer — everything a stranger can plant is unproven, and
+/// unproven conversations are exactly what the quota evicts on its own.
+#[cfg(feature = "node-embedded")]
+pub const VEIL_ERR_RATCHET_STORE_FULL: c_int = -22;
+
+/// Most conversations one device holds at once.
+///
+/// Spelled as a literal because cbindgen emits `#define`s only for literals: a
+/// `= veil_e2e::MAX_CONVERSATIONS` here compiles perfectly well and then simply
+/// does not appear in the header, which is the same "header drifts from
+/// lib.rs" failure the regeneration gate exists to stop — except that a
+/// MISSING constant produces no diff for the gate to catch. The assertion
+/// below is what keeps the literal honest: move the store's ceiling without
+/// moving this and the build stops here rather than shipping two numbers.
+#[cfg(feature = "node-embedded")]
+pub const VEIL_RATCHET_MAX_CONVERSATIONS: size_t = 1024;
+
+#[cfg(feature = "node-embedded")]
+const _: () = assert!(
+    VEIL_RATCHET_MAX_CONVERSATIONS == veil_e2e::MAX_CONVERSATIONS,
+    "VEIL_RATCHET_MAX_CONVERSATIONS drifted from veil_e2e::MAX_CONVERSATIONS"
+);
+
 /// Most conversation keys one [`veil_ratchet_ack_dirty`] call may name.
 ///
 /// A host acknowledges what it peeked, so this is far above any real batch. It
@@ -11503,6 +11532,59 @@ pub unsafe extern "C" fn veil_ratchet_list(
     VEIL_OK
 }
 
+/// Drop every unproven conversation that has gone unused for longer than the
+/// ratchet's time-to-live, and mark each so the host deletes its stored blob.
+/// `*out_dropped` receives how many went.
+///
+/// For a host to call on a timer, or when it comes back to the foreground.
+/// Without it the sweep only runs when the store is full, so a device that has
+/// been flooded once keeps carrying the wreckage until something else needs
+/// the room.
+///
+/// "Unproven" means a conversation this device has never sent a message on:
+/// somebody opened it, and nothing has confirmed they are who they named. Only
+/// those are aged out. A conversation that has carried traffic is never
+/// dropped by time, at any age — the peer's copy of it cannot be restarted by
+/// anything on the wire, so aging one out would wedge both ends for good. The
+/// host decides those with [`veil_ratchet_forget`].
+///
+/// The clock is this device's own, read here. There is no parameter for it,
+/// because there must be no way for a value that came off the network to
+/// decide which conversations are old enough to disappear.
+///
+/// # Safety
+///
+/// `handle` must be live. `out_dropped` MUST be writable.
+#[unsafe(no_mangle)]
+#[cfg(feature = "node-embedded")]
+pub unsafe extern "C" fn veil_ratchet_expire(
+    handle: *mut VeilHandle,
+    out_dropped: *mut size_t,
+    err_out: *mut *mut c_char,
+) -> c_int {
+    if let Err(rc) = unsafe { guard::ffi_prelude(err_out, "veil_ratchet_expire") } {
+        return rc;
+    }
+    null_check!(err_out, "handle" => handle, "out_dropped" => out_dropped);
+    get_or_return!(
+        handle_live,
+        handle_table(),
+        handle,
+        err_out,
+        VEIL_ERR_INVALID_ARG,
+        "VeilHandle"
+    );
+    let ratchet = match ratchet_for_bundle(&handle_live.bundle) {
+        Ok(r) => r,
+        Err(e) => {
+            unsafe { write_err(err_out, e) };
+            return VEIL_ERR;
+        }
+    };
+    unsafe { *out_dropped = ratchet.store.expire(veil_util::unix_secs_now_u64()) };
+    VEIL_OK
+}
+
 /// Export one conversation's whole state.
 ///
 /// EVERY BYTE IS KEY MATERIAL. The host must store it encrypted and must not
@@ -11626,8 +11708,20 @@ pub unsafe extern "C" fn veil_ratchet_import(
     };
     let key = unsafe { ratchet_key_from(key_64) };
     let bytes = unsafe { std::slice::from_raw_parts(blob, blob_len) };
-    match ratchet.store.import(&key, bytes) {
+    match ratchet
+        .store
+        .import(&key, bytes, veil_util::unix_secs_now_u64())
+    {
         Ok(()) => VEIL_OK,
+        Err(veil_e2e::RatchetSpliceError::StoreFull) => {
+            unsafe {
+                write_err(
+                    err_out,
+                    "ratchet store is full and holds nothing that can be dropped",
+                );
+            }
+            VEIL_ERR_RATCHET_STORE_FULL
+        }
         Err(e) => {
             unsafe { write_err(err_out, format!("ratchet state rejected: {e}")) };
             VEIL_ERR_INVALID_ARG

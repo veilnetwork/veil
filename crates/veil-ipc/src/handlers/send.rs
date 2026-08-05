@@ -339,6 +339,7 @@ async fn try_ratchet_seal(
             ratchet_pk: &cert.ratchet_x25519_pk,
         },
         data,
+        veil_util::unix_secs_now_u64(),
     ) {
         Ok(sealed) => Some(sealed),
         Err(e) => {
