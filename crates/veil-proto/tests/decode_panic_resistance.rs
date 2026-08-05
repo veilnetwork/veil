@@ -155,10 +155,6 @@ fn decoders() -> Vec<(&'static str, DecoderFn)> {
             decoder!(p::routing::RouteResponsePayload),
         ),
         (
-            "RouteUpdatePayload",
-            decoder!(p::routing::RouteUpdatePayload),
-        ),
-        (
             "PowChallengePayload",
             decoder!(p::routing::PowChallengePayload),
         ),
@@ -174,10 +170,6 @@ fn decoders() -> Vec<(&'static str, DecoderFn)> {
         (
             "RecursiveResponsePayload",
             decoder!(p::routing::RecursiveResponsePayload),
-        ),
-        (
-            "VersionVectorSyncPayload",
-            decoder!(p::routing::VersionVectorSyncPayload),
         ),
         (
             "RouteDiscoverOfferPayload",

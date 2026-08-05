@@ -64,7 +64,7 @@ Offset  Size  Field        Description
 | 5 | Mesh | Forward(0), Beacon(1), Ack(2) |
 | 6 | LocalApp | 79 типов IPC-сообщений (AppHello=0 … SendAnonymousDirectResult=78); полный список — в [`family.rs`](../../crates/veil-proto/src/family.rs) |
 | 7 | Tunnel | IpPacket(0) — TUN/TAP |
-| 8 | Routing | RouteAnnounce(0), RouteWithdraw(1), RouteRequest(2), RouteResponse(3), PowChallenge(4), PowResponse(5), PowAccept(6), RouteAnnounceAliased(7), RouteWithdrawAliased(8), RouteDiscover(9), RouteDiscoverOffer(10), RecursiveQuery(0x10), RecursiveResponse(0x11), RouteUpdate(0x12), VersionVectorSync(0x13) |
+| 8 | Routing | RouteAnnounce(0), RouteWithdraw(1), RouteRequest(2), RouteResponse(3), PowChallenge(4), PowResponse(5), PowAccept(6), RouteAnnounceAliased(7), RouteWithdrawAliased(8), RouteDiscover(9), RouteDiscoverOffer(10), RecursiveQuery(0x10), RecursiveResponse(0x11) |
 | 9 | Diag | Ping(1), Pong(2), TraceProbe(3), TraceHop(4) |
 | 10 | RelayChain | Hop(0) — звено цепочки ретрансляции с луковичным шифрованием; RegisterRendezvous(1), UnregisterRendezvous(2), ForwardIntroduce(3) — обычные управляющие нагрузки поверх установленного сеанса (без луковичного шифрования) |
 | 11 | PeerExchange | Walk(0), Challenge(1), Response(2), Result(3) |

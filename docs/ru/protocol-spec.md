@@ -126,7 +126,7 @@ Offset  Len  Тип    Описание
 | Mesh | 5 | Локальная UDP-сеть (беаконы, форвард) |
 | LocalApp | 6 | IPC для локальных приложений |
 | Tunnel | 7 | TUN/TAP IP-туннель |
-| Routing | 8 | RouteAnnounce/Withdraw, RouteRequest/Response, PoW, Recursive*, VersionVectorSync |
+| Routing | 8 | RouteAnnounce/Withdraw, RouteRequest/Response, PoW, Recursive* |
 | Diag | 9 | Диагностика: DiagPing, DiagPong, TraceProbe, TraceHop |
 | RelayChain | 10 | Onion-encrypted relay chain hop |
 | PeerExchange | 11 | PEX random-walk: Walk, Challenge, Response, Result |

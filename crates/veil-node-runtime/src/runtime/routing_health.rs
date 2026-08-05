@@ -437,11 +437,8 @@ impl NodeRuntime {
         };
         let mut shutdown_rx = shutdown_tx.subscribe();
         let dispatcher = Arc::clone(&self.dispatcher);
-        let route_cache = Arc::clone(&self.routing.route_cache);
-        let session_tx_registry = Arc::clone(&self.session_tx_registry);
         let dht_for_refresh = Arc::clone(&self.dht);
         let handle = tokio::spawn(async move {
-            let mut cycle = 0u32;
             loop {
                 // adaptive announce rate — scale interval by
                 // log2(routing_table_size) so larger networks gossip less
@@ -455,32 +452,18 @@ impl NodeRuntime {
                     }
                     _ = tokio::time::sleep(adaptive_interval) => {}
                 }
-                cycle += 1;
-
-                // Legacy refresh every 5th cycle (= ~2.5 min instead of every 30s).
-                // Event-driven RouteUpdate handles the fast path; this is backward
-                // compat for peers that don't support RouteUpdate yet.
-                if cycle.is_multiple_of(5) {
-                    dispatcher.refresh_all_routes();
-                }
-
-                // version-vector exchange every 10th cycle (~5 min).
-                if cycle.is_multiple_of(10) {
-                    let summary = rlock!(route_cache).version_summary();
-                    if !summary.is_empty() {
-                        let vv = veil_proto::routing::VersionVectorSyncPayload { entries: summary };
-                        let body = vv.encode();
-                        let mut hdr = veil_proto::header::FrameHeader::new(
-                            veil_proto::family::FrameFamily::Routing as u8,
-                            veil_proto::family::RoutingMsg::VersionVectorSync as u16,
-                        );
-                        hdr.body_len = body.len() as u32;
-                        let mut frame = veil_proto::codec::encode_header(&hdr).to_vec();
-                        frame.extend_from_slice(&body);
-                        rlock!(session_tx_registry)
-                            .send_to_all(veil_bufpool::pooled_shared_from_vec(frame));
-                    }
-                }
+                // Gossip refresh on EVERY cycle.
+                //
+                // This used to run once every five cycles (~2.5 min instead of
+                // ~30 s) because the event-driven RouteUpdate plane was meant
+                // to carry the fast path, leaving this as backward compat. That
+                // plane is gone (report6 V-H2) — it duplicated RouteAnnounce /
+                // RouteWithdraw without their protections — so throttling this
+                // to 1-in-5 would now be a straight 5x slowdown in route
+                // propagation with nothing covering the gap. The interval is
+                // already adaptive in `adaptive_interval` above, which is the
+                // right place to trade rate against network size.
+                dispatcher.refresh_all_routes();
             }
         });
         lock_tasks(&self.tasks).sessions.push(handle);

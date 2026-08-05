@@ -1007,7 +1007,6 @@ impl NodeRuntime {
             forward_seen_content: Arc::clone(&self.dispatcher.forward_seen_content),
             terminal_ack_replay: Arc::clone(&self.dispatcher.terminal_ack_replay),
             recursive_query_seen: Arc::clone(&self.dispatcher.recursive_query_seen),
-            vvsync_seen: Arc::clone(&self.dispatcher.vvsync_seen),
             pending_recursive: Arc::clone(&self.dispatcher.pending_recursive),
             recursive_reverse_path: Arc::clone(&self.dispatcher.recursive_reverse_path),
             alias_registry: Arc::clone(&self.dispatcher.alias_registry),

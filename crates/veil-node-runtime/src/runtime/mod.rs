@@ -2106,10 +2106,6 @@ impl NodeRuntime {
                 std::time::Duration::from_secs(30),
                 65536,
             ))),
-            vvsync_seen: Arc::new(Mutex::new(veil_dispatcher::ExpiryCache::new(
-                std::time::Duration::from_secs(veil_proto::budget::VVSYNC_MIN_INTERVAL_SECS),
-                veil_proto::budget::MAX_VVSYNC_SEEN_SIZE,
-            ))),
             pending_recursive: Arc::new(Mutex::new(std::collections::HashMap::new())),
             recursive_reverse_path: Arc::new(Mutex::new(std::collections::HashMap::new())),
             // session alias registry (empty; populated by SessionRunner).

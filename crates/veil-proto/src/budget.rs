@@ -208,11 +208,6 @@ pub const MAX_ROUTES_PER_DST: usize = 4;
 /// redundant paths.
 pub const MAX_ROUTES_PER_VIA: usize = 256;
 
-/// Maximum entries accepted in a `VersionVectorSyncPayload` (per-frame). At
-/// ~40 B/entry this caps a single sync frame near 400 KiB. Named so the cap and
-/// its memory implication live next to the other routing budgets instead of as
-/// a bare literal in the decoder. (audit cycle-3.)
-pub const MAX_VERSION_VECTOR_ENTRIES: usize = 10_000;
 
 /// Maximum number of bytes in a single TLV entry value.
 ///
@@ -732,18 +727,6 @@ pub const POW_CHALLENGE_TTL_SECS: u64 = 60;
 /// slots occupied by long-gone peers so new ones get tracked. 7 days = a
 /// conservative threshold that preserves history across normal uptime gaps.
 pub const REPUTATION_STALE_SECS: u64 = 7 * 24 * 3600;
-
-/// Per-peer minimum interval between VersionVectorSync-triggered RouteUpdate
-/// replies. A peer that sends VVSync more frequently than this
-/// is silently ignored — it already has a recent update pending. Prevents
-/// amplification loops where a compromised peer repeatedly triggers O(N)
-/// RouteUpdate fan-out.
-pub const VVSYNC_MIN_INTERVAL_SECS: u64 = 60;
-
-/// Maximum number of peer_ids tracked in the VVSync rate-limit cache.
-/// Scales with expected concurrent peer count; entries expire after
-/// `VVSYNC_MIN_INTERVAL_SECS`.
-pub const MAX_VVSYNC_SEEN_SIZE: usize = 4_096;
 
 /// Maximum number of concurrently pending diagnostic probes (ping/traceroute).
 /// If the cap is reached, stale (closed-receiver) entries are evicted first;

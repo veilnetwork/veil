@@ -234,7 +234,7 @@ Offset  Len  Тип    Поле         Описание
 | 5 | Mesh | Forward, Beacon, Ack |
 | 6 | LocalApp | 79 типов IPC-сообщений (AppHello=0 … SendAnonymousDirectResult=78; см. §18) |
 | 7 | Tunnel | IpPacket — TUN/TAP инкапсуляция |
-| 8 | Routing | RouteAnnounce/Withdraw, RouteRequest/Response, PowChallenge/Response/Accept, RouteAnnounceAliased/WithdrawAliased, RouteDiscover/Offer, RecursiveQuery/Response(0x10/0x11), RouteUpdate(0x12), VersionVectorSync(0x13) |
+| 8 | Routing | RouteAnnounce/Withdraw, RouteRequest/Response, PowChallenge/Response/Accept, RouteAnnounceAliased/WithdrawAliased, RouteDiscover/Offer, RecursiveQuery/Response(0x10/0x11) |
 | 9 | Diag | Ping/Pong, TraceProbe, TraceHop |
 | 10 | RelayChain | Hop(0) — onion-encrypted chain, RegisterRendezvous(1), UnregisterRendezvous(2), ForwardIntroduce(3), CircuitBuild(4)/CircuitData(5)/CircuitTeardown(6)/CircuitBuilt(7) |
 | 11 | PeerExchange | Walk, Challenge, Response, Result |
@@ -750,8 +750,16 @@ mlkem_pk, ed25519_pk, signature
 
 ### 10.9 Event-driven updates
 
-- `RouteUpdate` (0x12) — рассылается, когда сосед подключается или отключается.
-- `VersionVectorSync` (0x13) — периодическая синхронизация вектора версий (VV) для сверки состояния.
+Подключение и отключение соседа объявляется на самой gossip-плоскости:
+`RouteAnnounce` при открытии сессии, `ROUTE_WITHDRAW` при закрытии, плюс
+периодическое обновление.
+
+Вторая, событийная плоскость (`RouteUpdate` 0x12 и `VersionVectorSync` 0x13)
+раньше несла те же два события параллельно. Она удалена: она дублировала
+gossip-плоскость, не имея ни одной её защиты — ни проверки свежести по метке
+времени, ни дедупликации, ни монотонности последовательности, ни расчёта
+стоимости по числу прыжков, а веер рассылки был ничем не ограничен. Коды
+сообщений выведены из обращения и не должны переиспользоваться.
 
 ---
 
