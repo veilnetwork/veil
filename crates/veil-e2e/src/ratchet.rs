@@ -48,7 +48,7 @@
 //! and the whole point of the construction is that every authenticator is a
 //! symmetric tag either party could have produced.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::sync::Mutex;
 
 use veil_proto::RATCHET_E2E_MARKER;
@@ -341,7 +341,20 @@ impl Entry {
 struct Inner {
     entries: BTreeMap<ConversationKey, Entry>,
     version: u64,
-    dirty: BTreeSet<ConversationKey>,
+    /// Conversations whose bytes changed, each against the version at which
+    /// it was last marked. The version is what makes an acknowledgement safe:
+    /// a host clearing a mark is saying "the bytes I read at generation G are
+    /// down", and a conversation re-marked after G has moved since.
+    dirty: BTreeMap<ConversationKey, u64>,
+}
+
+impl Inner {
+    /// One committed change: the version moves, and the conversation is marked
+    /// AT the version it moved to.
+    fn commit_change(&mut self, key: ConversationKey) {
+        self.version = self.version.wrapping_add(1);
+        self.dirty.insert(key, self.version);
+    }
 }
 
 /// Every ratchet conversation this node currently holds, in memory.
@@ -369,7 +382,7 @@ impl RatchetStore {
             inner: Mutex::new(Inner {
                 entries: BTreeMap::new(),
                 version: 0,
-                dirty: BTreeSet::new(),
+                dirty: BTreeMap::new(),
             }),
         }
     }
@@ -402,7 +415,7 @@ impl RatchetStore {
     #[must_use]
     pub fn drain_dirty(&self) -> Vec<ConversationKey> {
         let mut g = self.lock();
-        std::mem::take(&mut g.dirty).into_iter().collect()
+        std::mem::take(&mut g.dirty).into_keys().collect()
     }
 
     /// Take at most `max` of the conversations waiting to be persisted,
@@ -415,11 +428,50 @@ impl RatchetStore {
     #[must_use]
     pub fn take_dirty(&self, max: usize) -> Vec<ConversationKey> {
         let mut g = self.lock();
-        let taken: Vec<_> = g.dirty.iter().take(max).copied().collect();
+        let taken: Vec<_> = g.dirty.keys().take(max).copied().collect();
         for key in &taken {
             g.dirty.remove(key);
         }
         taken
+    }
+
+    /// The conversations waiting to be persisted, WITHOUT clearing anything,
+    /// and the generation to acknowledge them at.
+    ///
+    /// The destructive read is the wrong shape for a durable host. Between
+    /// taking a mark and getting the bytes onto a disk there is an export, a
+    /// worker hop and a commit, and a failure at any of them loses the only
+    /// notice that conversation gets until it changes again — which for the
+    /// rest of the same batch may be never. Here the marks stand until the host
+    /// says the bytes are down.
+    ///
+    /// The returned generation is this store's version at the moment of the
+    /// read. Hand it back to [`ack_dirty`](Self::ack_dirty): a conversation
+    /// that changed in between was re-marked at a LATER version and keeps its
+    /// mark, because the write about to land does not contain that change.
+    #[must_use]
+    pub fn peek_dirty(&self, max: usize) -> (Vec<ConversationKey>, u64) {
+        let g = self.lock();
+        (g.dirty.keys().take(max).copied().collect(), g.version)
+    }
+
+    /// Clear the marks of `keys` whose bytes are now durable, as of
+    /// `generation`. Returns how many marks were cleared.
+    ///
+    /// A key marked after `generation` is left alone: acknowledging it would
+    /// throw away the notice for a change the host has not written. A key that
+    /// is not marked at all is not an error — a shutdown save writes everything
+    /// held and acknowledges nothing.
+    pub fn ack_dirty(&self, keys: &[ConversationKey], generation: u64) -> usize {
+        let mut g = self.lock();
+        let mut cleared = 0;
+        for key in keys {
+            if g.dirty.get(key).is_some_and(|marked| *marked <= generation) {
+                g.dirty.remove(key);
+                cleared += 1;
+            }
+        }
+        cleared
     }
 
     /// How many conversations are waiting to be persisted.
@@ -479,8 +531,7 @@ impl RatchetStore {
         let mut g = self.lock();
         let had = g.entries.remove(key).is_some();
         if had {
-            g.version = g.version.wrapping_add(1);
-            g.dirty.insert(*key);
+            g.commit_change(*key);
         }
         had
     }
@@ -646,8 +697,7 @@ fn seal_inner(
             (KIND_PROLOGUE, blob)
         }
     };
-    g.version = g.version.wrapping_add(1);
-    g.dirty.insert(key);
+    g.commit_change(key);
     drop(g);
 
     Ok(encode_payload(
@@ -780,8 +830,7 @@ fn open_inner(
             entry.authenticated = true;
         }
         let authenticated = entry.authenticated;
-        g.version = g.version.wrapping_add(1);
-        g.dirty.insert(key);
+        g.commit_change(key);
         return Ok(Opened {
             plaintext,
             ack_key: [0u8; ACK_KEY_LEN],
@@ -829,8 +878,7 @@ fn open_inner(
                         pending_prologue: None,
                     },
                 );
-                g.version = g.version.wrapping_add(1);
-                g.dirty.insert(key);
+                g.commit_change(key);
                 return Ok(Opened {
                     plaintext,
                     ack_key: [0u8; ACK_KEY_LEN],
@@ -1467,6 +1515,105 @@ mod tests {
         all.sort();
         all.dedup();
         assert_eq!(all.len(), 5);
+    }
+
+    #[test]
+    fn a_peek_consumes_nothing() {
+        // The whole difference from a drain: reading the list must not be what
+        // discharges the obligation, because between reading it and getting the
+        // bytes onto a disk there is an export, a worker hop and a commit.
+        let a = device(0xE0);
+        let peers: Vec<_> = (0..3u8).map(|i| device(0xE1 + i)).collect();
+        for b in &peers {
+            let (ek, pk) = (b.ek(), b.ratchet_pk());
+            seal(&a.store, &a.me(), keys(b, &ek, &pk), b"x").expect("seal");
+        }
+
+        let (first, gen_first) = a.store.peek_dirty(99);
+        assert_eq!(first.len(), 3);
+        assert_eq!(a.store.dirty_len(), 3, "peeking cleared a mark");
+        let (again, gen_again) = a.store.peek_dirty(99);
+        assert_eq!(again, first, "the same work, named the same way");
+        assert_eq!(gen_again, gen_first);
+
+        // Bounded the same way a drain is, and the remainder stays.
+        let (bounded, _) = a.store.peek_dirty(2);
+        assert_eq!(bounded.len(), 2);
+        assert_eq!(a.store.dirty_len(), 3);
+    }
+
+    #[test]
+    fn an_ack_clears_exactly_what_was_written() {
+        let a = device(0xF0);
+        let peers: Vec<_> = (0..3u8).map(|i| device(0xF1 + i)).collect();
+        for b in &peers {
+            let (ek, pk) = (b.ek(), b.ratchet_pk());
+            seal(&a.store, &a.me(), keys(b, &ek, &pk), b"x").expect("seal");
+        }
+
+        let (batch, generation) = a.store.peek_dirty(2);
+        assert_eq!(a.store.ack_dirty(&batch, generation), 2);
+        assert_eq!(a.store.dirty_len(), 1);
+
+        let (rest, gen_rest) = a.store.peek_dirty(99);
+        assert_eq!(rest.len(), 1);
+        assert_eq!(a.store.ack_dirty(&rest, gen_rest), 1);
+        assert_eq!(a.store.dirty_len(), 0);
+        // Acknowledging a conversation nobody marked is not an error: the
+        // shutdown save writes everything held and marks nothing.
+        assert_eq!(a.store.ack_dirty(&rest, gen_rest), 0);
+    }
+
+    #[test]
+    fn a_conversation_that_moved_since_the_peek_keeps_its_mark() {
+        // The reason the acknowledgement carries a generation at all. The host
+        // read this conversation's bytes at G and is now writing them; the
+        // conversation has moved since, and those bytes do not contain the
+        // move. Clearing the mark here would throw away the only notice that
+        // change gets — and the state that reaches the next launch would then
+        // be the one from before it, which is a message key used twice.
+        let (a, b) = (device(0x40), device(0x41));
+        let (ek, pk) = (b.ek(), b.ratchet_pk());
+        seal(&a.store, &a.me(), keys(&b, &ek, &pk), b"first").expect("seal");
+
+        let (batch, generation) = a.store.peek_dirty(99);
+        assert_eq!(batch.len(), 1);
+
+        // The send that lands while the write for the previous one is in flight.
+        seal(&a.store, &a.me(), keys(&b, &ek, &pk), b"second").expect("seal");
+
+        assert_eq!(
+            a.store.ack_dirty(&batch, generation),
+            0,
+            "a stale acknowledgement cleared a live mark"
+        );
+        assert_eq!(a.store.dirty_len(), 1);
+
+        // And the next pass, whose generation covers the second send, does
+        // clear it.
+        let (again, gen_again) = a.store.peek_dirty(99);
+        assert_eq!(a.store.ack_dirty(&again, gen_again), 1);
+        assert_eq!(a.store.dirty_len(), 0);
+    }
+
+    #[test]
+    fn a_write_that_never_landed_leaves_the_work_for_the_next_pass() {
+        // A disk error, a closed worker, a crash between the export and the
+        // commit: no acknowledgement, so the mark stands and the next flush
+        // does the work again. Under a destructive read this conversation had
+        // already been forgotten about — along with the rest of its batch.
+        let (a, b) = (device(0x50), device(0x51));
+        let (ek, pk) = (b.ek(), b.ratchet_pk());
+        seal(&a.store, &a.me(), keys(&b, &ek, &pk), b"x").expect("seal");
+
+        let (batch, _) = a.store.peek_dirty(99);
+        assert_eq!(batch.len(), 1);
+        // ... and the write fails here, so nothing is acknowledged.
+
+        let (retried, generation) = a.store.peek_dirty(99);
+        assert_eq!(retried, batch, "the work was lost with the notice");
+        assert_eq!(a.store.ack_dirty(&retried, generation), 1);
+        assert_eq!(a.store.dirty_len(), 0);
     }
 
     #[test]
