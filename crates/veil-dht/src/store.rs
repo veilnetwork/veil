@@ -749,17 +749,31 @@ pub mod rocks {
             .collect()
         }
 
-        /// Audit cycle-7 M4: collect only the 32-byte keys, dropping each
-        /// value without cloning it into the result. The whole on-disk value
-        /// set therefore never lands in process RAM at once (cf.
-        /// `iter_entries`, which materializes every value).
+        /// Collect only the 32-byte keys — read from the ts-index, so no value
+        /// is ever touched.
+        ///
+        /// Dropping `_v` from an iterator over the VALUE column family (what
+        /// this used to do) keeps the result small but does not stop the read:
+        /// RocksDB materializes each value into the iterator before the closure
+        /// can discard it. The republish driver calls this once a second while
+        /// holding the DHT mutex, so the whole cold tier was being pulled off
+        /// disk every second — the disk tier paying a full scan to hand back
+        /// 32 bytes per entry.
+        ///
+        /// The ts-index CF is an exact mirror of the value set: `put` and
+        /// `delete_entry` write value + reverse map + ts-index in ONE RocksDB
+        /// WriteBatch (all three rows or none), and `reconcile` repairs any
+        /// pre-batch database at open. Its rows are `ts(8) ‖ key(32)` with an
+        /// empty value, so iterating it reads index blocks only. Same key set,
+        /// no value I/O.
         fn iter_keys(&self) -> Vec<[u8; 32]> {
-            let iter = self.db.iterator(rocksdb::IteratorMode::Start);
-            iter.filter_map(|item| {
-                let (k, _v) = item.ok()?;
-                k.as_ref().try_into().ok()
-            })
-            .collect()
+            self.db
+                .iterator_cf(self.cf_ix(), rocksdb::IteratorMode::Start)
+                .filter_map(|item| {
+                    let (ix_key, _) = item.ok()?;
+                    <[u8; 32]>::try_from(ix_key.get(8..40)?).ok()
+                })
+                .collect()
         }
 
         fn retain(&mut self, f: &dyn Fn(&[u8; 32], &[u8]) -> bool) -> Vec<([u8; 32], u64)> {
@@ -2207,6 +2221,48 @@ mod tests {
         // remove decrements; the count survives a reopen (seeded from CF_KEY_TS).
         cold.remove(&[1u8; 32]);
         assert_eq!(cold.len(), 0);
+    }
+
+    /// report6 V-M2: `iter_keys` must read the ts-index, never the value CF.
+    ///
+    /// The republish driver calls it once a second while holding the DHT mutex.
+    /// Iterating the value CF and dropping each value looks free but is not —
+    /// RocksDB materializes every value into the iterator first, so the whole
+    /// cold tier was read off disk every second to hand back 32 bytes an entry.
+    ///
+    /// A value planted with no index rows is the observable difference between
+    /// the two implementations: the value CF has it, the ts-index does not. It
+    /// is unreachable in production (put and delete write all three rows in one
+    /// WriteBatch, and `reconcile` adopts any pre-batch leftovers at open), so
+    /// it serves purely as a probe for WHICH family the scan walks.
+    #[cfg(feature = "rocksdb-cold")]
+    #[test]
+    fn rocksdb_cold_iter_keys_reads_the_index_not_the_values() {
+        use super::ColdBackend;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("c");
+        let mut cold = super::rocks::RocksDbCold::open(&path, 0).unwrap();
+
+        cold.put([1u8; 32], b"indexed-a".to_vec());
+        cold.put([2u8; 32], b"indexed-b".to_vec());
+        // Value CF only — no reverse-map row, no ts-index row.
+        cold.plant_unindexed_value(&[3u8; 32], b"value-cf-only");
+
+        let keys = cold.iter_keys();
+        assert_eq!(keys.len(), 2, "iter_keys must report the indexed set: {keys:?}");
+        assert!(keys.contains(&[1u8; 32]) && keys.contains(&[2u8; 32]));
+        assert!(
+            !keys.contains(&[3u8; 32]),
+            "iter_keys walked the value column family — that scan reads every \
+             value off disk before discarding it",
+        );
+
+        // And it stays in step with the tier: a delete drops the key, an
+        // overwrite does not duplicate it.
+        cold.put([1u8; 32], b"indexed-a-v2".to_vec());
+        cold.remove(&[2u8; 32]);
+        let keys = cold.iter_keys();
+        assert_eq!(keys, vec![[1u8; 32]], "after overwrite + delete: {keys:?}");
     }
 
     /// audit report5: a torn put leaves a GHOST — the value landed, its two
