@@ -465,6 +465,17 @@
 #endif
 
 #if defined(VEIL_FFI_NODE_EMBEDDED)
+/**
+ * Most conversation keys one [`veil_ratchet_ack_dirty`] call may name.
+ *
+ * A host acknowledges what it peeked, so this is far above any real batch. It
+ * exists because the count decides how many bytes are read from the caller's
+ * buffer, and a bogus one must be refused rather than followed.
+ */
+#define VEIL_RATCHET_MAX_ACK_KEYS 4096
+#endif
+
+#if defined(VEIL_FFI_NODE_EMBEDDED)
 #define STREAM_ENDPOINT_ID 12
 #endif
 
@@ -2753,30 +2764,67 @@ int veil_pair_target_build_confirm(VeilHandle *handle,
 
 #if defined(VEIL_FFI_NODE_EMBEDDED)
 /**
- * Take up to `out_buf_cap / VEIL_RATCHET_KEY_LEN` conversations that have
- * changed since the last call, and clear their marks.
+ * Name up to `out_buf_cap / VEIL_RATCHET_KEY_LEN` conversations waiting to be
+ * persisted, WITHOUT clearing anything.
  *
- * `*out_written` receives how many keys were written; `*out_remaining`
- * receives how many are still waiting, so a host with a small buffer loops
- * until it reads zero. Whatever did not fit stays marked — losing the notice
- * for a conversation would mean losing its keys the next time the process
- * stops.
+ * `*out_written` receives how many keys were written — a COUNT OF KEYS, not a
+ * byte length. `*out_remaining` receives how many are still waiting beyond
+ * them, so a host with a small buffer loops until it reads zero.
+ * `*out_generation` receives the store's version at the moment of the read,
+ * and is what the host hands to [`veil_ratchet_ack_dirty`].
  *
- * The host's contract: export and persist each of these BEFORE it treats the
- * send or receive that produced them as complete.
+ * The host's contract is peek, persist, THEN acknowledge, and it must persist
+ * before it treats the send or receive that produced the change as complete.
+ * Reading the list is deliberately not what discharges the obligation: between
+ * here and a durable write there is an export, a worker hop and a commit, and
+ * a failure at any of them would otherwise lose the only notice these
+ * conversations get until they change again.
  *
  * # Safety
  *
  * `handle` must be live. `out_buf` MUST be writable for `out_buf_cap` bytes.
- * `out_written` and `out_remaining` MUST be writable.
+ * `out_written`, `out_remaining` and `out_generation` MUST be writable.
  */
 
-int veil_ratchet_take_dirty(VeilHandle *handle,
+int veil_ratchet_peek_dirty(VeilHandle *handle,
                             uint8_t *out_buf,
                             size_t out_buf_cap,
                             size_t *out_written,
                             size_t *out_remaining,
+                            uint64_t *out_generation,
                             char **err_out)
+;
+#endif
+
+#if defined(VEIL_FFI_NODE_EMBEDDED)
+/**
+ * Clear the marks of `key_count` conversations whose state is now durable.
+ *
+ * `generation` is the value [`veil_ratchet_peek_dirty`] reported for the read
+ * these keys came from. A conversation that has changed since was re-marked at
+ * a later generation and KEEPS its mark: the bytes the host just wrote do not
+ * contain that change, and clearing it would discard the only notice it gets.
+ * `*out_cleared` receives how many marks were actually cleared, which is how a
+ * host sees that a conversation moved under it.
+ *
+ * Acknowledging a conversation nobody marked is not an error.
+ *
+ * Returns [`VEIL_ERR_INVALID_ARG`] when `key_count` exceeds
+ * [`VEIL_RATCHET_MAX_ACK_KEYS`], in which case nothing was read or cleared.
+ *
+ * # Safety
+ *
+ * `handle` must be live. `keys` MUST point to
+ * `key_count * VEIL_RATCHET_KEY_LEN` readable bytes. `out_cleared` MUST be
+ * writable.
+ */
+
+int veil_ratchet_ack_dirty(VeilHandle *handle,
+                           const uint8_t *keys,
+                           size_t key_count,
+                           uint64_t generation,
+                           size_t *out_cleared,
+                           char **err_out)
 ;
 #endif
 

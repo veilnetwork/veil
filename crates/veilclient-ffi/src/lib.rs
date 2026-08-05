@@ -11225,6 +11225,14 @@ pub const VEIL_ERR_RATCHET_NO_CONVERSATION: c_int = -20;
 #[cfg(feature = "node-embedded")]
 pub const VEIL_ERR_RATCHET_BUFFER_TOO_SMALL: c_int = -21;
 
+/// Most conversation keys one [`veil_ratchet_ack_dirty`] call may name.
+///
+/// A host acknowledges what it peeked, so this is far above any real batch. It
+/// exists because the count decides how many bytes are read from the caller's
+/// buffer, and a bogus one must be refused rather than followed.
+#[cfg(feature = "node-embedded")]
+pub const VEIL_RATCHET_MAX_ACK_KEYS: size_t = 4096;
+
 #[cfg(feature = "node-embedded")]
 fn ratchet_for_bundle(bundle: &Arc<RuntimeBundle>) -> Result<veil_e2e::RatchetRuntime, String> {
     let services = embedded_services_for_bundle(bundle)?;
@@ -11260,6 +11268,21 @@ unsafe fn write_conversation_keys(
         }
     }
     n
+}
+
+/// Read `count` conversation keys out of a caller-supplied buffer.
+///
+/// # Safety
+///
+/// `keys` MUST point to `count * VEIL_RATCHET_KEY_LEN` readable bytes.
+#[cfg(feature = "node-embedded")]
+unsafe fn read_conversation_keys(
+    keys: *const u8,
+    count: size_t,
+) -> Vec<veil_e2e::ConversationKey> {
+    (0..count)
+        .map(|i| unsafe { ratchet_key_from(keys.add(i * VEIL_RATCHET_KEY_LEN)) })
+        .collect()
 }
 
 /// How many ratchet operations this node has committed since it started.
@@ -11303,33 +11326,38 @@ pub unsafe extern "C" fn veil_ratchet_state_version(
     }
 }
 
-/// Take up to `out_buf_cap / VEIL_RATCHET_KEY_LEN` conversations that have
-/// changed since the last call, and clear their marks.
+/// Name up to `out_buf_cap / VEIL_RATCHET_KEY_LEN` conversations waiting to be
+/// persisted, WITHOUT clearing anything.
 ///
-/// `*out_written` receives how many keys were written; `*out_remaining`
-/// receives how many are still waiting, so a host with a small buffer loops
-/// until it reads zero. Whatever did not fit stays marked — losing the notice
-/// for a conversation would mean losing its keys the next time the process
-/// stops.
+/// `*out_written` receives how many keys were written — a COUNT OF KEYS, not a
+/// byte length. `*out_remaining` receives how many are still waiting beyond
+/// them, so a host with a small buffer loops until it reads zero.
+/// `*out_generation` receives the store's version at the moment of the read,
+/// and is what the host hands to [`veil_ratchet_ack_dirty`].
 ///
-/// The host's contract: export and persist each of these BEFORE it treats the
-/// send or receive that produced them as complete.
+/// The host's contract is peek, persist, THEN acknowledge, and it must persist
+/// before it treats the send or receive that produced the change as complete.
+/// Reading the list is deliberately not what discharges the obligation: between
+/// here and a durable write there is an export, a worker hop and a commit, and
+/// a failure at any of them would otherwise lose the only notice these
+/// conversations get until they change again.
 ///
 /// # Safety
 ///
 /// `handle` must be live. `out_buf` MUST be writable for `out_buf_cap` bytes.
-/// `out_written` and `out_remaining` MUST be writable.
+/// `out_written`, `out_remaining` and `out_generation` MUST be writable.
 #[unsafe(no_mangle)]
 #[cfg(feature = "node-embedded")]
-pub unsafe extern "C" fn veil_ratchet_take_dirty(
+pub unsafe extern "C" fn veil_ratchet_peek_dirty(
     handle: *mut VeilHandle,
     out_buf: *mut u8,
     out_buf_cap: size_t,
     out_written: *mut size_t,
     out_remaining: *mut size_t,
+    out_generation: *mut u64,
     err_out: *mut *mut c_char,
 ) -> c_int {
-    if let Err(rc) = unsafe { guard::ffi_prelude(err_out, "veil_ratchet_take_dirty") } {
+    if let Err(rc) = unsafe { guard::ffi_prelude(err_out, "veil_ratchet_peek_dirty") } {
         return rc;
     }
     null_check!(err_out,
@@ -11337,6 +11365,7 @@ pub unsafe extern "C" fn veil_ratchet_take_dirty(
         "out_buf" => out_buf,
         "out_written" => out_written,
         "out_remaining" => out_remaining,
+        "out_generation" => out_generation,
     );
     get_or_return!(
         handle_live,
@@ -11353,14 +11382,76 @@ pub unsafe extern "C" fn veil_ratchet_take_dirty(
             return VEIL_ERR;
         }
     };
-    // Bounded, so a buffer that cannot hold everything leaves the remainder
-    // marked rather than dropping it on the floor.
-    let taken = ratchet.store.take_dirty(out_buf_cap / VEIL_RATCHET_KEY_LEN);
-    let written = unsafe { write_conversation_keys(&taken, out_buf, out_buf_cap) };
+    let room = out_buf_cap / VEIL_RATCHET_KEY_LEN;
+    let (named, generation) = ratchet.store.peek_dirty(room);
+    let written = unsafe { write_conversation_keys(&named, out_buf, out_buf_cap) };
     unsafe {
         *out_written = written;
-        *out_remaining = ratchet.store.dirty_len();
+        *out_remaining = ratchet.store.dirty_len().saturating_sub(written);
+        *out_generation = generation;
     }
+    VEIL_OK
+}
+
+/// Clear the marks of `key_count` conversations whose state is now durable.
+///
+/// `generation` is the value [`veil_ratchet_peek_dirty`] reported for the read
+/// these keys came from. A conversation that has changed since was re-marked at
+/// a later generation and KEEPS its mark: the bytes the host just wrote do not
+/// contain that change, and clearing it would discard the only notice it gets.
+/// `*out_cleared` receives how many marks were actually cleared, which is how a
+/// host sees that a conversation moved under it.
+///
+/// Acknowledging a conversation nobody marked is not an error.
+///
+/// Returns [`VEIL_ERR_INVALID_ARG`] when `key_count` exceeds
+/// [`VEIL_RATCHET_MAX_ACK_KEYS`], in which case nothing was read or cleared.
+///
+/// # Safety
+///
+/// `handle` must be live. `keys` MUST point to
+/// `key_count * VEIL_RATCHET_KEY_LEN` readable bytes. `out_cleared` MUST be
+/// writable.
+#[unsafe(no_mangle)]
+#[cfg(feature = "node-embedded")]
+pub unsafe extern "C" fn veil_ratchet_ack_dirty(
+    handle: *mut VeilHandle,
+    keys: *const u8,
+    key_count: size_t,
+    generation: u64,
+    out_cleared: *mut size_t,
+    err_out: *mut *mut c_char,
+) -> c_int {
+    if let Err(rc) = unsafe { guard::ffi_prelude(err_out, "veil_ratchet_ack_dirty") } {
+        return rc;
+    }
+    null_check!(err_out,
+        "handle" => handle,
+        "keys" => keys,
+        "out_cleared" => out_cleared,
+    );
+    if key_count > VEIL_RATCHET_MAX_ACK_KEYS {
+        unsafe { write_err(err_out, format!("implausible key count {key_count}")) };
+        return VEIL_ERR_INVALID_ARG;
+    }
+    get_or_return!(
+        handle_live,
+        handle_table(),
+        handle,
+        err_out,
+        VEIL_ERR_INVALID_ARG,
+        "VeilHandle"
+    );
+    let ratchet = match ratchet_for_bundle(&handle_live.bundle) {
+        Ok(r) => r,
+        Err(e) => {
+            unsafe { write_err(err_out, e) };
+            return VEIL_ERR;
+        }
+    };
+    let named = unsafe { read_conversation_keys(keys, key_count) };
+    let cleared = ratchet.store.ack_dirty(&named, generation);
+    unsafe { *out_cleared = cleared };
     VEIL_OK
 }
 

@@ -14,4 +14,4 @@
 ///
 /// Excluded from cbindgen's output (see `cbindgen.toml`) -- a header that
 /// contained its own hash could never be regenerated to a fixed point.
-pub const VEIL_ABI_CONTRACT_HASH: &core::ffi::CStr = c"35914444e0963d547cfb3fc1fe0d73c35c785b3f8318e8c655e33bc11aea4db8";
+pub const VEIL_ABI_CONTRACT_HASH: &core::ffi::CStr = c"db3dbaf1d0913e67329638bcb3cf315cdf58a2aab399537a2e4cb7e0970abd9c";
