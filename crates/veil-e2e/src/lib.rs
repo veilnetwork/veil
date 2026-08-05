@@ -24,6 +24,7 @@ use ml_kem::{
 };
 use rand_core::OsRng;
 use sha2::Sha256;
+use zeroize::Zeroizing;
 
 use veil_proto::{E2eEnvelope, ProtoError};
 
@@ -423,14 +424,25 @@ const PEM_FOOTER: &str = "-----END VEIL ML-KEM-768 KEY-----";
 const PEM_ENC_HEADER: &str = "-----BEGIN VEIL ML-KEM-768 ENCRYPTED KEY-----";
 const PEM_ENC_FOOTER: &str = "-----END VEIL ML-KEM-768 ENCRYPTED KEY-----";
 
-fn encode_pem(seed: &[u8; DK_SEED_BYTES]) -> String {
-    let b64 = base64::engine::general_purpose::STANDARD.encode(seed);
-    format!("{PEM_HEADER}\n{b64}\n{PEM_FOOTER}\n")
+/// The PLAINTEXT PEM: base64 of the decapsulation seed, wrapped in a header.
+///
+/// Every intermediate here is the key in another encoding, so each one is
+/// wiped on drop. Base64 is not a transformation that makes a secret less of
+/// one, and a `String` that is merely dropped leaves it in whatever heap page
+/// it happened to occupy (audit report7 V-09).
+fn encode_pem(seed: &[u8; DK_SEED_BYTES]) -> Zeroizing<String> {
+    let b64 = Zeroizing::new(base64::engine::general_purpose::STANDARD.encode(seed));
+    Zeroizing::new(format!("{PEM_HEADER}\n{}\n{PEM_FOOTER}\n", *b64))
 }
 
-fn decode_pem(pem: &str) -> Option<Vec<u8>> {
+/// Recover the seed from a plaintext PEM.
+///
+/// Returns [`Zeroizing`] for the same reason: this is the decapsulation seed,
+/// and the caller is going to validate its length and possibly reject it —
+/// the rejected copies are exactly the ones nobody thinks about.
+fn decode_pem(pem: &str) -> Option<Zeroizing<Vec<u8>>> {
     let mut inside = false;
-    let mut b64 = String::new();
+    let mut b64 = Zeroizing::new(String::new());
     for line in pem.lines() {
         let line = line.trim();
         if line == PEM_HEADER {
@@ -447,7 +459,10 @@ fn decode_pem(pem: &str) -> Option<Vec<u8>> {
     if b64.is_empty() {
         return None;
     }
-    base64::engine::general_purpose::STANDARD.decode(&b64).ok()
+    base64::engine::general_purpose::STANDARD
+        .decode(&*b64)
+        .ok()
+        .map(Zeroizing::new)
 }
 
 // ── Encrypted PEM ───────────────────────────────────────────────
@@ -515,7 +530,7 @@ fn derive_key_from_passphrase(
 }
 
 /// Encrypt DK seed → v2 PEM with random salt and embedded KDF params.
-fn encode_pem_encrypted(seed: &[u8; DK_SEED_BYTES], passphrase: &str) -> String {
+fn encode_pem_encrypted(seed: &[u8; DK_SEED_BYTES], passphrase: &str) -> Zeroizing<String> {
     use chacha20poly1305::{
         ChaCha20Poly1305, Key, Nonce,
         aead::{Aead, KeyInit},
@@ -551,14 +566,17 @@ fn encode_pem_encrypted(seed: &[u8; DK_SEED_BYTES], passphrase: &str) -> String 
     blob.extend_from_slice(&nonce_bytes);
     blob.extend_from_slice(&ciphertext);
 
+    // Ciphertext rather than key material, but the return type is shared with
+    // [`encode_pem`] and one of the two IS the seed — a uniform wrapper is
+    // cheaper than a rule about which of the two callers must remember.
     let b64 = base64::engine::general_purpose::STANDARD.encode(&blob);
-    format!("{PEM_ENC_HEADER}\n{b64}\n{PEM_ENC_FOOTER}\n")
+    Zeroizing::new(format!("{PEM_ENC_HEADER}\n{b64}\n{PEM_ENC_FOOTER}\n"))
 }
 
 /// Decrypt DK seed from an encrypted PEM. Only the v2 layout is accepted;
 /// anything else yields `None`, which the loader treats as "wrong passphrase
 /// or corrupt file" and refuses rather than replacing the key.
-fn decode_pem_encrypted(pem: &str, passphrase: &str) -> Option<Vec<u8>> {
+fn decode_pem_encrypted(pem: &str, passphrase: &str) -> Option<Zeroizing<Vec<u8>>> {
     use chacha20poly1305::{
         ChaCha20Poly1305, Key, Nonce,
         aead::{Aead, KeyInit},
@@ -621,7 +639,9 @@ fn decode_pem_encrypted(pem: &str, passphrase: &str) -> Option<Vec<u8>> {
         let key = derive_key_from_passphrase(passphrase, salt, m_cost, t_cost, p_cost);
         let cipher = ChaCha20Poly1305::new(Key::from_slice(key.as_array()));
         let nonce = Nonce::from_slice(nonce_bytes);
-        return cipher.decrypt(nonce, ct).ok();
+        // The AEAD hands back a plain `Vec` holding the decapsulation seed;
+        // wrap it before it can be moved anywhere else (audit report7 V-09).
+        return cipher.decrypt(nonce, ct).ok().map(Zeroizing::new);
     }
 
     // Anything that is not the exact v2 layout is refused. The caller treats
@@ -675,6 +695,20 @@ impl MlKemKeyAtRest {
             Self::PlaintextUpgradeFailed { .. } => "plaintext_upgrade_failed",
         }
     }
+}
+
+/// Copy a length-checked seed out of its wiped buffer into the fixed array the
+/// public API returns.
+///
+/// Length is a precondition, not a runtime question: every caller has already
+/// compared against [`DK_SEED_BYTES`]. Taking `&Zeroizing<Vec<u8>>` rather than
+/// consuming it is the point — the buffer stays owned by its wrapper and is
+/// wiped when that drops, instead of being cloned or moved into a plain `Vec`
+/// on the way here.
+fn seed_array(seed: &Zeroizing<Vec<u8>>) -> [u8; DK_SEED_BYTES] {
+    let mut out = [0u8; DK_SEED_BYTES];
+    out.copy_from_slice(&seed[..DK_SEED_BYTES]);
+    out
 }
 
 /// A loaded ML-KEM keypair plus what the loader left on disk.
@@ -735,7 +769,7 @@ pub fn load_or_generate_mlkem_key_encrypted(
 
                     return Ok(MlKemKeyLoad {
                         ek,
-                        dk_seed: seed.try_into().expect("DK_SEED_BYTES"),
+                        dk_seed: seed_array(&seed),
                         at_rest: MlKemKeyAtRest::AsConfigured,
                     });
                 }
@@ -764,9 +798,12 @@ pub fn load_or_generate_mlkem_key_encrypted(
                 // so the outcome travels back to a caller that does, rather
                 // than being dropped on the floor (audit report7 V-02).
                 let mut at_rest = MlKemKeyAtRest::AsConfigured;
+                let seed_arr = seed_array(&seed);
                 if let Some(pass) = passphrase {
-                    let seed_arr: [u8; DK_SEED_BYTES] =
-                        seed.clone().try_into().expect("DK_SEED_BYTES");
+                    // `seed_array` reads the one copy already in hand; the
+                    // `seed.clone()` that used to stand here minted a THIRD
+                    // plain `Vec` of the decapsulation seed for the sole
+                    // purpose of being consumed by `try_into` (report7 V-09).
                     let enc_pem = encode_pem_encrypted(&seed_arr, pass);
                     at_rest = match veil_util::atomic_write(path, enc_pem.as_bytes()) {
                         Ok(()) => MlKemKeyAtRest::UpgradedToEncrypted,
@@ -778,7 +815,7 @@ pub fn load_or_generate_mlkem_key_encrypted(
 
                 return Ok(MlKemKeyLoad {
                     ek,
-                    dk_seed: seed.try_into().expect("DK_SEED_BYTES"),
+                    dk_seed: seed_arr,
                     at_rest,
                 });
             }
@@ -1164,6 +1201,39 @@ mod tests {
         let second = load_or_generate_mlkem_key_encrypted(&path, None).unwrap();
         assert_eq!(second.at_rest, MlKemKeyAtRest::AsConfigured);
         assert!(!second.at_rest.is_degraded());
+    }
+
+    /// Every PEM intermediate that holds the decapsulation seed is wiped on
+    /// drop.
+    ///
+    /// The explicit type annotations ARE the assertion: this is a compile-time
+    /// property, and there is no safe way to observe a freed heap buffer to
+    /// check it at runtime. Widening any of these back to a plain `String` or
+    /// `Vec<u8>` — which is what they were (audit report7 V-09) — stops this
+    /// test compiling, and a test that does not compile fails the gate.
+    ///
+    /// The round-trip assertions are here so the wrappers are doing the job on
+    /// real key material rather than on an empty buffer.
+    #[test]
+    fn every_pem_intermediate_holding_the_seed_is_wiped_on_drop() {
+        let (_ek, seed) = generate_keypair();
+
+        let plain: Zeroizing<String> = encode_pem(&seed);
+        let decoded: Zeroizing<Vec<u8>> = decode_pem(&plain).expect("plaintext PEM round-trips");
+        assert_eq!(&decoded[..], &seed[..]);
+
+        let sealed: Zeroizing<String> = encode_pem_encrypted(&seed, "pass");
+        let opened: Zeroizing<Vec<u8>> =
+            decode_pem_encrypted(&sealed, "pass").expect("encrypted PEM round-trips");
+        assert_eq!(&opened[..], &seed[..]);
+        assert!(
+            decode_pem_encrypted(&sealed, "wrong").is_none(),
+            "control: the decoder still rejects a wrong passphrase"
+        );
+
+        // And the array handed to callers is copied OUT of the wiped buffer
+        // rather than the buffer being consumed into a plain `Vec` on the way.
+        assert_eq!(seed_array(&decoded), seed);
     }
 
     // ── v2 encrypted PEM format tests ─────────────────────────────────────
