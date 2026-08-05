@@ -73,10 +73,13 @@ class VeilMailbox {
     _validateId(receiverId, 'receiverId');
     _validateId(contentId, 'contentId');
     _validateId(senderId, 'senderId');
-    if (blob.length > ffi.veilMaxDataLen) {
+    // The relay's blob ceiling, not the IPC data ceiling: the two differ by a
+    // factor of sixteen, so validating against the wrong one let a PUT the
+    // relay was always going to refuse travel the whole way there first.
+    if (blob.length > ffi.veilMailboxMaxBlobBytes) {
       throw ArgumentError(
-        'blob length ${blob.length} exceeds veilMaxDataLen '
-        '(${ffi.veilMaxDataLen})',
+        'blob length ${blob.length} exceeds veilMailboxMaxBlobBytes '
+        '(${ffi.veilMailboxMaxBlobBytes})',
       );
     }
     // Blocking onion deposit to the relay — off-isolate via a TOP-LEVEL worker
@@ -551,14 +554,22 @@ List<MailboxBlob> _fetchWorker(
     }
     final count = outCount.value;
     if (count == 0) return <MailboxBlob>[];
-    const maxPendingBlobs = 8192;
-    if (count > maxPendingBlobs) {
+    // The daemon caps a batch at `veilMailboxMaxFetchCount`; the old guard here
+    // was eight times looser than that, so it could never fire — it described
+    // no limit anyone enforces.
+    if (count > ffi.veilMailboxMaxFetchCount) {
       throw VeilException(
           'mailbox returned an implausible pending count ($count > '
-          '$maxPendingBlobs) — refusing to allocate',
+          '${ffi.veilMailboxMaxFetchCount}) — refusing to allocate',
           code: ffi.veilErr);
     }
-    const blobBufLen = ffi.veilMaxDataLen;
+    // Sized from the daemon's OWN batch ceiling, not from a guess: the daemon
+    // cuts a fetch batch at `veilMailboxMaxFetchBytes`, so a buffer of exactly
+    // that size fits every batch that can ever be returned.  Sizing it from
+    // `veilMaxDataLen` was a coincidence that happened to hold, and the count
+    // alone can never justify a size — a record is anything up to
+    // `veilMailboxMaxBlobBytes` (report7 V-01).
+    const blobBufLen = ffi.veilMailboxMaxFetchBytes;
     final descriptors = calloc<ffi.VeilMailboxBlobStruct>(count);
     final blobBuf = calloc<Uint8>(blobBufLen);
     try {

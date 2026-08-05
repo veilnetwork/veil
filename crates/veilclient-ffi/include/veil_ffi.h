@@ -83,6 +83,43 @@
 #define VEIL_MAX_DATA_LEN (((16 * 1024) * 1024) - 256)
 
 /**
+ * Ceiling on the TOTAL payload bytes one mailbox fetch batch can return.
+ *
+ * The size of the `blob_buf` a caller must hand [`veil_mailbox_fetch_into`].
+ * A caller that allocates this much is correct for every possible batch, for
+ * every possible backlog, forever — which the record count returned by
+ * [`veil_mailbox_fetch_count`] could never tell it, because a record is
+ * anything up to [`VEIL_MAILBOX_MAX_BLOB_BYTES`]. Callers that guessed a
+ * buffer size instead failed `blob_buf too small` on exactly the backlogs
+ * they most needed to drain (audit report7 V-01).
+ *
+ * Mirrors `veil_mailbox::MAX_FETCH_BYTES`, and the mirror is CHECKED — see
+ * `mailbox_abi_constants_track_the_daemon` in this file's test module.
+ */
+#define VEIL_MAILBOX_MAX_FETCH_BYTES ((8 * 1024) * 1024)
+
+/**
+ * Ceiling on the number of records one mailbox fetch batch can return.
+ *
+ * The number of `VeilMailboxBlob` descriptor slots a caller must hand
+ * [`veil_mailbox_fetch_into`]. Mirrors `veil_mailbox::MAX_FETCH_COUNT`
+ * (checked — see [`VEIL_MAILBOX_MAX_FETCH_BYTES`]).
+ */
+#define VEIL_MAILBOX_MAX_FETCH_COUNT 1024
+
+/**
+ * Ceiling on a single deposited mailbox blob.
+ *
+ * The relay rejects a PUT above this, so it is the bound a caller should
+ * validate against before calling `veil_mailbox_put*` — NOT
+ * [`VEIL_MAX_DATA_LEN`], which is sixteen times larger and governs a
+ * different surface (the IPC send payload). Mirrors
+ * `veil_mailbox::MAX_BLOB_BYTES` (checked — see
+ * [`VEIL_MAILBOX_MAX_FETCH_BYTES`]).
+ */
+#define VEIL_MAILBOX_MAX_BLOB_BYTES (1024 * 1024)
+
+/**
  * Nothing corroborates `src_node_id`; it is a CLAIM the frame carried. Never a
  * basis for an authorization decision. This is the normal, correct level for
  * the anonymous meta-E2E path and for anything relayed — not a synonym for

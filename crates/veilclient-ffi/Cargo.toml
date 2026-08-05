@@ -126,6 +126,12 @@ veil-proto = { path = "../veil-proto" }
 veil-ipc = { path = "../veil-ipc" }
 # Same test: `route_ipc_deliver` takes the daemon's pooled buffer type.
 veil-bufpool = { path = "../veil-bufpool" }
+# The relay-side mailbox store, for the `VEIL_MAILBOX_*` constant-mirror test.
+# Those constants tell a C/Dart caller how large a buffer a fetch batch needs;
+# a comment claiming they mirror the daemon is exactly what let the Dart data
+# ceiling drift 256 bytes from this crate's (report7 V-07). DEV-only, so the
+# shipped cdylib does not grow a redb dependency for three integers.
+veil-mailbox = { path = "../veil-mailbox" }
 # Unit tests use temporary directories even when the optional embedded-node
 # feature is disabled. Keep the production dependency feature-gated above,
 # while making it unconditionally available to test targets.
