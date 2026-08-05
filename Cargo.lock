@@ -5352,6 +5352,7 @@ dependencies = [
  "veil-e2e",
  "veil-identity",
  "veil-ipc",
+ "veil-mailbox",
  "veil-node-runtime",
  "veil-onion-stream",
  "veil-proto",

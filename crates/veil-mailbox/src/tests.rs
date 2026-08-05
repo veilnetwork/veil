@@ -1431,3 +1431,198 @@ fn v05_control_a_real_sender_is_still_identified() {
         "an identified deposit must not spend the receiver's anonymous slice"
     );
 }
+
+// ── report7 V-01: the fetch batch is bounded in BYTES, not only in records ───
+
+/// Config for the megabyte-blob tests: the per-sender default (10 MiB) and the
+/// rate limiter would both stop the deposits long before the fetch ceiling is
+/// reached, and neither is what these tests are about.
+fn bulk_cfg() -> MailboxConfig {
+    MailboxConfig {
+        rate_limit_per_minute: 0,
+        quota_per_sender_bytes: u64::MAX,
+        ..MailboxConfig::default()
+    }
+}
+
+/// Deposit `n` blobs of exactly [`MAX_BLOB_BYTES`] for `recv`, each with a
+/// distinct content_id and a distinct deposit time so the oldest-first order
+/// is total. Returns the content_ids in deposit order.
+fn deposit_megabyte_blobs(mb: &Mailbox, clk: &Arc<AtomicU64>, recv: [u8; 32], n: u8) -> Vec<[u8; 32]> {
+    let sender = [0x5Au8; 32];
+    let mut ids = Vec::with_capacity(n as usize);
+    for i in 0..n {
+        let mut cid = [0u8; 32];
+        cid[0] = i;
+        clk.fetch_add(1, Ordering::SeqCst);
+        mb.put(recv, cid, sender, vec![0u8; MAX_BLOB_BYTES as usize])
+            .unwrap();
+        ids.push(cid);
+    }
+    ids
+}
+
+/// 17 × 1 MiB is the smallest backlog whose sum passes 16 MiB, the size every
+/// FFI/Flutter consumer allocated for a fetch. The count cap ([`MAX_FETCH_COUNT`]
+/// = 1024) does not see that at all: it would hand back all 17 — and, against a
+/// mailbox filled to the default 100 MiB receiver quota, all hundred megabytes
+/// of it, materialised in the relay's heap on EVERY fetch of the drain.
+#[test]
+fn v01_fetch_batch_stays_under_the_byte_ceiling_with_seventeen_megabyte_blobs() {
+    let (mb, _tmp, clk) = fresh(bulk_cfg());
+    let recv = [0x17u8; 32];
+    let ids = deposit_megabyte_blobs(&mb, &clk, recv, 17);
+
+    let batch = mb.fetch(recv).unwrap();
+    let total: u64 = batch.iter().map(|b| b.blob.len() as u64).sum();
+
+    assert!(
+        total <= MAX_FETCH_BYTES,
+        "a fetch batch must never exceed MAX_FETCH_BYTES ({MAX_FETCH_BYTES}), got {total}"
+    );
+    assert!(!batch.is_empty(), "the batch must make progress");
+    assert!(
+        batch.len() < ids.len(),
+        "17 MiB cannot fit under an 8 MiB ceiling — the count cap alone would \
+         have returned all {} records ({} bytes)",
+        ids.len(),
+        ids.len() as u64 * MAX_BLOB_BYTES
+    );
+    // The ceiling is a whole number of worst-case blobs, so the cut is exact.
+    assert_eq!(batch.len(), (MAX_FETCH_BYTES / MAX_BLOB_BYTES) as usize);
+    // Oldest-first is preserved across the cut.
+    for (i, b) in batch.iter().enumerate() {
+        assert_eq!(b.content_id, ids[i], "batch must stay oldest-first");
+    }
+}
+
+/// The other half of the contract: nothing is LOST to the ceiling. A backlog
+/// larger than one batch drains over several ack-then-fetch rounds, every round
+/// stays under the ceiling, and no round fails — the wedge in the report was a
+/// receiver that could neither read the batch nor ack it (ack keys off a
+/// content_id only a successful fetch reveals), leaving the box locked until
+/// the 7-day TTL.
+#[test]
+fn v01_seventeen_megabyte_blobs_drain_over_several_fetches_none_failing() {
+    let (mb, _tmp, clk) = fresh(bulk_cfg());
+    let recv = [0x18u8; 32];
+    let deposited = deposit_megabyte_blobs(&mb, &clk, recv, 17);
+
+    let mut drained: Vec<[u8; 32]> = Vec::new();
+    let mut rounds = 0usize;
+    loop {
+        let batch = mb.fetch(recv).unwrap();
+        if batch.is_empty() {
+            break;
+        }
+        rounds += 1;
+        assert!(
+            rounds <= deposited.len(),
+            "drain is not converging — {rounds} rounds for {} records",
+            deposited.len()
+        );
+        let total: u64 = batch.iter().map(|b| b.blob.len() as u64).sum();
+        assert!(
+            total <= MAX_FETCH_BYTES,
+            "round {rounds} returned {total} bytes, over the ceiling"
+        );
+        for b in batch {
+            assert_eq!(b.blob.len(), MAX_BLOB_BYTES as usize);
+            assert!(mb.ack(recv, b.content_id).unwrap(), "ack must remove");
+            drained.push(b.content_id);
+        }
+    }
+
+    let mut want = deposited.clone();
+    want.sort_unstable();
+    let mut got = drained.clone();
+    got.sort_unstable();
+    assert_eq!(got, want, "every deposited blob must come back exactly once");
+    assert_eq!(
+        rounds, 3,
+        "17 MiB under an 8 MiB ceiling is 8 + 8 + 1 — three fetches"
+    );
+    assert_eq!(mb.receiver_bytes(recv).unwrap(), 0, "quota fully released");
+}
+
+/// Write a record straight into the blobs table, bypassing `put`'s
+/// [`MAX_BLOB_BYTES`] gate. Reproduces a record that no current `put` would
+/// accept — a legacy row, or one written by a build with a larger cap.
+fn scribble_oversized_record(dir: &std::path::Path, recv: [u8; 32], cid: [u8; 32], len: usize) {
+    let db = Database::create(dir.join("mailbox").join("blobs.db")).unwrap();
+    let txn = db.begin_write().unwrap();
+    {
+        let mut t = txn.open_table(TABLE_BLOBS).unwrap();
+        let rec = encode_record(&[0x99u8; 32], 1, &vec![0u8; len]);
+        t.insert(make_key(&recv, &cid).as_slice(), rec.as_slice())
+            .unwrap();
+    }
+    txn.commit().unwrap();
+}
+
+/// The head of an oldest-first queue must ALWAYS be emitted, even when it alone
+/// exceeds the ceiling. Without that clause a single oversized record parks at
+/// the head forever and starves every deliverable blob behind it — the exact
+/// wedge the byte ceiling exists to prevent, reintroduced by the ceiling
+/// itself. (The same rule already guards the onion FETCH packer and the IPC
+/// response packer.)
+#[test]
+fn v01_head_record_is_emitted_even_when_it_alone_exceeds_the_ceiling() {
+    let cfg = bulk_cfg();
+    let (mb, tmp, clk) = fresh(cfg.clone());
+    let recv = [0x19u8; 32];
+    // A deliverable blob queued BEHIND the oversized one: it is what a wedge
+    // would starve.
+    clk.store(500, Ordering::SeqCst);
+    mb.put(recv, [0xEEu8; 32], [0x5Au8; 32], vec![7u8; 128])
+        .unwrap();
+    drop(mb);
+
+    // deposited_at = 1, older than the 128-byte blob above → head of the queue.
+    let huge = (MAX_FETCH_BYTES + 1) as usize;
+    scribble_oversized_record(tmp.path(), recv, [0xAAu8; 32], huge);
+
+    let mb = reopen(tmp.path(), cfg);
+    let batch = mb.fetch(recv).unwrap();
+    assert!(
+        !batch.is_empty(),
+        "an oversized head record must still be emitted — otherwise it wedges \
+         the queue until the 7-day TTL"
+    );
+    assert_eq!(batch[0].content_id, [0xAAu8; 32]);
+    assert_eq!(batch[0].blob.len(), huge);
+    assert_eq!(
+        batch.len(),
+        1,
+        "the ceiling still stops the batch after the mandatory head record"
+    );
+
+    // And once the head is acked the blob behind it is served — progress.
+    assert!(mb.ack(recv, [0xAAu8; 32]).unwrap());
+    let next = mb.fetch(recv).unwrap();
+    assert_eq!(next.len(), 1);
+    assert_eq!(next[0].content_id, [0xEEu8; 32]);
+}
+
+/// CONTROL: the byte ceiling must not shorten batches that fit. A thousand tiny
+/// records are still bounded by [`MAX_FETCH_COUNT`] alone, so a probe that
+/// simply made every batch small would fail here.
+#[test]
+fn v01_control_byte_ceiling_does_not_shorten_a_batch_that_fits() {
+    let (mb, _tmp, clk) = fresh(bulk_cfg());
+    let recv = [0x1Au8; 32];
+    let sender = [0x5Au8; 32];
+    for i in 0..1200u32 {
+        let mut cid = [0u8; 32];
+        cid[..4].copy_from_slice(&i.to_be_bytes());
+        clk.fetch_add(1, Ordering::SeqCst);
+        mb.put(recv, cid, sender, vec![0u8; 64]).unwrap();
+    }
+    let batch = mb.fetch(recv).unwrap();
+    assert_eq!(
+        batch.len(),
+        MAX_FETCH_COUNT,
+        "1200 × 64 B is far under the byte ceiling — the RECORD cap is what \
+         must bind here"
+    );
+}

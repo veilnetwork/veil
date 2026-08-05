@@ -203,6 +203,32 @@ pub const MIN_EVICTION_AGE_SECS: u64 = 3600;
 /// that need the rest are expected to ack-then-fetch in batches.
 pub const MAX_FETCH_COUNT: usize = 1024;
 
+/// hard cap on the total PAYLOAD BYTES returned by a
+/// single [`Mailbox::fetch`] call.
+///
+/// [`MAX_FETCH_COUNT`] bounds the batch on the wrong axis. A record may be up
+/// to [`MAX_BLOB_BYTES`] (1 MiB), so "at most 1024 records" is "at most 1 GiB",
+/// and in practice the binding constraint was the receiver's byte quota
+/// (`DEFAULT_QUOTA_PER_RECEIVER_BYTES` = 100 MiB): every fetch against a full
+/// mailbox materialised the whole 100 MiB backlog in the relay's heap. Each
+/// consumer then trimmed that to its own transport budget and threw the rest
+/// away — the local IPC handler to 12 MiB, the onion FETCH reply to a few KiB —
+/// so the relay paid the full allocation again on every round of a drain that
+/// only ever moved a slice of it (audit report7 V-01).
+///
+/// With a byte ceiling here the SUM of a batch is known before the caller sees
+/// it, which is what the count alone could never tell a consumer sizing a
+/// buffer: an FFI/Flutter caller can allocate this once and be right forever,
+/// instead of allocating a guess and failing when the guess is short. See
+/// [`Mailbox::fetch`] for the drain contract (ack the batch, fetch again).
+///
+/// 8 MiB sits below every downstream budget on the path
+/// (`veil_ipc::handlers::mailbox::MAX_MAILBOX_FETCH_BYTES` = 12 MiB, the 16 MiB
+/// IPC frame body, `veilclient_ffi::VEIL_MAX_DATA_LEN`), so those stay as
+/// defence in depth and never bite, and it is 8× [`MAX_BLOB_BYTES`] so a batch
+/// still carries eight worst-case blobs.
+pub const MAX_FETCH_BYTES: u64 = 8 * 1024 * 1024;
+
 /// Minimum size of a deposited blob (1 byte).
 ///
 /// pre-fix the only check was the
@@ -507,6 +533,8 @@ pub struct MailboxStats {
 /// On-disk record format for the `blobs` table value.
 ///
 /// Layout: `[sender_id (32) | deposited_at (8 BE) | blob_len (4 BE) | blob_bytes]`.
+const RECORD_HEADER_LEN: usize = 32 + 8 + 4;
+
 fn encode_record(sender_id: &[u8; 32], deposited_at: u64, blob: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(32 + 8 + 4 + blob.len());
     out.extend_from_slice(sender_id);
@@ -517,7 +545,7 @@ fn encode_record(sender_id: &[u8; 32], deposited_at: u64, blob: &[u8]) -> Vec<u8
 }
 
 fn decode_record(bytes: &[u8]) -> Result<([u8; 32], u64, Vec<u8>), MailboxError> {
-    if bytes.len() < 32 + 8 + 4 {
+    if bytes.len() < RECORD_HEADER_LEN {
         return Err(MailboxError::Corrupt("record too short for header"));
     }
     let mut sender = [0u8; 32];
@@ -532,10 +560,10 @@ fn decode_record(bytes: &[u8]) -> Result<([u8; 32], u64, Vec<u8>), MailboxError>
             .try_into()
             .map_err(|_| MailboxError::Corrupt("record blob_len slice"))?,
     ) as usize;
-    if bytes.len() != 44 + blob_len {
+    if bytes.len() != RECORD_HEADER_LEN + blob_len {
         return Err(MailboxError::Corrupt("record blob_len mismatch"));
     }
-    Ok((sender, deposited_at, bytes[44..].to_vec()))
+    Ok((sender, deposited_at, bytes[RECORD_HEADER_LEN..].to_vec()))
 }
 
 /// read just (sender_id, deposited_at)
@@ -543,7 +571,7 @@ fn decode_record(bytes: &[u8]) -> Result<([u8; 32], u64, Vec<u8>), MailboxError>
 /// needs the sender for per-sender counter bookkeeping but otherwise
 /// throws the blob away.
 fn decode_record_header(bytes: &[u8]) -> Result<([u8; 32], u64), MailboxError> {
-    if bytes.len() < 32 + 8 + 4 {
+    if bytes.len() < RECORD_HEADER_LEN {
         return Err(MailboxError::Corrupt("record too short for header"));
     }
     let mut sender = [0u8; 32];
@@ -1095,9 +1123,10 @@ impl Mailbox {
         Ok(outcome)
     }
 
-    /// Fetch up to [`MAX_FETCH_COUNT`] currently-stored blobs for `receiver`
-    /// oldest first. Does not delete — caller must call [`Self::ack`] for
-    /// each blob after the receiver has received it end-to-end.
+    /// Fetch currently-stored blobs for `receiver`, oldest first, bounded by
+    /// BOTH [`MAX_FETCH_COUNT`] records and [`MAX_FETCH_BYTES`] payload bytes.
+    /// Does not delete — caller must call [`Self::ack`] for each blob after
+    /// the receiver has received it end-to-end.
     ///
     /// ** bounded result. Pre-fix a
     /// receiver could trigger ~10 GiB heap allocation if an attacker
@@ -1108,6 +1137,14 @@ impl Mailbox {
     /// drain in loops would now leave older blobs unacked indefinitely;
     /// the standard mailbox-IPC consumer (`MailboxIpcBridge`) already
     /// drains in a loop because it ack's per-record after delivery.
+    ///
+    /// The byte bound is the second half of the same fix (audit report7 V-01):
+    /// the count cap alone let a batch reach the receiver's whole byte quota
+    /// (100 MiB by default), because 1024 records × [`MAX_BLOB_BYTES`] is
+    /// 1 GiB, not the megabytes the cap reads like. Records are packed
+    /// oldest-first until the next one would cross [`MAX_FETCH_BYTES`];
+    /// the FIRST selected record is always emitted, so a record that alone
+    /// exceeds the ceiling can never wedge the queue behind it.
     pub fn fetch(&self, receiver: [u8; 32]) -> Result<Vec<MailboxBlob>, MailboxError> {
         let txn = self.db.begin_read()?;
         let blobs = txn.open_table(TABLE_BLOBS)?;
@@ -1148,14 +1185,30 @@ impl Mailbox {
         // Order the selected survivors oldest-first (FIFO drain semantics).
         let mut selected: Vec<(u64, [u8; 32])> = heap.into_vec();
         selected.sort_unstable();
-        // Load the blob for ONLY the selected records.
-        let mut out: Vec<MailboxBlob> = Vec::with_capacity(selected.len());
+        // Load the blob for ONLY the selected records, and only while the batch
+        // stays under MAX_FETCH_BYTES. The stored record carries its payload
+        // length in its header, so the ceiling is applied BEFORE `decode_record`
+        // allocates the payload — the point of the bound is that the oversized
+        // bytes are never in the heap at all, not that they are dropped after.
+        let mut out: Vec<MailboxBlob> = Vec::new();
+        let mut batch_bytes: u64 = 0;
         for (deposited_at, content_id) in selected {
             let mut key = [0u8; KEY_LEN];
             key[..32].copy_from_slice(&receiver);
             key[32..].copy_from_slice(&content_id);
             if let Some(v) = blobs.get(key.as_slice())? {
-                let (sender, _ts, blob) = decode_record(v.value())?;
+                let raw = v.value();
+                let blob_len = (raw.len().saturating_sub(RECORD_HEADER_LEN)) as u64;
+                // Always emit the first record: a single record larger than the
+                // ceiling would otherwise sit at the head of an oldest-first
+                // queue forever and starve everything behind it. (`put` caps a
+                // payload at MAX_BLOB_BYTES, well under the ceiling, so this is
+                // a structural guarantee rather than a live path.)
+                if !out.is_empty() && batch_bytes.saturating_add(blob_len) > MAX_FETCH_BYTES {
+                    break;
+                }
+                let (sender, _ts, blob) = decode_record(raw)?;
+                batch_bytes = batch_bytes.saturating_add(blob.len() as u64);
                 out.push(MailboxBlob {
                     sender_id: sender,
                     content_id,
