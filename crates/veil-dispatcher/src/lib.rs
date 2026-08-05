@@ -586,7 +586,11 @@ pub type AnnounceReplayKey = (u8, [u8; 32], u32);
 ///    still-valid *signed* announcement through a *different* `via` path once
 ///    the original entry has expired from layer 1. A ROUTE_ANNOUNCE with
 ///    sequence N from origin O is accepted at most once regardless of which
-///    relay forwards it.
+///    relay forwards it. Layer 2 applies to the GOSSIP kinds only
+///    (`KIND_ANNOUNCE`, `KIND_WITHDRAW`); for `KIND_REQUEST` the third field is
+///    the requester rather than a forwarding relay, so collapsing it there
+///    would let one peer suppress everybody else's lookups — see
+///    [`RouteSeenSet::check_and_insert`].
 pub struct RouteSeenSet {
     /// Layer 1: per-(origin, via, seq) dedup.
     full: ExpiryCache<SeenKey>,
@@ -617,8 +621,29 @@ impl RouteSeenSet {
     pub const KIND_REQUEST: u8 = 2;
 
     fn check_and_insert(&mut self, kind: u8, origin: [u8; 32], via: [u8; 32], seq: u32) -> bool {
-        // Layer 2: per-(kind, origin, seq) check first — this is the replay guard.
-        if self.replay.check_and_insert((kind, origin, seq)) {
+        // Layer 2 exists to stop *gossip* being replayed through a different
+        // forwarding path once layer 1 expired, so it deliberately collapses
+        // `via`. That is correct for ANNOUNCE/WITHDRAW, where `via` really is
+        // the relay that forwarded a message the origin authored.
+        //
+        // It is wrong for KIND_REQUEST. There the third field is not a
+        // forwarding path — it is the REQUESTER, i.e. the author. Collapsing
+        // it turned the replay window into a suppression oracle: whoever
+        // occupies `(REQUEST, target, request_id)` first silently kills every
+        // OTHER node's route lookup for `target` carrying that id, for the
+        // whole TTL. With `ttl = 0` the occupying frame never reaches the
+        // `dht_quota` gate in `handle_route_request` (that gate sits inside the
+        // `ttl > 0` forward branch), so the suppression costs no quota and
+        // raises no violation — cheaper and quieter than flooding.
+        //
+        // A RouteRequest is not gossip: it is never re-forwarded by sequence
+        // and carries no per-origin counter to replay. Layer 1 already keys on
+        // the complete triple `(REQUEST, target, requester, request_id)`, which
+        // is the whole identity of the request, so it is the correct and
+        // sufficient dedup — and it puts the requester back in the key.
+        // Skipping layer 2 here also stops requests from evicting real
+        // announce entries out of the shared replay cache.
+        if kind != Self::KIND_REQUEST && self.replay.check_and_insert((kind, origin, seq)) {
             // Already seen this (kind, origin, seq) from some via — drop
             // regardless of current via to prevent replay through a different
             // forwarding path.
@@ -3368,6 +3393,84 @@ mod tests {
         assert!(
             rx_stranger.try_recv().is_err(),
             "ContactsOnly: nothing should be enqueued — even PowChallenge would confirm existence",
+        );
+    }
+
+    /// report6 validation: the `RouteRequest` dedup must NOT collapse the
+    /// requester.
+    ///
+    /// `RouteSeenSet`'s layer-2 replay window drops `via` on purpose — that is
+    /// right for gossip, where `via` is a forwarding relay. For a
+    /// `RouteRequest` the same field is the REQUESTER, so collapsing it made
+    /// `(target, request_id)` a suppression slot: whoever claims it first
+    /// silently kills every other node's lookup for that target until the TTL
+    /// expires. And it is free — the attacker sends `ttl = 0`, which never
+    /// reaches the `dht_quota` gate (that gate lives inside the `ttl > 0`
+    /// forward branch), so nothing is charged and no violation is raised.
+    ///
+    /// Drives the real handler: a relay must still forward the legitimate
+    /// lookup after an attacker has occupied the same `(target, request_id)`.
+    #[test]
+    fn report6_route_request_dedup_must_not_collapse_the_requester() {
+        use ed25519_dalek::SigningKey;
+        use veil_proto::routing::RouteRequestPayload;
+
+        let relay = [0x11u8; 32];
+        let target = [0x22u8; 32];
+        let attacker = [0xAAu8; 32];
+        let legit = [0xBBu8; 32];
+        let onward = [0xDDu8; 32]; // third peer — receives the relay's fan-out
+        let relay_sk = Arc::new(SigningKey::from_bytes(&[0x11u8; 32]));
+
+        let tx_reg = Arc::new(RwLock::new(veil_session::SessionTxRegistry::new()));
+        let _rx_attacker = tx_reg.write().unwrap().register(attacker);
+        let _rx_legit = tx_reg.write().unwrap().register(legit);
+        let mut rx_onward = tx_reg.write().unwrap().register(onward);
+
+        let disp =
+            make_gossip_dispatcher(relay, Arc::clone(&relay_sk), Arc::clone(&tx_reg), vec![]);
+        let hdr = FrameHeader::new(FrameFamily::Routing as u8, RoutingMsg::RouteRequest as u16);
+
+        // Same (target, request_id) for both — the collision the attacker wants.
+        const SHARED_ID: u32 = 1; // what a counter-from-1 node emits first
+        let squat = RouteRequestPayload {
+            target_node_id: target,
+            requester_node_id: attacker,
+            request_id: SHARED_ID,
+            ttl: 0, // no forward => no DHT-quota charge, no violation
+            signature: [0u8; 64],
+        };
+        let r = disp.dispatch(&hdr, &squat.encode(), attacker);
+        assert!(
+            matches!(r, DispatchResult::NoResponse),
+            "the squatting frame is free and silent by construction, got {r:?}",
+        );
+        assert!(
+            rx_onward.try_recv().is_err(),
+            "ttl=0 must not fan out — otherwise this test proves nothing about cost",
+        );
+
+        // The victim's lookup, same id, different requester: MUST be forwarded.
+        let real = RouteRequestPayload {
+            target_node_id: target,
+            requester_node_id: legit,
+            request_id: SHARED_ID,
+            ttl: 7,
+            signature: [0u8; 64],
+        };
+        disp.dispatch(&hdr, &real.encode(), legit);
+        assert!(
+            rx_onward.try_recv().is_ok(),
+            "a different requester's RouteRequest was swallowed by the attacker's \
+             (target, request_id) squat — the dedup key dropped the requester",
+        );
+
+        // Control: the dedup itself still works. The SAME requester replaying
+        // the SAME id must not be forwarded a second time.
+        disp.dispatch(&hdr, &real.encode(), legit);
+        assert!(
+            rx_onward.try_recv().is_err(),
+            "an exact (target, requester, request_id) replay must still be deduped",
         );
     }
 
