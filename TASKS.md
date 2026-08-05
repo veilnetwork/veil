@@ -9,7 +9,7 @@ Each epic ends by transitioning to the next via a re-analysis task.
 > * Remainder of **Epic 489 (Flutter mobile)**: drainMailbox helper + push-relay reference impl + iOS BG "drained" signal hook (see row).  489.10 HMAC-auth wakeup shipped on the daemon side (see T3).  The other 489.x are ✅ closed.  iOS APNs token storage upgraded to Keychain (2026-05-23).
 > * Remainder of the **anti-censorship roadmap**: bandwidth-mimicry (landing-pad ready, fail-closed, awaiting a pcap fixture from the operator — now tracked in the deferred backlog table); frame-timing-jitter, HTTP/2-shape padding, WebRTC-snowflake transport (new layers, not blocking).
 > * **Deferred large-scope backlog** (re-open triggers defined): see the table below (now includes the 4 deferred-with-proposal items from the 2026-06-14 audit batch — anycast first-use Sybil, CircuitBuilt ACK MAC, bandwidth-mimicry impl, pqcrypto migration).
-> * **Audit cycles 4–6 deferred tasks** (T1–T7): T1 handoff anti-replay and T4 remote IPC stream forwarding remain open; T2 remains open as a design item; T3/T5/T6/T7 done.  See the sections below.
+> * **Audit cycles 4–6 deferred tasks** (T1–T7): T2 remains open as a design item; T1 and T3–T7 are done.  See the sections below.  (T1 and T4 were listed here as open until 2026-08-05 although both had shipped — an external audit re-derived the whole T4 analysis from this line before finding the implementation.)
 > * **Operator-triggered actions**: stealth-canary on node1 active (see row); the reverted stress-soak overrides were archived to [`TASKS_ARCHIVE.md`](TASKS_ARCHIVE.md).
 
 ---
@@ -427,28 +427,19 @@ that can't be resolved locally** — recorded here with the core tension + an
 acceptance sketch so the analysis isn't lost. Cross-refs to the older scattered
 rows where they exist.
 
-**T1 — Handoff attach anti-replay (N2).** Priority low. Refs: existing deferral
-TASKS "Audit batch 2026-05-21" item 7 (handoff peer_id continuity); wire docstring
-`veil-proto/src/session.rs`; struct doc `veil-session/src/handoff.rs`
-`PendingHandoff.peer_node_id` (comment corrected this cycle to stop claiming the
-accept path verifies it).
-- *What:* `HandoffAttach{session_id, hmac=BLAKE3-keyed(tx_key)(session_id‖nonce)}`
-  travels in plaintext; `HandoffRegistry::consume` keys on `session_id` only.
-- *Core tension:* it's a **replay race, not a forge** (attacker lacks session
-  keys, can't mint — only re-send observed bytes and win the race to `consume`).
-  You can't bind the proof to the original transport because handoff exists to
-  MOVE the session to a new transport. A fresh challenge-response gate fixes
-  replay but costs a round-trip on every (supposedly seamless) handoff + new
-  pending-challenge state + a **wire-format version bump** whose v1 path stays
-  accepted until the fleet upgrades (so the hole isn't closed until a flag-flip).
-- *Why low:* impact is transient DoS only — a winning attacker attaches but
-  holds no keys, so the peer's first frame is AEAD-garbage to it and the session
-  drops. Annoy, not own.
-- *Acceptance:* challenge-response (or HMAC bound to a handshake-negotiated
-  handoff secret) gated behind a `handoff_v2` config flag; v1 accepted during
-  migration; sim test asserting a replayed attach is rejected. **Re-open:** real
-  exploitation observed, or a deployment where handoff churn makes the DoS
-  material.
+**T1 — Handoff attach anti-replay (N2). — CLOSED.**
+- *What it was:* `HandoffAttach{session_id, hmac}` travels in plaintext and
+  `HandoffRegistry::consume` keyed on `session_id` alone, so a captured attach
+  re-sent by a third party could win the race to consume the pending entry.
+  Transient DoS only (the winner holds no session keys), which is why it sat at
+  low priority.
+- *How it closed:* the accept path no longer spends the pending entry on the
+  strength of a `session_id`. It `peek`s the entry, verifies the responder's
+  HMAC against it, and consumes only after that verify passes — so a replayed
+  attach leaves the entry intact for the legitimate peer and is dropped.  See
+  `veil-session/src/handoff.rs` (module doc + `peek_and_dispatch`); regression
+  `peek_and_dispatch_rejects_replayed_response_t1` asserts a replayed response
+  is rejected on HMAC mismatch.
 
 **T2 — Anycast/relay reputation feedback loop (N3).** Priority low/medium. Refs:
 existing row "`AnycastService::resolve` signed records / reputation" above;
@@ -534,27 +525,26 @@ Refs: `mint_wake_payload` in `crates/veil-node-runtime/src/runtime/service_tasks
   `wake_payload: Option<[u8; WAKE_PAYLOAD_LEN]>` argument attached to the
   provider `data` map.
 
-**T4 — Remote IPC stream forwarding (PLAN phases 2-4).** Priority medium. Refs:
-`docs/en/PLAN_IPC_STREAM_FORWARDING.md`; `veil-ipc/src/handlers/stream.rs`
-(returns `REMOTE_NOT_IMPLEMENTED` for `dst_node_id != local` — fails closed by
-design, Phase 1 local streams shipped).
-- *What:* a bidirectional stream bridge so the SDK can `open_stream` to a remote
-  node's app endpoint over the veil.
-- *Core tension:* it's a **two-flow-control-domain proxy** (TCP-over-TCP class):
-  the local IPC channel backpressure (the 1024-slot channel + `PollSender`, fixed
-  this cycle in M3) must compose with the remote veil session's congestion/
-  window so a slow remote can't OOM the local SDK buffer and a slow local
-  consumer applies backpressure to the remote — needs careful window propagation.
-  Plus **teardown across 4 endpoints** (local-app ↔ local-daemon ↔ remote-daemon
-  ↔ remote-app): STREAM_CLOSE/reset/half-close must propagate without leaking
-  half-open streams or double-closing, including on session drop / reload (the
-  leak class fixed this cycle in L-10/M-D). Plus capability/quota gating for
-  app→arbitrary-remote-endpoint initiation.
-- *Acceptance:* per the PLAN phases — session-reuse + logical stream open
-  (phase 2), byte bridge with window propagation (phase 3), teardown/quota/
-  capability (phase 4); soak under reload + slow-peer. **Re-open:** an SDK use
-  case needs cross-node streams (until then the explicit `REMOTE_NOT_IMPLEMENTED`
-  is the honest contract).
+**T4 — Remote IPC stream forwarding (PLAN phases 2-4). — CLOSED** (PLAN phases
+2-4, 2026-06-03).
+- *What it was:* the SDK could not `open_stream` to a remote node's app
+  endpoint; `veil-ipc/src/handlers/stream.rs` answered `REMOTE_NOT_IMPLEMENTED`
+  for `dst_node_id != local`. The hard parts were composing two flow-control
+  domains and propagating teardown across four endpoints.
+- *How it closed:* cross-node `STREAM_OPEN` is bridged onto the wire
+  `AppOpen`/`AppData`/`AppClose` machinery by `open_remote_stream` plus a
+  per-stream pump task — the same building blocks `veil_proxy::VeilConnector`
+  has used since Epic 33 — with window propagation, per-client stream quota
+  reserved at request time, and reaping of idle/orphaned remote streams. See
+  `docs/en/PLAN_IPC_STREAM_FORWARDING.md`; regressions
+  `remote_bridge_pumps_inbound_then_closes_and_cleans_up`,
+  `remote_bridge_backpressure_sends_wire_app_close`, and the remote-stream
+  reap/ownership tests in `veil-ipc/src/streams.rs` +
+  `server_tests_unix.rs`.
+- *What survives of the old answer:* `REMOTE_NOT_IMPLEMENTED` is still returned
+  when a partial embedding has no stream bridge or session-tx broadcaster wired
+  (tests, setups without a full `NodeRuntime`). That is a fail-closed answer for
+  a missing dependency, not an unimplemented feature — do not read it as one.
 
 **T5 — RocksDB cold-tier eviction + republish bounding (audit M-A/M-B).** Priority
 medium (correctness, not just optimisation).
