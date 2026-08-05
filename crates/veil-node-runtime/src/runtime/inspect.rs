@@ -59,6 +59,18 @@ impl NodeRuntime {
         self.lock_state().peers.values().cloned().collect()
     }
 
+    /// Whether this node's ML-KEM decapsulation seed is stored on disk in the
+    /// form the configuration asks for.
+    ///
+    /// Answers a question an operator can otherwise only guess at: turning a
+    /// key passphrase on re-encrypts the existing plaintext file in place, and
+    /// that write can fail (read-only directory, full disk, wrong owner)
+    /// without stopping the node — the key in memory is correct either way.
+    /// The failure used to be discarded outright (audit report7 V-02).
+    pub fn mlkem_key_at_rest(&self) -> veil_e2e::MlKemKeyAtRest {
+        self.lock_state().mlkem_key_at_rest.clone()
+    }
+
     // cleanup: `broadcast_epidemic` runtime method removed.
     // module docstring listed this as operator-mutator admin
     // action, but no `AdminCommand` variant, CLI subcommand, or IPC handler

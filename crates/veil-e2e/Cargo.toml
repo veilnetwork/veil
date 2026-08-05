@@ -23,5 +23,10 @@ thiserror = "2.0"
 x25519-dalek = { version = "2", features = ["static_secrets"] }
 zeroize = "1.8"
 
+[dev-dependencies]
+# The key-loader tests need a directory whose permissions they can break and
+# restore without touching the shared temp dir the older tests use by name.
+tempfile = "3"
+
 [lints]
 workspace = true

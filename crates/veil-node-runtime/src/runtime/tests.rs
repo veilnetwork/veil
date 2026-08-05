@@ -2965,3 +2965,120 @@ async fn a_corrupt_identity_document_refuses_to_start_unless_allowed() {
 
     let _ = fs::remove_dir_all(&dir);
 }
+
+/// A node whose key could not be encrypted at rest says so, and keeps running.
+///
+/// The operator turned a key passphrase on for the first time. The loader
+/// re-encrypts the existing plaintext `mlkem.key` in place, and that write can
+/// fail — read-only directory here, but ENOSPC and wrong-owner land the same
+/// way. Before this the error was discarded outright (`let _ = atomic_write`,
+/// under a comment claiming it was logged, with no logging anywhere in the
+/// tree), so the node came up, worked, and left the decapsulation seed in
+/// plaintext while its operator believed otherwise (audit report7 V-02).
+///
+/// Both halves are asserted: the node STARTS (a daemon down because a
+/// directory is read-only would be a worse trade), and the state it reports is
+/// degraded.
+#[cfg(unix)]
+#[tokio::test(flavor = "current_thread")]
+async fn a_key_that_could_not_be_encrypted_at_rest_is_reported_crit_v02() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    // First run in a writable directory, with no passphrase: this is the node
+    // as it was before the operator changed their mind — identity files and a
+    // PLAINTEXT mlkem.key on disk.
+    let warm = save_test_config("mlkem-at-rest-warm", runtime_config_with_listen()).unwrap();
+    let warm_dir = warm.parent().unwrap().to_path_buf();
+    NodeRuntime::start(&warm, false)
+        .await
+        .expect("warm-up start")
+        .stop()
+        .await
+        .expect("warm-up stop");
+
+    // Same node, now with a passphrase configured — and a directory nothing can
+    // be written into, so the in-place re-encrypt cannot land.
+    let mut with_pass = runtime_config_with_listen();
+    with_pass.identity.as_mut().unwrap().key_passphrase = Some("first-passphrase".to_owned());
+    let cold = save_test_config("mlkem-at-rest-cold", with_pass).unwrap();
+    let cold_dir = cold.parent().unwrap().to_path_buf();
+    // The identity the warm-up materialised, so startup has nothing left to
+    // write into a directory it is about to lose write access to.
+    for name in [
+        "identity_document.bin",
+        "device_identity_sk.bin",
+        "anonymity_x25519.key",
+    ] {
+        let from = warm_dir.join(name);
+        if from.exists() {
+            fs::copy(&from, cold_dir.join(name)).unwrap();
+        }
+    }
+    // A PLAINTEXT key file: this is what the passphrase is about to fail to
+    // upgrade. (The warm-up does not leave one — a node with an identity seed
+    // DERIVES its key and persists nothing; only operator/seed nodes carry a
+    // file. This is that file.)
+    veil_e2e::load_or_generate_mlkem_key_encrypted(&cold_dir.join("mlkem.key"), None).unwrap();
+    assert!(
+        fs::read_to_string(cold_dir.join("mlkem.key"))
+            .unwrap()
+            .contains("BEGIN VEIL ML-KEM-768 KEY"),
+        "precondition: the key on disk is plaintext"
+    );
+    fs::set_permissions(&cold_dir, fs::Permissions::from_mode(0o500)).unwrap();
+    let writable_anyway = fs::File::create(cold_dir.join(".probe")).is_ok();
+    if writable_anyway {
+        // Running as a user the mode bits do not bind (root): the scenario
+        // cannot be built here, so assert nothing rather than assert something
+        // weaker.
+        let _ = fs::remove_file(cold_dir.join(".probe"));
+        fs::set_permissions(&cold_dir, fs::Permissions::from_mode(0o700)).unwrap();
+        let _ = fs::remove_dir_all(&cold_dir);
+        let _ = fs::remove_dir_all(&warm_dir);
+        eprintln!("SKIP: this user can write into a 0o500 directory (root?)");
+        return;
+    }
+
+    let mut runtime = NodeRuntime::start(&cold, false)
+        .await
+        .expect("a read-only key directory must NOT stop the node from starting");
+
+    let at_rest = runtime.mlkem_key_at_rest();
+    assert!(
+        at_rest.is_degraded(),
+        "the node must report that its key is not stored as configured, got {at_rest:?}"
+    );
+    assert_eq!(at_rest.as_str(), "plaintext_upgrade_failed");
+
+    runtime.stop().await.expect("runtime stops");
+    fs::set_permissions(&cold_dir, fs::Permissions::from_mode(0o700)).unwrap();
+    assert!(
+        fs::read_to_string(cold_dir.join("mlkem.key"))
+            .unwrap()
+            .contains("BEGIN VEIL ML-KEM-768 KEY"),
+        "the file really is still plaintext — that is what the silence hid"
+    );
+    let _ = fs::remove_dir_all(&cold_dir);
+    let _ = fs::remove_dir_all(&warm_dir);
+}
+
+/// CONTROL: the same node with a WRITABLE directory reports a healthy state,
+/// so the assertion above is about the failed write and not about every node
+/// that has a passphrase.
+#[cfg(unix)]
+#[tokio::test(flavor = "current_thread")]
+async fn a_key_encrypted_at_rest_reports_as_configured() {
+    let mut cfg = runtime_config_with_listen();
+    cfg.identity.as_mut().unwrap().key_passphrase = Some("first-passphrase".to_owned());
+    let path = save_test_config("mlkem-at-rest-ok", cfg).unwrap();
+    let dir = path.parent().unwrap().to_path_buf();
+
+    let mut runtime = NodeRuntime::start(&path, false).await.expect("start");
+    let at_rest = runtime.mlkem_key_at_rest();
+    assert!(
+        !at_rest.is_degraded(),
+        "a writable directory must yield a healthy at-rest state, got {at_rest:?}"
+    );
+    runtime.stop().await.expect("runtime stops");
+    let _ = fs::remove_dir_all(&dir);
+}
