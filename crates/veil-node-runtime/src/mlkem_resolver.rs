@@ -909,7 +909,10 @@ fn to_peer_cert(cert: VerifiedMlkemCert) -> veil_types::VerifiedPeerCert {
 }
 
 impl MlKemEkResolver for DhtMlKemEkResolver {
-    fn resolve_cert_cached(&self, target_node_id: NodeIdBytes) -> Option<veil_types::VerifiedPeerCert> {
+    fn resolve_cert_cached(
+        &self,
+        target_node_id: NodeIdBytes,
+    ) -> Option<veil_types::VerifiedPeerCert> {
         self.cached_cert(target_node_id).map(to_peer_cert)
     }
 
@@ -919,7 +922,11 @@ impl MlKemEkResolver for DhtMlKemEkResolver {
     ) -> std::pin::Pin<
         Box<dyn std::future::Future<Output = Option<veil_types::VerifiedPeerCert>> + Send + '_>,
     > {
-        Box::pin(async move { self.fetch_verified_cert(target_node_id).await.map(to_peer_cert) })
+        Box::pin(async move {
+            self.fetch_verified_cert(target_node_id)
+                .await
+                .map(to_peer_cert)
+        })
     }
 }
 

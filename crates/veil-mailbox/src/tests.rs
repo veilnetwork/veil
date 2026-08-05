@@ -1036,7 +1036,10 @@ fn anon_saturation_does_not_block_an_identified_sender() {
     let recv = [7u8; 32];
 
     let (anon_stored, anon_refused) = flood_anonymously(&mb, recv, 0xA0);
-    assert!(anon_stored > 0, "anonymous ingress must admit SOME deposits");
+    assert!(
+        anon_stored > 0,
+        "anonymous ingress must admit SOME deposits"
+    );
     assert!(
         anon_refused,
         "anonymous ingress ran to the iteration bound without ever being \
@@ -1084,7 +1087,10 @@ fn anon_flood_at_one_receiver_does_not_close_the_door_at_another() {
     let bystander = [2u8; 32];
 
     let (stored, refused) = flood_anonymously(&mb, victim, 0xB0);
-    assert!(stored > 0 && refused, "the flood must fill and then be refused");
+    assert!(
+        stored > 0 && refused,
+        "the flood must fill and then be refused"
+    );
 
     // A different receiver's anonymous slice is untouched by that flood.
     let out = mb
@@ -1130,7 +1136,10 @@ fn anon_budget_is_refunded_on_ack_and_reopens_the_entrance() {
     let recv = [3u8; 32];
 
     let (stored, refused) = flood_anonymously(&mb, recv, 0xD0);
-    assert!(stored > 0 && refused, "the flood must fill and then be refused");
+    assert!(
+        stored > 0 && refused,
+        "the flood must fill and then be refused"
+    );
     let saturated = mb.receiver_anon_bytes(recv).unwrap();
     assert!(saturated > 0, "the anonymous slice must be accounted");
 
@@ -1138,7 +1147,13 @@ fn anon_budget_is_refunded_on_ack_and_reopens_the_entrance() {
     let mut blocked_cid = [0xD0u8; 32];
     blocked_cid[..8].copy_from_slice(&999u64.to_be_bytes());
     let out = mb
-        .put_classified(recv, blocked_cid, [0u8; 32], vec![0u8; 64], TrustClass::Anonymous)
+        .put_classified(
+            recv,
+            blocked_cid,
+            [0u8; 32],
+            vec![0u8; 64],
+            TrustClass::Anonymous,
+        )
         .unwrap();
     assert!(
         !matches!(out, PutOutcome::Stored { .. }),
@@ -1148,14 +1163,23 @@ fn anon_budget_is_refunded_on_ack_and_reopens_the_entrance() {
     // Take one blob off the receiver's hands; the room must come back.
     let mut first_cid = [0xD0u8; 32];
     first_cid[..8].copy_from_slice(&0u64.to_be_bytes());
-    assert!(mb.ack(recv, first_cid).unwrap(), "the first blob must exist");
+    assert!(
+        mb.ack(recv, first_cid).unwrap(),
+        "the first blob must exist"
+    );
     assert_eq!(
         mb.receiver_anon_bytes(recv).unwrap(),
         saturated - crate::billable_bytes(64),
         "ack must refund exactly what the put charged"
     );
     let out = mb
-        .put_classified(recv, blocked_cid, [0u8; 32], vec![0u8; 64], TrustClass::Anonymous)
+        .put_classified(
+            recv,
+            blocked_cid,
+            [0u8; 32],
+            vec![0u8; 64],
+            TrustClass::Anonymous,
+        )
         .unwrap();
     assert!(
         matches!(out, PutOutcome::Stored { .. }),
@@ -1238,8 +1262,14 @@ fn v05_anon_counter_under_reporting_is_rebuilt_at_open() {
         mb.put_classified(recv, cid, [0u8; 32], vec![0u8; 64], TrustClass::Anonymous)
             .unwrap();
     }
-    mb.put_classified(other, [9u8; 32], [0u8; 32], vec![0u8; 32], TrustClass::Anonymous)
-        .unwrap();
+    mb.put_classified(
+        other,
+        [9u8; 32],
+        [0u8; 32],
+        vec![0u8; 32],
+        TrustClass::Anonymous,
+    )
+    .unwrap();
     let truth_recv = mb.receiver_anon_bytes(recv).unwrap();
     let truth_other = mb.receiver_anon_bytes(other).unwrap();
     assert_eq!(truth_recv, billable_bytes(64) * 3);
@@ -1272,16 +1302,18 @@ fn v05_anon_counter_over_reporting_and_orphan_rows_are_cleared() {
     let (mb, tmp, _clk) = fresh(cfg.clone());
     let recv = [0xB1u8; 32];
     let ghost = [0xB2u8; 32];
-    mb.put_classified(recv, [1u8; 32], [0u8; 32], vec![0u8; 64], TrustClass::Anonymous)
-        .unwrap();
+    mb.put_classified(
+        recv,
+        [1u8; 32],
+        [0u8; 32],
+        vec![0u8; 64],
+        TrustClass::Anonymous,
+    )
+    .unwrap();
     let truth = mb.receiver_anon_bytes(recv).unwrap();
     drop(mb);
 
-    scribble_anon_counter(
-        tmp.path(),
-        &[(recv, 99_999_999), (ghost, 12_345)],
-        false,
-    );
+    scribble_anon_counter(tmp.path(), &[(recv, 99_999_999), (ghost, 12_345)], false);
     let mb = reopen(tmp.path(), cfg);
     assert_eq!(
         mb.receiver_anon_bytes(recv).unwrap(),
@@ -1391,7 +1423,13 @@ fn v05_zero_sender_cannot_be_charged_to_the_shared_marker_bucket() {
 
     // The classification a verified token produces, with no sender to charge.
     let out = mb
-        .put_classified(recv, [1u8; 32], [0u8; 32], vec![0u8; 64], TrustClass::Identified)
+        .put_classified(
+            recv,
+            [1u8; 32],
+            [0u8; 32],
+            vec![0u8; 64],
+            TrustClass::Identified,
+        )
         .unwrap();
     assert!(matches!(out, PutOutcome::Stored { .. }));
 
@@ -1422,8 +1460,14 @@ fn v05_control_a_real_sender_is_still_identified() {
     let recv = [0xF1u8; 32];
     let sender = [0xF2u8; 32];
 
-    mb.put_classified(recv, [1u8; 32], sender, vec![0u8; 64], TrustClass::Identified)
-        .unwrap();
+    mb.put_classified(
+        recv,
+        [1u8; 32],
+        sender,
+        vec![0u8; 64],
+        TrustClass::Identified,
+    )
+    .unwrap();
     assert_eq!(sender_bytes_row(&mb, sender), billable_bytes(64));
     assert_eq!(
         mb.receiver_anon_bytes(recv).unwrap(),
@@ -1448,7 +1492,12 @@ fn bulk_cfg() -> MailboxConfig {
 /// Deposit `n` blobs of exactly [`MAX_BLOB_BYTES`] for `recv`, each with a
 /// distinct content_id and a distinct deposit time so the oldest-first order
 /// is total. Returns the content_ids in deposit order.
-fn deposit_megabyte_blobs(mb: &Mailbox, clk: &Arc<AtomicU64>, recv: [u8; 32], n: u8) -> Vec<[u8; 32]> {
+fn deposit_megabyte_blobs(
+    mb: &Mailbox,
+    clk: &Arc<AtomicU64>,
+    recv: [u8; 32],
+    n: u8,
+) -> Vec<[u8; 32]> {
     let sender = [0x5Au8; 32];
     let mut ids = Vec::with_capacity(n as usize);
     for i in 0..n {
@@ -1537,7 +1586,10 @@ fn v01_seventeen_megabyte_blobs_drain_over_several_fetches_none_failing() {
     want.sort_unstable();
     let mut got = drained.clone();
     got.sort_unstable();
-    assert_eq!(got, want, "every deposited blob must come back exactly once");
+    assert_eq!(
+        got, want,
+        "every deposited blob must come back exactly once"
+    );
     assert_eq!(
         rounds, 3,
         "17 MiB under an 8 MiB ceiling is 8 + 8 + 1 — three fetches"

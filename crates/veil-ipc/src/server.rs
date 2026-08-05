@@ -403,9 +403,7 @@ impl IpcClientState {
             client_token,
             streams_opened: 0,
             bind_decode_failures: 0,
-            owned_streams_opener: Arc::new(std::sync::Mutex::new(
-                std::collections::HashSet::new(),
-            )),
+            owned_streams_opener: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
             owned_streams_acceptor: Arc::new(std::sync::Mutex::new(
                 std::collections::HashSet::new(),
             )),

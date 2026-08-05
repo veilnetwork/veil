@@ -1981,8 +1981,10 @@ pub unsafe extern "C" fn veil_media_open_relay_channel(
                     for cell in media_wire_cells(frame.packets, batching_enabled) {
                         // One batch contains at most four video packets, so this
                         // preserves the former one-audio-slot-per-four cadence.
-                        if let Some(sealed) =
-                            rx_hi.try_recv().ok().and_then(|high| cipher_task.seal(&high))
+                        if let Some(sealed) = rx_hi
+                            .try_recv()
+                            .ok()
+                            .and_then(|high| cipher_task.seal(&high))
                         {
                             let ipc_started = std::time::Instant::now();
                             let result = sender
@@ -4033,8 +4035,7 @@ async fn run_recv_dispatch_loop(
         // Note what this does NOT cover, and why the close ALSO joins the
         // task: from here to the `cb(...)` below there is no `.await`, so a
         // cancellation arriving mid-dispatch takes effect only afterwards.
-        let Some(RecvCbSlot { cb, user_addr }) =
-            *cb_cell.lock().unwrap_or_else(|e| e.into_inner())
+        let Some(RecvCbSlot { cb, user_addr }) = *cb_cell.lock().unwrap_or_else(|e| e.into_inner())
         else {
             continue; // no handler currently installed — drop the frame
         };
@@ -11306,10 +11307,7 @@ unsafe fn write_conversation_keys(
 ///
 /// `keys` MUST point to `count * VEIL_RATCHET_KEY_LEN` readable bytes.
 #[cfg(feature = "node-embedded")]
-unsafe fn read_conversation_keys(
-    keys: *const u8,
-    count: size_t,
-) -> Vec<veil_e2e::ConversationKey> {
+unsafe fn read_conversation_keys(keys: *const u8, count: size_t) -> Vec<veil_e2e::ConversationKey> {
     (0..count)
         .map(|i| unsafe { ratchet_key_from(keys.add(i * VEIL_RATCHET_KEY_LEN)) })
         .collect()
@@ -11996,8 +11994,9 @@ mod v01_close_quiescence {
             user_addr: (&*probe as *const CbProbe) as usize,
         })));
         let (tx, rx) = mpsc::channel::<IncomingMessage>(8);
-        let task_slot: StdMutex<Option<tokio::task::JoinHandle<()>>> =
-            StdMutex::new(Some(rt.spawn(run_recv_dispatch_loop(rx, Arc::clone(&cb_cell)))));
+        let task_slot: StdMutex<Option<tokio::task::JoinHandle<()>>> = StdMutex::new(Some(
+            rt.spawn(run_recv_dispatch_loop(rx, Arc::clone(&cb_cell))),
+        ));
 
         rt.block_on(async {
             tx.send(frame(1)).await.expect("send 1");
@@ -12183,8 +12182,9 @@ mod v01_close_quiescence {
             user_addr: (&*probe as *const CbProbe) as usize,
         })));
         let (tx, rx) = mpsc::channel::<IncomingMessage>(8);
-        let task_slot: StdMutex<Option<tokio::task::JoinHandle<()>>> =
-            StdMutex::new(Some(rt.spawn(run_recv_dispatch_loop(rx, Arc::clone(&cb_cell)))));
+        let task_slot: StdMutex<Option<tokio::task::JoinHandle<()>>> = StdMutex::new(Some(
+            rt.spawn(run_recv_dispatch_loop(rx, Arc::clone(&cb_cell))),
+        ));
 
         // Control: outside a runtime the same inputs join synchronously — so
         // the `false` below is the reentrancy branch, not a broken harness.
@@ -12197,13 +12197,9 @@ mod v01_close_quiescence {
         rt.block_on(async {
             assert!(in_tokio_runtime());
             let task = retire_dispatch_callback(&cb_cell, &task_slot);
-            let synchronous = await_retired_task(
-                &rt,
-                task,
-                async move {
-                    done_probe.fetch_add(1, Ordering::SeqCst);
-                },
-            );
+            let synchronous = await_retired_task(&rt, task, async move {
+                done_probe.fetch_add(1, Ordering::SeqCst);
+            });
             assert!(
                 !synchronous,
                 "a reentrant caller must DEFER the join; joining here parks the \
@@ -12574,7 +12570,10 @@ mod xv01_ffi_edge {
     #[test]
     fn provenance_byte_matches_core_enum() {
         assert_eq!(SenderProvenance::Claimed.as_u8(), VEIL_PROVENANCE_CLAIMED);
-        assert_eq!(SenderProvenance::LocalIpc.as_u8(), VEIL_PROVENANCE_LOCAL_IPC);
+        assert_eq!(
+            SenderProvenance::LocalIpc.as_u8(),
+            VEIL_PROVENANCE_LOCAL_IPC
+        );
         assert_eq!(
             SenderProvenance::SessionPeer.as_u8(),
             VEIL_PROVENANCE_SESSION_PEER

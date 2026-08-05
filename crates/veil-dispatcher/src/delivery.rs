@@ -1760,7 +1760,10 @@ impl FrameDispatcher {
         }
         // No E2E marker — plaintext envelope (legitimate inter-app traffic).
         // No ACK key (non-E2E): DELIVERED clears the entry but earns no reputation.
-        Some(DecryptedForward::unproven(envelope.payload.clone(), [0u8; 32]))
+        Some(DecryptedForward::unproven(
+            envelope.payload.clone(),
+            [0u8; 32],
+        ))
     }
 
     /// originating IPC app of the delivery-stage transition.
@@ -3996,7 +3999,10 @@ mod ratchet_terminal_tests {
         let (hdr, body) = forward_frame([0x02u8; 32], payload);
         disp.dispatch(&hdr, &body, NodeId::from(RELAY));
 
-        assert_eq!(take(&mut rx).expect("delivered").1, SenderProvenance::Signed);
+        assert_eq!(
+            take(&mut rx).expect("delivered").1,
+            SenderProvenance::Signed
+        );
         assert_eq!(
             rlock!(disp.route_cache).lookup(&ALICE),
             None,
@@ -4190,8 +4196,10 @@ mod ratchet_terminal_tests {
             traffic_class: None,
         }
         .encode();
-        let mut hdr =
-            veil_proto::header::FrameHeader::new(FrameFamily::Delivery as u8, DeliveryMsg::Forward as u16);
+        let mut hdr = veil_proto::header::FrameHeader::new(
+            FrameFamily::Delivery as u8,
+            DeliveryMsg::Forward as u16,
+        );
         hdr.body_len = body.len() as u32;
         disp.dispatch(&hdr, &body, NodeId::from(RELAY));
 

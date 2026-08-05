@@ -46,7 +46,6 @@ use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
 use crate::cfg::NodeRole;
 use crate::crypto::session_cipher::SessionCipher;
-use veil_proto::codec::frame_aad;
 use crate::crypto::{kex, session_kdf};
 use crate::node::dispatcher::make_test_dispatcher;
 use crate::node::observability::NodeMetrics;
@@ -56,6 +55,7 @@ use crate::proto::family::{ControlMsg, FrameFamily, SessionMsg};
 use crate::proto::header::{FrameHeader, HEADER_SIZE};
 use crate::proto::session::RekeyPayload;
 use crate::transport::BoxIoStream;
+use veil_proto::codec::frame_aad;
 
 // ── Tiny seeded RNG (xorshift64) ─────────────────────────────────────────────
 //
@@ -243,7 +243,11 @@ impl ChaosDriver {
             ephemeral_pubkey: kp.public_key,
         }
         .encode();
-        let aad = chaos_aad_plaintext(FrameFamily::Session as u8, SessionMsg::RekeyInit as u16, body.len());
+        let aad = chaos_aad_plaintext(
+            FrameFamily::Session as u8,
+            SessionMsg::RekeyInit as u16,
+            body.len(),
+        );
         let enc = self
             .client_tx
             .seal(&body, &aad)

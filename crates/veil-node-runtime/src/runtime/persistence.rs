@@ -193,7 +193,10 @@ fn write_snapshot<T: serde::Serialize>(path: &Path, entries: &T, what: &str) -> 
     let json = match serde_json::to_string_pretty(entries) {
         Ok(j) => j,
         Err(e) => {
-            log::warn!("veil-persistence: cannot serialise {what} for {}: {e}", path.display());
+            log::warn!(
+                "veil-persistence: cannot serialise {what} for {}: {e}",
+                path.display()
+            );
             return PersistOutcome::Volatile {
                 reason: format!("serialise failed: {e}"),
             };

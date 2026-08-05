@@ -21,11 +21,7 @@ use tokio::{
 };
 
 use veil_abuse::{BanList, ViolationTracker};
-use veil_crypto::{
-    kex,
-    session_cipher::SessionCipher,
-    session_kdf,
-};
+use veil_crypto::{kex, session_cipher::SessionCipher, session_kdf};
 use veil_observability::{NodeLogger, NodeMetrics};
 use veil_proto::{
     budget::{MLKEM_REKEY_BYTES_THRESHOLD, MLKEM_REKEY_TIME_THRESHOLD_SECS},

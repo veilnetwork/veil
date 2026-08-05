@@ -343,7 +343,10 @@ async fn try_ratchet_seal(
     ) {
         Ok(sealed) => Some(sealed),
         Err(e) => {
-            log::debug!("ratchet.seal_failed dst={} {e}", veil_util::bytes_to_hex(&dst_node_id[..4]));
+            log::debug!(
+                "ratchet.seal_failed dst={} {e}",
+                veil_util::bytes_to_hex(&dst_node_id[..4])
+            );
             None
         }
     }
@@ -1458,9 +1461,7 @@ mod ratchet_send_tests {
             &self,
             target: [u8; 32],
         ) -> std::pin::Pin<
-            Box<
-                dyn std::future::Future<Output = Option<veil_types::VerifiedPeerCert>> + Send + '_,
-            >,
+            Box<dyn std::future::Future<Output = Option<veil_types::VerifiedPeerCert>> + Send + '_>,
         > {
             let out = self.resolve_cert_cached(target);
             Box::pin(async move { out })
@@ -1513,8 +1514,9 @@ mod ratchet_send_tests {
             ratchet_x25519_pk: peer_ring.current_ratchet_pk(),
             cert_version: 1,
         };
-        let route_cache =
-            RwLock::new(veil_routing::RouteCache::new(std::time::Duration::from_secs(60)));
+        let route_cache = RwLock::new(veil_routing::RouteCache::new(
+            std::time::Duration::from_secs(60),
+        ));
         wlock!(route_cache).insert(PEER, RELAY, 10_000, 2);
         let peer_mlkem = std::sync::RwLock::new(veil_e2e::PeerMlKemCache::new());
         wlock!(peer_mlkem).insert(
@@ -1603,9 +1605,14 @@ mod ratchet_send_tests {
         let fx = fixture(vec![PEER, RELAY]);
         let mut wh = sink().await;
         let mut rl = None;
-        handle_ipc_send(&mut wh, &payload(false, b"hello over a session"), &fx.ctx(true), &mut rl)
-            .await
-            .expect("send");
+        handle_ipc_send(
+            &mut wh,
+            &payload(false, b"hello over a session"),
+            &fx.ctx(true),
+            &mut rl,
+        )
+        .await
+        .expect("send");
 
         let sent = fx.taken();
         assert_eq!(sent.len(), 1);
@@ -1665,9 +1672,14 @@ mod ratchet_send_tests {
         let fx = fixture(vec![RELAY]); // no direct session to PEER
         let mut wh = sink().await;
         let mut rl = None;
-        handle_ipc_send(&mut wh, &payload(false, b"through a relay"), &fx.ctx(true), &mut rl)
-            .await
-            .expect("send");
+        handle_ipc_send(
+            &mut wh,
+            &payload(false, b"through a relay"),
+            &fx.ctx(true),
+            &mut rl,
+        )
+        .await
+        .expect("send");
 
         let sent = fx.taken();
         assert_eq!(sent.len(), 1);
@@ -1698,9 +1710,14 @@ mod ratchet_send_tests {
         let fx = fixture(vec![RELAY]);
         let mut wh = sink().await;
         let mut rl = None;
-        handle_ipc_send(&mut wh, &payload(true, b"anonymously yours"), &fx.ctx(true), &mut rl)
-            .await
-            .expect("send");
+        handle_ipc_send(
+            &mut wh,
+            &payload(true, b"anonymously yours"),
+            &fx.ctx(true),
+            &mut rl,
+        )
+        .await
+        .expect("send");
 
         let sent = fx.taken();
         assert_eq!(sent.len(), 1);

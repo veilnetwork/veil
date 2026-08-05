@@ -336,8 +336,8 @@ async fn wait_for_route(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{Mutex, RwLock};
     use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{Mutex, RwLock};
     use std::time::Duration;
 
     #[derive(Default)]

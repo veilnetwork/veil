@@ -1264,16 +1264,16 @@ impl NodeRuntime {
                             "node.sovereign_identity.load_failed",
                             format!("{e} — refusing to start as a legacy node"),
                         );
-                        return Err(NodeError::Config(
-                            veil_cfg::ConfigError::ValidationFailed(format!(
-                            "sovereign identity at {} exists but cannot be \
+                        return Err(NodeError::Config(veil_cfg::ConfigError::ValidationFailed(
+                            format!(
+                                "sovereign identity at {} exists but cannot be \
                              loaded: {e}. Re-provision with `veil-cli identity \
                              create`/`restore`, or set \
                              [global].allow_identity_fallback = true to start \
                              as an unrelated legacy node on purpose.",
                                 doc_path.display()
-                            )),
-                        ));
+                            ),
+                        )));
                     }
                 }
             } else if config.ephemeral_identity {
