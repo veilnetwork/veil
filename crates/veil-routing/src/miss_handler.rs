@@ -265,6 +265,29 @@ async fn run(ctx: MissHandlerCtx) {
     }
 }
 
+/// Draw a fresh `RouteRequest` correlation id from the OS CSPRNG.
+///
+/// This used to be a process-local `AtomicU32` starting at 1, contradicting the
+/// wire documentation (`RouteRequestPayload::request_id` is specified as a
+/// *random* token) and — far worse — making every node's ids **predictable**.
+///
+/// The receiving side dedups a `RouteRequest` and the dedup entry lives for the
+/// whole seen-set TTL. So an attacker who can guess the ids a fresh node will
+/// use only has to occupy them first for a popular `target`: every subsequent
+/// legitimate lookup for that target collapses into the attacker's entry and is
+/// dropped before it is ever forwarded. With a counter from 1, "guessing" is
+/// just counting — the first few ids of every restarted node are 1, 2, 3, …
+///
+/// An unpredictable 32-bit draw makes the occupy-first game cost the attacker
+/// the entire id space instead of the first N values. It is the *correlation*
+/// token only — nothing authenticates on it — so 32 bits from `OsRng` is the
+/// right primitive rather than a counter with a random seed (which leaks the
+/// same "next value is +1" structure once one id is observed).
+fn fresh_request_id() -> u32 {
+    use rand_core::{OsRng, RngCore};
+    OsRng.next_u32()
+}
+
 /// Build and flood a signed `ROUTE_REQUEST` to every currently-connected peer.
 fn flood_route_request(
     dst: &[u8; 32],
@@ -272,8 +295,7 @@ fn flood_route_request(
     signing_key: Option<&SigningKey>,
     broadcaster: &dyn FrameBroadcaster,
 ) {
-    static NEXT_REQUEST_ID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
-    let request_id = NEXT_REQUEST_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let request_id = fresh_request_id();
     let mut req = RouteRequestPayload {
         target_node_id: *dst,
         requester_node_id: local_node_id,
@@ -314,7 +336,7 @@ async fn wait_for_route(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::RwLock;
+    use std::sync::{Mutex, RwLock};
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::Duration;
 
@@ -351,6 +373,87 @@ mod tests {
     struct NoopLogger;
     impl RoutingLogger for NoopLogger {
         fn warn(&self, _: &str, _: &str) {}
+    }
+
+    /// Broadcaster that keeps every frame handed to `send_to_all`, so a test
+    /// can decode the `RouteRequestPayload` the flooder actually put on the
+    /// wire (rather than re-deriving it from a helper next to the real one).
+    #[derive(Default)]
+    struct CapturingBroadcaster {
+        frames: Mutex<Vec<Vec<u8>>>,
+    }
+    impl FrameBroadcaster for CapturingBroadcaster {
+        fn send_to(&self, _: &[u8; 32], _: u8, _: Vec<u8>) -> bool {
+            true
+        }
+        fn send_to_all_with_priority(&self, _: u8, bytes: Arc<[u8]>) {
+            self.frames.lock().unwrap().push(bytes.to_vec());
+        }
+        fn active_node_ids(&self) -> Vec<[u8; 32]> {
+            Vec::new()
+        }
+    }
+
+    /// The `request_id`s the flood path actually emits, in order.
+    fn flooded_request_ids(n: usize) -> Vec<u32> {
+        let bc = CapturingBroadcaster::default();
+        for i in 0..n {
+            let mut dst = [0u8; 32];
+            dst[0] = i as u8;
+            flood_route_request(&dst, [0u8; 32], None, &bc);
+        }
+        let frames = bc.frames.lock().unwrap();
+        assert_eq!(frames.len(), n, "one frame per flood call");
+        frames
+            .iter()
+            .map(|f| {
+                let body = &f[veil_proto::header::HEADER_SIZE..];
+                RouteRequestPayload::decode(body)
+                    .expect("flooded body must be a RouteRequestPayload")
+                    .request_id
+            })
+            .collect()
+    }
+
+    /// `request_id` is documented on the wire as a RANDOM correlation token,
+    /// and the receiving dedup keeps `(target, requester, request_id)` alive
+    /// for the whole seen-set TTL. A process-local counter starting at 1 made
+    /// those ids PREDICTABLE: an attacker only had to occupy the first N ids
+    /// for a popular target to swallow every restarted node's route lookups —
+    /// and with `ttl = 0` those occupying frames never reach the DHT quota
+    /// gate, so the suppression is free and silent.
+    ///
+    /// Two independent properties, because either one alone is passable by a
+    /// weakened implementation: a plain counter fails the magnitude check, and
+    /// a counter merely SEEDED from randomness fails the spacing check.
+    #[test]
+    fn flooded_request_ids_are_unpredictable_not_a_counter() {
+        const N: usize = 32;
+        let ids = flooded_request_ids(N);
+
+        // (1) Magnitude — with uniform 32-bit draws, P(all 32 land in the
+        // bottom sixteenth) = 16^-32 ≈ 2^-128. A counter from 1 emits
+        // 1..=32 and fails here outright.
+        assert!(
+            ids.iter().any(|&id| id > u32::MAX / 16),
+            "request_ids look like small counter values: {ids:?}",
+        );
+
+        // (2) Spacing — a counter (however it is seeded) advances by a fixed
+        // step. Uniform draws do not.
+        let steps: Vec<i64> = ids
+            .windows(2)
+            .map(|w| i64::from(w[1]) - i64::from(w[0]))
+            .collect();
+        assert!(
+            steps.windows(2).any(|s| s[0] != s[1]),
+            "consecutive request_ids advance by a constant step: {ids:?}",
+        );
+
+        // (3) No repeats within a short burst — a broken source that returns a
+        // constant would pass (1) and (2)'s magnitude but not this.
+        let unique: std::collections::HashSet<u32> = ids.iter().copied().collect();
+        assert_eq!(unique.len(), N, "request_ids repeated within one burst");
     }
 
     struct NoopBroadcaster;

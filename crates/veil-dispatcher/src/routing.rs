@@ -496,7 +496,9 @@ impl FrameDispatcher {
             Err(e) => return DispatchResult::Violation(format!("bad RouteRequest: {e}")),
         };
         // Dedup: treat (target, requester, request_id) as the seen-key,
-        // namespaced under the REQUEST kind (diff-audit M3).
+        // namespaced under the REQUEST kind (diff-audit M3). All three fields
+        // are load-bearing — `RouteSeenSet` deliberately skips its via-collapsing
+        // replay layer for REQUEST so the requester stays in the key.
         {
             let already_seen = lock!(self.route_seen_set).check_and_insert(
                 crate::RouteSeenSet::KIND_REQUEST,
