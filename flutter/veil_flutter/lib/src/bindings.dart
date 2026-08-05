@@ -22,6 +22,21 @@ const int veilErrReentrant = -4;
 /// Mirrors `VEIL_MAX_DATA_LEN` in `crates/veilclient-ffi/src/lib.rs`.
 const int veilMaxDataLen = 16 * 1024 * 1024;
 
+// ── Mailbox ceilings (mirror the VEIL_MAILBOX_* constants) ──────────────────
+
+/// Total payload bytes one mailbox fetch batch can return — the size of the
+/// `blob_buf` [veilMailboxFetchInto] needs.  The daemon cuts a batch here, so
+/// a buffer of exactly this size is correct for every backlog; sizing it from
+/// anything else is a guess, and the guess used to be short (report7 V-01).
+const int veilMailboxMaxFetchBytes = 8 * 1024 * 1024;
+
+/// Records one mailbox fetch batch can return — the descriptor-slot count.
+const int veilMailboxMaxFetchCount = 1024;
+
+/// Largest blob the relay accepts in a single PUT.  NOT [veilMaxDataLen],
+/// which is sixteen times larger and bounds a different surface.
+const int veilMailboxMaxBlobBytes = 1024 * 1024;
+
 // ── Network kind enum (veil_proto::NetworkKind wire bytes) ────────────────
 
 const int veilNetOffline = 0;

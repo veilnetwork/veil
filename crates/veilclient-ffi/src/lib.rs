@@ -164,6 +164,37 @@ pub const VEIL_ERR_REENTRANT: c_int = -4;
 /// than an OOM-sized allocation.
 pub const VEIL_MAX_DATA_LEN: size_t = 16 * 1024 * 1024 - 256;
 
+/// Ceiling on the TOTAL payload bytes one mailbox fetch batch can return.
+///
+/// The size of the `blob_buf` a caller must hand [`veil_mailbox_fetch_into`].
+/// A caller that allocates this much is correct for every possible batch, for
+/// every possible backlog, forever — which the record count returned by
+/// [`veil_mailbox_fetch_count`] could never tell it, because a record is
+/// anything up to [`VEIL_MAILBOX_MAX_BLOB_BYTES`]. Callers that guessed a
+/// buffer size instead failed `blob_buf too small` on exactly the backlogs
+/// they most needed to drain (audit report7 V-01).
+///
+/// Mirrors `veil_mailbox::MAX_FETCH_BYTES`, and the mirror is CHECKED — see
+/// `mailbox_abi_constants_track_the_daemon` in this file's test module.
+pub const VEIL_MAILBOX_MAX_FETCH_BYTES: size_t = 8 * 1024 * 1024;
+
+/// Ceiling on the number of records one mailbox fetch batch can return.
+///
+/// The number of `VeilMailboxBlob` descriptor slots a caller must hand
+/// [`veil_mailbox_fetch_into`]. Mirrors `veil_mailbox::MAX_FETCH_COUNT`
+/// (checked — see [`VEIL_MAILBOX_MAX_FETCH_BYTES`]).
+pub const VEIL_MAILBOX_MAX_FETCH_COUNT: u32 = 1024;
+
+/// Ceiling on a single deposited mailbox blob.
+///
+/// The relay rejects a PUT above this, so it is the bound a caller should
+/// validate against before calling `veil_mailbox_put*` — NOT
+/// [`VEIL_MAX_DATA_LEN`], which is sixteen times larger and governs a
+/// different surface (the IPC send payload). Mirrors
+/// `veil_mailbox::MAX_BLOB_BYTES` (checked — see
+/// [`VEIL_MAILBOX_MAX_FETCH_BYTES`]).
+pub const VEIL_MAILBOX_MAX_BLOB_BYTES: size_t = 1024 * 1024;
+
 // ── Internal types ───────────────────────────────────────────────────────────
 
 /// Shared runtime + client state. Held by `Arc` so that apps and
@@ -9510,6 +9541,39 @@ pub unsafe extern "C" fn veil_pair_target_build_confirm(
 mod tests {
     use super::*;
     use std::ffi::CStr;
+
+    /// The `VEIL_MAILBOX_*` constants are what a C or Dart caller sizes its
+    /// fetch buffers from; the daemon's are what actually bound a batch. Held
+    /// equal HERE, mechanically, because the alternative — a doc comment saying
+    /// they mirror — is what let the Dart data ceiling sit 256 bytes above this
+    /// crate's for however long it did (report7 V-07). A drift is a failing
+    /// test in the standard gate, not a `blob_buf too small` on a phone.
+    #[test]
+    fn mailbox_abi_constants_track_the_daemon() {
+        assert_eq!(
+            VEIL_MAILBOX_MAX_FETCH_BYTES as u64,
+            veil_mailbox::MAX_FETCH_BYTES,
+            "exported fetch-byte ceiling drifted from veil_mailbox::MAX_FETCH_BYTES"
+        );
+        assert_eq!(
+            VEIL_MAILBOX_MAX_FETCH_COUNT as usize,
+            veil_mailbox::MAX_FETCH_COUNT,
+            "exported fetch-count ceiling drifted from veil_mailbox::MAX_FETCH_COUNT"
+        );
+        assert_eq!(
+            VEIL_MAILBOX_MAX_BLOB_BYTES as u64,
+            veil_mailbox::MAX_BLOB_BYTES,
+            "exported blob ceiling drifted from veil_mailbox::MAX_BLOB_BYTES"
+        );
+    }
+
+    /// A batch has to fit the transport that carries it, or the ceiling moved
+    /// the wedge instead of removing it; and a batch has to hold at least one
+    /// worst-case record, or an oversized head is served alone forever. Both
+    /// are relations between compile-time constants, so they are checked at
+    /// compile time.
+    const _: () = assert!(VEIL_MAILBOX_MAX_FETCH_BYTES <= VEIL_MAX_DATA_LEN);
+    const _: () = assert!(VEIL_MAILBOX_MAX_BLOB_BYTES <= VEIL_MAILBOX_MAX_FETCH_BYTES);
 
     #[cfg(feature = "node-embedded")]
     #[test]
