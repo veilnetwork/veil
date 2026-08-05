@@ -541,8 +541,7 @@ impl FrameDispatcher {
                     // tell a good signature from a bad one. Treat as
                     // unattributable rather than guessing either way.
                     SigResult::UnknownKey => {
-                        if !lock!(self.abuse.unsigned_route_request_budget)
-                            .allow_at(Instant::now())
+                        if !lock!(self.abuse.unsigned_route_request_budget).allow_at(Instant::now())
                         {
                             return DispatchResult::NoResponse;
                         }
@@ -654,10 +653,7 @@ impl FrameDispatcher {
             if !lock!(self.abuse.dht_quota).allow(*peer_id.as_bytes()) {
                 return DispatchResult::Violation("RouteRequest DHT quota exceeded".to_string());
             }
-            let fwd = RouteRequestPayload {
-                ttl: ttl - 1,
-                ..p
-            };
+            let fwd = RouteRequestPayload { ttl: ttl - 1, ..p };
             let frame = encode_routing_frame(RoutingMsg::RouteRequest, &fwd.encode());
             if let Some(reg) = &self.session_tx_registry {
                 wlock!(reg).send_to_all_except_with_priority(
@@ -2767,7 +2763,6 @@ impl FrameDispatcher {
 
         DispatchResult::NoResponse
     }
-
 }
 
 // ── SigResult ────────────────────────────────────────────────────────────────

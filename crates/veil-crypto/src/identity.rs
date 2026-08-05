@@ -625,7 +625,10 @@ mod tests {
         let anon = derive_anonymity_x25519_sk(&seed);
         let master = derive_master_sk_ed25519(&seed);
 
-        assert_ne!(*ratchet, *anon, "ratchet key collided with the anonymity key");
+        assert_ne!(
+            *ratchet, *anon,
+            "ratchet key collided with the anonymity key"
+        );
         assert_ne!(
             *ratchet,
             mailbox[..32],
@@ -636,7 +639,10 @@ mod tests {
             mailbox[32..],
             "ratchet key collided with its own input"
         );
-        assert_ne!(*ratchet, *master, "ratchet key collided with the master key");
+        assert_ne!(
+            *ratchet, *master,
+            "ratchet key collided with the master key"
+        );
     }
 
     #[test]

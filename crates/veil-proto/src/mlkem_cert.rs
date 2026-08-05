@@ -479,7 +479,11 @@ mod tests {
         // A signature made over version-1 bytes must not verify as a
         // version-2 certificate, or the new field could simply be stripped.
         assert_eq!(MLKEM_CERT_SIG_CONTEXT, b"veil.mlkem_cert.v2");
-        assert!(sample_cert().signing_message().starts_with(b"veil.mlkem_cert.v2"));
+        assert!(
+            sample_cert()
+                .signing_message()
+                .starts_with(b"veil.mlkem_cert.v2")
+        );
     }
 
     #[test]

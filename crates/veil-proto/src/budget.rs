@@ -208,7 +208,6 @@ pub const MAX_ROUTES_PER_DST: usize = 4;
 /// redundant paths.
 pub const MAX_ROUTES_PER_VIA: usize = 256;
 
-
 /// Maximum number of bytes in a single TLV entry value.
 ///
 /// Must not exceed `u16::MAX` (65 535): the wire format stores the TLV length

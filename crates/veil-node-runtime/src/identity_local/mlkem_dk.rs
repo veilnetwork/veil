@@ -127,13 +127,20 @@ pub fn load_or_derive(
     //    it under that identity, and derive a DIFFERENT key on the next restart.
     if ephemeral_identity {
         let (ek, dk) = veil_e2e::generate_keypair();
-        return Ok(ResolvedMlKemKey::in_memory(ek, dk, MlKemKeySource::EphemeralStub));
+        return Ok(ResolvedMlKemKey::in_memory(
+            ek,
+            dk,
+            MlKemKeySource::EphemeralStub,
+        ));
     }
     // 1. An existing persisted key wins — never rotate a node that already has one.
     if mlkem_key_path.exists() {
         let loaded = load_or_generate_mlkem_key_encrypted(mlkem_key_path, passphrase)
             .map_err(|e| NodeError::InvalidArgument(format!("{e}")))?;
-        return Ok(ResolvedMlKemKey::from_file(loaded, MlKemKeySource::Persisted));
+        return Ok(ResolvedMlKemKey::from_file(
+            loaded,
+            MlKemKeySource::Persisted,
+        ));
     }
     // 2. Ephemeral-dir node with an identity: derive deterministically, at the
     //    epoch currently in force. Starting at `epoch` rather than at 0 matters:
@@ -188,11 +195,7 @@ pub struct ResolvedMlKemKey {
 }
 
 impl ResolvedMlKemKey {
-    fn in_memory(
-        ek: [u8; EK_BYTES],
-        dk_seed: [u8; DK_SEED_BYTES],
-        source: MlKemKeySource,
-    ) -> Self {
+    fn in_memory(ek: [u8; EK_BYTES], dk_seed: [u8; DK_SEED_BYTES], source: MlKemKeySource) -> Self {
         Self {
             ek,
             dk_seed,
@@ -228,7 +231,9 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let key_path = tmp.path().join("mlkem.key");
         // Create a persisted (random) key file + capture its EK.
-        let ek_file = load_or_generate_mlkem_key_encrypted(&key_path, None).unwrap().ek;
+        let ek_file = load_or_generate_mlkem_key_encrypted(&key_path, None)
+            .unwrap()
+            .ek;
         assert!(key_path.exists());
         // Also drop an identity seed so the derive branch WOULD be eligible.
         save_seed(tmp.path(), 0x11);
@@ -339,7 +344,9 @@ mod tests {
         assert_ne!(ek, derived_ek);
 
         // And random per call, so two deferred nodes never share one.
-        let ek2 = load_or_derive(&key_path, tmp.path(), None, 0, true).unwrap().ek;
+        let ek2 = load_or_derive(&key_path, tmp.path(), None, 0, true)
+            .unwrap()
+            .ek;
         assert_ne!(ek, ek2);
     }
 
