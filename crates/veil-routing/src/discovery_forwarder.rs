@@ -1,7 +1,8 @@
 //! Route discovery forwarder.
 //!
 //! Processes incoming [`RouteDiscoveryPacket`]s:
-//! 1. Validates PoW and timestamp.
+//! 1. Validates PoW and timestamp, then SPENDS the stamp: a solved PoW is
+//!    honoured once per forwarder, not once per validity window.
 //! 2. Enforces per-source and global rate limits.
 //! 3. Decrements TTL.
 //! 4. When TTL reaches 0 and this node can accept inbound connections →
@@ -20,13 +21,74 @@ use veil_abuse::rate_limiter::TokenBucket;
 use veil_proto::{
     budget::{
         DISCOVERY_GLOBAL_RATE_BURST, DISCOVERY_RATE_BURST, DISCOVERY_RATE_REFILL_SECS,
-        MAX_DISCOVERY_RATE_ENTRIES, ROUTE_DISCOVERY_POW_DIFFICULTY,
+        MAX_DISCOVERY_POW_SEEN, MAX_DISCOVERY_RATE_ENTRIES, ROUTE_DISCOVERY_POW_DIFFICULTY,
     },
     routing::RouteDiscoveryPacket,
 };
 use veil_types::NodeRole;
 
-use super::pow::verify_discovery_pow;
+use super::pow::{discovery_pow_window_secs, verify_discovery_pow};
+
+// ── SpentPowStamps ────────────────────────────────────────────────────────────
+
+/// Discovery PoW stamps this node has already honoured.
+///
+/// The discovery PoW commits to `src_node_id ‖ timestamp ‖ nonce` and nothing
+/// else — not the target (the packet has no target field), not the recipient,
+/// not the TTL, which forwarders mutate. So a solved stamp is a bearer token
+/// for the whole validity window, and the packet carrying it can be copied
+/// verbatim by anyone who sees it. Two consequences the rate limiters do not
+/// cover:
+///
+/// * one solve buys every packet the buckets will pass, not one packet;
+/// * a replay is charged to the ORIGINATOR's per-source bucket, so capturing
+///   one legitimate discovery packet and echoing it back at a forwarder
+///   exhausts the victim's discovery budget there for the refill period — a
+///   suppression primitive that costs the attacker no work at all.
+///
+/// Remembering the stamp turns "valid for a window" into "valid once per
+/// forwarder", which is the correlation the packet format cannot express.
+/// Checked AFTER the PoW verifies, so unsolved junk cannot fill this set, and
+/// BEFORE the rate limiters, so a replay never touches the victim's bucket.
+#[derive(Debug, Default)]
+struct SpentPowStamps {
+    seen: HashMap<[u8; 32], Instant>,
+}
+
+impl SpentPowStamps {
+    /// `true` if this stamp is fresh (and records it); `false` if already spent.
+    fn claim(&mut self, stamp: [u8; 32], now: Instant, ttl: std::time::Duration) -> bool {
+        // Outside the window a stale row is moot — `verify_discovery_pow`'s own
+        // timestamp check rejects the packet before it reaches here — so let
+        // the insert below refresh it rather than leaving it behind.
+        if let Some(first_seen) = self.seen.get(&stamp)
+            && now.duration_since(*first_seen) < ttl
+        {
+            return false;
+        }
+        if self.seen.len() >= MAX_DISCOVERY_POW_SEEN {
+            self.seen.retain(|_, t| now.duration_since(*t) < ttl);
+            // A purge frees nothing when every stamp is fresh, which is exactly
+            // the flood case. Drop the oldest so the cap holds unconditionally.
+            if self.seen.len() >= MAX_DISCOVERY_POW_SEEN
+                && let Some(oldest) = self.seen.iter().min_by_key(|(_, t)| **t).map(|(k, _)| *k)
+            {
+                self.seen.remove(&oldest);
+            }
+        }
+        self.seen.insert(stamp, now);
+        true
+    }
+}
+
+/// The identity of one solved stamp: everything the PoW hash commits to.
+fn pow_stamp_id(pkt: &RouteDiscoveryPacket) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(&pkt.src_node_id);
+    hasher.update(&pkt.timestamp.to_be_bytes());
+    hasher.update(&pkt.pow_nonce);
+    *hasher.finalize().as_bytes()
+}
 
 // ── DiscoveryNeighbor ─────────────────────────────────────────────────────────
 
@@ -58,6 +120,11 @@ pub enum ForwardDecision {
 pub enum DropReason {
     /// PoW invalid or timestamp outside the validity window.
     InvalidPoW,
+    /// The PoW stamp is valid but was already spent at this node — a repeat of
+    /// a packet we have already forwarded, or somebody else's packet replayed.
+    /// Distinct from [`Self::RateLimited`] on purpose: the packet cost the
+    /// sender no work, and it must not be charged to the originator's budget.
+    ReplayedPoW,
     /// Per-source or global rate limit exceeded.
     RateLimited,
     /// No eligible non-Leaf neighbor to forward (or TTL=0 but this node
@@ -77,6 +144,8 @@ pub struct DiscoveryForwarder {
     difficulty: u8,
     per_src: HashMap<[u8; 32], TokenBucket>,
     global: TokenBucket,
+    /// One-shot memory for solved PoW stamps — see [`SpentPowStamps`].
+    spent_pow: SpentPowStamps,
     /// Simple xorshift64 PRNG — no external dependency needed for this use.
     rng: u64,
 }
@@ -109,6 +178,7 @@ impl DiscoveryForwarder {
             per_src: HashMap::new(),
             // capacity=BURST, refill_rate=1 token/sec for global; 1/REFILL_SECS for per-src.
             global: TokenBucket::new(DISCOVERY_GLOBAL_RATE_BURST as f64, 1.0),
+            spent_pow: SpentPowStamps::default(),
             rng: if rng_seed == 0 { 1 } else { rng_seed },
         }
     }
@@ -146,6 +216,14 @@ impl DiscoveryForwarder {
             now_secs,
         ) {
             return ForwardDecision::Drop(DropReason::InvalidPoW);
+        }
+
+        // 1b. Spend the stamp. One solve is worth one packet at this node, not
+        // a window's worth — and a replay of somebody else's packet dies here,
+        // before it can charge their per-source bucket below.
+        let ttl = std::time::Duration::from_secs(discovery_pow_window_secs(self.difficulty));
+        if !self.spent_pow.claim(pow_stamp_id(pkt), now, ttl) {
+            return ForwardDecision::Drop(DropReason::ReplayedPoW);
         }
 
         // 2. Global rate limit (all sources combined).
@@ -411,6 +489,105 @@ mod tests {
             far_count * 100 / forward_count >= 60,
             "far node picked {far_count}/{forward_count} forwards ({:.0}%), want ≥ 60 %",
             far_count as f64 / forward_count as f64 * 100.0,
+        );
+    }
+
+    /// report6 V-H4: the discovery PoW is bound to nothing but its own source
+    /// and timestamp — no target (the packet has no target field), no
+    /// recipient, no per-request nonce the verifier checks. So a solved stamp
+    /// was a bearer token for the whole ~10-minute window, and the packet
+    /// carrying it could be copied verbatim by anyone who saw it.
+    ///
+    /// The damaging half is not the free extra packets, it is WHOSE budget they
+    /// spend: a replay was charged to the ORIGINATOR's per-source bucket, so
+    /// echoing one captured legitimate packet back at a forwarder exhausted the
+    /// victim's discovery budget there for the refill period, at zero cost to
+    /// the attacker.
+    #[test]
+    fn replayed_pow_stamp_is_dropped_before_it_can_charge_the_victim() {
+        let mut fwd = make_fwd(NodeRole::Core);
+        let neighbors = vec![relay_neighbor(5)];
+        let src = 0xAAu8;
+        let now = 1_000u64;
+
+        // The victim's genuine packet — one token of a burst of 3.
+        let genuine = make_pkt(src, now, 4);
+        assert!(
+            matches!(
+                fwd.handle(&genuine, &[9u8; 32], &neighbors, now),
+                ForwardDecision::Forward(_)
+            ),
+            "the first packet must forward",
+        );
+
+        // The attacker echoes it back, more times than the remaining budget.
+        for i in 0..5 {
+            assert_eq!(
+                fwd.handle(&genuine, &[0xEEu8; 32], &neighbors, now),
+                ForwardDecision::Drop(DropReason::ReplayedPoW),
+                "replay {i} must be refused as a spent stamp, not served",
+            );
+        }
+
+        // The victim's remaining budget must be untouched: with a burst of 3
+        // and one token spent, two more genuine packets must still forward.
+        for i in 1..DISCOVERY_RATE_BURST {
+            let ts = now + i as u64;
+            let pkt = make_pkt(src, ts, 4);
+            assert!(
+                matches!(
+                    fwd.handle(&pkt, &[9u8; 32], &neighbors, ts),
+                    ForwardDecision::Forward(_)
+                ),
+                "the replays burned the victim's own discovery budget (packet {i})",
+            );
+        }
+    }
+
+    /// A solved stamp is worth one packet at a forwarder, not a window's worth.
+    /// Same source, same solve, fresh arrival — still spent.
+    #[test]
+    fn one_solve_is_one_packet_even_within_the_window() {
+        let src_id = [0xBBu8; 32];
+        let ts = 1_700_000_000u64;
+        let nonce = solve_discovery_pow(&src_id, ts, 8);
+        let mut fwd = DiscoveryForwarder::new([1u8; 32], NodeRole::Core, 8);
+        let pkt = RouteDiscoveryPacket {
+            src_node_id: src_id,
+            timestamp: ts,
+            pow_nonce: nonce,
+            ttl: 4,
+        };
+        let neighbors = vec![relay_neighbor(7)];
+        assert_eq!(
+            fwd.handle(&pkt, &[9u8; 32], &neighbors, ts),
+            ForwardDecision::Forward([7u8; 32]),
+        );
+        // Still inside the validity window (600 s at this difficulty), so the
+        // PoW check alone would pass it again.
+        assert_eq!(
+            fwd.handle(&pkt, &[9u8; 32], &neighbors, ts + 60),
+            ForwardDecision::Drop(DropReason::ReplayedPoW),
+            "the same solve was honoured twice",
+        );
+    }
+
+    /// The spent-stamp memory stays bounded even when every stamp is fresh —
+    /// the case TTL purging alone cannot handle.
+    #[test]
+    fn spent_stamp_memory_is_bounded_under_a_flood() {
+        let mut spent = SpentPowStamps::default();
+        let now = Instant::now();
+        let ttl = std::time::Duration::from_secs(600);
+        for i in 0..(MAX_DISCOVERY_POW_SEEN as u64 * 2) {
+            let mut stamp = [0u8; 32];
+            stamp[..8].copy_from_slice(&i.to_le_bytes());
+            assert!(spent.claim(stamp, now, ttl), "every stamp here is distinct");
+        }
+        assert!(
+            spent.seen.len() <= MAX_DISCOVERY_POW_SEEN,
+            "spent-stamp set grew to {} entries, cap is {MAX_DISCOVERY_POW_SEEN}",
+            spent.seen.len(),
         );
     }
 

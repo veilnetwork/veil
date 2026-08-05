@@ -830,6 +830,19 @@ pub const DISCOVERY_POW_CONSERVATIVE_HASH_RATE: u64 = 50_000;
 /// Minimum timestamp validity window for discovery PoW packets (seconds).
 pub const DISCOVERY_POW_MIN_WINDOW_SECS: u64 = 600; // 10 minutes
 
+/// Maximum number of already-spent discovery PoW stamps a forwarder remembers.
+///
+/// A stamp is `(src_node_id, timestamp, pow_nonce)`, and a forwarder accepts
+/// each one exactly once for the length of the PoW validity window. Without
+/// that memory one solved stamp buys as many packets as the rate limiter
+/// allows, and — worse — anyone who sees a packet can replay it verbatim to
+/// burn the ORIGINATOR's per-source budget at every forwarder in the network.
+///
+/// 8 192 entries is a hair over the per-source rate-limit map and costs ~320 KiB.
+/// The set is TTL-purged first and only evicts its oldest entry if a purge frees
+/// nothing, so it is bounded regardless of arrival pattern.
+pub const MAX_DISCOVERY_POW_SEEN: usize = 8_192;
+
 /// Maximum number of simultaneous NAT relay tunnels a node will maintain.
 /// Each tunnel is keyed by a 32-bit session_token; entries are removed when
 /// the corresponding peer session closes. The cap prevents an authenticated
