@@ -11236,7 +11236,8 @@ pub const VEIL_ERR_RATCHET_BUFFER_TOO_SMALL: c_int = -21;
 #[cfg(feature = "node-embedded")]
 pub const VEIL_ERR_RATCHET_STORE_FULL: c_int = -22;
 
-/// Most conversations one device holds at once.
+/// Most conversations one device holds at once, and so the most
+/// [`veil_ratchet_list_page`] can ever walk.
 ///
 /// Spelled as a literal because cbindgen emits `#define`s only for literals: a
 /// `= veil_e2e::MAX_CONVERSATIONS` here compiles perfectly well and then simply
@@ -11529,6 +11530,77 @@ pub unsafe extern "C" fn veil_ratchet_list(
     let keys = ratchet.store.keys();
     let _ = unsafe { write_conversation_keys(&keys, out_buf, out_buf_cap) };
     unsafe { *out_total = keys.len() };
+    VEIL_OK
+}
+
+/// One page of the conversations this node holds, in key order, resuming
+/// strictly after `after_key_64`.
+///
+/// Pass `NULL` for `after_key_64` to start the walk, then pass the LAST key of
+/// the page just returned to continue it. A page shorter than
+/// `out_buf_cap / VEIL_RATCHET_KEY_LEN` is the end; a page of zero keys is the
+/// end with nothing in it. `*out_written` receives the count of keys written.
+///
+/// This is what [`veil_ratchet_list`] cannot do. That call writes as many keys
+/// as fit and reports the total, so a host whose buffer is smaller than the
+/// store can never reach the tail — it can only allocate for the whole set and
+/// try again. Here the cost of a page is the page: the walk seeks in
+/// logarithmic time and holds the store's lock for the length of the page
+/// rather than the length of the store, so a full save streams instead of
+/// stopping every other send and receive while it copies.
+///
+/// The cursor is a key rather than an offset because the store moves between
+/// pages — a conversation opens, another is evicted by the quota — and an
+/// offset would then skip or repeat whatever crossed it. Resuming at a key is
+/// well-defined whether or not that key is still held.
+///
+/// # Safety
+///
+/// `handle` must be live. `after_key_64`, when not NULL, MUST point to exactly
+/// [`VEIL_RATCHET_KEY_LEN`] readable bytes. `out_buf` MUST be writable for
+/// `out_buf_cap` bytes. `out_written` MUST be writable.
+#[unsafe(no_mangle)]
+#[cfg(feature = "node-embedded")]
+pub unsafe extern "C" fn veil_ratchet_list_page(
+    handle: *mut VeilHandle,
+    after_key_64: *const u8,
+    out_buf: *mut u8,
+    out_buf_cap: size_t,
+    out_written: *mut size_t,
+    err_out: *mut *mut c_char,
+) -> c_int {
+    if let Err(rc) = unsafe { guard::ffi_prelude(err_out, "veil_ratchet_list_page") } {
+        return rc;
+    }
+    null_check!(err_out,
+        "handle" => handle,
+        "out_buf" => out_buf,
+        "out_written" => out_written,
+    );
+    get_or_return!(
+        handle_live,
+        handle_table(),
+        handle,
+        err_out,
+        VEIL_ERR_INVALID_ARG,
+        "VeilHandle"
+    );
+    let ratchet = match ratchet_for_bundle(&handle_live.bundle) {
+        Ok(r) => r,
+        Err(e) => {
+            unsafe { write_err(err_out, e) };
+            return VEIL_ERR;
+        }
+    };
+    let after = if after_key_64.is_null() {
+        None
+    } else {
+        Some(unsafe { ratchet_key_from(after_key_64) })
+    };
+    let room = out_buf_cap / VEIL_RATCHET_KEY_LEN;
+    let page = ratchet.store.keys_after(after.as_ref(), room);
+    let written = unsafe { write_conversation_keys(&page, out_buf, out_buf_cap) };
+    unsafe { *out_written = written };
     VEIL_OK
 }
 
