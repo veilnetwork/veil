@@ -22,8 +22,19 @@
 //!
 //! ## Auth model
 //!
-//! **No auth on put.** Anyone can deposit. Per-receiver quota
-//! and 60/min rate limit at the storage layer gate abuse.
+//! **Deposit is open by default, not unauthenticated by design.** A PUT may
+//! carry a capability token, and `MailboxConfig::require_capability_token`
+//! makes one mandatory — tokenless puts are then rejected with
+//! `CapabilityRequired`. The relay ships with that gate off (senders are not
+//! all propagating tokens yet), so on a default relay anyone can deposit; a
+//! relay that turns it on accepts deposits only from holders of a token its
+//! receiver minted.
+//!
+//! Independent of the token, every deposit is bounded by the per-receiver
+//! quota and the 60/min rate limit at the storage layer, and the per-sender
+//! byte quota is keyed on the AUTHENTICATED session source rather than the
+//! wire-supplied `sender_id`.
+//!
 //! The receiver's `node_id` in the payload is taken at face value;
 //! storage records (sender, content_id, blob) and on-fetch the
 //! receiver decrypts end-to-end (relay never sees plaintext).
