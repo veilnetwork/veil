@@ -644,6 +644,43 @@ fn seal_inner(
     );
 
     let mut g = store.lock();
+
+    // Settle the conversation against the certificate BEFORE sealing anything
+    // into it.
+    //
+    // `open` will accept a prologue addressed to our published keys from
+    // whoever names a sender, because at first contact there is nothing to
+    // check the announced device key against. It records that key and marks
+    // the conversation unauthenticated. Here the caller has a certificate
+    // whose signature chain it verified, so the claim can finally be judged —
+    // and it has to be judged now, because using the entry means sealing our
+    // plaintext to whoever announced that key. A stranger who got a prologue
+    // in first would otherwise receive every message we send to this contact.
+    if let Some((matches_certificate, proven)) = g
+        .entries
+        .get(&key)
+        .map(|e| (e.peer_ik == *peer.ratchet_pk, e.authenticated))
+        && !proven
+    {
+        if matches_certificate {
+            // The announcement was true. Only the holder of that key's secret
+            // could have agreed the root this conversation runs on, so the
+            // peer is proven from here on and a later rotation of theirs must
+            // not be read as a contradiction.
+            if let Some(entry) = g.entries.get_mut(&key) {
+                entry.authenticated = true;
+            }
+        } else {
+            // It was not: an unverified claim against a verified certificate.
+            // Drop it. That closes the disclosure and the denial of service
+            // together — the stranger's session neither carries our plaintext
+            // nor keeps the real contact's prologue out, because what replaces
+            // it is a conversation we open ourselves, to the key the
+            // certificate publishes.
+            g.entries.remove(&key);
+        }
+    }
+
     let (kind, blob) = match g.entries.get_mut(&key) {
         Some(entry) => {
             let frame = entry.session.encrypt(plaintext, &ad)?;
@@ -740,11 +777,19 @@ pub fn is_ratchet_payload(payload: &[u8]) -> bool {
 /// Open a ratchet payload from `sender_node_id`.
 ///
 /// `published_peer_ik` is the device X25519 key that peer's verified
-/// certificate currently carries, when the caller has it. It is used for one
-/// thing: deciding whether the sender is proven. Passing `None` never prevents
-/// a message from being read — it only means the result comes back
-/// unauthenticated, and a later frame on the same conversation will settle it
-/// once the certificate has been resolved.
+/// certificate currently carries, when the caller has it. It decides two
+/// things, and both of them the same way — by whether the key a prologue
+/// announces is the key the peer published:
+///
+/// * whether the sender is reported as proven;
+/// * whether a prologue may take back a conversation some stranger opened
+///   first. It may, because announcing the published key and still producing a
+///   frame that opens takes that key's secret.
+///
+/// Passing `None` never prevents a message from being read — it only means the
+/// result comes back unauthenticated and displaces nothing, and a later frame
+/// on the same conversation will settle it once the certificate has been
+/// resolved.
 pub fn open(
     store: &RatchetStore,
     me: &RatchetIdentity<'_>,
@@ -807,6 +852,29 @@ fn open_inner(
     );
     let mut rng = OsRatchetRng;
 
+    let (message, frame) = match kind {
+        KIND_PROLOGUE => {
+            let message = InitialMessage::decode(blob)?;
+            let frame = message.first_frame().to_vec();
+            (Some(message), frame)
+        }
+        KIND_FRAME => (None, blob.to_vec()),
+        _ => return Err(RatchetSpliceError::Malformed("unknown payload kind")),
+    };
+
+    // Whether this prologue proves its own authorship.
+    //
+    // A prologue is sealed to our *published* keys, so producing one proves
+    // nothing on its own — that is the whole reason an established
+    // conversation is never re-keyed by one. But a prologue that announces the
+    // device key the peer's verified certificate publishes AND opens is a
+    // different object: the root is derived against that key, so only the
+    // holder of its secret can have built a frame that decrypts. Nobody else
+    // can reach this bar, whatever pair of device ids they name.
+    let proves_authorship = message
+        .as_ref()
+        .is_some_and(|m| published_peer_ik == Some(m.initiator_ik()));
+
     let mut g = store.lock();
 
     // An established conversation is never re-keyed by an inbound prologue.
@@ -817,34 +885,54 @@ fn open_inner(
     // hold, which is what a legitimate repeat (the peer has not seen our reply
     // yet) actually needs.
     if let Some(entry) = g.entries.get_mut(&key) {
-        let frame = match kind {
-            KIND_PROLOGUE => InitialMessage::decode(blob)?.first_frame().to_vec(),
-            KIND_FRAME => blob.to_vec(),
-            _ => return Err(RatchetSpliceError::Malformed("unknown payload kind")),
-        };
-        let plaintext = entry.session.decrypt(&frame, &ad, &mut rng)?;
-        // Something of theirs opened, so they have our half of the exchange and
-        // the prologue has done its job.
-        entry.pending_prologue = None;
-        if !entry.authenticated && published_peer_ik == Some(&entry.peer_ik) {
-            entry.authenticated = true;
+        match entry.session.decrypt(&frame, &ad, &mut rng) {
+            Ok(plaintext) => {
+                // Something of theirs opened, so they have our half of the
+                // exchange and the prologue has done its job.
+                entry.pending_prologue = None;
+                if !entry.authenticated
+                    && (published_peer_ik == Some(&entry.peer_ik) || proves_authorship)
+                {
+                    entry.authenticated = true;
+                }
+                let authenticated = entry.authenticated;
+                g.commit_change(key);
+                return Ok(Opened {
+                    plaintext,
+                    ack_key: [0u8; ACK_KEY_LEN],
+                    key,
+                    authenticated,
+                });
+            }
+            Err(e) => {
+                // The session we hold cannot read this. Two conversations that
+                // may be displaced by a prologue that has proved its
+                // authorship, and only those two:
+                //
+                // * one nothing has ever confirmed — a stranger who got in
+                //   first holds it, and the contact whose certificate we
+                //   verified is now asking for it back;
+                // * one we opened ourselves and have never heard a word back
+                //   on — the peer is starting over, and there is nothing
+                //   received to lose. Our own frames on it went unread either
+                //   way.
+                //
+                // A proven, answered conversation is untouchable, so a
+                // stranger's prologue and a replay of the peer's own both stop
+                // here — the second could otherwise rewind a live chain.
+                let displaceable = !entry.authenticated || entry.pending_prologue.is_some();
+                if !proves_authorship || !displaceable {
+                    return Err(RatchetSpliceError::Ratchet(e));
+                }
+            }
         }
-        let authenticated = entry.authenticated;
-        g.commit_change(key);
-        return Ok(Opened {
-            plaintext,
-            ack_key: [0u8; ACK_KEY_LEN],
-            key,
-            authenticated,
-        });
-    }
-
-    // No session. Only a prologue can start one; a bare frame is unreadable and
-    // saying so is not a leak — the sender learns nothing they did not send.
-    if kind != KIND_PROLOGUE {
+    } else if kind != KIND_PROLOGUE {
+        // No session. Only a prologue can start one; a bare frame is
+        // unreadable and saying so is not a leak — the sender learns nothing
+        // they did not send.
         return Err(RatchetSpliceError::NoSession);
     }
-    let message = InitialMessage::decode(blob)?;
+    let message = message.ok_or(RatchetSpliceError::NoSession)?;
 
     // Every device key a sender could still have addressed us at, paired with
     // the mailbox seed published beside it. The ring guarantees the two lists
@@ -1217,6 +1305,269 @@ mod tests {
         // And the real one still works.
         let got = a_to_b(&a, &b, b"still here").expect("open");
         assert_eq!(got.plaintext, b"still here");
+    }
+
+    /// A stranger's device, wearing the contact's two public identifiers.
+    ///
+    /// Everything this needs is public and resolvable: the victim's node and
+    /// device ids, the keys they published, and the ids of the contact whose
+    /// conversation is being taken.
+    fn squatter_for(contact: &Device, tag: u8) -> Device {
+        let mut s = device(tag);
+        s.node_id = contact.node_id;
+        s.instance_id = contact.instance_id;
+        s
+    }
+
+    #[test]
+    fn a_squatter_who_got_there_first_does_not_receive_what_we_send() {
+        // The order the anti-reset rule does not cover: a stranger opens the
+        // conversation BEFORE the real contact ever does. Nothing is re-keyed,
+        // so the rule is satisfied — and the entry the stranger left behind is
+        // then what every outgoing message to that contact is sealed with.
+        // The stranger both plants it and, being the relay that claimed to be
+        // the sender, sees the ciphertext.
+        let (a, b) = (device(0x60), device(0x61));
+        let squatter = squatter_for(&a, 0x62);
+
+        let (bek, bpk) = (b.ek(), b.ratchet_pk());
+        let grab = seal(
+            &squatter.store,
+            &squatter.me(),
+            keys(&b, &bek, &bpk),
+            b"i am alice",
+        )
+        .expect("seal")
+        .0;
+        let a_pk = a.ratchet_pk();
+        let got = open(&b.store, &b.me(), &a.node_id, &grab, Some(&a_pk), NOW).expect("open");
+        assert!(
+            !got.authenticated,
+            "the key it announced is not the one Alice published"
+        );
+
+        // Bob now writes to Alice, from the certificate he verified.
+        let (aek, apk) = (a.ek(), a.ratchet_pk());
+        let out = seal(
+            &b.store,
+            &b.me(),
+            keys(&a, &aek, &apk),
+            b"the account number is",
+        )
+        .expect("seal")
+        .0;
+        let b_pk = b.ratchet_pk();
+        assert!(
+            open(
+                &squatter.store,
+                &squatter.me(),
+                &b.node_id,
+                &out,
+                Some(&b_pk),
+                NOW
+            )
+            .is_err(),
+            "the squatter read a message Bob wrote to Alice"
+        );
+        assert_eq!(
+            open(&a.store, &a.me(), &b.node_id, &out, Some(&b_pk), NOW)
+                .expect("Alice could not read a message addressed to her")
+                .plaintext,
+            b"the account number is"
+        );
+    }
+
+    #[test]
+    fn a_squatter_who_got_there_first_is_displaced_by_the_real_contact() {
+        // The other half of the same order: the contact arrives second and
+        // must be able to take the conversation back. She can, because her
+        // prologue announces the key her certificate publishes and still
+        // opens — which takes that key's secret and so cannot be imitated.
+        let (a, b) = (device(0x63), device(0x64));
+        let squatter = squatter_for(&a, 0x65);
+
+        let (bek, bpk) = (b.ek(), b.ratchet_pk());
+        let grab = seal(
+            &squatter.store,
+            &squatter.me(),
+            keys(&b, &bek, &bpk),
+            b"i am alice",
+        )
+        .expect("seal")
+        .0;
+        let a_pk = a.ratchet_pk();
+        open(&b.store, &b.me(), &a.node_id, &grab, Some(&a_pk), NOW).expect("open");
+
+        let real = a_to_b(&a, &b, b"it is actually me").expect("the real contact was locked out");
+        assert_eq!(real.plaintext, b"it is actually me");
+        assert!(real.authenticated);
+
+        // And the squatter's session went with it.
+        let more = seal(
+            &squatter.store,
+            &squatter.me(),
+            keys(&b, &bek, &bpk),
+            b"still here",
+        )
+        .expect("seal")
+        .0;
+        assert!(
+            open(&b.store, &b.me(), &a.node_id, &more, Some(&a_pk), NOW).is_err(),
+            "the squatter kept the conversation after being displaced"
+        );
+
+        // The conversation Alice took back keeps running.
+        assert_eq!(
+            a_to_b(&a, &b, b"and again").expect("open").plaintext,
+            b"and again"
+        );
+    }
+
+    #[test]
+    fn a_replay_of_the_peers_own_prologue_does_not_rewind_a_live_conversation() {
+        // The cost of getting the displacement rule too wide, stated on its
+        // own. A prologue that announces the published key and opens under it
+        // is proof of authorship — but a relay that kept a copy of one can
+        // present that same proof later. Re-deriving from it would rebuild the
+        // conversation at its very first frame, hand the first message up a
+        // second time, and throw away every key agreed since. A proven,
+        // answered conversation is therefore untouchable no matter who asks.
+        let (a, b) = (device(0x6E), device(0x6F));
+        let (bek, bpk) = (b.ek(), b.ratchet_pk());
+        let opening = seal(&a.store, &a.me(), keys(&b, &bek, &bpk), b"hello")
+            .expect("seal")
+            .0;
+        let a_pk = a.ratchet_pk();
+        open(&b.store, &b.me(), &a.node_id, &opening, Some(&a_pk), NOW).expect("open");
+
+        let key = b.store.keys()[0];
+        let before_blob = b.store.export(&key).expect("held");
+        let before_version = b.store.version();
+
+        assert!(
+            open(&b.store, &b.me(), &a.node_id, &opening, Some(&a_pk), NOW).is_err(),
+            "a replayed prologue was accepted a second time"
+        );
+        assert_eq!(b.store.version(), before_version);
+        assert_eq!(
+            *b.store.export(&key).expect("held"),
+            *before_blob,
+            "and it must not have moved a single byte"
+        );
+    }
+
+    #[test]
+    fn a_squatter_arriving_second_takes_nothing_from_an_unproven_conversation() {
+        // The displacement rule's other edge, and the near miss it has to
+        // survive. Bob accepted Alice's first contact before her certificate
+        // resolved, so the conversation is genuine but unproven — exactly the
+        // state a stranger would want to knock over. Being unproven is not
+        // enough: the prologue must also announce the key Alice published, and
+        // a stranger cannot produce one that announces her key AND opens.
+        let (a, b) = (device(0x6B), device(0x6C));
+        let (bek, bpk) = (b.ek(), b.ratchet_pk());
+        let first = seal(&a.store, &a.me(), keys(&b, &bek, &bpk), b"hello")
+            .expect("seal")
+            .0;
+        let got = open(&b.store, &b.me(), &a.node_id, &first, None, NOW).expect("open");
+        assert!(!got.authenticated);
+
+        let squatter = squatter_for(&a, 0x6D);
+        let forged = seal(
+            &squatter.store,
+            &squatter.me(),
+            keys(&b, &bek, &bpk),
+            b"me instead",
+        )
+        .expect("seal")
+        .0;
+        let a_pk = a.ratchet_pk();
+        assert!(
+            open(&b.store, &b.me(), &a.node_id, &forged, Some(&a_pk), NOW).is_err(),
+            "a stranger displaced a conversation it cannot prove is its own"
+        );
+
+        // Alice's conversation is untouched, and settles the moment she speaks
+        // again against the certificate Bob now holds.
+        let next = seal(&a.store, &a.me(), keys(&b, &bek, &bpk), b"still me")
+            .expect("seal")
+            .0;
+        let got = open(&b.store, &b.me(), &a.node_id, &next, Some(&a_pk), NOW).expect("open");
+        assert_eq!(got.plaintext, b"still me");
+        assert!(got.authenticated);
+    }
+
+    #[test]
+    fn a_contact_proven_before_a_rotation_keeps_the_conversation() {
+        // The seal-side rule keys off the claim being unverified, NOT off the
+        // keys differing. A contact rotates their device key on a schedule,
+        // and once a conversation is proven the key it was agreed against is
+        // history the ratchet moved past long ago — tearing it down and
+        // starting over on every rotation would be a fresh way to lose mail.
+        let (a, b) = (device(0x66), device(0x67));
+        a_to_b(&a, &b, b"first").expect("open");
+
+        let (new_ek, _) = crate::keypair_from_dk_seed(&[0x68; DK_SEED_BYTES]).expect("keypair");
+        a.ring
+            .rotate(
+                NOW,
+                1,
+                [0x68; DK_SEED_BYTES],
+                new_ek,
+                MLKEM_SEED_MIN_OVERLAP_SECS,
+            )
+            .expect("rotate");
+
+        let (aek, apk) = (a.ek(), a.ratchet_pk());
+        let reply = seal(&b.store, &b.me(), keys(&a, &aek, &apk), b"still talking")
+            .expect("seal")
+            .0;
+        assert_eq!(
+            reply[2], KIND_FRAME,
+            "a rotation must not replace the conversation"
+        );
+        let b_pk = b.ratchet_pk();
+        assert_eq!(
+            open(&a.store, &a.me(), &b.node_id, &reply, Some(&b_pk), NOW)
+                .expect("open")
+                .plaintext,
+            b"still talking"
+        );
+    }
+
+    #[test]
+    fn a_peer_re_opening_a_conversation_we_never_heard_back_on_is_followed() {
+        // Our prologue is outstanding and nothing has ever come back on it,
+        // and the peer opens the conversation from their side — they lost
+        // their state, or dropped one a stranger had taken. Their prologue is
+        // provably theirs, there is nothing received to lose, and refusing it
+        // would strand both ends for good: neither session can read the
+        // other's frames and nothing on the wire would ever change that.
+        let (a, b) = (device(0x69), device(0x6A));
+        let (bek, bpk) = (b.ek(), b.ratchet_pk());
+        seal(&a.store, &a.me(), keys(&b, &bek, &bpk), b"anyone there").expect("seal");
+
+        let (aek, apk) = (a.ek(), a.ratchet_pk());
+        let fresh = seal(&b.store, &b.me(), keys(&a, &aek, &apk), b"starting over")
+            .expect("seal")
+            .0;
+        let b_pk = b.ratchet_pk();
+        let got = open(&a.store, &a.me(), &b.node_id, &fresh, Some(&b_pk), NOW).expect("open");
+        assert_eq!(got.plaintext, b"starting over");
+        assert!(got.authenticated);
+
+        // And the conversation now runs on the session the peer opened.
+        let back = seal(&a.store, &a.me(), keys(&b, &bek, &bpk), b"here now")
+            .expect("seal")
+            .0;
+        assert_eq!(back[2], KIND_FRAME);
+        let a_pk = a.ratchet_pk();
+        assert_eq!(
+            open(&b.store, &b.me(), &a.node_id, &back, Some(&a_pk), NOW)
+                .expect("open")
+                .plaintext,
+            b"here now"
+        );
     }
 
     #[test]
