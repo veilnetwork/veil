@@ -79,6 +79,21 @@ EOF
 build_one() {
   local triple="$1"
   local features="$2"
+
+  # Pre-flight, and it earns its place now that rust-toolchain.toml pins the
+  # channel: `rustup target add` performed before the pin landed on whatever
+  # `stable` resolved to, and the pinned toolchain does NOT inherit those. A
+  # machine that cross-compiled fine last week therefore meets a cargo error
+  # about a missing std, several layers down inside cargo-ndk, that says
+  # nothing about which command fixes it. The gates declare their own cross
+  # targets in rust-toolchain.toml; mobile targets are many and developer-
+  # invoked, so they are checked here instead of downloaded by everybody.
+  if ! rustup target list --installed | grep -qx "$triple"; then
+    echo "error: Rust target $triple is not installed for the pinned toolchain" >&2
+    echo "       install with: rustup target add $triple" >&2
+    exit 1
+  fi
+
   echo "==> cargo build --release -p veilclient-ffi --target $triple"
 
   local cargo_args=(--release -p veilclient-ffi --target "$triple")
