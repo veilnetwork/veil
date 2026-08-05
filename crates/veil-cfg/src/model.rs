@@ -942,8 +942,10 @@ pub struct MailboxPushConfig {
     ///
     /// The enforcement path is fully built and waiting: the structural
     /// validator raises a production-posture advisory whenever a push relay
-    /// runs with this `false`, and `production_hardening = true` promotes that
-    /// advisory to a fatal config error. Flip this default in the same release
+    /// runs with this `false`, and `[global].strict_config_validation = true`
+    /// promotes that advisory to a fatal config error (there is no
+    /// `production_hardening` knob — that name appeared here and nowhere else
+    /// in the tree). Flip this default in the same release
     /// that ships client-side envelope upload — not before.
     #[serde(default, skip_serializing_if = "is_false")]
     pub require_wake_hmac: bool,
