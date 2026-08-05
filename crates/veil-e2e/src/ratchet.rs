@@ -875,7 +875,24 @@ fn open_inner(
         .as_ref()
         .is_some_and(|m| published_peer_ik == Some(m.initiator_ik()));
 
-    let mut g = store.lock();
+    // Whether an entry may be replaced by this prologue. Cheap, and read at
+    // both ends of the key agreement below — the store is unlocked in between,
+    // so what was true when the work started is re-asked before it lands.
+    //
+    // Two conversations may be displaced by a prologue that has proved its
+    // authorship, and only those two:
+    //
+    // * one nothing has ever confirmed — a stranger who got in first holds it,
+    //   and the contact whose certificate we verified is asking for it back;
+    // * one we opened ourselves and have never heard a word back on — the peer
+    //   is starting over, and there is nothing received to lose. Our own frames
+    //   on it went unread either way.
+    //
+    // A proven, answered conversation is untouchable, so a stranger's prologue
+    // and a replay of the peer's own both stop here — the second could
+    // otherwise rewind a live chain.
+    let displaceable =
+        |e: &Entry| proves_authorship && (!e.authenticated || e.pending_prologue.is_some());
 
     // An established conversation is never re-keyed by an inbound prologue.
     // Anyone can produce one — a prologue is sealed to our *published* key —
@@ -884,53 +901,43 @@ fn open_inner(
     // The frame behind the prologue is tried against the session we already
     // hold, which is what a legitimate repeat (the peer has not seen our reply
     // yet) actually needs.
-    if let Some(entry) = g.entries.get_mut(&key) {
-        match entry.session.decrypt(&frame, &ad, &mut rng) {
-            Ok(plaintext) => {
-                // Something of theirs opened, so they have our half of the
-                // exchange and the prologue has done its job.
-                entry.pending_prologue = None;
-                if !entry.authenticated
-                    && (published_peer_ik == Some(&entry.peer_ik) || proves_authorship)
-                {
-                    entry.authenticated = true;
+    //
+    // Symmetric work only, on state that has to be under the lock anyway: a
+    // decrypt walks one chain and at most one Diffie-Hellman step.
+    {
+        let mut g = store.lock();
+        if let Some(entry) = g.entries.get_mut(&key) {
+            match entry.session.decrypt(&frame, &ad, &mut rng) {
+                Ok(plaintext) => {
+                    // Something of theirs opened, so they have our half of the
+                    // exchange and the prologue has done its job.
+                    entry.pending_prologue = None;
+                    if !entry.authenticated
+                        && (published_peer_ik == Some(&entry.peer_ik) || proves_authorship)
+                    {
+                        entry.authenticated = true;
+                    }
+                    let authenticated = entry.authenticated;
+                    g.commit_change(key);
+                    return Ok(Opened {
+                        plaintext,
+                        ack_key: [0u8; ACK_KEY_LEN],
+                        key,
+                        authenticated,
+                    });
                 }
-                let authenticated = entry.authenticated;
-                g.commit_change(key);
-                return Ok(Opened {
-                    plaintext,
-                    ack_key: [0u8; ACK_KEY_LEN],
-                    key,
-                    authenticated,
-                });
-            }
-            Err(e) => {
-                // The session we hold cannot read this. Two conversations that
-                // may be displaced by a prologue that has proved its
-                // authorship, and only those two:
-                //
-                // * one nothing has ever confirmed — a stranger who got in
-                //   first holds it, and the contact whose certificate we
-                //   verified is now asking for it back;
-                // * one we opened ourselves and have never heard a word back
-                //   on — the peer is starting over, and there is nothing
-                //   received to lose. Our own frames on it went unread either
-                //   way.
-                //
-                // A proven, answered conversation is untouchable, so a
-                // stranger's prologue and a replay of the peer's own both stop
-                // here — the second could otherwise rewind a live chain.
-                let displaceable = !entry.authenticated || entry.pending_prologue.is_some();
-                if !proves_authorship || !displaceable {
-                    return Err(RatchetSpliceError::Ratchet(e));
+                Err(e) => {
+                    if !displaceable(entry) {
+                        return Err(RatchetSpliceError::Ratchet(e));
+                    }
                 }
             }
+        } else if kind != KIND_PROLOGUE {
+            // No session. Only a prologue can start one; a bare frame is
+            // unreadable and saying so is not a leak — the sender learns
+            // nothing they did not send.
+            return Err(RatchetSpliceError::NoSession);
         }
-    } else if kind != KIND_PROLOGUE {
-        // No session. Only a prologue can start one; a bare frame is
-        // unreadable and saying so is not a leak — the sender learns nothing
-        // they did not send.
-        return Err(RatchetSpliceError::NoSession);
     }
     let message = message.ok_or(RatchetSpliceError::NoSession)?;
 
@@ -938,6 +945,16 @@ fn open_inner(
     // the mailbox seed published beside it. The ring guarantees the two lists
     // correspond element for element, so a sender working from a week-old
     // certificate finds the pair it actually used.
+    //
+    // NOT under the store's lock. This is the expensive half — one ML-KEM
+    // decapsulation and two Diffie-Hellmans per candidate, every candidate on
+    // a miss — and the store is one lock for every conversation this node
+    // holds. Running it while holding that lock let anyone who addressed a
+    // prologue at this device stall every other send and receive for the
+    // duration, for the price of one encapsulation and an instance id they
+    // chose themselves. The state this reads is our own key ring, which the
+    // store does not own; what the store has to say is asked again below,
+    // after the work, before anything lands.
     let ratchet_secrets = me.seed_ring.ratchet_secrets(now_unix);
     let mlkem_seeds = me.seed_ring.decrypt_seeds(now_unix);
     let mut first_err: Option<RatchetSpliceError> = None;
@@ -957,16 +974,26 @@ fn open_inner(
             Ok((plaintext, session)) => {
                 let peer_ik = *message.initiator_ik();
                 let authenticated = published_peer_ik == Some(&peer_ik);
-                g.entries.insert(
-                    key,
-                    Entry {
-                        session,
-                        peer_ik,
-                        authenticated,
-                        pending_prologue: None,
-                    },
-                );
-                g.commit_change(key);
+                let mut g = store.lock();
+                // Ask the store again. Another thread may have opened this
+                // conversation while the agreement above ran unlocked, and the
+                // same rule decides now as decided then: a conversation that is
+                // proven and answered is not overwritten. The message opened
+                // regardless, so it is genuine and still goes up — it is only
+                // the session that is dropped, in favour of the one already
+                // held.
+                if g.entries.get(&key).is_none_or(displaceable) {
+                    g.entries.insert(
+                        key,
+                        Entry {
+                            session,
+                            peer_ik,
+                            authenticated,
+                            pending_prologue: None,
+                        },
+                    );
+                    g.commit_change(key);
+                }
                 return Ok(Opened {
                     plaintext,
                     ack_key: [0u8; ACK_KEY_LEN],
@@ -1420,6 +1447,47 @@ mod tests {
         assert_eq!(
             a_to_b(&a, &b, b"and again").expect("open").plaintext,
             b"and again"
+        );
+    }
+
+    #[test]
+    fn concurrent_first_contact_settles_on_one_conversation() {
+        // The key agreement runs with the store unlocked, so two prologues for
+        // the same conversation can now be inside it at once. Whatever the
+        // interleaving, exactly one session may be held and exactly one change
+        // may be counted: a second insert would replace a session whose first
+        // message has already been handed upward, and the peer's next frame
+        // would arrive at a chain that never saw it.
+        let (a, b) = (device(0x70), device(0x71));
+        let (bek, bpk) = (b.ek(), b.ratchet_pk());
+        let payload = seal(&a.store, &a.me(), keys(&b, &bek, &bpk), b"race")
+            .expect("seal")
+            .0;
+        let a_pk = a.ratchet_pk();
+
+        let results: Vec<_> = std::thread::scope(|s| {
+            let handles: Vec<_> = (0..8)
+                .map(|_| {
+                    s.spawn(|| open(&b.store, &b.me(), &a.node_id, &payload, Some(&a_pk), NOW))
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|h| h.join().expect("worker panicked"))
+                .collect()
+        });
+
+        let opened: Vec<_> = results.into_iter().flatten().collect();
+        assert!(!opened.is_empty(), "nobody opened the prologue");
+        for o in &opened {
+            assert_eq!(o.plaintext, b"race");
+            assert!(o.authenticated);
+        }
+        assert_eq!(b.store.len(), 1, "the same conversation was held twice");
+        assert_eq!(
+            b.store.version(),
+            1,
+            "a second agreement overwrote the session the first one reported"
         );
     }
 
