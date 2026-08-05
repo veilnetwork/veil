@@ -21,6 +21,7 @@
 
 #include "veil_audio_record.h"
 #include "veil_diag_log.h"
+#include "veil_media_guard.h"
 
 #include <atomic>
 #include <cstring>
@@ -270,6 +271,7 @@ struct VeilAudioRecorder {
 extern "C" {
 
 VeilAudioRecorder* veil_media_recorder_create(void) {
+  VEIL_MEDIA_GUARD_BEGIN
 #if defined(VEIL_MEDIA_HAVE_WEBRTC)
   webrtc::Environment env = webrtc::CreateEnvironment();
   auto rec = new VeilAudioRecorder(env);
@@ -303,9 +305,11 @@ VeilAudioRecorder* veil_media_recorder_create(void) {
 #else
   return nullptr;
 #endif
+  VEIL_MEDIA_GUARD_END(nullptr)
 }
 
 int veil_media_recorder_start(VeilAudioRecorder* rec) {
+  VEIL_MEDIA_GUARD_BEGIN
 #if defined(VEIL_MEDIA_HAVE_WEBRTC)
   if (!rec || !rec->adm || !rec->sink) return VEIL_REC_ERR_ARG;
   if (rec->recording) return VEIL_REC_OK;
@@ -330,29 +334,35 @@ int veil_media_recorder_start(VeilAudioRecorder* rec) {
   (void)rec;
   return VEIL_REC_ERR;
 #endif
+  VEIL_MEDIA_GUARD_END(VEIL_REC_ERR)
 }
 
 float veil_media_recorder_level(VeilAudioRecorder* rec) {
+  VEIL_MEDIA_GUARD_BEGIN
 #if defined(VEIL_MEDIA_HAVE_WEBRTC)
   return (rec && rec->sink) ? rec->sink->level() : 0.f;
 #else
   (void)rec;
   return 0.f;
 #endif
+  VEIL_MEDIA_GUARD_END(0.f)
 }
 
 int veil_media_recorder_elapsed_ms(VeilAudioRecorder* rec) {
+  VEIL_MEDIA_GUARD_BEGIN
 #if defined(VEIL_MEDIA_HAVE_WEBRTC)
   return (rec && rec->sink) ? rec->sink->elapsed_ms() : 0;
 #else
   (void)rec;
   return 0;
 #endif
+  VEIL_MEDIA_GUARD_END(0)
 }
 
 int veil_media_recorder_stop(VeilAudioRecorder* rec, uint8_t** out_bytes,
                              size_t* out_len, int* out_duration_ms,
                              uint8_t* waveform_out, int waveform_bars) {
+  VEIL_MEDIA_GUARD_BEGIN
 #if defined(VEIL_MEDIA_HAVE_WEBRTC)
   if (!rec || !rec->sink) return VEIL_REC_ERR_ARG;
   if (out_bytes) *out_bytes = nullptr;
@@ -383,13 +393,17 @@ int veil_media_recorder_stop(VeilAudioRecorder* rec, uint8_t** out_bytes,
   (void)waveform_out; (void)waveform_bars;
   return VEIL_REC_ERR;
 #endif
+  VEIL_MEDIA_GUARD_END(VEIL_REC_ERR)
 }
 
 void veil_media_recorder_free_bytes(uint8_t* bytes) {
+  VEIL_MEDIA_GUARD_BEGIN
   if (bytes) free(bytes);
+  VEIL_MEDIA_GUARD_END_VOID
 }
 
 void veil_media_recorder_destroy(VeilAudioRecorder* rec) {
+  VEIL_MEDIA_GUARD_BEGIN
 #if defined(VEIL_MEDIA_HAVE_WEBRTC)
   if (!rec) return;
   if (rec->recording && rec->adm && rec->adm->Recording()) {
@@ -400,6 +414,7 @@ void veil_media_recorder_destroy(VeilAudioRecorder* rec) {
 #else
   (void)rec;
 #endif
+  VEIL_MEDIA_GUARD_END_VOID
 }
 
 }  // extern "C"

@@ -11,6 +11,7 @@
 
 #include "veil_audio_play.h"
 #include "veil_diag_log.h"
+#include "veil_media_guard.h"
 
 #include <atomic>
 #include <cstdlib>
@@ -44,6 +45,31 @@ namespace {
 constexpr int kSampleRate = 48000;
 constexpr int kOpusSdpChannels = 2;  // SDP convention (see recorder)
 
+// What a VOICE_OPUS container may claim, taken from the only thing that writes
+// one — veil_audio_record.cc, where the Opus encoder fixes the rate and
+// kMaxDurationMs stops the clip at six minutes.
+//
+// This matters because the eighteen-byte header is attacker-chosen and every
+// allocation on the decode path is sized from it. Left unchecked, the rate
+// field alone buys a gigabyte of scratch before a single packet is looked at,
+// and the packets behind it buy hundreds of megabytes more.
+constexpr uint8_t kVoiceOpusVersion = 1;
+constexpr int kVoiceOpusMaxRate = 48000;
+constexpr int kVoiceOpusMaxChannels = 2;
+constexpr uint32_t kVoiceOpusMaxDurationMs = 6 * 60 * 1000;
+// The decoded ceiling the two together imply: six minutes of mono at 48 kHz,
+// about 35 MB. A packet decodes to as much as 120 ms whatever its size, so
+// without this a hundred kilobytes of minimal packets inflate unboundedly.
+constexpr size_t kVoiceOpusMaxSamples =
+    static_cast<size_t>(kVoiceOpusMaxRate) * (kVoiceOpusMaxDurationMs / 1000);
+
+// The sample rates Opus itself defines. The recorder only ever writes 48000;
+// the rest are accepted so a clip from a future profile still plays.
+bool voice_opus_rate_ok(uint32_t rate) {
+  return rate == 8000 || rate == 12000 || rate == 16000 || rate == 24000 ||
+         rate == static_cast<uint32_t>(kVoiceOpusMaxRate);
+}
+
 void plog(const char* fmt, ...) {
   va_list ap;
   va_start(ap, fmt);
@@ -65,10 +91,37 @@ bool decode_voice_opus(const uint8_t* data, size_t len,
   if (!(data[0] == 'V' && data[1] == 'O' && data[2] == 'P' && data[3] == '1')) {
     return false;
   }
-  const int rate = (int)rd_u32le(data + 6);
-  if (rate <= 0) return false;
+  // Every field the header declares, checked against what a recorder could
+  // have produced — including the three the old parser never read at all.
+  if (data[4] != kVoiceOpusVersion) {
+    plog("player: unsupported container version %u", (unsigned)data[4]);
+    return false;
+  }
+  const unsigned channels = data[5];
+  if (channels < 1 || channels > (unsigned)kVoiceOpusMaxChannels) {
+    plog("player: channel count %u out of profile", channels);
+    return false;
+  }
+  const uint32_t rate_field = rd_u32le(data + 6);
+  if (!voice_opus_rate_ok(rate_field)) {
+    plog("player: sample rate %u out of profile", (unsigned)rate_field);
+    return false;
+  }
+  const int rate = (int)rate_field;
+  const uint32_t duration_ms = rd_u32le(data + 10);
+  if (duration_ms > kVoiceOpusMaxDurationMs) {
+    plog("player: duration %u ms out of profile", (unsigned)duration_ms);
+    return false;
+  }
   *out_rate = rate;
   const uint32_t packet_count = rd_u32le(data + 14);
+  // A packet costs at least its two-byte length prefix, so a count the bytes
+  // cannot hold is a lie about what follows.
+  if ((uint64_t)packet_count * 2 > (uint64_t)(len - 18)) {
+    plog("player: %u packets claimed, %zu bytes present", (unsigned)packet_count,
+         len - 18);
+    return false;
+  }
 
   auto factory = webrtc::CreateBuiltinAudioDecoderFactory();
   auto dec = factory->Create(
@@ -95,6 +148,13 @@ bool decode_voice_opus(const uint8_t* data, size_t len,
     off += plen;
     if (n <= 0) continue;
     const int frames = n / dec_ch;
+    // The second amplification, and the one the header cannot bound: a packet
+    // of three bytes decodes to 120 ms all the same, so the ratio between what
+    // arrives and what is held is set by the sender.
+    if (pcm->size() + (size_t)frames > kVoiceOpusMaxSamples) {
+      plog("player: decoded audio past the six-minute ceiling");
+      return false;
+    }
     for (int f = 0; f < frames; f++) {
       int32_t acc = 0;
       for (int c = 0; c < dec_ch; c++) acc += scratch[f * dec_ch + c];
@@ -222,6 +282,7 @@ extern "C" {
 
 VeilAudioPlayer* veil_media_player_create(const uint8_t* voice_opus,
                                           size_t len) {
+  VEIL_MEDIA_GUARD_BEGIN
 #if defined(VEIL_MEDIA_HAVE_WEBRTC)
   webrtc::Environment env = webrtc::CreateEnvironment();
   std::vector<int16_t> pcm;
@@ -251,9 +312,11 @@ VeilAudioPlayer* veil_media_player_create(const uint8_t* voice_opus,
   (void)len;
   return nullptr;
 #endif
+  VEIL_MEDIA_GUARD_END(nullptr)
 }
 
 int veil_media_player_start(VeilAudioPlayer* p) {
+  VEIL_MEDIA_GUARD_BEGIN
 #if defined(VEIL_MEDIA_HAVE_WEBRTC)
   if (!p || !p->adm || !p->sink) return VEIL_PLAY_ERR_ARG;
   if (p->playing) return VEIL_PLAY_OK;
@@ -267,9 +330,11 @@ int veil_media_player_start(VeilAudioPlayer* p) {
   (void)p;
   return VEIL_PLAY_ERR;
 #endif
+  VEIL_MEDIA_GUARD_END(VEIL_PLAY_ERR)
 }
 
 int veil_media_player_pause(VeilAudioPlayer* p) {
+  VEIL_MEDIA_GUARD_BEGIN
 #if defined(VEIL_MEDIA_HAVE_WEBRTC)
   if (!p || !p->sink) return VEIL_PLAY_ERR_ARG;
   p->sink->set_paused(true);
@@ -278,9 +343,11 @@ int veil_media_player_pause(VeilAudioPlayer* p) {
   (void)p;
   return VEIL_PLAY_ERR;
 #endif
+  VEIL_MEDIA_GUARD_END(VEIL_PLAY_ERR)
 }
 
 int veil_media_player_resume(VeilAudioPlayer* p) {
+  VEIL_MEDIA_GUARD_BEGIN
 #if defined(VEIL_MEDIA_HAVE_WEBRTC)
   if (!p || !p->sink) return VEIL_PLAY_ERR_ARG;
   p->sink->set_paused(false);
@@ -289,9 +356,11 @@ int veil_media_player_resume(VeilAudioPlayer* p) {
   (void)p;
   return VEIL_PLAY_ERR;
 #endif
+  VEIL_MEDIA_GUARD_END(VEIL_PLAY_ERR)
 }
 
 int veil_media_player_seek(VeilAudioPlayer* p, int ms) {
+  VEIL_MEDIA_GUARD_BEGIN
 #if defined(VEIL_MEDIA_HAVE_WEBRTC)
   if (!p || !p->sink) return VEIL_PLAY_ERR_ARG;
   p->sink->seek_ms(ms);
@@ -301,9 +370,11 @@ int veil_media_player_seek(VeilAudioPlayer* p, int ms) {
   (void)ms;
   return VEIL_PLAY_ERR;
 #endif
+  VEIL_MEDIA_GUARD_END(VEIL_PLAY_ERR)
 }
 
 int veil_media_player_set_speed(VeilAudioPlayer* p, float speed) {
+  VEIL_MEDIA_GUARD_BEGIN
 #if defined(VEIL_MEDIA_HAVE_WEBRTC)
   if (!p || !p->sink) return VEIL_PLAY_ERR_ARG;
   p->sink->set_speed(speed);
@@ -313,27 +384,33 @@ int veil_media_player_set_speed(VeilAudioPlayer* p, float speed) {
   (void)speed;
   return VEIL_PLAY_ERR;
 #endif
+  VEIL_MEDIA_GUARD_END(VEIL_PLAY_ERR)
 }
 
 int veil_media_player_position_ms(VeilAudioPlayer* p) {
+  VEIL_MEDIA_GUARD_BEGIN
 #if defined(VEIL_MEDIA_HAVE_WEBRTC)
   return (p && p->sink) ? p->sink->position_ms() : 0;
 #else
   (void)p;
   return 0;
 #endif
+  VEIL_MEDIA_GUARD_END(0)
 }
 
 int veil_media_player_duration_ms(VeilAudioPlayer* p) {
+  VEIL_MEDIA_GUARD_BEGIN
 #if defined(VEIL_MEDIA_HAVE_WEBRTC)
   return (p && p->sink) ? p->sink->duration_ms() : 0;
 #else
   (void)p;
   return 0;
 #endif
+  VEIL_MEDIA_GUARD_END(0)
 }
 
 int veil_media_player_is_playing(VeilAudioPlayer* p) {
+  VEIL_MEDIA_GUARD_BEGIN
 #if defined(VEIL_MEDIA_HAVE_WEBRTC)
   if (!p || !p->sink || !p->playing) return 0;
   return (!p->sink->paused() && !p->sink->finished()) ? 1 : 0;
@@ -341,10 +418,12 @@ int veil_media_player_is_playing(VeilAudioPlayer* p) {
   (void)p;
   return 0;
 #endif
+  VEIL_MEDIA_GUARD_END(0)
 }
 
 int veil_media_decode_pcm16k(const uint8_t* voice_opus, size_t len,
                              float** out_pcm, int* out_samples) {
+  VEIL_MEDIA_GUARD_BEGIN
 #if defined(VEIL_MEDIA_HAVE_WEBRTC)
   if (out_pcm) *out_pcm = nullptr;
   if (out_samples) *out_samples = 0;
@@ -374,14 +453,18 @@ int veil_media_decode_pcm16k(const uint8_t* voice_opus, size_t len,
   (void)voice_opus; (void)len; (void)out_pcm; (void)out_samples;
   return VEIL_PLAY_ERR;
 #endif
+  VEIL_MEDIA_GUARD_END(VEIL_PLAY_ERR)
 }
 
 void veil_media_free_pcm(float* pcm) {
+  VEIL_MEDIA_GUARD_BEGIN
   if (pcm) free(pcm);
+  VEIL_MEDIA_GUARD_END_VOID
 }
 
 int veil_media_decode_wav(const uint8_t* voice_opus, size_t len,
                           uint8_t** out_wav, size_t* out_len) {
+  VEIL_MEDIA_GUARD_BEGIN
 #if defined(VEIL_MEDIA_HAVE_WEBRTC)
   if (out_wav) *out_wav = nullptr;
   if (out_len) *out_len = 0;
@@ -428,13 +511,17 @@ int veil_media_decode_wav(const uint8_t* voice_opus, size_t len,
   (void)voice_opus; (void)len; (void)out_wav; (void)out_len;
   return VEIL_PLAY_ERR;
 #endif
+  VEIL_MEDIA_GUARD_END(VEIL_PLAY_ERR)
 }
 
 void veil_media_free_wav(uint8_t* wav) {
+  VEIL_MEDIA_GUARD_BEGIN
   if (wav) free(wav);
+  VEIL_MEDIA_GUARD_END_VOID
 }
 
 void veil_media_player_destroy(VeilAudioPlayer* p) {
+  VEIL_MEDIA_GUARD_BEGIN
 #if defined(VEIL_MEDIA_HAVE_WEBRTC)
   if (!p) return;
   if (p->playing && p->adm) {
@@ -445,6 +532,7 @@ void veil_media_player_destroy(VeilAudioPlayer* p) {
 #else
   (void)p;
 #endif
+  VEIL_MEDIA_GUARD_END_VOID
 }
 
 }  // extern "C"

@@ -16,6 +16,7 @@
 
 #include "veil_video_note.h"
 #include "veil_diag_log.h"
+#include "veil_media_guard.h"
 
 #include <algorithm>
 #include <atomic>
@@ -446,6 +447,7 @@ extern "C" {
 
 VeilVnoteRecorder* veil_media_vnote_recorder_create(int width, int fps,
                                                     int native_camera) {
+  VEIL_MEDIA_GUARD_BEGIN
 #if defined(VEIL_MEDIA_HAVE_WEBRTC)
   webrtc::Environment env = webrtc::CreateEnvironment();
   auto rec = new VeilVnoteRecorder(env, width > 0 ? width & ~1 : kDefaultSquare,
@@ -484,9 +486,11 @@ VeilVnoteRecorder* veil_media_vnote_recorder_create(int width, int fps,
   (void)native_camera;
   return nullptr;
 #endif
+  VEIL_MEDIA_GUARD_END(nullptr)
 }
 
 int veil_media_vnote_recorder_start(VeilVnoteRecorder* rec) {
+  VEIL_MEDIA_GUARD_BEGIN
 #if defined(VEIL_MEDIA_HAVE_WEBRTC)
   if (!rec || !rec->adm || !rec->audio) return VEIL_VNOTE_ERR_ARG;
   {
@@ -532,6 +536,7 @@ int veil_media_vnote_recorder_start(VeilVnoteRecorder* rec) {
   (void)rec;
   return VEIL_VNOTE_ERR;
 #endif
+  VEIL_MEDIA_GUARD_END(VEIL_VNOTE_ERR)
 }
 
 int veil_media_vnote_recorder_push_frame(VeilVnoteRecorder* rec,
@@ -540,6 +545,7 @@ int veil_media_vnote_recorder_push_frame(VeilVnoteRecorder* rec,
                                          int height, int stride_y,
                                          int stride_u, int stride_v,
                                          int64_t /*ts_us*/) {
+  VEIL_MEDIA_GUARD_BEGIN
 #if defined(VEIL_MEDIA_HAVE_WEBRTC)
   if (!rec || !y || !u || !v) return VEIL_VNOTE_ERR_ARG;
   encode_i420(rec, y, u, v, width, height, stride_y, stride_u, stride_v);
@@ -549,19 +555,23 @@ int veil_media_vnote_recorder_push_frame(VeilVnoteRecorder* rec,
   (void)stride_y; (void)stride_u; (void)stride_v;
   return VEIL_VNOTE_ERR;
 #endif
+  VEIL_MEDIA_GUARD_END(VEIL_VNOTE_ERR)
 }
 
 float veil_media_vnote_recorder_level(VeilVnoteRecorder* rec) {
+  VEIL_MEDIA_GUARD_BEGIN
 #if defined(VEIL_MEDIA_HAVE_WEBRTC)
   return (rec && rec->audio) ? rec->audio->level() : 0.f;
 #else
   (void)rec;
   return 0.f;
 #endif
+  VEIL_MEDIA_GUARD_END(0.f)
 }
 
 int veil_media_vnote_recorder_frame(VeilVnoteRecorder* rec, uint8_t* dst,
                                     int dst_cap, int* out_w, int* out_h) {
+  VEIL_MEDIA_GUARD_BEGIN
 #if defined(VEIL_MEDIA_HAVE_WEBRTC)
   if (!rec) return 0;
   return rec->preview.get_frame(dst, dst_cap, out_w, out_h);
@@ -569,9 +579,11 @@ int veil_media_vnote_recorder_frame(VeilVnoteRecorder* rec, uint8_t* dst,
   (void)rec; (void)dst; (void)dst_cap; (void)out_w; (void)out_h;
   return 0;
 #endif
+  VEIL_MEDIA_GUARD_END(VEIL_VNOTE_ERR)
 }
 
 int veil_media_vnote_recorder_elapsed_ms(VeilVnoteRecorder* rec) {
+  VEIL_MEDIA_GUARD_BEGIN
 #if defined(VEIL_MEDIA_HAVE_WEBRTC)
   if (!rec) return 0;
   std::lock_guard<std::mutex> lk(rec->video_mu);
@@ -583,10 +595,12 @@ int veil_media_vnote_recorder_elapsed_ms(VeilVnoteRecorder* rec) {
   (void)rec;
   return 0;
 #endif
+  VEIL_MEDIA_GUARD_END(0)
 }
 
 int veil_media_vnote_recorder_stop(VeilVnoteRecorder* rec, uint8_t** out_bytes,
                                    size_t* out_len, int* out_duration_ms) {
+  VEIL_MEDIA_GUARD_BEGIN
 #if defined(VEIL_MEDIA_HAVE_WEBRTC)
   if (!rec) return VEIL_VNOTE_ERR_ARG;
   if (out_bytes) *out_bytes = nullptr;
@@ -666,10 +680,13 @@ int veil_media_vnote_recorder_stop(VeilVnoteRecorder* rec, uint8_t** out_bytes,
   (void)rec; (void)out_bytes; (void)out_len; (void)out_duration_ms;
   return VEIL_VNOTE_ERR;
 #endif
+  VEIL_MEDIA_GUARD_END(VEIL_VNOTE_ERR)
 }
 
 void veil_media_vnote_free_bytes(uint8_t* bytes) {
+  VEIL_MEDIA_GUARD_BEGIN
   if (bytes) free(bytes);
+  VEIL_MEDIA_GUARD_END_VOID
 }
 
 // ── Player ──────────────────────────────────────────────────────────────────
@@ -696,6 +713,7 @@ struct VeilVnotePlayer {
 
 extern "C" VeilVnotePlayer* veil_media_vnote_player_create(
     const uint8_t* vnote, size_t len) {
+  VEIL_MEDIA_GUARD_BEGIN
 #if defined(VEIL_MEDIA_HAVE_WEBRTC)
   // Strict parse — the clip arrives over the network. Every offset is
   // bounds-checked; any inconsistency rejects the whole container.
@@ -721,6 +739,18 @@ extern "C" VeilVnotePlayer* veil_media_vnote_player_create(
   p->duration_ms = dur;
 
   size_t off = 24 + audio_len;
+  // Prove the frames could be there before reserving room for them. Each one
+  // carries a nine-byte header and at least one byte of payload, so a count
+  // that does not fit in what is left is a lie — and the reservation is where
+  // the lie is paid for: `frame_count` is a u32, the element is more than a
+  // word wide, and the throw that follows a tens-of-gigabytes request leaves a
+  // C entry point with no handler above it and takes the process down. The
+  // per-frame bounds checks below are correct and still could not help: they
+  // run after.
+  if ((uint64_t)frame_count > (uint64_t)(len - off) / 10) {
+    delete p;
+    return nullptr;
+  }
   p->frames.reserve(frame_count);
   uint32_t last_ts = 0;
   for (uint32_t i = 0; i < frame_count; i++) {
@@ -755,47 +785,57 @@ extern "C" VeilVnotePlayer* veil_media_vnote_player_create(
   (void)len;
   return nullptr;
 #endif
+  VEIL_MEDIA_GUARD_END(nullptr)
 }
 
 extern "C" int veil_media_vnote_player_duration_ms(VeilVnotePlayer* p) {
+  VEIL_MEDIA_GUARD_BEGIN
 #if defined(VEIL_MEDIA_HAVE_WEBRTC)
   return p ? (int)p->duration_ms : 0;
 #else
   (void)p;
   return 0;
 #endif
+  VEIL_MEDIA_GUARD_END(0)
 }
 
 extern "C" int veil_media_vnote_player_width(VeilVnotePlayer* p) {
+  VEIL_MEDIA_GUARD_BEGIN
 #if defined(VEIL_MEDIA_HAVE_WEBRTC)
   return p ? p->width : 0;
 #else
   (void)p;
   return 0;
 #endif
+  VEIL_MEDIA_GUARD_END(0)
 }
 
 extern "C" int veil_media_vnote_player_height(VeilVnotePlayer* p) {
+  VEIL_MEDIA_GUARD_BEGIN
 #if defined(VEIL_MEDIA_HAVE_WEBRTC)
   return p ? p->height : 0;
 #else
   (void)p;
   return 0;
 #endif
+  VEIL_MEDIA_GUARD_END(0)
 }
 
 extern "C" int veil_media_vnote_player_has_audio(VeilVnotePlayer* p) {
+  VEIL_MEDIA_GUARD_BEGIN
 #if defined(VEIL_MEDIA_HAVE_WEBRTC)
   return (p && p->audio_len > 0) ? 1 : 0;
 #else
   (void)p;
   return 0;
 #endif
+  VEIL_MEDIA_GUARD_END(0)
 }
 
 extern "C" int veil_media_vnote_player_audio(VeilVnotePlayer* p,
                                              uint8_t** out_bytes,
                                              size_t* out_len) {
+  VEIL_MEDIA_GUARD_BEGIN
 #if defined(VEIL_MEDIA_HAVE_WEBRTC)
   if (!p || !out_bytes || !out_len) return VEIL_VNOTE_ERR_ARG;
   *out_bytes = nullptr;
@@ -811,6 +851,7 @@ extern "C" int veil_media_vnote_player_audio(VeilVnotePlayer* p,
   (void)p; (void)out_bytes; (void)out_len;
   return VEIL_VNOTE_ERR;
 #endif
+  VEIL_MEDIA_GUARD_END(VEIL_VNOTE_ERR)
 }
 
 #if defined(VEIL_MEDIA_HAVE_WEBRTC)
@@ -833,6 +874,7 @@ void vnote_decode_one(VeilVnotePlayer* p, const VnoteFrameRef& f) {
 extern "C" int veil_media_vnote_player_frame_at(VeilVnotePlayer* p, int ms,
                                                 uint8_t* dst, int dst_cap,
                                                 int* out_w, int* out_h) {
+  VEIL_MEDIA_GUARD_BEGIN
 #if defined(VEIL_MEDIA_HAVE_WEBRTC)
   if (!p) return 0;
   if (ms < 0) ms = 0;
@@ -870,9 +912,11 @@ extern "C" int veil_media_vnote_player_frame_at(VeilVnotePlayer* p, int ms,
   (void)p; (void)ms; (void)dst; (void)dst_cap; (void)out_w; (void)out_h;
   return 0;
 #endif
+  VEIL_MEDIA_GUARD_END(VEIL_VNOTE_ERR)
 }
 
 extern "C" void veil_media_vnote_player_destroy(VeilVnotePlayer* p) {
+  VEIL_MEDIA_GUARD_BEGIN
 #if defined(VEIL_MEDIA_HAVE_WEBRTC)
   if (!p) return;
   if (p->dec) p->dec->Release();
@@ -880,9 +924,11 @@ extern "C" void veil_media_vnote_player_destroy(VeilVnotePlayer* p) {
 #else
   (void)p;
 #endif
+  VEIL_MEDIA_GUARD_END_VOID
 }
 
 void veil_media_vnote_recorder_destroy(VeilVnoteRecorder* rec) {
+  VEIL_MEDIA_GUARD_BEGIN
 #if defined(VEIL_MEDIA_HAVE_WEBRTC)
   if (!rec) return;
   {
@@ -908,6 +954,7 @@ void veil_media_vnote_recorder_destroy(VeilVnoteRecorder* rec) {
 #else
   (void)rec;
 #endif
+  VEIL_MEDIA_GUARD_END_VOID
 }
 
 }  // extern "C"
