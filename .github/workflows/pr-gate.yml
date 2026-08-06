@@ -77,3 +77,6 @@ jobs:
 
       - name: Stale CLI build-snippet policy
         run: ./scripts/check-cli-build-snippets.sh
+
+      - name: One definition of the mobile artifact build
+        run: ./scripts/check-mobile-build-single-source.sh

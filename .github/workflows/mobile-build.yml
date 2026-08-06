@@ -8,6 +8,17 @@ name: mobile-cross-compile
 # Manually triggered or on git tag push (release flow).  Skipped on
 # regular pushes — full matrix takes ~15-20 min and isn't load-bearing
 # for the daemon-side CI.
+#
+# Every leg calls `scripts/build-mobile.sh`, the same script a developer runs,
+# rather than spelling out its own `cargo build`.  It used to spell them out,
+# and they drifted: the script built with `production-seeds,node-embedded,
+# packet-tunnel` while this file passed `production-seeds` alone.  So the
+# artifacts uploaded here had no in-process node — the thing iOS cannot work
+# without and the deniable posture on Android depends on — and nothing said so.
+# The iOS legs had drifted further still: the script emits a staticlib through
+# `cargo rustc` and sets the bindgen triple for the simulator targets, neither
+# of which this file did.  Two definitions of one artifact is the defect; one
+# is the fix.
 
 on:
   workflow_dispatch:
@@ -40,6 +51,12 @@ jobs:
         with:
           targets: ${{ matrix.triple }}
 
+      # rust-toolchain.toml pins the channel, and the action above installs the
+      # target for whatever IT installed — not for the pinned toolchain cargo
+      # actually runs. Add it explicitly, which resolves through the pin.
+      - name: Add the cross target to the PINNED toolchain
+        run: rustup target add ${{ matrix.triple }}
+
       - name: Install cargo-ndk
         run: cargo install cargo-ndk --locked
 
@@ -52,14 +69,12 @@ jobs:
       - name: Cross-compile ffi
         env:
           ANDROID_NDK_HOME: ${{ steps.ndk.outputs.ndk-path }}
-        run: |
-          # cycle-7 (M3): this is the release/tag flow — bake in BUILTIN_SEEDS
-          # (production-seeds), never the bootstrap-less dev `allow-empty-seeds`.
-          # --platform 24: 32-bit armv7 builds rocksdb's C++ <fstream>, which
-          # needs fseeko/ftello — only present in bionic at API >= 24.
-          cargo ndk --target ${{ matrix.triple }} --platform 24 -- \
-            build --release -p veilclient-ffi \
-                  --features production-seeds
+        # Features, the NDK platform level and everything else live in the
+        # script. This is the release/tag flow, so the script's default
+        # `production-seeds` (BUILTIN_SEEDS baked in) is what we want, and its
+        # VEIL_MOBILE_DEV guard makes the bootstrap-less `allow-empty-seeds`
+        # impossible to reach from here by accident.
+        run: scripts/build-mobile.sh --target ${{ matrix.triple }}
 
       - name: Upload artifact
         uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
@@ -89,17 +104,15 @@ jobs:
         with:
           targets: ${{ matrix.triple }}
 
+      - name: Add the cross target to the PINNED toolchain
+        run: rustup target add ${{ matrix.triple }}
+
+      # The script owns the iOS specifics this file used to get wrong: a
+      # staticlib via `cargo rustc` (Apple disallows third-party dylibs in iOS
+      # apps), the `-simulator` bindgen triple the sim targets need, and the
+      # iOS 13.0 deployment floor.
       - name: Cross-compile ffi
-        env:
-          # iOS device/sim link at this deployment target; ___chkstk_darwin
-          # lives in libSystem from iOS 13 on, and rustc links cdylibs with
-          # -nodefaultlibs (dropping compiler-rt's copy), so an older target
-          # leaves it undefined. Harmless for the macOS legs in this matrix.
-          IPHONEOS_DEPLOYMENT_TARGET: "13.0"
-        run: |
-          cargo build --release -p veilclient-ffi \
-                --target ${{ matrix.triple }} \
-                --features production-seeds
+        run: scripts/build-mobile.sh --target ${{ matrix.triple }}
 
       - name: Upload artifact
         uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
@@ -163,12 +176,17 @@ jobs:
         with:
           targets: ${{ matrix.triple }}
 
+      - name: Add the cross target to the PINNED toolchain
+        run: rustup target add ${{ matrix.triple }}
+
       - name: Install cross-linker for ARM64
         if: matrix.triple == 'aarch64-unknown-linux-gnu'
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
 
+      # The cross toolchain env stays here — it is about THIS runner, not about
+      # what a veilclient-ffi artifact is. The features are the script's.
       - name: Cross-compile ffi
         env:
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
@@ -177,10 +195,7 @@ jobs:
           # headers (bits/wordsize.h not found). Point them at the cross gcc.
           CC_aarch64_unknown_linux_gnu: aarch64-linux-gnu-gcc
           CXX_aarch64_unknown_linux_gnu: aarch64-linux-gnu-g++
-        run: |
-          cargo build --release -p veilclient-ffi \
-                --target ${{ matrix.triple }} \
-                --features production-seeds
+        run: scripts/build-mobile.sh --target ${{ matrix.triple }}
 
       - name: Upload artifact
         uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
