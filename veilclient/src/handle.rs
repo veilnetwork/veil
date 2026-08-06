@@ -859,11 +859,16 @@ impl AppSender {
     /// GIVES the relay's KEM key (`dst_x25519_pk`) directly — so the daemon
     /// routes the source-routed onion STRAIGHT to `(dst_node_id, dst_x25519_pk)`
     /// with NO rendezvous-ad self-resolve (the flaky lookup that returned
-    /// `NoRendezvous`). Still authenticated (the relay verifies us) and still
-    /// attaches a one-time reply block delivered back to `(this app,
-    /// reply_endpoint_id)`. The KEM-key-given mailbox FETCH. `dst_x25519_pk` is
-    /// a PUBLIC key (the relay's published KEM key). Awaits the daemon's status
-    /// ack (unlike the self-resolving variant, which is fire-and-forget).
+    /// `NoRendezvous`). Still authenticated (the relay verifies us). The
+    /// KEM-key-given mailbox FETCH and ACK. `dst_x25519_pk` is a PUBLIC key (the
+    /// relay's published KEM key). Awaits the daemon's status ack (unlike the
+    /// self-resolving variant, which is fire-and-forget).
+    ///
+    /// `reply_endpoint_id` non-zero attaches a one-time reply block delivered
+    /// back to `(this app, reply_endpoint_id)`. Pass **0** when the target never
+    /// answers: no block, and no ephemeral reply circuit built for it. Endpoint
+    /// 0 receives nothing, so the two readings agree — a block addressed there
+    /// would be undeliverable.
     #[allow(clippy::too_many_arguments)]
     pub async fn send_anonymous_authenticated_direct_with_reply(
         &self,

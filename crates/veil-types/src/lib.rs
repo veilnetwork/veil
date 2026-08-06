@@ -265,10 +265,14 @@ pub trait AnonOnionSender: Send + Sync {
     /// relay), so the implementation routes a source-routed onion straight to it
     /// with NO rendezvous-ad resolve (eliminates the flaky self-resolve that
     /// returns `NoRendezvous`). Still authenticated — the relay verifies the
-    /// sender — and still attaches a one-time reply block addressed to
-    /// `(reply_app_id, reply_endpoint_id)` on this node so the relay can answer
-    /// WITHOUT either side publishing a public ad. The circuit length is the
-    /// implementation's configured default.
+    /// sender. The circuit length is the implementation's configured default.
+    ///
+    /// `reply` is `Some((reply_app_id, reply_endpoint_id))` when the caller
+    /// wants an answer: an ephemeral one-time reply circuit is built and a reply
+    /// block addressed there is attached, so the relay can answer WITHOUT either
+    /// side publishing a public ad. `None` skips the circuit entirely — for a
+    /// send the target never answers (the mailbox ACK), where building one costs
+    /// a full circuit per relay and carries nothing back.
     #[allow(clippy::too_many_arguments)]
     fn send_authenticated_direct_with_reply<'a>(
         &'a self,
@@ -277,8 +281,7 @@ pub trait AnonOnionSender: Send + Sync {
         app_id: [u8; 32],
         endpoint_id: u32,
         data: &'a [u8],
-        reply_app_id: [u8; 32],
-        reply_endpoint_id: u32,
+        reply: Option<([u8; 32], u32)>,
     ) -> std::pin::Pin<
         Box<dyn std::future::Future<Output = Result<(), AnonOnionSendError>> + Send + 'a>,
     >;

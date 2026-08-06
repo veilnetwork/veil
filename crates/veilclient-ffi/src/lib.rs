@@ -3629,11 +3629,15 @@ pub unsafe extern "C" fn veil_send_anonymous_authenticated_with_reply(
 /// the relay's KEM key (`dst_x25519_pk`, 32 bytes) directly — so the daemon
 /// routes the source-routed onion straight to `(dst_node_id, dst_x25519_pk)`
 /// with NO rendezvous-ad self-resolve (the flaky lookup that returned
-/// `NoRendezvous`). Still authenticated (the relay verifies the sender) and
-/// still attaches a one-time reply block delivered back to
-/// `(this app, reply_endpoint_id)`. This is the KEM-key-given mailbox FETCH;
-/// `dst_x25519_pk` is a PUBLIC key (the relay's published KEM key). All three
-/// `dst_*` arrays are 32 bytes.
+/// `NoRendezvous`). Still authenticated (the relay verifies the sender). This is
+/// the KEM-key-given mailbox FETCH and ACK; `dst_x25519_pk` is a PUBLIC key (the
+/// relay's published KEM key). All three `dst_*` arrays are 32 bytes.
+///
+/// A non-zero `reply_endpoint_id` attaches a one-time reply block delivered back
+/// to `(this app, reply_endpoint_id)`. Pass **0** when the target never answers
+/// (the mailbox ACK): no block is attached and no ephemeral reply circuit is
+/// built for it. Endpoint 0 receives nothing, so a block addressed there could
+/// not be delivered in any case.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn veil_send_anonymous_authenticated_direct_with_reply(
     app: *mut VeilApp,
