@@ -931,9 +931,10 @@ pub unsafe extern "C" fn veil_node_apply_config(
     // instant admin is ready. The generous ceiling is purely a failsafe for a
     // node that never comes up at all (e.g. a port it can't bind).
     const APPLY_CONNECT_ATTEMPTS: usize = 900; // ~90 s @ 100 ms
+    let started = std::time::Instant::now();
     let outcome = rt.block_on(async {
         let mut last_err = String::from("admin socket never became ready");
-        for _ in 0..APPLY_CONNECT_ATTEMPTS {
+        for attempt in 1..=APPLY_CONNECT_ATTEMPTS {
             let cmd = veil_node_runtime::admin::AdminCommand::ApplyConfig {
                 toml_content: toml_content.clone(),
                 persist: false,
@@ -947,11 +948,36 @@ pub unsafe extern "C" fn veil_node_apply_config(
                 }
                 Err(e) => {
                     last_err = e.to_string();
+                    // The node runs on its own thread. Once that thread has
+                    // EXITED there will never be an admin socket, so the
+                    // remaining attempts are ninety seconds of waiting for
+                    // something that already failed — and the caller is left
+                    // with the connect error rather than the reason.
+                    if node_thread_finished(node) {
+                        return Err(format!(
+                            "the node stopped before binding its admin socket at {} \
+                             (after {attempt} attempt(s), {:?}); \
+                             the node's own log carries why it stopped. \
+                             Last connect error: {last_err}",
+                            admin_socket.display(),
+                            started.elapsed(),
+                        ));
+                    }
                     tokio::time::sleep(Duration::from_millis(100)).await;
                 }
             }
         }
-        Err(last_err)
+        // Say what actually happened. This used to surface `last_err` alone,
+        // which for a socket that never appeared is a bare "No such file or
+        // directory (os error 2)" naming no file — indistinguishable from a
+        // config that points at a missing path, and read as exactly that.
+        Err(format!(
+            "the node did not bind its admin socket at {} within {:?} \
+             ({APPLY_CONNECT_ATTEMPTS} attempts), so apply-config never ran. \
+             Last connect error: {last_err}",
+            admin_socket.display(),
+            started.elapsed(),
+        ))
     });
     match outcome {
         Ok(()) => 0,
@@ -960,6 +986,17 @@ pub unsafe extern "C" fn veil_node_apply_config(
             -1
         }
     }
+}
+
+/// Whether the node's own thread has already exited.
+///
+/// `true` also when the handle no longer holds a thread — a node that was
+/// stopped is not going to bind anything either, and reporting "still coming
+/// up" for it would be the same wait-for-nothing this answers.
+fn node_thread_finished(node: &VeilNode) -> bool {
+    // Scoped so the std guard is dropped before any await in the caller.
+    let guard = veil_util::lock!(node.thread);
+    guard.as_ref().map(|t| t.is_finished()).unwrap_or(true)
 }
 
 /// Stop the embedded node: trigger graceful shutdown and join its thread.
@@ -1308,6 +1345,55 @@ mod tests {
             .into_owned();
         assert!(msg.contains("deferred"), "got: {msg}");
         unsafe { crate::veil_free_string(err) };
+    }
+
+    /// A node whose thread has exited will never bind an admin socket, and the
+    /// old loop spent ninety seconds finding that out — then reported the
+    /// connect error, `No such file or directory (os error 2)`, naming no file.
+    ///
+    /// On a phone that read as "the config points at a missing path" and sent
+    /// the search in the wrong direction entirely, while the app quietly fell
+    /// back to a fake transport and kept answering "ready".
+    #[test]
+    fn apply_config_gives_up_at_once_when_the_node_thread_is_gone() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("admin.sock");
+        let done = std::thread::spawn(|| {});
+        while !done.is_finished() {
+            std::thread::yield_now();
+        }
+        let node = VeilNode {
+            shutdown: Mutex::new(None),
+            thread: Mutex::new(Some(done)),
+            admin_socket: Some(sock.clone()),
+            #[cfg(feature = "packet-tunnel")]
+            owned_runtime_dir: None,
+        };
+        let mut err: *mut c_char = std::ptr::null_mut();
+        let toml = b"[global]\n";
+        let started = std::time::Instant::now();
+        let rc = unsafe { veil_node_apply_config(&node, toml.as_ptr(), toml.len(), &mut err) };
+        let elapsed = started.elapsed();
+        assert_eq!(rc, -1);
+        assert!(!err.is_null());
+        let msg = unsafe { CStr::from_ptr(err) }
+            .to_string_lossy()
+            .into_owned();
+        unsafe { crate::veil_free_string(err) };
+
+        assert!(
+            msg.contains("stopped before binding"),
+            "the message must say the node stopped, not repeat a connect \
+             errno; got: {msg}"
+        );
+        assert!(
+            msg.contains(&sock.display().to_string()),
+            "the message must name the socket it waited for; got: {msg}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "a dead node must not be waited out to the 90 s ceiling; took {elapsed:?}"
+        );
     }
 
     // Reproduces the xVeil deniable-boot flow end to end: provision an identity,
