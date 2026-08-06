@@ -4793,7 +4793,7 @@ impl veil_ipc::RendezvousReplicaResolver for RendezvousResolverImpl {
             // replicated yet). The local-fast-path validator only trusts a cached
             // ad that decodes, verifies, names this receiver, and is currently
             // valid (mirror-cache-poison resistant); remote results re-verified.
-            let ads = resolve_fresh_rendezvous_ads(
+            let mut ads = resolve_fresh_rendezvous_ads(
                 &self.dht,
                 &self.session_tx_registry,
                 &self.pending_recursive,
@@ -4805,6 +4805,31 @@ impl veil_ipc::RendezvousReplicaResolver for RendezvousResolverImpl {
                 false,
             )
             .await;
+            // The DHT copy of a receiver's ads disappears as soon as it stops
+            // republishing them, and a dozing phone stops within minutes — the
+            // very recipient the offline mailbox is for. An empty walk is not
+            // evidence the relay set moved; the ad we already hold is signed
+            // good for 24 hours. See `last_known_valid` for why this is the
+            // deposit path's call to make and never the live path's.
+            if ads.is_empty() {
+                let now_unix = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                if let Some(stale) = self.resolve_cache.last_known_valid(&receiver_id, now_unix) {
+                    self.logger.info(
+                        "anonymity.rendezvous.resolve.last_known",
+                        format!(
+                            "receiver={} no live ad in the DHT; depositing at {} \
+                             previously-validated replica(s) still inside their \
+                             signed validity",
+                            veil_util::hex_short(&receiver_id),
+                            stale.len(),
+                        ),
+                    );
+                    ads = stale;
+                }
+            }
             // Prefer the freshest signed ad before relay dedup. This avoids
             // returning a stale pre-cookie-fix ad just because it was in a
             // lower-numbered slot for the same relay.
