@@ -7565,6 +7565,52 @@ impl NodeServices {
         }
     }
 
+    /// This node's onion-stream rendezvous cookie — the value a peer must put in
+    /// front of every `[cookie][bytes]` circuit cell for R to splice it down our
+    /// pinned receive circuit.
+    ///
+    /// It is the cookie our registration key MAY claim, and nothing else: R
+    /// recomputes it from `reg_pk` and refuses any other pairing (see
+    /// [`veil_anonymity::circuit_register::cookie_for_reg_pk`]). A cookie derived
+    /// from the node_id instead — the shape the plain mailbox rendezvous uses,
+    /// where the registry is namespaced by the registrant's authenticated
+    /// session peer and needs no such binding — is refused at every relay, which
+    /// leaves the receive circuit unACKed and the whole live path dark.
+    ///
+    /// Consequently this value is NOT derivable by a peer from our node_id. A
+    /// sender learns it from the stream ad we publish once a receive circuit is
+    /// confirmed (`publish_stream_rendezvous_ad`).
+    pub fn onion_stream_local_cookie(&self) -> [u8; veil_anonymity::circuit_register::COOKIE_LEN] {
+        use base64::{Engine as _, engine::general_purpose::STANDARD};
+
+        let kp = self.onion_stream_registration_keypair();
+        // The key above is minted here as a raw 32-byte Ed25519 verifying key, so
+        // the decode cannot fail; fall back to an all-zero cookie rather than
+        // panicking on the hot receive path if that ever stops holding (an
+        // all-zero cookie fails the pairing check at R exactly like any other
+        // mismatch — it degrades to "no live path", never to a wrong binding).
+        STANDARD
+            .decode(&kp.public_key)
+            .ok()
+            .and_then(|v| <[u8; 32]>::try_from(v).ok())
+            .map(|pk| veil_anonymity::circuit_register::cookie_for_reg_pk(&pk))
+            .unwrap_or([0u8; veil_anonymity::circuit_register::COOKIE_LEN])
+    }
+
+    /// The MAILBOX rendezvous cookie a node publishes in its plain ads.
+    ///
+    /// A receiver's plain (sovereign-signed) ad space holds two classes of ad:
+    /// the mailbox ads the rendezvous-recipient task publishes under this
+    /// node_id-derived cookie, and the onion-stream ads published under
+    /// [`Self::onion_stream_local_cookie`]. A sender cannot compute the latter,
+    /// so it identifies stream ads by ELIMINATION — every ad whose cookie is not
+    /// this one. Exposed for that check.
+    pub fn mailbox_rendezvous_cookie(
+        node_id: &[u8; 32],
+    ) -> [u8; veil_anonymity::circuit_register::COOKIE_LEN] {
+        service_tasks::rendezvous_cookie_from_node_id(node_id)
+    }
+
     /// Register a LOCATION-anonymous service (onion-registration b5b-runtime):
     /// build an onion circuit whose terminus is the rendezvous relay R
     /// (`relay_path.last()`), and register `cookie` AT R over that circuit —
@@ -7808,18 +7854,26 @@ impl NodeServices {
     }
 
     /// Open a pinned stream circuit to a rendezvous relay R (`relay_path.last()`)
-    /// and REGISTER `cookie` at R, so the R-splice (`splice_stream_cell`) can
-    /// forward a peer's `[cookie][bytes]` cells down THIS circuit (Phase 1c++).
-    /// `reg_kp` signs the registration (first-wins anti-squat); `last_epoch` is the
-    /// per-cookie monotonic freshness counter. Returns the [`DataCircuit`] send
-    /// handle + the inbound return-cell channel. A bidirectional stream uses one
-    /// of these per endpoint; the CellDuplex sends `[peer_cookie][bytes]` forward
-    /// cells and reads returns off the channel. Mirrors `build_onion_circuit_once`'s
-    /// registration, but keeps the data-plane handle instead of just the ACK flag.
+    /// and REGISTER this node's stream cookie at R, so the R-splice
+    /// (`splice_stream_cell`) can forward a peer's `[cookie][bytes]` cells down
+    /// THIS circuit (Phase 1c++). `reg_kp` signs the registration; `last_epoch`
+    /// is the per-cookie monotonic freshness counter. Returns the [`DataCircuit`]
+    /// send handle + the inbound return-cell channel. A bidirectional stream uses
+    /// one of these per endpoint; the CellDuplex sends `[peer_cookie][bytes]`
+    /// forward cells and reads returns off the channel. Mirrors
+    /// `build_onion_circuit_once`'s registration, but keeps the data-plane handle
+    /// instead of just the ACK flag.
+    ///
+    /// The cookie is NOT a parameter: R refuses any pairing other than
+    /// [`veil_anonymity::circuit_register::cookie_for_reg_pk`], so a caller that
+    /// minted its cookie independently of `reg_kp` would build a circuit whose
+    /// registration is silently refused — no ACK, no cookie→circuit binding, and
+    /// therefore no live path at all. Deriving it here from the key makes that
+    /// pairing unrepresentable. Callers that need the value use
+    /// [`Self::onion_stream_local_cookie`], which derives it the same way.
     pub fn open_stream_circuit(
         &self,
         relay_path: &[[u8; 32]],
-        cookie: [u8; veil_anonymity::circuit_register::COOKIE_LEN],
         reg_kp: &veil_crypto::GeneratedKeyPair,
         last_epoch: &std::sync::atomic::AtomicU64,
     ) -> std::result::Result<
@@ -7835,6 +7889,7 @@ impl NodeServices {
             .ok()
             .and_then(|v| v.try_into().ok())
             .ok_or(AnonOnionSendError::NoIdentity)?;
+        let cookie = veil_anonymity::circuit_register::cookie_for_reg_pk(&reg_pk);
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
@@ -8171,7 +8226,6 @@ impl NodeServices {
     pub async fn open_stream_circuit_to_rendezvous_relay(
         &self,
         rendezvous_node_id: [u8; 32],
-        cookie: [u8; veil_anonymity::circuit_register::COOKIE_LEN],
         reg_kp: &veil_crypto::GeneratedKeyPair,
         last_epoch: &std::sync::atomic::AtomicU64,
         hop_count: usize,
@@ -8219,7 +8273,7 @@ impl NodeServices {
                 }
             }
         };
-        self.open_stream_circuit(&relay_path, cookie, reg_kp, last_epoch)
+        self.open_stream_circuit(&relay_path, reg_kp, last_epoch)
     }
 
     /// Open a pinned stream circuit to the receiver's PUBLISHED rendezvous relay.
@@ -8227,13 +8281,12 @@ impl NodeServices {
     /// This is the production-safe stream counterpart of
     /// [`Self::send_anonymous_authenticated_to`]: resolve the receiver's freshest
     /// signed `RendezvousAd`s, then try their relays in deterministic freshness
-    /// order until one stateful circuit opens. The caller-supplied `cookie` is
-    /// THIS origin's stream cookie; registering it at the receiver's R lets return
-    /// cells (ACKs / reverse stream data) splice back over this same circuit.
+    /// order until one stateful circuit opens. The circuit registers THIS origin's
+    /// stream cookie at the receiver's R, so return cells (ACKs / reverse stream
+    /// data) splice back over this same circuit.
     pub async fn open_stream_circuit_to_receiver_ad(
         &self,
         receiver_node_id: [u8; 32],
-        cookie: [u8; veil_anonymity::circuit_register::COOKIE_LEN],
         reg_kp: &veil_crypto::GeneratedKeyPair,
         last_epoch: &std::sync::atomic::AtomicU64,
         hop_count: usize,
@@ -8249,9 +8302,7 @@ impl NodeServices {
         let mut last_err = AnonOnionSendError::NoRelays;
         for relay in relays {
             match self
-                .open_stream_circuit_to_rendezvous_relay(
-                    relay, cookie, reg_kp, last_epoch, hop_count,
-                )
+                .open_stream_circuit_to_rendezvous_relay(relay, reg_kp, last_epoch, hop_count)
                 .await
             {
                 Ok(opened) => return Ok(opened),
@@ -8270,7 +8321,6 @@ impl NodeServices {
     /// ad. `None`-relays error if no resolvable relay is known yet.
     pub async fn open_stream_circuit_auto(
         &self,
-        cookie: [u8; veil_anonymity::circuit_register::COOKIE_LEN],
         reg_kp: &veil_crypto::GeneratedKeyPair,
         last_epoch: &std::sync::atomic::AtomicU64,
     ) -> std::result::Result<
@@ -8345,7 +8395,7 @@ impl NodeServices {
             // The deterministic R isn't cached yet — retry (NOT a different R).
             return Err(AnonOnionSendError::NoRelays);
         }
-        self.open_stream_circuit(&[r], cookie, reg_kp, last_epoch)
+        self.open_stream_circuit(&[r], reg_kp, last_epoch)
     }
 
     /// Send one FORWARD data cell over a pinned [`DataCircuit`]: `wrap_payload`

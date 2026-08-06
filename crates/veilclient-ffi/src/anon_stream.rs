@@ -501,8 +501,15 @@ enum RouteClass {
     Ack,
 }
 
-/// Deterministic 16-byte stream cookie for a node — both ends derive the peer's
-/// the same way (domain-separated app-id, distinct from the chat endpoint).
+/// Deterministic 16-byte stream cookie for a node — LEGACY, validation mode only.
+///
+/// The published-rendezvous path no longer uses this: the rendezvous relay
+/// refuses any cookie that is not the one the registrant's key may claim, so a
+/// node_id-derived cookie is unregisterable and its circuit never gets an ACK.
+/// There the receiver's cookie is [`veil_node_runtime::NodeServices::
+/// onion_stream_local_cookie`] and a sender reads the peer's out of the stream
+/// ad. `ValidationMinRouting` has no ad to read, so it keeps deriving both ends'
+/// cookies from the node id — the same (unregisterable) shape it always had.
 fn stream_cookie(node: &[u8; 32]) -> [u8; COOKIE_LEN] {
     // v2 leaves any pre-fix registration (whose random anti-squat key cannot be
     // reproduced after a hub restart) in a different relay-registry slot. Both
@@ -688,6 +695,12 @@ struct CircuitEntry {
     rendezvous_node: [u8; 32],
     first_hop_close_generation: u64,
     peer_tag: [u8; CIRCUIT_PEER_TAG_LEN],
+    /// The peer's stream cookie, taken from the very ad this circuit was opened
+    /// against. It is a function of the peer's registration key, not of its
+    /// node id, so it cannot be recomputed later from `dst_node` — carrying it
+    /// on the route is the only way the send path can address a cell that R
+    /// will splice.
+    peer_cookie: [u8; COOKIE_LEN],
     receiver_x25519_pk: [u8; 32],
     opened_at: Instant,
     last_used: Instant,
@@ -708,6 +721,7 @@ impl CircuitEntry {
             circuit: Arc::clone(&self.circuit),
             rendezvous_node: Some(self.rendezvous_node),
             first_hop_close_generation: self.first_hop_close_generation,
+            peer_cookie: self.peer_cookie,
             envelope: CircuitEnvelope::ProtectedIntro {
                 peer_tag: self.peer_tag,
                 receiver_x25519_pk: self.receiver_x25519_pk,
@@ -731,6 +745,9 @@ struct CircuitRoute {
     circuit: Arc<veil_node_runtime::DataCircuit>,
     rendezvous_node: Option<[u8; 32]>,
     first_hop_close_generation: u64,
+    /// Cookie every cell on this route is addressed to — see
+    /// [`CircuitEntry::peer_cookie`].
+    peer_cookie: [u8; COOKIE_LEN],
     envelope: CircuitEnvelope,
     stats: Option<Arc<CircuitRouteStats>>,
 }
@@ -1211,7 +1228,7 @@ impl CellSender for CircuitCells {
             }
             return Ok(());
         }
-        let env = self.stream_envelope(&dst.node, &route, &cell, is_handshake)?;
+        let env = self.stream_envelope(&route, &cell, is_handshake)?;
         if is_data {
             self.data_pacer.wait(dst.node).await;
         }
@@ -1354,12 +1371,11 @@ impl CircuitCells {
     /// `[cookie][sender-or-peer-tag][optional sealed intro][cell]`.
     fn stream_envelope(
         &self,
-        dst_node: &[u8; 32],
         route: &CircuitRoute,
         cell: &[u8],
         is_handshake: bool,
     ) -> io::Result<Vec<u8>> {
-        let cookie = stream_cookie(dst_node);
+        let cookie = route.peer_cookie;
         let protected_intro_len =
             matches!(route.envelope, CircuitEnvelope::ProtectedIntro { .. }) && is_handshake;
         let mut env = Vec::with_capacity(
@@ -1458,7 +1474,7 @@ impl CircuitCells {
         // intro bytes are effectively free; the only cost is a per-cell seal
         // (negligible at media rates — optimizable to first-cell-per-route once
         // an ack path exists).
-        let env = match self.stream_envelope(&dst_node, &route, &cell, true) {
+        let env = match self.stream_envelope(&route, &cell, true) {
             Ok(env) => env,
             // Oversized (payload > one cell) — drop; callers batch to fit.
             Err(_) => return false,
@@ -1556,7 +1572,7 @@ impl CircuitCells {
             copies
         };
         for alt in copies {
-            let Ok(env) = self.stream_envelope(&dst_node, &alt, cell, false) else {
+            let Ok(env) = self.stream_envelope(&alt, cell, false) else {
                 continue;
             };
             if self
@@ -1674,7 +1690,6 @@ impl CircuitCells {
         let base = (self.stripe_rr.load(Ordering::Relaxed) as usize) % n;
         // Drain the run once; dispatch cell i to route (base+i) % n.
         let run: Vec<Vec<u8>> = cells.drain(..run_len).collect();
-        let cookie = stream_cookie(&dst.node);
         let mut per_route_ok = vec![true; n];
         let mut failed_routes: Vec<usize> = Vec::new();
         let mut i = 0usize;
@@ -1687,7 +1702,7 @@ impl CircuitCells {
                 i += 1;
                 continue;
             }
-            match self.send_one_cell_on_route(&cookie, routes[ri], &run[i]) {
+            match self.send_one_cell_on_route(&routes[ri].peer_cookie, routes[ri], &run[i]) {
                 Ok(true) => i += 1,
                 Ok(false) => {
                     // Enqueue rejected (not queue-full): mark the route dead for
@@ -1792,7 +1807,7 @@ impl CircuitCells {
         count: usize,
         cells: &mut std::collections::VecDeque<Vec<u8>>,
     ) -> io::Result<(usize, Option<veil_node_runtime::DataCircuitSendError>)> {
-        let cookie = stream_cookie(&dst_node);
+        let cookie = route.peer_cookie;
         let mut sent = 0usize;
         while sent < count {
             let cell = cells.front().expect("chunk bounded by deque len");
@@ -1957,6 +1972,9 @@ impl CircuitCells {
                     circuit,
                     rendezvous_node: None,
                     first_hop_close_generation: 0,
+                    // Validation mode has no ad to read a cookie out of; it keeps
+                    // the legacy node_id derivation both ends agreed on.
+                    peer_cookie: stream_cookie(&dst_node),
                     envelope: CircuitEnvelope::LegacyClearSender {
                         sender_node: self.me,
                     },
@@ -3307,7 +3325,10 @@ fn try_open_circuit(
         let latest = veil_node_runtime::embedded_services()?;
         (latest.local_node_id() == me).then_some(latest)
     })?;
-    let cookie = stream_cookie(&me);
+    // OUR cookie: the one our stream registration key may claim. R recomputes it
+    // from `reg_pk` and refuses any other pairing, so this must not be derived
+    // from the node id (see `onion_stream_local_cookie`).
+    let cookie = services.onion_stream_local_cookie();
     let inbound_circuits: Arc<tokio::sync::Mutex<Vec<Arc<veil_node_runtime::DataCircuit>>>> =
         Arc::new(tokio::sync::Mutex::new(Vec::new()));
     let outbound_circuits = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
@@ -3406,9 +3427,7 @@ fn try_open_circuit(
         loop {
             attempt += 1;
             let opened =
-                match open_inbound_circuits(&services_bg, me, cookie, &reg_kp_bg, &epoch_bg, mode)
-                    .await
-                {
+                match open_inbound_circuits(&services_bg, me, &reg_kp_bg, &epoch_bg, mode).await {
                     Ok(opened) => opened,
                     Err(e) => {
                         if attempt == 1 || attempt.is_multiple_of(15) {
@@ -3703,7 +3722,6 @@ type OpenedInboundCircuit = (
 async fn open_inbound_circuits(
     services: &veil_node_runtime::NodeServices,
     me: [u8; 32],
-    cookie: [u8; COOKIE_LEN],
     reg_kp: &veil_crypto::GeneratedKeyPair,
     epoch: &AtomicU64,
     mode: CircuitMode,
@@ -3712,7 +3730,7 @@ async fn open_inbound_circuits(
 
     match mode {
         CircuitMode::ValidationMinRouting => services
-            .open_stream_circuit_auto(cookie, reg_kp, epoch)
+            .open_stream_circuit_auto(reg_kp, epoch)
             .await
             .map(|(circuit, rx)| vec![(None, circuit, rx)]),
         CircuitMode::PublishedRendezvous => {
@@ -3737,13 +3755,7 @@ async fn open_inbound_circuits(
             let mut last_err = AnonOnionSendError::NoRelays;
             for relay in relays {
                 match services
-                    .open_stream_circuit_to_rendezvous_relay(
-                        relay,
-                        cookie,
-                        reg_kp,
-                        epoch,
-                        CIRCUIT_HOPS,
-                    )
+                    .open_stream_circuit_to_rendezvous_relay(relay, reg_kp, epoch, CIRCUIT_HOPS)
                     .await
                 {
                     Ok((circuit, rx)) => opened.push((Some(relay), circuit, rx)),
@@ -3802,63 +3814,40 @@ async fn open_outbound_circuit(
         .resolve_stream_rendezvous_ads(dst_node)
         .await
         .map_err(|e| format!("resolve receiver ads: {e:?}"))?;
-    let expected_stream_cookie = stream_cookie(&dst_node);
     let resolved_ads = ads.len();
-    let receiver_ads = ads.clone();
+    // The receiver's plain ad space carries two classes: MAILBOX ads under the
+    // node_id-derived cookie the rendezvous-recipient task publishes, and the
+    // onion-stream ads the receiver publishes once a receive circuit is
+    // confirmed. Only the second class names a cookie R will splice, and its
+    // value is NOT derivable from the node id — it is the cookie the receiver's
+    // registration key may claim (R refuses any other pairing). So identify the
+    // stream ads by ELIMINATION and take the cookie from the ad itself.
+    //
+    // There is deliberately NO fall back to the mailbox ads: addressing a cell
+    // to a mailbox cookie cannot splice — R holds it in the session-keyed
+    // registry, not the circuit one — so a "fallback" pool only spends circuits
+    // and confirmation timeouts on routes that can never carry a byte. Failing
+    // here hands the message to the mailbox path instead, which is where it was
+    // going to end up anyway.
+    let mailbox_cookie = veil_node_runtime::NodeServices::mailbox_rendezvous_cookie(&dst_node);
     let stream_ads = ads
         .iter()
-        .filter(|ad| ad.auth_cookie == expected_stream_cookie)
+        .filter(|ad| ad.auth_cookie != mailbox_cookie)
         .cloned()
         .collect::<Vec<_>>();
-    let using_stream_cookie_ads = !stream_ads.is_empty();
-    if using_stream_cookie_ads {
-        let mut selected = stream_ads;
-        let stream_cookie_ad_count = selected.len();
-        let mut seen_relays = selected
-            .iter()
-            .map(|ad| ad.rendezvous_node_id)
-            .collect::<HashSet<_>>();
-        if selected.len() < desired_pool_target {
-            for ad in receiver_ads {
-                if selected.len() >= desired_pool_target {
-                    break;
-                }
-                if seen_relays.insert(ad.rendezvous_node_id) {
-                    selected.push(ad);
-                }
-            }
-            diag_node(
-                &me,
-                &format!(
-                    "outbound stream rendezvous supplement for {}: stream-cookie ads underfilled {}/{}; selected {} receiver ad(s)",
-                    short_node(&dst_node),
-                    stream_cookie_ad_count,
-                    desired_pool_target,
-                    selected.len()
-                ),
-            );
-        }
-        ads = selected;
-    } else {
-        // The circuit DATA envelope below is still addressed to
-        // `stream_cookie(dst)`. The rendezvous ad is used to learn the receiver's
-        // current R + X25519 intro key. In practice the normal mailbox ad can be
-        // fresher/visible before the stream-cookie ad lands (or the stream ad can
-        // be overwritten in the shared rendezvous slots), while the receiver has
-        // already registered the stream cookie at the same pinned R. Do not fail
-        // the whole bulk stream at open time; prefer matching stream ads when
-        // present, otherwise fall back to the freshest receiver ads and let the
-        // R-splice/ARQ prove whether that R owns the stream cookie.
+    if stream_ads.is_empty() {
         diag_node(
             &me,
             &format!(
-                "outbound stream rendezvous fallback for {}: no ad cookie={} among {} ad(s); using receiver ads",
+                "outbound stream rendezvous miss for {}: none of {} ad(s) carries a stream cookie (mailbox cookie={})",
                 short_node(&dst_node),
-                short_cookie(&expected_stream_cookie),
                 resolved_ads,
+                short_cookie(&mailbox_cookie),
             ),
         );
+        return Err("resolve receiver ads: no stream rendezvous ad".to_string());
     }
+    ads = stream_ads;
     let freshest_stream_valid_from = ads
         .iter()
         .map(|ad| ad.valid_from_unix)
@@ -3903,10 +3892,9 @@ async fn open_outbound_circuit(
     diag_node(
         &me,
         &format!(
-            "outbound stream rendezvous filter for {} cookie={} matched={} ads {}->{} fresh={}->{} max_valid_from={}",
+            "outbound stream rendezvous filter for {} stream_ads={} ads {}->{} fresh={}->{} max_valid_from={}",
             short_node(&dst_node),
-            short_cookie(&expected_stream_cookie),
-            using_stream_cookie_ads,
+            before_fresh_filter,
             resolved_ads,
             before_fresh_filter,
             before_fresh_filter,
@@ -4071,7 +4059,6 @@ async fn open_outbound_circuit(
         let (candidate, recv_rx) = match services
             .open_stream_circuit_to_rendezvous_relay(
                 ad.rendezvous_node_id,
-                stream_cookie(&me),
                 &reg_kp,
                 &epoch,
                 CIRCUIT_HOPS,
@@ -4108,7 +4095,9 @@ async fn open_outbound_circuit(
             Arc::clone(&peer_tags),
             Some(candidate.confirmed_flag()),
         );
-        if !confirm_circuit_with_probe(&services, &candidate, &stream_cookie(&me)).await {
+        if !confirm_circuit_with_probe(&services, &candidate, &services.onion_stream_local_cookie())
+            .await
+        {
             last_err = format!(
                 "R={} confirmation timed out after {}ms (no ACK, no probe echo)",
                 short_node(&ad.rendezvous_node_id),
@@ -4176,6 +4165,7 @@ async fn open_outbound_circuit(
             rendezvous_node: ad.rendezvous_node_id,
             first_hop_close_generation: services.session_close_generation(&first_hop),
             peer_tag,
+            peer_cookie: ad.auth_cookie,
             receiver_x25519_pk: ad.receiver_x25519_pk,
             opened_at: now,
             last_used: now,
