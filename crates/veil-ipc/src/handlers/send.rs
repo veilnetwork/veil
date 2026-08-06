@@ -1330,12 +1330,19 @@ pub(crate) async fn send_to_onion_service_status(
     }
 }
 
-/// `SendAuthenticatedDirectWithReply` (the KEM-key-given mailbox FETCH) after
-/// validation: send + await the relay leg, return the wire status (0 = ok).
+/// `SendAuthenticatedDirectWithReply` (the KEM-key-given direct send — mailbox
+/// FETCH and ACK) after validation: send + await the relay leg, return the wire
+/// status (0 = ok).
+///
+/// This is where the wire's `reply_endpoint_id == 0` sentinel is read, and the
+/// only place it exists: below this line "no answer wanted" is a typed `None`.
+/// A zero endpoint can never receive one anyway — a reply block addressed there
+/// is a circuit built to deliver to nobody.
 pub(crate) async fn send_authenticated_direct_with_reply_status(
     anon_onion_sender: Option<std::sync::Arc<dyn veil_types::AnonOnionSender>>,
     p: veil_proto::ipc::SendAuthenticatedDirectWithReplyPayload,
 ) -> u16 {
+    let reply = (p.reply_endpoint_id != 0).then_some((p.src_app_id, p.reply_endpoint_id));
     match anon_onion_sender.as_deref() {
         Some(s) => {
             match s
@@ -1345,8 +1352,7 @@ pub(crate) async fn send_authenticated_direct_with_reply_status(
                     p.target_app_id,
                     p.target_endpoint_id,
                     &p.data,
-                    p.src_app_id,
-                    p.reply_endpoint_id,
+                    reply,
                 )
                 .await
             {
@@ -1784,5 +1790,167 @@ mod ratchet_send_tests {
             .expect("send");
         assert_eq!(fx.me.store.version(), 2);
         assert_eq!(fx.me.store.drain_dirty().len(), 1, "named again");
+    }
+}
+
+/// The `reply_endpoint_id == 0` reading on the KEM-key-given direct send.
+///
+/// The mailbox drain builds SIX onion circuits per round against three relays —
+/// a forward and a reply circuit each for FETCH and for ACK. Half of them were
+/// the ACK's: the ack endpoint never answers, so every reply circuit it built
+/// registered a cookie at a relay, waited for its `CircuitBuilt`, and carried
+/// nothing. Zero now means "no answer wanted", and the ack sends with it.
+///
+/// Both directions are asserted. A handler that simply never attached a reply
+/// block would pass the first test and break every mailbox FETCH.
+#[cfg(test)]
+mod direct_reply_sentinel_tests {
+    use std::sync::Mutex;
+
+    type AnonFut<'a> = std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Result<(), veil_types::AnonOnionSendError>>
+                + Send
+                + 'a,
+        >,
+    >;
+
+    /// Records the `reply` argument of every direct send; every other method is
+    /// off this path and panics rather than silently passing.
+    #[derive(Default)]
+    struct RecordingSender {
+        replies: Mutex<Vec<Option<([u8; 32], u32)>>>,
+    }
+
+    impl veil_types::AnonOnionSender for RecordingSender {
+        fn send_authenticated_direct_with_reply<'a>(
+            &'a self,
+            _target_node_id: [u8; 32],
+            _target_x25519_pk: [u8; 32],
+            _app_id: [u8; 32],
+            _endpoint_id: u32,
+            _data: &'a [u8],
+            reply: Option<([u8; 32], u32)>,
+        ) -> AnonFut<'a> {
+            self.replies.lock().unwrap().push(reply);
+            Box::pin(async { Ok(()) })
+        }
+        fn send_authenticated<'a>(
+            &'a self,
+            _: [u8; 32],
+            _: [u8; 32],
+            _: u32,
+            _: &'a [u8],
+        ) -> AnonFut<'a> {
+            unimplemented!()
+        }
+        fn send_authenticated_with_reply<'a>(
+            &'a self,
+            _: [u8; 32],
+            _: [u8; 32],
+            _: u32,
+            _: &'a [u8],
+            _: [u8; 32],
+            _: u32,
+        ) -> AnonFut<'a> {
+            unimplemented!()
+        }
+        fn send_reply<'a>(&'a self, _: u64, _: &'a [u8], _: [u8; 32]) -> AnonFut<'a> {
+            unimplemented!()
+        }
+        fn register_onion_service<'a>(&'a self, _: usize) -> AnonFut<'a> {
+            unimplemented!()
+        }
+        fn register_rendezvous_publisher(
+            &self,
+            _: [u8; 32],
+            _: [u8; 16],
+            _: u64,
+            _: u8,
+            _: Vec<u8>,
+        ) {
+            unimplemented!()
+        }
+        fn send_to_onion_service<'a>(
+            &'a self,
+            _: [u8; 32],
+            _: [u8; 32],
+            _: u32,
+            _: &'a [u8],
+            _: usize,
+        ) -> AnonFut<'a> {
+            unimplemented!()
+        }
+        fn send_to_onion_service_anonymous<'a>(
+            &'a self,
+            _: [u8; 32],
+            _: [u8; 32],
+            _: u32,
+            _: [u8; 32],
+            _: &'a [u8],
+            _: usize,
+        ) -> AnonFut<'a> {
+            unimplemented!()
+        }
+        fn send_anonymous_direct<'a>(
+            &'a self,
+            _: [u8; 32],
+            _: [u8; 32],
+            _: [u8; 32],
+            _: u32,
+            _: [u8; 32],
+            _: &'a [u8],
+            _: usize,
+        ) -> AnonFut<'a> {
+            unimplemented!()
+        }
+    }
+
+    const SRC_APP: [u8; 32] = [0xA1; 32];
+
+    fn payload(reply_endpoint_id: u32) -> veil_proto::ipc::SendAuthenticatedDirectWithReplyPayload {
+        veil_proto::ipc::SendAuthenticatedDirectWithReplyPayload {
+            target_node_id: [0x01; 32],
+            target_x25519_pk: [0x02; 32],
+            target_app_id: [0x03; 32],
+            src_app_id: SRC_APP,
+            target_endpoint_id: 3,
+            reply_endpoint_id,
+            hop_count: 0,
+            data: vec![0x7Eu8; 32],
+        }
+    }
+
+    async fn reply_arg_for(reply_endpoint_id: u32) -> Option<([u8; 32], u32)> {
+        let sender = std::sync::Arc::new(RecordingSender::default());
+        let status = super::send_authenticated_direct_with_reply_status(
+            Some(sender.clone() as std::sync::Arc<dyn veil_types::AnonOnionSender>),
+            payload(reply_endpoint_id),
+        )
+        .await;
+        assert_eq!(status, 0, "the send itself must succeed");
+        let seen = sender.replies.lock().unwrap().clone();
+        assert_eq!(seen.len(), 1, "exactly one direct send");
+        seen[0]
+    }
+
+    #[tokio::test]
+    async fn a_zero_reply_endpoint_attaches_no_reply_block() {
+        assert_eq!(
+            reply_arg_for(0).await,
+            None,
+            "endpoint 0 can receive nothing, so a reply block addressed there \
+             only costs an ephemeral circuit — the ACK must not pay for one",
+        );
+    }
+
+    #[tokio::test]
+    async fn a_real_reply_endpoint_still_gets_one() {
+        assert_eq!(
+            reply_arg_for(9).await,
+            Some((SRC_APP, 9)),
+            "the mailbox FETCH depends on the reply block; dropping it for \
+             every send would silence the drain",
+        );
     }
 }

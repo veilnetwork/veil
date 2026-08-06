@@ -1985,12 +1985,21 @@ impl SendAnonymousDirectPayload {
 
 /// App → daemon request for an AUTHENTICATED, KEM-key-GIVEN sender-anonymous
 /// send to a KNOWN relay addressed by its `(target_node_id, target_x25519_pk)`,
-/// WITH a one-time reply block attached. Unlike [`SendAnonymousDirectPayload`]
-/// the recipient cryptographically verifies the sender (this is the mailbox
-/// FETCH, keyed on the verified receiver identity); unlike the self-resolving
-/// authenticated send it carries the relay's KEM key directly, so the daemon
-/// routes the onion straight to it with NO rendezvous-ad resolve. The reply is
-/// delivered back to `(src_app_id, reply_endpoint_id)` on this node.
+/// optionally WITH a one-time reply block attached. Unlike
+/// [`SendAnonymousDirectPayload`] the recipient cryptographically verifies the
+/// sender (this is the mailbox FETCH and ACK, keyed on the verified receiver
+/// identity); unlike the self-resolving authenticated send it carries the
+/// relay's KEM key directly, so the daemon routes the onion straight to it with
+/// NO rendezvous-ad resolve. The reply is delivered back to
+/// `(src_app_id, reply_endpoint_id)` on this node.
+///
+/// `reply_endpoint_id = 0` means NO reply block: nothing is delivered to
+/// endpoint 0, so a block addressed there could never be answered, and building
+/// its ephemeral reply circuit is pure cost. The ACK — which the relay never
+/// answers — sends with 0 and spends one circuit per relay instead of two. An
+/// older daemon ignores the distinction and builds the unused circuit anyway,
+/// which is exactly the behaviour this replaces, so mixed fleets degrade rather
+/// than break.
 ///
 /// Wire layout:
 /// ```text
@@ -1999,7 +2008,8 @@ impl SendAnonymousDirectPayload {
 /// [64..96]   target_app_id [u8; 32]
 /// [96..128]  src_app_id [u8; 32]            reply is delivered back to this app
 /// [128..132] target_endpoint_id u32 BE
-/// [132..136] reply_endpoint_id u32 BE       reply arrives at (src_app_id, this)
+/// [132..136] reply_endpoint_id u32 BE       reply arrives at (src_app_id, this);
+///                                           0 = no reply block, no reply circuit
 /// [136..140] hop_count u32 BE               advisory; daemon uses its default
 /// [140..]    data                            opaque payload (tail; empty for FETCH)
 /// ```
