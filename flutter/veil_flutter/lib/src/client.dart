@@ -2511,10 +2511,15 @@ class AppHandle implements Finalizable {
   /// relay's KEM key ([dstX25519Pk], 32 bytes) directly — so the daemon routes
   /// the source-routed onion STRAIGHT to ([dstNodeId], [dstX25519Pk]) with NO
   /// rendezvous-ad self-resolve (the flaky lookup that returned NoRendezvous).
-  /// Still authenticated (the relay verifies us) and still attaches a one-time
-  /// reply block delivered back to (this app, [replyEndpointId]), surfacing as a
-  /// non-zero [IncomingMessage.replyId]. The KEM-key-given mailbox FETCH;
-  /// [dstX25519Pk] is a PUBLIC key (the relay's published KEM key).
+  /// Still authenticated (the relay verifies us). The KEM-key-given mailbox
+  /// FETCH and ACK; [dstX25519Pk] is a PUBLIC key (the relay's published KEM
+  /// key).
+  ///
+  /// A non-zero [replyEndpointId] attaches a one-time reply block delivered back
+  /// to (this app, [replyEndpointId]), surfacing as a non-zero
+  /// [IncomingMessage.replyId]. Pass **0** when the target never answers: no
+  /// block, and no ephemeral reply circuit built to carry it. Endpoint 0
+  /// receives nothing, so such a block could not be delivered anyway.
   Future<void> sendAnonymousAuthenticatedDirectWithReply({
     required Uint8List dstNodeId,
     required Uint8List dstX25519Pk,

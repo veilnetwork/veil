@@ -2743,9 +2743,13 @@ async fn handle_ipc_client(
                         };
                         // 0 = ok; else an ipc_send_err. AUTHENTICATED, KEM-key-
                         // given sender-anonymous send to a known relay (NO ad
-                        // resolve) WITH a one-time reply block — the mailbox FETCH.
-                        // The reply is delivered back to (src_app_id,
-                        // reply_endpoint_id) on this client.
+                        // resolve) — the mailbox FETCH and ACK. A non-zero
+                        // reply_endpoint_id attaches a one-time reply block,
+                        // delivered back to (src_app_id, reply_endpoint_id) on
+                        // this client; 0 attaches none and builds no reply
+                        // circuit. src_app_id is still validated either way —
+                        // it is the sender's app identity, not just the reply
+                        // address.
                         // Rate-limit (D2) + src_app_id ownership (D1) stay INLINE
                         // (per-connection state); the ~5 s relay leg is the worst
                         // seconds-class arc of audit V and runs via

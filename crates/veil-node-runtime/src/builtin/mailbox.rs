@@ -1656,8 +1656,7 @@ mod tests {
             _: [u8; 32],
             _: u32,
             _: &'a [u8],
-            _: [u8; 32],
-            _: u32,
+            _: Option<([u8; 32], u32)>,
         ) -> AnonFut<'a> {
             Box::pin(async { Ok(()) })
         }
