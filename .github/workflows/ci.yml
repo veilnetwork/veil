@@ -78,6 +78,16 @@ jobs:
           RUSTFLAGS: "-D warnings"
         run: cargo check --workspace --all-targets
 
+      - name: Lint the code behind opt-in features
+        # Everything above builds each crate with its DEFAULT features, so code
+        # behind a non-default feature is not merely untested — it never
+        # reaches the compiler. `veilclient-ffi`'s embedded node and live
+        # streaming transport (~9k lines, what ships to phones and desktop)
+        # sat in that hole until 2026-08-06, when a five-day-old break in its
+        # rendezvous-cookie derivation was found by hand rather than by any of
+        # the 5052 green tests. One extra crate, two feature sets, ~30 s.
+        run: ./scripts/check-feature-gated-lints.sh
+
       - name: Install cbindgen
         run: cargo install cbindgen --version "^0.29" --locked
 
@@ -270,6 +280,37 @@ jobs:
             --workspace \
             --features veilcore/test-low-difficulty,veilcore/allow-empty-seeds \
             --lib --bins --tests \
+            --test-threads=2
+
+      - name: Run feature-gated tests
+        # The workspace pass above resolves every crate to its DEFAULT features,
+        # so tests behind an opt-in feature are not "skipped" — their source is
+        # never compiled into a binary at all. Two such sets exist:
+        #
+        #   veilclient-ffi node-embedded,packet-tunnel — the in-process node and
+        #     the live streaming transport; the set `scripts/build-mobile.sh`
+        #     ships. Adds 35 tests the workspace run cannot see.
+        #
+        #   veil-ipc veilcore-internals-test — three tests that build a
+        #     SessionTxRegistry / KademliaService directly; one of them is the
+        #     only guard on the anycast advertise-policy default, i.e. a
+        #     security default whose test has never run in CI.
+        #
+        # Both are single-crate runs, so they cost a crate compile each rather
+        # than a second workspace build.
+        env:
+          CARGO_PROFILE_DEV_DEBUG: '1'
+          RUSTFLAGS: '-C link-arg=-fuse-ld=mold'
+        run: |
+          cargo nextest run \
+            -p veilclient-ffi \
+            --features node-embedded,packet-tunnel \
+            --lib --tests \
+            --test-threads=2
+          cargo nextest run \
+            -p veil-ipc \
+            --features veilcore-internals-test \
+            --lib --tests \
             --test-threads=2
 
       - name: Run doctests
