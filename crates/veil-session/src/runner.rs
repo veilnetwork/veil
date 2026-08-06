@@ -4180,7 +4180,13 @@ impl SessionRunner {
 
             // ── Track bytes ──────────────────────────────────────────────────
             if let Some(m) = &self.metrics {
-                m.add_transport_bytes_rx((veil_proto::header::HEADER_SIZE + raw_body.len()) as u64);
+                let bytes = (veil_proto::header::HEADER_SIZE + raw_body.len()) as u64;
+                m.add_transport_bytes_rx(bytes);
+                // Same bytes, split by plane. The total alone cannot answer
+                // "what is this node receiving" — and that question came up
+                // with an idle client pulling two orders of magnitude more
+                // than it sent while every application counter stayed flat.
+                m.add_transport_bytes_rx_family(header.family, bytes);
             }
 
             // Decrypt-in-place: plaintext is written into `raw_body`

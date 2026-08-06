@@ -9,6 +9,31 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
+/// Slots for per-`FrameFamily` byte accounting — the raw discriminant indexes
+/// the array. Sized above the current family count so a newly added family
+/// lands in a slot instead of panicking or silently folding into another's
+/// total; anything beyond it is counted under [`FRAME_FAMILY_OTHER`].
+pub const FRAME_FAMILY_SLOTS: usize = 16;
+
+/// Where bytes whose family discriminant does not fit [`FRAME_FAMILY_SLOTS`]
+/// are counted, so the split always sums to the total.
+pub const FRAME_FAMILY_OTHER: usize = FRAME_FAMILY_SLOTS - 1;
+
+/// Metric label for a frame-family slot. Unknown discriminants and the
+/// overflow slot report `other`, so a reader never sees a bare number.
+fn frame_family_label(slot: usize) -> &'static str {
+    if slot == FRAME_FAMILY_OTHER {
+        return "other";
+    }
+    match u8::try_from(slot)
+        .ok()
+        .and_then(|v| veil_proto::family::FrameFamily::try_from(v).ok())
+    {
+        Some(family) => family.label(),
+        None => "other",
+    }
+}
+
 /// Number of most-recent route events (miss or recovery) tracked in the
 /// sliding-window reachability score.
 pub const REACHABILITY_WINDOW: usize = 20;
@@ -53,6 +78,14 @@ pub struct NodeMetrics {
     outbound_connect_failures_total: Arc<AtomicU64>,
     transport_bytes_rx_total: Arc<AtomicU64>,
     transport_bytes_tx_total: Arc<AtomicU64>,
+    /// Inbound bytes split by `FrameHeader::family`, indexed by the raw
+    /// discriminant.
+    ///
+    /// The total alone cannot answer "what is this node receiving". An idle
+    /// client was measured pulling 473 KB/s against 9 KB/s sent, with every
+    /// application-level counter flat — and the byte total said nothing about
+    /// which plane it was, so there was nowhere to start looking.
+    transport_bytes_rx_by_family: Arc<[AtomicU64; FRAME_FAMILY_SLOTS]>,
     // ── Session plane ────────────────────────────────────────────────────────
     session_handshake_failures_total: Arc<AtomicU64>,
     // ── Discovery / DHT ──────────────────────────────────────────────────────
@@ -302,6 +335,8 @@ pub struct MetricsSnapshot {
     pub outbound_connect_failures_total: u64,
     pub transport_bytes_rx_total: u64,
     pub transport_bytes_tx_total: u64,
+    /// Inbound bytes by frame family, indexed by discriminant.
+    pub transport_bytes_rx_by_family: [u64; FRAME_FAMILY_SLOTS],
     // Session
     pub session_handshake_failures_total: u64,
     // DHT
@@ -519,6 +554,7 @@ impl NodeMetrics {
             outbound_connect_failures_total: counter!(),
             transport_bytes_rx_total: counter!(),
             transport_bytes_tx_total: counter!(),
+            transport_bytes_rx_by_family: Arc::new(std::array::from_fn(|_| AtomicU64::new(0))),
             session_handshake_failures_total: counter!(),
             dht_store_total: counter!(),
             dht_lookup_total: counter!(),
@@ -634,6 +670,21 @@ impl NodeMetrics {
     pub fn add_transport_bytes_rx(&self, value: u64) {
         self.transport_bytes_rx_total
             .fetch_add(value, Ordering::Relaxed);
+    }
+
+    /// Account `value` inbound bytes to `family` (a `FrameHeader::family`
+    /// discriminant) as well as to the total. Out-of-range families land in
+    /// [`FRAME_FAMILY_OTHER`] so the split always sums to the total — a
+    /// silently dropped family would make this metric lie in exactly the
+    /// situation it exists to diagnose.
+    pub fn add_transport_bytes_rx_family(&self, family: u8, value: u64) {
+        let slot = usize::from(family);
+        let slot = if slot < FRAME_FAMILY_OTHER {
+            slot
+        } else {
+            FRAME_FAMILY_OTHER
+        };
+        self.transport_bytes_rx_by_family[slot].fetch_add(value, Ordering::Relaxed);
     }
 
     pub fn add_transport_bytes_tx(&self, value: u64) {
@@ -1142,6 +1193,9 @@ impl NodeMetrics {
             outbound_connect_attempts_total: load!(outbound_connect_attempts_total),
             outbound_connect_failures_total: load!(outbound_connect_failures_total),
             transport_bytes_rx_total: load!(transport_bytes_rx_total),
+            transport_bytes_rx_by_family: std::array::from_fn(|i| {
+                self.transport_bytes_rx_by_family[i].load(Ordering::Relaxed)
+            }),
             transport_bytes_tx_total: load!(transport_bytes_tx_total),
             session_handshake_failures_total: load!(session_handshake_failures_total),
             dht_store_total: load!(dht_store_total),
@@ -1265,6 +1319,15 @@ impl NodeMetrics {
             s.outbound_connect_failures_total
         );
         counter!("veil_transport_bytes_rx_total", s.transport_bytes_rx_total);
+        for (i, bytes) in s.transport_bytes_rx_by_family.iter().enumerate() {
+            if *bytes == 0 {
+                continue;
+            }
+            let name = frame_family_label(i);
+            out.push_str(&format!(
+                "veil_transport_bytes_rx_by_family{{family=\"{name}\"}} {bytes}\n"
+            ));
+        }
         counter!("veil_transport_bytes_tx_total", s.transport_bytes_tx_total);
         // Session
         counter!(
@@ -1739,5 +1802,42 @@ mod tests {
         assert!((snap.vivaldi_coord_y + 2.25).abs() < f64::EPSILON);
         assert!((snap.vivaldi_coord_height - 0.125).abs() < f64::EPSILON);
         assert!((snap.vivaldi_coord_error - 0.5).abs() < f64::EPSILON);
+    }
+
+    /// The split must account for every inbound byte the total counts.
+    ///
+    /// A family that quietly vanished — a discriminant past the array, a new
+    /// plane nobody added a slot for — would make this metric lie in exactly
+    /// the case it exists for: "the node receives megabytes and no counter
+    /// says which plane". So out-of-range families land in `other` rather
+    /// than being dropped, and this pins that.
+    #[test]
+    fn the_per_family_split_sums_to_the_inbound_total() {
+        let m = NodeMetrics::new();
+        // A few real families, then discriminants past the end of the array.
+        m.add_transport_bytes_rx(100);
+        m.add_transport_bytes_rx_family(4, 100); // App
+        m.add_transport_bytes_rx(250);
+        m.add_transport_bytes_rx_family(10, 250); // RelayChain
+        m.add_transport_bytes_rx(7);
+        m.add_transport_bytes_rx_family(200, 7); // not a family at all
+        m.add_transport_bytes_rx(3);
+        m.add_transport_bytes_rx_family(255, 3);
+
+        let s = m.snapshot();
+        let split: u64 = s.transport_bytes_rx_by_family.iter().sum();
+        assert_eq!(
+            split, s.transport_bytes_rx_total,
+            "every counted byte must appear in exactly one family slot"
+        );
+        assert_eq!(s.transport_bytes_rx_by_family[4], 100);
+        assert_eq!(s.transport_bytes_rx_by_family[10], 250);
+        assert_eq!(
+            s.transport_bytes_rx_by_family[FRAME_FAMILY_OTHER], 10,
+            "unknown discriminants are counted, not dropped"
+        );
+        assert_eq!(frame_family_label(4), "app");
+        assert_eq!(frame_family_label(10), "relay_chain");
+        assert_eq!(frame_family_label(FRAME_FAMILY_OTHER), "other");
     }
 }
