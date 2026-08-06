@@ -60,6 +60,15 @@ pub struct VeilNode {
     /// Optional caller-owned runtime directory. The Apple VPN upstream keeps
     /// its ephemeral config, identity-derived runtime files and obfs4 key here
     /// for exactly as long as the node handle is alive.
+    ///
+    /// The only writer is `veil_vpn_upstream_start`, which is itself
+    /// `packet-tunnel`-only, so the field carries the same gate. Without it the
+    /// field is neither written nor read and rustc says so: a `dead_code`
+    /// warning that stood on `--features node-embedded` alone — a set hosts do
+    /// build — while `node-embedded,packet-tunnel` stayed quiet, because an
+    /// assignment counts as a use. Neither set was compiled by any gate until
+    /// `scripts/check-feature-gated-lints.sh`.
+    #[cfg(feature = "packet-tunnel")]
     owned_runtime_dir: Option<tempfile::TempDir>,
 }
 
@@ -600,6 +609,7 @@ fn start_thread(
             shutdown: Mutex::new(Some(tx)),
             thread: Mutex::new(Some(thread)),
             admin_socket,
+            #[cfg(feature = "packet-tunnel")]
             owned_runtime_dir: None,
         })),
         Err(e) => {
@@ -1285,6 +1295,7 @@ mod tests {
             shutdown: Mutex::new(None),
             thread: Mutex::new(None),
             admin_socket: None,
+            #[cfg(feature = "packet-tunnel")]
             owned_runtime_dir: None,
         };
         let mut err: *mut c_char = std::ptr::null_mut();

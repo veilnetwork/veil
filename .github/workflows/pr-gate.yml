@@ -59,6 +59,13 @@ jobs:
           RUSTFLAGS: "-D warnings"
         run: cargo check --workspace --all-targets
 
+      - name: Lint the code behind opt-in features
+        # The two passes above see only DEFAULT features, which left ~9k lines
+        # of `veilclient-ffi` (embedded node + live streaming transport) out of
+        # every compile this gate runs. See the script header for the 2026-08-06
+        # regression that hid there for five days behind 5052 green tests.
+        run: ./scripts/check-feature-gated-lints.sh
+
       - name: Mutex poison-recovery policy
         run: ./scripts/check-mutex-poison-policy.sh
 
