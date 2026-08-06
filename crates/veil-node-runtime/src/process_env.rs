@@ -10,34 +10,22 @@
 //! The two things that needed it are here instead, as ordinary process state:
 //! written once, read by anyone, no unsafe.
 
-use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
-/// Where the deferred boot should place its working directory.
-///
-/// The embedded FFI entry point used to point `TMPDIR` at an app-writable
-/// directory, because on Android `std::env::temp_dir()` is `/data/local/tmp`
-/// — which an ordinary app cannot write, so the deferred boot's working dir
-/// failed with EACCES and the node thread died before binding its admin
-/// socket. Redirecting the whole process's idea of "temp" was a large hammer
-/// for one directory, and an unsafe one in a threaded host.
-///
-/// `None` means "use the platform default", which is what every non-Android
-/// build does.
-static DEFERRED_WORK_DIR: OnceLock<PathBuf> = OnceLock::new();
-
-/// Set the deferred boot's working directory. First call wins.
-///
-/// Safe to call from anywhere at any time, which is the whole point: a
-/// `OnceLock` write is synchronised, an environment write is not.
-pub fn set_deferred_work_dir(dir: impl Into<PathBuf>) {
-    let _ = DEFERRED_WORK_DIR.set(dir.into());
-}
-
-/// The configured deferred-boot working directory, if a host set one.
-pub fn deferred_work_dir() -> Option<&'static Path> {
-    DEFERRED_WORK_DIR.get().map(PathBuf::as_path)
-}
+// The deferred boot's working directory used to live here, as a `OnceLock`
+// whose first write won. It is gone: that directory is a property of ONE boot,
+// not of the process.
+//
+// Holding it here was wrong in both directions. The value is a node's ephemeral
+// runtime directory, which teardown deletes — so the second boot in a process
+// (an anonymity toggle) kept the first one's deleted path and died with ENOENT
+// before binding its admin socket. And a process can host several nodes at
+// once, which do not share a runtime directory at all.
+//
+// It is now a parameter of `run_foreground_deferred_with_shutdown`, derived by
+// the FFI from the admin socket that boot was handed. The V-06 lesson that put
+// it here — do not rewrite a threaded process's environment — is unchanged;
+// only the shape was wrong.
 
 /// Whether this process may rewrite its own environment.
 ///
@@ -68,35 +56,20 @@ pub fn env_writes_allowed() -> bool {
 mod tests {
     use super::*;
 
-    /// The whole point: these are readable and writable from any thread,
-    /// which the environment is not.
+    /// This is process state, readable from any thread, which the environment
+    /// is not.
     ///
     /// `set_var`/`remove_var` are unsafe because another thread calling
     /// `getenv` — anywhere, including inside libc — during the write is
     /// undefined behaviour. The runtime is embedded in hosts that have had
     /// threads running since before it was loaded, so "we do it early" was
     /// never true there (audit V-06).
+    ///
+    /// What is NOT here any more is the deferred working directory. It was a
+    /// `OnceLock` beside this one, and the first-write-wins that suits a
+    /// permission flag is exactly wrong for a path that changes every boot.
     #[test]
-    fn the_settings_are_writable_from_any_thread_and_first_write_wins() {
-        // Default before anyone sets anything.
+    fn env_writes_are_refused_until_an_entry_point_declares_it_safe() {
         assert!(!env_writes_allowed(), "no entry point has declared it safe");
-
-        let dir = std::env::temp_dir().join("v06-first");
-        let other = std::env::temp_dir().join("v06-second");
-        let (d1, d2) = (dir.clone(), other.clone());
-
-        // Two threads racing to set it. Whichever wins, the value is one of
-        // theirs and it never changes again — no torn state, no UB.
-        let a = std::thread::spawn(move || set_deferred_work_dir(d1));
-        let b = std::thread::spawn(move || set_deferred_work_dir(d2));
-        a.join().unwrap();
-        b.join().unwrap();
-
-        let settled = deferred_work_dir().expect("one of them won");
-        assert!(settled == dir || settled == other);
-
-        // First write wins: a later call cannot move it.
-        set_deferred_work_dir(std::env::temp_dir().join("v06-third"));
-        assert_eq!(deferred_work_dir().unwrap(), settled);
     }
 }

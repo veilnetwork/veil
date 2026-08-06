@@ -11,7 +11,7 @@
 //! when "ready" means.
 
 use std::ffi::{CString, c_char, c_int};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::thread::JoinHandle;
 use std::time::Duration;
@@ -473,25 +473,44 @@ pub unsafe extern "C" fn veil_node_start_deferred(
         unsafe { set_err(err_out, "admin_socket must use unix:// or tcp://") };
         return std::ptr::null_mut();
     };
-    // Android: `std::env::temp_dir()` defaults to /data/local/tmp, which a normal
-    // app CANNOT write — the deferred boot's `tempfile` working dir then fails
-    // with EACCES and the node thread exits before binding its admin socket, so
-    // apply_config sees ENOENT forever. The admin socket lives in an app-writable
-    // dir, so point TMPDIR (which temp_dir() honours) at its parent. This fixes
-    // every temp_dir() user in the embedded node at once, not just the deferred
-    // working dir.
-    //
-    // Recorded as process state, NOT written into the environment. The old
-    // `set_var("TMPDIR", ..)` claimed it ran "before the node thread is
-    // spawned" — true of OUR thread, and irrelevant: this is an FFI entry
-    // point in a Flutter host that has had threads running since before the
-    // library was loaded, and `getenv` from any of them during the write is
-    // undefined behaviour (audit V-06).
-    #[cfg(target_os = "android")]
-    if let Some(parent) = anchor.parent() {
-        veil_node_runtime::process_env::set_deferred_work_dir(parent);
-    }
     start_thread(None, Some(endpoint), Some(anchor), anonymous, err_out)
+}
+
+/// Where THIS boot's deferred working directory belongs, given the admin socket
+/// it was handed.
+///
+/// Android only: `std::env::temp_dir()` there is `/data/local/tmp`, which an
+/// ordinary app cannot write, so the deferred boot's `tempfile` dir fails with
+/// EACCES and the node thread dies before binding its admin socket. The admin
+/// socket already lives somewhere the app can write, so its parent is the
+/// answer. Everywhere else the platform temp dir is correct and this is `None`.
+///
+/// Derived per boot, deliberately. This was process-wide state — first
+/// `set_var("TMPDIR", ..)` (an environment write in a threaded host: undefined
+/// behaviour, audit V-06), then a `OnceLock` whose FIRST write won. The
+/// OnceLock is what broke a phone: the value is the node's ephemeral runtime
+/// directory, teardown deletes it, and the next boot in the same process — an
+/// anonymity toggle — kept pointing at the deleted one and died with ENOENT
+/// before it could bind anything. A process can also host several nodes at
+/// once, each with its own runtime directory.
+fn deferred_work_dir_for(admin_socket: Option<&Path>) -> Option<PathBuf> {
+    deferred_work_dir_from(admin_socket, cfg!(target_os = "android"))
+}
+
+/// The rule behind [`deferred_work_dir_for`], with the platform answer passed
+/// in rather than compiled in — so both branches are reachable from a test on
+/// any host. A `#[cfg]` here would leave the Android behaviour, which is the
+/// only one that ever went wrong, checkable only by an Android build.
+fn deferred_work_dir_from(
+    admin_socket: Option<&Path>,
+    platform_temp_is_unwritable: bool,
+) -> Option<PathBuf> {
+    if !platform_temp_is_unwritable {
+        return None;
+    }
+    admin_socket
+        .and_then(|p| p.parent())
+        .map(|p| p.to_path_buf())
 }
 
 fn start_thread(
@@ -504,6 +523,8 @@ fn start_thread(
     let (tx, mut rx) = watch::channel(false);
     let mut shutdown_deadline = rx.clone();
     let thread_admin_endpoint = admin_endpoint;
+    // THIS boot's working directory, from THIS boot's socket.
+    let thread_work_dir = deferred_work_dir_for(admin_socket.as_deref());
     let spawn = std::thread::Builder::new()
         .name("veil-node".into())
         .spawn(move || {
@@ -564,6 +585,7 @@ fn start_thread(
                         veil_node_runtime::admin::run_foreground_deferred_with_shutdown(
                             thread_admin_endpoint,
                             anonymous,
+                            thread_work_dir,
                             shutdown,
                         )
                         .await
@@ -1306,6 +1328,43 @@ mod tests {
         assert_eq!(
             cfg.global.admin_socket.as_deref(),
             Some(std::str::from_utf8(admin).unwrap())
+        );
+    }
+
+    /// A second boot must work from ITS OWN runtime directory.
+    ///
+    /// This was process-wide, write-once state. The value is the node's
+    /// ephemeral runtime directory, teardown deletes it, and so the second boot
+    /// in one process — toggling anonymity — tried to create its working dir
+    /// inside a directory that had just been removed. The node thread died with
+    /// ENOENT before binding its admin socket, and what the app showed was a
+    /// bare "No such file or directory (os error 2)" from the admin connect,
+    /// naming nothing, after ninety seconds of waiting.
+    #[test]
+    fn each_boot_derives_its_own_deferred_work_dir() {
+        let first = PathBuf::from("/data/app/files/xveil-rt-1/rt-aaaa/admin.sock");
+        let second = PathBuf::from("/data/app/files/xveil-rt-1/rt-bbbb/admin.sock");
+
+        // The Android answer, driven explicitly so this holds on any host.
+        let a = deferred_work_dir_from(Some(first.as_path()), true);
+        let b = deferred_work_dir_from(Some(second.as_path()), true);
+        assert_eq!(a.as_deref(), first.parent());
+        assert_eq!(b.as_deref(), second.parent());
+        assert_ne!(
+            a, b,
+            "the second boot must not inherit the first boot's directory — by \
+             then it has been deleted, and the node dies with ENOENT before it \
+             can bind its admin socket"
+        );
+
+        // Everywhere else the platform temp dir is writable and correct; asking
+        // for one at all is what kept this quirk Android-only.
+        assert_eq!(deferred_work_dir_from(Some(first.as_path()), false), None);
+
+        // And the real entry point still agrees with the platform it is on.
+        assert_eq!(
+            deferred_work_dir_for(Some(first.as_path())).is_some(),
+            cfg!(target_os = "android")
         );
     }
 

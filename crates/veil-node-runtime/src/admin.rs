@@ -1129,7 +1129,8 @@ pub async fn run_foreground_deferred() -> Result<()> {
     // Convenience wrapper: no external shutdown source (signals / admin-stop
     // still apply). Embedded hosts (the FFI `veil_node_stop`) want the
     // shutdown-aware variant below.
-    run_foreground_deferred_with_shutdown(None, false, std::future::pending::<()>()).await
+    // No work dir: the CLI runs where the platform temp dir is writable.
+    run_foreground_deferred_with_shutdown(None, false, None, std::future::pending::<()>()).await
 }
 
 /// As [`run_foreground_deferred`] but awaits an additional `external_shutdown`
@@ -1145,6 +1146,7 @@ pub async fn run_foreground_deferred() -> Result<()> {
 pub async fn run_foreground_deferred_with_shutdown<F>(
     admin_endpoint: Option<String>,
     anonymous: bool,
+    work_dir: Option<PathBuf>,
     external_shutdown: F,
 ) -> Result<()>
 where
@@ -1174,15 +1176,28 @@ where
     // the path exists and sets 0700 in the mkdir itself (no umask window, no
     // ignored error).
     //
-    // The parent directory comes from `process_env` rather than `TMPDIR`. The
-    // embedded FFI entry used to `set_var("TMPDIR", ..)` so this call would
-    // land somewhere an Android app can actually write — a process-wide
-    // environment write, performed in a host that already has threads running,
-    // which is undefined behaviour (audit V-06). One directory did not need
-    // the whole process's idea of "temp" rewritten.
+    // The parent directory is a PARAMETER of this boot, not a property of the
+    // process. It used to be neither: first `set_var("TMPDIR", ..)`, which is a
+    // process-wide environment write in a host that already has threads running
+    // — undefined behaviour (audit V-06) — and then a `OnceLock` whose first
+    // write won.
+    //
+    // First-write-wins is what broke a phone. Android is the only platform that
+    // sets this (elsewhere the platform temp dir is fine), and it points at the
+    // node's ephemeral runtime directory, which is DELETED when that node is
+    // torn down. So the second boot in one process — an anonymity toggle, an
+    // identity switch — kept the first boot's value, tried to create its
+    // working dir inside a directory that no longer existed, and the node
+    // thread died with ENOENT before binding its admin socket. What the app
+    // then reported was a bare "No such file or directory" from the admin
+    // connect, naming no path.
+    //
+    // One process can also run SEVERAL nodes at once here (all-online mode),
+    // and they do not share a runtime directory. Process-wide state was the
+    // wrong shape for this twice over.
     let mut builder = tempfile::Builder::new();
     builder.prefix("veil-deferred-");
-    let tmp_dir = match crate::process_env::deferred_work_dir() {
+    let tmp_dir = match work_dir {
         Some(parent) => builder.tempdir_in(parent)?,
         None => builder.tempdir()?,
     };
