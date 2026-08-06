@@ -158,9 +158,55 @@ impl RendezvousResolveCache {
         let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         let entry = inner.get(receiver)?;
         if entry.checked_at.elapsed() >= self.ttl {
-            inner.remove(receiver);
+            // Stale for the LIVE path, which is what this TTL is about — but the
+            // ads are kept rather than dropped, because a deposit may still use
+            // them via `last_known_valid`. Eviction stays with the capacity
+            // bound (oldest `checked_at` first) and with `remove`.
             return None;
         }
+        let ads: Vec<_> = entry
+            .ads
+            .iter()
+            .filter(|ad| is_currently_valid(ad, now_unix).is_ok())
+            .cloned()
+            .collect();
+        if ads.is_empty() {
+            inner.remove(receiver);
+            None
+        } else {
+            Some(ads)
+        }
+    }
+
+    /// The last network-validated route set for `receiver`, ignoring the
+    /// freshness TTL but still enforcing each ad's own signed validity.
+    ///
+    /// **Only the offline-deposit path may use this, never the live one.** The
+    /// 15-second TTL above exists because a receiver can move to another relay
+    /// while its old ad is still cryptographically valid, and an introduce sent
+    /// to the old relay is dropped in silence — so for the live path a stale
+    /// route is worse than no route, and it must re-walk.
+    ///
+    /// A deposit inverts that arithmetic. Its ads vanish from the DHT the
+    /// moment the receiver stops republishing, which is exactly what a phone
+    /// does when it dozes — and a dozing recipient is the entire reason the
+    /// offline mailbox exists. Losing the DHT copy is not evidence the relay
+    /// set changed; the signed ad says it is good for 24 hours. Depositing at a
+    /// relay the receiver has since left costs one copy out of the fan-out and
+    /// the blob is stale-evicted there; depositing nowhere costs the message.
+    /// On the stand a one-minute nap black-holed every deposit in that
+    /// direction until the phone was woken by hand (2026-08-06).
+    ///
+    /// `remove` still purges: when the stall detector has declared the route a
+    /// black hole, that verdict outranks this fallback and there is nothing
+    /// left to fall back to.
+    pub fn last_known_valid(
+        &self,
+        receiver: &[u8; 32],
+        now_unix: u64,
+    ) -> Option<Vec<RendezvousAd>> {
+        let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        let entry = inner.get(receiver)?;
         let ads: Vec<_> = entry
             .ads
             .iter()
@@ -798,6 +844,53 @@ mod tests {
         assert!(
             immediately_stale.get(&receiver, 100).is_none(),
             "route-cache TTL, not the ad validity window, controls re-resolution"
+        );
+    }
+
+    #[test]
+    fn deposit_may_use_a_route_the_live_path_considers_stale() {
+        // A receiver's ads leave the DHT as soon as it stops republishing them,
+        // which a phone does within minutes of dozing — and a dozing recipient
+        // is the whole reason the offline mailbox exists. The live path must
+        // still re-walk (a moved receiver silently drops introduces at the old
+        // relay); the deposit path must not be left with nothing.
+        let receiver = [7; 32];
+        let cache = RendezvousResolveCache::with_params(std::time::Duration::ZERO, 4);
+        cache.put(receiver, vec![ad(7, 1, 90, 200)]);
+
+        assert!(
+            cache.get(&receiver, 100).is_none(),
+            "the live path must re-walk once the freshness TTL is out"
+        );
+        let fallback = cache
+            .last_known_valid(&receiver, 100)
+            .expect("a deposit may still use the ad we already validated");
+        assert_eq!(fallback.len(), 1);
+        assert_eq!(fallback[0].rendezvous_node_id, [1; 32]);
+    }
+
+    #[test]
+    fn the_deposit_fallback_still_respects_signed_validity_and_eviction() {
+        // Two near misses, neither of which the test above would catch.
+        let receiver = [7; 32];
+
+        // 1. An ad past its OWN signed window is not a route, however recently
+        //    we held it. Ignoring the TTL must not become ignoring the ad.
+        let expired = RendezvousResolveCache::with_params(std::time::Duration::ZERO, 4);
+        expired.put(receiver, vec![ad(7, 1, 10, 99)]);
+        assert!(
+            expired.last_known_valid(&receiver, 100).is_none(),
+            "the signed validity window still decides, the TTL never did"
+        );
+
+        // 2. `remove` is the stall detector saying this route is a black hole.
+        //    That verdict outranks the fallback.
+        let purged = RendezvousResolveCache::with_params(std::time::Duration::ZERO, 4);
+        purged.put(receiver, vec![ad(7, 1, 90, 200)]);
+        purged.remove(&receiver);
+        assert!(
+            purged.last_known_valid(&receiver, 100).is_none(),
+            "a route the stall detector purged must not come back as a fallback"
         );
     }
 
