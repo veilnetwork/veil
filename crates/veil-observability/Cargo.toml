@@ -13,6 +13,7 @@ veil-error = { path = "../veil-error" }
 veil-ipc = { path = "../veil-ipc" }
 veil-mesh = { path = "../veil-mesh" }
 veil-pex = { path = "../veil-pex" }
+veil-proto = { path = "../veil-proto" }
 veil-proxy = { path = "../veil-proxy" }
 veil-routing = { path = "../veil-routing" }
 veil-types = { path = "../veil-types" }
