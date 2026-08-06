@@ -6627,6 +6627,130 @@ mod tests {
         net.stop().await;
     }
 
+    /// The onion-STREAM live path: a receiver pins a circuit at a rendezvous
+    /// relay R, R binds the receiver's stream cookie to it, and a `[cookie‖…]`
+    /// cell arriving at R is SPLICED back down that circuit.
+    ///
+    /// This is the whole live (sub-second) transport for chat, call setup and
+    /// file offers; when the binding does not happen there is no live path at
+    /// all and everything silently degrades to the store-and-forward mailbox
+    /// (8–10 s) — or, for a call invite, to nothing.
+    ///
+    /// Field evidence that motivated this test (two devices, three production
+    /// seeds, v0.4.2): 2733 × `inbound circuit confirmation timed out at R=…
+    /// (no ACK, no probe echo)` and 4453 × `outbound circuit open failed`, on
+    /// EVERY relay, for the whole session. The cause was a cookie the relay
+    /// refuses: R recomputes the cookie from the registration key and rejects
+    /// any other pairing, while the stream path minted its cookie from the
+    /// node_id — an unpairable value, so every registration was refused, no
+    /// `CircuitBuilt` ACK was emitted, and no cookie ever reached the splice
+    /// table. Nothing in the suite noticed, because the splice is the one step
+    /// no test drove end to end.
+    ///
+    /// Topology (4 nodes, full mesh, all anonymity-capable): N3 = the stream
+    /// receiver, N2 = R (terminus + splice), N1 = circuit mid-hop, N0 = spare.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn onion_stream_cookie_registers_and_splices_at_the_rendezvous() {
+        use crate::node::anonymity::circuit_data::CIRCUIT_PROBE_MAGIC;
+
+        let n = 4;
+        let mut net = SimNetwork::builder()
+            .nodes(n)
+            .role(NodeRole::Core)
+            .anonymity_relay(vec![true, true, true, true])
+            .sovereign_identities(true)
+            .build()
+            .await;
+        net.wire_full_mesh().await;
+        for i in 0..n {
+            assert!(
+                net.node(i)
+                    .wait_sessions(n - 1, Duration::from_secs(45))
+                    .await,
+                "node {i} should have {0} sessions",
+                n - 1
+            );
+        }
+
+        // The receiver resolves each hop's anonymity x25519 key out of its own
+        // relay-directory shard, so publish + mirror them first.
+        for i in 1..=2 {
+            net.node(i)
+                .runtime
+                .debug_force_publish_relay_directory_entry()
+                .await
+                .expect("relay must publish directory entry");
+        }
+        for i in 1..=2 {
+            let key =
+                crate::node::anonymity::directory::relay_directory_dht_key(&net.node(i).node_id());
+            if let Some(bytes) = net.node(i).runtime.dht_get_local(&key) {
+                net.node(3).runtime.dht_put_local(key, bytes);
+            }
+        }
+
+        let r_id = net.node(2).node_id();
+        let mid_id = net.node(1).node_id();
+        let receiver = net.node(3).runtime.access();
+
+        // EXACTLY what the stream hub does on the device: derive the stream
+        // registration key, then open the pinned receive circuit N3→N1→N2.
+        let reg_kp = receiver.onion_stream_registration_keypair();
+        let cookie = receiver.onion_stream_local_cookie();
+        let epoch = std::sync::atomic::AtomicU64::new(0);
+        let (circuit, mut recv_rx) = receiver
+            .open_stream_circuit(&[mid_id, r_id], &reg_kp, &epoch)
+            .expect("stream circuit to R must open");
+
+        // Let the CircuitBuild install at N1 + N2 and the ACK come back.
+        tokio::time::sleep(Duration::from_millis(400)).await;
+
+        // (1) R bound THIS node's stream cookie to a circuit. Without this the
+        //     splice below has nowhere to send and the live path is dark.
+        let r = net.node(2).runtime.access();
+        assert!(
+            r.dispatcher
+                .circuit_rendezvous
+                .as_ref()
+                .expect("R runs a circuit-rendezvous registry")
+                .lookup(&cookie)
+                .is_some(),
+            "R must bind the receiver's stream cookie to its receive circuit — \
+             a cookie R refuses leaves every sender's cell unspliceable",
+        );
+
+        // (2) R ACKed the registration. The originator only publishes a stream
+        //     ad (and only trusts the path) once the terminus confirms, so an
+        //     unconfirmed circuit is an invisible receiver.
+        assert!(
+            circuit.is_confirmed(),
+            "R must ACK a circuit whose piggy-backed registration it accepted",
+        );
+
+        // (3) THE LIVE PATH ITSELF: a `[cookie‖payload]` cell arriving at R over
+        //     this circuit is spliced back down the circuit bound to `cookie` —
+        //     the exact mechanism every live chat/call/file cell rides. Use the
+        //     loopback probe payload the production confirm path uses.
+        let mut probe = Vec::with_capacity(cookie.len() + CIRCUIT_PROBE_MAGIC.len());
+        probe.extend_from_slice(&cookie);
+        probe.extend_from_slice(CIRCUIT_PROBE_MAGIC);
+        receiver
+            .send_circuit_cell(&circuit, &probe)
+            .expect("probe cell must enqueue");
+
+        let echo = tokio::time::timeout(Duration::from_secs(10), recv_rx.recv())
+            .await
+            .expect("R must splice the cell back within 10 s — no echo means no live path")
+            .expect("the receive channel must stay open");
+        assert_eq!(
+            echo.as_slice(),
+            CIRCUIT_PROBE_MAGIC,
+            "R must splice back EXACTLY the post-cookie bytes",
+        );
+
+        net.stop().await;
+    }
+
     /// Prod entry-point variant of the onion-service e2e (onion-registration 3):
     /// the service calls the single high-level `register_onion_service(hop_count)`
     /// — which auto-PICKS the rendezvous relay + intermediate hops, builds the
