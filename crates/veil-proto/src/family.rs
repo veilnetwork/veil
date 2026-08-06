@@ -27,6 +27,29 @@ pub enum FrameFamily {
     PeerExchange = 11,
 }
 
+impl FrameFamily {
+    /// Stable lower-case name, for metric labels and logs.
+    ///
+    /// Kept beside the enum so a new family cannot be added without a name;
+    /// the match is exhaustive, so the compiler enforces that.
+    pub fn label(self) -> &'static str {
+        match self {
+            FrameFamily::Session => "session",
+            FrameFamily::Control => "control",
+            FrameFamily::Discovery => "discovery",
+            FrameFamily::Delivery => "delivery",
+            FrameFamily::App => "app",
+            FrameFamily::Mesh => "mesh",
+            FrameFamily::LocalApp => "local_app",
+            FrameFamily::Tunnel => "tunnel",
+            FrameFamily::Routing => "routing",
+            FrameFamily::Diag => "diag",
+            FrameFamily::RelayChain => "relay_chain",
+            FrameFamily::PeerExchange => "peer_exchange",
+        }
+    }
+}
+
 impl TryFrom<u8> for FrameFamily {
     type Error = ProtoError;
     fn try_from(v: u8) -> Result<Self, Self::Error> {

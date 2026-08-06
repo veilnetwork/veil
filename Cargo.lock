@@ -5013,6 +5013,7 @@ dependencies = [
  "veil-ipc",
  "veil-mesh",
  "veil-pex",
+ "veil-proto",
  "veil-proxy",
  "veil-routing",
  "veil-types",
