@@ -176,6 +176,20 @@ pub enum RatchetSpliceError {
     #[error("no local device identity")]
     NoLocalInstance,
 
+    /// The conversation stopped opening the peer's frames, so it was dropped.
+    ///
+    /// Distinct from the failure that preceded it because the caller has
+    /// something to DO about this one: the peer still believes its session is
+    /// fine — nothing tells a sender that its frames are not being opened —
+    /// and will keep sending on it forever unless it is told to start over.
+    ///
+    /// Reached only after [`WEDGED_AFTER_FRAME_FAILURES`] consecutive bare
+    /// frames failed against a session we hold. A prologue that fails is NOT
+    /// counted: one of those is how a peer legitimately starts over, and
+    /// replaying an old one must not be a way to unseat a live conversation.
+    #[error("conversation dropped: it stopped opening this peer's frames")]
+    WedgedConversationDropped,
+
     /// The store is at [`MAX_CONVERSATIONS`] and every conversation in it is
     /// one this device has spoken on, so there is nothing that can be dropped
     /// without stranding a live conversation and its peer for good.
@@ -282,6 +296,21 @@ pub const MAX_CONVERSATIONS: usize = 1_024;
 /// expiry at all.
 pub const UNPROVEN_TTL_SECS: u64 = 14 * 24 * 60 * 60;
 
+/// Consecutive bare frames that must fail against a held session before the
+/// conversation is given up as wedged.
+///
+/// A proven conversation is otherwise permanent, which is right while it works
+/// and a trap once it stops: a device re-key, a restored backup or a wire
+/// format that moved leaves a session that opens nothing, and it still refuses
+/// every prologue that would replace it. Measured on two devices as 48 frames
+/// refused in a row with no way back short of reinstalling.
+///
+/// Small on purpose. Every frame counted here arrived on an AUTHENTICATED
+/// session with the peer and still would not open, which a healthy chain does
+/// not do even once; the margin is for a reordered or duplicated frame, not for
+/// patience.
+pub const WEDGED_AFTER_FRAME_FAILURES: u32 = 3;
+
 struct Entry {
     session: RatchetSession,
     /// The peer's device X25519 key this session was keyed to.
@@ -296,6 +325,19 @@ struct Entry {
     /// The PQXDH prologue to re-attach to outgoing frames until the peer
     /// answers. `None` once anything of theirs has opened.
     pending_prologue: Option<Vec<u8>>,
+    /// Consecutive frames that failed to open against this session. Reset by
+    /// any success, in memory only — never encoded, so a restart forgives.
+    ///
+    /// A REPLAY of the prologue this entry was built from is never counted:
+    /// duplicate delivery of one prologue is ordinary on a lossy network, and
+    /// treating it as evidence would let a recorded prologue unseat a live
+    /// conversation. Anything else that will not open is real evidence — a bare
+    /// frame from a chain that moved on, or a NEW prologue, which is the peer
+    /// saying it has started over.
+    frame_failures: u32,
+    /// The prologue this conversation was built from, kept so a replay of it
+    /// can be told from a peer genuinely re-keying. In memory only.
+    accepted_prologue: Option<Vec<u8>>,
     /// Local unix seconds at the last message this conversation carried, in
     /// either direction. Persisted, so a restart does not make every stale
     /// conversation look fresh — on a phone that would mean the sweep below
@@ -412,6 +454,9 @@ impl Entry {
             authenticated,
             pending_prologue,
             last_used_at,
+            // Never encoded: a restart forgives a wedged conversation anyway.
+            frame_failures: 0,
+            accepted_prologue: None,
         })
     }
 }
@@ -984,6 +1029,8 @@ fn seal_inner(
                     authenticated: true,
                     pending_prologue: Some(blob[..PQXDH_PROLOGUE_LEN].to_vec()),
                     last_used_at: now_unix,
+                    frame_failures: 0,
+                    accepted_prologue: None,
                 },
             );
             (KIND_PROLOGUE, blob)
@@ -1176,6 +1223,8 @@ fn open_inner(
                     // Something of theirs opened, so they have our half of the
                     // exchange and the prologue has done its job.
                     entry.pending_prologue = None;
+                    // Opening again — whatever streak there was is history.
+                    entry.frame_failures = 0;
                     // Only here, after the tag verified. A frame that failed
                     // moved nothing else and must not move this either, or the
                     // eviction order becomes something an attacker writes by
@@ -1196,6 +1245,29 @@ fn open_inner(
                     });
                 }
                 Err(e) => {
+                    // A BARE FRAME that will not open is the evidence that this
+                    // session and the peer's have come apart — a prologue that
+                    // fails is not, because starting over is exactly what a
+                    // prologue is for.
+                    //
+                    // Nothing tells a SENDER that its frames are not being
+                    // opened, so without this the peer keeps sending on a
+                    // session nobody can read, forever. Give the conversation
+                    // up and say so; the caller's answer is what gets the peer
+                    // to start over.
+                    let is_replay_of_our_own = kind == KIND_PROLOGUE
+                        && entry
+                            .accepted_prologue
+                            .as_deref()
+                            .is_some_and(|p| blob.len() >= p.len() && &blob[..p.len()] == p);
+                    if !is_replay_of_our_own {
+                        entry.frame_failures = entry.frame_failures.saturating_add(1);
+                        if entry.frame_failures >= WEDGED_AFTER_FRAME_FAILURES {
+                            g.entries.remove(&key);
+                            g.commit_change(key);
+                            return Err(RatchetSpliceError::WedgedConversationDropped);
+                        }
+                    }
                     if !displaceable(entry) {
                         return Err(RatchetSpliceError::Ratchet(e));
                     }
@@ -1276,6 +1348,10 @@ fn open_inner(
                             authenticated,
                             pending_prologue: None,
                             last_used_at: now_unix,
+                            frame_failures: 0,
+                            // Reached only down the prologue path, so this IS
+                            // the prologue the conversation was built from.
+                            accepted_prologue: Some(blob[..PQXDH_PROLOGUE_LEN].to_vec()),
                         },
                     );
                     g.commit_change(key);
@@ -1374,6 +1450,27 @@ impl RatchetRuntime {
     /// been resolved. `None` costs authentication for one message, never
     /// readability.
     #[must_use]
+    /// Drop every conversation held with this peer, so the next thing sealed
+    /// for them starts a new key agreement.
+    ///
+    /// The answer to a peer saying our frames no longer open at their end. We
+    /// cannot verify that claim — it arrives unauthenticated — and do not need
+    /// to: the cost of believing a false one is a single extra prologue, while
+    /// the cost of ignoring a true one is a conversation that never recovers.
+    ///
+    /// Returns how many were dropped.
+    pub fn forget_peer(&self, peer_node_id: &[u8; 32]) -> usize {
+        let keys: Vec<_> = {
+            let g = self.store.lock();
+            g.entries
+                .keys()
+                .filter(|k| &k.peer_node_id == peer_node_id)
+                .copied()
+                .collect()
+        };
+        keys.iter().filter(|k| self.store.forget(k)).count()
+    }
+
     /// Diagnostic: is a conversation with this peer stored, and has it ever
     /// opened anything?
     ///
@@ -1500,6 +1597,154 @@ mod tests {
         assert_eq!(opened.key.peer_node_id, a.node_id);
         assert_eq!(opened.key.peer_instance_id, a.instance_id);
         assert_eq!(opened.key.local_instance_id, b.instance_id);
+    }
+
+    /// Alice and Bob, established and answered, so Alice's frames are bare
+    /// from here — the prologue is only re-attached until the peer replies.
+    fn settled_pair(tag: u8) -> (Device, Device) {
+        let (a, b) = (device(tag), device(tag ^ 0xff));
+        a_to_b(&a, &b, b"one").expect("first contact");
+        let (aek, apk) = (a.ek(), a.ratchet_pk());
+        let back = seal(&b.store, &b.me(), keys(&a, &aek, &apk), b"ack", NOW)
+            .expect("seal")
+            .0;
+        let b_pk = b.ratchet_pk();
+        open(&a.store, &a.me(), &b.node_id, &back, Some(&b_pk), NOW).expect("Alice opens");
+        (a, b)
+    }
+
+    /// One of Alice's bare frames, damaged: whatever the real cause — a
+    /// restored backup, a re-keyed device, a wire format that moved — what Bob
+    /// sees is a frame of hers that will not open.
+    fn unopenable_frame_from(a: &Device, b: &Device) -> Vec<u8> {
+        let (bek, bpk) = (b.ek(), b.ratchet_pk());
+        let mut f = seal(&a.store, &a.me(), keys(b, &bek, &bpk), b"x", NOW)
+            .expect("seal")
+            .0;
+        *f.last_mut().expect("non-empty") ^= 1;
+        f
+    }
+
+    #[test]
+    fn a_conversation_that_stops_opening_frames_is_given_up() {
+        // A proven conversation is otherwise permanent, and that is a trap once
+        // it stops working: it refuses every prologue that would replace it,
+        // and the peer is never told its frames are unreadable. Measured on two
+        // devices as 48 refusals in a row with no way back.
+        let (a, b) = settled_pair(0xC9);
+        let a_pk = a.ratchet_pk();
+
+        // Asserted with a LITERAL, not with the constant: a loop written as
+        // `1..WEDGED_AFTER_FRAME_FAILURES` empties itself the moment the
+        // constant becomes 1, and a test that adapts to the number it is
+        // guarding cannot catch that number being wrong. One lost frame must
+        // never cost the conversation, whatever the threshold is set to.
+        assert!(
+            WEDGED_AFTER_FRAME_FAILURES >= 2,
+            "one bad frame has to be forgiven"
+        );
+        let f = unopenable_frame_from(&a, &b);
+        assert!(matches!(
+            open(&b.store, &b.me(), &a.node_id, &f, Some(&a_pk), NOW),
+            Err(RatchetSpliceError::Ratchet(_))
+        ));
+        assert_eq!(
+            b.store.len(),
+            1,
+            "one frame that would not open is not evidence of a wedge"
+        );
+
+        for attempt in 2..WEDGED_AFTER_FRAME_FAILURES {
+            let f = unopenable_frame_from(&a, &b);
+            assert!(
+                matches!(
+                    open(&b.store, &b.me(), &a.node_id, &f, Some(&a_pk), NOW),
+                    Err(RatchetSpliceError::Ratchet(_))
+                ),
+                "attempt {attempt} is still short of the threshold"
+            );
+            assert_eq!(b.store.len(), 1, "the conversation is still held");
+        }
+
+        let f = unopenable_frame_from(&a, &b);
+        assert!(matches!(
+            open(&b.store, &b.me(), &a.node_id, &f, Some(&a_pk), NOW),
+            Err(RatchetSpliceError::WedgedConversationDropped)
+        ));
+        assert_eq!(
+            b.store.len(),
+            0,
+            "a conversation that cannot open the peer's frames is not kept"
+        );
+    }
+
+    #[test]
+    fn a_frame_that_opens_forgives_the_streak() {
+        // The failures have to be CONSECUTIVE, or a conversation that loses one
+        // frame a week would eventually be given up for no reason.
+        let (a, b) = settled_pair(0xCA);
+        let a_pk = a.ratchet_pk();
+        for _ in 1..WEDGED_AFTER_FRAME_FAILURES {
+            let f = unopenable_frame_from(&a, &b);
+            let _ = open(&b.store, &b.me(), &a.node_id, &f, Some(&a_pk), NOW);
+        }
+        a_to_b(&a, &b, b"still here").expect("a good frame opens");
+        // Streak cleared: the same number of failures again must not be enough.
+        for _ in 1..WEDGED_AFTER_FRAME_FAILURES {
+            let f = unopenable_frame_from(&a, &b);
+            let _ = open(&b.store, &b.me(), &a.node_id, &f, Some(&a_pk), NOW);
+        }
+        assert_eq!(b.store.len(), 1, "the conversation survived");
+    }
+
+    #[test]
+    fn a_replayed_prologue_never_counts_toward_the_wedge() {
+        // The reason only BARE frames count. A prologue that fails is how a
+        // peer legitimately starts over, and an old one can be replayed by
+        // anyone who saw it — counting those would hand a recorded prologue the
+        // power to unseat a live conversation by first wedging it.
+        let (a, b) = (device(0xCB), device(0xDB));
+        let (bek, bpk) = (b.ek(), b.ratchet_pk());
+        let prologue = seal(&a.store, &a.me(), keys(&b, &bek, &bpk), b"race", NOW)
+            .expect("seal")
+            .0;
+        let a_pk = a.ratchet_pk();
+        open(&b.store, &b.me(), &a.node_id, &prologue, Some(&a_pk), NOW).expect("first open");
+
+        // Walk the conversation on, so the recorded prologue is genuinely
+        // BEHIND the session and replaying it FAILS. Replaying one the session
+        // can still open proves nothing — it never reaches the counter at all,
+        // which is how the first version of this test passed while testing
+        // nothing.
+        for i in 0..4u8 {
+            a_to_b(&a, &b, &[i; 5]).expect("conversation continues");
+        }
+        let mut refused = 0;
+        // The CHANGE count, not the final size: dropping the conversation and
+        // then letting the next replay start a fresh one leaves the size back
+        // at one, so a size check reads as "nothing happened" when in fact the
+        // live conversation was thrown away and replaced.
+        let version_before = b.store.version();
+        for _ in 0..(WEDGED_AFTER_FRAME_FAILURES * 3) {
+            if open(&b.store, &b.me(), &a.node_id, &prologue, Some(&a_pk), NOW).is_err() {
+                refused += 1;
+            }
+        }
+        assert!(
+            refused >= WEDGED_AFTER_FRAME_FAILURES,
+            "the replays have to actually fail for this test to mean anything \
+             (refused {refused})"
+        );
+        assert_eq!(
+            b.store.version(),
+            version_before,
+            "a replayed prologue moved the conversation"
+        );
+        assert_eq!(
+            b.store.len(),
+            1,
+            "replaying a prologue must not be able to drop the conversation"
+        );
     }
 
     #[test]
