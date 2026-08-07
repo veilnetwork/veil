@@ -147,6 +147,21 @@ impl FrameDispatcher {
                 };
                 let Some(ratchet) = &self.crypto.ratchet else {
                     // No device identity: nothing could have been keyed to us.
+                    //
+                    // This returned in silence, and silence here is indistinguishable
+                    // from delivery: the sender's `veil_send` had already returned OK
+                    // (the IPC write to ITS node succeeded), so a node in this state
+                    // drops every direct frame ever addressed to it while both ends
+                    // report success. Measured 0 of 86 delivered across every payload
+                    // size before this line said anything at all.
+                    self.logger.warn(
+                        "app.ratchet.absent",
+                        format!(
+                            "sealed app frame from {} DROPPED — this node has no ratchet, \
+                             so no direct-session frame can ever be opened",
+                            veil_util::bytes_to_hex(&node_id.as_bytes()[..4])
+                        ),
+                    );
                     return DispatchResult::NoResponse;
                 };
                 let now_unix = veil_util::unix_secs_now_u64();
@@ -175,7 +190,19 @@ impl FrameDispatcher {
                         // Not a violation: a conversation the host has not
                         // restored yet looks exactly like this, and so does a
                         // frame for another of our devices.
-                        self.logger.debug("app.ratchet.open_failed", format!("{e}"));
+                        //
+                        // Not a violation, but not nothing either — at debug level
+                        // this was invisible on any normally-configured node, and a
+                        // peer whose every direct frame fails to open looks exactly
+                        // like a peer sending nothing. Warn: the sender believes it
+                        // delivered, and only this side knows otherwise.
+                        self.logger.warn(
+                            "app.ratchet.open_failed",
+                            format!(
+                                "sealed app frame from {} DROPPED — {e}",
+                                veil_util::bytes_to_hex(&node_id.as_bytes()[..4])
+                            ),
+                        );
                     }
                 }
                 DispatchResult::NoResponse
