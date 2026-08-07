@@ -212,10 +212,51 @@ impl FrameDispatcher {
                                  authenticated: {:?})",
                                 veil_util::bytes_to_hex(&node_id.as_bytes()[..4]),
                                 ratchet.published_ik(node_id.as_bytes()).is_some(),
-                                ratchet.peer_entry_authenticated(node_id.as_bytes())
+                                ratchet.peer_entry_authenticated(node_id.as_bytes()),
+                            ) + &format!(
+                                " kind={}",
+                                payload.data.get(2).copied().unwrap_or(255)
                             ),
                         );
+                        // The conversation was given up, and the peer does not
+                        // know: nothing on a send path reports that a frame did
+                        // not open, so without this it keeps sending on a
+                        // session no longer at this end and the pair never
+                        // recovers. Tell it to start over.
+                        if matches!(
+                            e,
+                            veil_e2e::RatchetSpliceError::WedgedConversationDropped
+                        ) {
+                            return DispatchResult::Response(crate::encode_response(
+                                header,
+                                veil_proto::family::FrameFamily::App as u8,
+                                AppMsg::AppSendUnopenable as u16,
+                                &[],
+                            ));
+                        }
                     }
+                }
+                DispatchResult::NoResponse
+            }
+
+            // The peer could not open what we sealed for it. Drop our side of
+            // the conversation so the next thing we seal starts a fresh key
+            // agreement; the peer has already dropped its own.
+            //
+            // Unauthenticated by construction, and it does not need to be: a
+            // false one costs one extra prologue, a true one ignored costs the
+            // conversation for good.
+            AppMsg::AppSendUnopenable => {
+                if let Some(ratchet) = &self.crypto.ratchet {
+                    let dropped = ratchet.forget_peer(node_id.as_bytes());
+                    self.logger.warn(
+                        "app.ratchet.peer_cannot_open",
+                        format!(
+                            "{} cannot open our sealed frames — dropped {dropped} \
+                             conversation(s); the next send re-keys",
+                            veil_util::bytes_to_hex(&node_id.as_bytes()[..4])
+                        ),
+                    );
                 }
                 DispatchResult::NoResponse
             }
