@@ -1815,11 +1815,15 @@ mod direct_reply_sentinel_tests {
         >,
     >;
 
+    /// What the sender trait carries as a reply path: `(src_app_id,
+    /// reply_endpoint_id)`, absent when the caller wants no reply.
+    type ReplyPath = Option<([u8; 32], u32)>;
+
     /// Records the `reply` argument of every direct send; every other method is
     /// off this path and panics rather than silently passing.
     #[derive(Default)]
     struct RecordingSender {
-        replies: Mutex<Vec<Option<([u8; 32], u32)>>>,
+        replies: Mutex<Vec<ReplyPath>>,
     }
 
     impl veil_types::AnonOnionSender for RecordingSender {

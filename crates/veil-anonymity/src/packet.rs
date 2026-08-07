@@ -2,16 +2,16 @@
 //!
 //! The user-facing API on top [`super::cell`] +
 //! [`super::circuit`] + [`super::onion`]. Composes the three
-//! primitives into "build a 512-byte cell that hops through N
+//! primitives into "build a [`CELL_SIZE`] cell that hops through N
 //! relays and delivers a payload to the final destination".
 //!
 //! # Why a separate module on top of the primitives
 //!
 //! The load-bearing censorship-resistance property is **observer
-//! sees uniform 512-byte cells at every hop**, including the
+//! sees uniform [`CELL_SIZE`] cells at every hop**, including the
 //! outbound from every relay. Without this:
 //!
-//! * Sender emits 512 B cell.
+//! * Sender emits one full cell.
 //! * Hop 1 peels one onion layer, producing a `[u8]` of size
 //!   `(previous - PER_HOP_OVERHEAD)`. If hop 1 forwards those bytes RAW, the
 //!   observer at the hop1→hop2 link sees a shrunken payload. Cell sizes shrink
@@ -19,25 +19,27 @@
 //!   deanonymizes (observer infers hop position from cell size).
 //!
 //! [`peel_anonymous_cell`] guarantees the relay's outbound is also
-//! a 512-byte cell by re-packing the peeled `inner` bytes through
+//! a full [`CELL_SIZE`] cell by re-packing the peeled `inner` bytes through
 //! [`super::cell::pack`]. The `PER_HOP_OVERHEAD` bytes per layer
 //! become zero-padding bytes inside the next cell, invisible to
 //! observers and ignored by the next hop's `cell::unpack`.
 //!
 //! # Maximum user payload per hop count (onion v2)
 //!
-//! For an N-hop circuit packed into a 512-byte cell, with
+//! For an N-hop circuit packed into a [`CELL_SIZE`] cell, with
 //! `PER_HOP_OVERHEAD = 81` (1 ttl + 32 next-hop + 48 onion v2; the 12-byte
 //! nonce is derived, not transmitted):
 //!
 //! max_payload(N) = MAX_PAYLOAD_PER_CELL - 81 * N
-//! = 510 - 81 * N
+//! = 8190 - 81 * N
 //!
-//! N=1 → 429 B
-//! N=2 → 348 B
-//! N=3 → 267 B
-//! N=6 → 24 B
-//! N=7 → reject — 510 - 567 < 0
+//! N=1 → 8109 B
+//! N=2 → 8028 B
+//! N=3 → 7947 B
+//!
+//! The per-hop cost is a rounding error at this cell size; before the
+//! 2026-08-07 bump to 8192 it was the binding limit (N=3 → 267 B) and it is
+//! what fragmented every message. See [`crate::cell::CELL_SIZE`].
 //!
 //! Higher hop counts trade payload budget for stronger
 //! unlinkability. Real Tor uses 3 hops as the standard tradeoff;
@@ -71,24 +73,22 @@ impl From<CellError> for PacketError {
 }
 
 /// Result of peeling one cell at the current hop. Critically
-/// `Forward.outbound_cell` is ALREADY a 512-byte cell ready to send
+/// `Forward.outbound_cell` is ALREADY a full [`CELL_SIZE`] cell ready to send
 /// — relays never see, expose, or transmit shorter buffers.
 ///
-/// `Forward` carries a 544 B inline buffer (32 B next_hop + 512 B
-/// cell) while `Final` carries a Vec<u8>; this is a "large enum
-/// variant" lint trigger, but **the inline buffer is intentional**.
-/// Boxing `Forward` would add an allocation per relay-hop on the
-/// anonymity hot path (cell relay is the most-frequent operation
-/// for relay nodes). The 520-byte size penalty matters only when
-/// CellPeelResult sits in a long-lived collection — it doesn't;
-/// callers consume it immediately.
+/// The cell is BOXED. It used to be inline, deliberately: at 512 B an
+/// allocation per relay-hop cost more than carrying the buffer by value on
+/// the anonymity layer's most frequent operation. The 2026-08-07 bump to
+/// 8192 B reverses that arithmetic — an inline cell means an 8 KiB memcpy
+/// each time this result is returned and again when it is destructured, on
+/// every relayed cell, plus an 8 KiB stack frame on phone-sized threads. One
+/// allocation is cheaper than two copies of that size.
 #[derive(Debug, PartialEq)]
-#[allow(clippy::large_enum_variant)]
 pub enum CellPeelResult {
     /// This hop forwards `outbound_cell` to `next_hop`.
     Forward {
         next_hop: [u8; NEXT_HOP_ID_LEN],
-        outbound_cell: [u8; CELL_SIZE],
+        outbound_cell: Box<[u8; CELL_SIZE]>,
     },
     /// This hop is the destination — `payload` is the original message.
     /// wrapped in `Zeroizing` so
@@ -101,14 +101,15 @@ pub enum CellPeelResult {
     },
 }
 
-/// maximum hop count that fits
-/// into a single 512-byte cell with zero user-payload bytes. Derived
-/// [`MAX_PAYLOAD_PER_CELL`] / [`PER_HOP_OVERHEAD`]. Exposed as
-/// a public constant so callers don't hardcode the magic `5`.
+/// Maximum hop count that fits into a single [`CELL_SIZE`] cell with zero
+/// user-payload bytes. Derived: [`MAX_PAYLOAD_PER_CELL`] /
+/// [`PER_HOP_OVERHEAD`]. Exposed as a public constant so callers don't
+/// hardcode it — it moved from 6 to 101 with the cell bump, and it is a
+/// budget ceiling, not a recommendation (paths are 2-3 hops).
 pub const MAX_HOPS_PER_CELL: usize = MAX_PAYLOAD_PER_CELL / PER_HOP_OVERHEAD;
 
 /// Maximum user payload bytes for an N-hop circuit packed into a
-/// 512-byte cell. Returns `None` when even 0 user bytes won't fit
+/// [`CELL_SIZE`] cell. Returns `None` when even 0 user bytes won't fit
 /// (caller asked for more hops than the cell budget can carry).
 ///
 /// This is the canonical helper for choosing `payload.len` ≤
@@ -121,14 +122,16 @@ pub fn max_payload_for_hops(n: usize) -> Option<usize> {
     MAX_PAYLOAD_PER_CELL.checked_sub(PER_HOP_OVERHEAD * n)
 }
 
-/// Build the outermost 512-byte cell for an N-hop circuit.
+/// Build the outermost [`CELL_SIZE`] cell for an N-hop circuit.
 /// `hops[0]` is the FIRST relay (the cell's first transmission
 /// goes to it); `hops[N-1]` is the FINAL destination that recovers
 /// the payload.
-pub fn build_anonymous_cell(payload: &[u8], hops: &[Hop]) -> Result<[u8; CELL_SIZE], PacketError> {
+pub fn build_anonymous_cell(
+    payload: &[u8],
+    hops: &[Hop],
+) -> Result<Box<[u8; CELL_SIZE]>, PacketError> {
     let max = max_payload_for_hops(hops.len()).ok_or(PacketError::TooManyHops {
         got: hops.len(),
-        // 510 / 81 = 6 hops max (onion v2); show it as a friendly hint.
         max: MAX_PAYLOAD_PER_CELL / PER_HOP_OVERHEAD,
     })?;
     if payload.len() > max {
@@ -140,13 +143,13 @@ pub fn build_anonymous_cell(payload: &[u8], hops: &[Hop]) -> Result<[u8; CELL_SI
     }
     let envelope = circuit::build_circuit(payload, hops)?;
     // Pack into a fixed-size cell. Cell padding fills the unused
-    // bytes with zeros; observers see a uniform 512-byte cell.
+    // bytes with zeros; observers see a uniform cell.
     Ok(cell::pack(&envelope)?)
 }
 
 /// Peel one cell at the current hop using its X25519 secret key.
-/// On `Forward`, the returned `outbound_cell` is also exactly 512
-/// bytes — relay forwards as-is; observer cannot distinguish
+/// On `Forward`, the returned `outbound_cell` is also exactly
+/// [`CELL_SIZE`] bytes — relay forwards as-is; observer cannot distinguish
 /// from any other cell on the network by size.
 pub fn peel_anonymous_cell(
     cell_bytes: &[u8; CELL_SIZE],
@@ -156,7 +159,7 @@ pub fn peel_anonymous_cell(
     match circuit::peel_circuit(&envelope, my_sk)? {
         PeelResult::Forward { next_hop, inner } => {
             // Re-pack inner into a fresh cell so the outbound is
-            // 512 bytes regardless of how many layers have been
+            // CELL_SIZE bytes regardless of how many layers have been
             // peeled. This is the load-bearing anonymity property
             // that justifies this module existing on top of the
             // circuit primitive. `inner` derefs to `&Vec<u8>` →
@@ -197,19 +200,22 @@ mod tests {
     #[test]
     fn epic482_1_max_payload_formula_matches_overhead() {
         // onion v2: PER_HOP_OVERHEAD = 81 (1 ttl + 32 next-hop + 48 onion;
-        // nonce derived, not transmitted). max_payload(N) = 510 - 81·N:
-        // 1 hop → 429, 2 → 348, 3 → 267, 6 → 24 (still fits), 7 → negative.
+        // nonce derived, not transmitted). max_payload(N) = 8190 - 81·N.
+        // The absolute values are spelled out rather than recomputed from the
+        // same constants the function uses — a formula asserted against itself
+        // proves nothing, and these are the numbers every send path budgets
+        // against.
         assert_eq!(max_payload_for_hops(0), None, "0 hops is invalid");
-        assert_eq!(max_payload_for_hops(1), Some(429));
-        assert_eq!(max_payload_for_hops(2), Some(348));
-        assert_eq!(max_payload_for_hops(3), Some(267));
-        // v2's bigger budget lets a 6-hop onion fit (24 B payload) where v1
-        // capped at 5; the formula only goes negative at N ≥ 7.
-        assert_eq!(max_payload_for_hops(6), Some(24));
+        assert_eq!(max_payload_for_hops(1), Some(8109));
+        assert_eq!(max_payload_for_hops(2), Some(8028));
+        assert_eq!(max_payload_for_hops(3), Some(7947));
+        // Since the 2026-08-07 cell bump the per-hop cost only exhausts the
+        // budget at absurd hop counts; the boundary must still be exact.
+        assert_eq!(max_payload_for_hops(MAX_HOPS_PER_CELL), Some(9));
         assert_eq!(
-            max_payload_for_hops(7),
+            max_payload_for_hops(MAX_HOPS_PER_CELL + 1),
             None,
-            "7 hops cannot fit in a 512 B cell"
+            "one hop past the budget must not fit"
         );
     }
 
@@ -379,12 +385,13 @@ mod tests {
 
     #[test]
     fn epic482_1_too_many_hops_rejected_at_build() {
-        // onion v2: 6 hops now fit (24 B payload); 7 is the first that can't.
-        let hops: Vec<_> = (0..7).map(|i| fresh_hop(i as u8 + 1).1).collect();
+        let hops: Vec<_> = (0..MAX_HOPS_PER_CELL + 1)
+            .map(|i| fresh_hop(i as u8 + 1).1)
+            .collect();
         let err = build_anonymous_cell(b"x", &hops).unwrap_err();
         assert!(
             matches!(err, PacketError::TooManyHops { .. }),
-            "7+ hops cannot fit in a 512 B cell — must be rejected: {err:?}"
+            "one hop past the cell budget must be rejected: {err:?}"
         );
     }
 
@@ -580,7 +587,7 @@ mod tests {
             }
             // Build cell, peel through 3 hops, recover plaintext.
             let entry_cell = build_anonymous_cell(&plaintext, &[hop1, hop2, hop3]).unwrap();
-            entry_bytes_concat.extend_from_slice(&entry_cell);
+            entry_bytes_concat.extend_from_slice(&entry_cell[..]);
 
             let after_h1 = match peel_anonymous_cell(&entry_cell, &sk1).unwrap() {
                 CellPeelResult::Forward { outbound_cell, .. } => outbound_cell,
@@ -639,7 +646,7 @@ mod tests {
         let (sk3, hop3) = fresh_hop(0x03);
 
         let max = max_payload_for_hops(3).unwrap();
-        let mut entries: Vec<[u8; CELL_SIZE]> = Vec::new();
+        let mut entries: Vec<Box<[u8; CELL_SIZE]>> = Vec::new();
         let mut exit_prefixes: Vec<[u8; 8]> = Vec::new();
 
         for i in 0..50 {
@@ -653,7 +660,7 @@ mod tests {
             plaintext.extend(std::iter::repeat_n(0xCDu8, pad_len));
 
             let entry_cell = build_anonymous_cell(&plaintext, &[hop1, hop2, hop3]).unwrap();
-            entries.push(entry_cell);
+            entries.push(entry_cell.clone());
 
             // Peel and collect exit prefix.
             let after_h1 = match peel_anonymous_cell(&entry_cell, &sk1).unwrap() {

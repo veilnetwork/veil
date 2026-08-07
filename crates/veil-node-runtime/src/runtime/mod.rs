@@ -10585,7 +10585,7 @@ impl NodeServices {
         hdr.body_len = cell.len() as u32;
         hdr.set_priority(veil_proto::priority::INTERACTIVE);
         let mut frame = encode_header(&hdr).to_vec();
-        frame.extend_from_slice(&cell);
+        frame.extend_from_slice(&cell[..]);
         if let Some(ref reg) = self.dispatcher.session_tx_registry {
             let guard = wlock!(reg);
             let sent =
@@ -11322,7 +11322,7 @@ impl NodeServices {
         hdr.body_len = cell.len() as u32;
         hdr.set_priority(veil_proto::priority::INTERACTIVE);
         let mut frame = encode_header(&hdr).to_vec();
-        frame.extend_from_slice(&cell);
+        frame.extend_from_slice(&cell[..]);
         if let Some(ref reg) = self.dispatcher.session_tx_registry {
             let guard = wlock!(reg);
             let sent =

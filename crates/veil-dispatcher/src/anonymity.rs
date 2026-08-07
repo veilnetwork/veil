@@ -274,7 +274,7 @@ impl FrameDispatcher {
                 // anti-leak policy — surfacing "I won't relay" would reveal the
                 // node's capability to a probe).
                 if self.anonymity_relay_capable {
-                    self.forward_anonymous_cell(&next_hop, &outbound_cell);
+                    self.forward_anonymous_cell(&next_hop, &outbound_cell[..]);
                 }
                 DispatchResult::NoResponse
             }
@@ -1564,7 +1564,7 @@ mod tests {
         }
     }
 
-    /// Wrong-size body (not 512 B) must be rejected as Violation.
+    /// Wrong-size body (not `CELL_SIZE`) must be rejected as Violation.
     #[test]
     fn epic482_7_dispatch_rejects_non_cell_size_body() {
         let dispatcher = crate::make_test_dispatcher(veil_cfg::NodeRole::Core);
@@ -1575,8 +1575,8 @@ mod tests {
         match result {
             DispatchResult::Violation(msg) => {
                 assert!(
-                    msg.contains("CELL_SIZE") || msg.contains("512"),
-                    "violation must mention size: {msg}"
+                    msg.contains(&CELL_SIZE.to_string()),
+                    "violation must name the expected cell size: {msg}"
                 );
             }
             other => panic!("expected Violation, got {other:?}"),
@@ -1612,7 +1612,7 @@ mod tests {
         let mut hdr = FrameHeader::new(FrameFamily::RelayChain as u8, RelayChainMsg::Hop as u16);
         hdr.body_len = CELL_SIZE as u32;
         let cell = pack(b"x").unwrap();
-        let result = dispatcher.dispatch_relay_chain(&hdr, &cell, NodeId::from([0x11u8; 32]));
+        let result = dispatcher.dispatch_relay_chain(&hdr, &cell[..], NodeId::from([0x11u8; 32]));
         assert!(
             matches!(result, DispatchResult::NoResponse),
             "missing sk must yield silent NoResponse, NOT Violation \
@@ -1637,7 +1637,7 @@ mod tests {
 
         let mut hdr = FrameHeader::new(FrameFamily::RelayChain as u8, RelayChainMsg::Hop as u16);
         hdr.body_len = CELL_SIZE as u32;
-        let result = dispatcher.dispatch_relay_chain(&hdr, &cell, NodeId::from([0x11u8; 32]));
+        let result = dispatcher.dispatch_relay_chain(&hdr, &cell[..], NodeId::from([0x11u8; 32]));
         assert!(
             matches!(result, DispatchResult::NoResponse),
             "AEAD failure must yield silent NoResponse, NOT Violation \
@@ -1689,7 +1689,7 @@ mod tests {
 
         let mut hdr = FrameHeader::new(FrameFamily::RelayChain as u8, RelayChainMsg::Hop as u16);
         hdr.body_len = CELL_SIZE as u32;
-        let result = dispatcher.dispatch_relay_chain(&hdr, &cell, NodeId::from([0x11u8; 32]));
+        let result = dispatcher.dispatch_relay_chain(&hdr, &cell[..], NodeId::from([0x11u8; 32]));
         assert!(
             matches!(result, DispatchResult::NoResponse),
             "Final hop accept must yield NoResponse: got {result:?}"
@@ -1743,7 +1743,7 @@ mod tests {
 
         let mut hdr = FrameHeader::new(FrameFamily::RelayChain as u8, RelayChainMsg::Hop as u16);
         hdr.body_len = CELL_SIZE as u32;
-        let result = dispatcher.dispatch_relay_chain(&hdr, &cell, NodeId::from([0x11u8; 32]));
+        let result = dispatcher.dispatch_relay_chain(&hdr, &cell[..], NodeId::from([0x11u8; 32]));
         assert!(
             matches!(result, DispatchResult::NoResponse),
             "malformed AppDeliverPayload must silent-drop: got {result:?}"
@@ -1789,7 +1789,7 @@ mod tests {
         let cell = build_anonymous_cell(&onion_payload, &[me_as_hop]).unwrap();
         let mut hdr = FrameHeader::new(FrameFamily::RelayChain as u8, RelayChainMsg::Hop as u16);
         hdr.body_len = CELL_SIZE as u32;
-        let result = dispatcher.dispatch_relay_chain(&hdr, &cell, NodeId::from([0x11u8; 32]));
+        let result = dispatcher.dispatch_relay_chain(&hdr, &cell[..], NodeId::from([0x11u8; 32]));
         assert!(
             matches!(result, DispatchResult::NoResponse),
             "auth final-hop accept must yield NoResponse: got {result:?}"
@@ -1847,7 +1847,7 @@ mod tests {
         let cell = build_anonymous_cell(&onion_payload, &[me_as_hop]).unwrap();
         let mut hdr = FrameHeader::new(FrameFamily::RelayChain as u8, RelayChainMsg::Hop as u16);
         hdr.body_len = CELL_SIZE as u32;
-        let result = dispatcher.dispatch_relay_chain(&hdr, &cell, NodeId::from([0x11u8; 32]));
+        let result = dispatcher.dispatch_relay_chain(&hdr, &cell[..], NodeId::from([0x11u8; 32]));
         assert!(
             matches!(result, DispatchResult::NoResponse),
             "unwired auth final-hop must silent-drop: got {result:?}"
@@ -2695,7 +2695,7 @@ mod tests {
 
         let mut hdr = FrameHeader::new(FrameFamily::RelayChain as u8, RelayChainMsg::Hop as u16);
         hdr.body_len = CELL_SIZE as u32;
-        let result = dispatcher.dispatch_relay_chain(&hdr, &cell, NodeId::from([0xEE; 32]));
+        let result = dispatcher.dispatch_relay_chain(&hdr, &cell[..], NodeId::from([0xEE; 32]));
         assert!(matches!(result, DispatchResult::NoResponse));
         // Registry still has the entry (forwarding doesn't unregister).
         assert_eq!(registry.len(), 1);
@@ -2726,7 +2726,7 @@ mod tests {
             let mut hdr =
                 FrameHeader::new(FrameFamily::RelayChain as u8, RelayChainMsg::Hop as u16);
             hdr.body_len = CELL_SIZE as u32;
-            let result = dispatcher.dispatch_relay_chain(&hdr, &cell, NodeId::from([0xEE; 32]));
+            let result = dispatcher.dispatch_relay_chain(&hdr, &cell[..], NodeId::from([0xEE; 32]));
             assert!(matches!(result, DispatchResult::NoResponse));
             rx.try_recv().is_ok()
         };
@@ -2771,7 +2771,7 @@ mod tests {
 
         let mut hdr = FrameHeader::new(FrameFamily::RelayChain as u8, RelayChainMsg::Hop as u16);
         hdr.body_len = CELL_SIZE as u32;
-        let result = dispatcher.dispatch_relay_chain(&hdr, &cell, NodeId::from([0x11u8; 32]));
+        let result = dispatcher.dispatch_relay_chain(&hdr, &cell[..], NodeId::from([0x11u8; 32]));
         assert!(
             matches!(result, DispatchResult::NoResponse),
             "unbound endpoint must silent-drop: got {result:?}"
