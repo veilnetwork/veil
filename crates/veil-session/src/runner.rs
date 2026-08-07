@@ -4186,7 +4186,7 @@ impl SessionRunner {
                 // "what is this node receiving" — and that question came up
                 // with an idle client pulling two orders of magnitude more
                 // than it sent while every application counter stayed flat.
-                m.add_transport_bytes_rx_family(header.family, bytes);
+                m.add_transport_bytes_rx_family(header.family, header.msg_type, bytes);
             }
 
             // Decrypt-in-place: plaintext is written into `raw_body`
