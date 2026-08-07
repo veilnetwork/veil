@@ -15,9 +15,28 @@ use std::{
 /// total; anything beyond it is counted under [`FRAME_FAMILY_OTHER`].
 pub const FRAME_FAMILY_SLOTS: usize = 16;
 
+/// Slots for the `relay_chain` message-type split.
+pub const RELAY_CHAIN_TYPE_SLOTS: usize = 16;
+
+/// `FrameFamily::RelayChain` discriminant, the one family split by message
+/// type. Kept as a plain number so this crate does not have to match on the
+/// enum; the test pins it against `FrameFamily::RelayChain as u8`.
+pub const FRAME_FAMILY_RELAY_CHAIN: u8 = 10;
+
 /// Where bytes whose family discriminant does not fit [`FRAME_FAMILY_SLOTS`]
 /// are counted, so the split always sums to the total.
 pub const FRAME_FAMILY_OTHER: usize = FRAME_FAMILY_SLOTS - 1;
+
+/// Metric label for a `relay_chain` message-type slot.
+fn relay_chain_type_label(slot: usize) -> &'static str {
+    match u16::try_from(slot)
+        .ok()
+        .and_then(|v| veil_proto::family::RelayChainMsg::try_from(v).ok())
+    {
+        Some(msg) => msg.label(),
+        None => "other",
+    }
+}
 
 /// Metric label for a frame-family slot. Unknown discriminants and the
 /// overflow slot report `other`, so a reader never sees a bare number.
@@ -86,6 +105,10 @@ pub struct NodeMetrics {
     /// application-level counter flat — and the byte total said nothing about
     /// which plane it was, so there was nowhere to start looking.
     transport_bytes_rx_by_family: Arc<[AtomicU64; FRAME_FAMILY_SLOTS]>,
+    /// Inbound `relay_chain` bytes split by message type. That family carried
+    /// 98.9% of a client's inbound while its data-cell counter accounted for
+    /// 3% of the volume, so the family alone was not enough to say what it is.
+    transport_bytes_rx_relay_chain: Arc<[AtomicU64; RELAY_CHAIN_TYPE_SLOTS]>,
     // ── Session plane ────────────────────────────────────────────────────────
     session_handshake_failures_total: Arc<AtomicU64>,
     // ── Discovery / DHT ──────────────────────────────────────────────────────
@@ -337,6 +360,8 @@ pub struct MetricsSnapshot {
     pub transport_bytes_tx_total: u64,
     /// Inbound bytes by frame family, indexed by discriminant.
     pub transport_bytes_rx_by_family: [u64; FRAME_FAMILY_SLOTS],
+    /// Inbound `relay_chain` bytes by message type.
+    pub transport_bytes_rx_relay_chain: [u64; RELAY_CHAIN_TYPE_SLOTS],
     // Session
     pub session_handshake_failures_total: u64,
     // DHT
@@ -555,6 +580,7 @@ impl NodeMetrics {
             transport_bytes_rx_total: counter!(),
             transport_bytes_tx_total: counter!(),
             transport_bytes_rx_by_family: Arc::new(std::array::from_fn(|_| AtomicU64::new(0))),
+            transport_bytes_rx_relay_chain: Arc::new(std::array::from_fn(|_| AtomicU64::new(0))),
             session_handshake_failures_total: counter!(),
             dht_store_total: counter!(),
             dht_lookup_total: counter!(),
@@ -677,7 +703,7 @@ impl NodeMetrics {
     /// [`FRAME_FAMILY_OTHER`] so the split always sums to the total — a
     /// silently dropped family would make this metric lie in exactly the
     /// situation it exists to diagnose.
-    pub fn add_transport_bytes_rx_family(&self, family: u8, value: u64) {
+    pub fn add_transport_bytes_rx_family(&self, family: u8, msg_type: u16, value: u64) {
         let slot = usize::from(family);
         let slot = if slot < FRAME_FAMILY_OTHER {
             slot
@@ -685,6 +711,18 @@ impl NodeMetrics {
             FRAME_FAMILY_OTHER
         };
         self.transport_bytes_rx_by_family[slot].fetch_add(value, Ordering::Relaxed);
+        // One family is split further: it carried 98.9% of a client's inbound
+        // while its data-cell counter accounted for 3% of the volume, so the
+        // family alone could not say what the bytes were.
+        if family == FRAME_FAMILY_RELAY_CHAIN {
+            let t = usize::from(msg_type);
+            let t = if t < RELAY_CHAIN_TYPE_SLOTS - 1 {
+                t
+            } else {
+                RELAY_CHAIN_TYPE_SLOTS - 1
+            };
+            self.transport_bytes_rx_relay_chain[t].fetch_add(value, Ordering::Relaxed);
+        }
     }
 
     pub fn add_transport_bytes_tx(&self, value: u64) {
@@ -1196,6 +1234,9 @@ impl NodeMetrics {
             transport_bytes_rx_by_family: std::array::from_fn(|i| {
                 self.transport_bytes_rx_by_family[i].load(Ordering::Relaxed)
             }),
+            transport_bytes_rx_relay_chain: std::array::from_fn(|i| {
+                self.transport_bytes_rx_relay_chain[i].load(Ordering::Relaxed)
+            }),
             transport_bytes_tx_total: load!(transport_bytes_tx_total),
             session_handshake_failures_total: load!(session_handshake_failures_total),
             dht_store_total: load!(dht_store_total),
@@ -1326,6 +1367,15 @@ impl NodeMetrics {
             let name = frame_family_label(i);
             out.push_str(&format!(
                 "veil_transport_bytes_rx_by_family{{family=\"{name}\"}} {bytes}\n"
+            ));
+        }
+        for (i, bytes) in s.transport_bytes_rx_relay_chain.iter().enumerate() {
+            if *bytes == 0 {
+                continue;
+            }
+            let name = relay_chain_type_label(i);
+            out.push_str(&format!(
+                "veil_transport_bytes_rx_relay_chain{{type=\"{name}\"}} {bytes}\n"
             ));
         }
         counter!("veil_transport_bytes_tx_total", s.transport_bytes_tx_total);
@@ -1816,13 +1866,13 @@ mod tests {
         let m = NodeMetrics::new();
         // A few real families, then discriminants past the end of the array.
         m.add_transport_bytes_rx(100);
-        m.add_transport_bytes_rx_family(4, 100); // App
+        m.add_transport_bytes_rx_family(4, 0, 100); // App
         m.add_transport_bytes_rx(250);
-        m.add_transport_bytes_rx_family(10, 250); // RelayChain
+        m.add_transport_bytes_rx_family(10, 5, 250); // RelayChain / CircuitData
         m.add_transport_bytes_rx(7);
-        m.add_transport_bytes_rx_family(200, 7); // not a family at all
+        m.add_transport_bytes_rx_family(200, 0, 7); // not a family at all
         m.add_transport_bytes_rx(3);
-        m.add_transport_bytes_rx_family(255, 3);
+        m.add_transport_bytes_rx_family(255, 0, 3);
 
         let s = m.snapshot();
         let split: u64 = s.transport_bytes_rx_by_family.iter().sum();
@@ -1839,5 +1889,19 @@ mod tests {
         assert_eq!(frame_family_label(4), "app");
         assert_eq!(frame_family_label(10), "relay_chain");
         assert_eq!(frame_family_label(FRAME_FAMILY_OTHER), "other");
+
+        // The relay-chain split must agree with the family total it refines,
+        // or the deeper metric contradicts the shallower one.
+        let chain: u64 = s.transport_bytes_rx_relay_chain.iter().sum();
+        assert_eq!(chain, s.transport_bytes_rx_by_family[10]);
+        assert_eq!(s.transport_bytes_rx_relay_chain[5], 250);
+        assert_eq!(relay_chain_type_label(5), "circuit_data");
+        assert_eq!(relay_chain_type_label(0), "hop");
+
+        // The constant this crate hardcodes must be the real discriminant.
+        assert_eq!(
+            FRAME_FAMILY_RELAY_CHAIN,
+            veil_proto::family::FrameFamily::RelayChain as u8
+        );
     }
 }

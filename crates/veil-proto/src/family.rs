@@ -1159,6 +1159,24 @@ pub enum RelayChainMsg {
     RegisterMailboxCookie = 8,
 }
 
+impl RelayChainMsg {
+    /// Stable lower-case name, for metric labels and logs. Exhaustive, so a
+    /// new message type cannot be added without one.
+    pub fn label(self) -> &'static str {
+        match self {
+            RelayChainMsg::Hop => "hop",
+            RelayChainMsg::RegisterRendezvous => "register_rendezvous",
+            RelayChainMsg::UnregisterRendezvous => "unregister_rendezvous",
+            RelayChainMsg::ForwardIntroduce => "forward_introduce",
+            RelayChainMsg::CircuitBuild => "circuit_build",
+            RelayChainMsg::CircuitData => "circuit_data",
+            RelayChainMsg::CircuitTeardown => "circuit_teardown",
+            RelayChainMsg::CircuitBuilt => "circuit_built",
+            RelayChainMsg::RegisterMailboxCookie => "register_mailbox_cookie",
+        }
+    }
+}
+
 impl TryFrom<u16> for RelayChainMsg {
     type Error = ProtoError;
     fn try_from(v: u16) -> Result<Self, Self::Error> {
