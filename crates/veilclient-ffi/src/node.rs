@@ -556,7 +556,24 @@ fn start_thread(
                     }
                 });
             }
+            // Same size as the FFI runtime next door, and for the same reason.
+            //
+            // Left uncapped, tokio takes one worker per core — which is a
+            // number chosen for a machine that wants to finish a batch, not for
+            // a phone that wants to stay asleep. Sampling the desktop app found
+            // 18 `tokio-rt-worker` threads on an 18-core Mac while
+            // `build_runtime` right beside it was deliberately holding its own
+            // pool to `min(cpu, 4)` "to keep RSS low on a budget Android
+            // device". Two decisions about the same host, disagreeing.
+            //
+            // This runtime drives the node's own I/O, which is network-bound
+            // and not parallel work: more workers buy wake-ups and stacks, not
+            // throughput.
+            let workers = std::thread::available_parallelism()
+                .map(|n| n.get().min(4))
+                .unwrap_or(2);
             let rt = match tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(workers)
                 .enable_all()
                 .build()
             {
