@@ -15,7 +15,7 @@
 //! * The `node_id` of the FIRST hop (where the cell needs to land
 //!   on the wire — caller's session_tx_registry sends it as a
 //!   fresh `RelayChain::Hop` frame).
-//! * The 512-byte cell ready to send.
+//! * The [`super::cell::CELL_SIZE`] cell ready to send.
 //!
 //! Caller assembles the runtime-glue (DHT lookup for candidates
 //! Vivaldi snapshot for RTT, session-registry for the actual
@@ -105,7 +105,7 @@ impl From<PacketError> for SenderError {
 /// `(first_hop_node_id, cell_bytes)` — caller sends `cell_bytes` to
 /// `first_hop_node_id` via its session-tx-registry as a
 /// `RelayChain::Hop` frame.
-pub type OutboundAnonymousCell = ([u8; 32], [u8; CELL_SIZE]);
+pub type OutboundAnonymousCell = ([u8; 32], Box<[u8; CELL_SIZE]>);
 
 /// Whether the relay hops of a built circuit actually satisfied the
 /// AS/netblock diversity gate, or silently degraded to latency-only
@@ -661,9 +661,8 @@ mod tests {
     fn epic482_7_payload_too_large_rejected_pre_build() {
         let (_, target_pk) = fresh_keypair();
         let target_id = [0u8; 32];
-        // Max payload for 1-hop is 418 B (per packet::max_payload_for_hops).
-        // Push past it.
-        let oversized = vec![0u8; 500];
+        // Push one byte past the 1-hop budget (packet::max_payload_for_hops).
+        let oversized = vec![0u8; crate::packet::max_payload_for_hops(1).expect("1 hop fits") + 1];
         let err = build_outbound_anonymous_cell(&oversized, &[], |_| None, target_id, target_pk, 1)
             .unwrap_err();
         assert!(
@@ -674,10 +673,17 @@ mod tests {
 
     #[test]
     fn epic482_7_too_many_hops_rejected_pre_picker() {
-        // packet::max_payload_for_hops returns None for hop_count >= 6.
+        // packet::max_payload_for_hops returns None one hop past the budget.
         let (_, target_pk) = fresh_keypair();
-        let err = build_outbound_anonymous_cell(b"x", &[], |_| None, [0u8; 32], target_pk, 7)
-            .unwrap_err();
+        let err = build_outbound_anonymous_cell(
+            b"x",
+            &[],
+            |_| None,
+            [0u8; 32],
+            target_pk,
+            crate::packet::MAX_HOPS_PER_CELL + 1,
+        )
+        .unwrap_err();
         assert!(
             matches!(err, SenderError::HopCountExceedsCellBudget { .. }),
             "expected HopCountExceedsCellBudget, got {err:?}"
