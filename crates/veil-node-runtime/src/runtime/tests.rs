@@ -3137,3 +3137,52 @@ fn one_fragment_carries_a_whole_auth_deliver() {
         CIRCUIT_PAYLOAD_BYTES / chunk.max(1),
     );
 }
+
+/// A full mailbox deposit chunk must fit the one anonymous cell that carries it.
+///
+/// `MAILBOX_PUT_CHUNK_DATA_BYTES` lives in veil-proto and the cell budget lives
+/// in veil-anonymity, which do not see each other — so the two were kept in step
+/// by a comment, and the comment went stale the moment the cell moved. This is
+/// the first place that can hold both. It encodes a MAXIMUM chunk exactly as the
+/// deposit path does (kind tag + AppDeliverPayload wrapping the encoded chunk)
+/// and checks the result against the real 1-hop budget.
+#[test]
+fn a_full_deposit_chunk_fits_one_anonymous_cell() {
+    use veil_proto::{MAILBOX_PUT_CHUNK_DATA_BYTES, MAX_MAILBOX_PUT_CHUNKS};
+
+    let chunk = veil_proto::ipc::MailboxPutChunkPayload {
+        content_id: [0x11; 32],
+        chunk_index: 0,
+        chunk_total: 1,
+        chunk_data: vec![0xAB; MAILBOX_PUT_CHUNK_DATA_BYTES],
+    }
+    .encode();
+
+    let deliver = veil_proto::AppDeliverPayload {
+        src_node_id: [0u8; 32],
+        src_app_id: [0x22; 32],
+        app_id: [0x33; 32],
+        endpoint_id: 1,
+        data: veil_bufpool::pooled_shared_from_vec(chunk),
+        reply_id: 0,
+        provenance: veil_proto::SenderProvenance::Claimed,
+    }
+    .encode();
+    // The deposit path prepends one final-hop kind tag before the onion wrap.
+    let on_wire = 1 + deliver.len();
+
+    let budget = veil_anonymity::packet::max_payload_for_hops(1).expect("1 hop fits a cell");
+    assert!(
+        on_wire <= budget,
+        "a full {MAILBOX_PUT_CHUNK_DATA_BYTES} B chunk encodes to {on_wire} B, over the \
+         1-hop cell budget of {budget} B — deposits would fail to build"
+    );
+
+    // Relay reassembly memory is the product, not either factor. Hold the
+    // ceiling it had at 256 x 240 so a bigger chunk cannot quietly buy a
+    // bigger buffer at every relay.
+    assert!(
+        MAILBOX_PUT_CHUNK_DATA_BYTES * MAX_MAILBOX_PUT_CHUNKS as usize <= 64 * 1024,
+        "reassembly ceiling grew past 64 KiB per in-flight deposit"
+    );
+}
