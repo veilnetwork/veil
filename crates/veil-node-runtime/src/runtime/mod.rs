@@ -7435,6 +7435,42 @@ fn circuit_backed_cleartext_id(cookie: &[u8; 16]) -> [u8; 32] {
     *h.finalize().as_bytes()
 }
 
+/// Plaintext bytes one sealed introduce can carry at `hop_count` hops — the
+/// budget every rendezvous send packs into.
+///
+/// It is bounded by the 512-byte ANONYMOUS cell
+/// ([`veil_anonymity::cell::CELL_SIZE`]) that carries the sender → rendezvous
+/// leg, minus the per-hop onion overhead, the fixed `IntroducePayload` header
+/// and the seal's own overhead. At 3 hops that is 156 bytes.
+///
+/// The receiver's leg is NOT this cell: the rendezvous forwards each sealed
+/// introduce inside one fixed [`veil_anonymity::circuit_data::CIRCUIT_PAYLOAD_BYTES`]
+/// circuit-data cell (16 KiB since the 2026-07-02 bump). Nothing ties the two
+/// numbers together, which is why a 135-byte fragment costs 16 KiB inbound —
+/// see the guard test beside this function.
+fn introduce_plaintext_budget(hop_count: usize) -> Option<usize> {
+    use veil_anonymity::rendezvous::{
+        INTRODUCE_OVERHEAD, IntroducePayload, MAX_INTRODUCE_CIPHERTEXT,
+    };
+    let final_budget = veil_anonymity::packet::max_payload_for_hops(hop_count)?;
+    let ciphertext_budget = final_budget
+        .saturating_sub(1 + IntroducePayload::FIXED_SIZE)
+        .min(MAX_INTRODUCE_CIPHERTEXT);
+    Some(ciphertext_budget.saturating_sub(INTRODUCE_OVERHEAD))
+}
+
+/// Signed-blob bytes one `AuthDeliverFragment` carries at `hop_count` hops:
+/// [`introduce_plaintext_budget`] minus the final-hop kind tag and the fragment
+/// header. This is the unit a multi-fragment message is cut into, and each
+/// fragment travels as its OWN introduce — so it is also the useful payload of
+/// one circuit-data cell on the receiving side.
+fn introduce_fragment_chunk_size(hop_count: usize) -> Option<usize> {
+    Some(
+        introduce_plaintext_budget(hop_count)?
+            .saturating_sub(1 + veil_proto::AuthDeliverFragment::HEADER_SIZE),
+    )
+}
+
 /// Map a low-level onion `SenderError` to the IPC-facing `AnonOnionSendError`.
 fn map_sender_err(e: veil_anonymity::sender::SenderError) -> veil_types::AnonOnionSendError {
     use veil_types::AnonOnionSendError;
@@ -9586,22 +9622,12 @@ impl NodeServices {
         // Largest signed-blob chunk that fits one fragment at this hop_count:
         //   Final-hop budget − [1 onion tag] − IntroducePayload fixed − introduce
         //   overhead − [1 inner tag] − fragment header.
-        let final_budget = veil_anonymity::packet::max_payload_for_hops(hop_count).ok_or(
+        let chunk_size = introduce_fragment_chunk_size(hop_count).ok_or(
             veil_anonymity::sender::SenderError::HopCountExceedsCellBudget {
                 hop_count,
                 max: veil_anonymity::packet::MAX_HOPS_PER_CELL,
             },
         )?;
-        let ciphertext_budget = final_budget
-            .min(
-                veil_anonymity::rendezvous::MAX_INTRODUCE_CIPHERTEXT
-                    + 1
-                    + veil_anonymity::rendezvous::IntroducePayload::FIXED_SIZE,
-            )
-            .saturating_sub(1 + veil_anonymity::rendezvous::IntroducePayload::FIXED_SIZE);
-        let chunk_size = ciphertext_budget
-            .saturating_sub(veil_anonymity::rendezvous::INTRODUCE_OVERHEAD)
-            .saturating_sub(1 + veil_proto::AuthDeliverFragment::HEADER_SIZE);
         if chunk_size == 0 {
             return Err(veil_anonymity::sender::SenderError::PayloadTooLarge {
                 hop_count,
@@ -10295,20 +10321,13 @@ impl NodeServices {
         circuit_backed: bool,
     ) -> std::result::Result<(), veil_anonymity::sender::SenderError> {
         use rand_core::RngCore;
-        use veil_anonymity::rendezvous::{
-            INTRODUCE_OVERHEAD, IntroducePayload, MAX_INTRODUCE_CIPHERTEXT, final_hop_kind,
-        };
+        use veil_anonymity::rendezvous::final_hop_kind;
 
-        let final_budget = veil_anonymity::packet::max_payload_for_hops(hop_count).ok_or(
-            veil_anonymity::sender::SenderError::HopCountExceedsCellBudget {
-                hop_count,
-                max: veil_anonymity::packet::MAX_HOPS_PER_CELL,
-            },
-        )?;
-        let ciphertext_budget = final_budget
-            .saturating_sub(1 + IntroducePayload::FIXED_SIZE)
-            .min(MAX_INTRODUCE_CIPHERTEXT);
-        let plaintext_budget = ciphertext_budget.saturating_sub(INTRODUCE_OVERHEAD);
+        let hops_fit = || veil_anonymity::sender::SenderError::HopCountExceedsCellBudget {
+            hop_count,
+            max: veil_anonymity::packet::MAX_HOPS_PER_CELL,
+        };
+        let plaintext_budget = introduce_plaintext_budget(hop_count).ok_or_else(hops_fit)?;
         if app_deliver_bytes.len() < plaintext_budget {
             let mut plaintext = Vec::with_capacity(1 + app_deliver_bytes.len());
             plaintext.push(final_hop_kind::APP_DELIVER);
@@ -10316,8 +10335,7 @@ impl NodeServices {
             return self.send_sealed_introduce(ad, &plaintext, hop_count, circuit_backed);
         }
 
-        let chunk_size =
-            plaintext_budget.saturating_sub(1 + veil_proto::AuthDeliverFragment::HEADER_SIZE);
+        let chunk_size = introduce_fragment_chunk_size(hop_count).ok_or_else(hops_fit)?;
         if chunk_size == 0 {
             return Err(veil_anonymity::sender::SenderError::PayloadTooLarge {
                 hop_count,

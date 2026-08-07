@@ -3086,3 +3086,48 @@ async fn a_key_encrypted_at_rest_reports_as_configured() {
     runtime.stop().await.expect("runtime stops");
     let _ = fs::remove_dir_all(&dir);
 }
+
+/// The introduce budget is sized to the 512-byte ANONYMOUS cell that carries the
+/// sender -> rendezvous leg. The rendezvous -> receiver leg is a different cell:
+/// one fixed `CIRCUIT_PAYLOAD_BYTES` circuit-data cell per forwarded introduce,
+/// bumped 384 -> 4096 -> 16384 for onion-stream throughput. Nothing ever tied
+/// the two together, so a 3-hop fragment carries 135 useful bytes inside 16 KiB
+/// of wire, and a message that needs several fragments pays that per fragment
+/// (times the bulk/reply redundancy of 3).
+///
+/// Measured on two live devices, 2026-08-07: a mailbox FETCH reply is capped at
+/// ~6 KB, which is 46 fragments here, and delivering ten 7-byte chat messages
+/// cost 41 MB of `relay_chain` / `circuit_data`.
+///
+/// The numbers are pinned, not endorsed: whatever fixes the ratio has to come
+/// through this test and say what it changed.
+#[test]
+fn an_introduce_fragment_is_budgeted_for_a_cell_it_no_longer_rides() {
+    use veil_anonymity::circuit_data::CIRCUIT_PAYLOAD_BYTES;
+
+    // The budget the sender packs into, from the real helper both send paths use.
+    assert_eq!(
+        super::introduce_plaintext_budget(3),
+        Some(156),
+        "3-hop sealed introduce plaintext budget"
+    );
+    let chunk = super::introduce_fragment_chunk_size(3).expect("3 hops fit a cell");
+    assert_eq!(chunk, 135, "signed bytes carried by one 3-hop fragment");
+
+    // The cell that fragment arrives in on the other side.
+    assert_eq!(CIRCUIT_PAYLOAD_BYTES, 16384, "circuit-data cell is fixed");
+    assert!(
+        CIRCUIT_PAYLOAD_BYTES / chunk >= 100,
+        "known defect: one fragment wastes {}x its cell — if this ratio has \
+         improved, update the numbers above and the plan that tracks it",
+        CIRCUIT_PAYLOAD_BYTES / chunk,
+    );
+
+    // The root: the introduce leg is bounded by the OLD 512-byte cell, so the
+    // whole final-hop budget is smaller than the padding of the cell it feeds.
+    assert!(
+        veil_anonymity::packet::max_payload_for_hops(3).unwrap() < CIRCUIT_PAYLOAD_BYTES / 50,
+        "the sender leg's entire cell budget is a rounding error next to the \
+         receiver leg's cell"
+    );
+}
