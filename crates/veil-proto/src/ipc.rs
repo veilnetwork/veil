@@ -2500,16 +2500,28 @@ pub const MAX_MAILBOX_CAPABILITY_TOKEN_BYTES: usize = 2048;
 /// by `MAX_FRAME_BODY`).
 /// Max `chunk_data` bytes carried by ONE [`MailboxPutChunkPayload`]. A network
 /// mailbox deposit travels as a sender-anonymous onion message capped at one
-/// 512-byte cell (`max_payload_for_hops(1) = 429 B`); after the AppDeliver +
-/// chunk-header overhead (~113 + 36 B) ≈ 280 B remain, so 240 leaves a safe
-/// margin. The depositor splits the encoded [`MailboxPutPayload`] across N such
+/// anonymous cell: `max_payload_for_hops(1) = 8109 B`, less the final-hop kind
+/// tag, `AppDeliverPayload::FIXED_SIZE` (104) and this payload's own 36-byte
+/// header — 7968 B. 7680 leaves a margin.
+///
+/// It was 240, hand-derived the same way against the 512-byte cell of the
+/// time. The 2026-08-07 cell bump made that a 32x tax rather than a fit: a
+/// ~1.5 KB deposit was seven chunks, and each chunk is a whole cell on the
+/// wire. A deliverable blob is bounded by the FETCH reply budget (~5.6 KB —
+/// anything larger can never be served and is purged), so at 7680 every
+/// deposit that can ever be read back is now ONE chunk.
+///
+/// The depositor splits the encoded [`MailboxPutPayload`] across N such
 /// chunks; the relay reassembles before storing. (The FETCH reply path already
-/// fragments, so only the deposit needs this.)
-pub const MAILBOX_PUT_CHUNK_DATA_BYTES: usize = 240;
+/// fragments, so only the deposit needs this.) Mirrored in xVeil as
+/// `kMailboxPutChunkDataBytes`.
+pub const MAILBOX_PUT_CHUNK_DATA_BYTES: usize = 7680;
 
-/// Hard cap on `chunk_total` (a reassembled deposit ≤ this × the chunk size ≈
-/// 60 KB — comfortably above any real mailbox blob ~few KB; bounds relay memory).
-pub const MAX_MAILBOX_PUT_CHUNKS: u16 = 256;
+/// Hard cap on `chunk_total`. The product with the chunk size is what bounds
+/// relay memory per in-flight deposit, and it is held at the same ~60 KB it
+/// was at 256 x 240 — the chunk grew 32x, so the count drops by the same
+/// factor. Still far above any deliverable blob, which is now one chunk.
+pub const MAX_MAILBOX_PUT_CHUNKS: u16 = 8;
 
 /// One fragment of a chunked network mailbox deposit (app → relay PUT endpoint).
 ///
@@ -7241,10 +7253,14 @@ mod tests {
 
     #[test]
     fn mailbox_put_chunk_round_trip() {
+        // Ride the cap rather than a literal: the count moves with the chunk
+        // size (their product is what bounds relay reassembly memory), so a
+        // hardcoded 12 goes stale the next time either one is retuned.
+        let total = MAX_MAILBOX_PUT_CHUNKS;
         let c = MailboxPutChunkPayload {
             content_id: [0x2C; 32],
-            chunk_index: 5,
-            chunk_total: 12,
+            chunk_index: total / 2,
+            chunk_total: total,
             chunk_data: vec![0xAB; MAILBOX_PUT_CHUNK_DATA_BYTES],
         };
         let buf = c.encode();
@@ -7256,8 +7272,8 @@ mod tests {
         // a final short chunk + a header-only (empty data) chunk both round-trip.
         let tail = MailboxPutChunkPayload {
             content_id: [0x2C; 32],
-            chunk_index: 11,
-            chunk_total: 12,
+            chunk_index: total - 1,
+            chunk_total: total,
             chunk_data: vec![1, 2, 3],
         };
         assert_eq!(
