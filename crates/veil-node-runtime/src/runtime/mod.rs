@@ -7471,6 +7471,58 @@ fn introduce_fragment_chunk_size(hop_count: usize) -> Option<usize> {
     )
 }
 
+/// A message needing at least this many fragments counts as bulk.
+const BULK_FRAGMENT_THRESHOLD: usize = 3;
+/// Copies of each fragment a bulk message sends down a single relay.
+const BULK_REDUNDANCY: usize = 3;
+
+/// How many copies of each fragment to put on the wire.
+///
+/// Redundancy exists for ONE reason: reassembly is all-or-nothing, so at F
+/// independently-lost fragments the odds collapse as (1-p)^F — a 27-fragment
+/// bulk chunk at p≈0.27 delivers ~0.01% on a single copy. Sending each fragment
+/// `redundancy` times and de-duping by (msg_id, frag_idx) lifts per-fragment
+/// delivery to 1-p^redundancy.
+///
+/// A ONE-fragment message has no reassembly to protect, so copies buy only a
+/// retry — and every caller on this path already owns one. That is not an
+/// assumption: the reply block is deliberately non-consuming ("stays valid
+/// until TTL so the app can retry if this reply's cell is dropped"), and the
+/// mailbox FETCH it serves is idempotent and non-destructive, re-fetched every
+/// drain round until the receiver acks. So the copies were re-sending something
+/// that was going to be re-requested three seconds later anyway.
+///
+/// It mattered because the reply path asks for 3 explicitly. Until the
+/// 2026-08-07 cell bump a ~6 KB mailbox reply was 46 fragments and the request
+/// was right; afterwards the same reply is a single fragment, and 3 copies of
+/// one 16 KiB circuit cell became the largest remaining term in the measured
+/// cost per delivered message (~341 KB for seven bytes of text).
+///
+/// `parallel` means several distinct relays are available AND the message
+/// fragments: spread one copy of each fragment across them for aggregate
+/// throughput instead of funnelling copies through one.
+fn onion_send_redundancy(
+    requested: usize,
+    frag_count: usize,
+    parallel: bool,
+    relay_count: usize,
+) -> usize {
+    if parallel {
+        log::debug!(
+            "onion bulk send: {frag_count} fragments round-robined across \
+             {relay_count} rendezvous relays (parallel endpoints, redundancy 1)",
+        );
+        return 1;
+    }
+    if frag_count <= 1 {
+        return 1;
+    }
+    if frag_count >= BULK_FRAGMENT_THRESHOLD {
+        return requested.max(BULK_REDUNDANCY);
+    }
+    requested
+}
+
 /// Map a low-level onion `SenderError` to the IPC-facing `AnonOnionSendError`.
 fn map_sender_err(e: veil_anonymity::sender::SenderError) -> veil_types::AnonOnionSendError {
     use veil_types::AnonOnionSendError;
@@ -9676,27 +9728,7 @@ impl NodeServices {
         // alone.
         let parallel = relays.len() > 1 && frag_count >= BULK_FRAGMENT_THRESHOLD;
 
-        // Reliability vs parallelism. With ONE relay, a multi-fragment (bulk)
-        // message needs redundant retransmit to survive cell loss (reassembly is
-        // all-or-nothing). With SEVERAL relays we PARALLELISE instead — 1x per
-        // fragment, round-robined across relays — so independent endpoints lift
-        // aggregate throughput; the chunk-granular re-request refills any dropped
-        // fragment. Funnelling `redundancy` copies through one relay is then pure
-        // waste, so the bulk bump is dropped when parallelising.
-        const BULK_FRAGMENT_THRESHOLD: usize = 3;
-        const BULK_REDUNDANCY: usize = 3;
-        let redundancy = if parallel {
-            log::debug!(
-                "onion bulk send: {frag_count} fragments round-robined across {} \
-                 rendezvous relays (parallel endpoints, redundancy 1)",
-                relays.len(),
-            );
-            1
-        } else if frag_count >= BULK_FRAGMENT_THRESHOLD {
-            redundancy.max(BULK_REDUNDANCY)
-        } else {
-            redundancy
-        };
+        let redundancy = onion_send_redundancy(redundancy, frag_count, parallel, relays.len());
 
         // S4: all size/fragment validation passed — NOW build the ephemeral reply
         // circuit (registers the cookie at R_a). Doing it here means a size
