@@ -196,11 +196,23 @@ impl FrameDispatcher {
                         // peer whose every direct frame fails to open looks exactly
                         // like a peer sending nothing. Warn: the sender believes it
                         // delivered, and only this side knows otherwise.
+                        // Whether we hold the peer's PUBLISHED device key decides
+                        // whether an inbound prologue may displace a stale entry
+                        // (`proves_authorship` in veil-e2e's `open`). That map is
+                        // filled as a side effect of resolving a peer's certificate
+                        // to SEND to them, so a node that has only ever received
+                        // from this peer holds nothing — and then no prologue can
+                        // ever replace the entry that keeps refusing. Log it beside
+                        // the error: the two together say which of those it is.
                         self.logger.warn(
                             "app.ratchet.open_failed",
                             format!(
-                                "sealed app frame from {} DROPPED — {e}",
-                                veil_util::bytes_to_hex(&node_id.as_bytes()[..4])
+                                "sealed app frame from {} DROPPED — {e} \
+                                 (published peer key known: {}, stored conversation \
+                                 authenticated: {:?})",
+                                veil_util::bytes_to_hex(&node_id.as_bytes()[..4]),
+                                ratchet.published_ik(node_id.as_bytes()).is_some(),
+                                ratchet.peer_entry_authenticated(node_id.as_bytes())
                             ),
                         );
                     }

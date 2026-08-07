@@ -1374,6 +1374,21 @@ impl RatchetRuntime {
     /// been resolved. `None` costs authentication for one message, never
     /// readability.
     #[must_use]
+    /// Diagnostic: is a conversation with this peer stored, and has it ever
+    /// opened anything?
+    ///
+    /// `authenticated` is what makes a conversation untouchable by an inbound
+    /// prologue (see `displaceable` in [`open`]), so when frames from a peer
+    /// stop opening it is the one bit that says whether the conversation can
+    /// still recover or is wedged for good. Read-only, no key material.
+    pub fn peer_entry_authenticated(&self, peer_node_id: &[u8; 32]) -> Option<bool> {
+        let g = self.store.lock();
+        g.entries
+            .iter()
+            .find(|(k, _)| &k.peer_node_id == peer_node_id)
+            .map(|(_, e)| e.authenticated)
+    }
+
     pub fn published_ik(&self, peer_node_id: &[u8; 32]) -> Option<[u8; 32]> {
         self.peer_ratchet_keys
             .read()
