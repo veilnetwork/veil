@@ -492,6 +492,21 @@ pub enum AppMsg {
     /// handing a ratchet payload to an application. The frame type cannot
     /// collide with anything.
     AppSendSealed = 7,
+
+    /// "Your sealed frames stopped opening here; start the conversation over."
+    ///
+    /// Nothing else tells a SENDER that its frames are unreadable. `veil_send`
+    /// returns as soon as the local node takes the IPC write, and a receiver
+    /// that cannot open a frame has, until now, simply dropped it — so a pair
+    /// whose sessions came apart (a re-keyed device, a restored backup, a wire
+    /// format that moved) stayed that way forever, each side reporting success.
+    /// Measured on two devices as 0 of 86 frames delivered while both ends
+    /// believed everything was fine.
+    ///
+    /// Carries no body. It is a hint to re-key, not an authenticated statement:
+    /// acting on it costs one prologue, and the peer that sends it could have
+    /// dropped the frame anyway.
+    AppSendUnopenable = 8,
 }
 
 impl TryFrom<u16> for AppMsg {
@@ -506,6 +521,7 @@ impl TryFrom<u16> for AppMsg {
             5 => Ok(AppMsg::AppWindowUpdate),
             6 => Ok(AppMsg::AppRtData),
             7 => Ok(AppMsg::AppSendSealed),
+            8 => Ok(AppMsg::AppSendUnopenable),
             _ => Err(ProtoError::UnknownMsgType {
                 family: FrameFamily::App as u8,
                 msg_type: v,
