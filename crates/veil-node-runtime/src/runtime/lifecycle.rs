@@ -490,6 +490,36 @@ impl NodeRuntime {
             Arc::clone(&self.identity.peer_ratchet_keys),
             Arc::clone(&self.identity.per_session_mlkem_dk),
         ));
+        // The identity in force CHANGED, so what the DHT holds for this node is
+        // the previous identity's. The only publish used to be the one-shot at
+        // startup, which had already run under the placeholder a deniable boot
+        // starts from — so a promoted node advertised a certificate for an
+        // identity it no longer used, every peer's PQXDH agreement failed
+        // against it, and each side dropped the other's frames in silence.
+        // Measured before this: 0 of 86 single-shot frames delivered in either
+        // direction between two devices on the same LAN, with four publish
+        // records in the log and every one under the placeholder id.
+        //
+        // The mailbox kept working throughout — it resolves different records —
+        // which is exactly why this looked like anything but an identity bug.
+        if identity_changed
+            && let Some(sov) = self.identity.sovereign_identity.get()
+        {
+            let veil_dir_path = self
+                .config_path
+                .parent()
+                .unwrap_or_else(|| std::path::Path::new("."))
+                .to_path_buf();
+            super::identity_publish::publish_sovereign_identity(
+                &sov,
+                &self.dht,
+                &self.identity.mlkem_keys,
+                &config,
+                &veil_dir_path,
+                &self.logger,
+            )
+            .await;
+        }
         // re-prime global mobile background-mode
         // multiplier from reloaded config — operator may have
         // bumped it to react to observed cellular usage.
