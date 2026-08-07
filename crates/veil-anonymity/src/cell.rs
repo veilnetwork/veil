@@ -1,6 +1,6 @@
 //! Fixed-size cell padding.
 //!
-//! All anonymity-layer traffic flows in 512-byte cells regardless of
+//! All anonymity-layer traffic flows in [`CELL_SIZE`]-byte cells regardless of
 //! the underlying message size. An on-path observer sees a stream of
 //! identical-size chunks and cannot infer:
 //!
@@ -13,17 +13,17 @@
 //! piece), the on-path observer also can't tell who sent a cell or
 //! who its final destination is.
 //!
-//! # Wire format (single cell, exactly 512 bytes)
+//! # Wire format (single cell, exactly [`CELL_SIZE`] bytes)
 //!
 //! ```text
-//! [0..2] payload_len u16 BE (0..=510)
+//! [0..2] payload_len u16 BE (0..=MAX_PAYLOAD_PER_CELL)
 //! [2..2+L] payload L bytes
-//! [2+L..] zero padding (510 - L) bytes
+//! [2+L..] zero padding (MAX_PAYLOAD_PER_CELL - L) bytes
 //! ```
 //!
 //! ## Why u16 BE for length
 //!
-//! u16 BE is enough for L [0, 510] (max payload), and matches every
+//! u16 BE is enough for the max payload, and matches every
 //! other length-prefixed wire format in this codebase (proto/header
 //! proto/codec, proto/family). Using BE means a future wire-trace
 //! parser can `xxd` a cell and read the length without endianness
@@ -48,7 +48,7 @@
 //! v1 is intentionally minimal:
 //!
 //! * **No multi-cell messages.** Caller's payload must fit in
-//!   [`MAX_PAYLOAD_PER_CELL`] = 510 bytes. Multi-cell sequencing
+//!   [`MAX_PAYLOAD_PER_CELL`]. Multi-cell sequencing
 //!   belongs in a higher layer that owns sequence numbers + reassembly.
 //! * **No encryption.** Cells contain plaintext at this layer; the
 //!   caller wraps them in AEAD before the wire. This separation
@@ -64,7 +64,25 @@
 /// Wire-format size of a cell. Constant across the entire anonymity
 /// layer; changing it would invalidate every in-flight cell + every
 /// observer's signature analysis assumption.
-pub const CELL_SIZE: usize = 512;
+///
+/// 2026-08-07 flag-day bump 512 -> 8192. This cell carries the sender ->
+/// rendezvous leg of an introduce, and at 512 it bounded a 3-hop sealed
+/// introduce to 135 usable bytes — while the SAME introduce reaches the
+/// receiver inside one fixed 16384-byte
+/// [`crate::circuit_data::CIRCUIT_PAYLOAD_BYTES`] circuit cell. The circuit
+/// cell was bumped 384 -> 4096 -> 16384 on 2026-07-02 for onion-stream
+/// throughput and this one was left behind, so every message longer than
+/// 135 bytes fragmented, each fragment paid a whole 16 KiB cell inbound, and
+/// three-or-more-fragment messages paid it three times over (bulk
+/// redundancy). Measured before the bump: 41 MB to carry ten 7-byte chat
+/// messages out of a mailbox.
+///
+/// 8192 rather than 16384: the largest thing that rides this path is a signed
+/// [`veil_types`]-level AuthDeliver capped at 6144 B, so 8192 makes every real
+/// message a SINGLE fragment with margin, while a small send pads to half an
+/// inbound cell instead of a whole one. BREAKING: every relay and client on a
+/// network must agree on this constant.
+pub const CELL_SIZE: usize = 8192;
 
 /// Bytes available for caller payload after the 2-byte length header.
 /// A `pack`-able message must fit in this; longer messages need a
@@ -83,17 +101,20 @@ pub enum CellError {
     NonZeroPadding { offset: usize, got: u8 },
 }
 
-/// Pack `payload` into a fixed-size 512-byte cell. Caller's payload
-/// must be at most [`MAX_PAYLOAD_PER_CELL`] = 510 bytes; longer
+/// Pack `payload` into a fixed-size [`CELL_SIZE`] cell. Caller's payload
+/// must be at most [`MAX_PAYLOAD_PER_CELL`]; longer
 /// messages must be fragmented at a higher layer (see module docs).
-pub fn pack(payload: &[u8]) -> Result<[u8; CELL_SIZE], CellError> {
+///
+/// Boxed: the cell is 8 KiB since the 2026-08-07 bump, too large to hand
+/// back on the stack from a function this hot (see [`CELL_SIZE`]).
+pub fn pack(payload: &[u8]) -> Result<Box<[u8; CELL_SIZE]>, CellError> {
     if payload.len() > MAX_PAYLOAD_PER_CELL {
         return Err(CellError::PayloadTooLarge {
             got: payload.len(),
             max: MAX_PAYLOAD_PER_CELL,
         });
     }
-    let mut cell = [0u8; CELL_SIZE];
+    let mut cell = Box::new([0u8; CELL_SIZE]);
     let len = payload.len() as u16;
     cell[0..2].copy_from_slice(&len.to_be_bytes());
     cell[2..2 + payload.len()].copy_from_slice(payload);
@@ -166,7 +187,7 @@ mod tests {
             CELL_SIZE,
             "cell must be exactly {CELL_SIZE} bytes"
         );
-        let recovered = unpack(&cell).expect("unpack");
+        let recovered = unpack(&cell[..]).expect("unpack");
         assert_eq!(recovered, payload);
     }
 
@@ -176,7 +197,7 @@ mod tests {
         // cell that's indistinguishable on the wire from a "filler"
         // cell, which is exactly what cover-traffic emitters need.
         let cell = pack(&[]).expect("pack empty");
-        let recovered = unpack(&cell).expect("unpack empty");
+        let recovered = unpack(&cell[..]).expect("unpack empty");
         assert_eq!(recovered, Vec::<u8>::new());
         // Sanity: the entire cell after the length header must be zero.
         assert!(
@@ -191,7 +212,7 @@ mod tests {
         // region is empty; entire cell is header + payload.
         let payload = vec![0xABu8; MAX_PAYLOAD_PER_CELL];
         let cell = pack(&payload).expect("pack max");
-        let recovered = unpack(&cell).expect("unpack max");
+        let recovered = unpack(&cell[..]).expect("unpack max");
         assert_eq!(recovered, payload);
         assert_eq!(recovered.len(), MAX_PAYLOAD_PER_CELL);
     }
@@ -231,7 +252,7 @@ mod tests {
         // silently produce a too-long payload.
         let mut cell = [0u8; CELL_SIZE];
         cell[0..2].copy_from_slice(&((MAX_PAYLOAD_PER_CELL + 1) as u16).to_be_bytes());
-        let err = unpack(&cell).unwrap_err();
+        let err = unpack(&cell[..]).unwrap_err();
         assert!(
             matches!(err, CellError::DeclaredLenTooLarge { .. }),
             "declared len > MAX must be rejected: {err:?}"
@@ -247,16 +268,14 @@ mod tests {
         // bit-flip in the padding region is either bit-rot or a
         // malleability attempt.
         cell[CELL_SIZE - 1] = 0xFF;
-        let err = unpack(&cell).unwrap_err();
-        assert!(
-            matches!(
-                err,
-                CellError::NonZeroPadding {
-                    offset: 511,
-                    got: 0xFF
-                }
-            ),
-            "non-zero padding byte must be detected: {err:?}"
+        let err = unpack(&cell[..]).unwrap_err();
+        assert_eq!(
+            err,
+            CellError::NonZeroPadding {
+                offset: CELL_SIZE - 1,
+                got: 0xFF
+            },
+            "non-zero padding byte must be detected",
         );
     }
 
@@ -268,7 +287,7 @@ mod tests {
         let mut cell = pack(payload).unwrap();
         let first_padding_offset = 2 + payload.len();
         cell[first_padding_offset] = 0x01;
-        let err = unpack(&cell).unwrap_err();
+        let err = unpack(&cell[..]).unwrap_err();
         assert_eq!(
             err,
             CellError::NonZeroPadding {

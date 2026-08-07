@@ -1049,13 +1049,24 @@ pub mod final_hop_kind {
     pub const APP_DELIVER_FRAGMENT: u8 = 0x04;
 }
 
-/// Cap on `IntroducePayload.ciphertext` length. Sized to the Final-hop budget
-/// of a 2-hop circuit: `[1 B onion tag] + IntroducePayload` (50 B fixed) +
-/// ciphertext must fit `max_payload_for_hops(2)` (~348 B), so the ciphertext
-/// can be ~297 B. 320 leaves a small margin and keeps the wire format
-/// predictable; the authenticated fragmentation path clamps each fragment to
-/// the actual per-hop budget regardless.
-pub const MAX_INTRODUCE_CIPHERTEXT: usize = 320;
+/// Cap on `IntroducePayload.ciphertext` length — DERIVED from the cell it
+/// rides, not a standalone number.
+///
+/// An introduce travels to the rendezvous as the Final-hop payload of one
+/// [`crate::cell::CELL_SIZE`] anonymous cell: `[1 B onion tag] +
+/// IntroducePayload` (fixed part) + ciphertext must fit
+/// [`crate::packet::max_payload_for_hops`]. This cap is the ONE-hop budget —
+/// the loosest any real path can be — and each send still clamps to its own
+/// hop count, so the wire cap never contradicts the per-hop budget.
+///
+/// It used to be a hardcoded 320, sized by hand against a 512-byte cell. When
+/// the cell grew, the cap did not, and it silently became the binding limit:
+/// every message over ~135 B fragmented (see [`crate::cell::CELL_SIZE`]).
+/// Deriving it means the two can no longer drift apart.
+pub const MAX_INTRODUCE_CIPHERTEXT: usize = crate::cell::MAX_PAYLOAD_PER_CELL
+    - crate::circuit::PER_HOP_OVERHEAD
+    - 1
+    - IntroducePayload::FIXED_SIZE;
 
 const INTRODUCE_DOMAIN: &[u8] = b"veil-introduce-v1\0";
 const INTRODUCE_NONCE_LEN: usize = 12;
