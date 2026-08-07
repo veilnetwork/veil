@@ -3186,3 +3186,40 @@ fn a_full_deposit_chunk_fits_one_anonymous_cell() {
         "reassembly ceiling grew past 64 KiB per in-flight deposit"
     );
 }
+
+/// A single-fragment send puts ONE copy on the wire, whatever the caller asked
+/// for; a fragmented one still pays for its all-or-nothing reassembly.
+///
+/// The reply path asks for 3 explicitly, and before the 2026-08-07 cell bump a
+/// ~6 KB mailbox FETCH reply really was 46 fragments, where losing any one lost
+/// the whole reply. After the bump the same reply is one fragment, so the two
+/// extra copies re-sent something the next drain round would have re-requested
+/// three seconds later anyway — measured as the largest remaining term in the
+/// cost of delivering one message.
+#[test]
+fn redundancy_is_for_reassembly_not_for_retry() {
+    use super::{BULK_FRAGMENT_THRESHOLD, onion_send_redundancy};
+
+    // One fragment: the caller's 3 is dropped. This is the reply path.
+    assert_eq!(
+        onion_send_redundancy(3, 1, false, 1),
+        1,
+        "a one-fragment reply must not be sent three times"
+    );
+    assert_eq!(onion_send_redundancy(1, 1, false, 1), 1);
+
+    // Two fragments: reassembly can now fail partially, so the caller's ask
+    // stands — but the bulk bump has not kicked in yet.
+    assert_eq!(onion_send_redundancy(3, 2, false, 1), 3);
+    assert_eq!(onion_send_redundancy(1, 2, false, 1), 1);
+
+    // Bulk down ONE relay: redundancy is raised to the bulk floor even when the
+    // caller asked for none.
+    assert_eq!(
+        onion_send_redundancy(1, BULK_FRAGMENT_THRESHOLD, false, 1),
+        super::BULK_REDUNDANCY
+    );
+
+    // Bulk across SEVERAL relays: spread instead of duplicate.
+    assert_eq!(onion_send_redundancy(3, 27, true, 3), 1);
+}
