@@ -396,15 +396,16 @@ bool ensure_encoder(VeilVnoteRecorder* rec, int w, int h) {
 
 // Center-crop to an even square, scale to the recorder's target square, then
 // VP8-encode. Called from the camera callback / push_frame; takes video_mu.
+//
+// A frame arriving BEFORE start() still updates the preview. The caller shows
+// the person a live round preview while the camera warms up and they get
+// ready, and only then starts the clip — so the preview cannot be conditional
+// on recording having begun. Everything from the encode timestamp down is,
+// which is where the guard now sits.
 void encode_i420(VeilVnoteRecorder* rec, const uint8_t* y, const uint8_t* u,
                  const uint8_t* v, int w, int h, int sy, int su, int sv) {
   if (w <= 1 || h <= 1) return;
   std::lock_guard<std::mutex> lk(rec->video_mu);
-  if (!rec->encoding) return;
-  const int64_t ts_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                            std::chrono::steady_clock::now() - rec->started_at)
-                            .count();
-  if (ts_ms > kMaxDurationMs) return;
 
   const int s = std::min(w, h) & ~1;
   const int ox = ((w - s) / 2) & ~1;
@@ -427,6 +428,16 @@ void encode_i420(VeilVnoteRecorder* rec, const uint8_t* y, const uint8_t* u,
   rec->preview.store_i420(buf->DataY(), buf->DataU(), buf->DataV(),
                           buf->width(), buf->height(), buf->StrideY(),
                           buf->StrideU(), buf->StrideV());
+
+  // Warm-up: the person can see themselves, but nothing is being kept yet.
+  // (`started_at` is only meaningful once start() has stamped it, so the
+  // timestamp below has to come after this.)
+  if (!rec->encoding) return;
+  const int64_t ts_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                            std::chrono::steady_clock::now() - rec->started_at)
+                            .count();
+  if (ts_ms > kMaxDurationMs) return;
+
   const bool want_key = ts_ms - rec->last_key_ms >= kKeyframeEveryMs;
   if (want_key) rec->last_key_ms = ts_ms;
   webrtc::VideoFrame frame = webrtc::VideoFrame::Builder()
