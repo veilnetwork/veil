@@ -214,8 +214,18 @@ impl FrameDispatcher {
                                 ratchet.published_ik(node_id.as_bytes()).is_some(),
                                 ratchet.peer_entry_authenticated(node_id.as_bytes()),
                             ) + &format!(
-                                " kind={}",
-                                payload.data.get(2).copied().unwrap_or(255)
+                                " kind={} we-hold ratchet_pk={} ek={}",
+                                payload.data.get(2).copied().unwrap_or(255),
+                                // Compare against the `advertises ratchet_pk=`
+                                // in this node's own publish line: a peer seals
+                                // to what was PUBLISHED, and can only be
+                                // answered with what is still HELD.
+                                veil_util::bytes_to_hex(
+                                    &self.crypto.mlkem_keys.current_ratchet_pk()[..4]
+                                ),
+                                veil_util::bytes_to_hex(
+                                    &self.crypto.mlkem_keys.current_ek()[..4]
+                                ),
                             ),
                         );
                         // The conversation was given up, and the peer does not

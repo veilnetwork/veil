@@ -129,10 +129,17 @@ pub(crate) async fn publish_sovereign_identity(
                     Ok(()) => logger.info(
                         "node.sovereign_identity.mlkem_cert_published",
                         format!(
-                            "node_id={} instance_id={} cert_version={}",
+                            "node_id={} instance_id={} cert_version={} \
+                             advertises ratchet_pk={} ek={}",
                             veil_util::bytes_to_hex(sov.node_id()),
                             veil_util::bytes_to_hex(&sov.active_instance_id()),
                             cert.cert_version,
+                            // What a peer will seal to. Printed so it can be
+                            // compared against what this node still HOLDS: if
+                            // they differ, every peer working from this record
+                            // is sealing to a key we cannot answer.
+                            veil_util::bytes_to_hex(&mlkem_keys.current_ratchet_pk()[..4]),
+                            veil_util::bytes_to_hex(&mlkem_keys.current_ek()[..4]),
                         ),
                     ),
                     Err(e) => logger.warn(
