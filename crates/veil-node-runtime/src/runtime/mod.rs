@@ -1639,8 +1639,8 @@ impl NodeRuntime {
         // host's, and xVeil restores it over the FFI before traffic flows.
         let ratchet_runtime = veil_e2e::RatchetRuntime {
             store: Arc::new(veil_e2e::RatchetStore::new()),
-            seed_ring: Arc::clone(&mlkem_keys),
-            local_node_id,
+            seed_ring: Arc::new(RwLock::new(Arc::clone(&mlkem_keys))),
+            local_node_id: Arc::new(RwLock::new(local_node_id)),
             local_instance_id: sovereign_cell.active_instance_handle(),
             peer_ratchet_keys: Arc::clone(&shared_peer_ratchet_keys),
         };

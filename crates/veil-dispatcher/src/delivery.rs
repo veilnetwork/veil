@@ -3856,8 +3856,8 @@ mod ratchet_terminal_tests {
             ring: Arc::clone(&ring),
             runtime: veil_e2e::RatchetRuntime {
                 store: Arc::new(veil_e2e::RatchetStore::new()),
-                seed_ring: ring,
-                local_node_id: node_id,
+                seed_ring: std::sync::Arc::new(std::sync::RwLock::new(ring)),
+                local_node_id: std::sync::Arc::new(std::sync::RwLock::new(node_id)),
                 local_instance_id: Arc::new(RwLock::new(Some(instance_id))),
                 peer_ratchet_keys: Arc::new(RwLock::new(veil_e2e::PeerRatchetKeyCache::new())),
             },

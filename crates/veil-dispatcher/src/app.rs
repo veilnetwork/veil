@@ -226,6 +226,20 @@ impl FrameDispatcher {
                                 veil_util::bytes_to_hex(
                                     &self.crypto.mlkem_keys.current_ek()[..4]
                                 ),
+                            ) + &format!(
+                                " ratchet-ring pk={} ek={}",
+                                // The ring the RATCHET actually opens with, as
+                                // opposed to the one the node publishes from.
+                                // They are the same Arc at startup and nothing
+                                // re-points the ratchet's when the identity is
+                                // promoted, so a difference here means peers
+                                // seal to a key this node cannot decapsulate.
+                                veil_util::bytes_to_hex(
+                                    &ratchet.identity().map(|i| i.seed_ring.current_ratchet_pk()).unwrap_or([0u8; 32])[..4]
+                                ),
+                                veil_util::bytes_to_hex(
+                                    &ratchet.identity().map(|i| i.seed_ring.current_ek()).unwrap_or([0u8; veil_e2e::EK_BYTES])[..4]
+                                ),
                             ),
                         );
                         // The conversation was given up, and the peer does not

@@ -236,8 +236,8 @@ pub struct PeerRatchetKeys<'a> {
 /// The two identifiers are held by value, not borrowed: the instance id lives
 /// behind a lock in [`RatchetRuntime`] because a device identity can be swapped
 /// while the node runs, and 48 bytes is not worth a lifetime.
-#[derive(Clone, Copy)]
-pub struct RatchetIdentity<'a> {
+#[derive(Clone)]
+pub struct RatchetIdentity {
     /// Our node id.
     pub local_node_id: [u8; 32],
     /// Which of our devices is speaking.
@@ -246,10 +246,10 @@ pub struct RatchetIdentity<'a> {
     /// predecessors. Both halves of a certificate come out of it, in matched
     /// order, so a sender working from a week-old certificate still finds the
     /// pair it addressed.
-    pub seed_ring: &'a MlKemSeedRing,
+    pub seed_ring: std::sync::Arc<MlKemSeedRing>,
 }
 
-impl std::fmt::Debug for RatchetIdentity<'_> {
+impl std::fmt::Debug for RatchetIdentity {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("RatchetIdentity")
             .field(
@@ -896,7 +896,7 @@ pub const ACK_KEY_LEN: usize = 32;
 /// stamp is set to, and nothing a peer sends contributes to it.
 pub fn seal(
     store: &RatchetStore,
-    me: &RatchetIdentity<'_>,
+    me: &RatchetIdentity,
     peer: PeerRatchetKeys<'_>,
     app_payload: &[u8],
     now_unix: u64,
@@ -911,7 +911,7 @@ pub fn seal(
 
 fn seal_inner(
     store: &RatchetStore,
-    me: &RatchetIdentity<'_>,
+    me: &RatchetIdentity,
     peer: PeerRatchetKeys<'_>,
     plaintext: &[u8],
     now_unix: u64,
@@ -1094,7 +1094,7 @@ pub fn is_ratchet_payload(payload: &[u8]) -> bool {
 /// resolved.
 pub fn open(
     store: &RatchetStore,
-    me: &RatchetIdentity<'_>,
+    me: &RatchetIdentity,
     sender_node_id: &[u8; 32],
     payload: &[u8],
     published_peer_ik: Option<&[u8; 32]>,
@@ -1125,7 +1125,7 @@ pub fn open(
 
 fn open_inner(
     store: &RatchetStore,
-    me: &RatchetIdentity<'_>,
+    me: &RatchetIdentity,
     sender_node_id: &[u8; 32],
     payload: &[u8],
     published_peer_ik: Option<&[u8; 32]>,
@@ -1406,9 +1406,17 @@ pub struct RatchetRuntime {
     /// The conversations, which the host persists.
     pub store: std::sync::Arc<RatchetStore>,
     /// Our mailbox keys, current and still-usable retired.
-    pub seed_ring: std::sync::Arc<MlKemSeedRing>,
-    /// Our node id.
-    pub local_node_id: [u8; 32],
+    ///
+    /// Behind a lock for the same reason `local_instance_id` is: a deniable
+    /// boot starts under a placeholder identity and is PROMOTED to the real
+    /// one while the node runs. This used to be a snapshot taken once at
+    /// construction, so after a promotion the node published one identity's
+    /// keys and opened with the placeholder's — every peer sealed to something
+    /// this node could not decapsulate, and every direct frame failed
+    /// authentication for the life of the process.
+    pub seed_ring: std::sync::Arc<std::sync::RwLock<std::sync::Arc<MlKemSeedRing>>>,
+    /// Our node id — swapped by the same promotion, for the same reason.
+    pub local_node_id: std::sync::Arc<std::sync::RwLock<[u8; 32]>>,
     /// Which of our devices we are, mirroring the active sovereign identity.
     ///
     /// Behind a lock and optional because both are true of the thing it
@@ -1434,15 +1442,43 @@ impl RatchetRuntime {
     /// Our half of a conversation, or `None` when this node has no device
     /// identity to speak as and therefore nothing a peer could address.
     #[must_use]
-    pub fn identity(&self) -> Option<RatchetIdentity<'_>> {
+    /// Re-point this runtime at the identity now in force.
+    ///
+    /// A deniable boot runs under a placeholder and is promoted later. Before
+    /// this existed the ring was a snapshot taken at construction, so after a
+    /// promotion the node published one identity's keys and opened with the
+    /// placeholder's: peers sealed to a key it could not decapsulate and every
+    /// direct frame failed authentication, silently, for the life of the
+    /// process. `local_instance_id` already followed the swap; these two are
+    /// the rest of the same identity and have to follow it together.
+    pub fn adopt_identity(&self, node_id: [u8; 32], ring: std::sync::Arc<MlKemSeedRing>) {
+        *self
+            .local_node_id
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = node_id;
+        *self
+            .seed_ring
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = ring;
+    }
+
+    pub fn identity(&self) -> Option<RatchetIdentity> {
         let instance = (*self
             .local_instance_id
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner))?;
         Some(RatchetIdentity {
-            local_node_id: self.local_node_id,
+            local_node_id: *self
+                .local_node_id
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
             local_instance_id: instance,
-            seed_ring: &self.seed_ring,
+            seed_ring: std::sync::Arc::clone(
+                &self
+                    .seed_ring
+                    .read()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+            ),
         })
     }
 
@@ -1535,7 +1571,7 @@ mod tests {
     struct Device {
         node_id: [u8; 32],
         instance_id: [u8; 16],
-        ring: MlKemSeedRing,
+        ring: std::sync::Arc<MlKemSeedRing>,
         store: RatchetStore,
     }
 
@@ -1545,17 +1581,17 @@ mod tests {
         Device {
             node_id: [tag; 32],
             instance_id: [tag; 16],
-            ring: MlKemSeedRing::new(0, seed, ek),
+            ring: std::sync::Arc::new(MlKemSeedRing::new(0, seed, ek)),
             store: RatchetStore::new(),
         }
     }
 
     impl Device {
-        fn me(&self) -> RatchetIdentity<'_> {
+        fn me(&self) -> RatchetIdentity {
             RatchetIdentity {
                 local_node_id: self.node_id,
                 local_instance_id: self.instance_id,
-                seed_ring: &self.ring,
+                seed_ring: std::sync::Arc::clone(&self.ring),
             }
         }
         fn ek(&self) -> [u8; EK_BYTES] {
@@ -2238,7 +2274,7 @@ mod tests {
         let me = RatchetIdentity {
             local_node_id: b.node_id,
             local_instance_id: other.instance_id,
-            seed_ring: &b.ring,
+            seed_ring: std::sync::Arc::clone(&b.ring),
         };
         assert_eq!(
             open(&b.store, &me, &a.node_id, &payload, None, NOW).unwrap_err(),
@@ -2798,7 +2834,7 @@ mod tests {
         let me = RatchetIdentity {
             local_node_id: b.node_id,
             local_instance_id: b.instance_id,
-            seed_ring: &b.ring,
+            seed_ring: std::sync::Arc::clone(&b.ring),
         };
         let a_pk = a.ratchet_pk();
         open(&store, &me, &a.node_id, &payload, Some(&a_pk), NOW).expect("open");
@@ -2838,7 +2874,7 @@ mod tests {
         let me = RatchetIdentity {
             local_node_id: b.node_id,
             local_instance_id: b.instance_id,
-            seed_ring: &b.ring,
+            seed_ring: std::sync::Arc::clone(&b.ring),
         };
         let a_pk = a.ratchet_pk();
         open(&store, &me, &a.node_id, &payload, Some(&a_pk), NOW).expect("open");
@@ -2869,7 +2905,7 @@ mod tests {
         let me = RatchetIdentity {
             local_node_id: a.node_id,
             local_instance_id: a.instance_id,
-            seed_ring: &a.ring,
+            seed_ring: std::sync::Arc::clone(&a.ring),
         };
         assert_eq!(
             seal(&store, &me, keys(&b, &bek, &bpk), b"no room", NOW).unwrap_err(),
@@ -2921,7 +2957,7 @@ mod tests {
         let me = RatchetIdentity {
             local_node_id: a.node_id,
             local_instance_id: a.instance_id,
-            seed_ring: &a.ring,
+            seed_ring: std::sync::Arc::clone(&a.ring),
         };
         assert_eq!(
             seal(&store, &me, keys(&b, &bek, &bpk), b"someone new", NOW).unwrap_err(),
@@ -2979,7 +3015,7 @@ mod tests {
         let me = RatchetIdentity {
             local_node_id: b.node_id,
             local_instance_id: b.instance_id,
-            seed_ring: &b.ring,
+            seed_ring: std::sync::Arc::clone(&b.ring),
         };
         let a_pk = a.ratchet_pk();
         let got = open(&store, &me, &a.node_id, &payload, Some(&a_pk), NOW)
@@ -3017,7 +3053,7 @@ mod tests {
         let me = RatchetIdentity {
             local_node_id: a.node_id,
             local_instance_id: a.instance_id,
-            seed_ring: &a.ring,
+            seed_ring: std::sync::Arc::clone(&a.ring),
         };
         for i in 0..4u8 {
             let peer = device(0x88 + i);
@@ -3210,7 +3246,7 @@ mod tests {
         let me = RatchetIdentity {
             local_node_id: a.node_id,
             local_instance_id: a.instance_id,
-            seed_ring: &a.ring,
+            seed_ring: std::sync::Arc::clone(&a.ring),
         };
         seal(
             &store,
