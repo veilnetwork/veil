@@ -514,8 +514,13 @@ impl NodeRuntime {
                 &sov,
                 &self.dht,
                 &self.identity.mlkem_keys,
-                &config,
                 &veil_dir_path,
+                // Sessions exist by now: replicate, or the records land in this
+                // node's own shard and no peer ever resolves them.
+                Some((
+                    &self.session_tx_registry,
+                    *self.identity.local_identity.node_id.as_bytes(),
+                )),
                 &self.logger,
             )
             .await;

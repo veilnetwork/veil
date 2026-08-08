@@ -1698,8 +1698,9 @@ impl NodeRuntime {
                 sov,
                 &dht,
                 &mlkem_keys,
-                &config,
                 &veil_dir_path,
+                // No peers yet at boot — this one is local-only by design.
+                None,
                 &logger,
             )
             .await;
