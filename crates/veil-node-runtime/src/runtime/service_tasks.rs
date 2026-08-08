@@ -793,7 +793,7 @@ pub(crate) async fn rendezvous_recipient_recheck(
 impl NodeRuntime {
     // ── proxy runtime wiring ───────────────────────────────────────
 
-    fn proxy_mlkem_ek_resolver(&self) -> Arc<dyn veil_types::MlKemEkResolver> {
+    pub(crate) fn proxy_mlkem_ek_resolver(&self) -> Arc<dyn veil_types::MlKemEkResolver> {
         Arc::new(crate::mlkem_resolver::DhtMlKemEkResolver::new(
             Arc::clone(&self.dht),
             Arc::clone(&self.session_tx_registry),
