@@ -130,6 +130,10 @@ impl NodeRuntime {
         // advertising exactly the keys it holds — and still be unreachable
         // because what is actually stored under its key is something else.
         // Nothing compared those two, so that gap was invisible.
+        // Frames that never reached the wire, counted where they are shed.
+        // Without this a lost frame is indistinguishable from one the network
+        // ate, and the search goes to the network every time.
+        let drop_metrics = self.metrics.clone();
         let selfcheck_resolver = self.proxy_mlkem_ek_resolver();
         let selfcheck_node_id = *self.identity.local_identity.node_id.as_bytes();
         let selfcheck_ring = Arc::clone(&self.identity.mlkem_keys);
@@ -331,6 +335,17 @@ impl NodeRuntime {
                             }
                         }
                         _ = on_change_tick.tick() => {
+                            if let Some(m) = &drop_metrics {
+                                let snap = m.snapshot();
+                                logger.info(
+                                    "node.session.shed_totals",
+                                    format!(
+                                        "tx_queue={} outbox={}",
+                                        snap.session_tx_drops_total,
+                                        snap.session_outbox_drops_total,
+                                    ),
+                                );
+                            }
                             // On-change republish (462.12): detect CLI-driven
                             // rotate / revoke by comparing the document
                             // file's mtime against the previous tick.
