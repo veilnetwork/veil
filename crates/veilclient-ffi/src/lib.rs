@@ -3225,8 +3225,20 @@ pub unsafe extern "C" fn veil_send(
     // send through the persistent `sender` half — set_recv_handler
     // only takes the receiver, so the sender stays addressable for the entire
     // app lifetime.
+    // Where a send's half-second goes.
+    //
+    // A file serve is one of these per chunk and each was measured at ~500 ms
+    // on a phone, which is the whole of a 200 KB transfer taking 21 s. From
+    // outside this call the three candidates are indistinguishable: entering
+    // the runtime, waiting for the sender mutex, or the queue write itself.
+    // Time them apart, and say so only when the call was actually slow — a
+    // healthy send must stay silent.
+    let call_started = std::time::Instant::now();
+    let mut lock_micros: u128 = 0;
     let send_res: Result<(), ClientError> = app_ref.bundle.runtime.block_on(async {
+        let entered = std::time::Instant::now();
         let inner_guard = app_ref.sender.lock().await;
+        lock_micros = entered.elapsed().as_micros();
         let Some(sender) = inner_guard.as_ref() else {
             return Err(ClientError::Protocol("app already closed".to_string()));
         };
@@ -3234,6 +3246,15 @@ pub unsafe extern "C" fn veil_send(
             .send(dst_node, dst_app, dst_endpoint_id, &payload)
             .await
     });
+    let total_micros = call_started.elapsed().as_micros();
+    if total_micros >= 50_000 {
+        log::warn!(
+            "veil_send SLOW: total {}ms lock {}ms bytes {}",
+            total_micros / 1000,
+            lock_micros / 1000,
+            payload.len()
+        );
+    }
     match send_res {
         Ok(()) => VEIL_OK,
         Err(e) => {
