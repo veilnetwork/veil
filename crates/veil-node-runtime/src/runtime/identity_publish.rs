@@ -15,9 +15,10 @@
 //! direction between two devices on the same LAN, and four publish records in
 //! the node's log, every one of them under the placeholder id.
 
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
-use veil_cfg::Config;
+use veil_session::SessionTxRegistry;
+
 use veil_dht::KademliaService;
 use veil_observability::NodeLogger;
 
@@ -32,12 +33,23 @@ pub(crate) async fn publish_sovereign_identity(
     sov: &SovereignIdentity,
     dht: &Arc<KademliaService>,
     mlkem_keys: &Arc<veil_e2e::MlKemSeedRing>,
-    config: &Config,
     veil_dir_path: &std::path::Path,
+    // Present once sessions exist: without it the records are written to THIS
+    // node's shard only and no peer ever sees them. The boot-time call passes
+    // `None` because there are no peers yet; every later call must not.
+    replication: Option<(&Arc<RwLock<SessionTxRegistry>>, [u8; 32])>,
     logger: &Arc<NodeLogger>,
 ) {
-        let publisher =
-            crate::identity_local::publisher_dht::DhtBackedPublisher::new(Arc::clone(&dht));
+    let publisher = match replication {
+        Some((registry, local_node_id)) => {
+            crate::identity_local::publisher_dht::DhtBackedPublisher::with_replication(
+                Arc::clone(dht),
+                Arc::clone(registry),
+                local_node_id,
+            )
+        }
+        None => crate::identity_local::publisher_dht::DhtBackedPublisher::new(Arc::clone(dht)),
+    };
         match veil_identity::publish::publish_identity_document(
             &sov.document, &publisher,
         ).await {
