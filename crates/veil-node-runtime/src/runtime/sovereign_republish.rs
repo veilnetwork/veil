@@ -125,6 +125,15 @@ impl NodeRuntime {
         const SOVEREIGN_ON_CHANGE_POLL_INTERVAL: std::time::Duration =
             std::time::Duration::from_secs(60);
 
+        // What the NETWORK will hand a peer for us, asked of the network the
+        // same way a peer asks. A node can be perfectly self-consistent —
+        // advertising exactly the keys it holds — and still be unreachable
+        // because what is actually stored under its key is something else.
+        // Nothing compared those two, so that gap was invisible.
+        let selfcheck_resolver = self.proxy_mlkem_ek_resolver();
+        let selfcheck_node_id = *self.identity.local_identity.node_id.as_bytes();
+        let selfcheck_ring = Arc::clone(&self.identity.mlkem_keys);
+
         let handle = supervised_spawn(
             Arc::clone(&self.logger),
             "sovereign_identity_republish",
@@ -135,6 +144,48 @@ impl NodeRuntime {
                         session_tx_registry,
                         local_node_id_for_replication,
                     );
+                // One-shot, once the routing table has had a chance to fill:
+                // ask the network for OUR OWN certificate exactly as a peer
+                // would, and print it beside the keys we actually hold. Equal
+                // means a peer can seal something we can open. Different means
+                // every peer is sealing to keys we cannot answer, and no amount
+                // of looking at our own publish path would ever show it.
+                {
+                    let resolver = Arc::clone(&selfcheck_resolver);
+                    let ring = Arc::clone(&selfcheck_ring);
+                    let lg = Arc::clone(&logger);
+                    tokio::spawn(async move {
+                        tokio::time::sleep(std::time::Duration::from_secs(45)).await;
+                        let held_pk = veil_util::bytes_to_hex(&ring.current_ratchet_pk()[..4]);
+                        let held_ek = veil_util::bytes_to_hex(&ring.current_ek()[..4]);
+                        match resolver.resolve_cert(selfcheck_node_id).await {
+                            Some(c) => {
+                                let net_pk =
+                                    veil_util::bytes_to_hex(&c.ratchet_x25519_pk[..4]);
+                                let net_ek = veil_util::bytes_to_hex(
+                                    &c.mlkem_ek[..4.min(c.mlkem_ek.len())],
+                                );
+                                let agree = net_pk == held_pk && net_ek == held_ek;
+                                lg.warn(
+                                    "node.identity.selfcheck",
+                                    format!(
+                                        "network returns ratchet_pk={net_pk} ek={net_ek}; \
+                                         we hold ratchet_pk={held_pk} ek={held_ek} — {}",
+                                        if agree { "AGREE" } else { "DISAGREE" }
+                                    ),
+                                );
+                            }
+                            None => lg.warn(
+                                "node.identity.selfcheck",
+                                format!(
+                                    "network returned NO certificate for us; we hold \
+                                     ratchet_pk={held_pk} ek={held_ek} — no peer can seal \
+                                     anything this node could open"
+                                ),
+                            ),
+                        }
+                    });
+                }
                 // target routing-table density at which we
                 // use the base republish cadence. Above target → less
                 // frequent (save bandwidth); below → more frequent
