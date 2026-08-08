@@ -490,6 +490,32 @@ impl NodeRuntime {
             Arc::clone(&self.identity.peer_ratchet_keys),
             Arc::clone(&self.identity.per_session_mlkem_dk),
         ));
+        // The ratchet opens with a ring and a node id it took ONCE, at
+        // construction — which on a deniable boot is the placeholder's. Nothing
+        // re-pointed them at the promoted identity, so this node published one
+        // identity's keys and decapsulated with another's: measured as
+        // `we-hold ratchet_pk=95b6dd81` beside `ratchet-ring pk=fe0747c5`, on
+        // every one of 8 refused frames, with 0 of 86 delivered in either
+        // direction. `local_instance_id` already followed the swap; these are
+        // the rest of the same identity and follow it here.
+        if identity_changed
+            && let Some(ratchet) = self.dispatcher.crypto.ratchet.as_ref()
+        {
+            ratchet.adopt_identity(
+                *self.identity.local_identity.node_id.as_bytes(),
+                Arc::clone(&self.identity.mlkem_keys),
+            );
+            self.logger.info(
+                "node.ratchet.identity_adopted",
+                format!(
+                    "ratchet now opens as {}",
+                    veil_util::bytes_to_hex(
+                        &self.identity.local_identity.node_id.as_bytes()[..4]
+                    )
+                ),
+            );
+        }
+
         // The identity in force CHANGED, so what the DHT holds for this node is
         // the previous identity's. The only publish used to be the one-shot at
         // startup, which had already run under the placeholder a deniable boot
