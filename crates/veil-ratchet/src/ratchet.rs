@@ -297,6 +297,24 @@ impl RatchetCore {
         self.pn = self.ns;
         self.ns = 0;
         self.nr = 0;
+        // Age the bank by epoch. A skipped key is filed under the remote public
+        // key of the epoch that would open it, and it only ever left this map
+        // when its message arrived — so keys for messages that never came sat
+        // here until MAX_SKIP_TOTAL. That is not a memory problem, it is a DISK
+        // one: the host persists the whole session on every advance into a
+        // container that may never reuse the slots it leaves behind. Measured
+        // on a real profile: 23,421 bytes of stored state, 324 banked keys
+        // spread over 42 epochs, and NONE in the current one — about 64 MB a
+        // day rewritten for keys nothing could still use.
+        //
+        // Two epochs are kept: the one just ending and the one starting. A
+        // step happens when the conversation changes direction, so that is the
+        // window in which a straggler from the old chain can still turn up;
+        // beyond it the peer has ratcheted twice and anything that old would
+        // have to be re-sent anyway.
+        let ending = self.dh_pk_remote;
+        self.skipped
+            .retain(|(pk, _), _| Some(*pk) == ending || *pk == header.dh_pk);
         self.dh_pk_remote = Some(header.dh_pk);
         self.rk = rk2;
         self.ckr = Some(ckr);
@@ -401,6 +419,25 @@ impl RatchetCore {
     #[must_use]
     pub fn skipped_len(&self) -> usize {
         self.skipped.len()
+    }
+
+    /// How many distinct DH epochs the bank spans, and how many of its keys
+    /// belong to the CURRENT one.
+    ///
+    /// Which decides whether the bank can be aged at all. Keys are filed under
+    /// the remote public key of the epoch that would open them, so a bank
+    /// spread over many old epochs is mostly keys for messages that stopped
+    /// being reachable long ago — and a bank concentrated in the current epoch
+    /// is not, in which case epoch-ageing would cost decryptability and buy
+    /// nothing. Counts only; no key material leaves.
+    #[must_use]
+    pub fn skipped_epochs(&self) -> (usize, usize) {
+        let epochs: std::collections::BTreeSet<[u8; 32]> =
+            self.skipped.keys().map(|(pk, _)| *pk).collect();
+        let current = self.dh_pk_remote.map_or(0, |cur| {
+            self.skipped.keys().filter(|(pk, _)| *pk == cur).count()
+        });
+        (epochs.len(), current)
     }
 
     #[cfg(test)]
@@ -669,8 +706,15 @@ mod tests {
         let (mut alice, mut bob, mut ar, mut br) = pair();
         let mut banked = 0usize;
 
-        // Each round: Alice sends MAX_SKIP messages of which Bob sees only the
-        // last, banking MAX_SKIP - 1; then the epoch turns.
+        // Each round Alice sends MAX_SKIP messages of which Bob sees only the
+        // last, banking MAX_SKIP - 1 — all WITHIN ONE EPOCH.
+        //
+        // The epoch used to turn between rounds, and that is no longer a route
+        // to the bound: a step now drops keys older than the epoch it ends, so
+        // cross-epoch accumulation plateaus at two epochs' worth by design.
+        // Staying in one epoch tests the ceiling that ageing does not enforce,
+        // which is the one this test is named for.
+        let _ = &mut ar;
         for round in 0..4 {
             let mut last = None;
             for _ in 0..MAX_SKIP {
@@ -688,10 +732,54 @@ mod tests {
                 Err(RatchetError::TooManySkipped(_)) => return, // refused, as designed
                 Err(e) => panic!("round {round}: unexpected {e:?}"),
             }
-            let (hb, _) = bob.send_step().expect("chain");
-            alice.recv_step(&hb, &mut ar).expect("b→a");
         }
         panic!("the cache never hit its bound after 4 rounds (banked {banked})");
+    }
+
+    #[test]
+    fn the_bank_forgets_epochs_it_has_ratcheted_past() {
+        // A skipped key only ever left the bank when its message arrived, so
+        // keys for messages that never came stayed for the life of the
+        // conversation. Measured on a real profile: 324 banked keys across 42
+        // epochs, none in the current one, in a 23 KB state the host rewrites
+        // WHOLE on every advance into a container that cannot reuse the slots
+        // it frees. Two epochs are kept; older ones are gone.
+        let (mut alice, mut bob, mut ar, mut br) = pair();
+
+        // Epoch 1: Alice sends two, Bob sees only the second — one key banked.
+        let (_skipped_1, _) = alice.send_step().expect("chain");
+        let (h1, _) = alice.send_step().expect("chain");
+        bob.recv_step(&h1, &mut br).expect("a→b");
+        assert_eq!(bob.skipped_len(), 1, "the unseen first message is banked");
+        let (epochs, current) = bob.skipped_epochs();
+        assert_eq!((epochs, current), (1, 1), "banked under the live epoch");
+
+        // Turn the epoch once: the key is one epoch back, still reachable.
+        let (hb, _) = bob.send_step().expect("chain");
+        alice.recv_step(&hb, &mut ar).expect("b→a");
+        let (_skipped_2, _) = alice.send_step().expect("chain");
+        let (h2, _) = alice.send_step().expect("chain");
+        bob.recv_step(&h2, &mut br).expect("a→b (epoch 2)");
+        assert_eq!(
+            bob.skipped_len(),
+            2,
+            "the ending epoch's key is kept — a straggler can still turn up",
+        );
+
+        // Turn it again: the first epoch is now two back and is dropped, while
+        // the second one's key survives.
+        let (hb2, _) = bob.send_step().expect("chain");
+        alice.recv_step(&hb2, &mut ar).expect("b→a");
+        let (_skipped_3, _) = alice.send_step().expect("chain");
+        let (h3, _) = alice.send_step().expect("chain");
+        bob.recv_step(&h3, &mut br).expect("a→b (epoch 3)");
+        assert_eq!(
+            bob.skipped_len(),
+            2,
+            "two epochs' worth, not three — the bank stopped growing",
+        );
+        let (epochs, _) = bob.skipped_epochs();
+        assert_eq!(epochs, 2, "and it spans exactly the two kept epochs");
     }
 
     #[test]
