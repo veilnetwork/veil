@@ -2268,6 +2268,27 @@ async fn handle_ipc_client(
                 // in-order, so the rollout needs no capability handshake.
                 let req_id = hdr.request_id;
 
+                // One client's requests are served STRICTLY IN ORDER here, and
+                // some arms wait on the network (a key resolve walks the DHT).
+                // While one does, every later request on this connection waits
+                // with it — which is how a `node_identity` that does nothing
+                // but copy bytes can time out. Say which request held the loop,
+                // and only when it held it long enough to matter.
+                struct LoopSpan(std::time::Instant, u16);
+                impl Drop for LoopSpan {
+                    fn drop(&mut self) {
+                        let ms = self.0.elapsed().as_millis();
+                        if ms >= 200 {
+                            log::warn!(
+                                "ipc read loop HELD {}ms by request type {}",
+                                ms,
+                                self.1
+                            );
+                        }
+                    }
+                }
+                let _loop_span = LoopSpan(std::time::Instant::now(), hdr.msg_type);
+
                 match LocalAppMsg::try_from(hdr.msg_type) {
                     Ok(LocalAppMsg::AppBind) => {
                         {
