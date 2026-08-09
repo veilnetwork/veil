@@ -52,6 +52,15 @@ pub struct RatchetSession {
 }
 
 impl RatchetSession {
+    /// How many skipped message keys this session banks — a COUNT, never the
+    /// keys. The host persists the whole session on every advance, and the
+    /// bank is the part that grows, so this is what tells a fat stored state
+    /// from a thin one.
+    #[must_use]
+    pub fn skipped_len(&self) -> usize {
+        self.core.skipped_len()
+    }
+
     /// The party that speaks first, keyed from a completed PQXDH.
     pub(crate) fn initiator(
         root: &[u8; KEY_LEN],
