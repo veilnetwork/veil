@@ -799,13 +799,28 @@ impl RatchetStore {
         blob: &[u8],
         now_unix: u64,
     ) -> Result<(), RatchetSpliceError> {
-        let entry = Entry::decode(blob)?;
+        let mut entry = Entry::decode(blob)?;
+        // Sweep the skipped-key bank on the way in. The step rule keeps two
+        // epochs but only runs when a step runs, and a peer that stopped
+        // answering never causes one — so its bank stays fat while our own
+        // sends keep rewriting the whole state around it. Restoring is the
+        // quiet moment to sweep: once per conversation per session, off every
+        // hot path. Measured before this existed: 324 banked keys spanning 42
+        // epochs, in a 23 KB state rewritten on every advance.
+        let dropped = entry.session.prune_skipped_to_current_epoch();
         let mut g = self.lock();
         if !g.entries.contains_key(key) && !g.make_room(now_unix) {
             return Err(RatchetSpliceError::StoreFull);
         }
         g.entries.insert(*key, entry);
         g.version = g.version.wrapping_add(1);
+        // An import does NOT normally mark the conversation dirty — the host
+        // just read those bytes, so writing them straight back is pointless.
+        // A sweep changes that: what is now held is smaller than what is on
+        // disk, and only a mark gets the smaller version written.
+        if dropped > 0 {
+            g.commit_change(*key);
+        }
         Ok(())
     }
 
