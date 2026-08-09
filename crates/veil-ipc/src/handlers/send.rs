@@ -249,8 +249,11 @@ fn relay_hops_to_try(
 /// exclusive writer to hand out, so the frame goes to the same reply channel
 /// the other seconds-class handlers already use.
 pub(crate) enum SendReply<'a> {
-    /// Straight to the socket — the caller owns the write half (tests, and any
-    /// path that is already off the loop).
+    /// Straight to the socket — the caller owns the write half. The tests drive
+    /// the handler this way so they can read the reply frame back without a
+    /// loop to run; no production path constructs it, which is the point of the
+    /// change above.
+    #[allow(dead_code)]
     Inline(&'a mut crate::transport::IpcWriteHalf),
     /// Handed to the loop's writer. Owned, so the send can outlive the frame
     /// that started it.
