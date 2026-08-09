@@ -319,22 +319,51 @@ mod tests {
         }
     }
 
+    /// Is `slot` sitting on the global slab's freelist right now?
+    ///
+    /// Answers for ONE cell instead of counting the whole slab. `stats()` is
+    /// process-wide and every test in this binary shares the global slab, so a
+    /// count taken here says as much about the neighbours as about us. A slot,
+    /// while we hold it, is ours alone.
+    fn slot_is_free(slot: u32) -> bool {
+        global()
+            .free
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .contains(&slot)
+    }
+
     #[test]
     fn refcount_clone_drop_returns_to_slab() {
-        let stats_before = stats();
         let p = acquire(dummy_inner());
+        let slot = unsafe { p.as_ref() }.slot;
+        // A heap fallback has no slot to come back to, so it would make the
+        // checks below vacuous. The default slab is thousands of cells and the
+        // handful its tests hold cannot exhaust it.
+        assert_ne!(slot, u32::MAX, "expected a slab cell, not a heap fallback");
+        assert!(!slot_is_free(slot), "a held cell is not on the freelist");
+
         unsafe {
             clone_cell(p);
             clone_cell(p);
             drop_cell(p);
             drop_cell(p);
+            // Two of the three references are gone; the cell is still ALIVE.
+            // Returning it here would hand a slot to another thread while this
+            // one still holds a pointer into it — a use-after-free the old
+            // count-based assertion could not see at all.
+            assert!(
+                !slot_is_free(slot),
+                "cell returned while a reference was still live"
+            );
             drop_cell(p);
         }
-        let stats_after = stats();
-        // Cell returned to slab — inflight should be back to whatever it
-        // was before. (Not strictly equal in parallel tests, but
-        // inflight should not have grown beyond the snapshot's peak.)
-        assert!(stats_after.cells_inflight <= stats_before.cells_inflight.max(1));
+        // The previous assertion was `after <= before.max(1)`. With nothing
+        // else inflight `before` is 0, so it read `after <= 1` — which a cell
+        // that never came back satisfies. It could not fail on the very leak
+        // it is named for, and under a loaded workspace run a neighbour's
+        // inflight cell made it fail for no fault of this code.
+        assert!(slot_is_free(slot), "cell did not return to the slab");
     }
 
     #[test]
