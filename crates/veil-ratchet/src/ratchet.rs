@@ -389,8 +389,17 @@ impl RatchetCore {
         }
     }
 
-    #[cfg(test)]
-    pub(crate) fn skipped_len(&self) -> usize {
+    /// How many skipped message keys this session is banking.
+    ///
+    /// A COUNT, never the keys: the host needs it because the session is
+    /// persisted whole on every advance, and the bank is the part that can
+    /// grow (bounded by [`MAX_SKIP_TOTAL`]). Measured on a real profile, one
+    /// conversation's stored state reached ~23 KB and is rewritten in full
+    /// every time the conversation moves, into a container that may never
+    /// reuse the slots it leaves behind — so what the size is MADE of decides
+    /// where the cut goes.
+    #[must_use]
+    pub fn skipped_len(&self) -> usize {
         self.skipped.len()
     }
 
