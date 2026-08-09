@@ -245,11 +245,21 @@ pub(crate) async fn write_frame_stream(
 mod body_budget_tests {
     use super::body_budget::{self, MAX_INFLIGHT_BODY_BYTES};
 
+    /// The budget is ONE counter for the whole process, and
+    /// `a_waiting_reader_proceeds_once_the_budget_frees` takes all of it on
+    /// purpose. Run beside it, any other test here reads `available() == 0`
+    /// and measures its neighbour instead of itself — the charge test
+    /// underflowed `before - 1024` and panicked with "subtract with overflow",
+    /// which reads like a budget bug and is not one. Every test that touches
+    /// the budget takes this first.
+    static BUDGET: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
     /// Audit V-07. The per-frame cap bounds one reader; nothing bounded the
     /// sum, so 256 clients each declaring 16 MiB was ~4 GiB allocated and
     /// zeroed before a single body byte arrived.
     #[tokio::test]
     async fn a_body_is_charged_against_the_global_budget() {
+        let _serialised = BUDGET.lock().await;
         let before = body_budget::available();
         let held = body_budget::acquire(1024).await.expect("acquire");
         assert_eq!(
@@ -270,6 +280,7 @@ mod body_budget_tests {
     /// zero-length frames would exhaust a budget it never spends.
     #[tokio::test]
     async fn an_empty_body_costs_nothing() {
+        let _serialised = BUDGET.lock().await;
         let before = body_budget::available();
         let held = body_budget::acquire(0).await.expect("acquire");
         assert!(held.is_none());
@@ -281,6 +292,7 @@ mod body_budget_tests {
     /// that keeps ordinary traffic working while a flood is in progress.
     #[tokio::test]
     async fn a_waiting_reader_proceeds_once_the_budget_frees() {
+        let _serialised = BUDGET.lock().await;
         let hog = body_budget::acquire(MAX_INFLIGHT_BODY_BYTES)
             .await
             .expect("acquire the whole budget");
