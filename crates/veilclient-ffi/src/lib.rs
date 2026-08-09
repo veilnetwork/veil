@@ -250,6 +250,21 @@ struct RuntimeBundle {
     /// overwrites. `std::sync::Mutex` is fine — accessed only from
     /// the FFI thread, never inside the runtime.
     pending_mailbox_fetch: StdMutex<Option<Vec<veilclient::MailboxBlobInfo>>>,
+    /// This node's id, remembered so the embedded-services lookup does not ask
+    /// the node for it again.
+    ///
+    /// Asking cost an IPC round trip on a path the ratchet takes for EVERY
+    /// flush — that is, after every send and every receive — and when that
+    /// request timed out the flush failed and the ratchet went DEGRADED, which
+    /// on a phone looked like a node that had stopped answering.
+    ///
+    /// Safe to remember because a stale value cannot pass silently: the id is
+    /// only ever used to LOOK UP the embedded services, and services for an id
+    /// this node no longer has simply do not exist, so the miss is visible and
+    /// the entry is refetched. That is deliberate — a plain "first write wins"
+    /// cache of a node id is exactly how the Android working directory bug
+    /// survived a node restart.
+    cached_node_id: StdMutex<Option<[u8; 32]>>,
 }
 
 /// Short-lived sovereign signing burst opened from a recovery phrase. The
@@ -2820,6 +2835,7 @@ pub unsafe extern "C" fn veil_connect(
         runtime: std::mem::ManuallyDrop::new(runtime),
         client: TokioMutex::new(client),
         pending_mailbox_fetch: StdMutex::new(None),
+        cached_node_id: StdMutex::new(None),
     });
     // IPC keepalive. The daemon reaps an established IPC connection after
     // IPC_SESSION_IDLE_TIMEOUT (15 min) of BIDIRECTIONAL silence (audit U3
@@ -4776,6 +4792,35 @@ pub unsafe extern "C" fn veil_register_onion_service(
 fn embedded_services_for_bundle(
     bundle: &Arc<RuntimeBundle>,
 ) -> Result<veil_node_runtime::NodeServices, String> {
+    fn services_for(me: [u8; 32]) -> Option<veil_node_runtime::NodeServices> {
+        veil_node_runtime::embedded_services_for(&me).or_else(|| {
+            let latest = veil_node_runtime::embedded_services()?;
+            (latest.local_node_id() == me).then_some(latest)
+        })
+    }
+
+    // A poisoned lock here means some other thread panicked while holding a
+    // 32-byte id; the value is still readable and nothing about it can be
+    // half-written, so take it rather than propagate the panic.
+    fn cached(bundle: &Arc<RuntimeBundle>) -> std::sync::MutexGuard<'_, Option<[u8; 32]>> {
+        match bundle.cached_node_id.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        }
+    }
+
+    // Remembered id first — no IPC, no client mutex.
+    let remembered = *cached(bundle);
+    if let Some(me) = remembered {
+        if let Some(services) = services_for(me) {
+            return Ok(services);
+        }
+        // The id we remembered belongs to a node this handle no longer runs
+        // (a deniable boot promoted the identity, or the node was rebuilt).
+        // Nothing was served from it — forget it and ask.
+        *cached(bundle) = None;
+    }
+
     let me = bundle.runtime.block_on(async {
         let client = bundle.client.lock().await;
         client
@@ -4784,12 +4829,10 @@ fn embedded_services_for_bundle(
             .map(|identity| identity.node_id)
             .map_err(|e| format!("node_identity: {e}"))
     })?;
-    veil_node_runtime::embedded_services_for(&me)
-        .or_else(|| {
-            let latest = veil_node_runtime::embedded_services()?;
-            (latest.local_node_id() == me).then_some(latest)
-        })
-        .ok_or_else(|| "embedded node services unavailable for this handle".to_string())
+    let services = services_for(me)
+        .ok_or_else(|| "embedded node services unavailable for this handle".to_string())?;
+    *cached(bundle) = Some(me);
+    Ok(services)
 }
 
 /// Register a location-anonymous service under a caller-owned random Ed25519
