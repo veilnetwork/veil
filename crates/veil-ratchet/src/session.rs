@@ -67,6 +67,11 @@ impl RatchetSession {
         self.core.skipped_epochs()
     }
 
+    /// See [`RatchetCore::prune_skipped_to_current_epoch`].
+    pub fn prune_skipped_to_current_epoch(&mut self) -> usize {
+        self.core.prune_skipped_to_current_epoch()
+    }
+
     /// The party that speaks first, keyed from a completed PQXDH.
     pub(crate) fn initiator(
         root: &[u8; KEY_LEN],
