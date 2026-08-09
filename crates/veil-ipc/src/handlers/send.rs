@@ -21,7 +21,8 @@
 //! plaintext `CaptureEvent` is emitted before E2E sealing so operators
 //! see what the app intended to send in addition to the encrypted envelope.
 
-use std::sync::{Mutex, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
+use tokio::sync::mpsc;
 
 use tokio::io::AsyncWriteExt;
 use veil_abuse::rate_limiter::{RateLimiter, TokenBucket};
@@ -239,7 +240,40 @@ fn relay_hops_to_try(
 /// ```ignore
 /// if rate_limited(wh, &mut rate_limiter).await? { return Ok; }
 /// ```
-async fn rate_limited(
+/// Where an app send's reply frame goes.
+///
+/// A send answers only when something went wrong, and it used to write that
+/// straight to the socket — which meant it had to run inside the IPC read
+/// loop, holding it for the length of a DHT key resolve (measured: 3.5 s) and
+/// expiring every unrelated request queued behind it. Off the loop there is no
+/// exclusive writer to hand out, so the frame goes to the same reply channel
+/// the other seconds-class handlers already use.
+pub(crate) enum SendReply<'a> {
+    /// Straight to the socket — the caller owns the write half (tests, and any
+    /// path that is already off the loop).
+    Inline(&'a mut crate::transport::IpcWriteHalf),
+    /// Handed to the loop's writer. Owned, so the send can outlive the frame
+    /// that started it.
+    Offloop(mpsc::Sender<crate::server::LoopReply>),
+}
+
+impl SendReply<'_> {
+    pub(crate) async fn write_all(&mut self, bytes: &[u8]) -> std::io::Result<()> {
+        match self {
+            SendReply::Inline(wh) => wh.write_all(bytes).await,
+            SendReply::Offloop(tx) => {
+                // A closed channel means the client is gone; its error frame
+                // has nowhere to go and nothing is owed to it.
+                let _ = tx
+                    .send(crate::server::LoopReply::Frame(bytes.to_vec()))
+                    .await;
+                Ok(())
+            }
+        }
+    }
+}
+
+pub(crate) async fn rate_limited(
     wh: &mut crate::transport::IpcWriteHalf,
     rate_limiter: &mut Option<TokenBucket>,
 ) -> std::io::Result<bool> {
@@ -264,39 +298,50 @@ async fn rate_limited(
 ///
 /// Reduces the raw parameter count to 4 while keeping all fields
 /// individually named so call-sites remain readable.
-pub(crate) struct IpcSendContext<'a> {
-    pub(crate) app_registry: &'a AppEndpointRegistry,
-    pub(crate) local_node_id: &'a [u8; 32],
-    pub(crate) session_tx_registry: Option<&'a dyn FrameBroadcaster>,
-    pub(crate) route_cache: Option<&'a RwLock<veil_routing::RouteCache>>,
-    pub(crate) route_updated: Option<&'a tokio::sync::Notify>,
-    pub(crate) peer_mlkem_keys: Option<&'a std::sync::RwLock<veil_e2e::PeerMlKemCache>>,
+/// Everything one app send needs, OWNED.
+///
+/// Borrowed before, which forced the send to run inside the IPC read loop —
+/// and that loop serves one client strictly in order. A send waits on a key
+/// resolve that walks the DHT, measured at 3.5 s, so every later request on
+/// that connection waited with it: `node_identity` and `pnet_status` expired,
+/// and the host's ratchet sat DEGRADED because its flush could not read the
+/// node identity. Owning the context is what lets the send leave the loop.
+///
+/// Every field was ALREADY an `Arc` where the server keeps it, so this costs
+/// a refcount bump per send, not a copy of anything.
+pub(crate) struct IpcSendContext {
+    pub(crate) app_registry: Arc<AppEndpointRegistry>,
+    pub(crate) local_node_id: [u8; 32],
+    pub(crate) session_tx_registry: Option<Arc<dyn FrameBroadcaster>>,
+    pub(crate) route_cache: Option<Arc<RwLock<veil_routing::RouteCache>>>,
+    pub(crate) route_updated: Option<Arc<tokio::sync::Notify>>,
+    pub(crate) peer_mlkem_keys: Option<Arc<std::sync::RwLock<veil_e2e::PeerMlKemCache>>>,
     /// Epic 486.1 slice 3: cold-start ML-KEM EK resolver.  When the cache
     /// lookup misses in the relay-encrypted path, the handler invokes this
     /// resolver to fetch + verify + cache the recipient's EK from the DHT.
     /// `None` preserves legacy behaviour exactly (test fixtures + setups
     /// without full NodeRuntime).
-    pub(crate) mlkem_ek_resolver: Option<&'a (dyn veil_types::MlKemEkResolver + 'a)>,
+    pub(crate) mlkem_ek_resolver: Option<Arc<dyn veil_types::MlKemEkResolver>>,
     /// Authenticated anonymous (onion/rendezvous) sender. `Some` only when the
     /// full NodeRuntime is wired; the `anonymous_authenticated` flag fails with
     /// `NO_RENDEZVOUS` when this is `None` (test fixtures / minimal setups).
-    pub(crate) anon_onion_sender: Option<&'a (dyn veil_types::AnonOnionSender + 'a)>,
+    pub(crate) anon_onion_sender: Option<Arc<dyn veil_types::AnonOnionSender>>,
     pub(crate) capture_tx: Option<
-        &'a Mutex<Option<tokio::sync::broadcast::Sender<veil_dispatcher_state::CaptureEvent>>>,
+        Arc<Mutex<Option<tokio::sync::broadcast::Sender<veil_dispatcher_state::CaptureEvent>>>>,
     >,
     pub(crate) pending_recursive: Option<
-        &'a Mutex<std::collections::HashMap<[u8; 16], veil_dispatcher_state::PendingRecursive>>,
+        Arc<Mutex<std::collections::HashMap<[u8; 16], veil_dispatcher_state::PendingRecursive>>>,
     >,
     /// Trace sampling rate.
     pub(crate) trace_sample_rate: f64,
     /// Pending-ACK tracker.
-    pub(crate) pending_ack: Option<&'a Mutex<veil_pending_ack::PendingAckTracker>>,
+    pub(crate) pending_ack: Option<Arc<Mutex<veil_pending_ack::PendingAckTracker>>>,
     /// One-to-one ratchet conversations, shared with the frame dispatcher.
     ///
     /// `None` on a node with no sovereign device identity (a supported
     /// configuration) and in fixtures without a full runtime; both keep the
     /// pre-existing ML-KEM behaviour exactly.
-    pub(crate) ratchet: Option<&'a veil_e2e::RatchetRuntime>,
+    pub(crate) ratchet: Option<veil_e2e::RatchetRuntime>,
 }
 
 /// Seal `data` through the ratchet, if everything it needs is in hand.
@@ -314,14 +359,14 @@ pub(crate) struct IpcSendContext<'a> {
 /// certificate published yet, and refusing to talk to either would break
 /// first contact for exactly the people who need it.
 async fn try_ratchet_seal(
-    ctx: &IpcSendContext<'_>,
+    ctx: &IpcSendContext,
     dst_node_id: &[u8; 32],
     data: &[u8],
 ) -> Option<(Vec<u8>, [u8; 32])> {
-    let ratchet = ctx.ratchet?;
+    let ratchet = ctx.ratchet.as_ref()?;
     // Cheap gate before anything expensive: no device identity, no ratchet.
     ratchet.identity()?;
-    let resolver = ctx.mlkem_ek_resolver?;
+    let resolver = ctx.mlkem_ek_resolver.as_deref()?;
 
     // Local records first. The full walk is three DHT rounds and this is the
     // ordinary send path; the 30-minute verified-cert cache above it means a
@@ -353,21 +398,19 @@ async fn try_ratchet_seal(
 }
 
 pub(crate) async fn handle_ipc_send(
-    wh: &mut crate::transport::IpcWriteHalf,
+    sink: &mut SendReply<'_>,
     body: &[u8],
-    ctx: &IpcSendContext<'_>,
-    rate_limiter: &mut Option<TokenBucket>,
+    ctx: &IpcSendContext,
 ) -> std::io::Result<()> {
-    let app_registry = ctx.app_registry;
-    let local_node_id = ctx.local_node_id;
-    let session_tx_registry = ctx.session_tx_registry;
-    let route_cache = ctx.route_cache;
-    let route_updated = ctx.route_updated;
-    let peer_mlkem_keys = ctx.peer_mlkem_keys;
-    let capture_tx = ctx.capture_tx;
-    if rate_limited(wh, rate_limiter).await? {
-        return Ok(());
-    }
+    // Borrowed out of the now-owned context so the body below reads exactly as
+    // it did when the context itself was borrowed.
+    let app_registry = &*ctx.app_registry;
+    let local_node_id = &ctx.local_node_id;
+    let session_tx_registry = ctx.session_tx_registry.as_deref();
+    let route_cache = ctx.route_cache.as_deref();
+    let route_updated = ctx.route_updated.as_deref();
+    let peer_mlkem_keys = ctx.peer_mlkem_keys.as_deref();
+    let capture_tx = ctx.capture_tx.as_deref();
 
     // This additive flag is intentionally read from the stable raw flags word:
     // AppIpcSendPayload ignores unknown bits, so old clients/servers remain
@@ -415,7 +458,7 @@ pub(crate) async fn handle_ipc_send(
         hdr.body_len = 2;
         let mut frame = codec::encode_header(&hdr).to_vec();
         frame.extend_from_slice(&ipc_send_err::PAYLOAD_TOO_LARGE.to_be_bytes());
-        wh.write_all(&frame).await?;
+        sink.write_all(&frame).await?;
         return Ok(());
     }
 
@@ -432,7 +475,7 @@ pub(crate) async fn handle_ipc_send(
             // meta-E2E `anonymous` conflicts with the onion transport, and
             // `is_reply` already implies the authenticated reply path.
             Some(ipc_send_err::INVALID_FLAGS)
-        } else if let Some(sender) = ctx.anon_onion_sender {
+        } else if let Some(sender) = ctx.anon_onion_sender.as_deref() {
             let result = if send.is_reply {
                 // Reply: the daemon takes the one-time block by id; the explicit
                 // destination fields are ignored. A consumed/expired/unknown id
@@ -489,12 +532,12 @@ pub(crate) async fn handle_ipc_send(
                 hdr.body_len = 2;
                 let mut frame = codec::encode_header(&hdr).to_vec();
                 frame.extend_from_slice(&code.to_be_bytes());
-                wh.write_all(&frame).await?;
+                sink.write_all(&frame).await?;
             }
             None if send.require_ack => {
                 let ok_hdr =
                     FrameHeader::new(FrameFamily::LocalApp as u8, LocalAppMsg::AppSendOk as u16);
-                wh.write_all(&codec::encode_header(&ok_hdr)).await?;
+                sink.write_all(&codec::encode_header(&ok_hdr)).await?;
             }
             None => {}
         }
@@ -611,7 +654,7 @@ pub(crate) async fn handle_ipc_send(
                     session_tx_registry,
                     route_updated,
                     peer_mlkem_keys,
-                    ctx.pending_recursive,
+                    ctx.pending_recursive.as_deref(),
                 )
                 .await
             };
@@ -677,7 +720,7 @@ pub(crate) async fn handle_ipc_send(
                     // this still surfaces as `NO_E2E_KEY` (legacy behaviour
                     // preserved).
                     if recipient_ek.is_none()
-                        && let Some(resolver) = ctx.mlkem_ek_resolver
+                        && let Some(resolver) = ctx.mlkem_ek_resolver.as_deref()
                     {
                         // Call control cannot sit behind the resolver's three
                         // multi-replica DHT freshness rounds (up to 9 s after
@@ -720,7 +763,7 @@ pub(crate) async fn handle_ipc_send(
                                     let mut frame = veil_proto::codec::encode_header(&hdr).to_vec();
                                     frame
                                         .extend_from_slice(&ipc_send_err::NO_E2E_KEY.to_be_bytes());
-                                    return wh.write_all(&frame).await;
+                                    return sink.write_all(&frame).await;
                                 }
                             }
                         } else {
@@ -752,7 +795,7 @@ pub(crate) async fn handle_ipc_send(
                                     let mut frame = veil_proto::codec::encode_header(&hdr).to_vec();
                                     frame
                                         .extend_from_slice(&ipc_send_err::NO_E2E_KEY.to_be_bytes());
-                                    return wh.write_all(&frame).await;
+                                    return sink.write_all(&frame).await;
                                 }
                             }
                         }
@@ -765,7 +808,7 @@ pub(crate) async fn handle_ipc_send(
                         hdr.body_len = 2;
                         let mut frame = veil_proto::codec::encode_header(&hdr).to_vec();
                         frame.extend_from_slice(&ipc_send_err::NO_E2E_KEY.to_be_bytes());
-                        return wh.write_all(&frame).await;
+                        return sink.write_all(&frame).await;
                     }
                 } else {
                     // No E2E infrastructure — send plaintext. send.data is
@@ -865,7 +908,7 @@ pub(crate) async fn handle_ipc_send(
                         hdr.body_len = 2;
                         let mut frame = codec::encode_header(&hdr).to_vec();
                         frame.extend_from_slice(&ipc_send_err::NO_ROUTE.to_be_bytes());
-                        return wh.write_all(&frame).await;
+                        return sink.write_all(&frame).await;
                     }
 
                     let chunk_count = total_size.div_ceil(MAX_CHUNK_PAYLOAD) as u32;
@@ -958,7 +1001,7 @@ pub(crate) async fn handle_ipc_send(
                         });
                         if all_ok {
                             delivered = true;
-                            if want_ack && let Some(tracker) = ctx.pending_ack {
+                            if want_ack && let Some(tracker) = ctx.pending_ack.as_deref() {
                                 let _ = lock!(tracker).register_batch(
                                     orig_content_id,
                                     *next_hop,
@@ -981,7 +1024,7 @@ pub(crate) async fn handle_ipc_send(
                                 FrameFamily::LocalApp as u8,
                                 LocalAppMsg::AppSendOk as u16,
                             );
-                            return wh.write_all(&codec::encode_header(&ok_hdr)).await;
+                            return sink.write_all(&codec::encode_header(&ok_hdr)).await;
                         }
                         return Ok(());
                     }
@@ -995,7 +1038,7 @@ pub(crate) async fn handle_ipc_send(
                     hdr.body_len = 2;
                     let mut frame = codec::encode_header(&hdr).to_vec();
                     frame.extend_from_slice(&ipc_send_err::NO_ROUTE.to_be_bytes());
-                    return wh.write_all(&frame).await;
+                    return sink.write_all(&frame).await;
                 }
 
                 // Pre-encode the envelope once; reused for all hop attempts.
@@ -1080,7 +1123,7 @@ pub(crate) async fn handle_ipc_send(
                         // retransmits use the same session path, not the final
                         // dst which may not be directly connected (B2 fix).
                         if send.require_ack
-                            && let Some(tracker) = ctx.pending_ack
+                            && let Some(tracker) = ctx.pending_ack.as_deref()
                         {
                             let _ = lock!(tracker).register(
                                 content_id,
@@ -1096,7 +1139,7 @@ pub(crate) async fn handle_ipc_send(
                                 FrameFamily::LocalApp as u8,
                                 LocalAppMsg::AppSendOk as u16,
                             );
-                            return wh.write_all(&codec::encode_header(&ok_hdr)).await;
+                            return sink.write_all(&codec::encode_header(&ok_hdr)).await;
                         }
                         return Ok(());
                     }
@@ -1129,7 +1172,7 @@ pub(crate) async fn handle_ipc_send(
             hdr.body_len = 2;
             let mut err_frame = codec::encode_header(&hdr).to_vec();
             err_frame.extend_from_slice(&err_code);
-            return wh.write_all(&err_frame).await;
+            return sink.write_all(&err_frame).await;
         }
     }
 
@@ -1141,7 +1184,7 @@ pub(crate) async fn handle_ipc_send(
     // syscall count per send and frees enough budget to push pps higher.
     if send.require_ack {
         let ok_hdr = FrameHeader::new(FrameFamily::LocalApp as u8, LocalAppMsg::AppSendOk as u16);
-        wh.write_all(&codec::encode_header(&ok_hdr)).await
+        sink.write_all(&codec::encode_header(&ok_hdr)).await
     } else {
         Ok(())
     }
@@ -1476,10 +1519,10 @@ mod ratchet_send_tests {
 
     struct Fixture {
         outbox: Arc<Outbox>,
-        route_cache: RwLock<veil_routing::RouteCache>,
-        peer_mlkem: std::sync::RwLock<veil_e2e::PeerMlKemCache>,
-        certs: Certs,
-        registry: veil_app::registry::AppEndpointRegistry,
+        route_cache: Arc<RwLock<veil_routing::RouteCache>>,
+        peer_mlkem: Arc<std::sync::RwLock<veil_e2e::PeerMlKemCache>>,
+        certs: Arc<Certs>,
+        registry: Arc<veil_app::registry::AppEndpointRegistry>,
         me: veil_e2e::RatchetRuntime,
         /// The peer's side, for opening what we sealed.
         peer: veil_e2e::RatchetRuntime,
@@ -1492,8 +1535,8 @@ mod ratchet_send_tests {
     ) -> veil_e2e::RatchetRuntime {
         veil_e2e::RatchetRuntime {
             store: Arc::new(veil_e2e::RatchetStore::new()),
-            seed_ring: ring,
-            local_node_id: node_id,
+            seed_ring: Arc::new(std::sync::RwLock::new(ring)),
+            local_node_id: Arc::new(std::sync::RwLock::new(node_id)),
             local_instance_id: Arc::new(std::sync::RwLock::new(Some(instance))),
             peer_ratchet_keys: Arc::new(std::sync::RwLock::new(
                 veil_e2e::PeerRatchetKeyCache::new(),
@@ -1537,31 +1580,35 @@ mod ratchet_send_tests {
                 live: live_peers,
                 sent: Mutex::new(Vec::new()),
             }),
-            route_cache,
-            peer_mlkem,
-            certs: Certs(cert),
-            registry: veil_app::registry::AppEndpointRegistry::new(),
+            route_cache: Arc::new(route_cache),
+            peer_mlkem: Arc::new(peer_mlkem),
+            certs: Arc::new(Certs(cert)),
+            registry: Arc::new(veil_app::registry::AppEndpointRegistry::new()),
             me: ratchet_runtime(ME, MY_INSTANCE, my_ring),
             peer: peer_rt,
         }
     }
 
     impl Fixture {
-        fn ctx(&self, with_ratchet: bool) -> IpcSendContext<'_> {
+        fn ctx(&self, with_ratchet: bool) -> IpcSendContext {
             IpcSendContext {
-                app_registry: &self.registry,
-                local_node_id: &ME,
-                session_tx_registry: Some(self.outbox.as_ref()),
-                route_cache: Some(&self.route_cache),
+                app_registry: Arc::clone(&self.registry),
+                local_node_id: ME,
+                session_tx_registry: Some(
+                    Arc::clone(&self.outbox) as Arc<dyn FrameBroadcaster>
+                ),
+                route_cache: Some(Arc::clone(&self.route_cache)),
                 route_updated: None,
-                peer_mlkem_keys: Some(&self.peer_mlkem),
-                mlkem_ek_resolver: Some(&self.certs),
+                peer_mlkem_keys: Some(Arc::clone(&self.peer_mlkem)),
+                mlkem_ek_resolver: Some(
+                    Arc::clone(&self.certs) as Arc<dyn veil_types::MlKemEkResolver>
+                ),
                 anon_onion_sender: None,
                 capture_tx: None,
                 pending_recursive: None,
                 trace_sample_rate: 0.0,
                 pending_ack: None,
-                ratchet: with_ratchet.then_some(&self.me),
+                ratchet: with_ratchet.then(|| self.me.clone()),
             }
         }
 
@@ -1610,12 +1657,9 @@ mod ratchet_send_tests {
     async fn a_direct_session_send_goes_out_through_the_ratchet() {
         let fx = fixture(vec![PEER, RELAY]);
         let mut wh = sink().await;
-        let mut rl = None;
-        handle_ipc_send(
-            &mut wh,
+        handle_ipc_send(&mut SendReply::Inline(&mut wh),
             &payload(false, b"hello over a session"),
             &fx.ctx(true),
-            &mut rl,
         )
         .await
         .expect("send");
@@ -1658,9 +1702,8 @@ mod ratchet_send_tests {
     async fn without_the_ratchet_a_direct_session_send_is_unchanged() {
         let fx = fixture(vec![PEER, RELAY]);
         let mut wh = sink().await;
-        let mut rl = None;
-        handle_ipc_send(&mut wh, &payload(false, b"plain"), &fx.ctx(false), &mut rl)
-            .await
+        handle_ipc_send(&mut SendReply::Inline(&mut wh), &payload(false, b"plain"), &fx.ctx(false))
+        .await
             .expect("send");
 
         let sent = fx.taken();
@@ -1677,12 +1720,9 @@ mod ratchet_send_tests {
     async fn a_relayed_send_carries_the_ratchet_payload() {
         let fx = fixture(vec![RELAY]); // no direct session to PEER
         let mut wh = sink().await;
-        let mut rl = None;
-        handle_ipc_send(
-            &mut wh,
+        handle_ipc_send(&mut SendReply::Inline(&mut wh),
             &payload(false, b"through a relay"),
             &fx.ctx(true),
-            &mut rl,
         )
         .await
         .expect("send");
@@ -1715,12 +1755,9 @@ mod ratchet_send_tests {
     async fn an_anonymous_send_stays_on_the_anonymous_path_and_stays_anonymous() {
         let fx = fixture(vec![RELAY]);
         let mut wh = sink().await;
-        let mut rl = None;
-        handle_ipc_send(
-            &mut wh,
+        handle_ipc_send(&mut SendReply::Inline(&mut wh),
             &payload(true, b"anonymously yours"),
             &fx.ctx(true),
-            &mut rl,
         )
         .await
         .expect("send");
@@ -1753,9 +1790,8 @@ mod ratchet_send_tests {
     async fn a_fallback_from_direct_to_relay_seals_once() {
         let fx = fixture(vec![RELAY]);
         let mut wh = sink().await;
-        let mut rl = None;
-        handle_ipc_send(&mut wh, &payload(false, b"once"), &fx.ctx(true), &mut rl)
-            .await
+        handle_ipc_send(&mut SendReply::Inline(&mut wh), &payload(false, b"once"), &fx.ctx(true))
+        .await
             .expect("send");
         assert_eq!(
             fx.me.store.version(),
@@ -1771,12 +1807,11 @@ mod ratchet_send_tests {
     async fn every_send_names_the_conversation_the_host_must_persist() {
         let fx = fixture(vec![PEER]);
         let mut wh = sink().await;
-        let mut rl = None;
         assert_eq!(fx.me.store.version(), 0);
         assert!(fx.me.store.drain_dirty().is_empty());
 
-        handle_ipc_send(&mut wh, &payload(false, b"one"), &fx.ctx(true), &mut rl)
-            .await
+        handle_ipc_send(&mut SendReply::Inline(&mut wh), &payload(false, b"one"), &fx.ctx(true))
+        .await
             .expect("send");
         assert_eq!(fx.me.store.version(), 1);
         let dirty = fx.me.store.drain_dirty();
@@ -1785,8 +1820,8 @@ mod ratchet_send_tests {
         assert_eq!(dirty[0].peer_instance_id, PEER_INSTANCE);
         assert_eq!(dirty[0].local_instance_id, MY_INSTANCE);
 
-        handle_ipc_send(&mut wh, &payload(false, b"two"), &fx.ctx(true), &mut rl)
-            .await
+        handle_ipc_send(&mut SendReply::Inline(&mut wh), &payload(false, b"two"), &fx.ctx(true))
+        .await
             .expect("send");
         assert_eq!(fx.me.store.version(), 2);
         assert_eq!(fx.me.store.drain_dirty().len(), 1, "named again");
