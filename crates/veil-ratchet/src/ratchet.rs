@@ -421,6 +421,31 @@ impl RatchetCore {
         self.skipped.len()
     }
 
+    /// Drop banked keys from every epoch except the one now being received.
+    /// Returns how many went.
+    ///
+    /// The step rule keeps two epochs, but it only runs WHEN A STEP RUNS — and
+    /// a peer that has stopped answering never causes one, so its bank sits
+    /// there while our own sends keep rewriting the whole state around it.
+    /// Measured: 324 keys over 42 epochs on a conversation with nobody at the
+    /// other end. This is the sweep for that case, meant for a quiet moment
+    /// (a restore), not for the hot path.
+    ///
+    /// More aggressive than the step rule by one epoch, deliberately: after a
+    /// restart there is no record of which epoch ended, and the alternative is
+    /// keeping every epoch forever. What it can cost is a straggler from the
+    /// chain that ended before the restart — a message the peer must re-send.
+    pub fn prune_skipped_to_current_epoch(&mut self) -> usize {
+        let before = self.skipped.len();
+        match self.dh_pk_remote {
+            Some(cur) => self.skipped.retain(|(pk, _), _| *pk == cur),
+            // No remote epoch yet: nothing has been received, so anything
+            // banked cannot belong to a chain we are on.
+            None => self.skipped.clear(),
+        }
+        before - self.skipped.len()
+    }
+
     /// How many distinct DH epochs the bank spans, and how many of its keys
     /// belong to the CURRENT one.
     ///
@@ -780,6 +805,43 @@ mod tests {
         );
         let (epochs, _) = bob.skipped_epochs();
         assert_eq!(epochs, 2, "and it spans exactly the two kept epochs");
+    }
+
+    #[test]
+    fn the_sweep_clears_every_epoch_but_the_live_one() {
+        // The step rule only fires when a step fires, and a peer that has
+        // stopped answering never causes one — so its bank stays fat while our
+        // own sends keep rewriting the state around it. This is the sweep for
+        // that case, and it keeps exactly the chain still being received.
+        let (mut alice, mut bob, mut ar, mut br) = pair();
+
+        // Epoch 1, one key banked.
+        let (_unseen, _) = alice.send_step().expect("chain");
+        let (h1, _) = alice.send_step().expect("chain");
+        bob.recv_step(&h1, &mut br).expect("a→b");
+        assert_eq!(bob.skipped_len(), 1);
+
+        // Turn the epoch: the old key is still held (one epoch back).
+        let (hb, _) = bob.send_step().expect("chain");
+        alice.recv_step(&hb, &mut ar).expect("b→a");
+        let (_unseen2, _) = alice.send_step().expect("chain");
+        let (h2, _) = alice.send_step().expect("chain");
+        bob.recv_step(&h2, &mut br).expect("a→b (epoch 2)");
+        assert_eq!(bob.skipped_len(), 2, "two epochs' worth");
+
+        // The sweep keeps only the live chain.
+        let dropped = bob.prune_skipped_to_current_epoch();
+        assert_eq!(dropped, 1, "the ended epoch's key went");
+        assert_eq!(bob.skipped_len(), 1);
+        let (epochs, current) = bob.skipped_epochs();
+        assert_eq!(
+            (epochs, current),
+            (1, 1),
+            "what remains is the epoch now being received",
+        );
+
+        // And it is idempotent — a second sweep has nothing left to take.
+        assert_eq!(bob.prune_skipped_to_current_epoch(), 0);
     }
 
     #[test]
