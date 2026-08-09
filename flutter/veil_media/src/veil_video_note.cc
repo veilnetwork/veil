@@ -23,6 +23,7 @@
 #include <chrono>
 #include <cstring>
 #include <memory>
+#include <condition_variable>
 #include <mutex>
 #include <vector>
 
@@ -341,6 +342,14 @@ struct VeilVnoteRecorder {
   int64_t last_key_ms = -kKeyframeEveryMs;
   std::chrono::steady_clock::time_point started_at;
 
+  // Raised by the first frame the camera delivers, so start() can wait for the
+  // capture to be REAL before it stamps the clock. Without it the warm-up —
+  // measured at 0.4-0.65 s on macOS — landed inside the clip: the timeline
+  // began, the microphone ran, and the first video frame arrived hundreds of
+  // milliseconds in, which plays back as a still picture at the start.
+  bool first_frame_seen = false;
+  std::condition_variable first_frame_cv;
+
 #if defined(VEIL_VNOTE_HAVE_NATIVE_CAMERA)
   std::unique_ptr<veil_media::CameraCapturer> camera;
 #endif
@@ -429,6 +438,11 @@ void encode_i420(VeilVnoteRecorder* rec, const uint8_t* y, const uint8_t* u,
                           buf->width(), buf->height(), buf->StrideY(),
                           buf->StrideU(), buf->StrideV());
 
+  if (!rec->first_frame_seen) {
+    rec->first_frame_seen = true;
+    rec->first_frame_cv.notify_all();
+  }
+
   // Warm-up: the person can see themselves, but nothing is being kept yet.
   // (`started_at` is only meaningful once start() has stamped it, so the
   // timestamp below has to come after this.)
@@ -507,6 +521,45 @@ int veil_media_vnote_recorder_start(VeilVnoteRecorder* rec) {
   {
     std::lock_guard<std::mutex> lk(rec->video_mu);
     if (rec->encoding) return VEIL_VNOTE_OK;
+    rec->first_frame_seen = false;
+  }
+
+#if defined(VEIL_VNOTE_HAVE_NATIVE_CAMERA)
+  // The camera comes up FIRST, and the clip waits for a frame from it.
+  //
+  // Opening it after the clock started put its warm-up inside the recording:
+  // the timeline and the microphone began, and the first video frame landed
+  // hundreds of milliseconds later (measured on macOS: 20.5 fps over a 2 s
+  // clip against 27.8 over 5 s — the same missing head, diluted). That plays
+  // back as a frozen picture at the start. Android already gated on the first
+  // frame from its Dart capturer; this is the same rule where the recorder
+  // owns the camera itself.
+  if (rec->want_native_camera) {
+    rec->camera.reset(veil_media::CreatePlatformCamera(
+        [rec](const uint8_t* y, const uint8_t* u, const uint8_t* v, int w,
+              int h, int sy, int su, int sv, int64_t /*ts_us*/) {
+          encode_i420(rec, y, u, v, w, h, sy, su, sv);
+        }));
+    if (rec->camera &&
+        !rec->camera->Start(rec->square, rec->square, rec->fps, nullptr)) {
+      vnlog("vnote: camera start failed (frames only from push)");
+      rec->camera.reset();
+    }
+    if (rec->camera) {
+      std::unique_lock<std::mutex> lk(rec->video_mu);
+      // Bounded: a camera that never delivers must not hang the recording.
+      // Falling through starts the clip anyway — a note with a late head beats
+      // a button that does nothing.
+      if (!rec->first_frame_cv.wait_for(lk, std::chrono::milliseconds(1500),
+                                        [rec] { return rec->first_frame_seen; })) {
+        vnlog("vnote: no first frame in 1500ms — starting anyway");
+      }
+    }
+  }
+#endif
+
+  {
+    std::lock_guard<std::mutex> lk(rec->video_mu);
     rec->started_at = std::chrono::steady_clock::now();
     rec->encoding = true;
   }
@@ -526,21 +579,6 @@ int veil_media_vnote_recorder_start(VeilVnoteRecorder* rec) {
   } else {
     vnlog("vnote: mic unavailable (permission?) — recording video-only");
   }
-#if defined(VEIL_VNOTE_HAVE_NATIVE_CAMERA)
-  // Platform camera; frames flow into the VP8 encoder. Android has no native
-  // backend — its Dart capturer pushes via veil_media_vnote_recorder_push_frame.
-  if (rec->want_native_camera)
-  rec->camera.reset(veil_media::CreatePlatformCamera(
-      [rec](const uint8_t* y, const uint8_t* u, const uint8_t* v, int w, int h,
-            int sy, int su, int sv, int64_t /*ts_us*/) {
-        encode_i420(rec, y, u, v, w, h, sy, su, sv);
-      }));
-  if (rec->camera &&
-      !rec->camera->Start(rec->square, rec->square, rec->fps, nullptr)) {
-    vnlog("vnote: camera start failed (frames only from push)");
-    rec->camera.reset();
-  }
-#endif
   vnlog("vnote: started square=%d fps=%d", rec->square, rec->fps);
   return VEIL_VNOTE_OK;
 #else
