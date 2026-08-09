@@ -21,7 +21,7 @@ use crate::handlers::outbox::{handle_outbox_ack, handle_outbox_find_missing, han
 use crate::handlers::queries::{
     handle_get_mobile_status, handle_get_node_identity, handle_get_peers, handle_join_bootstrap_uri,
 };
-use crate::handlers::send::{IpcSendContext, handle_ipc_send, handle_rt_send};
+use crate::handlers::send::{IpcSendContext, handle_rt_send};
 use crate::handlers::stream::handle_stream_open;
 #[cfg(windows)]
 use crate::path::IPC_PIPE_FILENAME;
