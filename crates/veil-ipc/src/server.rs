@@ -2321,22 +2321,65 @@ async fn handle_ipc_client(
                             frame.extend_from_slice(&ipc_send_err::SPOOFED_SRC.to_be_bytes());
                             wh.write_all(&frame).await?;
                         } else {
+                            // Cloned, not borrowed: every field is an `Arc`
+                            // where the server keeps it, so this is a handful
+                            // of refcount bumps — and it is what lets the send
+                            // leave this loop instead of holding it for the
+                            // length of a DHT key resolve.
                             let ctx = IpcSendContext {
-                                app_registry:        &app_registry,
-                                local_node_id:       &node_id,
-                                session_tx_registry: session_tx_registry.as_deref(),
-                                route_cache:         route_cache.as_deref(),
-                                route_updated:       route_updated.as_deref(),
-                                peer_mlkem_keys:     peer_mlkem_keys.as_deref(),
-                                mlkem_ek_resolver:   mlkem_ek_resolver.as_deref(),
-                                ratchet:             ratchet.as_ref(),
-                                anon_onion_sender:   anon_onion_sender.as_deref(),
-                                capture_tx:          capture_tx.as_deref(),
-                                pending_recursive:   pending_recursive.as_deref(),
+                                app_registry:        Arc::clone(&app_registry),
+                                local_node_id:       node_id,
+                                session_tx_registry: session_tx_registry.clone(),
+                                route_cache:         route_cache.clone(),
+                                route_updated:       route_updated.clone(),
+                                peer_mlkem_keys:     peer_mlkem_keys.clone(),
+                                mlkem_ek_resolver:   mlkem_ek_resolver.clone(),
+                                ratchet:             ratchet.clone(),
+                                anon_onion_sender:   anon_onion_sender.clone(),
+                                capture_tx:          capture_tx.clone(),
+                                pending_recursive:   pending_recursive.clone(),
                                 trace_sample_rate,
-                                pending_ack:         pending_ack.as_deref(),
+                                pending_ack:         pending_ack.clone(),
                             };
-                            handle_ipc_send(&mut wh, &body, &ctx, &mut rate_limiter).await?;
+                            // The rate check stays ON the loop — it is a
+                            // counter, and refusing has to be immediate.
+                            if !crate::handlers::send::rate_limited(
+                                &mut wh,
+                                &mut rate_limiter,
+                            )
+                            .await?
+                            {
+                                // Everything after it goes OFF the loop. A send
+                                // waits on a key resolve that walks the DHT
+                                // (measured: 3.5 s per send, 43 times in one
+                                // file transfer), and while it did, every later
+                                // request on this connection waited with it —
+                                // `node_identity` and `pnet_status` expired and
+                                // the host's ratchet sat DEGRADED.
+                                //
+                                // Concurrency stays bounded by the same permit
+                                // pool, but the WAIT for a permit happens in the
+                                // task, never here: the loop must not be able to
+                                // queue behind a send under any load.
+                                // Moved, not copied: the loop is done with
+                                // this buffer once the send owns it.
+                                let body_owned = body;
+                                let reply_tx = reply_tx.clone();
+                                let sem = Arc::clone(&spawn_sem);
+                                tokio::spawn(async move {
+                                    let _permit = sem.acquire_owned().await;
+                                    let mut sink =
+                                        crate::handlers::send::SendReply::Offloop(reply_tx);
+                                    if let Err(e) =
+                                        crate::handlers::send::handle_ipc_send(
+                                            &mut sink, &body_owned, &ctx,
+                                        )
+                                        .await
+                                    {
+                                        log::warn!("ipc send job ended: {e}");
+                                    }
+                                });
+                            }
                         }
                     }
                     Ok(LocalAppMsg::StreamOpen) => {
