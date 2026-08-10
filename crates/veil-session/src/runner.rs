@@ -1941,13 +1941,34 @@ impl SessionRunner {
             return;
         }
 
-        // Push the new URI into the cache.  `insert` overwrites any
-        // older entry under the same node_id and refreshes the TTL clock
-        // — exactly what we want after a deliberate migration.
+        // Push the new URI into the cache, for AS LONG AS THE PEER SIGNED
+        // FOR and no longer.
+        //
+        // `new_expiry_unix` is part of the verified payload and used to be
+        // written to the log line below and nowhere else, so the entry got
+        // the cache's flat one-hour TTL whatever the peer said. A node
+        // rotating every two minutes signs an eight-minute life; holding it
+        // an hour leaves this peer dialling a port that rotated away
+        // fifty-two minutes ago (report9 V-05). The cache caps the other
+        // direction on its own — a signed life longer than its TTL does not
+        // extend it.
         {
             let cache = self.dispatcher.dht().transport_cache();
             let mut c = lock!(cache);
-            c.insert(self.peer_id, payload.new_transport.clone());
+            let lifetime = payload.new_expiry_unix.saturating_sub(now_unix);
+            if lifetime == 0 {
+                // Signed, verified, and already over: the peer is telling us
+                // this URI is spent. Caching it would be worse than having
+                // nothing, and whatever is cached under this id is at least
+                // as old, so it goes too.
+                c.invalidate(&self.peer_id);
+            } else {
+                c.insert_for(
+                    self.peer_id,
+                    payload.new_transport.clone(),
+                    std::time::Duration::from_secs(lifetime),
+                );
+            }
         }
         self.logger.info(
             "session.migration.notify.applied",
