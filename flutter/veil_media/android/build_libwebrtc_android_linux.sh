@@ -47,7 +47,23 @@ done
 [ "$ok" = 1 ] || { echo "FATAL: gclient sync failed" >&2; exit 1; }
 
 OUT="out/android-arm64"
-ARGS='target_os="android" target_cpu="arm64" is_debug=false is_component_build=false symbol_level=0 rtc_include_tests=false rtc_build_examples=false rtc_build_tools=false rtc_enable_protobuf=false rtc_use_h264=false enable_libaom=false rtc_include_opus=true treat_warnings_as_errors=false'
+# android_static_analysis="off" is not an optimisation, it is what makes this
+# build finish. WebRTC's default is "build_server", which hands lint, ErrorProne
+# and the bytecode dep checks to a daemon that only exists when the build is
+# driven by depot_tools' autoninja wrapper. Under plain ninja every
+# *__validate_deps action dies with
+#
+#   Exception: AUTONINJA_BUILD_ID is not set.
+#              android_static_analysis = build_server requires autoninja integration
+#
+# after ~15 minutes of real compiling, so the failure looks like a toolchain
+# problem and is not one. Chromium's own docs say the mode "does not work on
+# bots" and that bots set it off.
+#
+# Nothing is lost here: those targets analyse WebRTC's Java SDK, and this build
+# wants libwebrtc.a — the native static library. We do not compile, ship or
+# link that Java.
+ARGS='target_os="android" target_cpu="arm64" is_debug=false is_component_build=false symbol_level=0 rtc_include_tests=false rtc_build_examples=false rtc_build_tools=false rtc_enable_protobuf=false rtc_use_h264=false enable_libaom=false rtc_include_opus=true treat_warnings_as_errors=false android_static_analysis="off"'
 # --export-compile-commands is load-bearing, exactly as on the other targets:
 # build_veil_media_so.sh reads call.cc's exact command out of
 # compile_commands.json rather than reinventing the two dozen flags WebRTC
