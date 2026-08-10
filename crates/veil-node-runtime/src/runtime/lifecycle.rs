@@ -267,6 +267,11 @@ impl NodeRuntime {
             state.metrics_endpoint = self.metrics_endpoint.clone();
         }
         lock!(self.live_sessions).clear();
+        // Withdraw the view this node published. Without it the embedded-FFI
+        // registry kept an Arc-clone of a stopped node's state for the life of
+        // the process, and a stale FFI id could still find and drive it
+        // (report9 V-08).
+        crate::runtime::services::withdraw_embedded_services(&self.access().local_node_id());
         self.logger.info("node.stop", "runtime stopped");
     }
 
