@@ -4552,7 +4552,21 @@ mod tests {
             "publisher must fan-out to at least one peer (got sent={sent})"
         );
 
-        // Edge-triggered: wait for both peers to hold the envelope.
+        // Edge-triggered, and RE-PUBLISHING while it waits — the same remedy
+        // `republish_until` documents for the pairing scenario, applied to the
+        // operation this scenario actually performs.
+        //
+        // The fan-out above is one shot: a peer whose session is a moment from
+        // ready drops the store call, and nothing retries inside the test's
+        // window because the node's own maintenance tick is a minute away.
+        // Waiting longer therefore does not help, and this scenario failed
+        // exactly that way under `cargo test --workspace` while passing five
+        // times out of five on its own. A PUT of the same bytes under the same
+        // key is idempotent, so retrying costs nothing.
+        //
+        // Sensitivity is unchanged: a genuine fan-out or replication-on-PUT
+        // regression never converges, and the assertion below still fires with
+        // the same message at the deadline.
         let deadline = tokio::time::Instant::now() + SIM_WAIT_LIMIT;
         loop {
             let n1_has = net.node(1).runtime.dht_get_local(&key).as_deref()
@@ -4567,6 +4581,9 @@ mod tests {
                 "operator's signed bundle did not replicate to peers — \
                  K-closest fan-out is broken or replication-on-PUT regression",
             );
+            net.node(0)
+                .runtime
+                .dht_publish_replicated(key, signed_envelope.clone());
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
 
@@ -5815,6 +5832,41 @@ mod tests {
             "every relay's directory entry must be mirrored into the sender \
              before it picks a circuit"
         );
+        // ...and the sender must actually KNOW those relays.
+        //
+        // Mirroring the directory entries is only half the precondition. The
+        // candidate pool is built from `dht_contacts()` — the Kademlia routing
+        // table — and each contact's entry is then looked up by node id. A
+        // routing table that has not yet learned the relays therefore yields
+        // an empty pool no matter how many entries were mirrored, and the send
+        // fails as `InsufficientRelayCandidates { have: 0 }`, which reads like
+        // a relay shortage rather than a question asked early.
+        //
+        // That is how this scenario failed under `cargo test --workspace`
+        // while passing on its own: `have: 0` with the mirroring assertion
+        // above satisfied leaves the routing table as the only source that
+        // could have been empty.
+        let deadline = tokio::time::Instant::now() + SIM_WAIT_LIMIT;
+        loop {
+            let known = net.node(0).runtime.dht_contacts();
+            let have = (1..n)
+                .filter(|&i| {
+                    let id = net.node(i).node_id();
+                    known.iter().any(|c| c.node_id == id)
+                })
+                .count();
+            if have >= n - 1 {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the sender's routing table knows {have} of the {} relays it \
+                 has directory entries for — the circuit picker draws its \
+                 candidates from that table, so it would find none",
+                n - 1
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
 
         // Send the anonymous message. hop_count = 3 means 2 relays + receiver.
         let payload = b"hi from anon sender";
@@ -5971,6 +6023,41 @@ mod tests {
             "every relay's directory entry must be mirrored into the sender \
              before it picks a circuit"
         );
+        // ...and the sender must actually KNOW those relays.
+        //
+        // Mirroring the directory entries is only half the precondition. The
+        // candidate pool is built from `dht_contacts()` — the Kademlia routing
+        // table — and each contact's entry is then looked up by node id. A
+        // routing table that has not yet learned the relays therefore yields
+        // an empty pool no matter how many entries were mirrored, and the send
+        // fails as `InsufficientRelayCandidates { have: 0 }`, which reads like
+        // a relay shortage rather than a question asked early.
+        //
+        // That is how this scenario failed under `cargo test --workspace`
+        // while passing on its own: `have: 0` with the mirroring assertion
+        // above satisfied leaves the routing table as the only source that
+        // could have been empty.
+        let deadline = tokio::time::Instant::now() + SIM_WAIT_LIMIT;
+        loop {
+            let known = net.node(0).runtime.dht_contacts();
+            let have = (1..n)
+                .filter(|&i| {
+                    let id = net.node(i).node_id();
+                    known.iter().any(|c| c.node_id == id)
+                })
+                .count();
+            if have >= n - 1 {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the sender's routing table knows {have} of the {} relays it \
+                 has directory entries for — the circuit picker draws its \
+                 candidates from that table, so it would find none",
+                n - 1
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
 
         // The receiver's verify task must resolve ALICE's IdentityDocument.
         // Publish it, then mirror it directly into the receiver's local DHT
