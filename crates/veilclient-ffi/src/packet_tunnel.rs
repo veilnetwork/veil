@@ -10,8 +10,8 @@ use std::net::{IpAddr, SocketAddr};
 use std::os::fd::{FromRawFd, IntoRawFd, OwnedFd};
 use std::os::raw::{c_char, c_int, c_ushort, c_void};
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU8, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
@@ -45,6 +45,66 @@ struct PacketTunnel {
     packet_tx: Option<mpsc::Sender<Vec<u8>>>,
     mtu: u16,
     thread: Option<std::thread::JoinHandle<()>>,
+    /// The host callback, for the callback-driven path. `None` for the
+    /// fd-driven one, which hands the host nothing to keep alive.
+    sink: Option<Arc<WriteSink>>,
+}
+
+/// The host's packet-write callback, and the only thing allowed to call it.
+///
+/// The opaque `ctx` is a raw pointer whose lifetime belongs to the host, and
+/// the host stops guaranteeing it the moment `veil_packet_tunnel_stop`
+/// returns. Stop cannot always establish that the worker is gone — it gives up
+/// after `STOP_TIMEOUT` and returns `VEIL_ERR` with the thread still running —
+/// so "the worker finished" is the wrong thing to build the contract on.
+///
+/// What stop CAN establish, in bounded time, is that nothing will call the
+/// callback again. [`Self::retire`] does exactly that: it closes the door and
+/// waits for whoever is already inside to leave. After it returns, `ctx` is
+/// unreachable from this process whatever the worker is still doing, and the
+/// host is free to deallocate.
+struct WriteSink {
+    /// Checked before the lock is taken. Without it a steady stream of
+    /// packets could keep readers arriving while `retire` waits for the
+    /// write lock, and the wait would not be bounded.
+    retired: AtomicBool,
+    slot: RwLock<Option<(PacketWriteFn, usize)>>,
+}
+
+impl WriteSink {
+    fn new(write_cb: PacketWriteFn, write_ctx: *mut c_void) -> Self {
+        Self {
+            retired: AtomicBool::new(false),
+            // Raw pointers are not Send. Stored as an integer and turned back
+            // into a pointer only at callback time, under the read lock.
+            slot: RwLock::new(Some((write_cb, write_ctx as usize))),
+        }
+    }
+
+    fn write(&self, data: &[u8]) {
+        if self.retired.load(Ordering::Acquire) {
+            return;
+        }
+        let guard = self
+            .slot
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some((write_cb, write_ctx)) = guard.as_ref() {
+            write_cb(*write_ctx as *mut c_void, data.as_ptr(), data.len());
+        }
+    }
+
+    /// Forbid further calls, then wait for any already in flight to return.
+    ///
+    /// Taking the write lock IS the wait: it cannot be granted while a reader
+    /// is inside the host callback.
+    fn retire(&self) {
+        self.retired.store(true, Ordering::Release);
+        *self
+            .slot
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+    }
 }
 
 /// Packet-oriented host bridge presented as a byte stream to `ipstack`.
@@ -58,27 +118,17 @@ struct CallbackDevice {
     packet_rx: mpsc::Receiver<Vec<u8>>,
     pending: Option<Vec<u8>>,
     pending_offset: usize,
-    write_cb: PacketWriteFn,
-    write_ctx: usize,
+    sink: Arc<WriteSink>,
     mtu: usize,
 }
 
 impl CallbackDevice {
-    fn new(
-        packet_rx: mpsc::Receiver<Vec<u8>>,
-        write_cb: PacketWriteFn,
-        write_ctx: *mut c_void,
-        mtu: u16,
-    ) -> Self {
+    fn new(packet_rx: mpsc::Receiver<Vec<u8>>, sink: Arc<WriteSink>, mtu: u16) -> Self {
         Self {
             packet_rx,
             pending: None,
             pending_offset: 0,
-            write_cb,
-            // Raw pointers are not Send. The host guarantees that the opaque
-            // context remains valid until stop completes, so store its bits as
-            // an integer and restore the pointer only at callback time.
-            write_ctx: write_ctx as usize,
+            sink,
             mtu: usize::from(mtu),
         }
     }
@@ -133,7 +183,7 @@ impl AsyncWrite for CallbackDevice {
                 "userspace stack emitted packet larger than tunnel MTU",
             )));
         }
-        (self.write_cb)(self.write_ctx as *mut c_void, buf.as_ptr(), buf.len());
+        self.sink.write(buf);
         Poll::Ready(Ok(buf.len()))
     }
 
@@ -222,7 +272,12 @@ fn tunnel_args(proxy_url: &str, dns_ip: &str, mtu: u16, route_dns: bool) -> Resu
     })
 }
 
-fn launch_tunnel<F>(packet_tx: Option<mpsc::Sender<Vec<u8>>>, mtu: u16, run: F) -> c_int
+fn launch_tunnel<F>(
+    packet_tx: Option<mpsc::Sender<Vec<u8>>>,
+    sink: Option<Arc<WriteSink>>,
+    mtu: u16,
+    run: F,
+) -> c_int
 where
     F: FnOnce(tokio::runtime::Runtime, CancellationToken) -> std::io::Result<usize>
         + Send
@@ -280,6 +335,7 @@ where
         packet_tx,
         mtu,
         thread: Some(thread),
+        sink,
     });
     crate::VEIL_OK
 }
@@ -409,7 +465,7 @@ unsafe fn start_fd_impl(
     // SAFETY: F_DUPFD_CLOEXEC returned a new descriptor owned by this function.
     let duplicated_fd = unsafe { OwnedFd::from_raw_fd(duplicated_fd) };
 
-    launch_tunnel(None, mtu, move |runtime, cancel| {
+    launch_tunnel(None, None, mtu, move |runtime, cancel| {
         args.tun_fd(Some(duplicated_fd.into_raw_fd()))
             .close_fd_on_drop(true);
         runtime.block_on(tun2proxy::general_run_async(
@@ -431,9 +487,15 @@ unsafe fn start_fd_impl(
 ///
 /// The ingress queue is bounded to 64 packets. A full queue returns
 /// `VEIL_ERR`; the provider should stop reading briefly and retry instead of
-/// accumulating unbounded packet memory. The callback context must remain live
-/// until [`veil_packet_tunnel_stop`] returns. `write_cb` is required and must
-/// not be null (a null C function pointer violates this FFI contract).
+/// accumulating unbounded packet memory.
+///
+/// The callback context must remain live until [`veil_packet_tunnel_stop`]
+/// returns, and that is a contract stop keeps on EVERY return path, including
+/// the one where it gives up on the worker and answers `VEIL_ERR`: it retires
+/// the callback and waits for any invocation already in flight before it
+/// returns, so no call can reach the context afterwards. `write_cb` is
+/// required and must not be null (a null C function pointer violates this FFI
+/// contract).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn veil_packet_tunnel_start_packets(
     proxy_url: *const c_char,
@@ -461,8 +523,9 @@ pub unsafe extern "C" fn veil_packet_tunnel_start_packets(
     args.ipv6_enabled = ipv6_enabled;
 
     let (packet_tx, packet_rx) = mpsc::channel(PACKET_QUEUE_CAPACITY);
-    let device = CallbackDevice::new(packet_rx, write_cb, write_ctx, mtu);
-    launch_tunnel(Some(packet_tx), mtu, move |runtime, cancel| {
+    let sink = Arc::new(WriteSink::new(write_cb, write_ctx));
+    let device = CallbackDevice::new(packet_rx, Arc::clone(&sink), mtu);
+    launch_tunnel(Some(packet_tx), Some(sink), mtu, move |runtime, cancel| {
         let sessions = runtime.block_on(tun2proxy::run(device, mtu, args, cancel))?;
         Ok(sessions)
     })
@@ -514,7 +577,7 @@ pub extern "C" fn veil_packet_tunnel_status() -> c_int {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn veil_packet_tunnel_stop() -> c_int {
-    let cancel = {
+    let (cancel, sink) = {
         let mut slot = tunnel_slot()
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -522,7 +585,7 @@ pub extern "C" fn veil_packet_tunnel_stop() -> c_int {
         let Some(tunnel) = slot.as_ref() else {
             return crate::VEIL_OK;
         };
-        tunnel.cancel.clone()
+        (tunnel.cancel.clone(), tunnel.sink.clone())
     };
     cancel.cancel();
 
@@ -540,9 +603,28 @@ pub extern "C" fn veil_packet_tunnel_stop() -> c_int {
             {
                 let _ = thread.join();
             }
+            // Redundant after a join, and kept anyway: the guarantee this
+            // function makes must not depend on which way it returned.
+            if let Some(sink) = sink {
+                sink.retire();
+            }
             return crate::VEIL_OK;
         }
         std::thread::sleep(Duration::from_millis(10));
+    }
+
+    // Timed out. The worker is still running, and this function cannot wait
+    // for it — the host's own stop path has a deadline of its own, and on
+    // Apple platforms it tears the provider down when that expires.
+    //
+    // Retiring the sink is what makes returning here safe. It used to return
+    // VEIL_ERR with the worker still holding the host's context pointer, and
+    // the host had already been told the context need only live "until stop
+    // returns": a packet arriving a moment later called a callback on a freed
+    // provider. Now the callback is unreachable before the return, so the
+    // leak is a leaked thread and not a corrupted heap.
+    if let Some(sink) = sink {
+        sink.retire();
     }
     crate::VEIL_ERR
 }
@@ -593,6 +675,81 @@ pub unsafe extern "C" fn veil_packet_tunnel_run_linux_helper(config_path: *const
     {
         let _ = config_path;
         crate::VEIL_ERR_INVALID_ARG
+    }
+}
+
+#[cfg(test)]
+mod write_sink_tests {
+    use super::*;
+    use std::sync::atomic::AtomicUsize;
+
+    // Statics rather than captures: the host callback is an `extern "C" fn`
+    // and cannot close over anything. One set per test, because the suite
+    // runs its tests on parallel threads.
+    static DELIVERED: AtomicUsize = AtomicUsize::new(0);
+
+    extern "C" fn count_calls(_ctx: *mut c_void, _data: *const u8, _len: usize) {
+        DELIVERED.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// A retired sink is unreachable, which is the whole guarantee stop makes.
+    ///
+    /// `veil_packet_tunnel_stop` gives up on the worker after `STOP_TIMEOUT`
+    /// and returns `VEIL_ERR` with the thread still running, while the host
+    /// has been told the context need only outlive the call. Whether that is
+    /// a leak or a use-after-free comes down to this: can a packet arriving
+    /// after stop returned still reach the callback.
+    #[test]
+    fn a_retired_sink_never_calls_the_host() {
+        let sink = WriteSink::new(count_calls, std::ptr::null_mut());
+        sink.write(b"before");
+        assert_eq!(
+            DELIVERED.load(Ordering::SeqCst),
+            1,
+            "the sink delivered nothing even before retirement, so this test \
+             would pass against a sink that never worked"
+        );
+
+        sink.retire();
+        sink.write(b"after");
+        assert_eq!(
+            DELIVERED.load(Ordering::SeqCst),
+            1,
+            "a retired sink called the host — by then the provider may be freed"
+        );
+    }
+
+    static ENTERED: AtomicBool = AtomicBool::new(false);
+    static LEFT: AtomicBool = AtomicBool::new(false);
+
+    extern "C" fn slow_callback(_ctx: *mut c_void, _data: *const u8, _len: usize) {
+        ENTERED.store(true, Ordering::SeqCst);
+        std::thread::sleep(Duration::from_millis(200));
+        LEFT.store(true, Ordering::SeqCst);
+    }
+
+    /// Retirement must also wait for the call already inside the host.
+    ///
+    /// Closing the door is not enough on its own: stop returns and the host
+    /// deallocates, and a callback that was already running is holding that
+    /// exact pointer. Setting the flag without waiting would satisfy the test
+    /// above and still corrupt memory here.
+    #[test]
+    fn retire_waits_for_a_callback_already_in_flight() {
+        let sink = Arc::new(WriteSink::new(slow_callback, std::ptr::null_mut()));
+        let writer = Arc::clone(&sink);
+        let handle = std::thread::spawn(move || writer.write(b"in flight"));
+
+        while !ENTERED.load(Ordering::SeqCst) {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        sink.retire();
+        assert!(
+            LEFT.load(Ordering::SeqCst),
+            "retire returned while the host callback was still running — the \
+             host is free to release the context the moment stop returns"
+        );
+        handle.join().expect("writer thread panicked");
     }
 }
 
@@ -669,7 +826,11 @@ mod tests {
         let (packet_tx, packet_rx) = mpsc::channel(2);
         let output = StdMutex::new(Vec::<Vec<u8>>::new());
         let output_ctx = (&output as *const StdMutex<Vec<Vec<u8>>>) as *mut c_void;
-        let mut device = CallbackDevice::new(packet_rx, collect_packet, output_ctx, 1280);
+        let mut device = CallbackDevice::new(
+            packet_rx,
+            Arc::new(WriteSink::new(collect_packet, output_ctx)),
+            1280,
+        );
 
         packet_tx.try_send(vec![0x45, 1, 2, 3, 4]).unwrap();
         runtime.block_on(async {
@@ -699,7 +860,11 @@ mod tests {
         let (_packet_tx, packet_rx) = mpsc::channel(1);
         let output = StdMutex::new(Vec::<Vec<u8>>::new());
         let output_ctx = (&output as *const StdMutex<Vec<Vec<u8>>>) as *mut c_void;
-        let mut device = CallbackDevice::new(packet_rx, collect_packet, output_ctx, 1280);
+        let mut device = CallbackDevice::new(
+            packet_rx,
+            Arc::new(WriteSink::new(collect_packet, output_ctx)),
+            1280,
+        );
         let error = runtime
             .block_on(device.write_all(&vec![0_u8; 1281]))
             .unwrap_err();

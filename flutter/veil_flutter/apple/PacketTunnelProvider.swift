@@ -237,7 +237,21 @@ public final class PacketTunnelProvider: NEPacketTunnelProvider {
         packetQueue.async {
             self.acceptingPackets = false
             self.pendingIngress.removeAll(keepingCapacity: false)
-            _ = veil_packet_tunnel_stop()
+            // Safe to finish the teardown on any result: stop retires the
+            // write callback and waits out any call already inside it before
+            // it returns, so nothing can reach this provider afterwards.
+            // A non-zero result means the engine thread outlived its deadline
+            // and leaked — worth saying out loud, because the next start will
+            // be refused as re-entrant and the tunnel will look broken for a
+            // reason nothing else reports.
+            let stopResult = veil_packet_tunnel_stop()
+            if stopResult != 0 {
+                NSLog(
+                    "[veil] packet tunnel stop returned %d — engine thread did not exit in time: %@",
+                    stopResult,
+                    PacketTunnelProvider.lastEngineError()
+                )
+            }
             self.stopUpstream()
             completionHandler()
         }
