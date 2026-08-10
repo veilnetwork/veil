@@ -36,6 +36,36 @@ mod tests {
     ///
     /// Returns whatever it has at the deadline so the CALLER's assertion is
     /// still the one that fails, with its own message.
+    /// Wait for `check` to hold on some node, RE-TRIGGERING the publish while
+    /// it waits.
+    ///
+    /// `debug_force_dht_republish` is one shot. If that single push does not
+    /// reach the peer — the session was a moment from ready, the store call
+    /// was dropped — nothing retries inside the test's window, because the
+    /// node's own maintenance tick is a minute away. Waiting longer therefore
+    /// changed nothing, which is why the pairing scenario still timed out at
+    /// sixty seconds while the others stopped flaking: the budget was never
+    /// the problem, the single attempt was.
+    ///
+    /// Returns false at the deadline so the CALLER's assertion is the one that
+    /// fails, with its own message.
+    async fn republish_until(
+        publisher: &veil_node_runtime::NodeRuntime,
+        mut check: impl FnMut() -> bool,
+    ) -> bool {
+        let deadline = tokio::time::Instant::now() + SIM_WAIT_LIMIT;
+        loop {
+            if check() {
+                return true;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return false;
+            }
+            publisher.debug_force_dht_republish().await;
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+
     async fn resolved_instances(
         runtime: &veil_node_runtime::NodeRuntime,
         node_id: [u8; 32],
@@ -1668,19 +1698,11 @@ mod tests {
         // Force a replicated STORE to all peers.
         net.node(0).runtime.debug_force_dht_republish().await;
 
-        let resolved_bytes = {
-            let deadline = tokio::time::Instant::now() + SIM_WAIT_LIMIT;
-            loop {
-                if let Some(bytes) = net.node(1).runtime.dht_get_local(&dht_key) {
-                    break Some(bytes);
-                }
-                if tokio::time::Instant::now() >= deadline {
-                    break None;
-                }
-                tokio::time::sleep(Duration::from_millis(50)).await;
-            }
-        }
-        .expect(
+        republish_until(&net.node(0).runtime, || {
+            net.node(1).runtime.dht_get_local(&dht_key).is_some()
+        })
+        .await;
+        let resolved_bytes = net.node(1).runtime.dht_get_local(&dht_key).expect(
             "node 1 must acquire alice's NameClaim via cross-node DHT \
              replication",
         );
@@ -1758,22 +1780,23 @@ mod tests {
         net.node(0).runtime.debug_force_dht_republish().await;
 
         // Edge-triggered poll: all 4 keys land on node 1.
-        let deadline = tokio::time::Instant::now() + SIM_WAIT_LIMIT;
-        loop {
+        republish_until(&net.node(0).runtime, || {
+            net.node(1).runtime.dht_get_local(&doc_key).is_some()
+                && net.node(1).runtime.dht_get_local(&reg_key).is_some()
+                && net.node(1).runtime.dht_get_local(&cert_key).is_some()
+                && net.node(1).runtime.dht_get_local(&name_key).is_some()
+        })
+        .await;
+        {
             let holds_doc = net.node(1).runtime.dht_get_local(&doc_key).is_some();
             let holds_reg = net.node(1).runtime.dht_get_local(&reg_key).is_some();
             let holds_cert = net.node(1).runtime.dht_get_local(&cert_key).is_some();
             let holds_name = net.node(1).runtime.dht_get_local(&name_key).is_some();
-            if holds_doc && holds_reg && holds_cert && holds_name {
-                break;
-            }
-            if tokio::time::Instant::now() >= deadline {
-                panic!(
-                    "node 1 missing records — doc={holds_doc} reg={holds_reg} \
-                     cert={holds_cert} name={holds_name}",
-                );
-            }
-            tokio::time::sleep(Duration::from_millis(50)).await;
+            assert!(
+                holds_doc && holds_reg && holds_cert && holds_name,
+                "node 1 missing records — doc={holds_doc} reg={holds_reg} \
+                 cert={holds_cert} name={holds_name}",
+            );
         }
 
         // Decode + binding sanity on each.
@@ -1936,19 +1959,15 @@ mod tests {
             .unwrap();
         net.node(0).runtime.debug_force_dht_republish().await;
         let doc_key = IdentityDocument::dht_key(&alice_node_id);
-        let deadline = tokio::time::Instant::now() + SIM_WAIT_LIMIT;
-        loop {
-            if let Some(b) = net.node(1).runtime.dht_get_local(&doc_key)
-                && let Ok(d) = IdentityDocument::decode(&b)
-                && d.identity_keys.len() == initial_keys
-            {
-                break;
-            }
-            if tokio::time::Instant::now() >= deadline {
-                panic!("charlie never received v1 doc");
-            }
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
+        let landed = republish_until(&net.node(0).runtime, || {
+            net.node(1)
+                .runtime
+                .dht_get_local(&doc_key)
+                .and_then(|b| IdentityDocument::decode(&b).ok())
+                .is_some_and(|d| d.identity_keys.len() == initial_keys)
+        })
+        .await;
+        assert!(landed, "charlie never received v1 doc");
 
         // Build alice's PairingSource. identity_sk + master_sk
         // come from her veil_dir + the sim master_seed file.
@@ -4169,22 +4188,16 @@ mod tests {
 
         // Wait for both records to replicate onto BOTH peers (nodes 1 and 2),
         // so node 1's resolve fan-out to {0, 2} reaches a 2-replica quorum.
-        let deadline = tokio::time::Instant::now() + SIM_WAIT_LIMIT;
-        loop {
-            let landed = |i: usize| {
-                net.node(i).runtime.dht_get_local(&claim_key).is_some()
-                    && net.node(i).runtime.dht_get_local(&doc_key).is_some()
-            };
-            if landed(1) && landed(2) {
-                break;
-            }
-            assert!(
-                tokio::time::Instant::now() < deadline,
-                "alice's NameClaim AND IdentityDocument must replicate to both \
-                 peers before the name-resolve test",
-            );
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
+        let landed = |i: usize| {
+            net.node(i).runtime.dht_get_local(&claim_key).is_some()
+                && net.node(i).runtime.dht_get_local(&doc_key).is_some()
+        };
+        let replicated = republish_until(&net.node(0).runtime, || landed(1) && landed(2)).await;
+        assert!(
+            replicated,
+            "alice's NameClaim AND IdentityDocument must replicate to both \
+             peers before the name-resolve test",
+        );
 
         let now = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
