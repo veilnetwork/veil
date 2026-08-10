@@ -53,7 +53,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::os::raw::c_void;
-use std::sync::{Arc, LazyLock, Mutex};
+use std::sync::{Arc, Condvar, LazyLock, Mutex};
 
 use chacha20poly1305::{
     ChaCha20Poly1305, Nonce,
@@ -513,6 +513,69 @@ struct RecvCb {
 static RECV: LazyLock<Mutex<HashMap<[u8; 32], RecvCb>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
+/// Dispatches currently INSIDE a host callback, counted per channel.
+///
+/// The registry lock is released before the FFI call — it has to be, or a
+/// re-entrant set/clear from inside the callback deadlocks. That leaves a
+/// window in which the callback pointer and its `ctx` have been taken out of
+/// the map and not yet used, and unregistering did nothing about it: the host
+/// cleared its callback, saw nothing pending on its own side (its counter only
+/// starts once the callback is ENTERED), destroyed the object, and this side
+/// then called into it (report9 V-01).
+///
+/// So clearing waits here. The count is taken under the SAME lock that hands
+/// out the callback, which is what makes the wait exact: a dispatch that got a
+/// target incremented before the entry could be removed, and one that finds no
+/// entry never calls anything.
+static IN_FLIGHT: LazyLock<(Mutex<HashMap<u64, u32>>, Condvar)> =
+    LazyLock::new(|| (Mutex::new(HashMap::new()), Condvar::new()));
+
+thread_local! {
+    /// The channel this thread is currently dispatching, if any.
+    ///
+    /// A callback is allowed to clear its own registration, and waiting for
+    /// itself to finish would hang forever. On this thread the callback is on
+    /// the stack, so the host cannot be destroying the object from here.
+    static DISPATCHING: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+}
+
+/// How long a clear waits for an in-flight dispatch before giving up and
+/// saying so.
+///
+/// Bounded rather than unbounded on purpose: a callback that never returns
+/// would otherwise wedge teardown, which is a worse failure than the one this
+/// closes and the exact shape of a bug this project has already been bitten by.
+/// The host's own drain waits one second; this waits longer, because it is the
+/// half that actually knows whether a call is in progress.
+const QUIESCE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Wait until no dispatch for `chan` is inside a host callback.
+///
+/// Call AFTER the entry is out of the map and with no registry lock held.
+fn await_quiescent(chan: u64) {
+    if DISPATCHING.with(std::cell::Cell::get) == Some(chan) {
+        // Re-entrant clear from inside the callback itself.
+        return;
+    }
+    let (lock, cv) = &*IN_FLIGHT;
+    let mut counts = lock.lock().unwrap_or_else(|p| p.into_inner());
+    let deadline = std::time::Instant::now() + QUIESCE_TIMEOUT;
+    while counts.get(&chan).copied().unwrap_or(0) > 0 {
+        let Some(left) = deadline.checked_duration_since(std::time::Instant::now()) else {
+            diag(format_args!(
+                "quiesce TIMEOUT chan={chan} in_flight={} — the host may free its \
+                 context while a dispatch is still inside its callback",
+                counts.get(&chan).copied().unwrap_or(0)
+            ));
+            return;
+        };
+        let (guard, _) = cv
+            .wait_timeout(counts, left)
+            .unwrap_or_else(|p| p.into_inner());
+        counts = guard;
+    }
+}
+
 /// Lightweight per-peer counter of media datagrams that OPENED against the
 /// channel's key. A diagnostic stat that also lets a host poll receipt without
 /// wiring a cross-thread recv callback — the Phase 2 two-node probe reads it via
@@ -540,6 +603,12 @@ pub(crate) fn set_recv_callback(
             cipher,
         },
     );
+    // Replacing is an unregistration for whoever was there: its `ctx` is now
+    // unreachable from the map, and the host is free to destroy it. Wait for
+    // any dispatch still inside it, exactly as a clear does.
+    if let Some(old) = replaced.as_ref().filter(|old| old.chan != chan) {
+        await_quiescent(old.chan);
+    }
     diag(format_args!(
         "set_recv_callback peer={:02x}{:02x}{:02x}{:02x} chan={chan} replaces={}",
         peer[0],
@@ -567,6 +636,12 @@ pub(crate) fn clear_recv_callback(peer: [u8; 32], chan: u64) {
     if owned {
         map.remove(&peer);
     }
+    // Registry lock dropped BEFORE waiting: a dispatch already inside a
+    // callback holds no registry lock, but one about to start needs it.
+    drop(map);
+    if owned {
+        await_quiescent(chan);
+    }
 }
 
 /// Remove any registration owned by `chan`, regardless of peer key. Fallback
@@ -588,7 +663,11 @@ pub(crate) fn clear_recv_callback_by_chan(chan: u64) {
         }
         !owned
     });
-    if map.len() == before {
+    let removed = map.len() != before;
+    drop(map);
+    if removed {
+        await_quiescent(chan);
+    } else {
         diag(format_args!("clear_by_chan chan={chan} no-entry"));
     }
 }
@@ -598,6 +677,11 @@ pub(crate) fn clear_recv_callback_by_chan(chan: u64) {
 /// so no transport can acquire a shortcut past the seal. The registry lock is
 /// released BEFORE the FFI call so a re-entrant set/clear from inside the
 /// callback cannot deadlock.
+///
+/// That release is also what made unregistering unsafe, so the call is counted
+/// in [`IN_FLIGHT`] while the registry is still held: clearing then waits for
+/// it. Without that, "the callback is no longer registered" said nothing about
+/// whether one was running (report9 V-01).
 fn dispatch_inbound(peer: [u8; 32], payload: &[u8]) {
     {
         let mut counts = RECV_COUNT.lock().unwrap_or_else(|p| p.into_inner());
@@ -609,10 +693,22 @@ fn dispatch_inbound(peer: [u8; 32], payload: &[u8]) {
     // window exhausted the "first 5" quota for the whole call).
     let target = {
         let mut map = RECV.lock().unwrap_or_else(|p| p.into_inner());
-        map.get_mut(&peer).map(|c| {
+        let found = map.get_mut(&peer).map(|c| {
             c.hits += 1;
             (c.cb, c.ctx, c.chan, c.hits)
-        })
+        });
+        // Counted while the registry is still held, so a clear either removes
+        // the entry before this (and there is no call to wait for) or waits for
+        // this call to finish. There is no third order.
+        if let Some((_, _, chan, _)) = found {
+            let (lock, _) = &*IN_FLIGHT;
+            *lock
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .entry(chan)
+                .or_insert(0) += 1;
+        }
+        found
     };
     #[cfg(debug_assertions)]
     match target {
@@ -659,8 +755,20 @@ fn dispatch_inbound(peer: [u8; 32], payload: &[u8]) {
             }
         }
     }
-    if let Some((cb, ctx, _, _)) = target {
+    if let Some((cb, ctx, chan, _)) = target {
+        let previous = DISPATCHING.with(|c| c.replace(Some(chan)));
         cb(ctx as *mut c_void, payload.as_ptr(), payload.len());
+        DISPATCHING.with(|c| c.set(previous));
+        let (lock, cv) = &*IN_FLIGHT;
+        let mut counts = lock.lock().unwrap_or_else(|p| p.into_inner());
+        match counts.get_mut(&chan) {
+            Some(n) if *n > 1 => *n -= 1,
+            _ => {
+                counts.remove(&chan);
+            }
+        }
+        drop(counts);
+        cv.notify_all();
     }
 }
 
@@ -1333,6 +1441,103 @@ mod tests {
         assert!(
             media_cell(vec![vec![0x80u8; 100], vec![0x90u8; 110]], 16).is_none(),
             "an oversized batch must be refused, not truncated"
+        );
+    }
+}
+
+#[cfg(test)]
+mod v01_quiescence_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
+    static ENTERED: AtomicBool = AtomicBool::new(false);
+    static RELEASE: AtomicBool = AtomicBool::new(false);
+    static LEFT_AT: AtomicU64 = AtomicU64::new(0);
+    static CLEARED_AT: AtomicU64 = AtomicU64::new(0);
+    static TICK: AtomicU64 = AtomicU64::new(0);
+
+    /// Stands in for the host's callback: announces that it is INSIDE, waits to
+    /// be let go, and stamps the moment it leaves.
+    extern "C" fn slow_cb(_ctx: *mut c_void, _ptr: *const u8, _len: usize) {
+        ENTERED.store(true, Ordering::SeqCst);
+        while !RELEASE.load(Ordering::SeqCst) {
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        LEFT_AT.store(TICK.fetch_add(1, Ordering::SeqCst), Ordering::SeqCst);
+    }
+
+    fn cipher() -> Arc<MediaCipher> {
+        Arc::new(
+            MediaCipher::new(&[0x33u8; 32], &[0xa1u8; 32], &[0xa2u8; 32]).expect("usable keys"),
+        )
+    }
+
+    /// Unregistering must not return while a dispatch is inside the callback.
+    ///
+    /// This is the whole of V-01. The host clears its callback, sees nothing
+    /// pending on ITS counter — which only starts once the callback is entered
+    /// — destroys the object, and this side calls into it. The window is
+    /// between taking `(cb, ctx)` out of the map and using them, so the test
+    /// parks a dispatch exactly there.
+    #[test]
+    fn clearing_waits_for_a_dispatch_already_inside_the_callback() {
+        let peer = [0x11u8; 32];
+        let chan = 4242u64;
+        ENTERED.store(false, Ordering::SeqCst);
+        RELEASE.store(false, Ordering::SeqCst);
+        TICK.store(1, Ordering::SeqCst);
+
+        set_recv_callback(peer, chan, slow_cb, std::ptr::null_mut(), cipher());
+
+        let dispatcher = std::thread::spawn(move || {
+            dispatch_inbound(peer, b"payload");
+        });
+        // Wait until the callback is genuinely inside; without this the clear
+        // could win the race for a reason that has nothing to do with the fix.
+        for _ in 0..500 {
+            if ENTERED.load(Ordering::SeqCst) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        assert!(ENTERED.load(Ordering::SeqCst), "the callback never started");
+
+        let clearer = std::thread::spawn(move || {
+            clear_recv_callback(peer, chan);
+            CLEARED_AT.store(TICK.fetch_add(1, Ordering::SeqCst), Ordering::SeqCst);
+        });
+
+        // Give the clear a real chance to return early if it is going to.
+        std::thread::sleep(std::time::Duration::from_millis(60));
+        RELEASE.store(true, Ordering::SeqCst);
+
+        dispatcher.join().unwrap();
+        clearer.join().unwrap();
+
+        assert!(
+            LEFT_AT.load(Ordering::SeqCst) < CLEARED_AT.load(Ordering::SeqCst),
+            "clear returned at {} while the callback only left at {} — the host \
+             is free to destroy its context under a call already in flight",
+            CLEARED_AT.load(Ordering::SeqCst),
+            LEFT_AT.load(Ordering::SeqCst)
+        );
+    }
+
+    /// A clear with nothing in flight must not wait around.
+    ///
+    /// The other half: a barrier that always waits its full timeout would pass
+    /// the test above and add two seconds to every channel teardown.
+    #[test]
+    fn clearing_an_idle_registration_returns_at_once() {
+        let peer = [0x22u8; 32];
+        let chan = 99u64;
+        set_recv_callback(peer, chan, slow_cb, std::ptr::null_mut(), cipher());
+        let started = std::time::Instant::now();
+        clear_recv_callback(peer, chan);
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(500),
+            "an idle clear waited {:?}",
+            started.elapsed()
         );
     }
 }
