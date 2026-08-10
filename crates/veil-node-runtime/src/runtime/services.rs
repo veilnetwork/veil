@@ -62,6 +62,33 @@ pub fn publish_embedded_services(services: NodeServices) {
     }
 }
 
+/// Drop the view a stopped node published.
+///
+/// Publishing had no counterpart, so a node that stopped stayed in this map for
+/// the life of the PROCESS: `by_node` grew by one entry per identity ever
+/// booted, and `latest` went on naming whichever node published last even after
+/// it was torn down. Both hold `Arc` clones of live node state, so the entry is
+/// not a stale label — it keeps the dead node's state alive and hands the FFI a
+/// handle it can still drive circuits through (report9 V-08).
+///
+/// `latest` is cleared only when it is THIS node's view: in a multi-identity
+/// process another node may have published after us, and clearing its fallback
+/// would break the single-node callers `latest` exists for.
+pub fn withdraw_embedded_services(node_id: &[u8; 32]) {
+    if let Ok(mut g) = embedded_services_registry().lock() {
+        g.by_node.remove(node_id);
+        if g.latest
+            .as_ref()
+            .is_some_and(|s| &s.local_node_id() == node_id)
+        {
+            // Fall back to whatever else is still published rather than to
+            // nothing: a surviving node is a better answer for an old
+            // single-node caller than "no embedded node".
+            g.latest = g.by_node.values().next().cloned();
+        }
+    }
+}
+
 /// A clone of the CURRENT services for a specific embedded node id.
 pub fn embedded_services_for(node_id: &[u8; 32]) -> Option<NodeServices> {
     embedded_services_registry()
@@ -1630,5 +1657,45 @@ mod m5_persist_tests {
             "persisted bytes must be byte-for-byte the signed bundle"
         );
         let _ = std::fs::remove_file(&path);
+    }
+}
+
+#[cfg(test)]
+mod v08_withdraw_tests {
+    /// Publishing must keep its counterpart on the stop path.
+    ///
+    /// A source check, and deliberately so: `NodeServices` is a bundle of live
+    /// node state that a unit test cannot assemble, so there is no honest way
+    /// to drive publish/withdraw here. What CAN rot is the wiring — a stop path
+    /// that forgets to withdraw — and that is a fact about the file.
+    ///
+    /// Both `stop` and `stop_via_arc` funnel through `finalize_stop_state`, so
+    /// the call belongs there and nowhere else; if that ever stops being true,
+    /// this test is the wrong shape and should be replaced rather than widened.
+    #[test]
+    fn the_stop_path_withdraws_what_startup_published() {
+        let lifecycle = include_str!("lifecycle.rs");
+        let start = lifecycle
+            .find("fn finalize_stop_state")
+            .expect("finalize_stop_state moved — this guard no longer watches the stop path");
+        let body = &lifecycle[start..];
+        let end = body.find("\n    pub async fn stop(").unwrap_or(body.len());
+        assert!(
+            body[..end].contains("withdraw_embedded_services"),
+            "the stop path no longer withdraws the embedded-services view: a \
+             stopped node stays in the registry for the life of the process, \
+             holding Arc clones of its state, and a stale FFI id can still \
+             find and drive it (report9 V-08)"
+        );
+    }
+
+    /// And publishing is still what it is withdrawing — a rename on one side
+    /// only would leave this file with a dead function and the registry with a
+    /// permanent entry.
+    #[test]
+    fn publish_and_withdraw_are_a_pair() {
+        let source = include_str!("services.rs");
+        assert!(source.contains("pub fn publish_embedded_services"));
+        assert!(source.contains("pub fn withdraw_embedded_services"));
     }
 }
