@@ -258,12 +258,29 @@ struct RuntimeBundle {
     /// request timed out the flush failed and the ratchet went DEGRADED, which
     /// on a phone looked like a node that had stopped answering.
     ///
-    /// Safe to remember because a stale value cannot pass silently: the id is
-    /// only ever used to LOOK UP the embedded services, and services for an id
-    /// this node no longer has simply do not exist, so the miss is visible and
-    /// the entry is refetched. That is deliberate — a plain "first write wins"
-    /// cache of a node id is exactly how the Android working directory bug
-    /// survived a node restart.
+    /// KNOWN LIMIT — audit report9 finding 4, and the reasoning that was
+    /// written here before it was wrong.
+    ///
+    /// The claim was that a stale value cannot pass silently, because services
+    /// for an id this node no longer has do not exist, so the lookup misses and
+    /// the entry is refetched. The registry it looks in
+    /// (`veil_node_runtime::publish_embedded_services`) is keyed by node id and
+    /// only ever INSERTS: it overwrites on republish, which is what deferred
+    /// init needs, but an identity PROMOTION publishes under a NEW id and
+    /// leaves the old entry in place for the life of the process. So the miss
+    /// this cache was justified by never happens, and after a promotion the
+    /// lookup can hand back the superseded node's services.
+    ///
+    /// What that costs is bounded but real: onion registration or withdrawal
+    /// through a detached DHT, and old identity graphs held alive. The ratchet
+    /// — the caller this cache exists for — shares one `Arc` that survives a
+    /// reload, so its state is not at risk; that is why this is a limit rather
+    /// than a live corruption.
+    ///
+    /// The fix is in the registry, not here: entries want handle scope and a
+    /// generation, with the superseded id removed when a promotion publishes.
+    /// Inventing a validity check on this side would have to guess which node
+    /// belongs to which handle, and in all-online mode there are several.
     cached_node_id: StdMutex<Option<[u8; 32]>>,
 }
 
@@ -4815,9 +4832,11 @@ fn embedded_services_for_bundle(
         if let Some(services) = services_for(me) {
             return Ok(services);
         }
-        // The id we remembered belongs to a node this handle no longer runs
-        // (a deniable boot promoted the identity, or the node was rebuilt).
-        // Nothing was served from it — forget it and ask.
+        // A miss means the id belongs to no published node at all. It does
+        // NOT mean a hit is current: the registry never removes a superseded
+        // id (see `cached_node_id`), so a promotion leaves the old entry
+        // answering. Forgetting on a miss is still right; it is simply not the
+        // whole guarantee this once claimed to be.
         *cached(bundle) = None;
     }
 
