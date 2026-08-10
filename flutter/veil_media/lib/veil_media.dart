@@ -1038,8 +1038,14 @@ class VeilVnotePlayer {
     try {
       var buf = _frameBuf;
       if (buf == null) {
-        _frameCap = width > 0 ? width * height * 4 : 480 * 480 * 4;
-        if (_frameCap <= 0) _frameCap = 480 * 480 * 4;
+        // `width`/`height` come from the clip's header, which arrived over the
+        // network. The parser now refuses an absurd one, but this side must not
+        // depend on that: a header alone should never decide the size of an
+        // allocation. 65535 x 65535 x 4 is a 17 GB calloc from a 24-byte file.
+        const maxSide = 1920;
+        final w = width > 0 && width <= maxSide ? width : 480;
+        final h = height > 0 && height <= maxSide ? height : 480;
+        _frameCap = w * h * 4;
         buf = calloc<Uint8>(_frameCap);
         _frameBuf = buf;
       }
