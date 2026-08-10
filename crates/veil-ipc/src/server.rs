@@ -1775,7 +1775,15 @@ impl IpcServer {
                             self.bootstrap_invite_create_sink.clone();
                         let pair_source_sink = self.pair_source_sink.clone();
                         let pair_target_sink = self.pair_target_sink.clone();
+                        // A client task that outlives its server is a client
+                        // task nobody can stop: it holds the registry, the
+                        // sinks and its permit for the life of the process,
+                        // and `run` returning says nothing about it (report9
+                        // V-13). The accept loop had this signal all along;
+                        // the clients it spawned did not.
+                        let mut client_shutdown = self.shutdown_rx.clone();
                         tokio::spawn(async move {
+                            let client = async move {
                             // The pre-auth permit covers the handshake only,
                             // and is handed back the moment the client proves
                             // itself — a slow-but-legitimate app must not sit
@@ -1802,6 +1810,25 @@ impl IpcServer {
                             // by the daemon binary.
                             if let Err(e) = handle_ipc_client(stream, registry, streams, node_id, max_rate, tx_reg, route_cache, route_updated, peer_mlkem_keys, mlkem_ek_resolver, ratchet, anon_onion_sender, capture_tx, trace_sample_rate, pending_ack, pending_recursive, app_socket_dir, metrics, anycast_service, hint_registry, mobile_event_sink, local_identity_algo, local_identity_pubkey, local_relay_x25519_pubkey, peer_list_provider, bootstrap_join_sink, mobile_status_provider, event_bus, push_envelope_sink, mailbox_backend, mailbox_crypto_sink, outbox_backend, rendezvous_resolver, relay_key_resolver, bootstrap_invite_create_sink, pair_source_sink, pair_target_sink, pnet_status_provider, listen_transports_provider, hole_punch_driver, stream_bridge).await {
                                 eprintln!("[veil-ipc] client disconnected: {e} (kind={:?})", e.kind());
+                            }
+                            };
+                            // Dropped, not aborted: cancelling at an await
+                            // boundary is what releases the socket, the
+                            // permit and every Arc this client holds, and it
+                            // happens between frames rather than inside one.
+                            if *client_shutdown.borrow() {
+                                return;
+                            }
+                            tokio::pin!(client);
+                            loop {
+                                tokio::select! {
+                                    () = &mut client => return,
+                                    changed = client_shutdown.changed() => {
+                                        if changed.is_err() || *client_shutdown.borrow() {
+                                            return;
+                                        }
+                                    }
+                                }
                             }
                         });
                     }

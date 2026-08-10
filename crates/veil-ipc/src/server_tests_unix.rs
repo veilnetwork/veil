@@ -119,6 +119,36 @@ async fn client_hello_ok() {
     let _ = server_handle.await;
 }
 
+/// Shutting the server down must reach the clients it accepted.
+///
+/// The accept loop had the signal; the tasks it spawned did not. So `run`
+/// returning said nothing about them: an authenticated client task kept its
+/// socket, its permit and its clone of the registry and the sinks for the life
+/// of the process (report9 V-13).
+///
+/// EOF on the client's socket is the observable: it can only come from the
+/// client TASK ending, since `run` returning closes the listener and not an
+/// accepted connection.
+#[tokio::test]
+async fn shutdown_reaches_an_already_accepted_client() {
+    let sock = temp_socket_path();
+    let (mut server, shutdown_tx, _registry) = make_server(sock.clone());
+    let server_handle = tokio::spawn(async move { server.run().await });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let mut client = connect_and_hello(&sock).await;
+
+    let _ = shutdown_tx.send(true);
+
+    let mut buf = [0u8; 1];
+    let closed = tokio::time::timeout(Duration::from_secs(5), client.read(&mut buf)).await;
+    assert!(
+        matches!(closed, Ok(Ok(0))),
+        "the client task outlived the server: it still holds this socket, its \
+         permit and its clone of the registry — got {closed:?}"
+    );
+    let _ = server_handle.await;
+}
+
 // ── 24.7: version mismatch ────────────────────────────────────────────
 
 #[tokio::test]
