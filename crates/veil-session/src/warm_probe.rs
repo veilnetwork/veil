@@ -127,6 +127,16 @@ pub struct WarmProbeConfig {
     pub hot_standby: HotStandbyConfig,
 }
 
+impl Drop for WarmProbeConfig {
+    /// The probe holds a copy of the session's AEAD TX key for as long as it
+    /// is dialling, and the config is dropped when the task ends. Dropping it
+    /// as-is left the copy in the allocator (report9 V-17).
+    fn drop(&mut self) {
+        use zeroize::Zeroize as _;
+        self.tx_key.zeroize();
+    }
+}
+
 /// Spawn the warm-probe task for one session. Returns a handle the
 /// controller uses to ask for a handoff. The task dials the alt
 /// transport at startup; a dial failure is surfaced through the handle's
