@@ -21,11 +21,20 @@ longer written down anywhere else — the design note lived in a session
 scratchpad and is gone.
 
 `veil-udp-obfs` exists and is used, but only as a per-datagram AEAD wrapper for
-mesh realm DATA (`realm_psk` in the realm config, beacons stay plaintext so
-discovery still works). It was intended to become a full transport alongside
+mesh realm DATA and beacons (`realm_psk` in the realm config). It was intended
+to become a full transport alongside
 `obfs4-tcp`, and it is not one: there is no handshake, no listener, no stream,
 no reliability layer. Reaching a session `Transport` means roughly 1000+ LOC of
 reliable UDP (ARQ), which is why it was parked.
+
+**Corrected 2026-08-10 (report9 V-11).** This paragraph used to end
+"...beacons stay plaintext so discovery still works". That stopped being true
+with C-03: `BeaconSender::send_once` AEAD-seals every broadcast beacon whenever
+`realm_psk` is set, and the seal carries the traffic-shape padding besides.
+Only an UNSET `realm_psk` leaves beacons in the clear, which is the legacy
+path. The distinction matters to an operator: read as written, it says turning
+`realm_psk` on still leaves discovery readable to a passive LAN observer, and
+someone could design a deployment around a weakness the code does not have.
 
 **Why it was parked rather than built:** the failure that prompted it turned
 out not to be DPI at all. The reverse-leg deadlock was a PMTU/full-MSS downlink
