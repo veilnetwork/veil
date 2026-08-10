@@ -22,6 +22,14 @@
 
 // ── PendingRecursive ──────────────────────────────────────────────
 
+/// The in-flight recursive queries, keyed by query id.
+///
+/// Named because the shape is shared verbatim by the dispatcher that owns
+/// the map and by every handler that borrows it, and spelling it out at each
+/// site is how the two drift apart.
+pub type PendingRecursiveMap =
+    std::sync::Arc<std::sync::Mutex<std::collections::HashMap<[u8; 16], PendingRecursive>>>;
+
 /// A recursive DHT query awaiting its `RecursiveResponse`.
 ///
 /// The response handler parses `resp.payload` according to `query_type` —

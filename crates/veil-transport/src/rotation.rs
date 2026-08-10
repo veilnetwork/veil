@@ -191,9 +191,20 @@ impl RotationSpec {
 /// and mirrored to structured logs in production.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RotationEvent {
-    /// Successfully bound a new port; broadcast was issued; the old
-    /// listener will be dropped after the grace period.
+    /// The caller is accepting on `new_port` and the broadcast has been
+    /// issued. Reported after both, so a peer that acts on this event
+    /// acts on a port that is already serving.
     Rotated { new_port: u16 },
+    /// The caller was handed a free port and did not come up on it, so
+    /// nothing was broadcast: the old listener keeps serving the URI
+    /// peers already hold, and the loop retries at the next interval.
+    AdoptFailed { reason: String },
+    /// The grace period after a `Rotated` has elapsed. The caller may
+    /// now close the listener that rotation replaced; until this event
+    /// BOTH are expected to be accepting, which is the whole point of
+    /// the grace period — a peer whose cached URI still names the old
+    /// port must be able to connect while its cache expires.
+    RetireOld,
     /// Bind failed at this tick (port range exhausted, all attempts
     /// `EADDRINUSE`, etc.). The OLD listener stays in place and the loop
     /// retries at the next interval; until then existing peers keep
@@ -242,6 +253,21 @@ impl BindFn for DefaultBinder {
 /// `TransportMigrationNotify` payload + pushes it through the session-tx
 /// registry's `send_to_all` path.  Tests pass a closure that records
 /// invocations so the assertion can check (port, count).
+pub trait AdoptFn: Send + Sync + 'static {
+    /// Bind `new_port` and start accepting on it, keeping whatever
+    /// listener is already in service. Returns whether that succeeded:
+    /// `false` means nothing may be advertised for this port.
+    fn adopt(
+        &self,
+        new_port: u16,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'static>>;
+}
+
+/// Trait for the broadcast closure called after a successful rotation
+/// with the freshly-bound port.  In production this constructs a signed
+/// `TransportMigrationNotify` payload + pushes it through the session-tx
+/// registry's `send_to_all` path.  Tests pass a closure that records
+/// invocations so the assertion can check (port, count).
 pub trait BroadcastFn: Send + Sync + 'static {
     fn broadcast(
         &self,
@@ -254,31 +280,47 @@ pub trait BroadcastFn: Send + Sync + 'static {
 /// Lifecycle per tick:
 ///
 /// 1. Sleep `spec.rotation_interval` (interruptible via `shutdown_rx`).
-/// 2. Call `binder.bind(...)`. On error → emit `BindFailed`, skip to
-///    step 1 (the old listener stays live).
-/// 3. Call `broadcaster.broadcast(new_port)`. The broadcaster is
-///    responsible for signing + transmitting the migration notify.
-/// 4. Sleep `spec.grace_period` (interruptible).
-/// 5. Drop the old listener implicitly — the caller owns the swap.
-///    `new_port` is reported through `events_tx` so the caller can pick
-///    it up + replace the listener in whatever wrapper it owns.
+/// 2. Call `binder.bind(...)` to find a free port. On error → emit
+///    `BindFailed`, skip to step 1 (the old listener stays live).
+/// 3. Call `adopter.adopt(new_port)`: the caller binds it for real and
+///    starts accepting, KEEPING the listener already in service. On
+///    `false` → emit `AdoptFailed`, skip to step 1. Nothing has been
+///    advertised, so peers are still holding a URI that works.
+/// 4. Call `broadcaster.broadcast(new_port)` and emit `Rotated`.
+/// 5. Sleep `spec.grace_period` (interruptible), then emit `RetireOld`
+///    so the caller closes the listener rotation replaced.
 ///
 /// The loop exits cleanly when `shutdown_rx` flips to `true`.
 ///
-/// **Why the caller owns the listener swap, not the rotator:** binding +
+/// **Why the adopt comes before the broadcast.** It used to come after
+/// the grace period, and the probe listener from step 2 was dropped the
+/// moment it was bound — so the port in the migration notify was closed
+/// for the whole grace period, 30 minutes by default. Peers cached an
+/// endpoint that refused connections; anything else on the host could
+/// take the freed port in the meantime, and then the caller's real bind
+/// failed and the port stayed dead. A port is advertised now only once
+/// something is accepting on it.
+///
+/// **Why both listeners run through the grace period.** The broadcast is
+/// best-effort and peers cache the old URI for several rotation
+/// intervals, so retiring the old listener at swap time would break
+/// exactly the peers that missed the notify — the case the grace period
+/// exists for. Step 5 is what actually closes it.
+///
+/// **Why the caller owns the listeners, not the rotator:** binding +
 /// broadcasting are stateless side-effects; rebinding the runtime's
 /// task spawner to accept against the NEW listener requires lifecycle
 /// access (tx registry, handshake spawn, etc.) that lives in veilcore.
-/// Returning the new port + binder gives the caller everything it
-/// needs without dragging cross-crate types here.
-pub async fn run_rotation_loop<B, C>(
+pub async fn run_rotation_loop<B, A, C>(
     spec: RotationSpec,
     binder: B,
+    adopter: A,
     broadcaster: C,
     events_tx: tokio::sync::mpsc::Sender<RotationEvent>,
     mut shutdown_rx: watch::Receiver<bool>,
 ) where
     B: BindFn,
+    A: AdoptFn,
     C: BroadcastFn,
 {
     loop {
@@ -307,15 +349,13 @@ pub async fn run_rotation_loop<B, C>(
             .await;
         let new_port = match bind_result {
             Ok((listener, port)) => {
-                // Caller owns the listener post-rotation — drop our
-                // reference so it goes from scope after broadcast/
-                // grace.  Actually we drop it immediately: the
-                // production caller's tx-registry-driven broadcast
-                // includes the listener bind upstream (lifecycle.rs
-                // pulls a fresh listener through here only once and
-                // hands it to its own accept loop). Keeping the
-                // listener inside this loop would orphan a bound
-                // socket every iteration.
+                // The bind was a PROBE: it proves the port is free and
+                // is dropped straight away, because the caller has to
+                // bind the port itself to accept on it. That leaves a
+                // window in which anything on the host could take the
+                // port, which is why `adopt` below is the thing that
+                // decides whether this rotation happened — and why
+                // nothing is advertised before it answers.
                 drop(listener);
                 port
             }
@@ -329,27 +369,40 @@ pub async fn run_rotation_loop<B, C>(
             }
         };
 
-        // Step 3: broadcast the new port.  Caller-supplied closure
-        // does the actual sign+send; we don't observe its outcome
-        // since broadcasts are best-effort (peer may have just
-        // closed the session anyway).
-        broadcaster.broadcast(new_port).await;
+        // Step 3: hand the port over BEFORE anything is advertised. The
+        // caller binds it for real and starts accepting on it alongside
+        // the listener already in service; `false` means it did not, and
+        // then this tick simply did not happen. Peers keep the URI they
+        // hold, which still works, and the next interval tries again.
+        if !adopter.adopt(new_port).await {
+            let _ = events_tx
+                .send(RotationEvent::AdoptFailed {
+                    reason: format!("caller did not come up on port {new_port}"),
+                })
+                .await;
+            continue;
+        }
 
-        // Step 4: grace sleep — let in-flight handshakes finish
-        // against the old listener.  Zero grace = drop immediately;
+        // Step 4: broadcast, now that the port answers.  Caller-supplied
+        // closure does the actual sign+send; we don't observe its outcome
+        // since broadcasts are best-effort (peer may have just closed the
+        // session anyway).
+        broadcaster.broadcast(new_port).await;
+        let _ = events_tx.send(RotationEvent::Rotated { new_port }).await;
+
+        // Step 5: grace sleep — both listeners are accepting throughout,
+        // so a peer connecting on either the cached port or the new one
+        // gets through. Zero grace = retire the old one immediately;
         // valid but typically operators set 30m+.
         if !spec.grace_period.is_zero() {
             tokio::select! {
                 biased;
                 changed = shutdown_rx.changed() => {
                     if changed.is_err() || *shutdown_rx.borrow() {
-                        // Report the rotation as completed even on
-                        // mid-grace shutdown so the caller knows about
-                        // the new port (it'll bind+accept on the next
-                        // startup against whichever listener it owns).
-                        let _ = events_tx
-                            .send(RotationEvent::Rotated { new_port })
-                            .await;
+                        // No RetireOld on the way out: the caller is
+                        // dropping both listeners with the runtime, and
+                        // asking it to close the old one first would only
+                        // shorten the window in which peers can still land.
                         let _ = events_tx.send(RotationEvent::Shutdown).await;
                         return;
                     }
@@ -358,9 +411,8 @@ pub async fn run_rotation_loop<B, C>(
             }
         }
 
-        // Step 5: report.  Caller picks up the new port via events_tx
-        // and swaps its accept-loop against a listener it owns separately.
-        let _ = events_tx.send(RotationEvent::Rotated { new_port }).await;
+        // Step 6: the cached-URI window is over; the old listener can go.
+        let _ = events_tx.send(RotationEvent::RetireOld).await;
     }
 }
 
@@ -562,9 +614,41 @@ mod tests {
         }
     }
 
+    /// Mock adopter. Records what it was handed, answers per script, and
+    /// appends to a log the broadcaster shares — so the ORDER of the two
+    /// is observable, which is the whole property of the reorder.
+    struct MockAdopter {
+        fail_ports: Vec<u16>,
+        order: Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    impl AdoptFn for MockAdopter {
+        fn adopt(
+            &self,
+            new_port: u16,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'static>> {
+            let order = Arc::clone(&self.order);
+            let ok = !self.fail_ports.contains(&new_port);
+            Box::pin(async move {
+                order.lock().unwrap().push(format!("adopt:{new_port}"));
+                ok
+            })
+        }
+    }
+
+    /// An adopter that always comes up, for the tests that are about
+    /// something else.
+    fn adopter_ok() -> MockAdopter {
+        MockAdopter {
+            fail_ports: Vec::new(),
+            order: Arc::new(std::sync::Mutex::new(Vec::new())),
+        }
+    }
+
     /// Mock broadcaster that records the ports it was called with.
     struct MockBroadcaster {
         calls: Arc<std::sync::Mutex<Vec<u16>>>,
+        order: Option<Arc<std::sync::Mutex<Vec<String>>>>,
     }
 
     impl BroadcastFn for MockBroadcaster {
@@ -573,8 +657,12 @@ mod tests {
             new_port: u16,
         ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'static>> {
             let calls = Arc::clone(&self.calls);
+            let order = self.order.clone();
             Box::pin(async move {
                 calls.lock().unwrap().push(new_port);
+                if let Some(o) = order {
+                    o.lock().unwrap().push(format!("broadcast:{new_port}"));
+                }
             })
         }
     }
@@ -596,25 +684,36 @@ mod tests {
         let broadcast_calls = Arc::new(std::sync::Mutex::new(Vec::new()));
         let broadcaster = MockBroadcaster {
             calls: Arc::clone(&broadcast_calls),
+            order: None,
         };
+        let adopter = adopter_ok();
         let bind_calls = Arc::clone(&binder.bind_calls);
 
         let (events_tx, mut events_rx) = mpsc::channel(8);
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
         let handle = tokio::spawn(async move {
-            run_rotation_loop(spec, binder, broadcaster, events_tx, shutdown_rx).await;
+            run_rotation_loop(spec, binder, adopter, broadcaster, events_tx, shutdown_rx).await;
         });
 
-        // Advance to first rotation.
+        // Advance to first rotation. Zero grace, so the old listener is
+        // retired in the same breath — but still AFTER the rotation is
+        // reported, because "retire the old one" only means anything
+        // once something else is serving.
         tokio::time::advance(Duration::from_secs(60)).await;
-        let ev = events_rx.recv().await.unwrap();
-        assert_eq!(ev, RotationEvent::Rotated { new_port: 42424 });
+        assert_eq!(
+            events_rx.recv().await.unwrap(),
+            RotationEvent::Rotated { new_port: 42424 }
+        );
+        assert_eq!(events_rx.recv().await.unwrap(), RotationEvent::RetireOld);
 
         // Advance to second rotation.
         tokio::time::advance(Duration::from_secs(60)).await;
-        let ev = events_rx.recv().await.unwrap();
-        assert_eq!(ev, RotationEvent::Rotated { new_port: 42425 });
+        assert_eq!(
+            events_rx.recv().await.unwrap(),
+            RotationEvent::Rotated { new_port: 42425 }
+        );
+        assert_eq!(events_rx.recv().await.unwrap(), RotationEvent::RetireOld);
 
         assert_eq!(bind_calls.load(Ordering::SeqCst), 2);
         assert_eq!(&*broadcast_calls.lock().unwrap(), &vec![42424, 42425]);
@@ -643,13 +742,15 @@ mod tests {
         let broadcast_calls = Arc::new(std::sync::Mutex::new(Vec::new()));
         let broadcaster = MockBroadcaster {
             calls: Arc::clone(&broadcast_calls),
+            order: None,
         };
+        let adopter = adopter_ok();
 
         let (events_tx, mut events_rx) = mpsc::channel(8);
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
         let handle = tokio::spawn(async move {
-            run_rotation_loop(spec, binder, broadcaster, events_tx, shutdown_rx).await;
+            run_rotation_loop(spec, binder, adopter, broadcaster, events_tx, shutdown_rx).await;
         });
 
         tokio::time::advance(Duration::from_secs(60)).await;
@@ -684,14 +785,16 @@ mod tests {
         };
         let broadcaster = MockBroadcaster {
             calls: Arc::new(std::sync::Mutex::new(Vec::new())),
+            order: None,
         };
+        let adopter = adopter_ok();
         let bind_calls = Arc::clone(&binder.bind_calls);
 
         let (events_tx, mut events_rx) = mpsc::channel(8);
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
         let handle = tokio::spawn(async move {
-            run_rotation_loop(spec, binder, broadcaster, events_tx, shutdown_rx).await;
+            run_rotation_loop(spec, binder, adopter, broadcaster, events_tx, shutdown_rx).await;
         });
 
         // Signal shutdown before any tick fires — loop must exit cleanly.
@@ -706,8 +809,24 @@ mod tests {
         let _ = tokio::time::timeout(Duration::from_secs(1), handle).await;
     }
 
+    /// The grace period must delay the RETIREMENT of the old listener,
+    /// and must not delay the new port going live.
+    ///
+    /// It used to do the opposite, and that was the defect: the probe
+    /// listener was dropped at bind time, the port went into the migration
+    /// notify immediately, and the caller was only told to bind it once the
+    /// grace period was over — 30 minutes by default. For that whole window
+    /// the advertised endpoint refused connections, and anything else on the
+    /// host was free to take the port, after which the caller's bind failed
+    /// and it never came up at all.
+    ///
+    /// Asserted on the CLOCK rather than on "no event yet": the previous
+    /// version of this test advanced time, slept, and called `try_recv`,
+    /// which is empty whenever the loop task has not been polled yet. It
+    /// passed against the reordered loop it was supposed to forbid — it was
+    /// measuring scheduling latency, not the grace period.
     #[tokio::test(start_paused = true)]
-    async fn loop_grace_period_delays_rotated_event() {
+    async fn grace_delays_retiring_the_old_listener_not_the_new_port() {
         let spec = RotationSpec::new(
             "127.0.0.1",
             10000..=60000,
@@ -720,30 +839,114 @@ mod tests {
             results: Arc::new(std::sync::Mutex::new(vec![Ok(50000)])),
             bind_calls: Arc::new(AtomicU32::new(0)),
         };
+        let order = Arc::new(std::sync::Mutex::new(Vec::new()));
         let broadcaster = MockBroadcaster {
             calls: Arc::new(std::sync::Mutex::new(Vec::new())),
+            order: Some(Arc::clone(&order)),
+        };
+        let adopter = MockAdopter {
+            fail_ports: Vec::new(),
+            order: Arc::clone(&order),
+        };
+
+        let (events_tx, mut events_rx) = mpsc::channel(8);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
+        let started = tokio::time::Instant::now();
+        let handle = tokio::spawn(async move {
+            run_rotation_loop(spec, binder, adopter, broadcaster, events_tx, shutdown_rx).await;
+        });
+
+        // Time auto-advances while this awaits, so the arrival time is the
+        // assertion: the rotation is reported at the tick, not a grace later.
+        assert_eq!(
+            events_rx.recv().await.unwrap(),
+            RotationEvent::Rotated { new_port: 50000 }
+        );
+        let at_rotated = started.elapsed();
+        assert!(
+            at_rotated < Duration::from_secs(90),
+            "the new port was only reported after the grace period ({at_rotated:?}) — \
+             it is advertised by then, so it was advertised closed"
+        );
+
+        // And the old listener stays until the grace is actually over.
+        assert_eq!(events_rx.recv().await.unwrap(), RotationEvent::RetireOld);
+        let at_retire = started.elapsed();
+        assert!(
+            at_retire >= at_rotated + Duration::from_secs(30),
+            "the old listener was retired {:?} after the swap, short of the \
+             30s grace — peers still holding the old URI lose their route",
+            at_retire - at_rotated
+        );
+
+        // The port answers before anyone is told about it.
+        assert_eq!(
+            &*order.lock().unwrap(),
+            &vec!["adopt:50000".to_string(), "broadcast:50000".to_string()],
+            "the migration notify must not go out ahead of the bind"
+        );
+
+        let _ = shutdown_tx.send(true);
+        let _ = tokio::time::timeout(Duration::from_secs(1), handle).await;
+    }
+
+    /// A caller that cannot come up on the port must not have it advertised.
+    ///
+    /// The probe bind proves the port was free a moment ago, not that the
+    /// caller holds it: between the probe's `drop` and the caller's own bind
+    /// anything on the host can take it. Broadcasting on the strength of the
+    /// probe is what turned that race into a dead advertised endpoint.
+    #[tokio::test(start_paused = true)]
+    async fn a_port_the_caller_could_not_take_is_never_broadcast() {
+        let spec = RotationSpec::new(
+            "127.0.0.1",
+            10000..=60000,
+            8,
+            Duration::from_secs(60),
+            Duration::ZERO,
+        )
+        .unwrap();
+        let binder = MockBinder {
+            results: Arc::new(std::sync::Mutex::new(vec![Ok(50000), Ok(50001)])),
+            bind_calls: Arc::new(AtomicU32::new(0)),
+        };
+        let broadcast_calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let broadcaster = MockBroadcaster {
+            calls: Arc::clone(&broadcast_calls),
+            order: None,
+        };
+        let adopter = MockAdopter {
+            fail_ports: vec![50000],
+            order: Arc::new(std::sync::Mutex::new(Vec::new())),
         };
 
         let (events_tx, mut events_rx) = mpsc::channel(8);
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
         let handle = tokio::spawn(async move {
-            run_rotation_loop(spec, binder, broadcaster, events_tx, shutdown_rx).await;
+            run_rotation_loop(spec, binder, adopter, broadcaster, events_tx, shutdown_rx).await;
         });
 
-        // Advance to rotation tick (60s) AND wait through the bind +
-        // broadcast.  Event should still be pending due to grace.
-        tokio::time::advance(Duration::from_secs(60)).await;
-        tokio::time::sleep(Duration::from_secs(1)).await; // let task run
-        assert!(
-            events_rx.try_recv().is_err(),
-            "Rotated should not fire until grace period elapses"
+        match events_rx.recv().await.unwrap() {
+            RotationEvent::AdoptFailed { reason } => {
+                assert!(
+                    reason.contains("50000"),
+                    "reason should name the port: {reason}"
+                );
+            }
+            other => panic!("expected AdoptFailed for a port the caller lost, got {other:?}"),
+        }
+        // The tick is a no-op, so the next one rotates normally.
+        assert_eq!(
+            events_rx.recv().await.unwrap(),
+            RotationEvent::Rotated { new_port: 50001 }
         );
-
-        // Advance through grace (30s).
-        tokio::time::advance(Duration::from_secs(31)).await;
-        let ev = events_rx.recv().await.unwrap();
-        assert_eq!(ev, RotationEvent::Rotated { new_port: 50000 });
+        assert_eq!(
+            &*broadcast_calls.lock().unwrap(),
+            &vec![50001],
+            "a port nothing was accepting on was put into a migration notify"
+        );
 
         let _ = shutdown_tx.send(true);
         let _ = tokio::time::timeout(Duration::from_secs(1), handle).await;

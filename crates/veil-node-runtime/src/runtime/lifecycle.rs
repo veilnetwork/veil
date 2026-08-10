@@ -498,9 +498,7 @@ impl NodeRuntime {
         // every one of 8 refused frames, with 0 of 86 delivered in either
         // direction. `local_instance_id` already followed the swap; these are
         // the rest of the same identity and follow it here.
-        if identity_changed
-            && let Some(ratchet) = self.dispatcher.crypto.ratchet.as_ref()
-        {
+        if identity_changed && let Some(ratchet) = self.dispatcher.crypto.ratchet.as_ref() {
             ratchet.adopt_identity(
                 *self.identity.local_identity.node_id.as_bytes(),
                 Arc::clone(&self.identity.mlkem_keys),
@@ -509,9 +507,7 @@ impl NodeRuntime {
                 "node.ratchet.identity_adopted",
                 format!(
                     "ratchet now opens as {}",
-                    veil_util::bytes_to_hex(
-                        &self.identity.local_identity.node_id.as_bytes()[..4]
-                    )
+                    veil_util::bytes_to_hex(&self.identity.local_identity.node_id.as_bytes()[..4])
                 ),
             );
         }
@@ -528,9 +524,7 @@ impl NodeRuntime {
         //
         // The mailbox kept working throughout — it resolves different records —
         // which is exactly why this looked like anything but an identity bug.
-        if identity_changed
-            && let Some(sov) = self.identity.sovereign_identity.get()
-        {
+        if identity_changed && let Some(sov) = self.identity.sovereign_identity.get() {
             let veil_dir_path = self
                 .config_path
                 .parent()

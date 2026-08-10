@@ -1454,9 +1454,6 @@ impl std::fmt::Debug for RatchetRuntime {
 }
 
 impl RatchetRuntime {
-    /// Our half of a conversation, or `None` when this node has no device
-    /// identity to speak as and therefore nothing a peer could address.
-    #[must_use]
     /// Re-point this runtime at the identity now in force.
     ///
     /// A deniable boot runs under a placeholder and is promoted later. Before
@@ -1477,6 +1474,9 @@ impl RatchetRuntime {
             .unwrap_or_else(std::sync::PoisonError::into_inner) = ring;
     }
 
+    /// Our half of a conversation, or `None` when this node has no device
+    /// identity to speak as and therefore nothing a peer could address.
+    #[must_use]
     pub fn identity(&self) -> Option<RatchetIdentity> {
         let instance = (*self
             .local_instance_id
@@ -1690,10 +1690,15 @@ mod tests {
         // constant becomes 1, and a test that adapts to the number it is
         // guarding cannot catch that number being wrong. One lost frame must
         // never cost the conversation, whatever the threshold is set to.
-        assert!(
-            WEDGED_AFTER_FRAME_FAILURES >= 2,
-            "one bad frame has to be forgiven"
-        );
+        //
+        // In a `const` block so it is the BUILD that fails, not this test: a
+        // threshold of 1 is wrong for every caller, not just for this case.
+        const {
+            assert!(
+                WEDGED_AFTER_FRAME_FAILURES >= 2,
+                "one bad frame has to be forgiven"
+            )
+        };
         let f = unopenable_frame_from(&a, &b);
         assert!(matches!(
             open(&b.store, &b.me(), &a.node_id, &f, Some(&a_pk), NOW),
