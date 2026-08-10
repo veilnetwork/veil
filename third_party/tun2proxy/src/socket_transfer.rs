@@ -16,6 +16,19 @@ use tokio::net::{TcpSocket, UdpSocket, UnixDatagram};
 
 const REQUEST_BUFFER_SIZE: usize = 64;
 
+/// Most sockets one [`Request`] may ask the parent to make.
+///
+/// The requester asks for exactly this many and nothing else ever does, so the
+/// ceiling and the request are one number — see `create_socket_queue` in
+/// `lib.rs`.
+///
+/// It is a CEILING because `number` arrives from the namespace child, which is
+/// the less privileged side of this socket. `u32::MAX` used to reach a
+/// `Vec::with_capacity` in the parent (16 GiB of reservation) and then a loop
+/// asking the parent's namespace for four billion sockets. Neither is
+/// something the child is entitled to ask for (report9 V-07).
+pub const MAX_SOCKETS_PER_REQUEST: u32 = 64;
+
 #[derive(bincode::Encode, bincode::Decode, Hash, Copy, Clone, Eq, PartialEq, Debug, Serialize, Deserialize)]
 struct Request {
     protocol: SocketProtocol,
@@ -135,6 +148,11 @@ where
     // Borrow socket as mut to prevent multiple simultaneous requests
     let socket = socket.deref_mut();
 
+    // The same ceiling the parent enforces, applied here so the two sides
+    // agree by construction. `number` sizes two allocations below, and the
+    // parent will not answer with more than this however much is asked.
+    let number = number.min(MAX_SOCKETS_PER_REQUEST);
+
     let mut request = [0u8; 1000];
 
     // Send request
@@ -215,8 +233,20 @@ pub async fn process_socket_requests(socket: &UnixDatagram, shutdown_token: toki
         let size = bincode::encode_into_slice(response, &mut buf, bincode::config::standard())
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
 
-        let mut owned_fd_buf: Vec<OwnedFd> = Vec::with_capacity(request.number as usize);
-        for _ in 0..request.number {
+        // Clamped rather than refused: a response still goes out, so a child
+        // that asked for too much gets what it is entitled to instead of
+        // waiting on a reply that never comes — and the parent's socket
+        // broker keeps serving every other child.
+        let number = request.number.min(MAX_SOCKETS_PER_REQUEST);
+        if number != request.number {
+            log::warn!(
+                "socket_transfer: request for {} sockets clamped to {number} — nothing asks for more",
+                request.number
+            );
+        }
+
+        let mut owned_fd_buf: Vec<OwnedFd> = Vec::with_capacity(number as usize);
+        for _ in 0..number {
             let fd = match request.protocol {
                 SocketProtocol::Tcp => match request.domain {
                     SocketDomain::IpV4 => tokio::net::TcpSocket::new_v4(),
@@ -245,4 +275,54 @@ pub async fn process_socket_requests(socket: &UnixDatagram, shutdown_token: toki
     }
     log::info!("socket_transfer: process_socket_requests exiting");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::net::UdpSocket as TokioUdpSocket;
+
+    /// The parent must not build whatever the child asks it for.
+    ///
+    /// `number` crosses this socket from the namespace child, which is the
+    /// less privileged side. `u32::MAX` reached a `Vec::with_capacity` in the
+    /// parent — sixteen gibibytes of reservation — and then a loop asking the
+    /// parent's own namespace for four billion sockets. The child is not
+    /// entitled to either, and nothing legitimate asks for more than
+    /// `MAX_SOCKETS_PER_REQUEST` (report9 V-07).
+    ///
+    /// Clamped rather than refused, so the reply still goes out: a child that
+    /// overreached gets what it is entitled to instead of blocking on an
+    /// answer that never comes, and the broker keeps serving.
+    #[tokio::test]
+    async fn a_request_past_the_ceiling_is_clamped_not_obeyed() {
+        let (parent, child) = UnixDatagram::pair().expect("socketpair");
+        let token = tokio_util::sync::CancellationToken::new();
+        let server = tokio::spawn({
+            let token = token.clone();
+            async move {
+                let _ = process_socket_requests(&parent, token).await;
+            }
+        });
+
+        let mut child = child;
+        // Asked for through the real client, so the request on the wire is
+        // the one the parent actually parses.
+        let sockets: Vec<TokioUdpSocket> = request_sockets(&mut child, SocketDomain::IpV4, u32::MAX)
+            .await
+            .expect("the broker refused to answer at all");
+
+        assert!(
+            sockets.len() <= MAX_SOCKETS_PER_REQUEST as usize,
+            "the parent handed out {} sockets for one request — the ceiling is {}",
+            sockets.len(),
+            MAX_SOCKETS_PER_REQUEST
+        );
+        // And it answered with something, so the clamp did not turn into a
+        // silent refusal that would hang the child.
+        assert!(!sockets.is_empty(), "the clamp swallowed the request entirely");
+
+        token.cancel();
+        let _ = server.await;
+    }
 }
