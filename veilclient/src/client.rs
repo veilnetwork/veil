@@ -6,7 +6,7 @@ use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{Mutex, mpsc};
 
-use veil_ipc::transport::{self, IpcReadHalf, IpcStream, IpcWriteHalf};
+use veil_ipc::transport::{self, IpcReadHalf, IpcStream};
 use veilcore::proto::{
     AppBindOkPayload, AppBindPayload, AppIpcHelloOkPayload, AppIpcHelloPayload, FrameFamily,
     FrameHeader, IPC_PROTOCOL_VERSION, LocalAppMsg, codec, ipc_bind_flags,
@@ -368,7 +368,29 @@ pub(crate) fn encode_frame_with_id(msg_type: u16, request_id: u32, body: &[u8]) 
     frame
 }
 
-pub(crate) async fn run_writer_task(mut wh: IpcWriteHalf, mut rx: mpsc::Receiver<Vec<u8>>) {
+/// How long one frame may take to reach the local node before the writer
+/// gives up on the connection.
+///
+/// There was no deadline at all, and `write_all` on a peer that has stopped
+/// reading never returns: the task and its socket stayed alive for the life of
+/// the process, long after the client and every handle had gone (report9
+/// V-14). The task cannot simply be aborted when the client drops — the write
+/// half is shared with every `AppHandle`, and some of them outlive it — so the
+/// bound belongs on the write.
+///
+/// Thirty seconds bounds a peer that is WEDGED, not one that is slow: this is
+/// a Unix socket to a node in the same session, and a local node that has not
+/// drained one frame in half a minute is not going to.
+pub(crate) const WRITE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Generic over the write half so the deadline above can be tested against a
+/// writer that never completes — the real one needs a peer that has stopped
+/// reading AND a full kernel buffer, which is not something a test can stage
+/// portably.
+pub(crate) async fn run_writer_task<W: tokio::io::AsyncWrite + Unpin>(
+    mut wh: W,
+    mut rx: mpsc::Receiver<Vec<u8>>,
+) {
     /// Cap on frames drained in one batch — bounds the worst-case syscall
     /// size at writev-style concat and keeps tail-latency for interactive
     /// frames bounded.
@@ -390,16 +412,24 @@ pub(crate) async fn run_writer_task(mut wh: IpcWriteHalf, mut rx: mpsc::Receiver
         }
         let mut failed = false;
         for f in frames {
-            if wh.write_all(&f).await.is_err() {
-                failed = true;
-                break;
+            match tokio::time::timeout(WRITE_DEADLINE, wh.write_all(&f)).await {
+                Ok(Ok(())) => {}
+                // Either the socket errored or the peer stopped reading. Both
+                // mean this connection is finished; holding the task open on
+                // the second is what leaked it.
+                Ok(Err(_)) | Err(_) => {
+                    failed = true;
+                    break;
+                }
             }
         }
         if failed {
             break;
         }
     }
-    let _ = wh.shutdown().await;
+    // Bounded for the same reason: a wedged peer must not hold the task here
+    // either, one line short of releasing the socket.
+    let _ = tokio::time::timeout(WRITE_DEADLINE, wh.shutdown()).await;
 }
 
 /// Connected client session with the local veil node.
@@ -3474,6 +3504,79 @@ pub async fn connect_ipc_any(anchor: &Path) -> Result<IpcStream, ClientError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A write half that accepts nothing, ever — a peer that has stopped
+    /// reading with its buffer full.
+    struct StalledWriter;
+
+    impl tokio::io::AsyncWrite for StalledWriter {
+        fn poll_write(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            _buf: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            std::task::Poll::Pending
+        }
+
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Pending
+        }
+
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Pending
+        }
+    }
+
+    /// The writer must give up on a peer that has stopped reading.
+    ///
+    /// `write_all` had no deadline, so the task and its socket stayed alive
+    /// for the life of the process — long after the client and every handle
+    /// were gone (report9 V-14). Aborting the task on client drop is NOT the
+    /// fix: the write half is shared with `AppHandle`s that outlive it.
+    ///
+    /// Paused clock, so this costs no wall time and still exercises the real
+    /// deadline rather than a shortened one.
+    #[tokio::test(start_paused = true)]
+    async fn the_writer_gives_up_on_a_peer_that_stopped_reading() {
+        let (tx, rx) = mpsc::channel::<Vec<u8>>(4);
+        let task = tokio::spawn(run_writer_task(StalledWriter, rx));
+        tx.send(vec![1, 2, 3]).await.expect("queued");
+        // Held open on purpose: the task must end because the WRITE gave up,
+        // not because the channel closed.
+        let finished = tokio::time::timeout(WRITE_DEADLINE * 3, task).await;
+        assert!(
+            finished.is_ok(),
+            "the writer is still holding the socket for a peer that will \
+             never read it"
+        );
+        drop(tx);
+    }
+
+    /// And a writer whose peer reads keeps going — a deadline that fired on
+    /// everything would pass the test above and break every send.
+    #[tokio::test(start_paused = true)]
+    async fn a_writer_whose_peer_reads_keeps_serving() {
+        let (tx, rx) = mpsc::channel::<Vec<u8>>(4);
+        let (client, mut server) = tokio::io::duplex(64 * 1024);
+        let task = tokio::spawn(run_writer_task(client, rx));
+        tx.send(vec![7, 7, 7]).await.expect("queued");
+        let mut got = [0u8; 3];
+        tokio::io::AsyncReadExt::read_exact(&mut server, &mut got)
+            .await
+            .expect("the frame must arrive");
+        assert_eq!(got, [7, 7, 7]);
+        drop(tx);
+        tokio::time::timeout(WRITE_DEADLINE, task)
+            .await
+            .expect("the task ends when its channel closes")
+            .expect("no panic");
+    }
 
     /// audit cycle-6 (P3 review): consume-one FIFO matching must NOT misroute a
     /// reply. With queue [abandoned_A, live_B], the FIRST StreamOpenOk (which by
