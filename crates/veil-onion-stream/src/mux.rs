@@ -106,6 +106,12 @@ const ACCEPT_BACKLOG: usize = 64;
 type StreamKey = (Peer, u32);
 type Routes = Arc<Mutex<HashMap<StreamKey, mpsc::Sender<Vec<u8>>>>>;
 
+/// How many stream ids `open` tries before taking one anyway.
+///
+/// Only ever more than one after the id space has come round — see the probe
+/// in [`StreamMux::open`].
+const OPEN_ID_PROBES: u32 = 64;
+
 /// Per-peer final delivery models `(btl_bw B/s, rtt_min ms, recorded)` from
 /// closed streams, used to warm-start the next stream's BBR estimator (see
 /// `Config::warm_btl_bw`). The cold estimator climb costs seconds per stream;
@@ -150,6 +156,9 @@ struct MuxDuplex<S: CellSender> {
     routes: Routes,
     bw_cache: BwCache,
     inbound_rx: mpsc::Receiver<Vec<u8>>,
+    /// The sender half this duplex installed under [`Self::key`]. Kept only so
+    /// the drop above can tell its own route from a later generation's.
+    route_tx: mpsc::Sender<Vec<u8>>,
 }
 
 impl<S: CellSender> CellDuplex for MuxDuplex<S> {
@@ -197,10 +206,20 @@ impl<S: CellSender> CellDuplex for MuxDuplex<S> {
 
 impl<S: CellSender> Drop for MuxDuplex<S> {
     fn drop(&mut self) {
-        self.routes
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .remove(&self.key);
+        // Only if the route under this key is still OURS.
+        //
+        // Stream ids repeat: `open` builds them as `(n << 1) | parity` from a
+        // `u32`, so the id space is exhausted after 2^31 opens and the key
+        // comes round again. A blind `remove` then let a stream that had ended
+        // tear down the route of the LIVE stream that had since taken its key —
+        // a stream that never collided with anything itself (report9 V-20).
+        let mut routes = self.routes.lock().unwrap_or_else(|p| p.into_inner());
+        if routes
+            .get(&self.key)
+            .is_some_and(|tx| tx.same_channel(&self.route_tx))
+        {
+            routes.remove(&self.key);
+        }
     }
 }
 
@@ -255,14 +274,33 @@ impl<S: CellSender> StreamMux<S> {
         // Split the id space by node order so this node's opened ids never
         // collide with the peer's opened ids on either side.
         let parity = if self.me < peer.node { 0 } else { 1 };
-        let n = self.next_id.fetch_add(1, Ordering::Relaxed);
-        let sid = (n << 1) | parity;
         let (tx, rx) = mpsc::channel(STREAM_INBOX);
-        let key = (peer.node, sid);
-        self.routes
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .insert(key, tx);
+        // Take a key nothing is routed on. `(n << 1) | parity` from a `u32`
+        // repeats after 2^31 opens, and inserting on top of a live route
+        // silently steals that stream's inbound cells (report9 V-20).
+        //
+        // The accept side already checks before it inserts; only this side
+        // replaced. A probe costs one map lookup and only ever runs twice
+        // after the id space has come round.
+        let mut sid = 0;
+        let mut key = (peer.node, sid);
+        {
+            let mut routes = self.routes.lock().unwrap_or_else(|p| p.into_inner());
+            for _ in 0..OPEN_ID_PROBES {
+                let n = self.next_id.fetch_add(1, Ordering::Relaxed);
+                sid = (n << 1) | parity;
+                key = (peer.node, sid);
+                if !routes.contains_key(&key) {
+                    break;
+                }
+            }
+            // Every probed key is live for this peer, which needs that many
+            // concurrent streams to one peer in exactly this stretch of the id
+            // space. The last candidate is taken anyway: `open` has no way to
+            // refuse, and the drop guard above at least keeps the displaced
+            // stream from tearing down this one on its way out.
+            routes.insert(key, tx.clone());
+        }
         let duplex = MuxDuplex {
             sender: self.sender.clone(),
             peer,
@@ -270,6 +308,7 @@ impl<S: CellSender> StreamMux<S> {
             routes: self.routes.clone(),
             bw_cache: self.bw_cache.clone(),
             inbound_rx: rx,
+            route_tx: tx,
         };
         let cfg = warm_config(self.cfg, &self.bw_cache, peer.node);
         OnionStream::connect(duplex, cfg, sid, initial_seq(sid))
@@ -346,7 +385,7 @@ async fn demux<S: CellSender>(
             routes
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
-                .insert(key, tx);
+                .insert(key, tx.clone());
             let duplex = MuxDuplex {
                 sender: sender.clone(),
                 peer: src,
@@ -354,6 +393,7 @@ async fn demux<S: CellSender>(
                 routes: routes.clone(),
                 bw_cache: bw_cache.clone(),
                 inbound_rx: rx,
+                route_tx: tx,
             };
             // The accept side is the bulk SENDER in a ranged pull (the peer
             // opens a stream and we serve the payload), so it needs the warm
@@ -370,6 +410,86 @@ async fn demux<S: CellSender>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct NoSender;
+
+    impl CellSender for NoSender {
+        async fn send(&self, _dst: Addr, _cell: Vec<u8>) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// A duplex that has ended must not take down the route of the stream that
+    /// has since taken its key.
+    ///
+    /// Stream ids repeat — `(n << 1) | parity` from a `u32` runs out after
+    /// 2^31 opens — so the key comes round while a NEW stream is using it. The
+    /// old duplex's blind `remove` then killed a stream that never collided
+    /// with anything itself (report9 V-20).
+    #[test]
+    fn a_dropped_duplex_does_not_remove_a_newer_streams_route() {
+        let routes: Routes = Arc::new(Mutex::new(HashMap::new()));
+        let bw_cache: BwCache = Arc::new(Mutex::new(HashMap::new()));
+        let peer = Addr {
+            node: [9u8; 32],
+            app: [0u8; 32],
+        };
+        let key = (peer.node, 3u32);
+
+        // The stream that holds the key NOW.
+        let (live_tx, _live_rx) = mpsc::channel::<Vec<u8>>(1);
+        routes.lock().unwrap().insert(key, live_tx.clone());
+
+        // A duplex from an earlier generation on the same key, ending.
+        let (old_tx, old_rx) = mpsc::channel::<Vec<u8>>(1);
+        let stale = MuxDuplex {
+            sender: Arc::new(NoSender),
+            peer,
+            key,
+            routes: routes.clone(),
+            bw_cache,
+            inbound_rx: old_rx,
+            route_tx: old_tx,
+        };
+        drop(stale);
+
+        let held = routes.lock().unwrap();
+        let still = held.get(&key).expect(
+            "the live stream lost its route to a duplex from an earlier \
+             generation of the same id",
+        );
+        assert!(
+            still.same_channel(&live_tx),
+            "the route under this key is no longer the live stream's"
+        );
+    }
+
+    /// And a duplex still holding its own route does remove it — a guard that
+    /// never removed would leak an entry per stream.
+    #[test]
+    fn a_dropped_duplex_removes_its_own_route() {
+        let routes: Routes = Arc::new(Mutex::new(HashMap::new()));
+        let peer = Addr {
+            node: [4u8; 32],
+            app: [0u8; 32],
+        };
+        let key = (peer.node, 5u32);
+        let (tx, rx) = mpsc::channel::<Vec<u8>>(1);
+        routes.lock().unwrap().insert(key, tx.clone());
+        drop(MuxDuplex {
+            sender: Arc::new(NoSender),
+            peer,
+            key,
+            routes: routes.clone(),
+            bw_cache: Arc::new(Mutex::new(HashMap::new())),
+            inbound_rx: rx,
+            route_tx: tx,
+        });
+        assert!(
+            routes.lock().unwrap().get(&key).is_none(),
+            "the duplex left its own route behind"
+        );
+    }
 
     #[test]
     fn warm_config_seeds_from_fresh_cache_only() {
