@@ -223,9 +223,7 @@ impl FrameDispatcher {
                                 veil_util::bytes_to_hex(
                                     &self.crypto.mlkem_keys.current_ratchet_pk()[..4]
                                 ),
-                                veil_util::bytes_to_hex(
-                                    &self.crypto.mlkem_keys.current_ek()[..4]
-                                ),
+                                veil_util::bytes_to_hex(&self.crypto.mlkem_keys.current_ek()[..4]),
                             ) + &format!(
                                 " ratchet-ring pk={} ek={}",
                                 // The ring the RATCHET actually opens with, as
@@ -235,10 +233,16 @@ impl FrameDispatcher {
                                 // promoted, so a difference here means peers
                                 // seal to a key this node cannot decapsulate.
                                 veil_util::bytes_to_hex(
-                                    &ratchet.identity().map(|i| i.seed_ring.current_ratchet_pk()).unwrap_or([0u8; 32])[..4]
+                                    &ratchet
+                                        .identity()
+                                        .map(|i| i.seed_ring.current_ratchet_pk())
+                                        .unwrap_or([0u8; 32])[..4]
                                 ),
                                 veil_util::bytes_to_hex(
-                                    &ratchet.identity().map(|i| i.seed_ring.current_ek()).unwrap_or([0u8; veil_e2e::EK_BYTES])[..4]
+                                    &ratchet
+                                        .identity()
+                                        .map(|i| i.seed_ring.current_ek())
+                                        .unwrap_or([0u8; veil_e2e::EK_BYTES])[..4]
                                 ),
                             ),
                         );
@@ -247,10 +251,7 @@ impl FrameDispatcher {
                         // not open, so without this it keeps sending on a
                         // session no longer at this end and the pair never
                         // recovers. Tell it to start over.
-                        if matches!(
-                            e,
-                            veil_e2e::RatchetSpliceError::WedgedConversationDropped
-                        ) {
+                        if matches!(e, veil_e2e::RatchetSpliceError::WedgedConversationDropped) {
                             return DispatchResult::Response(crate::encode_response(
                                 header,
                                 veil_proto::family::FrameFamily::App as u8,

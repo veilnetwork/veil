@@ -762,7 +762,7 @@ impl NodeRuntime {
             // accept loop.  Capacity 2 gives slack for a rotation event
             // arriving while the loop is still busy with the previous one.
             let (listener_swap_tx, mut listener_swap_rx) =
-                tokio::sync::mpsc::channel::<Box<dyn veil_transport::TransportListener>>(2);
+                tokio::sync::mpsc::channel::<super::ephemeral_rotator::ListenerSwap>(2);
             if let Some(eph) = listen.ephemeral.as_ref() {
                 self.wire_ephemeral_rotator_for_listen(
                     listen.listen_id,
@@ -782,191 +782,237 @@ impl NodeRuntime {
 
             let handle = tokio::spawn(async move {
                 let mut current_listener = listener;
+                // The listener a rotation replaced, still accepting until the
+                // grace period ends. The migration notify is best-effort and
+                // peers cache the old URI for several rotation intervals, so
+                // closing this at swap time would strand exactly the peers the
+                // grace period exists for.
+                let mut retiring: Option<Box<dyn veil_transport::TransportListener>> = None;
                 loop {
-                    tokio::select! {
+                    // The select yields the accept RESULT instead of handling
+                    // it inline, because two branches accept now and they must
+                    // share one handler — which a select arm cannot do.
+                    let raw = tokio::select! {
                         _ = shutdown_rx.changed() => break,
                         // ── Listener swap (Phase 5f Step 3) ────────────
-                        // Rotator-consumer pushes a freshly bound listener
-                        // here.  Replace the current one and loop back; the
-                        // old listener drops here, closing its socket.
-                        // Existing accepted connections (already handed
-                        // off to session-spawn tasks) are unaffected.
-                        Some(new_listener) = listener_swap_rx.recv() => {
-                            let new_addr = new_listener.local_addr();
-                            logger.info(
-                                "listen.swap",
-                                format!(
-                                    "listen_id={listen_id} listener_handle={listener_handle} \
-                                     swapping to new_local_addr={new_addr}",
-                                ),
-                            );
-                            current_listener = new_listener;
-                            // Update the published local_addr on the state
-                            // entry so admin surfaces reflect the new port.
-                            {
-                                let mut state_lock = lock!(state);
-                                if let Some(entry) = state_lock.listens.get_mut(&listen_id) {
-                                    entry.local_addr = Some(new_addr);
+                        // The rotator's consumer drives both halves of a
+                        // rotation through here: `Activate` puts the new
+                        // listener into service ALONGSIDE the old one, and
+                        // `RetireOld` closes the old one a grace period later.
+                        // Existing accepted connections (already handed off to
+                        // session-spawn tasks) are unaffected by either.
+                        Some(msg) = listener_swap_rx.recv() => {
+                            match msg {
+                                super::ephemeral_rotator::ListenerSwap::Activate(
+                                    new_listener,
+                                ) => {
+                                    let new_addr = new_listener.local_addr();
+                                    logger.info(
+                                        "listen.swap",
+                                        format!(
+                                            "listen_id={listen_id} listener_handle={listener_handle} \
+                                             swapping to new_local_addr={new_addr}, old kept until grace",
+                                        ),
+                                    );
+                                    // The old one is not dropped: it moves to
+                                    // `retiring` and keeps answering. Anything
+                                    // already retiring has outlived its own
+                                    // grace by definition, so it goes now.
+                                    retiring =
+                                        Some(std::mem::replace(&mut current_listener, new_listener));
+                                    // Update the published local_addr on the state
+                                    // entry so admin surfaces reflect the new port.
+                                    {
+                                        let mut state_lock = lock!(state);
+                                        if let Some(entry) = state_lock.listens.get_mut(&listen_id) {
+                                            entry.local_addr = Some(new_addr);
+                                        }
+                                    }
+                                }
+                                super::ephemeral_rotator::ListenerSwap::RetireOld => {
+                                    if retiring.take().is_some() {
+                                        logger.info(
+                                            "listen.retire_old",
+                                            format!(
+                                                "listen_id={listen_id} \
+                                                 listener_handle={listener_handle} \
+                                                 grace elapsed, previous listener closed",
+                                            ),
+                                        );
+                                    }
                                 }
                             }
                             continue;
                         }
-                        raw = current_listener.accept_split() => match raw {
-                            Ok(veil_transport::RawInbound { remote_addr, finish }) => {
-                                // cycle-7 H2: `accept_split` returns after only the
-                                // kernel accept; the (attacker-driven) handshake is
-                                // the `finish` future, spawned below behind the
-                                // inbound-handshake semaphore. A stalled/slow client
-                                // therefore occupies ONE bounded handshake slot
-                                // instead of wedging this serial accept loop for the
-                                // whole handshake-timeout window (slowloris HOL DoS).
-                                //
-                                // drop connections from IPs the scanner-shield has
-                                // soft-banned (port scanners, HTTP probes that
-                                // previously sent invalid-magic frames). The peer
-                                // addr is known pre-handshake, so we skip the
-                                // handshake entirely for banned IPs.
-                                let banned_ip = remote_addr
-                                    .map(|sa| sa.ip())
-                                    .filter(|ip| scanner_shield.is_banned(*ip));
-                                if let Some(ip) = banned_ip {
+                        raw = current_listener.accept_split() => raw,
+                        raw = accept_from_retiring(retiring.as_deref()) => raw,
+                    };
+                    match raw {
+                        Ok(veil_transport::RawInbound {
+                            remote_addr,
+                            finish,
+                        }) => {
+                            // cycle-7 H2: `accept_split` returns after only the
+                            // kernel accept; the (attacker-driven) handshake is
+                            // the `finish` future, spawned below behind the
+                            // inbound-handshake semaphore. A stalled/slow client
+                            // therefore occupies ONE bounded handshake slot
+                            // instead of wedging this serial accept loop for the
+                            // whole handshake-timeout window (slowloris HOL DoS).
+                            //
+                            // drop connections from IPs the scanner-shield has
+                            // soft-banned (port scanners, HTTP probes that
+                            // previously sent invalid-magic frames). The peer
+                            // addr is known pre-handshake, so we skip the
+                            // handshake entirely for banned IPs.
+                            let banned_ip = remote_addr
+                                .map(|sa| sa.ip())
+                                .filter(|ip| scanner_shield.is_banned(*ip));
+                            if let Some(ip) = banned_ip {
+                                logger.info(
+                                    "session.accept.scanner_dropped",
+                                    format!(
+                                        "listen_id={} listener_handle={} remote_ip={}",
+                                        listen_id, listener_handle, ip
+                                    ),
+                                );
+                                drop(finish);
+                                continue;
+                            }
+                            // j: demoted to DEBUG. Under sustained
+                            // peer-retry-after-ban patterns this fires ~30/sec on bootstrap;
+                            // operational visibility preserved via
+                            // `veil_inbound_sessions_total` counter.
+                            logger.debug(
+                                "session.accept",
+                                format!(
+                                    "listen_id={} listener_handle={}",
+                                    listen_id, listener_handle
+                                ),
+                            );
+                            // pre-spawn inbound-handshake cap.
+                            // Sem permit MUST be acquired before tokio::spawn so an
+                            // inbound flood cannot exhaust task-allocator/memory
+                            // before the post-handshake `max_concurrent` gate triggers.
+                            // The permit is held across the spawned handshake, so the
+                            // cap now bounds concurrent IN-FLIGHT handshakes directly.
+                            let permit = match Arc::clone(&inbound_sem).try_acquire_owned() {
+                                Ok(p) => p,
+                                Err(_) => {
                                     logger.info(
-                                        "session.accept.scanner_dropped",
+                                        "session.accept.capacity_dropped",
                                         format!(
-                                            "listen_id={} listener_handle={} remote_ip={}",
-                                            listen_id, listener_handle, ip
+                                            "listen_id={} listener_handle={} — \
+                                                 in-flight handshake cap reached, dropping inbound",
+                                            listen_id, listener_handle
                                         ),
                                     );
                                     drop(finish);
                                     continue;
                                 }
-                                // j: demoted to DEBUG. Under sustained
-                                // peer-retry-after-ban patterns this fires ~30/sec on bootstrap;
-                                // operational visibility preserved via
-                                // `veil_inbound_sessions_total` counter.
-                                logger.debug(
-                                    "session.accept",
-                                    format!(
-                                        "listen_id={} listener_handle={}",
-                                        listen_id, listener_handle
+                            };
+                            let ctx = InboundSessionContext {
+                                runtime: SessionRuntimeContext {
+                                    identity: Arc::clone(&identity),
+                                    state: Arc::clone(&state),
+                                    live_sessions: Arc::clone(&live_sessions),
+                                    session_close_generations: Arc::clone(
+                                        &session_close_generations,
                                     ),
-                                );
-                                // pre-spawn inbound-handshake cap.
-                                // Sem permit MUST be acquired before tokio::spawn so an
-                                // inbound flood cannot exhaust task-allocator/memory
-                                // before the post-handshake `max_concurrent` gate triggers.
-                                // The permit is held across the spawned handshake, so the
-                                // cap now bounds concurrent IN-FLIGHT handshakes directly.
-                                let permit = match Arc::clone(&inbound_sem).try_acquire_owned() {
-                                    Ok(p) => p,
-                                    Err(_) => {
-                                        logger.info(
-                                            "session.accept.capacity_dropped",
+                                    event_bus: Arc::clone(&event_bus),
+                                    next_link_id: Arc::clone(&next_link_id),
+                                    logger: Arc::clone(&logger),
+                                    metrics: metrics.clone(),
+                                    dispatcher: Arc::clone(&dispatcher),
+                                    session_registry: Arc::clone(&session_registry),
+                                    session_tx_registry: Arc::clone(&session_tx_registry),
+                                    session_outbox: Arc::clone(&session_outbox),
+                                    anonymity: Arc::clone(&anonymity),
+                                    sessions_per_ip: Arc::clone(&sessions_per_ip),
+                                    scanner_shield: Arc::clone(&scanner_shield),
+                                    defaults: Arc::clone(&defaults_for_listener),
+                                    rtt_table: Arc::clone(&rtt_table_for_probe),
+                                    config_path: config_path_for_listener.clone(),
+                                    mobile: Arc::clone(&mobile),
+                                    resumption: Arc::clone(&resumption_for_listener),
+                                    handoff: Arc::clone(&handoff_for_listener),
+                                    allowed_peer_algos: allowed_peer_algos_for_listener.clone(),
+                                    network_gate: network_gate_for_listener
+                                        .as_ref()
+                                        .map(Arc::clone),
+                                    verified_peer_certs: Arc::clone(
+                                        &verified_peer_certs_for_listener,
+                                    ),
+                                    outbound_connector_refresh: Arc::clone(
+                                        &outbound_connector_refresh,
+                                    ),
+                                },
+                                listen_id,
+                                listener_handle,
+                            };
+                            let pending_accepts_t = Arc::clone(&pending_accepts);
+                            let logger_t = Arc::clone(&logger);
+                            // Spawn the handshake + session off the accept loop.
+                            // `permit` is moved in and held for the whole task, so
+                            // it covers the handshake and auto-drops on exit
+                            // (success / timeout / error), freeing one slot back to
+                            // `inbound_handshake_sem`.
+                            let wrapped = tokio::spawn(async move {
+                                let _permit = permit;
+                                let connection = match finish.await {
+                                    Ok(c) => c,
+                                    Err(e) => {
+                                        // Handshake failure is per-connection — log
+                                        // and drop, never back off the accept loop
+                                        // (a slow/bad client must not slow good ones).
+                                        logger_t.debug(
+                                            "session.handshake_error",
                                             format!(
-                                                "listen_id={} listener_handle={} — \
-                                                 in-flight handshake cap reached, dropping inbound",
-                                                listen_id, listener_handle
+                                                "listen_id={listen_id} \
+                                                     listener_handle={listener_handle} error={e}"
                                             ),
                                         );
-                                        drop(finish);
-                                        continue;
+                                        return;
                                     }
                                 };
-                                let ctx = InboundSessionContext {
-                                    runtime: SessionRuntimeContext {
-                                        identity:            Arc::clone(&identity),
-                                        state:               Arc::clone(&state),
-                                        live_sessions:       Arc::clone(&live_sessions),
-                                        session_close_generations: Arc::clone(&session_close_generations),
-                                        event_bus:           Arc::clone(&event_bus),
-                                        next_link_id:        Arc::clone(&next_link_id),
-                                        logger:              Arc::clone(&logger),
-                                        metrics:             metrics.clone(),
-                                        dispatcher:          Arc::clone(&dispatcher),
-                                        session_registry:    Arc::clone(&session_registry),
-                                        session_tx_registry: Arc::clone(&session_tx_registry),
-                                        session_outbox:      Arc::clone(&session_outbox),
-                                        anonymity: Arc::clone(&anonymity),
-                                        sessions_per_ip:     Arc::clone(&sessions_per_ip),
-                                        scanner_shield:      Arc::clone(&scanner_shield),
-                                        defaults:       Arc::clone(&defaults_for_listener),
-                                        rtt_table: Arc::clone(&rtt_table_for_probe),
-                                        config_path: config_path_for_listener.clone(),
-                                        mobile: Arc::clone(&mobile),
-                                        resumption:    Arc::clone(&resumption_for_listener),
-                                        handoff:            Arc::clone(&handoff_for_listener),
-                                        allowed_peer_algos:             allowed_peer_algos_for_listener.clone(),
-                                        network_gate:           network_gate_for_listener.as_ref().map(Arc::clone),
-                                        verified_peer_certs:    Arc::clone(&verified_peer_certs_for_listener),
-                                        outbound_connector_refresh: Arc::clone(&outbound_connector_refresh),
-                                    },
-                                    listen_id,
-                                    listener_handle,
+                                // Hand the freshly-handshaked connection to a
+                                // waiting reverse-connect acceptor if one is queued.
+                                let connection = if let Some(waiter) =
+                                    pop_accept_waiter(&pending_accepts_t, listen_id)
+                                {
+                                    match waiter.send((listener_handle, connection)) {
+                                        Ok(()) => return,
+                                        Err((_, connection)) => connection,
+                                    }
+                                } else {
+                                    connection
                                 };
-                                let pending_accepts_t = Arc::clone(&pending_accepts);
-                                let logger_t = Arc::clone(&logger);
-                                // Spawn the handshake + session off the accept loop.
-                                // `permit` is moved in and held for the whole task, so
-                                // it covers the handshake and auto-drops on exit
-                                // (success / timeout / error), freeing one slot back to
-                                // `inbound_handshake_sem`.
-                                let wrapped = tokio::spawn(async move {
-                                    let _permit = permit;
-                                    let connection = match finish.await {
-                                        Ok(c) => c,
-                                        Err(e) => {
-                                            // Handshake failure is per-connection — log
-                                            // and drop, never back off the accept loop
-                                            // (a slow/bad client must not slow good ones).
-                                            logger_t.debug(
-                                                "session.handshake_error",
-                                                format!(
-                                                    "listen_id={listen_id} \
-                                                     listener_handle={listener_handle} error={e}"
-                                                ),
-                                            );
-                                            return;
-                                        }
-                                    };
-                                    // Hand the freshly-handshaked connection to a
-                                    // waiting reverse-connect acceptor if one is queued.
-                                    let connection = if let Some(waiter) =
-                                        pop_accept_waiter(&pending_accepts_t, listen_id)
-                                    {
-                                        match waiter.send((listener_handle, connection)) {
-                                            Ok(()) => return,
-                                            Err((_, connection)) => connection,
-                                        }
-                                    } else {
-                                        connection
-                                    };
-                                    let handle = spawn_inbound_session(ctx, connection);
-                                    let _ = handle.await;
-                                });
-                                push_session_handle(&tasks, wrapped);
-                            }
-                            Err(err) => {
-                                logger.warn(
-                                    "listen.accept_error",
-                                    format!(
-                                        "listen_id={} listener_handle={} error={}",
-                                        listen_id, listener_handle, err
-                                    ),
-                                );
-                                // Back off before retrying. `accept()` returns
-                                // PERSISTENT errors under fd exhaustion
-                                // (EMFILE/ENFILE) — it fails instantly and keeps
-                                // failing until fds free up. Without this pause
-                                // the loop would busy-spin at 100% CPU and flood
-                                // the log one line per iteration (exactly the
-                                // failure mode an inbound flood can induce).
-                                // The sibling on-demand accept loop bails on
-                                // error; the main data-plane listener must
-                                // instead recover, so we back off rather than
-                                // break. 100 ms is short enough not to delay
-                                // shutdown materially.
-                                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                            }
+                                let handle = spawn_inbound_session(ctx, connection);
+                                let _ = handle.await;
+                            });
+                            push_session_handle(&tasks, wrapped);
+                        }
+                        Err(err) => {
+                            logger.warn(
+                                "listen.accept_error",
+                                format!(
+                                    "listen_id={} listener_handle={} error={}",
+                                    listen_id, listener_handle, err
+                                ),
+                            );
+                            // Back off before retrying. `accept()` returns
+                            // PERSISTENT errors under fd exhaustion
+                            // (EMFILE/ENFILE) — it fails instantly and keeps
+                            // failing until fds free up. Without this pause
+                            // the loop would busy-spin at 100% CPU and flood
+                            // the log one line per iteration (exactly the
+                            // failure mode an inbound flood can induce).
+                            // The sibling on-demand accept loop bails on
+                            // error; the main data-plane listener must
+                            // instead recover, so we back off rather than
+                            // break. 100 ms is short enough not to delay
+                            // shutdown materially.
+                            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                         }
                     }
                 }
@@ -1022,7 +1068,7 @@ impl NodeRuntime {
         advertise: Option<&str>,
         eph: &veil_cfg::EphemeralConfig,
         listen_ctx: Arc<TransportContext>,
-        listener_swap_tx: tokio::sync::mpsc::Sender<Box<dyn veil_transport::TransportListener>>,
+        listener_swap_tx: tokio::sync::mpsc::Sender<super::ephemeral_rotator::ListenerSwap>,
     ) -> Result<()> {
         // Identity must be Ed25519 — wire frame's sig path uses
         // ed25519-dalek directly.  Fail fast at startup rather than
@@ -1496,6 +1542,48 @@ pub(crate) fn persist_applied_config(
         veil_cfg::save_config(config_path, config)?;
     }
     Ok(())
+}
+
+/// Accept from the listener a rotation replaced, while it is still in
+/// service.
+///
+/// `pending()` when there is none — a select branch that resolved instantly
+/// would spin the accept loop at 100% CPU, which is the same failure the
+/// `accept_split` error arm backs off from.
+async fn accept_from_retiring(
+    listener: Option<&dyn veil_transport::TransportListener>,
+) -> veil_transport::Result<veil_transport::RawInbound> {
+    match listener {
+        Some(l) => l.accept_split().await,
+        None => std::future::pending().await,
+    }
+}
+
+#[cfg(test)]
+mod retiring_listener_tests {
+    use super::accept_from_retiring;
+
+    /// With nothing retiring, the branch must never resolve.
+    ///
+    /// It is one arm of the accept loop's `select!`, so an arm that returns
+    /// immediately is not a wrong answer — it is a loop that spins at 100%
+    /// CPU for as long as no rotation is in flight, which is all of the
+    /// time. The `accept_split` error arm already backs off 100 ms for
+    /// exactly this failure; this arm has no such floor and must not need
+    /// one.
+    #[tokio::test]
+    async fn nothing_retiring_never_resolves() {
+        let elapsed = tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            accept_from_retiring(None),
+        )
+        .await;
+        assert!(
+            elapsed.is_err(),
+            "the retiring-listener branch resolved with no listener behind it — \
+             the accept loop would spin on it"
+        );
+    }
 }
 
 #[cfg(test)]

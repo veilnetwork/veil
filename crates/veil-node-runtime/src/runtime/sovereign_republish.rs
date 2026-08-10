@@ -164,11 +164,9 @@ impl NodeRuntime {
                         let held_ek = veil_util::bytes_to_hex(&ring.current_ek()[..4]);
                         match resolver.resolve_cert(selfcheck_node_id).await {
                             Some(c) => {
-                                let net_pk =
-                                    veil_util::bytes_to_hex(&c.ratchet_x25519_pk[..4]);
-                                let net_ek = veil_util::bytes_to_hex(
-                                    &c.mlkem_ek[..4.min(c.mlkem_ek.len())],
-                                );
+                                let net_pk = veil_util::bytes_to_hex(&c.ratchet_x25519_pk[..4]);
+                                let net_ek =
+                                    veil_util::bytes_to_hex(&c.mlkem_ek[..4.min(c.mlkem_ek.len())]);
                                 let agree = net_pk == held_pk && net_ek == held_ek;
                                 lg.warn(
                                     "node.identity.selfcheck",

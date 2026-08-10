@@ -41,7 +41,7 @@ use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 
 use veil_transport::rotation::{
-    BindFn, BroadcastFn, DefaultBinder, RotationEvent, RotationSpec, run_rotation_loop,
+    AdoptFn, BindFn, BroadcastFn, DefaultBinder, RotationEvent, RotationSpec, run_rotation_loop,
 };
 
 use veil_cfg::EphemeralConfig;
@@ -139,13 +139,109 @@ impl BroadcastFn for SessionTxBroadcaster {
 /// fills, the loop's `events_tx.send(...).await` will park, blocking
 /// subsequent rotations.  64-deep channel matches the bind-retry cap
 /// and is more than sufficient for any realistic rotation cadence.
-pub fn spawn_ephemeral_rotator(
+/// What the rotator's consumer sends to a listener's accept loop.
+///
+/// Two messages rather than one listener, because a rotation is two events
+/// separated by the grace period. `Activate` starts the new port WITHOUT
+/// touching the one in service; `RetireOld` closes the previous one once the
+/// grace period says peers have had time to learn the new URI. Collapsing
+/// them into "here is your new listener" is what made the grace period a
+/// promise the code did not keep.
+pub enum ListenerSwap {
+    /// Accept on this listener from now on, keeping the previous one.
+    Activate(Box<dyn TransportListener>),
+    /// The grace period is over: close the listener `Activate` replaced.
+    RetireOld,
+}
+
+// Hand-written: `TransportListener` is a trait object with no `Debug`
+// bound, and adding one to the trait for a log line is the wrong trade.
+impl std::fmt::Debug for ListenerSwap {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Activate(l) => f.debug_tuple("Activate").field(&l.local_addr()).finish(),
+            Self::RetireOld => f.write_str("RetireOld"),
+        }
+    }
+}
+
+/// Binds a port the rotator has probed free and puts it into service
+/// alongside the listener already accepting.
+///
+/// This runs BEFORE the migration notify goes out, and its answer decides
+/// whether the notify goes out at all — see `run_rotation_loop`. A probe
+/// bind only proves the port was free a moment ago; between the probe's
+/// drop and this bind anything on the host can take it, and a notify sent
+/// on the strength of the probe advertises whatever won that race.
+struct ListenerAdopter {
+    template: TransportUri,
+    host: String,
+    registry: Arc<TransportRegistry>,
+    listen_ctx: Arc<TransportContext>,
+    swap_tx: mpsc::Sender<ListenerSwap>,
+    logger: Arc<NodeLogger>,
+    listen_id: String,
+}
+
+impl AdoptFn for ListenerAdopter {
+    fn adopt(
+        &self,
+        new_port: u16,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'static>> {
+        let template = self.template.clone();
+        let host = self.host.clone();
+        let registry = Arc::clone(&self.registry);
+        let listen_ctx = Arc::clone(&self.listen_ctx);
+        let swap_tx = self.swap_tx.clone();
+        let logger = Arc::clone(&self.logger);
+        let listen_id = self.listen_id.clone();
+        Box::pin(async move {
+            let Some(new_uri) = template.with_host_port(host, new_port) else {
+                logger.warn(
+                    "listen.rotation.uri_compose_failed",
+                    format!("listen_id={listen_id} could not compose new URI for port {new_port}"),
+                );
+                return false;
+            };
+            let new_listener = match registry.bind(&new_uri, listen_ctx).await {
+                Ok(l) => l,
+                Err(e) => {
+                    logger.warn(
+                        "listen.rotation.rebind_failed",
+                        format!(
+                            "listen_id={listen_id} bind({new_uri:?}) failed: {e} \
+                             — old listener kept in service, nothing advertised",
+                        ),
+                    );
+                    return false;
+                }
+            };
+            let local_addr = new_listener.local_addr();
+            if let Err(e) = swap_tx.send(ListenerSwap::Activate(new_listener)).await {
+                logger.warn(
+                    "listen.rotation.swap_send_failed",
+                    format!("listen_id={listen_id} accept loop swap channel closed: {e}"),
+                );
+                return false;
+            }
+            logger.info(
+                "listen.rotation.swap_sent",
+                format!("listen_id={listen_id} new_port={new_port} new_addr={local_addr}"),
+            );
+            true
+        })
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn spawn_ephemeral_rotator<A: AdoptFn>(
     spec: RotationSpec,
     local_node_id: [u8; 32],
     signing_key: SigningKey,
     uri_template: UriTemplate,
     new_expiry_offset: Duration,
     session_tx_registry: Arc<RwLock<SessionTxRegistry>>,
+    adopter: A,
 ) -> (
     JoinHandle<()>,
     mpsc::Receiver<RotationEvent>,
@@ -159,13 +255,15 @@ pub fn spawn_ephemeral_rotator(
         new_expiry_offset,
         session_tx_registry,
         DefaultBinder,
+        adopter,
     )
 }
 
 /// Test-hook variant of the same helper — accepts a custom binder so unit
 /// tests can drive the loop with mocked random-port outcomes without
 /// touching real sockets.
-pub fn spawn_ephemeral_rotator_with_binder<B: BindFn>(
+#[allow(clippy::too_many_arguments)]
+pub fn spawn_ephemeral_rotator_with_binder<B: BindFn, A: AdoptFn>(
     spec: RotationSpec,
     local_node_id: [u8; 32],
     signing_key: SigningKey,
@@ -173,6 +271,7 @@ pub fn spawn_ephemeral_rotator_with_binder<B: BindFn>(
     new_expiry_offset: Duration,
     session_tx_registry: Arc<RwLock<SessionTxRegistry>>,
     binder: B,
+    adopter: A,
 ) -> (
     JoinHandle<()>,
     mpsc::Receiver<RotationEvent>,
@@ -188,7 +287,7 @@ pub fn spawn_ephemeral_rotator_with_binder<B: BindFn>(
         new_expiry_offset,
     };
     let handle = tokio::spawn(async move {
-        run_rotation_loop(spec, binder, broadcaster, events_tx, shutdown_rx).await;
+        run_rotation_loop(spec, binder, adopter, broadcaster, events_tx, shutdown_rx).await;
     });
     (handle, events_rx, shutdown_tx)
 }
@@ -235,7 +334,7 @@ pub fn wire_ephemeral_rotator(
     session_tx_registry: Arc<RwLock<SessionTxRegistry>>,
     registry: Arc<TransportRegistry>,
     listen_ctx: Arc<TransportContext>,
-    listener_swap_tx: mpsc::Sender<Box<dyn TransportListener>>,
+    listener_swap_tx: mpsc::Sender<ListenerSwap>,
     logger: Arc<NodeLogger>,
     listen_id_for_log: String,
 ) -> Result<EphemeralRotatorHandles, String> {
@@ -282,6 +381,19 @@ pub fn wire_ephemeral_rotator(
     // (say) 3 consecutive migration notifies still has a usable URI
     // until the operator's next rotation.
     let new_expiry_offset = rotation.saturating_mul(4);
+    let listen_id = listen_id_for_log;
+    // The adopter is what makes the port real. It runs inside the rotation
+    // loop ahead of the broadcast, so a port nothing came up on is never
+    // advertised — see `run_rotation_loop`.
+    let adopter = ListenerAdopter {
+        template: template_source,
+        host: template_host,
+        registry,
+        listen_ctx,
+        swap_tx: listener_swap_tx.clone(),
+        logger: Arc::clone(&logger),
+        listen_id: listen_id.clone(),
+    };
     let (rotator_handle, mut events_rx, shutdown_tx) = spawn_ephemeral_rotator(
         spec,
         local_node_id,
@@ -289,56 +401,45 @@ pub fn wire_ephemeral_rotator(
         uri_template,
         new_expiry_offset,
         session_tx_registry,
+        adopter,
     );
 
-    // ── consumer task: rebind + push to accept loop ────────────────
-    let template_for_rebind = template_source;
-    let host_for_rebind = template_host;
-    let listen_id = listen_id_for_log;
+    // ── consumer task: log the lifecycle, retire the old listener ──
+    // The rebind moved into the adopter above, because it has to happen
+    // BEFORE the broadcast. What is left here is the other end of the grace
+    // period: closing the listener the rotation replaced, and not a moment
+    // earlier — peers cache the old URI for several rotation intervals, and
+    // the ones that missed the notify are exactly who the grace is for.
     let consumer = tokio::spawn(async move {
         while let Some(ev) = events_rx.recv().await {
             match ev {
                 RotationEvent::Rotated { new_port } => {
-                    let Some(new_uri) =
-                        template_for_rebind.with_host_port(host_for_rebind.clone(), new_port)
-                    else {
+                    logger.info(
+                        "listen.rotation.rotated",
+                        format!(
+                            "listen_id={listen_id} new_port={new_port} — both listeners \
+                             accepting until the grace period ends",
+                        ),
+                    );
+                }
+                RotationEvent::RetireOld => {
+                    if listener_swap_tx
+                        .send(ListenerSwap::RetireOld)
+                        .await
+                        .is_err()
+                    {
                         logger.warn(
-                            "listen.rotation.uri_compose_failed",
-                            format!(
-                                "listen_id={listen_id} could not compose new URI for port {new_port}",
-                            ),
+                            "listen.rotation.retire_send_failed",
+                            format!("listen_id={listen_id} accept loop swap channel closed"),
                         );
-                        continue;
-                    };
-                    match registry.bind(&new_uri, Arc::clone(&listen_ctx)).await {
-                        Ok(new_listener) => {
-                            let local_addr = new_listener.local_addr();
-                            if let Err(e) = listener_swap_tx.send(new_listener).await {
-                                logger.warn(
-                                    "listen.rotation.swap_send_failed",
-                                    format!(
-                                        "listen_id={listen_id} accept loop swap channel closed: {e}",
-                                    ),
-                                );
-                                break;
-                            }
-                            logger.info(
-                                "listen.rotation.swap_sent",
-                                format!(
-                                    "listen_id={listen_id} new_port={new_port} new_addr={local_addr}",
-                                ),
-                            );
-                        }
-                        Err(e) => {
-                            logger.warn(
-                                "listen.rotation.rebind_failed",
-                                format!(
-                                    "listen_id={listen_id} bind({new_uri:?}) failed: {e} \
-                                     — old listener kept in service",
-                                ),
-                            );
-                        }
+                        break;
                     }
+                }
+                RotationEvent::AdoptFailed { reason } => {
+                    logger.warn(
+                        "listen.rotation.adopt_failed",
+                        format!("listen_id={listen_id} reason={reason}"),
+                    );
                 }
                 RotationEvent::BindFailed { reason } => {
                     logger.warn(
@@ -373,6 +474,21 @@ mod tests {
 
     /// Scripted binder used by the wire-level test below — returns one
     /// port in order then errors thereafter.
+    /// Adopter for tests that are about the rotator, not the listener: it
+    /// answers "yes, I came up" without binding anything. Tests that care
+    /// whether the port is really taken drive `run_rotation_loop` directly
+    /// (see `veil_transport::rotation`).
+    struct AlwaysAdopts;
+
+    impl AdoptFn for AlwaysAdopts {
+        fn adopt(
+            &self,
+            _new_port: u16,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'static>> {
+            Box::pin(async { true })
+        }
+    }
+
     struct ScriptedBinder {
         ports: Arc<StdMutex<Vec<u16>>>,
         calls: Arc<AtomicU32>,
@@ -454,6 +570,7 @@ mod tests {
             Duration::from_secs(3600),
             Arc::clone(&registry),
             binder,
+            AlwaysAdopts,
         );
 
         // Wait for `Rotated` on the real clock — interval is 50ms.
@@ -535,6 +652,7 @@ mod tests {
             Duration::from_secs(3600),
             Arc::clone(&registry),
             binder,
+            AlwaysAdopts,
         );
 
         let ev = tokio::time::timeout(Duration::from_secs(5), events_rx.recv())
