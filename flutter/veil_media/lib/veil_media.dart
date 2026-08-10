@@ -19,6 +19,7 @@ import 'dart:typed_data';
 
 import 'package:ffi/ffi.dart';
 
+import 'src/i420.dart';
 import 'src/bindings.dart' as ffi;
 
 /// An enumerated audio device.
@@ -248,6 +249,14 @@ class VeilMediaEngine {
   bool pushVideoFrame(
       Uint8List y, Uint8List u, Uint8List v, int width, int height) {
     _ensure();
+    // The plane lengths must supply what the geometry below declares. The C
+    // ABI takes pointers and no lengths, so this is the last place the two can
+    // be reconciled; short planes are an out-of-bounds read in the encoder
+    // (report9 V-08). `pushAndroid420Frame` has checked since it was written —
+    // these tightly-packed paths had not.
+    if (!i420PlanesFit(y.length, u.length, v.length, width, height)) {
+      return false;
+    }
     final total = y.length + u.length + v.length;
     if (total <= 0) return false;
     if (_pushBuf == null || _pushCap < total) {
@@ -609,6 +618,14 @@ class VeilGroupMediaEngine {
     int height,
   ) {
     _ensure();
+    // The plane lengths must supply what the geometry below declares. The C
+    // ABI takes pointers and no lengths, so this is the last place the two can
+    // be reconciled; short planes are an out-of-bounds read in the encoder
+    // (report9 V-08). `pushAndroid420Frame` has checked since it was written —
+    // these tightly-packed paths had not.
+    if (!i420PlanesFit(y.length, u.length, v.length, width, height)) {
+      return false;
+    }
     final total = y.length + u.length + v.length;
     if (total <= 0) return false;
     if (_pushBuf == null || _pushCap < total) {
@@ -884,6 +901,14 @@ class VeilVnoteRecorder {
   /// Push one tightly-packed I420 frame (the Android Dart capturer path).
   bool pushFrame(Uint8List y, Uint8List u, Uint8List v, int width, int height) {
     if (!_alive) return false;
+    // The plane lengths must supply what the geometry below declares. The C
+    // ABI takes pointers and no lengths, so this is the last place the two can
+    // be reconciled; short planes are an out-of-bounds read in the encoder
+    // (report9 V-08). `pushAndroid420Frame` has checked since it was written —
+    // these tightly-packed paths had not.
+    if (!i420PlanesFit(y.length, u.length, v.length, width, height)) {
+      return false;
+    }
     final total = y.length + u.length + v.length;
     if (total <= 0) return false;
     if (_pushBuf == null || _pushCap < total) {

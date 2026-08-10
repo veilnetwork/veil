@@ -44,10 +44,15 @@ ssl/cert.pem
 # resolve fresh).  veil_flutter is a plugin library.
 flutter/veil_flutter/pubspec.lock
 flutter/veil_flutter/example/pubspec.lock
+# veil_media is one too. The entry was missing only because nothing had run
+# `flutter test` in it before, which is how a lock file and a build/ tree
+# turned up as untracked the first time something did.
+flutter/veil_media/pubspec.lock
 
 # Flutter build output (apk/aar/ios staging artefacts).
 flutter/veil_flutter/build/
 flutter/veil_flutter/example/build/
+flutter/veil_media/build/
 
 # cycle-7 audit (2026-05-31): stray local build artefacts that landed in the
 # repo root (ad-hoc `rustc -o rust_out` / piped builds + a generated `doc/`
