@@ -195,7 +195,9 @@ where
 
             macro_rules! create_socket_queue {
                 ($domain:ident) => {{
-                    const SOCKETS_PER_REQUEST: usize = 64;
+                    // The parent enforces this same number as a ceiling.
+                    const SOCKETS_PER_REQUEST: usize =
+                        crate::socket_transfer::MAX_SOCKETS_PER_REQUEST as usize;
 
                     let socket = socket.clone();
                     let (tx, rx) = channel(SOCKETS_PER_REQUEST);
