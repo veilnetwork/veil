@@ -3185,6 +3185,7 @@ impl SessionRunner {
             .send_pending_session_ticket(&wire_tx, &mut write_error_count)
             .is_err()
         {
+            Self::stop_writer(wire_tx, &mut writer_handle).await;
             return;
         }
 
@@ -3320,6 +3321,7 @@ impl SessionRunner {
                     && let std::ops::ControlFlow::Break(()) =
                         self.drain_outbox_into_pq(outbox, &mut pq, &mut timers)
                 {
+                    Self::stop_writer(wire_tx, &mut writer_handle).await;
                     return;
                 }
                 if let Some(ref mut rpc_outbox) = rpc_outbox {
@@ -3334,6 +3336,7 @@ impl SessionRunner {
                             "session.idle_timeout",
                             format!("peer_id={}", hex_short(&self.peer_id)),
                         );
+                        Self::stop_writer(wire_tx, &mut writer_handle).await;
                         return;
                     }
                     // Hard liveness-ceiling backstop (M5 zombie reaper). When a
@@ -3359,6 +3362,7 @@ impl SessionRunner {
                                 hex_short(&self.peer_id),
                             ),
                         );
+                        Self::stop_writer(wire_tx, &mut writer_handle).await;
                         return;
                     }
                     // stage (c.2): proactive rx-stall trigger.
@@ -3504,6 +3508,7 @@ impl SessionRunner {
                                         KEEPALIVE_SWAP_ATTEMPT_CEILING,
                                     ),
                                 );
+                                Self::stop_writer(wire_tx, &mut writer_handle).await;
                                 return;
                             }
                         }
@@ -3751,6 +3756,7 @@ impl SessionRunner {
                             .and_then(|n| encrypted_batch_wire_len.checked_add(n))
                         else {
                             self.on_primary_write_error(&mut write_error_count);
+                            Self::stop_writer(wire_tx, &mut writer_handle).await;
                             return;
                         };
                         encrypted_batch_wire_len = next_len;
@@ -3767,6 +3773,7 @@ impl SessionRunner {
                             Err(mpsc::error::TrySendError::Full(_)) => continue,
                             Err(mpsc::error::TrySendError::Closed(_)) => {
                                 self.on_primary_write_error(&mut write_error_count);
+                                Self::stop_writer(wire_tx, &mut writer_handle).await;
                                 return;
                             }
                         }
@@ -3794,7 +3801,11 @@ impl SessionRunner {
                     for frame in encrypted_batch_frames {
                         let enc = match apply_tx_cipher(&frame, cipher) {
                             Some(enc) => enc,
-                            None => return, // cipher/header error — close session
+                            None => {
+                                // cipher/header error — close session
+                                Self::stop_writer(wire_tx, &mut writer_handle).await;
+                                return;
+                            }
                         };
                         encrypted_batch.extend_from_slice(&enc);
                     }
@@ -3810,6 +3821,7 @@ impl SessionRunner {
                         // an invariant broke); encrypted frames cannot be
                         // dropped without desynchronising the session cipher.
                         self.on_primary_write_error(&mut write_error_count);
+                        Self::stop_writer(wire_tx, &mut writer_handle).await;
                         return;
                     }
                     if let Some(m) = &self.metrics {
@@ -3962,6 +3974,7 @@ impl SessionRunner {
                             // Graceful close: just return from `run`.
                             // The caller cleans up.  Pre-Q.7 behaviour
                             // preserved bit-for-bit.
+                            Self::stop_writer(wire_tx, &mut writer_handle).await;
                             return;
                         }
                         // Evict expired RPC slots so they don't
@@ -4004,6 +4017,7 @@ impl SessionRunner {
                                 error,
                             ),
                         );
+                        Self::stop_writer(wire_tx, &mut writer_handle).await;
                         return;
                     }
                     NextInput::WriterClosed => {
@@ -4020,6 +4034,7 @@ impl SessionRunner {
                             ),
                         );
                         let _ = self.fire_hot_standby_trigger("writer_closed");
+                        Self::stop_writer(wire_tx, &mut writer_handle).await;
                         return;
                     }
                 }
@@ -4263,7 +4278,10 @@ impl SessionRunner {
                             &mut write_error_count,
                         ) {
                             std::ops::ControlFlow::Continue(()) => continue,
-                            std::ops::ControlFlow::Break(()) => return,
+                            std::ops::ControlFlow::Break(()) => {
+                                Self::stop_writer(wire_tx, &mut writer_handle).await;
+                                return;
+                            }
                         }
                     }
                     Ok(SessionMsg::RekeyAck) => {
@@ -4271,7 +4289,10 @@ impl SessionRunner {
                         // ephemeral is non-contributory (downgrade attempt).
                         match self.handle_rekey_ack_arm(body, &mut rekey, &mut rx_cipher_prev) {
                             std::ops::ControlFlow::Continue(()) => continue,
-                            std::ops::ControlFlow::Break(()) => return,
+                            std::ops::ControlFlow::Break(()) => {
+                                Self::stop_writer(wire_tx, &mut writer_handle).await;
+                                return;
+                            }
                         }
                     }
                     Ok(SessionMsg::RekeyKeptInit) => {
@@ -4287,7 +4308,10 @@ impl SessionRunner {
                         match self.handle_mlkem_rekey_ek_arm(body, &wire_tx, &mut write_error_count)
                         {
                             std::ops::ControlFlow::Continue(()) => continue,
-                            std::ops::ControlFlow::Break(()) => return,
+                            std::ops::ControlFlow::Break(()) => {
+                                Self::stop_writer(wire_tx, &mut writer_handle).await;
+                                return;
+                            }
                         }
                     }
                     Ok(SessionMsg::MlKemRekeyAck) => {
@@ -4457,8 +4481,33 @@ impl SessionRunner {
         // FIN) before run returns and the session-glue layer drops
         // its frame of reference. Best-effort: timeout if writer has
         // its own pathology, since we don't want to leak run callers.
+        Self::stop_writer(wire_tx, &mut writer_handle).await;
+    }
+
+    /// Close the wire channel and wait for the writer task, then make sure it
+    /// is gone either way.
+    ///
+    /// Dropping `wire_tx` is what lets the writer drain what is queued, shut
+    /// its write half and resolve, so the peer sees a clean FIN. The bound is
+    /// there because a writer with its own pathology must not hold `run`'s
+    /// caller; the abort is there because a bound that merely stops WAITING
+    /// leaves the task running, which is the leak it was supposed to prevent.
+    ///
+    /// Called on every exit from the session loop — the ordinary one and each
+    /// early return. Eleven of those returns used to skip it entirely, leaving
+    /// the writer task and the socket write half alive with nobody holding a
+    /// handle to them (report9 V-12).
+    async fn stop_writer(
+        wire_tx: mpsc::Sender<veil_bufpool::PooledShared>,
+        writer_handle: &mut tokio::task::JoinHandle<()>,
+    ) {
         drop(wire_tx);
-        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), writer_handle).await;
+        if tokio::time::timeout(std::time::Duration::from_secs(5), &mut *writer_handle)
+            .await
+            .is_err()
+        {
+            writer_handle.abort();
+        }
     }
 
     fn record_violation(&self, reason: &str) {
