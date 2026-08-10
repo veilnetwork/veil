@@ -1319,7 +1319,7 @@ int veil_media_group_engine_remove_peer(VeilGroupMediaEngine* engine,
   ws->fanout->Remove(peer->chan);
   peer->shim->SetRemoteVideoSsrc(0);
   peer->shim->Stop();
-  run_on(ws->worker_tq.get(), [&]() {
+  const bool torn_down = run_on(ws->worker_tq.get(), [&]() {
     stop_group_peer_video(ws, peer);
     if (peer->recv_stream) {
       peer->recv_stream->Stop();
@@ -1327,6 +1327,20 @@ int veil_media_group_engine_remove_peer(VeilGroupMediaEngine* engine,
       peer->recv_stream = nullptr;
     }
   });
+  if (!torn_down) {
+    // The worker queue never scheduled, so the receive streams are still
+    // live — and `peer->shim` is the transport they were configured with
+    // (`rc.rtcp_send_transport`). Erasing the peer here destroys that shim
+    // underneath streams that still hold it: the exact use-after-free the
+    // result of `run_on` exists to report (report9 V-02).
+    //
+    // The peer stays, which is the truth: its streams are still in the Call.
+    // `fanout->Remove` and `shim->Stop()` above already stopped delivery, and
+    // both are idempotent, so a later attempt picks up where this left off.
+    vlog("group media: remove peer DEFERRED — worker queue did not schedule; "
+         "the peer keeps its streams and its transport");
+    return VEIL_MEDIA_ERR_STATE;
+  }
   ws->peers.erase(it);
   vlog("group media: remove peer peers=%zu", ws->peers.size());
 #endif
