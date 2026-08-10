@@ -608,6 +608,24 @@ impl AnycastService {
         // hot-tier `inserted_at` via `get_local_with_meta`, compute
         // age, and drop records where `age >= record.ttl`.  No wire
         // change — the `ttl` field always existed in the record.
+        //
+        // HOW FAR THAT GOES, and it is less far than it reads (report9 V-06).
+        // `inserted_at` belongs to the BLOB, and every provider for a service
+        // tag shares it: an advertise is a read-modify-write of the whole
+        // `AnycastList`, so any provider's refresh restarts the clock for
+        // every record in it. A provider that departs is therefore held for
+        // its TTL after the LAST write by ANYONE, not after its own — which
+        // for a busy tag is indefinitely. The blackhole is narrowed, not
+        // closed; it is closed only for a tag with one publisher.
+        //
+        // It cannot be closed from this side. A record carries no timestamp,
+        // `upsert` replaces it in place, and Ed25519 over identical fields is
+        // deterministic — a provider refreshing produces byte-identical
+        // bytes, so nothing observable here separates "still publishing" from
+        // "left behind". A signed per-record `issued_at`, or one DHT key per
+        // provider, is what closes it. `v06_a_departed_provider_still_
+        // outlives_its_ttl` pins the current behaviour and fails the day
+        // either lands.
         let entry = self.dht.get_local_with_meta(&key);
         let now = std::time::Instant::now();
         // (node_id, effective_score) — effective_score = peer-claimed score
@@ -1027,6 +1045,63 @@ mod tests {
             expired.node_ids.len(),
             0,
             "expired record must be filtered out"
+        );
+    }
+
+    /// report9 V-06 — the per-record TTL is enforced against a clock the
+    /// records SHARE, and this pins the consequence until the format can fix
+    /// it.
+    ///
+    /// Every provider for a service tag lives in one `AnycastList` under one
+    /// DHT key, and an advertise is a read-modify-write of that whole blob.
+    /// The store stamps `inserted_at` on the BLOB, so any provider's
+    /// re-advertise restarts the TTL clock for every other record in it —
+    /// including one belonging to a provider that departed and will never
+    /// publish again. That is the blackhole the per-record TTL was added to
+    /// stop. `resolve_drops_records_past_their_ttl` above does not see it
+    /// because it has a single advertiser, which is the one arrangement where
+    /// a shared clock is the right clock.
+    ///
+    /// **Why this asserts the WRONG behaviour.** Closing it locally is not
+    /// possible: a record carries no timestamp, `upsert` replaces it in place,
+    /// and Ed25519 over identical fields is deterministic — so a provider
+    /// refreshing its advertisement produces BYTE-IDENTICAL bytes. Nothing a
+    /// resolver can observe distinguishes "still here, republishing" from
+    /// "gone, left behind by someone else's write". The fix is a signed
+    /// per-record `issued_at`, or one DHT key per provider; both are wire
+    /// changes.
+    ///
+    /// So this runs as a tripwire rather than sitting in a report. **If it
+    /// starts failing, the defect is fixed** — invert the assertion to expect
+    /// one candidate and delete this paragraph.
+    #[test]
+    fn v06_a_departed_provider_still_outlives_its_ttl() {
+        let dht = Arc::new(KademliaService::new([0xE3; 32]));
+        let leaving = AnycastService::new(Arc::clone(&dht), [0xE3; 32])
+            .with_policy(AnycastResolvePolicy::BestEffort);
+        let staying = AnycastService::new(Arc::clone(&dht), [0xE4; 32])
+            .with_policy(AnycastResolvePolicy::BestEffort);
+
+        leaving.advertise(*b"ttl2", 7, 1); // 1 s record TTL, then departs
+        staying.advertise(*b"ttl2", 7, 60);
+        assert_eq!(leaving.resolve(*b"ttl2", 8).node_ids.len(), 2);
+
+        // Past the departed provider's TTL, and the one still here republishes
+        // as it would on any refresh interval.
+        std::thread::sleep(std::time::Duration::from_millis(1200));
+        staying.advertise(*b"ttl2", 7, 60);
+
+        let ids = leaving.resolve(*b"ttl2", 8).node_ids;
+        assert_eq!(
+            ids.len(),
+            2,
+            "only one candidate came back, so the shared TTL clock is gone — \
+             report9 V-06 is fixed and this test now asserts the wrong thing"
+        );
+        assert!(
+            ids.contains(&[0xE3; 32]),
+            "the departed provider is the one that must still be here for this \
+             to be the V-06 case at all"
         );
     }
 
