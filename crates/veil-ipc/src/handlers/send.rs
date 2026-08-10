@@ -332,9 +332,7 @@ pub(crate) struct IpcSendContext {
     pub(crate) capture_tx: Option<
         Arc<Mutex<Option<tokio::sync::broadcast::Sender<veil_dispatcher_state::CaptureEvent>>>>,
     >,
-    pub(crate) pending_recursive: Option<
-        Arc<Mutex<std::collections::HashMap<[u8; 16], veil_dispatcher_state::PendingRecursive>>>,
-    >,
+    pub(crate) pending_recursive: Option<veil_dispatcher_state::PendingRecursiveMap>,
     /// Trace sampling rate.
     pub(crate) trace_sample_rate: f64,
     /// Pending-ACK tracker.
@@ -1597,9 +1595,7 @@ mod ratchet_send_tests {
             IpcSendContext {
                 app_registry: Arc::clone(&self.registry),
                 local_node_id: ME,
-                session_tx_registry: Some(
-                    Arc::clone(&self.outbox) as Arc<dyn FrameBroadcaster>
-                ),
+                session_tx_registry: Some(Arc::clone(&self.outbox) as Arc<dyn FrameBroadcaster>),
                 route_cache: Some(Arc::clone(&self.route_cache)),
                 route_updated: None,
                 peer_mlkem_keys: Some(Arc::clone(&self.peer_mlkem)),
@@ -1660,7 +1656,8 @@ mod ratchet_send_tests {
     async fn a_direct_session_send_goes_out_through_the_ratchet() {
         let fx = fixture(vec![PEER, RELAY]);
         let mut wh = sink().await;
-        handle_ipc_send(&mut SendReply::Inline(&mut wh),
+        handle_ipc_send(
+            &mut SendReply::Inline(&mut wh),
             &payload(false, b"hello over a session"),
             &fx.ctx(true),
         )
@@ -1705,9 +1702,13 @@ mod ratchet_send_tests {
     async fn without_the_ratchet_a_direct_session_send_is_unchanged() {
         let fx = fixture(vec![PEER, RELAY]);
         let mut wh = sink().await;
-        handle_ipc_send(&mut SendReply::Inline(&mut wh), &payload(false, b"plain"), &fx.ctx(false))
+        handle_ipc_send(
+            &mut SendReply::Inline(&mut wh),
+            &payload(false, b"plain"),
+            &fx.ctx(false),
+        )
         .await
-            .expect("send");
+        .expect("send");
 
         let sent = fx.taken();
         assert_eq!(sent.len(), 1);
@@ -1723,7 +1724,8 @@ mod ratchet_send_tests {
     async fn a_relayed_send_carries_the_ratchet_payload() {
         let fx = fixture(vec![RELAY]); // no direct session to PEER
         let mut wh = sink().await;
-        handle_ipc_send(&mut SendReply::Inline(&mut wh),
+        handle_ipc_send(
+            &mut SendReply::Inline(&mut wh),
             &payload(false, b"through a relay"),
             &fx.ctx(true),
         )
@@ -1758,7 +1760,8 @@ mod ratchet_send_tests {
     async fn an_anonymous_send_stays_on_the_anonymous_path_and_stays_anonymous() {
         let fx = fixture(vec![RELAY]);
         let mut wh = sink().await;
-        handle_ipc_send(&mut SendReply::Inline(&mut wh),
+        handle_ipc_send(
+            &mut SendReply::Inline(&mut wh),
             &payload(true, b"anonymously yours"),
             &fx.ctx(true),
         )
@@ -1793,9 +1796,13 @@ mod ratchet_send_tests {
     async fn a_fallback_from_direct_to_relay_seals_once() {
         let fx = fixture(vec![RELAY]);
         let mut wh = sink().await;
-        handle_ipc_send(&mut SendReply::Inline(&mut wh), &payload(false, b"once"), &fx.ctx(true))
+        handle_ipc_send(
+            &mut SendReply::Inline(&mut wh),
+            &payload(false, b"once"),
+            &fx.ctx(true),
+        )
         .await
-            .expect("send");
+        .expect("send");
         assert_eq!(
             fx.me.store.version(),
             1,
@@ -1813,9 +1820,13 @@ mod ratchet_send_tests {
         assert_eq!(fx.me.store.version(), 0);
         assert!(fx.me.store.drain_dirty().is_empty());
 
-        handle_ipc_send(&mut SendReply::Inline(&mut wh), &payload(false, b"one"), &fx.ctx(true))
+        handle_ipc_send(
+            &mut SendReply::Inline(&mut wh),
+            &payload(false, b"one"),
+            &fx.ctx(true),
+        )
         .await
-            .expect("send");
+        .expect("send");
         assert_eq!(fx.me.store.version(), 1);
         let dirty = fx.me.store.drain_dirty();
         assert_eq!(dirty.len(), 1);
@@ -1823,9 +1834,13 @@ mod ratchet_send_tests {
         assert_eq!(dirty[0].peer_instance_id, PEER_INSTANCE);
         assert_eq!(dirty[0].local_instance_id, MY_INSTANCE);
 
-        handle_ipc_send(&mut SendReply::Inline(&mut wh), &payload(false, b"two"), &fx.ctx(true))
+        handle_ipc_send(
+            &mut SendReply::Inline(&mut wh),
+            &payload(false, b"two"),
+            &fx.ctx(true),
+        )
         .await
-            .expect("send");
+        .expect("send");
         assert_eq!(fx.me.store.version(), 2);
         assert_eq!(fx.me.store.drain_dirty().len(), 1, "named again");
     }
