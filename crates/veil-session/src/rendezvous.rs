@@ -348,7 +348,11 @@ impl RateLimiter {
                 .iter()
                 .filter_map(|(key, ts)| ts.last().map(|last| (*key, *last)))
                 .collect();
-            seen.sort_unstable_by_key(|(_, last)| *last);
+            // Tie-broken by key, not left to hash order: entries admitted in
+            // the same instant share a timestamp, and "whichever the map
+            // happened to yield first" makes eviction — and any test about
+            // it — differ from run to run.
+            seen.sort_unstable_by(|(ka, la), (kb, lb)| la.cmp(lb).then_with(|| ka.cmp(kb)));
             let excess = self.state.len().saturating_sub(target);
             for (key, _) in seen.iter().take(excess) {
                 // Never evict the requester we just admitted: dropping its
@@ -1278,27 +1282,36 @@ mod tests {
         );
     }
 
-    /// And the requester that was just admitted keeps its history.
+    /// The requester that was just admitted is not evicted BY ITS OWN
+    /// admission.
     ///
-    /// Evicting it would be worse than not evicting at all: its budget would
-    /// reset on every call, so the limiter would stop limiting the one
-    /// identity flooding hardest.
+    /// That is the whole of the clause, and it is narrower than it first
+    /// sounds — it says nothing about somebody else's admission later. Two
+    /// earlier versions of this test asserted more than that and passed for
+    /// reasons unrelated to the guard: one waited for a THROTTLED caller to be
+    /// refused, which never reaches the eviction pass at all, and one used a
+    /// high key that sorts last and so was never a candidate. Both were green
+    /// with the guard removed.
+    ///
+    /// So: everyone ties on time, which puts the key order in charge, and the
+    /// caller under test holds the lowest key — first in line to go. Without
+    /// the guard its own admission throws its history away, which is what
+    /// resets a budget one call at a time.
     #[test]
     fn the_just_admitted_requester_is_never_the_one_evicted() {
         let cap = 4;
-        let mut rl = RateLimiter::new(Duration::from_secs(60), 2, cap);
+        let mut rl = RateLimiter::new(Duration::from_secs(60), 100, cap);
         let now = Instant::now();
-        let flooder = [0xAAu8; 32];
-        for i in 0..50u32 {
-            let mut key = [0u8; 32];
-            key[..4].copy_from_slice(&i.to_be_bytes());
-            rl.allow(key, now);
-            rl.allow(flooder, now);
+        let lowest = [0u8; 32];
+        for i in 1..=8u8 {
+            rl.allow([i; 32], now);
         }
-        assert!(
-            !rl.allow(flooder, now),
-            "the flooder's own history was evicted, so its budget resets on \
-             every call and the limit never binds"
+        assert!(rl.allow(lowest, now), "within its own burst");
+        assert_eq!(
+            rl.current_entries(&lowest),
+            1,
+            "the caller's own admission evicted its own history — its budget \
+             resets on every call and the limit never binds"
         );
     }
 
