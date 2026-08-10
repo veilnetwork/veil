@@ -34,7 +34,14 @@ use std::{
 use veil_cfg::NodeId;
 
 /// A handoff pending on either side of a session.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// `Debug` is written by hand and REDACTS the key.
+///
+/// It used to be derived, so every `{:?}` of this struct — a diagnostic line,
+/// a panic message, an `assert_eq!` failure in a test — printed a live session
+/// key in full (report9 V-17). Nothing formats it today, which is exactly why
+/// a derive is the wrong thing to leave here: the leak arrives with the first
+/// person who adds a log line.
+#[derive(Clone, PartialEq, Eq)]
 pub struct PendingHandoff {
     /// Remote peer's node_id, captured at registration. Diagnostic only — the
     /// accept path keys on `session_id`; ownership is proven by the
@@ -52,6 +59,29 @@ pub struct PendingHandoff {
     pub rx_key: [u8; 32],
     /// Wall-clock point after which this entry is garbage.
     pub expires_at: Instant,
+}
+
+impl core::fmt::Debug for PendingHandoff {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("PendingHandoff")
+            .field("peer_node_id", &self.peer_node_id)
+            .field("nonce", &"<redacted>")
+            .field("rx_key", &"<redacted>")
+            .field("expires_at", &self.expires_at)
+            .finish()
+    }
+}
+
+impl Drop for PendingHandoff {
+    /// The key is a copy of the session's AEAD key and the entry outlives the
+    /// frame that carried it — it sits in a registry until the warm socket
+    /// arrives or the entry expires. Dropping it as-is left that copy in the
+    /// allocator (report9 V-17).
+    fn drop(&mut self) {
+        use zeroize::Zeroize as _;
+        self.rx_key.zeroize();
+        self.nonce.zeroize();
+    }
 }
 
 /// Thread-safe map of `session_id → PendingHandoff`.
@@ -254,6 +284,15 @@ pub struct SessionHandoffHandles {
     /// `PendingHandoff.rx_key` covers the verification path, so this
     /// field is not consulted on accept.
     pub tx_key: [u8; 32],
+}
+
+impl Drop for SessionHandoffHandles {
+    /// Each clone carries its own copy of the key, so each wipes its own
+    /// (report9 V-17).
+    fn drop(&mut self) {
+        use zeroize::Zeroize as _;
+        self.tx_key.zeroize();
+    }
 }
 
 /// Per-runtime registry of session-id → handoff handles. A
@@ -816,6 +855,40 @@ where
         );
     }
     PeekOutcome::HandoffBound
+}
+
+#[cfg(test)]
+mod v17_key_hygiene_tests {
+    use super::*;
+
+    /// A struct that carries a session key must not print it.
+    ///
+    /// `Debug` was derived here, so any `{:?}` — a diagnostic line, a panic
+    /// message, an `assert_eq!` failure — rendered a live key in full. Nothing
+    /// formats it today, and that is the point: a derive leaves the leak
+    /// waiting for the first person who adds a log line (report9 V-17).
+    #[test]
+    fn the_pending_entry_does_not_print_its_key() {
+        let entry = PendingHandoff {
+            peer_node_id: NodeId::from([9u8; 32]),
+            nonce: [0xAB; 32],
+            rx_key: [0xCD; 32],
+            expires_at: Instant::now(),
+        };
+        let rendered = format!("{entry:?}");
+        assert!(
+            !rendered.contains("205"),
+            "the key's bytes are in the debug output: {rendered}"
+        );
+        assert!(
+            !rendered.contains("171"),
+            "the nonce's bytes are in the debug output: {rendered}"
+        );
+        assert!(
+            rendered.contains("redacted"),
+            "the debug output should say what it withheld: {rendered}"
+        );
+    }
 }
 
 #[cfg(test)]
