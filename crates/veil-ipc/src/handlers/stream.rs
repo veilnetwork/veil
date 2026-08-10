@@ -33,6 +33,15 @@ use crate::transport::IpcWriteHalf;
 /// `VeilConnector`'s `OPEN_RECEIPT_TIMEOUT`.
 const OPEN_RECEIPT_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// How many wire-stream ids an open will try before giving up.
+///
+/// Only ever exceeds one after the `u32` counter has wrapped and landed on a
+/// run of ids still live for the same peer. Sixty-four consecutive collisions
+/// means the node holds at least that many concurrent streams to one peer in
+/// exactly that region of the id space — at which point refusing is far better
+/// than displacing one of them.
+const WIRE_ID_PROBES: u32 = 64;
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn handle_stream_open(
     wh: &mut IpcWriteHalf,
@@ -274,7 +283,42 @@ async fn open_remote_stream(
     use std::sync::atomic::Ordering;
 
     let dst = p.dst_node_id;
-    let wire_stream_id = bridge.wire_stream_counter.fetch_add(1, Ordering::Relaxed);
+    // Take an id that is FREE for this destination.
+    //
+    // The counter is a `u32` shared by every surface that opens wire streams
+    // on this node, and after four billion opens it wraps. The key includes
+    // the node id, so a wrap can only collide with a stream to the SAME peer —
+    // but `insert` replaces, so that collision silently stole a live stream's
+    // receipt waiter and inbound route, and the two owners need not be the
+    // same local app (report9 V-19). Probing costs one map lookup per open and
+    // is only ever more than one after a wrap.
+    let mut allocated = None;
+    for _ in 0..WIRE_ID_PROBES {
+        let candidate = bridge.wire_stream_counter.fetch_add(1, Ordering::Relaxed);
+        let receipt_taken = bridge
+            .pending_receipts
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains_key(&(dst, candidate));
+        if receipt_taken {
+            continue;
+        }
+        let route_taken = bridge
+            .veil_stream_rx
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains_key(&(dst, candidate));
+        if route_taken {
+            continue;
+        }
+        allocated = Some(candidate);
+        break;
+    }
+    // Every probed id is in use for this peer. Refusing is the honest answer:
+    // the alternative is displacing a stream that is still running.
+    let Some(wire_stream_id) = allocated else {
+        return Err(stream_open_err::CAPACITY_REACHED);
+    };
 
     // Register the receipt waiter + inbound data channel BEFORE sending AppOpen
     // so a fast remote cannot reply before we are listening.

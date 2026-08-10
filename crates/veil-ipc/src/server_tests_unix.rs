@@ -2545,6 +2545,98 @@ async fn ipc_client_error_exit_still_closes_its_streams() {
 /// CONTROL for the V-04 teardown guard, driven through the REAL connection
 /// loop: when the loop does act on `RemoteStreamOpened` — claims ownership and
 /// disarms — the stream must survive and the peer must NOT be sent an
+/// A wire-stream id that is already in use must not be handed out again.
+///
+/// The counter is a `u32` shared by every surface that opens wire streams on
+/// this node; after four billion opens it wraps. The map key includes the node
+/// id, so a wrap can only collide with a stream to the SAME peer — and `insert`
+/// replaces, so the collision silently stole a live stream's receipt waiter and
+/// inbound route (report9 V-19). The two owners need not be the same local app.
+///
+/// The wrap itself is not staged here — four billion `fetch_add`s is not a
+/// test. What is staged is the state a wrap produces: the id the counter is
+/// about to hand out is already registered and live.
+#[tokio::test]
+async fn an_id_already_in_use_is_not_handed_out_again() {
+    use std::collections::HashMap;
+    use std::sync::Mutex as StdMutex;
+    use std::sync::atomic::AtomicU32;
+
+    let sock = temp_socket_path();
+    let remote = [0xEEu8; 32];
+    let (wire_tx, _wire_rx) = tokio::sync::mpsc::unbounded_channel();
+    let bcast: Arc<dyn veil_types::FrameBroadcaster> = Arc::new(CapturingPeerBroadcaster {
+        peer_id: remote,
+        tx: wire_tx,
+    });
+    let bridge = crate::bridge::IpcStreamBridge {
+        veil_stream_rx: Arc::new(StdMutex::new(HashMap::new())),
+        pending_receipts: Arc::new(StdMutex::new(HashMap::new())),
+        wire_stream_counter: Arc::new(AtomicU32::new(1)),
+    };
+
+    // A stream that is ALREADY running on the id the counter will offer first.
+    // Both halves are kept alive here, which is what makes it a live stream
+    // rather than a stale key.
+    let (victim_receipt_tx, _victim_receipt_rx) = tokio::sync::oneshot::channel::<u8>();
+    let (victim_data_tx, _victim_data_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(4);
+    bridge
+        .pending_receipts
+        .lock()
+        .unwrap()
+        .insert((remote, 1), victim_receipt_tx);
+    bridge
+        .veil_stream_rx
+        .lock()
+        .unwrap()
+        .insert((remote, 1), victim_data_tx);
+
+    let (server, shutdown_tx, _) = make_server(sock.clone());
+    let mut server = server
+        .with_session_tx_registry(bcast)
+        .with_stream_bridge(bridge.clone());
+    let sh = tokio::spawn(async move { server.run().await });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let mut client = connect_and_hello(&sock).await;
+    let open = StreamOpenPayload {
+        dst_node_id: remote,
+        app_id: [0xAAu8; 32],
+        endpoint_id: 1,
+        initial_window: STREAM_INITIAL_WINDOW,
+    };
+    send_ipc_frame_id(
+        &mut client,
+        LocalAppMsg::StreamOpen as u16,
+        7,
+        &open.encode(),
+    )
+    .await;
+
+    let mut moved_on = false;
+    for _ in 0..2000 {
+        if bridge
+            .pending_receipts
+            .lock()
+            .unwrap()
+            .contains_key(&(remote, 2))
+        {
+            moved_on = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+    assert!(
+        moved_on,
+        "the open took an id that was already live: the stream holding it has \
+         just lost its receipt waiter and its inbound route to a stranger"
+    );
+
+    drop(client);
+    let _ = shutdown_tx.send(true);
+    let _ = sh.await;
+}
+
 /// `AppClose`.
 ///
 /// Deleting the `guard.disarm()` at that call site would tear down every
