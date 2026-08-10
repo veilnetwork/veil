@@ -12,6 +12,10 @@
 # nothing about behaviour, and there is no runtime coverage of the engine on
 # this host. Treat a pass as "this would build", nothing more.
 #
+# With one exception it is also a RULE check: `-Werror=unused-result` below
+# turns the engine's `[[nodiscard]] run_on` into a hard failure, so a call site
+# that ignores "the worker queue never scheduled" cannot pass this gate.
+#
 # Needs the from-source WebRTC checkout the dylib build needs:
 #   WEBRTC_SRC=~/Projects/veilnetwork/webrtc-checkout/src \
 #   WEBRTC_OUT=out/mac-arm64 ./test/run_engine_typecheck.sh
@@ -42,7 +46,13 @@ cmd = entry['command'] if entry.get('command') else ' '.join(entry['arguments'])
 cmd = cmd.replace(re.search(r'(\S*call/call\.cc)', cmd).group(1), src)
 cmd = re.sub(r'-o\s+\S+', '-o ' + out, cmd)
 print('cd ' + cc[0]['directory'])
-print(cmd + ' -DVEIL_MEDIA_HAVE_WEBRTC=1 -I' + shimdir)
+# `-Werror=unused-result` is the reason the engine's `run_on` carries
+# `[[nodiscard]]` at all. Without it the attribute is a warning in a build
+# whose output nobody reads, and report9 V-02 was exactly one call site that
+# ignored that result and destroyed a transport underneath the streams
+# configured with it. As an error, a new call site cannot get past this gate
+# without saying what it does when the worker queue never schedules.
+print(cmd + ' -DVEIL_MEDIA_HAVE_WEBRTC=1 -Werror=unused-result -I' + shimdir)
 PY
 
 bash "${TMPDIR:-/tmp}/veil_media_typecheck.sh"

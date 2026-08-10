@@ -35,7 +35,8 @@ namespace veil_media {
 // the bug this exists to prevent. The timeout bounds *scheduling* latency (a
 // task queue that is wedged or already shut down), not `f` itself.
 template <typename TaskQueue, typename F>
-bool run_on_with_timeout(TaskQueue* tq, F&& f, std::chrono::milliseconds timeout) {
+[[nodiscard]] bool run_on_with_timeout(TaskQueue* tq, F&& f,
+                                       std::chrono::milliseconds timeout) {
   if (tq == nullptr || tq->IsCurrent()) {
     f();
     return true;

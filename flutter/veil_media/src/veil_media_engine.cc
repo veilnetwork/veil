@@ -186,8 +186,14 @@ void update_atomic_max(std::atomic<int64_t>* target, int64_t value) {
 // engine writing stream pointers into freed memory whenever the worker queue
 // was wedged or already shut down (audit report8 H-07; ASan calls it
 // stack-use-after-scope).
+//
+// `[[nodiscard]]`, because "the operation did not happen" is not a diagnostic
+// this file can afford to drop on the floor: report9 V-02 was one call site
+// that ignored it and destroyed a transport underneath the streams still
+// configured with it. Every caller below now either propagates the failure or
+// says in one line why it cannot happen there.
 template <typename F>
-bool run_on(webrtc::TaskQueueBase* tq, F&& f) {
+[[nodiscard]] bool run_on(webrtc::TaskQueueBase* tq, F&& f) {
   const bool ran = veil_media::run_on_with_timeout(tq, std::forward<F>(f),
                                                    std::chrono::seconds(10));
   if (!ran) {
@@ -1263,7 +1269,10 @@ int veil_media_group_engine_add_peer(VeilGroupMediaEngine* engine,
   peer->video_sink = std::make_unique<VeilVideoSink>();
   ws->fanout->Add(veil_chan);
   if (engine->audio_running.load()) {
-    run_on(ws->worker_tq.get(), [&]() {
+    // Discarded because the next line checks the OUTCOME, which is stricter: a
+    // queue that never scheduled leaves `recv_stream` null and takes the same
+    // failure path as a stream that failed to create.
+    (void)run_on(ws->worker_tq.get(), [&]() {
       webrtc::AudioReceiveStreamInterface::Config rc;
       rc.rtp.remote_ssrc = remote_ssrc;
       rc.rtcp_send_transport = peer->shim.get();
@@ -1280,17 +1289,37 @@ int veil_media_group_engine_add_peer(VeilGroupMediaEngine* engine,
     }
   }
   if (engine->video_running.load()) {
-    run_on(ws->worker_tq.get(), [&]() {
+    // Discarded for the same reason: `video_recv_stream` stays null.
+    (void)run_on(ws->worker_tq.get(), [&]() {
       ensure_group_video_codecs(ws);
       start_group_peer_video(ws, peer.get());
     });
     if (peer->video_recv_stream == nullptr) {
       if (peer->recv_stream) {
-        run_on(ws->worker_tq.get(), [&]() {
+        const bool rolled_back = run_on(ws->worker_tq.get(), [&]() {
           peer->recv_stream->Stop();
           ws->call->DestroyAudioReceiveStream(peer->recv_stream);
           peer->recv_stream = nullptr;
         });
+        if (!rolled_back) {
+          // The audio receive stream this rollback exists to destroy is still
+          // in the Call, and `peer->shim` is the transport it was configured
+          // with. Returning here would destroy `peer` — a local unique_ptr —
+          // and take the shim with it: report9 V-02's use-after-free, reached
+          // through the add path rather than the remove one.
+          //
+          // So the peer is KEPT, exactly as `remove_peer` keeps it, and it
+          // carries the streams it really has. Delivery is already stopped
+          // below, both stops are idempotent, and a later `remove_peer`
+          // retries the teardown.
+          ws->fanout->Remove(veil_chan);
+          peer->shim->SetRemoteVideoSsrc(0);
+          peer->shim->Stop();
+          ws->peers.emplace(key, std::move(peer));
+          vlog("group media: add peer ROLLBACK DEFERRED — worker queue did "
+               "not schedule; the peer keeps its audio stream and transport");
+          return VEIL_MEDIA_ERR_STATE;
+        }
       }
       ws->fanout->Remove(veil_chan);
       peer->shim->Stop();
@@ -1354,7 +1383,9 @@ int veil_media_group_engine_start_audio(VeilGroupMediaEngine* engine) {
   if (!engine->ws || !engine->ws->call) return VEIL_MEDIA_ERR_STATE;
   GroupWebrtcState* ws = engine->ws.get();
   const uint32_t local_ssrc = group_audio_ssrc_of(engine->local);
-  run_on(ws->worker_tq.get(), [&]() {
+  // Discarded: `ws->send_stream == nullptr` below is the stricter check — a
+  // queue that never scheduled leaves it null.
+  (void)run_on(ws->worker_tq.get(), [&]() {
     ws->call->SignalChannelNetworkState(webrtc::MediaType::AUDIO,
                                         webrtc::kNetworkUp);
     if (ws->send_stream == nullptr) {
@@ -1422,21 +1453,29 @@ int veil_media_group_engine_stop_audio(VeilGroupMediaEngine* engine) {
       if (ws->adm->Recording()) ws->adm->StopRecording();
       if (ws->adm->Playing()) ws->adm->StopPlayout();
     }
-    run_on(ws->worker_tq.get(), [&]() {
-      if (ws->send_stream) {
-        ws->send_stream->Stop();
-        ws->call->DestroyAudioSendStream(ws->send_stream);
-        ws->send_stream = nullptr;
-      }
-      for (auto& entry : ws->peers) {
-        GroupPeerState* peer = entry.second.get();
-        if (peer->recv_stream) {
-          peer->recv_stream->Stop();
-          ws->call->DestroyAudioReceiveStream(peer->recv_stream);
-          peer->recv_stream = nullptr;
-        }
-      }
-    });
+    if (!run_on(ws->worker_tq.get(), [&]() {
+          if (ws->send_stream) {
+            ws->send_stream->Stop();
+            ws->call->DestroyAudioSendStream(ws->send_stream);
+            ws->send_stream = nullptr;
+          }
+          for (auto& entry : ws->peers) {
+            GroupPeerState* peer = entry.second.get();
+            if (peer->recv_stream) {
+              peer->recv_stream->Stop();
+              ws->call->DestroyAudioReceiveStream(peer->recv_stream);
+              peer->recv_stream = nullptr;
+            }
+          }
+        })) {
+      // The streams are still in the Call. The flag says stopped, which is
+      // what the caller asked for and what the capture devices above already
+      // did; the streams are what did not happen, and saying OK here is how
+      // that becomes invisible.
+      vlog("group audio: stop INCOMPLETE — worker queue did not schedule; "
+           "the streams are still live");
+      return VEIL_MEDIA_ERR_STATE;
+    }
   }
 #endif
   return VEIL_MEDIA_OK;
@@ -1489,7 +1528,9 @@ int veil_media_group_engine_start_video(VeilGroupMediaEngine* engine) {
   GroupWebrtcState* ws = engine->ws.get();
   const uint32_t local_ssrc = group_video_ssrc_of(engine->local);
   bool peers_ready = true;
-  run_on(ws->worker_tq.get(), [&]() {
+  // Discarded: the `!ws->video_send_stream || !peers_ready` check below is
+  // stricter — a queue that never scheduled leaves both untouched.
+  (void)run_on(ws->worker_tq.get(), [&]() {
     ws->call->SignalChannelNetworkState(webrtc::MediaType::VIDEO,
                                         webrtc::kNetworkUp);
     ensure_group_video_codecs(ws);
@@ -1596,15 +1637,19 @@ int veil_media_group_engine_stop_video(VeilGroupMediaEngine* engine) {
   if (ws->test_video_run.exchange(false) && ws->test_video_thread.joinable())
     ws->test_video_thread.join();
   if (ws->call) {
-    run_on(ws->worker_tq.get(), [&]() {
-      if (ws->video_send_stream) {
-        ws->video_send_stream->Stop();
-        ws->call->DestroyVideoSendStream(ws->video_send_stream);
-        ws->video_send_stream = nullptr;
-      }
-      for (auto& entry : ws->peers)
-        stop_group_peer_video(ws, entry.second.get());
-    });
+    if (!run_on(ws->worker_tq.get(), [&]() {
+          if (ws->video_send_stream) {
+            ws->video_send_stream->Stop();
+            ws->call->DestroyVideoSendStream(ws->video_send_stream);
+            ws->video_send_stream = nullptr;
+          }
+          for (auto& entry : ws->peers)
+            stop_group_peer_video(ws, entry.second.get());
+        })) {
+      vlog("group video: stop INCOMPLETE — worker queue did not schedule; "
+           "the streams are still live");
+      return VEIL_MEDIA_ERR_STATE;
+    }
   }
 #endif
   return VEIL_MEDIA_OK;
@@ -1807,7 +1852,7 @@ int veil_media_engine_start_audio(VeilMediaEngine* engine, int send, int recv) {
   const uint32_t remote_ssrc = ssrc_of(engine->peer);
 
   // Streams must be created on the Call's worker queue.
-  run_on(ws->worker_tq.get(), [&]() {
+  const bool created = run_on(ws->worker_tq.get(), [&]() {
     // The Call's audio network state defaults to kNetworkDown, which makes the
     // send transport hold every RTP packet in the pacer (only RTCP leaks out on
     // its own path). Bring the audio channel up so mic audio actually flows.
@@ -1838,6 +1883,13 @@ int veil_media_engine_start_audio(VeilMediaEngine* engine, int send, int recv) {
       if (ws->recv_stream) ws->recv_stream->Start();
     }
   });
+  if (!created) {
+    // Nothing was created, and `audio_running` is set unconditionally further
+    // down — so without this the engine reports a running call with no
+    // streams, and the ADM below starts a microphone whose audio goes nowhere.
+    vlog("audio: start FAILED — worker queue did not schedule; no streams");
+    return VEIL_MEDIA_ERR_STATE;
+  }
   // webrtc::Call does NOT drive the AudioDeviceModule the way PeerConnection
   // does — start capture/playout explicitly, else the send stream has no audio
   // frames (only RTCP flows) and the recv stream is never played out. The
@@ -1899,18 +1951,22 @@ int veil_media_engine_stop_audio(VeilMediaEngine* engine) {
       if (ws->adm->Recording()) ws->adm->StopRecording();
       if (ws->adm->Playing()) ws->adm->StopPlayout();
     }
-    run_on(ws->worker_tq.get(), [&]() {
-      if (ws->send_stream) {
-        ws->send_stream->Stop();
-        ws->call->DestroyAudioSendStream(ws->send_stream);
-        ws->send_stream = nullptr;
-      }
-      if (ws->recv_stream) {
-        ws->recv_stream->Stop();
-        ws->call->DestroyAudioReceiveStream(ws->recv_stream);
-        ws->recv_stream = nullptr;
-      }
-    });
+    if (!run_on(ws->worker_tq.get(), [&]() {
+          if (ws->send_stream) {
+            ws->send_stream->Stop();
+            ws->call->DestroyAudioSendStream(ws->send_stream);
+            ws->send_stream = nullptr;
+          }
+          if (ws->recv_stream) {
+            ws->recv_stream->Stop();
+            ws->call->DestroyAudioReceiveStream(ws->recv_stream);
+            ws->recv_stream = nullptr;
+          }
+        })) {
+      vlog("audio: stop INCOMPLETE — worker queue did not schedule; "
+           "the streams are still live");
+      return VEIL_MEDIA_ERR_STATE;
+    }
   }
 #endif
   return VEIL_MEDIA_OK;
@@ -1922,15 +1978,18 @@ int veil_media_engine_set_max_rtp_packet_size(VeilMediaEngine* engine,
 #if defined(VEIL_MEDIA_HAVE_WEBRTC)
   if (!engine->ws || !engine->ws->call) return VEIL_MEDIA_ERR_STATE;
   WebrtcState* ws = engine->ws.get();
-  int result = VEIL_MEDIA_OK;
-  run_on(ws->worker_tq.get(), [&]() {
+  // Pre-set to the failure: `run_on` not scheduling means the size was NOT
+  // applied, and an initial OK here would report a setting that never landed.
+  int result = VEIL_MEDIA_ERR_STATE;
+  const bool applied = run_on(ws->worker_tq.get(), [&]() {
     if (ws->video_send_stream != nullptr) {
-      result = VEIL_MEDIA_ERR_STATE;
       return;
     }
     ws->video_max_rtp_packet_size =
         max_packet_size == 0 ? 0 : std::clamp(max_packet_size, 576, 1460);
+    result = VEIL_MEDIA_OK;
   });
+  (void)applied;  // folded into `result`, which starts at the failure
   return result;
 #else
   (void)max_packet_size;
@@ -1948,7 +2007,7 @@ int veil_media_engine_start_video(VeilMediaEngine* engine, int send, int recv,
   const uint32_t remote_v = video_ssrc_of(engine->peer);
   constexpr int kVp8Pt = 96;
 
-  run_on(ws->worker_tq.get(), [&]() {
+  const bool created = run_on(ws->worker_tq.get(), [&]() {
     // Video has its own network state (defaults kNetworkDown); bring it up.
     ws->call->SignalChannelNetworkState(webrtc::MediaType::VIDEO,
                                         webrtc::kNetworkUp);
@@ -2054,6 +2113,12 @@ int veil_media_engine_start_video(VeilMediaEngine* engine, int send, int recv,
       if (ws->video_recv_stream) ws->video_recv_stream->Start();
     }
   });
+  if (!created) {
+    // No streams were created, and everything below — the SSRC routing, the
+    // synthetic source, the OK — is written as though they were.
+    vlog("video: start FAILED — worker queue did not schedule; no streams");
+    return VEIL_MEDIA_ERR_STATE;
+  }
   // Route inbound video RTP (this SSRC) to the video demuxer in the shim.
   ws->shim->SetRemoteVideoSsrc(remote_v);
   vlog("video: start send=%d recv=%d ssrc(local=%u remote=%u)", send, recv,
@@ -2097,8 +2162,11 @@ int veil_media_engine_set_video_bitrate(VeilMediaEngine* engine,
 #if defined(VEIL_MEDIA_HAVE_WEBRTC)
   if (!engine->ws || !engine->ws->call) return VEIL_MEDIA_ERR_STATE;
   WebrtcState* ws = engine->ws.get();
+  // Discarded: `rc` starts at the failure and is only raised to OK by the
+  // last line INSIDE the closure, so a queue that never scheduled returns the
+  // failure by construction.
   int rc = VEIL_MEDIA_ERR_STATE;
-  run_on(ws->worker_tq.get(), [&]() {
+  (void)run_on(ws->worker_tq.get(), [&]() {
     if (ws->video_send_stream == nullptr) return;
     // Same budget rules as start_video: the explicit debug pin wins, and the
     // clamps keep the encoder inside the padded-onion / direct envelopes.
@@ -2172,18 +2240,25 @@ int veil_media_engine_stop_video(VeilMediaEngine* engine) {
   if (ws->test_video_run.exchange(false) && ws->test_video_thread.joinable())
     ws->test_video_thread.join();
   if (ws->call) {
-    run_on(ws->worker_tq.get(), [&]() {
-      if (ws->video_send_stream) {
-        ws->video_send_stream->Stop();
-        ws->call->DestroyVideoSendStream(ws->video_send_stream);
-        ws->video_send_stream = nullptr;
-      }
-      if (ws->video_recv_stream) {
-        ws->video_recv_stream->Stop();
-        ws->call->DestroyVideoReceiveStream(ws->video_recv_stream);
-        ws->video_recv_stream = nullptr;
-      }
-    });
+    if (!run_on(ws->worker_tq.get(), [&]() {
+          if (ws->video_send_stream) {
+            ws->video_send_stream->Stop();
+            ws->call->DestroyVideoSendStream(ws->video_send_stream);
+            ws->video_send_stream = nullptr;
+          }
+          if (ws->video_recv_stream) {
+            ws->video_recv_stream->Stop();
+            ws->call->DestroyVideoReceiveStream(ws->video_recv_stream);
+            ws->video_recv_stream = nullptr;
+          }
+        })) {
+      // Routing stays as it is on purpose: the receive stream is still in the
+      // Call, and cutting its SSRC would leave it alive and starved rather
+      // than gone.
+      vlog("video: stop INCOMPLETE — worker queue did not schedule; "
+           "the streams are still live");
+      return VEIL_MEDIA_ERR_STATE;
+    }
   }
   if (ws->shim) ws->shim->SetRemoteVideoSsrc(0);
 #endif
@@ -2634,7 +2709,7 @@ char* veil_media_engine_get_stats(VeilMediaEngine* engine) {
     android420_replaced =
         ws->android420_stats.replaced.load(std::memory_order_relaxed);
 #endif
-    run_on(ws->worker_tq.get(), [&] {
+    const bool sampled = run_on(ws->worker_tq.get(), [&] {
       if (ws->call) {
         const auto cs = ws->call->GetStats();
         if (cs.rtt_ms >= 0) rtt_ms = cs.rtt_ms;
@@ -2675,6 +2750,14 @@ char* veil_media_engine_get_stats(VeilMediaEngine* engine) {
       }
     });
     if (rtt_ms < 0) rtt_ms = 0;  // unknown yet — keep the legacy "0" shape
+    // Everything the closure above fills stays at its initialiser when the
+    // worker queue never schedules, and a caller cannot tell a zero that was
+    // measured from a zero that was never asked for. This flag is that
+    // difference; it is additive, so a reader that does not know it is
+    // unaffected.
+    if (!sampled)
+      vlog("stats: worker queue did not schedule; call/stream figures are "
+           "defaults, not measurements");
     const auto tx_video = ws->shim->outbound_video_cadence();
     const auto rx_video = ws->shim->inbound_video_cadence();
     const auto delivered_video = ws->shim->delivered_video_cadence();
@@ -2685,8 +2768,12 @@ char* veil_media_engine_get_stats(VeilMediaEngine* engine) {
                        static_cast<double>(elapsed)
                  : 0.0;
     };
-    char json[1664];
-    std::snprintf(
+    // Grown with the `worker_stalled` field below. `snprintf` truncates in
+    // silence, and a truncated object is not a smaller answer — it is one the
+    // Dart side cannot parse at all, so the return is checked below rather
+    // than trusted.
+    char json[1792];
+    const int written = std::snprintf(
         json, sizeof(json),
         "{\"tx_pkts\":%llu,\"rx_pkts\":%llu,\"tx_bytes\":%llu,"
         "\"rx_bytes\":%llu,\"tx_drops\":%llu,\"rx_drops\":%llu,"
@@ -2694,7 +2781,7 @@ char* veil_media_engine_get_stats(VeilMediaEngine* engine) {
         "\"tx_jitter_ms\":%d,\"tx_loss_pct\":%d,"
         "\"audio_delay_ms\":%u,\"audio_jb_ms\":%u,"
         "\"video_delay_ms\":%d,\"video_jb_ms\":%d,"
-        "\"pacer_delay_ms\":%lld,"
+        "\"pacer_delay_ms\":%lld,\"worker_stalled\":%d,"
         "\"video_tx_frames\":%llu,\"video_tx_fps\":%.1f,"
         "\"video_tx_max_gap_ms\":%lld,\"video_tx_holds_75ms\":%llu,"
         "\"video_rx_arrival_frames\":%llu,\"video_rx_arrival_fps\":%.1f,"
@@ -2721,7 +2808,7 @@ char* veil_media_engine_get_stats(VeilMediaEngine* engine) {
         static_cast<unsigned long long>(ws->shim->inbound_dropped_count()),
         static_cast<long long>(rtt_ms), jitter_ms, loss_pct, tx_jitter_ms,
         tx_loss_pct, audio_delay_ms, audio_jb_ms, video_delay_ms, video_jb_ms,
-        static_cast<long long>(pacer_delay_ms),
+        static_cast<long long>(pacer_delay_ms), sampled ? 0 : 1,
         static_cast<unsigned long long>(tx_video.frames),
         cadence_fps(tx_video),
         static_cast<long long>(tx_video.max_gap_ns / 1000000),
@@ -2745,7 +2832,13 @@ char* veil_media_engine_get_stats(VeilMediaEngine* engine) {
         static_cast<unsigned long long>(android420_replaced),
         ws->video_target_bitrate_bps,
         ws->video_max_fps.load(std::memory_order_relaxed));
-    return dup_cstr(json);
+    if (written < 0 || static_cast<size_t>(written) >= sizeof(json)) {
+      vlog("stats: JSON did not fit in %zu bytes (needed %d) — returning the "
+           "minimal shape rather than a truncated object",
+           sizeof(json), written);
+    } else {
+      return dup_cstr(json);
+    }
   }
 #endif
   return dup_cstr(
