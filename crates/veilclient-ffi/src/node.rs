@@ -14,7 +14,7 @@ use std::ffi::{CString, c_char, c_int};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use libc::size_t;
 use tokio::sync::watch;
@@ -1038,8 +1038,76 @@ fn node_thread_finished(node: &VeilNode) -> bool {
     guard.as_ref().map(|t| t.is_finished()).unwrap_or(true)
 }
 
+/// How often the bounded stop asks whether the node's thread has finished.
+///
+/// Short enough that a normal stop — which finishes in milliseconds — is not
+/// held up by the polling itself, long enough that a wedged one does not spin.
+const STOP_POLL: Duration = Duration::from_millis(25);
+
+/// Stop the embedded node with a BOUND on the wait, and say which happened.
+///
+/// Returns `0` when the node's thread finished and everything it held was
+/// released; `1` when `timeout_ms` passed first and the thread was DETACHED;
+/// `-1` for a null handle.
+///
+/// ## Why this exists (report9 X-17)
+///
+/// [`veil_node_stop`] joins without a bound. A host that gives its teardown a
+/// deadline — xVeil gives it fifteen seconds — can abandon the WAIT, but the
+/// call stays blocked in `join`, and by then the handle has already been
+/// consumed. So there is no second attempt: retrying with the same pointer is
+/// a double free, and the app is left saying "locked" while a node it can no
+/// longer reach keeps its sockets and its network identity.
+///
+/// This does not make a wedged node let go. Its sockets belong to a tokio
+/// runtime inside that thread, and the only thing that closes them is that
+/// runtime winding down; a thread cannot be killed from outside in Rust.
+/// What this buys is that the CALLER stops waiting, learns which of the two
+/// things happened, and can stop claiming a lock it does not have.
+///
+/// ## What detaching leaks, and why on purpose
+///
+/// On the timeout path the handle is deliberately NOT dropped. `VeilNode` owns
+/// the node's runtime directory (`owned_runtime_dir`, a `TempDir`), and
+/// dropping it DELETES that directory — the config, the identity-derived files
+/// and the obfs4 key of a node that is, by construction here, still running.
+/// Freeing the handle would take those out from under it. One small struct and
+/// one directory guard are leaked per wedged stop instead, and the directory
+/// then lives until the process exits, which is exactly as long as the node
+/// using it does.
+///
+/// # Safety
+/// `node` must be a handle returned by `veil_node_start*` and not yet stopped.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn veil_node_stop_timeout(node: *mut VeilNode, timeout_ms: u64) -> i32 {
+    if node.is_null() {
+        return -1;
+    }
+    let node = unsafe { Box::from_raw(node) };
+    if let Some(tx) = veil_util::lock!(node.shutdown).take() {
+        let _ = tx.send(true);
+    }
+    let deadline = Instant::now() + Duration::from_millis(timeout_ms.min(u64::from(u32::MAX)));
+    while !node_thread_finished(&node) {
+        if Instant::now() >= deadline {
+            // Detached, not freed. See the note above: the handle owns the
+            // runtime directory of a node that is still using it.
+            std::mem::forget(node);
+            return 1;
+        }
+        std::thread::sleep(STOP_POLL);
+    }
+    if let Some(thread) = veil_util::lock!(node.thread).take() {
+        let _ = thread.join();
+    }
+    0
+}
+
 /// Stop the embedded node: trigger graceful shutdown and join its thread.
 /// Consumes the handle.
+///
+/// Waits as long as it takes. A caller that cannot afford that wants
+/// [`veil_node_stop_timeout`], which bounds it and reports which way it went.
 ///
 /// # Safety
 /// `node` must be a handle returned by `veil_node_start*` and not yet stopped.
@@ -1061,6 +1129,88 @@ pub unsafe extern "C" fn veil_node_stop(node: *mut VeilNode) {
 mod tests {
     use super::*;
     use std::ffi::CStr;
+
+    /// Build a handle whose thread runs for `run_for`, as `veil_node_start`
+    /// would leave one.
+    fn node_running_for(run_for: Duration) -> *mut VeilNode {
+        let (tx, _rx) = tokio::sync::watch::channel(false);
+        let thread = std::thread::spawn(move || std::thread::sleep(run_for));
+        Box::into_raw(Box::new(VeilNode {
+            shutdown: std::sync::Mutex::new(Some(tx)),
+            thread: std::sync::Mutex::new(Some(thread)),
+            admin_socket: None,
+            #[cfg(feature = "packet-tunnel")]
+            owned_runtime_dir: None,
+        }))
+    }
+
+    /// A stop that runs out of its budget must RETURN, and say so.
+    ///
+    /// The unbounded `veil_node_stop` cannot: the host's own deadline abandons
+    /// the wait while the call stays in `join`, and the handle is consumed by
+    /// then, so there is no second attempt (report9 X-17).
+    #[test]
+    fn a_stop_that_runs_out_of_budget_returns_and_reports_it() {
+        let node = node_running_for(Duration::from_secs(30));
+        let started = Instant::now();
+        let rc = unsafe { veil_node_stop_timeout(node, 150) };
+        let waited = started.elapsed();
+        assert_eq!(rc, 1, "a node that did not finish must report 1, not 0");
+        assert!(
+            waited < Duration::from_secs(5),
+            "the bounded stop waited {waited:?} on a 150ms budget — it is not \
+             bounded at all"
+        );
+    }
+
+    /// And the ordinary case still finishes and says so.
+    ///
+    /// Without this the test above passes on an implementation that returns 1
+    /// unconditionally, which would report every clean shutdown as abandoned.
+    #[test]
+    fn a_node_that_stops_reports_that_it_stopped() {
+        let node = node_running_for(Duration::from_millis(1));
+        let rc = unsafe { veil_node_stop_timeout(node, 5_000) };
+        assert_eq!(rc, 0, "a node whose thread finished must report 0");
+    }
+
+    #[test]
+    fn a_null_handle_is_refused_rather_than_dereferenced() {
+        assert_eq!(
+            unsafe { veil_node_stop_timeout(std::ptr::null_mut(), 10) },
+            -1
+        );
+    }
+
+    /// Detaching must not delete the runtime directory of a node that is still
+    /// using it.
+    ///
+    /// `VeilNode` owns a `TempDir`, and dropping the handle DELETES it — the
+    /// config, the identity-derived files and the obfs4 key. On the timeout
+    /// path the node is by construction still running, so freeing the handle
+    /// would pull those out from under it. The handle is leaked instead, and
+    /// this is what says so.
+    #[cfg(feature = "packet-tunnel")]
+    #[test]
+    fn a_detached_node_keeps_its_runtime_directory() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().to_path_buf();
+        std::fs::write(path.join("identity.toml"), b"x").expect("write");
+        let (tx, _rx) = tokio::sync::watch::channel(false);
+        let thread = std::thread::spawn(|| std::thread::sleep(Duration::from_secs(30)));
+        let node = Box::into_raw(Box::new(VeilNode {
+            shutdown: std::sync::Mutex::new(Some(tx)),
+            thread: std::sync::Mutex::new(Some(thread)),
+            admin_socket: None,
+            owned_runtime_dir: Some(dir),
+        }));
+        assert_eq!(unsafe { veil_node_stop_timeout(node, 100) }, 1);
+        assert!(
+            path.join("identity.toml").exists(),
+            "the detached node's runtime directory was deleted out from under \
+             it — the node is still running and those are its files"
+        );
+    }
 
     #[cfg(feature = "packet-tunnel")]
     #[test]
