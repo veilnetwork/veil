@@ -80,6 +80,18 @@ jobs:
           cargo metadata --manifest-path fuzz/Cargo.toml --locked --format-version 1 > /dev/null
           cargo audit --deny warnings --file fuzz/Cargo.lock
 
+      - name: cargo check (fuzz targets)
+        # The steps above read the fuzz crate's LOCKFILE and never build it,
+        # and the comment in ci.yml says so out loud: "Nothing in CI builds the
+        # crate either". So a fuzz target that stops compiling stops being
+        # coverage, silently. `fuzz_cipher_open` did exactly that when audit
+        # V-01 moved `frame_aad` into veil_proto and widened it from three
+        # bytes to the whole frame header.
+        #
+        # A type check, not a run: it costs one build of an out-of-workspace
+        # crate and answers the only question the other steps cannot.
+        run: cargo check --manifest-path fuzz/Cargo.toml --locked
+
       - name: Install cargo-deny
         run: cargo install cargo-deny --version "^0.19" --locked
 
