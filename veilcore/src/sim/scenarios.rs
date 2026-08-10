@@ -10,6 +10,51 @@ mod tests {
 
     use crate::{cfg::NodeRole, sim::SimNetwork};
 
+    /// How long a wait-on-condition loop in these scenarios may go before it
+    /// calls the thing broken.
+    ///
+    /// It is a FAILURE BOUND, not a delay: every use sits in a loop that
+    /// breaks the moment the condition holds, so a healthy run pays nothing
+    /// for a large number here. The old bounds — five to ten seconds — were
+    /// sized against a scenario running on its own, while
+    /// `cargo test --workspace` runs dozens of binaries at once on a machine
+    /// that is already saturated. DHT replication then takes longer than the
+    /// bound and the scenario fails for LOAD rather than for a defect, which
+    /// is a red gate nobody can read and everybody learns to re-run.
+    ///
+    /// What it costs: a genuinely stuck scenario takes this long to say so.
+    /// That is the right trade against a suite that flakes.
+    const SIM_WAIT_LIMIT: Duration = Duration::from_secs(60);
+
+    /// Charlie's view of every instance behind `node_id`, once it has settled.
+    ///
+    /// Sessions are established by the time a scenario asks, but each one's
+    /// sovereign identity is validated on its own task — so asking straight
+    /// away saw one device or two depending on how busy the machine was. It
+    /// failed as "fan-out resolved 1, expected 2", which reads like the
+    /// fan-out being broken rather than the question being asked early.
+    ///
+    /// Returns whatever it has at the deadline so the CALLER's assertion is
+    /// still the one that fails, with its own message.
+    async fn resolved_instances(
+        runtime: &veil_node_runtime::NodeRuntime,
+        node_id: [u8; 32],
+        want: usize,
+    ) -> Vec<[u8; 32]> {
+        use crate::proto::recipient::{InstanceTag, Recipient};
+        let deadline = tokio::time::Instant::now() + SIM_WAIT_LIMIT;
+        loop {
+            let targets = runtime.debug_resolve_recipient(&Recipient {
+                node_id,
+                instance_tag: InstanceTag::All,
+            });
+            if targets.len() >= want || tokio::time::Instant::now() >= deadline {
+                return targets;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
     // ── two-node IPC stream-forwarding e2e (raw IPC client over the sim) ────────
     //
     // Brings up two real `NodeRuntime`s on loopback TCP, each with a plain-Unix
@@ -29,6 +74,33 @@ mod tests {
             StreamOpenInboundPayload, StreamOpenOkPayload, StreamOpenPayload, decode_header,
             encode_header,
         };
+
+        /// Connect to a node's IPC socket, waiting for it to be there.
+        ///
+        /// `build()` returns once the nodes are constructed; binding the IPC
+        /// listener happens on their own tasks a moment later. Connecting
+        /// straight away therefore raced the bind, and lost whenever the
+        /// machine was busy — which on a full `cargo test --workspace` is
+        /// most of the time. It failed as `NotFound` on the socket path, so
+        /// it read like a missing file rather than a test that arrived early.
+        ///
+        /// Retrying until it answers is the fix rather than a longer sleep:
+        /// a sleep picks a number that is wrong on some machine, and this
+        /// waits exactly as long as it needs to.
+        async fn connect_ipc(path: &std::path::Path) -> UnixStream {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            let mut last = None;
+            while std::time::Instant::now() < deadline {
+                match UnixStream::connect(path).await {
+                    Ok(stream) => return stream,
+                    Err(e) => {
+                        last = Some(e);
+                        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                    }
+                }
+            }
+            panic!("ipc socket {path:?} never accepted a connection: {last:?}");
+        }
 
         fn sock_path(node: &crate::sim::SimNode) -> std::path::PathBuf {
             let uri = node
@@ -104,7 +176,7 @@ mod tests {
             let b_sock = sock_path(net.node(1));
 
             // ── B binds a named endpoint to accept inbound streams ──────────────
-            let mut b = UnixStream::connect(&b_sock).await.expect("connect B ipc");
+            let mut b = connect_ipc(&b_sock).await;
             hello(&mut b).await;
             const ENDPOINT: u32 = 7;
             let bind = AppBindPayload {
@@ -120,7 +192,7 @@ mod tests {
             let app_id = bind_ok.app_id;
 
             // ── A opens a stream to B's endpoint ────────────────────────────────
-            let mut a = UnixStream::connect(&a_sock).await.expect("connect A ipc");
+            let mut a = connect_ipc(&a_sock).await;
             hello(&mut a).await;
             let open = StreamOpenPayload {
                 dst_node_id: b_node_id,
@@ -569,7 +641,7 @@ mod tests {
         // reconnect typically completes within another ~500 ms, so on a
         // healthy machine we exit at ~3.5 s instead of 5 s. Generous 8 s
         // ceiling preserves the original safety margin.
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(8);
+        let deadline = tokio::time::Instant::now() + SIM_WAIT_LIMIT;
         let (ids_after_0, ids_after_1) = loop {
             let ids_now_0: std::collections::HashSet<_> = net
                 .node(0)
@@ -1368,7 +1440,7 @@ mod tests {
         // the dispatcher verifies + persists it (typically <300ms on fast
         // loopback) instead of always waiting the worst-case interval.
         let resp = {
-            let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+            let deadline = tokio::time::Instant::now() + SIM_WAIT_LIMIT;
             loop {
                 let r = net.node(2).runtime.lookup_local_app_endpoint(
                     owner_node_id,
@@ -1597,7 +1669,7 @@ mod tests {
         net.node(0).runtime.debug_force_dht_republish().await;
 
         let resolved_bytes = {
-            let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+            let deadline = tokio::time::Instant::now() + SIM_WAIT_LIMIT;
             loop {
                 if let Some(bytes) = net.node(1).runtime.dht_get_local(&dht_key) {
                     break Some(bytes);
@@ -1686,7 +1758,7 @@ mod tests {
         net.node(0).runtime.debug_force_dht_republish().await;
 
         // Edge-triggered poll: all 4 keys land on node 1.
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let deadline = tokio::time::Instant::now() + SIM_WAIT_LIMIT;
         loop {
             let holds_doc = net.node(1).runtime.dht_get_local(&doc_key).is_some();
             let holds_reg = net.node(1).runtime.dht_get_local(&reg_key).is_some();
@@ -1864,7 +1936,7 @@ mod tests {
             .unwrap();
         net.node(0).runtime.debug_force_dht_republish().await;
         let doc_key = IdentityDocument::dht_key(&alice_node_id);
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let deadline = tokio::time::Instant::now() + SIM_WAIT_LIMIT;
         loop {
             if let Some(b) = net.node(1).runtime.dht_get_local(&doc_key)
                 && let Ok(d) = IdentityDocument::decode(&b)
@@ -1991,7 +2063,7 @@ mod tests {
             .await
             .unwrap();
         net.node(0).runtime.debug_force_dht_republish().await;
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let deadline = tokio::time::Instant::now() + SIM_WAIT_LIMIT;
         loop {
             if let Some(b) = net.node(1).runtime.dht_get_local(&doc_key)
                 && let Ok(d) = IdentityDocument::decode(&b)
@@ -2113,10 +2185,13 @@ mod tests {
         // bogus `::Specific` returns empty.
         //
         // Multi-instance fan-out must resolve to BOTH peers post-fix.
-        let all_targets = charlie.debug_resolve_recipient(&Recipient {
-            node_id: alice_node_id,
-            instance_tag: InstanceTag::All,
-        });
+        // WAITED for, not assumed. Both of alice's sessions are established by
+        // here, but charlie validates each one's sovereign identity on its own
+        // task — so asking straight away sometimes saw one device and
+        // sometimes two, depending on how busy the machine was. It failed as
+        // "fan-out resolved 1, expected 2", which reads like the fan-out being
+        // broken rather than the question being asked early.
+        let all_targets = resolved_instances(charlie, alice_node_id, 2).await;
         assert_eq!(
             all_targets.len(),
             2,
@@ -2197,11 +2272,7 @@ mod tests {
         // Sanity: charlie's resolver knows about both alice
         // instances (the multi-instance fan-out fix wired
         // session-resumption to restore the binding).
-        use crate::proto::recipient::{InstanceTag, Recipient};
-        let all = charlie.debug_resolve_recipient(&Recipient {
-            node_id: alice_node_id,
-            instance_tag: InstanceTag::All,
-        });
+        let all = resolved_instances(charlie, alice_node_id, 2).await;
         assert_eq!(all.len(), 2);
 
         // Pick instance_a higher → that peer wins.
@@ -3628,7 +3699,7 @@ mod tests {
         // record locally once the STORE frame arrives + dispatcher persists.
         // On loopback this typically completes in <300ms; deadline = 5s
         // gives ~16x headroom for slow CI machines.
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let deadline = tokio::time::Instant::now() + SIM_WAIT_LIMIT;
         let peers_with_value = loop {
             let count = (1..n)
                 .filter(|i| net.node(*i).runtime.debug_dht_raw_value(&key) == Some(value.clone()))
@@ -3741,7 +3812,7 @@ mod tests {
         let alice_doc_key = IdentityDocument::dht_key(&alice_node_id);
         let bob_doc_key = IdentityDocument::dht_key(&bob_node_id);
 
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let deadline = tokio::time::Instant::now() + SIM_WAIT_LIMIT;
         loop {
             if net.node(1).runtime.dht_get_local(&alice_doc_key).is_some() {
                 break;
@@ -4098,7 +4169,7 @@ mod tests {
 
         // Wait for both records to replicate onto BOTH peers (nodes 1 and 2),
         // so node 1's resolve fan-out to {0, 2} reaches a 2-replica quorum.
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        let deadline = tokio::time::Instant::now() + SIM_WAIT_LIMIT;
         loop {
             let landed = |i: usize| {
                 net.node(i).runtime.dht_get_local(&claim_key).is_some()
@@ -4307,7 +4378,7 @@ mod tests {
         // a mesh of N=5 < K=8 should be in the K-closest set; once 4
         // are populated we know the fan-out finished and we can
         // begin tampering).
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(8);
+        let deadline = tokio::time::Instant::now() + SIM_WAIT_LIMIT;
         loop {
             let count = (0..n)
                 .filter(|i| net.node(*i).runtime.dht_get_local(&key).is_some())
@@ -4469,7 +4540,7 @@ mod tests {
         );
 
         // Edge-triggered: wait for both peers to hold the envelope.
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let deadline = tokio::time::Instant::now() + SIM_WAIT_LIMIT;
         loop {
             let n1_has = net.node(1).runtime.dht_get_local(&key).as_deref()
                 == Some(signed_envelope.as_slice());
@@ -4920,7 +4991,7 @@ mod tests {
         // ticket; the SERVER never dials back and caches none. (The old test
         // assumed BOTH sides cache one, which was never true once directional
         // dedup landed.) Discover which side is the client dynamically.
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let deadline = tokio::time::Instant::now() + SIM_WAIT_LIMIT;
         let client_idx = loop {
             if net.node(0).runtime.debug_peer_tickets_contains(&n1_id) {
                 break 0usize;
@@ -5700,13 +5771,37 @@ mod tests {
         // landed under which K-closest node. To make this test
         // deterministic, mirror each relay's directory entry into the
         // sender's local DHT cache directly.
-        for i in 1..n {
-            let relay_node_id = net.node(i).node_id();
-            let key = crate::node::anonymity::directory::relay_directory_dht_key(&relay_node_id);
-            if let Some(bytes) = net.node(i).runtime.dht_get_local(&key) {
-                net.node(0).runtime.dht_put_local(key, bytes);
+        // `if let Some(...)` and move on was the bug, in BOTH scenarios that
+        // carry this block: the publish above is awaited, but the entry
+        // reaching that node's own local shard is not the same moment.
+        // Whichever relays had not landed yet were silently skipped, and the
+        // send then failed as `InsufficientRelayCandidates { need: 2, have: 1
+        // }` — a mirroring step that gave up quietly, reported as a relay
+        // shortage.
+        let deadline = tokio::time::Instant::now() + SIM_WAIT_LIMIT;
+        let mut mirrored;
+        loop {
+            mirrored = 0usize;
+            for i in 1..n {
+                let relay_node_id = net.node(i).node_id();
+                let key =
+                    crate::node::anonymity::directory::relay_directory_dht_key(&relay_node_id);
+                if let Some(bytes) = net.node(i).runtime.dht_get_local(&key) {
+                    net.node(0).runtime.dht_put_local(key, bytes);
+                    mirrored += 1;
+                }
             }
+            if mirrored >= n - 1 || tokio::time::Instant::now() >= deadline {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
         }
+        assert_eq!(
+            mirrored,
+            n - 1,
+            "every relay's directory entry must be mirrored into the sender \
+             before it picks a circuit"
+        );
 
         // Send the anonymous message. hop_count = 3 means 2 relays + receiver.
         let payload = b"hi from anon sender";
@@ -5832,13 +5927,37 @@ mod tests {
                 .await
                 .expect("relay-capable node must succeed publish");
         }
-        for i in 1..n {
-            let relay_node_id = net.node(i).node_id();
-            let key = crate::node::anonymity::directory::relay_directory_dht_key(&relay_node_id);
-            if let Some(bytes) = net.node(i).runtime.dht_get_local(&key) {
-                net.node(0).runtime.dht_put_local(key, bytes);
+        // `if let Some(...)` and move on was the bug, in BOTH scenarios that
+        // carry this block: the publish above is awaited, but the entry
+        // reaching that node's own local shard is not the same moment.
+        // Whichever relays had not landed yet were silently skipped, and the
+        // send then failed as `InsufficientRelayCandidates { need: 2, have: 1
+        // }` — a mirroring step that gave up quietly, reported as a relay
+        // shortage.
+        let deadline = tokio::time::Instant::now() + SIM_WAIT_LIMIT;
+        let mut mirrored;
+        loop {
+            mirrored = 0usize;
+            for i in 1..n {
+                let relay_node_id = net.node(i).node_id();
+                let key =
+                    crate::node::anonymity::directory::relay_directory_dht_key(&relay_node_id);
+                if let Some(bytes) = net.node(i).runtime.dht_get_local(&key) {
+                    net.node(0).runtime.dht_put_local(key, bytes);
+                    mirrored += 1;
+                }
             }
+            if mirrored >= n - 1 || tokio::time::Instant::now() >= deadline {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
         }
+        assert_eq!(
+            mirrored,
+            n - 1,
+            "every relay's directory entry must be mirrored into the sender \
+             before it picks a circuit"
+        );
 
         // The receiver's verify task must resolve ALICE's IdentityDocument.
         // Publish it, then mirror it directly into the receiver's local DHT
