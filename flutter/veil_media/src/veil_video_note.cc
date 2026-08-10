@@ -71,6 +71,13 @@ constexpr int kSampleRate = 48000;
 constexpr int kOpusSdpChannels = 2;  // SDP convention (see veil_audio_record)
 constexpr int kOpusPayloadType = 111;
 constexpr int kDefaultSquare = 480;
+
+// Ceilings for a RECEIVED note's header. A clip made here is a 480-square at
+// ordinary camera rates; these leave room for four times that and still refuse
+// a header whose only purpose is to make the host allocate.
+constexpr uint16_t kMaxVnoteSide = 1920;
+constexpr uint8_t kMaxVnoteFps = 120;
+constexpr uint32_t kMaxVnoteDurationMs = 10 * 60 * 1000;
 constexpr int kDefaultFps = 24;
 constexpr int kKeyframeEveryMs = 2000;
 constexpr int kTargetBitrateBps = 500000;
@@ -777,6 +784,18 @@ extern "C" VeilVnotePlayer* veil_media_vnote_player_create(
   const uint32_t frame_count = rd_u32le(vnote + 20);
   if ((uint64_t)24 + audio_len > len) return nullptr;
   if ((flags & 1) && audio_len == 0) return nullptr;
+  // Dimensions, rate and duration are read straight off the wire and were the
+  // only header fields nothing bounded. The frame COUNT below is checked
+  // against what the container could hold, but width and height are not, and
+  // the host allocates its frame buffer from them: 65535 x 65535 x 4 asks for
+  // 17 GB on a clip 24 bytes long. A note recorded here is a 480-square, so
+  // these caps are four times anything the recorder produces and still refuse
+  // the absurd.
+  if (w == 0 || h == 0 || w > kMaxVnoteSide || h > kMaxVnoteSide) {
+    return nullptr;
+  }
+  if (fps == 0 || fps > kMaxVnoteFps) return nullptr;
+  if (dur > kMaxVnoteDurationMs) return nullptr;
 
   auto p = new VeilVnotePlayer(webrtc::CreateEnvironment());
   p->bytes.assign(vnote, vnote + len);
