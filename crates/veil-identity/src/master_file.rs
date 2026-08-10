@@ -73,6 +73,7 @@
 
 use std::fs;
 use std::io;
+use std::io::Read as _;
 use std::path::Path;
 
 use argon2::{Algorithm, Argon2, Params, Version};
@@ -146,7 +147,7 @@ pub enum MasterFileError {
     KdfTooWeak {
         m_cost: u32,
         t_cost: u32,
-        p_cost: u8,
+        p_cost: u32,
     },
     #[error(
         "master file KDF parameters above maximum (m_cost={m_cost}, \
@@ -155,12 +156,58 @@ pub enum MasterFileError {
     KdfTooStrong {
         m_cost: u32,
         t_cost: u32,
-        p_cost: u8,
+        p_cost: u32,
     },
     #[error("master file password is wrong or file is corrupt")]
     WrongPasswordOrTampered,
     #[error("argon2 error: {0}")]
     Argon2(String),
+}
+
+/// Upper bounds on the in-band Argon2id cost parameters.
+///
+/// The bundle is attacker-photographable (QR cold-backup import, pasteable
+/// `veil:master-backup` URI), so on the READ side these stop an unbounded KDF
+/// before any work happens — m_cost up to `u32::MAX` would make argon2 attempt
+/// a ~4 TiB allocation before the AEAD tag is even checked. Generous beyond any
+/// legitimate schedule: OWASP m=64 MiB t=3 = 192 MiB·iter sits far inside.
+const MAX_M_COST_KIB: u32 = 1_048_576; // 1 GiB
+const MAX_T_COST: u32 = 1000;
+const MAX_P_COST: u32 = 64;
+const MAX_KDF_PRODUCT_KIB: u64 = 256 * 1024 * 1024; // 256 GiB·iter
+
+/// The one place the cost bounds are decided, used by the encoder and the
+/// decoder alike.
+///
+/// Shared because they used to disagree, and the disagreement was silent
+/// (report9 V-16). The encoder took `p_cost: u32`, derived the key with the
+/// FULL value and wrote `p_cost as u8` to the wire — so `p = 65` produced a
+/// file the decoder refuses as too strong, and `p = 256` truncated to 0 and
+/// came back as too weak. Either way the caller wrote a backup nobody can
+/// open, and found out only when they tried to restore it.
+///
+/// Refusing at encode time is the whole point: write nothing that cannot be
+/// read back.
+fn check_kdf_params(m_cost_kib: u32, t_cost: u32, p_cost: u32) -> Result<(), MasterFileError> {
+    if m_cost_kib < MIN_M_COST_KIB || t_cost < MIN_T_COST || u32::from(MIN_P_COST) > p_cost {
+        return Err(MasterFileError::KdfTooWeak {
+            m_cost: m_cost_kib,
+            t_cost,
+            p_cost,
+        });
+    }
+    if m_cost_kib > MAX_M_COST_KIB
+        || t_cost > MAX_T_COST
+        || p_cost > MAX_P_COST
+        || u64::from(m_cost_kib).saturating_mul(u64::from(t_cost)) > MAX_KDF_PRODUCT_KIB
+    {
+        return Err(MasterFileError::KdfTooStrong {
+            m_cost: m_cost_kib,
+            t_cost,
+            p_cost,
+        });
+    }
+    Ok(())
 }
 
 // ── Public API ───────────────────────────────────────────────────────────────
@@ -218,6 +265,10 @@ pub fn encode_master_seed_encrypted_with(
     t_cost: u32,
     p_cost: u32,
 ) -> Result<Vec<u8>, MasterFileError> {
+    // Before the salt, the nonce and the KDF: a bundle this build cannot read
+    // back must never be written (report9 V-16).
+    check_kdf_params(m_cost_kib, t_cost, p_cost)?;
+
     let mut salt = [0u8; KDF_SALT_LEN];
     OsRng.fill_bytes(&mut salt);
     let mut nonce = [0u8; AEAD_NONCE_LEN];
@@ -255,16 +306,6 @@ pub fn decode_master_seed_encrypted(
         )));
     }
     let parsed = decode_file(bytes)?;
-    if parsed.m_cost_kib < MIN_M_COST_KIB
-        || parsed.t_cost < MIN_T_COST
-        || parsed.p_cost < MIN_P_COST
-    {
-        return Err(MasterFileError::KdfTooWeak {
-            m_cost: parsed.m_cost_kib,
-            t_cost: parsed.t_cost,
-            p_cost: parsed.p_cost,
-        });
-    }
     // audit cycle-7 (MED): clamp the UPPER bound + m_cost×t_cost product of the
     // in-band Argon2id cost params BEFORE any KDF work. The bundle is
     // attacker-photographable (QR cold-backup import / pasteable
@@ -276,21 +317,7 @@ pub fn decode_master_seed_encrypted(
     // 2026-05-25 phase L): 1 GiB memory / 1000 iters / 64 lanes individual caps
     // + a 256 GiB·iter product cap — generous beyond any legitimate Argon2
     // schedule (OWASP m=64 MiB t=3 = 192 MiB·iter sits far inside this).
-    const MAX_M_COST_KIB: u32 = 1_048_576; // 1 GiB
-    const MAX_T_COST: u32 = 1000;
-    const MAX_P_COST: u8 = 64;
-    const MAX_KDF_PRODUCT_KIB: u64 = 256 * 1024 * 1024; // 256 GiB·iter
-    if parsed.m_cost_kib > MAX_M_COST_KIB
-        || parsed.t_cost > MAX_T_COST
-        || parsed.p_cost > MAX_P_COST
-        || (parsed.m_cost_kib as u64).saturating_mul(parsed.t_cost as u64) > MAX_KDF_PRODUCT_KIB
-    {
-        return Err(MasterFileError::KdfTooStrong {
-            m_cost: parsed.m_cost_kib,
-            t_cost: parsed.t_cost,
-            p_cost: parsed.p_cost,
-        });
-    }
+    check_kdf_params(parsed.m_cost_kib, parsed.t_cost, u32::from(parsed.p_cost))?;
     let key = derive_key(
         password,
         &parsed.salt,
@@ -345,7 +372,15 @@ pub fn load_master_seed_encrypted(
     // useful to a future cracker, and zeroizing all key-adjacent
     // material is cheap insurance against a memory-disclosure bug
     // elsewhere in the process.
-    let bytes: Zeroizing<Vec<u8>> = Zeroizing::new(fs::read(path)?);
+    // Bounded at the cap plus one, not `fs::read` (report9 V-15). The size
+    // refusal lived in the decoder, so the whole file was already in memory by
+    // the time it fired: a large file — or a special one that never ends —
+    // was read in full first. One byte over the cap is enough for the decoder
+    // to give the same refusal it always gave.
+    let mut bytes: Zeroizing<Vec<u8>> = Zeroizing::new(Vec::new());
+    fs::File::open(path)?
+        .take(MAX_MASTER_FILE_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)?;
     decode_master_seed_encrypted(&bytes, password)
 }
 
@@ -568,6 +603,78 @@ mod tests {
             TEST_P_COST,
         )
         .unwrap();
+    }
+
+    /// A bundle this build cannot read back must never be written.
+    ///
+    /// The encoder took `p_cost: u32`, derived the key with the full value and
+    /// wrote `p_cost as u8`. So `p = 65` produced a file the decoder refuses as
+    /// too strong, and `p = 256` truncated to 0 and came back as too weak —
+    /// either way a backup nobody can open, discovered only at restore time
+    /// (report9 V-16).
+    #[test]
+    fn refuses_to_write_a_backup_it_could_not_read_back() {
+        let dir = tempdir();
+        let seed = [7u8; MASTER_SEED_LEN];
+        for p_cost in [65u32, 256, 0] {
+            let path = dir.join(format!("master-p{p_cost}.enc"));
+            let err = save_master_seed_encrypted_with(
+                &path,
+                &seed,
+                b"pw",
+                TEST_M_COST_KIB,
+                TEST_T_COST,
+                p_cost,
+            )
+            .expect_err("p_cost={p_cost} must be refused before anything is written");
+            assert!(
+                matches!(
+                    err,
+                    MasterFileError::KdfTooStrong { .. } | MasterFileError::KdfTooWeak { .. }
+                ),
+                "p_cost={p_cost} gave {err:?}"
+            );
+            assert!(
+                !path.exists(),
+                "a file was written for p_cost={p_cost} that cannot be opened again"
+            );
+        }
+    }
+
+    /// And the values that are representable still work — a check that refuses
+    /// everything would pass the test above and break every save.
+    #[test]
+    fn the_representable_costs_still_round_trip() {
+        let dir = tempdir();
+        let path = dir.join("master-ok.enc");
+        let seed = [9u8; MASTER_SEED_LEN];
+        save_master_seed_encrypted_with(&path, &seed, b"pw", TEST_M_COST_KIB, TEST_T_COST, 64)
+            .expect("p_cost at the cap is representable and must be accepted");
+        assert_eq!(
+            *load_master_seed_encrypted(&path, b"pw").unwrap(),
+            seed,
+            "a file written at the cap must open"
+        );
+    }
+
+    /// An oversized file is refused WITHOUT being read in full.
+    ///
+    /// The size refusal lived in the decoder, so `fs::read` had already pulled
+    /// the whole file into memory by the time it fired (report9 V-15). The
+    /// refusal names the buffer it judged, which is what makes this
+    /// discriminating: bounded, it reports 513 bytes; unbounded, it reports
+    /// however many megabytes the file happens to be.
+    #[test]
+    fn an_oversized_file_is_refused_without_reading_all_of_it() {
+        let dir = tempdir();
+        let path = dir.join("huge.enc");
+        fs::write(&path, vec![0u8; 4 * 1024 * 1024]).unwrap();
+        let err = load_master_seed_encrypted(&path, b"pw").expect_err("must refuse");
+        let text = err.to_string();
+        assert!(
+            text.contains(&format!("{}B >", MAX_MASTER_FILE_BYTES + 1)),
+            "the loader read more than the cap plus one byte: {text}"
+        );
     }
 
     #[test]
