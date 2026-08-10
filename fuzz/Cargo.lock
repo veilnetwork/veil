@@ -3169,8 +3169,11 @@ dependencies = [
  "rand_core 0.6.4",
  "sha2",
  "thiserror 2.0.19",
+ "veil-crypto",
  "veil-proto",
+ "veil-ratchet",
  "veil-util",
+ "x25519-dalek",
  "zeroize",
 ]
 
@@ -3434,6 +3437,7 @@ dependencies = [
  "veil-ipc",
  "veil-mesh",
  "veil-pex",
+ "veil-proto",
  "veil-proxy",
  "veil-routing",
  "veil-types",
@@ -3509,6 +3513,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "veil-ratchet"
+version = "0.4.2"
+dependencies = [
+ "chacha20poly1305",
+ "hkdf",
+ "ml-kem",
+ "rand_core 0.6.4",
+ "sha2",
+ "subtle",
+ "thiserror 2.0.19",
+ "x25519-dalek",
+ "zeroize",
+]
+
+[[package]]
 name = "veil-reputation"
 version = "0.4.2"
 dependencies = [
@@ -3522,6 +3541,7 @@ version = "0.4.2"
 dependencies = [
  "blake3",
  "ed25519-dalek",
+ "rand_core 0.6.4",
  "serde",
  "tokio",
  "veil-abuse",
