@@ -277,11 +277,26 @@ pub trait BindClosure: Send + Sync + 'static {
 
 // ── Rate limiter ────────────────────────────────────────────────────
 
-/// Simple sliding-window-per-pubkey rate limiter.  Bounded growth: the
-/// outer `HashMap` is pruned on each insertion that finds itself > 2×
-/// `rate_burst * max_concurrent_slots` (a very loose bound — at typical
-/// production settings (burst=3, slots=16) we cap at ~96 entries
-/// before pruning, which is negligible memory).
+/// Simple sliding-window-per-pubkey rate limiter.
+///
+/// Growth is bounded two ways, and it used to have only the first. Over the
+/// soft cap the map drops every entry whose whole history has expired — which
+/// removes nothing at all when the requesters are ACTIVE. A caller who keeps
+/// distinct pubkeys busy inside the window therefore grew the map without
+/// limit AND made every later admitted request walk all of it under the lock:
+/// O(N) per request, O(N²) over the flood (report9 V-18). Distinct pubkeys
+/// cost a signature and a proof of work, which is a price, not a wall.
+///
+/// So when expiry alone cannot bring it back under the cap, the
+/// least-recently-seen entries are evicted down to a target. Evicting an
+/// active entry hands that requester a fresh budget, and that is not a way
+/// around the limiter: this limits PER PUBKEY, so anyone who can mint another
+/// pubkey already has a fresh budget without evicting anything. The proof of
+/// work is what prices that, and it is unaffected here.
+///
+/// Evicting in a batch rather than one at a time is what keeps the amortized
+/// cost flat: the scan happens once per quarter-cap of admissions, not once
+/// per admission.
 #[derive(Debug)]
 pub struct RateLimiter {
     window: Duration,
@@ -314,14 +329,35 @@ impl RateLimiter {
         }
         entry.push(now);
 
-        // Optional global prune to bound memory.  Cheap: drop the
-        // entry entirely if its history is empty AND it's an older
-        // key; this keeps the map to size O(active requesters in window).
+        // Global prune to bound memory. First by expiry, which is free and
+        // right whenever the flood has moved on.
         if self.state.len() > self.soft_cap {
             self.state.retain(|_, ts| {
                 ts.retain(|t| now.duration_since(*t) <= self.window);
                 !ts.is_empty()
             });
+        }
+        // Expiry removes nothing when every requester is active, which is
+        // exactly the case that has to be bounded. Evict the
+        // least-recently-seen down to a target below the cap so the next
+        // admissions are free.
+        if self.state.len() > self.soft_cap {
+            let target = (self.soft_cap * 3 / 4).max(1);
+            let mut seen: Vec<([u8; 32], Instant)> = self
+                .state
+                .iter()
+                .filter_map(|(key, ts)| ts.last().map(|last| (*key, *last)))
+                .collect();
+            seen.sort_unstable_by_key(|(_, last)| *last);
+            let excess = self.state.len().saturating_sub(target);
+            for (key, _) in seen.iter().take(excess) {
+                // Never evict the requester we just admitted: dropping its
+                // fresh entry would hand it an unlimited budget, one call at
+                // a time.
+                if *key != requester {
+                    self.state.remove(key);
+                }
+            }
         }
         true
     }
@@ -329,6 +365,13 @@ impl RateLimiter {
     /// Test/diagnostics helper. (audit cycle-3: `#[cfg(test)]` instead of
     /// `#[allow(dead_code)]` — its only caller, `rate_limiter_entries_for`, is
     /// itself test-only.)
+    /// How many requesters are tracked right now — the quantity the caps are
+    /// about.
+    #[cfg(test)]
+    fn tracked(&self) -> usize {
+        self.state.len()
+    }
+
     #[cfg(test)]
     fn current_entries(&self, requester: &[u8; 32]) -> usize {
         self.state.get(requester).map(|v| v.len()).unwrap_or(0)
@@ -1205,6 +1248,58 @@ mod tests {
         let later = now + Duration::from_millis(100);
         rl.allow([0xFFu8; 32], later);
         assert!(rl.state.len() <= 5, "expected prune to bound map");
+    }
+
+    /// A flood of ACTIVE pubkeys must not grow the map without limit.
+    ///
+    /// Expiry-only pruning removes nothing while everyone is inside the
+    /// window, so the map grew per distinct pubkey and every later admitted
+    /// request walked all of it under the lock (report9 V-18).
+    #[test]
+    fn rate_limiter_bounds_a_flood_of_active_pubkeys() {
+        let cap = 8;
+        let mut rl = RateLimiter::new(Duration::from_secs(60), 1, cap);
+        let now = Instant::now();
+        // Every one of these is INSIDE the window, so nothing can expire.
+        for i in 0..200u32 {
+            let mut key = [0u8; 32];
+            key[..4].copy_from_slice(&i.to_be_bytes());
+            assert!(
+                rl.allow(key, now),
+                "a fresh pubkey is within its own budget"
+            );
+        }
+        assert!(
+            rl.tracked() <= cap,
+            "the map grew to {} with a soft cap of {cap} — a flood of active \
+             pubkeys is unbounded in memory, and every admitted request walks \
+             all of it",
+            rl.tracked()
+        );
+    }
+
+    /// And the requester that was just admitted keeps its history.
+    ///
+    /// Evicting it would be worse than not evicting at all: its budget would
+    /// reset on every call, so the limiter would stop limiting the one
+    /// identity flooding hardest.
+    #[test]
+    fn the_just_admitted_requester_is_never_the_one_evicted() {
+        let cap = 4;
+        let mut rl = RateLimiter::new(Duration::from_secs(60), 2, cap);
+        let now = Instant::now();
+        let flooder = [0xAAu8; 32];
+        for i in 0..50u32 {
+            let mut key = [0u8; 32];
+            key[..4].copy_from_slice(&i.to_be_bytes());
+            rl.allow(key, now);
+            rl.allow(flooder, now);
+        }
+        assert!(
+            !rl.allow(flooder, now),
+            "the flooder's own history was evicted, so its budget resets on \
+             every call and the limit never binds"
+        );
     }
 
     // ── PSK uniqueness ────────────────────────────────────────────
