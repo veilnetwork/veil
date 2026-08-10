@@ -281,6 +281,11 @@ struct RuntimeBundle {
     /// generation, with the superseded id removed when a promotion publishes.
     /// Inventing a validity check on this side would have to guess which node
     /// belongs to which handle, and in all-online mode there are several.
+    ///
+    /// Gated with its only reader: `embedded_services_for_bundle` is
+    /// `node-embedded`, and without that feature this is a mutex nothing
+    /// touches. Built without it, the crate failed its own lint gate.
+    #[cfg(feature = "node-embedded")]
     cached_node_id: StdMutex<Option<[u8; 32]>>,
 }
 
@@ -2852,6 +2857,7 @@ pub unsafe extern "C" fn veil_connect(
         runtime: std::mem::ManuallyDrop::new(runtime),
         client: TokioMutex::new(client),
         pending_mailbox_fetch: StdMutex::new(None),
+        #[cfg(feature = "node-embedded")]
         cached_node_id: StdMutex::new(None),
     });
     // IPC keepalive. The daemon reaps an established IPC connection after
