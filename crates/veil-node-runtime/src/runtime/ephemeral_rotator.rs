@@ -165,6 +165,29 @@ impl std::fmt::Debug for ListenerSwap {
     }
 }
 
+/// What to BIND and what to ADVERTISE, which are different questions.
+///
+/// They were answered with one value, and that is the whole of report9 V-06:
+/// the operator's `advertise` address — a public IP or a DNS name this machine
+/// need not own — was handed to `bind`. Every rotation then failed to rebind
+/// and the listener never moved, in exactly the configuration `advertise`
+/// exists for. Absent an `advertise` URI the two coincide, which is why it went
+/// unnoticed: the default configuration is the one where the bug cannot show.
+///
+/// Returns `(bind_uri, bind_host, advertise_uri, advertise_host)`.
+fn rotation_targets(
+    listen_uri: &TransportUri,
+    advertise_uri: Option<&TransportUri>,
+) -> (TransportUri, String, TransportUri, String) {
+    let bind_host = listen_uri.plaintext_host().unwrap_or("0.0.0.0").to_owned();
+    let advertise = advertise_uri.cloned().unwrap_or_else(|| listen_uri.clone());
+    let advertise_host = advertise
+        .plaintext_host()
+        .map(str::to_owned)
+        .unwrap_or_else(|| bind_host.clone());
+    (listen_uri.clone(), bind_host, advertise, advertise_host)
+}
+
 /// Binds a port the rotator has probed free and puts it into service
 /// alongside the listener already accepting.
 ///
@@ -346,7 +369,8 @@ pub fn wire_ephemeral_rotator(
     let grace = parse_duration_spec(&eph.grace_period)
         .map_err(|e| format!("grace_period parse failed: {e}"))?;
     let (port_lo, port_hi) = eph.range;
-    let host = listen_uri.plaintext_host().unwrap_or("0.0.0.0").to_owned();
+    let (bind_uri, host, template_source, template_host) =
+        rotation_targets(listen_uri, advertise_uri);
 
     let spec = RotationSpec::new(
         host.clone(),
@@ -358,14 +382,9 @@ pub fn wire_ephemeral_rotator(
     .map_err(|e| format!("spec invalid: {e}"))?;
 
     // ── URI template for the broadcast payload ────────────────────
-    // Prefer the operator's `advertise` URI as the template when set
-    // (so peers learn the externally-reachable address rather than
-    // the bind host).  When absent, fall back to the bind URI.
-    let template_source = advertise_uri.cloned().unwrap_or_else(|| listen_uri.clone());
-    let template_host = template_source
-        .plaintext_host()
-        .map(|s| s.to_owned())
-        .unwrap_or_else(|| host.clone());
+    // The operator's `advertise` URI when set, so peers learn the
+    // externally-reachable address rather than the bind host; the bind URI
+    // otherwise. See `rotation_targets` for why these are kept apart.
     let template_for_broadcast = template_source.clone();
     let host_for_broadcast = template_host.clone();
     let uri_template: UriTemplate = Box::new(move |port: u16| {
@@ -386,8 +405,11 @@ pub fn wire_ephemeral_rotator(
     // loop ahead of the broadcast, so a port nothing came up on is never
     // advertised — see `run_rotation_loop`.
     let adopter = ListenerAdopter {
-        template: template_source,
-        host: template_host,
+        // The BIND side of `rotation_targets`. The adopter's only job is to
+        // make the port real; what peers are told is the broadcast template's
+        // business, and conflating the two is report9 V-06.
+        template: bind_uri,
+        host: host.clone(),
         registry,
         listen_ctx,
         swap_tx: listener_swap_tx.clone(),
@@ -712,6 +734,66 @@ mod tests {
             transport_ctx,
             logger,
         )
+    }
+
+    /// Binding and advertising must not be the same address.
+    ///
+    /// The rotator hands its adopter a URI to BIND and the broadcaster a URI to
+    /// ADVERTISE, and both came from the advertise template. So with `advertise`
+    /// set to a public address — which is what the option is for — every
+    /// rotation asked the kernel to bind an address this machine does not own,
+    /// the rebind failed, and the listener never moved (report9 V-06).
+    ///
+    /// Asserted on the decision rather than through a bind, because the bind is
+    /// what a machine with that address would refuse and this one cannot
+    /// reproduce: the wrong VALUE is the defect.
+    #[test]
+    fn bind_target_is_the_listen_address_not_the_advertised_one() {
+        // A scheme that shows its host: `plaintext_host` is None for obfs4 and
+        // every TLS scheme, and both sides then fall back to the same
+        // "0.0.0.0" — which is why the default deployment never saw this.
+        let listen = TransportUri::parse("tcp://127.0.0.1:5556").unwrap();
+        let advertise = TransportUri::parse("tcp://203.0.113.7:5556").unwrap();
+
+        let (bind_uri, bind_host, adv_uri, adv_host) = rotation_targets(&listen, Some(&advertise));
+        assert_eq!(
+            bind_host, "127.0.0.1",
+            "the rotator would bind an address this host does not own"
+        );
+        assert_eq!(bind_uri.to_string(), listen.to_string());
+        assert_eq!(
+            adv_host, "203.0.113.7",
+            "peers must still learn the externally reachable address"
+        );
+        assert_eq!(adv_uri.to_string(), advertise.to_string());
+    }
+
+    /// Without `advertise` the two coincide — which is why the swap above went
+    /// unnoticed, and why a test that only covers the default proves nothing.
+    #[test]
+    fn without_an_advertise_uri_both_targets_are_the_listen_address() {
+        let listen = TransportUri::parse("tcp://127.0.0.1:5556").unwrap();
+        let (bind_uri, bind_host, adv_uri, adv_host) = rotation_targets(&listen, None);
+        assert_eq!(bind_host, adv_host);
+        assert_eq!(bind_uri.to_string(), adv_uri.to_string());
+        assert_eq!(bind_host, "127.0.0.1");
+    }
+
+    /// What an encrypted listen URI actually resolves to, written down because
+    /// it surprised this pass.
+    ///
+    /// `plaintext_host` exists to warn operators about DPI-readable endpoints,
+    /// not to name a bind address — it is None for obfs4 and for every TLS
+    /// scheme. Using it here means an obfs4 listener rebinds on 0.0.0.0 no
+    /// matter which host the operator configured. That is pre-existing and
+    /// separate from V-06; it is asserted so the behaviour is a decision on
+    /// record rather than a surprise, and so a change to it fails loudly.
+    #[test]
+    fn an_encrypted_listen_uri_falls_back_to_all_interfaces() {
+        let listen = TransportUri::parse("obfs4-tcp://127.0.0.1:5556").unwrap();
+        let (_, bind_host, _, adv_host) = rotation_targets(&listen, None);
+        assert_eq!(bind_host, "0.0.0.0");
+        assert_eq!(adv_host, "0.0.0.0");
     }
 
     #[test]
