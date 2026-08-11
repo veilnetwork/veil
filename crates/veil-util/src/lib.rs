@@ -672,6 +672,47 @@ pub fn redact_addr_for_log(transport: &str) -> std::borrow::Cow<'_, str> {
     }
 }
 
+/// Whether hickory-resolver's system-DNS configuration reader can run on
+/// `target_os` without aborting the process.
+///
+/// `hickory-resolver`'s `Resolver::builder_tokio()` (and `TokioResolver::
+/// builder_tokio()`) call `system_conf::read_system_conf()`. Every platform
+/// implements that by parsing a file — except Android, whose implementation
+/// (`hickory-resolver-0.26.1/src/system_conf/android.rs:10`) opens with
+///
+/// ```text
+/// let ctx = ndk_context::android_context();
+/// ```
+///
+/// and `ndk_context::android_context()` is
+/// `ANDROID_CONTEXT.expect("android context was not initialized")`. Nothing in
+/// this workspace — and nothing in the hosting app — ever calls
+/// `ndk_context::initialize_android_context`, because that needs a global-ref'd
+/// Java `Context` that only the app process can hand over. So on Android that
+/// `expect` always fires, and with `panic = "abort"` (workspace release profile)
+/// a panic on a tokio worker is an immediate `SIGABRT` — not an `Err` the
+/// caller can fall back from, and not something a `JoinHandle` can catch.
+///
+/// Callers of this predicate are the ones that treat resolver construction as
+/// *fallible* (`.ok()?`, `Err(_) => Vec::new()`). This function restores that
+/// contract on Android by telling them to skip the constructor entirely, so the
+/// documented soft-failure path runs instead of the process dying.
+///
+/// Takes the OS name instead of reading `cfg!` directly so the decision is
+/// testable from any host; production call sites pass [`std::env::consts::OS`],
+/// which is `"android"` for every Android target.
+///
+/// This does NOT make a Veil node DNS-blind on Android:
+/// * A/AAAA resolution goes through `tokio::net::lookup_host` (getaddrinfo),
+///   which needs no JVM context.
+/// * Seed discovery's DoT and DoH stages build resolvers from pinned upstream
+///   IPs (`ResolverConfig::tls` / `::https`) and never touch system config.
+///
+/// Only the paths that *enumerate the OS nameservers* are affected.
+pub fn system_dns_config_readable(target_os: &str) -> bool {
+    target_os != "android"
+}
+
 /// Probe the device's battery level (0-100 percent).
 ///
 /// Returns 100 (assume full / no battery) on:
@@ -902,6 +943,145 @@ impl From<Ttl> for std::time::Duration {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Android is the one target whose hickory `read_system_conf` reaches for
+    /// an uninitialised `ndk_context`, so it is the one target that must be
+    /// refused. Weakening this to `true` puts the `SIGABRT` back.
+    #[test]
+    fn android_may_not_read_system_dns_config() {
+        assert!(
+            !system_dns_config_readable("android"),
+            "Android must never reach hickory's system_conf reader: it calls \
+             ndk_context::android_context(), which panics \"android context was \
+             not initialized\", and panic=abort turns that into SIGABRT on the \
+             tokio worker"
+        );
+    }
+
+    /// Every other target parses a config file and is safe — refusing them all
+    /// would silently drop the last-resort DNS stage on desktop too.
+    #[test]
+    fn non_android_targets_may_read_system_dns_config() {
+        for os in ["linux", "macos", "windows", "ios", "freebsd"] {
+            assert!(
+                system_dns_config_readable(os),
+                "{os} reads system DNS config from a file; it must stay enabled"
+            );
+        }
+    }
+
+    /// The production call sites pass `std::env::consts::OS`. Pin that this
+    /// host agrees with the predicate, so a rename of the constant's Android
+    /// spelling could not silently re-arm the abort.
+    #[test]
+    fn host_os_constant_is_accepted_off_android() {
+        assert_eq!(
+            system_dns_config_readable(std::env::consts::OS),
+            std::env::consts::OS != "android"
+        );
+    }
+
+    /// Structural guard for the abort itself.
+    ///
+    /// The unit tests above prove the *predicate* is right; they cannot prove
+    /// it is *used*, and the abort only reproduces on an Android device — no
+    /// test on this host can execute the panicking branch. So pin the shape
+    /// instead: every non-comment system-config resolver constructor in the
+    /// workspace must be accompanied, in its own file, by at least as many
+    /// `system_dns_config_readable(` guards.
+    ///
+    /// The hazard list is exhaustive against hickory 0.26: `read_system_conf`
+    /// has exactly two entries, `TokioResolver::builder_tokio()` and
+    /// `Resolver::builder(provider)` — the latter is what the former delegates
+    /// to. `Resolver::builder_with_config(...)` is deliberately absent: it
+    /// takes an explicit `ResolverConfig` (that is how the DoT and DoH stages
+    /// build, from pinned upstream IPs) and never reads system config, so it
+    /// is safe on Android and must NOT be gated.
+    ///
+    /// Adding an unguarded system-config resolver anywhere in `crates/` turns
+    /// this red. Deleting a guard while leaving its constructor turns this
+    /// red. That is the property that keeps `libveilclient_ffi.so` from
+    /// re-acquiring a `SIGABRT` on the "no seeds at all" path.
+    #[test]
+    fn every_system_conf_resolver_is_android_guarded() {
+        /// Constructors that reach `hickory_resolver::system_conf::read_system_conf`.
+        const HAZARDS: [&str; 2] = ["builder_tokio(", "Resolver::builder("];
+
+        fn code_lines(src: &str) -> impl Iterator<Item = &str> {
+            src.lines().filter(|l| {
+                let t = l.trim_start();
+                !(t.starts_with("//") || t.starts_with("*") || t.starts_with("#!["))
+            })
+        }
+
+        fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            let Ok(entries) = std::fs::read_dir(dir) else {
+                return;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    // `target/` can be nested under a crate; never scan build
+                    // output — it contains vendored copies of hickory itself.
+                    if path.file_name().is_some_and(|n| n == "target") {
+                        continue;
+                    }
+                    walk(&path, out);
+                } else if path.extension().is_some_and(|e| e == "rs") {
+                    out.push(path);
+                }
+            }
+        }
+
+        let crates_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("veil-util lives at <workspace>/crates/veil-util")
+            .to_path_buf();
+        assert!(
+            crates_dir.join("veil-bootstrap").is_dir(),
+            "expected the workspace crates dir at {}",
+            crates_dir.display()
+        );
+
+        let mut files = Vec::new();
+        walk(&crates_dir, &mut files);
+
+        let mut constructor_files = 0usize;
+        for file in &files {
+            let Ok(src) = std::fs::read_to_string(file) else {
+                continue;
+            };
+            let constructors = code_lines(&src)
+                .filter(|l| HAZARDS.iter().any(|h| l.contains(h)))
+                .count();
+            if constructors == 0 {
+                continue;
+            }
+            constructor_files += 1;
+            let guards = code_lines(&src)
+                .filter(|l| l.contains("system_dns_config_readable("))
+                .count();
+            assert!(
+                guards >= constructors,
+                "{}: {constructors} system-config resolver constructor(s) but \
+                 only {guards} system_dns_config_readable guard(s). Every \
+                 {HAZARDS:?} must be skipped on Android — they reach \
+                 hickory's read_system_conf, which calls \
+                 ndk_context::android_context(), which panics \"android \
+                 context was not initialized\", and panic=abort makes that a \
+                 process-wide SIGABRT on a tokio worker.",
+                file.display(),
+            );
+        }
+
+        assert!(
+            constructor_files >= 2,
+            "expected to find the known system-config resolver sites \
+             (veil-bootstrap/src/dns.rs and veil-transport/src/ech_dns.rs); \
+             found {constructor_files}. If they were renamed this guard is \
+             scanning nothing and must be re-pointed."
+        );
+    }
 
     #[test]
     fn empty_input_is_empty_string() {

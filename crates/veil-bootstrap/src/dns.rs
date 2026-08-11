@@ -116,7 +116,25 @@ pub async fn discover_seeds_dns_secure(domain: &str) -> Vec<BootstrapPeer> {
 /// Plain-DNS seed discovery via the system resolver.  Used as a
 /// last-resort fallback by [`discover_seeds_dns`] and directly by tests
 /// (where DoT/DoH would touch the public internet).
+///
+/// # Android
+///
+/// Returns an empty vec without building a resolver.  Hickory reads the
+/// system nameserver list on Android by calling into the JVM, and its
+/// very first statement is `ndk_context::android_context()` — an
+/// `expect` on a static this workspace never initialises.  Under the
+/// workspace's `panic = "abort"` that is a `SIGABRT` on whichever tokio
+/// worker ran the task, not the `Err` the `match` below is written
+/// against.  See [`veil_util::system_dns_config_readable`].
+///
+/// Skipping the stage costs Android the censor-readable last resort
+/// only: the DoT and DoH stages above dial pinned upstream IPs and are
+/// unaffected, so seed discovery still works.
 pub async fn discover_seeds_dns_system(domain: &str) -> Vec<BootstrapPeer> {
+    if !veil_util::system_dns_config_readable(std::env::consts::OS) {
+        return Vec::new();
+    }
+
     let query_name = format!("_veil._bootstrap.{domain}.");
 
     // hickory-resolver 0.26 (RUSTSEC-2026-0119 fix) renamed `AsyncResolver`
