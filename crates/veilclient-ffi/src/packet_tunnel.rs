@@ -5,12 +5,13 @@
 //! entry point. This module invokes `general_run_async` directly with an owned
 //! cancellation token and exposes one process-wide VPN instance to Flutter.
 
+use std::cell::Cell;
 use std::ffi::{CStr, CString};
 use std::net::{IpAddr, SocketAddr};
 use std::os::fd::{FromRawFd, IntoRawFd, OwnedFd};
 use std::os::raw::{c_char, c_int, c_ushort, c_void};
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
@@ -63,7 +64,20 @@ struct PacketTunnel {
 /// waits for whoever is already inside to leave. After it returns, `ctx` is
 /// unreachable from this process whatever the worker is still doing, and the
 /// host is free to deallocate.
+///
+/// That rendezvous is also why stop cannot run *inside* the callback. The read
+/// lock a dispatch holds is exactly what `retire` waits for, so a host callback
+/// that calls stop synchronously would be waiting for its own stack frame —
+/// `std::sync::RwLock` tracks no reentrancy and would simply never return. The
+/// same call would reach `thread.join()` first on the path where the worker has
+/// already finished, and `Runtime::drop` there waits for the very tokio worker
+/// thread the callback is running on. Neither edge is closed by releasing the
+/// lock earlier; both are closed by refusing. [`IN_DISPATCH`] is how stop
+/// recognises the case.
 struct WriteSink {
+    /// Identifies this sink to [`IN_DISPATCH`]. Never zero, so "no dispatch on
+    /// this thread" and "dispatching some sink" cannot be confused.
+    id: u64,
     /// Checked before the lock is taken. Without it a steady stream of
     /// packets could keep readers arriving while `retire` waits for the
     /// write lock, and the wait would not be bounded.
@@ -71,9 +85,21 @@ struct WriteSink {
     slot: RwLock<Option<(PacketWriteFn, usize)>>,
 }
 
+thread_local! {
+    /// Id of the sink this thread is currently dispatching, 0 for none.
+    ///
+    /// Read by [`veil_packet_tunnel_stop`] to detect a stop issued from inside
+    /// the host's own packet callback, which it must refuse rather than serve:
+    /// on this thread the callback is on the stack, so every wait stop would
+    /// otherwise perform is a wait for this thread.
+    static IN_DISPATCH: Cell<u64> = const { Cell::new(0) };
+}
+
 impl WriteSink {
     fn new(write_cb: PacketWriteFn, write_ctx: *mut c_void) -> Self {
+        static NEXT_ID: AtomicU64 = AtomicU64::new(1);
         Self {
+            id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
             retired: AtomicBool::new(false),
             // Raw pointers are not Send. Stored as an integer and turned back
             // into a pointer only at callback time, under the read lock.
@@ -90,7 +116,12 @@ impl WriteSink {
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some((write_cb, write_ctx)) = guard.as_ref() {
+            // Save and restore rather than set and clear: the marker describes
+            // the innermost dispatch on this stack, and clearing it would tell
+            // an outer dispatch's stop that it is safe to block.
+            let previous = IN_DISPATCH.replace(self.id);
             write_cb(*write_ctx as *mut c_void, data.as_ptr(), data.len());
+            IN_DISPATCH.set(previous);
         }
     }
 
@@ -200,6 +231,14 @@ fn tunnel_slot() -> &'static Mutex<Option<PacketTunnel>> {
     static SLOT: OnceLock<Mutex<Option<PacketTunnel>>> = OnceLock::new();
     SLOT.get_or_init(|| Mutex::new(None))
 }
+
+/// Serialises the tests that install into, or assert on, the process-wide
+/// tunnel slot. Cargo runs a suite's tests on parallel threads and the slot is
+/// one object; without this, a test that installs a tunnel makes a test that
+/// asserts "no tunnel is running" fail for a reason that has nothing to do
+/// with either of them.
+#[cfg(test)]
+static SLOT_SERIAL: Mutex<()> = Mutex::new(());
 
 fn set_error(error: &Arc<Mutex<Option<String>>>, message: impl Into<String>) {
     *error
@@ -496,6 +535,13 @@ unsafe fn start_fd_impl(
 /// returns, so no call can reach the context afterwards. `write_cb` is
 /// required and must not be null (a null C function pointer violates this FFI
 /// contract).
+///
+/// `write_cb` must NOT call [`veil_packet_tunnel_stop`] on the callback's own
+/// thread. The one invocation stop would have to wait for is the caller's, so
+/// it cannot honour the promise above and refuses instead, answering
+/// `VEIL_ERR_REENTRANT` after requesting cancellation. Hand the stop to
+/// another thread — the Apple provider posts it to its packet queue — and the
+/// full guarantee applies again.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn veil_packet_tunnel_start_packets(
     proxy_url: *const c_char,
@@ -575,8 +621,45 @@ pub extern "C" fn veil_packet_tunnel_status() -> c_int {
         .unwrap_or(VEIL_TUNNEL_STOPPED)
 }
 
+/// Stop the running tunnel, or `VEIL_OK` when none is running.
+///
+/// Returns `VEIL_ERR_REENTRANT` when called from inside the host's packet
+/// callback. Cancellation is still requested in that case, so the host's
+/// intent is not dropped; only the waiting is skipped, and the caller must not
+/// read that code as "nothing happened".
 #[unsafe(no_mangle)]
 pub extern "C" fn veil_packet_tunnel_stop() -> c_int {
+    // Before anything that can block, including `cleanup_finished`: it joins a
+    // finished worker thread, and on the reentrant path that thread is inside
+    // `Runtime::drop` waiting for the tokio worker this callback is running on.
+    // Everything stop does afterwards — the join, and `retire` waiting for the
+    // read lock this dispatch holds — is a wait for this very thread.
+    {
+        let slot = tunnel_slot()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let dispatching = IN_DISPATCH.get();
+        let reentrant_cancel = match slot.as_ref() {
+            Some(tunnel)
+                if tunnel
+                    .sink
+                    .as_ref()
+                    .is_some_and(|sink| sink.id == dispatching) =>
+            {
+                Some(tunnel.cancel.clone())
+            }
+            _ => None,
+        };
+        drop(slot);
+        if let Some(cancel) = reentrant_cancel {
+            // Cheap, non-blocking and idempotent. The host asked for a stop and
+            // is about to be told "not from here"; the request itself still
+            // stands, and the worker unwinds on its own thread.
+            cancel.cancel();
+            return crate::VEIL_ERR_REENTRANT;
+        }
+    }
+
     let (cancel, sink) = {
         let mut slot = tunnel_slot()
             .lock()
@@ -751,6 +834,120 @@ mod write_sink_tests {
         );
         handle.join().expect("writer thread panicked");
     }
+
+    static MARKER_DURING_DISPATCH: AtomicU64 = AtomicU64::new(0);
+
+    extern "C" fn record_dispatch_marker(_ctx: *mut c_void, _data: *const u8, _len: usize) {
+        // Recorded, not asserted: unwinding out of an `extern "C" fn` aborts
+        // the process, which would take the whole suite down with it.
+        MARKER_DURING_DISPATCH.store(IN_DISPATCH.get(), Ordering::SeqCst);
+    }
+
+    /// A dispatch names itself on this thread, and only for its own duration.
+    ///
+    /// This is what lets stop tell "called from the host's callback" apart
+    /// from "called from anywhere else", and it is structural: no sleeps, no
+    /// second thread, nothing that can pass by being slow. The marker must be
+    /// absent before the call — otherwise a stop issued from an ordinary
+    /// thread would be refused for no reason — and absent again after it, or
+    /// the refusal outlives the callback and stop stops working entirely.
+    #[test]
+    fn a_dispatch_marks_this_thread_only_while_it_runs() {
+        let sink = WriteSink::new(record_dispatch_marker, std::ptr::null_mut());
+        assert_ne!(sink.id, 0, "0 is the reserved 'no dispatch' marker value");
+        assert_eq!(
+            IN_DISPATCH.get(),
+            0,
+            "this thread claims to be dispatching before anything was dispatched"
+        );
+
+        sink.write(b"egress packet");
+
+        assert_eq!(
+            MARKER_DURING_DISPATCH.load(Ordering::SeqCst),
+            sink.id,
+            "the host callback ran without this sink's marker set, so a stop \
+             called from inside it cannot be recognised as reentrant"
+        );
+        assert_eq!(
+            IN_DISPATCH.get(),
+            0,
+            "the marker outlived the dispatch — every later stop on this \
+             thread would be refused"
+        );
+    }
+
+    extern "C" fn stop_from_inside_the_callback(ctx: *mut c_void, _data: *const u8, _len: usize) {
+        let code = veil_packet_tunnel_stop();
+        // SAFETY: the test leaks the sender on purpose, precisely because on
+        // the failing path this callback is parked inside stop holding the
+        // pointer while the test thread unwinds.
+        let sender = unsafe { &*(ctx.cast::<std::sync::mpsc::Sender<c_int>>()) };
+        let _ = sender.send(code);
+    }
+
+    /// Stop called from inside the host callback must answer, not hang.
+    ///
+    /// Two separate waits inside stop are waits for this exact thread: `retire`
+    /// wants the write lock that this dispatch is holding as a reader, and the
+    /// join reaches `Runtime::drop`, which waits for the tokio worker the
+    /// callback is running on. `RwLock` has no reentrancy tracking, so the
+    /// first is a permanent self-deadlock rather than an error.
+    ///
+    /// The Apple provider is one deleted `packetQueue.async` away from this:
+    /// `failTunnel` already calls stop from the write path's own logic.
+    #[test]
+    fn stop_from_inside_the_callback_refuses_instead_of_deadlocking() {
+        let _serial = SLOT_SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        let (sender, receiver) = std::sync::mpsc::channel::<c_int>();
+        let sender = Box::into_raw(Box::new(sender));
+        let sink = Arc::new(WriteSink::new(
+            stop_from_inside_the_callback,
+            sender.cast::<c_void>(),
+        ));
+        let cancel = CancellationToken::new();
+        *tunnel_slot()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(PacketTunnel {
+            cancel: cancel.clone(),
+            phase: Arc::new(AtomicU8::new(VEIL_TUNNEL_RUNNING as u8)),
+            error: Arc::new(Mutex::new(None)),
+            packet_tx: None,
+            mtu: 1280,
+            thread: None,
+            sink: Some(Arc::clone(&sink)),
+        });
+
+        let writer = Arc::clone(&sink);
+        std::thread::spawn(move || writer.write(b"egress packet"));
+
+        // Bounded, and never joined: joining the writer is exactly the
+        // unbounded wait this test exists to prove impossible.
+        let outcome = receiver.recv_timeout(Duration::from_secs(10));
+        // Put the singleton back before anything can unwind, so a failure here
+        // does not cascade into every other test that reads it.
+        *tunnel_slot()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+
+        let code = outcome.expect(
+            "reentrant stop deadlocked: the host callback called \
+             veil_packet_tunnel_stop and never got an answer",
+        );
+        assert_eq!(
+            code,
+            crate::VEIL_ERR_REENTRANT,
+            "stop served a call it cannot honour from inside the callback"
+        );
+        assert!(
+            cancel.is_cancelled(),
+            "the refusal dropped the host's request: refusing to wait is not \
+             the same as refusing to stop"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -774,6 +971,9 @@ mod tests {
 
     #[test]
     fn invalid_inputs_fail_before_creating_global_tunnel() {
+        let _serial = SLOT_SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let proxy = CString::new("socks5://127.0.0.1:1080").unwrap();
         let dns = CString::new("1.1.1.1").unwrap();
         // SAFETY: pointers remain valid for the duration of the call.
@@ -786,6 +986,9 @@ mod tests {
 
     #[test]
     fn remote_proxy_is_rejected_so_vpn_cannot_bypass_veil() {
+        let _serial = SLOT_SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let proxy = CString::new("socks5://8.8.8.8:1080").unwrap();
         let dns = CString::new("1.1.1.1").unwrap();
         // fd is rejected too, but proxy validation happens first and both must
