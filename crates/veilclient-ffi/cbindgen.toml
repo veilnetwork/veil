@@ -108,4 +108,9 @@ bitflags = false
 # C define so consumers building the client-only dylib don't see symbols their
 # binary lacks. Hosts that link the `node-embedded` build define this.
 [defines]
+# Every cfg-gated item must map to a guard, or cbindgen emits it bare and
+# the canonical header promises symbols the default library does not have
+# (audit report10 V-08). A consumer then compiles cleanly and fails at link
+# or dlopen, which is the worst place to learn it.
 "feature = node-embedded" = "VEIL_FFI_NODE_EMBEDDED"
+"feature = packet-tunnel" = "VEIL_FFI_PACKET_TUNNEL"

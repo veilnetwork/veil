@@ -535,13 +535,21 @@
 #define NICKNAME_FREE 1
 #endif
 
+#if defined(VEIL_FFI_PACKET_TUNNEL)
 #define VEIL_TUNNEL_STOPPED 0
+#endif
 
+#if defined(VEIL_FFI_PACKET_TUNNEL)
 #define VEIL_TUNNEL_STARTING 1
+#endif
 
+#if defined(VEIL_FFI_PACKET_TUNNEL)
 #define VEIL_TUNNEL_RUNNING 2
+#endif
 
+#if defined(VEIL_FFI_PACKET_TUNNEL)
 #define VEIL_TUNNEL_ERROR 3
+#endif
 
 typedef struct Option_MediaRecvFn Option_MediaRecvFn;
 
@@ -770,6 +778,7 @@ typedef void (*VeilPeerCb)(void *user,
  */
 typedef void (*VeilEventCb)(void *user, uint8_t kind, const uint8_t *payload, size_t payload_len);
 
+#if defined(VEIL_FFI_PACKET_TUNNEL)
 /**
  * Host callback for one raw IP packet emitted by the userspace stack.
  *
@@ -779,6 +788,7 @@ typedef void (*VeilEventCb)(void *user, uint8_t kind, const uint8_t *payload, si
  * [`veil_packet_tunnel_stop`] returns.
  */
 typedef void (*PacketWriteFn)(void*, const uint8_t*, uintptr_t);
+#endif
 
 #ifdef __cplusplus
 extern "C" {
@@ -3256,7 +3266,7 @@ VeilNode *veil_node_start_deferred(const uint8_t *admin_socket_ptr,
 ;
 #endif
 
-#if defined(VEIL_FFI_NODE_EMBEDDED)
+#if (defined(VEIL_FFI_NODE_EMBEDDED) && defined(VEIL_FFI_PACKET_TUNNEL))
 /**
  * Start a dedicated, ephemeral Veil node that owns the SOCKS5 upstream for an
  * Apple Packet Tunnel extension.
@@ -3312,8 +3322,51 @@ int veil_node_apply_config(const VeilNode *node,
 
 #if defined(VEIL_FFI_NODE_EMBEDDED)
 /**
+ * Stop the embedded node with a BOUND on the wait, and say which happened.
+ *
+ * Returns `0` when the node's thread finished and everything it held was
+ * released; `1` when `timeout_ms` passed first and the thread was DETACHED;
+ * `-1` for a null handle.
+ *
+ * ## Why this exists (report9 X-17)
+ *
+ * [`veil_node_stop`] joins without a bound. A host that gives its teardown a
+ * deadline — xVeil gives it fifteen seconds — can abandon the WAIT, but the
+ * call stays blocked in `join`, and by then the handle has already been
+ * consumed. So there is no second attempt: retrying with the same pointer is
+ * a double free, and the app is left saying "locked" while a node it can no
+ * longer reach keeps its sockets and its network identity.
+ *
+ * This does not make a wedged node let go. Its sockets belong to a tokio
+ * runtime inside that thread, and the only thing that closes them is that
+ * runtime winding down; a thread cannot be killed from outside in Rust.
+ * What this buys is that the CALLER stops waiting, learns which of the two
+ * things happened, and can stop claiming a lock it does not have.
+ *
+ * ## What detaching leaks, and why on purpose
+ *
+ * On the timeout path the handle is deliberately NOT dropped. `VeilNode` owns
+ * the node's runtime directory (`owned_runtime_dir`, a `TempDir`), and
+ * dropping it DELETES that directory — the config, the identity-derived files
+ * and the obfs4 key of a node that is, by construction here, still running.
+ * Freeing the handle would take those out from under it. One small struct and
+ * one directory guard are leaked per wedged stop instead, and the directory
+ * then lives until the process exits, which is exactly as long as the node
+ * using it does.
+ *
+ * # Safety
+ * `node` must be a handle returned by `veil_node_start*` and not yet stopped.
+ */
+ int32_t veil_node_stop_timeout(VeilNode *node, uint64_t timeout_ms) ;
+#endif
+
+#if defined(VEIL_FFI_NODE_EMBEDDED)
+/**
  * Stop the embedded node: trigger graceful shutdown and join its thread.
  * Consumes the handle.
+ *
+ * Waits as long as it takes. A caller that cannot afford that wants
+ * [`veil_node_stop_timeout`], which bounds it and reports which way it went.
  *
  * # Safety
  * `node` must be a handle returned by `veil_node_start*` and not yet stopped.
@@ -3321,6 +3374,7 @@ int veil_node_apply_config(const VeilNode *node,
  void veil_node_stop(VeilNode *node) ;
 #endif
 
+#if defined(VEIL_FFI_PACKET_TUNNEL)
 /**
  * Start a packet engine over an OS-owned TUN file descriptor.
  *
@@ -3339,7 +3393,9 @@ int veil_packet_tunnel_start_fd(int tun_fd,
                                 bool packet_information,
                                 bool route_dns)
 ;
+#endif
 
+#if defined(VEIL_FFI_PACKET_TUNNEL)
 /**
  * Start a TUN engine whose SOCKS5 listener is selected per flow by an
  * authenticated loopback service (Android VpnService UID ownership lookup).
@@ -3357,7 +3413,9 @@ int veil_packet_tunnel_start_fd_routed(int tun_fd,
                                        const char *selector_addr,
                                        const char *selector_token)
 ;
+#endif
 
+#if defined(VEIL_FFI_PACKET_TUNNEL)
 /**
  * Start a packet engine over a host-owned packet callback.
  *
@@ -3369,9 +3427,22 @@ int veil_packet_tunnel_start_fd_routed(int tun_fd,
  *
  * The ingress queue is bounded to 64 packets. A full queue returns
  * `VEIL_ERR`; the provider should stop reading briefly and retry instead of
- * accumulating unbounded packet memory. The callback context must remain live
- * until [`veil_packet_tunnel_stop`] returns. `write_cb` is required and must
- * not be null (a null C function pointer violates this FFI contract).
+ * accumulating unbounded packet memory.
+ *
+ * The callback context must remain live until [`veil_packet_tunnel_stop`]
+ * returns, and that is a contract stop keeps on EVERY return path, including
+ * the one where it gives up on the worker and answers `VEIL_ERR`: it retires
+ * the callback and waits for any invocation already in flight before it
+ * returns, so no call can reach the context afterwards. `write_cb` is
+ * required and must not be null (a null C function pointer violates this FFI
+ * contract).
+ *
+ * `write_cb` must NOT call [`veil_packet_tunnel_stop`] on the callback's own
+ * thread. The one invocation stop would have to wait for is the caller's, so
+ * it cannot honour the promise above and refuses instead, answering
+ * `VEIL_ERR_REENTRANT` after requesting cancellation. Hand the stop to
+ * another thread — the Apple provider posts it to its packet queue — and the
+ * full guarantee applies again.
  */
 
 int veil_packet_tunnel_start_packets(const char *proxy_url,
@@ -3382,7 +3453,9 @@ int veil_packet_tunnel_start_packets(const char *proxy_url,
                                      PacketWriteFn write_cb,
                                      void *write_ctx)
 ;
+#endif
 
+#if defined(VEIL_FFI_PACKET_TUNNEL)
 /**
  * Queue one raw IP packet read from the host packet-flow API.
  *
@@ -3392,17 +3465,33 @@ int veil_packet_tunnel_start_packets(const char *proxy_url,
  * `data` before returning; the host may release its buffer immediately.
  */
  int veil_packet_tunnel_send_packet(const uint8_t *data, uintptr_t len) ;
+#endif
 
+#if defined(VEIL_FFI_PACKET_TUNNEL)
  int veil_packet_tunnel_status(void) ;
+#endif
 
+#if defined(VEIL_FFI_PACKET_TUNNEL)
+/**
+ * Stop the running tunnel, or `VEIL_OK` when none is running.
+ *
+ * Returns `VEIL_ERR_REENTRANT` when called from inside the host's packet
+ * callback. Cancellation is still requested in that case, so the host's
+ * intent is not dropped; only the waiting is skipped, and the caller must not
+ * read that code as "nothing happened".
+ */
  int veil_packet_tunnel_stop(void) ;
+#endif
 
+#if defined(VEIL_FFI_PACKET_TUNNEL)
 /**
  * Latest engine error, allocated with `CString::into_raw`. Free with the
  * existing `veil_free_string` ABI. Returns null when no error is recorded.
  */
  char *veil_packet_tunnel_last_error(void) ;
+#endif
 
+#if defined(VEIL_FFI_PACKET_TUNNEL)
 /**
  * Run xVeil's privileged Linux desktop packet-tunnel helper.
  *
@@ -3420,6 +3509,7 @@ int veil_packet_tunnel_start_packets(const char *proxy_url,
  * `config_path` must be a live NUL-terminated UTF-8 string for this call.
  */
  int veil_packet_tunnel_run_linux_helper(const char *config_path) ;
+#endif
 
 #if defined(VEIL_FFI_NODE_EMBEDDED)
 /**
