@@ -233,10 +233,17 @@ pub enum LocalListener {
         expected_token: LocalToken,
     },
     /// Windows NamedPipe listener with token authentication.
-    /// Unlike TCP, NamedPipe has no persistent listener — a fresh
-    /// `NamedPipeServer` instance is `create`d on every `accept` call
-    /// then `connect.await` waits for a client. The pipe `name` (full
-    /// `\\.\pipe\xxx` form) is stored so each accept knows what to bind.
+    ///
+    /// Unlike TCP there is no kernel listener object: a pipe name exists
+    /// only while at least one `NamedPipeServer` instance for it is open.
+    /// So this variant *owns* one — `listening` always holds a live
+    /// instance between [`bind_named_pipe`] and drop, and `accept_raw`
+    /// only takes it out once its replacement has been created. Holding
+    /// the name continuously is what makes the `first_pipe_instance(true)`
+    /// bind in [`bind_named_pipe`] mean anything: while this listener is
+    /// alive no other process can claim the name, so an attacker cannot
+    /// squat it in a gap between accepts and collect client tokens.
+    ///
     /// Default Windows DACL on the pipe permits any authenticated user to
     /// open it; the 32-byte token (file-protected by NTFS ACL) is the
     /// access-control gate, exactly as for TCP-loopback.
@@ -244,6 +251,13 @@ pub enum LocalListener {
     NamedPipe {
         /// Full Windows pipe name, e.g. `\\.\pipe\veil-admin-1234`.
         name: String,
+        /// The instance that currently owns the name and is waiting for a
+        /// client. Always `Some` — `accept_raw` refills it inside the same
+        /// critical section that empties it. The mutex is async because
+        /// `accept_raw` awaits `connect()` with the instance still parked
+        /// here: if that future is cancelled the instance stays in place
+        /// and the name is never released.
+        listening: tokio::sync::Mutex<Option<tokio::net::windows::named_pipe::NamedPipeServer>>,
         /// Expected token — clients must send exactly these 32 bytes first.
         expected_token: LocalToken,
     },
@@ -393,13 +407,42 @@ impl LocalListener {
             #[cfg(windows)]
             Self::NamedPipe {
                 name,
+                listening,
                 expected_token,
             } => {
                 use tokio::net::windows::named_pipe::ServerOptions;
-                let server = ServerOptions::new()
+                // Wait for the client on the instance we already own,
+                // while it stays parked in `listening`. Two consequences,
+                // both deliberate:
+                //   * the pipe name is owned for the whole wait, so there
+                //     is no gap for a squatter (that is the whole point);
+                //   * `connect()` is cancel-safe, so if this future is
+                //     dropped mid-wait the instance is still in place and
+                //     no connection event is lost.
+                // The lock also serialises concurrent `accept_raw` calls,
+                // which matches the backend: one listening instance at a
+                // time, exactly as tokio's canonical pipe-server loop.
+                let mut slot = listening.lock().await;
+                {
+                    let server = slot.as_ref().ok_or_else(|| {
+                        std::io::Error::other("named pipe listener has no server instance")
+                    })?;
+                    server.connect().await?;
+                }
+                // Connected. Create the successor *before* handing this
+                // instance to the caller: the name must never be owned by
+                // the handed-out connection alone, or dropping the client
+                // stream would release it.
+                // `first_pipe_instance` is false here on purpose — only
+                // the very first instance asserts exclusive ownership of
+                // the name; later instances join the set it opened.
+                let replacement = ServerOptions::new()
                     .first_pipe_instance(false)
                     .create(name)?;
-                server.connect().await?;
+                let server = slot.replace(replacement).ok_or_else(|| {
+                    std::io::Error::other("named pipe listener has no server instance")
+                })?;
+                drop(slot);
                 Ok((
                     PendingStream {
                         inner: PendingStreamInner::NamedPipe {
@@ -803,19 +846,38 @@ pub async fn connect_tcp(
 /// the expected token.
 #[cfg(windows)]
 pub fn bind_named_pipe(name: &str) -> std::io::Result<(LocalListener, String, LocalToken)> {
-    // Validate we can create at least one server instance up front — this
-    // catches "path already exists + first_pipe_instance enforced" and
-    // similar bind errors at config-time rather than at first-accept. The
-    // temp instance is dropped immediately; `accept` will create the
-    // real instance.
-    {
-        use tokio::net::windows::named_pipe::ServerOptions;
-        let _probe = ServerOptions::new().create(name)?;
-    }
+    use tokio::net::windows::named_pipe::ServerOptions;
+    // `first_pipe_instance(true)` is the bind. A Windows pipe name has no
+    // exclusive owner by default: any process may add an instance to a
+    // name another process already serves, and a name with zero instances
+    // open belongs to whoever creates it next. This flag is the one thing
+    // that changes that — it makes `create` fail with ERROR_ACCESS_DENIED
+    // (→ `PermissionDenied`) if the name exists at all, so a squatter that
+    // got there first stops us from starting instead of silently sharing
+    // the name with us and collecting clients' tokens. Fail closed.
+    //
+    // The instance is *kept*, not probed and dropped: it is handed to the
+    // listener, which owns some instance of the name for its whole life
+    // (see [`LocalListener::NamedPipe`]). Without that the exclusivity
+    // asserted here would last only microseconds and the name would fall
+    // open again between accepts.
+    let listening = ServerOptions::new()
+        .first_pipe_instance(true)
+        .create(name)
+        .map_err(|e| {
+            std::io::Error::new(
+                e.kind(),
+                format!(
+                    "named pipe {name}: cannot claim the name as its first instance \
+                     (another process already holds it?): {e}"
+                ),
+            )
+        })?;
     let token = LocalToken::generate();
     Ok((
         LocalListener::NamedPipe {
             name: name.to_owned(),
+            listening: tokio::sync::Mutex::new(Some(listening)),
             expected_token: token.clone(),
         },
         name.to_owned(),
@@ -1245,5 +1307,145 @@ mod tests {
         // should detect it as a socket and unlink + bind cleanly.
         assert!(path.exists());
         let _listener2 = bind_unix(&path).expect("rebind over stale socket must work");
+    }
+
+    // ── named-pipe name ownership (Windows) ──────────────────
+    //
+    // A Windows pipe name is not a file: it exists only while some process
+    // holds an instance of it, and by default ANY process may add its own
+    // instance to a name another process is already serving. So the two
+    // things worth asserting are (a) we refuse to start if somebody else
+    // holds the name, and (b) we never let go of it while we are running.
+    // These only build and run on Windows; the CI job that executes them is
+    // `.github/workflows/windows-release-gate.yml`.
+
+    /// Unique `\\.\pipe\…` name per test run. A collision with a leftover
+    /// pipe from an earlier run would look exactly like the squatting these
+    /// tests assert against, so the name carries pid + random.
+    #[cfg(windows)]
+    fn unique_pipe_name(label: &str) -> String {
+        use rand_core::{OsRng, RngCore};
+        format!(
+            r"\\.\pipe\veil-local-transport-test-{label}-{}-{:016x}",
+            std::process::id(),
+            OsRng.next_u64(),
+        )
+    }
+
+    /// Try to take `name` the way a squatter would — as its exclusive first
+    /// instance. Panics if the claim SUCCEEDS: success means that at this
+    /// instant nobody owns the name, which is the window an attacker uses
+    /// to stand up their own pipe and read clients' bearer tokens.
+    #[cfg(windows)]
+    fn claim_must_fail(name: &str, when: &str) {
+        use tokio::net::windows::named_pipe::ServerOptions;
+        if let Ok(_squatter) = ServerOptions::new().first_pipe_instance(true).create(name) {
+            panic!(
+                "{when}: {name} was claimable by another process — the listener is \
+                 not holding the name, so a squatter could serve it and collect \
+                 the tokens clients present"
+            );
+        }
+    }
+
+    /// Somebody already holds the name ⇒ bind must fail closed. Pre-fix
+    /// `bind_named_pipe` created its probe instance with tokio's default
+    /// `first_pipe_instance: false`, so it happily *joined* the squatter's
+    /// pipe and the daemon ran alongside it.
+    #[cfg(windows)]
+    #[test]
+    fn bind_named_pipe_refuses_a_squatted_name() {
+        use tokio::net::windows::named_pipe::ServerOptions;
+        let name = unique_pipe_name("squatted");
+        let _squatter = ServerOptions::new()
+            .create(&name)
+            .expect("test setup: squatter must get the name first");
+
+        // `LocalListener` has no Debug (see `must_fail` above), so match.
+        match bind_named_pipe(&name) {
+            Ok(_) => panic!(
+                "bind_named_pipe accepted a name another process already holds — \
+                 the daemon would silently share the pipe with the squatter"
+            ),
+            Err(e) => assert_eq!(
+                e.kind(),
+                std::io::ErrorKind::PermissionDenied,
+                "squatted bind must fail with ERROR_ACCESS_DENIED, got: {e}"
+            ),
+        }
+    }
+
+    /// The name must be continuously owned for the listener's whole life —
+    /// not just at bind. Pre-fix the bind probe was dropped immediately and
+    /// every accept created a fresh instance, so between the probe and the
+    /// first accept, and between any two accepts, zero instances existed
+    /// and the name was free for the taking.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn pipe_name_is_owned_between_accepts() {
+        use std::sync::Arc;
+        use tokio::net::windows::named_pipe::ClientOptions;
+
+        let name = unique_pipe_name("owned");
+        let (listener, echoed, token) = match bind_named_pipe(&name) {
+            Ok(v) => v,
+            Err(e) => panic!("bind on a free name must succeed: {e}"),
+        };
+        assert_eq!(echoed, name, "bind must echo the name back");
+        let listener = Arc::new(listener);
+
+        claim_must_fail(&name, "immediately after bind");
+
+        for round in 1..=2u32 {
+            let accepting = {
+                let l = Arc::clone(&listener);
+                tokio::spawn(async move { l.accept_raw().await })
+            };
+            // Let the accept task reach `connect()` before the client opens.
+            // Not required for correctness (the instance is listening from
+            // bind time and tokio treats ERROR_PIPE_CONNECTED as connected),
+            // it just keeps the ordering the obvious one.
+            tokio::task::yield_now().await;
+
+            let mut client = ClientOptions::new()
+                .open(&name)
+                .unwrap_or_else(|e| panic!("round {round}: client open failed: {e}"));
+            client.write_all(token.as_bytes()).await.unwrap();
+            client.flush().await.unwrap();
+
+            let (pending, peer) = tokio::time::timeout(Duration::from_secs(10), accepting)
+                .await
+                .unwrap_or_else(|_| panic!("round {round}: accept_raw never completed"))
+                .expect("accept task panicked")
+                .unwrap_or_else(|e| panic!("round {round}: accept_raw failed: {e}"));
+            assert!(peer.uid_matches_local);
+            let stream = pending
+                .verify()
+                .await
+                .unwrap_or_else(|e| panic!("round {round}: token handshake failed: {e}"));
+
+            claim_must_fail(&name, &format!("while round {round}'s connection is live"));
+            drop(stream);
+            drop(client);
+            claim_must_fail(&name, &format!("after round {round}'s connection closed"));
+        }
+
+        // …and released once the listener is gone, so a restart can rebind.
+        drop(listener);
+        let mut last_err = None;
+        for _ in 0..50 {
+            match bind_named_pipe(&name) {
+                Ok(_) => return,
+                Err(e) => last_err = Some(e),
+            }
+            // The final handle closes on drop, but let the reactor finish
+            // its deregistration before calling this a leak.
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!(
+            "name still claimed ~1s after the listener dropped — a restart cannot \
+             rebind: {}",
+            last_err.expect("loop ran at least once")
+        );
     }
 }
