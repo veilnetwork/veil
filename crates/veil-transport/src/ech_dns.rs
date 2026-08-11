@@ -66,9 +66,25 @@ static RESOLVER: OnceLock<Option<TokioResolver>> = OnceLock::new();
 /// GREASE is the right call.
 const HTTPS_RR_TIMEOUT: Duration = Duration::from_secs(3);
 
+/// Build (once) the shared system-config resolver, or `None` if this
+/// platform has no reachable system DNS configuration.
+///
+/// # Android
+///
+/// `builder_tokio()` is *not* fallible on Android the way `.ok()?`
+/// assumes: hickory reads the nameserver list through the JVM and
+/// starts with `ndk_context::android_context()`, an `expect` on a
+/// static nothing in this workspace initialises.  With the workspace's
+/// `panic = "abort"` that aborts the process from whichever tokio
+/// worker touched an ECH lookup first.  Returning `None` here routes
+/// the caller into the module's documented soft failure — fall back to
+/// ECH GREASE — instead.  See [`veil_util::system_dns_config_readable`].
 fn resolver() -> Option<&'static TokioResolver> {
     RESOLVER
         .get_or_init(|| {
+            if !veil_util::system_dns_config_readable(std::env::consts::OS) {
+                return None;
+            }
             let builder = TokioResolver::builder_tokio().ok()?;
             builder.build().ok()
         })

@@ -188,6 +188,85 @@ async fn deferred_anonymous_stub_arms_onion_at_runtime() {
     let _ = fs::remove_file(anon);
 }
 
+/// A node whose owner refused the shared seeds must come up OFFLINE AND
+/// ALIVE. This is the exact shape the app composes for a declining identity:
+/// `builtin_seed_policy = "never"`, no `peers`, no `[[bootstrap_peers]]`, no
+/// `bootstrap_dns_domain`.
+///
+/// On an Android device that config used to reach
+/// `discover_seeds_dns_system` → `Resolver::builder_tokio()` →
+/// `ndk_context::android_context()` and take the process down with
+/// `SIGABRT: 'android context was not initialized'` from a tokio worker,
+/// 12-90 s after boot.
+///
+/// This host is not Android, so the abort itself cannot be reproduced here —
+/// see `veil_util::system_dns_config_readable`'s tests and the
+/// `every_system_conf_resolver_is_android_guarded` structural guard for that
+/// half. What this test pins is the reachability half, on the real boot path:
+/// the node starts, reports itself running with zero peers, survives past the
+/// point where the DNS fallback would have been spawned, and shuts down — and
+/// the very config it booted from is one the gate refuses to arm discovery
+/// for.
+#[tokio::test(flavor = "current_thread")]
+async fn node_refusing_builtin_seeds_boots_offline_and_stays_alive() {
+    let mut config = runtime_config_with_listen();
+    config.peers.clear();
+    config.bootstrap_peers.clear();
+    config.global.builtin_seed_policy = veil_cfg::BuiltinSeedPolicy::Never;
+    assert!(
+        config.global.bootstrap_dns_domain.is_none(),
+        "fixture must mirror the shipped config, which names no DNS domain"
+    );
+
+    // The decision, checked on the same value the runtime is about to boot
+    // from: nothing may arm DNS seed discovery here.
+    assert_eq!(
+        super::service_tasks::dns_seed_discovery_domain(&config),
+        None,
+        "a refusing identity with no peers must not start DNS seed discovery: \
+         the only domain on offer is the RFC 6761-reserved placeholder, and \
+         reaching the system-DNS stage aborts the process on Android"
+    );
+    // And the refusal must not be a lie either — no builtin seed may be
+    // spliced into the dial list behind the owner's back.
+    assert!(
+        super::service_tasks::resolve_bootstrap_candidates(
+            &config,
+            &test_support::valid_identity().public_key,
+        )
+        .is_empty(),
+        "builtin_seed_policy=never must leave the candidate set empty"
+    );
+
+    let path = save_test_config("node-runtime-seedless", config).unwrap();
+    let mut runtime = NodeRuntime::start(&path, true)
+        .await
+        .expect("a node that refused the builtin seeds must still start");
+
+    let summary = runtime.summary();
+    assert_eq!(summary.peers_configured, 0, "offline: no peers configured");
+    assert_eq!(summary.listens_configured, 1, "alive: still listening");
+    assert!(
+        runtime.peers().is_empty(),
+        "no peer may appear from a seed list the owner declined"
+    );
+
+    // Stay up past the window in which the bootstrap task would have run its
+    // DoT/DoH stages and fallen into the system-DNS stage. On Android the
+    // pre-fix build was already dead by this point.
+    sleep(Duration::from_millis(750)).await;
+    assert!(
+        runtime.peers().is_empty(),
+        "still no peers after the bootstrap window — the refusal held"
+    );
+
+    runtime
+        .stop()
+        .await
+        .expect("a seedless node must shut down cleanly, not abort");
+    let _ = fs::remove_file(path);
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn inbound_listen_creates_session() {
     let path =

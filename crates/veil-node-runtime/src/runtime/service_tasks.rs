@@ -1505,15 +1505,11 @@ impl NodeRuntime {
         }
 
         // if both peers and bootstrap_peers are empty, try DNS discovery as
-        // the last fallback.
-        if config.bootstrap_peers.is_empty() && config.peers.is_empty() {
+        // the last fallback — but only against a domain the operator actually
+        // named. See `dns_seed_discovery_domain`.
+        if let Some(domain) = dns_seed_discovery_domain(config) {
             // No builtin seeds — try DNS discovery asynchronously.
             let logger = self.logger.clone();
-            let domain = config
-                .global
-                .bootstrap_dns_domain
-                .clone()
-                .unwrap_or_else(|| veil_bootstrap::dns::DEFAULT_BOOTSTRAP_DOMAIN.to_owned());
             let state = Arc::clone(&self.state);
             let dht = Arc::clone(&self.dht);
             let access = self.access();
@@ -1595,6 +1591,35 @@ impl NodeRuntime {
             return;
         }
         if config.bootstrap_peers.is_empty() {
+            // Nothing to dial and nothing to discover. This is a legitimate
+            // resting state — a node whose owner declined the builtin seeds
+            // and named no entry points of its own is meant to come up
+            // OFFLINE AND ALIVE, not to abort and not to be quietly re-seeded.
+            // Say so once, so "no network" reads as a decision in the log
+            // rather than as a silent failure.
+            if config.peers.is_empty() {
+                self.logger.info(
+                    "bootstrap.none",
+                    format!(
+                        "no entry points: 0 configured, builtin seeds {} \
+                         (policy={}), DNS discovery {}; node stays offline \
+                         until a peer is added",
+                        if matches!(
+                            config.global.builtin_seed_policy,
+                            veil_cfg::BuiltinSeedPolicy::Never
+                        ) {
+                            "refused"
+                        } else {
+                            "unavailable"
+                        },
+                        config.global.builtin_seed_policy,
+                        match config.global.bootstrap_dns_domain {
+                            Some(ref d) => format!("found nothing at {d}"),
+                            None => "not configured".to_owned(),
+                        },
+                    ),
+                );
+            }
             return;
         }
 
@@ -5064,6 +5089,46 @@ pub fn resolve_bootstrap_candidates(
     out
 }
 
+/// The domain the DNS seed-discovery fallback should query, or `None` when
+/// that fallback must not run at all.
+///
+/// Two conditions, both required:
+///
+/// 1. **Nothing else to dial.** Unchanged from the original inline check:
+///    DNS discovery is the last fallback, so a node with `peers` or
+///    `[[bootstrap_peers]]` (including seeds spliced in by
+///    [`resolve_bootstrap_candidates`]) never reaches it.
+///
+/// 2. **The operator named a domain.** This is the new condition. The old code
+///    fell back to [`veil_bootstrap::dns::DEFAULT_BOOTSTRAP_DOMAIN`], which is
+///    `veil.example` — inside the `.example` TLD that RFC 6761 §6.5 reserves
+///    and guarantees will never resolve in the public DNS. Querying it is not
+///    a fallback, it is dead work: several seconds of DoT and DoH against a
+///    name that cannot exist, followed by a plain-DNS stage whose only purpose
+///    is to fail.
+///
+/// Condition 2 is what makes the Android abort unreachable in the shipped
+/// configuration. The app composes a config with no `[[bootstrap_peers]]` and
+/// no `bootstrap_dns_domain`; an identity that sets
+/// `builtin_seed_policy = "never"` therefore satisfies condition 1, and the old
+/// code walked straight into `discover_seeds_dns_system` →
+/// `Resolver::builder_tokio()` → `ndk_context::android_context()` → `SIGABRT`
+/// on a tokio worker. (`veil-bootstrap`'s own Android guard closes that door
+/// too; this closes the corridor leading to it.)
+///
+/// Deliberately NOT keyed on [`veil_cfg::BuiltinSeedPolicy::Never`]. `Never` is
+/// documented as the off switch for the *compile-time* seed list; a testnet
+/// that declines those seeds and names its own `bootstrap_dns_domain` is
+/// explicitly asking for that discovery, and suppressing it would break a
+/// supported deployment. Nothing is acquired here that the operator did not
+/// name, so the refusal stays honest either way.
+pub fn dns_seed_discovery_domain(config: &veil_cfg::Config) -> Option<String> {
+    if !config.bootstrap_peers.is_empty() || !config.peers.is_empty() {
+        return None;
+    }
+    config.global.bootstrap_dns_domain.clone()
+}
+
 // ── BootstrapWatchdog tunables + decision logic ──────────────────────────────
 //
 // Sampled by `spawn_bootstrap_watchdog_task`. Exposed at module scope (instead
@@ -5638,6 +5703,87 @@ mod tests {
         let builtin = vec![peer("SEED1")];
         assert!(
             builtin_seed_contribution(veil_cfg::BuiltinSeedPolicy::Never, true, builtin).is_empty(),
+        );
+    }
+
+    // ── DNS seed-discovery gate ──────────────────────────────────────────
+    //
+    // The crash these pin: an identity that declined the shared seeds boots
+    // with `builtin_seed_policy = "never"`, no `peers` and no
+    // `[[bootstrap_peers]]`. The runtime used to answer that by querying
+    // `veil.example` — a domain RFC 6761 guarantees cannot resolve — which
+    // ran the DoT and DoH stages for nothing and then entered
+    // `discover_seeds_dns_system`. On Android that constructor calls
+    // `ndk_context::android_context()`, whose `expect` fires on a tokio
+    // worker; with `panic = "abort"` the whole process takes SIGABRT
+    // ("android context was not initialized") 12-90 s after boot.
+
+    /// The exact shipped shape of the defect: seeds refused, no peers, no
+    /// bootstrap peers, no DNS domain. Nothing must be spawned. Weakening the
+    /// gate back to the `unwrap_or(DEFAULT_BOOTSTRAP_DOMAIN)` default makes
+    /// this return `Some("veil.example")` and go red.
+    #[test]
+    fn refusing_seeds_with_no_peers_does_not_start_dns_discovery() {
+        let cfg = config_with(Vec::new(), veil_cfg::BuiltinSeedPolicy::Never);
+        assert!(cfg.peers.is_empty(), "fixture must have no peers");
+        assert!(
+            cfg.global.bootstrap_dns_domain.is_none(),
+            "fixture must not name a DNS domain — that is the shipped config"
+        );
+        assert_eq!(
+            dns_seed_discovery_domain(&cfg),
+            None,
+            "a node with nothing to dial and no configured bootstrap DNS \
+             domain must NOT run seed discovery: the only domain available is \
+             the RFC 6761-reserved placeholder, and reaching the system-DNS \
+             stage aborts the process on Android"
+        );
+    }
+
+    /// Same for the default policy — the gate is about the missing domain, not
+    /// about the refusal, so a stock node with an empty candidate set is
+    /// covered too.
+    #[test]
+    fn no_domain_means_no_dns_discovery_under_any_policy() {
+        for policy in [
+            veil_cfg::BuiltinSeedPolicy::Never,
+            veil_cfg::BuiltinSeedPolicy::Auto,
+            veil_cfg::BuiltinSeedPolicy::Always,
+        ] {
+            let cfg = config_with(Vec::new(), policy);
+            assert_eq!(
+                dns_seed_discovery_domain(&cfg),
+                None,
+                "policy {policy} must not reach DNS discovery without a domain"
+            );
+        }
+    }
+
+    /// The gate must not cost a deployment that genuinely uses DNS discovery:
+    /// naming a domain still arms it, including under `Never` (declining the
+    /// compile-time seeds is not declining your own operator's domain).
+    #[test]
+    fn a_configured_domain_still_arms_dns_discovery() {
+        let mut cfg = config_with(Vec::new(), veil_cfg::BuiltinSeedPolicy::Never);
+        cfg.global.bootstrap_dns_domain = Some("seeds.testnet.invalid".to_owned());
+        assert_eq!(
+            dns_seed_discovery_domain(&cfg),
+            Some("seeds.testnet.invalid".to_owned()),
+            "an operator who named a bootstrap DNS domain must still get \
+             discovery — the gate targets the placeholder, not the feature"
+        );
+    }
+
+    /// Condition 1 preserved: DNS discovery stays the LAST fallback.
+    #[test]
+    fn dns_discovery_stays_last_behind_configured_entry_points() {
+        let mut cfg = config_with(vec![peer("ALT")], veil_cfg::BuiltinSeedPolicy::Never);
+        cfg.global.bootstrap_dns_domain = Some("seeds.testnet.invalid".to_owned());
+        assert_eq!(
+            dns_seed_discovery_domain(&cfg),
+            None,
+            "a node with bootstrap_peers has something to dial; DNS discovery \
+             is the last fallback and must not run"
         );
     }
 
