@@ -2,6 +2,15 @@ name: Windows release gate
 
 on:
   workflow_dispatch:
+  # veil-local-transport carries Windows-only code (named-pipe listener)
+  # that no developer machine on this project can compile, let alone run.
+  # This is the only host that can, so any PR touching that crate has to
+  # come through here — otherwise the `#[cfg(windows)]` arms are reviewed
+  # by eye and shipped untested.
+  pull_request:
+    paths:
+      - 'crates/veil-local-transport/**'
+      - '.github/workflows/windows-release-gate.yml'
 
 permissions:
   contents: read
@@ -24,6 +33,11 @@ jobs:
             ~/.cargo/git
             target
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+      # First, and without the clang-cl detour: this crate has no C deps,
+      # and its named-pipe tests are the ones that cannot run anywhere else.
+      # Failing here should not wait on a veilcore build.
+      - name: Run local-transport tests (named-pipe name ownership)
+        run: cargo test -p veil-local-transport
       - name: Build core without RocksDB
         env:
           CC: clang-cl
@@ -43,6 +57,10 @@ jobs:
   release-build:
     name: Windows release build (${{ matrix.target }})
     runs-on: windows-latest
+    # Release binaries are a release concern, not a per-PR one — a PR that
+    # only touches veil-local-transport needs the tests above, not two full
+    # release builds. Keeps the new pull_request trigger cheap.
+    if: github.event_name == 'workflow_dispatch'
     strategy:
       fail-fast: false
       matrix:
