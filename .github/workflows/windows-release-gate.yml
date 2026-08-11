@@ -2,14 +2,24 @@ name: Windows release gate
 
 on:
   workflow_dispatch:
-  # veil-local-transport carries Windows-only code (named-pipe listener)
-  # that no developer machine on this project can compile, let alone run.
-  # This is the only host that can, so any PR touching that crate has to
-  # come through here — otherwise the `#[cfg(windows)]` arms are reviewed
-  # by eye and shipped untested.
+  # Several crates carry Windows-only code that no developer machine on this
+  # project can compile, let alone run. This is the only host that can, so a
+  # PR touching one of them has to come through here — otherwise the
+  # `#[cfg(windows)]` arms are reviewed by eye and shipped untested.
+  #
+  # veil-local-transport: the named-pipe listener.
+  # veilclient-ffi: the embedded node's boot path. It was watching only
+  #   local-transport that let a Windows build ship which could not start a
+  #   node AT ALL — the host handed it a bare `C:\...\admin.sock`, the FFI
+  #   wrapped it `unix://` and pasted it into a TOML template, and `\U` opened
+  #   a unicode escape. Nothing on this gate had ever executed that path.
+  # veil-cfg: owns `admin_socket` parsing and the `not(unix)` endpoint default
+  #   the embedded node now relies on.
   pull_request:
     paths:
       - 'crates/veil-local-transport/**'
+      - 'crates/veilclient-ffi/**'
+      - 'crates/veil-cfg/**'
       - '.github/workflows/windows-release-gate.yml'
 
 permissions:
@@ -53,6 +63,71 @@ jobs:
           CC: clang-cl
           CXX: clang-cl
         run: cargo test -p veilcore --lib --no-default-features node::admin_transport::tests -- --test-threads=1
+
+  embedded-node:
+    name: Windows embedded node (veilclient-ffi)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-ffi-${{ hashFiles('**/Cargo.lock') }}
+      # `--no-default-features` drops `tls-boring`, so this needs no cmake or
+      # BoringSSL build; the node boot path under test does not use it.
+      - name: Build the embedded node FFI
+        env:
+          CC: clang-cl
+          CXX: clang-cl
+        run: >-
+          cargo build -p veilclient-ffi --lib
+          --no-default-features --features node-embedded
+      # Composition is where the shipped Windows build actually died, and it is
+      # pure string work — fast, and it fails loudly if the TOML escaping
+      # regresses.
+      #
+      # Both test steps prove they RAN. A cargo filter that matches nothing
+      # still exits 0, so a renamed test would leave this gate green having
+      # executed none of it — the exact failure mode the gate exists to end.
+      - name: Compose a config from a Windows runtime path
+        shell: bash
+        env:
+          CC: clang-cl
+          CXX: clang-cl
+        run: |
+          cargo test -p veilclient-ffi --lib \
+            --no-default-features --features node-embedded,test-low-difficulty \
+            node::tests::config_compose -- --test-threads=1 > compose.log 2>&1
+          rc=$?
+          cat compose.log
+          grep -qE '[1-9][0-9]* passed' compose.log || {
+            echo "::error::no compose test ran — check the filter"; exit 1; }
+          exit $rc
+      # The real proof, and the first time any of it has run on Windows:
+      # compose against a genuine `C:\Users\...\Temp\...` directory, boot a
+      # deferred node on it, wait for the admin.port/admin.token sidecars to
+      # appear, promote it with apply-config over that admin connection, stop
+      # it, and boot a second node in the same directory to show the sidecars
+      # it left do not wedge the next launch.
+      - name: Boot an embedded node on a Windows runtime directory
+        shell: bash
+        env:
+          CC: clang-cl
+          CXX: clang-cl
+        run: |
+          cargo test -p veilclient-ffi --lib \
+            --no-default-features --features node-embedded \
+            a_windows_runtime_dir_boots -- --ignored --nocapture \
+            --test-threads=1 > smoke.log 2>&1
+          rc=$?
+          cat smoke.log
+          grep -qE '1 passed' smoke.log || {
+            echo "::error::the Windows boot smoke did not execute"; exit 1; }
+          exit $rc
 
   release-build:
     name: Windows release build (${{ matrix.target }})
