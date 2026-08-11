@@ -488,6 +488,22 @@ fn stream_table() -> &'static StdMutex<HandleTable<VeilStreamFfi>> {
     T.get_or_init(|| StdMutex::new(HandleTable::new()))
 }
 
+/// The embedded node's table (audit report10 #1).
+///
+/// `VeilNode` was the one handle in this crate still handed out as a real
+/// `Box::into_raw` pointer while every other type had already moved here. That
+/// left the exact pair this table exists to prevent: `veil_node_apply_config`
+/// held `&*node` for up to ninety seconds while a concurrent
+/// `veil_node_stop` ran `Box::from_raw` and freed it, and two concurrent stops
+/// were a plain double free. The Dart layer guarded the same-isolate ordering
+/// and said so in a comment naming the residual; this removes the residual
+/// rather than the reachability.
+#[cfg(feature = "node-embedded")]
+pub(crate) fn node_table() -> &'static StdMutex<HandleTable<crate::node::VeilNode>> {
+    static T: OnceLock<StdMutex<HandleTable<crate::node::VeilNode>>> = OnceLock::new();
+    T.get_or_init(|| StdMutex::new(HandleTable::new()))
+}
+
 #[cfg(feature = "node-embedded")]
 fn anon_stream_table() -> &'static StdMutex<HandleTable<VeilAnonStreamFfi>> {
     static T: OnceLock<StdMutex<HandleTable<VeilAnonStreamFfi>>> = OnceLock::new();

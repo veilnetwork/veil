@@ -68,8 +68,14 @@ pub struct VeilNode {
     /// build — while `node-embedded,packet-tunnel` stayed quiet, because an
     /// assignment counts as a use. Neither set was compiled by any gate until
     /// `scripts/check-feature-gated-lints.sh`.
+    ///
+    /// A `Mutex` now, because the handle handed to C is an opaque token rather
+    /// than an address: the VPN upstream used to write this field through
+    /// `(*node).owned_runtime_dir = ...`, which a token cannot do and which was
+    /// the one mutation-through-pointer easy to miss when auditing the three
+    /// obvious dereferences.
     #[cfg(feature = "packet-tunnel")]
-    owned_runtime_dir: Option<tempfile::TempDir>,
+    owned_runtime_dir: Mutex<Option<tempfile::TempDir>>,
 }
 
 fn provision_identity() -> Result<veil_cfg::IdentityConfig, String> {
@@ -644,13 +650,16 @@ fn start_thread(
         });
 
     match spawn {
-        Ok(thread) => Box::into_raw(Box::new(VeilNode {
-            shutdown: Mutex::new(Some(tx)),
-            thread: Mutex::new(Some(thread)),
-            admin_socket,
-            #[cfg(feature = "packet-tunnel")]
-            owned_runtime_dir: None,
-        })),
+        Ok(thread) => crate::HandleTable::insert(
+            crate::node_table(),
+            VeilNode {
+                shutdown: Mutex::new(Some(tx)),
+                thread: Mutex::new(Some(thread)),
+                admin_socket,
+                #[cfg(feature = "packet-tunnel")]
+                owned_runtime_dir: Mutex::new(None),
+            },
+        ) as *mut VeilNode,
         Err(e) => {
             unsafe { set_err(err_out, &format!("failed to spawn node thread: {e}")) };
             std::ptr::null_mut()
@@ -858,7 +867,15 @@ pub unsafe extern "C" fn veil_vpn_upstream_start(
         unsafe { set_err(err_out, &format!("start VPN upstream failed: {detail}")) };
         return std::ptr::null_mut();
     }
-    unsafe { (*node).owned_runtime_dir = Some(runtime_dir) };
+    match crate::HandleTable::get(crate::node_table(), node as usize) {
+        Some(live) => *veil_util::lock!(live.owned_runtime_dir) = Some(runtime_dir),
+        None => {
+            // Only reachable if the node were stopped between start and here.
+            // Fail closed rather than leak the directory silently.
+            unsafe { set_err(err_out, "node handle went away during VPN start") };
+            return std::ptr::null_mut();
+        }
+    }
 
     let address = match listen.parse::<std::net::SocketAddr>() {
         Ok(address) => address,
@@ -922,7 +939,17 @@ pub unsafe extern "C" fn veil_node_apply_config(
         unsafe { set_err(err_out, "node is null") };
         return -1;
     }
-    let node = unsafe { &*node };
+    // The Arc is cloned out of the table BEFORE the admin-socket round trip,
+    // which can take up to ninety seconds. A concurrent stop removes the entry
+    // and invalidates the token, but the value itself lives until this call
+    // drops its clone -- which is the whole point of the table.
+    let node = match crate::HandleTable::get(crate::node_table(), node as usize) {
+        Some(live) => live,
+        None => {
+            unsafe { set_err(err_out, "node handle is not live (already stopped?)") };
+            return -1;
+        }
+    };
     let admin_socket = match &node.admin_socket {
         Some(p) => p.clone(),
         None => {
@@ -992,7 +1019,7 @@ pub unsafe extern "C" fn veil_node_apply_config(
                     // remaining attempts are ninety seconds of waiting for
                     // something that already failed — and the caller is left
                     // with the connect error rather than the reason.
-                    if node_thread_finished(node) {
+                    if node_thread_finished(&node) {
                         return Err(format!(
                             "the node stopped before binding its admin socket at {} \
                              (after {attempt} attempt(s), {:?}); \
@@ -1083,7 +1110,12 @@ pub unsafe extern "C" fn veil_node_stop_timeout(node: *mut VeilNode, timeout_ms:
     if node.is_null() {
         return -1;
     }
-    let node = unsafe { Box::from_raw(node) };
+    // Removing from the table IS the consume: a second stop with the same
+    // token finds nothing and returns, where `Box::from_raw` twice was a
+    // double free.
+    let Some(node) = crate::HandleTable::remove(crate::node_table(), node as usize) else {
+        return -1;
+    };
     if let Some(tx) = veil_util::lock!(node.shutdown).take() {
         let _ = tx.send(true);
     }
@@ -1091,7 +1123,10 @@ pub unsafe extern "C" fn veil_node_stop_timeout(node: *mut VeilNode, timeout_ms:
     while !node_thread_finished(&node) {
         if Instant::now() >= deadline {
             // Detached, not freed. See the note above: the handle owns the
-            // runtime directory of a node that is still using it.
+            // runtime directory of a node that is still using it. Forgetting
+            // the Arc leaks one strong reference, so the value outlives every
+            // other clone and the directory survives for as long as the node
+            // that is still writing into it.
             std::mem::forget(node);
             return 1;
         }
@@ -1116,7 +1151,12 @@ pub unsafe extern "C" fn veil_node_stop(node: *mut VeilNode) {
     if node.is_null() {
         return;
     }
-    let node = unsafe { Box::from_raw(node) };
+    let Some(node) = crate::HandleTable::remove(crate::node_table(), node as usize) else {
+        // Double stop, or a token from a node that is already gone. A safe
+        // no-op, where the previous `Box::from_raw` freed the same allocation
+        // twice.
+        return;
+    };
     if let Some(tx) = veil_util::lock!(node.shutdown).take() {
         let _ = tx.send(true);
     }
@@ -1135,13 +1175,93 @@ mod tests {
     fn node_running_for(run_for: Duration) -> *mut VeilNode {
         let (tx, _rx) = tokio::sync::watch::channel(false);
         let thread = std::thread::spawn(move || std::thread::sleep(run_for));
-        Box::into_raw(Box::new(VeilNode {
-            shutdown: std::sync::Mutex::new(Some(tx)),
-            thread: std::sync::Mutex::new(Some(thread)),
-            admin_socket: None,
-            #[cfg(feature = "packet-tunnel")]
-            owned_runtime_dir: None,
-        }))
+        // Through the table, exactly as `veil_node_start` does. A test that
+        // minted a real pointer would hand the code under test a token it
+        // would decode as a slot index -- the test would be exercising a
+        // different program from the one that ships.
+        crate::HandleTable::insert(
+            crate::node_table(),
+            VeilNode {
+                shutdown: std::sync::Mutex::new(Some(tx)),
+                thread: std::sync::Mutex::new(Some(thread)),
+                admin_socket: None,
+                #[cfg(feature = "packet-tunnel")]
+                owned_runtime_dir: std::sync::Mutex::new(None),
+            },
+        ) as *mut VeilNode
+    }
+
+    /// Two stops of the same node must not free it twice (report10 #1).
+    ///
+    /// The old shape was `Box::from_raw` on both paths: the second call
+    /// reinterpreted freed memory as a live struct and freed it again. There is
+    /// no way to assert "did not corrupt the heap" directly, so this asserts
+    /// the observable consequence of the fix -- the second stop finds no live
+    /// entry and says so -- and runs under the ordinary test allocator, where a
+    /// genuine double free aborts the process rather than failing an assertion.
+    #[test]
+    fn stopping_twice_is_a_safe_no_op() {
+        let node = node_running_for(Duration::from_millis(10));
+        assert_eq!(unsafe { veil_node_stop_timeout(node, 5_000) }, 0);
+        // Same token, second time. Not "returns 0 again" -- it must report that
+        // there was nothing to stop, which is what lets a caller tell a real
+        // stop from a repeat.
+        assert_eq!(
+            unsafe { veil_node_stop_timeout(node, 5_000) },
+            -1,
+            "the second stop must find no live node, not free one again",
+        );
+        // And the untimed entry point, which returns nothing: it must simply
+        // not blow up.
+        unsafe { veil_node_stop(node) };
+    }
+
+    /// A token whose slot was freed and handed to a DIFFERENT node must not
+    /// resolve to that node (classic ABA).
+    #[test]
+    fn a_stale_token_never_matches_its_successor() {
+        let first = node_running_for(Duration::from_millis(5));
+        assert_eq!(unsafe { veil_node_stop_timeout(first, 5_000) }, 0);
+        let second = node_running_for(Duration::from_millis(5));
+        // The slot is reused -- that is the point of the free list -- so the
+        // addresses can coincide while the generations cannot.
+        assert_eq!(
+            unsafe { veil_node_stop_timeout(first, 5_000) },
+            -1,
+            "a stale token resolved to the node that took over its slot",
+        );
+        assert_eq!(unsafe { veil_node_stop_timeout(second, 5_000) }, 0);
+    }
+
+    /// A stop that lands while `apply_config` is in flight must not free the
+    /// node under it.
+    ///
+    /// This is the pair the finding is actually about: `apply_config` held
+    /// `&*node` across an admin-socket round trip of up to ninety seconds while
+    /// a concurrent stop ran `Box::from_raw`. The call must now finish against
+    /// its own clone -- failing on the socket, which is fine, rather than on
+    /// freed memory.
+    #[test]
+    fn a_stop_during_apply_config_does_not_free_it_underneath() {
+        let node = node_running_for(Duration::from_secs(30));
+        // The token crosses as a `usize`: a raw pointer is not `Send`, and the
+        // handle is not an address any more anyway.
+        let token = node as usize;
+        let stopper = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(20));
+            unsafe { veil_node_stop_timeout(token as *mut VeilNode, 5_000) }
+        });
+        let mut err: *mut c_char = std::ptr::null_mut();
+        let toml = b"[global]\n";
+        // Returns -1 either way: this node has no admin socket. What matters is
+        // that it RETURNS -- under the old shape the same interleaving read a
+        // freed allocation.
+        let rc = unsafe { veil_node_apply_config(node, toml.as_ptr(), toml.len(), &mut err) };
+        assert_eq!(rc, -1);
+        if !err.is_null() {
+            unsafe { crate::veil_free_string(err) };
+        }
+        let _ = stopper.join().expect("stopper thread panicked");
     }
 
     /// A stop that runs out of its budget must RETURN, and say so.
@@ -1198,12 +1318,15 @@ mod tests {
         std::fs::write(path.join("identity.toml"), b"x").expect("write");
         let (tx, _rx) = tokio::sync::watch::channel(false);
         let thread = std::thread::spawn(|| std::thread::sleep(Duration::from_secs(30)));
-        let node = Box::into_raw(Box::new(VeilNode {
-            shutdown: std::sync::Mutex::new(Some(tx)),
-            thread: std::sync::Mutex::new(Some(thread)),
-            admin_socket: None,
-            owned_runtime_dir: Some(dir),
-        }));
+        let node = crate::HandleTable::insert(
+            crate::node_table(),
+            VeilNode {
+                shutdown: std::sync::Mutex::new(Some(tx)),
+                thread: std::sync::Mutex::new(Some(thread)),
+                admin_socket: None,
+                owned_runtime_dir: std::sync::Mutex::new(Some(dir)),
+            },
+        ) as *mut VeilNode;
         assert_eq!(unsafe { veil_node_stop_timeout(node, 100) }, 1);
         assert!(
             path.join("identity.toml").exists(),
@@ -1554,16 +1677,24 @@ mod tests {
     fn apply_config_requires_a_deferred_node() {
         // A node with no admin socket (i.e. not started deferred) is rejected
         // immediately — no hang on admin-socket connect retries.
-        let node = VeilNode {
-            shutdown: Mutex::new(None),
-            thread: Mutex::new(None),
-            admin_socket: None,
-            #[cfg(feature = "packet-tunnel")]
-            owned_runtime_dir: None,
-        };
+        // Through the table, because the handle is a token now. Passing `&node`
+        // still compiles and still returns -1 -- but for "this handle is not
+        // live" rather than "this node was not started deferred", so the test
+        // would have gone on passing while checking something else entirely.
+        let node = crate::HandleTable::insert(
+            crate::node_table(),
+            VeilNode {
+                shutdown: Mutex::new(None),
+                thread: Mutex::new(None),
+                admin_socket: None,
+                #[cfg(feature = "packet-tunnel")]
+                owned_runtime_dir: Mutex::new(None),
+            },
+        ) as *mut VeilNode;
         let mut err: *mut c_char = std::ptr::null_mut();
         let toml = b"[global]\n";
-        let rc = unsafe { veil_node_apply_config(&node, toml.as_ptr(), toml.len(), &mut err) };
+        let rc = unsafe { veil_node_apply_config(node, toml.as_ptr(), toml.len(), &mut err) };
+        crate::HandleTable::remove(crate::node_table(), node as usize);
         assert_eq!(rc, -1);
         assert!(!err.is_null());
         let msg = unsafe { CStr::from_ptr(err) }
@@ -1588,17 +1719,21 @@ mod tests {
         while !done.is_finished() {
             std::thread::yield_now();
         }
-        let node = VeilNode {
-            shutdown: Mutex::new(None),
-            thread: Mutex::new(Some(done)),
-            admin_socket: Some(sock.clone()),
-            #[cfg(feature = "packet-tunnel")]
-            owned_runtime_dir: None,
-        };
+        let node = crate::HandleTable::insert(
+            crate::node_table(),
+            VeilNode {
+                shutdown: Mutex::new(None),
+                thread: Mutex::new(Some(done)),
+                admin_socket: Some(sock.clone()),
+                #[cfg(feature = "packet-tunnel")]
+                owned_runtime_dir: Mutex::new(None),
+            },
+        ) as *mut VeilNode;
         let mut err: *mut c_char = std::ptr::null_mut();
         let toml = b"[global]\n";
         let started = std::time::Instant::now();
-        let rc = unsafe { veil_node_apply_config(&node, toml.as_ptr(), toml.len(), &mut err) };
+        let rc = unsafe { veil_node_apply_config(node, toml.as_ptr(), toml.len(), &mut err) };
+        crate::HandleTable::remove(crate::node_table(), node as usize);
         let elapsed = started.elapsed();
         assert_eq!(rc, -1);
         assert!(!err.is_null());
