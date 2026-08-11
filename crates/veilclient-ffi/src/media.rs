@@ -606,7 +606,18 @@ pub(crate) fn set_recv_callback(
     // Replacing is an unregistration for whoever was there: its `ctx` is now
     // unreachable from the map, and the host is free to destroy it. Wait for
     // any dispatch still inside it, exactly as a clear does.
-    if let Some(old) = replaced.as_ref().filter(|old| old.chan != chan) {
+    //
+    // Keyed on the CONTEXT, not just the channel (audit report10 #2). The
+    // condition used to be `old.chan != chan` alone, so re-registering on the
+    // same channel with a different ctx returned immediately -- and that is a
+    // real sequence: a host swapping its receiver keeps the channel and hands
+    // over a new context, then frees the old one on the strength of this call
+    // having returned. A dispatch still inside the old callback then used
+    // freed memory. The channel is not what the host destroys; the context is.
+    if let Some(old) = replaced
+        .as_ref()
+        .filter(|old| old.chan != chan || old.ctx != ctx as usize)
+    {
         await_quiescent(old.chan);
     }
     diag(format_args!(
@@ -885,6 +896,73 @@ mod tests {
     extern "C" fn record(_ctx: *mut c_void, _ptr: *const u8, len: usize) {
         RX_CALLS.fetch_add(1, Ordering::SeqCst);
         RX_BYTES.fetch_add(len, Ordering::SeqCst);
+    }
+
+    /// Replacing the callback on the SAME channel must wait for a dispatch
+    /// still inside the old one (audit report10 #2).
+    ///
+    /// The condition used to be `old.chan != chan`, so a host that kept the
+    /// channel and handed over a new context got an immediate return and then
+    /// freed the old context out from under a running callback. Asserted on the
+    /// observable consequence: the registering thread must not return until the
+    /// in-flight callback has left.
+    #[test]
+    fn replacing_a_context_on_the_same_channel_waits_for_the_old_one() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        static INSIDE: AtomicUsize = AtomicUsize::new(0);
+        static LEFT: AtomicUsize = AtomicUsize::new(0);
+        INSIDE.store(0, Ordering::SeqCst);
+        LEFT.store(0, Ordering::SeqCst);
+
+        extern "C" fn slow(_ctx: *mut c_void, _ptr: *const u8, _len: usize) {
+            INSIDE.fetch_add(1, Ordering::SeqCst);
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            LEFT.fetch_add(1, Ordering::SeqCst);
+        }
+
+        let peer = [0x5au8; 32];
+        let chan = 0xfeed_u64;
+        let keys = cipher(peer, [1u8; 32], [2u8; 32]);
+        set_recv_callback(peer, chan, slow, 0x1000 as *mut c_void, Arc::clone(&keys));
+
+        // Stand in for a datagram arriving on a worker: mark the channel busy
+        // the way dispatch does, so the registry sees an in-flight call.
+        {
+            let (lock, _) = &*IN_FLIGHT;
+            *lock
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .entry(chan)
+                .or_insert(0) += 1;
+        }
+        let busy = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            let (lock, cv) = &*IN_FLIGHT;
+            let mut counts = lock.lock().unwrap_or_else(|p| p.into_inner());
+            if let Some(n) = counts.get_mut(&chan) {
+                *n -= 1;
+            }
+            LEFT.fetch_add(1, Ordering::SeqCst);
+            cv.notify_all();
+        });
+
+        // Same channel, DIFFERENT context. This is the call that used to
+        // return straight away.
+        let started = std::time::Instant::now();
+        set_recv_callback(peer, chan, slow, 0x2000 as *mut c_void, keys);
+        let waited = started.elapsed();
+        busy.join().expect("busy thread panicked");
+
+        assert!(
+            waited >= std::time::Duration::from_millis(150),
+            "registration returned after {waited:?} while a dispatch was still \
+             inside the old callback — the host would free that context now",
+        );
+        assert!(
+            LEFT.load(Ordering::SeqCst) >= 1,
+            "the in-flight dispatch had not left when registration returned",
+        );
+        RECV.lock().unwrap_or_else(|p| p.into_inner()).remove(&peer);
     }
 
     /// Our side of a call with `peer`.
