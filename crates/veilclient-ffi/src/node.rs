@@ -265,6 +265,43 @@ unsafe fn read_arg(
     }
 }
 
+/// Render `value` as a TOML basic string — quotes included — so it can be
+/// dropped into a config template as a VALUE and read back byte for byte.
+///
+/// The runtime endpoints are filesystem paths and URIs chosen by the host, and
+/// a host is entitled to characters the TOML grammar reserves. A Windows
+/// runtime directory is the loud case (`C:\Users\...` fails to parse: `\U`
+/// begins a unicode escape), but a POSIX directory name may legally contain a
+/// quote or a newline, and pasting one between two quote characters lets it
+/// close the string and append keys of its own to the composed config.
+///
+/// Escapes exactly what TOML v1.0 requires: the two delimiters, and the
+/// control characters — the compact forms where they exist, `\u00XX` for the
+/// rest. Any value without them is returned unchanged inside quotes, so the
+/// output for an ordinary POSIX socket path is byte-identical to the plain
+/// interpolation this replaced.
+fn toml_basic_string(value: &str) -> String {
+    let mut out = String::with_capacity(value.len() + 2);
+    out.push('"');
+    for ch in value.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\u{8}' => out.push_str("\\b"),
+            '\t' => out.push_str("\\t"),
+            '\n' => out.push_str("\\n"),
+            '\u{c}' => out.push_str("\\f"),
+            '\r' => out.push_str("\\r"),
+            c if (c as u32) < 0x20 || c as u32 == 0x7f => {
+                out.push_str(&format!("\\u{:04X}", c as u32));
+            }
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
 /// Compose a full, bootable node config by combining a stored identity (the
 /// config TOML from `veil_config_init`, kept in the host's deniable container)
 /// with EPHEMERAL runtime endpoints chosen per launch: `listen_transport` (e.g.
@@ -334,10 +371,18 @@ pub unsafe extern "C" fn veil_config_compose(
     } else {
         format!("unix://{admin}")
     };
+    // Each endpoint is rendered as a TOML string rather than pasted between two
+    // quote characters. A Windows runtime directory is the case that forced it:
+    // `C:\Users\...` is not a mangled value in a basic string, it is a PARSE
+    // ERROR (`\U` opens a unicode escape), so the boot died here, before the
+    // node started, with nothing in any log but a TOML column number.
     let template = format!(
-        "[[listen]]\nid = \"0x00000001\"\ntransport = \"{listen}\"\n\n\
-         [ipc]\nenabled = true\nsocket_uri = \"{ipc_endpoint}\"\n\n\
-         [global]\nadmin_socket = \"{admin_endpoint}\"\n"
+        "[[listen]]\nid = \"0x00000001\"\ntransport = {}\n\n\
+         [ipc]\nenabled = true\nsocket_uri = {}\n\n\
+         [global]\nadmin_socket = {}\n",
+        toml_basic_string(&listen),
+        toml_basic_string(&ipc_endpoint),
+        toml_basic_string(&admin_endpoint),
     );
     let mut config = match veil_cfg::parse_toml_str(&template) {
         Ok(c) => c,
@@ -1621,6 +1666,158 @@ mod tests {
         );
     }
 
+    /// The escaping table itself, pinned.
+    ///
+    /// The identity case is the one the POSIX builds depend on: an ordinary
+    /// socket path must come back with nothing but quotes added, so composing
+    /// on macOS, Linux and Android renders exactly the bytes it always did.
+    #[test]
+    fn toml_basic_string_escapes_only_what_the_grammar_reserves() {
+        assert_eq!(
+            toml_basic_string("/tmp/xveil-rt-1/admin.sock"),
+            "\"/tmp/xveil-rt-1/admin.sock\"",
+            "an ordinary POSIX path must be the identity function"
+        );
+        assert_eq!(
+            toml_basic_string(r"C:\Users\me\admin.sock"),
+            r#""C:\\Users\\me\\admin.sock""#
+        );
+        assert_eq!(toml_basic_string("a\"b"), r#""a\"b""#);
+        assert_eq!(toml_basic_string("a\nb\tc\rd"), r#""a\nb\tc\rd""#);
+        // No compact form: the long escape, and uppercase hex per the spec.
+        assert_eq!(toml_basic_string("a\u{1}b"), r#""a\u0001b""#);
+        assert_eq!(toml_basic_string("a\u{7f}b"), r#""a\u007Fb""#);
+        // Non-ASCII is legal in a basic string and stays literal.
+        assert_eq!(toml_basic_string("Пользователи"), "\"Пользователи\"");
+    }
+
+    /// A Windows runtime path must survive composition.
+    ///
+    /// The runtime endpoints used to be interpolated RAW into a hand-built TOML
+    /// template, and a TOML basic string reads `\` as the start of an escape.
+    /// A stock Windows temp directory (`C:\Users\...`) therefore did not merely
+    /// arrive mangled: `\U` opens a unicode escape, so the template failed to
+    /// PARSE and the boot died inside compose — before the node was ever asked
+    /// to bind anything, and with no "unsupported endpoint" in any log to say
+    /// so. Anyone reading a user's report saw only "runtime template parse
+    /// failed" naming a TOML column.
+    ///
+    /// Composition is pure string work, so this holds on every host: it fails
+    /// on macOS against the raw-interpolation version.
+    #[test]
+    fn config_compose_escapes_windows_runtime_paths() {
+        let mut err: *mut c_char = std::ptr::null_mut();
+        let id_out = unsafe { veil_config_init(8, &mut err) };
+        assert!(!id_out.is_null());
+        let identity_toml = unsafe { CStr::from_ptr(id_out) }
+            .to_string_lossy()
+            .into_owned();
+        unsafe { crate::veil_free_string(id_out) };
+
+        let listen = b"tcp://127.0.0.1:9931";
+        // What `Directory.systemTemp` actually hands the app on Windows.
+        let ipc = br"tcp://127.0.0.1:0?runtime_dir=C:\Users\me\AppData\Local\Temp\xveil-rt-1";
+        // A bare path (no scheme) gets the `unix://` wrapper — the shape a
+        // Windows host sent before the endpoint plan gave it TCP.
+        let admin = br"C:\Users\me\AppData\Local\Temp\xveil-rt-1\admin.sock";
+        let out = unsafe {
+            veil_config_compose(
+                identity_toml.as_ptr(),
+                identity_toml.len(),
+                listen.as_ptr(),
+                listen.len(),
+                ipc.as_ptr(),
+                ipc.len(),
+                admin.as_ptr(),
+                admin.len(),
+                &mut err,
+            )
+        };
+        let detail = if err.is_null() {
+            String::new()
+        } else {
+            unsafe { CStr::from_ptr(err) }
+                .to_string_lossy()
+                .into_owned()
+        };
+        assert!(
+            !out.is_null(),
+            "compose rejected a Windows runtime path: {detail}"
+        );
+        let full = unsafe { CStr::from_ptr(out) }
+            .to_string_lossy()
+            .into_owned();
+        unsafe { crate::veil_free_string(out) };
+
+        let cfg = veil_cfg::parse_toml_str(&full).expect("composed config parses");
+        // Every backslash survives, in both the query string and the path.
+        assert_eq!(
+            cfg.ipc.socket_uri.as_deref(),
+            Some(std::str::from_utf8(ipc).unwrap()),
+            "the TCP runtime_dir lost its backslashes"
+        );
+        assert_eq!(
+            cfg.global.admin_socket.as_deref(),
+            Some(format!("unix://{}", std::str::from_utf8(admin).unwrap()).as_str()),
+            "the admin path lost its backslashes"
+        );
+    }
+
+    /// A quote or a newline in the runtime directory must stay DATA.
+    ///
+    /// Both are legal in a POSIX directory name, so this hole is open on the
+    /// platforms that ship today, not only on Windows: raw interpolation let
+    /// the path close the TOML string and append keys of its own to the
+    /// composed config.
+    #[test]
+    fn config_compose_keeps_quotes_in_paths_out_of_the_grammar() {
+        let mut err: *mut c_char = std::ptr::null_mut();
+        let id_out = unsafe { veil_config_init(8, &mut err) };
+        assert!(!id_out.is_null());
+        let identity_toml = unsafe { CStr::from_ptr(id_out) }
+            .to_string_lossy()
+            .into_owned();
+        unsafe { crate::veil_free_string(id_out) };
+
+        let listen = b"tcp://127.0.0.1:9931";
+        let ipc = b"/tmp/xveil-rt/app.sock";
+        // Closes the string and tries to graft a second key on behind it.
+        let admin = "/tmp/xveil-rt/a\".sock\npersist_enabled = true\nx = \"";
+        let out = unsafe {
+            veil_config_compose(
+                identity_toml.as_ptr(),
+                identity_toml.len(),
+                listen.as_ptr(),
+                listen.len(),
+                ipc.as_ptr(),
+                ipc.len(),
+                admin.as_ptr(),
+                admin.len(),
+                &mut err,
+            )
+        };
+        assert!(!out.is_null(), "compose returned null");
+        let full = unsafe { CStr::from_ptr(out) }
+            .to_string_lossy()
+            .into_owned();
+        unsafe { crate::veil_free_string(out) };
+
+        let cfg = veil_cfg::parse_toml_str(&full).expect("composed config parses");
+        // The whole thing is ONE value, punctuation and all.
+        assert_eq!(
+            cfg.global.admin_socket.as_deref(),
+            Some(format!("unix://{admin}").as_str()),
+            "the injected text did not stay inside the value"
+        );
+        // ... and it did not reach the switch it was aiming at. The embedded
+        // node keeps nothing on disk; an injected `persist_enabled = true`
+        // would write veil's snapshot files out of the container.
+        assert!(
+            !cfg.persist_enabled,
+            "a path injected persist_enabled into the composed config"
+        );
+    }
+
     /// A second boot must work from ITS OWN runtime directory.
     ///
     /// This was process-wide, write-once state. The value is the node's
@@ -1816,5 +2013,132 @@ mod tests {
         };
         unsafe { veil_node_stop(node) };
         assert_eq!(rc, 0, "apply_config failed: {apply_err}");
+    }
+
+    /// The Windows boot, on a real Windows runtime directory, end to end.
+    ///
+    /// Nothing had ever run this. No developer machine on this project is a
+    /// Windows host, and the Windows gate watched `veil-local-transport` only,
+    /// so every `#[cfg(windows)]` decision on the embedded-node path shipped
+    /// reviewed by eye. What shipped could not start a node at all: the host
+    /// sent a bare `C:\...\admin.sock`, this crate wrapped it `unix://` and
+    /// pasted it into a TOML template, and `\U` opened a unicode escape — the
+    /// boot died in compose, before the node ran, reporting a TOML column.
+    ///
+    /// Heavy (mines an identity and boots a real node), so it is `--ignored`
+    /// and run by name from the Windows gate:
+    ///   cargo test -p veilclient-ffi --features node-embedded \
+    ///     a_windows_runtime_dir_boots -- --ignored --nocapture
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "boots a real node; run with --ignored --nocapture"]
+    fn a_windows_runtime_dir_boots_a_node_end_to_end() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime_dir = dir.path().to_string_lossy().into_owned();
+        // The fixture must be the real thing, not a POSIX-looking path that
+        // would let this pass without touching the defect.
+        assert!(
+            runtime_dir.contains('\\'),
+            "expected a backslashed Windows path, got {runtime_dir}"
+        );
+
+        // Exactly the endpoints `localEndpointPlanFor('windows')` now sends.
+        let endpoint = format!("tcp://127.0.0.1:0?runtime_dir={runtime_dir}");
+        let listen = "tcp://127.0.0.1:19098";
+        let mut err: *mut c_char = std::ptr::null_mut();
+
+        // Difficulty 0 = canonical. An 8-bit identity is refused by
+        // apply-config validation, whose floor is DEFAULT_POW_DIFFICULTY.
+        let id_ptr = unsafe { veil_config_init(0, &mut err) };
+        assert!(!id_ptr.is_null(), "config_init failed");
+        let id_toml = unsafe { CStr::from_ptr(id_ptr) }
+            .to_string_lossy()
+            .into_owned();
+        unsafe { crate::veil_free_string(id_ptr) };
+
+        // 1. COMPOSE — where the shipped build died.
+        let full_ptr = unsafe {
+            veil_config_compose(
+                id_toml.as_ptr(),
+                id_toml.len(),
+                listen.as_ptr(),
+                listen.len(),
+                endpoint.as_ptr(),
+                endpoint.len(),
+                endpoint.as_ptr(),
+                endpoint.len(),
+                &mut err,
+            )
+        };
+        let detail = if err.is_null() {
+            String::new()
+        } else {
+            unsafe { CStr::from_ptr(err) }
+                .to_string_lossy()
+                .into_owned()
+        };
+        assert!(!full_ptr.is_null(), "compose failed: {detail}");
+        let full = unsafe { CStr::from_ptr(full_ptr) }
+            .to_string_lossy()
+            .into_owned();
+        unsafe { crate::veil_free_string(full_ptr) };
+
+        // 2. START_DEFERRED — the arm that used to answer `Unsupported`.
+        let node =
+            unsafe { veil_node_start_deferred(endpoint.as_ptr(), endpoint.len(), false, &mut err) };
+        assert!(!node.is_null(), "start_deferred returned null");
+
+        // 3. The sidecars appear: proof the node really bound a TCP admin
+        // endpoint and published where to find it. This is what the app's
+        // readiness probe watches for.
+        let port_file = dir.path().join("admin.port");
+        let token_file = dir.path().join("admin.token");
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
+        while std::time::Instant::now() < deadline && !(port_file.exists() && token_file.exists()) {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(
+            port_file.exists() && token_file.exists(),
+            "admin.port/admin.token never appeared in {runtime_dir}"
+        );
+
+        // 4. APPLY_CONFIG — connects to that admin endpoint and promotes the
+        // node to its real identity. Exercises the whole client path.
+        let rc = unsafe { veil_node_apply_config(node, full.as_ptr(), full.len(), &mut err) };
+        let apply_err = if err.is_null() {
+            String::new()
+        } else {
+            unsafe { CStr::from_ptr(err) }
+                .to_string_lossy()
+                .into_owned()
+        };
+
+        // 5. STOP.
+        unsafe { veil_node_stop(node) };
+        assert_eq!(rc, 0, "apply_config failed: {apply_err}");
+
+        // 6. A SECOND boot reuses the same runtime directory.
+        //
+        // Deliberately not "the sidecars are deleted on stop" — they are not.
+        // `prepare_admin_endpoint` sweeps STALE sidecars before it binds, and
+        // the TCP arm of the Restart path skips `remove_file` because the
+        // anchor is synthetic. What the app depends on is this: the files a
+        // stopped node leaves behind must not wedge the next launch. On the
+        // desktop the directory is leased per boot, but a crash leaves it, and
+        // this is the first time that path has ever run on Windows.
+        let again =
+            unsafe { veil_node_start_deferred(endpoint.as_ptr(), endpoint.len(), false, &mut err) };
+        let again_err = if err.is_null() {
+            String::new()
+        } else {
+            unsafe { CStr::from_ptr(err) }
+                .to_string_lossy()
+                .into_owned()
+        };
+        assert!(
+            !again.is_null(),
+            "a second boot could not reuse the runtime dir: {again_err}"
+        );
+        unsafe { veil_node_stop(again) };
     }
 }
