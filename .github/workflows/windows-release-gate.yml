@@ -99,13 +99,29 @@ jobs:
           CC: clang-cl
           CXX: clang-cl
         run: |
+          # `|| rc=$?`, not a bare call: this shell runs with `-e`, so a genuine
+          # test FAILURE used to abort the step before `cat compose.log` — the
+          # gate swallowed the very output it exists to show.
+          rc=0
           cargo test -p veilclient-ffi --lib \
             --no-default-features --features node-embedded,test-low-difficulty \
-            node::tests::config_compose -- --test-threads=1 > compose.log 2>&1
-          rc=$?
+            node::tests::config_compose -- --test-threads=1 > compose.log 2>&1 || rc=$?
           cat compose.log
-          grep -qE '[1-9][0-9]* passed' compose.log || {
-            echo "::error::no compose test ran — check the filter"; exit 1; }
+          if ! grep -qE '[1-9][0-9]* passed' compose.log; then
+            # Two different zeros that mean opposite things. A filter matching
+            # nothing still leaves a NON-zero `filtered out` count. Zero passed
+            # AND zero filtered out means the harness holds no tests at all,
+            # which is not a filter problem: veilclient-ffi/src/lib.rs carries a
+            # crate-level `#![cfg(unix)]`, so on Windows the crate, its tests
+            # and the embedded node all compile to nothing. Say so, rather than
+            # sending the next reader after a filter that is perfectly correct.
+            if grep -q '; 0 filtered out' compose.log; then
+              echo "::error::veilclient-ffi compiled to an EMPTY crate here (0 tests AND 0 filtered out). src/lib.rs is #![cfg(unix)], so there is no embedded node on Windows to test. The filter is correct — the crate is absent. This job cannot mean anything until that gate is lifted."
+            else
+              echo "::error::no compose test ran — check the filter"
+            fi
+            exit 1
+          fi
           exit $rc
       # The real proof, and the first time any of it has run on Windows:
       # compose against a genuine `C:\Users\...\Temp\...` directory, boot a
@@ -119,14 +135,22 @@ jobs:
           CC: clang-cl
           CXX: clang-cl
         run: |
+          # `|| rc=$?` for the same reason as the compose step: `-e` would
+          # otherwise abort before the log is printed.
+          rc=0
           cargo test -p veilclient-ffi --lib \
             --no-default-features --features node-embedded \
             a_windows_runtime_dir_boots -- --ignored --nocapture \
-            --test-threads=1 > smoke.log 2>&1
-          rc=$?
+            --test-threads=1 > smoke.log 2>&1 || rc=$?
           cat smoke.log
-          grep -qE '1 passed' smoke.log || {
-            echo "::error::the Windows boot smoke did not execute"; exit 1; }
+          if ! grep -qE '1 passed' smoke.log; then
+            if grep -q '; 0 filtered out' smoke.log; then
+              echo "::error::veilclient-ffi compiled to an EMPTY crate here (0 tests AND 0 filtered out). src/lib.rs is #![cfg(unix)]. Note that a_windows_runtime_dir_boots_a_node_end_to_end is #[cfg(windows)] INSIDE that #![cfg(unix)] crate — an empty intersection, so it can never run on any platform."
+            else
+              echo "::error::the Windows boot smoke did not execute"
+            fi
+            exit 1
+          fi
           exit $rc
 
   release-build:
