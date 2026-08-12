@@ -29,6 +29,34 @@
 
 ### Fixed
 
+- **A deferred-init boot no longer dials the builtin seeds before its host has
+  said anything.** `--defer-init` / `veil_node_start_deferred` boot from
+  `build_stub_config_with_ephemeral_identity`, and the host's real config
+  arrives afterwards as `admin apply-config`. That stub was `Config::default()`,
+  which is `builtin_seed_policy = "auto"` — and `auto`'s condition, "neither
+  `peers` nor `[[bootstrap_peers]]` is set", is what the stub is by
+  construction. So every deferred boot on every host logged
+  `bootstrap.builtin dialing N entry point(s): 0 configured + N builtin
+  seed(s)` and opened outbound connectors to the compiled-in seed hosts,
+  seconds before the config that had something to say about it was applied.
+
+  For an embedded host that offers its user a choice about those seeds, this
+  silently defeated it: the refusal is expressed as `builtin_seed_policy =
+  "never"` in the config the host COMPOSES, which is the second config the node
+  reads. A user who declined still reached the operator's seed hosts once per
+  start, and no test on the host's side could see it — every one of them
+  inspects the composed config.
+
+  The stub now sets `builtin_seed_policy = "never"`. Nothing is lost for a host
+  that wants the seeds: apply-config is a full reload, so `spawn_all_services`
+  re-runs the bootstrap task against the real config and splices them in there,
+  over connectors that outlive the boot. The boot dial was never the one that
+  bootstrapped the node — it also carried no `[transport]`, so on any
+  deployment pinning an obfs4 PSK every one of those dials failed the handshake,
+  and it presented a compiled-in constant identity shared by every install. A
+  deferred node given no config now stays offline, which is what deferred-init
+  means.
+
 - **Inbound frame bodies now share a node-wide memory budget.** The 16 MiB
   per-frame cap and the 30-second slow-loris deadline are both *per frame, per
   session*; nothing summed them. Every authenticated session is an independent
