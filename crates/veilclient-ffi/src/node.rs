@@ -1687,8 +1687,25 @@ mod tests {
         // No compact form: the long escape, and uppercase hex per the spec.
         assert_eq!(toml_basic_string("a\u{1}b"), r#""a\u0001b""#);
         assert_eq!(toml_basic_string("a\u{7f}b"), r#""a\u007Fb""#);
-        // Non-ASCII is legal in a basic string and stays literal.
-        assert_eq!(toml_basic_string("Пользователи"), "\"Пользователи\"");
+        // Non-ASCII is legal in a basic string and stays literal. The case that
+        // matters is the localized name of the very directory the `C:\Users`
+        // assertion above walks: a Russian Windows install spells it in
+        // Cyrillic, and those bytes must survive composition untouched.
+        //
+        // Spelled with `\u{..}` escapes ON PURPOSE — do NOT "tidy" this back
+        // into literal characters. `scripts/check-cyrillic-runtime-strings.sh`
+        // fails on any Cyrillic sharing a line with `assert*!` (a homoglyph in
+        // an operator-visible string is a review-obfuscation vector), and that
+        // gate runs in pr-gate.yml, pr-hygiene.yml and ci.yml — un-escaping
+        // turns all three red. rustc resolves the escapes at lex time, so the
+        // bytes under test are identical either way.
+        let users_ru =
+            "\u{41F}\u{43E}\u{43B}\u{44C}\u{437}\u{43E}\u{432}\u{430}\u{442}\u{435}\u{43B}\u{438}";
+        assert_eq!(
+            toml_basic_string(users_ru),
+            format!("\"{users_ru}\""),
+            "non-ASCII must pass through unchanged, gaining only the quotes"
+        );
     }
 
     /// A Windows runtime path must survive composition.
