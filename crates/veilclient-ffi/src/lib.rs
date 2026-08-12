@@ -53,14 +53,6 @@
 //! calls will leak the detail string.
 
 #![allow(clippy::missing_safety_doc)]
-// `veilclient-ffi` exposes types (`AppHandle`, `VeilClient`,
-// `MailboxBlobInfo`, …) that are themselves `#[cfg(unix)]`-gated in the
-// upstream `veilclient` crate (Unix-domain-socket IPC).  Mobile FFI
-// builds target iOS / Android (both Unix-family), so gating the whole
-// crate on `cfg(unix)` keeps the workspace `cargo check --target
-// x86_64-pc-windows-gnu` gate green without breaking any actual
-// downstream consumer.
-#![cfg(unix)]
 
 use std::ffi::CString;
 #[cfg(feature = "node-embedded")]
