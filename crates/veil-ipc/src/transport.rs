@@ -102,3 +102,19 @@ pub async fn connect_tcp(
 ) -> std::io::Result<IpcStream> {
     local_transport::connect_tcp(addr, token).await
 }
+
+/// Connect to an IPC listener over a Windows NamedPipe and perform the token
+/// handshake.
+///
+/// The facade for the third backend. `bind_named_pipe` reached the server side
+/// through [`crate::server`], which calls `veil_local_transport` directly, so
+/// the client half of the pair was never given a home here — and
+/// `veilclient::client::connect_ipc_any` has called `transport::
+/// connect_named_pipe` since the NamedPipe probe was written. That call has
+/// never resolved: the only consumer of this module that reaches it is
+/// `#[cfg(windows)]` inside a crate that was `#![cfg(unix)]`, an empty
+/// intersection, so nothing ever compiled the line.
+#[cfg(windows)]
+pub async fn connect_named_pipe(name: &str, token: &IpcToken) -> std::io::Result<IpcStream> {
+    local_transport::connect_named_pipe(name, token).await
+}

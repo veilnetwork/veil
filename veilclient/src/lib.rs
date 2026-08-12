@@ -63,21 +63,16 @@
 //! | [`MAX_CLOCK_SKEW_SECS`] | 300 | Max timestamp skew accepted by relay nodes (seconds) |
 //! | [`MAX_STREAM_SEND_WINDOW`] | 16 MiB | Maximum in-flight bytes per application stream |
 
-#[cfg(unix)]
 pub mod client;
 pub mod error;
-#[cfg(unix)]
 pub mod handle;
 /// PoW-gated rendezvous initiator client (Slice 4 of the
 /// PoW-Gated Rendezvous epic; see `docs/internal/PLAN_POW_GATED_RENDEZVOUS.md`).
 /// Cross-platform — pure crypto + signing, no IPC dependency.
 pub mod rendezvous;
-#[cfg(unix)]
 pub mod stream;
 
-#[cfg(unix)]
 pub use client::APP_IPC_SEND_PREFIX_BYTES;
-#[cfg(unix)]
 pub use client::{
     CreateBootstrapInviteReply,
     JoinBootstrapResult,
@@ -99,9 +94,7 @@ pub use client::{
     VeilEvent,
 };
 pub use error::ClientError;
-#[cfg(unix)]
 pub use handle::{AppHandle, AppReceiver, AppSender, IncomingMessage, IncomingStream};
-#[cfg(unix)]
 pub use stream::VeilStream;
 
 // ── Network contract constants (stable) ──────────────────────────────────────
