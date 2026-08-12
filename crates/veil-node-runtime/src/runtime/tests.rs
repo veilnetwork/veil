@@ -332,7 +332,11 @@ async fn the_applied_config_is_what_puts_a_deferred_node_on_the_network() {
     // task, respawn them all against the new config.
     runtime.reload().await.expect("apply-config style reload");
 
-    let registered: Vec<String> = runtime.peers().iter().map(|p| p.transport.clone()).collect();
+    let registered: Vec<String> = runtime
+        .peers()
+        .iter()
+        .map(|p| p.transport.clone())
+        .collect();
     assert_eq!(
         registered,
         vec!["tcp://127.0.0.1:1".to_owned()],
