@@ -86,6 +86,46 @@ jobs:
         run: >-
           cargo build -p veilclient-ffi --lib
           --no-default-features --features node-embedded
+
+      # WHAT THE DLL ACTUALLY OFFERS, which is the question the build's exit
+      # code does not answer.
+      #
+      # `#![cfg(unix)]` at the crate root made every one of these compile to
+      # nothing off Unix. `cargo build` still exited 0 and produced a DLL, and
+      # that DLL shipped: the published v0.9.1 bundle carries a 105 KB
+      # veilclient_ffi.dll whose export address table has ZERO entries, beside
+      # a hidden_volume_ffi.dll with 285. So the Windows app has had no way to
+      # reach the network at all, and every gate around it was green — this one
+      # included, because it only ever asked whether the build succeeded.
+      #
+      # dumpbin reads the export table, which is the table GetProcAddress
+      # consults. A symbol listing would answer a different question: `nm`
+      # reports symbols that are defined but not exported, and a DLL can define
+      # everything and export none of it.
+      #
+      # The floor is a floor, not a non-empty test: a regex that stops matching
+      # would otherwise shrink the count silently and agree with itself. The
+      # header declares well over a hundred entry points; fifty is the alarm.
+      - name: The DLL exports what the app looks up
+        shell: pwsh
+        run: |
+          $dll = "target/debug/veilclient_ffi.dll"
+          if (-not (Test-Path $dll)) { throw "no DLL at $dll" }
+          $rows = (& dumpbin.exe /EXPORTS $dll) |
+            Select-String -Pattern '^\s+\d+\s+[0-9A-Fa-f]+\s+[0-9A-Fa-f]{8}\s+(\S+)' |
+            ForEach-Object { $_.Matches[0].Groups[1].Value }
+          $veil = $rows | Where-Object { $_ -like 'veil_*' } | Sort-Object -Unique
+          Write-Host "exported veil_* entry points: $($veil.Count)"
+          if ($veil.Count -lt 50) {
+            throw "::error::the DLL exports $($veil.Count) veil_* entry points. A build that succeeds and exports nothing is what shipped in v0.9.1."
+          }
+          # The one the Dart side reads BEFORE any other lookup: without it the
+          # app refuses the library outright, so its absence is not a partial
+          # failure but a total one.
+          if ($veil -notcontains 'veil_abi_contract_hash') {
+            throw "::error::veil_abi_contract_hash is not exported; the app checks it before every other symbol"
+          }
+
       # Composition is where the shipped Windows build actually died, and it is
       # pure string work — fast, and it fails loudly if the TOML escaping
       # regresses.
