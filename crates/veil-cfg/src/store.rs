@@ -375,6 +375,8 @@ pub fn parse_toml_str(content: &str) -> Result<Config> {
 /// The returned config has:
 /// * One [identity] block (Ed25519, ephemeral keypair)
 /// * Empty `peers`, `listen`, `bootstrap_peers`
+/// * `builtin_seed_policy = "never"` — the stub dials nothing at all; see the
+///   note at the assignment for why the boot dial was never load-bearing
 /// * Default global / mobile / etc. config blocks
 ///
 /// **Lifecycle**: the caller writes this config to a temp dir and passes
@@ -469,6 +471,37 @@ pub fn build_stub_config_with_ephemeral_identity(anonymous: bool) -> Result<Conf
     // (`relay_capable || receive_anonymous || onion_service`), needed to unseal
     // introduces. `relay_capable` stays false (we don't carry others' circuits).
     config.anonymity.receive_anonymous = true;
+    // The stub must dial NOTHING. It is the only config in the process that the
+    // host did not author, and `Config::default()` leaves
+    // `builtin_seed_policy = "auto"` — whose condition is "neither `peers` nor
+    // `[[bootstrap_peers]]` is set", which the stub satisfies by construction.
+    // So every deferred boot spliced `veil_bootstrap::builtin_seeds()` into its
+    // dial list and opened outbound connectors to the operator's production
+    // hosts, before the host's real config had been applied and therefore
+    // before anything had asked whether this identity wanted them.
+    //
+    // For xVeil that silently defeated a shipped setting. A person creating an
+    // identity may decline the shared seeds; the app answers by composing
+    // `builtin_seed_policy = "never"` — but that config only arrives as the
+    // apply-config AFTER this one has booted, so a refuser still touched the
+    // shared seed hosts once per start. For a deniable messenger the setting
+    // has to hold from the first packet, not from the second config.
+    //
+    // Nothing is lost by refusing here, because the boot dial was never the
+    // one that bootstraps the node:
+    //   * apply-config is a full reload — `do_stop_tasks` aborts these
+    //     connectors and `spawn_all_services` re-runs `spawn_bootstrap_task`
+    //     against the REAL config, so a host that keeps the seeds gets them
+    //     spliced in there, over connectors that outlive the boot;
+    //   * the stub has no `[transport]`, so on a deployment that pins an obfs4
+    //     PSK every one of those dials failed the handshake anyway;
+    //   * the stub identity is a compiled-in constant, so what those dials
+    //     presented to the seeds was one node_id shared by every install.
+    //
+    // A deferred node that is never given a config now stays offline, which is
+    // what deferred-init means: the host supplies the network, and until it
+    // does there is no network to be on.
+    config.global.builtin_seed_policy = crate::model::BuiltinSeedPolicy::Never;
     if anonymous {
         // LOCATION anonymity (opt-in): additionally run the onion service so
         // peers/relays never learn this identity's IP and it can't be correlated
@@ -751,6 +784,46 @@ mod tests {
         assert!(
             !from_disk.ephemeral_identity,
             "the marker must not be settable from a config file"
+        );
+    }
+
+    /// The deferred stub must refuse the compiled-in seed list.
+    ///
+    /// Not a preference: this config boots before the host has applied one, so
+    /// whatever it says about the network is said on behalf of a person who has
+    /// not been asked. `Config::default()` says `auto`, and `auto`'s condition
+    /// — no `peers`, no `[[bootstrap_peers]]` — is exactly what the stub is, so
+    /// the default answer was "dial the operator's production hosts".
+    ///
+    /// The assertion is on the ENUM rather than on any resulting dial, because
+    /// this crate cannot see a dial. `builtin_seed_policy` is the only input
+    /// `resolve_bootstrap_candidates` consults for the compiled-in list, and
+    /// the runtime crate's `deferred_stub_boot_dials_no_builtin_seed` pins the
+    /// other half against a node that has actually started.
+    #[test]
+    fn the_deferred_stub_refuses_the_builtin_seeds() {
+        for anonymous in [false, true] {
+            let stub = super::build_stub_config_with_ephemeral_identity(anonymous).unwrap();
+            assert_eq!(
+                stub.global.builtin_seed_policy,
+                crate::model::BuiltinSeedPolicy::Never,
+                "the stub boots before the host's config, so it must dial nothing \
+                 (anonymous={anonymous})"
+            );
+            assert!(stub.bootstrap_peers.is_empty());
+            assert!(stub.peers.is_empty());
+            assert!(
+                stub.global.bootstrap_dns_domain.is_none(),
+                "and must not reach the network through DNS discovery either"
+            );
+        }
+
+        // The DEFAULT is what this overrides, and if the default ever became
+        // `never` on its own the override above would stop proving anything.
+        assert_eq!(
+            super::super::Config::default().global.builtin_seed_policy,
+            crate::model::BuiltinSeedPolicy::Auto,
+            "the stub's refusal is only meaningful while the default still dials"
         );
     }
 
