@@ -1,8 +1,167 @@
 # Changelog
 
-## Unreleased
+## v0.5.0 — 2026-08-12
+
+**Flag day. A node built from this release cannot exchange a frame with one
+built from v0.4.2, in either direction, on any transport.** Two unnegotiated
+wire changes force it and neither has a compatibility window. The OVL1 frame
+header's version byte goes 1 → 2, because the AEAD now authenticates the whole
+24-byte header instead of three bytes of it; the two associated-data
+constructions are not interoperable, and the version byte exists so that the
+refusal is legible — a peer from the other side is rejected at `decode_header`
+with `UnsupportedVersion` rather than failing every AEAD open with an error
+indistinguishable from corruption or an attack. Separately, the anonymous cell
+grows 512 → 8192 bytes, which every relay and client on a network must agree on
+by construction. **Roll clients, relays and seeds together.** A partial rollout
+does not degrade gracefully; it partitions the network along the version line.
+Within the roll, take relays before clients: `CircuitBuilt` ACKs grew 4 → 36
+bytes with no negotiation of their own.
+
+Two consequences of that boundary are worth stating plainly, because neither
+looks like a version problem in a log. An old peer dialling an upgraded node is
+refused before it can say who it is, and `UnsupportedVersion` is one of the
+strings the scanner shield reads as pre-protocol garbage — so a v1 seed
+retrying against a v2 node is classified as a port scanner and its address is
+banned for 300 seconds after five attempts in a minute. And a cell-size
+mismatch is recorded as a peer violation in both directions, so the two islands
+actively accumulate ban strikes against each other rather than sitting idle.
+Leaving a seed behind is worse than leaving it off. ⚠️ The `WIRE_PROTOCOL.md`
+docs still describe version 1 and were not updated in this range.
+
+**Every host that links `veilclient-ffi` must be rebuilt against this release.**
+The C ABI broke in five places that kept their old symbol names, most sharply
+`VeilRecvCb`, which gained a `provenance` byte in the MIDDLE of its argument
+list — an old host's callback would read `reply_id` out of a register holding
+one byte, which is memory corruption rather than a link error. The library
+therefore now carries `veil_abi_contract_hash`, a SHA-256 over the generated C
+header, and a caller holding a different one is refused at load rather than
+called: the Dart side throws `VeilAbiContractMismatch` and no library handle
+escapes. There is no shim and no fallback, by design — a mismatch is a rebuild,
+not a downgrade path.
+
+**What does not break.** No config key was removed or renamed, so a v0.4.2
+`config.toml` still parses under the strict parser and every added key carries
+a default. No state path moved. The mailbox database opens in place with
+its record layout byte-identical, the ban file is unchanged, and the
+update-manifest encoding has an empty diff — a v0.4.2 updater consumes this
+release exactly as it consumed the last one. `ogate` and `oproxy` have no
+commits in this range at all, so their flags and environment overrides are
+untouched. Nothing under `ansible/`, `docker/` or `monitoring/` needs mirroring.
+
+**What an operator with a running node has to do.** Stop it, replace the
+binary, start it — plus the following, each of which applies only if it names
+something you actually set. If `require_signed_config` is on, pin an issuer
+before upgrading: enforcement without `VEIL_CONFIG_TRUSTED_ISSUER_PUBKEY` now
+refuses to boot where it used to proceed, and self-certification no longer
+counts. `chmod 600` the file named by `key_passphrase_file`; a group-readable
+one is now refused rather than warned about. If you have a sovereign identity
+and no `mlkem.key` file, decide whether you want the published mailbox key to
+change — `mlkem_rotation_secs = 0` reproduces the v0.4.2 key exactly. If you
+relied on DHT values surviving a restart without setting
+`dht.values_persist_path`, set it: the implied path is gone, and the snapshot
+format is v2 besides, so the old file is ignored once either way. Fix any script
+calling `veil-cli config sign`, which now requires `--signer-key`, and drop
+`--features tls-webpki-roots` from any build pipeline. Relay operators should
+re-check mailbox quota sizing: quotas are charged in billable bytes now
+(payload + 256 per record), so an unchanged number admits far fewer records.
 
 ### Breaking
+
+- **The OVL1 frame header is authenticated whole, and `VERSION` goes 1 → 2**
+  (external audit report4, V-01). The AEAD associated data was
+  `[family, msg_type_hi, msg_type_lo]`; everything else in the 24-byte header —
+  `flags`, `header_len`, `body_len`, `stream_id`, `request_id` — sat outside the
+  Poly1305 tag. `tcp://`, `ws://` and `socks://` are registered transports and
+  carry no outer authentication of their own, so on those an on-path attacker
+  could take an AUTHENTIC frame and rewrite the parts that say where it goes:
+  move a valid `AppData`/`AppClose` onto a different stream, change `request_id`
+  so a DHT response is handed to the wrong waiter, or change `body_len` so the
+  peer waits for bytes that never arrive, allocates for them, or tears the
+  session down. The ciphertext was genuine in every case; only its placement was
+  forged, and placement is where the meaning lives.
+
+  The AAD is now the entire final wire header. It costs nothing to send — the
+  AAD is never transmitted, it is the header the receiver already holds — and
+  nothing to compute, because both sides already encode and decode those bytes.
+  On the send path it must be built AFTER `body_len` becomes the ciphertext
+  length; on the receive path it must be the header AS RECEIVED, never a
+  rebuild, because a reconstructed header has `flags = 0` while a real control
+  frame carries priority bits there. Both rules are in the codec doc-comment,
+  and the test suite caught both while they were being got wrong.
+
+  `HelloPayload.ovl1_major` has been on the wire since the first handshake and
+  nothing ever read it. It is checked now, which turns the negotiation the
+  payload always claimed to carry into one that happens, and puts a sentence an
+  operator can act on into the handshake error. ⛔ The old
+  `veil_crypto::session_cipher::frame_aad` is DELETED rather than deprecated: a
+  caller still building the short AAD would compile and then fail every open at
+  runtime,
+  which is a far worse way to find out. The replacement lives in
+  `veil_proto::codec`, where the header type is. The golden frame-header vector
+  exists to make a wire-breaking change impossible to make by accident; it is
+  updated, and the v1 vector is kept as a rejection case.
+
+- **The published ML-KEM certificate goes V1 → V2, and version 1 is refused
+  rather than tolerated.** A device published a key anyone could encapsulate to
+  and nothing that could authenticate it. The certificate now carries a
+  `ratchet_x25519_pubkey`, its signature context moves from
+  `veil.mlkem_cert.v1` to `veil.mlkem_cert.v2` — the only domain-separation
+  string that changes in this release — and the size cap goes 2048 → 2560. This
+  is a DHT-published record, so it is a second versioned wire break independent
+  of the frame header, and it is a hard refusal on the old version by design.
+
+- **The route-request signature no longer covers `ttl`, and this one carries no
+  marker at all.** The signature covered a field every hop rewrites, and nobody
+  checked it — a hop could edit the TTL of a signed request and the signature
+  still verified for the fields it did cover, which is the worst of both. The
+  signed bytes are now `target || requester || req_id`, and TTL is bounded on
+  ingress instead (`MAX_ROUTE_REQUEST_TTL = 8`). ⚠️ The 133-byte wire layout is
+  unchanged and `ttl` still sits at the same offset, so an old and a new node
+  exchange byte-identical packets whose signatures simply never verify against
+  each other. There is no version byte and no error that names the cause. It is
+  gated in practice only by the frame-header version above; do not rely on
+  anything else catching it.
+
+- **The second route-gossip plane is removed rather than have its defences
+  rebuilt.** `RoutingMsg::RouteUpdate` (0x12) and `VersionVectorSync` (0x13) and
+  the 138-byte `RouteUpdatePayload` are gone, and the message codes are
+  tombstoned so they cannot be reused. An old node's 0x12/0x13 frames now decode
+  to `UnknownMsgType`. DHT-routed forwarding was already carrying this traffic;
+  the second plane existed to be hardened rather than to be needed.
+
+- **The anonymous cell grows 512 → 8192 bytes.** The introduce path had two
+  cells and only one of them ever grew. Sender → rendezvous rode a 512-byte
+  anonymous cell; rendezvous → receiver rides a 16384-byte circuit-data cell,
+  bumped 384 → 4096 → 16384 on 2026-07-02 for onion-stream throughput. Nothing
+  tied them together, so the small one stayed the binding limit: 267 payload
+  bytes at three hops, 135 after the introduce seal and fragment header.
+  Anything longer fragmented, every fragment arrived in a whole 16 KiB cell, and
+  three-or-more-fragment messages were sent three times over for bulk/reply
+  redundancy. A ~6 KB mailbox FETCH reply was 46 fragments and up to 138 cells —
+  2.2 MB of wire for 6 KB of mail. Measured on two live devices: 41 MB to
+  deliver ten 7-byte chat messages.
+
+  At 8192 the three-hop fragment budget is 7815 B, so a full 6144-byte
+  `AuthDeliver` — the largest thing this path carries — is one fragment. The
+  bulk redundancy never triggers, the all-or-nothing reassembly has nothing to
+  lose, and the 16 KiB inbound cell stops being 99% padding. 8192 rather than
+  matching the circuit cell at 16384 because the payload ceiling is what sets
+  the useful size, and doubling past it would only double what a small send pads
+  to on the way out. `MAX_INTRODUCE_CIPHERTEXT` stops being a hand-sized 320 and
+  derives from the cell instead — the same defect in miniature, a number sized
+  by hand against a cell and left behind when the cell moved.
+
+- **The mailbox deposit chunk is sized for the cell it actually rides**:
+  `MAILBOX_PUT_CHUNK_DATA_BYTES` 240 → 7680, `MAX_MAILBOX_PUT_CHUNKS` 256 → 8.
+  A number hand-derived against the anonymous cell, in a crate that cannot see
+  that cell, kept in step by a comment — and the comment was right when it was
+  written. After the cell bump it was actively harmful: a chunk is ONE cell on
+  the wire whatever it holds, so a ~1.5 KB deposit was seven chunks, seven whole
+  8 KiB cells for 1.7 KB of content, worse than before the bump rather than
+  better. What bounds relay memory is the product of the two numbers, not either
+  factor, so the reassembly ceiling stays at the ~60 KB it was instead of
+  quietly becoming 1.9 MB per in-flight deposit. Mirrored in xVeil as
+  `kMailboxPutChunkDataBytes`.
 
 - **`CircuitBuilt` ACKs now carry a terminus proof and grew from 4 to 36 bytes**
   (audit VL-01). The ACK's only field was a circuit id, and every hop knows the
@@ -26,6 +185,218 @@
   state — an unconfirmed circuit is re-selected by path maintenance rather than
   frozen — but it does mean circuits do not confirm across a version boundary.
   **Roll relays before clients.**
+
+- **A rendezvous cookie is now derived from the registration key, so claiming
+  one takes a preimage rather than merely being early** (audit VL-02).
+  First-registration-wins only defends the cookie while the legitimate service
+  holds the entry. It does not survive the service losing it — the rendezvous
+  restarts, or the 600-second TTL reaps a subscription during an outage — and
+  the cookie is public, because it rides in the DHT ad so senders can find the
+  service. Whoever registered first after that moment owned it, and the real
+  service was then rejected as the squatter on its own name. The relay cannot
+  tell the two apart: it never learns the receiver's `node_id` (that is the
+  property the design exists for) and it never sees the ad, so everything it
+  knows is in the registration payload. The relay now recomputes the cookie
+  from `reg_pk` and refuses any other pairing, which also lands against an
+  EMPTY registry — precisely the window first-wins never covered. It costs
+  nothing in key lifetime: a sovereign service already derived both its cookie
+  and its `reg_pk` from `(identity_seed, period, slot)`, so they already
+  rotated together. `register_onion_circuit` no longer TAKES a cookie; it
+  returns the one it registered under, which makes the mispairing
+  unrepresentable rather than merely wrong. **Breaking for anyone driving
+  `register_onion_circuit` directly, and any cookie minted by an older node is
+  unregisterable at an updated relay.**
+
+- **The live path could not register the cookie it addressed, and the fix
+  changes what a receiver publishes.** Every onion-stream circuit registration
+  had been refused at every relay since the cookie was bound to the
+  registration key: the stream path minted its cookie from the `node_id`
+  instead, a value no key can claim. So the registration was refused, no
+  `CircuitBuilt` ACK came back, and no cookie ever reached the splice table —
+  in both directions, on every relay, for every peer. Field evidence across two
+  devices and three production seeds: 2733 inbound circuit confirmations timed
+  out, 4453 outbound opens failed, and not one route was ever found. Everything
+  that arrived arrived through the mailbox, which is where the eight-second
+  chat latency came from; a call invite, which has no mailbox to fall back to,
+  went out eight times and arrived none. `open_stream_circuit` no longer takes
+  a cookie either — it derives one from the key it is about to sign with — and
+  the sender reads the cookie off the ad the receiver publishes once its
+  receive circuit confirms. The old fallback to mailbox ads is gone with it:
+  addressing a cell to a mailbox cookie cannot splice, because the relay holds
+  that one in the session-keyed registry rather than the circuit one, so the
+  fallback only spent circuits and ten-second timeouts on routes that could not
+  carry a byte. **A receiver on this build publishes a different stream cookie,
+  so its live path only meets senders on this build.** Mismatched pairs degrade
+  to the mailbox, which is exactly where they already were.
+
+- **The FFI surface carries an ABI contract hash, and five entry points changed
+  shape without changing name.** The hand-written Dart bindings had no link to
+  the native side at all, and the one number they restated had already drifted
+  by 256 bytes. `veil_abi_contract_hash` is now a SHA-256 over the generated C
+  header, derived by the same script that generates the header and the Dart
+  constants, and gated in CI by regenerating all three and diffing. A caller
+  carrying a different hash was built against a different ABI — same symbol
+  names, possibly different signatures — so it is refused at load.
+
+  The changes that make it necessary: `VeilRecvCb` gained a `provenance` byte
+  between `src_app_id` and `reply_id`, i.e. in the middle of the argument list;
+  `veil_stream_accept` gained an `out_provenance` out-parameter;
+  `veil_media_open_channel`, `veil_media_open_direct_channel` and
+  `veil_media_open_relay_channel` each gained `tx_key` and `rx_key`, because
+  call media is now sealed on every transport rather than on one out of three;
+  and `veil_media_channel_set_e2e_keys` is REMOVED, keys being mandatory at
+  open. On the Dart side `configureRelayMediaCipher` is gone, `acceptStream`
+  returns a third field, and the media-open calls take required key arguments.
+  Additive alongside them: `veil_node_stop_timeout` and nine
+  `veil_ratchet_*` entry points, so ratchet state — the one thing that cannot
+  be rebuilt — has a way out of the process.
+
+- **Two IPC payloads grew a provenance byte, and `IPC_PROTOCOL_VERSION` did not
+  move.** `StreamOpenInboundPayload` goes 76 → 77 bytes and `AppDeliverPayload`
+  gains a trailing byte, both carrying the sender-trust level the node had been
+  computing and then dropping one frame short of the app. The node↔app IPC
+  boundary is therefore byte-incompatible with a v0.4.2 build while still
+  announcing version 1 on both sides. ⚠️ `ipc_wire_format_snapshot` pins nine
+  payloads and neither of these two is among them, which is why the growth did
+  not trip the gate that exists for exactly this — the gate's own doc-comment
+  records the last time a version check passed `1 == 1` while the bytes had
+  diverged. **The daemon and the app it talks to must be built from the same
+  tree**; this is not a network boundary, so it is not covered by the frame
+  header version. Widening that snapshot is left for its own change rather than
+  folded into a release.
+
+- **Onion call media is reframed: `MEDIA_BATCH_MAGIC` no longer exists as a
+  top-level cell.** Call media was end-to-end sealed on one transport out of
+  three and open on the other two; the magic byte moved inside the AEAD, so
+  onion ingress accepts only `[MEDIA_MAGIC][sealed]` and the dispatch decision
+  is made on decrypted plaintext rather than on bytes an attacker supplies.
+
+- **`veil-cli config sign` requires `--signer-key`, and enforcement requires a
+  pinned issuer.** A signed config authenticated whoever held the file: with
+  `require_signed_config` on and no `VEIL_CONFIG_TRUSTED_ISSUER_PUBKEY`
+  pinned, the node booted anyway, and a config signed with its own
+  `[identity].private_key` satisfied the check. Both are refused now, for
+  `node run` and for `admin apply-config` alike, and an empty environment value
+  reads as unset rather than as a pin. `veil-cli config sign` therefore grew a
+  required `--signer-key <PATH>` (mode 0600 or it aborts), a new
+  `veil-cli config signer-key <PATH>` mints the offline keypair, and
+  `save_config` refuses to rewrite a signed config under enforcement instead of
+  silently stripping the signature header. Enforcement is opt-in and defaults
+  to off, so a node that never turned it on is unaffected. ⚠️ The signing
+  procedure in `docs/{en,ru}/OPERATIONS.md` still describes the old flow and
+  was not updated here.
+
+- **The DHT values snapshot is versioned, and a v0.4.2 file is ignored rather
+  than guessed at.** A restart handed every restored value a clean sheet and a
+  fresh hour, because the bare unversioned JSON array carried neither the
+  origin of a value nor its age. The file is now `{ version: 2, entries }` with
+  mandatory `origin` and `age_secs` per entry, and anything that is not
+  version 2 is dropped. An operator with `dht.values_persist_path` configured
+  loses their cached values once, on the first boot — one republish interval of
+  a cache. Separately, both the periodic writer and the restore-on-start stop
+  inventing `<config_dir>/dht_values.json` when no path is configured; DHT
+  values were being written next to the config on nodes that never asked for
+  it. A node that relied on that implied path must now set the key.
+
+- **A broken identity document refuses to start instead of silently
+  downgrading the node.** It used to warn and continue as an unrelated,
+  legacy `node_id`-keyed node — the same install, a different identity, and
+  nothing in the log an operator would read as that. A MISSING document is
+  unchanged and still boots identity-less; only an unreadable one is fatal.
+  `[global] allow_identity_fallback = true` restores the old behaviour, and it
+  has to be edited into the file, because a programmatic save patches and will
+  not add a key that is absent.
+
+- **The `tls-webpki-roots` cargo feature is removed.** It had been a no-op —
+  `tls_client.use_system_roots` works in every build — so a pipeline passing
+  `--features tls-webpki-roots` now fails on an unknown feature rather than
+  quietly getting what it already had.
+
+### Security
+
+An audit pass over the transport, session, routing, mailbox and identity layers
+ran through this release. The wire items above are the sharpest of them; these
+are the rest, each with a regression test verified against the broken code.
+
+- **A solved discovery proof was a bearer token, so echoing one back cost its
+  owner the work they had done.** The receiver now remembers spent stamps
+  rather than treating a valid proof as reusable by whoever repeats it. Route
+  lookups can also no longer be suppressed by squatting the first few request
+  ids: request ids come from the system RNG, as the wire documentation always
+  said they did, and the via-collapsing dedup layer no longer applies to
+  requests. (The route-request signature change is under Breaking — it is
+  wire-visible and carries no version signal.)
+- **A message could name any sender, and the check ran on the wrong path.** The
+  node also decided the sender's trust level and then dropped it one frame
+  short of the app, so provenance never reached the surface that displays it —
+  which is why the FFI callback grew a `provenance` byte.
+- **One-to-one messaging had no key agreement, so nothing was forward-secret.**
+  A ratchet now exists, with somewhere to keep a conversation; a stranger who
+  opened the conversation first is no longer who our messages get sealed to; a
+  conversation that stops opening the peer's frames is given up rather than
+  retried forever; and anyone who could reach the node could previously make it
+  hold ratchet state forever.
+- **The mailbox ML-KEM key was permanent, so a leak of it was permanent too.**
+  It rotates now. A node's receive keys no longer outlive the identity they
+  belong to, a mined nonce no longer outlives the identity it was mined for,
+  and the host ticket key rotates rather than one key opening every ticket.
+- **Quota and capacity defects across the mailbox.** A byte quota charged the
+  payload and not the record; the per-chunk cap was documentation rather than a
+  check; a fetch batch was bounded by record count, so one batch could be the
+  receiver's whole quota; every anonymous depositor on the network shared one
+  bucket; a squatter could hold every deposit slot; and the leaf byte quota was
+  built end to end and never attached.
+- **A token could name a relay it was not bound to**, and a passphrase file was
+  read whatever its mode. The Falcon and ML-KEM key material no longer passes
+  through ordinary heap buffers that are freed rather than wiped, a handoff
+  entry no longer prints or keeps its session key, and turning on a key
+  passphrase can no longer leave the key in plaintext without saying so.
+- **The IPC connection cap was spent before anyone was authenticated**, and the
+  admin surface now holds slots for the command that fixes a wedged node. On
+  Android the call notification's actions were a request anyone could make, and
+  a one-shot capability could be consumed twice.
+- **The installer skipped a pinned release key on macOS.** Both `install.sh`
+  and `install.ps1` now fail closed on an unverifiable download, with
+  `--skip-signature` / `-SkipSignature` as the explicit opt-out. A TCP read
+  treated as a frame and two fail-open update gates are closed with it.
+
+### Added
+
+- **End-to-end sealing for messages to an online peer**, which previously left
+  the node with none at all, and a device key that can be authenticated rather
+  than merely encapsulated to.
+- **Ratchet state export and import across the FFI**, plus a dirty-list so a
+  host with a small buffer can page through the list rather than never reaching
+  its end.
+- **A bounded node stop that says which way it went**, and an apply-config that
+  fails fast on a dead node instead of waiting 90 seconds and then blaming a
+  missing file.
+- **Per-message-type and per-frame-family byte metrics**, so relay-chain and
+  inbound traffic can be attributed rather than totalled.
+- **A fourth production seed**, so three hosts are not the whole network.
+- **A Windows build of the call media engine that actually compiles.** The port
+  shipped source-only and uncompiled in v0.4.2; the screen capturer, the
+  response-file driven compile, the MSVC C++ runtime link and the voice-message
+  path are fixed here.
+
+### Changed
+
+- **The node runtime is sized for a phone when it is running on one.** The
+  anonymous reply path stops sending a one-fragment reply three times, the
+  mailbox ACK stops building a reply circuit no one answers, and the ratchet's
+  key agreement no longer runs under the lock every conversation shares.
+- **Opening a session no longer clones the whole DHT store into RAM**, and the
+  cold tier is no longer read off disk once a second to hand back its keys.
+- **The lazy miner's PoW nonces move out of `config.toml`** into a disposable
+  `<stem>.runtime-state.toml` beside it, applied as an overlay after signature
+  verification so persisting a nonce cannot invalidate a signed config. The
+  config directory must be writable; deleting the sidecar costs one re-mine.
+- **Mailbox quotas are charged in billable bytes** (payload plus 256 per
+  record) rather than payload alone, so the configured numbers now mean
+  physical bytes. Existing values admit correspondingly fewer records.
+- **The toolchain is pinned in `rust-toolchain.toml`**, because an unpinned one
+  silently rewrote the tree: a rustfmt release, not a commit, turned
+  `cargo fmt --all --check` red across 34 files on 2026-08-05.
 
 ### Fixed
 
@@ -145,6 +516,31 @@
   cannot have committed, because committing consumes the value it drops — with
   the single call sitting past the last gate, beside the session-registry
   insert it already guarded.
+
+### Release notes for whoever cuts this
+
+Auto-update: **`min_compatible_version = 0.4.0`**. This is the first minor bump
+since the workflow's fallback was written, and that fallback is the `.0` of the
+release's own minor line — which for `v0.5.0` is `0.5.0`, a manifest no
+installed node can satisfy. **Cut this release through a `workflow_dispatch`
+with `min_compatible_version` set explicitly** rather than letting a bare tag
+push take the default, or every 0.4.x install refuses the update it is being
+offered. The gate compares against the binary crate's own `CARGO_PKG_VERSION`,
+so `veil-cli` at 0.5.0 is what a node reports about itself.
+
+⚠️ The shell installer now refuses a download it cannot verify, and a missing
+`sha256-<triple>.txt.sig` is a hard error that `--skip-signature` does not
+cover — while `release.yml` still treats `RELEASE_INSTALLER_ED25519_SK` as
+optional and emits no `.sig` when it is unset. At v0.4.2 an unset secret was a
+silent downgrade to sha256-only; here it makes `install.sh` unusable. Confirm
+the secret is set before tagging.
+
+`veilcore` and `veilclient` rejoin the shared version line at 0.5.0. They were
+left behind at v0.4.2 — that release commit bumped the 51 crates under
+`crates/`, and these two sit at the repository root, outside that glob — so
+their stated version has understated the tree for a release.
+`veil-onion-stream` remains on its independent 0.1.x line and
+`veil-vpn-helper` on its 0.1.x line.
 
 ## v0.4.2 — 2026-07-29
 

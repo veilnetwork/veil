@@ -127,6 +127,19 @@ jobs:
           toolchain: stable
           targets: ${{ matrix.triple }}
 
+      # rust-toolchain.toml pins the channel, and the action above installs the
+      # target for whatever IT installed — not for the pinned toolchain cargo
+      # actually runs. Add it explicitly, which resolves through the pin. This
+      # is the same step mobile-build.yml already carries, and it was missing
+      # here: this is the workflow a TAG starts, so the omission could only
+      # ever surface as a broken release. Four of the seven legs are cross
+      # targets (both musl triples, aarch64-gnu, aarch64-windows) and each
+      # would have failed on `error[E0463]: can't find crate for 'core'` —
+      # the pinned toolchain brings only the host plus what rust-toolchain.toml
+      # names, and it names one gnu-windows target for the gates.
+      - name: Add the cross target to the PINNED toolchain
+        run: rustup target add ${{ matrix.triple }}
+
       - name: Install ARM64 Linux cross-linker
         if: matrix.cross_linker == 'aarch64-linux-gnu-gcc'
         run: |
