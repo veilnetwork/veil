@@ -119,6 +119,14 @@ pub fn builtin_seeds() -> Vec<BootstrapPeer> {
             tls_cert: None,
             tls_ca_cert: None,
         },
+        veil_types::BootstrapPeer {
+            transport: "obfs4-tcp://198.51.100.14:5556".to_owned(),
+            public_key: "+RJLf6DKWlA9mib0Iv0lcmeNwZGkdnYFI4bxl1WKvjQ=".to_owned(),
+            nonce: "ASju2g==".to_owned(),
+            algo: veil_types::SignatureAlgorithm::Ed25519,
+            tls_cert: None,
+            tls_ca_cert: None,
+        },
     ]
 }
 
