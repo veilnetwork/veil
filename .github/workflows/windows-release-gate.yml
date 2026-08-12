@@ -111,6 +111,26 @@ jobs:
         run: |
           $dll = "target/debug/veilclient_ffi.dll"
           if (-not (Test-Path $dll)) { throw "no DLL at $dll" }
+
+          # dumpbin lives in the MSVC toolchain and is NOT on the runner's PATH
+          # by default — the first version of this step called it bare and the
+          # gate failed with "'dumpbin.exe' is not recognized", which looks
+          # exactly like a red gate and says nothing whatever about the DLL.
+          # A check that cannot run must not be mistaken for a check that ran
+          # and found nothing, so the developer shell is entered explicitly and
+          # its absence is its own error.
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          if (-not (Test-Path $vswhere)) { throw "::error::vswhere not found; cannot locate the MSVC tools" }
+          $vs = & $vswhere -latest -products * `
+            -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 `
+            -property installationPath
+          if (-not $vs) { throw "::error::no MSVC toolchain on this runner" }
+          Import-Module (Join-Path $vs 'Common7\Tools\Microsoft.VisualStudio.DevShell.dll')
+          Enter-VsDevShell -VsInstallPath $vs -SkipAutomaticLocation -DevCmdArguments '-arch=x64' | Out-Null
+          if (-not (Get-Command dumpbin.exe -ErrorAction SilentlyContinue)) {
+            throw "::error::dumpbin is still not on PATH after entering the dev shell"
+          }
+
           $rows = (& dumpbin.exe /EXPORTS $dll) |
             Select-String -Pattern '^\s+\d+\s+[0-9A-Fa-f]+\s+[0-9A-Fa-f]{8}\s+(\S+)' |
             ForEach-Object { $_.Matches[0].Groups[1].Value }
