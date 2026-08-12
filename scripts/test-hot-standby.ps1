@@ -300,9 +300,9 @@ function Invoke-PhaseSessionHealth($bin) {
         $sessions = ($out | Select-String -Pattern '^sessions_active:\s*(\d+)').Matches.Groups[1].Value
         $listens  = ($out | Select-String -Pattern '^listens_active:\s*(\d+)').Matches.Groups[1].Value
         if ([int]$sessions -ge 1) {
-            Write-Pass "node-$n: $sessions session(s), $listens listener(s)"
+            Write-Pass "node-${n}: $sessions session(s), $listens listener(s)"
         } else {
-            Invoke-RecordFail "node-$n: 0 active sessions (expected >= 1)"
+            Invoke-RecordFail "node-${n}: 0 active sessions (expected >= 1)"
         }
     }
 }
@@ -314,13 +314,13 @@ function Invoke-PhaseTransportInventory($bin) {
         if ($LASTEXITCODE -ne 0) { Invoke-RecordFail "sessions list failed on node-$n"; continue }
         $active = @($out | Where-Object { ($_ -split "`t")[4] -eq 'active' })
         if ($active.Count -ge 1) {
-            Write-Pass "node-$n: $($active.Count) active session(s)"
+            Write-Pass "node-${n}: $($active.Count) active session(s)"
             foreach ($row in $active) {
                 $cols = $row -split "`t"
                 Write-Host "    primary transport: $($cols[3]) (link=$($cols[0]))"
             }
         } else {
-            Invoke-RecordFail "node-$n: sessions list has no active rows"
+            Invoke-RecordFail "node-${n}: sessions list has no active rows"
         }
     }
 }
