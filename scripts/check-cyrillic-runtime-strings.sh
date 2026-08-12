@@ -135,5 +135,24 @@ if mobile_violations:
 
 if rc == 0:
     print("OK: no Cyrillic in runtime strings, CI tooling, or mobile plugin source.")
+else:
+    # Name the workflows this will turn red. Discovered by scanning for our own
+    # basename rather than hardcoded, so adding or renaming a workflow that runs
+    # this gate updates the message on its own and it can never go stale.
+    callers = set()
+    wf_dir = os.path.join('.github', 'workflows')
+    if os.path.isdir(wf_dir):
+        for f in os.listdir(wf_dir):
+            if not f.endswith(('.yml', '.yaml')):
+                continue
+            try:
+                body = open(os.path.join(wf_dir, f), encoding='utf-8', errors='ignore').read()
+            except OSError:
+                continue
+            if SELF in body:
+                callers.add(f)
+    if callers:
+        print("This gate runs in: " + ", ".join(sorted(callers)) +
+              " -- these will fail until the violations above are resolved.")
 sys.exit(rc)
 PY
