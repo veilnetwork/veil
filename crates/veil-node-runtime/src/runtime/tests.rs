@@ -188,6 +188,162 @@ async fn deferred_anonymous_stub_arms_onion_at_runtime() {
     let _ = fs::remove_file(anon);
 }
 
+/// A deferred boot must reach NOTHING.
+///
+/// This is the window nobody was watching. `veil_node_start_deferred` takes no
+/// config — the node boots from `build_stub_config_with_ephemeral_identity`,
+/// and the host's real config arrives afterwards as an apply-config. The stub
+/// was `Config::default()`, which is `builtin_seed_policy = "auto"`, and
+/// `auto`'s condition is "no `peers`, no `[[bootstrap_peers]]`" — which the
+/// stub satisfies by construction. So every deferred boot, on every host, put
+/// the compiled-in production seeds in its peer table and opened connectors to
+/// them, seconds before the config that had something to say about it landed.
+///
+/// For the messenger built on this that silently defeated a shipped setting: a
+/// person who declined the shared seeds gets `builtin_seed_policy = "never"` in
+/// the config the app COMPOSES, and still touched those hosts once per start.
+///
+/// Asserted on a runtime that has actually STARTED, not on the config struct.
+/// `peers()` is the table `connect_peer_active` reads and the table
+/// `spawn_bootstrap_task` writes immediately before it spawns the outbound
+/// connector for each entry, so an entry appearing here IS the dial.
+#[tokio::test(flavor = "current_thread")]
+async fn deferred_stub_boot_dials_no_builtin_seed() {
+    let stub = veil_cfg::build_stub_config_with_ephemeral_identity(false).unwrap();
+
+    // A floor first. This whole test is "a set stayed empty", and the loudest
+    // way for it to pass is for the compiled-in list to have become empty —
+    // which is a real build configuration here (`allow-empty-seeds`), not a
+    // hypothetical.
+    assert!(
+        !veil_bootstrap::builtin_seeds().is_empty(),
+        "this build has no builtin seeds at all, so an empty peer table proves \
+         nothing about the stub"
+    );
+    // The decision, on the exact value the boot below is about to use.
+    assert!(
+        super::service_tasks::resolve_bootstrap_candidates(
+            &stub,
+            &stub.identity.as_ref().expect("stub identity").public_key,
+        )
+        .is_empty(),
+        "the stub must contribute no bootstrap candidate of any kind"
+    );
+
+    let path = save_test_config("node-runtime-deferred-stub", stub).unwrap();
+    let mut runtime = NodeRuntime::start(&path, true)
+        .await
+        .expect("the deferred stub must still start — offline is not failed");
+    assert!(
+        runtime.peers().is_empty(),
+        "a deferred boot registered {} peer(s) before its host said anything: {:?}",
+        runtime.peers().len(),
+        runtime
+            .peers()
+            .iter()
+            .map(|p| p.transport.clone())
+            .collect::<Vec<_>>(),
+    );
+    // The splice happens inside the bootstrap task, not at `start`. Stay up
+    // past the window in which it runs, or the emptiness above is just an
+    // observation taken too early.
+    sleep(Duration::from_millis(750)).await;
+    assert!(
+        runtime.peers().is_empty(),
+        "the deferred boot reached the builtin seeds after all: {:?}",
+        runtime
+            .peers()
+            .iter()
+            .map(|p| p.transport.clone())
+            .collect::<Vec<_>>(),
+    );
+
+    runtime.stop().await.expect("the stub shuts down cleanly");
+    let _ = fs::remove_file(path);
+}
+
+/// The positive control for [`deferred_stub_boot_dials_no_builtin_seed`]:
+/// refusing at the stub must not cost the ordinary owner their bootstrap.
+///
+/// Without this, a "fix" that switched bootstrapping off entirely would pass
+/// the test above and take every install off the network.
+///
+/// Two halves, because the keeper's seeds arrive by two different mechanisms
+/// and both have to still work:
+///
+///   * the DECISION — an applied config shaped like the one the app composes
+///     for someone who KEPT the seeds (no `[[bootstrap_peers]]`, policy left at
+///     the shipped default) still resolves to every compiled-in seed;
+///   * the ACT — the reload that apply-config performs re-runs the bootstrap
+///     task and registers what it resolved. That half is asserted with ONE
+///     bootstrap peer on loopback rather than with the production list: the
+///     mechanism is what is in question, and a test that dials an operator's
+///     hosts to prove it is a test that dials an operator's hosts.
+#[tokio::test(flavor = "current_thread")]
+async fn the_applied_config_is_what_puts_a_deferred_node_on_the_network() {
+    // ── the decision ────────────────────────────────────────────────────────
+    let mut keeper = runtime_config_with_listen();
+    keeper.peers.clear();
+    keeper.bootstrap_peers.clear();
+    assert_eq!(
+        keeper.global.builtin_seed_policy,
+        veil_cfg::BuiltinSeedPolicy::Auto,
+        "a keeper's composed config leaves the policy alone — only a refusal \
+         writes one"
+    );
+    let builtin = veil_bootstrap::builtin_seeds();
+    assert!(!builtin.is_empty(), "floor: this build compiles in seeds");
+    assert_eq!(
+        super::service_tasks::resolve_bootstrap_candidates(
+            &keeper,
+            &test_support::valid_identity().public_key,
+        )
+        .len(),
+        builtin.len(),
+        "an owner who kept the shared seeds must still get all of them"
+    );
+
+    // ── the act ─────────────────────────────────────────────────────────────
+    let stub = veil_cfg::build_stub_config_with_ephemeral_identity(false).unwrap();
+    let path = save_test_config("node-runtime-deferred-promote", stub).unwrap();
+    let mut runtime = NodeRuntime::start(&path, true)
+        .await
+        .expect("the deferred stub starts");
+    assert!(runtime.peers().is_empty(), "nothing before the host speaks");
+
+    let mut promoted = runtime_config_with_listen();
+    promoted.peers.clear();
+    let seed_keys = test_support::ed25519_keypair();
+    promoted.bootstrap_peers = vec![veil_cfg::BootstrapPeer {
+        // Port 1 on loopback: the registration is what is asserted, and the
+        // connector's dial fails immediately with nowhere to go.
+        transport: "tcp://127.0.0.1:1".to_owned(),
+        public_key: seed_keys.public_key.clone(),
+        nonce: "AAAAAAAAAAAAAAAAAAAAAA==".to_owned(),
+        algo: veil_cfg::SignatureAlgorithm::Ed25519,
+        tls_cert: None,
+        tls_ca_cert: None,
+    }];
+    // A FULL render, not `save_config`'s comment-preserving patch — the file on
+    // disk is the stub, and patching hand-maintained sections over it is not
+    // what apply-config does with the bytes it is handed.
+    veil_cfg::render_config(&path, &promoted).expect("write the promoted config");
+    // The same pipeline `AdminCommand::ApplyConfig` runs: validate, stop every
+    // task, respawn them all against the new config.
+    runtime.reload().await.expect("apply-config style reload");
+
+    let registered: Vec<String> = runtime.peers().iter().map(|p| p.transport.clone()).collect();
+    assert_eq!(
+        registered,
+        vec!["tcp://127.0.0.1:1".to_owned()],
+        "the reload must register the applied config's bootstrap peers — if it \
+         does not, refusing at the stub leaves a node that never dials anything"
+    );
+
+    runtime.stop().await.expect("the promoted node shuts down");
+    let _ = fs::remove_file(path);
+}
+
 /// A node whose owner refused the shared seeds must come up OFFLINE AND
 /// ALIVE. This is the exact shape the app composes for a declining identity:
 /// `builtin_seed_policy = "never"`, no `peers`, no `[[bootstrap_peers]]`, no
