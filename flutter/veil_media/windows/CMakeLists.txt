@@ -28,19 +28,31 @@ project(veil_media LANGUAGES C)
 get_filename_component(_veil_media_windows "${CMAKE_CURRENT_LIST_DIR}" REALPATH)
 set(_veil_media_dll "${_veil_media_windows}/veil_media.dll")
 
-if(NOT EXISTS "${_veil_media_dll}")
+# Whether a missing engine is fatal here or merely loud is a decision, and it
+# is made in one place for both desktop platforms. See the long note there.
+include("${_veil_media_windows}/../cmake/veil_media_engine_policy.cmake")
+veil_media_engine_policy(_veil_media_required _veil_media_why)
+
+if(EXISTS "${_veil_media_dll}")
+  set(veil_media_bundled_libraries
+    "${_veil_media_dll}"
+    PARENT_SCOPE
+  )
+elseif(_veil_media_required)
   message(FATAL_ERROR
     "veil_media (windows): prebuilt engine missing:\n"
     "  ${_veil_media_dll}\n"
+    "Refusing to build without it because ${_veil_media_why}.\n"
+    "Failing here is deliberate: a bundle without it starts, looks healthy and\n"
+    "throws at the first voice message — every zip through v0.9.1 did.\n"
     "Build it on a Windows host with a from-source win-x64 libwebrtc:\n"
     "  windows/build_veil_media_dll_windows.ps1\n"
     "or download the artifact the webrtc-windows workflow produces, then place\n"
-    "veil_media.dll next to this CMakeLists before flutter build windows.\n"
-    "Failing here is deliberate: a bundle without it starts, looks healthy and\n"
-    "throws at the first voice message.")
+    "veil_media.dll next to this CMakeLists before flutter build windows.")
+else()
+  # One string, not three — see the linux CMakeLists.
+  veil_media_engine_absent_warning("${_veil_media_dll}" "windows"
+    "    windows/build_veil_media_dll_windows.ps1 (Windows host, from-source win-x64 libwebrtc)\n    or the libveil_media-win-x64 artifact from the webrtc-windows workflow.\n")
+  # Empty, and set explicitly — see the linux CMakeLists for why.
+  set(veil_media_bundled_libraries "" PARENT_SCOPE)
 endif()
-
-set(veil_media_bundled_libraries
-  "${_veil_media_dll}"
-  PARENT_SCOPE
-)
