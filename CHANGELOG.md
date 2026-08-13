@@ -1,5 +1,44 @@
 # Changelog
 
+## v0.5.1 — 2026-08-13
+
+**Windows stops shipping a library that exports nothing.** `veilclient-ffi`
+carried `#![cfg(unix)]` at its crate root, so every entry point compiled away
+off Unix. `cargo build` still exited 0 and produced a DLL, and that DLL
+shipped: the published xVeil v0.9.1 Windows bundle contains a 105 KB
+`veilclient_ffi.dll` whose export address table has **zero** entries, beside a
+`hidden_volume_ffi.dll` with 285 in the same archive. The app on Windows had
+no way to reach the network at all — no embedded node, and no `veil-cli` in
+the bundle to fall back to.
+
+The gate turned out to be over-broad rather than load-bearing. Its own comment
+said it existed to keep a Windows type-check green "without breaking any actual
+downstream consumer", and that assumption had simply stopped being true. The
+pieces underneath were already written: the named-pipe listener in
+`veil-local-transport`, the `#[cfg(windows)]` connect path in the IPC client,
+and the `not(unix)` endpoint default in `veil-cfg`.
+
+Measured rather than inferred, because a green build is what certified the
+empty DLL in the first place: **131 exported `veil_*` entry points**, including
+`veil_abi_contract_hash`, which the Dart side reads before any other symbol;
+and an embedded node that boots on a real `C:\Users\…\Temp\…` runtime
+directory, binds its admin endpoint and stops cleanly. The Windows gate now
+asks that question on every run — it reads the export table `GetProcAddress`
+consults, with a floor rather than a non-empty test, and it fails loudly when
+it cannot run at all rather than reporting an absence it never measured.
+
+Also here: three fixes to that gate itself, which had been red since a
+toolchain pin landed. Cross targets were being installed onto the toolchain the
+setup action brings rather than the one `rust-toolchain.toml` pins, so the
+aarch64 leg had been failing for a week with `can't find crate for 'core'`; a
+named-pipe test panicked in its own setup outside a tokio runtime and had never
+passed since it was written; and the embedded-node job blamed a test filter for
+what was really an absent crate.
+
+No wire, ABI or on-disk change. A v0.5.0 node and a v0.5.1 node are
+interoperable, and the v0.5.0 flag day below still describes the boundary that
+matters.
+
 ## v0.5.0 — 2026-08-12
 
 **Flag day. A node built from this release cannot exchange a frame with one
