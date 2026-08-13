@@ -20,16 +20,34 @@ project(veil_media LANGUAGES C)
 get_filename_component(_veil_media_linux "${CMAKE_CURRENT_LIST_DIR}" REALPATH)
 set(_veil_media_so "${_veil_media_linux}/libveil_media.so")
 
-if(NOT EXISTS "${_veil_media_so}")
+# Whether a missing engine is fatal here or merely loud is a decision, and it
+# is made in one place for both desktop platforms. See the long note there.
+include("${_veil_media_linux}/../cmake/veil_media_engine_policy.cmake")
+veil_media_engine_policy(_veil_media_required _veil_media_why)
+
+if(EXISTS "${_veil_media_so}")
+  set(veil_media_bundled_libraries
+    "${_veil_media_so}"
+    PARENT_SCOPE
+  )
+elseif(_veil_media_required)
   message(FATAL_ERROR
     "veil_media (linux): prebuilt engine missing:\n"
     "  ${_veil_media_so}\n"
+    "Refusing to build without it because ${_veil_media_why}.\n"
+    "A bundle with no engine starts, looks healthy, and throws at the first\n"
+    "voice message — v0.9.1 shipped exactly that.\n"
     "Build it on an x86_64 Linux host with a from-source linux-x64 libwebrtc.a:\n"
     "  veil_media/linux/build_veil_media_so_linux.sh\n"
-    "then place libveil_media.so next to this CMakeLists before flutter build linux.")
+    "or download the artifact the webrtc-linux workflow produces, then place\n"
+    "libveil_media.so next to this CMakeLists before flutter build linux.")
+else()
+  # One string, not three: the third parameter is a single argument and any
+  # extra quoted pieces would land in ARGN and be silently dropped.
+  veil_media_engine_absent_warning("${_veil_media_so}" "linux"
+    "    veil_media/linux/build_veil_media_so_linux.sh (x86_64 Linux host, from-source linux-x64 libwebrtc.a)\n    or the libveil_media-linux-x64 artifact from the webrtc-linux workflow.\n")
+  # Empty, and set explicitly rather than left undefined: the parent's
+  # generated_plugins.cmake list(APPEND)s this, and an undefined variable there
+  # would be indistinguishable from a plugin that forgot to answer.
+  set(veil_media_bundled_libraries "" PARENT_SCOPE)
 endif()
-
-set(veil_media_bundled_libraries
-  "${_veil_media_so}"
-  PARENT_SCOPE
-)
