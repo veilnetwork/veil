@@ -86,6 +86,66 @@ jobs:
         run: >-
           cargo build -p veilclient-ffi --lib
           --no-default-features --features node-embedded
+
+      # WHAT THE DLL ACTUALLY OFFERS, which is the question the build's exit
+      # code does not answer.
+      #
+      # `#![cfg(unix)]` at the crate root made every one of these compile to
+      # nothing off Unix. `cargo build` still exited 0 and produced a DLL, and
+      # that DLL shipped: the published v0.9.1 bundle carries a 105 KB
+      # veilclient_ffi.dll whose export address table has ZERO entries, beside
+      # a hidden_volume_ffi.dll with 285. So the Windows app has had no way to
+      # reach the network at all, and every gate around it was green — this one
+      # included, because it only ever asked whether the build succeeded.
+      #
+      # dumpbin reads the export table, which is the table GetProcAddress
+      # consults. A symbol listing would answer a different question: `nm`
+      # reports symbols that are defined but not exported, and a DLL can define
+      # everything and export none of it.
+      #
+      # The floor is a floor, not a non-empty test: a regex that stops matching
+      # would otherwise shrink the count silently and agree with itself. The
+      # header declares well over a hundred entry points; fifty is the alarm.
+      - name: The DLL exports what the app looks up
+        shell: pwsh
+        run: |
+          $dll = "target/debug/veilclient_ffi.dll"
+          if (-not (Test-Path $dll)) { throw "no DLL at $dll" }
+
+          # dumpbin lives in the MSVC toolchain and is NOT on the runner's PATH
+          # by default — the first version of this step called it bare and the
+          # gate failed with "'dumpbin.exe' is not recognized", which looks
+          # exactly like a red gate and says nothing whatever about the DLL.
+          # A check that cannot run must not be mistaken for a check that ran
+          # and found nothing, so the developer shell is entered explicitly and
+          # its absence is its own error.
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          if (-not (Test-Path $vswhere)) { throw "::error::vswhere not found; cannot locate the MSVC tools" }
+          $vs = & $vswhere -latest -products * `
+            -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 `
+            -property installationPath
+          if (-not $vs) { throw "::error::no MSVC toolchain on this runner" }
+          Import-Module (Join-Path $vs 'Common7\Tools\Microsoft.VisualStudio.DevShell.dll')
+          Enter-VsDevShell -VsInstallPath $vs -SkipAutomaticLocation -DevCmdArguments '-arch=x64' | Out-Null
+          if (-not (Get-Command dumpbin.exe -ErrorAction SilentlyContinue)) {
+            throw "::error::dumpbin is still not on PATH after entering the dev shell"
+          }
+
+          $rows = (& dumpbin.exe /EXPORTS $dll) |
+            Select-String -Pattern '^\s+\d+\s+[0-9A-Fa-f]+\s+[0-9A-Fa-f]{8}\s+(\S+)' |
+            ForEach-Object { $_.Matches[0].Groups[1].Value }
+          $veil = $rows | Where-Object { $_ -like 'veil_*' } | Sort-Object -Unique
+          Write-Host "exported veil_* entry points: $($veil.Count)"
+          if ($veil.Count -lt 50) {
+            throw "::error::the DLL exports $($veil.Count) veil_* entry points. A build that succeeds and exports nothing is what shipped in v0.9.1."
+          }
+          # The one the Dart side reads BEFORE any other lookup: without it the
+          # app refuses the library outright, so its absence is not a partial
+          # failure but a total one.
+          if ($veil -notcontains 'veil_abi_contract_hash') {
+            throw "::error::veil_abi_contract_hash is not exported; the app checks it before every other symbol"
+          }
+
       # Composition is where the shipped Windows build actually died, and it is
       # pure string work — fast, and it fails loudly if the TOML escaping
       # regresses.
@@ -99,13 +159,29 @@ jobs:
           CC: clang-cl
           CXX: clang-cl
         run: |
+          # `|| rc=$?`, not a bare call: this shell runs with `-e`, so a genuine
+          # test FAILURE used to abort the step before `cat compose.log` — the
+          # gate swallowed the very output it exists to show.
+          rc=0
           cargo test -p veilclient-ffi --lib \
             --no-default-features --features node-embedded,test-low-difficulty \
-            node::tests::config_compose -- --test-threads=1 > compose.log 2>&1
-          rc=$?
+            node::tests::config_compose -- --test-threads=1 > compose.log 2>&1 || rc=$?
           cat compose.log
-          grep -qE '[1-9][0-9]* passed' compose.log || {
-            echo "::error::no compose test ran — check the filter"; exit 1; }
+          if ! grep -qE '[1-9][0-9]* passed' compose.log; then
+            # Two different zeros that mean opposite things. A filter matching
+            # nothing still leaves a NON-zero `filtered out` count. Zero passed
+            # AND zero filtered out means the harness holds no tests at all,
+            # which is not a filter problem: veilclient-ffi/src/lib.rs carries a
+            # crate-level `#![cfg(unix)]`, so on Windows the crate, its tests
+            # and the embedded node all compile to nothing. Say so, rather than
+            # sending the next reader after a filter that is perfectly correct.
+            if grep -q '; 0 filtered out' compose.log; then
+              echo "::error::veilclient-ffi compiled to an EMPTY crate here (0 tests AND 0 filtered out). src/lib.rs is #![cfg(unix)], so there is no embedded node on Windows to test. The filter is correct — the crate is absent. This job cannot mean anything until that gate is lifted."
+            else
+              echo "::error::no compose test ran — check the filter"
+            fi
+            exit 1
+          fi
           exit $rc
       # The real proof, and the first time any of it has run on Windows:
       # compose against a genuine `C:\Users\...\Temp\...` directory, boot a
@@ -119,14 +195,22 @@ jobs:
           CC: clang-cl
           CXX: clang-cl
         run: |
+          # `|| rc=$?` for the same reason as the compose step: `-e` would
+          # otherwise abort before the log is printed.
+          rc=0
           cargo test -p veilclient-ffi --lib \
             --no-default-features --features node-embedded \
             a_windows_runtime_dir_boots -- --ignored --nocapture \
-            --test-threads=1 > smoke.log 2>&1
-          rc=$?
+            --test-threads=1 > smoke.log 2>&1 || rc=$?
           cat smoke.log
-          grep -qE '1 passed' smoke.log || {
-            echo "::error::the Windows boot smoke did not execute"; exit 1; }
+          if ! grep -qE '1 passed' smoke.log; then
+            if grep -q '; 0 filtered out' smoke.log; then
+              echo "::error::veilclient-ffi compiled to an EMPTY crate here (0 tests AND 0 filtered out). src/lib.rs is #![cfg(unix)]. Note that a_windows_runtime_dir_boots_a_node_end_to_end is #[cfg(windows)] INSIDE that #![cfg(unix)] crate — an empty intersection, so it can never run on any platform."
+            else
+              echo "::error::the Windows boot smoke did not execute"
+            fi
+            exit 1
+          fi
           exit $rc
 
   release-build:
@@ -147,6 +231,17 @@ jobs:
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
         with:
           targets: ${{ matrix.target }}
+      # rust-toolchain.toml pins the channel, and the action above installs the
+      # target for whatever IT installed — not for the pinned toolchain cargo
+      # actually runs. Add it explicitly, which resolves through the pin.
+      #
+      # Without this the aarch64 leg died in `cfg-if` with "can't find crate for
+      # `core`": rustup silently switched to the pinned 1.97.1, which carries
+      # only its host target plus the ones rust-toolchain.toml names. The x86_64
+      # leg passed throughout and hid it — there, the matrix target IS the host.
+      # Same fix, and same reason, as mobile-build.yml.
+      - name: Add the cross target to the PINNED toolchain
+        run: rustup target add ${{ matrix.target }}
       - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: |
