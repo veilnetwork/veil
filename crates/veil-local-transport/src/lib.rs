@@ -1352,9 +1352,18 @@ mod tests {
     /// `bind_named_pipe` created its probe instance with tokio's default
     /// `first_pipe_instance: false`, so it happily *joined* the squatter's
     /// pipe and the daemon ran alongside it.
+    ///
+    /// Must be a `#[tokio::test]`, not a `#[test]`: tokio's `ServerOptions::
+    /// create` registers the pipe handle with the reactor (`PollEvented::new`),
+    /// so it panics "there is no reactor running" outside a runtime — in the
+    /// SETUP line below, before a single assertion is reached. That is a
+    /// property of tokio's wrapper, not of Windows: the pipe-ownership
+    /// expectations asserted here are exactly right, and `bind_named_pipe`
+    /// already honours them (see `pipe_name_is_owned_between_accepts`, which
+    /// has always passed).
     #[cfg(windows)]
-    #[test]
-    fn bind_named_pipe_refuses_a_squatted_name() {
+    #[tokio::test]
+    async fn bind_named_pipe_refuses_a_squatted_name() {
         use tokio::net::windows::named_pipe::ServerOptions;
         let name = unique_pipe_name("squatted");
         let _squatter = ServerOptions::new()
