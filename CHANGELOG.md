@@ -1,5 +1,35 @@
 # Changelog
 
+## v0.5.2 — 2026-08-13
+
+**A checkout without the prebuilt call engine now builds.** `veil_media`'s
+Linux and Windows CMake raised `FATAL_ERROR` when `libveil_media` was absent,
+and that library is gitignored — so `flutter build linux` on a clean clone of a
+host project could not start. iOS was the same shape through the podspec's
+`-force_load`. That is the opposite of how this project treats its other
+optional natives, whose stated contract is that the bundle builds, runs, and
+reports the feature as unavailable.
+
+The strictness is not gone, because it was earning its keep: a host app once
+shipped with no engine and every call, voice message, video note and
+transcription threw at first use. It is now conditional, and the default is the
+safe one. In order: `-DVEIL_MEDIA_REQUIRE_ENGINE`, then the environment
+variable of the same name, then `CI` being set — which every runner does and no
+developer shell does — and only then the permissive path. Forgetting to say
+anything on a runner lands on strict; reaching permissive from a release takes
+writing `=0` deliberately. The environment variable exists because
+`flutter build linux|windows` drives cmake itself and forwards no cmake
+arguments, so `-D` is not reachable from that path at all.
+
+Verified on an aarch64 Linux host with the engine moved aside: the build
+completes, warns, and produces a bundle with no engine in it; the same host
+with the original CMakeLists fails, which is the reported symptom. And with the
+engine restored: builds, no warning, engine present.
+
+`veil_flutter`'s own `FATAL_ERROR` deliberately stays strict. That library is
+built from this repository by `scripts/build-native.sh`, so its absence means a
+skipped build step rather than a dependency nobody can obtain.
+
 ## v0.5.1 — 2026-08-13
 
 **Windows stops shipping a library that exports nothing.** `veilclient-ffi`
