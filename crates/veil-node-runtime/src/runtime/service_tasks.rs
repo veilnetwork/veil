@@ -2529,7 +2529,12 @@ impl NodeRuntime {
         // used a cookie the other slot's subscriber never registered → the relay
         // dropped the introduce (`cookie_unknown`) and incoming delivery silently
         // failed. The node_id is public (it keys the ad), so this leaks nothing.
-        let local_node_id = *self.identity.local_identity.node_id.as_bytes();
+        // The address we RECEIVE under, which is the identity's — not the
+        // transport key's. They are the same value for every node in the field
+        // today and diverge only once a device gets a transport key of its own;
+        // at that moment a device still listening under its transport id would
+        // be waiting where nobody sends, looking reachable from every angle.
+        let local_node_id = self.receiver_node_id();
         let cookie = rendezvous_cookie_from_node_id(&local_node_id);
 
         let handle = supervised_spawn(
