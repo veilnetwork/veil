@@ -1681,12 +1681,31 @@ pub enum DelegateDeviceError {
     FreshnessWindowTooLong { secs: u64 },
 }
 
+/// How the caller holds the master secret.
+///
+/// Two shapes, because two callers have it in different forms and neither can
+/// cheaply produce the other's. An operator recovering an identity has the
+/// BIP-39 SEED. An embedded application has no seed at all — the phrase is
+/// consumed at setup and never stored — but its node config carries
+/// `derive_master_sk_ed25519(seed)` in `[identity] private_key`, because that
+/// is exactly what a phrase-provisioned config is built from. Deriving is one
+/// way: the seed cannot be recovered from the key.
+///
+/// Without this an application could only delegate by asking for the phrase
+/// again, at a moment (linking a second device, days later) when there is
+/// nothing to prompt from.
+pub enum MasterSecret {
+    /// The BIP-39 master seed; the signing key is derived from it.
+    Seed(Zeroizing<[u8; 32]>),
+    /// The already-derived Ed25519 master secret.
+    SigningKey(Zeroizing<[u8; 32]>),
+}
+
 pub struct DelegateDeviceOptions {
     pub veil_dir: PathBuf,
-    /// Recovered from the BIP-39 phrase or the encrypted master file. Only the
-    /// master can authorise a new device, which is what makes this a
+    /// Only the master can authorise a new device, which is what makes this a
     /// delegation rather than a claim.
-    pub master_seed: Zeroizing<[u8; 32]>,
+    pub master: MasterSecret,
     /// The Ed25519 public key of the device being admitted, 32 bytes.
     pub device_pubkey: Vec<u8>,
     pub now_unix: u64,
@@ -1771,7 +1790,10 @@ pub fn delegate_device(
     // wrong phrase produces a document that verifies against a different
     // identity entirely, and the failure surfaces much later as peers refusing
     // a node they cannot resolve.
-    let master_sk = SigningKey::from_bytes(&derive_master_sk_ed25519(&opts.master_seed));
+    let master_sk = match &opts.master {
+        MasterSecret::Seed(seed) => SigningKey::from_bytes(&derive_master_sk_ed25519(seed)),
+        MasterSecret::SigningKey(sk) => SigningKey::from_bytes(sk),
+    };
     let master_pk = master_sk.verifying_key();
     let computed_node_id = compute_node_id(master_pk.as_bytes());
     if computed_node_id != doc.node_id {
@@ -2332,7 +2354,7 @@ mod tests {
     -> DelegateDeviceOptions {
         DelegateDeviceOptions {
             veil_dir: dir,
-            master_seed: seed,
+            master: MasterSecret::Seed(seed),
             device_pubkey: pk,
             now_unix: DELEGATE_NOW,
             valid_until_unix: DELEGATE_NOW + 7 * 86_400,
