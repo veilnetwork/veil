@@ -149,23 +149,29 @@ impl RuntimeMailboxCrypto {
         // Sealing to ourselves is a normal first-document operation. Never
         // depend on a DHT round-trip for our own certificate: the runtime owns
         // the exact DK seed and sovereign instance binding already.
-        let cert = if recipient_node_id == self.local_node_id {
-            local_verified_cert(
+        let certs: Vec<_> = if recipient_node_id == self.local_node_id {
+            vec![local_verified_cert(
                 self.local_node_id,
                 sovereign.active_instance_id(),
                 &self.mlkem_keys.current_seed(),
-            )?
+            )?]
         } else {
+            // EVERY device of the recipient. Sealing to one delivered to
+            // whichever instance the registry listed first and silently not to
+            // the rest — they stayed online, correctly published, and simply
+            // never saw the mail.
             self.mlkem_resolver()
-                .fetch_verified_cert(recipient_node_id)
+                .fetch_verified_certs(recipient_node_id)
                 .await
-                .ok_or(OfflineSealError::RecipientCertUnresolved)?
         };
+        if certs.is_empty() {
+            return Err(OfflineSealError::RecipientCertUnresolved);
+        }
         // Embed our own signed document so an offline recipient can verify us
         // without a DHT resolve (see `open` + `seal_mailbox_blob`).
         mailbox_seal::seal_mailbox_blob(
             &auth,
-            &cert,
+            &certs,
             &self.local_node_id,
             &recipient_node_id,
             &sovereign.document,

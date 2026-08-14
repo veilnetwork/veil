@@ -100,7 +100,11 @@ const MAILBOX_BLOB_V3: u8 = 0x03;
 /// the recipient falls back to a DHT resolve).
 pub fn seal_mailbox_blob(
     auth: &AuthAppDeliver,
-    recipient_cert: &VerifiedMlkemCert,
+    // One per DEVICE of the recipient. A slice of one delivers to a single
+    // device of an identity that may have several, and the others receive
+    // nothing while remaining online and correctly published — the fan-out
+    // format exists precisely to avoid that.
+    recipient_certs: &[VerifiedMlkemCert],
     sender_node_id: &[u8; 32],
     recipient_node_id: &[u8; 32],
     sender_doc: &IdentityDocument,
@@ -115,18 +119,13 @@ pub fn seal_mailbox_blob(
     }
     // Main blob: REAL sender bound into the fan-out (unchanged anti-redirect
     // binding) — the recipient needs the recovered sender_node_id to open it.
-    let main = fanout_encrypt(
-        &inner,
-        std::slice::from_ref(recipient_cert),
-        sender_node_id,
-        recipient_node_id,
-    )?;
+    let main = fanout_encrypt(&inner, recipient_certs, sender_node_id, recipient_node_id)?;
     let main_blob = encode_fanout_blob(&main)?;
     // Sidecar: the real sender_node_id, sealed to the same cert under the
     // all-zero placeholder so the recipient can recover it BEFORE knowing it.
     let sidecar = fanout_encrypt(
         sender_node_id,
-        std::slice::from_ref(recipient_cert),
+        recipient_certs,
         &SIDECAR_PLACEHOLDER_SENDER,
         recipient_node_id,
     )?;
@@ -139,7 +138,7 @@ pub fn seal_mailbox_blob(
     // reachability proof for a NAT'd / cold-table peer.
     let sealed_doc = fanout_encrypt(
         &sender_doc.encode(),
-        std::slice::from_ref(recipient_cert),
+        recipient_certs,
         sender_node_id,
         recipient_node_id,
     )?;
@@ -351,6 +350,122 @@ mod tests {
         (cert, node_id, instance_id, dk_seed)
     }
 
+    /// A second DEVICE of the same recipient identity: same node_id, its own
+    /// instance and its own ML-KEM keypair. That is what two devices of one
+    /// identity look like to a sender.
+    fn recipient_device(instance_byte: u8) -> (VerifiedMlkemCert, [u8; 16], Zeroizing<[u8; 64]>) {
+        let (ek, dk_seed) = generate_prekey();
+        let instance_id = [instance_byte; 16];
+        (
+            VerifiedMlkemCert {
+                node_id: [0xBBu8; 32],
+                instance_id,
+                mlkem_algo: ALGO_ML_KEM_768,
+                mlkem_pubkey: ek,
+                ratchet_x25519_pubkey: [0x5A; 32],
+                cert_version: 1,
+            },
+            instance_id,
+            dk_seed,
+        )
+    }
+
+    /// ONE blob, opened by EITHER device of the recipient identity.
+    ///
+    /// This is what makes an identity with several devices deliverable. Sealing
+    /// to a single instance reached whichever one the registry listed first;
+    /// the others stayed online, correctly published, and simply never saw the
+    /// mail — with nothing to observe from either side.
+    #[test]
+    fn a_blob_sealed_to_two_devices_opens_on_both() {
+        let sov = sender_sovereign("sender");
+        let sender_id = *sov.node_id();
+        let (cert_a, inst_a, dk_a) = recipient_device(0x11);
+        let (cert_b, inst_b, dk_b) = recipient_device(0x22);
+        let recipient_id = cert_a.node_id;
+        assert_eq!(cert_a.node_id, cert_b.node_id, "one identity");
+        assert_ne!(inst_a, inst_b, "two devices");
+
+        let auth = sov.sign_auth_deliver(
+            recipient_id,
+            [0xCCu8; 32],
+            9,
+            NOW,
+            0x1234,
+            b"to every device".to_vec(),
+            Vec::new(),
+        );
+        let blob = seal_mailbox_blob(
+            &auth,
+            &[cert_a.clone(), cert_b.clone()],
+            &sender_id,
+            &recipient_id,
+            &sov.document,
+        )
+        .unwrap();
+
+        for (instance, dk, cert) in [(inst_a, &dk_a, &cert_a), (inst_b, &dk_b, &cert_b)] {
+            let opened = open_mailbox_blob(
+                &blob,
+                &instance,
+                &recipient_id,
+                &sender_id,
+                dk,
+                cert.cert_version,
+                &sov.document,
+                NOW,
+                DEFAULT_AUTH_DELIVER_FRESHNESS_SECS,
+            )
+            .unwrap_or_else(|e| panic!("device {instance:?} could not open it: {e:?}"));
+            assert_eq!(opened.data, b"to every device");
+            assert_eq!(opened.sender_node_id, sender_id);
+        }
+    }
+
+    /// And a device NOT sealed to still cannot read it — the fan-out widens
+    /// delivery to the identity's own devices, not to anyone holding the blob.
+    #[test]
+    fn a_device_left_out_of_the_fanout_cannot_open_it() {
+        let sov = sender_sovereign("sender");
+        let sender_id = *sov.node_id();
+        let (cert_a, _inst_a, _dk_a) = recipient_device(0x11);
+        let (_cert_b, inst_b, dk_b) = recipient_device(0x22);
+        let recipient_id = cert_a.node_id;
+
+        let auth = sov.sign_auth_deliver(
+            recipient_id,
+            [0xCCu8; 32],
+            9,
+            NOW,
+            0x1234,
+            b"only for A".to_vec(),
+            Vec::new(),
+        );
+        let blob = seal_mailbox_blob(
+            &auth,
+            std::slice::from_ref(&cert_a),
+            &sender_id,
+            &recipient_id,
+            &sov.document,
+        )
+        .unwrap();
+
+        assert!(
+            open_mailbox_blob(
+                &blob,
+                &inst_b,
+                &recipient_id,
+                &sender_id,
+                &dk_b,
+                1,
+                &sov.document,
+                NOW,
+                DEFAULT_AUTH_DELIVER_FRESHNESS_SECS,
+            )
+            .is_err()
+        );
+    }
+
     #[test]
     fn seal_open_round_trips_and_verifies() {
         let sov = sender_sovereign("sender");
@@ -366,8 +481,14 @@ mod tests {
             b"offline hello".to_vec(),
             Vec::new(),
         );
-        let blob =
-            seal_mailbox_blob(&auth, &cert, &sender_id, &recipient_id, &sov.document).unwrap();
+        let blob = seal_mailbox_blob(
+            &auth,
+            std::slice::from_ref(&cert),
+            &sender_id,
+            &recipient_id,
+            &sov.document,
+        )
+        .unwrap();
 
         let opened = open_mailbox_blob(
             &blob,
@@ -409,8 +530,14 @@ mod tests {
             b"survives version hint mismatch".to_vec(),
             Vec::new(),
         );
-        let blob =
-            seal_mailbox_blob(&auth, &cert, &sender_id, &recipient_id, &sov.document).unwrap();
+        let blob = seal_mailbox_blob(
+            &auth,
+            std::slice::from_ref(&cert),
+            &sender_id,
+            &recipient_id,
+            &sov.document,
+        )
+        .unwrap();
 
         let opened = open_mailbox_blob(
             &blob,
@@ -444,8 +571,14 @@ mod tests {
             b"sealed-sender hello".to_vec(),
             Vec::new(),
         );
-        let blob =
-            seal_mailbox_blob(&auth, &cert, &sender_id, &recipient_id, &sov.document).unwrap();
+        let blob = seal_mailbox_blob(
+            &auth,
+            std::slice::from_ref(&cert),
+            &sender_id,
+            &recipient_id,
+            &sov.document,
+        )
+        .unwrap();
 
         // 1) recover the sender from the sidecar with NO prior knowledge of it.
         let recovered =
@@ -490,8 +623,14 @@ mod tests {
             b"x".to_vec(),
             Vec::new(),
         );
-        let mut blob =
-            seal_mailbox_blob(&auth, &cert, &sender_id, &recipient_id, &sov.document).unwrap();
+        let mut blob = seal_mailbox_blob(
+            &auth,
+            std::slice::from_ref(&cert),
+            &sender_id,
+            &recipient_id,
+            &sov.document,
+        )
+        .unwrap();
         // Flip a byte well inside the sidecar fan-out blob's interior.
         let tamper_at = blob.len() / 4;
         blob[tamper_at] ^= 0xFF;
@@ -520,8 +659,14 @@ mod tests {
             b"x".to_vec(),
             Vec::new(),
         );
-        let blob =
-            seal_mailbox_blob(&auth, &cert, &sender_id, &recipient_id, &sov.document).unwrap();
+        let blob = seal_mailbox_blob(
+            &auth,
+            std::slice::from_ref(&cert),
+            &sender_id,
+            &recipient_id,
+            &sov.document,
+        )
+        .unwrap();
 
         let err = open_mailbox_blob(
             &blob,
@@ -554,8 +699,14 @@ mod tests {
             b"x".to_vec(),
             Vec::new(),
         );
-        let blob =
-            seal_mailbox_blob(&auth, &cert, &sender_id, &recipient_id, &sov.document).unwrap();
+        let blob = seal_mailbox_blob(
+            &auth,
+            std::slice::from_ref(&cert),
+            &sender_id,
+            &recipient_id,
+            &sov.document,
+        )
+        .unwrap();
 
         let err = open_mailbox_blob(
             &blob,
@@ -587,8 +738,14 @@ mod tests {
             b"x".to_vec(),
             Vec::new(),
         );
-        let mut blob =
-            seal_mailbox_blob(&auth, &cert, &sender_id, &recipient_id, &sov.document).unwrap();
+        let mut blob = seal_mailbox_blob(
+            &auth,
+            std::slice::from_ref(&cert),
+            &sender_id,
+            &recipient_id,
+            &sov.document,
+        )
+        .unwrap();
         // Flip a byte at the tail (inside the AEAD ciphertext) → AEAD auth fails.
         let last = blob.len() - 1;
         blob[last] ^= 0xFF;
@@ -626,8 +783,14 @@ mod tests {
             b"hi".to_vec(),
             Vec::new(),
         );
-        let blob =
-            seal_mailbox_blob(&auth, &cert, &sender_id, &recipient_id, &sov.document).unwrap();
+        let blob = seal_mailbox_blob(
+            &auth,
+            std::slice::from_ref(&cert),
+            &sender_id,
+            &recipient_id,
+            &sov.document,
+        )
+        .unwrap();
 
         // 1) recover the sender id from the sidecar (no prior knowledge), then
         // 2) recover the sender's document straight out of the blob.
@@ -682,8 +845,14 @@ mod tests {
             b"x".to_vec(),
             Vec::new(),
         );
-        let mut blob =
-            seal_mailbox_blob(&auth, &cert, &sender_id, &recipient_id, &sov.document).unwrap();
+        let mut blob = seal_mailbox_blob(
+            &auth,
+            std::slice::from_ref(&cert),
+            &sender_id,
+            &recipient_id,
+            &sov.document,
+        )
+        .unwrap();
 
         // Locate the sealed-doc region: [ 0x03 | sidecar_len | sidecar | doc_len | doc | main ]
         // and flip a byte well inside it.
@@ -723,8 +892,14 @@ mod tests {
             b"x".to_vec(),
             Vec::new(),
         );
-        let blob =
-            seal_mailbox_blob(&auth, &cert, &sender_id, &recipient_id, &sov.document).unwrap();
+        let blob = seal_mailbox_blob(
+            &auth,
+            std::slice::from_ref(&cert),
+            &sender_id,
+            &recipient_id,
+            &sov.document,
+        )
+        .unwrap();
 
         let doc = recover_embedded_sender_doc(
             &blob,
