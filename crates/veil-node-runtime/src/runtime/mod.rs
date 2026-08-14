@@ -1117,6 +1117,36 @@ fn dht_publish_replicated_via(
 }
 
 impl NodeRuntime {
+    /// The address this node RECEIVES under: mailbox drops, rendezvous ads,
+    /// the cookie that ties the two together.
+    ///
+    /// Not the same question as "who is this node on the wire". The handshake
+    /// identity is the `[identity]` keypair and must stay that way — it is what
+    /// a peer authenticates against. But a sender seals mail to an IDENTITY,
+    /// walking node_id → document → registry → per-device certs, and an
+    /// identity with several devices has one address for all of them.
+    ///
+    /// Today the two coincide for every node in the field: a mined identity is
+    /// its own master, and a phrase-provisioned one derives the config key from
+    /// the same master the document names, so `BLAKE3(master_pk)` IS the config
+    /// node_id. They diverge only once a device is given a transport key of its
+    /// own — and at that moment a device that kept receiving under its transport
+    /// id would be waiting at an address nobody sends to, while remaining
+    /// perfectly reachable-looking from every angle.
+    ///
+    /// CHANGING THIS MEANS CHANGING BOTH SIDES. The receiver cookie is derived
+    /// from this id and must stay bit-for-bit identical to the app-side
+    /// publisher's (`MailboxService._deriveCookie`); a mismatch had the two
+    /// advertising the same relay under different cookies, and the relay
+    /// dropped every introduce as `cookie_unknown` with delivery failing in
+    /// silence.
+    fn receiver_node_id(&self) -> [u8; 32] {
+        match self.identity.sovereign_identity.get() {
+            Some(sov) => *sov.node_id(),
+            None => *self.identity.local_identity.node_id.as_bytes(),
+        }
+    }
+
     pub async fn start(config_path: impl AsRef<Path>, foreground_mode: bool) -> Result<Self> {
         let config_path = config_path.as_ref().to_path_buf();
         let config = veil_cfg::load_config(&config_path)?;
