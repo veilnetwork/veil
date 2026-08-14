@@ -667,6 +667,47 @@ impl SovereignIdentity {
     /// previous value and bump, or (for now) stamp `1` on every
     /// fresh startup; peers tie-break on `(reg_version, sig)` so
     /// publishing the same version repeatedly is benign.
+    /// One registry entry per device the document names — not just this one.
+    ///
+    /// The registry is how a peer turns an identity into somewhere to deliver:
+    /// it resolves `node_id`, reads the instances, and seals one envelope per
+    /// instance. A node that advertises only ITSELF therefore hides every other
+    /// device of the same identity, and since all of them publish under the one
+    /// `node_id` they overwrite each other in turn — whichever wrote last is
+    /// the only device anyone can reach, and the rest stay online believing
+    /// they are reachable.
+    ///
+    /// Derived from the document rather than from local state, which is what
+    /// makes every device publish the SAME registry: the document already names
+    /// each device, and an instance id is the head of the device id that is
+    /// already in the entry. Two devices racing to publish now write identical
+    /// bytes instead of contradicting each other.
+    pub fn all_instance_entries(&self) -> Vec<veil_proto::instance_registry::InstanceEntry> {
+        use crate::publish::build_instance_entry;
+        self.document
+            .identity_keys
+            .iter()
+            .enumerate()
+            .map(|(idx, key)| {
+                let mut instance_id = [0u8; 16];
+                instance_id.copy_from_slice(&key.device_id[..16]);
+                build_instance_entry(instance_id, idx as u16, String::new(), 0)
+            })
+            .collect()
+    }
+
+    /// The version to publish the registry under.
+    ///
+    /// The document's own issue time, so it is monotonic without any stored
+    /// counter and identical on every device holding that document. A device
+    /// still carrying an older document publishes a LOWER version and loses the
+    /// tie-break, instead of overwriting the newer registry with a set that has
+    /// one device missing — which is what a constant version 1 on every startup
+    /// allowed.
+    pub fn registry_version(&self) -> u64 {
+        self.document.issued_at_unix
+    }
+
     pub fn build_and_sign_registry(
         &self,
         reg_version: u64,
