@@ -8558,7 +8558,165 @@ pub unsafe extern "C" fn veil_delegate_device_from_phrase_zeroize(
     match veil_identity::sovereign_flow::delegate_device(
         veil_identity::sovereign_flow::DelegateDeviceOptions {
             veil_dir: dir,
-            master_seed,
+            master: veil_identity::sovereign_flow::MasterSecret::Seed(master_seed),
+            device_pubkey: pubkey,
+            now_unix,
+            valid_until_unix: now_unix + VEIL_DEFAULT_RESTORE_VALIDITY_SECS,
+            out_path: None,
+        },
+    ) {
+        Ok(_output) => VEIL_OK,
+        Err(e) => {
+            unsafe {
+                write_err(err_out, format!("delegate_device: {e}"));
+            }
+            VEIL_ERR
+        }
+    }
+}
+
+/// Admit a device using the master secret an application already holds: the
+/// `[identity]` keypair of its own node config.
+///
+/// The sibling that takes a phrase is for an operator with a paper backup. An
+/// application has no phrase — it is consumed at setup and never stored — and
+/// asking for it again at the moment a second device is linked, possibly days
+/// later, means there is nothing to prompt from. What it does have is the node
+/// config, and for a phrase-provisioned identity that config's private key IS
+/// the master secret: `veil_config_init_from_phrase_zeroize` writes
+/// `derive_master_sk_ed25519(master_seed)` into it. So the same authority is
+/// already in the caller's hands, in a different shape.
+///
+/// `config_toml` is a SECRET — it carries that key — and is wiped in place
+/// before return on every path. `device_pubkey` may be NULL, meaning this
+/// device's own key from `device_identity_sk.bin` in `veil_dir`. Returns
+/// `VEIL_OK`, or sets `*err_out` and returns `VEIL_ERR`.
+///
+/// Behind `node-embedded`: reading a node config needs `veil-cfg`, which is
+/// pulled in by that feature. The callers that have a node config are exactly
+/// the hosts that embed a node.
+#[cfg(feature = "node-embedded")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn veil_delegate_device_from_config_zeroize(
+    config_toml: *mut u8,
+    config_toml_len: usize,
+    veil_dir: *const u8,
+    veil_dir_len: usize,
+    device_pubkey: *const u8,
+    device_pubkey_len: usize,
+    err_out: *mut *mut c_char,
+) -> c_int {
+    unsafe {
+        clear_err(err_out);
+    }
+    if config_toml.is_null() {
+        unsafe {
+            write_err(err_out, "config_toml is NULL");
+        }
+        return VEIL_ERR_INVALID_ARG;
+    }
+
+    struct ZeroOnDrop {
+        ptr: *mut u8,
+        len: usize,
+    }
+    impl Drop for ZeroOnDrop {
+        fn drop(&mut self) {
+            unsafe { volatile_wipe(self.ptr, self.len) };
+        }
+    }
+    let _guard = ZeroOnDrop {
+        ptr: config_toml,
+        len: config_toml_len,
+    };
+
+    let toml_bytes =
+        unsafe { std::slice::from_raw_parts(config_toml as *const u8, config_toml_len) };
+    let Ok(toml) = std::str::from_utf8(toml_bytes) else {
+        unsafe {
+            write_err(err_out, "config_toml is not valid UTF-8");
+        }
+        return VEIL_ERR_INVALID_ARG;
+    };
+    let Some(dir_str) = (unsafe { slice_to_str(veil_dir, veil_dir_len) }) else {
+        unsafe {
+            write_err(err_out, "veil_dir is NULL or invalid UTF-8");
+        }
+        return VEIL_ERR_INVALID_ARG;
+    };
+    let dir = std::path::PathBuf::from(dir_str);
+
+    let config = match veil_cfg::parse_toml_str(toml) {
+        Ok(c) => c,
+        Err(e) => {
+            unsafe {
+                write_err(err_out, format!("config parse failed: {e}"));
+            }
+            return VEIL_ERR_INVALID_ARG;
+        }
+    };
+    let Some(identity) = config.identity else {
+        unsafe {
+            write_err(err_out, "config carries no [identity]");
+        }
+        return VEIL_ERR_INVALID_ARG;
+    };
+    if identity.algo != veil_types::SignatureAlgorithm::Ed25519 {
+        unsafe {
+            write_err(err_out, "delegation requires an Ed25519 identity");
+        }
+        return VEIL_ERR_INVALID_ARG;
+    }
+    let sk_bytes: zeroize::Zeroizing<Vec<u8>> = {
+        use base64::Engine as _;
+        match base64::engine::general_purpose::STANDARD.decode(identity.private_key.as_str()) {
+            Ok(v) => zeroize::Zeroizing::new(v),
+            Err(e) => {
+                unsafe {
+                    write_err(err_out, format!("private_key decode failed: {e}"));
+                }
+                return VEIL_ERR_INVALID_ARG;
+            }
+        }
+    };
+    if sk_bytes.len() != 32 {
+        unsafe {
+            write_err(
+                err_out,
+                format!("private_key must be 32 bytes, got {}", sk_bytes.len()),
+            );
+        }
+        return VEIL_ERR_INVALID_ARG;
+    }
+    let mut master_sk = zeroize::Zeroizing::new([0u8; 32]);
+    master_sk.copy_from_slice(&sk_bytes);
+
+    let pubkey: Vec<u8> = if device_pubkey.is_null() {
+        match veil_identity::sovereign_flow::load_identity_sk(&dir) {
+            Ok(seed) => ed25519_dalek::SigningKey::from_bytes(seed.as_array())
+                .verifying_key()
+                .as_bytes()
+                .to_vec(),
+            Err(e) => {
+                unsafe {
+                    write_err(err_out, format!("load own device key: {e}"));
+                }
+                return VEIL_ERR;
+            }
+        }
+    } else {
+        unsafe { std::slice::from_raw_parts(device_pubkey, device_pubkey_len) }.to_vec()
+    };
+
+    let now_unix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+
+    match veil_identity::sovereign_flow::delegate_device(
+        veil_identity::sovereign_flow::DelegateDeviceOptions {
+            veil_dir: dir,
+            master: veil_identity::sovereign_flow::MasterSecret::SigningKey(master_sk),
             device_pubkey: pubkey,
             now_unix,
             valid_until_unix: now_unix + VEIL_DEFAULT_RESTORE_VALIDITY_SECS,

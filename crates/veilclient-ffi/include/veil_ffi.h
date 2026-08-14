@@ -2556,6 +2556,40 @@ int veil_delegate_device_from_phrase_zeroize(uint8_t *phrase,
                                              char **err_out)
 ;
 
+#if defined(VEIL_FFI_NODE_EMBEDDED)
+/**
+ * Admit a device using the master secret an application already holds: the
+ * `[identity]` keypair of its own node config.
+ *
+ * The sibling that takes a phrase is for an operator with a paper backup. An
+ * application has no phrase — it is consumed at setup and never stored — and
+ * asking for it again at the moment a second device is linked, possibly days
+ * later, means there is nothing to prompt from. What it does have is the node
+ * config, and for a phrase-provisioned identity that config's private key IS
+ * the master secret: `veil_config_init_from_phrase_zeroize` writes
+ * `derive_master_sk_ed25519(master_seed)` into it. So the same authority is
+ * already in the caller's hands, in a different shape.
+ *
+ * `config_toml` is a SECRET — it carries that key — and is wiped in place
+ * before return on every path. `device_pubkey` may be NULL, meaning this
+ * device's own key from `device_identity_sk.bin` in `veil_dir`. Returns
+ * `VEIL_OK`, or sets `*err_out` and returns `VEIL_ERR`.
+ *
+ * Behind `node-embedded`: reading a node config needs `veil-cfg`, which is
+ * pulled in by that feature. The callers that have a node config are exactly
+ * the hosts that embed a node.
+ */
+
+int veil_delegate_device_from_config_zeroize(uint8_t *config_toml,
+                                             uintptr_t config_toml_len,
+                                             const uint8_t *veil_dir,
+                                             uintptr_t veil_dir_len,
+                                             const uint8_t *device_pubkey,
+                                             uintptr_t device_pubkey_len,
+                                             char **err_out)
+;
+#endif
+
 /**
  * Restore identity AND write an encrypted master-seed backup
  * ([`veil_restore_identity_from_phrase_zeroize`] + passphrase-protected
