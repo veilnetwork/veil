@@ -826,7 +826,11 @@ where
                 // drive the shared post-IDENTITY tail (CAPS → KA → CONFIRM → ATTACH).
                 let remote_identity = IdentityPayload::decode(&remote_identity_body)
                     .map_err(|e| HandshakeError(format!("OVL1 IDENTITY decode (C6): {e}")))?;
-                verify_identity_binding(&remote_identity, "OVL1 IDENTITY (C6)")?;
+                // Not fatal on its own any more: a device of a multi-device
+                // identity fails it by construction and proves the link by
+                // delegation below. Never waived — see the tail of
+                // `complete_handshake_from_capabilities`.
+                let binding_direct = identity_binding_holds(&remote_identity);
                 verify_hello_matches_identity(remote_id, &remote_identity, "OVL1 IDENTITY (C6)")?;
 
                 return complete_handshake_from_capabilities(
@@ -842,6 +846,7 @@ where
                     remote_identity,
                     &identity_wire,
                     &remote_identity_body,
+                    binding_direct,
                     sovereign_ctx,
                     " (C6)",
                     local_advertised_transports,
@@ -891,7 +896,7 @@ where
         f(true, family, SessionMsg::Identity as u16, &body, remote_id);
     }
 
-    verify_identity_binding(&remote_identity, "OVL1 IDENTITY")?;
+    let binding_direct = identity_binding_holds(&remote_identity);
     verify_hello_matches_identity(remote_id, &remote_identity, "OVL1 IDENTITY")?;
 
     complete_handshake_from_capabilities(
@@ -907,6 +912,7 @@ where
         remote_identity,
         &identity_wire,
         &body,
+        binding_direct,
         sovereign_ctx,
         "",
         local_advertised_transports,
@@ -969,6 +975,21 @@ pub fn build_local_attach_bytes(
 
 /// Verify `BLAKE3(public_key) == claimed_node_id`. Prevents any peer from
 /// impersonating an arbitrary node_id during IDENTITY exchange.
+/// Whether `BLAKE3(public_key) == node_id` holds outright.
+///
+/// A device of a MULTI-DEVICE identity does not satisfy this, and must not:
+/// `node_id` is BLAKE3 of the MASTER key while the peer answers with its own
+/// per-device key. Such a peer proves the link the other way — a master-signed
+/// delegation, verified in the IDENTITY_PROOF exchange and bound to THIS
+/// session's ephemeral key, so it cannot be replayed from another session.
+///
+/// Callers accept that route by deferring: they take this predicate, and if it
+/// is false they REQUIRE a verified proof naming the very identity the peer
+/// claimed. Nothing is waived on the peer's say-so.
+pub fn identity_binding_holds(id: &IdentityPayload) -> bool {
+    *blake3::hash(&id.public_key).as_bytes() == id.node_id
+}
+
 pub fn verify_identity_binding(id: &IdentityPayload, error_label: &str) -> Result<()> {
     let expected: [u8; 32] = *blake3::hash(&id.public_key).as_bytes();
     if expected != id.node_id {
@@ -1091,6 +1112,10 @@ async fn complete_handshake_from_capabilities<S>(
     // MAC).
     local_identity_bytes: &[u8],
     remote_identity_bytes: &[u8],
+    // Whether BLAKE3(peer public_key) == the node_id it claimed. False is legal
+    // ONLY for a device of a multi-device identity, and only if the delegation
+    // proof below names that same identity.
+    binding_direct: bool,
     sovereign_ctx: Option<SovereignHandshakeCtx<'_>>,
     label_suffix: &str,
     local_advertised_transports: &[String],
@@ -1372,10 +1397,41 @@ where
                 "OVL1 IDENTITY_PROOF{label_suffix}: peer proof rejected: {e}"
             ))
         })?;
+        // Scoped to the deferred case ON PURPOSE. When the hash binding already
+        // held, the proof is an ADDITIONAL statement — this crate lets a node's
+        // sovereign identity be independent of its transport key, and two tests
+        // encode exactly that. Demanding equality there would retire a shape
+        // the protocol supports. Where the binding did NOT hold, the proof is
+        // the only thing standing between "a device of this identity" and "a
+        // stranger wearing its node_id", so it must name that identity.
+        if !binding_direct && validated.node_id != remote_identity.node_id {
+            return Err(HandshakeError(format!(
+                "OVL1 IDENTITY_PROOF{label_suffix}: proof is for {} but IDENTITY \
+                 claimed {} — peer rejected",
+                veil_util::hex_short(&validated.node_id),
+                veil_util::hex_short(&remote_identity.node_id),
+            )));
+        }
         Some(validated)
     } else {
         None
     };
+
+    // A peer whose key does not hash to the node_id it claimed is legal only as
+    // a DEVICE of that identity, and only once the delegation above has been
+    // verified. Reaching here without one means the claim was never
+    // established: refuse, exactly as the old unconditional binding refused.
+    //
+    // Gated on the VERIFIED proof, never on the peer advertising
+    // SUPPORTS_SOVEREIGN_IDENTITY — capabilities are the peer's word, and a
+    // waiver granted on the strength of a flag is no check at all.
+    if !binding_direct && validated_sovereign_identity.is_none() {
+        return Err(HandshakeError(format!(
+            "OVL1 IDENTITY{label_suffix}: node_id does not match \
+             BLAKE3(public_key) and no verified delegation was presented — peer \
+             identity rejected",
+        )));
+    }
 
     // ── HYBRID_KEX_CT ────────────────────────────────────────────────
     // Conditions for engaging the hybrid path:
@@ -1906,6 +1962,25 @@ mod tests {
         }
     }
 
+    /// A DEVICE of a multi-device identity: its own transport keypair, but
+    /// claiming the identity's node_id rather than the hash of that keypair.
+    ///
+    /// This is what the hash binding cannot accept and what the delegation
+    /// proof exists to establish. Built by hand because it is precisely the
+    /// shape `test_identity` cannot produce.
+    fn device_identity(seed: u8, claims: [u8; 32]) -> TestHandshakeIdentity {
+        let sk = ed25519_dalek::SigningKey::from_bytes(&[seed; 32]);
+        let public_key = STANDARD.encode(sk.verifying_key().to_bytes());
+        let hex = veil_util::bytes_to_hex(&claims);
+        TestHandshakeIdentity {
+            algo: SignatureAlgorithm::Ed25519,
+            public_key,
+            private_key: STANDARD.encode([seed; 32]),
+            nonce: format!("test-nonce-{seed:02x}"),
+            node_id: hex.parse::<veil_cfg::NodeId>().unwrap(),
+        }
+    }
+
     fn test_identity(seed: u8) -> TestHandshakeIdentity {
         // Generate a real Ed25519 keypair for signing.
         let sk = ed25519_dalek::SigningKey::from_bytes(&[seed; 32]);
@@ -1957,6 +2032,73 @@ mod tests {
         )
         .await
         .expect("OVL1 handshake succeeds")
+    }
+
+    /// The other half of the relaxation: a claim with NO delegation behind it.
+    ///
+    /// A peer answering with its own key under a node_id that is not the hash
+    /// of that key is what the binding always refused. Deferring the refusal to
+    /// the delegation proof must not turn it into a waiver — reaching the end of
+    /// the handshake with no verified delegation is still a rejection, and this
+    /// is the test that keeps it one.
+    #[tokio::test]
+    async fn a_device_claiming_an_identity_without_a_proof_is_refused() {
+        let (a, b) = duplex(64 * 1024);
+        // Alice answers with her own key while claiming an unrelated node_id,
+        // and offers nothing to back it up.
+        let alice = tokio::spawn(async move {
+            let mut stream = a;
+            let identity = device_identity(0xAA, [0x42u8; 32]);
+            perform_ovl1_handshake(
+                &mut stream,
+                &identity,
+                NodeRole::Core,
+                veil_cfg::DiscoveryMode::Public,
+                None,
+                None,
+                None,
+                Some([0u8; 32]),
+                None,
+                None,
+                None, // no sovereign context: no proof will be exchanged
+                &[],
+                false,
+                None,
+                None,
+                None,
+            )
+            .await
+        });
+        let bob = tokio::spawn(async move {
+            let mut stream = b;
+            let identity = test_identity(0xBB);
+            perform_ovl1_handshake(
+                &mut stream,
+                &identity,
+                NodeRole::Core,
+                veil_cfg::DiscoveryMode::Public,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                &[],
+                false,
+                None,
+                None,
+                None,
+            )
+            .await
+        });
+
+        let bob_res = bob.await.expect("bob task");
+        let _ = alice.await;
+        assert!(
+            bob_res.is_err(),
+            "an unproven claim must not complete a handshake"
+        );
     }
 
     /// Variant of `run_side` that supplies a `peer_observed_addr` —
@@ -2191,6 +2333,174 @@ mod tests {
     /// exchange a `SessionMsg::IdentityProof` frame between KA and
     /// SESSION_CONFIRM. Each side ends up with a verified peer
     /// `ValidatedIdentity` in the handshake result.
+    /// A device of a multi-device identity completes a handshake under the
+    /// IDENTITY's node_id while answering with its OWN transport key.
+    ///
+    /// Before this the hash binding refused it outright, so a second device was
+    /// reachable only through a relay — a detour paid on every message for a
+    /// peer that was right there. The proof is bound to THIS session's ephemeral
+    /// key, so it cannot be lifted from another session, and it must name the
+    /// very identity the peer claimed.
+    #[tokio::test]
+    async fn a_device_may_answer_for_its_identity_when_it_proves_delegation() {
+        use veil_cfg::sovereign_flow::{CreateIdentityOptions, create_identity};
+        use veil_identity::sovereign::SovereignIdentity;
+        // PoW difficulty no longer used by IdentityDocument; field retained for API stability
+        const DEFAULT_IDENTITY_POW_DIFFICULTY: u32 = 0;
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let base_dir = std::env::temp_dir().join(format!(
+            // A base of its own: the reference test below uses the same
+            // fixture with its own counter, and sharing the directory had
+            // the two writing over each other's documents.
+            "veil-handshake-device-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&base_dir).unwrap();
+        let mk_dir = |tag: &str| {
+            let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+            let p = base_dir.join(format!("{tag}-{n}"));
+            std::fs::create_dir_all(&p).unwrap();
+            p
+        };
+
+        // Two independent sovereign identities, each persisted to its
+        // own veil_dir (the exact on-disk layout `create_identity`
+        // writes). Loaded via `SovereignIdentity::load_from_dir` — the
+        // same path the runtime will use at node startup.
+        let alice_dir = mk_dir("alice");
+        let _ = create_identity(CreateIdentityOptions {
+            veil_dir: alice_dir.clone(),
+            save_encrypted_with_password: None,
+            argon2_params_override: None,
+            extra_entropy: None,
+            instance_label: "alice-handshake-test".into(),
+            pow_difficulty: DEFAULT_IDENTITY_POW_DIFFICULTY,
+            issued_at_unix: 1_700_000_000,
+            valid_until_unix: 1_700_000_000 + 7 * 86_400,
+            algo: veil_types::SignatureAlgorithm::Ed25519,
+        })
+        .unwrap();
+
+        let bob_dir = mk_dir("bob");
+        let _ = create_identity(CreateIdentityOptions {
+            veil_dir: bob_dir.clone(),
+            save_encrypted_with_password: None,
+            argon2_params_override: None,
+            extra_entropy: None,
+            instance_label: "bob-handshake-test".into(),
+            pow_difficulty: DEFAULT_IDENTITY_POW_DIFFICULTY,
+            issued_at_unix: 1_700_000_000,
+            valid_until_unix: 1_700_000_000 + 7 * 86_400,
+            algo: veil_types::SignatureAlgorithm::Ed25519,
+        })
+        .unwrap();
+
+        let alice_sov = SovereignIdentity::load_from_dir(&alice_dir).unwrap();
+        let bob_sov = SovereignIdentity::load_from_dir(&bob_dir).unwrap();
+        let alice_id = *alice_sov.node_id();
+        let bob_id = *bob_sov.node_id();
+        assert_ne!(alice_id, bob_id);
+
+        // Each side has its own revocation cache (node-level concern).
+
+        let now: u64 = 1_700_000_050;
+        let (a, b) = duplex(64 * 1024);
+
+        let alice_task = tokio::spawn(async move {
+            let mut stream = a;
+            // Alice answers with HER OWN key while claiming the IDENTITY's
+            // node_id — the shape the hash binding refuses and the delegation
+            // proof exists to establish.
+            let identity = device_identity(0xAA, alice_id);
+            let ctx = SovereignHandshakeCtx {
+                sovereign: &alice_sov,
+                now_unix_secs: now,
+                local_mlkem_dk_seed: None,
+            };
+            // alice = outbound (writes HELLO first).
+            perform_ovl1_handshake(
+                &mut stream,
+                &identity,
+                NodeRole::Core,
+                veil_cfg::DiscoveryMode::Public,
+                None,
+                None,
+                None,
+                Some([0u8; 32]),
+                None,
+                None,
+                Some(ctx),
+                &[],
+                false,
+                None,
+                None, // P-Net: no network gate in test fixture
+                None, // S3: no peer_observed_addr in test fixture
+            )
+            .await
+            .expect("alice handshake ok")
+        });
+
+        let bob_task = tokio::spawn(async move {
+            let mut stream = b;
+            let identity = test_identity(0xBB);
+            let ctx = SovereignHandshakeCtx {
+                sovereign: &bob_sov,
+                now_unix_secs: now,
+                local_mlkem_dk_seed: None,
+            };
+            // bob = inbound (reads HELLO first).
+            perform_ovl1_handshake(
+                &mut stream,
+                &identity,
+                NodeRole::Core,
+                veil_cfg::DiscoveryMode::Public,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(ctx),
+                &[],
+                false,
+                None,
+                None, // P-Net: no network gate in test fixture
+                None, // S3: no peer_observed_addr in test fixture
+            )
+            .await
+            .expect("bob handshake ok")
+        });
+
+        let (alice_res, bob_res) = tokio::join!(alice_task, bob_task);
+        let alice_res = alice_res.unwrap();
+        let bob_res = bob_res.unwrap();
+
+        // Each side advertised SUPPORTS_SOVEREIGN_IDENTITY.
+        assert!(alice_res.remote_capabilities.supports_sovereign_identity());
+        assert!(bob_res.remote_capabilities.supports_sovereign_identity());
+
+        // Each side has a verified peer identity. Alice must see Bob
+        // Bob must see Alice.
+        let alice_view = alice_res
+            .validated_sovereign_identity
+            .expect("alice sees bob");
+        let bob_view = bob_res
+            .validated_sovereign_identity
+            .expect("bob sees alice");
+        assert_eq!(alice_view.node_id, bob_id, "alice learns bob's node_id");
+        assert_eq!(bob_view.node_id, alice_id, "bob learns alice's node_id");
+
+        // Session keys still match — handshake completed the normal
+        // CONFIRM + ATTACH tail after the proof exchange.
+        assert_eq!(
+            alice_res.session_keys.session_id,
+            bob_res.session_keys.session_id
+        );
+        assert_eq!(alice_res.session_keys.tx_key, bob_res.session_keys.rx_key);
+    }
+
     #[tokio::test]
     async fn sovereign_proof_exchange_runs_end_to_end() {
         use veil_cfg::sovereign_flow::{CreateIdentityOptions, create_identity};
