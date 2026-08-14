@@ -2625,6 +2625,27 @@ int veil_adopt_identity_document_from_config_zeroize(uint8_t *config_toml,
 #endif
 
 /**
+ * The identity address a signed document names — `BLAKE3(master_pubkey)`,
+ * written to `out_node_id` (32 bytes).
+ *
+ * This is the address an identity RECEIVES under, and it is not always the
+ * address its node speaks under. A host whose config keypair IS the master —
+ * every identity in the field today — sees the same 32 bytes both ways. A host
+ * whose device has a transport key of its own does not, and it has to publish
+ * its rendezvous ad and poll its mailbox under THIS one, or it waits at an
+ * address nobody sends to while looking perfectly reachable.
+ *
+ * Decodes and verifies nothing beyond the encoding: the caller is reading its
+ * OWN stored document, which it wrote itself.
+ */
+
+int veil_identity_document_node_id(const uint8_t *document,
+                                   uintptr_t document_len,
+                                   uint8_t *out_node_id,
+                                   char **err_out)
+;
+
+/**
  * Restore identity AND write an encrypted master-seed backup
  * ([`veil_restore_identity_from_phrase_zeroize`] + passphrase-protected
  * `master.enc` file in `veil_dir`).
