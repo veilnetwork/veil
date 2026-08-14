@@ -1648,6 +1648,184 @@ pub fn load_master_falcon_keypair(
     parse_master_falcon_keypair(&bytes)
 }
 
+// ── Device delegation ────────────────────────────────────────────────────────
+
+#[derive(Debug, thiserror::Error)]
+pub enum DelegateDeviceError {
+    #[error("io: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("no identity_document.bin in {0}")]
+    NoDocument(PathBuf),
+    #[error("document decode: {0}")]
+    DocumentDecode(String),
+    #[error("device pubkey must be 32 bytes, got {0}")]
+    PubkeyLength(usize),
+    #[error(
+        "device pubkey already present as identity_keys[{idx}] — use \
+         `identity rotate` to extend its validity instead"
+    )]
+    AlreadyPresent { idx: usize },
+    #[error(
+        "MAX_IDENTITY_KEYS ({max}) would be exceeded (document already has {current})"
+    )]
+    TooManyKeys { max: usize, current: usize },
+    #[error(
+        "master seed does not match this identity: it derives node_id {computed}, \
+         the document carries {document}"
+    )]
+    WrongMaster { computed: String, document: String },
+    #[error(
+        "valid_until_unix − now_unix = {secs}s exceeds \
+         MAX_FRESHNESS_WINDOW_SECS ({MAX_FRESHNESS_WINDOW_SECS}s)"
+    )]
+    FreshnessWindowTooLong { secs: u64 },
+}
+
+pub struct DelegateDeviceOptions {
+    pub veil_dir: PathBuf,
+    /// Recovered from the BIP-39 phrase or the encrypted master file. Only the
+    /// master can authorise a new device, which is what makes this a
+    /// delegation rather than a claim.
+    pub master_seed: Zeroizing<[u8; 32]>,
+    /// The Ed25519 public key of the device being admitted, 32 bytes.
+    pub device_pubkey: Vec<u8>,
+    pub now_unix: u64,
+    pub valid_until_unix: u64,
+    /// Where the updated document goes. `None` replaces the one in `veil_dir`,
+    /// which is what a device admitting another wants. `Some` writes elsewhere
+    /// and leaves `veil_dir` untouched — for handing the result to the admitted
+    /// device out of band, without this one adopting it first.
+    pub out_path: Option<PathBuf>,
+}
+
+// Safe to derive, unlike the Options beside it: this carries a public document
+// and two indices. The master seed never appears here.
+#[derive(Debug)]
+pub struct DelegateDeviceOutput {
+    pub document: IdentityDocument,
+    /// Index of the newly appended key — what the admitted device writes into
+    /// its own `device_sig_key_idx.bin`.
+    pub new_key_idx: u16,
+    /// True when the delegated key is THIS device's own: the document is then
+    /// re-signed by the new key and `sig_key_idx` moves to it, because the
+    /// previous signer's secret lives on another machine.
+    pub signed_by_new_key: bool,
+}
+
+/// Admit another device to an existing identity: append its key to the signed
+/// document, under the master's signature.
+///
+/// This is the operation that makes one identity hold several devices, and the
+/// alternative is not "several documents" — it is data loss. Two devices that
+/// each restore the same phrase produce two documents with the SAME node_id and
+/// one key apiece, both published to the DHT under that id. Whichever
+/// republishes last wins, and the other device becomes unreachable through the
+/// identity layer while still believing it is online.
+///
+/// Lifted out of `veil-cli identity delegate-device`, which is where this logic
+/// used to live in full — unreachable from a library caller, and therefore from
+/// any embedding application, which is exactly the caller that needs it.
+///
+/// Two signing cases, and the difference is not cosmetic. Normally the document
+/// is re-signed by the LOCAL active subkey: an operator runs this on the device
+/// that already belongs to the identity, admitting another. But a device that
+/// is delegating ITSELF — restored from the phrase, holding the master and its
+/// own fresh key, merging into a document it received from elsewhere — cannot
+/// sign with the previous signer's subkey, because that secret is on the other
+/// machine. It signs with the key it just delegated and moves `sig_key_idx`
+/// there; every subkey in the document is master-signed, so a verifier accepts
+/// either.
+pub fn delegate_device(
+    opts: DelegateDeviceOptions,
+) -> Result<DelegateDeviceOutput, DelegateDeviceError> {
+    use veil_proto::identity_document::MAX_IDENTITY_KEYS;
+
+    let window = opts.valid_until_unix.saturating_sub(opts.now_unix);
+    if window == 0 || window > MAX_FRESHNESS_WINDOW_SECS {
+        return Err(DelegateDeviceError::FreshnessWindowTooLong { secs: window });
+    }
+    if opts.device_pubkey.len() != 32 {
+        return Err(DelegateDeviceError::PubkeyLength(opts.device_pubkey.len()));
+    }
+
+    let doc_path = opts.veil_dir.join(IDENTITY_DOCUMENT_FILE);
+    if !doc_path.exists() {
+        return Err(DelegateDeviceError::NoDocument(doc_path));
+    }
+    let mut doc = IdentityDocument::decode(&std::fs::read(&doc_path)?)
+        .map_err(|e| DelegateDeviceError::DocumentDecode(e.to_string()))?;
+
+    if doc.identity_keys.len() >= MAX_IDENTITY_KEYS {
+        return Err(DelegateDeviceError::TooManyKeys {
+            max: MAX_IDENTITY_KEYS,
+            current: doc.identity_keys.len(),
+        });
+    }
+    for (idx, k) in doc.identity_keys.iter().enumerate() {
+        if k.pubkey == opts.device_pubkey {
+            return Err(DelegateDeviceError::AlreadyPresent { idx });
+        }
+    }
+
+    // The master must be the one this document names. Without this check a
+    // wrong phrase produces a document that verifies against a different
+    // identity entirely, and the failure surfaces much later as peers refusing
+    // a node they cannot resolve.
+    let master_sk = SigningKey::from_bytes(&derive_master_sk_ed25519(&opts.master_seed));
+    let master_pk = master_sk.verifying_key();
+    let computed_node_id = compute_node_id(master_pk.as_bytes());
+    if computed_node_id != doc.node_id {
+        return Err(DelegateDeviceError::WrongMaster {
+            computed: hex_encode(&computed_node_id),
+            document: hex_encode(&doc.node_id),
+        });
+    }
+
+    let device_id = compute_node_id(&opts.device_pubkey);
+    let cert_sig = master_sk.sign(&build_certify(
+        &doc.node_id,
+        ALGO_ED25519,
+        &opts.device_pubkey,
+        &device_id,
+        opts.now_unix,
+        opts.valid_until_unix,
+    ));
+    doc.identity_keys.push(IdentityKey {
+        algo: ALGO_ED25519,
+        pubkey: opts.device_pubkey.clone(),
+        device_id,
+        valid_from_unix: opts.now_unix,
+        valid_until_unix: opts.valid_until_unix,
+        master_sig: cert_sig.to_bytes().to_vec(),
+    });
+    let new_key_idx = (doc.identity_keys.len() - 1) as u16;
+
+    // Whose secret re-signs the document. The local subkey normally; the newly
+    // delegated one when it IS the local subkey (self-delegation).
+    let local_seed = load_identity_sk(&opts.veil_dir)?;
+    let local_sk = SigningKey::from_bytes(local_seed.as_array());
+    let signed_by_new_key = local_sk.verifying_key().as_bytes()[..] == opts.device_pubkey[..];
+    if signed_by_new_key {
+        doc.sig_key_idx = new_key_idx;
+    }
+
+    doc.issued_at_unix = opts.now_unix;
+    if opts.valid_until_unix > doc.valid_until_unix {
+        doc.valid_until_unix = opts.valid_until_unix;
+    }
+    let mut doc_msg = Vec::with_capacity(DOC_SIG_CONTEXT.len() + 512);
+    doc_msg.extend_from_slice(DOC_SIG_CONTEXT);
+    doc_msg.extend_from_slice(&doc.canonical_signing_bytes());
+    doc.document_sig = local_sk.sign(&doc_msg).to_bytes().to_vec();
+
+    atomic_write(opts.out_path.as_ref().unwrap_or(&doc_path), &doc.encode())?;
+    Ok(DelegateDeviceOutput {
+        document: doc,
+        new_key_idx,
+        signed_by_new_key,
+    })
+}
+
 /// Persist the device's identity_sk seed to
 /// `<veil_dir>/device_identity_sk.bin` with restrictive
 /// permissions. File is 32 raw bytes — no magic header because
@@ -2113,6 +2291,191 @@ mod tests {
             valid_until_unix: issued + 7 * 86_400,
             algo: veil_types::SignatureAlgorithm::Ed25519,
         }
+    }
+
+    // ── delegate_device ────────────────────────────────────────
+    //
+    // What makes one identity hold several devices. The alternative is not
+    // "several documents": two devices that each restore the same phrase
+    // publish two documents under the SAME node_id, whichever republishes last
+    // wins, and the loser drops out of the identity layer while still believing
+    // it is online.
+
+    const DELEGATE_NOW: u64 = 1_700_000_000;
+
+    fn provision(dir: PathBuf, seed: Zeroizing<[u8; MASTER_SEED_LEN]>) -> RestoreIdentityOutput {
+        restore_identity(RestoreIdentityOptions {
+            veil_dir: dir,
+            master_seed: seed,
+            save_encrypted_with_password: None,
+            argon2_params_override: None,
+            instance_label: "device".into(),
+            pow_difficulty: TEST_POW_DIFFICULTY,
+            now_unix: DELEGATE_NOW,
+            valid_until_unix: DELEGATE_NOW + 7 * 86_400,
+            algo: veil_types::SignatureAlgorithm::Ed25519,
+            master_falcon_keypair_bytes: None,
+        })
+        .expect("provision")
+    }
+
+    /// This device's own public key, as the delegation names it.
+    fn device_pubkey(dir: &Path) -> Vec<u8> {
+        let seed = load_identity_sk(dir).expect("identity_sk");
+        SigningKey::from_bytes(seed.as_array())
+            .verifying_key()
+            .as_bytes()
+            .to_vec()
+    }
+
+    fn delegate_opts(dir: PathBuf, seed: Zeroizing<[u8; MASTER_SEED_LEN]>, pk: Vec<u8>)
+    -> DelegateDeviceOptions {
+        DelegateDeviceOptions {
+            veil_dir: dir,
+            master_seed: seed,
+            device_pubkey: pk,
+            now_unix: DELEGATE_NOW,
+            valid_until_unix: DELEGATE_NOW + 7 * 86_400,
+            out_path: None,
+        }
+    }
+
+    #[test]
+    fn delegate_device_admits_a_second_device_and_the_document_still_verifies() {
+        let seed = create_identity(test_opts(tempdir())).unwrap().master_seed;
+        let a = tempdir();
+        let b = tempdir();
+        provision(a.clone(), seed.clone());
+        provision(b.clone(), seed.clone());
+        // Two devices, one identity: same node_id, different keys. That is the
+        // precondition the whole mechanism rests on.
+        assert_ne!(device_pubkey(&a), device_pubkey(&b));
+
+        let out = delegate_device(delegate_opts(a.clone(), seed.clone(), device_pubkey(&b)))
+            .expect("delegate");
+
+        assert_eq!(out.new_key_idx, 1);
+        assert_eq!(out.document.identity_keys.len(), 2);
+        assert!(!out.signed_by_new_key, "the local subkey signs");
+        assert_eq!(out.document.sig_key_idx, 0, "the local device keeps signing");
+        verify_identity_document(&out.document, DELEGATE_NOW)
+            .expect("a delegated document must verify");
+        // And it is on disk, not merely returned — the node reads the file.
+        let reread = IdentityDocument::decode(
+            &std::fs::read(a.join(IDENTITY_DOCUMENT_FILE)).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(reread.identity_keys.len(), 2);
+    }
+
+    // THE CASE AN APP NEEDS. A device restored from the phrase holds the master
+    // and its own fresh key, receives the other device's document, and must add
+    // itself — it cannot sign with the previous signer's subkey, because that
+    // secret is on the other machine.
+    #[test]
+    fn delegate_device_signs_with_the_new_key_when_delegating_itself() {
+        let seed = create_identity(test_opts(tempdir())).unwrap().master_seed;
+        let a = tempdir();
+        let b = tempdir();
+        provision(a.clone(), seed.clone());
+        provision(b.clone(), seed.clone());
+
+        // B receives A's document, replacing its own single-key one.
+        std::fs::copy(
+            a.join(IDENTITY_DOCUMENT_FILE),
+            b.join(IDENTITY_DOCUMENT_FILE),
+        )
+        .unwrap();
+
+        let out = delegate_device(delegate_opts(b.clone(), seed.clone(), device_pubkey(&b)))
+            .expect("self-delegate");
+
+        assert!(out.signed_by_new_key);
+        assert_eq!(out.document.sig_key_idx, out.new_key_idx);
+        assert_eq!(out.document.identity_keys.len(), 2);
+        verify_identity_document(&out.document, DELEGATE_NOW)
+            .expect("a self-delegated document must verify");
+        // Both devices are in it, and the identity did not move.
+        let keys: Vec<&Vec<u8>> = out.document.identity_keys.iter().map(|k| &k.pubkey).collect();
+        assert!(keys.contains(&&device_pubkey(&a)));
+        assert!(keys.contains(&&device_pubkey(&b)));
+    }
+
+    #[test]
+    fn delegate_device_refuses_a_master_that_is_not_this_identity() {
+        let seed = create_identity(test_opts(tempdir())).unwrap().master_seed;
+        let other = create_identity(test_opts(tempdir())).unwrap().master_seed;
+        let a = tempdir();
+        let b = tempdir();
+        provision(a.clone(), seed.clone());
+        provision(b.clone(), seed);
+
+        // A wrong phrase must fail HERE. Left unchecked it produces a document
+        // that verifies against a different identity, and the fault surfaces
+        // much later as peers refusing a node they cannot resolve.
+        let err = delegate_device(delegate_opts(a, other, device_pubkey(&b))).unwrap_err();
+        assert!(
+            matches!(err, DelegateDeviceError::WrongMaster { .. }),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn delegate_device_refuses_a_key_already_in_the_document() {
+        let seed = create_identity(test_opts(tempdir())).unwrap().master_seed;
+        let a = tempdir();
+        provision(a.clone(), seed.clone());
+        let own = device_pubkey(&a);
+        let err = delegate_device(delegate_opts(a, seed, own)).unwrap_err();
+        assert!(
+            matches!(err, DelegateDeviceError::AlreadyPresent { idx: 0 }),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn delegate_device_refuses_a_pubkey_of_the_wrong_length() {
+        let seed = create_identity(test_opts(tempdir())).unwrap().master_seed;
+        let a = tempdir();
+        provision(a.clone(), seed.clone());
+        let err = delegate_device(delegate_opts(a, seed, vec![7u8; 31])).unwrap_err();
+        assert!(
+            matches!(err, DelegateDeviceError::PubkeyLength(31)),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn delegate_device_refuses_a_freshness_window_out_of_range() {
+        let seed = create_identity(test_opts(tempdir())).unwrap().master_seed;
+        let a = tempdir();
+        let b = tempdir();
+        provision(a.clone(), seed.clone());
+        provision(b.clone(), seed.clone());
+        let mut opts = delegate_opts(a.clone(), seed.clone(), device_pubkey(&b));
+        opts.valid_until_unix = opts.now_unix; // zero window
+        assert!(matches!(
+            delegate_device(opts).unwrap_err(),
+            DelegateDeviceError::FreshnessWindowTooLong { secs: 0 }
+        ));
+
+        let mut opts = delegate_opts(a, seed, device_pubkey(&b));
+        opts.valid_until_unix = opts.now_unix + MAX_FRESHNESS_WINDOW_SECS + 1;
+        assert!(matches!(
+            delegate_device(opts).unwrap_err(),
+            DelegateDeviceError::FreshnessWindowTooLong { .. }
+        ));
+    }
+
+    #[test]
+    fn delegate_device_says_so_when_there_is_no_document() {
+        let seed = create_identity(test_opts(tempdir())).unwrap().master_seed;
+        let empty = tempdir();
+        let err = delegate_device(delegate_opts(empty, seed, vec![9u8; 32])).unwrap_err();
+        assert!(
+            matches!(err, DelegateDeviceError::NoDocument(_)),
+            "got {err:?}"
+        );
     }
 
     // ── hybrid create_identity ─────────────────────────────────

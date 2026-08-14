@@ -2076,15 +2076,9 @@ fn delegate_device<I: CommandIo>(
     io: &mut I,
     args: super::cli::IdentityDelegateDeviceArgs,
 ) -> std::result::Result<(), IdentityCliError> {
-    use ed25519_dalek::{Signer, SigningKey};
     use veil_cfg::identity_master::decode_master_seed_from_phrase;
     use veil_cfg::identity_master_file::load_master_seed_encrypted;
-    use veil_crypto::identity::{
-        certify_message as build_certify, compute_node_id, derive_master_sk_ed25519,
-    };
-    use veil_proto::identity_document::{
-        ALGO_ED25519, DOC_SIG_CONTEXT, IdentityKey, MAX_FRESHNESS_WINDOW_SECS, MAX_IDENTITY_KEYS,
-    };
+    use veil_proto::identity_document::MAX_FRESHNESS_WINDOW_SECS;
     use zeroize::Zeroizing;
 
     let veil_dir = resolve_dir(args.veil_dir.as_deref())?;
@@ -2098,44 +2092,14 @@ fn delegate_device<I: CommandIo>(
     }
     let valid_until = now.saturating_add(window);
 
-    // 1. Load + decode existing document.
-    let doc_path = veil_dir.join(IDENTITY_DOCUMENT_FILE);
-    if !doc_path.exists() {
-        return Err(IdentityCliError::NoDocument(doc_path));
-    }
-    let bytes = fs::read(&doc_path)?;
-    let mut doc = IdentityDocument::decode(&bytes)
-        .map_err(|e| IdentityCliError::DocumentDecode(e.to_string()))?;
-
-    // 2. Cap check.
-    if doc.identity_keys.len() >= MAX_IDENTITY_KEYS {
-        return Err(IdentityCliError::DelegateDevice(format!(
-            "MAX_IDENTITY_KEYS ({MAX_IDENTITY_KEYS}) would be exceeded \
-             (current = {})",
-            doc.identity_keys.len(),
-        )));
-    }
-
-    // 3. Read the new device's pubkey (raw 32 bytes OR 64 hex chars).
+    // The document, the cap check, the master match, the certificate and the
+    // re-signing all live in `veil_identity::sovereign_flow::delegate_device`.
+    // They used to live HERE, in full, which meant no library caller — and so
+    // no embedding application — could admit a device at all. An app that
+    // cannot do this has no way to hold one identity on two devices: each one
+    // publishes its own single-key document under the same node_id and the
+    // later publisher silently displaces the other.
     let device_pubkey = read_pubkey_file(&args.pubkey_file)?;
-    if device_pubkey.len() != 32 {
-        return Err(IdentityCliError::PubkeyFile(format!(
-            "expected 32 bytes, got {}",
-            device_pubkey.len(),
-        )));
-    }
-    // Reject the obvious self-delegation footgun: master is already
-    // identity_keys[0] in standalone docs; delegating to a key that
-    // matches an existing subkey would be wasted bytes.
-    for (idx, k) in doc.identity_keys.iter().enumerate() {
-        if k.pubkey == device_pubkey {
-            return Err(IdentityCliError::DelegateDevice(format!(
-                "device pubkey already present as identity_keys[{idx}] — \
-                 use `identity rotate` to extend its validity instead"
-            )));
-        }
-    }
-    let device_id = compute_node_id(&device_pubkey);
 
     // 4. Load master_sk from --password-file OR --phrase-file (xor).
     if args.password_file.is_some() && args.phrase_file.is_some() {
@@ -2161,68 +2125,30 @@ fn delegate_device<I: CommandIo>(
         ));
     };
 
-    // 5. Verify master matches the document's node_id.
-    let master_sk_bytes = derive_master_sk_ed25519(&master_seed);
-    let master_sk = SigningKey::from_bytes(&master_sk_bytes);
-    let master_pk = master_sk.verifying_key();
-    let computed_node_id = compute_node_id(master_pk.as_bytes());
-    if computed_node_id != doc.node_id {
-        return Err(IdentityCliError::DelegateDevice(format!(
-            "master_seed does not match the existing identity: \
-             computed node_id {} but document carries {}",
-            hex_encode(&computed_node_id),
-            hex_encode(&doc.node_id),
-        )));
-    }
-
-    // 6. Master signs the new delegation cert.
-    let cert_msg = build_certify(
-        &doc.node_id,
-        ALGO_ED25519,
-        &device_pubkey,
-        &device_id,
-        now,
-        valid_until,
-    );
-    let cert_sig = master_sk.sign(&cert_msg);
-
-    // 7. Append the new IdentityKey. We do NOT bump sig_key_idx —
-    // the source device keeps signing with its own subkey. The
-    // target device, after receiving this updated doc + a
-    // `device_sig_key_idx.bin` override (currently produced by
-    // the pairing flow, can also be hand-written), will pick up
-    // its own subkey index.
-    doc.identity_keys.push(IdentityKey {
-        algo: ALGO_ED25519,
-        pubkey: device_pubkey.clone(),
-        device_id,
-        valid_from_unix: now,
-        valid_until_unix: valid_until,
-        master_sig: cert_sig.to_bytes().to_vec(),
-    });
-    let new_idx = (doc.identity_keys.len() - 1) as u16;
-
-    // 8. Re-sign the document with the source device's identity_sk
-    // (still the active subkey at doc.sig_key_idx).
-    use veil_cfg::sovereign_flow::load_identity_sk;
-    let active_seed = load_identity_sk(&veil_dir)
-        .map_err(|e| IdentityCliError::DelegateDevice(format!("load identity_sk: {e}")))?;
-    let active_sk = SigningKey::from_bytes(active_seed.as_array());
-    doc.issued_at_unix = now;
-    // Bump the document-level window forward to whichever is larger:
-    // the existing window or the freshly-delegated subkey's window.
-    if valid_until > doc.valid_until_unix {
-        doc.valid_until_unix = valid_until;
-    }
-    let mut doc_msg = Vec::with_capacity(DOC_SIG_CONTEXT.len() + 512);
-    doc_msg.extend_from_slice(DOC_SIG_CONTEXT);
-    doc_msg.extend_from_slice(&doc.canonical_signing_bytes());
-    doc.document_sig = active_sk.sign(&doc_msg).to_bytes().to_vec();
-
-    // 9. Write updated document.
     let used_out_override = args.out.is_some();
-    let out_path = args.out.unwrap_or_else(|| doc_path.clone());
-    veil_util::atomic_write(&out_path, &doc.encode())?;
+    let doc_path = veil_dir.join(IDENTITY_DOCUMENT_FILE);
+    let out_path = args.out.clone().unwrap_or_else(|| doc_path.clone());
+    let delegated = veil_cfg::sovereign_flow::delegate_device(
+        veil_cfg::sovereign_flow::DelegateDeviceOptions {
+            veil_dir: veil_dir.clone(),
+            master_seed,
+            device_pubkey: device_pubkey.clone(),
+            now_unix: now,
+            valid_until_unix: valid_until,
+            out_path: args.out.clone(),
+        },
+    )
+    .map_err(|e| match e {
+        veil_identity::sovereign_flow::DelegateDeviceError::NoDocument(p) => {
+            IdentityCliError::NoDocument(p)
+        }
+        veil_identity::sovereign_flow::DelegateDeviceError::PubkeyLength(n) => {
+            IdentityCliError::PubkeyFile(format!("expected 32 bytes, got {n}"))
+        }
+        other => IdentityCliError::DelegateDevice(other.to_string()),
+    })?;
+    let doc = delegated.document;
+    let new_idx = delegated.new_key_idx;
 
     io.emit(OutputEvent::message(format!(
         "delegated device {} for node_id {}",
