@@ -169,6 +169,26 @@ pub struct Config {
 }
 
 impl Config {
+    /// Where this node's identity material lives: `[global] identity_dir` when
+    /// the operator (or an embedding host) named one, otherwise the directory
+    /// holding the config file, which is what it has always been.
+    ///
+    /// One function rather than the six copies of `config_path.parent()` that
+    /// grew across the runtime: an identity directory that half the code agrees
+    /// on is worse than none, because the loader would find a document and a
+    /// republisher would not.
+    pub fn identity_dir_for(&self, config_path: &std::path::Path) -> std::path::PathBuf {
+        if let Some(dir) = &self.global.identity_dir
+            && !dir.is_empty()
+        {
+            return std::path::PathBuf::from(dir);
+        }
+        config_path
+            .parent()
+            .unwrap_or(std::path::Path::new("."))
+            .to_path_buf()
+    }
+
     fn default_persist_enabled() -> bool {
         true
     }
@@ -3764,6 +3784,23 @@ pub struct GlobalConfig {
     #[serde(default, skip_serializing_if = "is_default_legacy_allow")]
     pub allow_identity_fallback: bool,
 
+    /// Where this node's identity material lives — `identity_document.bin`,
+    /// `device_identity_sk.bin`, `instance_id`, the ML-KEM key, persisted name
+    /// claims. Defaults to the config file's own directory, which is what every
+    /// operator-run node wants and what this has always meant.
+    ///
+    /// It is separable because for an EMBEDDED host the two are not the same
+    /// place and cannot be made the same place. Deferred init stages the config
+    /// in a per-boot temp directory created by this crate — random name, 0700,
+    /// scrubbed on shutdown — so a host that provisions an identity of its own
+    /// has nowhere to put it: the directory does not exist when it is
+    /// provisioning, and it is gone by the next boot. Such a host would silently
+    /// get the degenerate `master_pk == device_pk` document instead, which is
+    /// indistinguishable from "no identity was provisioned" in every log line
+    /// it produces.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity_dir: Option<String>,
+
     /// **Phase 10 slice 2c** — TLS ECH GREASE on outbound public-PKI
     /// HTTPS connections (currently the bootstrap fetch path).  When
     /// `true`, the client adds an Encrypted Client Hello GREASE
@@ -3850,6 +3887,7 @@ impl Default for GlobalConfig {
             log_format: LogFormat::default(),
             bootstrap_dns_domain: None,
             allow_identity_fallback: false,
+            identity_dir: None,
             discovered_peers_cache_path: None,
             bootstrap_https_urls: Vec::new(),
             bootstrap_tor_socks_proxy: None,
