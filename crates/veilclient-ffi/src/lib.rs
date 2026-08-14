@@ -8438,6 +8438,143 @@ pub unsafe extern "C" fn veil_restore_identity_from_phrase_zeroize(
     }
 }
 
+/// Admit a device to the identity whose `identity_document.bin` is in
+/// `veil_dir`, appending its key under the master derived from `phrase` and
+/// rewriting the document in place.
+///
+/// This is what lets one identity hold several devices, and the alternative is
+/// not "one document each". `node_id` is BLAKE3(master_pk), so two devices
+/// restored from one phrase publish two single-key documents under the SAME id;
+/// the later publisher displaces the earlier, and the displaced device stays
+/// online believing it is reachable.
+///
+/// `device_pubkey` may be NULL, and for an embedding application that is the
+/// usual call: it means "this device's own key", read from
+/// `device_identity_sk.bin` in `veil_dir`, so the caller never handles key
+/// material at all. The flow it serves is a merge — a device restored from the
+/// phrase receives the other device's document, drops it into `veil_dir`, and
+/// calls this to add itself. The previous signer's secret is on the other
+/// machine, so the document is re-signed by the newly delegated key and
+/// `sig_key_idx` moves to it; every subkey is master-signed, so a verifier
+/// accepts either.
+///
+/// `phrase` is a SECRET, passed as a writable `(*mut u8, len)` buffer that is
+/// overwritten with `0` before return on EVERY path. Returns `VEIL_OK` on
+/// success; on failure sets `*err_out` and returns `VEIL_ERR`. Refuses, rather
+/// than guesses, when the phrase belongs to a different identity than the
+/// document does.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn veil_delegate_device_from_phrase_zeroize(
+    phrase: *mut u8,
+    phrase_len: usize,
+    veil_dir: *const u8,
+    veil_dir_len: usize,
+    device_pubkey: *const u8,
+    device_pubkey_len: usize,
+    err_out: *mut *mut c_char,
+) -> c_int {
+    unsafe {
+        clear_err(err_out);
+    }
+    if phrase.is_null() {
+        unsafe {
+            write_err(err_out, "phrase is NULL");
+        }
+        return VEIL_ERR_INVALID_ARG;
+    }
+    if phrase_len > MAX_FFI_CSTR_LEN {
+        unsafe {
+            write_err(err_out, "phrase too long (>4 KiB)");
+        }
+        return VEIL_ERR_INVALID_ARG;
+    }
+
+    struct ZeroOnDrop {
+        ptr: *mut u8,
+        len: usize,
+    }
+    impl Drop for ZeroOnDrop {
+        fn drop(&mut self) {
+            unsafe { volatile_wipe(self.ptr, self.len) };
+        }
+    }
+    let _guard = ZeroOnDrop {
+        ptr: phrase,
+        len: phrase_len,
+    };
+
+    let phrase_bytes = unsafe { std::slice::from_raw_parts(phrase as *const u8, phrase_len) };
+    let phrase_str = match std::str::from_utf8(phrase_bytes) {
+        Ok(s) => s,
+        Err(_) => {
+            unsafe {
+                write_err(err_out, "phrase is not valid UTF-8");
+            }
+            return VEIL_ERR_INVALID_ARG;
+        }
+    };
+    let Some(dir_str) = (unsafe { slice_to_str(veil_dir, veil_dir_len) }) else {
+        unsafe {
+            write_err(err_out, "veil_dir is NULL or invalid UTF-8");
+        }
+        return VEIL_ERR_INVALID_ARG;
+    };
+    let dir = std::path::PathBuf::from(dir_str);
+
+    // NULL means "my own key". Resolved here rather than left to the caller so
+    // an application never has to load, carry or pass a signing key.
+    let pubkey: Vec<u8> = if device_pubkey.is_null() {
+        match veil_identity::sovereign_flow::load_identity_sk(&dir) {
+            Ok(seed) => ed25519_dalek::SigningKey::from_bytes(seed.as_array())
+                .verifying_key()
+                .as_bytes()
+                .to_vec(),
+            Err(e) => {
+                unsafe {
+                    write_err(err_out, format!("load own device key: {e}"));
+                }
+                return VEIL_ERR;
+            }
+        }
+    } else {
+        unsafe { std::slice::from_raw_parts(device_pubkey, device_pubkey_len) }.to_vec()
+    };
+
+    let master_seed = match veil_identity::master_seed::decode_master_seed_from_phrase(phrase_str) {
+        Ok(s) => s,
+        Err(e) => {
+            unsafe {
+                write_err(err_out, format!("decode phrase: {e}"));
+            }
+            return VEIL_ERR;
+        }
+    };
+
+    let now_unix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+
+    match veil_identity::sovereign_flow::delegate_device(
+        veil_identity::sovereign_flow::DelegateDeviceOptions {
+            veil_dir: dir,
+            master_seed,
+            device_pubkey: pubkey,
+            now_unix,
+            valid_until_unix: now_unix + VEIL_DEFAULT_RESTORE_VALIDITY_SECS,
+            out_path: None,
+        },
+    ) {
+        Ok(_output) => VEIL_OK,
+        Err(e) => {
+            unsafe {
+                write_err(err_out, format!("delegate_device: {e}"));
+            }
+            VEIL_ERR
+        }
+    }
+}
+
 /// Restore identity AND write an encrypted master-seed backup
 /// ([`veil_restore_identity_from_phrase_zeroize`] + passphrase-protected
 /// `master.enc` file in `veil_dir`).
