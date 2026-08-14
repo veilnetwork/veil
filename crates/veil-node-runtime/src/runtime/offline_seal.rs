@@ -72,38 +72,6 @@ fn local_verified_cert(
     })
 }
 
-/// Who a mailbox blob is sealed for.
-///
-/// Named rather than passed as a bool because the two are not "the same thing
-/// with a flag": one addresses somebody else, the other addresses the rest of
-/// ourselves, and the second could not be expressed at all until now.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum MailboxAudience {
-    /// The recipient identity's devices. Addressed to our OWN id this means
-    /// our own instance -- a normal first-document operation.
-    Recipient,
-    /// Every OTHER device of our identity, the active one excluded.
-    ///
-    /// What "carry this to my other device" means, and what had no spelling
-    /// before: sealing to our own id produced a copy for ourselves and for
-    /// nobody else, so a device group could never deliver anything to the
-    /// device it had just linked.
-    MyOtherDevices,
-}
-
-/// The recipient set for [`MailboxAudience::MyOtherDevices`].
-///
-/// Pure, so the rule that decides who a sync reaches is testable without a
-/// runtime, a DHT or a second device.
-pub(crate) fn other_device_certs(
-    all: Vec<VerifiedMlkemCert>,
-    active_instance: [u8; 16],
-) -> Vec<VerifiedMlkemCert> {
-    all.into_iter()
-        .filter(|cert| cert.instance_id != active_instance)
-        .collect()
-}
-
 /// Failure of a runtime offline seal/open.
 #[derive(Debug, thiserror::Error)]
 pub enum OfflineSealError {
@@ -163,25 +131,6 @@ impl RuntimeMailboxCrypto {
         endpoint_id: u32,
         data: &[u8],
     ) -> Result<Vec<u8>, OfflineSealError> {
-        self.seal_for(
-            MailboxAudience::Recipient,
-            recipient_node_id,
-            app_id,
-            endpoint_id,
-            data,
-        )
-        .await
-    }
-
-    /// [`seal`], with the audience said out loud. See [`MailboxAudience`].
-    pub async fn seal_for(
-        &self,
-        audience: MailboxAudience,
-        recipient_node_id: [u8; 32],
-        app_id: [u8; 32],
-        endpoint_id: u32,
-        data: &[u8],
-    ) -> Result<Vec<u8>, OfflineSealError> {
         let sovereign = self
             .sovereign
             .as_ref()
@@ -200,18 +149,7 @@ impl RuntimeMailboxCrypto {
         // Sealing to ourselves is a normal first-document operation. Never
         // depend on a DHT round-trip for our own certificate: the runtime owns
         // the exact DK seed and sovereign instance binding already.
-        let certs: Vec<_> = if audience == MailboxAudience::MyOtherDevices {
-            // Our OWN identity resolved the same way a peer's is -- the registry
-            // is what knows our other devices; the runtime only knows itself.
-            // Then the active instance comes out, so a sender never deposits
-            // for the device it is sending from.
-            other_device_certs(
-                self.mlkem_resolver()
-                    .fetch_verified_certs(self.local_node_id)
-                    .await,
-                sovereign.active_instance_id(),
-            )
-        } else if recipient_node_id == self.local_node_id {
+        let certs: Vec<_> = if recipient_node_id == self.local_node_id {
             vec![local_verified_cert(
                 self.local_node_id,
                 sovereign.active_instance_id(),
@@ -556,46 +494,5 @@ mod tests {
         assert_eq!(cert.instance_id, instance_id);
         assert_eq!(cert.cert_version, LOCAL_MLKEM_CERT_VERSION);
         assert_eq!(cert.mlkem_pubkey.len(), veil_e2e::EK_BYTES);
-    }
-}
-
-#[cfg(test)]
-mod audience_tests {
-    use super::*;
-
-    fn cert(instance_byte: u8) -> VerifiedMlkemCert {
-        VerifiedMlkemCert {
-            node_id: [9u8; 32],
-            instance_id: [instance_byte; 16],
-            mlkem_algo: veil_proto::prekey_bundle::ALGO_ML_KEM_768,
-            mlkem_pubkey: vec![1, 2, 3],
-            ratchet_x25519_pubkey: [4u8; 32],
-            cert_version: 1,
-        }
-    }
-
-    /// The point of the whole exercise: a sync addressed at "my devices"
-    /// reaches the others and not the sender.
-    #[test]
-    fn the_sending_device_is_not_one_of_its_own_recipients() {
-        let out = other_device_certs(vec![cert(0xAA), cert(0xBB), cert(0xCC)], [0xBB; 16]);
-        let ids: Vec<_> = out.iter().map(|c| c.instance_id[0]).collect();
-        assert_eq!(ids, vec![0xAA, 0xCC]);
-    }
-
-    /// A lone device syncing to "my other devices" has none. Empty is the
-    /// honest answer -- the caller fails the send rather than depositing a
-    /// blob addressed to nobody.
-    #[test]
-    fn a_lone_device_has_no_other_devices() {
-        assert!(other_device_certs(vec![cert(0x11)], [0x11; 16]).is_empty());
-    }
-
-    /// Every device kept when ours is not in the set: a registry that has not
-    /// caught up with this instance yet must not silently drop a recipient.
-    #[test]
-    fn an_unlisted_sender_removes_nobody() {
-        let out = other_device_certs(vec![cert(1), cert(2)], [0xEE; 16]);
-        assert_eq!(out.len(), 2);
     }
 }
