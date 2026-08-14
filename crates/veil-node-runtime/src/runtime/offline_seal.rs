@@ -91,16 +91,16 @@ pub enum MailboxAudience {
     MyOtherDevices,
 }
 
-/// The recipient set for [`MailboxAudience::MyOtherDevices`].
+/// Which of our instances are NOT the one asking.
 ///
 /// Pure, so the rule that decides who a sync reaches is testable without a
 /// runtime, a DHT or a second device.
-pub(crate) fn other_device_certs(
-    all: Vec<VerifiedMlkemCert>,
-    active_instance: [u8; 16],
-) -> Vec<VerifiedMlkemCert> {
+pub(crate) fn other_instances(
+    all: Vec<veil_proto::instance_registry::InstanceEntry>,
+    active: [u8; 16],
+) -> Vec<veil_proto::instance_registry::InstanceEntry> {
     all.into_iter()
-        .filter(|cert| cert.instance_id != active_instance)
+        .filter(|entry| entry.instance_id != active)
         .collect()
 }
 
@@ -201,16 +201,26 @@ impl RuntimeMailboxCrypto {
         // depend on a DHT round-trip for our own certificate: the runtime owns
         // the exact DK seed and sovereign instance binding already.
         let certs: Vec<_> = if audience == MailboxAudience::MyOtherDevices {
-            // Our OWN identity resolved the same way a peer's is -- the registry
-            // is what knows our other devices; the runtime only knows itself.
-            // Then the active instance comes out, so a sender never deposits
-            // for the device it is sending from.
-            other_device_certs(
+            // OUR devices come from the document this runtime already holds,
+            // not from a DHT walk about ourselves. Measured on a two-device
+            // stand: the registry said instances=2 and resolving our own id
+            // through the network still returned nothing, so every deposit was
+            // addressed to no one. We know our devices; only their CERTS are
+            // theirs to publish.
+            let mine = sovereign.active_instance_id();
+            let others = other_instances(sovereign.all_instance_entries(), mine);
+            if others.is_empty() {
+                Vec::new()
+            } else {
                 self.mlkem_resolver()
-                    .fetch_verified_certs(self.local_node_id)
-                    .await,
-                sovereign.active_instance_id(),
-            )
+                    .certs_for_instances(
+                        self.local_node_id,
+                        &sovereign.document,
+                        &others,
+                        now,
+                    )
+                    .await
+            }
         } else if recipient_node_id == self.local_node_id {
             vec![local_verified_cert(
                 self.local_node_id,
@@ -576,14 +586,12 @@ mod tests {
 mod audience_tests {
     use super::*;
 
-    fn cert(instance_byte: u8) -> VerifiedMlkemCert {
-        VerifiedMlkemCert {
-            node_id: [9u8; 32],
+    fn entry(instance_byte: u8) -> veil_proto::instance_registry::InstanceEntry {
+        veil_proto::instance_registry::InstanceEntry {
             instance_id: [instance_byte; 16],
-            mlkem_algo: veil_proto::prekey_bundle::ALGO_ML_KEM_768,
-            mlkem_pubkey: vec![1, 2, 3],
-            ratchet_x25519_pubkey: [4u8; 32],
-            cert_version: 1,
+            bound_identity_key_idx: 0,
+            label: String::new(),
+            last_seen_unix_ms: 0,
         }
     }
 
@@ -591,8 +599,8 @@ mod audience_tests {
     /// reaches the others and not the sender.
     #[test]
     fn the_sending_device_is_not_one_of_its_own_recipients() {
-        let out = other_device_certs(vec![cert(0xAA), cert(0xBB), cert(0xCC)], [0xBB; 16]);
-        let ids: Vec<_> = out.iter().map(|c| c.instance_id[0]).collect();
+        let out = other_instances(vec![entry(0xAA), entry(0xBB), entry(0xCC)], [0xBB; 16]);
+        let ids: Vec<_> = out.iter().map(|e| e.instance_id[0]).collect();
         assert_eq!(ids, vec![0xAA, 0xCC]);
     }
 
@@ -601,14 +609,13 @@ mod audience_tests {
     /// blob addressed to nobody.
     #[test]
     fn a_lone_device_has_no_other_devices() {
-        assert!(other_device_certs(vec![cert(0x11)], [0x11; 16]).is_empty());
+        assert!(other_instances(vec![entry(0x11)], [0x11; 16]).is_empty());
     }
 
-    /// Every device kept when ours is not in the set: a registry that has not
+    /// Everyone kept when ours is not in the set: a document that has not
     /// caught up with this instance yet must not silently drop a recipient.
     #[test]
     fn an_unlisted_sender_removes_nobody() {
-        let out = other_device_certs(vec![cert(1), cert(2)], [0xEE; 16]);
-        assert_eq!(out.len(), 2);
+        assert_eq!(other_instances(vec![entry(1), entry(2)], [0xEE; 16]).len(), 2);
     }
 }
