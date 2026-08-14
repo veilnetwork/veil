@@ -8646,50 +8646,10 @@ pub unsafe extern "C" fn veil_delegate_device_from_config_zeroize(
     };
     let dir = std::path::PathBuf::from(dir_str);
 
-    let config = match veil_cfg::parse_toml_str(toml) {
-        Ok(c) => c,
-        Err(e) => {
-            unsafe {
-                write_err(err_out, format!("config parse failed: {e}"));
-            }
-            return VEIL_ERR_INVALID_ARG;
-        }
+    let master_sk = match master_signing_key_from_config(toml, err_out) {
+        Ok(k) => k,
+        Err(rc) => return rc,
     };
-    let Some(identity) = config.identity else {
-        unsafe {
-            write_err(err_out, "config carries no [identity]");
-        }
-        return VEIL_ERR_INVALID_ARG;
-    };
-    if identity.algo != veil_types::SignatureAlgorithm::Ed25519 {
-        unsafe {
-            write_err(err_out, "delegation requires an Ed25519 identity");
-        }
-        return VEIL_ERR_INVALID_ARG;
-    }
-    let sk_bytes: zeroize::Zeroizing<Vec<u8>> = {
-        use base64::Engine as _;
-        match base64::engine::general_purpose::STANDARD.decode(identity.private_key.as_str()) {
-            Ok(v) => zeroize::Zeroizing::new(v),
-            Err(e) => {
-                unsafe {
-                    write_err(err_out, format!("private_key decode failed: {e}"));
-                }
-                return VEIL_ERR_INVALID_ARG;
-            }
-        }
-    };
-    if sk_bytes.len() != 32 {
-        unsafe {
-            write_err(
-                err_out,
-                format!("private_key must be 32 bytes, got {}", sk_bytes.len()),
-            );
-        }
-        return VEIL_ERR_INVALID_ARG;
-    }
-    let mut master_sk = zeroize::Zeroizing::new([0u8; 32]);
-    master_sk.copy_from_slice(&sk_bytes);
 
     let pubkey: Vec<u8> = if device_pubkey.is_null() {
         match veil_identity::sovereign_flow::load_identity_sk(&dir) {
@@ -8731,6 +8691,164 @@ pub unsafe extern "C" fn veil_delegate_device_from_config_zeroize(
             VEIL_ERR
         }
     }
+}
+
+/// Merge an identity document received from another device of this identity
+/// into `veil_dir`, using the master secret in this node's own config.
+///
+/// ONE call for both directions, because they are not symmetric and getting
+/// only one of them right leaves the other device exactly where it started.
+/// The device that merges first receives a document naming only the other and
+/// appends itself. The device that merges second receives one that already
+/// names it — nothing to append. Either way this records
+/// `device_sig_key_idx.bin`: `sig_key_idx` inside the document names whichever
+/// subkey signed it, so a device that stores such a document without recording
+/// its OWN index signs with a key it does not have, the loader rejects the
+/// mismatch, and the node comes up with no identity at all.
+///
+/// Refuses — writing nothing — a document that does not decode, does not
+/// verify, or belongs to a different identity.
+///
+/// `config_toml` is a SECRET and is wiped in place before return on every
+/// path. On success writes the resulting subkey index to `*key_idx_out` when
+/// that pointer is non-NULL. Behind `node-embedded`, like its sibling.
+#[cfg(feature = "node-embedded")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn veil_adopt_identity_document_from_config_zeroize(
+    config_toml: *mut u8,
+    config_toml_len: usize,
+    veil_dir: *const u8,
+    veil_dir_len: usize,
+    document: *const u8,
+    document_len: usize,
+    key_idx_out: *mut u16,
+    err_out: *mut *mut c_char,
+) -> c_int {
+    unsafe {
+        clear_err(err_out);
+    }
+    if config_toml.is_null() || document.is_null() {
+        unsafe {
+            write_err(err_out, "config_toml or document is NULL");
+        }
+        return VEIL_ERR_INVALID_ARG;
+    }
+
+    struct ZeroOnDrop {
+        ptr: *mut u8,
+        len: usize,
+    }
+    impl Drop for ZeroOnDrop {
+        fn drop(&mut self) {
+            unsafe { volatile_wipe(self.ptr, self.len) };
+        }
+    }
+    let _guard = ZeroOnDrop {
+        ptr: config_toml,
+        len: config_toml_len,
+    };
+
+    let toml_bytes =
+        unsafe { std::slice::from_raw_parts(config_toml as *const u8, config_toml_len) };
+    let Ok(toml) = std::str::from_utf8(toml_bytes) else {
+        unsafe {
+            write_err(err_out, "config_toml is not valid UTF-8");
+        }
+        return VEIL_ERR_INVALID_ARG;
+    };
+    let Some(dir_str) = (unsafe { slice_to_str(veil_dir, veil_dir_len) }) else {
+        unsafe {
+            write_err(err_out, "veil_dir is NULL or invalid UTF-8");
+        }
+        return VEIL_ERR_INVALID_ARG;
+    };
+    let incoming = unsafe { std::slice::from_raw_parts(document, document_len) };
+
+    let master_sk = match master_signing_key_from_config(toml, err_out) {
+        Ok(k) => k,
+        Err(rc) => return rc,
+    };
+
+    let now_unix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+
+    match veil_identity::sovereign_flow::adopt_identity_document(
+        std::path::Path::new(dir_str),
+        incoming,
+        veil_identity::sovereign_flow::MasterSecret::SigningKey(master_sk),
+        now_unix,
+        now_unix + VEIL_DEFAULT_RESTORE_VALIDITY_SECS,
+    ) {
+        Ok(outcome) => {
+            if !key_idx_out.is_null() {
+                unsafe { *key_idx_out = outcome.key_idx() };
+            }
+            VEIL_OK
+        }
+        Err(e) => {
+            unsafe {
+                write_err(err_out, format!("adopt_identity_document: {e}"));
+            }
+            VEIL_ERR
+        }
+    }
+}
+
+/// The master Ed25519 secret out of a node config, or the `VEIL_ERR_*` to
+/// return. Shared by the two config-taking identity entry points so they
+/// cannot drift on what counts as a usable config.
+#[cfg(feature = "node-embedded")]
+fn master_signing_key_from_config(
+    toml: &str,
+    err_out: *mut *mut c_char,
+) -> Result<zeroize::Zeroizing<[u8; 32]>, c_int> {
+    let config = match veil_cfg::parse_toml_str(toml) {
+        Ok(c) => c,
+        Err(e) => {
+            unsafe {
+                write_err(err_out, format!("config parse failed: {e}"));
+            }
+            return Err(VEIL_ERR_INVALID_ARG);
+        }
+    };
+    let Some(identity) = config.identity else {
+        unsafe {
+            write_err(err_out, "config carries no [identity]");
+        }
+        return Err(VEIL_ERR_INVALID_ARG);
+    };
+    if identity.algo != veil_types::SignatureAlgorithm::Ed25519 {
+        unsafe {
+            write_err(err_out, "delegation requires an Ed25519 identity");
+        }
+        return Err(VEIL_ERR_INVALID_ARG);
+    }
+    let decoded: zeroize::Zeroizing<Vec<u8>> = {
+        use base64::Engine as _;
+        match base64::engine::general_purpose::STANDARD.decode(identity.private_key.as_str()) {
+            Ok(v) => zeroize::Zeroizing::new(v),
+            Err(e) => {
+                unsafe {
+                    write_err(err_out, format!("private_key decode failed: {e}"));
+                }
+                return Err(VEIL_ERR_INVALID_ARG);
+            }
+        }
+    };
+    if decoded.len() != 32 {
+        unsafe {
+            write_err(
+                err_out,
+                format!("private_key must be 32 bytes, got {}", decoded.len()),
+            );
+        }
+        return Err(VEIL_ERR_INVALID_ARG);
+    }
+    let mut out = zeroize::Zeroizing::new([0u8; 32]);
+    out.copy_from_slice(&decoded);
+    Ok(out)
 }
 
 /// Restore identity AND write an encrypted master-seed backup

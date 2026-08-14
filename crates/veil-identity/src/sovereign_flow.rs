@@ -1848,6 +1848,118 @@ pub fn delegate_device(
     })
 }
 
+#[derive(Debug, thiserror::Error)]
+pub enum AdoptDocumentError {
+    #[error("io: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("incoming document decode: {0}")]
+    DocumentDecode(String),
+    #[error("incoming document does not verify: {0}")]
+    Verify(String),
+    #[error(
+        "incoming document is a different identity: it carries node_id {incoming}, \
+         this master derives {mine}"
+    )]
+    DifferentIdentity { incoming: String, mine: String },
+    #[error("delegation: {0}")]
+    Delegate(#[from] DelegateDeviceError),
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum AdoptOutcome {
+    /// The incoming document already named this device: taken as it stands.
+    Adopted { key_idx: u16 },
+    /// It did not: this device appended itself under the master.
+    Delegated { key_idx: u16 },
+}
+
+impl AdoptOutcome {
+    pub fn key_idx(&self) -> u16 {
+        match self {
+            Self::Adopted { key_idx } | Self::Delegated { key_idx } => *key_idx,
+        }
+    }
+}
+
+/// Merge a document received from another device of the same identity with
+/// this device's own state. Idempotent, and safe to run in either direction.
+///
+/// Both directions occur and they are NOT symmetric. The device that merges
+/// first receives a document naming only the other and has to append itself.
+/// The device that merges second receives one that already names it — nothing
+/// to append, and nothing it could append, since the key is already there.
+/// Handling only the first case leaves the second device on its old single-key
+/// document, which is the state this whole mechanism exists to leave behind.
+///
+/// Either way this writes `device_sig_key_idx.bin`, and that file is the part
+/// that is easy to miss. `sig_key_idx` inside the document names whichever
+/// subkey signed it — the OTHER device's, in the adopt case. A device that
+/// stores such a document without recording its own index tries to sign with a
+/// key it does not have, `SovereignIdentity::load_from_dir` rejects the
+/// mismatch, and the node fails closed: no identity at all, from a merge that
+/// looked like it worked.
+pub fn adopt_identity_document(
+    veil_dir: &Path,
+    incoming_bytes: &[u8],
+    master: MasterSecret,
+    now_unix: u64,
+    valid_until_unix: u64,
+) -> Result<AdoptOutcome, AdoptDocumentError> {
+    let incoming = IdentityDocument::decode(incoming_bytes)
+        .map_err(|e| AdoptDocumentError::DocumentDecode(e.to_string()))?;
+    // Verified BEFORE anything is written. An unverifiable document from a
+    // device that is not what the ceremony took it for must not reach disk.
+    crate::verify::verify_identity_document(&incoming, now_unix)
+        .map_err(|e| AdoptDocumentError::Verify(e.to_string()))?;
+
+    let master_sk = match &master {
+        MasterSecret::Seed(seed) => SigningKey::from_bytes(&derive_master_sk_ed25519(seed)),
+        MasterSecret::SigningKey(sk) => SigningKey::from_bytes(sk),
+    };
+    let mine = compute_node_id(master_sk.verifying_key().as_bytes());
+    if mine != incoming.node_id {
+        return Err(AdoptDocumentError::DifferentIdentity {
+            incoming: hex_encode(&incoming.node_id),
+            mine: hex_encode(&mine),
+        });
+    }
+
+    let own_seed = load_identity_sk(veil_dir)?;
+    let own_pk = SigningKey::from_bytes(own_seed.as_array())
+        .verifying_key()
+        .as_bytes()
+        .to_vec();
+
+    let doc_path = veil_dir.join(IDENTITY_DOCUMENT_FILE);
+    if let Some(idx) = incoming
+        .identity_keys
+        .iter()
+        .position(|k| k.pubkey == own_pk)
+    {
+        let idx = idx as u16;
+        atomic_write(&doc_path, &incoming.encode())?;
+        save_device_sig_key_idx(veil_dir, idx)?;
+        return Ok(AdoptOutcome::Adopted { key_idx: idx });
+    }
+
+    // Not named yet. Stage the incoming document and append ourselves to it —
+    // delegate_device re-signs with our own key, because the signer of what we
+    // just received keeps its secret on another machine.
+    atomic_write(&doc_path, &incoming.encode())?;
+    let out = delegate_device(DelegateDeviceOptions {
+        veil_dir: veil_dir.to_path_buf(),
+        master,
+        device_pubkey: own_pk,
+        now_unix,
+        valid_until_unix,
+        out_path: None,
+    })?;
+    save_device_sig_key_idx(veil_dir, out.new_key_idx)?;
+    Ok(AdoptOutcome::Delegated {
+        key_idx: out.new_key_idx,
+    })
+}
+
 /// Persist the device's identity_sk seed to
 /// `<veil_dir>/device_identity_sk.bin` with restrictive
 /// permissions. File is 32 raw bytes — no magic header because
@@ -2497,6 +2609,197 @@ mod tests {
         assert!(
             matches!(err, DelegateDeviceError::NoDocument(_)),
             "got {err:?}"
+        );
+    }
+
+    // ── adopt_identity_document ────────────────────────────────
+
+    // THE ROUND TRIP, and the assertion that matters is not "two keys" — it is
+    // that BOTH directories still load. `sig_key_idx` inside the document names
+    // whichever subkey signed it, so the device that merely adopts must record
+    // its OWN index separately; without that it tries to sign with a key it does
+    // not have, the loader rejects the mismatch, and the node comes up with no
+    // identity at all from a merge that looked like it worked.
+    #[test]
+    fn adopting_in_both_directions_leaves_two_loadable_devices() {
+        use crate::sovereign::SovereignIdentity;
+
+        let seed = create_identity(test_opts(tempdir())).unwrap().master_seed;
+        let a = tempdir();
+        let b = tempdir();
+        provision(a.clone(), seed.clone());
+        provision(b.clone(), seed.clone());
+
+        // B receives A's document and is not in it: it appends itself.
+        let a_doc = std::fs::read(a.join(IDENTITY_DOCUMENT_FILE)).unwrap();
+        let first = adopt_identity_document(
+            &b,
+            &a_doc,
+            MasterSecret::Seed(seed.clone()),
+            DELEGATE_NOW,
+            DELEGATE_NOW + 7 * 86_400,
+        )
+        .expect("B merges");
+        assert!(matches!(first, AdoptOutcome::Delegated { .. }));
+
+        // A receives the merged document back and IS in it: nothing to append.
+        let merged = std::fs::read(b.join(IDENTITY_DOCUMENT_FILE)).unwrap();
+        let second = adopt_identity_document(
+            &a,
+            &merged,
+            MasterSecret::Seed(seed.clone()),
+            DELEGATE_NOW,
+            DELEGATE_NOW + 7 * 86_400,
+        )
+        .expect("A adopts");
+        assert!(
+            matches!(second, AdoptOutcome::Adopted { .. }),
+            "got {second:?}"
+        );
+        assert_ne!(
+            first.key_idx(),
+            second.key_idx(),
+            "the two devices are different subkeys"
+        );
+
+        // The proof: both directories load, under one identity, as two devices.
+        let sov_a = SovereignIdentity::load_from_dir(&a).expect("A loads");
+        let sov_b = SovereignIdentity::load_from_dir(&b).expect("B loads");
+        assert_eq!(sov_a.node_id(), sov_b.node_id(), "one identity");
+        assert_ne!(
+            sov_a.active_instance_id(),
+            sov_b.active_instance_id(),
+            "two devices"
+        );
+        assert_eq!(sov_a.document.identity_keys.len(), 2);
+        assert_eq!(sov_b.document.identity_keys.len(), 2);
+    }
+
+    #[test]
+    fn adopting_the_same_document_twice_changes_nothing() {
+        use crate::sovereign::SovereignIdentity;
+
+        let seed = create_identity(test_opts(tempdir())).unwrap().master_seed;
+        let a = tempdir();
+        let b = tempdir();
+        provision(a.clone(), seed.clone());
+        provision(b.clone(), seed.clone());
+        let a_doc = std::fs::read(a.join(IDENTITY_DOCUMENT_FILE)).unwrap();
+
+        adopt_identity_document(
+            &b,
+            &a_doc,
+            MasterSecret::Seed(seed.clone()),
+            DELEGATE_NOW,
+            DELEGATE_NOW + 7 * 86_400,
+        )
+        .unwrap();
+        let after_first = std::fs::read(b.join(IDENTITY_DOCUMENT_FILE)).unwrap();
+
+        // A device re-announcing its document must not grow B's a third key.
+        let again = adopt_identity_document(
+            &b,
+            &after_first,
+            MasterSecret::Seed(seed),
+            DELEGATE_NOW,
+            DELEGATE_NOW + 7 * 86_400,
+        )
+        .unwrap();
+        assert!(matches!(again, AdoptOutcome::Adopted { .. }));
+        assert_eq!(
+            SovereignIdentity::load_from_dir(&b)
+                .unwrap()
+                .document
+                .identity_keys
+                .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn adopting_refuses_a_document_from_another_identity() {
+        let seed = create_identity(test_opts(tempdir())).unwrap().master_seed;
+        let other = create_identity(test_opts(tempdir())).unwrap().master_seed;
+        let a = tempdir();
+        let b = tempdir();
+        provision(a.clone(), seed.clone());
+        provision(b.clone(), other);
+        let stranger_doc = std::fs::read(b.join(IDENTITY_DOCUMENT_FILE)).unwrap();
+        let before = std::fs::read(a.join(IDENTITY_DOCUMENT_FILE)).unwrap();
+
+        let err = adopt_identity_document(
+            &a,
+            &stranger_doc,
+            MasterSecret::Seed(seed),
+            DELEGATE_NOW,
+            DELEGATE_NOW + 7 * 86_400,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, AdoptDocumentError::DifferentIdentity { .. }),
+            "got {err:?}"
+        );
+        // And nothing was written: a device left holding someone else's
+        // document signs with a key that document does not name, which takes it
+        // off the network entirely.
+        assert_eq!(
+            std::fs::read(a.join(IDENTITY_DOCUMENT_FILE)).unwrap(),
+            before
+        );
+    }
+
+    #[test]
+    fn adopting_refuses_bytes_that_do_not_decode() {
+        let seed = create_identity(test_opts(tempdir())).unwrap().master_seed;
+        let a = tempdir();
+        provision(a.clone(), seed.clone());
+        let before = std::fs::read(a.join(IDENTITY_DOCUMENT_FILE)).unwrap();
+        let err = adopt_identity_document(
+            &a,
+            b"not a document at all",
+            MasterSecret::Seed(seed),
+            DELEGATE_NOW,
+            DELEGATE_NOW + 7 * 86_400,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, AdoptDocumentError::DocumentDecode(_)),
+            "got {err:?}"
+        );
+        assert_eq!(
+            std::fs::read(a.join(IDENTITY_DOCUMENT_FILE)).unwrap(),
+            before
+        );
+    }
+
+    // A truncated or tampered transfer decodes but does not verify. It must be
+    // refused BEFORE anything reaches disk.
+    #[test]
+    fn adopting_refuses_a_document_whose_signature_is_broken() {
+        let seed = create_identity(test_opts(tempdir())).unwrap().master_seed;
+        let a = tempdir();
+        let b = tempdir();
+        provision(a.clone(), seed.clone());
+        provision(b.clone(), seed.clone());
+        let mut doc = IdentityDocument::decode(
+            &std::fs::read(a.join(IDENTITY_DOCUMENT_FILE)).unwrap(),
+        )
+        .unwrap();
+        doc.document_sig[0] ^= 0xFF;
+        let before = std::fs::read(b.join(IDENTITY_DOCUMENT_FILE)).unwrap();
+
+        let err = adopt_identity_document(
+            &b,
+            &doc.encode(),
+            MasterSecret::Seed(seed),
+            DELEGATE_NOW,
+            DELEGATE_NOW + 7 * 86_400,
+        )
+        .unwrap_err();
+        assert!(matches!(err, AdoptDocumentError::Verify(_)), "got {err:?}");
+        assert_eq!(
+            std::fs::read(b.join(IDENTITY_DOCUMENT_FILE)).unwrap(),
+            before
         );
     }
 

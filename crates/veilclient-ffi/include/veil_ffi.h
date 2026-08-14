@@ -2590,6 +2590,40 @@ int veil_delegate_device_from_config_zeroize(uint8_t *config_toml,
 ;
 #endif
 
+#if defined(VEIL_FFI_NODE_EMBEDDED)
+/**
+ * Merge an identity document received from another device of this identity
+ * into `veil_dir`, using the master secret in this node's own config.
+ *
+ * ONE call for both directions, because they are not symmetric and getting
+ * only one of them right leaves the other device exactly where it started.
+ * The device that merges first receives a document naming only the other and
+ * appends itself. The device that merges second receives one that already
+ * names it — nothing to append. Either way this records
+ * `device_sig_key_idx.bin`: `sig_key_idx` inside the document names whichever
+ * subkey signed it, so a device that stores such a document without recording
+ * its OWN index signs with a key it does not have, the loader rejects the
+ * mismatch, and the node comes up with no identity at all.
+ *
+ * Refuses — writing nothing — a document that does not decode, does not
+ * verify, or belongs to a different identity.
+ *
+ * `config_toml` is a SECRET and is wiped in place before return on every
+ * path. On success writes the resulting subkey index to `*key_idx_out` when
+ * that pointer is non-NULL. Behind `node-embedded`, like its sibling.
+ */
+
+int veil_adopt_identity_document_from_config_zeroize(uint8_t *config_toml,
+                                                     uintptr_t config_toml_len,
+                                                     const uint8_t *veil_dir,
+                                                     uintptr_t veil_dir_len,
+                                                     const uint8_t *document,
+                                                     uintptr_t document_len,
+                                                     uint16_t *key_idx_out,
+                                                     char **err_out)
+;
+#endif
+
 /**
  * Restore identity AND write an encrypted master-seed backup
  * ([`veil_restore_identity_from_phrase_zeroize`] + passphrase-protected
