@@ -669,6 +669,32 @@ impl AppSender {
         &self.app_id
     }
 
+    /// Send to the OTHER DEVICES of this identity.
+    ///
+    /// `my_node_id` is our own identity address, which is also what every
+    /// device of it answers to — so the node cannot tell from the address
+    /// whether we mean ourselves or our siblings, and a plain send addressed
+    /// there is short-circuited into a local delivery that never leaves the
+    /// machine. The flag says which of the two is meant.
+    pub async fn send_to_my_devices_owned(
+        &self,
+        my_node_id: [u8; 32],
+        dst_app_id: [u8; 32],
+        dst_endpoint_id: u32,
+        data: Vec<u8>,
+    ) -> Result<(), ClientError> {
+        self.writer
+            .write_app_ipc_send_owned(
+                &my_node_id,
+                &self.app_id,
+                &dst_app_id,
+                dst_endpoint_id,
+                veil_proto::ipc::IPC_SEND_FLAG_MY_OTHER_DEVICES,
+                &data,
+            )
+            .await
+    }
+
     /// Send a datagram (mirror [`AppHandle::send`]).
     pub async fn send(
         &self,
