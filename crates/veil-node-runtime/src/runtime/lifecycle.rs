@@ -447,10 +447,25 @@ impl NodeRuntime {
         // over any degenerate rebuild — that is the whole difference between one
         // identity with several devices and several devices that collide into
         // one node.
+        //
+        // ONLY when the config NAMES an identity directory. Without one the
+        // veil_dir is the per-boot staging directory this crate made for the
+        // deferred boot — and the document sitting there is the one the STUB
+        // wrote for itself moments ago. Loading that pinned the node's sovereign
+        // identity to the throwaway key while its address moved to the real one:
+        // measured live, the node published its instance registry under the stub
+        // id, which is the shape of the failure this reload path was written to
+        // prevent (`PeerUnresolved` on every remote seal, nothing delivered).
+        //
+        // A host that provisions an identity of its own always names the
+        // directory — that is what `identity_dir` is for — so gating on it
+        // separates "a document someone put here" from "a document we just
+        // generated for a key that is about to stop existing".
+        let named_dir = config.global.identity_dir.is_some();
         let doc_path = self
             .identity_dir
             .join(veil_identity::sovereign::IDENTITY_DOCUMENT_FILE);
-        let provisioned = if doc_path.exists() {
+        let provisioned = if named_dir && doc_path.exists() {
             match veil_identity::sovereign::SovereignIdentity::load_from_dir(&self.identity_dir) {
                 Ok(sov) => {
                     self.logger.info(
