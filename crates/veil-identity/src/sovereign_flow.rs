@@ -1648,6 +1648,17 @@ pub fn load_master_falcon_keypair(
     parse_master_falcon_keypair(&bytes)
 }
 
+/// The identity address a signed document names — `BLAKE3(master_pubkey)`.
+///
+/// The address an identity RECEIVES under, which is not always the address its
+/// node speaks under: a host whose config keypair IS the master sees the same
+/// 32 bytes both ways, and a host whose device has a transport key of its own
+/// does not. Reading it takes only a decode, so an embedding application can
+/// answer "where does my mail arrive" from the document it already stores.
+pub fn document_node_id(encoded: &[u8]) -> Result<[u8; 32], veil_proto::ProtoError> {
+    Ok(IdentityDocument::decode(encoded)?.node_id)
+}
+
 // ── Device delegation ────────────────────────────────────────────────────────
 
 #[derive(Debug, thiserror::Error)]

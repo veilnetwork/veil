@@ -8851,6 +8851,51 @@ fn master_signing_key_from_config(
     Ok(out)
 }
 
+/// The identity address a signed document names — `BLAKE3(master_pubkey)`,
+/// written to `out_node_id` (32 bytes).
+///
+/// This is the address an identity RECEIVES under, and it is not always the
+/// address its node speaks under. A host whose config keypair IS the master —
+/// every identity in the field today — sees the same 32 bytes both ways. A host
+/// whose device has a transport key of its own does not, and it has to publish
+/// its rendezvous ad and poll its mailbox under THIS one, or it waits at an
+/// address nobody sends to while looking perfectly reachable.
+///
+/// Decodes and verifies nothing beyond the encoding: the caller is reading its
+/// OWN stored document, which it wrote itself.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn veil_identity_document_node_id(
+    document: *const u8,
+    document_len: usize,
+    out_node_id: *mut u8,
+    err_out: *mut *mut c_char,
+) -> c_int {
+    unsafe {
+        clear_err(err_out);
+    }
+    if document.is_null() || out_node_id.is_null() {
+        unsafe {
+            write_err(err_out, "document or out_node_id is NULL");
+        }
+        return VEIL_ERR_INVALID_ARG;
+    }
+    let bytes = unsafe { std::slice::from_raw_parts(document, document_len) };
+    match veil_identity::sovereign_flow::document_node_id(bytes) {
+        Ok(node_id) => {
+            unsafe {
+                std::ptr::copy_nonoverlapping(node_id.as_ptr(), out_node_id, 32);
+            }
+            VEIL_OK
+        }
+        Err(e) => {
+            unsafe {
+                write_err(err_out, format!("document decode: {e}"));
+            }
+            VEIL_ERR
+        }
+    }
+}
+
 /// Restore identity AND write an encrypted master-seed backup
 /// ([`veil_restore_identity_from_phrase_zeroize`] + passphrase-protected
 /// `master.enc` file in `veil_dir`).
