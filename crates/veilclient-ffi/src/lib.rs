@@ -8851,6 +8851,162 @@ fn master_signing_key_from_config(
     Ok(out)
 }
 
+/// Derive the master signing key from a BIP-39 phrase, writing 32 bytes to
+/// `out_master_sk`. No mining, no disk, no config.
+///
+/// An application that gives each device a transport key of its own can no
+/// longer treat its node config as the master — the config becomes a device
+/// key — but it still needs the master to admit further devices, at a moment
+/// (days later, from a Devices screen) when the phrase is long gone. So it
+/// keeps THIS instead: the same 32 bytes the config used to carry, in the same
+/// container, at the same exposure as before.
+///
+/// A SECRET both ways: `phrase` is wiped in place on every path, and the caller
+/// owns what lands in `out_master_sk`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn veil_master_signing_key_from_phrase_zeroize(
+    phrase: *mut u8,
+    phrase_len: usize,
+    out_master_sk: *mut u8,
+    err_out: *mut *mut c_char,
+) -> c_int {
+    unsafe {
+        clear_err(err_out);
+    }
+    if phrase.is_null() || out_master_sk.is_null() {
+        unsafe {
+            write_err(err_out, "phrase or out_master_sk is NULL");
+        }
+        return VEIL_ERR_INVALID_ARG;
+    }
+    if phrase_len > MAX_FFI_CSTR_LEN {
+        unsafe {
+            write_err(err_out, "phrase too long (>4 KiB)");
+        }
+        return VEIL_ERR_INVALID_ARG;
+    }
+
+    struct ZeroOnDrop {
+        ptr: *mut u8,
+        len: usize,
+    }
+    impl Drop for ZeroOnDrop {
+        fn drop(&mut self) {
+            unsafe { volatile_wipe(self.ptr, self.len) };
+        }
+    }
+    let _guard = ZeroOnDrop {
+        ptr: phrase,
+        len: phrase_len,
+    };
+
+    let bytes = unsafe { std::slice::from_raw_parts(phrase as *const u8, phrase_len) };
+    let Ok(text) = std::str::from_utf8(bytes) else {
+        unsafe {
+            write_err(err_out, "phrase is not valid UTF-8");
+        }
+        return VEIL_ERR_INVALID_ARG;
+    };
+    let seed = match veil_identity::master_seed::decode_master_seed_from_phrase(text) {
+        Ok(s) => s,
+        Err(e) => {
+            unsafe {
+                write_err(err_out, format!("decode phrase: {e}"));
+            }
+            return VEIL_ERR;
+        }
+    };
+    let sk = zeroize::Zeroizing::new(veil_crypto::identity::derive_master_sk_ed25519(&seed));
+    unsafe {
+        std::ptr::copy_nonoverlapping(sk.as_ptr(), out_master_sk, 32);
+    }
+    VEIL_OK
+}
+
+/// Merge a document received from another device, authorising with the master
+/// key directly rather than with a node config.
+///
+/// The sibling that reads the master out of a config works only while the
+/// config IS the master. Once a device has a transport key of its own — the
+/// change that stops two devices restored from one phrase being one node — the
+/// config is a device key and cannot authorise anything.
+///
+/// `master_sk` is 32 SECRET bytes and is wiped in place before return.
+/// `document` may name this device already (adopt) or not (delegate); both are
+/// handled, and this device's own subkey index is recorded either way.
+#[cfg(feature = "node-embedded")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn veil_adopt_identity_document_from_master_zeroize(
+    master_sk: *mut u8,
+    veil_dir: *const u8,
+    veil_dir_len: usize,
+    document: *const u8,
+    document_len: usize,
+    key_idx_out: *mut u16,
+    err_out: *mut *mut c_char,
+) -> c_int {
+    unsafe {
+        clear_err(err_out);
+    }
+    if master_sk.is_null() || document.is_null() {
+        unsafe {
+            write_err(err_out, "master_sk or document is NULL");
+        }
+        return VEIL_ERR_INVALID_ARG;
+    }
+
+    struct ZeroOnDrop {
+        ptr: *mut u8,
+        len: usize,
+    }
+    impl Drop for ZeroOnDrop {
+        fn drop(&mut self) {
+            unsafe { volatile_wipe(self.ptr, self.len) };
+        }
+    }
+    let _guard = ZeroOnDrop {
+        ptr: master_sk,
+        len: 32,
+    };
+
+    let Some(dir_str) = (unsafe { slice_to_str(veil_dir, veil_dir_len) }) else {
+        unsafe {
+            write_err(err_out, "veil_dir is NULL or invalid UTF-8");
+        }
+        return VEIL_ERR_INVALID_ARG;
+    };
+    let mut key = zeroize::Zeroizing::new([0u8; 32]);
+    unsafe {
+        std::ptr::copy_nonoverlapping(master_sk as *const u8, key.as_mut_ptr(), 32);
+    }
+    let incoming = unsafe { std::slice::from_raw_parts(document, document_len) };
+    let now_unix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+
+    match veil_identity::sovereign_flow::adopt_identity_document(
+        std::path::Path::new(dir_str),
+        incoming,
+        veil_identity::sovereign_flow::MasterSecret::SigningKey(key),
+        now_unix,
+        now_unix + VEIL_DEFAULT_RESTORE_VALIDITY_SECS,
+    ) {
+        Ok(outcome) => {
+            if !key_idx_out.is_null() {
+                unsafe { *key_idx_out = outcome.key_idx() };
+            }
+            VEIL_OK
+        }
+        Err(e) => {
+            unsafe {
+                write_err(err_out, format!("adopt_identity_document: {e}"));
+            }
+            VEIL_ERR
+        }
+    }
+}
+
 /// The identity address a signed document names — `BLAKE3(master_pubkey)`,
 /// written to `out_node_id` (32 bytes).
 ///
