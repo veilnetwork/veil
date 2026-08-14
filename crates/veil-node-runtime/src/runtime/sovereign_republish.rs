@@ -96,11 +96,7 @@ impl NodeRuntime {
         // Veil dir for re-scanning persisted name claims on each tick
         // (so a claim added mid-session starts publishing at the next
         // republish without requiring a node restart).
-        let veil_dir = self
-            .config_path
-            .parent()
-            .unwrap_or(std::path::Path::new("."))
-            .to_path_buf();
+        let veil_dir = self.identity_dir.clone();
 
         /// Default republish cadence — matches the 6-hour TTL/freshness
         /// figure cited in `docs/identity-model.md`.

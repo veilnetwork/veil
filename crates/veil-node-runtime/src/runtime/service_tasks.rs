@@ -1968,11 +1968,7 @@ impl NodeRuntime {
             );
             return;
         }
-        let veil_dir = self
-            .config_path
-            .parent()
-            .unwrap_or(std::path::Path::new("."))
-            .to_path_buf();
+        let veil_dir = self.identity_dir.clone();
         let mlkem_key_path = veil_dir.join("mlkem.key");
         if crate::identity_local::mlkem_dk::derive_for_epoch(&mlkem_key_path, &veil_dir, 0)
             .is_none()
@@ -3066,11 +3062,7 @@ impl NodeRuntime {
         // multi-device pairing sinks (Epic 489.8).  One forwarder
         // instance handles both Source + Target sides — wire surface
         // shipped; ceremony plumbing fills in a follow-up slice.
-        let veil_dir = self
-            .config_path
-            .parent()
-            .map(std::path::PathBuf::from)
-            .unwrap_or_default();
+        let veil_dir = self.identity_dir.clone();
         let pairing_fwd = Arc::new(crate::pairing_forwarder::PairingForwarder::new(
             Arc::clone(&self.logger),
             veil_dir,

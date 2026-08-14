@@ -163,11 +163,7 @@ impl NodeRuntime {
         // into every handshake until restart — expired-proof rejects
         // after 7 d of uptime, seen live on the production seeds).
         let sovereign_identity_for_reissue = self.identity.sovereign_identity.clone();
-        let veil_dir_for_reissue = self
-            .config_path
-            .parent()
-            .unwrap_or(std::path::Path::new("."))
-            .to_path_buf();
+        let veil_dir_for_reissue = self.identity_dir.clone();
         let reissue_logger = Arc::clone(&self.logger);
         let tasks = Arc::clone(&self.tasks);
         // No per-tick catch_unwind/supervisor here ON PURPOSE: the workspace

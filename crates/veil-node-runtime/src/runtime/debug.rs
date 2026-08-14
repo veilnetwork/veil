@@ -147,11 +147,7 @@ impl NodeRuntime {
     /// for the production 60 s mtime-poll on the republish task.
     /// No-op when no sovereign identity is on disk.
     pub async fn debug_republish_sovereign_identity(&self) -> Result<()> {
-        let veil_dir = self
-            .config_path
-            .parent()
-            .unwrap_or(std::path::Path::new("."))
-            .to_path_buf();
+        let veil_dir = self.identity_dir.clone();
         let Ok(sov) = veil_identity::sovereign::SovereignIdentity::load_from_dir(&veil_dir) else {
             return Ok(());
         };
@@ -180,11 +176,7 @@ impl NodeRuntime {
         ) {
             let _ = veil_identity::publish::publish_mlkem_cert(&cert, &publisher).await;
         }
-        let veil_dir = self
-            .config_path
-            .parent()
-            .unwrap_or(std::path::Path::new("."))
-            .to_path_buf();
+        let veil_dir = self.identity_dir.clone();
         if let Ok(claims) = veil_identity::sovereign::load_persisted_name_claims(&veil_dir) {
             for claim in &claims {
                 let _ = veil_identity::publish::publish_name_claim(claim, &publisher).await;
