@@ -2131,7 +2131,7 @@ fn delegate_device<I: CommandIo>(
     let delegated = veil_cfg::sovereign_flow::delegate_device(
         veil_cfg::sovereign_flow::DelegateDeviceOptions {
             veil_dir: veil_dir.clone(),
-            master_seed,
+            master: veil_cfg::sovereign_flow::MasterSecret::Seed(master_seed),
             device_pubkey: device_pubkey.clone(),
             now_unix: now,
             valid_until_unix: valid_until,
