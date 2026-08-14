@@ -283,8 +283,17 @@ try {
     'iphlpapi.lib', 'crypt32.lib', 'dxgi.lib', 'd3d11.lib'
   )
 
-  Write-Host '==> linking veil_media.dll'
-  $linkArgs = @('/DLL', "/OUT:$dll", "/DEF:$def", '/MACHINE:X64', '/OPT:REF', '/OPT:ICF') +
+  # The machine comes from what the OBJECTS were built for, not from the
+  # output directory's name: the compile flags are inherited verbatim from the
+  # checkout's own compile_commands.json, so `--target=` is the one statement
+  # of architecture that cannot disagree with the bytes being linked.
+  #
+  # It was a hardcoded X64. Linking an arm64 bundle then produced one error per
+  # object -- "machine type arm64 conflicts with x64" -- a wall that reads like
+  # a broken bundle and is one flag.
+  $machine = if ($templateCmd -match '--target=aarch64') { 'ARM64' } else { 'X64' }
+  Write-Host "==> linking veil_media.dll (/MACHINE:$machine)"
+  $linkArgs = @('/DLL', "/OUT:$dll", "/DEF:$def", "/MACHINE:$machine", '/OPT:REF', '/OPT:ICF') +
     $objects + @($webrtcLib) + $cxxObjs + $systemLibs
   & $linker @linkArgs
   if ($LASTEXITCODE -ne 0) { throw 'link failed' }
