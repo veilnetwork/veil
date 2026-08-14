@@ -70,21 +70,22 @@ pub(crate) async fn publish_sovereign_identity(
             ),
         }
 
-    // InstanceRegistry publish: advertise this node's single
-    // instance so peers can locate it by (node_id
-    // instance_id). For MVP, `reg_version = 1` on every
-    // fresh startup — peers tie-break on (version, sig) so
-    // republishing the same version is benign. Future:
-    // persist + monotonically bump reg_version across
-    // restarts, and extend the entry list when paired
-    // devices (462.30) join the identity.
-    let instance_entry = veil_identity::publish::build_instance_entry(
-        sov.active_instance_id(),
-        sov.sig_key_idx,
-        String::new(), // label empty for MVP; CLI flag to set it is follow-up
-        0,             // last_seen_unix_ms — populated by subsequent republishes
-    );
-    let registry = sov.build_and_sign_registry(1, vec![instance_entry]);
+    // InstanceRegistry publish: advertise EVERY device this identity names, so
+    // a peer resolving node_id can seal one envelope per device.
+    //
+    // It used to advertise only this node's own instance, under a constant
+    // `reg_version = 1`. Both halves were wrong once an identity had a second
+    // device: every device publishes under the same node_id, so each in turn
+    // replaced the registry with a set of one — itself — and the equal version
+    // left peers tie-breaking on a signature. Whichever device wrote last was
+    // the only one anyone could reach, and the others stayed online believing
+    // they were reachable.
+    //
+    // Both now come from the document, which already names every device and is
+    // the same document on all of them: identical registries instead of
+    // contradicting ones, and a version that a device carrying an older
+    // document loses rather than wins.
+    let registry = sov.build_and_sign_registry(sov.registry_version(), sov.all_instance_entries());
     match veil_identity::publish::publish_instance_registry(&registry, &publisher).await {
         Ok(()) => logger.info(
             "node.sovereign_identity.registry_published",

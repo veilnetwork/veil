@@ -1665,9 +1665,7 @@ pub enum DelegateDeviceError {
          `identity rotate` to extend its validity instead"
     )]
     AlreadyPresent { idx: usize },
-    #[error(
-        "MAX_IDENTITY_KEYS ({max}) would be exceeded (document already has {current})"
-    )]
+    #[error("MAX_IDENTITY_KEYS ({max}) would be exceeded (document already has {current})")]
     TooManyKeys { max: usize, current: usize },
     #[error(
         "master seed does not match this identity: it derives node_id {computed}, \
@@ -2462,8 +2460,11 @@ mod tests {
             .to_vec()
     }
 
-    fn delegate_opts(dir: PathBuf, seed: Zeroizing<[u8; MASTER_SEED_LEN]>, pk: Vec<u8>)
-    -> DelegateDeviceOptions {
+    fn delegate_opts(
+        dir: PathBuf,
+        seed: Zeroizing<[u8; MASTER_SEED_LEN]>,
+        pk: Vec<u8>,
+    ) -> DelegateDeviceOptions {
         DelegateDeviceOptions {
             veil_dir: dir,
             master: MasterSecret::Seed(seed),
@@ -2491,14 +2492,16 @@ mod tests {
         assert_eq!(out.new_key_idx, 1);
         assert_eq!(out.document.identity_keys.len(), 2);
         assert!(!out.signed_by_new_key, "the local subkey signs");
-        assert_eq!(out.document.sig_key_idx, 0, "the local device keeps signing");
+        assert_eq!(
+            out.document.sig_key_idx, 0,
+            "the local device keeps signing"
+        );
         verify_identity_document(&out.document, DELEGATE_NOW)
             .expect("a delegated document must verify");
         // And it is on disk, not merely returned — the node reads the file.
-        let reread = IdentityDocument::decode(
-            &std::fs::read(a.join(IDENTITY_DOCUMENT_FILE)).unwrap(),
-        )
-        .unwrap();
+        let reread =
+            IdentityDocument::decode(&std::fs::read(a.join(IDENTITY_DOCUMENT_FILE)).unwrap())
+                .unwrap();
         assert_eq!(reread.identity_keys.len(), 2);
     }
 
@@ -2530,7 +2533,12 @@ mod tests {
         verify_identity_document(&out.document, DELEGATE_NOW)
             .expect("a self-delegated document must verify");
         // Both devices are in it, and the identity did not move.
-        let keys: Vec<&Vec<u8>> = out.document.identity_keys.iter().map(|k| &k.pubkey).collect();
+        let keys: Vec<&Vec<u8>> = out
+            .document
+            .identity_keys
+            .iter()
+            .map(|k| &k.pubkey)
+            .collect();
         assert!(keys.contains(&&device_pubkey(&a)));
         assert!(keys.contains(&&device_pubkey(&b)));
     }
@@ -2781,10 +2789,9 @@ mod tests {
         let b = tempdir();
         provision(a.clone(), seed.clone());
         provision(b.clone(), seed.clone());
-        let mut doc = IdentityDocument::decode(
-            &std::fs::read(a.join(IDENTITY_DOCUMENT_FILE)).unwrap(),
-        )
-        .unwrap();
+        let mut doc =
+            IdentityDocument::decode(&std::fs::read(a.join(IDENTITY_DOCUMENT_FILE)).unwrap())
+                .unwrap();
         doc.document_sig[0] ^= 0xFF;
         let before = std::fs::read(b.join(IDENTITY_DOCUMENT_FILE)).unwrap();
 
@@ -2801,6 +2808,112 @@ mod tests {
             std::fs::read(b.join(IDENTITY_DOCUMENT_FILE)).unwrap(),
             before
         );
+    }
+
+    // ── what the merged identity advertises ────────────────────
+    //
+    // The registry is how a peer turns an identity into somewhere to deliver.
+    // Both devices publish it under the same node_id, so if they disagree the
+    // last writer decides who is reachable — and if either advertises only
+    // itself, the other drops out of reach while still believing it is online.
+    #[test]
+    fn a_merged_document_makes_both_devices_advertise_the_same_two() {
+        use crate::sovereign::SovereignIdentity;
+
+        let seed = create_identity(test_opts(tempdir())).unwrap().master_seed;
+        let a = tempdir();
+        let b = tempdir();
+        provision(a.clone(), seed.clone());
+        provision(b.clone(), seed.clone());
+
+        let a_doc = std::fs::read(a.join(IDENTITY_DOCUMENT_FILE)).unwrap();
+        adopt_identity_document(
+            &b,
+            &a_doc,
+            MasterSecret::Seed(seed.clone()),
+            DELEGATE_NOW,
+            DELEGATE_NOW + 7 * 86_400,
+        )
+        .unwrap();
+        let merged = std::fs::read(b.join(IDENTITY_DOCUMENT_FILE)).unwrap();
+        adopt_identity_document(
+            &a,
+            &merged,
+            MasterSecret::Seed(seed),
+            DELEGATE_NOW,
+            DELEGATE_NOW + 7 * 86_400,
+        )
+        .unwrap();
+
+        let sov_a = SovereignIdentity::load_from_dir(&a).unwrap();
+        let sov_b = SovereignIdentity::load_from_dir(&b).unwrap();
+        let ea = sov_a.all_instance_entries();
+        let eb = sov_b.all_instance_entries();
+
+        assert_eq!(ea.len(), 2, "both devices are advertised");
+        // Identical, not merely equal in size: two devices racing to publish
+        // must write the same bytes rather than contradict each other.
+        let ids_a: Vec<[u8; 16]> = ea.iter().map(|e| e.instance_id).collect();
+        let ids_b: Vec<[u8; 16]> = eb.iter().map(|e| e.instance_id).collect();
+        assert_eq!(ids_a, ids_b);
+        let idx_a: Vec<u16> = ea.iter().map(|e| e.bound_identity_key_idx).collect();
+        let idx_b: Vec<u16> = eb.iter().map(|e| e.bound_identity_key_idx).collect();
+        assert_eq!(idx_a, idx_b);
+        assert_eq!(idx_a, vec![0u16, 1u16], "each entry names its own subkey");
+
+        // And each device finds ITSELF in what the other advertises — the
+        // property that makes it deliverable.
+        assert!(ids_a.contains(&sov_a.active_instance_id()));
+        assert!(ids_a.contains(&sov_b.active_instance_id()));
+        assert_ne!(sov_a.active_instance_id(), sov_b.active_instance_id());
+
+        // One version, so neither overwrites the other with a poorer set.
+        assert_eq!(sov_a.registry_version(), sov_b.registry_version());
+    }
+
+    #[test]
+    fn a_single_device_advertises_exactly_itself() {
+        use crate::sovereign::SovereignIdentity;
+
+        let seed = create_identity(test_opts(tempdir())).unwrap().master_seed;
+        let a = tempdir();
+        provision(a.clone(), seed);
+        let sov = SovereignIdentity::load_from_dir(&a).unwrap();
+        let entries = sov.all_instance_entries();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].instance_id, sov.active_instance_id());
+        assert_eq!(entries[0].bound_identity_key_idx, sov.sig_key_idx);
+    }
+
+    // A device still holding the pre-merge document must LOSE the tie-break,
+    // not win it: it would otherwise replace a registry naming both devices
+    // with one naming only itself.
+    #[test]
+    fn an_older_document_publishes_a_lower_registry_version() {
+        use crate::sovereign::SovereignIdentity;
+
+        let seed = create_identity(test_opts(tempdir())).unwrap().master_seed;
+        let a = tempdir();
+        let b = tempdir();
+        provision(a.clone(), seed.clone());
+        provision(b.clone(), seed.clone());
+        let before = SovereignIdentity::load_from_dir(&b)
+            .unwrap()
+            .registry_version();
+
+        let a_doc = std::fs::read(a.join(IDENTITY_DOCUMENT_FILE)).unwrap();
+        adopt_identity_document(
+            &b,
+            &a_doc,
+            MasterSecret::Seed(seed),
+            DELEGATE_NOW + 60,
+            DELEGATE_NOW + 60 + 7 * 86_400,
+        )
+        .unwrap();
+        let after = SovereignIdentity::load_from_dir(&b)
+            .unwrap()
+            .registry_version();
+        assert!(after > before, "merging moves the version forward");
     }
 
     // ── hybrid create_identity ─────────────────────────────────
