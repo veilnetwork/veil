@@ -272,6 +272,40 @@ class VeilDaemonService : Service() {
         microphone: Boolean,
         camera: Boolean,
     ) {
+        try {
+            startForegroundOrThrow(notification, microphone, camera)
+        } catch (refused: IllegalStateException) {
+            // ForegroundServiceStartNotAllowedException, from Android 12. It
+            // extends IllegalStateException and is NOT a SecurityException, so
+            // the media-type catch below never saw it and it escaped out of
+            // onCreate — which kills the whole process, not just the service:
+            //
+            //   ForegroundServiceStartNotAllowedException: Service.startForeground()
+            //   not allowed due to mAllowStartForeground false
+            //     at VeilDaemonService.startForegroundCompat(VeilDaemonService.kt:287)
+            //     at VeilDaemonService.onCreate(VeilDaemonService.kt:92)
+            //
+            // Observed on a phone doing nothing unusual: unlock the app once
+            // its screen has switched off and the app vanishes, with no crash
+            // dialog and nothing in the app's own log — it is gone before it
+            // can write one. The comment on the catch below already says a
+            // rejected foreground start "must degrade to process/network
+            // retention, never crash the entire application"; that was the
+            // right rule and this is the case it did not cover.
+            //
+            // stopSelf rather than carrying on: a service that cannot go
+            // foreground will be killed by the platform anyway, and the app
+            // survives to say the background node is not running.
+            Log.w(TAG, "Foreground start refused by the platform; the background node will not run", refused)
+            stopSelf()
+        }
+    }
+
+    private fun startForegroundOrThrow(
+        notification: Notification,
+        microphone: Boolean,
+        camera: Boolean,
+    ) {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
             // Android 14+ requires a foregroundServiceType matching
             // the service's actual purpose.  REMOTE_MESSAGING fits
