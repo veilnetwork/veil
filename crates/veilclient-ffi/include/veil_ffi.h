@@ -2520,6 +2520,43 @@ int veil_restore_identity_from_phrase_zeroize(uint8_t *phrase,
 ;
 
 /**
+ * Admit a device to the identity whose `identity_document.bin` is in
+ * `veil_dir`, appending its key under the master derived from `phrase` and
+ * rewriting the document in place.
+ *
+ * This is what lets one identity hold several devices, and the alternative is
+ * not "one document each". `node_id` is BLAKE3(master_pk), so two devices
+ * restored from one phrase publish two single-key documents under the SAME id;
+ * the later publisher displaces the earlier, and the displaced device stays
+ * online believing it is reachable.
+ *
+ * `device_pubkey` may be NULL, and for an embedding application that is the
+ * usual call: it means "this device's own key", read from
+ * `device_identity_sk.bin` in `veil_dir`, so the caller never handles key
+ * material at all. The flow it serves is a merge — a device restored from the
+ * phrase receives the other device's document, drops it into `veil_dir`, and
+ * calls this to add itself. The previous signer's secret is on the other
+ * machine, so the document is re-signed by the newly delegated key and
+ * `sig_key_idx` moves to it; every subkey is master-signed, so a verifier
+ * accepts either.
+ *
+ * `phrase` is a SECRET, passed as a writable `(*mut u8, len)` buffer that is
+ * overwritten with `0` before return on EVERY path. Returns `VEIL_OK` on
+ * success; on failure sets `*err_out` and returns `VEIL_ERR`. Refuses, rather
+ * than guesses, when the phrase belongs to a different identity than the
+ * document does.
+ */
+
+int veil_delegate_device_from_phrase_zeroize(uint8_t *phrase,
+                                             uintptr_t phrase_len,
+                                             const uint8_t *veil_dir,
+                                             uintptr_t veil_dir_len,
+                                             const uint8_t *device_pubkey,
+                                             uintptr_t device_pubkey_len,
+                                             char **err_out)
+;
+
+/**
  * Restore identity AND write an encrypted master-seed backup
  * ([`veil_restore_identity_from_phrase_zeroize`] + passphrase-protected
  * `master.enc` file in `veil_dir`).
