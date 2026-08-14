@@ -357,8 +357,21 @@ impl veil_ipc::MailboxCryptoSink for RuntimeMailboxCrypto {
     ) -> Pin<Box<dyn Future<Output = veil_ipc::MailboxSealOutcome> + Send + 'a>> {
         Box::pin(async move {
             use veil_ipc::MailboxSealOutcome as O;
+            // A mailbox blob exists to reach ANOTHER MACHINE. Depositing one on
+            // a relay for ourselves would be a round trip to a copy we already
+            // hold -- the sender wrote it locally before asking for this. So at
+            // this boundary "seal to my own identity" can only mean the rest of
+            // my devices, and needs no flag from the caller to say so.
+            //
+            // The internal `seal` keeps addressing us alone; that path is the
+            // first-document operation, which is genuinely about this device.
+            let audience = if recipient_node_id == self.local_node_id {
+                MailboxAudience::MyOtherDevices
+            } else {
+                MailboxAudience::Recipient
+            };
             match self
-                .seal(recipient_node_id, app_id, endpoint_id, &data)
+                .seal_for(audience, recipient_node_id, app_id, endpoint_id, &data)
                 .await
             {
                 Ok(blob) => O::Ok(blob),
