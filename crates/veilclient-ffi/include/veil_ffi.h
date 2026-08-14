@@ -2625,6 +2625,52 @@ int veil_adopt_identity_document_from_config_zeroize(uint8_t *config_toml,
 #endif
 
 /**
+ * Derive the master signing key from a BIP-39 phrase, writing 32 bytes to
+ * `out_master_sk`. No mining, no disk, no config.
+ *
+ * An application that gives each device a transport key of its own can no
+ * longer treat its node config as the master — the config becomes a device
+ * key — but it still needs the master to admit further devices, at a moment
+ * (days later, from a Devices screen) when the phrase is long gone. So it
+ * keeps THIS instead: the same 32 bytes the config used to carry, in the same
+ * container, at the same exposure as before.
+ *
+ * A SECRET both ways: `phrase` is wiped in place on every path, and the caller
+ * owns what lands in `out_master_sk`.
+ */
+
+int veil_master_signing_key_from_phrase_zeroize(uint8_t *phrase,
+                                                uintptr_t phrase_len,
+                                                uint8_t *out_master_sk,
+                                                char **err_out)
+;
+
+#if defined(VEIL_FFI_NODE_EMBEDDED)
+/**
+ * Merge a document received from another device, authorising with the master
+ * key directly rather than with a node config.
+ *
+ * The sibling that reads the master out of a config works only while the
+ * config IS the master. Once a device has a transport key of its own — the
+ * change that stops two devices restored from one phrase being one node — the
+ * config is a device key and cannot authorise anything.
+ *
+ * `master_sk` is 32 SECRET bytes and is wiped in place before return.
+ * `document` may name this device already (adopt) or not (delegate); both are
+ * handled, and this device's own subkey index is recorded either way.
+ */
+
+int veil_adopt_identity_document_from_master_zeroize(uint8_t *master_sk,
+                                                     const uint8_t *veil_dir,
+                                                     uintptr_t veil_dir_len,
+                                                     const uint8_t *document,
+                                                     uintptr_t document_len,
+                                                     uint16_t *key_idx_out,
+                                                     char **err_out)
+;
+#endif
+
+/**
  * The identity address a signed document names — `BLAKE3(master_pubkey)`,
  * written to `out_node_id` (32 bytes).
  *
