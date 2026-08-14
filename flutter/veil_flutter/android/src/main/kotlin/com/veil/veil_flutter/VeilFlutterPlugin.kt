@@ -234,7 +234,30 @@ class VeilFlutterPlugin : FlutterPlugin, MethodCallHandler, ActivityAware,
                 val intent = Intent(ctx, VeilDaemonService::class.java).apply {
                     action = VeilDaemonService.ACTION_STOP
                 }
-                ctx.startService(intent)
+                // Delivering ACTION_STOP through startService is what lets the
+                // service tear the node down on its own terms. From Android 12
+                // that call is refused OUTRIGHT when the app is backgrounded —
+                // BackgroundServiceStartNotAllowedException — and it does not
+                // care that the intent says "stop": the rule is about starting
+                // a service at all.
+                //
+                // Unhandled, that threw across the method channel and the app
+                // reported "node failed to start: Not allowed to start service
+                // ... action.STOP", which names a start for what was a stop and
+                // leaves the node marked errored while the app calls itself
+                // ready. Seen on a phone whose screen had simply switched off:
+                // lock the app from the background and this is what happens.
+                //
+                // stopService is not refused, so the fallback still stops the
+                // node; what it loses is the graceful ACTION_STOP path, which
+                // is the right trade against not stopping at all. The catch is
+                // IllegalStateException because that is what the 12+ exception
+                // extends — the specific class does not exist below API 31.
+                try {
+                    ctx.startService(intent)
+                } catch (refused: IllegalStateException) {
+                    ctx.stopService(intent)
+                }
                 result.success(null)
             }
             // ── Background-execution permission (battery optimisation) ───────
