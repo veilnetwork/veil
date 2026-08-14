@@ -1159,6 +1159,19 @@ pub const IPC_SEND_FLAG_RELAY_MEDIA_SEALED: u32 = 0x0000_0040;
 /// every hop.
 pub const IPC_SEND_FLAG_RELAY_CONTROL_COMPAT: u32 = 0x0000_0080;
 
+/// This send is for the sender's OTHER DEVICES, not for the sender.
+///
+/// A send addressed at our own `node_id` is short-circuited into a local
+/// delivery: the frame never leaves the node, because normally an app
+/// addressing itself means itself. A device sync means the opposite -- the
+/// copy we already hold is not the point, the other devices of this identity
+/// are -- and the two are indistinguishable from the address alone, since
+/// every device of an identity answers to the same one.
+///
+/// Set it and the local short-circuit is skipped, so the frame takes the path
+/// that reaches a sibling: sealed per instance, our own left out.
+pub const IPC_SEND_FLAG_MY_OTHER_DEVICES: u32 = 0x0000_0100;
+
 /// Versioned prefix of a symmetrically sealed relay-media cell. Shared by the
 /// local IPC gate and the media endpoint codec; relays never interpret it.
 pub const RELAY_MEDIA_SEALED_MAGIC: [u8; 4] = *b"VME1";
@@ -1208,6 +1221,9 @@ pub struct AppIpcSendPayload {
     /// On an authenticated send, attach a one-time reply block addressed to
     /// `(src_app_id, reply_endpoint_id)`. Set `IPC_SEND_FLAG_EXPECT_REPLY`.
     pub expect_reply: bool,
+    /// Deliver to this identity's OTHER devices rather than to ourselves.
+    /// Set `IPC_SEND_FLAG_MY_OTHER_DEVICES`.
+    pub my_other_devices: bool,
     /// This send is a reply routed via `reply_id` (ignores the explicit
     /// destination). Set `IPC_SEND_FLAG_IS_REPLY`.
     pub is_reply: bool,
@@ -1276,6 +1292,7 @@ impl AppIpcSendPayload {
         let anonymous_authenticated = flags & IPC_SEND_FLAG_ANONYMOUS_AUTHENTICATED != 0;
         let expect_reply = flags & IPC_SEND_FLAG_EXPECT_REPLY != 0;
         let is_reply = flags & IPC_SEND_FLAG_IS_REPLY != 0;
+        let my_other_devices = flags & IPC_SEND_FLAG_MY_OTHER_DEVICES != 0;
         let data_len = super::read_u32_be(buf, 104)? as usize;
         // checked_add — 32-bit overflow defence.
         let total = Self::FIXED_SIZE
@@ -1319,6 +1336,7 @@ impl AppIpcSendPayload {
             anonymous_authenticated,
             expect_reply,
             is_reply,
+            my_other_devices,
             reply_id,
             reply_endpoint_id,
             data: pooled.into_shared(),
