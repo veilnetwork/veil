@@ -465,8 +465,32 @@ impl DhtMlKemEkResolver {
             return Vec::new();
         };
 
-        let mut out: Vec<VerifiedMlkemCert> = Vec::with_capacity(reg.instances.len());
-        for instance in &reg.instances {
+        self.certs_for_instances(target_node_id, &doc, &reg.instances, now_unix)
+            .await
+    }
+
+    /// Resolve the ML-KEM cert of each named instance and keep the ones that
+    /// verify against `doc`.
+    ///
+    /// Split out because OUR OWN devices are not discovered the same way. A
+    /// peer's instances come from the registry it published; ours are in the
+    /// document this runtime already holds, and asking the network about
+    /// ourselves to learn what we know is both slower and a dependency on the
+    /// DHT answering about us -- which it may not, and which cost a stand run
+    /// to find out. Only the SIBLING'S CERT genuinely needs the network: it is
+    /// their key, not ours.
+    ///
+    /// An instance whose cert is missing is skipped rather than failing the
+    /// whole set -- it may never have come online since it was admitted.
+    pub(crate) async fn certs_for_instances(
+        &self,
+        target_node_id: [u8; 32],
+        doc: &IdentityDocument,
+        instances: &[veil_proto::instance_registry::InstanceEntry],
+        now_unix: u64,
+    ) -> Vec<VerifiedMlkemCert> {
+        let mut out: Vec<VerifiedMlkemCert> = Vec::with_capacity(instances.len());
+        for instance in instances {
             let cert_key = MlKemKeyCert::dht_key(&target_node_id, &instance.instance_id);
             let Some(cert) = self
                 .dht_get_freshest(
@@ -474,7 +498,7 @@ impl DhtMlKemEkResolver {
                     |b| {
                         MlKemKeyCert::decode(b)
                             .ok()
-                            .filter(|c| verify_mlkem_cert(c, &doc, now_unix).is_ok())
+                            .filter(|c| verify_mlkem_cert(c, doc, now_unix).is_ok())
                     },
                     |c| (c.cert_version, c.valid_from_unix),
                 )
@@ -483,7 +507,7 @@ impl DhtMlKemEkResolver {
                 self.log_dbg("mlkem_resolver.cert.dht_miss", &target_node_id, "");
                 continue;
             };
-            match verify_mlkem_cert(&cert, &doc, now_unix) {
+            match verify_mlkem_cert(&cert, doc, now_unix) {
                 Ok(verified) => out.push(verified),
                 Err(e) => self.log_dbg(
                     "mlkem_resolver.cert.verify_failed",
@@ -498,7 +522,7 @@ impl DhtMlKemEkResolver {
                 "target={} instances={} of {}",
                 hex8(&target_node_id),
                 out.len(),
-                reg.instances.len(),
+                instances.len(),
             ),
         );
         out
