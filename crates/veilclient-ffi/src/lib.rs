@@ -3322,6 +3322,95 @@ pub unsafe extern "C" fn veil_send(
     }
 }
 
+/// Send to the OTHER DEVICES of this identity.
+///
+/// `my_node_id` is our own identity address. Every device of an identity
+/// answers to it, so a plain [`veil_send`] addressed there is short-circuited
+/// into a local delivery that never leaves the machine — right when an app
+/// addresses itself, wrong for a device sync. This says which is meant, and
+/// the node seals a copy per sibling instance with ours left out.
+///
+/// A named export rather than a flags argument, following the other send
+/// classes here: the operation is different, not the same one qualified.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn veil_send_to_my_devices(
+    app: *mut VeilApp,
+    my_node_id: *const u8,
+    dst_app_id: *const u8,
+    dst_endpoint_id: u32,
+    data: *const u8,
+    len: size_t,
+    err_out: *mut *mut c_char,
+) -> c_int {
+    if let Err(rc) = unsafe { guard::ffi_prelude(err_out, "veil_send_to_my_devices") } {
+        return rc;
+    }
+    null_check!(err_out,
+        "app" => app,
+        "my_node_id" => my_node_id,
+        "dst_app_id" => dst_app_id,
+    );
+    if data.is_null() && len > 0 {
+        unsafe {
+            write_err(err_out, "data is NULL but len > 0");
+        }
+        return VEIL_ERR_INVALID_ARG;
+    }
+    if len > VEIL_MAX_DATA_LEN {
+        unsafe {
+            write_err(
+                err_out,
+                format!("data len {len} exceeds VEIL_MAX_DATA_LEN ({VEIL_MAX_DATA_LEN})"),
+            );
+        }
+        return VEIL_ERR_INVALID_ARG;
+    }
+    get_or_return!(
+        app_ref,
+        app_table(),
+        app,
+        err_out,
+        VEIL_ERR_INVALID_ARG,
+        "VeilApp"
+    );
+    let mut mine = [0u8; 32];
+    let mut dst_app = [0u8; 32];
+    // SAFETY: as in `veil_send` — both pointers are NULL-checked above and the
+    // 32-byte size contract is the header's.
+    unsafe {
+        ptr::copy_nonoverlapping(my_node_id, mine.as_mut_ptr(), 32);
+        ptr::copy_nonoverlapping(dst_app_id, dst_app.as_mut_ptr(), 32);
+    }
+    let payload: Vec<u8> = if len == 0 {
+        Vec::new()
+    } else {
+        unsafe { std::slice::from_raw_parts(data, len) }.to_vec()
+    };
+    let send_res: Result<(), ClientError> = app_ref.bundle.runtime.block_on(async {
+        let inner_guard = app_ref.sender.lock().await;
+        let Some(sender) = inner_guard.as_ref() else {
+            return Err(ClientError::Protocol("app already closed".to_string()));
+        };
+        sender
+            .send_to_my_devices_owned(mine, dst_app, dst_endpoint_id, payload)
+            .await
+    });
+    match send_res {
+        Ok(()) => VEIL_OK,
+        Err(e) => {
+            let s = e.to_string();
+            unsafe {
+                write_err(err_out, format!("send failed: {s}"));
+            }
+            if s.contains("app already closed") {
+                VEIL_ERR_CLOSED
+            } else {
+                VEIL_ERR
+            }
+        }
+    }
+}
+
 /// Send a loss-tolerant datagram over an already-active direct peer session at
 /// REALTIME priority.
 ///
