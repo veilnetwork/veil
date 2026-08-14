@@ -204,6 +204,36 @@ pub fn pow_score(
     pow_score_raw(&pk_bytes, &signing_key, &nonce)
 }
 
+/// Which of two nonces is the better proof of work for the SAME identity, and
+/// a total order — never "both are better".
+///
+/// Two devices of one identity share a master keypair, and the score is a
+/// deterministic function of `(pk, sk, nonce)`: an Ed25519 signature over
+/// `pk ‖ nonce` is deterministic, so a nonce one device mined scores identically
+/// on the other. That is what makes a nonce transferable between them — and
+/// what makes a rule for disagreement necessary, because two devices that mined
+/// independently hold two valid nonces of different quality.
+///
+/// More leading zero bits wins. On a tie the lexicographically smaller nonce
+/// wins — arbitrary, but ARBITRARY AND FIXED is the whole point: a comparison
+/// that can answer "mine is better" on both sides has two devices overwriting
+/// each other forever. The instance registry had exactly that shape, published
+/// under one key with a constant version, and the last writer decided who was
+/// reachable.
+pub fn better_nonce(
+    a_score: PowScore,
+    a_nonce: &[u8],
+    b_score: PowScore,
+    b_nonce: &[u8],
+) -> std::cmp::Ordering {
+    a_score
+        .zero_bits
+        .cmp(&b_score.zero_bits)
+        // Reversed: the SMALLER nonce is the better one, so it must compare
+        // Greater here.
+        .then_with(|| b_nonce.cmp(a_nonce))
+}
+
 pub fn available_thread_count() -> usize {
     std::thread::available_parallelism()
         .map(usize::from)
@@ -230,4 +260,87 @@ pub(super) fn nonce_to_u32(nonce: &[u8; NONCE_LEN]) -> u32 {
 
 pub fn u32_to_nonce(value: u32) -> [u8; NONCE_LEN] {
     value.to_be_bytes()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── better_nonce ────────────────────────────────────────────────
+    //
+    // Two devices of one identity can each mine a valid nonce for the SAME
+    // master keypair. Choosing between them has to be a total order computed
+    // identically on both, or they overwrite each other for as long as both are
+    // running — the shape the instance registry had, published under one key
+    // with a constant version.
+
+    fn score(bits: u32) -> PowScore {
+        PowScore { zero_bits: bits }
+    }
+
+    #[test]
+    fn better_nonce_prefers_more_leading_zero_bits() {
+        use std::cmp::Ordering;
+        assert_eq!(
+            better_nonce(score(20), b"aaaa", score(18), b"aaaa"),
+            Ordering::Greater
+        );
+        assert_eq!(
+            better_nonce(score(18), b"aaaa", score(20), b"aaaa"),
+            Ordering::Less
+        );
+    }
+
+    #[test]
+    fn better_nonce_breaks_ties_on_the_nonce_itself() {
+        use std::cmp::Ordering;
+        // Equal quality: the smaller nonce is the better one, so it compares
+        // Greater.
+        assert_eq!(
+            better_nonce(score(20), b"aaaa", score(20), b"bbbb"),
+            Ordering::Greater
+        );
+        assert_eq!(
+            better_nonce(score(20), b"bbbb", score(20), b"aaaa"),
+            Ordering::Less
+        );
+    }
+
+    #[test]
+    fn better_nonce_is_equal_only_for_the_same_nonce() {
+        use std::cmp::Ordering;
+        assert_eq!(
+            better_nonce(score(20), b"aaaa", score(20), b"aaaa"),
+            Ordering::Equal
+        );
+    }
+
+    // THE PROPERTY THAT MATTERS: whatever pair two devices hold, they reach the
+    // same verdict. A comparison that answered "mine is better" to both sides
+    // would have them republishing over each other indefinitely.
+    #[test]
+    fn better_nonce_never_lets_both_sides_win() {
+        use std::cmp::Ordering;
+        let cases: [(u32, &[u8]); 5] = [
+            (18, b"aaaa"),
+            (18, b"bbbb"),
+            (20, b"aaaa"),
+            (20, b"zzzz"),
+            (21, b"mmmm"),
+        ];
+        for (ab, an) in cases {
+            for (bb, bn) in cases {
+                let forward = better_nonce(score(ab), an, score(bb), bn);
+                let backward = better_nonce(score(bb), bn, score(ab), an);
+                assert_eq!(
+                    forward,
+                    backward.reverse(),
+                    "asymmetry for ({ab},{an:?}) vs ({bb},{bn:?})"
+                );
+                if (ab, an) != (bb, bn) {
+                    assert_ne!(forward, Ordering::Equal);
+                }
+            }
+        }
+    }
 }
