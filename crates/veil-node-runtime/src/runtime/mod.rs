@@ -540,6 +540,16 @@ pub fn pick_quorum_match(
 
 pub struct NodeRuntime {
     config_path: PathBuf,
+    /// Home of this node's identity material, resolved ONCE at construction
+    /// from `[global] identity_dir` or, failing that, the config file's
+    /// directory.
+    ///
+    /// It is a field rather than a derivation because it used to be derived —
+    /// `config_path.parent()`, written out ten times across this crate. Every
+    /// copy agreed only as long as the answer was that one expression; an
+    /// identity directory that half the code agrees on is worse than none,
+    /// because the loader finds a document where the republisher finds nothing.
+    identity_dir: PathBuf,
     foreground_mode: bool,
     registry: Arc<TransportRegistry>,
     transport_ctx: Arc<TransportContext>,
@@ -1192,16 +1202,19 @@ impl NodeRuntime {
         let transport_ctx = Arc::new(veil_cfg::transport_glue::context_from_config(&config)?);
         let local_identity = Arc::new(HandshakeIdentity::from_config(&config)?);
 
-        // veil_dir is the node config's parent — home of the identity files
-        // (`device_identity_sk.bin`, `mlkem.key`) read by the sovereign load and
-        // the ML-KEM key resolution. The ML-KEM keypair is resolved AFTER the
-        // sovereign auto-load below (not here), because its identity-derived path
-        // needs `device_identity_sk.bin`, which the standalone-identity build
-        // writes during that auto-load.
-        let veil_dir_path = config_path
-            .parent()
-            .unwrap_or(std::path::Path::new("."))
-            .to_path_buf();
+        // veil_dir is home to the identity files (`device_identity_sk.bin`,
+        // `mlkem.key`) read by the sovereign load and the ML-KEM key resolution.
+        // The ML-KEM keypair is resolved AFTER the sovereign auto-load below
+        // (not here), because its identity-derived path needs
+        // `device_identity_sk.bin`, which the standalone-identity build writes
+        // during that auto-load.
+        //
+        // Normally the config file's own directory. `[global] identity_dir`
+        // overrides it, and an EMBEDDED host has to use that: deferred init
+        // stages the config in a per-boot temp directory this crate creates and
+        // scrubs, so a host that provisions an identity of its own has nowhere
+        // to put it and would silently get the degenerate document instead.
+        let veil_dir_path = config.identity_dir_for(&config_path);
 
         // sovereign-identity auto-load. Three paths:
         //
@@ -2194,6 +2207,7 @@ impl NodeRuntime {
         let force_reconnect_notify_arc = Arc::new(tokio::sync::Notify::new());
         let mut runtime = Self {
             config_path,
+            identity_dir: veil_dir_path.clone(),
             foreground_mode,
             registry,
             transport_ctx,

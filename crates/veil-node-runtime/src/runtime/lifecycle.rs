@@ -433,15 +433,60 @@ impl NodeRuntime {
         // multi-device IdentityDocument (is_standalone()==false) is never touched,
         // and a rebuild for an unchanged identity is idempotent (same keypair →
         // same node_id).
-        let new_sovereign = match self.identity.sovereign_identity.get() {
-            Some(sov) if sov.is_standalone() => {
-                let veil_dir = self
-                    .config_path
-                    .parent()
-                    .unwrap_or_else(|| std::path::Path::new("."));
-                build_standalone_sovereign_identity(veil_dir, &config, &self.logger).or(Some(sov))
+        // The identity directory is a property of the config, and THIS is where
+        // the real config arrives. A deferred boot constructs the runtime under
+        // a throwaway stub that names none, so whatever was resolved at
+        // construction pointed at veil's own per-boot staging directory. Every
+        // read below — and every later republish, re-issue and name-claim scan
+        // that uses this field — has to be against the promoted answer.
+        self.identity_dir = config.identity_dir_for(&self.config_path);
+
+        // A provisioned document the construction pass COULD NOT have seen: it
+        // tested for one in the staging directory, which by definition holds
+        // nothing an embedding host put there. If one is on disk now it wins
+        // over any degenerate rebuild — that is the whole difference between one
+        // identity with several devices and several devices that collide into
+        // one node.
+        let doc_path = self
+            .identity_dir
+            .join(veil_identity::sovereign::IDENTITY_DOCUMENT_FILE);
+        let provisioned = if doc_path.exists() {
+            match veil_identity::sovereign::SovereignIdentity::load_from_dir(&self.identity_dir) {
+                Ok(sov) => {
+                    self.logger.info(
+                        "node.sovereign_identity.loaded",
+                        format!(
+                            "node_id={} instance_id={} (promoted on reload from {})",
+                            veil_util::bytes_to_hex(sov.node_id()),
+                            veil_util::bytes_to_hex(&sov.active_instance_id()),
+                            self.identity_dir.display(),
+                        ),
+                    );
+                    Some(Arc::new(sov))
+                }
+                Err(e) => {
+                    // Fail loud, then carry on the old way. A document that
+                    // exists and does not load is an identity its owner
+                    // provisioned and this node cannot use — the one case that
+                    // must never pass as ordinary (audit V-07).
+                    self.logger.error(
+                        "node.sovereign_identity.load_failed",
+                        format!("{e} — {} exists but did not load", doc_path.display()),
+                    );
+                    None
+                }
             }
-            other => other,
+        } else {
+            None
+        };
+
+        let new_sovereign = match (provisioned, self.identity.sovereign_identity.get()) {
+            (Some(loaded), _) => Some(loaded),
+            (None, Some(sov)) if sov.is_standalone() => {
+                build_standalone_sovereign_identity(&self.identity_dir, &config, &self.logger)
+                    .or(Some(sov))
+            }
+            (None, other) => other,
         };
         // Reuse the SAME shared cell across the reload (only refresh its
         // contents): long-lived holders — the maintenance re-issue tick
@@ -530,11 +575,7 @@ impl NodeRuntime {
         // The mailbox kept working throughout — it resolves different records —
         // which is exactly why this looked like anything but an identity bug.
         if identity_changed && let Some(sov) = self.identity.sovereign_identity.get() {
-            let veil_dir_path = self
-                .config_path
-                .parent()
-                .unwrap_or_else(|| std::path::Path::new("."))
-                .to_path_buf();
+            let veil_dir_path = self.identity_dir.clone();
             super::identity_publish::publish_sovereign_identity(
                 &sov,
                 &self.dht,
@@ -930,9 +971,7 @@ impl NodeRuntime {
         Option<Arc<x25519_dalek::StaticSecret>>,
     ) {
         rederive_identity_bound_keys(
-            self.config_path
-                .parent()
-                .unwrap_or(std::path::Path::new(".")),
+            &self.identity_dir,
             config.global.mlkem_rotation_secs,
             self.dispatcher.anonymity_x25519_sk.is_some(),
             &self.logger,
