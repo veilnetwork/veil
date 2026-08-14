@@ -412,6 +412,98 @@ impl DhtMlKemEkResolver {
         Some(verified)
     }
 
+    /// Every instance of the recipient, so a message reaches every device of
+    /// one identity instead of whichever the registry happened to list first.
+    ///
+    /// [`Self::fetch_verified_cert`] picks ONE — `max_by_key(last_seen_unix_ms)`
+    /// over the registry — which was right only while an identity had exactly
+    /// one device. With two it delivers to one of them, and since
+    /// `last_seen_unix_ms` is published as 0 that is not even a choice, just
+    /// whichever came first. The other device receives nothing and cannot tell:
+    /// it is online, its cert is published, and mail addressed to the identity
+    /// goes elsewhere. The fan-out format was built for exactly this — one
+    /// envelope per instance, each bound to its own instance_id and
+    /// cert_version — and was being handed a slice of one.
+    ///
+    /// Deliberately does NOT read the single-cert cache: that cache holds one
+    /// cert per recipient and cannot answer "all of them". A device that
+    /// resolves but whose cert is missing is skipped rather than failing the
+    /// send — it may never have come online since it was admitted — so this
+    /// returns the ones that verified, and empty only when none did.
+    pub async fn fetch_verified_certs(&self, target_node_id: [u8; 32]) -> Vec<VerifiedMlkemCert> {
+        let Some(doc) = self.fetch_verified_document(target_node_id, None).await else {
+            return Vec::new();
+        };
+        let Ok(now) = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) else {
+            return Vec::new();
+        };
+        let now_unix = now.as_secs();
+
+        let reg_key = InstanceRegistry::dht_key(&target_node_id);
+        let Some(reg) = self
+            .dht_get_freshest(
+                reg_key,
+                |b| {
+                    InstanceRegistry::decode(b).ok().filter(|r| {
+                        r.node_id == target_node_id && verify_instance_registry_sig(r, &doc)
+                    })
+                },
+                |r| {
+                    (
+                        r.instances
+                            .iter()
+                            .map(|i| i.last_seen_unix_ms)
+                            .max()
+                            .unwrap_or(0),
+                        0,
+                    )
+                },
+            )
+            .await
+        else {
+            self.log_dbg("mlkem_resolver.registry.dht_miss", &target_node_id, "");
+            return Vec::new();
+        };
+
+        let mut out: Vec<VerifiedMlkemCert> = Vec::with_capacity(reg.instances.len());
+        for instance in &reg.instances {
+            let cert_key = MlKemKeyCert::dht_key(&target_node_id, &instance.instance_id);
+            let Some(cert) = self
+                .dht_get_freshest(
+                    cert_key,
+                    |b| {
+                        MlKemKeyCert::decode(b)
+                            .ok()
+                            .filter(|c| verify_mlkem_cert(c, &doc, now_unix).is_ok())
+                    },
+                    |c| (c.cert_version, c.valid_from_unix),
+                )
+                .await
+            else {
+                self.log_dbg("mlkem_resolver.cert.dht_miss", &target_node_id, "");
+                continue;
+            };
+            match verify_mlkem_cert(&cert, &doc, now_unix) {
+                Ok(verified) => out.push(verified),
+                Err(e) => self.log_dbg(
+                    "mlkem_resolver.cert.verify_failed",
+                    &target_node_id,
+                    &format!("{e:?}"),
+                ),
+            }
+        }
+        self.logger.debug(
+            "mlkem_resolver.resolved_all",
+            format!(
+                "target={} instances={} of {}",
+                hex8(&target_node_id),
+                out.len(),
+                reg.instances.len(),
+            ),
+        );
+        out
+    }
+
     /// Resolve + verify a node's relay X25519 KEM public key from the DHT:
     /// fetch its verified `IdentityDocument` (to obtain the signing subkey),
     /// then recursive-walk `RelayKeyRecord::dht_key(node_id)` and verify the
