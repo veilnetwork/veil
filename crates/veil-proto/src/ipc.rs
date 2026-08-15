@@ -3119,6 +3119,158 @@ impl MailboxFetchRespPayload {
     }
 }
 
+/// A request for one slice of one stored blob.
+///
+/// Wire layout: `[content_id (32) | offset u32 BE]` — 36 bytes.
+///
+/// Sent to `MAILBOX_SLICE_ENDPOINT_ID` over the same authenticated path a FETCH
+/// uses, so the relay knows WHOSE mailbox to read without being told: the
+/// requester's verified identity is the receiver, exactly as for FETCH. There is
+/// deliberately no receiver field to disagree with it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MailboxSliceReqPayload {
+    /// Which stored blob. Announced by a FETCH reply as an entry whose blob is
+    /// empty — see [`MailboxSlicePayload`].
+    pub content_id: [u8; 32],
+    /// Byte offset into the blob. The receiver walks it upward until it holds
+    /// [`MailboxSlicePayload::total_len`] bytes.
+    pub offset: u32,
+}
+
+impl MailboxSliceReqPayload {
+    /// Fixed wire size.
+    pub const WIRE_SIZE: usize = 32 + 4;
+
+    /// Encode to wire bytes.
+    pub fn encode(&self) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(Self::WIRE_SIZE);
+        buf.extend_from_slice(&self.content_id);
+        buf.extend_from_slice(&self.offset.to_be_bytes());
+        buf
+    }
+
+    /// Decode from wire bytes.
+    pub fn decode(buf: &[u8]) -> Result<Self, ProtoError> {
+        if buf.len() < Self::WIRE_SIZE {
+            return Err(ProtoError::BufferTooShort {
+                need: Self::WIRE_SIZE,
+                got: buf.len(),
+            });
+        }
+        Ok(Self {
+            content_id: super::read_array::<32>(buf, 0)?,
+            offset: super::read_u32_be(buf, 32)?,
+        })
+    }
+}
+
+/// One slice of one stored blob, the reply to a [`MailboxSliceReqPayload`].
+///
+/// Wire layout: `[content_id (32) | offset u32 BE | total_len u32 BE |
+/// bytes_len u32 BE | bytes]`.
+///
+/// Why this exists: a FETCH reply is ONE signed auth-deliver message, and a
+/// mailbox blob carries one ML-KEM envelope per recipient DEVICE — which is what
+/// makes a message addressed to an identity reach all of it. So the blob grows
+/// with the identity, and past a few devices no message of any size fits in one
+/// reply. The deposit side was never the limit: a PUT is chunked and carries up
+/// to a megabyte. Only the reply was.
+///
+/// `total_len` is repeated in every slice rather than sent once, so a receiver
+/// that starts mid-blob — after a restart, or a lost first reply — knows how
+/// much it is collecting without a separate round trip to ask.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MailboxSlicePayload {
+    /// Which blob this is part of.
+    pub content_id: [u8; 32],
+    /// Where `bytes` starts within the blob.
+    pub offset: u32,
+    /// Full length of the blob, in every slice. Zero means the relay holds no
+    /// such blob for this receiver — an answer, not an empty slice, so a
+    /// receiver does not loop forever on a blob that has aged out or been acked
+    /// from another device.
+    pub total_len: u32,
+    /// This slice.
+    pub bytes: Vec<u8>,
+}
+
+impl MailboxSlicePayload {
+    /// Header size before `bytes`.
+    pub const HEADER_SIZE: usize = 32 + 4 + 4 + 4;
+
+    /// Encode to wire bytes.
+    pub fn encode(&self) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(Self::HEADER_SIZE + self.bytes.len());
+        buf.extend_from_slice(&self.content_id);
+        buf.extend_from_slice(&self.offset.to_be_bytes());
+        buf.extend_from_slice(&self.total_len.to_be_bytes());
+        buf.extend_from_slice(&(self.bytes.len() as u32).to_be_bytes());
+        buf.extend_from_slice(&self.bytes);
+        buf
+    }
+
+    /// Decode from wire bytes.
+    pub fn decode(buf: &[u8]) -> Result<Self, ProtoError> {
+        if buf.len() < Self::HEADER_SIZE {
+            return Err(ProtoError::BufferTooShort {
+                need: Self::HEADER_SIZE,
+                got: buf.len(),
+            });
+        }
+        let content_id = super::read_array::<32>(buf, 0)?;
+        let offset = super::read_u32_be(buf, 32)?;
+        let total_len = super::read_u32_be(buf, 36)?;
+        let bytes_len = super::read_u32_be(buf, 40)? as usize;
+        // Bound BEFORE allocating: the length is attacker-supplied on a path
+        // whose sender is anonymous, and the same cap the deposit is held to is
+        // the only honest ceiling for what may come back out of it.
+        if total_len as usize > MAX_MAILBOX_BLOB_BYTES {
+            return Err(ProtoError::ValueTooLarge {
+                field: "mailbox_slice.total_len",
+                value: u64::from(total_len),
+                max: MAX_MAILBOX_BLOB_BYTES as u64,
+            });
+        }
+        if bytes_len > MAX_MAILBOX_BLOB_BYTES {
+            return Err(ProtoError::ValueTooLarge {
+                field: "mailbox_slice.bytes_len",
+                value: bytes_len as u64,
+                max: MAX_MAILBOX_BLOB_BYTES as u64,
+            });
+        }
+        let end = Self::HEADER_SIZE
+            .checked_add(bytes_len)
+            .ok_or(ProtoError::Malformed(
+                "mailbox_slice: bytes_len overflow".to_owned(),
+            ))?;
+        if buf.len() < end {
+            return Err(ProtoError::BufferTooShort {
+                need: end,
+                got: buf.len(),
+            });
+        }
+        // A slice that claims to reach past the end of the blob it belongs to is
+        // malformed rather than merely odd: a receiver sizing its reassembly
+        // from `total_len` would be written outside it.
+        let reach = (offset as usize)
+            .checked_add(bytes_len)
+            .ok_or(ProtoError::Malformed(
+                "mailbox_slice: offset overflow".to_owned(),
+            ))?;
+        if reach > total_len as usize {
+            return Err(ProtoError::Malformed(format!(
+                "mailbox_slice: offset {offset} + {bytes_len} exceeds total {total_len}"
+            )));
+        }
+        Ok(Self {
+            content_id,
+            offset,
+            total_len,
+            bytes: buf[Self::HEADER_SIZE..end].to_vec(),
+        })
+    }
+}
+
 /// Payload [`crate::family::LocalAppMsg::MailboxAck`].
 ///
 /// Wire layout: `[receiver_id (32) | content_id (32) | auth_cookie (16)]`
@@ -6805,6 +6957,7 @@ mod tests {
             require_ack: false,
             anonymous: false,
             anonymous_authenticated: false,
+            my_other_devices: false,
             expect_reply: false,
             is_reply: false,
             reply_id: 0,
@@ -6826,6 +6979,7 @@ mod tests {
             require_ack: true,
             anonymous: false,
             anonymous_authenticated: true,
+            my_other_devices: false,
             expect_reply: false,
             is_reply: false,
             reply_id: 0,
@@ -6857,6 +7011,7 @@ mod tests {
             require_ack: false,
             anonymous: false,
             anonymous_authenticated: true,
+            my_other_devices: false,
             expect_reply: true,
             is_reply: false,
             reply_id: 0,
@@ -6877,6 +7032,7 @@ mod tests {
             require_ack: false,
             anonymous: false,
             anonymous_authenticated: false,
+            my_other_devices: false,
             expect_reply: false,
             is_reply: true,
             reply_id: 0xDEAD_BEEF_0000_0042,
@@ -6902,6 +7058,7 @@ mod tests {
             require_ack: true,
             anonymous: false,
             anonymous_authenticated: false,
+            my_other_devices: false,
             expect_reply: false,
             is_reply: false,
             reply_id: 0,
@@ -7604,6 +7761,82 @@ mod tests {
         assert_eq!(buf.len(), MailboxFetchPayload::WIRE_SIZE);
         let d = MailboxFetchPayload::decode(&buf).unwrap();
         assert_eq!(d, p);
+    }
+
+    #[test]
+    fn mailbox_slice_request_round_trips() {
+        let p = MailboxSliceReqPayload {
+            content_id: [7u8; 32],
+            offset: 5_000,
+        };
+        let buf = p.encode();
+        assert_eq!(buf.len(), MailboxSliceReqPayload::WIRE_SIZE);
+        assert_eq!(MailboxSliceReqPayload::decode(&buf).unwrap(), p);
+    }
+
+    #[test]
+    fn mailbox_slice_round_trips_and_carries_the_total_in_every_piece() {
+        // The total is repeated in each slice so a receiver that starts mid-blob
+        // — after a restart, or a lost first reply — knows how much it is
+        // collecting without another round trip.
+        let p = MailboxSlicePayload {
+            content_id: [9u8; 32],
+            offset: 4_096,
+            total_len: 12_000,
+            bytes: vec![0xABu8; 2_048],
+        };
+        let d = MailboxSlicePayload::decode(&p.encode()).unwrap();
+        assert_eq!(d, p);
+        assert_eq!(d.total_len, 12_000);
+    }
+
+    /// A slice reaching past the end of the blob it claims to belong to is
+    /// malformed, not merely odd: a receiver sizes its reassembly buffer from
+    /// `total_len`, so accepting this writes outside it.
+    #[test]
+    fn mailbox_slice_rejects_a_piece_that_reaches_past_the_total() {
+        let mut buf = MailboxSlicePayload {
+            content_id: [1u8; 32],
+            offset: 0,
+            total_len: 100,
+            bytes: vec![0u8; 10],
+        }
+        .encode();
+        // offset := 95, so 95 + 10 > 100.
+        buf[32..36].copy_from_slice(&95u32.to_be_bytes());
+        assert!(MailboxSlicePayload::decode(&buf).is_err());
+    }
+
+    /// A length is bounded BEFORE anything is allocated for it. The sender on
+    /// this path is anonymous, so the field is attacker-supplied by
+    /// construction.
+    #[test]
+    fn mailbox_slice_rejects_an_absurd_total_without_allocating() {
+        let mut buf = MailboxSlicePayload {
+            content_id: [1u8; 32],
+            offset: 0,
+            total_len: 8,
+            bytes: vec![0u8; 8],
+        }
+        .encode();
+        buf[36..40].copy_from_slice(&u32::MAX.to_be_bytes());
+        assert!(MailboxSlicePayload::decode(&buf).is_err());
+    }
+
+    /// Zero total is the relay saying "no such blob", not an empty slice — so a
+    /// receiver stops instead of looping on a blob that aged out or was acked
+    /// from another device.
+    #[test]
+    fn mailbox_slice_can_say_there_is_no_such_blob() {
+        let p = MailboxSlicePayload {
+            content_id: [3u8; 32],
+            offset: 0,
+            total_len: 0,
+            bytes: Vec::new(),
+        };
+        let d = MailboxSlicePayload::decode(&p.encode()).unwrap();
+        assert_eq!(d.total_len, 0);
+        assert!(d.bytes.is_empty());
     }
 
     #[test]
