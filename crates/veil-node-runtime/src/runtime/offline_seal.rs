@@ -197,8 +197,32 @@ impl RuntimeMailboxCrypto {
         let sovereign = self.sovereign.get().ok_or(OfflineSealError::NoIdentity)?;
         let now = now_unix();
         let nonce = rand_core::OsRng.next_u64();
+        // THE CRYPTOGRAPHIC RECIPIENT IS THE IDENTITY whenever the addressee is
+        // any device of ours. Everything a recipient's crypto lives under — the
+        // registry, the per-instance certs, the fan-out binding the certs are
+        // checked against — is keyed by the identity, and the transport id is
+        // only the relay's STORAGE key. Sealing with the transport id as the
+        // binding failed `NodeIdMismatch` against every honest cert (measured,
+        // once the seal error had a voice), and on the master it only ever
+        // worked because its transport id IS the identity.
+        //
+        // The auth's dst uses the same value, because the opener reconstructs
+        // dst as the id it opened under — the two must be one choice.
+        let identity = sovereign.document.node_id;
+        let addressed_to_us = audience == MailboxAudience::MyOtherDevices
+            || recipient_node_id == self.local_node_id
+            || sovereign
+                .document
+                .identity_keys
+                .iter()
+                .any(|key| key.device_id == recipient_node_id);
+        let crypto_recipient = if addressed_to_us {
+            identity
+        } else {
+            recipient_node_id
+        };
         let auth = sovereign.sign_auth_deliver(
-            recipient_node_id,
+            crypto_recipient,
             app_id,
             endpoint_id,
             now,
@@ -232,16 +256,13 @@ impl RuntimeMailboxCrypto {
             }
         } else if recipient_node_id == self.local_node_id {
             vec![local_verified_cert(
-                self.local_node_id,
+                // Under the identity, like the published copy: the fan-out
+                // refuses any cert whose node id is not the recipient binding.
+                identity,
                 sovereign.active_instance_id(),
                 &self.mlkem_keys.current_seed(),
             )?]
-        } else if sovereign
-            .document
-            .identity_keys
-            .iter()
-            .any(|key| key.device_id == recipient_node_id)
-        {
+        } else if addressed_to_us {
             // The recipient is OUR OWN DEVICE, addressed by its transport id.
             // Everything it publishes — instance registry and per-instance
             // certs — lives under the IDENTITY, so a resolve under the
@@ -258,9 +279,7 @@ impl RuntimeMailboxCrypto {
             // nothing. Sealing to every instance of the identity is the
             // device-sync fan-out semantics — each device opens its own
             // envelope, the rest ignore it.
-            self.mlkem_resolver()
-                .fetch_verified_certs(sovereign.document.node_id)
-                .await
+            self.mlkem_resolver().fetch_verified_certs(identity).await
         } else {
             // EVERY device of the recipient. Sealing to one delivered to
             // whichever instance the registry listed first and silently not to
@@ -291,7 +310,7 @@ impl RuntimeMailboxCrypto {
             &auth,
             &certs,
             &sovereign.document.node_id,
-            &recipient_node_id,
+            &crypto_recipient,
             &sovereign.document,
         )
         .map_err(OfflineSealError::Seal)
@@ -321,21 +340,34 @@ impl RuntimeMailboxCrypto {
         // eras across the three would fail in a way that reads like a forged
         // blob rather than a stale key.
         let candidates = self.mlkem_keys.decrypt_seeds(now);
+        // Which id this blob was bound TO. Mail for us is bound to the
+        // IDENTITY — that is where our certs live and what the seal side now
+        // writes — so the identity goes first. The transport id stays as the
+        // fallback for blobs sealed before the rule, on a master whose two ids
+        // are the same 32 bytes; on a sibling it never matches anything new.
+        let identity = sovereign.document.node_id;
+        let our_ids: Vec<[u8; 32]> = if identity == self.local_node_id {
+            vec![identity]
+        } else {
+            vec![identity, self.local_node_id]
+        };
         let mut recovered = None;
         let mut last_err = None;
-        for dk_seed in candidates.iter() {
-            match mailbox_seal::recover_sender_node_id(
-                blob,
-                &our_instance,
-                &self.local_node_id,
-                dk_seed,
-                our_cert_version,
-            ) {
-                Ok(id) => {
-                    recovered = Some((id, *dk_seed));
-                    break;
+        'outer: for our_node_id in our_ids.iter() {
+            for dk_seed in candidates.iter() {
+                match mailbox_seal::recover_sender_node_id(
+                    blob,
+                    &our_instance,
+                    our_node_id,
+                    dk_seed,
+                    our_cert_version,
+                ) {
+                    Ok(id) => {
+                        recovered = Some((id, *dk_seed, *our_node_id));
+                        break 'outer;
+                    }
+                    Err(e) => last_err = Some(e),
                 }
-                Err(e) => last_err = Some(e),
             }
         }
         // No candidate opened it. Report the LAST failure rather than a synthetic
@@ -344,8 +376,8 @@ impl RuntimeMailboxCrypto {
         // nothing at all, which cannot happen (it always yields the current
         // seed) — but saying so beats inventing a `MailboxSealError` that did
         // not occur.
-        let (sender_node_id, dk_seed) = match recovered {
-            Some(pair) => pair,
+        let (sender_node_id, dk_seed, our_node_id) = match recovered {
+            Some(triple) => triple,
             None => {
                 return Err(match last_err {
                     Some(e) => OfflineSealError::Open(e),
@@ -363,7 +395,7 @@ impl RuntimeMailboxCrypto {
         let embedded = mailbox_seal::recover_embedded_sender_doc(
             blob,
             &our_instance,
-            &self.local_node_id,
+            &our_node_id,
             &sender_node_id,
             &dk_seed,
             our_cert_version,
@@ -382,7 +414,7 @@ impl RuntimeMailboxCrypto {
         mailbox_seal::open_mailbox_blob(
             blob,
             &our_instance,
-            &self.local_node_id,
+            &our_node_id,
             &sender_node_id,
             &dk_seed,
             our_cert_version,
