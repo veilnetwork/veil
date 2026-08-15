@@ -25,13 +25,14 @@ use veil_types::BootstrapPeer;
     not(debug_assertions),
     not(test),
     not(feature = "production-seeds"),
+    not(feature = "testnet-seeds"),
     not(feature = "allow-empty-seeds"),
 ))]
 compile_error!(
     "release build without seeds: populate `builtin_seeds()` in \
      node/bootstrap/seeds.rs and build with `--features production-seeds`, \
-     or opt in to `--features allow-empty-seeds` for testnet / \
-     custom-deployment builds."
+     `--features testnet-seeds` for the testnet, or opt in to \
+     `--features allow-empty-seeds` for a custom deployment."
 );
 
 /// Hardcoded bootstrap seed list.
@@ -65,22 +66,69 @@ compile_error!(
 // with unrelated probe traffic). Tests + dev builds get the full
 // list because most unit tests exercise the "we have a seed list"
 // code path.
+/// No builtin seeds at all: `allow-empty-seeds` and nothing else chosen.
 #[cfg(all(
-    not(test),
-    not(debug_assertions),
     feature = "allow-empty-seeds",
     not(feature = "production-seeds"),
+    not(feature = "testnet-seeds"),
 ))]
 pub fn builtin_seeds() -> Vec<BootstrapPeer> {
     Vec::new()
 }
 
-#[cfg(not(all(
-    not(test),
-    not(debug_assertions),
-    feature = "allow-empty-seeds",
+/// THE TESTNET. Same hosts as production, own port, own obfs4 PSK, own
+/// identities — and it is the PSK that makes them separate networks rather
+/// than two ports on one: a node holding one cannot complete an obfs4
+/// handshake with a node holding the other.
+///
+/// It is also what a build with no seed feature gets, which is the point.
+/// `debug_assertions` used to select the PRODUCTION list, so every development
+/// build in every build path dialled the production seeds — the app's own
+/// build scripts passed no seed feature in debug at all. Development traffic
+/// now lands on the network built for it.
+#[cfg(all(
     not(feature = "production-seeds"),
-)))]
+    any(feature = "testnet-seeds", not(feature = "allow-empty-seeds")),
+))]
+pub fn builtin_seeds() -> Vec<BootstrapPeer> {
+    testnet_seeds()
+}
+
+/// The testnet seed nodes. Public values, mirrored by the app at
+/// `assets/testnet/seeds.json` and checked against this list in both
+/// directions by `test/bundled_seeds_match_builtin_test.dart` over there.
+pub fn testnet_seeds() -> Vec<BootstrapPeer> {
+    vec![
+        // TESTNET_SEEDS_BEGIN
+        veil_types::BootstrapPeer {
+            transport: "obfs4-tcp://203.12.31.146:5557".to_owned(),
+            public_key: "w/WPXT94DKI4CfgvJo3ti828dx/iYgncgOvXrbA8aBQ=".to_owned(),
+            nonce: "AE1JRw==".to_owned(),
+            algo: veil_types::SignatureAlgorithm::Ed25519,
+            tls_cert: None,
+            tls_ca_cert: None,
+        },
+        veil_types::BootstrapPeer {
+            transport: "obfs4-tcp://203.12.31.145:5557".to_owned(),
+            public_key: "muTNaMipdTGItwXorxG9sdJuJ91+YM8CSU7xhdmv/TE=".to_owned(),
+            nonce: "AQdiPQ==".to_owned(),
+            algo: veil_types::SignatureAlgorithm::Ed25519,
+            tls_cert: None,
+            tls_ca_cert: None,
+        },
+        veil_types::BootstrapPeer {
+            transport: "obfs4-tcp://203.12.31.134:5557".to_owned(),
+            public_key: "mZneNgnM8qo9aqxzB6EDt7fC1BA4Plwqr/+p8Pj7ORc=".to_owned(),
+            nonce: "AAAzoQ==".to_owned(),
+            algo: veil_types::SignatureAlgorithm::Ed25519,
+            tls_cert: None,
+            tls_ca_cert: None,
+        },
+        // TESTNET_SEEDS_END
+    ]
+}
+
+#[cfg(feature = "production-seeds")]
 pub fn builtin_seeds() -> Vec<BootstrapPeer> {
     // The public source ships with NO built-in seed nodes. Operators running
     // their own network populate this list with their bootstrap nodes'

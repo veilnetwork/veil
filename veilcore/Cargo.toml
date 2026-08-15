@@ -23,6 +23,7 @@ rocksdb-cold = ["dep:rocksdb", "veil-dht/rocksdb-cold"]
 # accidentally shipping a production binary that can't bootstrap without
 # explicit config.
 production-seeds = ["veil-bootstrap/production-seeds"]
+testnet-seeds = ["veil-bootstrap/testnet-seeds"]
 allow-empty-seeds = ["veil-bootstrap/allow-empty-seeds"]
 # Epic 447.4: opt-in to the heaviest sim/scenarios tests (≥55 s each) which
 # are otherwise `#[ignore]`d by default to keep the local dev sweep fast.
