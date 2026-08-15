@@ -65,6 +65,12 @@ impl NodeRuntime {
             // Legacy node — nothing to republish.
             return;
         };
+        // The CELL, so a document this task re-reads from disk becomes the
+        // document the rest of the node uses. Re-reading into the task's own
+        // handle and stopping there is what made a merged second device visible
+        // to the DHT and invisible to everything local: sealing, handshakes and
+        // the delegation re-issue all read the cell.
+        let sovereign_cell = self.identity.sovereign_identity.clone();
         let mut shutdown_rx = shutdown_tx.subscribe();
         let dht = Arc::clone(&self.dht);
         let dht_for_density = Arc::clone(&self.dht);
@@ -254,18 +260,20 @@ impl NodeRuntime {
                         .ok()
                         .and_then(|m| m.modified().ok());
 
-                // Rebuild the single-entry registry once before the loop so
-                // we don't reallocate it on every tick. reg_version stays
-                // at `1` for MVP (see startup publish note).
-                let mut registry = {
-                    let instance_entry = veil_identity::publish::build_instance_entry(
-                        sov.active_instance_id(),
-                        sov.sig_key_idx,
-                        String::new(),
-                        0,
-                    );
-                    sov.build_and_sign_registry(1, vec![instance_entry])
-                };
+                // Built once before the loop so we don't reallocate it on every
+                // tick — from the DOCUMENT, exactly as the startup publish
+                // builds it.
+                //
+                // It used to be a set of one (this device) under a constant
+                // `reg_version = 1`, which is the shape the startup path was
+                // fixed away from and this one was not. Left alone it undid that
+                // fix on a schedule: every device publishes under the same
+                // node_id, so each republish tick overwrote the registry naming
+                // both devices with one naming only the publisher, and the equal
+                // version gave the network no way to prefer the fuller record.
+                // A second device linked successfully and then dropped off the
+                // map within a tick.
+                let mut registry = super::identity_publish::full_registry(&sov);
 
                 // debounce window for topology-driven republish.
                 // Without it, every PEX walk / route announce / handshake
@@ -386,15 +394,14 @@ impl NodeRuntime {
                                             ),
                                         );
                                         sov = std::sync::Arc::new(new_sov);
+                                        // Everything else reads the cell, so a
+                                        // re-read that stops at this task's own
+                                        // handle changes what the DHT is told
+                                        // and nothing about what this node does.
+                                        sovereign_cell.set(std::sync::Arc::clone(&sov));
                                         // Rebuild registry with the fresh sovereign handle.
-                                        let new_entry =
-                                            veil_identity::publish::build_instance_entry(
-                                                sov.active_instance_id(),
-                                                sov.sig_key_idx,
-                                                String::new(),
-                                                0,
-                                            );
-                                        registry = sov.build_and_sign_registry(1, vec![new_entry]);
+                                        registry =
+                                            super::identity_publish::full_registry(&sov);
                                         // Immediate re-publish of document + registry.
                                         if let Err(e) = veil_identity::publish::publish_identity_document(
                                             &sov.document, &publisher,

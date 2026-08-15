@@ -18,6 +18,10 @@ pub enum NodeError {
     AdminProtocol(String),
     #[error("invalid argument: {0}")]
     InvalidArgument(String),
+    /// The node's own sovereign identity could not be read or could not be
+    /// used — a document that fails to load, or one naming somebody else.
+    #[error("identity error: {0}")]
+    Identity(String),
 }
 
 pub type Result<T> = std::result::Result<T, NodeError>;

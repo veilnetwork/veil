@@ -1253,6 +1253,28 @@ int veil_send(VeilApp *app,
 ;
 
 /**
+ * Send to the OTHER DEVICES of this identity.
+ *
+ * `my_node_id` is our own identity address. Every device of an identity
+ * answers to it, so a plain [`veil_send`] addressed there is short-circuited
+ * into a local delivery that never leaves the machine — right when an app
+ * addresses itself, wrong for a device sync. This says which is meant, and
+ * the node seals a copy per sibling instance with ours left out.
+ *
+ * A named export rather than a flags argument, following the other send
+ * classes here: the operation is different, not the same one qualified.
+ */
+
+int veil_send_to_my_devices(VeilApp *app,
+                            const uint8_t *my_node_id,
+                            const uint8_t *dst_app_id,
+                            uint32_t dst_endpoint_id,
+                            const uint8_t *data,
+                            size_t len,
+                            char **err_out)
+;
+
+/**
  * Send a loss-tolerant datagram over an already-active direct peer session at
  * REALTIME priority.
  *
@@ -3490,6 +3512,31 @@ int veil_node_apply_config(const VeilNode *node,
                            size_t config_len,
                            char **err_out)
 ;
+#endif
+
+#if defined(VEIL_FFI_NODE_EMBEDDED)
+/**
+ * Tell a running node to re-read `identity_document.bin` and republish, WITHOUT
+ * restarting anything.
+ *
+ * The counterpart to [`veil_node_apply_config`] for the one thing that is not a
+ * reconfiguration: a host that merges another device's document into the
+ * identity directory has changed a file the node already read, and the node has
+ * to read it again. Applying a config does that as a side effect of stopping
+ * and restarting every service — which drops every client's IPC connection, so
+ * the mailbox, chat and media clients all fail their next call. Measured on a
+ * two-device stand: the link succeeded and each deposit after it failed with
+ * `connection closed`.
+ *
+ * Returns 0 on success, -1 on failure with `*err_out` set (free it with
+ * `veil_free_string`). A document naming a DIFFERENT identity is a failure, not
+ * a silent no-op.
+ *
+ * # Safety
+ * `node` must be a live handle from `veil_node_start_deferred`; `err_out` (if
+ * non-null) must be a writable `*mut c_char` slot.
+ */
+ int veil_node_reload_identity(const VeilNode *node, char **err_out) ;
 #endif
 
 #if defined(VEIL_FFI_NODE_EMBEDDED)
