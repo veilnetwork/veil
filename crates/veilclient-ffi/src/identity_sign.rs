@@ -302,6 +302,67 @@ mod tests {
 
     /// The case the whole entry point exists for: a key that is NOT the hash
     /// preimage of the author still speaks for them, because the master said so.
+    /// THE ONE THE DEFECT WAS ABOUT: a restore that is handed the host's node
+    /// key must name THAT key in the document, not a fresh random one.
+    ///
+    /// With two keys the node signs with one and the document vouches for the
+    /// other, so every signature the device makes fails its own author binding
+    /// — silently, since such a message is stored, filtered out of every read
+    /// and skipped by every send.
+    #[test]
+    fn a_restore_given_a_node_key_names_that_key() {
+        use std::ffi::CString;
+        let toml = identity_toml();
+        // The key the node actually runs on.
+        let cfg = veil_cfg::parse_toml_str(&toml).expect("parse");
+        let identity = cfg.identity.expect("identity");
+        let node_pub = {
+            use base64::{Engine as _, engine::general_purpose::STANDARD};
+            STANDARD.decode(identity.public_key.as_bytes()).expect("pubkey")
+        };
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let dir_s = CString::new(dir.path().to_str().unwrap()).unwrap();
+        let label = CString::new("stand").unwrap();
+        let phrase = veil_identity::master_seed::encode_master_seed_to_phrase(
+            &[0x77u8; 32],
+        )
+        .expect("phrase");
+        let mut phrase_buf = phrase.to_string().into_bytes();
+        let mut err: *mut c_char = std::ptr::null_mut();
+        let rc = unsafe {
+            crate::veil_restore_identity_from_phrase_zeroize_with_node_key(
+                phrase_buf.as_mut_ptr(),
+                phrase_buf.len(),
+                dir_s.as_ptr() as *const u8,
+                dir_s.as_bytes().len(),
+                label.as_ptr() as *const u8,
+                label.as_bytes().len(),
+                toml.as_ptr(),
+                toml.len(),
+                &mut err,
+            )
+        };
+        assert_eq!(rc, 0, "restore failed: rc={rc}");
+
+        let sov = veil_identity::sovereign::SovereignIdentity::load_from_dir(dir.path())
+            .expect("load restored identity");
+        assert!(
+            sov.document
+                .identity_keys
+                .iter()
+                .any(|k| k.pubkey == node_pub),
+            "the document must name the node's own key, not a generated one",
+        );
+        // And the whole point: that key now verifies for this identity.
+        let mut node_pub_32 = [0u8; 32];
+        node_pub_32.copy_from_slice(&node_pub);
+        assert_eq!(
+            authorizes(&sov.document.encode(), sov.node_id(), &node_pub_32),
+            VERIFY_VALID,
+        );
+    }
+
     #[test]
     fn a_subkey_the_document_names_is_authorized() {
         let (doc, node_id, subkey) = standalone_document();

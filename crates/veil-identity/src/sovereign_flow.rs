@@ -666,6 +666,21 @@ pub struct RestoreIdentityOptions {
     /// name-claim continuity. Tests can also pass this bundle
     /// in-memory without touching disk.
     pub master_falcon_keypair_bytes: Option<Vec<u8>>,
+
+    /// This device's signing seed, when the caller already has one.
+    ///
+    /// A restore GENERATES a random device key and names it in the document.
+    /// That is one key too many on any host that already runs a node: the node
+    /// boots on its own mined key, signs with it, and is known to the network
+    /// by it — while the document vouches for a different key entirely. Every
+    /// signature the device makes then fails its own author binding, and the
+    /// symptoms are silent: the message is stored, filtered out of every read
+    /// and skipped by every send, with nothing anywhere saying why.
+    ///
+    /// Passing the node's own key here collapses the two into one, so "this
+    /// device" stops meaning two different things. `None` keeps the previous
+    /// behaviour for callers that have no node key to offer.
+    pub device_sk_seed: Option<Zeroizing<[u8; 32]>>,
 }
 
 /// Successful restoration result. The returned `document` is the
@@ -927,7 +942,12 @@ pub fn restore_identity(
     // Fresh per-device identity_sk (always Ed25519).
     // Phase 6 slice 6i — mlocked storage from the OsRng output forward.
     let mut identity_sk_seed: SensitiveBytesN<32> = SensitiveBytesN::new();
-    OsRng.fill_bytes(identity_sk_seed.as_mut_array());
+    match &opts.device_sk_seed {
+        // The host's node key, so the document names the key this device
+        // actually signs and handshakes with. See `device_sk_seed`.
+        Some(seed) => identity_sk_seed.as_mut_array().copy_from_slice(&seed[..]),
+        None => OsRng.fill_bytes(identity_sk_seed.as_mut_array()),
+    }
     let identity_sk = SigningKey::from_bytes(identity_sk_seed.as_array());
     let identity_pk = identity_sk.verifying_key();
 
@@ -2458,6 +2478,7 @@ mod tests {
             valid_until_unix: DELEGATE_NOW + 7 * 86_400,
             algo: veil_types::SignatureAlgorithm::Ed25519,
             master_falcon_keypair_bytes: None,
+        device_sk_seed: None,
         })
         .expect("provision")
     }
@@ -3249,6 +3270,7 @@ mod tests {
             valid_until_unix: now + 7 * 86_400,
             algo: SignatureAlgorithm::Falcon512,
             master_falcon_keypair_bytes: None,
+        device_sk_seed: None,
         })
         .expect_err("falcon-only restore must reject missing bundle");
         assert!(
@@ -3741,6 +3763,7 @@ mod tests {
             valid_until_unix: now + 7 * 86_400,
             algo: veil_types::SignatureAlgorithm::Ed25519,
             master_falcon_keypair_bytes: None,
+        device_sk_seed: None,
         }
     }
 
@@ -3867,7 +3890,8 @@ mod tests {
             now_unix: now,
             valid_until_unix: now + 7 * 86_400,
             algo: SignatureAlgorithm::Ed25519Falcon512Hybrid,
-            master_falcon_keypair_bytes: None, // ← the operator forgot to back up.
+            master_falcon_keypair_bytes: None,
+        device_sk_seed: None, // ← the operator forgot to back up.
         })
         .expect_err("must reject hybrid restore without master_falcon bundle");
         assert!(

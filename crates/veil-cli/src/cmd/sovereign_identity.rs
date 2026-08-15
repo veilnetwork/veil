@@ -701,6 +701,9 @@ fn restore<I: CommandIo>(
         valid_until_unix: now.saturating_add(args.valid_for_secs),
         algo,
         master_falcon_keypair_bytes,
+        // The CLI restores onto a host that has no node key of its own yet, so
+        // there is none to adopt: a key is generated, as before.
+        device_sk_seed: None,
     };
 
     io.emit(OutputEvent::message(format!(
@@ -1990,6 +1993,7 @@ fn import_qr_backup<I: CommandIo>(
         valid_until_unix: now + 7 * 86_400,
         algo: veil_types::SignatureAlgorithm::Ed25519,
         master_falcon_keypair_bytes: None,
+        device_sk_seed: None,
     })
     .map_err(|e| IdentityCliError::ImportQrBackup(format!("restore: {e}")))?;
 

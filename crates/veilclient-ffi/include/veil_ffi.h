@@ -2517,19 +2517,14 @@ int veil_verify_wake_hmac(const uint8_t *key_32,
  int veil_validate_bip39_phrase_zeroize(uint8_t *phrase, uintptr_t phrase_len, char **err_out) ;
 
 /**
- * Restore an identity from a BIP-39 master phrase, zeroizing the phrase on
- * consume.
+ * Restore an identity from a BIP-39 phrase, generating this device's key.
  *
- * Decodes `phrase` → master_seed → derives identity_sk → builds a fresh signed
- * `IdentityDocument` and writes `identity_document.bin`, `instance.toml`, and
- * `identity_sk.bin` to `veil_dir`. `instance_label` is the human-readable
- * device name (capped at 64 chars). Idempotent: same phrase + same `veil_dir`
- * regenerates the per-device key; the `node_id` (= BLAKE3(master_pk)) is stable.
+ * The original entry point, unchanged, for a host with no node identity of its
+ * own to offer. Every host that has already mined a node has one — see
+ * `veil_restore_identity_from_phrase_zeroize_with_node_key`.
  *
- * `phrase` is a SECRET, passed as a writable `(*mut u8, len)` buffer that is
- * overwritten with `0` before return on EVERY path. `veil_dir` and
- * `instance_label` are non-secret `(*const u8, len)` UTF-8. Returns `VEIL_OK`
- * on success; on failure sets `*err_out` and returns `VEIL_ERR`.
+ * # Safety
+ * As the with-node-key form, minus the TOML argument.
  */
 
 int veil_restore_identity_from_phrase_zeroize(uint8_t *phrase,
@@ -2539,6 +2534,43 @@ int veil_restore_identity_from_phrase_zeroize(uint8_t *phrase,
                                               const uint8_t *instance_label,
                                               uintptr_t instance_label_len,
                                               char **err_out)
+;
+
+/**
+ * Restore an identity and name THE HOST'S OWN NODE KEY as this device's
+ * subkey, taken from `identity_toml` — the config the node boots on.
+ *
+ * A restore otherwise mints a fresh random device key, which on a host that
+ * has already mined a node identity leaves TWO keys for one device: the node
+ * signs and handshakes with one, the identity document vouches for the other.
+ * Every signature the device makes then fails its own author binding, and does
+ * so in silence — the message is stored, filtered out of every read and
+ * skipped by every send, with nothing saying why. Measured on a two-device
+ * stand as a device whose own posts were invisible on the device that wrote
+ * them.
+ *
+ * Naming the node's key collapses the two, so "this device" stops meaning two
+ * different things. Nothing about the identity changes: the node_id is still
+ * BLAKE3(master_pk) and the master still signs the subkey — only WHICH subkey.
+ *
+ * `identity_toml` carries the node's private key and is NOT zeroized here: the
+ * caller owns those bytes and holds them for the life of the node anyway.
+ * `phrase` is zeroized exactly as in the other entry point.
+ *
+ * # Safety
+ * `phrase` must be writable for `phrase_len`; `veil_dir`, `instance_label` and
+ * `identity_toml` readable for their lengths; `err_out` a writable slot.
+ */
+
+int veil_restore_identity_from_phrase_zeroize_with_node_key(uint8_t *phrase,
+                                                            uintptr_t phrase_len,
+                                                            const uint8_t *veil_dir,
+                                                            uintptr_t veil_dir_len,
+                                                            const uint8_t *instance_label,
+                                                            uintptr_t instance_label_len,
+                                                            const uint8_t *identity_toml,
+                                                            uintptr_t identity_toml_len,
+                                                            char **err_out)
 ;
 
 /**

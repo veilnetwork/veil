@@ -8419,8 +8419,10 @@ pub unsafe extern "C" fn veil_validate_bip39_phrase_zeroize(
 /// overwritten with `0` before return on EVERY path. `veil_dir` and
 /// `instance_label` are non-secret `(*const u8, len)` UTF-8. Returns `VEIL_OK`
 /// on success; on failure sets `*err_out` and returns `VEIL_ERR`.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn veil_restore_identity_from_phrase_zeroize(
+/// The body of both restore entry points, differing only in whether the host
+/// had a node key to offer. See `device_sk_seed` below.
+unsafe fn restore_from_phrase_inner(
+    device_seed: Option<zeroize::Zeroizing<[u8; 32]>>,
     phrase: *mut u8,
     phrase_len: usize,
     veil_dir: *const u8,
@@ -8514,6 +8516,18 @@ pub unsafe extern "C" fn veil_restore_identity_from_phrase_zeroize(
         valid_until_unix: now_unix + VEIL_DEFAULT_RESTORE_VALIDITY_SECS,
         algo: veil_types::SignatureAlgorithm::Ed25519,
         master_falcon_keypair_bytes: None,
+        // ADOPT THE NODE'S OWN KEY when the host offers one, so the document
+        // names the key this device actually signs and handshakes with.
+        //
+        // A restore otherwise generates a fresh random device key, and a host
+        // that already mined a node identity then has TWO: the node signs with
+        // one and the document vouches for the other. Every signature the
+        // device makes fails its own author binding after that, silently — the
+        // message is stored, filtered out of every read and skipped by every
+        // send, with nothing anywhere saying why. Measured on a two-device
+        // stand: node key cdbbaa51…, document subkey 507614a8…, and the
+        // device's own posts invisible on the device that wrote them.
+        device_sk_seed: device_seed,
     };
 
     match veil_identity::sovereign_flow::restore_identity(opts) {
@@ -8524,6 +8538,124 @@ pub unsafe extern "C" fn veil_restore_identity_from_phrase_zeroize(
             }
             VEIL_ERR
         }
+    }
+}
+
+/// Restore an identity from a BIP-39 phrase, generating this device's key.
+///
+/// The original entry point, unchanged, for a host with no node identity of its
+/// own to offer. Every host that has already mined a node has one — see
+/// `veil_restore_identity_from_phrase_zeroize_with_node_key`.
+///
+/// # Safety
+/// As the with-node-key form, minus the TOML argument.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn veil_restore_identity_from_phrase_zeroize(
+    phrase: *mut u8,
+    phrase_len: usize,
+    veil_dir: *const u8,
+    veil_dir_len: usize,
+    instance_label: *const u8,
+    instance_label_len: usize,
+    err_out: *mut *mut c_char,
+) -> c_int {
+    unsafe {
+        restore_from_phrase_inner(
+            None,
+            phrase,
+            phrase_len,
+            veil_dir,
+            veil_dir_len,
+            instance_label,
+            instance_label_len,
+            err_out,
+        )
+    }
+}
+
+/// Restore an identity and name THE HOST'S OWN NODE KEY as this device's
+/// subkey, taken from `identity_toml` — the config the node boots on.
+///
+/// A restore otherwise mints a fresh random device key, which on a host that
+/// has already mined a node identity leaves TWO keys for one device: the node
+/// signs and handshakes with one, the identity document vouches for the other.
+/// Every signature the device makes then fails its own author binding, and does
+/// so in silence — the message is stored, filtered out of every read and
+/// skipped by every send, with nothing saying why. Measured on a two-device
+/// stand as a device whose own posts were invisible on the device that wrote
+/// them.
+///
+/// Naming the node's key collapses the two, so "this device" stops meaning two
+/// different things. Nothing about the identity changes: the node_id is still
+/// BLAKE3(master_pk) and the master still signs the subkey — only WHICH subkey.
+///
+/// `identity_toml` carries the node's private key and is NOT zeroized here: the
+/// caller owns those bytes and holds them for the life of the node anyway.
+/// `phrase` is zeroized exactly as in the other entry point.
+///
+/// # Safety
+/// `phrase` must be writable for `phrase_len`; `veil_dir`, `instance_label` and
+/// `identity_toml` readable for their lengths; `err_out` a writable slot.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn veil_restore_identity_from_phrase_zeroize_with_node_key(
+    phrase: *mut u8,
+    phrase_len: usize,
+    veil_dir: *const u8,
+    veil_dir_len: usize,
+    instance_label: *const u8,
+    instance_label_len: usize,
+    identity_toml: *const u8,
+    identity_toml_len: usize,
+    err_out: *mut *mut c_char,
+) -> c_int {
+    let Some(toml_str) = (unsafe { slice_to_str(identity_toml, identity_toml_len) }) else {
+        unsafe { write_err(err_out, "identity_toml is NULL or invalid UTF-8") };
+        return VEIL_ERR_INVALID_ARG;
+    };
+    let config = match veil_cfg::parse_toml_str(toml_str) {
+        Ok(c) => c,
+        Err(e) => {
+            unsafe { write_err(err_out, format!("identity_toml parse failed: {e}")) };
+            return VEIL_ERR_INVALID_ARG;
+        }
+    };
+    let Some(identity) = config.identity else {
+        unsafe { write_err(err_out, "identity_toml carries no [identity]") };
+        return VEIL_ERR_INVALID_ARG;
+    };
+    if identity.algo != veil_types::SignatureAlgorithm::Ed25519 {
+        unsafe {
+            write_err(err_out, "only an Ed25519 node key can be named as a device subkey")
+        };
+        return VEIL_ERR_INVALID_ARG;
+    }
+    let key_b64 = identity.private_key;
+    use base64::{Engine as _, engine::general_purpose::STANDARD};
+    // Ed25519 private keys ARE the 32-byte seed. Anything else is not a key
+    // this document can name, and guessing would put a subkey in the document
+    // that signs nothing.
+    let seed = match STANDARD.decode(key_b64.as_bytes()) {
+        Ok(bytes) if bytes.len() == 32 => {
+            let mut seed = [0u8; 32];
+            seed.copy_from_slice(&bytes);
+            zeroize::Zeroizing::new(seed)
+        }
+        _ => {
+            unsafe { write_err(err_out, "identity_toml key is not a 32-byte Ed25519 seed") };
+            return VEIL_ERR_INVALID_ARG;
+        }
+    };
+    unsafe {
+        restore_from_phrase_inner(
+            Some(seed),
+            phrase,
+            phrase_len,
+            veil_dir,
+            veil_dir_len,
+            instance_label,
+            instance_label_len,
+            err_out,
+        )
     }
 }
 
@@ -9304,6 +9436,7 @@ pub unsafe extern "C" fn veil_restore_identity_from_phrase_zeroize_with_password
         valid_until_unix: now_unix + VEIL_DEFAULT_RESTORE_VALIDITY_SECS,
         algo: veil_types::SignatureAlgorithm::Ed25519,
         master_falcon_keypair_bytes: None,
+        device_sk_seed: None,
     };
 
     match veil_identity::sovereign_flow::restore_identity(opts) {
