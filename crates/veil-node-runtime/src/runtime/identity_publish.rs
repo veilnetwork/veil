@@ -39,27 +39,36 @@ impl crate::runtime::NodeRuntime {
     ///
     /// So: load, install into the shared cell, publish. Nothing is stopped.
     ///
-    /// Refuses a document for a DIFFERENT identity. The directory is trusted to
-    /// hold OUR material; a document naming another node_id is either a mistake
-    /// or an attempt to make this node answer for someone else, and adopting it
-    /// would leave the node signing with a key its transport identity cannot
-    /// back. Returns how many devices the document names.
+    /// Refuses a document for a DIFFERENT IDENTITY — compared against the
+    /// identity currently in force, never against this node's transport key.
+    /// Those two are the same value only on a device that boots on the master
+    /// key; a device restored into an existing identity has a transport key of
+    /// its own, which is the entire point of the arrangement, and checking
+    /// against it refuses every legitimate re-read on exactly the devices this
+    /// exists for. What must not change is WHICH IDENTITY this node answers
+    /// for. Returns how many devices the document names.
     pub async fn reload_sovereign_identity(&self) -> crate::error::Result<usize> {
         use crate::error::NodeError;
 
         let dir = self.identity_dir.clone();
         let sov = veil_identity::sovereign::SovereignIdentity::load_from_dir(&dir)
-            .map_err(|e| NodeError::Identity(format!("identity re-read from {}: {e}", dir.display())))?;
-        let ours = *self.identity.local_identity.node_id.as_bytes();
-        if *sov.node_id() != ours {
+            .map_err(|e| {
+                NodeError::Identity(format!("identity re-read from {}: {e}", dir.display()))
+            })?;
+        // `load_from_dir` has already checked that the document still names the
+        // key on this disk, so a merge that dropped this device cannot get here.
+        if let Some(current) = self.identity.sovereign_identity.get()
+            && !identity_reload_allowed(*current.node_id(), *sov.node_id())
+        {
             return Err(NodeError::Identity(format!(
-                "identity re-read refused: {} names node_id={} but this node is {}",
+                "identity re-read refused: {} names identity {} but this node answers for {}",
                 dir.display(),
                 veil_util::bytes_to_hex(sov.node_id()),
-                veil_util::bytes_to_hex(&ours),
+                veil_util::bytes_to_hex(current.node_id()),
             )));
         }
         let devices = sov.document.identity_keys.len();
+        let identity = *sov.node_id();
         let sov = Arc::new(sov);
         self.identity.sovereign_identity.set(Arc::clone(&sov));
         super::identity_publish::publish_sovereign_identity(
@@ -69,21 +78,40 @@ impl crate::runtime::NodeRuntime {
             &dir,
             // Sessions exist by the time a host merges anything, so replicate —
             // a local-only publish is a record no peer can resolve.
-            Some((&self.session_tx_registry, ours)),
+            Some((
+                &self.session_tx_registry,
+                *self.identity.local_identity.node_id.as_bytes(),
+            )),
             &self.logger,
         )
         .await;
         self.logger.info(
             "node.sovereign_identity.reloaded",
             format!(
-                "node_id={} devices={} — re-read from {} without a runtime reload",
-                veil_util::bytes_to_hex(&ours),
+                "identity={} devices={} — re-read from {} without a runtime reload",
+                veil_util::bytes_to_hex(&identity),
                 devices,
                 dir.display(),
             ),
         );
         Ok(devices)
     }
+}
+
+/// May a document just read from disk replace the identity in force?
+///
+/// Two parameters, and the node's TRANSPORT key is deliberately not one of
+/// them. It is the same value as the identity only on a device that boots on
+/// the master key; a device restored into an existing identity has a transport
+/// key of its own — that is the whole arrangement — so comparing against it
+/// refuses every legitimate re-read on exactly the devices this exists for.
+/// Measured on a two-device stand: the restored one refused its own merge,
+/// naming its transport id as the reason.
+///
+/// What must hold is that the identity this node answers for does not change
+/// underneath it.
+pub(crate) fn identity_reload_allowed(in_force: [u8; 32], incoming: [u8; 32]) -> bool {
+    in_force == incoming
 }
 
 /// The registry to publish for `sov` — every device the document names, under
@@ -299,6 +327,16 @@ mod tests {
         .expect("persist standalone identity");
         veil_identity::sovereign::SovereignIdentity::load_from_dir(dir)
             .expect("load standalone identity")
+    }
+
+    /// A merge that adds a device keeps the identity, so it is allowed; a
+    /// document naming somebody else is not. The device's own transport key
+    /// cannot appear here at all, which is the point — see the function.
+    #[test]
+    fn a_re_read_may_add_devices_but_not_change_who_we_are() {
+        let identity = [0x11u8; 32];
+        assert!(identity_reload_allowed(identity, identity));
+        assert!(!identity_reload_allowed(identity, [0x22u8; 32]));
     }
 
     /// THE ONE THE SECOND DEVICE DISAPPEARED THROUGH.
