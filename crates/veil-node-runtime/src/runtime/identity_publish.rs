@@ -24,6 +24,85 @@ use veil_observability::NodeLogger;
 
 use veil_identity::sovereign::SovereignIdentity;
 
+impl crate::runtime::NodeRuntime {
+    /// Re-read the identity document from disk and tell the network about it.
+    ///
+    /// The small operation that used to have no spelling. A host that merges a
+    /// sibling's document — the moment two devices of one identity become one
+    /// identity with two devices — changes a file the running node had already
+    /// read, and the only way to make the node read it again was to apply a
+    /// config: a full stop-and-restart of every service. That works and costs
+    /// far too much. It tears down the IPC server, so every client connection
+    /// dies with it; measured on a two-device stand, the merge succeeded and
+    /// then every mailbox deposit failed with `connection closed` for as long as
+    /// the app kept running.
+    ///
+    /// So: load, install into the shared cell, publish. Nothing is stopped.
+    ///
+    /// Refuses a document for a DIFFERENT identity. The directory is trusted to
+    /// hold OUR material; a document naming another node_id is either a mistake
+    /// or an attempt to make this node answer for someone else, and adopting it
+    /// would leave the node signing with a key its transport identity cannot
+    /// back. Returns how many devices the document names.
+    pub async fn reload_sovereign_identity(&self) -> crate::error::Result<usize> {
+        use crate::error::NodeError;
+
+        let dir = self.identity_dir.clone();
+        let sov = veil_identity::sovereign::SovereignIdentity::load_from_dir(&dir)
+            .map_err(|e| NodeError::Identity(format!("identity re-read from {}: {e}", dir.display())))?;
+        let ours = *self.identity.local_identity.node_id.as_bytes();
+        if *sov.node_id() != ours {
+            return Err(NodeError::Identity(format!(
+                "identity re-read refused: {} names node_id={} but this node is {}",
+                dir.display(),
+                veil_util::bytes_to_hex(sov.node_id()),
+                veil_util::bytes_to_hex(&ours),
+            )));
+        }
+        let devices = sov.document.identity_keys.len();
+        let sov = Arc::new(sov);
+        self.identity.sovereign_identity.set(Arc::clone(&sov));
+        super::identity_publish::publish_sovereign_identity(
+            &sov,
+            &self.dht,
+            &self.identity.mlkem_keys,
+            &dir,
+            // Sessions exist by the time a host merges anything, so replicate —
+            // a local-only publish is a record no peer can resolve.
+            Some((&self.session_tx_registry, ours)),
+            &self.logger,
+        )
+        .await;
+        self.logger.info(
+            "node.sovereign_identity.reloaded",
+            format!(
+                "node_id={} devices={} — re-read from {} without a runtime reload",
+                veil_util::bytes_to_hex(&ours),
+                devices,
+                dir.display(),
+            ),
+        );
+        Ok(devices)
+    }
+}
+
+/// The registry to publish for `sov` — every device the document names, under
+/// the document's own issue time.
+///
+/// One function because there are three publishers (startup, the periodic
+/// republish task, the sim-only debug republish) and they disagreed. Two of them
+/// built a set of ONE — this device — under a constant `reg_version = 1`, which
+/// is the shape the startup path was deliberately moved away from: every device
+/// publishes under the same node_id, so a one-device registry overwrites the
+/// registry naming both, and an equal version gives the network nothing to
+/// prefer the fuller record by. A second device linked, worked, and vanished
+/// from the map at the next republish tick.
+pub(crate) fn full_registry(
+    sov: &SovereignIdentity,
+) -> veil_proto::instance_registry::InstanceRegistry {
+    sov.build_and_sign_registry(sov.registry_version(), sov.all_instance_entries())
+}
+
 /// Publish [`sov`]'s document, instance registry, ML-KEM certificate and any
 /// persisted name claims.
 ///
@@ -85,7 +164,7 @@ pub(crate) async fn publish_sovereign_identity(
     // the same document on all of them: identical registries instead of
     // contradicting ones, and a version that a device carrying an older
     // document loses rather than wins.
-    let registry = sov.build_and_sign_registry(sov.registry_version(), sov.all_instance_entries());
+    let registry = full_registry(sov);
     match veil_identity::publish::publish_instance_registry(&registry, &publisher).await {
         Ok(()) => logger.info(
             "node.sovereign_identity.registry_published",
@@ -198,5 +277,64 @@ pub(crate) async fn publish_sovereign_identity(
                 veil_util::bytes_to_hex(sov.node_id()),
             ),
         ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn standalone(dir: &std::path::Path) -> SovereignIdentity {
+        let seed = veil_util::sensitive_bytes::SensitiveBytesN::<32>::from_bytes([0x42u8; 32]);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        veil_identity::sovereign_flow::save_standalone_identity_to_dir(
+            dir,
+            &seed,
+            now - 3600,
+            now + 3 * 86_400,
+        )
+        .expect("persist standalone identity");
+        veil_identity::sovereign::SovereignIdentity::load_from_dir(dir)
+            .expect("load standalone identity")
+    }
+
+    /// THE ONE THE SECOND DEVICE DISAPPEARED THROUGH.
+    ///
+    /// Every device of an identity publishes its registry under the SAME
+    /// node_id, so a registry naming only the publisher does not sit beside the
+    /// one naming both — it replaces it. Two of the three publishers built
+    /// exactly that, under a constant version that could not lose the
+    /// tie-break, so a linked second device stayed reachable only until the
+    /// next republish tick.
+    #[test]
+    fn the_registry_names_every_device_the_document_does() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut sov = standalone(tmp.path());
+        assert_eq!(full_registry(&sov).instances.len(), 1, "one device so far");
+
+        // What linking does: the sibling's subkey joins the document.
+        let mut sibling = sov.document.identity_keys[0].clone();
+        sibling.device_id = [0xEEu8; 32];
+        sov.document.identity_keys.push(sibling);
+
+        let reg = full_registry(&sov);
+        assert_eq!(
+            reg.instances.len(),
+            2,
+            "a registry naming one device HIDES the other — it overwrites, it does not coexist",
+        );
+        assert!(
+            reg.instances
+                .iter()
+                .any(|i| i.instance_id == [0xEEu8; 16]),
+            "the device that joined has to be in it",
+        );
+        assert_eq!(
+            reg.reg_version, sov.document.issued_at_unix,
+            "a constant version cannot lose to a fuller record",
+        );
     }
 }
