@@ -817,6 +817,43 @@ void _sendReplyWorker(int appAddr, int replyId, Uint8List data) {
 /// sender lock and `block_on`s the daemon send path. That is usually quick, but
 /// call signaling heartbeats exercise it during exactly the busy media periods
 /// where a contended node can park the caller; keep it off Flutter's UI isolate.
+/// Off-isolate body of [AppHandle.sendToMyDevices]. Identical to
+/// [_sendWorker] but for the native entry point: the flag it sets is what
+/// stops the node short-circuiting a self-addressed frame into a local
+/// delivery that never leaves the machine.
+void _sendToMyDevicesWorker(int appAddr, Uint8List myNodeId, Uint8List dstAppId,
+    int dstEndpointId, Uint8List data) {
+  final app = Pointer<ffi.VeilApp>.fromAddress(appAddr);
+  final mine = calloc<Uint8>(32);
+  final dstApp = calloc<Uint8>(32);
+  final dataPtr = data.isNotEmpty ? calloc<Uint8>(data.length) : nullptr;
+  final errOut = calloc<Pointer<Utf8>>();
+  try {
+    mine.asTypedList(32).setAll(0, myNodeId);
+    dstApp.asTypedList(32).setAll(0, dstAppId);
+    if (data.isNotEmpty) {
+      dataPtr.asTypedList(data.length).setAll(0, data);
+    }
+    final rc = ffi.veilSendToMyDevices(
+      app,
+      mine,
+      dstApp,
+      dstEndpointId,
+      dataPtr,
+      data.length,
+      errOut,
+    );
+    if (rc != ffi.veilOk) {
+      throw VeilException('send failed: ${_readErrAndFree(errOut)}', code: rc);
+    }
+  } finally {
+    calloc.free(mine);
+    calloc.free(dstApp);
+    if (dataPtr != nullptr) calloc.free(dataPtr);
+    calloc.free(errOut);
+  }
+}
+
 void _sendWorker(int appAddr, Uint8List dstNodeId, Uint8List dstAppId,
     int dstEndpointId, Uint8List data) {
   final app = Pointer<ffi.VeilApp>.fromAddress(appAddr);
@@ -2429,6 +2466,28 @@ class AppHandle implements Finalizable {
     final appAddr = _app.address;
     return Isolate.run(
         () => _sendWorker(appAddr, dstNodeId, dstAppId, dstEndpointId, data));
+  }
+
+  /// Send to the OTHER DEVICES of this identity.
+  ///
+  /// [myNodeId] is our own identity address — the one every device of this
+  /// identity answers to, which is exactly why a plain [send] there does not
+  /// work: the node cannot tell "me" from "my other devices" and delivers the
+  /// frame locally, where it never leaves the machine. This says which is
+  /// meant; the node seals a copy per sibling and leaves ours out.
+  Future<void> sendToMyDevices({
+    required Uint8List myNodeId,
+    required Uint8List dstAppId,
+    required int dstEndpointId,
+    required Uint8List data,
+  }) async {
+    _ensureOpen();
+    if (myNodeId.length != 32 || dstAppId.length != 32) {
+      throw ArgumentError('my_node_id and dst_app_id must be 32 bytes');
+    }
+    final appAddr = _app.address;
+    return Isolate.run(() =>
+        _sendToMyDevicesWorker(appAddr, myNodeId, dstAppId, dstEndpointId, data));
   }
 
   /// Send a loss-tolerant datagram over an already-active direct peer session
