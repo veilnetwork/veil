@@ -50,6 +50,10 @@ veilclient = { path = "../../veilclient" }
 veil-onion-stream = { path = "../veil-onion-stream" }
 veil-app = { path = "../veil-app" }
 veil-identity = { path = "../veil-identity" }
+# Already in the build graph through veil-identity; named here because the
+# document-authorises entry point decodes an IdentityDocument by hand before
+# handing it to the audited verifier.
+veil-proto = { path = "../veil-proto" }
 veil-types = { path = "../veil-types" }
 # Runtime toggle for the slow-inbound-dispatch trace (rt_trace) on embedded
 # nodes — the session crate is already in-tree via the node runtime.
