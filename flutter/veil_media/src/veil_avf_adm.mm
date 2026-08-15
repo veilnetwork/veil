@@ -639,9 +639,22 @@ class VeilAvfAdm : public webrtc::webrtc_impl::AudioDeviceModuleDefault<
     // available, and the built-in speaker is the safe default for a call.
     AVAudioSession* session = [AVAudioSession sharedInstance];
     NSError* session_error = nil;
+    // Apple renamed this option in the iOS 26 SDK (…AllowBluetooth →
+    // …AllowBluetoothHFP) and the old spelling still resolves there, so the
+    // OLD one is the portable choice: the new one does not exist on an older
+    // Xcode, and this has to compile on whatever Xcode a contributor — or a CI
+    // runner — happens to have. It failed exactly that way, with "use of
+    // undeclared identifier", on a runner one SDK behind this machine.
+#if defined(__IPHONE_26_0) && \
+    __IPHONE_OS_VERSION_MAX_ALLOWED >= __IPHONE_26_0
+    const AVAudioSessionCategoryOptions bluetooth_option =
+        AVAudioSessionCategoryOptionAllowBluetoothHFP;
+#else
+    const AVAudioSessionCategoryOptions bluetooth_option =
+        AVAudioSessionCategoryOptionAllowBluetooth;
+#endif
     const AVAudioSessionCategoryOptions options =
-        AVAudioSessionCategoryOptionAllowBluetoothHFP |
-        AVAudioSessionCategoryOptionDefaultToSpeaker;
+        bluetooth_option | AVAudioSessionCategoryOptionDefaultToSpeaker;
     if (![session setCategory:AVAudioSessionCategoryPlayAndRecord
                          mode:AVAudioSessionModeVoiceChat
                       options:options
