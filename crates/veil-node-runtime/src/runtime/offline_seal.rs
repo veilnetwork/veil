@@ -236,6 +236,33 @@ impl RuntimeMailboxCrypto {
                 sovereign.active_instance_id(),
                 &self.mlkem_keys.current_seed(),
             )?]
+        } else if let Some(entry) = sovereign
+            .all_instance_entries()
+            .into_iter()
+            .find(|entry| {
+                sovereign
+                    .document
+                    .identity_keys
+                    .get(entry.bound_identity_key_idx as usize)
+                    .is_some_and(|key| key.device_id == recipient_node_id)
+            })
+        {
+            // The recipient is OUR OWN DEVICE, addressed by its transport id.
+            // Its document is this one, and its cert is published under the
+            // IDENTITY — `MlKemKeyCert::dht_key(identity, instance)` — so a
+            // resolve under the transport id walks a key nobody writes.
+            // Measured live: the master's every deposit to its sibling failed
+            // `mailbox_seal` while the sibling's deposits to the master (whose
+            // transport id IS the identity) sailed through, and the asymmetry
+            // read as a one-way network fault.
+            self.mlkem_resolver()
+                .certs_for_instances(
+                    sovereign.document.node_id,
+                    &sovereign.document,
+                    &[entry],
+                    now,
+                )
+                .await
         } else {
             // EVERY device of the recipient. Sealing to one delivered to
             // whichever instance the registry listed first and silently not to
