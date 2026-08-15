@@ -32,7 +32,6 @@ use veil_dispatcher::PendingRecursive;
 use veil_e2e::PeerMlKemCache;
 use veil_identity::mailbox_seal::{self, MailboxSealError};
 use veil_identity::mlkem_fanout::VerifiedMlkemCert;
-use veil_identity::sovereign::SovereignIdentity;
 use veil_identity::verify::verify_identity_document;
 use veil_observability::NodeLogger;
 use veil_proto::ipc::AuthAppDeliver;
@@ -132,7 +131,18 @@ pub struct RuntimeMailboxCrypto {
     peer_mlkem_keys: Arc<RwLock<PeerMlKemCache>>,
     peer_ratchet_keys: Arc<RwLock<veil_e2e::PeerRatchetKeyCache>>,
     peer_mlkem_certs: Arc<RwLock<PeerMlKemCertCache>>,
-    sovereign: Option<Arc<SovereignIdentity>>,
+    /// The CELL, not what it held when this handle was built.
+    ///
+    /// This sink is installed on the IPC server once and lives as long as the
+    /// server does, so a snapshot here freezes whichever document was in force
+    /// at that moment. That is exactly the defect the cell exists to prevent —
+    /// its own doc comment records the 2026-07-17 production case where a frozen
+    /// `Option<Arc<..>>` kept presenting an expired delegation — and it bit
+    /// again, differently: a second device merged into the document, the cell
+    /// was updated, and every deposit went on being sealed from the pre-merge
+    /// copy that named one device. Nothing short of restarting the whole runtime
+    /// made a merge visible, and restarting it dropped every client connection.
+    sovereign: super::identity_state::SovereignIdentityCell,
     mlkem_keys: Arc<veil_e2e::MlKemSeedRing>,
     logger: Arc<NodeLogger>,
 }
@@ -182,10 +192,9 @@ impl RuntimeMailboxCrypto {
         endpoint_id: u32,
         data: &[u8],
     ) -> Result<Vec<u8>, OfflineSealError> {
-        let sovereign = self
-            .sovereign
-            .as_ref()
-            .ok_or(OfflineSealError::NoIdentity)?;
+        // Read per call: a document merged since this handle was built is what
+        // decides who "my other devices" are.
+        let sovereign = self.sovereign.get().ok_or(OfflineSealError::NoIdentity)?;
         let now = now_unix();
         let nonce = rand_core::OsRng.next_u64();
         let auth = sovereign.sign_auth_deliver(
@@ -259,10 +268,7 @@ impl RuntimeMailboxCrypto {
         blob: &[u8],
         our_cert_version: u64,
     ) -> Result<AuthAppDeliver, OfflineSealError> {
-        let sovereign = self
-            .sovereign
-            .as_ref()
-            .ok_or(OfflineSealError::NoIdentity)?;
+        let sovereign = self.sovereign.get().ok_or(OfflineSealError::NoIdentity)?;
         let our_instance = sovereign.active_instance_id();
         let now = now_unix();
         // Recover the sender from the blob's sidecar (the anonymous mailbox
@@ -438,7 +444,7 @@ impl super::NodeRuntime {
             peer_mlkem_keys: Arc::clone(&self.identity.peer_mlkem_keys),
             peer_ratchet_keys: Arc::clone(&self.identity.peer_ratchet_keys),
             peer_mlkem_certs: Arc::clone(&self.identity.peer_mlkem_certs),
-            sovereign: self.identity.sovereign_identity.get(),
+            sovereign: self.identity.sovereign_identity.clone(),
             mlkem_keys: Arc::clone(&self.identity.mlkem_keys),
             logger: Arc::clone(&self.logger),
         }
@@ -487,10 +493,73 @@ mod tests {
             peer_mlkem_keys: Arc::new(RwLock::new(PeerMlKemCache::new())),
             peer_ratchet_keys: Arc::new(RwLock::new(veil_e2e::PeerRatchetKeyCache::new())),
             peer_mlkem_certs: Arc::new(RwLock::new(PeerMlKemCertCache::new())),
-            sovereign: Some(sov),
+            sovereign: crate::runtime::identity_state::SovereignIdentityCell::new(Some(sov)),
             mlkem_keys: ring,
             logger: Arc::new(NodeLogger::new_noop()),
         }
+    }
+
+    /// The handle follows the identity CELL, not whatever it held when built.
+    ///
+    /// This sink is installed on the IPC server once, at startup, and the app
+    /// reaches every deposit through it. Holding a snapshot meant a document
+    /// merged later — the whole of what linking a second device does — was
+    /// invisible to sealing for the life of the process: the registry said two
+    /// devices and every deposit kept being sealed from the copy that named one.
+    ///
+    /// Built here over an EMPTY cell so the difference is a plain error rather
+    /// than a shape argument: a snapshot is `None` forever, and the same handle
+    /// seals successfully the moment the cell is filled.
+    #[tokio::test]
+    async fn a_document_installed_after_the_handle_is_the_one_it_seals_from() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (ek, dk) = veil_e2e::generate_keypair();
+        let ring = Arc::new(veil_e2e::MlKemSeedRing::new(0, dk, ek));
+
+        let seed = veil_util::sensitive_bytes::SensitiveBytesN::<32>::from_bytes([0x31u8; 32]);
+        let now = now_unix();
+        veil_identity::sovereign_flow::save_standalone_identity_to_dir(
+            tmp.path(),
+            &seed,
+            now - 3600,
+            now + 3 * 86_400,
+        )
+        .expect("persist standalone identity");
+        let sov = Arc::new(
+            veil_identity::sovereign::SovereignIdentity::load_from_dir(tmp.path())
+                .expect("load standalone identity"),
+        );
+        let local_node_id = *sov.node_id();
+
+        let cell = crate::runtime::identity_state::SovereignIdentityCell::new(None);
+        let crypto = RuntimeMailboxCrypto {
+            dht: Arc::new(KademliaService::new(local_node_id)),
+            session_tx_registry: Arc::new(RwLock::new(SessionTxRegistry::new())),
+            pending_recursive: Arc::new(Mutex::new(HashMap::new())),
+            local_node_id,
+            peer_mlkem_keys: Arc::new(RwLock::new(PeerMlKemCache::new())),
+            peer_ratchet_keys: Arc::new(RwLock::new(veil_e2e::PeerRatchetKeyCache::new())),
+            peer_mlkem_certs: Arc::new(RwLock::new(PeerMlKemCertCache::new())),
+            sovereign: cell.clone(),
+            mlkem_keys: ring,
+            logger: Arc::new(NodeLogger::new_noop()),
+        };
+
+        assert!(
+            matches!(
+                crypto.seal(local_node_id, [0x77u8; 32], 9, b"before").await,
+                Err(OfflineSealError::NoIdentity)
+            ),
+            "nothing is installed yet",
+        );
+
+        // What a merge does: install a document into the cell the runtime shares.
+        cell.set(Arc::clone(&sov));
+
+        crypto
+            .seal(local_node_id, [0x77u8; 32], 9, b"after")
+            .await
+            .expect("the SAME handle must seal from the document now in force");
     }
 
     /// A mailbox blob sealed BEFORE a key rotation still opens after it.
