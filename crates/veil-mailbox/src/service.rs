@@ -88,6 +88,33 @@ pub const MAILBOX_WAKE_ENDPOINT_ID: u32 = 4;
 /// relay-debounced per receiver; a shallow buffer suffices.
 pub const MAILBOX_WAKE_ENDPOINT_CAPACITY: usize = 32;
 
+/// Endpoint id for fetching ONE blob in slices.
+///
+/// A FETCH reply is one signed auth-deliver message, so a blob larger than that
+/// could be stored and never handed back — the relay refuses such a deposit at
+/// the door, and refused a legitimate one. A mailbox blob carries one ML-KEM
+/// envelope PER RECIPIENT DEVICE, which is exactly what lets a message
+/// addressed to an identity reach all of it, so the size grows with the
+/// identity: measured, a 2874-byte frame sealed to 6976 bytes for an identity
+/// with one other device, and past three other devices no message of any size
+/// fits. Shrinking what the app sends cannot help, because the cost is charged
+/// per blob and it is the ENVELOPES that grow.
+///
+/// The deposit side was never the limit — a PUT is chunked and carries up to a
+/// megabyte. Only the reply was, and that asymmetry is what this closes.
+///
+/// The request is `content_id ‖ offset`; the reply is a
+/// [`veil_proto::ipc::MailboxSlicePayload`]. Each request is its own onion round
+/// trip carrying its own one-time reply path, so nothing has to reuse a reply
+/// block. Additive: a relay older than this endpoint binds nothing and drops the
+/// deliver, and a client older than it never asks — it sees the announced blob
+/// as an empty one and skips it, which is what the relay's own purge did before.
+pub const MAILBOX_SLICE_ENDPOINT_ID: u32 = 5;
+
+/// mpsc channel buffer depth for the SLICE endpoint. One in-flight slice per
+/// draining receiver, and slices are rarer than puts.
+pub const MAILBOX_SLICE_ENDPOINT_CAPACITY: usize = 64;
+
 /// Cap on the total blob bytes returned in a single network FETCH reply, so the
 /// response fits the anonymous reply path. A receiver re-fetches (after acking)
 /// to drain more. Smaller than the local-IPC fetch cap (which isn't onion-bound).
