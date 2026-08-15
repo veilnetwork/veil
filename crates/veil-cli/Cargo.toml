@@ -21,6 +21,7 @@ path = "src/bin/cli.rs"
 default = ["rocksdb-cold", "tls-boring"]
 rocksdb-cold = ["veilcore/rocksdb-cold"]
 production-seeds = ["veilcore/production-seeds"]
+testnet-seeds = ["veilcore/testnet-seeds"]
 allow-empty-seeds = ["veilcore/allow-empty-seeds"]
 slow-sim-tests = ["veilcore/slow-sim-tests"]
 test-low-difficulty = ["veilcore/test-low-difficulty"]

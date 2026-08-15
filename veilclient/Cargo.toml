@@ -35,6 +35,7 @@ thiserror = "2.0"
 # build mode without re-declaring the chain.
 allow-empty-seeds = ["veilcore/allow-empty-seeds"]
 production-seeds  = ["veilcore/production-seeds"]
+testnet-seeds     = ["veilcore/testnet-seeds"]
 test-low-difficulty = ["veilcore/test-low-difficulty"]
 # Forward the BoringSSL TLS-fingerprint backend so downstream binaries that
 # embed a node (or otherwise dial veil TLS) can enable the rotating
