@@ -186,6 +186,69 @@ pub unsafe extern "C" fn veil_identity_verify(
     }
 }
 
+/// Does the identity document in `doc` authorise `pubkey_32` to speak for
+/// `node_id_32`?
+///
+/// The question a device's signature raises and `veil_identity_verify` cannot
+/// answer. That one binds a key to an author by hash — `node_id = BLAKE3(key)` —
+/// which is exactly right when the author signs with their own key and exactly
+/// wrong for an identity with several devices: the author is the IDENTITY, the
+/// key is the DEVICE's, and the two hashes differ by construction. A device
+/// therefore rejected its own messages, and every peer rejected them too.
+///
+/// The identity document is what closes that gap: the master signs each device
+/// subkey, so a subkey speaks for the identity without the master being present
+/// anywhere near the message. Answering here rather than handing the document
+/// out keeps every check on this side of the boundary — the master binding, the
+/// validity window, the per-device certificate — where they are already audited
+/// and cannot be half-applied by a caller.
+///
+/// Returns 0 when the document verifies, names `node_id_32`, and lists
+/// `pubkey_32` among its identity keys; 1 when any of those is false — which
+/// includes a REVOKED subkey, because a document that no longer lists a key no
+/// longer speaks for it; -1 on a bad argument.
+///
+/// # Safety
+/// `doc_ptr` must be readable for `doc_len` bytes; `node_id_32` and
+/// `pubkey_32` for 32 bytes each.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn veil_identity_document_authorizes(
+    doc_ptr: *const u8,
+    doc_len: size_t,
+    node_id_32: *const u8,
+    pubkey_32: *const u8,
+) -> c_int {
+    if doc_ptr.is_null() || node_id_32.is_null() || pubkey_32.is_null() {
+        return SIGN_ERR;
+    }
+    let doc_bytes = unsafe { std::slice::from_raw_parts(doc_ptr, doc_len) };
+    let node_id = unsafe { std::slice::from_raw_parts(node_id_32, 32) };
+    let pubkey = unsafe { std::slice::from_raw_parts(pubkey_32, 32) };
+
+    let Ok(doc) = veil_proto::identity_document::IdentityDocument::decode(doc_bytes) else {
+        return VERIFY_INVALID;
+    };
+    // The document must be the claimed identity's own, or any master could
+    // vouch for any key under any name.
+    if doc.node_id != *node_id {
+        return VERIFY_INVALID;
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    // Master binding, validity window and every device certificate, in the one
+    // audited place that knows all three.
+    if veil_identity::verify::verify_identity_document(&doc, now).is_err() {
+        return VERIFY_INVALID;
+    }
+    if doc.identity_keys.iter().any(|key| key.pubkey == pubkey) {
+        VERIFY_VALID
+    } else {
+        VERIFY_INVALID
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -201,6 +264,78 @@ mod tests {
             .into_owned();
         unsafe { crate::veil_free_string(out) };
         toml
+    }
+
+    /// Build a standalone sovereign identity on disk and return its document
+    /// bytes plus the one subkey it names.
+    fn standalone_document() -> (Vec<u8>, [u8; 32], [u8; 32]) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let seed = veil_util::sensitive_bytes::SensitiveBytesN::<32>::from_bytes([0x5Cu8; 32]);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        veil_identity::sovereign_flow::save_standalone_identity_to_dir(
+            dir.path(),
+            &seed,
+            now - 3600,
+            now + 3 * 86_400,
+        )
+        .expect("persist standalone identity");
+        let sov = veil_identity::sovereign::SovereignIdentity::load_from_dir(dir.path())
+            .expect("load standalone identity");
+        let mut subkey = [0u8; 32];
+        subkey.copy_from_slice(&sov.document.identity_keys[0].pubkey);
+        (sov.document.encode(), *sov.node_id(), subkey)
+    }
+
+    fn authorizes(doc: &[u8], node_id: &[u8; 32], pubkey: &[u8; 32]) -> c_int {
+        unsafe {
+            veil_identity_document_authorizes(
+                doc.as_ptr(),
+                doc.len(),
+                node_id.as_ptr(),
+                pubkey.as_ptr(),
+            )
+        }
+    }
+
+    /// The case the whole entry point exists for: a key that is NOT the hash
+    /// preimage of the author still speaks for them, because the master said so.
+    #[test]
+    fn a_subkey_the_document_names_is_authorized() {
+        let (doc, node_id, subkey) = standalone_document();
+        assert_eq!(authorizes(&doc, &node_id, &subkey), VERIFY_VALID);
+    }
+
+    #[test]
+    fn a_key_the_document_does_not_name_is_refused() {
+        let (doc, node_id, _) = standalone_document();
+        assert_eq!(authorizes(&doc, &node_id, &[0xAAu8; 32]), VERIFY_INVALID);
+    }
+
+    /// A master may vouch only for its OWN identity. Without this, any document
+    /// would authorise any key under any name.
+    #[test]
+    fn a_document_for_another_identity_authorizes_nothing() {
+        let (doc, _, subkey) = standalone_document();
+        assert_eq!(authorizes(&doc, &[0x11u8; 32], &subkey), VERIFY_INVALID);
+    }
+
+    /// A document whose master signature has been tampered with grants nothing,
+    /// even for a key it still lists — otherwise "the document says so" would
+    /// mean "somebody wrote it down".
+    #[test]
+    fn a_tampered_document_authorizes_nothing() {
+        let (mut doc, node_id, subkey) = standalone_document();
+        let last = doc.len() - 1;
+        doc[last] ^= 0xFF;
+        assert_eq!(authorizes(&doc, &node_id, &subkey), VERIFY_INVALID);
+    }
+
+    #[test]
+    fn garbage_is_refused_rather_than_trusted() {
+        assert_eq!(authorizes(b"not a document", &[0x11u8; 32], &[0x22u8; 32]), VERIFY_INVALID);
     }
 
     #[test]

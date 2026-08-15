@@ -3281,6 +3281,42 @@ int veil_identity_verify(const uint8_t *node_id_32,
 
 #if defined(VEIL_FFI_NODE_EMBEDDED)
 /**
+ * Does the identity document in `doc` authorise `pubkey_32` to speak for
+ * `node_id_32`?
+ *
+ * The question a device's signature raises and `veil_identity_verify` cannot
+ * answer. That one binds a key to an author by hash — `node_id = BLAKE3(key)` —
+ * which is exactly right when the author signs with their own key and exactly
+ * wrong for an identity with several devices: the author is the IDENTITY, the
+ * key is the DEVICE's, and the two hashes differ by construction. A device
+ * therefore rejected its own messages, and every peer rejected them too.
+ *
+ * The identity document is what closes that gap: the master signs each device
+ * subkey, so a subkey speaks for the identity without the master being present
+ * anywhere near the message. Answering here rather than handing the document
+ * out keeps every check on this side of the boundary — the master binding, the
+ * validity window, the per-device certificate — where they are already audited
+ * and cannot be half-applied by a caller.
+ *
+ * Returns 0 when the document verifies, names `node_id_32`, and lists
+ * `pubkey_32` among its identity keys; 1 when any of those is false — which
+ * includes a REVOKED subkey, because a document that no longer lists a key no
+ * longer speaks for it; -1 on a bad argument.
+ *
+ * # Safety
+ * `doc_ptr` must be readable for `doc_len` bytes; `node_id_32` and
+ * `pubkey_32` for 32 bytes each.
+ */
+
+int veil_identity_document_authorizes(const uint8_t *doc_ptr,
+                                      size_t doc_len,
+                                      const uint8_t *node_id_32,
+                                      const uint8_t *pubkey_32)
+;
+#endif
+
+#if defined(VEIL_FFI_NODE_EMBEDDED)
+/**
  * Sign an already-mined seed set with the sovereign key of the embedded node
  * running as `owner_node_id`, and publish the nickname record to the DHT
  * (store-local + K-closest fan-out; auto-renewal rides the periodic
