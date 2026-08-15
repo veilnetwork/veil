@@ -288,6 +288,35 @@ final void Function(Pointer<VeilApp>) veilAppClose = nativeLib
     )
     .asFunction();
 
+/// Send to the OTHER DEVICES of this identity.
+///
+/// Same shape as [veilSend]; the first id is OUR OWN identity address. Every
+/// device of an identity answers to it, so a plain send addressed there is
+/// short-circuited into a local delivery that never leaves the machine — right
+/// when an app addresses itself, wrong for a device sync. This says which is
+/// meant, and the node seals a copy per sibling with ours left out.
+final int Function(
+  Pointer<VeilApp>,
+  Pointer<Uint8>,
+  Pointer<Uint8>,
+  int,
+  Pointer<Uint8>,
+  int,
+  Pointer<Pointer<Utf8>>,
+) veilSendToMyDevices = nativeLib
+    .lookup<
+        NativeFunction<
+            Int32 Function(
+              Pointer<VeilApp>,
+              Pointer<Uint8>,
+              Pointer<Uint8>,
+              Uint32,
+              Pointer<Uint8>,
+              IntPtr,
+              Pointer<Pointer<Utf8>>,
+            )>>('veil_send_to_my_devices')
+    .asFunction();
+
 final int Function(
   Pointer<VeilApp>,
   Pointer<Uint8>,
