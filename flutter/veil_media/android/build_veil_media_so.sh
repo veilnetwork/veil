@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Build libveil_media.so for android-arm64 from a from-source WebRTC checkout.
+# Build libveil_media.so for one Android ABI from a from-source WebRTC checkout.
+# ANDROID_TARGET picks it: android-arm64 (default), android-arm, android-x64.
 # Runs on the SAME x86_64 Linux host as build_libwebrtc_android_linux.sh, after
 # libwebrtc.a is built (so out/android-arm64/compile_commands.json exists).
 #
@@ -12,18 +13,35 @@
 # live in the APK; see the Android integration notes in BUILD-INTEGRATION.md for
 # the load-order / RTLD_GLOBAL requirement).
 #
-# Usage: WEBRTC_BUILD=~/webrtc-android ./build_veil_media_so.sh [dest_dir]
+# Usage: WEBRTC_BUILD=~/webrtc-android [ANDROID_TARGET=android-arm] \
+#          ./build_veil_media_so.sh [dest_dir]
 set -euo pipefail
 
 WEBRTC_BUILD="${WEBRTC_BUILD:-$HOME/webrtc-android}"
 WEBRTC_SRC="$WEBRTC_BUILD/src"
-WEBRTC_OUT="out/android-arm64"
+# WHICH Android. An APK ships three ABIs and this built one of them, with the
+# target spelled into the path — so a bundle for armeabi-v7a or x86_64 failed
+# with "no out/android-arm64/compile_commands.json", which names a directory
+# nobody asked for and reads like a missing build rather than a wrong guess.
+#
+# The out dir and the jniLibs dir have to move TOGETHER: they are the same
+# choice written two ways, and letting one be overridden without the other is
+# how an arm64 library ends up in the x86_64 folder, where nothing notices
+# until an emulator refuses to start.
+ANDROID_TARGET="${ANDROID_TARGET:-android-arm64}"
+case "$ANDROID_TARGET" in
+  android-arm64) ANDROID_ABI_DIR=arm64-v8a ;;
+  android-arm)   ANDROID_ABI_DIR=armeabi-v7a ;;
+  android-x64)   ANDROID_ABI_DIR=x86_64 ;;
+  *) echo "unknown ANDROID_TARGET=$ANDROID_TARGET (android-arm64|android-arm|android-x64)" >&2; exit 2 ;;
+esac
+WEBRTC_OUT="${WEBRTC_OUT:-out/$ANDROID_TARGET}"
 SRCDIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../src" && pwd)"
-DEST="${1:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/jniLibs/arm64-v8a}"
+DEST="${1:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/jniLibs/$ANDROID_ABI_DIR}"
 mkdir -p "$DEST"
 
 CC_JSON="$WEBRTC_SRC/$WEBRTC_OUT/compile_commands.json"
-[ -f "$CC_JSON" ] || { echo "no $CC_JSON — run build_libwebrtc_android_linux.sh first" >&2; exit 1; }
+[ -f "$CC_JSON" ] || { echo "no $CC_JSON — run build_libwebrtc_android_linux.sh first, or set ANDROID_TARGET to the ABI this checkout actually built" >&2; exit 1; }
 
 TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
 
