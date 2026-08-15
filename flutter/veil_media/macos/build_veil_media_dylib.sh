@@ -81,6 +81,21 @@ SDK="sdk/xcode_links/$(ls sdk/xcode_links | grep -iE 'MacOSX[0-9].*\.sdk$' | hea
 DEADSTRIP="-Wl,-dead_strip"
 [ -n "${VEIL_MEDIA_NO_DEADSTRIP:-}" ] && DEADSTRIP=""
 
+# WHICH MAC. The link target was written as arm64 because that is what this
+# is built on, while the compile side takes its flags from the bundle's own
+# compile_commands.json — so an x86_64 bundle compiled x86_64 objects and
+# then asked the linker for arm64. Every member of libwebrtc.a was skipped
+# with "found architecture 'x86_64', required architecture 'arm64'" and the
+# link died on undefined symbols, which reads like a missing library.
+#
+# Derived from the same command the objects were compiled with, exactly as
+# the Windows wrapper derives /MACHINE: the bundle knows what it is, and
+# nothing else here should be guessing.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+MAC_TARGET="$(python3 "$SCRIPT_DIR/_mac_target.py" \
+  "$WEBRTC_SRC/$WEBRTC_OUT/compile_commands.json")"
+echo "==> linking for $MAC_TARGET"
+
 link_dylib() {
   # $1 = output path, remaining args = extra linker flags
   local out="$1"; shift
@@ -90,7 +105,7 @@ link_dylib() {
     $DEADSTRIP -Wl,-undefined,dynamic_lookup \
     "$@" \
     -install_name @rpath/libveil_media.dylib \
-    --target=arm64-apple-macos -isysroot "$SDK" \
+    --target="$MAC_TARGET" -isysroot "$SDK" \
     -framework Foundation -framework CoreFoundation -framework CoreAudio -framework AudioToolbox \
     -framework AudioUnit -framework CoreServices -framework IOKit -framework SystemConfiguration \
     -framework Security -framework CoreMedia -framework CoreVideo -framework AVFoundation -framework ApplicationServices \
