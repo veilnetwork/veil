@@ -66,8 +66,8 @@ pub mod service;
 pub use service::{
     MAILBOX_ACK_ENDPOINT_CAPACITY, MAILBOX_ACK_ENDPOINT_ID, MAILBOX_APP_ID, MAILBOX_APP_NAME,
     MAILBOX_FETCH_ENDPOINT_CAPACITY, MAILBOX_FETCH_ENDPOINT_ID, MAILBOX_FETCH_REPLY_MAX_BYTES,
-    MAILBOX_PUT_ENDPOINT_CAPACITY, MAILBOX_PUT_ENDPOINT_ID, MAILBOX_WAKE_ENDPOINT_CAPACITY,
-    MAILBOX_WAKE_ENDPOINT_ID,
+    MAILBOX_PUT_ENDPOINT_CAPACITY, MAILBOX_PUT_ENDPOINT_ID, MAILBOX_SLICE_ENDPOINT_CAPACITY,
+    MAILBOX_SLICE_ENDPOINT_ID, MAILBOX_WAKE_ENDPOINT_CAPACITY, MAILBOX_WAKE_ENDPOINT_ID,
 };
 
 pub mod capability;
@@ -1218,6 +1218,48 @@ impl Mailbox {
             }
         }
         Ok(out)
+    }
+
+    /// One window of a stored blob, for a receiver whose blob cannot ride a
+    /// single FETCH reply.
+    ///
+    /// The size a mailbox blob reaches is not the app's to choose: a blob
+    /// carries one ML-KEM envelope PER RECIPIENT DEVICE, so it grows with the
+    /// identity rather than with the message, and past a few devices nothing of
+    /// any size fits a reply. The deposit side was never the limit — a PUT is
+    /// chunked and carries up to a megabyte. Only the reply was.
+    ///
+    /// `Ok(None)` is an ANSWER, not an empty window: the blob has aged out, was
+    /// acked from another device, or was never deposited. A receiver told
+    /// "nothing here" stops; one handed an empty window would ask for the same
+    /// offset forever.
+    ///
+    /// Same authorization as [`Self::fetch`] — the caller passes the
+    /// cryptographically verified `receiver`, and the key is `(receiver,
+    /// content_id)`, so a receiver can only ever read its own mail.
+    pub fn slice(
+        &self,
+        receiver: [u8; 32],
+        content_id: [u8; 32],
+        offset: u32,
+        max_len: usize,
+    ) -> Result<Option<(u32, Vec<u8>)>, MailboxError> {
+        let txn = self.db.begin_read()?;
+        let blobs = txn.open_table(TABLE_BLOBS)?;
+        let mut key = [0u8; KEY_LEN];
+        key[..32].copy_from_slice(&receiver);
+        key[32..].copy_from_slice(&content_id);
+        let Some(v) = blobs.get(key.as_slice())? else {
+            return Ok(None);
+        };
+        let (_sender, _deposited_at, blob) = decode_record(v.value())?;
+        let total_len = blob.len() as u32;
+        // An offset past the end yields an empty window with a truthful
+        // total_len, which is what tells a confused receiver to stop rather
+        // than to retry. Saturating throughout: the offset is wire-supplied.
+        let start = (offset as usize).min(blob.len());
+        let end = start.saturating_add(max_len).min(blob.len());
+        Ok(Some((total_len, blob[start..end].to_vec())))
     }
 
     /// Acknowledge receipt: delete `(receiver, content_id)` if it

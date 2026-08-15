@@ -53,6 +53,7 @@ use veil_app::AppMessage;
 use veil_mailbox::{
     MAILBOX_ACK_ENDPOINT_CAPACITY, MAILBOX_ACK_ENDPOINT_ID, MAILBOX_APP_ID,
     MAILBOX_FETCH_ENDPOINT_CAPACITY, MAILBOX_FETCH_ENDPOINT_ID, MAILBOX_FETCH_REPLY_MAX_BYTES,
+    MAILBOX_SLICE_ENDPOINT_CAPACITY, MAILBOX_SLICE_ENDPOINT_ID,
     MAILBOX_PUT_ENDPOINT_CAPACITY, MAILBOX_PUT_ENDPOINT_ID, Mailbox,
 };
 use veil_proto::{
@@ -284,13 +285,18 @@ pub fn spawn_mailbox_app_service(
                 endpoint_id: MAILBOX_ACK_ENDPOINT_ID,
                 capacity: MAILBOX_ACK_ENDPOINT_CAPACITY,
             },
+            BuiltinEndpoint {
+                endpoint_id: MAILBOX_SLICE_ENDPOINT_ID,
+                capacity: MAILBOX_SLICE_ENDPOINT_CAPACITY,
+            },
         ],
     };
     host.spawn(ctx, spec, move |mut ctx, mut rxs| async move {
-        // Receivers are in spec.endpoints order: [PUT, FETCH, ACK].
+        // Receivers are in spec.endpoints order: [PUT, FETCH, ACK, SLICE].
         let mut put_rx = rxs.remove(0);
         let mut fetch_rx = rxs.remove(0);
         let mut ack_rx = rxs.remove(0);
+        let mut slice_rx = rxs.remove(0);
         // Per-service deposit reassembler — the task is single-threaded, so the
         // `&mut` needs no lock. State stays local to this service instance.
         let mut reassembler = PutChunkReassembler::default();
@@ -310,6 +316,9 @@ pub fn spawn_mailbox_app_service(
                 }
                 Some(msg) = ack_rx.recv() => {
                     handle_ack_message(&mailbox, msg);
+                }
+                Some(msg) = slice_rx.recv() => {
+                    handle_slice_message(&mailbox, reply_sender.as_ref(), msg).await;
                 }
                 _ = ctx.shutdown.changed() => {
                     log::info!("veil-mailbox: app service stopping");
@@ -546,14 +555,22 @@ pub async fn handle_fetch_message(
     // re-fetches to drain the rest (FETCH is non-destructive, deduped
     // receiver-side by content_id).
     //
-    // A blob that ALONE exceeds the budget can never be served: emitting it
-    // (the old "always emit at least one" progress rule) made send_reply fail
-    // PayloadTooLarge on EVERY fetch, and since the queue is oldest-first the
-    // oversized blob stayed at its head — permanently wedging that receiver's
-    // mailbox and starving every deliverable blob behind it (observed in
-    // production). Purge such blobs instead: undeliverable-by-protocol mail is
-    // dead mail (the PUT gate now rejects new ones at the door; this clears
-    // any already stored).
+    // A blob that ALONE exceeds the budget is ANNOUNCED rather than sent: the
+    // entry rides with an empty blob, and the receiver collects it a window at
+    // a time from the SLICE endpoint. It must not be emitted whole — that made
+    // send_reply fail PayloadTooLarge on EVERY fetch, and since the queue is
+    // oldest-first the oversized blob stayed at its head, wedging that
+    // receiver's mailbox and starving everything behind it (observed in
+    // production).
+    //
+    // It was purged instead, for a while, and that was the wrong end of the
+    // problem: what a blob weighs is not the sender's to choose. One ML-KEM
+    // envelope per recipient DEVICE means the weight follows the identity, and
+    // past a few devices NO message of any size fits a reply. Purging made a
+    // multi-device identity undeliverable to by design.
+    //
+    // A receiver that predates the SLICE endpoint sees an entry with no bytes
+    // and skips it — the same outcome the purge produced, minus the deletion.
     let reply_budget = fetch_reply_budget();
     let mut total = 0usize;
     let mut wire: Vec<MailboxBlobWire> = Vec::new();
@@ -563,22 +580,26 @@ pub async fn handle_fetch_message(
         }
         let cost = b.blob.len() + PER_BLOB_WIRE_HDR;
         if cost > reply_budget {
-            match mailbox.ack(src_node_id, b.content_id) {
-                Ok(removed) => log::warn!(
-                    "veil-mailbox: purged oversized blob (recv={} cid={} {}B > \
-                     fetch budget {reply_budget}B, removed={removed}) — it could \
-                     never ride a FETCH reply",
-                    hex_short(&src_node_id),
-                    hex_short(&b.content_id),
-                    b.blob.len(),
-                ),
-                Err(e) => log::warn!(
-                    "veil-mailbox: failed to purge oversized blob (recv={} cid={}): {e}",
-                    hex_short(&src_node_id),
-                    hex_short(&b.content_id),
-                ),
+            // Announce it: header only, no bytes. The receiver asks the SLICE
+            // endpoint for the rest and acks it like any other blob.
+            if total + PER_BLOB_WIRE_HDR > reply_budget {
+                break; // no room even for the announcement this round
             }
-            continue; // the NEXT blob may well fit — keep packing
+            total += PER_BLOB_WIRE_HDR;
+            log::debug!(
+                "veil-mailbox: announcing oversized blob (recv={} cid={} {}B > \
+                 fetch budget {reply_budget}B) — the receiver will slice it",
+                hex_short(&src_node_id),
+                hex_short(&b.content_id),
+                b.blob.len(),
+            );
+            wire.push(MailboxBlobWire {
+                sender_id: b.sender_id,
+                content_id: b.content_id,
+                deposited_at: b.deposited_at,
+                blob: Vec::new(),
+            });
+            continue;
         }
         if total + cost > reply_budget {
             break; // deliverable, just not THIS round — a later fetch gets it
@@ -600,6 +621,111 @@ pub async fn handle_fetch_message(
         ),
         Err(e) => log::warn!(
             "veil-mailbox: FETCH reply failed (recv={}): {e:?}",
+            hex_short(&src_node_id),
+        ),
+    }
+}
+
+/// Handle one incoming app message addressed to the SLICE endpoint.
+///
+/// The half of the mailbox that the reply budget used to make impossible. A
+/// blob carries one ML-KEM envelope per recipient DEVICE, so its size follows
+/// the identity rather than the message: past a few devices nothing of any size
+/// rides a single FETCH reply, and the deposit — chunked, up to a megabyte —
+/// was never the constraint. Here the receiver asks for one window at a time,
+/// each request its own onion round trip with its own one-time reply path.
+///
+/// Same authorization as FETCH and ACK, and it has to be: the onion delivery
+/// verified the requester, so `src_node_id` IS the receiver, and the store is
+/// keyed on `(receiver, content_id)`. A caller can only ever read its own mail,
+/// and an unauthenticated or reply-less request is refused rather than served.
+///
+/// A blob this relay does not hold answers `total_len = 0` — an answer, not
+/// silence, so the receiver stops instead of walking offsets forever.
+pub async fn handle_slice_message(
+    mailbox: &Mailbox,
+    reply_sender: Option<&Arc<dyn AnonOnionSender>>,
+    msg: AppMessage,
+) {
+    let (src_node_id, provenance, reply_id, data) = match msg {
+        AppMessage::Deliver {
+            src_node_id,
+            provenance,
+            reply_id,
+            data,
+            ..
+        } => (src_node_id, provenance, reply_id, data),
+        other => {
+            log::debug!("veil-mailbox: ignoring non-Deliver on SLICE endpoint: {other:?}");
+            return;
+        }
+    };
+    if !provenance.is_authenticated() {
+        log::debug!(
+            "veil-mailbox: SLICE dropped (src {} is {provenance:?}, not an authenticated identity)",
+            hex_short(&src_node_id),
+        );
+        return;
+    }
+    if src_node_id == [0u8; 32] || reply_id == 0 {
+        log::debug!("veil-mailbox: SLICE dropped (unauthenticated src or no reply path)");
+        return;
+    }
+    let Some(sender) = reply_sender else {
+        log::debug!("veil-mailbox: SLICE dropped — no reply egress configured");
+        return;
+    };
+    let req = match veil_proto::ipc::MailboxSliceReqPayload::decode(&data) {
+        Ok(r) => r,
+        Err(e) => {
+            log::debug!(
+                "veil-mailbox: SLICE dropped (malformed request from {}): {e}",
+                hex_short(&src_node_id),
+            );
+            return;
+        }
+    };
+    // What one reply may carry, minus this payload's own header — the same
+    // budget the FETCH packer works to, so a slice can never be the thing that
+    // cannot be delivered.
+    let window = fetch_reply_budget()
+        .saturating_sub(veil_proto::ipc::MailboxSlicePayload::HEADER_SIZE);
+    let resp = match mailbox.slice(src_node_id, req.content_id, req.offset, window) {
+        Ok(Some((total_len, bytes))) => veil_proto::ipc::MailboxSlicePayload {
+            content_id: req.content_id,
+            offset: req.offset,
+            total_len,
+            bytes,
+        },
+        Ok(None) => veil_proto::ipc::MailboxSlicePayload {
+            content_id: req.content_id,
+            offset: req.offset,
+            total_len: 0,
+            bytes: Vec::new(),
+        },
+        Err(e) => {
+            log::warn!(
+                "veil-mailbox: SLICE store error (recv={} cid={}): {e}",
+                hex_short(&src_node_id),
+                hex_short(&req.content_id),
+            );
+            return;
+        }
+    };
+    let n = resp.bytes.len();
+    let total = resp.total_len;
+    match sender
+        .send_reply(reply_id, &resp.encode(), MAILBOX_APP_ID)
+        .await
+    {
+        Ok(()) => log::debug!(
+            "veil-mailbox: SLICE replied {n}B at {} of {total}B to recv={} cid={}",
+            req.offset,
+            hex_short(&src_node_id),
+            hex_short(&req.content_id),
+        ),
+        Err(e) => log::warn!(
+            "veil-mailbox: SLICE reply failed (recv={}): {e:?}",
             hex_short(&src_node_id),
         ),
     }
@@ -750,25 +876,15 @@ pub fn handle_put_message(
         );
     }
 
-    // Reject a deposit whose blob could never be FETCHED back out: PUT accepts
-    // chunked payloads far past the reply cap (MAX_MAILBOX_BLOB_BYTES = 1 MB vs
-    // ~5.6 KB deliverable), so without this gate an oversized deposit was
-    // stored, then wedged its receiver's queue head forever (send_reply
-    // PayloadTooLarge on every drain). Fail it loudly at the door instead.
-    {
-        let cost = req.blob.len() + PER_BLOB_WIRE_HDR;
-        let budget = fetch_reply_budget();
-        if cost > budget {
-            log::warn!(
-                "veil-mailbox: PUT rejected (recv={} cid={} blob {}B + hdr > \
-                 fetch budget {budget}B — would be permanently unfetchable)",
-                hex_short(&req.receiver_id),
-                hex_short(&req.content_id),
-                req.blob.len(),
-            );
-            return;
-        }
-    }
+    // NO SIZE GATE HERE ANY MORE, and its removal is the point of the SLICE
+    // endpoint. It rejected any deposit larger than one FETCH reply, which was
+    // right while a reply was the only way out of the store — an unfetchable
+    // blob wedged its receiver's queue head. But a blob's weight is not the
+    // sender's to choose: it carries one ML-KEM envelope per recipient DEVICE,
+    // so it grows with the identity, and past a few devices the gate refused
+    // EVERY message to that identity. What is stored is bounded by the store's
+    // own MAX_BLOB_BYTES; what a reply may carry is now a separate question,
+    // answered a window at a time.
 
     let envelope_for_push = req.push_envelope.clone();
     // NOTE (489.10 slice 4.4): `req.wake_hmac_envelope` IS now forwarded onto the
@@ -1870,18 +1986,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn network_fetch_purges_oversized_head_blob_and_serves_next() {
+    async fn network_fetch_announces_oversized_head_blob_and_serves_next() {
         let (mailbox, _tmp) = fresh_mailbox();
         let recv = [0x77u8; 32];
-        // Pre-existing oversized deposit (stored via the raw store API, as by a
-        // relay predating the PUT gate): ALONE it exceeds the reply budget, so
-        // under the old "always emit at least one" rule it rode every reply,
-        // failed PayloadTooLarge each time, and wedged the queue head forever.
+        // A deposit that ALONE exceeds the reply budget. It cannot ride a reply
+        // whole — under the old "always emit at least one" rule it failed
+        // PayloadTooLarge every time and wedged the queue head forever — and it
+        // must not be deleted either: what a blob weighs is not the sender's to
+        // choose, since it carries one envelope per recipient DEVICE.
         let oversized = vec![0xEE; fetch_reply_budget()];
         mailbox
             .put(recv, [0xC1; 32], [0xAA; 32], oversized)
             .unwrap();
-        // A perfectly deliverable blob stuck BEHIND it.
+        // A perfectly deliverable blob behind it.
         mailbox
             .put(recv, [0xC2; 32], [0xAA; 32], b"deliverable".to_vec())
             .unwrap();
@@ -1901,17 +2018,170 @@ mod tests {
         };
         handle_fetch_message(&mailbox, Some(&sender), msg).await;
 
-        // The reply carries ONLY the deliverable blob and fits the budget.
         let cap = captured.lock().unwrap();
         assert_eq!(cap.len(), 1, "exactly one reply");
         let resp = veil_proto::MailboxFetchRespPayload::decode(&cap[0].1).unwrap();
-        assert_eq!(resp.blobs.len(), 1);
-        assert_eq!(resp.blobs[0].content_id, [0xC2; 32]);
-        // The oversized blob is PURGED from the store, not merely skipped —
-        // otherwise it stays at the queue head as a permanent tombstone.
+        assert_eq!(resp.blobs.len(), 2, "the oversized one is announced too");
+        let announced = resp
+            .blobs
+            .iter()
+            .find(|b| b.content_id == [0xC1; 32])
+            .expect("the oversized blob is named in the reply");
+        assert!(
+            announced.blob.is_empty(),
+            "announced with no bytes — the receiver comes back for them",
+        );
+        let served = resp
+            .blobs
+            .iter()
+            .find(|b| b.content_id == [0xC2; 32])
+            .expect("the deliverable blob still rides");
+        assert_eq!(served.blob, b"deliverable");
+        // And the reply still fits what one reply may carry.
+        assert!(cap[0].1.len() <= fetch_reply_budget());
+        // The announced blob is STILL THERE. Deleting it is how a receiver ends
+        // up waiting forever for mail the relay threw away.
         let left = mailbox.fetch(recv).unwrap();
-        assert_eq!(left.len(), 1, "oversized blob gone from the store");
-        assert_eq!(left[0].content_id, [0xC2; 32]);
+        assert_eq!(left.len(), 2, "nothing was purged");
+    }
+
+    #[tokio::test]
+    async fn slice_endpoint_serves_a_blob_no_reply_could_carry() {
+        let (mailbox, _tmp) = fresh_mailbox();
+        let recv = [0x66u8; 32];
+        let cid = [0xD1u8; 32];
+        // Three replies' worth: the walk has to take several rounds, which is
+        // the case a single-round implementation would pass by accident.
+        let payload: Vec<u8> = (0..fetch_reply_budget() * 3)
+            .map(|i| (i % 251) as u8)
+            .collect();
+        mailbox.put(recv, cid, [0xAA; 32], payload.clone()).unwrap();
+
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sender: Arc<dyn veil_types::AnonOnionSender> = Arc::new(MockReplySender {
+            captured: std::sync::Arc::clone(&captured),
+        });
+        let mut got: Vec<u8> = Vec::new();
+        let mut offset = 0u32;
+        for round in 0..16 {
+            let req = veil_proto::ipc::MailboxSliceReqPayload {
+                content_id: cid,
+                offset,
+            }
+            .encode();
+            handle_slice_message(
+                &mailbox,
+                Some(&sender),
+                AppMessage::Deliver {
+                    src_node_id: recv,
+                    provenance: SenderProvenance::Signed,
+                    src_app_id: [0u8; 32],
+                    app_id: MAILBOX_APP_ID,
+                    endpoint_id: MAILBOX_SLICE_ENDPOINT_ID,
+                    data: veil_bufpool::pooled_shared_from_vec(req),
+                    reply_id: 9,
+                },
+            )
+            .await;
+            let reply = {
+                let cap = captured.lock().unwrap();
+                assert_eq!(cap.len(), round + 1, "one reply per request");
+                cap[round].1.clone()
+            };
+            assert!(
+                reply.len() <= fetch_reply_budget(),
+                "a slice reply must itself fit one reply",
+            );
+            let slice = veil_proto::ipc::MailboxSlicePayload::decode(&reply).unwrap();
+            assert_eq!(slice.total_len as usize, payload.len());
+            if slice.bytes.is_empty() {
+                break;
+            }
+            offset += slice.bytes.len() as u32;
+            got.extend_from_slice(&slice.bytes);
+            if got.len() >= payload.len() {
+                break;
+            }
+        }
+        assert_eq!(got, payload, "the windows reassemble to the deposit");
+    }
+
+    #[tokio::test]
+    async fn slice_endpoint_refuses_to_read_another_receivers_mail() {
+        let (mailbox, _tmp) = fresh_mailbox();
+        let owner = [0x11u8; 32];
+        let cid = [0xD2u8; 32];
+        mailbox
+            .put(owner, cid, [0xAA; 32], vec![0x5A; 4096])
+            .unwrap();
+
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sender: Arc<dyn veil_types::AnonOnionSender> = Arc::new(MockReplySender {
+            captured: std::sync::Arc::clone(&captured),
+        });
+        // A DIFFERENT authenticated node naming the content id it wants.
+        handle_slice_message(
+            &mailbox,
+            Some(&sender),
+            AppMessage::Deliver {
+                src_node_id: [0x99u8; 32],
+                provenance: SenderProvenance::Signed,
+                src_app_id: [0u8; 32],
+                app_id: MAILBOX_APP_ID,
+                endpoint_id: MAILBOX_SLICE_ENDPOINT_ID,
+                data: veil_bufpool::pooled_shared_from_vec(
+                    veil_proto::ipc::MailboxSliceReqPayload {
+                        content_id: cid,
+                        offset: 0,
+                    }
+                    .encode(),
+                ),
+                reply_id: 9,
+            },
+        )
+        .await;
+        let cap = captured.lock().unwrap();
+        assert_eq!(cap.len(), 1, "it is answered, not ignored");
+        let slice = veil_proto::ipc::MailboxSlicePayload::decode(&cap[0].1).unwrap();
+        assert_eq!(slice.total_len, 0, "and the answer is: nothing here");
+        assert!(slice.bytes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn slice_endpoint_refuses_an_unauthenticated_request() {
+        let (mailbox, _tmp) = fresh_mailbox();
+        let recv = [0x22u8; 32];
+        let cid = [0xD3u8; 32];
+        mailbox.put(recv, cid, [0xAA; 32], vec![0x5A; 4096]).unwrap();
+
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sender: Arc<dyn veil_types::AnonOnionSender> = Arc::new(MockReplySender {
+            captured: std::sync::Arc::clone(&captured),
+        });
+        handle_slice_message(
+            &mailbox,
+            Some(&sender),
+            AppMessage::Deliver {
+                src_node_id: recv,
+                provenance: SenderProvenance::Claimed,
+                src_app_id: [0u8; 32],
+                app_id: MAILBOX_APP_ID,
+                endpoint_id: MAILBOX_SLICE_ENDPOINT_ID,
+                data: veil_bufpool::pooled_shared_from_vec(
+                    veil_proto::ipc::MailboxSliceReqPayload {
+                        content_id: cid,
+                        offset: 0,
+                    }
+                    .encode(),
+                ),
+                reply_id: 9,
+            },
+        )
+        .await;
+        assert!(
+            captured.lock().unwrap().is_empty(),
+            "an unverified claim gets no bytes and no answer",
+        );
     }
 
     #[test]
@@ -2124,16 +2394,20 @@ mod tests {
     }
 
     #[test]
-    fn put_endpoint_rejects_unfetchable_oversized_blob() {
+    fn put_endpoint_stores_a_blob_no_single_reply_could_carry() {
         let (mb, _tmp) = fresh_mailbox();
         let recv = [0x55u8; 32];
         let mut ra = PutChunkReassembler::default();
         // Blob big enough that blob + per-entry wire header exceeds one FETCH
-        // reply — storing it would make it permanently unfetchable.
+        // reply. It used to be refused at the door as "permanently
+        // unfetchable", which for a multi-device identity meant refusing every
+        // message: a blob carries one ML-KEM envelope per recipient DEVICE, so
+        // its weight follows the identity and no size the app could pick was
+        // small enough. It is stored now and served in windows.
+        //
         // A ~5.6 KB blob does not fit one chunk, and must not be made to: the
         // decoder caps chunk_data at 240 B, so a single oversized chunk would
-        // be rejected there and this test would pass without the fetch-budget
-        // gate below ever running.
+        // be rejected there and the deposit path below would never run.
         let inner = mk_inner(
             recv,
             [0xC9; 32],
@@ -2157,10 +2431,16 @@ mod tests {
                 },
             );
         }
-        assert!(
-            mb.fetch(recv).unwrap().is_empty(),
-            "unfetchable deposit must be rejected at the door"
-        );
+        let stored = mb.fetch(recv).unwrap();
+        assert_eq!(stored.len(), 1, "the oversized deposit is kept");
+        assert_eq!(stored[0].blob.len(), fetch_reply_budget());
+        // And it can be read back out, which is what makes keeping it honest.
+        let (total, window) = mb
+            .slice(recv, [0xC9; 32], 0, 1024)
+            .unwrap()
+            .expect("stored, therefore sliceable");
+        assert_eq!(total as usize, fetch_reply_budget());
+        assert_eq!(window.len(), 1024);
 
         // Control: a normal-sized deposit through the same path still lands.
         let ok = mk_payload(recv, [0xCA; 32], [0x33; 32], b"fits".to_vec(), None);
@@ -2179,10 +2459,8 @@ mod tests {
                 reply_id: 0,
             },
         );
-        assert_eq!(
-            mb.fetch(recv).unwrap().len(),
-            1,
-            "normal deposit still stored"
-        );
+        let both = mb.fetch(recv).unwrap();
+        assert_eq!(both.len(), 2, "normal deposit still stored, beside the big one");
+        assert!(both.iter().any(|b| b.blob == b"fits"));
     }
 }
