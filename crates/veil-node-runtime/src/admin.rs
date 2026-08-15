@@ -309,6 +309,23 @@ pub enum AdminCommand {
     /// from the in-memory `AtomicBool`, config knobs from
     /// already-loaded `MobileConfig`.
     MobileStatus,
+    /// **Re-read `identity_document.bin` and republish, without stopping
+    /// anything.**
+    ///
+    /// For the host that owns the identity material: it merges a sibling
+    /// device's document into the directory the node reads, and the node has to
+    /// notice. [`Self::ApplyConfig`] with an unchanged config does make it
+    /// notice — by stopping and restarting every service, which drops every
+    /// client's IPC connection along the way. That is a reconfiguration used as
+    /// a re-read, and the difference showed up as `connection closed` on every
+    /// mailbox deposit after a link.
+    ///
+    /// A background task already polls the document's mtime once a minute, so
+    /// this is not the only way the change lands — it is the way to land it
+    /// AT ONCE and be told what happened. Returns `AdminResult::Ack` naming the
+    /// number of devices the document holds, or an error if it names another
+    /// identity.
+    ReloadIdentity,
     /// **Push a new config to the running daemon without going through
     /// the filesystem.**  Distinct from [`Self::Reload`] (which
     /// re-reads `self.config_path`):  here the caller supplies the
@@ -2602,6 +2619,16 @@ async fn execute_admin_command(
             Ok(AdminResult::MobileStatus(rt.mobile_status()))
         }
 
+        AdminCommand::ReloadIdentity => {
+            let rt = runtime.lock().await;
+            match rt.reload_sovereign_identity().await {
+                Ok(devices) => Ok(AdminResult::Ack {
+                    message: format!("identity re-read (devices={devices})"),
+                }),
+                Err(e) => Err(e),
+            }
+        }
+
         AdminCommand::ApplyConfig {
             toml_content,
             persist,
@@ -3219,6 +3246,10 @@ pub fn audit_event_for(
             // expected ops batches without leaking secrets.
             format!("toml_bytes={} persist={persist}", toml_content.len()),
         ),
+        // Audited for the same reason apply_config is: it changes which
+        // devices this identity answers for. The document itself is not
+        // logged — only that a re-read happened.
+        AdminCommand::ReloadIdentity => ("reload_identity", String::new()),
         // Read-only commands: not audited.
         _ => return None,
     };

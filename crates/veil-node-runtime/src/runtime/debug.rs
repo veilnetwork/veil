@@ -155,13 +155,7 @@ impl NodeRuntime {
         let publisher =
             crate::identity_local::publisher_dht::DhtBackedPublisher::new(Arc::clone(&self.dht));
         let _ = veil_identity::publish::publish_identity_document(&sov.document, &publisher).await;
-        let instance_entry = veil_identity::publish::build_instance_entry(
-            sov.active_instance_id(),
-            sov.sig_key_idx,
-            String::new(),
-            0,
-        );
-        let registry = sov.build_and_sign_registry(1, vec![instance_entry]);
+        let registry = super::identity_publish::full_registry(&sov);
         let _ = veil_identity::publish::publish_instance_registry(&registry, &publisher).await;
         let cert_valid_from = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)

@@ -1099,6 +1099,89 @@ pub unsafe extern "C" fn veil_node_apply_config(
     }
 }
 
+/// Tell a running node to re-read `identity_document.bin` and republish, WITHOUT
+/// restarting anything.
+///
+/// The counterpart to [`veil_node_apply_config`] for the one thing that is not a
+/// reconfiguration: a host that merges another device's document into the
+/// identity directory has changed a file the node already read, and the node has
+/// to read it again. Applying a config does that as a side effect of stopping
+/// and restarting every service — which drops every client's IPC connection, so
+/// the mailbox, chat and media clients all fail their next call. Measured on a
+/// two-device stand: the link succeeded and each deposit after it failed with
+/// `connection closed`.
+///
+/// Returns 0 on success, -1 on failure with `*err_out` set (free it with
+/// `veil_free_string`). A document naming a DIFFERENT identity is a failure, not
+/// a silent no-op.
+///
+/// # Safety
+/// `node` must be a live handle from `veil_node_start_deferred`; `err_out` (if
+/// non-null) must be a writable `*mut c_char` slot.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn veil_node_reload_identity(
+    node: *const VeilNode,
+    err_out: *mut *mut c_char,
+) -> c_int {
+    if node.is_null() {
+        unsafe { set_err(err_out, "node is null") };
+        return -1;
+    }
+    let node = match crate::HandleTable::get(crate::node_table(), node as usize) {
+        Some(live) => live,
+        None => {
+            unsafe { set_err(err_out, "node handle is not live (already stopped?)") };
+            return -1;
+        }
+    };
+    let admin_socket = match &node.admin_socket {
+        Some(p) => p.clone(),
+        None => {
+            unsafe {
+                set_err(
+                    err_out,
+                    "node was not started in deferred mode (no admin socket to reload identity on)",
+                )
+            };
+            return -1;
+        }
+    };
+    let rt = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(rt) => rt,
+        Err(e) => {
+            unsafe { set_err(err_out, &format!("reload_identity runtime build failed: {e}")) };
+            return -1;
+        }
+    };
+    // Unlike apply_config there is no waiting for the admin socket to appear:
+    // this is only ever called on a node that has been serving for a while, so
+    // a socket that is not there is a fact to report rather than a race to
+    // ride out.
+    let outcome = rt.block_on(async {
+        let cmd = veil_node_runtime::admin::AdminCommand::ReloadIdentity;
+        match veil_node_runtime::admin::send_request(&admin_socket, cmd).await {
+            Ok(resp) => match resp.error {
+                Some(e) => Err(format!("reload-identity rejected: {e}")),
+                None => Ok(()),
+            },
+            Err(e) => Err(format!(
+                "reload-identity could not reach the node's admin socket at {}: {e}",
+                admin_socket.display(),
+            )),
+        }
+    });
+    match outcome {
+        Ok(()) => 0,
+        Err(e) => {
+            unsafe { set_err(err_out, &e) };
+            -1
+        }
+    }
+}
+
 /// Whether the node's own thread has already exited.
 ///
 /// `true` also when the handle no longer holds a thread — a node that was
