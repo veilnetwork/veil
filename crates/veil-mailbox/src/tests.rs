@@ -1678,3 +1678,66 @@ fn v01_control_byte_ceiling_does_not_shorten_a_batch_that_fits() {
          must bind here"
     );
 }
+
+
+// ── SLICE: a blob too heavy for one reply, read a window at a time ──────────
+//
+// The size of a mailbox blob is not the sender's to choose — one ML-KEM
+// envelope per recipient DEVICE means it grows with the identity — so "too big
+// to fetch" had to stop meaning "undeliverable".
+
+#[test]
+fn t1_4_slice_walks_the_blob_and_reports_the_whole_length() {
+    let (mb, _tmp, _clk) = fresh(MailboxConfig::default());
+    let recv = [11u8; 32];
+    let cid = [22u8; 32];
+    let payload: Vec<u8> = (0..5000u32).map(|i| (i % 251) as u8).collect();
+    mb.put(recv, cid, [33u8; 32], payload.clone()).unwrap();
+
+    let mut got = Vec::new();
+    let mut offset = 0u32;
+    let mut rounds = 0;
+    loop {
+        let (total, bytes) = mb.slice(recv, cid, offset, 1024).unwrap().unwrap();
+        assert_eq!(total as usize, payload.len(), "every slice states the whole length");
+        if bytes.is_empty() {
+            break;
+        }
+        offset += bytes.len() as u32;
+        got.extend_from_slice(&bytes);
+        rounds += 1;
+        assert!(rounds < 100, "walk is not converging");
+    }
+    assert_eq!(got, payload, "the windows reassemble to the deposit");
+    assert!(rounds >= 4, "a 5000-byte blob in 1024-byte windows takes several");
+}
+
+#[test]
+fn t1_4_slice_of_an_absent_blob_answers_none() {
+    // An ANSWER, not an empty window: a receiver handed emptiness would ask for
+    // the same offset forever, and a blob that aged out or was acked from
+    // another device is exactly the case that produces this.
+    let (mb, _tmp, _clk) = fresh(MailboxConfig::default());
+    assert!(mb.slice([1u8; 32], [2u8; 32], 0, 1024).unwrap().is_none());
+
+    // And a receiver cannot read someone else's mail by naming its content id.
+    let cid = [2u8; 32];
+    mb.put([1u8; 32], cid, [3u8; 32], b"mine".to_vec()).unwrap();
+    assert!(mb.slice([9u8; 32], cid, 0, 1024).unwrap().is_none());
+    assert!(mb.slice([1u8; 32], cid, 0, 1024).unwrap().is_some());
+}
+
+#[test]
+fn t1_4_slice_past_the_end_is_empty_with_a_truthful_length() {
+    let (mb, _tmp, _clk) = fresh(MailboxConfig::default());
+    let recv = [4u8; 32];
+    let cid = [5u8; 32];
+    mb.put(recv, cid, [6u8; 32], vec![7u8; 100]).unwrap();
+
+    let (total, bytes) = mb.slice(recv, cid, 500, 1024).unwrap().unwrap();
+    assert_eq!(total, 100);
+    assert!(bytes.is_empty());
+    // A window that starts inside and runs past the end is clamped, not an error.
+    let (_, tail) = mb.slice(recv, cid, 90, 1024).unwrap().unwrap();
+    assert_eq!(tail.len(), 10);
+}
