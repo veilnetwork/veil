@@ -250,10 +250,22 @@ impl RuntimeMailboxCrypto {
         }
         // Embed our own signed document so an offline recipient can verify us
         // without a DHT resolve (see `open` + `seal_mailbox_blob`).
+        //
+        // THE SENDER IS THE IDENTITY, NOT THE TRANSPORT KEY. The inner auth
+        // already says so (`sign_auth_deliver` writes `document.node_id`), and
+        // everything the recipient does with the sidecar's value assumes it:
+        // the embedded document is accepted only when `doc.node_id` equals it,
+        // the DHT fallback resolves it, and `verify_auth_deliver` compares it
+        // against the document again. On a master device the two ids are the
+        // same 32 bytes and every check passes by coincidence; on a sibling
+        // they differ, the honest embedded document was discarded as forged,
+        // the DHT resolve looked where nobody publishes, and every deposit the
+        // sibling made failed open as `SenderDocUnresolved` — measured live as
+        // the master receiving nothing at all.
         mailbox_seal::seal_mailbox_blob(
             &auth,
             &certs,
-            &self.local_node_id,
+            &sovereign.document.node_id,
             &recipient_node_id,
             &sovereign.document,
         )
@@ -603,6 +615,47 @@ mod tests {
         assert_eq!(auth.data, payload);
         assert_eq!(auth.app_id, app_id);
         assert_eq!(auth.endpoint_id, 9);
+    }
+
+    /// A SIBLING's deposit must be openable, and a sibling is exactly a node
+    /// whose transport id is NOT its document's node id.
+    ///
+    /// The seal used to write `local_node_id` into the sidecar while the inner
+    /// auth said `document.node_id`. On a master device the two are the same
+    /// 32 bytes and every check passes by coincidence. On a sibling they
+    /// differ: the recipient recovered the transport id, threw away the
+    /// honest embedded document (`doc.node_id` names the identity, not the
+    /// transport), resolved the transport id in a DHT where nobody publishes a
+    /// document, and failed `SenderDocUnresolved`. Measured live as a master
+    /// device with zero inbound messages for a whole session while the
+    /// sibling's client logged every deposit as stored.
+    #[tokio::test]
+    async fn a_blob_sealed_by_a_sibling_transport_key_still_opens() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (ek, dk) = veil_e2e::generate_keypair();
+        let ring = Arc::new(veil_e2e::MlKemSeedRing::new(0, dk, ek));
+        let mut crypto = crypto_over(tmp.path(), Arc::clone(&ring));
+        // The sibling condition, stated directly: the node runs on a mined
+        // transport key, so its wire id is not the identity in its document.
+        crypto.local_node_id = [0xD4u8; 32];
+
+        let app_id = [0x42u8; 32];
+        let payload = b"a sibling wrote this";
+        let blob = crypto
+            .seal(crypto.local_node_id, app_id, 3, payload)
+            .await
+            .expect("self-seal needs no DHT");
+
+        let auth = crypto
+            .open(&blob, LOCAL_MLKEM_CERT_VERSION)
+            .await
+            .expect("the recipient must verify the sender by its embedded document");
+        assert_eq!(auth.data, payload);
+        // And the author the app sees is the IDENTITY — the value the group
+        // layer keys everything by — never the transport key.
+        let doc_node_id = crypto.sovereign.get().unwrap().document.node_id;
+        assert_eq!(auth.sender_node_id, doc_node_id);
+        assert_ne!(auth.sender_node_id, crypto.local_node_id);
     }
 
     /// Past the overlap the retired seed is gone, and the blob fails CLOSED —
