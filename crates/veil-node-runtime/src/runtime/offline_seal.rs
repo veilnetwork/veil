@@ -430,7 +430,22 @@ impl veil_ipc::MailboxCryptoSink for RuntimeMailboxCrypto {
                 Ok(blob) => O::Ok(blob),
                 Err(OfflineSealError::NoIdentity) => O::NoIdentity,
                 Err(OfflineSealError::RecipientCertUnresolved) => O::PeerUnresolved,
-                Err(_) => O::Failed,
+                Err(e) => {
+                    // Same reasoning as the open path's detail log: the IPC
+                    // surface collapses every remaining failure into `Failed`,
+                    // and a seal that fails on the SENDER is even quieter than
+                    // an open that fails on the receiver — the deposit simply
+                    // never leaves, the outbox retries forever, and the log
+                    // says a word with no class in it. Cost a live session:
+                    // the master's deposits to its sibling failed for hours as
+                    // "Failed" while every candidate cause needed this line to
+                    // be told apart.
+                    log::warn!(
+                        "mailbox_seal failed (detail, recipient={}): {e:?}",
+                        veil_util::hex_short(&recipient_node_id),
+                    );
+                    O::Failed
+                }
             }
         })
     }
