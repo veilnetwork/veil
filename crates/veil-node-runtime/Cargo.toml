@@ -13,6 +13,7 @@ license = "AGPL-3.0-or-later"
 # `--features production-seeds` on veil-node-runtime activates the same
 # behaviour as enabling it on veil-bootstrap directly.
 production-seeds = ["veil-bootstrap/production-seeds"]
+testnet-seeds = ["veil-bootstrap/testnet-seeds"]
 allow-empty-seeds = ["veil-bootstrap/allow-empty-seeds"]
 rocksdb-cold = ["veil-dht/rocksdb-cold"]
 test-low-difficulty = [

@@ -26,6 +26,7 @@ tls-boring = ["veilclient/tls-boring"]
 # seeds compiled in).
 allow-empty-seeds = ["veilclient/allow-empty-seeds"]
 production-seeds  = ["veilclient/production-seeds"]
+testnet-seeds     = ["veilclient/testnet-seeds"]
 
 [dependencies]
 # Veil SDK / IPC client.

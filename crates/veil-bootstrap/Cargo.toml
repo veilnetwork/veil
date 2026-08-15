@@ -12,7 +12,11 @@ license = "AGPL-3.0-or-later"
 tls-boring = ["veil-transport/tls-boring"]
 # Production safety gate (Epic 412.10): asserts BUILTIN_SEEDS is non-empty.
 production-seeds = []
-# Opt-in escape hatch for testnet builds with no builtin seeds.
+# The TESTNET seed set: same hosts as production, own port, own obfs4 PSK,
+# own node identities. Mutually exclusive with `production-seeds` in practice —
+# a binary belongs to one network.
+testnet-seeds = []
+# Opt-in escape hatch for builds with no builtin seeds at all.
 allow-empty-seeds = []
 
 [dependencies]

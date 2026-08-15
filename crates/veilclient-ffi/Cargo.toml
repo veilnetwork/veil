@@ -28,6 +28,7 @@ tls-boring = ["veilclient/tls-boring"]
 # (Flutter plugin, mobile build script) opt-in.
 allow-empty-seeds = ["veilclient/allow-empty-seeds"]
 production-seeds  = ["veilclient/production-seeds"]
+testnet-seeds     = ["veilclient/testnet-seeds"]
 test-low-difficulty = ["veilclient/test-low-difficulty"]
 packet-tunnel = ["dep:tun2proxy", "dep:tun", "dep:serde", "dep:serde_json"]
 
