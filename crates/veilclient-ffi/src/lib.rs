@@ -9017,6 +9017,108 @@ pub unsafe extern "C" fn veil_adopt_identity_document_from_config_zeroize(
     }
 }
 
+/// Adopt a document that already names THIS device, authorising with nothing
+/// but the device's own key out of its node config.
+///
+/// The third entry point, for the one caller the other two fail: a freshly
+/// linked device. Its config is not the master (`from_config` demands that),
+/// and the phrase left with the ceremony (`from_master` needs those 32
+/// bytes). What it does hold is its own device key — and the incoming
+/// document carries a master-signed cert for exactly that key, so the
+/// master's authority arrives INSIDE the document. Verify it, find our key
+/// in it, store it. A document that does not name us is refused, which is
+/// what keeps this from being an accept-anything hole.
+///
+/// `config_toml` is SECRET (carries the device private key) and is wiped in
+/// place before return, success or failure.
+#[cfg(feature = "node-embedded")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn veil_adopt_identity_document_named_zeroize(
+    config_toml: *mut u8,
+    config_toml_len: usize,
+    veil_dir: *const u8,
+    veil_dir_len: usize,
+    document: *const u8,
+    document_len: usize,
+    key_idx_out: *mut u16,
+    err_out: *mut *mut c_char,
+) -> c_int {
+    unsafe {
+        clear_err(err_out);
+    }
+    if config_toml.is_null() || document.is_null() {
+        unsafe {
+            write_err(err_out, "config_toml or document is NULL");
+        }
+        return VEIL_ERR_INVALID_ARG;
+    }
+
+    struct ZeroOnDrop {
+        ptr: *mut u8,
+        len: usize,
+    }
+    impl Drop for ZeroOnDrop {
+        fn drop(&mut self) {
+            unsafe { volatile_wipe(self.ptr, self.len) };
+        }
+    }
+    let _guard = ZeroOnDrop {
+        ptr: config_toml,
+        len: config_toml_len,
+    };
+
+    let toml_bytes =
+        unsafe { std::slice::from_raw_parts(config_toml as *const u8, config_toml_len) };
+    let Ok(toml) = std::str::from_utf8(toml_bytes) else {
+        unsafe {
+            write_err(err_out, "config_toml is not valid UTF-8");
+        }
+        return VEIL_ERR_INVALID_ARG;
+    };
+    let Some(dir_str) = (unsafe { slice_to_str(veil_dir, veil_dir_len) }) else {
+        unsafe {
+            write_err(err_out, "veil_dir is NULL or invalid UTF-8");
+        }
+        return VEIL_ERR_INVALID_ARG;
+    };
+    let incoming = unsafe { std::slice::from_raw_parts(document, document_len) };
+
+    // Same extraction as the master path — [identity].private_key — but here
+    // the config is a DEVICE config, so those 32 bytes are the device seed.
+    let device_sk = match master_signing_key_from_config(toml, err_out) {
+        Ok(k) => k,
+        Err(rc) => return rc,
+    };
+    let mut own_sk: veil_util::sensitive_bytes::SensitiveBytesN<32> =
+        veil_util::sensitive_bytes::SensitiveBytesN::new();
+    own_sk.as_mut_slice().copy_from_slice(device_sk.as_ref());
+
+    let now_unix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+
+    match veil_identity::sovereign_flow::adopt_named_identity_document(
+        std::path::Path::new(dir_str),
+        incoming,
+        &own_sk,
+        now_unix,
+    ) {
+        Ok(outcome) => {
+            if !key_idx_out.is_null() {
+                unsafe { *key_idx_out = outcome.key_idx() };
+            }
+            VEIL_OK
+        }
+        Err(e) => {
+            unsafe {
+                write_err(err_out, format!("adopt_named_identity_document: {e}"));
+            }
+            VEIL_ERR
+        }
+    }
+}
+
 /// The master Ed25519 secret out of a node config, or the `VEIL_ERR_*` to
 /// return. Shared by the two config-taking identity entry points so they
 /// cannot drift on what counts as a usable config.
