@@ -1910,6 +1910,61 @@ impl AdoptOutcome {
     }
 }
 
+/// The union of a local and an incoming document's key sets, or None when the
+/// incoming brings nothing the local does not already hold.
+///
+/// EXISTS BECAUSE WHOLESALE ADOPTION ROLLS KEYS BACK. "The incoming document
+/// names me, take it as it stands" is correct for a device with no document
+/// and destructive for one with a richer document: a sibling that missed a
+/// delegation keeps announcing its stale copy, and whichever device adopts it
+/// wholesale silently DROPS the delegated key — measured live as a
+/// retro-delegated writer key vanishing from the whole family, taking every
+/// row that writer ever signed back to "unverifiable".
+///
+/// Each subkey carries its own master-signed cert, so a union of two verified
+/// documents is verifiable by construction — it only needs re-signing, which
+/// the caller does with its own key exactly the way `delegate_device` does.
+fn union_identity_keys(
+    local: &IdentityDocument,
+    incoming: &IdentityDocument,
+) -> Option<Vec<IdentityKey>> {
+    let mut keys = local.identity_keys.clone();
+    let mut grew = false;
+    for k in &incoming.identity_keys {
+        if !keys.iter().any(|have| have.pubkey == k.pubkey) {
+            keys.push(k.clone());
+            grew = true;
+        }
+    }
+    grew.then_some(keys)
+}
+
+/// Re-sign `doc` with this device's own subkey and write it out, recording the
+/// device's own index. The one signing shape every non-master path shares.
+fn resign_and_store_document(
+    veil_dir: &Path,
+    mut doc: IdentityDocument,
+    own_sk: &SigningKey,
+    own_pk: &[u8],
+    now_unix: u64,
+) -> Result<u16, AdoptDocumentError> {
+    let Some(idx) = doc.identity_keys.iter().position(|k| k.pubkey == own_pk) else {
+        return Err(AdoptDocumentError::Verify(
+            "unioned document does not name this device's key".into(),
+        ));
+    };
+    let idx = idx as u16;
+    doc.sig_key_idx = idx;
+    doc.issued_at_unix = now_unix;
+    let mut doc_msg = Vec::with_capacity(DOC_SIG_CONTEXT.len() + 512);
+    doc_msg.extend_from_slice(DOC_SIG_CONTEXT);
+    doc_msg.extend_from_slice(&doc.canonical_signing_bytes());
+    doc.document_sig = own_sk.sign(&doc_msg).to_bytes().to_vec();
+    atomic_write(&veil_dir.join(IDENTITY_DOCUMENT_FILE), &doc.encode())?;
+    save_device_sig_key_idx(veil_dir, idx)?;
+    Ok(idx)
+}
+
 /// Merge a document received from another device of the same identity with
 /// this device's own state. Idempotent, and safe to run in either direction.
 ///
@@ -1966,6 +2021,48 @@ pub fn adopt_identity_document(
         .position(|k| k.pubkey == own_pk)
     {
         let idx = idx as u16;
+        // Never let a stale announcement shrink the key set: keep every key
+        // the local document holds that the incoming one lost.
+        if let Ok(local_bytes) = std::fs::read(&doc_path) {
+            if let Ok(local) = IdentityDocument::decode(&local_bytes) {
+                if local.node_id == incoming.node_id {
+                    match union_identity_keys(&local, &incoming) {
+                        None => {
+                            // Nothing new — refresh expiry at most.
+                            let mut keep = local;
+                            if incoming.valid_until_unix > keep.valid_until_unix {
+                                keep.valid_until_unix = incoming.valid_until_unix;
+                                let own_sk = SigningKey::from_bytes(own_seed.as_array());
+                                let key_idx = resign_and_store_document(
+                                    veil_dir, keep, &own_sk, &own_pk, now_unix,
+                                )?;
+                                return Ok(AdoptOutcome::Adopted { key_idx });
+                            }
+                            let key_idx = keep
+                                .identity_keys
+                                .iter()
+                                .position(|k| k.pubkey == own_pk)
+                                .map(|i| i as u16)
+                                .unwrap_or(idx);
+                            save_device_sig_key_idx(veil_dir, key_idx)?;
+                            return Ok(AdoptOutcome::Adopted { key_idx });
+                        }
+                        Some(keys) => {
+                            let mut merged = local;
+                            merged.identity_keys = keys;
+                            if incoming.valid_until_unix > merged.valid_until_unix {
+                                merged.valid_until_unix = incoming.valid_until_unix;
+                            }
+                            let own_sk = SigningKey::from_bytes(own_seed.as_array());
+                            let key_idx = resign_and_store_document(
+                                veil_dir, merged, &own_sk, &own_pk, now_unix,
+                            )?;
+                            return Ok(AdoptOutcome::Adopted { key_idx });
+                        }
+                    }
+                }
+            }
+        }
         atomic_write(&doc_path, &incoming.encode())?;
         save_device_sig_key_idx(veil_dir, idx)?;
         return Ok(AdoptOutcome::Adopted { key_idx: idx });
@@ -2021,10 +2118,46 @@ pub fn adopt_named_identity_document(
     crate::verify::verify_identity_document(&incoming, now_unix)
         .map_err(|e| AdoptDocumentError::Verify(e.to_string()))?;
 
-    let own_pk = SigningKey::from_bytes(own_identity_sk.as_array())
-        .verifying_key()
-        .as_bytes()
-        .to_vec();
+    let own_sk = SigningKey::from_bytes(own_identity_sk.as_array());
+    let own_pk = own_sk.verifying_key().as_bytes().to_vec();
+
+    // A device that already holds a document must never let this call SHRINK
+    // it — a sibling that missed a delegation announces its stale copy
+    // forever, and wholesale adoption would drop the delegated keys. Union
+    // instead, and accept an incoming that does not name us as long as the
+    // union still does (our own local document names us).
+    let doc_path = veil_dir.join(IDENTITY_DOCUMENT_FILE);
+    if let Ok(local_bytes) = std::fs::read(&doc_path) {
+        if let Ok(local) = IdentityDocument::decode(&local_bytes) {
+            if local.node_id == incoming.node_id
+                && local.identity_keys.iter().any(|k| k.pubkey == own_pk)
+            {
+                return match union_identity_keys(&local, &incoming) {
+                    None => {
+                        let key_idx = local
+                            .identity_keys
+                            .iter()
+                            .position(|k| k.pubkey == own_pk)
+                            .expect("checked above") as u16;
+                        save_device_sig_key_idx(veil_dir, key_idx)?;
+                        Ok(AdoptOutcome::Adopted { key_idx })
+                    }
+                    Some(keys) => {
+                        let mut merged = local;
+                        merged.identity_keys = keys;
+                        if incoming.valid_until_unix > merged.valid_until_unix {
+                            merged.valid_until_unix = incoming.valid_until_unix;
+                        }
+                        let key_idx = resign_and_store_document(
+                            veil_dir, merged, &own_sk, &own_pk, now_unix,
+                        )?;
+                        Ok(AdoptOutcome::Adopted { key_idx })
+                    }
+                };
+            }
+        }
+    }
+
     let Some(idx) = incoming
         .identity_keys
         .iter()
@@ -2844,6 +2977,109 @@ mod tests {
                 .expect("instance file");
         let device_id = veil_crypto::identity::compute_node_id(&dev_pk);
         assert_eq!(inst.instance_id, device_id[..16], "instance id is stable");
+    }
+
+    // THE ROLLBACK REGRESSION, measured live: A delegated a third key, a
+    // sibling that missed it kept announcing its two-key copy, A adopted it
+    // wholesale ("it names me"), and the third key vanished from the family —
+    // with every row that writer ever signed going back to "unverifiable".
+    #[test]
+    fn adopting_a_stale_subset_document_drops_no_keys() {
+        use crate::sovereign::SovereignIdentity;
+        use ed25519_dalek::SigningKey as EdSk;
+
+        let seed = create_identity(test_opts(tempdir())).unwrap().master_seed;
+        let a = tempdir();
+        provision(a.clone(), seed.clone());
+        let stale = std::fs::read(a.join(IDENTITY_DOCUMENT_FILE)).unwrap();
+
+        // A grows: a retro-delegated writer key.
+        let writer_seed: SensitiveBytesN<32> = SensitiveBytesN::from_bytes([0x51u8; 32]);
+        let writer_pk = EdSk::from_bytes(writer_seed.as_array())
+            .verifying_key()
+            .as_bytes()
+            .to_vec();
+        delegate_device(delegate_opts(a.clone(), seed.clone(), writer_pk.clone())).unwrap();
+        assert_eq!(
+            IdentityDocument::decode(&std::fs::read(a.join(IDENTITY_DOCUMENT_FILE)).unwrap())
+                .unwrap()
+                .identity_keys
+                .len(),
+            2
+        );
+
+        // The stale one-key document comes back — master path.
+        let out = adopt_identity_document(
+            &a,
+            &stale,
+            MasterSecret::Seed(seed.clone()),
+            DELEGATE_NOW,
+            DELEGATE_NOW + 7 * 86_400,
+        )
+        .expect("adopt");
+        assert!(matches!(out, AdoptOutcome::Adopted { .. }));
+        let doc =
+            IdentityDocument::decode(&std::fs::read(a.join(IDENTITY_DOCUMENT_FILE)).unwrap())
+                .unwrap();
+        assert_eq!(doc.identity_keys.len(), 2, "stale adopt must not shrink");
+        assert!(
+            doc.identity_keys.iter().any(|k| k.pubkey == writer_pk),
+            "the delegated writer key survives"
+        );
+        SovereignIdentity::load_from_dir(&a).expect("still loads");
+    }
+
+    #[test]
+    fn named_adopt_unions_a_stale_document_too() {
+        use crate::sovereign::SovereignIdentity;
+        use ed25519_dalek::SigningKey as EdSk;
+
+        // Master provisions, delegates the device, hands over the document.
+        let master = tempdir();
+        let seed = create_identity(test_opts(master.clone())).unwrap().master_seed;
+        let one_key_doc = std::fs::read(master.join(IDENTITY_DOCUMENT_FILE)).unwrap();
+
+        let dev_seed: SensitiveBytesN<32> = SensitiveBytesN::from_bytes([0x42u8; 32]);
+        let dev_pk = EdSk::from_bytes(dev_seed.as_array())
+            .verifying_key()
+            .as_bytes()
+            .to_vec();
+        delegate_device(delegate_opts(master.clone(), seed.clone(), dev_pk)).unwrap();
+        let two_key_doc = std::fs::read(master.join(IDENTITY_DOCUMENT_FILE)).unwrap();
+
+        let fresh = tempdir();
+        std::fs::create_dir_all(&fresh).unwrap();
+        adopt_named_identity_document(&fresh, &two_key_doc, &dev_seed, DELEGATE_NOW)
+            .expect("first adopt");
+
+        // The stale ONE-key document arrives (does not even name us). The
+        // union keeps our key, and the call reports our recorded index.
+        let out =
+            adopt_named_identity_document(&fresh, &one_key_doc, &dev_seed, DELEGATE_NOW)
+                .expect("stale adopt");
+        assert!(matches!(out, AdoptOutcome::Adopted { key_idx: 1 }));
+        let doc =
+            IdentityDocument::decode(&std::fs::read(fresh.join(IDENTITY_DOCUMENT_FILE)).unwrap())
+                .unwrap();
+        assert_eq!(doc.identity_keys.len(), 2, "nothing shrank");
+        SovereignIdentity::load_from_dir(&fresh).expect("still loads");
+
+        // And a genuinely new key arriving later is UNIONED in.
+        let third_seed: SensitiveBytesN<32> = SensitiveBytesN::from_bytes([0x77u8; 32]);
+        let third_pk = EdSk::from_bytes(third_seed.as_array())
+            .verifying_key()
+            .as_bytes()
+            .to_vec();
+        delegate_device(delegate_opts(master.clone(), seed, third_pk.clone())).unwrap();
+        let three_key_doc = std::fs::read(master.join(IDENTITY_DOCUMENT_FILE)).unwrap();
+        adopt_named_identity_document(&fresh, &three_key_doc, &dev_seed, DELEGATE_NOW)
+            .expect("union adopt");
+        let doc =
+            IdentityDocument::decode(&std::fs::read(fresh.join(IDENTITY_DOCUMENT_FILE)).unwrap())
+                .unwrap();
+        assert_eq!(doc.identity_keys.len(), 3, "the new key is unioned in");
+        assert!(doc.identity_keys.iter().any(|k| k.pubkey == third_pk));
+        SovereignIdentity::load_from_dir(&fresh).expect("still loads after union");
     }
 
     #[test]
