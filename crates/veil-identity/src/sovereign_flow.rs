@@ -1989,6 +1989,86 @@ pub fn adopt_identity_document(
     })
 }
 
+/// Adopt a document that ALREADY NAMES this device, with no master secret.
+///
+/// The linking ceremony's receiving half on a device that has no sovereign
+/// material of its own — the "mined" temporary identity every fresh install
+/// starts with. The source device delegated OUR pubkey into the document
+/// under the master and handed the result over the ceremony channel; the
+/// master's authority is IN the document (every subkey is master-signed),
+/// so nothing here needs a secret this device was never given.
+///
+/// What binds the document to us is the pair of checks below: it verifies
+/// internally against its own `node_id`, and it carries a master-signed
+/// cert for exactly the key whose secret THIS device holds. A document from
+/// a different identity can pass the first only by being a real document of
+/// that identity — and then it cannot contain our key, because only our
+/// ceremony partner was given it.
+///
+/// Measured before this existed: the receiving device logged
+/// `source document merged=false` on every adopt, kept `documentBytes: 0`
+/// forever, and dropped every sibling-signed row as unverifiable — the
+/// device-linking flow silently produced a device that could never verify
+/// its own family.
+pub fn adopt_named_identity_document(
+    veil_dir: &Path,
+    incoming_bytes: &[u8],
+    own_identity_sk: &SensitiveBytesN<32>,
+    now_unix: u64,
+) -> Result<AdoptOutcome, AdoptDocumentError> {
+    let incoming = IdentityDocument::decode(incoming_bytes)
+        .map_err(|e| AdoptDocumentError::DocumentDecode(e.to_string()))?;
+    crate::verify::verify_identity_document(&incoming, now_unix)
+        .map_err(|e| AdoptDocumentError::Verify(e.to_string()))?;
+
+    let own_pk = SigningKey::from_bytes(own_identity_sk.as_array())
+        .verifying_key()
+        .as_bytes()
+        .to_vec();
+    let Some(idx) = incoming
+        .identity_keys
+        .iter()
+        .position(|k| k.pubkey == own_pk)
+    else {
+        return Err(AdoptDocumentError::Verify(
+            "document does not name this device's key".into(),
+        ));
+    };
+
+    // The sk file first: a document on disk whose recorded index names a key
+    // this directory cannot load is exactly the fail-closed state the
+    // adopt_identity_document doc-comment warns about.
+    std::fs::create_dir_all(veil_dir)?;
+    save_identity_sk(veil_dir, own_identity_sk)?;
+    atomic_write(&veil_dir.join(IDENTITY_DOCUMENT_FILE), &incoming.encode())?;
+    save_device_sig_key_idx(veil_dir, idx as u16)?;
+
+    // Instance file, only when the dir has none. The id is the device_id
+    // truncation — the SAME value this device has been publishing while it ran
+    // on its degenerate single-key document, so adopting the family document
+    // does not change which instance peers know it as.
+    {
+        use crate::instance::{LocalInstance, default_instance_path};
+        let inst_path = default_instance_path(veil_dir);
+        if !inst_path.exists() {
+            let device_id = veil_crypto::identity::compute_node_id(&own_pk);
+            let mut instance_id = [0u8; 16];
+            instance_id.copy_from_slice(&device_id[..16]);
+            LocalInstance {
+                instance_id,
+                label: "device".into(),
+            }
+            .save(&inst_path)
+            .map_err(|e| {
+                AdoptDocumentError::Io(std::io::Error::other(e.to_string()))
+            })?;
+        }
+    }
+    Ok(AdoptOutcome::Adopted {
+        key_idx: idx as u16,
+    })
+}
+
 /// Persist the device's identity_sk seed to
 /// `<veil_dir>/device_identity_sk.bin` with restrictive
 /// permissions. File is 32 raw bytes — no magic header because
@@ -2715,6 +2795,82 @@ mod tests {
         assert_eq!(sov_b.document.identity_keys.len(), 2);
     }
 
+    // ── adopt_named_identity_document ──────────────────────────
+    //
+    // The no-master path. The live shape it exists for: a freshly installed
+    // device holds a mined temporary identity — no phrase, no master config,
+    // no document — and receives over the linking ceremony a document into
+    // which the source device already delegated ITS key.
+
+    #[test]
+    fn named_adopt_takes_a_document_that_names_this_device() {
+        use crate::sovereign::SovereignIdentity;
+        use ed25519_dalek::SigningKey as EdSk;
+
+        let master = tempdir();
+        let seed = create_identity(test_opts(master.clone())).unwrap().master_seed;
+
+        // The ceremony's source side: delegate the fresh device's pubkey.
+        let dev_seed: SensitiveBytesN<32> = SensitiveBytesN::from_bytes([0x42u8; 32]);
+        let dev_pk = EdSk::from_bytes(dev_seed.as_array())
+            .verifying_key()
+            .as_bytes()
+            .to_vec();
+        delegate_device(delegate_opts(master.clone(), seed, dev_pk.clone())).unwrap();
+        let doc_bytes = std::fs::read(master.join(IDENTITY_DOCUMENT_FILE)).unwrap();
+
+        // The receiving side: an empty dir and the device's own sk. No master.
+        let fresh = tempdir();
+        std::fs::create_dir_all(&fresh).unwrap();
+        let outcome =
+            adopt_named_identity_document(&fresh, &doc_bytes, &dev_seed, DELEGATE_NOW)
+                .expect("named adopt");
+        assert!(matches!(outcome, AdoptOutcome::Adopted { key_idx: 1 }));
+
+        // The state the whole mechanism exists to produce: the dir LOADS,
+        // as this device, under the master's identity.
+        let sov = SovereignIdentity::load_from_dir(&fresh).expect("fresh dir loads");
+        let master_sov = SovereignIdentity::load_from_dir(&master).unwrap();
+        assert_eq!(sov.node_id(), master_sov.node_id(), "one identity");
+        assert_eq!(
+            sov.document.identity_keys[1].pubkey, dev_pk,
+            "our key, at our recorded index"
+        );
+
+        // The instance file exists and carries the device_id truncation — the
+        // id this device was already publishing before the adopt.
+        let inst =
+            crate::instance::LocalInstance::load(&crate::instance::default_instance_path(&fresh))
+                .expect("instance file");
+        let device_id = veil_crypto::identity::compute_node_id(&dev_pk);
+        assert_eq!(inst.instance_id, device_id[..16], "instance id is stable");
+    }
+
+    #[test]
+    fn named_adopt_refuses_a_document_that_does_not_name_us() {
+        let master = tempdir();
+        create_identity(test_opts(master.clone())).unwrap();
+        let doc_bytes = std::fs::read(master.join(IDENTITY_DOCUMENT_FILE)).unwrap();
+
+        // A key the document has never seen. This is also the accept-anything
+        // check: a valid FOREIGN document must not be storable, or any peer
+        // could hand a device someone else's identity.
+        let stranger: SensitiveBytesN<32> = SensitiveBytesN::from_bytes([0x66u8; 32]);
+        let fresh = tempdir();
+        std::fs::create_dir_all(&fresh).unwrap();
+        let err = adopt_named_identity_document(&fresh, &doc_bytes, &stranger, DELEGATE_NOW)
+            .unwrap_err();
+        assert!(
+            matches!(err, AdoptDocumentError::Verify(_)),
+            "got {err:?}"
+        );
+        assert!(
+            !fresh.join(IDENTITY_DOCUMENT_FILE).exists()
+                && !fresh.join(DEVICE_IDENTITY_SK_FILE).exists(),
+            "a refused adopt must write nothing"
+        );
+    }
+
     #[test]
     fn adopting_the_same_document_twice_changes_nothing() {
         use crate::sovereign::SovereignIdentity;
@@ -3232,6 +3388,7 @@ mod tests {
             valid_until_unix: now + 7 * 86_400,
             algo: SignatureAlgorithm::Falcon512,
             master_falcon_keypair_bytes: Some(bundle.clone()),
+            device_sk_seed: None,
         })
         .expect("falcon-only restore");
 
@@ -3846,6 +4003,7 @@ mod tests {
             valid_until_unix: now + 7 * 86_400,
             algo: SignatureAlgorithm::Ed25519Falcon512Hybrid,
             master_falcon_keypair_bytes: Some(falcon_bundle.clone()),
+            device_sk_seed: None,
         })
         .expect("hybrid restore");
 
