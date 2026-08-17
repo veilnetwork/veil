@@ -392,13 +392,21 @@ impl Default for AuthDeliverReassembler {
 ///
 /// `sender_doc` MUST be the verified IdentityDocument of `p.sender_node_id`
 /// (caller resolves it). `self_node_id` is the recipient's own node_id.
+///
+/// On success, returns the `device_id` of the subkey that verified.
+/// `sender_node_id` names an IDENTITY — a whole device family — while
+/// `sig_key_idx` picks the one DEVICE in it that actually signed. That subkey
+/// is the protocol's only cryptographic device attribution, so a consumer
+/// that must act per-device (the relay mailbox keys boxes by fetcher id) gets
+/// it from here, off the same proof, rather than from anything the sender
+/// merely claims.
 pub fn verify_auth_deliver(
     p: &AuthAppDeliver,
     sender_doc: &IdentityDocument,
     self_node_id: &[u8; 32],
     now_unix: u64,
     freshness_window_secs: u64,
-) -> Result<(), AuthDeliverError> {
+) -> Result<[u8; 32], AuthDeliverError> {
     // The claimed sender must match the document we resolved for it.
     if p.sender_node_id != sender_doc.node_id {
         return Err(AuthDeliverError::SenderMismatch);
@@ -435,7 +443,8 @@ pub fn verify_auth_deliver(
         &p.signing_bytes_with_dst(self_node_id),
         &p.signature,
     )
-    .map_err(|_| AuthDeliverError::BadSignature)
+    .map_err(|_| AuthDeliverError::BadSignature)?;
+    Ok(subkey.device_id)
 }
 
 #[cfg(test)]
@@ -445,6 +454,11 @@ mod tests {
     use veil_proto::identity_document::IdentityKey;
 
     const NOW: u64 = 1_700_000_000;
+
+    /// The fixture subkey's device id — deliberately NOT zero, so a test that
+    /// asserts on the verify result cannot pass by confusing it with the
+    /// all-zero anonymous marker.
+    const DEVICE_ID: [u8; 32] = [0xD7; 32];
 
     #[test]
     fn replay_cache_accepts_once_then_rejects_duplicate() {
@@ -515,7 +529,7 @@ mod tests {
             identity_keys: vec![IdentityKey {
                 algo: ALGO_ED25519,
                 pubkey: pk_bytes,
-                device_id: [0u8; 32],
+                device_id: DEVICE_ID,
                 valid_from_unix: NOW - 10,
                 valid_until_unix: NOW + 86_400,
                 master_sig: vec![0u8; 64],
@@ -553,7 +567,21 @@ mod tests {
         let (doc, p, self_id, _) = signed_fixture();
         assert_eq!(
             verify_auth_deliver(&p, &doc, &self_id, NOW, DEFAULT_AUTH_DELIVER_FRESHNESS_SECS),
-            Ok(())
+            Ok(DEVICE_ID)
+        );
+    }
+
+    /// The Ok value must be the device_id of the SUBKEY that verified — tied
+    /// to `sig_key_idx`, not to any fixed constant: it is the caller's only
+    /// handle on which family device signed an identity-addressed message.
+    #[test]
+    fn verify_returns_the_signing_subkeys_device_id() {
+        let (doc, p, self_id, _) = signed_fixture();
+        let dev = verify_auth_deliver(&p, &doc, &self_id, NOW, DEFAULT_AUTH_DELIVER_FRESHNESS_SECS)
+            .expect("fixture delivery must verify");
+        assert_eq!(
+            dev, doc.identity_keys[p.sig_key_idx as usize].device_id,
+            "verify must name the exact device behind sig_key_idx",
         );
     }
 

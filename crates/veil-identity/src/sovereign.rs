@@ -1082,6 +1082,8 @@ mod tests {
         assert_eq!(p.sig_key_idx, sov.sig_key_idx);
 
         // Recipient (bob) verifies against the SENDER's (alice's) document.
+        // The Ok value is the signing subkey's device_id — verify names the
+        // exact family device behind the identity, off the same proof.
         assert_eq!(
             verify_auth_deliver(
                 &p,
@@ -1090,7 +1092,7 @@ mod tests {
                 now,
                 DEFAULT_AUTH_DELIVER_FRESHNESS_SECS
             ),
-            Ok(()),
+            Ok(sov.document.identity_keys[sov.sig_key_idx as usize].device_id),
             "a genuine signed delivery must verify",
         );
         // Tampered data must be rejected.
@@ -1137,7 +1139,7 @@ mod tests {
         // The signed reply block survives a wire round-trip.
         let decoded = veil_proto::AuthAppDeliver::decode(&p.encode()).unwrap();
         assert_eq!(decoded.reply_blocks, vec![rb]);
-        // It verifies as-is.
+        // It verifies as-is (Ok = the signing subkey's device_id).
         assert_eq!(
             verify_auth_deliver(
                 &decoded,
@@ -1146,7 +1148,7 @@ mod tests {
                 now,
                 DEFAULT_AUTH_DELIVER_FRESHNESS_SECS
             ),
-            Ok(()),
+            Ok(sov.document.identity_keys[sov.sig_key_idx as usize].device_id),
         );
         // Tampering the reply block breaks the signature.
         let mut bad = decoded.clone();

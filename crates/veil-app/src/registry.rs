@@ -61,6 +61,15 @@ pub enum AppMessage {
         /// or is merely what the frame claimed. Consult this before treating
         /// `src_node_id` as an identity — see [`SenderProvenance`].
         provenance: SenderProvenance,
+        /// The DEVICE that signed this message, when the delivery path proved
+        /// one. `src_node_id` names an IDENTITY — a whole device family — and
+        /// every device of that family authenticates as it, so a consumer
+        /// keyed by "who asked" sees one key for all of them. Only the
+        /// signed-delivery path can name the member device (the verified
+        /// `sig_key_idx` subkey of the sender's IdentityDocument carries its
+        /// device_id); every other path has no signature to name one with and
+        /// passes `None`. In-process only — this never rides the wire.
+        sender_device_id: Option<[u8; 32]>,
         src_app_id: [u8; 32],
         app_id: [u8; 32],
         endpoint_id: u32,
@@ -389,10 +398,12 @@ impl AppEndpointRegistry {
         endpoint_id: u32,
         data: veil_bufpool::PooledShared,
     ) -> bool {
-        // No reply path on the generic delivery path.
+        // No reply path on the generic delivery path — and no signature
+        // either, so there is no device to name.
         self.route_ipc_deliver_with_reply(
             src_node_id,
             provenance,
+            None,
             src_app_id,
             app_id,
             endpoint_id,
@@ -405,11 +416,16 @@ impl AppEndpointRegistry {
     /// (reply-channel): non-zero `reply_id` ⇒ the recipient app may reply via
     /// it. Used by the authenticated-delivery task when the message embedded a
     /// one-time reply path.
+    ///
+    /// `sender_device_id` follows the same rule as `provenance`: only a path
+    /// that VERIFIED a signature may pass `Some` — it is the device_id of the
+    /// subkey that verified, nothing weaker (see [`AppMessage::Deliver`]).
     #[allow(clippy::too_many_arguments)]
     pub fn route_ipc_deliver_with_reply(
         &self,
         src_node_id: [u8; 32],
         provenance: SenderProvenance,
+        sender_device_id: Option<[u8; 32]>,
         src_app_id: [u8; 32],
         app_id: [u8; 32],
         endpoint_id: u32,
@@ -425,6 +441,7 @@ impl AppEndpointRegistry {
             AppMessage::Deliver {
                 src_node_id,
                 provenance,
+                sender_device_id,
                 src_app_id,
                 app_id,
                 endpoint_id,
