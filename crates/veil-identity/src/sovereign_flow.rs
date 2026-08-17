@@ -522,6 +522,7 @@ pub fn create_identity(
         valid_until_unix: opts.valid_until_unix,
         sig_key_idx: 0,
         identity_keys: vec![identity_key],
+        revoked_devices: Vec::new(),
         document_sig: Vec::new(),
     };
 
@@ -1006,6 +1007,7 @@ pub fn restore_identity(
         valid_until_unix: opts.valid_until_unix,
         sig_key_idx: 0,
         identity_keys: vec![identity_key],
+        revoked_devices: Vec::new(),
         document_sig: Vec::new(),
     };
 
@@ -1415,6 +1417,7 @@ pub fn build_standalone_identity_document(
         valid_until_unix,
         sig_key_idx: 0,
         identity_keys: vec![identity_key],
+        revoked_devices: Vec::new(),
         document_sig: Vec::new(),
     };
 
@@ -1927,16 +1930,44 @@ impl AdoptOutcome {
 fn union_identity_keys(
     local: &IdentityDocument,
     incoming: &IdentityDocument,
-) -> Option<Vec<IdentityKey>> {
-    let mut keys = local.identity_keys.clone();
-    let mut grew = false;
-    for k in &incoming.identity_keys {
-        if !keys.iter().any(|have| have.pubkey == k.pubkey) {
-            keys.push(k.clone());
-            grew = true;
+) -> Option<(Vec<IdentityKey>, Vec<veil_proto::identity_document::RevokedDevice>)> {
+    use veil_proto::identity_document::RevokedDevice;
+    // Tombstones first: a grow-only set, kept strictly ascending (the wire's
+    // canonical order). The lattice is what makes the merge order-free —
+    // sets only grow, keys only leave through tombstone membership, so any
+    // two devices converge no matter who merged whom first.
+    let mut revoked: Vec<RevokedDevice> = local.revoked_devices.clone();
+    let mut changed = false;
+    for r in &incoming.revoked_devices {
+        match revoked.binary_search_by(|have| have.device_id.cmp(&r.device_id)) {
+            Ok(_) => {}
+            Err(at) => {
+                revoked.insert(at, r.clone());
+                changed = true;
+            }
         }
     }
-    grew.then_some(keys)
+    let is_revoked =
+        |id: &[u8; 32]| revoked.binary_search_by(|have| have.device_id.cmp(id)).is_ok();
+    let mut keys: Vec<IdentityKey> = local
+        .identity_keys
+        .iter()
+        .filter(|k| !is_revoked(&k.device_id))
+        .cloned()
+        .collect();
+    if keys.len() != local.identity_keys.len() {
+        changed = true; // a fresh tombstone just retired a local key
+    }
+    for k in &incoming.identity_keys {
+        if is_revoked(&k.device_id) {
+            continue; // never resurrect a revoked key
+        }
+        if !keys.iter().any(|have| have.pubkey == k.pubkey) {
+            keys.push(k.clone());
+            changed = true;
+        }
+    }
+    changed.then_some((keys, revoked))
 }
 
 /// Re-sign `doc` with this device's own subkey and write it out, recording the
@@ -2047,9 +2078,10 @@ pub fn adopt_identity_document(
                             save_device_sig_key_idx(veil_dir, key_idx)?;
                             return Ok(AdoptOutcome::Adopted { key_idx });
                         }
-                        Some(keys) => {
+                        Some((keys, revoked)) => {
                             let mut merged = local;
                             merged.identity_keys = keys;
+                            merged.revoked_devices = revoked;
                             if incoming.valid_until_unix > merged.valid_until_unix {
                                 merged.valid_until_unix = incoming.valid_until_unix;
                             }
@@ -2084,6 +2116,79 @@ pub fn adopt_identity_document(
     Ok(AdoptOutcome::Delegated {
         key_idx: out.new_key_idx,
     })
+}
+
+/// Retire a device's key from the identity document, permanently.
+///
+/// Group-membership revocation already exists and is not enough: the group
+/// stops LISTING the device, but the document keeps VOUCHING for its key —
+/// every row it ever signs verifies until the cert ages out, on every peer.
+/// This is the cryptographic half: the key leaves `identity_keys` and a
+/// MASTER-signed tombstone takes its place, so no stale sibling copy can
+/// ever union it back in (the tombstone is what beats the merge's
+/// never-shrink rule — and it is master-signed because the document's own
+/// signature is a device subkey's, and an unsigned tombstone would let any
+/// sibling permanently revoke any other).
+///
+/// Idempotent: revoking an already-tombstoned device changes nothing and
+/// reports it. Refuses to revoke the LOCAL signing key — a device leaves,
+/// it does not erase itself out from under its own document signature.
+pub fn revoke_identity_device(
+    veil_dir: &Path,
+    master: MasterSecret,
+    device_id: &[u8; 32],
+    now_unix: u64,
+) -> Result<bool, AdoptDocumentError> {
+    use veil_proto::identity_document::RevokedDevice;
+
+    let doc_path = veil_dir.join(IDENTITY_DOCUMENT_FILE);
+    let local_bytes = std::fs::read(&doc_path)?;
+    let mut doc = IdentityDocument::decode(&local_bytes)
+        .map_err(|e| AdoptDocumentError::DocumentDecode(e.to_string()))?;
+
+    let master_sk = match &master {
+        MasterSecret::Seed(seed) => SigningKey::from_bytes(&derive_master_sk_ed25519(seed)),
+        MasterSecret::SigningKey(sk) => SigningKey::from_bytes(sk),
+    };
+    let mine = compute_node_id(master_sk.verifying_key().as_bytes());
+    if mine != doc.node_id {
+        return Err(AdoptDocumentError::DifferentIdentity {
+            incoming: hex_encode(&doc.node_id),
+            mine: hex_encode(&mine),
+        });
+    }
+
+    if doc
+        .revoked_devices
+        .iter()
+        .any(|r| &r.device_id == device_id)
+    {
+        return Ok(false); // already tombstoned — nothing to change
+    }
+
+    let own_seed = load_identity_sk(veil_dir)?;
+    let own_sk = SigningKey::from_bytes(own_seed.as_array());
+    let own_pk = own_sk.verifying_key().as_bytes().to_vec();
+    if compute_node_id(&own_pk) == *device_id {
+        return Err(AdoptDocumentError::Verify(
+            "refusing to revoke this device's own signing key".into(),
+        ));
+    }
+
+    doc.identity_keys.retain(|k| &k.device_id != device_id);
+    let sig = master_sk.sign(&RevokedDevice::signing_message(&doc.node_id, device_id));
+    let tombstone = RevokedDevice {
+        device_id: *device_id,
+        master_sig: sig.to_bytes().to_vec(),
+    };
+    let at = doc
+        .revoked_devices
+        .binary_search_by(|have| have.device_id.cmp(device_id))
+        .unwrap_err();
+    doc.revoked_devices.insert(at, tombstone);
+
+    resign_and_store_document(veil_dir, doc, &own_sk, &own_pk, now_unix)?;
+    Ok(true)
 }
 
 /// Adopt a document that ALREADY NAMES this device, with no master secret.
@@ -2142,9 +2247,10 @@ pub fn adopt_named_identity_document(
                         save_device_sig_key_idx(veil_dir, key_idx)?;
                         Ok(AdoptOutcome::Adopted { key_idx })
                     }
-                    Some(keys) => {
+                    Some((keys, revoked)) => {
                         let mut merged = local;
                         merged.identity_keys = keys;
+                        merged.revoked_devices = revoked;
                         if incoming.valid_until_unix > merged.valid_until_unix {
                             merged.valid_until_unix = incoming.valid_until_unix;
                         }
@@ -3080,6 +3186,123 @@ mod tests {
         assert_eq!(doc.identity_keys.len(), 3, "the new key is unioned in");
         assert!(doc.identity_keys.iter().any(|k| k.pubkey == third_pk));
         SovereignIdentity::load_from_dir(&fresh).expect("still loads after union");
+    }
+
+    // ── revoke_identity_device ─────────────────────────────────
+
+    #[test]
+    fn revoking_a_device_tombstones_it_and_the_union_cannot_resurrect_it() {
+        use crate::sovereign::SovereignIdentity;
+        use ed25519_dalek::SigningKey as EdSk;
+
+        let master = tempdir();
+        let seed = create_identity(test_opts(master.clone())).unwrap().master_seed;
+        let dev_seed: SensitiveBytesN<32> = SensitiveBytesN::from_bytes([0x42u8; 32]);
+        let dev_pk = EdSk::from_bytes(dev_seed.as_array())
+            .verifying_key()
+            .as_bytes()
+            .to_vec();
+        delegate_device(delegate_opts(master.clone(), seed.clone(), dev_pk.clone())).unwrap();
+        let dev_id = veil_crypto::identity::compute_node_id(&dev_pk);
+        // A stale sibling copy from BEFORE the revocation — the union input
+        // that used to make removal impossible.
+        let stale = std::fs::read(master.join(IDENTITY_DOCUMENT_FILE)).unwrap();
+
+        let changed = revoke_identity_device(
+            &master,
+            MasterSecret::Seed(seed.clone()),
+            &dev_id,
+            DELEGATE_NOW,
+        )
+        .expect("revoke");
+        assert!(changed);
+        let doc =
+            IdentityDocument::decode(&std::fs::read(master.join(IDENTITY_DOCUMENT_FILE)).unwrap())
+                .unwrap();
+        assert!(
+            doc.identity_keys.iter().all(|k| k.device_id != dev_id),
+            "the key left the document"
+        );
+        assert_eq!(doc.revoked_devices.len(), 1, "one master-signed tombstone");
+        crate::verify::verify_identity_document(&doc, DELEGATE_NOW)
+            .expect("the amended document verifies, tombstone sig included");
+        SovereignIdentity::load_from_dir(&master).expect("still loads");
+
+        // Idempotent.
+        assert!(!revoke_identity_device(
+            &master,
+            MasterSecret::Seed(seed.clone()),
+            &dev_id,
+            DELEGATE_NOW,
+        )
+        .expect("second revoke"));
+
+        // THE POINT: the stale pre-revocation copy comes back through the
+        // merge and the revoked key must NOT return with it.
+        let out = adopt_identity_document(
+            &master,
+            &stale,
+            MasterSecret::Seed(seed),
+            DELEGATE_NOW,
+            DELEGATE_NOW + 7 * 86_400,
+        )
+        .expect("stale adopt");
+        assert!(matches!(out, AdoptOutcome::Adopted { .. }));
+        let after =
+            IdentityDocument::decode(&std::fs::read(master.join(IDENTITY_DOCUMENT_FILE)).unwrap())
+                .unwrap();
+        assert!(
+            after.identity_keys.iter().all(|k| k.device_id != dev_id),
+            "the tombstone outlives every stale copy"
+        );
+        assert_eq!(after.revoked_devices.len(), 1);
+    }
+
+    #[test]
+    fn a_forged_tombstone_does_not_verify() {
+        use ed25519_dalek::SigningKey as EdSk;
+        // A sibling without the master must not be able to mint a tombstone:
+        // the document re-signs fine (its signature is a subkey's), so the
+        // master check on the tombstone itself is the only thing standing
+        // between "any device" and "permanently revoke any other".
+        let master = tempdir();
+        let seed = create_identity(test_opts(master.clone())).unwrap().master_seed;
+        let dev_seed: SensitiveBytesN<32> = SensitiveBytesN::from_bytes([0x42u8; 32]);
+        let dev_pk = EdSk::from_bytes(dev_seed.as_array())
+            .verifying_key()
+            .as_bytes()
+            .to_vec();
+        delegate_device(delegate_opts(master.clone(), seed, dev_pk.clone())).unwrap();
+        let mut doc =
+            IdentityDocument::decode(&std::fs::read(master.join(IDENTITY_DOCUMENT_FILE)).unwrap())
+                .unwrap();
+        let dev_id = veil_crypto::identity::compute_node_id(&dev_pk);
+        doc.identity_keys.retain(|k| k.device_id != dev_id);
+        doc.revoked_devices = vec![veil_proto::identity_document::RevokedDevice {
+            device_id: dev_id,
+            master_sig: vec![0x66; 64], // not the master's signature
+        }];
+        let err = crate::verify::verify_identity_document(&doc, DELEGATE_NOW).unwrap_err();
+        assert!(
+            matches!(err, crate::verify::VerifyError::RevocationSigInvalid { .. }),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn a_device_cannot_revoke_its_own_signing_key() {
+        let master = tempdir();
+        let seed = create_identity(test_opts(master.clone())).unwrap().master_seed;
+        let own = device_pubkey(&master);
+        let own_id = veil_crypto::identity::compute_node_id(&own);
+        let err = revoke_identity_device(
+            &master,
+            MasterSecret::Seed(seed),
+            &own_id,
+            DELEGATE_NOW,
+        )
+        .unwrap_err();
+        assert!(matches!(err, AdoptDocumentError::Verify(_)), "got {err:?}");
     }
 
     #[test]

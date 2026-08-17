@@ -709,6 +709,7 @@ mod tests {
             valid_until_unix: now + 7 * 24 * 3600,
             sig_key_idx: 0,
             identity_keys: vec![identity_key],
+            revoked_devices: Vec::new(),
             document_sig: Vec::new(),
         };
 
@@ -1029,6 +1030,7 @@ mod tests {
             valid_until_unix: now + 7 * 24 * 3600,
             sig_key_idx: 0,
             identity_keys,
+            revoked_devices: Vec::new(),
             document_sig: Vec::new(),
         };
 

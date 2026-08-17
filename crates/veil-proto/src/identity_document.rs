@@ -45,6 +45,68 @@ pub const IDENTITY_DOCUMENT_MAGIC: [u8; 2] = *b"ID";
 /// Wire-format version.
 pub const IDENTITY_DOCUMENT_V1: u8 = 1;
 
+/// Wire-format version 2: appends master-signed revocation tombstones after
+/// the identity keys. A document with an EMPTY revocation list still encodes
+/// as V1, so the version only changes when a revocation actually exists —
+/// and a build that predates V2 then refuses the whole document, which is
+/// the correct posture for a verifier that cannot see who was revoked.
+pub const IDENTITY_DOCUMENT_V2: u8 = 2;
+
+/// Cap on revocation tombstones per document. Bounded like
+/// [`MAX_IDENTITY_KEYS`], sized for a lifetime of device turnover.
+pub const MAX_REVOKED_DEVICE_IDS: usize = 64;
+
+/// Domain prefix of the master signature inside a [`RevokedDevice`].
+/// The signed message is `REVOKE_CONTEXT || node_id || device_id`.
+pub const REVOKE_CONTEXT: &[u8] = b"veil.identity.revoke.v1";
+
+/// A master-signed tombstone: `device_id` may never again appear among
+/// [`IdentityDocument::identity_keys`].
+///
+/// MASTER-signed, deliberately: the document's own signature is made by a
+/// device subkey, so an unsigned tombstone would let ANY sibling permanently
+/// revoke any other by re-signing a document without it. The tombstone
+/// carries the master's own authority the same way each key's cert does.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RevokedDevice {
+    /// The revoked device's stable address (`BLAKE3(pubkey)`).
+    pub device_id: [u8; 32],
+    /// Master signature over `REVOKE_CONTEXT || node_id || device_id`.
+    pub master_sig: Vec<u8>,
+}
+
+impl RevokedDevice {
+    /// The message the master signs (and every verifier checks).
+    pub fn signing_message(node_id: &[u8; 32], device_id: &[u8; 32]) -> Vec<u8> {
+        let mut m = Vec::with_capacity(REVOKE_CONTEXT.len() + 64);
+        m.extend_from_slice(REVOKE_CONTEXT);
+        m.extend_from_slice(node_id);
+        m.extend_from_slice(device_id);
+        m
+    }
+
+    fn encode_into(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&self.device_id);
+        out.extend_from_slice(&(self.master_sig.len() as u16).to_be_bytes());
+        out.extend_from_slice(&self.master_sig);
+    }
+
+    fn decode(buf: &[u8], pos: &mut usize) -> Result<Self, ProtoError> {
+        let device_id = read_array::<32>(buf, pos, "revoked_device.device_id")?;
+        let sig_len = read_u16(buf, pos, "revoked_device.sig_len")? as usize;
+        if sig_len == 0 || sig_len > MAX_SIG_BYTES {
+            return Err(ProtoError::Malformed(format!(
+                "revoked_device: sig_len out of range ({sig_len})"
+            )));
+        }
+        let master_sig = read_bytes(buf, pos, sig_len, "revoked_device.master_sig")?;
+        Ok(Self {
+            device_id,
+            master_sig,
+        })
+    }
+}
+
 /// Ed25519 algorithm byte.
 pub const ALGO_ED25519: u8 = 0;
 /// Falcon-512 algorithm byte.
@@ -250,6 +312,10 @@ pub struct IdentityDocument {
     pub sig_key_idx: u16,
     /// Active identity subkeys (≤ `MAX_IDENTITY_KEYS`).
     pub identity_keys: Vec<IdentityKey>,
+    /// Master-signed revocation tombstones (wire V2; empty on V1). A
+    /// device_id listed here may never re-enter [`Self::identity_keys`]:
+    /// document merges union this set grow-only and drop any key it names.
+    pub revoked_devices: Vec<RevokedDevice>,
     /// Document signature by the active identity subkey.
     ///
     /// Covers the canonical bytes of every preceding field (everything in
@@ -262,7 +328,13 @@ impl IdentityDocument {
     pub fn encode(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(512);
         out.extend_from_slice(&IDENTITY_DOCUMENT_MAGIC);
-        out.push(IDENTITY_DOCUMENT_V1);
+        // V1 while nothing is revoked: byte-identical to every existing
+        // document, so the format only moves when a revocation exists.
+        out.push(if self.revoked_devices.is_empty() {
+            IDENTITY_DOCUMENT_V1
+        } else {
+            IDENTITY_DOCUMENT_V2
+        });
         out.extend_from_slice(&self.node_id);
         out.push(self.master_algo);
         out.extend_from_slice(&(self.master_pubkey.len() as u16).to_be_bytes());
@@ -273,6 +345,12 @@ impl IdentityDocument {
         out.push(self.identity_keys.len() as u8);
         for k in &self.identity_keys {
             k.encode_into(&mut out);
+        }
+        if !self.revoked_devices.is_empty() {
+            out.push(self.revoked_devices.len() as u8);
+            for r in &self.revoked_devices {
+                r.encode_into(&mut out);
+            }
         }
         out.extend_from_slice(&(self.document_sig.len() as u16).to_be_bytes());
         out.extend_from_slice(&self.document_sig);
@@ -298,7 +376,7 @@ impl IdentityDocument {
         pos += 2;
 
         let version = read_u8(buf, &mut pos, "identity_document.version")?;
-        if version != IDENTITY_DOCUMENT_V1 {
+        if version != IDENTITY_DOCUMENT_V1 && version != IDENTITY_DOCUMENT_V2 {
             return Err(ProtoError::Malformed(format!(
                 "identity_document: unsupported version {version}"
             )));
@@ -355,6 +433,48 @@ impl IdentityDocument {
             )));
         }
 
+        let mut revoked_devices = Vec::new();
+        if version == IDENTITY_DOCUMENT_V2 {
+            let revoked_count = read_u8(buf, &mut pos, "identity_document.revoked_count")?;
+            // An EMPTY list must encode as V1 — accepting a V2 document with
+            // zero tombstones would give one logical document two encodings.
+            if revoked_count == 0 {
+                return Err(ProtoError::Malformed(
+                    "identity_document: v2 with empty revocation list".into(),
+                ));
+            }
+            if revoked_count as usize > MAX_REVOKED_DEVICE_IDS {
+                return Err(ProtoError::Malformed(format!(
+                    "identity_document: revoked_count > {MAX_REVOKED_DEVICE_IDS}"
+                )));
+            }
+            revoked_devices.reserve(revoked_count as usize);
+            let mut prev: Option<[u8; 32]> = None;
+            for _ in 0..revoked_count {
+                let r = RevokedDevice::decode(buf, &mut pos)?;
+                // Strictly ascending device_ids: one canonical encoding per
+                // set, duplicates impossible by construction.
+                if let Some(p) = prev {
+                    if r.device_id <= p {
+                        return Err(ProtoError::Malformed(
+                            "identity_document: revoked_devices not strictly ascending"
+                                .into(),
+                        ));
+                    }
+                }
+                prev = Some(r.device_id);
+                // A key both live and revoked is a contradiction, not a merge
+                // input.
+                if identity_keys.iter().any(|k| k.device_id == r.device_id) {
+                    return Err(ProtoError::Malformed(
+                        "identity_document: revoked device_id still among identity_keys"
+                            .into(),
+                    ));
+                }
+                revoked_devices.push(r);
+            }
+        }
+
         let doc_sig_len = read_u16(buf, &mut pos, "identity_document.doc_sig_len")? as usize;
         if doc_sig_len == 0 || doc_sig_len > MAX_SIG_BYTES {
             return Err(ProtoError::Malformed(format!(
@@ -380,6 +500,7 @@ impl IdentityDocument {
             valid_until_unix,
             sig_key_idx,
             identity_keys,
+            revoked_devices,
             document_sig,
         })
     }
@@ -424,6 +545,15 @@ impl IdentityDocument {
                 .iter()
                 .map(|k| k.encoded_len())
                 .sum::<usize>()
+            + if self.revoked_devices.is_empty() {
+                0
+            } else {
+                1 + self
+                    .revoked_devices
+                    .iter()
+                    .map(|r| 32 + 2 + r.master_sig.len())
+                    .sum::<usize>()
+            }
             + 2
             + self.document_sig.len()
     }
@@ -460,8 +590,73 @@ mod tests {
             valid_until_unix: 1_700_000_000 + MAX_FRESHNESS_WINDOW_SECS,
             sig_key_idx: 0,
             identity_keys: vec![sample_identity_key(0xAA)],
+            revoked_devices: Vec::new(),
             document_sig: vec![0xDE; 64],
         }
+    }
+
+    fn tombstone(byte: u8) -> RevokedDevice {
+        RevokedDevice {
+            device_id: [byte; 32],
+            master_sig: vec![0xC5; 64],
+        }
+    }
+
+    // ── V2: revocation tombstones ─────────────────────────────
+
+    #[test]
+    fn a_document_with_tombstones_roundtrips_as_v2() {
+        let mut doc = sample_document();
+        doc.revoked_devices = vec![tombstone(0x01), tombstone(0x02)];
+        let wire = doc.encode();
+        assert_eq!(wire[2], IDENTITY_DOCUMENT_V2);
+        let decoded = IdentityDocument::decode(&wire).expect("v2 roundtrip");
+        assert_eq!(decoded, doc);
+        assert_eq!(wire.len(), doc.encoded_len());
+    }
+
+    #[test]
+    fn an_empty_revocation_list_still_encodes_v1() {
+        // One logical document, one encoding: the version moves only when a
+        // tombstone exists, so every pre-revocation fleet stays compatible.
+        let doc = sample_document();
+        assert_eq!(doc.encode()[2], IDENTITY_DOCUMENT_V1);
+        let mut wire = doc.encode();
+        // Hand-forge a v2 header with a zero-count list: must be refused.
+        wire[2] = IDENTITY_DOCUMENT_V2;
+        // (v2 parses a count byte where v1 has the sig trailer — whatever it
+        // reads, the document must not decode cleanly.)
+        assert!(IdentityDocument::decode(&wire).is_err());
+    }
+
+    #[test]
+    fn tombstones_must_be_strictly_ascending() {
+        let mut doc = sample_document();
+        doc.revoked_devices = vec![tombstone(0x02), tombstone(0x01)];
+        let wire = doc.encode();
+        let err = IdentityDocument::decode(&wire).unwrap_err();
+        assert!(
+            err.to_string().contains("strictly ascending"),
+            "got: {err}"
+        );
+        // Duplicates fall to the same rule.
+        doc.revoked_devices = vec![tombstone(0x01), tombstone(0x01)];
+        assert!(IdentityDocument::decode(&doc.encode()).is_err());
+    }
+
+    #[test]
+    fn a_key_cannot_be_both_live_and_revoked() {
+        let mut doc = sample_document();
+        let live_id = doc.identity_keys[0].device_id;
+        doc.revoked_devices = vec![RevokedDevice {
+            device_id: live_id,
+            master_sig: vec![0xC5; 64],
+        }];
+        let err = IdentityDocument::decode(&doc.encode()).unwrap_err();
+        assert!(
+            err.to_string().contains("still among identity_keys"),
+            "got: {err}"
+        );
     }
 
     #[test]
