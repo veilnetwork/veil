@@ -16,12 +16,16 @@
 //!
 //! Bounded like the rendezvous registry (`MAX_CIRCUITS` total, per-link cap) so
 //! a peer cannot exhaust relay memory by asking it to allocate circuit state
-//! (the DoS surface 482.7 §5 flags). Reject-on-full (never evict an honest
-//! circuit to admit a new one).
+//! (the DoS surface 482.7 §5 flags). Reject-on-full — but only after an inline
+//! reclaim pass over the affected bucket: a LIVE circuit is never evicted to
+//! admit a new one, while an entry the periodic gc would reap anyway (idle past
+//! the TTL) or a one-shot reply binding that already delivered its reply (see
+//! [`SERVED_LINGER_SECS`]) does not get to starve admissions just because the
+//! maintenance tick hasn't come round yet.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use crate::circuit_data::ReplayWindow;
 use crate::circuit_setup::{CIRCUIT_KEY_LEN, CircuitInstall};
@@ -35,6 +39,29 @@ pub const MAX_CIRCUITS: usize = 10_000;
 pub const MAX_CIRCUITS_PER_LINK: usize = 64;
 /// Default idle TTL: a circuit with no cell in this window is GC'd.
 pub const DEFAULT_CIRCUIT_TTL_SECS: u64 = 300;
+/// Grace after the LAST introduce forwarded down a terminus circuit before its
+/// slot may be reclaimed under install pressure.
+///
+/// The funnel this exists for: on a small topology a terminus has only a
+/// handful of possible prev_links — with 3 relays, every 2-hop circuit funnels
+/// into 6 directed 64-slot buckets. One ephemeral reply circuit is built per
+/// chat send / mailbox FETCH poll, its cookie answers a single reply, and
+/// nothing ever tears it down (no originator sends CircuitTeardown) — so each
+/// one held its bucket slot for the full 300 s idle TTL. 64 slots × 300 s hold
+/// × one circuit per SEND per link = buckets permanently full, and ~98.6% of
+/// live introduces died at `cookie_unknown` because the NEXT registration
+/// could not be installed. A binding that has already forwarded its reply is
+/// the one thing safe to reclaim early.
+///
+/// Why a grace and not immediate teardown: the relay cannot tell a one-shot
+/// reply binding from a long-lived hosted-service registration (the signed
+/// `CircuitRegisterPayload` carries no such marker), and a single logical
+/// reply may ride SEVERAL introduces down the same binding (sliced mailbox
+/// FETCH responses; `auth_deliver` fragments). Each forwarded introduce
+/// re-arms the grace, so a multi-part reply in flight is never cut; a binding
+/// quiet for `SERVED_LINGER_SECS` after its last forward is reclaimable —
+/// and even then only when a bucket is actually under pressure.
+pub const SERVED_LINGER_SECS: u64 = 30;
 
 type Link = [u8; 32];
 
@@ -66,6 +93,14 @@ pub struct CircuitState {
     /// subscription instead of waiting for its TTL. `None` until a registration
     /// binds it (b4a `register`).
     registered_cookie: Mutex<Option<[u8; 16]>>,
+    /// Unix secs of the LAST introduce forwarded DOWN this (terminus) circuit;
+    /// 0 = never served. Set by the dispatcher when
+    /// `try_forward_introduce_via_circuit` sends a reply cell, re-armed on every
+    /// forward so a multi-part reply keeps its binding. A served binding past
+    /// [`SERVED_LINGER_SECS`] is reclaimable under install pressure — the
+    /// escape valve for one-shot reply circuits that otherwise squat their
+    /// bucket slot for the whole idle TTL (see the const's funnel arithmetic).
+    last_served_unix: AtomicU64,
 }
 
 impl Drop for CircuitState {
@@ -95,6 +130,7 @@ impl CircuitState {
             replay_ret: Mutex::new(ReplayWindow::new()),
             next_return_seq: AtomicU32::new(1),
             registered_cookie: Mutex::new(None),
+            last_served_unix: AtomicU64::new(0),
         }
     }
 
@@ -121,6 +157,20 @@ impl CircuitState {
             .registered_cookie
             .lock()
             .unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// Record that an introduce was forwarded DOWN this circuit (the reply
+    /// travelling to the originator). Re-armed on every forward: a sliced
+    /// FETCH response or fragmented reply is several introduces on ONE
+    /// binding, and only the LAST one starts the [`SERVED_LINGER_SECS`]
+    /// clock. `fetch_max` so a stale clock can't rewind the marker.
+    pub fn mark_served(&self, now: u64) {
+        self.last_served_unix.fetch_max(now, Ordering::Relaxed);
+    }
+
+    /// Unix secs of the last forwarded introduce; 0 = never served.
+    pub fn last_served_unix(&self) -> u64 {
+        self.last_served_unix.load(Ordering::Relaxed)
     }
 
     /// Allocate the next return-direction seq for a cell this node originates.
@@ -184,8 +234,37 @@ struct Inner {
     fwd: HashMap<(Link, CircuitId), std::sync::Arc<CircuitState>>,
     /// `(next_link, circuit_id_out)` → state (return lookup); only for non-termini.
     bwd: HashMap<(Link, CircuitId), std::sync::Arc<CircuitState>>,
-    /// Per-prev-link live count for the per-link cap.
-    per_link: HashMap<Link, usize>,
+    /// Per-prev-link bucket membership (`circuit_id_in`s) for the per-link cap.
+    /// Ids, not a bare count, so the install-pressure reclaim can sweep ONE
+    /// bucket in O(bucket) instead of filtering the whole `fwd` map. Bounded by
+    /// `max_per_link` (64), so the linear scans stay trivial.
+    per_link: HashMap<Link, Vec<CircuitId>>,
+}
+
+impl Inner {
+    /// Occupancy of one prev_link's bucket.
+    fn bucket_len(&self, prev_link: &Link) -> usize {
+        self.per_link.get(prev_link).map_or(0, Vec::len)
+    }
+
+    /// Unlink one circuit from ALL indices. The single removal path — explicit
+    /// teardown, periodic gc and install-pressure reclaim all go through it so
+    /// the three indices can never drift apart.
+    fn detach(&mut self, prev_link: &Link, cid_in: CircuitId) -> Option<std::sync::Arc<CircuitState>> {
+        let state = self.fwd.remove(&(*prev_link, cid_in))?;
+        if let Some(nl) = state.next_link {
+            self.bwd.remove(&(nl, state.circuit_id_out));
+        }
+        if let Some(ids) = self.per_link.get_mut(prev_link) {
+            if let Some(pos) = ids.iter().position(|c| *c == cid_in) {
+                ids.swap_remove(pos);
+            }
+            if ids.is_empty() {
+                self.per_link.remove(prev_link);
+            }
+        }
+        Some(state)
+    }
 }
 
 impl CircuitTable {
@@ -221,11 +300,26 @@ impl CircuitTable {
         if g.fwd.contains_key(&fwd_key) {
             return Err(InstallError::Duplicate);
         }
+        // Inline reclaim on a would-be refusal (small-topology starvation fix):
+        // the periodic gc lives on the runtime maintenance tick, so between
+        // ticks a full bucket refused EVERY registration even when most of its
+        // occupants were idle-expired or already-served reply bindings. On a
+        // 3-relay network — 6 directed 64-slot buckets, one 300 s-held circuit
+        // per SEND — that meant buckets sat permanently full and admissions
+        // only happened in the brief post-tick windows (~98.6% of live
+        // introduces starved). Reclaim what the gc would reap anyway, then
+        // re-check; a bucket full of genuinely live circuits still refuses.
         if g.fwd.len() >= self.max_total {
-            return Err(InstallError::TableFull);
+            self.reclaim_table(&mut g, now);
+            if g.fwd.len() >= self.max_total {
+                return Err(InstallError::TableFull);
+            }
         }
-        if g.per_link.get(&prev_link).copied().unwrap_or(0) >= self.max_per_link {
-            return Err(InstallError::PerLinkFull);
+        if g.bucket_len(&prev_link) >= self.max_per_link {
+            self.reclaim_bucket(&mut g, &prev_link, now);
+            if g.bucket_len(&prev_link) >= self.max_per_link {
+                return Err(InstallError::PerLinkFull);
+            }
         }
         // Backward-index dedup (diff-audit S1/M1): `bwd` is the ONLY index used to
         // route RETURN cells. `circuit_id_out` is an originator-chosen u32, so two
@@ -248,8 +342,97 @@ impl CircuitTable {
             g.bwd
                 .insert((nl, install.circuit_id_out), std::sync::Arc::clone(&state));
         }
-        *g.per_link.entry(prev_link).or_insert(0) += 1;
+        g.per_link
+            .entry(prev_link)
+            .or_default()
+            .push(install.circuit_id_in);
         Ok(state)
+    }
+
+    /// Install-pressure reclaim for ONE bucket, O(bucket) and allocation-light
+    /// (a single ≤bucket-sized id Vec). Two passes, second only if the first
+    /// left the bucket full:
+    ///
+    /// 1. idle past the TTL — exactly the periodic gc's criterion, run inline
+    ///    because the dispatcher never calls `gc` between maintenance ticks;
+    /// 2. served reply bindings quiet for [`SERVED_LINGER_SECS`] — a terminus
+    ///    circuit whose registration already answered (introduce forwarded
+    ///    down it, nothing since). Its table slot is the scarce resource; the
+    ///    cookie subscription is NOT touched — the rendezvous registry holds
+    ///    its own `Arc` to this state and return-forwarding never consults the
+    ///    table, so a late slice of a multi-part reply (or a hosted service we
+    ///    can't distinguish on the wire) keeps flowing after the slot frees.
+    fn reclaim_bucket(&self, g: &mut Inner, prev_link: &Link, now: u64) {
+        let ttl = self.ttl_secs;
+        let Some(ids) = g.per_link.get(prev_link) else {
+            return;
+        };
+        let idle: Vec<CircuitId> = ids
+            .iter()
+            .filter(|cid| {
+                g.fwd.get(&(*prev_link, **cid)).is_some_and(|s| {
+                    let last = *s.last_seen_unix.lock().unwrap_or_else(|p| p.into_inner());
+                    now.saturating_sub(last) >= ttl
+                })
+            })
+            .copied()
+            .collect();
+        for cid in idle {
+            g.detach(prev_link, cid);
+        }
+        if g.bucket_len(prev_link) < self.max_per_link {
+            return;
+        }
+        let Some(ids) = g.per_link.get(prev_link) else {
+            return;
+        };
+        let served: Vec<CircuitId> = ids
+            .iter()
+            .filter(|cid| {
+                g.fwd.get(&(*prev_link, **cid)).is_some_and(|s| {
+                    let served = s.last_served_unix();
+                    served != 0 && now.saturating_sub(served) >= SERVED_LINGER_SECS
+                })
+            })
+            .copied()
+            .collect();
+        for cid in served {
+            g.detach(prev_link, cid);
+        }
+    }
+
+    /// Whole-table analogue of [`Self::reclaim_bucket`] for a `TableFull`
+    /// verdict: pass 1 is the periodic gc inline; pass 2 (only if still full)
+    /// frees served-and-quiet reply bindings across all buckets.
+    fn reclaim_table(&self, g: &mut Inner, now: u64) {
+        let ttl = self.ttl_secs;
+        let idle: Vec<(Link, CircuitId)> = g
+            .fwd
+            .iter()
+            .filter(|(_, s)| {
+                let last = *s.last_seen_unix.lock().unwrap_or_else(|p| p.into_inner());
+                now.saturating_sub(last) >= ttl
+            })
+            .map(|(k, _)| *k)
+            .collect();
+        for (link, cid) in idle {
+            g.detach(&link, cid);
+        }
+        if g.fwd.len() < self.max_total {
+            return;
+        }
+        let served: Vec<(Link, CircuitId)> = g
+            .fwd
+            .iter()
+            .filter(|(_, s)| {
+                let served = s.last_served_unix();
+                served != 0 && now.saturating_sub(served) >= SERVED_LINGER_SECS
+            })
+            .map(|(k, _)| *k)
+            .collect();
+        for (link, cid) in served {
+            g.detach(&link, cid);
+        }
     }
 
     /// Look up by the FORWARD key (cell arriving from `prev_link`).
@@ -275,17 +458,7 @@ impl CircuitTable {
     /// Remove a circuit (teardown). Idempotent.
     pub fn remove(&self, prev_link: &Link, cid_in: CircuitId) {
         let mut g = self.inner.lock().unwrap_or_else(|p| p.into_inner());
-        if let Some(state) = g.fwd.remove(&(*prev_link, cid_in)) {
-            if let Some(nl) = state.next_link {
-                g.bwd.remove(&(nl, state.circuit_id_out));
-            }
-            if let Some(c) = g.per_link.get_mut(prev_link) {
-                *c = c.saturating_sub(1);
-                if *c == 0 {
-                    g.per_link.remove(prev_link);
-                }
-            }
-        }
+        g.detach(prev_link, cid_in);
     }
 
     /// Evict circuits idle past the TTL. Returns the number removed.
@@ -302,19 +475,17 @@ impl CircuitTable {
             .map(|(k, _)| *k)
             .collect();
         for (prev_link, cid_in) in &stale {
-            if let Some(state) = g.fwd.remove(&(*prev_link, *cid_in)) {
-                if let Some(nl) = state.next_link {
-                    g.bwd.remove(&(nl, state.circuit_id_out));
-                }
-                if let Some(c) = g.per_link.get_mut(prev_link) {
-                    *c = c.saturating_sub(1);
-                    if *c == 0 {
-                        g.per_link.remove(prev_link);
-                    }
-                }
-            }
+            g.detach(prev_link, *cid_in);
         }
         stale.len()
+    }
+
+    /// Occupancy of one prev_link's bucket (for the dispatcher's refusal log).
+    pub fn link_occupancy(&self, prev_link: &Link) -> usize {
+        self.inner
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .bucket_len(prev_link)
     }
 
     pub fn len(&self) -> usize {
@@ -471,6 +642,103 @@ mod tests {
         // Per-link freed → can install again up to cap.
         t.install(&inst(10, 11, 1), prev, Some(next), 0).unwrap();
         assert_eq!(t.len(), 1);
+    }
+
+    #[test]
+    fn full_bucket_with_idle_expired_admits_after_inline_gc() {
+        // The small-topology starvation regression: a bucket full of
+        // idle-expired one-shot circuits must not refuse a new registration
+        // just because the periodic gc tick hasn't run — install itself
+        // reclaims what the gc would reap and retries.
+        let t = CircuitTable::with_params(100, 2, 300);
+        let prev = [1u8; 32];
+        t.install(&inst(1, 0, 1), prev, None, 1000).unwrap();
+        t.install(&inst(2, 0, 1), prev, None, 1000).unwrap();
+        // Both occupants idle past the TTL → the new install evicts + lands.
+        let s = t.install(&inst(3, 0, 1), prev, None, 1000 + 300).unwrap();
+        assert_eq!(s.circuit_id_in, 3);
+        assert!(t.lookup_forward(&prev, 1).is_none(), "expired occupant evicted");
+        assert!(t.lookup_forward(&prev, 2).is_none(), "expired occupant evicted");
+        assert_eq!(t.len(), 1);
+    }
+
+    #[test]
+    fn full_bucket_all_fresh_still_refuses() {
+        // Reject-on-full is intact for LIVE circuits: nothing idle-expired,
+        // nothing served → the inline reclaim finds no victim and the verdict
+        // stays PerLinkFull.
+        let t = CircuitTable::with_params(100, 2, 300);
+        let prev = [1u8; 32];
+        t.install(&inst(1, 0, 1), prev, None, 1000).unwrap();
+        t.install(&inst(2, 0, 1), prev, None, 1000).unwrap();
+        assert!(matches!(
+            t.install(&inst(3, 0, 1), prev, None, 1000 + 299),
+            Err(InstallError::PerLinkFull)
+        ));
+        assert_eq!(t.len(), 2, "no live occupant was evicted");
+    }
+
+    #[test]
+    fn table_full_with_idle_expired_admits_after_inline_gc() {
+        // Same relief for the GLOBAL cap: expired entries anywhere in the
+        // table are reclaimed before a TableFull refusal.
+        let t = CircuitTable::with_params(2, 64, 300);
+        t.install(&inst(1, 0, 1), [1u8; 32], None, 0).unwrap();
+        t.install(&inst(2, 0, 1), [2u8; 32], None, 0).unwrap();
+        // Fresh entries at t=299 → still refused.
+        assert!(matches!(
+            t.install(&inst(3, 0, 1), [3u8; 32], None, 299),
+            Err(InstallError::TableFull)
+        ));
+        // Expired at t=300 → reclaimed, install lands.
+        t.install(&inst(3, 0, 1), [3u8; 32], None, 300).unwrap();
+        assert_eq!(t.len(), 1);
+    }
+
+    #[test]
+    fn served_reply_binding_freed_under_install_pressure() {
+        // A one-shot reply binding that already forwarded its introduce frees
+        // its bucket slot under pressure once SERVED_LINGER_SECS have passed —
+        // while an unserved, fresh sibling is never touched.
+        let t = CircuitTable::with_params(100, 2, 300);
+        let prev = [1u8; 32];
+        let served = t.install(&inst(1, 0, 1), prev, None, 1000).unwrap();
+        t.install(&inst(2, 0, 1), prev, None, 1000).unwrap();
+        served.mark_served(1005);
+        // Linger not yet elapsed (and nothing idle-expired) → still refused.
+        assert!(matches!(
+            t.install(&inst(3, 0, 1), prev, None, 1005 + SERVED_LINGER_SECS - 1),
+            Err(InstallError::PerLinkFull)
+        ));
+        // Linger elapsed → the SERVED circuit is evicted, the fresh unserved
+        // one survives, and the install lands.
+        t.install(&inst(3, 0, 1), prev, None, 1005 + SERVED_LINGER_SECS)
+            .unwrap();
+        assert!(t.lookup_forward(&prev, 1).is_none(), "served slot reclaimed");
+        assert!(
+            t.lookup_forward(&prev, 2).is_some(),
+            "unserved live circuit must never be pressure-evicted"
+        );
+        assert!(t.lookup_forward(&prev, 3).is_some());
+    }
+
+    #[test]
+    fn remark_served_rearms_linger_for_multi_slice_replies() {
+        // A sliced reply is several introduces down ONE binding; every forward
+        // re-arms the linger clock, so only quiet-since-the-LAST-slice bindings
+        // are reclaimable — an in-flight multi-part reply is never cut.
+        let t = CircuitTable::with_params(100, 1, 300);
+        let prev = [1u8; 32];
+        let s = t.install(&inst(1, 0, 1), prev, None, 1000).unwrap();
+        s.mark_served(1000); // slice 1
+        s.mark_served(1020); // slice 2 re-arms the clock
+        assert!(matches!(
+            t.install(&inst(2, 0, 1), prev, None, 1020 + SERVED_LINGER_SECS - 1),
+            Err(InstallError::PerLinkFull)
+        ));
+        t.install(&inst(2, 0, 1), prev, None, 1020 + SERVED_LINGER_SECS)
+            .unwrap();
+        assert!(t.lookup_forward(&prev, 2).is_some());
     }
 
     #[test]

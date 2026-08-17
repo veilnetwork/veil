@@ -940,10 +940,28 @@ impl FrameDispatcher {
                 next_hop,
                 inner,
             } => {
-                if table
-                    .install(&install, prev_link, Some(next_hop), now)
-                    .is_err()
-                {
+                if let Err(e) = table.install(&install, prev_link, Some(next_hop), now) {
+                    // OBSERVABILITY (log-only): a refused install was FULLY
+                    // silent — the setup is dropped, the originator sees only a
+                    // missing CircuitBuilt ACK, and the sender goes on to hand
+                    // out a cookie this relay never bound (surfacing later as
+                    // introduce.cookie_unknown at the terminus). On a small
+                    // topology the per-link buckets (64 slots × 300 s idle
+                    // hold, one circuit per SEND over 2 links) sat permanently
+                    // full, so this refusal was the COMMON case, not the edge —
+                    // it must leave exactly one line. Wire behaviour unchanged
+                    // (anti-leak: still no Violation response).
+                    self.logger.info(
+                        "anonymity.circuit.install_refused",
+                        format!(
+                            "circuit install refused ({e:?}) at middle hop: \
+                             prev={} bucket={}/{} table={}; setup dropped",
+                            veil_util::hex_short(&prev_link),
+                            table.link_occupancy(&prev_link),
+                            veil_anonymity::circuit_table::MAX_CIRCUITS_PER_LINK,
+                            table.len(),
+                        ),
+                    );
                     return DispatchResult::NoResponse; // cap/duplicate — drop
                 }
                 self.send_relay_chain_msg(
@@ -955,7 +973,28 @@ impl FrameDispatcher {
             veil_anonymity::circuit_setup::SetupPeelResult::Terminus { install, payload } => {
                 let circuit = match table.install(&install, prev_link, None, now) {
                     Ok(c) => c,
-                    Err(_) => return DispatchResult::NoResponse,
+                    Err(e) => {
+                        // OBSERVABILITY (log-only): the terminus twin of the
+                        // middle-hop line above — THE refusal that killed
+                        // rendezvous registrations on small topologies. The
+                        // piggy-backed cookie registration is never processed,
+                        // so the sender's peer introduces at a cookie this
+                        // relay never bound → cookie_unknown. One line per
+                        // refusal; wire stays silent (anti-leak).
+                        self.logger.info(
+                            "anonymity.circuit.install_refused",
+                            format!(
+                                "circuit install refused ({e:?}) at terminus: \
+                                 prev={} bucket={}/{} table={}; registration \
+                                 payload dropped unprocessed",
+                                veil_util::hex_short(&prev_link),
+                                table.link_occupancy(&prev_link),
+                                veil_anonymity::circuit_table::MAX_CIRCUITS_PER_LINK,
+                                table.len(),
+                            ),
+                        );
+                        return DispatchResult::NoResponse;
+                    }
                 };
                 let circuit_id_in = circuit.circuit_id_in;
 
@@ -1612,6 +1651,24 @@ impl FrameDispatcher {
                 // as before); on sent=false the introduce IS dropped and
                 // send.peer_unreachable (just logged) names the session error.
                 if sent {
+                    // The cell just sent down this circuit IS the reply
+                    // travelling to the reply-circuit originator — for a
+                    // one-shot reply binding (one built per chat send /
+                    // mailbox FETCH poll) the relay's job is now done, yet
+                    // nothing ever tears it down: it would squat its 64-slot
+                    // per-link bucket for the full 300 s idle TTL, which on a
+                    // 2-link topology is exactly what starved new
+                    // registrations. Mark it SERVED so the table can reclaim
+                    // the slot under install pressure after a linger grace —
+                    // not an immediate teardown, because (a) a sliced FETCH
+                    // response / fragmented reply is several introduces down
+                    // ONE binding (each forward re-arms the grace), and (b) a
+                    // long-lived hosted-service registration is
+                    // indistinguishable on the wire; even if one IS reclaimed
+                    // under pressure, the rendezvous registry keeps its own
+                    // Arc to this state and return-forwarding never consults
+                    // the table, so its introduces keep flowing.
+                    circuit.mark_served(circuit_now_unix());
                     self.logger.debug(
                         "anonymity.relay_chain.introduce.circuit_forwarded",
                         format!(
@@ -2762,6 +2819,145 @@ mod tests {
             got, post_cookie,
             "splice forwarded EXACTLY the post-cookie bytes"
         );
+    }
+
+    /// Admission-funnel relief, dispatcher end: an introduce forwarded down a
+    /// circuit-registered reply binding marks that binding SERVED (the wiring
+    /// the table's install-pressure reclaim keys on); a SECOND slice still
+    /// forwards (served ≠ torn down — sliced replies ride one binding); once
+    /// the linger grace elapses the served slot yields to a new install under
+    /// bucket pressure; and the cookie STILL resolves + forwards afterwards —
+    /// the rendezvous registry holds its own Arc, so reclaiming the table slot
+    /// never cuts a late slice.
+    #[test]
+    fn forwarded_introduce_marks_binding_served_and_slot_yields_under_pressure() {
+        use base64::Engine;
+        use base64::engine::general_purpose::STANDARD;
+        use veil_anonymity::circuit_register::{CircuitRegisterPayload, CircuitRendezvousRegistry};
+        use veil_anonymity::circuit_setup::{CircuitInstall, CircuitSetupHop, build_circuit_setup};
+        use veil_anonymity::circuit_table::{CircuitTable, SERVED_LINGER_SECS};
+        use veil_crypto::{generate_keypair, sign_message};
+        use veil_session::tx_registry::SessionTxRegistry;
+        use veil_types::SignatureAlgorithm;
+
+        let mut d = crate::make_test_dispatcher(veil_cfg::NodeRole::Core);
+        let sk = StaticSecret::random_from_rng(OsRng);
+        let pk = PublicKey::from(&sk).to_bytes();
+        d.anonymity_x25519_sk = Some(std::sync::Arc::new(sk));
+        // Bucket cap 1: the reply binding owns the whole bucket, so the later
+        // install only lands if the served slot is actually reclaimed.
+        let table = std::sync::Arc::new(CircuitTable::with_params(10_000, 1, 300));
+        d.circuit_table = Some(std::sync::Arc::clone(&table));
+        d.circuit_rendezvous = Some(std::sync::Arc::new(CircuitRendezvousRegistry::new()));
+
+        let recv_hop = [0xEE; 32];
+        let mut reg_tx = SessionTxRegistry::new();
+        let mut recv_rx = reg_tx.register(NodeId::from(recv_hop));
+        d.session_tx_registry = Some(std::sync::Arc::new(std::sync::RwLock::new(reg_tx)));
+
+        // Reply binding at R: terminus build carrying a signed registration.
+        let recv_cid = 77u32;
+        let kp = generate_keypair(SignatureAlgorithm::Ed25519);
+        let reg_pk: [u8; 32] = STANDARD.decode(&kp.public_key).unwrap().try_into().unwrap();
+        let cookie = veil_anonymity::circuit_register::cookie_for_reg_pk(&reg_pk);
+        let epoch = 1u64;
+        let msg = CircuitRegisterPayload::signing_bytes(&cookie, &reg_pk, epoch);
+        let sig = sign_message(
+            SignatureAlgorithm::Ed25519,
+            &kp.public_key,
+            &kp.private_key,
+            &msg,
+        )
+        .unwrap();
+        let regp = CircuitRegisterPayload {
+            cookie,
+            reg_pk,
+            epoch,
+            signature: sig,
+        };
+        let rhop = CircuitSetupHop {
+            node_id: [0u8; 32],
+            pubkey: pk,
+            circuit_id_in: recv_cid,
+            circuit_id_out: 0,
+            circuit_key: [3u8; 32],
+        };
+        let renv = build_circuit_setup(&[rhop], &regp.encode()).unwrap();
+        let mut rhdr = FrameHeader::new(
+            FrameFamily::RelayChain as u8,
+            RelayChainMsg::CircuitBuild as u16,
+        );
+        rhdr.body_len = renv.len() as u32;
+        d.dispatch_relay_chain(&rhdr, &renv, NodeId::from(recv_hop));
+        let _ = recv_rx.try_recv(); // drain the CircuitBuilt ACK
+
+        let state = table
+            .lookup_forward(&recv_hop, recv_cid)
+            .expect("binding installed");
+        assert_eq!(state.last_served_unix(), 0, "not served before any forward");
+
+        // Slice 1: a forwarded introduce marks the binding served.
+        let intro1 = IntroducePayload {
+            receiver_node_id: [0xAB; 32],
+            auth_cookie: cookie,
+            ciphertext: b"reply-slice-1".to_vec(),
+        };
+        assert!(matches!(
+            d.try_forward_introduce_via_circuit(&intro1),
+            CircuitIntroduceForward::Forwarded
+        ));
+        let served1 = state.last_served_unix();
+        assert!(served1 > 0, "forwarded introduce must mark the binding served");
+        recv_rx.try_recv().expect("slice 1 sent down the circuit");
+
+        // Slice 2 (distinct bytes dodge the replay fingerprint): the binding is
+        // NOT torn down by being served — multi-slice replies keep flowing —
+        // and the forward re-arms the served clock.
+        let intro2 = IntroducePayload {
+            ciphertext: b"reply-slice-2".to_vec(),
+            ..intro1.clone()
+        };
+        assert!(matches!(
+            d.try_forward_introduce_via_circuit(&intro2),
+            CircuitIntroduceForward::Forwarded
+        ));
+        recv_rx.try_recv().expect("slice 2 sent down the circuit");
+        assert!(state.last_served_unix() >= served1, "forward re-arms the clock");
+
+        // Under bucket pressure after the linger grace, the served slot yields
+        // (time injected at the table API — the dispatcher install path passes
+        // wall-clock `now` the same way).
+        let pressure = CircuitInstall {
+            circuit_id_in: recv_cid + 1,
+            circuit_id_out: 0,
+            circuit_key: [9u8; 32],
+        };
+        table
+            .install(
+                &pressure,
+                recv_hop,
+                None,
+                state.last_served_unix() + SERVED_LINGER_SECS,
+            )
+            .expect("served slot must yield to a new install under pressure");
+        assert!(
+            table.lookup_forward(&recv_hop, recv_cid).is_none(),
+            "served binding's table slot reclaimed"
+        );
+
+        // The registry kept its own Arc: a LATE slice still resolves the cookie
+        // and still forwards down the reply path after the slot was reclaimed.
+        let intro3 = IntroducePayload {
+            ciphertext: b"reply-slice-3-late".to_vec(),
+            ..intro1
+        };
+        assert!(matches!(
+            d.try_forward_introduce_via_circuit(&intro3),
+            CircuitIntroduceForward::Forwarded
+        ));
+        recv_rx
+            .try_recv()
+            .expect("late slice still rides the reply path after slot reclaim");
     }
 
     /// diff-audit Δ2-d: a `CircuitBuilt` ACK arriving from the first hop, tagged
