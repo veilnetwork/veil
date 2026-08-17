@@ -141,6 +141,50 @@ pub trait MlKemEkResolver: Send + Sync {
         None
     }
 
+    /// The certificate of ONE NAMED DEVICE of the recipient, local records
+    /// only. See [`resolve_cert_for_instance`](Self::resolve_cert_for_instance).
+    /// Implementations without a local cache keep the conservative miss.
+    fn resolve_cert_for_instance_cached(
+        &self,
+        _target_node_id: [u8; 32],
+        _instance_id: [u8; 16],
+    ) -> Option<VerifiedPeerCert> {
+        None
+    }
+
+    /// Reactively fetch + verify the certificate of one named device of the
+    /// recipient — `(node_id, instance_id)`, not just `node_id`.
+    ///
+    /// [`resolve_cert`](Self::resolve_cert) answers "the identity's
+    /// certificate", and for a multi-device identity that question has no one
+    /// answer: the resolver picks a registry row by a freshness field every
+    /// device publishes as zero, so the pick is whichever row the iterator
+    /// happened to end on. A caller that already KNOWS which device it is
+    /// talking to — a live session's verified identity proof names the far
+    /// instance — must ask for that device by name, or it seals to one device
+    /// and delivers to another and neither end can tell.
+    ///
+    /// Returns `None` when that device's certificate cannot be resolved or
+    /// verified; callers fall back to the singular resolve, which is exact for
+    /// the single-instance peers that are the overwhelming common case.
+    fn resolve_cert_for_instance(
+        &self,
+        target_node_id: [u8; 32],
+        instance_id: [u8; 16],
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<VerifiedPeerCert>> + Send + '_>>
+    {
+        // Derived default so existing implementations (test fakes, minimal
+        // setups) keep compiling: the singular answer, kept only when it
+        // already names the requested device. A mismatch is a miss, never a
+        // silent substitution — substituting is the exact defect the targeted
+        // surface exists to fix.
+        Box::pin(async move {
+            self.resolve_cert(target_node_id)
+                .await
+                .filter(|c| c.instance_id == instance_id)
+        })
+    }
+
     /// Reactively fetch + verify the recipient's **whole** certificate.
     ///
     /// This, not [`resolve_ek`](Self::resolve_ek), is the primitive: the two
@@ -185,6 +229,23 @@ pub struct VerifiedPeerCert {
     pub ratchet_x25519_pk: [u8; 32],
     /// Monotonic rotation counter, for choosing between replicas.
     pub cert_version: u64,
+}
+
+/// Names the device at the far end of the live direct session to a peer
+/// identity, when there is one and its handshake proved which device it is.
+///
+/// A session is keyed by the peer's IDENTITY address — every device of that
+/// identity answers to the same 32 bytes — so "a session to `node_id`" always
+/// terminates at exactly one device: whichever one rendezvous happened to
+/// resolve. The handshake's identity proof carries that device's id, and this
+/// trait is how a send path that must key material to a device (the ratchet
+/// seal) asks for it without importing the session registry concretely.
+///
+/// `None` means "no live session" or "the session's handshake proved no
+/// sovereign identity" (a legacy peer) — callers keep their singular,
+/// identity-addressed behaviour for both.
+pub trait SessionInstanceLookup: Send + Sync {
+    fn session_instance(&self, peer_node_id: &[u8; 32]) -> Option<[u8; 16]>;
 }
 
 /// Reactively resolve a node's relay X25519 KEM public key by `node_id` over

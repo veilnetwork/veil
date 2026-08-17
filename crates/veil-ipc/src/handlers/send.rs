@@ -343,6 +343,10 @@ pub(crate) struct IpcSendContext {
     /// configuration) and in fixtures without a full runtime; both keep the
     /// pre-existing ML-KEM behaviour exactly.
     pub(crate) ratchet: Option<veil_e2e::RatchetRuntime>,
+    /// Which DEVICE is at the far end of the live session to a peer identity
+    /// (defect №35). `None` (tests / minimal setups) keeps the singular,
+    /// identity-addressed cert resolve exactly.
+    pub(crate) session_instance_lookup: Option<Arc<dyn veil_types::SessionInstanceLookup>>,
 }
 
 /// Seal `data` through the ratchet, if everything it needs is in hand.
@@ -369,12 +373,49 @@ async fn try_ratchet_seal(
     ratchet.identity()?;
     let resolver = ctx.mlkem_ek_resolver.as_deref()?;
 
+    // Which device of the recipient's family? Before defect №35 two answers
+    // to that question were given independently: the cert below by the
+    // resolver's `max_by_key(last_seen_unix_ms)` over registry rows that all
+    // publish 0 — i.e. by whichever row the iterator happened to end on,
+    // cached for 30 minutes — and the transport by the one live session to
+    // the identity, terminating at whichever device rendezvous happened to
+    // resolve. In a five-device family they disagree 4/5 of the time; the
+    // receiving device refuses the frame (`NotForThisDevice`), the sender is
+    // never told, and it re-sends its prologue every ~9 s forever. The
+    // session's validated identity proof names the device it actually ends
+    // at, so when the send is session-backed that instance — not the cache's
+    // tie accident — is the authoritative pairing.
+    let session_instance = ctx
+        .session_instance_lookup
+        .as_deref()
+        .and_then(|lookup| lookup.session_instance(dst_node_id));
+    let paired = match session_instance {
+        Some(instance) => match resolver.resolve_cert_for_instance_cached(*dst_node_id, instance) {
+            Some(c) => Some(c),
+            None => resolver.resolve_cert_for_instance(*dst_node_id, instance).await,
+        },
+        // No live session, or a legacy handshake that proved no instance:
+        // nothing named a device, so the singular resolve below stays the
+        // answer — which is today's behaviour, and exact for the
+        // single-instance peer.
+        None => None,
+    };
+
     // Local records first. The full walk is three DHT rounds and this is the
     // ordinary send path; the 30-minute verified-cert cache above it means a
     // peer costs that walk once, not once per message.
-    let cert = match resolver.resolve_cert_cached(*dst_node_id) {
+    //
+    // Also the fallback when the SESSION named a device but its cert did not
+    // resolve — fail-open to the singular row rather than refusing to seal:
+    // a wrong-device seal now earns an `AppSendUnopenable` reply that drops
+    // the cached row and re-keys, where an unsealed message would silently
+    // lose its sender proof.
+    let cert = match paired {
         Some(c) => c,
-        None => resolver.resolve_cert(*dst_node_id).await?,
+        None => match resolver.resolve_cert_cached(*dst_node_id) {
+            Some(c) => c,
+            None => resolver.resolve_cert(*dst_node_id).await?,
+        },
     };
 
     match ratchet.seal_for(
@@ -1526,15 +1567,60 @@ mod ratchet_send_tests {
         }
     }
 
+    /// What the session layer would answer to "which device does the live
+    /// session to PEER terminate at?". `None` = no session / legacy handshake.
+    struct PinnedInstance(Option<[u8; 16]>);
+
+    impl veil_types::SessionInstanceLookup for PinnedInstance {
+        fn session_instance(&self, peer: &[u8; 32]) -> Option<[u8; 16]> {
+            (*peer == PEER).then_some(self.0).flatten()
+        }
+    }
+
+    /// A resolver holding one verified row per device of a peer — the steady
+    /// state for a multi-device family after the fan-out paths have walked it.
+    struct FamilyCerts(Vec<veil_types::VerifiedPeerCert>);
+
+    impl veil_types::MlKemEkResolver for FamilyCerts {
+        fn resolve_cert_cached(&self, target: [u8; 32]) -> Option<veil_types::VerifiedPeerCert> {
+            // The singular question has no honest answer for a family; the
+            // production resolver's zero-valued freshness tie hands back an
+            // arbitrary row. Modeled here as "the last one", which is what an
+            // all-zero `max_by_key` over an iterator returns.
+            self.0.iter().filter(|c| c.node_id == target).last().cloned()
+        }
+        fn resolve_cert(
+            &self,
+            target: [u8; 32],
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Option<veil_types::VerifiedPeerCert>> + Send + '_>,
+        > {
+            let out = self.resolve_cert_cached(target);
+            Box::pin(async move { out })
+        }
+        fn resolve_cert_for_instance_cached(
+            &self,
+            target: [u8; 32],
+            instance: [u8; 16],
+        ) -> Option<veil_types::VerifiedPeerCert> {
+            self.0
+                .iter()
+                .find(|c| c.node_id == target && c.instance_id == instance)
+                .cloned()
+        }
+    }
+
     struct Fixture {
         outbox: Arc<Outbox>,
         route_cache: Arc<RwLock<veil_routing::RouteCache>>,
         peer_mlkem: Arc<std::sync::RwLock<veil_e2e::PeerMlKemCache>>,
-        certs: Arc<Certs>,
+        certs: Arc<dyn veil_types::MlKemEkResolver>,
         registry: Arc<veil_app::registry::AppEndpointRegistry>,
         me: veil_e2e::RatchetRuntime,
         /// The peer's side, for opening what we sealed.
         peer: veil_e2e::RatchetRuntime,
+        /// What [`PinnedInstance`] answers for PEER in [`Fixture::ctx`].
+        session_instance: Option<[u8; 16]>,
     }
 
     fn ratchet_runtime(
@@ -1595,7 +1681,45 @@ mod ratchet_send_tests {
             registry: Arc::new(veil_app::registry::AppEndpointRegistry::new()),
             me: ratchet_runtime(ME, MY_INSTANCE, my_ring),
             peer: peer_rt,
+            session_instance: None,
         }
+    }
+
+    /// PEER as a two-device family: the live session ends at PEER_INSTANCE,
+    /// while the resolver's singular answer is the OTHER device — the №35
+    /// mismatch, on purpose. Returns the fixture and the sibling's runtime so
+    /// tests can prove where a frame is (and is not) openable.
+    fn family_fixture() -> (Fixture, veil_e2e::RatchetRuntime) {
+        const SIBLING_INSTANCE: [u8; 16] = [0xB2u8; 16];
+        let mut fx = fixture(vec![PEER, RELAY]);
+        let sibling_ring = ring(0xC5);
+        let peer_ring = std::sync::Arc::clone(&fx.peer.seed_ring.read().expect("ring"));
+        let session_row = veil_types::VerifiedPeerCert {
+            node_id: PEER,
+            instance_id: PEER_INSTANCE,
+            mlkem_ek: peer_ring.current_ek().to_vec(),
+            ratchet_x25519_pk: peer_ring.current_ratchet_pk(),
+            cert_version: 1,
+        };
+        let sibling_row = veil_types::VerifiedPeerCert {
+            node_id: PEER,
+            instance_id: SIBLING_INSTANCE,
+            mlkem_ek: sibling_ring.current_ek().to_vec(),
+            ratchet_x25519_pk: sibling_ring.current_ratchet_pk(),
+            cert_version: 1,
+        };
+        let my_ratchet_pk = fx
+            .me
+            .seed_ring
+            .read()
+            .expect("ring")
+            .current_ratchet_pk();
+        let sibling_rt = ratchet_runtime(PEER, SIBLING_INSTANCE, sibling_ring);
+        wlock!(sibling_rt.peer_ratchet_keys).insert(ME, my_ratchet_pk);
+        // Singular answer = the LAST row = the sibling: the accident row and
+        // the session's device must differ for the test to say anything.
+        fx.certs = Arc::new(FamilyCerts(vec![session_row, sibling_row]));
+        (fx, sibling_rt)
     }
 
     impl Fixture {
@@ -1607,15 +1731,17 @@ mod ratchet_send_tests {
                 route_cache: Some(Arc::clone(&self.route_cache)),
                 route_updated: None,
                 peer_mlkem_keys: Some(Arc::clone(&self.peer_mlkem)),
-                mlkem_ek_resolver: Some(
-                    Arc::clone(&self.certs) as Arc<dyn veil_types::MlKemEkResolver>
-                ),
+                mlkem_ek_resolver: Some(Arc::clone(&self.certs)),
                 anon_onion_sender: None,
                 capture_tx: None,
                 pending_recursive: None,
                 trace_sample_rate: 0.0,
                 pending_ack: None,
                 ratchet: with_ratchet.then(|| self.me.clone()),
+                // Always present, answering `self.session_instance`: `None`
+                // through it must behave exactly like no lookup at all, and
+                // every pre-existing test exercises that leg for free.
+                session_instance_lookup: Some(Arc::new(PinnedInstance(self.session_instance))),
             }
         }
 
@@ -1702,6 +1828,76 @@ mod ratchet_send_tests {
             opened.authenticated,
             "and knows who wrote it, which an unsealed APP_SEND never told it"
         );
+    }
+
+    /// Defect №35, the sender's half. For a multi-device peer the cert cache
+    /// and the live session each name a device INDEPENDENTLY — the cache by an
+    /// all-zero freshness tie, the session by rendezvous accident — and they
+    /// disagree 4/5 of the time in a five-device family. When the session says
+    /// which device it terminates at, the seal must be keyed to THAT device.
+    ///
+    /// Proven by where the frame opens: at the session's device, and refused
+    /// by the sibling the singular cache would have picked.
+    #[tokio::test]
+    async fn a_session_backed_send_is_sealed_for_the_sessions_device_not_the_cache_accident() {
+        let (mut fx, sibling) = family_fixture();
+        fx.session_instance = Some(PEER_INSTANCE);
+        let mut wh = sink().await;
+        handle_ipc_send(
+            &mut SendReply::Inline(&mut wh),
+            &payload(false, b"to the device the session ends at"),
+            &fx.ctx(true),
+        )
+        .await
+        .expect("send");
+
+        let sent = fx.taken();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].0, PEER, "down the direct session");
+        let body = veil_proto::app::AppSendPayload::decode(&sent[0].1[veil_proto::HEADER_SIZE..])
+            .expect("body");
+        let now = veil_util::unix_secs_now_u64();
+        assert!(
+            matches!(
+                sibling.open_payload(&ME, &body.data, now),
+                Err(veil_e2e::RatchetSpliceError::NotForThisDevice)
+            ),
+            "the sibling — the row the singular resolve hands back — must \
+             refuse it, or this test is not about the pairing rule"
+        );
+        let opened = fx
+            .peer
+            .open_payload(&ME, &body.data, now)
+            .expect("the device the session terminates at opens it");
+        assert_eq!(opened.plaintext, b"to the device the session ends at");
+        assert!(opened.authenticated);
+    }
+
+    /// The fail-open half of the rule: no session-named instance (no live
+    /// session, or a legacy handshake that proved none) keeps the singular
+    /// resolve deciding — exactly the pre-№35 behaviour, which is correct for
+    /// every single-instance peer.
+    #[tokio::test]
+    async fn without_a_session_instance_the_singular_row_still_decides() {
+        let (fx, sibling) = family_fixture(); // session_instance: None
+        let mut wh = sink().await;
+        handle_ipc_send(
+            &mut SendReply::Inline(&mut wh),
+            &payload(false, b"addressed to the identity"),
+            &fx.ctx(true),
+        )
+        .await
+        .expect("send");
+
+        let sent = fx.taken();
+        assert_eq!(sent.len(), 1);
+        let body = veil_proto::app::AppSendPayload::decode(&sent[0].1[veil_proto::HEADER_SIZE..])
+            .expect("body");
+        let now = veil_util::unix_secs_now_u64();
+        let opened = sibling
+            .open_payload(&ME, &body.data, now)
+            .expect("the singular row's device opens it — unchanged behaviour");
+        assert_eq!(opened.plaintext, b"addressed to the identity");
     }
 
     /// Without the ratchet wired the same send is the plaintext APP_SEND it

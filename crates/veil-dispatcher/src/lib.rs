@@ -287,6 +287,14 @@ pub struct CryptoContext {
     >,
 }
 
+/// Drops locally-cached verified-certificate material for one peer, forcing
+/// the next seal toward it to re-resolve. See
+/// [`FrameDispatcher::peer_cert_invalidate`]; the production closure calls the
+/// runtime resolver's `invalidate_peer`. A bare `Fn` rather than a trait
+/// because the dispatcher needs exactly one verb and must not depend on the
+/// resolver's crate.
+pub type PeerCertInvalidateFn = Arc<dyn Fn(&[u8; 32]) + Send + Sync>;
+
 // ── AbuseContext ──────────────────────────────────────────────────────────────
 
 /// Abuse-resistance state shared by all dispatcher clones.
@@ -840,6 +848,19 @@ pub struct FrameDispatcher {
     /// `node/dispatcher/delivery.rs` (live forward path) and by
     /// the unit tests there.
     pub session_registry: Option<Arc<Mutex<veil_session::SessionRegistry>>>,
+
+    /// Sender-side half of the `AppSendUnopenable` feedback (defect №35):
+    /// drops the runtime resolver's cached certificate rows for a peer that
+    /// just said it cannot open what we sealed. Forgetting the ratchet
+    /// conversation alone is not enough — the verified-cert cache would keep
+    /// re-issuing the same wrong-device row for the rest of its 30-minute
+    /// TTL, re-wedging every re-key.
+    ///
+    /// `Arc<Mutex<Option<…>>>` for the same reason as `capture_tx`: the
+    /// resolver is built later than the dispatcher (IPC wiring), and the
+    /// dispatcher has been cloned into running sessions by then — all clones
+    /// share this slot, so an in-place set reaches every one.
+    pub peer_cert_invalidate: Arc<Mutex<Option<PeerCertInvalidateFn>>>,
 
     // ── Routing gossip ─────────────────────────────────────────
     /// Gossip dedup set — shared across all concurrent sessions.
@@ -1874,6 +1895,7 @@ pub fn make_test_dispatcher(role: NodeRole) -> FrameDispatcher {
         session_tx_registry: None,
         rendezvous_weak: Arc::new(std::sync::Mutex::new(None)),
         session_registry: None,
+        peer_cert_invalidate: Arc::new(Mutex::new(None)),
         route_seen_set: Arc::new(Mutex::new(RouteSeenSet::new(
             std::time::Duration::from_secs(60),
             4096,
@@ -2594,6 +2616,7 @@ mod tests {
             session_tx_registry: Some(tx_registry),
             rendezvous_weak: Arc::new(std::sync::Mutex::new(None)),
             session_registry: None, // test dispatcher — sovereign routing bypassed
+            peer_cert_invalidate: Arc::new(Mutex::new(None)),
             route_seen_set: Arc::new(Mutex::new(RouteSeenSet::new(
                 std::time::Duration::from_secs(60),
                 4096,

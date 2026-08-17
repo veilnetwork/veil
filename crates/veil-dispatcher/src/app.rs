@@ -251,7 +251,26 @@ impl FrameDispatcher {
                         // not open, so without this it keeps sending on a
                         // session no longer at this end and the pair never
                         // recovers. Tell it to start over.
-                        if matches!(e, veil_e2e::RatchetSpliceError::WedgedConversationDropped) {
+                        //
+                        // `NotForThisDevice` earns the same reply (defect №35):
+                        // the frame was keyed to a SIBLING device of ours,
+                        // because the sender's cert row and its session named
+                        // "which device of the family" independently — the row
+                        // by an all-zero last_seen tie (whichever the iterator
+                        // ended on, cached 30 min), the session by whichever
+                        // device rendezvous resolved. Four times out of five in
+                        // a five-device family those disagree, and a frame on a
+                        // direct session terminates HERE, so it is always the
+                        // mismatch and never a sibling's legitimate mail. In
+                        // silence the sender re-sends its prologue every ~9 s
+                        // forever; this reply makes it drop the conversation
+                        // AND the cached row, and the re-key resolves for the
+                        // device its session actually ends at.
+                        if matches!(
+                            e,
+                            veil_e2e::RatchetSpliceError::WedgedConversationDropped
+                                | veil_e2e::RatchetSpliceError::NotForThisDevice
+                        ) {
                             return DispatchResult::Response(crate::encode_response(
                                 header,
                                 veil_proto::family::FrameFamily::App as u8,
@@ -282,6 +301,21 @@ impl FrameDispatcher {
                             veil_util::bytes_to_hex(&node_id.as_bytes()[..4])
                         ),
                     );
+                }
+                // The conversation is not the only thing keyed to the wrong
+                // place: the verified-cert cache that keyed it still holds the
+                // same row for up to 30 minutes, and a re-key that re-reads it
+                // re-seals to the same device the peer just refused (defect
+                // №35). Drop the peer's cached rows so the re-key re-resolves
+                // — and, when its session names an instance, resolves for THAT
+                // device.
+                let invalidate = self
+                    .peer_cert_invalidate
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .clone();
+                if let Some(invalidate) = invalidate {
+                    invalidate(node_id.as_bytes());
                 }
                 DispatchResult::NoResponse
             }
@@ -453,10 +487,117 @@ impl FrameDispatcher {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use veil_app::registry::{AppMessage, SenderProvenance};
     use veil_proto::app::AppOpenPayload;
     use veil_proto::family::{AppMsg, FrameFamily};
     use veil_proto::header::FrameHeader;
+
+    fn ratchet_runtime(node_id: [u8; 32], instance: [u8; 16]) -> veil_e2e::RatchetRuntime {
+        let (ek, dk) = veil_e2e::generate_keypair();
+        veil_e2e::RatchetRuntime {
+            store: Arc::new(veil_e2e::RatchetStore::new()),
+            seed_ring: Arc::new(std::sync::RwLock::new(Arc::new(veil_e2e::MlKemSeedRing::new(
+                0, dk, ek,
+            )))),
+            local_node_id: Arc::new(std::sync::RwLock::new(node_id)),
+            local_instance_id: Arc::new(std::sync::RwLock::new(Some(instance))),
+            peer_ratchet_keys: Arc::new(std::sync::RwLock::new(
+                veil_e2e::PeerRatchetKeyCache::new(),
+            )),
+        }
+    }
+
+    /// Defect №35, the recipient's half. A direct-session frame keyed to a
+    /// SIBLING device of ours is always the sender's cert-row/session
+    /// mismatch — the session terminates here, so no sibling's legitimate
+    /// mail can arrive on it — and in silence the sender re-sends its
+    /// prologue every ~9 s forever. It must earn the same `AppSendUnopenable`
+    /// reply a dropped wedged conversation earns.
+    #[test]
+    fn a_frame_keyed_to_a_sibling_device_earns_the_unopenable_reply() {
+        let us = [0xBBu8; 32];
+        let sender_id = [0xAAu8; 32];
+
+        let mut disp = crate::make_test_dispatcher(veil_cfg::NodeRole::Core);
+        let our_rt = ratchet_runtime(us, [0x0B; 16]);
+        let our_ring = Arc::clone(&our_rt.seed_ring.read().expect("ring"));
+        disp.crypto = Arc::new(crate::CryptoContext {
+            ratchet: Some(our_rt),
+            ..(*disp.crypto).clone()
+        });
+
+        // The sender seals to our identity's published keys but names our
+        // sibling — the two independent answers to "which device of the
+        // family" (its cached cert row's tie accident vs. the device its
+        // session actually reached) disagreeing, as they do 4/5 of the time
+        // in a five-device family.
+        let sender_rt = ratchet_runtime(sender_id, [0x0A; 16]);
+        let ek = our_ring.current_ek();
+        let ratchet_pk = our_ring.current_ratchet_pk();
+        let (sealed, _ack_key) = sender_rt
+            .seal_for(
+                veil_e2e::PeerRatchetKeys {
+                    node_id: &us,
+                    instance_id: &[0x0C; 16], // a sibling, not our [0x0B; 16]
+                    mlkem_ek: &ek,
+                    ratchet_pk: &ratchet_pk,
+                },
+                b"keyed to the wrong device",
+                veil_util::unix_secs_now_u64(),
+            )
+            .expect("seal");
+
+        let body = veil_proto::app::AppSendPayload {
+            src_app_id: [0x11; 32],
+            app_id: [0x22; 32],
+            endpoint_id: 7,
+            data: veil_bufpool::pooled_shared_from_vec(sealed),
+        }
+        .encode();
+        let mut hdr = FrameHeader::new(FrameFamily::App as u8, AppMsg::AppSendSealed as u16);
+        hdr.body_len = body.len() as u32;
+
+        let crate::DispatchResult::Response(reply) = disp.dispatch(&hdr, &body, sender_id) else {
+            panic!("a sibling-keyed frame must answer the sender, not drop in silence");
+        };
+        let reply_hdr = veil_proto::codec::decode_header(&reply).expect("reply header");
+        assert_eq!(
+            reply_hdr.msg_type,
+            AppMsg::AppSendUnopenable as u16,
+            "the reply that makes the sender re-key instead of retrying forever"
+        );
+    }
+
+    /// The sender-side half of the same feedback: an inbound
+    /// `AppSendUnopenable` must invalidate the peer's cached certificate rows
+    /// (via the runtime-wired hook), or the re-key it triggers re-reads the
+    /// 30-minute cache and re-seals to the very row the peer just refused.
+    #[test]
+    fn an_unopenable_reply_drops_the_peers_cached_certs() {
+        let disp = crate::make_test_dispatcher(veil_cfg::NodeRole::Core);
+        let hits: Arc<std::sync::Mutex<Vec<[u8; 32]>>> = Arc::default();
+        {
+            let hits = Arc::clone(&hits);
+            *disp
+                .peer_cert_invalidate
+                .lock()
+                .unwrap_or_else(|p| p.into_inner()) = Some(Arc::new(move |peer: &[u8; 32]| {
+                hits.lock().unwrap_or_else(|p| p.into_inner()).push(*peer);
+            }));
+        }
+
+        let peer = [0xAAu8; 32];
+        let hdr = FrameHeader::new(FrameFamily::App as u8, AppMsg::AppSendUnopenable as u16);
+        disp.dispatch(&hdr, &[], peer);
+
+        assert_eq!(
+            hits.lock().unwrap_or_else(|p| p.into_inner()).as_slice(),
+            &[peer],
+            "exactly the refusing peer's rows, nobody else's"
+        );
+    }
 
     /// X/V-01, the stream half. A byte-stream initiator reaches the app as the
     /// same raw 32 bytes a datagram sender did, so it carries a trust level
