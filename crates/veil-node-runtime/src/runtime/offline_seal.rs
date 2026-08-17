@@ -103,6 +103,48 @@ pub(crate) fn other_instances(
         .collect()
 }
 
+/// The ONE registry row a deposit addressed to `recipient_device_id` — one of
+/// our OWN devices, named by its transport id — should be sealed for.
+///
+/// Sealing to every instance of the identity was the correct semantics when
+/// the family shared one box: every device drained the same mailbox, each
+/// opened its own envelope, the rest ignored it. The device box ended that —
+/// the relay keys the box by the TARGET device id and only that device's
+/// signed fetch drains it — so a deposit addressed to one device is opened by
+/// exactly that device and the other N−1 envelopes are pure weight. Measured
+/// live: an 1800-byte device-group chunk sealed to 30055 bytes with a
+/// 5-device family (≈5 ML-KEM certs), which is what forced every family
+/// mailbox delivery through the slice path — 6 onion round trips per blob,
+/// hours of churn on a backlog.
+///
+/// The walk is registry row → `bound_identity_key_idx` →
+/// `identity_keys[idx].device_id`, and it is entirely local: the recipient is
+/// one of us, so both the registry and the document are already in hand.
+/// `None` when no row maps (an older row whose key idx points nowhere useful,
+/// or an out-of-range idx) and when more than one does (legacy rows all bound
+/// to idx 0) — the caller keeps the full identity fan, failing open to
+/// correctness rather than picking a device by guess.
+///
+/// Pure, so the rule that decides who a device-addressed deposit reaches is
+/// testable without a runtime, a DHT or a second device.
+pub(crate) fn select_own_device_instance(
+    entries: &[veil_proto::instance_registry::InstanceEntry],
+    identity_keys: &[veil_proto::identity_document::IdentityKey],
+    recipient_device_id: &[u8; 32],
+) -> Option<veil_proto::instance_registry::InstanceEntry> {
+    let mut matches = entries.iter().filter(|entry| {
+        identity_keys
+            .get(entry.bound_identity_key_idx as usize)
+            .is_some_and(|key| key.device_id == *recipient_device_id)
+    });
+    let first = matches.next()?;
+    match matches.next() {
+        // Two rows claiming the same device key is ambiguity, not a choice.
+        Some(_) => None,
+        None => Some(first.clone()),
+    }
+}
+
 /// Failure of a runtime offline seal/open.
 #[derive(Debug, thiserror::Error)]
 pub enum OfflineSealError {
@@ -276,10 +318,45 @@ impl RuntimeMailboxCrypto {
             // document: a device's published instance id is the random one its
             // config minted (`cfg::instance`), not `device_id[..16]`, and a
             // first version of this fix derived the latter and resolved
-            // nothing. Sealing to every instance of the identity is the
-            // device-sync fan-out semantics — each device opens its own
-            // envelope, the rest ignore it.
-            self.mlkem_resolver().fetch_verified_certs(identity).await
+            // nothing.
+            //
+            // ONE envelope, not the family fan. The fan was the correct
+            // semantics when the family shared one box — each device drained
+            // it, opened its own envelope and ignored the rest. The device box
+            // is drained by exactly the device it is keyed to, so the other
+            // N−1 envelopes were pure weight: measured 1800 B → 30055 B at
+            // 5 devices, which is what forced every family mailbox delivery
+            // through the slice path. See `select_own_device_instance`; when
+            // no registry row maps to the addressee, keep the fan — heavier
+            // and correct beats lighter and lost.
+            match select_own_device_instance(
+                &sovereign.all_instance_entries(),
+                &sovereign.document.identity_keys,
+                &recipient_node_id,
+            ) {
+                Some(instance) => {
+                    log::debug!(
+                        "mailbox_seal: single-envelope for own device {} (instance {})",
+                        veil_util::hex_short(&recipient_node_id),
+                        veil_util::bytes_to_hex(&instance.instance_id[..4]),
+                    );
+                    self.mlkem_resolver()
+                        .certs_for_instances(
+                            self.local_node_id,
+                            &sovereign.document,
+                            std::slice::from_ref(&instance),
+                            now,
+                        )
+                        .await
+                }
+                None => {
+                    log::info!(
+                        "mailbox_seal: full identity fan for own device {} (no unique registry row maps to it)",
+                        veil_util::hex_short(&recipient_node_id),
+                    );
+                    self.mlkem_resolver().fetch_verified_certs(identity).await
+                }
+            }
         } else {
             // EVERY device of the recipient. Sealing to one delivered to
             // whichever instance the registry listed first and silently not to
@@ -762,6 +839,69 @@ mod tests {
         );
     }
 
+    /// One envelope must be meaningfully lighter than the family fan — the
+    /// whole point of `select_own_device_instance`.
+    ///
+    /// The live measurement behind it: an 1800-byte device-group chunk sealed
+    /// to 30055 bytes with a 5-device family, which pushed every family
+    /// mailbox delivery over the slice threshold. The bound asserted here is
+    /// structural, not a ratio: each dropped device saves at least its
+    /// ML-KEM-768 main-blob ciphertext (1088 bytes), so four dropped devices
+    /// save at least four of those — however much lighter the rest of the
+    /// format ever gets.
+    #[test]
+    fn one_envelope_is_meaningfully_lighter_than_the_family_fan() {
+        let tmp = tempfile::tempdir().unwrap();
+        let seed = veil_util::sensitive_bytes::SensitiveBytesN::<32>::from_bytes([0x5Au8; 32]);
+        let now = now_unix();
+        veil_identity::sovereign_flow::save_standalone_identity_to_dir(
+            tmp.path(),
+            &seed,
+            now - 3600,
+            now + 3 * 86_400,
+        )
+        .expect("persist standalone identity");
+        let sov = veil_identity::sovereign::SovereignIdentity::load_from_dir(tmp.path())
+            .expect("load standalone identity");
+        let identity = sov.document.node_id;
+
+        // Five devices' certs, built locally the way `local_verified_cert`
+        // always builds ours — the size comparison needs real envelopes, not
+        // a DHT.
+        let certs: Vec<_> = (0u8..5)
+            .map(|i| {
+                local_verified_cert(
+                    identity,
+                    [i + 1; 16],
+                    &[i + 13; veil_e2e::DK_SEED_BYTES],
+                )
+                .expect("local cert")
+            })
+            .collect();
+        let auth = sov.sign_auth_deliver(
+            identity,
+            [0x77u8; 32],
+            9,
+            now,
+            1,
+            vec![0xABu8; 1800],
+            Vec::new(),
+        );
+        let single =
+            mailbox_seal::seal_mailbox_blob(&auth, &certs[..1], &identity, &identity, &sov.document)
+                .expect("single-envelope seal");
+        let fan =
+            mailbox_seal::seal_mailbox_blob(&auth, &certs, &identity, &identity, &sov.document)
+                .expect("family-fan seal");
+        assert!(
+            fan.len() - single.len() >= 4 * 1088,
+            "four dropped devices must save at least their four ML-KEM ciphertexts \
+             (single={}, fan={})",
+            single.len(),
+            fan.len(),
+        );
+    }
+
     #[test]
     fn local_recipient_cert_is_derived_without_dht() {
         let node_id = [7; 32];
@@ -811,5 +951,66 @@ mod audience_tests {
     #[test]
     fn an_unlisted_sender_removes_nobody() {
         assert_eq!(other_instances(vec![entry(1), entry(2)], [0xEE; 16]).len(), 2);
+    }
+
+    fn entry_bound(
+        instance_byte: u8,
+        key_idx: u16,
+    ) -> veil_proto::instance_registry::InstanceEntry {
+        veil_proto::instance_registry::InstanceEntry {
+            instance_id: [instance_byte; 16],
+            bound_identity_key_idx: key_idx,
+            label: String::new(),
+            last_seen_unix_ms: 0,
+        }
+    }
+
+    fn key_for(device_byte: u8) -> veil_proto::identity_document::IdentityKey {
+        veil_proto::identity_document::IdentityKey {
+            algo: 0,
+            pubkey: Vec::new(),
+            device_id: [device_byte; 32],
+            valid_from_unix: 0,
+            valid_until_unix: 0,
+            master_sig: Vec::new(),
+        }
+    }
+
+    /// The point of the diet: a deposit addressed to ONE device seals for
+    /// that device's instance alone, not for the family.
+    #[test]
+    fn a_device_addressed_deposit_picks_that_device_alone() {
+        let keys = [key_for(0xA1), key_for(0xB2), key_for(0xC3)];
+        let entries = [entry_bound(1, 0), entry_bound(2, 1), entry_bound(3, 2)];
+        let picked = select_own_device_instance(&entries, &keys, &[0xB2; 32])
+            .expect("the mapped row must be found");
+        assert_eq!(picked.instance_id, [2u8; 16]);
+    }
+
+    /// A recipient no registry row maps to keeps the full fan — heavier and
+    /// correct beats lighter and lost.
+    #[test]
+    fn a_recipient_no_row_maps_to_keeps_the_full_fan() {
+        let keys = [key_for(0xA1)];
+        let entries = [entry_bound(1, 0)];
+        assert!(select_own_device_instance(&entries, &keys, &[0xEE; 32]).is_none());
+    }
+
+    /// An out-of-range key idx (an older row the document has moved past)
+    /// maps to nothing rather than to whatever sits at a wrapped index.
+    #[test]
+    fn an_out_of_range_key_idx_keeps_the_full_fan() {
+        let keys = [key_for(0xA1)];
+        let entries = [entry_bound(1, 7)];
+        assert!(select_own_device_instance(&entries, &keys, &[0xA1; 32]).is_none());
+    }
+
+    /// Two rows bound to the same key — the shape legacy registries have,
+    /// every row at idx 0 — is ambiguity, and ambiguity keeps the fan.
+    #[test]
+    fn two_rows_claiming_one_key_keep_the_full_fan() {
+        let keys = [key_for(0xA1)];
+        let entries = [entry_bound(1, 0), entry_bound(2, 0)];
+        assert!(select_own_device_instance(&entries, &keys, &[0xA1; 32]).is_none());
     }
 }
