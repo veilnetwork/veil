@@ -145,6 +145,7 @@ fn build_test_identity(seed_byte: u8, n_instances: usize) -> TestIdentity {
         valid_until_unix: now() + 7 * 86_400,
         sig_key_idx: 0,
         identity_keys,
+        revoked_devices: Vec::new(),
         document_sig: Vec::new(),
     };
 
@@ -787,6 +788,7 @@ fn phase645_h5_falcon512_producer_round_trip() {
             valid_until_unix: valid_until,
             master_sig: cert_sig.to_bytes().to_vec(),
         }],
+        revoked_devices: Vec::new(),
         document_sig: Vec::new(),
     };
     // The verifier requires `document_sig` to be a signature by the
