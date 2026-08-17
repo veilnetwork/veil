@@ -166,6 +166,16 @@ impl NodeRuntime {
         let veil_dir_for_reissue = self.identity_dir.clone();
         let reissue_logger = Arc::clone(&self.logger);
         let tasks = Arc::clone(&self.tasks);
+        // OS-suspension recovery handles (see `runtime/suspension_watch.rs`).
+        // The maintenance task is the one loop guaranteed alive on every node,
+        // so it carries the wall-vs-monotonic clock sample; these are the
+        // levers the detector pulls when the two clocks diverge. All cheap
+        // Arc clones; the detector fires at most once per resume.
+        let event_bus_for_suspension = Arc::clone(&self.event_bus);
+        let mlkem_republish_for_suspension = Arc::clone(&self.mlkem_republish_now);
+        let dht_republish_for_suspension = Arc::clone(&self.dht_republish_now);
+        let force_reconnect_for_suspension = Arc::clone(&self.force_reconnect_notify);
+        let suspension_logger = Arc::clone(&self.logger);
         // No per-tick catch_unwind/supervisor here ON PURPOSE: the workspace
         // builds release with `panic = "abort"` (see Cargo.toml), so a panic in
         // any tick phase aborts the whole process — a loud crash that the node's
@@ -183,8 +193,36 @@ impl NodeRuntime {
             // Hourly cadence for the identity-quota GC (its gc_at doc assumes
             // an infrequent caller — the LRU rebuild is O(n log n)).
             let mut last_identity_quota_gc = std::time::Instant::now();
+            // Suspension detector: its own 15 s arm rather than piggybacking
+            // on `cleanup_interval`, which operators tune from 1 s (seeds) to
+            // minutes — detection latency after a resume must not ride along.
+            // NEVER battery-throttled: a throttled detector is a detector that
+            // misses exactly the low-power suspensions it exists for.
+            let mut suspension_interval = tokio::time::interval(
+                super::suspension_watch::SUSPENSION_SAMPLE_INTERVAL,
+            );
+            let mut suspension_watch = super::suspension_watch::SuspensionWatch::new(
+                super::suspension_watch::DEFAULT_SUSPENSION_GAP_THRESHOLD,
+            );
             loop {
                 tokio::select! {
+                    _ = suspension_interval.tick() => {
+                        if let Some(gap) = suspension_watch.sample(
+                            std::time::Instant::now(),
+                            std::time::SystemTime::now(),
+                        ) {
+                            let live_count = lock!(live_sessions).len();
+                            super::suspension_watch::fire_suspension_recovery(
+                                gap,
+                                live_count,
+                                &event_bus_for_suspension,
+                                &mlkem_republish_for_suspension,
+                                &dht_republish_for_suspension,
+                                &force_reconnect_for_suspension,
+                                &suspension_logger,
+                            );
+                        }
+                    }
                     _ = interval.tick() => {
                         let now = std::time::Instant::now();
                         // 300 s peer-gossip exchange heartbeat: refresh peer

@@ -122,6 +122,8 @@ impl NodeRuntime {
         let session_outbox = Arc::clone(&self.session_outbox);
         let metrics = self.metrics.clone();
         let logger = Arc::clone(&self.logger);
+        // Poked by the suspension detector — see the select arm below.
+        let republish_now = Arc::clone(&self.dht_republish_now);
         let handle = supervised_spawn(Arc::clone(&self.logger), "dht_republish", async move {
             let interval = republish_interval;
             let mut scheduler = veil_dht::republish::RepublishScheduler::new();
@@ -132,6 +134,18 @@ impl NodeRuntime {
                 tokio::select! {
                     Ok(_) = shutdown_rx.changed() => {
                         if *shutdown_rx.borrow() { break; }
+                    }
+                    // Suspension detected (`runtime/suspension_watch.rs`): the
+                    // per-key due times in `RepublishScheduler` are `Instant`s,
+                    // which froze with CLOCK_MONOTONIC while the device slept —
+                    // so every key is now due LATE by the sleep length, while
+                    // the remote holders of our replicas kept expiring them on
+                    // the wall clock. Drop the schedule: every stored key
+                    // re-staggers over `interval / 4` from now, the same
+                    // bounded fan a fresh boot does, instead of trusting
+                    // deadlines the suspension silently stretched.
+                    _ = republish_now.notified() => {
+                        scheduler = veil_dht::republish::RepublishScheduler::new();
                     }
                     _ = tick_interval.tick() => {
                         // Call-RTT-spike experiment switch: skip republish
