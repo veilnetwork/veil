@@ -573,6 +573,14 @@ pub async fn handle_fetch_message(
                         );
                     }
                     blobs.extend(dev_blobs);
+                    blobs.sort_by_key(|b| b.deposited_at);
+                    // Oldest-first ACROSS the two boxes, not per-box: the
+                    // reply budget packs from the front, so "identity box
+                    // first" starves the device box for as long as the
+                    // identity backlog alone can fill a reply — measured
+                    // live: 133 device blobs announced, none served, while
+                    // 74 identity blobs took the whole budget every round.
+
                 }
                 Err(e) => log::warn!(
                     "veil-mailbox: FETCH device-box store error (recv={} dev={}): {e}",
@@ -2112,6 +2120,61 @@ mod tests {
             resp.blobs[1].blob, b"for-device",
             "the device box rides the SAME reply",
         );
+    }
+
+    /// The reply budget packs from the front, so ordering IS delivery policy:
+    /// a device-box blob older than the identity backlog must not wait behind
+    /// it. Measured live before the merge-sort: 133 device blobs announced,
+    /// zero served — 74 identity blobs took the whole budget every round.
+    #[tokio::test]
+    async fn network_fetch_serves_boxes_oldest_first_not_identity_first() {
+        let tmp = tempfile::tempdir().unwrap();
+        let clock = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(1_000));
+        let c2 = std::sync::Arc::clone(&clock);
+        let mailbox = Arc::new(
+            Mailbox::open_with_clock(
+                tmp.path(),
+                veil_mailbox::MailboxConfig::default(),
+                move || c2.load(std::sync::atomic::Ordering::SeqCst),
+            )
+            .unwrap(),
+        );
+        let identity = [0x11u8; 32];
+        let device = [0xD1u8; 32];
+        // Device blob deposited FIRST (older)…
+        mailbox
+            .put(device, [0xC1; 32], [0xAA; 32], b"older-device".to_vec())
+            .unwrap();
+        clock.store(2_000, std::sync::atomic::Ordering::SeqCst);
+        // …identity blob a wall-clock second later.
+        mailbox
+            .put(identity, [0xC2; 32], [0xAA; 32], b"newer-identity".to_vec())
+            .unwrap();
+
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sender: Arc<dyn veil_types::AnonOnionSender> = Arc::new(MockReplySender {
+            captured: std::sync::Arc::clone(&captured),
+        });
+        let msg = AppMessage::Deliver {
+            src_node_id: identity,
+            provenance: SenderProvenance::Signed,
+            sender_device_id: Some(device),
+            src_app_id: [0u8; 32],
+            app_id: MAILBOX_APP_ID,
+            endpoint_id: MAILBOX_FETCH_ENDPOINT_ID,
+            data: veil_bufpool::pooled_shared_from_vec(Vec::new()),
+            reply_id: 55,
+        };
+        handle_fetch_message(&mailbox, Some(&sender), msg).await;
+
+        let cap = captured.lock().unwrap();
+        let resp = veil_proto::MailboxFetchRespPayload::decode(&cap[0].1).unwrap();
+        assert_eq!(resp.blobs.len(), 2);
+        assert_eq!(
+            resp.blobs[0].blob, b"older-device",
+            "the older device-box blob is served first",
+        );
+        assert_eq!(resp.blobs[1].blob, b"newer-identity");
     }
 
     /// An oversized blob in a DEVICE box: FETCH announces it, so SLICE must
