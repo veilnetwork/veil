@@ -2426,6 +2426,22 @@ impl NodeRuntime {
                                 } => {
                                     via_reply = via_reply_circuit;
                                     use veil_identity::auth_deliver::ReassembleOutcome;
+                                    // OBSERVABILITY (log-only): name each
+                                    // fragment BEFORE reassembly — a message
+                                    // stuck forever Pending (some fragments
+                                    // never arrived) was invisible: neither
+                                    // rejected nor delivered.
+                                    logger.debug(
+                                        "anonymity.auth_deliver.fragment",
+                                        format!(
+                                            "auth fragment {}/{} msg_id[..4]={} \
+                                             ({} B, via_reply={via_reply_circuit})",
+                                            frag.frag_idx.saturating_add(1),
+                                            frag.frag_count,
+                                            veil_util::hex_str(&frag.msg_id[..4]),
+                                            frag.chunk.len(),
+                                        ),
+                                    );
                                     match reassembler.push(frag, now_unix) {
                                         ReassembleOutcome::Complete(bytes) => {
                                             match veil_proto::AuthAppDeliver::decode(&bytes) {
