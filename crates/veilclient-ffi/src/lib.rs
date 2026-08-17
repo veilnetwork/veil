@@ -2798,6 +2798,24 @@ fn build_runtime() -> Result<tokio::runtime::Runtime, std::io::Error> {
     let workers = std::thread::available_parallelism()
         .map(|n| n.get().min(4))
         .unwrap_or(2);
+    build_runtime_with(workers)
+}
+
+/// One worker, for a HANDLE runtime.
+///
+/// Every [`veil_connect`] handle carries its own runtime, and an app holds
+/// several handles at once — sampled live: six handles, six runtimes,
+/// twenty-four permanent `veil-ffi` worker threads, every one parked. This
+/// read for months as "the blocking pool never drains"; the stacks say
+/// otherwise — they are ordinary runtime workers, multiplied by handles.
+/// A handle is a thin IPC client: `block_on` request/response plus one
+/// event-stream task, which one worker drives fine. The full-size builder
+/// stays for anything that genuinely computes.
+fn build_handle_runtime() -> Result<tokio::runtime::Runtime, std::io::Error> {
+    build_runtime_with(1)
+}
+
+fn build_runtime_with(workers: usize) -> Result<tokio::runtime::Runtime, std::io::Error> {
     tokio::runtime::Builder::new_multi_thread()
         .worker_threads(workers)
         .enable_all()
@@ -2842,7 +2860,7 @@ pub unsafe extern "C" fn veil_connect(
         }
         return ptr::null_mut();
     };
-    let runtime = match build_runtime() {
+    let runtime = match build_handle_runtime() {
         Ok(rt) => rt,
         Err(e) => {
             unsafe {
