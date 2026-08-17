@@ -1626,6 +1626,7 @@ mod ratchet_send_tests {
 
     fn payload(anonymous: bool, data: &[u8]) -> Vec<u8> {
         AppIpcSendPayload {
+            my_other_devices: false,
             src_app_id: [0x11u8; 32],
             dst_node_id: PEER,
             app_id: [0x22u8; 32],

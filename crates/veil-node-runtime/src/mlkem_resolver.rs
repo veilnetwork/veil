@@ -1117,6 +1117,7 @@ mod tests {
             sig: vec![0u8; 64],
         };
         let doc = IdentityDocument {
+            revoked_devices: Vec::new(),
             node_id: [0x11; 32],
             issued_at_unix: 0,
             valid_until_unix: u64::MAX,

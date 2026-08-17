@@ -119,22 +119,31 @@ async fn process_auth_deliver(
     };
 
     // 2. Verify recipient binding, sender↔doc match, freshness, subkey, sig.
-    if let Err(e) = veil_identity::auth_deliver::verify_auth_deliver(
+    //    The Ok value is the device_id of the subkey that verified:
+    //    `sender_node_id` is the IDENTITY shared by a whole device family, and
+    //    the `sig_key_idx` subkey is the one place the protocol names the
+    //    member device that actually signed. Endpoint handlers that must act
+    //    per-device (the mailbox keys boxes by fetcher id) get it from this
+    //    proof, not from anything the sender claims.
+    let sender_device_id = match veil_identity::auth_deliver::verify_auth_deliver(
         &auth,
         &sender_doc,
         local_node_id,
         now_unix,
         freshness_window,
     ) {
-        logger.info(
-            "anonymity.auth_deliver.verify_failed",
-            format!(
-                "auth delivery from {} rejected: {e}",
-                veil_util::hex_short(&auth.sender_node_id),
-            ),
-        );
-        return;
-    }
+        Ok(dev) => dev,
+        Err(e) => {
+            logger.info(
+                "anonymity.auth_deliver.verify_failed",
+                format!(
+                    "auth delivery from {} rejected: {e}",
+                    veil_util::hex_short(&auth.sender_node_id),
+                ),
+            );
+            return;
+        }
+    };
 
     // 3. Replay check AFTER signature verify, so a forger cannot poison the
     //    cache with bogus (sender, nonce) entries to suppress a real sender.
@@ -188,6 +197,9 @@ async fn process_auth_deliver(
         // The signature over this message was verified against the sender's
         // identity document just above — the strongest provenance there is.
         veil_app::registry::SenderProvenance::Signed,
+        // The verified signer DEVICE (from the same signature) — the only
+        // delivery path entitled to pass `Some` here.
+        Some(sender_device_id),
         [0u8; 32], // AuthAppDeliver carries no src_app_id in v1
         app_id,
         endpoint_id,

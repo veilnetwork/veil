@@ -291,6 +291,7 @@ mod tests {
             .try_send(AppMessage::Deliver {
                 src_node_id: [9u8; 32],
                 provenance: veil_app::registry::SenderProvenance::SessionPeer,
+                sender_device_id: None,
                 src_app_id: [0u8; 32],
                 app_id,
                 endpoint_id: 42,

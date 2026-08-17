@@ -507,13 +507,14 @@ pub async fn handle_fetch_message(
     reply_sender: Option<&Arc<dyn AnonOnionSender>>,
     msg: AppMessage,
 ) {
-    let (src_node_id, provenance, reply_id) = match msg {
+    let (src_node_id, provenance, sender_device_id, reply_id) = match msg {
         AppMessage::Deliver {
             src_node_id,
             provenance,
+            sender_device_id,
             reply_id,
             ..
-        } => (src_node_id, provenance, reply_id),
+        } => (src_node_id, provenance, sender_device_id, reply_id),
         other => {
             log::debug!("veil-mailbox: ignoring non-Deliver on FETCH endpoint: {other:?}");
             return;
@@ -540,7 +541,7 @@ pub async fn handle_fetch_message(
         log::debug!("veil-mailbox: FETCH dropped — no reply egress configured");
         return;
     };
-    let blobs = match mailbox.fetch(src_node_id) {
+    let mut blobs = match mailbox.fetch(src_node_id) {
         Ok(b) => b,
         Err(e) => {
             log::warn!(
@@ -550,6 +551,37 @@ pub async fn handle_fetch_message(
             return;
         }
     };
+    // The mailbox key is the AUTHENTICATED FETCHER id — and every device of a
+    // family authenticates as the shared IDENTITY, so a box keyed by a
+    // device's own id was never fetched by anyone: deposits landed and sat
+    // until TTL, a live black hole. The `sig_key_idx` subkey that verified
+    // THIS request names the exact signing device, and that proof IS the
+    // authorization to drain that device's box (same standard as the identity
+    // box: the verified id, nothing claimed). Identity box first, device box
+    // behind it, one shared reply budget — no wire change, so an old client
+    // drains its device box the moment the relay serves it.
+    if let Some(dev) = sender_device_id {
+        if dev != src_node_id && dev != [0u8; 32] {
+            match mailbox.fetch(dev) {
+                Ok(dev_blobs) => {
+                    if !dev_blobs.is_empty() {
+                        log::debug!(
+                            "veil-mailbox: FETCH recv={} also drains device box {} ({} blob(s))",
+                            hex_short(&src_node_id),
+                            hex_short(&dev),
+                            dev_blobs.len(),
+                        );
+                    }
+                    blobs.extend(dev_blobs);
+                }
+                Err(e) => log::warn!(
+                    "veil-mailbox: FETCH device-box store error (recv={} dev={}): {e}",
+                    hex_short(&src_node_id),
+                    hex_short(&dev),
+                ),
+            }
+        }
+    }
     // Bound the reply so the whole encoded MailboxFetchRespPayload fits in ONE
     // signed AuthDeliver (see [fetch_reply_budget]). Oldest-first; the receiver
     // re-fetches to drain the rest (FETCH is non-destructive, deduped
@@ -647,14 +679,15 @@ pub async fn handle_slice_message(
     reply_sender: Option<&Arc<dyn AnonOnionSender>>,
     msg: AppMessage,
 ) {
-    let (src_node_id, provenance, reply_id, data) = match msg {
+    let (src_node_id, provenance, sender_device_id, reply_id, data) = match msg {
         AppMessage::Deliver {
             src_node_id,
             provenance,
+            sender_device_id,
             reply_id,
             data,
             ..
-        } => (src_node_id, provenance, reply_id, data),
+        } => (src_node_id, provenance, sender_device_id, reply_id, data),
         other => {
             log::debug!("veil-mailbox: ignoring non-Deliver on SLICE endpoint: {other:?}");
             return;
@@ -690,7 +723,20 @@ pub async fn handle_slice_message(
     // cannot be delivered.
     let window = fetch_reply_budget()
         .saturating_sub(veil_proto::ipc::MailboxSlicePayload::HEADER_SIZE);
-    let resp = match mailbox.slice(src_node_id, req.content_id, req.offset, window) {
+    // FETCH announces device-box blobs alongside identity-box ones, so the
+    // slice lookup must cover the same two boxes — an oversized blob that can
+    // be announced but never sliced would put the client in a request loop
+    // that no retry ends. Identity box first; the verified signer device's
+    // box only behind it, under the same authorization as the extra fetch.
+    let mut sliced = mailbox.slice(src_node_id, req.content_id, req.offset, window);
+    if matches!(sliced, Ok(None)) {
+        if let Some(dev) = sender_device_id {
+            if dev != src_node_id && dev != [0u8; 32] {
+                sliced = mailbox.slice(dev, req.content_id, req.offset, window);
+            }
+        }
+    }
+    let resp = match sliced {
         Ok(Some((total_len, bytes))) => veil_proto::ipc::MailboxSlicePayload {
             content_id: req.content_id,
             offset: req.offset,
@@ -742,13 +788,14 @@ pub async fn handle_slice_message(
 /// cadence the whole time. All paths fail-safe: malformed/unauthenticated
 /// requests are logged + discarded.
 pub fn handle_ack_message(mailbox: &Mailbox, msg: AppMessage) {
-    let (src_node_id, provenance, data) = match msg {
+    let (src_node_id, provenance, sender_device_id, data) = match msg {
         AppMessage::Deliver {
             src_node_id,
             provenance,
+            sender_device_id,
             data,
             ..
-        } => (src_node_id, provenance, data),
+        } => (src_node_id, provenance, sender_device_id, data),
         other => {
             log::debug!("veil-mailbox: ignoring non-Deliver on ACK endpoint: {other:?}");
             return;
@@ -786,6 +833,27 @@ pub fn handle_ack_message(mailbox: &Mailbox, msg: AppMessage) {
             "veil-mailbox: ACK store error (recv={}): {e}",
             hex_short(&src_node_id),
         ),
+    }
+    // FETCH serves the verified signer's device box alongside the identity
+    // box, so the ack must reach both: a deposit duplicated into the two
+    // boxes that dies in only one is re-served on every later fetch — the
+    // exact re-serve loop this endpoint exists to end. Same authorization as
+    // the extra fetch: the `sig_key_idx` subkey that verified this request IS
+    // the device, so it can only ever drop that device's own mail.
+    if let Some(dev) = sender_device_id {
+        if dev != src_node_id && dev != [0u8; 32] {
+            match mailbox.ack(dev, content_id) {
+                Ok(removed) => log::debug!(
+                    "veil-mailbox: ACK device box dev={} content={} removed={removed}",
+                    hex_short(&dev),
+                    hex_short(&content_id),
+                ),
+                Err(e) => log::warn!(
+                    "veil-mailbox: ACK device-box store error (dev={}): {e}",
+                    hex_short(&dev),
+                ),
+            }
+        }
     }
 }
 
@@ -1135,6 +1203,7 @@ mod tests {
         AppMessage::Deliver {
             src_node_id,
             provenance: SenderProvenance::Signed,
+            sender_device_id: None,
             src_app_id: [0u8; 32],
             app_id: MAILBOX_APP_ID,
             endpoint_id: veil_mailbox::MAILBOX_WAKE_ENDPOINT_ID,
@@ -1250,6 +1319,7 @@ mod tests {
         AppMessage::Deliver {
             src_node_id,
             provenance: SenderProvenance::Signed,
+            sender_device_id: None,
             src_app_id: [0u8; 32],
             app_id: MAILBOX_APP_ID,
             endpoint_id: MAILBOX_ACK_ENDPOINT_ID,
@@ -1424,6 +1494,7 @@ mod tests {
             .try_send(AppMessage::Deliver {
                 src_node_id: [33u8; 32],
                 provenance: SenderProvenance::Claimed,
+                sender_device_id: None,
                 src_app_id: [0u8; 32],
                 app_id: MAILBOX_APP_ID,
                 endpoint_id: MAILBOX_PUT_ENDPOINT_ID,
@@ -1471,6 +1542,7 @@ mod tests {
             .try_send(AppMessage::Deliver {
                 src_node_id: [33u8; 32],
                 provenance: SenderProvenance::Claimed,
+                sender_device_id: None,
                 src_app_id: [0u8; 32],
                 app_id: MAILBOX_APP_ID,
                 endpoint_id: MAILBOX_PUT_ENDPOINT_ID,
@@ -1489,6 +1561,7 @@ mod tests {
             .try_send(AppMessage::Deliver {
                 src_node_id: [33u8; 32],
                 provenance: SenderProvenance::Claimed,
+                sender_device_id: None,
                 src_app_id: [0u8; 32],
                 app_id: MAILBOX_APP_ID,
                 endpoint_id: MAILBOX_PUT_ENDPOINT_ID,
@@ -1517,6 +1590,7 @@ mod tests {
             .try_send(AppMessage::Deliver {
                 src_node_id: [44u8; 32],
                 provenance: SenderProvenance::Claimed,
+                sender_device_id: None,
                 src_app_id: [0u8; 32],
                 app_id: MAILBOX_APP_ID,
                 endpoint_id: veil_mailbox::MAILBOX_WAKE_ENDPOINT_ID,
@@ -1566,6 +1640,7 @@ mod tests {
             .try_send(AppMessage::Deliver {
                 src_node_id: [33u8; 32],
                 provenance: SenderProvenance::Claimed,
+                sender_device_id: None,
                 src_app_id: [0u8; 32],
                 app_id: MAILBOX_APP_ID,
                 endpoint_id: MAILBOX_PUT_ENDPOINT_ID,
@@ -1615,6 +1690,7 @@ mod tests {
             .try_send(AppMessage::Deliver {
                 src_node_id: [3u8; 32],
                 provenance: SenderProvenance::Claimed,
+                sender_device_id: None,
                 src_app_id: [0u8; 32],
                 app_id: MAILBOX_APP_ID,
                 endpoint_id: MAILBOX_PUT_ENDPOINT_ID,
@@ -1648,6 +1724,7 @@ mod tests {
             .try_send(AppMessage::Deliver {
                 src_node_id: [3u8; 32],
                 provenance: SenderProvenance::Claimed,
+                sender_device_id: None,
                 src_app_id: [0u8; 32],
                 app_id: MAILBOX_APP_ID,
                 endpoint_id: MAILBOX_PUT_ENDPOINT_ID,
@@ -1662,6 +1739,7 @@ mod tests {
             .try_send(AppMessage::Deliver {
                 src_node_id: [9u8; 32],
                 provenance: SenderProvenance::Claimed,
+                sender_device_id: None,
                 src_app_id: [0u8; 32],
                 app_id: MAILBOX_APP_ID,
                 endpoint_id: MAILBOX_PUT_ENDPOINT_ID,
@@ -1701,6 +1779,7 @@ mod tests {
             .try_send(AppMessage::Deliver {
                 src_node_id: [3u8; 32],
                 provenance: SenderProvenance::Claimed,
+                sender_device_id: None,
                 src_app_id: [0u8; 32],
                 app_id: MAILBOX_APP_ID,
                 endpoint_id: MAILBOX_PUT_ENDPOINT_ID,
@@ -1846,6 +1925,7 @@ mod tests {
         let msg = AppMessage::Deliver {
             src_node_id: recv,
             provenance: SenderProvenance::Signed,
+            sender_device_id: None,
             src_app_id: [0u8; 32],
             app_id: MAILBOX_APP_ID,
             endpoint_id: MAILBOX_FETCH_ENDPOINT_ID,
@@ -1879,6 +1959,7 @@ mod tests {
         let anon = AppMessage::Deliver {
             src_node_id: [0u8; 32],
             provenance: SenderProvenance::Claimed,
+            sender_device_id: None,
             src_app_id: [0u8; 32],
             app_id: MAILBOX_APP_ID,
             endpoint_id: MAILBOX_FETCH_ENDPOINT_ID,
@@ -1890,6 +1971,7 @@ mod tests {
         let noreply = AppMessage::Deliver {
             src_node_id: [0x77u8; 32],
             provenance: SenderProvenance::Signed,
+            sender_device_id: None,
             src_app_id: [0u8; 32],
             app_id: MAILBOX_APP_ID,
             endpoint_id: MAILBOX_FETCH_ENDPOINT_ID,
@@ -1923,6 +2005,7 @@ mod tests {
         let spoofed = AppMessage::Deliver {
             src_node_id: victim,
             provenance: SenderProvenance::Claimed,
+            sender_device_id: None,
             src_app_id: [0u8; 32],
             app_id: MAILBOX_APP_ID,
             endpoint_id: MAILBOX_FETCH_ENDPOINT_ID,
@@ -1952,6 +2035,7 @@ mod tests {
             AppMessage::Deliver {
                 src_node_id: victim,
                 provenance: SenderProvenance::Claimed,
+                sender_device_id: None,
                 src_app_id: [0u8; 32],
                 app_id: MAILBOX_APP_ID,
                 endpoint_id: MAILBOX_ACK_ENDPOINT_ID,
@@ -1972,6 +2056,7 @@ mod tests {
             AppMessage::Deliver {
                 src_node_id: victim,
                 provenance: SenderProvenance::Signed,
+                sender_device_id: None,
                 src_app_id: [0u8; 32],
                 app_id: MAILBOX_APP_ID,
                 endpoint_id: MAILBOX_ACK_ENDPOINT_ID,
@@ -1982,6 +2067,198 @@ mod tests {
         assert!(
             mailbox.fetch(victim).unwrap().is_empty(),
             "a verified ACK must still drop the blob",
+        );
+    }
+
+    /// A family device authenticates FETCH as the shared IDENTITY, so mail
+    /// deposited under its own DEVICE id was never fetched by anyone — a live
+    /// black hole. The verified signer device on the request is the
+    /// authorization to drain that box too, in the SAME reply: identity box
+    /// first, device box behind it.
+    #[tokio::test]
+    async fn network_fetch_drains_the_verified_devices_box_alongside_the_identitys() {
+        let (mailbox, _tmp) = fresh_mailbox();
+        let identity = [0x11u8; 32];
+        let device = [0xD1u8; 32];
+        mailbox
+            .put(identity, [0xC1; 32], [0xAA; 32], b"for-identity".to_vec())
+            .unwrap();
+        mailbox
+            .put(device, [0xC2; 32], [0xAA; 32], b"for-device".to_vec())
+            .unwrap();
+
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sender: Arc<dyn veil_types::AnonOnionSender> = Arc::new(MockReplySender {
+            captured: std::sync::Arc::clone(&captured),
+        });
+        let msg = AppMessage::Deliver {
+            src_node_id: identity,
+            provenance: SenderProvenance::Signed,
+            sender_device_id: Some(device),
+            src_app_id: [0u8; 32],
+            app_id: MAILBOX_APP_ID,
+            endpoint_id: MAILBOX_FETCH_ENDPOINT_ID,
+            data: veil_bufpool::pooled_shared_from_vec(Vec::new()),
+            reply_id: 13,
+        };
+        handle_fetch_message(&mailbox, Some(&sender), msg).await;
+
+        let cap = captured.lock().unwrap();
+        assert_eq!(cap.len(), 1, "one reply carries both boxes");
+        let resp = veil_proto::MailboxFetchRespPayload::decode(&cap[0].1).unwrap();
+        assert_eq!(resp.blobs.len(), 2, "identity box + device box");
+        assert_eq!(resp.blobs[0].blob, b"for-identity", "identity box first");
+        assert_eq!(
+            resp.blobs[1].blob, b"for-device",
+            "the device box rides the SAME reply",
+        );
+    }
+
+    /// An oversized blob in a DEVICE box: FETCH announces it, so SLICE must
+    /// find it too — a blob that can be announced but never sliced puts the
+    /// client in a request loop no retry ends. Same two-box lookup, same
+    /// authorization: only the verified signer device reaches its own box.
+    #[tokio::test]
+    async fn network_slice_reads_the_verified_devices_box() {
+        let (mailbox, _tmp) = fresh_mailbox();
+        let identity = [0x11u8; 32];
+        let device = [0xD1u8; 32];
+        let cid = [0xC7u8; 32];
+        let body = vec![0xB7u8; 9000];
+        mailbox.put(device, cid, [0xAA; 32], body.clone()).unwrap();
+
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sender: Arc<dyn veil_types::AnonOnionSender> = Arc::new(MockReplySender {
+            captured: std::sync::Arc::clone(&captured),
+        });
+        let req = veil_proto::ipc::MailboxSliceReqPayload {
+            content_id: cid,
+            offset: 0,
+        };
+        let msg = AppMessage::Deliver {
+            src_node_id: identity,
+            provenance: SenderProvenance::Signed,
+            sender_device_id: Some(device),
+            src_app_id: [0u8; 32],
+            app_id: MAILBOX_APP_ID,
+            endpoint_id: MAILBOX_SLICE_ENDPOINT_ID,
+            data: veil_bufpool::pooled_shared_from_vec(req.encode()),
+            reply_id: 34,
+        };
+        handle_slice_message(&mailbox, Some(&sender), msg).await;
+
+        let cap = captured.lock().unwrap();
+        assert_eq!(cap.len(), 1);
+        let resp = veil_proto::ipc::MailboxSlicePayload::decode(&cap[0].1).unwrap();
+        assert_eq!(resp.total_len as usize, body.len(), "the device-box blob answers");
+        assert!(!resp.bytes.is_empty());
+        assert_eq!(&body[..resp.bytes.len()], &resp.bytes[..]);
+
+        // And WITHOUT the verified device the same request finds nothing —
+        // the box stays invisible to a fetcher the signature does not name.
+        drop(cap);
+        captured.lock().unwrap().clear();
+        let req2 = veil_proto::ipc::MailboxSliceReqPayload {
+            content_id: cid,
+            offset: 0,
+        };
+        let msg2 = AppMessage::Deliver {
+            src_node_id: identity,
+            provenance: SenderProvenance::Signed,
+            sender_device_id: None,
+            src_app_id: [0u8; 32],
+            app_id: MAILBOX_APP_ID,
+            endpoint_id: MAILBOX_SLICE_ENDPOINT_ID,
+            data: veil_bufpool::pooled_shared_from_vec(req2.encode()),
+            reply_id: 35,
+        };
+        handle_slice_message(&mailbox, Some(&sender), msg2).await;
+        let cap = captured.lock().unwrap();
+        assert_eq!(cap.len(), 1);
+        let resp2 = veil_proto::ipc::MailboxSlicePayload::decode(&cap[0].1).unwrap();
+        assert_eq!(resp2.total_len, 0, "no verified device, no device-box slice");
+        assert!(resp2.bytes.is_empty());
+    }
+
+    /// Without a verified signer device the old contract holds exactly: a
+    /// fetch reads ONLY the box keyed by the authenticated fetcher id. `Some`
+    /// is minted solely by the signature-verified delivery path, so nothing a
+    /// non-family fetcher sends can name someone else's device box.
+    #[tokio::test]
+    async fn network_fetch_without_a_verified_device_leaves_device_boxes_alone() {
+        let (mailbox, _tmp) = fresh_mailbox();
+        let identity = [0x11u8; 32];
+        let device = [0xD1u8; 32];
+        mailbox
+            .put(device, [0xC2; 32], [0xAA; 32], b"for-device".to_vec())
+            .unwrap();
+
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sender: Arc<dyn veil_types::AnonOnionSender> = Arc::new(MockReplySender {
+            captured: std::sync::Arc::clone(&captured),
+        });
+        let msg = AppMessage::Deliver {
+            src_node_id: identity,
+            provenance: SenderProvenance::Signed,
+            sender_device_id: None,
+            src_app_id: [0u8; 32],
+            app_id: MAILBOX_APP_ID,
+            endpoint_id: MAILBOX_FETCH_ENDPOINT_ID,
+            data: veil_bufpool::pooled_shared_from_vec(Vec::new()),
+            reply_id: 21,
+        };
+        handle_fetch_message(&mailbox, Some(&sender), msg).await;
+
+        let cap = captured.lock().unwrap();
+        assert_eq!(cap.len(), 1, "the empty identity box still answers");
+        let resp = veil_proto::MailboxFetchRespPayload::decode(&cap[0].1).unwrap();
+        assert!(
+            resp.blobs.is_empty(),
+            "no verified device ⇒ no device box in the reply",
+        );
+        assert_eq!(
+            mailbox.fetch(device).unwrap().len(),
+            1,
+            "the device box is untouched",
+        );
+    }
+
+    /// A deposit duplicated into BOTH the identity box and the signer's
+    /// device box must die in both on one ack — a surviving copy is re-served
+    /// on every later fetch, the exact loop the ACK endpoint exists to end.
+    #[test]
+    fn network_ack_from_a_family_device_clears_both_boxes() {
+        let (mailbox, _tmp) = fresh_mailbox();
+        let identity = [0x11u8; 32];
+        let device = [0xD1u8; 32];
+        let cid = [0xC7u8; 32];
+        mailbox
+            .put(identity, cid, [0xAA; 32], b"copy-i".to_vec())
+            .unwrap();
+        mailbox
+            .put(device, cid, [0xAA; 32], b"copy-d".to_vec())
+            .unwrap();
+
+        handle_ack_message(
+            &mailbox,
+            AppMessage::Deliver {
+                src_node_id: identity,
+                provenance: SenderProvenance::Signed,
+                sender_device_id: Some(device),
+                src_app_id: [0u8; 32],
+                app_id: MAILBOX_APP_ID,
+                endpoint_id: MAILBOX_ACK_ENDPOINT_ID,
+                data: veil_bufpool::pooled_shared_from_vec(cid.to_vec()),
+                reply_id: 0,
+            },
+        );
+        assert!(
+            mailbox.fetch(identity).unwrap().is_empty(),
+            "the identity-box copy dies",
+        );
+        assert!(
+            mailbox.fetch(device).unwrap().is_empty(),
+            "the device-box copy dies in the same ack",
         );
     }
 
@@ -2010,6 +2287,7 @@ mod tests {
         let msg = AppMessage::Deliver {
             src_node_id: recv,
             provenance: SenderProvenance::Signed,
+            sender_device_id: None,
             src_app_id: [0u8; 32],
             app_id: MAILBOX_APP_ID,
             endpoint_id: MAILBOX_FETCH_ENDPOINT_ID,
@@ -2075,6 +2353,7 @@ mod tests {
                 AppMessage::Deliver {
                     src_node_id: recv,
                     provenance: SenderProvenance::Signed,
+                    sender_device_id: None,
                     src_app_id: [0u8; 32],
                     app_id: MAILBOX_APP_ID,
                     endpoint_id: MAILBOX_SLICE_ENDPOINT_ID,
@@ -2126,6 +2405,7 @@ mod tests {
             AppMessage::Deliver {
                 src_node_id: [0x99u8; 32],
                 provenance: SenderProvenance::Signed,
+                sender_device_id: None,
                 src_app_id: [0u8; 32],
                 app_id: MAILBOX_APP_ID,
                 endpoint_id: MAILBOX_SLICE_ENDPOINT_ID,
@@ -2164,6 +2444,7 @@ mod tests {
             AppMessage::Deliver {
                 src_node_id: recv,
                 provenance: SenderProvenance::Claimed,
+                sender_device_id: None,
                 src_app_id: [0u8; 32],
                 app_id: MAILBOX_APP_ID,
                 endpoint_id: MAILBOX_SLICE_ENDPOINT_ID,
@@ -2355,6 +2636,7 @@ mod tests {
                 AppMessage::Deliver {
                     src_node_id: [0x33u8; 32],
                     provenance: SenderProvenance::Claimed,
+                    sender_device_id: None,
                     src_app_id: [0u8; 32],
                     app_id: MAILBOX_APP_ID,
                     endpoint_id: MAILBOX_PUT_ENDPOINT_ID,
@@ -2380,6 +2662,7 @@ mod tests {
                 AppMessage::Deliver {
                     src_node_id: [0x33u8; 32],
                     provenance: SenderProvenance::Claimed,
+                    sender_device_id: None,
                     src_app_id: [0u8; 32],
                     app_id: MAILBOX_APP_ID,
                     endpoint_id: MAILBOX_PUT_ENDPOINT_ID,
@@ -2423,6 +2706,7 @@ mod tests {
                 AppMessage::Deliver {
                     src_node_id: [0x33u8; 32],
                     provenance: SenderProvenance::Claimed,
+                    sender_device_id: None,
                     src_app_id: [0u8; 32],
                     app_id: MAILBOX_APP_ID,
                     endpoint_id: MAILBOX_PUT_ENDPOINT_ID,
@@ -2452,6 +2736,7 @@ mod tests {
             AppMessage::Deliver {
                 src_node_id: [0x33u8; 32],
                 provenance: SenderProvenance::Claimed,
+                sender_device_id: None,
                 src_app_id: [0u8; 32],
                 app_id: MAILBOX_APP_ID,
                 endpoint_id: MAILBOX_PUT_ENDPOINT_ID,
