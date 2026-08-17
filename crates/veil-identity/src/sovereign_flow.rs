@@ -1686,6 +1686,11 @@ pub fn document_node_id(encoded: &[u8]) -> Result<[u8; 32], veil_proto::ProtoErr
 
 #[derive(Debug, thiserror::Error)]
 pub enum DelegateDeviceError {
+    #[error(
+        "device {device_id} is REVOKED in this document: a tombstoned key can \
+         never return; relinking requires a freshly minted device key"
+    )]
+    Revoked { device_id: String },
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
     #[error("no identity_document.bin in {0}")]
@@ -1816,6 +1821,22 @@ pub fn delegate_device(
         if k.pubkey == opts.device_pubkey {
             return Err(DelegateDeviceError::AlreadyPresent { idx });
         }
+    }
+    // A tombstoned key can NEVER come back — and refusing here is not just
+    // policy but self-preservation: encode would happily write a document
+    // with the key both live and revoked, and decode REJECTS that document
+    // as malformed, so a successful delegation of a revoked key would brick
+    // the identity on its next load. Relinking a revoked device requires a
+    // freshly minted device key.
+    let delegated_device_id = compute_node_id(&opts.device_pubkey);
+    if doc
+        .revoked_devices
+        .iter()
+        .any(|r| r.device_id == delegated_device_id)
+    {
+        return Err(DelegateDeviceError::Revoked {
+            device_id: hex_encode(&delegated_device_id),
+        });
     }
 
     // The master must be the one this document names. Without this check a
@@ -2269,6 +2290,22 @@ pub fn adopt_named_identity_document(
         .iter()
         .position(|k| k.pubkey == own_pk)
     else {
+        // Being ABSENT and being REVOKED are different answers: the first
+        // means "not delegated yet, ask the ceremony partner", the second
+        // means "this key is finished — relinking needs a fresh one". The
+        // caller surfaces them differently, so they must not share a string.
+        let own_id = compute_node_id(&own_pk);
+        if incoming
+            .revoked_devices
+            .iter()
+            .any(|r| r.device_id == own_id)
+        {
+            return Err(AdoptDocumentError::Verify(
+                "this device's key is REVOKED in the incoming document: \
+                 relinking requires a freshly minted device key"
+                    .into(),
+            ));
+        }
         return Err(AdoptDocumentError::Verify(
             "document does not name this device's key".into(),
         ));
@@ -3287,6 +3324,40 @@ mod tests {
             matches!(err, crate::verify::VerifyError::RevocationSigInvalid { .. }),
             "got {err:?}"
         );
+    }
+
+    #[test]
+    fn a_tombstoned_key_cannot_be_delegated_back() {
+        use ed25519_dalek::SigningKey as EdSk;
+        // Not just policy — self-preservation: encode would write a document
+        // with the key both live and revoked, and DECODE rejects that as
+        // malformed, so a successful re-delegation would brick the identity
+        // on its next load.
+        let master = tempdir();
+        let seed = create_identity(test_opts(master.clone())).unwrap().master_seed;
+        let dev_seed: SensitiveBytesN<32> = SensitiveBytesN::from_bytes([0x42u8; 32]);
+        let dev_pk = EdSk::from_bytes(dev_seed.as_array())
+            .verifying_key()
+            .as_bytes()
+            .to_vec();
+        delegate_device(delegate_opts(master.clone(), seed.clone(), dev_pk.clone())).unwrap();
+        let dev_id = veil_crypto::identity::compute_node_id(&dev_pk);
+        revoke_identity_device(
+            &master,
+            MasterSecret::Seed(seed.clone()),
+            &dev_id,
+            DELEGATE_NOW,
+        )
+        .unwrap();
+
+        let err =
+            delegate_device(delegate_opts(master.clone(), seed, dev_pk)).unwrap_err();
+        assert!(
+            matches!(err, DelegateDeviceError::Revoked { .. }),
+            "got {err:?}"
+        );
+        // And the document still loads — nothing was written.
+        crate::sovereign::SovereignIdentity::load_from_dir(&master).expect("still loads");
     }
 
     #[test]
