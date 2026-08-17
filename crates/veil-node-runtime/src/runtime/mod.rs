@@ -9278,14 +9278,31 @@ impl NodeServices {
         // unbounded — the origin table (cap 256) filled in ~10 h as each 150 s
         // rebuild leaked an entry, after which builds failed and the service went
         // dark. Run them here so idle/expired entries are reclaimed.
-        if let Some(t) = self.dispatcher.circuit_table.as_ref() {
-            t.gc(now_unix);
-        }
-        if let Some(r) = self.dispatcher.circuit_rendezvous.as_ref() {
-            r.gc(now_unix);
-        }
-        if let Some(o) = self.dispatcher.circuit_origin.as_ref() {
-            o.gc(now_unix);
+        let gc_relay = self
+            .dispatcher
+            .circuit_table
+            .as_ref()
+            .map_or(0, |t| t.gc(now_unix));
+        let gc_rendezvous = self
+            .dispatcher
+            .circuit_rendezvous
+            .as_ref()
+            .map_or(0, |r| r.gc(now_unix));
+        let gc_origin = self
+            .dispatcher
+            .circuit_origin
+            .as_ref()
+            .map_or(0, |o| o.gc(now_unix));
+        if gc_relay + gc_rendezvous + gc_origin > 0 {
+            // OBSERVABILITY (log-only): an evicted rendezvous binding is the
+            // event that later surfaces as introduce.cookie_unknown at this
+            // relay; an evicted relay circuit is what turns the NEXT forwarded
+            // introduce into a data_unknown_circuit drop on this hop. Name the
+            // evictions when they happen instead of leaving them silent.
+            log::info!(
+                "anonymity.circuit.gc evicted relay_circuits={gc_relay} \
+                 rendezvous_bindings={gc_rendezvous} origin_circuits={gc_origin}"
+            );
         }
 
         // Refresh at half the relay-side circuit idle TTL (300 s) → 150 s.

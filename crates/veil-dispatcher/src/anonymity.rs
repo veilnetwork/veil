@@ -433,6 +433,20 @@ impl FrameDispatcher {
                 return DispatchResult::NoResponse;
             }
         };
+        // OBSERVABILITY (log-only): name the introduce's ARRIVAL at the
+        // terminus so any drop further down this function can be correlated
+        // with it. The cookie is truncated to a 4-byte prefix — enough to
+        // diff against a registration, short enough not to hand a log-watcher
+        // the full (public but subscriber-linkable) value.
+        self.logger.debug(
+            "anonymity.relay_chain.introduce.arrived",
+            format!(
+                "introduce at terminus: receiver={} cookie[..4]={} ct={} B",
+                veil_util::hex_short(&intro.receiver_node_id),
+                veil_util::hex_str(&intro.auth_cookie[..4]),
+                intro.ciphertext.len(),
+            ),
+        );
         let Some(reg) = &self.rendezvous_registry else {
             self.logger.info(
                 "anonymity.relay_chain.introduce.no_registry",
@@ -522,10 +536,21 @@ impl FrameDispatcher {
                                 ),
                             );
                         }
+                        // OBSERVABILITY (log-only): a 4-byte cookie prefix +
+                        // registry occupancy — enough to tell "registration
+                        // expired/evicted" from "never registered here"
+                        // without logging the full linkable cookie.
                         #[cfg(not(feature = "relay-trace"))]
                         self.logger.info(
                             "anonymity.relay_chain.introduce.cookie_unknown",
-                            "no subscriber registered for this (receiver, auth_cookie); dropped",
+                            format!(
+                                "no subscriber for receiver={} cookie[..4]={} \
+                                 (session_subs={} circuit_subs={}); dropped",
+                                veil_util::hex_short(&intro.receiver_node_id),
+                                veil_util::hex_str(&intro.auth_cookie[..4]),
+                                reg.len(),
+                                self.circuit_rendezvous.as_ref().map_or(0, |r| r.len()),
+                            ),
                         );
                         return DispatchResult::NoResponse;
                     }
@@ -538,7 +563,18 @@ impl FrameDispatcher {
         };
         let body_bytes = match forward.encode() {
             Ok(b) => b,
-            Err(_) => return DispatchResult::NoResponse, // oversize (cap'd anyway)
+            Err(_) => {
+                // OBSERVABILITY (log-only): this was a fully silent drop of a
+                // KNOWN-subscriber introduce (oversize ForwardIntroduce).
+                self.logger.info(
+                    "anonymity.relay_chain.introduce.session_encode_failed",
+                    format!(
+                        "ForwardIntroduce encode failed (ct={} B); introduce dropped",
+                        forward.ciphertext.len(),
+                    ),
+                );
+                return DispatchResult::NoResponse; // oversize (cap'd anyway)
+            }
         };
         // subscriber.peer_node_id is the raw [u8; 32] from the
         // veil-anonymity crate — convert to NodeId at the boundary.
@@ -563,7 +599,17 @@ impl FrameDispatcher {
                 ),
             );
         }
-        self.send_relay_chain_msg(&target, RelayChainMsg::ForwardIntroduce, &body_bytes);
+        let sent = self.send_relay_chain_msg(&target, RelayChainMsg::ForwardIntroduce, &body_bytes);
+        // OBSERVABILITY (log-only): session-forward outcome. sent=false is the
+        // drop point (send.peer_unreachable, just logged, names the send error).
+        self.logger.debug(
+            "anonymity.relay_chain.introduce.session_forward",
+            format!(
+                "sent={sent} receiver={} bytes={}",
+                veil_util::hex_short(&subscriber.peer_node_id),
+                body_bytes.len(),
+            ),
+        );
         DispatchResult::NoResponse
     }
 
@@ -753,6 +799,18 @@ impl FrameDispatcher {
                 // Replay-detection counter would land here if a
                 // future SOC dashboard requires it; current rate-
                 // limit + abuse tracker covers operator visibility.
+                // OBSERVABILITY (DEBUG only — the prod default stays silent,
+                // so the timing-oracle stance above stands): a LIVE introduce
+                // swallowed here (e.g. the same sealed bytes already came via
+                // another leg) was otherwise invisible.
+                self.logger.debug(
+                    "anonymity.relay_chain.forward.replay_dropped",
+                    format!(
+                        "sealed introduce dropped as replay (from peer={}, \
+                         via_reply={via_reply_circuit})",
+                        veil_util::hex_short(peer),
+                    ),
+                );
                 return DispatchResult::NoResponse;
             }
             Err(_) => {
@@ -1005,7 +1063,18 @@ impl FrameDispatcher {
         use veil_anonymity::circuit_wire::CircuitDataPayload;
         let cell = match CircuitDataPayload::decode(body) {
             Ok(c) => c,
-            Err(_) => return DispatchResult::NoResponse,
+            Err(_) => {
+                // OBSERVABILITY (log-only): demux failure — malformed cell.
+                self.logger.debug(
+                    "anonymity.circuit.data_decode_failed",
+                    format!(
+                        "CircuitData decode failed ({} B) from peer={}; dropped",
+                        body.len(),
+                        veil_util::hex_short(node_id.as_bytes()),
+                    ),
+                );
+                return DispatchResult::NoResponse;
+            }
         };
         circuit_data_diag(|d| d.rx = d.rx.saturating_add(1));
         let link = *node_id.as_bytes();
@@ -1025,6 +1094,15 @@ impl FrameDispatcher {
                     .unwrap_or_else(|p| p.into_inner())
                     .accept(cell.seq)
                 {
+                    // OBSERVABILITY (log-only): a forward cell silently eaten
+                    // by the replay window.
+                    self.logger.debug(
+                        "anonymity.circuit.replay_fwd_dropped",
+                        format!(
+                            "forward cell replay/too-old: circuit_id={} seq={}",
+                            cell.circuit_id, cell.seq,
+                        ),
+                    );
                     return DispatchResult::NoResponse; // replay / too-old
                 }
                 state.touch(now);
@@ -1093,12 +1171,39 @@ impl FrameDispatcher {
                                 circuit_data_diag(|d| {
                                     d.splice_miss = d.splice_miss.saturating_add(1);
                                 });
+                                // OBSERVABILITY (log-only): per-event line for
+                                // the splice_miss counter — the leading 16 B
+                                // did not resolve as a registered cookie, so
+                                // the cell falls through to terminus_data.
+                                self.logger.debug(
+                                    "anonymity.circuit.splice_miss",
+                                    format!(
+                                        "terminus cell cookie[..4]={} not in \
+                                         circuit-rendezvous registry ({} B)",
+                                        veil_util::hex_str(&cookie[..4]),
+                                        p.len(),
+                                    ),
+                                );
                             }
                         }
                         if !spliced && let Some(p) = &payload {
                             self.logger.info(
                                 "anonymity.circuit.terminus_data",
                                 format!("circuit terminus rx {} B", p.len()),
+                            );
+                        }
+                        if payload.is_none() {
+                            // OBSERVABILITY (log-only): an unframeable terminus
+                            // cell previously died with no counter AND no line.
+                            self.logger.debug(
+                                "anonymity.circuit.terminus_unframed",
+                                format!(
+                                    "terminus cell payload unframeable: \
+                                     circuit_id={} seq={} ({} B); dropped",
+                                    cell.circuit_id,
+                                    cell.seq,
+                                    buf.len(),
+                                ),
                             );
                         }
                     }
@@ -1115,6 +1220,16 @@ impl FrameDispatcher {
                     .unwrap_or_else(|p| p.into_inner())
                     .accept(cell.seq)
                 {
+                    // OBSERVABILITY (log-only): a return cell (possibly a
+                    // forwarded introduce in transit) eaten by the replay
+                    // window at a middle hop.
+                    self.logger.debug(
+                        "anonymity.circuit.replay_ret_dropped",
+                        format!(
+                            "return cell replay/too-old: circuit_id={} seq={}",
+                            cell.circuit_id, cell.seq,
+                        ),
+                    );
                     return DispatchResult::NoResponse;
                 }
                 state.touch(now);
@@ -1167,12 +1282,23 @@ impl FrameDispatcher {
                             Ok(()) => circuit_data_diag(|d| {
                                 d.origin_stream_ok = d.origin_stream_ok.saturating_add(1);
                             }),
-                            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                            Err(tokio::sync::mpsc::error::TrySendError::Full(v)) => {
                                 circuit_data_diag(|d| {
                                     d.origin_stream_full = d.origin_stream_full.saturating_add(1);
                                 });
+                                // OBSERVABILITY (log-only): counted-but-silent.
+                                self.logger.debug(
+                                    "anonymity.circuit.stream_sink_full",
+                                    format!(
+                                        "stream sink full: circuit_id={} seq={} \
+                                         ({} B dropped)",
+                                        cell.circuit_id,
+                                        cell.seq,
+                                        v.len(),
+                                    ),
+                                );
                             }
-                            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                            Err(tokio::sync::mpsc::error::TrySendError::Closed(v)) => {
                                 // TRUE stream failure: the sink WAS registered
                                 // for this circuit but its receiver (feed task)
                                 // has been dropped while the sender entry lingers
@@ -1181,6 +1307,17 @@ impl FrameDispatcher {
                                     d.origin_stream_missing =
                                         d.origin_stream_missing.saturating_add(1);
                                 });
+                                // OBSERVABILITY (log-only): counted-but-silent.
+                                self.logger.debug(
+                                    "anonymity.circuit.stream_sink_closed",
+                                    format!(
+                                        "stream sink closed (feed task gone): \
+                                         circuit_id={} seq={} ({} B dropped)",
+                                        cell.circuit_id,
+                                        cell.seq,
+                                        v.len(),
+                                    ),
+                                );
                             }
                         }
                         return DispatchResult::NoResponse;
@@ -1193,6 +1330,20 @@ impl FrameDispatcher {
                     circuit_data_diag(|d| {
                         d.origin_introduce = d.origin_introduce.saturating_add(1);
                     });
+                    // OBSERVABILITY (log-only): the return-circuit introduce
+                    // demux, BEFORE auth processing — pairs with the terminus's
+                    // introduce.circuit_forwarded on the other end.
+                    self.logger.debug(
+                        "anonymity.circuit.origin_introduce",
+                        format!(
+                            "return-circuit introduce opened: {} B circuit_id={} \
+                             seq={} reply={}",
+                            opened.len(),
+                            cell.circuit_id,
+                            cell.seq,
+                            origin.is_reply,
+                        ),
+                    );
                     // A return cell on OUR circuit: if this circuit is one of
                     // our ephemeral REPLY circuits, the payload is the peer
                     // answering something we sent live (me→R proof).
@@ -1202,6 +1353,18 @@ impl FrameDispatcher {
                     circuit_data_diag(|d| {
                         d.origin_open_err = d.origin_open_err.saturating_add(1);
                     });
+                    // OBSERVABILITY (log-only): demux failure on OUR circuit —
+                    // a return layer failed AEAD (key/seq mismatch).
+                    self.logger.debug(
+                        "anonymity.circuit.origin_open_failed",
+                        format!(
+                            "return-cell open failed (layer AEAD): circuit_id={} \
+                             seq={} from peer={}",
+                            cell.circuit_id,
+                            cell.seq,
+                            veil_util::hex_short(&link),
+                        ),
+                    );
                     DispatchResult::NoResponse // a layer failed AEAD — drop
                 }
             };
@@ -1209,6 +1372,22 @@ impl FrameDispatcher {
 
         // Unknown circuit — anti-leak silent drop.
         circuit_data_diag(|d| d.unknown = d.unknown.saturating_add(1));
+        // OBSERVABILITY (log-only): per-event line for the `unknown` counter.
+        // What lands here is a RelayChain::CircuitData cell matching NO
+        // forward/backward relay entry and NO origin circuit — e.g. a
+        // forwarded introduce whose return circuit already expired on this
+        // hop (idle-GC'd / torn down / node restarted).
+        self.logger.debug(
+            "anonymity.circuit.data_unknown_circuit",
+            format!(
+                "RelayChain::CircuitData for unknown circuit_id={} seq={} \
+                 from peer={} ({} B); no forward/backward/origin match — dropped",
+                cell.circuit_id,
+                cell.seq,
+                veil_util::hex_short(&link),
+                cell.ciphertext.len(),
+            ),
+        );
         DispatchResult::NoResponse
     }
 
@@ -1371,6 +1550,16 @@ impl FrameDispatcher {
         if lock!(self.circuit_introduce_seen).check_and_insert(fp) {
             // Already forwarded this exact introduce recently. The cookie WAS
             // known — caller must not mislabel it as an unknown cookie.
+            // OBSERVABILITY (log-only): this dedup drop was silent in the
+            // default build — the ONE line naming it.
+            self.logger.info(
+                "anonymity.relay_chain.introduce.circuit_replay_dropped",
+                format!(
+                    "duplicate introduce for cookie[..4]={} already forwarded \
+                     recently; dropped",
+                    veil_util::hex_str(&intro.auth_cookie[..4]),
+                ),
+            );
             return CircuitIntroduceForward::KnownButDropped;
         }
         // Frame the introduce into a FIXED-SIZE cell, then apply R's (terminus)
@@ -1378,11 +1567,31 @@ impl FrameDispatcher {
         let mut buf = match wrap_payload(&intro.ciphertext) {
             Ok(b) => b,
             // introduce larger than one cell — drop, but the cookie was known.
-            Err(_) => return CircuitIntroduceForward::KnownButDropped,
+            Err(_) => {
+                self.logger.info(
+                    "anonymity.relay_chain.introduce.circuit_oversize",
+                    format!(
+                        "introduce ct={} B exceeds one return cell; dropped \
+                         (cookie[..4]={})",
+                        intro.ciphertext.len(),
+                        veil_util::hex_str(&intro.auth_cookie[..4]),
+                    ),
+                );
+                return CircuitIntroduceForward::KnownButDropped;
+            }
         };
         // D5: refuse to send if the return-seq space is exhausted (would reuse
         // keystream). Drop the cell; the circuit idle-GCs and is rebuilt fresh.
         let Some(seq) = circuit.alloc_return_seq() else {
+            self.logger.info(
+                "anonymity.relay_chain.introduce.circuit_seq_exhausted",
+                format!(
+                    "return-seq space exhausted on circuit_id={}; introduce \
+                     dropped (cookie[..4]={}; circuit awaits idle-GC + rebuild)",
+                    circuit.circuit_id_in,
+                    veil_util::hex_str(&intro.auth_cookie[..4]),
+                ),
+            );
             return CircuitIntroduceForward::KnownButDropped;
         };
         apply_layer(&circuit.circuit_key, Direction::Return, seq, &mut buf);
@@ -1393,16 +1602,55 @@ impl FrameDispatcher {
         };
         match cell.encode() {
             Ok(body) => {
-                self.send_relay_chain_msg(
+                let sent = self.send_relay_chain_msg(
                     &NodeId::from(circuit.prev_link),
                     RelayChainMsg::CircuitData,
                     &body,
                 );
+                // OBSERVABILITY (log-only): the forward attempt + its send
+                // result. Return value is unchanged (`Forwarded` either way —
+                // as before); on sent=false the introduce IS dropped and
+                // send.peer_unreachable (just logged) names the session error.
+                if sent {
+                    self.logger.debug(
+                        "anonymity.relay_chain.introduce.circuit_forwarded",
+                        format!(
+                            "introduce sent down return circuit: circuit_id={} \
+                             seq={seq} cell={} B next={} cookie[..4]={}",
+                            circuit.circuit_id_in,
+                            body.len(),
+                            veil_util::hex_short(&circuit.prev_link),
+                            veil_util::hex_str(&intro.auth_cookie[..4]),
+                        ),
+                    );
+                } else {
+                    self.logger.info(
+                        "anonymity.relay_chain.introduce.circuit_send_failed",
+                        format!(
+                            "return-circuit send failed: circuit_id={} next={} \
+                             cookie[..4]={}; introduce dropped",
+                            circuit.circuit_id_in,
+                            veil_util::hex_short(&circuit.prev_link),
+                            veil_util::hex_str(&intro.auth_cookie[..4]),
+                        ),
+                    );
+                }
                 CircuitIntroduceForward::Forwarded
             }
             // Oversize (too many return hops for the cell cap) — drop; the cell
             // budget is a known b6 refinement. Cookie was known.
-            Err(_) => CircuitIntroduceForward::KnownButDropped,
+            Err(_) => {
+                self.logger.info(
+                    "anonymity.relay_chain.introduce.circuit_encode_failed",
+                    format!(
+                        "CircuitData encode failed for circuit_id={}; introduce \
+                         dropped (cookie[..4]={})",
+                        circuit.circuit_id_in,
+                        veil_util::hex_str(&intro.auth_cookie[..4]),
+                    ),
+                );
+                CircuitIntroduceForward::KnownButDropped
+            }
         }
     }
 
