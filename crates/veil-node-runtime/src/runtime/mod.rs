@@ -41,6 +41,7 @@ mod session_defaults;
 pub(crate) mod session_guard;
 mod sovereign_republish;
 mod space_discovery;
+mod suspension_watch;
 mod update_check;
 mod uri_helpers;
 // Phase 2 pre-work (veilcore extraction): `handoff` + `hot_standby`
@@ -747,6 +748,14 @@ pub struct NodeRuntime {
     /// node would be publishing an EK it had already replaced. The rotation task
     /// only rotates; the republish task owns publishing, and this is the seam.
     pub mlkem_republish_now: Arc<tokio::sync::Notify>,
+    /// Poked by the suspension detector (`runtime/suspension_watch.rs`) when
+    /// the wall clock has run ahead of CLOCK_MONOTONIC — i.e. the OS suspended
+    /// this process without telling anyone. The DHT-republish task's per-key
+    /// due times are `Instant`-based, so after a suspension every one of them
+    /// is late by the sleep length while remote replica holders expired us on
+    /// the wall clock; the poke drops that schedule so every stored key
+    /// re-staggers from now, same as a fresh boot.
+    pub dht_republish_now: Arc<tokio::sync::Notify>,
     /// Pending diagnostic reply channels: `seq → Sender<DiagEvent>`.
     /// Shared with `FrameDispatcher` so admin handlers can register waiters.
     pub pending_diag: Arc<
@@ -2433,6 +2442,7 @@ impl NodeRuntime {
             )),
             inbound_handshake_sem_target: config.session.max_concurrent.saturating_mul(4).max(1024),
             mlkem_republish_now: Arc::new(tokio::sync::Notify::new()),
+            dht_republish_now: Arc::new(tokio::sync::Notify::new()),
             pending_diag: Arc::clone(&shared_pending_diag),
             // H10 stage-B (4/N): 16 session-config knobs collapsed
             // into one `Arc<SessionDefaults>`. Same Arc is cloned into
