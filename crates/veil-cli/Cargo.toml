@@ -82,7 +82,8 @@ toml = "0.9"
 zeroize = "1"
 
 [target.'cfg(target_os = "linux")'.dependencies]
-tikv-jemallocator = "0.6"
+tikv-jemallocator = { version = "0.6", features = ["stats"] }
+tikv-jemalloc-ctl = { version = "0.6", features = ["stats"] }
 
 # Windows Service mode — `veil-cli service install/uninstall/run`
 # registers the node with the Service Control Manager so it survives reboots
