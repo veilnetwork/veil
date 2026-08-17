@@ -152,6 +152,7 @@ mod tests {
                 valid_until_unix: 1_700_000_000 + 7 * 86_400,
                 master_sig: vec![0xCC; 64],
             }],
+            revoked_devices: Vec::new(),
             document_sig: vec![0xFF; 64],
         }
     }

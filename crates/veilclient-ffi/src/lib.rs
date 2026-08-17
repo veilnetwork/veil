@@ -9119,6 +9119,108 @@ pub unsafe extern "C" fn veil_adopt_identity_document_named_zeroize(
     }
 }
 
+/// Revoke a device's key from the identity document, with the master derived
+/// from `phrase`. The cryptographic half of device revocation: the group
+/// membership half already exists, but the document kept VOUCHING for the
+/// revoked key until its cert aged out. Removes the key, adds a
+/// master-signed tombstone the document merge can never resurrect, and
+/// re-signs with this device's own key.
+///
+/// `phrase` is SECRET and wiped in place before return. `device_id` is the
+/// 32-byte device address (BLAKE3 of its pubkey). Writes 1 to `changed_out`
+/// when the document changed, 0 when the device was already tombstoned.
+#[cfg(feature = "node-embedded")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn veil_revoke_identity_device_from_phrase_zeroize(
+    phrase: *mut u8,
+    phrase_len: usize,
+    veil_dir: *const u8,
+    veil_dir_len: usize,
+    device_id: *const u8,
+    changed_out: *mut u8,
+    err_out: *mut *mut c_char,
+) -> c_int {
+    unsafe {
+        clear_err(err_out);
+    }
+    if phrase.is_null() || device_id.is_null() {
+        unsafe {
+            write_err(err_out, "phrase or device_id is NULL");
+        }
+        return VEIL_ERR_INVALID_ARG;
+    }
+    if phrase_len > MAX_FFI_CSTR_LEN {
+        unsafe {
+            write_err(err_out, "phrase too long (>4 KiB)");
+        }
+        return VEIL_ERR_INVALID_ARG;
+    }
+
+    struct ZeroOnDrop {
+        ptr: *mut u8,
+        len: usize,
+    }
+    impl Drop for ZeroOnDrop {
+        fn drop(&mut self) {
+            unsafe { volatile_wipe(self.ptr, self.len) };
+        }
+    }
+    let _guard = ZeroOnDrop {
+        ptr: phrase,
+        len: phrase_len,
+    };
+
+    let bytes = unsafe { std::slice::from_raw_parts(phrase as *const u8, phrase_len) };
+    let Ok(text) = std::str::from_utf8(bytes) else {
+        unsafe {
+            write_err(err_out, "phrase is not valid UTF-8");
+        }
+        return VEIL_ERR_INVALID_ARG;
+    };
+    let Some(dir_str) = (unsafe { slice_to_str(veil_dir, veil_dir_len) }) else {
+        unsafe {
+            write_err(err_out, "veil_dir is NULL or invalid UTF-8");
+        }
+        return VEIL_ERR_INVALID_ARG;
+    };
+    let seed = match veil_identity::master_seed::decode_master_seed_from_phrase(text) {
+        Ok(s) => s,
+        Err(e) => {
+            unsafe {
+                write_err(err_out, format!("decode phrase: {e}"));
+            }
+            return VEIL_ERR;
+        }
+    };
+    let mut id = [0u8; 32];
+    id.copy_from_slice(unsafe { std::slice::from_raw_parts(device_id, 32) });
+
+    let now_unix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+
+    match veil_identity::sovereign_flow::revoke_identity_device(
+        std::path::Path::new(dir_str),
+        veil_identity::sovereign_flow::MasterSecret::Seed(seed),
+        &id,
+        now_unix,
+    ) {
+        Ok(changed) => {
+            if !changed_out.is_null() {
+                unsafe { *changed_out = u8::from(changed) };
+            }
+            VEIL_OK
+        }
+        Err(e) => {
+            unsafe {
+                write_err(err_out, format!("revoke_identity_device: {e}"));
+            }
+            VEIL_ERR
+        }
+    }
+}
+
 /// The master Ed25519 secret out of a node config, or the `VEIL_ERR_*` to
 /// return. Shared by the two config-taking identity entry points so they
 /// cannot drift on what counts as a usable config.

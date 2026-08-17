@@ -127,6 +127,8 @@ pub enum VerifyError {
     },
     #[error("identity_document: identity_key[{idx}] master certification invalid")]
     CertSigInvalid { idx: usize },
+    #[error("identity_document: revocation tombstone {idx} master signature invalid")]
+    RevocationSigInvalid { idx: usize },
     #[error(
         "identity_document: sig_key_idx {sig_key_idx} out of bounds \
          ({n_keys} keys)"
@@ -233,6 +235,20 @@ pub fn verify_identity_document(
         }
         // 4c. Master cert.
         verify_identity_key_cert(doc, key).map_err(|_| VerifyError::CertSigInvalid { idx })?;
+    }
+
+    // 4d. Every revocation tombstone must carry the MASTER's signature.
+    // Unsigned tombstones would let any device that can re-sign a document
+    // permanently revoke any other; signed ones carry the same authority a
+    // key cert does. (decode already enforced ordering, uniqueness and the
+    // no-live-and-revoked contradiction.)
+    for (idx, revoked) in doc.revoked_devices.iter().enumerate() {
+        let msg = veil_proto::identity_document::RevokedDevice::signing_message(
+            &doc.node_id,
+            &revoked.device_id,
+        );
+        verify_sig_raw(doc.master_algo, &doc.master_pubkey, &msg, &revoked.master_sig)
+            .map_err(|_| VerifyError::RevocationSigInvalid { idx })?;
     }
 
     // 5. sig_key_idx bounds.
@@ -780,6 +796,7 @@ mod tests {
             valid_until_unix: valid_until,
             sig_key_idx: 0,
             identity_keys: vec![identity_key],
+            revoked_devices: Vec::new(),
             document_sig: Vec::new(),
         };
 

@@ -521,6 +521,7 @@ mod tests {
                 master_sig: vec![0u8; 64],
             }],
             sig_key_idx: 0,
+            revoked_devices: Vec::new(),
             document_sig: vec![0u8; 64],
         };
 
