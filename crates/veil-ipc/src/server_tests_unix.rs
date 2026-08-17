@@ -330,6 +330,8 @@ async fn e2e_local_send_delivers_to_receiver() {
     let src_app_id = ok_b.app_id;
 
     let send = AppIpcSendPayload {
+
+        my_other_devices: false,
         src_app_id,
         dst_node_id: node_id(), // same node
         app_id: target_app_id,
@@ -465,6 +467,8 @@ async fn slow_reader_does_not_block_server() {
     let ok_b = AppBindOkPayload::decode(&bind_body).unwrap();
 
     let send = AppIpcSendPayload {
+
+        my_other_devices: false,
         src_app_id: ok_b.app_id,
         dst_node_id: node_id(),
         app_id: ok.app_id,
@@ -946,6 +950,7 @@ async fn ipc_send_relay_via_route_cache() {
     // Send APP_IPC_SEND with dst=C (no direct session, but B is the relay).
     let app_id = [0xAAu8; 32];
     let send = AppIpcSendPayload {
+        my_other_devices: false,
         src_app_id,
         dst_node_id: c_id,
         app_id,
@@ -1003,6 +1008,7 @@ async fn ipc_send_relay_via_route_cache() {
     let mut sealed = veil_proto::ipc::RELAY_MEDIA_SEALED_MAGIC.to_vec();
     sealed.extend_from_slice(&[0x5au8; 96]);
     let compact_send = AppIpcSendPayload {
+        my_other_devices: false,
         src_app_id,
         dst_node_id: c_id,
         app_id,
@@ -1039,6 +1045,7 @@ async fn ipc_send_relay_via_route_cache() {
     // rollout and some old decoders reject optional trailing extensions.
     let compat_payload = b"call-control".to_vec();
     let compat_send = AppIpcSendPayload {
+        my_other_devices: false,
         src_app_id,
         dst_node_id: c_id,
         app_id,
@@ -1280,6 +1287,7 @@ async fn spoofed_src_app_id_is_rejected() {
     // Send with a DIFFERENT (spoofed) src_app_id — all 0x55 bytes.
     let spoofed_src = [0x55u8; 32];
     let send = AppIpcSendPayload {
+        my_other_devices: false,
         src_app_id: spoofed_src,
         dst_node_id: [0xCCu8; 32],
         app_id: [0xAAu8; 32],
@@ -1519,6 +1527,7 @@ async fn full_delivery_channel_drops_frame_and_increments_counter() {
             .send(AppMessage::Deliver {
                 src_node_id: [i; 32],
                 provenance: veil_proto::SenderProvenance::SessionPeer,
+                sender_device_id: None,
                 src_app_id: [0u8; 32],
                 app_id: [0u8; 32],
                 endpoint_id: 1,
@@ -1622,6 +1631,8 @@ async fn anonymous_send_payload_starts_with_meta_e2e_marker() {
     let ok = AppBindOkPayload::decode(&body).unwrap();
 
     let send = AppIpcSendPayload {
+
+        my_other_devices: false,
         src_app_id: ok.app_id,
         dst_node_id: c_id,
         app_id: [0xAAu8; 32],
@@ -1725,6 +1736,8 @@ async fn acknowledged_oversized_send_registers_one_complete_chunk_batch() {
     let app = AppBindOkPayload::decode(&body).unwrap();
 
     let ordinary = AppIpcSendPayload {
+
+        my_other_devices: false,
         src_app_id: app.app_id,
         dst_node_id: destination,
         app_id: [0x34; 32],
@@ -1767,6 +1780,7 @@ async fn acknowledged_oversized_send_registers_one_complete_chunk_batch() {
 
     let payload_len = MAX_ENVELOPE_PAYLOAD + MAX_CHUNK_PAYLOAD + 7;
     let send = AppIpcSendPayload {
+        my_other_devices: false,
         src_app_id: app.app_id,
         dst_node_id: destination,
         app_id: [0x34; 32],

@@ -720,6 +720,9 @@ async fn forward_endpoint(
             AppMessage::Deliver {
                 src_node_id,
                 provenance,
+                // Relay-internal (mailbox box authorization) — AppDeliverPayload
+                // has no field for it, deliberately: no wire change.
+                sender_device_id: _,
                 src_app_id,
                 app_id,
                 endpoint_id,
