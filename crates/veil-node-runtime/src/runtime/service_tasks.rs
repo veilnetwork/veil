@@ -2801,6 +2801,23 @@ impl NodeRuntime {
         let Some(ratchet_runtime) = self.dispatcher.crypto.ratchet.clone() else {
             unreachable!("the dispatcher is always built with a ratchet runtime")
         };
+        // Defect №35, sender-side feedback: a peer answering AppSendUnopenable
+        // has just refused something we sealed — a wedged conversation, or a
+        // frame keyed to a sibling device of its family. The dispatcher
+        // forgets the conversation; THIS closure is what keeps the re-key from
+        // re-sealing to the identical wrong row the resolver still holds
+        // cached (30-minute TTL). Set in-place on the shared slot because the
+        // dispatcher (and its session clones) were built before this resolver
+        // existed.
+        {
+            let resolver = Arc::clone(&dht_key_resolver);
+            *self
+                .dispatcher
+                .peer_cert_invalidate
+                .lock()
+                .unwrap_or_else(|p| p.into_inner()) =
+                Some(Arc::new(move |peer: &[u8; 32]| resolver.invalidate_peer(peer)));
+        }
         let relay_key_resolver: Arc<dyn veil_types::RelayKeyResolver> =
             dht_key_resolver as Arc<dyn veil_types::RelayKeyResolver>;
         // Authenticated anonymous (onion/rendezvous) sender for the IPC
@@ -2825,6 +2842,16 @@ impl NodeRuntime {
             .with_route_updated(route_updated)
             .with_e2e_keys(Arc::clone(&self.identity.peer_mlkem_keys))
             .with_mlkem_ek_resolver(mlkem_ek_resolver)
+            // Defect №35, the pairing rule: the ratchet seal must resolve the
+            // cert for the DEVICE the live session terminates at, not for
+            // whichever registry row the resolver's zero-valued freshness tie
+            // happened to hand back. The session registry's validated
+            // identities are the one place that knows the far device.
+            .with_session_instance_lookup(Arc::new(
+                veil_session::glue::SessionInstanceDirectory::new(Arc::clone(
+                    &self.session_registry,
+                )),
+            ))
             .with_relay_key_resolver(relay_key_resolver)
             // The SAME conversations the frame dispatcher opens with. Two
             // stores would mean a session advanced on send and not on receive:

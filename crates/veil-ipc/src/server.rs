@@ -929,6 +929,11 @@ pub struct IpcServer {
     /// preserves the legacy "no key → NO_E2E_KEY error" semantics
     /// exactly (used by tests + setup without full NodeRuntime).
     mlkem_ek_resolver: Option<Arc<dyn veil_types::MlKemEkResolver>>,
+    /// Which DEVICE the live session to a peer identity terminates at
+    /// (defect №35) — lets the ratchet seal resolve the cert for that device
+    /// instead of the resolver's registry-tie accident. `None` (tests /
+    /// minimal setups) keeps the singular resolve exactly.
+    session_instance_lookup: Option<Arc<dyn veil_types::SessionInstanceLookup>>,
     /// One-to-one ratchet conversations, shared with the frame dispatcher.
     /// `None` on a node with no sovereign device identity, and in fixtures
     /// without a full runtime; both keep the pre-existing ML-KEM behaviour.
@@ -1128,6 +1133,7 @@ impl IpcServer {
             route_updated: None,
             peer_mlkem_keys: None,
             mlkem_ek_resolver: None,
+            session_instance_lookup: None,
             ratchet: None,
             anon_onion_sender: None,
             capture_tx: None,
@@ -1310,6 +1316,20 @@ impl IpcServer {
         resolver: Arc<dyn veil_types::MlKemEkResolver>,
     ) -> Self {
         self.mlkem_ek_resolver = Some(resolver);
+        self
+    }
+
+    /// Attach the session-instance lookup, so a session-backed ratchet seal
+    /// can resolve the recipient's cert for the DEVICE the session actually
+    /// terminates at (defect №35). Without it the seal keys to whichever
+    /// registry row the singular resolve's zero-valued freshness tie hands
+    /// back — exact for single-instance peers, 1-in-N for a family.
+    #[must_use]
+    pub fn with_session_instance_lookup(
+        mut self,
+        lookup: Arc<dyn veil_types::SessionInstanceLookup>,
+    ) -> Self {
+        self.session_instance_lookup = Some(lookup);
         self
     }
 
@@ -1747,6 +1767,7 @@ impl IpcServer {
                         let route_updated = self.route_updated.clone();
                         let peer_mlkem_keys = self.peer_mlkem_keys.clone();
                         let mlkem_ek_resolver = self.mlkem_ek_resolver.clone();
+                        let session_instance_lookup = self.session_instance_lookup.clone();
                         let ratchet = self.ratchet.clone();
                         let anon_onion_sender = self.anon_onion_sender.clone();
                         let capture_tx = self.capture_tx.clone();
@@ -1811,7 +1832,7 @@ impl IpcServer {
                             // operators can diagnose IPC disconnects without
                             // strace. Tracing is wired in at log-level WARN
                             // by the daemon binary.
-                            if let Err(e) = handle_ipc_client(stream, registry, streams, node_id, max_rate, tx_reg, route_cache, route_updated, peer_mlkem_keys, mlkem_ek_resolver, ratchet, anon_onion_sender, capture_tx, trace_sample_rate, pending_ack, pending_recursive, app_socket_dir, metrics, anycast_service, hint_registry, mobile_event_sink, local_identity_algo, local_identity_pubkey, local_relay_x25519_pubkey, peer_list_provider, bootstrap_join_sink, mobile_status_provider, event_bus, push_envelope_sink, mailbox_backend, mailbox_crypto_sink, outbox_backend, rendezvous_resolver, relay_key_resolver, bootstrap_invite_create_sink, pair_source_sink, pair_target_sink, pnet_status_provider, listen_transports_provider, hole_punch_driver, stream_bridge).await {
+                            if let Err(e) = handle_ipc_client(stream, registry, streams, node_id, max_rate, tx_reg, route_cache, route_updated, peer_mlkem_keys, mlkem_ek_resolver, session_instance_lookup, ratchet, anon_onion_sender, capture_tx, trace_sample_rate, pending_ack, pending_recursive, app_socket_dir, metrics, anycast_service, hint_registry, mobile_event_sink, local_identity_algo, local_identity_pubkey, local_relay_x25519_pubkey, peer_list_provider, bootstrap_join_sink, mobile_status_provider, event_bus, push_envelope_sink, mailbox_backend, mailbox_crypto_sink, outbox_backend, rendezvous_resolver, relay_key_resolver, bootstrap_invite_create_sink, pair_source_sink, pair_target_sink, pnet_status_provider, listen_transports_provider, hole_punch_driver, stream_bridge).await {
                                 eprintln!("[veil-ipc] client disconnected: {e} (kind={:?})", e.kind());
                             }
                             };
@@ -2005,6 +2026,7 @@ async fn handle_ipc_client(
     route_updated: Option<Arc<tokio::sync::Notify>>,
     peer_mlkem_keys: Option<Arc<std::sync::RwLock<veil_e2e::PeerMlKemCache>>>,
     mlkem_ek_resolver: Option<Arc<dyn veil_types::MlKemEkResolver>>,
+    session_instance_lookup: Option<Arc<dyn veil_types::SessionInstanceLookup>>,
     ratchet: Option<veil_e2e::RatchetRuntime>,
     anon_onion_sender: Option<Arc<dyn veil_types::AnonOnionSender>>,
     capture_tx: Option<
@@ -2364,6 +2386,7 @@ async fn handle_ipc_client(
                                 route_updated:       route_updated.clone(),
                                 peer_mlkem_keys:     peer_mlkem_keys.clone(),
                                 mlkem_ek_resolver:   mlkem_ek_resolver.clone(),
+                                session_instance_lookup: session_instance_lookup.clone(),
                                 ratchet:             ratchet.clone(),
                                 anon_onion_sender:   anon_onion_sender.clone(),
                                 capture_tx:          capture_tx.clone(),

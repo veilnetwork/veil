@@ -86,6 +86,20 @@ const CERT_CACHE_TTL: Duration = Duration::from_secs(30 * 60);
 pub type PeerMlKemCertCache =
     std::collections::HashMap<[u8; 32], (VerifiedMlkemCert, std::time::Instant)>;
 
+/// `(node_id, instance_id) → (verified cert, when-resolved)` — the
+/// per-DEVICE sibling of [`PeerMlKemCertCache`].
+///
+/// The node-keyed cache holds ONE row per identity and so cannot answer "the
+/// certificate of the device my session terminates at" for a multi-device
+/// peer: whichever row it holds is the one the singular walk's zero-valued
+/// freshness tie handed it. The targeted resolve
+/// ([`DhtMlKemEkResolver::fetch_verified_cert_for_instance`]) caches here
+/// instead, keyed by the device it was actually asked about, and deliberately
+/// does NOT write the node-keyed caches — those answer the broader
+/// identity-shaped question and must keep answering it unchanged.
+pub type PeerInstanceCertCache =
+    std::collections::HashMap<([u8; 32], [u8; 16]), (VerifiedMlkemCert, std::time::Instant)>;
+
 /// DHT-driven impl of [`MlKemEkResolver`].  Wraps the same set of
 /// `Arc`-shared runtime components that `NodeRuntime::dht_recursive_get`
 /// uses, plus a write-through to `peer_mlkem_keys` cache.
@@ -107,6 +121,12 @@ pub struct DhtMlKemEkResolver {
     /// the other resolver instance over `self.identity` so live + seal paths
     /// warm each other.
     cert_cache: Arc<RwLock<PeerMlKemCertCache>>,
+    /// Per-device verified-cert cache (see [`PeerInstanceCertCache`]). Built
+    /// fresh per resolver rather than threaded through `new` like `cert_cache`:
+    /// its one consumer is the direct-session seal path, which talks to the
+    /// long-lived IPC-server resolver, so there is no second instance to share
+    /// warmth with.
+    instance_cert_cache: Arc<RwLock<PeerInstanceCertCache>>,
     logger: Arc<NodeLogger>,
     step_timeout: Duration,
     /// Verified-cert cache TTL. Defaults to [`CERT_CACHE_TTL`]; overridable
@@ -138,6 +158,7 @@ impl DhtMlKemEkResolver {
             peer_mlkem_keys,
             peer_ratchet_keys,
             cert_cache,
+            instance_cert_cache: Arc::new(RwLock::new(PeerInstanceCertCache::new())),
             logger,
             step_timeout: DEFAULT_STEP_TIMEOUT,
             cert_ttl: CERT_CACHE_TTL,
@@ -356,6 +377,14 @@ impl DhtMlKemEkResolver {
                 return None;
             }
         };
+        // NOT a real choice for a multi-device peer: every published row
+        // carries `last_seen_unix_ms = 0` (the registry is deliberately
+        // byte-identical across devices — see `sovereign.rs::
+        // all_instance_entries`), so `max_by_key` returns whichever row the
+        // iterator happened to end on. That is fine for the single-instance
+        // peers this walk was built for, and it is why a caller that knows
+        // which device it is talking to must use
+        // [`Self::fetch_verified_cert_for_instance`] instead of this.
         let instance = reg.instances.iter().max_by_key(|i| i.last_seen_unix_ms)?;
 
         // ── Step 3: MlKemKeyCert ────────────────────────────────────
@@ -410,6 +439,141 @@ impl DhtMlKemEkResolver {
             ),
         );
         Some(verified)
+    }
+
+    /// The certificate of ONE NAMED DEVICE of the recipient — the resolve the
+    /// direct-session seal path must use when the session says which device it
+    /// terminates at.
+    ///
+    /// Defect №35: [`Self::fetch_verified_cert`] and the session answered the
+    /// question "which device of the family" INDEPENDENTLY — the cert by an
+    /// all-zero `last_seen_unix_ms` tie (i.e. by iterator accident), the
+    /// session by whichever device rendezvous happened to resolve — and in a
+    /// five-device family the two answers disagree 4/5 of the time. The frame
+    /// then goes down the one live session, arrives at a device it was not
+    /// keyed to, is refused as `NotForThisDevice`, and the sender — never told
+    /// — re-sends its prologue every ~9 s forever. Resolving BY the session's
+    /// validated instance removes the second answer.
+    ///
+    /// The cert slot is directly addressable
+    /// (`MlKemKeyCert::dht_key(node_id, instance_id)`), so this skips the
+    /// InstanceRegistry round: the registry's only job in the singular walk is
+    /// choosing an instance, and here the session already chose. Verification
+    /// is unchanged — the same `verify_mlkem_cert` against the same verified
+    /// document — plus a check that the fetched cert names the instance it was
+    /// asked for, so a mis-stored row cannot re-open the mismatch this exists
+    /// to close.
+    pub async fn fetch_verified_cert_for_instance(
+        &self,
+        target_node_id: [u8; 32],
+        instance_id: [u8; 16],
+    ) -> Option<VerifiedMlkemCert> {
+        // ── Step 0: fast paths ──────────────────────────────────────
+        // The per-device cache first; then the node-keyed cache, but only when
+        // the row it holds already names this device (common for the
+        // single-instance peer, where the two questions coincide).
+        if let Some((cert, ts)) = rlock!(self.instance_cert_cache).get(&(target_node_id, instance_id))
+            && ts.elapsed() < self.cert_ttl
+        {
+            let cert = cert.clone();
+            self.log_dbg("mlkem_resolver.instance_cert.cache_hit", &target_node_id, "");
+            self.publish_ratchet_key(target_node_id, &cert);
+            return Some(cert);
+        }
+        if let Some((cert, ts)) = rlock!(self.cert_cache).get(&target_node_id)
+            && ts.elapsed() < self.cert_ttl
+            && cert.instance_id == instance_id
+        {
+            let cert = cert.clone();
+            self.publish_ratchet_key(target_node_id, &cert);
+            return Some(cert);
+        }
+
+        // ── Step 1: IdentityDocument (same walk as the singular resolve) ────
+        let doc = self.fetch_verified_document(target_node_id, None).await?;
+        let now_unix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()?
+            .as_secs();
+
+        // ── Step 2: MlKemKeyCert at the named device's slot ─────────
+        // Freshest-of-candidates by the cert's own supersede order, exactly as
+        // in the singular walk (see the Step-3 comment there for why
+        // first-replica-wins was a production message-loss path).
+        let cert_key = MlKemKeyCert::dht_key(&target_node_id, &instance_id);
+        let cert = match self
+            .dht_get_freshest(
+                cert_key,
+                |b| {
+                    MlKemKeyCert::decode(b)
+                        .ok()
+                        .filter(|c| verify_mlkem_cert(c, &doc, now_unix).is_ok())
+                },
+                |c| (c.cert_version, c.valid_from_unix),
+            )
+            .await
+        {
+            Some(c) => c,
+            None => {
+                self.log_dbg("mlkem_resolver.instance_cert.dht_miss", &target_node_id, "");
+                return None;
+            }
+        };
+        let verified = verify_mlkem_cert(&cert, &doc, now_unix)
+            .map_err(|e| {
+                self.log_dbg(
+                    "mlkem_resolver.instance_cert.verify_failed",
+                    &target_node_id,
+                    &format!("{e:?}"),
+                )
+            })
+            .ok()?;
+        if verified.instance_id != instance_id {
+            self.log_dbg(
+                "mlkem_resolver.instance_cert.instance_mismatch",
+                &target_node_id,
+                "cert slot returned a different device's certificate",
+            );
+            return None;
+        }
+
+        // ── Step 3: cache writeback ────────────────────────────────
+        // The per-device cache and the receive path's device key — NOT the
+        // node-keyed caches: they answer the identity-shaped question and this
+        // resolve answered a narrower one. The ratchet-key write is right
+        // because the peer's inbound frames come from the device at the far
+        // end of the session, which is exactly the device this resolved.
+        lru_insert(
+            &self.instance_cert_cache,
+            (target_node_id, instance_id),
+            (verified.clone(), std::time::Instant::now()),
+        );
+        self.publish_ratchet_key(target_node_id, &verified);
+        self.logger.debug(
+            "mlkem_resolver.instance_cert.resolved",
+            format!(
+                "target={} instance={}",
+                hex8(&target_node_id),
+                veil_util::bytes_to_hex(&instance_id[..4]),
+            ),
+        );
+        Some(verified)
+    }
+
+    /// Drop every locally-cached certificate row for `target_node_id`, so the
+    /// next seal to that peer re-resolves instead of re-serving the cache.
+    ///
+    /// This is the sender-side half of the `AppSendUnopenable` feedback: the
+    /// peer just told us it cannot open what we sealed (`NotForThisDevice` —
+    /// keyed to a sibling device — or a dropped wedged conversation). The
+    /// ratchet conversation is forgotten by the dispatcher, but the
+    /// verified-cert cache would keep re-issuing the same wrong row for the
+    /// rest of its 30-minute TTL, re-wedging every re-key. The EK cache goes
+    /// with it — same material, same staleness.
+    pub fn invalidate_peer(&self, target_node_id: &[u8; 32]) {
+        wlock!(self.cert_cache).remove(target_node_id);
+        wlock!(self.instance_cert_cache).retain(|(node_id, _), _| node_id != target_node_id);
+        wlock!(self.peer_mlkem_keys).remove(target_node_id);
     }
 
     /// Every instance of the recipient, so a message reaches every device of
@@ -940,14 +1104,19 @@ where
     out
 }
 
-/// A per-peer cache keyed by node id, whose values carry when they were
-/// written so the bound can evict the oldest.
-type TimestampedPeerCache<V> =
-    Arc<RwLock<std::collections::HashMap<[u8; 32], (V, std::time::Instant)>>>;
+/// A per-peer cache — keyed by node id, or by `(node id, instance id)` for
+/// the per-device variant — whose values carry when they were written so the
+/// bound can evict the oldest.
+type TimestampedPeerCache<K, V> =
+    Arc<RwLock<std::collections::HashMap<K, (V, std::time::Instant)>>>;
 
 /// Insert into a `MAX_PEER_MLKEM_CACHE`-bounded map, evicting the oldest entry
 /// by its recorded timestamp when full.
-fn lru_insert<V>(cache: &TimestampedPeerCache<V>, key: [u8; 32], value: (V, std::time::Instant)) {
+fn lru_insert<K: Eq + std::hash::Hash + Copy, V>(
+    cache: &TimestampedPeerCache<K, V>,
+    key: K,
+    value: (V, std::time::Instant),
+) {
     let mut c = wlock!(cache);
     if c.len() >= veil_proto::budget::MAX_PEER_MLKEM_CACHE
         && !c.contains_key(&key)
@@ -1011,6 +1180,69 @@ impl DhtMlKemEkResolver {
         self.log_dbg("mlkem_resolver.cert.local_hit", &target_node_id, "");
         Some(verified)
     }
+
+    /// The named device's certificate from local records only — the sync
+    /// counterpart of [`fetch_verified_cert_for_instance`](Self::fetch_verified_cert_for_instance),
+    /// mirroring [`cached_cert`](Self::cached_cert): caches first, then the
+    /// persistent local DHT mirror, never accepting unverified bytes.
+    fn cached_cert_for_instance(
+        &self,
+        target_node_id: [u8; 32],
+        instance_id: [u8; 16],
+    ) -> Option<VerifiedMlkemCert> {
+        if let Some((cert, ts)) = rlock!(self.instance_cert_cache).get(&(target_node_id, instance_id))
+            && ts.elapsed() < self.cert_ttl
+        {
+            let cert = cert.clone();
+            self.publish_ratchet_key(target_node_id, &cert);
+            return Some(cert);
+        }
+        // The node-keyed row, only when it happens to name this device — a
+        // mismatch is a miss, never a substitution.
+        if let Some((cert, ts)) = rlock!(self.cert_cache).get(&target_node_id)
+            && ts.elapsed() < self.cert_ttl
+            && cert.instance_id == instance_id
+        {
+            let cert = cert.clone();
+            self.publish_ratchet_key(target_node_id, &cert);
+            return Some(cert);
+        }
+
+        let now_unix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()?
+            .as_secs();
+        let doc = IdentityDocument::decode(
+            &self
+                .dht
+                .get_local(&IdentityDocument::dht_key(&target_node_id))?,
+        )
+        .ok()?;
+        if doc.node_id != target_node_id || verify_identity_document(&doc, now_unix).is_err() {
+            return None;
+        }
+        // Straight to the named device's cert slot — no registry read, same
+        // reasoning as the async walk: the registry only chooses an instance,
+        // and the caller already chose.
+        let cert = MlKemKeyCert::decode(
+            &self
+                .dht
+                .get_local(&MlKemKeyCert::dht_key(&target_node_id, &instance_id))?,
+        )
+        .ok()?;
+        let verified = verify_mlkem_cert(&cert, &doc, now_unix).ok()?;
+        if verified.instance_id != instance_id {
+            return None;
+        }
+        lru_insert(
+            &self.instance_cert_cache,
+            (target_node_id, instance_id),
+            (verified.clone(), std::time::Instant::now()),
+        );
+        self.publish_ratchet_key(target_node_id, &verified);
+        self.log_dbg("mlkem_resolver.instance_cert.local_hit", &target_node_id, "");
+        Some(verified)
+    }
 }
 
 /// A verified certificate, restated in the Tier-0 shape the send path takes.
@@ -1040,6 +1272,29 @@ impl MlKemEkResolver for DhtMlKemEkResolver {
     > {
         Box::pin(async move {
             self.fetch_verified_cert(target_node_id)
+                .await
+                .map(to_peer_cert)
+        })
+    }
+
+    fn resolve_cert_for_instance_cached(
+        &self,
+        target_node_id: NodeIdBytes,
+        instance_id: [u8; 16],
+    ) -> Option<veil_types::VerifiedPeerCert> {
+        self.cached_cert_for_instance(target_node_id, instance_id)
+            .map(to_peer_cert)
+    }
+
+    fn resolve_cert_for_instance(
+        &self,
+        target_node_id: NodeIdBytes,
+        instance_id: [u8; 16],
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Option<veil_types::VerifiedPeerCert>> + Send + '_>,
+    > {
+        Box::pin(async move {
+            self.fetch_verified_cert_for_instance(target_node_id, instance_id)
                 .await
                 .map(to_peer_cert)
         })
@@ -1183,9 +1438,13 @@ mod tests {
     }
 
     fn dummy_cert(node_id: [u8; 32]) -> VerifiedMlkemCert {
+        dummy_cert_with_instance(node_id, [0xab; 16])
+    }
+
+    fn dummy_cert_with_instance(node_id: [u8; 32], instance_id: [u8; 16]) -> VerifiedMlkemCert {
         VerifiedMlkemCert {
             node_id,
-            instance_id: [0xab; 16],
+            instance_id,
             mlkem_algo: 1,
             mlkem_pubkey: vec![0x42; 32],
             ratchet_x25519_pubkey: [0x5A; 32],
@@ -1241,6 +1500,122 @@ mod tests {
         assert_eq!(got.mlkem_ek, vec![0x42; 32]);
         assert_eq!(got.cert_version, 7);
         assert_eq!(resolver.resolve_cert_cached([8u8; 32]), None);
+    }
+
+    // Defect №35: the targeted resolve must return the row of the DEVICE IT
+    // WAS ASKED FOR, never the node-keyed cache's row for a different device.
+    // That node-keyed row is the singular walk's zero-valued freshness tie —
+    // an iterator accident — and serving it here would re-open the exact
+    // mismatch (sealed for one device, delivered to another) this surface
+    // exists to close.
+    #[test]
+    fn resolve_cert_for_instance_cached_returns_the_named_row_not_the_tie_accident() {
+        let dht = Arc::new(KademliaService::new([1u8; 32]));
+        let target = [9u8; 32];
+        let accident = [0xab; 16]; // what the singular cache holds
+        let session_device = [0xcd; 16]; // what the session terminates at
+        let cert_cache = Arc::new(RwLock::new(PeerMlKemCertCache::new()));
+        wlock!(cert_cache).insert(
+            target,
+            (
+                dummy_cert_with_instance(target, accident),
+                std::time::Instant::now(),
+            ),
+        );
+        let resolver = make_test_resolver_with_cert_cache(dht, cert_cache);
+        wlock!(resolver.instance_cert_cache).insert(
+            (target, session_device),
+            (
+                dummy_cert_with_instance(target, session_device),
+                std::time::Instant::now(),
+            ),
+        );
+
+        let got = resolver
+            .resolve_cert_for_instance_cached(target, session_device)
+            .expect("the per-device row");
+        assert_eq!(got.instance_id, session_device);
+
+        // The node-keyed row IS served when it happens to name the requested
+        // device — the two questions coincide for a single-instance peer.
+        let got = resolver
+            .resolve_cert_for_instance_cached(target, accident)
+            .expect("the singular row, because it matches");
+        assert_eq!(got.instance_id, accident);
+
+        // A device nothing holds a row for is a MISS, never a substitution.
+        assert_eq!(
+            resolver.resolve_cert_for_instance_cached(target, [0xee; 16]),
+            None
+        );
+    }
+
+    // With no peers configured a real walk yields None, so a `Some(_)` can
+    // only have come from the per-device cache — same proof shape as the
+    // singular fast-path test above.
+    #[tokio::test]
+    async fn fetch_verified_cert_for_instance_serves_a_fresh_cache_entry_without_dht() {
+        let dht = Arc::new(KademliaService::new([1u8; 32]));
+        let target = [9u8; 32];
+        let device = [0xcd; 16];
+        let resolver = make_test_resolver(dht);
+        wlock!(resolver.instance_cert_cache).insert(
+            (target, device),
+            (
+                dummy_cert_with_instance(target, device),
+                std::time::Instant::now(),
+            ),
+        );
+        assert_eq!(
+            resolver.fetch_verified_cert_for_instance(target, device).await,
+            Some(dummy_cert_with_instance(target, device)),
+        );
+        // TTL is enforced on this cache too: expired means the peerless walk,
+        // which yields None.
+        let resolver = resolver.with_cert_ttl(Duration::from_secs(0));
+        assert_eq!(
+            resolver.fetch_verified_cert_for_instance(target, device).await,
+            None,
+        );
+    }
+
+    // The sender-side half of the AppSendUnopenable feedback: after the peer
+    // refuses a frame, EVERY cached row for it must go — cert, per-device
+    // certs, and the EK — or the 30-minute TTL re-issues the refused material
+    // to the very re-key the feedback triggered.
+    #[test]
+    fn invalidating_a_peer_drops_every_cached_row_and_only_its_own() {
+        let dht = Arc::new(KademliaService::new([1u8; 32]));
+        let target = [9u8; 32];
+        let bystander = [7u8; 32];
+        let cert_cache = Arc::new(RwLock::new(PeerMlKemCertCache::new()));
+        wlock!(cert_cache).insert(target, (dummy_cert(target), std::time::Instant::now()));
+        wlock!(cert_cache).insert(
+            bystander,
+            (dummy_cert(bystander), std::time::Instant::now()),
+        );
+        let resolver = make_test_resolver_with_cert_cache(dht, Arc::clone(&cert_cache));
+        for instance in [[0x01; 16], [0x02; 16]] {
+            wlock!(resolver.instance_cert_cache).insert(
+                (target, instance),
+                (
+                    dummy_cert_with_instance(target, instance),
+                    std::time::Instant::now(),
+                ),
+            );
+        }
+        wlock!(resolver.peer_mlkem_keys)
+            .insert(target, (vec![0x42; 32], std::time::Instant::now()));
+
+        resolver.invalidate_peer(&target);
+
+        assert!(rlock!(cert_cache).get(&target).is_none());
+        assert!(rlock!(resolver.instance_cert_cache).is_empty());
+        assert!(rlock!(resolver.peer_mlkem_keys).get(&target).is_none());
+        assert!(
+            rlock!(cert_cache).get(&bystander).is_some(),
+            "a peer's refusal must not evict anyone else's rows"
+        );
     }
 
     // The receive path decides sender provenance synchronously and cannot walk

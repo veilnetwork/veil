@@ -1095,6 +1095,10 @@ impl NodeRuntime {
             // strong controller.
             rendezvous_weak: Arc::clone(&self.dispatcher.rendezvous_weak),
             session_registry: Some(Arc::clone(&self.session_registry)),
+            // The same shared slot: a reload rebuilds the dispatcher, and a
+            // fresh empty slot here would silently detach the №35 feedback
+            // (peer says "unopenable" → nothing invalidates the cert cache).
+            peer_cert_invalidate: Arc::clone(&self.dispatcher.peer_cert_invalidate),
             route_seen_set: Arc::new(Mutex::new(veil_dispatcher::RouteSeenSet::new(
                 std::time::Duration::from_secs(config.routing.route_seen_window_secs),
                 config.routing.route_seen_capacity,

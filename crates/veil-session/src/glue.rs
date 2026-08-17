@@ -47,3 +47,33 @@ impl veil_types::FrameBroadcaster for SessionTxBroadcaster {
         rlock!(self.inner).active_node_ids().into_iter().collect()
     }
 }
+
+/// Adapter exposing [`SessionRegistry`](crate::manager::SessionRegistry) as
+/// [`veil_types::SessionInstanceLookup`] — the same shape as
+/// [`SessionTxBroadcaster`], for the same reason: veil-ipc's send path needs
+/// one answer ("which DEVICE is at the far end of the session to this
+/// identity?") without importing the registry concretely, which its crate
+/// tier forbids.
+pub struct SessionInstanceDirectory {
+    inner: Arc<std::sync::Mutex<crate::manager::SessionRegistry>>,
+}
+
+impl SessionInstanceDirectory {
+    pub fn new(inner: Arc<std::sync::Mutex<crate::manager::SessionRegistry>>) -> Self {
+        Self { inner }
+    }
+}
+
+impl veil_types::SessionInstanceLookup for SessionInstanceDirectory {
+    fn session_instance(&self, peer_node_id: &[u8; 32]) -> Option<[u8; 16]> {
+        self.inner
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get_by_peer_id(&veil_cfg::NodeId::from(*peer_node_id))
+            .and_then(|e| e.validated_sovereign_identity.as_ref())
+            // The instance the handshake's identity proof named — the one
+            // answer that is about THIS session rather than about whatever
+            // the peer's registry happened to list.
+            .map(|v| v.active_instance_id)
+    }
+}
