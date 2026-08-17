@@ -682,6 +682,18 @@ impl SovereignIdentity {
     /// each device, and an instance id is the head of the device id that is
     /// already in the entry. Two devices racing to publish now write identical
     /// bytes instead of contradicting each other.
+    ///
+    /// `last_seen_unix_ms` is 0 on every entry, DELIBERATELY, for the same
+    /// reason: stamping publish time would make each device's registry unique
+    /// again — each claiming itself (or the moment of its own publish) as
+    /// freshest — and whichever wrote last would once more decide what peers
+    /// see, which is the exact contradiction this derivation removed. The
+    /// cost is that the field cannot rank instances (defect №35: a resolver
+    /// `max_by_key` over all-zero values picks a row by iterator accident),
+    /// so nothing may use it to choose a device; a sender that knows which
+    /// device it is talking to must ask for it by instance id
+    /// (`resolve_cert_for_instance`), and one that does not must fan out to
+    /// all of them.
     pub fn all_instance_entries(&self) -> Vec<veil_proto::instance_registry::InstanceEntry> {
         use crate::publish::build_instance_entry;
         self.document

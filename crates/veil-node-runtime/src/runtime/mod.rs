@@ -2020,6 +2020,9 @@ impl NodeRuntime {
             session_tx_registry: Some(Arc::clone(&shared_session_tx_registry)),
             rendezvous_weak: Arc::new(std::sync::Mutex::new(None)),
             session_registry: Some(Arc::clone(&shared_session_registry)),
+            // Filled in-place by the IPC wiring in `service_tasks` once the
+            // runtime resolver exists (defect №35 sender-side feedback).
+            peer_cert_invalidate: Arc::new(Mutex::new(None)),
             route_seen_set: Arc::clone(&shared_route_seen_set),
             announce_seq: Arc::clone(&shared_announce_seq),
             listen_transports: Arc::clone(&listen_transports),
