@@ -1848,10 +1848,10 @@ impl SessionRunner {
     ///
     /// Path:
     /// 1. Decode the body.  Malformed → record violation, drop.
-    /// 2. Sig-verify against the peer's handshake-attested pubkey.
-    ///    The peer_id self-binding (`node_id == BLAKE3(pubkey)`) is
-    ///    re-checked inside `verify_transport_migration_notify`; both
-    ///    must hold for the new URI to displace the cached one.
+    /// 2. Sig-verify against the peer's handshake-attested pubkey, with the
+    ///    announced `node_id` pinned to the one the handshake bound that
+    ///    pubkey to; both must hold for the new URI to displace the cached
+    ///    one.
     /// 3. Reject IF the announced `node_id` doesn't match our session's
     ///    `peer_id` — a valid sig for ANOTHER node is not authorization
     ///    to update this peer's cache entry.
@@ -1865,7 +1865,7 @@ impl SessionRunner {
     ///    peers.
     pub fn handle_transport_migration_notify_arm(&mut self, body: &[u8]) {
         use veil_proto::session::{
-            TransportMigrationNotifyPayload, verify_transport_migration_notify,
+            TransportMigrationNotifyPayload, verify_transport_migration_notify_bound,
         };
         let payload = match TransportMigrationNotifyPayload::decode(body) {
             Ok(p) => p,
@@ -1927,7 +1927,26 @@ impl SessionRunner {
             .map(|d| d.as_secs())
             .unwrap_or(0);
 
-        if let Err(e) = verify_transport_migration_notify(&payload, &pubkey, now_unix) {
+        // Verified against the binding THIS SESSION established, not against
+        // `BLAKE3(pubkey)`.
+        //
+        // The hash form is one identity per key, and a multi-device identity
+        // is not that: a delegated device signs with its own key while
+        // speaking for the identity's node_id, so its device address is never
+        // that node_id and the hash form refuses it by construction. Under it,
+        // every device but the one holding the master is unable to announce a
+        // rotation and its peers go on dialling a URI it has left — silently,
+        // since the reject is debug-only.
+        //
+        // `peer_id` is the right thing to demand instead because the handshake
+        // has already refused any peer whose key neither hashes to its claimed
+        // node_id NOR carried a verified delegation naming it, and both
+        // `peer_id` and `peer_public_key` come out of that same handshake. The
+        // `node_id != peer_id` check above still stands, so this remains a
+        // statement about THIS peer's own cache entry and nothing else.
+        if let Err(e) =
+            verify_transport_migration_notify_bound(&payload, &pubkey, now_unix, Some(&self.peer_id))
+        {
             // Replay-window failures are expected on clock-skewed peers
             // and shouldn't poison the violation tracker.  Treat ANY
             // verify failure as debug-only — a forged sig from a
