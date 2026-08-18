@@ -23,6 +23,7 @@
 //! `register` + `handle_final_introduce` to forward down the circuit in b4b.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use base64::Engine;
@@ -83,6 +84,31 @@ pub fn cookie_for_reg_pk(reg_pk: &[u8; REG_PK_LEN]) -> [u8; COOKIE_LEN] {
 pub const MAX_CIRCUIT_SUBSCRIPTIONS: usize = 10_000;
 /// Default subscription TTL — refreshed on re-register.
 pub const DEFAULT_SUBSCRIPTION_TTL_SECS: u64 = 600;
+/// Cap on subscriptions whose circuit arrived over ONE neighbour link.
+///
+/// The circuit table caps a neighbour at
+/// [`MAX_CIRCUITS_PER_LINK`](crate::circuit_table::MAX_CIRCUITS_PER_LINK) = 64
+/// concurrent circuits, and that number was the relay's whole answer to "how
+/// much state can one neighbour make me hold". It stopped being the answer
+/// when install-pressure reclaim landed: reclaim frees the TABLE slot but
+/// deliberately leaves the cookie bound, because return-forwarding does not
+/// consult the table and dropping the binding would cut the late slices of a
+/// sliced reply. The subscription therefore outlives its slot, holding an
+/// `Arc<CircuitState>` for up to [`DEFAULT_SUBSCRIPTION_TTL_SECS`].
+///
+/// A binding is reclaimable 30 s after it last served
+/// ([`SERVED_LINGER_SECS`](crate::circuit_table::SERVED_LINGER_SECS)), so a
+/// neighbour that keeps serving its own circuits can cycle its 64 slots about
+/// twenty times inside one 600 s TTL: ≈1280 live states against a quota of 64,
+/// and ~13% of the global cap from a single peer.
+///
+/// 256 is deliberately 4× the table's per-link quota rather than equal to it:
+/// the reply circuits this bounds are minted one per send and one per mailbox
+/// poll, so a cap AT the table quota would refuse a busy honest client — the
+/// exact starvation the reclaim work was undoing. See
+/// [`CircuitRendezvousRegistry::register`] for why hitting it evicts instead
+/// of refusing.
+pub const MAX_SUBSCRIPTIONS_PER_LINK: usize = 256;
 
 /// Signed registration a receiver delivers as the circuit-setup terminus
 /// payload. `reg_pk` is an Ed25519 public key (raw bytes); `signature` covers
@@ -195,12 +221,81 @@ struct Subscription {
     epoch: u64,
 }
 
+/// Subscriptions plus the per-link index that makes the ceiling cheap.
+///
+/// The index is not an optimisation of a scan that would otherwise be fine.
+/// `register` runs on every circuit build a relay accepts, and the registry
+/// holds up to `MAX_CIRCUIT_SUBSCRIPTIONS` = 10 000 entries — asking "how many
+/// does this neighbour hold" by filtering the whole map would put a
+/// 10 000-element walk on that path. Cookies, not a bare count, because the
+/// eviction has to pick a victim among one link's entries; bounded by
+/// `per_link_cap`, so the linear scans inside a bucket stay trivial. Same
+/// shape and the same reason as `circuit_table::Inner::per_link`.
+#[derive(Default)]
+struct Inner {
+    subs: HashMap<[u8; COOKIE_LEN], Subscription>,
+    per_link: HashMap<[u8; 32], Vec<[u8; COOKIE_LEN]>>,
+}
+
+impl Inner {
+    fn insert(&mut self, cookie: [u8; COOKIE_LEN], sub: Subscription) {
+        let link = sub.circuit.prev_link;
+        match self.subs.insert(cookie, sub) {
+            // A refresh keeping the same neighbour: the bucket already has it.
+            Some(prev) if prev.circuit.prev_link == link => {}
+            // A refresh that arrived over a DIFFERENT neighbour, which is the
+            // ordinary case rather than the exotic one: a service rebuilds its
+            // circuit every 150 s down a freshly chosen path and re-registers
+            // the same cookie, since the cookie follows the reg_pk and not the
+            // route. Leaving it in the old bucket would charge one link for
+            // state another link holds — the count the ceiling is measured on
+            // would stop meaning anything for both.
+            Some(prev) => {
+                self.unbucket(&prev.circuit.prev_link, &cookie);
+                self.per_link.entry(link).or_default().push(cookie);
+            }
+            None => self.per_link.entry(link).or_default().push(cookie),
+        }
+    }
+
+    /// The single removal path — teardown, TTL gc and the per-link ceiling all
+    /// go through it, so the two indices cannot drift apart.
+    fn remove(&mut self, cookie: &[u8; COOKIE_LEN]) -> Option<Subscription> {
+        let sub = self.subs.remove(cookie)?;
+        self.unbucket(&sub.circuit.prev_link, cookie);
+        Some(sub)
+    }
+
+    fn unbucket(&mut self, prev_link: &[u8; 32], cookie: &[u8; COOKIE_LEN]) {
+        let Some(cookies) = self.per_link.get_mut(prev_link) else {
+            return;
+        };
+        if let Some(pos) = cookies.iter().position(|c| c == cookie) {
+            cookies.swap_remove(pos);
+        }
+        if cookies.is_empty() {
+            self.per_link.remove(prev_link);
+        }
+    }
+
+    fn bucket_len(&self, prev_link: &[u8; 32]) -> usize {
+        self.per_link.get(prev_link).map_or(0, Vec::len)
+    }
+}
+
 /// Bounded, cookie-keyed registry of circuit-backed rendezvous subscriptions.
 /// First-registration-wins per cookie; refresh allowed for the same `reg_pk`.
 pub struct CircuitRendezvousRegistry {
-    inner: Mutex<HashMap<[u8; COOKIE_LEN], Subscription>>,
+    inner: Mutex<Inner>,
     cap: usize,
+    per_link_cap: usize,
     ttl_secs: u64,
+    /// Bindings dropped by the per-link ceiling since the last read. Counted
+    /// because an evicted binding is what later surfaces as an
+    /// `introduce.cookie_unknown` at this relay, and the periodic GC already
+    /// reports its own evictions for exactly that reason — a ceiling that
+    /// fired silently would be the one eviction nothing could account for.
+    over_link_cap_evictions: AtomicU64,
 }
 
 impl CircuitRendezvousRegistry {
@@ -209,11 +304,25 @@ impl CircuitRendezvousRegistry {
     }
 
     pub fn with_params(cap: usize, ttl_secs: u64) -> Self {
+        Self::with_link_cap(cap, MAX_SUBSCRIPTIONS_PER_LINK, ttl_secs)
+    }
+
+    pub fn with_link_cap(cap: usize, per_link_cap: usize, ttl_secs: u64) -> Self {
         Self {
-            inner: Mutex::new(HashMap::new()),
+            inner: Mutex::new(Inner::default()),
             cap: cap.max(1),
+            per_link_cap: per_link_cap.max(1),
             ttl_secs,
+            over_link_cap_evictions: AtomicU64::new(0),
         }
+    }
+
+    /// Subscriptions currently held whose circuit arrived over `prev_link`.
+    pub fn link_occupancy(&self, prev_link: &[u8; 32]) -> usize {
+        self.inner
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .bucket_len(prev_link)
     }
 
     /// Verify + record a registration, binding `payload.cookie` to `circuit`.
@@ -235,7 +344,7 @@ impl CircuitRendezvousRegistry {
             return Err(RegisterError::CookieNotBoundToKey);
         }
         let mut g = self.inner.lock().unwrap_or_else(|p| p.into_inner());
-        match g.get(&payload.cookie) {
+        let fresh_cookie = match g.subs.get(&payload.cookie) {
             Some(existing) if existing.reg_pk != payload.reg_pk => {
                 return Err(RegisterError::CookieClaimed);
             }
@@ -245,12 +354,20 @@ impl CircuitRendezvousRegistry {
             Some(existing) if payload.epoch <= existing.epoch => {
                 return Err(RegisterError::StaleEpoch);
             }
-            Some(_) => {}
+            Some(_) => false,
             None => {
-                if g.len() >= self.cap {
+                if g.subs.len() >= self.cap {
                     return Err(RegisterError::Full);
                 }
+                true
             }
+        };
+        // Per-link ceiling (see `MAX_SUBSCRIPTIONS_PER_LINK`). Only a NEW
+        // cookie can grow this link's share; a refresh replaces an entry the
+        // link already holds.
+        if fresh_cookie && Self::make_room_for_link(&mut g, &circuit.prev_link, self.per_link_cap)
+        {
+            self.over_link_cap_evictions.fetch_add(1, Ordering::Relaxed);
         }
         // Record the cookie ON the circuit so its teardown can evict this sub.
         circuit.set_registered_cookie(payload.cookie);
@@ -266,10 +383,62 @@ impl CircuitRendezvousRegistry {
         Ok(())
     }
 
+    /// Make one slot for `prev_link` when it is already at its ceiling.
+    ///
+    /// Evicting instead of refusing is the deliberate half. A refusal would
+    /// leave the originator without its `CircuitBuilt` ACK while its peer
+    /// introduces at a cookie no relay bound — the exact starvation the
+    /// install-pressure reclaim exists to end — and the client most likely to
+    /// reach a per-link ceiling is an honest one bursting sends, since one
+    /// reply circuit is minted per send and per mailbox poll.
+    ///
+    /// The victim is the binding that has ALREADY forwarded a reply and did so
+    /// longest ago: `last_served_unix` is re-armed on every forward, so the
+    /// minimum over served entries is the one whose reply finished furthest in
+    /// the past and therefore the least likely to still owe a slice. Only if
+    /// this link has served nothing at all does the oldest registration go —
+    /// a link holding 256 never-served bindings is not a caller with a reply
+    /// in flight.
+    ///
+    /// Returns whether a binding was dropped.
+    fn make_room_for_link(g: &mut Inner, prev_link: &[u8; 32], per_link_cap: usize) -> bool {
+        if g.bucket_len(prev_link) < per_link_cap {
+            return false;
+        }
+        let Some(bucket) = g.per_link.get(prev_link) else {
+            return false;
+        };
+        let served_first = |c: &&[u8; COOKIE_LEN]| {
+            g.subs
+                .get(*c)
+                .is_some_and(|s| s.circuit.last_served_unix() != 0)
+        };
+        let victim = bucket
+            .iter()
+            .filter(served_first)
+            .min_by_key(|c| g.subs.get(*c).map_or(0, |s| s.circuit.last_served_unix()))
+            .or_else(|| {
+                bucket
+                    .iter()
+                    .min_by_key(|c| g.subs.get(*c).map_or(0, |s| s.registered_unix))
+            })
+            .copied();
+        match victim {
+            Some(cookie) => g.remove(&cookie).is_some(),
+            None => false,
+        }
+    }
+
+    /// Read and reset the per-link-ceiling eviction counter — the same shape
+    /// [`Self::gc`] reports its evictions in, so both land in one log line.
+    pub fn take_over_link_cap_evictions(&self) -> u64 {
+        self.over_link_cap_evictions.swap(0, Ordering::Relaxed)
+    }
+
     /// Resolve a cookie to its circuit (for forwarding an introduce down it).
     pub fn lookup(&self, cookie: &[u8; COOKIE_LEN]) -> Option<Arc<CircuitState>> {
         let g = self.inner.lock().unwrap_or_else(|p| p.into_inner());
-        g.get(cookie).map(|s| Arc::clone(&s.circuit))
+        g.subs.get(cookie).map(|s| Arc::clone(&s.circuit))
     }
 
     /// Drop a cookie's subscription (e.g. on circuit teardown).
@@ -284,13 +453,27 @@ impl CircuitRendezvousRegistry {
     pub fn gc(&self, now_unix: u64) -> usize {
         let mut g = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         let ttl = self.ttl_secs;
-        let before = g.len();
-        g.retain(|_, s| now_unix.saturating_sub(s.registered_unix) < ttl);
-        before - g.len()
+        let expired: Vec<[u8; COOKIE_LEN]> = g
+            .subs
+            .iter()
+            .filter(|(_, s)| now_unix.saturating_sub(s.registered_unix) >= ttl)
+            .map(|(c, _)| *c)
+            .collect();
+        // Through `Inner::remove` rather than `retain`, so the per-link index
+        // is emptied with the map instead of holding cookies that no longer
+        // resolve — a stale bucket would keep counting against the ceiling.
+        for cookie in &expired {
+            g.remove(cookie);
+        }
+        expired.len()
     }
 
     pub fn len(&self) -> usize {
-        self.inner.lock().unwrap_or_else(|p| p.into_inner()).len()
+        self.inner
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .subs
+            .len()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -366,14 +549,19 @@ mod tests {
     }
 
     fn a_circuit() -> Arc<CircuitState> {
-        let t = CircuitTable::new();
+        circuit_from(&CircuitTable::new(), [0xEE; 32], 1)
+    }
+
+    /// A terminus circuit installed on `prev_link` under `cid`. The table is
+    /// passed in so several circuits can share one (ids must not collide).
+    fn circuit_from(t: &CircuitTable, prev_link: [u8; 32], cid: u32) -> Arc<CircuitState> {
         t.install(
             &CircuitInstall {
-                circuit_id_in: 1,
+                circuit_id_in: cid,
                 circuit_id_out: 0,
                 circuit_key: [9u8; 32],
             },
-            [0xEE; 32],
+            prev_link,
             None,
             0,
         )
@@ -488,6 +676,176 @@ mod tests {
         // A strictly-fresher epoch from the legitimate holder → accepted.
         let (fresher, _) = signed_with(101, &kp);
         reg.register(&fresher, a_circuit(), 2).unwrap();
+    }
+
+    /// One neighbour must not out-hold its quota by cycling table slots.
+    ///
+    /// Reclaim frees the table slot and deliberately keeps the cookie bound,
+    /// so the state survives in this registry for the full TTL. Without a
+    /// ceiling here, a link that serves its own circuits recycles its 64 table
+    /// slots every 30 s and holds ~1280 states against a quota of 64. The
+    /// ceiling has to be measured on the ORIGINATING LINK — the registry is
+    /// cookie-keyed and never learns who the receiver is — and `prev_link` is
+    /// the one thing it does know, being this relay's immediate neighbour.
+    #[test]
+    fn one_link_cannot_hold_more_than_its_ceiling() {
+        const CAP: usize = 4;
+        let reg = CircuitRendezvousRegistry::with_link_cap(1000, CAP, 600);
+        let table = CircuitTable::new();
+        let link = [0xA1u8; 32];
+
+        // Every registration is a fresh key (hence a fresh cookie) on the same
+        // neighbour — a peer minting reply circuits as fast as it likes.
+        for i in 0..(CAP as u32 * 5) {
+            let (p, _) = signed_at(1);
+            reg.register(&p, circuit_from(&table, link, i + 1), i as u64)
+                .expect("a new cookie is admitted, never refused");
+        }
+        assert_eq!(
+            reg.link_occupancy(&link),
+            CAP,
+            "the neighbour's share is bounded no matter how many it mints"
+        );
+        assert_eq!(reg.len(), CAP, "and nothing leaked into the global count");
+    }
+
+    /// The ceiling is per neighbour, not a global one wearing a disguise: a
+    /// second link's bindings must be untouched by the first filling up.
+    #[test]
+    fn the_ceiling_does_not_reach_across_links() {
+        const CAP: usize = 3;
+        let reg = CircuitRendezvousRegistry::with_link_cap(1000, CAP, 600);
+        let table = CircuitTable::new();
+        let quiet = [0xB2u8; 32];
+        let noisy = [0xC3u8; 32];
+
+        let (p, _) = signed_at(1);
+        let quiet_cookie = p.cookie;
+        reg.register(&p, circuit_from(&table, quiet, 1), 0).unwrap();
+
+        for i in 0..(CAP as u32 * 3) {
+            let (p, _) = signed_at(1);
+            reg.register(&p, circuit_from(&table, noisy, 100 + i), i as u64)
+                .unwrap();
+        }
+
+        assert!(
+            reg.lookup(&quiet_cookie).is_some(),
+            "a busy neighbour must not evict a quiet one's binding"
+        );
+        assert_eq!(reg.link_occupancy(&noisy), CAP);
+        assert_eq!(reg.link_occupancy(&quiet), 1);
+    }
+
+    /// Which binding goes matters: the one whose reply finished longest ago,
+    /// not whichever the hash map happened to hand over. A binding that has
+    /// never served — a hosted service waiting for its first introduce — is
+    /// the last thing to drop while any served one remains.
+    #[test]
+    fn eviction_takes_the_reply_that_finished_longest_ago() {
+        const CAP: usize = 3;
+        let reg = CircuitRendezvousRegistry::with_link_cap(1000, CAP, 600);
+        let table = CircuitTable::new();
+        let link = [0xD4u8; 32];
+
+        // Three bindings: one never served (a hosted service), two served —
+        // one long ago, one just now.
+        let (unserved, _) = signed_at(1);
+        reg.register(&unserved, circuit_from(&table, link, 1), 0)
+            .unwrap();
+
+        let (stale, _) = signed_at(1);
+        let stale_circuit = circuit_from(&table, link, 2);
+        stale_circuit.mark_served(100);
+        reg.register(&stale, stale_circuit, 0).unwrap();
+
+        let (recent, _) = signed_at(1);
+        let recent_circuit = circuit_from(&table, link, 3);
+        recent_circuit.mark_served(900);
+        reg.register(&recent, recent_circuit, 0).unwrap();
+
+        // A fourth arrives at the ceiling.
+        let (fourth, _) = signed_at(1);
+        reg.register(&fourth, circuit_from(&table, link, 4), 1000)
+            .unwrap();
+
+        assert!(
+            reg.lookup(&stale.cookie).is_none(),
+            "the reply that finished longest ago is the one that goes"
+        );
+        assert!(
+            reg.lookup(&recent.cookie).is_some(),
+            "a reply that just went out may still owe a slice"
+        );
+        assert!(
+            reg.lookup(&unserved.cookie).is_some(),
+            "a binding that never served has no finished reply to judge it by"
+        );
+        assert!(reg.lookup(&fourth.cookie).is_some());
+    }
+
+    /// The per-link index has to empty with the map. A bucket still holding
+    /// cookies that no longer resolve would count phantoms against the
+    /// ceiling, and the link would be evicting live bindings to make room for
+    /// entries that are already gone. Both removal paths are checked because
+    /// each is a separate chance to drift.
+    #[test]
+    fn removing_a_binding_empties_its_place_in_the_link_index() {
+        let reg = CircuitRendezvousRegistry::with_link_cap(1000, 8, 300);
+        let table = CircuitTable::new();
+        let link = [0xE5u8; 32];
+
+        let (torn_down, _) = signed_at(1);
+        reg.register(&torn_down, circuit_from(&table, link, 1), 0)
+            .unwrap();
+        let (expires, _) = signed_at(1);
+        reg.register(&expires, circuit_from(&table, link, 2), 0)
+            .unwrap();
+        assert_eq!(reg.link_occupancy(&link), 2);
+
+        reg.remove(&torn_down.cookie); // teardown path
+        assert_eq!(reg.link_occupancy(&link), 1);
+
+        assert_eq!(reg.gc(300), 1); // TTL path
+        assert_eq!(
+            reg.link_occupancy(&link),
+            0,
+            "the link's bucket must go with its last binding"
+        );
+        assert_eq!(reg.len(), 0);
+    }
+
+    /// A service rebuilds its circuit down a fresh path every 150 s and
+    /// re-registers the SAME cookie, because the cookie follows `reg_pk` and
+    /// not the route — so a refresh routinely arrives over a different
+    /// neighbour. The link index has to follow it. Left behind, one link would
+    /// be charged for state another link holds, and both counts would stop
+    /// describing anything.
+    #[test]
+    fn a_refresh_over_a_new_path_moves_the_binding_between_links() {
+        let reg = CircuitRendezvousRegistry::with_link_cap(1000, 8, 600);
+        let table = CircuitTable::new();
+        let first = [0x11u8; 32];
+        let second = [0x22u8; 32];
+
+        let kp = generate_keypair(SignatureAlgorithm::Ed25519);
+        let (initial, _) = signed_with(10, &kp);
+        reg.register(&initial, circuit_from(&table, first, 1), 0)
+            .unwrap();
+        assert_eq!(reg.link_occupancy(&first), 1);
+
+        // Same key, same cookie, fresher epoch, new neighbour.
+        let (rebuilt, _) = signed_with(11, &kp);
+        reg.register(&rebuilt, circuit_from(&table, second, 2), 150)
+            .unwrap();
+
+        assert_eq!(reg.len(), 1, "a refresh replaces, it does not add");
+        assert_eq!(
+            reg.link_occupancy(&first),
+            0,
+            "the old neighbour must stop being charged for it"
+        );
+        assert_eq!(reg.link_occupancy(&second), 1);
     }
 
     #[test]
