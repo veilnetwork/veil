@@ -135,6 +135,15 @@ pub enum SovereignIdentityError {
          (has the node been provisioned with `identity create`?)"
     )]
     FileMissing { file: &'static str, dir: String },
+    #[error(
+        "sovereign_identity: the document in `{dir}` does not verify against itself: {source} \
+         — every peer would reject this identity; refusing to run on it"
+    )]
+    DocumentInvalid {
+        dir: String,
+        #[source]
+        source: crate::verify::VerifyError,
+    },
 }
 
 impl SovereignIdentity {
@@ -328,8 +337,46 @@ impl SovereignIdentity {
     ///   on source-side devices where the doc's `sig_key_idx`
     ///   already matches.
     ///
-    /// Returns a validated [`SovereignIdentity`] handle.
+    /// Returns a validated [`SovereignIdentity`] handle: the document's own
+    /// signature chain is checked here, not merely the SK↔subkey binding.
+    ///
+    /// The SK↔subkey binding says nothing about the rest of the document. A
+    /// device whose `identity_document.bin` has been edited — a delegation
+    /// appended, a tombstone dropped, a master pubkey swapped — satisfies that
+    /// binding and starts up clean, then fails EVERY handshake, because peers
+    /// run [`verify_identity_document`] on what they receive. The
+    /// disagreement surfaces as unexplained per-peer rejections instead of one
+    /// refusal at boot, and boot is the only moment anything can name the file
+    /// that is wrong. So the chain the peers check is the chain checked here.
+    ///
+    /// Deliberately the CLOCK-FREE ladder
+    /// ([`verify_identity_document_bindings`]): a lapsed delegation is a state
+    /// this device recovers from, and the recovery path starts by loading. See
+    /// that function for why. [`Self::load_from_dir_unverified`] remains for
+    /// tooling that must inspect a document precisely BECAUSE it is broken.
+    ///
+    /// [`verify_identity_document`]: crate::verify::verify_identity_document
+    /// [`verify_identity_document_bindings`]: crate::verify::verify_identity_document_bindings
     pub fn load_from_dir(veil_dir: &Path) -> Result<Self, SovereignIdentityError> {
+        let sov = Self::load_from_dir_unverified(veil_dir)?;
+        crate::verify::verify_identity_document_bindings(&sov.document).map_err(|source| {
+            SovereignIdentityError::DocumentInvalid {
+                dir: veil_dir.display().to_string(),
+                source,
+            }
+        })?;
+        Ok(sov)
+    }
+
+    /// [`Self::load_from_dir`] without the document-chain verification — the
+    /// SK↔subkey binding only.
+    ///
+    /// Separately named so that reaching for it is a decision. Its callers are
+    /// recovery and diagnosis: a repair tool has to read the document that
+    /// does not verify in order to say what is wrong with it, and refusing to
+    /// load is the opposite of what it needs. Nothing that goes on to sign or
+    /// handshake should call this.
+    pub fn load_from_dir_unverified(veil_dir: &Path) -> Result<Self, SovereignIdentityError> {
         let doc_path = veil_dir.join(IDENTITY_DOCUMENT_FILE);
         if !doc_path.exists() {
             return Err(SovereignIdentityError::FileMissing {
@@ -877,34 +924,39 @@ mod tests {
         // this device's identity_sk corresponds to a later subkey.
         // Persist the override file and assert `load_from_dir`
         // uses it (via `from_parts`, not `from_parts_active`).
-        use crate::sovereign_flow::{save_device_sig_key_idx, save_identity_sk};
+        //
+        // The second key is admitted through `delegate_device` rather than
+        // hand-appended with a zero cert: the loader verifies the document's
+        // own chain, so a fabricated cert is refused, and a fixture carrying
+        // one would only be testing that refusal.
+        use crate::sovereign_flow::{
+            DelegateDeviceOptions, MasterSecret, delegate_device, save_device_sig_key_idx,
+            save_identity_sk,
+        };
         use ed25519_dalek::SigningKey as EdSk;
-        use veil_proto::identity_document::IdentityKey;
 
         let (dir, out) = fresh_dir_with_identity();
 
-        // Append a second IdentityKey for a fake "target device" —
-        // we only need the binding `SK seed → subkey.pubkey` to be
-        // consistent for `from_parts` to accept it.
-        let mut doc = out.document.clone();
         let tgt_seed: veil_util::sensitive_bytes::SensitiveBytesN<32> =
             veil_util::sensitive_bytes::SensitiveBytesN::from_bytes([0x33u8; 32]);
-        let tgt_sk = EdSk::from_bytes(tgt_seed.as_array());
-        let tgt_pk = tgt_sk.verifying_key();
-        doc.identity_keys.push(IdentityKey {
-            algo: veil_proto::identity_document::ALGO_ED25519,
-            pubkey: tgt_pk.as_bytes().to_vec(),
-            device_id: veil_crypto::identity::compute_node_id(tgt_pk.as_bytes()),
-            valid_from_unix: 1_700_000_000,
+        let tgt_pk = EdSk::from_bytes(tgt_seed.as_array()).verifying_key();
+        let delegated = delegate_device(DelegateDeviceOptions {
+            veil_dir: dir.clone(),
+            master: MasterSecret::Seed(out.master_seed.clone()),
+            device_pubkey: tgt_pk.as_bytes().to_vec(),
+            now_unix: 1_700_000_000,
             valid_until_unix: 1_700_000_000 + 7 * 86_400,
-            master_sig: vec![0u8; 64], // signature not verified by
-                                       // `SovereignIdentity` at load time
-        });
-        let new_idx = (doc.identity_keys.len() - 1) as u16;
+            out_path: None,
+        })
+        .expect("delegate the target device");
+        let new_idx = delegated.new_key_idx;
+        assert_ne!(
+            new_idx, delegated.document.sig_key_idx,
+            "the override must point somewhere the document does not"
+        );
 
-        // Overwrite disk with the mutated doc + target's SK seed +
-        // override pointer.
-        std::fs::write(dir.join(IDENTITY_DOCUMENT_FILE), doc.encode()).unwrap();
+        // The target's SK seed + override pointer, over the document the
+        // delegation just wrote.
         save_identity_sk(&dir, &tgt_seed).unwrap();
         save_device_sig_key_idx(&dir, new_idx).unwrap();
 
@@ -1014,6 +1066,90 @@ mod tests {
             matches!(err, SovereignIdentityError::SkSubkeyMismatch { .. }),
             "{err:?}"
         );
+    }
+
+    /// A document edited under the loader's nose must not start the node.
+    ///
+    /// The tamper is the smallest one that leaves every OTHER invariant
+    /// intact: the SK still matches the subkey it is indexed at, decode still
+    /// succeeds, only the master certification over that subkey no longer
+    /// holds. That is precisely the shape the old loader admitted and every
+    /// peer refused — it checked the SK↔subkey binding and nothing else.
+    #[test]
+    fn load_rejects_a_document_whose_master_cert_was_tampered() {
+        let (dir, _out) = fresh_dir_with_identity();
+        let mut doc = veil_proto::identity_document::IdentityDocument::decode(
+            &std::fs::read(dir.join(IDENTITY_DOCUMENT_FILE)).unwrap(),
+        )
+        .unwrap();
+        doc.identity_keys[0].master_sig[0] ^= 0xFF;
+        std::fs::write(dir.join(IDENTITY_DOCUMENT_FILE), doc.encode()).unwrap();
+
+        let err = SovereignIdentity::load_from_dir(&dir).unwrap_err();
+        assert!(
+            matches!(err, SovereignIdentityError::DocumentInvalid { .. }),
+            "{err:?}"
+        );
+        // The recovery entry point still hands the broken document over — a
+        // repair tool cannot describe what is wrong with a file it is refused.
+        SovereignIdentity::load_from_dir_unverified(&dir)
+            .expect("the unverified loader still opens it");
+    }
+
+    /// Same, one rung further down: a tombstone whose master signature does
+    /// not hold. Unsigned tombstones would let anything that can re-sign a
+    /// document retire any device, so the verifier checks them — and a loader
+    /// that skipped the chain skipped this too.
+    #[test]
+    fn load_rejects_a_document_whose_tombstone_signature_was_forged() {
+        use veil_proto::identity_document::RevokedDevice;
+        let (dir, _out) = fresh_dir_with_identity();
+        let mut doc = veil_proto::identity_document::IdentityDocument::decode(
+            &std::fs::read(dir.join(IDENTITY_DOCUMENT_FILE)).unwrap(),
+        )
+        .unwrap();
+        doc.revoked_devices.push(RevokedDevice {
+            device_id: [0x7Au8; 32],
+            master_sig: vec![0u8; 64],
+        });
+        std::fs::write(dir.join(IDENTITY_DOCUMENT_FILE), doc.encode()).unwrap();
+
+        let err = SovereignIdentity::load_from_dir(&dir).unwrap_err();
+        assert!(
+            matches!(err, SovereignIdentityError::DocumentInvalid { .. }),
+            "{err:?}"
+        );
+    }
+
+    /// The clock must not be able to brick a device.
+    ///
+    /// A delegation window is days long and a device can be off for longer;
+    /// the cure is `reissue_self_delegation`, which needs the identity
+    /// LOADED. Gating the loader on `now` would refuse the one device that
+    /// has to self-heal, so the ladder the loader runs is the clock-free one.
+    #[test]
+    fn load_accepts_a_document_whose_delegation_window_has_passed() {
+        let (dir, _out) = fresh_dir_with_identity();
+        // The fixture is pinned to 2023 with a 7-day window, so wall-clock
+        // "now" is already years past it.
+        let doc = veil_proto::identity_document::IdentityDocument::decode(
+            &std::fs::read(dir.join(IDENTITY_DOCUMENT_FILE)).unwrap(),
+        )
+        .unwrap();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        assert!(
+            now > doc.valid_until_unix,
+            "fixture must already be expired for this test to mean anything"
+        );
+        assert!(
+            verify_identity_document(&doc, now).is_err(),
+            "the time-checked ladder must refuse it — that is the contrast"
+        );
+        SovereignIdentity::load_from_dir(&dir)
+            .expect("an expired delegation still loads, so the device can re-issue it");
     }
 
     #[test]
