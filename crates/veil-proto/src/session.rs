@@ -1470,11 +1470,41 @@ pub fn verify_transport_migration_notify(
     pubkey: &[u8; 32],
     now_unix: u64,
 ) -> Result<(), ProtoError> {
-    // Identity binding: node_id MUST equal BLAKE3(pubkey).
-    let expected_node_id = *blake3::hash(pubkey).as_bytes();
+    verify_transport_migration_notify_bound(payload, pubkey, now_unix, None)
+}
+
+/// [`verify_transport_migration_notify`] where the caller has ALREADY
+/// established which node_id `pubkey` speaks for.
+///
+/// `vouched_node_id` is that binding. `None` keeps the strict shape: the
+/// node_id must be `BLAKE3(pubkey)`, so the payload proves its own identity.
+/// `Some(id)` says the caller holds a stronger statement than a hash and the
+/// node_id must equal `id` instead.
+///
+/// The distinction exists because one identity may run on several devices. A
+/// delegated device signs with ITS key while speaking for the identity's
+/// node_id — `BLAKE3(pubkey)` is its own device address, never the identity's,
+/// so the hash form refuses it by construction and every device but the first
+/// loses the ability to announce a transport rotation. Its peers go on dialling
+/// the URI it left. Only a caller that has verified the delegation may pass
+/// `Some`: for a session, that is the handshake, which refuses outright any
+/// peer whose key neither hashes to its claimed node_id nor carries a verified
+/// delegation naming it.
+pub fn verify_transport_migration_notify_bound(
+    payload: &TransportMigrationNotifyPayload,
+    pubkey: &[u8; 32],
+    now_unix: u64,
+    vouched_node_id: Option<&[u8; 32]>,
+) -> Result<(), ProtoError> {
+    // Identity binding: node_id MUST equal BLAKE3(pubkey), or the node_id the
+    // caller's own verified binding names for this key.
+    let expected_node_id = match vouched_node_id {
+        Some(id) => *id,
+        None => *blake3::hash(pubkey).as_bytes(),
+    };
     if expected_node_id != payload.node_id {
         return Err(ProtoError::Malformed(
-            "TransportMigrationNotify: node_id != BLAKE3(pubkey)".to_owned(),
+            "TransportMigrationNotify: node_id is not the one this pubkey speaks for".to_owned(),
         ));
     }
     // Replay-window check.
@@ -2934,6 +2964,96 @@ mod tests {
         );
         // Verify against wrong pubkey fails (identity binding check).
         assert!(verify_transport_migration_notify(&payload, &pubkey_b, 1_699_999_910).is_err());
+    }
+
+    /// A delegated device announces a rotation for the IDENTITY it belongs to.
+    ///
+    /// Its own key hashes to its device address, never to the identity's
+    /// node_id, so the hash form refused it — and every device but the master
+    /// lost the ability to say it had moved. The vouched form asks the
+    /// question the session can actually answer.
+    #[test]
+    fn migration_notify_from_a_delegated_device_is_accepted_when_vouched() {
+        let device_sk = test_signing_key(0xD1);
+        let device_pk = device_sk.verifying_key().to_bytes();
+        // The identity's node_id — deliberately NOT BLAKE3(device_pk).
+        let identity_node_id = [0x5Au8; 32];
+        assert_ne!(identity_node_id, *blake3::hash(&device_pk).as_bytes());
+
+        let payload = sign_transport_migration_notify(
+            identity_node_id,
+            1_700_000_000,
+            1_699_999_900,
+            "obfs4-tcp://1.2.3.4:9000".to_owned(),
+            &device_sk,
+        );
+
+        assert!(
+            verify_transport_migration_notify(&payload, &device_pk, 1_699_999_910).is_err(),
+            "the hash form is exactly what refuses a delegated device"
+        );
+        verify_transport_migration_notify_bound(
+            &payload,
+            &device_pk,
+            1_699_999_910,
+            Some(&identity_node_id),
+        )
+        .expect("the identity the session validated vouches for this key");
+    }
+
+    /// Vouching says which node_id a key speaks for; it does not stop
+    /// demanding that the key be the one that signed.
+    #[test]
+    fn migration_notify_vouching_does_not_admit_a_foreign_signer() {
+        let stranger_sk = test_signing_key(0xF0);
+        let device_pk = test_signing_key(0xD1).verifying_key().to_bytes();
+        let identity_node_id = [0x5Au8; 32];
+
+        // A stranger signs a perfectly-shaped notify for the identity.
+        let payload = sign_transport_migration_notify(
+            identity_node_id,
+            1_700_000_000,
+            1_699_999_900,
+            "obfs4-tcp://6.6.6.6:9000".to_owned(),
+            &stranger_sk,
+        );
+        assert!(
+            verify_transport_migration_notify_bound(
+                &payload,
+                &device_pk,
+                1_699_999_910,
+                Some(&identity_node_id),
+            )
+            .is_err(),
+            "a signature from a key the session never attested must not pass"
+        );
+    }
+
+    /// And the vouched node_id is a pin, not a waiver: a device of identity A
+    /// cannot move identity B's cache entry.
+    #[test]
+    fn migration_notify_vouching_still_pins_the_node_id() {
+        let device_sk = test_signing_key(0xD1);
+        let device_pk = device_sk.verifying_key().to_bytes();
+        let other_identity = [0x77u8; 32];
+
+        let payload = sign_transport_migration_notify(
+            [0x5Au8; 32],
+            1_700_000_000,
+            1_699_999_900,
+            "obfs4-tcp://1.2.3.4:9000".to_owned(),
+            &device_sk,
+        );
+        assert!(
+            verify_transport_migration_notify_bound(
+                &payload,
+                &device_pk,
+                1_699_999_910,
+                Some(&other_identity),
+            )
+            .is_err(),
+            "the announced node_id must be the one the caller vouched for"
+        );
     }
 
     #[test]
