@@ -233,6 +233,20 @@ pub struct KademliaService {
     dht_config: DhtRuntimeConfig,
     /// Optional metrics handle — wired by the runtime after construction.
     metrics: Option<Arc<dyn DhtMetrics>>,
+
+    /// How many times a contact was passed over for candidate selection
+    /// because it advertised `NO_DHT_SERVICE`.
+    ///
+    /// Exists because the property it measures is otherwise invisible. The
+    /// byte budget that preceded this change looked healthy by its own
+    /// counters — thousands of refusals — while the traffic it was meant to
+    /// reduce did not move at all. A filter with no instrument is a filter
+    /// nobody can tell apart from a no-op, so this one counts every skip and
+    /// the routing-table gauge beside it shows the contact is still there.
+    /// `Arc` because the service is `Clone` and every clone must count into
+    /// the SAME total — a per-clone counter would report whichever handle the
+    /// metrics endpoint happens to hold.
+    no_service_skips: Arc<std::sync::atomic::AtomicU64>,
     /// shared client-side cache for `node_id → transport`
     /// mappings observed via prior `ResolveTransport` responses. Every
     /// `NetworkPeerQuerier` constructed inside this service shares this
@@ -443,6 +457,7 @@ impl KademliaService {
             store_req_id: Arc::new(AtomicU32::new(0x8000_0000)),
             dht_config,
             metrics: None,
+            no_service_skips: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             transport_cache: Arc::new(Mutex::new(super::transport_cache::TransportCache::new())),
             lookup_cache: Arc::new(Mutex::new(super::lookup_cache::LookupCache::with_defaults())),
             local_announcement: Arc::new(Mutex::new(None)),
@@ -727,7 +742,7 @@ impl KademliaService {
             // A no-service peer must never be handed to a walker as a closer
             // node: every referral turns into store/query traffic at the peer
             // that asked not to receive any.
-            .filter(|c| c.dht_service())
+            .filter(|c| self.count_service_skip(c))
             .cloned()
             .collect();
 
@@ -1326,12 +1341,34 @@ impl KademliaService {
     /// filtered here once rather than at each call site. Reachability paths
     /// (resolve_transport's "do I know this node") read the routing table
     /// directly and are unaffected.
+    /// `Contact::dht_service`, counting the refusals as it goes.
+    ///
+    /// Returns what the predicate returns, so it drops straight into a
+    /// `filter`; the counting is the whole reason it is not just the
+    /// predicate. See [`Self::no_dht_service_skips`].
+    fn count_service_skip(&self, contact: &Contact) -> bool {
+        if contact.dht_service() {
+            return true;
+        }
+        self.no_service_skips
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        false
+    }
+
+    /// How many candidate slots have gone to somebody else because their
+    /// occupant asked not to serve. Pair it with the routing-table size: the
+    /// contacts are still there, they are simply never chosen.
+    pub fn no_dht_service_skips(&self) -> u64 {
+        self.no_service_skips
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     pub fn find_closest_nodes(&self, target: &[u8; 32], k: usize) -> Vec<[u8; 32]> {
         lock!(self.inner)
             .routing
             .find_closest(target, k)
             .into_iter()
-            .filter(|c| c.dht_service())
+            .filter(|c| self.count_service_skip(c))
             .map(|c| c.node_id)
             .collect()
     }
@@ -1350,7 +1387,7 @@ impl KademliaService {
             .routing
             .find_closest(target, k)
             .into_iter()
-            .filter(|c| c.dht_service())
+            .filter(|c| self.count_service_skip(c))
             .cloned()
             .collect()
     }
@@ -1370,7 +1407,7 @@ impl KademliaService {
             .routing
             .find_closest(target, k)
             .into_iter()
-            .filter(|c| c.dht_service())
+            .filter(|c| self.count_service_skip(c))
             .map(|c| (c.node_id, c.transport.clone()))
             .collect()
     }
@@ -1389,7 +1426,8 @@ impl KademliaService {
             .find_closest(target, self.k())
             .into_iter()
             .filter(|c| {
-                matches!(c.discovery_mode(), veil_types::DiscoveryMode::Public) && c.dht_service()
+                matches!(c.discovery_mode(), veil_types::DiscoveryMode::Public)
+                    && self.count_service_skip(c)
             })
             .map(|c| c.node_id)
             .collect();
@@ -1507,7 +1545,7 @@ impl KademliaService {
                 .routing
                 .find_closest(&key, self.k())
                 .into_iter()
-                .filter(|c| c.dht_service())
+                .filter(|c| self.count_service_skip(c))
                 .cloned()
                 .collect()
         };
@@ -1614,7 +1652,7 @@ impl KademliaService {
                 .routing
                 .find_closest(&target, self.k())
                 .into_iter()
-                .filter(|c| c.dht_service())
+                .filter(|c| self.count_service_skip(c))
                 .cloned()
                 .collect()
         };

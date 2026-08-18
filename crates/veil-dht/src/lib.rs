@@ -109,6 +109,28 @@ mod tests {
             svc.find_closest_public_node_ids(&target, 8)
                 .contains(&[1u8; 32])
         );
+
+        // The skip is COUNTED. A filter with no instrument is one nobody can
+        // tell apart from a no-op — which is exactly how the byte budget
+        // before this looked healthy by its own counters while changing the
+        // traffic by nothing.
+        assert!(
+            svc.no_dht_service_skips() > 0,
+            "every path above passed over the quiet peer and none said so"
+        );
+    }
+
+    /// The counter must not fire for peers that are simply not the closest —
+    /// only for ones actively passed over. A count that rose on ordinary
+    /// selection would be noise indistinguishable from the signal.
+    #[test]
+    fn nothing_is_counted_when_everyone_serves() {
+        let svc = test_kademlia([0u8; 32]);
+        svc.add_contact(Contact::new([1u8; 32], "tcp://a:9000"));
+        svc.add_contact(Contact::new([2u8; 32], "tcp://b:9000"));
+        let _ = svc.find_closest_nodes(&[3u8; 32], 8);
+        let _ = svc.find_closest_public_node_ids(&[3u8; 32], 8);
+        assert_eq!(svc.no_dht_service_skips(), 0);
     }
 
     #[test]
