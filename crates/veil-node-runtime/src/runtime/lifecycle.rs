@@ -1133,6 +1133,7 @@ impl NodeRuntime {
             pow_difficulty: config.abuse.pow_min_difficulty as u8,
             pow_pending: Arc::new(Mutex::new(veil_dispatcher::PowPendingTable::new())),
             discovery_mode: config.routing.discovery_mode,
+            dht_service: config.dht.participate,
             pending_diag: Arc::clone(&self.pending_diag),
             capture_tx: Arc::clone(&self.dispatcher.capture_tx),
             capture_active: Arc::clone(&self.dispatcher.capture_active),

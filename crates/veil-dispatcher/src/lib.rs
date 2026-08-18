@@ -953,6 +953,13 @@ pub struct FrameDispatcher {
     /// via `RouteResponse`. See [`veil_cfg::DiscoveryMode`].
     pub discovery_mode: veil_cfg::DiscoveryMode,
 
+    /// `[dht] participate` — threaded to the OVL1 handshake so a
+    /// non-participating node also ADVERTISES `NO_DHT_SERVICE`. The local
+    /// store-refusal alone was measured to change nothing: the bytes cross
+    /// the network before the refusal. One knob, two effects — refuse what
+    /// legacy peers still send, and ask upgraded peers not to send at all.
+    pub dht_service: bool,
+
     // ── Diagnostics ────────────────────────────────────────────────
     /// One-shot channels waiting for a Pong or TraceHop reply keyed by `seq`.
     /// Admin command handlers insert a `Sender` before sending the probe;
@@ -1925,6 +1932,7 @@ pub fn make_test_dispatcher(role: NodeRole) -> FrameDispatcher {
         pow_difficulty: 0,
         pow_pending: Arc::new(Mutex::new(PowPendingTable::new())),
         discovery_mode: veil_cfg::DiscoveryMode::Public,
+        dht_service: true,
         pending_diag: Arc::new(Mutex::new(HashMap::new())),
         capture_tx: Arc::new(Mutex::new(None)),
         capture_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -2735,6 +2743,7 @@ mod tests {
             pow_difficulty: 0,
             pow_pending: Arc::new(Mutex::new(PowPendingTable::new())),
             discovery_mode: veil_cfg::DiscoveryMode::Public,
+            dht_service: true,
             pending_diag: Arc::new(Mutex::new(HashMap::new())),
             capture_tx: Arc::new(Mutex::new(None)),
             capture_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),

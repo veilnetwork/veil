@@ -326,6 +326,11 @@ pub async fn perform_ovl1_handshake<S>(
     // `cfg.anonymity.relay_capable` at the runtime layer. Default
     // false — being an anonymity relay has non-trivial cost.
     anonymity_relay_capable: bool,
+    // when false, advertise `cap_flags::NO_DHT_SERVICE` so peers
+    // stop picking us as a store/walk candidate. Sourced from
+    // `cfg.dht.serve_dht`. Default true — the bit only ever asks
+    // for LESS work, never grants more.
+    dht_service: bool,
     // q: optional early ban-check. When `Some`, called
     // on the inbound side immediately after decoding the peer's HELLO
     // frame (we now know `remote_id`) and BEFORE the expensive Falcon-512
@@ -880,6 +885,7 @@ where
                     " (C6)",
                     local_advertised_transports,
                     anonymity_relay_capable,
+                    dht_service,
                     verified_membership_cert,
                     peer_observed_addr,
                 )
@@ -946,6 +952,7 @@ where
         "",
         local_advertised_transports,
         anonymity_relay_capable,
+        dht_service,
         verified_membership_cert,
         peer_observed_addr,
     )
@@ -1149,6 +1156,7 @@ async fn complete_handshake_from_capabilities<S>(
     label_suffix: &str,
     local_advertised_transports: &[String],
     anonymity_relay_capable: bool,
+    dht_service: bool,
     // Cert verified by `perform_ovl1_handshake` (P-Net mode) — threaded
     // here so the returned `OvlHandshakeResult` carries it for the
     // caller's per-peer cert cache. `None` in public mode or when the
@@ -1208,6 +1216,12 @@ where
     // us as a circuit candidate.
     if anonymity_relay_capable {
         caps.flags |= cap_flags::ANONYMITY_RELAY;
+    }
+    // ask peers not to spend DHT work on us when the operator (or the
+    // app's platform default) turned serving off. Reachability is not
+    // affected — see the bit's own doc.
+    if !dht_service {
+        caps.flags |= cap_flags::NO_DHT_SERVICE;
     }
     // advertise SUPPORTS_HYBRID_KEX iff we
     // have ML-KEM material to back it up (local DK seed for

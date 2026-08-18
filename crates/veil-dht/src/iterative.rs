@@ -147,7 +147,12 @@ impl PeerQuerier for LocalPeerQuerier {
         Box::pin(async move {
             let guard = lock!(nodes);
             match guard.get(&peer_id) {
-                Some(rt) => rt.find_closest(&target, K).into_iter().cloned().collect(),
+                Some(rt) => rt
+                    .find_closest(&target, K)
+                    .into_iter()
+                    .filter(|c| c.dht_service())
+                    .cloned()
+                    .collect(),
                 None => vec![],
             }
         })
@@ -163,7 +168,12 @@ impl PeerQuerier for LocalPeerQuerier {
             let guard = lock!(nodes);
             match guard.get(&peer_id) {
                 Some(rt) => {
-                    let contacts = rt.find_closest(&key, K).into_iter().cloned().collect();
+                    let contacts = rt
+                        .find_closest(&key, K)
+                        .into_iter()
+                        .filter(|c| c.dht_service())
+                        .cloned()
+                        .collect();
                     FindValueResult::Nodes(contacts)
                 }
                 None => FindValueResult::Nodes(vec![]),

@@ -397,6 +397,9 @@ pub struct AttachedDebugSession {
     /// `handle_find_node_v2` can filter the peer out of FIND_NODE responses
     /// if they prefer to stay hidden.
     pub remote_discovery_mode: veil_cfg::DiscoveryMode,
+    /// False when the peer advertised `NO_DHT_SERVICE` — stamped into the
+    /// routing-table `Contact` so no candidate-selection path picks it.
+    pub remote_dht_service: bool,
     /// True when this session was accepted INTO the referral headroom above
     /// `max_concurrent` (the node was already at its data ceiling). Such a
     /// session is transient: it exists only to deliver a peer-gossip sample so
@@ -2055,6 +2058,7 @@ impl NodeRuntime {
             pow_difficulty: config.abuse.pow_min_difficulty as u8,
             pow_pending: Arc::new(Mutex::new(veil_dispatcher::PowPendingTable::new())),
             discovery_mode: config.routing.discovery_mode,
+            dht_service: config.dht.participate,
             pending_diag: Arc::clone(&shared_pending_diag),
             capture_tx: Arc::new(Mutex::new(None)),
             capture_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -5912,10 +5916,11 @@ impl NodeServices {
             // handshake completing is fresh evidence of working egress).
             access
                 .dht
-                .add_contact_trusted(veil_dht::routing::Contact::with_mode(
+                .add_contact_trusted(veil_dht::routing::Contact::with_caps(
                     *peer.node_id.as_bytes(),
                     &peer.transport,
                     session.remote_discovery_mode,
+                    session.remote_dht_service,
                 ));
             let _ = access
                 .dht
@@ -6639,10 +6644,11 @@ pub fn spawn_inbound_session(
             // `handle_find_node_v2` can filter them out of FIND_NODE responses
             // if they prefer to stay hidden from DHT-walks.
             inbound.runtime.dispatcher.dht.add_contact_trusted(
-                veil_dht::routing::Contact::with_mode(
+                veil_dht::routing::Contact::with_caps(
                     *peer_id.as_bytes(),
                     inbound_transport.clone(),
                     session.remote_discovery_mode,
+                    session.remote_dht_service,
                 ),
             );
             // promote any unverified candidate for this

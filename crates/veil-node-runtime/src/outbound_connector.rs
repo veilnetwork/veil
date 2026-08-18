@@ -539,10 +539,11 @@ pub fn spawn_outbound_peers(
                                 // FIND_NODE responses if they prefer to stay
                                 // hidden from DHT-walks.
                                 access.dht.add_contact_trusted(
-                                    veil_dht::routing::Contact::with_mode(
+                                    veil_dht::routing::Contact::with_caps(
                                         *peer.node_id.as_bytes(),
                                         &peer.transport,
                                         session.remote_discovery_mode,
+                                        session.remote_dht_service,
                                     ),
                                 );
                                 // promote any unverified candidate

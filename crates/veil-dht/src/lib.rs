@@ -52,6 +52,65 @@ mod tests {
         )
     }
 
+    /// The whole point of the bit: a peer that asked out disappears from
+    /// every CANDIDATE list — what we hand walkers, whom we pick as store
+    /// targets, whom we seed lookups from — while remaining in the table so
+    /// it stays reachable.
+    #[test]
+    fn a_no_service_peer_is_never_a_candidate() {
+        let svc = test_kademlia([0u8; 32]);
+        let serving = Contact::with_caps(
+            [1u8; 32],
+            "tcp://serves:9000",
+            veil_types::DiscoveryMode::Public,
+            true,
+        );
+        let quiet = Contact::with_caps(
+            [2u8; 32],
+            "tcp://quiet:9000",
+            veil_types::DiscoveryMode::Public,
+            false,
+        );
+        svc.add_contact(serving);
+        svc.add_contact(quiet);
+        assert_eq!(
+            svc.routing_table_size(),
+            2,
+            "both stay in the table — eviction would break reachability"
+        );
+
+        let target = [3u8; 32];
+        assert!(
+            !svc.find_closest_nodes(&target, 8).contains(&[2u8; 32]),
+            "never a next-hop or replication target"
+        );
+        assert!(
+            !svc.find_closest_public_node_ids(&target, 8)
+                .contains(&[2u8; 32]),
+            "never handed to a walker as a closer node"
+        );
+        assert!(
+            !svc.find_closest_with_transport(&target, 8)
+                .iter()
+                .any(|(id, _)| *id == [2u8; 32]),
+            "never a replication target in the subnet-diversity path"
+        );
+        assert!(
+            !svc.find_closest_contacts(&target, 8)
+                .iter()
+                .any(|c| c.node_id == [2u8; 32]),
+            "never a seed for an iterative walk"
+        );
+
+        // And the serving peer is still picked, so the filter is not just
+        // emptying every list.
+        assert!(svc.find_closest_nodes(&target, 8).contains(&[1u8; 32]));
+        assert!(
+            svc.find_closest_public_node_ids(&target, 8)
+                .contains(&[1u8; 32])
+        );
+    }
+
     #[test]
     fn dht_store_lookup_delete_integration() {
         let svc = test_kademlia([0u8; 32]);
