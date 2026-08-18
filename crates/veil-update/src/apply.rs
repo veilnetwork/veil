@@ -121,6 +121,15 @@ pub enum ApplyError {
          {min_compatible:?} — refusing to apply (cannot verify version compatibility)"
     )]
     MalformedVersionConstraint { min_compatible: String },
+    /// V13-H4: the manifest publishes an OLDER product version than the one
+    /// running. Distinct from `AntiDowngrade`, which compares release
+    /// timestamps: this catches an old product republished under a fresh
+    /// timestamp, where the timestamp floor alone would let it through.
+    #[error(
+        "version downgrade rejected: this binary is v{current} but the update \
+         publishes v{target} — refusing to replace a newer product with an older one"
+    )]
+    VersionDowngrade { current: String, target: String },
 }
 
 /// cycle-7 (M5): is `current` (the running binary's version) recent enough to
@@ -155,6 +164,42 @@ fn min_compatible_satisfied(current: &str, min_compatible: &str) -> Result<(), A
         return Err(ApplyError::IncompatibleVersion {
             current: current.to_string(),
             min_compatible: min_compatible.to_string(),
+        });
+    }
+    Ok(())
+}
+
+/// V13-H4: is `target` (the manifest's product version) at least `current` (the
+/// running binary's own `CARGO_PKG_VERSION`)?
+///
+/// EQUAL passes. A rebuild republished under the same version with a newer
+/// `release_unix` is a legitimate hotfix, and the release_unix floor — which
+/// rejects equal timestamps — is the gate that keeps that monotonic. Only a
+/// strictly LOWER product version is a downgrade here.
+///
+/// Parsing policy is deliberately the opposite of
+/// [`min_compatible_satisfied`]'s. That one guards a mandatory migration and
+/// has to fail closed. This one is defence in depth layered on an already-solid
+/// timestamp floor, and `version` is operator-set free text that a
+/// date-versioned release train (`2026.08.18`) will not parse as semver.
+/// Refusing those would brick a working update path to re-check something the
+/// floor already covers, so an unparseable version WARNS and defers.
+fn not_a_version_downgrade(current: &str, target: &str) -> Result<(), ApplyError> {
+    let (Ok(cur), Ok(tgt)) = (
+        semver::Version::parse(current.trim()),
+        semver::Version::parse(target.trim()),
+    ) else {
+        log::warn!(
+            "update: cannot compare product versions (running {current:?}, manifest \
+             {target:?}) — at least one is not semver; the release_unix \
+             anti-downgrade floor is the only version gate for this apply"
+        );
+        return Ok(());
+    };
+    if tgt < cur {
+        return Err(ApplyError::VersionDowngrade {
+            current: current.to_string(),
+            target: target.to_string(),
         });
     }
     Ok(())
@@ -278,14 +323,15 @@ pub fn apply_update(
         });
     }
 
-    // Step 2: anti-downgrade. Read current installed release_unix;
-    // missing state file → 0 (fresh install — any positive
-    // release_unix is "newer").
+    // Step 2: anti-downgrade. The floor is the HIGHER of the authenticated
+    // on-disk record (MAC-verified, or the read above failed closed) and the
+    // release timestamp compiled into this binary. Deleting the state file used
+    // to drop the floor to 0 and re-open the whole downgrade window; the
+    // embedded value cannot be deleted without replacing the binary. See
+    // `installed_version::anti_downgrade_floor`.
     let installed_opt = store.read_release_unix_for_apply()?;
-    // Anti-downgrade floor: the recorded value, which under a keyed store is
-    // MAC-authenticated or the read above would have failed closed.
     let previous = installed_opt.unwrap_or(0);
-    let anti_downgrade_floor = previous;
+    let anti_downgrade_floor = crate::installed_version::anti_downgrade_floor(installed_opt);
     if manifest.release_unix <= anti_downgrade_floor {
         return Err(ApplyError::AntiDowngrade {
             manifest: manifest.release_unix,
@@ -326,6 +372,15 @@ pub fn apply_update(
     // drift. (Previously the signed `min_compatible_version` field was inert —
     // checked by nothing.)
     min_compatible_satisfied(current_version, &manifest.min_compatible_version)?;
+
+    // Step 2d (V13-H4): the manifest's PRODUCT VERSION was never compared
+    // against the version compiled into the running binary — only
+    // `min_compatible_version` was, and an old manifest carries an old (so
+    // trivially satisfied) bound. Timestamps and versions can disagree: an
+    // operator who republishes v1.2.0 under a fresh `release_unix` clears the
+    // anti-downgrade floor while still shipping the older product. Compare the
+    // two versions directly.
+    not_a_version_downgrade(current_version, &manifest.version)?;
 
     // Step 3: atomic stage + +x + rename. The staging file is created next to
     // `install_path` with an UNPREDICTABLE name, `O_EXCL`+`O_NOFOLLOW`, written,
@@ -511,6 +566,7 @@ fn with_tmp_suffix(path: &Path) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
+    use super::super::installed_version::EmbeddedReleaseGuard;
     use super::super::manifest::{decode_manifest, sign_manifest};
     use super::*;
     use std::time::SystemTime;
@@ -529,6 +585,14 @@ mod tests {
     }
 
     fn fixture_manifest(release_unix: u64, sha256: [u8; 32]) -> VerifiedManifest {
+        fixture_manifest_versioned(release_unix, sha256, "1.2.3")
+    }
+
+    fn fixture_manifest_versioned(
+        release_unix: u64,
+        sha256: [u8; 32],
+        version: &str,
+    ) -> VerifiedManifest {
         let kp = generate_keypair(SignatureAlgorithm::Ed25519);
         // Use the RUNNING host's platform so the U5 platform gate
         // (`host_matches_platform_target`) passes regardless of which OS/arch
@@ -541,7 +605,7 @@ mod tests {
         // (that is `min_compatible_gate`'s job), so pin a min below 0.1.0.
         let bytes = sign_manifest(
             release_unix,
-            "1.2.3",
+            version,
             "0.0.1",
             &host_pt,
             sha256,
@@ -688,6 +752,167 @@ mod tests {
         let mut h = Sha256::new();
         h.update(data);
         h.finalize().into()
+    }
+
+    // ── V13-H4: deleting the state file must not buy a downgrade ──
+
+    /// The defect, at the site that decides. `read_release_unix_for_apply`
+    /// cannot tell a deleted state file from a fresh install — both are `None`
+    /// — and `unwrap_or(0)` let an OLD but still-validly-signed manifest
+    /// replace a newer running binary. The floor now falls back to the release
+    /// timestamp compiled into this binary, which cannot be deleted.
+    #[test]
+    fn v13h4_missing_state_does_not_permit_an_older_release() {
+        let _embedded = EmbeddedReleaseGuard::set(2_000_000_000);
+        let dir = unique_dir("h4-missing-state");
+        let install = dir.join("veil");
+        // No state file is ever written — exactly what an attacker leaves
+        // behind after deleting it.
+        let store = InstalledVersionStore::new(dir.join("installed.json"));
+
+        let payload = b"an older, still validly signed binary";
+        let manifest = fixture_manifest(1_900_000_000, sha256_of(payload));
+
+        let err = apply_update(
+            &manifest,
+            payload,
+            &install,
+            &store,
+            env!("CARGO_PKG_VERSION"),
+        )
+        .unwrap_err();
+
+        match err {
+            ApplyError::AntiDowngrade {
+                manifest,
+                installed,
+            } => {
+                assert_eq!(manifest, 1_900_000_000);
+                assert_eq!(
+                    installed, 2_000_000_000,
+                    "floor must come from the embedded release, not from 0"
+                );
+            }
+            other => panic!("expected AntiDowngrade, got {other:?}"),
+        }
+        assert!(
+            !install.exists(),
+            "an old release must not have replaced the installed binary"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The floor must not brick the case it looks like: a genuine fresh install
+    /// has no state file either, and its binary was published BEFORE the update
+    /// it is fetching, so a newer manifest still clears the embedded floor.
+    #[test]
+    fn v13h4_a_genuine_fresh_install_still_installs() {
+        let _embedded = EmbeddedReleaseGuard::set(2_000_000_000);
+        let dir = unique_dir("h4-fresh-install");
+        let install = dir.join("veil");
+        let state = dir.join("installed.json");
+        let store = InstalledVersionStore::new(state.clone());
+
+        let payload = b"a newer binary";
+        let manifest = fixture_manifest(2_000_000_001, sha256_of(payload));
+
+        let outcome = apply_update(
+            &manifest,
+            payload,
+            &install,
+            &store,
+            env!("CARGO_PKG_VERSION"),
+        )
+        .unwrap();
+
+        assert_eq!(std::fs::read(&install).unwrap(), payload);
+        assert_eq!(outcome.new_release_unix, 2_000_000_001);
+        assert_eq!(store.read_release_unix().unwrap(), Some(2_000_000_001));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A node that has already updated past its own build must not be dragged
+    /// back to it: an authenticated record above the embedded value still wins,
+    /// so the update it is offered next is judged against the record.
+    #[test]
+    fn v13h4_authenticated_state_newer_than_embedded_still_wins() {
+        let _embedded = EmbeddedReleaseGuard::set(2_000_000_000);
+        let dir = unique_dir("h4-state-wins");
+        let install = dir.join("veil");
+        let state = dir.join("installed.json");
+        let store = InstalledVersionStore::with_hmac_key(state.clone(), [7u8; 32]);
+        store.write(2_100_000_000).unwrap();
+
+        // Between the embedded floor and the recorded one: the record has to be
+        // the binding constraint or this would install.
+        let payload = b"a binary older than what is installed";
+        let stale = fixture_manifest(2_050_000_000, sha256_of(payload));
+        let err =
+            apply_update(&stale, payload, &install, &store, env!("CARGO_PKG_VERSION")).unwrap_err();
+        match err {
+            ApplyError::AntiDowngrade { installed, .. } => assert_eq!(installed, 2_100_000_000),
+            other => panic!("expected AntiDowngrade, got {other:?}"),
+        }
+
+        // And a manifest above the record installs normally.
+        let newer_payload = b"a genuinely newer binary";
+        let newer = fixture_manifest(2_200_000_000, sha256_of(newer_payload));
+        let outcome = apply_update(
+            &newer,
+            newer_payload,
+            &install,
+            &store,
+            env!("CARGO_PKG_VERSION"),
+        )
+        .unwrap();
+        assert_eq!(outcome.new_release_unix, 2_200_000_000);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The second half of V13-H4: the manifest's PRODUCT version was never
+    /// compared against the running binary's. A fresh `release_unix` on an old
+    /// product clears the timestamp floor, so the versions have to be compared
+    /// directly.
+    #[test]
+    fn v13h4_older_product_version_is_refused_even_with_a_newer_timestamp() {
+        let dir = unique_dir("h4-version-downgrade");
+        let install = dir.join("veil");
+        let store = InstalledVersionStore::new(dir.join("installed.json"));
+
+        let payload = b"an old product republished today";
+        // Timestamp is far in the future of any floor; only the version is old.
+        let manifest = fixture_manifest_versioned(2_000_000_000, sha256_of(payload), "0.9.0");
+
+        let err = apply_update(&manifest, payload, &install, &store, "1.5.0").unwrap_err();
+        assert!(
+            matches!(err, ApplyError::VersionDowngrade { .. }),
+            "expected VersionDowngrade, got {err:?}"
+        );
+        assert!(!install.exists(), "an older product must not be installed");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Policy of the version gate, stated directly: equal passes (a same-version
+    /// rebuild is a legitimate hotfix and the timestamp floor keeps it
+    /// monotonic), newer passes, strictly older is refused, and an unparseable
+    /// version defers to the timestamp floor instead of bricking a
+    /// date-versioned release train.
+    #[test]
+    fn v13h4_version_gate_policy() {
+        assert!(not_a_version_downgrade("1.2.3", "1.2.4").is_ok());
+        assert!(not_a_version_downgrade("1.2.3", "1.2.3").is_ok());
+        assert!(not_a_version_downgrade("1.2.3", "2.0.0").is_ok());
+        assert!(matches!(
+            not_a_version_downgrade("1.2.3", "1.2.2"),
+            Err(ApplyError::VersionDowngrade { .. })
+        ));
+        assert!(matches!(
+            not_a_version_downgrade("1.2.3", "0.1.0"),
+            Err(ApplyError::VersionDowngrade { .. })
+        ));
+        // Not semver on either side → defer, do not brick.
+        assert!(not_a_version_downgrade("1.2.3", "2026.08.18").is_ok());
+        assert!(not_a_version_downgrade("nightly", "1.2.3").is_ok());
     }
 
     #[test]
