@@ -180,6 +180,11 @@ impl RuntimeStateProbe {
         let dht_store = self.dispatcher.dht.store_len();
         let dht_transport_cache = self.dispatcher.dht.transport_cache_len();
         let dht_lookup_cache = self.dispatcher.dht.lookup_cache_len();
+        // What this node spent on OTHER people's work, and what it declined.
+        // Without the refused side a budget that is set too tight looks
+        // exactly like a quiet network.
+        let (svc_served, svc_refused, svc_refusals) = self.dispatcher.abuse.service_budget.totals();
+        let svc_budget = self.dispatcher.abuse.service_budget.bytes_per_hour();
 
         format!(
             "# HELP veil_state_live_sessions Number of live transport sessions\n\
@@ -238,7 +243,19 @@ impl RuntimeStateProbe {
              veil_state_dht_transport_cache {dht_transport_cache}\n\
              # HELP veil_state_dht_lookup_cache In-flight DHT iterative-lookup entries\n\
              # TYPE veil_state_dht_lookup_cache gauge\n\
-             veil_state_dht_lookup_cache {dht_lookup_cache}\n",
+             veil_state_dht_lookup_cache {dht_lookup_cache}\n\
+             # HELP veil_service_budget_bytes_per_hour Bytes per hour this node will spend on other peers' work\n\
+             # TYPE veil_service_budget_bytes_per_hour gauge\n\
+             veil_service_budget_bytes_per_hour {svc_budget}\n\
+             # HELP veil_service_budget_served_bytes_total Bytes of other peers' work this node performed\n\
+             # TYPE veil_service_budget_served_bytes_total counter\n\
+             veil_service_budget_served_bytes_total {svc_served}\n\
+             # HELP veil_service_budget_refused_bytes_total Bytes of other peers' work declined for want of budget\n\
+             # TYPE veil_service_budget_refused_bytes_total counter\n\
+             veil_service_budget_refused_bytes_total {svc_refused}\n\
+             # HELP veil_service_budget_refusals_total Requests declined for want of budget\n\
+             # TYPE veil_service_budget_refusals_total counter\n\
+             veil_service_budget_refusals_total {svc_refusals}\n",
         )
     }
 }

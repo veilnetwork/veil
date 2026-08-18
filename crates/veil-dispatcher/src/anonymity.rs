@@ -2907,7 +2907,10 @@ mod tests {
             CircuitIntroduceForward::Forwarded
         ));
         let served1 = state.last_served_unix();
-        assert!(served1 > 0, "forwarded introduce must mark the binding served");
+        assert!(
+            served1 > 0,
+            "forwarded introduce must mark the binding served"
+        );
         recv_rx.try_recv().expect("slice 1 sent down the circuit");
 
         // Slice 2 (distinct bytes dodge the replay fingerprint): the binding is
@@ -2922,7 +2925,10 @@ mod tests {
             CircuitIntroduceForward::Forwarded
         ));
         recv_rx.try_recv().expect("slice 2 sent down the circuit");
-        assert!(state.last_served_unix() >= served1, "forward re-arms the clock");
+        assert!(
+            state.last_served_unix() >= served1,
+            "forward re-arms the clock"
+        );
 
         // Under bucket pressure after the linger grace, the served slot yields
         // (time injected at the table API — the dispatcher install path passes

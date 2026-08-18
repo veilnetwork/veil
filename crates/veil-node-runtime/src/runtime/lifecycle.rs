@@ -1048,6 +1048,23 @@ impl NodeRuntime {
                 ratchet: self.dispatcher.crypto.ratchet.clone(),
             }),
             abuse: Arc::new(veil_dispatcher::AbuseContext {
+                // A reload must not hand out a free hour. The bucket's LEVEL is
+                // live state — rebuilding it refills it — so the existing
+                // budget is carried over whenever the resolved number is
+                // unchanged, and replaced only when the operator actually
+                // moved the dial.
+                service_budget: {
+                    let wanted = veil_dispatcher::service_budget::ServiceBudget::for_role(
+                        role,
+                        config.dht.service_budget_bytes_per_hour,
+                    );
+                    let held = &self.dispatcher.abuse.service_budget;
+                    if held.bytes_per_hour() == wanted.bytes_per_hour() {
+                        Arc::clone(held)
+                    } else {
+                        Arc::new(wanted)
+                    }
+                },
                 rate_limiter: Arc::clone(&self.rate_limiter),
                 ban_list: Arc::clone(&self.ban_list),
                 violation_tracker: Arc::clone(&self.violation_tracker),

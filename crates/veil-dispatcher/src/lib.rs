@@ -59,6 +59,7 @@ pub mod discovery;
 pub mod envelope_chunks;
 pub mod pending_ack;
 pub mod routing;
+pub mod service_budget;
 pub mod session;
 pub mod sink_impl;
 
@@ -334,6 +335,14 @@ pub struct AbuseContext {
     /// just out of a bounded pot. See
     /// [`veil_proto::budget::UNSIGNED_ROUTE_REQUEST_BURST`].
     pub unsigned_route_request_budget: Arc<Mutex<veil_abuse::rate_limiter::TokenBucket>>,
+    /// What this node will spend on OTHER people's work, per hour.
+    ///
+    /// Not an abuse limiter in the usual sense — the requests it declines are
+    /// perfectly legitimate. It is the owner's bill: measured on an idle
+    /// client, 85% of everything received was work done for strangers, and the
+    /// answers to the node's own questions were one thousandth of it. See
+    /// [`crate::service_budget`].
+    pub service_budget: Arc<crate::service_budget::ServiceBudget>,
     /// Per-peer quota for new route insertions from RouteResponse.
     ///
     /// Limits how many distinct destinations a single peer may contribute to the
@@ -1829,6 +1838,12 @@ pub fn make_test_dispatcher(role: NodeRole) -> FrameDispatcher {
             ratchet: None,
         }),
         abuse: Arc::new(AbuseContext {
+            // From the ROLE, never a bare default: `Default` is the leaf
+            // figure, and handing it to a Core dispatcher meters the very
+            // nodes whose job is to serve.
+            service_budget: std::sync::Arc::new(crate::service_budget::ServiceBudget::for_role(
+                role, None,
+            )),
             rate_limiter: Arc::new(Mutex::new(PerPeerLimiter::new(
                 1000.0,
                 1000.0,
@@ -2046,6 +2061,90 @@ mod tests {
                 assert_eq!(msg_type, ControlMsg::Pong as u16, "expected Pong");
             }
             other => panic!("expected Response(Pong), got {other:?}"),
+        }
+    }
+
+    // ── Service budget ────────────────────────────────────────────────────────
+
+    /// The single largest line of an idle client's bill was strangers writing
+    /// THEIR records into OUR store: 82% of everything the discovery plane
+    /// received, 373 MB a day. Once the hourly budget is spent, that stops.
+    #[test]
+    fn a_store_beyond_the_budget_is_declined_not_served() {
+        use crate::service_budget::ServiceKind;
+        let d = make_test_dispatcher(NodeRole::Leaf);
+        let before = d.dht.store_len();
+
+        // Drain the budget the way real traffic would.
+        let hourly = d.abuse.service_budget.bytes_per_hour();
+        while d
+            .abuse
+            .service_budget
+            .try_serve(ServiceKind::Lookup, hourly / 64)
+        {}
+
+        let payload = veil_proto::discovery::StorePayload::unsigned([7u8; 32], vec![1u8; 64]);
+        let hdr = FrameHeader::new(
+            FrameFamily::Discovery as u8,
+            veil_proto::family::DiscoveryMsg::Store as u16,
+        );
+        let result = d.dispatch(&hdr, &payload.encode(), [9u8; 32]);
+        assert!(
+            matches!(result, DispatchResult::RateLimited),
+            "a store beyond budget must soft-drop like a quota drop, got {result:?}",
+        );
+        assert_eq!(
+            d.dht.store_len(),
+            before,
+            "the record must not have been kept",
+        );
+    }
+
+    /// The bill this exists to cut is work done for OTHER people. A node that
+    /// metered the answers to its own questions would take itself off the
+    /// network to save bandwidth, which is not the trade anyone asked for.
+    #[test]
+    fn an_answer_to_our_own_question_is_never_charged() {
+        use crate::service_budget::ServiceKind;
+        let d = make_test_dispatcher(NodeRole::Leaf);
+        let hourly = d.abuse.service_budget.bytes_per_hour();
+        while d
+            .abuse
+            .service_budget
+            .try_serve(ServiceKind::Lookup, hourly / 64)
+        {}
+        let (_, refused_before, refusals_before) = d.abuse.service_budget.totals();
+
+        // Responses to our own walks, arriving with the budget fully spent.
+        for msg in [
+            veil_proto::family::DiscoveryMsg::FindNodeV2Response,
+            veil_proto::family::DiscoveryMsg::FindValueResponse,
+            veil_proto::family::DiscoveryMsg::ResolveTransportResponse,
+        ] {
+            let hdr = FrameHeader::new(FrameFamily::Discovery as u8, msg as u16);
+            d.dispatch(&hdr, &[0u8; 32], [9u8; 32]);
+        }
+        let (_, refused_after, refusals_after) = d.abuse.service_budget.totals();
+        assert_eq!(
+            (refused_before, refusals_before),
+            (refused_after, refusals_after),
+            "our own answers must not be metered as somebody else's work",
+        );
+    }
+
+    /// A seed is Core, serving other people is its whole job, and a default
+    /// nobody chose must never meter the network's backbone.
+    #[test]
+    fn a_core_dispatcher_serves_a_store_no_matter_how_much_it_has_served() {
+        use crate::service_budget::ServiceKind;
+        let d = make_test_dispatcher(NodeRole::Core);
+        for _ in 0..64 {
+            assert!(
+                d.abuse
+                    .service_budget
+                    .try_serve(ServiceKind::StoreRecord, 8 * 1024 * 1024),
+                "a Core node must not be metered by default",
+            );
         }
     }
 
@@ -2546,6 +2645,12 @@ mod tests {
                 ratchet: None,
             }),
             abuse: Arc::new(AbuseContext {
+                // From the ROLE, never a bare default: `Default` is the leaf
+                // figure, and handing it to a Core dispatcher meters the very
+                // nodes whose job is to serve.
+                service_budget: std::sync::Arc::new(
+                    crate::service_budget::ServiceBudget::for_role(role, None),
+                ),
                 rate_limiter: Arc::new(Mutex::new(PerPeerLimiter::new(
                     1000.0,
                     1000.0,
