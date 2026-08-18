@@ -2029,6 +2029,22 @@ pub struct DhtConfig {
     )]
     pub participate: bool,
 
+    /// Bytes per hour this node will spend on OTHER people's DHT work, or
+    /// `None` for the role default.
+    ///
+    /// Measured on an idle client: 85% of everything received was work done
+    /// for strangers — storing their records, answering their lookups, being a
+    /// hop of their walks — while the answers to the node's own questions were
+    /// one thousandth of the bill. [`participate`](Self::participate) is the
+    /// all-or-nothing version of the same question; this is the dial, because
+    /// on a network where every client is a leaf and only the seeds are core,
+    /// clients that store nothing take the replica set down to the seeds.
+    ///
+    /// Role defaults when unset: `core` unmetered (serving IS a seed's job),
+    /// `leaf` 8 MB/h. `Some(0)` refuses everything.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service_budget_bytes_per_hour: Option<u64>,
+
     /// Kademlia k-bucket size — contacts returned per FIND_NODE response (default 20).
     #[serde(default = "DhtConfig::default_k")]
     pub k: u8,
@@ -2320,6 +2336,7 @@ impl DhtConfig {
 impl Default for DhtConfig {
     fn default() -> Self {
         Self {
+            service_budget_bytes_per_hour: None,
             republish_interval_secs: Self::default_republish_interval_secs(),
             cleanup_interval_secs: Self::default_cleanup_interval_secs(),
             participate: Self::default_participate(),
@@ -5302,6 +5319,7 @@ mod config_knobs_tests {
     #[test]
     fn dht_config_non_default_roundtrip() {
         let custom = DhtConfig {
+            service_budget_bytes_per_hour: None,
             republish_interval_secs: 300,
             cleanup_interval_secs: 30,
             participate: true,
