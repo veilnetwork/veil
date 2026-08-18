@@ -9319,7 +9319,16 @@ impl NodeServices {
             .circuit_origin
             .as_ref()
             .map_or(0, |o| o.gc(now_unix));
-        if gc_relay + gc_rendezvous + gc_origin > 0 {
+        // Not a GC result: bindings the per-link ceiling dropped at register
+        // time, drained here so they ride the same line. A neighbour holding
+        // registry state past its table quota shows up as a non-zero count
+        // here and nowhere else.
+        let over_link_cap = self
+            .dispatcher
+            .circuit_rendezvous
+            .as_ref()
+            .map_or(0, |r| r.take_over_link_cap_evictions());
+        if gc_relay + gc_rendezvous + gc_origin > 0 || over_link_cap > 0 {
             // OBSERVABILITY (log-only): an evicted rendezvous binding is the
             // event that later surfaces as introduce.cookie_unknown at this
             // relay; an evicted relay circuit is what turns the NEXT forwarded
@@ -9327,7 +9336,8 @@ impl NodeServices {
             // evictions when they happen instead of leaving them silent.
             log::info!(
                 "anonymity.circuit.gc evicted relay_circuits={gc_relay} \
-                 rendezvous_bindings={gc_rendezvous} origin_circuits={gc_origin}"
+                 rendezvous_bindings={gc_rendezvous} origin_circuits={gc_origin} \
+                 over_link_cap={over_link_cap}"
             );
         }
 
