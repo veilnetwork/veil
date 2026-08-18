@@ -27,15 +27,22 @@ getrandom = "0.2"
 libc = "0.2"
 
 [target.'cfg(windows)'.dependencies]
-# `VirtualLock` / `VirtualUnlock` for `MlockedBytes`'s Windows backend.
-# Narrow feature gate — only the `Memory` namespace from Win32,
-# ≈ 30 KB extra compile time.  Matches the rust-msrv windows-sys
-# baseline (0.59 is stable as of 2026-Q2).
+# `VirtualLock` / `VirtualUnlock` for `MlockedBytes`'s Windows backend,
+# and the `Security` namespaces `win_acl` needs to give a bearer-token file
+# an explicit owner-SID-only DACL (Windows has no `chmod 0o600`, so an
+# unhardened token file inherits whatever the runtime directory allows).
+# Narrow feature gates — namespaces only, no umbrella `Win32`.  Matches the
+# rust-msrv windows-sys baseline (0.59 is stable as of 2026-Q2).
 windows-sys = { version = "0.59", features = [
     "Win32_System_Memory",
     "Win32_Foundation",
     "Win32_NetworkManagement_IpHelper",
     "Win32_Networking_WinSock",
+    # `win_acl`: token/SID lookup, ACL build + set + read-back.
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Threading",
 ] }
 
 [dev-dependencies]
