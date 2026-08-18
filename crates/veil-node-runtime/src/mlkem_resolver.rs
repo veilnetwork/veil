@@ -121,6 +121,32 @@ pub struct ResolvedCerts {
     pub expired_devices: usize,
     /// Devices the DHT did not answer for and that were never remembered.
     pub unknown_devices: usize,
+    /// How far the resolve actually got before it produced nothing.
+    pub stage: ResolveStage,
+}
+
+/// How far a fan-out resolve got before it ran out of things to ask.
+///
+/// A fan-out needs three records, and only the LAST of them is about
+/// certificates at all: the recipient's identity document, the instance
+/// registry that names its devices, and then one certificate per device.
+/// Missing any of the three ends with an empty `certs`, and the seal path
+/// reported all three as "the recipient has never published a certificate" —
+/// a sentence about the recipient's devices, said when we may never have
+/// learned that the recipient HAS any. Two live-stand iterations were spent
+/// looking for a certificate problem that was never the failing step.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum ResolveStage {
+    /// The recipient's devices were enumerated and each one was asked about.
+    /// Whatever went wrong is then genuinely about certificates.
+    #[default]
+    Fanned,
+    /// The recipient's identity document did not resolve, so its devices were
+    /// never enumerated and no certificate was ever asked for.
+    DocumentUnresolved,
+    /// The document resolved, but the instance registry naming the recipient's
+    /// devices did not — the same "no devices to ask" outcome, one step later.
+    RegistryUnresolved,
 }
 
 impl ResolvedCerts {
@@ -132,6 +158,16 @@ impl ResolvedCerts {
             certs: vec![cert],
             expired_devices: 0,
             unknown_devices: 0,
+            stage: ResolveStage::Fanned,
+        }
+    }
+
+    /// The resolve that never learned who the recipient's devices are.
+    #[must_use]
+    pub fn stopped_at(stage: ResolveStage) -> Self {
+        Self {
+            stage,
+            ..Self::default()
         }
     }
 
@@ -584,11 +620,16 @@ impl DhtMlKemEkResolver {
         // The per-device cache first; then the node-keyed cache, but only when
         // the row it holds already names this device (common for the
         // single-instance peer, where the two questions coincide).
-        if let Some((cert, ts)) = rlock!(self.instance_cert_cache).get(&(target_node_id, instance_id))
+        if let Some((cert, ts)) =
+            rlock!(self.instance_cert_cache).get(&(target_node_id, instance_id))
             && ts.elapsed() < self.cert_ttl
         {
             let cert = cert.clone();
-            self.log_dbg("mlkem_resolver.instance_cert.cache_hit", &target_node_id, "");
+            self.log_dbg(
+                "mlkem_resolver.instance_cert.cache_hit",
+                &target_node_id,
+                "",
+            );
             self.publish_ratchet_key(target_node_id, &cert);
             return Some(cert);
         }
@@ -725,7 +766,7 @@ impl DhtMlKemEkResolver {
     /// returns the ones that verified, and empty only when none did.
     pub async fn fetch_verified_certs(&self, target_node_id: [u8; 32]) -> ResolvedCerts {
         let Some(doc) = self.fetch_verified_document(target_node_id, None).await else {
-            return ResolvedCerts::default();
+            return ResolvedCerts::stopped_at(ResolveStage::DocumentUnresolved);
         };
         let Ok(now) = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) else {
             return ResolvedCerts::default();
@@ -755,7 +796,7 @@ impl DhtMlKemEkResolver {
             .await
         else {
             self.log_dbg("mlkem_resolver.registry.dht_miss", &target_node_id, "");
-            return ResolvedCerts::default();
+            return ResolvedCerts::stopped_at(ResolveStage::RegistryUnresolved);
         };
 
         self.certs_for_instances(target_node_id, &doc, &reg.instances, now_unix)
@@ -1340,7 +1381,8 @@ impl DhtMlKemEkResolver {
         target_node_id: [u8; 32],
         instance_id: [u8; 16],
     ) -> Option<VerifiedMlkemCert> {
-        if let Some((cert, ts)) = rlock!(self.instance_cert_cache).get(&(target_node_id, instance_id))
+        if let Some((cert, ts)) =
+            rlock!(self.instance_cert_cache).get(&(target_node_id, instance_id))
             && ts.elapsed() < self.cert_ttl
         {
             let cert = cert.clone();
@@ -1390,7 +1432,11 @@ impl DhtMlKemEkResolver {
             (verified.clone(), std::time::Instant::now()),
         );
         self.publish_ratchet_key(target_node_id, &verified);
-        self.log_dbg("mlkem_resolver.instance_cert.local_hit", &target_node_id, "");
+        self.log_dbg(
+            "mlkem_resolver.instance_cert.local_hit",
+            &target_node_id,
+            "",
+        );
         Some(verified)
     }
 }
@@ -1857,14 +1903,18 @@ mod tests {
             ),
         );
         assert_eq!(
-            resolver.fetch_verified_cert_for_instance(target, device).await,
+            resolver
+                .fetch_verified_cert_for_instance(target, device)
+                .await,
             Some(dummy_cert_with_instance(target, device)),
         );
         // TTL is enforced on this cache too: expired means the peerless walk,
         // which yields None.
         let resolver = resolver.with_cert_ttl(Duration::from_secs(0));
         assert_eq!(
-            resolver.fetch_verified_cert_for_instance(target, device).await,
+            resolver
+                .fetch_verified_cert_for_instance(target, device)
+                .await,
             None,
         );
     }

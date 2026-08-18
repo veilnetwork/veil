@@ -198,9 +198,8 @@ impl NodeRuntime {
             // minutes — detection latency after a resume must not ride along.
             // NEVER battery-throttled: a throttled detector is a detector that
             // misses exactly the low-power suspensions it exists for.
-            let mut suspension_interval = tokio::time::interval(
-                super::suspension_watch::SUSPENSION_SAMPLE_INTERVAL,
-            );
+            let mut suspension_interval =
+                tokio::time::interval(super::suspension_watch::SUSPENSION_SAMPLE_INTERVAL);
             let mut suspension_watch = super::suspension_watch::SuspensionWatch::new(
                 super::suspension_watch::DEFAULT_SUSPENSION_GAP_THRESHOLD,
             );
