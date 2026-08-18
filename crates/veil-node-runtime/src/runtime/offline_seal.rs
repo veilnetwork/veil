@@ -38,7 +38,7 @@ use veil_proto::ipc::AuthAppDeliver;
 use veil_session::SessionTxRegistry;
 
 use crate::mlkem_cert_store::MlKemCertStore;
-use crate::mlkem_resolver::{DhtMlKemEkResolver, PeerMlKemCertCache, ResolvedCerts};
+use crate::mlkem_resolver::{DhtMlKemEkResolver, PeerMlKemCertCache, ResolveStage, ResolvedCerts};
 
 /// Auth-deliver freshness window for the OFFLINE (mailbox) open path. Unlike the
 /// 300s live-onion window, a stored-and-forwarded message is delivered whenever
@@ -159,22 +159,45 @@ pub(crate) fn select_own_device_instance(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CertUnresolved {
     /// Nothing on the DHT and nothing remembered, for any device of the
-    /// recipient.
-    NothingFound,
+    /// recipient. `devices` is how many were asked about — `0` means the
+    /// recipient is known to have none we can address.
+    NothingFound {
+        /// How many devices were asked about and answered for by nobody.
+        devices: usize,
+    },
     /// Every device that could have been sealed for had only a remembered
     /// certificate whose own signed validity window has closed.
     OnlyExpired {
         /// How many devices were in that state.
         devices: usize,
     },
+    /// The recipient's identity document never resolved, so its devices were
+    /// never enumerated. NOT a statement about certificates: this recipient
+    /// may be publishing perfectly and simply be unreachable from here — on
+    /// another network, or behind a routing table that has not filled yet.
+    DocumentUnresolved,
+    /// The document resolved but the registry naming the recipient's devices
+    /// did not. Same "we never learned who to ask" class as
+    /// [`Self::DocumentUnresolved`], one step further in.
+    RegistryUnresolved,
 }
 
 impl std::fmt::Display for CertUnresolved {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::NothingFound => f.write_str(
-                "nothing resolved and nothing stored — the recipient has never published \
-                 a certificate we have seen",
+            Self::NothingFound { devices } => write!(
+                f,
+                "{devices} device(s) of the recipient were asked about and none has a \
+                 certificate on the network or one we had stored",
+            ),
+            Self::DocumentUnresolved => f.write_str(
+                "the recipient's identity document did not resolve — its devices were never \
+                 enumerated, so this says nothing about its certificates; the recipient may \
+                 be unreachable from this node rather than unpublished",
+            ),
+            Self::RegistryUnresolved => f.write_str(
+                "the recipient's identity document resolved but its instance registry did \
+                 not — we never learned which devices to ask about",
             ),
             Self::OnlyExpired { devices } => write!(
                 f,
@@ -188,12 +211,22 @@ impl std::fmt::Display for CertUnresolved {
 impl ResolvedCerts {
     /// The reason a resolve produced nothing to seal to.
     fn unresolved(&self) -> CertUnresolved {
+        // Stage first: a resolve that never enumerated the recipient's devices
+        // has no standing to say anything about their certificates, however
+        // many or few it counted.
+        match self.stage {
+            ResolveStage::DocumentUnresolved => return CertUnresolved::DocumentUnresolved,
+            ResolveStage::RegistryUnresolved => return CertUnresolved::RegistryUnresolved,
+            ResolveStage::Fanned => {}
+        }
         if self.expired_devices > 0 {
             CertUnresolved::OnlyExpired {
                 devices: self.expired_devices,
             }
         } else {
-            CertUnresolved::NothingFound
+            CertUnresolved::NothingFound {
+                devices: self.unknown_devices,
+            }
         }
     }
 }
@@ -701,13 +734,14 @@ mod tests {
     fn the_reason_separates_expired_material_from_none_at_all() {
         assert_eq!(
             ResolvedCerts::default().unresolved(),
-            CertUnresolved::NothingFound,
+            CertUnresolved::NothingFound { devices: 0 },
         );
         assert_eq!(
             ResolvedCerts {
                 certs: Vec::new(),
                 expired_devices: 2,
                 unknown_devices: 1,
+                stage: ResolveStage::Fanned,
             }
             .unresolved(),
             CertUnresolved::OnlyExpired { devices: 2 },
@@ -718,6 +752,65 @@ mod tests {
                 .to_string()
                 .contains("republish"),
             "the error itself must say what has to happen next",
+        );
+    }
+
+    /// A resolve that never learned who the recipient's devices are must not
+    /// answer for them.
+    ///
+    /// The fan-out needs the identity document, then the instance registry,
+    /// then one certificate per device — and only the third step is about
+    /// certificates. Every one of the three used to end as the same sentence,
+    /// "the recipient has never published a certificate we have seen", which
+    /// is a claim about devices whose existence the first two steps never
+    /// established. Two live-stand iterations were spent hunting a certificate
+    /// problem while the real answer was that the peers in question were on a
+    /// different network and their documents were never resolvable from here.
+    #[test]
+    fn a_resolve_that_never_enumerated_devices_says_so_instead_of_blaming_certificates() {
+        for (stage, expected) in [
+            (
+                ResolveStage::DocumentUnresolved,
+                CertUnresolved::DocumentUnresolved,
+            ),
+            (
+                ResolveStage::RegistryUnresolved,
+                CertUnresolved::RegistryUnresolved,
+            ),
+        ] {
+            // Device counts deliberately non-zero AND expired-looking: the
+            // stage must win, because those counts were never collected about
+            // this recipient's real device set.
+            let resolved = ResolvedCerts {
+                certs: Vec::new(),
+                expired_devices: 3,
+                unknown_devices: 4,
+                stage,
+            };
+            assert_eq!(
+                resolved.unresolved(),
+                expected,
+                "{stage:?} must not be reported as a certificate verdict",
+            );
+            let said = OfflineSealError::RecipientCertUnresolved(resolved.unresolved()).to_string();
+            assert!(
+                !said.contains("never published"),
+                "{stage:?} must not accuse the recipient of not publishing: {said}",
+            );
+        }
+
+        // And the genuine certificate verdict still carries how many devices
+        // were actually asked, so "nobody answered for 3 devices" is not the
+        // same line as "this recipient has no devices we can address".
+        assert_eq!(
+            ResolvedCerts {
+                certs: Vec::new(),
+                expired_devices: 0,
+                unknown_devices: 3,
+                stage: ResolveStage::Fanned,
+            }
+            .unresolved(),
+            CertUnresolved::NothingFound { devices: 3 },
         );
     }
 
@@ -970,12 +1063,8 @@ mod tests {
         // a DHT.
         let certs: Vec<_> = (0u8..5)
             .map(|i| {
-                local_verified_cert(
-                    identity,
-                    [i + 1; 16],
-                    &[i + 13; veil_e2e::DK_SEED_BYTES],
-                )
-                .expect("local cert")
+                local_verified_cert(identity, [i + 1; 16], &[i + 13; veil_e2e::DK_SEED_BYTES])
+                    .expect("local cert")
             })
             .collect();
         let auth = sov.sign_auth_deliver(
@@ -987,9 +1076,14 @@ mod tests {
             vec![0xABu8; 1800],
             Vec::new(),
         );
-        let single =
-            mailbox_seal::seal_mailbox_blob(&auth, &certs[..1], &identity, &identity, &sov.document)
-                .expect("single-envelope seal");
+        let single = mailbox_seal::seal_mailbox_blob(
+            &auth,
+            &certs[..1],
+            &identity,
+            &identity,
+            &sov.document,
+        )
+        .expect("single-envelope seal");
         let fan =
             mailbox_seal::seal_mailbox_blob(&auth, &certs, &identity, &identity, &sov.document)
                 .expect("family-fan seal");
@@ -1050,7 +1144,10 @@ mod audience_tests {
     /// caught up with this instance yet must not silently drop a recipient.
     #[test]
     fn an_unlisted_sender_removes_nobody() {
-        assert_eq!(other_instances(vec![entry(1), entry(2)], [0xEE; 16]).len(), 2);
+        assert_eq!(
+            other_instances(vec![entry(1), entry(2)], [0xEE; 16]).len(),
+            2
+        );
     }
 
     fn entry_bound(

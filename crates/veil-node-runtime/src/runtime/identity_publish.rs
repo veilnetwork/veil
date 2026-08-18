@@ -51,8 +51,8 @@ impl crate::runtime::NodeRuntime {
         use crate::error::NodeError;
 
         let dir = self.identity_dir.clone();
-        let sov = veil_identity::sovereign::SovereignIdentity::load_from_dir(&dir)
-            .map_err(|e| {
+        let sov =
+            veil_identity::sovereign::SovereignIdentity::load_from_dir(&dir).map_err(|e| {
                 NodeError::Identity(format!("identity re-read from {}: {e}", dir.display()))
             })?;
         // `load_from_dir` has already checked that the document still names the
@@ -365,9 +365,7 @@ mod tests {
             "a registry naming one device HIDES the other — it overwrites, it does not coexist",
         );
         assert!(
-            reg.instances
-                .iter()
-                .any(|i| i.instance_id == [0xEEu8; 16]),
+            reg.instances.iter().any(|i| i.instance_id == [0xEEu8; 16]),
             "the device that joined has to be in it",
         );
         assert_eq!(
