@@ -95,6 +95,121 @@ struct SignedBody {
 /// other JSON file format.
 const INSTALLED_VERSION_MAC_DOMAIN: &[u8] = b"veil-installed-version-mac-v1\0";
 
+/// `release_unix` of the build this binary came from, baked in at compile time
+/// from `$VEIL_RELEASE_UNIX`.
+///
+/// `scripts/build-release.sh` exports it from the same `--source-date-epoch`
+/// variable it hands to `update sign-manifest --release-unix`, so a release
+/// binary and the manifest that publishes it carry the identical number. A
+/// developer `cargo build` leaves the variable unset and gets `0`, which
+/// contributes no floor — exactly today's behaviour.
+///
+/// A DEDICATED variable rather than `SOURCE_DATE_EPOCH`: distro build systems
+/// (Debian, Nix, Guix) set `SOURCE_DATE_EPOCH` to their own changelog date, and
+/// a downstream rebuild stamped later than the upstream manifest would refuse
+/// upstream's updates forever. This name is ours.
+pub const EMBEDDED_RELEASE_UNIX: u64 = parse_embedded_release_unix();
+
+/// Decimal parse in const context. A malformed `VEIL_RELEASE_UNIX` fails the
+/// BUILD rather than silently degrading to `0` — a release binary that quietly
+/// shipped without its floor is the failure this whole constant exists to
+/// prevent, and it would be invisible until someone tried the downgrade.
+const fn parse_embedded_release_unix() -> u64 {
+    match option_env!("VEIL_RELEASE_UNIX") {
+        None => 0,
+        Some(text) => {
+            let bytes = text.as_bytes();
+            if bytes.is_empty() {
+                panic!("VEIL_RELEASE_UNIX is set but empty");
+            }
+            let mut value: u64 = 0;
+            let mut i = 0;
+            while i < bytes.len() {
+                let digit = bytes[i];
+                if digit < b'0' || digit > b'9' {
+                    panic!("VEIL_RELEASE_UNIX must be decimal digits only");
+                }
+                // Overflow is a const-eval error, so an absurd value is a build
+                // failure too.
+                value = value * 10 + (digit - b'0') as u64;
+                i += 1;
+            }
+            value
+        }
+    }
+}
+
+/// The monotonic release floor an apply (or an availability decision) must
+/// clear, given the authenticated on-disk record.
+///
+/// Missing state used to mean floor `0` — "fresh install, anything signed is
+/// newer". That is true of a fresh install and false of an installed node whose
+/// state file was deleted, and deleting one file is not a privilege. The gap
+/// was wide enough for an OLD but still-validly-signed and still-unexpired
+/// manifest to replace a newer running binary, reintroducing whatever that
+/// release fixed.
+///
+/// The running binary's own release timestamp closes it: a process cannot be
+/// executing a build that had not been published yet, so
+/// [`EMBEDDED_RELEASE_UNIX`] is a floor an attacker cannot lower without first
+/// replacing the binary — which is the thing they were trying to do. A genuine
+/// fresh install is unaffected, because its binary was published before the
+/// update it is fetching; and an authenticated record NEWER than the embedded
+/// value still wins, so a node that has already updated is not dragged back to
+/// its original release.
+pub fn anti_downgrade_floor(recorded: Option<u64>) -> u64 {
+    anti_downgrade_floor_from(recorded, embedded_release_unix())
+}
+
+/// [`anti_downgrade_floor`] with the embedded value passed in, so the policy
+/// can be stated once and checked without rebuilding the crate.
+pub(crate) fn anti_downgrade_floor_from(recorded: Option<u64>, embedded: u64) -> u64 {
+    recorded.unwrap_or(0).max(embedded)
+}
+
+#[cfg(not(test))]
+fn embedded_release_unix() -> u64 {
+    EMBEDDED_RELEASE_UNIX
+}
+
+/// Test builds read the embedded floor through a thread-local so the REAL
+/// decision — the one `apply_update` makes at its own call site — can be
+/// exercised against a non-zero floor. A test suite compiled without
+/// `VEIL_RELEASE_UNIX` has an embedded value of `0`, and a fix whose only
+/// coverage was a helper function returning `0` would pass just as happily
+/// with the fix removed.
+#[cfg(test)]
+fn embedded_release_unix() -> u64 {
+    EMBEDDED_RELEASE_UNIX_OVERRIDE.with(|slot| slot.get().unwrap_or(EMBEDDED_RELEASE_UNIX))
+}
+
+#[cfg(test)]
+thread_local! {
+    static EMBEDDED_RELEASE_UNIX_OVERRIDE: std::cell::Cell<Option<u64>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Pretend, for the current thread, that this binary was published at
+/// `release_unix`. Restores the previous value on drop so tests running in
+/// parallel on other threads are untouched.
+#[cfg(test)]
+pub(crate) struct EmbeddedReleaseGuard(Option<u64>);
+
+#[cfg(test)]
+impl EmbeddedReleaseGuard {
+    pub(crate) fn set(release_unix: u64) -> Self {
+        let previous = EMBEDDED_RELEASE_UNIX_OVERRIDE.with(|slot| slot.replace(Some(release_unix)));
+        Self(previous)
+    }
+}
+
+#[cfg(test)]
+impl Drop for EmbeddedReleaseGuard {
+    fn drop(&mut self) {
+        EMBEDDED_RELEASE_UNIX_OVERRIDE.with(|slot| slot.set(self.0));
+    }
+}
+
 /// File-backed persistence for `installed_release_unix`.
 #[derive(Debug, Clone)]
 pub struct InstalledVersionStore {
@@ -268,6 +383,69 @@ mod tests {
             .unwrap_or(0);
         let pid = std::process::id();
         std::env::temp_dir().join(format!("veil-installed-version-{label}-{pid}-{nanos}.json"))
+    }
+
+    // ── V13-H4: the floor must not collapse when the state file goes away ──
+
+    /// The defect. `read_release_unix_for_apply` reports `None` for a deleted
+    /// state file exactly as it does for a fresh install, and `unwrap_or(0)`
+    /// turned that into "any signed manifest is newer". Deleting one JSON file
+    /// is not a privilege; it must not buy an attacker a downgrade.
+    #[test]
+    fn missing_state_falls_back_to_the_embedded_release() {
+        let embedded = 1_800_000_000;
+        assert_eq!(anti_downgrade_floor_from(None, embedded), embedded);
+    }
+
+    /// A genuine fresh install still installs: the binary was published before
+    /// the update it is fetching, so the manifest clears its own binary's floor.
+    #[test]
+    fn a_fresh_install_still_clears_its_own_embedded_floor() {
+        let embedded = 1_800_000_000;
+        let newer_manifest = embedded + 1;
+        assert!(newer_manifest > anti_downgrade_floor_from(None, embedded));
+    }
+
+    /// A node that has already updated must not be dragged back to the release
+    /// its binary shipped with: the authenticated record wins when it is higher.
+    #[test]
+    fn an_authenticated_state_newer_than_embedded_wins() {
+        let embedded = 1_800_000_000;
+        let recorded = 1_900_000_000;
+        assert_eq!(
+            anti_downgrade_floor_from(Some(recorded), embedded),
+            recorded
+        );
+    }
+
+    /// And the reverse: a hand-replaced binary newer than the record is floored
+    /// by the binary, not by the stale record.
+    #[test]
+    fn an_embedded_release_newer_than_the_state_wins() {
+        let embedded = 1_900_000_000;
+        let recorded = 1_800_000_000;
+        assert_eq!(
+            anti_downgrade_floor_from(Some(recorded), embedded),
+            embedded
+        );
+    }
+
+    /// A developer build leaves `VEIL_RELEASE_UNIX` unset, contributes no floor,
+    /// and behaves exactly as before.
+    #[test]
+    fn an_unstamped_build_contributes_no_floor() {
+        assert_eq!(anti_downgrade_floor_from(Some(42), 0), 42);
+        assert_eq!(anti_downgrade_floor_from(None, 0), 0);
+    }
+
+    /// The public entry point must consult the embedded value, not just the
+    /// record — this is what `apply_update` and the checker actually call.
+    #[test]
+    fn the_public_floor_consults_the_embedded_release() {
+        let _guard = EmbeddedReleaseGuard::set(1_800_000_000);
+        assert_eq!(anti_downgrade_floor(None), 1_800_000_000);
+        assert_eq!(anti_downgrade_floor(Some(1_700_000_000)), 1_800_000_000);
+        assert_eq!(anti_downgrade_floor(Some(1_900_000_000)), 1_900_000_000);
     }
 
     #[test]

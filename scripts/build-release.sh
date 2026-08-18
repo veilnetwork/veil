@@ -157,6 +157,14 @@ fi
 # ── Build environment — deterministic flags ─────────────────────────────────
 
 export SOURCE_DATE_EPOCH="$source_date_epoch"
+# Anti-downgrade floor compiled INTO the binary (audit V13-H4).  Same number
+# that `update sign-manifest --release-unix` writes into this build's manifest
+# below, so the binary refuses anything published at-or-before its own release
+# even when the on-disk installed-version state file has been deleted.  A
+# dedicated variable, not SOURCE_DATE_EPOCH itself: distro rebuilds set that one
+# to their own changelog date, and a downstream stamp later than the upstream
+# manifest would refuse upstream's updates forever.
+export VEIL_RELEASE_UNIX="$source_date_epoch"
 # --remap-path-prefix strips host paths from binary debug info so
 # the binary built on /home/alice/veil matches /Users/bob/proj/veil.
 export RUSTFLAGS="${RUSTFLAGS:-} --remap-path-prefix=$REPO_ROOT=. --remap-path-prefix=$HOME=/HOME"

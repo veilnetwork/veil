@@ -27,7 +27,9 @@ use veil_transport::TransportContext;
 use veil_types::UpdateConfig;
 
 use super::fetch::{FetchError, UpdateAvailability, check_for_update_via_https};
-use super::installed_version::{InstalledVersionError, InstalledVersionStore};
+use super::installed_version::{
+    InstalledVersionError, InstalledVersionStore, anti_downgrade_floor,
+};
 
 /// Absolute lower bound for a believable wall clock, used only in the
 /// "no installed version recorded" (check-only) mode where there is no
@@ -159,17 +161,22 @@ impl UpdateChecker {
         Ok(availability)
     }
 
-    /// Read installed release_unix. None on disk → 0 (fresh
-    /// install — any signed manifest is "newer").
+    /// Read installed release_unix, floored by the release timestamp compiled
+    /// into this binary.
+    ///
+    /// The floor has to match the apply path's (V13-H4), or a deleted state
+    /// file would make the checker announce an old manifest as "Available" and
+    /// the apply that follows would reject it — an update prompt that can never
+    /// be satisfied. See `installed_version::anti_downgrade_floor`.
     fn read_installed_release_unix(&self) -> Result<u64, CheckerError> {
         let Some(ref path) = self.config.installed_version_path else {
             // No state file configured. This is the supported "check-
             // only" mode: operator runs `update --check` from a
             // package-manager-installed binary; the manifest is just
             // for "hey, version X published" notification, no apply
-            // path. Treat as `0` so any signed manifest reports
-            // Available.
-            return Ok(0);
+            // path. There is no recorded install, so the embedded
+            // release timestamp is the whole floor.
+            return Ok(anti_downgrade_floor(None));
         };
         match self.installed_version_hmac_key {
             // M16: authenticate the read like the apply path. A present-but-wrong
@@ -180,11 +187,11 @@ impl UpdateChecker {
             Some(key) => {
                 let store = InstalledVersionStore::with_hmac_key(path.clone(), key);
                 let v = store.read_release_unix_for_apply()?;
-                Ok(v.unwrap_or(0))
+                Ok(anti_downgrade_floor(v))
             }
             None => {
                 let store = InstalledVersionStore::new(path.clone());
-                Ok(store.read_release_unix()?.unwrap_or(0))
+                Ok(anti_downgrade_floor(store.read_release_unix()?))
             }
         }
     }
