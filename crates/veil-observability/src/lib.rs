@@ -18,10 +18,26 @@ pub const FRAME_FAMILY_SLOTS: usize = 16;
 /// Slots for the `relay_chain` message-type split.
 pub const RELAY_CHAIN_TYPE_SLOTS: usize = 16;
 
-/// `FrameFamily::RelayChain` discriminant, the one family split by message
-/// type. Kept as a plain number so this crate does not have to match on the
-/// enum; the test pins it against `FrameFamily::RelayChain as u8`.
+/// Slots for the `discovery` and `routing` message-type splits.
+///
+/// Same reason `relay_chain` got one: on an idle production client those two
+/// families were 49% and 24% of everything received, and "discovery" is not an
+/// answer — a walk this node asked for, a walk it was asked to forward, and a
+/// record somebody stored on it are three different costs with three different
+/// remedies, and they were one number.
+pub const DISCOVERY_TYPE_SLOTS: usize = 16;
+/// Routing needs more than a family-sized array: `RecursiveQuery` /
+/// `RecursiveResponse` sit at 0x10/0x11, and a 16-slot array would fold the
+/// two recursive-walk types — the ones a client forwards on somebody else's
+/// behalf — into the same "other" bucket as an unknown code.
+pub const ROUTING_TYPE_SLOTS: usize = 24;
+
+/// Discriminants of the families split by message type. Kept as plain numbers
+/// so this crate does not have to match on the enum; the test pins each
+/// against `FrameFamily::<V> as u8`.
 pub const FRAME_FAMILY_RELAY_CHAIN: u8 = 10;
+pub const FRAME_FAMILY_DISCOVERY: u8 = 2;
+pub const FRAME_FAMILY_ROUTING: u8 = 8;
 
 /// Where bytes whose family discriminant does not fit [`FRAME_FAMILY_SLOTS`]
 /// are counted, so the split always sums to the total.
@@ -32,6 +48,28 @@ fn relay_chain_type_label(slot: usize) -> &'static str {
     match u16::try_from(slot)
         .ok()
         .and_then(|v| veil_proto::family::RelayChainMsg::try_from(v).ok())
+    {
+        Some(msg) => msg.label(),
+        None => "other",
+    }
+}
+
+/// Metric label for a `discovery` message-type slot.
+fn discovery_type_label(slot: usize) -> &'static str {
+    match u16::try_from(slot)
+        .ok()
+        .and_then(|v| veil_proto::family::DiscoveryMsg::try_from(v).ok())
+    {
+        Some(msg) => msg.label(),
+        None => "other",
+    }
+}
+
+/// Metric label for a `routing` message-type slot.
+fn routing_type_label(slot: usize) -> &'static str {
+    match u16::try_from(slot)
+        .ok()
+        .and_then(|v| veil_proto::family::RoutingMsg::try_from(v).ok())
     {
         Some(msg) => msg.label(),
         None => "other",
@@ -109,6 +147,10 @@ pub struct NodeMetrics {
     /// 98.9% of a client's inbound while its data-cell counter accounted for
     /// 3% of the volume, so the family alone was not enough to say what it is.
     transport_bytes_rx_relay_chain: Arc<[AtomicU64; RELAY_CHAIN_TYPE_SLOTS]>,
+    /// Inbound `discovery` and `routing` bytes split by message type — the two
+    /// families that dominate an idle client and could not say why.
+    transport_bytes_rx_discovery: Arc<[AtomicU64; DISCOVERY_TYPE_SLOTS]>,
+    transport_bytes_rx_routing: Arc<[AtomicU64; ROUTING_TYPE_SLOTS]>,
     // ── Session plane ────────────────────────────────────────────────────────
     session_handshake_failures_total: Arc<AtomicU64>,
     // ── Discovery / DHT ──────────────────────────────────────────────────────
@@ -362,6 +404,9 @@ pub struct MetricsSnapshot {
     pub transport_bytes_rx_by_family: [u64; FRAME_FAMILY_SLOTS],
     /// Inbound `relay_chain` bytes by message type.
     pub transport_bytes_rx_relay_chain: [u64; RELAY_CHAIN_TYPE_SLOTS],
+    /// Inbound `discovery` / `routing` bytes by message type.
+    pub transport_bytes_rx_discovery: [u64; DISCOVERY_TYPE_SLOTS],
+    pub transport_bytes_rx_routing: [u64; ROUTING_TYPE_SLOTS],
     // Session
     pub session_handshake_failures_total: u64,
     // DHT
@@ -581,6 +626,8 @@ impl NodeMetrics {
             transport_bytes_tx_total: counter!(),
             transport_bytes_rx_by_family: Arc::new(std::array::from_fn(|_| AtomicU64::new(0))),
             transport_bytes_rx_relay_chain: Arc::new(std::array::from_fn(|_| AtomicU64::new(0))),
+            transport_bytes_rx_discovery: Arc::new(std::array::from_fn(|_| AtomicU64::new(0))),
+            transport_bytes_rx_routing: Arc::new(std::array::from_fn(|_| AtomicU64::new(0))),
             session_handshake_failures_total: counter!(),
             dht_store_total: counter!(),
             dht_lookup_total: counter!(),
@@ -714,14 +761,26 @@ impl NodeMetrics {
         // One family is split further: it carried 98.9% of a client's inbound
         // while its data-cell counter accounted for 3% of the volume, so the
         // family alone could not say what the bytes were.
-        if family == FRAME_FAMILY_RELAY_CHAIN {
+        let split = match family {
+            FRAME_FAMILY_RELAY_CHAIN => Some((
+                &self.transport_bytes_rx_relay_chain[..],
+                RELAY_CHAIN_TYPE_SLOTS,
+            )),
+            FRAME_FAMILY_DISCOVERY => {
+                Some((&self.transport_bytes_rx_discovery[..], DISCOVERY_TYPE_SLOTS))
+            }
+            FRAME_FAMILY_ROUTING => {
+                Some((&self.transport_bytes_rx_routing[..], ROUTING_TYPE_SLOTS))
+            }
+            _ => None,
+        };
+        if let Some((slots, len)) = split {
             let t = usize::from(msg_type);
-            let t = if t < RELAY_CHAIN_TYPE_SLOTS - 1 {
-                t
-            } else {
-                RELAY_CHAIN_TYPE_SLOTS - 1
-            };
-            self.transport_bytes_rx_relay_chain[t].fetch_add(value, Ordering::Relaxed);
+            // Everything past the last slot lands IN the last slot, so a split
+            // still sums to its family total. A dropped type would make this
+            // metric lie in the one situation it exists to diagnose.
+            let t = if t < len - 1 { t } else { len - 1 };
+            slots[t].fetch_add(value, Ordering::Relaxed);
         }
     }
 
@@ -1237,6 +1296,12 @@ impl NodeMetrics {
             transport_bytes_rx_relay_chain: std::array::from_fn(|i| {
                 self.transport_bytes_rx_relay_chain[i].load(Ordering::Relaxed)
             }),
+            transport_bytes_rx_discovery: std::array::from_fn(|i| {
+                self.transport_bytes_rx_discovery[i].load(Ordering::Relaxed)
+            }),
+            transport_bytes_rx_routing: std::array::from_fn(|i| {
+                self.transport_bytes_rx_routing[i].load(Ordering::Relaxed)
+            }),
             transport_bytes_tx_total: load!(transport_bytes_tx_total),
             session_handshake_failures_total: load!(session_handshake_failures_total),
             dht_store_total: load!(dht_store_total),
@@ -1376,6 +1441,24 @@ impl NodeMetrics {
             let name = relay_chain_type_label(i);
             out.push_str(&format!(
                 "veil_transport_bytes_rx_relay_chain{{type=\"{name}\"}} {bytes}\n"
+            ));
+        }
+        for (i, bytes) in s.transport_bytes_rx_discovery.iter().enumerate() {
+            if *bytes == 0 {
+                continue;
+            }
+            let name = discovery_type_label(i);
+            out.push_str(&format!(
+                "veil_transport_bytes_rx_discovery{{type=\"{name}\"}} {bytes}\n"
+            ));
+        }
+        for (i, bytes) in s.transport_bytes_rx_routing.iter().enumerate() {
+            if *bytes == 0 {
+                continue;
+            }
+            let name = routing_type_label(i);
+            out.push_str(&format!(
+                "veil_transport_bytes_rx_routing{{type=\"{name}\"}} {bytes}\n"
             ));
         }
         counter!("veil_transport_bytes_tx_total", s.transport_bytes_tx_total);
@@ -1902,6 +1985,75 @@ mod tests {
         assert_eq!(
             FRAME_FAMILY_RELAY_CHAIN,
             veil_proto::family::FrameFamily::RelayChain as u8
+        );
+    }
+}
+
+#[cfg(test)]
+mod family_split_tests {
+    use super::*;
+
+    /// The discriminants this crate hard-codes must be the ones the wire uses.
+    #[test]
+    fn the_split_families_are_the_ones_they_claim_to_be() {
+        use veil_proto::family::FrameFamily;
+        assert_eq!(FRAME_FAMILY_RELAY_CHAIN, FrameFamily::RelayChain as u8);
+        assert_eq!(FRAME_FAMILY_DISCOVERY, FrameFamily::Discovery as u8);
+        assert_eq!(FRAME_FAMILY_ROUTING, FrameFamily::Routing as u8);
+    }
+
+    /// Every message type of a split family must have a slot of its own.
+    ///
+    /// Routing is the one that nearly did not: `RecursiveQuery` and
+    /// `RecursiveResponse` sit at 0x10/0x11, above a family-sized array, and
+    /// those two are exactly the traffic a client forwards for other people —
+    /// the thing the split exists to make visible. Folded into "other" they
+    /// would have been indistinguishable from an unknown code.
+    #[test]
+    fn no_message_type_of_a_split_family_falls_into_other() {
+        use veil_proto::family::{DiscoveryMsg, RoutingMsg};
+        for t in 0u16..64 {
+            if let Ok(msg) = DiscoveryMsg::try_from(t) {
+                assert!(
+                    usize::from(t) < DISCOVERY_TYPE_SLOTS - 1,
+                    "discovery {} would be counted as other",
+                    msg.label()
+                );
+            }
+            if let Ok(msg) = RoutingMsg::try_from(t) {
+                assert!(
+                    usize::from(t) < ROUTING_TYPE_SLOTS - 1,
+                    "routing {} would be counted as other",
+                    msg.label()
+                );
+            }
+        }
+    }
+
+    /// A split must sum to its family total, or the metric lies in exactly the
+    /// situation it exists to diagnose.
+    #[test]
+    fn a_split_sums_to_its_family() {
+        let m = NodeMetrics::new();
+        m.add_transport_bytes_rx_family(FRAME_FAMILY_DISCOVERY, 1, 100);
+        m.add_transport_bytes_rx_family(FRAME_FAMILY_DISCOVERY, 12, 40);
+        // An out-of-range type still has to be counted somewhere.
+        m.add_transport_bytes_rx_family(FRAME_FAMILY_DISCOVERY, 9999, 7);
+        m.add_transport_bytes_rx_family(FRAME_FAMILY_ROUTING, 0x11, 55);
+        let s = m.snapshot();
+        assert_eq!(
+            s.transport_bytes_rx_discovery.iter().sum::<u64>(),
+            s.transport_bytes_rx_by_family[usize::from(FRAME_FAMILY_DISCOVERY)],
+        );
+        assert_eq!(s.transport_bytes_rx_discovery[1], 100);
+        assert_eq!(s.transport_bytes_rx_discovery[DISCOVERY_TYPE_SLOTS - 1], 7);
+        assert_eq!(
+            s.transport_bytes_rx_routing.iter().sum::<u64>(),
+            s.transport_bytes_rx_by_family[usize::from(FRAME_FAMILY_ROUTING)],
+        );
+        assert_eq!(
+            s.transport_bytes_rx_routing[0x11], 55,
+            "a recursive response must not land in the overflow slot",
         );
     }
 }

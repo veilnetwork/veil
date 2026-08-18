@@ -365,6 +365,27 @@ pub enum DiscoveryMsg {
     AnnounceTransport = 14,
 }
 
+impl DiscoveryMsg {
+    /// Stable lower-case name, for metric labels and logs. Exhaustive, so a
+    /// new message type cannot be added without one.
+    pub fn label(self) -> &'static str {
+        match self {
+            DiscoveryMsg::FindValue => "find_value",
+            DiscoveryMsg::Store => "store",
+            DiscoveryMsg::Delete => "delete",
+            DiscoveryMsg::AnnounceAttachment => "announce_attachment",
+            DiscoveryMsg::GetAttachment => "get_attachment",
+            DiscoveryMsg::GetAppEndpoint => "get_app_endpoint",
+            DiscoveryMsg::FindValueResponse => "find_value_response",
+            DiscoveryMsg::FindNodeV2 => "find_node_v2",
+            DiscoveryMsg::FindNodeV2Response => "find_node_v2_response",
+            DiscoveryMsg::ResolveTransport => "resolve_transport",
+            DiscoveryMsg::ResolveTransportResponse => "resolve_transport_response",
+            DiscoveryMsg::AnnounceTransport => "announce_transport",
+        }
+    }
+}
+
 impl TryFrom<u16> for DiscoveryMsg {
     type Error = ProtoError;
     fn try_from(v: u16) -> Result<Self, Self::Error> {
@@ -1045,6 +1066,28 @@ pub enum RoutingMsg {
     // route-gossip plane. Removed (report6 V-H2): they duplicated
     // RouteAnnounce / RouteWithdraw, which are emitted in the same code blocks,
     // while carrying none of that plane's protections. Do not reuse the codes.
+}
+
+impl RoutingMsg {
+    /// Stable lower-case name, for metric labels and logs. Exhaustive, so a
+    /// new message type cannot be added without one.
+    pub fn label(self) -> &'static str {
+        match self {
+            RoutingMsg::RouteAnnounce => "route_announce",
+            RoutingMsg::RouteWithdraw => "route_withdraw",
+            RoutingMsg::RouteRequest => "route_request",
+            RoutingMsg::RouteResponse => "route_response",
+            RoutingMsg::PowChallenge => "pow_challenge",
+            RoutingMsg::PowResponse => "pow_response",
+            RoutingMsg::PowAccept => "pow_accept",
+            RoutingMsg::RouteAnnounceAliased => "route_announce_aliased",
+            RoutingMsg::RouteWithdrawAliased => "route_withdraw_aliased",
+            RoutingMsg::RouteDiscover => "route_discover",
+            RoutingMsg::RouteDiscoverOffer => "route_discover_offer",
+            RoutingMsg::RecursiveQuery => "recursive_query",
+            RoutingMsg::RecursiveResponse => "recursive_response",
+        }
+    }
 }
 
 impl TryFrom<u16> for RoutingMsg {
