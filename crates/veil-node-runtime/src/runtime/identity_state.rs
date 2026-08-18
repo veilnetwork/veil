@@ -36,6 +36,7 @@
 use std::sync::{Arc, Mutex, RwLock};
 
 use crate::local_identity::HandshakeIdentity;
+use crate::mlkem_cert_store::MlKemCertStore;
 use crate::mlkem_resolver::PeerMlKemCertCache;
 use crate::types::NodeIdBytes;
 use veil_e2e::{DK_SEED_BYTES, PeerMlKemCache};
@@ -173,6 +174,16 @@ pub struct IdentityState {
     /// deposit time out / `PeerUnresolved`. See [`PeerMlKemCertCache`].
     pub peer_mlkem_certs: Arc<RwLock<PeerMlKemCertCache>>,
 
+    /// The same certificates, kept on disk and bounded by each certificate's
+    /// OWN signed validity window rather than by a cache TTL.
+    ///
+    /// `peer_mlkem_certs` above is RAM with a 30-minute TTL, and a device's
+    /// certificate slot has exactly one writer — that device. So a device off
+    /// for longer than the TTL was unresolvable and unsealable-for, measured on
+    /// a real phone as ~45 minutes of `PeerUnresolved` on every deposit to a
+    /// force-stopped sibling. See [`MlKemCertStore`].
+    pub peer_mlkem_cert_store: Arc<MlKemCertStore>,
+
     /// `peer → device X25519 key`, taken from that peer's verified certificate.
     ///
     /// The ratchet counterpart of `peer_mlkem_keys`, and shared with
@@ -213,6 +224,7 @@ impl IdentityState {
         mlkem_keys: Arc<veil_e2e::MlKemSeedRing>,
         peer_mlkem_keys: Arc<RwLock<PeerMlKemCache>>,
         peer_mlkem_certs: Arc<RwLock<PeerMlKemCertCache>>,
+        peer_mlkem_cert_store: Arc<MlKemCertStore>,
         peer_ratchet_keys: Arc<RwLock<veil_e2e::PeerRatchetKeyCache>>,
         per_session_mlkem_dk: Arc<
             Mutex<
@@ -232,6 +244,7 @@ impl IdentityState {
             mlkem_keys,
             peer_mlkem_keys,
             peer_mlkem_certs,
+            peer_mlkem_cert_store,
             peer_ratchet_keys,
             per_session_mlkem_dk,
         }

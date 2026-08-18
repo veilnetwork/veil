@@ -814,6 +814,7 @@ impl NodeRuntime {
             Arc::clone(&self.identity.peer_mlkem_keys),
             Arc::clone(&self.identity.peer_ratchet_keys),
             Arc::clone(&self.identity.peer_mlkem_certs),
+            Arc::clone(&self.identity.peer_mlkem_cert_store),
             Arc::clone(&self.logger),
         ))
     }
@@ -2793,6 +2794,7 @@ impl NodeRuntime {
             Arc::clone(&self.identity.peer_mlkem_keys),
             Arc::clone(&self.identity.peer_ratchet_keys),
             Arc::clone(&self.identity.peer_mlkem_certs),
+            Arc::clone(&self.identity.peer_mlkem_cert_store),
             Arc::clone(&self.logger),
         ));
         let mlkem_ek_resolver: Arc<dyn veil_types::MlKemEkResolver> =

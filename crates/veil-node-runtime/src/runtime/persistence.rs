@@ -189,7 +189,11 @@ pub fn load_discovered_peers(
 
 /// Serialise and atomically write `entries`, logging (and reporting) any
 /// failure. `what` names the store for the log line.
-fn write_snapshot<T: serde::Serialize>(path: &Path, entries: &T, what: &str) -> PersistOutcome {
+pub(crate) fn write_snapshot<T: serde::Serialize>(
+    path: &Path,
+    entries: &T,
+    what: &str,
+) -> PersistOutcome {
     let json = match serde_json::to_string_pretty(entries) {
         Ok(j) => j,
         Err(e) => {
@@ -222,7 +226,7 @@ fn write_snapshot<T: serde::Serialize>(path: &Path, entries: &T, what: &str) -> 
 /// exists and cannot be parsed used to look exactly like no file at all, so an
 /// operator who hand-edited it into invalid JSON lost the entire store without
 /// a single line saying so.
-fn read_snapshot<T: serde::de::DeserializeOwned>(
+pub(crate) fn read_snapshot<T: serde::de::DeserializeOwned>(
     path: &Path,
     what: &str,
 ) -> Result<Option<T>, String> {
