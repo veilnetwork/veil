@@ -18,6 +18,7 @@ pub mod local_identity;
 pub mod memory;
 pub mod mesh_glue;
 pub mod metrics_http;
+pub mod mlkem_cert_store;
 pub mod mlkem_resolver;
 pub mod mobile_sink;
 pub mod mobile_status_provider;

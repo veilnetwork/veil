@@ -29,7 +29,7 @@ mod offline_seal;
 mod p_net_ban_sync;
 mod peer_handshake;
 mod persist_tasks;
-mod persistence;
+pub(crate) mod persistence;
 mod pex_runtime;
 mod rendezvous_binder;
 mod resumption_state;
@@ -1676,6 +1676,17 @@ impl NodeRuntime {
                 veil_proto::budget::MAX_PEER_MLKEM_CACHE,
             ),
         ));
+        // The same certificates on disk. Built here beside the RAM cache it
+        // backs, and from `config_path` because that is where every other
+        // learned-state snapshot this runtime keeps already lives
+        // (`peers_discovered.json`, `bans.json`).
+        let shared_peer_mlkem_cert_store = Arc::new(crate::mlkem_cert_store::MlKemCertStore::load(
+            &config_path,
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0),
+        ));
         // The device Diffie-Hellman half of the same certificates, kept apart
         // so the frame dispatcher can read it: the dispatcher decides sender
         // provenance synchronously and cannot reach this crate's cert type.
@@ -2434,6 +2445,7 @@ impl NodeRuntime {
                 Arc::clone(&mlkem_keys),
                 Arc::clone(&shared_peer_mlkem_keys),
                 Arc::clone(&shared_peer_mlkem_certs),
+                Arc::clone(&shared_peer_mlkem_cert_store),
                 Arc::clone(&shared_peer_ratchet_keys),
                 Arc::clone(&shared_per_session_mlkem_dk),
             )),
