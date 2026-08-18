@@ -1791,25 +1791,50 @@ pub struct DelegateDeviceOutput {
 /// machine. It signs with the key it just delegated and moves `sig_key_idx`
 /// there; every subkey in the document is master-signed, so a verifier accepts
 /// either.
-pub fn delegate_device(
-    opts: DelegateDeviceOptions,
-) -> Result<DelegateDeviceOutput, DelegateDeviceError> {
-    use veil_proto::identity_document::MAX_IDENTITY_KEYS;
-
-    let window = opts.valid_until_unix.saturating_sub(opts.now_unix);
+/// The doc-independent half of [`delegate_device`]'s preconditions: the
+/// freshness window and the pubkey length. Split out so the in-memory core
+/// and the on-disk wrapper reject the same inputs, and so the wrapper keeps
+/// rejecting them BEFORE it touches the filesystem.
+fn check_delegation_inputs(
+    device_pubkey: &[u8],
+    now_unix: u64,
+    valid_until_unix: u64,
+) -> Result<(), DelegateDeviceError> {
+    let window = valid_until_unix.saturating_sub(now_unix);
     if window == 0 || window > MAX_FRESHNESS_WINDOW_SECS {
         return Err(DelegateDeviceError::FreshnessWindowTooLong { secs: window });
     }
-    if opts.device_pubkey.len() != 32 {
-        return Err(DelegateDeviceError::PubkeyLength(opts.device_pubkey.len()));
+    if device_pubkey.len() != 32 {
+        return Err(DelegateDeviceError::PubkeyLength(device_pubkey.len()));
     }
+    Ok(())
+}
 
-    let doc_path = opts.veil_dir.join(IDENTITY_DOCUMENT_FILE);
-    if !doc_path.exists() {
-        return Err(DelegateDeviceError::NoDocument(doc_path));
-    }
-    let mut doc = IdentityDocument::decode(&std::fs::read(&doc_path)?)
-        .map_err(|e| DelegateDeviceError::DocumentDecode(e.to_string()))?;
+/// Everything [`delegate_device`] does EXCEPT read and write files: every
+/// precondition, the master cert, the append and the re-signature, against a
+/// document held in memory.
+///
+/// EXISTS SO A CALLER CAN VALIDATE BEFORE IT COMMITS. `adopt_identity_document`
+/// used to stage the incoming document to `identity_document.bin` and only then
+/// call `delegate_device`, which re-read it and could still refuse —
+/// `TooManyKeys`, `Revoked`, a bad freshness window. The refusal returned an
+/// `Err` over a directory that had ALREADY been overwritten with a document
+/// naming no key this device holds, and `SovereignIdentity::load_from_dir`
+/// fails closed on exactly that shape: a caller that handled the error by
+/// leaving things alone was left with no identity at all. Revocation makes the
+/// case ordinary rather than theoretical — a tombstoned device that adopts a
+/// sibling's announcement takes the `Revoked` branch every time.
+fn delegate_into_document(
+    mut doc: IdentityDocument,
+    local_sk: &SigningKey,
+    master: &MasterSecret,
+    device_pubkey: &[u8],
+    now_unix: u64,
+    valid_until_unix: u64,
+) -> Result<DelegateDeviceOutput, DelegateDeviceError> {
+    use veil_proto::identity_document::MAX_IDENTITY_KEYS;
+
+    check_delegation_inputs(device_pubkey, now_unix, valid_until_unix)?;
 
     if doc.identity_keys.len() >= MAX_IDENTITY_KEYS {
         return Err(DelegateDeviceError::TooManyKeys {
@@ -1818,7 +1843,7 @@ pub fn delegate_device(
         });
     }
     for (idx, k) in doc.identity_keys.iter().enumerate() {
-        if k.pubkey == opts.device_pubkey {
+        if k.pubkey == device_pubkey {
             return Err(DelegateDeviceError::AlreadyPresent { idx });
         }
     }
@@ -1828,7 +1853,7 @@ pub fn delegate_device(
     // as malformed, so a successful delegation of a revoked key would brick
     // the identity on its next load. Relinking a revoked device requires a
     // freshly minted device key.
-    let delegated_device_id = compute_node_id(&opts.device_pubkey);
+    let delegated_device_id = compute_node_id(device_pubkey);
     if doc
         .revoked_devices
         .iter()
@@ -1843,7 +1868,7 @@ pub fn delegate_device(
     // wrong phrase produces a document that verifies against a different
     // identity entirely, and the failure surfaces much later as peers refusing
     // a node they cannot resolve.
-    let master_sk = match &opts.master {
+    let master_sk = match master {
         MasterSecret::Seed(seed) => SigningKey::from_bytes(&derive_master_sk_ed25519(seed)),
         MasterSecret::SigningKey(sk) => SigningKey::from_bytes(sk),
     };
@@ -1856,49 +1881,78 @@ pub fn delegate_device(
         });
     }
 
-    let device_id = compute_node_id(&opts.device_pubkey);
+    let device_id = delegated_device_id;
     let cert_sig = master_sk.sign(&build_certify(
         &doc.node_id,
         ALGO_ED25519,
-        &opts.device_pubkey,
+        device_pubkey,
         &device_id,
-        opts.now_unix,
-        opts.valid_until_unix,
+        now_unix,
+        valid_until_unix,
     ));
     doc.identity_keys.push(IdentityKey {
         algo: ALGO_ED25519,
-        pubkey: opts.device_pubkey.clone(),
+        pubkey: device_pubkey.to_vec(),
         device_id,
-        valid_from_unix: opts.now_unix,
-        valid_until_unix: opts.valid_until_unix,
+        valid_from_unix: now_unix,
+        valid_until_unix,
         master_sig: cert_sig.to_bytes().to_vec(),
     });
     let new_key_idx = (doc.identity_keys.len() - 1) as u16;
 
     // Whose secret re-signs the document. The local subkey normally; the newly
     // delegated one when it IS the local subkey (self-delegation).
-    let local_seed = load_identity_sk(&opts.veil_dir)?;
-    let local_sk = SigningKey::from_bytes(local_seed.as_array());
-    let signed_by_new_key = local_sk.verifying_key().as_bytes()[..] == opts.device_pubkey[..];
+    let signed_by_new_key = local_sk.verifying_key().as_bytes()[..] == device_pubkey[..];
     if signed_by_new_key {
         doc.sig_key_idx = new_key_idx;
     }
 
-    doc.issued_at_unix = opts.now_unix;
-    if opts.valid_until_unix > doc.valid_until_unix {
-        doc.valid_until_unix = opts.valid_until_unix;
+    doc.issued_at_unix = now_unix;
+    if valid_until_unix > doc.valid_until_unix {
+        doc.valid_until_unix = valid_until_unix;
     }
     let mut doc_msg = Vec::with_capacity(DOC_SIG_CONTEXT.len() + 512);
     doc_msg.extend_from_slice(DOC_SIG_CONTEXT);
     doc_msg.extend_from_slice(&doc.canonical_signing_bytes());
     doc.document_sig = local_sk.sign(&doc_msg).to_bytes().to_vec();
 
-    atomic_write(opts.out_path.as_ref().unwrap_or(&doc_path), &doc.encode())?;
     Ok(DelegateDeviceOutput {
         document: doc,
         new_key_idx,
         signed_by_new_key,
     })
+}
+
+pub fn delegate_device(
+    opts: DelegateDeviceOptions,
+) -> Result<DelegateDeviceOutput, DelegateDeviceError> {
+    // Cheap, doc-independent refusals first — the pre-split order, so a bad
+    // window is still reported ahead of a missing document.
+    check_delegation_inputs(&opts.device_pubkey, opts.now_unix, opts.valid_until_unix)?;
+
+    let doc_path = opts.veil_dir.join(IDENTITY_DOCUMENT_FILE);
+    if !doc_path.exists() {
+        return Err(DelegateDeviceError::NoDocument(doc_path));
+    }
+    let doc = IdentityDocument::decode(&std::fs::read(&doc_path)?)
+        .map_err(|e| DelegateDeviceError::DocumentDecode(e.to_string()))?;
+    let local_seed = load_identity_sk(&opts.veil_dir)?;
+    let local_sk = SigningKey::from_bytes(local_seed.as_array());
+
+    let out = delegate_into_document(
+        doc,
+        &local_sk,
+        &opts.master,
+        &opts.device_pubkey,
+        opts.now_unix,
+        opts.valid_until_unix,
+    )?;
+
+    atomic_write(
+        opts.out_path.as_ref().unwrap_or(&doc_path),
+        &out.document.encode(),
+    )?;
+    Ok(out)
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -2012,8 +2066,7 @@ fn resign_and_store_document(
     doc_msg.extend_from_slice(DOC_SIG_CONTEXT);
     doc_msg.extend_from_slice(&doc.canonical_signing_bytes());
     doc.document_sig = own_sk.sign(&doc_msg).to_bytes().to_vec();
-    atomic_write(&veil_dir.join(IDENTITY_DOCUMENT_FILE), &doc.encode())?;
-    save_device_sig_key_idx(veil_dir, idx)?;
+    write_document_and_index(veil_dir, &doc, idx)?;
     Ok(idx)
 }
 
@@ -2116,27 +2169,77 @@ pub fn adopt_identity_document(
                 }
             }
         }
-        atomic_write(&doc_path, &incoming.encode())?;
-        save_device_sig_key_idx(veil_dir, idx)?;
+        write_document_and_index(veil_dir, &incoming, idx)?;
         return Ok(AdoptOutcome::Adopted { key_idx: idx });
     }
 
-    // Not named yet. Stage the incoming document and append ourselves to it —
-    // delegate_device re-signs with our own key, because the signer of what we
-    // just received keeps its secret on another machine.
-    atomic_write(&doc_path, &incoming.encode())?;
-    let out = delegate_device(DelegateDeviceOptions {
-        veil_dir: veil_dir.to_path_buf(),
-        master,
-        device_pubkey: own_pk,
+    // Not named yet: append ourselves to the incoming document IN MEMORY and
+    // re-sign it with our own key, because the signer of what we just received
+    // keeps its secret on another machine.
+    //
+    // In memory and not on disk, deliberately. This used to stage `incoming`
+    // to `identity_document.bin` first and let `delegate_device` re-read it,
+    // which meant every refusal that path can raise — `TooManyKeys`, a bad
+    // freshness window, and above all `Revoked` — returned an error over a
+    // directory whose document no longer named ANY key this device holds.
+    // `load_from_dir` fails closed on that shape, so a device that got
+    // tombstoned and then adopted a sibling's announcement lost its identity
+    // outright, and re-running the adopt could not recover it: the same branch
+    // refused again, every time. Building the result first leaves the
+    // directory untouched on every one of those paths.
+    let own_sk = SigningKey::from_bytes(own_seed.as_array());
+    let out = delegate_into_document(
+        incoming,
+        &own_sk,
+        &master,
+        &own_pk,
         now_unix,
         valid_until_unix,
-        out_path: None,
-    })?;
-    save_device_sig_key_idx(veil_dir, out.new_key_idx)?;
+    )?;
+    write_document_and_index(veil_dir, &out.document, out.new_key_idx)?;
     Ok(AdoptOutcome::Delegated {
         key_idx: out.new_key_idx,
     })
+}
+
+/// Publish a finished document and the device's own key index together, and
+/// leave the directory byte-for-byte untouched if either write fails.
+///
+/// The pair is not atomic on POSIX and cannot be made so with two renames, so
+/// the failure is COMPENSATED instead: the previous bytes of both files are
+/// captured first and put back if anything goes wrong. Without that, an
+/// `identity_document.bin` that landed next to a `device_sig_key_idx.bin` that
+/// never did names a key at the wrong offset, `load_from_dir` rejects the
+/// mismatch, and the node comes up with no identity at all.
+fn write_document_and_index(
+    veil_dir: &Path,
+    doc: &IdentityDocument,
+    key_idx: u16,
+) -> Result<(), AdoptDocumentError> {
+    let doc_path = veil_dir.join(IDENTITY_DOCUMENT_FILE);
+    let idx_path = veil_dir.join(DEVICE_SIG_KEY_IDX_FILE);
+    let prev_doc = std::fs::read(&doc_path).ok();
+    let prev_idx = std::fs::read(&idx_path).ok();
+
+    let restore = |path: &Path, prev: Option<&Vec<u8>>| match prev {
+        Some(bytes) => {
+            let _ = atomic_write(path, bytes);
+        }
+        None => {
+            let _ = std::fs::remove_file(path);
+        }
+    };
+
+    if let Err(e) = atomic_write(&doc_path, &doc.encode()) {
+        restore(&doc_path, prev_doc.as_ref());
+        return Err(e.into());
+    }
+    if let Err(e) = save_device_sig_key_idx(veil_dir, key_idx) {
+        restore(&doc_path, prev_doc.as_ref());
+        restore(&idx_path, prev_idx.as_ref());
+        return Err(e.into());
+    }
+    Ok(())
 }
 
 /// Retire a device's key from the identity document, permanently.
@@ -2316,8 +2419,7 @@ pub fn adopt_named_identity_document(
     // adopt_identity_document doc-comment warns about.
     std::fs::create_dir_all(veil_dir)?;
     save_identity_sk(veil_dir, own_identity_sk)?;
-    atomic_write(&veil_dir.join(IDENTITY_DOCUMENT_FILE), &incoming.encode())?;
-    save_device_sig_key_idx(veil_dir, idx as u16)?;
+    write_document_and_index(veil_dir, &incoming, idx as u16)?;
 
     // Instance file, only when the dir has none. The id is the device_id
     // truncation — the SAME value this device has been publishing while it ran
@@ -3223,6 +3325,82 @@ mod tests {
         assert_eq!(doc.identity_keys.len(), 3, "the new key is unioned in");
         assert!(doc.identity_keys.iter().any(|k| k.pubkey == third_pk));
         SovereignIdentity::load_from_dir(&fresh).expect("still loads after union");
+    }
+
+    /// Every file in `dir`, sorted, contents included — the only comparison
+    /// that can tell "wrote nothing" from "wrote something equivalent".
+    fn dir_snapshot(dir: &Path) -> Vec<(String, Vec<u8>)> {
+        let mut out: Vec<(String, Vec<u8>)> = std::fs::read_dir(dir)
+            .expect("read_dir")
+            .map(|e| e.expect("dir entry"))
+            .filter(|e| e.path().is_file())
+            .map(|e| {
+                (
+                    e.file_name().to_string_lossy().into_owned(),
+                    std::fs::read(e.path()).expect("read file"),
+                )
+            })
+            .collect();
+        out.sort();
+        out
+    }
+
+    /// A REFUSED adopt must not have already replaced the document.
+    ///
+    /// Revocation makes the case ordinary rather than theoretical: a
+    /// tombstoned device is not named in its siblings' announcements, so it
+    /// takes the append-myself branch, and that branch is refused — a
+    /// tombstoned key can never come back. The old code staged the incoming
+    /// document to disk BEFORE asking, so the refusal returned an `Err` over a
+    /// directory whose `identity_document.bin` named no key this device holds.
+    /// `load_from_dir` fails closed on exactly that, and re-running the adopt
+    /// could not repair it: the same branch refused again, forever. Comparing
+    /// the whole directory byte-for-byte is the assertion; comparing only the
+    /// document would pass on a write that happened to round-trip.
+    #[test]
+    fn a_refused_adopt_leaves_the_directory_byte_for_byte_unchanged() {
+        use crate::sovereign::SovereignIdentity;
+
+        let seed = create_identity(test_opts(tempdir())).unwrap().master_seed;
+        let a = tempdir();
+        let b = tempdir();
+        provision(a.clone(), seed.clone());
+        provision(b.clone(), seed.clone());
+
+        // A admits B and then retires it, which is what puts B's key behind a
+        // master-signed tombstone in everything A announces from now on.
+        let b_pk = device_pubkey(&b);
+        delegate_device(delegate_opts(a.clone(), seed.clone(), b_pk.clone())).unwrap();
+        let b_id = veil_crypto::identity::compute_node_id(&b_pk);
+        assert!(
+            revoke_identity_device(&a, MasterSecret::Seed(seed.clone()), &b_id, DELEGATE_NOW)
+                .expect("revoke"),
+        );
+        let a_doc = std::fs::read(a.join(IDENTITY_DOCUMENT_FILE)).unwrap();
+
+        let before = dir_snapshot(&b);
+        let err = adopt_identity_document(
+            &b,
+            &a_doc,
+            MasterSecret::Seed(seed),
+            DELEGATE_NOW,
+            DELEGATE_NOW + 7 * 86_400,
+        )
+        .expect_err("a tombstoned key can never re-delegate itself");
+        assert!(
+            matches!(
+                err,
+                AdoptDocumentError::Delegate(DelegateDeviceError::Revoked { .. })
+            ),
+            "got {err:?}"
+        );
+        assert_eq!(
+            before,
+            dir_snapshot(&b),
+            "a refused adopt must leave the directory exactly as it found it"
+        );
+        SovereignIdentity::load_from_dir(&b)
+            .expect("the refused device still holds its own identity");
     }
 
     // ── revoke_identity_device ─────────────────────────────────
