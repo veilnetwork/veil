@@ -4013,6 +4013,10 @@ mod tests {
                 valid_until_unix: valid_until,
                 sig_key_idx: 0,
                 identity_keys: vec![key],
+                // No revocation history in this fixture: an empty list is
+                // also what keeps the document on the V1 encoding, which is
+                // the shape this scenario's peers expect.
+                revoked_devices: Vec::new(),
                 document_sig: Vec::new(),
             };
             let mut doc_msg = Vec::new();
