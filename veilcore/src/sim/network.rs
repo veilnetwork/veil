@@ -173,6 +173,10 @@ fn provision_restored_sovereign_identity_for_sim(
         valid_until_unix: now + 7 * 86_400,
         algo: veil_types::SignatureAlgorithm::Ed25519,
         master_falcon_keypair_bytes: None,
+        // The simulated restore mints its own device key, which is what a
+        // real restore onto a blank machine does. A caller-supplied seed is
+        // for the path that keeps the transport key the node already runs on.
+        device_sk_seed: None,
     })
     .expect("sim restored sovereign identity provisioning");
 
