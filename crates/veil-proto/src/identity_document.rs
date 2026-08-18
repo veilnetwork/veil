@@ -457,8 +457,7 @@ impl IdentityDocument {
                 if let Some(p) = prev {
                     if r.device_id <= p {
                         return Err(ProtoError::Malformed(
-                            "identity_document: revoked_devices not strictly ascending"
-                                .into(),
+                            "identity_document: revoked_devices not strictly ascending".into(),
                         ));
                     }
                 }
@@ -467,8 +466,7 @@ impl IdentityDocument {
                 // input.
                 if identity_keys.iter().any(|k| k.device_id == r.device_id) {
                     return Err(ProtoError::Malformed(
-                        "identity_document: revoked device_id still among identity_keys"
-                            .into(),
+                        "identity_document: revoked device_id still among identity_keys".into(),
                     ));
                 }
                 revoked_devices.push(r);
@@ -635,10 +633,7 @@ mod tests {
         doc.revoked_devices = vec![tombstone(0x02), tombstone(0x01)];
         let wire = doc.encode();
         let err = IdentityDocument::decode(&wire).unwrap_err();
-        assert!(
-            err.to_string().contains("strictly ascending"),
-            "got: {err}"
-        );
+        assert!(err.to_string().contains("strictly ascending"), "got: {err}");
         // Duplicates fall to the same rule.
         doc.revoked_devices = vec![tombstone(0x01), tombstone(0x01)];
         assert!(IdentityDocument::decode(&doc.encode()).is_err());
