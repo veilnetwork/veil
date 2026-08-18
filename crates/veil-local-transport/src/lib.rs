@@ -132,7 +132,7 @@ fn hex_nibble(c: u8) -> std::io::Result<u8> {
 /// many parallel tests compete for the pool.
 pub async fn write_token_file(path: &Path, token: &LocalToken) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
+        veil_util::create_dir_owner_only(parent)?;
     }
     // No `remove_file` pre-step: `write_owner_only` (atomic_write) replaces the
     // target via a hardened staged rename, which avoids the symlink/TOCTOU
@@ -164,7 +164,7 @@ pub async fn read_token_file(path: &Path) -> std::io::Result<LocalToken> {
 /// permissions on Unix. Paired with [`read_port_file`].
 pub async fn write_port_file(path: &Path, port: u16) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
+        veil_util::create_dir_owner_only(parent)?;
     }
     write_owner_only(path, port.to_string().as_bytes())
 }
@@ -188,8 +188,17 @@ pub async fn read_port_file(path: &Path) -> std::io::Result<u16> {
 /// the file world-readable; any local process that won the race could scrape
 /// an admin/ipc token off disk.
 ///
-/// On non-Unix the mode bits are ignored (NTFS ACLs would need a separate
-/// mechanism —).
+/// On Windows there is no mode to set, so the file gets an explicit
+/// owner-SID-only NTFS DACL instead, and that DACL is READ BACK before the
+/// write is allowed to stand. Inheritance was not good enough here: the token
+/// lands in `VEIL_RUNTIME_DIR`, which is operator-supplied and whose platform
+/// default falls through `%LOCALAPPDATA%` → `%APPDATA%` → `%TEMP%` — and
+/// `%TEMP%` for a service account is `C:\Windows\Temp`, shared by every account
+/// on the machine. Since the default named-pipe DACL already admits any
+/// authenticated OS user, the token file IS the access-control gate for both
+/// the admin and the IPC plane; a copy of it readable by another local user is
+/// a full compromise of both. An ACL that cannot be confirmed therefore aborts
+/// the write rather than publishing the token under permissions nobody checked.
 fn write_owner_only(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     // Hardened against symlink / TOCTOU on the sidecar path: delegate to
     // `veil_util::atomic_write`, which stages to an UNPREDICTABLE
@@ -200,7 +209,7 @@ fn write_owner_only(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     // access to a misconfigured runtime dir could pre-place a symlink and
     // capture/redirect the token/port write (the Unix-socket bind is already
     // hardened separately in `bind_unix`).
-    veil_util::atomic_write(path, bytes)
+    veil_util::atomic_write_owner_only(path, bytes)
 }
 
 // ── PeerInfo ──────────────────────────────────────────────────────────────────

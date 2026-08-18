@@ -1627,7 +1627,7 @@ pub async fn prepare_admin_endpoint(endpoint: &AdminEndpoint) -> Result<()> {
                 .to_owned(),
         )),
         AdminEndpoint::Tcp { runtime_dir, .. } => {
-            tokio::fs::create_dir_all(runtime_dir).await?;
+            veil_util::create_dir_owner_only(runtime_dir)?;
             let anchor = runtime_dir.join(ADMIN_ANCHOR_FILENAME);
             // Probe for a live server by attempting an admin request; a
             // success means we're about to clobber a running node.
@@ -1647,7 +1647,7 @@ pub async fn prepare_admin_endpoint(endpoint: &AdminEndpoint) -> Result<()> {
         }
         #[cfg(windows)]
         AdminEndpoint::NamedPipe { runtime_dir, .. } => {
-            tokio::fs::create_dir_all(runtime_dir).await?;
+            veil_util::create_dir_owner_only(runtime_dir)?;
             // NamedPipe doesn't have a pre-bind "port" file, only the token
             // and pipe-name sidecars. The `bind_named_pipe` probe at actual
             // bind time will fail with `AlreadyExists` if another server
@@ -1742,7 +1742,10 @@ pub async fn bind_admin_endpoint(
             runtime_dir,
         } => {
             let (listener, local_addr, token) = admin_transport::bind_tcp(*bind_addr).await?;
-            std::fs::create_dir_all(runtime_dir)?;
+            // Owner-only (0o700 / owner-SID-only DACL): `admin.token` lands
+            // here and is the whole gate on the TCP-loopback and named-pipe
+            // backends.
+            veil_util::create_dir_owner_only(runtime_dir)?;
             admin_transport::write_port_file(
                 &runtime_dir.join(ADMIN_PORT_FILENAME),
                 local_addr.port(),
@@ -1758,7 +1761,10 @@ pub async fn bind_admin_endpoint(
             runtime_dir,
         } => {
             let (listener, actual_name, token) = admin_transport::bind_named_pipe(pipe_name)?;
-            std::fs::create_dir_all(runtime_dir)?;
+            // Owner-only (0o700 / owner-SID-only DACL): `admin.token` lands
+            // here and is the whole gate on the TCP-loopback and named-pipe
+            // backends.
+            veil_util::create_dir_owner_only(runtime_dir)?;
             // Write the pipe name (UTF-8) so clients know what to open.
             // Kept as a plain file next to `admin.token`; no permission
             // enforcement (the token file is the secret, not the name).

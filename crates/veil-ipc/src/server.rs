@@ -1574,7 +1574,10 @@ impl IpcServer {
         bind_addr: std::net::SocketAddr,
         runtime_dir: PathBuf,
     ) -> std::io::Result<()> {
-        std::fs::create_dir_all(&runtime_dir)?;
+        // Owner-only (0o700 / owner-SID-only DACL): this directory is where
+        // `ipc.token` lands, and the bearer token in it is the whole gate on
+        // the TCP-loopback and named-pipe backends.
+        veil_util::create_dir_owner_only(&runtime_dir)?;
         let (listener, local_addr, token) = transport::bind_tcp(bind_addr).await?;
         // write port + token through atomic
         // `OpenOptions::mode(0o600).create(true)` helpers (in
@@ -1605,7 +1608,10 @@ impl IpcServer {
         pipe_name: String,
         runtime_dir: PathBuf,
     ) -> std::io::Result<()> {
-        std::fs::create_dir_all(&runtime_dir)?;
+        // Owner-only (0o700 / owner-SID-only DACL): this directory is where
+        // `ipc.token` lands, and the bearer token in it is the whole gate on
+        // the TCP-loopback and named-pipe backends.
+        veil_util::create_dir_owner_only(&runtime_dir)?;
         let (listener, actual_name, token) = veil_local_transport::bind_named_pipe(&pipe_name)?;
         // route the token write through
         // `write_token_file` for hex-buffer zeroize parity with the

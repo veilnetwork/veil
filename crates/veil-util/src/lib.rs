@@ -16,6 +16,43 @@ pub mod sensitive_bytes;
 /// of an OS full-tunnel route on Windows.
 pub mod outbound_interface;
 
+/// Owner-only NTFS DACLs for bearer-secret files. Windows only — POSIX gets
+/// the same property from `0o600` at create time.
+#[cfg(windows)]
+mod win_acl;
+
+/// What reading an object's access-control state actually established.
+///
+/// POSIX collapses to `OwnerOnly` by construction: the mode is set in the
+/// `open(2)` that creates the file, so there is no window in which it could be
+/// anything else and nothing to read back. Windows has to ask.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AclVerdict {
+    /// The DACL was read back and no trustee other than the owner is granted
+    /// anything.
+    OwnerOnly,
+    /// The DACL was read back and `foreign_grants` trustees besides the owner
+    /// are granted access. A NULL DACL — which means "everyone, everything",
+    /// not "nobody" — counts as one.
+    Shared { foreign_grants: usize },
+    /// The DACL could neither be applied nor read back: the API failed, or the
+    /// filesystem carries no ACLs at all (FAT32, some network redirectors).
+    Unverifiable,
+}
+
+/// May a file carrying a bearer secret be published under `verdict`?
+///
+/// Only a DACL that was read back and named nobody but the owner qualifies.
+/// `Unverifiable` is refused rather than tolerated, because the two outcomes
+/// are indistinguishable afterwards: a token file on a filesystem that silently
+/// dropped the ACL looks exactly like one that took it, and the process that
+/// could still have deleted it has already moved on. The cost of refusing is a
+/// node that will not start; the cost of guessing is a 32-byte admin/IPC
+/// credential readable by every account on the machine.
+pub fn secret_write_permitted(verdict: &AclVerdict) -> bool {
+    matches!(verdict, AclVerdict::OwnerOnly)
+}
+
 /// Run `op` with up to 5 attempts when it returns
 /// [`std::io::ErrorKind::PermissionDenied`]. Exponential backoff
 /// 25 / 50 / 100 / 200 ms before retries 2-5; any other error is
@@ -52,6 +89,50 @@ where
 /// [`with_eacces_retry`] semantics.
 pub fn create_dir_all_with_eacces_retry(path: &std::path::Path) -> std::io::Result<()> {
     with_eacces_retry(|| std::fs::create_dir_all(path))
+}
+
+/// Create the runtime directory and restrict it to the current user: `0o700`
+/// on Unix, an inheritable owner-SID-only DACL on Windows.
+///
+/// `veil_cfg::locate::runtime_veil_dir` has always documented this as the
+/// caller's job — "the directory is not created here, that's the caller's job
+/// after applying the correct mode (`0o700` on Unix / ACL-owner-only on
+/// Windows)" — and every caller was reaching for a bare `create_dir_all`, which
+/// applies neither. That matters because the directory is where the admin and
+/// IPC bearer tokens land, and the platform default falls through to `%TEMP%`
+/// (`C:\Windows\Temp` for a service account) when neither `%LOCALAPPDATA%` nor
+/// `%APPDATA%` is set.
+///
+/// Tightening is BEST-EFFORT and logged, not fatal: a directory that stays
+/// permissive cannot by itself expose a file whose own DACL denies the reader,
+/// so the token file's own verified permissions remain the gate. Refusing to
+/// start over a directory ACL would trade a contained weakness for an outage.
+pub fn create_dir_owner_only(path: &std::path::Path) -> std::io::Result<()> {
+    create_dir_all_with_eacces_retry(path)?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        if let Err(e) = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)) {
+            log::warn!(
+                "could not restrict runtime directory {} to 0o700: {e} — files \
+                 written there still carry their own owner-only mode",
+                path.display()
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    if let Err(e) = win_acl::harden_dir(path) {
+        log::warn!(
+            "could not restrict runtime directory {} to an owner-only ACL: {e} — \
+             bearer-token files written there still carry their own verified \
+             owner-only ACL",
+            path.display()
+        );
+    }
+
+    Ok(())
 }
 
 /// Arm `command` to call `setsid` in the child between `fork` and `exec`
@@ -165,9 +246,36 @@ pub fn leading_zero_bits(bytes: &[u8]) -> u32 {
 /// snapshot is owner-readable only. On non-Unix targets (Windows) the
 /// default ACL inherits from the parent directory; deployments are
 /// expected to keep `~/.veil/` (or equivalent) under the user's own
-/// profile, where the directory ACL already excludes other users.
+/// profile, where the directory ACL already excludes other users. A file whose
+/// contents are a BEARER SECRET must not settle for that inheritance — use
+/// [`atomic_write_owner_only`], which sets and verifies an explicit DACL.
 pub fn atomic_write(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    atomic_write_inner(path, bytes, false)
+}
+
+/// [`atomic_write`] for a file whose contents authenticate the reader.
+///
+/// Adds, on Windows only, an explicit owner-SID-only DACL on the staging file
+/// (inherited by the published path through the rename) and a read-back of the
+/// published path, and FAILS rather than leaving a file whose permissions could
+/// not be confirmed — see [`secret_write_permitted`] for why an unverifiable
+/// ACL is refused instead of warned about. The refusal path deletes the file it
+/// could not vouch for.
+///
+/// On POSIX this is byte-for-byte [`atomic_write`]: `0o600` is applied by the
+/// `open(2)` that creates the staging file and carried by the rename, so there
+/// is nothing to add and nothing to check.
+pub fn atomic_write_owner_only(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    atomic_write_inner(path, bytes, true)
+}
+
+fn atomic_write_inner(
+    path: &std::path::Path,
+    bytes: &[u8],
+    owner_only: bool,
+) -> std::io::Result<()> {
     use std::io::Write as _;
+    let _ = owner_only;
     let parent = path.parent();
     if let Some(p) = parent {
         create_dir_all_with_eacces_retry(p)?;
@@ -194,6 +302,19 @@ pub fn atomic_write(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()>
                 // Freshly-created exclusive file — write + fsync, then keep it
                 // for the rename. A write/sync error is real (not a name race):
                 // clean up the partial tmp and propagate without retrying.
+                //
+                // The DACL goes on BEFORE the bytes: the staging name is
+                // unpredictable and opened `O_EXCL`, so nobody can be holding
+                // this object, but a secret should never sit in an object whose
+                // permissions are still whatever the directory handed down.
+                #[cfg(windows)]
+                if owner_only
+                    && let Err(e) = win_acl::harden_open_file(&f, &tmp.display().to_string())
+                {
+                    drop(f);
+                    let _ = std::fs::remove_file(&tmp);
+                    return Err(e);
+                }
                 if let Err(e) = f.write_all(bytes).and_then(|()| f.sync_all()) {
                     let _ = std::fs::remove_file(&tmp);
                     return Err(e);
@@ -223,6 +344,16 @@ pub fn atomic_write(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()>
     })?;
     match std::fs::rename(&tmp, path) {
         Ok(()) => {
+            // A rename within a volume carries the object's own security
+            // descriptor, so the published path should already be owner-only —
+            // "should" is what the read-back is here to replace. If the
+            // published file cannot be confirmed, delete it: a caller that
+            // sees an error must not also be leaving a readable secret behind.
+            #[cfg(windows)]
+            if owner_only && let Err(e) = win_acl::verify_path(path) {
+                let _ = std::fs::remove_file(path);
+                return Err(e);
+            }
             // fsync the parent
             // directory after the rename so the rename itself is
             // durably persisted. Without this, a power loss in the
@@ -1197,6 +1328,79 @@ mod tests {
         assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
         // The pre-existing content must be intact (NOT truncated).
         assert_eq!(std::fs::read(&victim).unwrap(), b"attacker-content");
+    }
+
+    // ── V13-H3: bearer-token files must not settle for an inherited ACL ──
+
+    /// The whole point of the read-back. Windows has no `chmod 0o600`, so the
+    /// only evidence that a token file is owner-only is a DACL that was read
+    /// back and named nobody else.
+    #[test]
+    fn only_a_confirmed_owner_only_acl_may_carry_a_secret() {
+        assert!(secret_write_permitted(&AclVerdict::OwnerOnly));
+    }
+
+    /// A filesystem with no ACLs at all (FAT32, some network redirectors) and a
+    /// correctly-restricted NTFS file are indistinguishable once the handle is
+    /// gone. Refusing is the only answer that does not depend on which one it
+    /// was.
+    #[test]
+    fn an_unverifiable_acl_refuses_the_secret_write() {
+        assert!(!secret_write_permitted(&AclVerdict::Unverifiable));
+    }
+
+    /// One foreign grant is one local account that can authenticate to the
+    /// admin and IPC planes, so the threshold is one, not "a lot".
+    #[test]
+    fn a_single_foreign_grant_refuses_the_secret_write() {
+        assert!(!secret_write_permitted(&AclVerdict::Shared {
+            foreign_grants: 1
+        }));
+        assert!(!secret_write_permitted(&AclVerdict::Shared {
+            foreign_grants: 7
+        }));
+    }
+
+    /// `atomic_write_owner_only` must publish the same bytes as
+    /// `atomic_write` — the hardening is additive, not a different write.
+    #[test]
+    fn owner_only_write_publishes_the_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("token");
+        atomic_write_owner_only(&path, b"deadbeef").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"deadbeef");
+        // Replacing an existing secret must work too — the token is rewritten
+        // on every bind.
+        atomic_write_owner_only(&path, b"cafebabe").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"cafebabe");
+    }
+
+    /// The POSIX path is unchanged: `0o600` comes from the `open(2)` that
+    /// creates the staging file and rides the rename.
+    #[cfg(unix)]
+    #[test]
+    fn owner_only_write_is_0o600_on_unix() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("token");
+        atomic_write_owner_only(&path, b"secret").unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600, "published token mode was {mode:o}");
+    }
+
+    /// The runtime directory is where both bearer tokens land; a bare
+    /// `create_dir_all` applies neither `0o700` nor an owner-only DACL.
+    #[cfg(unix)]
+    #[test]
+    fn runtime_dir_is_0o700_on_unix() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let run = dir.path().join("veil").join("run");
+        create_dir_owner_only(&run).unwrap();
+        let mode = std::fs::metadata(&run).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o700, "runtime dir mode was {mode:o}");
+        // Idempotent: every bind calls it again on an existing directory.
+        create_dir_owner_only(&run).unwrap();
     }
 
     // ── R4: Ttl newtype ──────────────────────────────────────

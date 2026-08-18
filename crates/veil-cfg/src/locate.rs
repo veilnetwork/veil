@@ -201,6 +201,8 @@ pub fn default_admin_socket_uri(hint: &Path) -> String {
 ///
 /// The directory is **not** created here — that's the caller's job after
 /// applying the correct mode (`0o700` on Unix / ACL-owner-only on Windows).
+/// `veil_util::create_dir_owner_only` does both; a bare `create_dir_all` does
+/// neither, and this directory holds the admin and IPC bearer tokens.
 pub fn runtime_veil_dir() -> PathBuf {
     if let Some(explicit) = env::var_os("VEIL_RUNTIME_DIR") {
         return PathBuf::from(explicit);
