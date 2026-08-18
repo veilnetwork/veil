@@ -22,6 +22,12 @@
 //!
 //! Only `ALGO_ED25519` and `ALGO_FALCON512` are accepted. Unknown
 //! algorithm bytes are rejected at step 4/6.
+//!
+//! [`verify_identity_document_bindings`] is the same ladder minus steps 3 and
+//! 4b/4b' — the clock-dependent ones. It exists for a device checking its OWN
+//! on-disk document, where a lapsed window is a state to recover from rather
+//! than a reason to refuse; see its docs. Anything arriving from a peer goes
+//! through [`verify_identity_document`].
 
 use ed25519_dalek::{Signature as EdSignature, Verifier as _, VerifyingKey as EdVerifyingKey};
 use pqcrypto_falcon::falcon512;
@@ -159,6 +165,36 @@ pub fn verify_identity_document(
     doc: &IdentityDocument,
     now_unix_secs: u64,
 ) -> Result<ValidatedIdentity, VerifyError> {
+    verify_document_inner(doc, Some(now_unix_secs))
+}
+
+/// The same ladder with the two clock-dependent rungs (document freshness
+/// window, per-delegation validity window) left out: every binding, every
+/// master certification, every tombstone signature and the document signature
+/// are checked exactly as [`verify_identity_document`] checks them.
+///
+/// For a caller holding a document it did not receive over the wire — the
+/// on-disk one this device signs with. An expired delegation there is a state
+/// the device recovers FROM (`reissue_self_delegation` re-signs a forward
+/// window, and it needs the document loaded to do it), so refusing on the
+/// clock would brick exactly the device that has to self-heal: a phone offline
+/// past its 7-day delegation window would never boot far enough to renew it.
+/// A broken SIGNATURE is not recoverable and not legitimate, so it is refused
+/// here.
+///
+/// Peers still run the full time-checked ladder on what they receive — this
+/// weaker check is for local material only, and never for anything a remote
+/// party supplied.
+pub fn verify_identity_document_bindings(
+    doc: &IdentityDocument,
+) -> Result<ValidatedIdentity, VerifyError> {
+    verify_document_inner(doc, None)
+}
+
+fn verify_document_inner(
+    doc: &IdentityDocument,
+    now: Option<u64>,
+) -> Result<ValidatedIdentity, VerifyError> {
     // Audit batch 2026-05-25 phase M (cross-audit closure): removed
     // tautological magic/version check.  Previous code compared
     // `IDENTITY_DOCUMENT_MAGIC != [b'I', b'D']` — both sides are the
@@ -182,23 +218,25 @@ pub fn verify_identity_document(
     // `issued_at_unix` set to "today + 30 days" would silently
     // verify, which would let a compromised master sign a document
     // that activates AFTER a revocation window.
-    if now_unix_secs > doc.valid_until_unix {
-        return Err(VerifyError::Expired {
-            now: now_unix_secs,
-            valid_until: doc.valid_until_unix,
-        });
-    }
-    // `issued_at_unix == 0` is the legacy / unset sentinel — never
-    // reject on it (some publish-side helpers and all pre-refactor
-    // identities serialize zero by default). Real producers always
-    // pass `now`, so a value > now + skew can only mean intentional
-    // future-dating.
-    if doc.issued_at_unix > 0 && now_unix_secs + TIME_VALIDITY_SKEW_SECS < doc.issued_at_unix {
-        return Err(VerifyError::NotYetValid {
-            now: now_unix_secs,
-            issued_at: doc.issued_at_unix,
-            skew: TIME_VALIDITY_SKEW_SECS,
-        });
+    if let Some(now_unix_secs) = now {
+        if now_unix_secs > doc.valid_until_unix {
+            return Err(VerifyError::Expired {
+                now: now_unix_secs,
+                valid_until: doc.valid_until_unix,
+            });
+        }
+        // `issued_at_unix == 0` is the legacy / unset sentinel — never
+        // reject on it (some publish-side helpers and all pre-refactor
+        // identities serialize zero by default). Real producers always
+        // pass `now`, so a value > now + skew can only mean intentional
+        // future-dating.
+        if doc.issued_at_unix > 0 && now_unix_secs + TIME_VALIDITY_SKEW_SECS < doc.issued_at_unix {
+            return Err(VerifyError::NotYetValid {
+                now: now_unix_secs,
+                issued_at: doc.issued_at_unix,
+                skew: TIME_VALIDITY_SKEW_SECS,
+            });
+        }
     }
 
     // 4. Every identity_key's deterministic device_id binding
@@ -215,23 +253,26 @@ pub fn verify_identity_document(
         }
         // 4b. Per-delegation expiry — even if doc is fresh, an
         // individual subkey may have aged out.
-        if now_unix_secs > key.valid_until_unix {
-            return Err(VerifyError::KeyExpired {
-                idx,
-                now: now_unix_secs,
-                valid_until: key.valid_until_unix,
-            });
-        }
-        // 4b'. Per-delegation lower bound.
-        // Same legacy-sentinel handling as the document level.
-        if key.valid_from_unix > 0 && now_unix_secs + TIME_VALIDITY_SKEW_SECS < key.valid_from_unix
-        {
-            return Err(VerifyError::KeyNotYetValid {
-                idx,
-                now: now_unix_secs,
-                valid_from: key.valid_from_unix,
-                skew: TIME_VALIDITY_SKEW_SECS,
-            });
+        if let Some(now_unix_secs) = now {
+            if now_unix_secs > key.valid_until_unix {
+                return Err(VerifyError::KeyExpired {
+                    idx,
+                    now: now_unix_secs,
+                    valid_until: key.valid_until_unix,
+                });
+            }
+            // 4b'. Per-delegation lower bound.
+            // Same legacy-sentinel handling as the document level.
+            if key.valid_from_unix > 0
+                && now_unix_secs + TIME_VALIDITY_SKEW_SECS < key.valid_from_unix
+            {
+                return Err(VerifyError::KeyNotYetValid {
+                    idx,
+                    now: now_unix_secs,
+                    valid_from: key.valid_from_unix,
+                    skew: TIME_VALIDITY_SKEW_SECS,
+                });
+            }
         }
         // 4c. Master cert.
         verify_identity_key_cert(doc, key).map_err(|_| VerifyError::CertSigInvalid { idx })?;
