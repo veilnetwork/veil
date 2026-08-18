@@ -121,6 +121,7 @@ impl RuntimeStateProbe {
         let outbox = self.session_outbox.len();
         let bans = self.ban_list.lock().map(|g| g.len()).unwrap_or(0);
         let dht_contacts = self.dispatcher.dht.routing_table_node_ids().len();
+        let dht_no_service_skips = self.dispatcher.dht.no_dht_service_skips();
         let route_cache_dst = self
             .dispatcher
             .route_cache
@@ -208,6 +209,9 @@ impl RuntimeStateProbe {
              # HELP veil_state_dht_routing_contacts Contacts in DHT routing table\n\
              # TYPE veil_state_dht_routing_contacts gauge\n\
              veil_state_dht_routing_contacts {dht_contacts}\n\
+             # HELP veil_dht_no_service_skips_total Candidate slots not given to a peer that advertised NO_DHT_SERVICE\n\
+             # TYPE veil_dht_no_service_skips_total counter\n\
+             veil_dht_no_service_skips_total {dht_no_service_skips}\n\
              # HELP veil_state_route_cache_destinations Distinct destinations in route cache\n\
              # TYPE veil_state_route_cache_destinations gauge\n\
              veil_state_route_cache_destinations {route_cache_dst}\n\
