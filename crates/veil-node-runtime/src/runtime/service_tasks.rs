@@ -2817,8 +2817,9 @@ impl NodeRuntime {
                 .dispatcher
                 .peer_cert_invalidate
                 .lock()
-                .unwrap_or_else(|p| p.into_inner()) =
-                Some(Arc::new(move |peer: &[u8; 32]| resolver.invalidate_peer(peer)));
+                .unwrap_or_else(|p| p.into_inner()) = Some(Arc::new(move |peer: &[u8; 32]| {
+                resolver.invalidate_peer(peer)
+            }));
         }
         let relay_key_resolver: Arc<dyn veil_types::RelayKeyResolver> =
             dht_key_resolver as Arc<dyn veil_types::RelayKeyResolver>;

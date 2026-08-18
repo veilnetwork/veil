@@ -53,8 +53,8 @@ use veil_app::AppMessage;
 use veil_mailbox::{
     MAILBOX_ACK_ENDPOINT_CAPACITY, MAILBOX_ACK_ENDPOINT_ID, MAILBOX_APP_ID,
     MAILBOX_FETCH_ENDPOINT_CAPACITY, MAILBOX_FETCH_ENDPOINT_ID, MAILBOX_FETCH_REPLY_MAX_BYTES,
-    MAILBOX_SLICE_ENDPOINT_CAPACITY, MAILBOX_SLICE_ENDPOINT_ID,
-    MAILBOX_PUT_ENDPOINT_CAPACITY, MAILBOX_PUT_ENDPOINT_ID, Mailbox,
+    MAILBOX_PUT_ENDPOINT_CAPACITY, MAILBOX_PUT_ENDPOINT_ID, MAILBOX_SLICE_ENDPOINT_CAPACITY,
+    MAILBOX_SLICE_ENDPOINT_ID, Mailbox,
 };
 use veil_proto::{
     MAILBOX_PUT_CHUNK_DATA_BYTES, MAX_MAILBOX_FETCH_ENTRIES, MAX_MAILBOX_PUT_CHUNKS,
@@ -580,7 +580,6 @@ pub async fn handle_fetch_message(
                     // identity backlog alone can fill a reply — measured
                     // live: 133 device blobs announced, none served, while
                     // 74 identity blobs took the whole budget every round.
-
                 }
                 Err(e) => log::warn!(
                     "veil-mailbox: FETCH device-box store error (recv={} dev={}): {e}",
@@ -729,8 +728,8 @@ pub async fn handle_slice_message(
     // What one reply may carry, minus this payload's own header — the same
     // budget the FETCH packer works to, so a slice can never be the thing that
     // cannot be delivered.
-    let window = fetch_reply_budget()
-        .saturating_sub(veil_proto::ipc::MailboxSlicePayload::HEADER_SIZE);
+    let window =
+        fetch_reply_budget().saturating_sub(veil_proto::ipc::MailboxSlicePayload::HEADER_SIZE);
     // FETCH announces device-box blobs alongside identity-box ones, so the
     // slice lookup must cover the same two boxes — an oversized blob that can
     // be announced but never sliced would put the client in a request loop
@@ -2210,16 +2209,24 @@ mod tests {
         };
         handle_slice_message(&mailbox, Some(&sender), msg).await;
 
-        let cap = captured.lock().unwrap();
-        assert_eq!(cap.len(), 1);
-        let resp = veil_proto::ipc::MailboxSlicePayload::decode(&cap[0].1).unwrap();
-        assert_eq!(resp.total_len as usize, body.len(), "the device-box blob answers");
-        assert!(!resp.bytes.is_empty());
-        assert_eq!(&body[..resp.bytes.len()], &resp.bytes[..]);
+        // Scoped, not `drop`ped: the guard must be structurally dead before
+        // the second `.await` below, and a plain `drop()` leaves it alive as
+        // far as the await-holding-lock check is concerned.
+        {
+            let cap = captured.lock().unwrap();
+            assert_eq!(cap.len(), 1);
+            let resp = veil_proto::ipc::MailboxSlicePayload::decode(&cap[0].1).unwrap();
+            assert_eq!(
+                resp.total_len as usize,
+                body.len(),
+                "the device-box blob answers"
+            );
+            assert!(!resp.bytes.is_empty());
+            assert_eq!(&body[..resp.bytes.len()], &resp.bytes[..]);
+        }
 
         // And WITHOUT the verified device the same request finds nothing —
         // the box stays invisible to a fetcher the signature does not name.
-        drop(cap);
         captured.lock().unwrap().clear();
         let req2 = veil_proto::ipc::MailboxSliceReqPayload {
             content_id: cid,
@@ -2239,7 +2246,10 @@ mod tests {
         let cap = captured.lock().unwrap();
         assert_eq!(cap.len(), 1);
         let resp2 = veil_proto::ipc::MailboxSlicePayload::decode(&cap[0].1).unwrap();
-        assert_eq!(resp2.total_len, 0, "no verified device, no device-box slice");
+        assert_eq!(
+            resp2.total_len, 0,
+            "no verified device, no device-box slice"
+        );
         assert!(resp2.bytes.is_empty());
     }
 
@@ -2495,7 +2505,9 @@ mod tests {
         let (mailbox, _tmp) = fresh_mailbox();
         let recv = [0x22u8; 32];
         let cid = [0xD3u8; 32];
-        mailbox.put(recv, cid, [0xAA; 32], vec![0x5A; 4096]).unwrap();
+        mailbox
+            .put(recv, cid, [0xAA; 32], vec![0x5A; 4096])
+            .unwrap();
 
         let captured = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let sender: Arc<dyn veil_types::AnonOnionSender> = Arc::new(MockReplySender {
@@ -2808,7 +2820,11 @@ mod tests {
             },
         );
         let both = mb.fetch(recv).unwrap();
-        assert_eq!(both.len(), 2, "normal deposit still stored, beside the big one");
+        assert_eq!(
+            both.len(),
+            2,
+            "normal deposit still stored, beside the big one"
+        );
         assert!(both.iter().any(|b| b.blob == b"fits"));
     }
 }
