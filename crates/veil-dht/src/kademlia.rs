@@ -724,6 +724,10 @@ impl KademliaService {
             .find_closest(target, self.k())
             .into_iter()
             .filter(|c| matches!(c.discovery_mode(), veil_types::DiscoveryMode::Public))
+            // A no-service peer must never be handed to a walker as a closer
+            // node: every referral turns into store/query traffic at the peer
+            // that asked not to receive any.
+            .filter(|c| c.dht_service())
             .cloned()
             .collect();
 
@@ -1317,11 +1321,17 @@ impl KademliaService {
     }
 
     /// Return the `k` closest node IDs to `target` from the routing table.
+    /// Every consumer of this is a CANDIDATE-selection path (forward
+    /// next-hops, replication targets, walk hops), so no-service peers are
+    /// filtered here once rather than at each call site. Reachability paths
+    /// (resolve_transport's "do I know this node") read the routing table
+    /// directly and are unaffected.
     pub fn find_closest_nodes(&self, target: &[u8; 32], k: usize) -> Vec<[u8; 32]> {
         lock!(self.inner)
             .routing
             .find_closest(target, k)
             .into_iter()
+            .filter(|c| c.dht_service())
             .map(|c| c.node_id)
             .collect()
     }
@@ -1340,6 +1350,7 @@ impl KademliaService {
             .routing
             .find_closest(target, k)
             .into_iter()
+            .filter(|c| c.dht_service())
             .cloned()
             .collect()
     }
@@ -1359,6 +1370,7 @@ impl KademliaService {
             .routing
             .find_closest(target, k)
             .into_iter()
+            .filter(|c| c.dht_service())
             .map(|c| (c.node_id, c.transport.clone()))
             .collect()
     }
@@ -1376,7 +1388,9 @@ impl KademliaService {
             .routing
             .find_closest(target, self.k())
             .into_iter()
-            .filter(|c| matches!(c.discovery_mode(), veil_types::DiscoveryMode::Public))
+            .filter(|c| {
+                matches!(c.discovery_mode(), veil_types::DiscoveryMode::Public) && c.dht_service()
+            })
             .map(|c| c.node_id)
             .collect();
         let half_cap = public.len().div_ceil(2).max(1);
@@ -1493,6 +1507,7 @@ impl KademliaService {
                 .routing
                 .find_closest(&key, self.k())
                 .into_iter()
+                .filter(|c| c.dht_service())
                 .cloned()
                 .collect()
         };
@@ -1599,6 +1614,7 @@ impl KademliaService {
                 .routing
                 .find_closest(&target, self.k())
                 .into_iter()
+                .filter(|c| c.dht_service())
                 .cloned()
                 .collect()
         };
