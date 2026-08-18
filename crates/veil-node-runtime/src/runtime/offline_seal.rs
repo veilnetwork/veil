@@ -37,7 +37,8 @@ use veil_observability::NodeLogger;
 use veil_proto::ipc::AuthAppDeliver;
 use veil_session::SessionTxRegistry;
 
-use crate::mlkem_resolver::{DhtMlKemEkResolver, PeerMlKemCertCache};
+use crate::mlkem_cert_store::MlKemCertStore;
+use crate::mlkem_resolver::{DhtMlKemEkResolver, PeerMlKemCertCache, ResolvedCerts};
 
 /// Auth-deliver freshness window for the OFFLINE (mailbox) open path. Unlike the
 /// 300s live-onion window, a stored-and-forwarded message is delivered whenever
@@ -145,13 +146,65 @@ pub(crate) fn select_own_device_instance(
     }
 }
 
+/// Why a seal could find no certificate to encrypt to.
+///
+/// One error variant used to carry both, and the two want opposite responses.
+/// A recipient nobody has ever resolved has no key and will not have one until
+/// it publishes; retrying is all that is left. A recipient whose remembered
+/// certificates have all run past their SIGNED window was known — it needs only
+/// to come online and republish, and the operator can be told which device and
+/// how long ago. 45 minutes of live deposits produced the same
+/// `mailbox_seal failed: ... PeerUnresolved` line for every attempt and said
+/// neither.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CertUnresolved {
+    /// Nothing on the DHT and nothing remembered, for any device of the
+    /// recipient.
+    NothingFound,
+    /// Every device that could have been sealed for had only a remembered
+    /// certificate whose own signed validity window has closed.
+    OnlyExpired {
+        /// How many devices were in that state.
+        devices: usize,
+    },
+}
+
+impl std::fmt::Display for CertUnresolved {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NothingFound => f.write_str(
+                "nothing resolved and nothing stored — the recipient has never published \
+                 a certificate we have seen",
+            ),
+            Self::OnlyExpired { devices } => write!(
+                f,
+                "{devices} device(s) had only a stored certificate past its own signed \
+                 validity window — they must come online and republish",
+            ),
+        }
+    }
+}
+
+impl ResolvedCerts {
+    /// The reason a resolve produced nothing to seal to.
+    fn unresolved(&self) -> CertUnresolved {
+        if self.expired_devices > 0 {
+            CertUnresolved::OnlyExpired {
+                devices: self.expired_devices,
+            }
+        } else {
+            CertUnresolved::NothingFound
+        }
+    }
+}
+
 /// Failure of a runtime offline seal/open.
 #[derive(Debug, thiserror::Error)]
 pub enum OfflineSealError {
     #[error("no sovereign identity loaded")]
     NoIdentity,
-    #[error("could not resolve + verify the recipient's ML-KEM cert from the DHT")]
-    RecipientCertUnresolved,
+    #[error("no usable ML-KEM certificate for the recipient: {0}")]
+    RecipientCertUnresolved(CertUnresolved),
     #[error("could not resolve + verify the sender's identity document from the DHT")]
     SenderDocUnresolved,
     #[error("could not derive the local ML-KEM recipient key: {0}")]
@@ -173,6 +226,10 @@ pub struct RuntimeMailboxCrypto {
     peer_mlkem_keys: Arc<RwLock<PeerMlKemCache>>,
     peer_ratchet_keys: Arc<RwLock<veil_e2e::PeerRatchetKeyCache>>,
     peer_mlkem_certs: Arc<RwLock<PeerMlKemCertCache>>,
+    /// The same certificates on disk, bounded by each certificate's own signed
+    /// validity window. What lets a deposit be sealed for a device that has
+    /// been off longer than the RAM cache's TTL.
+    peer_mlkem_cert_store: Arc<MlKemCertStore>,
     /// The CELL, not what it held when this handle was built.
     ///
     /// This sink is installed on the IPC server once and lives as long as the
@@ -201,6 +258,7 @@ impl RuntimeMailboxCrypto {
             Arc::clone(&self.peer_mlkem_keys),
             Arc::clone(&self.peer_ratchet_keys),
             Arc::clone(&self.peer_mlkem_certs),
+            Arc::clone(&self.peer_mlkem_cert_store),
             Arc::clone(&self.logger),
         )
     }
@@ -275,7 +333,7 @@ impl RuntimeMailboxCrypto {
         // Sealing to ourselves is a normal first-document operation. Never
         // depend on a DHT round-trip for our own certificate: the runtime owns
         // the exact DK seed and sovereign instance binding already.
-        let certs: Vec<_> = if audience == MailboxAudience::MyOtherDevices {
+        let resolved: ResolvedCerts = if audience == MailboxAudience::MyOtherDevices {
             // OUR devices come from the document this runtime already holds,
             // not from a DHT walk about ourselves. Measured on a two-device
             // stand: the registry said instances=2 and resolving our own id
@@ -285,25 +343,20 @@ impl RuntimeMailboxCrypto {
             let mine = sovereign.active_instance_id();
             let others = other_instances(sovereign.all_instance_entries(), mine);
             if others.is_empty() {
-                Vec::new()
+                ResolvedCerts::default()
             } else {
                 self.mlkem_resolver()
-                    .certs_for_instances(
-                        self.local_node_id,
-                        &sovereign.document,
-                        &others,
-                        now,
-                    )
+                    .certs_for_instances(self.local_node_id, &sovereign.document, &others, now)
                     .await
             }
         } else if recipient_node_id == self.local_node_id {
-            vec![local_verified_cert(
+            ResolvedCerts::just(local_verified_cert(
                 // Under the identity, like the published copy: the fan-out
                 // refuses any cert whose node id is not the recipient binding.
                 identity,
                 sovereign.active_instance_id(),
                 &self.mlkem_keys.current_seed(),
-            )?]
+            )?)
         } else if addressed_to_us {
             // The recipient is OUR OWN DEVICE, addressed by its transport id.
             // Everything it publishes — instance registry and per-instance
@@ -366,9 +419,12 @@ impl RuntimeMailboxCrypto {
                 .fetch_verified_certs(recipient_node_id)
                 .await
         };
-        if certs.is_empty() {
-            return Err(OfflineSealError::RecipientCertUnresolved);
+        if resolved.is_empty() {
+            return Err(OfflineSealError::RecipientCertUnresolved(
+                resolved.unresolved(),
+            ));
         }
+        let certs = resolved.certs;
         // Embed our own signed document so an offline recipient can verify us
         // without a DHT resolve (see `open` + `seal_mailbox_blob`).
         //
@@ -538,7 +594,18 @@ impl veil_ipc::MailboxCryptoSink for RuntimeMailboxCrypto {
             {
                 Ok(blob) => O::Ok(blob),
                 Err(OfflineSealError::NoIdentity) => O::NoIdentity,
-                Err(OfflineSealError::RecipientCertUnresolved) => O::PeerUnresolved,
+                // The wire status stays `PeerUnresolved` — it is a numbered
+                // `MailboxCryptoStatus` the app decodes — but the class goes to
+                // the log, because "no certificate at all" and "the stored
+                // certificate is past its window" are answered by different
+                // things and looked identical for 45 minutes of live retries.
+                Err(OfflineSealError::RecipientCertUnresolved(reason)) => {
+                    log::warn!(
+                        "mailbox_seal: no recipient certificate (recipient={}): {reason}",
+                        veil_util::hex_short(&recipient_node_id),
+                    );
+                    O::PeerUnresolved
+                }
                 Err(e) => {
                     // Same reasoning as the open path's detail log: the IPC
                     // surface collapses every remaining failure into `Failed`,
@@ -605,6 +672,7 @@ impl super::NodeRuntime {
             peer_mlkem_keys: Arc::clone(&self.identity.peer_mlkem_keys),
             peer_ratchet_keys: Arc::clone(&self.identity.peer_ratchet_keys),
             peer_mlkem_certs: Arc::clone(&self.identity.peer_mlkem_certs),
+            peer_mlkem_cert_store: Arc::clone(&self.identity.peer_mlkem_cert_store),
             sovereign: self.identity.sovereign_identity.clone(),
             mlkem_keys: Arc::clone(&self.identity.mlkem_keys),
             logger: Arc::clone(&self.logger),
@@ -622,6 +690,36 @@ fn now_unix() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The two failures a seal can have when it has no certificate, told apart.
+    ///
+    /// A recipient that has run its certificates past their signed window is
+    /// waiting to republish; a recipient nothing was ever resolved for is not
+    /// coming back on its own. Both used to arrive as one wordless
+    /// `PeerUnresolved`, which is what 45 minutes of live retries produced.
+    #[test]
+    fn the_reason_separates_expired_material_from_none_at_all() {
+        assert_eq!(
+            ResolvedCerts::default().unresolved(),
+            CertUnresolved::NothingFound,
+        );
+        assert_eq!(
+            ResolvedCerts {
+                certs: Vec::new(),
+                expired_devices: 2,
+                unknown_devices: 1,
+            }
+            .unresolved(),
+            CertUnresolved::OnlyExpired { devices: 2 },
+            "a device with expired material is the one the operator can act on",
+        );
+        assert!(
+            OfflineSealError::RecipientCertUnresolved(CertUnresolved::OnlyExpired { devices: 2 })
+                .to_string()
+                .contains("republish"),
+            "the error itself must say what has to happen next",
+        );
+    }
 
     /// Assemble a `RuntimeMailboxCrypto` over a real standalone identity and an
     /// empty DHT. Every path this test takes is in-process: sealing to OURSELVES
@@ -654,6 +752,7 @@ mod tests {
             peer_mlkem_keys: Arc::new(RwLock::new(PeerMlKemCache::new())),
             peer_ratchet_keys: Arc::new(RwLock::new(veil_e2e::PeerRatchetKeyCache::new())),
             peer_mlkem_certs: Arc::new(RwLock::new(PeerMlKemCertCache::new())),
+            peer_mlkem_cert_store: Arc::new(MlKemCertStore::ephemeral()),
             sovereign: crate::runtime::identity_state::SovereignIdentityCell::new(Some(sov)),
             mlkem_keys: ring,
             logger: Arc::new(NodeLogger::new_noop()),
@@ -701,6 +800,7 @@ mod tests {
             peer_mlkem_keys: Arc::new(RwLock::new(PeerMlKemCache::new())),
             peer_ratchet_keys: Arc::new(RwLock::new(veil_e2e::PeerRatchetKeyCache::new())),
             peer_mlkem_certs: Arc::new(RwLock::new(PeerMlKemCertCache::new())),
+            peer_mlkem_cert_store: Arc::new(MlKemCertStore::ephemeral()),
             sovereign: cell.clone(),
             mlkem_keys: ring,
             logger: Arc::new(NodeLogger::new_noop()),

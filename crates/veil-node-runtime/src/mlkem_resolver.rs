@@ -57,6 +57,8 @@ use veil_session::SessionTxRegistry;
 use veil_types::{MlKemEkResolver, NodeIdBytes, RelayKeyResolver};
 use veil_util::{lock, rlock, wlock};
 
+use crate::mlkem_cert_store::{CertRecall, MlKemCertStore};
+
 /// Default per-step timeout when none is configured (3 sec).  Three
 /// sequential DHT walks (doc + registry + cert) so total budget caps
 /// at ~9 sec in the worst case.
@@ -100,6 +102,46 @@ pub type PeerMlKemCertCache =
 pub type PeerInstanceCertCache =
     std::collections::HashMap<([u8; 32], [u8; 16]), (VerifiedMlkemCert, std::time::Instant)>;
 
+/// What a per-device fan-out resolve produced, and what happened to the devices
+/// it produced nothing for.
+///
+/// The certificates alone could not tell the seal path why it had none, and
+/// "none" has two causes that call for opposite responses: a recipient nobody
+/// has ever resolved has no key and never will until it publishes one, while a
+/// recipient whose remembered certificates have all run past their signed
+/// window WAS known and needs only to come online and republish. Collapsing
+/// both into an empty vector is what made 45 minutes of identical
+/// `PeerUnresolved` lines say nothing about which had happened.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct ResolvedCerts {
+    /// The devices that can be sealed for.
+    pub certs: Vec<VerifiedMlkemCert>,
+    /// Devices whose only available material was a remembered certificate whose
+    /// own signed validity window has closed.
+    pub expired_devices: usize,
+    /// Devices the DHT did not answer for and that were never remembered.
+    pub unknown_devices: usize,
+}
+
+impl ResolvedCerts {
+    /// One resolved certificate — the shape the caller that already holds a
+    /// cert needs to speak the same language as a fan-out.
+    #[must_use]
+    pub fn just(cert: VerifiedMlkemCert) -> Self {
+        Self {
+            certs: vec![cert],
+            expired_devices: 0,
+            unknown_devices: 0,
+        }
+    }
+
+    /// Whether nothing can be sealed for.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.certs.is_empty()
+    }
+}
+
 /// DHT-driven impl of [`MlKemEkResolver`].  Wraps the same set of
 /// `Arc`-shared runtime components that `NodeRuntime::dht_recursive_get`
 /// uses, plus a write-through to `peer_mlkem_keys` cache.
@@ -127,6 +169,16 @@ pub struct DhtMlKemEkResolver {
     /// long-lived IPC-server resolver, so there is no second instance to share
     /// warmth with.
     instance_cert_cache: Arc<RwLock<PeerInstanceCertCache>>,
+    /// Verified certificates that outlive the process. Consulted only when the
+    /// DHT answers nothing, and every row re-verified there and then — see
+    /// [`MlKemCertStore`].
+    ///
+    /// The two caches above are RAM and expire on a TTL somebody chose; a
+    /// device off longer than that TTL had nothing anywhere, and its
+    /// certificate slot has exactly one writer — itself — so no other device of
+    /// its family could answer for it either. That is the whole of the
+    /// production failure this field exists for.
+    cert_store: Arc<MlKemCertStore>,
     logger: Arc<NodeLogger>,
     step_timeout: Duration,
     /// Verified-cert cache TTL. Defaults to [`CERT_CACHE_TTL`]; overridable
@@ -148,6 +200,7 @@ impl DhtMlKemEkResolver {
         peer_mlkem_keys: Arc<RwLock<PeerMlKemCache>>,
         peer_ratchet_keys: Arc<RwLock<veil_e2e::PeerRatchetKeyCache>>,
         cert_cache: Arc<RwLock<PeerMlKemCertCache>>,
+        cert_store: Arc<MlKemCertStore>,
         logger: Arc<NodeLogger>,
     ) -> Self {
         Self {
@@ -159,6 +212,7 @@ impl DhtMlKemEkResolver {
             peer_ratchet_keys,
             cert_cache,
             instance_cert_cache: Arc::new(RwLock::new(PeerInstanceCertCache::new())),
+            cert_store,
             logger,
             step_timeout: DEFAULT_STEP_TIMEOUT,
             cert_ttl: CERT_CACHE_TTL,
@@ -206,6 +260,49 @@ impl DhtMlKemEkResolver {
             keys.remove(&victim);
         }
         keys.insert(target_node_id, cert.ratchet_x25519_pubkey);
+    }
+
+    /// The remembered certificate of one device, for a walk that came back
+    /// empty-handed.
+    ///
+    /// Consulted ONLY after the DHT has been asked and has said nothing, so a
+    /// live publication always wins: this cannot pin a key the recipient has
+    /// rotated away from while the recipient is reachable. The row is
+    /// re-verified inside [`MlKemCertStore::recall`] against the same document
+    /// this walk just verified, so what comes back has passed the identical
+    /// check the network copy would have.
+    fn recall_cert(
+        &self,
+        target_node_id: [u8; 32],
+        instance_id: [u8; 16],
+        doc: &IdentityDocument,
+        now_unix: u64,
+    ) -> CertRecall {
+        let recall = self
+            .cert_store
+            .recall(&target_node_id, &instance_id, doc, now_unix);
+        match &recall {
+            CertRecall::Verified(cert) => self.log_dbg(
+                "mlkem_resolver.cert.remembered",
+                &target_node_id,
+                &format!(
+                    "instance={} cert_version={} — DHT silent, serving the stored certificate",
+                    veil_util::bytes_to_hex(&instance_id[..4]),
+                    cert.cert_version,
+                ),
+            ),
+            CertRecall::Expired { valid_until_unix } => self.log_dbg(
+                "mlkem_resolver.cert.remembered_expired",
+                &target_node_id,
+                &format!(
+                    "instance={} valid_until={valid_until_unix} now={now_unix} — \
+                     the device must republish before anything can be sealed for it",
+                    veil_util::bytes_to_hex(&instance_id[..4]),
+                ),
+            ),
+            CertRecall::Absent => {}
+        }
+        recall
     }
 
     /// Override the per-step DHT timeout.  Useful for tests +
@@ -396,7 +493,7 @@ impl DhtMlKemEkResolver {
         // longer matched the receiver's dk → every blob sealed to it failed
         // open (`Fanout(AeadFailed)`) and was quarantined away.
         let cert_key = MlKemKeyCert::dht_key(&target_node_id, &instance.instance_id);
-        let cert = match self
+        let from_dht = match self
             .dht_get_freshest(
                 cert_key,
                 |b| {
@@ -408,21 +505,36 @@ impl DhtMlKemEkResolver {
             )
             .await
         {
-            Some(c) => c,
+            Some(cert) => match verify_mlkem_cert(&cert, &doc, now_unix) {
+                Ok(verified) => {
+                    self.cert_store.remember(&cert, now_unix);
+                    Some(verified)
+                }
+                Err(e) => {
+                    self.log_dbg(
+                        "mlkem_resolver.cert.verify_failed",
+                        &target_node_id,
+                        &format!("{e:?}"),
+                    );
+                    None
+                }
+            },
             None => {
                 self.log_dbg("mlkem_resolver.cert.dht_miss", &target_node_id, "");
-                return None;
+                None
             }
         };
-        let verified = verify_mlkem_cert(&cert, &doc, now_unix)
-            .map_err(|e| {
-                self.log_dbg(
-                    "mlkem_resolver.cert.verify_failed",
-                    &target_node_id,
-                    &format!("{e:?}"),
-                )
-            })
-            .ok()?;
+        // The DHT is asked first and always wins, so a live publication can
+        // never be overridden by a stored one; the store answers only for the
+        // device that has stopped publishing, which is the only device nothing
+        // else in the network can answer for.
+        let verified = match from_dht {
+            Some(verified) => verified,
+            None => match self.recall_cert(target_node_id, instance.instance_id, &doc, now_unix) {
+                CertRecall::Verified(cert) => *cert,
+                CertRecall::Expired { .. } | CertRecall::Absent => return None,
+            },
+        };
 
         // ── Step 4: cache writeback ────────────────────────────────
         // Every per-peer cache is [`MAX_PEER_MLKEM_CACHE`]-bounded LRU — same
@@ -501,7 +613,7 @@ impl DhtMlKemEkResolver {
         // in the singular walk (see the Step-3 comment there for why
         // first-replica-wins was a production message-loss path).
         let cert_key = MlKemKeyCert::dht_key(&target_node_id, &instance_id);
-        let cert = match self
+        let from_dht = match self
             .dht_get_freshest(
                 cert_key,
                 |b| {
@@ -513,21 +625,34 @@ impl DhtMlKemEkResolver {
             )
             .await
         {
-            Some(c) => c,
+            Some(cert) => match verify_mlkem_cert(&cert, &doc, now_unix) {
+                Ok(verified) => {
+                    self.cert_store.remember(&cert, now_unix);
+                    Some(verified)
+                }
+                Err(e) => {
+                    self.log_dbg(
+                        "mlkem_resolver.instance_cert.verify_failed",
+                        &target_node_id,
+                        &format!("{e:?}"),
+                    );
+                    None
+                }
+            },
             None => {
                 self.log_dbg("mlkem_resolver.instance_cert.dht_miss", &target_node_id, "");
-                return None;
+                None
             }
         };
-        let verified = verify_mlkem_cert(&cert, &doc, now_unix)
-            .map_err(|e| {
-                self.log_dbg(
-                    "mlkem_resolver.instance_cert.verify_failed",
-                    &target_node_id,
-                    &format!("{e:?}"),
-                )
-            })
-            .ok()?;
+        // Same order as the singular walk: network first, stored only for the
+        // device that has stopped answering for itself.
+        let verified = match from_dht {
+            Some(verified) => verified,
+            None => match self.recall_cert(target_node_id, instance_id, &doc, now_unix) {
+                CertRecall::Verified(cert) => *cert,
+                CertRecall::Expired { .. } | CertRecall::Absent => return None,
+            },
+        };
         if verified.instance_id != instance_id {
             self.log_dbg(
                 "mlkem_resolver.instance_cert.instance_mismatch",
@@ -574,6 +699,10 @@ impl DhtMlKemEkResolver {
         wlock!(self.cert_cache).remove(target_node_id);
         wlock!(self.instance_cert_cache).retain(|(node_id, _), _| node_id != target_node_id);
         wlock!(self.peer_mlkem_keys).remove(target_node_id);
+        // The stored copy goes with them, and for a stronger reason: the RAM
+        // rows die with the process, this one would come back after a restart
+        // and re-serve the very material the peer has just refused.
+        self.cert_store.forget_node(target_node_id);
     }
 
     /// Every instance of the recipient, so a message reaches every device of
@@ -594,12 +723,12 @@ impl DhtMlKemEkResolver {
     /// resolves but whose cert is missing is skipped rather than failing the
     /// send — it may never have come online since it was admitted — so this
     /// returns the ones that verified, and empty only when none did.
-    pub async fn fetch_verified_certs(&self, target_node_id: [u8; 32]) -> Vec<VerifiedMlkemCert> {
+    pub async fn fetch_verified_certs(&self, target_node_id: [u8; 32]) -> ResolvedCerts {
         let Some(doc) = self.fetch_verified_document(target_node_id, None).await else {
-            return Vec::new();
+            return ResolvedCerts::default();
         };
         let Ok(now) = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) else {
-            return Vec::new();
+            return ResolvedCerts::default();
         };
         let now_unix = now.as_secs();
 
@@ -626,7 +755,7 @@ impl DhtMlKemEkResolver {
             .await
         else {
             self.log_dbg("mlkem_resolver.registry.dht_miss", &target_node_id, "");
-            return Vec::new();
+            return ResolvedCerts::default();
         };
 
         self.certs_for_instances(target_node_id, &doc, &reg.instances, now_unix)
@@ -652,11 +781,14 @@ impl DhtMlKemEkResolver {
         doc: &IdentityDocument,
         instances: &[veil_proto::instance_registry::InstanceEntry],
         now_unix: u64,
-    ) -> Vec<VerifiedMlkemCert> {
-        let mut out: Vec<VerifiedMlkemCert> = Vec::with_capacity(instances.len());
+    ) -> ResolvedCerts {
+        let mut out = ResolvedCerts {
+            certs: Vec::with_capacity(instances.len()),
+            ..ResolvedCerts::default()
+        };
         for instance in instances {
             let cert_key = MlKemKeyCert::dht_key(&target_node_id, &instance.instance_id);
-            let Some(cert) = self
+            let fetched = self
                 .dht_get_freshest(
                     cert_key,
                     |b| {
@@ -666,27 +798,45 @@ impl DhtMlKemEkResolver {
                     },
                     |c| (c.cert_version, c.valid_from_unix),
                 )
-                .await
-            else {
-                self.log_dbg("mlkem_resolver.cert.dht_miss", &target_node_id, "");
-                continue;
-            };
-            match verify_mlkem_cert(&cert, doc, now_unix) {
-                Ok(verified) => out.push(verified),
-                Err(e) => self.log_dbg(
+                .await;
+            match fetched
+                .as_ref()
+                .map(|c| (c, verify_mlkem_cert(c, doc, now_unix)))
+            {
+                Some((cert, Ok(verified))) => {
+                    // Kept so this device stays sealable after it goes quiet:
+                    // its slot has exactly one writer, itself, and nothing else
+                    // in the network can answer for it once it stops.
+                    self.cert_store.remember(cert, now_unix);
+                    out.certs.push(verified);
+                    continue;
+                }
+                Some((_, Err(e))) => self.log_dbg(
                     "mlkem_resolver.cert.verify_failed",
                     &target_node_id,
                     &format!("{e:?}"),
                 ),
+                None => self.log_dbg("mlkem_resolver.cert.dht_miss", &target_node_id, ""),
+            }
+            // DHT silence about a device is the ordinary state of a device that
+            // is OFF, not an error — and it used to end the seal. A device
+            // whose cert we have held since it was last online is still sealable
+            // for as long as that certificate's own signed window says so.
+            match self.recall_cert(target_node_id, instance.instance_id, doc, now_unix) {
+                CertRecall::Verified(cert) => out.certs.push(*cert),
+                CertRecall::Expired { .. } => out.expired_devices += 1,
+                CertRecall::Absent => out.unknown_devices += 1,
             }
         }
         self.logger.debug(
             "mlkem_resolver.resolved_all",
             format!(
-                "target={} instances={} of {}",
+                "target={} instances={} of {} (expired={} unknown={})",
                 hex8(&target_node_id),
-                out.len(),
+                out.certs.len(),
                 instances.len(),
+                out.expired_devices,
+                out.unknown_devices,
             ),
         );
         out
@@ -1401,6 +1551,7 @@ mod tests {
             Arc::new(RwLock::new(PeerMlKemCache::new())),
             Arc::new(RwLock::new(veil_e2e::PeerRatchetKeyCache::new())),
             Arc::new(RwLock::new(PeerMlKemCertCache::new())),
+            Arc::new(crate::mlkem_cert_store::MlKemCertStore::ephemeral()),
             Arc::new(NodeLogger::new_noop()),
         )
     }
@@ -1433,8 +1584,147 @@ mod tests {
             Arc::new(RwLock::new(PeerMlKemCache::new())),
             peer_ratchet_keys,
             cert_cache,
+            Arc::new(crate::mlkem_cert_store::MlKemCertStore::ephemeral()),
             Arc::new(NodeLogger::new_noop()),
         )
+    }
+
+    /// A resolver over an EMPTY DHT whose persistent cert store the test holds,
+    /// so every `Some(_)` it produces can only have come from the store.
+    fn make_test_resolver_with_store(
+        dht: Arc<KademliaService>,
+        cert_store: Arc<crate::mlkem_cert_store::MlKemCertStore>,
+    ) -> DhtMlKemEkResolver {
+        DhtMlKemEkResolver::new(
+            dht,
+            Arc::new(RwLock::new(SessionTxRegistry::new())),
+            Arc::new(Mutex::new(std::collections::HashMap::new())),
+            [1u8; 32],
+            Arc::new(RwLock::new(PeerMlKemCache::new())),
+            Arc::new(RwLock::new(veil_e2e::PeerRatchetKeyCache::new())),
+            Arc::new(RwLock::new(PeerMlKemCertCache::new())),
+            cert_store,
+            Arc::new(NodeLogger::new_noop()),
+        )
+    }
+
+    fn entry(instance_id: [u8; 16]) -> veil_proto::instance_registry::InstanceEntry {
+        veil_proto::instance_registry::InstanceEntry {
+            instance_id,
+            bound_identity_key_idx: 0,
+            label: String::new(),
+            last_seen_unix_ms: 0,
+        }
+    }
+
+    /// The measured production case, at the function the mailbox seal calls.
+    ///
+    /// A device of the family is force-stopped, so its certificate slot — which
+    /// has exactly ONE writer, itself — goes unanswered while the identity
+    /// document and instance registry stay answerable through its live
+    /// siblings. With no peers configured the walk genuinely resolves nothing,
+    /// so a cert here can only have come from the store, and its acceptance can
+    /// only have come from `verify_mlkem_cert` passing against the same document
+    /// a live walk would have used.
+    #[tokio::test]
+    async fn a_stored_cert_seals_for_a_device_the_dht_no_longer_answers_for() {
+        use crate::mlkem_cert_store::MlKemCertStore;
+        use crate::mlkem_cert_store::fixture::{NOW, signer};
+
+        let s = signer(0x21);
+        let store = Arc::new(MlKemCertStore::ephemeral());
+        // Stored while the device was up; a full day later it is still inside
+        // the 30-day window its certificate was SIGNED for.
+        assert!(store.remember(&s.cert([0xab; 16], NOW, NOW + 30 * 86_400, 4), NOW));
+        let resolver = make_test_resolver_with_store(
+            Arc::new(KademliaService::new([1u8; 32])),
+            Arc::clone(&store),
+        );
+
+        let resolved = resolver
+            .certs_for_instances(s.doc.node_id, &s.doc, &[entry([0xab; 16])], NOW + 86_400)
+            .await;
+        assert_eq!(
+            resolved.certs.len(),
+            1,
+            "the deposit must have a key to seal to"
+        );
+        assert_eq!(resolved.certs[0].cert_version, 4);
+        assert_eq!(resolved.expired_devices, 0);
+        assert_eq!(resolved.unknown_devices, 0);
+    }
+
+    /// Past the certificate's own signed window the store must NOT stand in.
+    /// The seal fails as it did before — and says which of the two failures it
+    /// is, which is the difference between "wait for the device" and "this peer
+    /// was never resolvable".
+    #[tokio::test]
+    async fn an_expired_stored_cert_does_not_seal_and_says_so() {
+        use crate::mlkem_cert_store::MlKemCertStore;
+        use crate::mlkem_cert_store::fixture::{NOW, signer};
+
+        let s = signer(0x22);
+        let store = Arc::new(MlKemCertStore::ephemeral());
+        assert!(store.remember(&s.cert([0xab; 16], NOW, NOW + 3600, 1), NOW));
+        let resolver = make_test_resolver_with_store(
+            Arc::new(KademliaService::new([1u8; 32])),
+            Arc::clone(&store),
+        );
+
+        let resolved = resolver
+            .certs_for_instances(s.doc.node_id, &s.doc, &[entry([0xab; 16])], NOW + 7200)
+            .await;
+        assert!(
+            resolved.is_empty(),
+            "expired material must not be sealed to"
+        );
+        assert_eq!(resolved.expired_devices, 1);
+        assert_eq!(resolved.unknown_devices, 0);
+    }
+
+    /// A device that was never resolved has no key and cannot acquire one from
+    /// a local file — the honest failure, unchanged.
+    #[tokio::test]
+    async fn a_device_never_resolved_still_fails_as_unknown() {
+        use crate::mlkem_cert_store::MlKemCertStore;
+        use crate::mlkem_cert_store::fixture::{NOW, signer};
+
+        let s = signer(0x23);
+        let resolver = make_test_resolver_with_store(
+            Arc::new(KademliaService::new([1u8; 32])),
+            Arc::new(MlKemCertStore::ephemeral()),
+        );
+        let resolved = resolver
+            .certs_for_instances(s.doc.node_id, &s.doc, &[entry([0xcd; 16])], NOW)
+            .await;
+        assert!(resolved.is_empty());
+        assert_eq!(resolved.expired_devices, 0);
+        assert_eq!(resolved.unknown_devices, 1);
+    }
+
+    /// Invalidation must reach the file, or the refused certificate comes back
+    /// on the next seal and, worse, after a restart.
+    #[tokio::test]
+    async fn invalidating_a_peer_drops_its_stored_certs_too() {
+        use crate::mlkem_cert_store::MlKemCertStore;
+        use crate::mlkem_cert_store::fixture::{NOW, signer};
+
+        let s = signer(0x24);
+        let store = Arc::new(MlKemCertStore::ephemeral());
+        assert!(store.remember(&s.cert([0xab; 16], NOW, NOW + 30 * 86_400, 1), NOW));
+        let resolver = make_test_resolver_with_store(
+            Arc::new(KademliaService::new([1u8; 32])),
+            Arc::clone(&store),
+        );
+        resolver.invalidate_peer(&s.doc.node_id);
+        assert!(
+            store.is_empty(),
+            "the peer said it cannot open what we sealed"
+        );
+        let resolved = resolver
+            .certs_for_instances(s.doc.node_id, &s.doc, &[entry([0xab; 16])], NOW)
+            .await;
+        assert!(resolved.is_empty());
     }
 
     fn dummy_cert(node_id: [u8; 32]) -> VerifiedMlkemCert {
