@@ -1712,6 +1712,12 @@ pub enum DelegateDeviceError {
     )]
     WrongMaster { computed: String, document: String },
     #[error(
+        "this identity's master is algo {algo} (1 = Ed25519); the multi-device \
+         operations sign with an Ed25519 master only, so they cannot act on it. \
+         Re-create the identity as Ed25519 to use several devices"
+    )]
+    UnsupportedMasterAlgo { algo: u8 },
+    #[error(
         "valid_until_unix − now_unix = {secs}s exceeds \
          MAX_FRESHNESS_WINDOW_SECS ({MAX_FRESHNESS_WINDOW_SECS}s)"
     )]
@@ -1861,6 +1867,23 @@ fn delegate_into_document(
     {
         return Err(DelegateDeviceError::Revoked {
             device_id: hex_encode(&delegated_device_id),
+        });
+    }
+
+    // Say which of the two things is wrong before comparing node_ids.
+    //
+    // The master key is reconstructed from 32 Ed25519 bytes below, and a
+    // hybrid identity's node_id is BLAKE3 over its 929-byte (Ed25519+Falcon)
+    // master pubkey — so the comparison can never match, and without this it
+    // reports "master seed does not match this identity", sending the operator
+    // hunting for a wrong phrase that is in fact correct. `identity create
+    // --algo=hybrid` builds such an identity today, so this is reachable, not
+    // hypothetical. Naming the algorithm is a refusal, not support: signing
+    // the cert with a hybrid master needs the Falcon half plumbed through
+    // MasterSecret and a hybrid cert on the wire.
+    if doc.master_algo != ALGO_ED25519 {
+        return Err(DelegateDeviceError::UnsupportedMasterAlgo {
+            algo: doc.master_algo,
         });
     }
 
@@ -2101,6 +2124,19 @@ pub fn adopt_identity_document(
     crate::verify::verify_identity_document(&incoming, now_unix)
         .map_err(|e| AdoptDocumentError::Verify(e.to_string()))?;
 
+    // Ahead of the identity comparison, for the reason spelled out in
+    // `delegate_into_document`: a hybrid master can never match a node_id
+    // hashed over its 929-byte pubkey, and "this is a different identity" is
+    // the wrong thing to tell an operator whose phrase is right. Nothing has
+    // been written at this point.
+    if incoming.master_algo != ALGO_ED25519 {
+        return Err(AdoptDocumentError::Delegate(
+            DelegateDeviceError::UnsupportedMasterAlgo {
+                algo: incoming.master_algo,
+            },
+        ));
+    }
+
     let master_sk = match &master {
         MasterSecret::Seed(seed) => SigningKey::from_bytes(&derive_master_sk_ed25519(seed)),
         MasterSecret::SigningKey(sk) => SigningKey::from_bytes(sk),
@@ -2269,6 +2305,18 @@ pub fn revoke_identity_device(
     let local_bytes = std::fs::read(&doc_path)?;
     let mut doc = IdentityDocument::decode(&local_bytes)
         .map_err(|e| AdoptDocumentError::DocumentDecode(e.to_string()))?;
+
+    // Same refusal, same reason, and it matters most here: revoking a
+    // compromised device is the operation you least want reported as "wrong
+    // phrase". Checked before the tombstone is minted and long before
+    // `resign_and_store_document` writes anything.
+    if doc.master_algo != ALGO_ED25519 {
+        return Err(AdoptDocumentError::Delegate(
+            DelegateDeviceError::UnsupportedMasterAlgo {
+                algo: doc.master_algo,
+            },
+        ));
+    }
 
     let master_sk = match &master {
         MasterSecret::Seed(seed) => SigningKey::from_bytes(&derive_master_sk_ed25519(seed)),
@@ -3552,6 +3600,98 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(err, AdoptDocumentError::Verify(_)), "got {err:?}");
+    }
+
+    // ── hybrid master: an honest refusal, not a wrong-phrase story ──────
+    //
+    // `identity create --algo=hybrid` is a shipped CLI path, so these three
+    // operations DO get handed hybrid documents. The master they rebuild is
+    // 32 Ed25519 bytes while a hybrid node_id is BLAKE3 over 929, so the
+    // node_id comparison can never match and the mismatch reads as if the
+    // operator supplied the wrong seed. Revocation is the one that costs: the
+    // answer to a compromised device, reported as "wrong phrase".
+    //
+    // Asserted with the CORRECT master seed, which is the whole point — that
+    // message is reachable with nothing wrong but the algorithm.
+
+    fn hybrid_opts(dir: PathBuf) -> CreateIdentityOptions {
+        CreateIdentityOptions {
+            algo: veil_types::SignatureAlgorithm::Ed25519Falcon512Hybrid,
+            ..test_opts(dir)
+        }
+    }
+
+    #[test]
+    fn delegating_from_a_hybrid_master_names_the_algorithm() {
+        let dir = tempdir();
+        let seed = create_identity(hybrid_opts(dir.clone())).unwrap().master_seed;
+        let device: SensitiveBytesN<32> = SensitiveBytesN::from_bytes([0x21u8; 32]);
+        let device_pk = ed25519_dalek::SigningKey::from_bytes(device.as_array())
+            .verifying_key()
+            .as_bytes()
+            .to_vec();
+
+        let err = delegate_device(delegate_opts(dir, seed, device_pk)).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                DelegateDeviceError::UnsupportedMasterAlgo { algo }
+                    if algo == veil_proto::identity_document::ALGO_ED25519_FALCON512_HYBRID
+            ),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn revoking_on_a_hybrid_master_names_the_algorithm_and_writes_nothing() {
+        let dir = tempdir();
+        let seed = create_identity(hybrid_opts(dir.clone())).unwrap().master_seed;
+        let before = std::fs::read(dir.join(IDENTITY_DOCUMENT_FILE)).unwrap();
+
+        let err =
+            revoke_identity_device(&dir, MasterSecret::Seed(seed), &[0x9Au8; 32], DELEGATE_NOW)
+                .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                AdoptDocumentError::Delegate(DelegateDeviceError::UnsupportedMasterAlgo { .. })
+            ),
+            "got {err:?}"
+        );
+        assert_eq!(
+            before,
+            std::fs::read(dir.join(IDENTITY_DOCUMENT_FILE)).unwrap(),
+            "a refused revoke must not have touched the document"
+        );
+    }
+
+    #[test]
+    fn adopting_a_hybrid_document_names_the_algorithm_and_writes_nothing() {
+        let a = tempdir();
+        let seed = create_identity(hybrid_opts(a.clone())).unwrap().master_seed;
+        let a_doc = std::fs::read(a.join(IDENTITY_DOCUMENT_FILE)).unwrap();
+        let before = std::fs::read(a.join(IDENTITY_DOCUMENT_FILE)).unwrap();
+
+        let err = adopt_identity_document(
+            &a,
+            &a_doc,
+            MasterSecret::Seed(seed),
+            DELEGATE_NOW,
+            DELEGATE_NOW + 7 * 86_400,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                AdoptDocumentError::Delegate(DelegateDeviceError::UnsupportedMasterAlgo { .. })
+            ),
+            "got {err:?}"
+        );
+        assert_eq!(
+            before,
+            std::fs::read(a.join(IDENTITY_DOCUMENT_FILE)).unwrap(),
+            "a refused adopt must not have touched the document"
+        );
     }
 
     #[test]
@@ -4963,26 +5103,28 @@ mod tests {
     fn save_paired_target_state_round_trips_through_load_from_dir() {
         use crate::sovereign::SovereignIdentity;
         use ed25519_dalek::SigningKey as EdSk;
-        use veil_proto::identity_document::IdentityKey;
 
-        // Provision a source, then append a "target device"
-        // IdentityKey whose SK seed we know; save paired target
-        // state into a second dir and load it back.
+        // Provision a source, then admit a "target device" whose SK seed we
+        // know; save paired target state into a second dir and load it back.
+        //
+        // Admitted through `delegate_device`, not hand-appended: the loader
+        // verifies the document's own chain, and a zero master_sig is exactly
+        // what that refuses.
         let src_dir = tempdir();
-        let created = create_identity(test_opts(src_dir)).unwrap();
-        let mut doc = created.document;
+        let created = create_identity(test_opts(src_dir.clone())).unwrap();
         let tgt_seed: SensitiveBytesN<32> = SensitiveBytesN::from_bytes([0xCDu8; 32]);
-        let tgt_sk = EdSk::from_bytes(tgt_seed.as_array());
-        let tgt_pk = tgt_sk.verifying_key();
-        doc.identity_keys.push(IdentityKey {
-            algo: ALGO_ED25519,
-            pubkey: tgt_pk.as_bytes().to_vec(),
-            device_id: veil_crypto::identity::compute_node_id(tgt_pk.as_bytes()),
-            valid_from_unix: 1_700_000_000,
-            valid_until_unix: 1_700_000_000 + 7 * 86_400,
-            master_sig: vec![0u8; 64],
-        });
-        let tgt_idx = (doc.identity_keys.len() - 1) as u16;
+        let tgt_pk = EdSk::from_bytes(tgt_seed.as_array()).verifying_key();
+        let delegated = delegate_device(DelegateDeviceOptions {
+            veil_dir: src_dir,
+            master: MasterSecret::Seed(created.master_seed.clone()),
+            device_pubkey: tgt_pk.as_bytes().to_vec(),
+            now_unix: DELEGATE_NOW,
+            valid_until_unix: DELEGATE_NOW + 7 * 86_400,
+            out_path: None,
+        })
+        .expect("delegate the target device");
+        let doc = delegated.document;
+        let tgt_idx = delegated.new_key_idx;
 
         let tgt_dir = tempdir();
         save_paired_target_state(&tgt_dir, &doc, &tgt_seed, tgt_idx, [0xEE; 16], "phone").unwrap();

@@ -6003,6 +6003,100 @@ fn phase5e_transport_migration_notify_bad_signature_rejected() {
     assert_eq!(c.lookup(&peer_id), None, "forged sig must NOT update cache",);
 }
 
+/// A DELEGATED device of a multi-device identity announces its rotation.
+///
+/// The session's `peer_id` is the IDENTITY's node_id while `peer_public_key`
+/// is the device's own — the shape the handshake admits once the device has
+/// proved its delegation, and the one the hash binding refuses by
+/// construction, since `BLAKE3(device key)` is the device address and never
+/// the identity's. Before this, every device but the one holding the master
+/// silently lost the ability to say it had moved, and its peers went on
+/// dialling the URI it had left.
+#[test]
+fn a_delegated_device_may_announce_its_own_transport_rotation() {
+    use base64::{Engine as _, engine::general_purpose::STANDARD};
+    use ed25519_dalek::SigningKey;
+    use veil_proto::session::sign_transport_migration_notify;
+
+    let device_sk = SigningKey::from_bytes(&[0xD1u8; 32]);
+    let device_pk = device_sk.verifying_key().to_bytes();
+    // What the handshake attested: this key answers for THIS identity.
+    let identity_node_id = [0x5Au8; 32];
+    assert_ne!(
+        identity_node_id,
+        *blake3::hash(&device_pk).as_bytes(),
+        "the device address is not the identity's node_id — that is the case"
+    );
+
+    let mut runner =
+        make_migration_test_runner(identity_node_id, Some(STANDARD.encode(device_pk)));
+
+    let new_uri = "obfs4-tcp://9.9.9.9:7821".to_owned();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let payload = sign_transport_migration_notify(
+        identity_node_id,
+        now + 3600,
+        now,
+        new_uri.clone(),
+        &device_sk,
+    );
+
+    runner.handle_transport_migration_notify_arm(&payload.encode());
+
+    let cache = runner.dispatcher.dht().transport_cache();
+    let mut c = cache.lock().unwrap();
+    assert_eq!(
+        c.lookup(&identity_node_id),
+        Some(new_uri),
+        "a device the session validated must be able to move its identity's entry",
+    );
+}
+
+/// The other half: accepting a delegated device is not accepting anyone who
+/// names the identity. A key this session never attested signs a
+/// perfectly-shaped notify for the same node_id and gets nothing.
+#[test]
+fn a_foreign_key_cannot_announce_a_rotation_for_the_identity() {
+    use base64::{Engine as _, engine::general_purpose::STANDARD};
+    use ed25519_dalek::SigningKey;
+    use veil_proto::session::sign_transport_migration_notify;
+
+    let device_pk = SigningKey::from_bytes(&[0xD1u8; 32])
+        .verifying_key()
+        .to_bytes();
+    let stranger_sk = SigningKey::from_bytes(&[0xF0u8; 32]);
+    let identity_node_id = [0x5Au8; 32];
+
+    // The session attested the DEVICE's key; the stranger signs anyway.
+    let mut runner =
+        make_migration_test_runner(identity_node_id, Some(STANDARD.encode(device_pk)));
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let payload = sign_transport_migration_notify(
+        identity_node_id,
+        now + 3600,
+        now,
+        "obfs4-tcp://hostile:6666".to_owned(),
+        &stranger_sk,
+    );
+
+    runner.handle_transport_migration_notify_arm(&payload.encode());
+
+    let cache = runner.dispatcher.dht().transport_cache();
+    let mut c = cache.lock().unwrap();
+    assert_eq!(
+        c.lookup(&identity_node_id),
+        None,
+        "only the key this session attested may move the entry",
+    );
+}
+
 /// Malformed body (too short to even decode) → recorded as a violation
 /// no panic, no cache update.
 #[test]
