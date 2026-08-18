@@ -135,12 +135,18 @@ pub struct IdentityState {
     /// signatures on `AnnounceAttachment` frames.
     pub peer_pubkeys: veil_types::PeerPubkeysCache,
 
-    /// peer → `ValidatedIdentity` cache that survives
-    /// `reload_with` so session-resumption fast paths (which bypass
-    /// the `IdentityProof` exchange) can restore the peer's sovereign
-    /// binding.
-    pub peer_sovereign_identities:
-        Arc<Mutex<std::collections::HashMap<NodeIdBytes, ValidatedIdentity>>>,
+    /// `(peer, device) → ValidatedIdentity` cache that survives `reload_with`
+    /// so session-resumption fast paths (which bypass the `IdentityProof`
+    /// exchange) can restore the peer's sovereign binding.
+    ///
+    /// KEYED BY THE PAIR, not by the peer. Several devices of one identity all
+    /// present that identity's `node_id` in their HELLO — that is the whole
+    /// shape the delegation check exists to allow — so a peer-keyed map holds
+    /// one slot for the entire family and each sibling's full handshake
+    /// overwrites the last one's binding. A resumption then restores whichever
+    /// sibling handshaked most recently, and the session claims to be a device
+    /// it is not.
+    pub peer_sovereign_identities: PeerSovereignBindings,
 
     /// Maps `peer_id → roles_supported` bitmask from the handshake (
     /// Cross-checked against advertised capabilities preventing
@@ -192,15 +198,17 @@ pub struct IdentityState {
     >,
 }
 
+/// `(sovereign node_id, device instance_id) → ValidatedIdentity`.
+pub type PeerSovereignBindings =
+    Arc<Mutex<std::collections::HashMap<([u8; 32], [u8; 16]), ValidatedIdentity>>>;
+
 impl IdentityState {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         local_identity: Arc<HandshakeIdentity>,
         sovereign_identity: SovereignIdentityCell,
         peer_pubkeys: veil_types::PeerPubkeysCache,
-        peer_sovereign_identities: Arc<
-            Mutex<std::collections::HashMap<NodeIdBytes, ValidatedIdentity>>,
-        >,
+        peer_sovereign_identities: PeerSovereignBindings,
         peer_roles: Arc<Mutex<PeerLruCache<u8>>>,
         mlkem_keys: Arc<veil_e2e::MlKemSeedRing>,
         peer_mlkem_keys: Arc<RwLock<PeerMlKemCache>>,

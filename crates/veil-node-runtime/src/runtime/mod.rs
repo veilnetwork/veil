@@ -373,6 +373,11 @@ pub struct AttachedDebugSession {
     pub metrics: Option<Arc<NodeMetrics>>,
     /// Authenticated peer node_id from the handshake.
     pub peer_id: NodeId,
+    /// WHICH DEVICE of `peer_id` this session ends at, when the handshake
+    /// proved one (or a resumption ticket named one). `None` for peers with no
+    /// sovereign identity, and for a resumption that could not resolve the
+    /// device — never guessed.
+    pub peer_instance_id: Option<[u8; 16]>,
     /// Session keys derived during the OVL1 handshake.
     pub session_keys: veil_crypto::session_kdf::SessionKeys,
     /// Transport-layer observed address of the peer (as seen by our socket).
@@ -1644,11 +1649,10 @@ impl NodeRuntime {
         // is kept). Lets the resumption fast path restore the
         // peer's `ValidatedIdentity` even though the handshake
         // skipped the `IdentityProof` exchange.
-        let peer_sovereign_identities: Arc<
-            Mutex<std::collections::HashMap<[u8; 32], veil_identity::verify::ValidatedIdentity>>,
-        > = Arc::new(Mutex::new(std::collections::HashMap::with_capacity(
-            veil_proto::budget::MAX_PEER_SOVEREIGN_IDENTITIES,
-        )));
+        let peer_sovereign_identities: crate::runtime::identity_state::PeerSovereignBindings =
+            Arc::new(Mutex::new(std::collections::HashMap::with_capacity(
+                veil_proto::budget::MAX_PEER_SOVEREIGN_IDENTITIES,
+            )));
         let peer_roles: Arc<Mutex<veil_types::PeerLruCache<u8>>> = Arc::new(Mutex::new(
             veil_types::PeerLruCache::with_capacity(veil_proto::budget::MAX_PEER_PUBKEYS_CACHE),
         ));
@@ -2500,9 +2504,20 @@ impl NodeRuntime {
             // SessionRuntimeContext) carry one `Arc<ResumptionState>` instead
             // of two siblings.
             resumption: Arc::new(resumption_state::ResumptionState::new(
-                Arc::new(Mutex::new(veil_session::ticket::TicketIssuer::new(
-                    veil_session::ticket::TicketKey::generate(),
-                ))),
+                Arc::new(Mutex::new(
+                    veil_session::ticket::TicketIssuer::new(
+                        veil_session::ticket::TicketKey::generate(),
+                    )
+                    // The issuer refuses to resume an instance-less ticket from
+                    // a peer we already know as a multi-device identity; the
+                    // binding cache is what knows that, and it lives here.
+                    .with_instance_oracle({
+                        let bindings = Arc::clone(&peer_sovereign_identities);
+                        Arc::new(move |peer: &[u8; 32]| {
+                            lock!(bindings).keys().any(|(id, _)| id == peer)
+                        })
+                    }),
+                )),
                 Arc::new(Mutex::new(std::collections::HashMap::new())),
             )),
             // H10 stage-B: PEX bundle — 4 PEX fields collapsed
@@ -6489,15 +6504,23 @@ pub fn spawn_inbound_session(
             // session resumption is always enabled post-removal
             // of NegotiatedCapabilities. Issue a ticket unconditionally.
             //
-            // audit MEDIUM: peer_instance_id is hardcoded to [0; 16] until
-            // sovereign-identity multi-instance metadata passes through
-            // handshake. When the handshake delivers peer's device/instance
-            // ID, replace `[0u8; 16]` with the real value to avoid AEAD nonce
-            // reuse risk when two instances of the same identity resume
-            // concurrently. See `TicketIssuer::issue_for_instance` docstring.
+            // The ticket names WHICH DEVICE of the peer it was issued to. It
+            // used to be hardcoded `[0; 16]`, and that sentinel is the reason a
+            // resumed session could not tell one device of an identity from
+            // another: with no device in the ticket, the fast path fell back to
+            // a per-peer binding that every sibling overwrote in turn. `None`
+            // (peer proved no sovereign identity, or the resumption could not
+            // resolve a device) keeps the sentinel, which the issuer now reads
+            // as "do not resume this if the peer has known devices".
+            let peer_instance = session.peer_instance_id.unwrap_or([0u8; 16]);
             let ticket_to_send = {
-                let blob = lock!(inbound.runtime.resumption.ticket_issuer)
-                    .issue_for_instance(session_id, peer_id, [0u8; 16], raw_tx_key, raw_rx_key);
+                let blob = lock!(inbound.runtime.resumption.ticket_issuer).issue_for_instance(
+                    session_id,
+                    peer_id,
+                    peer_instance,
+                    raw_tx_key,
+                    raw_rx_key,
+                );
                 Some(blob)
             };
             // consume the receiver pre-reserved

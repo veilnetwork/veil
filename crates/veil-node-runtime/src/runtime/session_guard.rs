@@ -16,6 +16,12 @@
 //! 7. `sessions_per_ip`              (Mutex)
 //! 8. `reputation`                   (Mutex; admin paths)
 //!
+//! One more edge, outside the numbered chain: the session-resumption
+//! `ticket_issuer` mutex is acquired BEFORE `peer_sovereign_identities` (#5),
+//! because the issuer's instance oracle reads that map to decide whether an
+//! instance-less ticket is ambiguous. Nothing may take them the other way
+//! round.
+//!
 //! `SessionGuard::drop` follows a strict subset:
 //! `live_sessions → session_registry → session_tx_registry → sessions_per_ip
 //! → reputation`.
