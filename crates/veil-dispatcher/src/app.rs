@@ -498,9 +498,9 @@ mod tests {
         let (ek, dk) = veil_e2e::generate_keypair();
         veil_e2e::RatchetRuntime {
             store: Arc::new(veil_e2e::RatchetStore::new()),
-            seed_ring: Arc::new(std::sync::RwLock::new(Arc::new(veil_e2e::MlKemSeedRing::new(
-                0, dk, ek,
-            )))),
+            seed_ring: Arc::new(std::sync::RwLock::new(Arc::new(
+                veil_e2e::MlKemSeedRing::new(0, dk, ek),
+            ))),
             local_node_id: Arc::new(std::sync::RwLock::new(node_id)),
             local_instance_id: Arc::new(std::sync::RwLock::new(Some(instance))),
             peer_ratchet_keys: Arc::new(std::sync::RwLock::new(

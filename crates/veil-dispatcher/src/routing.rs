@@ -1744,6 +1744,18 @@ impl FrameDispatcher {
         if !lock!(self.abuse.recursive_query_limiter).allow(*peer_id.as_bytes()) {
             return DispatchResult::NoResponse;
         }
+        // Being a hop of somebody else's walk, paid out of this node's hourly
+        // budget for other people's work. Charged on the QUERY and not on the
+        // response: declining here means we never become a hop, so the reply
+        // leg never comes back through us either — and a response that DOES
+        // arrive is then an answer to a question of our own, which is the
+        // node's own need and must never be metered.
+        if !self.abuse.service_budget.try_serve(
+            crate::service_budget::ServiceKind::ForwardWalk,
+            body.len() as u64,
+        ) {
+            return DispatchResult::NoResponse;
+        }
 
         let q = match RecursiveQueryPayload::decode(body) {
             Ok(q) => q,

@@ -1,4 +1,5 @@
 use super::{DispatchResult, FrameDispatcher, encode_response};
+use crate::service_budget::ServiceKind;
 use veil_cfg::NodeId;
 use veil_proto::{
     discovery::{
@@ -233,6 +234,17 @@ impl FrameDispatcher {
                 if !lock!(self.abuse.dht_quota).allow(*node_id.as_bytes()) {
                     return DispatchResult::RateLimited;
                 }
+                // Somebody else's search, paid for out of this node's hourly
+                // budget for other people's work. Declining reuses the quota
+                // soft-drop the walker already handles — it moves on to
+                // another node rather than retrying us.
+                if !self
+                    .abuse
+                    .service_budget
+                    .try_serve(ServiceKind::Lookup, body.len() as u64)
+                {
+                    return DispatchResult::RateLimited;
+                }
                 let payload = match FindValuePayload::decode(body) {
                     Ok(p) => p,
                     Err(e) => return DispatchResult::Violation(format!("bad FindValue: {e}")),
@@ -252,6 +264,19 @@ impl FrameDispatcher {
             }
 
             DiscoveryMsg::Store => {
+                // The single largest line of an idle client's bill: 82% of
+                // everything the discovery plane received was strangers
+                // writing THEIR records into OUR store. Metered, not refused
+                // outright — every xVeil client runs as `leaf` and only the
+                // seeds are `core`, so a leaf that stores nothing takes the
+                // replica set down to the seeds.
+                if !self
+                    .abuse
+                    .service_budget
+                    .try_serve(ServiceKind::StoreRecord, body.len() as u64)
+                {
+                    return DispatchResult::RateLimited;
+                }
                 // b: quota overflow → soft-drop (`RateLimited`), not
                 // `Violation`. Heavy-but-legitimate publishers (a well-known
                 // node republishing many application records to K=20 closest
@@ -496,6 +521,13 @@ impl FrameDispatcher {
                 if !lock!(self.abuse.dht_quota).allow(*node_id.as_bytes()) {
                     return DispatchResult::RateLimited;
                 }
+                if !self
+                    .abuse
+                    .service_budget
+                    .try_serve(ServiceKind::Lookup, body.len() as u64)
+                {
+                    return DispatchResult::RateLimited;
+                }
                 let payload = match FindNodeV2Payload::decode(body) {
                     Ok(p) => p,
                     Err(e) => return DispatchResult::Violation(format!("bad FindNodeV2: {e}")),
@@ -523,6 +555,13 @@ impl FrameDispatcher {
             // additionally sign the response.
             DiscoveryMsg::ResolveTransport => {
                 if !lock!(self.abuse.dht_quota).allow(*node_id.as_bytes()) {
+                    return DispatchResult::RateLimited;
+                }
+                if !self
+                    .abuse
+                    .service_budget
+                    .try_serve(ServiceKind::Lookup, body.len() as u64)
+                {
                     return DispatchResult::RateLimited;
                 }
                 let payload = match ResolveTransportPayload::decode(body) {

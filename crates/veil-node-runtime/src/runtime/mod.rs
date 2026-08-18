@@ -1971,6 +1971,13 @@ impl NodeRuntime {
                 ratchet: Some(ratchet_runtime.clone()),
             }),
             abuse: Arc::new(veil_dispatcher::AbuseContext {
+                // Role-aware on purpose: a seed is Core and serving others IS
+                // its job, so metering it would meter the backbone. Only a
+                // leaf — every xVeil client — gets a bill.
+                service_budget: Arc::new(veil_dispatcher::service_budget::ServiceBudget::for_role(
+                    role,
+                    config.dht.service_budget_bytes_per_hour,
+                )),
                 rate_limiter: Arc::clone(&rate_limiter),
                 ban_list: Arc::clone(&ban_list),
                 violation_tracker: Arc::clone(&violation_tracker),
