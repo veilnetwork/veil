@@ -15,7 +15,7 @@
 //! domain-separate from any other AEAD usage of the same key.
 
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use chacha20poly1305::{ChaCha20Poly1305, KeyInit, aead::Aead, aead::generic_array::GenericArray};
 use rand_core::{OsRng, RngCore};
@@ -154,6 +154,14 @@ impl TicketKey {
 /// re-derive the SAME `tx_key` / `rx_key` from the ticket plaintext
 /// → AEAD nonce reuse on the resumed session → catastrophic crypto
 /// break**. Single-use semantics close the window.
+/// Answers, for one peer, "does this node already know at least one sovereign
+/// DEVICE of that peer?".
+///
+/// The issuer cannot see the runtime's per-peer binding cache and must not
+/// depend on it, so the runtime hands the question down as a closure. It exists
+/// for exactly one decision — see [`TicketIssuer::resume_instance_usable`].
+pub type SovereignInstanceOracle = Arc<dyn Fn(&[u8; 32]) -> bool + Send + Sync>;
+
 pub struct TicketIssuer {
     key: TicketKey,
     /// The previous key, kept for DECRYPT ONLY across the overlap window so a
@@ -170,6 +178,10 @@ pub struct TicketIssuer {
     /// key, so rotating cannot hand an attacker a second use of a ticket the
     /// old key already spent.
     consumed_tickets: Mutex<HashMap<[u8; 12], u64>>,
+    /// Supplied by the runtime; see [`SovereignInstanceOracle`]. `None` in
+    /// tests and in nodes with no sovereign-identity material, where every
+    /// ticket is unambiguous by construction.
+    instance_oracle: Option<SovereignInstanceOracle>,
 }
 
 impl TicketIssuer {
@@ -178,6 +190,43 @@ impl TicketIssuer {
             key,
             prev_key: None,
             consumed_tickets: Mutex::new(HashMap::new()),
+            instance_oracle: None,
+        }
+    }
+
+    /// Install the oracle that decides whether an instance-less ticket may
+    /// still be resumed. Builder-style so the runtime can wire it at the one
+    /// place it constructs the issuer.
+    #[must_use]
+    pub fn with_instance_oracle(mut self, oracle: SovereignInstanceOracle) -> Self {
+        self.instance_oracle = Some(oracle);
+        self
+    }
+
+    /// May a ticket naming `instance` for `peer_id` be resumed at all?
+    ///
+    /// THE ONE CASE THIS REFUSES is the `[0; 16]` sentinel for a peer we
+    /// already know as a sovereign identity with at least one device. A
+    /// resumed session skips the IdentityProof exchange, so the only thing
+    /// that can say WHICH device of that identity is at the far end is the
+    /// ticket — and the sentinel says nothing. Resuming anyway lands the
+    /// session on whichever sibling's binding the cache happens to hold, and
+    /// everything keyed by instance (the registry's per-device index, the
+    /// ratchet cert a direct-session seal picks) then answers for the wrong
+    /// device. Worse, it is self-sustaining: the resumed session has no
+    /// validated instance, so the ticket IT issues is instance-less too, and
+    /// the pair never recovers. Refusing costs one full handshake and ends it.
+    ///
+    /// Everything else resumes: a named instance is exact, and an instance-less
+    /// ticket from a peer we hold no sovereign binding for cannot be ambiguous
+    /// — there is no sibling to confuse it with.
+    pub fn resume_instance_usable(&self, peer_id: &[u8; 32], instance: &[u8; 16]) -> bool {
+        if instance != &[0u8; 16] {
+            return true;
+        }
+        match &self.instance_oracle {
+            Some(known) => !known(peer_id),
+            None => true,
         }
     }
 
@@ -584,6 +633,45 @@ mod tests {
         assert_eq!(blob.len(), SESSION_TICKET_ENCRYPTED_SIZE);
         let ticket = issuer.decrypt(&blob).expect("decrypt");
         assert_eq!(ticket.peer_instance_id, inst);
+    }
+
+    /// The `[0; 16]` sentinel is the ONE case the issuer refuses to resume,
+    /// and only for a peer it already knows as an identity with devices.
+    ///
+    /// A resumed session skips the IdentityProof exchange, so the ticket is
+    /// the only thing that can name which device answered. Resuming on the
+    /// sentinel lands the session on whichever sibling's binding the runtime
+    /// cache happens to hold — and the resumed session, having no validated
+    /// device of its own, issues another sentinel ticket, so the pair never
+    /// recovers. One full handshake ends it.
+    #[test]
+    fn an_unnamed_device_resumes_only_for_a_peer_with_no_known_devices() {
+        let known = [0xAAu8; 32];
+        let stranger = [0xBBu8; 32];
+        let issuer = TicketIssuer::new(TicketKey::from_bytes([9u8; 32]))
+            .with_instance_oracle(std::sync::Arc::new(move |peer: &[u8; 32]| *peer == known));
+
+        assert!(
+            !issuer.resume_instance_usable(&known, &[0u8; 16]),
+            "an unnamed device on a peer with known devices is ambiguous"
+        );
+        assert!(
+            issuer.resume_instance_usable(&known, &[0x11u8; 16]),
+            "a NAMED device is exact — always resumable"
+        );
+        assert!(
+            issuer.resume_instance_usable(&stranger, &[0u8; 16]),
+            "no known devices means no sibling to confuse it with"
+        );
+    }
+
+    /// Without an oracle — a node with no sovereign material, and every test
+    /// fixture — nothing is ambiguous and nothing is refused.
+    #[test]
+    fn without_an_oracle_every_ticket_stays_resumable() {
+        let issuer = make_issuer();
+        assert!(issuer.resume_instance_usable(&[0xAA; 32], &[0u8; 16]));
+        assert!(issuer.resume_instance_usable(&[0xAA; 32], &[0x11; 16]));
     }
 
     // ── ticket replay protection ────────────────
