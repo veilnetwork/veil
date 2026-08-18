@@ -1944,9 +1944,12 @@ impl SessionRunner {
         // `peer_id` and `peer_public_key` come out of that same handshake. The
         // `node_id != peer_id` check above still stands, so this remains a
         // statement about THIS peer's own cache entry and nothing else.
-        if let Err(e) =
-            verify_transport_migration_notify_bound(&payload, &pubkey, now_unix, Some(&self.peer_id))
-        {
+        if let Err(e) = verify_transport_migration_notify_bound(
+            &payload,
+            &pubkey,
+            now_unix,
+            Some(&self.peer_id),
+        ) {
             // Replay-window failures are expected on clock-skewed peers
             // and shouldn't poison the violation tracker.  Treat ANY
             // verify failure as debug-only — a forged sig from a

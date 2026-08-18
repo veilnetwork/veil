@@ -57,6 +57,9 @@ pub struct RemoteHandshakeInfo {
     /// Peer's last-known DHT discoverability preference extracted from
     /// `CapabilitiesPayload.discovery_mode`.
     pub remote_discovery_mode: DiscoveryMode,
+    /// False when the peer advertised `NO_DHT_SERVICE`: keep the session,
+    /// keep it resolvable, but never pick it as a DHT candidate.
+    pub remote_dht_service: bool,
     /// Peer explicitly advertised the authenticated realtime DATAGRAM lane.
     /// False on legacy and fast-resumed handshakes.
     pub supports_realtime_datagrams: bool,
@@ -666,6 +669,7 @@ pub async fn register_connection_session(
         local_advertised_transports.extend(listener_advertisements);
         let discovery_mode = runtime.dispatcher.discovery_mode;
         let anonymity_relay_capable = runtime.anonymity.relay_capable;
+        let dht_service = runtime.dispatcher.dht_service;
         let ban_list_arc = Arc::clone(&runtime.dispatcher.abuse.ban_list);
         let is_banned_fn = move |peer_id: [u8; 32]| -> bool {
             ban_list_arc
@@ -699,6 +703,7 @@ pub async fn register_connection_session(
                 sovereign_ctx,
                 &local_advertised_transports,
                 anonymity_relay_capable,
+                dht_service,
                 Some(&is_banned_fn),
                 // P-Net Phase 2d: pass the loaded gate from
                 // SessionRuntimeContext. None when public-mode.
@@ -743,6 +748,7 @@ pub async fn register_connection_session(
                 // `commit` below the accept gates.
                 let pending_peer_state = prepare_peer_handshake_state(&runtime, &r, &transport);
                 let remote_discovery_mode = r.remote_capabilities.parse_discovery_mode();
+                let remote_dht_service = r.remote_capabilities.dht_service();
                 let mut udp_reflector_port = None;
                 let mut shared_udp_reflectors = Vec::with_capacity(4);
                 for advertisement in r
@@ -771,6 +777,7 @@ pub async fn register_connection_session(
                         nonce: r.nonce,
                         session_keys: r.session_keys,
                         remote_discovery_mode,
+                        remote_dht_service,
                         supports_realtime_datagrams: r
                             .remote_capabilities
                             .supports_realtime_datagrams(),
@@ -1195,6 +1202,7 @@ pub async fn register_connection_session(
         public_key: remote_identity.public_key,
         nonce: remote_identity.nonce,
         remote_discovery_mode: remote_identity.remote_discovery_mode,
+        remote_dht_service: remote_identity.remote_dht_service,
         // Transient when accepted past the data cap (into the headroom only).
         referral: referral_session,
         reserved_outbox_rx,

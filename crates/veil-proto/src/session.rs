@@ -357,6 +357,23 @@ pub mod cap_flags {
     /// Legacy peers leave the bit clear and continue to carry `AppRtData` on
     /// the reliable ordered session stream.
     pub const SUPPORTS_REALTIME_DATAGRAMS: u8 = 1 << 4;
+    /// Peer asks NOT to be used as a DHT service candidate: do not pick it
+    /// as a store/replication target, do not route walks through it, and do
+    /// not return it to walkers as a closer node. It remains fully REACHABLE
+    /// — sessions, resolve_transport for its own announcement, mailbox and
+    /// direct delivery are all unaffected; this bit is only about doing DHT
+    /// work for OTHERS.
+    ///
+    /// Deliberately a NEGATIVE bit. A legacy peer never sets it and decodes
+    /// it as an unknown flag it ignores, so in a mixed fleet the default is
+    /// the status quo (everyone serves) and the bit only ever REDUCES what
+    /// its setter is asked to do. An affirmative `CAN_DHT` bit would have
+    /// read every legacy peer as refusing service.
+    ///
+    /// Sourced from `[dht] serve_dht = false` at the runtime layer; the app
+    /// defaults it off on phones, where the measured cost of serving
+    /// strangers was gigabytes a day against bytes of own traffic.
+    pub const NO_DHT_SERVICE: u8 = 1 << 5;
 }
 
 // c: role_bits moved to veil-types alongside NodeRole.
@@ -463,6 +480,14 @@ impl CapabilitiesPayload {
     /// lane?
     pub fn supports_realtime_datagrams(&self) -> bool {
         self.flags & cap_flags::SUPPORTS_REALTIME_DATAGRAMS != 0
+    }
+
+    /// Whether this peer may be used as a DHT service candidate. True unless
+    /// the peer explicitly asked out via [`cap_flags::NO_DHT_SERVICE`] — which
+    /// is also what every legacy peer reads as, keeping a mixed fleet on the
+    /// status quo.
+    pub fn dht_service(&self) -> bool {
+        self.flags & cap_flags::NO_DHT_SERVICE == 0
     }
 
     /// Realtime DATAGRAM negotiation succeeds only when both peers advertise
@@ -2202,6 +2227,62 @@ mod tests {
             discovery_mode: 1, // ContactsOnly
         };
         assert_eq!(CapabilitiesPayload::decode(&p.encode()).unwrap(), p);
+    }
+
+    /// The DHT-service bit is NEGATIVE, and this is the property that makes a
+    /// mixed fleet safe: a legacy peer sets no flags at all and therefore
+    /// reads as SERVING — the status quo. An affirmative `CAN_DHT` bit would
+    /// have read every legacy peer as refusing, emptying the replica set of
+    /// the whole un-upgraded network on the day it shipped.
+    #[test]
+    fn a_peer_that_says_nothing_still_serves() {
+        let silent = CapabilitiesPayload {
+            roles_supported: role_bits::CORE,
+            flags: 0,
+            discovery_mode: 0,
+        };
+        assert!(silent.dht_service());
+        assert!(
+            CapabilitiesPayload::decode(&silent.encode())
+                .unwrap()
+                .dht_service()
+        );
+    }
+
+    #[test]
+    fn the_no_service_bit_round_trips_and_reads_back() {
+        let quiet = CapabilitiesPayload {
+            roles_supported: role_bits::LEAF,
+            flags: cap_flags::CAN_RELAY | cap_flags::NO_DHT_SERVICE,
+            discovery_mode: 0,
+        };
+        let decoded = CapabilitiesPayload::decode(&quiet.encode()).unwrap();
+        assert_eq!(decoded, quiet);
+        assert!(!decoded.dht_service());
+        assert_eq!(
+            decoded.parse_discovery_mode(),
+            veil_types::DiscoveryMode::Public,
+            "asking not to SERVE is not asking to be hidden — the two are \
+             independent, and conflating them would make the node unreachable"
+        );
+    }
+
+    /// It occupies its own bit and disturbs no other flag's meaning.
+    #[test]
+    fn the_no_service_bit_does_not_collide() {
+        for other in [
+            cap_flags::CAN_RELAY,
+            cap_flags::SUPPORTS_SOVEREIGN_IDENTITY,
+            cap_flags::ANONYMITY_RELAY,
+            cap_flags::SUPPORTS_HYBRID_KEX,
+            cap_flags::SUPPORTS_REALTIME_DATAGRAMS,
+        ] {
+            assert_eq!(
+                other & cap_flags::NO_DHT_SERVICE,
+                0,
+                "NO_DHT_SERVICE overlaps an existing flag"
+            );
+        }
     }
 
     /// (Variant C): unknown `discovery_mode` byte must

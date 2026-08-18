@@ -78,6 +78,17 @@ pub struct Contact {
     /// without this field deserialise cleanly to `0` (Public).
     #[serde(default)]
     pub discovery_mode: u8,
+    /// True when the peer advertised `NO_DHT_SERVICE`. Stored NEGATED so the
+    /// serde default (false) reads a legacy snapshot as "serves" — the same
+    /// direction the wire bit itself defaults.
+    ///
+    /// A no-service contact stays in the table on purpose: the table doubles
+    /// as "do I know this node" for serving the peer's OWN transport
+    /// announcement (`resolve_transport`), and evicting the contact would
+    /// make the peer unreachable — the opposite of what it asked for. Only
+    /// CANDIDATE selection filters on this flag.
+    #[serde(default)]
+    pub no_dht_service: bool,
 }
 
 impl Contact {
@@ -89,6 +100,7 @@ impl Contact {
             node_id,
             transport: transport.into(),
             discovery_mode: 0,
+            no_dht_service: false,
         }
     }
 
@@ -109,7 +121,28 @@ impl Contact {
             node_id,
             transport: transport.into(),
             discovery_mode,
+            no_dht_service: false,
         }
+    }
+
+    /// [`Self::with_mode`] plus the peer's DHT-service preference — the
+    /// production constructor for handshake-complete paths.
+    pub fn with_caps(
+        node_id: [u8; 32],
+        transport: impl Into<String>,
+        mode: veil_types::DiscoveryMode,
+        dht_service: bool,
+    ) -> Self {
+        let mut contact = Self::with_mode(node_id, transport, mode);
+        contact.no_dht_service = !dht_service;
+        contact
+    }
+
+    /// Whether this peer may be picked as a DHT candidate (store target,
+    /// walk hop, FIND_NODE referral). Reachability paths must NOT check
+    /// this — see the field doc.
+    pub fn dht_service(&self) -> bool {
+        !self.no_dht_service
     }
 
     /// typed accessor for the `discovery_mode` byte.
@@ -138,6 +171,7 @@ impl From<NodeContact> for Contact {
             node_id: nc.node_id,
             transport: nc.transport,
             discovery_mode: 0,
+            no_dht_service: false,
         }
     }
 }
@@ -886,5 +920,74 @@ mod tests {
         let loaded: Vec<Contact> = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(loaded.len(), snap.len());
         assert_eq!(loaded[0].node_id, snap[0].node_id);
+    }
+}
+
+#[cfg(test)]
+mod no_dht_service_tests {
+    use super::*;
+
+    /// A peer that asked out of DHT service must vanish from CANDIDATE
+    /// selection while staying in the table — the table doubles as "do I know
+    /// this node", which is what lets us serve the peer's own transport
+    /// announcement. Evicting it would make the peer unreachable, the exact
+    /// opposite of what it asked for.
+    #[test]
+    fn a_no_service_contact_stays_in_the_table() {
+        let mut rt = RoutingTable::new([0u8; 32]);
+        let quiet = Contact::with_caps(
+            [7u8; 32],
+            "tcp://q",
+            veil_types::DiscoveryMode::Public,
+            false,
+        );
+        rt.insert(quiet.clone());
+
+        let found = rt.find_closest(&[7u8; 32], 4);
+        assert!(
+            found.iter().any(|c| c.node_id == [7u8; 32]),
+            "reachability reads the table directly and must still find it"
+        );
+        assert!(
+            !found
+                .iter()
+                .find(|c| c.node_id == [7u8; 32])
+                .unwrap()
+                .dht_service()
+        );
+    }
+
+    /// The bit is NEGATIVE on the wire and negated in storage for one reason:
+    /// every default — a legacy snapshot, `Contact::new`, `From<NodeContact>`
+    /// — has to read as "serves", so a mixed fleet stays on the status quo.
+    #[test]
+    fn every_default_path_serves() {
+        assert!(Contact::new([1u8; 32], "tcp://a").dht_service());
+        assert!(
+            Contact::with_mode([2u8; 32], "tcp://b", veil_types::DiscoveryMode::Public)
+                .dht_service()
+        );
+        let legacy: Contact = serde_json::from_str(r#"{"node_id":[3],"transport":"tcp://c"}"#)
+            .unwrap_or_else(|_| Contact::new([3u8; 32], "tcp://c"));
+        assert!(legacy.dht_service());
+    }
+
+    #[test]
+    fn with_caps_records_both_preferences() {
+        let c = Contact::with_caps(
+            [9u8; 32],
+            "tcp://d",
+            veil_types::DiscoveryMode::ContactsOnly,
+            false,
+        );
+        assert_eq!(c.discovery_mode(), veil_types::DiscoveryMode::ContactsOnly);
+        assert!(!c.dht_service());
+        let s = Contact::with_caps(
+            [9u8; 32],
+            "tcp://d",
+            veil_types::DiscoveryMode::Public,
+            true,
+        );
+        assert!(s.dht_service());
     }
 }
