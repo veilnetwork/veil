@@ -130,6 +130,44 @@ pub struct PendingPeerState {
     observed_addr: Option<std::net::SocketAddr>,
 }
 
+/// Which of a peer's device bindings a RESUMED session is allowed to adopt.
+///
+/// A resumption skips the IdentityProof exchange, so nothing in the exchange
+/// itself says which device answered. Every device of one identity connects
+/// under that identity's `node_id` — that is precisely the shape the
+/// delegation check in the handshake exists to permit — so "the binding for
+/// this peer" names a FAMILY. Picking the wrong member is not cosmetic:
+/// the session registry indexes the session under that device, and a
+/// direct-session seal asks the session which device it is talking to, so a
+/// wrong answer keys mail to a sibling and the recipient refuses it.
+///
+/// `resumed_instance` is the ticket's answer. `Some(non-zero)` addresses one
+/// row exactly. Otherwise — the initiator half of a resumption, whose ticket
+/// names IT to the responder rather than the responder to it, or a ticket
+/// minted before tickets carried the instance — a binding is adopted only when
+/// the identity has exactly ONE known device. With two, any pick is a coin
+/// flip, and a session that claims no device is strictly better than one that
+/// claims the wrong one.
+pub(crate) fn binding_for_resumed_session(
+    bindings: &std::collections::HashMap<
+        ([u8; 32], [u8; 16]),
+        veil_identity::verify::ValidatedIdentity,
+    >,
+    peer_id: [u8; 32],
+    resumed_instance: Option<[u8; 16]>,
+) -> Option<veil_identity::verify::ValidatedIdentity> {
+    if let Some(instance) = resumed_instance
+        && instance != [0u8; 16]
+    {
+        return bindings.get(&(peer_id, instance)).cloned();
+    }
+    let mut rows = bindings.iter().filter(|((id, _), _)| *id == peer_id);
+    match (rows.next(), rows.next()) {
+        (Some((_, only)), None) => Some(only.clone()),
+        _ => None,
+    }
+}
+
 /// Derive [`PendingPeerState`] from a completed OVL1 handshake **without
 /// mutating any shared state**.
 ///
@@ -165,14 +203,22 @@ pub fn prepare_peer_handshake_state(
         // carries and what the cache should learn for future resumptions.
         Some(v) => (Some(v.clone()), Some(v)),
         None => {
-            // Resumption path — look up the cached binding if we recorded
-            // one earlier.  Cached sovereign bindings from the resumption
-            // fast path are trusted unconditionally; a compromised subkey
-            // is mitigated by the document's short `valid_until_unix`
-            // window. Read-only: nothing to publish back.
-            let cached = lock!(runtime.identity.peer_sovereign_identities)
-                .get(&peer_id)
-                .cloned();
+            // Resumption path — look up the binding an earlier full handshake
+            // recorded.  Cached sovereign bindings from the resumption fast
+            // path are trusted unconditionally; a compromised subkey is
+            // mitigated by the document's short `valid_until_unix` window.
+            // Read-only: nothing to publish back.
+            //
+            // WHICH binding is the whole question. Every device of one
+            // identity connects under that identity's `node_id`, so "the
+            // binding for this peer" names a FAMILY, not a device. The ticket
+            // carries the device, and the responder half of a resumption reads
+            // it straight off: the pair addresses one row exactly.
+            let cached = binding_for_resumed_session(
+                &lock!(runtime.identity.peer_sovereign_identities),
+                peer_id,
+                r.resumed_peer_instance_id,
+            );
             (cached, None)
         }
     };
@@ -219,18 +265,22 @@ impl PendingPeerState {
         // later resumption can key the peer by it.
         if let Some(v) = self.sovereign_to_cache {
             use veil_proto::budget::MAX_PEER_SOVEREIGN_IDENTITIES;
+            // Keyed by (identity, device). A peer-keyed slot let each device of
+            // a multi-device identity overwrite its siblings, and the loser's
+            // next resumption then restored the winner's binding.
+            let key = (peer_id, v.active_instance_id);
             let mut sovereign_g = lock!(runtime.identity.peer_sovereign_identities);
             // Cap unbounded HashMap growth. Random eviction (HashMap iter
             // is non-deterministic) is acceptable here — cache hit/miss
             // only affects the resumption fast-path; missed entries
             // trigger a full handshake.
             if sovereign_g.len() >= MAX_PEER_SOVEREIGN_IDENTITIES
-                && !sovereign_g.contains_key(&peer_id)
+                && !sovereign_g.contains_key(&key)
                 && let Some(k) = sovereign_g.keys().next().copied()
             {
                 sovereign_g.remove(&k);
             }
-            sovereign_g.insert(peer_id, v);
+            sovereign_g.insert(key, v);
         }
         // Cache the peer's raw public key for signature verification.  Skip
         // if public_key is empty — this happens during session resumption
@@ -1093,6 +1143,13 @@ pub async fn register_connection_session(
     // trace in the per-peer caches and evicts nothing from them. The matching
     // SessionGuard below removes the registry entry on session end.
     let session_entry = pending_peer_state.commit(&runtime);
+    // Which DEVICE of the peer this session ends at, for the resumption ticket
+    // the inbound spawner is about to mint. Read before the entry moves into
+    // the registry.
+    let peer_instance_id = session_entry
+        .validated_sovereign_identity
+        .as_ref()
+        .map(|v| v.active_instance_id);
     lock!(runtime.session_registry).insert(session_entry);
     runtime.logger.info(
         "session.open",
@@ -1130,6 +1187,7 @@ pub async fn register_connection_session(
         quic_datagrams: quic_datagrams.filter(|_| remote_identity.supports_realtime_datagrams),
         metrics: runtime.metrics.clone(),
         peer_id: remote_identity.node_id,
+        peer_instance_id,
         session_keys: remote_identity.session_keys,
         observed_addr: peer.remote_addr,
         udp_reflector_port: remote_identity.udp_reflector_port,
@@ -1250,6 +1308,95 @@ pub fn peer_transport_context(
         ctx = ctx.with_client_identity_from_files(Path::new(cert), Path::new(key))?;
     }
     Ok(ctx)
+}
+
+#[cfg(test)]
+mod resumed_binding_tests {
+    use super::binding_for_resumed_session;
+    use std::collections::HashMap;
+    use veil_identity::verify::ValidatedIdentity;
+
+    const IDENTITY: [u8; 32] = [0xAA; 32];
+    const LAPTOP: [u8; 16] = [0x01; 16];
+    const PHONE: [u8; 16] = [0x02; 16];
+
+    fn device(instance: [u8; 16]) -> ValidatedIdentity {
+        ValidatedIdentity {
+            node_id: IDENTITY,
+            master_algo: 0,
+            master_pubkey: vec![0xEE; 32],
+            active_identity_pubkey: instance.to_vec(),
+            active_identity_algo: 0,
+            active_key_idx: 0,
+            active_device_id: [instance[0]; 32],
+            active_instance_id: instance,
+        }
+    }
+
+    fn family() -> HashMap<([u8; 32], [u8; 16]), ValidatedIdentity> {
+        HashMap::from([
+            ((IDENTITY, LAPTOP), device(LAPTOP)),
+            ((IDENTITY, PHONE), device(PHONE)),
+        ])
+    }
+
+    /// THE DEFECT, in one assertion. Both devices of an identity hand out the
+    /// SAME `node_id` in their HELLO, so a per-peer binding cache held one
+    /// slot for the family and the later full handshake overwrote the earlier
+    /// one. The laptop's resumption then restored the phone's binding, the
+    /// registry indexed the session under the phone, and a direct-session seal
+    /// keyed its mail to a device at the other end of the room. The ticket
+    /// names the device; the lookup must use it.
+    #[test]
+    fn a_resumption_takes_the_binding_of_the_device_its_ticket_names() {
+        let bindings = family();
+        let picked = binding_for_resumed_session(&bindings, IDENTITY, Some(LAPTOP))
+            .expect("the laptop's own binding");
+        assert_eq!(picked.active_instance_id, LAPTOP);
+        let picked = binding_for_resumed_session(&bindings, IDENTITY, Some(PHONE))
+            .expect("the phone's own binding");
+        assert_eq!(picked.active_instance_id, PHONE);
+    }
+
+    /// A ticket that names a device this node holds no binding for gets
+    /// nothing — never a sibling's row as a consolation.
+    #[test]
+    fn a_named_device_we_do_not_know_yields_no_binding() {
+        let mut bindings = family();
+        bindings.remove(&(IDENTITY, PHONE));
+        assert!(binding_for_resumed_session(&bindings, IDENTITY, Some(PHONE)).is_none());
+    }
+
+    /// No device named — the initiator half of a resumption, or a ticket
+    /// minted before tickets carried the instance. One known device is
+    /// unambiguous and may be adopted; a family may not, because any pick
+    /// would be a coin flip.
+    #[test]
+    fn an_unnamed_device_is_adopted_only_when_the_identity_has_exactly_one() {
+        let solo = HashMap::from([((IDENTITY, LAPTOP), device(LAPTOP))]);
+        assert_eq!(
+            binding_for_resumed_session(&solo, IDENTITY, None)
+                .expect("the only device there is")
+                .active_instance_id,
+            LAPTOP,
+        );
+        assert!(
+            binding_for_resumed_session(&family(), IDENTITY, None).is_none(),
+            "with two devices and nothing naming one, no binding is the only honest answer"
+        );
+        assert!(
+            binding_for_resumed_session(&family(), IDENTITY, Some([0u8; 16])).is_none(),
+            "the all-zero sentinel means unspecified, not device zero"
+        );
+    }
+
+    /// Another identity's rows are not candidates, however few of ours exist.
+    #[test]
+    fn a_different_identitys_devices_are_never_borrowed() {
+        let bindings = HashMap::from([((IDENTITY, LAPTOP), device(LAPTOP))]);
+        assert!(binding_for_resumed_session(&bindings, [0xBB; 32], None).is_none());
+        assert!(binding_for_resumed_session(&bindings, [0xBB; 32], Some(LAPTOP)).is_none());
+    }
 }
 
 #[cfg(test)]

@@ -224,6 +224,16 @@ pub struct OvlHandshakeResult {
     /// the daemon can log "your public address appears to be …" or
     /// auto-populate an `advertise = "..."` URI.
     pub remote_observed_addr: Option<std::net::SocketAddr>,
+    /// WHICH DEVICE of `node_id` this resumed session belongs to, as the
+    /// resumption ticket named it. `None` on the full-handshake path (where
+    /// `validated_sovereign_identity` answers the same question, with proof)
+    /// and on the client half of a resumption (a client cannot learn the
+    /// responder's device from a ticket the responder minted for it).
+    ///
+    /// `Some([0; 16])` is the legacy sentinel: a ticket issued before tickets
+    /// carried the instance, or one for a peer that never proved a sovereign
+    /// identity. It means "unspecified", never "device zero".
+    pub resumed_peer_instance_id: Option<[u8; 16]>,
 }
 
 /// Maximum frame body size accepted during the handshake phase (before the peer
@@ -539,8 +549,18 @@ where
                 v.decrypt(ticket_blob)
             };
             if let Some(ticket) = maybe_ticket {
+                // A ticket that does not say WHICH DEVICE of a multi-device
+                // peer it belongs to cannot be resumed: the fast path skips the
+                // IdentityProof exchange, so the ticket is the only thing that
+                // could say, and guessing lands the session on a sibling's
+                // binding. See `TicketIssuer::resume_instance_usable`.
+                let instance_usable = {
+                    let v = verifier.lock().unwrap_or_else(|p| p.into_inner());
+                    v.resume_instance_usable(&remote_id, &ticket.peer_instance_id)
+                };
                 // Verify the ticket's peer_id matches the connecting node.
                 if ticket.peer_id == remote_id
+                    && instance_usable
                     && let Some(peer_resume_nonce) = remote_hello.resume_nonce
                 {
                     // Fast-path accepted ONLY with a valid ticket AND a resume
@@ -657,6 +677,10 @@ where
                         // querying their public IP must rely on the original
                         // full-handshake's result.
                         remote_observed_addr: None,
+                        // The ticket is what carries the peer's device across
+                        // a resumption; the runtime resolves the binding for
+                        // exactly this (identity, instance) pair.
+                        resumed_peer_instance_id: Some(ticket.peer_instance_id),
                     });
                 }
                 // peer_id mismatch → fall through to full handshake.
@@ -782,6 +806,11 @@ where
                     // S3: see ticket-resumption sibling — no observed-addr
                     // learned on fast-path.
                     remote_observed_addr: None,
+                    // The ticket names OUR device to the responder, not the
+                    // responder's to us, so the client half learns nothing
+                    // here. The runtime falls back to the peer's binding only
+                    // when that peer has exactly one known device.
+                    resumed_peer_instance_id: None,
                 });
             }
             Ok(SessionMsg::Identity) => {
@@ -1697,6 +1726,9 @@ where
         validated_sovereign_identity,
         verified_membership_cert,
         remote_observed_addr,
+        // The full path proved the peer's device outright; nothing was
+        // inherited from a ticket.
+        resumed_peer_instance_id: None,
     })
 }
 
@@ -2829,6 +2861,9 @@ mod tests {
         use crate::ticket::{TicketIssuer, TicketKey};
         use std::sync::{Arc, Mutex};
 
+        /// The client's device, as the ticket records it.
+        const PEER_INSTANCE: [u8; 16] = [0x5A; 16];
+
         // ── Step 1: full handshake ────────────────────────────────────────────
         let (a, b) = duplex(64 * 1024);
         let server_id = test_identity(0xAA);
@@ -2899,10 +2934,17 @@ mod tests {
         // From the server's perspective, the remote (connecting) peer is the client.
         let peer_id = *srv_r.node_id.as_bytes(); // server sees the CLIENT as remote
 
-        let ticket_blob = issuer
-            .lock()
-            .unwrap()
-            .issue(srv_session_id, peer_id, srv_tx, srv_rx);
+        // The ticket names WHICH DEVICE of the peer it belongs to. That field
+        // used to be a hardcoded `[0; 16]` in production issuance, and a
+        // resumed session therefore had nothing to say which device of a
+        // multi-device identity was at the far end.
+        let ticket_blob = issuer.lock().unwrap().issue_for_instance(
+            srv_session_id,
+            peer_id,
+            PEER_INSTANCE,
+            srv_tx,
+            srv_rx,
+        );
 
         // Build ClientTicketEntry as the runner would.
         let entry = veil_proto::session::ClientTicketEntry {
@@ -3015,7 +3057,108 @@ mod tests {
             srv2.session_keys.session_id, cli2.session_keys.session_id,
             "resumed session_id must match on both sides"
         );
-        let _ = (&srv2, &cli2);
+
+        // ── Step 5: the ticket carried the peer's DEVICE across the resume ──
+        // The responder skipped the IdentityProof exchange, so the ticket is
+        // the only thing that can name which device of the peer's identity it
+        // is now talking to. Without it the runtime falls back to a per-peer
+        // binding that every sibling device overwrites in turn.
+        assert_eq!(
+            srv2.resumed_peer_instance_id,
+            Some(PEER_INSTANCE),
+            "the responder must recover the peer's device from the ticket"
+        );
+        assert!(
+            cli2.resumed_peer_instance_id.is_none(),
+            "the initiator's ticket names IT to the responder, not the responder to it"
+        );
+
+        // ── Step 6: a device-less ticket from a known family is NOT resumed ──
+        // `[0; 16]` means unspecified. For a peer this node already knows as a
+        // sovereign identity with devices, resuming on it would hand the
+        // session whichever sibling's binding the cache happens to hold — and
+        // the session would then mint another device-less ticket, so the pair
+        // could never recover. One full handshake ends it.
+        let strict_issuer = Arc::new(Mutex::new(
+            TicketIssuer::new(TicketKey::generate())
+                .with_instance_oracle(Arc::new(|_: &[u8; 32]| true)),
+        ));
+        let legacy_blob = strict_issuer.lock().unwrap().issue_for_instance(
+            srv_session_id,
+            peer_id,
+            [0u8; 16],
+            srv_tx,
+            srv_rx,
+        );
+        let mut legacy_entry = entry.clone();
+        legacy_entry.blob = legacy_blob;
+
+        let (a3, b3) = duplex(64 * 1024);
+        let server_id3 = test_identity(0xAA);
+        let srv_task3 = tokio::spawn(async move {
+            perform_ovl1_handshake(
+                &mut { a3 },
+                &server_id3,
+                NodeRole::Core,
+                veil_cfg::DiscoveryMode::Public,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(strict_issuer),
+                None,
+                &[],
+                false,
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("server falls back to the full handshake")
+        });
+        let cli_task3 = tokio::spawn({
+            let cid = client_id.clone();
+            async move {
+                perform_ovl1_handshake(
+                    &mut { b3 },
+                    &cid,
+                    NodeRole::Core,
+                    veil_cfg::DiscoveryMode::Public,
+                    None,
+                    None,
+                    None,
+                    Some([0u8; 32]),
+                    Some(legacy_entry),
+                    None,
+                    None,
+                    &[],
+                    false,
+                    None,
+                    None,
+                    None,
+                )
+                .await
+                .expect("client takes the C6 fallback")
+            }
+        });
+        let (srv3, cli3) = tokio::join!(srv_task3, cli_task3);
+        let srv3 = srv3.unwrap();
+        let cli3 = cli3.unwrap();
+        assert!(
+            srv3.resumed_peer_instance_id.is_none(),
+            "a device-less ticket from a known family must not resume"
+        );
+        assert!(
+            !srv3.public_key.is_empty(),
+            "the full handshake ran: the fast path leaves the responder's view \
+             of the peer public key empty"
+        );
+        assert_ne!(
+            srv3.session_keys.session_id, srv_session_id,
+            "a fresh session, not the ticket's"
+        );
+        let _ = (&srv2, &cli2, &cli3);
     }
 
     /// 462.17 + 462.20 end-to-end integration: two real

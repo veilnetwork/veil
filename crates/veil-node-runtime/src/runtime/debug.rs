@@ -324,7 +324,10 @@ impl NodeRuntime {
         if lock!(self.identity.peer_roles).contains_key(peer) {
             held.push("peer_roles");
         }
-        if lock!(self.identity.peer_sovereign_identities).contains_key(peer) {
+        if lock!(self.identity.peer_sovereign_identities)
+            .keys()
+            .any(|(id, _)| id == peer)
+        {
             held.push("peer_sovereign_identities");
         }
         if self
