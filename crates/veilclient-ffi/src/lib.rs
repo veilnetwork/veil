@@ -2794,6 +2794,10 @@ fn await_retired_task(
 ///
 /// Worker threads = `min(cpu_count, 4)` — small enough to keep RSS low
 /// on a budget Android device, large enough to overlap I/O on multi-core.
+/// Test-only since `8e1f5c00` gave every handle a single-worker runtime of its
+/// own: production takes `build_runtime_with(1)` and nothing else asks for the
+/// sized pool. The tests still want a multi-worker runtime to overlap I/O.
+#[cfg(test)]
 fn build_runtime() -> Result<tokio::runtime::Runtime, std::io::Error> {
     let workers = std::thread::available_parallelism()
         .map(|n| n.get().min(4))
@@ -8439,6 +8443,10 @@ pub unsafe extern "C" fn veil_validate_bip39_phrase_zeroize(
 /// on success; on failure sets `*err_out` and returns `VEIL_ERR`.
 /// The body of both restore entry points, differing only in whether the host
 /// had a node key to offer. See `device_sk_seed` below.
+// The same pointer/length pairs the public wrappers take, plus the optional
+// device seed that tells the two entry points apart — see `bind_internal` and
+// `mailbox_put_inner` for the same shape and the same reason.
+#[allow(clippy::too_many_arguments)]
 unsafe fn restore_from_phrase_inner(
     device_seed: Option<zeroize::Zeroizing<[u8; 32]>>,
     phrase: *mut u8,
@@ -8614,6 +8622,13 @@ pub unsafe extern "C" fn veil_restore_identity_from_phrase_zeroize(
 /// # Safety
 /// `phrase` must be writable for `phrase_len`; `veil_dir`, `instance_label` and
 /// `identity_toml` readable for their lengths; `err_out` a writable slot.
+// Behind `node-embedded`, like `master_signing_key_from_config` below and for
+// the same reason: this entry point reads the node's own config, and
+// `veil-cfg` is an OPTIONAL dependency that only that feature pulls in. Added
+// without the gate, it compiled everywhere xVeil builds — which always turns
+// the feature on — and broke a plain `cargo clippy --workspace` that nothing
+// had run since the hygiene gate started failing at `cargo fmt`.
+#[cfg(feature = "node-embedded")]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn veil_restore_identity_from_phrase_zeroize_with_node_key(
     phrase: *mut u8,
@@ -8643,7 +8658,10 @@ pub unsafe extern "C" fn veil_restore_identity_from_phrase_zeroize_with_node_key
     };
     if identity.algo != veil_types::SignatureAlgorithm::Ed25519 {
         unsafe {
-            write_err(err_out, "only an Ed25519 node key can be named as a device subkey")
+            write_err(
+                err_out,
+                "only an Ed25519 node key can be named as a device subkey",
+            )
         };
         return VEIL_ERR_INVALID_ARG;
     }

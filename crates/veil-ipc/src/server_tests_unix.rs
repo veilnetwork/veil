@@ -330,7 +330,6 @@ async fn e2e_local_send_delivers_to_receiver() {
     let src_app_id = ok_b.app_id;
 
     let send = AppIpcSendPayload {
-
         my_other_devices: false,
         src_app_id,
         dst_node_id: node_id(), // same node
@@ -467,7 +466,6 @@ async fn slow_reader_does_not_block_server() {
     let ok_b = AppBindOkPayload::decode(&bind_body).unwrap();
 
     let send = AppIpcSendPayload {
-
         my_other_devices: false,
         src_app_id: ok_b.app_id,
         dst_node_id: node_id(),
@@ -1631,7 +1629,6 @@ async fn anonymous_send_payload_starts_with_meta_e2e_marker() {
     let ok = AppBindOkPayload::decode(&body).unwrap();
 
     let send = AppIpcSendPayload {
-
         my_other_devices: false,
         src_app_id: ok.app_id,
         dst_node_id: c_id,
@@ -1736,7 +1733,6 @@ async fn acknowledged_oversized_send_registers_one_complete_chunk_batch() {
     let app = AppBindOkPayload::decode(&body).unwrap();
 
     let ordinary = AppIpcSendPayload {
-
         my_other_devices: false,
         src_app_id: app.app_id,
         dst_node_id: destination,

@@ -316,6 +316,6 @@ mod tests {
     /// or the "gradation" is a word rather than a behaviour.
     #[test]
     fn the_mobile_default_is_meaningfully_smaller() {
-        assert!(MOBILE_SERVICE_BYTES_PER_HOUR * 4 <= DEFAULT_SERVICE_BYTES_PER_HOUR);
+        const { assert!(MOBILE_SERVICE_BYTES_PER_HOUR * 4 <= DEFAULT_SERVICE_BYTES_PER_HOUR) };
     }
 }

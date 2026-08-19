@@ -4469,17 +4469,27 @@ mod tests {
     }
 
     #[cfg(unix)]
+    /// Wait until the admin socket ACCEPTS a connection, not until its path
+    /// appears.
+    ///
+    /// The path existing is the wrong question: bind(2) creates it and
+    /// listen(2) is what makes a connect succeed, so between the two a client
+    /// gets ECONNREFUSED against a file that is plainly there. Asking the file
+    /// system made `concurrent_admin_requests_do_not_deadlock` fail roughly
+    /// once per full `cargo test --workspace`, where every crate's test binary
+    /// runs at once and the gap widens — and never once when the test ran
+    /// alone, which is how it stayed in the tree.
     async fn wait_for_socket(socket: &Path) {
         timeout(Duration::from_secs(5), async {
             loop {
-                if socket.exists() {
+                if tokio::net::UnixStream::connect(socket).await.is_ok() {
                     break;
                 }
                 sleep(Duration::from_millis(10)).await;
             }
         })
         .await
-        .expect("socket appears");
+        .expect("socket accepts a connection");
     }
 
     #[cfg(unix)]
@@ -4590,6 +4600,7 @@ mod tests {
             None,
             &[],
             false,
+            true, // dht_service: a test node serves, like any default node
             None,
             None, // P-Net: no network gate in admin test fixture
             None, // S3: no peer_observed_addr in admin test fixture

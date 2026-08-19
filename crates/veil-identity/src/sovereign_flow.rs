@@ -2028,7 +2028,10 @@ impl AdoptOutcome {
 fn union_identity_keys(
     local: &IdentityDocument,
     incoming: &IdentityDocument,
-) -> Option<(Vec<IdentityKey>, Vec<veil_proto::identity_document::RevokedDevice>)> {
+) -> Option<(
+    Vec<IdentityKey>,
+    Vec<veil_proto::identity_document::RevokedDevice>,
+)> {
     use veil_proto::identity_document::RevokedDevice;
     // Tombstones first: a grow-only set, kept strictly ascending (the wire's
     // canonical order). The lattice is what makes the merge order-free —
@@ -2045,8 +2048,11 @@ fn union_identity_keys(
             }
         }
     }
-    let is_revoked =
-        |id: &[u8; 32]| revoked.binary_search_by(|have| have.device_id.cmp(id)).is_ok();
+    let is_revoked = |id: &[u8; 32]| {
+        revoked
+            .binary_search_by(|have| have.device_id.cmp(id))
+            .is_ok()
+    };
     let mut keys: Vec<IdentityKey> = local
         .identity_keys
         .iter()
@@ -2164,44 +2170,41 @@ pub fn adopt_identity_document(
         let idx = idx as u16;
         // Never let a stale announcement shrink the key set: keep every key
         // the local document holds that the incoming one lost.
-        if let Ok(local_bytes) = std::fs::read(&doc_path) {
-            if let Ok(local) = IdentityDocument::decode(&local_bytes) {
-                if local.node_id == incoming.node_id {
-                    match union_identity_keys(&local, &incoming) {
-                        None => {
-                            // Nothing new — refresh expiry at most.
-                            let mut keep = local;
-                            if incoming.valid_until_unix > keep.valid_until_unix {
-                                keep.valid_until_unix = incoming.valid_until_unix;
-                                let own_sk = SigningKey::from_bytes(own_seed.as_array());
-                                let key_idx = resign_and_store_document(
-                                    veil_dir, keep, &own_sk, &own_pk, now_unix,
-                                )?;
-                                return Ok(AdoptOutcome::Adopted { key_idx });
-                            }
-                            let key_idx = keep
-                                .identity_keys
-                                .iter()
-                                .position(|k| k.pubkey == own_pk)
-                                .map(|i| i as u16)
-                                .unwrap_or(idx);
-                            save_device_sig_key_idx(veil_dir, key_idx)?;
-                            return Ok(AdoptOutcome::Adopted { key_idx });
-                        }
-                        Some((keys, revoked)) => {
-                            let mut merged = local;
-                            merged.identity_keys = keys;
-                            merged.revoked_devices = revoked;
-                            if incoming.valid_until_unix > merged.valid_until_unix {
-                                merged.valid_until_unix = incoming.valid_until_unix;
-                            }
-                            let own_sk = SigningKey::from_bytes(own_seed.as_array());
-                            let key_idx = resign_and_store_document(
-                                veil_dir, merged, &own_sk, &own_pk, now_unix,
-                            )?;
-                            return Ok(AdoptOutcome::Adopted { key_idx });
-                        }
+        if let Ok(local_bytes) = std::fs::read(&doc_path)
+            && let Ok(local) = IdentityDocument::decode(&local_bytes)
+            && local.node_id == incoming.node_id
+        {
+            match union_identity_keys(&local, &incoming) {
+                None => {
+                    // Nothing new — refresh expiry at most.
+                    let mut keep = local;
+                    if incoming.valid_until_unix > keep.valid_until_unix {
+                        keep.valid_until_unix = incoming.valid_until_unix;
+                        let own_sk = SigningKey::from_bytes(own_seed.as_array());
+                        let key_idx =
+                            resign_and_store_document(veil_dir, keep, &own_sk, &own_pk, now_unix)?;
+                        return Ok(AdoptOutcome::Adopted { key_idx });
                     }
+                    let key_idx = keep
+                        .identity_keys
+                        .iter()
+                        .position(|k| k.pubkey == own_pk)
+                        .map(|i| i as u16)
+                        .unwrap_or(idx);
+                    save_device_sig_key_idx(veil_dir, key_idx)?;
+                    return Ok(AdoptOutcome::Adopted { key_idx });
+                }
+                Some((keys, revoked)) => {
+                    let mut merged = local;
+                    merged.identity_keys = keys;
+                    merged.revoked_devices = revoked;
+                    if incoming.valid_until_unix > merged.valid_until_unix {
+                        merged.valid_until_unix = incoming.valid_until_unix;
+                    }
+                    let own_sk = SigningKey::from_bytes(own_seed.as_array());
+                    let key_idx =
+                        resign_and_store_document(veil_dir, merged, &own_sk, &own_pk, now_unix)?;
+                    return Ok(AdoptOutcome::Adopted { key_idx });
                 }
             }
         }
@@ -2404,36 +2407,33 @@ pub fn adopt_named_identity_document(
     // instead, and accept an incoming that does not name us as long as the
     // union still does (our own local document names us).
     let doc_path = veil_dir.join(IDENTITY_DOCUMENT_FILE);
-    if let Ok(local_bytes) = std::fs::read(&doc_path) {
-        if let Ok(local) = IdentityDocument::decode(&local_bytes) {
-            if local.node_id == incoming.node_id
-                && local.identity_keys.iter().any(|k| k.pubkey == own_pk)
-            {
-                return match union_identity_keys(&local, &incoming) {
-                    None => {
-                        let key_idx = local
-                            .identity_keys
-                            .iter()
-                            .position(|k| k.pubkey == own_pk)
-                            .expect("checked above") as u16;
-                        save_device_sig_key_idx(veil_dir, key_idx)?;
-                        Ok(AdoptOutcome::Adopted { key_idx })
-                    }
-                    Some((keys, revoked)) => {
-                        let mut merged = local;
-                        merged.identity_keys = keys;
-                        merged.revoked_devices = revoked;
-                        if incoming.valid_until_unix > merged.valid_until_unix {
-                            merged.valid_until_unix = incoming.valid_until_unix;
-                        }
-                        let key_idx = resign_and_store_document(
-                            veil_dir, merged, &own_sk, &own_pk, now_unix,
-                        )?;
-                        Ok(AdoptOutcome::Adopted { key_idx })
-                    }
-                };
+    if let Ok(local_bytes) = std::fs::read(&doc_path)
+        && let Ok(local) = IdentityDocument::decode(&local_bytes)
+        && local.node_id == incoming.node_id
+        && local.identity_keys.iter().any(|k| k.pubkey == own_pk)
+    {
+        return match union_identity_keys(&local, &incoming) {
+            None => {
+                let key_idx = local
+                    .identity_keys
+                    .iter()
+                    .position(|k| k.pubkey == own_pk)
+                    .expect("checked above") as u16;
+                save_device_sig_key_idx(veil_dir, key_idx)?;
+                Ok(AdoptOutcome::Adopted { key_idx })
             }
-        }
+            Some((keys, revoked)) => {
+                let mut merged = local;
+                merged.identity_keys = keys;
+                merged.revoked_devices = revoked;
+                if incoming.valid_until_unix > merged.valid_until_unix {
+                    merged.valid_until_unix = incoming.valid_until_unix;
+                }
+                let key_idx =
+                    resign_and_store_document(veil_dir, merged, &own_sk, &own_pk, now_unix)?;
+                Ok(AdoptOutcome::Adopted { key_idx })
+            }
+        };
     }
 
     let Some(idx) = incoming
@@ -2485,9 +2485,7 @@ pub fn adopt_named_identity_document(
                 label: "device".into(),
             }
             .save(&inst_path)
-            .map_err(|e| {
-                AdoptDocumentError::Io(std::io::Error::other(e.to_string()))
-            })?;
+            .map_err(|e| AdoptDocumentError::Io(std::io::Error::other(e.to_string())))?;
         }
     }
     Ok(AdoptOutcome::Adopted {
@@ -2984,7 +2982,7 @@ mod tests {
             valid_until_unix: DELEGATE_NOW + 7 * 86_400,
             algo: veil_types::SignatureAlgorithm::Ed25519,
             master_falcon_keypair_bytes: None,
-        device_sk_seed: None,
+            device_sk_seed: None,
         })
         .expect("provision")
     }
@@ -3234,7 +3232,9 @@ mod tests {
         use ed25519_dalek::SigningKey as EdSk;
 
         let master = tempdir();
-        let seed = create_identity(test_opts(master.clone())).unwrap().master_seed;
+        let seed = create_identity(test_opts(master.clone()))
+            .unwrap()
+            .master_seed;
 
         // The ceremony's source side: delegate the fresh device's pubkey.
         let dev_seed: SensitiveBytesN<32> = SensitiveBytesN::from_bytes([0x42u8; 32]);
@@ -3248,9 +3248,8 @@ mod tests {
         // The receiving side: an empty dir and the device's own sk. No master.
         let fresh = tempdir();
         std::fs::create_dir_all(&fresh).unwrap();
-        let outcome =
-            adopt_named_identity_document(&fresh, &doc_bytes, &dev_seed, DELEGATE_NOW)
-                .expect("named adopt");
+        let outcome = adopt_named_identity_document(&fresh, &doc_bytes, &dev_seed, DELEGATE_NOW)
+            .expect("named adopt");
         assert!(matches!(outcome, AdoptOutcome::Adopted { key_idx: 1 }));
 
         // The state the whole mechanism exists to produce: the dir LOADS,
@@ -3311,9 +3310,8 @@ mod tests {
         )
         .expect("adopt");
         assert!(matches!(out, AdoptOutcome::Adopted { .. }));
-        let doc =
-            IdentityDocument::decode(&std::fs::read(a.join(IDENTITY_DOCUMENT_FILE)).unwrap())
-                .unwrap();
+        let doc = IdentityDocument::decode(&std::fs::read(a.join(IDENTITY_DOCUMENT_FILE)).unwrap())
+            .unwrap();
         assert_eq!(doc.identity_keys.len(), 2, "stale adopt must not shrink");
         assert!(
             doc.identity_keys.iter().any(|k| k.pubkey == writer_pk),
@@ -3329,7 +3327,9 @@ mod tests {
 
         // Master provisions, delegates the device, hands over the document.
         let master = tempdir();
-        let seed = create_identity(test_opts(master.clone())).unwrap().master_seed;
+        let seed = create_identity(test_opts(master.clone()))
+            .unwrap()
+            .master_seed;
         let one_key_doc = std::fs::read(master.join(IDENTITY_DOCUMENT_FILE)).unwrap();
 
         let dev_seed: SensitiveBytesN<32> = SensitiveBytesN::from_bytes([0x42u8; 32]);
@@ -3347,9 +3347,8 @@ mod tests {
 
         // The stale ONE-key document arrives (does not even name us). The
         // union keeps our key, and the call reports our recorded index.
-        let out =
-            adopt_named_identity_document(&fresh, &one_key_doc, &dev_seed, DELEGATE_NOW)
-                .expect("stale adopt");
+        let out = adopt_named_identity_document(&fresh, &one_key_doc, &dev_seed, DELEGATE_NOW)
+            .expect("stale adopt");
         assert!(matches!(out, AdoptOutcome::Adopted { key_idx: 1 }));
         let doc =
             IdentityDocument::decode(&std::fs::read(fresh.join(IDENTITY_DOCUMENT_FILE)).unwrap())
@@ -3459,7 +3458,9 @@ mod tests {
         use ed25519_dalek::SigningKey as EdSk;
 
         let master = tempdir();
-        let seed = create_identity(test_opts(master.clone())).unwrap().master_seed;
+        let seed = create_identity(test_opts(master.clone()))
+            .unwrap()
+            .master_seed;
         let dev_seed: SensitiveBytesN<32> = SensitiveBytesN::from_bytes([0x42u8; 32]);
         let dev_pk = EdSk::from_bytes(dev_seed.as_array())
             .verifying_key()
@@ -3492,13 +3493,15 @@ mod tests {
         SovereignIdentity::load_from_dir(&master).expect("still loads");
 
         // Idempotent.
-        assert!(!revoke_identity_device(
-            &master,
-            MasterSecret::Seed(seed.clone()),
-            &dev_id,
-            DELEGATE_NOW,
-        )
-        .expect("second revoke"));
+        assert!(
+            !revoke_identity_device(
+                &master,
+                MasterSecret::Seed(seed.clone()),
+                &dev_id,
+                DELEGATE_NOW,
+            )
+            .expect("second revoke")
+        );
 
         // THE POINT: the stale pre-revocation copy comes back through the
         // merge and the revoked key must NOT return with it.
@@ -3529,7 +3532,9 @@ mod tests {
         // master check on the tombstone itself is the only thing standing
         // between "any device" and "permanently revoke any other".
         let master = tempdir();
-        let seed = create_identity(test_opts(master.clone())).unwrap().master_seed;
+        let seed = create_identity(test_opts(master.clone()))
+            .unwrap()
+            .master_seed;
         let dev_seed: SensitiveBytesN<32> = SensitiveBytesN::from_bytes([0x42u8; 32]);
         let dev_pk = EdSk::from_bytes(dev_seed.as_array())
             .verifying_key()
@@ -3560,7 +3565,9 @@ mod tests {
         // malformed, so a successful re-delegation would brick the identity
         // on its next load.
         let master = tempdir();
-        let seed = create_identity(test_opts(master.clone())).unwrap().master_seed;
+        let seed = create_identity(test_opts(master.clone()))
+            .unwrap()
+            .master_seed;
         let dev_seed: SensitiveBytesN<32> = SensitiveBytesN::from_bytes([0x42u8; 32]);
         let dev_pk = EdSk::from_bytes(dev_seed.as_array())
             .verifying_key()
@@ -3576,8 +3583,7 @@ mod tests {
         )
         .unwrap();
 
-        let err =
-            delegate_device(delegate_opts(master.clone(), seed, dev_pk)).unwrap_err();
+        let err = delegate_device(delegate_opts(master.clone(), seed, dev_pk)).unwrap_err();
         assert!(
             matches!(err, DelegateDeviceError::Revoked { .. }),
             "got {err:?}"
@@ -3589,16 +3595,13 @@ mod tests {
     #[test]
     fn a_device_cannot_revoke_its_own_signing_key() {
         let master = tempdir();
-        let seed = create_identity(test_opts(master.clone())).unwrap().master_seed;
+        let seed = create_identity(test_opts(master.clone()))
+            .unwrap()
+            .master_seed;
         let own = device_pubkey(&master);
         let own_id = veil_crypto::identity::compute_node_id(&own);
-        let err = revoke_identity_device(
-            &master,
-            MasterSecret::Seed(seed),
-            &own_id,
-            DELEGATE_NOW,
-        )
-        .unwrap_err();
+        let err = revoke_identity_device(&master, MasterSecret::Seed(seed), &own_id, DELEGATE_NOW)
+            .unwrap_err();
         assert!(matches!(err, AdoptDocumentError::Verify(_)), "got {err:?}");
     }
 
@@ -3624,7 +3627,9 @@ mod tests {
     #[test]
     fn delegating_from_a_hybrid_master_names_the_algorithm() {
         let dir = tempdir();
-        let seed = create_identity(hybrid_opts(dir.clone())).unwrap().master_seed;
+        let seed = create_identity(hybrid_opts(dir.clone()))
+            .unwrap()
+            .master_seed;
         let device: SensitiveBytesN<32> = SensitiveBytesN::from_bytes([0x21u8; 32]);
         let device_pk = ed25519_dalek::SigningKey::from_bytes(device.as_array())
             .verifying_key()
@@ -3645,7 +3650,9 @@ mod tests {
     #[test]
     fn revoking_on_a_hybrid_master_names_the_algorithm_and_writes_nothing() {
         let dir = tempdir();
-        let seed = create_identity(hybrid_opts(dir.clone())).unwrap().master_seed;
+        let seed = create_identity(hybrid_opts(dir.clone()))
+            .unwrap()
+            .master_seed;
         let before = std::fs::read(dir.join(IDENTITY_DOCUMENT_FILE)).unwrap();
 
         let err =
@@ -3706,12 +3713,9 @@ mod tests {
         let stranger: SensitiveBytesN<32> = SensitiveBytesN::from_bytes([0x66u8; 32]);
         let fresh = tempdir();
         std::fs::create_dir_all(&fresh).unwrap();
-        let err = adopt_named_identity_document(&fresh, &doc_bytes, &stranger, DELEGATE_NOW)
-            .unwrap_err();
-        assert!(
-            matches!(err, AdoptDocumentError::Verify(_)),
-            "got {err:?}"
-        );
+        let err =
+            adopt_named_identity_document(&fresh, &doc_bytes, &stranger, DELEGATE_NOW).unwrap_err();
+        assert!(matches!(err, AdoptDocumentError::Verify(_)), "got {err:?}");
         assert!(
             !fresh.join(IDENTITY_DOCUMENT_FILE).exists()
                 && !fresh.join(DEVICE_IDENTITY_SK_FILE).exists(),
@@ -4275,7 +4279,7 @@ mod tests {
             valid_until_unix: now + 7 * 86_400,
             algo: SignatureAlgorithm::Falcon512,
             master_falcon_keypair_bytes: None,
-        device_sk_seed: None,
+            device_sk_seed: None,
         })
         .expect_err("falcon-only restore must reject missing bundle");
         assert!(
@@ -4768,7 +4772,7 @@ mod tests {
             valid_until_unix: now + 7 * 86_400,
             algo: veil_types::SignatureAlgorithm::Ed25519,
             master_falcon_keypair_bytes: None,
-        device_sk_seed: None,
+            device_sk_seed: None,
         }
     }
 
@@ -4897,7 +4901,7 @@ mod tests {
             valid_until_unix: now + 7 * 86_400,
             algo: SignatureAlgorithm::Ed25519Falcon512Hybrid,
             master_falcon_keypair_bytes: None,
-        device_sk_seed: None, // ← the operator forgot to back up.
+            device_sk_seed: None, // ← the operator forgot to back up.
         })
         .expect_err("must reject hybrid restore without master_falcon bundle");
         assert!(

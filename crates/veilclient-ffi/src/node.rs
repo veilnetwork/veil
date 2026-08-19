@@ -1152,7 +1152,12 @@ pub unsafe extern "C" fn veil_node_reload_identity(
     {
         Ok(rt) => rt,
         Err(e) => {
-            unsafe { set_err(err_out, &format!("reload_identity runtime build failed: {e}")) };
+            unsafe {
+                set_err(
+                    err_out,
+                    &format!("reload_identity runtime build failed: {e}"),
+                )
+            };
             return -1;
         }
     };
