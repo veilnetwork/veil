@@ -90,6 +90,28 @@ pub struct DiscoveredPeerSnapshot {
     source: PeerSource,
 }
 
+/// The slot this node already occupies in `NodeState::peers`, if any.
+///
+/// The map is keyed by `PeerId` — a local slot number — so nothing about its
+/// shape stops the same node_id appearing many times, and nothing did: a
+/// production seed reached 919 entries for 21 distinct nodes because the
+/// peer-exchange path minted a fresh slot on every gossip round. Both the
+/// gossip path and the snapshot loader ask this first and write into the slot
+/// they get back.
+///
+/// Linear in the map, which is the point: bounded by the number of DISTINCT
+/// peers once callers use it, and called once per newly-learned peer rather
+/// than per frame.
+pub(crate) fn existing_slot_for(
+    peers: &std::collections::BTreeMap<veil_cfg::PeerId, PeerConfigEntry>,
+    node_id: &[u8; 32],
+) -> Option<veil_cfg::PeerId> {
+    peers
+        .iter()
+        .find(|(_, e)| e.node_id.as_bytes() == node_id)
+        .map(|(id, _)| *id)
+}
+
 /// Path for the discovered-peers file, derived from config path.
 pub fn discovered_peers_path(config_path: &Path) -> PathBuf {
     config_path
@@ -142,6 +164,12 @@ pub fn load_discovered_peers(
     };
     let mut restored = 0usize;
     let mut peer_id_counter: u32 = crate::types::synthetic_peer_id::PERSISTENCE_BASE;
+    // A snapshot written before the gossip path stopped minting a slot per
+    // round holds the same node many times over — 919 entries for 21 nodes on
+    // one production seed. Loading it verbatim would restore the bloat and dial
+    // every copy, so an entry whose node is already placed is skipped. Asking
+    // the live map rather than a private set also covers a node that arrived
+    // some other way while the load was running.
     let active = {
         let reg = access
             .session_tx_registry
@@ -161,6 +189,9 @@ pub fn load_discovered_peers(
         // filters landed would seed every restart with unreachable
         // 0.0.0.0:5555 dial targets that self-connect to our own listener.
         if is_wildcard_transport(&snap.transport) {
+            continue;
+        }
+        if existing_slot_for(&lock_state(state).peers, node_id.as_bytes()).is_some() {
             continue;
         }
         let peer_id = veil_cfg::PeerId::new(peer_id_counter);
@@ -322,6 +353,71 @@ pub fn load_bans(ban_list: &Arc<Mutex<BanList>>, config_path: &Path) -> LoadOutc
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn peer_entry(slot: u32, node_id: [u8; 32], transport: &str) -> PeerConfigEntry {
+        PeerConfigEntry {
+            peer_id: veil_cfg::PeerId::new(slot),
+            node_id: veil_cfg::NodeId::from(node_id),
+            public_key: String::new(),
+            nonce: String::new(),
+            transport: transport.to_string(),
+            algo: veil_cfg::SignatureAlgorithm::Ed25519,
+            tls_cert: None,
+            tls_key: None,
+            tls_ca_cert: None,
+            bootstrap_only: false,
+            source: crate::types::PeerSource::Exchanged,
+        }
+    }
+
+    /// A node already in the map is found by node_id, whatever slot it sits in.
+    ///
+    /// The map is keyed by slot, so "is this peer known" cannot be answered by
+    /// a key lookup and nothing was answering it another way: every gossip
+    /// round minted a new slot for a peer already present, and one production
+    /// seed reached 919 entries for 21 distinct nodes. Break-check: return
+    /// `None` unconditionally and both callers mint again.
+    #[test]
+    fn a_peer_already_in_the_map_is_found_by_its_node_id() {
+        let mut peers = std::collections::BTreeMap::new();
+        let known = [0x11u8; 32];
+        // Slots deliberately not starting at zero and not contiguous — the
+        // answer must not depend on where the entry happens to sit.
+        peers.insert(veil_cfg::PeerId::new(7), peer_entry(7, known, "tcp://a:1"));
+        peers.insert(
+            veil_cfg::PeerId::new(99),
+            peer_entry(99, [0x22u8; 32], "tcp://b:2"),
+        );
+
+        assert_eq!(
+            existing_slot_for(&peers, &known),
+            Some(veil_cfg::PeerId::new(7)),
+            "a known node must resolve to the slot it already occupies"
+        );
+        assert_eq!(
+            existing_slot_for(&peers, &[0x33u8; 32]),
+            None,
+            "a node nobody has seen has no slot to reuse"
+        );
+    }
+
+    /// The same node under a NEW transport reuses its slot rather than adding.
+    ///
+    /// A peer that changed address is still one peer; minting a second slot is
+    /// how the store came to hold the same node under several addresses at
+    /// once, dialling all of them forever.
+    #[test]
+    fn a_changed_address_does_not_earn_a_second_slot() {
+        let mut peers = std::collections::BTreeMap::new();
+        let node = [0x44u8; 32];
+        peers.insert(veil_cfg::PeerId::new(3), peer_entry(3, node, "tcp://old:1"));
+
+        let slot = existing_slot_for(&peers, &node).expect("known node");
+        peers.insert(slot, peer_entry(slot.get(), node, "tcp://new:2"));
+
+        assert_eq!(peers.len(), 1, "one node, one slot");
+        assert_eq!(peers[&slot].transport, "tcp://new:2", "and the new address");
+    }
 
     fn ban_list_with(ids: &[[u8; 32]]) -> Arc<Mutex<BanList>> {
         let bl = Arc::new(Mutex::new(BanList::default()));
