@@ -50,7 +50,32 @@ fn spawn_memory_stats_reporter() {
         .ok();
 }
 
+/// Die quietly when the reader goes away, the way every other Unix tool does.
+///
+/// Rust sets `SIGPIPE` to `SIG_IGN` before `main`, so a write to a closed pipe
+/// comes back as `EPIPE` instead of killing the process — and `println!`
+/// panics on a failed write. `veil-cli node dht list | head` therefore ended in
+/// a panic and a backtrace instead of ten lines and a prompt, which reads like
+/// the node broke when nothing did.
+///
+/// Restoring the default disposition is the smallest fix that covers every
+/// print in the binary; the alternative is auditing several hundred `println!`
+/// sites for `BrokenPipe`. It is confined to the CLI entry point: a library or
+/// an embedded host must keep Rust's default, or an unrelated socket write
+/// would take the whole process down.
+#[cfg(unix)]
+fn die_quietly_on_broken_pipe() {
+    // SAFETY: called at the top of `main`, before any thread is spawned, and
+    // `SIG_DFL` for SIGPIPE is what the process would have had without Rust's
+    // pre-main override.
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
+}
+
 fn main() {
+    #[cfg(unix)]
+    die_quietly_on_broken_pipe();
     #[cfg(target_os = "linux")]
     spawn_memory_stats_reporter();
     // This is a real process entry point: nothing has spawned a thread yet, so
