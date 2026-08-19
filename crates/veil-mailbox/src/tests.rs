@@ -1679,7 +1679,6 @@ fn v01_control_byte_ceiling_does_not_shorten_a_batch_that_fits() {
     );
 }
 
-
 // ── SLICE: a blob too heavy for one reply, read a window at a time ──────────
 //
 // The size of a mailbox blob is not the sender's to choose — one ML-KEM
@@ -1699,7 +1698,11 @@ fn t1_4_slice_walks_the_blob_and_reports_the_whole_length() {
     let mut rounds = 0;
     loop {
         let (total, bytes) = mb.slice(recv, cid, offset, 1024).unwrap().unwrap();
-        assert_eq!(total as usize, payload.len(), "every slice states the whole length");
+        assert_eq!(
+            total as usize,
+            payload.len(),
+            "every slice states the whole length"
+        );
         if bytes.is_empty() {
             break;
         }
@@ -1709,7 +1712,10 @@ fn t1_4_slice_walks_the_blob_and_reports_the_whole_length() {
         assert!(rounds < 100, "walk is not converging");
     }
     assert_eq!(got, payload, "the windows reassemble to the deposit");
-    assert!(rounds >= 4, "a 5000-byte blob in 1024-byte windows takes several");
+    assert!(
+        rounds >= 4,
+        "a 5000-byte blob in 1024-byte windows takes several"
+    );
 }
 
 #[test]

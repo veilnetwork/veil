@@ -560,33 +560,34 @@ pub async fn handle_fetch_message(
     // box: the verified id, nothing claimed). Identity box first, device box
     // behind it, one shared reply budget — no wire change, so an old client
     // drains its device box the moment the relay serves it.
-    if let Some(dev) = sender_device_id {
-        if dev != src_node_id && dev != [0u8; 32] {
-            match mailbox.fetch(dev) {
-                Ok(dev_blobs) => {
-                    if !dev_blobs.is_empty() {
-                        log::debug!(
-                            "veil-mailbox: FETCH recv={} also drains device box {} ({} blob(s))",
-                            hex_short(&src_node_id),
-                            hex_short(&dev),
-                            dev_blobs.len(),
-                        );
-                    }
-                    blobs.extend(dev_blobs);
-                    blobs.sort_by_key(|b| b.deposited_at);
-                    // Oldest-first ACROSS the two boxes, not per-box: the
-                    // reply budget packs from the front, so "identity box
-                    // first" starves the device box for as long as the
-                    // identity backlog alone can fill a reply — measured
-                    // live: 133 device blobs announced, none served, while
-                    // 74 identity blobs took the whole budget every round.
+    if let Some(dev) = sender_device_id
+        && dev != src_node_id
+        && dev != [0u8; 32]
+    {
+        match mailbox.fetch(dev) {
+            Ok(dev_blobs) => {
+                if !dev_blobs.is_empty() {
+                    log::debug!(
+                        "veil-mailbox: FETCH recv={} also drains device box {} ({} blob(s))",
+                        hex_short(&src_node_id),
+                        hex_short(&dev),
+                        dev_blobs.len(),
+                    );
                 }
-                Err(e) => log::warn!(
-                    "veil-mailbox: FETCH device-box store error (recv={} dev={}): {e}",
-                    hex_short(&src_node_id),
-                    hex_short(&dev),
-                ),
+                blobs.extend(dev_blobs);
+                blobs.sort_by_key(|b| b.deposited_at);
+                // Oldest-first ACROSS the two boxes, not per-box: the
+                // reply budget packs from the front, so "identity box
+                // first" starves the device box for as long as the
+                // identity backlog alone can fill a reply — measured
+                // live: 133 device blobs announced, none served, while
+                // 74 identity blobs took the whole budget every round.
             }
+            Err(e) => log::warn!(
+                "veil-mailbox: FETCH device-box store error (recv={} dev={}): {e}",
+                hex_short(&src_node_id),
+                hex_short(&dev),
+            ),
         }
     }
     // Bound the reply so the whole encoded MailboxFetchRespPayload fits in ONE
@@ -736,12 +737,12 @@ pub async fn handle_slice_message(
     // that no retry ends. Identity box first; the verified signer device's
     // box only behind it, under the same authorization as the extra fetch.
     let mut sliced = mailbox.slice(src_node_id, req.content_id, req.offset, window);
-    if matches!(sliced, Ok(None)) {
-        if let Some(dev) = sender_device_id {
-            if dev != src_node_id && dev != [0u8; 32] {
-                sliced = mailbox.slice(dev, req.content_id, req.offset, window);
-            }
-        }
+    if matches!(sliced, Ok(None))
+        && let Some(dev) = sender_device_id
+        && dev != src_node_id
+        && dev != [0u8; 32]
+    {
+        sliced = mailbox.slice(dev, req.content_id, req.offset, window);
     }
     let resp = match sliced {
         Ok(Some((total_len, bytes))) => veil_proto::ipc::MailboxSlicePayload {
@@ -847,19 +848,20 @@ pub fn handle_ack_message(mailbox: &Mailbox, msg: AppMessage) {
     // exact re-serve loop this endpoint exists to end. Same authorization as
     // the extra fetch: the `sig_key_idx` subkey that verified this request IS
     // the device, so it can only ever drop that device's own mail.
-    if let Some(dev) = sender_device_id {
-        if dev != src_node_id && dev != [0u8; 32] {
-            match mailbox.ack(dev, content_id) {
-                Ok(removed) => log::debug!(
-                    "veil-mailbox: ACK device box dev={} content={} removed={removed}",
-                    hex_short(&dev),
-                    hex_short(&content_id),
-                ),
-                Err(e) => log::warn!(
-                    "veil-mailbox: ACK device-box store error (dev={}): {e}",
-                    hex_short(&dev),
-                ),
-            }
+    if let Some(dev) = sender_device_id
+        && dev != src_node_id
+        && dev != [0u8; 32]
+    {
+        match mailbox.ack(dev, content_id) {
+            Ok(removed) => log::debug!(
+                "veil-mailbox: ACK device box dev={} content={} removed={removed}",
+                hex_short(&dev),
+                hex_short(&content_id),
+            ),
+            Err(e) => log::warn!(
+                "veil-mailbox: ACK device-box store error (dev={}): {e}",
+                hex_short(&dev),
+            ),
         }
     }
 }

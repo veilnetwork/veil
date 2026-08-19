@@ -318,16 +318,16 @@ mod tests {
         let identity = cfg.identity.expect("identity");
         let node_pub = {
             use base64::{Engine as _, engine::general_purpose::STANDARD};
-            STANDARD.decode(identity.public_key.as_bytes()).expect("pubkey")
+            STANDARD
+                .decode(identity.public_key.as_bytes())
+                .expect("pubkey")
         };
 
         let dir = tempfile::tempdir().expect("tempdir");
         let dir_s = CString::new(dir.path().to_str().unwrap()).unwrap();
         let label = CString::new("stand").unwrap();
-        let phrase = veil_identity::master_seed::encode_master_seed_to_phrase(
-            &[0x77u8; 32],
-        )
-        .expect("phrase");
+        let phrase = veil_identity::master_seed::encode_master_seed_to_phrase(&[0x77u8; 32])
+            .expect("phrase");
         let mut phrase_buf = phrase.to_string().into_bytes();
         let mut err: *mut c_char = std::ptr::null_mut();
         let rc = unsafe {
@@ -396,7 +396,10 @@ mod tests {
 
     #[test]
     fn garbage_is_refused_rather_than_trusted() {
-        assert_eq!(authorizes(b"not a document", &[0x11u8; 32], &[0x22u8; 32]), VERIFY_INVALID);
+        assert_eq!(
+            authorizes(b"not a document", &[0x11u8; 32], &[0x22u8; 32]),
+            VERIFY_INVALID
+        );
     }
 
     #[test]

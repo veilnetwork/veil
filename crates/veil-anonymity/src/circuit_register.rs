@@ -365,8 +365,7 @@ impl CircuitRendezvousRegistry {
         // Per-link ceiling (see `MAX_SUBSCRIPTIONS_PER_LINK`). Only a NEW
         // cookie can grow this link's share; a refresh replaces an entry the
         // link already holds.
-        if fresh_cookie && Self::make_room_for_link(&mut g, &circuit.prev_link, self.per_link_cap)
-        {
+        if fresh_cookie && Self::make_room_for_link(&mut g, &circuit.prev_link, self.per_link_cap) {
             self.over_link_cap_evictions.fetch_add(1, Ordering::Relaxed);
         }
         // Record the cookie ON the circuit so its teardown can evict this sub.

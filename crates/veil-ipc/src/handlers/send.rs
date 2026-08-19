@@ -392,7 +392,11 @@ async fn try_ratchet_seal(
     let paired = match session_instance {
         Some(instance) => match resolver.resolve_cert_for_instance_cached(*dst_node_id, instance) {
             Some(c) => Some(c),
-            None => resolver.resolve_cert_for_instance(*dst_node_id, instance).await,
+            None => {
+                resolver
+                    .resolve_cert_for_instance(*dst_node_id, instance)
+                    .await
+            }
         },
         // No live session, or a legacy handshake that proved no instance:
         // nothing named a device, so the singular resolve below stays the
@@ -1587,7 +1591,7 @@ mod ratchet_send_tests {
             // production resolver's zero-valued freshness tie hands back an
             // arbitrary row. Modeled here as "the last one", which is what an
             // all-zero `max_by_key` over an iterator returns.
-            self.0.iter().filter(|c| c.node_id == target).last().cloned()
+            self.0.iter().rfind(|c| c.node_id == target).cloned()
         }
         fn resolve_cert(
             &self,
@@ -1708,12 +1712,7 @@ mod ratchet_send_tests {
             ratchet_x25519_pk: sibling_ring.current_ratchet_pk(),
             cert_version: 1,
         };
-        let my_ratchet_pk = fx
-            .me
-            .seed_ring
-            .read()
-            .expect("ring")
-            .current_ratchet_pk();
+        let my_ratchet_pk = fx.me.seed_ring.read().expect("ring").current_ratchet_pk();
         let sibling_rt = ratchet_runtime(PEER, SIBLING_INSTANCE, sibling_ring);
         wlock!(sibling_rt.peer_ratchet_keys).insert(ME, my_ratchet_pk);
         // Singular answer = the LAST row = the sibling: the accident row and
