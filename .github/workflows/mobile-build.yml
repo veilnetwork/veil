@@ -183,7 +183,12 @@ jobs:
         if: matrix.triple == 'aarch64-unknown-linux-gnu'
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
+          # No --no-install-recommends here: the target libc headers reach
+          # gcc-aarch64-linux-gnu through Recommends, not Depends. This step
+          # only survived the flag because g++ pulls them as a hard dependency
+          # -- luck, not a contract. libc6-dev-arm64-cross is named outright.
+          sudo apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu \
+            libc6-dev-arm64-cross
 
       # The cross toolchain env stays here — it is about THIS runner, not about
       # what a veilclient-ffi artifact is. The features are the script's.
