@@ -1289,7 +1289,23 @@ impl KademliaService {
                     inner.pending_per_source.remove(&source);
                 }
             }
-            inner.routing.insert_trusted(contact);
+            // Do NOT overwrite an entry the handshake already stamped.
+            //
+            // A pending contact is what a THIRD PARTY told us: node id and
+            // transport, and default capabilities because nobody may speak for
+            // a peer's own preferences. The verified entry, if there is one,
+            // came from that peer's own CAPABILITIES frame — strictly better
+            // information about the same node.
+            //
+            // Overwriting it silently undid both stamps the handshake had just
+            // made: `discovery_mode` (so a peer asking to stay out of
+            // FIND_NODE answers went back to Public) and `no_dht_service` (so a
+            // peer asking not to serve was picked as a candidate again). Both
+            // were invisible until the skip counter gave the second one a
+            // number.
+            if !inner.routing.contains(node_id) {
+                inner.routing.insert_trusted(contact);
+            }
             return true;
         }
         false
