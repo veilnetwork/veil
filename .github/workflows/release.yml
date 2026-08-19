@@ -111,6 +111,9 @@ jobs:
             is_windows: true
 
     runs-on: ${{ matrix.runner }}
+    # A hang here used to cost the runner's six-hour default. Every leg of
+    # this matrix has finished in well under fifteen minutes.
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
@@ -140,11 +143,33 @@ jobs:
       - name: Add the cross target to the PINNED toolchain
         run: rustup target add ${{ matrix.triple }}
 
+      # BOUNDED, because the unbounded form hung a v0.6.0 release leg for two
+      # and a half hours with no output at all — six of the seven targets were
+      # built and waiting on this one. Two things make apt wait forever here:
+      # the runner image runs unattended-upgrades, whose dpkg lock apt waits on
+      # silently under `-qq`, and a package that wants to ask something gets no
+      # terminal to ask it on. `DPkg::Lock::Timeout` turns the first into an
+      # error, `DEBIAN_FRONTEND` answers the second, and the retry covers the
+      # ordinary case of losing the lock race once.
       - name: Install ARM64 Linux cross-linker
         if: matrix.cross_linker == 'aarch64-linux-gnu-gcc'
+        timeout-minutes: 10
+        env:
+          DEBIAN_FRONTEND: noninteractive
         run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
+          set -euo pipefail
+          apt_get() { sudo apt-get -o DPkg::Lock::Timeout=180 "$@"; }
+          for attempt in 1 2 3; do
+            if apt_get update -qq && \
+               apt_get install -y --no-install-recommends \
+                 gcc-aarch64-linux-gnu g++-aarch64-linux-gnu; then
+              exit 0
+            fi
+            echo "apt attempt $attempt failed; retrying" >&2
+            sleep 15
+          done
+          echo "::error::could not install the aarch64 cross-linker in three attempts"
+          exit 1
 
       - name: Install cargo-zigbuild (musl C/C++ cross via zig)
         if: matrix.install_musl == true
@@ -275,6 +300,7 @@ jobs:
   publish:
     needs: build
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     # The ONE job that writes: it attaches the artifacts to the release.
     permissions:
       contents: write
