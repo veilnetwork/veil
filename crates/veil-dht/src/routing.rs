@@ -89,6 +89,17 @@ pub struct Contact {
     /// CANDIDATE selection filters on this flag.
     #[serde(default)]
     pub no_dht_service: bool,
+    /// Whether the two fields above were STATED by the peer itself.
+    ///
+    /// `Contact::new` cannot tell "this peer is Public and serves" from "I was
+    /// not told" — both are the struct defaults. Post-handshake bookkeeping
+    /// builds such a contact and inserts it TRUSTED, so a rule that only
+    /// distrusted gossip did not stop it: the session-open path overwrote the
+    /// stamps the handshake had set moments earlier, and blanked the transport
+    /// with it. Marking the difference is what lets an insert that knows less
+    /// leave alone what is already known.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub caps_known: bool,
 }
 
 impl Contact {
@@ -101,6 +112,7 @@ impl Contact {
             transport: transport.into(),
             discovery_mode: 0,
             no_dht_service: false,
+            caps_known: false,
         }
     }
 
@@ -122,6 +134,7 @@ impl Contact {
             transport: transport.into(),
             discovery_mode,
             no_dht_service: false,
+            caps_known: true,
         }
     }
 
@@ -172,6 +185,7 @@ impl From<NodeContact> for Contact {
             transport: nc.transport,
             discovery_mode: 0,
             no_dht_service: false,
+            caps_known: false,
         }
     }
 }
@@ -473,8 +487,32 @@ impl RoutingTable {
         // Update existing entry: move to tail (most recently seen).
         // (Updates bypass rate limit — only NEW contacts are limited.)
         if let Some(pos) = bucket.iter().position(|c| c.node_id == contact.node_id) {
-            bucket.remove(pos);
-            bucket.push_back(contact);
+            let held = bucket.remove(pos).expect("position() just found it");
+            let mut next = contact;
+            // Only a completed handshake may state a peer's own preferences.
+            //
+            // `discovery_mode` and `no_dht_service` come from that peer's
+            // CAPABILITIES frame. Every other source — peer exchange, a
+            // bootstrap entry, a promoted pending contact — is a THIRD PARTY
+            // describing someone else, and carries the struct defaults. An
+            // untrusted re-insert used to overwrite the whole record, so any
+            // later gossip about a peer silently reverted both stamps: the one
+            // asking to stay out of FIND_NODE answers, and the one asking not
+            // to be given DHT work. Found live — the handshake logged
+            // `dht_service=false` and the replication fanned out to that peer
+            // anyway, because gossip had already put the defaults back.
+            if held.caps_known && !next.caps_known {
+                next.discovery_mode = held.discovery_mode;
+                next.no_dht_service = held.no_dht_service;
+                next.caps_known = true;
+            }
+            // Same rule for the transport: post-handshake bookkeeping inserts
+            // an empty one, and an empty string is not news about where a peer
+            // can be reached.
+            if next.transport.is_empty() {
+                next.transport = held.transport;
+            }
+            bucket.push_back(next);
             return;
         }
         // token-bucket rate limit replaces the legacy
@@ -970,6 +1008,47 @@ mod no_dht_service_tests {
         let legacy: Contact = serde_json::from_str(r#"{"node_id":[3],"transport":"tcp://c"}"#)
             .unwrap_or_else(|_| Contact::new([3u8; 32], "tcp://c"));
         assert!(legacy.dht_service());
+    }
+
+    /// Gossip may refresh a peer's transport; it may not speak for that
+    /// peer's own preferences. Anything but a handshake carries the struct
+    /// defaults, and letting those land wiped both stamps — which is exactly
+    /// what happened live: the handshake logged `dht_service=false`, peer
+    /// exchange re-inserted the same node a moment later, and the replication
+    /// fanned out to it as if it had never asked.
+    #[test]
+    fn untrusted_reinsert_cannot_clear_handshake_capabilities() {
+        let mut rt = RoutingTable::new([0u8; 32]);
+        rt.insert_trusted(Contact::with_caps(
+            [7u8; 32],
+            "quic://real:5601",
+            veil_types::DiscoveryMode::IntroductionOnly,
+            false,
+        ));
+        // What peer exchange knows: an id and a transport, nothing else.
+        rt.insert(Contact::new([7u8; 32], "tcp://gossip:9000"));
+        // And what the session-open bookkeeping inserts — TRUSTED, with an
+        // empty transport and no capabilities at all. This is the one that
+        // actually did the damage in production: being trusted, it was exempt
+        // from every rule aimed at gossip.
+        rt.insert_trusted(Contact::new([7u8; 32], ""));
+
+        let held = rt
+            .find_closest(&[7u8; 32], 4)
+            .into_iter()
+            .find(|c| c.node_id == [7u8; 32])
+            .expect("still in the table");
+        assert!(!held.dht_service(), "gossip put it back into candidacy");
+        assert_eq!(
+            held.discovery_mode(),
+            veil_types::DiscoveryMode::IntroductionOnly,
+            "gossip also reverted the hide-from-walks preference"
+        );
+        assert_eq!(
+            held.transport, "tcp://gossip:9000",
+            "a transport that is actually known DOES refresh; an empty one is \
+             not news and must not erase what we have"
+        );
     }
 
     #[test]

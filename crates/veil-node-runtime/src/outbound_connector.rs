@@ -556,9 +556,10 @@ pub fn spawn_outbound_peers(
                                 access.logger.info(
                                     "dht.peer_added",
                                     format!(
-                                        "outbound handshake → peer={} transport={}",
+                                        "outbound handshake → peer={} transport={} dht_service={}",
                                         veil_util::hex_short(peer.node_id.as_bytes()),
                                         veil_util::redact_addr_for_log(&peer.transport),
+                                        session.remote_dht_service,
                                     ),
                                 );
                                 access.dispatcher.on_session_opened(

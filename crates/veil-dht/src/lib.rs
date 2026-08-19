@@ -120,6 +120,37 @@ mod tests {
         );
     }
 
+    /// Promotion must not undo what the handshake stamped.
+    ///
+    /// A pending contact is a THIRD PARTY's word: id and transport, default
+    /// capabilities, because nobody may speak for a peer's own preferences.
+    /// Promoting it over a verified entry silently reverted both stamps —
+    /// `discovery_mode` and `no_dht_service` — and nothing could see it until
+    /// the skip counter gave the second one a number. Found live: the peer
+    /// advertised `dht_service=false`, the log said so, and the replication
+    /// still fanned out to it.
+    #[test]
+    fn promotion_does_not_overwrite_handshake_capabilities() {
+        let svc = test_kademlia([0u8; 32]);
+        let quiet = [9u8; 32];
+
+        // What a third party told us, and what the peer itself then said.
+        svc.add_contact_unverified_from([1u8; 32], Contact::new(quiet, "tcp://gossip:9000"));
+        svc.add_contact_trusted(Contact::with_caps(
+            quiet,
+            "quic://real:5601",
+            veil_types::DiscoveryMode::Public,
+            false,
+        ));
+        assert!(svc.promote_contact_if_pending(&quiet));
+
+        assert!(
+            !svc.find_closest_nodes(&[3u8; 32], 8).contains(&quiet),
+            "promotion put the peer back into candidate selection"
+        );
+        assert!(svc.no_dht_service_skips() > 0);
+    }
+
     /// The counter must not fire for peers that are simply not the closest —
     /// only for ones actively passed over. A count that rose on ordinary
     /// selection would be noise indistinguishable from the signal.

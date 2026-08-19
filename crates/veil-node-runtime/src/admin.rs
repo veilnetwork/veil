@@ -2688,7 +2688,16 @@ async fn execute_admin_command(
                 .into_iter()
                 .map(|c| AdminDhtContact {
                     node_id: node_id_hex(&c.node_id),
-                    transport: c.transport,
+                    // The transport column doubles as the place to say what
+                    // this contact is ALLOWED to be used for. Without it the
+                    // table looks identical whether a peer's "do not give me
+                    // DHT work" reached us or was quietly reverted by gossip —
+                    // which is a difference nobody could see for an afternoon.
+                    transport: if c.dht_service() {
+                        c.transport
+                    } else {
+                        format!("{} [no-dht-service]", c.transport)
+                    },
                 })
                 .collect();
             Ok(AdminResult::DhtContacts { contacts })
