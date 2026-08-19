@@ -1371,6 +1371,7 @@ impl KademliaService {
         false
     }
 
+
     /// How many candidate slots have gone to somebody else because their
     /// occupant asked not to serve. Pair it with the routing-table size: the
     /// contacts are still there, they are simply never chosen.
@@ -1662,26 +1663,48 @@ impl KademliaService {
             return cached;
         }
 
-        let mut seeds: Vec<Contact> = {
+        // Taken before the routing lock: `peer_ids` reaches into the outbox's
+        // own lock, and acquiring the two in one order here and the other order
+        // anywhere else is how deadlocks are built.
+        let session_peers = outbox.peer_ids();
+        let seeds: Vec<Contact> = {
             let inner = lock!(self.inner);
-            inner
+            let mut seeds: Vec<Contact> = inner
                 .routing
                 .find_closest(&target, self.k())
                 .into_iter()
                 .filter(|c| self.count_service_skip(c))
                 .cloned()
-                .collect()
-        };
-        // Also seed from all peers with active sessions so nodes not yet in the
-        // routing table (or not XOR-close to the target) are still reachable.
-        // Use HashSet for O(1) dedup (was O(n²) with linear any).
-        let mut seed_ids: std::collections::HashSet<[u8; 32]> =
-            seeds.iter().map(|c| c.node_id).collect();
-        for peer_id in outbox.peer_ids() {
-            if seed_ids.insert(peer_id) {
-                seeds.push(Contact::new(peer_id, ""));
+                .collect();
+            // Also seed from all peers with active sessions so nodes not yet in
+            // the routing table (or not XOR-close to the target) are still
+            // reachable. Use HashSet for O(1) dedup (was O(n²) with linear any).
+            //
+            // Seeded from the TABLE when the table knows them. `Contact::new`
+            // says `caps_known: false`, which reads downstream as "serves, and
+            // nobody has said otherwise" — so building one here for a peer
+            // whose CAPABILITIES frame we have already read threw that frame
+            // away, one line below the filter that had just honoured it. A peer
+            // that asked not to serve, and that we have a session with, was
+            // handed back to the walk as a willing candidate; measured on a leaf
+            // advertising NO_DHT_SERVICE whose only peers were seeds that all
+            // held it marked, incoming STORE was 80% of everything it received.
+            //
+            // Nothing is dropped here: an entry that is present keeps its own
+            // statement, and one that is absent still gets the bare contact,
+            // because a peer we have never heard from has refused nothing.
+            let mut seed_ids: std::collections::HashSet<[u8; 32]> =
+                seeds.iter().map(|c| c.node_id).collect();
+            for peer_id in session_peers {
+                if seed_ids.insert(peer_id) {
+                    match inner.routing.contact(&peer_id) {
+                        Some(known) => seeds.push(known.clone()),
+                        None => seeds.push(Contact::new(peer_id, "")),
+                    }
+                }
             }
-        }
+            seeds
+        };
         let timeout = Duration::from_millis(self.dht_config.find_node_timeout_ms);
         let querier = super::network_querier::NetworkPeerQuerier::with_cache(
             Arc::clone(&outbox),
@@ -2093,6 +2116,56 @@ mod tests {
             .unwrap();
         let resp = svc.handle_find_value(FindValuePayload { key });
         assert!(matches!(resp, FindValueResponse::Value(v) if v == b"record"));
+    }
+
+    /// A session peer the table knows as no-service is seeded with its own
+    /// answer, not with a blank one.
+    ///
+    /// The walk seeds from two places: the routing table, filtered through
+    /// `count_service_skip`, and the live session list. The session half used
+    /// to build `Contact::new`, whose `caps_known: false` reads downstream as
+    /// "serves, nobody said otherwise" — so a peer that HAD said otherwise was
+    /// handed back as willing, one line below the filter that had just dropped
+    /// it. Break-check: put `Contact::new(peer_id, "")` back and this fails on
+    /// `dht_service()`.
+    #[tokio::test]
+    async fn a_session_peer_keeps_the_answer_it_gave() {
+        struct SilentRouter(Vec<[u8; 32]>);
+        impl FrameRouter for SilentRouter {
+            fn send_request(
+                &self,
+                _peer: [u8; 32],
+                _request_id: u32,
+                _frame: Vec<u8>,
+            ) -> Option<tokio::sync::oneshot::Receiver<Option<Vec<u8>>>> {
+                None
+            }
+            fn peer_ids(&self) -> Vec<[u8; 32]> {
+                self.0.clone()
+            }
+        }
+
+        let quiet = [0x77u8; 32];
+        let svc = make_test_kademlia_service([0x0Au8; 32]);
+        svc.add_contact_trusted(Contact::with_caps(
+            quiet,
+            "tcp://quiet:9000",
+            veil_types::DiscoveryMode::Public,
+            false,
+        ));
+
+        let found = svc
+            .find_node_iterative_network([0x42u8; 32], Arc::new(SilentRouter(vec![quiet])))
+            .await;
+
+        let seeded = found
+            .iter()
+            .find(|c| c.node_id == quiet)
+            .expect("a session peer must still be seeded — nothing is dropped here");
+        assert!(
+            !seeded.dht_service(),
+            "the peer asked not to serve and the walk must carry that, not overwrite it"
+        );
     }
 
     #[tokio::test]
