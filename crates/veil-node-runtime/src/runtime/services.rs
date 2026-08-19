@@ -342,8 +342,32 @@ impl NodeRuntime {
                                             // claim in `outbound_connector::spawn_outbound_peers`.
                                             use base64::Engine as _;
                                             let b64 = base64::engine::general_purpose::STANDARD;
-                                            let peer_id = veil_cfg::PeerId::new(peer_id_counter);
-                                            peer_id_counter = peer_id_counter.wrapping_add(1);
+                                            // Reuse this node's slot if it already has one.
+                                            //
+                                            // `NodeState::peers` is keyed by PeerId — a local
+                                            // slot number — not by node_id, and the two checks
+                                            // above only ask "is there a live session" and "is it
+                                            // banned". Neither looks in the map, so every gossip
+                                            // round minted a fresh slot for a peer already in it:
+                                            // a production seed reached 919 entries for 21
+                                            // distinct node_ids, a 237 KB file, and 919 outbound
+                                            // dial attempts on the next restart. The dedup that
+                                            // WAS thought about (the comment above) covers the
+                                            // connector task, not the map.
+                                            let existing = crate::runtime::persistence::existing_slot_for(
+                                                &lock_state(&state).peers,
+                                                &p.node_id,
+                                            );
+                                            let peer_id = match existing {
+                                                Some(id) => id,
+                                                None => {
+                                                    let id =
+                                                        veil_cfg::PeerId::new(peer_id_counter);
+                                                    peer_id_counter =
+                                                        peer_id_counter.wrapping_add(1);
+                                                    id
+                                                },
+                                            };
                                             let entry = crate::types::PeerConfigEntry {
                                                 peer_id,
                                                 node_id: veil_cfg::NodeId::from(p.node_id),
