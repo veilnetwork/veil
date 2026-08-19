@@ -151,18 +151,36 @@ jobs:
       # terminal to ask it on. `DPkg::Lock::Timeout` turns the first into an
       # error, `DEBIAN_FRONTEND` answers the second, and the retry covers the
       # ordinary case of losing the lock race once.
+      # Twenty-five minutes, not ten, and recommends left on. Both are paid for.
+      #
+      # The ceiling is a backstop, not the defence: `DPkg::Lock::Timeout` turns
+      # the hang this step exists to bound into an error in three minutes
+      # whatever the ceiling says. What the ceiling has to outlast is an
+      # ordinary slow day on the mirror -- a sibling repository measured
+      # 15m53s for a comparable package set on this same runner host, having
+      # been killed at ten the attempt before.
+      #
+      # And `--no-install-recommends` is gone. The target libc headers reach
+      # `gcc-aarch64-linux-gnu` through Recommends, not Depends; this step only
+      # survived the flag because `g++-aarch64-linux-gnu` sits beside it and
+      # pulls them as a hard dependency. That is luck, not a contract, and the
+      # same flag cost a sibling repository a red tag on
+      # `bits/libc-header-start.h`. `libc6-dev-arm64-cross` is named outright.
       - name: Install ARM64 Linux cross-linker
         if: matrix.cross_linker == 'aarch64-linux-gnu-gcc'
-        timeout-minutes: 10
+        timeout-minutes: 25
         env:
           DEBIAN_FRONTEND: noninteractive
         run: |
           set -euo pipefail
-          apt_get() { sudo apt-get -o DPkg::Lock::Timeout=180 "$@"; }
+          apt_get() {
+            sudo apt-get -o DPkg::Lock::Timeout=180 -o Acquire::Retries=3 "$@"
+          }
           for attempt in 1 2 3; do
             if apt_get update -qq && \
-               apt_get install -y --no-install-recommends \
-                 gcc-aarch64-linux-gnu g++-aarch64-linux-gnu; then
+               apt_get install -y \
+                 gcc-aarch64-linux-gnu g++-aarch64-linux-gnu \
+                 libc6-dev-arm64-cross; then
               exit 0
             fi
             echo "apt attempt $attempt failed; retrying" >&2
@@ -390,6 +408,27 @@ jobs:
           rm -f "$keyfile" "$pubfile"
           [ "$signed" -gt 0 ] || { echo "::error::no sha256-*.txt manifests to sign"; exit 1; }
 
+      # The release page carries the CHANGELOG entry for this tag, not a list
+      # of commit subjects. `generate_release_notes: true` produced exactly one
+      # line -- a compare link -- for v0.6.0, under 43 artifacts nobody could
+      # then read a description of. Artifacts whose notes nobody can read are
+      # artifacts nobody can check.
+      - name: Release notes from the CHANGELOG entry for this tag
+        run: |
+          set -euo pipefail
+          # index(...) == 1 rather than a regex: the version is full of dots,
+          # and as a pattern v0.1.0 would match the heading of v0.10.0. The
+          # em-dash that follows the version is part of the needle for the
+          # same reason -- v0.6.0 must not match v0.6.0-rc1.
+          awk -v v="$RELEASE_TAG" 'index($0, "## " v " —") == 1 {f=1; print; next}
+                                   f && /^## / {exit}
+                                   f {print}' CHANGELOG.md > "$RUNNER_TEMP/notes.md"
+          if [ ! -s "$RUNNER_TEMP/notes.md" ]; then
+            echo "::error::CHANGELOG.md has no section for $RELEASE_TAG, so this release would publish with an empty page. Add the entry, then move the tag."
+            exit 1
+          fi
+          echo "notes: $(wc -l < "$RUNNER_TEMP/notes.md") lines from the $RELEASE_TAG entry"
+
       - name: Attach to Release
         uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
@@ -398,4 +437,26 @@ jobs:
           draft: ${{ env.RELEASE_DRAFT }}
           files: out/*
           fail_on_unmatched_files: true
-          generate_release_notes: true
+          body_path: ${{ runner.temp }}/notes.md
+
+      # The action above writes the body only when it CREATES the release. Move
+      # a tag and re-run, and it replaces every asset while leaving the notes
+      # from the first attempt in place -- fresh binaries under a stale page,
+      # which is the harder half to notice: an empty body is obviously broken,
+      # a confidently outdated one reads as fine.
+      - name: The notes must match the tag, not the first attempt
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release edit "$RELEASE_TAG" \
+            --notes-file "$RUNNER_TEMP/notes.md" --repo "$GITHUB_REPOSITORY"
+          gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" \
+            --json body -q .body > "$RUNNER_TEMP/published-notes.md"
+          if ! diff -q "$RUNNER_TEMP/notes.md" "$RUNNER_TEMP/published-notes.md" \
+               >/dev/null; then
+            echo "::error::the release page does not carry the CHANGELOG entry for $RELEASE_TAG"
+            diff -u "$RUNNER_TEMP/notes.md" "$RUNNER_TEMP/published-notes.md" || true
+            exit 1
+          fi
+          echo "notes on the release page match the $RELEASE_TAG entry"
