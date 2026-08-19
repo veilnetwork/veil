@@ -678,6 +678,20 @@ impl RoutingTable {
             .any(|c| &c.node_id == node_id)
     }
 
+    /// The table's entry for `node_id`, or `None` when it has never heard from
+    /// it.
+    ///
+    /// For callers that need the whole contact — its capabilities, its
+    /// discovery mode, the transport it was last seen on — rather than one
+    /// predicate. Same O(total_contacts) walk as [`Self::contains`].
+    pub fn contact(&self, node_id: &[u8; 32]) -> Option<&Contact> {
+        self.buckets
+            .iter()
+            .flat_map(|b| b.iter())
+            .find(|c| &c.node_id == node_id)
+    }
+
+
     /// Return all contacts from all buckets (cloned).
     pub fn all_contacts(&self) -> Vec<Contact> {
         self.buckets.iter().flatten().cloned().collect()
