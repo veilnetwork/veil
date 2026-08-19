@@ -1,5 +1,60 @@
 # Changelog
 
+## v0.6.0 — 2026-08-19
+
+The minor digit moves because the wire and the FFI both gained surface. Nothing
+here is a flag day: a v0.6.0 node and a v0.5.2 node exchange frames normally.
+
+**An identity can be more than one device.** A signed identity document names
+every device key under one master; a device that holds nothing can be named
+into a family and adopt the document that names it; a linked device is served
+the history that predates it, in slices when one envelope no longer fits.
+Revocation retires a key and leaves a tombstone that survives a merge, so an
+older copy of the document cannot resurrect a device that was removed. The
+merge is a union in both directions — wholesale adoption used to roll delegated
+keys back.
+
+**A peer may ask not to be a DHT service candidate.** `cap_flags` gained
+`NO_DHT_SERVICE`, advertised from `[dht] participate`. The bit is NEGATIVE on
+purpose: a node built before it advertises no flag and is read as willing, so a
+mixed network keeps behaving as it did. A peer that declines stays in
+everyone's routing table — the table is also the answer to "do I know this
+node", and evicting it would make it unreachable, which is the opposite of what
+it asked for. `veil_dht_no_service_skips_total` counts the candidate slots it
+is passed over for, because a mechanism nobody can measure is one nobody can
+tell from a mechanism that silently does nothing.
+
+A defect found only by running it live: the bookkeeping that opens a session
+inserted `Contact::new(peer, "")` through the TRUSTED path, which carries
+defaults, so it erased the capabilities the handshake had just stamped a moment
+earlier. `discovery_mode` had been losing the same argument since long before
+this branch — a peer that asked not to appear in FIND_NODE answers reappeared
+in them on every session open. Contacts now carry `caps_known`, and an insert
+that states nothing keeps what is already known.
+
+**The mailbox serves a device's own box**, drains oldest-first across both
+boxes rather than starving one, gives every await inside a PUT a deadline — one
+deposit that never returned used to wedge every other one — and stops
+destroying a sender it could not resolve.
+
+### Fixed
+
+- Compaction waited on a lock it held itself; the shutdown chain was protected
+  against exceptions but not against hangs.
+- The hygiene gate had been failing at its first step since 2026-08-14, and
+  behind it the TEST build did not compile in three crates: a handshake
+  parameter and two struct fields added by the work above never reached the
+  call sites in test code. An FFI entry point reached production the same way —
+  it reads the node config through the OPTIONAL `veil-cfg` dependency and
+  carried no feature gate, so it compiled only because every consumer happens
+  to turn that feature on.
+- `h2` to 0.4.16 for RUSTSEC-2026-0258. It arrives through the DNS resolver in
+  `veil-bootstrap`, so it is linked into every client, not only into paths that
+  speak HTTP.
+- A test waited for the admin socket's PATH to appear when what it needed was a
+  connection to be accepted; `bind(2)` creates the path and `listen(2)` is what
+  makes a connect succeed.
+
 ## v0.5.2 — 2026-08-13
 
 **A checkout without the prebuilt call engine now builds.** `veil_media`'s
