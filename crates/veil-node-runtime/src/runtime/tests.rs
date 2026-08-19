@@ -777,6 +777,7 @@ async fn mobility_black_holed_bootstrap_session_reaps_and_redials() {
         None,
         &[],
         false,
+        true, // dht_service: a test node serves, like any default node
         None,
         None,
         None,
@@ -843,6 +844,7 @@ async fn mobility_black_holed_bootstrap_session_reaps_and_redials() {
         None,
         &[],
         false,
+        true, // dht_service: a test node serves, like any default node
         None,
         None,
         None,
@@ -1411,6 +1413,7 @@ pub fn verify_remote_peer_identity_reports_mismatch_readably() {
             session_id: [0u8; 32],
         },
         remote_discovery_mode: veil_cfg::DiscoveryMode::Public,
+        remote_dht_service: true,
         supports_realtime_datagrams: false,
         udp_reflector_port: None,
         shared_udp_reflectors: Vec::new(),
@@ -1451,6 +1454,7 @@ pub fn verify_remote_peer_identity_reports_nonce_mismatch_readably() {
             session_id: [0u8; 32],
         },
         remote_discovery_mode: veil_cfg::DiscoveryMode::Public,
+        remote_dht_service: true,
         supports_realtime_datagrams: false,
         udp_reflector_port: None,
         shared_udp_reflectors: Vec::new(),
@@ -1544,6 +1548,7 @@ where
         None,
         &[],
         false,
+        true, // dht_service: a test node serves, like any default node
         None,
         None, // P-Net: no network gate in this fixture
         None, // S3: no peer_observed_addr in this fixture
@@ -1782,6 +1787,11 @@ async fn bootstrap_find_node_contacts_added_to_dht() {
         node_id: discovered_ann.node_id,
         transport: discovered_ann.transport.clone(),
         discovery_mode: 0,
+        // Learned from a signed announcement, not from a handshake: nobody
+        // stated capabilities, so it serves (the bit only ever asks for less)
+        // and `caps_known` stays false so a later handshake can speak.
+        no_dht_service: false,
+        caps_known: false,
     };
 
     // Spawn a mock session that answers FindNodeV2 → node_ids and

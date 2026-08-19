@@ -454,12 +454,12 @@ impl IdentityDocument {
                 let r = RevokedDevice::decode(buf, &mut pos)?;
                 // Strictly ascending device_ids: one canonical encoding per
                 // set, duplicates impossible by construction.
-                if let Some(p) = prev {
-                    if r.device_id <= p {
-                        return Err(ProtoError::Malformed(
-                            "identity_document: revoked_devices not strictly ascending".into(),
-                        ));
-                    }
+                if let Some(p) = prev
+                    && r.device_id <= p
+                {
+                    return Err(ProtoError::Malformed(
+                        "identity_document: revoked_devices not strictly ascending".into(),
+                    ));
                 }
                 prev = Some(r.device_id);
                 // A key both live and revoked is a contradiction, not a merge

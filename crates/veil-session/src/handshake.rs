@@ -2072,6 +2072,7 @@ mod tests {
             None,
             &[],
             false,
+            true, // dht_service: a test node serves, like any default node
             None,
             None, // P-Net: no network gate in test fixture
             None, // S3: no peer_observed_addr in test fixture
@@ -2109,6 +2110,7 @@ mod tests {
                 None, // no sovereign context: no proof will be exchanged
                 &[],
                 false,
+                true, // dht_service: a test node serves, like any default node
                 None,
                 None,
                 None,
@@ -2132,6 +2134,7 @@ mod tests {
                 None,
                 &[],
                 false,
+                true, // dht_service: a test node serves, like any default node
                 None,
                 None,
                 None,
@@ -2174,6 +2177,7 @@ mod tests {
             None,
             &[],
             false,
+            true, // dht_service: a test node serves, like any default node
             None,
             None,
             peer_observed_addr,
@@ -2208,6 +2212,7 @@ mod tests {
             None,
             &[],
             true,
+            true, // dht_service: a test node serves, like any default node
             None,
             None, // P-Net: no network gate in test fixture
             None, // S3: no peer_observed_addr in test fixture
@@ -2480,6 +2485,7 @@ mod tests {
                 Some(ctx),
                 &[],
                 false,
+                true, // dht_service: a test node serves, like any default node
                 None,
                 None, // P-Net: no network gate in test fixture
                 None, // S3: no peer_observed_addr in test fixture
@@ -2511,6 +2517,7 @@ mod tests {
                 Some(ctx),
                 &[],
                 false,
+                true, // dht_service: a test node serves, like any default node
                 None,
                 None, // P-Net: no network gate in test fixture
                 None, // S3: no peer_observed_addr in test fixture
@@ -2632,6 +2639,7 @@ mod tests {
                 Some(ctx),
                 &[],
                 false,
+                true, // dht_service: a test node serves, like any default node
                 None,
                 None, // P-Net: no network gate in test fixture
                 None, // S3: no peer_observed_addr in test fixture
@@ -2663,6 +2671,7 @@ mod tests {
                 Some(ctx),
                 &[],
                 false,
+                true, // dht_service: a test node serves, like any default node
                 None,
                 None, // P-Net: no network gate in test fixture
                 None, // S3: no peer_observed_addr in test fixture
@@ -2756,6 +2765,7 @@ mod tests {
                 Some(ctx),
                 &[],
                 false,
+                true, // dht_service: a test node serves, like any default node
                 None,
                 None, // P-Net: no network gate in test fixture
                 None, // S3: no peer_observed_addr in test fixture
@@ -2813,6 +2823,7 @@ mod tests {
                 None,
                 &[],
                 false,
+                true, // dht_service: a test node serves, like any default node
                 None,
                 None, // P-Net: no network gate in test fixture
                 None, // S3: no peer_observed_addr in test fixture
@@ -2903,6 +2914,7 @@ mod tests {
                 None,
                 &[],
                 false,
+                true, // dht_service: a test node serves, like any default node
                 None,
                 None, // P-Net: no network gate in test fixture
                 None, // S3: no peer_observed_addr in test fixture
@@ -2928,6 +2940,7 @@ mod tests {
                     None,
                     &[],
                     false,
+                    true, // dht_service: a test node serves, like any default node
                     None,
                     None, // P-Net: no network gate in test fixture
                     None, // S3: no peer_observed_addr in test fixture
@@ -2993,6 +3006,7 @@ mod tests {
                 None,
                 &[],
                 false,
+                true, // dht_service: a test node serves, like any default node
                 None,
                 None, // P-Net: no network gate in test fixture
                 None, // S3: no peer_observed_addr in test fixture
@@ -3018,6 +3032,7 @@ mod tests {
                     None,
                     &[],
                     false,
+                    true, // dht_service: a test node serves, like any default node
                     None,
                     None, // P-Net: no network gate in test fixture
                     None, // S3: no peer_observed_addr in test fixture
@@ -3124,6 +3139,7 @@ mod tests {
                 None,
                 &[],
                 false,
+                true, // dht_service: a test node serves, like any default node
                 None,
                 None,
                 None,
@@ -3148,6 +3164,7 @@ mod tests {
                     None,
                     &[],
                     false,
+                    true, // dht_service: a test node serves, like any default node
                     None,
                     None,
                     None,
@@ -3266,6 +3283,7 @@ mod tests {
                 Some(ctx),
                 &[],
                 false,
+                true, // dht_service: a test node serves, like any default node
                 None,
                 None, // P-Net: no network gate in test fixture
                 None, // S3: no peer_observed_addr in test fixture
@@ -3297,6 +3315,7 @@ mod tests {
                 Some(ctx),
                 &[],
                 false,
+                true, // dht_service: a test node serves, like any default node
                 None,
                 None, // P-Net: no network gate in test fixture
                 None, // S3: no peer_observed_addr in test fixture

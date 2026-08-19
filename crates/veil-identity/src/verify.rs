@@ -288,8 +288,13 @@ fn verify_document_inner(
             &doc.node_id,
             &revoked.device_id,
         );
-        verify_sig_raw(doc.master_algo, &doc.master_pubkey, &msg, &revoked.master_sig)
-            .map_err(|_| VerifyError::RevocationSigInvalid { idx })?;
+        verify_sig_raw(
+            doc.master_algo,
+            &doc.master_pubkey,
+            &msg,
+            &revoked.master_sig,
+        )
+        .map_err(|_| VerifyError::RevocationSigInvalid { idx })?;
     }
 
     // 5. sig_key_idx bounds.

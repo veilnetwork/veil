@@ -296,9 +296,14 @@ impl RuntimeMailboxCrypto {
         )
     }
 
-    /// Seal `data` for `recipient_node_id`'s `(app_id, endpoint_id)` into a
-    /// mailbox blob (the caller owns the binding — same fields the live onion
-    /// `APP_DELIVER_AUTH` path binds).
+    /// [`Self::seal_for`] with the audience left implicit.
+    ///
+    /// Test-only, and that is the whole story: once an identity could address
+    /// its own devices, every production caller had an audience worth stating
+    /// and moved to `seal_for`. Keeping the shorthand compiled into the
+    /// library made it dead code the lint had to be told to ignore; keeping it
+    /// behind `cfg(test)` says what it is instead.
+    #[cfg(test)]
     pub async fn seal(
         &self,
         recipient_node_id: [u8; 32],
@@ -316,7 +321,10 @@ impl RuntimeMailboxCrypto {
         .await
     }
 
-    /// [`seal`], with the audience said out loud. See [`MailboxAudience`].
+    /// Seal `data` for `recipient_node_id`'s `(app_id, endpoint_id)` into a
+    /// mailbox blob — the caller owns the binding, the same fields the live
+    /// onion `APP_DELIVER_AUTH` path binds — with the audience said out loud.
+    /// See [`MailboxAudience`].
     pub async fn seal_for(
         &self,
         audience: MailboxAudience,

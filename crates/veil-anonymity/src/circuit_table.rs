@@ -250,7 +250,11 @@ impl Inner {
     /// Unlink one circuit from ALL indices. The single removal path — explicit
     /// teardown, periodic gc and install-pressure reclaim all go through it so
     /// the three indices can never drift apart.
-    fn detach(&mut self, prev_link: &Link, cid_in: CircuitId) -> Option<std::sync::Arc<CircuitState>> {
+    fn detach(
+        &mut self,
+        prev_link: &Link,
+        cid_in: CircuitId,
+    ) -> Option<std::sync::Arc<CircuitState>> {
         let state = self.fwd.remove(&(*prev_link, cid_in))?;
         if let Some(nl) = state.next_link {
             self.bwd.remove(&(nl, state.circuit_id_out));
@@ -657,8 +661,14 @@ mod tests {
         // Both occupants idle past the TTL → the new install evicts + lands.
         let s = t.install(&inst(3, 0, 1), prev, None, 1000 + 300).unwrap();
         assert_eq!(s.circuit_id_in, 3);
-        assert!(t.lookup_forward(&prev, 1).is_none(), "expired occupant evicted");
-        assert!(t.lookup_forward(&prev, 2).is_none(), "expired occupant evicted");
+        assert!(
+            t.lookup_forward(&prev, 1).is_none(),
+            "expired occupant evicted"
+        );
+        assert!(
+            t.lookup_forward(&prev, 2).is_none(),
+            "expired occupant evicted"
+        );
         assert_eq!(t.len(), 1);
     }
 
@@ -714,7 +724,10 @@ mod tests {
         // one survives, and the install lands.
         t.install(&inst(3, 0, 1), prev, None, 1005 + SERVED_LINGER_SECS)
             .unwrap();
-        assert!(t.lookup_forward(&prev, 1).is_none(), "served slot reclaimed");
+        assert!(
+            t.lookup_forward(&prev, 1).is_none(),
+            "served slot reclaimed"
+        );
         assert!(
             t.lookup_forward(&prev, 2).is_some(),
             "unserved live circuit must never be pressure-evicted"

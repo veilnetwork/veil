@@ -6028,8 +6028,7 @@ fn a_delegated_device_may_announce_its_own_transport_rotation() {
         "the device address is not the identity's node_id — that is the case"
     );
 
-    let mut runner =
-        make_migration_test_runner(identity_node_id, Some(STANDARD.encode(device_pk)));
+    let mut runner = make_migration_test_runner(identity_node_id, Some(STANDARD.encode(device_pk)));
 
     let new_uri = "obfs4-tcp://9.9.9.9:7821".to_owned();
     let now = std::time::SystemTime::now()
@@ -6071,8 +6070,7 @@ fn a_foreign_key_cannot_announce_a_rotation_for_the_identity() {
     let identity_node_id = [0x5Au8; 32];
 
     // The session attested the DEVICE's key; the stranger signs anyway.
-    let mut runner =
-        make_migration_test_runner(identity_node_id, Some(STANDARD.encode(device_pk)));
+    let mut runner = make_migration_test_runner(identity_node_id, Some(STANDARD.encode(device_pk)));
 
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
