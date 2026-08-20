@@ -918,6 +918,17 @@ pub struct FrameDispatcher {
     /// Bounded to `MAX_ROUTE_ORIGIN_SEQ_CACHE`; the oldest entry is evicted
     /// when full, which is also the least useful one to keep.
     pub route_forward_last: Arc<Mutex<HashMap<NodeIdBytes, (Instant, u8)>>>,
+    /// What we last pushed to a peer on session establish, and when.
+    ///
+    /// `push_owned_dht_records` fires on EVERY session open, including inbound
+    /// ones — so the remote side decides how often it happens. A phone on a
+    /// bad link reconnects and gets the whole dump again, unchanged, every
+    /// time. The digest is of the records we would send; if it matches and the
+    /// peer's copies have not had time to expire, sending them again tells it
+    /// nothing it does not already have.
+    ///
+    /// Keyed by peer and bounded like the other gossip maps.
+    pub owned_push_last: Arc<Mutex<HashMap<NodeIdBytes, (Instant, u64)>>>,
     /// Monotonic sequence counter for locally-originated route announcements.
     pub announce_seq: Arc<AtomicU32>,
     /// Listen transports of this node — included in RouteResponse.
@@ -1942,6 +1953,7 @@ pub fn make_test_dispatcher(role: NodeRole) -> FrameDispatcher {
         ))),
         route_origin_seq: Arc::new(Mutex::new(HashMap::new())),
         route_forward_last: Arc::new(Mutex::new(HashMap::new())),
+        owned_push_last: Arc::new(Mutex::new(HashMap::new())),
         announce_seq: Arc::new(AtomicU32::new(0)),
         listen_transports: Arc::new(RwLock::new(vec![])),
         own_external_addrs: Arc::new(RwLock::new(vec![])),
@@ -2837,6 +2849,7 @@ mod tests {
             loss_tracker: Arc::new(veil_routing::loss_tracker::LossTracker::new()),
             route_origin_seq: Arc::new(Mutex::new(HashMap::new())),
             route_forward_last: Arc::new(Mutex::new(HashMap::new())),
+            owned_push_last: Arc::new(Mutex::new(HashMap::new())),
             // PoW solver resource limits — permissive in tests.
             pow_solver_semaphore: Arc::new(tokio::sync::Semaphore::new(
                 veil_proto::budget::MAX_CONCURRENT_POW_SOLVERS,

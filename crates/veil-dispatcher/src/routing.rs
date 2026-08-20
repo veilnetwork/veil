@@ -1302,6 +1302,8 @@ impl FrameDispatcher {
         let local_id = self.local_node_id;
         let keys = self.dht.stored_key_ids();
         let mut pushed = 0usize;
+        let mut frames: Vec<Vec<u8>> = Vec::new();
+        let mut digest = blake3::Hasher::new();
         for key in keys {
             // The key may have been evicted between the key scan and here.
             let Some(value) = self.dht.peek_value(&key) else {
@@ -1342,8 +1344,56 @@ impl FrameDispatcher {
             let mut frame = Vec::with_capacity(HEADER_SIZE + body.len());
             frame.extend_from_slice(&encode_header(&hdr));
             frame.extend_from_slice(&body);
-            wlock!(reg_arc).send_to(&new_peer, veil_proto::header::priority::BACKGROUND, frame);
+            // Collected rather than sent as we go: what to send has to be
+            // known in full before we can ask whether it is anything new.
+            digest.update(&key);
+            digest.update(&(frame.len() as u32).to_be_bytes());
+            frames.push(frame);
             pushed += 1;
+        }
+
+        // Nothing new for a peer that already has it.
+        //
+        // This runs on EVERY session open, inbound included, so how often it
+        // happens is the remote side's decision, not ours: a phone on a bad
+        // link reconnects and takes the same dump again. The window is the
+        // republish interval, because that is how long the peer's copies live
+        // without a refresh — inside it, re-sending an unchanged set tells the
+        // peer nothing it does not already have.
+        let fingerprint = u64::from_be_bytes(
+            digest.finalize().as_bytes()[..8]
+                .try_into()
+                .expect("8 bytes of a 32-byte hash"),
+        );
+        let window = std::time::Duration::from_secs(self.dht.dht_config().republish_interval_secs);
+        if pushed > 0 && !window.is_zero() {
+            let now = Instant::now();
+            let mut last = lock!(self.owned_push_last);
+            if let Some(&(when, seen)) = last.get(&new_peer)
+                && seen == fingerprint
+                && now.duration_since(when) < window
+            {
+                if let Some(m) = &self.metrics {
+                    m.inc_owned_push_suppressed();
+                }
+                return;
+            }
+            // Bounded like the other per-peer maps: evict the oldest, whose
+            // copy on the far side is closest to expiring anyway.
+            if last.len() >= veil_proto::budget::MAX_ROUTE_ORIGIN_SEQ_CACHE
+                && !last.contains_key(&new_peer)
+                && let Some(&oldest) = last
+                    .iter()
+                    .min_by_key(|(_, (when, _))| *when)
+                    .map(|(k, _)| k)
+            {
+                last.remove(&oldest);
+            }
+            last.insert(new_peer, (now, fingerprint));
+        }
+
+        for frame in frames {
+            wlock!(reg_arc).send_to(&new_peer, veil_proto::header::priority::BACKGROUND, frame);
         }
         if pushed > 0 {
             self.logger.info(
@@ -3086,6 +3136,176 @@ mod push_owned_tests {
         assert!(
             rx.try_recv().is_ok(),
             "a peer we have never heard from has refused nothing"
+        );
+    }
+
+    /// The same peer, reconnecting with nothing changed, is not dumped on again.
+    ///
+    /// This runs on EVERY session open, inbound included, so the remote side
+    /// decides how often it happens: a phone on a bad link reconnects and used
+    /// to take the identical dump every time. Break-check: remove the
+    /// fingerprint gate in `push_owned_dht_records` and the second call sends
+    /// again.
+    #[test]
+    fn an_unchanged_record_set_is_not_pushed_to_the_same_peer_twice() {
+        let (sk, _pk, local_id) = new_signer();
+        let mut disp = make_test_dispatcher(NodeRole::Core);
+        disp.local_node_id = local_id;
+        disp.dht = Arc::new(KademliaService::with_config(
+            local_id,
+            veil_dht::DhtRuntimeConfig {
+                allow_unsigned_store: true,
+                ..Default::default()
+            },
+        ));
+
+        let entry = AppEndpointEntry {
+            node_id: local_id,
+            app_id: [0xA5u8; 32],
+            endpoint_id: 7,
+            gateway_node_id: None,
+            epoch: 1,
+            expires_at: u64::MAX / 2,
+            max_concurrent_streams: 4,
+            protocol_version: 1,
+            bandwidth_hint_kbps: 64,
+        };
+        let key = app_endpoint_key(&entry.node_id, &entry.app_id, entry.endpoint_id);
+        disp.dht
+            .handle_store(StorePayload::unsigned(
+                key,
+                entry.encode_for_dht_signed(&sk),
+            ))
+            .unwrap();
+
+        let reg = Arc::new(RwLock::new(SessionTxRegistry::new()));
+        let peer: [u8; 32] = [0x11; 32];
+        let mut rx = reg.write().unwrap().register(peer);
+        let disp = Arc::new(disp);
+
+        Arc::clone(&disp).push_owned_dht_records(peer, &reg);
+        assert!(
+            rx.try_recv().is_ok(),
+            "the first push must reach a peer that has nothing"
+        );
+        while rx.try_recv().is_ok() {}
+
+        Arc::clone(&disp).push_owned_dht_records(peer, &reg);
+        assert!(
+            rx.try_recv().is_err(),
+            "the same set, to the same peer, inside the republish window is \
+             news to nobody"
+        );
+    }
+
+    /// A CHANGED set goes out at once, whatever the window says.
+    ///
+    /// The gate is on repetition, not on the clock: a record the peer has
+    /// never seen must not wait for a window to expire. Break-check: key the
+    /// map by peer alone, ignoring the fingerprint, and this fails.
+    #[test]
+    fn a_changed_record_set_is_pushed_immediately() {
+        let (sk, _pk, local_id) = new_signer();
+        let mut disp = make_test_dispatcher(NodeRole::Core);
+        disp.local_node_id = local_id;
+        disp.dht = Arc::new(KademliaService::with_config(
+            local_id,
+            veil_dht::DhtRuntimeConfig {
+                allow_unsigned_store: true,
+                ..Default::default()
+            },
+        ));
+
+        let mut entry = AppEndpointEntry {
+            node_id: local_id,
+            app_id: [0xA5u8; 32],
+            endpoint_id: 7,
+            gateway_node_id: None,
+            epoch: 1,
+            expires_at: u64::MAX / 2,
+            max_concurrent_streams: 4,
+            protocol_version: 1,
+            bandwidth_hint_kbps: 64,
+        };
+        let key = app_endpoint_key(&entry.node_id, &entry.app_id, entry.endpoint_id);
+        disp.dht
+            .handle_store(StorePayload::unsigned(
+                key,
+                entry.encode_for_dht_signed(&sk),
+            ))
+            .unwrap();
+
+        let reg = Arc::new(RwLock::new(SessionTxRegistry::new()));
+        let peer: [u8; 32] = [0x11; 32];
+        let mut rx = reg.write().unwrap().register(peer);
+        let disp = Arc::new(disp);
+
+        Arc::clone(&disp).push_owned_dht_records(peer, &reg);
+        while rx.try_recv().is_ok() {}
+
+        // A second record the peer has never seen.
+        entry.endpoint_id = 8;
+        let key2 = app_endpoint_key(&entry.node_id, &entry.app_id, entry.endpoint_id);
+        disp.dht
+            .handle_store(StorePayload::unsigned(
+                key2,
+                entry.encode_for_dht_signed(&sk),
+            ))
+            .unwrap();
+
+        Arc::clone(&disp).push_owned_dht_records(peer, &reg);
+        assert!(
+            rx.try_recv().is_ok(),
+            "a set the peer has not seen must go out without waiting"
+        );
+    }
+
+    /// One peer's push must not silence another's.
+    #[test]
+    fn the_push_memory_does_not_leak_between_peers() {
+        let (sk, _pk, local_id) = new_signer();
+        let mut disp = make_test_dispatcher(NodeRole::Core);
+        disp.local_node_id = local_id;
+        disp.dht = Arc::new(KademliaService::with_config(
+            local_id,
+            veil_dht::DhtRuntimeConfig {
+                allow_unsigned_store: true,
+                ..Default::default()
+            },
+        ));
+
+        let entry = AppEndpointEntry {
+            node_id: local_id,
+            app_id: [0xA5u8; 32],
+            endpoint_id: 7,
+            gateway_node_id: None,
+            epoch: 1,
+            expires_at: u64::MAX / 2,
+            max_concurrent_streams: 4,
+            protocol_version: 1,
+            bandwidth_hint_kbps: 64,
+        };
+        let key = app_endpoint_key(&entry.node_id, &entry.app_id, entry.endpoint_id);
+        disp.dht
+            .handle_store(StorePayload::unsigned(
+                key,
+                entry.encode_for_dht_signed(&sk),
+            ))
+            .unwrap();
+
+        let reg = Arc::new(RwLock::new(SessionTxRegistry::new()));
+        let first: [u8; 32] = [0x11; 32];
+        let second: [u8; 32] = [0x22; 32];
+        let mut rx1 = reg.write().unwrap().register(first);
+        let mut rx2 = reg.write().unwrap().register(second);
+        let disp = Arc::new(disp);
+
+        Arc::clone(&disp).push_owned_dht_records(first, &reg);
+        assert!(rx1.try_recv().is_ok());
+        Arc::clone(&disp).push_owned_dht_records(second, &reg);
+        assert!(
+            rx2.try_recv().is_ok(),
+            "a peer that has never been pushed to must be pushed to"
         );
     }
 

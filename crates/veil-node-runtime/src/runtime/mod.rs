@@ -2163,6 +2163,7 @@ impl NodeRuntime {
             // per-origin sequence monotonicity cache.
             route_origin_seq: Arc::new(Mutex::new(std::collections::HashMap::new())),
             route_forward_last: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            owned_push_last: Arc::new(Mutex::new(std::collections::HashMap::new())),
             // PoW solver resource limits.
             pow_solver_semaphore: Arc::new(tokio::sync::Semaphore::new(
                 veil_proto::budget::MAX_CONCURRENT_POW_SOLVERS,
