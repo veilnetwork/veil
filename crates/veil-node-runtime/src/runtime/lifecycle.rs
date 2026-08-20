@@ -1197,6 +1197,9 @@ impl NodeRuntime {
             // in-flight per-peer counters (and warm windows) are preserved.
             loss_tracker: Arc::clone(&self.dispatcher.loss_tracker),
             route_origin_seq: Arc::clone(&self.dispatcher.route_origin_seq),
+            // Shared, not fresh: a rebuilt dispatcher that forgot what it had
+            // already relayed would forward the whole plane again.
+            route_forward_last: Arc::clone(&self.dispatcher.route_forward_last),
             pow_solver_semaphore: Arc::clone(&self.dispatcher.pow_solver_semaphore),
             pow_active_difficulty: Arc::clone(&self.dispatcher.pow_active_difficulty),
             pow_challenge_seen: Arc::clone(&self.dispatcher.pow_challenge_seen),

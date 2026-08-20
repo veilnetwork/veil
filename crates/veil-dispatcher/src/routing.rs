@@ -361,9 +361,10 @@ impl FrameDispatcher {
             raw_score
         };
         wlock!(self.route_cache).insert(p.origin_node_id, p.via_node_id, score, p.hop_count);
-        // Forward if TTL allows.
+        // Forward if TTL allows, and if this is NEWS rather than repetition.
         if p.ttl > 0
             && p.hop_count < self.max_gossip_hops
+            && self.forward_is_worth_it(p.origin_node_id, p.hop_count)
             && let Some(frame) = self.build_announce_forward(&p)
             && let Some(reg) = &self.session_tx_registry
         {
@@ -1583,6 +1584,65 @@ impl FrameDispatcher {
     // ── Private routing helpers ──────────────────────────────────────────────
 
     /// Build a forwarded ROUTE_ANNOUNCE re-signed by the local node.
+    /// Should we relay gossip about `origin` again, or is this a repeat?
+    ///
+    /// Forwarding rewrites `via_node_id` to this node, so everything we relay
+    /// about one origin refreshes ONE entry on every downstream peer. Keeping
+    /// that entry alive needs one relay per cache TTL; measured on a live
+    /// testnet we were sending six, and forwarded announcements were 85% of
+    /// all routing traffic. The directly-announced plane, by contrast, came
+    /// out at 1.3 refreshes per TTL — correctly paced, and left alone.
+    ///
+    /// Three things pass immediately, because they are news and not repetition:
+    ///
+    /// * an origin we have never relayed (or have not relayed in a full
+    ///   window, so downstream entries are near expiry);
+    /// * a SHORTER path than the one we last relayed — holding an improvement
+    ///   back would leave peers scoring a worse route until the window ends;
+    /// * everything, if the route cache has no TTL to divide (`ZERO`), because
+    ///   then nothing expires and the premise does not hold.
+    ///
+    /// The window is half the cache TTL, taken FROM the cache rather than
+    /// written beside it: two refreshes per lifetime is the same margin the
+    /// direct plane already has, and a constant here would starve the cache
+    /// the day the TTL shrinks.
+    ///
+    /// `RouteWithdraw` is deliberately NOT throttled. A withdrawal is not a
+    /// refresh — it is the one message whose delay is felt as a black hole.
+    fn forward_is_worth_it(&self, origin: [u8; 32], hop_count: u8) -> bool {
+        let ttl = rlock!(self.route_cache).ttl();
+        if ttl.is_zero() {
+            return true;
+        }
+        let window = ttl / 2;
+        let now = Instant::now();
+        let mut last = lock!(self.route_forward_last);
+        match last.get(&origin) {
+            Some(&(when, relayed_hops))
+                if now.duration_since(when) < window && hop_count >= relayed_hops =>
+            {
+                if let Some(m) = &self.metrics {
+                    m.inc_gossip_forward_suppressed();
+                }
+                return false;
+            }
+            _ => {}
+        }
+        // Bounded the same way `route_origin_seq` is: evict the oldest, which
+        // is also the entry whose downstream copy is closest to expiry anyway.
+        if last.len() >= veil_proto::budget::MAX_ROUTE_ORIGIN_SEQ_CACHE
+            && !last.contains_key(&origin)
+            && let Some(&oldest) = last
+                .iter()
+                .min_by_key(|(_, (when, _))| *when)
+                .map(|(k, _)| k)
+        {
+            last.remove(&oldest);
+        }
+        last.insert(origin, (now, hop_count));
+        true
+    }
+
     fn build_announce_forward(&self, received: &RouteAnnouncePayload) -> Option<Vec<u8>> {
         let key = self.crypto.local_signing_key.as_ref()?;
         let seq = self.announce_seq.fetch_add(1, Ordering::Relaxed);
@@ -2812,6 +2872,83 @@ pub enum SigResult {
     Invalid,
     /// The peer's public key is not in the local cache.
     UnknownKey,
+}
+
+#[cfg(test)]
+mod gossip_forward_throttle_tests {
+    //! What the forward throttle must let through, and what it must stop.
+    //!
+    //! Measured on a live testnet before it existed: hop-1 announcements
+    //! refreshed each downstream entry 1.3 times per route-cache TTL, which is
+    //! exactly what keeping it alive needs; forwarded hop-2 announcements
+    //! refreshed theirs 6.0 times and were 85% of all routing traffic.
+    //! Forwarding rewrites `via` to this node, so everything relayed about one
+    //! origin lands in ONE downstream cache slot — relaying it six times
+    //! refreshes that one slot six times.
+
+    use crate::{NodeRole, make_test_dispatcher};
+
+    const ORIGIN: [u8; 32] = [0x42; 32];
+    const OTHER: [u8; 32] = [0x43; 32];
+
+    /// The first relay of an origin always goes out.
+    #[test]
+    fn news_about_an_unseen_origin_is_relayed() {
+        let d = make_test_dispatcher(NodeRole::Core);
+        assert!(
+            d.forward_is_worth_it(ORIGIN, 1),
+            "an origin we have never relayed is news"
+        );
+    }
+
+    /// The second relay of the same origin at the same distance is repetition.
+    ///
+    /// Break-check: delete the window check in `forward_is_worth_it` and this
+    /// goes green on the second call.
+    #[test]
+    fn relaying_the_same_origin_again_inside_the_window_is_suppressed() {
+        let d = make_test_dispatcher(NodeRole::Core);
+        assert!(d.forward_is_worth_it(ORIGIN, 1));
+        assert!(
+            !d.forward_is_worth_it(ORIGIN, 1),
+            "the downstream entry we just refreshed does not need refreshing again"
+        );
+        assert!(
+            !d.forward_is_worth_it(ORIGIN, 2),
+            "a LONGER path is not news either"
+        );
+    }
+
+    /// A shorter path is news, and must not wait out the window.
+    ///
+    /// Holding an improvement back leaves every downstream peer scoring a
+    /// worse route until the window ends. Break-check: drop the
+    /// `hop_count >= relayed_hops` clause and this fails.
+    #[test]
+    fn a_shorter_path_is_relayed_immediately() {
+        let d = make_test_dispatcher(NodeRole::Core);
+        assert!(d.forward_is_worth_it(ORIGIN, 3));
+        assert!(
+            d.forward_is_worth_it(ORIGIN, 2),
+            "a shorter path to the same origin is news, not repetition"
+        );
+        assert!(
+            d.forward_is_worth_it(ORIGIN, 1),
+            "and so is a shorter one again"
+        );
+    }
+
+    /// The throttle is per origin: one origin's traffic must not silence
+    /// another's. Keying it any wider would suppress real news.
+    #[test]
+    fn the_throttle_does_not_leak_between_origins() {
+        let d = make_test_dispatcher(NodeRole::Core);
+        assert!(d.forward_is_worth_it(ORIGIN, 1));
+        assert!(
+            d.forward_is_worth_it(OTHER, 1),
+            "a different origin has its own downstream entry"
+        );
+    }
 }
 
 #[cfg(test)]
