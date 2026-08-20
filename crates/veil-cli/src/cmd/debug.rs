@@ -13,6 +13,10 @@ use veil_cfg::{self, ConfigError, Result};
 use veil_node_runtime::admin::{
     self as node, ADMIN_PROTOCOL_VERSION, AdminCommand, AdminRequest, AdminResponse, AdminResult,
 };
+use veil_proto::family::{
+    AppMsg, ControlMsg, DeliveryMsg, DiagMsg, DiscoveryMsg, FrameFamily, LocalAppMsg, MeshMsg,
+    PexMsg, RelayChainMsg, RoutingMsg, SessionMsg, TunnelMsg,
+};
 use veil_transport::BoxIoStream;
 
 pub fn handle_debug_command(config_arg: Option<&Path>, command: DebugCommand) -> Result<()> {
@@ -409,114 +413,53 @@ fn handle_debug_capture(
     })
 }
 
-/// Return a short human-readable name for a frame family number.
-fn family_name(family: u8) -> &'static str {
-    match family {
-        0 => "Session",
-        1 => "Control",
-        2 => "Discovery",
-        3 => "Delivery",
-        4 => "App",
-        5 => "Mesh",
-        6 => "LocalApp",
-        7 => "Tunnel",
-        8 => "Routing",
-        9 => "Diag",
-        10 => "Budget",
-        11 => "PeerExchange",
-        _ => "Unknown",
+/// Human-readable frame family name, taken from the protocol definition.
+///
+/// This used to be a hand-copied `match` and it had drifted: family 10 was
+/// still labelled `Budget` long after the wire renamed it to `RelayChain`, so
+/// a capture of onion circuit cells read as budget accounting. The enum's own
+/// doc promises that "a new family cannot be added without a name" — which is
+/// true of `FrameFamily::label()`, where the compiler checks exhaustiveness,
+/// and false of any second copy of it. So there is no second copy any more.
+fn family_name(family: u8) -> String {
+    match FrameFamily::try_from(family) {
+        Ok(fam) => fam.label().to_owned(),
+        Err(_) => format!("unknown({family})"),
     }
 }
 
-/// Return a short human-readable name for a msg_type within a family.
-fn msg_type_name(family: u8, msg_type: u16) -> &'static str {
-    match (family, msg_type) {
-        // Session
-        (0, 0) => "Hello",
-        (0, 1) => "Identity",
-        (0, 2) => "Capabilities",
-        (0, 3) => "KeyAgreement",
-        (0, 4) => "Confirm",
-        (0, 5) => "Attach",
-        (0, 6) => "Detach",
-        (0, 7) => "Keepalive",
-        (0, 8) => "RekeyInit",
-        (0, 9) => "RekeyAck",
-        (0, 10) => "MlKemRekeyEk",
-        (0, 11) => "MlKemRekeyAck",
-        (0, 12) => "Ticket",
-        (0, 13) => "SleepAdvert",
-        (0, 14) => "Padding",
-        // Control
-        (1, 0) => "Ping",
-        (1, 1) => "Pong",
-        (1, 2) => "NeighborOffer",
-        (1, 3) => "RouteProbe",
-        (1, 4) => "RouteReply",
-        (1, 5) => "Error",
-        (1, 6) => "NatProbeReq",
-        (1, 7) => "NatProbeReply",
-        (1, 8) => "NatRelayReq",
-        (1, 0x10) => "Keepalive",
-        (1, 0x11) => "KeepaliveAck",
-        (1, 0x20) => "EpidemicBcast",
-        (1, 0x30) => "Backpressure",
-        // Discovery
-        (2, 0) => "FindNode",
-        (2, 1) => "FindValue",
-        (2, 2) => "Store",
-        (2, 3) => "Delete",
-        (2, 4) => "AnnounceAttach",
-        (2, 5) => "GetAttach",
-        (2, 6) => "GetMailboxSet",
-        (2, 7) => "GetAppEndpoint",
-        (2, 8) => "FindNodeResp",
-        (2, 9) => "FindValueResp",
-        // Delivery
-        (3, 0) => "MailboxPut",
-        (3, 1) => "MailboxFetch",
-        (3, 2) => "MailboxAck",
-        (3, 3) => "Forward",
-        (3, 4) => "DeliveryStatus",
-        (3, 5) => "MailboxReplicate",
-        (3, 6) => "MailboxFetchReplica",
-        (3, 7) => "ChunkManifest",
-        (3, 8) => "Chunk",
-        (3, 0x10) => "Transit",
-        (3, 0x11) => "RecursiveRelay",
-        // App
-        (4, 0) => "Open",
-        (4, 1) => "Close",
-        (4, 2) => "Data",
-        (4, 3) => "RtData",
-        (4, 4) => "Send",
-        (4, 5) => "Receipt",
-        (4, 6) => "WindowUpdate",
-        // Mesh
-        (5, 0) => "Forward",
-        (5, 1) => "Beacon",
-        // Routing
-        (8, 0) => "Announce",
-        (8, 1) => "Withdraw",
-        (8, 2) => "Request",
-        (8, 3) => "Response",
-        (8, 4) => "PowChallenge",
-        (8, 5) => "PowResponse",
-        (8, 6) => "PowAccept",
-        (8, 7) => "AnnounceAliased",
-        (8, 8) => "WithdrawAliased",
-        (8, 0x10) => "RecursiveQuery",
-        // Diag
-        (9, 1) => "Ping",
-        (9, 2) => "Pong",
-        (9, 3) => "TraceProbe",
-        (9, 4) => "TraceHop",
-        // PeerExchange
-        (11, 0) => "Walk",
-        (11, 1) => "Challenge",
-        (11, 2) => "Response",
-        (11, 3) => "Result",
-        _ => "?",
+/// Human-readable `msg_type` name within a family, taken from the protocol
+/// definition.
+///
+/// Every family's message enum carries `TryFrom<u16>` and derives `Debug`, so
+/// the variant name comes from the wire definition itself: a new message type
+/// is named automatically, and a new *family* fails to compile here until it
+/// is added to the match.
+fn msg_type_name(family: u8, msg_type: u16) -> String {
+    let Ok(fam) = FrameFamily::try_from(family) else {
+        return format!("?({msg_type})");
+    };
+    // Decode `msg_type` as `$ty` and print the variant name it decodes to.
+    macro_rules! named {
+        ($ty:ty) => {
+            <$ty>::try_from(msg_type)
+                .map(|m| format!("{m:?}"))
+                .unwrap_or_else(|_| format!("?({msg_type})"))
+        };
+    }
+    match fam {
+        FrameFamily::Session => named!(SessionMsg),
+        FrameFamily::Control => named!(ControlMsg),
+        FrameFamily::Discovery => named!(DiscoveryMsg),
+        FrameFamily::Delivery => named!(DeliveryMsg),
+        FrameFamily::App => named!(AppMsg),
+        FrameFamily::Mesh => named!(MeshMsg),
+        FrameFamily::LocalApp => named!(LocalAppMsg),
+        FrameFamily::Tunnel => named!(TunnelMsg),
+        FrameFamily::Routing => named!(RoutingMsg),
+        FrameFamily::Diag => named!(DiagMsg),
+        FrameFamily::RelayChain => named!(RelayChainMsg),
+        FrameFamily::PeerExchange => named!(PexMsg),
     }
 }
 
@@ -601,4 +544,60 @@ fn load_admin_socket(config_arg: Option<&Path>) -> Result<std::path::PathBuf> {
 /// Show first 8 chars of a hex node_id for compact display.
 fn short_id(hex: &str) -> &str {
     &hex[..hex.len().min(8)]
+}
+
+#[cfg(test)]
+mod capture_name_tests {
+    use super::*;
+
+    /// Every family in the protocol, so the round-trip below cannot silently
+    /// skip the one that drifted.
+    const ALL: [FrameFamily; 12] = [
+        FrameFamily::Session,
+        FrameFamily::Control,
+        FrameFamily::Discovery,
+        FrameFamily::Delivery,
+        FrameFamily::App,
+        FrameFamily::Mesh,
+        FrameFamily::LocalApp,
+        FrameFamily::Tunnel,
+        FrameFamily::Routing,
+        FrameFamily::Diag,
+        FrameFamily::RelayChain,
+        FrameFamily::PeerExchange,
+    ];
+
+    /// The row that actually drifted: family 10 is the onion relay chain, and
+    /// type 5 on it is a circuit data cell. The hand-copied table called the
+    /// family `Budget` and had no name for the type at all, so a capture of
+    /// onion traffic read as budget accounting with an unnamed message.
+    #[test]
+    fn family_ten_is_the_relay_chain() {
+        assert_eq!(family_name(10), "relay_chain");
+        assert_eq!(msg_type_name(10, 5), "CircuitData");
+    }
+
+    /// There is no second copy of the family table. Break-check: hand-write a
+    /// name for any single family in `family_name` and this goes red.
+    #[test]
+    fn every_family_names_itself_as_the_protocol_does() {
+        for fam in ALL {
+            assert_eq!(
+                family_name(fam as u8),
+                fam.label(),
+                "family {} disagrees with its protocol label",
+                fam as u8
+            );
+        }
+    }
+
+    /// Numbers the protocol does not define are reported as unknown rather
+    /// than guessed at — a capture must not invent a name for a frame this
+    /// build cannot decode.
+    #[test]
+    fn unknown_numbers_are_marked_not_guessed() {
+        assert_eq!(family_name(200), "unknown(200)");
+        assert_eq!(msg_type_name(200, 3), "?(3)");
+        assert_eq!(msg_type_name(8, 4242), "?(4242)");
+    }
 }
