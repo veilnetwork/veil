@@ -558,12 +558,21 @@ impl FrameDispatcher {
 
             // OVL1-level keepalive. Reply immediately with KeepaliveAck.
             // Keepalive/ack frames are REALTIME class (lowest queue latency).
+            //
+            // The incoming body is padding and is never read (that is what lets
+            // the sender vary it). The ack carries its OWN padding, drawn
+            // independently: an ack that mirrored the keepalive's size would
+            // make the pair correlate by length, which is the same fingerprint
+            // one layer along.
             ControlMsg::Keepalive => {
+                let pad = veil_session::keepalive_emit::keepalive_pad_body();
                 let mut hdr =
                     FrameHeader::new(FrameFamily::Control as u8, ControlMsg::KeepaliveAck as u16);
-                hdr.body_len = 0;
+                hdr.body_len = pad.len() as u32;
                 hdr.set_priority(veil_proto::header::TrafficClass::RealTime as u8);
-                DispatchResult::Response(encode_header(&hdr).to_vec())
+                let mut frame = encode_header(&hdr).to_vec();
+                frame.extend_from_slice(&pad);
+                DispatchResult::Response(frame)
             }
 
             // KeepaliveAck — the runner updates last_rx on frame receipt;
