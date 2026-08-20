@@ -177,6 +177,16 @@ pub struct RouteCache {
 }
 
 impl RouteCache {
+    /// How long an entry survives without a refresh.
+    ///
+    /// Exposed so the gossip-forward throttle can be derived FROM it rather
+    /// than guessed beside it: the throttle exists to stop re-forwarding a
+    /// route more often than keeping it alive requires, and a constant that
+    /// does not track this one would starve the cache the day the TTL shrinks.
+    pub fn ttl(&self) -> Duration {
+        self.ttl
+    }
+
     pub fn new(ttl: Duration) -> Self {
         Self {
             entries: HashMap::new(),

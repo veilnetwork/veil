@@ -342,6 +342,16 @@ pub struct NodeMetrics {
     /// drop" (quota field removed 2026-05-22 after design moved past
     /// forward-then-verify).
     unknown_origin_gossip_rejected_total: Arc<AtomicU64>,
+    /// Gossip forwards suppressed because this origin was already relayed
+    /// within half the route-cache TTL.
+    ///
+    /// Forwarding rewrites `via` to this node, so everything relayed about one
+    /// origin refreshes ONE entry downstream, and keeping it alive needs one
+    /// relay per TTL. Measured before the throttle: six per lifetime, and
+    /// forwarded announcements were 85% of all routing traffic. Read this
+    /// beside `gossip_announces_rx_total` to see how much of the plane was
+    /// repetition.
+    gossip_forward_suppressed_total: Arc<AtomicU64>,
     /// Exit-proxy CONNECT targets denied by `is_forbidden_destination`
     /// (loopback/private/link-local/metadata)..
     exit_proxy_dest_denied_total: Arc<AtomicU64>,
@@ -488,6 +498,7 @@ pub struct MetricsSnapshot {
     pub gossip_announces_rx_total: u64,
     // Denial/drop counters
     pub unknown_origin_gossip_rejected_total: u64,
+    pub gossip_forward_suppressed_total: u64,
     pub exit_proxy_dest_denied_total: u64,
     pub socks5_accepts_throttled_total: u64,
     pub gateway_lift_seen_evicted_total: u64,
@@ -684,6 +695,7 @@ impl NodeMetrics {
             route_cache_hits_total: counter!(),
             gossip_announces_rx_total: counter!(),
             unknown_origin_gossip_rejected_total: counter!(),
+            gossip_forward_suppressed_total: counter!(),
             exit_proxy_dest_denied_total: counter!(),
             socks5_accepts_throttled_total: counter!(),
             gateway_lift_seen_evicted_total: counter!(),
@@ -901,6 +913,11 @@ impl NodeMetrics {
 
     pub fn inc_unknown_origin_gossip_rejected(&self) {
         self.unknown_origin_gossip_rejected_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn inc_gossip_forward_suppressed(&self) {
+        self.gossip_forward_suppressed_total
             .fetch_add(1, Ordering::Relaxed);
     }
 
@@ -1368,6 +1385,7 @@ impl NodeMetrics {
             route_cache_hits_total: load!(route_cache_hits_total),
             gossip_announces_rx_total: load!(gossip_announces_rx_total),
             unknown_origin_gossip_rejected_total: load!(unknown_origin_gossip_rejected_total),
+            gossip_forward_suppressed_total: load!(gossip_forward_suppressed_total),
             exit_proxy_dest_denied_total: load!(exit_proxy_dest_denied_total),
             socks5_accepts_throttled_total: load!(socks5_accepts_throttled_total),
             gateway_lift_seen_evicted_total: load!(gateway_lift_seen_evicted_total),
