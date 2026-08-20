@@ -18,6 +18,7 @@ pub mod backpressure_signal;
 pub mod battery_adjusted_keepalive;
 pub mod cover_traffic;
 pub mod dispatcher_sink;
+pub mod frame_diag;
 pub mod fsm;
 pub mod glue;
 pub mod handoff;

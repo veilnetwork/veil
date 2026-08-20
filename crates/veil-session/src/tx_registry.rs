@@ -491,6 +491,7 @@ impl SessionTxRegistry {
         priority: u8,
         frame: veil_bufpool::PooledShared,
     ) -> Result<(), SendToError> {
+        crate::frame_diag::note_outbound(peer_id, &frame, "tx_registry");
         let tx = match self.senders.get(peer_id) {
             Some(entry) => &entry.tx,
             None => return Err(SendToError::Missing),
