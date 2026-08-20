@@ -1629,6 +1629,12 @@ impl NodeMetrics {
             "veil_gossip_announces_rx_total",
             s.gossip_announces_rx_total
         );
+        // Read beside the line above: together they say how much of the
+        // routing plane was repetition rather than news.
+        counter!(
+            "veil_gossip_forward_suppressed_total",
+            s.gossip_forward_suppressed_total
+        );
         // Denial/drop counters
         counter!(
             "veil_unknown_origin_gossip_rejected_total",
@@ -1860,6 +1866,64 @@ impl veil_ipc::IpcMetrics for NodeMetrics {
 mod tests {
     use super::*;
     use std::fs;
+
+    /// Every counter in the snapshot must reach the exporter.
+    ///
+    /// A counter is added in four places — the atomic, the snapshot field, the
+    /// load, and the render — and forgetting the last one produces a number
+    /// nothing can read. That is not hypothetical: `gossip_forward_suppressed`
+    /// was added to measure how much routing gossip was repetition, shipped,
+    /// deployed to three seeds, and only then found to be invisible in both
+    /// `node metrics` and `/metrics`.
+    ///
+    /// Reads the snapshot's own field list out of this file rather than
+    /// duplicating it, so a counter added tomorrow is covered without anybody
+    /// remembering to add it here.
+    ///
+    /// Break-check: delete one `counter!` line from `render_prometheus` and
+    /// this names the field.
+    #[test]
+    fn every_snapshot_counter_is_exported() {
+        // `file!()` is workspace-relative and the test's cwd is the crate
+        // directory, so it does not resolve. `CARGO_MANIFEST_DIR` does, from
+        // wherever the runner is invoked.
+        let source = fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/lib.rs"))
+            .expect("read own source");
+
+        // The `pub <name>: u64` fields of MetricsSnapshot.
+        let start = source
+            .find("pub struct MetricsSnapshot")
+            .expect("MetricsSnapshot exists");
+        let body_start = source[start..].find('{').expect("struct body") + start;
+        let body_end = source[body_start..].find("\n}").expect("struct end") + body_start;
+        let body = &source[body_start..body_end];
+
+        let rendered = NodeMetrics::new().render_prometheus();
+
+        let mut missing = Vec::new();
+        for line in body.lines() {
+            let line = line.trim();
+            let Some(rest) = line.strip_prefix("pub ") else {
+                continue;
+            };
+            let Some((name, ty)) = rest.split_once(':') else {
+                continue;
+            };
+            if !ty.trim().starts_with("u64") && !ty.trim().starts_with("f64") {
+                continue;
+            }
+            let name = name.trim();
+            if !rendered.contains(&format!("veil_{name}")) {
+                missing.push(name.to_owned());
+            }
+        }
+
+        assert!(
+            missing.is_empty(),
+            "these snapshot counters are never rendered, so nothing can read \
+             them: {missing:?}"
+        );
+    }
 
     /// SECURITY (audit 2026-05-29, log-injection regression): control
     /// characters in attacker-controlled fields MUST be escaped so they
