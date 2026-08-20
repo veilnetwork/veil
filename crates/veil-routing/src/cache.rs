@@ -17,7 +17,7 @@
 
 use std::{
     collections::{HashMap, HashSet},
-    sync::atomic::{AtomicU64, Ordering},
+    sync::atomic::{AtomicBool, AtomicU64, Ordering},
     time::{Duration, Instant},
 };
 
@@ -95,6 +95,16 @@ pub struct RouteCacheEntry {
     /// non-mutating and unlocks future `RwLock<RouteCache>` migration. Zero
     /// means "never accessed since insert"; larger = more recently used.
     pub last_used: AtomicU64,
+    /// Whether a lookup has ever RETURNED this entry.
+    ///
+    /// Separate from `last_used` on purpose. That one is an LRU token and is
+    /// non-zero from the moment of insert — eviction picks the smallest, so a
+    /// fresh entry starting at zero would be thrown away on the next insert.
+    /// The two questions are different: "how recently was this touched" orders
+    /// eviction, "was this ever chosen" says whether the path carries traffic
+    /// at all, and only the second can tell a load-bearing route from a
+    /// failover candidate.
+    pub ever_chosen: AtomicBool,
     /// `true` for entries restored from a persisted snapshot.
     ///
     /// Stale entries are never evicted by TTL — they persist until a fresh
@@ -118,6 +128,7 @@ impl Clone for RouteCacheEntry {
             hop_count: self.hop_count,
             expires_at: self.expires_at,
             last_used: AtomicU64::new(self.last_used.load(Ordering::Relaxed)),
+            ever_chosen: AtomicBool::new(self.ever_chosen.load(Ordering::Relaxed)),
             is_stale: self.is_stale,
             labels: self.labels.clone(),
         }
@@ -144,6 +155,27 @@ impl RouteCacheEntry {
 }
 
 // ── RouteCache ────────────────────────────────────────────────────────────────
+
+/// One cached path as an operator sees it.
+///
+/// A named type rather than a tuple because five positional fields is where a
+/// reader starts counting commas, and two of them are 32-byte arrays that look
+/// alike.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RouteSnapshot {
+    pub dst: [u8; 32],
+    pub next_hop: [u8; 32],
+    /// Lower is better, in milliunits.
+    pub score: u32,
+    /// 1 = direct peer.
+    pub hop_count: u8,
+    /// Whether a lookup has ever chosen this path since it was cached.
+    ///
+    /// `RouteCacheEntry::last_used` stays zero until something selects the
+    /// entry, so this separates a path that carries traffic from one that is
+    /// only a failover candidate.
+    pub used: bool,
+}
 
 /// Short-lived multi-path next-hop hints indexed by destination node_id.
 ///
@@ -310,6 +342,7 @@ impl RouteCache {
             // fresh insert gets the latest access token so LRU
             // sees it as the most recently used.
             last_used: AtomicU64::new(next_access_token()),
+            ever_chosen: AtomicBool::new(false),
             is_stale: false,
             labels,
         };
@@ -469,6 +502,7 @@ impl RouteCache {
         entry
             .last_used
             .store(next_access_token(), Ordering::Relaxed);
+        entry.ever_chosen.store(true, Ordering::Relaxed);
         Some(entry.next_hop)
     }
 
@@ -484,6 +518,7 @@ impl RouteCache {
         entry
             .last_used
             .store(next_access_token(), Ordering::Relaxed);
+        entry.ever_chosen.store(true, Ordering::Relaxed);
         Some(entry.next_hop)
     }
 
@@ -524,6 +559,7 @@ impl RouteCache {
                 continue;
             }
             e.last_used.store(token, Ordering::Relaxed);
+            e.ever_chosen.store(true, Ordering::Relaxed);
             out.push((e.next_hop, e.score, e.hop_count));
         }
         out
@@ -723,6 +759,7 @@ impl RouteCache {
                 // inserts (if an operator restores and immediately inserts
                 // both count as "just-used").
                 last_used: AtomicU64::new(next_access_token()),
+                ever_chosen: AtomicBool::new(false),
                 is_stale: true,
                 // snapshot format does not yet carry labels —
                 // restored entries get an empty list and will only have
@@ -788,13 +825,24 @@ impl RouteCache {
     /// Return `(dst, next_hop, score, hop_count)` for every non-expired route.
     ///
     /// Used by the admin introspection path (`node routes`).
-    pub fn all_routes_with_score(&self) -> Vec<([u8; 32], [u8; 32], u32, u8)> {
+    pub fn all_routes_with_score(&self) -> Vec<RouteSnapshot> {
         let now = Instant::now();
         let mut out = Vec::with_capacity(self.entries.len());
         for (dst, bucket) in &self.entries {
             for e in bucket {
                 if !e.is_expired(now) {
-                    out.push((*dst, e.next_hop, e.score, e.hop_count));
+                    // `used` answers "has this path ever been chosen".
+                    // NOT `last_used`: that is an LRU token, non-zero from
+                    // insert, and reading it as "was it used" marks every
+                    // cached path used — which is what the first version of
+                    // this did, and what the test caught.
+                    out.push(RouteSnapshot {
+                        dst: *dst,
+                        next_hop: e.next_hop,
+                        score: e.score,
+                        hop_count: e.hop_count,
+                        used: e.ever_chosen.load(Ordering::Relaxed),
+                    });
                 }
             }
         }
@@ -841,6 +889,51 @@ impl RouteCache {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A freshly cached path is not "used" until something chooses it.
+    ///
+    /// Every destination holds up to `MAX_ROUTES_PER_DST` = 4 candidates, and
+    /// on a live testnet all of them held exactly 4 — a saturated cache looks
+    /// identical whether one path carries everything or all four share the
+    /// load. `last_used` is the only thing that separates them, and any
+    /// argument about the cap has to start from it.
+    ///
+    /// Break-check: report `used: true` unconditionally and the first
+    /// assertion fails; report it as `last_used == 0` and the second does.
+    #[test]
+    fn a_path_is_marked_used_only_after_it_is_chosen() {
+        let mut cache = RouteCache::new(Duration::from_secs(60));
+        cache.insert([1u8; 32], [2u8; 32], 5_000, 1);
+        cache.insert([1u8; 32], [3u8; 32], 9_000, 2);
+
+        let before = cache.all_routes_with_score();
+        assert_eq!(before.len(), 2);
+        assert!(
+            before.iter().all(|r| !r.used),
+            "nothing has looked this destination up yet"
+        );
+
+        assert_eq!(cache.lookup(&[1u8; 32]), Some([2u8; 32]));
+
+        let after = cache.all_routes_with_score();
+        let best = after
+            .iter()
+            .find(|r| r.next_hop == [2u8; 32])
+            .expect("the chosen path is still cached");
+        assert!(
+            best.used,
+            "the path the lookup returned must be marked used"
+        );
+        let alt = after
+            .iter()
+            .find(|r| r.next_hop == [3u8; 32])
+            .expect("the alternative is still cached");
+        assert!(
+            !alt.used,
+            "an alternative nobody chose must stay unmarked — otherwise the \
+             mark says nothing"
+        );
+    }
 
     #[test]
     fn insert_and_lookup_single() {

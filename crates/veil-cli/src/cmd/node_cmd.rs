@@ -936,22 +936,41 @@ fn render_routes(
         bucket.sort_by_key(|r| r.score);
     }
 
+    // `used` marks a path something has actually chosen. Every destination
+    // holds up to four candidates and a saturated cache looks identical
+    // whether one of them carries everything or all four share the load — the
+    // mark is the only thing that tells them apart, and it is what any
+    // argument about the per-destination cap has to start from.
+    let mark = |e: &node::AdminRouteEntry| if e.used { "  used" } else { "" };
+
     for (dst, hops) in &by_dst {
         let best = hops[0];
         lines.push(format!(
-            "{}  →  {}  score={}  hops={}",
-            dst, best.next_hop, best.score, best.hops,
+            "{}  →  {}  score={}  hops={}{}",
+            dst,
+            best.next_hop,
+            best.score,
+            best.hops,
+            mark(best),
         ));
         for alt in &hops[1..] {
             lines.push(format!(
-                "{}     {}  score={}  hops={}  (alt)",
+                "{}     {}  score={}  hops={}  (alt){}",
                 " ".repeat(dst.len()),
                 alt.next_hop,
                 alt.score,
                 alt.hops,
+                mark(alt),
             ));
         }
     }
+    let used = routes.iter().filter(|r| r.used).count();
+    lines.push(String::new());
+    lines.push(format!(
+        "{} of {} cached paths have been chosen at least once",
+        used,
+        routes.len(),
+    ));
     lines.join("\n")
 }
 
