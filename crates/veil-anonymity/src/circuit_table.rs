@@ -27,7 +27,7 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
-use crate::circuit_data::ReplayWindow;
+use crate::circuit_data::{CircuitCellBytes, ReplayWindow};
 use crate::circuit_setup::{CIRCUIT_KEY_LEN, CircuitInstall};
 use crate::circuit_wire::CircuitId;
 
@@ -78,6 +78,10 @@ pub struct CircuitState {
     pub next_link: Option<Link>,
     /// Circuit id on the `next_link` side.
     pub circuit_id_out: CircuitId,
+    /// Size of every data cell on this circuit, learned from the setup. The
+    /// relay enforces it on both directions: uniformity has to hold against the
+    /// hop that sees every cell, and that hop is this one.
+    pub cell_bytes: CircuitCellBytes,
     /// Last-activity timestamp (unix secs) for idle GC.
     pub last_seen_unix: Mutex<u64>,
     /// Anti-replay window for forward-direction cells.
@@ -125,6 +129,7 @@ impl CircuitState {
             circuit_id_in: install.circuit_id_in,
             next_link,
             circuit_id_out: install.circuit_id_out,
+            cell_bytes: install.cell_bytes,
             last_seen_unix: Mutex::new(now),
             replay_fwd: Mutex::new(ReplayWindow::new()),
             replay_ret: Mutex::new(ReplayWindow::new()),
@@ -517,6 +522,7 @@ mod tests {
 
     fn inst(cid_in: u32, cid_out: u32, key: u8) -> CircuitInstall {
         CircuitInstall {
+            cell_bytes: crate::circuit_data::CircuitCellBytes::legacy(),
             circuit_id_in: cid_in,
             circuit_id_out: cid_out,
             circuit_key: [key; CIRCUIT_KEY_LEN],
