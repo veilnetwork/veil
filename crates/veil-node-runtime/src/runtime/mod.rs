@@ -5565,11 +5565,30 @@ impl NodeServices {
         if punch_timeout.is_zero() {
             return Err(HolePunchDialFailure::PunchTimeout);
         }
-        let peer = veil_nat::punch_udp(&socket, &candidates, punch_token, punch_timeout)
-            .await
-            .ok()
-            .flatten()
-            .ok_or(HolePunchDialFailure::PunchTimeout)?;
+        // The punch is bound to this node's veil, so a peer on a different
+        // deployment cannot converge with us and be promoted into a session.
+        let network_tag = veil_nat::network_tag(self.transport_ctx.obfs4_psk.as_deref());
+        let punched = veil_nat::punch_udp(
+            &socket,
+            &candidates,
+            punch_token,
+            &network_tag,
+            punch_timeout,
+        )
+        .await
+        .unwrap_or_default();
+        if punched.peer.is_none() && punched.foreign_tokens > 0 {
+            // A cross-veil punch fails by timing out, exactly like a NAT that
+            // never opened. Say which one it was.
+            self.logger.debug(
+                "nat.udp_punch.foreign_network",
+                format!(
+                    "{} punch packet(s) carried a token from another veil",
+                    punched.foreign_tokens
+                ),
+            );
+        }
+        let peer = punched.peer.ok_or(HolePunchDialFailure::PunchTimeout)?;
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         if remaining.is_zero() {
             return Err(HolePunchDialFailure::PunchTimeout);

@@ -1112,16 +1112,31 @@ impl NodeRuntime {
                                 if punch_timeout.is_zero() {
                                     return;
                                 }
-                                let peer = match veil_nat::punch_udp(
+                                // Bound to our veil: see `veil_nat::network_tag`.
+                                let network_tag = veil_nat::network_tag(
+                                    access.transport_ctx.obfs4_psk.as_deref(),
+                                );
+                                let punched = veil_nat::punch_udp(
                                     &socket,
                                     &peer_candidates,
                                     punch_token,
+                                    &network_tag,
                                     punch_timeout,
                                 )
                                 .await
-                                {
-                                    Ok(Some(peer)) => peer,
-                                    _ => return,
+                                .unwrap_or_default();
+                                let Some(peer) = punched.peer else {
+                                    if punched.foreign_tokens > 0 {
+                                        logger.debug(
+                                            "nat.udp_punch.foreign_network",
+                                            format!(
+                                                "{} punch packet(s) carried a token \
+                                                 from another veil",
+                                                punched.foreign_tokens
+                                            ),
+                                        );
+                                    }
+                                    return;
                                 };
                                 let remaining = deadline
                                     .saturating_duration_since(tokio::time::Instant::now());

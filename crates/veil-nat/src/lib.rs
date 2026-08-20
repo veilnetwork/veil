@@ -19,8 +19,8 @@ pub mod udp_punch;
 
 pub use discovery::{ExternalAddrDiscovery, candidate_to_socket_addr, socket_addr_to_candidate};
 pub use udp_punch::{
-    DEFAULT_UDP_REFLECTOR_PORT, UDP_PUNCH_PACKET_LEN, UdpReflectorAdvertisement,
+    DEFAULT_UDP_REFLECTOR_PORT, PunchOutcome, UDP_PUNCH_PACKET_LEN, UdpReflectorAdvertisement,
     discover_udp_mapping, discover_udp_mapping_any, discover_udp_mapping_any_for_punch,
-    is_public_punch_addr, parse_udp_reflector_advertisement, punch_udp, serve_udp_reflector,
-    udp_reflector_advertisement, udp_reflector_endpoint_advertisement,
+    is_public_punch_addr, network_tag, parse_udp_reflector_advertisement, punch_udp,
+    serve_udp_reflector, udp_reflector_advertisement, udp_reflector_endpoint_advertisement,
 };
