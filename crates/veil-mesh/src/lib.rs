@@ -46,7 +46,7 @@ pub use link::{InMemoryLink, LocalLink, SendResult};
 pub use neighbor::{MeshNeighborProvider, NeighborTable};
 pub use realm::{InMemoryRealm, RealmNode};
 pub use transport::{LocalTransport, MultiTransportNeighborTable};
-pub use udp::{UdpLink, UdpRealm};
+pub use udp::{MAX_UDP_FRAME, UdpLink, UdpRealm};
 
 #[cfg(test)]
 mod tests {
