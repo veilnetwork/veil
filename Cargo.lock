@@ -4899,6 +4899,7 @@ dependencies = [
 name = "veil-nat"
 version = "0.6.0"
 dependencies = [
+ "blake3",
  "quinn",
  "rcgen",
  "rustls",

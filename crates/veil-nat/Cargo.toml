@@ -6,6 +6,7 @@ description = "NAT traversal: ICE-style candidate discovery, UDP hole-punch, rel
 license = "AGPL-3.0-or-later"
 
 [dependencies]
+blake3 = "1.5"
 veil-proto = { path = "../veil-proto" }
 veil-types = { path = "../veil-types" }
 
