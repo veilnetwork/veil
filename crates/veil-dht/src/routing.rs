@@ -691,6 +691,21 @@ impl RoutingTable {
             .find(|c| &c.node_id == node_id)
     }
 
+    /// What this peer said about serving the DHT, or `None` when the table has
+    /// never heard from it.
+    ///
+    /// `None` and `Some(true)` are deliberately different answers. A contact
+    /// that is simply absent has not asked for anything, and a caller must not
+    /// read silence as a refusal; only a peer's own CAPABILITIES frame speaks
+    /// for it. Same O(total_contacts) walk as [`Self::contains`], and the same
+    /// justification: this runs once per session establish, not per frame.
+    pub fn serves_dht(&self, node_id: &[u8; 32]) -> Option<bool> {
+        self.buckets
+            .iter()
+            .flat_map(|b| b.iter())
+            .find(|c| &c.node_id == node_id)
+            .map(|c| c.dht_service())
+    }
 
     /// Return all contacts from all buckets (cloned).
     pub fn all_contacts(&self) -> Vec<Contact> {
