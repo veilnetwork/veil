@@ -44,11 +44,69 @@ use crate::circuit_setup::CIRCUIT_KEY_LEN;
 /// cells per byte cuts both. Cost: small control/chat sends still pad to one
 /// uniform cell, now 16 KiB on the wire — accepted for the same uniformity
 /// reason as the first bump.
+/// 2026-08-20: no longer the size of every cell everywhere — see
+/// [`CircuitCellBytes`]. Kept as the size a circuit gets when nothing chose one
+/// (legacy peers, and the bulk end of the range), so existing behaviour is the
+/// default rather than a special case.
 pub const CIRCUIT_PAYLOAD_BYTES: usize = 16384;
 /// Length-prefix width inside the fixed payload (`[len u16 BE][bytes][pad]`).
 const LEN_PREFIX: usize = 2;
-/// Largest real payload that fits one fixed cell.
+/// Largest real payload that fits a `CIRCUIT_PAYLOAD_BYTES` cell.
 pub const MAX_CIRCUIT_INNER: usize = CIRCUIT_PAYLOAD_BYTES - LEN_PREFIX;
+
+/// Smallest cell a circuit may negotiate. Must comfortably hold the largest
+/// sealed introduce (`MAX_INTRODUCE_CIPHERTEXT` = 320) plus the length prefix,
+/// with room for the registration payloads that share the path.
+pub const MIN_CIRCUIT_CELL_BYTES: usize = 1024;
+
+/// The size of every data cell on ONE circuit, chosen when the circuit is built
+/// and carried in the setup so every hop validates the same number.
+///
+/// # Why this stopped being a global constant
+///
+/// It was one value for the whole network, and a heartbeat proved what that
+/// costs: `CIRCUIT_HEARTBEAT_MAGIC` is EIGHT bytes and rode a 16384-byte cell
+/// every 15 s, measured live as 56% of an idle phone's traffic. That is the
+/// bandwidth half.
+///
+/// The other half is that one global size is a fixed number an observer can
+/// write a rule against. Uniformity has to hold where the leak is — *within* a
+/// circuit, against a hop that sees every cell on it. It does not have to be
+/// the SAME number on every circuit in the world, and making it one handed a
+/// DPI classifier a constant for free.
+///
+/// So: chosen per circuit, uniform for that circuit's life. A hop still sees
+/// nothing but identical cells; there is no longer a network-wide number.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CircuitCellBytes(usize);
+
+impl CircuitCellBytes {
+    /// Reject a size that cannot carry the protocol's own payloads, or that
+    /// will not fit the 2-byte wire field, rather than letting a malformed
+    /// setup install a circuit that can never send anything.
+    pub fn new(bytes: usize) -> Result<Self, CircuitError> {
+        if !(MIN_CIRCUIT_CELL_BYTES..=CIRCUIT_PAYLOAD_BYTES).contains(&bytes) {
+            return Err(CircuitError::Malformed(format!(
+                "circuit cell {bytes} outside {MIN_CIRCUIT_CELL_BYTES}..={CIRCUIT_PAYLOAD_BYTES}"
+            )));
+        }
+        Ok(Self(bytes))
+    }
+
+    /// The legacy whole-network size, for paths that have not chosen one.
+    pub const fn legacy() -> Self {
+        Self(CIRCUIT_PAYLOAD_BYTES)
+    }
+
+    pub const fn get(self) -> usize {
+        self.0
+    }
+
+    /// Largest real payload one cell of this size carries.
+    pub const fn max_inner(self) -> usize {
+        self.0 - LEN_PREFIX
+    }
+}
 
 /// Travel direction along a circuit. Mixed into the keystream so the two
 /// directions are cryptographically independent.
@@ -125,14 +183,15 @@ pub fn apply_layers(
 /// Frame a payload into a FIXED-SIZE cell buffer: `[len u16 BE][payload][random
 /// pad]`. The pad is random so a fixed cell reveals nothing about the payload
 /// length to a hop (the recipient reads `len` back out after peeling).
-pub fn wrap_payload(payload: &[u8]) -> Result<Vec<u8>, CircuitError> {
-    if payload.len() > MAX_CIRCUIT_INNER {
+pub fn wrap_payload(payload: &[u8], cell: CircuitCellBytes) -> Result<Vec<u8>, CircuitError> {
+    if payload.len() > cell.max_inner() {
         return Err(CircuitError::Malformed(format!(
-            "circuit payload {} > MAX {MAX_CIRCUIT_INNER}",
-            payload.len()
+            "circuit payload {} > MAX {}",
+            payload.len(),
+            cell.max_inner()
         )));
     }
-    let mut buf = vec![0u8; CIRCUIT_PAYLOAD_BYTES];
+    let mut buf = vec![0u8; cell.get()];
     buf[..LEN_PREFIX].copy_from_slice(&(payload.len() as u16).to_be_bytes());
     buf[LEN_PREFIX..LEN_PREFIX + payload.len()].copy_from_slice(payload);
     OsRng.fill_bytes(&mut buf[LEN_PREFIX + payload.len()..]);
@@ -261,7 +320,7 @@ mod tests {
 
     #[test]
     fn wrap_read_roundtrip_is_fixed_size() {
-        let buf = wrap_payload(b"introduce-bytes").unwrap();
+        let buf = wrap_payload(b"introduce-bytes", CircuitCellBytes::legacy()).unwrap();
         assert_eq!(
             buf.len(),
             CIRCUIT_PAYLOAD_BYTES,
@@ -269,17 +328,23 @@ mod tests {
         );
         assert_eq!(read_payload(&buf).unwrap(), b"introduce-bytes");
         // Empty payload still a full fixed cell.
-        let e = wrap_payload(b"").unwrap();
+        let e = wrap_payload(b"", CircuitCellBytes::legacy()).unwrap();
         assert_eq!(e.len(), CIRCUIT_PAYLOAD_BYTES);
         assert!(read_payload(&e).unwrap().is_empty());
         // Oversize rejected.
-        assert!(wrap_payload(&vec![0u8; MAX_CIRCUIT_INNER + 1]).is_err());
+        assert!(
+            wrap_payload(
+                &vec![0u8; MAX_CIRCUIT_INNER + 1],
+                CircuitCellBytes::legacy()
+            )
+            .is_err()
+        );
     }
 
     #[test]
     fn layer_is_self_inverse_and_size_preserving() {
         let key = k(0xA1);
-        let mut buf = wrap_payload(b"hello").unwrap();
+        let mut buf = wrap_payload(b"hello", CircuitCellBytes::legacy()).unwrap();
         let orig = buf.clone();
         apply_layer(&key, Direction::Return, 7, &mut buf);
         assert_eq!(buf.len(), orig.len(), "size preserved");
@@ -294,7 +359,7 @@ mod tests {
         let (k0, k1, k2) = (k(10), k(20), k(30));
         let seq = 99u32;
         // Terminus wraps + applies its layer; each hop toward orig applies its.
-        let mut cell = wrap_payload(b"reply payload").unwrap();
+        let mut cell = wrap_payload(b"reply payload", CircuitCellBytes::legacy()).unwrap();
         apply_layer(&k2, Direction::Return, seq, &mut cell);
         assert_eq!(cell.len(), CIRCUIT_PAYLOAD_BYTES);
         apply_layer(&k1, Direction::Return, seq, &mut cell);
@@ -308,7 +373,7 @@ mod tests {
     #[test]
     fn forward_and_return_are_independent() {
         let key = k(5);
-        let mut a = wrap_payload(b"x").unwrap();
+        let mut a = wrap_payload(b"x", CircuitCellBytes::legacy()).unwrap();
         let mut b = a.clone();
         apply_layer(&key, Direction::Forward, 1, &mut a);
         apply_layer(&key, Direction::Return, 1, &mut b);
@@ -355,7 +420,7 @@ mod tests {
         // in the forward direction (the keepalive path added for dead-idle-TCP).
         let (k0, k1, k2) = (k(10), k(20), k(30));
         let seq = 42u32;
-        let mut cell = wrap_payload(CIRCUIT_HEARTBEAT_MAGIC).unwrap();
+        let mut cell = wrap_payload(CIRCUIT_HEARTBEAT_MAGIC, CircuitCellBytes::legacy()).unwrap();
         apply_layers(&[k0, k1, k2], Direction::Forward, seq, &mut cell).unwrap();
         assert_eq!(cell.len(), CIRCUIT_PAYLOAD_BYTES, "fixed size on the wire");
         // Each hop peels its own layer; the terminus peels the last and reads it.
