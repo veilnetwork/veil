@@ -48,7 +48,7 @@ use std::{
     net::SocketAddr,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -495,6 +495,11 @@ pub struct BeaconSender {
     /// prefix already guarantees nonce uniqueness; this is the documented
     /// secondary input. Unused when `obfs` is `None`.
     obfs_counter: AtomicU64,
+    /// Whether the last beacon send failed, so the loop can log the TRANSITION
+    /// rather than every attempt. A beacon that cannot be sent usually cannot
+    /// be sent forever (a missing socket permission, a vanished interface), and
+    /// a warning every `interval` would be a stream nobody reads.
+    send_failing: AtomicBool,
 }
 
 impl BeaconSender {
@@ -506,6 +511,23 @@ impl BeaconSender {
         interval: Duration,
     ) -> std::io::Result<Self> {
         let socket = UdpSocket::bind(bind_addr).await?;
+        // A UDP socket refuses `sendto` to a broadcast address until the caller
+        // asks for the permission: BSD and Linux both answer EACCES, and the
+        // default `beacon_addr` is `255.255.255.255:9100`. Without this the
+        // beacon loop runs forever and no datagram ever leaves the host --
+        // measured, not deduced: a node with mesh configured and its realm
+        // bound emitted zero beacons in 35 seconds at a 10-second interval,
+        // while a plain socket WITH the flag reached a listener on the same
+        // host 3/3 from a separate process.
+        //
+        // The field is named `broadcast_addr`. Deciding whether a given IPv4
+        // address really is one needs the interface netmask -- 192.168.1.255 is
+        // indistinguishable from 192.168.1.70 without it -- and the flag grants
+        // nothing beyond what the operator already asked for by naming the
+        // address. So: ask for it whenever the target is IPv4.
+        if broadcast_addr.is_ipv4() {
+            socket.set_broadcast(true)?;
+        }
         veil_util::outbound_interface::configure_outbound_socket(
             &socket,
             if broadcast_addr.is_ipv4() {
@@ -528,6 +550,7 @@ impl BeaconSender {
             public_key_b64: String::new(),
             obfs: None,
             obfs_counter: AtomicU64::new(0),
+            send_failing: AtomicBool::new(false),
         })
     }
 
@@ -647,7 +670,30 @@ impl BeaconSender {
             };
             tokio::select! {
                 _ = tokio::time::sleep(delay) => {
-                    let _ = self.send_once().await;
+                    // `let _ =` here is what kept a dead beacon quiet. The seal
+                    // failure a few lines up in `send_once` IS logged; the send
+                    // failure was not, so a socket that refused every datagram
+                    // looked exactly like a working one. Log the TRANSITION, so
+                    // a permanent failure is one line and not one per interval.
+                    match self.send_once().await {
+                        Ok(()) => {
+                            if self.send_failing.swap(false, Ordering::Relaxed) {
+                                log::info!(
+                                    "veil-mesh: beacon to {} is sending again",
+                                    self.broadcast_addr
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            if !self.send_failing.swap(true, Ordering::Relaxed) {
+                                log::warn!(
+                                    "veil-mesh: beacon send to {} failed, mesh \
+                                     discovery stays silent until this clears: {e}",
+                                    self.broadcast_addr
+                                );
+                            }
+                        }
+                    }
                 }
                 Ok(_) = shutdown_rx.changed() => {
                     if *shutdown_rx.borrow() { break; }
@@ -1073,6 +1119,66 @@ mod tests {
             rl.allow(newcomer),
             "expired subnet slots must be swept before refusing"
         );
+    }
+
+    /// The beacon socket must be ALLOWED to reach a broadcast address.
+    ///
+    /// A UDP socket answers EACCES to `sendto` a broadcast address until
+    /// `SO_BROADCAST` is set, and the default `beacon_addr` is
+    /// `255.255.255.255:9100`. Without the flag the send fails every time,
+    /// and `run` used to discard the error, so the beacon loop ran for the
+    /// life of the process while nothing left the host.
+    ///
+    /// This asserts the socket OPTION rather than a delivered datagram
+    /// deliberately: a test that broadcasts for real is at the mercy of the
+    /// sandbox it runs in, and one that silently skips is a line in the list
+    /// of things nobody checked.
+    ///
+    /// Break-check: delete the `set_broadcast` call and this reddens.
+    #[tokio::test]
+    async fn the_beacon_socket_is_allowed_to_broadcast() {
+        let sender = BeaconSender::new(
+            RealmId([7u8; 16]),
+            [1u8; 32],
+            "255.255.255.255:9100".parse().unwrap(),
+            "0.0.0.0:0".parse().unwrap(),
+            Duration::from_secs(10),
+        )
+        .await
+        .expect("bind an ephemeral send socket");
+
+        assert!(
+            sender.socket.broadcast().expect("read SO_BROADCAST back"),
+            "sendto a broadcast address answers EACCES without this flag"
+        );
+    }
+
+    /// Sending to a broadcast address actually succeeds.
+    ///
+    /// The existing sender tests all aim at a unicast `127.0.0.1` sink, which
+    /// is exactly why none of them noticed: unicast needs no permission. This
+    /// one exercises the address family the default config uses, and asserts
+    /// on the RESULT of the send rather than on a datagram arriving, so it
+    /// cannot pass for an environmental reason.
+    ///
+    /// Break-check: delete the `set_broadcast` call and this fails with
+    /// `Permission denied`.
+    #[tokio::test]
+    async fn a_broadcast_send_is_not_refused() {
+        let sender = BeaconSender::new(
+            RealmId([7u8; 16]),
+            [1u8; 32],
+            "255.255.255.255:9199".parse().unwrap(),
+            "0.0.0.0:0".parse().unwrap(),
+            Duration::from_secs(10),
+        )
+        .await
+        .expect("bind an ephemeral send socket");
+
+        sender
+            .send_once()
+            .await
+            .expect("a beacon aimed at the default broadcast address must not be refused");
     }
 
     /// Build a genuinely signed beacon frame for the replay tests.
