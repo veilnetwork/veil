@@ -4475,12 +4475,100 @@ fn retire_circuits_later(
 #[cfg(test)]
 mod tests {
     use super::{
-        CIRCUIT_INTRO_LEN, CIRCUIT_MSS, CIRCUIT_PEER_TAG_LEN, CircuitMode,
-        DATAGRAM_AUTH_DELIVER_MAX, DATAGRAM_AUTH_SIGNATURE_MAX, DATAGRAM_MAX_CELL, DATAGRAM_MSS,
-        circuit_env_value_mode, parse_stream_peer_intro_plaintext, stream_peer_intro_plaintext,
+        CIRCUIT_HEARTBEAT_INTERVAL, CIRCUIT_HEARTBEAT_MAX_SECS, CIRCUIT_INTRO_LEN, CIRCUIT_MSS,
+        CIRCUIT_PEER_TAG_LEN, CircuitMode, DATAGRAM_AUTH_DELIVER_MAX, DATAGRAM_AUTH_SIGNATURE_MAX,
+        DATAGRAM_MAX_CELL, DATAGRAM_MSS, circuit_env_value_mode, circuit_heartbeat_wait,
+        parse_stream_peer_intro_plaintext, stream_peer_intro_plaintext,
     };
     use veil_anonymity::circuit_register::COOKIE_LEN;
     use veil_onion_stream::wire::{DATA_OVERHEAD, Frame, MAX_CELL};
+
+    /// Install one circuit in a relay-side table and let `secs_between` seconds
+    /// pass between touches, `touches` times, running the GC at every step the
+    /// way the maintenance tick does. Returns whether the circuit is still
+    /// installed at the end.
+    fn circuit_survives(secs_between: u64, touches: u32) -> bool {
+        use veil_anonymity::circuit_setup::CircuitInstall;
+        use veil_anonymity::circuit_table::CircuitTable;
+
+        let table = CircuitTable::new();
+        let prev = [0x11u8; 32];
+        let install = CircuitInstall {
+            circuit_id_in: 7,
+            circuit_id_out: 8,
+            circuit_key: [0x22u8; 32],
+            cell_bytes: veil_anonymity::circuit_data::CircuitCellBytes::legacy(),
+        };
+        let mut now = 1_000_000u64;
+        table
+            .install(&install, prev, Some([0x33u8; 32]), now)
+            .expect("installs");
+        for _ in 0..touches {
+            now += secs_between;
+            table.gc(now);
+            if let Some(state) = table.lookup_forward(&prev, 7) {
+                state.touch(now);
+            } else {
+                return false;
+            }
+        }
+        now += secs_between;
+        table.gc(now);
+        table.lookup_forward(&prev, 7).is_some()
+    }
+
+    /// The heartbeat's ONLY remaining job is keeping the relay-side circuit
+    /// state out of the idle GC, so the cadence has to be checked against what
+    /// that GC actually does — not against what the const assert assumes it
+    /// does. The assert is arithmetic over two constants; this exercises
+    /// `CircuitTable::gc` itself.
+    ///
+    /// The budget is the WORST gap: two consecutive misses means three gaps at
+    /// the longest jittered draw must still fit inside the TTL.
+    #[test]
+    fn the_heartbeat_cadence_outruns_the_relays_idle_gc() {
+        assert!(
+            circuit_survives(CIRCUIT_HEARTBEAT_MAX_SECS, 6),
+            "a heartbeat at the longest jittered wait must keep the circuit installed"
+        );
+        assert!(
+            circuit_survives(CIRCUIT_HEARTBEAT_MAX_SECS * 3, 3),
+            "two consecutive misses at the longest wait must still be survivable"
+        );
+    }
+
+    /// The other half: the GC really does evict, so the test above is not
+    /// passing because nothing ever expires.
+    ///
+    /// Break-check for the pair: raise CIRCUIT_HEARTBEAT_INTERVAL_SECS past the
+    /// budget and the const assert stops the build before either runs.
+    #[test]
+    fn a_circuit_left_longer_than_the_ttl_is_evicted() {
+        let ttl = veil_anonymity::circuit_table::DEFAULT_CIRCUIT_TTL_SECS;
+        assert!(
+            !circuit_survives(ttl + 1, 1),
+            "the GC must evict a circuit idle past its TTL"
+        );
+    }
+
+    /// Every draw must land inside the advertised band, and the band must not
+    /// collapse to a point — an exactly periodic cell was the pattern this
+    /// replaces.
+    #[test]
+    fn the_heartbeat_wait_is_drawn_inside_its_band() {
+        let base = CIRCUIT_HEARTBEAT_INTERVAL.as_secs();
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..256 {
+            let w = circuit_heartbeat_wait();
+            assert!(
+                w.as_secs() >= base * 8 / 10 && w.as_secs() <= CIRCUIT_HEARTBEAT_MAX_SECS,
+                "wait {}s outside the band",
+                w.as_secs()
+            );
+            seen.insert(w.as_millis());
+        }
+        assert!(seen.len() > 32, "jitter collapsed to {} values", seen.len());
+    }
 
     #[test]
     fn circuit_env_is_strict_opt_in() {
