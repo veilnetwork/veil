@@ -1371,6 +1371,22 @@ impl KademliaService {
         false
     }
 
+    /// May we hand this peer work it did not ask for?
+    ///
+    /// `true` when the peer has not told us otherwise — an unknown peer has
+    /// made no request, and treating silence as refusal would cut off every
+    /// node we have not handshaked with yet.
+    ///
+    /// This exists for the paths that are NOT candidate selection.
+    /// [`Self::count_service_skip`] covers "who do I pick out of the table";
+    /// this covers "somebody just connected, may I push to them", which no
+    /// filter on selection can reach because nothing was selected.
+    pub fn peer_serves_dht(&self, node_id: &[u8; 32]) -> bool {
+        lock!(self.inner)
+            .routing
+            .serves_dht(node_id)
+            .unwrap_or(true)
+    }
 
     /// How many candidate slots have gone to somebody else because their
     /// occupant asked not to serve. Pair it with the routing-table size: the

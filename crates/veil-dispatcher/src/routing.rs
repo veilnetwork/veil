@@ -1280,6 +1280,24 @@ impl FrameDispatcher {
             header::{FrameHeader, HEADER_SIZE, TrafficClass},
         };
 
+        // A peer that advertised NO_DHT_SERVICE gets nothing pushed to it.
+        //
+        // This is the path the capability bit could not reach. Every filter for
+        // it sits on candidate SELECTION — who to pick out of the routing table
+        // as a store target, a walk hop, a referral — and nothing is selected
+        // here: the peer connected, so it gets the dump. Measured on a leaf that
+        // had asked not to serve and whose only three sessions were with seeds
+        // that had already marked it `[no-dht-service]`: incoming STORE was
+        // 3.7 KB/s, 80% of everything it received, 318 MB a day. Refusing the
+        // records locally never touched that number, because the bytes cross
+        // the network before any local decision is made.
+        //
+        // Unknown peers still get the push (`peer_serves_dht` answers `true`
+        // for a node the table has not heard from): silence is not a refusal.
+        if !self.dht.peer_serves_dht(&new_peer) {
+            return;
+        }
+
         let local_id = self.local_node_id;
         let keys = self.dht.stored_key_ids();
         let mut pushed = 0usize;
@@ -2830,6 +2848,108 @@ mod push_owned_tests {
         let pk = sk.verifying_key().to_bytes();
         let node_id: NodeIdBytes = *blake3::hash(&pk).as_bytes();
         (sk, pk, node_id)
+    }
+
+    /// A peer that asked not to serve gets nothing pushed to it.
+    ///
+    /// The bit had a filter on every candidate-selection path and none here,
+    /// because nothing is selected: the peer connected, so it got the dump.
+    /// Break-check: drop the `peer_serves_dht` guard in
+    /// `push_owned_dht_records` and this goes green again on the STORE frame.
+    #[test]
+    fn a_peer_that_asked_not_to_serve_is_pushed_nothing() {
+        let (sk, _pk, local_id) = new_signer();
+        let mut disp = make_test_dispatcher(NodeRole::Core);
+        disp.local_node_id = local_id;
+        disp.dht = Arc::new(KademliaService::with_config(
+            local_id,
+            veil_dht::DhtRuntimeConfig {
+                allow_unsigned_store: true,
+                ..Default::default()
+            },
+        ));
+
+        let entry = AppEndpointEntry {
+            node_id: local_id,
+            app_id: [0xA5u8; 32],
+            endpoint_id: 7,
+            gateway_node_id: None,
+            epoch: 1,
+            expires_at: u64::MAX / 2,
+            max_concurrent_streams: 4,
+            protocol_version: 1,
+            bandwidth_hint_kbps: 64,
+        };
+        let key = app_endpoint_key(&entry.node_id, &entry.app_id, entry.endpoint_id);
+        let value = entry.encode_for_dht_signed(&sk);
+        disp.dht
+            .handle_store(StorePayload::unsigned(key, value))
+            .unwrap();
+
+        let quiet: [u8; 32] = [0x22; 32];
+        disp.dht
+            .add_contact_trusted(veil_dht::routing::Contact::with_caps(
+                quiet,
+                "tcp://quiet",
+                veil_types::DiscoveryMode::Public,
+                false,
+            ));
+
+        let reg = Arc::new(RwLock::new(SessionTxRegistry::new()));
+        let mut rx = reg.write().unwrap().register(quiet);
+        disp.session_tx_registry = Some(Arc::clone(&reg));
+
+        Arc::new(disp).push_owned_dht_records(quiet, &reg);
+
+        assert!(
+            rx.try_recv().is_err(),
+            "a peer advertising NO_DHT_SERVICE must receive no owned-record push"
+        );
+    }
+
+    /// Silence is not a refusal: a peer the table has never heard from still
+    /// gets the push, because it has not asked for anything.
+    #[test]
+    fn an_unknown_peer_is_still_pushed_to() {
+        let (sk, _pk, local_id) = new_signer();
+        let mut disp = make_test_dispatcher(NodeRole::Core);
+        disp.local_node_id = local_id;
+        disp.dht = Arc::new(KademliaService::with_config(
+            local_id,
+            veil_dht::DhtRuntimeConfig {
+                allow_unsigned_store: true,
+                ..Default::default()
+            },
+        ));
+
+        let entry = AppEndpointEntry {
+            node_id: local_id,
+            app_id: [0xA5u8; 32],
+            endpoint_id: 7,
+            gateway_node_id: None,
+            epoch: 1,
+            expires_at: u64::MAX / 2,
+            max_concurrent_streams: 4,
+            protocol_version: 1,
+            bandwidth_hint_kbps: 64,
+        };
+        let key = app_endpoint_key(&entry.node_id, &entry.app_id, entry.endpoint_id);
+        let value = entry.encode_for_dht_signed(&sk);
+        disp.dht
+            .handle_store(StorePayload::unsigned(key, value))
+            .unwrap();
+
+        let reg = Arc::new(RwLock::new(SessionTxRegistry::new()));
+        let stranger: [u8; 32] = [0x33; 32];
+        let mut rx = reg.write().unwrap().register(stranger);
+        disp.session_tx_registry = Some(Arc::clone(&reg));
+
+        Arc::new(disp).push_owned_dht_records(stranger, &reg);
+
+        assert!(
+            rx.try_recv().is_ok(),
+            "a peer we have never heard from has refused nothing"
+        );
     }
 
     /// Signed AppEndpoint record owned by this node is pushed to the new peer.
