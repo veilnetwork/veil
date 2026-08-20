@@ -828,6 +828,20 @@ pub struct AdminRouteEntry {
     pub score: u32,
     /// Hop count (1 = direct peer).
     pub hops: u8,
+    /// Whether a lookup has ever chosen this path since it was cached.
+    ///
+    /// `RouteCacheEntry::last_used` is zero until something selects the entry,
+    /// so this is the difference between a route that carries traffic and one
+    /// that is only a failover candidate. Every destination holds up to
+    /// `MAX_ROUTES_PER_DST` = 4, and on a live testnet all of them held
+    /// exactly 4 — a saturated cache tells you nothing about how many are
+    /// needed unless you can see which ones are used.
+    ///
+    /// `serde(default)` so a newer client can still read an older node's
+    /// answer, where the field is absent and "never chosen" is the safe
+    /// reading.
+    #[serde(default)]
+    pub used: bool,
 }
 
 /// one row of `node mesh-status` output — leaf-side view
@@ -3074,12 +3088,13 @@ async fn execute_admin_command(
             let routes = rt
                 .route_cache_all()
                 .into_iter()
-                .filter(|(dst, _, _, _)| filter_bytes.is_none_or(|f| *dst == f))
-                .map(|(dst, next_hop, score, hops)| AdminRouteEntry {
-                    dst: node_id_hex(&dst),
-                    next_hop: node_id_hex(&next_hop),
-                    score,
-                    hops,
+                .filter(|r| filter_bytes.is_none_or(|f| r.dst == f))
+                .map(|r| AdminRouteEntry {
+                    dst: node_id_hex(&r.dst),
+                    next_hop: node_id_hex(&r.next_hop),
+                    score: r.score,
+                    hops: r.hop_count,
+                    used: r.used,
                 })
                 .collect();
             let (mp_en, mp_paths, mp_min_prio, redund, ecmp_band) = rt.multi_path_config();

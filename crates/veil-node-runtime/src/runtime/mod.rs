@@ -3987,7 +3987,7 @@ impl NodeRuntime {
     }
 
     /// Return `(dst, next_hop, score, hop_count)` for every non-expired route.
-    pub fn route_cache_all(&self) -> Vec<([u8; 32], [u8; 32], u32, u8)> {
+    pub fn route_cache_all(&self) -> Vec<veil_routing::cache::RouteSnapshot> {
         rlock!(self.routing.route_cache).all_routes_with_score()
     }
 
