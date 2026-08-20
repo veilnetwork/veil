@@ -284,17 +284,58 @@ const CIRCUIT_PUBLISHED_RELAY_EXPAND_AFTER: Duration = Duration::from_secs(5);
 const CIRCUIT_REFRESH_POLL: Duration = Duration::from_secs(5);
 // How often the receiver sends a FORWARD keepalive heartbeat up each pinned
 // inbound circuit (`veil_anonymity::circuit_data::CIRCUIT_HEARTBEAT_MAGIC`).
-// The inbound circuit is otherwise receive-only, so its first-hop TCP session
-// only carries traffic when the node happens to transmit for another reason;
-// left idle it dies (mobile power-save / NAT rebind / VPN) and the rendezvous
-// relay's downstream introduce pushes queue behind a dead socket until the
-// node next sends — the measured 10–60 s delivery stalls that flushed in a
-// batch. 15 s beats the ~10–20 s stalls and stays well under the session
-// keepalive base (30 s, stretched ×up-to-120 in background). One tiny cell per
-// circuit per interval — negligible cost. Must be a multiple-ish of
-// CIRCUIT_REFRESH_POLL (5 s); the poll loop fires it on the first tick at/after
-// the interval.
-const CIRCUIT_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
+//
+// "One tiny cell — negligible cost" was wrong, and measurably so. The payload
+// is eight bytes, but it rides one whole circuit cell: 16384 B padded, 16418 B
+// on the wire. At the old 15 s cadence that was 56% of an idle phone's entire
+// traffic — the single largest line item in a 2.63 GB/day idle bill.
+//
+// The cadence was chosen against the session keepalive: "15 s ... stays well
+// under the session keepalive base (30 s, stretched ×up-to-120 in background)".
+// That premise does not hold for this deployment. xVeil configures
+// `session.keepalive_interval_secs = 10` and never sets
+// `mobile.background_keepalive_multiplier`, whose default is 1 — so nothing
+// stretches, and a jittered ~10 s keepalive is already keeping the first-hop
+// socket (and its NAT mapping) warm, at 25-120 B a frame instead of 16418.
+// Warming the socket is therefore NOT this heartbeat's job; the cheaper
+// mechanism was doing it all along, four times as often.
+//
+// What is left, and what this cadence is now sized against, is the relay-side
+// circuit state: `CircuitTable` GCs any circuit whose `last_seen_unix` is older
+// than DEFAULT_CIRCUIT_TTL_SECS (300 s), and every accepted cell `touch`es it
+// at every hop. So the heartbeat must land inside 300 s even after losses.
+// The budget is therefore the WORST gap, not the average one: two consecutive
+// misses means three gaps must still fit in 300 s, so the longest a jittered
+// draw may produce is 100 s. 75 s ±20% tops out at 90 s (3 × 90 = 270 s) and
+// cuts the cell rate five-fold. The compile-time assert below holds that tie to
+// the relay's own constant, because the two numbers live in different crates
+// and nothing else would notice them drifting apart.
+//
+// Jittered per fire, for the same reason the session keepalive is: an exactly
+// periodic cell is a pattern an observer can lock onto without decrypting it,
+// and this one was measured at exactly 15.0 s. The draw is quantised by the
+// poll loop, which fires it on the first tick at/after the target.
+const CIRCUIT_HEARTBEAT_INTERVAL_SECS: u64 = 75;
+/// Jitter applied to each heartbeat wait, as a percentage of the interval.
+const CIRCUIT_HEARTBEAT_JITTER_PCT: u64 = 20;
+const CIRCUIT_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(CIRCUIT_HEARTBEAT_INTERVAL_SECS);
+/// Longest wait a jittered draw can produce.
+const CIRCUIT_HEARTBEAT_MAX_SECS: u64 = CIRCUIT_HEARTBEAT_INTERVAL_SECS
+    + CIRCUIT_HEARTBEAT_INTERVAL_SECS * CIRCUIT_HEARTBEAT_JITTER_PCT / 100;
+// Two consecutive misses must still leave the relay-side circuit alive.
+const _: () = assert!(
+    3 * CIRCUIT_HEARTBEAT_MAX_SECS < veil_anonymity::circuit_table::DEFAULT_CIRCUIT_TTL_SECS,
+    "heartbeat cadence must keep the relay's circuit state inside its idle TTL"
+);
+
+/// A fresh heartbeat wait: `CIRCUIT_HEARTBEAT_INTERVAL` ±`CIRCUIT_HEARTBEAT_JITTER_PCT`.
+fn circuit_heartbeat_wait() -> Duration {
+    use rand_core::{OsRng, RngCore};
+    let base = CIRCUIT_HEARTBEAT_INTERVAL.as_millis() as u64;
+    let span = base * CIRCUIT_HEARTBEAT_JITTER_PCT * 2 / 100;
+    let low = base - span / 2;
+    Duration::from_millis(low + u64::from(OsRng.next_u32()) % span.max(1))
+}
 const CIRCUIT_CONFIRM_TIMEOUT: Duration = Duration::from_secs(10);
 // Loopback splice-probe cadence inside the confirm window: give the ordinary
 // CircuitBuilt ACK a short head start, then probe repeatedly (each probe is an
@@ -3575,6 +3616,7 @@ fn try_open_circuit(
             retire_circuits_later(&services_bg, retired);
 
             let mut last_heartbeat = Instant::now();
+            let mut heartbeat_wait = circuit_heartbeat_wait();
             loop {
                 tokio::time::sleep(CIRCUIT_REFRESH_POLL).await;
                 let now = Instant::now();
@@ -3587,8 +3629,9 @@ fn try_open_circuit(
                 // sends don't hold the slot lock; a QueueFull/NoRelays here is
                 // harmless (the next tick retries, and a truly dead circuit is
                 // rotated by the idle-refresh below).
-                if now.saturating_duration_since(last_heartbeat) >= CIRCUIT_HEARTBEAT_INTERVAL {
+                if now.saturating_duration_since(last_heartbeat) >= heartbeat_wait {
                     last_heartbeat = now;
+                    heartbeat_wait = circuit_heartbeat_wait();
                     let circs: Vec<Arc<veil_node_runtime::DataCircuit>> =
                         circuit_slot.lock().await.iter().cloned().collect();
                     for circ in &circs {
