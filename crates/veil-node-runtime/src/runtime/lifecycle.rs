@@ -1200,6 +1200,7 @@ impl NodeRuntime {
             // Shared, not fresh: a rebuilt dispatcher that forgot what it had
             // already relayed would forward the whole plane again.
             route_forward_last: Arc::clone(&self.dispatcher.route_forward_last),
+            owned_push_last: Arc::clone(&self.dispatcher.owned_push_last),
             pow_solver_semaphore: Arc::clone(&self.dispatcher.pow_solver_semaphore),
             pow_active_difficulty: Arc::clone(&self.dispatcher.pow_active_difficulty),
             pow_challenge_seen: Arc::clone(&self.dispatcher.pow_challenge_seen),

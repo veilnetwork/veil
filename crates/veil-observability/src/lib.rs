@@ -352,6 +352,13 @@ pub struct NodeMetrics {
     /// beside `gossip_announces_rx_total` to see how much of the plane was
     /// repetition.
     gossip_forward_suppressed_total: Arc<AtomicU64>,
+    /// Owned-record pushes skipped because the peer already had exactly this
+    /// set and its copies had not had time to expire.
+    ///
+    /// The push runs on every session open, inbound included, so its frequency
+    /// belongs to the remote side: a peer that reconnects often took the same
+    /// dump every time.
+    owned_push_suppressed_total: Arc<AtomicU64>,
     /// Exit-proxy CONNECT targets denied by `is_forbidden_destination`
     /// (loopback/private/link-local/metadata)..
     exit_proxy_dest_denied_total: Arc<AtomicU64>,
@@ -499,6 +506,7 @@ pub struct MetricsSnapshot {
     // Denial/drop counters
     pub unknown_origin_gossip_rejected_total: u64,
     pub gossip_forward_suppressed_total: u64,
+    pub owned_push_suppressed_total: u64,
     pub exit_proxy_dest_denied_total: u64,
     pub socks5_accepts_throttled_total: u64,
     pub gateway_lift_seen_evicted_total: u64,
@@ -696,6 +704,7 @@ impl NodeMetrics {
             gossip_announces_rx_total: counter!(),
             unknown_origin_gossip_rejected_total: counter!(),
             gossip_forward_suppressed_total: counter!(),
+            owned_push_suppressed_total: counter!(),
             exit_proxy_dest_denied_total: counter!(),
             socks5_accepts_throttled_total: counter!(),
             gateway_lift_seen_evicted_total: counter!(),
@@ -918,6 +927,11 @@ impl NodeMetrics {
 
     pub fn inc_gossip_forward_suppressed(&self) {
         self.gossip_forward_suppressed_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn inc_owned_push_suppressed(&self) {
+        self.owned_push_suppressed_total
             .fetch_add(1, Ordering::Relaxed);
     }
 
@@ -1386,6 +1400,7 @@ impl NodeMetrics {
             gossip_announces_rx_total: load!(gossip_announces_rx_total),
             unknown_origin_gossip_rejected_total: load!(unknown_origin_gossip_rejected_total),
             gossip_forward_suppressed_total: load!(gossip_forward_suppressed_total),
+            owned_push_suppressed_total: load!(owned_push_suppressed_total),
             exit_proxy_dest_denied_total: load!(exit_proxy_dest_denied_total),
             socks5_accepts_throttled_total: load!(socks5_accepts_throttled_total),
             gateway_lift_seen_evicted_total: load!(gateway_lift_seen_evicted_total),
@@ -1634,6 +1649,10 @@ impl NodeMetrics {
         counter!(
             "veil_gossip_forward_suppressed_total",
             s.gossip_forward_suppressed_total
+        );
+        counter!(
+            "veil_owned_push_suppressed_total",
+            s.owned_push_suppressed_total
         );
         // Denial/drop counters
         counter!(
