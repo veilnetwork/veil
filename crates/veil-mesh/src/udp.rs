@@ -341,6 +341,39 @@ impl UdpRealm {
         self.obfs.clone()
     }
 
+    /// Bind the SHARED socket that beacons are received on.
+    ///
+    /// Beacons are broadcast, and the kernel fans a broadcast datagram out to
+    /// EVERY socket bound to the port — measured 4/4 and 4/4 across two
+    /// processes. Unicast is the opposite: it goes to exactly one of them
+    /// (0/10 and 10/10 in the same run). That is why this is a socket of its
+    /// own rather than `SO_REUSEPORT` on the realm socket: the realm socket
+    /// carries DATA, and sharing its port would repair discovery by silently
+    /// stealing half the traffic it exists to deliver.
+    ///
+    /// The beacon port therefore has to be a port nothing sends unicast to —
+    /// which is why `beacon_addr` defaults to a port no realm binds. Two nodes
+    /// on one host give their realms different `bind_addr`s, as they must
+    /// (a unicast port cannot be shared), and still hear each other here.
+    ///
+    /// `SO_REUSEPORT` is unix-only. On Windows the equivalent lets a second
+    /// process TAKE a bound port rather than share it, so the socket is bound
+    /// plainly there and the same-host case stays unsupported — a documented
+    /// limitation, not a silent one.
+    pub fn bind_beacon_receiver(port: u16) -> std::io::Result<UdpSocket> {
+        use socket2::{Domain, Protocol, Socket, Type};
+        let sock = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
+        #[cfg(unix)]
+        {
+            sock.set_reuse_address(true)?;
+            sock.set_reuse_port(true)?;
+        }
+        let addr: SocketAddr = (std::net::Ipv4Addr::UNSPECIFIED, port).into();
+        sock.bind(&addr.into())?;
+        sock.set_nonblocking(true)?;
+        UdpSocket::from_std(sock.into())
+    }
+
     /// Create a `UdpLink` toward `remote_addr` for `remote_id`.
     pub fn link_to(&self, remote_id: [u8; 32], remote_addr: SocketAddr) -> UdpLink {
         UdpLink::new(
@@ -449,9 +482,14 @@ impl UdpRealm {
     /// //... normal dispatch
     /// }
     /// ```
-    pub fn make_beacon_receiver(&self, neighbors: NeighborTable) -> BeaconReceiver {
+    pub fn make_beacon_receiver(
+        &self,
+        local_node_id: [u8; 32],
+        neighbors: NeighborTable,
+    ) -> BeaconReceiver {
         BeaconReceiver::new(
             self.realm_id,
+            local_node_id,
             neighbors,
             Arc::clone(&self.std_socket),
             self.obfs.clone(),
@@ -466,43 +504,54 @@ impl UdpRealm {
         let mut buf = vec![0u8; MAX_UDP_FRAME];
         loop {
             let (len, src) = self.socket.recv_from(&mut buf).await?;
-            let wire = &buf[..len];
-            // With a realm obfs key, legitimate peers seal every frame (C-03
-            // seals beacons too). On open failure we fall back to a plaintext
-            // decode ONLY for BROADCAST frames — cleartext beacons may still
-            // arrive from cross-config / discovering peers, and are separately
-            // gated by `BeaconReceiver::require_signed`. An unsealed UNICAST
-            // frame is a DATA injection attempt and is REJECTED, so realm_psk
-            // gates admission of DATA, not just its confidentiality. Without a
-            // key, decode directly (unchanged behaviour).
-            let frame = match &self.obfs {
-                Some(key) => match veil_udp_obfs::open_datagram(key, wire) {
-                    Ok((_counter, payload)) => MeshFrame::decode(&payload).ok(),
-                    Err(_) => MeshFrame::decode(wire).ok().filter(MeshFrame::is_broadcast),
-                },
-                None => MeshFrame::decode(wire).ok(),
-            };
-            if let Some(frame) = frame {
-                // End-to-end replay guard: a captured sealed datagram re-opens
-                // and re-decodes cleanly, so AEAD alone does not stop replays.
-                // The originator stamps a per-frame nonce that survives every
-                // forward hop; drop any `(src, nonce)` we have recently seen.
-                // `nonce == 0` means unset (legacy / plaintext-origin frames,
-                // e.g. beacons) and is not checked. (audit cycle-2 HIGH.)
-                if frame.nonce != 0
-                    && self
-                        .replay
-                        .lock()
-                        .unwrap_or_else(|p| p.into_inner())
-                        .check_and_record(frame.src_node_id, frame.nonce)
-                {
-                    // Replayed / duplicate frame — drop and keep receiving.
-                    continue;
-                }
+            if let Some(frame) = self.decode_datagram(&buf[..len]) {
                 return Ok((frame, src));
             }
-            // Malformed datagram — silently drop and retry
+            // Malformed, or a replay this realm has already seen — drop and
+            // keep receiving.
         }
+    }
+
+    /// Open and decode one datagram under this realm's rules.
+    ///
+    /// Shared with the beacon-receive socket so the two do not drift: the
+    /// unseal fallback, the broadcast-only exemption and the replay guard are
+    /// admission policy, and admission policy stated twice is admission policy
+    /// that will eventually disagree with itself.
+    ///
+    /// `None` means "do not deliver this": undecodable, or a replay.
+    pub fn decode_datagram(&self, wire: &[u8]) -> Option<MeshFrame> {
+        // With a realm obfs key, legitimate peers seal every frame (C-03
+        // seals beacons too). On open failure we fall back to a plaintext
+        // decode ONLY for BROADCAST frames — cleartext beacons may still
+        // arrive from cross-config / discovering peers, and are separately
+        // gated by `BeaconReceiver::require_signed`. An unsealed UNICAST
+        // frame is a DATA injection attempt and is REJECTED, so realm_psk
+        // gates admission of DATA, not just its confidentiality. Without a
+        // key, decode directly (unchanged behaviour).
+        let frame = match &self.obfs {
+            Some(key) => match veil_udp_obfs::open_datagram(key, wire) {
+                Ok((_counter, payload)) => MeshFrame::decode(&payload).ok(),
+                Err(_) => MeshFrame::decode(wire).ok().filter(MeshFrame::is_broadcast),
+            },
+            None => MeshFrame::decode(wire).ok(),
+        }?;
+        // End-to-end replay guard: a captured sealed datagram re-opens
+        // and re-decodes cleanly, so AEAD alone does not stop replays.
+        // The originator stamps a per-frame nonce that survives every
+        // forward hop; drop any `(src, nonce)` we have recently seen.
+        // `nonce == 0` means unset (legacy / plaintext-origin frames,
+        // e.g. beacons) and is not checked. (audit cycle-2 HIGH.)
+        if frame.nonce != 0
+            && self
+                .replay
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .check_and_record(frame.src_node_id, frame.nonce)
+        {
+            return None;
+        }
+        Some(frame)
     }
 }
 
@@ -721,7 +770,7 @@ mod tests {
         // legacy opt-out: these discovery/rate-limit tests use unsigned beacons
         // (`new_basic`); the default now requires signed.
         let mut receiver_a = realm_a
-            .make_beacon_receiver(neighbors_a.clone())
+            .make_beacon_receiver([0xA7u8; 32], neighbors_a.clone())
             .with_require_signed(false);
 
         // B sends beacons directly to A's address (unicast on loopback).
@@ -813,7 +862,7 @@ mod tests {
         // legacy opt-out: these discovery/rate-limit tests use unsigned beacons
         // (`new_basic`); the default now requires signed.
         let mut receiver_a = realm_a
-            .make_beacon_receiver(neighbors_a.clone())
+            .make_beacon_receiver([0xA7u8; 32], neighbors_a.clone())
             .with_require_signed(false);
 
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
@@ -861,7 +910,7 @@ mod tests {
         // legacy opt-out: these discovery/rate-limit tests use unsigned beacons
         // (`new_basic`); the default now requires signed.
         let mut receiver_a = realm_a
-            .make_beacon_receiver(neighbors_a.clone())
+            .make_beacon_receiver([0xA7u8; 32], neighbors_a.clone())
             .with_require_signed(false);
 
         // Flood: send MAX+1 beacons from B using distinct node IDs (so the
@@ -898,6 +947,39 @@ mod tests {
 
     /// A freshly-created `UdpLink` (never sent) is alive because `last_success`
     /// is initialised to `now`.
+    /// Two beacon sockets can hold the same port at once.
+    ///
+    /// That is the property this code provides, and the whole reason the
+    /// beacon port is separate from the realm port: the kernel fans a
+    /// BROADCAST datagram out to every socket bound to a port, so two nodes on
+    /// one host both hear beacons. Measured across two processes before this
+    /// was written — 4/4 and 4/4.
+    ///
+    /// ⛔ The first version of this test also asserted delivery, and sent to
+    /// `127.0.0.1` to avoid depending on broadcast in a sandbox. That
+    /// contradicted the measurement it was built on: UNICAST under
+    /// `SO_REUSEPORT` goes to exactly ONE socket (0/10 and 10/10 in the same
+    /// run), which is precisely why the realm's unicast port must not be
+    /// shared. It passed once by luck and failed the next run. Delivery is a
+    /// kernel property, established live and recorded in
+    /// `artifacts/lan-beacon-never-left-the-host-2026-08-20.md`; what belongs
+    /// here is the bind.
+    ///
+    /// Break-check: drop `set_reuse_port` and the second bind fails with
+    /// `AddrInUse`.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn two_beacon_sockets_can_share_one_port() {
+        // A concrete port, because binding the SAME one twice is the point.
+        // A machine that already holds it is not a failed assertion.
+        const PORT: u16 = 39_431;
+        let Ok(_first) = UdpRealm::bind_beacon_receiver(PORT) else {
+            return;
+        };
+        UdpRealm::bind_beacon_receiver(PORT)
+            .expect("a second socket must be able to share the beacon port");
+    }
+
     #[test]
     fn fresh_link_is_alive() {
         let socket = Arc::new(std::net::UdpSocket::bind("127.0.0.1:0").unwrap());

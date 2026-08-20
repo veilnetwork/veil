@@ -198,7 +198,7 @@ pub(crate) fn apply_profile_defaults(
                 bind_addr: "0.0.0.0:9100".to_owned(),
                 realm_id: "0".repeat(32),
                 realm_psk: None,
-                beacon_addr: "255.255.255.255:9100".to_owned(),
+                beacon_addr: "255.255.255.255:9101".to_owned(),
                 autodiscover_gateway: true,
                 autodiscover_max_concurrent: 3,
                 beacon_dedup_window_secs: 3,
@@ -244,7 +244,7 @@ pub(crate) fn apply_profile_defaults(
                 bind_addr: "0.0.0.0:9100".to_owned(),
                 realm_id: "0".repeat(32),
                 realm_psk: None,
-                beacon_addr: "255.255.255.255:9100".to_owned(),
+                beacon_addr: "255.255.255.255:9101".to_owned(),
                 autodiscover_gateway: true,
                 autodiscover_max_concurrent: 3,
                 beacon_dedup_window_secs: 3,
@@ -1120,6 +1120,66 @@ fn set_existing_value<O: ConfigOps>(
         veil_cfg::set(config, key, value)?;
         Ok(ConfigMutation::save(path.to_path_buf()))
     })
+}
+
+#[cfg(test)]
+mod beacon_port_tests {
+    /// Every shipped profile must beacon to a port its own realm does not bind.
+    ///
+    /// Beacons are received on a socket SHARED by every node on the host
+    /// (`SO_REUSEPORT`), because the kernel fans a broadcast out to all of
+    /// them. It hands each UNICAST datagram to exactly one — measured 4/4 and
+    /// 4/4 against 0/10 and 10/10 across two processes. So the beacon port has
+    /// to be a port nothing sends unicast to. If a profile ever sets them
+    /// equal, the shared socket lands on the realm's DATA port and the kernel
+    /// starts giving that DATA away; nothing else in the tree would notice.
+    ///
+    /// Break-check: set `beacon_addr` back to `:9100` in either profile.
+    #[test]
+    fn no_profile_beacons_to_its_own_realm_port() {
+        // Both shipped profiles that enable mesh, read from the code that
+        // builds them rather than from a copy of their numbers.
+        for profile in [
+            crate::cmd::cli::ConfigProfile::CensorshipTarget,
+            crate::cmd::cli::ConfigProfile::Mobile,
+        ] {
+            let mut config = veil_cfg::Config::default();
+            super::apply_profile_defaults(&mut config, profile);
+            let Some(mesh) = config.mesh else {
+                panic!("{profile:?} was expected to enable mesh");
+            };
+            let realm: std::net::SocketAddr = mesh.bind_addr.parse().expect("realm addr");
+            let beacon: std::net::SocketAddr = mesh.beacon_addr.parse().expect("beacon addr");
+            assert_ne!(
+                realm.port(),
+                beacon.port(),
+                "profile {profile:?} beacons to the port its realm binds — a \
+                 shared beacon socket there would steal unicast DATA"
+            );
+        }
+    }
+
+    /// And the serde default is separate too, for a hand-written `[mesh]`
+    /// section that names only `bind_addr` and `realm_id`.
+    ///
+    /// 9100 is not arbitrary: it is the port every shipped profile binds its
+    /// realm to, and the one a hand-written config copies from the docs.
+    #[test]
+    fn the_serde_default_beacon_port_is_not_the_conventional_realm_port() {
+        let toml = concat!(
+            "bind_addr = \"0.0.0.0:9100\"\n",
+            "realm_id = \"00000000000000000000000000000000\"\n",
+        );
+        let cfg: veil_cfg::MeshConfig =
+            toml::from_str(toml).expect("a minimal mesh section parses");
+        let beacon: std::net::SocketAddr = cfg.beacon_addr.parse().expect("beacon addr");
+        assert_ne!(
+            beacon.port(),
+            9100,
+            "the default beacon port must not land on the realm port a \
+             hand-written config binds"
+        );
+    }
 }
 
 #[cfg(test)]

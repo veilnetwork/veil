@@ -4956,7 +4956,19 @@ mod node_role_tests {
 // at top of this file). See comment above.
 
 fn default_beacon_addr() -> String {
-    "255.255.255.255:9100".to_owned()
+    // 9101, NOT the realm port.
+    //
+    // Beacons are received on a socket shared by every node on the host
+    // (`SO_REUSEPORT`), because the kernel fans broadcast out to all of them.
+    // It hands each UNICAST datagram to exactly one, so the beacon port must
+    // be a port nothing sends unicast to — sharing the realm port would repair
+    // discovery by stealing DATA. Keeping them equal was why a second node on
+    // one host silently ran with mesh disabled.
+    //
+    // ⚠️ Changing this is a WIRE-VISIBLE default: a node on 9101 does not hear
+    // a node still beaconing to 9100. Deliberate, and taken in one step rather
+    // than with a dual-send window.
+    "255.255.255.255:9101".to_owned()
 }
 
 // `default_nonce_base64` moved to veil-types so the

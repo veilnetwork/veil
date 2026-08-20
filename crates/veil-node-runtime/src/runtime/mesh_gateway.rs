@@ -290,6 +290,7 @@ impl NodeRuntime {
         };
 
         let realm_recv = Arc::clone(realm);
+        let local_node_id = self.dispatcher.local_node_id;
         let neighbors = Arc::new(NeighborTable::new());
         let autodiscovered_recv = Arc::clone(&self.autodiscovered_peers);
         let autodiscover_enabled = mesh_cfg.autodiscover_gateway;
@@ -339,11 +340,41 @@ impl NodeRuntime {
             crate::mesh_glue::RttBatterySink::new(Arc::clone(&self.routing.rtt_table)),
         );
         let beacon_dedup_window = std::time::Duration::from_secs(mesh_cfg.beacon_dedup_window_secs);
+        // The port beacons are SENT to is the port they must be received on.
+        // Reading it from `beacon_addr` rather than from `bind_addr` is the
+        // whole point of the split: the realm keeps a private unicast port per
+        // node, and every node on the host shares this one.
+        let beacon_port = match mesh_cfg.beacon_addr.parse::<std::net::SocketAddr>() {
+            Ok(a) => a.port(),
+            Err(_) => {
+                self.logger.warn(
+                    "mesh.beacon.bad_addr",
+                    format!(
+                        "beacon_addr `{}` is not an address:port — no beacons                          will be received",
+                        mesh_cfg.beacon_addr
+                    ),
+                );
+                return;
+            }
+        };
+        let beacon_socket = match veil_mesh::UdpRealm::bind_beacon_receiver(beacon_port) {
+            Ok(sock) => sock,
+            Err(error) => {
+                self.logger.warn(
+                    "mesh.beacon.recv_bind_failed",
+                    format!(
+                        "could not bind the shared beacon port {beacon_port}:                          {error} — this node sends beacons but hears none"
+                    ),
+                );
+                return;
+            }
+        };
         let mut recv_shutdown = shutdown_tx.subscribe();
         let handle = tokio::spawn(async move {
             let mut receiver = {
                 let r = veil_mesh::BeaconReceiver::new(
                     realm_id,
+                    local_node_id,
                     (*neighbors).clone(),
                     std_socket,
                     beacon_obfs,
@@ -356,17 +387,31 @@ impl NodeRuntime {
                     r.disable_autodiscovery()
                 }
             };
+            let mut buf = vec![0u8; veil_mesh::MAX_UDP_FRAME];
             loop {
                 tokio::select! {
                     Ok(_) = recv_shutdown.changed() => {
                         if *recv_shutdown.borrow() { break; }
                     }
-                    result = realm_recv.recv_frame() => {
-                        match result {
-                            Ok((frame, addr)) if frame.is_broadcast() => {
-                                receiver.handle_beacon(&frame, addr);
+                    // Beacons arrive on their OWN socket, shared with every
+                    // other node on this host. The realm socket is not read
+                    // here any more: it carries unicast DATA, and a port
+                    // carrying unicast cannot be shared — the kernel hands
+                    // each unicast datagram to exactly one socket, so sharing
+                    // the realm port would have repaired discovery by stealing
+                    // DATA. Admission is still the realm's: `decode_datagram`
+                    // is the same unseal / broadcast-exemption / replay path
+                    // `recv_frame` uses.
+                    got = beacon_socket.recv_from(&mut buf) => {
+                        match got {
+                            Ok((len, addr)) => {
+                                if let Some(frame) =
+                                    realm_recv.decode_datagram(&buf[..len])
+                                    && frame.is_broadcast()
+                                {
+                                    receiver.handle_beacon(&frame, addr);
+                                }
                             }
-                            Ok(_) => {} // unicast — handled elsewhere
                             Err(_) => break,
                         }
                     }
