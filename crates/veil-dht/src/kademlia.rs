@@ -1371,6 +1371,25 @@ impl KademliaService {
         false
     }
 
+    /// May we send this peer a replica it did not ask for?
+    ///
+    /// Reads the ROUTING TABLE rather than the contact the walk handed back. The
+    /// table holds what the peer actually said at handshake; a walk result can
+    /// carry a contact assembled from a referral on the wire, and trusting that
+    /// for a policy decision is how the statement got lost the first time.
+    ///
+    /// Counts the refusal for the same reason [`Self::count_service_skip`] does:
+    /// a mechanism nobody can measure is one nobody can tell from a mechanism
+    /// that silently does nothing.
+    fn count_replica_skip(&self, node_id: &[u8; 32]) -> bool {
+        if self.peer_serves_dht(node_id) {
+            return true;
+        }
+        self.no_service_skips
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        false
+    }
+
     /// May we hand this peer work it did not ask for?
     ///
     /// `true` when the peer has not told us otherwise — an unknown peer has
@@ -1808,6 +1827,24 @@ impl KademliaService {
         // reach K peers?" metric).
         let mut sent = 0usize;
         for contact in closest {
+            // The fan-out goes over the walk RESULT, and the walk result is the
+            // one place a declining peer could still reach: every candidate-
+            // selection filter sits upstream of it. Deferred on 2026-08-19 for a
+            // reason that has since been measured away -- the worry was that
+            // filtering here shrinks the replica set, and in a network with
+            // three `core` seeds that could not be done blind. It was then
+            // measured: the declining peer held 4 records (its own publications)
+            // against the seeds' 237, and accepted 0 of 506 offered. It is not
+            // in the replica set, so removing it costs nothing; the bytes were
+            // being sent and discarded.
+            //
+            // The caveat that stands is O4: this must not fire for a peer whose
+            // capabilities are UNKNOWN. `peer_serves_dht` answers `true` for a
+            // node the table has not heard from -- silence is not a refusal, and
+            // treating it as one would shrink replication for real.
+            if !self.count_replica_skip(&contact.node_id) {
+                continue;
+            }
             let request_id = self.store_req_id.fetch_add(1, Ordering::Relaxed);
             let payload = StorePayload::unsigned(key, value.clone());
             let body = payload.encode();
@@ -2253,6 +2290,154 @@ mod tests {
         assert!(
             found.iter().any(|c| c.node_id == stranger),
             "a peer the table has never heard from has refused nothing"
+        );
+    }
+
+    /// Router that records every (peer, msg_type) it is asked to send, so a
+    /// test can tell "the walk asked it" from "the fan-out stored to it".
+    #[cfg(test)]
+    struct RecordingRouter {
+        peers: Vec<[u8; 32]>,
+        seen: std::sync::Mutex<Vec<([u8; 32], u16)>>,
+    }
+    impl FrameRouter for RecordingRouter {
+        fn send_request(
+            &self,
+            peer: [u8; 32],
+            _request_id: u32,
+            frame: Vec<u8>,
+        ) -> Option<tokio::sync::oneshot::Receiver<Option<Vec<u8>>>> {
+            let mt = veil_proto::codec::decode_header(&frame)
+                .map(|h| h.msg_type)
+                .unwrap_or(u16::MAX);
+            self.seen.lock().unwrap().push((peer, mt));
+            // Sender dropped: the walk gets no answer, so the result is the
+            // seed set — the same shape `SilentRouter` gives, but recorded.
+            let (_tx, rx) = tokio::sync::oneshot::channel();
+            Some(rx)
+        }
+        fn peer_ids(&self) -> Vec<[u8; 32]> {
+            self.peers.clone()
+        }
+    }
+
+    /// The replica fan-out must NOT overreach. A peer the table has never heard
+    /// from has refused nothing, so it is still a store target — this is the
+    /// arm that would quietly shrink replication if the gate read silence as
+    /// refusal.
+    ///
+    /// Break-check: make `count_replica_skip` return false for an unknown peer
+    /// and this goes red.
+    #[tokio::test]
+    async fn the_replica_fanout_still_stores_to_an_unknown_peer() {
+        let stranger = [0x33u8; 32];
+        let svc = make_test_kademlia_service([0x0Au8; 32]);
+        let router = Arc::new(RecordingRouter {
+            peers: vec![stranger],
+            seen: std::sync::Mutex::new(Vec::new()),
+        });
+
+        svc.store_replicated([0x42u8; 32], b"v".to_vec(), router.clone())
+            .await
+            .expect("replicates");
+
+        let store_ty = veil_proto::family::DiscoveryMsg::Store as u16;
+        assert!(
+            router
+                .seen
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(p, mt)| *p == stranger && *mt == store_ty),
+            "silence is not a refusal: an unknown peer must still get the replica"
+        );
+    }
+
+    /// The fan-out gate earns its place on a CACHED walk result.
+    ///
+    /// `find_node_iterative_network` short-circuits on a cached result, so a
+    /// result computed while a peer was still serving outlives the moment that
+    /// peer declines — its capabilities arrive at the next handshake, the cache
+    /// does not notice, and the republish tick fans out over the stale copy.
+    /// Every upstream filter has already run by then. This is the last decision
+    /// before the bytes leave, and it is the only one still standing.
+    ///
+    /// Break-check: drop the `count_replica_skip` guard in `store_replicated`
+    /// and the STORE goes to the peer that declined.
+    #[tokio::test]
+    async fn a_cached_walk_result_does_not_outlive_a_peers_refusal() {
+        let peer = [0x77u8; 32];
+        let key = [0x42u8; 32];
+        let svc = make_test_kademlia_service([0x0Au8; 32]);
+
+        // While it still served, a walk ran and its result was cached.
+        svc.add_contact_trusted(Contact::with_caps(
+            peer,
+            "tcp://p:9000",
+            veil_types::DiscoveryMode::Public,
+            true,
+        ));
+        let warm = svc
+            .find_node_iterative_network(key, Arc::new(SilentRouter(vec![peer])))
+            .await;
+        assert!(
+            warm.iter().any(|c| c.node_id == peer),
+            "precondition: the cached result must contain the peer"
+        );
+
+        // Then it declined. The cache still holds the old answer.
+        svc.add_contact_trusted(Contact::with_caps(
+            peer,
+            "tcp://p:9000",
+            veil_types::DiscoveryMode::Public,
+            false,
+        ));
+
+        let router = Arc::new(RecordingRouter {
+            peers: vec![peer],
+            seen: std::sync::Mutex::new(Vec::new()),
+        });
+        svc.store_replicated(key, b"v".to_vec(), router.clone())
+            .await
+            .expect("replicates");
+
+        let store_ty = veil_proto::family::DiscoveryMsg::Store as u16;
+        assert!(
+            !router
+                .seen
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(p, mt)| *p == peer && *mt == store_ty),
+            "a stale cached result must not put a declining peer back in the \
+             replica set"
+        );
+    }
+
+    /// The refusal arm of the same gate, stated on the predicate.
+    #[test]
+    fn the_replica_gate_refuses_a_known_decliner_and_allows_silence() {
+        let quiet = [0x77u8; 32];
+        let stranger = [0x33u8; 32];
+        let svc = make_test_kademlia_service([0x0Au8; 32]);
+        svc.add_contact_trusted(Contact::with_caps(
+            quiet,
+            "tcp://quiet:9000",
+            veil_types::DiscoveryMode::Public,
+            false,
+        ));
+
+        assert!(
+            !svc.count_replica_skip(&quiet),
+            "a known decliner is skipped"
+        );
+        assert!(
+            svc.count_replica_skip(&stranger),
+            "a peer we have never heard from has refused nothing"
+        );
+        assert!(
+            svc.no_dht_service_skips() >= 1,
+            "the refusal must be counted, or nobody can tell it from a no-op"
         );
     }
 
