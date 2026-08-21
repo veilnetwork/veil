@@ -1603,9 +1603,26 @@ impl KademliaService {
         };
         let mut seed_ids: std::collections::HashSet<[u8; 32]> =
             seeds.iter().map(|c| c.node_id).collect();
+        // The FIND_VALUE twin of the FIND_NODE seeding fix, and it was missed
+        // when that one landed: `Contact::new` says `caps_known: false`, which
+        // reads downstream as "serves, and nobody has said otherwise", so
+        // building one here for a peer whose CAPABILITIES frame we have already
+        // read throws that frame away — one line below the filter that had just
+        // honoured it. Two identical seeding sites, one of them fixed.
+        //
+        // Silence still seeds: a peer the table has never heard from has
+        // refused nothing, and dropping it would cut off every node we have not
+        // handshaked with yet — at startup, all of them.
         for peer_id in outbox.peer_ids() {
             if seed_ids.insert(peer_id) {
-                seeds.push(Contact::new(peer_id, ""));
+                match lock!(self.inner).routing.contact(&peer_id) {
+                    Some(known) => {
+                        if self.count_service_skip(known) {
+                            seeds.push(known.clone());
+                        }
+                    }
+                    None => seeds.push(Contact::new(peer_id, "")),
+                }
             }
         }
         let timeout = Duration::from_millis(self.dht_config.find_node_timeout_ms);
@@ -2350,6 +2367,66 @@ mod tests {
                 .iter()
                 .any(|(p, mt)| *p == stranger && *mt == store_ty),
             "silence is not a refusal: an unknown peer must still get the replica"
+        );
+    }
+
+    /// The FIND_VALUE walk seeds from sessions too, and that site kept the
+    /// blank-contact bug for as long as its FIND_NODE twin had it: two
+    /// identical loops, one of them fixed on 2026-08-19 and one not. The
+    /// declining peer went on being seeded into every value lookup — which is
+    /// what a `FindNodeV2` and its follow-up `ResolveTransport` to that peer
+    /// are made of.
+    ///
+    /// Break-check: restore `Contact::new(peer_id, "")` unconditionally and the
+    /// decliner is queried again.
+    #[tokio::test]
+    async fn a_session_peer_that_refused_is_not_seeded_into_the_value_walk() {
+        let quiet = [0x77u8; 32];
+        let svc = make_test_kademlia_service([0x0Au8; 32]);
+        svc.add_contact_trusted(Contact::with_caps(
+            quiet,
+            "tcp://quiet:9000",
+            veil_types::DiscoveryMode::Public,
+            false,
+        ));
+        let router = Arc::new(RecordingRouter {
+            peers: vec![quiet],
+            seen: std::sync::Mutex::new(Vec::new()),
+        });
+
+        let _ = svc
+            .find_value_iterative_network([0x42u8; 32], router.clone())
+            .await;
+
+        assert!(
+            router.seen.lock().unwrap().is_empty(),
+            "a peer that asked not to serve must not be seeded into a value walk"
+        );
+    }
+
+    /// The same site must not overreach: silence is not a refusal, so a session
+    /// peer the table has never heard from still seeds the value walk.
+    #[tokio::test]
+    async fn an_unknown_session_peer_still_seeds_the_value_walk() {
+        let stranger = [0x33u8; 32];
+        let svc = make_test_kademlia_service([0x0Au8; 32]);
+        let router = Arc::new(RecordingRouter {
+            peers: vec![stranger],
+            seen: std::sync::Mutex::new(Vec::new()),
+        });
+
+        let _ = svc
+            .find_value_iterative_network([0x42u8; 32], router.clone())
+            .await;
+
+        assert!(
+            router
+                .seen
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(p, _)| *p == stranger),
+            "a peer we have never heard from has refused nothing"
         );
     }
 
