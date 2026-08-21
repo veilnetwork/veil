@@ -7557,8 +7557,6 @@ pub struct DataCircuit {
     /// the circuit (in practice the 600 s origin-table TTL rotates first).
     next_seq: std::sync::atomic::AtomicU32,
     confirmed: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    /// Size of every cell on this circuit — the number its setup negotiated.
-    cell_bytes: veil_anonymity::circuit_data::CircuitCellBytes,
 }
 
 /// Detailed local enqueue result for pinned circuit DATA. This is intentionally
@@ -7805,12 +7803,7 @@ impl NodeServices {
         };
 
         // Build the origin circuit with the registration as terminus payload.
-        let (setup, mut origin) = match build_origin_circuit(
-            &hops,
-            veil_anonymity::circuit_origin::choose_cell_bytes(),
-            &reg.encode(),
-            now,
-        ) {
+        let (setup, mut origin) = match build_origin_circuit(&hops, &reg.encode(), now) {
             Ok(v) => v,
             Err(e) => {
                 log::warn!("build_onion_circuit_once NoRelays: build_origin_circuit failed: {e:?}");
@@ -7896,13 +7889,8 @@ impl NodeServices {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
-        let (setup, origin) = build_origin_circuit(
-            &hops,
-            veil_anonymity::circuit_origin::choose_cell_bytes(),
-            terminus_payload,
-            now,
-        )
-        .map_err(|_| AnonOnionSendError::NoRelays)?;
+        let (setup, origin) = build_origin_circuit(&hops, terminus_payload, now)
+            .map_err(|_| AnonOnionSendError::NoRelays)?;
         // Snapshot what the handle needs BEFORE the origin moves into the table.
         let circ = DataCircuit {
             first_hop: origin.first_hop,
@@ -7911,7 +7899,6 @@ impl NodeServices {
             keys: origin.circuit_keys.clone(),
             next_seq: std::sync::atomic::AtomicU32::new(0),
             confirmed: std::sync::Arc::clone(&origin.confirmed),
-            cell_bytes: origin.cell_bytes,
         };
         // Register the stream return-cell sink keyed by origin_circuit_id BEFORE
         // sending the build, so no early return cell is dropped once it comes up.
@@ -8521,8 +8508,7 @@ impl NodeServices {
         use veil_anonymity::circuit_wire::CircuitDataPayload;
 
         let seq = circ.alloc_seq().ok_or(DataCircuitSendError::NoRelays)?; // exhausted → rotate
-        let mut buf = wrap_payload(payload, circ.cell_bytes)
-            .map_err(|_| DataCircuitSendError::PayloadTooLarge)?;
+        let mut buf = wrap_payload(payload).map_err(|_| DataCircuitSendError::PayloadTooLarge)?;
         apply_layers(&circ.keys, Direction::Forward, seq, &mut buf)
             .map_err(|_| DataCircuitSendError::NoRelays)?;
         let cell = CircuitDataPayload {
@@ -8530,9 +8516,7 @@ impl NodeServices {
             seq,
             ciphertext: buf,
         };
-        let enc = cell
-            .encode(circ.cell_bytes)
-            .map_err(|_| DataCircuitSendError::NoRelays)?;
+        let enc = cell.encode().map_err(|_| DataCircuitSendError::NoRelays)?;
         self.send_relay_chain_frame(
             &circ.first_hop,
             veil_proto::family::RelayChainMsg::CircuitData,
