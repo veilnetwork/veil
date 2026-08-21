@@ -191,6 +191,31 @@ impl PeerQuerier for LocalPeerQuerier {
 /// `params.alpha` unqueried nodes per round until convergence.
 ///
 /// Returns up to `params.k` contacts closest to `target`.
+/// May a REFERRED contact be admitted to a walk's shortlist?
+///
+/// A peer that advertised `NO_DHT_SERVICE` asked not to be handed DHT work, and
+/// a shortlist entry is exactly that: every admission becomes a `FindNodeV2`, a
+/// `ResolveTransport` for whatever it answers, and a `STORE` if the walk ends on
+/// it. The selection paths (routing-table seeds, session seeds, the referrals a
+/// node hands OUT) all filter such a peer already — but the shortlist also grows
+/// from what other peers refer IN, and a referral arrives as a bare contact from
+/// the wire. So the gate belongs here, at admission, rather than at each of the
+/// places a name can arrive from.
+///
+/// Measured on a testnet leaf advertising the refusal: 0.42 `STORE`/s and 0.42
+/// `FindNodeV2`/s from EACH of three seeds, every one of them discarded on
+/// arrival — it held 0 of 506 records offered.
+///
+/// # The exemption is load-bearing
+///
+/// A walk whose TARGET is the declining peer is how anyone finds it at all: its
+/// transport, its rendezvous advertisement, the reply path to it. Declining to
+/// serve the DHT is not a request to become unreachable, and without this arm
+/// the refusal would silently cost the peer its own reachability.
+fn may_walk_into(contact: &Contact, target: &[u8; 32]) -> bool {
+    contact.dht_service() || &contact.node_id == target
+}
+
 pub async fn find_node_iterative(
     target: [u8; 32],
     seed_contacts: Vec<Contact>,
@@ -305,6 +330,20 @@ pub async fn find_node_iterative(
                 // peer_dist — i.e., the contact is genuinely closer to the
                 // target. Reject equal-distance siblings of the responder.
                 if r_dist >= peer_dist {
+                    filtered += 1;
+                    continue;
+                }
+                if !may_walk_into(&r, &target) {
+                    // Countable, because a mechanism nobody can see is one
+                    // nobody can tell from a mechanism that does nothing. This
+                    // should fall to zero once every referrer filters its own
+                    // responses; while it does not, it names who still refers a
+                    // peer that declined.
+                    log::debug!(
+                        "dht.walk.referral_declined referrer={} referred={}",
+                        veil_util::hex_short(&peer_id),
+                        veil_util::hex_short(&r.node_id),
+                    );
                     filtered += 1;
                     continue;
                 }
@@ -460,6 +499,9 @@ pub async fn find_value_iterative(
                         if r_dist >= peer_dist {
                             continue;
                         }
+                        if !may_walk_into(&r, &key) {
+                            continue;
+                        }
                         if shortlist_ids.insert(r.node_id) {
                             shortlist.push(r);
                             admitted += 1;
@@ -504,6 +546,137 @@ fn sort_by_distance(contacts: &mut [Contact], target: &[u8; 32]) {
 mod tests {
     use super::super::routing::RoutingTable;
     use super::*;
+
+    /// A querier that refers whatever it is told to, WITHOUT the service
+    /// filter — which is the case the admission gate exists for. The stock
+    /// [`LocalPeerQuerier`] filters `dht_service()` itself, so a test built on
+    /// it would pass whether or not the gate is there.
+    struct UnfilteredReferrer {
+        refers: Vec<Contact>,
+        asked: std::sync::Arc<Mutex<Vec<[u8; 32]>>>,
+    }
+
+    impl PeerQuerier for UnfilteredReferrer {
+        fn find_node<'a>(
+            &'a self,
+            peer_id: [u8; 32],
+            _target: [u8; 32],
+        ) -> Pin<Box<dyn Future<Output = Vec<Contact>> + Send + 'a>> {
+            lock!(self.asked).push(peer_id);
+            let refers = self.refers.clone();
+            Box::pin(async move { refers })
+        }
+
+        fn find_value<'a>(
+            &'a self,
+            peer_id: [u8; 32],
+            _key: [u8; 32],
+        ) -> Pin<Box<dyn Future<Output = FindValueResult> + Send + 'a>> {
+            lock!(self.asked).push(peer_id);
+            let refers = self.refers.clone();
+            Box::pin(async move { FindValueResult::Nodes(refers) })
+        }
+    }
+
+    /// A peer that asked not to serve the DHT must not be walked into just
+    /// because somebody referred it. Referrals arrive from the wire, so the
+    /// referrer's own filter cannot be relied on.
+    ///
+    /// Break-check: drop the `may_walk_into` arm in `find_node_iterative` and
+    /// the decliner is queried and returned.
+    #[tokio::test]
+    async fn a_referred_decliner_is_not_walked_into() {
+        let seed = [0x01u8; 32];
+        let decliner = [0x02u8; 32];
+        let target = [0xFFu8; 32];
+
+        let asked = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let querier = UnfilteredReferrer {
+            refers: vec![Contact::with_caps(
+                decliner,
+                "tcp://d:1",
+                veil_types::DiscoveryMode::Public,
+                false, // asked not to serve
+            )],
+            asked: std::sync::Arc::clone(&asked),
+        };
+
+        let out = find_node_iterative(
+            target,
+            vec![Contact::new(seed, "tcp://s:1")],
+            &querier,
+            &IterativeParams::default(),
+        )
+        .await;
+
+        assert!(
+            !lock!(asked).contains(&decliner),
+            "a declining peer must not be queried"
+        );
+        assert!(
+            !out.iter().any(|c| c.node_id == decliner),
+            "a declining peer must not reach the result"
+        );
+    }
+
+    /// ...but a walk whose TARGET is that peer must still reach it. Declining
+    /// to serve the DHT is not a request to become unreachable: this is how a
+    /// sender finds its transport and its rendezvous advertisement.
+    ///
+    /// Break-check: drop the `|| &contact.node_id == target` arm and this goes
+    /// red — which is the arm most likely to be "simplified" away later.
+    #[tokio::test]
+    async fn a_decliner_is_still_findable_when_it_is_the_target() {
+        let seed = [0x01u8; 32];
+        let decliner = [0x02u8; 32];
+
+        let asked = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let querier = UnfilteredReferrer {
+            refers: vec![Contact::with_caps(
+                decliner,
+                "tcp://d:1",
+                veil_types::DiscoveryMode::Public,
+                false,
+            )],
+            asked: std::sync::Arc::clone(&asked),
+        };
+
+        let out = find_node_iterative(
+            decliner, // the walk is FOR this peer
+            vec![Contact::new(seed, "tcp://s:1")],
+            &querier,
+            &IterativeParams::default(),
+        )
+        .await;
+
+        assert!(
+            out.iter().any(|c| c.node_id == decliner),
+            "a peer that declined DHT service must still be findable by name"
+        );
+    }
+
+    /// Both arms, stated directly on the predicate.
+    #[test]
+    fn may_walk_into_states_both_arms() {
+        let id = [0x07u8; 32];
+        let other = [0x08u8; 32];
+        let serving = Contact::new(id, "tcp://a:1");
+        let declining =
+            Contact::with_caps(id, "tcp://a:1", veil_types::DiscoveryMode::Public, false);
+
+        assert!(
+            may_walk_into(&serving, &other),
+            "a serving peer is walkable"
+        );
+        assert!(
+            !may_walk_into(&declining, &other),
+            "a decliner is not walkable as a hop"
+        );
+        assert!(
+            may_walk_into(&declining, &id),
+            "a decliner is walkable when it IS the target"
+        );
+    }
 
     /// Build a 3-node topology: A knows B and C, B knows C and D, C knows D.
     /// Looking up D from A should traverse A → B/C → D.
