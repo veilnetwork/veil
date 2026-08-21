@@ -556,7 +556,6 @@ mod tests {
     fn circuit_from(t: &CircuitTable, prev_link: [u8; 32], cid: u32) -> Arc<CircuitState> {
         t.install(
             &CircuitInstall {
-                cell_bytes: crate::circuit_data::CircuitCellBytes::legacy(),
                 circuit_id_in: cid,
                 circuit_id_out: 0,
                 circuit_key: [9u8; 32],

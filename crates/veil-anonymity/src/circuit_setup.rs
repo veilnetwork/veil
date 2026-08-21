@@ -26,7 +26,6 @@
 use zeroize::Zeroizing;
 
 use crate::circuit::{CircuitError, FINAL_HOP_SENTINEL, MAX_CIRCUIT_TTL, NEXT_HOP_ID_LEN};
-use crate::circuit_data::CircuitCellBytes;
 use crate::circuit_wire::CircuitId;
 use crate::onion;
 
@@ -36,20 +35,10 @@ const CID_LEN: usize = 4;
 pub const CIRCUIT_KEY_LEN: usize = 32;
 /// TTL byte (anti-loop, constant per layer — same rationale as `circuit.rs`).
 const TTL_LEN: usize = 1;
-/// Width of the negotiated data-cell size on the wire (u16 BE).
-const CELL_BYTES_LEN: usize = 2;
 
 /// Fixed per-layer prefix BEFORE the inner ciphertext:
-/// `[ttl(1)][next_hop_id(32)][circuit_id_in(4)][circuit_id_out(4)][circuit_key(32)][cell_bytes(2)]`.
-///
-/// `cell_bytes` is the SAME number in every layer — it is a property of the
-/// circuit, not of the hop (see [`build_circuit_setup`], which takes it once so
-/// the hops cannot be given differing values). Each hop learns it here and then
-/// refuses every data cell of any other size, which is what makes the size
-/// uniform where uniformity actually protects anything: within one circuit,
-/// against the hop that sees all of its cells.
-const SETUP_PREFIX_LEN: usize =
-    TTL_LEN + NEXT_HOP_ID_LEN + CID_LEN + CID_LEN + CIRCUIT_KEY_LEN + CELL_BYTES_LEN;
+/// `[ttl(1)][next_hop_id(32)][circuit_id_in(4)][circuit_id_out(4)][circuit_key(32)]`.
+const SETUP_PREFIX_LEN: usize = TTL_LEN + NEXT_HOP_ID_LEN + CID_LEN + CID_LEN + CIRCUIT_KEY_LEN;
 
 /// One hop in a circuit-setup, with its install parameters. `circuit_id_in` is
 /// the id cells arriving from the PREVIOUS link will carry; `circuit_id_out` is
@@ -74,8 +63,6 @@ pub struct CircuitInstall {
     pub circuit_id_in: CircuitId,
     pub circuit_id_out: CircuitId,
     pub circuit_key: [u8; CIRCUIT_KEY_LEN],
-    /// Size of every data cell on this circuit, chosen by the originator.
-    pub cell_bytes: CircuitCellBytes,
 }
 
 impl Drop for CircuitInstall {
@@ -101,7 +88,6 @@ impl std::fmt::Debug for CircuitInstall {
             .field("circuit_id_in", &self.circuit_id_in)
             .field("circuit_id_out", &self.circuit_id_out)
             .field("circuit_key", &"<redacted>")
-            .field("cell_bytes", &self.cell_bytes.get())
             .finish()
     }
 }
@@ -129,7 +115,6 @@ pub enum SetupPeelResult {
 /// (decrypted) to the terminus alongside its install (may be empty).
 pub fn build_circuit_setup(
     hops: &[CircuitSetupHop],
-    cell: CircuitCellBytes,
     terminus_payload: &[u8],
 ) -> Result<Vec<u8>, CircuitError> {
     if hops.is_empty() {
@@ -146,7 +131,7 @@ pub fn build_circuit_setup(
 
     // Innermost layer = terminus: next_hop = sentinel, inner = terminus_payload.
     let last = hops.last().expect("non-empty");
-    let inner = build_layer(&FINAL_HOP_SENTINEL, last, cell, terminus_payload);
+    let inner = build_layer(&FINAL_HOP_SENTINEL, last, terminus_payload);
     let mut wrapped = onion::wrap_for_hop(&inner, &last.pubkey);
 
     // Wrap through preceding hops in reverse; each layer carries THIS hop's
@@ -154,7 +139,7 @@ pub fn build_circuit_setup(
     for i in (0..hops.len() - 1).rev() {
         let this_hop = &hops[i];
         let next_node_id = hops[i + 1].node_id;
-        let layer = build_layer(&next_node_id, this_hop, cell, &wrapped);
+        let layer = build_layer(&next_node_id, this_hop, &wrapped);
         wrapped = onion::wrap_for_hop(&layer, &this_hop.pubkey);
     }
     Ok(wrapped)
@@ -165,7 +150,6 @@ pub fn build_circuit_setup(
 fn build_layer(
     next_hop_id: &[u8; NEXT_HOP_ID_LEN],
     hop: &CircuitSetupHop,
-    cell: CircuitCellBytes,
     inner: &[u8],
 ) -> Vec<u8> {
     let mut layer = Vec::with_capacity(SETUP_PREFIX_LEN + inner.len());
@@ -174,7 +158,6 @@ fn build_layer(
     layer.extend_from_slice(&hop.circuit_id_in.to_be_bytes());
     layer.extend_from_slice(&hop.circuit_id_out.to_be_bytes());
     layer.extend_from_slice(&hop.circuit_key);
-    layer.extend_from_slice(&(cell.get() as u16).to_be_bytes());
     layer.extend_from_slice(inner);
     layer
 }
@@ -213,18 +196,12 @@ pub fn peel_circuit_setup(
     let mut circuit_key = [0u8; CIRCUIT_KEY_LEN];
     circuit_key.copy_from_slice(&plaintext[o..o + CIRCUIT_KEY_LEN]);
     o += CIRCUIT_KEY_LEN;
-    // A size outside the legal range is a malformed setup, not a circuit to
-    // install: the hop would accept cells it can never frame a payload into.
-    let cell_bytes =
-        CircuitCellBytes::new(u16::from_be_bytes([plaintext[o], plaintext[o + 1]]) as usize)?;
-    o += CELL_BYTES_LEN;
     let inner = Zeroizing::new(plaintext[o..].to_vec());
 
     let install = CircuitInstall {
         circuit_id_in,
         circuit_id_out,
         circuit_key,
-        cell_bytes,
     };
     if next_hop == FINAL_HOP_SENTINEL {
         Ok(SetupPeelResult::Terminus {
@@ -247,7 +224,6 @@ fn read_cid(buf: &[u8], at: usize) -> CircuitId {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::circuit_data::MIN_CIRCUIT_CELL_BYTES;
     use rand_core::OsRng;
     use x25519_dalek::{PublicKey, StaticSecret};
 
@@ -273,7 +249,7 @@ mod tests {
         let (sk2, h2) = hop(2, 12, 0);
         let hops = [h0.clone(), h1.clone(), h2.clone()];
 
-        let env = build_circuit_setup(&hops, CircuitCellBytes::legacy(), b"register-me").unwrap();
+        let env = build_circuit_setup(&hops, b"register-me").unwrap();
 
         // Hop 0 peels → installs (10→11), forwards to node_id [1;32].
         let r0 = peel_circuit_setup(&env, &sk0).unwrap();
@@ -322,7 +298,7 @@ mod tests {
     #[test]
     fn single_hop_setup_is_terminus() {
         let (sk0, h0) = hop(0, 7, 0);
-        let env = build_circuit_setup(&[h0], CircuitCellBytes::legacy(), b"").unwrap();
+        let env = build_circuit_setup(&[h0], b"").unwrap();
         match peel_circuit_setup(&env, &sk0).unwrap() {
             SetupPeelResult::Terminus { install, payload } => {
                 assert_eq!(install.circuit_id_in, 7);
@@ -336,88 +312,23 @@ mod tests {
     fn wrong_key_fails_to_peel() {
         let (_sk0, h0) = hop(0, 1, 2);
         let (sk_other, _) = hop(9, 0, 0);
-        let env = build_circuit_setup(&[h0], CircuitCellBytes::legacy(), b"x").unwrap();
+        let env = build_circuit_setup(&[h0], b"x").unwrap();
         assert!(peel_circuit_setup(&env, &sk_other).is_err());
     }
 
     #[test]
     fn rejects_empty_hops() {
         assert!(matches!(
-            build_circuit_setup(&[], CircuitCellBytes::legacy(), b""),
+            build_circuit_setup(&[], b""),
             Err(CircuitError::NoHops)
         ));
-    }
-
-    /// Every hop of one circuit must learn the SAME cell size. If they ever
-    /// disagreed, a middle hop would drop each cell as wrong-sized and the
-    /// circuit would go silently dead — so the size is taken once, for the
-    /// circuit, and this asserts it lands identically at all three hops.
-    ///
-    /// Break-check: make `build_layer` write `CircuitCellBytes::legacy()`
-    /// instead of `cell` and this goes red at hop 0.
-    #[test]
-    fn one_size_reaches_every_hop_of_the_circuit() {
-        let (sk0, h0) = hop(0, 10, 11);
-        let (sk1, h1) = hop(1, 11, 12);
-        let (sk2, h2) = hop(2, 12, 0);
-        let chosen = CircuitCellBytes::new(4096).unwrap();
-
-        let env = build_circuit_setup(&[h0, h1, h2], chosen, b"payload").unwrap();
-
-        let inner0 = match peel_circuit_setup(&env, &sk0).unwrap() {
-            SetupPeelResult::Forward { install, inner, .. } => {
-                assert_eq!(install.cell_bytes, chosen, "hop 0");
-                inner
-            }
-            other => panic!("hop0 expected Forward, got {other:?}"),
-        };
-        let inner1 = match peel_circuit_setup(&inner0, &sk1).unwrap() {
-            SetupPeelResult::Forward { install, inner, .. } => {
-                assert_eq!(install.cell_bytes, chosen, "hop 1");
-                inner
-            }
-            other => panic!("hop1 expected Forward, got {other:?}"),
-        };
-        match peel_circuit_setup(&inner1, &sk2).unwrap() {
-            SetupPeelResult::Terminus { install, .. } => {
-                assert_eq!(install.cell_bytes, chosen, "terminus");
-            }
-            other => panic!("hop2 expected Terminus, got {other:?}"),
-        }
-    }
-
-    /// A setup naming a size no circuit may use is refused outright. Installing
-    /// it would give the hop a circuit it can never frame a payload into (below
-    /// the floor) or one that overruns the u16 length field (above the cap).
-    ///
-    /// The layer is built by hand because `build_circuit_setup` cannot express
-    /// an illegal size — `CircuitCellBytes` will not hold one.
-    #[test]
-    fn a_setup_naming_an_illegal_cell_size_is_refused() {
-        for bad in [0u16, 1, (MIN_CIRCUIT_CELL_BYTES - 1) as u16] {
-            let sk = StaticSecret::random_from_rng(OsRng);
-            let pk = PublicKey::from(&sk).to_bytes();
-            let mut layer = Vec::new();
-            layer.push(MAX_CIRCUIT_TTL);
-            layer.extend_from_slice(&FINAL_HOP_SENTINEL);
-            layer.extend_from_slice(&7u32.to_be_bytes());
-            layer.extend_from_slice(&0u32.to_be_bytes());
-            layer.extend_from_slice(&[0x11u8; CIRCUIT_KEY_LEN]);
-            layer.extend_from_slice(&bad.to_be_bytes());
-            let env = onion::wrap_for_hop(&layer, &pk);
-
-            assert!(
-                peel_circuit_setup(&env, &sk).is_err(),
-                "cell size {bad} must not install a circuit"
-            );
-        }
     }
 
     #[test]
     fn rejects_too_long() {
         let many: Vec<CircuitSetupHop> = (0..MAX_CIRCUIT_TTL).map(|i| hop(i, 0, 0).1).collect();
         assert!(matches!(
-            build_circuit_setup(&many, CircuitCellBytes::legacy(), b""),
+            build_circuit_setup(&many, b""),
             Err(CircuitError::CircuitTooLongForTtl { .. })
         ));
     }

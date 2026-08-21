@@ -1127,23 +1127,6 @@ impl FrameDispatcher {
         if let Some(table) = &self.circuit_table {
             // FORWARD cell: arrived from prev_link tagged circuit_id_in.
             if let Some(state) = table.lookup_forward(&link, cell.circuit_id) {
-                // The circuit is known now, so its size can finally be checked
-                // (decode could not: the id that names the circuit lives inside
-                // the header). A cell of any other size is not one of this
-                // circuit's — refuse it rather than relay a distinguishable
-                // quantum onward.
-                if cell.expect_cell(state.cell_bytes).is_err() {
-                    self.logger.debug(
-                        "anonymity.circuit.wrong_cell_size",
-                        format!(
-                            "forward cell {} B != circuit's {} B: circuit_id={}; dropped",
-                            cell.ciphertext.len(),
-                            state.cell_bytes.get(),
-                            cell.circuit_id,
-                        ),
-                    );
-                    return DispatchResult::NoResponse;
-                }
                 if !state
                     .replay_fwd
                     .lock()
@@ -1171,7 +1154,7 @@ impl FrameDispatcher {
                             seq: cell.seq,
                             ciphertext: buf,
                         };
-                        if let Ok(b) = out.encode(state.cell_bytes) {
+                        if let Ok(b) = out.encode() {
                             let sent = self.send_relay_chain_msg(
                                 &NodeId::from(nl),
                                 RelayChainMsg::CircuitData,
@@ -1270,18 +1253,6 @@ impl FrameDispatcher {
             // RETURN cell: arrived from next_link tagged circuit_id_out. This relay
             // applies its layer and passes toward the originator (prev_link).
             if let Some(state) = table.lookup_backward(&link, cell.circuit_id) {
-                if cell.expect_cell(state.cell_bytes).is_err() {
-                    self.logger.debug(
-                        "anonymity.circuit.wrong_cell_size",
-                        format!(
-                            "return cell {} B != circuit's {} B: circuit_id={}; dropped",
-                            cell.ciphertext.len(),
-                            state.cell_bytes.get(),
-                            cell.circuit_id,
-                        ),
-                    );
-                    return DispatchResult::NoResponse;
-                }
                 if !state
                     .replay_ret
                     .lock()
@@ -1308,7 +1279,7 @@ impl FrameDispatcher {
                     seq: cell.seq,
                     ciphertext: buf,
                 };
-                if let Ok(b) = out.encode(state.cell_bytes) {
+                if let Ok(b) = out.encode() {
                     let sent = self.send_relay_chain_msg(
                         &NodeId::from(state.prev_link),
                         RelayChainMsg::CircuitData,
@@ -1336,18 +1307,6 @@ impl FrameDispatcher {
             .as_ref()
             .and_then(|t| t.lookup(&link, cell.circuit_id))
         {
-            if cell.expect_cell(origin.cell_bytes).is_err() {
-                self.logger.debug(
-                    "anonymity.circuit.wrong_cell_size",
-                    format!(
-                        "origin cell {} B != circuit's {} B: circuit_id={}; dropped",
-                        cell.ciphertext.len(),
-                        origin.cell_bytes.get(),
-                        cell.circuit_id,
-                    ),
-                );
-                return DispatchResult::NoResponse;
-            }
             return match origin.open_return(cell.seq, &cell.ciphertext) {
                 Ok(opened) => {
                     circuit_data_diag(|d| d.origin_open_ok = d.origin_open_ok.saturating_add(1));
@@ -1644,7 +1603,7 @@ impl FrameDispatcher {
         }
         // Frame the introduce into a FIXED-SIZE cell, then apply R's (terminus)
         // return layer; intermediate hops add theirs, the originator peels all.
-        let mut buf = match wrap_payload(&intro.ciphertext, circuit.cell_bytes) {
+        let mut buf = match wrap_payload(&intro.ciphertext) {
             Ok(b) => b,
             // introduce larger than one cell — drop, but the cookie was known.
             Err(_) => {
@@ -1680,7 +1639,7 @@ impl FrameDispatcher {
             seq,
             ciphertext: buf,
         };
-        match cell.encode(circuit.cell_bytes) {
+        match cell.encode() {
             Ok(body) => {
                 let sent = self.send_relay_chain_msg(
                     &NodeId::from(circuit.prev_link),
@@ -1764,7 +1723,7 @@ impl FrameDispatcher {
     ) -> bool {
         use veil_anonymity::circuit_data::{Direction, apply_layer, wrap_payload};
         use veil_anonymity::circuit_wire::CircuitDataPayload;
-        let mut buf = match wrap_payload(bytes, circuit.cell_bytes) {
+        let mut buf = match wrap_payload(bytes) {
             Ok(b) => b,
             Err(_) => {
                 circuit_data_diag(|d| d.splice_fail = d.splice_fail.saturating_add(1));
@@ -1781,7 +1740,7 @@ impl FrameDispatcher {
             seq,
             ciphertext: buf,
         };
-        if let Ok(body) = cell.encode(circuit.cell_bytes) {
+        if let Ok(body) = cell.encode() {
             let sent = self.send_relay_chain_msg(
                 &NodeId::from(circuit.prev_link),
                 RelayChainMsg::CircuitData,
@@ -2347,12 +2306,7 @@ mod tests {
             circuit_id_out: 0,
             circuit_key: [7u8; 32],
         };
-        let env = build_circuit_setup(
-            &[hop],
-            veil_anonymity::circuit_data::CircuitCellBytes::legacy(),
-            b"reg-payload",
-        )
-        .unwrap();
+        let env = build_circuit_setup(&[hop], b"reg-payload").unwrap();
         let mut hdr = FrameHeader::new(
             FrameFamily::RelayChain as u8,
             RelayChainMsg::CircuitBuild as u16,
@@ -2431,12 +2385,7 @@ mod tests {
             circuit_id_out: 0,
             circuit_key: [3u8; 32],
         };
-        let env = build_circuit_setup(
-            &[hop],
-            veil_anonymity::circuit_data::CircuitCellBytes::legacy(),
-            &reg.encode(),
-        )
-        .unwrap();
+        let env = build_circuit_setup(&[hop], &reg.encode()).unwrap();
         let mut hdr = FrameHeader::new(
             FrameFamily::RelayChain as u8,
             RelayChainMsg::CircuitBuild as u16,
@@ -2540,12 +2489,7 @@ mod tests {
                 circuit_id_out: 0,
                 circuit_key: [3u8; 32],
             };
-            let env = build_circuit_setup(
-                &[hop],
-                veil_anonymity::circuit_data::CircuitCellBytes::legacy(),
-                &regp.encode(),
-            )
-            .unwrap();
+            let env = build_circuit_setup(&[hop], &regp.encode()).unwrap();
             let mut hdr = FrameHeader::new(
                 FrameFamily::RelayChain as u8,
                 RelayChainMsg::CircuitBuild as u16,
@@ -2608,7 +2552,6 @@ mod tests {
             .as_ref()
             .unwrap()
             .insert(std::sync::Arc::new(OriginCircuit {
-                cell_bytes: veil_anonymity::circuit_data::CircuitCellBytes::legacy(),
                 circuit_keys: vec![r_key],
                 first_hop: r_id,
                 origin_circuit_id: origin_cid,
@@ -2634,20 +2577,14 @@ mod tests {
 
         // R frames it into a fixed-size cell + applies its return layer.
         let seq = 1u32;
-        let mut buf = wrap_payload(
-            &introduce_ct,
-            veil_anonymity::circuit_data::CircuitCellBytes::legacy(),
-        )
-        .unwrap();
+        let mut buf = wrap_payload(&introduce_ct).unwrap();
         apply_layer(&r_key, Direction::Return, seq, &mut buf);
         let cell = CircuitDataPayload {
             circuit_id: origin_cid,
             seq,
             ciphertext: buf,
         };
-        let body = cell
-            .encode(veil_anonymity::circuit_data::CircuitCellBytes::legacy())
-            .unwrap();
+        let body = cell.encode().unwrap();
         let mut hdr = FrameHeader::new(
             FrameFamily::RelayChain as u8,
             RelayChainMsg::CircuitData as u16,
@@ -2692,7 +2629,6 @@ mod tests {
             .as_ref()
             .unwrap()
             .insert(std::sync::Arc::new(OriginCircuit {
-                cell_bytes: veil_anonymity::circuit_data::CircuitCellBytes::legacy(),
                 circuit_keys: vec![r_key],
                 first_hop: r_id,
                 origin_circuit_id: origin_cid,
@@ -2708,20 +2644,14 @@ mod tests {
         // R frames the stream bytes into a fixed cell + applies its return layer.
         let stream_bytes = b"onion-stream cell payload".to_vec();
         let seq = 1u32;
-        let mut buf = wrap_payload(
-            &stream_bytes,
-            veil_anonymity::circuit_data::CircuitCellBytes::legacy(),
-        )
-        .unwrap();
+        let mut buf = wrap_payload(&stream_bytes).unwrap();
         apply_layer(&r_key, Direction::Return, seq, &mut buf);
         let cell = CircuitDataPayload {
             circuit_id: origin_cid,
             seq,
             ciphertext: buf,
         };
-        let body = cell
-            .encode(veil_anonymity::circuit_data::CircuitCellBytes::legacy())
-            .unwrap();
+        let body = cell.encode().unwrap();
         let mut hdr = FrameHeader::new(
             FrameFamily::RelayChain as u8,
             RelayChainMsg::CircuitData as u16,
@@ -2739,86 +2669,6 @@ mod tests {
             got, stream_bytes,
             "stream_recv must receive the opened return-cell bytes"
         );
-    }
-
-    /// A cell that is not THIS circuit's size is refused, even though it is a
-    /// perfectly well-formed cell of the size the whole network used to use.
-    ///
-    /// This is the decision the per-circuit size exists to make: the size is
-    /// uniform *within* a circuit, so the hop that sees every cell learns
-    /// nothing from length — and a cell of another size is, by definition, not
-    /// one of this circuit's.
-    ///
-    /// The test asserts BOTH halves, because asserting only the refusal would
-    /// also pass on a circuit that is simply broken: the same circuit accepts a
-    /// correctly-sized cell right afterwards.
-    ///
-    /// Break-check: drop the `expect_cell` guard in the origin branch of
-    /// `handle_circuit_data` and the first half goes red.
-    #[tokio::test]
-    async fn a_cell_of_another_size_is_not_this_circuits() {
-        use veil_anonymity::circuit_data::{
-            CircuitCellBytes, Direction, apply_layer, wrap_payload,
-        };
-        use veil_anonymity::circuit_origin::{OriginCircuit, OriginCircuitTable};
-        use veil_anonymity::circuit_wire::CircuitDataPayload;
-
-        let mut d = crate::make_test_dispatcher(veil_cfg::NodeRole::Core);
-        d.circuit_origin = Some(std::sync::Arc::new(OriginCircuitTable::new()));
-
-        let r_id = [0x9C; 32];
-        let r_key = [0x44u8; 32];
-        let origin_cid = 4243u32;
-        let ours = CircuitCellBytes::new(4096).unwrap();
-        d.circuit_origin
-            .as_ref()
-            .unwrap()
-            .insert(std::sync::Arc::new(OriginCircuit {
-                cell_bytes: ours,
-                circuit_keys: vec![r_key],
-                first_hop: r_id,
-                origin_circuit_id: origin_cid,
-                created_unix: 0,
-                confirmed: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-                is_reply: false,
-            }));
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(16);
-        d.stream_recv.lock().unwrap().insert(origin_cid, tx);
-
-        let feed = |d: &FrameDispatcher, size: CircuitCellBytes, seq: u32, bytes: &[u8]| {
-            let mut buf = wrap_payload(bytes, size).unwrap();
-            apply_layer(&r_key, Direction::Return, seq, &mut buf);
-            let body = CircuitDataPayload {
-                circuit_id: origin_cid,
-                seq,
-                ciphertext: buf,
-            }
-            .encode(size)
-            .unwrap();
-            let mut hdr = FrameHeader::new(
-                FrameFamily::RelayChain as u8,
-                RelayChainMsg::CircuitData as u16,
-            );
-            hdr.body_len = body.len() as u32;
-            d.dispatch_relay_chain(&hdr, &body, NodeId::from(r_id));
-        };
-
-        // A valid 16384-byte cell — the old network-wide size — on a circuit
-        // that negotiated 4096. Nothing must reach the stream.
-        feed(&d, CircuitCellBytes::legacy(), 1, b"wrong-sized");
-        assert!(
-            rx.try_recv().is_err(),
-            "a cell of another size must not be delivered"
-        );
-
-        // The same circuit, its own size: delivered. So the refusal above was
-        // about the size, not about a dead circuit.
-        feed(&d, ours, 2, b"right-sized");
-        let got = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv())
-            .await
-            .expect("correctly-sized cell not delivered in 500ms")
-            .expect("channel closed");
-        assert_eq!(got, b"right-sized".to_vec());
     }
 
     /// R-SPLICE end-to-end (the core of the pinned-circuit stream): a FORWARD
@@ -2884,12 +2734,7 @@ mod tests {
             circuit_id_out: 0,
             circuit_key: [3u8; 32],
         };
-        let renv = build_circuit_setup(
-            &[rhop],
-            veil_anonymity::circuit_data::CircuitCellBytes::legacy(),
-            &regp.encode(),
-        )
-        .unwrap();
+        let renv = build_circuit_setup(&[rhop], &regp.encode()).unwrap();
         let mut rhdr = FrameHeader::new(
             FrameFamily::RelayChain as u8,
             RelayChainMsg::CircuitBuild as u16,
@@ -2915,12 +2760,7 @@ mod tests {
             circuit_id_out: 0,
             circuit_key: [7u8; 32],
         };
-        let senv = build_circuit_setup(
-            &[shop],
-            veil_anonymity::circuit_data::CircuitCellBytes::legacy(),
-            b"no-reg",
-        )
-        .unwrap();
+        let senv = build_circuit_setup(&[shop], b"no-reg").unwrap();
         let mut shdr = FrameHeader::new(
             FrameFamily::RelayChain as u8,
             RelayChainMsg::CircuitBuild as u16,
@@ -2946,20 +2786,14 @@ mod tests {
         framed.extend_from_slice(&cookie);
         framed.extend_from_slice(&post_cookie);
         let fseq = 1u32;
-        let mut fbuf = wrap_payload(
-            &framed,
-            veil_anonymity::circuit_data::CircuitCellBytes::legacy(),
-        )
-        .unwrap();
+        let mut fbuf = wrap_payload(&framed).unwrap();
         apply_layer(&send_key, Direction::Forward, fseq, &mut fbuf);
         let fwd = CircuitDataPayload {
             circuit_id: send_cid,
             seq: fseq,
             ciphertext: fbuf,
         };
-        let fbody = fwd
-            .encode(veil_anonymity::circuit_data::CircuitCellBytes::legacy())
-            .unwrap();
+        let fbody = fwd.encode().unwrap();
         let mut fhdr = FrameHeader::new(
             FrameFamily::RelayChain as u8,
             RelayChainMsg::CircuitData as u16,
@@ -3048,12 +2882,7 @@ mod tests {
             circuit_id_out: 0,
             circuit_key: [3u8; 32],
         };
-        let renv = build_circuit_setup(
-            &[rhop],
-            veil_anonymity::circuit_data::CircuitCellBytes::legacy(),
-            &regp.encode(),
-        )
-        .unwrap();
+        let renv = build_circuit_setup(&[rhop], &regp.encode()).unwrap();
         let mut rhdr = FrameHeader::new(
             FrameFamily::RelayChain as u8,
             RelayChainMsg::CircuitBuild as u16,
@@ -3105,7 +2934,6 @@ mod tests {
         // (time injected at the table API — the dispatcher install path passes
         // wall-clock `now` the same way).
         let pressure = CircuitInstall {
-            cell_bytes: veil_anonymity::circuit_data::CircuitCellBytes::legacy(),
             circuit_id_in: recv_cid + 1,
             circuit_id_out: 0,
             circuit_key: [9u8; 32],
@@ -3155,7 +2983,6 @@ mod tests {
             .as_ref()
             .unwrap()
             .insert(std::sync::Arc::new(OriginCircuit {
-                cell_bytes: veil_anonymity::circuit_data::CircuitCellBytes::legacy(),
                 circuit_keys: vec![[0x33u8; 32]],
                 first_hop: r_id,
                 origin_circuit_id: origin_cid,
@@ -3215,7 +3042,6 @@ mod tests {
                 .as_ref()
                 .unwrap()
                 .insert(std::sync::Arc::new(OriginCircuit {
-                    cell_bytes: veil_anonymity::circuit_data::CircuitCellBytes::legacy(),
                     circuit_keys: vec![terminus_key],
                     first_hop: r_id,
                     origin_circuit_id: origin_cid,
