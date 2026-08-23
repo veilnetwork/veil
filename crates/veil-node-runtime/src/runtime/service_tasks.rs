@@ -4458,13 +4458,8 @@ pub(super) async fn resolve_fresh_rendezvous_ads(
                 .filter(|ad| verify_rendezvous_ad(ad).is_ok())
                 .filter(|ad| is_currently_valid(ad, now).is_ok()),
         );
-        if !ads.is_empty() {
-            logger.debug(
-                "anonymity.rendezvous.resolve.local_self",
-                format!("slots={} — own ad read locally, no walk", ads.len()),
-            );
-        }
     }
+    let from_local_mirror = !ads.is_empty();
 
     let walks = (0..MAX_RENDEZVOUS_AD_SLOTS).map(|idx| {
         let key = rendezvous_ad_dht_key_at(&receiver_id, idx);
@@ -4532,8 +4527,13 @@ pub(super) async fn resolve_fresh_rendezvous_ads(
         logger.info(
             "anonymity.rendezvous.resolve.refreshed",
             format!(
-                "receiver={} candidates={} freshest_relay={} valid_from={}",
+                "receiver={} source={} candidates={} freshest_relay={} valid_from={}",
                 veil_util::hex_short(&receiver_id),
+                // Say WHERE the ads came from. Without this the line reads
+                // "refreshed" for a purely local read and an operator counting
+                // it would see a DHT walk that never happened — the instrument
+                // lying by its own name.
+                if from_local_mirror { "local" } else { "dht" },
                 ads.len(),
                 veil_util::hex_short(&ads[0].rendezvous_node_id),
                 ads[0].valid_from_unix,
