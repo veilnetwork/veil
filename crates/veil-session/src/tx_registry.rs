@@ -872,8 +872,14 @@ mod tests {
             veil_bufpool::pooled_shared_from_vec(vec![7u8; 4]),
         );
 
-        assert!(rx_sender.try_recv().is_err(), "the peer it came from must be skipped");
-        assert!(rx_origin.try_recv().is_err(), "the node it is ABOUT must be skipped");
+        assert!(
+            rx_sender.try_recv().is_err(),
+            "the peer it came from must be skipped"
+        );
+        assert!(
+            rx_origin.try_recv().is_err(),
+            "the node it is ABOUT must be skipped"
+        );
         let (prio, frame) = rx_bystander
             .try_recv()
             .expect("every other peer still receives the forward");
@@ -897,6 +903,9 @@ mod tests {
             veil_bufpool::pooled_shared_from_vec(vec![9u8; 2]),
         );
         assert!(rx_a.try_recv().is_err());
-        assert!(rx_b.try_recv().is_ok(), "the other peer must still be reached");
+        assert!(
+            rx_b.try_recv().is_ok(),
+            "the other peer must still be reached"
+        );
     }
 }
