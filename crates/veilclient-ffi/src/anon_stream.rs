@@ -341,7 +341,32 @@ const CIRCUIT_HOPS: usize = 2;
 // stalls (desktop receiver, 234 generations/session). Fewer rebuilds = fewer
 // such windows. Still bounded well under the 600s cookie TTL so a genuinely
 // dead path (heartbeat failing) still rotates for path freshness.
-const CIRCUIT_IDLE_REFRESH_AFTER: Duration = Duration::from_secs(300);
+// RAISED 300 -> 900 to keep the ratio its own comment names. The 300 was
+// chosen as half the "600s cookie TTL" cited above -- that TTL is
+// RENDEZVOUS_AD_VALIDITY_SECS, raised to 1800 in a1e60355 once the reason for
+// its shortness turned out to have been solved elsewhere. Leaving 300 behind
+// would not preserve the author's bound, it would silently tighten it to a
+// sixth of the TTL instead of a half.
+//
+// What it costs on an idle node, measured 23.08: the gate is
+// `generation_age >= X && idle_for >= X`, and generation_age resets on every
+// refresh while idle_for only grows, so on a node with no traffic the age term
+// alone fires it -- forever, every ~304 s. Each turn rebuilds the circuits,
+// re-registers at every relay and re-publishes the ad slots. After the
+// rendezvous fixes landed, `relay_chain/CircuitData` was the single largest
+// frame type an idle phone exchanged: 23% of its traffic, 17 cells of 2074 B
+// per 15 minutes, one per 53 s.
+//
+// What it does NOT relax: a genuinely dead path. Inbound starvation is caught
+// by the separate branch above (CIRCUIT_INBOUND_STARVATION_AFTER), unconfirmed
+// registrations by the early-refresh branch, and a stale circuit under an
+// active stream by CIRCUIT_HANDSHAKE_REOPEN_AFTER. This branch is the IDLE
+// rotation only.
+//
+// It does lengthen how long one path stays observable, which is an
+// unlinkability property and not merely a traffic number -- it is here for
+// review on that basis, not smuggled in as an optimisation.
+const CIRCUIT_IDLE_REFRESH_AFTER: Duration = Duration::from_secs(900);
 // A long-lived outbound circuit can black-hole after a bulk stream RTOs. The
 // content layer then opens a fresh stream and sends SYNs, but idle-based refresh
 // alone keeps reusing the same stale circuit because every retry updates
