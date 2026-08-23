@@ -286,15 +286,44 @@ const RENDEZVOUS_SESSION_EVENT_DEBOUNCE: std::time::Duration =
 const RENDEZVOUS_TICK_JITTER_MS: u64 = 3000;
 /// Ad validity window the recipient requests (the maintenance tick refreshes the
 /// published ad before half-life). Comfortably longer than the check interval
-/// (RENDEZVOUS_RECIPIENT_CHECK_INTERVAL = 15s), but kept SHORT on purpose: this
-/// is also how long a STALE ad (a previous-relay/cookie ad a sender resolved +
-/// cached before the receiver rotated) stays usable. At 1h it black-holed
-/// delivery for up to an hour after a receiver restart (the sender's cached ad
-/// pointed at a relay the receiver no longer registers → cookie_unknown on every
-/// introduce). 10 min bounds that self-heal window while the ~15s refresh keeps
-/// the live ad alive with ~40x margin. pub(crate) so the initial onion-service
-/// register (runtime::mod) uses the same window, not the 24h directory default.
-pub(crate) const RENDEZVOUS_AD_VALIDITY_SECS: u64 = 600;
+/// (RENDEZVOUS_RECIPIENT_CHECK_INTERVAL = 15s). pub(crate) so the initial
+/// onion-service register (runtime::mod) uses the same window, not the 24h
+/// directory default.
+///
+/// RAISED 600 -> 1800 because the reason for 600 was solved elsewhere and
+/// nobody came back for it. It was shortened 1h -> 10min on 2026-06-28
+/// ("so a stale cached ad self-heals fast"): a sender holding a cached
+/// previous-relay ad kept firing introduces into a relay the receiver had
+/// left, and `cookie_unknown` is deliberately silent, so the ad's own expiry
+/// was the only thing that ended it. Five days later, 2026-07-03, the
+/// sender-side stall self-heal landed (`AnonSendStallTracker`): three
+/// un-answered sends drop the resolve cache and widen the fan-out. The
+/// black-hole window is now bounded by THAT — ~3 sends and at most one forced
+/// re-resolve per ANON_SEND_WIDEN_SECS — not by this constant.
+///
+/// What this does NOT relax: reacting to a real change. The maintenance guard
+/// republishes when the published ad's (relay, cookie, KEM, window) differs
+/// from the live publisher entry, independently of freshness — so a rotated
+/// relay is republished at once. Only the periodic refresh of an UNCHANGED ad
+/// is slowed, and that refresh is what an idle phone pays for: measured at
+/// 600s it cost one recursive STORE + FIND_VALUE per ad slot per ~333 s,
+/// eight slots at a time, 17.8% of an idle phone's traffic on one link.
+///
+/// Not raised further than 1800 in one step: this is a live-network property,
+/// and 3x is enough to measure the effect against the same stand.
+pub(crate) const RENDEZVOUS_AD_VALIDITY_SECS: u64 = 1800;
+
+/// The maintenance tick republishes at half the window, so that half must stay
+/// clear of the cadence at which the recipient task re-registers — otherwise an
+/// ad would spend part of its life expired between refreshes. Guards against
+/// INVERSION, not against any particular value: the long-standing 600 passes it
+/// (300 against 75) and so does 1800 (900 against 75). Compile-time so an edit
+/// to either constant cannot quietly cross the line.
+const _: () = assert!(
+    RENDEZVOUS_AD_VALIDITY_SECS / 2
+        > RENDEZVOUS_RECIPIENT_CHECK_INTERVAL.as_secs() * RENDEZVOUS_REREGISTER_EVERY_TICKS * 2,
+    "ad half-life must stay clear of the re-register cadence",
+);
 /// Re-register with the (still-live) current relay every N ticks — the relay's
 /// cookie map is in-memory, so this survives a relay restart.
 const RENDEZVOUS_REREGISTER_EVERY_TICKS: u64 = 5;
