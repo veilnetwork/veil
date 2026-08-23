@@ -625,6 +625,7 @@ impl NodeRuntime {
         veil_session::runner::set_mobile_outbound_batch_window_ms(
             config.mobile.outbound_batch_window_ms.unwrap_or(0),
         );
+        veil_session::runner::set_mobile_outbound_batch_always(config.mobile.outbound_batch_always);
         // re-prime global session-rotation interval
         // from reloaded config. Active sessions keep their
         // existing rotation deadline (computed at session start);

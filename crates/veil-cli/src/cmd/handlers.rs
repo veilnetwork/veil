@@ -235,7 +235,22 @@ pub(crate) fn apply_profile_defaults(
                 // they target is actually material. Operator can flip
                 // either independently in `[mobile]` after measuring.
                 low_battery_throttle_maintenance: false,
-                outbound_batch_window_ms: None,
+                // Measured, so no longer deferred. On an idle phone, 23.08,
+                // one seed link over 599 s: 521 frames carrying 190 B/s of
+                // bodies cost 413 B/s on the wire — 260 bytes of framing and
+                // obfs4 padding PER FRAME, about twice the payload they
+                // wrapped. Outbound frames cluster (30% of gaps under 50 ms),
+                // and replaying that capture through a 200 ms window merges
+                // 39% of them; 1 s would merge 53% but buys little more for
+                // five times the latency.
+                //
+                // `always` because the saving is bytes, not radio wake-ups, and
+                // a charging phone pays the same 260 bytes a low one does. The
+                // battery-gated path is untouched for configs that use it.
+                // Interactive frames bypass the coalescer, so liveness probes
+                // are unaffected.
+                outbound_batch_window_ms: Some(200),
+                outbound_batch_always: true,
             };
             // Leaf behind CGN-NAT finds upstream gateways via mesh
             // beacons. Mesh is per-LAN so this works whether the

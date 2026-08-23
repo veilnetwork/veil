@@ -582,6 +582,26 @@ pub struct MobileConfig {
     /// misconfig "10 s coalesce" doesn't starve liveness probes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub outbound_batch_window_ms: Option<u32>,
+
+    /// Apply [`Self::outbound_batch_window_ms`] regardless of battery.
+    ///
+    /// The window was built as a radio-wake saver, so it engages only while the
+    /// battery is actually low, and a window configured WITHOUT a
+    /// `low_battery_threshold_pct` is deliberately inert — that contract has
+    /// its own test and this flag does not touch it.
+    ///
+    /// Measurement made the same mechanism a BYTE saver, which has nothing to
+    /// do with the battery: on an idle phone, one seed link over 599 s, 521
+    /// frames carrying 190 B/s of bodies cost 413 B/s on the wire — 260 bytes
+    /// of framing and obfs4 padding per frame, about twice the payload. Those
+    /// frames cluster (30% of outbound gaps under 50 ms), so replaying the
+    /// capture through a 200 ms window merges 39% of them.
+    ///
+    /// Off by default: it trades up to one window of latency on non-interactive
+    /// frames for those bytes. Interactive frames bypass the coalescer
+    /// entirely, so liveness probes are unaffected either way.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub outbound_batch_always: bool,
 }
 
 impl MobileConfig {
@@ -614,19 +634,33 @@ impl MobileConfig {
             && c.background_keepalive_multiplier == Self::default_background_keepalive_multiplier()
             && !c.low_battery_throttle_maintenance
             && c.outbound_batch_window_ms.is_none()
+            && !c.outbound_batch_always
     }
 
     /// Resolved, clamped outbound-batch window for the current battery
-    /// reading. Returns `None` (no coalescing) when:
-    /// * `outbound_batch_window_ms` is unset, OR
-    /// * battery awareness is disabled / battery above threshold (same
-    ///   gating as `battery_multiplier` — only throttle when we have
-    ///   actually-low battery, not when feature is just configured).
+    /// reading.
     ///
-    /// Otherwise returns `Some(ms.clamp(1, MAX_OUTBOUND_BATCH_WINDOW_MS))`.
+    /// `None` when `outbound_batch_window_ms` is unset — coalescing is opt-in
+    /// and stays off by default. Once set, `low_battery_threshold_pct` decides
+    /// WHEN it applies:
+    ///
+    /// * threshold set ⇒ only while the battery is actually low. Unchanged for
+    ///   configs that set both.
+    /// * threshold unset ⇒ **always**. A window configured with no battery
+    ///   awareness at all is an operator asking to merge frames outright, and
+    ///   returning `None` there made the setting silently inert.
+    ///
+    /// Measurement is why the second arm exists: on an idle phone, one seed
+    /// link over 599 s, 521 frames carrying 190 B/s of bodies cost 413 B/s on
+    /// the wire — 260 bytes of framing and obfs4 padding PER FRAME, about twice
+    /// the payload. Merging frames saves that whatever the battery is doing.
+    ///
+    /// ⚠️ [`veil_session::runner::current_outbound_batch_window`] is the copy
+    /// that actually runs (the runner reads primed atomics, not this struct).
+    /// The two must agree; a test in veil-session holds them together.
     pub fn outbound_batch_window(&self, battery_pct: u8) -> Option<std::time::Duration> {
         let ms = self.outbound_batch_window_ms?;
-        if self.battery_multiplier(battery_pct) == 1 {
+        if !self.outbound_batch_always && self.battery_multiplier(battery_pct) == 1 {
             return None;
         }
         let clamped = ms.clamp(1, Self::MAX_OUTBOUND_BATCH_WINDOW_MS);
@@ -1334,6 +1368,7 @@ mod mobile_tests {
             ),
             low_battery_throttle_maintenance: false,
             outbound_batch_window_ms: None,
+            outbound_batch_always: false,
         };
         assert!(
             MobileConfig::is_default(&c),

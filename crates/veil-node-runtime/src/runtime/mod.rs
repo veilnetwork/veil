@@ -2639,6 +2639,10 @@ impl NodeRuntime {
         veil_session::runner::set_mobile_outbound_batch_window_ms(
             config.mobile.outbound_batch_window_ms.unwrap_or(0),
         );
+        // The battery-independent opt-in. Without priming it the config field
+        // would parse and then do nothing, which is the failure mode the
+        // window itself already had.
+        veil_session::runner::set_mobile_outbound_batch_always(config.mobile.outbound_batch_always);
         // prime the global session-rotation interval
         // (0 = disabled). Runtime-side clamp ensures any value
         // < 60 gets pushed up to the floor, defending against
