@@ -115,15 +115,49 @@ impl std::fmt::Debug for OriginCircuit {
 /// to choose (it is the only party that sees the whole path), every hop merely
 /// enforces whatever arrives in the setup.
 ///
-/// It returns the legacy 16384 for now, and that is a real constraint rather
-/// than a placeholder: `veil-onion-stream` frames up to a COMPILE-TIME
-/// `MAX_CELL` (= 16382, `CIRCUIT_PAYLOAD_BYTES - 2`) and hands the result to
-/// whichever circuit is at hand, so a circuit that negotiated less would reject
-/// its own stream's frames as too large. Varying the size therefore has to wait
-/// on the stream layer learning its circuit's MSS instead of a constant — the
-/// plumbing here is what makes that possible, not the whole of it.
+/// # Why 2048 and not the legacy 16384
+///
+/// The number that mattered was never the bulk one. Measured 23.08 across all
+/// three testnet seeds at once, on a phone with zero contacts and nothing to
+/// send: `RelayChain` cells were **73.8%** of every body byte it exchanged —
+/// twelve frames outweighing the other 715 together. Each is the eight-byte
+/// circuit heartbeat (`CIRCUIT_HEARTBEAT_MAGIC`) riding a full 16410-byte cell,
+/// because a cell is padded to its size whatever it carries. The heartbeat
+/// cadence was already cut 15s → 79s for the same reason; the size is the half
+/// that was left, and it is worth eight times as much.
+///
+/// # What it costs
+///
+/// A smaller cell is cheaper idle and dearer under load, and the trade is
+/// deliberate rather than free:
+///
+/// * bulk moves in more cells — a 5 MB transfer becomes ~2 500 cells instead of
+///   ~310, so per-cell wire overhead goes from ~0.16% to ~1.3% of the payload;
+/// * an observer gets more timing samples per byte transferred.
+///
+/// 1024 (`MIN_CIRCUIT_CELL_BYTES`) would buy roughly 0.3 GB/month more on an
+/// idle phone while doubling both of those. 2048 takes eight of the sixteen
+/// available factors for a quarter of the bulk cost, which is where the curve
+/// stops being worth it.
+///
+/// # What it does NOT buy
+///
+/// Uniformity within one circuit is the anonymity property, and it is
+/// unchanged. But a single size chosen by every node is still a single size:
+/// this is a SMALLER global constant, not the per-circuit variety the plumbing
+/// enables. The classifier's free invariant moves from 16410 to 2074 — it does
+/// not disappear. Removing it needs sizes that differ per circuit, which needs
+/// a hub that can hold more than one MSS.
+///
+/// ⚠️ Changing this number BREAKS THE WIRE against nodes that expect another —
+/// every hop refuses a cell of any other size, and the setup prefix that
+/// carries it is length-sensitive. It moves for the whole network at once or
+/// not at all.
 pub fn choose_cell_bytes() -> CircuitCellBytes {
-    CircuitCellBytes::legacy()
+    // 2048 is inside `MIN_CIRCUIT_CELL_BYTES..=CIRCUIT_PAYLOAD_BYTES`, so the
+    // constructor cannot fail; `legacy()` keeps the promise honest if it ever
+    // moves outside.
+    CircuitCellBytes::new(2048).unwrap_or_else(|_| CircuitCellBytes::legacy())
 }
 
 /// Build a circuit-setup envelope addressed through `hops` (`hops[0]` first,

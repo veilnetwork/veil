@@ -307,6 +307,28 @@ pub(crate) fn media_batch_body_max() -> usize {
         - crate::media::MEDIA_SEAL_OVERHEAD
         - 1
 }
+
+/// Everything one cell must carry BEFORE any payload: the length prefix, the
+/// splice header, and the worst-case protected-intro framing a media batch adds.
+const CIRCUIT_CELL_FIXED_COST: usize = veil_anonymity::circuit_data::LEN_PREFIX
+    + COOKIE_LEN
+    + CIRCUIT_PEER_TAG_LEN
+    + 1
+    + CIRCUIT_INTRO_LEN
+    + 1
+    + crate::media::MEDIA_SEAL_OVERHEAD
+    + 1;
+// The budgets above are `usize` subtractions from the cell size. A cell too
+// small for the fixed cost would not error — it would WRAP, and hand the media
+// path a batch limit near `usize::MAX`. `CircuitCellBytes::new` already refuses
+// anything under `MIN_CIRCUIT_CELL_BYTES`, so pinning the two together here is
+// what makes every size the constructor admits arithmetically safe. Checked at
+// compile time because the only alternative is discovering it from a wrapped
+// length at run time.
+const _: () = assert!(
+    veil_anonymity::circuit_data::MIN_CIRCUIT_CELL_BYTES > CIRCUIT_CELL_FIXED_COST,
+    "the smallest negotiable cell must still leave room for a payload"
+);
 const CIRCUIT_HOPS: usize = 2;
 // How long a pinned INBOUND circuit may sit idle (no received data) before it is
 // rebuilt on a fresh path. Raised 45s -> 300s: the 45s rebuild cadence was pure
@@ -4532,8 +4554,8 @@ mod tests {
         CIRCUIT_HEARTBEAT_INTERVAL, CIRCUIT_HEARTBEAT_MAX_SECS, CIRCUIT_INTRO_LEN,
         CIRCUIT_PEER_TAG_LEN, CircuitMode, DATAGRAM_AUTH_DELIVER_MAX, DATAGRAM_AUTH_SIGNATURE_MAX,
         DATAGRAM_MAX_CELL, DATAGRAM_MSS, circuit_env_max, circuit_env_value_mode,
-        circuit_heartbeat_wait, circuit_mss_for, parse_stream_peer_intro_plaintext,
-        stream_peer_intro_plaintext,
+        circuit_heartbeat_wait, circuit_mss_for, media_batch_body_max,
+        parse_stream_peer_intro_plaintext, stream_peer_intro_plaintext,
     };
     use veil_anonymity::circuit_register::COOKIE_LEN;
     use veil_onion_stream::wire::{DATA_OVERHEAD, Frame, MAX_CELL};
@@ -4658,26 +4680,39 @@ mod tests {
         }
     }
 
-    /// This refactor must be a NO-OP at today's policy.
+    /// Every send-path budget must track the POLICY, not a legacy constant.
     ///
-    /// `circuit_mss_for` and `circuit_env_max` replaced two constants derived
-    /// from the legacy cell. If they disagree with those constants by a single
-    /// byte while `choose_cell_bytes` still returns legacy, the data path
-    /// changed underneath a change that was supposed to only move where the
-    /// number comes from.
+    /// Two halves, and they check different things:
+    ///
+    /// * the formula still agrees bit-for-bit with the onion-stream crate's own
+    ///   `MAX_CELL` derivation *at the legacy size* — that tie is what says the
+    ///   arithmetic was moved, not rewritten;
+    /// * the live budgets follow `choose_cell_bytes`, so a policy change cannot
+    ///   leave the send path sizing against a cell nobody builds any more.
+    ///
+    /// If the policy moves again, the second half is re-derived from it — the
+    /// literal below is a statement of the current choice, not a magic number.
     #[test]
-    fn sizing_from_the_policy_is_bit_exact_with_the_constants_it_replaced() {
+    fn the_send_path_budgets_track_the_policy_not_the_legacy_cell() {
+        use veil_anonymity::circuit_data::{CircuitCellBytes, LEN_PREFIX};
+
         assert_eq!(
-            veil_anonymity::circuit_origin::choose_cell_bytes(),
-            veil_anonymity::circuit_data::CircuitCellBytes::legacy(),
-            "this test states what the CURRENT policy is; if the policy moved, \
-             the assertions below are the ones to re-derive, not to delete"
+            circuit_mss_for(CircuitCellBytes::legacy()),
+            MAX_CELL - COOKIE_LEN - CIRCUIT_PEER_TAG_LEN - DATA_OVERHEAD,
+            "the moved arithmetic must still reproduce the crate's own ceiling"
         );
-        assert_eq!(
-            circuit_mss_for(veil_anonymity::circuit_data::CircuitCellBytes::legacy()),
-            MAX_CELL - COOKIE_LEN - CIRCUIT_PEER_TAG_LEN - DATA_OVERHEAD
+
+        let policy = veil_anonymity::circuit_origin::choose_cell_bytes();
+        assert_eq!(policy.get(), 2048, "the current choice, stated on purpose");
+        assert_eq!(circuit_env_max(), policy.get() - LEN_PREFIX);
+        assert!(
+            circuit_env_max() < MAX_CELL,
+            "a policy at the legacy size would make this test vacuous"
         );
-        assert_eq!(circuit_env_max(), MAX_CELL);
+        assert!(
+            media_batch_body_max() > 0 && media_batch_body_max() < circuit_env_max(),
+            "the media batch budget must stay a real, bounded number"
+        );
     }
 
     /// A stream frame plus its splice header must fill EXACTLY one cell, at any
