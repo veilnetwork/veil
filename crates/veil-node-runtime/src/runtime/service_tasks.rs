@@ -4304,6 +4304,39 @@ impl RendezvousResolverImpl {
     }
 }
 
+/// Enrol a send-path receiver in the refresh-ahead set — unless it is us.
+///
+/// The proactive set exists to spare the SEND path a synchronous DHT walk, and
+/// no send goes to our own rendezvous ad: reaching ourselves needs no route.
+/// Enrolling self turns a one-off self-resolve into a standing subscription,
+/// because the refresher re-walks every member once per cache TTL forever.
+///
+/// Measured 23.08 on an idle phone with zero contacts: **2536** FIND_VALUE
+/// walks of its OWN eight ad slots in 80 minutes, dead on 15.0s, **53%** of
+/// every DHT frame it exchanged. The refresh task's own doc promises "a node
+/// that stops messaging adds zero steady-state DHT load"; for the single
+/// receiver id that can never be messaged, that promise was inverted.
+///
+/// Self still resolves on demand — the mailbox drain's cold path needs it. It
+/// just does not buy a standing subscription.
+fn note_send_target(
+    resolve_cache: &Arc<super::anonymity_state::RendezvousResolveCache>,
+    receiver_id: [u8; 32],
+    local_node_id: [u8; 32],
+) {
+    if receiver_id == local_node_id {
+        // WHICH caller resolves self was not answerable from any log —
+        // measurement could name the frames and the keys, never the origin.
+        // Left as an instrument rather than another guess.
+        log::debug!(
+            "rendezvous.resolve.self receiver={} — walking, not enrolling in refresh-ahead",
+            veil_util::hex_short(&receiver_id),
+        );
+        return;
+    }
+    resolve_cache.note_send_use(receiver_id);
+}
+
 /// Resolve every requested rendezvous-ad slot from independent connected DHT
 /// peers, compare all still-valid signed candidates by publication time, and
 /// write the winner for each slot back into the local mirror.  A plain
@@ -4340,7 +4373,21 @@ pub(super) async fn resolve_fresh_rendezvous_ads(
     if !force_refresh {
         // Feed the refresh-ahead task: this receiver is being actively sent
         // to, keep its route warm for the activity window.
-        resolve_cache.note_send_use(receiver_id);
+        //
+        // OURSELF never qualifies. The proactive set exists to spare the SEND
+        // path a synchronous walk, and no send goes to our own rendezvous ad —
+        // reaching ourselves needs no route. Enrolling self turned a one-off
+        // self-resolve into a permanent 8-walks-per-TTL loop: measured 23.08 on
+        // an idle phone with zero contacts, 2536 FIND_VALUE walks of its OWN ad
+        // slots in 80 minutes, dead on 15.0s, 53% of every DHT frame it
+        // exchanged. The doc on the refresh task promises "a node that stops
+        // messaging adds zero steady-state DHT load"; for the one receiver id
+        // that can never be messaged, that promise was inverted.
+        //
+        // Resolving self still WORKS — the walk below runs as asked, and the
+        // mailbox drain's cold path depends on it. It just does not buy a
+        // standing subscription to re-walk forever.
+        note_send_target(resolve_cache, receiver_id, local_node_id);
         if let Some(ads) = resolve_cache.get(&receiver_id, now) {
             return ads;
         }
@@ -6485,6 +6532,36 @@ mod tests {
             run_wake_only_trigger(false).await,
             1,
             "gate OFF: legacy wake-only push is still dispatched (back-compat)"
+        );
+    }
+
+    /// The refresh-ahead set must never contain us.
+    ///
+    /// Asserted through the CACHE, not through the predicate: what matters is
+    /// that the background refresher gets no candidate, and that a real peer
+    /// still does. A predicate-only test would pass just as happily if the
+    /// call site had the arms the wrong way round.
+    #[test]
+    fn resolving_our_own_ad_does_not_subscribe_us_to_refresh_ahead() {
+        let me = [1u8; 32];
+        let peer = [2u8; 32];
+        let cache = Arc::new(super::super::anonymity_state::RendezvousResolveCache::new());
+        let window = std::time::Duration::from_secs(300);
+        let margin = std::time::Duration::from_secs(6);
+
+        super::note_send_target(&cache, me, me);
+        assert!(
+            cache.refresh_candidates(window, margin).is_empty(),
+            "self-resolve enrolled us; the refresher would re-walk our own 8 ad \
+             slots once per TTL forever"
+        );
+
+        super::note_send_target(&cache, peer, me);
+        assert_eq!(
+            cache.refresh_candidates(window, margin),
+            vec![peer],
+            "a genuine send target must still be kept warm — the whole point of \
+             the proactive set"
         );
     }
 }
