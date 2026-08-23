@@ -330,10 +330,36 @@ pub struct RoutingTable {
     /// then refills at `DHT_BUCKET_TOKEN_REFILL_PER_SEC`) plus
     /// exponential backoff on sustained pressure.
     bucket_rate: Vec<BucketRateState>,
+    /// What each peer last STATED about itself, kept for as long as the table
+    /// lives — deliberately OUTLIVING the peer's contact.
+    ///
+    /// `Contact::caps_known` alone cannot carry a preference across a
+    /// reconnect, because the entry it would be preserved on is gone by then:
+    /// `on_session_closed` removes the contact outright ("this peer is no
+    /// longer reachable"). The peer then comes back on the 1-RTT resume path,
+    /// which exchanges no CAPABILITIES, and the fresh entry starts from the
+    /// struct defaults — "Public, serves". Measured live 23.08 on three seeds:
+    /// a phone advertising `NO_DHT_SERVICE` lost the flag on every one of them
+    /// within a minute of cycling its Wi-Fi, and the seeds' skip counters
+    /// froze while DHT work flowed to it again.
+    ///
+    /// Only NON-default statements are held, so the map stays the size of "how
+    /// many peers asked for something" rather than "how many peers exist"; a
+    /// peer that restates the default drops out of it. `STATED_CAPS_MAX` caps
+    /// it regardless.
+    stated_caps: std::collections::HashMap<[u8; 32], (u8, bool)>,
     /// Disable rate limit for tests.
     #[cfg(test)]
     pub rate_limit_disabled: bool,
 }
+
+/// Ceiling on [`RoutingTable::stated_caps`]. Each entry is a node id plus two
+/// bytes, and only peers that asked for something non-default occupy one, so
+/// this is far above any real fleet; it exists so a peer churning through
+/// node ids cannot grow the map without bound. Past the cap a new statement is
+/// simply not remembered — the peer is served as though it had never asked,
+/// which is the pre-existing behaviour, not a new failure mode.
+pub const STATED_CAPS_MAX: usize = 4096;
 
 /// token-bucket + exponential-backoff state for one
 /// k-bucket. Stored as a parallel `Vec` (256 entries) on `RoutingTable`.
@@ -419,6 +445,7 @@ impl RoutingTable {
             k,
             sketch_threshold: 0,
             bucket_rate,
+            stated_caps: std::collections::HashMap::new(),
             #[cfg(test)]
             rate_limit_disabled: true, // tests run without rate limit by default
         }
@@ -454,6 +481,47 @@ impl RoutingTable {
     }
 
     /// Effective capacity for a given bucket index.
+    /// Reconcile an incoming contact with what the peer has already SAID.
+    ///
+    /// Two directions, and both matter:
+    ///
+    /// * The contact states something ⇒ that is the freshest word from the
+    ///   peer itself, so it is recorded. Restating the default drops the
+    ///   record, which is how a peer withdraws a refusal.
+    /// * The contact states nothing ⇒ fill it in from the record, if any. This
+    ///   is the arm that survives `remove_contact`: a resumed reconnect knows
+    ///   nothing and would otherwise reintroduce the peer as "Public, serves".
+    fn apply_stated_caps(&mut self, contact: &mut Contact) {
+        if contact.caps_known {
+            let stated = (contact.discovery_mode, contact.no_dht_service);
+            if stated == (0, false) {
+                self.stated_caps.remove(&contact.node_id);
+            } else if self.stated_caps.contains_key(&contact.node_id)
+                || self.stated_caps.len() < STATED_CAPS_MAX
+            {
+                self.stated_caps.insert(contact.node_id, stated);
+            } else {
+                log::debug!(
+                    "dht.stated_caps.full node={} — preference not remembered",
+                    veil_util::hex_short(&contact.node_id),
+                );
+            }
+            return;
+        }
+        if let Some(&(mode, no_service)) = self.stated_caps.get(&contact.node_id) {
+            contact.discovery_mode = mode;
+            contact.no_dht_service = no_service;
+            contact.caps_known = true;
+        }
+    }
+
+    /// How many peers have a non-default preference on record. Observability
+    /// for [`STATED_CAPS_MAX`]; also lets a test assert the map does not grow
+    /// on peers that asked for nothing.
+    pub fn stated_caps_len(&self) -> usize {
+        self.stated_caps.len()
+    }
+
     fn bucket_cap(&self, idx: usize) -> usize {
         if idx < self.sketch_threshold {
             1
@@ -490,10 +558,11 @@ impl RoutingTable {
         self.insert_inner(contact, true);
     }
 
-    fn insert_inner(&mut self, contact: Contact, bypass_rate_limit: bool) {
+    fn insert_inner(&mut self, mut contact: Contact, bypass_rate_limit: bool) {
         if contact.node_id == self.local_id {
             return; // never store self
         }
+        self.apply_stated_caps(&mut contact);
         let dist = xor_distance(&self.local_id, &contact.node_id);
         let idx = bucket_index(&dist);
         // trusted callers (post-handshake) get full bucket
@@ -1183,6 +1252,99 @@ mod no_dht_service_tests {
             "a peer that stopped refusing must be taken at its word"
         );
         assert_eq!(held.discovery_mode(), veil_types::DiscoveryMode::Public);
+    }
+
+    /// The case the `caps_known` rule alone could NOT fix, because by the time
+    /// the peer comes back there is no entry left to preserve anything on.
+    ///
+    /// `on_session_closed` removes the contact outright, so a Wi-Fi cycle is:
+    /// remove → resume (no CAPABILITIES) → insert a fresh, defaulted entry.
+    /// Measured live 23.08: deploying only the `caps_known` half to one of
+    /// three seeds changed nothing — the flag vanished on the fixed seed too.
+    #[test]
+    fn a_refusal_outlives_the_contact_being_removed() {
+        let mut rt = RoutingTable::new([0u8; 32]);
+        rt.insert_trusted(Contact::from_handshake(
+            [7u8; 32],
+            "tcp://198.51.100.7:53050",
+            Some((veil_types::DiscoveryMode::IntroductionOnly, false)),
+        ));
+
+        // Session drops: dispatcher::on_session_closed → remove_contact.
+        rt.remove(&[7u8; 32]);
+        assert_eq!(rt.total_contacts(), 0, "the entry really is gone");
+
+        // Reconnect over obfs4/TCP: resumption states nothing at all.
+        rt.insert_trusted(Contact::from_handshake(
+            [7u8; 32],
+            "tcp://198.51.100.7:53338",
+            None,
+        ));
+
+        let held = rt
+            .find_closest(&[7u8; 32], 4)
+            .into_iter()
+            .find(|c| c.node_id == [7u8; 32])
+            .expect("back in the table");
+        assert!(
+            !held.dht_service(),
+            "the peer asked once and has not withdrawn it; a reconnect is not a withdrawal"
+        );
+        assert_eq!(
+            held.discovery_mode(),
+            veil_types::DiscoveryMode::IntroductionOnly
+        );
+        assert_eq!(held.transport, "tcp://198.51.100.7:53338");
+    }
+
+    /// A refusal must be withdrawable, or the record becomes a one-way trap
+    /// for any peer that changes its mind.
+    #[test]
+    fn a_full_handshake_withdraws_the_remembered_refusal() {
+        let mut rt = RoutingTable::new([0u8; 32]);
+        rt.insert_trusted(Contact::from_handshake(
+            [7u8; 32],
+            "tcp://a:1",
+            Some((veil_types::DiscoveryMode::IntroductionOnly, false)),
+        ));
+        assert_eq!(rt.stated_caps_len(), 1);
+
+        rt.insert_trusted(Contact::from_handshake(
+            [7u8; 32],
+            "tcp://a:2",
+            Some((veil_types::DiscoveryMode::Public, true)),
+        ));
+        assert_eq!(
+            rt.stated_caps_len(),
+            0,
+            "restating the default must clear the record, not shadow it forever"
+        );
+
+        // And the withdrawal survives a reconnect too — the arm that would
+        // otherwise resurrect a refusal the peer already took back.
+        rt.remove(&[7u8; 32]);
+        rt.insert_trusted(Contact::from_handshake([7u8; 32], "tcp://a:3", None));
+        let held = rt
+            .find_closest(&[7u8; 32], 4)
+            .into_iter()
+            .find(|c| c.node_id == [7u8; 32])
+            .expect("back in the table");
+        assert!(held.dht_service());
+    }
+
+    /// The record is sized by "who asked for something", not "who exists".
+    #[test]
+    fn peers_that_ask_for_nothing_are_not_remembered() {
+        let mut rt = RoutingTable::new([0u8; 32]);
+        for i in 1..=50u8 {
+            rt.insert_trusted(Contact::from_handshake(
+                [i; 32],
+                "tcp://a",
+                Some((veil_types::DiscoveryMode::Public, true)),
+            ));
+            rt.insert(Contact::new([i; 32], "tcp://gossip"));
+        }
+        assert_eq!(rt.stated_caps_len(), 0);
     }
 
     /// `from_handshake` is the decision, not a predicate: assert on what it
