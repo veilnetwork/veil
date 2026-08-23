@@ -206,11 +206,28 @@ pub(crate) fn replicate_dht_value(
 
     // Fan-out — fire-and-forget. Peers without a direct session are silently
     // skipped; the STORE forwards greedily on receivers we DO have sessions to.
+    //
+    // BACKGROUND, not INTERACTIVE. Nothing waits on this: it republishes a
+    // record we already hold, on a half-life cadence with hours of slack, and
+    // the call does not even read the outcome. INTERACTIVE bought it nothing
+    // and cost something — the outbound coalescer only packs when the queue
+    // HEAD is BULK or BACKGROUND, so an interactive republish at the head
+    // switches packing off for that drain pass and every frame behind it pays
+    // its own padding bucket.
+    //
+    // Measured 23.08 on an idle phone: 260 bytes of framing and padding per
+    // frame against 190 B/s of bodies on one seed link — about twice the
+    // payload. 84 of the 99 send sites in the dispatcher and runtime pass
+    // INTERACTIVE, so the classification had become a default rather than a
+    // statement, and the coalescer's gate could almost never open.
+    //
+    // Send-path DHT lookups keep INTERACTIVE: a resolve in service of an
+    // actual send IS latency-sensitive. This one is not.
     let guard = tx_reg.read().unwrap_or_else(|p| p.into_inner());
     for peer in candidates {
         let _ = guard.send_to(
             &peer,
-            veil_proto::header::priority::INTERACTIVE,
+            veil_proto::header::priority::BACKGROUND,
             frame.clone(),
         );
     }
