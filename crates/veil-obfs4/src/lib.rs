@@ -118,9 +118,14 @@ pub const LEN_PREFIX_BYTES: usize = 2;
 /// MTU efficiency).
 pub const MAX_FRAME_CIPHERTEXT_BYTES: usize = 16 * 1024;
 
-/// Max padding appended to each frame body before AEAD.  Larger values
-/// disrupt frame-size fingerprinting but cost bandwidth.  1024 bytes is
-/// the same magnitude as TLS record padding upper bound.
+/// Plaintext budget reserved for padding when sizing a frame.
+///
+/// ⚠️ NOT the range the pad length is drawn from — that is
+/// [`WIRE_MAX_PADDING_BYTES`] (255), because the on-wire `pad_len` field is a
+/// single byte. Drawing over this wider value and then clamping is what used to
+/// pile 75% of all frames onto exactly 255 bytes of padding; see
+/// [`pad_len_from`]. Kept at 1024 purely as a conservative reservation in
+/// [`MAX_PLAINTEXT_PER_FRAME`], where over-reserving is harmless.
 pub const MAX_PADDING_BYTES: usize = 1024;
 
 /// Max plaintext bytes that fit into a single obfs4 frame with the
@@ -134,9 +139,11 @@ pub const MAX_PLAINTEXT_PER_FRAME: usize =
 // Audit batch 2026-05-25 phase M: lock in the chunking-math invariants.
 // `MAX_PLAINTEXT_PER_FRAME` derives MAX_FRAME_CIPHERTEXT_BYTES minus
 // the AEAD overhead and a conservative `MAX_PADDING_BYTES` budget
-// (`wrap_frame` actually caps the wire pad-len byte at u8::MAX=255 via
-// `.min(255)` regardless of MAX_PADDING_BYTES, so the formula is
-// over-conservative — a strict improvement).  Compile-time invariants
+// (`wrap_frame` draws over `WIRE_MAX_PADDING_BYTES` = 255, the only
+// value the one-byte wire field can carry, so this budget is
+// over-conservative by 769 bytes — a strict improvement, and the reason
+// `MAX_PADDING_BYTES` survives as a reservation rather than a range).
+// Compile-time invariants
 // guard the underlying arithmetic against silently going negative or
 // past the wire-frame cap.
 const _: () = {
@@ -287,10 +294,47 @@ fn len_nonce(counter: u64) -> [u8; NONCE_LEN] {
 
 // ── Frame wrap / unwrap ──────────────────────────────────────────────────────
 
+/// The largest pad length the wire can express: `pad_len` is a single byte in
+/// the frame body, and the receiver reads exactly that many bytes off the tail.
+pub const WIRE_MAX_PADDING_BYTES: usize = u8::MAX as usize;
+
+/// Choose a pad length from two random bytes.
+///
+/// Pure so it can be checked over EVERY input rather than sampled.
+///
+/// # What this replaced, and why it was worse at its own job
+///
+/// The draw used to be `raw % (MAX_PADDING_BYTES + 1)` — uniform over
+/// `0..=1024` — followed by `.min(255)`, because the wire field is one byte.
+/// Clamping a wide uniform draw into a narrow field does not narrow the
+/// distribution, it PILES IT ON THE EDGE: every draw of 255..=1024 collapsed to
+/// 255, so **75.1%** (770/1025) of all frames were padded by exactly the
+/// maximum.
+///
+/// That is expensive — the mean pad was ~223 B against a measured mean payload
+/// of ~218 B on an idle phone, so the padding was the size of the message — and
+/// it is also the opposite of what padding is for. The point of a random pad is
+/// to blur the relationship between payload size and wire size; a spike at the
+/// maximum makes wire size a near-deterministic `payload + 255`, which an
+/// observer subtracts.
+///
+/// Drawing directly over `0..=WIRE_MAX_PADDING_BYTES` costs half the bytes
+/// (mean 127.5) and is genuinely uniform. It is also exactly unbiased, which
+/// the old form was not: `u16` has 65536 values, and 65536 is divisible by 256
+/// but not by 1025.
+///
+/// The wire format is untouched — same one-byte field, same receiver — so this
+/// interoperates in both directions with peers that have not taken it.
+#[inline]
+pub fn pad_len_from(raw: u16) -> usize {
+    (raw as usize) % (WIRE_MAX_PADDING_BYTES + 1)
+}
+
 /// Wrap an outbound payload into a wire frame.
 ///
 /// Steps:
-/// 1. Pick a random pad-length in `[0, MAX_PADDING_BYTES]`.
+/// 1. Pick a random pad-length in `[0, WIRE_MAX_PADDING_BYTES]` (see
+///    [`pad_len_from`] for why that range and not a wider one).
 /// 2. Build body = `[1 byte pad-len || payload || pad-len bytes random]`.
 /// 3. AEAD-encrypt body with `body_cipher` keyed on counter-derived nonce.
 /// 4. Encrypt the 2-byte length prefix with `len_cipher` AEAD (taking only
@@ -307,23 +351,11 @@ fn len_nonce(counter: u64) -> [u8; NONCE_LEN] {
 /// 18 bytes but we extract only the first 2 ciphertext bytes — that's
 /// equivalent to ChaCha20 keystream prefix encryption.
 pub fn wrap_frame(key: &DirectionKey, counter: u64, payload: &[u8]) -> Result<Vec<u8>, FrameError> {
-    // Pad-length: random 0..=MAX_PADDING_BYTES.
+    // Pad-length: uniform over what the wire can actually carry.
     let mut pad_byte = [0u8; 2];
     rand::rng().fill_bytes(&mut pad_byte);
-    let pad_len = (u16::from_be_bytes(pad_byte) as usize) % (MAX_PADDING_BYTES + 1);
+    let pad_len = pad_len_from(u16::from_be_bytes(pad_byte));
 
-    // Body = pad-len-byte || payload || random padding.
-    //
-    // Audit batch 2026-05-25 phase M: clarified comment.  Wire format
-    // packs pad_len in a single u8, so we cap to 255 first then build
-    // the body — receiver reads exactly `pad_len` bytes off the tail.
-    // NOTE (audit cycle-6): the runtime `.min(u8::MAX)` below is the ONLY
-    // guard — `MAX_PADDING_BYTES` is intentionally larger than `u8::MAX`
-    // (1024), and there is NO compile-time assert that it is ≤ u8::MAX (an
-    // earlier comment here wrongly claimed one — such an assert would in
-    // fact fail to compile). The runtime cap makes the on-wire pad_len fit
-    // the single byte regardless of `MAX_PADDING_BYTES`.
-    let pad_len = pad_len.min(u8::MAX as usize);
     let body_len = 1 + payload.len() + pad_len;
     let mut body = Vec::with_capacity(body_len);
     body.push(pad_len as u8);
@@ -769,5 +801,59 @@ mod tests {
         assert!(ct_eq(b"hello", b"hello"));
         assert!(!ct_eq(b"hello", b"world"));
         assert!(!ct_eq(b"hello", b"hello!"));
+    }
+
+    /// Checked over EVERY input, not sampled — the property is exact.
+    ///
+    /// The old draw was `raw % 1025` then `.min(255)`. Clamping a wide uniform
+    /// draw into a narrow field does not narrow the distribution, it piles it
+    /// on the edge: 770 of the 1025 possible values collapsed to 255, so 75.1%
+    /// of frames carried the maximum pad. Expensive (mean ~223 B against a
+    /// measured mean payload of ~218 B on an idle phone) and self-defeating —
+    /// padding exists to blur the payload-to-wire relationship, and a spike at
+    /// the maximum restores it.
+    #[test]
+    fn the_pad_length_is_exactly_uniform_over_what_the_wire_can_carry() {
+        let mut counts = [0u32; 256];
+        for raw in 0..=u16::MAX {
+            let n = pad_len_from(raw);
+            assert!(
+                n <= WIRE_MAX_PADDING_BYTES,
+                "pad {n} cannot fit the one-byte wire field"
+            );
+            counts[n] += 1;
+        }
+        // 65536 = 256 * 256 exactly, so every length is equally likely and the
+        // draw carries no modulo bias. (The old `% 1025` did: 65536 % 1025 = 411.)
+        for (n, c) in counts.iter().enumerate() {
+            assert_eq!(*c, 256, "pad length {n} is not equally likely");
+        }
+    }
+
+    /// The specific regression, stated as its own assertion so a future change
+    /// that reintroduces clamping fails on the symptom and not just the shape.
+    #[test]
+    fn the_maximum_pad_is_no_likelier_than_any_other() {
+        let max_hits = (0..=u16::MAX)
+            .filter(|&raw| pad_len_from(raw) == WIRE_MAX_PADDING_BYTES)
+            .count();
+        let share = max_hits as f64 / 65536.0;
+        assert!(
+            (share - 1.0 / 256.0).abs() < 1e-9,
+            "the maximum pad is drawn {share:.4} of the time, not 1/256 — \
+             a clamp has been reintroduced (the old code sat at 0.751)"
+        );
+    }
+
+    /// Mean pad halves, which is the byte saving, and it is a consequence of
+    /// the shape above rather than a separate tuning knob.
+    #[test]
+    fn the_mean_pad_is_half_the_wire_maximum() {
+        let total: u64 = (0..=u16::MAX).map(|raw| pad_len_from(raw) as u64).sum();
+        let mean = total as f64 / 65536.0;
+        assert!(
+            (mean - 127.5).abs() < 1e-9,
+            "mean pad {mean:.2}, expected 127.5 (the old draw averaged ~223)"
+        );
     }
 }
