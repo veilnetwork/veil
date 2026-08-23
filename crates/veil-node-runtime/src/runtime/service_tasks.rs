@@ -4431,6 +4431,41 @@ pub(super) async fn resolve_fresh_rendezvous_ads(
     // Always fill the cache from every system slot. The IPC caller may request
     // only one returned replica, but caching that partial lookup would hide a
     // fresher ad in another slot from the live send path for the cache TTL.
+    // OUR OWN ad needs no network. The walk exists because a cached ad can be
+    // stale — the receiver may have moved to another relay since it was
+    // resolved. For our own ad that cannot happen: we ARE the receiver, and
+    // the local mirror is exactly what we wrote when we published. Asking the
+    // network where our own advertisement is means asking strangers what we
+    // just told them.
+    //
+    // Measured 23.08 on an idle node: the pinned-circuit refresh
+    // (`CIRCUIT_IDLE_REFRESH_AFTER`) drove one full 8-slot walk of our OWN
+    // slots every ~304 s, forever — the node's log shows one of them starting
+    // 22 s after `rendezvous_ad.published` wrote the very ads it went looking
+    // for. That was about half of all recursive DHT traffic an idle phone
+    // exchanged.
+    //
+    // Falls through to the walk when the mirror holds nothing: the mailbox
+    // drain's cold path (not registered anywhere yet) depends on it, and so
+    // does a node whose ads have expired.
+    let mut ads = Vec::new();
+    if receiver_id == local_node_id {
+        ads.extend(
+            (0..MAX_RENDEZVOUS_AD_SLOTS)
+                .filter_map(|idx| dht.get_local(&rendezvous_ad_dht_key_at(&receiver_id, idx)))
+                .filter_map(|bytes| decode_rendezvous_ad(&bytes).ok())
+                .filter(|ad| ad.receiver_node_id == receiver_id)
+                .filter(|ad| verify_rendezvous_ad(ad).is_ok())
+                .filter(|ad| is_currently_valid(ad, now).is_ok()),
+        );
+        if !ads.is_empty() {
+            logger.debug(
+                "anonymity.rendezvous.resolve.local_self",
+                format!("slots={} — own ad read locally, no walk", ads.len()),
+            );
+        }
+    }
+
     let walks = (0..MAX_RENDEZVOUS_AD_SLOTS).map(|idx| {
         let key = rendezvous_ad_dht_key_at(&receiver_id, idx);
         async move {
@@ -4459,8 +4494,11 @@ pub(super) async fn resolve_fresh_rendezvous_ads(
         }
     });
 
-    let mut ads = Vec::new();
-    for (_idx, key, candidates) in futures::future::join_all(walks).await {
+    for (_idx, key, candidates) in if ads.is_empty() {
+        futures::future::join_all(walks).await
+    } else {
+        Vec::new()
+    } {
         let mut decoded: Vec<_> = candidates
             .into_iter()
             .filter_map(|bytes| decode_rendezvous_ad(&bytes).ok().map(|ad| (ad, bytes)))
