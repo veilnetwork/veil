@@ -151,6 +151,33 @@ impl Contact {
         contact
     }
 
+    /// The entry a completed handshake justifies.
+    ///
+    /// `caps` is `Some((mode, dht_service))` only when the peer actually SENT
+    /// a CAPABILITIES frame. A fast-resumed handshake exchanges none and
+    /// synthesizes `flags = 0`, which every accessor reads as the ordinary
+    /// answer "Public, serves" — indistinguishable, from the payload alone,
+    /// from a peer that said so. Passing `None` there is what keeps a
+    /// reconnect from overwriting the stamps the last full handshake made:
+    /// the contact goes in with [`Self::caps_known`] false, and
+    /// [`RoutingTable::insert`] leaves the stored preferences alone.
+    ///
+    /// Callers must NOT collapse this to `with_caps(.., dht_service)` using a
+    /// synthesized payload. Measured live 23.08: a phone advertising
+    /// `NO_DHT_SERVICE` held the flag on three seeds, then lost it on all
+    /// three the moment it reconnected and resumption replaced the full
+    /// handshake — DHT work to it resumed and the skip counters froze.
+    pub fn from_handshake(
+        node_id: [u8; 32],
+        transport: impl Into<String>,
+        caps: Option<(veil_types::DiscoveryMode, bool)>,
+    ) -> Self {
+        match caps {
+            Some((mode, dht_service)) => Self::with_caps(node_id, transport, mode, dht_service),
+            None => Self::new(node_id, transport),
+        }
+    }
+
     /// Whether this peer may be picked as a DHT candidate (store target,
     /// walk hop, FIND_NODE referral). Reachability paths must NOT check
     /// this — see the field doc.
@@ -1077,6 +1104,108 @@ mod no_dht_service_tests {
             held.transport, "tcp://gossip:9000",
             "a transport that is actually known DOES refresh; an empty one is \
              not news and must not erase what we have"
+        );
+    }
+
+    /// The reconnect case, which the gossip rule above could not catch.
+    ///
+    /// A fast-resumed handshake exchanges no CAPABILITIES and synthesizes
+    /// `flags = 0`. Fed through `with_caps` that reads as a peer STATING
+    /// "Public, serves" — `caps_known` true — so the preservation rule in
+    /// `insert` did not fire and the refusal was overwritten. Measured live
+    /// 23.08: the flag survived on three seeds until the phone's Wi-Fi was
+    /// cycled, then vanished on all three inside a minute.
+    ///
+    /// The address must still refresh: a reconnect is precisely when the
+    /// peer's observed address changes, and freezing it would trade one
+    /// defect for a worse one.
+    #[test]
+    fn a_resumed_handshake_keeps_the_refusal_and_still_moves_the_address() {
+        let mut rt = RoutingTable::new([0u8; 32]);
+        rt.insert_trusted(Contact::from_handshake(
+            [7u8; 32],
+            "tcp://198.51.100.7:53050",
+            Some((veil_types::DiscoveryMode::IntroductionOnly, false)),
+        ));
+
+        // Reconnect over obfs4/TCP: resumption, new source port, no caps.
+        rt.insert_trusted(Contact::from_handshake(
+            [7u8; 32],
+            "tcp://198.51.100.7:53338",
+            None,
+        ));
+
+        let held = rt
+            .find_closest(&[7u8; 32], 4)
+            .into_iter()
+            .find(|c| c.node_id == [7u8; 32])
+            .expect("still in the table");
+        assert!(
+            !held.dht_service(),
+            "a resumption states nothing and must not put the peer back into candidacy"
+        );
+        assert_eq!(
+            held.discovery_mode(),
+            veil_types::DiscoveryMode::IntroductionOnly,
+            "nor revert the hide-from-walks preference"
+        );
+        assert_eq!(
+            held.transport, "tcp://198.51.100.7:53338",
+            "the new address IS news and must land"
+        );
+    }
+
+    /// The other half of the same rule: a peer that genuinely changes its mind
+    /// must be believed. Without this, "never update capabilities" would pass
+    /// the test above and leave a peer's refusal — or its withdrawal of one —
+    /// stuck forever.
+    #[test]
+    fn a_full_handshake_still_overrides_what_is_stored() {
+        let mut rt = RoutingTable::new([0u8; 32]);
+        rt.insert_trusted(Contact::from_handshake(
+            [7u8; 32],
+            "tcp://a:1",
+            Some((veil_types::DiscoveryMode::IntroductionOnly, false)),
+        ));
+        rt.insert_trusted(Contact::from_handshake(
+            [7u8; 32],
+            "tcp://a:2",
+            Some((veil_types::DiscoveryMode::Public, true)),
+        ));
+
+        let held = rt
+            .find_closest(&[7u8; 32], 4)
+            .into_iter()
+            .find(|c| c.node_id == [7u8; 32])
+            .expect("still in the table");
+        assert!(
+            held.dht_service(),
+            "a peer that stopped refusing must be taken at its word"
+        );
+        assert_eq!(held.discovery_mode(), veil_types::DiscoveryMode::Public);
+    }
+
+    /// `from_handshake` is the decision, not a predicate: assert on what it
+    /// builds, so a future caller cannot get the arms backwards unnoticed.
+    #[test]
+    fn from_handshake_states_only_what_it_was_told() {
+        let unstated = Contact::from_handshake([1u8; 32], "tcp://a", None);
+        assert!(!unstated.caps_known);
+        assert!(
+            unstated.dht_service(),
+            "unknown still reads as serves — the wire default, unchanged"
+        );
+
+        let stated = Contact::from_handshake(
+            [1u8; 32],
+            "tcp://a",
+            Some((veil_types::DiscoveryMode::ContactsOnly, false)),
+        );
+        assert!(stated.caps_known);
+        assert!(!stated.dht_service());
+        assert_eq!(
+            stated.discovery_mode(),
+            veil_types::DiscoveryMode::ContactsOnly
         );
     }
 
