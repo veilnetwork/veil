@@ -574,6 +574,36 @@ impl SessionTxRegistry {
         }
     }
 
+    /// Send `bytes` to every registered session except TWO peers.
+    ///
+    /// Exists for gossip forwarding, which must skip both the peer the frame
+    /// arrived from AND the node the frame is about: a route announcement
+    /// forwarded back to its own origin tells that node how to reach itself,
+    /// which is never useful and cost a measured 14% of all announcements a
+    /// phone received. The single-exclusion form above cannot express it.
+    pub fn send_to_all_except_two_with_priority(
+        &self,
+        exclude_a: &NodeIdBytes,
+        exclude_b: &NodeIdBytes,
+        priority: u8,
+        bytes: veil_bufpool::PooledShared,
+    ) {
+        for (peer_id, entry) in self.senders.iter() {
+            if peer_id == exclude_a || peer_id == exclude_b {
+                continue;
+            }
+            match entry.tx.try_send((priority, bytes.clone())) {
+                Ok(_) => {}
+                Err(mpsc::error::TrySendError::Full(_)) => {
+                    self.drops_total.fetch_add(1, Ordering::Relaxed);
+                }
+                Err(mpsc::error::TrySendError::Closed(_)) => {
+                    // Lazy cleanup — next write-lock op prunes.
+                }
+            }
+        }
+    }
+
     /// Node-ids of all currently registered live sessions. Skips
     /// closed-channel stragglers (lazy-cleanup invariant).
     pub fn peer_ids(&self) -> Vec<NodeIdBytes> {
@@ -819,5 +849,54 @@ mod tests {
             "current owner can remove its sender"
         );
         assert!(!reg.has_session(&peer));
+    }
+
+    /// Gossip forwarding must skip the node the frame is ABOUT, not only the
+    /// peer it came from. A route announcement forwarded back to its origin
+    /// tells that node how to reach itself — measured as 15 of the 105
+    /// announcements a phone received in 15 minutes.
+    #[test]
+    fn a_two_way_exclusion_skips_both_and_still_reaches_everyone_else() {
+        let mut reg = SessionTxRegistry::new();
+        let sender = [1u8; 32];
+        let origin = [2u8; 32];
+        let bystander = [3u8; 32];
+        let mut rx_sender = reg.register(sender);
+        let mut rx_origin = reg.register(origin);
+        let mut rx_bystander = reg.register(bystander);
+
+        reg.send_to_all_except_two_with_priority(
+            &sender,
+            &origin,
+            veil_proto::header::priority::BACKGROUND,
+            veil_bufpool::pooled_shared_from_vec(vec![7u8; 4]),
+        );
+
+        assert!(rx_sender.try_recv().is_err(), "the peer it came from must be skipped");
+        assert!(rx_origin.try_recv().is_err(), "the node it is ABOUT must be skipped");
+        let (prio, frame) = rx_bystander
+            .try_recv()
+            .expect("every other peer still receives the forward");
+        assert_eq!(prio, veil_proto::header::priority::BACKGROUND);
+        assert_eq!(&frame[..], &[7u8; 4]);
+    }
+
+    /// The two exclusions are independent: naming the same peer twice must not
+    /// silence anyone else (a `==` typo collapsing both arms would).
+    #[test]
+    fn excluding_one_peer_twice_silences_only_that_peer() {
+        let mut reg = SessionTxRegistry::new();
+        let a = [1u8; 32];
+        let b = [2u8; 32];
+        let mut rx_a = reg.register(a);
+        let mut rx_b = reg.register(b);
+        reg.send_to_all_except_two_with_priority(
+            &a,
+            &a,
+            veil_proto::header::priority::BACKGROUND,
+            veil_bufpool::pooled_shared_from_vec(vec![9u8; 2]),
+        );
+        assert!(rx_a.try_recv().is_err());
+        assert!(rx_b.try_recv().is_ok(), "the other peer must still be reached");
     }
 }

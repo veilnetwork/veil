@@ -368,8 +368,16 @@ impl FrameDispatcher {
             && let Some(frame) = self.build_announce_forward(&p)
             && let Some(reg) = &self.session_tx_registry
         {
-            wlock!(reg).send_to_all_except_with_priority(
+            // Skip BOTH the peer this arrived from and the node it is ABOUT.
+            // Forwarding an announcement back to its origin tells that node how
+            // to reach itself: it cannot use the route, and it pays for the
+            // frame. Measured on a phone: 15 of the 105 announcements it
+            // received in 15 minutes were about itself, all at hop_count 2 —
+            // i.e. every one came through this forward. The three other announce
+            // sites already exclude their subject; this one did not.
+            wlock!(reg).send_to_all_except_two_with_priority(
                 peer_id.as_bytes(),
+                &p.origin_node_id,
                 veil_proto::header::priority::BACKGROUND,
                 veil_bufpool::pooled_shared_from_vec(frame),
             );
