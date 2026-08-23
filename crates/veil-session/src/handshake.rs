@@ -181,6 +181,24 @@ pub struct OvlHandshakeResult {
     pub remote_identity_payload: IdentityPayload,
     /// Raw payload received during CAPABILITIES exchange.
     pub remote_capabilities: CapabilitiesPayload,
+    /// Whether [`Self::remote_capabilities`] is what the peer SAID, or what
+    /// this side had to invent because no CAPABILITIES frame was exchanged.
+    ///
+    /// The fast-resume path returns `flags = 0, discovery_mode = 0`, and every
+    /// accessor on `CapabilitiesPayload` reads zero as an ordinary answer:
+    /// `dht_service()` is `flags & NO_DHT_SERVICE == 0`, so a synthesized
+    /// payload says "serves" in exactly the words a peer would use to say it.
+    /// Downstream bookkeeping cannot tell the two apart from the payload
+    /// alone, and stamped a peer's routing-table entry as though the peer had
+    /// just restated its preferences — erasing what its last FULL handshake
+    /// had recorded. Measured live: a phone advertising `NO_DHT_SERVICE` kept
+    /// the flag on three seeds until it reconnected, and lost it on all three
+    /// the moment resumption replaced the full handshake.
+    ///
+    /// `false` therefore means "not news": consumers must leave whatever they
+    /// already know about this peer alone. A future versioned ticket that
+    /// carries the capability flags would set this back to `true`.
+    pub remote_caps_stated: bool,
     /// Raw payload received during ATTACH exchange.
     pub remote_attach: AttachPayload,
     /// Interpreted role from the ATTACH payload.
@@ -641,6 +659,8 @@ where
                         node_id: remote_id,
                         mlkem_pubkey: None,
                     };
+                    // Synthesized, not received — CAPABILITIES was not
+                    // exchanged. See `remote_caps_stated`.
                     let remote_capabilities = CapabilitiesPayload {
                         roles_supported: 0,
                         flags: 0,
@@ -653,6 +673,7 @@ where
                         session_keys,
                         remote_identity_payload,
                         remote_capabilities,
+                        remote_caps_stated: false,
                         remote_attach,
                         remote_role,
                         remote_vivaldi,
@@ -784,6 +805,8 @@ where
                     node_id: remote_id,
                     mlkem_pubkey: None,
                 };
+                // Synthesized, not received — CAPABILITIES was not exchanged.
+                // See `remote_caps_stated`.
                 let remote_capabilities = CapabilitiesPayload {
                     roles_supported: 0,
                     flags: 0,
@@ -796,6 +819,7 @@ where
                     session_keys,
                     remote_identity_payload,
                     remote_capabilities,
+                    remote_caps_stated: false,
                     remote_attach,
                     remote_role,
                     remote_vivaldi,
@@ -1732,6 +1756,8 @@ where
         session_keys,
         remote_identity_payload: remote_identity,
         remote_capabilities,
+        // Decoded from the peer's own CAPABILITIES frame — this is news.
+        remote_caps_stated: true,
         remote_attach,
         remote_role,
         remote_vivaldi,
