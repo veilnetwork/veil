@@ -2686,6 +2686,17 @@ static MOBILE_OUTBOUND_BATCH_WINDOW_MS: AtomicU32 = AtomicU32::new(0);
 /// stalling 1-second-cadence ROUTE_PROBE liveness).
 pub const MAX_MOBILE_OUTBOUND_BATCH_WINDOW_MS: u32 = 1000;
 
+/// Serialise tests that write the process-wide mobile globals.
+///
+/// The coalescing knobs are atomics shared by the whole process, so two tests
+/// setting them in parallel would read each other's values and fail for a
+/// reason that has nothing to do with what they assert.
+#[cfg(test)]
+pub(crate) fn tests_mobile_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock().unwrap_or_else(|p| p.into_inner())
+}
+
 /// Set the low-battery threshold. `None` disables every
 /// battery-aware feature (route-probe throttle, maintenance throttle
 /// outbound batching). Called from runtime startup + reload sites
@@ -2695,6 +2706,15 @@ pub fn set_mobile_low_battery_threshold_pct(threshold: Option<u8>) {
     MOBILE_LOW_BATTERY_THRESHOLD_PCT.store(v, Ordering::Relaxed);
 }
 
+/// Whether the outbound-batch window applies regardless of battery.
+/// Primed from `MobileConfig::outbound_batch_always` at runtime startup.
+static MOBILE_OUTBOUND_BATCH_ALWAYS: AtomicBool = AtomicBool::new(false);
+
+/// Set the battery-independent coalescing opt-in.
+pub fn set_mobile_outbound_batch_always(always: bool) {
+    MOBILE_OUTBOUND_BATCH_ALWAYS.store(always, Ordering::Relaxed);
+}
+
 /// Set the outbound-batch window in milliseconds.
 /// `0` disables coalescing. Clamped to `MAX_MOBILE_OUTBOUND_BATCH_WINDOW_MS`.
 pub fn set_mobile_outbound_batch_window_ms(ms: u32) {
@@ -2702,26 +2722,42 @@ pub fn set_mobile_outbound_batch_window_ms(ms: u32) {
     MOBILE_OUTBOUND_BATCH_WINDOW_MS.store(clamped, Ordering::Relaxed);
 }
 
-/// Resolved coalescing window for the given battery reading. Returns
-/// `Some(duration)` only when ALL of:
-/// * outbound batch window is configured (`!= 0`)
-/// * battery threshold is configured (`!= DISABLED`)
-/// * battery is non-zero AND at-or-below the threshold (matches
-///   `MobileConfig::battery_multiplier` semantics — `0` = AC sentinel
-///   never throttle).
+/// Resolved coalescing window for the given battery reading.
 ///
-/// Otherwise `None` (coalescing off → fast path in session runner).
+/// The window is off unless configured (`!= 0`). Once configured, the battery
+/// threshold decides WHEN it applies:
+///
+/// * threshold configured ⇒ only while the battery is actually low (non-zero
+///   and at-or-below it — `0` is the AC sentinel and never throttles). This is
+///   the original radio-wake behaviour and is unchanged for configs that set
+///   both.
+/// * threshold NOT configured ⇒ off. That contract is deliberate and tested;
+///   `outbound_batch_always` is the explicit opt-out from it, not this.
+///
+/// `outbound_batch_always` bypasses the battery question entirely. The window
+/// was built as a radio-wake saver, but measurement made it a BYTE saver too.
+/// On an idle phone, 23.08, one seed link over 599 s: 521 frames carrying
+/// 190 B/s of bodies cost 413 B/s on the wire — **260 bytes of framing and
+/// obfs4 padding per frame, roughly twice the payload it wrapped**. Those
+/// frames cluster (30% of outbound gaps under 50 ms), so replaying the capture
+/// through a 200 ms window merges 39% of them, and a 1 s window 53%. That is
+/// worth having on mains power, and nothing about it depends on the battery.
+///
+/// Interactive frames still bypass entirely — the coalescer only engages when
+/// every queued frame is non-interactive, so liveness probes are unaffected.
 pub fn current_outbound_batch_window(battery_pct: u8) -> Option<std::time::Duration> {
     let ms = MOBILE_OUTBOUND_BATCH_WINDOW_MS.load(Ordering::Relaxed);
     if ms == 0 {
         return None;
     }
-    let threshold = MOBILE_LOW_BATTERY_THRESHOLD_PCT.load(Ordering::Relaxed);
-    if threshold == MOBILE_LOW_BATTERY_THRESHOLD_DISABLED {
-        return None;
-    }
-    if battery_pct == 0 || battery_pct > threshold {
-        return None;
+    if !MOBILE_OUTBOUND_BATCH_ALWAYS.load(Ordering::Relaxed) {
+        let threshold = MOBILE_LOW_BATTERY_THRESHOLD_PCT.load(Ordering::Relaxed);
+        if threshold == MOBILE_LOW_BATTERY_THRESHOLD_DISABLED {
+            return None;
+        }
+        if battery_pct == 0 || battery_pct > threshold {
+            return None;
+        }
     }
     Some(std::time::Duration::from_millis(ms as u64))
 }
@@ -5185,5 +5221,76 @@ mod reeval_teardown_tests {
             TIMEOUT, // genuine DATA stale — peer sends only keepalives
             false,
         ));
+    }
+
+    /// The coalescing gate exists TWICE — here as primed atomics, and in
+    /// `veil_cfg::MobileConfig::outbound_batch_window` as a method on the
+    /// struct. Two copies of one policy is how a rule drifts from the thing it
+    /// is supposed to describe, so hold them together across the whole matrix
+    /// rather than trusting that both were edited.
+    #[test]
+    fn the_two_copies_of_the_coalescing_gate_agree() {
+        let _g = tests_mobile_lock();
+        for window in [None, Some(200u32)] {
+            for always in [false, true] {
+                for threshold in [None, Some(30u8)] {
+                    for battery in [0u8, 20, 50, 100] {
+                        let cfg = veil_cfg::MobileConfig {
+                            low_battery_threshold_pct: threshold,
+                            low_battery_multiplier: 4,
+                            outbound_batch_window_ms: window,
+                            outbound_batch_always: always,
+                            ..Default::default()
+                        };
+                        set_mobile_low_battery_threshold_pct(threshold);
+                        set_mobile_outbound_batch_window_ms(window.unwrap_or(0));
+                        set_mobile_outbound_batch_always(always);
+                        assert_eq!(
+                            current_outbound_batch_window(battery),
+                            cfg.outbound_batch_window(battery),
+                            "window={window:?} always={always} threshold={threshold:?} battery={battery}"
+                        );
+                    }
+                }
+            }
+        }
+        set_mobile_outbound_batch_window_ms(0);
+        set_mobile_low_battery_threshold_pct(None);
+        set_mobile_outbound_batch_always(false);
+    }
+
+    /// The explicit opt-in must coalesce on mains, where the byte saving is,
+    /// WITHOUT redefining the battery contract next to it.
+    #[test]
+    fn the_always_flag_coalesces_on_mains_and_leaves_the_battery_contract_alone() {
+        let _g = tests_mobile_lock();
+        // Contract that must NOT move: window set, no threshold, no flag ⇒ off.
+        set_mobile_low_battery_threshold_pct(None);
+        set_mobile_outbound_batch_window_ms(200);
+        set_mobile_outbound_batch_always(false);
+        assert_eq!(current_outbound_batch_window(100), None);
+        assert_eq!(current_outbound_batch_window(0), None);
+
+        set_mobile_outbound_batch_always(true);
+        // 0 is the AC sentinel and 100 is a full battery — neither is "low",
+        // and both must still coalesce now that no threshold is configured.
+        for battery in [0u8, 100] {
+            assert_eq!(
+                current_outbound_batch_window(battery),
+                Some(std::time::Duration::from_millis(200)),
+                "battery={battery}"
+            );
+        }
+        // With a threshold configured and the flag off, the old behaviour must
+        // be untouched.
+        set_mobile_outbound_batch_always(false);
+        set_mobile_low_battery_threshold_pct(Some(30));
+        assert_eq!(current_outbound_batch_window(100), None);
+        assert_eq!(
+            current_outbound_batch_window(20),
+            Some(std::time::Duration::from_millis(200))
+        );
+        set_mobile_outbound_batch_window_ms(0);
+        set_mobile_low_battery_threshold_pct(None);
     }
 }
