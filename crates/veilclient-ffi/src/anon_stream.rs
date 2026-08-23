@@ -4497,6 +4497,7 @@ mod tests {
             circuit_id_in: 7,
             circuit_id_out: 8,
             circuit_key: [0x22u8; 32],
+            cell_bytes: veil_anonymity::circuit_data::CircuitCellBytes::legacy(),
         };
         let mut now = 1_000_000u64;
         table
