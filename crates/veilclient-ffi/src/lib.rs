@@ -1511,7 +1511,7 @@ pub unsafe extern "C" fn veil_media_open_channel(
                     break;
                 };
                 let next_len = body_len.saturating_add(2 + pkt.len());
-                if next_len > anon_stream::MEDIA_BATCH_BODY_MAX {
+                if next_len > anon_stream::media_batch_body_max() {
                     pending = Some(pkt);
                     break;
                 }
@@ -1522,7 +1522,7 @@ pub unsafe extern "C" fn veil_media_open_channel(
             // sequence space is exhausted) is dropped, never sent in the
             // clear — the splice relay reads whatever goes down this circuit.
             // Not a route problem either, so it must not arm the re-warm.
-            let Some(cell) = media::media_cell(packets, anon_stream::MEDIA_BATCH_BODY_MAX) else {
+            let Some(cell) = media::media_cell(packets, anon_stream::media_batch_body_max()) else {
                 continue;
             };
             let Some(sealed) = cipher_task.seal(&cell) else {

@@ -212,13 +212,53 @@ fn short_cookie(cookie: &[u8; COOKIE_LEN]) -> String {
 }
 
 /// Smaller MSS for the circuit path so the onion-stream cell + the
-/// `[cookie 16][peer_tag 32]` splice envelope exactly fill one fixed
-/// CircuitData cell (4096-B since the 2026-07-02 flag-day bump).
+/// `[cookie 16][peer_tag 32]` splice envelope exactly fill one
+/// CircuitData cell.
 const CIRCUIT_PEER_TAG_LEN: usize = 32;
-const CIRCUIT_MSS: usize = veil_onion_stream::wire::MAX_CELL
-    - COOKIE_LEN
-    - CIRCUIT_PEER_TAG_LEN
-    - veil_onion_stream::wire::DATA_OVERHEAD;
+
+/// The stream MSS that a circuit of `cell` bytes can carry.
+///
+/// Every stream frame becomes one circuit cell, wrapped as
+/// `[cookie 16][peer_tag 32][frame]` inside the cell's `[len u16][payload][pad]`
+/// envelope. So the frame budget is the cell minus its own length prefix minus
+/// that splice header, and the engine's MSS is that minus `DATA_OVERHEAD`.
+///
+/// This used to be a constant, and being a constant is what pinned every
+/// circuit in the network to 16384 bytes: `f54a68bf` moved the size into the
+/// circuit, but the framer still cut to a compile-time maximum and handed the
+/// result to whichever circuit was at hand, so a circuit that negotiated less
+/// would have refused its own stream's frames. Measured 23.08 on an idle phone:
+/// the eight-byte circuit heartbeat rode a full 16410-byte cell and accounted
+/// for 74% of every body byte the phone exchanged.
+///
+/// ⚠️ The engine holds ONE MSS for the whole hub, so this must be evaluated
+/// against the size this node ORIGINATES ([`veil_anonymity::circuit_origin::
+/// choose_cell_bytes`]), not against some individual circuit: the hub is built
+/// before any circuit exists, and its pools hold several. A peer that
+/// negotiated a smaller cell than we frame for is not a silent corruption —
+/// `wrap_payload` refuses the oversized payload at the send path and the hop
+/// would refuse the cell anyway.
+const fn circuit_mss_for(cell: veil_anonymity::circuit_data::CircuitCellBytes) -> usize {
+    cell.get()
+        - veil_anonymity::circuit_data::LEN_PREFIX
+        - COOKIE_LEN
+        - CIRCUIT_PEER_TAG_LEN
+        - veil_onion_stream::wire::DATA_OVERHEAD
+}
+
+/// The largest splice envelope a cell this node originates can carry.
+///
+/// The send path checked every envelope against `wire::MAX_CELL`, which is the
+/// LEGACY cell's budget. That is the right ceiling only while every circuit is
+/// legacy-sized; once a circuit negotiates less, an envelope can pass this gate
+/// and still not fit, and the failure then surfaces deeper as
+/// `PayloadTooLarge`. Deriving the gate from the same policy the circuits are
+/// built with keeps the two in step — and at the legacy size it is bit-exact
+/// with the constant it replaces, so today nothing changes.
+fn circuit_env_max() -> usize {
+    veil_anonymity::circuit_origin::choose_cell_bytes().get()
+        - veil_anonymity::circuit_data::LEN_PREFIX
+}
 // The external-node fallback sends every stream cell as one authenticated app
 // payload. That envelope is capped at MAX_AUTH_DELIVER_MSG_BYTES *after* the
 // sovereign header + signature are added, so it cannot reuse the 16 KiB
@@ -241,7 +281,7 @@ const _: () =
 // visible. The send path caps every splice envelope (cookie + tag + stream
 // cell) at MAX_CELL, so MAX_CELL must not exceed what the circuit's fixed
 // inner payload accepts. A max-size DATA envelope fills it exactly:
-// COOKIE(16) + TAG(32) + DATA_OVERHEAD(16) + CIRCUIT_MSS == MAX_CELL.
+// COOKIE(16) + TAG(32) + DATA_OVERHEAD(16) + the legacy MSS == MAX_CELL.
 const _: () =
     assert!(veil_onion_stream::wire::MAX_CELL <= veil_anonymity::circuit_data::MAX_CIRCUIT_INNER);
 const CIRCUIT_INTRO_MARKER: u8 = 0xA7;
@@ -252,14 +292,21 @@ const CIRCUIT_INTRO_LEN: usize =
 /// Maximum batch body that still fits the worst-case protected-intro envelope:
 /// cookie + peer tag + intro marker/seal + MEDIA_MAGIC + the end-to-end seal +
 /// the batch magic that now lives INSIDE that seal + body.
-pub(crate) const MEDIA_BATCH_BODY_MAX: usize = veil_onion_stream::wire::MAX_CELL
-    - COOKIE_LEN
-    - CIRCUIT_PEER_TAG_LEN
-    - 1
-    - CIRCUIT_INTRO_LEN
-    - 1
-    - crate::media::MEDIA_SEAL_OVERHEAD
-    - 1;
+///
+/// A function rather than a constant for the same reason as [`circuit_env_max`]:
+/// the budget is one cell's worth, and a cell is no longer one number for the
+/// whole network. At the legacy size it is bit-exact with the constant it
+/// replaces.
+pub(crate) fn media_batch_body_max() -> usize {
+    circuit_env_max()
+        - COOKIE_LEN
+        - CIRCUIT_PEER_TAG_LEN
+        - 1
+        - CIRCUIT_INTRO_LEN
+        - 1
+        - crate::media::MEDIA_SEAL_OVERHEAD
+        - 1
+}
 const CIRCUIT_HOPS: usize = 2;
 // How long a pinned INBOUND circuit may sit idle (no received data) before it is
 // rebuilt on a fresh path. Raised 45s -> 300s: the 45s rebuild cadence was pure
@@ -1447,11 +1494,11 @@ impl CircuitCells {
             }
         }
         env.extend_from_slice(cell);
-        if env.len() > veil_onion_stream::wire::MAX_CELL {
+        if env.len() > circuit_env_max() {
             return Err(io::Error::other(format!(
                 "circuit stream envelope too large: {} > {}",
                 env.len(),
-                veil_onion_stream::wire::MAX_CELL
+                circuit_env_max()
             )));
         }
         Ok(env)
@@ -1814,7 +1861,7 @@ impl CircuitCells {
             }
         }
         env.extend_from_slice(cell);
-        if env.len() > veil_onion_stream::wire::MAX_CELL {
+        if env.len() > circuit_env_max() {
             return Err(io::Error::other("circuit stream envelope too large"));
         }
         match self
@@ -1867,11 +1914,11 @@ impl CircuitCells {
                 }
             }
             env.extend_from_slice(cell);
-            if env.len() > veil_onion_stream::wire::MAX_CELL {
+            if env.len() > circuit_env_max() {
                 return Err(io::Error::other(format!(
                     "circuit stream envelope too large: {} > {}",
                     env.len(),
-                    veil_onion_stream::wire::MAX_CELL
+                    circuit_env_max()
                 )));
             }
             if let Err(e) = self
@@ -3058,7 +3105,14 @@ impl AnonStreamHub {
         };
 
         let (cells, mss) = match circuit_cells {
-            Some(c) => (HubCells::Circuit(Box::new(c)), CIRCUIT_MSS),
+            // Frame to the size this node ORIGINATES, not to the compile-time
+            // ceiling. The hub exists before any circuit does and its pools
+            // hold several, so the policy — not one circuit — is what the one
+            // shared engine can be sized against. See `circuit_mss_for`.
+            Some(c) => (
+                HubCells::Circuit(Box::new(c)),
+                circuit_mss_for(veil_anonymity::circuit_origin::choose_cell_bytes()),
+            ),
             None => {
                 // Datagram path (default / fallback): feed inbound from msg_rx.
                 spawn_anon_feed(msg_rx, in_tx);
@@ -4475,10 +4529,11 @@ fn retire_circuits_later(
 #[cfg(test)]
 mod tests {
     use super::{
-        CIRCUIT_HEARTBEAT_INTERVAL, CIRCUIT_HEARTBEAT_MAX_SECS, CIRCUIT_INTRO_LEN, CIRCUIT_MSS,
+        CIRCUIT_HEARTBEAT_INTERVAL, CIRCUIT_HEARTBEAT_MAX_SECS, CIRCUIT_INTRO_LEN,
         CIRCUIT_PEER_TAG_LEN, CircuitMode, DATAGRAM_AUTH_DELIVER_MAX, DATAGRAM_AUTH_SIGNATURE_MAX,
-        DATAGRAM_MAX_CELL, DATAGRAM_MSS, circuit_env_value_mode, circuit_heartbeat_wait,
-        parse_stream_peer_intro_plaintext, stream_peer_intro_plaintext,
+        DATAGRAM_MAX_CELL, DATAGRAM_MSS, circuit_env_max, circuit_env_value_mode,
+        circuit_heartbeat_wait, circuit_mss_for, parse_stream_peer_intro_plaintext,
+        stream_peer_intro_plaintext,
     };
     use veil_anonymity::circuit_register::COOKIE_LEN;
     use veil_onion_stream::wire::{DATA_OVERHEAD, Frame, MAX_CELL};
@@ -4603,9 +4658,65 @@ mod tests {
         }
     }
 
+    /// This refactor must be a NO-OP at today's policy.
+    ///
+    /// `circuit_mss_for` and `circuit_env_max` replaced two constants derived
+    /// from the legacy cell. If they disagree with those constants by a single
+    /// byte while `choose_cell_bytes` still returns legacy, the data path
+    /// changed underneath a change that was supposed to only move where the
+    /// number comes from.
+    #[test]
+    fn sizing_from_the_policy_is_bit_exact_with_the_constants_it_replaced() {
+        assert_eq!(
+            veil_anonymity::circuit_origin::choose_cell_bytes(),
+            veil_anonymity::circuit_data::CircuitCellBytes::legacy(),
+            "this test states what the CURRENT policy is; if the policy moved, \
+             the assertions below are the ones to re-derive, not to delete"
+        );
+        assert_eq!(
+            circuit_mss_for(veil_anonymity::circuit_data::CircuitCellBytes::legacy()),
+            MAX_CELL - COOKIE_LEN - CIRCUIT_PEER_TAG_LEN - DATA_OVERHEAD
+        );
+        assert_eq!(circuit_env_max(), MAX_CELL);
+    }
+
+    /// A stream frame plus its splice header must fill EXACTLY one cell, at any
+    /// size a circuit may negotiate — not just the legacy one.
+    ///
+    /// This is the property that pinned the whole network to 16384: the framer
+    /// cut to a compile-time maximum, so a smaller circuit would have refused
+    /// its own frames. Asserting it across the range is what lets
+    /// `choose_cell_bytes` return something else without the data path being
+    /// re-derived by hand.
+    #[test]
+    fn a_full_frame_fills_exactly_one_cell_at_every_negotiable_size() {
+        use veil_anonymity::circuit_data::{
+            CIRCUIT_PAYLOAD_BYTES, CircuitCellBytes, LEN_PREFIX, MIN_CIRCUIT_CELL_BYTES,
+        };
+        for bytes in [MIN_CIRCUIT_CELL_BYTES, 2048, 4096, CIRCUIT_PAYLOAD_BYTES] {
+            let cell = CircuitCellBytes::new(bytes).expect("inside the negotiable range");
+            let mss = circuit_mss_for(cell);
+            let payload = vec![0xABu8; mss];
+            let data = Frame::Data {
+                stream_id: 7,
+                seq: 0,
+                win: 1024,
+                payload: &payload,
+            }
+            .encode();
+            assert_eq!(
+                LEN_PREFIX + COOKIE_LEN + CIRCUIT_PEER_TAG_LEN + data.len(),
+                bytes,
+                "a full DATA frame must fill exactly one {bytes}-byte cell"
+            );
+        }
+    }
+
     #[test]
     fn protected_circuit_envelopes_fit_one_cell_without_reducing_data_mss() {
-        let payload = [0xABu8; CIRCUIT_MSS];
+        const LEGACY_MSS: usize =
+            circuit_mss_for(veil_anonymity::circuit_data::CircuitCellBytes::legacy());
+        let payload = [0xABu8; LEGACY_MSS];
         let data = Frame::Data {
             stream_id: 7,
             seq: 0,
@@ -4619,7 +4730,7 @@ mod tests {
             "protected DATA must still exactly fill one CircuitData inner cell"
         );
         assert_eq!(
-            CIRCUIT_MSS,
+            LEGACY_MSS,
             MAX_CELL - COOKIE_LEN - CIRCUIT_PEER_TAG_LEN - DATA_OVERHEAD
         );
 

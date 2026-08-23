@@ -50,7 +50,12 @@ use crate::circuit_setup::CIRCUIT_KEY_LEN;
 /// default rather than a special case.
 pub const CIRCUIT_PAYLOAD_BYTES: usize = 16384;
 /// Length-prefix width inside the fixed payload (`[len u16 BE][bytes][pad]`).
-const LEN_PREFIX: usize = 2;
+///
+/// Public because callers outside this crate have to size their own payloads
+/// against a circuit's negotiated cell — the onion-stream MSS is exactly
+/// `cell - LEN_PREFIX - (splice header) - (frame overhead)`, and writing the 2
+/// by hand there is how that arithmetic drifts from this one.
+pub const LEN_PREFIX: usize = 2;
 /// Largest real payload that fits a `CIRCUIT_PAYLOAD_BYTES` cell.
 pub const MAX_CIRCUIT_INNER: usize = CIRCUIT_PAYLOAD_BYTES - LEN_PREFIX;
 
