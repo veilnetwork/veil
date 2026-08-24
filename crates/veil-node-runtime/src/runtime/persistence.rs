@@ -114,6 +114,38 @@ pub(crate) fn existing_slot_for(
         .map(|(id, _)| *id)
 }
 
+/// Evict the oldest PEX-learned rows until at most `cap` remain, counting the
+/// one about to be admitted. Returns how many were retired.
+///
+/// Every distinct node id learned from PEX mints a peer row, a line in
+/// `discovered_peers.json` and an outbound connector task that retries for as
+/// long as the row exists — and nothing ever removed any of it.
+/// `PexConfig.max_peers` bounds the walk table, not this, so a peer feeding
+/// well-formed contacts could grow all three without limit: slowly, but with
+/// no ceiling to reach.
+///
+/// `PeerId` is a monotonic local slot and the map is ordered by it, so the
+/// first exchanged row is the oldest. Only `Exchanged` rows are eligible —
+/// configured and bootstrap peers are the operator's, not the network's.
+pub(crate) fn evict_exchanged_over_cap(
+    peers: &mut std::collections::BTreeMap<veil_cfg::PeerId, PeerConfigEntry>,
+    cap: usize,
+) -> usize {
+    let exchanged: Vec<veil_cfg::PeerId> = peers
+        .iter()
+        .filter(|(_, e)| e.source == crate::types::PeerSource::Exchanged)
+        .map(|(id, _)| *id)
+        .collect();
+    if exchanged.len() < cap {
+        return 0;
+    }
+    let over = exchanged.len() + 1 - cap;
+    for victim in exchanged.iter().take(over) {
+        peers.remove(victim);
+    }
+    over
+}
+
 /// Path for the discovered-peers file, derived from config path.
 pub fn discovered_peers_path(config_path: &Path) -> PathBuf {
     config_path
@@ -488,6 +520,72 @@ mod tests {
             bootstrap_only: false,
             source: crate::types::PeerSource::Exchanged,
         }
+    }
+
+    /// Thousands of well-formed PEX contacts must not grow the peer table
+    /// without limit.
+    ///
+    /// Each admitted node id costs a map row, a line in
+    /// `discovered_peers.json` and an outbound connector task that retries for
+    /// as long as the row exists. `PexConfig.max_peers` bounds the walk table
+    /// and nothing else, so before the cap one authenticated peer feeding
+    /// valid contacts in a loop grew all three with no ceiling.
+    #[test]
+    fn thousands_of_exchanged_peers_settle_at_the_cap() {
+        const CAP: usize = 64;
+        let mut peers: std::collections::BTreeMap<veil_cfg::PeerId, PeerConfigEntry> =
+            std::collections::BTreeMap::new();
+
+        // Two rows the operator owns. They must survive every eviction: the
+        // network does not get to displace configured peers.
+        let mut configured = peer_entry(0, [0xC0; 32], "tcp://10.0.0.1:5555");
+        configured.source = crate::types::PeerSource::Configured;
+        peers.insert(configured.peer_id, configured);
+        let mut boot = peer_entry(1, [0xB0; 32], "tcp://10.0.0.2:5555");
+        boot.source = crate::types::PeerSource::Bootstrap;
+        peers.insert(boot.peer_id, boot);
+
+        let mut first_exchanged = None;
+        for slot in 2u32..3000 {
+            let mut node_id = [0u8; 32];
+            node_id[..4].copy_from_slice(&slot.to_le_bytes());
+            evict_exchanged_over_cap(&mut peers, CAP);
+            let entry = peer_entry(slot, node_id, "tcp://10.1.2.3:5555");
+            first_exchanged.get_or_insert(entry.peer_id);
+            peers.insert(entry.peer_id, entry);
+        }
+
+        let exchanged = peers
+            .values()
+            .filter(|e| e.source == crate::types::PeerSource::Exchanged)
+            .count();
+        assert_eq!(
+            exchanged, CAP,
+            "2998 admissions must settle at the cap, not accumulate"
+        );
+        assert_eq!(
+            peers.len(),
+            CAP + 2,
+            "the operator's configured and bootstrap rows are never evicted"
+        );
+
+        // Eviction has to retire the work, not just the row: `holds_peer_row`
+        // — the check an outbound connector uses to decide it is no longer
+        // wanted — consults exactly this lookup.
+        let mut oldest = [0u8; 32];
+        oldest[..4].copy_from_slice(&2u32.to_le_bytes());
+        assert!(
+            existing_slot_for(&peers, &oldest).is_none(),
+            "the evicted row must be gone, so its connector task stops"
+        );
+
+        // And the newest arrivals are the ones kept.
+        let mut newest = [0u8; 32];
+        newest[..4].copy_from_slice(&2999u32.to_le_bytes());
+        assert!(
+            existing_slot_for(&peers, &newest).is_some(),
+            "eviction takes the oldest, not an arbitrary row"
+        );
     }
 
     fn listen_entry(transport: &str, advertise: Option<&str>) -> crate::types::ListenConfigEntry {

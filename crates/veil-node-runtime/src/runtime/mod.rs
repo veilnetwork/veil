@@ -4400,6 +4400,18 @@ impl NodeRuntime {
 }
 
 impl NodeServices {
+    /// Does this node still hold a peer row for `node_id`?
+    ///
+    /// An outbound connector task retries for the life of the process, so
+    /// until this existed there was no way to stop one: dropping the peer row
+    /// left the task dialling an address nothing wanted any more. That is what
+    /// made the exchanged-peer table unboundable — a cap can only evict if
+    /// eviction actually retires the work the row was paying for.
+    pub(crate) fn holds_peer_row(&self, node_id: &[u8; 32]) -> bool {
+        crate::runtime::persistence::existing_slot_for(&lock_state(&self.state).peers, node_id)
+            .is_some()
+    }
+
     pub async fn dht_get_replicated(
         &self,
         key: [u8; 32],
