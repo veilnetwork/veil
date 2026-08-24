@@ -124,6 +124,28 @@ impl RatchetSession {
         Ok(frame)
     }
 
+    /// Where the sending chain stands — see [`crate::ratchet::SendPosition`].
+    ///
+    /// A host records this durably BEFORE it publishes a ciphertext, so that a
+    /// write that never lands cannot let a restart re-derive a key this
+    /// session already spent on the wire (report12 X-H5). Reserving a small
+    /// run at a time keeps that to one small write per run rather than one per
+    /// message.
+    pub fn send_position(&self) -> Option<crate::ratchet::SendPosition> {
+        self.core.send_position()
+    }
+
+    /// Burn sending-chain steps until the next message would be `to.next`.
+    ///
+    /// The recovery half: on start, a state older than the position last
+    /// reserved is fast-forwarded past every index that might already have
+    /// been spent. Keys burned this way were never emitted, so the peer sees
+    /// a gap its skipped-key window absorbs — which costs nothing next to two
+    /// ciphertexts under one nonce.
+    pub fn skip_send_to(&mut self, to: crate::ratchet::SendPosition) -> Result<u32, RatchetError> {
+        self.core.skip_send_to(to)
+    }
+
     /// Open one message.
     ///
     /// On any failure — a forged tag, a malformed frame, a replay, a peer
@@ -508,6 +530,83 @@ mod tests {
             let f = b.encrypt(&back, AD).expect("seal");
             assert_eq!(a.decrypt(&f, AD, &mut ar).expect("open"), back);
         }
+    }
+
+    /// report12 X-H5: the state behind a published ciphertext used to be
+    /// written AFTER the frame went out, and the write was allowed to fail.
+    /// A restart then brought back the state from before the send, and the
+    /// next message re-derived the very key and nonce that frame already used
+    /// — for different plaintext. Two ciphertexts under one nonce hand anyone
+    /// who sees both the XOR of their plaintexts.
+    ///
+    /// The position is small enough to record BEFORE publishing, and it is
+    /// what lets a restart step over every index that might already have been
+    /// spent.
+    #[test]
+    fn a_restart_behind_a_recorded_position_never_reuses_a_key() {
+        let (mut a, mut b, _ar, mut br) = pair();
+
+        // What a host would keep: the state as last written, and a position
+        // reserved a little ahead of it.
+        let stale_state = a.export_state();
+        let reserved = a.send_position().expect("a sending chain exists");
+        let reserved = crate::ratchet::SendPosition {
+            next: reserved.next + 4,
+            ..reserved
+        };
+
+        // Four frames go out. Their state never reaches disk.
+        let published: Vec<Vec<u8>> = (0..4)
+            .map(|i| a.encrypt(&[i as u8; 24], AD).expect("seal"))
+            .collect();
+
+        // The crash: everything since the last write is gone.
+        let mut recovered = RatchetSession::import_state(&stale_state).expect("import");
+        let burned = recovered.skip_send_to(reserved).expect("skip");
+        assert_eq!(burned, 4, "the recovered chain must step over all four");
+
+        let after = recovered.encrypt(b"after the restart", AD).expect("seal");
+        for (i, earlier) in published.iter().enumerate() {
+            assert_ne!(
+                &after[..],
+                &earlier[..],
+                "frame {i} and the post-restart frame are the same bytes"
+            );
+        }
+
+        // The real proof is on the peer: it took all four, and it takes this
+        // one as the NEXT message rather than a replay of one it has seen.
+        for frame in &published {
+            b.decrypt(frame, AD, &mut br)
+                .expect("peer opens the published frames");
+        }
+        assert_eq!(
+            b.decrypt(&after, AD, &mut br)
+                .expect("peer opens the recovered frame"),
+            b"after the restart",
+        );
+    }
+
+    /// Without the skip, that same restart walks straight back over a key it
+    /// already spent — and the peer refuses the frame as one it has seen.
+    #[test]
+    fn a_restart_without_the_skip_reuses_an_index() {
+        let (mut a, mut b, _ar, mut br) = pair();
+        let stale_state = a.export_state();
+        let first = a.encrypt(b"the published one", AD).expect("seal");
+
+        let mut recovered = RatchetSession::import_state(&stale_state).expect("import");
+        let reused = recovered
+            .encrypt(b"a different plaintext", AD)
+            .expect("seal");
+
+        b.decrypt(&first, AD, &mut br)
+            .expect("peer opens the published frame");
+        assert!(
+            b.decrypt(&reused, AD, &mut br).is_err(),
+            "the peer accepted a second frame at an index it had already \
+             consumed — that is the nonce reuse this guards"
+        );
     }
 
     #[test]
