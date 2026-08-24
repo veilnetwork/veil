@@ -1993,6 +1993,20 @@ pub enum AdoptDocumentError {
     DifferentIdentity { incoming: String, mine: String },
     #[error("delegation: {0}")]
     Delegate(#[from] DelegateDeviceError),
+    /// The write failed AND putting the previous contents back failed too, so
+    /// the identity directory is in a state this crate otherwise guarantees it
+    /// never leaves. Distinct from [`Self::Io`] because the recovery is
+    /// different: the caller has not merely failed to adopt a document, it is
+    /// now holding a directory that may be half-written (report12 V-M4).
+    #[error(
+        "write failed ({cause}) and the rollback of {path} failed too \
+         ({rollback}) — the identity directory may be inconsistent"
+    )]
+    RollbackFailed {
+        path: String,
+        cause: String,
+        rollback: String,
+    },
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -2272,29 +2286,48 @@ fn write_document_and_index(
     // A restore that itself fails leaves the directory in the state this
     // function promises never to leave it in, and the caller is about to be
     // told only about the ORIGINAL error. Say so where it happens.
-    let restore = |path: &Path, prev: Option<&Vec<u8>>| {
-        let outcome = match prev {
+    // A restore that itself fails leaves the directory in the state this
+    // function promises never to leave it in. It used to say so only in a log,
+    // and the caller was told about the ORIGINAL error alone — so a process
+    // with logging off could not tell "the write failed, nothing changed" from
+    // "the write failed and the directory is now half-written". Those need
+    // different answers, so they are now different errors (report12 V-M4).
+    let restore = |path: &Path, prev: Option<&Vec<u8>>| -> std::io::Result<()> {
+        match prev {
             Some(bytes) => atomic_write(path, bytes),
             None => match std::fs::remove_file(path) {
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
                 other => other,
             },
-        };
-        if let Err(e) = outcome {
+        }
+    };
+    let rolled_back = |path: &Path, prev: Option<&Vec<u8>>, cause: &dyn std::fmt::Display| {
+        restore(path, prev).map_err(|e| {
             log::error!(
-                "veil-identity: could not put {} back after a failed write ({e}) —                  the identity directory may now be inconsistent",
+                "veil-identity: could not put {} back after a failed write ({e}) — \
+                 the identity directory may now be inconsistent",
                 path.display()
             );
-        }
+            AdoptDocumentError::RollbackFailed {
+                path: path.display().to_string(),
+                cause: cause.to_string(),
+                rollback: e.to_string(),
+            }
+        })
     };
 
     if let Err(e) = atomic_write(&doc_path, &doc.encode()) {
-        restore(&doc_path, prev_doc.as_ref());
+        rolled_back(&doc_path, prev_doc.as_ref(), &e)?;
         return Err(e.into());
     }
     if let Err(e) = save_device_sig_key_idx(veil_dir, key_idx) {
-        restore(&doc_path, prev_doc.as_ref());
-        restore(&idx_path, prev_idx.as_ref());
+        // Both are attempted even if the first fails: the second may still be
+        // restorable, and leaving it alone because the first was not would
+        // widen the damage rather than report it.
+        let first = rolled_back(&doc_path, prev_doc.as_ref(), &e);
+        let second = rolled_back(&idx_path, prev_idx.as_ref(), &e);
+        first?;
+        second?;
         return Err(e.into());
     }
     Ok(())
@@ -3441,6 +3474,48 @@ mod tests {
     /// index refused, document deleted. New code: refuses before touching
     /// anything.
     #[cfg(unix)]
+    /// report12 V-M4: a rollback that fails leaves the directory in the state
+    /// this function promises never to leave it in. It used to say so only in
+    /// a log, while the caller was handed the ORIGINAL write error — so a
+    /// process with logging off could not tell "the write failed and nothing
+    /// changed" from "the write failed and the directory is half-written".
+    /// Those call for different answers, so they are different errors.
+    #[test]
+    fn a_rollback_that_fails_reaches_the_caller_and_is_not_only_logged() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let seed = create_identity(test_opts(tempdir())).unwrap().master_seed;
+        let d = tempdir();
+        provision(d.clone(), seed.clone());
+        let doc_path = d.join(IDENTITY_DOCUMENT_FILE);
+        let doc = IdentityDocument::decode(&std::fs::read(&doc_path).unwrap()).unwrap();
+
+        // A directory nothing can be created in: the write fails, and so does
+        // putting the previous document back. Reading still works, so the
+        // capture before it succeeds — which is what makes this the rollback
+        // path rather than the capture path next door.
+        std::fs::set_permissions(&d, std::fs::Permissions::from_mode(0o500)).unwrap();
+        if std::fs::write(d.join("probe"), b"x").is_ok() {
+            let _ = std::fs::remove_file(d.join("probe"));
+            std::fs::set_permissions(&d, std::fs::Permissions::from_mode(0o700)).unwrap();
+            // Running as root: the mode is not enforced, so neither write can
+            // be made to fail. Say so rather than pass vacuously.
+            eprintln!("skipped: running as root, mode 500 is not enforced");
+            return;
+        }
+
+        let err = write_document_and_index(&d, &doc, 0).unwrap_err();
+        std::fs::set_permissions(&d, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(
+            matches!(err, AdoptDocumentError::RollbackFailed { .. }),
+            "a failed rollback must reach the caller as itself, got {err:?}"
+        );
+        assert!(
+            doc_path.exists(),
+            "and the document that was there all along must still be there"
+        );
+    }
+
     #[test]
     fn a_previous_state_that_cannot_be_read_is_never_treated_as_absent() {
         use std::os::unix::fs::PermissionsExt;
