@@ -497,6 +497,23 @@ impl CircuitTable {
             .bucket_len(prev_link)
     }
 
+    /// Fullest per-prev-link bucket right now, and how many buckets exist.
+    ///
+    /// The per-link cap is the limit that actually bites: `MAX_CIRCUITS` is
+    /// 10_000 while one bucket holds 64, and a small topology funnels every
+    /// 2-hop circuit into a handful of them. When those filled, ~98.6% of live
+    /// introduces died at `cookie_unknown` (see [`SERVED_LINGER_SECS`]) — and
+    /// nothing exported the number, so the pressure was invisible until
+    /// delivery broke. `install_refused` fires only AFTER a bucket is already
+    /// full; this reads the headroom before that.
+    pub fn max_link_occupancy(&self) -> (usize, usize) {
+        let g = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        (
+            g.per_link.values().map(|v| v.len()).max().unwrap_or(0),
+            g.per_link.len(),
+        )
+    }
+
     pub fn len(&self) -> usize {
         self.inner
             .lock()
