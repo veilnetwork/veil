@@ -27,7 +27,7 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
-use crate::circuit_data::ReplayWindow;
+use crate::circuit_data::{CircuitCellBytes, ReplayWindow};
 use crate::circuit_setup::{CIRCUIT_KEY_LEN, CircuitInstall};
 use crate::circuit_wire::CircuitId;
 
@@ -78,6 +78,10 @@ pub struct CircuitState {
     pub next_link: Option<Link>,
     /// Circuit id on the `next_link` side.
     pub circuit_id_out: CircuitId,
+    /// Size of every data cell on this circuit, learned from the setup. The
+    /// relay enforces it on both directions: uniformity has to hold against the
+    /// hop that sees every cell, and that hop is this one.
+    pub cell_bytes: CircuitCellBytes,
     /// Last-activity timestamp (unix secs) for idle GC.
     pub last_seen_unix: Mutex<u64>,
     /// Anti-replay window for forward-direction cells.
@@ -125,6 +129,7 @@ impl CircuitState {
             circuit_id_in: install.circuit_id_in,
             next_link,
             circuit_id_out: install.circuit_id_out,
+            cell_bytes: install.cell_bytes,
             last_seen_unix: Mutex::new(now),
             replay_fwd: Mutex::new(ReplayWindow::new()),
             replay_ret: Mutex::new(ReplayWindow::new()),
@@ -492,6 +497,23 @@ impl CircuitTable {
             .bucket_len(prev_link)
     }
 
+    /// Fullest per-prev-link bucket right now, and how many buckets exist.
+    ///
+    /// The per-link cap is the limit that actually bites: `MAX_CIRCUITS` is
+    /// 10_000 while one bucket holds 64, and a small topology funnels every
+    /// 2-hop circuit into a handful of them. When those filled, ~98.6% of live
+    /// introduces died at `cookie_unknown` (see [`SERVED_LINGER_SECS`]) — and
+    /// nothing exported the number, so the pressure was invisible until
+    /// delivery broke. `install_refused` fires only AFTER a bucket is already
+    /// full; this reads the headroom before that.
+    pub fn max_link_occupancy(&self) -> (usize, usize) {
+        let g = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        (
+            g.per_link.values().map(|v| v.len()).max().unwrap_or(0),
+            g.per_link.len(),
+        )
+    }
+
     pub fn len(&self) -> usize {
         self.inner
             .lock()
@@ -517,10 +539,42 @@ mod tests {
 
     fn inst(cid_in: u32, cid_out: u32, key: u8) -> CircuitInstall {
         CircuitInstall {
+            cell_bytes: crate::circuit_data::CircuitCellBytes::legacy(),
             circuit_id_in: cid_in,
             circuit_id_out: cid_out,
             circuit_key: [key; CIRCUIT_KEY_LEN],
         }
+    }
+
+    /// The gauge has to report the FULLEST bucket, not the average and not the
+    /// total: the per-link cap is what refuses an install, and one starving
+    /// bucket beside three empty ones is exactly the state that killed
+    /// introduces while every aggregate still looked healthy.
+    #[test]
+    fn the_headroom_gauge_reports_the_fullest_bucket_not_the_average() {
+        let t = CircuitTable::new();
+        let busy = [1u8; 32];
+        let quiet = [2u8; 32];
+        assert_eq!(t.max_link_occupancy(), (0, 0), "empty table has no buckets");
+
+        for i in 0..5u32 {
+            t.install(&inst(i, 100 + i, 0xAA), busy, Some([9u8; 32]), 1000)
+                .unwrap();
+        }
+        t.install(&inst(50, 150, 0xBB), quiet, Some([9u8; 32]), 1000)
+            .unwrap();
+
+        let (max, links) = t.max_link_occupancy();
+        assert_eq!(links, 2, "both prev-links are counted");
+        assert_eq!(
+            max, 5,
+            "must be the fullest bucket (5), not the total (6) nor the mean (3)"
+        );
+        assert_eq!(
+            t.len(),
+            6,
+            "len stays the total, the two answer differently"
+        );
     }
 
     #[test]

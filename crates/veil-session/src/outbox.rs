@@ -177,6 +177,7 @@ impl SessionOutbox {
         // raw `[u8; 32]` (session/runtime hot path) and future `NodeId`
         // callers both work without explicit conversion.
         let peer_id: NodeId = peer_id.into();
+        crate::frame_diag::note_outbound(peer_id.as_bytes(), &frame, "outbox");
         let (response_tx, response_rx) = oneshot::channel();
         let req = OutboxRequest {
             request_id,

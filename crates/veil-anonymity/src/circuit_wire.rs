@@ -10,7 +10,7 @@
 //! installs or peels circuit state; it is pure encode/decode framing.
 
 use crate::circuit::CircuitError;
-use crate::circuit_data::CIRCUIT_PAYLOAD_BYTES;
+use crate::circuit_data::{CIRCUIT_PAYLOAD_BYTES, CircuitCellBytes, MIN_CIRCUIT_CELL_BYTES};
 
 /// Per-link circuit identifier. Scoped to a single (link, direction) — each hop
 /// re-tags `circuit_id_in → circuit_id_out`, so the same circuit shows a
@@ -56,16 +56,20 @@ impl CircuitDataPayload {
     /// `circuit_id + seq + ciphertext_len` prefix.
     pub const HEADER_LEN: usize = 4 + 4 + 2;
 
-    pub fn encode(&self) -> Result<Vec<u8>, CircuitError> {
-        // diff-audit Δ2-f: every circuit data cell carries EXACTLY the fixed
-        // payload size — `wrap_payload` pads to it and the XOR layers are
-        // length-preserving, so legitimate cells are always this size. Enforce it
-        // (rather than the old `<= MAX` cap) so a variable-length cell can never
-        // reach the wire as a size-correlation fingerprint for a passive observer.
-        if self.ciphertext.len() != CIRCUIT_PAYLOAD_BYTES {
+    /// `cell` is THIS circuit's negotiated size — see
+    /// [`crate::circuit_data::CircuitCellBytes`].
+    pub fn encode(&self, cell: CircuitCellBytes) -> Result<Vec<u8>, CircuitError> {
+        // diff-audit Δ2-f: every circuit data cell carries EXACTLY this
+        // circuit's payload size — `wrap_payload` pads to it and the XOR layers
+        // are length-preserving, so legitimate cells are always that size.
+        // Enforce it (rather than the old `<= MAX` cap) so a variable-length
+        // cell can never reach the wire as a size-correlation fingerprint for a
+        // hop watching one circuit.
+        if self.ciphertext.len() != cell.get() {
             return Err(CircuitError::Malformed(format!(
-                "circuit data ciphertext {} != fixed {CIRCUIT_PAYLOAD_BYTES}",
-                self.ciphertext.len()
+                "circuit data ciphertext {} != this circuit's {}",
+                self.ciphertext.len(),
+                cell.get()
             )));
         }
         let mut out = Vec::with_capacity(Self::HEADER_LEN + self.ciphertext.len());
@@ -76,6 +80,13 @@ impl CircuitDataPayload {
         Ok(out)
     }
 
+    /// Structural parse only — it deliberately does NOT take this circuit's
+    /// size, because the circuit is not known yet: a hop finds the circuit by
+    /// the `circuit_id` that lives INSIDE this header, so the size check cannot
+    /// happen until after the lookup. What it does enforce is that the cell is
+    /// a legal size at all, and that the length field and the frame agree.
+    /// The per-circuit check is [`Self::expect_cell`], applied by the caller the
+    /// moment it knows which circuit this is.
     pub fn decode(blob: &[u8]) -> Result<Self, CircuitError> {
         if blob.len() < Self::HEADER_LEN {
             return Err(CircuitError::Malformed(format!(
@@ -87,10 +98,13 @@ impl CircuitDataPayload {
         let circuit_id = u32::from_be_bytes([blob[0], blob[1], blob[2], blob[3]]);
         let seq = u32::from_be_bytes([blob[4], blob[5], blob[6], blob[7]]);
         let len = u16::from_be_bytes([blob[8], blob[9]]) as usize;
-        // Δ2-f: reject any cell that is not the fixed payload size (see `encode`).
-        if len != CIRCUIT_PAYLOAD_BYTES {
+        // Bound the length field before allocating against it. The exact size
+        // belongs to the circuit and is checked in `expect_cell`; here we only
+        // refuse a number no circuit could ever have negotiated.
+        if CircuitCellBytes::new(len).is_err() {
             return Err(CircuitError::Malformed(format!(
-                "circuit data ciphertext_len {len} != fixed {CIRCUIT_PAYLOAD_BYTES}"
+                "circuit data ciphertext_len {len} outside \
+                 {MIN_CIRCUIT_CELL_BYTES}..={CIRCUIT_PAYLOAD_BYTES}"
             )));
         }
         // Exact length: reject BOTH truncation and trailing garbage. The cell
@@ -109,6 +123,24 @@ impl CircuitDataPayload {
             seq,
             ciphertext: blob[Self::HEADER_LEN..Self::HEADER_LEN + len].to_vec(),
         })
+    }
+
+    /// Reject a cell that is not THIS circuit's size.
+    ///
+    /// Δ2-f, now per circuit: `wrap_payload` pads to the negotiated size and the
+    /// XOR layers are length-preserving, so every legitimate cell on a circuit
+    /// is exactly that size. A hop applies this after the `(link, circuit_id)`
+    /// lookup, so it can never be talked into forwarding an odd-sized cell —
+    /// which is what a size-correlation fingerprint would need.
+    pub fn expect_cell(&self, cell: CircuitCellBytes) -> Result<(), CircuitError> {
+        if self.ciphertext.len() != cell.get() {
+            return Err(CircuitError::Malformed(format!(
+                "circuit data ciphertext {} != this circuit's {}",
+                self.ciphertext.len(),
+                cell.get()
+            )));
+        }
+        Ok(())
     }
 }
 
@@ -308,7 +340,7 @@ mod tests {
             seq: 42,
             ciphertext,
         };
-        let enc = p.encode().unwrap();
+        let enc = p.encode(CircuitCellBytes::legacy()).unwrap();
         assert_eq!(
             enc.len(),
             CircuitDataPayload::HEADER_LEN + CIRCUIT_PAYLOAD_BYTES
@@ -325,7 +357,10 @@ mod tests {
             seq: 0,
             ciphertext: vec![],
         };
-        assert!(empty.encode().is_err(), "empty ciphertext must be rejected");
+        assert!(
+            empty.encode(CircuitCellBytes::legacy()).is_err(),
+            "empty ciphertext must be rejected"
+        );
         // A hand-built blob declaring a non-fixed length is rejected at decode.
         let mut blob = Vec::new();
         blob.extend_from_slice(&1u32.to_be_bytes());
@@ -342,7 +377,7 @@ mod tests {
             seq: 1,
             ciphertext: vec![0u8; MAX_CIRCUIT_DATA_CIPHERTEXT + 1],
         };
-        assert!(p.encode().is_err());
+        assert!(p.encode(CircuitCellBytes::legacy()).is_err());
     }
 
     #[test]
@@ -378,7 +413,7 @@ mod tests {
             seq: 9,
             ciphertext: vec![7u8; CIRCUIT_PAYLOAD_BYTES],
         };
-        let mut enc = data.encode().unwrap();
+        let mut enc = data.encode(CircuitCellBytes::legacy()).unwrap();
         assert!(CircuitDataPayload::decode(&enc).is_ok());
         enc.push(0x00); // trailing garbage
         assert!(

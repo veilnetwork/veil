@@ -1414,6 +1414,7 @@ pub fn verify_remote_peer_identity_reports_mismatch_readably() {
         },
         remote_discovery_mode: veil_cfg::DiscoveryMode::Public,
         remote_dht_service: true,
+        remote_caps_stated: true,
         supports_realtime_datagrams: false,
         udp_reflector_port: None,
         shared_udp_reflectors: Vec::new(),
@@ -1455,6 +1456,7 @@ pub fn verify_remote_peer_identity_reports_nonce_mismatch_readably() {
         },
         remote_discovery_mode: veil_cfg::DiscoveryMode::Public,
         remote_dht_service: true,
+        remote_caps_stated: true,
         supports_realtime_datagrams: false,
         udp_reflector_port: None,
         shared_udp_reflectors: Vec::new(),
@@ -2799,17 +2801,26 @@ async fn udp_discovery_punch_and_same_socket_quic_roundtrip() {
     let punch_token = [0xA5; 16];
     let left_candidates = [right_mapping];
     let right_candidates = [left_mapping];
+    // Both ends are the same deployment here, so they share a network tag.
+    let tag = veil_nat::network_tag(None);
     let (left_peer, right_peer) = tokio::join!(
-        veil_nat::punch_udp(&left, &left_candidates, punch_token, Duration::from_secs(1),),
+        veil_nat::punch_udp(
+            &left,
+            &left_candidates,
+            punch_token,
+            &tag,
+            Duration::from_secs(1),
+        ),
         veil_nat::punch_udp(
             &right,
             &right_candidates,
             punch_token,
+            &tag,
             Duration::from_secs(1),
         ),
     );
-    assert_eq!(left_peer.unwrap(), Some(right_mapping));
-    assert_eq!(right_peer.unwrap(), Some(left_mapping));
+    assert_eq!(left_peer.unwrap().peer, Some(right_mapping));
+    assert_eq!(right_peer.unwrap().peer, Some(left_mapping));
 
     let ctx = Arc::new(TransportContext::for_debug().unwrap());
     let responder_ctx = Arc::clone(&ctx);

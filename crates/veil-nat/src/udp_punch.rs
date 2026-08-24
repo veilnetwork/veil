@@ -21,6 +21,66 @@ const KIND_DISCOVER: u8 = 1;
 const KIND_DISCOVER_REPLY: u8 = 2;
 const KIND_PUNCH: u8 = 3;
 
+/// Domain separators for the network binding below.
+const NETWORK_TAG_CONTEXT: &str = "veil/nat/udp-punch/network-tag/v1";
+const TOKEN_BINDING_CONTEXT: &str = "veil/nat/udp-punch/token-binding/v1";
+
+/// Tag shared by every node that configures no obfs4 PSK, so the open veil
+/// keeps punching among itself exactly as it did before this binding existed.
+const PUBLIC_NETWORK_TAG: [u8; 32] = *b"veil.public.udp-punch.network.v1";
+
+/// Which veil a punch belongs to.
+///
+/// A punch used to be authenticated by the attempt token alone, and the token
+/// travels over signalling — so it crosses any boundary that signalling
+/// crosses. Two nodes on *different* veils could therefore complete a punch
+/// and promote it into a full session, which is how a testnet client ended up
+/// holding a session with a production seed: the only thing separating the two
+/// deployments was the obfs4 PSK, and a punched QUIC path never touches obfs4.
+///
+/// The PSK is the value a deployment already ships to exactly its own members,
+/// so it is what the punch is bound to. Nodes with no PSK share
+/// [`PUBLIC_NETWORK_TAG`] and are unaffected.
+///
+/// ⚠️ This is a correctness boundary, not a security one: the PSK ships inside
+/// every release binary, so it stops accidents, not a deliberate joiner. Real
+/// isolation is `network_gate` (P-Net membership certs) in the handshake.
+pub fn network_tag(obfs4_psk: Option<&[u8; 32]>) -> [u8; 32] {
+    match obfs4_psk {
+        Some(psk) => blake3::derive_key(NETWORK_TAG_CONTEXT, psk),
+        None => PUBLIC_NETWORK_TAG,
+    }
+}
+
+/// The token actually put on the wire: the signalled token bound to our veil.
+///
+/// Derived rather than sent, so the packet layout is unchanged (still 16 bytes
+/// at `[10..26]`) and so an observer of signalling — which carries the *bare*
+/// token — still cannot produce a valid punch packet without also knowing the
+/// network tag.
+fn bound_token(token: [u8; 16], network_tag: &[u8; 32]) -> [u8; 16] {
+    let mut hasher = blake3::Hasher::new_derive_key(TOKEN_BINDING_CONTEXT);
+    hasher.update(network_tag);
+    hasher.update(&token);
+    let mut out = [0u8; 16];
+    out.copy_from_slice(&hasher.finalize().as_bytes()[..16]);
+    out
+}
+
+/// What a punch attempt observed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct PunchOutcome {
+    /// Peer-reflexive address to promote, when the punch converged.
+    pub peer: Option<SocketAddr>,
+    /// Well-formed punch packets whose token did not match ours.
+    ///
+    /// A cross-veil punch fails by *timing out*, which is indistinguishable
+    /// from a NAT that never opened — so without this counter the new boundary
+    /// would be invisible in operation. A non-zero value on a failed attempt
+    /// means somebody punched at us with a token we could not recognise.
+    pub foreign_tokens: u32,
+}
+
 /// Conventional port used by Core nodes that automatically offer the bounded
 /// reflector service. This is a protocol default, not a central endpoint: any
 /// operator can serve it and peers announce availability during their
@@ -161,6 +221,12 @@ fn packet(kind: u8, token: [u8; 16]) -> [u8; UDP_PUNCH_PACKET_LEN] {
     out[8] = kind;
     out[10..26].copy_from_slice(&token);
     out
+}
+
+/// A well-formed punch packet, whatever token it carries. Used to tell a
+/// stranger's punch apart from stray traffic when counting foreign tokens.
+fn is_punch_shaped(buf: &[u8]) -> bool {
+    buf.len() == UDP_PUNCH_PACKET_LEN && &buf[..8] == MAGIC && buf[8] == KIND_PUNCH
 }
 
 fn valid_packet(buf: &[u8], kind: u8, token: &[u8; 16]) -> bool {
@@ -355,8 +421,9 @@ pub async fn punch_udp(
     socket: &UdpSocket,
     candidates: &[SocketAddr],
     token: [u8; 16],
+    network_tag: &[u8; 32],
     timeout: Duration,
-) -> io::Result<Option<SocketAddr>> {
+) -> io::Result<PunchOutcome> {
     let mut seen = HashSet::new();
     let candidates: Vec<SocketAddr> = candidates
         .iter()
@@ -365,10 +432,14 @@ pub async fn punch_udp(
         .filter(|candidate| seen.insert(*candidate))
         .take(veil_proto::budget::MAX_HOLE_PUNCH_CANDIDATES)
         .collect();
+    let mut outcome = PunchOutcome::default();
     if candidates.is_empty() {
-        return Ok(None);
+        return Ok(outcome);
     }
 
+    // Everything on the wire uses the bound token; the bare `token` is never
+    // sent, so the binding cannot be skipped by a caller that forgets it.
+    let token = bound_token(token, network_tag);
     let probe = packet(KIND_PUNCH, token);
     let deadline = time::Instant::now() + timeout;
     let mut cadence = time::interval(Duration::from_millis(50));
@@ -376,7 +447,7 @@ pub async fn punch_udp(
     let mut buf = [0u8; UDP_PUNCH_PACKET_LEN];
     loop {
         tokio::select! {
-            _ = time::sleep_until(deadline) => return Ok(None),
+            _ = time::sleep_until(deadline) => return Ok(outcome),
             _ = cadence.tick() => {
                 for candidate in &candidates {
                     // One unreachable candidate must not abort the whole ICE set.
@@ -386,10 +457,14 @@ pub async fn punch_udp(
             received = socket.recv_from(&mut buf) => {
                 let (len, source) = received?;
                 if !valid_packet(&buf[..len], KIND_PUNCH, &token) {
+                    if is_punch_shaped(&buf[..len]) {
+                        outcome.foreign_tokens = outcome.foreign_tokens.saturating_add(1);
+                    }
                     continue;
                 }
                 let _ = socket.send_to(&probe, source).await;
-                return Ok(Some(source));
+                outcome.peer = Some(source);
+                return Ok(outcome);
             }
         }
     }
@@ -634,15 +709,128 @@ mod tests {
         let left_addr = left.local_addr().unwrap();
         let right_addr = right.local_addr().unwrap();
         let token = [0xA5; 16];
+        let tag = network_tag(Some(&[7u8; 32]));
         let left_candidates = [right_addr];
         let right_candidates = [left_addr];
 
         let (left_seen, right_seen) = tokio::join!(
-            punch_udp(&left, &left_candidates, token, Duration::from_secs(1),),
-            punch_udp(&right, &right_candidates, token, Duration::from_secs(1),),
+            punch_udp(&left, &left_candidates, token, &tag, Duration::from_secs(1)),
+            punch_udp(
+                &right,
+                &right_candidates,
+                token,
+                &tag,
+                Duration::from_secs(1)
+            ),
         );
-        assert_eq!(left_seen.unwrap(), Some(right_addr));
-        assert_eq!(right_seen.unwrap(), Some(left_addr));
+        assert_eq!(left_seen.unwrap().peer, Some(right_addr));
+        assert_eq!(right_seen.unwrap().peer, Some(left_addr));
+    }
+
+    /// The defect this binding exists for: two nodes on different veils, given
+    /// the same attempt token by signalling that crossed between them, must NOT
+    /// converge. Before the binding they did, and the punched path was promoted
+    /// into a full session — that is how a testnet client came to hold a
+    /// session with a production seed.
+    ///
+    /// Break-check: drop the `network_tag` argument from `bound_token` and this
+    /// goes green again.
+    #[tokio::test]
+    async fn a_punch_does_not_converge_across_veils() {
+        let left = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let right = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let left_addr = left.local_addr().unwrap();
+        let right_addr = right.local_addr().unwrap();
+        let token = [0xA5; 16];
+        let production = network_tag(Some(&[1u8; 32]));
+        let testnet = network_tag(Some(&[2u8; 32]));
+        assert_ne!(
+            production, testnet,
+            "different PSKs must give different tags"
+        );
+        let to_right = [right_addr];
+        let to_left = [left_addr];
+
+        let (left_seen, right_seen) = tokio::join!(
+            punch_udp(
+                &left,
+                &to_right,
+                token,
+                &production,
+                Duration::from_millis(400)
+            ),
+            punch_udp(
+                &right,
+                &to_left,
+                token,
+                &testnet,
+                Duration::from_millis(400)
+            ),
+        );
+        let left_seen = left_seen.unwrap();
+        let right_seen = right_seen.unwrap();
+        assert_eq!(left_seen.peer, None, "converged across veils");
+        assert_eq!(right_seen.peer, None, "converged across veils");
+        // ...and the attempt is observable rather than a silent timeout.
+        assert!(
+            left_seen.foreign_tokens > 0 && right_seen.foreign_tokens > 0,
+            "a cross-veil punch must be counted, not just time out"
+        );
+    }
+
+    /// Nodes that configure no PSK are the open veil and keep working with each
+    /// other exactly as before. Without this the binding would silently split
+    /// every public deployment into isolated pairs.
+    #[tokio::test]
+    async fn nodes_without_a_psk_still_punch_each_other() {
+        let left = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let right = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let left_addr = left.local_addr().unwrap();
+        let right_addr = right.local_addr().unwrap();
+        let public = network_tag(None);
+        assert_eq!(public, PUBLIC_NETWORK_TAG);
+        let to_right = [right_addr];
+        let to_left = [left_addr];
+
+        let (left_seen, right_seen) = tokio::join!(
+            punch_udp(&left, &to_right, [9u8; 16], &public, Duration::from_secs(1)),
+            punch_udp(&right, &to_left, [9u8; 16], &public, Duration::from_secs(1)),
+        );
+        assert_eq!(left_seen.unwrap().peer, Some(right_addr));
+        assert_eq!(right_seen.unwrap().peer, Some(left_addr));
+    }
+
+    /// Signalling carries the bare token, so anyone who reads signalling knows
+    /// it. That must not be enough to punch: the wire token is derived, never
+    /// sent.
+    #[tokio::test]
+    async fn knowing_the_signalled_token_is_not_enough_to_punch() {
+        let bound = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let observer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let token = [0x5A; 16];
+        let tag = network_tag(Some(&[3u8; 32]));
+        assert_ne!(
+            bound_token(token, &tag),
+            token,
+            "bare token went on the wire"
+        );
+
+        // The observer replays exactly what signalling gave it.
+        observer
+            .send_to(&packet(KIND_PUNCH, token), bound.local_addr().unwrap())
+            .await
+            .unwrap();
+        let seen = punch_udp(
+            &bound,
+            &[observer.local_addr().unwrap()],
+            token,
+            &tag,
+            Duration::from_millis(300),
+        )
+        .await
+        .unwrap();
+        assert_eq!(seen.peer, None);
+        assert!(seen.foreign_tokens > 0);
     }
 
     #[tokio::test]
@@ -655,11 +843,19 @@ mod tests {
             .send_to(&wrong, left.local_addr().unwrap())
             .await
             .unwrap();
-        assert_eq!(
-            punch_udp(&left, &[right_addr], [1u8; 16], Duration::from_millis(100),)
-                .await
-                .unwrap(),
-            None,
+        let seen = punch_udp(
+            &left,
+            &[right_addr],
+            [1u8; 16],
+            &network_tag(None),
+            Duration::from_millis(100),
+        )
+        .await
+        .unwrap();
+        assert_eq!(seen.peer, None);
+        assert!(
+            seen.foreign_tokens > 0,
+            "a wrong-token punch must be counted"
         );
     }
 }

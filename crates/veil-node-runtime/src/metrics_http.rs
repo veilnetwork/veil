@@ -122,6 +122,22 @@ impl RuntimeStateProbe {
         let bans = self.ban_list.lock().map(|g| g.len()).unwrap_or(0);
         let dht_contacts = self.dispatcher.dht.routing_table_node_ids().len();
         let dht_no_service_skips = self.dispatcher.dht.no_dht_service_skips();
+        // Circuit-table headroom. The per-link bucket (64) is the cap that
+        // actually bites, not MAX_CIRCUITS (10_000): a small topology funnels
+        // every 2-hop circuit into a handful of buckets, and when they filled,
+        // ~98.6% of live introduces died at `cookie_unknown`. Nothing exported
+        // the number, so on 24.08 the question "is the cap binding today?"
+        // could not be answered from a running seed at all — the journal was
+        // silent and the rendezvous counters measure a different mechanism.
+        let (circuits, circuit_max_link, circuit_links) = self
+            .dispatcher
+            .circuit_table
+            .as_ref()
+            .map(|t| {
+                let (max, links) = t.max_link_occupancy();
+                (t.len(), max, links)
+            })
+            .unwrap_or((0, 0, 0));
         let route_cache_dst = self
             .dispatcher
             .route_cache
@@ -188,7 +204,16 @@ impl RuntimeStateProbe {
         let svc_budget = self.dispatcher.abuse.service_budget.bytes_per_hour();
 
         format!(
-            "# HELP veil_state_live_sessions Number of live transport sessions\n\
+            "# HELP veil_state_circuits Circuits installed at this relay\n\
+             # TYPE veil_state_circuits gauge\n\
+             veil_state_circuits {circuits}\n\
+             # HELP veil_state_circuit_max_link Fullest per-prev-link bucket (cap is 64)\n\
+             # TYPE veil_state_circuit_max_link gauge\n\
+             veil_state_circuit_max_link {circuit_max_link}\n\
+             # HELP veil_state_circuit_links Prev-links with at least one circuit\n\
+             # TYPE veil_state_circuit_links gauge\n\
+             veil_state_circuit_links {circuit_links}\n\
+             # HELP veil_state_live_sessions Number of live transport sessions\n\
              # TYPE veil_state_live_sessions gauge\n\
              veil_state_live_sessions {live_sessions}\n\
              # HELP veil_state_session_tx_registry Number of peers with registered tx senders\n\

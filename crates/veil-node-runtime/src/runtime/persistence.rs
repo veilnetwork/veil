@@ -25,7 +25,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use veil_util::lock;
 
-use super::uri_helpers::is_wildcard_transport;
+use super::uri_helpers::{is_undialable_from_here, is_wildcard_transport};
 use super::{NodeServices, NodeState, lock_state};
 use crate::types::{PeerConfigEntry, PeerSource};
 use veil_abuse::BanList;
@@ -90,12 +90,53 @@ pub struct DiscoveredPeerSnapshot {
     source: PeerSource,
 }
 
+/// The slot this node already occupies in `NodeState::peers`, if any.
+///
+/// The map is keyed by `PeerId` — a local slot number — so nothing about its
+/// shape stops the same node_id appearing many times, and nothing did: a
+/// production seed reached 919 entries for 21 distinct nodes because the
+/// peer-exchange path minted a fresh slot on every gossip round. Both the
+/// gossip path and the snapshot loader ask this first and write into the slot
+/// they get back.
+///
+/// Linear in the map, which is the point: bounded by the number of DISTINCT
+/// peers once callers use it, and called once per newly-learned peer rather
+/// than per frame.
+pub(crate) fn existing_slot_for(
+    peers: &std::collections::BTreeMap<veil_cfg::PeerId, PeerConfigEntry>,
+    node_id: &[u8; 32],
+) -> Option<veil_cfg::PeerId> {
+    peers
+        .iter()
+        .find(|(_, e)| e.node_id.as_bytes() == node_id)
+        .map(|(id, _)| *id)
+}
+
 /// Path for the discovered-peers file, derived from config path.
 pub fn discovered_peers_path(config_path: &Path) -> PathBuf {
     config_path
         .parent()
         .unwrap_or(Path::new("."))
         .join("peers_discovered.json")
+}
+
+/// Does this node present a PRIVATE address to its peers?
+///
+/// Read from our own listeners, because that is what we tell the network we
+/// are. A node advertising `192.168.1.5` lives on a LAN and a neighbour's
+/// `192.168.1.7` is plausibly its to dial; a node advertising a public address
+/// can never reach either. `advertise` wins over `transport` when set — it is
+/// the address peers are actually given — and a wildcard bind says nothing
+/// about where we are, so it does not count.
+fn we_are_site_local(st: &NodeState) -> bool {
+    st.listens.values().any(|l| {
+        let uri = l.advertise.as_deref().unwrap_or(&l.transport);
+        !is_wildcard_transport(uri)
+            && matches!(
+                super::uri_helpers::host_reach(uri),
+                super::uri_helpers::HostReach::SiteLocal
+            )
+    })
 }
 
 /// Persist all non-configured peers from `state.peers` to disk.
@@ -109,11 +150,16 @@ pub fn persist_discovered_peers(
 ) -> PersistOutcome {
     let entries: Vec<DiscoveredPeerSnapshot> = {
         let st = lock_state(state);
+        // Same gate as the wildcard filter beside it, and for the same reason
+        // spelled out there: a snapshot must not seed the next startup with
+        // dial targets nobody here can reach.
+        let site_local = we_are_site_local(&st);
         st.peers
             .values()
             .filter(|e| !matches!(e.source, PeerSource::Configured))
             .filter(|e| !e.bootstrap_only)
             .filter(|e| !is_wildcard_transport(&e.transport))
+            .filter(|e| !is_undialable_from_here(&e.transport, site_local))
             .map(|e| DiscoveredPeerSnapshot {
                 node_id: e.node_id.to_string(),
                 public_key: e.public_key.clone(),
@@ -142,6 +188,12 @@ pub fn load_discovered_peers(
     };
     let mut restored = 0usize;
     let mut peer_id_counter: u32 = crate::types::synthetic_peer_id::PERSISTENCE_BASE;
+    // A snapshot written before the gossip path stopped minting a slot per
+    // round holds the same node many times over — 919 entries for 21 nodes on
+    // one production seed. Loading it verbatim would restore the bloat and dial
+    // every copy, so an entry whose node is already placed is skipped. Asking
+    // the live map rather than a private set also covers a node that arrived
+    // some other way while the load was running.
     let active = {
         let reg = access
             .session_tx_registry
@@ -149,6 +201,8 @@ pub fn load_discovered_peers(
             .unwrap_or_else(|p| p.into_inner());
         reg.active_node_ids()
     };
+    // Our own posture, read once: the loop below asks it per snapshot.
+    let site_local = we_are_site_local(&lock_state(state));
     for snap in snapshots {
         let Ok(node_id) = snap.node_id.parse::<veil_cfg::NodeId>() else {
             continue;
@@ -161,6 +215,16 @@ pub fn load_discovered_peers(
         // filters landed would seed every restart with unreachable
         // 0.0.0.0:5555 dial targets that self-connect to our own listener.
         if is_wildcard_transport(&snap.transport) {
+            continue;
+        }
+        // And the same for addresses that are real but not real HERE. Filtering
+        // only on write would leave every snapshot taken before this landed
+        // untouched: a production seed carried 573 loopback entries and 149 for
+        // one stranger's LAN, and each is an outbound dial on startup.
+        if is_undialable_from_here(&snap.transport, site_local) {
+            continue;
+        }
+        if existing_slot_for(&lock_state(state).peers, node_id.as_bytes()).is_some() {
             continue;
         }
         let peer_id = veil_cfg::PeerId::new(peer_id_counter);
@@ -322,6 +386,190 @@ pub fn load_bans(ban_list: &Arc<Mutex<BanList>>, config_path: &Path) -> LoadOutc
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn peer_entry(slot: u32, node_id: [u8; 32], transport: &str) -> PeerConfigEntry {
+        PeerConfigEntry {
+            peer_id: veil_cfg::PeerId::new(slot),
+            node_id: veil_cfg::NodeId::from(node_id),
+            public_key: String::new(),
+            nonce: String::new(),
+            transport: transport.to_string(),
+            algo: veil_cfg::SignatureAlgorithm::Ed25519,
+            tls_cert: None,
+            tls_key: None,
+            tls_ca_cert: None,
+            bootstrap_only: false,
+            source: crate::types::PeerSource::Exchanged,
+        }
+    }
+
+    fn listen_entry(transport: &str, advertise: Option<&str>) -> crate::types::ListenConfigEntry {
+        crate::types::ListenConfigEntry {
+            listen_id: crate::types::ListenId::new(1),
+            listener_handle: None,
+            transport: transport.to_owned(),
+            advertise: advertise.map(str::to_owned),
+            relay: None,
+            tls_cert: None,
+            tls_key: None,
+            tls_ca_cert: None,
+            psk_file: None,
+            visibility: veil_cfg::Visibility::Public,
+            allowlist_node_ids: vec![],
+            group_label: None,
+            ephemeral: None,
+            on_demand: None,
+            local_addr: None,
+            active: false,
+        }
+    }
+
+    fn state_with(
+        listens: Vec<crate::types::ListenConfigEntry>,
+        peers: Vec<PeerConfigEntry>,
+        config_path: &Path,
+    ) -> Arc<Mutex<NodeState>> {
+        Arc::new(Mutex::new(NodeState::new(
+            veil_cfg::NodeId::from([0xAAu8; 32]),
+            crate::types::NodeRole::Core,
+            config_path.to_path_buf(),
+            true,
+            std::time::Instant::now(),
+            false,
+            None,
+            peers,
+            listens,
+        )))
+    }
+
+    /// Our posture comes from what we ADVERTISE, not from what we bind.
+    #[test]
+    fn a_wildcard_bind_does_not_make_us_a_lan_node() {
+        let dir = std::env::temp_dir().join("veil-posture-test");
+        let public = state_with(
+            vec![listen_entry(
+                "obfs4-tcp://0.0.0.0:5556",
+                Some("tcp://198.51.100.11:5556"),
+            )],
+            vec![],
+            &dir,
+        );
+        assert!(
+            !we_are_site_local(&lock_state(&public)),
+            "a seed advertising a public address is not on anybody's LAN"
+        );
+
+        let bind_only = state_with(vec![listen_entry("tcp://0.0.0.0:9000", None)], vec![], &dir);
+        assert!(
+            !we_are_site_local(&lock_state(&bind_only)),
+            "a wildcard bind says nothing about where we are"
+        );
+
+        let lan = state_with(
+            vec![listen_entry("tcp://192.168.1.5:9000", None)],
+            vec![],
+            &dir,
+        );
+        assert!(
+            we_are_site_local(&lock_state(&lan)),
+            "a node listening on a LAN address is a LAN node"
+        );
+    }
+
+    /// The decision, not the predicate: an address nobody here can dial must
+    /// not reach the file.
+    ///
+    /// A production seed's `peers_discovered.json` held 573 loopback entries
+    /// and 149 for one stranger's home network, and every one of them becomes
+    /// an outbound dial on the next start. Break-check: drop the
+    /// `is_undialable_from_here` filter in `persist_discovered_peers` and the
+    /// two junk entries come back.
+    #[test]
+    fn a_public_node_does_not_persist_what_it_could_never_dial() {
+        let dir = std::env::temp_dir().join(format!("veil-persist-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let config_path = dir.join("node.toml");
+
+        let state = state_with(
+            vec![listen_entry(
+                "obfs4-tcp://0.0.0.0:5556",
+                Some("tcp://198.51.100.11:5556"),
+            )],
+            vec![
+                peer_entry(1, [0x01u8; 32], "tcp://127.0.0.1:9000"),
+                peer_entry(2, [0x02u8; 32], "obfs4-tcp://192.168.1.70:5599"),
+                peer_entry(3, [0x03u8; 32], "obfs4-tcp://198.51.100.11:5556"),
+            ],
+            &config_path,
+        );
+
+        persist_discovered_peers(&state, &config_path);
+        let written =
+            std::fs::read_to_string(discovered_peers_path(&config_path)).expect("snapshot written");
+        std::fs::remove_dir_all(&dir).ok();
+
+        assert!(
+            written.contains("198.51.100.11"),
+            "a reachable peer must survive: {written}"
+        );
+        assert!(
+            !written.contains("127.0.0.1"),
+            "loopback cannot name another node: {written}"
+        );
+        assert!(
+            !written.contains("192.168.1.70"),
+            "a public node can never reach somebody else's LAN: {written}"
+        );
+    }
+
+    /// A node already in the map is found by node_id, whatever slot it sits in.
+    ///
+    /// The map is keyed by slot, so "is this peer known" cannot be answered by
+    /// a key lookup and nothing was answering it another way: every gossip
+    /// round minted a new slot for a peer already present, and one production
+    /// seed reached 919 entries for 21 distinct nodes. Break-check: return
+    /// `None` unconditionally and both callers mint again.
+    #[test]
+    fn a_peer_already_in_the_map_is_found_by_its_node_id() {
+        let mut peers = std::collections::BTreeMap::new();
+        let known = [0x11u8; 32];
+        // Slots deliberately not starting at zero and not contiguous — the
+        // answer must not depend on where the entry happens to sit.
+        peers.insert(veil_cfg::PeerId::new(7), peer_entry(7, known, "tcp://a:1"));
+        peers.insert(
+            veil_cfg::PeerId::new(99),
+            peer_entry(99, [0x22u8; 32], "tcp://b:2"),
+        );
+
+        assert_eq!(
+            existing_slot_for(&peers, &known),
+            Some(veil_cfg::PeerId::new(7)),
+            "a known node must resolve to the slot it already occupies"
+        );
+        assert_eq!(
+            existing_slot_for(&peers, &[0x33u8; 32]),
+            None,
+            "a node nobody has seen has no slot to reuse"
+        );
+    }
+
+    /// The same node under a NEW transport reuses its slot rather than adding.
+    ///
+    /// A peer that changed address is still one peer; minting a second slot is
+    /// how the store came to hold the same node under several addresses at
+    /// once, dialling all of them forever.
+    #[test]
+    fn a_changed_address_does_not_earn_a_second_slot() {
+        let mut peers = std::collections::BTreeMap::new();
+        let node = [0x44u8; 32];
+        peers.insert(veil_cfg::PeerId::new(3), peer_entry(3, node, "tcp://old:1"));
+
+        let slot = existing_slot_for(&peers, &node).expect("known node");
+        peers.insert(slot, peer_entry(slot.get(), node, "tcp://new:2"));
+
+        assert_eq!(peers.len(), 1, "one node, one slot");
+        assert_eq!(peers[&slot].transport, "tcp://new:2", "and the new address");
+    }
 
     fn ban_list_with(ids: &[[u8; 32]]) -> Arc<Mutex<BanList>> {
         let bl = Arc::new(Mutex::new(BanList::default()));

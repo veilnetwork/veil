@@ -361,14 +361,23 @@ impl FrameDispatcher {
             raw_score
         };
         wlock!(self.route_cache).insert(p.origin_node_id, p.via_node_id, score, p.hop_count);
-        // Forward if TTL allows.
+        // Forward if TTL allows, and if this is NEWS rather than repetition.
         if p.ttl > 0
             && p.hop_count < self.max_gossip_hops
+            && self.forward_is_worth_it(p.origin_node_id, p.hop_count)
             && let Some(frame) = self.build_announce_forward(&p)
             && let Some(reg) = &self.session_tx_registry
         {
-            wlock!(reg).send_to_all_except_with_priority(
+            // Skip BOTH the peer this arrived from and the node it is ABOUT.
+            // Forwarding an announcement back to its origin tells that node how
+            // to reach itself: it cannot use the route, and it pays for the
+            // frame. Measured on a phone: 15 of the 105 announcements it
+            // received in 15 minutes were about itself, all at hop_count 2 —
+            // i.e. every one came through this forward. The three other announce
+            // sites already exclude their subject; this one did not.
+            wlock!(reg).send_to_all_except_two_with_priority(
                 peer_id.as_bytes(),
+                &p.origin_node_id,
                 veil_proto::header::priority::BACKGROUND,
                 veil_bufpool::pooled_shared_from_vec(frame),
             );
@@ -1280,9 +1289,29 @@ impl FrameDispatcher {
             header::{FrameHeader, HEADER_SIZE, TrafficClass},
         };
 
+        // A peer that advertised NO_DHT_SERVICE gets nothing pushed to it.
+        //
+        // This is the path the capability bit could not reach. Every filter for
+        // it sits on candidate SELECTION — who to pick out of the routing table
+        // as a store target, a walk hop, a referral — and nothing is selected
+        // here: the peer connected, so it gets the dump. Measured on a leaf that
+        // had asked not to serve and whose only three sessions were with seeds
+        // that had already marked it `[no-dht-service]`: incoming STORE was
+        // 3.7 KB/s, 80% of everything it received, 318 MB a day. Refusing the
+        // records locally never touched that number, because the bytes cross
+        // the network before any local decision is made.
+        //
+        // Unknown peers still get the push (`peer_serves_dht` answers `true`
+        // for a node the table has not heard from): silence is not a refusal.
+        if !self.dht.peer_serves_dht(&new_peer) {
+            return;
+        }
+
         let local_id = self.local_node_id;
         let keys = self.dht.stored_key_ids();
         let mut pushed = 0usize;
+        let mut frames: Vec<Vec<u8>> = Vec::new();
+        let mut digest = blake3::Hasher::new();
         for key in keys {
             // The key may have been evicted between the key scan and here.
             let Some(value) = self.dht.peek_value(&key) else {
@@ -1323,8 +1352,56 @@ impl FrameDispatcher {
             let mut frame = Vec::with_capacity(HEADER_SIZE + body.len());
             frame.extend_from_slice(&encode_header(&hdr));
             frame.extend_from_slice(&body);
-            wlock!(reg_arc).send_to(&new_peer, veil_proto::header::priority::BACKGROUND, frame);
+            // Collected rather than sent as we go: what to send has to be
+            // known in full before we can ask whether it is anything new.
+            digest.update(&key);
+            digest.update(&(frame.len() as u32).to_be_bytes());
+            frames.push(frame);
             pushed += 1;
+        }
+
+        // Nothing new for a peer that already has it.
+        //
+        // This runs on EVERY session open, inbound included, so how often it
+        // happens is the remote side's decision, not ours: a phone on a bad
+        // link reconnects and takes the same dump again. The window is the
+        // republish interval, because that is how long the peer's copies live
+        // without a refresh — inside it, re-sending an unchanged set tells the
+        // peer nothing it does not already have.
+        let fingerprint = u64::from_be_bytes(
+            digest.finalize().as_bytes()[..8]
+                .try_into()
+                .expect("8 bytes of a 32-byte hash"),
+        );
+        let window = std::time::Duration::from_secs(self.dht.dht_config().republish_interval_secs);
+        if pushed > 0 && !window.is_zero() {
+            let now = Instant::now();
+            let mut last = lock!(self.owned_push_last);
+            if let Some(&(when, seen)) = last.get(&new_peer)
+                && seen == fingerprint
+                && now.duration_since(when) < window
+            {
+                if let Some(m) = &self.metrics {
+                    m.inc_owned_push_suppressed();
+                }
+                return;
+            }
+            // Bounded like the other per-peer maps: evict the oldest, whose
+            // copy on the far side is closest to expiring anyway.
+            if last.len() >= veil_proto::budget::MAX_ROUTE_ORIGIN_SEQ_CACHE
+                && !last.contains_key(&new_peer)
+                && let Some(&oldest) = last
+                    .iter()
+                    .min_by_key(|(_, (when, _))| *when)
+                    .map(|(k, _)| k)
+            {
+                last.remove(&oldest);
+            }
+            last.insert(new_peer, (now, fingerprint));
+        }
+
+        for frame in frames {
+            wlock!(reg_arc).send_to(&new_peer, veil_proto::header::priority::BACKGROUND, frame);
         }
         if pushed > 0 {
             self.logger.info(
@@ -1565,6 +1642,65 @@ impl FrameDispatcher {
     // ── Private routing helpers ──────────────────────────────────────────────
 
     /// Build a forwarded ROUTE_ANNOUNCE re-signed by the local node.
+    /// Should we relay gossip about `origin` again, or is this a repeat?
+    ///
+    /// Forwarding rewrites `via_node_id` to this node, so everything we relay
+    /// about one origin refreshes ONE entry on every downstream peer. Keeping
+    /// that entry alive needs one relay per cache TTL; measured on a live
+    /// testnet we were sending six, and forwarded announcements were 85% of
+    /// all routing traffic. The directly-announced plane, by contrast, came
+    /// out at 1.3 refreshes per TTL — correctly paced, and left alone.
+    ///
+    /// Three things pass immediately, because they are news and not repetition:
+    ///
+    /// * an origin we have never relayed (or have not relayed in a full
+    ///   window, so downstream entries are near expiry);
+    /// * a SHORTER path than the one we last relayed — holding an improvement
+    ///   back would leave peers scoring a worse route until the window ends;
+    /// * everything, if the route cache has no TTL to divide (`ZERO`), because
+    ///   then nothing expires and the premise does not hold.
+    ///
+    /// The window is half the cache TTL, taken FROM the cache rather than
+    /// written beside it: two refreshes per lifetime is the same margin the
+    /// direct plane already has, and a constant here would starve the cache
+    /// the day the TTL shrinks.
+    ///
+    /// `RouteWithdraw` is deliberately NOT throttled. A withdrawal is not a
+    /// refresh — it is the one message whose delay is felt as a black hole.
+    fn forward_is_worth_it(&self, origin: [u8; 32], hop_count: u8) -> bool {
+        let ttl = rlock!(self.route_cache).ttl();
+        if ttl.is_zero() {
+            return true;
+        }
+        let window = ttl / 2;
+        let now = Instant::now();
+        let mut last = lock!(self.route_forward_last);
+        match last.get(&origin) {
+            Some(&(when, relayed_hops))
+                if now.duration_since(when) < window && hop_count >= relayed_hops =>
+            {
+                if let Some(m) = &self.metrics {
+                    m.inc_gossip_forward_suppressed();
+                }
+                return false;
+            }
+            _ => {}
+        }
+        // Bounded the same way `route_origin_seq` is: evict the oldest, which
+        // is also the entry whose downstream copy is closest to expiry anyway.
+        if last.len() >= veil_proto::budget::MAX_ROUTE_ORIGIN_SEQ_CACHE
+            && !last.contains_key(&origin)
+            && let Some(&oldest) = last
+                .iter()
+                .min_by_key(|(_, (when, _))| *when)
+                .map(|(k, _)| k)
+        {
+            last.remove(&oldest);
+        }
+        last.insert(origin, (now, hop_count));
+        true
+    }
+
     fn build_announce_forward(&self, received: &RouteAnnouncePayload) -> Option<Vec<u8>> {
         let key = self.crypto.local_signing_key.as_ref()?;
         let seq = self.announce_seq.fetch_add(1, Ordering::Relaxed);
@@ -2797,6 +2933,83 @@ pub enum SigResult {
 }
 
 #[cfg(test)]
+mod gossip_forward_throttle_tests {
+    //! What the forward throttle must let through, and what it must stop.
+    //!
+    //! Measured on a live testnet before it existed: hop-1 announcements
+    //! refreshed each downstream entry 1.3 times per route-cache TTL, which is
+    //! exactly what keeping it alive needs; forwarded hop-2 announcements
+    //! refreshed theirs 6.0 times and were 85% of all routing traffic.
+    //! Forwarding rewrites `via` to this node, so everything relayed about one
+    //! origin lands in ONE downstream cache slot — relaying it six times
+    //! refreshes that one slot six times.
+
+    use crate::{NodeRole, make_test_dispatcher};
+
+    const ORIGIN: [u8; 32] = [0x42; 32];
+    const OTHER: [u8; 32] = [0x43; 32];
+
+    /// The first relay of an origin always goes out.
+    #[test]
+    fn news_about_an_unseen_origin_is_relayed() {
+        let d = make_test_dispatcher(NodeRole::Core);
+        assert!(
+            d.forward_is_worth_it(ORIGIN, 1),
+            "an origin we have never relayed is news"
+        );
+    }
+
+    /// The second relay of the same origin at the same distance is repetition.
+    ///
+    /// Break-check: delete the window check in `forward_is_worth_it` and this
+    /// goes green on the second call.
+    #[test]
+    fn relaying_the_same_origin_again_inside_the_window_is_suppressed() {
+        let d = make_test_dispatcher(NodeRole::Core);
+        assert!(d.forward_is_worth_it(ORIGIN, 1));
+        assert!(
+            !d.forward_is_worth_it(ORIGIN, 1),
+            "the downstream entry we just refreshed does not need refreshing again"
+        );
+        assert!(
+            !d.forward_is_worth_it(ORIGIN, 2),
+            "a LONGER path is not news either"
+        );
+    }
+
+    /// A shorter path is news, and must not wait out the window.
+    ///
+    /// Holding an improvement back leaves every downstream peer scoring a
+    /// worse route until the window ends. Break-check: drop the
+    /// `hop_count >= relayed_hops` clause and this fails.
+    #[test]
+    fn a_shorter_path_is_relayed_immediately() {
+        let d = make_test_dispatcher(NodeRole::Core);
+        assert!(d.forward_is_worth_it(ORIGIN, 3));
+        assert!(
+            d.forward_is_worth_it(ORIGIN, 2),
+            "a shorter path to the same origin is news, not repetition"
+        );
+        assert!(
+            d.forward_is_worth_it(ORIGIN, 1),
+            "and so is a shorter one again"
+        );
+    }
+
+    /// The throttle is per origin: one origin's traffic must not silence
+    /// another's. Keying it any wider would suppress real news.
+    #[test]
+    fn the_throttle_does_not_leak_between_origins() {
+        let d = make_test_dispatcher(NodeRole::Core);
+        assert!(d.forward_is_worth_it(ORIGIN, 1));
+        assert!(
+            d.forward_is_worth_it(OTHER, 1),
+            "a different origin has its own downstream entry"
+        );
+    }
+}
+
+#[cfg(test)]
 mod push_owned_tests {
     //! direct unit tests [`FrameDispatcher::push_owned_dht_records`].
     //!
@@ -2830,6 +3043,278 @@ mod push_owned_tests {
         let pk = sk.verifying_key().to_bytes();
         let node_id: NodeIdBytes = *blake3::hash(&pk).as_bytes();
         (sk, pk, node_id)
+    }
+
+    /// A peer that asked not to serve gets nothing pushed to it.
+    ///
+    /// The bit had a filter on every candidate-selection path and none here,
+    /// because nothing is selected: the peer connected, so it got the dump.
+    /// Break-check: drop the `peer_serves_dht` guard in
+    /// `push_owned_dht_records` and this goes green again on the STORE frame.
+    #[test]
+    fn a_peer_that_asked_not_to_serve_is_pushed_nothing() {
+        let (sk, _pk, local_id) = new_signer();
+        let mut disp = make_test_dispatcher(NodeRole::Core);
+        disp.local_node_id = local_id;
+        disp.dht = Arc::new(KademliaService::with_config(
+            local_id,
+            veil_dht::DhtRuntimeConfig {
+                allow_unsigned_store: true,
+                ..Default::default()
+            },
+        ));
+
+        let entry = AppEndpointEntry {
+            node_id: local_id,
+            app_id: [0xA5u8; 32],
+            endpoint_id: 7,
+            gateway_node_id: None,
+            epoch: 1,
+            expires_at: u64::MAX / 2,
+            max_concurrent_streams: 4,
+            protocol_version: 1,
+            bandwidth_hint_kbps: 64,
+        };
+        let key = app_endpoint_key(&entry.node_id, &entry.app_id, entry.endpoint_id);
+        let value = entry.encode_for_dht_signed(&sk);
+        disp.dht
+            .handle_store(StorePayload::unsigned(key, value))
+            .unwrap();
+
+        let quiet: [u8; 32] = [0x22; 32];
+        disp.dht
+            .add_contact_trusted(veil_dht::routing::Contact::with_caps(
+                quiet,
+                "tcp://quiet",
+                veil_types::DiscoveryMode::Public,
+                false,
+            ));
+
+        let reg = Arc::new(RwLock::new(SessionTxRegistry::new()));
+        let mut rx = reg.write().unwrap().register(quiet);
+        disp.session_tx_registry = Some(Arc::clone(&reg));
+
+        Arc::new(disp).push_owned_dht_records(quiet, &reg);
+
+        assert!(
+            rx.try_recv().is_err(),
+            "a peer advertising NO_DHT_SERVICE must receive no owned-record push"
+        );
+    }
+
+    /// Silence is not a refusal: a peer the table has never heard from still
+    /// gets the push, because it has not asked for anything.
+    #[test]
+    fn an_unknown_peer_is_still_pushed_to() {
+        let (sk, _pk, local_id) = new_signer();
+        let mut disp = make_test_dispatcher(NodeRole::Core);
+        disp.local_node_id = local_id;
+        disp.dht = Arc::new(KademliaService::with_config(
+            local_id,
+            veil_dht::DhtRuntimeConfig {
+                allow_unsigned_store: true,
+                ..Default::default()
+            },
+        ));
+
+        let entry = AppEndpointEntry {
+            node_id: local_id,
+            app_id: [0xA5u8; 32],
+            endpoint_id: 7,
+            gateway_node_id: None,
+            epoch: 1,
+            expires_at: u64::MAX / 2,
+            max_concurrent_streams: 4,
+            protocol_version: 1,
+            bandwidth_hint_kbps: 64,
+        };
+        let key = app_endpoint_key(&entry.node_id, &entry.app_id, entry.endpoint_id);
+        let value = entry.encode_for_dht_signed(&sk);
+        disp.dht
+            .handle_store(StorePayload::unsigned(key, value))
+            .unwrap();
+
+        let reg = Arc::new(RwLock::new(SessionTxRegistry::new()));
+        let stranger: [u8; 32] = [0x33; 32];
+        let mut rx = reg.write().unwrap().register(stranger);
+        disp.session_tx_registry = Some(Arc::clone(&reg));
+
+        Arc::new(disp).push_owned_dht_records(stranger, &reg);
+
+        assert!(
+            rx.try_recv().is_ok(),
+            "a peer we have never heard from has refused nothing"
+        );
+    }
+
+    /// The same peer, reconnecting with nothing changed, is not dumped on again.
+    ///
+    /// This runs on EVERY session open, inbound included, so the remote side
+    /// decides how often it happens: a phone on a bad link reconnects and used
+    /// to take the identical dump every time. Break-check: remove the
+    /// fingerprint gate in `push_owned_dht_records` and the second call sends
+    /// again.
+    #[test]
+    fn an_unchanged_record_set_is_not_pushed_to_the_same_peer_twice() {
+        let (sk, _pk, local_id) = new_signer();
+        let mut disp = make_test_dispatcher(NodeRole::Core);
+        disp.local_node_id = local_id;
+        disp.dht = Arc::new(KademliaService::with_config(
+            local_id,
+            veil_dht::DhtRuntimeConfig {
+                allow_unsigned_store: true,
+                ..Default::default()
+            },
+        ));
+
+        let entry = AppEndpointEntry {
+            node_id: local_id,
+            app_id: [0xA5u8; 32],
+            endpoint_id: 7,
+            gateway_node_id: None,
+            epoch: 1,
+            expires_at: u64::MAX / 2,
+            max_concurrent_streams: 4,
+            protocol_version: 1,
+            bandwidth_hint_kbps: 64,
+        };
+        let key = app_endpoint_key(&entry.node_id, &entry.app_id, entry.endpoint_id);
+        disp.dht
+            .handle_store(StorePayload::unsigned(
+                key,
+                entry.encode_for_dht_signed(&sk),
+            ))
+            .unwrap();
+
+        let reg = Arc::new(RwLock::new(SessionTxRegistry::new()));
+        let peer: [u8; 32] = [0x11; 32];
+        let mut rx = reg.write().unwrap().register(peer);
+        let disp = Arc::new(disp);
+
+        Arc::clone(&disp).push_owned_dht_records(peer, &reg);
+        assert!(
+            rx.try_recv().is_ok(),
+            "the first push must reach a peer that has nothing"
+        );
+        while rx.try_recv().is_ok() {}
+
+        Arc::clone(&disp).push_owned_dht_records(peer, &reg);
+        assert!(
+            rx.try_recv().is_err(),
+            "the same set, to the same peer, inside the republish window is \
+             news to nobody"
+        );
+    }
+
+    /// A CHANGED set goes out at once, whatever the window says.
+    ///
+    /// The gate is on repetition, not on the clock: a record the peer has
+    /// never seen must not wait for a window to expire. Break-check: key the
+    /// map by peer alone, ignoring the fingerprint, and this fails.
+    #[test]
+    fn a_changed_record_set_is_pushed_immediately() {
+        let (sk, _pk, local_id) = new_signer();
+        let mut disp = make_test_dispatcher(NodeRole::Core);
+        disp.local_node_id = local_id;
+        disp.dht = Arc::new(KademliaService::with_config(
+            local_id,
+            veil_dht::DhtRuntimeConfig {
+                allow_unsigned_store: true,
+                ..Default::default()
+            },
+        ));
+
+        let mut entry = AppEndpointEntry {
+            node_id: local_id,
+            app_id: [0xA5u8; 32],
+            endpoint_id: 7,
+            gateway_node_id: None,
+            epoch: 1,
+            expires_at: u64::MAX / 2,
+            max_concurrent_streams: 4,
+            protocol_version: 1,
+            bandwidth_hint_kbps: 64,
+        };
+        let key = app_endpoint_key(&entry.node_id, &entry.app_id, entry.endpoint_id);
+        disp.dht
+            .handle_store(StorePayload::unsigned(
+                key,
+                entry.encode_for_dht_signed(&sk),
+            ))
+            .unwrap();
+
+        let reg = Arc::new(RwLock::new(SessionTxRegistry::new()));
+        let peer: [u8; 32] = [0x11; 32];
+        let mut rx = reg.write().unwrap().register(peer);
+        let disp = Arc::new(disp);
+
+        Arc::clone(&disp).push_owned_dht_records(peer, &reg);
+        while rx.try_recv().is_ok() {}
+
+        // A second record the peer has never seen.
+        entry.endpoint_id = 8;
+        let key2 = app_endpoint_key(&entry.node_id, &entry.app_id, entry.endpoint_id);
+        disp.dht
+            .handle_store(StorePayload::unsigned(
+                key2,
+                entry.encode_for_dht_signed(&sk),
+            ))
+            .unwrap();
+
+        Arc::clone(&disp).push_owned_dht_records(peer, &reg);
+        assert!(
+            rx.try_recv().is_ok(),
+            "a set the peer has not seen must go out without waiting"
+        );
+    }
+
+    /// One peer's push must not silence another's.
+    #[test]
+    fn the_push_memory_does_not_leak_between_peers() {
+        let (sk, _pk, local_id) = new_signer();
+        let mut disp = make_test_dispatcher(NodeRole::Core);
+        disp.local_node_id = local_id;
+        disp.dht = Arc::new(KademliaService::with_config(
+            local_id,
+            veil_dht::DhtRuntimeConfig {
+                allow_unsigned_store: true,
+                ..Default::default()
+            },
+        ));
+
+        let entry = AppEndpointEntry {
+            node_id: local_id,
+            app_id: [0xA5u8; 32],
+            endpoint_id: 7,
+            gateway_node_id: None,
+            epoch: 1,
+            expires_at: u64::MAX / 2,
+            max_concurrent_streams: 4,
+            protocol_version: 1,
+            bandwidth_hint_kbps: 64,
+        };
+        let key = app_endpoint_key(&entry.node_id, &entry.app_id, entry.endpoint_id);
+        disp.dht
+            .handle_store(StorePayload::unsigned(
+                key,
+                entry.encode_for_dht_signed(&sk),
+            ))
+            .unwrap();
+
+        let reg = Arc::new(RwLock::new(SessionTxRegistry::new()));
+        let first: [u8; 32] = [0x11; 32];
+        let second: [u8; 32] = [0x22; 32];
+        let mut rx1 = reg.write().unwrap().register(first);
+        let mut rx2 = reg.write().unwrap().register(second);
+        let disp = Arc::new(disp);
+
+        Arc::clone(&disp).push_owned_dht_records(first, &reg);
+        assert!(rx1.try_recv().is_ok());
+        Arc::clone(&disp).push_owned_dht_records(second, &reg);
+        assert!(
+            rx2.try_recv().is_ok(),
+            "a peer that has never been pushed to must be pushed to"
+        );
     }
 
     /// Signed AppEndpoint record owned by this node is pushed to the new peer.

@@ -212,13 +212,53 @@ fn short_cookie(cookie: &[u8; COOKIE_LEN]) -> String {
 }
 
 /// Smaller MSS for the circuit path so the onion-stream cell + the
-/// `[cookie 16][peer_tag 32]` splice envelope exactly fill one fixed
-/// CircuitData cell (4096-B since the 2026-07-02 flag-day bump).
+/// `[cookie 16][peer_tag 32]` splice envelope exactly fill one
+/// CircuitData cell.
 const CIRCUIT_PEER_TAG_LEN: usize = 32;
-const CIRCUIT_MSS: usize = veil_onion_stream::wire::MAX_CELL
-    - COOKIE_LEN
-    - CIRCUIT_PEER_TAG_LEN
-    - veil_onion_stream::wire::DATA_OVERHEAD;
+
+/// The stream MSS that a circuit of `cell` bytes can carry.
+///
+/// Every stream frame becomes one circuit cell, wrapped as
+/// `[cookie 16][peer_tag 32][frame]` inside the cell's `[len u16][payload][pad]`
+/// envelope. So the frame budget is the cell minus its own length prefix minus
+/// that splice header, and the engine's MSS is that minus `DATA_OVERHEAD`.
+///
+/// This used to be a constant, and being a constant is what pinned every
+/// circuit in the network to 16384 bytes: `f54a68bf` moved the size into the
+/// circuit, but the framer still cut to a compile-time maximum and handed the
+/// result to whichever circuit was at hand, so a circuit that negotiated less
+/// would have refused its own stream's frames. Measured 23.08 on an idle phone:
+/// the eight-byte circuit heartbeat rode a full 16410-byte cell and accounted
+/// for 74% of every body byte the phone exchanged.
+///
+/// ⚠️ The engine holds ONE MSS for the whole hub, so this must be evaluated
+/// against the size this node ORIGINATES ([`veil_anonymity::circuit_origin::
+/// choose_cell_bytes`]), not against some individual circuit: the hub is built
+/// before any circuit exists, and its pools hold several. A peer that
+/// negotiated a smaller cell than we frame for is not a silent corruption —
+/// `wrap_payload` refuses the oversized payload at the send path and the hop
+/// would refuse the cell anyway.
+const fn circuit_mss_for(cell: veil_anonymity::circuit_data::CircuitCellBytes) -> usize {
+    cell.get()
+        - veil_anonymity::circuit_data::LEN_PREFIX
+        - COOKIE_LEN
+        - CIRCUIT_PEER_TAG_LEN
+        - veil_onion_stream::wire::DATA_OVERHEAD
+}
+
+/// The largest splice envelope a cell this node originates can carry.
+///
+/// The send path checked every envelope against `wire::MAX_CELL`, which is the
+/// LEGACY cell's budget. That is the right ceiling only while every circuit is
+/// legacy-sized; once a circuit negotiates less, an envelope can pass this gate
+/// and still not fit, and the failure then surfaces deeper as
+/// `PayloadTooLarge`. Deriving the gate from the same policy the circuits are
+/// built with keeps the two in step — and at the legacy size it is bit-exact
+/// with the constant it replaces, so today nothing changes.
+fn circuit_env_max() -> usize {
+    veil_anonymity::circuit_origin::choose_cell_bytes().get()
+        - veil_anonymity::circuit_data::LEN_PREFIX
+}
 // The external-node fallback sends every stream cell as one authenticated app
 // payload. That envelope is capped at MAX_AUTH_DELIVER_MSG_BYTES *after* the
 // sovereign header + signature are added, so it cannot reuse the 16 KiB
@@ -241,7 +281,7 @@ const _: () =
 // visible. The send path caps every splice envelope (cookie + tag + stream
 // cell) at MAX_CELL, so MAX_CELL must not exceed what the circuit's fixed
 // inner payload accepts. A max-size DATA envelope fills it exactly:
-// COOKIE(16) + TAG(32) + DATA_OVERHEAD(16) + CIRCUIT_MSS == MAX_CELL.
+// COOKIE(16) + TAG(32) + DATA_OVERHEAD(16) + the legacy MSS == MAX_CELL.
 const _: () =
     assert!(veil_onion_stream::wire::MAX_CELL <= veil_anonymity::circuit_data::MAX_CIRCUIT_INNER);
 const CIRCUIT_INTRO_MARKER: u8 = 0xA7;
@@ -252,14 +292,43 @@ const CIRCUIT_INTRO_LEN: usize =
 /// Maximum batch body that still fits the worst-case protected-intro envelope:
 /// cookie + peer tag + intro marker/seal + MEDIA_MAGIC + the end-to-end seal +
 /// the batch magic that now lives INSIDE that seal + body.
-pub(crate) const MEDIA_BATCH_BODY_MAX: usize = veil_onion_stream::wire::MAX_CELL
-    - COOKIE_LEN
-    - CIRCUIT_PEER_TAG_LEN
-    - 1
-    - CIRCUIT_INTRO_LEN
-    - 1
-    - crate::media::MEDIA_SEAL_OVERHEAD
-    - 1;
+///
+/// A function rather than a constant for the same reason as [`circuit_env_max`]:
+/// the budget is one cell's worth, and a cell is no longer one number for the
+/// whole network. At the legacy size it is bit-exact with the constant it
+/// replaces.
+pub(crate) fn media_batch_body_max() -> usize {
+    circuit_env_max()
+        - COOKIE_LEN
+        - CIRCUIT_PEER_TAG_LEN
+        - 1
+        - CIRCUIT_INTRO_LEN
+        - 1
+        - crate::media::MEDIA_SEAL_OVERHEAD
+        - 1
+}
+
+/// Everything one cell must carry BEFORE any payload: the length prefix, the
+/// splice header, and the worst-case protected-intro framing a media batch adds.
+const CIRCUIT_CELL_FIXED_COST: usize = veil_anonymity::circuit_data::LEN_PREFIX
+    + COOKIE_LEN
+    + CIRCUIT_PEER_TAG_LEN
+    + 1
+    + CIRCUIT_INTRO_LEN
+    + 1
+    + crate::media::MEDIA_SEAL_OVERHEAD
+    + 1;
+// The budgets above are `usize` subtractions from the cell size. A cell too
+// small for the fixed cost would not error — it would WRAP, and hand the media
+// path a batch limit near `usize::MAX`. `CircuitCellBytes::new` already refuses
+// anything under `MIN_CIRCUIT_CELL_BYTES`, so pinning the two together here is
+// what makes every size the constructor admits arithmetically safe. Checked at
+// compile time because the only alternative is discovering it from a wrapped
+// length at run time.
+const _: () = assert!(
+    veil_anonymity::circuit_data::MIN_CIRCUIT_CELL_BYTES > CIRCUIT_CELL_FIXED_COST,
+    "the smallest negotiable cell must still leave room for a payload"
+);
 const CIRCUIT_HOPS: usize = 2;
 // How long a pinned INBOUND circuit may sit idle (no received data) before it is
 // rebuilt on a fresh path. Raised 45s -> 300s: the 45s rebuild cadence was pure
@@ -284,17 +353,58 @@ const CIRCUIT_PUBLISHED_RELAY_EXPAND_AFTER: Duration = Duration::from_secs(5);
 const CIRCUIT_REFRESH_POLL: Duration = Duration::from_secs(5);
 // How often the receiver sends a FORWARD keepalive heartbeat up each pinned
 // inbound circuit (`veil_anonymity::circuit_data::CIRCUIT_HEARTBEAT_MAGIC`).
-// The inbound circuit is otherwise receive-only, so its first-hop TCP session
-// only carries traffic when the node happens to transmit for another reason;
-// left idle it dies (mobile power-save / NAT rebind / VPN) and the rendezvous
-// relay's downstream introduce pushes queue behind a dead socket until the
-// node next sends — the measured 10–60 s delivery stalls that flushed in a
-// batch. 15 s beats the ~10–20 s stalls and stays well under the session
-// keepalive base (30 s, stretched ×up-to-120 in background). One tiny cell per
-// circuit per interval — negligible cost. Must be a multiple-ish of
-// CIRCUIT_REFRESH_POLL (5 s); the poll loop fires it on the first tick at/after
-// the interval.
-const CIRCUIT_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
+//
+// "One tiny cell — negligible cost" was wrong, and measurably so. The payload
+// is eight bytes, but it rides one whole circuit cell: 16384 B padded, 16418 B
+// on the wire. At the old 15 s cadence that was 56% of an idle phone's entire
+// traffic — the single largest line item in a 2.63 GB/day idle bill.
+//
+// The cadence was chosen against the session keepalive: "15 s ... stays well
+// under the session keepalive base (30 s, stretched ×up-to-120 in background)".
+// That premise does not hold for this deployment. xVeil configures
+// `session.keepalive_interval_secs = 10` and never sets
+// `mobile.background_keepalive_multiplier`, whose default is 1 — so nothing
+// stretches, and a jittered ~10 s keepalive is already keeping the first-hop
+// socket (and its NAT mapping) warm, at 25-120 B a frame instead of 16418.
+// Warming the socket is therefore NOT this heartbeat's job; the cheaper
+// mechanism was doing it all along, four times as often.
+//
+// What is left, and what this cadence is now sized against, is the relay-side
+// circuit state: `CircuitTable` GCs any circuit whose `last_seen_unix` is older
+// than DEFAULT_CIRCUIT_TTL_SECS (300 s), and every accepted cell `touch`es it
+// at every hop. So the heartbeat must land inside 300 s even after losses.
+// The budget is therefore the WORST gap, not the average one: two consecutive
+// misses means three gaps must still fit in 300 s, so the longest a jittered
+// draw may produce is 100 s. 75 s ±20% tops out at 90 s (3 × 90 = 270 s) and
+// cuts the cell rate five-fold. The compile-time assert below holds that tie to
+// the relay's own constant, because the two numbers live in different crates
+// and nothing else would notice them drifting apart.
+//
+// Jittered per fire, for the same reason the session keepalive is: an exactly
+// periodic cell is a pattern an observer can lock onto without decrypting it,
+// and this one was measured at exactly 15.0 s. The draw is quantised by the
+// poll loop, which fires it on the first tick at/after the target.
+const CIRCUIT_HEARTBEAT_INTERVAL_SECS: u64 = 75;
+/// Jitter applied to each heartbeat wait, as a percentage of the interval.
+const CIRCUIT_HEARTBEAT_JITTER_PCT: u64 = 20;
+const CIRCUIT_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(CIRCUIT_HEARTBEAT_INTERVAL_SECS);
+/// Longest wait a jittered draw can produce.
+const CIRCUIT_HEARTBEAT_MAX_SECS: u64 = CIRCUIT_HEARTBEAT_INTERVAL_SECS
+    + CIRCUIT_HEARTBEAT_INTERVAL_SECS * CIRCUIT_HEARTBEAT_JITTER_PCT / 100;
+// Two consecutive misses must still leave the relay-side circuit alive.
+const _: () = assert!(
+    3 * CIRCUIT_HEARTBEAT_MAX_SECS < veil_anonymity::circuit_table::DEFAULT_CIRCUIT_TTL_SECS,
+    "heartbeat cadence must keep the relay's circuit state inside its idle TTL"
+);
+
+/// A fresh heartbeat wait: `CIRCUIT_HEARTBEAT_INTERVAL` ±`CIRCUIT_HEARTBEAT_JITTER_PCT`.
+fn circuit_heartbeat_wait() -> Duration {
+    use rand_core::{OsRng, RngCore};
+    let base = CIRCUIT_HEARTBEAT_INTERVAL.as_millis() as u64;
+    let span = base * CIRCUIT_HEARTBEAT_JITTER_PCT * 2 / 100;
+    let low = base - span / 2;
+    Duration::from_millis(low + u64::from(OsRng.next_u32()) % span.max(1))
+}
 const CIRCUIT_CONFIRM_TIMEOUT: Duration = Duration::from_secs(10);
 // Loopback splice-probe cadence inside the confirm window: give the ordinary
 // CircuitBuilt ACK a short head start, then probe repeatedly (each probe is an
@@ -1406,11 +1516,11 @@ impl CircuitCells {
             }
         }
         env.extend_from_slice(cell);
-        if env.len() > veil_onion_stream::wire::MAX_CELL {
+        if env.len() > circuit_env_max() {
             return Err(io::Error::other(format!(
                 "circuit stream envelope too large: {} > {}",
                 env.len(),
-                veil_onion_stream::wire::MAX_CELL
+                circuit_env_max()
             )));
         }
         Ok(env)
@@ -1773,7 +1883,7 @@ impl CircuitCells {
             }
         }
         env.extend_from_slice(cell);
-        if env.len() > veil_onion_stream::wire::MAX_CELL {
+        if env.len() > circuit_env_max() {
             return Err(io::Error::other("circuit stream envelope too large"));
         }
         match self
@@ -1826,11 +1936,11 @@ impl CircuitCells {
                 }
             }
             env.extend_from_slice(cell);
-            if env.len() > veil_onion_stream::wire::MAX_CELL {
+            if env.len() > circuit_env_max() {
                 return Err(io::Error::other(format!(
                     "circuit stream envelope too large: {} > {}",
                     env.len(),
-                    veil_onion_stream::wire::MAX_CELL
+                    circuit_env_max()
                 )));
             }
             if let Err(e) = self
@@ -3017,7 +3127,14 @@ impl AnonStreamHub {
         };
 
         let (cells, mss) = match circuit_cells {
-            Some(c) => (HubCells::Circuit(Box::new(c)), CIRCUIT_MSS),
+            // Frame to the size this node ORIGINATES, not to the compile-time
+            // ceiling. The hub exists before any circuit does and its pools
+            // hold several, so the policy — not one circuit — is what the one
+            // shared engine can be sized against. See `circuit_mss_for`.
+            Some(c) => (
+                HubCells::Circuit(Box::new(c)),
+                circuit_mss_for(veil_anonymity::circuit_origin::choose_cell_bytes()),
+            ),
             None => {
                 // Datagram path (default / fallback): feed inbound from msg_rx.
                 spawn_anon_feed(msg_rx, in_tx);
@@ -3575,6 +3692,7 @@ fn try_open_circuit(
             retire_circuits_later(&services_bg, retired);
 
             let mut last_heartbeat = Instant::now();
+            let mut heartbeat_wait = circuit_heartbeat_wait();
             loop {
                 tokio::time::sleep(CIRCUIT_REFRESH_POLL).await;
                 let now = Instant::now();
@@ -3587,8 +3705,9 @@ fn try_open_circuit(
                 // sends don't hold the slot lock; a QueueFull/NoRelays here is
                 // harmless (the next tick retries, and a truly dead circuit is
                 // rotated by the idle-refresh below).
-                if now.saturating_duration_since(last_heartbeat) >= CIRCUIT_HEARTBEAT_INTERVAL {
+                if now.saturating_duration_since(last_heartbeat) >= heartbeat_wait {
                     last_heartbeat = now;
+                    heartbeat_wait = circuit_heartbeat_wait();
                     let circs: Vec<Arc<veil_node_runtime::DataCircuit>> =
                         circuit_slot.lock().await.iter().cloned().collect();
                     for circ in &circs {
@@ -4432,12 +4551,101 @@ fn retire_circuits_later(
 #[cfg(test)]
 mod tests {
     use super::{
-        CIRCUIT_INTRO_LEN, CIRCUIT_MSS, CIRCUIT_PEER_TAG_LEN, CircuitMode,
-        DATAGRAM_AUTH_DELIVER_MAX, DATAGRAM_AUTH_SIGNATURE_MAX, DATAGRAM_MAX_CELL, DATAGRAM_MSS,
-        circuit_env_value_mode, parse_stream_peer_intro_plaintext, stream_peer_intro_plaintext,
+        CIRCUIT_HEARTBEAT_INTERVAL, CIRCUIT_HEARTBEAT_MAX_SECS, CIRCUIT_INTRO_LEN,
+        CIRCUIT_PEER_TAG_LEN, CircuitMode, DATAGRAM_AUTH_DELIVER_MAX, DATAGRAM_AUTH_SIGNATURE_MAX,
+        DATAGRAM_MAX_CELL, DATAGRAM_MSS, circuit_env_max, circuit_env_value_mode,
+        circuit_heartbeat_wait, circuit_mss_for, media_batch_body_max,
+        parse_stream_peer_intro_plaintext, stream_peer_intro_plaintext,
     };
     use veil_anonymity::circuit_register::COOKIE_LEN;
     use veil_onion_stream::wire::{DATA_OVERHEAD, Frame, MAX_CELL};
+
+    /// Install one circuit in a relay-side table and let `secs_between` seconds
+    /// pass between touches, `touches` times, running the GC at every step the
+    /// way the maintenance tick does. Returns whether the circuit is still
+    /// installed at the end.
+    fn circuit_survives(secs_between: u64, touches: u32) -> bool {
+        use veil_anonymity::circuit_setup::CircuitInstall;
+        use veil_anonymity::circuit_table::CircuitTable;
+
+        let table = CircuitTable::new();
+        let prev = [0x11u8; 32];
+        let install = CircuitInstall {
+            circuit_id_in: 7,
+            circuit_id_out: 8,
+            circuit_key: [0x22u8; 32],
+            cell_bytes: veil_anonymity::circuit_data::CircuitCellBytes::legacy(),
+        };
+        let mut now = 1_000_000u64;
+        table
+            .install(&install, prev, Some([0x33u8; 32]), now)
+            .expect("installs");
+        for _ in 0..touches {
+            now += secs_between;
+            table.gc(now);
+            if let Some(state) = table.lookup_forward(&prev, 7) {
+                state.touch(now);
+            } else {
+                return false;
+            }
+        }
+        now += secs_between;
+        table.gc(now);
+        table.lookup_forward(&prev, 7).is_some()
+    }
+
+    /// The heartbeat's ONLY remaining job is keeping the relay-side circuit
+    /// state out of the idle GC, so the cadence has to be checked against what
+    /// that GC actually does — not against what the const assert assumes it
+    /// does. The assert is arithmetic over two constants; this exercises
+    /// `CircuitTable::gc` itself.
+    ///
+    /// The budget is the WORST gap: two consecutive misses means three gaps at
+    /// the longest jittered draw must still fit inside the TTL.
+    #[test]
+    fn the_heartbeat_cadence_outruns_the_relays_idle_gc() {
+        assert!(
+            circuit_survives(CIRCUIT_HEARTBEAT_MAX_SECS, 6),
+            "a heartbeat at the longest jittered wait must keep the circuit installed"
+        );
+        assert!(
+            circuit_survives(CIRCUIT_HEARTBEAT_MAX_SECS * 3, 3),
+            "two consecutive misses at the longest wait must still be survivable"
+        );
+    }
+
+    /// The other half: the GC really does evict, so the test above is not
+    /// passing because nothing ever expires.
+    ///
+    /// Break-check for the pair: raise CIRCUIT_HEARTBEAT_INTERVAL_SECS past the
+    /// budget and the const assert stops the build before either runs.
+    #[test]
+    fn a_circuit_left_longer_than_the_ttl_is_evicted() {
+        let ttl = veil_anonymity::circuit_table::DEFAULT_CIRCUIT_TTL_SECS;
+        assert!(
+            !circuit_survives(ttl + 1, 1),
+            "the GC must evict a circuit idle past its TTL"
+        );
+    }
+
+    /// Every draw must land inside the advertised band, and the band must not
+    /// collapse to a point — an exactly periodic cell was the pattern this
+    /// replaces.
+    #[test]
+    fn the_heartbeat_wait_is_drawn_inside_its_band() {
+        let base = CIRCUIT_HEARTBEAT_INTERVAL.as_secs();
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..256 {
+            let w = circuit_heartbeat_wait();
+            assert!(
+                w.as_secs() >= base * 8 / 10 && w.as_secs() <= CIRCUIT_HEARTBEAT_MAX_SECS,
+                "wait {}s outside the band",
+                w.as_secs()
+            );
+            seen.insert(w.as_millis());
+        }
+        assert!(seen.len() > 32, "jitter collapsed to {} values", seen.len());
+    }
 
     #[test]
     fn circuit_env_is_strict_opt_in() {
@@ -4472,9 +4680,78 @@ mod tests {
         }
     }
 
+    /// Every send-path budget must track the POLICY, not a legacy constant.
+    ///
+    /// Two halves, and they check different things:
+    ///
+    /// * the formula still agrees bit-for-bit with the onion-stream crate's own
+    ///   `MAX_CELL` derivation *at the legacy size* — that tie is what says the
+    ///   arithmetic was moved, not rewritten;
+    /// * the live budgets follow `choose_cell_bytes`, so a policy change cannot
+    ///   leave the send path sizing against a cell nobody builds any more.
+    ///
+    /// If the policy moves again, the second half is re-derived from it — the
+    /// literal below is a statement of the current choice, not a magic number.
+    #[test]
+    fn the_send_path_budgets_track_the_policy_not_the_legacy_cell() {
+        use veil_anonymity::circuit_data::{CircuitCellBytes, LEN_PREFIX};
+
+        assert_eq!(
+            circuit_mss_for(CircuitCellBytes::legacy()),
+            MAX_CELL - COOKIE_LEN - CIRCUIT_PEER_TAG_LEN - DATA_OVERHEAD,
+            "the moved arithmetic must still reproduce the crate's own ceiling"
+        );
+
+        let policy = veil_anonymity::circuit_origin::choose_cell_bytes();
+        assert_eq!(policy.get(), 2048, "the current choice, stated on purpose");
+        assert_eq!(circuit_env_max(), policy.get() - LEN_PREFIX);
+        assert!(
+            circuit_env_max() < MAX_CELL,
+            "a policy at the legacy size would make this test vacuous"
+        );
+        assert!(
+            media_batch_body_max() > 0 && media_batch_body_max() < circuit_env_max(),
+            "the media batch budget must stay a real, bounded number"
+        );
+    }
+
+    /// A stream frame plus its splice header must fill EXACTLY one cell, at any
+    /// size a circuit may negotiate — not just the legacy one.
+    ///
+    /// This is the property that pinned the whole network to 16384: the framer
+    /// cut to a compile-time maximum, so a smaller circuit would have refused
+    /// its own frames. Asserting it across the range is what lets
+    /// `choose_cell_bytes` return something else without the data path being
+    /// re-derived by hand.
+    #[test]
+    fn a_full_frame_fills_exactly_one_cell_at_every_negotiable_size() {
+        use veil_anonymity::circuit_data::{
+            CIRCUIT_PAYLOAD_BYTES, CircuitCellBytes, LEN_PREFIX, MIN_CIRCUIT_CELL_BYTES,
+        };
+        for bytes in [MIN_CIRCUIT_CELL_BYTES, 2048, 4096, CIRCUIT_PAYLOAD_BYTES] {
+            let cell = CircuitCellBytes::new(bytes).expect("inside the negotiable range");
+            let mss = circuit_mss_for(cell);
+            let payload = vec![0xABu8; mss];
+            let data = Frame::Data {
+                stream_id: 7,
+                seq: 0,
+                win: 1024,
+                payload: &payload,
+            }
+            .encode();
+            assert_eq!(
+                LEN_PREFIX + COOKIE_LEN + CIRCUIT_PEER_TAG_LEN + data.len(),
+                bytes,
+                "a full DATA frame must fill exactly one {bytes}-byte cell"
+            );
+        }
+    }
+
     #[test]
     fn protected_circuit_envelopes_fit_one_cell_without_reducing_data_mss() {
-        let payload = [0xABu8; CIRCUIT_MSS];
+        const LEGACY_MSS: usize =
+            circuit_mss_for(veil_anonymity::circuit_data::CircuitCellBytes::legacy());
+        let payload = [0xABu8; LEGACY_MSS];
         let data = Frame::Data {
             stream_id: 7,
             seq: 0,
@@ -4488,7 +4765,7 @@ mod tests {
             "protected DATA must still exactly fill one CircuitData inner cell"
         );
         assert_eq!(
-            CIRCUIT_MSS,
+            LEGACY_MSS,
             MAX_CELL - COOKIE_LEN - CIRCUIT_PEER_TAG_LEN - DATA_OVERHEAD
         );
 

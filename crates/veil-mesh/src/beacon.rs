@@ -48,7 +48,7 @@ use std::{
     net::SocketAddr,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -495,6 +495,11 @@ pub struct BeaconSender {
     /// prefix already guarantees nonce uniqueness; this is the documented
     /// secondary input. Unused when `obfs` is `None`.
     obfs_counter: AtomicU64,
+    /// Whether the last beacon send failed, so the loop can log the TRANSITION
+    /// rather than every attempt. A beacon that cannot be sent usually cannot
+    /// be sent forever (a missing socket permission, a vanished interface), and
+    /// a warning every `interval` would be a stream nobody reads.
+    send_failing: AtomicBool,
 }
 
 impl BeaconSender {
@@ -506,6 +511,23 @@ impl BeaconSender {
         interval: Duration,
     ) -> std::io::Result<Self> {
         let socket = UdpSocket::bind(bind_addr).await?;
+        // A UDP socket refuses `sendto` to a broadcast address until the caller
+        // asks for the permission: BSD and Linux both answer EACCES, and the
+        // default `beacon_addr` is `255.255.255.255:9101`. Without this the
+        // beacon loop runs forever and no datagram ever leaves the host --
+        // measured, not deduced: a node with mesh configured and its realm
+        // bound emitted zero beacons in 35 seconds at a 10-second interval,
+        // while a plain socket WITH the flag reached a listener on the same
+        // host 3/3 from a separate process.
+        //
+        // The field is named `broadcast_addr`. Deciding whether a given IPv4
+        // address really is one needs the interface netmask -- 192.168.1.255 is
+        // indistinguishable from 192.168.1.70 without it -- and the flag grants
+        // nothing beyond what the operator already asked for by naming the
+        // address. So: ask for it whenever the target is IPv4.
+        if broadcast_addr.is_ipv4() {
+            socket.set_broadcast(true)?;
+        }
         veil_util::outbound_interface::configure_outbound_socket(
             &socket,
             if broadcast_addr.is_ipv4() {
@@ -528,6 +550,7 @@ impl BeaconSender {
             public_key_b64: String::new(),
             obfs: None,
             obfs_counter: AtomicU64::new(0),
+            send_failing: AtomicBool::new(false),
         })
     }
 
@@ -647,7 +670,30 @@ impl BeaconSender {
             };
             tokio::select! {
                 _ = tokio::time::sleep(delay) => {
-                    let _ = self.send_once().await;
+                    // `let _ =` here is what kept a dead beacon quiet. The seal
+                    // failure a few lines up in `send_once` IS logged; the send
+                    // failure was not, so a socket that refused every datagram
+                    // looked exactly like a working one. Log the TRANSITION, so
+                    // a permanent failure is one line and not one per interval.
+                    match self.send_once().await {
+                        Ok(()) => {
+                            if self.send_failing.swap(false, Ordering::Relaxed) {
+                                log::info!(
+                                    "veil-mesh: beacon to {} is sending again",
+                                    self.broadcast_addr
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            if !self.send_failing.swap(true, Ordering::Relaxed) {
+                                log::warn!(
+                                    "veil-mesh: beacon send to {} failed, mesh \
+                                     discovery stays silent until this clears: {e}",
+                                    self.broadcast_addr
+                                );
+                            }
+                        }
+                    }
                 }
                 Ok(_) = shutdown_rx.changed() => {
                     if *shutdown_rx.borrow() { break; }
@@ -691,6 +737,15 @@ pub struct BeaconReceiver {
     /// for interop with unsigned-beacon deployments is gone. `with_require_signed`
     /// survives for tests that exercise registration without minting a key.
     require_signed: bool,
+    /// Who WE are, so a beacon of ours is not mistaken for a neighbour's.
+    ///
+    /// Beacons are broadcast, and every socket bound to the beacon port gets a
+    /// copy — including this node's own. Required rather than optional
+    /// because a receiver that does not know its own name cannot tell, and the
+    /// failure is silent: the node registers itself as a neighbour and dials
+    /// its own advertised address. Observed live the moment the beacon port
+    /// became shared.
+    local_node_id: [u8; 32],
     /// Per-source deduplication window.
     ///
     /// Maps `source node_id → last_accepted Instant`. A beacon from a source
@@ -721,12 +776,14 @@ pub struct BeaconReceiver {
 impl BeaconReceiver {
     pub fn new(
         realm_id: RealmId,
+        local_node_id: [u8; 32],
         neighbors: NeighborTable,
         std_socket: Arc<std::net::UdpSocket>,
         obfs: Option<Arc<veil_udp_obfs::ObfsKey>>,
     ) -> Self {
         Self {
             realm_id,
+            local_node_id,
             neighbors,
             std_socket,
             obfs,
@@ -790,6 +847,13 @@ impl BeaconReceiver {
     /// limit exceeded, or neighbor table full). Returns `true` on acceptance.
     pub fn handle_beacon(&mut self, frame: &MeshFrame, sender_addr: SocketAddr) -> bool {
         if frame.realm_id != self.realm_id {
+            return false;
+        }
+        // Our own beacon, arriving because broadcast reaches every socket on
+        // the port — including ours. Dropped BEFORE the rate limiter, so a
+        // node cannot spend its own per-IP budget on itself and starve the
+        // neighbours it shares a host with.
+        if frame.src_node_id == self.local_node_id {
             return false;
         }
         // Amortised housekeeping: evict stale rate-limiter entries every 256 beacons
@@ -962,8 +1026,13 @@ mod tests {
         use crate::neighbor::NeighborTable;
         let table = NeighborTable::new();
         let std_sock = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
-        let mut receiver =
-            BeaconReceiver::new(RealmId([1u8; 16]), table.clone(), Arc::new(std_sock), None);
+        let mut receiver = BeaconReceiver::new(
+            RealmId([1u8; 16]),
+            [0xA7u8; 32],
+            table.clone(),
+            Arc::new(std_sock),
+            None,
+        );
         let frame = MeshFrame::new(
             RealmId([2u8; 16]), // wrong realm
             [1u8; 32],
@@ -982,9 +1051,14 @@ mod tests {
         let std_sock = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
         // legacy opt-out: exercises neighbor registration with an unsigned
         // beacon, not the signing gate (default now requires signed).
-        let mut receiver =
-            BeaconReceiver::new(RealmId([1u8; 16]), table.clone(), Arc::new(std_sock), None)
-                .with_require_signed(false);
+        let mut receiver = BeaconReceiver::new(
+            RealmId([1u8; 16]),
+            [0xA7u8; 32],
+            table.clone(),
+            Arc::new(std_sock),
+            None,
+        )
+        .with_require_signed(false);
         let frame = MeshFrame::new(
             RealmId([1u8; 16]),
             [9u8; 32],
@@ -1005,9 +1079,14 @@ mod tests {
         use crate::neighbor::NeighborTable;
         let table = NeighborTable::new();
         let std_sock = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
-        let mut receiver =
-            BeaconReceiver::new(RealmId([1u8; 16]), table.clone(), Arc::new(std_sock), None)
-                .with_require_signed(true);
+        let mut receiver = BeaconReceiver::new(
+            RealmId([1u8; 16]),
+            [0xA7u8; 32],
+            table.clone(),
+            Arc::new(std_sock),
+            None,
+        )
+        .with_require_signed(true);
         // new_basic produces an UNSIGNED beacon.
         let frame = MeshFrame::new(
             RealmId([1u8; 16]),
@@ -1035,8 +1114,13 @@ mod tests {
         use crate::neighbor::NeighborTable;
         let table = NeighborTable::new();
         let std_sock = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
-        let mut receiver =
-            BeaconReceiver::new(RealmId([1u8; 16]), table.clone(), Arc::new(std_sock), None);
+        let mut receiver = BeaconReceiver::new(
+            RealmId([1u8; 16]),
+            [0xA7u8; 32],
+            table.clone(),
+            Arc::new(std_sock),
+            None,
+        );
         let frame = MeshFrame::new(
             RealmId([1u8; 16]),
             [9u8; 32],
@@ -1073,6 +1157,66 @@ mod tests {
             rl.allow(newcomer),
             "expired subnet slots must be swept before refusing"
         );
+    }
+
+    /// The beacon socket must be ALLOWED to reach a broadcast address.
+    ///
+    /// A UDP socket answers EACCES to `sendto` a broadcast address until
+    /// `SO_BROADCAST` is set, and the default `beacon_addr` is
+    /// `255.255.255.255:9101`. Without the flag the send fails every time,
+    /// and `run` used to discard the error, so the beacon loop ran for the
+    /// life of the process while nothing left the host.
+    ///
+    /// This asserts the socket OPTION rather than a delivered datagram
+    /// deliberately: a test that broadcasts for real is at the mercy of the
+    /// sandbox it runs in, and one that silently skips is a line in the list
+    /// of things nobody checked.
+    ///
+    /// Break-check: delete the `set_broadcast` call and this reddens.
+    #[tokio::test]
+    async fn the_beacon_socket_is_allowed_to_broadcast() {
+        let sender = BeaconSender::new(
+            RealmId([7u8; 16]),
+            [1u8; 32],
+            "255.255.255.255:9101".parse().unwrap(),
+            "0.0.0.0:0".parse().unwrap(),
+            Duration::from_secs(10),
+        )
+        .await
+        .expect("bind an ephemeral send socket");
+
+        assert!(
+            sender.socket.broadcast().expect("read SO_BROADCAST back"),
+            "sendto a broadcast address answers EACCES without this flag"
+        );
+    }
+
+    /// Sending to a broadcast address actually succeeds.
+    ///
+    /// The existing sender tests all aim at a unicast `127.0.0.1` sink, which
+    /// is exactly why none of them noticed: unicast needs no permission. This
+    /// one exercises the address family the default config uses, and asserts
+    /// on the RESULT of the send rather than on a datagram arriving, so it
+    /// cannot pass for an environmental reason.
+    ///
+    /// Break-check: delete the `set_broadcast` call and this fails with
+    /// `Permission denied`.
+    #[tokio::test]
+    async fn a_broadcast_send_is_not_refused() {
+        let sender = BeaconSender::new(
+            RealmId([7u8; 16]),
+            [1u8; 32],
+            "255.255.255.255:9199".parse().unwrap(),
+            "0.0.0.0:0".parse().unwrap(),
+            Duration::from_secs(10),
+        )
+        .await
+        .expect("bind an ephemeral send socket");
+
+        sender
+            .send_once()
+            .await
+            .expect("a beacon aimed at the default broadcast address must not be refused");
     }
 
     /// Build a genuinely signed beacon frame for the replay tests.
@@ -1113,7 +1257,7 @@ mod tests {
         let std_sock = Arc::new(std::net::UdpSocket::bind("127.0.0.1:0").unwrap());
         // Rate window disabled so the probe targets the REPLAY guard and not
         // the per-source throttle that would mask it.
-        let mut receiver = BeaconReceiver::new(realm, table.clone(), std_sock, None)
+        let mut receiver = BeaconReceiver::new(realm, [0xA7u8; 32], table.clone(), std_sock, None)
             .with_dedup_window(std::time::Duration::ZERO);
 
         let (frame, _node_id) = signed_beacon_frame(realm, [0x11u8; 32]);
@@ -1152,9 +1296,14 @@ mod tests {
         use crate::neighbor::NeighborTable;
         let table = NeighborTable::new();
         let std_sock = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
-        let mut receiver =
-            BeaconReceiver::new(RealmId([1u8; 16]), table.clone(), Arc::new(std_sock), None)
-                .with_require_signed(false);
+        let mut receiver = BeaconReceiver::new(
+            RealmId([1u8; 16]),
+            [0xA7u8; 32],
+            table.clone(),
+            Arc::new(std_sock),
+            None,
+        )
+        .with_require_signed(false);
         let frame = MeshFrame::new(
             RealmId([1u8; 16]),
             [9u8; 32],
@@ -1171,9 +1320,14 @@ mod tests {
         use crate::neighbor::NeighborTable;
         let table = NeighborTable::new();
         let std_sock = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
-        let mut receiver =
-            BeaconReceiver::new(RealmId([1u8; 16]), table.clone(), Arc::new(std_sock), None)
-                .with_require_signed(false);
+        let mut receiver = BeaconReceiver::new(
+            RealmId([1u8; 16]),
+            [0xA7u8; 32],
+            table.clone(),
+            Arc::new(std_sock),
+            None,
+        )
+        .with_require_signed(false);
         let frame = MeshFrame::new(
             RealmId([1u8; 16]),
             [7u8; 32],
@@ -1213,9 +1367,14 @@ mod tests {
         use crate::neighbor::NeighborTable;
         let table = NeighborTable::new();
         let std_sock = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
-        let mut receiver =
-            BeaconReceiver::new(RealmId([1u8; 16]), table.clone(), Arc::new(std_sock), None)
-                .with_require_signed(false);
+        let mut receiver = BeaconReceiver::new(
+            RealmId([1u8; 16]),
+            [0xA7u8; 32],
+            table.clone(),
+            Arc::new(std_sock),
+            None,
+        )
+        .with_require_signed(false);
         // Rate limit is MAX_BEACONS_PER_IP_PER_WINDOW = 10 per minute.
         // Send 10+1 beacons from different node_ids (same sender IP).
         let sender: SocketAddr = "127.0.0.1:7777".parse().unwrap();
@@ -1251,7 +1410,7 @@ mod tests {
         let table = NeighborTable::new();
         let std_sock = Arc::new(std::net::UdpSocket::bind("127.0.0.1:0").unwrap());
 
-        let mut receiver = BeaconReceiver::new(realm, table.clone(), std_sock, None)
+        let mut receiver = BeaconReceiver::new(realm, [0xA7u8; 32], table.clone(), std_sock, None)
             .with_require_signed(false)
             .with_dedup_window(std::time::Duration::from_secs(60)); // long window
 
@@ -1350,6 +1509,62 @@ mod tests {
         assert_eq!(decoded[0].role_flags, 0x05);
     }
 
+    /// A node does not discover itself.
+    ///
+    /// Beacons are broadcast and the beacon port is SHARED by every node on
+    /// the host, so a node's own beacon comes straight back to it. Without
+    /// this it registers itself as a neighbour and dials its own advertised
+    /// address — observed live the moment the port became shared, as
+    /// `mesh.autodiscover.connect` naming the node's own id in its own log.
+    ///
+    /// Dropped before the rate limiter on purpose: our own beacons share the
+    /// host's source IP with every neighbour on it, so counting them would let
+    /// a node spend its per-IP budget on itself.
+    ///
+    /// Break-check: remove the `src_node_id == local_node_id` gate and this
+    /// goes green on the accept.
+    #[test]
+    fn a_node_ignores_its_own_beacon() {
+        use crate::neighbor::NeighborTable;
+        let realm = RealmId([1u8; 16]);
+        let me = [0xA7u8; 32];
+        let table = NeighborTable::new();
+        let std_sock = Arc::new(std::net::UdpSocket::bind("127.0.0.1:0").unwrap());
+        let mut receiver = BeaconReceiver::new(realm, me, table.clone(), std_sock, None)
+            .with_require_signed(false);
+
+        let mine = MeshFrame::new(
+            realm,
+            me,
+            BROADCAST_NODE_ID,
+            1,
+            MeshBeaconPayload::new_basic(me, realm).encode(),
+        );
+        let addr: SocketAddr = "127.0.0.1:9101".parse().unwrap();
+        assert!(
+            !receiver.handle_beacon(&mine, addr),
+            "our own beacon must not register us as our own neighbour"
+        );
+        assert!(
+            table.is_empty(),
+            "the neighbour table must stay empty: we are not our own neighbour"
+        );
+
+        // And a real neighbour on the same shared port still gets through.
+        let theirs_id = [0x5Bu8; 32];
+        let theirs = MeshFrame::new(
+            realm,
+            theirs_id,
+            BROADCAST_NODE_ID,
+            1,
+            MeshBeaconPayload::new_basic(theirs_id, realm).encode(),
+        );
+        assert!(
+            receiver.handle_beacon(&theirs, addr),
+            "the filter must drop only US, not everybody sharing the port"
+        );
+    }
+
     /// With dedup disabled (window = 0), all beacons from the same source pass.
     #[test]
     fn dedup_disabled_passes_all_beacons() {
@@ -1359,7 +1574,7 @@ mod tests {
         let table = NeighborTable::new();
         let std_sock = Arc::new(std::net::UdpSocket::bind("127.0.0.1:0").unwrap());
 
-        let mut receiver = BeaconReceiver::new(realm, table.clone(), std_sock, None)
+        let mut receiver = BeaconReceiver::new(realm, [0xA7u8; 32], table.clone(), std_sock, None)
             .with_require_signed(false)
             .with_dedup_window(std::time::Duration::ZERO); // disabled
 

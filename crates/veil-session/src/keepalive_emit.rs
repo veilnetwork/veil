@@ -25,16 +25,48 @@
 //! semantically-named methods (`try_arm` / `oldest` / `clear` /
 //! `is_armed`) with 5 unit tests pinning the oldest-preserved invariant.
 
+use rand_core::{OsRng, RngCore};
+
 use veil_proto::{ControlMsg, codec::encode_header, family::FrameFamily, header::FrameHeader};
 
-/// Build a `Control / Keepalive` frame ready to push to the priority
-/// queue.  Zero-byte body — keepalive is a pure liveness ping; no
-/// payload semantics.  Cheap (one header encode); idempotent —
-/// returns a fresh `Vec<u8>` on every call.
+/// Body-length range for a keepalive, in bytes.
+///
+/// The body carries nothing — the receiver never reads it (see the
+/// `ControlMsg::Keepalive` arm of the control dispatcher, which answers with an
+/// ack and never touches the body). Its whole job is to stop the frame from
+/// having ONE size.
+///
+/// A zero-body keepalive was exactly HEADER_SIZE bytes, forever, on a jittered
+/// but otherwise steady cadence. Encryption hides the contents, not the length,
+/// so that was a constant an on-path classifier could match without decrypting
+/// anything — the same shape argument that made the fixed circuit cell a
+/// liability. TLS-bucket padding would also blur it, but it is off by default
+/// (it inflated bulk traffic ~2.5x); this pays the cost only on the one frame
+/// that is otherwise a fingerprint, at a few tens of bytes per period.
+pub const KEEPALIVE_PAD_MIN: usize = 1;
+pub const KEEPALIVE_PAD_MAX: usize = 96;
+
+/// Random padding body for a keepalive or its ack. Length AND contents are
+/// drawn fresh each time; an ack draws independently of the keepalive that
+/// prompted it, so the pair does not correlate by size either.
+pub fn keepalive_pad_body() -> Vec<u8> {
+    let span = (KEEPALIVE_PAD_MAX - KEEPALIVE_PAD_MIN + 1) as u32;
+    let len = KEEPALIVE_PAD_MIN + (OsRng.next_u32() % span) as usize;
+    let mut body = vec![0u8; len];
+    OsRng.fill_bytes(&mut body);
+    body
+}
+
+/// Build a `Control / Keepalive` frame ready to push to the priority queue.
+/// The body is random padding the peer discards — see [`keepalive_pad_body`].
+/// Idempotent: returns a fresh `Vec<u8>`, of a fresh length, on every call.
 pub fn build_keepalive_frame() -> Vec<u8> {
+    let body = keepalive_pad_body();
     let mut hdr = FrameHeader::new(FrameFamily::Control as u8, ControlMsg::Keepalive as u16);
-    hdr.body_len = 0;
-    encode_header(&hdr).to_vec()
+    hdr.body_len = body.len() as u32;
+    let mut frame = encode_header(&hdr).to_vec();
+    frame.extend_from_slice(&body);
+    frame
 }
 
 /// Ledger of an in-flight keepalive-ack expectation, tied to Epic 459
@@ -110,20 +142,54 @@ mod tests {
     use super::*;
     use veil_proto::codec::decode_header;
 
-    /// `build_keepalive_frame` must encode a valid Control/Keepalive
-    /// frame with zero-byte body.  Wire shape is checked by decoding
-    /// the result back through the same codec.
+    /// `build_keepalive_frame` must encode a valid Control/Keepalive frame
+    /// whose declared body length matches the bytes actually appended. Wire
+    /// shape is checked by decoding the result back through the same codec.
     #[test]
-    fn build_frame_decodes_as_control_keepalive_zero_body() {
+    fn build_frame_decodes_as_control_keepalive_with_its_body() {
         let frame = build_keepalive_frame();
         let hdr = decode_header(&frame).expect("decodes");
         assert_eq!(hdr.family, FrameFamily::Control as u8);
         assert_eq!(hdr.msg_type, ControlMsg::Keepalive as u16);
-        assert_eq!(hdr.body_len, 0);
         assert_eq!(
             frame.len(),
-            veil_proto::header::HEADER_SIZE,
-            "zero-body keepalive must be exactly HEADER_SIZE bytes"
+            veil_proto::header::HEADER_SIZE + hdr.body_len as usize,
+            "declared body length must match the bytes on the wire"
+        );
+        assert!(
+            (KEEPALIVE_PAD_MIN..=KEEPALIVE_PAD_MAX).contains(&(hdr.body_len as usize)),
+            "body {} outside the padding range",
+            hdr.body_len
+        );
+    }
+
+    /// A keepalive must not have ONE size. Drawing many frames must produce
+    /// more than a single length — the property the padding exists for.
+    ///
+    /// Break-check: return a fixed-length body from `keepalive_pad_body` and
+    /// this goes red.
+    #[test]
+    fn a_keepalive_does_not_have_one_size() {
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..64 {
+            seen.insert(build_keepalive_frame().len());
+        }
+        assert!(
+            seen.len() > 8,
+            "keepalive sizes collapsed to {} distinct value(s)",
+            seen.len()
+        );
+    }
+
+    /// The bytes must be random too: a constant filler would be as matchable
+    /// as a constant length once a classifier looks past the size.
+    #[test]
+    fn the_padding_bytes_are_not_a_constant() {
+        let a = keepalive_pad_body();
+        let b = keepalive_pad_body();
+        assert!(
+            a != b || a.iter().collect::<std::collections::HashSet<_>>().len() > 1,
+            "padding bodies look constant"
         );
     }
 

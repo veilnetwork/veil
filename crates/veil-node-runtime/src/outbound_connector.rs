@@ -539,11 +539,13 @@ pub fn spawn_outbound_peers(
                                 // FIND_NODE responses if they prefer to stay
                                 // hidden from DHT-walks.
                                 access.dht.add_contact_trusted(
-                                    veil_dht::routing::Contact::with_caps(
+                                    veil_dht::routing::Contact::from_handshake(
                                         *peer.node_id.as_bytes(),
                                         &peer.transport,
-                                        session.remote_discovery_mode,
-                                        session.remote_dht_service,
+                                        session.remote_caps_stated.then_some((
+                                            session.remote_discovery_mode,
+                                            session.remote_dht_service,
+                                        )),
                                     ),
                                 );
                                 // promote any unverified candidate
@@ -559,7 +561,17 @@ pub fn spawn_outbound_peers(
                                         "outbound handshake → peer={} transport={} dht_service={}",
                                         veil_util::hex_short(peer.node_id.as_bytes()),
                                         veil_util::redact_addr_for_log(&peer.transport),
-                                        session.remote_dht_service,
+                                        // "unstated" is not a synonym for the
+                                        // synthesized `true` a resumed
+                                        // handshake carries — printing the
+                                        // bare bool made the log agree with a
+                                        // routing table that had just been
+                                        // told nothing.
+                                        if session.remote_caps_stated {
+                                            session.remote_dht_service.to_string()
+                                        } else {
+                                            "unstated(resumed)".to_string()
+                                        },
                                     ),
                                 );
                                 access.dispatcher.on_session_opened(

@@ -1371,6 +1371,42 @@ impl KademliaService {
         false
     }
 
+    /// May we send this peer a replica it did not ask for?
+    ///
+    /// Reads the ROUTING TABLE rather than the contact the walk handed back. The
+    /// table holds what the peer actually said at handshake; a walk result can
+    /// carry a contact assembled from a referral on the wire, and trusting that
+    /// for a policy decision is how the statement got lost the first time.
+    ///
+    /// Counts the refusal for the same reason [`Self::count_service_skip`] does:
+    /// a mechanism nobody can measure is one nobody can tell from a mechanism
+    /// that silently does nothing.
+    fn count_replica_skip(&self, node_id: &[u8; 32]) -> bool {
+        if self.peer_serves_dht(node_id) {
+            return true;
+        }
+        self.no_service_skips
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        false
+    }
+
+    /// May we hand this peer work it did not ask for?
+    ///
+    /// `true` when the peer has not told us otherwise — an unknown peer has
+    /// made no request, and treating silence as refusal would cut off every
+    /// node we have not handshaked with yet.
+    ///
+    /// This exists for the paths that are NOT candidate selection.
+    /// [`Self::count_service_skip`] covers "who do I pick out of the table";
+    /// this covers "somebody just connected, may I push to them", which no
+    /// filter on selection can reach because nothing was selected.
+    pub fn peer_serves_dht(&self, node_id: &[u8; 32]) -> bool {
+        lock!(self.inner)
+            .routing
+            .serves_dht(node_id)
+            .unwrap_or(true)
+    }
+
     /// How many candidate slots have gone to somebody else because their
     /// occupant asked not to serve. Pair it with the routing-table size: the
     /// contacts are still there, they are simply never chosen.
@@ -1567,9 +1603,26 @@ impl KademliaService {
         };
         let mut seed_ids: std::collections::HashSet<[u8; 32]> =
             seeds.iter().map(|c| c.node_id).collect();
+        // The FIND_VALUE twin of the FIND_NODE seeding fix, and it was missed
+        // when that one landed: `Contact::new` says `caps_known: false`, which
+        // reads downstream as "serves, and nobody has said otherwise", so
+        // building one here for a peer whose CAPABILITIES frame we have already
+        // read throws that frame away — one line below the filter that had just
+        // honoured it. Two identical seeding sites, one of them fixed.
+        //
+        // Silence still seeds: a peer the table has never heard from has
+        // refused nothing, and dropping it would cut off every node we have not
+        // handshaked with yet — at startup, all of them.
         for peer_id in outbox.peer_ids() {
             if seed_ids.insert(peer_id) {
-                seeds.push(Contact::new(peer_id, ""));
+                match lock!(self.inner).routing.contact(&peer_id) {
+                    Some(known) => {
+                        if self.count_service_skip(known) {
+                            seeds.push(known.clone());
+                        }
+                    }
+                    None => seeds.push(Contact::new(peer_id, "")),
+                }
             }
         }
         let timeout = Duration::from_millis(self.dht_config.find_node_timeout_ms);
@@ -1662,26 +1715,77 @@ impl KademliaService {
             return cached;
         }
 
-        let mut seeds: Vec<Contact> = {
+        // Taken before the routing lock: `peer_ids` reaches into the outbox's
+        // own lock, and acquiring the two in one order here and the other order
+        // anywhere else is how deadlocks are built.
+        let session_peers = outbox.peer_ids();
+        let seeds: Vec<Contact> = {
             let inner = lock!(self.inner);
-            inner
+            let mut seeds: Vec<Contact> = inner
                 .routing
                 .find_closest(&target, self.k())
                 .into_iter()
                 .filter(|c| self.count_service_skip(c))
                 .cloned()
-                .collect()
-        };
-        // Also seed from all peers with active sessions so nodes not yet in the
-        // routing table (or not XOR-close to the target) are still reachable.
-        // Use HashSet for O(1) dedup (was O(n²) with linear any).
-        let mut seed_ids: std::collections::HashSet<[u8; 32]> =
-            seeds.iter().map(|c| c.node_id).collect();
-        for peer_id in outbox.peer_ids() {
-            if seed_ids.insert(peer_id) {
-                seeds.push(Contact::new(peer_id, ""));
+                .collect();
+            // Also seed from all peers with active sessions so nodes not yet in
+            // the routing table (or not XOR-close to the target) are still
+            // reachable. Use HashSet for O(1) dedup (was O(n²) with linear any).
+            //
+            // Seeded from the TABLE when the table knows them. `Contact::new`
+            // says `caps_known: false`, which reads downstream as "serves, and
+            // nobody has said otherwise" — so building one here for a peer
+            // whose CAPABILITIES frame we have already read threw that frame
+            // away, one line below the filter that had just honoured it. A peer
+            // that asked not to serve, and that we have a session with, was
+            // handed back to the walk as a willing candidate; measured on a leaf
+            // advertising NO_DHT_SERVICE whose only peers were seeds that all
+            // held it marked, incoming STORE was 80% of everything it received.
+            //
+            // Nothing is dropped here: an entry that is present keeps its own
+            // statement, and one that is absent still gets the bare contact,
+            // because a peer we have never heard from has refused nothing.
+            let mut seed_ids: std::collections::HashSet<[u8; 32]> =
+                seeds.iter().map(|c| c.node_id).collect();
+            let session_peer_count = session_peers.len();
+            for peer_id in session_peers {
+                if seed_ids.insert(peer_id) {
+                    match inner.routing.contact(&peer_id) {
+                        // Knowing the answer and not acting on it is what cost
+                        // 90% of a refusing leaf's incoming traffic. A peer
+                        // that advertised NO_DHT_SERVICE is a TRANSPORT --
+                        // we route through it and we message it -- but it is
+                        // not DHT infrastructure: not a seed, not a hop, not a
+                        // store target. This was the one place the statement
+                        // was known and ignored, and because `store_replicated`
+                        // fans out over the walk RESULT rather than the table,
+                        // one unfiltered seed put the peer back in the replica
+                        // set for every key the network wrote.
+                        Some(known) => {
+                            if self.count_service_skip(known) {
+                                seeds.push(known.clone());
+                            }
+                        }
+                        // Silence is not a refusal: a peer the table has never
+                        // heard from has asked for nothing.
+                        None => seeds.push(Contact::new(peer_id, "")),
+                    }
+                }
             }
-        }
+            // A walk with no seeds finds nothing, and the caller only sees an
+            // empty result. Say why. There is deliberately NO fallback to the
+            // peers just filtered out: reaching for them is the defect, and a
+            // node whose every reachable peer declined to serve genuinely has
+            // no DHT to walk. Bootstrap is unaffected -- seeds are `core` and
+            // serve.
+            if seeds.is_empty() && session_peer_count > 0 {
+                log::debug!(
+                    "dht.walk.no_seeds session_peers={session_peer_count} \
+                     reason=every reachable peer advertised NO_DHT_SERVICE"
+                );
+            }
+            seeds
+        };
         let timeout = Duration::from_millis(self.dht_config.find_node_timeout_ms);
         let querier = super::network_querier::NetworkPeerQuerier::with_cache(
             Arc::clone(&outbox),
@@ -1740,6 +1844,24 @@ impl KademliaService {
         // reach K peers?" metric).
         let mut sent = 0usize;
         for contact in closest {
+            // The fan-out goes over the walk RESULT, and the walk result is the
+            // one place a declining peer could still reach: every candidate-
+            // selection filter sits upstream of it. Deferred on 2026-08-19 for a
+            // reason that has since been measured away -- the worry was that
+            // filtering here shrinks the replica set, and in a network with
+            // three `core` seeds that could not be done blind. It was then
+            // measured: the declining peer held 4 records (its own publications)
+            // against the seeds' 237, and accepted 0 of 506 offered. It is not
+            // in the replica set, so removing it costs nothing; the bytes were
+            // being sent and discarded.
+            //
+            // The caveat that stands is O4: this must not fire for a peer whose
+            // capabilities are UNKNOWN. `peer_serves_dht` answers `true` for a
+            // node the table has not heard from -- silence is not a refusal, and
+            // treating it as one would shrink replication for real.
+            if !self.count_replica_skip(&contact.node_id) {
+                continue;
+            }
             let request_id = self.store_req_id.fetch_add(1, Ordering::Relaxed);
             let payload = StorePayload::unsigned(key, value.clone());
             let body = payload.encode();
@@ -2093,6 +2215,307 @@ mod tests {
             .unwrap();
         let resp = svc.handle_find_value(FindValuePayload { key });
         assert!(matches!(resp, FindValueResponse::Value(v) if v == b"record"));
+    }
+
+    /// Shared silent router: the walk gets no answers, so what comes back IS
+    /// the seed set. That is the point — a seed is a store target, because
+    /// `store_replicated` fans out over this result.
+    #[cfg(test)]
+    struct SilentRouter(Vec<[u8; 32]>);
+    impl FrameRouter for SilentRouter {
+        fn send_request(
+            &self,
+            _peer: [u8; 32],
+            _request_id: u32,
+            _frame: Vec<u8>,
+        ) -> Option<tokio::sync::oneshot::Receiver<Option<Vec<u8>>>> {
+            None
+        }
+        fn peer_ids(&self) -> Vec<[u8; 32]> {
+            self.0.clone()
+        }
+    }
+
+    /// A session peer that advertised NO_DHT_SERVICE is not seeded at all.
+    ///
+    /// This REPLACES `a_session_peer_keeps_the_answer_it_gave`, which asserted
+    /// the opposite ("nothing is dropped here"). That was the previous step:
+    /// it stopped the walk from OVERWRITING the peer's answer with a blank
+    /// `Contact::new`. Preserving the answer changed no traffic, and the live
+    /// measurement said so — because the walk still seeded the peer, and
+    /// `store_replicated` sends STORE to the walk RESULT. Knowing and not
+    /// acting is not a fix. Break-check: push the contact unconditionally and
+    /// this fails.
+    #[tokio::test]
+    async fn a_session_peer_that_refused_is_not_seeded_into_the_walk() {
+        let quiet = [0x77u8; 32];
+        let svc = make_test_kademlia_service([0x0Au8; 32]);
+        svc.add_contact_trusted(Contact::with_caps(
+            quiet,
+            "tcp://quiet:9000",
+            veil_types::DiscoveryMode::Public,
+            false,
+        ));
+
+        let found = svc
+            .find_node_iterative_network([0x42u8; 32], Arc::new(SilentRouter(vec![quiet])))
+            .await;
+
+        assert!(
+            !found.iter().any(|c| c.node_id == quiet),
+            "a peer that asked not to serve must not be a walk seed — being one \
+             puts it back in the replica set for every key the network writes"
+        );
+    }
+
+    /// The filter must not overreach: a session peer that DOES serve is still
+    /// seeded, which is why the session half exists at all (a node whose table
+    /// is cold, or whose contacts are not XOR-close, still has to walk).
+    #[tokio::test]
+    async fn a_session_peer_that_serves_is_still_seeded() {
+        let willing = [0x55u8; 32];
+        let svc = make_test_kademlia_service([0x0Au8; 32]);
+        svc.add_contact_trusted(Contact::with_caps(
+            willing,
+            "tcp://willing:9000",
+            veil_types::DiscoveryMode::Public,
+            true,
+        ));
+
+        let found = svc
+            .find_node_iterative_network([0x42u8; 32], Arc::new(SilentRouter(vec![willing])))
+            .await;
+
+        assert!(
+            found.iter().any(|c| c.node_id == willing),
+            "a peer that serves must still seed the walk"
+        );
+    }
+
+    /// Silence is not a refusal. A session peer the table has never heard from
+    /// has asked for nothing, and dropping it would cut off every node we have
+    /// not yet handshaked with — including, at startup, all of them.
+    #[tokio::test]
+    async fn an_unknown_session_peer_is_still_seeded() {
+        let stranger = [0x33u8; 32];
+        let svc = make_test_kademlia_service([0x0Au8; 32]);
+
+        let found = svc
+            .find_node_iterative_network([0x42u8; 32], Arc::new(SilentRouter(vec![stranger])))
+            .await;
+
+        assert!(
+            found.iter().any(|c| c.node_id == stranger),
+            "a peer the table has never heard from has refused nothing"
+        );
+    }
+
+    /// Router that records every (peer, msg_type) it is asked to send, so a
+    /// test can tell "the walk asked it" from "the fan-out stored to it".
+    #[cfg(test)]
+    struct RecordingRouter {
+        peers: Vec<[u8; 32]>,
+        seen: std::sync::Mutex<Vec<([u8; 32], u16)>>,
+    }
+    impl FrameRouter for RecordingRouter {
+        fn send_request(
+            &self,
+            peer: [u8; 32],
+            _request_id: u32,
+            frame: Vec<u8>,
+        ) -> Option<tokio::sync::oneshot::Receiver<Option<Vec<u8>>>> {
+            let mt = veil_proto::codec::decode_header(&frame)
+                .map(|h| h.msg_type)
+                .unwrap_or(u16::MAX);
+            self.seen.lock().unwrap().push((peer, mt));
+            // Sender dropped: the walk gets no answer, so the result is the
+            // seed set — the same shape `SilentRouter` gives, but recorded.
+            let (_tx, rx) = tokio::sync::oneshot::channel();
+            Some(rx)
+        }
+        fn peer_ids(&self) -> Vec<[u8; 32]> {
+            self.peers.clone()
+        }
+    }
+
+    /// The replica fan-out must NOT overreach. A peer the table has never heard
+    /// from has refused nothing, so it is still a store target — this is the
+    /// arm that would quietly shrink replication if the gate read silence as
+    /// refusal.
+    ///
+    /// Break-check: make `count_replica_skip` return false for an unknown peer
+    /// and this goes red.
+    #[tokio::test]
+    async fn the_replica_fanout_still_stores_to_an_unknown_peer() {
+        let stranger = [0x33u8; 32];
+        let svc = make_test_kademlia_service([0x0Au8; 32]);
+        let router = Arc::new(RecordingRouter {
+            peers: vec![stranger],
+            seen: std::sync::Mutex::new(Vec::new()),
+        });
+
+        svc.store_replicated([0x42u8; 32], b"v".to_vec(), router.clone())
+            .await
+            .expect("replicates");
+
+        let store_ty = veil_proto::family::DiscoveryMsg::Store as u16;
+        assert!(
+            router
+                .seen
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(p, mt)| *p == stranger && *mt == store_ty),
+            "silence is not a refusal: an unknown peer must still get the replica"
+        );
+    }
+
+    /// The FIND_VALUE walk seeds from sessions too, and that site kept the
+    /// blank-contact bug for as long as its FIND_NODE twin had it: two
+    /// identical loops, one of them fixed on 2026-08-19 and one not. The
+    /// declining peer went on being seeded into every value lookup — which is
+    /// what a `FindNodeV2` and its follow-up `ResolveTransport` to that peer
+    /// are made of.
+    ///
+    /// Break-check: restore `Contact::new(peer_id, "")` unconditionally and the
+    /// decliner is queried again.
+    #[tokio::test]
+    async fn a_session_peer_that_refused_is_not_seeded_into_the_value_walk() {
+        let quiet = [0x77u8; 32];
+        let svc = make_test_kademlia_service([0x0Au8; 32]);
+        svc.add_contact_trusted(Contact::with_caps(
+            quiet,
+            "tcp://quiet:9000",
+            veil_types::DiscoveryMode::Public,
+            false,
+        ));
+        let router = Arc::new(RecordingRouter {
+            peers: vec![quiet],
+            seen: std::sync::Mutex::new(Vec::new()),
+        });
+
+        let _ = svc
+            .find_value_iterative_network([0x42u8; 32], router.clone())
+            .await;
+
+        assert!(
+            router.seen.lock().unwrap().is_empty(),
+            "a peer that asked not to serve must not be seeded into a value walk"
+        );
+    }
+
+    /// The same site must not overreach: silence is not a refusal, so a session
+    /// peer the table has never heard from still seeds the value walk.
+    #[tokio::test]
+    async fn an_unknown_session_peer_still_seeds_the_value_walk() {
+        let stranger = [0x33u8; 32];
+        let svc = make_test_kademlia_service([0x0Au8; 32]);
+        let router = Arc::new(RecordingRouter {
+            peers: vec![stranger],
+            seen: std::sync::Mutex::new(Vec::new()),
+        });
+
+        let _ = svc
+            .find_value_iterative_network([0x42u8; 32], router.clone())
+            .await;
+
+        assert!(
+            router
+                .seen
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(p, _)| *p == stranger),
+            "a peer we have never heard from has refused nothing"
+        );
+    }
+
+    /// The fan-out gate earns its place on a CACHED walk result.
+    ///
+    /// `find_node_iterative_network` short-circuits on a cached result, so a
+    /// result computed while a peer was still serving outlives the moment that
+    /// peer declines — its capabilities arrive at the next handshake, the cache
+    /// does not notice, and the republish tick fans out over the stale copy.
+    /// Every upstream filter has already run by then. This is the last decision
+    /// before the bytes leave, and it is the only one still standing.
+    ///
+    /// Break-check: drop the `count_replica_skip` guard in `store_replicated`
+    /// and the STORE goes to the peer that declined.
+    #[tokio::test]
+    async fn a_cached_walk_result_does_not_outlive_a_peers_refusal() {
+        let peer = [0x77u8; 32];
+        let key = [0x42u8; 32];
+        let svc = make_test_kademlia_service([0x0Au8; 32]);
+
+        // While it still served, a walk ran and its result was cached.
+        svc.add_contact_trusted(Contact::with_caps(
+            peer,
+            "tcp://p:9000",
+            veil_types::DiscoveryMode::Public,
+            true,
+        ));
+        let warm = svc
+            .find_node_iterative_network(key, Arc::new(SilentRouter(vec![peer])))
+            .await;
+        assert!(
+            warm.iter().any(|c| c.node_id == peer),
+            "precondition: the cached result must contain the peer"
+        );
+
+        // Then it declined. The cache still holds the old answer.
+        svc.add_contact_trusted(Contact::with_caps(
+            peer,
+            "tcp://p:9000",
+            veil_types::DiscoveryMode::Public,
+            false,
+        ));
+
+        let router = Arc::new(RecordingRouter {
+            peers: vec![peer],
+            seen: std::sync::Mutex::new(Vec::new()),
+        });
+        svc.store_replicated(key, b"v".to_vec(), router.clone())
+            .await
+            .expect("replicates");
+
+        let store_ty = veil_proto::family::DiscoveryMsg::Store as u16;
+        assert!(
+            !router
+                .seen
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(p, mt)| *p == peer && *mt == store_ty),
+            "a stale cached result must not put a declining peer back in the \
+             replica set"
+        );
+    }
+
+    /// The refusal arm of the same gate, stated on the predicate.
+    #[test]
+    fn the_replica_gate_refuses_a_known_decliner_and_allows_silence() {
+        let quiet = [0x77u8; 32];
+        let stranger = [0x33u8; 32];
+        let svc = make_test_kademlia_service([0x0Au8; 32]);
+        svc.add_contact_trusted(Contact::with_caps(
+            quiet,
+            "tcp://quiet:9000",
+            veil_types::DiscoveryMode::Public,
+            false,
+        ));
+
+        assert!(
+            !svc.count_replica_skip(&quiet),
+            "a known decliner is skipped"
+        );
+        assert!(
+            svc.count_replica_skip(&stranger),
+            "a peer we have never heard from has refused nothing"
+        );
+        assert!(
+            svc.no_dht_service_skips() >= 1,
+            "the refusal must be counted, or nobody can tell it from a no-op"
+        );
     }
 
     #[tokio::test]

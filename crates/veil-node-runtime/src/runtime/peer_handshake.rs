@@ -59,7 +59,16 @@ pub struct RemoteHandshakeInfo {
     pub remote_discovery_mode: DiscoveryMode,
     /// False when the peer advertised `NO_DHT_SERVICE`: keep the session,
     /// keep it resolvable, but never pick it as a DHT candidate.
+    ///
+    /// Meaningless unless [`Self::remote_caps_stated`] is true — a resumed
+    /// handshake synthesizes "serves" without asking the peer.
     pub remote_dht_service: bool,
+    /// Whether [`Self::remote_discovery_mode`] and [`Self::remote_dht_service`]
+    /// were STATED by the peer in this handshake. False on the fast-resume
+    /// path, which invents a zero capabilities payload. Callers that write
+    /// these into shared state must leave the stored values alone when this is
+    /// false — see `veil_dht::routing::Contact::caps_known`.
+    pub remote_caps_stated: bool,
     /// Peer explicitly advertised the authenticated realtime DATAGRAM lane.
     /// False on legacy and fast-resumed handshakes.
     pub supports_realtime_datagrams: bool,
@@ -778,6 +787,7 @@ pub async fn register_connection_session(
                         session_keys: r.session_keys,
                         remote_discovery_mode,
                         remote_dht_service,
+                        remote_caps_stated: r.remote_caps_stated,
                         supports_realtime_datagrams: r
                             .remote_capabilities
                             .supports_realtime_datagrams(),
@@ -1203,6 +1213,7 @@ pub async fn register_connection_session(
         nonce: remote_identity.nonce,
         remote_discovery_mode: remote_identity.remote_discovery_mode,
         remote_dht_service: remote_identity.remote_dht_service,
+        remote_caps_stated: remote_identity.remote_caps_stated,
         // Transient when accepted past the data cap (into the headroom only).
         referral: referral_session,
         reserved_outbox_rx,
