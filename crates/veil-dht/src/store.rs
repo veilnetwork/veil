@@ -1186,6 +1186,31 @@ impl TieredStore {
         None
     }
 
+    /// Read without moving the entry between tiers or re-dating it.
+    ///
+    /// [`Self::get`] promotes a cold hit to hot and stamps it `Instant::now()`.
+    /// That is right for OUR OWN lookups: a key this node keeps asking for
+    /// belongs in the hot tier. It is wrong for the answer to a remote
+    /// FIND_VALUE, where reading is something anyone may ask for and each ask
+    /// re-dates the record. Alternating eviction and reads, a peer keeps a
+    /// record alive past the retention its publisher asked for and pays
+    /// nothing for it (report12 V-M7).
+    ///
+    /// This is only the half that stops a REMOTE reader from extending a
+    /// record. The absolute expiry is still not carried across a tier move, so
+    /// a promotion driven by our own lookups still re-dates — that needs the
+    /// original insertion stamp stored in the cold tier, which changes what
+    /// both cold backends keep on disk.
+    ///
+    /// Returns an owned value because the cold tier hands back owned bytes.
+    /// Taking `&self` is the point: this path cannot mutate the store.
+    pub fn get_no_promote(&self, key: &[u8; 32]) -> Option<Vec<u8>> {
+        if let Some((value, _)) = self.hot.get(key) {
+            return Some(value.clone());
+        }
+        self.cold.get(key)
+    }
+
     /// Get a value AND its hot-tier `inserted_at` timestamp.  Used by
     /// layers that need per-entry freshness independent of the store-
     /// wide TTL (audit batch 2026-05-25 phase N — anycast resolve uses
@@ -1408,6 +1433,16 @@ impl TieredStore {
     }
 
     /// Cold tier size.
+    /// `true` if `key` currently sits in the hot tier.
+    ///
+    /// Tier PLACEMENT, not tier size: a promotion is byte- and count-neutral
+    /// because it demotes something else to make room, so `cold_len` alone
+    /// cannot see one happen. A test that watched the counts watched the one
+    /// number a promotion is guaranteed not to move.
+    pub fn is_hot(&self, key: &[u8; 32]) -> bool {
+        self.hot.contains_key(key)
+    }
+
     pub fn cold_len(&self) -> usize {
         self.cold.len()
     }
@@ -1729,6 +1764,34 @@ mod tests {
         store.get(&[1u8; 32]); // promote [1] back to hot, demote [2]
         assert_eq!(store.hot_len(), 1);
         assert!(store.hot.contains_key(&[1u8; 32]));
+    }
+
+    /// report12 V-M7: the read that answers a REMOTE FIND_VALUE must leave the
+    /// entry where it is. `promotion_on_access` above pins the opposite for our
+    /// own lookups, and both are wanted — the difference is who asked.
+    #[test]
+    fn a_non_promoting_read_leaves_both_tiers_alone() {
+        let mut store = TieredStore::new(1, 10);
+        store.put([1u8; 32], b"a".to_vec());
+        store.put([2u8; 32], b"b".to_vec()); // [1] → cold
+        assert_eq!(store.cold_len(), 1);
+
+        assert_eq!(
+            store.get_no_promote(&[1u8; 32]),
+            Some(b"a".to_vec()),
+            "a cold entry must still be answerable"
+        );
+        assert_eq!(store.cold_len(), 1, "reading it must not promote it");
+        assert!(
+            store.hot.contains_key(&[2u8; 32]),
+            "and must not demote whatever was hot to make room"
+        );
+        assert_eq!(
+            store.get_no_promote(&[2u8; 32]),
+            Some(b"b".to_vec()),
+            "a hot entry reads the same way"
+        );
+        assert_eq!(store.hot_len(), 1);
     }
 
     /// report6 V-M1: a snapshot must carry provenance and remaining lifetime
