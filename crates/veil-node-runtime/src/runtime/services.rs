@@ -44,7 +44,6 @@ struct EmbeddedServicesRegistry {
     by_node: BTreeMap<[u8; 32], NodeServices>,
 }
 
-
 /// The most PEX-learned peer rows this node keeps.
 ///
 /// Each one costs a map entry, a line in `discovered_peers.json` and an

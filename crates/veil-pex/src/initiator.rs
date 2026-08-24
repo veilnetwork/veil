@@ -1018,11 +1018,7 @@ mod tests {
         )
         .await;
 
-        let kept = pex_state
-            .lock()
-            .unwrap()
-            .discovered_peers
-            .len();
+        let kept = pex_state.lock().unwrap().discovered_peers.len();
         let sent = rx.try_recv().expect("connect_tx received a batch");
         assert_eq!(
             sent.len(),

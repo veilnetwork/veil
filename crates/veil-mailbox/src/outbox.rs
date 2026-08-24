@@ -369,7 +369,8 @@ impl Outbox {
                         .get(META_KEY_TOTAL_BYTES)?
                         .map(|v| v.value())
                         .unwrap_or(0);
-                    let new_total = current.saturating_sub(crate::billable_bytes(blob.len() as u64));
+                    let new_total =
+                        current.saturating_sub(crate::billable_bytes(blob.len() as u64));
                     meta.insert(META_KEY_TOTAL_BYTES, new_total)?;
                     should_commit = true;
                     true

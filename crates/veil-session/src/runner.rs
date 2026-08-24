@@ -460,6 +460,11 @@ pub struct HotStandbyState {
     /// Auto-swap controller — spawned warm-probe + flap-damping.
     /// `None` disables the auto-trigger feature.
     pub controller: Option<std::sync::Arc<crate::hot_standby::HotStandbyController>>,
+    /// Set by `register_swap_channel` so a rekey can re-file this
+    /// session's row under its new `session_id`. `None` whenever nothing
+    /// was registered — a bootstrap session, or a fixture that wired
+    /// `swap_rx` by hand.
+    pub swap_registry: Option<crate::handoff::SwapRegistryHandle>,
     /// Consecutive write-error count required to fire the controller.
     /// `0` disables the counter even when a `controller` is wired.
     /// Triggered AFTER a primary write fails — works for half-dead
@@ -1126,6 +1131,12 @@ impl SessionRunner {
             self.crypto.tx_cipher = Some(SessionCipher::new(&new_keys.tx_key, true));
             self.crypto.rx_cipher = Some(SessionCipher::new(&new_keys.rx_key, true));
             self.session_id = new_keys.session_id;
+            // The swap registry filed this session under the id it had
+            // when it registered, and the auto handoff looks it up by the
+            // CURRENT id (report12 V-M11).
+            if let Some(handle) = self.hot_standby.swap_registry.as_ref() {
+                handle.rekey(self.session_id);
+            }
             rekey.record_rekey_complete(tokio::time::Instant::now());
             // l: demoted to DEBUG.
             self.logger.debug(
@@ -2354,6 +2365,12 @@ impl SessionRunner {
             self.crypto.tx_cipher = Some(SessionCipher::new(&new_keys.tx_key, true));
             self.crypto.rx_cipher = Some(SessionCipher::new(&new_keys.rx_key, true));
             self.session_id = new_keys.session_id;
+            // The swap registry filed this session under the id it had
+            // when it registered, and the auto handoff looks it up by the
+            // CURRENT id (report12 V-M11).
+            if let Some(handle) = self.hot_standby.swap_registry.as_ref() {
+                handle.rekey(self.session_id);
+            }
             rekey.record_rekey_complete(tokio::time::Instant::now());
             // l: demoted to DEBUG.
             self.logger.debug(
@@ -2481,7 +2498,9 @@ impl SessionRunner {
             .map(|(t, _, _)| t)
             .unwrap_or([0u8; 32]);
         let tx = self.with_swap_inbox();
-        Some(registry.register(self.session_id, self.peer_id.into(), tx, tx_key))
+        let guard = registry.register(self.session_id, self.peer_id.into(), tx, tx_key);
+        self.hot_standby.swap_registry = Some(guard.handle());
+        Some(guard)
     }
 }
 

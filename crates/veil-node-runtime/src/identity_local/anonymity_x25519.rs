@@ -105,7 +105,7 @@ pub fn load_or_create(veil_dir: &Path) -> std::io::Result<x25519_dalek::StaticSe
                     "anonymity X25519 sk vanished between create and read",
                 )
             })
-        },
+        }
         Err(e) => Err(e),
     }
 }
@@ -263,7 +263,10 @@ mod tests {
             .collect();
 
         let keys: Vec<[u8; 32]> = handles.into_iter().map(|h| h.join().unwrap()).collect();
-        let on_disk = load(&dir).unwrap().expect("a key must be published").to_bytes();
+        let on_disk = load(&dir)
+            .unwrap()
+            .expect("a key must be published")
+            .to_bytes();
         for (i, k) in keys.iter().enumerate() {
             assert_eq!(
                 *k, on_disk,

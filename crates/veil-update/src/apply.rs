@@ -909,11 +909,11 @@ mod tests {
         std::fs::set_permissions(&bin_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
 
         match err {
-            Err(ApplyError::InstallVisibleNotDurable { .. }) => {},
+            Err(ApplyError::InstallVisibleNotDurable { .. }) => {}
             other => {
                 let _ = std::fs::remove_dir_all(&dir);
                 panic!("expected InstallVisibleNotDurable, got {other:?}");
-            },
+            }
         }
         assert_eq!(
             store.read_release_unix().unwrap(),

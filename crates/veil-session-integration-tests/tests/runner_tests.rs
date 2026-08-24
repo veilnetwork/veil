@@ -324,6 +324,7 @@ async fn runner_ping_pong() {
         peer_public_key: None,
         peer_nonce: None,
         hot_standby: veil_session::runner::HotStandbyState {
+            swap_registry: None,
             swap_rx: None,
             handoff_registry: None,
             handoff_ack_waiters: None,
@@ -419,6 +420,7 @@ async fn runner_aead_encrypt_decrypt_round_trip() {
         peer_public_key: None,
         peer_nonce: None,
         hot_standby: veil_session::runner::HotStandbyState {
+            swap_registry: None,
             swap_rx: None,
             handoff_registry: None,
             handoff_ack_waiters: None,
@@ -520,18 +522,20 @@ async fn runner_aead_encrypt_decrypt_round_trip() {
 /// it: `cargo test -p veil-session-integration-tests --test runner_tests \
 /// the_swap_registry_follows -- --ignored`.
 ///
-/// What the fix costs, measured rather than guessed: the registry needs a
-/// `rekey` that carries the row to the new id, the guard needs to remove by the
-/// CURRENT id rather than the one it captured (otherwise the moved row leaks
-/// for the life of the process), and the runner needs to hold its registry and
-/// id cell to do the carrying. That last part is the expensive one —
-/// `SessionRunner` is built by struct literal in 33 places, so a new field
-/// touches all of them. Every piece was written and compiled while this test
-/// was made; what stopped it being shipped is that the churn belongs in a
-/// change of its own, in a failover path this test only half covers.
+/// The fix is three pieces: `SessionSwapRegistry::rekey` carries the row over,
+/// the guard removes by the CURRENT id rather than the one it captured
+/// (otherwise the moved row leaks for the life of the process), and the runner
+/// keeps a `SwapRegistryHandle` to do the carrying at both rekey completions.
+///
+/// The handle lives in `HotStandbyState`, beside the `swap_rx` it belongs
+/// with, rather than in `SessionRunner` — that is what kept the change to one
+/// added line per fixture instead of a new argument through every construction
+/// site.
+///
+/// What deliberately does NOT move is the stored `tx_key`: both peers seal and
+/// verify `HandoffAttach` with the HANDSHAKE keys, which a rekey leaves alone.
+/// Rotating it here would break the warm probe this row exists to feed.
 #[tokio::test]
-#[ignore = "report12 V-M11: proven defect, fix needs the runner to own its \
-            registry row — see the note above"]
 async fn the_swap_registry_follows_the_session_across_a_rekey() {
     use tokio::io::AsyncReadExt;
     use veil_crypto::session_cipher::SessionCipher;
@@ -557,9 +561,7 @@ async fn the_swap_registry_follows_the_session_across_a_rekey() {
 
     let (mut client, server) = tokio::io::duplex(65_536);
     let ban_list = Arc::clone(&dispatcher.abuse.ban_list);
-    let violation_tracker_arc = Arc::clone(&dispatcher.abuse.violation_tracker);
-    let violation_tracker = Arc::clone(&violation_tracker_arc);
-    let initial_violations = lock!(violation_tracker_arc).count(&peer_id);
+    let violation_tracker = Arc::clone(&dispatcher.abuse.violation_tracker);
     let logger = Arc::clone(&dispatcher.logger);
     let mut runner = SessionRunner {
         stream: Box::new(server),
@@ -606,6 +608,7 @@ async fn the_swap_registry_follows_the_session_across_a_rekey() {
         peer_public_key: None,
         peer_nonce: None,
         hot_standby: veil_session::runner::HotStandbyState {
+            swap_registry: None,
             swap_rx: None,
             handoff_registry: None,
             handoff_ack_waiters: None,
@@ -618,7 +621,7 @@ async fn the_swap_registry_follows_the_session_across_a_rekey() {
     // The registration the production paths make (outbound_connector.rs:647,
     // runtime/mod.rs:6048 and 6799): once, with the INITIAL session id.
     let swap_registry = Arc::new(veil_session::handoff::SessionSwapRegistry::new());
-    let _swap_guard = runner
+    let swap_guard = runner
         .register_swap_channel(&swap_registry)
         .expect("a non-zero session id must register");
     assert!(
@@ -707,6 +710,18 @@ async fn the_swap_registry_follows_the_session_across_a_rekey() {
 
     drop(client);
     let _ = server_task.await;
+
+    // The guard is what removes the row, so after a carry it has to remove the
+    // row that is actually there. A guard still naming the id it captured at
+    // registration would leave the moved row behind for the life of the
+    // process — and a lookup of that id later hands a warm socket to a session
+    // that is gone.
+    drop(swap_guard);
+    assert!(
+        swap_registry.is_empty(),
+        "the moved row outlived its guard: {} left behind",
+        swap_registry.len(),
+    );
 }
 
 /// regression guard: a manually-driven rekey exchange exercises
@@ -796,6 +811,7 @@ async fn runner_rekey_grace_recovers_inflight_old_encrypted_frames() {
         peer_public_key: None,
         peer_nonce: None,
         hot_standby: veil_session::runner::HotStandbyState {
+            swap_registry: None,
             swap_rx: None,
             handoff_registry: None,
             handoff_ack_waiters: None,
@@ -1039,6 +1055,7 @@ async fn runner_rekey_emits_observability_counters() {
         peer_public_key: None,
         peer_nonce: None,
         hot_standby: veil_session::runner::HotStandbyState {
+            swap_registry: None,
             swap_rx: None,
             handoff_registry: None,
             handoff_ack_waiters: None,
@@ -1255,6 +1272,7 @@ async fn runner_rekey_storm_triggers_cap_eviction_once_after_four_rekeys() {
         peer_public_key: None,
         peer_nonce: None,
         hot_standby: veil_session::runner::HotStandbyState {
+            swap_registry: None,
             swap_rx: None,
             handoff_registry: None,
             handoff_ack_waiters: None,
@@ -1582,6 +1600,7 @@ async fn phase650b_mutual_rekey_collision_kept_init_when_local_node_id_lower() {
         peer_public_key: None,
         peer_nonce: None,
         hot_standby: veil_session::runner::HotStandbyState {
+            swap_registry: None,
             swap_rx: None,
             handoff_registry: None,
             handoff_ack_waiters: None,
@@ -1898,6 +1917,7 @@ async fn phase650b_mutual_rekey_collision_aborted_init_when_local_node_id_higher
         peer_public_key: None,
         peer_nonce: None,
         hot_standby: veil_session::runner::HotStandbyState {
+            swap_registry: None,
             swap_rx: None,
             handoff_registry: None,
             handoff_ack_waiters: None,
@@ -2166,6 +2186,7 @@ async fn phase650b_rekey_state_survives_transport_swap() {
         peer_public_key: None,
         peer_nonce: None,
         hot_standby: veil_session::runner::HotStandbyState {
+            swap_registry: None,
             swap_rx: None,
             handoff_registry: None,
             handoff_ack_waiters: None,
@@ -2443,6 +2464,7 @@ async fn phase650b_rekey_bypasses_low_battery_deferral_window() {
         peer_public_key: None,
         peer_nonce: None,
         hot_standby: veil_session::runner::HotStandbyState {
+            swap_registry: None,
             swap_rx: None,
             handoff_registry: None,
             handoff_ack_waiters: None,
@@ -2712,6 +2734,7 @@ async fn phase650b_rekey_state_survives_hot_standby_trigger_firing() {
         peer_public_key: None,
         peer_nonce: None,
         hot_standby: veil_session::runner::HotStandbyState {
+            swap_registry: None,
             swap_rx: None,
             handoff_registry: None,
             handoff_ack_waiters: None,
@@ -2970,6 +2993,7 @@ async fn phase650b_idle_timeout_fires_during_awaiting_ack_when_peer_silent() {
         peer_public_key: None,
         peer_nonce: None,
         hot_standby: veil_session::runner::HotStandbyState {
+            swap_registry: None,
             swap_rx: None,
             handoff_registry: None,
             handoff_ack_waiters: None,
@@ -3128,6 +3152,7 @@ async fn runner_delivery_forward_relayed_to_next_hop() {
         peer_public_key: None,
         peer_nonce: None,
         hot_standby: veil_session::runner::HotStandbyState {
+            swap_registry: None,
             swap_rx: None,
             handoff_registry: None,
             handoff_ack_waiters: None,
@@ -3243,6 +3268,7 @@ async fn idle_session_closed_after_timeout() {
         peer_public_key: None,
         peer_nonce: None,
         hot_standby: veil_session::runner::HotStandbyState {
+            swap_registry: None,
             swap_rx: None,
             handoff_registry: None,
             handoff_ack_waiters: None,
@@ -3324,6 +3350,7 @@ async fn runner_truncated_header_exits_cleanly() {
         peer_public_key: None,
         peer_nonce: None,
         hot_standby: veil_session::runner::HotStandbyState {
+            swap_registry: None,
             swap_rx: None,
             handoff_registry: None,
             handoff_ack_waiters: None,
@@ -3425,6 +3452,7 @@ async fn rekey_completes_and_subsequent_frames_decrypt() {
         peer_public_key: None,
         peer_nonce: None,
         hot_standby: veil_session::runner::HotStandbyState {
+            swap_registry: None,
             swap_rx: None,
             handoff_registry: None,
             handoff_ack_waiters: None,
@@ -3611,6 +3639,7 @@ fn make_mlkem_runner(
         peer_public_key: None,
         peer_nonce: None,
         hot_standby: veil_session::runner::HotStandbyState {
+            swap_registry: None,
             swap_rx: None,
             handoff_registry: None,
             handoff_ack_waiters: None,
@@ -4028,6 +4057,7 @@ fn make_swap_runner(
         peer_public_key: None,
         peer_nonce: None,
         hot_standby: veil_session::runner::HotStandbyState {
+            swap_registry: None,
             swap_rx: None,
             handoff_registry: None,
             handoff_ack_waiters: None,
@@ -4187,6 +4217,7 @@ async fn swap_preserves_aead_counter_across_transports() {
         peer_public_key: None,
         peer_nonce: None,
         hot_standby: veil_session::runner::HotStandbyState {
+            swap_registry: None,
             swap_rx: None,
             handoff_registry: None,
             handoff_ack_waiters: None,
@@ -4334,6 +4365,7 @@ async fn handoff_init_stashes_registry_and_emits_ack() {
         peer_public_key: None,
         peer_nonce: None,
         hot_standby: veil_session::runner::HotStandbyState {
+            swap_registry: None,
             swap_rx: None,
             handoff_registry: Some(Arc::clone(&registry)),
             handoff_ack_waiters: None,
@@ -4467,6 +4499,7 @@ async fn handoff_ack_forwards_nonce_to_waiting_initiator() {
         peer_public_key: None,
         peer_nonce: None,
         hot_standby: veil_session::runner::HotStandbyState {
+            swap_registry: None,
             swap_rx: None,
             handoff_registry: None,
             handoff_ack_waiters: Some(std::sync::Arc::clone(&waiters)),
@@ -4564,6 +4597,7 @@ async fn handoff_init_with_malformed_body_is_a_violation() {
         peer_public_key: None,
         peer_nonce: None,
         hot_standby: veil_session::runner::HotStandbyState {
+            swap_registry: None,
             swap_rx: None,
             handoff_registry: Some(Arc::clone(&registry)),
             handoff_ack_waiters: None,
@@ -4705,6 +4739,7 @@ async fn end_to_end_handoff_pipeline_via_peek_and_dispatch() {
         peer_public_key: None,
         peer_nonce: None,
         hot_standby: veil_session::runner::HotStandbyState {
+            swap_registry: None,
             swap_rx: None,
             handoff_registry: Some(Arc::clone(&handoff_reg)),
             handoff_ack_waiters: None,
@@ -5003,6 +5038,7 @@ async fn auto_trigger_fires_on_primary_write_error() {
         peer_public_key: None,
         peer_nonce: None,
         hot_standby: veil_session::runner::HotStandbyState {
+            swap_registry: None,
             swap_rx: None,
             handoff_registry: None,
             handoff_ack_waiters: None,
@@ -5202,6 +5238,7 @@ async fn rx_stall_fires_proactive_trigger_before_idle_timeout() {
         peer_public_key: None,
         peer_nonce: None,
         hot_standby: veil_session::runner::HotStandbyState {
+            swap_registry: None,
             swap_rx: None,
             handoff_registry: None,
             handoff_ack_waiters: None,
@@ -5337,6 +5374,7 @@ async fn keepalive_probe_timeout_fires_trigger_when_no_ack() {
         peer_public_key: None,
         peer_nonce: None,
         hot_standby: veil_session::runner::HotStandbyState {
+            swap_registry: None,
             swap_rx: None,
             handoff_registry: None,
             handoff_ack_waiters: None,
@@ -5757,6 +5795,7 @@ async fn q7_rotation_deadline_fires_and_runner_returns_when_no_controller() {
         peer_public_key: None,
         peer_nonce: None,
         hot_standby: veil_session::runner::HotStandbyState {
+            swap_registry: None,
             swap_rx: None,
             // No controller → fire_hot_standby_trigger returns false →
             // fallback to graceful close.
@@ -6035,6 +6074,7 @@ fn make_migration_test_runner(
         peer_public_key,
         peer_nonce: None,
         hot_standby: veil_session::runner::HotStandbyState {
+            swap_registry: None,
             swap_rx: None,
             handoff_registry: None,
             handoff_ack_waiters: None,
@@ -6434,6 +6474,7 @@ fn make_mobility_blackhole_runner(outbox_rx: mpsc::Receiver<PriorityFrame>) -> S
         peer_public_key: None,
         peer_nonce: None,
         hot_standby: veil_session::runner::HotStandbyState {
+            swap_registry: None,
             swap_rx: None,
             handoff_registry: None,
             handoff_ack_waiters: None,

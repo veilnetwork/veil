@@ -473,6 +473,7 @@ pub fn spawn_outbound_peers(
                                     peer_public_key:                Some(session.public_key.clone()),
                                     peer_nonce:                     Some(session.nonce.clone()),
                                     hot_standby: veil_session::runner::HotStandbyState {
+                                        swap_registry: None,
                                         swap_rx: None,
                                         handoff_registry: Some(Arc::clone(&access.handoff.registry)),
                                         handoff_ack_waiters: Some(Arc::clone(&access.handoff.ack_waiters)),
