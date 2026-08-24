@@ -135,8 +135,20 @@ impl PexState {
         self.active_walks = self.outstanding_walks.len() as u32;
     }
 
-    pub fn add_peers(&mut self, peers: Vec<PexPeer>, max: usize) {
+    /// Add peers to the walk table and return the ones it ACTUALLY took.
+    ///
+    /// The return value is not a convenience. Every filter below — binding,
+    /// wildcard, duplicate, subnet diversity, capacity — decides whether this
+    /// node keeps a row, and the runtime consumes the same list to decide
+    /// whether to open a connector task for it. While this returned nothing,
+    /// the two decisions were made from different lists: the caller forwarded
+    /// everything it had offered, so rows this table refused still became
+    /// runtime peers with their own indefinitely-retrying connector, and the
+    /// configured `max_peers` bounded the table while bounding nothing that
+    /// costs memory, sockets or battery.
+    pub fn add_peers(&mut self, peers: Vec<PexPeer>, max: usize) -> Vec<PexPeer> {
         let now = Instant::now();
+        let mut accepted = Vec::new();
         for peer in peers {
             // verify node_id ↔ public_key binding BEFORE
             // any storage / persistence path. Per the canonical rule
@@ -187,8 +199,10 @@ impl PexState {
                     continue;
                 }
             }
+            accepted.push(peer.clone());
             self.discovered_peers.push((peer, now));
         }
+        accepted
     }
 
     fn check_subnet_diversity(&self, peer: &PexPeer) -> bool {
@@ -603,18 +617,23 @@ async fn handle_result(
         .take(MAX_PEERS_PER_PEX_RESULT)
         .cloned()
         .collect();
-    {
+    let accepted = {
         let mut state = pex_state.lock().unwrap_or_else(|p| p.into_inner());
         // Retire the ticket this Result belongs to. The count used to be
         // decremented for ANY Result, so an unsolicited one with an invented
         // walk_id drove the gauge toward zero while real walks were still open.
         state.retire_walk(result.walk_id);
-        state.add_peers(peers.clone(), config.max_peers);
-    }
+        state.add_peers(peers, config.max_peers)
+    };
 
-    // Notify runtime to attempt connections to newly discovered peers.
-    if !peers.is_empty() {
-        let _ = connect_tx.try_send(peers);
+    // Notify runtime to attempt connections to newly discovered peers —
+    // ONLY the ones the table above actually kept. A Result may carry ten
+    // well-formed contacts of which this node wants none: all duplicates, all
+    // from one /24, or simply arriving at a full table. Forwarding those anyway
+    // handed the runtime a peer row and a connector task per node id, which is
+    // the resource a `max_peers` reading of the config says is bounded.
+    if !accepted.is_empty() {
+        let _ = connect_tx.try_send(accepted);
     }
 }
 
@@ -634,20 +653,17 @@ fn handle_learned_peer(
     if !pex_binding_ok(&peer) || is_wildcard_transport(&peer.transport) {
         return;
     }
-    // Only nudge a dial when this is a genuinely NEW contact, so a steady
-    // stream of relayed walks for already-known peers doesn't spam the connect
-    // path (the directional dedup would reject those anyway). `add_peers`
-    // itself dedups storage; we check membership first only to gate the dial.
-    let is_new = {
+    // Only nudge a dial for a contact the walk table ACCEPTED. Novelty alone
+    // used to be the gate, which let through the rows `add_peers` then refused
+    // for subnet diversity or for arriving at a full table: new to this node,
+    // never stored by it, and still given a connector task of its own.
+    let accepted = {
         let mut state = pex_state.lock().unwrap_or_else(|p| p.into_inner());
-        let already = state
-            .discovered_peers
-            .iter()
-            .any(|(p, _)| p.node_id == peer.node_id);
-        state.add_peers(vec![peer.clone()], config.max_peers);
-        !already
+        !state
+            .add_peers(vec![peer.clone()], config.max_peers)
+            .is_empty()
     };
-    if is_new {
+    if accepted {
         logger.info(
             "pex.learned_peer",
             &format!(
@@ -949,6 +965,94 @@ mod tests {
             "only the binding-valid peer is forwarded to connect_tx"
         );
         assert_eq!(sent[0].node_id, good_id);
+    }
+
+    /// Only rows the walk table KEPT may reach the runtime.
+    ///
+    /// A peer that passes the binding and wildcard checks can still be refused
+    /// by the table — a duplicate, a third address from one /24, or simply one
+    /// too many. The runtime opens a peer row and an indefinitely-retrying
+    /// connector task per node id it is handed, so forwarding the refused rows
+    /// meant `max_peers` bounded the table and nothing that costs memory,
+    /// sockets or battery. One authenticated peer sending well-formed Results
+    /// in a loop was enough.
+    #[tokio::test]
+    async fn only_rows_the_table_kept_reach_the_runtime() {
+        use veil_proto::pex::PexResult;
+
+        struct NoopLogger;
+        impl PexLogger for NoopLogger {
+            fn info(&self, _: &str, _: &str) {}
+            fn warn(&self, _: &str, _: &str) {}
+        }
+
+        // Well-formed contacts: node_id == BLAKE3(public_key), dialable
+        // address, all inside one /24 so the diversity rule refuses the third
+        // onwards. Nothing here is malformed; the table simply does not want
+        // them all.
+        let peer = |n: u8| {
+            let pk = vec![n; 32];
+            PexPeer {
+                node_id: *blake3::hash(&pk).as_bytes(),
+                transport: format!("tcp://10.9.9.{n}:9000"),
+                public_key: pk,
+                nonce: n as u64,
+            }
+        };
+        let offered: Vec<PexPeer> = (1u8..=6).map(peer).collect();
+
+        let pex_state = Arc::new(Mutex::new(PexState::new()));
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<PexPeer>>(4);
+        let config = PexConfig::default();
+
+        handle_result(
+            &PexResult {
+                walk_id: 1,
+                peers: offered.clone(),
+            },
+            [0u8; 32],
+            &config,
+            &pex_state,
+            &tx,
+            &NoopLogger,
+        )
+        .await;
+
+        let kept = pex_state
+            .lock()
+            .unwrap()
+            .discovered_peers
+            .len();
+        let sent = rx.try_recv().expect("connect_tx received a batch");
+        assert_eq!(
+            sent.len(),
+            kept,
+            "the runtime is handed exactly what the table kept, not what was offered"
+        );
+        assert!(
+            sent.len() < offered.len(),
+            "the fixture must actually exercise a refusal, or it proves nothing"
+        );
+
+        // The same contacts again: every one is now a duplicate, so the table
+        // takes nothing and the runtime must hear nothing. This is the shape a
+        // flood takes — repeat Results costing a peer row and a task each.
+        handle_result(
+            &PexResult {
+                walk_id: 2,
+                peers: offered,
+            },
+            [0u8; 32],
+            &config,
+            &pex_state,
+            &tx,
+            &NoopLogger,
+        )
+        .await;
+        assert!(
+            rx.try_recv().is_err(),
+            "a Result that adds nothing must not wake the connect path at all"
+        );
     }
 
     #[test]
