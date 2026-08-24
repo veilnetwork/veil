@@ -50,6 +50,26 @@ pub(crate) struct Header {
 }
 
 /// One end of a conversation.
+/// A point in a sending chain: which chain, and the index the next message
+/// will carry. Small enough for a host to write durably BEFORE it publishes a
+/// ciphertext, which is the whole reason it exists (report12 X-H5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SendPosition {
+    /// Our sending DH public key. A sending chain lives and dies with it, so
+    /// it says whether a recorded position still refers to the chain we hold.
+    pub chain: [u8; 32],
+    /// The index the next sealed message will carry.
+    pub next: u32,
+}
+
+/// How far ahead a recorded position may drag the sending chain.
+///
+/// A host reserves a small run of indices at a time, so a legitimate skip is
+/// tens, not thousands. The cap is what keeps a corrupted or hostile mark from
+/// grinding the chain forward — and from opening a gap wider than the peer's
+/// skipped-key window, which would cost delivery rather than save it.
+pub const MAX_SEND_SKIP: u32 = 1024;
+
 #[derive(Clone)]
 pub(crate) struct RatchetCore {
     dh_sk: StaticSecret,
@@ -195,6 +215,49 @@ impl RatchetCore {
             },
             mk,
         ))
+    }
+
+    /// Where the sending chain stands: which chain, and the index the NEXT
+    /// message will carry.
+    ///
+    /// `None` when there is no sending chain yet (nothing has been sealed and
+    /// no root step has run), because there is then no position to reserve.
+    pub(crate) fn send_position(&self) -> Option<SendPosition> {
+        self.cks.as_ref()?;
+        Some(SendPosition {
+            chain: self.dh_pk,
+            next: self.ns,
+        })
+    }
+
+    /// Burn sending-chain steps until the next message would be `to.next`.
+    ///
+    /// Returns how many keys were discarded. Nothing happens — and nothing is
+    /// wrong — when the position names a different chain or one we have
+    /// already passed: a mark from a chain we no longer hold cannot collide
+    /// with keys from the chain we do hold, because the two derive from
+    /// different chain keys.
+    pub(crate) fn skip_send_to(&mut self, to: SendPosition) -> Result<u32, RatchetError> {
+        if to.chain != self.dh_pk || to.next <= self.ns {
+            return Ok(0);
+        }
+        let count = to.next - self.ns;
+        if count > MAX_SEND_SKIP {
+            return Err(RatchetError::SendSkipTooFar {
+                requested: count,
+                max: MAX_SEND_SKIP,
+            });
+        }
+        let cks = self.cks.as_mut().ok_or(RatchetError::NoSendingChain)?;
+        for _ in 0..count {
+            let (next, _burned) = kdf_ck(cks);
+            *cks = next;
+        }
+        self.ns = to.next;
+        // Not `sent_any`: nothing was emitted. That flag says the peer has
+        // seen an encapsulation key from us, and burning keys tells them
+        // nothing at all.
+        Ok(count)
     }
 
     /// Resolve the message key for an arriving header.

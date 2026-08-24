@@ -114,6 +114,12 @@ pub enum RatchetError {
     #[error("malformed ratchet frame: {0}")]
     MalformedFrame(&'static str),
 
+    /// A recorded send position asks the chain to jump further than a host
+    /// reserving indices could legitimately have got ahead — a corrupted or
+    /// hostile mark. See [`ratchet::MAX_SEND_SKIP`].
+    #[error("send position is {requested} ahead, past the {max} cap")]
+    SendSkipTooFar { requested: u32, max: u32 },
+
     /// Persisted session state did not decode.
     #[error("malformed ratchet state: {0}")]
     MalformedState(&'static str),
