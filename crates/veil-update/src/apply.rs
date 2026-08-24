@@ -91,6 +91,24 @@ pub enum ApplyError {
     AntiDowngrade { manifest: u64, installed: u64 },
     #[error("installed-version state: {0}")]
     InstalledVersion(#[from] InstalledVersionError),
+    /// The new binary is in place but its directory entry could not be made
+    /// durable, so the installed-version record was deliberately NOT advanced.
+    ///
+    /// The two are one decision: a non-durable entry can roll back to the old
+    /// binary after a power loss, and a state file that had already recorded
+    /// the new release would then refuse — by its own anti-downgrade gate — to
+    /// install the release that never landed. Leaving the record alone is what
+    /// keeps a retry possible; the retry re-stages, re-verifies the same sha,
+    /// and is measured against the OLD installed value.
+    #[error(
+        "install at {install_path} is visible but not durable ({source}); the \
+         installed-version record was left unchanged so the update can be \
+         re-applied"
+    )]
+    InstallVisibleNotDurable {
+        install_path: PathBuf,
+        source: std::io::Error,
+    },
     #[error(
         "platform mismatch: manifest targets `{manifest_target}` but this host is \
          {host_os}/{host_arch} — refusing to install a foreign-platform binary"
@@ -443,16 +461,31 @@ pub fn apply_update(
     //.tmp path, leaving the user with a half-applied update.
     //
     // POSIX: open(parent, O_RDONLY) then fsync. Windows: documented
-    // not to support directory fsync; std skips it on this platform.
-    // Best-effort — a fsync failure here means the update is committed
-    // to page cache but not to disk, which is the same risk as a power
-    // loss in the immediate window after rename. Don't fail the
-    // apply: the bytes ARE on disk under the tmp path on retry, and a
-    // subsequent apply will re-stage cleanly.
-    if let Some(parent) = install_path.parent()
-        && let Ok(dir_file) = std::fs::File::open(parent)
-    {
-        let _ = dir_file.sync_all();
+    // not to support directory fsync; std skips it on this platform, so
+    // there is nothing here to succeed or fail and the state below is
+    // written as before.
+    //
+    // NOT best-effort any more. The failure and the state write are the two
+    // halves of one decision: if the directory entry is not durable, the
+    // binary can still be the OLD one after a power loss — while the state
+    // file, which IS written durably, would say the new release is installed.
+    // The next apply then meets the anti-downgrade gate against its own
+    // record and refuses to install the very release that never landed. Old
+    // binary, new floor, and no way forward but an operator.
+    //
+    // So the floor is not advanced when the entry is not durable. A retry
+    // costs a re-stage and re-verifies the same sha, and the gate still
+    // compares against the OLD installed value — which is what makes leaving
+    // it alone the recoverable choice.
+    #[cfg(not(windows))]
+    if let Some(parent) = install_path.parent() {
+        let durable = std::fs::File::open(parent).and_then(|d| d.sync_all());
+        if let Err(e) = durable {
+            return Err(ApplyError::InstallVisibleNotDurable {
+                install_path: install_path.to_path_buf(),
+                source: e,
+            });
+        }
     }
 
     // Step 4: persist new release_unix. Crash here means binary
@@ -828,6 +861,70 @@ mod tests {
         assert_eq!(std::fs::read(&install).unwrap(), payload);
         assert_eq!(outcome.new_release_unix, 2_000_000_001);
         assert_eq!(store.read_release_unix().unwrap(), Some(2_000_000_001));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An install that is visible but not durable must not advance the floor.
+    ///
+    /// The parent-directory fsync used to be best-effort: its failure was
+    /// dropped and the new `release_unix` was written anyway. The two are one
+    /// decision. A directory entry that is not durable can roll back to the
+    /// OLD binary after a power loss, while the state file — which IS written
+    /// durably — says the new release is installed; the next apply then meets
+    /// the anti-downgrade gate against its own record and refuses to install
+    /// the release that never landed. Old binary, new floor, no way forward.
+    ///
+    /// The fixture makes the fsync fail the only way a test can: a parent
+    /// directory that may be written and entered but not READ. The rename
+    /// needs write+execute and succeeds; opening the directory to sync it
+    /// needs read and does not.
+    #[cfg(unix)]
+    #[test]
+    fn an_install_that_is_not_durable_leaves_the_floor_alone() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let _embedded = EmbeddedReleaseGuard::set(2_000_000_000);
+        let dir = unique_dir("h4-not-durable");
+        // The state file lives OUTSIDE the unreadable directory: this is about
+        // the binary's entry, not about being unable to write the record.
+        let state = dir.join("installed.json");
+        let store = InstalledVersionStore::new(state.clone());
+        let bin_dir = dir.join("bin");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        let install = bin_dir.join("veil");
+
+        let payload = b"a newer binary";
+        let manifest = fixture_manifest(2_000_000_001, sha256_of(payload));
+
+        // Write + execute, no read.
+        std::fs::set_permissions(&bin_dir, std::fs::Permissions::from_mode(0o300)).unwrap();
+        let err = apply_update(
+            &manifest,
+            payload,
+            &install,
+            &store,
+            env!("CARGO_PKG_VERSION"),
+        );
+        // Restore before asserting, or a failure leaves an undeletable dir.
+        std::fs::set_permissions(&bin_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        match err {
+            Err(ApplyError::InstallVisibleNotDurable { .. }) => {},
+            other => {
+                let _ = std::fs::remove_dir_all(&dir);
+                panic!("expected InstallVisibleNotDurable, got {other:?}");
+            },
+        }
+        assert_eq!(
+            store.read_release_unix().unwrap(),
+            None,
+            "the floor must be left where a retry can still clear it",
+        );
+        assert_eq!(
+            std::fs::read(&install).unwrap(),
+            payload,
+            "and the binary IS in place — that is what makes the report honest",
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
