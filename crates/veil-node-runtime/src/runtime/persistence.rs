@@ -21,8 +21,10 @@
 //!   present and unreadable" is logged. An operator who edits the file and
 //!   breaks it must not lose the whole ban list without a word.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, LazyLock, Mutex};
 use veil_util::lock;
 
 use super::uri_helpers::{is_undialable_from_here, is_wildcard_transport};
@@ -148,7 +150,7 @@ pub fn persist_discovered_peers(
     state: &Arc<Mutex<NodeState>>,
     config_path: &Path,
 ) -> PersistOutcome {
-    let entries: Vec<DiscoveredPeerSnapshot> = {
+    let (sequence, entries): (u64, Vec<DiscoveredPeerSnapshot>) = {
         let mut st = lock_state(state);
         // Trim the proof set to the peers we still track. Every handshake adds
         // an id, including strangers who dial in and are never entered in the
@@ -163,7 +165,11 @@ pub fn persist_discovered_peers(
         // spelled out there: a snapshot must not seed the next startup with
         // dial targets nobody here can reach.
         let site_local = we_are_site_local(&st);
-        st.peers
+        // Taken here, under the same lock that reads the peers, so the
+        // publication order matches the order the state changed in.
+        let sequence = next_snapshot_seq();
+        let entries = st
+            .peers
             .values()
             .filter(|e| !matches!(e.source, PeerSource::Configured))
             .filter(|e| !e.bootstrap_only)
@@ -184,10 +190,11 @@ pub fn persist_discovered_peers(
                 transport: e.transport.clone(),
                 source: e.source,
             })
-            .collect()
+            .collect();
+        (sequence, entries)
     };
     let path = discovered_peers_path(config_path);
-    write_snapshot(&path, &entries, "discovered peers")
+    write_snapshot_ordered(&path, &entries, "discovered peers", sequence)
 }
 
 /// Load previously-discovered peers from disk and spawn outbound connections.
@@ -278,6 +285,58 @@ pub fn load_discovered_peers(
 
 /// Serialise and atomically write `entries`, logging (and reporting) any
 /// failure. `what` names the store for the log line.
+/// Monotonic snapshot sequence. Take it WHILE the lock that builds the
+/// snapshot is held: the point is that sequence order equals the order the
+/// state actually changed in.
+static SNAPSHOT_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// Highest sequence already on disk, per file.
+static PUBLISHED: LazyLock<Mutex<HashMap<PathBuf, u64>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// The next snapshot sequence. Call it under the lock that reads the state.
+pub(crate) fn next_snapshot_seq() -> u64 {
+    SNAPSHOT_SEQ.fetch_add(1, Ordering::Relaxed) + 1
+}
+
+/// [`write_snapshot`], but a snapshot older than the one already on disk is
+/// dropped instead of overwriting it.
+///
+/// Every writer here builds its entries under a lock and writes them after
+/// releasing it, so the order the FILE sees is not the order the state changed
+/// in: two threads reach the write in either order and whichever went last
+/// won. Each snapshot is the whole file, so a late older one does not merely
+/// lose an update — it undoes the newer one. For discovered peers that means
+/// dropping a peer a handshake had just proved, which is the entry a censored
+/// node has nothing else to bootstrap from; for the ban list it means a ban the
+/// operator was told was durable.
+///
+/// Skipping is safe, not a lost write: the newer sequence encodes the same
+/// whole file at a later moment, so it already contains everything the older
+/// one carried. A failed write does not advance the mark, so the next attempt
+/// still tries rather than believing this sequence landed.
+pub(crate) fn write_snapshot_ordered<T: serde::Serialize>(
+    path: &Path,
+    entries: &T,
+    what: &str,
+    sequence: u64,
+) -> PersistOutcome {
+    // The guard both orders the publications and serializes them.
+    let mut published = lock!(PUBLISHED);
+    if let Some(&on_disk) = published.get(path)
+        && sequence <= on_disk
+    {
+        // A strictly newer snapshot of this same file is already durable, and
+        // it supersedes this one entirely — so the caller's change IS on disk.
+        return PersistOutcome::Durable;
+    }
+    let outcome = write_snapshot(path, entries, what);
+    if outcome.is_durable() {
+        published.insert(path.to_path_buf(), sequence);
+    }
+    outcome
+}
+
 pub(crate) fn write_snapshot<T: serde::Serialize>(
     path: &Path,
     entries: &T,
@@ -368,17 +427,20 @@ pub fn bans_path(config_path: &Path) -> PathBuf {
 /// (audit report7 V-03).
 #[must_use = "a ban that was not written back is lost on the next restart"]
 pub fn persist_bans(ban_list: &Arc<Mutex<BanList>>, config_path: &Path) -> PersistOutcome {
-    let entries: Vec<BanSnapshot> = {
+    let (sequence, entries): (u64, Vec<BanSnapshot>) = {
         let bl = lock!(ban_list);
-        bl.manual_bans()
+        let sequence = next_snapshot_seq();
+        let entries = bl
+            .manual_bans()
             .into_iter()
             .map(|e| BanSnapshot {
                 node_id: veil_util::hex_str(&e.peer_id),
                 reason: e.reason.clone(),
             })
-            .collect()
+            .collect();
+        (sequence, entries)
     };
-    write_snapshot(&bans_path(config_path), &entries, "ban list")
+    write_snapshot_ordered(&bans_path(config_path), &entries, "ban list", sequence)
 }
 
 /// Load manual bans from disk into the ban list.
@@ -783,6 +845,64 @@ mod tests {
             "precondition: nothing was restored — which is exactly why it has \
              to be reported"
         );
+    }
+
+    /// Two writers, one file, and the OLDER snapshot arriving last.
+    ///
+    /// Every snapshot here is built under a lock and written after releasing
+    /// it, so the order the file sees is not the order the state changed in.
+    /// Each snapshot is the WHOLE file, so a late older one does not lose an
+    /// update, it undoes the newer one: for discovered peers that drops a peer
+    /// a handshake had just proved — the entry a censored node has nothing else
+    /// to bootstrap from.
+    #[test]
+    fn a_late_older_snapshot_does_not_overwrite_a_newer_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("peers.json");
+
+        // Sequences are taken in the order the state changed.
+        let older = next_snapshot_seq();
+        let newer = next_snapshot_seq();
+
+        let proved = vec!["a-peer-we-reached".to_string()];
+        assert_eq!(
+            write_snapshot_ordered(&path, &proved, "test", newer),
+            PersistOutcome::Durable
+        );
+
+        // The stalled writer finally lands, still holding the earlier state.
+        let stale: Vec<String> = Vec::new();
+        assert_eq!(
+            write_snapshot_ordered(&path, &stale, "test", older),
+            PersistOutcome::Durable,
+            "the caller's change IS on disk — carried by the newer snapshot"
+        );
+
+        let back: Vec<String> = read_snapshot(&path, "test").unwrap().unwrap();
+        assert_eq!(
+            back, proved,
+            "a superseded snapshot must not undo the newer one"
+        );
+    }
+
+    /// The ordering must not become "only the first write ever lands".
+    #[test]
+    fn a_newer_snapshot_still_replaces_an_older_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("peers.json");
+
+        let first = next_snapshot_seq();
+        assert!(
+            write_snapshot_ordered(&path, &vec!["one".to_string()], "test", first).is_durable()
+        );
+
+        let second = next_snapshot_seq();
+        assert!(
+            write_snapshot_ordered(&path, &vec!["two".to_string()], "test", second).is_durable()
+        );
+
+        let back: Vec<String> = read_snapshot(&path, "test").unwrap().unwrap();
+        assert_eq!(back, vec!["two".to_string()]);
     }
 
     /// The same two answers for the discovered-peer store, whose writes were
