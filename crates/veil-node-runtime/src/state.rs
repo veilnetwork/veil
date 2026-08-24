@@ -1,4 +1,8 @@
-use std::{collections::BTreeMap, path::PathBuf, time::Instant};
+use std::{
+    collections::{BTreeMap, HashSet},
+    path::PathBuf,
+    time::Instant,
+};
 
 use crate::types::{
     ListenConfigEntry, ListenId, NodeId, NodeRole, NodeSummary, PeerConfigEntry, PeerId,
@@ -29,6 +33,23 @@ pub struct NodeState {
     /// it records is a lasting property of the node, not an event. An operator
     /// who missed one warning at startup would otherwise have no way to ask
     /// whether their key is actually encrypted at rest (audit report7 V-02).
+    /// node_ids we have completed at least one OVL1 handshake with in this
+    /// process (or restored from a snapshot that was written under the same
+    /// rule).
+    ///
+    /// The discovered-peers snapshot exists to answer one question on a cold
+    /// start: "who did we actually reach last time?" Peer-exchange used to
+    /// write its gossip straight to that file the moment a peer was learned —
+    /// before any dial, let alone a successful one — so a transport nobody
+    /// here can ever reach was persisted and re-dialled on every subsequent
+    /// start, forever. A production seed carried four such entries pointing at
+    /// a different network's port; deleting them by hand brought them back
+    /// within two hours.
+    ///
+    /// Membership here is the proof that the entry earned its place. Peers the
+    /// operator configured are exempt: they are policy, not discovery, and
+    /// `persist_discovered_peers` never wrote them anyway.
+    pub handshaked: HashSet<[u8; 32]>,
     pub mlkem_key_at_rest: veil_e2e::MlKemKeyAtRest,
 }
 
@@ -62,6 +83,7 @@ impl NodeState {
                 .map(|entry| (entry.listen_id, entry))
                 .collect(),
             mlkem_key_at_rest: veil_e2e::MlKemKeyAtRest::AsConfigured,
+            handshaked: HashSet::new(),
         }
     }
 
