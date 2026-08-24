@@ -44,6 +44,16 @@ struct EmbeddedServicesRegistry {
     by_node: BTreeMap<[u8; 32], NodeServices>,
 }
 
+
+/// The most PEX-learned peer rows this node keeps.
+///
+/// Each one costs a map entry, a line in `discovered_peers.json` and an
+/// outbound connector task that retries for as long as the row exists. The PEX
+/// walk table's own `max_peers` (32 by default) bounds the table, not this;
+/// a production seed legitimately reached 21 distinct node ids, so this sits
+/// an order of magnitude above ordinary use and exists only as a ceiling.
+const MAX_EXCHANGED_PEERS: usize = 256;
+
 fn embedded_services_registry() -> &'static Mutex<EmbeddedServicesRegistry> {
     static REGISTRY: OnceLock<Mutex<EmbeddedServicesRegistry>> = OnceLock::new();
     REGISTRY.get_or_init(|| Mutex::new(EmbeddedServicesRegistry::default()))
@@ -368,6 +378,27 @@ impl NodeRuntime {
                                                     id
                                                 },
                                             };
+                                            // Cap the PEX-learned rows; see
+                                            // `evict_exchanged_over_cap` for what
+                                            // each one costs and why the walk
+                                            // table's own cap does not bound it.
+                                            if existing.is_none() {
+                                                let retired = {
+                                                    let mut st = lock_state(&state);
+                                                    crate::runtime::persistence::evict_exchanged_over_cap(
+                                                        &mut st.peers,
+                                                        MAX_EXCHANGED_PEERS,
+                                                    )
+                                                };
+                                                if retired > 0 {
+                                                    logger.info(
+                                                        "pex.evict",
+                                                        format!(
+                                                            "exchanged rows at cap {MAX_EXCHANGED_PEERS}, retired {retired} oldest",
+                                                        ),
+                                                    );
+                                                }
+                                            }
                                             let entry = crate::types::PeerConfigEntry {
                                                 peer_id,
                                                 node_id: veil_cfg::NodeId::from(p.node_id),

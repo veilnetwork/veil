@@ -212,6 +212,21 @@ pub fn spawn_outbound_peers(
                 // not a one-shot permit, so a stale wake cannot cancel the
                 // first reconnect after that session eventually closes.
                 refresh_rx.borrow_and_update();
+                // A PEX-learned row that has since been evicted takes its
+                // connector with it. Only `Exchanged` is retired this way:
+                // configured, bootstrap and synthetic gateway peers keep their
+                // task whether or not they are in `NodeState::peers`, which is
+                // where the gateway range lives outside the map entirely.
+                //
+                // Without this the exchanged table could not be capped in any
+                // meaningful sense. Dropping a row freed a little memory and
+                // left the expensive half — an indefinitely retrying dial —
+                // running until the process ended.
+                if peer.source == crate::types::PeerSource::Exchanged
+                    && !access.holds_peer_row(&peer_node_id)
+                {
+                    break;
+                }
                 // Check if this peer was banned.  Audit batch 2026-05-25
                 // phase J: previously `break` exited the entire
                 // outbound_connector task, dropping the slot_guard and
