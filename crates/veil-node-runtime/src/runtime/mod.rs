@@ -130,6 +130,18 @@ pub struct RuntimeTasks {
     pub background: Vec<JoinHandle<()>>,
 }
 
+/// Sustained probe rate for one target once its burst is spent: one attempt
+/// per ten minutes. A peer that has genuinely returned reconnects on its own
+/// announcement long before this matters; a peer that never answers costs
+/// 6 probes an hour instead of 1140.
+const NAT_PROBE_SUSTAINED_PER_SEC: f64 = 1.0 / 600.0;
+/// Burst allowed before the sustained rate bites — enough for a real
+/// reconnect handshake, which succeeds on the first or second attempt.
+const NAT_PROBE_BURST: f64 = 3.0;
+/// Forget a target that nobody has probed for this long, so the map cannot
+/// grow without bound and a long-absent peer starts from a full burst.
+const NAT_PROBE_IDLE_FORGET: std::time::Duration = std::time::Duration::from_secs(3600);
+
 #[derive(Clone)]
 pub struct NodeServices {
     registry: Arc<TransportRegistry>,
@@ -156,6 +168,9 @@ pub struct NodeServices {
     pub dispatcher: Arc<FrameDispatcher>,
     pub session_registry: Arc<Mutex<veil_session::SessionRegistry>>,
     pub session_tx_registry: Arc<RwLock<veil_session::SessionTxRegistry>>,
+    /// Probe back-off keyed by TARGET — see the field of the same name on
+    /// the runtime for what it cost in production before it existed.
+    pub nat_probe_backoff: Arc<Mutex<PerPeerLimiter>>,
     pub session_outbox: Arc<veil_session::SessionOutbox>,
     /// notification handle that the outbound-connector trips
     /// on close of a synthetic-range gateway session (peer_id ≥ `0xC000_0000`).
@@ -681,6 +696,26 @@ pub struct NodeRuntime {
     pub routing: Arc<routing_state::RoutingState>,
     /// Per-peer rate limiter (shared across all incoming frame paths).
     rate_limiter: Arc<Mutex<PerPeerLimiter>>,
+    /// Back-off for NAT-traversal probes, keyed by the TARGET we are trying to
+    /// reach — not by the coordinator we ask.
+    ///
+    /// A probe exists precisely for a peer we cannot dial, so "unreachable" is
+    /// not a reason to stop trying; it is the entry condition. Nothing bounded
+    /// how long we keep trying, and a target that can never answer — a host
+    /// that is switched off, or one on another network whose PSK we will never
+    /// speak — was probed forever at the same rate as one that just blipped.
+    ///
+    /// Measured 24.08 on a production seed: 6093 `nat.probe.forward_failed`
+    /// in 5.3 h, 19 a minute, **two thirds of everything the node logged**.
+    /// Half the targets were dead hosts of our own fleet; the rest sat on the
+    /// test network. Removing their transports stopped the futile dialling and
+    /// changed the probe rate by nothing (18.7/min against 19.2), because the
+    /// probe is driven by knowing a node_id, not by holding a transport.
+    ///
+    /// A token bucket rather than a fixed interval so a genuine reconnect can
+    /// still burst, while a target that never answers decays to the sustained
+    /// rate and stays there.
+    nat_probe_backoff: Arc<Mutex<PerPeerLimiter>>,
     /// Ban list — rejected peers are dropped on connect.
     ban_list: Arc<Mutex<BanList>>,
     /// Violation tracker — escalates repeated offences to bans.
@@ -2436,6 +2471,11 @@ impl NodeRuntime {
                 Arc::clone(&shared_vivaldi),
             )),
             rate_limiter,
+            nat_probe_backoff: Arc::new(Mutex::new(PerPeerLimiter::new(
+                NAT_PROBE_SUSTAINED_PER_SEC,
+                NAT_PROBE_BURST,
+                NAT_PROBE_IDLE_FORGET,
+            ))),
             ban_list,
             violation_tracker,
             runtime_summary: Arc::new(Mutex::new(RuntimeSummary {
@@ -5194,6 +5234,19 @@ impl NodeServices {
             xor
         });
         const MAX_COORDINATOR_ATTEMPTS: usize = 4;
+        // Give up on a target that will not answer. See `nat_probe_backoff`
+        // for what this cost in production before it existed.
+        if !lock!(self.nat_probe_backoff).allow(target_node_id) {
+            self.logger.debug(
+                "nat.probe.backoff",
+                format!(
+                    "target {} is in probe back-off — not asking any coordinator",
+                    veil_util::hex_short(&target_node_id),
+                ),
+            );
+            return None;
+        }
+
         for coordinator in candidates.into_iter().take(MAX_COORDINATOR_ATTEMPTS) {
             if let Some(reply) = self
                 .attempt_nat_traversal_via_with_punch_token(

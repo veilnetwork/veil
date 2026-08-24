@@ -666,6 +666,7 @@ impl NodeRuntime {
             dispatcher: Arc::clone(&self.dispatcher),
             session_registry: Arc::clone(&self.session_registry),
             session_tx_registry: Arc::clone(&self.session_tx_registry),
+            nat_probe_backoff: Arc::clone(&self.nat_probe_backoff),
             session_outbox: Arc::clone(&self.session_outbox),
             gateway_failover_notify: Arc::clone(&self.gateway_failover_notify),
             force_reconnect_notify: Arc::clone(&self.force_reconnect_notify),
