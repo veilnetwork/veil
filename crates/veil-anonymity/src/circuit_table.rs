@@ -546,6 +546,37 @@ mod tests {
         }
     }
 
+    /// The gauge has to report the FULLEST bucket, not the average and not the
+    /// total: the per-link cap is what refuses an install, and one starving
+    /// bucket beside three empty ones is exactly the state that killed
+    /// introduces while every aggregate still looked healthy.
+    #[test]
+    fn the_headroom_gauge_reports_the_fullest_bucket_not_the_average() {
+        let t = CircuitTable::new();
+        let busy = [1u8; 32];
+        let quiet = [2u8; 32];
+        assert_eq!(t.max_link_occupancy(), (0, 0), "empty table has no buckets");
+
+        for i in 0..5u32 {
+            t.install(&inst(i, 100 + i, 0xAA), busy, Some([9u8; 32]), 1000)
+                .unwrap();
+        }
+        t.install(&inst(50, 150, 0xBB), quiet, Some([9u8; 32]), 1000)
+            .unwrap();
+
+        let (max, links) = t.max_link_occupancy();
+        assert_eq!(links, 2, "both prev-links are counted");
+        assert_eq!(
+            max, 5,
+            "must be the fullest bucket (5), not the total (6) nor the mean (3)"
+        );
+        assert_eq!(
+            t.len(),
+            6,
+            "len stays the total, the two answer differently"
+        );
+    }
+
     #[test]
     fn install_and_dual_lookup() {
         let t = CircuitTable::new();
