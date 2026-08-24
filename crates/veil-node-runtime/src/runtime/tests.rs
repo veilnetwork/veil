@@ -3483,3 +3483,50 @@ fn redundancy_is_for_reassembly_not_for_retry() {
     // Bulk across SEVERAL relays: spread instead of duplicate.
     assert_eq!(onion_send_redundancy(3, 27, true, 3), 1);
 }
+
+/// The probe back-off has to let a real reconnect through and still stop a
+/// target that never answers. Pins the CHOICE of constants against the
+/// limiter's own semantics: the bucket is what veil-abuse tests, the numbers
+/// are what this commit decided.
+#[test]
+fn a_target_that_never_answers_stops_being_probed_but_a_returning_one_does_not() {
+    use veil_abuse::PerPeerLimiter;
+    let mut l = PerPeerLimiter::new(
+        super::NAT_PROBE_SUSTAINED_PER_SEC,
+        super::NAT_PROBE_BURST,
+        super::NAT_PROBE_IDLE_FORGET,
+    );
+    let dead = [7u8; 32];
+
+    // A genuine reconnect gets its attempts: the handshake succeeds on the
+    // first or second, so the burst must cover that with room.
+    let granted = (0..3).filter(|_| l.allow(dead)).count();
+    assert_eq!(granted, 3, "burst must cover a real reconnect");
+
+    // After that the target is refused, and stays refused — this is the whole
+    // point: 6093 failures in 5.3 h came from having no such stop.
+    for _ in 0..50 {
+        assert!(
+            !l.allow(dead),
+            "a target that spent its burst must not be probed again immediately"
+        );
+    }
+
+    // A different target is unaffected — the back-off is per target, not global.
+    assert!(
+        l.allow([9u8; 32]),
+        "back-off on one target must not silence probes to another"
+    );
+}
+
+/// The sustained rate is the number that decides the steady-state cost, so it
+/// gets pinned separately from the burst: one probe per ten minutes is
+/// 6 an hour against the 1140 an hour measured on a production seed.
+#[test]
+fn the_sustained_probe_rate_is_one_per_ten_minutes() {
+    let per_hour = super::NAT_PROBE_SUSTAINED_PER_SEC * 3600.0;
+    assert!(
+        (per_hour - 6.0).abs() < 1e-9,
+        "expected 6 probes an hour, got {per_hour}"
+    );
+}
