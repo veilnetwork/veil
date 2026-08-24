@@ -908,9 +908,13 @@ impl KademliaService {
     pub fn handle_find_value(&self, payload: FindValuePayload) -> FindValueResponse {
         // Try the local store first. Drop the inner lock immediately so
         // `ranked_public_contacts` can re-acquire it for the fallback path.
+        // Non-promoting (report12 V-M7): answering a remote FIND_VALUE must
+        // not move the entry to hot and re-date it. Reading is something any
+        // peer may ask for, so a promoting read here lets one keep a record
+        // alive indefinitely by alternating eviction and reads.
         let local_value = {
-            let mut inner = lock!(self.inner);
-            inner.store.get(&payload.key).cloned()
+            let inner = lock!(self.inner);
+            inner.store.get_no_promote(&payload.key)
         };
         if let Some(v) = local_value {
             FindValueResponse::Value(v)
@@ -2215,6 +2219,55 @@ mod tests {
             .unwrap();
         let resp = svc.handle_find_value(FindValuePayload { key });
         assert!(matches!(resp, FindValueResponse::Value(v) if v == b"record"));
+    }
+
+    /// report12 V-M7: answering a remote FIND_VALUE must not lift the record
+    /// out of the cold tier and re-date it. A promoting read there is a
+    /// retention extension any peer can ask for, repeatedly and for free —
+    /// alternating eviction and reads keeps a record alive past whatever its
+    /// publisher asked for.
+    ///
+    /// Asserted at the CALL SITE rather than on the store helper: what was
+    /// wrong here was which read this handler picked.
+    #[test]
+    fn answering_a_remote_find_value_does_not_promote_from_cold() {
+        // hot capacity is `(max_store_entries / 4).max(64)`, so a small store
+        // still holds 64 hot — 65 records is what puts the first one in cold.
+        let svc = KademliaService::with_config(
+            [7u8; 32],
+            DhtRuntimeConfig {
+                allow_unsigned_store: true,
+                max_store_entries: 256,
+                ..DhtRuntimeConfig::default()
+            },
+        );
+        let first = attachment_key(&[0u8; 32]);
+        svc.handle_store(StorePayload::unsigned(first, b"record".to_vec()))
+            .unwrap();
+        for i in 1..=64u8 {
+            svc.handle_store(StorePayload::unsigned(attachment_key(&[i; 32]), vec![i]))
+                .unwrap();
+        }
+        assert!(
+            !lock!(svc.inner).store.is_hot(&first),
+            "the fixture failed to demote the first record, so nothing below \
+             is tested"
+        );
+
+        let resp = svc.handle_find_value(FindValuePayload { key: first });
+        assert!(
+            matches!(resp, FindValueResponse::Value(ref v) if v == b"record"),
+            "a cold record must still be answerable"
+        );
+        // PLACEMENT, not counts. A promotion demotes something else to make
+        // room, so `cold_len` is exactly the number it cannot move — an
+        // earlier version of this test asserted on it and passed against the
+        // defect.
+        assert!(
+            !lock!(svc.inner).store.is_hot(&first),
+            "the answer promoted the record: a peer can keep any record alive \
+             by reading it, for as long as it keeps reading"
+        );
     }
 
     /// Shared silent router: the walk gets no answers, so what comes back IS
