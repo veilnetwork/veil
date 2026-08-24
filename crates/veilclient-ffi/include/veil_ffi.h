@@ -2536,6 +2536,7 @@ int veil_restore_identity_from_phrase_zeroize(uint8_t *phrase,
                                               char **err_out)
 ;
 
+#if defined(VEIL_FFI_NODE_EMBEDDED)
 /**
  * Restore an identity and name THE HOST'S OWN NODE KEY as this device's
  * subkey, taken from `identity_toml` — the config the node boots on.
@@ -2572,6 +2573,7 @@ int veil_restore_identity_from_phrase_zeroize_with_node_key(uint8_t *phrase,
                                                             uintptr_t identity_toml_len,
                                                             char **err_out)
 ;
+#endif
 
 /**
  * Admit a device to the identity whose `identity_document.bin` is in
@@ -2675,6 +2677,59 @@ int veil_adopt_identity_document_from_config_zeroize(uint8_t *config_toml,
                                                      uintptr_t document_len,
                                                      uint16_t *key_idx_out,
                                                      char **err_out)
+;
+#endif
+
+#if defined(VEIL_FFI_NODE_EMBEDDED)
+/**
+ * Adopt a document that already names THIS device, authorising with nothing
+ * but the device's own key out of its node config.
+ *
+ * The third entry point, for the one caller the other two fail: a freshly
+ * linked device. Its config is not the master (`from_config` demands that),
+ * and the phrase left with the ceremony (`from_master` needs those 32
+ * bytes). What it does hold is its own device key — and the incoming
+ * document carries a master-signed cert for exactly that key, so the
+ * master's authority arrives INSIDE the document. Verify it, find our key
+ * in it, store it. A document that does not name us is refused, which is
+ * what keeps this from being an accept-anything hole.
+ *
+ * `config_toml` is SECRET (carries the device private key) and is wiped in
+ * place before return, success or failure.
+ */
+
+int veil_adopt_identity_document_named_zeroize(uint8_t *config_toml,
+                                               uintptr_t config_toml_len,
+                                               const uint8_t *veil_dir,
+                                               uintptr_t veil_dir_len,
+                                               const uint8_t *document,
+                                               uintptr_t document_len,
+                                               uint16_t *key_idx_out,
+                                               char **err_out)
+;
+#endif
+
+#if defined(VEIL_FFI_NODE_EMBEDDED)
+/**
+ * Revoke a device's key from the identity document, with the master derived
+ * from `phrase`. The cryptographic half of device revocation: the group
+ * membership half already exists, but the document kept VOUCHING for the
+ * revoked key until its cert aged out. Removes the key, adds a
+ * master-signed tombstone the document merge can never resurrect, and
+ * re-signs with this device's own key.
+ *
+ * `phrase` is SECRET and wiped in place before return. `device_id` is the
+ * 32-byte device address (BLAKE3 of its pubkey). Writes 1 to `changed_out`
+ * when the document changed, 0 when the device was already tombstoned.
+ */
+
+int veil_revoke_identity_device_from_phrase_zeroize(uint8_t *phrase,
+                                                    uintptr_t phrase_len,
+                                                    const uint8_t *veil_dir,
+                                                    uintptr_t veil_dir_len,
+                                                    const uint8_t *device_id,
+                                                    uint8_t *changed_out,
+                                                    char **err_out)
 ;
 #endif
 
