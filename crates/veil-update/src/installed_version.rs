@@ -104,6 +104,14 @@ const INSTALLED_VERSION_MAC_DOMAIN: &[u8] = b"veil-installed-version-mac-v1\0";
 /// developer `cargo build` leaves the variable unset and gets `0`, which
 /// contributes no floor — exactly today's behaviour.
 ///
+/// ⚠️ TWO release paths, not one. `release.yml` builds the Windows targets by
+/// calling cargo directly (the repo-global clang `[env]` breaks on
+/// `*-windows-msvc`), so it does NOT go through that script. It had no
+/// equivalent export, which meant every published Windows binary carried a
+/// floor of `0` — a missing variable degrades in silence, since the const
+/// parser below only rejects a malformed one. That leg now sets the variable
+/// and refuses to build without it; any third build path must do the same.
+///
 /// A DEDICATED variable rather than `SOURCE_DATE_EPOCH`: distro build systems
 /// (Debian, Nix, Guix) set `SOURCE_DATE_EPOCH` to their own changelog date, and
 /// a downstream rebuild stamped later than the upstream manifest would refuse
