@@ -184,12 +184,20 @@ pub(crate) async fn handle_mailbox_ack(
     // Recipient's app confirms end-to-end receipt.  Backend verifies
     // `auth_cookie`; mismatch returns false (a no-op from the caller's
     // perspective).
-    // Per-client rate-limit (shared read-query bucket, symmetric with
-    // `handle_mailbox_fetch`): ack hits the backend's auth-cookie verify +
-    // store mutation, so a local process must not be able to spam it. On
-    // limit, reply the same no-op `removed=false` a cookie mismatch yields, so
-    // the rate-limit is not a distinguishable oracle.
-    if !client_state.allow_query() {
+    // Per-client rate-limit on its OWN bucket, sized against the fetch cap.
+    // It used to share the read-query bucket (burst 30) while one fetch hands
+    // out up to 256 blobs, so a recipient acking its batch — exactly what the
+    // protocol asks of it — ran dry after about 29 and the rest came back
+    // `removed=false`. That is the same word as "already gone" and "bad
+    // cookie", so the app stopped asking about rows that were still there, and
+    // every later fetch returned them again.
+    //
+    // The reply on limit is still that indistinguishable no-op: the bucket is
+    // what was wrong, not the answer's shape, and a distinct one would be a
+    // wire change for old clients to misread. With the burst tied to what a
+    // fetch may return, a recipient doing the ordinary thing no longer reaches
+    // it.
+    if !client_state.allow_ack() {
         return write_frame_wh(
             wh,
             FrameFamily::LocalApp as u8,
