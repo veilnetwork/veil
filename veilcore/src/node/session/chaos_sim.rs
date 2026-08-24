@@ -423,6 +423,7 @@ async fn idle_timeout_closes_silent_duplex_peer() {
         peer_public_key: None,
         peer_nonce: None,
         hot_standby: crate::node::session::runner::HotStandbyState {
+            swap_registry: None,
             swap_rx: None,
             handoff_registry: None,
             handoff_ack_waiters: None,
@@ -513,6 +514,7 @@ async fn run_chaos_iteration_inner(
         peer_public_key: None,
         peer_nonce: None,
         hot_standby: crate::node::session::runner::HotStandbyState {
+            swap_registry: None,
             swap_rx: None,
             handoff_registry: None,
             handoff_ack_waiters: None,
@@ -812,6 +814,7 @@ async fn run_chaos_iteration_lossy(
         peer_public_key: None,
         peer_nonce: None,
         hot_standby: crate::node::session::runner::HotStandbyState {
+            swap_registry: None,
             swap_rx: None,
             handoff_registry: None,
             handoff_ack_waiters: None,
@@ -1210,6 +1213,7 @@ async fn run_p2p_iteration(seed: u64, ping_count: u64, bytes_threshold: u64) -> 
         peer_public_key: None,
         peer_nonce: None,
         hot_standby: crate::node::session::runner::HotStandbyState {
+            swap_registry: None,
             swap_rx: None,
             handoff_registry: None,
             handoff_ack_waiters: None,
@@ -1262,6 +1266,7 @@ async fn run_p2p_iteration(seed: u64, ping_count: u64, bytes_threshold: u64) -> 
         peer_public_key: None,
         peer_nonce: None,
         hot_standby: crate::node::session::runner::HotStandbyState {
+            swap_registry: None,
             swap_rx: None,
             handoff_registry: None,
             handoff_ack_waiters: None,

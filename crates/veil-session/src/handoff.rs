@@ -357,7 +357,7 @@ impl SessionSwapRegistry {
         inner.by_peer.insert(peer_node_id, session_id);
         SwapRegistryGuard {
             registry: std::sync::Arc::clone(self),
-            session_id,
+            session_id: std::sync::Arc::new(Mutex::new(session_id)),
             peer_node_id,
         }
     }
@@ -410,6 +410,37 @@ impl SessionSwapRegistry {
         self.len() == 0
     }
 
+    /// Move a live registration from `old` to `new_session_id`.
+    ///
+    /// A rekey rotates `session_id` on both peers at once, but the row
+    /// filed here keeps the id the session had when it registered, so
+    /// every lookup by the CURRENT id misses — which is what the auto
+    /// handoff does. Sessions long-lived enough to rekey are exactly the
+    /// ones failover is for (report12 V-M11).
+    ///
+    /// The stored `tx_key` deliberately does NOT move with it: both peers
+    /// seal and verify `HandoffAttach` with the HANDSHAKE keys, which a
+    /// rekey does not rotate on either side. Replacing it with the
+    /// rekeyed TX key would break the very probe it feeds.
+    ///
+    /// Absent `old` is a no-op — a bootstrap session never registered,
+    /// and a dropped guard already removed the row.
+    fn rekey(&self, old: &[u8; 32], new_session_id: [u8; 32], peer_node_id: &NodeId) {
+        if *old == new_session_id {
+            return;
+        }
+        let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        let Some(handles) = inner.by_session.remove(old) else {
+            return;
+        };
+        inner.by_session.insert(new_session_id, handles);
+        // Same care as `remove`: only re-point the peer row if it still
+        // names the session we just moved.
+        if inner.by_peer.get(peer_node_id) == Some(old) {
+            inner.by_peer.insert(*peer_node_id, new_session_id);
+        }
+    }
+
     fn remove(&self, session_id: &[u8; 32], peer_node_id: &NodeId) {
         let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         inner.by_session.remove(session_id);
@@ -442,13 +473,58 @@ impl std::fmt::Debug for SessionSwapRegistry {
 /// channel.
 pub struct SwapRegistryGuard {
     registry: std::sync::Arc<SessionSwapRegistry>,
-    session_id: [u8; 32],
+    /// Shared with every [`SwapRegistryHandle`] this guard hands out, so
+    /// a rekey that moves the row also moves what the guard removes.
+    /// Holding the old id here would leak the moved row for the life of
+    /// the process.
+    session_id: std::sync::Arc<Mutex<[u8; 32]>>,
     peer_node_id: NodeId,
+}
+
+impl SwapRegistryGuard {
+    /// A handle for the runner that owns this session, so it can carry
+    /// the registration across a rekey. The guard stays the owner: the
+    /// handle can move the row but never removes it.
+    pub fn handle(&self) -> SwapRegistryHandle {
+        SwapRegistryHandle {
+            registry: std::sync::Arc::clone(&self.registry),
+            session_id: std::sync::Arc::clone(&self.session_id),
+            peer_node_id: self.peer_node_id,
+        }
+    }
 }
 
 impl Drop for SwapRegistryGuard {
     fn drop(&mut self) {
-        self.registry.remove(&self.session_id, &self.peer_node_id);
+        let id = *self.session_id.lock().unwrap_or_else(|p| p.into_inner());
+        self.registry.remove(&id, &self.peer_node_id);
+    }
+}
+
+/// Lets a running session re-file its swap registration when its
+/// `session_id` rotates. Handed out by [`SwapRegistryGuard::handle`].
+///
+/// Lock order is the cell then the registry, here and in the guard's
+/// `Drop` — the only two places that take both.
+pub struct SwapRegistryHandle {
+    registry: std::sync::Arc<SessionSwapRegistry>,
+    session_id: std::sync::Arc<Mutex<[u8; 32]>>,
+    peer_node_id: NodeId,
+}
+
+impl SwapRegistryHandle {
+    /// Carry this session's row over to `new_session_id`.
+    pub fn rekey(&self, new_session_id: [u8; 32]) {
+        let mut cell = self.session_id.lock().unwrap_or_else(|p| p.into_inner());
+        self.registry
+            .rekey(&cell, new_session_id, &self.peer_node_id);
+        *cell = new_session_id;
+    }
+}
+
+impl std::fmt::Debug for SwapRegistryHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SwapRegistryHandle").finish_non_exhaustive()
     }
 }
 

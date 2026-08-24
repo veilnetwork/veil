@@ -5999,6 +5999,7 @@ impl NodeServices {
                 peer_public_key: Some(session.public_key.clone()),
                 peer_nonce: Some(session.nonce.clone()),
                 hot_standby: veil_session::runner::HotStandbyState {
+                    swap_registry: None,
                     swap_rx: None,
                     handoff_registry: Some(Arc::clone(&access.handoff.registry)),
                     handoff_ack_waiters: Some(Arc::clone(&access.handoff.ack_waiters)),
@@ -6710,6 +6711,7 @@ pub fn spawn_inbound_session(
                 peer_public_key: None,
                 peer_nonce: None,
                 hot_standby: veil_session::runner::HotStandbyState {
+                    swap_registry: None,
                     swap_rx: None,
                     handoff_registry: Some(Arc::clone(&inbound.runtime.handoff.registry)),
                     handoff_ack_waiters: Some(Arc::clone(&inbound.runtime.handoff.ack_waiters)),
