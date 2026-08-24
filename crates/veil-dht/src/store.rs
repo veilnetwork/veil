@@ -1033,8 +1033,24 @@ pub struct StoredEntry {
 #[derive(Debug)]
 pub struct TieredStore {
     /// Hot tier: recently accessed entries (always in-memory).
-    hot: HashMap<[u8; 32], (Vec<u8>, Instant)>,
+    ///
+    /// `(value, order_ts, first_seen)`. The two stamps used to be one, and one
+    /// stamp cannot do both jobs: `hot_order` wants the entry RE-DATED on
+    /// promotion (or a record read up from cold is the next thing demoted, so
+    /// promotion buys nothing), while the TTL wants the stamp NEVER re-dated
+    /// (or a tier move hands the record a fresh full lifetime). Merged, the
+    /// re-dating won and age reset on every promotion — report12 V-M7.
+    hot: HashMap<[u8; 32], (Vec<u8>, Instant, Instant)>,
+    /// Keyed by `order_ts`: demotion order, and nothing to do with expiry.
     hot_order: BTreeMap<(Instant, [u8; 32]), ()>,
+    /// `first_seen` for entries that are currently COLD, so a promotion can
+    /// give the record its own age back rather than today's date.
+    ///
+    /// Kept here rather than in the backends: neither would have to change on
+    /// disk for this, and a durable tier restored from disk has no meaningful
+    /// `Instant` anyway. Every path that takes a key out of cold drops it from
+    /// here too, so this cannot outgrow the tier it describes.
+    cold_first_seen: HashMap<[u8; 32], Instant>,
     hot_capacity: usize,
 
     /// Cold tier: pluggable backend.
@@ -1082,6 +1098,7 @@ impl TieredStore {
         Self {
             hot: HashMap::new(),
             hot_order: BTreeMap::new(),
+            cold_first_seen: HashMap::new(),
             hot_capacity,
             cold: Box::new(InMemoryCold::new(cold_capacity)),
             total_bytes: 0,
@@ -1111,6 +1128,7 @@ impl TieredStore {
         Self {
             hot: HashMap::new(),
             hot_order: BTreeMap::new(),
+            cold_first_seen: HashMap::new(),
             hot_capacity,
             cold,
             total_bytes,
@@ -1168,7 +1186,7 @@ impl TieredStore {
     pub fn get(&mut self, key: &[u8; 32]) -> Option<&Vec<u8>> {
         // Check hot first.
         if self.hot.contains_key(key) {
-            return self.hot.get(key).map(|(v, _)| v);
+            return self.hot.get(key).map(|(v, _, _)| v);
         }
         // Check cold — promote if found.
         if let Some(value) = self.cold.get(key) {
@@ -1180,8 +1198,11 @@ impl TieredStore {
             // eviction loop (audit U1).
             self.cold.remove(key);
             self.total_bytes = self.total_bytes.saturating_sub(value.len() as u64);
-            self.insert_hot(*key, value, Instant::now());
-            return self.hot.get(key).map(|(v, _)| v);
+            let now = Instant::now();
+            // Re-dated for ORDER, its own age kept for EXPIRY.
+            let first_seen = self.cold_first_seen.remove(key).unwrap_or(now);
+            self.insert_hot(*key, value, now, first_seen);
+            return self.hot.get(key).map(|(v, _, _)| v);
         }
         None
     }
@@ -1205,7 +1226,7 @@ impl TieredStore {
     /// Returns an owned value because the cold tier hands back owned bytes.
     /// Taking `&self` is the point: this path cannot mutate the store.
     pub fn get_no_promote(&self, key: &[u8; 32]) -> Option<Vec<u8>> {
-        if let Some((value, _)) = self.hot.get(key) {
+        if let Some((value, _, _)) = self.hot.get(key) {
             return Some(value.clone());
         }
         self.cold.get(key)
@@ -1224,15 +1245,16 @@ impl TieredStore {
     /// surfaced from cold tier).
     pub fn get_with_meta(&mut self, key: &[u8; 32]) -> Option<(&Vec<u8>, Instant)> {
         if self.hot.contains_key(key) {
-            return self.hot.get(key).map(|(v, ts)| (v, *ts));
+            return self.hot.get(key).map(|(v, _, first)| (v, *first));
         }
         if let Some(value) = self.cold.get(key) {
             // Byte-neutral promotion — see `get` (audit U1).
             self.cold.remove(key);
             self.total_bytes = self.total_bytes.saturating_sub(value.len() as u64);
             let now = Instant::now();
-            self.insert_hot(*key, value, now);
-            return self.hot.get(key).map(|(v, ts)| (v, *ts));
+            let first_seen = self.cold_first_seen.remove(key).unwrap_or(now);
+            self.insert_hot(*key, value, now, first_seen);
+            return self.hot.get(key).map(|(v, _, first)| (v, *first));
         }
         None
     }
@@ -1333,7 +1355,7 @@ impl TieredStore {
                 // bytes actually free.
                 if let Some(&(old_ts, old_key)) = self.hot_order.keys().next() {
                     self.hot_order.remove(&(old_ts, old_key));
-                    if let Some((old_val, _)) = self.hot.remove(&old_key) {
+                    if let Some((old_val, _, _)) = self.hot.remove(&old_key) {
                         self.account_eviction(&old_key, old_val.len() as u64);
                     }
                     continue;
@@ -1350,16 +1372,21 @@ impl TieredStore {
         //    hot side and handles hot-overflow demotion.
         self.entry_origin.insert(key, origin);
         *self.origin_bytes.entry(origin).or_insert(0) += new_bytes;
-        self.insert_hot(key, value, ts);
+        self.insert_hot(key, value, ts, ts);
         true
     }
 
+    /// Also drops the entry's `first_seen`: every path that takes a key out
+    /// of cold comes through here or names the key itself, which is what keeps
+    /// [`Self::cold_first_seen`] from outgrowing the tier it describes.
+    ///
     /// Decrement [`Self::total_bytes`] and per-origin tracking when an
     /// entry is evicted out-of-band (cold backend's own LRU cache or
     /// hot-overflow demote-and-drop).  Internal helper — call sites must
     /// have already removed the entry from its tier.
     fn account_eviction(&mut self, key: &[u8; 32], bytes: u64) {
         self.total_bytes = self.total_bytes.saturating_sub(bytes);
+        self.cold_first_seen.remove(key);
         if let Some(origin) = self.entry_origin.remove(key)
             && let Some(slot) = self.origin_bytes.get_mut(&origin)
         {
@@ -1373,7 +1400,7 @@ impl TieredStore {
     /// Look up the byte size of a stored value, irrespective of tier.
     /// Used by the per-origin cap delta check.  Returns `0` if absent.
     fn value_bytes(&self, key: &[u8; 32]) -> u64 {
-        if let Some((v, _)) = self.hot.get(key) {
+        if let Some((v, _, _)) = self.hot.get(key) {
             return v.len() as u64;
         }
         self.cold.get(key).map(|v| v.len() as u64).unwrap_or(0)
@@ -1382,10 +1409,11 @@ impl TieredStore {
     /// Remove a key from both tiers.
     pub fn remove(&mut self, key: &[u8; 32]) {
         let mut removed_bytes: u64 = 0;
-        if let Some((val, ts)) = self.hot.remove(key) {
+        if let Some((val, ts, _)) = self.hot.remove(key) {
             self.hot_order.remove(&(ts, *key));
             removed_bytes = removed_bytes.saturating_add(val.len() as u64);
         }
+        self.cold_first_seen.remove(key);
         // Cold doesn't return the removed value from its `remove` API.
         // Get the value first so we can subtract its bytes from the total.
         let cold_bytes = self.cold.get(key).map(|v| v.len() as u64).unwrap_or(0);
@@ -1459,8 +1487,11 @@ impl TieredStore {
     /// Iterate all entries across both tiers (hot first, then cold).
     /// Returns owned `(key, value)` pairs — no promotion side-effects.
     pub fn iter(&self) -> Vec<([u8; 32], Vec<u8>)> {
-        let mut result: Vec<([u8; 32], Vec<u8>)> =
-            self.hot.iter().map(|(k, (v, _))| (*k, v.clone())).collect();
+        let mut result: Vec<([u8; 32], Vec<u8>)> = self
+            .hot
+            .iter()
+            .map(|(k, (v, _, _))| (*k, v.clone()))
+            .collect();
         result.extend(self.cold.iter_entries());
         result
     }
@@ -1488,8 +1519,8 @@ impl TieredStore {
     pub fn iter_hot_with_meta(&self, now: Instant) -> Vec<StoredEntry> {
         self.hot
             .iter()
-            .map(|(k, (v, inserted_at))| {
-                let (origin, age) = self.entry_meta(k, *inserted_at, now);
+            .map(|(k, (v, _order_ts, first_seen))| {
+                let (origin, age) = self.entry_meta(k, *first_seen, now);
                 StoredEntry {
                     key: *k,
                     value: v.clone(),
@@ -1542,7 +1573,10 @@ impl TieredStore {
     /// re-serialising it every interval would defeat the disk tier and risk an
     /// OOM on large stores. No promotion side-effects.
     pub fn iter_hot(&self) -> Vec<([u8; 32], Vec<u8>)> {
-        self.hot.iter().map(|(k, (v, _))| (*k, v.clone())).collect()
+        self.hot
+            .iter()
+            .map(|(k, (v, _, _))| (*k, v.clone()))
+            .collect()
     }
 
     /// Iterate all KEYS across both tiers WITHOUT materializing cold-tier
@@ -1561,7 +1595,7 @@ impl TieredStore {
     /// interval; promoting them would churn the hot/cold boundary and defeat
     /// the tiering. Returns an owned clone; `&self`, no side-effects.
     pub fn peek(&self, key: &[u8; 32]) -> Option<Vec<u8>> {
-        if let Some((v, _)) = self.hot.get(key) {
+        if let Some((v, _, _)) = self.hot.get(key) {
             return Some(v.clone());
         }
         self.cold.get(key)
@@ -1600,11 +1634,13 @@ impl TieredStore {
         // Hot tier retain — accumulate per-key freed bytes so we can
         // adjust per-origin counters once the iteration finishes.
         let mut freed_hot_keys: Vec<([u8; 32], u64)> = Vec::new();
-        self.hot.retain(|key, (value, inserted_at)| {
+        self.hot.retain(|key, (value, order_ts, first_seen)| {
             let value_expired = expired.map(|f| f(value)).unwrap_or(false);
-            let keep = now.duration_since(*inserted_at) < ttl && !value_expired;
+            // Age from `first_seen`: the whole point of splitting the stamps is
+            // that a tier move must not buy a record another full lifetime.
+            let keep = now.duration_since(*first_seen) < ttl && !value_expired;
             if !keep {
-                self.hot_order.remove(&(*inserted_at, *key));
+                self.hot_order.remove(&(*order_ts, *key));
                 freed_hot_keys.push((*key, value.len() as u64));
             }
             keep
@@ -1640,9 +1676,29 @@ impl TieredStore {
         };
         if let Some(cutoff) = now.checked_sub(ttl) {
             removed_cold.extend(self.cold.retain_newer_than(cutoff));
+            // A backend's own stamp is when the entry was DEMOTED — it has no
+            // idea when the record was first seen, and a durable one keeps no
+            // stamp at all. So age the cold tier by what we kept for it: an
+            // entry demoted a moment ago can still be long past its lifetime,
+            // and before this it simply outlived the sweep (report12 V-M7).
+            let stale: Vec<[u8; 32]> = self
+                .cold_first_seen
+                .iter()
+                .filter(|(_, first)| **first < cutoff)
+                .map(|(k, _)| *k)
+                .collect();
+            for key in stale {
+                // Only the stale keys' sizes are read, never the whole tier —
+                // the materialization audit U2 warns about is a full scan.
+                let bytes = self.value_bytes(&key);
+                self.cold.remove(&key);
+                self.cold_first_seen.remove(&key);
+                removed_cold.push((key, bytes));
+            }
         }
         let mut freed_cold: u64 = 0;
         for (key, bytes) in &removed_cold {
+            self.cold_first_seen.remove(key);
             freed_cold = freed_cold.saturating_add(*bytes);
             if let Some(origin) = self.entry_origin.remove(key)
                 && let Some(slot) = self.origin_bytes.get_mut(&origin)
@@ -1664,7 +1720,7 @@ impl TieredStore {
     /// over-full hot tier is a bounded overshoot that the next successful
     /// demotion corrects, and a dropped DHT value is not recoverable at all
     /// (audit V-08).
-    fn insert_hot(&mut self, key: [u8; 32], value: Vec<u8>, ts: Instant) {
+    fn insert_hot(&mut self, key: [u8; 32], value: Vec<u8>, ts: Instant, first_seen: Instant) {
         if self.hot.len() >= self.hot_capacity {
             self.demote_oldest_hot();
         }
@@ -1673,7 +1729,7 @@ impl TieredStore {
         // inserted into hot when calling this — invariant enforced by
         // private visibility and call-sites that come through put_at.
         self.total_bytes = self.total_bytes.saturating_add(value.len() as u64);
-        self.hot.insert(key, (value, ts));
+        self.hot.insert(key, (value, ts, first_seen));
         self.hot_order.insert((ts, key), ());
     }
 
@@ -1687,8 +1743,14 @@ impl TieredStore {
             && let Some(entry) = self.hot.remove(&key)
         {
             self.hot_order.remove(&(ts, key));
+            let first_seen = entry.2;
             match self.cold.put(key, entry.0) {
                 ColdPut::Stored(evicted) => {
+                    // The record's own age goes with it. Without this the cold
+                    // tier only knows when it was DEMOTED, so a promotion hands
+                    // it a fresh lifetime and a tier move became a way to
+                    // outlive the retention its publisher asked for.
+                    self.cold_first_seen.insert(key, first_seen);
                     if let Some((evicted_key, evicted_val)) = evicted {
                         self.account_eviction(&evicted_key, evicted_val.len() as u64);
                     }
@@ -1703,7 +1765,7 @@ impl TieredStore {
                     // entry, and re-dating it would make it the last thing
                     // demotion tries again rather than the first.
                     log::warn!("dht.demote: cold tier refused the value; keeping it hot");
-                    self.hot.insert(key, (value, ts));
+                    self.hot.insert(key, (value, ts, first_seen));
                     self.hot_order.insert((ts, key), ());
                 }
             }
@@ -1764,6 +1826,52 @@ mod tests {
         store.get(&[1u8; 32]); // promote [1] back to hot, demote [2]
         assert_eq!(store.hot_len(), 1);
         assert!(store.hot.contains_key(&[1u8; 32]));
+    }
+
+    /// report12 V-M7, the other half: a tier move must not hand the record
+    /// another full lifetime.
+    ///
+    /// The stamp `hot_order` sorts by is re-dated on promotion — it has to be,
+    /// or a record read up from cold is the very next thing demoted and
+    /// promotion buys nothing. When that was also the stamp the TTL measured,
+    /// every promotion reset the record's age, and a node that keeps looking a
+    /// key up keeps it alive past whatever its publisher asked for.
+    #[test]
+    fn a_promotion_does_not_buy_the_record_another_lifetime() {
+        use std::time::Duration;
+
+        let now = Instant::now();
+        // Stored in the PAST, because the promotion stamps the real clock: an
+        // entry put at `now` and promoted a microsecond later is the same age
+        // either way, and the test cannot tell the two apart. An earlier
+        // version did exactly that and passed against the defect.
+        let Some(long_ago) = now.checked_sub(Duration::from_secs(600)) else {
+            eprintln!("skipped: the clock has no past to place the entry in");
+            return;
+        };
+
+        let mut store = TieredStore::new(1, 10);
+        store.put_at([1u8; 32], b"a".to_vec(), long_ago);
+        store.put_at([2u8; 32], b"b".to_vec(), long_ago); // [1] → cold
+        assert_eq!(store.cold_len(), 1);
+
+        // Read it back up. The promotion re-dates it for ORDER, which is what
+        // used to re-date it for age as well.
+        assert!(store.get(&[1u8; 32]).is_some());
+        assert!(store.is_hot(&[1u8; 32]), "the fixture failed to promote it");
+
+        // Sweeping everything older than a minute. Both entries are ten
+        // minutes old; only a reset age would save one.
+        store.retain_fresh_age_only(now, Duration::from_secs(60));
+        assert!(
+            store.get_no_promote(&[2u8; 32]).is_none(),
+            "the never-moved entry of the same age survived, so the sweep is \
+             not doing what the rest of this test assumes"
+        );
+        assert!(
+            store.get_no_promote(&[1u8; 32]).is_none(),
+            "the record outlived its ttl by being read: the promotion reset its age"
+        );
     }
 
     /// report12 V-M7: the read that answers a REMOTE FIND_VALUE must leave the
@@ -2827,17 +2935,22 @@ mod v08_tests {
     fn a_cold_tier_that_refuses_does_not_lose_the_value() {
         let mut store = TieredStore::with_cold(1, Box::new(RefusingCold::default()));
 
-        store.insert_hot([1u8; 32], b"first".to_vec(), Instant::now());
+        store.insert_hot([1u8; 32], b"first".to_vec(), Instant::now(), Instant::now());
         // Forces a demotion attempt, which the cold tier refuses.
-        store.insert_hot([2u8; 32], b"second".to_vec(), Instant::now());
+        store.insert_hot(
+            [2u8; 32],
+            b"second".to_vec(),
+            Instant::now(),
+            Instant::now(),
+        );
 
         assert_eq!(
-            store.hot.get(&[1u8; 32]).map(|(v, _)| v.as_slice()),
+            store.hot.get(&[1u8; 32]).map(|(v, _, _)| v.as_slice()),
             Some(&b"first"[..]),
             "the refused value must stay hot, not vanish"
         );
         assert_eq!(
-            store.hot.get(&[2u8; 32]).map(|(v, _)| v.as_slice()),
+            store.hot.get(&[2u8; 32]).map(|(v, _, _)| v.as_slice()),
             Some(&b"second"[..]),
             "and the new one still lands"
         );
