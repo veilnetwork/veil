@@ -225,6 +225,14 @@ jobs:
         shell: bash
         env:
           SOURCE_DATE_EPOCH: ${{ steps.epoch.outputs.value }}
+          # The updater's anti-downgrade floor is baked in from this at COMPILE
+          # time. The Unix leg gets it from scripts/build-release.sh, which
+          # exports it; this leg calls cargo directly and had no equivalent, so
+          # every published Windows binary carried a floor of 0 — no floor —
+          # and an old but still validly signed manifest could roll one back to
+          # whatever release it fixed. Same value as the Unix leg: the tagged
+          # commit's author date, which is what the manifest is signed with.
+          VEIL_RELEASE_UNIX: ${{ steps.epoch.outputs.value }}
           CARGO_INCREMENTAL: 0
           RUSTFLAGS: '--remap-path-prefix=${{ github.workspace }}=. --remap-path-prefix=C:\=/'
           # The repo-global [env] CC=clang/CXX=clang++ (.cargo/config.toml, a
@@ -241,6 +249,15 @@ jobs:
           # pulls <cstdint> in transitively, so rocksdb's headers compile without it.
           CXXFLAGS: ''
         run: |
+          # A MISSING VEIL_RELEASE_UNIX compiles to 0 in silence — the const
+          # parser only rejects a malformed one — so the failure this whole
+          # constant exists to prevent is invisible until someone tries the
+          # downgrade. Refuse to build instead.
+          : "${VEIL_RELEASE_UNIX:?a release build must carry its release timestamp}"
+          if [ "$VEIL_RELEASE_UNIX" -le 0 ] 2>/dev/null; then
+            echo "VEIL_RELEASE_UNIX=$VEIL_RELEASE_UNIX gives no anti-downgrade floor" >&2
+            exit 1
+          fi
           # Phase 6.50.b audit fix: switched from allow-empty-seeds to
           # production-seeds.  Pre-fix a CI release artifact for Windows
           # would be built without builtin seeds, producing a binary that
