@@ -146,6 +146,30 @@ pub enum SovereignIdentityError {
     },
 }
 
+/// The index of the subkey in `document` that `identity_sk` actually holds.
+///
+/// `hint` is tried first so the ordinary case costs one comparison; the scan
+/// runs only when the hint does not hold, which is the crash-window case. The
+/// answer is unambiguous: a document may not carry the same pubkey twice, so
+/// at most one slot can match.
+fn resolve_sig_key_idx(
+    document: &IdentityDocument,
+    identity_sk: &IdentitySigningKey,
+    hint: u16,
+) -> Option<u16> {
+    let matches = |idx: usize| -> bool {
+        document.identity_keys.get(idx).is_some_and(|k| {
+            k.algo == identity_sk.algo() && identity_sk.verify_skpk_match(&k.pubkey).is_ok()
+        })
+    };
+    if matches(hint as usize) {
+        return Some(hint);
+    }
+    (0..document.identity_keys.len())
+        .find(|i| matches(*i))
+        .and_then(|i| u16::try_from(i).ok())
+}
+
 impl SovereignIdentity {
     /// Construct from already-in-memory material, validating the
     /// SK↔subkey binding and the "active subkey is not revoked"
@@ -404,9 +428,29 @@ impl SovereignIdentity {
             Err(e) => return Err(SovereignIdentityError::Io(e)),
         };
 
-        let sig_key_idx = match load_device_sig_key_idx(veil_dir)? {
+        // The stored index is a HINT, not the authority (report12 V-M4).
+        //
+        // The document and this index are two files written one after the
+        // other, so a crash or a power loss between them leaves the pair
+        // disagreeing: an index naming a slot that moved, or one past the end
+        // of a document that shrank. The cross-check inside
+        // `from_parts_with_signer` catches that — it derives the pubkey from
+        // this device's secret key and compares — but catching it as an error
+        // means the identity does not load at all, and the device is bricked
+        // until someone repairs a file by hand.
+        //
+        // Nothing has to be guessed to repair it: the document says which
+        // subkey is ours, because only one of them matches our key. So the
+        // hint is tried first, and if it does not hold the document is asked
+        // instead. That makes the pair self-correcting and the write ordering
+        // between the two files stop mattering.
+        let hint = load_device_sig_key_idx(veil_dir)?.unwrap_or(document.sig_key_idx);
+        let sig_key_idx = match resolve_sig_key_idx(&document, &identity_sk, hint) {
             Some(idx) => idx,
-            None => document.sig_key_idx,
+            // No slot matches: this is not a stale index, it is a document
+            // that does not carry this device at all (revoked, or another
+            // identity's). Let the constructor say so in its own words.
+            None => hint,
         };
         Self::from_parts_with_signer(document, identity_sk, sig_key_idx)
     }
@@ -965,6 +1009,59 @@ mod tests {
         // `from_parts_active` would have rejected with `SkSubkeyMismatch`
         // since doc.sig_key_idx still points at slot 0 and its
         // SK is the source's, not the target's.
+    }
+
+    /// report12 V-M4: the document and the index file are written one after
+    /// the other, so a crash or a power loss between them leaves the index
+    /// naming a slot that is no longer this device's. The SK↔subkey
+    /// cross-check catches the disagreement — but catching it as an error
+    /// means the identity does not load AT ALL, and the device is bricked
+    /// until someone edits a file by hand.
+    ///
+    /// Nothing has to be guessed to repair it: only one subkey in the document
+    /// matches this device's key. `from_parts_active` already recovers the
+    /// neighbouring window this way (see the test below); this is the same
+    /// recovery for the window between the two writes.
+    #[test]
+    fn a_stale_sig_key_idx_is_repaired_from_the_document() {
+        use crate::sovereign_flow::{
+            DelegateDeviceOptions, MasterSecret, delegate_device, save_device_sig_key_idx,
+            save_identity_sk,
+        };
+        use ed25519_dalek::SigningKey as EdSk;
+
+        let (dir, out) = fresh_dir_with_identity();
+
+        let tgt_seed: veil_util::sensitive_bytes::SensitiveBytesN<32> =
+            veil_util::sensitive_bytes::SensitiveBytesN::from_bytes([0x33u8; 32]);
+        let tgt_pk = EdSk::from_bytes(tgt_seed.as_array()).verifying_key();
+        let delegated = delegate_device(DelegateDeviceOptions {
+            veil_dir: dir.clone(),
+            master: MasterSecret::Seed(out.master_seed.clone()),
+            device_pubkey: tgt_pk.as_bytes().to_vec(),
+            now_unix: 1_700_000_000,
+            valid_until_unix: 1_700_000_000 + 7 * 86_400,
+            out_path: None,
+        })
+        .expect("delegate the target device");
+        let real_idx = delegated.new_key_idx;
+        let stale_idx = delegated.document.sig_key_idx;
+        assert_ne!(
+            real_idx, stale_idx,
+            "the fixture must leave the index pointing somewhere ELSE, or \
+             there is no staleness to repair"
+        );
+
+        save_identity_sk(&dir, &tgt_seed).unwrap();
+        // What the crash left behind: the index still naming the old slot.
+        save_device_sig_key_idx(&dir, stale_idx).unwrap();
+
+        let sov = SovereignIdentity::load_from_dir(&dir)
+            .expect("a stale index must not stop the identity from loading");
+        assert_eq!(
+            sov.sig_key_idx, real_idx,
+            "the document was asked and it knows which subkey is ours"
+        );
     }
 
     #[test]
