@@ -48,6 +48,7 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 
@@ -151,6 +152,12 @@ pub struct MlKemCertStore {
     /// never has to ask whether persistence is on.
     path: Option<PathBuf>,
     rows: Mutex<BTreeMap<CertKey, Row>>,
+    /// Snapshot generation, taken WHILE the `rows` lock is held so its order is
+    /// the order the mutations happened in.
+    next_gen: AtomicU64,
+    /// Highest generation actually on disk. Guarded rather than atomic because
+    /// the guard also serializes the writes themselves — see [`Self::flush`].
+    published_gen: Mutex<u64>,
 }
 
 /// Snapshot path for `config_path`: `…/config.toml` → `…/peer_mlkem_certs.json`.
@@ -203,6 +210,8 @@ impl MlKemCertStore {
         Self {
             path: Some(path),
             rows: Mutex::new(rows),
+            next_gen: AtomicU64::new(0),
+            published_gen: Mutex::new(0),
         }
     }
 
@@ -212,6 +221,8 @@ impl MlKemCertStore {
         Self {
             path: None,
             rows: Mutex::new(BTreeMap::new()),
+            next_gen: AtomicU64::new(0),
+            published_gen: Mutex::new(0),
         }
     }
 
@@ -244,7 +255,7 @@ impl MlKemCertStore {
         }
         let key = (cert.node_id, cert.instance_id);
         let row = Row::from_cert(cert);
-        let snapshot = {
+        let (generation, snapshot) = {
             let mut rows = lock!(self.rows);
             if let Some(held) = rows.get(&key)
                 && held.supersede_key() >= row.supersede_key()
@@ -259,9 +270,9 @@ impl MlKemCertStore {
             if !rows.contains_key(&key) {
                 return false;
             }
-            encode(&rows)
+            (self.next_generation(), encode(&rows))
         };
-        self.flush(&snapshot);
+        self.flush(generation, &snapshot);
         true
     }
 
@@ -314,36 +325,64 @@ impl MlKemCertStore {
     /// re-wedging loop that invalidation exists to break, and worse, because
     /// this one survives a restart.
     pub fn forget_node(&self, node_id: &[u8; 32]) {
-        let snapshot = {
+        let (generation, snapshot) = {
             let mut rows = lock!(self.rows);
             let before = rows.len();
             rows.retain(|(held, _), _| held != node_id);
             if rows.len() == before {
                 return;
             }
-            encode(&rows)
+            (self.next_generation(), encode(&rows))
         };
-        self.flush(&snapshot);
+        self.flush(generation, &snapshot);
     }
 
     fn forget(&self, key: &CertKey) {
-        let snapshot = {
+        let (generation, snapshot) = {
             let mut rows = lock!(self.rows);
             if rows.remove(key).is_none() {
                 return;
             }
-            encode(&rows)
+            (self.next_generation(), encode(&rows))
         };
-        self.flush(&snapshot);
+        self.flush(generation, &snapshot);
     }
 
-    fn flush(&self, snapshot: &[CertSnapshot]) {
+    /// The next snapshot generation. Call it while the `rows` lock is held: the
+    /// point is that generation order equals mutation order.
+    fn next_generation(&self) -> u64 {
+        self.next_gen.fetch_add(1, Ordering::Relaxed) + 1
+    }
+
+    fn flush(&self, generation: u64, snapshot: &[CertSnapshot]) {
         let Some(path) = self.path.as_ref() else {
             return;
         };
+        // The guard serializes the writes AND orders them.
+        //
+        // The snapshot is encoded under the `rows` lock and written after it is
+        // released, so two threads could reach the file in either order —
+        // whichever wrote last won. Each snapshot is the WHOLE map, so a late
+        // OLDER one silently undoes the newer mutation: the row `forget_node`
+        // had just dropped is back, and the file re-serves material the peer
+        // has already said it cannot open. That is the persistent re-wedging
+        // loop invalidation exists to break, and unlike the RAM caches it
+        // survives a restart.
+        //
+        // A superseded snapshot is therefore skipped rather than written. It
+        // needs no write of its own: every generation encodes the entire map,
+        // so the newer one already contains whatever the older one carried.
+        let mut published = lock!(self.published_gen);
+        if generation <= *published {
+            return;
+        }
         // `write_snapshot` logs its own failure at the site that knows the
         // path, and the caller has already been told the row stands in memory.
-        let _ = write_snapshot(path, &snapshot, "peer ML-KEM certs");
+        // A failed write does not advance the mark: the next mutation should
+        // still try, rather than believe this generation is on disk.
+        if write_snapshot(path, &snapshot, "peer ML-KEM certs").is_durable() {
+            *published = generation;
+        }
     }
 }
 
@@ -579,6 +618,67 @@ mod tests {
 
     /// The whole point of a file: the certificate is still there after the
     /// process that fetched it is gone.
+    /// Two writers, one file, and the OLDER snapshot arriving last.
+    ///
+    /// Every mutator encodes the whole map under the `rows` lock and writes it
+    /// after releasing it, so the order the file sees is not the order the
+    /// mutations happened in. A late older snapshot silently undoes the newer
+    /// one — and because each snapshot is the entire map, "undoes" means the
+    /// row `forget_node` just dropped is back on disk. That is the file
+    /// re-serving material the peer has already said it cannot open, which is
+    /// the persistent form of the re-wedging loop invalidation exists to break,
+    /// and unlike the RAM caches it survives a restart.
+    #[test]
+    fn a_late_older_snapshot_does_not_resurrect_a_forgotten_row() {
+        let s = signer(0x21);
+        let tmp = tempfile::tempdir().unwrap();
+        let config = tmp.path().join("config.toml");
+        let store = MlKemCertStore::load(&config, NOW);
+        assert!(store.remember(&s.cert([0xab; 16], NOW, NOW + 30 * 86_400, 1), NOW));
+
+        // What a writer that got as far as encoding, then stalled, is holding.
+        let stale_generation = store.next_generation();
+        let stale_snapshot = encode(&lock!(store.rows).clone());
+        assert_eq!(
+            stale_snapshot.len(),
+            1,
+            "the stalled writer still has the row"
+        );
+
+        // Meanwhile the peer says it cannot open what we sealed.
+        store.forget_node(&s.doc.node_id);
+        assert_eq!(store.len(), 0);
+
+        // The stalled writer finally lands.
+        store.flush(stale_generation, &stale_snapshot);
+
+        let reborn = MlKemCertStore::load(&config, NOW);
+        assert_eq!(
+            reborn.len(),
+            0,
+            "a superseded snapshot must not put the forgotten row back on disk",
+        );
+    }
+
+    /// The ordering must not turn into "only the first write ever lands": a
+    /// newer generation still replaces an older one, which is the ordinary case.
+    #[test]
+    fn a_newer_snapshot_still_replaces_an_older_one() {
+        let s = signer(0x22);
+        let tmp = tempfile::tempdir().unwrap();
+        let config = tmp.path().join("config.toml");
+        let store = MlKemCertStore::load(&config, NOW);
+        assert!(store.remember(&s.cert([0xab; 16], NOW, NOW + 30 * 86_400, 1), NOW));
+        assert_eq!(MlKemCertStore::load(&config, NOW).len(), 1);
+
+        store.forget_node(&s.doc.node_id);
+        assert_eq!(
+            MlKemCertStore::load(&config, NOW).len(),
+            0,
+            "the newer snapshot is written, not skipped",
+        );
+    }
+
     #[test]
     fn a_restart_keeps_the_remembered_certs() {
         let s = signer(0x17);
