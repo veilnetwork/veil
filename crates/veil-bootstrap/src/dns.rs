@@ -51,6 +51,20 @@ const SECURE_DNS_TIMEOUT: Duration = Duration::from_secs(4);
 /// it's hung and we'd rather move on.
 const SYSTEM_DNS_TIMEOUT: Duration = Duration::from_secs(3);
 
+/// The encrypted upstreams, in the order they are tried.
+const ENCRYPTED_UPSTREAMS: [&ServerGroup<'_>; 3] = [&CLOUDFLARE, &GOOGLE, &QUAD9];
+
+/// What ONE encrypted upstream may spend before the next is tried.
+///
+/// `SECURE_DNS_TIMEOUT` divided by the number of upstreams, so every one of
+/// them is reached within the stage's budget even when the earlier ones hang.
+/// Kept as an expression rather than a number: adding a fourth upstream must
+/// shrink the slice rather than silently overrun the stage — the arithmetic is
+/// asserted in the tests below.
+const PER_UPSTREAM_DNS_TIMEOUT: Duration = Duration::from_millis(
+    (SECURE_DNS_TIMEOUT.as_millis() / ENCRYPTED_UPSTREAMS.len() as u128) as u64,
+);
+
 /// Query DNS TXT records for bootstrap seeds, preferring encrypted
 /// transports (DoT > DoH > system).
 ///
@@ -89,10 +103,20 @@ pub async fn discover_seeds_dns(domain: &str) -> Vec<BootstrapPeer> {
     }
 
     // Stage 3: system DNS — censor-readable, last resort.  Returns
-    // whatever the local resolver chooses (potentially rewritten by a
-    // DPI middlebox); operator-deployed bootstrap signature on the
-    // signed-invite layer (`signed_invite.rs`) protects against a
-    // tampered TXT response delivering rogue seeds.
+    // whatever the local resolver chooses, and NOTHING here authenticates
+    // it: `parse_seed_txt` reads transport, pubkey and nonce, and there is
+    // no issuer signature in the record to check.  This comment used to
+    // claim the signed-invite layer covered it; it does not — that layer
+    // signs invites, not TXT records, so a resolver or an on-path
+    // middlebox chooses these seeds outright.
+    //
+    // What bounds it is where it sits rather than what it proves: the
+    // caller reaches DNS discovery only when the node has no configured
+    // and no builtin peers at all, so there is nothing here for rogue
+    // seeds to displace, and `MAX_BOOTSTRAP_SEEDS_PER_SOURCE` caps what
+    // one source can contribute.  A node with no other contact can still
+    // have its first ones chosen for it, which is why stages 1 and 2 are
+    // given a budget each upstream can actually use.
     tokio::time::timeout(SYSTEM_DNS_TIMEOUT, discover_seeds_dns_system(domain))
         .await
         .unwrap_or_default()
@@ -177,16 +201,37 @@ async fn run_encrypted_group(
     Some(run_txt_query(&resolver, query_name).await)
 }
 
-/// Race CLOUDFLARE / GOOGLE / QUAD9 for the requested mode and return
-/// the first non-empty success.  Single-resolver failures (network
-/// error, NXDOMAIN, transport-layer block) silently fall through to
-/// the next upstream.
+/// Try CLOUDFLARE, then GOOGLE, then QUAD9 for the requested mode and
+/// return the first non-empty success.  Single-resolver failures
+/// (network error, NXDOMAIN, transport-layer block) fall through to the
+/// next upstream.
+///
+/// In series, not raced — the doc here said "Race" and the code never
+/// did, which matters because the two disclose differently: asking one
+/// upstream and stopping tells only that one what this node is looking
+/// for, and racing tells all three.  Kept in series for that reason;
+/// what was actually broken was the budget, below.
+///
+/// EACH UPSTREAM GETS ITS OWN SLICE.  The stage as a whole had a single
+/// 4-second timeout and nothing bounded one upstream inside it, so a
+/// blocked resolver — which does not refuse, it hangs, and is exactly
+/// what this staging exists for — consumed the entire budget and the
+/// other two were never tried.  DoT then failed, DoH lost its own
+/// budget the same way, and the node arrived at plain system DNS: the
+/// censorship this ladder is built against was what collapsed it onto
+/// the one rung that a censor can rewrite.
 async fn run_encrypted(domain: &str, mode: EncryptedMode) -> Option<Vec<BootstrapPeer>> {
     let query_name = format!("_veil._bootstrap.{domain}.");
-    for group in [&CLOUDFLARE, &GOOGLE, &QUAD9] {
-        if let Some(seeds) = run_encrypted_group(group, mode, &query_name).await
-            && !seeds.is_empty()
-        {
+    for group in ENCRYPTED_UPSTREAMS {
+        let Ok(Some(seeds)) = tokio::time::timeout(
+            PER_UPSTREAM_DNS_TIMEOUT,
+            run_encrypted_group(group, mode, &query_name),
+        )
+        .await
+        else {
+            continue;
+        };
+        if !seeds.is_empty() {
             return Some(seeds);
         }
     }
@@ -256,6 +301,47 @@ fn parse_seed_txt(line: &str) -> Option<BootstrapPeer> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every encrypted upstream must be reachable inside the stage's budget.
+    ///
+    /// The stage had one 4-second timeout and nothing bounded a single
+    /// upstream inside it, so a blocked resolver — which hangs rather than
+    /// refusing, and is exactly what this ladder exists for — spent the whole
+    /// budget and the other two were never tried. DoT failed, DoH lost its own
+    /// budget the same way, and the node arrived at plain system DNS: the one
+    /// rung a censor can rewrite, reached BECAUSE of the censorship.
+    #[test]
+    fn every_upstream_fits_inside_the_stage_budget() {
+        let worst_case = PER_UPSTREAM_DNS_TIMEOUT * ENCRYPTED_UPSTREAMS.len() as u32;
+        assert!(
+            worst_case <= SECURE_DNS_TIMEOUT,
+            "all {} upstreams hanging costs {worst_case:?}, past the stage's \
+             {SECURE_DNS_TIMEOUT:?} — the last ones would never be tried",
+            ENCRYPTED_UPSTREAMS.len(),
+        );
+        assert!(
+            !PER_UPSTREAM_DNS_TIMEOUT.is_zero(),
+            "a slice of zero refuses every upstream instantly",
+        );
+    }
+
+    /// A seed read off plain DNS carries no proof of who issued it.
+    ///
+    /// Pinned here because the stage-3 comment used to claim the signed-invite
+    /// layer covered these records. It does not, and a reader who believes it
+    /// would treat the last rung as authenticated.
+    #[test]
+    fn a_txt_seed_carries_no_issuer_proof() {
+        let line = "transport=tcp://s:7001 pubkey=AAAA sig=anything issuer=someone";
+        let peer = parse_seed_txt(line).expect("should parse");
+        assert_eq!(peer.transport, "tcp://s:7001");
+        assert_eq!(peer.public_key, "AAAA");
+        assert!(
+            peer.tls_cert.is_none() && peer.tls_ca_cert.is_none(),
+            "nothing in a BootstrapPeer holds an issuer signature, so the \
+             fields a record might carry one in are dropped unread",
+        );
+    }
 
     #[test]
     fn parse_valid_seed_txt() {
