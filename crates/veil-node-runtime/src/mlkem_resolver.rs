@@ -491,16 +491,7 @@ impl DhtMlKemEkResolver {
                         r.node_id == target_node_id && verify_instance_registry_sig(r, &doc)
                     })
                 },
-                |r| {
-                    (
-                        r.instances
-                            .iter()
-                            .map(|i| i.last_seen_unix_ms)
-                            .max()
-                            .unwrap_or(0),
-                        0,
-                    )
-                },
+                registry_freshness,
             )
             .await
         {
@@ -782,16 +773,7 @@ impl DhtMlKemEkResolver {
                         r.node_id == target_node_id && verify_instance_registry_sig(r, &doc)
                     })
                 },
-                |r| {
-                    (
-                        r.instances
-                            .iter()
-                            .map(|i| i.last_seen_unix_ms)
-                            .max()
-                            .unwrap_or(0),
-                        0,
-                    )
-                },
+                registry_freshness,
             )
             .await
         else {
@@ -1538,6 +1520,37 @@ fn hex8(node_id: &[u8; 32]) -> String {
     veil_util::bytes_to_hex(&node_id[..4])
 }
 
+/// Supersede order for two signed `InstanceRegistry` candidates of the same
+/// identity, newest first once reversed.
+///
+/// `reg_version` FIRST, exactly as the cert walk orders by `cert_version`: it
+/// is the registry's own monotonic counter, and its doc has always promised
+/// that consumers reject a decreasing one.
+///
+/// Nothing read it. The key was `(max last_seen, 0)`, and `last_seen_unix_ms`
+/// is published as 0 on EVERY row on purpose — `sovereign.rs::
+/// all_instance_entries` keeps the registry byte-identical across a device
+/// family — so every candidate scored `(0, 0)`, the sort was a no-op, and the
+/// winner was whichever replica the walk happened to return first. After a
+/// second device is linked, the old one-device registry and the new two-device
+/// one are BOTH correctly signed by a still-valid key, so a lagging replica
+/// could hand back the old one and the new device silently vanished from the
+/// seal fan-out. That is the exact failure [`MlKemResolver::dht_get_freshest`]
+/// exists to end, left switched off for this one key by a placeholder.
+///
+/// `max last_seen` stays as the tie-break rather than being dropped: it costs
+/// nothing at 0 and is the right second term if rows ever carry real times.
+fn registry_freshness(r: &InstanceRegistry) -> (u64, u64) {
+    (
+        r.reg_version,
+        r.instances
+            .iter()
+            .map(|i| i.last_seen_unix_ms)
+            .max()
+            .unwrap_or(0),
+    )
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 //
 // Unit-test coverage focuses on the **pure** parts of the pipeline.
@@ -1547,6 +1560,79 @@ fn hex8(node_id: &[u8; 32]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Both registries below are correctly signed by a key that is still in
+    /// the document — that is the whole difficulty. Nothing about the old one
+    /// is invalid; it is merely superseded, and only `reg_version` says so.
+    fn registry_with(version: u64, instances: usize) -> InstanceRegistry {
+        InstanceRegistry {
+            node_id: [0x22; 32],
+            reg_version: version,
+            signing_identity_key_idx: 0,
+            instances: (0..instances)
+                .map(|i| veil_proto::instance_registry::InstanceEntry {
+                    instance_id: [i as u8; 16],
+                    bound_identity_key_idx: 0,
+                    label: String::new(),
+                    // 0 on every row, as every publisher writes it.
+                    last_seen_unix_ms: 0,
+                })
+                .collect(),
+            sig: vec![0u8; 64],
+        }
+    }
+
+    /// The freshness key must separate an old registry from a new one. With
+    /// `(max last_seen, 0)` it could not: every published row carries
+    /// `last_seen_unix_ms = 0`, so both candidates scored identically.
+    #[test]
+    fn a_newer_registry_outranks_an_older_one() {
+        let old = registry_with(1, 1);
+        let new = registry_with(2, 2);
+        assert!(
+            registry_freshness(&new) > registry_freshness(&old),
+            "reg_version is the registry's supersede order and must decide"
+        );
+    }
+
+    /// The bug in the form it actually bit: `dht_get_freshest` sorts with a
+    /// STABLE sort, so when every candidate ties the winner is whichever
+    /// replica answered first. A lagging replica listed first therefore won,
+    /// and the device added by the newer registry was left out of the seal
+    /// fan-out — online, correctly signed, and unreachable.
+    #[test]
+    fn the_newer_registry_wins_from_either_candidate_order() {
+        let old = registry_with(1, 1);
+        let new = registry_with(2, 2);
+
+        for candidates in [
+            vec![old.clone(), new.clone()],
+            vec![new.clone(), old.clone()],
+        ] {
+            let mut sorted = candidates;
+            sorted.sort_by_key(|r| std::cmp::Reverse(registry_freshness(r)));
+            assert_eq!(
+                sorted[0].reg_version, 2,
+                "the stale replica must not win by answering first"
+            );
+            assert_eq!(
+                sorted[0].instances.len(),
+                2,
+                "the linked device must survive selection"
+            );
+        }
+    }
+
+    /// A tie on version falls through to the timestamp rather than to
+    /// whichever replica spoke first, for the day rows carry real times.
+    #[test]
+    fn equal_versions_fall_through_to_last_seen() {
+        let mut a = registry_with(5, 1);
+        let mut b = registry_with(5, 1);
+        a.instances[0].last_seen_unix_ms = 100;
+        b.instances[0].last_seen_unix_ms = 200;
+        assert!(registry_freshness(&b) > registry_freshness(&a));
+    }
 
     #[test]
     fn hex8_formats_first_four_bytes() {
