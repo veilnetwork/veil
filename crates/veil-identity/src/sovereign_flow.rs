@@ -2257,15 +2257,34 @@ fn write_document_and_index(
 ) -> Result<(), AdoptDocumentError> {
     let doc_path = veil_dir.join(IDENTITY_DOCUMENT_FILE);
     let idx_path = veil_dir.join(DEVICE_SIG_KEY_IDX_FILE);
-    let prev_doc = std::fs::read(&doc_path).ok();
-    let prev_idx = std::fs::read(&idx_path).ok();
+    // Captured BEFORE anything is touched, and the capture must be CERTAIN.
+    //
+    // These were `std::fs::read(..).ok()`, which answers `None` both for a
+    // file that is not there and for one that could not be read. `restore`
+    // reads `None` as "there was nothing here" and DELETES — so a transient
+    // read failure at capture time turned the compensation into the very thing
+    // it exists to prevent, removing an identity document that was present the
+    // whole time. Absence and not-knowing are different answers, and only one
+    // of them can be put back.
+    let prev_doc = read_for_compensation(&doc_path)?;
+    let prev_idx = read_for_compensation(&idx_path)?;
 
-    let restore = |path: &Path, prev: Option<&Vec<u8>>| match prev {
-        Some(bytes) => {
-            let _ = atomic_write(path, bytes);
-        }
-        None => {
-            let _ = std::fs::remove_file(path);
+    // A restore that itself fails leaves the directory in the state this
+    // function promises never to leave it in, and the caller is about to be
+    // told only about the ORIGINAL error. Say so where it happens.
+    let restore = |path: &Path, prev: Option<&Vec<u8>>| {
+        let outcome = match prev {
+            Some(bytes) => atomic_write(path, bytes),
+            None => match std::fs::remove_file(path) {
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                other => other,
+            },
+        };
+        if let Err(e) = outcome {
+            log::error!(
+                "veil-identity: could not put {} back after a failed write ({e}) —                  the identity directory may now be inconsistent",
+                path.display()
+            );
         }
     };
 
@@ -2279,6 +2298,19 @@ fn write_document_and_index(
         return Err(e.into());
     }
     Ok(())
+}
+
+/// The bytes currently at `path`, or `None` when there is genuinely no file.
+///
+/// Any other read failure is an ERROR rather than an absence: what cannot be
+/// captured cannot be put back, and treating it as "nothing was here" is what
+/// turns the compensation into a delete.
+fn read_for_compensation(path: &Path) -> std::io::Result<Option<Vec<u8>>> {
+    match std::fs::read(path) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e),
+    }
 }
 
 /// Retire a device's key from the identity document, permanently.
@@ -3390,6 +3422,63 @@ mod tests {
             .collect();
         out.sort();
         out
+    }
+
+    /// A previous state that cannot be READ is not a previous state that was
+    /// ABSENT, and only one of the two can be put back.
+    ///
+    /// The capture was `std::fs::read(..).ok()`, which answers `None` for
+    /// both. `restore` reads `None` as "there was nothing here" and DELETES,
+    /// so a document that was present the whole time — merely unreadable for a
+    /// moment — was removed by the compensation that exists to protect it.
+    /// `load_from_dir` then fails closed and the node comes up with no
+    /// identity at all.
+    ///
+    /// Arranged so the two behaviours differ: the document is unreadable
+    /// (mode 000) but still WRITABLE through temp+rename, which needs
+    /// directory permission rather than file permission, and the index path is
+    /// a directory so the second write fails. Old code: document written,
+    /// index refused, document deleted. New code: refuses before touching
+    /// anything.
+    #[cfg(unix)]
+    #[test]
+    fn a_previous_state_that_cannot_be_read_is_never_treated_as_absent() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let seed = create_identity(test_opts(tempdir())).unwrap().master_seed;
+        let d = tempdir();
+        provision(d.clone(), seed.clone());
+        let doc_path = d.join(IDENTITY_DOCUMENT_FILE);
+        let doc = IdentityDocument::decode(&std::fs::read(&doc_path).unwrap()).unwrap();
+
+        // The second write must fail: a directory where the index file goes.
+        let idx_path = d.join(DEVICE_SIG_KEY_IDX_FILE);
+        let _ = std::fs::remove_file(&idx_path);
+        std::fs::create_dir(&idx_path).unwrap();
+
+        // The document becomes unreadable, and stays present.
+        std::fs::set_permissions(&doc_path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::read(&doc_path).is_ok() {
+            // Running as root: the mode is not enforced, so this arrangement
+            // cannot be made. Say so rather than pass vacuously.
+            eprintln!("skipped: running as root, mode 000 is not enforced");
+            return;
+        }
+
+        let err = write_document_and_index(&d, &doc, 0).unwrap_err();
+        assert!(
+            matches!(err, AdoptDocumentError::Io(_)),
+            "an uncapturable previous state must be an io error, got {err:?}"
+        );
+        std::fs::set_permissions(&doc_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(
+            doc_path.exists(),
+            "the document was present the whole time and must still be there"
+        );
+        assert!(
+            !std::fs::read(&doc_path).unwrap().is_empty(),
+            "and it must still hold its bytes, not an empty file"
+        );
     }
 
     /// A REFUSED adopt must not have already replaced the document.
