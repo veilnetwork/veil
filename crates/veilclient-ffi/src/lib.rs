@@ -12901,6 +12901,153 @@ pub unsafe extern "C" fn veil_ratchet_export(
     VEIL_OK
 }
 
+/// Where a conversation's sending chain stands: the chain it is on, and the
+/// index the next sealed message will carry.
+///
+/// A host records this durably BEFORE it publishes a ciphertext, so that a
+/// state write which never lands cannot let a restart re-derive a key this
+/// session already spent on the wire (report12 X-H5). It is 36 bytes against
+/// the state's kilobytes, which is what makes it affordable on the send path —
+/// and a host reserving a small run of indices at a time pays it once per run
+/// rather than once per message.
+///
+/// Returns [`VEIL_ERR_RATCHET_NO_CONVERSATION`] when the key names nothing
+/// held, or names a conversation with no sending chain yet — there is then no
+/// position to reserve, and nothing has been published either.
+///
+/// # Safety
+///
+/// `handle` must be live. `key_64` MUST point to exactly
+/// [`VEIL_RATCHET_KEY_LEN`] readable bytes. `out_chain_32` MUST be writable
+/// for 32 bytes. `out_next` MUST be writable.
+#[unsafe(no_mangle)]
+#[cfg(feature = "node-embedded")]
+pub unsafe extern "C" fn veil_ratchet_send_position(
+    handle: *mut VeilHandle,
+    key_64: *const u8,
+    out_chain_32: *mut u8,
+    out_next: *mut u32,
+    err_out: *mut *mut c_char,
+) -> c_int {
+    if let Err(rc) = unsafe { guard::ffi_prelude(err_out, "veil_ratchet_send_position") } {
+        return rc;
+    }
+    null_check!(err_out,
+        "handle" => handle,
+        "key_64" => key_64,
+        "out_chain_32" => out_chain_32,
+        "out_next" => out_next,
+    );
+    get_or_return!(
+        handle_live,
+        handle_table(),
+        handle,
+        err_out,
+        VEIL_ERR_INVALID_ARG,
+        "VeilHandle"
+    );
+    let ratchet = match ratchet_for_bundle(&handle_live.bundle) {
+        Ok(r) => r,
+        Err(e) => {
+            unsafe { write_err(err_out, e) };
+            return VEIL_ERR;
+        }
+    };
+    let key = unsafe { ratchet_key_from(key_64) };
+    let Some(at) = ratchet.store.send_position(&key) else {
+        unsafe {
+            write_err(
+                err_out,
+                "no conversation with a sending chain under that key",
+            )
+        };
+        return VEIL_ERR_RATCHET_NO_CONVERSATION;
+    };
+    unsafe {
+        ptr::copy_nonoverlapping(at.chain.as_ptr(), out_chain_32, 32);
+        *out_next = at.next;
+    }
+    VEIL_OK
+}
+
+/// Step a conversation's sending chain past every index that might already
+/// have been spent, and report how many keys were burned.
+///
+/// The recovery half of [`veil_ratchet_send_position`]: on start, a state
+/// restored from before an unwritten send is fast-forwarded to the last
+/// position the host recorded. Keys burned this way were never emitted, so the
+/// peer sees a gap its skipped-key window absorbs.
+///
+/// A position naming a chain this conversation is no longer on, or an index it
+/// has already passed, burns nothing and is not an error — keys from a chain
+/// we no longer hold cannot collide with keys from the one we do.
+///
+/// Returns [`VEIL_ERR_RATCHET_NO_CONVERSATION`] when the key names nothing
+/// held, and [`VEIL_ERR_INVALID_ARG`] when the position asks for a jump past
+/// what a host reserving indices could legitimately have got ahead — a
+/// corrupted or hostile mark. Nothing is burned in either case.
+///
+/// # Safety
+///
+/// `handle` must be live. `key_64` MUST point to exactly
+/// [`VEIL_RATCHET_KEY_LEN`] readable bytes. `chain_32` MUST point to 32
+/// readable bytes. `out_burned` MUST be writable.
+#[unsafe(no_mangle)]
+#[cfg(feature = "node-embedded")]
+pub unsafe extern "C" fn veil_ratchet_skip_send_to(
+    handle: *mut VeilHandle,
+    key_64: *const u8,
+    chain_32: *const u8,
+    next: u32,
+    out_burned: *mut u32,
+    err_out: *mut *mut c_char,
+) -> c_int {
+    if let Err(rc) = unsafe { guard::ffi_prelude(err_out, "veil_ratchet_skip_send_to") } {
+        return rc;
+    }
+    null_check!(err_out,
+        "handle" => handle,
+        "key_64" => key_64,
+        "chain_32" => chain_32,
+        "out_burned" => out_burned,
+    );
+    get_or_return!(
+        handle_live,
+        handle_table(),
+        handle,
+        err_out,
+        VEIL_ERR_INVALID_ARG,
+        "VeilHandle"
+    );
+    let ratchet = match ratchet_for_bundle(&handle_live.bundle) {
+        Ok(r) => r,
+        Err(e) => {
+            unsafe { write_err(err_out, e) };
+            return VEIL_ERR;
+        }
+    };
+    let key = unsafe { ratchet_key_from(key_64) };
+    let mut chain = [0u8; 32];
+    unsafe { ptr::copy_nonoverlapping(chain_32, chain.as_mut_ptr(), 32) };
+    match ratchet
+        .store
+        .skip_send_to(&key, veil_e2e::ratchet::SendPosition { chain, next })
+    {
+        Ok(burned) => {
+            unsafe { *out_burned = burned };
+            VEIL_OK
+        }
+        Err(veil_e2e::ratchet::RatchetSkipError::NoConversation) => {
+            unsafe { write_err(err_out, "no conversation under that key") };
+            VEIL_ERR_RATCHET_NO_CONVERSATION
+        }
+        Err(e) => {
+            unsafe { write_err(err_out, e.to_string()) };
+            VEIL_ERR_INVALID_ARG
+        }
+    }
+}
+
 /// Restore one conversation from bytes [`veil_ratchet_export`] produced.
 ///
 /// Called for every stored conversation at startup, BEFORE traffic flows: a
