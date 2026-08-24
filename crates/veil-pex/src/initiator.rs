@@ -1,5 +1,6 @@
 //! PEX initiator task — periodically sends random walks and processes results.
 
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -21,11 +22,46 @@ const MAX_PEERS_PER_SUBNET: usize = 2;
 // 3..20 → 1 h, >=20 → 1 day.
 const INITIAL_DELAY_SECS: u64 = 30;
 
+/// How long a walk we sent stays eligible to have its PoW challenges answered.
+///
+/// A challenge rides back from a hop the walk reached, so it arrives within a
+/// round trip of the walk leaving. Two minutes is far past that and still far
+/// short of the walk cadence (15 min at its most eager), so it cannot let one
+/// round's tickets bleed into the next.
+const WALK_CHALLENGE_WINDOW: Duration = Duration::from_secs(120);
+
+/// Ceiling on tickets held at once. `walk_parallelism` per round is a handful,
+/// so this is slack for a slow round overlapping the next, not a working size.
+const MAX_OUTSTANDING_WALKS: usize = 64;
+
+/// Most hops that may extract one PoW each from a single walk. A walk carries
+/// `ttl` 4..12, so 12 is the honest maximum; a hop counted twice is a hop
+/// asking twice.
+const MAX_POW_PER_WALK: usize = 12;
+
+/// A walk this node actually sent, and the hops that have already been paid
+/// PoW for it.
+struct WalkTicket {
+    issued_at: Instant,
+    paid: HashSet<[u8; 32]>,
+}
+
 /// Discovered peers from PEX, shared with the runtime for connection attempts.
 pub struct PexState {
     pub discovered_peers: Vec<(PexPeer, Instant)>,
+    /// Walks we sent and have not yet retired. Mirrors `outstanding_walks`
+    /// so the CLI and admin surfaces keep reading a plain count.
     pub active_walks: u32,
     pub last_walk_at: Option<Instant>,
+    /// walk_id -> ticket, for the walks THIS node sent.
+    ///
+    /// A PoW challenge names a `walk_id`, and until this existed nothing
+    /// checked that the walk was ours: any authenticated peer could name any
+    /// number and have us grind BLAKE3 at `MAX_POW_DIFFICULTY` (24 — up to
+    /// 2^26 hashes) for each one, serially, inside the same task that services
+    /// every other PEX event. On a phone that is the battery, which is the one
+    /// budget this project spends its measurements on.
+    outstanding_walks: HashMap<u64, WalkTicket>,
 }
 
 impl Default for PexState {
@@ -40,7 +76,63 @@ impl PexState {
             discovered_peers: Vec::new(),
             active_walks: 0,
             last_walk_at: None,
+            outstanding_walks: HashMap::new(),
         }
+    }
+
+    /// Record a walk this node put on the wire.
+    fn note_walk_sent(&mut self, walk_id: u64) {
+        let now = Instant::now();
+        self.outstanding_walks
+            .retain(|_, t| now.duration_since(t.issued_at) < WALK_CHALLENGE_WINDOW);
+        if self.outstanding_walks.len() >= MAX_OUTSTANDING_WALKS {
+            // Drop the oldest rather than refuse the new one: a ticket that old
+            // is past the window in all but name, and refusing would let a
+            // stalled round lock out the next.
+            if let Some(oldest) = self
+                .outstanding_walks
+                .iter()
+                .min_by_key(|(_, t)| t.issued_at)
+                .map(|(id, _)| *id)
+            {
+                self.outstanding_walks.remove(&oldest);
+            }
+        }
+        self.outstanding_walks.insert(
+            walk_id,
+            WalkTicket {
+                issued_at: now,
+                paid: HashSet::new(),
+            },
+        );
+        self.active_walks = self.outstanding_walks.len() as u32;
+    }
+
+    /// Whether `from_peer` may have one PoW solved for `walk_id`.
+    ///
+    /// True at most once per (walk we sent, hop): a walk legitimately draws a
+    /// challenge from every hop it reaches, so this cannot consume the ticket
+    /// on the first one, but a hop that asks twice is answered once.
+    fn claim_pow(&mut self, walk_id: u64, from_peer: [u8; 32]) -> bool {
+        let now = Instant::now();
+        let Some(ticket) = self.outstanding_walks.get_mut(&walk_id) else {
+            return false;
+        };
+        if now.duration_since(ticket.issued_at) >= WALK_CHALLENGE_WINDOW {
+            self.outstanding_walks.remove(&walk_id);
+            self.active_walks = self.outstanding_walks.len() as u32;
+            return false;
+        }
+        if ticket.paid.len() >= MAX_POW_PER_WALK {
+            return false;
+        }
+        ticket.paid.insert(from_peer)
+    }
+
+    /// Retire a walk once its Result has come back.
+    fn retire_walk(&mut self, walk_id: u64) {
+        self.outstanding_walks.remove(&walk_id);
+        self.active_walks = self.outstanding_walks.len() as u32;
     }
 
     pub fn add_peers(&mut self, peers: Vec<PexPeer>, max: usize) {
@@ -263,7 +355,8 @@ pub async fn spawn_pex_initiator(
                     Some(PexEvent::Challenge { challenge, from_peer }) => {
                         handle_challenge(
                             &challenge, from_peer, &local_node_id, &local_pubkey, local_nonce,
-                            signing_key.as_ref(), broadcaster.as_ref(), logger.as_ref(),
+                            signing_key.as_ref(), broadcaster.as_ref(), &pex_state,
+                            logger.as_ref(),
                         ).await;
                     }
                     Some(PexEvent::Result { result, from_peer }) => {
@@ -339,11 +432,12 @@ fn send_walks(
                     target_node_id[0], target_node_id[1]
                 ),
             );
-        }
 
-        {
+            // Only a walk that actually left counts. The counter used to be
+            // incremented here whether or not there was a peer to send to, so
+            // an isolated node reported walks it never made.
             let mut state = pex_state.lock().unwrap_or_else(|p| p.into_inner());
-            state.active_walks += 1;
+            state.note_walk_sent(walk_id);
             state.last_walk_at = Some(Instant::now());
         }
     }
@@ -353,12 +447,13 @@ fn send_walks(
 #[allow(clippy::too_many_arguments)]
 async fn handle_challenge(
     challenge: &PexChallenge,
-    _from_peer: [u8; 32],
+    from_peer: [u8; 32],
     _local_node_id: &[u8; 32],
     _local_pubkey: &[u8],
     _local_nonce: u64,
     signing_key: Option<&ed25519_dalek::SigningKey>,
     broadcaster: &dyn FrameBroadcaster,
+    pex_state: &Arc<Mutex<PexState>>,
     logger: &dyn PexLogger,
 ) {
     logger.info(
@@ -368,6 +463,33 @@ async fn handle_challenge(
             challenge.walk_id, challenge.difficulty
         ),
     );
+
+    // Answer PoW only for a walk WE sent, and at most once per hop.
+    //
+    // Nothing checked this before: `from_peer` was received and discarded, and
+    // any authenticated peer could name any `walk_id` and have this task grind
+    // BLAKE3 to `MAX_POW_DIFFICULTY`. The solve is on `spawn_blocking`, but the
+    // loop below awaits it, so a stream of invented challenges also starves
+    // every other PEX event behind CPU nobody asked for.
+    //
+    // The check is by walk_id and NOT by "the peer we sent the walk to": a walk
+    // has ttl 4..12 and every hop it reaches answers the ORIGIN, so a legitimate
+    // challenge routinely arrives from a node this one never dialled. Binding to
+    // the sent-to peer would have broken discovery.
+    {
+        let mut state = pex_state.lock().unwrap_or_else(|p| p.into_inner());
+        if !state.claim_pow(challenge.walk_id, from_peer) {
+            logger.warn(
+                "pex.challenge.unsolicited",
+                &format!(
+                    "walk_id={} difficulty={} — no outstanding walk of ours, \
+                     or this hop was already answered; not solving",
+                    challenge.walk_id, challenge.difficulty
+                ),
+            );
+            return;
+        }
+    }
 
     // skip peers that demand PoW difficulty above what a legitimate
     // node ever produces. Without this cap the initiator burns CPU forever on
@@ -483,7 +605,10 @@ async fn handle_result(
         .collect();
     {
         let mut state = pex_state.lock().unwrap_or_else(|p| p.into_inner());
-        state.active_walks = state.active_walks.saturating_sub(1);
+        // Retire the ticket this Result belongs to. The count used to be
+        // decremented for ANY Result, so an unsolicited one with an invented
+        // walk_id drove the gauge toward zero while real walks were still open.
+        state.retire_walk(result.walk_id);
         state.add_peers(peers.clone(), config.max_peers);
     }
 
@@ -641,6 +766,96 @@ fn is_wildcard_transport(transport: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A PoW challenge names a walk_id, and nothing used to check that the walk
+    /// was ours. Any authenticated peer could invent one and have this node
+    /// grind BLAKE3 at `MAX_POW_DIFFICULTY` — 2^26 hashes — for each, serially,
+    /// in the task that also services every other PEX event.
+    #[test]
+    fn an_invented_walk_id_buys_no_proof_of_work() {
+        let mut state = PexState::new();
+        let hop = [7u8; 32];
+        assert!(
+            !state.claim_pow(0xDEAD_BEEF, hop),
+            "a walk this node never sent must not be worth a single hash"
+        );
+        assert_eq!(state.active_walks, 0);
+    }
+
+    /// A walk carries ttl 4..12 and every hop it reaches challenges the ORIGIN,
+    /// so one walk legitimately draws several challenges from nodes this one
+    /// never dialled. The ticket therefore cannot be consumed by the first
+    /// challenge — it is spent per hop.
+    #[test]
+    fn a_sent_walk_pays_each_hop_once() {
+        let mut state = PexState::new();
+        state.note_walk_sent(42);
+        assert_eq!(state.active_walks, 1);
+
+        let hop_a = [1u8; 32];
+        let hop_b = [2u8; 32];
+        assert!(state.claim_pow(42, hop_a), "first hop is legitimate");
+        assert!(
+            state.claim_pow(42, hop_b),
+            "a second hop on the same walk is legitimate too"
+        );
+        assert!(
+            !state.claim_pow(42, hop_a),
+            "a hop that asks twice for the same walk is answered once"
+        );
+    }
+
+    /// The per-walk ceiling is the honest maximum ttl, so a hop count beyond
+    /// what a walk can reach cannot extract more work.
+    #[test]
+    fn one_walk_cannot_be_milked_past_its_ttl() {
+        let mut state = PexState::new();
+        state.note_walk_sent(9);
+        for i in 0..MAX_POW_PER_WALK {
+            let mut hop = [0u8; 32];
+            hop[0] = i as u8;
+            assert!(state.claim_pow(9, hop), "hop {i} is within ttl");
+        }
+        let mut extra = [0u8; 32];
+        extra[0] = 0xFF;
+        assert!(
+            !state.claim_pow(9, extra),
+            "past the ttl ceiling the walk is spent"
+        );
+    }
+
+    /// Tickets are bounded, so a node that walks for a long time without
+    /// results cannot grow this map without limit.
+    #[test]
+    fn outstanding_walks_are_bounded() {
+        let mut state = PexState::new();
+        for id in 0..(MAX_OUTSTANDING_WALKS as u64 * 3) {
+            state.note_walk_sent(id);
+        }
+        assert!(
+            state.outstanding_walks.len() <= MAX_OUTSTANDING_WALKS,
+            "held {} tickets, ceiling is {MAX_OUTSTANDING_WALKS}",
+            state.outstanding_walks.len()
+        );
+        assert_eq!(state.active_walks as usize, state.outstanding_walks.len());
+    }
+
+    /// The gauge used to be decremented for ANY Result, so an unsolicited one
+    /// naming an invented walk_id drove it toward zero while real walks were
+    /// still open.
+    #[test]
+    fn retiring_a_walk_we_never_sent_moves_nothing() {
+        let mut state = PexState::new();
+        state.note_walk_sent(1);
+        state.note_walk_sent(2);
+        assert_eq!(state.active_walks, 2);
+
+        state.retire_walk(0xABCD);
+        assert_eq!(state.active_walks, 2, "an unknown walk_id retires nothing");
+
+        state.retire_walk(1);
+        assert_eq!(state.active_walks, 1);
+    }
 
     #[test]
     fn solve_pex_pow_finds_solution() {
