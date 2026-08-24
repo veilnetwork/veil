@@ -209,6 +209,43 @@ impl ServiceBudget {
         allowed
     }
 
+    /// Charge bytes for work that has already been done.
+    ///
+    /// [`try_serve`](Self::try_serve) charges what the REQUEST weighs, because
+    /// the reply cannot be measured before it is built — and for a lookup that
+    /// reply runs to `MAX_DHT_VALUE_BYTES`, three orders of magnitude past the
+    /// request that asked for it. So the meter counted a fraction of what the
+    /// node actually sent, and the hourly budget a person set for other
+    /// people's work bounded that fraction rather than the traffic.
+    ///
+    /// Called once the reply exists, with the bytes the admission did not
+    /// cover. It cannot refuse — they are already spent — so the balance goes
+    /// into debt and the NEXT request waits for it to refill. Nothing already
+    /// answered is taken back.
+    pub fn note_served(&self, kind: ServiceKind, extra: u64) {
+        self.note_served_at(kind, extra, Instant::now());
+    }
+
+    /// [`note_served`](Self::note_served) with an injectable clock.
+    pub fn note_served_at(&self, kind: ServiceKind, extra: u64, now: Instant) {
+        if extra == 0 {
+            return;
+        }
+        self.served_bytes.fetch_add(extra, Ordering::Relaxed);
+        if self.is_unmetered() || self.bytes_per_hour == 0 {
+            return;
+        }
+        {
+            let mut b = self.bucket.lock().unwrap_or_else(|p| p.into_inner());
+            b.charge_at(extra as f64, now);
+        }
+        log::trace!(
+            target: "service_budget.reconciled",
+            "{} cost {extra} B more than its request weighed",
+            kind.label(),
+        );
+    }
+
     /// `(served, refused, refusals)` since start, for the metrics endpoint.
     #[must_use]
     pub fn totals(&self) -> (u64, u64, u64) {
@@ -281,6 +318,62 @@ mod tests {
         assert!(
             !b.try_serve_at(ServiceKind::Lookup, 0, t0),
             "zero-length requests must exhaust the budget like any other",
+        );
+    }
+
+    /// The meter has to count what was SENT, not what was asked for.
+    ///
+    /// Admission charges the request, because the reply does not exist yet. A
+    /// value answer runs to `MAX_DHT_VALUE_BYTES` — three orders of magnitude
+    /// past the request — so an hourly budget set for other people's work
+    /// bounded a fraction of the traffic and let the rest through unseen.
+    #[test]
+    fn a_reply_bigger_than_its_request_is_charged_for() {
+        let hourly = 100_000;
+        let b = ServiceBudget::new(hourly);
+        let t0 = Instant::now();
+
+        // A tiny request admitted, then answered with 16 KiB.
+        assert!(b.try_serve_at(ServiceKind::Lookup, 40, t0));
+        b.note_served_at(ServiceKind::Lookup, 16 * 1024 - 40, t0);
+
+        let (served, _, _) = b.totals();
+        assert_eq!(
+            served,
+            16 * 1024,
+            "the meter has to show the bytes that left, not the ask",
+        );
+
+        // And the balance moved with it: at 40 B a request the budget would
+        // take thousands more, but the replies are what spend it.
+        let mut admitted = 0;
+        for _ in 0..10 {
+            if b.try_serve_at(ServiceKind::Lookup, 40, t0) {
+                admitted += 1;
+                b.note_served_at(ServiceKind::Lookup, 16 * 1024 - 40, t0);
+            }
+        }
+        assert!(
+            admitted < 10,
+            "a budget of {hourly} B cannot answer eleven 16 KiB lookups in one \
+             instant; it admitted {admitted} more",
+        );
+    }
+
+    /// A reconciliation must never be able to lock the bucket out for longer
+    /// than the window it is sized in.
+    #[test]
+    fn one_enormous_reply_costs_at_most_a_full_window() {
+        let hourly = 10_000;
+        let b = ServiceBudget::new(hourly);
+        let t0 = Instant::now();
+        b.note_served_at(ServiceKind::Lookup, 10_000_000, t0);
+
+        // One full window later the budget is available again.
+        let later = t0 + std::time::Duration::from_secs(3600);
+        assert!(
+            b.try_serve_at(ServiceKind::Lookup, 1, later),
+            "a debt deeper than the bucket would take hours to refill",
         );
     }
 

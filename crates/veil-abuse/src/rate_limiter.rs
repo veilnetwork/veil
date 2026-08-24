@@ -75,6 +75,20 @@ impl TokenBucket {
         }
     }
 
+    /// Debit `n` tokens for work that has ALREADY happened.
+    ///
+    /// Unlike [`Self::allow_n_at`] this cannot refuse — the bytes are spent —
+    /// so the balance is allowed to go negative and the next admission waits
+    /// for the debt to refill. That is the only honest way to meter a reply
+    /// whose size is not known until it has been built.
+    ///
+    /// Floored at `-capacity`: one enormous charge should cost at most a full
+    /// window, not lock the bucket for as many windows as it happens to weigh.
+    pub fn charge_at(&mut self, n: f64, now: Instant) {
+        self.refill(now);
+        self.tokens = (self.tokens - n).max(-self.capacity);
+    }
+
     /// Current token level (for diagnostics).
     pub fn tokens(&self) -> f64 {
         self.tokens
