@@ -250,11 +250,21 @@ impl FrameDispatcher {
                     Err(e) => return DispatchResult::Violation(format!("bad FindValue: {e}")),
                 };
                 let resp = self.dht.handle_find_value(payload);
+                let encoded = resp.encode();
+                // The admission above paid for the REQUEST. A value answer runs
+                // to `MAX_DHT_VALUE_BYTES`, so the meter counted a fraction of
+                // what this node is about to send — reconcile now that the size
+                // is known. Nothing is taken back; the balance goes into debt
+                // and the next asker waits for it.
+                self.abuse.service_budget.note_served(
+                    ServiceKind::Lookup,
+                    (encoded.len() as u64).saturating_sub(body.len() as u64),
+                );
                 DispatchResult::Response(encode_response(
                     header,
                     FrameFamily::Discovery as u8,
                     DiscoveryMsg::FindValueResponse as u16,
-                    &resp.encode(),
+                    &encoded,
                 ))
             }
             DiscoveryMsg::FindValueResponse => {
