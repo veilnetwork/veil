@@ -158,7 +158,7 @@ impl Outbox {
                 for entry in entries.iter()? {
                     let (_, v) = entry?;
                     let (_, blob) = decode_record(v.value())?;
-                    total = total.saturating_add(blob.len() as u64);
+                    total = total.saturating_add(crate::billable_bytes(blob.len() as u64));
                 }
                 meta.insert(META_KEY_TOTAL_BYTES, total)?;
             }
@@ -211,6 +211,17 @@ impl Outbox {
                 max: MAX_OUTBOX_BLOB_BYTES as u64,
             });
         }
+        // The floor `Mailbox::put` has had since the audit that added
+        // `BlobTooSmall`, and which this path never got. Its reasoning is the
+        // same here: a zero-length blob is legal on the wire and cost a
+        // payload-counted quota nothing at all, while still writing an entries
+        // row and an eviction row that live until the TTL.
+        if (blob.len() as u64) < crate::MIN_BLOB_BYTES {
+            return Err(MailboxError::BlobTooSmall {
+                actual: blob.len() as u64,
+                min: crate::MIN_BLOB_BYTES,
+            });
+        }
         let now = (self.clock)();
         let txn = self.db.begin_write()?;
         {
@@ -226,7 +237,7 @@ impl Outbox {
             let mut old_blob_len: u64 = 0;
             if let Some(record) = stale_record {
                 let (old_ts, old_blob) = decode_record(&record)?;
-                old_blob_len = old_blob.len() as u64;
+                old_blob_len = crate::billable_bytes(old_blob.len() as u64);
                 let old_evict = make_evict_key(old_ts, &receiver_id, &content_id);
                 evict.remove(old_evict.as_slice())?;
             }
@@ -235,9 +246,14 @@ impl Outbox {
                 .get(META_KEY_TOTAL_BYTES)?
                 .map(|v| v.value())
                 .unwrap_or(0);
+            // Against the RECORD COST, the way the relay's own quota has
+            // counted since audit V-05: payload plus what the row costs on
+            // disk. A payload-only quota bounded bytes and not cardinality, so
+            // the entry count — the actual lever — was limited by nothing but
+            // the 30-day TTL.
             let new_total = current_total
                 .saturating_sub(old_blob_len)
-                .saturating_add(blob.len() as u64);
+                .saturating_add(crate::billable_bytes(blob.len() as u64));
             if new_total > self.config.quota_total_bytes {
                 // Abort the txn implicitly by returning before commit.
                 return Err(MailboxError::OutboxQuotaExceeded {
@@ -353,7 +369,7 @@ impl Outbox {
                         .get(META_KEY_TOTAL_BYTES)?
                         .map(|v| v.value())
                         .unwrap_or(0);
-                    let new_total = current.saturating_sub(blob.len() as u64);
+                    let new_total = current.saturating_sub(crate::billable_bytes(blob.len() as u64));
                     meta.insert(META_KEY_TOTAL_BYTES, new_total)?;
                     should_commit = true;
                     true
@@ -401,7 +417,8 @@ impl Outbox {
                 let key = make_key(&recv, &cid);
                 if let Some(record_guard) = entries.get(key.as_slice())? {
                     let (_, blob) = decode_record(record_guard.value())?;
-                    bytes_freed = bytes_freed.saturating_add(blob.len() as u64);
+                    bytes_freed =
+                        bytes_freed.saturating_add(crate::billable_bytes(blob.len() as u64));
                 }
                 if entries.remove(key.as_slice())?.is_some() {
                     count += 1;
@@ -429,9 +446,14 @@ impl Outbox {
         Ok(t.len()?)
     }
 
-    /// aggregate blob bytes currently stored.
-    /// Cheap (single-key read). Useful for operators tracking how
+    /// What the outbox currently occupies against its quota: every stored
+    /// blob's payload plus [`crate::RECORD_OVERHEAD_BYTES`] for the row it
+    /// lives in. Cheap (single-key read). Useful for operators tracking how
     /// close the outbox is to its `quota_total_bytes` cap.
+    ///
+    /// Physical bytes rather than payload bytes, matching the relay's own
+    /// accounting — a quota that counted only payloads bounded no number of
+    /// rows at all.
     pub fn total_blob_bytes(&self) -> Result<u64, MailboxError> {
         let txn = self.db.begin_read()?;
         let meta = txn.open_table(OUTBOX_TABLE_META)?;
@@ -579,11 +601,11 @@ mod tests {
         let (o, _tmp, clk) = fresh(OutboxConfig::default());
         let recv = [1u8; 32];
         clk.store(300, Ordering::SeqCst);
-        o.put(recv, [b'C'; 32], vec![]).unwrap();
+        o.put(recv, [b'C'; 32], vec![1]).unwrap();
         clk.store(100, Ordering::SeqCst);
-        o.put(recv, [b'A'; 32], vec![]).unwrap();
+        o.put(recv, [b'A'; 32], vec![1]).unwrap();
         clk.store(200, Ordering::SeqCst);
-        o.put(recv, [b'B'; 32], vec![]).unwrap();
+        o.put(recv, [b'B'; 32], vec![1]).unwrap();
         let bf = BloomFilter::for_capacity(100, 0.01);
         let missing = o.find_missing(recv, 0, &bf).unwrap();
         assert_eq!(missing.len(), 3);
@@ -631,9 +653,9 @@ mod tests {
         });
         let recv = [1u8; 32];
         clk.store(0, Ordering::SeqCst);
-        o.put(recv, [b'A'; 32], vec![]).unwrap();
+        o.put(recv, [b'A'; 32], vec![1]).unwrap();
         clk.store(50, Ordering::SeqCst);
-        o.put(recv, [b'B'; 32], vec![]).unwrap();
+        o.put(recv, [b'B'; 32], vec![1]).unwrap();
         clk.store(200, Ordering::SeqCst);
         let pruned = o.prune_expired().unwrap();
         // Cutoff = 200-100 = 100. A (ts=0) and B (ts=50) both pruned.
@@ -687,16 +709,62 @@ mod tests {
         assert_eq!(o.total_blob_bytes().unwrap(), 0);
     }
 
+    /// A quota counted in payloads bounds no number of rows.
+    ///
+    /// `blob_len = 0` is legal on the wire and cost a payload-counted quota
+    /// nothing at all, while every distinct (receiver, content) pair still
+    /// wrote an entries row and an eviction row that live until the 30-day
+    /// TTL. `Mailbox::put` has refused empty blobs since the audit that added
+    /// `BlobTooSmall`, and the relay's quota has counted physical bytes since
+    /// audit V-05; this path had neither.
+    #[test]
+    fn an_empty_blob_is_refused_and_the_quota_bounds_the_row_count() {
+        let (o, _tmp, _clk) = fresh(OutboxConfig {
+            ttl_secs: DEFAULT_OUTBOX_TTL_SECS,
+            quota_total_bytes: 2000,
+        });
+        let recv = [1u8; 32];
+
+        let err = o.put(recv, [b'Z'; 32], vec![]).unwrap_err();
+        assert!(
+            matches!(err, MailboxError::BlobTooSmall { actual: 0, .. }),
+            "expected BlobTooSmall, got {err:?}",
+        );
+        assert_eq!(o.len().unwrap(), 0, "and nothing was written");
+
+        // The smallest legal blob, repeated: the byte quota is now what stops
+        // it, because each row is charged what it costs.
+        let mut admitted = 0u64;
+        for i in 0..100u32 {
+            let mut cid = [0u8; 32];
+            cid[..4].copy_from_slice(&i.to_le_bytes());
+            if o.put(recv, cid, vec![1]).is_ok() {
+                admitted += 1;
+            }
+        }
+        assert_eq!(
+            admitted,
+            2000 / crate::billable_bytes(1),
+            "the row count has to be bounded by the quota, not by the TTL",
+        );
+        assert_eq!(o.len().unwrap(), admitted);
+    }
+
     /// aggregate quota fires before DB write.
+    ///
+    /// Sized in PHYSICAL bytes: each record costs its payload plus
+    /// `RECORD_OVERHEAD_BYTES`, so the quota bounds the row count as well as
+    /// the volume. A quota below one record's overhead admits nothing at all,
+    /// which is the honest reading of "this much disk".
     #[test]
     fn phase6_50_d_6_3_outbox_rejects_over_quota_total() {
         let cfg = OutboxConfig {
             ttl_secs: DEFAULT_OUTBOX_TTL_SECS,
-            quota_total_bytes: 100,
+            quota_total_bytes: 500,
         };
         let (o, _tmp, _clk) = fresh(cfg);
         let recv = [1u8; 32];
-        // 60 + 60 = 120 > 100; second put rejected.
+        // (60+256) fits; a second (60+256) would be 632 > 500.
         o.put(recv, [b'A'; 32], vec![0; 60]).unwrap();
         let err = o.put(recv, [b'B'; 32], vec![0; 60]).unwrap_err();
         match err {
@@ -705,14 +773,14 @@ mod tests {
                 blob_size,
                 cap_bytes,
             } => {
-                assert_eq!(current_bytes, 60);
+                assert_eq!(current_bytes, crate::billable_bytes(60));
                 assert_eq!(blob_size, 60);
-                assert_eq!(cap_bytes, 100);
+                assert_eq!(cap_bytes, 500);
             }
             other => panic!("expected OutboxQuotaExceeded, got {other:?}"),
         }
         // Counter still reflects only the first successful put.
-        assert_eq!(o.total_blob_bytes().unwrap(), 60);
+        assert_eq!(o.total_blob_bytes().unwrap(), crate::billable_bytes(60));
     }
 
     /// replace-put adjusts the counter by delta.
@@ -722,13 +790,14 @@ mod tests {
         let recv = [1u8; 32];
         let cid = [b'A'; 32];
         o.put(recv, cid, vec![0; 100]).unwrap();
-        assert_eq!(o.total_blob_bytes().unwrap(), 100);
+        assert_eq!(o.total_blob_bytes().unwrap(), crate::billable_bytes(100));
         // Re-put same key with larger blob → counter goes to new size, not sum.
         o.put(recv, cid, vec![0; 300]).unwrap();
-        assert_eq!(o.total_blob_bytes().unwrap(), 300);
-        // Re-put same key with smaller blob → counter shrinks.
+        assert_eq!(o.total_blob_bytes().unwrap(), crate::billable_bytes(300));
+        // Re-put same key with smaller blob → counter shrinks. One record, so
+        // one overhead — a replace must not accumulate them either.
         o.put(recv, cid, vec![0; 50]).unwrap();
-        assert_eq!(o.total_blob_bytes().unwrap(), 50);
+        assert_eq!(o.total_blob_bytes().unwrap(), crate::billable_bytes(50));
     }
 
     /// ack decrements the counter.
@@ -738,10 +807,15 @@ mod tests {
         let recv = [1u8; 32];
         o.put(recv, [b'A'; 32], vec![0; 100]).unwrap();
         o.put(recv, [b'B'; 32], vec![0; 200]).unwrap();
-        assert_eq!(o.total_blob_bytes().unwrap(), 300);
+        assert_eq!(
+            o.total_blob_bytes().unwrap(),
+            crate::billable_bytes(100) + crate::billable_bytes(200),
+        );
         assert!(o.ack(recv, [b'A'; 32]).unwrap());
-        assert_eq!(o.total_blob_bytes().unwrap(), 200);
+        assert_eq!(o.total_blob_bytes().unwrap(), crate::billable_bytes(200));
         assert!(o.ack(recv, [b'B'; 32]).unwrap());
+        // Back to nothing — the overheads must be refunded too, or the outbox
+        // creeps toward a quota it is not holding.
         assert_eq!(o.total_blob_bytes().unwrap(), 0);
     }
 
@@ -758,12 +832,15 @@ mod tests {
         o.put(recv, [b'A'; 32], vec![0; 100]).unwrap();
         clk.store(200, Ordering::SeqCst);
         o.put(recv, [b'B'; 32], vec![0; 50]).unwrap();
-        assert_eq!(o.total_blob_bytes().unwrap(), 150);
+        assert_eq!(
+            o.total_blob_bytes().unwrap(),
+            crate::billable_bytes(100) + crate::billable_bytes(50),
+        );
         clk.store(300, Ordering::SeqCst);
         let pruned = o.prune_expired().unwrap();
         // Cutoff = 300-100 = 200. A (ts=0) pruned; B (ts=200, NOT <
         // cutoff in `range::<&[u8]>(.. upper)` — exclusive upper) kept.
         assert_eq!(pruned, 1);
-        assert_eq!(o.total_blob_bytes().unwrap(), 50);
+        assert_eq!(o.total_blob_bytes().unwrap(), crate::billable_bytes(50));
     }
 }
