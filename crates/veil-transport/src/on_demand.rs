@@ -118,6 +118,23 @@ impl OnDemandLifecycle {
                 .compare_exchange(prev, prev - 1, Ordering::SeqCst, Ordering::SeqCst)
                 .is_ok()
             {
+                // The budget just ran out, so the slot is retired — say so on
+                // the channel the waiters actually watch.
+                //
+                // `await_ttl_or_shutdown` selects on the TTL and this signal
+                // and nothing else, so before this the rendezvous permit
+                // watcher slept until the TTL no matter how quickly the slot
+                // spent itself. With `max_accepts` defaulting to 1 and a
+                // documented TTL of five minutes, one connection took a slot
+                // out of the pool for five minutes after it was finished with
+                // — the semaphore permit and the `slots_in_use` gauge both.
+                //
+                // Signalled here rather than at each accept loop: retiring is
+                // a property of the budget reaching zero, not of any one
+                // caller remembering to announce it.
+                if prev == 1 {
+                    self.shutdown();
+                }
                 return prev;
             }
         }
@@ -138,11 +155,15 @@ impl OnDemandLifecycle {
         false
     }
 
-    /// Async wait until either (a) TTL deadline reached, (b) explicit
-    /// shutdown signalled.  Note this does NOT track the accept-budget
-    /// path — accept-task implementations check `note_accept()` after
-    /// each handshake and break out of their loop manually when the
-    /// returned `prev` indicates the slot is now retired.
+    /// Async wait until either (a) TTL deadline reached, or (b) the slot is
+    /// retired — by an explicit [`Self::shutdown`], or by the accept budget
+    /// running out, which signals the same channel from [`Self::note_accept`].
+    ///
+    /// The accept-budget path used not to be covered here, and the accept
+    /// tasks that break out of their own loop on `note_accept`'s return value
+    /// were the only thing that noticed. Anything ELSE waiting on this — the
+    /// rendezvous permit watcher, which holds a semaphore slot — slept until
+    /// the TTL however quickly the slot spent itself.
     ///
     /// Designed for use in a `tokio::select!` arm alongside
     /// `listener.accept()` so the accept-task wakes promptly when
@@ -309,6 +330,56 @@ mod tests {
     }
 
     // ── note_accept ────────────────────────────────────────────────
+
+    /// Spending the budget must wake whoever is waiting on the slot.
+    ///
+    /// The rendezvous permit watcher holds a semaphore slot and a
+    /// `slots_in_use` gauge, and waits on `await_ttl_or_shutdown`. That wait
+    /// covered the TTL and an explicit shutdown and nothing else, so with
+    /// `max_accepts` at its default of 1 and a documented five-minute TTL, one
+    /// connection took a slot out of the pool for five minutes after it was
+    /// finished with.
+    #[tokio::test]
+    async fn spending_the_budget_wakes_a_waiter_at_once() {
+        // A TTL long enough that reaching it would be the test hanging, not
+        // the test passing.
+        let l = std::sync::Arc::new(make_lifecycle(Duration::from_secs(600), 1));
+        let waiter = {
+            let l = std::sync::Arc::clone(&l);
+            tokio::spawn(async move { l.await_ttl_or_shutdown().await })
+        };
+
+        // Nothing has retired the slot yet.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(!waiter.is_finished(), "the waiter must not wake on its own");
+
+        assert_eq!(l.note_accept(), 1, "the last allowed accept");
+        assert!(l.should_exit(), "the slot is retired by the budget");
+
+        tokio::time::timeout(Duration::from_secs(5), waiter)
+            .await
+            .expect("the waiter has to wake when the budget runs out")
+            .expect("the waiting task must not panic");
+    }
+
+    /// And not before: a slot with budget left is still in service.
+    #[tokio::test]
+    async fn a_slot_with_budget_left_does_not_retire() {
+        let l = std::sync::Arc::new(make_lifecycle(Duration::from_secs(600), 2));
+        let waiter = {
+            let l = std::sync::Arc::clone(&l);
+            tokio::spawn(async move { l.await_ttl_or_shutdown().await })
+        };
+
+        assert_eq!(l.note_accept(), 2, "one of two");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(
+            !waiter.is_finished(),
+            "a slot that may still accept must stay in service",
+        );
+        assert!(!l.should_exit());
+        waiter.abort();
+    }
 
     #[test]
     fn note_accept_decrements_counter() {
