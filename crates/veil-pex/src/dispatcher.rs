@@ -39,6 +39,41 @@ pub struct PexDispatcher {
     logger: Arc<dyn PexLogger>,
 }
 
+/// The peers we may hand to a stranger who asks.
+///
+/// `PexState::discovered_peers` is filled straight from received results —
+/// hearsay we have never contacted — and serving it verbatim turns every node
+/// into a relay for addresses it cannot reach. A production seed ended up
+/// advertising transports on another network's port, which its own PSK can
+/// never complete; deleting them by hand brought them back within two hours,
+/// because the neighbours were still handing them out.
+///
+/// A live session is the one claim we can actually make about a peer, and it
+/// is also the filter another network can never pass. This is a newtype rather
+/// than a filter at the call site so the rule cannot be forgotten: `dispatch`
+/// takes nothing else, and the only way to build one is to name the sessions.
+/// The walk pool is untouched — this is about what we EMIT.
+pub struct VouchedPeers(Vec<PexPeer>);
+
+impl VouchedPeers {
+    pub fn from_sessions(
+        known: &[(PexPeer, Instant)],
+        live: &std::collections::HashSet<[u8; 32]>,
+    ) -> Self {
+        Self(
+            known
+                .iter()
+                .filter(|(p, _)| live.contains(&p.node_id))
+                .map(|(p, _)| p.clone())
+                .collect(),
+        )
+    }
+
+    pub fn as_slice(&self) -> &[PexPeer] {
+        &self.0
+    }
+}
+
 impl PexDispatcher {
     pub fn new(
         local_node_id: [u8; 32],
@@ -69,7 +104,7 @@ impl PexDispatcher {
         peer_id: [u8; 32],
         broadcaster: Option<&dyn FrameBroadcaster>,
         advertise_uris: &[String],
-        known_peers: &[(PexPeer, Instant)],
+        known_peers: &VouchedPeers,
     ) -> PexDispatchOutcome {
         let msg = match PexMsg::try_from(msg_type) {
             Ok(m) => m,
@@ -255,7 +290,7 @@ impl PexDispatcher {
         body: &[u8],
         _peer_id: [u8; 32],
         advertise_uris: &[String],
-        known_peers: &[(PexPeer, Instant)],
+        known_peers: &VouchedPeers,
     ) -> PexDispatchOutcome {
         let response = match PexResponse::decode(body) {
             Ok(r) => r,
@@ -315,7 +350,7 @@ impl PexDispatcher {
         }
 
         // Add known peers.
-        for (peer, _) in known_peers {
+        for peer in known_peers.as_slice() {
             if peers.len() >= self.max_response_peers as usize {
                 break;
             }
@@ -527,5 +562,66 @@ mod walk_origin_auth_tests {
         let mut w = signed_walk(0xABCD, [0x11; 32]);
         w.origin_pubkey.truncate(16);
         assert!(!verify_walk_origin(&w));
+    }
+
+    fn pex_peer(id: u8, transport: &str) -> PexPeer {
+        PexPeer {
+            node_id: [id; 32],
+            transport: transport.to_owned(),
+            public_key: vec![id; 32],
+            nonce: 0,
+        }
+    }
+
+    /// We pass on peers, not rumours.
+    ///
+    /// `discovered_peers` is whatever the last result told us, contacted or
+    /// not. A production seed served transports on another network's port from
+    /// that pool — its own PSK can never complete them — and the entries
+    /// returned within two hours of being deleted, because the neighbours kept
+    /// handing them out.
+    ///
+    /// Break-check: make `from_sessions` ignore `live` and the rumour is
+    /// served.
+    #[test]
+    fn a_peer_we_never_reached_is_not_passed_on() {
+        let known = vec![
+            (
+                pex_peer(0x11, "obfs4-tcp://198.51.100.11:5556"),
+                Instant::now(),
+            ),
+            (
+                pex_peer(0x22, "obfs4-tcp://198.51.100.11:5557"),
+                Instant::now(),
+            ),
+        ];
+        let live: std::collections::HashSet<[u8; 32]> = [[0x11u8; 32]].into_iter().collect();
+
+        let vouched = VouchedPeers::from_sessions(&known, &live);
+
+        let served: Vec<&str> = vouched
+            .as_slice()
+            .iter()
+            .map(|p| p.transport.as_str())
+            .collect();
+        assert_eq!(
+            served,
+            vec!["obfs4-tcp://198.51.100.11:5556"],
+            "only the peer we hold a session with may be handed on"
+        );
+    }
+
+    /// No session, nothing to say — an empty answer beats a wrong one.
+    #[test]
+    fn a_node_with_no_sessions_vouches_for_nobody() {
+        let known = vec![(
+            pex_peer(0x33, "obfs4-tcp://198.51.100.7:5556"),
+            Instant::now(),
+        )];
+        let vouched = VouchedPeers::from_sessions(&known, &Default::default());
+        assert!(
+            vouched.as_slice().is_empty(),
+            "a node that has reached nobody cannot vouch for anybody"
+        );
     }
 }

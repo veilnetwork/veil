@@ -1726,11 +1726,27 @@ impl FrameDispatcher {
             FrameFamily::PeerExchange => {
                 if let Some(ref pex) = self.pex_dispatcher {
                     let uris = self.listen_transports_snapshot();
+                    // Serve only peers we hold a live session with — see
+                    // `VouchedPeers`, whose constructor is the only way to
+                    // build the argument `dispatch` takes.
+                    let live = self
+                        .session_tx_registry
+                        .as_ref()
+                        .map(|reg| {
+                            reg.read()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .active_node_ids()
+                        })
+                        .unwrap_or_default();
                     let known = self
                         .pex_state
                         .as_ref()
-                        .map(|s| lock!(s).discovered_peers.clone())
-                        .unwrap_or_default();
+                        .map(|s| {
+                            veil_pex::VouchedPeers::from_sessions(&lock!(s).discovered_peers, &live)
+                        })
+                        .unwrap_or_else(|| {
+                            veil_pex::VouchedPeers::from_sessions(&[], &Default::default())
+                        });
                     // PEX is its own crate now; bridge the
                     // SessionTxRegistry through the FrameBroadcaster trait
                     // adapter and translate the small outcome enum back into
