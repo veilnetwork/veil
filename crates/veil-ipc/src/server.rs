@@ -69,6 +69,22 @@ const IPC_QUERY_BURST: u32 = 30;
 const IPC_PUT_REFILL_PER_SEC: f32 = 50.0;
 const IPC_PUT_BURST: u32 = 200;
 
+/// Per-client `MailboxAck` rate.
+///
+/// Acks used to share the read-query bucket (burst 30), and one fetch legally
+/// returns up to `MAX_MAILBOX_FETCH_ENTRIES` — 256 — blobs, every one of which
+/// the recipient must ack. So a recipient doing exactly what the protocol asks
+/// ran out of tokens after about 29 of them, and the rest were answered
+/// `removed=false`: the same word the daemon uses for "already gone" and "bad
+/// cookie". The app reads that as nothing to do, stops asking, and the rows
+/// stay — so the next fetch returns the same blobs, and the one after that.
+///
+/// The burst is therefore tied to the fetch cap: whatever one fetch is allowed
+/// to hand out, the recipient is allowed to acknowledge. Refill matches the put
+/// path, since ack is the far end of the same delivery.
+const IPC_ACK_REFILL_PER_SEC: f32 = 50.0;
+const IPC_ACK_BURST: u32 = veil_proto::ipc::MAX_MAILBOX_FETCH_ENTRIES as u32;
+
 /// Byte-budgeted, clone-able sender for a client's veil→IPC delivery queue.
 ///
 /// The underlying mpsc is bounded by frame COUNT (`DELIVERY_CHANNEL_CAP`), but a
@@ -386,6 +402,8 @@ pub struct IpcClientState {
     /// and vice-versa. Fills at `IPC_PUT_REFILL_PER_SEC`, caps at `IPC_PUT_BURST`.
     put_tokens: f32,
     put_last_refill: std::time::Instant,
+    ack_tokens: f32,
+    ack_last_refill: std::time::Instant,
 }
 
 impl IpcClientState {
@@ -414,6 +432,8 @@ impl IpcClientState {
             query_last_refill: std::time::Instant::now(),
             put_tokens: IPC_PUT_BURST as f32,
             put_last_refill: std::time::Instant::now(),
+            ack_tokens: IPC_ACK_BURST as f32,
+            ack_last_refill: std::time::Instant::now(),
         }
     }
 
@@ -432,6 +452,23 @@ impl IpcClientState {
             (self.query_tokens + elapsed * IPC_QUERY_REFILL_PER_SEC).min(IPC_QUERY_BURST as f32);
         if self.query_tokens >= 1.0 {
             self.query_tokens -= 1.0;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Per-client token-bucket gate for `MailboxAck`. Sized against the fetch
+    /// cap rather than the read-query rate — see [`IPC_ACK_BURST`] for what
+    /// sharing the query bucket cost.
+    pub(super) fn allow_ack(&mut self) -> bool {
+        let now = std::time::Instant::now();
+        let elapsed = now.duration_since(self.ack_last_refill).as_secs_f32();
+        self.ack_last_refill = now;
+        self.ack_tokens =
+            (self.ack_tokens + elapsed * IPC_ACK_REFILL_PER_SEC).min(IPC_ACK_BURST as f32);
+        if self.ack_tokens >= 1.0 {
+            self.ack_tokens -= 1.0;
             true
         } else {
             false
@@ -3305,6 +3342,46 @@ mod put_rate_limit_tests {
         // Budget is available again.
         assert!(tx.try_send(frame()).is_ok());
         assert_eq!(inflight.load(Ordering::Acquire), 80);
+    }
+
+    /// A recipient must be able to acknowledge a whole fetch.
+    ///
+    /// Acks shared the read-query bucket (burst 30) while one fetch hands out
+    /// up to `MAX_MAILBOX_FETCH_ENTRIES` blobs, every one of which the
+    /// recipient is required to ack. So the ordinary act of clearing a batch
+    /// ran dry after about 29, and the remaining acks were answered
+    /// `removed=false` — the same word as "already gone" and "bad cookie". The
+    /// app reads that as nothing to do and stops asking, while the rows are
+    /// still there, so the next fetch returns the same blobs again.
+    #[test]
+    fn a_whole_fetch_can_be_acknowledged_in_one_burst() {
+        let (tx, _rx) = mpsc::channel::<veil_bufpool::PooledShared>(1);
+        let mut st = IpcClientState::new(tx, [0u8; 32], [0u8; 16], None);
+
+        let mut allowed = 0usize;
+        for _ in 0..veil_proto::ipc::MAX_MAILBOX_FETCH_ENTRIES {
+            if st.allow_ack() {
+                allowed += 1;
+            }
+        }
+        assert_eq!(
+            allowed,
+            veil_proto::ipc::MAX_MAILBOX_FETCH_ENTRIES,
+            "every blob one fetch may return has to be acknowledgeable",
+        );
+
+        // Still bounded: a runaway local process does not get an open door.
+        assert!(
+            !st.allow_ack(),
+            "past the burst the ack path must still be limited",
+        );
+
+        // And it is its own bucket — clearing a mailbox must not cost the UI
+        // its ability to read anything else.
+        assert!(
+            st.allow_query(),
+            "read-query bucket must be unaffected by acks",
+        );
     }
 
     /// audit cycle-6 (A9): the per-client MailboxPut bucket allows up to

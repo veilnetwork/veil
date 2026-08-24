@@ -1507,9 +1507,19 @@ impl VeilClient {
     }
 
     /// Acknowledge end-to-end receipt of a blob. Daemon deletes the
-    /// blob and frees its quota slice. Idempotent — a repeat ack
-    /// returns `false`. `auth_cookie` is verified the same way as
-    /// [`Self::mailbox_fetch`].
+    /// blob and frees its quota slice. `auth_cookie` is verified the same way
+    /// as [`Self::mailbox_fetch`].
+    ///
+    /// `true` means the row was removed by THIS call. `false` does not mean
+    /// "already done": the daemon answers it for a repeat ack, for a cookie
+    /// that does not verify, for a content id it has no row for, and when the
+    /// caller is past its ack rate — deliberately indistinguishable, so the
+    /// answer is not a probe for what a mailbox holds. This doc used to name
+    /// only the first of those, and a caller that reads `false` as "nothing
+    /// left to do" stops asking about rows that are still there.
+    ///
+    /// So: treat `false` as "not confirmed", not as "confirmed already". The
+    /// next fetch is what says whether the blob is really gone.
     pub async fn mailbox_ack(
         &self,
         receiver_id: [u8; 32],
