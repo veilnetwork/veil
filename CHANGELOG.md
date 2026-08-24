@@ -1,5 +1,128 @@
 # Changelog
 
+## v0.7.0 — 2026-08-24
+
+The minor digit moves because the wire breaks, and unlike v0.6.0 this one IS a
+flag day. Three changes are length- or token-sensitive with no branch for the
+old shape: circuit cells, the hole-punch token, and the LAN beacon port. A
+v0.7.0 node and a v0.6.0 node still speak OVL1, but they cannot share a
+circuit, cannot punch each other, and cannot hear each other's beacons. Network
+and clients move together.
+
+Most of what follows was found by measuring an idle phone rather than by
+reading code, and the theme is the same throughout: a node was paying to talk
+to itself, and paying in a shape an observer could match.
+
+**A circuit's cells are the size that circuit negotiated, and that size is now
+2048 bytes.** The cell size used to be one number for the whole network, and a
+heartbeat showed what that costs: the eight-byte `CIRCUIT_HEARTBEAT_MAGIC` rode
+a full 16410-byte cell every 15 seconds, measured live as 56% of an idle
+phone's traffic, with RelayChain cells accounting for 73.8% of every body byte
+exchanged. Bandwidth is the smaller half. The larger half is that one global
+size is an invariant a classifier can write a rule against — 16410 bytes every
+15.0 seconds, without decrypting anything. Uniformity has to hold where the
+leak is, within one circuit against the hop that sees all of its cells; it
+never had to be the same number everywhere. The setup layer now carries the
+size, every hop stores it and refuses a cell of any other size, and the stream
+frames to its circuit's MSS instead of a compile-time maximum. 2048 rather than
+the 1024 floor: 1024 buys roughly 0.3 GB/month more while doubling the bulk
+cost, turning a 5 MB transfer into ~2500 cells instead of ~310 and handing an
+observer more timing samples per byte. What this does not buy is per-circuit
+variety — the classifier's free invariant moves from 16410 to 2074, it does not
+disappear.
+
+**A hole punch belongs to a veil, not to whoever knows the token.** A punch was
+authenticated by its attempt token alone, and the token travels over
+signalling, so it crossed whatever boundary signalling crossed. Not
+hypothetical: the production seed on one host held punched sessions with all
+three testnet seeds and a testnet phone — 60 punches in one log window,
+cross-network peers making up 52% of the production seed's frame traffic and
+58% of the testnet seed's, while a debug phone whose seed assets list only
+testnet spent 35% of its bytes on a network it has no business being in. A
+punched QUIC path carries neither of the two things that separate the
+deployments, since no listener port is involved and obfs4 is not in the path.
+The token on the wire is now derived from the deployment's PSK plus the
+signalled token rather than sent, so reading signalling is no longer enough to
+punch. Packet layout is unchanged. Nodes with no PSK share a public tag and
+keep working with each other exactly as before. This is a correctness boundary
+and not a security one, and the code says so: the PSK ships inside every
+release binary, so it stops accidents, not a deliberate joiner.
+
+**The LAN beacon gets a port of its own, and finally leaves the host.** Two
+nodes on one host could not both run mesh — the second bind failed and mesh was
+silently disabled. `SO_REUSEPORT` on the realm socket was measured before being
+taken, and the measurement forbade it: across two processes sharing one port,
+broadcast reached 4/4 and 4/4, but unicast went 0/10 and 10/10. The realm
+socket carries both, so sharing its port would have repaired discovery by
+silently stealing half the data it exists to deliver. The beacon moved to
+255.255.255.255:9101 on its own shared socket instead, the realm socket stays
+exclusive, and a node no longer discovers itself — a shared beacon port means
+its own broadcast comes back, and the receiver had no notion of who it was. In
+the same area, the beacon had never actually left the machine: the socket was
+missing `SO_BROADCAST`.
+
+**A keepalive stops being the one frame with one size.** The OVL1 keepalive was
+a bare 24-byte header on a jittered but steady cadence. Encryption hides what a
+frame says, not how long it is, so that pair was matchable without decrypting
+anything. It now carries 1..96 random bytes, and its ack draws independently
+rather than mirroring the request, because a 60-byte question answered by a
+60-byte answer is still a constant relationship. The body means nothing and is
+never read, which is why a peer built before this accepts it and replies
+normally — no flag day in this one.
+
+**An idle node stops asking the network about itself.** `resolve_fresh_rendezvous_ads`
+walked all eight DHT ad slots for any receiver including ourselves, though for
+our own ad the local mirror is exactly what we published. The pinned-circuit
+refresh fires every ~304 s forever on a node with no traffic, and each turn
+drove a full eight-slot walk: 48 FIND_VALUE frames across a 1798 s capture,
+about half of all recursive DHT traffic and roughly 9% of an idle phone's bill.
+One walk began 22 seconds after the node wrote the very ads it then went
+looking for. Alongside it: an idle node kept re-walking its own ad eight slots
+at a time, a node was told how to reach itself, the ad TTL was short for a
+reason that had been fixed five days earlier, republishing our own records is
+now background work so frames can pack, a peer that already holds our records
+is not sent them again, and route news is relayed once rather than repeatedly.
+A coalescing window was measured and deliberately not taken.
+
+**A peer's refusal to serve the DHT now outlives the things that kept erasing
+it.** A refusal had to survive its contact being deleted, a session being
+opened, a referral arriving from elsewhere, and a FIND_VALUE walk seeded from
+sessions that erased the answer. Each of those was a separate path that read a
+peer as willing again.
+
+**A peer is written down only once a handshake proved it.** `persist_discovered_peers`
+wrote every non-configured entry, and peer exchange inserts what it hears
+before the first dial, so gossip reached `peers_discovered.json` with nothing
+behind it and every start dialled the whole file forever. Three production
+seeds came to advertise transports on a testnet port this way; deleting the
+entries by hand brought them back within two hours, because the neighbours kept
+handing them out. Peers are now persisted from the handshake path, and a PEX
+response serves only peers we hold a live session with — expressed as a newtype
+whose only constructor names the live set, so a later edit cannot quietly go
+back to serving the pool. Which peers we walk is untouched; that is a separate
+question from which peers we vouch for. A NAT probe also stops retrying a
+target that will not answer.
+
+### Fixed
+
+- `cargo audit (fuzz lockfile)` had been failing on every main run since the
+  cell-size work merged: two dependencies added by commits above never reached
+  `fuzz/Cargo.lock`, and `--locked` refuses to update it silently. The local
+  hygiene gate does not run that step, which is how a green run locally sat on
+  top of a red main for a day.
+- One node, one slot: a peer could occupy more than one.
+- A closed pipe is no longer a crash in the CLI.
+- The capture tool named onion cells after a family that no longer exists, so
+  the instrument lied by name.
+- A counter nothing renders is a counter nobody can read; circuit-table
+  headroom is now exported, with a test that covers the accessor by the break
+  it would actually take.
+- A resumed handshake states nothing and must not overwrite what the peer said.
+- Three quarters of every obfs4 frame's padding was the maximum, which is the
+  opposite of padding.
+- An address that is real somewhere is not real here.
+- A home IP recorded in a June live-test note was redacted from the docs.
+
 ## v0.6.0 — 2026-08-19
 
 The minor digit moves because the wire and the FFI both gained surface. Nothing
