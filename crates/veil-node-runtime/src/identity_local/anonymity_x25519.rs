@@ -73,22 +73,63 @@ pub fn load(veil_dir: &Path) -> std::io::Result<Option<x25519_dalek::StaticSecre
     Ok(Some(x25519_dalek::StaticSecret::from(buf)))
 }
 
-/// Load the key from disk; if absent, generate a fresh one and persist.
+/// Load the key from disk; if absent, generate a fresh one and persist it —
+/// unless somebody else got there first, in which case theirs is used.
 ///
-/// The two-step (load → maybe-save) is intentionally not atomic: if two
-/// processes race on first startup, both will generate a key and one
-/// will overwrite the other's file [`veil_util::atomic_write`]'s
-/// `rename(2)`. The losing process keeps using its in-memory key
-/// which becomes orphaned (un-decryptable) once it restarts. Operators
-/// are expected to run a single daemon per `veil_dir`; this is the
-/// same constraint as [`SovereignIdentity`].
+/// The two-step (load → maybe-save) is not atomic, and it used to end there:
+/// two processes racing on first startup both generated a key, `atomic_write`'s
+/// `rename(2)` published one of them, and the loser carried on with an
+/// in-memory key that nothing on disk backed. Everything it sealed under that
+/// key became un-openable at its next restart, silently, and the only stated
+/// defence was that operators are expected to run one daemon per `veil_dir`.
+///
+/// The publish is now `create_new` (`O_EXCL`), so the race has a winner and a
+/// LOSER RATHER THAN TWO WINNERS: `AlreadyExists` means another process
+/// published first, and this one adopts what is on disk instead of keeping a
+/// key nobody else will ever have. One daemon per directory is still the
+/// supported arrangement — this removes the silent divergence when it is not
+/// the arrangement in force.
 pub fn load_or_create(veil_dir: &Path) -> std::io::Result<x25519_dalek::StaticSecret> {
     if let Some(sk) = load(veil_dir)? {
         return Ok(sk);
     }
     let sk = x25519_dalek::StaticSecret::random_from_rng(rand_core::OsRng);
-    save(veil_dir, &sk)?;
-    Ok(sk)
+    match save_new(veil_dir, &sk) {
+        Ok(()) => Ok(sk),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            // The other process won. Its key is the one every future start of
+            // this directory will read, so it is the one to use now.
+            load(veil_dir)?.ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "anonymity X25519 sk vanished between create and read",
+                )
+            })
+        },
+        Err(e) => Err(e),
+    }
+}
+
+/// Publish the key only if the file does not exist yet.
+///
+/// `O_EXCL` rather than [`save`]'s temp-and-rename: the point here is to LOSE
+/// when somebody else has already published, and a rename always wins.
+fn save_new(veil_dir: &Path, sk: &x25519_dalek::StaticSecret) -> std::io::Result<()> {
+    use std::io::Write as _;
+    let path = key_path(veil_dir);
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        opts.mode(0o600);
+    }
+    let mut f = opts.open(&path)?;
+    f.write_all(&sk.to_bytes())?;
+    f.sync_all()
 }
 
 /// Derive the anonymity X25519 secret DETERMINISTICALLY from this identity's
@@ -196,6 +237,42 @@ pub fn load_or_derive(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Two starts racing on an empty directory must end on ONE key.
+    ///
+    /// Both generate one — there is nothing on disk to load — and the publish
+    /// used to be a rename, which always wins. So both processes believed
+    /// their own key while only one was on disk, and everything the loser
+    /// sealed became un-openable at its next start. Nothing said so; the only
+    /// stated defence was that operators run one daemon per directory.
+    #[test]
+    fn two_racing_starts_agree_on_one_key() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().to_path_buf();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
+
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                let dir = dir.clone();
+                let barrier = std::sync::Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    load_or_create(&dir).unwrap().to_bytes()
+                })
+            })
+            .collect();
+
+        let keys: Vec<[u8; 32]> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        let on_disk = load(&dir).unwrap().expect("a key must be published").to_bytes();
+        for (i, k) in keys.iter().enumerate() {
+            assert_eq!(
+                *k, on_disk,
+                "starter {i} kept a key that is not the one on disk — its \
+                 sealed data dies at the next start",
+            );
+        }
+    }
+
     use x25519_dalek::PublicKey;
 
     /// Placeholder identity: neither derived from it nor written. Same reasoning
