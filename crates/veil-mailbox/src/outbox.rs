@@ -382,9 +382,48 @@ impl Outbox {
         Ok(removed)
     }
 
+    /// Expired keys collected — and held in memory — by one prune pass.
+    ///
+    /// redb will not let a table be mutated while its own range is being
+    /// walked, so the keys to delete have to be read out first. Reading out
+    /// ALL of them made a large expiry one long write transaction with a
+    /// `Vec<Vec<u8>>` the size of the backlog: the outbox is now bounded by
+    /// its quota rather than only by the 30-day TTL, but a full one is still
+    /// hundreds of thousands of rows, and a prune should not be the moment
+    /// that costs the most.
+    ///
+    /// A pass therefore takes at most this many, commits, and comes back. Each
+    /// pass removes the eviction rows it saw, so the range strictly shrinks
+    /// and the loop ends.
+    const PRUNE_BATCH: usize = 1024;
+
     /// Remove entries older than `now - ttl_secs`. Returns the count
     /// pruned. Designed for periodic background invocation.
+    ///
+    /// Runs in bounded passes — see [`Self::PRUNE_BATCH`].
     pub fn prune_expired(&self) -> Result<u64, MailboxError> {
+        self.prune_expired_in_batches(Self::PRUNE_BATCH)
+    }
+
+    /// [`Self::prune_expired`] with the pass size named, so the loop itself can
+    /// be exercised without building a backlog of [`Self::PRUNE_BATCH`] rows.
+    fn prune_expired_in_batches(&self, batch: usize) -> Result<u64, MailboxError> {
+        let mut pruned = 0u64;
+        loop {
+            let (seen, removed) = self.prune_expired_batch(batch)?;
+            pruned = pruned.saturating_add(removed);
+            // Fewer than a full batch means the range is exhausted. `seen`
+            // rather than `removed` drives this: a malformed eviction key is
+            // still deleted but removes no entry, and using `removed` would
+            // stop early with those keys still in the table.
+            if seen < batch {
+                return Ok(pruned);
+            }
+        }
+    }
+
+    /// One bounded prune pass: returns (eviction rows seen, entries removed).
+    fn prune_expired_batch(&self, batch: usize) -> Result<(usize, u64), MailboxError> {
         let now = (self.clock)();
         let cutoff = now.saturating_sub(self.config.ttl_secs);
         let txn = self.db.begin_write()?;
@@ -396,11 +435,15 @@ impl Outbox {
             let mut upper = [0u8; 8 + 32 + 32];
             upper[..8].copy_from_slice(&cutoff_be);
             let lower = [0u8; 8 + 32 + 32];
-            let mut victims: Vec<Vec<u8>> = Vec::new();
+            let mut victims: Vec<Vec<u8>> = Vec::with_capacity(batch.min(1024));
             for e in evict.range::<&[u8]>(lower.as_slice()..upper.as_slice())? {
+                if victims.len() >= batch {
+                    break;
+                }
                 let (k, _) = e?;
                 victims.push(k.value().to_vec());
             }
+            let seen = victims.len();
             let mut count = 0u64;
             // accumulate bytes freed by pruned
             // blobs to decrement the counter once at the end (cheaper
@@ -433,7 +476,7 @@ impl Outbox {
                 let new_total = current.saturating_sub(bytes_freed);
                 meta.insert(META_KEY_TOTAL_BYTES, new_total)?;
             }
-            count
+            (seen, count)
         };
         txn.commit()?;
         Ok(pruned)
@@ -707,6 +750,46 @@ mod tests {
         }
         // No bytes leaked into the counter.
         assert_eq!(o.total_blob_bytes().unwrap(), 0);
+    }
+
+    /// A prune must not be the moment that costs the most.
+    ///
+    /// Every expired key was read into one `Vec<Vec<u8>>` inside a single
+    /// write transaction, so a large expiry was one long transaction with a
+    /// heap the size of the backlog. redb will not let a table be mutated
+    /// while its own range is walked, so reading keys out first is necessary —
+    /// reading ALL of them is not.
+    #[test]
+    fn a_backlog_is_pruned_in_bounded_passes() {
+        let (o, _tmp, clk) = fresh(OutboxConfig {
+            ttl_secs: 100,
+            ..OutboxConfig::default()
+        });
+        let recv = [1u8; 32];
+        clk.store(0, Ordering::SeqCst);
+        for i in 0..10u32 {
+            let mut cid = [0u8; 32];
+            cid[..4].copy_from_slice(&i.to_le_bytes());
+            o.put(recv, cid, vec![1]).unwrap();
+        }
+        clk.store(1000, Ordering::SeqCst);
+
+        // One pass takes its batch and no more.
+        let (seen, removed) = o.prune_expired_batch(4).unwrap();
+        assert_eq!((seen, removed), (4, 4), "a pass is bounded by its batch");
+        assert_eq!(o.len().unwrap(), 6, "and the rest are still there");
+
+        // And the loop keeps coming back until there is nothing left. Driven
+        // at the same small batch on purpose: with the production batch the
+        // remainder fits in one pass, and a prune that stopped after its first
+        // would pass that test while leaving a backlog that only grows.
+        assert_eq!(o.prune_expired_in_batches(2).unwrap(), 6);
+        assert_eq!(o.len().unwrap(), 0);
+        assert_eq!(
+            o.total_blob_bytes().unwrap(),
+            0,
+            "every pass has to refund what it freed, not just the last one",
+        );
     }
 
     /// A quota counted in payloads bounds no number of rows.
