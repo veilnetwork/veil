@@ -23,7 +23,7 @@ pub mod initiator;
 
 use veil_proto::pex::{PexChallenge, PexPeer, PexResult};
 
-pub use dispatcher::PexDispatcher;
+pub use dispatcher::{PexDispatcher, VouchedPeers};
 pub use initiator::{PexConnectTx, PexState, spawn_pex_initiator};
 
 /// Build a wire frame for a PEX message (shared by dispatcher and initiator).
