@@ -3307,6 +3307,7 @@ dependencies = [
  "rand 0.9.5",
  "serde",
  "serde_json",
+ "socket2",
  "thiserror 2.0.19",
  "tokio",
  "veil-crypto",
@@ -3321,6 +3322,7 @@ dependencies = [
 name = "veil-nat"
 version = "0.6.0"
 dependencies = [
+ "blake3",
  "quinn",
  "tokio",
  "veil-proto",
