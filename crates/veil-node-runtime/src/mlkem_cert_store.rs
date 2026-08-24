@@ -48,7 +48,6 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 
@@ -57,7 +56,7 @@ use veil_proto::identity_document::IdentityDocument;
 use veil_proto::mlkem_cert::MlKemKeyCert;
 use veil_util::lock;
 
-use crate::runtime::persistence::{read_snapshot, write_snapshot};
+use crate::runtime::persistence::{next_snapshot_seq, read_snapshot, write_snapshot_ordered};
 
 /// `(node_id, instance_id)` — the ONE device a certificate belongs to.
 ///
@@ -152,12 +151,6 @@ pub struct MlKemCertStore {
     /// never has to ask whether persistence is on.
     path: Option<PathBuf>,
     rows: Mutex<BTreeMap<CertKey, Row>>,
-    /// Snapshot generation, taken WHILE the `rows` lock is held so its order is
-    /// the order the mutations happened in.
-    next_gen: AtomicU64,
-    /// Highest generation actually on disk. Guarded rather than atomic because
-    /// the guard also serializes the writes themselves — see [`Self::flush`].
-    published_gen: Mutex<u64>,
 }
 
 /// Snapshot path for `config_path`: `…/config.toml` → `…/peer_mlkem_certs.json`.
@@ -210,8 +203,6 @@ impl MlKemCertStore {
         Self {
             path: Some(path),
             rows: Mutex::new(rows),
-            next_gen: AtomicU64::new(0),
-            published_gen: Mutex::new(0),
         }
     }
 
@@ -221,8 +212,6 @@ impl MlKemCertStore {
         Self {
             path: None,
             rows: Mutex::new(BTreeMap::new()),
-            next_gen: AtomicU64::new(0),
-            published_gen: Mutex::new(0),
         }
     }
 
@@ -351,38 +340,21 @@ impl MlKemCertStore {
     /// The next snapshot generation. Call it while the `rows` lock is held: the
     /// point is that generation order equals mutation order.
     fn next_generation(&self) -> u64 {
-        self.next_gen.fetch_add(1, Ordering::Relaxed) + 1
+        next_snapshot_seq()
     }
 
     fn flush(&self, generation: u64, snapshot: &[CertSnapshot]) {
         let Some(path) = self.path.as_ref() else {
             return;
         };
-        // The guard serializes the writes AND orders them.
+        // The ordering lives in `write_snapshot_ordered`, shared with the
+        // discovered-peer and ban snapshots, which have the same shape and had
+        // the same defect. One statement of the policy rather than three: a
+        // rule written down twice eventually disagrees with itself.
         //
-        // The snapshot is encoded under the `rows` lock and written after it is
-        // released, so two threads could reach the file in either order —
-        // whichever wrote last won. Each snapshot is the WHOLE map, so a late
-        // OLDER one silently undoes the newer mutation: the row `forget_node`
-        // had just dropped is back, and the file re-serves material the peer
-        // has already said it cannot open. That is the persistent re-wedging
-        // loop invalidation exists to break, and unlike the RAM caches it
-        // survives a restart.
-        //
-        // A superseded snapshot is therefore skipped rather than written. It
-        // needs no write of its own: every generation encodes the entire map,
-        // so the newer one already contains whatever the older one carried.
-        let mut published = lock!(self.published_gen);
-        if generation <= *published {
-            return;
-        }
         // `write_snapshot` logs its own failure at the site that knows the
         // path, and the caller has already been told the row stands in memory.
-        // A failed write does not advance the mark: the next mutation should
-        // still try, rather than believe this generation is on disk.
-        if write_snapshot(path, &snapshot, "peer ML-KEM certs").is_durable() {
-            *published = generation;
-        }
+        let _ = write_snapshot_ordered(path, &snapshot, "peer ML-KEM certs", generation);
     }
 }
 
