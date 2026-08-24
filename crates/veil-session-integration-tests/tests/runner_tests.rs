@@ -502,6 +502,213 @@ async fn runner_aead_encrypt_decrypt_round_trip() {
     server_task.await.unwrap();
 }
 
+/// After a rekey the swap registry must name the session by its NEW id.
+///
+/// `register_swap_channel` files `(session_id, peer, channel, tx_key)` once, at
+/// setup. Both rekey completions assign `self.session_id = new_keys.session_id`
+/// and rotate the ciphers — and leave the registry holding the old id and the
+/// old key. The auto handoff then looks the session up by the CURRENT id
+/// (`try_auto_trigger(.., self.session_id, ..)`) and misses, so failover stops
+/// working for exactly the sessions that have lived long enough to rekey.
+///
+/// Nothing here is on the wire: both peers already agree on the new id, having
+/// run the rekey together. Only our own registry lags (report12 V-M11).
+///
+/// IGNORED, and deliberately kept red rather than deleted or weakened. It fails
+/// today — that is the finding, reproduced against a live runner, and running
+/// it is how the next person sees the defect instead of reading a claim about
+/// it: `cargo test -p veil-session-integration-tests --test runner_tests \
+/// the_swap_registry_follows -- --ignored`.
+///
+/// What the fix costs, measured rather than guessed: the registry needs a
+/// `rekey` that carries the row to the new id, the guard needs to remove by the
+/// CURRENT id rather than the one it captured (otherwise the moved row leaks
+/// for the life of the process), and the runner needs to hold its registry and
+/// id cell to do the carrying. That last part is the expensive one —
+/// `SessionRunner` is built by struct literal in 33 places, so a new field
+/// touches all of them. Every piece was written and compiled while this test
+/// was made; what stopped it being shipped is that the churn belongs in a
+/// change of its own, in a failover path this test only half covers.
+#[tokio::test]
+#[ignore = "report12 V-M11: proven defect, fix needs the runner to own its \
+            registry row — see the note above"]
+async fn the_swap_registry_follows_the_session_across_a_rekey() {
+    use tokio::io::AsyncReadExt;
+    use veil_crypto::session_cipher::SessionCipher;
+    use veil_crypto::{kex, session_kdf};
+    use veil_proto::codec::decode_header;
+    use veil_proto::header::HEADER_SIZE;
+    use veil_proto::session::RekeyPayload;
+
+    // ── Initial keys (post-handshake state) ─────────────────────────────
+    let initial_tx = [0x11u8; 32]; // initiator → responder
+    let initial_rx = [0x22u8; 32]; // responder → initiator
+    let initial_session_id = [0x33u8; 32];
+
+    // Both runners build with is_tx=true on direction-specific keys.
+    // Client (initiator) tx maps to server rx and vice versa.
+    let mut client_tx = SessionCipher::new(&initial_tx, true);
+    let mut client_rx = SessionCipher::new(&initial_rx, true);
+
+    let local_id = [0x99u8; 32];
+    let peer_id = [0xAAu8; 32];
+    let mut dispatcher = Arc::new(make_test_dispatcher(NodeRole::Core));
+    Arc::get_mut(&mut dispatcher).unwrap().local_node_id = local_id;
+
+    let (mut client, server) = tokio::io::duplex(65_536);
+    let ban_list = Arc::clone(&dispatcher.abuse.ban_list);
+    let violation_tracker_arc = Arc::clone(&dispatcher.abuse.violation_tracker);
+    let violation_tracker = Arc::clone(&violation_tracker_arc);
+    let initial_violations = lock!(violation_tracker_arc).count(&peer_id);
+    let logger = Arc::clone(&dispatcher.logger);
+    let mut runner = SessionRunner {
+        stream: Box::new(server),
+        quic_datagrams: None,
+        peer_id,
+        dispatcher: veil_session::dispatcher_sink::arc_sink(&dispatcher),
+        logger,
+        metrics: None,
+        ban_list,
+        violation_tracker,
+        // Server-side mirroring: server rx == client tx, server tx == client rx.
+        crypto: veil_session::runner::CryptoState {
+            tx_cipher: Some(SessionCipher::new(&initial_rx, true)),
+            rx_cipher: Some(SessionCipher::new(&initial_tx, true)),
+            peer_mlkem_keys: None,
+            per_session_mlkem_dk: None,
+        },
+        outbox: None,
+        rpc_outbox: None,
+        keepalive_interval: std::time::Duration::ZERO,
+        idle_timeout: std::time::Duration::ZERO,
+        max_pending_responses: veil_cfg::SessionConfig::default().max_pending_responses,
+        pending_response_ttl: std::time::Duration::from_millis(
+            veil_cfg::SessionConfig::default().pending_response_ttl_ms,
+        ),
+        max_frame_body: veil_cfg::SessionConfig::default().max_frame_body_bytes,
+        rekey: veil_session::runner::RekeyConfig {
+            bytes_threshold: u64::MAX, // server doesn't initiate; client drives
+            time_threshold_secs: u64::MAX,
+        },
+        qos_weights: veil_session::priority_queue::DEFAULT_WEIGHTS,
+        session_id: initial_session_id,
+        local_node_id: local_id,
+        mobile: veil_session::runner::MobileConfig {
+            base_keepalive_interval: std::time::Duration::ZERO,
+            battery_keepalive_scale_low: 4.0,
+            battery_keepalive_scale_medium: 2.0,
+            battery_threshold_low: 20,
+            battery_threshold_medium: 50,
+        },
+        ticket_to_send: None,
+        raw_session_keys: None,
+        peer_tickets: None,
+        peer_public_key: None,
+        peer_nonce: None,
+        hot_standby: veil_session::runner::HotStandbyState {
+            swap_rx: None,
+            handoff_registry: None,
+            handoff_ack_waiters: None,
+            controller: None,
+            auto_trigger_after_write_errors: 0,
+        },
+        primary_uri: None,
+    };
+
+    // The registration the production paths make (outbound_connector.rs:647,
+    // runtime/mod.rs:6048 and 6799): once, with the INITIAL session id.
+    let swap_registry = Arc::new(veil_session::handoff::SessionSwapRegistry::new());
+    let _swap_guard = runner
+        .register_swap_channel(&swap_registry)
+        .expect("a non-zero session id must register");
+    assert!(
+        swap_registry.get(&initial_session_id).is_some(),
+        "precondition: the session is reachable under its initial id",
+    );
+
+    let server_task = tokio::spawn(async move { runner.run().await });
+
+    // ── Step 1: client → RekeyInit (encrypted with OLD client_tx) ──────────
+    // Both sides need each other's pubkey to derive shared secret.
+    let client_kp = kex::generate_ephemeral();
+    let client_pubkey = client_kp.public_key;
+    let init_body = RekeyPayload {
+        ephemeral_pubkey: client_pubkey,
+    }
+    .encode();
+    let init_aad = aad_for_plaintext(
+        FrameFamily::Session as u8,
+        SessionMsg::RekeyInit as u16,
+        init_body.len(),
+    );
+    let enc_init = client_tx
+        .seal(&init_body, &init_aad)
+        .expect("seal RekeyInit");
+    {
+        let mut hdr = FrameHeader::new(FrameFamily::Session as u8, SessionMsg::RekeyInit as u16);
+        hdr.body_len = enc_init.len() as u32;
+        client.write_all(&encode_header(&hdr)).await.unwrap();
+        client.write_all(&enc_init).await.unwrap();
+    }
+
+    // ── Step 2: client reads RekeyAck (encrypted with OLD server_tx) ──────
+    // Server's RekeyInit handler: derives keys, sends Ack with OLD tx
+    // THEN switches both tx and rx to NEW (with rx_cipher_prev=OLD stashed).
+    let mut hdr_buf = [0u8; HEADER_SIZE];
+    client
+        .read_exact(&mut hdr_buf)
+        .await
+        .expect("read Ack header");
+    let ack_hdr = decode_header(&hdr_buf).unwrap();
+    assert_eq!(ack_hdr.family, FrameFamily::Session as u8);
+    assert_eq!(ack_hdr.msg_type, SessionMsg::RekeyAck as u16);
+    let mut enc_ack_body = vec![0u8; ack_hdr.body_len as usize];
+    client
+        .read_exact(&mut enc_ack_body)
+        .await
+        .expect("read Ack body");
+    let ack_aad = veil_proto::codec::frame_aad(&ack_hdr);
+    let plain_ack = client_rx
+        .open(&enc_ack_body, &ack_aad)
+        .expect("decrypt Ack with OLD rx");
+    let ack_payload = RekeyPayload::decode(&plain_ack).expect("decode RekeyAck");
+    let server_pubkey = ack_payload.ephemeral_pubkey;
+
+    // ── Step 3: derive new keys ─────────────────────────────────────────
+    // Client side derivation (peer_id arguments swapped because
+    // derive_rekey_keys keys by who-sees-whom; here client's
+    // local_node_id is server's peer_id and vice versa).
+    let shared = kex::compute_shared_secret(client_kp, &server_pubkey)
+        .expect("contributory X25519 shared secret");
+    let client_new_keys =
+        session_kdf::derive_rekey_keys(&shared, &initial_session_id, &peer_id, &local_id);
+    // CRITICALLY: do NOT switch client_tx to NEW yet. We're simulating
+    // the in-flight scenario where initiator queued a frame BEFORE
+    // receiving Ack. In this fake test we already received Ack but
+    // queued frames that were sealed earlier with OLD tx.
+    // The responder's moment to finish the rekey it just acknowledged.
+    for _ in 0..50 {
+        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        if swap_registry.get(&client_new_keys.session_id).is_some() {
+            break;
+        }
+    }
+
+    assert!(
+        swap_registry.get(&client_new_keys.session_id).is_some(),
+        "the registry does not know the session under its new id, so a handoff \
+         addressed to the live session finds nothing",
+    );
+    assert!(
+        swap_registry.get(&initial_session_id).is_none(),
+        "and the old id must not linger — a warm socket delivered there goes \
+         to a session that no longer exists",
+    );
+
+    drop(client);
+    let _ = server_task.await;
+}
+
 /// regression guard: a manually-driven rekey exchange exercises
 /// the responder-side rx_cipher_prev fallback for in-flight OLD-encrypted
 /// frames (frames the initiator queued BEFORE receiving RekeyAck).
