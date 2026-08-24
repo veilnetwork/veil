@@ -149,7 +149,16 @@ pub fn persist_discovered_peers(
     config_path: &Path,
 ) -> PersistOutcome {
     let entries: Vec<DiscoveredPeerSnapshot> = {
-        let st = lock_state(state);
+        let mut st = lock_state(state);
+        // Trim the proof set to the peers we still track. Every handshake adds
+        // an id, including strangers who dial in and are never entered in the
+        // map, so on a seed serving mobile clients the set would otherwise
+        // grow with every device that ever connected. Only ids present here
+        // are ever read below.
+        let tracked: std::collections::HashSet<[u8; 32]> =
+            st.peers.values().map(|e| *e.node_id.as_bytes()).collect();
+        st.handshaked.retain(|id| tracked.contains(id));
+        let st = st;
         // Same gate as the wildcard filter beside it, and for the same reason
         // spelled out there: a snapshot must not seed the next startup with
         // dial targets nobody here can reach.
@@ -158,6 +167,14 @@ pub fn persist_discovered_peers(
             .values()
             .filter(|e| !matches!(e.source, PeerSource::Configured))
             .filter(|e| !e.bootstrap_only)
+            // Peer-exchange calls this the moment it learns a peer — before
+            // the first dial. Writing an unproven entry means the next cold
+            // start dials it, and every start after that, whether or not it
+            // was ever reachable: a production seed re-acquired four
+            // cross-network transports within two hours of being cleaned by
+            // hand. Persist what we actually reached. A peer that connects
+            // later is persisted then, from the handshake path.
+            .filter(|e| st.handshaked.contains(e.node_id.as_bytes()))
             .filter(|e| !is_wildcard_transport(&e.transport))
             .filter(|e| !is_undialable_from_here(&e.transport, site_local))
             .map(|e| DiscoveredPeerSnapshot {
@@ -242,7 +259,15 @@ pub fn load_discovered_peers(
             bootstrap_only: false,
             source: snap.source,
         };
-        lock_state(state).peers.insert(peer_id, entry.clone());
+        {
+            let mut st = lock_state(state);
+            st.peers.insert(peer_id, entry.clone());
+            // Everything in the snapshot was written under the handshake rule
+            // above, so it keeps its proof across the restart. Dropping it
+            // here instead would empty the cache after two offline restarts —
+            // exactly when a censored node has nothing else to bootstrap from.
+            st.handshaked.insert(*node_id.as_bytes());
+        }
         let _ = crate::outbound_connector::spawn_outbound_peers(vec![entry], access, shutdown_tx);
         restored += 1;
     }
@@ -429,7 +454,8 @@ mod tests {
         peers: Vec<PeerConfigEntry>,
         config_path: &Path,
     ) -> Arc<Mutex<NodeState>> {
-        Arc::new(Mutex::new(NodeState::new(
+        let proven: Vec<[u8; 32]> = peers.iter().map(|p| *p.node_id.as_bytes()).collect();
+        let mut st = NodeState::new(
             veil_cfg::NodeId::from([0xAAu8; 32]),
             crate::types::NodeRole::Core,
             config_path.to_path_buf(),
@@ -439,7 +465,12 @@ mod tests {
             None,
             peers,
             listens,
-        )))
+        );
+        // Default for the surrounding tests: they ask what the address filters
+        // do, so every peer arrives already proven. The handshake gate has its
+        // own test below, which builds the mixed case by hand.
+        st.handshaked.extend(proven);
+        Arc::new(Mutex::new(st))
     }
 
     /// Our posture comes from what we ADVERTISE, not from what we bind.
@@ -519,6 +550,97 @@ mod tests {
         assert!(
             !written.contains("192.168.1.70"),
             "a public node can never reach somebody else's LAN: {written}"
+        );
+    }
+
+    /// Gossip is a rumour until a handshake makes it a fact.
+    ///
+    /// Peer-exchange inserts what it hears into `NodeState::peers` and calls
+    /// this function in the same breath — before the first dial. A production
+    /// seed therefore carried transports for a DIFFERENT network's port, which
+    /// its own PSK can never complete; deleting them by hand brought two of
+    /// them back within two hours, and each one is an outbound dial on every
+    /// start from then on. Only what we actually reached belongs in the file.
+    ///
+    /// Break-check: drop the `handshaked` filter in
+    /// `persist_discovered_peers` and the unproven peer reappears in the
+    /// snapshot.
+    #[test]
+    fn a_peer_we_never_reached_does_not_reach_the_snapshot() {
+        let dir = std::env::temp_dir().join(format!("veil-proof-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let config_path = dir.join("node.toml");
+
+        let reached = [0x11u8; 32];
+        let rumoured = [0x22u8; 32];
+        let state = state_with(
+            vec![listen_entry(
+                "obfs4-tcp://0.0.0.0:5556",
+                Some("tcp://198.51.100.11:5556"),
+            )],
+            vec![
+                peer_entry(1, reached, "obfs4-tcp://198.51.100.11:5556"),
+                peer_entry(2, rumoured, "obfs4-tcp://198.51.100.11:5557"),
+            ],
+            &config_path,
+        );
+        // Both are dialable from here and neither is configured — the address
+        // filters cannot tell them apart. The only difference is the proof.
+        lock_state(&state).handshaked.remove(&rumoured);
+
+        persist_discovered_peers(&state, &config_path);
+        let written =
+            std::fs::read_to_string(discovered_peers_path(&config_path)).expect("snapshot written");
+        std::fs::remove_dir_all(&dir).ok();
+
+        assert!(
+            written.contains(":5556"),
+            "a peer we handshook must survive: {written}"
+        );
+        assert!(
+            !written.contains(":5557"),
+            "a peer we only heard about must not be written: {written}"
+        );
+    }
+
+    /// The proof set is bounded by the peers we track, not by uptime.
+    ///
+    /// Every completed handshake marks a node_id, and most of them belong to
+    /// strangers who dial in and are never entered in `peers` — on a seed
+    /// serving mobile clients that is one entry per device, forever. Persisting
+    /// is the moment the set is read, so it is also the moment to trim it.
+    ///
+    /// Break-check: drop the `retain` in `persist_discovered_peers` and the
+    /// stranger's mark survives.
+    #[test]
+    fn a_stranger_we_do_not_track_is_not_remembered_forever() {
+        let dir = std::env::temp_dir().join(format!("veil-bound-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let config_path = dir.join("node.toml");
+
+        let tracked = [0x33u8; 32];
+        let stranger = [0x44u8; 32];
+        let state = state_with(
+            vec![listen_entry(
+                "obfs4-tcp://0.0.0.0:5556",
+                Some("tcp://198.51.100.11:5556"),
+            )],
+            vec![peer_entry(1, tracked, "obfs4-tcp://198.51.100.11:5556")],
+            &config_path,
+        );
+        lock_state(&state).handshaked.insert(stranger);
+
+        persist_discovered_peers(&state, &config_path);
+        std::fs::remove_dir_all(&dir).ok();
+
+        let st = lock_state(&state);
+        assert!(
+            st.handshaked.contains(&tracked),
+            "a peer we track keeps its proof"
+        );
+        assert!(
+            !st.handshaked.contains(&stranger),
+            "a node we do not track must not be held in memory for the rest of the run"
         );
     }
 

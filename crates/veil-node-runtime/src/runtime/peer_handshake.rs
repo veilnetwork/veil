@@ -946,6 +946,29 @@ pub async fn register_connection_session(
         }
     }
 
+    // OVL1 is done and the listener's allowlist (if any) accepted this peer:
+    // this is the moment we know the endpoint we hold for them actually
+    // works. `persist_discovered_peers` writes only peers that reach this
+    // line, so gossip we never dialled — or dialled and never reached —
+    // stops being handed to the next cold start as a bootstrap candidate.
+    let newly_proven = lock_state(&runtime.state)
+        .handshaked
+        .insert(*remote_identity.node_id.as_bytes());
+    if newly_proven {
+        // And write it out here. The only other caller on this path is the
+        // nonce-relearn branch above, which fires rarely; without this a peer
+        // we just reached would wait for the next peer-exchange round to be
+        // recorded, and a node that gets little gossip — a phone — could keep
+        // an empty cache and cold-start with nothing but the builtin seeds.
+        // Guarded on `newly_proven` so a reconnect to a peer already in the
+        // file does not rewrite it.
+        let state_for_persist = Arc::clone(&runtime.state);
+        let config_path = runtime.config_path.clone();
+        tokio::task::spawn_blocking(move || {
+            persistence::persist_discovered_peers(&state_for_persist, &config_path);
+        });
+    }
+
     let (reserved_outbox_rx, referral_session) = {
         // Hard-reject only when even the referral headroom above the data cap
         // is full; otherwise accept (a session at/above max_concurrent is a
