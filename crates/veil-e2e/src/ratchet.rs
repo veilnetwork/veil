@@ -144,6 +144,10 @@ impl ConversationKey {
 /// Coarse on the receive path by design: a peer must not learn which of "wrong
 /// device", "no session", "forged tag" applies by watching what comes back, so
 /// every caller here maps the whole enum to one outcome — the frame is dropped.
+/// Re-exported so a caller of [`RatchetStore::skip_send_to`] does not need a
+/// direct dependency on `veil-ratchet` just to name its argument.
+pub use veil_ratchet::SendPosition;
+
 /// Why a [`skip_send_to`](RatchetStore::skip_send_to) could not be applied.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum RatchetSkipError {

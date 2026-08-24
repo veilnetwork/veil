@@ -3274,6 +3274,72 @@ int veil_ratchet_export(VeilHandle *handle,
 
 #if defined(VEIL_FFI_NODE_EMBEDDED)
 /**
+ * Where a conversation's sending chain stands: the chain it is on, and the
+ * index the next sealed message will carry.
+ *
+ * A host records this durably BEFORE it publishes a ciphertext, so that a
+ * state write which never lands cannot let a restart re-derive a key this
+ * session already spent on the wire (report12 X-H5). It is 36 bytes against
+ * the state's kilobytes, which is what makes it affordable on the send path —
+ * and a host reserving a small run of indices at a time pays it once per run
+ * rather than once per message.
+ *
+ * Returns [`VEIL_ERR_RATCHET_NO_CONVERSATION`] when the key names nothing
+ * held, or names a conversation with no sending chain yet — there is then no
+ * position to reserve, and nothing has been published either.
+ *
+ * # Safety
+ *
+ * `handle` must be live. `key_64` MUST point to exactly
+ * [`VEIL_RATCHET_KEY_LEN`] readable bytes. `out_chain_32` MUST be writable
+ * for 32 bytes. `out_next` MUST be writable.
+ */
+
+int veil_ratchet_send_position(VeilHandle *handle,
+                               const uint8_t *key_64,
+                               uint8_t *out_chain_32,
+                               uint32_t *out_next,
+                               char **err_out)
+;
+#endif
+
+#if defined(VEIL_FFI_NODE_EMBEDDED)
+/**
+ * Step a conversation's sending chain past every index that might already
+ * have been spent, and report how many keys were burned.
+ *
+ * The recovery half of [`veil_ratchet_send_position`]: on start, a state
+ * restored from before an unwritten send is fast-forwarded to the last
+ * position the host recorded. Keys burned this way were never emitted, so the
+ * peer sees a gap its skipped-key window absorbs.
+ *
+ * A position naming a chain this conversation is no longer on, or an index it
+ * has already passed, burns nothing and is not an error — keys from a chain
+ * we no longer hold cannot collide with keys from the one we do.
+ *
+ * Returns [`VEIL_ERR_RATCHET_NO_CONVERSATION`] when the key names nothing
+ * held, and [`VEIL_ERR_INVALID_ARG`] when the position asks for a jump past
+ * what a host reserving indices could legitimately have got ahead — a
+ * corrupted or hostile mark. Nothing is burned in either case.
+ *
+ * # Safety
+ *
+ * `handle` must be live. `key_64` MUST point to exactly
+ * [`VEIL_RATCHET_KEY_LEN`] readable bytes. `chain_32` MUST point to 32
+ * readable bytes. `out_burned` MUST be writable.
+ */
+
+int veil_ratchet_skip_send_to(VeilHandle *handle,
+                              const uint8_t *key_64,
+                              const uint8_t *chain_32,
+                              uint32_t next,
+                              uint32_t *out_burned,
+                              char **err_out)
+;
+#endif
+
+#if defined(VEIL_FFI_NODE_EMBEDDED)
+/**
  * Restore one conversation from bytes [`veil_ratchet_export`] produced.
  *
  * Called for every stored conversation at startup, BEFORE traffic flows: a
