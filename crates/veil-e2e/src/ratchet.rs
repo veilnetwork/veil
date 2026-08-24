@@ -144,6 +144,17 @@ impl ConversationKey {
 /// Coarse on the receive path by design: a peer must not learn which of "wrong
 /// device", "no session", "forged tag" applies by watching what comes back, so
 /// every caller here maps the whole enum to one outcome — the frame is dropped.
+/// Why a [`skip_send_to`](RatchetStore::skip_send_to) could not be applied.
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum RatchetSkipError {
+    /// The key names nothing this store holds.
+    #[error("no conversation under that key")]
+    NoConversation,
+    /// The ratchet refused the position — see `veil_ratchet::RatchetError`.
+    #[error("ratchet refused the position: {0}")]
+    Ratchet(String),
+}
+
 #[derive(Debug, PartialEq, Eq, thiserror::Error)]
 pub enum RatchetSpliceError {
     /// The payload is not a ratchet payload, or is truncated.
@@ -775,6 +786,55 @@ impl RatchetStore {
     #[must_use]
     pub fn export(&self, key: &ConversationKey) -> Option<Zeroizing<Vec<u8>>> {
         self.lock().entries.get(key).map(Entry::encode)
+    }
+
+    /// Where a conversation's sending chain stands.
+    ///
+    /// Small enough for the host to write durably BEFORE it publishes a
+    /// ciphertext — 36 bytes against the state's kilobytes — which is what
+    /// makes the guarantee affordable on the send path (report12 X-H5).
+    ///
+    /// `None` when the key names nothing held, or when the conversation has
+    /// no sending chain yet and so has no position to reserve.
+    #[must_use]
+    pub fn send_position(&self, key: &ConversationKey) -> Option<veil_ratchet::SendPosition> {
+        self.lock()
+            .entries
+            .get(key)
+            .and_then(|e| e.session.send_position())
+    }
+
+    /// Step a conversation's sending chain past every index that might
+    /// already have been spent, and report how many were burned.
+    ///
+    /// The recovery half of [`send_position`](Self::send_position): a state
+    /// restored from before an unwritten send is fast-forwarded to the last
+    /// position the host recorded, so no key it may already have published
+    /// under can come round again.
+    ///
+    /// Marks the conversation dirty when it actually moves — the chain
+    /// changed, and a state left unwritten would be behind again on the next
+    /// start, which is where this began.
+    pub fn skip_send_to(
+        &self,
+        key: &ConversationKey,
+        to: veil_ratchet::SendPosition,
+    ) -> Result<u32, RatchetSkipError> {
+        let mut guard = self.lock();
+        let entry = guard
+            .entries
+            .get_mut(key)
+            .ok_or(RatchetSkipError::NoConversation)?;
+        let burned = entry
+            .session
+            .skip_send_to(to)
+            .map_err(|e| RatchetSkipError::Ratchet(e.to_string()))?;
+        if burned > 0 {
+            guard.version += 1;
+            let version = guard.version;
+            guard.dirty.insert(*key, version);
+        }
+        Ok(burned)
     }
 
     /// Put a conversation back, from bytes [`export`](Self::export) produced.
@@ -1634,6 +1694,59 @@ mod tests {
             .0;
         let a_pk = a.ratchet_pk();
         open(&b.store, &b.me(), &a.node_id, &payload, Some(&a_pk), NOW)
+    }
+
+    /// report12 X-H5: the position is what a host records BEFORE it publishes,
+    /// and the skip is what a restart applies. This pins the store's half of
+    /// that — the cryptographic property is pinned in `veil-ratchet` itself.
+    #[test]
+    fn a_skip_that_moves_the_chain_marks_the_conversation_dirty() {
+        let (a, b) = (device(1), device(2));
+        a_to_b(&a, &b, b"first").expect("open");
+        let key = a.store.keys().first().copied().expect("a conversation");
+
+        let at = a.store.send_position(&key).expect("a sending chain");
+        let _ = a.store.drain_dirty();
+
+        // A position we have already passed changes nothing, and a store that
+        // marked it dirty anyway would have the host writing for no reason.
+        assert_eq!(a.store.skip_send_to(&key, at).expect("skip"), 0);
+        assert!(
+            a.store.drain_dirty().is_empty(),
+            "nothing moved, so nothing is owed to disk"
+        );
+
+        let ahead = veil_ratchet::SendPosition {
+            next: at.next + 3,
+            ..at
+        };
+        assert_eq!(a.store.skip_send_to(&key, ahead).expect("skip"), 3);
+        assert_eq!(
+            a.store.send_position(&key).expect("still held").next,
+            at.next + 3
+        );
+        assert_eq!(
+            a.store.drain_dirty(),
+            vec![key],
+            "the chain moved, so the state on disk is behind and must be written"
+        );
+    }
+
+    #[test]
+    fn a_position_for_a_conversation_we_do_not_hold_is_not_an_answer() {
+        let a = device(1);
+        let missing = ConversationKey::from_storage_key(&[9u8; CONVERSATION_KEY_LEN]);
+        assert!(a.store.send_position(&missing).is_none());
+        assert_eq!(
+            a.store.skip_send_to(
+                &missing,
+                veil_ratchet::SendPosition {
+                    chain: [0u8; 32],
+                    next: 5
+                }
+            ),
+            Err(RatchetSkipError::NoConversation)
+        );
     }
 
     #[test]
