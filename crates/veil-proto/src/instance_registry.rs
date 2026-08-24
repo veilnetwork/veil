@@ -120,8 +120,19 @@ pub struct InstanceEntry {
 pub struct InstanceRegistry {
     /// Identity this registry belongs to.
     pub node_id: [u8; 32],
-    /// Monotonic registry version (bumped on each publish). Consumers
-    /// reject decreasing values to defend against stale replay.
+    /// Monotonic registry version, taken from the identity document's
+    /// issuance time so every device of a family publishes the same one.
+    ///
+    /// Consumers ORDER by it: `mlkem_resolver::registry_freshness` ranks
+    /// candidates `(reg_version, max last_seen)` so a superseded replica cannot
+    /// win by answering first. This doc used to say consumers "reject
+    /// decreasing values", and for a long time no consumer read the field at
+    /// all — an older registry, still correctly signed, could take the seal
+    /// fan-out and drop a linked device out of it.
+    ///
+    /// Ordering is not yet rejection: there is no durable per-identity
+    /// high-water mark, so a replica that serves ONLY an old version is
+    /// believed. Closing that needs persisted state and is not done here.
     pub reg_version: u64,
     /// Index into the current `IdentityDocument.identity_keys` of the
     /// subkey that signed this registry.
