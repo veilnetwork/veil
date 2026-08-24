@@ -453,10 +453,22 @@ jobs:
             --notes-file "$RUNNER_TEMP/notes.md" --repo "$GITHUB_REPOSITORY"
           gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" \
             --json body -q .body > "$RUNNER_TEMP/published-notes.md"
-          if ! diff -q "$RUNNER_TEMP/notes.md" "$RUNNER_TEMP/published-notes.md" \
-               >/dev/null; then
-            echo "::error::the release page does not carry the CHANGELOG entry for $RELEASE_TAG"
-            diff -u "$RUNNER_TEMP/notes.md" "$RUNNER_TEMP/published-notes.md" || true
-            exit 1
-          fi
-          echo "notes on the release page match the $RELEASE_TAG entry"
+          # Compare the CONTENT, not the trailing whitespace. `-q .body` writes
+          # its own closing newline and the API hands the body back with CRLF
+          # endings, so a byte-for-byte `diff` calls a correct page wrong. That
+          # is not hypothetical: v0.7.0 built all seven targets, attached them,
+          # wrote the right 7812 bytes of notes -- and this step failed it over
+          # ONE empty line. A guard that cries wolf on every release is one
+          # nobody reads, which costs more than the drift it was built to catch.
+          python3 - "$RUNNER_TEMP/notes.md" "$RUNNER_TEMP/published-notes.md" <<'PY'
+          import difflib, sys
+          def read(p):
+              return open(p, encoding="utf-8").read().replace("\r\n", "\n").rstrip("\n")
+          want, got = read(sys.argv[1]), read(sys.argv[2])
+          if want != got:
+              print("::error::the release page does not carry the CHANGELOG entry")
+              sys.stdout.writelines(difflib.unified_diff(
+                  want.splitlines(True), got.splitlines(True), "expected", "published"))
+              sys.exit(1)
+          print(f"notes on the release page match ({len(want)} bytes)")
+          PY
