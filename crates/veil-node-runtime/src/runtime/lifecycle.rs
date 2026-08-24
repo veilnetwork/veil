@@ -625,6 +625,7 @@ impl NodeRuntime {
         veil_session::runner::set_mobile_outbound_batch_window_ms(
             config.mobile.outbound_batch_window_ms.unwrap_or(0),
         );
+        veil_session::runner::set_mobile_outbound_batch_always(config.mobile.outbound_batch_always);
         // re-prime global session-rotation interval
         // from reloaded config. Active sessions keep their
         // existing rotation deadline (computed at session start);
@@ -1197,6 +1198,10 @@ impl NodeRuntime {
             // in-flight per-peer counters (and warm windows) are preserved.
             loss_tracker: Arc::clone(&self.dispatcher.loss_tracker),
             route_origin_seq: Arc::clone(&self.dispatcher.route_origin_seq),
+            // Shared, not fresh: a rebuilt dispatcher that forgot what it had
+            // already relayed would forward the whole plane again.
+            route_forward_last: Arc::clone(&self.dispatcher.route_forward_last),
+            owned_push_last: Arc::clone(&self.dispatcher.owned_push_last),
             pow_solver_semaphore: Arc::clone(&self.dispatcher.pow_solver_semaphore),
             pow_active_difficulty: Arc::clone(&self.dispatcher.pow_active_difficulty),
             pow_challenge_seen: Arc::clone(&self.dispatcher.pow_challenge_seen),

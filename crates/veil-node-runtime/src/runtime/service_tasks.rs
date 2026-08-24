@@ -286,15 +286,44 @@ const RENDEZVOUS_SESSION_EVENT_DEBOUNCE: std::time::Duration =
 const RENDEZVOUS_TICK_JITTER_MS: u64 = 3000;
 /// Ad validity window the recipient requests (the maintenance tick refreshes the
 /// published ad before half-life). Comfortably longer than the check interval
-/// (RENDEZVOUS_RECIPIENT_CHECK_INTERVAL = 15s), but kept SHORT on purpose: this
-/// is also how long a STALE ad (a previous-relay/cookie ad a sender resolved +
-/// cached before the receiver rotated) stays usable. At 1h it black-holed
-/// delivery for up to an hour after a receiver restart (the sender's cached ad
-/// pointed at a relay the receiver no longer registers → cookie_unknown on every
-/// introduce). 10 min bounds that self-heal window while the ~15s refresh keeps
-/// the live ad alive with ~40x margin. pub(crate) so the initial onion-service
-/// register (runtime::mod) uses the same window, not the 24h directory default.
-pub(crate) const RENDEZVOUS_AD_VALIDITY_SECS: u64 = 600;
+/// (RENDEZVOUS_RECIPIENT_CHECK_INTERVAL = 15s). pub(crate) so the initial
+/// onion-service register (runtime::mod) uses the same window, not the 24h
+/// directory default.
+///
+/// RAISED 600 -> 1800 because the reason for 600 was solved elsewhere and
+/// nobody came back for it. It was shortened 1h -> 10min on 2026-06-28
+/// ("so a stale cached ad self-heals fast"): a sender holding a cached
+/// previous-relay ad kept firing introduces into a relay the receiver had
+/// left, and `cookie_unknown` is deliberately silent, so the ad's own expiry
+/// was the only thing that ended it. Five days later, 2026-07-03, the
+/// sender-side stall self-heal landed (`AnonSendStallTracker`): three
+/// un-answered sends drop the resolve cache and widen the fan-out. The
+/// black-hole window is now bounded by THAT — ~3 sends and at most one forced
+/// re-resolve per ANON_SEND_WIDEN_SECS — not by this constant.
+///
+/// What this does NOT relax: reacting to a real change. The maintenance guard
+/// republishes when the published ad's (relay, cookie, KEM, window) differs
+/// from the live publisher entry, independently of freshness — so a rotated
+/// relay is republished at once. Only the periodic refresh of an UNCHANGED ad
+/// is slowed, and that refresh is what an idle phone pays for: measured at
+/// 600s it cost one recursive STORE + FIND_VALUE per ad slot per ~333 s,
+/// eight slots at a time, 17.8% of an idle phone's traffic on one link.
+///
+/// Not raised further than 1800 in one step: this is a live-network property,
+/// and 3x is enough to measure the effect against the same stand.
+pub(crate) const RENDEZVOUS_AD_VALIDITY_SECS: u64 = 1800;
+
+/// The maintenance tick republishes at half the window, so that half must stay
+/// clear of the cadence at which the recipient task re-registers — otherwise an
+/// ad would spend part of its life expired between refreshes. Guards against
+/// INVERSION, not against any particular value: the long-standing 600 passes it
+/// (300 against 75) and so does 1800 (900 against 75). Compile-time so an edit
+/// to either constant cannot quietly cross the line.
+const _: () = assert!(
+    RENDEZVOUS_AD_VALIDITY_SECS / 2
+        > RENDEZVOUS_RECIPIENT_CHECK_INTERVAL.as_secs() * RENDEZVOUS_REREGISTER_EVERY_TICKS * 2,
+    "ad half-life must stay clear of the re-register cadence",
+);
 /// Re-register with the (still-live) current relay every N ticks — the relay's
 /// cookie map is in-memory, so this survives a relay restart.
 const RENDEZVOUS_REREGISTER_EVERY_TICKS: u64 = 5;
@@ -1112,16 +1141,31 @@ impl NodeRuntime {
                                 if punch_timeout.is_zero() {
                                     return;
                                 }
-                                let peer = match veil_nat::punch_udp(
+                                // Bound to our veil: see `veil_nat::network_tag`.
+                                let network_tag = veil_nat::network_tag(
+                                    access.transport_ctx.obfs4_psk.as_deref(),
+                                );
+                                let punched = veil_nat::punch_udp(
                                     &socket,
                                     &peer_candidates,
                                     punch_token,
+                                    &network_tag,
                                     punch_timeout,
                                 )
                                 .await
-                                {
-                                    Ok(Some(peer)) => peer,
-                                    _ => return,
+                                .unwrap_or_default();
+                                let Some(peer) = punched.peer else {
+                                    if punched.foreign_tokens > 0 {
+                                        logger.debug(
+                                            "nat.udp_punch.foreign_network",
+                                            format!(
+                                                "{} punch packet(s) carried a token \
+                                                 from another veil",
+                                                punched.foreign_tokens
+                                            ),
+                                        );
+                                    }
+                                    return;
                                 };
                                 let remaining = deadline
                                     .saturating_duration_since(tokio::time::Instant::now());
@@ -4289,6 +4333,39 @@ impl RendezvousResolverImpl {
     }
 }
 
+/// Enrol a send-path receiver in the refresh-ahead set — unless it is us.
+///
+/// The proactive set exists to spare the SEND path a synchronous DHT walk, and
+/// no send goes to our own rendezvous ad: reaching ourselves needs no route.
+/// Enrolling self turns a one-off self-resolve into a standing subscription,
+/// because the refresher re-walks every member once per cache TTL forever.
+///
+/// Measured 23.08 on an idle phone with zero contacts: **2536** FIND_VALUE
+/// walks of its OWN eight ad slots in 80 minutes, dead on 15.0s, **53%** of
+/// every DHT frame it exchanged. The refresh task's own doc promises "a node
+/// that stops messaging adds zero steady-state DHT load"; for the single
+/// receiver id that can never be messaged, that promise was inverted.
+///
+/// Self still resolves on demand — the mailbox drain's cold path needs it. It
+/// just does not buy a standing subscription.
+fn note_send_target(
+    resolve_cache: &Arc<super::anonymity_state::RendezvousResolveCache>,
+    receiver_id: [u8; 32],
+    local_node_id: [u8; 32],
+) {
+    if receiver_id == local_node_id {
+        // WHICH caller resolves self was not answerable from any log —
+        // measurement could name the frames and the keys, never the origin.
+        // Left as an instrument rather than another guess.
+        log::debug!(
+            "rendezvous.resolve.self receiver={} — walking, not enrolling in refresh-ahead",
+            veil_util::hex_short(&receiver_id),
+        );
+        return;
+    }
+    resolve_cache.note_send_use(receiver_id);
+}
+
 /// Resolve every requested rendezvous-ad slot from independent connected DHT
 /// peers, compare all still-valid signed candidates by publication time, and
 /// write the winner for each slot back into the local mirror.  A plain
@@ -4325,7 +4402,21 @@ pub(super) async fn resolve_fresh_rendezvous_ads(
     if !force_refresh {
         // Feed the refresh-ahead task: this receiver is being actively sent
         // to, keep its route warm for the activity window.
-        resolve_cache.note_send_use(receiver_id);
+        //
+        // OURSELF never qualifies. The proactive set exists to spare the SEND
+        // path a synchronous walk, and no send goes to our own rendezvous ad —
+        // reaching ourselves needs no route. Enrolling self turned a one-off
+        // self-resolve into a permanent 8-walks-per-TTL loop: measured 23.08 on
+        // an idle phone with zero contacts, 2536 FIND_VALUE walks of its OWN ad
+        // slots in 80 minutes, dead on 15.0s, 53% of every DHT frame it
+        // exchanged. The doc on the refresh task promises "a node that stops
+        // messaging adds zero steady-state DHT load"; for the one receiver id
+        // that can never be messaged, that promise was inverted.
+        //
+        // Resolving self still WORKS — the walk below runs as asked, and the
+        // mailbox drain's cold path depends on it. It just does not buy a
+        // standing subscription to re-walk forever.
+        note_send_target(resolve_cache, receiver_id, local_node_id);
         if let Some(ads) = resolve_cache.get(&receiver_id, now) {
             return ads;
         }
@@ -4340,6 +4431,36 @@ pub(super) async fn resolve_fresh_rendezvous_ads(
     // Always fill the cache from every system slot. The IPC caller may request
     // only one returned replica, but caching that partial lookup would hide a
     // fresher ad in another slot from the live send path for the cache TTL.
+    // OUR OWN ad needs no network. The walk exists because a cached ad can be
+    // stale — the receiver may have moved to another relay since it was
+    // resolved. For our own ad that cannot happen: we ARE the receiver, and
+    // the local mirror is exactly what we wrote when we published. Asking the
+    // network where our own advertisement is means asking strangers what we
+    // just told them.
+    //
+    // Measured 23.08 on an idle node: the pinned-circuit refresh
+    // (`CIRCUIT_IDLE_REFRESH_AFTER`) drove one full 8-slot walk of our OWN
+    // slots every ~304 s, forever — the node's log shows one of them starting
+    // 22 s after `rendezvous_ad.published` wrote the very ads it went looking
+    // for. That was about half of all recursive DHT traffic an idle phone
+    // exchanged.
+    //
+    // Falls through to the walk when the mirror holds nothing: the mailbox
+    // drain's cold path (not registered anywhere yet) depends on it, and so
+    // does a node whose ads have expired.
+    let mut ads = Vec::new();
+    if receiver_id == local_node_id {
+        ads.extend(
+            (0..MAX_RENDEZVOUS_AD_SLOTS)
+                .filter_map(|idx| dht.get_local(&rendezvous_ad_dht_key_at(&receiver_id, idx)))
+                .filter_map(|bytes| decode_rendezvous_ad(&bytes).ok())
+                .filter(|ad| ad.receiver_node_id == receiver_id)
+                .filter(|ad| verify_rendezvous_ad(ad).is_ok())
+                .filter(|ad| is_currently_valid(ad, now).is_ok()),
+        );
+    }
+    let from_local_mirror = !ads.is_empty();
+
     let walks = (0..MAX_RENDEZVOUS_AD_SLOTS).map(|idx| {
         let key = rendezvous_ad_dht_key_at(&receiver_id, idx);
         async move {
@@ -4368,8 +4489,11 @@ pub(super) async fn resolve_fresh_rendezvous_ads(
         }
     });
 
-    let mut ads = Vec::new();
-    for (_idx, key, candidates) in futures::future::join_all(walks).await {
+    for (_idx, key, candidates) in if ads.is_empty() {
+        futures::future::join_all(walks).await
+    } else {
+        Vec::new()
+    } {
         let mut decoded: Vec<_> = candidates
             .into_iter()
             .filter_map(|bytes| decode_rendezvous_ad(&bytes).ok().map(|ad| (ad, bytes)))
@@ -4403,8 +4527,13 @@ pub(super) async fn resolve_fresh_rendezvous_ads(
         logger.info(
             "anonymity.rendezvous.resolve.refreshed",
             format!(
-                "receiver={} candidates={} freshest_relay={} valid_from={}",
+                "receiver={} source={} candidates={} freshest_relay={} valid_from={}",
                 veil_util::hex_short(&receiver_id),
+                // Say WHERE the ads came from. Without this the line reads
+                // "refreshed" for a purely local read and an operator counting
+                // it would see a DHT walk that never happened — the instrument
+                // lying by its own name.
+                if from_local_mirror { "local" } else { "dht" },
                 ads.len(),
                 veil_util::hex_short(&ads[0].rendezvous_node_id),
                 ads[0].valid_from_unix,
@@ -6470,6 +6599,36 @@ mod tests {
             run_wake_only_trigger(false).await,
             1,
             "gate OFF: legacy wake-only push is still dispatched (back-compat)"
+        );
+    }
+
+    /// The refresh-ahead set must never contain us.
+    ///
+    /// Asserted through the CACHE, not through the predicate: what matters is
+    /// that the background refresher gets no candidate, and that a real peer
+    /// still does. A predicate-only test would pass just as happily if the
+    /// call site had the arms the wrong way round.
+    #[test]
+    fn resolving_our_own_ad_does_not_subscribe_us_to_refresh_ahead() {
+        let me = [1u8; 32];
+        let peer = [2u8; 32];
+        let cache = Arc::new(super::super::anonymity_state::RendezvousResolveCache::new());
+        let window = std::time::Duration::from_secs(300);
+        let margin = std::time::Duration::from_secs(6);
+
+        super::note_send_target(&cache, me, me);
+        assert!(
+            cache.refresh_candidates(window, margin).is_empty(),
+            "self-resolve enrolled us; the refresher would re-walk our own 8 ad \
+             slots once per TTL forever"
+        );
+
+        super::note_send_target(&cache, peer, me);
+        assert_eq!(
+            cache.refresh_candidates(window, margin),
+            vec![peer],
+            "a genuine send target must still be kept warm — the whole point of \
+             the proactive set"
         );
     }
 }

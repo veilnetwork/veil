@@ -16,7 +16,7 @@ use std::sync::{Arc, Mutex};
 use rand_core::{OsRng, RngCore};
 
 use crate::circuit::CircuitError;
-use crate::circuit_data::{Direction, apply_layers, read_payload};
+use crate::circuit_data::{CircuitCellBytes, Direction, apply_layers, read_payload};
 use crate::circuit_setup::{CIRCUIT_KEY_LEN, CircuitSetupHop, build_circuit_setup};
 use crate::circuit_wire::CircuitId;
 
@@ -54,6 +54,10 @@ pub struct OriginCircuit {
     /// verified inbound only proves them→us). The sender-side stall detector
     /// keys off this. False for hosted-service / data circuits.
     pub is_reply: bool,
+    /// Size of every data cell on this circuit — the number the originator
+    /// chose and put in the setup, so every send down it pads to the same
+    /// quantum the hops are enforcing.
+    pub cell_bytes: CircuitCellBytes,
 }
 
 impl Drop for OriginCircuit {
@@ -105,6 +109,57 @@ impl std::fmt::Debug for OriginCircuit {
     }
 }
 
+/// The cell size a newly-built circuit gets.
+///
+/// One function so the policy has a single home: the size is the ORIGINATOR's
+/// to choose (it is the only party that sees the whole path), every hop merely
+/// enforces whatever arrives in the setup.
+///
+/// # Why 2048 and not the legacy 16384
+///
+/// The number that mattered was never the bulk one. Measured 23.08 across all
+/// three testnet seeds at once, on a phone with zero contacts and nothing to
+/// send: `RelayChain` cells were **73.8%** of every body byte it exchanged —
+/// twelve frames outweighing the other 715 together. Each is the eight-byte
+/// circuit heartbeat (`CIRCUIT_HEARTBEAT_MAGIC`) riding a full 16410-byte cell,
+/// because a cell is padded to its size whatever it carries. The heartbeat
+/// cadence was already cut 15s → 79s for the same reason; the size is the half
+/// that was left, and it is worth eight times as much.
+///
+/// # What it costs
+///
+/// A smaller cell is cheaper idle and dearer under load, and the trade is
+/// deliberate rather than free:
+///
+/// * bulk moves in more cells — a 5 MB transfer becomes ~2 500 cells instead of
+///   ~310, so per-cell wire overhead goes from ~0.16% to ~1.3% of the payload;
+/// * an observer gets more timing samples per byte transferred.
+///
+/// 1024 (`MIN_CIRCUIT_CELL_BYTES`) would buy roughly 0.3 GB/month more on an
+/// idle phone while doubling both of those. 2048 takes eight of the sixteen
+/// available factors for a quarter of the bulk cost, which is where the curve
+/// stops being worth it.
+///
+/// # What it does NOT buy
+///
+/// Uniformity within one circuit is the anonymity property, and it is
+/// unchanged. But a single size chosen by every node is still a single size:
+/// this is a SMALLER global constant, not the per-circuit variety the plumbing
+/// enables. The classifier's free invariant moves from 16410 to 2074 — it does
+/// not disappear. Removing it needs sizes that differ per circuit, which needs
+/// a hub that can hold more than one MSS.
+///
+/// ⚠️ Changing this number BREAKS THE WIRE against nodes that expect another —
+/// every hop refuses a cell of any other size, and the setup prefix that
+/// carries it is length-sensitive. It moves for the whole network at once or
+/// not at all.
+pub fn choose_cell_bytes() -> CircuitCellBytes {
+    // 2048 is inside `MIN_CIRCUIT_CELL_BYTES..=CIRCUIT_PAYLOAD_BYTES`, so the
+    // constructor cannot fail; `legacy()` keeps the promise honest if it ever
+    // moves outside.
+    CircuitCellBytes::new(2048).unwrap_or_else(|_| CircuitCellBytes::legacy())
+}
+
 /// Build a circuit-setup envelope addressed through `hops` (`hops[0]` first,
 /// `hops[N-1]` the terminus R), with freshly-random per-link ids + per-hop keys.
 /// `terminus_payload` rides to R (e.g. a signed `CircuitRegisterPayload`).
@@ -112,6 +167,7 @@ impl std::fmt::Debug for OriginCircuit {
 /// `CircuitBuild`; keep `origin_state` to open returns.
 pub fn build_origin_circuit(
     hops: &[OriginHop],
+    cell: CircuitCellBytes,
     terminus_payload: &[u8],
     now_unix: u64,
 ) -> Result<(Vec<u8>, OriginCircuit), CircuitError> {
@@ -139,7 +195,7 @@ pub fn build_origin_circuit(
             circuit_key: keys[i],
         })
         .collect();
-    let setup = build_circuit_setup(&setup_hops, terminus_payload)?;
+    let setup = build_circuit_setup(&setup_hops, cell, terminus_payload)?;
     let origin = OriginCircuit {
         circuit_keys: keys,
         first_hop: hops[0].node_id,
@@ -147,6 +203,7 @@ pub fn build_origin_circuit(
         created_unix: now_unix,
         confirmed: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         is_reply: false, // callers building a REPLY circuit set this afterwards
+        cell_bytes: cell,
     };
     Ok((setup, origin))
 }
@@ -281,7 +338,9 @@ mod tests {
         let (sk0, h0) = hop();
         let (sk1, h1) = hop();
         let (sk2, h2) = hop(); // terminus
-        let (env, origin) = build_origin_circuit(&[h0, h1, h2], b"register", 1000).unwrap();
+        let (env, origin) =
+            build_origin_circuit(&[h0, h1, h2], CircuitCellBytes::legacy(), b"register", 1000)
+                .unwrap();
         assert_eq!(origin.circuit_keys.len(), 3);
         assert_eq!(origin.first_hop, h0.node_id);
 
@@ -327,11 +386,16 @@ mod tests {
         let (_s0, h0) = hop();
         let (_s1, h1) = hop();
         let (_s2, h2) = hop();
-        let (_env, origin) = build_origin_circuit(&[h0, h1, h2], b"", 0).unwrap();
+        let (_env, origin) =
+            build_origin_circuit(&[h0, h1, h2], CircuitCellBytes::legacy(), b"", 0).unwrap();
         let k = &origin.circuit_keys;
         let seq = 5u32;
         // Terminus wraps + applies its layer; intermediate hops apply theirs.
-        let mut cell = wrap_payload(b"introduce-bytes").unwrap();
+        let mut cell = wrap_payload(
+            b"introduce-bytes",
+            crate::circuit_data::CircuitCellBytes::legacy(),
+        )
+        .unwrap();
         apply_layer(&k[2], Direction::Return, seq, &mut cell);
         apply_layer(&k[1], Direction::Return, seq, &mut cell);
         apply_layer(&k[0], Direction::Return, seq, &mut cell);
@@ -354,14 +418,15 @@ mod tests {
     fn origin_table_insert_lookup_cap_gc() {
         let t = OriginCircuitTable::with_params(1, 300);
         let (_s, h) = hop();
-        let (_env, origin) = build_origin_circuit(&[h], b"", 100).unwrap();
+        let (_env, origin) =
+            build_origin_circuit(&[h], CircuitCellBytes::legacy(), b"", 100).unwrap();
         let oc = Arc::new(origin);
         assert!(t.insert(Arc::clone(&oc)));
         assert!(t.lookup(&oc.first_hop, oc.origin_circuit_id).is_some());
 
         // Cap = 1: a second distinct circuit is refused.
         let (_s2, h2) = hop();
-        let (_e2, o2) = build_origin_circuit(&[h2], b"", 100).unwrap();
+        let (_e2, o2) = build_origin_circuit(&[h2], CircuitCellBytes::legacy(), b"", 100).unwrap();
         assert!(!t.insert(Arc::new(o2)));
 
         // GC past TTL frees it.

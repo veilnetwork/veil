@@ -342,6 +342,23 @@ pub struct NodeMetrics {
     /// drop" (quota field removed 2026-05-22 after design moved past
     /// forward-then-verify).
     unknown_origin_gossip_rejected_total: Arc<AtomicU64>,
+    /// Gossip forwards suppressed because this origin was already relayed
+    /// within half the route-cache TTL.
+    ///
+    /// Forwarding rewrites `via` to this node, so everything relayed about one
+    /// origin refreshes ONE entry downstream, and keeping it alive needs one
+    /// relay per TTL. Measured before the throttle: six per lifetime, and
+    /// forwarded announcements were 85% of all routing traffic. Read this
+    /// beside `gossip_announces_rx_total` to see how much of the plane was
+    /// repetition.
+    gossip_forward_suppressed_total: Arc<AtomicU64>,
+    /// Owned-record pushes skipped because the peer already had exactly this
+    /// set and its copies had not had time to expire.
+    ///
+    /// The push runs on every session open, inbound included, so its frequency
+    /// belongs to the remote side: a peer that reconnects often took the same
+    /// dump every time.
+    owned_push_suppressed_total: Arc<AtomicU64>,
     /// Exit-proxy CONNECT targets denied by `is_forbidden_destination`
     /// (loopback/private/link-local/metadata)..
     exit_proxy_dest_denied_total: Arc<AtomicU64>,
@@ -488,6 +505,8 @@ pub struct MetricsSnapshot {
     pub gossip_announces_rx_total: u64,
     // Denial/drop counters
     pub unknown_origin_gossip_rejected_total: u64,
+    pub gossip_forward_suppressed_total: u64,
+    pub owned_push_suppressed_total: u64,
     pub exit_proxy_dest_denied_total: u64,
     pub socks5_accepts_throttled_total: u64,
     pub gateway_lift_seen_evicted_total: u64,
@@ -684,6 +703,8 @@ impl NodeMetrics {
             route_cache_hits_total: counter!(),
             gossip_announces_rx_total: counter!(),
             unknown_origin_gossip_rejected_total: counter!(),
+            gossip_forward_suppressed_total: counter!(),
+            owned_push_suppressed_total: counter!(),
             exit_proxy_dest_denied_total: counter!(),
             socks5_accepts_throttled_total: counter!(),
             gateway_lift_seen_evicted_total: counter!(),
@@ -901,6 +922,16 @@ impl NodeMetrics {
 
     pub fn inc_unknown_origin_gossip_rejected(&self) {
         self.unknown_origin_gossip_rejected_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn inc_gossip_forward_suppressed(&self) {
+        self.gossip_forward_suppressed_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn inc_owned_push_suppressed(&self) {
+        self.owned_push_suppressed_total
             .fetch_add(1, Ordering::Relaxed);
     }
 
@@ -1368,6 +1399,8 @@ impl NodeMetrics {
             route_cache_hits_total: load!(route_cache_hits_total),
             gossip_announces_rx_total: load!(gossip_announces_rx_total),
             unknown_origin_gossip_rejected_total: load!(unknown_origin_gossip_rejected_total),
+            gossip_forward_suppressed_total: load!(gossip_forward_suppressed_total),
+            owned_push_suppressed_total: load!(owned_push_suppressed_total),
             exit_proxy_dest_denied_total: load!(exit_proxy_dest_denied_total),
             socks5_accepts_throttled_total: load!(socks5_accepts_throttled_total),
             gateway_lift_seen_evicted_total: load!(gateway_lift_seen_evicted_total),
@@ -1611,6 +1644,16 @@ impl NodeMetrics {
             "veil_gossip_announces_rx_total",
             s.gossip_announces_rx_total
         );
+        // Read beside the line above: together they say how much of the
+        // routing plane was repetition rather than news.
+        counter!(
+            "veil_gossip_forward_suppressed_total",
+            s.gossip_forward_suppressed_total
+        );
+        counter!(
+            "veil_owned_push_suppressed_total",
+            s.owned_push_suppressed_total
+        );
         // Denial/drop counters
         counter!(
             "veil_unknown_origin_gossip_rejected_total",
@@ -1842,6 +1885,64 @@ impl veil_ipc::IpcMetrics for NodeMetrics {
 mod tests {
     use super::*;
     use std::fs;
+
+    /// Every counter in the snapshot must reach the exporter.
+    ///
+    /// A counter is added in four places — the atomic, the snapshot field, the
+    /// load, and the render — and forgetting the last one produces a number
+    /// nothing can read. That is not hypothetical: `gossip_forward_suppressed`
+    /// was added to measure how much routing gossip was repetition, shipped,
+    /// deployed to three seeds, and only then found to be invisible in both
+    /// `node metrics` and `/metrics`.
+    ///
+    /// Reads the snapshot's own field list out of this file rather than
+    /// duplicating it, so a counter added tomorrow is covered without anybody
+    /// remembering to add it here.
+    ///
+    /// Break-check: delete one `counter!` line from `render_prometheus` and
+    /// this names the field.
+    #[test]
+    fn every_snapshot_counter_is_exported() {
+        // `file!()` is workspace-relative and the test's cwd is the crate
+        // directory, so it does not resolve. `CARGO_MANIFEST_DIR` does, from
+        // wherever the runner is invoked.
+        let source = fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/lib.rs"))
+            .expect("read own source");
+
+        // The `pub <name>: u64` fields of MetricsSnapshot.
+        let start = source
+            .find("pub struct MetricsSnapshot")
+            .expect("MetricsSnapshot exists");
+        let body_start = source[start..].find('{').expect("struct body") + start;
+        let body_end = source[body_start..].find("\n}").expect("struct end") + body_start;
+        let body = &source[body_start..body_end];
+
+        let rendered = NodeMetrics::new().render_prometheus();
+
+        let mut missing = Vec::new();
+        for line in body.lines() {
+            let line = line.trim();
+            let Some(rest) = line.strip_prefix("pub ") else {
+                continue;
+            };
+            let Some((name, ty)) = rest.split_once(':') else {
+                continue;
+            };
+            if !ty.trim().starts_with("u64") && !ty.trim().starts_with("f64") {
+                continue;
+            }
+            let name = name.trim();
+            if !rendered.contains(&format!("veil_{name}")) {
+                missing.push(name.to_owned());
+            }
+        }
+
+        assert!(
+            missing.is_empty(),
+            "these snapshot counters are never rendered, so nothing can read \
+             them: {missing:?}"
+        );
+    }
 
     /// SECURITY (audit 2026-05-29, log-injection regression): control
     /// characters in attacker-controlled fields MUST be escaped so they

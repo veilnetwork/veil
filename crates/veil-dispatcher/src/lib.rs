@@ -900,6 +900,35 @@ pub struct FrameDispatcher {
     /// Bounded to `MAX_ROUTE_ORIGIN_SEQ_CACHE` entries; lowest-sequence entry
     /// evicted when full.
     pub route_origin_seq: Arc<Mutex<HashMap<(NodeIdBytes, NodeIdBytes), u32>>>,
+    /// When we last FORWARDED gossip about an origin, and at what hop count.
+    ///
+    /// Forwarding rewrites `via_node_id` to this node, so everything we relay
+    /// about one origin lands in ONE cache slot on every downstream peer.
+    /// Relaying it again before that slot needs refreshing is repetition, and
+    /// repetition is where the traffic went: measured on a live testnet, hop-1
+    /// announcements refreshed each `(origin, via)` pair 1.3 times per cache
+    /// TTL -- exactly right -- while forwarded hop-2 announcements refreshed
+    /// theirs 6.0 times, and were 85% of the volume.
+    ///
+    /// The hop count is kept alongside the instant so an IMPROVEMENT is never
+    /// throttled: a shorter path is news, not repetition, and holding it back
+    /// would leave downstream peers scoring a worse route for up to the
+    /// throttle window.
+    ///
+    /// Bounded to `MAX_ROUTE_ORIGIN_SEQ_CACHE`; the oldest entry is evicted
+    /// when full, which is also the least useful one to keep.
+    pub route_forward_last: Arc<Mutex<HashMap<NodeIdBytes, (Instant, u8)>>>,
+    /// What we last pushed to a peer on session establish, and when.
+    ///
+    /// `push_owned_dht_records` fires on EVERY session open, including inbound
+    /// ones — so the remote side decides how often it happens. A phone on a
+    /// bad link reconnects and gets the whole dump again, unchanged, every
+    /// time. The digest is of the records we would send; if it matches and the
+    /// peer's copies have not had time to expire, sending them again tells it
+    /// nothing it does not already have.
+    ///
+    /// Keyed by peer and bounded like the other gossip maps.
+    pub owned_push_last: Arc<Mutex<HashMap<NodeIdBytes, (Instant, u64)>>>,
     /// Monotonic sequence counter for locally-originated route announcements.
     pub announce_seq: Arc<AtomicU32>,
     /// Listen transports of this node — included in RouteResponse.
@@ -1923,6 +1952,8 @@ pub fn make_test_dispatcher(role: NodeRole) -> FrameDispatcher {
             4096,
         ))),
         route_origin_seq: Arc::new(Mutex::new(HashMap::new())),
+        route_forward_last: Arc::new(Mutex::new(HashMap::new())),
+        owned_push_last: Arc::new(Mutex::new(HashMap::new())),
         announce_seq: Arc::new(AtomicU32::new(0)),
         listen_transports: Arc::new(RwLock::new(vec![])),
         own_external_addrs: Arc::new(RwLock::new(vec![])),
@@ -2817,6 +2848,8 @@ mod tests {
             pending_ack: Arc::new(Mutex::new(pending_ack::PendingAckTracker::new())),
             loss_tracker: Arc::new(veil_routing::loss_tracker::LossTracker::new()),
             route_origin_seq: Arc::new(Mutex::new(HashMap::new())),
+            route_forward_last: Arc::new(Mutex::new(HashMap::new())),
+            owned_push_last: Arc::new(Mutex::new(HashMap::new())),
             // PoW solver resource limits — permissive in tests.
             pow_solver_semaphore: Arc::new(tokio::sync::Semaphore::new(
                 veil_proto::budget::MAX_CONCURRENT_POW_SOLVERS,

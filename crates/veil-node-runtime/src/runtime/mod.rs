@@ -399,7 +399,15 @@ pub struct AttachedDebugSession {
     pub remote_discovery_mode: veil_cfg::DiscoveryMode,
     /// False when the peer advertised `NO_DHT_SERVICE` — stamped into the
     /// routing-table `Contact` so no candidate-selection path picks it.
+    ///
+    /// Only meaningful when [`Self::remote_caps_stated`] is true.
     pub remote_dht_service: bool,
+    /// Whether the two fields above came from the peer's own CAPABILITIES
+    /// frame. False on a fast-resumed handshake, which synthesizes a zero
+    /// payload that reads as "Public, serves" — the ordinary answer, not a
+    /// missing one. Anything writing these into the routing table must treat
+    /// false as "no news" and leave the stored stamps alone.
+    pub remote_caps_stated: bool,
     /// True when this session was accepted INTO the referral headroom above
     /// `max_concurrent` (the node was already at its data ceiling). Such a
     /// session is transient: it exists only to deliver a peer-gossip sample so
@@ -2162,6 +2170,8 @@ impl NodeRuntime {
             loss_tracker: Arc::new(veil_routing::loss_tracker::LossTracker::new()),
             // per-origin sequence monotonicity cache.
             route_origin_seq: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            route_forward_last: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            owned_push_last: Arc::new(Mutex::new(std::collections::HashMap::new())),
             // PoW solver resource limits.
             pow_solver_semaphore: Arc::new(tokio::sync::Semaphore::new(
                 veil_proto::budget::MAX_CONCURRENT_POW_SOLVERS,
@@ -2629,6 +2639,10 @@ impl NodeRuntime {
         veil_session::runner::set_mobile_outbound_batch_window_ms(
             config.mobile.outbound_batch_window_ms.unwrap_or(0),
         );
+        // The battery-independent opt-in. Without priming it the config field
+        // would parse and then do nothing, which is the failure mode the
+        // window itself already had.
+        veil_session::runner::set_mobile_outbound_batch_always(config.mobile.outbound_batch_always);
         // prime the global session-rotation interval
         // (0 = disabled). Runtime-side clamp ensures any value
         // < 60 gets pushed up to the floor, defending against
@@ -3985,7 +3999,7 @@ impl NodeRuntime {
     }
 
     /// Return `(dst, next_hop, score, hop_count)` for every non-expired route.
-    pub fn route_cache_all(&self) -> Vec<([u8; 32], [u8; 32], u32, u8)> {
+    pub fn route_cache_all(&self) -> Vec<veil_routing::cache::RouteSnapshot> {
         rlock!(self.routing.route_cache).all_routes_with_score()
     }
 
@@ -5563,11 +5577,30 @@ impl NodeServices {
         if punch_timeout.is_zero() {
             return Err(HolePunchDialFailure::PunchTimeout);
         }
-        let peer = veil_nat::punch_udp(&socket, &candidates, punch_token, punch_timeout)
-            .await
-            .ok()
-            .flatten()
-            .ok_or(HolePunchDialFailure::PunchTimeout)?;
+        // The punch is bound to this node's veil, so a peer on a different
+        // deployment cannot converge with us and be promoted into a session.
+        let network_tag = veil_nat::network_tag(self.transport_ctx.obfs4_psk.as_deref());
+        let punched = veil_nat::punch_udp(
+            &socket,
+            &candidates,
+            punch_token,
+            &network_tag,
+            punch_timeout,
+        )
+        .await
+        .unwrap_or_default();
+        if punched.peer.is_none() && punched.foreign_tokens > 0 {
+            // A cross-veil punch fails by timing out, exactly like a NAT that
+            // never opened. Say which one it was.
+            self.logger.debug(
+                "nat.udp_punch.foreign_network",
+                format!(
+                    "{} punch packet(s) carried a token from another veil",
+                    punched.foreign_tokens
+                ),
+            );
+        }
+        let peer = punched.peer.ok_or(HolePunchDialFailure::PunchTimeout)?;
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         if remaining.is_zero() {
             return Err(HolePunchDialFailure::PunchTimeout);
@@ -5916,11 +5949,12 @@ impl NodeServices {
             // handshake completing is fresh evidence of working egress).
             access
                 .dht
-                .add_contact_trusted(veil_dht::routing::Contact::with_caps(
+                .add_contact_trusted(veil_dht::routing::Contact::from_handshake(
                     *peer.node_id.as_bytes(),
                     &peer.transport,
-                    session.remote_discovery_mode,
-                    session.remote_dht_service,
+                    session
+                        .remote_caps_stated
+                        .then_some((session.remote_discovery_mode, session.remote_dht_service)),
                 ));
             let _ = access
                 .dht
@@ -6644,11 +6678,12 @@ pub fn spawn_inbound_session(
             // `handle_find_node_v2` can filter them out of FIND_NODE responses
             // if they prefer to stay hidden from DHT-walks.
             inbound.runtime.dispatcher.dht.add_contact_trusted(
-                veil_dht::routing::Contact::with_caps(
+                veil_dht::routing::Contact::from_handshake(
                     *peer_id.as_bytes(),
                     inbound_transport.clone(),
-                    session.remote_discovery_mode,
-                    session.remote_dht_service,
+                    session
+                        .remote_caps_stated
+                        .then_some((session.remote_discovery_mode, session.remote_dht_service)),
                 ),
             );
             // promote any unverified candidate for this
@@ -7536,6 +7571,8 @@ pub struct DataCircuit {
     /// the circuit (in practice the 600 s origin-table TTL rotates first).
     next_seq: std::sync::atomic::AtomicU32,
     confirmed: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Size of every cell on this circuit — the number its setup negotiated.
+    cell_bytes: veil_anonymity::circuit_data::CircuitCellBytes,
 }
 
 /// Detailed local enqueue result for pinned circuit DATA. This is intentionally
@@ -7782,7 +7819,12 @@ impl NodeServices {
         };
 
         // Build the origin circuit with the registration as terminus payload.
-        let (setup, mut origin) = match build_origin_circuit(&hops, &reg.encode(), now) {
+        let (setup, mut origin) = match build_origin_circuit(
+            &hops,
+            veil_anonymity::circuit_origin::choose_cell_bytes(),
+            &reg.encode(),
+            now,
+        ) {
             Ok(v) => v,
             Err(e) => {
                 log::warn!("build_onion_circuit_once NoRelays: build_origin_circuit failed: {e:?}");
@@ -7868,8 +7910,13 @@ impl NodeServices {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
-        let (setup, origin) = build_origin_circuit(&hops, terminus_payload, now)
-            .map_err(|_| AnonOnionSendError::NoRelays)?;
+        let (setup, origin) = build_origin_circuit(
+            &hops,
+            veil_anonymity::circuit_origin::choose_cell_bytes(),
+            terminus_payload,
+            now,
+        )
+        .map_err(|_| AnonOnionSendError::NoRelays)?;
         // Snapshot what the handle needs BEFORE the origin moves into the table.
         let circ = DataCircuit {
             first_hop: origin.first_hop,
@@ -7878,6 +7925,7 @@ impl NodeServices {
             keys: origin.circuit_keys.clone(),
             next_seq: std::sync::atomic::AtomicU32::new(0),
             confirmed: std::sync::Arc::clone(&origin.confirmed),
+            cell_bytes: origin.cell_bytes,
         };
         // Register the stream return-cell sink keyed by origin_circuit_id BEFORE
         // sending the build, so no early return cell is dropped once it comes up.
@@ -8487,7 +8535,8 @@ impl NodeServices {
         use veil_anonymity::circuit_wire::CircuitDataPayload;
 
         let seq = circ.alloc_seq().ok_or(DataCircuitSendError::NoRelays)?; // exhausted → rotate
-        let mut buf = wrap_payload(payload).map_err(|_| DataCircuitSendError::PayloadTooLarge)?;
+        let mut buf = wrap_payload(payload, circ.cell_bytes)
+            .map_err(|_| DataCircuitSendError::PayloadTooLarge)?;
         apply_layers(&circ.keys, Direction::Forward, seq, &mut buf)
             .map_err(|_| DataCircuitSendError::NoRelays)?;
         let cell = CircuitDataPayload {
@@ -8495,7 +8544,9 @@ impl NodeServices {
             seq,
             ciphertext: buf,
         };
-        let enc = cell.encode().map_err(|_| DataCircuitSendError::NoRelays)?;
+        let enc = cell
+            .encode(circ.cell_bytes)
+            .map_err(|_| DataCircuitSendError::NoRelays)?;
         self.send_relay_chain_frame(
             &circ.first_hop,
             veil_proto::family::RelayChainMsg::CircuitData,
