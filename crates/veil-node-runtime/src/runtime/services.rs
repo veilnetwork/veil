@@ -1747,10 +1747,21 @@ mod v08_withdraw_tests {
     /// And publishing is still what it is withdrawing — a rename on one side
     /// only would leave this file with a dead function and the registry with a
     /// permanent entry.
+    ///
+    /// Pinned by REFERENCE, not by a source search. This read its own file and
+    /// asserted it contained "pub fn publish_embedded_services" — a string
+    /// that is present in the assertion itself, one line below the search.
+    /// The predicate was therefore satisfied by the test's own text and stayed
+    /// true with BOTH functions deleted; verified by removing the two
+    /// definitions and re-evaluating it. A guard that cannot fail is a claim
+    /// of coverage that was never there.
+    ///
+    /// Function pointers cost nothing at runtime and put the names AND the
+    /// signatures in front of the compiler, which is what "these two exist as
+    /// a pair" actually means.
     #[test]
     fn publish_and_withdraw_are_a_pair() {
-        let source = include_str!("services.rs");
-        assert!(source.contains("pub fn publish_embedded_services"));
-        assert!(source.contains("pub fn withdraw_embedded_services"));
+        let _publish: fn(super::NodeServices) = super::publish_embedded_services;
+        let _withdraw: fn(&[u8; 32]) = super::withdraw_embedded_services;
     }
 }

@@ -952,17 +952,39 @@ mod v17_key_hygiene_tests {
             expires_at: Instant::now(),
         };
         let rendered = format!("{entry:?}");
+        // Named fields, not a bare substring. This used to assert
+        // `!rendered.contains("205")` — 0xCD in decimal — against the WHOLE
+        // rendering, which also carries `expires_at: Instant { tv_sec: .. }`.
+        // A monotonic clock whose seconds or nanoseconds happen to contain
+        // "205" (or "171" for the nonce) failed the test on a machine that had
+        // simply been up a while: the gate went red on uptime, with the
+        // redaction working perfectly. A byte value spelled in decimal is three
+        // digits, and three digits collide with everything.
         assert!(
-            !rendered.contains("205"),
+            rendered.contains("rx_key: \"<redacted>\""),
+            "the key field is not redacted: {rendered}"
+        );
+        assert!(
+            rendered.contains("nonce: \"<redacted>\""),
+            "the nonce field is not redacted: {rendered}"
+        );
+        // A derived `Debug` renders `[205, 205, 205, ...]`. A RUN cannot be
+        // produced by a timestamp, so this stays a real check on the leak
+        // rather than a check on the clock.
+        assert!(
+            !rendered.contains("205, 205"),
             "the key's bytes are in the debug output: {rendered}"
         );
         assert!(
-            !rendered.contains("171"),
+            !rendered.contains("171, 171"),
             "the nonce's bytes are in the debug output: {rendered}"
         );
+        // Vacuity guard: a `Debug` that printed nothing at all would satisfy
+        // every negative above. The field that is NOT secret must still show.
         assert!(
-            rendered.contains("redacted"),
-            "the debug output should say what it withheld: {rendered}"
+            rendered.contains("9, 9, 9"),
+            "the non-secret field stopped rendering, so the assertions above \
+             are about an empty string: {rendered}"
         );
     }
 }
