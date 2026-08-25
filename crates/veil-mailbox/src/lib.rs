@@ -203,6 +203,74 @@ pub const MIN_EVICTION_AGE_SECS: u64 = 3600;
 /// that need the rest are expected to ack-then-fetch in batches.
 pub const MAX_FETCH_COUNT: usize = 1024;
 
+/// Content ids one FETCH request may ask the relay to leave out.
+///
+/// Bounded because the list arrives from the network: a fetcher naming
+/// thousands of ids would make the relay carry them and check each record
+/// against all of them. Sixty-four is far past what a real drain sets aside —
+/// a client gives up on a record only after several transient failures — and
+/// a request past the cap is truncated rather than refused, because refusing
+/// would break a drain over a field the relay is free to ignore.
+pub const MAX_FETCH_SKIP: usize = 64;
+
+/// What a FETCH request may say, beyond who is asking.
+///
+/// The request body used to be empty and the relay never read it, so this is
+/// strictly additive in both directions: an old relay ignores whatever a new
+/// client sends, and a new relay reads an empty body from an old client as
+/// "skip nothing" — which is exactly the behaviour both have today.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MailboxFetchRequest {
+    /// Records the fetcher already holds and cannot use yet. See
+    /// [`Mailbox::fetch_skipping`].
+    pub skip: Vec<[u8; 32]>,
+}
+
+impl MailboxFetchRequest {
+    /// Leading byte, so a body that is not this can be told apart from one
+    /// that is and left alone.
+    const MAGIC: u8 = 0xF1;
+
+    /// Wire bytes: magic, count, then the ids. Truncated at
+    /// [`MAX_FETCH_SKIP`] rather than refused — a request the relay would
+    /// reject is worse than one it partly honours.
+    #[must_use]
+    pub fn encode(&self) -> Vec<u8> {
+        let n = self.skip.len().min(MAX_FETCH_SKIP);
+        let mut out = Vec::with_capacity(3 + n * 32);
+        out.push(Self::MAGIC);
+        out.extend_from_slice(&(n as u16).to_be_bytes());
+        for cid in self.skip.iter().take(n) {
+            out.extend_from_slice(cid);
+        }
+        out
+    }
+
+    /// Read a request body, tolerating everything.
+    ///
+    /// NEVER an error. An empty body is every client that predates this field;
+    /// an unrecognised one is a client this relay does not know about. Both
+    /// mean "skip nothing", because the alternative — refusing the fetch —
+    /// would strand somebody's mail over a hint.
+    #[must_use]
+    pub fn decode(body: &[u8]) -> Self {
+        if body.len() < 3 || body[0] != Self::MAGIC {
+            return Self::default();
+        }
+        let count = u16::from_be_bytes([body[1], body[2]]) as usize;
+        let available = (body.len() - 3) / 32;
+        let n = count.min(available).min(MAX_FETCH_SKIP);
+        let mut skip = Vec::with_capacity(n);
+        for i in 0..n {
+            let at = 3 + i * 32;
+            let mut cid = [0u8; 32];
+            cid.copy_from_slice(&body[at..at + 32]);
+            skip.push(cid);
+        }
+        Self { skip }
+    }
+}
+
 /// hard cap on the total PAYLOAD BYTES returned by a
 /// single [`Mailbox::fetch`] call.
 ///
@@ -1146,6 +1214,32 @@ impl Mailbox {
     /// the FIRST selected record is always emitted, so a record that alone
     /// exceeds the ceiling can never wedge the queue behind it.
     pub fn fetch(&self, receiver: [u8; 32]) -> Result<Vec<MailboxBlob>, MailboxError> {
+        self.fetch_skipping(receiver, &[])
+    }
+
+    /// [`fetch`](Self::fetch), leaving out records the fetcher already has in
+    /// hand.
+    ///
+    /// The selection is oldest-first and bounded by a reply budget, so the
+    /// front of the queue decides what a fetch returns. A record the fetcher
+    /// cannot use yet — one whose open failed for a transient reason, and
+    /// which it therefore has not acked — sits at that front and is served
+    /// again on every fetch, spending slots and bytes that everything behind
+    /// it needs. Nothing else in the queue moves until it does (report14
+    /// X14-M4).
+    ///
+    /// Skipping happens at SELECTION, not after: a record filtered out of the
+    /// heap costs neither a slot nor a byte of the budget, which is the whole
+    /// point. The list is capped by the request decoder, so the linear check
+    /// here is over at most [`MAX_FETCH_SKIP`] entries.
+    ///
+    /// A record is never deleted by this — the fetcher will come back for it,
+    /// and the relay's TTL is what retires it otherwise.
+    pub fn fetch_skipping(
+        &self,
+        receiver: [u8; 32],
+        skip: &[[u8; 32]],
+    ) -> Result<Vec<MailboxBlob>, MailboxError> {
         let txn = self.db.begin_read()?;
         let blobs = txn.open_table(TABLE_BLOBS)?;
         // Range scan: prefix = receiver_id || 0..0.. receiver_id || ff..ff.
@@ -1176,6 +1270,12 @@ impl Mailbox {
             }
             let mut content_id = [0u8; 32];
             content_id.copy_from_slice(&key_bytes[32..]);
+            if skip.contains(&content_id) {
+                // Asked for by nobody: the fetcher says it cannot use this one
+                // yet, and serving it again spends the budget everything
+                // behind it is waiting for.
+                continue;
+            }
             let (_sender, deposited_at) = decode_record_header(v.value())?;
             heap.push((deposited_at, content_id));
             if heap.len() > MAX_FETCH_COUNT {
