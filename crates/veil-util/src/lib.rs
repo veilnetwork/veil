@@ -539,7 +539,7 @@ fn atomic_write_inner(
             )
         })
     })?;
-    match std::fs::rename(&tmp, path) {
+    match rename_durable(&tmp, path) {
         Ok(()) => {
             // A rename within a volume carries the object's own security
             // descriptor, so the published path should already be owner-only —
@@ -553,7 +553,14 @@ fn atomic_write_inner(
             }
             // fsync the parent
             // directory after the rename so the rename itself is
-            // durably persisted. Without this, a power loss in the
+            // durably persisted. This is the POSIX half only: on Windows
+            // `fsync_dir` is `Ok(())` and there is no directory-fsync concept
+            // to stand in for it, so the barrier there has to live INSIDE the
+            // rename — which is why the call above is `rename_durable` rather
+            // than `std::fs::rename`. Content was already `sync_all`'d; what
+            // was unbarriered on Windows was the publish, and every durable
+            // file veil writes is published through here (report14 V14-L4).
+            // Without this, a power loss in the
             // narrow window between rename(2) returning and the dirent
             // hitting disk could leave the directory referencing
             // either the old name (file gone), the new name (good)
@@ -1270,6 +1277,47 @@ impl From<Ttl> for std::time::Duration {
 
 #[cfg(test)]
 mod tests {
+
+    /// Every durable file veil writes is published through `atomic_write`, and
+    /// the publish renames DURABLY.
+    ///
+    /// A STRUCTURAL guard, for the same reason as the one in `veil-update`:
+    /// the half that matters cannot be observed where these tests run. On
+    /// POSIX `rename_durable` IS `fs::rename` and the barrier is the parent
+    /// fsync beneath it, so no behavioural test on this platform can tell the
+    /// two apart — a passing suite here says nothing about Windows either way.
+    ///
+    /// What was wrong: `fsync_dir` is `Ok(())` on non-Unix, so on Windows the
+    /// content was fsynced and the PUBLISH had no barrier at all. V14-L4 was
+    /// closed by hardening the updater's binary rename, and this — the helper
+    /// underneath the identity document, the master file, the config store,
+    /// the runtime state and the updater's own installed-version file — was
+    /// left on a bare rename. A power loss could therefore lose the very state
+    /// file whose durability that fix was about.
+    ///
+    /// Still unproven ON Windows: that needs a power-fault run on a VM.
+    #[test]
+    fn atomic_write_publishes_through_the_durable_rename() {
+        let src = include_str!("lib.rs");
+        let at = src
+            .find("fn atomic_write_inner(")
+            .expect("the helper moved — this guard no longer watches it");
+        let body = &src[at..];
+        let end = body
+            .find("\nfn fsync_dir")
+            .or_else(|| body.find("\npub fn write_executable_staged"))
+            .expect("could not bound the helper");
+        let body = &body[..end];
+        assert!(
+            body.contains("rename_durable(&tmp, path)"),
+            "the publish must go through the durable helper"
+        );
+        assert!(
+            !body.contains("std::fs::rename(&tmp, path)"),
+            "a bare rename leaves Windows with no barrier on the publish, and \
+             fsync_dir is a no-op there"
+        );
+    }
     use super::*;
 
     /// Android is the one target whose hickory `read_system_conf` reaches for

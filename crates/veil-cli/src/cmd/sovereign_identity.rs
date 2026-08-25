@@ -1040,7 +1040,11 @@ fn migrate<I: CommandIo>(
         f.write_all(&cert_bytes)?;
         f.sync_all()?;
     }
-    fs::rename(&tmp, &cert_out)?;
+    // The barrier, not the shared helper: `veil_util::atomic_write` always
+    // creates 0o600, and this file is deliberately 0o644 for a daemon running
+    // as another user to pick up. `rename_durable` is `fs::rename` on POSIX and
+    // adds Windows' write-through, which a bare rename gives no substitute for.
+    veil_util::rename_durable(&tmp, &cert_out)?;
 
     // Step 7: emit summary.
     let dht_key = migration_cert_dht_key(&old_doc.node_id);
