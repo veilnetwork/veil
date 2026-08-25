@@ -281,6 +281,19 @@ pub struct UdpRealm {
     replay: std::sync::Mutex<MeshReplayState>,
 }
 
+/// Whether a datagram arrived sealed under the realm's key.
+///
+/// `Sealed` also covers a realm with no key configured: there is then no
+/// inside to be outside of.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FrameOrigin {
+    /// Opened with the realm key — or a realm that has none.
+    Sealed,
+    /// Decoded in the clear, under the broadcast-only fallback. Whoever sent
+    /// it does not hold the realm key.
+    Plaintext,
+}
+
 impl UdpRealm {
     /// Bind a UDP socket and create a realm listener.
     ///
@@ -521,6 +534,20 @@ impl UdpRealm {
     ///
     /// `None` means "do not deliver this": undecodable, or a replay.
     pub fn decode_datagram(&self, wire: &[u8]) -> Option<MeshFrame> {
+        self.decode_datagram_with_origin(wire).map(|(f, _)| f)
+    }
+
+    /// [`decode_datagram`](Self::decode_datagram), and whether the datagram
+    /// arrived SEALED under this realm's key.
+    ///
+    /// The distinction is not about confidentiality — it is admission. A
+    /// plaintext broadcast is accepted so cross-config and discovering peers
+    /// can still be heard, and the beacon's own signature is no help in
+    /// telling who they are: it is made with the key the beacon carries, so
+    /// anyone can produce a valid one. Only the seal says "this came from
+    /// inside the realm", and a caller about to grant a privilege on the
+    /// strength of a beacon needs to know which it has (report12 V-M2).
+    pub fn decode_datagram_with_origin(&self, wire: &[u8]) -> Option<(MeshFrame, FrameOrigin)> {
         // With a realm obfs key, legitimate peers seal every frame (C-03
         // seals beacons too). On open failure we fall back to a plaintext
         // decode ONLY for BROADCAST frames — cleartext beacons may still
@@ -529,13 +556,19 @@ impl UdpRealm {
         // frame is a DATA injection attempt and is REJECTED, so realm_psk
         // gates admission of DATA, not just its confidentiality. Without a
         // key, decode directly (unchanged behaviour).
-        let frame = match &self.obfs {
+        let (frame, origin) = match &self.obfs {
             Some(key) => match veil_udp_obfs::open_datagram(key, wire) {
-                Ok((_counter, payload)) => MeshFrame::decode(&payload).ok(),
-                Err(_) => MeshFrame::decode(wire).ok().filter(MeshFrame::is_broadcast),
+                Ok((_counter, payload)) => (MeshFrame::decode(&payload).ok(), FrameOrigin::Sealed),
+                Err(_) => (
+                    MeshFrame::decode(wire).ok().filter(MeshFrame::is_broadcast),
+                    FrameOrigin::Plaintext,
+                ),
             },
-            None => MeshFrame::decode(wire).ok(),
-        }?;
+            // No realm key: there is no inside to be outside of, and every
+            // frame is as trusted as the deployment made it.
+            None => (MeshFrame::decode(wire).ok(), FrameOrigin::Sealed),
+        };
+        let frame = frame?;
         // End-to-end replay guard: a captured sealed datagram re-opens
         // and re-decodes cleanly, so AEAD alone does not stop replays.
         // The originator stamps a per-frame nonce that survives every
@@ -551,7 +584,7 @@ impl UdpRealm {
         {
             return None;
         }
-        Some(frame)
+        Some((frame, origin))
     }
 }
 

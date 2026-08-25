@@ -405,11 +405,15 @@ impl NodeRuntime {
                     got = beacon_socket.recv_from(&mut buf) => {
                         match got {
                             Ok((len, addr)) => {
-                                if let Some(frame) =
-                                    realm_recv.decode_datagram(&buf[..len])
+                                if let Some((frame, origin)) =
+                                    realm_recv.decode_datagram_with_origin(&buf[..len])
                                     && frame.is_broadcast()
                                 {
-                                    receiver.handle_beacon(&frame, addr);
+                                    // The origin travels with the frame: a
+                                    // beacon heard in the clear inside a keyed
+                                    // realm is from outside it, and grants
+                                    // nothing (report12 V-M2).
+                                    receiver.handle_beacon_from(&frame, addr, origin);
                                 }
                             }
                             Err(_) => break,
