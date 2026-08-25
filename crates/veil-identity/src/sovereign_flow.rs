@@ -155,6 +155,25 @@ pub struct CreateIdentityOptions {
 // recovery secrets — a derived Debug would dump the master seed / BIP-39 phrase
 // into any `{:?}` (tracing span, error context, test panic). Redact them.
 // Keep this in sync if secret-bearing fields are added (diff-audit defect M7).
+/// Whether an identity with this master algorithm can add or remove devices.
+///
+/// It is not a property of the device flows themselves — `delegate_device`,
+/// `adopt_identity_document` and `revoke_identity_device` all refuse anything
+/// but Ed25519 with `UnsupportedMasterAlgo`, because a hybrid master cannot
+/// match a node_id hashed over its 929-byte public key and the lifecycle has
+/// no algorithm-generic signer behind it yet.
+///
+/// The refusals are fail-fast and write nothing, so nothing is CORRUPTED by
+/// this. What was missing is that an operator learned it at the moment they
+/// tried to link a second phone, or to revoke a stolen one — long after the
+/// identity was created and the choice was expensive to unmake
+/// (report14 V14-M12). Creation reports it now, in
+/// [`CreateIdentityOutput::supports_device_lifecycle`].
+#[must_use]
+pub fn master_algo_supports_device_lifecycle(master_algo: u8) -> bool {
+    master_algo == ALGO_ED25519
+}
+
 pub struct CreateIdentityOutput {
     /// Stable 32-byte identity address (BLAKE3 over master_pk).
     pub node_id: [u8; 32],
@@ -179,6 +198,16 @@ pub struct CreateIdentityOutput {
     /// Absolute path to the encrypted master file, if one was
     /// written.
     pub encrypted_master_path: Option<PathBuf>,
+    /// Whether this identity can add or remove DEVICES.
+    ///
+    /// `false` for a hybrid or standalone-Falcon master: the device lifecycle
+    /// refuses those, so such an identity is single-device for as long as that
+    /// is true — a phone linked to it cannot be added, and one that is stolen
+    /// cannot be revoked. See
+    /// [`master_algo_supports_device_lifecycle`] (report14 V14-M12).
+    ///
+    /// Reported HERE because this is the only moment the choice is cheap.
+    pub supports_device_lifecycle: bool,
     /// The raw identity signing key seed for this instance. The
     /// caller is responsible for persisting this however they
     /// choose (plain TOML, encrypted file, hardware token…).
@@ -590,6 +619,7 @@ pub fn create_identity(
         instance,
         identity_sk_path,
         encrypted_master_path,
+        supports_device_lifecycle: master_algo_supports_device_lifecycle(master_algo_byte),
         identity_sk_seed,
         master_falcon_path,
     })
@@ -4194,6 +4224,60 @@ mod tests {
     // • verifies under verify_identity_document (canonical hybrid
     // verify in verify::verify_proof_sig)
     // • persists `master_falcon.bin` (mode 0o600) inside veil_dir.
+    /// What each master algorithm can actually DO, reported where the choice
+    /// is still cheap.
+    ///
+    /// The device lifecycle refuses anything but Ed25519 — a hybrid master
+    /// cannot match a node_id hashed over its 929-byte public key, and there
+    /// is no algorithm-generic signer behind delegate/adopt/revoke yet. The
+    /// refusals are fail-fast and write nothing, so nothing is corrupted; what
+    /// was missing is that an operator learned it at the moment they tried to
+    /// link a second phone, or to revoke a stolen one, long after the identity
+    /// was created (report14 V14-M12). The refusals themselves are pinned by
+    /// the three tests above this one.
+    #[test]
+    fn creation_reports_whether_this_identity_can_ever_add_a_device() {
+        use veil_proto::identity_document::{ALGO_ED25519, ALGO_ED25519_FALCON512_HYBRID};
+        use veil_types::SignatureAlgorithm;
+
+        assert!(master_algo_supports_device_lifecycle(ALGO_ED25519));
+        assert!(!master_algo_supports_device_lifecycle(
+            ALGO_ED25519_FALCON512_HYBRID
+        ));
+
+        let issued = 1_700_000_000u64;
+        let make = |algo: SignatureAlgorithm| {
+            let dir = tempdir();
+            create_identity(CreateIdentityOptions {
+                veil_dir: dir,
+                save_encrypted_with_password: None,
+                argon2_params_override: None,
+                extra_entropy: None,
+                instance_label: "capability".into(),
+                pow_difficulty: TEST_POW_DIFFICULTY,
+                issued_at_unix: issued,
+                valid_until_unix: issued + 7 * 86_400,
+                algo,
+            })
+            .expect("create")
+        };
+
+        let ed = make(SignatureAlgorithm::Ed25519);
+        assert!(
+            ed.supports_device_lifecycle,
+            "an Ed25519 identity can add and revoke devices"
+        );
+        assert_eq!(ed.document.master_algo, ALGO_ED25519);
+
+        let hybrid = make(SignatureAlgorithm::Ed25519Falcon512Hybrid);
+        assert!(
+            !hybrid.supports_device_lifecycle,
+            "a hybrid identity is single-device for as long as the lifecycle \
+             refuses it, and the operator has to be told at creation"
+        );
+        assert_eq!(hybrid.document.master_algo, ALGO_ED25519_FALCON512_HYBRID);
+    }
+
     #[test]
     fn create_identity_hybrid_produces_verifiable_document() {
         use veil_proto::identity_document::ALGO_ED25519_FALCON512_HYBRID;
