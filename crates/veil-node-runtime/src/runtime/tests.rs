@@ -3062,6 +3062,19 @@ async fn nat_signaling_skips_tokenless_reply_and_uses_next_coordinator() {
 /// starting a second punch. Uses a silent local reflector so the shared
 /// attempt stays inside its discovery window while both callers race, and
 /// asserts the whole thing finishes well inside the 5 s budget.
+// Loopback reflector, so unix only. On Windows the punch socket is pinned to an
+// outbound interface with `IP_UNICAST_IF`
+// (`veil_util::outbound_interface::configure_outbound_socket`, a no-op
+// everywhere else), and a socket pinned to a physical interface cannot reach
+// 127.0.0.1. Every send then fails and discovery reports "no reflector was
+// sendable" — which is CORRECT for what it was asked to do.
+//
+// Established by marking each of the four `NoReflector` returns with a distinct
+// outcome and running on the machine: the discovery call was the one that
+// fired, after the config, its reflector list and the discovery primitive had
+// each been cleared by their own assertion. The single-flight property under
+// test is platform-independent; only the way this arranges a failure is not.
+#[cfg(unix)]
 #[tokio::test(flavor = "current_thread")]
 async fn attempt_hole_punch_is_single_flight_per_peer() {
     // A bound-but-silent UDP socket: discovery sends here and never gets a
@@ -3118,6 +3131,20 @@ async fn attempt_hole_punch_is_single_flight_per_peer() {
         services.attempt_p2p_hole_punch(peer),
     );
     let elapsed = started.elapsed();
+
+    // And the same premise AFTER the attempt. The runtime persists config in
+    // some flows, so "valid when the test looked" and "valid when the punch
+    // re-read it" are different claims; if these two disagree the outcome
+    // below is about a config that was rewritten under us.
+    let after = veil_cfg::load_config(&path).expect("the config must still reload");
+    assert!(
+        after.nat.enabled,
+        "nat.enabled was cleared during the attempt"
+    );
+    assert!(
+        !after.nat.udp_reflectors.is_empty(),
+        "nat.udp_reflectors was cleared during the attempt"
+    );
 
     assert_eq!(a, veil_ipc::HolePunchOutcome::MappingUnusable);
     assert_eq!(
