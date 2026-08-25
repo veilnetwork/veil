@@ -572,7 +572,10 @@ fn write_file_atomically_secure(path: &Path, bytes: &[u8]) -> io::Result<()> {
     //     either the old name (file gone), the new name (good), or a
     //     half-allocated inode. Most FS configs journal dirent updates
     //     by default, but explicit parent fsync is the portable guarantee.
-    veil_util::atomic_write(path, bytes)
+    // …and, since this file is the encrypted master secret, an explicit
+    // owner-only DACL on Windows rather than whatever the parent directory
+    // admits (report14 V14-M8). On POSIX it is the same write.
+    veil_util::atomic_write_owner_only(path, bytes)
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────────
