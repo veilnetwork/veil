@@ -33,11 +33,38 @@ pub struct PexDispatcher {
     local_difficulty: u8,
     max_response_peers: u8,
     pending_challenges: Mutex<HashMap<u64, PendingChallenge>>,
+    /// Walks this node FORWARDED, and the two peers each sits between.
+    ///
+    /// A walk travels away from its origin, but everything that answers it —
+    /// the challenge, the solved response, the result — has to travel back
+    /// along the same path. Nothing recorded that path, so the terminal node
+    /// addressed the ORIGIN directly and a node two hops out has no session
+    /// with it: the frame was handed to `send_to`, refused, and dropped in
+    /// silence. Multi-hop discovery therefore never completed — only walks
+    /// that happened to terminate at a direct neighbour of the origin did
+    /// (report14 V14-M11).
+    forwarded_walks: Mutex<HashMap<u64, ForwardedWalk>>,
     walk_rate: Mutex<HashMap<[u8; 32], Instant>>,
     /// Channel to forward Challenge/Result events to the PEX initiator task.
     event_tx: tokio::sync::mpsc::Sender<PexEvent>,
     logger: Arc<dyn PexLogger>,
 }
+
+/// One walk this node relayed: which way is back, and which way is on.
+struct ForwardedWalk {
+    /// The hop the walk arrived from — the way back toward the origin.
+    prev: [u8; 32],
+    /// The hop it was forwarded to — the way on toward the terminal node.
+    next: [u8; 32],
+    at: Instant,
+}
+
+/// Walks this node will remember the path of at once.
+///
+/// Same shape of bound as `MAX_ACTIVE_CHALLENGES`, and for the same reason:
+/// every entry is created by somebody else's traffic. A walk that is not
+/// answered inside the challenge TTL is a walk nobody is waiting on.
+const MAX_FORWARDED_WALKS: usize = 256;
 
 /// The peers we may hand to a stranger who asks.
 ///
@@ -91,6 +118,7 @@ impl PexDispatcher {
             local_difficulty,
             max_response_peers: config.max_response_peers,
             pending_challenges: Mutex::new(HashMap::new()),
+            forwarded_walks: Mutex::new(HashMap::new()),
             walk_rate: Mutex::new(HashMap::new()),
             event_tx,
             logger,
@@ -112,9 +140,11 @@ impl PexDispatcher {
         };
         match msg {
             PexMsg::Walk => self.handle_walk(body, peer_id, broadcaster),
-            PexMsg::Challenge => self.handle_challenge_incoming(body, peer_id),
-            PexMsg::Response => self.handle_response(body, peer_id, advertise_uris, known_peers),
-            PexMsg::Result => self.handle_result(body, peer_id),
+            PexMsg::Challenge => self.handle_challenge_incoming(body, peer_id, broadcaster),
+            PexMsg::Response => {
+                self.handle_response(body, peer_id, broadcaster, advertise_uris, known_peers)
+            }
+            PexMsg::Result => self.handle_result(body, peer_id, broadcaster),
         }
     }
 
@@ -186,17 +216,69 @@ impl PexDispatcher {
             let frame = encode_pex_frame(PexMsg::Walk, &forwarded.encode());
             let active = b.active_node_ids();
             let exclude = [peer_id, walk.origin_node_id];
-            if let Some(next_hop) = find_closest_peer(&active, &walk.target_node_id, &exclude) {
-                b.send_to(&next_hop, TrafficClass::Background as u8, frame);
+            if let Some(next_hop) = find_closest_peer(&active, &walk.target_node_id, &exclude)
+                && b.send_to(&next_hop, TrafficClass::Background as u8, frame)
+            {
+                // The path, so the answers can come back along it. Recorded
+                // only when the walk actually LEFT: a path to a hop that
+                // refused the frame is a path nothing will ever travel.
+                self.remember_path(walk.walk_id, peer_id, next_hop);
             }
         }
         PexDispatchOutcome::NoResponse
     }
 
+    /// Remember which way is back and which way is on for a walk we relayed.
+    ///
+    /// Bounded and aged like the pending-challenge table: every entry is
+    /// created by somebody else's traffic, and a walk unanswered inside the
+    /// challenge TTL is a walk nobody is waiting on.
+    fn remember_path(&self, walk_id: u64, prev: [u8; 32], next: [u8; 32]) {
+        let mut paths = self
+            .forwarded_walks
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let now = Instant::now();
+        paths.retain(|_, p| now.duration_since(p.at).as_secs() < CHALLENGE_TTL_SECS * 2);
+        if paths.len() >= MAX_FORWARDED_WALKS {
+            return;
+        }
+        paths.insert(
+            walk_id,
+            ForwardedWalk {
+                prev,
+                next,
+                at: now,
+            },
+        );
+    }
+
+    /// Where a frame for `walk_id` goes next, given who it came from.
+    ///
+    /// `None` means this node is not a relay for that walk — it is the origin,
+    /// or the terminal node, or it never saw the walk at all — and the frame is
+    /// ours to handle. The direction check is what keeps a frame from being
+    /// bounced back where it came from.
+    fn relay_hop(&self, walk_id: u64, from: [u8; 32], toward_origin: bool) -> Option<[u8; 32]> {
+        let paths = self
+            .forwarded_walks
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let path = paths.get(&walk_id)?;
+        if Instant::now().duration_since(path.at).as_secs() >= CHALLENGE_TTL_SECS * 2 {
+            return None;
+        }
+        if toward_origin {
+            (from == path.next).then_some(path.prev)
+        } else {
+            (from == path.prev).then_some(path.next)
+        }
+    }
+
     fn emit_challenge(
         &self,
         walk: &PexWalk,
-        _peer_id: [u8; 32],
+        peer_id: [u8; 32],
         broadcaster: Option<&dyn FrameBroadcaster>,
         origin_authenticated: bool,
     ) -> PexDispatchOutcome {
@@ -250,10 +332,33 @@ impl PexDispatcher {
             );
         }
 
-        // Send challenge back to origin via the session to the forwarding peer.
+        // Toward the origin: directly when we have a session with it, and
+        // otherwise BACK ALONG THE PATH the walk came down.
+        //
+        // Only the direct attempt existed, under a comment claiming it went
+        // "via the session to the forwarding peer" — it did not, it named the
+        // origin. A terminal node two hops out has no session with the origin,
+        // so `send_to` refused and the challenge was dropped in silence
+        // (report14 V14-M11). The direct attempt is kept and tried FIRST
+        // because it is one hop instead of several, and because a peer running
+        // an older build relays nothing.
         if let Some(b) = broadcaster {
             let frame = encode_pex_frame(PexMsg::Challenge, &challenge.encode());
-            b.send_to(&walk.origin_node_id, TrafficClass::Interactive as u8, frame);
+            let direct = b.send_to(
+                &walk.origin_node_id,
+                TrafficClass::Interactive as u8,
+                frame.clone(),
+            );
+            if !direct && !b.send_to(&peer_id, TrafficClass::Interactive as u8, frame) {
+                self.logger.warn(
+                    "pex.challenge.undeliverable",
+                    &format!(
+                        "walk_id={} — no session with the origin and none back \
+                         along the path; the walk ends here",
+                        walk.walk_id
+                    ),
+                );
+            }
         }
 
         self.logger.info(
@@ -272,11 +377,25 @@ impl PexDispatcher {
         PexDispatchOutcome::NoResponse
     }
 
-    fn handle_challenge_incoming(&self, body: &[u8], peer_id: [u8; 32]) -> PexDispatchOutcome {
+    fn handle_challenge_incoming(
+        &self,
+        body: &[u8],
+        peer_id: [u8; 32],
+        broadcaster: Option<&dyn FrameBroadcaster>,
+    ) -> PexDispatchOutcome {
         let challenge = match PexChallenge::decode(body) {
             Ok(c) => c,
             Err(_) => return PexDispatchOutcome::NoResponse,
         };
+        // A walk WE relayed: this challenge is not ours to answer, it is ours
+        // to pass back toward the origin (report14 V14-M11).
+        if let Some(hop) = self.relay_hop(challenge.walk_id, peer_id, true)
+            && let Some(b) = broadcaster
+        {
+            let frame = encode_pex_frame(PexMsg::Challenge, &challenge.encode());
+            b.send_to(&hop, TrafficClass::Interactive as u8, frame);
+            return PexDispatchOutcome::NoResponse;
+        }
         // Forward to the PEX initiator task for PoW solving.
         let _ = self.event_tx.try_send(PexEvent::Challenge {
             challenge,
@@ -288,7 +407,8 @@ impl PexDispatcher {
     fn handle_response(
         &self,
         body: &[u8],
-        _peer_id: [u8; 32],
+        peer_id: [u8; 32],
+        broadcaster: Option<&dyn FrameBroadcaster>,
         advertise_uris: &[String],
         known_peers: &VouchedPeers,
     ) -> PexDispatchOutcome {
@@ -296,6 +416,15 @@ impl PexDispatcher {
             Ok(r) => r,
             Err(e) => return PexDispatchOutcome::Violation(format!("bad PexResponse: {e}")),
         };
+        // Travelling the other way: a solved response for a walk WE relayed
+        // belongs to the node that challenged, further along.
+        if let Some(hop) = self.relay_hop(response.walk_id, peer_id, false)
+            && let Some(b) = broadcaster
+        {
+            let frame = encode_pex_frame(PexMsg::Response, &response.encode());
+            b.send_to(&hop, TrafficClass::Interactive as u8, frame);
+            return PexDispatchOutcome::NoResponse;
+        }
 
         // Look up pending challenge.
         let pending = {
@@ -369,11 +498,26 @@ impl PexDispatcher {
         PexDispatchOutcome::Response(encode_pex_frame(PexMsg::Result, &result.encode()))
     }
 
-    fn handle_result(&self, body: &[u8], peer_id: [u8; 32]) -> PexDispatchOutcome {
+    fn handle_result(
+        &self,
+        body: &[u8],
+        peer_id: [u8; 32],
+        broadcaster: Option<&dyn FrameBroadcaster>,
+    ) -> PexDispatchOutcome {
         let result = match PexResult::decode(body) {
             Ok(r) => r,
             Err(_) => return PexDispatchOutcome::NoResponse,
         };
+        // The last leg of the same round trip: a result for a walk WE relayed
+        // is the origin's, not ours, and absorbing it here is how a relay
+        // quietly ate the answer to somebody else's walk (report14 V14-M11).
+        if let Some(hop) = self.relay_hop(result.walk_id, peer_id, true)
+            && let Some(b) = broadcaster
+        {
+            let frame = encode_pex_frame(PexMsg::Result, &result.encode());
+            b.send_to(&hop, TrafficClass::Interactive as u8, frame);
+            return PexDispatchOutcome::NoResponse;
+        }
         // Forward to the PEX initiator task for peer connection.
         let _ = self.event_tx.try_send(PexEvent::Result {
             result,
@@ -622,6 +766,192 @@ mod walk_origin_auth_tests {
         assert!(
             vouched.as_slice().is_empty(),
             "a node that has reached nobody cannot vouch for anybody"
+        );
+    }
+}
+
+#[cfg(test)]
+mod reverse_path_tests {
+    use super::*;
+    use std::sync::Mutex as StdMutex;
+
+    const ORIGIN: [u8; 32] = [0x01; 32];
+    const RELAY: [u8; 32] = [0x02; 32];
+    const TERMINAL: [u8; 32] = [0x03; 32];
+
+    #[derive(Default)]
+    struct Wire {
+        sent: StdMutex<Vec<([u8; 32], u16)>>,
+        /// Peers this node has a session with. A `send_to` to anybody else
+        /// fails, which is the whole shape of the finding: the terminal node
+        /// has no session with the origin.
+        reachable: Vec<[u8; 32]>,
+    }
+
+    impl Wire {
+        fn with(reachable: Vec<[u8; 32]>) -> Self {
+            Self {
+                sent: StdMutex::new(Vec::new()),
+                reachable,
+            }
+        }
+        fn to(&self, peer: [u8; 32]) -> Vec<u16> {
+            self.sent
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .iter()
+                .filter(|(p, _)| *p == peer)
+                .map(|(_, m)| *m)
+                .collect()
+        }
+    }
+
+    impl FrameBroadcaster for Wire {
+        fn send_to(&self, peer_id: &[u8; 32], _priority: u8, bytes: Vec<u8>) -> bool {
+            if !self.reachable.contains(peer_id) {
+                return false;
+            }
+            // The frame's msg_type through the real decoder: reading it out of
+            // the header by hand gave 19505 — two bytes of the magic — and a
+            // test that compares the wrong number is a test about nothing.
+            let msg = veil_proto::codec::decode_header(&bytes)
+                .map(|h| h.msg_type)
+                .unwrap_or(u16::MAX);
+            self.sent
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .push((*peer_id, msg));
+            true
+        }
+        fn send_to_all_with_priority(&self, _priority: u8, _bytes: Arc<[u8]>) {}
+        fn active_node_ids(&self) -> Vec<[u8; 32]> {
+            self.reachable.clone()
+        }
+    }
+
+    struct Quiet;
+    impl PexLogger for Quiet {
+        fn info(&self, _event: &str, _message: &str) {}
+        fn warn(&self, _event: &str, _message: &str) {}
+    }
+
+    fn dispatcher(local: [u8; 32]) -> (PexDispatcher, tokio::sync::mpsc::Receiver<PexEvent>) {
+        let (tx, rx) = tokio::sync::mpsc::channel(16);
+        let cfg = veil_types::PexConfig::default();
+        (
+            PexDispatcher::new(local, vec![0u8; 32], 0, 0, &cfg, tx, Arc::new(Quiet)),
+            rx,
+        )
+    }
+
+    fn walk(walk_id: u64, ttl: u8, target: [u8; 32]) -> PexWalk {
+        PexWalk {
+            walk_id,
+            target_node_id: target,
+            origin_node_id: ORIGIN,
+            origin_pubkey: vec![0u8; 32],
+            origin_nonce: 0,
+            origin_sig: [0u8; 64],
+            ttl,
+            origin_transport: String::new(),
+        }
+    }
+
+    /// Everything a walk provokes has to come back along the path the walk
+    /// took. Nothing recorded that path: the terminal node addressed the
+    /// ORIGIN, which a node two hops out has no session with, so the frame was
+    /// refused and dropped in silence — and multi-hop discovery never
+    /// completed (report14 V14-M11).
+    #[test]
+    fn a_relayed_walk_carries_its_answers_back_along_the_path() {
+        let (relay, _rx) = dispatcher(RELAY);
+        // The relay talks to the origin and to the terminal node; the two ends
+        // do not talk to each other.
+        let wire = Wire::with(vec![ORIGIN, TERMINAL]);
+        let known = VouchedPeers::from_sessions(&[], &Default::default());
+
+        // The target is the origin's own key-space neighbourhood, so the relay
+        // is NOT closer to it than the sender and the walk is forwarded rather
+        // than terminated here. `should_terminate` is that comparison, and a
+        // target picked without checking it makes this test about termination
+        // instead.
+        let w = walk(77, 6, ORIGIN);
+        relay.dispatch(
+            PexMsg::Walk as u16,
+            &w.encode(),
+            ORIGIN,
+            Some(&wire),
+            &[],
+            &known,
+        );
+        assert_eq!(
+            wire.to(TERMINAL),
+            vec![PexMsg::Walk as u16],
+            "the fixture did not forward the walk, so there is no path to test"
+        );
+
+        // The terminal node challenges. It reaches the relay, not the origin.
+        let challenge = PexChallenge {
+            walk_id: 77,
+            challenge_nonce: [9u8; 32],
+            timestamp: 0,
+            difficulty: 1,
+        };
+        relay.dispatch(
+            PexMsg::Challenge as u16,
+            &challenge.encode(),
+            TERMINAL,
+            Some(&wire),
+            &[],
+            &known,
+        );
+        assert!(
+            wire.to(ORIGIN).contains(&(PexMsg::Challenge as u16)),
+            "the challenge stopped at the relay; the origin is still waiting"
+        );
+
+        // A frame arriving from the WRONG side is not bounced back.
+        let before = wire.to(TERMINAL).len();
+        relay.dispatch(
+            PexMsg::Challenge as u16,
+            &challenge.encode(),
+            ORIGIN,
+            Some(&wire),
+            &[],
+            &known,
+        );
+        assert_eq!(
+            wire.to(TERMINAL).len(),
+            before,
+            "a challenge from the origin's side is not the relay's to pass on"
+        );
+    }
+
+    /// The terminal node's own half: with no session to the origin, the
+    /// challenge goes back to the peer that handed it the walk.
+    #[test]
+    fn a_terminal_node_challenges_back_along_the_walk() {
+        let (terminal, _rx) = dispatcher(TERMINAL);
+        // Only the relay is reachable — exactly the case that used to drop the
+        // challenge on the floor.
+        let wire = Wire::with(vec![RELAY]);
+        let known = VouchedPeers::from_sessions(&[], &Default::default());
+
+        // ttl 1 terminates here.
+        let w = walk(88, 1, TERMINAL);
+        terminal.dispatch(
+            PexMsg::Walk as u16,
+            &w.encode(),
+            RELAY,
+            Some(&wire),
+            &[],
+            &known,
+        );
+
+        assert!(
+            wire.to(RELAY).contains(&(PexMsg::Challenge as u16)),
+            "the challenge was addressed to a node this one cannot reach, so \
+             it went nowhere"
         );
     }
 }
