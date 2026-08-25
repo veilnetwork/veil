@@ -391,7 +391,20 @@ async fn discover_udp_mapping_any_inner(
     let mut degenerate_responders = HashSet::new();
     loop {
         let received = match time::timeout_at(deadline, socket.recv_from(&mut buf)).await {
-            Ok(result) => result?,
+            // A receive that FAILS is not a reflector that could not be
+            // reached: the sends above already succeeded, or this loop would
+            // never have been entered. Windows makes the difference visible —
+            // a datagram to a port nothing answers comes back as
+            // `WSAECONNRESET` on the NEXT receive, per-datagram and
+            // non-fatal, where POSIX simply waits. Propagating it made the
+            // caller report `NoReflector` for a reflector that was configured,
+            // parsed and sent to, sending an operator after missing config
+            // instead of an unreachable host.
+            //
+            // Keep waiting instead: another selected reflector may still
+            // answer, and the deadline above is what ends this either way.
+            Ok(Err(_)) => continue,
+            Ok(Ok(result)) => result,
             Err(_) => return Ok(None),
         };
         let (len, source) = received;
@@ -857,5 +870,43 @@ mod tests {
             seen.foreign_tokens > 0,
             "a wrong-token punch must be counted"
         );
+    }
+}
+
+#[cfg(test)]
+mod silent_reflector_contract {
+    use super::*;
+
+    /// A reflector that is reachable but never answers is `Ok(None)`, not an
+    /// error.
+    ///
+    /// The caller in `veil-node-runtime` maps ANY error from this function to
+    /// "no reflector" — its comment says an error here means none was even
+    /// sendable. That is the contract this pins, and it is platform-visible:
+    /// Windows reports a datagram nobody answers through the NEXT receive
+    /// (`WSAECONNRESET`) where POSIX simply waits.
+    #[tokio::test]
+    async fn a_silent_reflector_is_no_mapping_not_an_error() {
+        let silent = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let silent_addr = silent.local_addr().unwrap();
+        let socket = tokio::net::UdpSocket::bind("0.0.0.0:0").await.unwrap();
+
+        let outcome = discover_udp_mapping_any_for_punch(
+            &socket,
+            &[silent_addr],
+            [0x5au8; 16],
+            Duration::from_millis(300),
+        )
+        .await;
+
+        match outcome {
+            Ok(None) => {}
+            Ok(Some(mapping)) => panic!("a silent reflector answered: {mapping:?}"),
+            Err(error) => panic!(
+                "a reachable but silent reflector must not read as unsendable: \
+                 {error:?} (kind={:?})",
+                error.kind()
+            ),
+        }
     }
 }

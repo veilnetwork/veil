@@ -3093,6 +3093,21 @@ async fn attempt_hole_punch_is_single_flight_per_peer() {
         !reloaded.nat.udp_reflectors.is_empty(),
         "nat.udp_reflectors did not survive the round trip"
     );
+    // And they must PARSE. `available_udp_reflectors` drops anything that does
+    // not with `.parse().ok()`, silently, so a surviving-but-unparsable string
+    // reaches the caller as the same `NoReflector` this test is distinguishing
+    // from.
+    let parsed: Vec<std::net::SocketAddr> = reloaded
+        .nat
+        .udp_reflectors
+        .iter()
+        .filter_map(|value| value.parse::<std::net::SocketAddr>().ok())
+        .collect();
+    assert!(
+        !parsed.is_empty(),
+        "configured reflectors survived but none parses: {:?}",
+        reloaded.nat.udp_reflectors
+    );
 
     let started = std::time::Instant::now();
     // Poll both on ONE task: the first poll of `a` inserts the single-flight
