@@ -1441,6 +1441,7 @@ pub fn verify_remote_peer_identity_reports_mismatch_readably() {
         remote_dht_service: true,
         remote_caps_stated: true,
         supports_realtime_datagrams: false,
+        supports_realtime_rekey: false,
         udp_reflector_port: None,
         shared_udp_reflectors: Vec::new(),
     };
@@ -1483,6 +1484,7 @@ pub fn verify_remote_peer_identity_reports_nonce_mismatch_readably() {
         remote_dht_service: true,
         remote_caps_stated: true,
         supports_realtime_datagrams: false,
+        supports_realtime_rekey: false,
         udp_reflector_port: None,
         shared_udp_reflectors: Vec::new(),
     };

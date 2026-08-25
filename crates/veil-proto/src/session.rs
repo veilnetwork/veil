@@ -357,6 +357,17 @@ pub mod cap_flags {
     /// Legacy peers leave the bit clear and continue to carry `AppRtData` on
     /// the reliable ordered session stream.
     pub const SUPPORTS_REALTIME_DATAGRAMS: u8 = 1 << 4;
+    /// Peer re-derives the realtime DATAGRAM lane's key when the session
+    /// rekeys, instead of keeping the one derived from the handshake for the
+    /// life of the session.
+    ///
+    /// Its own bit, and negotiated, precisely so this is not a flag day: two
+    /// peers that both set it rotate together at each rekey completion, and a
+    /// peer that does not keeps the static key it always had. Rotating
+    /// unilaterally would leave the other side unable to open anything past
+    /// the first rekey, which is why the capability exists rather than the
+    /// behaviour simply changing (report12 V-M12).
+    pub const SUPPORTS_REALTIME_REKEY: u8 = 1 << 6;
     /// Peer asks NOT to be used as a DHT service candidate: do not pick it
     /// as a store/replication target, do not route walks through it, and do
     /// not return it to walkers as a closer node. It remains fully REACHABLE
@@ -494,6 +505,17 @@ impl CapabilitiesPayload {
     /// support. Transport availability is checked separately by the runtime.
     pub fn realtime_datagrams_negotiated(&self, peer: &CapabilitiesPayload) -> bool {
         self.supports_realtime_datagrams() && peer.supports_realtime_datagrams()
+    }
+
+    /// Does this peer rotate the realtime lane's key at a session rekey?
+    pub fn supports_realtime_rekey(&self) -> bool {
+        self.flags & cap_flags::SUPPORTS_REALTIME_REKEY != 0
+    }
+
+    /// Rotating the lane needs BOTH sides: one that rotates alone leaves the
+    /// other unable to open anything past the first rekey.
+    pub fn realtime_rekey_negotiated(&self, peer: &CapabilitiesPayload) -> bool {
+        self.supports_realtime_rekey() && peer.supports_realtime_rekey()
     }
 }
 
@@ -2267,6 +2289,31 @@ mod tests {
         );
     }
 
+    /// report12 V-M12: rotating the realtime lane is negotiated, not assumed.
+    /// A peer that rotates alone leaves the other unable to open anything past
+    /// the first rekey, so the AND is the whole point — and a legacy peer,
+    /// whose flags byte has the bit clear, keeps the static key it always had.
+    #[test]
+    fn lane_rotation_needs_both_sides_and_legacy_peers_opt_out_by_silence() {
+        let mut modern = CapabilitiesPayload::from_node_role(veil_types::NodeRole::Core);
+        let mut legacy = CapabilitiesPayload::from_node_role(veil_types::NodeRole::Core);
+        modern.flags |= cap_flags::SUPPORTS_REALTIME_REKEY;
+
+        assert!(modern.supports_realtime_rekey());
+        assert!(
+            !legacy.supports_realtime_rekey(),
+            "a peer that never heard of the bit must read as not rotating"
+        );
+        assert!(
+            !modern.realtime_rekey_negotiated(&legacy),
+            "one side alone must not rotate"
+        );
+        assert!(!legacy.realtime_rekey_negotiated(&modern));
+
+        legacy.flags |= cap_flags::SUPPORTS_REALTIME_REKEY;
+        assert!(modern.realtime_rekey_negotiated(&legacy));
+    }
+
     /// It occupies its own bit and disturbs no other flag's meaning.
     #[test]
     fn the_no_service_bit_does_not_collide() {
@@ -2276,6 +2323,7 @@ mod tests {
             cap_flags::ANONYMITY_RELAY,
             cap_flags::SUPPORTS_HYBRID_KEX,
             cap_flags::SUPPORTS_REALTIME_DATAGRAMS,
+            cap_flags::SUPPORTS_REALTIME_REKEY,
         ] {
             assert_eq!(
                 other & cap_flags::NO_DHT_SERVICE,

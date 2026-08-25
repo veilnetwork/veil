@@ -72,6 +72,10 @@ pub struct RemoteHandshakeInfo {
     /// Peer explicitly advertised the authenticated realtime DATAGRAM lane.
     /// False on legacy and fast-resumed handshakes.
     pub supports_realtime_datagrams: bool,
+    /// Whether the peer rotates the realtime lane's key at a session rekey.
+    /// Both sides must, or the one that does leaves the other unable to open
+    /// anything past the first rekey (report12 V-M12).
+    pub supports_realtime_rekey: bool,
     /// Bounded UDP reflector port advertised by this authenticated peer.
     /// The runtime combines it with transport metadata only after all session
     /// admission gates pass.
@@ -791,6 +795,7 @@ pub async fn register_connection_session(
                         supports_realtime_datagrams: r
                             .remote_capabilities
                             .supports_realtime_datagrams(),
+                        supports_realtime_rekey: r.remote_capabilities.supports_realtime_rekey(),
                         udp_reflector_port,
                         shared_udp_reflectors,
                     },
@@ -1224,7 +1229,16 @@ pub async fn register_connection_session(
         // Never send media into a side channel an older peer does not read.
         // Fast-resumed handshakes currently synthesize zero capabilities, so
         // they also preserve the ordered-stream fallback conservatively.
-        quic_datagrams: quic_datagrams.filter(|_| remote_identity.supports_realtime_datagrams),
+        // The lane at all needs both sides to speak it; rotating its key needs
+        // both sides again, separately — a peer can understand the lane and
+        // still keep the handshake-derived key for the session's life
+        // (report12 V-M12).
+        quic_datagrams: quic_datagrams
+            .filter(|_| remote_identity.supports_realtime_datagrams)
+            .map(|handle| veil_session::runner::RealtimeLaneOffer {
+                handle,
+                peer_rotates: remote_identity.supports_realtime_rekey,
+            }),
         metrics: runtime.metrics.clone(),
         peer_id: remote_identity.node_id,
         peer_instance_id,
