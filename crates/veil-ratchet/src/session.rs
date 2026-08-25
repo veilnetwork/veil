@@ -67,6 +67,12 @@ impl RatchetSession {
         self.core.skipped_epochs()
     }
 
+    /// See [`RatchetCore::clear_skipped`]. Only for a conversation the caller
+    /// has never answered.
+    pub fn clear_skipped(&mut self) -> usize {
+        self.core.clear_skipped()
+    }
+
     /// See [`RatchetCore::prune_skipped_to_current_epoch`].
     pub fn prune_skipped_to_current_epoch(&mut self) -> usize {
         self.core.prune_skipped_to_current_epoch()

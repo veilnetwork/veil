@@ -300,6 +300,23 @@ const CONVERSATION_BLOB_V2: u8 = 2;
 /// before we have said a word back is already an unusual person.
 pub const MAX_UNPROVEN_PER_PEER: usize = 8;
 
+/// The most skipped message keys this store banks across ALL conversations.
+///
+/// `MAX_SKIP_TOTAL` bounds ONE conversation at 2 000, and `MAX_CONVERSATIONS`
+/// bounds the count at 1 024 — but 1 024 × 2 000 is two million banked keys,
+/// and a banked key is a 32-byte secret in a map node. That is hundreds of
+/// megabytes on a device where the whole app has tens, and every one of them
+/// is put there by somebody else's frames (report12 V-M10).
+///
+/// Deliberately NOT a smaller per-conversation cap, which is what the report
+/// asks for and what would break the case this store exists to serve: the
+/// mailbox hands over up to `MAX_FETCH_COUNT` entries at once and an offline
+/// backlog arrives in arbitrary order, so a single conversation legitimately
+/// needs its full allowance. This bounds the SUM instead, and 64 000 is
+/// thirty-two conversations at their full 2 000 — far past any honest
+/// simultaneous backlog, far short of what a flood wants.
+pub const MAX_SKIPPED_KEYS_TOTAL: usize = 64_000;
+
 /// The largest number of conversations one device holds at once.
 ///
 /// A ceiling is required because the *inbound* side of this store is driven by
@@ -533,6 +550,65 @@ impl Inner {
             self.commit_change(*key);
         }
         stale.len()
+    }
+
+    /// Bring the banked skipped keys back under [`MAX_SKIPPED_KEYS_TOTAL`].
+    ///
+    /// Swept from UNPROVEN conversations only, largest bank first, with the
+    /// same operation the import path already uses: keys from epochs the chain
+    /// has moved past. A conversation this device has spoken on keeps its bank
+    /// whole — the quota must not become a way to make somebody else's
+    /// messages unreadable, which is the same rule `make_room` follows.
+    ///
+    /// Returns how many keys went, and marks whatever it touched: what is held
+    /// is now smaller than what is on disk.
+    fn enforce_skipped_budget(&mut self) -> usize {
+        self.enforce_skipped_budget_to(MAX_SKIPPED_KEYS_TOTAL)
+    }
+
+    /// [`enforce_skipped_budget`](Self::enforce_skipped_budget) against an
+    /// explicit ceiling.
+    ///
+    /// The budget is a parameter rather than a constant read inside so a test
+    /// can drive the policy — which entries are swept and which are spared —
+    /// without banking sixty-four thousand keys to reach the real one.
+    fn enforce_skipped_budget_to(&mut self, budget: usize) -> usize {
+        let total: usize = self.entries.values().map(|e| e.session.skipped_len()).sum();
+        if total <= budget {
+            return 0;
+        }
+        let mut freed = 0;
+        loop {
+            let victim = self
+                .entries
+                .iter()
+                .filter(|(_, e)| e.droppable() && e.session.skipped_len() > 0)
+                .max_by_key(|(k, e)| (e.session.skipped_len(), **k))
+                .map(|(k, _)| *k);
+            let Some(key) = victim else { break };
+            let Some(entry) = self.entries.get_mut(&key) else {
+                break;
+            };
+            // The gentle sweep first: keys from epochs the chain has moved
+            // past cost nothing to lose. It is not enough on its own — a
+            // flood fills the CURRENT epoch, which that sweep keeps — so a
+            // bank still standing after it is cleared outright. Only for a
+            // conversation this device has never answered: for one it has,
+            // the same act would make a real correspondent unreadable.
+            let mut dropped = entry.session.prune_skipped_to_current_epoch();
+            if dropped == 0 {
+                dropped = entry.session.clear_skipped();
+            }
+            if dropped == 0 {
+                break;
+            }
+            freed += dropped;
+            self.commit_change(key);
+            if total - freed.min(total) <= budget {
+                break;
+            }
+        }
+        freed
     }
 
     /// Make room for one more conversation. `false` when there is none.
@@ -1357,6 +1433,14 @@ fn open_inner(
                     }
                     let authenticated = entry.authenticated;
                     g.commit_change(key);
+                    // A frame that opened may have banked keys for the ones it
+                    // arrived ahead of. Checked HERE, after the tag verified,
+                    // for the same reason `last_used_at` moves here: a frame
+                    // that failed must not be able to drive this either.
+                    // The count is returned rather than logged: this crate
+                    // has no logger, and a sweep is visible in the dirty marks
+                    // it leaves behind anyway.
+                    let _swept = g.enforce_skipped_budget();
                     return Ok(Opened {
                         plaintext,
                         ack_key: [0u8; ACK_KEY_LEN],
@@ -1800,6 +1884,64 @@ mod tests {
     /// and every eviction costs the host a blob delete and the scrub after it.
     ///
     /// A peer now churns its OWN quota instead of the store's.
+    /// report12 V-M10: `MAX_SKIP_TOTAL` bounds ONE conversation and
+    /// `MAX_CONVERSATIONS` bounds the count, but their product is two million
+    /// banked 32-byte secrets — hundreds of megabytes, all of it put there by
+    /// somebody else's frames.
+    ///
+    /// The sum is bounded now, and the sweep takes only from conversations
+    /// this device has never spoken on: a quota that could make a real
+    /// correspondent's messages unreadable would be a worse bug than the one
+    /// it fixes.
+    #[test]
+    fn the_sweep_takes_from_a_stranger_and_spares_one_we_answered() {
+        let (a, b) = (device(1), device(2));
+
+        // A real banked key: b sends two, a opens only the second, so the
+        // first's key is banked against its late arrival.
+        let (ek, pk) = (a.ek(), a.ratchet_pk());
+        let first = seal(&b.store, &b.me(), keys(&a, &ek, &pk), b"one", NOW)
+            .expect("seal")
+            .0;
+        let second = seal(&b.store, &b.me(), keys(&a, &ek, &pk), b"two", NOW)
+            .expect("seal")
+            .0;
+        let b_pk = b.ratchet_pk();
+        open(&a.store, &a.me(), &b.node_id, &second, Some(&b_pk), NOW).expect("open");
+        let key = a.store.keys().first().copied().expect("a conversation");
+        assert!(
+            a.store.lock().entries[&key].session.skipped_len() > 0,
+            "the fixture banked nothing, so the sweep below is not tested"
+        );
+
+        // Answered, so it is proven — and a budget of zero would sweep
+        // anything sweepable.
+        {
+            let mut g = a.store.lock();
+            g.entries.get_mut(&key).unwrap().authenticated = true;
+            assert_eq!(
+                g.enforce_skipped_budget_to(0),
+                0,
+                "a conversation this device has spoken on keeps its bank, \
+                 whatever the pressure"
+            );
+            assert!(g.entries[&key].session.skipped_len() > 0);
+
+            // The same conversation unproven is exactly what a flood produces.
+            g.entries.get_mut(&key).unwrap().authenticated = false;
+            let freed = g.enforce_skipped_budget_to(0);
+            assert!(
+                freed > 0,
+                "an unproven bank over budget must be swept: it is the class a \
+                 stranger can fill"
+            );
+        }
+
+        // And the ordinary case costs nothing: under budget, nothing moves.
+        assert_eq!(a.store.lock().enforce_skipped_budget(), 0);
+        drop(first);
+    }
+
     #[test]
     fn one_peer_cannot_churn_more_than_its_own_share() {
         // `a` receives; the flood comes from node 2; `other` is a genuinely
