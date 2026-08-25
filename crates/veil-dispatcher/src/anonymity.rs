@@ -940,6 +940,28 @@ impl FrameDispatcher {
                 next_hop,
                 inner,
             } => {
+                // Somebody else's circuit, carried on this node's hourly budget
+                // for other people's work (report12 V-M8). `RelayCircuit` was
+                // in the enum and its label and nowhere else, so relaying was
+                // the one service that cost the meter nothing at all — on a
+                // phone, where serving others is most of the bill.
+                //
+                // Refused at ADMISSION only. A circuit already carrying traffic
+                // is left alone: cutting one mid-conversation would take down
+                // somebody's live path over an accounting decision, and the
+                // per-link caps already bound how many can exist at once. What
+                // a spent budget stops is taking on MORE.
+                //
+                // The setup body is what can be measured here; the frames this
+                // circuit will forward are charged as they pass, below.
+                // Declined silently, like every other refusal on this path — a
+                // Violation would confirm relay-capability to a prober.
+                if !self.abuse.service_budget.try_serve(
+                    crate::service_budget::ServiceKind::RelayCircuit,
+                    body.len() as u64,
+                ) {
+                    return DispatchResult::NoResponse;
+                }
                 if let Err(e) = table.install(&install, prev_link, Some(next_hop), now) {
                     // OBSERVABILITY (log-only): a refused install was FULLY
                     // silent — the setup is dropped, the originator sees only a
@@ -1172,6 +1194,18 @@ impl FrameDispatcher {
                             ciphertext: buf,
                         };
                         if let Ok(b) = out.encode(state.cell_bytes) {
+                            // What relaying actually costs, charged as it is
+                            // spent (report12 V-M8). Recorded rather than
+                            // asked: this circuit was admitted at build time,
+                            // and cutting it here would take down a live path
+                            // over accounting. The balance goes into debt and
+                            // the next BUILD waits for it — which is the lever,
+                            // and the same shape the FindValue reconciliation
+                            // uses one module over.
+                            self.abuse.service_budget.note_served(
+                                crate::service_budget::ServiceKind::RelayCircuit,
+                                b.len() as u64,
+                            );
                             let sent = self.send_relay_chain_msg(
                                 &NodeId::from(nl),
                                 RelayChainMsg::CircuitData,
@@ -2323,6 +2357,123 @@ mod tests {
             }
             other => panic!("expected AnonymousFragment, got {other:?}"),
         }
+    }
+
+    /// report12 V-M8: `RelayCircuit` was in the enum and its label and nowhere
+    /// else, so carrying somebody else's circuit cost the service meter
+    /// nothing at all — on a phone, where serving others is most of the bill.
+    ///
+    /// Two properties together, because either alone would be the wrong fix: a
+    /// spent budget must refuse a NEW circuit, and must NOT cut one already
+    /// carrying traffic. Cutting a live circuit takes down somebody's path
+    /// over an accounting decision.
+    #[test]
+    fn a_spent_budget_refuses_a_new_relay_but_keeps_carrying_the_live_one() {
+        use crate::service_budget::ServiceKind;
+        use veil_anonymity::circuit_setup::{CircuitSetupHop, build_circuit_setup};
+        use veil_anonymity::circuit_table::CircuitTable;
+
+        // Leaf, not Core: a Core budget is UNMETERED, so the drain below would
+        // never end. The circuit capability is wired by hand either way.
+        let mut d = crate::make_test_dispatcher(veil_cfg::NodeRole::Leaf);
+        assert!(
+            !d.abuse.service_budget.is_unmetered(),
+            "an unmetered budget cannot be spent, so nothing below is tested"
+        );
+        let sk = StaticSecret::random_from_rng(OsRng);
+        let pk = PublicKey::from(&sk).to_bytes();
+        d.anonymity_x25519_sk = Some(std::sync::Arc::new(sk));
+        d.circuit_table = Some(std::sync::Arc::new(CircuitTable::new()));
+
+        // Two hops: this node forwards to the second, which is the relaying
+        // case — a terminus circuit ends HERE and is our own inbound traffic.
+        let relayed = |id_in: u32| {
+            build_circuit_setup(
+                &[
+                    CircuitSetupHop {
+                        node_id: [0u8; 32],
+                        pubkey: pk,
+                        circuit_id_in: id_in,
+                        circuit_id_out: id_in + 1000,
+                        circuit_key: [7u8; 32],
+                    },
+                    CircuitSetupHop {
+                        node_id: [0xAB; 32],
+                        pubkey: PublicKey::from(&StaticSecret::random_from_rng(OsRng)).to_bytes(),
+                        circuit_id_in: 9,
+                        circuit_id_out: 0,
+                        circuit_key: [8u8; 32],
+                    },
+                ],
+                veil_anonymity::circuit_data::CircuitCellBytes::legacy(),
+                b"",
+            )
+            .unwrap()
+        };
+        let build_frame = |env: &[u8]| {
+            let mut hdr = FrameHeader::new(
+                FrameFamily::RelayChain as u8,
+                RelayChainMsg::CircuitBuild as u16,
+            );
+            hdr.body_len = env.len() as u32;
+            hdr
+        };
+
+        // One circuit admitted while there is budget.
+        let first = relayed(42);
+        let prev = NodeId::from([0xEE; 32]);
+        d.dispatch_relay_chain(&build_frame(&first), &first, prev);
+        let table = d.circuit_table.as_ref().unwrap();
+        assert_eq!(table.len(), 1, "the fixture failed to install a relay");
+        let (served_before, _, _) = d.abuse.service_budget.totals();
+        assert!(
+            served_before > 0,
+            "admitting a relay must cost the meter something"
+        );
+
+        // Drain the hour the way real traffic would — coarsely first, then a
+        // byte at a time. A coarse drain alone stops as soon as the REMAINDER
+        // is smaller than the step, and what it leaves behind (~130 KB here)
+        // is more than enough to admit another circuit, so the test would
+        // pass against the defect.
+        let hourly = d.abuse.service_budget.bytes_per_hour();
+        while d
+            .abuse
+            .service_budget
+            .try_serve(ServiceKind::Lookup, hourly / 64)
+        {}
+        while d.abuse.service_budget.try_serve(ServiceKind::Lookup, 1) {}
+        assert!(
+            !d.abuse
+                .service_budget
+                .try_serve(ServiceKind::RelayCircuit, 1),
+            "the budget is not actually spent, so nothing below is tested"
+        );
+
+        // A NEW circuit is refused: nothing installed, and silently — a
+        // Violation would confirm relay-capability to a prober.
+        let second = relayed(77);
+        let result = d.dispatch_relay_chain(&build_frame(&second), &second, prev);
+        assert!(
+            matches!(result, DispatchResult::NoResponse),
+            "a refused relay must stay silent, got {result:?}"
+        );
+        assert_eq!(
+            d.circuit_table.as_ref().unwrap().len(),
+            1,
+            "the spent budget must refuse the second circuit"
+        );
+
+        // The one already installed is untouched. Its own teardown still
+        // works, which is the shape of "still ours to carry".
+        assert!(
+            d.circuit_table
+                .as_ref()
+                .unwrap()
+                .lookup_forward(&[0xEE; 32], 42)
+                .is_some(),
+            "the live circuit was cut by an accounting decision"
+        );
     }
 
     /// CircuitBuild at the terminus installs circuit state keyed by
