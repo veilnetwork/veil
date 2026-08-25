@@ -1196,11 +1196,12 @@ impl TieredStore {
             // insert_hot's re-add here — otherwise `total_bytes` drifts upward
             // on every cold→hot promotion and spuriously trips the byte-cap
             // eviction loop (audit U1).
-            self.cold.remove(key);
-            self.total_bytes = self.total_bytes.saturating_sub(value.len() as u64);
             let now = Instant::now();
+            // Byte-neutral ONLY when the cold copy really went away. If the
+            // delete failed the node now holds two copies, and both are
+            // counted — see `release_cold`.
             // Re-dated for ORDER, its own age kept for EXPIRY.
-            let first_seen = self.cold_first_seen.remove(key).unwrap_or(now);
+            let (_, first_seen) = self.release_cold(key, value.len() as u64, now);
             self.insert_hot(*key, value, now, first_seen);
             return self.hot.get(key).map(|(v, _, _)| v);
         }
@@ -1248,11 +1249,10 @@ impl TieredStore {
             return self.hot.get(key).map(|(v, _, first)| (v, *first));
         }
         if let Some(value) = self.cold.get(key) {
-            // Byte-neutral promotion — see `get` (audit U1).
-            self.cold.remove(key);
-            self.total_bytes = self.total_bytes.saturating_sub(value.len() as u64);
+            // Byte-neutral promotion — see `get` (audit U1), and only when
+            // the cold copy really went (report14 V14-M4).
             let now = Instant::now();
-            let first_seen = self.cold_first_seen.remove(key).unwrap_or(now);
+            let (_, first_seen) = self.release_cold(key, value.len() as u64, now);
             self.insert_hot(*key, value, now, first_seen);
             return self.hot.get(key).map(|(v, _, first)| (v, *first));
         }
@@ -1395,6 +1395,30 @@ impl TieredStore {
                 self.origin_bytes.remove(&origin);
             }
         }
+    }
+
+    /// Drop `key`'s cold copy and stop counting its bytes — but only if the
+    /// backend really deleted it.
+    ///
+    /// [`ColdBackend::remove`] reports nothing: the trait returns `()`, and a
+    /// RocksDB write error is logged and swallowed. Subtracting bytes for a
+    /// value that is still on disk drifts `total_bytes` DOWN, and the record
+    /// comes back at the next restart to be counted again — expiry and the
+    /// global cap both stop meaning what they say (report14 V14-M4).
+    /// `TieredStore::remove` already asked this question (audit report5); the
+    /// promotion and sweep paths did not.
+    ///
+    /// Returns whether the value is gone, and the `first_seen` to carry
+    /// forward. A failed delete KEEPS the stamp, so the next sweep tries
+    /// again instead of losing track of an entry it can no longer age.
+    fn release_cold(&mut self, key: &[u8; 32], bytes: u64, now: Instant) -> (bool, Instant) {
+        self.cold.remove(key);
+        if self.cold.contains(key) {
+            let first_seen = self.cold_first_seen.get(key).copied().unwrap_or(now);
+            return (false, first_seen);
+        }
+        self.total_bytes = self.total_bytes.saturating_sub(bytes);
+        (true, self.cold_first_seen.remove(key).unwrap_or(now))
     }
 
     /// Look up the byte size of a stored value, irrespective of tier.
@@ -1691,9 +1715,16 @@ impl TieredStore {
                 // Only the stale keys' sizes are read, never the whole tier —
                 // the materialization audit U2 warns about is a full scan.
                 let bytes = self.value_bytes(&key);
-                self.cold.remove(&key);
-                self.cold_first_seen.remove(&key);
-                removed_cold.push((key, bytes));
+                // Counted as freed only if it really went. A delete that
+                // failed leaves the record on disk AND its stamp in place, so
+                // the next sweep tries again rather than forgetting an entry
+                // it can no longer age (report14 V14-M4).
+                // Zero bytes on purpose: the subtraction for this tier happens
+                // once below, from `removed_cold`, and doing it here as well
+                // would take the value off the total twice.
+                if self.release_cold(&key, 0, now).0 {
+                    removed_cold.push((key, bytes));
+                }
             }
         }
         let mut freed_cold: u64 = 0;
@@ -2886,6 +2917,68 @@ mod v08_tests {
         fn retain(&mut self, _f: &dyn Fn(&[u8; 32], &[u8]) -> bool) -> Vec<([u8; 32], u64)> {
             Vec::new()
         }
+    }
+
+    /// A promotion whose cold delete failed leaves TWO copies, and both are
+    /// counted.
+    ///
+    /// The subtraction here exists to cancel `insert_hot`'s re-add, so the
+    /// promotion is byte-neutral — which is true only while the cold copy
+    /// actually goes away. When it does not, the node holds the value in hot
+    /// AND on disk while the counter believes it holds one: the disk copy is
+    /// free, and it comes back at the next restart to be counted again
+    /// (report14 V14-M4).
+    #[test]
+    fn a_promotion_whose_cold_delete_failed_counts_both_copies() {
+        let mut store = TieredStore::with_cold(1, Box::new(UndeletableCold::default()));
+        store.put([1u8; 32], vec![0u8; 100]);
+        store.put([2u8; 32], vec![0u8; 10]); // demotes [1] into cold
+        assert_eq!(store.total_bytes(), 110);
+
+        // Promote it back. The cold backend says yes and does nothing.
+        assert_eq!(store.get(&[1u8; 32]).map(|v| v.len()), Some(100));
+
+        assert_eq!(
+            store.total_bytes(),
+            210,
+            "the value is in hot and still on disk; counting one of them makes \
+             the other free"
+        );
+        assert!(
+            store.contains(&[1u8; 32]),
+            "the fixture stopped modelling a failed delete, so this test is \
+             about nothing"
+        );
+    }
+
+    /// The same for the age sweep: an entry it could not delete must keep its
+    /// stamp, or the next sweep has nothing left to age it by.
+    #[test]
+    fn an_expiry_sweep_that_could_not_delete_keeps_the_entry_accounted() {
+        let mut store = TieredStore::with_cold(1, Box::new(UndeletableCold::default()));
+        store.put([1u8; 32], vec![0u8; 100]);
+        store.put([2u8; 32], vec![0u8; 10]); // demotes [1] into cold
+        assert_eq!(store.total_bytes(), 110);
+
+        // Everything is long past its lifetime.
+        store.retain_fresh_age_only(Instant::now(), std::time::Duration::from_secs(0));
+
+        assert!(
+            store.contains(&[1u8; 32]),
+            "the delete failed, so the value is still on disk"
+        );
+        assert_eq!(
+            store.total_bytes(),
+            100,
+            "the hot entry went and the cold one did not; crediting bytes that \
+             are still stored is what lets a failing disk open unlimited room \
+             under the cap"
+        );
+
+        // And the sweep can still find it: a stamp dropped for an entry that
+        // did not go is an entry nothing will ever age again.
+        store.retain_fresh_age_only(Instant::now(), std::time::Duration::from_secs(0));
+        assert_eq!(store.total_bytes(), 100);
     }
 
     /// audit report5: `TieredStore::remove` measured the cold value, told the
