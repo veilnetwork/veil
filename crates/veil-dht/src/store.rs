@@ -41,6 +41,12 @@ pub enum ColdPut {
     Failed(Vec<u8>),
 }
 
+/// One persisted row's publisher: `(key, origin, value_len)`.
+///
+/// A named type because the tuple is three arrays deep and clippy is right
+/// that nobody reads that at a glance.
+pub type PersistedOrigin = ([u8; 32], [u8; 32], u64);
+
 /// Trait for the cold storage tier.
 ///
 /// Default: `InMemoryCold` (HashMap).
@@ -126,6 +132,30 @@ pub trait ColdBackend: Send + Sync + std::fmt::Debug {
     /// seed `total_bytes` on open. In-memory backends start empty and return
     /// `None` (nothing to seed).
     fn cold_total_bytes(&self) -> Option<u64> {
+        None
+    }
+
+    /// Record WHO published the value now stored at `key`.
+    ///
+    /// Per-origin bytes lived only in memory, so a restart handed every
+    /// publisher a fresh allowance while its rows were still on disk — the
+    /// global cap bounded the damage, but the per-origin one stopped meaning
+    /// anything across restarts (report14 V14-L3).
+    ///
+    /// Optional: an in-memory backend does not survive a restart, so it has
+    /// nothing to remember. The default does nothing.
+    fn set_origin(&mut self, _key: &[u8; 32], _origin: &[u8; 32]) {}
+
+    /// Forget `key`'s origin, when the value it described is gone.
+    fn forget_origin(&mut self, _key: &[u8; 32]) {}
+
+    /// Every persisted row whose publisher this backend remembers, so the
+    /// per-origin counters can be rebuilt on open.
+    ///
+    /// `None` means "this backend does not remember"; rows it has no origin
+    /// for are simply unattributed — legacy rows written before this existed
+    /// are exactly that, and they stay counted by the global total.
+    fn origins(&self) -> Option<Vec<PersistedOrigin>> {
         None
     }
 
@@ -283,6 +313,13 @@ pub mod rocks {
     /// tier's total bytes to seed `TieredStore::total_bytes`. Legacy `v1`
     /// entries (8-byte, ts-only) are read back compatibly: missing len ⇒ 0.
     const CF_KEY_TS: &str = "key_ts_v1";
+    /// `key -> publisher node id`, so the per-origin quota survives a restart
+    /// (report14 V14-L3). A separate family and not a value prefix: the value
+    /// format is what every existing node already has on disk, and
+    /// `create_missing_column_families` means an old database opens with this
+    /// one simply empty — its rows are then unattributed, which is the honest
+    /// answer for values written before anybody wrote the origin down.
+    const CF_KEY_ORIGIN: &str = "key_origin_v1";
 
     /// The entry `evict_oldest` settled on: its ts-index row (kept so the row
     /// can be deleted by its own key), the 32-byte store key, and the value.
@@ -357,7 +394,8 @@ pub mod rocks {
             cf_opts.set_max_write_buffer_number(2);
             let cfs = vec![
                 rocksdb::ColumnFamilyDescriptor::new(CF_TS_INDEX, cf_opts.clone()),
-                rocksdb::ColumnFamilyDescriptor::new(CF_KEY_TS, cf_opts),
+                rocksdb::ColumnFamilyDescriptor::new(CF_KEY_TS, cf_opts.clone()),
+                rocksdb::ColumnFamilyDescriptor::new(CF_KEY_ORIGIN, cf_opts),
             ];
             let db = rocksdb::DB::open_cf_descriptors(&opts, path, cfs)?;
             let (count, seed_bytes) = Self::reconcile(&db, side_cfs_existed);
@@ -381,7 +419,8 @@ pub mod rocks {
             let cf_opts = rocksdb::Options::default();
             let cfs = vec![
                 rocksdb::ColumnFamilyDescriptor::new(CF_TS_INDEX, cf_opts.clone()),
-                rocksdb::ColumnFamilyDescriptor::new(CF_KEY_TS, cf_opts),
+                rocksdb::ColumnFamilyDescriptor::new(CF_KEY_TS, cf_opts.clone()),
+                rocksdb::ColumnFamilyDescriptor::new(CF_KEY_ORIGIN, cf_opts),
             ];
             let db = rocksdb::DB::open_cf_descriptors_read_only(&opts, path, cfs, false)?;
             let (count, seed_bytes) = Self::reconcile(&db, true);
@@ -574,6 +613,12 @@ pub mod rocks {
         fn cf_ix(&self) -> &rocksdb::ColumnFamily {
             self.db.cf_handle(CF_TS_INDEX).expect("CF_TS_INDEX present")
         }
+        fn cf_origin(&self) -> &rocksdb::ColumnFamily {
+            self.db
+                .cf_handle(CF_KEY_ORIGIN)
+                .expect("CF_KEY_ORIGIN present")
+        }
+
         fn cf_kt(&self) -> &rocksdb::ColumnFamily {
             self.db.cf_handle(CF_KEY_TS).expect("CF_KEY_TS present")
         }
@@ -739,6 +784,45 @@ pub mod rocks {
                 return ColdPut::Stored(Some((ev_key, ev_val)));
             }
             ColdPut::Stored(None)
+        }
+
+        fn set_origin(&mut self, key: &[u8; 32], origin: &[u8; 32]) {
+            if let Err(e) = self.db.put_cf(self.cf_origin(), key, origin) {
+                // Best effort: an origin nobody wrote down is an unattributed
+                // row, which is the same state every legacy row is in. The
+                // VALUE is what must not be lost, and that write already
+                // happened.
+                log::warn!("dht.cold.rocksdb: origin write failed: {e}");
+            }
+        }
+
+        fn forget_origin(&mut self, key: &[u8; 32]) {
+            let _ = self.db.delete_cf(self.cf_origin(), key);
+        }
+
+        fn origins(&self) -> Option<Vec<super::PersistedOrigin>> {
+            let mut out = Vec::new();
+            for item in self
+                .db
+                .iterator_cf(self.cf_origin(), rocksdb::IteratorMode::Start)
+            {
+                let Ok((k, v)) = item else { continue };
+                if k.len() != 32 || v.len() != 32 {
+                    continue;
+                }
+                // The VALUE's length, read from the main family: an origin row
+                // for a key whose value is gone describes nothing and must not
+                // charge anybody.
+                let Ok(Some(value)) = self.db.get(&k[..]) else {
+                    continue;
+                };
+                let mut key = [0u8; 32];
+                let mut origin = [0u8; 32];
+                key.copy_from_slice(&k);
+                origin.copy_from_slice(&v);
+                out.push((key, origin, value.len() as u64));
+            }
+            Some(out)
         }
 
         fn remove(&mut self, key: &[u8; 32]) {
@@ -1125,6 +1209,30 @@ impl TieredStore {
                 "DHT cold tier: seeded total_bytes={total_bytes} from persisted disk tier on open"
             );
         }
+        // Per-origin bytes are seeded too, from what the backend remembers.
+        // They used to start empty however much was on disk, so a restart
+        // handed every publisher a fresh allowance while its rows were still
+        // there — the per-origin cap simply stopped applying across restarts
+        // (report14 V14-L3).
+        //
+        // A row the backend has no origin for stays UNATTRIBUTED rather than
+        // being guessed at. That is every row written before this existed, and
+        // it is the honest state: the global total still counts them.
+        let mut origin_bytes: HashMap<[u8; 32], u64> = HashMap::new();
+        let mut entry_origin: HashMap<[u8; 32], [u8; 32]> = HashMap::new();
+        if let Some(rows) = cold.origins() {
+            for (key, origin, bytes) in rows {
+                entry_origin.insert(key, origin);
+                *origin_bytes.entry(origin).or_insert(0) += bytes;
+            }
+            if !entry_origin.is_empty() {
+                log::info!(
+                    "DHT cold tier: seeded {} per-origin row(s) across {} publisher(s)",
+                    entry_origin.len(),
+                    origin_bytes.len()
+                );
+            }
+        }
         Self {
             hot: HashMap::new(),
             hot_order: BTreeMap::new(),
@@ -1133,8 +1241,8 @@ impl TieredStore {
             cold,
             total_bytes,
             max_bytes: None,
-            origin_bytes: HashMap::new(),
-            entry_origin: HashMap::new(),
+            origin_bytes,
+            entry_origin,
             per_origin_max_bytes: None,
         }
     }
@@ -1414,9 +1522,12 @@ impl TieredStore {
     fn release_cold(&mut self, key: &[u8; 32], bytes: u64, now: Instant) -> (bool, Instant) {
         self.cold.remove(key);
         if self.cold.contains(key) {
+            // Still there, so its origin row still describes something.
             let first_seen = self.cold_first_seen.get(key).copied().unwrap_or(now);
             return (false, first_seen);
         }
+        // Gone for real: its origin row describes nothing now.
+        self.cold.forget_origin(key);
         self.total_bytes = self.total_bytes.saturating_sub(bytes);
         (true, self.cold_first_seen.remove(key).unwrap_or(now))
     }
@@ -1782,6 +1893,13 @@ impl TieredStore {
                     // it a fresh lifetime and a tier move became a way to
                     // outlive the retention its publisher asked for.
                     self.cold_first_seen.insert(key, first_seen);
+                    // And WHO published it, for the same reason one level up:
+                    // the per-origin counters live in memory, so a restart
+                    // handed every publisher a fresh allowance while its rows
+                    // were still on disk (report14 V14-L3).
+                    if let Some(origin) = self.entry_origin.get(&key).copied() {
+                        self.cold.set_origin(&key, &origin);
+                    }
                     if let Some((evicted_key, evicted_val)) = evicted {
                         self.account_eviction(&evicted_key, evicted_val.len() as u64);
                     }
@@ -2979,6 +3097,99 @@ mod v08_tests {
         // did not go is an entry nothing will ever age again.
         store.retain_fresh_age_only(Instant::now(), std::time::Duration::from_secs(0));
         assert_eq!(store.total_bytes(), 100);
+    }
+
+    /// A backend that remembers publishers seeds the per-origin counters.
+    ///
+    /// They used to start empty however much was on disk, so a restart handed
+    /// every publisher a fresh allowance while its rows were still there — the
+    /// per-origin cap stopped applying across restarts, and only the global one
+    /// stood (report14 V14-L3).
+    #[test]
+    fn a_restart_does_not_hand_a_publisher_a_fresh_allowance() {
+        /// Shared so the test can open the SAME disk twice — which is what a
+        /// restart is, and the only thing that exercises the seeding.
+        #[derive(Debug, Default)]
+        struct Disk {
+            entries: HashMap<[u8; 32], Vec<u8>>,
+            origins: HashMap<[u8; 32], [u8; 32]>,
+        }
+
+        #[derive(Debug, Clone, Default)]
+        struct RememberingCold(std::sync::Arc<std::sync::Mutex<Disk>>);
+
+        impl RememberingCold {
+            fn disk(&self) -> std::sync::MutexGuard<'_, Disk> {
+                self.0.lock().unwrap_or_else(|p| p.into_inner())
+            }
+        }
+
+        impl ColdBackend for RememberingCold {
+            fn get(&self, key: &[u8; 32]) -> Option<Vec<u8>> {
+                self.disk().entries.get(key).cloned()
+            }
+            fn put(&mut self, key: [u8; 32], value: Vec<u8>) -> ColdPut {
+                self.disk().entries.insert(key, value);
+                ColdPut::Stored(None)
+            }
+            fn remove(&mut self, key: &[u8; 32]) {
+                self.disk().entries.remove(key);
+            }
+            fn contains(&self, key: &[u8; 32]) -> bool {
+                self.disk().entries.contains_key(key)
+            }
+            fn len(&self) -> usize {
+                self.disk().entries.len()
+            }
+            fn iter_entries(&self) -> Vec<([u8; 32], Vec<u8>)> {
+                self.disk()
+                    .entries
+                    .iter()
+                    .map(|(k, v)| (*k, v.clone()))
+                    .collect()
+            }
+            fn retain(&mut self, _f: &dyn Fn(&[u8; 32], &[u8]) -> bool) -> Vec<([u8; 32], u64)> {
+                Vec::new()
+            }
+            fn set_origin(&mut self, key: &[u8; 32], origin: &[u8; 32]) {
+                self.disk().origins.insert(*key, *origin);
+            }
+            fn forget_origin(&mut self, key: &[u8; 32]) {
+                self.disk().origins.remove(key);
+            }
+            fn origins(&self) -> Option<Vec<super::PersistedOrigin>> {
+                let disk = self.disk();
+                Some(
+                    disk.origins
+                        .iter()
+                        .filter_map(|(k, o)| disk.entries.get(k).map(|v| (*k, *o, v.len() as u64)))
+                        .collect(),
+                )
+            }
+        }
+
+        let publisher = [0xAAu8; 32];
+        // Hot capacity 1, so the first value is demoted into cold by the
+        // second — which is the path that writes the origin down.
+        let disk = RememberingCold::default();
+        let mut store =
+            TieredStore::with_cold(1, Box::new(disk.clone())).with_per_origin_max_bytes(150);
+        assert!(store.put_with_origin([1u8; 32], vec![0u8; 100], publisher));
+        assert!(store.put_with_origin([2u8; 32], vec![0u8; 10], publisher));
+        assert!(
+            !store.put_with_origin([3u8; 32], vec![0u8; 100], publisher),
+            "the publisher is at its quota, or this test is about nothing"
+        );
+
+        // The same disk, opened again. Everything this session learned in
+        // memory is gone; what the backend remembers is all there is.
+        drop(store);
+        let mut reopened = TieredStore::with_cold(1, Box::new(disk)).with_per_origin_max_bytes(150);
+        assert!(
+            !reopened.put_with_origin([4u8; 32], vec![0u8; 100], publisher),
+            "a restart must not hand a publisher a second allowance while its \
+             rows are still on disk"
+        );
     }
 
     /// audit report5: `TieredStore::remove` measured the cold value, told the
