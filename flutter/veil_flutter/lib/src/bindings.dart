@@ -1445,6 +1445,7 @@ const int veilHolePunchQuicFailed = abi.veilHolePunchQuicFailed;
 const int veilHolePunchRefusedAnonymous = abi.veilHolePunchRefusedAnonymous;
 const int veilHolePunchUnknownPeer = abi.veilHolePunchUnknownPeer;
 const int veilHolePunchUnsupported = abi.veilHolePunchUnsupported;
+const int veilHolePunchConfigUnavailable = abi.veilHolePunchConfigUnavailable;
 
 final int Function(
   Pointer<VeilHandle>,

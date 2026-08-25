@@ -135,6 +135,9 @@ const int veilHolePunchRefusedAnonymous = 6;
 const int veilHolePunchUnknownPeer = 7;
 /// `VEIL_HOLE_PUNCH_UNSUPPORTED`
 const int veilHolePunchUnsupported = 8;
+
+/// The daemon could not read its own config to answer the request.
+const int veilHolePunchConfigUnavailable = 9;
 /// `VEIL_CREATE_INVITE_OK`
 const int veilCreateInviteOk = 0;
 /// `VEIL_CREATE_INVITE_NOT_CONFIGURED`
