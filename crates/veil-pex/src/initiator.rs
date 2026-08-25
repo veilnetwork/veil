@@ -34,10 +34,21 @@ const WALK_CHALLENGE_WINDOW: Duration = Duration::from_secs(120);
 /// so this is slack for a slow round overlapping the next, not a working size.
 const MAX_OUTSTANDING_WALKS: usize = 64;
 
-/// Most hops that may extract one PoW each from a single walk. A walk carries
-/// `ttl` 4..12, so 12 is the honest maximum; a hop counted twice is a hop
-/// asking twice.
-const MAX_POW_PER_WALK: usize = 12;
+/// Peers that may extract a PoW from a single walk.
+///
+/// ONE, because that is what the protocol produces. A walk carries `ttl` 4..12
+/// and that number used to be taken as the ceiling — but a hop either FORWARDS
+/// the walk or terminates it, and only the terminating node challenges. Each
+/// walk_id is minted fresh and sent to exactly one peer, so one walk draws
+/// exactly one legitimate challenge (verified against `dispatcher.rs`'s
+/// `should_terminate` branch, which is either/or).
+///
+/// The extra eleven were not slack, they were eleven Sybil peers that learned
+/// a walk_id extracting a proof of work each (report14 V14-M10). A retry from
+/// the peer that already challenged is refused whatever this number is — the
+/// ticket records WHO paid — so nothing legitimate is lost by naming the real
+/// maximum.
+const MAX_POW_PER_WALK: usize = 1;
 
 /// A walk this node actually sent, and the hops that have already been paid
 /// PoW for it.
@@ -110,9 +121,12 @@ impl PexState {
 
     /// Whether `from_peer` may have one PoW solved for `walk_id`.
     ///
-    /// True at most once per (walk we sent, hop): a walk legitimately draws a
-    /// challenge from every hop it reaches, so this cannot consume the ticket
-    /// on the first one, but a hop that asks twice is answered once.
+    /// True at most once per (walk we sent, hop), and at most
+    /// [`MAX_POW_PER_WALK`] hops per walk — which is one, because a walk is
+    /// either forwarded or terminated and only the terminating node
+    /// challenges. The earlier note here said a walk "legitimately draws a
+    /// challenge from every hop it reaches"; that describes a protocol this
+    /// crate does not implement (report14 V14-M10).
     fn claim_pow(&mut self, walk_id: u64, from_peer: [u8; 32]) -> bool {
         let now = Instant::now();
         let Some(ticket) = self.outstanding_walks.get_mut(&walk_id) else {
@@ -562,17 +576,33 @@ async fn handle_challenge(
 
     let frame = encode_pex_frame(PexMsg::Response, &response.encode());
 
-    // Send response back through any connected peer (the network will route it).
-    let peer_ids = broadcaster.active_node_ids();
-    if let Some(&first) = peer_ids.first() {
-        // Send to first available peer — the frame will be routed to the challenger.
-        broadcaster.send_to(&first, TrafficClass::Interactive as u8, frame);
+    // Back to the peer that ASKED.
+    //
+    // This used to take `active_node_ids().first()` under a comment saying
+    // "the network will route it". Nothing routes a PEX frame — the family is
+    // point-to-point between session peers — so the answer went to whichever
+    // peer happened to be first in the session registry, and the challenger
+    // waited for a response that was never coming. `from_peer` is the hop that
+    // challenged us and the only address this answer has (report14 V14-M11).
+    //
+    // The outcome is checked, because a send that quietly did nothing is
+    // indistinguishable from one that worked, and this walk has now paid for a
+    // proof of work whose answer went nowhere.
+    if broadcaster.send_to(&from_peer, TrafficClass::Interactive as u8, frame) {
+        logger.info(
+            "pex.response.sent",
+            &format!("walk_id={}", challenge.walk_id),
+        );
+    } else {
+        logger.warn(
+            "pex.response.undeliverable",
+            &format!(
+                "walk_id={} — no live session with the peer that challenged \
+                 us, so the solved proof of work has nowhere to go",
+                challenge.walk_id
+            ),
+        );
     }
-
-    logger.info(
-        "pex.response.sent",
-        &format!("walk_id={}", challenge.walk_id),
-    );
 }
 
 /// Handle a PexResult — add peers to state and notify runtime to connect.
@@ -783,6 +813,85 @@ fn is_wildcard_transport(transport: &str) -> bool {
 mod tests {
     use super::*;
 
+    /// The answer goes to the peer that ASKED.
+    ///
+    /// It used to go to `active_node_ids().first()`, under a comment saying
+    /// "the network will route it". Nothing routes a PEX frame — the family is
+    /// point-to-point between session peers — so a solved proof of work landed
+    /// on whichever peer happened to be first in the session registry, and the
+    /// challenger waited for a response that was never coming
+    /// (report14 V14-M11).
+    #[tokio::test]
+    async fn a_solved_challenge_answers_the_peer_that_asked() {
+        use std::sync::Mutex as StdMutex;
+
+        const CHALLENGER: [u8; 32] = [0xC1; 32];
+        const SOMEBODY_ELSE: [u8; 32] = [0x0E; 32];
+
+        #[derive(Default)]
+        struct Recording {
+            sent: StdMutex<Vec<([u8; 32], Vec<u8>)>>,
+        }
+        impl FrameBroadcaster for Recording {
+            fn send_to(&self, peer_id: &[u8; 32], _priority: u8, bytes: Vec<u8>) -> bool {
+                self.sent
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .push((*peer_id, bytes));
+                true
+            }
+            fn send_to_all_with_priority(&self, _priority: u8, _bytes: std::sync::Arc<[u8]>) {}
+            fn active_node_ids(&self) -> Vec<[u8; 32]> {
+                // SOMEBODY_ELSE first on purpose: that is what the old code
+                // would have picked.
+                vec![SOMEBODY_ELSE, CHALLENGER]
+            }
+        }
+
+        struct Quiet;
+        impl PexLogger for Quiet {
+            fn info(&self, _event: &str, _message: &str) {}
+            fn warn(&self, _event: &str, _message: &str) {}
+        }
+
+        let walk_id = 4242u64;
+        let state = Arc::new(Mutex::new(PexState::new()));
+        state
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .note_walk_sent(walk_id);
+
+        let challenge = veil_proto::pex::PexChallenge {
+            walk_id,
+            challenge_nonce: [9u8; 32],
+            timestamp: veil_util::unix_secs_now_u64(),
+            // Trivial on purpose: the PoW is not what is under test.
+            difficulty: 1,
+        };
+        let broadcaster = Recording::default();
+
+        handle_challenge(
+            &challenge,
+            CHALLENGER,
+            &[1u8; 32],
+            &[2u8; 32],
+            0,
+            None,
+            &broadcaster,
+            &state,
+            &Quiet,
+        )
+        .await;
+
+        let sent = broadcaster.sent.lock().unwrap_or_else(|p| p.into_inner());
+        assert_eq!(sent.len(), 1, "exactly one answer");
+        assert_eq!(
+            sent[0].0, CHALLENGER,
+            "the answer went to a peer that never asked, and the challenger \
+             is still waiting"
+        );
+    }
+
     /// A PoW challenge names a walk_id, and nothing used to check that the walk
     /// was ours. Any authenticated peer could invent one and have this node
     /// grind BLAKE3 at `MAX_POW_DIFFICULTY` — 2^26 hashes — for each, serially,
@@ -798,45 +907,53 @@ mod tests {
         assert_eq!(state.active_walks, 0);
     }
 
-    /// A walk carries ttl 4..12 and every hop it reaches challenges the ORIGIN,
-    /// so one walk legitimately draws several challenges from nodes this one
-    /// never dialled. The ticket therefore cannot be consumed by the first
-    /// challenge — it is spent per hop.
+    /// One walk, one challenge.
+    ///
+    /// This test used to assert the opposite — that a second hop on the same
+    /// walk was legitimate too — on the belief that every hop a walk reaches
+    /// challenges the origin. The dispatcher says otherwise: a hop either
+    /// FORWARDS the walk or terminates it, and only the terminating node
+    /// challenges. So the second claim is a second peer that learned a walk_id,
+    /// and answering it is a proof of work spent on nobody's discovery
+    /// (report14 V14-M10).
     #[test]
-    fn a_sent_walk_pays_each_hop_once() {
+    fn a_sent_walk_pays_one_hop() {
         let mut state = PexState::new();
         state.note_walk_sent(42);
         assert_eq!(state.active_walks, 1);
 
         let hop_a = [1u8; 32];
         let hop_b = [2u8; 32];
-        assert!(state.claim_pow(42, hop_a), "first hop is legitimate");
         assert!(
-            state.claim_pow(42, hop_b),
-            "a second hop on the same walk is legitimate too"
+            state.claim_pow(42, hop_a),
+            "the terminating hop is legitimate"
+        );
+        assert!(
+            !state.claim_pow(42, hop_b),
+            "a second peer on one walk is a peer that learned a walk_id"
         );
         assert!(
             !state.claim_pow(42, hop_a),
-            "a hop that asks twice for the same walk is answered once"
+            "and the hop that did challenge is answered once"
         );
     }
 
-    /// The per-walk ceiling is the honest maximum ttl, so a hop count beyond
-    /// what a walk can reach cannot extract more work.
+    /// The per-walk ceiling is what the protocol produces, so anything past it
+    /// cannot extract more work.
     #[test]
-    fn one_walk_cannot_be_milked_past_its_ttl() {
+    fn one_walk_cannot_be_milked_past_its_ceiling() {
         let mut state = PexState::new();
         state.note_walk_sent(9);
         for i in 0..MAX_POW_PER_WALK {
             let mut hop = [0u8; 32];
             hop[0] = i as u8;
-            assert!(state.claim_pow(9, hop), "hop {i} is within ttl");
+            assert!(state.claim_pow(9, hop), "hop {i} is within the ceiling");
         }
         let mut extra = [0u8; 32];
         extra[0] = 0xFF;
         assert!(
             !state.claim_pow(9, extra),
-            "past the ttl ceiling the walk is spent"
+            "past the ceiling the walk is spent"
         );
     }
 
