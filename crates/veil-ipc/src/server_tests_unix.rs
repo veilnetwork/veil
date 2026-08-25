@@ -81,13 +81,29 @@ async fn send_ipc_frame(client: &mut UnixStream, msg_type: u16, body: &[u8]) {
     }
 }
 
+/// How long a test waits for one IPC frame before calling it a failure.
+///
+/// Generous for a local socket, and the point is not the number: it is that
+/// there IS one. Every test in this file reads through here, and an unbounded
+/// `read_exact` turns a server that never answers into a run that never ends.
+/// Several of these tests are `#[ignore]`d as flaky on sandboxed sockets and
+/// the note invites running them by hand — which used to WEDGE instead of
+/// reporting, so the invitation cost ten minutes and told you nothing.
+const IPC_FRAME_WAIT: Duration = Duration::from_secs(10);
+
 async fn recv_ipc_frame(client: &mut UnixStream) -> (FrameHeader, Vec<u8>) {
     let mut hdr_buf = [0u8; veil_proto::HEADER_SIZE];
-    client.read_exact(&mut hdr_buf).await.unwrap();
+    tokio::time::timeout(IPC_FRAME_WAIT, client.read_exact(&mut hdr_buf))
+        .await
+        .expect("no IPC frame header arrived within IPC_FRAME_WAIT")
+        .unwrap();
     let hdr = codec::decode_header(&hdr_buf).unwrap();
     let mut body = vec![0u8; hdr.body_len as usize];
     if !body.is_empty() {
-        client.read_exact(&mut body).await.unwrap();
+        tokio::time::timeout(IPC_FRAME_WAIT, client.read_exact(&mut body))
+            .await
+            .expect("IPC frame header arrived but its body did not")
+            .unwrap();
     }
     (hdr, body)
 }
