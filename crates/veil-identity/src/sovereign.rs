@@ -838,27 +838,18 @@ pub fn save_name_claim(
     veil_dir: &std::path::Path,
     claim: &veil_proto::name_claim_v2::NameClaim,
 ) -> std::io::Result<std::path::PathBuf> {
-    use std::fs;
-    use std::io::Write as _;
-
     let dir = veil_dir.join(NAME_CLAIMS_DIR);
     veil_util::create_dir_all_with_eacces_retry(&dir)?;
     // `claim.name` is already normalized at sign time — safe to use as a filename.
     let path = dir.join(format!("{}.bin", claim.name));
-    let tmp = path.with_extension("tmp");
-    veil_util::with_eacces_retry(|| {
-        let mut f = fs::File::create(&tmp)?;
-        f.write_all(&claim.encode())?;
-        f.sync_all()?;
-        Ok(())
-    })?;
-    match fs::rename(&tmp, &path) {
-        Ok(()) => Ok(path),
-        Err(e) => {
-            let _ = fs::remove_file(&tmp);
-            Err(e)
-        }
-    }
+    // Through the shared helper rather than a hand-rolled write+rename: this
+    // one fsynced the file and then published it with a bare rename and no
+    // parent fsync at all, so a power loss could drop a name the operator had
+    // registered. `atomic_write` adds that fsync on POSIX and the
+    // write-through barrier on Windows, plus the unpredictable tmp name the
+    // fixed `.tmp` suffix here did not have.
+    veil_util::atomic_write(&path, &claim.encode())?;
+    Ok(path)
 }
 
 /// Load all persisted [`NameClaim`](veil_proto::name_claim_v2::NameClaim)
