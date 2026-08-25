@@ -3079,6 +3079,21 @@ async fn attempt_hole_punch_is_single_flight_per_peer() {
     let services = rt.access();
     let peer = services.local_node_id;
 
+    // The premise, stated. `attempt_p2p_hole_punch` RE-READS the config from
+    // disk and answers `NoReflector` when it cannot — the same answer it gives
+    // when there is genuinely no reflector, so a round-trip that loses these
+    // fields is indistinguishable from the outcome under test. Checked here so
+    // a failure names the cause instead of showing two enum variants.
+    let reloaded = veil_cfg::load_config(&path).expect("the config must reload");
+    assert!(
+        reloaded.nat.enabled,
+        "nat.enabled did not survive the round trip"
+    );
+    assert!(
+        !reloaded.nat.udp_reflectors.is_empty(),
+        "nat.udp_reflectors did not survive the round trip"
+    );
+
     let started = std::time::Instant::now();
     // Poll both on ONE task: the first poll of `a` inserts the single-flight
     // slot before yielding into discovery; `b` is then polled, sees the slot
