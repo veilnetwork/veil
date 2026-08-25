@@ -3716,8 +3716,9 @@ mod tests {
 
         // Edge-triggered wait: every non-publisher peer should hold the
         // record locally once the STORE frame arrives + dispatcher persists.
-        // On loopback this typically completes in <300ms; deadline = 5s
-        // gives ~16x headroom for slow CI machines.
+        // On loopback this typically completes in <300ms; the deadline is
+        // `SIM_WAIT_LIMIT` — see it for why patience alone does not settle
+        // this scenario under a saturated machine.
         let deadline = tokio::time::Instant::now() + SIM_WAIT_LIMIT;
         let peers_with_value = loop {
             let count = (1..n)

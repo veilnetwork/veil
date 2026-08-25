@@ -2558,6 +2558,44 @@ pub fn padding_enabled() -> bool {
 /// 1 = Active (background but UI alive — 2× longer keepalive)
 /// 2 = LowPower (Doze / iOS BackgroundTask — full multiplier + route-probe paused)
 /// Mirrors `veil_proto::MobileBackgroundMode` wire enum byte.
+/// Test-only override for [`MLKEM_REKEY_BYTES_THRESHOLD`]; `0` means "use it".
+///
+/// A global rather than a field for the reason the section below already gives
+/// for the mobile signals: `SessionRunner` is built by struct literal in
+/// dozens of places, and threading a value through all of them to reach one
+/// line is worse than a signal the whole process shares.
+///
+/// It exists because the threshold is 128 GiB. A test that drives a rekey by
+/// CROSSING it has to move 128 GB through memory, and the one that did was
+/// flaky for exactly that reason — its writes outran the runner, whose own
+/// replies filled the return buffer nobody was draining, until the runner gave
+/// up and the next write met a broken pipe. It passed or failed on how the
+/// scheduler felt, which is a gate nobody can read.
+static MLKEM_REKEY_BYTES_OVERRIDE: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// The ML-KEM rekey byte threshold this process is running with.
+fn mlkem_rekey_bytes_threshold() -> u64 {
+    match MLKEM_REKEY_BYTES_OVERRIDE.load(Ordering::Relaxed) {
+        0 => MLKEM_REKEY_BYTES_THRESHOLD,
+        n => n,
+    }
+}
+
+/// Set the override. `0` restores [`MLKEM_REKEY_BYTES_THRESHOLD`].
+///
+/// Tests only, and they must serialise on it: it is process-wide, and every
+/// runner started afterwards reads it.
+pub fn set_mlkem_rekey_bytes_threshold(bytes: u64) {
+    MLKEM_REKEY_BYTES_OVERRIDE.store(bytes, Ordering::Relaxed);
+}
+
+/// What [`set_mlkem_rekey_bytes_threshold`] last set, or `0`.
+#[must_use]
+pub fn mlkem_rekey_bytes_override() -> u64 {
+    MLKEM_REKEY_BYTES_OVERRIDE.load(Ordering::Relaxed)
+}
+
 static MOBILE_BACKGROUND_TIER: AtomicU8 = AtomicU8::new(0);
 static MOBILE_BACKGROUND_KEEPALIVE_MULTIPLIER: AtomicU32 = AtomicU32::new(1);
 
@@ -3305,7 +3343,7 @@ impl SessionRunner {
 
         // ── ML-KEM rekey state ─────────────────────────────────────
         let mut mlkem_rekey = crate::mlkem_rekey_context::MlKemRekeyContext::new(
-            MLKEM_REKEY_BYTES_THRESHOLD,
+            mlkem_rekey_bytes_threshold(),
             MLKEM_REKEY_TIME_THRESHOLD_SECS,
         );
 
