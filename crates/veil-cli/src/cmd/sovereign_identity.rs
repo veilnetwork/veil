@@ -493,6 +493,18 @@ fn emit_creation_summary<I: CommandIo>(
             falcon.display()
         )));
     }
+    if !out.supports_device_lifecycle {
+        // Said HERE because this is the only moment the choice is cheap. The
+        // device flows refuse a non-Ed25519 master fail-fast, so nothing is
+        // corrupted — but an operator used to learn it when they tried to link
+        // a second phone, or to revoke a stolen one, and by then the identity
+        // was published and the phrase was written down (report14 V14-M12).
+        io.emit(OutputEvent::message(String::new()));
+        io.emit(OutputEvent::message(
+            "NOTE: this identity is SINGLE-DEVICE. Its master algorithm has no              device lifecycle yet, so `identity delegate`, `identity adopt` and              `identity revoke-device` will refuse it — a second device cannot              be linked, and a lost one cannot be revoked. Create with the              default Ed25519 master if you need either."
+                .to_string(),
+        ));
+    }
     io.emit(OutputEvent::message(String::new()));
 
     // ext: for standalone Falcon-512 (master_algo = 2) the
