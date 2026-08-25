@@ -1747,3 +1747,83 @@ fn t1_4_slice_past_the_end_is_empty_with_a_truthful_length() {
     let (_, tail) = mb.slice(recv, cid, 90, 1024).unwrap().unwrap();
     assert_eq!(tail.len(), 10);
 }
+
+/// A record the fetcher cannot use yet must not spend the reply budget that
+/// everything behind it is waiting for.
+///
+/// The selection is oldest-first and bounded, so the front of the queue
+/// decides what a fetch returns. A blob whose open failed transiently is not
+/// acked — correctly, nothing said it was bad — so it sits at that front and
+/// is served again on every fetch. Nothing behind it moves until it does
+/// (report14 X14-M4).
+#[test]
+fn a_skipped_record_costs_neither_a_slot_nor_a_byte() {
+    let (mb, _tmp, clock) = fresh(MailboxConfig::default());
+    let recv = [1u8; 32];
+    let head = [0xAAu8; 32];
+    let tail = [0xBBu8; 32];
+    // Oldest first: `head` is what every fetch leads with, so the clock has to
+    // move between the two or the order is whatever the map hands back.
+    mb.put(recv, head, [9u8; 32], vec![7u8; 64]).unwrap();
+    clock.fetch_add(10, Ordering::SeqCst);
+    mb.put(recv, tail, [9u8; 32], vec![8u8; 64]).unwrap();
+
+    let all = mb.fetch(recv).unwrap();
+    assert_eq!(all.len(), 2, "the fixture did not store both records");
+    assert_eq!(all[0].content_id, head, "the head is what leads a fetch");
+
+    let without_head = mb.fetch_skipping(recv, &[head]).unwrap();
+    assert_eq!(
+        without_head.len(),
+        1,
+        "skipping must leave the record in place and out of the answer"
+    );
+    assert_eq!(
+        without_head[0].content_id, tail,
+        "the tail is what the fetcher was waiting for"
+    );
+
+    // And the record is still THERE: skipping is not deleting, and the
+    // fetcher comes back for it.
+    assert_eq!(mb.fetch(recv).unwrap().len(), 2);
+}
+
+/// The request body is read by a relay that understands it and ignored by one
+/// that does not — in both directions.
+#[test]
+fn a_fetch_request_body_is_read_liberally() {
+    use crate::{MAX_FETCH_SKIP, MailboxFetchRequest};
+
+    // Every client that predates the field sends nothing.
+    assert!(MailboxFetchRequest::decode(&[]).skip.is_empty());
+    // A body this relay does not recognise is not an error either.
+    assert!(MailboxFetchRequest::decode(b"hello there").skip.is_empty());
+
+    let req = MailboxFetchRequest {
+        skip: vec![[1u8; 32], [2u8; 32]],
+    };
+    let round = MailboxFetchRequest::decode(&req.encode());
+    assert_eq!(round, req, "what one relay writes another must read");
+
+    // A count past the cap is truncated, not refused: a request the relay
+    // rejects is worse than one it partly honours.
+    let many = MailboxFetchRequest {
+        skip: (0..(MAX_FETCH_SKIP as u16 + 10))
+            .map(|i| {
+                let mut c = [0u8; 32];
+                c[..2].copy_from_slice(&i.to_be_bytes());
+                c
+            })
+            .collect(),
+    };
+    assert_eq!(
+        MailboxFetchRequest::decode(&many.encode()).skip.len(),
+        MAX_FETCH_SKIP
+    );
+
+    // A count that lies about what follows takes what is actually there.
+    let mut lying = vec![0xF1u8];
+    lying.extend_from_slice(&99u16.to_be_bytes());
+    lying.extend_from_slice(&[3u8; 32]);
+    assert_eq!(MailboxFetchRequest::decode(&lying).skip, vec![[3u8; 32]]);
+}

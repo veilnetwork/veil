@@ -507,14 +507,23 @@ pub async fn handle_fetch_message(
     reply_sender: Option<&Arc<dyn AnonOnionSender>>,
     msg: AppMessage,
 ) {
-    let (src_node_id, provenance, sender_device_id, reply_id) = match msg {
+    let (src_node_id, provenance, sender_device_id, reply_id, request) = match msg {
         AppMessage::Deliver {
             src_node_id,
             provenance,
             sender_device_id,
             reply_id,
+            data,
             ..
-        } => (src_node_id, provenance, sender_device_id, reply_id),
+        } => {
+            // The request body. It was empty on every client that predates the
+            // field and this handler never read it, so reading it now is
+            // additive in both directions — and `decode` never fails, because
+            // refusing a fetch over a hint would strand somebody's mail
+            // (report14 X14-M4).
+            let request = veil_mailbox::MailboxFetchRequest::decode(&data);
+            (src_node_id, provenance, sender_device_id, reply_id, request)
+        }
         other => {
             log::debug!("veil-mailbox: ignoring non-Deliver on FETCH endpoint: {other:?}");
             return;
@@ -541,7 +550,7 @@ pub async fn handle_fetch_message(
         log::debug!("veil-mailbox: FETCH dropped — no reply egress configured");
         return;
     };
-    let mut blobs = match mailbox.fetch(src_node_id) {
+    let mut blobs = match mailbox.fetch_skipping(src_node_id, &request.skip) {
         Ok(b) => b,
         Err(e) => {
             log::warn!(
@@ -564,7 +573,7 @@ pub async fn handle_fetch_message(
         && dev != src_node_id
         && dev != [0u8; 32]
     {
-        match mailbox.fetch(dev) {
+        match mailbox.fetch_skipping(dev, &request.skip) {
             Ok(dev_blobs) => {
                 if !dev_blobs.is_empty() {
                     log::debug!(
