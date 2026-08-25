@@ -335,6 +335,16 @@ pub struct AbuseContext {
     /// just out of a bounded pot. See
     /// [`veil_proto::budget::UNSIGNED_ROUTE_REQUEST_BURST`].
     pub unsigned_route_request_budget: Arc<Mutex<veil_abuse::rate_limiter::TokenBucket>>,
+    /// Budget for opening ratchet payloads from senders this node has never
+    /// proven.
+    ///
+    /// Opening one costs a PQXDH accept against every still-usable mailbox
+    /// secret, and that is paid before anything about the sender is known. The
+    /// per-peer cap on unproven conversations is keyed by the node id the
+    /// SENDER claims, which is free to vary — so the work scaled with claims
+    /// rather than with peers (report14 V14-M5). A peer already proven does
+    /// not come out of this pot.
+    pub unproven_ratchet_open_budget: Arc<Mutex<veil_abuse::rate_limiter::TokenBucket>>,
     /// What this node will spend on OTHER people's work, per hour.
     ///
     /// Not an abuse limiter in the usual sense — the requests it declines are
@@ -1934,6 +1944,13 @@ pub fn make_test_dispatcher(role: NodeRole) -> FrameDispatcher {
                     1.0 / veil_proto::budget::UNSIGNED_ROUTE_REQUEST_REFILL_SECS as f64,
                 ),
             )),
+            unproven_ratchet_open_budget: Arc::new(Mutex::new(
+                veil_abuse::rate_limiter::TokenBucket::new(
+                    veil_proto::budget::UNPROVEN_RATCHET_OPEN_BURST as f64,
+                    veil_proto::budget::UNPROVEN_RATCHET_OPEN_BURST as f64
+                        / veil_proto::budget::UNPROVEN_RATCHET_OPEN_REFILL_SECS as f64,
+                ),
+            )),
             dht_contact_quota: Arc::new(Mutex::new(veil_abuse::DhtQuota::new(
                 1_000_000,
                 Duration::from_secs(60),
@@ -2744,6 +2761,13 @@ mod tests {
                     veil_abuse::rate_limiter::TokenBucket::new(
                         veil_proto::budget::UNSIGNED_ROUTE_REQUEST_BURST as f64,
                         1.0 / veil_proto::budget::UNSIGNED_ROUTE_REQUEST_REFILL_SECS as f64,
+                    ),
+                )),
+                unproven_ratchet_open_budget: Arc::new(Mutex::new(
+                    veil_abuse::rate_limiter::TokenBucket::new(
+                        veil_proto::budget::UNPROVEN_RATCHET_OPEN_BURST as f64,
+                        veil_proto::budget::UNPROVEN_RATCHET_OPEN_BURST as f64
+                            / veil_proto::budget::UNPROVEN_RATCHET_OPEN_REFILL_SECS as f64,
                     ),
                 )),
                 dht_contact_quota: Arc::new(Mutex::new(veil_abuse::DhtQuota::new(

@@ -1680,6 +1680,44 @@ impl FrameDispatcher {
                 }
                 return None;
             };
+            // BEFORE the expensive part, for senders nobody has proven.
+            //
+            // Opening a prologue tries a PQXDH accept against every
+            // still-usable mailbox secret — a decapsulation each — and all of
+            // that is paid before anything about the sender is known. The
+            // per-peer cap on unproven conversations is keyed by the node id
+            // the SENDER claims, which costs an attacker nothing to vary: each
+            // fresh claim brought its own allowance, so the work scaled with
+            // claims rather than with peers (report14 V14-M5).
+            //
+            // A peer this node has PROVEN never comes out of this pot: an
+            // established conversation must not be rate-limited by a defence
+            // against strangers, and proving one is exactly what an attacker
+            // varying claimed ids cannot do.
+            let proven = ratchet
+                .peer_entry_authenticated(&envelope.sender_node_id)
+                .unwrap_or(false);
+            if !proven {
+                let admitted = {
+                    let mut bucket = self
+                        .abuse
+                        .unproven_ratchet_open_budget
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner());
+                    bucket.allow_at(std::time::Instant::now())
+                };
+                if !admitted {
+                    self.logger.debug(
+                        "delivery.ratchet.unproven_budget",
+                        "refused a ratchet open from an unproven sender: the \
+                         node-wide budget for first contacts is spent",
+                    );
+                    if let Some(m) = &self.metrics {
+                        m.inc_decrypt_failures();
+                    }
+                    return None;
+                }
+            }
             let now_unix = veil_util::unix_secs_now_u64();
             match ratchet.open_payload(&envelope.sender_node_id, &envelope.payload, now_unix) {
                 Ok(opened) => {
@@ -4083,6 +4121,94 @@ mod ratchet_terminal_tests {
             take(&mut rx).expect("delivered").2,
             b"downgrade me",
             "the genuine frame still opens"
+        );
+    }
+
+    /// A flood of first contacts is bounded by a pot the flooder cannot widen.
+    ///
+    /// Opening a ratchet prologue costs a PQXDH accept against every
+    /// still-usable mailbox secret, and that is paid before anything about the
+    /// sender is proven. The per-peer cap on unproven conversations is keyed
+    /// by the node id the SENDER claims, which costs nothing to vary — so each
+    /// fresh claim brought its own allowance and the work scaled with claims
+    /// rather than with peers (report14 V14-M5).
+    ///
+    /// Driven through `decrypt_forward_payload` rather than `dispatch`: the
+    /// frame path in front of it has limiters of its own keyed by the RELAY,
+    /// and a test that went through them would be measuring those instead.
+    #[test]
+    fn a_flood_of_unproven_senders_runs_out_of_budget() {
+        let (alice, bob) = (party(ALICE, 0xA7), party(BOB, 0xB7));
+        learn(&bob, &alice);
+        let (disp, _h, _rx) = dispatcher_for(&bob);
+
+        let open = |disp: &crate::FrameDispatcher, from: &Party, body: &[u8]| {
+            let envelope = veil_proto::delivery::DeliveryEnvelope {
+                recipient: veil_proto::recipient::Recipient::any(bob.node_id),
+                sender_node_id: from.node_id,
+                src_app_id: APP,
+                app_id: APP,
+                endpoint_id: ENDPOINT,
+                content_id: [0u8; 32],
+                created_at: veil_util::unix_secs_now_u64(),
+                ttl_secs: 60,
+                payload: body.to_vec(),
+                trace_id: 0,
+                require_ack: false,
+            };
+            let (mut s, mut sa, mut a, mut e) = ([0u8; 32], [0u8; 32], [0u8; 32], 0u32);
+            disp.decrypt_forward_payload(
+                body.first().copied(),
+                &[],
+                &envelope,
+                &mut s,
+                &mut sa,
+                &mut a,
+                &mut e,
+            )
+        };
+
+        // Alice first, while the pot is full: this is what makes her PROVEN,
+        // and proven is the state the flood below must not be able to touch.
+        let first = seal(&alice, &bob, b"first");
+        assert!(
+            open(&disp, &alice, &first).is_some(),
+            "the fixture cannot even open an ordinary frame"
+        );
+
+        // The flood: well-formed frames from claimed senders nobody has
+        // proven. They do not open — a stranger cannot seal to this node — and
+        // that is the point: the cost this bounds is paid BY TRYING.
+        let burst = veil_proto::budget::UNPROVEN_RATCHET_OPEN_BURST as usize;
+        for i in 0..burst + 8 {
+            let mut claimed = [0u8; 32];
+            claimed[..8].copy_from_slice(&(i as u64).to_be_bytes());
+            let stranger = party(claimed, 0xC0u8.wrapping_add(i as u8));
+            let body = seal(&stranger, &bob, b"hello");
+            let _ = open(&disp, &stranger, &body);
+        }
+
+        // The pot is spent, which is what says the flood was charged for.
+        {
+            let mut bucket = disp
+                .abuse
+                .unproven_ratchet_open_budget
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            assert!(
+                !bucket.allow_at(std::time::Instant::now()),
+                "the strangers were not charged: the work scales with claimed \
+                 ids, which is the finding"
+            );
+        }
+
+        // And Alice still opens with the pot empty. A defence against
+        // strangers that also stops an established conversation is not a
+        // defence, it is the same denial with a different author.
+        let second = seal(&alice, &bob, b"second");
+        assert!(
+            open(&disp, &alice, &second).is_some(),
+            "a proven peer must not come out of the strangers' pot"
         );
     }
 
