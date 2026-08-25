@@ -363,6 +363,27 @@ mod write_new_tests {
         assert!(leftovers.is_empty(), "left behind: {leftovers:?}");
     }
 
+    /// A durable rename still replaces, which is what the install path needs.
+    ///
+    /// On POSIX this is `fs::rename` and the assertion is about the contract
+    /// rather than the barrier: the barrier there is the caller's parent
+    /// fsync, and on Windows it is `MOVEFILE_WRITE_THROUGH` inside the call —
+    /// which cannot be observed from here, and is why the flag is asserted
+    /// structurally in the update crate instead (report14 V14-L4).
+    #[test]
+    fn a_durable_rename_replaces_what_is_there() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let from = dir.path().join("new");
+        let to = dir.path().join("installed");
+        std::fs::write(&from, b"new binary").expect("stage");
+        std::fs::write(&to, b"old binary").expect("old");
+
+        rename_durable(&from, &to).expect("rename");
+
+        assert_eq!(std::fs::read(&to).expect("read"), b"new binary");
+        assert!(!from.exists(), "the staging name must be gone");
+    }
+
     /// Losing is what this is for: the second publish must not replace the
     /// first, which a rename would.
     #[test]
@@ -394,6 +415,54 @@ mod write_new_tests {
         write_new_owner_only(&path, &[1u8; 32]).expect("publish");
         let mode = std::fs::metadata(&path).expect("stat").permissions().mode();
         assert_eq!(mode & 0o777, 0o600, "got {:o}", mode & 0o777);
+    }
+}
+
+/// Rename `from` onto `to` with the directory entry made DURABLE.
+///
+/// `rename(2)` is atomic in the kernel and not durable until the parent
+/// directory's entry is flushed, so a caller that needs the new name to
+/// survive a power loss follows it with an fsync of the parent. Windows
+/// documents no directory fsync at all, and `std::fs::rename` there gives no
+/// barrier either — so the binary-replacement path skipped the durability
+/// check entirely on that platform and advanced its installed-state floor
+/// anyway. A power loss in that window leaves the OLD binary with a state file
+/// that says the new release is installed, and the next apply refuses to
+/// install the release that never landed (report14 V14-L4).
+///
+/// `MOVEFILE_WRITE_THROUGH` is the barrier Windows does have: the call does
+/// not return until the change is flushed to disk. On POSIX this is
+/// `fs::rename` unchanged — the caller's parent fsync is what makes it
+/// durable there, and doing both would be the same barrier twice.
+pub fn rename_durable(from: &std::path::Path, to: &std::path::Path) -> std::io::Result<()> {
+    #[cfg(not(windows))]
+    {
+        std::fs::rename(from, to)
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt as _;
+        fn wide(p: &std::path::Path) -> Vec<u16> {
+            p.as_os_str()
+                .encode_wide()
+                .chain(std::iter::once(0))
+                .collect()
+        }
+        let from_w = wide(from);
+        let to_w = wide(to);
+        // SAFETY: both buffers are NUL-terminated and outlive the call.
+        let ok = unsafe {
+            windows_sys::Win32::Storage::FileSystem::MoveFileExW(
+                from_w.as_ptr(),
+                to_w.as_ptr(),
+                windows_sys::Win32::Storage::FileSystem::MOVEFILE_REPLACE_EXISTING
+                    | windows_sys::Win32::Storage::FileSystem::MOVEFILE_WRITE_THROUGH,
+            )
+        };
+        if ok == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(())
     }
 }
 

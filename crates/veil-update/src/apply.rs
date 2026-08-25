@@ -438,7 +438,11 @@ pub fn apply_update(
     // 3a the install_path either doesn't exist (Windows
     // shuffle-out) or doesn't exist in any meaningful sense
     // (POSIX clobber semantics) — either way the rename succeeds.
-    if let Err(e) = std::fs::rename(&tmp_path, install_path) {
+    // Durable on BOTH platforms: POSIX gets its parent fsync below, Windows
+    // gets `MOVEFILE_WRITE_THROUGH` inside this call. The Windows path had
+    // neither, and advanced the installed-state floor anyway (report14
+    // V14-L4).
+    if let Err(e) = veil_util::rename_durable(&tmp_path, install_path) {
         // Best-effort cleanup of the staging file so we don't
         // leak it across retries.
         let _ = std::fs::remove_file(&tmp_path);
@@ -460,10 +464,11 @@ pub fn apply_update(
     // install_path inode survives but the dirent points back to the
     //.tmp path, leaving the user with a half-applied update.
     //
-    // POSIX: open(parent, O_RDONLY) then fsync. Windows: documented
-    // not to support directory fsync; std skips it on this platform, so
-    // there is nothing here to succeed or fail and the state below is
-    // written as before.
+    // POSIX: open(parent, O_RDONLY) then fsync. Windows has no directory
+    // fsync at all, which is why the rename above is a `MOVEFILE_WRITE_THROUGH`
+    // there — the barrier that platform does have, applied inside the call
+    // rather than after it. Doing both on POSIX would be the same barrier
+    // twice, so this half stays where it is.
     //
     // NOT best-effort any more. The failure and the state write are the two
     // halves of one decision: if the directory entry is not durable, the
@@ -599,6 +604,36 @@ fn with_tmp_suffix(path: &Path) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
+
+    /// The install step renames DURABLY, on both platforms.
+    ///
+    /// A STRUCTURAL guard, because the half that matters cannot be observed
+    /// where these tests run: on POSIX `rename_durable` is `fs::rename` and
+    /// the barrier is the parent fsync below it; on Windows it is
+    /// `MOVEFILE_WRITE_THROUGH` inside the call, and there is no directory
+    /// fsync to stand in for it. That platform had neither, and advanced its
+    /// installed-state floor anyway — so a power loss left the OLD binary with
+    /// a state file naming the new release, and the next apply refused to
+    /// install the release that never landed (report14 V14-L4).
+    ///
+    /// Still unproven ON Windows: this needs a power-fault run on a VM, which
+    /// is how this project has settled its other Windows questions.
+    #[test]
+    fn the_install_rename_is_the_durable_one() {
+        let src = include_str!("apply.rs");
+        let at = src
+            .find("// 2. tmp_path → install_path")
+            .expect("the install step moved — this guard no longer watches it");
+        let step = &src[at..at + 2000];
+        assert!(
+            step.contains("veil_util::rename_durable("),
+            "the install step must rename through the durable helper"
+        );
+        assert!(
+            !step.contains("std::fs::rename(&tmp_path, install_path)"),
+            "a bare rename gives Windows no barrier at all"
+        );
+    }
     use super::super::installed_version::EmbeddedReleaseGuard;
     use super::super::manifest::{decode_manifest, sign_manifest};
     use super::*;
