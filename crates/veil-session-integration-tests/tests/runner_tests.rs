@@ -5297,7 +5297,6 @@ async fn rx_stall_fires_proactive_trigger_before_idle_timeout() {
 ///   cargo test -p veil-session-integration-tests --test runner_tests \
 ///       keepalive_probe_timeout_fires_trigger_when_no_ack \
 ///       -- --ignored --test-threads=1
-#[ignore = "timing-sensitive: passes single-threaded, flaky under --test-threads=2"]
 #[tokio::test(flavor = "current_thread")]
 async fn keepalive_probe_timeout_fires_trigger_when_no_ack() {
     use veil_session::SessionTxRegistry;
@@ -5404,10 +5403,21 @@ async fn keepalive_probe_timeout_fires_trigger_when_no_ack() {
     handle.abort();
     let _ = handle.await;
 
-    assert_eq!(
-        controller.swap_attempts_in_window(&NodeId::from(peer_id)),
-        1,
-        "keepalive-probe timeout should have fired exactly one trigger"
+    // At LEAST one, and not a storm. "Exactly one" was arithmetic that never
+    // held: keepalive is 50 ms and the probe timeout 100 ms, so a 300 ms run
+    // fits more than one cycle by construction — the test failed every time,
+    // in parallel AND in the single-threaded mode its own note prescribed,
+    // which is what an `#[ignore]` reading "timing-sensitive" was hiding.
+    //
+    // The bounds come from the timings rather than from a guess: one cycle is
+    // 150 ms from probe to trigger, so 300 ms cannot legitimately produce more
+    // than three. Below one the probe path never fired; above three it is
+    // firing on every tick, and both are what this test is for.
+    let attempts = controller.swap_attempts_in_window(&NodeId::from(peer_id));
+    assert!(
+        (1..=3).contains(&attempts),
+        "keepalive-probe timeout fired {attempts} triggers in 300 ms; one \
+         probe cycle is 150 ms, so 1..=3 is the whole legitimate range"
     );
 }
 
