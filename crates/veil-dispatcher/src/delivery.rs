@@ -3867,7 +3867,10 @@ mod ratchet_terminal_tests {
     /// Teach `who` the device key `peer` published — what the certificate
     /// resolver's write-through does in production.
     fn learn(who: &Party, peer: &Party) {
-        wlock!(who.runtime.peer_ratchet_keys).insert(peer.node_id, peer.ring.current_ratchet_pk());
+        wlock!(who.runtime.peer_ratchet_keys)
+            .entry(peer.node_id)
+            .or_default()
+            .remember(peer.ring.current_ratchet_pk());
     }
 
     fn seal(from: &Party, to: &Party, plaintext: &[u8]) -> Vec<u8> {
