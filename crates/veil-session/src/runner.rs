@@ -303,12 +303,38 @@ fn enqueue_outbox_frame(
 ///
 /// A channel rather than a shared lock, because the alternative is taking one
 /// per DATAGRAM on a media path to serve an event that happens once an hour.
+///
+/// A WATCH, because the receiver only ever needs the LATEST key. This was a
+/// one-slot `mpsc` whose producer dropped the new rotation when the slot was
+/// full, on the reasoning that the pending one superseded it. It is the other
+/// way round: the pending one is stale, and the dropped one is what the
+/// sender and the peer had already moved to — so the receiver applied a key
+/// nobody was sending under. The grace window cannot cover that either, since
+/// it retains RETIRED keys and the one missing is the new one. The lane stayed
+/// deaf until the next rotation.
 pub(crate) type RealtimeRekey = ([u8; 32], [u8; 32]);
+
+/// Apply the newest rotation the watch holds, if it holds one.
+///
+/// Named and separate so it can be tested: the receiver itself only runs on a
+/// live QUIC connection, and the property worth pinning — that a rotation
+/// arriving before the previous one is applied WINS rather than being lost —
+/// is about which key ends up in the cipher, not about datagram plumbing.
+fn apply_pending_rekey(
+    rx: &mut crate::realtime_datagram::RealtimeDatagramRx,
+    rekeys: &mut tokio::sync::watch::Receiver<Option<RealtimeRekey>>,
+    now: std::time::Instant,
+) {
+    let latest = *rekeys.borrow_and_update();
+    if let Some((rx_key, session_id)) = latest {
+        rx.rekey(&rx_key, &session_id, now);
+    }
+}
 
 fn spawn_realtime_receiver(
     handle: veil_transport::QuicDatagramHandle,
     mut rx: crate::realtime_datagram::RealtimeDatagramRx,
-    mut rekeys: tokio::sync::mpsc::Receiver<RealtimeRekey>,
+    mut rekeys: tokio::sync::watch::Receiver<Option<RealtimeRekey>>,
     context: RealtimeReceiverContext,
 ) -> RealtimeReceiverTask {
     RealtimeReceiverTask(tokio::spawn(async move {
@@ -328,8 +354,11 @@ fn spawn_realtime_receiver(
                 // the moment it told us to, and one opened under the old key
                 // afterwards is a drop for nothing.
                 biased;
-                Some((rx_key, session_id)) = rekeys.recv() => {
-                    rx.rekey(&rx_key, &session_id, std::time::Instant::now());
+                Ok(()) = rekeys.changed() => {
+                    // `changed` is cancel-safe, so losing this branch of the
+                    // select never loses the rotation: the value stays in the
+                    // watch until it is observed.
+                    apply_pending_rekey(&mut rx, &mut rekeys, std::time::Instant::now());
                     continue;
                 }
                 received = handle.recv() => received,
@@ -461,7 +490,7 @@ pub struct CryptoState {
 /// exists to avoid.
 pub(crate) struct RealtimeRekeyTargets<'a> {
     lane: Option<&'a mut RealtimeDatagramLane>,
-    receiver: Option<&'a tokio::sync::mpsc::Sender<RealtimeRekey>>,
+    receiver: Option<&'a tokio::sync::watch::Sender<Option<RealtimeRekey>>>,
 }
 
 /// A negotiated realtime DATAGRAM lane, with what the peer agreed to do with
@@ -1197,10 +1226,11 @@ impl SessionRunner {
             {
                 lane.tx.rekey(&new_keys.tx_key, &new_keys.session_id);
                 if let Some(tx) = realtime.receiver {
-                    // Full means a rotation is already queued and this one
-                    // supersedes nothing the receiver has not yet applied —
-                    // dropping it is safer than blocking the session loop.
-                    let _ = tx.try_send((new_keys.rx_key, new_keys.session_id));
+                    // Overwrites any rotation the receiver has not applied
+                    // yet, which is the point: that one is stale the moment
+                    // this one exists. Never blocks the session loop, and
+                    // never drops the key the peer is now sending under.
+                    let _ = tx.send(Some((new_keys.rx_key, new_keys.session_id)));
                 }
             }
             rekey.record_rekey_complete(tokio::time::Instant::now());
@@ -2447,10 +2477,11 @@ impl SessionRunner {
             {
                 lane.tx.rekey(&new_keys.tx_key, &new_keys.session_id);
                 if let Some(tx) = realtime.receiver {
-                    // Full means a rotation is already queued and this one
-                    // supersedes nothing the receiver has not yet applied —
-                    // dropping it is safer than blocking the session loop.
-                    let _ = tx.try_send((new_keys.rx_key, new_keys.session_id));
+                    // Overwrites any rotation the receiver has not applied
+                    // yet, which is the point: that one is stale the moment
+                    // this one exists. Never blocks the session loop, and
+                    // never drops the key the peer is now sending under.
+                    let _ = tx.send(Some((new_keys.rx_key, new_keys.session_id)));
                 }
             }
             rekey.record_rekey_complete(tokio::time::Instant::now());
@@ -3252,7 +3283,7 @@ impl SessionRunner {
         let mut realtime_receiver_task = None;
         // `None` when the peer did not advertise lane rotation: it keeps the
         // static key, so telling our receiver to move would strand it.
-        let mut realtime_rekey_tx: Option<tokio::sync::mpsc::Sender<RealtimeRekey>> = None;
+        let mut realtime_rekey_tx: Option<tokio::sync::watch::Sender<Option<RealtimeRekey>>> = None;
         let mut realtime_lane = match (self.quic_datagrams.take(), self.raw_session_keys.as_ref()) {
             (Some(offer), Some((raw_tx_key, raw_rx_key, session_id))) => offer
                 .handle
@@ -3262,10 +3293,11 @@ impl SessionRunner {
                 .map(|max_datagram_size| {
                     let rx =
                         crate::realtime_datagram::RealtimeDatagramRx::new(raw_rx_key, session_id);
-                    // Room for one pending rekey: a second before the first
-                    // is applied would mean two rotations inside one receive,
-                    // which the grace window already covers.
-                    let (rekey_tx, rekey_rx) = tokio::sync::mpsc::channel(1);
+                    // The latest rotation, not a queue of them: a second
+                    // before the first is applied overwrites it, which is what
+                    // the receiver wants — the older one is already superseded
+                    // on the sending side and at the peer.
+                    let (rekey_tx, rekey_rx) = tokio::sync::watch::channel(None);
                     realtime_rekey_tx = offer.peer_rotates.then_some(rekey_tx);
                     realtime_receiver_task = Some(spawn_realtime_receiver(
                         offer.handle.clone(),
@@ -5454,5 +5486,102 @@ mod reeval_teardown_tests {
         );
         set_mobile_outbound_batch_window_ms(0);
         set_mobile_low_battery_threshold_pct(None);
+    }
+}
+
+#[cfg(test)]
+mod realtime_rekey_delivery_tests {
+    use super::*;
+    use crate::realtime_datagram::{RealtimeDatagramRx, RealtimeDatagramTx};
+    use std::time::Instant;
+
+    const S0: [u8; 32] = [0x01; 32];
+    const K0: [u8; 32] = [0x02; 32];
+    const SA: [u8; 32] = [0x0A; 32];
+    const KA: [u8; 32] = [0xAA; 32];
+    const SB: [u8; 32] = [0x0B; 32];
+    const KB: [u8; 32] = [0xBB; 32];
+
+    fn opened_by(rx: &mut RealtimeDatagramRx, sealed: &[Vec<u8>]) -> Option<Vec<u8>> {
+        let now = Instant::now();
+        let mut out = None;
+        for datagram in sealed {
+            if let Ok(Some(frame)) = rx.decode_datagram(datagram, now) {
+                out = Some(frame);
+            }
+        }
+        out
+    }
+
+    /// Two rotations before the receiver applies either: the LATEST wins.
+    ///
+    /// The receiver runs on a live QUIC connection, so what is driven here is
+    /// the step it delegates to — which key ends up in the cipher — with the
+    /// real ciphers on both sides.
+    #[test]
+    fn a_rotation_landing_before_the_previous_is_applied_wins() {
+        let mut rx = RealtimeDatagramRx::new(&K0, &S0);
+        let (rekeys_tx, mut rekeys_rx) = tokio::sync::watch::channel(None);
+
+        // Both land while the receiver is busy with a datagram.
+        rekeys_tx.send(Some((KA, SA))).unwrap();
+        rekeys_tx.send(Some((KB, SB))).unwrap();
+
+        apply_pending_rekey(&mut rx, &mut rekeys_rx, Instant::now());
+
+        // The peer sends under the SECOND rotation, because that is the one
+        // our own sending half moved to as well.
+        let mut peer = RealtimeDatagramTx::new(&KB, &SB);
+        let sealed = peer.encode_frame(b"after two rotations", 256).unwrap();
+
+        assert_eq!(
+            opened_by(&mut rx, &sealed).as_deref(),
+            Some(&b"after two rotations"[..]),
+            "the receiver is on a key the peer has already moved off, so every \
+             datagram on the media lane is a drop until the next rotation"
+        );
+    }
+
+    /// The comparison that gives the assertion above its meaning.
+    ///
+    /// The one-slot queue this replaced refused the second rotation and the
+    /// producer discarded it, so the receiver applied the FIRST. This is what
+    /// that costs, with the same two rotations and the same ciphers.
+    #[test]
+    fn applying_the_older_rotation_leaves_the_lane_deaf() {
+        let mut rx = RealtimeDatagramRx::new(&K0, &S0);
+        rx.rekey(&KA, &SA, Instant::now());
+
+        let mut peer = RealtimeDatagramTx::new(&KB, &SB);
+        let sealed = peer.encode_frame(b"after two rotations", 256).unwrap();
+
+        assert!(
+            opened_by(&mut rx, &sealed).is_none(),
+            "if the older rotation could open the newer traffic there would be \
+             nothing to fix, and the test above would prove nothing"
+        );
+
+        // Vacuity guard: the fixture is capable of opening SOMETHING, so the
+        // negative above is about the key and not about a broken encoder.
+        let mut right = RealtimeDatagramRx::new(&K0, &S0);
+        right.rekey(&KB, &SB, Instant::now());
+        assert_eq!(
+            opened_by(&mut right, &sealed).as_deref(),
+            Some(&b"after two rotations"[..]),
+        );
+    }
+
+    /// The receiver is told through a watch, not a queue — by TYPE.
+    ///
+    /// A one-slot queue is what dropped the newer rotation. Pinned with the
+    /// compiler rather than a source search: a text guard living in this file
+    /// would contain the very literal it looks for.
+    #[test]
+    fn the_receiver_is_told_through_a_watch() {
+        let (tx, _rx) = tokio::sync::watch::channel::<Option<RealtimeRekey>>(None);
+        let _targets = RealtimeRekeyTargets {
+            lane: None,
+            receiver: Some(&tx),
+        };
     }
 }
