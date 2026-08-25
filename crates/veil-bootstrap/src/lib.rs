@@ -19,7 +19,7 @@ pub mod signed_invite;
 pub use cache::{
     DiscoveredPeer, DiscoveredPeerCache, MAX_DISCOVERED_PEERS, load_or_generate_cache_hmac_key,
 };
-pub use dns::discover_seeds_dns;
+pub use dns::{DnsBootstrapPolicy, discover_seeds_dns, discover_seeds_dns_with_policy};
 pub use encrypted_invite::{
     ENCRYPTED_INVITE_SCHEME, EncryptedInviteError, MAX_ENCRYPTED_INVITE_BYTES, decrypt_invite,
     encrypt_invite,

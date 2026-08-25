@@ -1407,6 +1407,12 @@ mod mobile_tests {
 /// were the dominant ogate-tunnel bottleneck (not session-flapping, not CPU).
 /// Operators on bandwidth-constrained links can lower this through
 /// `[abuse] rate_limit_fps = N` in node.toml.
+/// Keeps a boolean option defaulting to ON when the key is absent, so an
+/// existing config file behaves exactly as it did before the key existed.
+fn default_bootstrap_dns_allow_system() -> bool {
+    true
+}
+
 fn default_rate_limit_fps() -> f64 {
     200_000.0
 }
@@ -3673,6 +3679,27 @@ pub struct GlobalConfig {
     /// Default: `veil.example`. Set to a real domain with `_veil._bootstrap.<domain>` TXT records.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bootstrap_dns_domain: Option<String>,
+    /// Base64 public keys this node will accept from DNS bootstrap discovery.
+    ///
+    /// A TXT record is not signed: DoT and DoH authenticate the RESOLVER, and
+    /// the system-DNS last resort authenticates nothing — so a local resolver
+    /// or an on-path middlebox chooses the seeds a fresh node first talks to.
+    /// The handshake still proves each peer is who it claims, so this is not
+    /// impersonation; it is eclipse, fingerprinting and denial
+    /// (report14 V14-M9).
+    ///
+    /// Empty (the default) keeps today's behaviour. With any entry, a
+    /// discovered peer whose key is not listed is dropped — from every stage,
+    /// because no stage authenticates the record.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub bootstrap_dns_pinned_keys: Vec<String>,
+    /// Whether the unauthenticated system-DNS stage may run.
+    ///
+    /// `true` (the default) keeps today's behaviour: if DoT and DoH are both
+    /// blocked, discovery falls back to whatever the local resolver says.
+    /// `false` is secure-only — no seeds rather than seeds a middlebox chose.
+    #[serde(default = "default_bootstrap_dns_allow_system")]
+    pub bootstrap_dns_allow_system: bool,
     /// file path for the discovered-peer cache. After
     /// every successful OVL1 handshake, the runtime upserts the
     /// peer's `(transport, public_key, nonce, algo)` here. At cold
@@ -3938,6 +3965,8 @@ impl Default for GlobalConfig {
             log_level: LogLevel::default(),
             log_format: LogFormat::default(),
             bootstrap_dns_domain: None,
+            bootstrap_dns_pinned_keys: Vec::new(),
+            bootstrap_dns_allow_system: true,
             allow_identity_fallback: false,
             identity_dir: None,
             discovered_peers_cache_path: None,

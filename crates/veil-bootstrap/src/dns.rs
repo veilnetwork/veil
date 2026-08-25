@@ -71,7 +71,65 @@ const PER_UPSTREAM_DNS_TIMEOUT: Duration = Duration::from_millis(
 /// Returns an empty vec on any failure — bootstrap then falls through
 /// to builtin seeds.  This is the **production** entry-point used by
 /// `veilcore::node::bootstrap::*`.
+/// What an operator will accept from DNS bootstrap discovery.
+///
+/// A TXT record is not signed. DoT and DoH authenticate the RESOLVER, not the
+/// record, and the system-DNS last resort authenticates nothing at all — so a
+/// local resolver or an on-path middlebox chooses the seeds a fresh node first
+/// talks to. The handshake still proves each peer is who it claims, so this is
+/// not impersonation; it is eclipse, fingerprinting and denial
+/// (report14 V14-M9).
+///
+/// What an operator can do about it is say in advance what they expect, and
+/// say whether the unauthenticated stage may run at all. Both default to
+/// today's behaviour: no pins, last resort allowed.
+#[derive(Debug, Clone)]
+pub struct DnsBootstrapPolicy {
+    /// Base64 public keys the operator expects. EMPTY means no pinning; with
+    /// any entry, a discovered peer whose key is not among them is dropped —
+    /// from EVERY stage, because no stage authenticates the record.
+    pub pinned_public_keys: Vec<String>,
+    /// Whether the system-DNS stage may run. `false` means secure-only: if DoT
+    /// and DoH are both blocked, discovery returns nothing rather than
+    /// whatever the local resolver chooses.
+    pub allow_unsigned_system_dns: bool,
+}
+
+impl Default for DnsBootstrapPolicy {
+    fn default() -> Self {
+        Self {
+            pinned_public_keys: Vec::new(),
+            allow_unsigned_system_dns: true,
+        }
+    }
+}
+
+impl DnsBootstrapPolicy {
+    /// Drop anything the operator did not ask for. No pins ⇒ unchanged.
+    fn admit(&self, seeds: Vec<BootstrapPeer>) -> Vec<BootstrapPeer> {
+        if self.pinned_public_keys.is_empty() {
+            return seeds;
+        }
+        seeds
+            .into_iter()
+            .filter(|p| self.pinned_public_keys.iter().any(|k| k == &p.public_key))
+            .collect()
+    }
+}
+
+/// [`discover_seeds_dns`] under an explicit policy.
+pub async fn discover_seeds_dns_with_policy(
+    domain: &str,
+    policy: &DnsBootstrapPolicy,
+) -> Vec<BootstrapPeer> {
+    discover_seeds_dns_inner(domain, policy).await
+}
+
 pub async fn discover_seeds_dns(domain: &str) -> Vec<BootstrapPeer> {
+    discover_seeds_dns_inner(domain, &DnsBootstrapPolicy::default()).await
+}
+
+async fn discover_seeds_dns_inner(domain: &str, policy: &DnsBootstrapPolicy) -> Vec<BootstrapPeer> {
     // Stage 1: DoT to pinned upstreams.  TLS-on-853 is the most
     // censor-resistant: encrypted, port-distinct from vanilla DNS-on-53,
     // and pinned-IP defeats DNS-spoofing of the upstream hostname.
@@ -82,9 +140,9 @@ pub async fn discover_seeds_dns(domain: &str) -> Vec<BootstrapPeer> {
     .await
     .ok()
     .flatten()
-        && !seeds.is_empty()
+        && !policy.admit(seeds.clone()).is_empty()
     {
-        return seeds;
+        return policy.admit(seeds);
     }
 
     // Stage 2: DoH if DoT was blocked.  HTTPS-on-443 indistinguishable
@@ -97,9 +155,9 @@ pub async fn discover_seeds_dns(domain: &str) -> Vec<BootstrapPeer> {
     .await
     .ok()
     .flatten()
-        && !seeds.is_empty()
+        && !policy.admit(seeds.clone()).is_empty()
     {
-        return seeds;
+        return policy.admit(seeds);
     }
 
     // Stage 3: system DNS — censor-readable, last resort.  Returns
@@ -117,9 +175,16 @@ pub async fn discover_seeds_dns(domain: &str) -> Vec<BootstrapPeer> {
     // one source can contribute.  A node with no other contact can still
     // have its first ones chosen for it, which is why stages 1 and 2 are
     // given a budget each upstream can actually use.
-    tokio::time::timeout(SYSTEM_DNS_TIMEOUT, discover_seeds_dns_system(domain))
-        .await
-        .unwrap_or_default()
+    if !policy.allow_unsigned_system_dns {
+        // Secure-only: an operator who says so would rather have no seeds than
+        // seeds a middlebox chose.
+        return Vec::new();
+    }
+    policy.admit(
+        tokio::time::timeout(SYSTEM_DNS_TIMEOUT, discover_seeds_dns_system(domain))
+            .await
+            .unwrap_or_default(),
+    )
 }
 
 /// DoT- + DoH-only seed discovery (no system-DNS fallback).  Used by
@@ -300,6 +365,44 @@ fn parse_seed_txt(line: &str) -> Option<BootstrapPeer> {
 
 #[cfg(test)]
 mod tests {
+
+    fn peer(pk: &str) -> BootstrapPeer {
+        BootstrapPeer {
+            transport: "tcp://seed.example:9000".into(),
+            public_key: pk.into(),
+            nonce: String::new(),
+            algo: veil_types::SignatureAlgorithm::Ed25519,
+            tls_cert: None,
+            tls_ca_cert: None,
+        }
+    }
+
+    /// A TXT record is not signed, on any of the three stages: DoT and DoH
+    /// authenticate the RESOLVER and the system-DNS last resort authenticates
+    /// nothing. An operator who knows which seeds they expect can say so, and
+    /// then a resolver's choices are refused (report14 V14-M9).
+    #[test]
+    fn a_pinned_operator_takes_only_the_seeds_they_named() {
+        let policy = DnsBootstrapPolicy {
+            pinned_public_keys: vec!["theirs".into()],
+            ..Default::default()
+        };
+        let admitted = policy.admit(vec![peer("theirs"), peer("somebody-elses")]);
+        assert_eq!(admitted.len(), 1);
+        assert_eq!(admitted[0].public_key, "theirs");
+    }
+
+    /// And the default keeps today's behaviour exactly: no pins, everything
+    /// through, last resort allowed. A gate that changed what every existing
+    /// config does would be a different kind of failure.
+    #[test]
+    fn the_default_policy_changes_nothing() {
+        let policy = DnsBootstrapPolicy::default();
+        assert!(policy.pinned_public_keys.is_empty());
+        assert!(policy.allow_unsigned_system_dns);
+        let seeds = vec![peer("a"), peer("b")];
+        assert_eq!(policy.admit(seeds).len(), 2);
+    }
     use super::*;
 
     /// Every encrypted upstream must be reachable inside the stage's budget.
