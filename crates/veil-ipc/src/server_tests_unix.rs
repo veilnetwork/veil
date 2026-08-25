@@ -303,12 +303,22 @@ async fn second_bind_same_endpoint_rejected() {
 
 // ── 26.5: E2E: client B sends → client A (same node) gets APP_DELIVER ─
 
-// Audit batch 2026-05-24: this test is a pre-existing flake on
-// sandboxed Unix-socket timing (hangs in CI / WSL / nested containers,
-// passes locally on bare metal).  Documented in audit batch 2026-05-23
-// (commit 884e32c) as "pre-existing flakes that hang on master too".
-// Run explicitly with `cargo test -p veil-ipc -- --ignored` when
-// validating IPC changes on Linux bare metal.
+// Audit batch 2026-05-24: documented as a pre-existing flake on sandboxed
+// Unix-socket TIMING (commit 884e32c, "pre-existing flakes that hang on
+// master too"). Run explicitly with `cargo test -p veil-ipc -- --ignored`
+// when validating IPC changes on Linux bare metal.
+//
+// Measured 2026-08-25 on macOS, and timing is not what it looks like: no
+// frame arrives AT ALL, not a late one. Sockets themselves are fine — the
+// hello roundtrip, the wrong-token rejection and the stream open/data/close
+// tests in this same file pass on the same run. What is silent is
+// specifically the local `AppIpcSend` path: instrumented with an 8-second
+// budget, `slow_reader_does_not_block_server` received zero of its twenty
+// `AppSendOk` replies rather than slow ones.
+//
+// Whoever has Linux bare metal: that is the comparison worth making. "Slow
+// under sandboxing" and "answers nothing on this platform" call for
+// different fixes, and the label was costing the reader the difference.
 #[ignore = "flaky on sandboxed Unix sockets — run with --ignored"]
 #[tokio::test]
 async fn e2e_local_send_delivers_to_receiver() {
