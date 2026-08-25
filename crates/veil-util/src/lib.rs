@@ -269,6 +269,37 @@ pub fn atomic_write_owner_only(path: &std::path::Path, bytes: &[u8]) -> std::io:
     atomic_write_inner(path, bytes, true)
 }
 
+/// Publish `bytes` at `path` ONLY if nothing is there yet.
+///
+/// `O_EXCL` rather than [`atomic_write`]'s temp-and-rename, and the difference
+/// is the whole point: a rename ALWAYS wins, so two processes that both create
+/// a fresh secret on first start both believe they published, while the disk
+/// holds one of them. The loser then runs on a key nothing on disk backs, and
+/// everything it sealed under that key is un-openable at its next start —
+/// silently.
+///
+/// Here the race has a winner and a LOSER: `AlreadyExists` is the signal that
+/// somebody else published first, and the caller must adopt what is on disk
+/// rather than keep what it generated.
+///
+/// Publishing is TWO steps — the claim on the name, then the bytes — so a
+/// reader arriving between them sees a file of length zero. That is not
+/// corruption, it is a publish in progress, and an adopting caller has to
+/// tolerate it briefly (see the retry in `anonymity_x25519::load_after_race`).
+///
+/// Mode `0o600` and `O_NOFOLLOW` on Unix, exactly as the staging file of
+/// [`atomic_write`]; on Windows the parent directory's ACL applies, which for
+/// a BEARER SECRET is the same caveat [`atomic_write`] documents.
+pub fn write_new_owner_only(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write as _;
+    if let Some(parent) = path.parent() {
+        create_dir_all_with_eacces_retry(parent)?;
+    }
+    let mut f = open_owner_only_create_new(path)?;
+    f.write_all(bytes)?;
+    f.sync_all()
+}
+
 fn atomic_write_inner(
     path: &std::path::Path,
     bytes: &[u8],
