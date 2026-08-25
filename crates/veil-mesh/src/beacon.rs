@@ -846,6 +846,43 @@ impl BeaconReceiver {
     /// Returns `false` if the beacon was silently dropped (wrong realm, rate
     /// limit exceeded, or neighbor table full). Returns `true` on acceptance.
     pub fn handle_beacon(&mut self, frame: &MeshFrame, sender_addr: SocketAddr) -> bool {
+        self.handle_beacon_from(frame, sender_addr, crate::udp::FrameOrigin::Sealed)
+    }
+
+    /// [`handle_beacon`](Self::handle_beacon), told whether the datagram
+    /// arrived sealed under the realm key.
+    ///
+    /// A realm with a key that hears a beacon in the CLEAR is hearing somebody
+    /// who does not hold that key. The beacon's signature does not identify
+    /// them: it is made with the key the beacon itself carries, so anyone can
+    /// produce a valid one — which is why `require_signed`, whose own note
+    /// says an on-link attacker "must not be able to register/redirect
+    /// neighbor links or inject IS_GATEWAY entries without a key", did not
+    /// actually achieve either. Only the seal says "from inside the realm"
+    /// (report12 V-M2).
+    ///
+    /// Such a beacon is still decoded, logged and counted — that is what the
+    /// plaintext fallback in `decode_datagram` exists for, and cross-config
+    /// peers stay visible. What it no longer does is change this node's
+    /// topology.
+    pub fn handle_beacon_from(
+        &mut self,
+        frame: &MeshFrame,
+        sender_addr: SocketAddr,
+        origin: crate::udp::FrameOrigin,
+    ) -> bool {
+        // Refused HERE, before any state is touched. Placed after the dedup
+        // window it would let an outsider spend the victim's dedup slot by
+        // claiming its node id, suppressing the real, sealed beacon for the
+        // length of the window — a smaller hole than the one being closed, but
+        // one this fix would have opened.
+        if self.obfs.is_some() && origin == crate::udp::FrameOrigin::Plaintext {
+            log::debug!(
+                "mesh.beacon: unsealed beacon from {sender_addr} in a keyed \
+                 realm — it registers no link and no gateway"
+            );
+            return false;
+        }
         if frame.realm_id != self.realm_id {
             return false;
         }
@@ -1069,6 +1106,98 @@ mod tests {
         receiver.handle_beacon(&frame, "127.0.0.1:5555".parse().unwrap());
         assert_eq!(table.len(), 1);
         assert!(table.link_to(&[9u8; 32]).is_some());
+    }
+
+    /// report12 V-M2: with a realm key configured, a beacon that arrives in
+    /// the CLEAR is from somebody who does not hold that key. It used to
+    /// register a neighbour link and, with IS_GATEWAY set, an autodial entry —
+    /// on a LAN, that is a stranger inserting itself into the topology of a
+    /// realm it is not in.
+    ///
+    /// `require_signed` was believed to stop exactly this; its own note says
+    /// an on-link attacker "must not be able to register/redirect neighbor
+    /// links or inject IS_GATEWAY entries without a key". It could not: the
+    /// signature is made with the key the beacon carries, so an attacker signs
+    /// its own beacon and passes. Only the seal answers the question.
+    #[test]
+    fn an_unsealed_beacon_in_a_keyed_realm_registers_nothing() {
+        use crate::neighbor::NeighborTable;
+        use crate::udp::FrameOrigin;
+
+        let table = NeighborTable::new();
+        let std_sock = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let mut receiver = BeaconReceiver::new(
+            RealmId([1u8; 16]),
+            [0xA7u8; 32],
+            table.clone(),
+            Arc::new(std_sock),
+            Some(Arc::new(veil_udp_obfs::ObfsKey::derive(
+                b"realm-psk",
+                &[0xA7u8; 32],
+            ))), // the realm HAS a key
+        )
+        .with_require_signed(false); // the signature is not what is under test
+        let frame = MeshFrame::new(
+            RealmId([1u8; 16]),
+            [9u8; 32],
+            BROADCAST_NODE_ID,
+            1,
+            MeshBeaconPayload::new_basic([9u8; 32], RealmId([1u8; 16])).encode(),
+        );
+        let addr = "127.0.0.1:5555".parse().unwrap();
+
+        assert!(
+            !receiver.handle_beacon_from(&frame, addr, FrameOrigin::Plaintext),
+            "an unsealed beacon must not register a link"
+        );
+        assert_eq!(table.len(), 0, "no neighbour from outside the realm");
+
+        // A sealed beacon is an ordinary member and still works — otherwise
+        // this would be a fix that broke the realm it protects. A different
+        // node id, because the per-source dedup window would swallow a second
+        // beacon from the same one whatever this change did.
+        let member = MeshFrame::new(
+            RealmId([1u8; 16]),
+            [10u8; 32],
+            BROADCAST_NODE_ID,
+            1,
+            MeshBeaconPayload::new_basic([10u8; 32], RealmId([1u8; 16])).encode(),
+        );
+        assert!(receiver.handle_beacon_from(&member, addr, FrameOrigin::Sealed));
+        assert_eq!(table.len(), 1);
+        assert!(table.link_to(&[10u8; 32]).is_some());
+    }
+
+    /// A realm with NO key has no inside to be outside of: the plaintext path
+    /// is the only path, and it must keep working exactly as it did.
+    #[test]
+    fn a_keyless_realm_still_takes_a_plaintext_beacon() {
+        use crate::neighbor::NeighborTable;
+        use crate::udp::FrameOrigin;
+
+        let table = NeighborTable::new();
+        let std_sock = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let mut receiver = BeaconReceiver::new(
+            RealmId([1u8; 16]),
+            [0xA7u8; 32],
+            table.clone(),
+            Arc::new(std_sock),
+            None, // no realm key
+        )
+        .with_require_signed(false);
+        let frame = MeshFrame::new(
+            RealmId([1u8; 16]),
+            [9u8; 32],
+            BROADCAST_NODE_ID,
+            1,
+            MeshBeaconPayload::new_basic([9u8; 32], RealmId([1u8; 16])).encode(),
+        );
+        assert!(receiver.handle_beacon_from(
+            &frame,
+            "127.0.0.1:5555".parse().unwrap(),
+            FrameOrigin::Plaintext,
+        ));
+        assert_eq!(table.len(), 1);
     }
 
     /// SECURITY (audit 2026-05-29, A5 regression): in require-signed
