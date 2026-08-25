@@ -90,24 +90,75 @@ pub fn load(veil_dir: &Path) -> std::io::Result<Option<x25519_dalek::StaticSecre
 /// supported arrangement — this removes the silent divergence when it is not
 /// the arrangement in force.
 pub fn load_or_create(veil_dir: &Path) -> std::io::Result<x25519_dalek::StaticSecret> {
-    if let Some(sk) = load(veil_dir)? {
-        return Ok(sk);
+    match load(veil_dir) {
+        Ok(Some(sk)) => return Ok(sk),
+        // Genuinely absent: ours to create, below.
+        Ok(None) => {}
+        // Present but not whole. Publishing is TWO steps — an `O_EXCL` claim
+        // on the name, then the 32 bytes — and a start that arrives between
+        // them sees a file of length zero. That is not a corrupt key, it is a
+        // key that has not finished being written, and the first read is where
+        // a loser meets it just as often as the create does.
+        Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
+            return load_after_race(veil_dir);
+        }
+        Err(e) => return Err(e),
     }
     let sk = x25519_dalek::StaticSecret::random_from_rng(rand_core::OsRng);
     match save_new(veil_dir, &sk) {
         Ok(()) => Ok(sk),
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-            // The other process won. Its key is the one every future start of
+            // The other start won. Its key is the one every future start of
             // this directory will read, so it is the one to use now.
-            load(veil_dir)?.ok_or_else(|| {
-                std::io::Error::new(
-                    std::io::ErrorKind::NotFound,
-                    "anonymity X25519 sk vanished between create and read",
-                )
-            })
+            //
+            // But winning is TWO steps — `O_EXCL` claims the name, and the 32
+            // bytes land after it — and a loser that reads between them sees a
+            // file of length zero. That is not a corrupt key and must not be
+            // reported as one: it is a key that has not finished being written.
+            // So wait for it, briefly and boundedly.
+            //
+            // Bounded rather than forever because a winner can die between the
+            // two steps and leave an empty file nobody will ever fill; an error
+            // after the budget is the honest answer there, and the operator
+            // gets a message that names what to delete.
+            load_after_race(veil_dir)
         }
         Err(e) => Err(e),
     }
+}
+
+/// Read the winner's key, allowing for the gap between its `O_EXCL` create and
+/// its write.
+///
+/// The wait is short and the budget small: the two steps are one `create` and
+/// one 32-byte `write` with no I/O in between, so a winner that is alive
+/// finishes in microseconds. Anything past the budget is a winner that died
+/// mid-publish, and the caller is told so in words that name the file.
+fn load_after_race(veil_dir: &Path) -> std::io::Result<x25519_dalek::StaticSecret> {
+    const ATTEMPTS: u32 = 50;
+    const PAUSE: std::time::Duration = std::time::Duration::from_millis(2);
+    let mut last: Option<std::io::Error> = None;
+    for attempt in 0..ATTEMPTS {
+        match load(veil_dir) {
+            Ok(Some(sk)) => return Ok(sk),
+            // Present but not yet whole, or gone again: both are "not settled".
+            Ok(None) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::InvalidData => last = Some(e),
+            Err(e) => return Err(e),
+        }
+        if attempt + 1 < ATTEMPTS {
+            std::thread::sleep(PAUSE);
+        }
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::TimedOut,
+        format!(
+            "another start claimed {} and never finished writing it ({}); \
+             remove that file to let this node publish its own key",
+            key_path(veil_dir).display(),
+            last.map_or_else(|| "still absent".to_string(), |e| e.to_string()),
+        ),
+    ))
 }
 
 /// Publish the key only if the file does not exist yet.
@@ -245,6 +296,58 @@ mod tests {
     /// their own key while only one was on disk, and everything the loser
     /// sealed became un-openable at its next start. Nothing said so; the only
     /// stated defence was that operators run one daemon per directory.
+    /// The `O_EXCL` claim and the 32-byte write are TWO steps, and a loser that
+    /// reads between them sees a file of length zero. That is not a corrupt key
+    /// — it is one that has not finished being written — and reporting it as
+    /// corrupt is what `two_racing_starts_agree_on_one_key` caught under the
+    /// contention of a full workspace run, having passed on its own every time.
+    #[test]
+    fn a_claim_without_its_bytes_yet_is_waited_for_not_rejected() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().to_path_buf();
+
+        // Exactly what the winner leaves behind between its two steps.
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(key_path(&dir), b"").unwrap();
+
+        let winner = {
+            let dir = dir.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                let sk = x25519_dalek::StaticSecret::random_from_rng(rand_core::OsRng);
+                std::fs::write(key_path(&dir), sk.to_bytes()).unwrap();
+                sk.to_bytes()
+            })
+        };
+
+        let seen = load_or_create(&dir).expect("an unfinished claim must be waited for");
+        assert_eq!(
+            seen.to_bytes(),
+            winner.join().unwrap(),
+            "the key read must be the winner's, not one of our own"
+        );
+    }
+
+    /// ...but not forever. A winner that died mid-publish leaves a file nobody
+    /// will ever fill, and a node that waits on it never starts.
+    #[test]
+    fn a_claim_nobody_finishes_gives_up_and_says_which_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().to_path_buf();
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(key_path(&dir), b"").unwrap();
+
+        let err = match load_or_create(&dir) {
+            Ok(_) => panic!("an empty claim cannot be honoured"),
+            Err(e) => e,
+        };
+        assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
+        assert!(
+            err.to_string().contains("remove that file"),
+            "the operator has to be told what to do: {err}"
+        );
+    }
+
     #[test]
     fn two_racing_starts_agree_on_one_key() {
         let tmp = tempfile::tempdir().unwrap();
