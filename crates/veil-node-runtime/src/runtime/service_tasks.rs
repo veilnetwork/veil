@@ -1573,9 +1573,16 @@ impl NodeRuntime {
             let shutdown_tx = self.shutdown_tx.clone();
             let tasks = Arc::clone(&self.tasks);
             let my_pubkey_async = my_pubkey.clone();
+            // What this operator will accept from an unsigned TXT record. No
+            // pins and the last resort allowed is the default, which is what
+            // every existing config says (report14 V14-M9).
+            let dns_policy = veil_bootstrap::DnsBootstrapPolicy {
+                pinned_public_keys: config.global.bootstrap_dns_pinned_keys.clone(),
+                allow_unsigned_system_dns: config.global.bootstrap_dns_allow_system,
+            };
             let handle = supervised_spawn(Arc::clone(&self.logger), "bootstrap_dns", async move {
                 let seeds = filter_self_seeds(
-                    veil_bootstrap::discover_seeds_dns(&domain).await,
+                    veil_bootstrap::discover_seeds_dns_with_policy(&domain, &dns_policy).await,
                     &my_pubkey_async,
                 );
                 if seeds.is_empty() {
