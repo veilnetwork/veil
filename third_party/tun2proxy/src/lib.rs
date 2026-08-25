@@ -196,8 +196,7 @@ where
             macro_rules! create_socket_queue {
                 ($domain:ident) => {{
                     // The parent enforces this same number as a ceiling.
-                    const SOCKETS_PER_REQUEST: usize =
-                        crate::socket_transfer::MAX_SOCKETS_PER_REQUEST as usize;
+                    const SOCKETS_PER_REQUEST: usize = crate::socket_transfer::MAX_SOCKETS_PER_REQUEST as usize;
 
                     let socket = socket.clone();
                     let (tx, rx) = channel(SOCKETS_PER_REQUEST);
@@ -736,7 +735,6 @@ async fn handle_udp_associate_session(
 /// a broken resolver or a hostile one — and the session is dropped rather than
 /// buffered indefinitely (audit V-06/V-07 share this shape).
 const MAX_DNS_TCP_PENDING: usize = (u16::MAX as usize) + 2;
-
 
 async fn handle_dns_over_tcp_session(
     mut udp_stack: IpStackUdpStream,

@@ -63,7 +63,11 @@ impl DumpLogger {
         );
         let c_msg = std::ffi::CString::new(msg).unwrap();
         let ptr = c_msg.as_ptr();
-        if let Some(cb) = DUMP_CALLBACK.lock().unwrap().clone() {
+        // Copied out and the lock RELEASED before the call — a callback that
+        // logs, or that installs another callback, would otherwise take the
+        // mutex its own caller is holding (report14 V14-L5).
+        let cb = DUMP_CALLBACK.lock().ok().and_then(|g| g.clone());
+        if let Some(cb) = cb {
             unsafe {
                 cb.call(record.level().into(), ptr);
             }

@@ -292,12 +292,109 @@ pub fn atomic_write_owner_only(path: &std::path::Path, bytes: &[u8]) -> std::io:
 /// a BEARER SECRET is the same caveat [`atomic_write`] documents.
 pub fn write_new_owner_only(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
     use std::io::Write as _;
-    if let Some(parent) = path.parent() {
-        create_dir_all_with_eacces_retry(parent)?;
+    let parent = path.parent();
+    if let Some(p) = parent {
+        create_dir_all_with_eacces_retry(p)?;
     }
-    let mut f = open_owner_only_create_new(path)?;
-    f.write_all(bytes)?;
-    f.sync_all()
+    // Written to a TEMP name and published by LINKING it, rather than opened
+    // at the final name and filled in place.
+    //
+    // The direct version made the claim in two steps, and a crash or a write
+    // error between them left the final name existing and EMPTY — a claim
+    // nobody would ever finish, and every later start of that directory then
+    // met a file it could neither read nor replace (report14 V14-L6). Here
+    // the final name appears only once the bytes are on the platter, so a
+    // reader either does not see it or sees it whole.
+    //
+    // `hard_link` and not `rename`: a rename REPLACES, and losing is the whole
+    // point of this function. `link(2)` fails with `AlreadyExists` when the
+    // target is there, which is the same answer `O_EXCL` gave and the answer
+    // the caller acts on.
+    let mut rand_bytes = [0u8; 8];
+    getrandom::getrandom(&mut rand_bytes).map_err(|e| {
+        std::io::Error::other(format!("write_new_owner_only: getrandom failed: {e}"))
+    })?;
+    let tmp = path.with_extension(format!("claim.{}", bytes_to_hex(&rand_bytes)));
+    {
+        let mut f = open_owner_only_create_new(&tmp)?;
+        f.write_all(bytes)?;
+        f.sync_all()?;
+    }
+    let published = std::fs::hard_link(&tmp, path);
+    // The temp is ours either way: we chose an unpredictable name and created
+    // it with `O_EXCL`, so removing it cannot touch anybody else's file.
+    let _ = std::fs::remove_file(&tmp);
+    published?;
+    // The DIRENT has to be durable too, or a power loss can leave the bytes on
+    // disk with no name pointing at them — which reads as "never published"
+    // and lets a later start mint a second key.
+    if let Some(p) = parent {
+        let _ = std::fs::File::open(p).and_then(|d| d.sync_all());
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod write_new_tests {
+    use super::*;
+
+    /// The published name appears WHOLE or not at all.
+    ///
+    /// The version this replaced opened the final name with `O_EXCL` and then
+    /// wrote into it, so a crash or a write error between the two left a file
+    /// of length zero standing at the name every later start reads — a claim
+    /// nobody would finish, and one that cannot be replaced either, because
+    /// the next `O_EXCL` sees it and loses (report14 V14-L6).
+    #[test]
+    fn a_published_file_is_never_seen_half_written() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("key");
+        write_new_owner_only(&path, &[7u8; 32]).expect("publish");
+        assert_eq!(std::fs::read(&path).expect("read"), vec![7u8; 32]);
+
+        // Nothing of the staging is left behind for the next start to trip
+        // over — a stray claim file is how a directory grows one per crash.
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+            .expect("readdir")
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n != "key")
+            .collect();
+        assert!(leftovers.is_empty(), "left behind: {leftovers:?}");
+    }
+
+    /// Losing is what this is for: the second publish must not replace the
+    /// first, which a rename would.
+    #[test]
+    fn a_second_publish_loses_and_says_so() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("key");
+        write_new_owner_only(&path, b"first").expect("first");
+        let err = write_new_owner_only(&path, b"second").expect_err("must lose");
+        assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(std::fs::read(&path).expect("read"), b"first");
+
+        // …and the loser's staging is not left lying around either.
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+            .expect("readdir")
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n != "key")
+            .collect();
+        assert!(leftovers.is_empty(), "left behind: {leftovers:?}");
+    }
+
+    /// Owner-only on POSIX, where it can be observed.
+    #[test]
+    #[cfg(unix)]
+    fn a_published_secret_is_readable_only_by_its_owner() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("key");
+        write_new_owner_only(&path, &[1u8; 32]).expect("publish");
+        let mode = std::fs::metadata(&path).expect("stat").permissions().mode();
+        assert_eq!(mode & 0o777, 0o600, "got {:o}", mode & 0o777);
+    }
 }
 
 fn atomic_write_inner(

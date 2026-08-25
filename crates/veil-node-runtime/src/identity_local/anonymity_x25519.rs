@@ -166,21 +166,13 @@ fn load_after_race(veil_dir: &Path) -> std::io::Result<x25519_dalek::StaticSecre
 /// `O_EXCL` rather than [`save`]'s temp-and-rename: the point here is to LOSE
 /// when somebody else has already published, and a rename always wins.
 fn save_new(veil_dir: &Path, sk: &x25519_dalek::StaticSecret) -> std::io::Result<()> {
-    use std::io::Write as _;
-    let path = key_path(veil_dir);
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir)?;
-    }
-    let mut opts = std::fs::OpenOptions::new();
-    opts.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt as _;
-        opts.mode(0o600);
-    }
-    let mut f = opts.open(&path)?;
-    f.write_all(&sk.to_bytes())?;
-    f.sync_all()
+    // The shared helper, which publishes by LINKING a durable temp rather than
+    // opening the final name and filling it in place. The version this
+    // replaced made the claim in two steps, so a crash between them left the
+    // key file existing and EMPTY — a claim nobody would finish, and every
+    // later start of the directory met a file it could neither read nor
+    // replace (report14 V14-L6).
+    veil_util::write_new_owner_only(&key_path(veil_dir), &sk.to_bytes())
 }
 
 /// Derive the anonymity X25519 secret DETERMINISTICALLY from this identity's
