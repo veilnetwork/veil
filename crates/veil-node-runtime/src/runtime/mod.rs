@@ -5840,7 +5840,7 @@ impl NodeServices {
                     "nat.udp_punch.config_unavailable",
                     format!("explicit punch cannot load config: {error}"),
                 );
-                return Outcome::NoReflector;
+                return Outcome::ConfigUnavailable;
             }
         };
         let peer_ctx = match peer_transport_context(&self.transport_ctx, &peer) {

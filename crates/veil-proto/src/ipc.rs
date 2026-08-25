@@ -5929,6 +5929,16 @@ pub mod hole_punch_status {
     /// not a full runtime). Distinct from `NO_REFLECTOR` so an unwired
     /// daemon is never mistaken for a reflector outage.
     pub const UNSUPPORTED: u8 = 8;
+    /// The daemon could not read its own config to answer the request.
+    ///
+    /// Distinct from `NO_REFLECTOR` for the same reason `UNSUPPORTED` is:
+    /// the punch path re-reads the config from disk and used to report a
+    /// failed read as "no reflector", sending an operator after missing NAT
+    /// configuration when the file itself was the problem. The enum this
+    /// mirrors promises that "every variant names the exact stage that ended
+    /// the attempt"; a read that never got as far as looking for a reflector
+    /// names no stage at all.
+    pub const CONFIG_UNAVAILABLE: u8 = 9;
 }
 
 /// Reply to [`crate::family::LocalAppMsg::AttemptHolePunch`].

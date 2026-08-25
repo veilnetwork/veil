@@ -7218,6 +7218,8 @@ pub const VEIL_HOLE_PUNCH_QUIC_FAILED: u8 = 5;
 pub const VEIL_HOLE_PUNCH_REFUSED_ANONYMOUS: u8 = 6;
 pub const VEIL_HOLE_PUNCH_UNKNOWN_PEER: u8 = 7;
 pub const VEIL_HOLE_PUNCH_UNSUPPORTED: u8 = 8;
+/// The daemon could not read its own config to answer the request.
+pub const VEIL_HOLE_PUNCH_CONFIG_UNAVAILABLE: u8 = 9;
 
 /// Run one explicit, bounded UDP hole-punch attempt toward a registered
 /// peer (real-P2P epic, Stage B: punch in the call path). The daemon

@@ -410,6 +410,9 @@ enum VeilHolePunchStatus {
   /// The daemon has no hole-punch driver wired (older/partial build).
   unsupported(ffi.veilHolePunchUnsupported),
 
+  /// The daemon could not read its own config to answer the request.
+  configUnavailable(ffi.veilHolePunchConfigUnavailable),
+
   /// Forward-compat: daemon returned a status byte we don't recognise.
   unknown(-1);
 

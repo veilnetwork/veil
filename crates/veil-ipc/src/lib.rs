@@ -635,6 +635,10 @@ pub enum HolePunchOutcome {
     RefusedAnonymous,
     /// The node_id is not a registered peer of this daemon.
     UnknownPeer,
+    /// The daemon could not read its own config to answer the request —
+    /// distinct from [`Self::NoReflector`], which is about what the config
+    /// SAYS rather than whether it could be read at all.
+    ConfigUnavailable,
 }
 
 impl HolePunchOutcome {
@@ -650,6 +654,7 @@ impl HolePunchOutcome {
             Self::QuicFailed => s::QUIC_FAILED,
             Self::RefusedAnonymous => s::REFUSED_ANONYMOUS,
             Self::UnknownPeer => s::UNKNOWN_PEER,
+            Self::ConfigUnavailable => s::CONFIG_UNAVAILABLE,
         }
     }
 }
@@ -1027,5 +1032,66 @@ impl std::fmt::Debug for EventBus {
         f.debug_struct("EventBus")
             .field("receiver_count", &self.tx.receiver_count())
             .finish()
+    }
+}
+
+#[cfg(test)]
+mod config_unavailable_status_tests {
+    use super::*;
+
+    /// A config the daemon cannot READ is not a config that says "no
+    /// reflector".
+    ///
+    /// `attempt_p2p_hole_punch` re-reads the config from disk and reported a
+    /// failed read as `NoReflector` — the same answer it gives when NAT is
+    /// switched off or no endpoint is known. An operator chasing a punch
+    /// failure was sent after missing configuration when the file itself was
+    /// the problem, and the enum's own documentation promises the opposite:
+    /// "every variant names the exact stage that ended the attempt so app-side
+    /// transport badges and logs can show the real reason instead of a generic
+    /// failure".
+    ///
+    /// Additive by construction, and the precedent is in the constant beside
+    /// it: `UNSUPPORTED` was given its own byte so an unwired daemon "is never
+    /// mistaken for a reflector outage". The reply is a fixed 33 bytes with the
+    /// status in one of them, and the Dart enum resolves an unrecognised byte
+    /// to `unknown`, so an older app reads this as a plain punch failure rather
+    /// than as the wrong cause.
+    #[test]
+    fn a_config_that_cannot_be_read_has_its_own_wire_status() {
+        assert_eq!(
+            HolePunchOutcome::ConfigUnavailable.wire_status(),
+            veil_proto::hole_punch_status::CONFIG_UNAVAILABLE,
+        );
+        assert_ne!(
+            HolePunchOutcome::ConfigUnavailable.wire_status(),
+            HolePunchOutcome::NoReflector.wire_status(),
+            "a failed read must not arrive as a reflector outage",
+        );
+    }
+
+    /// Every outcome keeps its own byte — no two share one.
+    #[test]
+    fn no_two_outcomes_answer_with_the_same_byte() {
+        let all = [
+            HolePunchOutcome::Connected,
+            HolePunchOutcome::NoReflector,
+            HolePunchOutcome::SignalingTimeout,
+            HolePunchOutcome::MappingUnusable,
+            HolePunchOutcome::PunchTimeout,
+            HolePunchOutcome::QuicFailed,
+            HolePunchOutcome::RefusedAnonymous,
+            HolePunchOutcome::UnknownPeer,
+            HolePunchOutcome::ConfigUnavailable,
+        ];
+        let mut seen = std::collections::BTreeSet::new();
+        for outcome in all {
+            assert!(
+                seen.insert(outcome.wire_status()),
+                "{outcome:?} reuses a status byte, so its stage is not \
+                 distinguishable on the wire"
+            );
+        }
+        assert_eq!(seen.len(), all.len());
     }
 }
