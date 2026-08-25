@@ -821,6 +821,30 @@ pub const UNSIGNED_ROUTE_REQUEST_BURST: u32 = 32;
 /// Refill period for [`UNSIGNED_ROUTE_REQUEST_BURST`], in seconds.
 pub const UNSIGNED_ROUTE_REQUEST_REFILL_SECS: u64 = 60;
 
+/// Ratchet opens a node will attempt for senders it has never proven, per
+/// window.
+///
+/// A ratchet prologue is opened by trying a PQXDH accept against every
+/// still-usable mailbox secret — a decapsulation each, plus the store work
+/// behind it. That cost is paid BEFORE anything about the sender is proven,
+/// and the per-peer cap on unproven conversations is keyed by the node id the
+/// SENDER claims, which an attacker varies for free: every fresh claim gets
+/// its own allowance, so the work scales with claims rather than with peers
+/// (report14 V14-M5).
+///
+/// Held by the RECIPIENT and not keyed at all, for the same reason
+/// [`UNSIGNED_ROUTE_REQUEST_BURST`] is: an unproven sender has no identity to
+/// key on. A peer this node HAS proven never comes out of this pot — an
+/// established conversation is not rate-limited by a defence against strangers.
+///
+/// Generous against the honest case it could bite: a first contact is a rare
+/// event, and 64 of them a minute is far past any real rate of people
+/// introducing themselves.
+pub const UNPROVEN_RATCHET_OPEN_BURST: u32 = 64;
+
+/// Refill period for [`UNPROVEN_RATCHET_OPEN_BURST`], in seconds.
+pub const UNPROVEN_RATCHET_OPEN_REFILL_SECS: u64 = 60;
+
 /// Per-source rate limit burst for discovery packet forwarding.
 pub const DISCOVERY_RATE_BURST: u32 = 3;
 

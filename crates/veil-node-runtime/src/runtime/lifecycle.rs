@@ -1082,6 +1082,11 @@ impl NodeRuntime {
                 unsigned_route_request_budget: Arc::clone(
                     &self.dispatcher.abuse.unsigned_route_request_budget,
                 ),
+                // Reused across reloads for the same reason the others are: a
+                // reload must not hand a flooder a fresh pot.
+                unproven_ratchet_open_budget: Arc::clone(
+                    &self.dispatcher.abuse.unproven_ratchet_open_budget,
+                ),
                 // reuse across reloads for the same reason.
                 dht_contact_quota: Arc::clone(&self.dispatcher.abuse.dht_contact_quota),
                 // reuse across reloads to preserve in-flight rate state.
