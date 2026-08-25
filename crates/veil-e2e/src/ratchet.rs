@@ -1274,10 +1274,10 @@ pub fn is_ratchet_payload(payload: &[u8]) -> bool {
 
 /// Open a ratchet payload from `sender_node_id`.
 ///
-/// `published_peer_ik` is the device X25519 key that peer's verified
-/// certificate currently carries, when the caller has it. It decides two
-/// things, and both of them the same way — by whether the key a prologue
-/// announces is the key the peer published:
+/// `peer_devices` are the device X25519 keys that peer's verified certificates
+/// carry, when the caller has them. They decide two things, and both of them
+/// the same way — by whether the key a prologue announces is one the peer
+/// published:
 ///
 /// * whether the sender is reported as proven;
 /// * whether a prologue may take back a conversation some stranger opened
@@ -1293,17 +1293,10 @@ pub fn open(
     me: &RatchetIdentity,
     sender_node_id: &[u8; 32],
     payload: &[u8],
-    published_peer_ik: Option<&[u8; 32]>,
+    peer_devices: Option<&PeerDeviceKeys>,
     now_unix: u64,
 ) -> Result<Opened, RatchetSpliceError> {
-    let mut opened = open_inner(
-        store,
-        me,
-        sender_node_id,
-        payload,
-        published_peer_ik,
-        now_unix,
-    )?;
+    let mut opened = open_inner(store, me, sender_node_id, payload, peer_devices, now_unix)?;
     if opened.plaintext.len() < ACK_KEY_LEN {
         // Authenticated, so it came from the peer — but the peer built a
         // payload this version does not understand. Refuse rather than hand a
@@ -1324,7 +1317,7 @@ fn open_inner(
     me: &RatchetIdentity,
     sender_node_id: &[u8; 32],
     payload: &[u8],
-    published_peer_ik: Option<&[u8; 32]>,
+    peer_devices: Option<&PeerDeviceKeys>,
     now_unix: u64,
 ) -> Result<Opened, RatchetSpliceError> {
     if payload.len() <= HEADER_LEN {
@@ -1380,7 +1373,7 @@ fn open_inner(
     // can reach this bar, whatever pair of device ids they name.
     let proves_authorship = message
         .as_ref()
-        .is_some_and(|m| published_peer_ik == Some(m.initiator_ik()));
+        .is_some_and(|m| peer_devices.is_some_and(|d| d.contains(m.initiator_ik())));
 
     // Whether an entry may be replaced by this prologue. Cheap, and read at
     // both ends of the key agreement below — the store is unlocked in between,
@@ -1427,7 +1420,8 @@ fn open_inner(
                     // aiming garbage at whichever conversation it wants kept.
                     entry.last_used_at = now_unix;
                     if !entry.authenticated
-                        && (published_peer_ik == Some(&entry.peer_ik) || proves_authorship)
+                        && (peer_devices.is_some_and(|d| d.contains(&entry.peer_ik))
+                            || proves_authorship)
                     {
                         entry.authenticated = true;
                     }
@@ -1518,7 +1512,7 @@ fn open_inner(
         ) {
             Ok((plaintext, session)) => {
                 let peer_ik = *message.initiator_ik();
-                let authenticated = published_peer_ik == Some(&peer_ik);
+                let authenticated = peer_devices.is_some_and(|d| d.contains(&peer_ik));
                 let mut g = store.lock();
                 // Ask the store again. Another thread may have opened this
                 // conversation while the agreement above ran unlocked, and the
@@ -1587,13 +1581,76 @@ fn open_inner(
 
 // ── Peer ratchet-key directory ───────────────────────────────────────────────
 
-/// `peer_node_id → device X25519 key from that peer's verified certificate`.
+/// The device X25519 keys one peer's verified certificates have published.
+///
+/// A SET, and that is the fix rather than an optimisation. A certificate is
+/// per DEVICE, so a peer with a phone and a laptop publishes two of these —
+/// and this held one key per NODE, so whichever sibling's certificate resolved
+/// last overwrote the other. An authentic prologue from the overwritten device
+/// then failed the comparison and was filed as unauthenticated, which costs
+/// that conversation its claim on the slot and can cost the message its place
+/// (report14 V14-M6).
+///
+/// Membership is the question being asked — "is this key one this identity
+/// published?" — and the answer is as true of the second device as the first.
+/// Retired keys stay in for the same reason the seed ring keeps retired
+/// secrets: a peer working from a certificate we resolved last week announced
+/// the key that was current then.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PeerDeviceKeys {
+    /// Newest first. Small and linear on purpose: it is at most [`Self::MAX`]
+    /// entries and a scan of eight arrays beats a hash on every one of them.
+    keys: Vec<[u8; 32]>,
+}
+
+impl PeerDeviceKeys {
+    /// Devices-times-rotations kept for one peer.
+    ///
+    /// Bounds what one peer costs, and generously against the honest case: an
+    /// identity with eight devices, or one device that rotated eight times
+    /// since we last spoke, still authenticates.
+    pub const MAX: usize = 8;
+
+    /// Record a key from a verified certificate. Newest wins the room.
+    pub fn remember(&mut self, key: [u8; 32]) {
+        if let Some(at) = self.keys.iter().position(|k| *k == key) {
+            self.keys.remove(at);
+        }
+        self.keys.insert(0, key);
+        self.keys.truncate(Self::MAX);
+    }
+
+    /// Whether `key` came from a certificate this peer published.
+    #[must_use]
+    pub fn contains(&self, key: &[u8; 32]) -> bool {
+        self.keys.iter().any(|k| k == key)
+    }
+
+    /// The most recently published key, for callers that need ONE — a
+    /// diagnostic, or a readiness check.
+    #[must_use]
+    pub fn newest(&self) -> Option<[u8; 32]> {
+        self.keys.first().copied()
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.keys.is_empty()
+    }
+
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.keys.len()
+    }
+}
+
+/// `peer_node_id → the device keys that peer's verified certificates carry`.
 ///
 /// The exact counterpart of [`PeerMlKemCache`](crate::PeerMlKemCache), written
 /// by whatever resolves and verifies certificates and read on the receive path,
 /// which is synchronous and cannot walk a DHT. A miss costs authentication for
 /// that one message, never readability.
-pub type PeerRatchetKeyCache = std::collections::HashMap<[u8; 32], [u8; 32]>;
+pub type PeerRatchetKeyCache = std::collections::HashMap<[u8; 32], PeerDeviceKeys>;
 
 // ── The handle both paths hold ───────────────────────────────────────────────
 
@@ -1726,12 +1783,22 @@ impl RatchetRuntime {
             .map(|(_, e)| e.authenticated)
     }
 
+    /// The most recent device key this peer published, for callers that need
+    /// ONE — a readiness check, a diagnostic. Authentication asks
+    /// [`peer_devices`](Self::peer_devices) instead: a peer has one key PER
+    /// DEVICE and any of them proves the identity.
     pub fn published_ik(&self, peer_node_id: &[u8; 32]) -> Option<[u8; 32]> {
+        self.peer_devices(peer_node_id).and_then(|d| d.newest())
+    }
+
+    /// Every device key this peer's verified certificates have carried.
+    #[must_use]
+    pub fn peer_devices(&self, peer_node_id: &[u8; 32]) -> Option<PeerDeviceKeys> {
         self.peer_ratchet_keys
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get(peer_node_id)
-            .copied()
+            .cloned()
     }
 
     /// Seal for a peer whose certificate the caller has verified. See [`seal`].
@@ -1753,13 +1820,13 @@ impl RatchetRuntime {
         now_unix: u64,
     ) -> Result<Opened, RatchetSpliceError> {
         let me = self.identity().ok_or(RatchetSpliceError::NoLocalInstance)?;
-        let published = self.published_ik(sender_node_id);
+        let devices = self.peer_devices(sender_node_id);
         open(
             &self.store,
             &me,
             sender_node_id,
             payload,
-            published.as_ref(),
+            devices.as_ref(),
             now_unix,
         )
     }
@@ -1771,6 +1838,17 @@ mod tests {
     use crate::{DK_SEED_BYTES, EK_BYTES, MLKEM_SEED_MIN_OVERLAP_SECS};
 
     const NOW: u64 = 1_800_000_000;
+
+    /// One published device key, as the peer directory now holds them.
+    ///
+    /// A peer has one key PER DEVICE, and the cache keeps the set. These tests
+    /// speak for one device each, so the set has one member — the shape the
+    /// old `Option<&[u8; 32]>` argument assumed everywhere.
+    fn dev(pk: &[u8; 32]) -> PeerDeviceKeys {
+        let mut d = PeerDeviceKeys::default();
+        d.remember(*pk);
+        d
+    }
 
     struct Device {
         node_id: [u8; 32],
@@ -1822,7 +1900,132 @@ mod tests {
             .expect("seal")
             .0;
         let a_pk = a.ratchet_pk();
-        open(&b.store, &b.me(), &a.node_id, &payload, Some(&a_pk), NOW)
+        open(
+            &b.store,
+            &b.me(),
+            &a.node_id,
+            &payload,
+            Some(&dev(&a_pk)),
+            NOW,
+        )
+    }
+
+    /// One peer, two devices, and both of them are that peer.
+    ///
+    /// A certificate is per DEVICE, so a peer with a phone and a laptop
+    /// publishes two device keys. The directory held ONE key per node, so
+    /// whichever sibling's certificate resolved last overwrote the other — and
+    /// an authentic prologue from the overwritten device then failed the
+    /// comparison and was filed as merely claimed (report14 V14-M6). The
+    /// message still opened; what it lost was its name, and with it the right
+    /// to take back a conversation a stranger opened first.
+    #[test]
+    fn either_device_of_one_peer_authenticates() {
+        fn peer_device(node: u8, instance: u8, seed_tag: u8) -> Device {
+            let seed = [seed_tag; DK_SEED_BYTES];
+            let (ek, _) = crate::keypair_from_dk_seed(&seed).expect("keypair");
+            Device {
+                node_id: [node; 32],
+                instance_id: [instance; 16],
+                ring: std::sync::Arc::new(MlKemSeedRing::new(0, seed, ek)),
+                store: RatchetStore::new(),
+            }
+        }
+
+        let me = device(9);
+        // ONE identity: same node id, two of its devices.
+        let phone = peer_device(5, 0xA1, 0x11);
+        let laptop = peer_device(5, 0xB2, 0x22);
+        assert_eq!(phone.node_id, laptop.node_id);
+        assert_ne!(
+            phone.ratchet_pk(),
+            laptop.ratchet_pk(),
+            "two devices of one identity publish two device keys — if they \
+             published one, this test is about nothing"
+        );
+
+        // What the directory holds after both certificates have been resolved.
+        let mut published = PeerDeviceKeys::default();
+        published.remember(phone.ratchet_pk());
+        published.remember(laptop.ratchet_pk());
+        assert_eq!(published.len(), 2, "one slot per node is the defect");
+
+        let seal_to_me = |from: &Device, body: &[u8]| {
+            let (ek, pk) = (me.ek(), me.ratchet_pk());
+            seal(&from.store, &from.me(), keys(&me, &ek, &pk), body, NOW)
+                .expect("seal")
+                .0
+        };
+
+        for (who, body) in [
+            (&phone, &b"from the phone"[..]),
+            (&laptop, &b"from the laptop"[..]),
+        ] {
+            let payload = seal_to_me(who, body);
+            let opened = open(
+                &me.store,
+                &me.me(),
+                &who.node_id,
+                &payload,
+                Some(&published),
+                NOW,
+            )
+            .expect("open");
+            assert_eq!(opened.plaintext, body);
+            assert!(
+                opened.authenticated,
+                "this device's key IS one the identity published; calling it \
+                 unproven is the multi-device delivery defect"
+            );
+        }
+
+        // The vacuity guard: a key the peer never published still fails. The
+        // set widens what counts as the peer, it does not stop counting.
+        let stranger = peer_device(7, 0xC3, 0x33);
+        let payload = seal_to_me(&stranger, b"not this identity");
+        let opened = open(
+            &me.store,
+            &me.me(),
+            &stranger.node_id,
+            &payload,
+            Some(&published),
+            NOW,
+        )
+        .expect("open");
+        assert!(
+            !opened.authenticated,
+            "a key nobody published must not authenticate anyone"
+        );
+    }
+
+    /// The directory keeps a bounded number of keys per peer, newest first.
+    #[test]
+    fn the_device_directory_is_bounded_and_newest_first() {
+        let mut d = PeerDeviceKeys::default();
+        for i in 0..(PeerDeviceKeys::MAX as u8 + 3) {
+            d.remember([i; 32]);
+        }
+        assert_eq!(
+            d.len(),
+            PeerDeviceKeys::MAX,
+            "one peer may not grow forever"
+        );
+        assert_eq!(
+            d.newest(),
+            Some([PeerDeviceKeys::MAX as u8 + 2; 32]),
+            "the key that arrived last is the one a caller wanting ONE gets"
+        );
+        assert!(
+            !d.contains(&[0u8; 32]),
+            "the oldest fell out, which is what bounded means"
+        );
+
+        // Re-publishing a key it already holds moves it, and adds nothing.
+        let held = d.len();
+        let existing = d.newest().expect("something");
+        d.remember(existing);
+        assert_eq!(d.len(), held);
+        assert_eq!(d.newest(), Some(existing));
     }
 
     /// report12 X-H5: the position is what a host records BEFORE it publishes,
@@ -1907,7 +2110,15 @@ mod tests {
             .expect("seal")
             .0;
         let b_pk = b.ratchet_pk();
-        open(&a.store, &a.me(), &b.node_id, &second, Some(&b_pk), NOW).expect("open");
+        open(
+            &a.store,
+            &a.me(),
+            &b.node_id,
+            &second,
+            Some(&dev(&b_pk)),
+            NOW,
+        )
+        .expect("open");
         let key = a.store.keys().first().copied().expect("a conversation");
         assert!(
             a.store.lock().entries[&key].session.skipped_len() > 0,
@@ -2019,7 +2230,7 @@ mod tests {
             .expect("seal")
             .0;
         let b_pk = b.ratchet_pk();
-        open(&a.store, &a.me(), &b.node_id, &back, Some(&b_pk), NOW).expect("Alice opens");
+        open(&a.store, &a.me(), &b.node_id, &back, Some(&dev(&b_pk)), NOW).expect("Alice opens");
         (a, b)
     }
 
@@ -2060,7 +2271,7 @@ mod tests {
         };
         let f = unopenable_frame_from(&a, &b);
         assert!(matches!(
-            open(&b.store, &b.me(), &a.node_id, &f, Some(&a_pk), NOW),
+            open(&b.store, &b.me(), &a.node_id, &f, Some(&dev(&a_pk)), NOW),
             Err(RatchetSpliceError::Ratchet(_))
         ));
         assert_eq!(
@@ -2073,7 +2284,7 @@ mod tests {
             let f = unopenable_frame_from(&a, &b);
             assert!(
                 matches!(
-                    open(&b.store, &b.me(), &a.node_id, &f, Some(&a_pk), NOW),
+                    open(&b.store, &b.me(), &a.node_id, &f, Some(&dev(&a_pk)), NOW),
                     Err(RatchetSpliceError::Ratchet(_))
                 ),
                 "attempt {attempt} is still short of the threshold"
@@ -2083,7 +2294,7 @@ mod tests {
 
         let f = unopenable_frame_from(&a, &b);
         assert!(matches!(
-            open(&b.store, &b.me(), &a.node_id, &f, Some(&a_pk), NOW),
+            open(&b.store, &b.me(), &a.node_id, &f, Some(&dev(&a_pk)), NOW),
             Err(RatchetSpliceError::WedgedConversationDropped)
         ));
         assert_eq!(
@@ -2101,13 +2312,13 @@ mod tests {
         let a_pk = a.ratchet_pk();
         for _ in 1..WEDGED_AFTER_FRAME_FAILURES {
             let f = unopenable_frame_from(&a, &b);
-            let _ = open(&b.store, &b.me(), &a.node_id, &f, Some(&a_pk), NOW);
+            let _ = open(&b.store, &b.me(), &a.node_id, &f, Some(&dev(&a_pk)), NOW);
         }
         a_to_b(&a, &b, b"still here").expect("a good frame opens");
         // Streak cleared: the same number of failures again must not be enough.
         for _ in 1..WEDGED_AFTER_FRAME_FAILURES {
             let f = unopenable_frame_from(&a, &b);
-            let _ = open(&b.store, &b.me(), &a.node_id, &f, Some(&a_pk), NOW);
+            let _ = open(&b.store, &b.me(), &a.node_id, &f, Some(&dev(&a_pk)), NOW);
         }
         assert_eq!(b.store.len(), 1, "the conversation survived");
     }
@@ -2124,7 +2335,15 @@ mod tests {
             .expect("seal")
             .0;
         let a_pk = a.ratchet_pk();
-        open(&b.store, &b.me(), &a.node_id, &prologue, Some(&a_pk), NOW).expect("first open");
+        open(
+            &b.store,
+            &b.me(),
+            &a.node_id,
+            &prologue,
+            Some(&dev(&a_pk)),
+            NOW,
+        )
+        .expect("first open");
 
         // Walk the conversation on, so the recorded prologue is genuinely
         // BEHIND the session and replaying it FAILS. Replaying one the session
@@ -2141,7 +2360,16 @@ mod tests {
         // live conversation was thrown away and replaced.
         let version_before = b.store.version();
         for _ in 0..(WEDGED_AFTER_FRAME_FAILURES * 3) {
-            if open(&b.store, &b.me(), &a.node_id, &prologue, Some(&a_pk), NOW).is_err() {
+            if open(
+                &b.store,
+                &b.me(),
+                &a.node_id,
+                &prologue,
+                Some(&dev(&a_pk)),
+                NOW,
+            )
+            .is_err()
+            {
                 refused += 1;
             }
         }
@@ -2172,7 +2400,8 @@ mod tests {
                 .expect("seal")
                 .0;
             let b_pk = b.ratchet_pk();
-            let got = open(&a.store, &a.me(), &b.node_id, &back, Some(&b_pk), NOW).expect("open");
+            let got =
+                open(&a.store, &a.me(), &b.node_id, &back, Some(&dev(&b_pk)), NOW).expect("open");
             assert_eq!(got.plaintext, vec![i; 9]);
             assert!(got.authenticated);
 
@@ -2205,13 +2434,29 @@ mod tests {
 
         // Bob answers. Now Alice knows he has it.
         let a_pk = a.ratchet_pk();
-        open(&b.store, &b.me(), &a.node_id, &second, Some(&a_pk), NOW).expect("open");
+        open(
+            &b.store,
+            &b.me(),
+            &a.node_id,
+            &second,
+            Some(&dev(&a_pk)),
+            NOW,
+        )
+        .expect("open");
         let (aek, apk) = (a.ek(), a.ratchet_pk());
         let reply = seal(&b.store, &b.me(), keys(&a, &aek, &apk), b"got it", NOW)
             .expect("seal")
             .0;
         let b_pk = b.ratchet_pk();
-        open(&a.store, &a.me(), &b.node_id, &reply, Some(&b_pk), NOW).expect("open");
+        open(
+            &a.store,
+            &a.me(),
+            &b.node_id,
+            &reply,
+            Some(&dev(&b_pk)),
+            NOW,
+        )
+        .expect("open");
 
         let third = seal(&a.store, &a.me(), keys(&b, &ek, &pk), b"3", NOW)
             .expect("seal")
@@ -2231,7 +2476,7 @@ mod tests {
             .0;
         drop(lost);
         let a_pk = a.ratchet_pk();
-        let got = open(&b.store, &b.me(), &a.node_id, &kept, Some(&a_pk), NOW).expect("open");
+        let got = open(&b.store, &b.me(), &a.node_id, &kept, Some(&dev(&a_pk)), NOW).expect("open");
         assert_eq!(got.plaintext, b"kept");
     }
 
@@ -2255,7 +2500,7 @@ mod tests {
             .expect("seal")
             .0;
         let a_pk = a.ratchet_pk();
-        let got = open(&b.store, &b.me(), &a.node_id, &next, Some(&a_pk), NOW).expect("open");
+        let got = open(&b.store, &b.me(), &a.node_id, &next, Some(&dev(&a_pk)), NOW).expect("open");
         assert!(got.authenticated);
     }
 
@@ -2274,7 +2519,7 @@ mod tests {
             &b.me(),
             &a.node_id,
             &payload,
-            Some(&someone_else),
+            Some(&dev(&someone_else)),
             NOW,
         )
         .expect("open");
@@ -2305,7 +2550,15 @@ mod tests {
         .0;
         let a_pk = a.ratchet_pk();
         assert!(
-            open(&b.store, &b.me(), &a.node_id, &forged, Some(&a_pk), NOW).is_err(),
+            open(
+                &b.store,
+                &b.me(),
+                &a.node_id,
+                &forged,
+                Some(&dev(&a_pk)),
+                NOW
+            )
+            .is_err(),
             "a second prologue must not re-key a live conversation"
         );
 
@@ -2348,7 +2601,7 @@ mod tests {
         .expect("seal")
         .0;
         let a_pk = a.ratchet_pk();
-        let got = open(&b.store, &b.me(), &a.node_id, &grab, Some(&a_pk), NOW).expect("open");
+        let got = open(&b.store, &b.me(), &a.node_id, &grab, Some(&dev(&a_pk)), NOW).expect("open");
         assert!(
             !got.authenticated,
             "the key it announced is not the one Alice published"
@@ -2372,14 +2625,14 @@ mod tests {
                 &squatter.me(),
                 &b.node_id,
                 &out,
-                Some(&b_pk),
+                Some(&dev(&b_pk)),
                 NOW
             )
             .is_err(),
             "the squatter read a message Bob wrote to Alice"
         );
         assert_eq!(
-            open(&a.store, &a.me(), &b.node_id, &out, Some(&b_pk), NOW)
+            open(&a.store, &a.me(), &b.node_id, &out, Some(&dev(&b_pk)), NOW)
                 .expect("Alice could not read a message addressed to her")
                 .plaintext,
             b"the account number is"
@@ -2406,7 +2659,7 @@ mod tests {
         .expect("seal")
         .0;
         let a_pk = a.ratchet_pk();
-        open(&b.store, &b.me(), &a.node_id, &grab, Some(&a_pk), NOW).expect("open");
+        open(&b.store, &b.me(), &a.node_id, &grab, Some(&dev(&a_pk)), NOW).expect("open");
 
         let real = a_to_b(&a, &b, b"it is actually me").expect("the real contact was locked out");
         assert_eq!(real.plaintext, b"it is actually me");
@@ -2423,7 +2676,7 @@ mod tests {
         .expect("seal")
         .0;
         assert!(
-            open(&b.store, &b.me(), &a.node_id, &more, Some(&a_pk), NOW).is_err(),
+            open(&b.store, &b.me(), &a.node_id, &more, Some(&dev(&a_pk)), NOW).is_err(),
             "the squatter kept the conversation after being displaced"
         );
 
@@ -2452,7 +2705,16 @@ mod tests {
         let results: Vec<_> = std::thread::scope(|s| {
             let handles: Vec<_> = (0..8)
                 .map(|_| {
-                    s.spawn(|| open(&b.store, &b.me(), &a.node_id, &payload, Some(&a_pk), NOW))
+                    s.spawn(|| {
+                        open(
+                            &b.store,
+                            &b.me(),
+                            &a.node_id,
+                            &payload,
+                            Some(&dev(&a_pk)),
+                            NOW,
+                        )
+                    })
                 })
                 .collect();
             handles
@@ -2490,14 +2752,30 @@ mod tests {
             .expect("seal")
             .0;
         let a_pk = a.ratchet_pk();
-        open(&b.store, &b.me(), &a.node_id, &opening, Some(&a_pk), NOW).expect("open");
+        open(
+            &b.store,
+            &b.me(),
+            &a.node_id,
+            &opening,
+            Some(&dev(&a_pk)),
+            NOW,
+        )
+        .expect("open");
 
         let key = b.store.keys()[0];
         let before_blob = b.store.export(&key).expect("held");
         let before_version = b.store.version();
 
         assert!(
-            open(&b.store, &b.me(), &a.node_id, &opening, Some(&a_pk), NOW).is_err(),
+            open(
+                &b.store,
+                &b.me(),
+                &a.node_id,
+                &opening,
+                Some(&dev(&a_pk)),
+                NOW
+            )
+            .is_err(),
             "a replayed prologue was accepted a second time"
         );
         assert_eq!(b.store.version(), before_version);
@@ -2536,7 +2814,15 @@ mod tests {
         .0;
         let a_pk = a.ratchet_pk();
         assert!(
-            open(&b.store, &b.me(), &a.node_id, &forged, Some(&a_pk), NOW).is_err(),
+            open(
+                &b.store,
+                &b.me(),
+                &a.node_id,
+                &forged,
+                Some(&dev(&a_pk)),
+                NOW
+            )
+            .is_err(),
             "a stranger displaced a conversation it cannot prove is its own"
         );
 
@@ -2545,7 +2831,7 @@ mod tests {
         let next = seal(&a.store, &a.me(), keys(&b, &bek, &bpk), b"still me", NOW)
             .expect("seal")
             .0;
-        let got = open(&b.store, &b.me(), &a.node_id, &next, Some(&a_pk), NOW).expect("open");
+        let got = open(&b.store, &b.me(), &a.node_id, &next, Some(&dev(&a_pk)), NOW).expect("open");
         assert_eq!(got.plaintext, b"still me");
         assert!(got.authenticated);
     }
@@ -2587,9 +2873,16 @@ mod tests {
         );
         let b_pk = b.ratchet_pk();
         assert_eq!(
-            open(&a.store, &a.me(), &b.node_id, &reply, Some(&b_pk), NOW)
-                .expect("open")
-                .plaintext,
+            open(
+                &a.store,
+                &a.me(),
+                &b.node_id,
+                &reply,
+                Some(&dev(&b_pk)),
+                NOW
+            )
+            .expect("open")
+            .plaintext,
             b"still talking"
         );
     }
@@ -2624,7 +2917,15 @@ mod tests {
         .expect("seal")
         .0;
         let b_pk = b.ratchet_pk();
-        let got = open(&a.store, &a.me(), &b.node_id, &fresh, Some(&b_pk), NOW).expect("open");
+        let got = open(
+            &a.store,
+            &a.me(),
+            &b.node_id,
+            &fresh,
+            Some(&dev(&b_pk)),
+            NOW,
+        )
+        .expect("open");
         assert_eq!(got.plaintext, b"starting over");
         assert!(got.authenticated);
 
@@ -2635,7 +2936,7 @@ mod tests {
         assert_eq!(back[2], KIND_FRAME);
         let a_pk = a.ratchet_pk();
         assert_eq!(
-            open(&b.store, &b.me(), &a.node_id, &back, Some(&a_pk), NOW)
+            open(&b.store, &b.me(), &a.node_id, &back, Some(&dev(&a_pk)), NOW)
                 .expect("open")
                 .plaintext,
             b"here now"
@@ -2695,7 +2996,7 @@ mod tests {
                 &b.me(),
                 &a.node_id,
                 &strip_the_post_quantum_leg(&good),
-                Some(&a_pk),
+                Some(&dev(&a_pk)),
                 NOW
             )
             .unwrap_err(),
@@ -2709,7 +3010,7 @@ mod tests {
         // The unmangled payload still opens, so the refusal was about the
         // missing leg and not about the surgery.
         assert_eq!(
-            open(&b.store, &b.me(), &a.node_id, &good, Some(&a_pk), NOW)
+            open(&b.store, &b.me(), &a.node_id, &good, Some(&dev(&a_pk)), NOW)
                 .expect("open")
                 .plaintext,
             b"downgrade me"
@@ -2738,7 +3039,7 @@ mod tests {
                 &b.me(),
                 &a.node_id,
                 &strip_the_post_quantum_leg(&good),
-                Some(&a_pk),
+                Some(&dev(&a_pk)),
                 NOW
             )
             .unwrap_err(),
@@ -2746,7 +3047,7 @@ mod tests {
         );
         assert_eq!(*b.store.export(&key).expect("held"), *before);
         assert_eq!(
-            open(&b.store, &b.me(), &a.node_id, &good, Some(&a_pk), NOW)
+            open(&b.store, &b.me(), &a.node_id, &good, Some(&dev(&a_pk)), NOW)
                 .expect("open")
                 .plaintext,
             b"downgrade me"
@@ -2764,7 +3065,15 @@ mod tests {
             .expect("seal")
             .0;
         let b_pk = b.ratchet_pk();
-        open(&a.store, &a.me(), &b.node_id, &reply, Some(&b_pk), NOW).expect("open");
+        open(
+            &a.store,
+            &a.me(),
+            &b.node_id,
+            &reply,
+            Some(&dev(&b_pk)),
+            NOW,
+        )
+        .expect("open");
         let bare = seal(&a.store, &a.me(), keys(&b, &ek, &pk), b"two", NOW)
             .expect("seal")
             .0;
@@ -2801,7 +3110,17 @@ mod tests {
         let last = forged.len() - 1;
         forged[last] ^= 0xFF;
         let a_pk = a.ratchet_pk();
-        assert!(open(&b.store, &b.me(), &a.node_id, &forged, Some(&a_pk), NOW).is_err());
+        assert!(
+            open(
+                &b.store,
+                &b.me(),
+                &a.node_id,
+                &forged,
+                Some(&dev(&a_pk)),
+                NOW
+            )
+            .is_err()
+        );
 
         assert_eq!(
             b.store.version(),
@@ -2820,7 +3139,7 @@ mod tests {
 
         // And the genuine frame still opens.
         assert_eq!(
-            open(&b.store, &b.me(), &a.node_id, &good, Some(&a_pk), NOW)
+            open(&b.store, &b.me(), &a.node_id, &good, Some(&dev(&a_pk)), NOW)
                 .expect("open")
                 .plaintext,
             b"two"
@@ -2863,7 +3182,15 @@ mod tests {
             .expect("seal")
             .0;
         let a_pk = a.ratchet_pk();
-        let got = open(&b.store, &b.me(), &a.node_id, &third, Some(&a_pk), NOW).expect("open");
+        let got = open(
+            &b.store,
+            &b.me(),
+            &a.node_id,
+            &third,
+            Some(&dev(&a_pk)),
+            NOW,
+        )
+        .expect("open");
         assert_eq!(got.plaintext, b"three");
         assert!(got.authenticated, "the authenticated flag must survive too");
 
@@ -2873,7 +3200,7 @@ mod tests {
             .0;
         let b_pk = b.ratchet_pk();
         assert_eq!(
-            open(&a.store, &a.me(), &b.node_id, &back, Some(&b_pk), NOW)
+            open(&a.store, &a.me(), &b.node_id, &back, Some(&dev(&b_pk)), NOW)
                 .expect("open")
                 .plaintext,
             b"four"
@@ -2904,9 +3231,16 @@ mod tests {
         assert_eq!(again[2], KIND_PROLOGUE);
         let a_pk = a.ratchet_pk();
         assert_eq!(
-            open(&b.store, &b.me(), &a.node_id, &again, Some(&a_pk), NOW)
-                .expect("open")
-                .plaintext,
+            open(
+                &b.store,
+                &b.me(),
+                &a.node_id,
+                &again,
+                Some(&dev(&a_pk)),
+                NOW
+            )
+            .expect("open")
+            .plaintext,
             b"again"
         );
     }
@@ -2931,7 +3265,15 @@ mod tests {
         );
 
         let a_pk = a.ratchet_pk();
-        open(&b.store, &b.me(), &a.node_id, &payload, Some(&a_pk), NOW).expect("open");
+        open(
+            &b.store,
+            &b.me(),
+            &a.node_id,
+            &payload,
+            Some(&dev(&a_pk)),
+            NOW,
+        )
+        .expect("open");
         assert_eq!(b.store.version(), 1);
         assert_eq!(b.store.drain_dirty().len(), 1);
     }
@@ -3088,9 +3430,16 @@ mod tests {
 
         let a_pk = a.ratchet_pk();
         assert_eq!(
-            open(&b.store, &b.me(), &a.node_id, &payload, Some(&a_pk), NOW)
-                .expect("a retired pair must still open")
-                .plaintext,
+            open(
+                &b.store,
+                &b.me(),
+                &a.node_id,
+                &payload,
+                Some(&dev(&a_pk)),
+                NOW
+            )
+            .expect("a retired pair must still open")
+            .plaintext,
             b"pre-rotation"
         );
     }
@@ -3124,7 +3473,15 @@ mod tests {
         );
 
         let a_pk = a.ratchet_pk();
-        let got = open(&b.store, &b.me(), &a.node_id, &payload, Some(&a_pk), NOW).expect("open");
+        let got = open(
+            &b.store,
+            &b.me(),
+            &a.node_id,
+            &payload,
+            Some(&dev(&a_pk)),
+            NOW,
+        )
+        .expect("open");
         assert_eq!(got.ack_key, sent_key);
         assert_eq!(got.plaintext, b"deliver me", "and must not leak into it");
 
@@ -3216,7 +3573,7 @@ mod tests {
             seed_ring: std::sync::Arc::clone(&b.ring),
         };
         let a_pk = a.ratchet_pk();
-        open(&store, &me, &a.node_id, &payload, Some(&a_pk), NOW).expect("open");
+        open(&store, &me, &a.node_id, &payload, Some(&dev(&a_pk)), NOW).expect("open");
 
         // Held, and the store did not grow: one of the planted entries went.
         assert_eq!(store.len(), 1_024, "the store grew past its ceiling");
@@ -3256,7 +3613,7 @@ mod tests {
             seed_ring: std::sync::Arc::clone(&b.ring),
         };
         let a_pk = a.ratchet_pk();
-        open(&store, &me, &a.node_id, &payload, Some(&a_pk), NOW).expect("open");
+        open(&store, &me, &a.node_id, &payload, Some(&dev(&a_pk)), NOW).expect("open");
 
         assert!(
             !store.has_session(&unproven[0]),
@@ -3397,7 +3754,7 @@ mod tests {
             seed_ring: std::sync::Arc::clone(&b.ring),
         };
         let a_pk = a.ratchet_pk();
-        let got = open(&store, &me, &a.node_id, &payload, Some(&a_pk), NOW)
+        let got = open(&store, &me, &a.node_id, &payload, Some(&dev(&a_pk)), NOW)
             .expect("a genuine message was dropped because the store was full");
         assert_eq!(got.plaintext, b"read me");
 
@@ -3824,11 +4181,19 @@ mod tests {
         ];
         for (name, payload) in cases {
             assert!(
-                open(&b.store, &b.me(), &a.node_id, &payload, Some(&a_pk), NOW).is_err(),
+                open(
+                    &b.store,
+                    &b.me(),
+                    &a.node_id,
+                    &payload,
+                    Some(&dev(&a_pk)),
+                    NOW
+                )
+                .is_err(),
                 "{name} was accepted"
             );
         }
-        assert!(open(&b.store, &b.me(), &a.node_id, &good, Some(&a_pk), NOW).is_ok());
+        assert!(open(&b.store, &b.me(), &a.node_id, &good, Some(&dev(&a_pk)), NOW).is_ok());
     }
 
     #[test]
@@ -3850,13 +4215,29 @@ mod tests {
             HEADER_LEN + PQXDH_PROLOGUE_LEN + FRAME_OVERHEAD + plaintext.len()
         );
         let a_pk = a.ratchet_pk();
-        open(&b.store, &b.me(), &a.node_id, &first, Some(&a_pk), NOW).expect("open");
+        open(
+            &b.store,
+            &b.me(),
+            &a.node_id,
+            &first,
+            Some(&dev(&a_pk)),
+            NOW,
+        )
+        .expect("open");
         let (aek, apk) = (a.ek(), a.ratchet_pk());
         let reply = seal(&b.store, &b.me(), keys(&a, &aek, &apk), b"r", NOW)
             .expect("seal")
             .0;
         let b_pk = b.ratchet_pk();
-        open(&a.store, &a.me(), &b.node_id, &reply, Some(&b_pk), NOW).expect("open");
+        open(
+            &a.store,
+            &a.me(),
+            &b.node_id,
+            &reply,
+            Some(&dev(&b_pk)),
+            NOW,
+        )
+        .expect("open");
         let second = seal(&a.store, &a.me(), keys(&b, &ek, &pk), plaintext, NOW)
             .expect("seal")
             .0;

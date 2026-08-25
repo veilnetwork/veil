@@ -1673,7 +1673,10 @@ mod ratchet_send_tests {
         );
         // The peer knows our device key, as it would after resolving us.
         let peer_rt = ratchet_runtime(PEER, PEER_INSTANCE, peer_ring);
-        wlock!(peer_rt.peer_ratchet_keys).insert(ME, my_ring.current_ratchet_pk());
+        wlock!(peer_rt.peer_ratchet_keys)
+            .entry(ME)
+            .or_default()
+            .remember(my_ring.current_ratchet_pk());
         Fixture {
             outbox: Arc::new(Outbox {
                 live: live_peers,
@@ -1714,7 +1717,10 @@ mod ratchet_send_tests {
         };
         let my_ratchet_pk = fx.me.seed_ring.read().expect("ring").current_ratchet_pk();
         let sibling_rt = ratchet_runtime(PEER, SIBLING_INSTANCE, sibling_ring);
-        wlock!(sibling_rt.peer_ratchet_keys).insert(ME, my_ratchet_pk);
+        wlock!(sibling_rt.peer_ratchet_keys)
+            .entry(ME)
+            .or_default()
+            .remember(my_ratchet_pk);
         // Singular answer = the LAST row = the sibling: the accident row and
         // the session's device must differ for the test to say anything.
         fx.certs = Arc::new(FamilyCerts(vec![session_row, sibling_row]));

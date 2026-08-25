@@ -295,7 +295,14 @@ impl DhtMlKemEkResolver {
         {
             keys.remove(&victim);
         }
-        keys.insert(target_node_id, cert.ratchet_x25519_pubkey);
+        // Remembered ALONGSIDE this peer's other devices, not over them. A
+        // certificate is per device, so a peer with a phone and a laptop
+        // publishes two of these; overwriting meant whichever sibling resolved
+        // last was the only one the receive path could authenticate
+        // (report14 V14-M6).
+        keys.entry(target_node_id)
+            .or_default()
+            .remember(cert.ratchet_x25519_pubkey);
     }
 
     /// The remembered certificate of one device, for a walk that came back
@@ -2067,7 +2074,7 @@ mod tests {
         );
         resolver.resolve_cert(target).await.expect("cached cert");
         assert_eq!(
-            rlock!(ratchet_keys).get(&target).copied(),
+            rlock!(ratchet_keys).get(&target).and_then(|d| d.newest()),
             Some([0x5A; 32]),
             "the verified device key must reach the map the receive path reads"
         );
