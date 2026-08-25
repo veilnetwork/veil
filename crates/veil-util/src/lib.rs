@@ -460,7 +460,24 @@ pub fn rename_durable(from: &std::path::Path, to: &std::path::Path) -> std::io::
             )
         };
         if ok == 0 {
-            return Err(std::io::Error::last_os_error());
+            let err = std::io::Error::last_os_error();
+            // ERROR_ACCESS_DENIED (5) is not "you may not do this". On Windows
+            // it is what `MoveFileEx` returns when the destination is open
+            // elsewhere or carries the readonly attribute.
+            //
+            // `std::fs::rename` survives that by falling back to
+            // `SetFileInformationByHandle` with POSIX semantics, which
+            // replaces a file other handles still hold. Calling `MoveFileExW`
+            // directly drops that fallback — which broke compaction outright
+            // in hidden-volume, where the identical helper was measured on a
+            // Windows machine. The cross-compile was green there too.
+            //
+            // The barrier is lost on this path. A publish that happens without
+            // it beats one that does not happen.
+            if err.raw_os_error() == Some(5) {
+                return std::fs::rename(from, to);
+            }
+            return Err(err);
         }
         Ok(())
     }
@@ -694,10 +711,39 @@ fn open_owner_only_create_new(path: &std::path::Path) -> std::io::Result<std::fs
 
 #[cfg(not(unix))]
 fn open_owner_only_create_new(path: &std::path::Path) -> std::io::Result<std::fs::File> {
-    std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(path)
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt as _;
+        // The mask is the point. A plain `.write(true)` asks for
+        // `GENERIC_WRITE`, and `SetSecurityInfo` — which is how the owner-only
+        // DACL gets onto this handle — needs `WRITE_DAC`, which
+        // `GENERIC_WRITE` does not include. Without it every owner-only write
+        // failed on Windows with `ERROR_ACCESS_DENIED` before a byte was
+        // written, which means the identity secrets that go through
+        // `atomic_write_owner_only` could not be saved on that platform at
+        // all. `READ_CONTROL` is needed to read the DACL back for the verdict,
+        // and `DELETE` to rename the staging file into place.
+        const GENERIC_WRITE: u32 = 0x4000_0000;
+        const DELETE: u32 = 0x0001_0000;
+        const READ_CONTROL: u32 = 0x0002_0000;
+        const WRITE_DAC: u32 = 0x0004_0000;
+        // `.write(true)` stays: Rust validates the logical flags before it
+        // looks at the mask, and `create_new` without it is refused with
+        // "creating or truncating a file requires write or append access".
+        // The mask is what actually reaches `CreateFileW`.
+        return std::fs::OpenOptions::new()
+            .write(true)
+            .access_mode(GENERIC_WRITE | DELETE | READ_CONTROL | WRITE_DAC)
+            .create_new(true)
+            .open(path);
+    }
+    #[cfg(not(windows))]
+    {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)
+    }
 }
 
 /// Encode a byte slice as a lowercase hex string. Uses a pre-allocated
