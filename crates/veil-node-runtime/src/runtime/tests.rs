@@ -637,6 +637,31 @@ async fn metrics_counters_move_on_session_lifecycle() {
     let _ = fs::remove_file(path);
 }
 
+/// How long a test waits for the runtime to dial it before calling it a
+/// failure.
+///
+/// The tests that use it are `#[ignore]`d as probabilistic — the dial may
+/// legitimately not happen, which is the thing they are about. What must not
+/// happen is a WEDGE: `accept()` waits forever, so a run invited by the ignore
+/// note ("run with --ignored") stops dead instead of reporting. Ten seconds is
+/// far past any real dial on loopback, and the point is that there is a bound
+/// at all.
+const TEST_DIAL_WAIT: Duration = Duration::from_secs(10);
+
+/// `listener.accept()` with [`TEST_DIAL_WAIT`] on it, so a dial that never
+/// comes is a named failure rather than a hung run.
+async fn accept_dial(listener: &TcpListener, what: &str) -> tokio::net::TcpStream {
+    match timeout(TEST_DIAL_WAIT, listener.accept()).await {
+        Ok(Ok((stream, _))) => stream,
+        Ok(Err(e)) => panic!("{what}: accept failed: {e}"),
+        Err(_) => panic!(
+            "{what}: the runtime never dialled within {TEST_DIAL_WAIT:?} — \
+             which is what these tests call probabilistic, and is a RESULT, \
+             not a reason to stop"
+        ),
+    }
+}
+
 // Audit batch 2026-05-24: probabilistically flaky after Phase E20
 // directional dedup landed (commit 4caea9b, 2026-05-22).  The test
 // uses a randomly-generated sovereign identity for the runtime AND
@@ -665,7 +690,7 @@ async fn runtime_creates_outbound_session_for_configured_peer() {
     let mut runtime = NodeRuntime::start(&path, true)
         .await
         .expect("runtime starts");
-    let (mut peer_stream, _) = peer_listener.accept().await.expect("peer accept");
+    let mut peer_stream = accept_dial(&peer_listener, "peer").await;
     let _runtime_node_id = complete_test_handshake(&mut peer_stream).await;
 
     timeout(Duration::from_secs(2), async {
@@ -762,7 +787,7 @@ async fn mobility_black_holed_bootstrap_session_reaps_and_redials() {
 
     // Phase 1 — admitted: the bootstrap dial lands, we complete the
     // scripted handshake, the session registers.
-    let (mut first_stream, _) = listener.accept().await.expect("first accept");
+    let mut first_stream = accept_dial(&listener, "first").await;
     let _ = perform_ovl1_handshake(
         &mut first_stream,
         &peer_identity,
@@ -903,7 +928,7 @@ async fn outbound_reconnect_happens_after_disconnect() {
         .await
         .expect("runtime starts");
 
-    let (mut first_stream, _) = listener.accept().await.expect("first accept");
+    let mut first_stream = accept_dial(&listener, "first").await;
     let _runtime_node_id = complete_test_handshake(&mut first_stream).await;
     timeout(Duration::from_secs(2), async {
         loop {
@@ -929,7 +954,7 @@ async fn outbound_reconnect_happens_after_disconnect() {
 
     first_stream.shutdown().await.expect("first shutdown");
 
-    let (mut second_stream, _) = listener.accept().await.expect("second accept");
+    let mut second_stream = accept_dial(&listener, "second").await;
     let _runtime_node_id = complete_test_handshake(&mut second_stream).await;
     timeout(Duration::from_secs(3), async {
         loop {
@@ -975,7 +1000,7 @@ async fn outbound_session_rejects_mismatched_peer_identity() {
     let mut runtime = NodeRuntime::start(&path, true)
         .await
         .expect("runtime starts");
-    let (mut peer_stream, _) = peer_listener.accept().await.expect("peer accept");
+    let mut peer_stream = accept_dial(&peer_listener, "peer").await;
     let _runtime_node_id = complete_test_handshake(&mut peer_stream).await;
 
     timeout(Duration::from_secs(2), async {
@@ -1014,7 +1039,7 @@ async fn outbound_session_accepts_and_updates_mismatched_peer_nonce() {
     let mut runtime = NodeRuntime::start(&path, true)
         .await
         .expect("runtime starts");
-    let (mut peer_stream, _) = peer_listener.accept().await.expect("peer accept");
+    let mut peer_stream = accept_dial(&peer_listener, "peer").await;
     let _runtime_node_id = complete_test_handshake(&mut peer_stream).await;
 
     // Session must be established (not rejected) even though the stored
