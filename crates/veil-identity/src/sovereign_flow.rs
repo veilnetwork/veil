@@ -3610,6 +3610,14 @@ mod tests {
         );
     }
 
+    // POSIX modes are how this arrangement is made — a file that exists and
+    // cannot be read. Windows expresses that through ACLs, so the test is
+    // gated exactly like the rollback one above it, which was gated and this
+    // one was not. Ungated, it did not merely skip on Windows: it took the
+    // whole crate's test build down with it, so NOTHING in veil-identity was
+    // runnable there — including the guard that every private-key file is
+    // published owner-only.
+    #[cfg(unix)]
     #[test]
     fn a_previous_state_that_cannot_be_read_is_never_treated_as_absent() {
         use std::os::unix::fs::PermissionsExt;
