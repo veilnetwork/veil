@@ -3658,7 +3658,6 @@ fn make_mlkem_runner(
 #[tokio::test]
 async fn mlkem_rekey_triggered_by_byte_threshold() {
     use tokio::io::AsyncReadExt;
-    use veil_proto::budget::MLKEM_REKEY_BYTES_THRESHOLD;
     use veil_proto::family::SessionMsg;
 
     // This test counts bytes on the wire, so it needs the padding flag at its
@@ -3667,6 +3666,11 @@ async fn mlkem_rekey_triggered_by_byte_threshold() {
     // what used to make this one fail in a parallel run and pass in a serial
     // one.
     let _padding = PaddingGuard::set(false);
+    // 200 KB instead of 128 GiB: this test is about CROSSING the threshold,
+    // not about the number. Crossing the real one means moving 128 GB through
+    // memory, which is what made this test a coin flip.
+    const TEST_THRESHOLD: u64 = 200_000;
+    let _threshold = MlKemThresholdGuard::set(TEST_THRESHOLD);
 
     let peer_id = [0xAAu8; 32];
     let (peer_mlkem_keys, per_session_mlkem_dk) = make_mlkem_state();
@@ -3688,7 +3692,7 @@ async fn mlkem_rekey_triggered_by_byte_threshold() {
     // We send a large PING (body = zeros) in a loop.
     // Since the runner counts RX bytes, we send enough to exceed the threshold.
     let chunk = vec![0u8; 65_000]; // ~65 KB per frame body
-    let frames_needed = (MLKEM_REKEY_BYTES_THRESHOLD / 65_000) as usize + 1;
+    let frames_needed = (TEST_THRESHOLD / 65_000) as usize + 1;
     for _ in 0..frames_needed {
         write_frame(
             &mut client,
@@ -3802,6 +3806,11 @@ async fn mlkem_rekey_responder_updates_cache_and_acks() {
 /// The old long-term DK seed should NOT match the new one (forward secrecy).
 #[tokio::test]
 async fn mlkem_rekey_initiator_commits_dk_seed_after_ack() {
+    // Same reason as the byte-threshold test above: crossing the real 128-GiB
+    // threshold means moving 128 GB through memory, and this test crosses it
+    // too. Both took the scheduler's word for whether they passed.
+    const TEST_THRESHOLD: u64 = 200_000;
+    let _threshold = MlKemThresholdGuard::set(TEST_THRESHOLD);
     use tokio::io::AsyncReadExt;
     use veil_proto::family::SessionMsg;
     use veil_proto::session::MlKemRekeyEkPayload;
@@ -3840,7 +3849,7 @@ async fn mlkem_rekey_initiator_commits_dk_seed_after_ack() {
 
     // Flood enough data to trigger the threshold.
     let chunk = vec![0u8; 65_000];
-    let frames_needed = (veil_proto::budget::MLKEM_REKEY_BYTES_THRESHOLD / 65_000) as usize + 1;
+    let frames_needed = (TEST_THRESHOLD / 65_000) as usize + 1;
     for _ in 0..frames_needed {
         write_frame(
             &mut client,
@@ -5861,6 +5870,46 @@ fn padding_lock() -> std::sync::MutexGuard<'static, ()> {
 /// named local: dropping it immediately releases the lock and restores the
 /// flag before the test body runs.
 #[must_use]
+/// Pins the ML-KEM byte threshold for the duration.
+///
+/// Its OWN lock, not the padding one: a test that holds `PaddingGuard` and
+/// then asks for this would take the same `Mutex` twice on one thread and
+/// hang, which is what the first version of this guard did. Order, where both
+/// are wanted: padding first, threshold second.
+///
+/// The real threshold is 128 GiB. A test that drives a rekey by crossing it
+/// has to move 128 GB through memory, and doing so is what made these tests
+/// flaky: the writes outran the runner, its own replies filled the return
+/// buffer nobody was draining, and it gave up — so the next write met a broken
+/// pipe. Which of those happened first depended on the scheduler.
+struct MlKemThresholdGuard {
+    _lock: std::sync::MutexGuard<'static, ()>,
+    prev: u64,
+}
+
+fn mlkem_threshold_lock() -> std::sync::MutexGuard<'static, ()> {
+    use std::sync::OnceLock;
+    static LOCK: OnceLock<std::sync::Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| std::sync::Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+}
+
+impl MlKemThresholdGuard {
+    fn set(bytes: u64) -> Self {
+        let lock = mlkem_threshold_lock();
+        let prev = veil_session::runner::mlkem_rekey_bytes_override();
+        veil_session::runner::set_mlkem_rekey_bytes_threshold(bytes);
+        Self { _lock: lock, prev }
+    }
+}
+
+impl Drop for MlKemThresholdGuard {
+    fn drop(&mut self) {
+        veil_session::runner::set_mlkem_rekey_bytes_threshold(self.prev);
+    }
+}
+
 struct PaddingGuard {
     _lock: std::sync::MutexGuard<'static, ()>,
     prev: bool,
