@@ -285,6 +285,21 @@ pub const CONVERSATION_BLOB_MAGIC: [u8; 4] = *b"VRC1";
 /// there is no shim, because nothing has shipped.
 const CONVERSATION_BLOB_V2: u8 = 2;
 
+/// The most conversations one PEER may hold that this device has never
+/// answered.
+///
+/// Unproven conversations are the ones a stranger can create: they cannot make
+/// us seal to them, so every conversation a flood produces is in this class.
+/// The global ceiling bounds how many exist; this bounds how many ONE sender
+/// can be responsible for, which is what turns "a peer churns the whole store"
+/// into "a peer churns eight slots".
+///
+/// Generous against the honest case it could bite: a contact reaches us from
+/// one conversation per device, and the moment we answer any of them it stops
+/// being unproven and stops counting here. Eight devices all talking to us
+/// before we have said a word back is already an unusual person.
+pub const MAX_UNPROVEN_PER_PEER: usize = 8;
+
 /// The largest number of conversations one device holds at once.
 ///
 /// A ceiling is required because the *inbound* side of this store is driven by
@@ -532,7 +547,33 @@ impl Inner {
     /// announces the key a contact published and still opens), so however many
     /// a flood creates, every one of them is in the class the next admission
     /// evicts, and not one proven conversation moves.
-    fn make_room(&mut self, now_unix: u64) -> bool {
+    fn make_room(&mut self, incoming: &ConversationKey, now_unix: u64) -> bool {
+        // One peer may not churn the whole store.
+        //
+        // A stranger's conversations are unproven by construction, so eviction
+        // never touches a proven one — that part already held. What did not is
+        // the COST of the churn: by varying its instance id, a single reachable
+        // sender takes every unproven slot in turn, and each eviction costs the
+        // host a blob delete and the scrub that follows it (report12 V-M10).
+        //
+        // Confining a peer to its own quota makes that cost proportional to the
+        // number of distinct peers rather than to how fast one of them can
+        // rename itself. It is checked BEFORE the ceiling, so the peer at its
+        // quota recycles its own slot even in a store with room to spare, and
+        // never reaches the global victim at all.
+        let mut mine: Vec<(u64, ConversationKey)> = self
+            .entries
+            .iter()
+            .filter(|(k, e)| k.peer_node_id == incoming.peer_node_id && e.droppable())
+            .map(|(k, e)| (e.last_used_at, *k))
+            .collect();
+        if mine.len() >= MAX_UNPROVEN_PER_PEER {
+            mine.sort_unstable();
+            let (_, oldest) = mine[0];
+            self.entries.remove(&oldest);
+            self.commit_change(oldest);
+            return true;
+        }
         if self.entries.len() < MAX_CONVERSATIONS {
             return true;
         }
@@ -873,7 +914,7 @@ impl RatchetStore {
         // epochs, in a 23 KB state rewritten on every advance.
         let dropped = entry.session.prune_skipped_to_current_epoch();
         let mut g = self.lock();
-        if !g.entries.contains_key(key) && !g.make_room(now_unix) {
+        if !g.entries.contains_key(key) && !g.make_room(key, now_unix) {
             return Err(RatchetSpliceError::StoreFull);
         }
         g.entries.insert(*key, entry);
@@ -1073,7 +1114,7 @@ fn seal_inner(
             // Room before work: the key agreement below is the expensive part,
             // and a store with nothing droppable in it is not going to hold the
             // result anyway.
-            if !g.make_room(now_unix) {
+            if !g.make_room(&key, now_unix) {
                 return Err(RatchetSpliceError::StoreFull);
             }
             let mut rng = OsRatchetRng;
@@ -1417,7 +1458,7 @@ fn open_inner(
                     None => Some(false),
                 };
                 if let Some(replaces) = admit
-                    && (replaces || g.make_room(now_unix))
+                    && (replaces || g.make_room(&key, now_unix))
                 {
                     g.entries.insert(
                         key,
@@ -1750,6 +1791,65 @@ mod tests {
                 }
             ),
             Err(RatchetSkipError::NoConversation)
+        );
+    }
+
+    /// report12 V-M10: eviction only ever takes an UNPROVEN conversation, so a
+    /// flood could never cost anyone a proven one. What it could do is take
+    /// every unproven slot in turn — one sender, varying its instance id —
+    /// and every eviction costs the host a blob delete and the scrub after it.
+    ///
+    /// A peer now churns its OWN quota instead of the store's.
+    #[test]
+    fn one_peer_cannot_churn_more_than_its_own_share() {
+        // `a` receives; the flood comes from node 2; `other` is a genuinely
+        // different node — an earlier version reused node 2 here and then
+        // asked why "another peer" was being refused.
+        let (a, other) = (device(1), device(3));
+
+        // Twice the quota of conversations from the SAME peer, each from a
+        // different device instance — the shape of the flood.
+        //
+        // Opened WITHOUT the sender's ratchet key, which is what makes them
+        // unproven: a stranger cannot make us answer, and an answered
+        // conversation is authenticated and outside this quota entirely. An
+        // earlier version of this test handed the key over and then wondered
+        // why the cap did nothing.
+        let mut spoken = 0;
+        for i in 0..(MAX_UNPROVEN_PER_PEER as u8 * 2) {
+            let mut sender = device(2);
+            sender.instance_id = [i.wrapping_add(1); 16];
+            let (ek, pk) = (a.ek(), a.ratchet_pk());
+            let payload = seal(
+                &sender.store,
+                &sender.me(),
+                keys(&a, &ek, &pk),
+                b"hello",
+                NOW,
+            )
+            .expect("seal")
+            .0;
+            if open(&a.store, &a.me(), &sender.node_id, &payload, None, NOW).is_ok() {
+                spoken += 1;
+            }
+        }
+        assert!(
+            spoken > MAX_UNPROVEN_PER_PEER,
+            "the fixture must actually get past the quota, or nothing is tested"
+        );
+        assert_eq!(
+            a.store.len(),
+            MAX_UNPROVEN_PER_PEER,
+            "one peer must not hold more unproven conversations than its share"
+        );
+
+        // And a DIFFERENT peer still gets in: the quota is per sender, not a
+        // shared ceiling the first arrival can spend on everyone's behalf.
+        a_to_b(&other, &a, b"from somebody else").expect("open");
+        assert_eq!(
+            a.store.len(),
+            MAX_UNPROVEN_PER_PEER + 1,
+            "another peer's first conversation must still be admitted"
         );
     }
 
