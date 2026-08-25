@@ -145,6 +145,25 @@ impl RealtimeDatagramTx {
         }
     }
 
+    /// Re-key this lane from the session's NEW material.
+    ///
+    /// The lane derives its key once, at construction, from the HANDSHAKE
+    /// keys — which a session rekey does not rotate. So the lane's key is the
+    /// one thing in a long-lived session that never changes, and a session
+    /// that rekeys for forward secrecy keeps handing its datagrams the same
+    /// key for its whole life (report12 V-M12).
+    ///
+    /// The sequence counter is deliberately NOT reset. It is what the nonce is
+    /// built from, so letting it run means no nonce is ever reused under
+    /// either key, and the receiver's replay window stays unbroken across the
+    /// change — a reset would do the opposite of both.
+    pub fn rekey(&mut self, raw_tx_key: &[u8; 32], session_id: &[u8; 32]) {
+        let mut key = derive_key(raw_tx_key, session_id);
+        self.cipher = ChaCha20Poly1305::new((&key).into());
+        use zeroize::Zeroize;
+        key.zeroize();
+    }
+
     /// Encrypt one complete loss-tolerant OVL1 frame into bounded datagrams.
     pub fn encode_frame(
         &mut self,
@@ -251,10 +270,27 @@ struct Assembly {
 /// Receive-side AEAD, replay window and bounded fragment reassembly.
 pub struct RealtimeDatagramRx {
     cipher: ChaCha20Poly1305,
+    /// The key from before the last [`rekey`](Self::rekey), kept until
+    /// `previous_until`.
+    ///
+    /// This lane is unordered and lossy by definition, so a datagram sealed
+    /// just before a rekey routinely arrives just after it. The ordered lane
+    /// solves the same problem with `rekey_rx_grace_buffer`; here the AEAD tag
+    /// is the discriminator — the new key is tried first, and only a failure
+    /// falls back, so a forgery costs one extra open and nothing else.
+    previous: Option<(ChaCha20Poly1305, Instant)>,
     replay: ReplayWindow,
     assemblies: HashMap<u32, Assembly>,
     assembly_bytes: usize,
 }
+
+/// How long a datagram sealed under the pre-rekey key is still opened.
+///
+/// The ordered lane holds its grace for 30 s against frames already queued;
+/// this lane carries live media, where anything older than a couple of seconds
+/// is discarded by the consumer anyway. Long enough for the in-flight window,
+/// short enough that a key is not kept around for a call's duration.
+pub const REALTIME_REKEY_GRACE: Duration = Duration::from_secs(5);
 
 impl RealtimeDatagramRx {
     pub fn new(raw_rx_key: &[u8; 32], session_id: &[u8; 32]) -> Self {
@@ -264,10 +300,62 @@ impl RealtimeDatagramRx {
         key.zeroize();
         Self {
             cipher,
+            previous: None,
             replay: ReplayWindow::default(),
             assemblies: HashMap::new(),
             assembly_bytes: 0,
         }
+    }
+
+    /// Re-key this lane from the session's NEW material, keeping the old key
+    /// openable for [`REALTIME_REKEY_GRACE`].
+    ///
+    /// See [`RealtimeDatagramTx::rekey`] for why the lane needs this at all.
+    /// The grace exists because the lane is unordered: a datagram sealed a
+    /// moment before the rekey arrives a moment after it, and dropping it
+    /// would make every rotation a hole in the media stream.
+    ///
+    /// The replay window is untouched: sequence numbers keep running across
+    /// the change, so a datagram cannot be replayed by arriving "under the old
+    /// key" either.
+    pub fn rekey(&mut self, raw_rx_key: &[u8; 32], session_id: &[u8; 32], now: Instant) {
+        let mut key = derive_key(raw_rx_key, session_id);
+        let fresh = ChaCha20Poly1305::new((&key).into());
+        use zeroize::Zeroize;
+        key.zeroize();
+        let retired = std::mem::replace(&mut self.cipher, fresh);
+        self.previous = Some((retired, now + REALTIME_REKEY_GRACE));
+    }
+
+    /// Open `datagram` under the current key, falling back to the retired one
+    /// while its grace lasts.
+    fn open(
+        &mut self,
+        header: &FragmentHeader,
+        datagram: &[u8],
+        now: Instant,
+    ) -> Result<Vec<u8>, RealtimeDatagramError> {
+        let payload = || Payload {
+            msg: &datagram[HEADER_LEN..],
+            aad: &datagram[..HEADER_LEN],
+        };
+        if let Ok(plaintext) = self.cipher.decrypt(&nonce_for(header.sequence), payload()) {
+            return Ok(plaintext);
+        }
+        // Expired grace is dropped here rather than on a timer: this is the
+        // only place that would consult it, and a lane with no traffic has
+        // nothing to protect.
+        if let Some((_, until)) = &self.previous
+            && now >= *until
+        {
+            self.previous = None;
+        }
+        let Some((previous, _)) = &self.previous else {
+            return Err(RealtimeDatagramError::Authentication);
+        };
+        previous
+            .decrypt(&nonce_for(header.sequence), payload())
+            .map_err(|_| RealtimeDatagramError::Authentication)
     }
 
     /// Authenticate one fragment. Returns a complete frame only when every
@@ -280,16 +368,7 @@ impl RealtimeDatagramRx {
         self.prune(now);
         let header = FragmentHeader::decode(datagram)?;
         self.replay.precheck(header.sequence)?;
-        let plaintext = self
-            .cipher
-            .decrypt(
-                &nonce_for(header.sequence),
-                Payload {
-                    msg: &datagram[HEADER_LEN..],
-                    aad: &datagram[..HEADER_LEN],
-                },
-            )
-            .map_err(|_| RealtimeDatagramError::Authentication)?;
+        let plaintext = self.open(&header, datagram, now)?;
         self.replay.commit(header.sequence);
         if plaintext.is_empty() || plaintext.len() > header.total_len as usize {
             return Err(RealtimeDatagramError::AssemblyOverflow);
@@ -408,6 +487,105 @@ mod tests {
             RealtimeDatagramTx::new(&key, &session),
             RealtimeDatagramRx::new(&key, &session),
         )
+    }
+
+    /// report12 V-M12: the lane derives its key once from the HANDSHAKE
+    /// material, which a session rekey does not rotate — so the one key in a
+    /// long-lived session that never changes is the one carrying its media.
+    ///
+    /// Rotating it has to survive the lane being unordered: a datagram sealed
+    /// a moment before the rekey arrives a moment after.
+    #[test]
+    fn a_rekeyed_lane_still_opens_what_was_sealed_just_before_it() {
+        let (mut tx, mut rx) = pair();
+        let now = Instant::now();
+
+        // In flight when the rekey happens.
+        let early = tx.encode_frame(b"before", 256).unwrap();
+
+        let next_session = [0x99u8; 32];
+        tx.rekey(&[0x42; 32], &next_session);
+        rx.rekey(&[0x42; 32], &next_session, now);
+
+        let late = tx.encode_frame(b"after", 256).unwrap();
+
+        // The new key opens the new frame...
+        let mut opened = None;
+        for d in &late {
+            if let Some(frame) = rx.decode_datagram(d, now).unwrap() {
+                opened = Some(frame);
+            }
+        }
+        assert_eq!(opened.as_deref(), Some(&b"after"[..]));
+
+        // ...and the retired one still opens what was already on the wire.
+        let mut stale = None;
+        for d in &early {
+            if let Some(frame) = rx.decode_datagram(d, now).unwrap() {
+                stale = Some(frame);
+            }
+        }
+        assert_eq!(
+            stale.as_deref(),
+            Some(&b"before"[..]),
+            "dropping the in-flight window would make every rotation a hole \
+             in the media stream"
+        );
+    }
+
+    /// ...but not forever. A key kept for the length of a call is a key the
+    /// rotation did not retire.
+    #[test]
+    fn the_retired_key_stops_opening_once_its_grace_is_up() {
+        let (mut tx, mut rx) = pair();
+        let now = Instant::now();
+        let early = tx.encode_frame(b"before", 256).unwrap();
+
+        let next_session = [0x99u8; 32];
+        tx.rekey(&[0x42; 32], &next_session);
+        rx.rekey(&[0x42; 32], &next_session, now);
+
+        let later = now + REALTIME_REKEY_GRACE + Duration::from_secs(1);
+        let mut opened = None;
+        for d in &early {
+            if let Ok(Some(frame)) = rx.decode_datagram(d, later) {
+                opened = Some(frame);
+            }
+        }
+        assert!(
+            opened.is_none(),
+            "the pre-rekey key outlived its grace, so the rotation bought \
+             nothing"
+        );
+    }
+
+    /// The sequence counter must RUN across a rekey, not restart: it is what
+    /// the nonce is built from, and the receiver's replay window is keyed by
+    /// it. A reset would offer the same sequence twice and let the window
+    /// refuse the second one.
+    #[test]
+    fn a_rekey_does_not_restart_the_sequence() {
+        let (mut tx, mut rx) = pair();
+        let now = Instant::now();
+        for d in &tx.encode_frame(b"one", 256).unwrap() {
+            rx.decode_datagram(d, now).unwrap();
+        }
+
+        let next_session = [0x99u8; 32];
+        tx.rekey(&[0x42; 32], &next_session);
+        rx.rekey(&[0x42; 32], &next_session, now);
+
+        let mut opened = None;
+        for d in &tx.encode_frame(b"two", 256).unwrap() {
+            if let Some(frame) = rx.decode_datagram(d, now).unwrap() {
+                opened = Some(frame);
+            }
+        }
+        assert_eq!(
+            opened.as_deref(),
+            Some(&b"two"[..]),
+            "a restarted sequence would be refused by the replay window"
+        );
     }
 
     #[test]
