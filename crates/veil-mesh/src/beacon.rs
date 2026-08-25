@@ -841,14 +841,6 @@ impl BeaconReceiver {
         self
     }
 
-    /// Process one incoming beacon frame.
-    ///
-    /// Returns `false` if the beacon was silently dropped (wrong realm, rate
-    /// limit exceeded, or neighbor table full). Returns `true` on acceptance.
-    pub fn handle_beacon(&mut self, frame: &MeshFrame, sender_addr: SocketAddr) -> bool {
-        self.handle_beacon_from(frame, sender_addr, crate::udp::FrameOrigin::Sealed)
-    }
-
     /// [`handle_beacon`](Self::handle_beacon), told whether the datagram
     /// arrived sealed under the realm key.
     ///
@@ -1077,7 +1069,11 @@ mod tests {
             1,
             MeshBeaconPayload::new_basic([1u8; 32], RealmId([2u8; 16])).encode(),
         );
-        receiver.handle_beacon(&frame, "127.0.0.1:9999".parse().unwrap());
+        receiver.handle_beacon_from(
+            &frame,
+            "127.0.0.1:9999".parse().unwrap(),
+            crate::udp::FrameOrigin::Sealed,
+        );
         assert_eq!(table.len(), 0); // not added
     }
 
@@ -1103,7 +1099,11 @@ mod tests {
             1,
             MeshBeaconPayload::new_basic([9u8; 32], RealmId([1u8; 16])).encode(),
         );
-        receiver.handle_beacon(&frame, "127.0.0.1:5555".parse().unwrap());
+        receiver.handle_beacon_from(
+            &frame,
+            "127.0.0.1:5555".parse().unwrap(),
+            crate::udp::FrameOrigin::Sealed,
+        );
         assert_eq!(table.len(), 1);
         assert!(table.link_to(&[9u8; 32]).is_some());
     }
@@ -1224,7 +1224,11 @@ mod tests {
             1,
             MeshBeaconPayload::new_basic([9u8; 32], RealmId([1u8; 16])).encode(),
         );
-        let accepted = receiver.handle_beacon(&frame, "127.0.0.1:5555".parse().unwrap());
+        let accepted = receiver.handle_beacon_from(
+            &frame,
+            "127.0.0.1:5555".parse().unwrap(),
+            crate::udp::FrameOrigin::Sealed,
+        );
         assert!(
             !accepted,
             "unsigned beacon must be dropped in require_signed mode"
@@ -1258,7 +1262,11 @@ mod tests {
             MeshBeaconPayload::new_basic([9u8; 32], RealmId([1u8; 16])).encode(),
         );
         assert!(
-            !receiver.handle_beacon(&frame, "127.0.0.1:5555".parse().unwrap()),
+            !receiver.handle_beacon_from(
+                &frame,
+                "127.0.0.1:5555".parse().unwrap(),
+                crate::udp::FrameOrigin::Sealed
+            ),
             "default mode must drop an unsigned beacon"
         );
         assert_eq!(table.len(), 0);
@@ -1392,7 +1400,7 @@ mod tests {
         let (frame, _node_id) = signed_beacon_frame(realm, [0x11u8; 32]);
         let honest: SocketAddr = "127.0.0.1:7001".parse().unwrap();
         assert!(
-            receiver.handle_beacon(&frame, honest),
+            receiver.handle_beacon_from(&frame, honest, crate::udp::FrameOrigin::Sealed),
             "the genuine beacon is accepted"
         );
         assert_eq!(table.len(), 1, "the honest link is registered");
@@ -1403,7 +1411,7 @@ mod tests {
         // itself, because the re-add of a just-removed entry returns true.
         let attacker: SocketAddr = "127.0.0.1:7002".parse().unwrap();
         assert!(
-            !receiver.handle_beacon(&frame, attacker),
+            !receiver.handle_beacon_from(&frame, attacker, crate::udp::FrameOrigin::Sealed),
             "a verbatim replay must be dropped before the link is re-registered"
         );
 
@@ -1412,7 +1420,7 @@ mod tests {
         let (fresh, _) = signed_beacon_frame(realm, [0x11u8; 32]);
         if fresh.payload != frame.payload {
             assert!(
-                receiver.handle_beacon(&fresh, attacker),
+                receiver.handle_beacon_from(&fresh, attacker, crate::udp::FrameOrigin::Sealed),
                 "a fresh signed beacon must still be accepted"
             );
         }
@@ -1440,7 +1448,11 @@ mod tests {
             1,
             MeshBeaconPayload::new_basic([9u8; 32], RealmId([1u8; 16])).encode(),
         );
-        assert!(receiver.handle_beacon(&frame, "127.0.0.1:5555".parse().unwrap()));
+        assert!(receiver.handle_beacon_from(
+            &frame,
+            "127.0.0.1:5555".parse().unwrap(),
+            crate::udp::FrameOrigin::Sealed
+        ));
         assert_eq!(table.len(), 1);
     }
 
@@ -1464,8 +1476,16 @@ mod tests {
             1,
             MeshBeaconPayload::new_basic([7u8; 32], RealmId([1u8; 16])).encode(),
         );
-        receiver.handle_beacon(&frame, "127.0.0.1:6666".parse().unwrap());
-        receiver.handle_beacon(&frame, "127.0.0.1:6666".parse().unwrap());
+        receiver.handle_beacon_from(
+            &frame,
+            "127.0.0.1:6666".parse().unwrap(),
+            crate::udp::FrameOrigin::Sealed,
+        );
+        receiver.handle_beacon_from(
+            &frame,
+            "127.0.0.1:6666".parse().unwrap(),
+            crate::udp::FrameOrigin::Sealed,
+        );
         assert_eq!(table.len(), 1); // not doubled
     }
 
@@ -1518,7 +1538,7 @@ mod tests {
                 1,
                 MeshBeaconPayload::new_basic(node_id, RealmId([1u8; 16])).encode(),
             );
-            if receiver.handle_beacon(&frame, sender) {
+            if receiver.handle_beacon_from(&frame, sender, crate::udp::FrameOrigin::Sealed) {
                 accepted += 1;
             }
         }
@@ -1554,12 +1574,12 @@ mod tests {
 
         // First beacon: accepted.
         assert!(
-            receiver.handle_beacon(&frame, addr),
+            receiver.handle_beacon_from(&frame, addr, crate::udp::FrameOrigin::Sealed),
             "first beacon must be accepted"
         );
         // Second beacon within window: dropped.
         assert!(
-            !receiver.handle_beacon(&frame, addr),
+            !receiver.handle_beacon_from(&frame, addr, crate::udp::FrameOrigin::Sealed),
             "duplicate within window must be dropped"
         );
     }
@@ -1671,7 +1691,7 @@ mod tests {
         );
         let addr: SocketAddr = "127.0.0.1:9101".parse().unwrap();
         assert!(
-            !receiver.handle_beacon(&mine, addr),
+            !receiver.handle_beacon_from(&mine, addr, crate::udp::FrameOrigin::Sealed),
             "our own beacon must not register us as our own neighbour"
         );
         assert!(
@@ -1689,7 +1709,7 @@ mod tests {
             MeshBeaconPayload::new_basic(theirs_id, realm).encode(),
         );
         assert!(
-            receiver.handle_beacon(&theirs, addr),
+            receiver.handle_beacon_from(&theirs, addr, crate::udp::FrameOrigin::Sealed),
             "the filter must drop only US, not everybody sharing the port"
         );
     }
@@ -1717,7 +1737,7 @@ mod tests {
         let addr: SocketAddr = "127.0.0.1:9002".parse().unwrap();
 
         // Both beacons processed (neighbor table only adds once, but handle_beacon returns true).
-        assert!(receiver.handle_beacon(&frame, addr));
+        assert!(receiver.handle_beacon_from(&frame, addr, crate::udp::FrameOrigin::Sealed));
         // Second call returns false because neighbor already in table — but not because of dedup.
         // (The neighbor table add returns false for a duplicate, so handle_beacon returns false here.)
         // We just check that the dedup map is empty.

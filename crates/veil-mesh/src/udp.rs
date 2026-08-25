@@ -485,16 +485,25 @@ impl UdpRealm {
     /// Create a [`BeaconReceiver`] that uses this realm's shared socket to
     /// construct back-links toward beacon senders.
     ///
-    /// The caller must route broadcast frames to it from the receive loop:
+    /// The caller must route broadcast frames to it from the receive loop,
+    /// carrying the ORIGIN through:
     ///
     /// ```ignore
-    /// let (frame, addr) = realm.recv_frame.await?;
-    /// if frame.is_broadcast {
-    /// receiver.handle_beacon(&frame, addr);
+    /// let got = realm.recv_frame().await?;
+    /// if got.frame.is_broadcast {
+    ///     receiver.handle_beacon_from(&got.frame, got.from, got.origin, crate::udp::FrameOrigin::Sealed);
     /// } else {
-    /// //... normal dispatch
+    ///     // ... normal dispatch
     /// }
     /// ```
+    ///
+    /// The origin is not decoration. In a realm with a key, a beacon heard in
+    /// the CLEAR comes from somebody who does not hold that key, and only the
+    /// seal says otherwise — the beacon's own signature is made with the key
+    /// the beacon carries, so anyone can produce a valid one. This snippet
+    /// used to end in a call that assumed `Sealed`, which handed an on-link
+    /// attacker the topology and gateway privileges the realm key exists to
+    /// gate (report14 V14-M13).
     pub fn make_beacon_receiver(
         &self,
         local_node_id: [u8; 32],
@@ -511,20 +520,44 @@ impl UdpRealm {
 
     /// Receive one `MeshFrame` from the socket.
     ///
-    /// Returns `(frame, sender_addr)` on success. Drops datagrams that fail
-    /// to decode or exceed `MAX_UDP_FRAME`.
-    pub async fn recv_frame(&self) -> std::io::Result<(MeshFrame, SocketAddr)> {
+    /// Carries the ORIGIN with the frame, because a caller that has to ask for
+    /// it separately is a caller that can forget. This used to return a pair
+    /// and drop the provenance on the floor, and the beacon entry point beside
+    /// it then assumed the most privileged answer (report14 V14-M13).
+    ///
+    /// Drops datagrams that fail to decode or exceed `MAX_UDP_FRAME`.
+    pub async fn recv_frame(&self) -> std::io::Result<ReceivedFrame> {
         let mut buf = vec![0u8; MAX_UDP_FRAME];
         loop {
             let (len, src) = self.socket.recv_from(&mut buf).await?;
-            if let Some(frame) = self.decode_datagram(&buf[..len]) {
-                return Ok((frame, src));
+            if let Some((frame, origin)) = self.decode_datagram_with_origin(&buf[..len]) {
+                return Ok(ReceivedFrame {
+                    frame,
+                    from: src,
+                    origin,
+                });
             }
             // Malformed, or a replay this realm has already seen — drop and
             // keep receiving.
         }
     }
+}
 
+/// One datagram this realm accepted, with WHERE it came from and HOW.
+///
+/// A struct rather than a tuple so the provenance cannot be dropped by
+/// pattern-matching two of three fields — which is what the pair this replaced
+/// invited, and what made the documented receive loop grant realm-key
+/// privileges to a plaintext beacon (report14 V14-M13).
+#[derive(Debug, Clone)]
+pub struct ReceivedFrame {
+    pub frame: MeshFrame,
+    pub from: SocketAddr,
+    /// Sealed under the realm key, or heard in the clear.
+    pub origin: FrameOrigin,
+}
+
+impl UdpRealm {
     /// Open and decode one datagram under this realm's rules.
     ///
     /// Shared with the beacon-receive socket so the two do not drift: the
@@ -657,11 +690,11 @@ mod tests {
         let frame = sample_frame();
         assert_eq!(link_a_to_b.send(&frame), SendResult::Ok);
 
-        let (received, _src) =
-            tokio::time::timeout(std::time::Duration::from_secs(2), realm_b.recv_frame())
-                .await
-                .expect("timeout")
-                .unwrap();
+        let got = tokio::time::timeout(std::time::Duration::from_secs(2), realm_b.recv_frame())
+            .await
+            .expect("timeout")
+            .unwrap();
+        let received = got.frame;
 
         assert_eq!(received, frame);
     }
@@ -687,11 +720,11 @@ mod tests {
         let link = realm_a.link_to([2u8; 32], addr_b);
         let frame = sample_frame();
         assert_eq!(link.send(&frame), SendResult::Ok);
-        let (received, _src) =
-            tokio::time::timeout(std::time::Duration::from_secs(2), realm_b.recv_frame())
-                .await
-                .expect("timeout")
-                .unwrap();
+        let got = tokio::time::timeout(std::time::Duration::from_secs(2), realm_b.recv_frame())
+            .await
+            .expect("timeout")
+            .unwrap();
+        let received = got.frame;
         assert_eq!(
             received, frame,
             "matching-PSK realm must open the sealed frame"
@@ -764,12 +797,93 @@ mod tests {
             plain_sender.link_to(BROADCAST_NODE_ID, addr).send(&bcast),
             SendResult::Ok
         );
-        let (received, _src) =
-            tokio::time::timeout(std::time::Duration::from_secs(2), sealed_recv.recv_frame())
-                .await
-                .expect("broadcast must be delivered")
-                .unwrap();
+        let got = tokio::time::timeout(std::time::Duration::from_secs(2), sealed_recv.recv_frame())
+            .await
+            .expect("broadcast must be delivered")
+            .unwrap();
+        let received = got.frame;
         assert_eq!(received, bcast, "unsealed broadcast must still parse");
+        // …and it arrives marked as what it is. The receive used to hand back
+        // the frame alone, and the beacon entry point beside it then assumed
+        // the most privileged answer — so a caller wiring the two together the
+        // way the docs showed gave an on-link stranger the topology and
+        // gateway privileges the realm key exists to gate (report14 V14-M13).
+        assert_eq!(
+            got.origin,
+            FrameOrigin::Plaintext,
+            "a beacon heard in the clear in a KEYED realm comes from somebody \
+             who does not hold that key, and the receive has to say so"
+        );
+    }
+
+    /// The documented receive loop, run end to end: a plaintext beacon in a
+    /// keyed realm must not change this node's topology.
+    ///
+    /// The composition is what the finding was about — each half was defensible
+    /// alone. `recv_frame` dropped the provenance, and `handle_beacon` invented
+    /// `Sealed` to replace it (report14 V14-M13).
+    #[tokio::test]
+    async fn the_documented_receive_loop_refuses_a_plaintext_beacon() {
+        let realm_id = RealmId([9u8; 16]);
+        let psk = [7u8; 32];
+        let plain_sender = UdpRealm::bind("127.0.0.1:0".parse().unwrap(), realm_id, None)
+            .await
+            .unwrap();
+        let sealed_recv = UdpRealm::bind("127.0.0.1:0".parse().unwrap(), realm_id, Some(&psk[..]))
+            .await
+            .unwrap();
+        let addr = sealed_recv.local_addr().unwrap();
+
+        let neighbors = crate::neighbor::NeighborTable::new();
+        // The signature is not what is under test here — the realm KEY is —
+        // and an unsigned beacon is refused whatever its origin, which would
+        // make every assertion below true for the wrong reason.
+        let mut receiver = sealed_recv
+            .make_beacon_receiver([2u8; 32], neighbors.clone())
+            .with_require_signed(false);
+
+        let beacon = |node: [u8; 32]| {
+            MeshFrame::new(
+                realm_id,
+                node,
+                veil_proto::mesh::BROADCAST_NODE_ID,
+                5,
+                veil_proto::mesh::MeshBeaconPayload::new_basic(node, realm_id).encode(),
+            )
+        };
+        let frame = beacon([1u8; 32]);
+        assert_eq!(
+            plain_sender
+                .link_to(veil_proto::mesh::BROADCAST_NODE_ID, addr)
+                .send(&frame),
+            SendResult::Ok
+        );
+
+        let got = tokio::time::timeout(std::time::Duration::from_secs(2), sealed_recv.recv_frame())
+            .await
+            .expect("the beacon must still be delivered")
+            .unwrap();
+
+        // Exactly the loop the module doc shows.
+        let accepted = receiver.handle_beacon_from(&got.frame, got.from, got.origin);
+        assert!(
+            !accepted,
+            "a beacon nobody sealed must not register a neighbour in a keyed \
+             realm — this is the whole of the finding"
+        );
+        assert_eq!(neighbors.len(), 0, "no neighbour from outside the realm");
+
+        // The vacuity guard, and the reason the fix is about PROVENANCE rather
+        // than about refusing beacons: the same frame, marked as what a realm
+        // member's would be, is taken. A different node id because the
+        // per-source dedup window would swallow a second beacon from the same
+        // one whatever this change did.
+        let member = beacon([3u8; 32]);
+        assert!(
+            receiver.handle_beacon_from(&member, got.from, FrameOrigin::Sealed),
+            "a sealed beacon is an ordinary member and must still register"
+        );
+        assert_eq!(neighbors.len(), 1);
     }
 
     #[tokio::test]
@@ -814,13 +928,14 @@ mod tests {
             .unwrap();
 
         // A receives one frame and dispatches it to BeaconReceiver.
-        let (frame, src) = tokio::time::timeout(Duration::from_secs(3), realm_a.recv_frame())
+        let got = tokio::time::timeout(Duration::from_secs(3), realm_a.recv_frame())
             .await
             .expect("beacon not received within 3 s")
             .unwrap();
+        let (frame, src, origin) = (got.frame, got.from, got.origin);
 
         assert!(frame.is_broadcast(), "beacon must be a broadcast frame");
-        let accepted = receiver_a.handle_beacon(&frame, src);
+        let accepted = receiver_a.handle_beacon_from(&frame, src, origin);
         assert!(accepted, "beacon should be accepted");
         assert!(
             neighbors_a.link_to(&node_b_id).is_some(),
@@ -904,13 +1019,14 @@ mod tests {
             .await
             .unwrap();
 
-        let (frame, src) = tokio::time::timeout(Duration::from_secs(3), realm_a.recv_frame())
+        let got = tokio::time::timeout(Duration::from_secs(3), realm_a.recv_frame())
             .await
             .expect("sealed beacon not received within 3 s")
             .unwrap();
+        let (frame, src, origin) = (got.frame, got.from, got.origin);
         assert!(frame.is_broadcast(), "beacon must be a broadcast frame");
         assert!(
-            receiver_a.handle_beacon(&frame, src),
+            receiver_a.handle_beacon_from(&frame, src, origin),
             "sealed beacon accepted"
         );
         assert!(
@@ -961,11 +1077,12 @@ mod tests {
         // Receive all frames synchronously (they're already in the socket buffer).
         let mut accepted = 0u32;
         for _ in 0..total {
-            let (frame, src) = tokio::time::timeout(Duration::from_secs(2), realm_a.recv_frame())
+            let got = tokio::time::timeout(Duration::from_secs(2), realm_a.recv_frame())
                 .await
                 .expect("frame not received in time")
                 .unwrap();
-            if receiver_a.handle_beacon(&frame, src) {
+            let (frame, src, origin) = (got.frame, got.from, got.origin);
+            if receiver_a.handle_beacon_from(&frame, src, origin) {
                 accepted += 1;
             }
         }
