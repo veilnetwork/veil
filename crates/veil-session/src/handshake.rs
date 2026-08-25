@@ -1265,6 +1265,11 @@ where
     // runtime additionally requires the selected transport to expose a
     // negotiated DATAGRAM handle before enabling it.
     caps.flags |= cap_flags::SUPPORTS_REALTIME_DATAGRAMS;
+    // And that this build re-derives the lane's key when the session rekeys.
+    // Advertised unconditionally because the code that does it is always
+    // present; whether it HAPPENS is the negotiation, and a peer without the
+    // bit keeps the static key it always had (report12 V-M12).
+    caps.flags |= cap_flags::SUPPORTS_REALTIME_REKEY;
     let caps_bytes = caps.encode();
     let caps_wire =
         write_frame(stream, family, SessionMsg::Capabilities as u16, &caps_bytes).await?;

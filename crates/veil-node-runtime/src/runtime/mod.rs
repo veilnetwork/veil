@@ -384,7 +384,7 @@ pub struct AttachedDebugSession {
     /// Unreliable side channel cloned from the same authenticated QUIC
     /// connection before its primary stream was consumed. `None` for TCP,
     /// obfs4, TLS and websocket transports.
-    pub quic_datagrams: Option<veil_transport::QuicDatagramHandle>,
+    pub quic_datagrams: Option<veil_session::runner::RealtimeLaneOffer>,
     pub metrics: Option<Arc<NodeMetrics>>,
     /// Authenticated peer node_id from the handshake.
     pub peer_id: NodeId,

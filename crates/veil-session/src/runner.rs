@@ -183,6 +183,10 @@ async fn await_next_input(
 /// lane. It exists only after capability AND transport negotiation succeed.
 struct RealtimeDatagramLane {
     handle: veil_transport::QuicDatagramHandle,
+    /// Whether the peer rotates its half too. False keeps the lane on the key
+    /// derived at the handshake, which is what every peer without the
+    /// capability expects to keep receiving under.
+    peer_rotates: bool,
     tx: crate::realtime_datagram::RealtimeDatagramTx,
     max_datagram_size: usize,
     logged_send_kinds: u8,
@@ -295,9 +299,16 @@ fn enqueue_outbox_frame(
     }
 }
 
+/// A rekey handed to the realtime receiver: the session's new RX key and id.
+///
+/// A channel rather than a shared lock, because the alternative is taking one
+/// per DATAGRAM on a media path to serve an event that happens once an hour.
+pub(crate) type RealtimeRekey = ([u8; 32], [u8; 32]);
+
 fn spawn_realtime_receiver(
     handle: veil_transport::QuicDatagramHandle,
     mut rx: crate::realtime_datagram::RealtimeDatagramRx,
+    mut rekeys: tokio::sync::mpsc::Receiver<RealtimeRekey>,
     context: RealtimeReceiverContext,
 ) -> RealtimeReceiverTask {
     RealtimeReceiverTask(tokio::spawn(async move {
@@ -311,7 +322,18 @@ fn spawn_realtime_receiver(
         } = context;
         let mut logged_receive_kinds = 0u8;
         loop {
-            let datagram = match handle.recv().await {
+            let datagram = match tokio::select! {
+                // Biased so a rekey that is already waiting is applied before
+                // the next datagram is opened: the other side switched keys
+                // the moment it told us to, and one opened under the old key
+                // afterwards is a drop for nothing.
+                biased;
+                Some((rx_key, session_id)) = rekeys.recv() => {
+                    rx.rekey(&rx_key, &session_id, std::time::Instant::now());
+                    continue;
+                }
+                received = handle.recv() => received,
+            } {
                 Ok(datagram) => datagram,
                 Err(error) => {
                     logger.debug(
@@ -429,6 +451,34 @@ pub struct CryptoState {
     /// so the dispatcher uses it for decryption of incoming E2E
     /// messages from this peer.  Shared `Arc` with `CryptoContext`.
     pub per_session_mlkem_dk: Option<PerSessionMlKemDk>,
+}
+
+/// What a rekey completion needs to rotate the realtime lane: the sending half
+/// it owns, and the channel to the receiving half that lives in its own task.
+///
+/// Passed as one argument because the two are useless apart — rotating the
+/// sender without telling the receiver is the failure this whole capability
+/// exists to avoid.
+pub(crate) struct RealtimeRekeyTargets<'a> {
+    lane: Option<&'a mut RealtimeDatagramLane>,
+    receiver: Option<&'a tokio::sync::mpsc::Sender<RealtimeRekey>>,
+}
+
+/// A negotiated realtime DATAGRAM lane, with what the peer agreed to do with
+/// it.
+///
+/// The flag travels WITH the handle rather than as a field of its own for the
+/// reason the mobile signals one section down give: `SessionRunner` is built
+/// by struct literal in dozens of places, and a new field touches all of them
+/// while this touches only the places that actually offer a lane.
+pub struct RealtimeLaneOffer {
+    pub handle: veil_transport::QuicDatagramHandle,
+    /// Whether the peer re-derives the lane's key when the session rekeys.
+    ///
+    /// Both sides must, or the one that rotates leaves the other unable to
+    /// open anything past the first rekey — which is why this is negotiated
+    /// rather than assumed (report12 V-M12).
+    pub peer_rotates: bool,
 }
 
 /// Hot-standby transport-swap state for one session.
@@ -597,7 +647,7 @@ pub struct SessionRunner {
     /// QUIC DATAGRAM handle cloned from the same connection as `stream`.
     /// The runner uses it only for authenticated AppRtData; other transports
     /// and hot-swapped streams keep the established ordered fallback.
-    pub quic_datagrams: Option<veil_transport::QuicDatagramHandle>,
+    pub quic_datagrams: Option<RealtimeLaneOffer>,
     pub peer_id: NodeIdBytes,
     pub dispatcher: Arc<dyn crate::dispatcher_sink::DispatcherSink>,
     pub logger: Arc<NodeLogger>,
@@ -1056,6 +1106,7 @@ impl SessionRunner {
         body: &[u8],
         rekey: &mut crate::rekey_context::RekeyContext,
         rx_cipher_prev: &mut crate::rekey_rx_grace_buffer::RekeyRxGraceBuffer,
+        realtime: RealtimeRekeyTargets<'_>,
     ) -> std::ops::ControlFlow<()> {
         use std::ops::ControlFlow;
         // Initiator path: peer confirmed the rekey, sent their pubkey.
@@ -1136,6 +1187,21 @@ impl SessionRunner {
             // CURRENT id (report12 V-M11).
             if let Some(handle) = self.hot_standby.swap_registry.as_ref() {
                 handle.rekey(self.session_id);
+            }
+            // And the realtime lane, whose key is otherwise the one thing in
+            // a long-lived session that never moves (report12 V-M12). Only
+            // when the peer rotates too: alone, we would be sending under a
+            // key it cannot open.
+            if let Some(lane) = realtime.lane
+                && lane.peer_rotates
+            {
+                lane.tx.rekey(&new_keys.tx_key, &new_keys.session_id);
+                if let Some(tx) = realtime.receiver {
+                    // Full means a rotation is already queued and this one
+                    // supersedes nothing the receiver has not yet applied —
+                    // dropping it is safer than blocking the session loop.
+                    let _ = tx.try_send((new_keys.rx_key, new_keys.session_id));
+                }
             }
             rekey.record_rekey_complete(tokio::time::Instant::now());
             // l: demoted to DEBUG.
@@ -2201,6 +2267,7 @@ impl SessionRunner {
         body: &[u8],
         rekey: &mut crate::rekey_context::RekeyContext,
         rx_cipher_prev: &mut crate::rekey_rx_grace_buffer::RekeyRxGraceBuffer,
+        realtime: RealtimeRekeyTargets<'_>,
         wire_tx: &mpsc::Sender<veil_bufpool::PooledShared>,
         write_error_count: &mut crate::write_error_tracker::WriteErrorTracker,
     ) -> std::ops::ControlFlow<()> {
@@ -2370,6 +2437,21 @@ impl SessionRunner {
             // CURRENT id (report12 V-M11).
             if let Some(handle) = self.hot_standby.swap_registry.as_ref() {
                 handle.rekey(self.session_id);
+            }
+            // And the realtime lane, whose key is otherwise the one thing in
+            // a long-lived session that never moves (report12 V-M12). Only
+            // when the peer rotates too: alone, we would be sending under a
+            // key it cannot open.
+            if let Some(lane) = realtime.lane
+                && lane.peer_rotates
+            {
+                lane.tx.rekey(&new_keys.tx_key, &new_keys.session_id);
+                if let Some(tx) = realtime.receiver {
+                    // Full means a rotation is already queued and this one
+                    // supersedes nothing the receiver has not yet applied —
+                    // dropping it is safer than blocking the session loop.
+                    let _ = tx.try_send((new_keys.rx_key, new_keys.session_id));
+                }
             }
             rekey.record_rekey_complete(tokio::time::Instant::now());
             // l: demoted to DEBUG.
@@ -3168,17 +3250,27 @@ impl SessionRunner {
         // session cipher's implicit nonce counter cannot safely be shared with
         // an unordered/lossy transport.
         let mut realtime_receiver_task = None;
+        // `None` when the peer did not advertise lane rotation: it keeps the
+        // static key, so telling our receiver to move would strand it.
+        let mut realtime_rekey_tx: Option<tokio::sync::mpsc::Sender<RealtimeRekey>> = None;
         let mut realtime_lane = match (self.quic_datagrams.take(), self.raw_session_keys.as_ref()) {
-            (Some(handle), Some((raw_tx_key, raw_rx_key, session_id))) => handle
+            (Some(offer), Some((raw_tx_key, raw_rx_key, session_id))) => offer
+                .handle
                 .max_size()
                 // 24-byte lane header + 16-byte Poly1305 tag + ≥1 payload.
                 .filter(|size| *size > 40)
                 .map(|max_datagram_size| {
                     let rx =
                         crate::realtime_datagram::RealtimeDatagramRx::new(raw_rx_key, session_id);
+                    // Room for one pending rekey: a second before the first
+                    // is applied would mean two rotations inside one receive,
+                    // which the grace window already covers.
+                    let (rekey_tx, rekey_rx) = tokio::sync::mpsc::channel(1);
+                    realtime_rekey_tx = offer.peer_rotates.then_some(rekey_tx);
                     realtime_receiver_task = Some(spawn_realtime_receiver(
-                        handle.clone(),
+                        offer.handle.clone(),
                         rx,
+                        rekey_rx,
                         RealtimeReceiverContext {
                             peer_id: self.peer_id,
                             dispatcher: Arc::clone(&self.dispatcher),
@@ -3196,7 +3288,8 @@ impl SessionRunner {
                         ),
                     );
                     RealtimeDatagramLane {
-                        handle,
+                        handle: offer.handle,
+                        peer_rotates: offer.peer_rotates,
                         tx: crate::realtime_datagram::RealtimeDatagramTx::new(
                             raw_tx_key, session_id,
                         ),
@@ -4389,6 +4482,10 @@ impl SessionRunner {
                             body,
                             &mut rekey,
                             &mut rx_cipher_prev,
+                            RealtimeRekeyTargets {
+                                lane: realtime_lane.as_mut(),
+                                receiver: realtime_rekey_tx.as_ref(),
+                            },
                             &wire_tx,
                             &mut write_error_count,
                         ) {
@@ -4402,7 +4499,15 @@ impl SessionRunner {
                     Ok(SessionMsg::RekeyAck) => {
                         // Break tears the session down when the peer's rekey
                         // ephemeral is non-contributory (downgrade attempt).
-                        match self.handle_rekey_ack_arm(body, &mut rekey, &mut rx_cipher_prev) {
+                        match self.handle_rekey_ack_arm(
+                            body,
+                            &mut rekey,
+                            &mut rx_cipher_prev,
+                            RealtimeRekeyTargets {
+                                lane: realtime_lane.as_mut(),
+                                receiver: realtime_rekey_tx.as_ref(),
+                            },
+                        ) {
                             std::ops::ControlFlow::Continue(()) => continue,
                             std::ops::ControlFlow::Break(()) => {
                                 Self::stop_writer(wire_tx, &mut writer_handle).await;
