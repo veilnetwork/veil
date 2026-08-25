@@ -77,10 +77,66 @@ pub(crate) fn traffic_status_update(delta_tx: usize, delta_rx: usize) -> Result<
 }
 
 fn send_traffic_stat(traffic_status: &TrafficStatus) -> Result<()> {
-    if let Ok(cb) = TRAFFIC_STATUS_CALLBACK.lock() {
-        if let Some(cb) = cb.clone() {
-            unsafe { cb.call(traffic_status) };
-        }
+    // Copied out and the lock RELEASED before the call.
+    //
+    // The callback is foreign code, and foreign code may do anything —
+    // including install a new callback, which takes this very mutex. Calling
+    // while the guard is alive makes that a deadlock: the callback waits for a
+    // lock its own caller is holding, and nothing unwinds it (report14
+    // V14-L5). Nothing about a registry needs to stay locked while the thing
+    // it registered runs.
+    let cb = TRAFFIC_STATUS_CALLBACK.lock().ok().and_then(|g| g.clone());
+    if let Some(cb) = cb {
+        unsafe { cb.call(traffic_status) };
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod reentrancy_tests {
+    use super::*;
+
+    /// A callback that installs another callback must not deadlock.
+    ///
+    /// The registry mutex was held ACROSS the call, so foreign code that
+    /// reached back into `tun2proxy_set_traffic_status_callback` waited for a
+    /// lock its own caller was holding. Nothing unwinds that (report14
+    /// V14-L5).
+    ///
+    /// Reverting the fix does not make this red — it makes it HANG, which is
+    /// what a deadlock is. A test harness cannot time out a thread parked in
+    /// `Mutex::lock`.
+    static REENTERED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+    unsafe extern "C" fn reinstalling_cb(_status: *const TrafficStatus, _ctx: *mut c_void) {
+        REENTERED.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        // The whole point: from inside the callback, register another one.
+        unsafe {
+            tun2proxy_set_traffic_status_callback(0, Some(quiet_cb), std::ptr::null_mut());
+        }
+    }
+
+    unsafe extern "C" fn quiet_cb(_status: *const TrafficStatus, _ctx: *mut c_void) {}
+
+    #[test]
+    fn a_callback_that_registers_another_does_not_deadlock() {
+        unsafe {
+            tun2proxy_set_traffic_status_callback(0, Some(reinstalling_cb), std::ptr::null_mut());
+        }
+        send_traffic_stat(&TrafficStatus { tx: 1, rx: 2 }).expect("send");
+        assert_eq!(
+            REENTERED.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the callback must have run — and returned"
+        );
+
+        // The re-registration took effect, which is what proves the lock was
+        // actually free while the callback held the floor.
+        let now = TRAFFIC_STATUS_CALLBACK.lock().unwrap().clone();
+        assert!(now.is_some());
+
+        unsafe {
+            tun2proxy_set_traffic_status_callback(0, None, std::ptr::null_mut());
+        }
+    }
 }

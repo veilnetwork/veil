@@ -483,6 +483,15 @@ impl Outbox {
             let mut bytes_freed: u64 = 0;
             for v in victims {
                 if v.len() != 8 + 32 + 32 {
+                    // A row of the wrong shape names nothing this table can
+                    // find, so there is no entry to remove — but it is still
+                    // IN the range the next pass selects from, and skipping it
+                    // left it there. A batch full of these made the loop above
+                    // re-select the same rows forever, pruning nothing and
+                    // never returning (report14 V14-L1). The comment on that
+                    // loop already said malformed keys are deleted; now they
+                    // are.
+                    evict.remove(v.as_slice())?;
                     continue;
                 }
                 let mut recv = [0u8; 32];
@@ -913,6 +922,56 @@ mod tests {
         // one overhead — a replace must not accumulate them either.
         o.put(recv, cid, vec![0; 50]).unwrap();
         assert_eq!(o.total_blob_bytes().unwrap(), crate::billable_bytes(50));
+    }
+
+    /// A prune pass must make progress, even over rows it cannot read.
+    ///
+    /// The batch loop stops when a pass sees fewer rows than it asked for. A
+    /// malformed eviction row was SKIPPED rather than deleted, so it stayed in
+    /// the range the next pass selects from — and a batch full of them made
+    /// the loop select the same rows forever, pruning nothing and never
+    /// returning (report14 V14-L1).
+    #[test]
+    fn a_prune_over_unreadable_rows_still_finishes() {
+        let (o, tmp, clock) = fresh(OutboxConfig::default());
+        let recv = [1u8; 32];
+        o.put(recv, [b'A'; 32], vec![0; 10]).unwrap();
+        drop(o);
+
+        // Plant rows of the wrong shape at the front of the eviction range —
+        // the exact debris a truncated write or an older layout leaves.
+        let db_path = tmp.path().join("mailbox").join("outbox.db");
+        {
+            let db = Database::create(&db_path).unwrap();
+            let txn = db.begin_write().unwrap();
+            {
+                let mut evict = txn.open_table(OUTBOX_TABLE_EVICT).unwrap();
+                for i in 0..8u8 {
+                    // Timestamp 0 so they sort first, and a length nothing can
+                    // decode.
+                    let mut junk = vec![0u8; 8 + 4];
+                    junk[8] = i;
+                    evict.insert(junk.as_slice(), ()).unwrap();
+                }
+            }
+            txn.commit().unwrap();
+        }
+
+        let clk = clock.load(Ordering::SeqCst);
+        let o = Outbox::open_with_clock(tmp.path(), OutboxConfig::default(), move || {
+            clk + DEFAULT_OUTBOX_TTL_SECS * 2
+        })
+        .unwrap();
+
+        // A batch smaller than the debris is what makes the loop repeat.
+        let pruned = o
+            .prune_expired_in_batches(4)
+            .expect("a prune that cannot finish is a prune that never returns");
+        assert_eq!(pruned, 1, "the one real expired entry is gone");
+
+        // And the debris is gone too, so the next prune has nothing to trip on.
+        let again = o.prune_expired_in_batches(4).expect("second pass");
+        assert_eq!(again, 0);
     }
 
     /// An outbox written under the OLD accounting is recounted on open.

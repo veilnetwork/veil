@@ -93,7 +93,6 @@ const MAX_PROXY_HEADER_BYTES: usize = 64 * 1024;
 /// the parser.
 const MAX_PROXY_SKIP_BYTES: usize = 16 * 1024 * 1024;
 
-
 impl HttpConnection {
     async fn new(
         server_addr: SocketAddr,
