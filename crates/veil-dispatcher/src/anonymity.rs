@@ -1343,6 +1343,19 @@ impl FrameDispatcher {
                     ciphertext: buf,
                 };
                 if let Ok(b) = out.encode(state.cell_bytes) {
+                    // Billed exactly like the forward direction above, and for
+                    // the same reason: this relay spent the bytes either way.
+                    // Only the forward leg was charged, so a circuit whose
+                    // traffic is mostly a DOWNLOAD — the common shape, since a
+                    // request is small and its answer is not — ran almost free
+                    // and never met the fairness lever the budget exists to be
+                    // (report14 V14-M2). Recorded rather than asked, as above:
+                    // the circuit was admitted at build time, and the balance
+                    // going into debt is what the next BUILD waits for.
+                    self.abuse.service_budget.note_served(
+                        crate::service_budget::ServiceKind::RelayCircuit,
+                        b.len() as u64,
+                    );
                     let sent = self.send_relay_chain_msg(
                         &NodeId::from(state.prev_link),
                         RelayChainMsg::CircuitData,
@@ -2364,6 +2377,113 @@ mod tests {
     /// nothing at all — on a phone, where serving others is most of the bill.
     ///
     /// Two properties together, because either alone would be the wrong fix: a
+    /// Relaying costs the same bytes in both directions, and only one of them
+    /// was billed.
+    ///
+    /// `note_served` sat on the FORWARD leg alone. The common shape of a
+    /// circuit is a small request and a large answer, so almost all of what a
+    /// relay actually spends travels the RETURN leg — and a download-heavy
+    /// circuit therefore ran nearly free, never meeting the fairness lever the
+    /// service budget exists to be (report14 V14-M2).
+    #[test]
+    fn a_relayed_cell_is_billed_in_both_directions() {
+        use veil_anonymity::circuit_setup::{CircuitSetupHop, build_circuit_setup};
+        use veil_anonymity::circuit_table::CircuitTable;
+        use veil_anonymity::circuit_wire::CircuitDataPayload;
+
+        // Leaf, not Core: a Core budget is UNMETERED and would record nothing.
+        let mut d = crate::make_test_dispatcher(veil_cfg::NodeRole::Leaf);
+        assert!(
+            !d.abuse.service_budget.is_unmetered(),
+            "an unmetered budget records nothing, so nothing below is tested"
+        );
+        let sk = StaticSecret::random_from_rng(OsRng);
+        let pk = PublicKey::from(&sk).to_bytes();
+        d.anonymity_x25519_sk = Some(std::sync::Arc::new(sk));
+        d.circuit_table = Some(std::sync::Arc::new(CircuitTable::new()));
+
+        // Two hops, so this node RELAYS rather than terminating: a terminus
+        // circuit ends here and is our own inbound traffic, which is not what
+        // the service budget is about.
+        let next_id = [0xABu8; 32];
+        let cell_bytes = veil_anonymity::circuit_data::CircuitCellBytes::legacy();
+        let setup = build_circuit_setup(
+            &[
+                CircuitSetupHop {
+                    node_id: [0u8; 32],
+                    pubkey: pk,
+                    circuit_id_in: 42,
+                    circuit_id_out: 1042,
+                    circuit_key: [7u8; 32],
+                },
+                CircuitSetupHop {
+                    node_id: next_id,
+                    pubkey: PublicKey::from(&StaticSecret::random_from_rng(OsRng)).to_bytes(),
+                    circuit_id_in: 9,
+                    circuit_id_out: 0,
+                    circuit_key: [8u8; 32],
+                },
+            ],
+            cell_bytes,
+            b"",
+        )
+        .unwrap();
+
+        let frame = |msg: RelayChainMsg, body: &[u8]| {
+            let mut hdr = FrameHeader::new(FrameFamily::RelayChain as u8, msg as u16);
+            hdr.body_len = body.len() as u32;
+            hdr
+        };
+        let prev = NodeId::from([0xEEu8; 32]);
+        d.dispatch_relay_chain(&frame(RelayChainMsg::CircuitBuild, &setup), &setup, prev);
+        assert_eq!(
+            d.circuit_table.as_ref().unwrap().len(),
+            1,
+            "the fixture failed to install a relay"
+        );
+
+        let cell = |circuit_id: u32| {
+            CircuitDataPayload {
+                circuit_id,
+                seq: 1,
+                ciphertext: vec![0u8; cell_bytes.get()],
+            }
+            .encode(cell_bytes)
+            .expect("encode")
+        };
+
+        // FORWARD: arrives from prev tagged circuit_id_in.
+        let (before, _, _) = d.abuse.service_budget.totals();
+        let fwd = cell(42);
+        d.dispatch_relay_chain(&frame(RelayChainMsg::CircuitData, &fwd), &fwd, prev);
+        let (after_forward, _, _) = d.abuse.service_budget.totals();
+        assert!(
+            after_forward > before,
+            "the forward leg is the half that was already billed; if it is not \
+             billed either, this test is about the fixture"
+        );
+
+        // RETURN: arrives from next tagged circuit_id_out. Same relay, same
+        // bytes, same cost.
+        let ret = cell(1042);
+        d.dispatch_relay_chain(
+            &frame(RelayChainMsg::CircuitData, &ret),
+            &ret,
+            NodeId::from(next_id),
+        );
+        let (after_return, _, _) = d.abuse.service_budget.totals();
+        assert!(
+            after_return > after_forward,
+            "the return leg carries the answer — the bulk of a real circuit — \
+             and spends this relay's bandwidth exactly as the request did"
+        );
+        assert_eq!(
+            after_return - after_forward,
+            after_forward - before,
+            "one cell is one cell whichever way it travels"
+        );
+    }
+
     /// spent budget must refuse a NEW circuit, and must NOT cut one already
     /// carrying traffic. Cutting a live circuit takes down somebody's path
     /// over an accounting decision.
