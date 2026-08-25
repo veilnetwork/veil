@@ -3773,6 +3773,29 @@ mod tests {
     }
 
     use tokio::time::{sleep, timeout};
+
+    /// How long these tests wait for the runtime to dial them.
+    ///
+    /// They are `#[ignore]`d — one as probabilistic, the TCP pair as an
+    /// integration run — and their notes invite running them by hand. A bare
+    /// `accept()` has no bound, so taking that invitation stopped the run dead
+    /// instead of reporting; `sessions_list_shows_outbound_peer_session` sat
+    /// past sixty seconds and never came back. Ten seconds is far past any
+    /// real loopback dial, and the point is that there is a bound at all.
+    const TEST_DIAL_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+
+    /// `listener.accept()` with [`TEST_DIAL_WAIT`] on it: a dial that never
+    /// comes becomes a named failure rather than a hung run.
+    async fn accept_dial(listener: &tokio::net::TcpListener, what: &str) -> tokio::net::TcpStream {
+        match timeout(TEST_DIAL_WAIT, listener.accept()).await {
+            Ok(Ok((stream, _))) => stream,
+            Ok(Err(e)) => panic!("{what}: accept failed: {e}"),
+            Err(_) => panic!(
+                "{what}: the runtime never dialled within {TEST_DIAL_WAIT:?} — \
+                 that is a RESULT, not a reason to stop"
+            ),
+        }
+    }
     #[cfg(unix)]
     use tokio::{
         io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
@@ -4248,7 +4271,7 @@ mod tests {
         let peer_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let peer_addr = peer_listener.local_addr().unwrap();
         let peer_task = tokio::spawn(async move {
-            let (first_stream, _) = peer_listener.accept().await.unwrap();
+            let first_stream = accept_dial(&peer_listener, "first").await;
             let first_task = tokio::spawn(async move {
                 let mut stream = first_stream;
                 let _runtime_node_id = complete_test_handshake(&mut stream).await;
@@ -4262,7 +4285,7 @@ mod tests {
                 }
             });
 
-            let (second_stream, _) = peer_listener.accept().await.unwrap();
+            let second_stream = accept_dial(&peer_listener, "second").await;
             let second_task = tokio::spawn(async move {
                 let mut stream = second_stream;
                 let _runtime_node_id = complete_test_handshake(&mut stream).await;
@@ -4352,7 +4375,7 @@ mod tests {
         let server = tokio::spawn(async move { run_foreground(server_path, true).await });
 
         wait_for_socket(&socket).await;
-        let (mut peer_stream, _) = peer_listener.accept().await.unwrap();
+        let mut peer_stream = accept_dial(&peer_listener, "peer").await;
         let _runtime_node_id = complete_test_handshake(&mut peer_stream).await;
 
         timeout(Duration::from_secs(2), async {
