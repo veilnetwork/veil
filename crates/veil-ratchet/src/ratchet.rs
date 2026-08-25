@@ -484,6 +484,23 @@ impl RatchetCore {
         self.skipped.len()
     }
 
+    /// Drop EVERY banked key. Returns how many went.
+    ///
+    /// Stronger than [`prune_skipped_to_current_epoch`](Self::prune_skipped_to_current_epoch),
+    /// which keeps the epoch now being received — and that is exactly the
+    /// epoch a flood fills, so the gentler sweep frees nothing under the
+    /// pressure it is meant to relieve.
+    ///
+    /// What it costs the conversation: the messages those keys were banked
+    /// for no longer open if they arrive later. That is why the caller must
+    /// only do this to a conversation it has never answered — for one it has,
+    /// the same act would make a real correspondent unreadable.
+    pub(crate) fn clear_skipped(&mut self) -> usize {
+        let n = self.skipped.len();
+        self.skipped.clear();
+        n
+    }
+
     /// Drop banked keys from every epoch except the one now being received.
     /// Returns how many went.
     ///
