@@ -1,5 +1,69 @@
 # Changelog
 
+## v0.8.0 — 2026-08-25
+
+The minor digit moves because two wire surfaces gain a field, both additively:
+a mailbox FETCH may now carry a list of records the caller cannot use yet, and
+the realtime datagram lane can rotate its key by negotiation. Old peers read an
+empty list and never rotate; new peers reading an old one see what they saw
+before. Nothing in this release is a flag day.
+
+Most of what follows came out of a report audit, and the last of it out of
+running the test suites on Windows and on aarch64 Linux for the first time.
+That last step earned its keep twice over: it found a regression this very
+cycle had introduced, and a defect that had been there all along.
+
+**Durability on Windows was a comment, not a barrier.** `atomic_write` — the
+helper under the identity document, the master file, the config store, the
+runtime state and the updater's own installed-version file — fsynced its
+content and then published it with a bare rename. `fsync_dir` is `Ok(())` on
+non-Unix and std's rename passes only `MOVEFILE_REPLACE_EXISTING`, which
+replaces the target without flushing it, so that platform took no barrier at
+all. It renames through `MOVEFILE_WRITE_THROUGH` now. The first cut of that
+change dropped std's `ACCESS_DENIED` fallback and broke a sibling project's
+compaction outright; the fallback is back, and only running on Windows found
+it.
+
+**Owner-only writes never worked on Windows.** The staging file was opened for
+`GENERIC_WRITE`, and `SetSecurityInfo` needs `WRITE_DAC` to put the owner-only
+DACL on the handle, so every such write failed before a byte was written — and
+that helper is what `sovereign_flow` saves identity secrets through. On that
+platform they could not be saved at all. The mask now asks for what it uses.
+
+**A rekeyed realtime lane could go deaf.** The receiver is told about a
+rotation over a channel that held one slot, and the producer dropped a new
+rotation when the slot was full, on the reasoning that the pending one
+superseded it. It is the other way round: the pending one is stale and the
+discarded one is what the peer had already moved to. A watch carries the
+latest key now.
+
+**PEX walks answer along the path they took.** A terminal challenge went
+straight to the origin with no reverse route and the response went to the first
+active peer rather than the challenger, so a multi-hop walk could neither
+deliver its challenge nor answer the right node. The path is remembered per
+walk, and one walk buys one proof rather than twelve.
+
+**Accounting that a restart could reset.** A cold DHT record could buy another
+lifetime by surviving a restart, and the per-origin quota did not survive one
+at all. Both are now recomputed from what is on disk rather than from what a
+process remembered.
+
+**Beacons carry their provenance.** A public receive API erased `FrameOrigin`
+and the documented wrapper then marked every frame `Sealed`, so a downstream
+built from the recommended composition could give a plaintext LAN beacon
+gateway privileges in a keyed realm.
+
+**Admission that one peer could exhaust.** A flood of first contacts is drawn
+from one pot now, the banked skipped ratchet keys have an aggregate ceiling,
+and a peer's device keys are a set rather than one slot that siblings
+overwrote.
+
+Smaller: an operator can pin which DNS-discovered seeds they accept; identity
+creation says up front whether that identity will ever be able to add a
+device; a claimed key file with no bytes yet is no longer reported as corrupt;
+two first starts on one directory settle on a single decapsulation key; and a
+relayed cell is billed whichever way it travels.
+
 ## v0.7.0 — 2026-08-24
 
 The minor digit moves because the wire breaks, and unlike v0.6.0 this one IS a
