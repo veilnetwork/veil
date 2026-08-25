@@ -39,8 +39,15 @@
 //! `entries[(receiver[32] || content_id[32])] → encoded_record`
 //! `eviction_index[(deposited_at[8] || receiver[32] || content_id[32])] → `
 //!
-//! No global byte counter or quota — outbox sizing is bounded by the
-//! TTL and the user's actual send rate, not by an explicit cap.
+//! `meta["total_bytes"]` → running total of what the entries cost on disk
+//! `meta["accounting_version"]` → what that total COUNTS
+//!
+//! The outbox is bounded by an explicit cap
+//! ([`OutboxConfig::quota_total_bytes`]) as well as by the TTL and the user's
+//! send rate. The counter is maintained incrementally on put/ack/prune and
+//! recomputed from the entries whenever the accounting version on disk is not
+//! the one this build uses — a counter is only as good as the agreement about
+//! what it counts.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -59,6 +66,22 @@ const OUTBOX_TABLE_EVICT: TableDefinition<&[u8], ()> = TableDefinition::new("out
 /// ABI churn on the entries table.
 const OUTBOX_TABLE_META: TableDefinition<&str, u64> = TableDefinition::new("outbox_meta_v1");
 const META_KEY_TOTAL_BYTES: &str = "total_bytes";
+
+/// What the running counter counts, as a number this code can compare against.
+///
+/// Version 1 summed raw blob lengths. Version 2 sums
+/// [`billable_bytes`](crate::billable_bytes), which adds the per-row overhead
+/// a record actually costs on disk. A database written by the first and opened
+/// by the second carries a counter that is CORRECT-LOOKING and too small, and
+/// nothing recomputed it: the recompute below only ran when the key was
+/// missing entirely. So an upgraded outbox undercounted forever, and its real
+/// disk use passed the cap while the quota still believed there was room
+/// (report14 V14-M3).
+const META_KEY_ACCOUNTING_VERSION: &str = "accounting_version";
+
+/// Bump this whenever the meaning of the counter changes, and the next open
+/// recomputes. A counter is only as good as the agreement about what it counts.
+const ACCOUNTING_VERSION: u64 = 2;
 
 const KEY_LEN: usize = 32 + 32;
 
@@ -152,7 +175,14 @@ impl Outbox {
             let _ = txn.open_table(OUTBOX_TABLE_ENTRIES)?;
             let _ = txn.open_table(OUTBOX_TABLE_EVICT)?;
             let mut meta = txn.open_table(OUTBOX_TABLE_META)?;
-            if meta.get(META_KEY_TOTAL_BYTES)?.is_none() {
+            // Recomputed when the counter is absent OR when it was written
+            // under a different accounting. Absence alone is not enough: an
+            // outbox upgraded from version 1 has a counter, and it is wrong.
+            let counted_as = meta
+                .get(META_KEY_ACCOUNTING_VERSION)?
+                .map(|v| v.value())
+                .unwrap_or(1);
+            if meta.get(META_KEY_TOTAL_BYTES)?.is_none() || counted_as != ACCOUNTING_VERSION {
                 let entries = txn.open_table(OUTBOX_TABLE_ENTRIES)?;
                 let mut total: u64 = 0;
                 for entry in entries.iter()? {
@@ -161,6 +191,7 @@ impl Outbox {
                     total = total.saturating_add(crate::billable_bytes(blob.len() as u64));
                 }
                 meta.insert(META_KEY_TOTAL_BYTES, total)?;
+                meta.insert(META_KEY_ACCOUNTING_VERSION, ACCOUNTING_VERSION)?;
             }
         }
         txn.commit()?;
@@ -882,6 +913,91 @@ mod tests {
         // one overhead — a replace must not accumulate them either.
         o.put(recv, cid, vec![0; 50]).unwrap();
         assert_eq!(o.total_blob_bytes().unwrap(), crate::billable_bytes(50));
+    }
+
+    /// An outbox written under the OLD accounting is recounted on open.
+    ///
+    /// Version 1 summed raw blob lengths; version 2 sums what a record costs
+    /// on disk. The recompute only ran when the counter was ABSENT, so an
+    /// upgraded database kept a correct-looking, too-small number forever —
+    /// and its real disk use passed the cap while the quota still believed
+    /// there was room (report14 V14-M3).
+    #[test]
+    fn an_outbox_from_the_old_accounting_is_recounted_on_open() {
+        let tmp = tempfile::tempdir().unwrap();
+        let recv = [1u8; 32];
+        {
+            let o = Outbox::open(tmp.path(), OutboxConfig::default()).unwrap();
+            o.put(recv, [b'A'; 32], vec![0; 100]).unwrap();
+            o.put(recv, [b'B'; 32], vec![0; 200]).unwrap();
+        }
+        let honest = crate::billable_bytes(100) + crate::billable_bytes(200);
+
+        // Rewrite the metadata the way a version-1 build left it: the raw
+        // lengths, and no accounting version at all.
+        {
+            let db = Database::create(tmp.path().join("mailbox").join("outbox.db")).unwrap();
+            let txn = db.begin_write().unwrap();
+            {
+                let mut meta = txn.open_table(OUTBOX_TABLE_META).unwrap();
+                meta.insert(META_KEY_TOTAL_BYTES, 300u64).unwrap();
+                meta.remove(META_KEY_ACCOUNTING_VERSION).unwrap();
+            }
+            txn.commit().unwrap();
+        }
+
+        // Scoped: redb takes an exclusive lock on the file, so each open has
+        // to be the only one alive.
+        {
+            let reopened = Outbox::open(tmp.path(), OutboxConfig::default()).unwrap();
+            assert_eq!(
+                reopened.total_blob_bytes().unwrap(),
+                honest,
+                "an upgraded outbox must recount, or the quota protects a \
+                 number nobody maintains any more"
+            );
+        }
+
+        // And it does not recount on every open after that: the version is
+        // stamped, so the walk is a migration and not a startup cost.
+        let again = Outbox::open(tmp.path(), OutboxConfig::default()).unwrap();
+        assert_eq!(again.total_blob_bytes().unwrap(), honest);
+    }
+
+    /// The invariant the counter exists to stand for.
+    #[test]
+    fn the_counter_equals_what_the_rows_cost() {
+        let (o, tmp, _clk) = fresh(OutboxConfig::default());
+        let recv = [1u8; 32];
+        for (i, len) in [17usize, 512, 4096, 3].into_iter().enumerate() {
+            let mut cid = [0u8; 32];
+            cid[0] = i as u8;
+            o.put(recv, cid, vec![0; len]).unwrap();
+        }
+        o.ack(recv, [0u8; 32]).unwrap();
+
+        let counted = o.total_blob_bytes().unwrap();
+        drop(o);
+        // Reopened from scratch with the version cleared, so the total is
+        // derived from the rows rather than carried forward.
+        {
+            let db = Database::create(tmp.path().join("mailbox").join("outbox.db")).unwrap();
+            let txn = db.begin_write().unwrap();
+            {
+                let mut meta = txn.open_table(OUTBOX_TABLE_META).unwrap();
+                meta.remove(META_KEY_ACCOUNTING_VERSION).unwrap();
+            }
+            txn.commit().unwrap();
+        }
+        let recomputed = Outbox::open(tmp.path(), OutboxConfig::default())
+            .unwrap()
+            .total_blob_bytes()
+            .unwrap();
+        assert_eq!(
+            counted, recomputed,
+            "the incrementally-maintained counter and the sum of the rows are \
+             the same number, or one of the two is a fiction"
+        );
     }
 
     /// ack decrements the counter.
