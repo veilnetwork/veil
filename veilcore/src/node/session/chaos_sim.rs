@@ -632,7 +632,7 @@ async fn chaos_sim_smoke_baseline() {
 /// `#[ignore]` so it doesn't run in default `cargo test` —
 /// invoke explicitly per slice via `--ignored`.
 #[tokio::test]
-#[ignore = "long-running stress test; invoke with `cargo test --release chaos_sim_full -- --ignored --nocapture`"]
+#[ignore = "long-running stress test; invoke with `cargo test --release --features allow-empty-seeds chaos_sim_full -- --ignored --nocapture`"]
 async fn chaos_sim_full_stress() {
     let mut failures = 0u64;
     let mut total_events = 0u64;
