@@ -4517,8 +4517,17 @@ mod tests {
     /// once per full `cargo test --workspace`, where every crate's test binary
     /// runs at once and the gap widens — and never once when the test ran
     /// alone, which is how it stayed in the tree.
+    ///
+    /// The budget is generous for the same reason `SIM_WAIT_LIMIT` in
+    /// veilcore's scenarios is: the wait is edge-triggered, so it costs
+    /// nothing when the socket is up in milliseconds, and five seconds was
+    /// still sized against a binary running on its own. Under a full
+    /// `cargo test --workspace` — every crate's binary at once — it expired,
+    /// which is the very failure the note above describes, one layer further
+    /// out. What it costs: a socket that never comes up takes this long to
+    /// say so.
     async fn wait_for_socket(socket: &Path) {
-        timeout(Duration::from_secs(5), async {
+        timeout(Duration::from_secs(60), async {
             loop {
                 if tokio::net::UnixStream::connect(socket).await.is_ok() {
                     break;
