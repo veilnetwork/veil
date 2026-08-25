@@ -1584,8 +1584,15 @@ pub fn save_master_falcon_keypair(
 
     // cycle-7 MH3: hardened atomic write (O_EXCL + O_NOFOLLOW + 0o600 +
     // fsync + parent-dir fsync) instead of the predictable-tmp + rename dance.
+    // OWNER-ONLY, not merely 0o600. On POSIX the two are byte-for-byte the
+    // same; on Windows the plain helper lets the file inherit the parent
+    // directory's ACL, and a master signing key in a directory somebody chose
+    // for their own reasons is readable by whoever that ACL admits. This is a
+    // BEARER SECRET, so the write sets an explicit owner-SID-only DACL, reads
+    // it back, and FAILS rather than leaving a file whose permissions it could
+    // not vouch for (report14 V14-M8).
     let path = veil_dir.join(MASTER_FALCON_FILE);
-    veil_util::atomic_write(&path, &framed)
+    veil_util::atomic_write_owner_only(&path, &framed)
 }
 
 /// parse the framed `master_falcon.bin` bundle into
@@ -2575,8 +2582,10 @@ pub fn save_identity_sk(
     // `path.with_extension("tmp")` + rename, which a local actor with write
     // access to `veil_dir` could pre-empt with a symlink to redirect the SK
     // write, and which skipped the parent-dir fsync (crash-window key loss).
+    // Owner-only: this is the device's private key, and on Windows the plain
+    // helper inherits the parent ACL (report14 V14-M8).
     let path = veil_dir.join(DEVICE_IDENTITY_SK_FILE);
-    veil_util::atomic_write(&path, seed.as_slice())
+    veil_util::atomic_write_owner_only(&path, seed.as_slice())
 }
 
 /// Load the device's identity_sk seed from
@@ -2649,8 +2658,9 @@ pub fn save_identity_falcon_keypair(
 
     // cycle-7 MH3: hardened atomic write (O_EXCL + O_NOFOLLOW + 0o600 +
     // fsync + parent-dir fsync) — replaces the predictable-tmp + rename dance.
-    // The combined SK+PK body keeps the write atomic (no SK-without-PK window).
-    veil_util::atomic_write(&path, &body)
+    // The combined SK+PK body keeps the write atomic (no SK-without-PK window),
+    // and owner-only because it carries the SK (report14 V14-M8).
+    veil_util::atomic_write_owner_only(&path, &body)
 }
 
 /// load a Falcon-512 keypair from the
@@ -2976,6 +2986,60 @@ pub fn default_identity_dir() -> std::io::Result<PathBuf> {
 
 #[cfg(test)]
 mod tests {
+
+    /// Every file that holds a private key is written with an explicit
+    /// owner-only ACL, not with the plain helper.
+    ///
+    /// A STRUCTURAL guard, because the difference is invisible where these
+    /// tests run: on POSIX `atomic_write_owner_only` is byte-for-byte
+    /// `atomic_write` — `0o600` comes from the `open(2)` that creates the
+    /// staging file either way. On WINDOWS the plain helper lets the published
+    /// file inherit the parent directory's ACL, and a private key in a
+    /// directory somebody chose for their own reasons is then readable by
+    /// whoever that ACL admits (report14 V14-M8).
+    ///
+    /// So what is asserted is the call, in the functions that write secrets.
+    /// A document or a key index is not one of them and keeps the plain
+    /// helper.
+    #[test]
+    fn every_private_key_file_is_written_owner_only() {
+        const SECRET_WRITERS: &[&str] = &[
+            "pub fn save_master_falcon_keypair(",
+            "pub fn save_identity_sk(",
+            "pub fn save_identity_falcon_keypair(",
+        ];
+        let src = include_str!("sovereign_flow.rs");
+        for start in SECRET_WRITERS {
+            let at = src.find(start).unwrap_or_else(|| {
+                panic!("{start} is gone — this guard names a function that no longer exists")
+            });
+            // Up to the next top-level item: enough to cover the body.
+            let rest = &src[at + start.len()..];
+            let body_end = rest.find("\npub fn ").unwrap_or(rest.len());
+            let body = &rest[..body_end];
+            assert!(
+                body.contains("atomic_write_owner_only("),
+                "{start} must publish its secret owner-only"
+            );
+            assert!(
+                !body.contains("veil_util::atomic_write(") && !body.contains(" atomic_write("),
+                "{start} still writes a private key with the plain helper, \
+                 which inherits the parent ACL on Windows"
+            );
+        }
+
+        // The master file's encrypted blob goes through its own helper.
+        let master = include_str!("master_file.rs");
+        let at = master
+            .find("fn write_file_atomically_secure(")
+            .expect("the master file writer is gone");
+        let body = &master[at..];
+        let end = body.find("\n// ").unwrap_or(body.len());
+        assert!(
+            body[..end].contains("atomic_write_owner_only("),
+            "the encrypted master secret must be written owner-only"
+        );
+    }
     use super::*;
 
     use crate::master_file::load_master_seed_encrypted;

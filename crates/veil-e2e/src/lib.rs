@@ -876,7 +876,10 @@ fn parse_mlkem_pem(
             // plain `Vec` of the decapsulation seed for the sole
             // purpose of being consumed by `try_into` (report7 V-09).
             let enc_pem = encode_pem_encrypted(&seed_arr, pass);
-            at_rest = match veil_util::atomic_write(path, enc_pem.as_bytes()) {
+            // Owner-only: the file being written IS the decapsulation seed,
+            // and on Windows the plain helper lets it inherit whatever the
+            // parent directory's ACL admits (report14 V14-M8).
+            at_rest = match veil_util::atomic_write_owner_only(path, enc_pem.as_bytes()) {
                 Ok(()) => MlKemKeyAtRest::UpgradedToEncrypted,
                 Err(e) => MlKemKeyAtRest::PlaintextUpgradeFailed {
                     reason: e.to_string(),

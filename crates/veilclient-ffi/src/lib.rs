@@ -2710,6 +2710,48 @@ unsafe fn volatile_wipe(ptr: *mut u8, len: usize) {
     core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
 }
 
+/// Zero a caller-owned secret buffer no matter how the call returns.
+///
+/// ARMED FIRST, before any other argument is looked at. That ordering is the
+/// whole contract: ten entry points used to validate their ancillary
+/// arguments — a document pointer, a device id, a TOML blob — and return the
+/// documented error while the phrase or the private config the caller had just
+/// handed over stayed in that caller's memory. xVeil wipes its own buffer in a
+/// `finally` and never noticed; a standalone C caller following the header has
+/// no such second line of defence (report14 V14-M14).
+///
+/// One type rather than ten identical local copies, for the same reason
+/// `bytes_to_hex` replaced its seven: a rule that is written down once cannot
+/// be got wrong in the tenth place.
+struct ZeroOnDrop {
+    ptr: *mut u8,
+    len: usize,
+}
+
+impl ZeroOnDrop {
+    /// Arm the guard, or refuse the buffer.
+    ///
+    /// `None` is "this is not a buffer this ABI can scrub as documented" — a
+    /// NULL pointer, or a length past [`MAX_FFI_CSTR_LEN`], which is rejected
+    /// BEFORE anything touches it. The caller turns that into
+    /// `VEIL_ERR_INVALID_ARG`.
+    ///
+    /// # Safety
+    /// `ptr` must be valid for writes of `len` bytes, or be NULL.
+    unsafe fn arm(ptr: *mut u8, len: usize) -> Option<Self> {
+        if ptr.is_null() || len > MAX_FFI_CSTR_LEN {
+            return None;
+        }
+        Some(Self { ptr, len })
+    }
+}
+
+impl Drop for ZeroOnDrop {
+    fn drop(&mut self) {
+        unsafe { volatile_wipe(self.ptr, self.len) };
+    }
+}
+
 /// detect FFI re-entry from inside a Tokio worker
 /// thread (e.g. from a recv-handler callback) and refuse to proceed.
 ///
@@ -8392,18 +8434,9 @@ pub unsafe extern "C" fn veil_validate_bip39_phrase_zeroize(
     // RAII guard: zero the WHOLE caller buffer on EVERY return path — success,
     // decode failure, or non-UTF-8 — so possibly-sensitive input never lingers.
     // Mirrors `veil_restore_identity_from_phrase_zeroize`.
-    struct ZeroOnDrop {
-        ptr: *mut u8,
-        len: usize,
-    }
-    impl Drop for ZeroOnDrop {
-        fn drop(&mut self) {
-            unsafe { volatile_wipe(self.ptr, self.len) };
-        }
-    }
-    let _guard = ZeroOnDrop {
-        ptr: phrase,
-        len: phrase_len,
+    let Some(_guard) = (unsafe { ZeroOnDrop::arm(phrase, phrase_len) }) else {
+        unsafe { write_err(err_out, "phrase is NULL or too long (>4 KiB)") };
+        return VEIL_ERR_INVALID_ARG;
     };
 
     // UTF-8 decode AFTER the guard is armed.
@@ -8477,18 +8510,9 @@ unsafe fn restore_from_phrase_inner(
 
     // RAII guard: zero the WHOLE caller buffer no matter how this returns
     // (early return on validation error, panic, success).
-    struct ZeroOnDrop {
-        ptr: *mut u8,
-        len: usize,
-    }
-    impl Drop for ZeroOnDrop {
-        fn drop(&mut self) {
-            unsafe { volatile_wipe(self.ptr, self.len) };
-        }
-    }
-    let _guard = ZeroOnDrop {
-        ptr: phrase,
-        len: phrase_len,
+    let Some(_guard) = (unsafe { ZeroOnDrop::arm(phrase, phrase_len) }) else {
+        unsafe { write_err(err_out, "phrase is NULL or too long (>4 KiB)") };
+        return VEIL_ERR_INVALID_ARG;
     };
 
     // UTF-8 decode AFTER guard armed, so a non-UTF8 phrase still gets
@@ -8641,6 +8665,15 @@ pub unsafe extern "C" fn veil_restore_identity_from_phrase_zeroize_with_node_key
     identity_toml_len: usize,
     err_out: *mut *mut c_char,
 ) -> c_int {
+    // ARMED FIRST. Everything below can refuse the call — a NULL TOML, one
+    // that will not parse, a key of the wrong algorithm — and every one of
+    // those returns used to leave the caller's phrase exactly where it was
+    // (report14 V14-M14). The inner call arms its own guard as well; wiping a
+    // buffer twice costs nothing.
+    let Some(_phrase_guard) = (unsafe { ZeroOnDrop::arm(phrase, phrase_len) }) else {
+        unsafe { write_err(err_out, "phrase is NULL or too long (>4 KiB)") };
+        return VEIL_ERR_INVALID_ARG;
+    };
     let Some(toml_str) = (unsafe { slice_to_str(identity_toml, identity_toml_len) }) else {
         unsafe { write_err(err_out, "identity_toml is NULL or invalid UTF-8") };
         return VEIL_ERR_INVALID_ARG;
@@ -8746,18 +8779,9 @@ pub unsafe extern "C" fn veil_delegate_device_from_phrase_zeroize(
         return VEIL_ERR_INVALID_ARG;
     }
 
-    struct ZeroOnDrop {
-        ptr: *mut u8,
-        len: usize,
-    }
-    impl Drop for ZeroOnDrop {
-        fn drop(&mut self) {
-            unsafe { volatile_wipe(self.ptr, self.len) };
-        }
-    }
-    let _guard = ZeroOnDrop {
-        ptr: phrase,
-        len: phrase_len,
+    let Some(_guard) = (unsafe { ZeroOnDrop::arm(phrase, phrase_len) }) else {
+        unsafe { write_err(err_out, "phrase is NULL or too long (>4 KiB)") };
+        return VEIL_ERR_INVALID_ARG;
     };
 
     let phrase_bytes = unsafe { std::slice::from_raw_parts(phrase as *const u8, phrase_len) };
@@ -8873,18 +8897,9 @@ pub unsafe extern "C" fn veil_delegate_device_from_config_zeroize(
         return VEIL_ERR_INVALID_ARG;
     }
 
-    struct ZeroOnDrop {
-        ptr: *mut u8,
-        len: usize,
-    }
-    impl Drop for ZeroOnDrop {
-        fn drop(&mut self) {
-            unsafe { volatile_wipe(self.ptr, self.len) };
-        }
-    }
-    let _guard = ZeroOnDrop {
-        ptr: config_toml,
-        len: config_toml_len,
+    let Some(_guard) = (unsafe { ZeroOnDrop::arm(config_toml, config_toml_len) }) else {
+        unsafe { write_err(err_out, "config_toml is NULL or too long (>4 KiB)") };
+        return VEIL_ERR_INVALID_ARG;
     };
 
     let toml_bytes =
@@ -8984,26 +8999,22 @@ pub unsafe extern "C" fn veil_adopt_identity_document_from_config_zeroize(
     unsafe {
         clear_err(err_out);
     }
+
+    let Some(_guard) = (unsafe { ZeroOnDrop::arm(config_toml, config_toml_len) }) else {
+        unsafe { write_err(err_out, "config_toml is NULL or too long (>4 KiB)") };
+        return VEIL_ERR_INVALID_ARG;
+    };
+
+    // AFTER the guard: a NULL ancillary argument used to return the documented
+    // error with the caller's secret still sitting in their memory (report14
+    // V14-M14). The secret's own pointer and length are `arm`'s business
+    // above; this is only about the rest.
     if config_toml.is_null() || document.is_null() {
         unsafe {
             write_err(err_out, "config_toml or document is NULL");
         }
         return VEIL_ERR_INVALID_ARG;
     }
-
-    struct ZeroOnDrop {
-        ptr: *mut u8,
-        len: usize,
-    }
-    impl Drop for ZeroOnDrop {
-        fn drop(&mut self) {
-            unsafe { volatile_wipe(self.ptr, self.len) };
-        }
-    }
-    let _guard = ZeroOnDrop {
-        ptr: config_toml,
-        len: config_toml_len,
-    };
 
     let toml_bytes =
         unsafe { std::slice::from_raw_parts(config_toml as *const u8, config_toml_len) };
@@ -9082,26 +9093,22 @@ pub unsafe extern "C" fn veil_adopt_identity_document_named_zeroize(
     unsafe {
         clear_err(err_out);
     }
+
+    let Some(_guard) = (unsafe { ZeroOnDrop::arm(config_toml, config_toml_len) }) else {
+        unsafe { write_err(err_out, "config_toml is NULL or too long (>4 KiB)") };
+        return VEIL_ERR_INVALID_ARG;
+    };
+
+    // AFTER the guard: a NULL ancillary argument used to return the documented
+    // error with the caller's secret still sitting in their memory (report14
+    // V14-M14). The secret's own pointer and length are `arm`'s business
+    // above; this is only about the rest.
     if config_toml.is_null() || document.is_null() {
         unsafe {
             write_err(err_out, "config_toml or document is NULL");
         }
         return VEIL_ERR_INVALID_ARG;
     }
-
-    struct ZeroOnDrop {
-        ptr: *mut u8,
-        len: usize,
-    }
-    impl Drop for ZeroOnDrop {
-        fn drop(&mut self) {
-            unsafe { volatile_wipe(self.ptr, self.len) };
-        }
-    }
-    let _guard = ZeroOnDrop {
-        ptr: config_toml,
-        len: config_toml_len,
-    };
 
     let toml_bytes =
         unsafe { std::slice::from_raw_parts(config_toml as *const u8, config_toml_len) };
@@ -9179,12 +9186,6 @@ pub unsafe extern "C" fn veil_revoke_identity_device_from_phrase_zeroize(
     unsafe {
         clear_err(err_out);
     }
-    if phrase.is_null() || device_id.is_null() {
-        unsafe {
-            write_err(err_out, "phrase or device_id is NULL");
-        }
-        return VEIL_ERR_INVALID_ARG;
-    }
     if phrase_len > MAX_FFI_CSTR_LEN {
         unsafe {
             write_err(err_out, "phrase too long (>4 KiB)");
@@ -9192,19 +9193,21 @@ pub unsafe extern "C" fn veil_revoke_identity_device_from_phrase_zeroize(
         return VEIL_ERR_INVALID_ARG;
     }
 
-    struct ZeroOnDrop {
-        ptr: *mut u8,
-        len: usize,
-    }
-    impl Drop for ZeroOnDrop {
-        fn drop(&mut self) {
-            unsafe { volatile_wipe(self.ptr, self.len) };
-        }
-    }
-    let _guard = ZeroOnDrop {
-        ptr: phrase,
-        len: phrase_len,
+    let Some(_guard) = (unsafe { ZeroOnDrop::arm(phrase, phrase_len) }) else {
+        unsafe { write_err(err_out, "phrase is NULL or too long (>4 KiB)") };
+        return VEIL_ERR_INVALID_ARG;
     };
+
+    // AFTER the guard: a NULL ancillary argument used to return the documented
+    // error with the caller's secret still sitting in their memory (report14
+    // V14-M14). The secret's own pointer and length are `arm`'s business
+    // above; this is only about the rest.
+    if phrase.is_null() || device_id.is_null() {
+        unsafe {
+            write_err(err_out, "phrase or device_id is NULL");
+        }
+        return VEIL_ERR_INVALID_ARG;
+    }
 
     let bytes = unsafe { std::slice::from_raw_parts(phrase as *const u8, phrase_len) };
     let Ok(text) = std::str::from_utf8(bytes) else {
@@ -9334,12 +9337,6 @@ pub unsafe extern "C" fn veil_master_signing_key_from_phrase_zeroize(
     unsafe {
         clear_err(err_out);
     }
-    if phrase.is_null() || out_master_sk.is_null() {
-        unsafe {
-            write_err(err_out, "phrase or out_master_sk is NULL");
-        }
-        return VEIL_ERR_INVALID_ARG;
-    }
     if phrase_len > MAX_FFI_CSTR_LEN {
         unsafe {
             write_err(err_out, "phrase too long (>4 KiB)");
@@ -9347,19 +9344,21 @@ pub unsafe extern "C" fn veil_master_signing_key_from_phrase_zeroize(
         return VEIL_ERR_INVALID_ARG;
     }
 
-    struct ZeroOnDrop {
-        ptr: *mut u8,
-        len: usize,
-    }
-    impl Drop for ZeroOnDrop {
-        fn drop(&mut self) {
-            unsafe { volatile_wipe(self.ptr, self.len) };
-        }
-    }
-    let _guard = ZeroOnDrop {
-        ptr: phrase,
-        len: phrase_len,
+    let Some(_guard) = (unsafe { ZeroOnDrop::arm(phrase, phrase_len) }) else {
+        unsafe { write_err(err_out, "phrase is NULL or too long (>4 KiB)") };
+        return VEIL_ERR_INVALID_ARG;
     };
+
+    // AFTER the guard: a NULL ancillary argument used to return the documented
+    // error with the caller's secret still sitting in their memory (report14
+    // V14-M14). The secret's own pointer and length are `arm`'s business
+    // above; this is only about the rest.
+    if phrase.is_null() || out_master_sk.is_null() {
+        unsafe {
+            write_err(err_out, "phrase or out_master_sk is NULL");
+        }
+        return VEIL_ERR_INVALID_ARG;
+    }
 
     let bytes = unsafe { std::slice::from_raw_parts(phrase as *const u8, phrase_len) };
     let Ok(text) = std::str::from_utf8(bytes) else {
@@ -9409,26 +9408,22 @@ pub unsafe extern "C" fn veil_adopt_identity_document_from_master_zeroize(
     unsafe {
         clear_err(err_out);
     }
+
+    let Some(_guard) = (unsafe { ZeroOnDrop::arm(master_sk, 32) }) else {
+        unsafe { write_err(err_out, "master_sk is NULL or too long (>4 KiB)") };
+        return VEIL_ERR_INVALID_ARG;
+    };
+
+    // AFTER the guard: a NULL ancillary argument used to return the documented
+    // error with the caller's secret still sitting in their memory (report14
+    // V14-M14). The secret's own pointer and length are `arm`'s business
+    // above; this is only about the rest.
     if master_sk.is_null() || document.is_null() {
         unsafe {
             write_err(err_out, "master_sk or document is NULL");
         }
         return VEIL_ERR_INVALID_ARG;
     }
-
-    struct ZeroOnDrop {
-        ptr: *mut u8,
-        len: usize,
-    }
-    impl Drop for ZeroOnDrop {
-        fn drop(&mut self) {
-            unsafe { volatile_wipe(self.ptr, self.len) };
-        }
-    }
-    let _guard = ZeroOnDrop {
-        ptr: master_sk,
-        len: 32,
-    };
 
     let Some(dir_str) = (unsafe { slice_to_str(veil_dir, veil_dir_len) }) else {
         unsafe {
@@ -9567,23 +9562,11 @@ pub unsafe extern "C" fn veil_restore_identity_from_phrase_zeroize_with_password
         return VEIL_ERR_INVALID_ARG;
     }
 
-    // RAII guard: zero both phrase + password buffers regardless of
-    // return path.  Same struct as the zeroize-only variant, repeated
-    // here per buffer because lengths differ.
-    struct ZeroOnDrop {
-        ptr: *mut u8,
-        len: usize,
-    }
-    impl Drop for ZeroOnDrop {
-        fn drop(&mut self) {
-            // `volatile_wipe` is NULL-safe.
-            unsafe { volatile_wipe(self.ptr, self.len) };
-        }
-    }
-
-    let _phrase_guard = ZeroOnDrop {
-        ptr: phrase,
-        len: phrase_len,
+    // RAII guards: zero both phrase + password buffers regardless of return
+    // path. One guard per buffer because the lengths differ.
+    let Some(_phrase_guard) = (unsafe { ZeroOnDrop::arm(phrase, phrase_len) }) else {
+        unsafe { write_err(err_out, "phrase is NULL or too long (>4 KiB)") };
+        return VEIL_ERR_INVALID_ARG;
     };
 
     // Read password BEFORE constructing its guard so we can copy it to an owned
@@ -11423,6 +11406,102 @@ mod tests {
             buf.iter().all(|&b| b == 0),
             "buffer must be zeroed on error path; got: {:?}",
             buf
+        );
+    }
+
+    /// A `_zeroize` entry point that refuses the call because of a SECONDARY
+    /// argument must still have wiped the secret.
+    ///
+    /// The guard used to be armed after those checks, so a NULL device id, a
+    /// NULL document or a TOML that would not parse returned the documented
+    /// error with the caller's phrase exactly where they had put it. xVeil
+    /// wipes its own buffer in a `finally` and never saw it; a C caller
+    /// following the header has no such second line of defence
+    /// (report14 V14-M14).
+    // Two of the three entry points below live behind `node-embedded`, and
+    // the whole point is the ORDER inside them, so the test follows the gate.
+    #[cfg(feature = "node-embedded")]
+    #[test]
+    fn a_refusal_over_another_argument_still_wipes_the_secret() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let dir_s = dir.path().to_str().unwrap();
+
+        // 1. Revoke: valid phrase, NULL device id.
+        let phrase = fresh_phrase();
+        let mut buf: Vec<u8> = phrase.as_bytes().to_vec();
+        let n = buf.len();
+        let mut changed: u8 = 0;
+        let mut err: *mut c_char = ptr::null_mut();
+        let rc = unsafe {
+            veil_revoke_identity_device_from_phrase_zeroize(
+                buf.as_mut_ptr(),
+                n,
+                dir_s.as_ptr(),
+                dir_s.len(),
+                ptr::null(),
+                &mut changed,
+                &mut err,
+            )
+        };
+        assert_eq!(rc, VEIL_ERR_INVALID_ARG);
+        if !err.is_null() {
+            unsafe { veil_free_string(err) };
+        }
+        assert!(
+            buf.iter().all(|&b| b == 0),
+            "a NULL device_id must not cost the caller their phrase: {buf:?}"
+        );
+
+        // 2. Master signing key: valid phrase, NULL output pointer.
+        let phrase = fresh_phrase();
+        let mut buf: Vec<u8> = phrase.as_bytes().to_vec();
+        let n = buf.len();
+        let mut err: *mut c_char = ptr::null_mut();
+        let rc = unsafe {
+            veil_master_signing_key_from_phrase_zeroize(
+                buf.as_mut_ptr(),
+                n,
+                ptr::null_mut(),
+                &mut err,
+            )
+        };
+        assert_eq!(rc, VEIL_ERR_INVALID_ARG);
+        if !err.is_null() {
+            unsafe { veil_free_string(err) };
+        }
+        assert!(
+            buf.iter().all(|&b| b == 0),
+            "a NULL out_master_sk must not cost the caller their phrase: {buf:?}"
+        );
+
+        // 3. Restore with a node key: valid phrase, TOML that will not parse.
+        let phrase = fresh_phrase();
+        let mut buf: Vec<u8> = phrase.as_bytes().to_vec();
+        let n = buf.len();
+        let junk = b"this is not toml at all {{{";
+        let label = "test-device";
+        let mut err: *mut c_char = ptr::null_mut();
+        let rc = unsafe {
+            veil_restore_identity_from_phrase_zeroize_with_node_key(
+                buf.as_mut_ptr(),
+                n,
+                dir_s.as_ptr(),
+                dir_s.len(),
+                label.as_ptr(),
+                label.len(),
+                junk.as_ptr(),
+                junk.len(),
+                &mut err,
+            )
+        };
+        assert_eq!(rc, VEIL_ERR_INVALID_ARG);
+        if !err.is_null() {
+            unsafe { veil_free_string(err) };
+        }
+        assert!(
+            buf.iter().all(|&b| b == 0),
+            "a TOML that would not parse must not cost the caller their \
+             phrase: {buf:?}"
         );
     }
 
