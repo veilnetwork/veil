@@ -755,102 +755,196 @@ pub fn load_or_generate_mlkem_key_encrypted(
     // failures (e.g. EACCES from a too-restrictive parent dir, EIO from
     // a failing disk).
     match std::fs::read_to_string(path) {
-        Ok(pem) => {
-            // Try encrypted PEM first if a passphrase is set.
-            if let Some(pass) = passphrase
-                && pem.contains(PEM_ENC_HEADER)
-            {
-                if let Some(seed) = decode_pem_encrypted(&pem, pass)
-                    && seed.len() == DK_SEED_BYTES
-                {
-                    let dk = parse_dk(&seed).expect("seed just validated");
-                    let ek_arr = dk.encapsulation_key().to_bytes();
-                    let ek: [u8; EK_BYTES] = ek_arr.as_slice().try_into().expect("EK size");
-
-                    return Ok(MlKemKeyLoad {
-                        ek,
-                        dk_seed: seed_array(&seed),
-                        at_rest: MlKemKeyAtRest::AsConfigured,
-                    });
-                }
-                // Encrypted header found but decode failed → wrong passphrase
-                // or corrupt blob. DO NOT fall through to plaintext attempt
-                // or to regeneration — operator must resolve.
-                return Err(E2eError::MlKemKeyUnreadable {
-                    path: path.to_path_buf(),
-                });
+        Ok(pem) => match parse_mlkem_pem(path, &pem, passphrase) {
+            Ok(load) => Ok(load),
+            // PRESENT BUT NOT WHOLE is what a start racing another one's
+            // publish sees: `O_EXCL` claims the name and the PEM lands after
+            // it, and a read landing between the two gets an empty file. That
+            // is not a corrupt key, and this arm meets it just as often as the
+            // create below does — which is how the first version of this fix
+            // still failed the race test it came with.
+            //
+            // A genuinely corrupt file, or a wrong passphrase, comes back as
+            // the same error once the short budget is spent. Paying 100 ms to
+            // tell those apart is nothing against reporting a healthy
+            // container as unreadable at startup.
+            Err(E2eError::MlKemKeyUnreadable { .. }) => {
+                load_published_by_the_winner(path, passphrase)
             }
-            // Plaintext PEM path (no passphrase, or passphrase set but file
-            // is plaintext — auto-upgrade).
-            if let Some(seed) = decode_pem(&pem)
-                && seed.len() == DK_SEED_BYTES
-            {
-                let dk = parse_dk(&seed).expect("seed just validated");
-                let ek_arr = dk.encapsulation_key().to_bytes();
-                let ek: [u8; EK_BYTES] = ek_arr.as_slice().try_into().expect("EK size");
-
-                // Auto-upgrade: if passphrase is set and file is plaintext →
-                // re-encrypt in-place via atomic_write. Failure to re-encrypt
-                // is non-fatal — the key in memory is correct and the upgrade
-                // retries at the next start — but it is NOT nothing: the seed
-                // stays on disk in plaintext under an operator who just asked
-                // for it to be encrypted. This function has no logger handle,
-                // so the outcome travels back to a caller that does, rather
-                // than being dropped on the floor (audit report7 V-02).
-                let mut at_rest = MlKemKeyAtRest::AsConfigured;
-                let seed_arr = seed_array(&seed);
-                if let Some(pass) = passphrase {
-                    // `seed_array` reads the one copy already in hand; the
-                    // `seed.clone()` that used to stand here minted a THIRD
-                    // plain `Vec` of the decapsulation seed for the sole
-                    // purpose of being consumed by `try_into` (report7 V-09).
-                    let enc_pem = encode_pem_encrypted(&seed_arr, pass);
-                    at_rest = match veil_util::atomic_write(path, enc_pem.as_bytes()) {
-                        Ok(()) => MlKemKeyAtRest::UpgradedToEncrypted,
-                        Err(e) => MlKemKeyAtRest::PlaintextUpgradeFailed {
-                            reason: e.to_string(),
-                        },
-                    };
-                }
-
-                return Ok(MlKemKeyLoad {
-                    ek,
-                    dk_seed: seed_arr,
-                    at_rest,
-                });
-            }
-            // File exists but neither encrypted-with-passphrase nor
-            // plaintext PEM parse worked → corrupt or unknown format.
-            Err(E2eError::MlKemKeyUnreadable {
-                path: path.to_path_buf(),
-            })
-        }
+            Err(e) => Err(e),
+        },
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            // Fresh install — generate and atomically write.
+            // Fresh install — generate and publish.
             let (ek, dk_seed) = generate_keypair();
             let pem = if let Some(pass) = passphrase {
                 encode_pem_encrypted(&dk_seed, pass)
             } else {
                 encode_pem(&dk_seed)
             };
-            // atomic_write handles 0o600 mode, fsync, parent dir fsync.
-            veil_util::atomic_write(path, pem.as_bytes()).map_err(|source| {
-                E2eError::MlKemKeyIo {
+            // `write_new_owner_only` (O_EXCL), NOT `atomic_write`.
+            //
+            // A rename always wins, so two starts racing on a fresh directory
+            // both saw ENOENT, both generated a decapsulation key, and both
+            // believed they had published — while the disk held one of them.
+            // The loser then ran on a key nothing on disk backed: it published
+            // that key's EK in its certificate, and everything sealed to it
+            // became un-openable the moment the node restarted and read the
+            // WINNER's key instead. Silently, and with no way afterwards to
+            // tell which messages were lost that way (report14 V14-M7).
+            //
+            // With O_EXCL the race has a loser, and a loser adopts the key on
+            // disk — the one every future start of this directory will read.
+            match veil_util::write_new_owner_only(path, pem.as_bytes()) {
+                Ok(()) => Ok(MlKemKeyLoad {
+                    ek,
+                    dk_seed,
+                    at_rest: MlKemKeyAtRest::AsConfigured,
+                }),
+                Err(source) if source.kind() == std::io::ErrorKind::AlreadyExists => {
+                    load_published_by_the_winner(path, passphrase)
+                }
+                Err(source) => Err(E2eError::MlKemKeyIo {
                     path: path.to_path_buf(),
                     source,
-                }
-            })?;
-            Ok(MlKemKeyLoad {
-                ek,
-                dk_seed,
-                at_rest: MlKemKeyAtRest::AsConfigured,
-            })
+                }),
+            }
         }
         Err(source) => Err(E2eError::MlKemKeyIo {
             path: path.to_path_buf(),
             source,
         }),
     }
+}
+
+/// Turn the PEM already read from `path` into a usable key.
+///
+/// Split out of [`load_or_generate_mlkem_key_encrypted`] so that the loser of a
+/// first-start race can re-read the winner's file without going near the
+/// generate-and-publish branch — which is exactly the branch it must not take a
+/// second time.
+fn parse_mlkem_pem(
+    path: &Path,
+    pem: &str,
+    passphrase: Option<&str>,
+) -> Result<MlKemKeyLoad, E2eError> {
+    // Try encrypted PEM first if a passphrase is set.
+    if let Some(pass) = passphrase
+        && pem.contains(PEM_ENC_HEADER)
+    {
+        if let Some(seed) = decode_pem_encrypted(pem, pass)
+            && seed.len() == DK_SEED_BYTES
+        {
+            let dk = parse_dk(&seed).expect("seed just validated");
+            let ek_arr = dk.encapsulation_key().to_bytes();
+            let ek: [u8; EK_BYTES] = ek_arr.as_slice().try_into().expect("EK size");
+
+            return Ok(MlKemKeyLoad {
+                ek,
+                dk_seed: seed_array(&seed),
+                at_rest: MlKemKeyAtRest::AsConfigured,
+            });
+        }
+        // Encrypted header found but decode failed → wrong passphrase
+        // or corrupt blob. DO NOT fall through to plaintext attempt
+        // or to regeneration — operator must resolve.
+        return Err(E2eError::MlKemKeyUnreadable {
+            path: path.to_path_buf(),
+        });
+    }
+    // Plaintext PEM path (no passphrase, or passphrase set but file
+    // is plaintext — auto-upgrade).
+    if let Some(seed) = decode_pem(pem)
+        && seed.len() == DK_SEED_BYTES
+    {
+        let dk = parse_dk(&seed).expect("seed just validated");
+        let ek_arr = dk.encapsulation_key().to_bytes();
+        let ek: [u8; EK_BYTES] = ek_arr.as_slice().try_into().expect("EK size");
+
+        // Auto-upgrade: if passphrase is set and file is plaintext →
+        // re-encrypt in-place via atomic_write. Failure to re-encrypt
+        // is non-fatal — the key in memory is correct and the upgrade
+        // retries at the next start — but it is NOT nothing: the seed
+        // stays on disk in plaintext under an operator who just asked
+        // for it to be encrypted. This function has no logger handle,
+        // so the outcome travels back to a caller that does, rather
+        // than being dropped on the floor (audit report7 V-02).
+        let mut at_rest = MlKemKeyAtRest::AsConfigured;
+        let seed_arr = seed_array(&seed);
+        if let Some(pass) = passphrase {
+            // `seed_array` reads the one copy already in hand; the
+            // `seed.clone()` that used to stand here minted a THIRD
+            // plain `Vec` of the decapsulation seed for the sole
+            // purpose of being consumed by `try_into` (report7 V-09).
+            let enc_pem = encode_pem_encrypted(&seed_arr, pass);
+            at_rest = match veil_util::atomic_write(path, enc_pem.as_bytes()) {
+                Ok(()) => MlKemKeyAtRest::UpgradedToEncrypted,
+                Err(e) => MlKemKeyAtRest::PlaintextUpgradeFailed {
+                    reason: e.to_string(),
+                },
+            };
+        }
+
+        return Ok(MlKemKeyLoad {
+            ek,
+            dk_seed: seed_arr,
+            at_rest,
+        });
+    }
+    // File exists but neither encrypted-with-passphrase nor
+    // plaintext PEM parse worked → corrupt or unknown format.
+    Err(E2eError::MlKemKeyUnreadable {
+        path: path.to_path_buf(),
+    })
+}
+
+/// Read the key the winner of a first-start race published.
+///
+/// Publishing is TWO steps — the `O_EXCL` claim on the name, then the PEM —
+/// and a loser that reads between them sees a file of length zero, which parses
+/// as unreadable. During this window that is not corruption, it is a publish in
+/// progress, so it is retried briefly rather than reported.
+///
+/// Bounded rather than forever: a winner can die between the two steps and
+/// leave an empty file nobody will ever fill. Past the budget the honest answer
+/// is the parse error, which names the file an operator has to remove.
+///
+/// The budget matches `anonymity_x25519::load_after_race`, which solves the
+/// same race for the other long-lived secret in a `veil_dir`: one create and
+/// one small write with no I/O between them finish in microseconds.
+fn load_published_by_the_winner(
+    path: &Path,
+    passphrase: Option<&str>,
+) -> Result<MlKemKeyLoad, E2eError> {
+    const ATTEMPTS: u32 = 50;
+    const PAUSE: std::time::Duration = std::time::Duration::from_millis(2);
+    let mut last: Option<E2eError> = None;
+    for attempt in 0..ATTEMPTS {
+        match std::fs::read_to_string(path) {
+            Ok(pem) => match parse_mlkem_pem(path, &pem, passphrase) {
+                Ok(load) => return Ok(load),
+                // Not whole yet — or a passphrase mismatch, which looks the
+                // same from here and is reported as itself once the budget is
+                // spent.
+                Err(e @ E2eError::MlKemKeyUnreadable { .. }) => last = Some(e),
+                Err(e) => return Err(e),
+            },
+            // The claim is gone again: the winner died and cleaned up, or the
+            // filesystem has not caught up. Either way, not settled.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(source) => {
+                return Err(E2eError::MlKemKeyIo {
+                    path: path.to_path_buf(),
+                    source,
+                });
+            }
+        }
+        if attempt + 1 < ATTEMPTS {
+            std::thread::sleep(PAUSE);
+        }
+    }
+    Err(last.unwrap_or_else(|| E2eError::MlKemKeyUnreadable {
+        path: path.to_path_buf(),
+    }))
 }
 
 // ── tests ─────────────────────────────────────────────────────────────────────
@@ -861,6 +955,66 @@ mod tests {
 
     fn ids() -> ([u8; 32], [u8; 32]) {
         ([0xAA; 32], [0xBB; 32])
+    }
+
+    /// Two starts on a fresh `veil_dir` must not end up with two different
+    /// decapsulation keys.
+    ///
+    /// The publish used to be a temp-and-rename, and a rename ALWAYS wins — so
+    /// both starts saw ENOENT, both generated a key, both believed they had
+    /// published, and the disk kept one of them. The loser published the other
+    /// key's EK in its certificate; everything sealed to it stopped opening the
+    /// moment that node restarted and read the winner's key (report14 V14-M7).
+    ///
+    /// Not a probabilistic test in the part that matters: whether the threads
+    /// actually overlap or serialise, every one of them must end on the key
+    /// that is ON DISK. Overlapping is what makes the OLD code fail, and a
+    /// barrier plus a keygen inside the window makes overlapping the norm.
+    #[test]
+    fn concurrent_first_starts_agree_on_one_key() {
+        const STARTS: usize = 8;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("mlkem.key");
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(STARTS));
+
+        let mut handles = Vec::with_capacity(STARTS);
+        for _ in 0..STARTS {
+            let path = path.clone();
+            let barrier = std::sync::Arc::clone(&barrier);
+            handles.push(std::thread::spawn(move || {
+                barrier.wait();
+                load_or_generate_mlkem_key_encrypted(&path, None).expect("load or generate")
+            }));
+        }
+        let loaded: Vec<MlKemKeyLoad> = handles
+            .into_iter()
+            .map(|h| h.join().expect("start panicked"))
+            .collect();
+
+        // What every future start of this directory will read.
+        let on_disk = load_or_generate_mlkem_key_encrypted(&path, None).expect("reload");
+        for (i, got) in loaded.iter().enumerate() {
+            assert_eq!(
+                got.dk_seed, on_disk.dk_seed,
+                "start {i} kept a decapsulation key the disk does not have, so \
+                 everything sealed to its published EK dies at its next restart"
+            );
+            assert_eq!(got.ek, on_disk.ek, "start {i} published a different EK");
+        }
+    }
+
+    /// The publish must LOSE when somebody else got there first — that is the
+    /// property the race turns on, and it is the one a well-meaning switch back
+    /// to `atomic_write` would silently remove.
+    #[test]
+    fn publishing_a_key_refuses_to_overwrite_one() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("mlkem.key");
+        veil_util::write_new_owner_only(&path, b"first").expect("first publish");
+        let err = veil_util::write_new_owner_only(&path, b"second")
+            .expect_err("a second publish must not overwrite the first");
+        assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(std::fs::read(&path).expect("read"), b"first");
     }
 
     #[test]
