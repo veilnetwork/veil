@@ -159,6 +159,32 @@ pub trait ColdBackend: Send + Sync + std::fmt::Debug {
         None
     }
 
+    /// Record WHEN this node first saw the record now stored at `key`, as a
+    /// wall-clock unix second.
+    ///
+    /// `first_seen` is an `Instant`, which is process-local by construction —
+    /// so a restart forgot every cold entry's age and the sweep aged them from
+    /// zero, handing a record another full lifetime for the price of a restart
+    /// (report14 V14-L2). The backend's own stamp cannot stand in for it: that
+    /// one says when the entry was DEMOTED.
+    ///
+    /// Wall-clock and not the monotonic clock, because it has to survive the
+    /// process. The reader clamps a stamp from the future, which is what a
+    /// clock moved backwards looks like.
+    fn set_first_seen(&mut self, _key: &[u8; 32], _unix_secs: u64) {}
+
+    /// Forget `key`'s first-seen stamp.
+    fn forget_first_seen(&mut self, _key: &[u8; 32]) {}
+
+    /// `(key, first_seen_unix)` for every persisted row this backend stamped.
+    ///
+    /// `None` means "this backend does not remember"; a row it has no stamp
+    /// for is aged from the moment it was read back, which is the behaviour
+    /// every row had before this existed.
+    fn first_seen_all(&self) -> Option<Vec<([u8; 32], u64)>> {
+        None
+    }
+
     /// Whether this backend persists across a process restart (disk-backed).
     /// In-memory backends return `false`; a RocksDB backend returns `true`.
     /// Distinct from [`Self::cold_total_bytes`], which concerns restart
@@ -320,6 +346,11 @@ pub mod rocks {
     /// one simply empty — its rows are then unattributed, which is the honest
     /// answer for values written before anybody wrote the origin down.
     const CF_KEY_ORIGIN: &str = "key_origin_v1";
+    /// `key -> first-seen unix seconds`, so a record cannot buy another full
+    /// lifetime by surviving a restart (report14 V14-L2). Separate from
+    /// `CF_KEY_TS`, whose stamp is when the entry was DEMOTED and therefore
+    /// says nothing about how old the record is.
+    const CF_KEY_FIRST_SEEN: &str = "key_first_seen_v1";
 
     /// The entry `evict_oldest` settled on: its ts-index row (kept so the row
     /// can be deleted by its own key), the 32-byte store key, and the value.
@@ -395,7 +426,8 @@ pub mod rocks {
             let cfs = vec![
                 rocksdb::ColumnFamilyDescriptor::new(CF_TS_INDEX, cf_opts.clone()),
                 rocksdb::ColumnFamilyDescriptor::new(CF_KEY_TS, cf_opts.clone()),
-                rocksdb::ColumnFamilyDescriptor::new(CF_KEY_ORIGIN, cf_opts),
+                rocksdb::ColumnFamilyDescriptor::new(CF_KEY_ORIGIN, cf_opts.clone()),
+                rocksdb::ColumnFamilyDescriptor::new(CF_KEY_FIRST_SEEN, cf_opts),
             ];
             let db = rocksdb::DB::open_cf_descriptors(&opts, path, cfs)?;
             let (count, seed_bytes) = Self::reconcile(&db, side_cfs_existed);
@@ -420,7 +452,8 @@ pub mod rocks {
             let cfs = vec![
                 rocksdb::ColumnFamilyDescriptor::new(CF_TS_INDEX, cf_opts.clone()),
                 rocksdb::ColumnFamilyDescriptor::new(CF_KEY_TS, cf_opts.clone()),
-                rocksdb::ColumnFamilyDescriptor::new(CF_KEY_ORIGIN, cf_opts),
+                rocksdb::ColumnFamilyDescriptor::new(CF_KEY_ORIGIN, cf_opts.clone()),
+                rocksdb::ColumnFamilyDescriptor::new(CF_KEY_FIRST_SEEN, cf_opts),
             ];
             let db = rocksdb::DB::open_cf_descriptors_read_only(&opts, path, cfs, false)?;
             let (count, seed_bytes) = Self::reconcile(&db, true);
@@ -613,6 +646,12 @@ pub mod rocks {
         fn cf_ix(&self) -> &rocksdb::ColumnFamily {
             self.db.cf_handle(CF_TS_INDEX).expect("CF_TS_INDEX present")
         }
+        fn cf_first_seen(&self) -> &rocksdb::ColumnFamily {
+            self.db
+                .cf_handle(CF_KEY_FIRST_SEEN)
+                .expect("CF_KEY_FIRST_SEEN present")
+        }
+
         fn cf_origin(&self) -> &rocksdb::ColumnFamily {
             self.db
                 .cf_handle(CF_KEY_ORIGIN)
@@ -798,6 +837,44 @@ pub mod rocks {
 
         fn forget_origin(&mut self, key: &[u8; 32]) {
             let _ = self.db.delete_cf(self.cf_origin(), key);
+        }
+
+        fn set_first_seen(&mut self, key: &[u8; 32], unix_secs: u64) {
+            if let Err(e) = self
+                .db
+                .put_cf(self.cf_first_seen(), key, unix_secs.to_be_bytes())
+            {
+                // Best effort: a row with no stamp is aged from the moment it
+                // is read back, which is where every row was before this.
+                log::warn!("dht.cold.rocksdb: first-seen write failed: {e}");
+            }
+        }
+
+        fn forget_first_seen(&mut self, key: &[u8; 32]) {
+            let _ = self.db.delete_cf(self.cf_first_seen(), key);
+        }
+
+        fn first_seen_all(&self) -> Option<Vec<([u8; 32], u64)>> {
+            let mut out = Vec::new();
+            for item in self
+                .db
+                .iterator_cf(self.cf_first_seen(), rocksdb::IteratorMode::Start)
+            {
+                let Ok((k, v)) = item else { continue };
+                if k.len() != 32 || v.len() != 8 {
+                    continue;
+                }
+                // A stamp for a key whose value is gone describes nothing.
+                if !matches!(self.db.get(&k[..]), Ok(Some(_))) {
+                    continue;
+                }
+                let mut key = [0u8; 32];
+                key.copy_from_slice(&k);
+                let mut ts = [0u8; 8];
+                ts.copy_from_slice(&v);
+                out.push((key, u64::from_be_bytes(ts)));
+            }
+            Some(out)
         }
 
         fn origins(&self) -> Option<Vec<super::PersistedOrigin>> {
@@ -1220,6 +1297,29 @@ impl TieredStore {
         // it is the honest state: the global total still counts them.
         let mut origin_bytes: HashMap<[u8; 32], u64> = HashMap::new();
         let mut entry_origin: HashMap<[u8; 32], [u8; 32]> = HashMap::new();
+        // How old each persisted row is, so the expiry sweep does not start
+        // it over. A stamp from the FUTURE is what a clock moved backwards
+        // looks like, and it is clamped to "now" rather than believed
+        // (report14 V14-L2).
+        let mut cold_first_seen: HashMap<[u8; 32], Instant> = HashMap::new();
+        if let Some(rows) = cold.first_seen_all() {
+            let now = Instant::now();
+            let unix_now = veil_util::unix_secs_now_u64();
+            for (key, stamped) in rows {
+                let age = unix_now.saturating_sub(stamped);
+                cold_first_seen.insert(
+                    key,
+                    now.checked_sub(std::time::Duration::from_secs(age))
+                        .unwrap_or(now),
+                );
+            }
+            if !cold_first_seen.is_empty() {
+                log::info!(
+                    "DHT cold tier: seeded {} first-seen stamp(s) from disk",
+                    cold_first_seen.len()
+                );
+            }
+        }
         if let Some(rows) = cold.origins() {
             for (key, origin, bytes) in rows {
                 entry_origin.insert(key, origin);
@@ -1236,7 +1336,7 @@ impl TieredStore {
         Self {
             hot: HashMap::new(),
             hot_order: BTreeMap::new(),
-            cold_first_seen: HashMap::new(),
+            cold_first_seen,
             hot_capacity,
             cold,
             total_bytes,
@@ -1526,8 +1626,9 @@ impl TieredStore {
             let first_seen = self.cold_first_seen.get(key).copied().unwrap_or(now);
             return (false, first_seen);
         }
-        // Gone for real: its origin row describes nothing now.
+        // Gone for real: its side rows describe nothing now.
         self.cold.forget_origin(key);
+        self.cold.forget_first_seen(key);
         self.total_bytes = self.total_bytes.saturating_sub(bytes);
         (true, self.cold_first_seen.remove(key).unwrap_or(now))
     }
@@ -1900,6 +2001,14 @@ impl TieredStore {
                     if let Some(origin) = self.entry_origin.get(&key).copied() {
                         self.cold.set_origin(&key, &origin);
                     }
+                    // And HOW OLD it is, as a wall-clock second. `first_seen`
+                    // is an `Instant` and dies with the process, so a restart
+                    // aged every cold entry from zero and handed it another
+                    // full lifetime (report14 V14-L2).
+                    let age = Instant::now().saturating_duration_since(first_seen);
+                    let unix_now = veil_util::unix_secs_now_u64();
+                    self.cold
+                        .set_first_seen(&key, unix_now.saturating_sub(age.as_secs()));
                     if let Some((evicted_key, evicted_val)) = evicted {
                         self.account_eviction(&evicted_key, evicted_val.len() as u64);
                     }
@@ -3097,6 +3206,119 @@ mod v08_tests {
         // did not go is an entry nothing will ever age again.
         store.retain_fresh_age_only(Instant::now(), std::time::Duration::from_secs(0));
         assert_eq!(store.total_bytes(), 100);
+    }
+
+    /// A restart does not buy a record another lifetime.
+    ///
+    /// `first_seen` is an `Instant`, which dies with the process — so every
+    /// cold entry came back aged zero and the expiry sweep started it over.
+    /// The backend's own stamp cannot stand in for it: that one says when the
+    /// entry was DEMOTED (report14 V14-L2).
+    #[test]
+    fn a_restart_does_not_reset_a_cold_entry_age() {
+        #[derive(Debug, Default)]
+        struct Disk {
+            entries: HashMap<[u8; 32], Vec<u8>>,
+            first_seen: HashMap<[u8; 32], u64>,
+        }
+
+        #[derive(Debug, Clone, Default)]
+        struct StampingCold(std::sync::Arc<std::sync::Mutex<Disk>>);
+
+        impl StampingCold {
+            fn disk(&self) -> std::sync::MutexGuard<'_, Disk> {
+                self.0.lock().unwrap_or_else(|p| p.into_inner())
+            }
+        }
+
+        impl ColdBackend for StampingCold {
+            fn get(&self, key: &[u8; 32]) -> Option<Vec<u8>> {
+                self.disk().entries.get(key).cloned()
+            }
+            fn put(&mut self, key: [u8; 32], value: Vec<u8>) -> ColdPut {
+                self.disk().entries.insert(key, value);
+                ColdPut::Stored(None)
+            }
+            fn remove(&mut self, key: &[u8; 32]) {
+                self.disk().entries.remove(key);
+            }
+            fn contains(&self, key: &[u8; 32]) -> bool {
+                self.disk().entries.contains_key(key)
+            }
+            fn len(&self) -> usize {
+                self.disk().entries.len()
+            }
+            fn iter_entries(&self) -> Vec<([u8; 32], Vec<u8>)> {
+                self.disk()
+                    .entries
+                    .iter()
+                    .map(|(k, v)| (*k, v.clone()))
+                    .collect()
+            }
+            fn retain(&mut self, _f: &dyn Fn(&[u8; 32], &[u8]) -> bool) -> Vec<([u8; 32], u64)> {
+                Vec::new()
+            }
+            fn set_first_seen(&mut self, key: &[u8; 32], unix_secs: u64) {
+                self.disk().first_seen.insert(*key, unix_secs);
+            }
+            fn forget_first_seen(&mut self, key: &[u8; 32]) {
+                self.disk().first_seen.remove(key);
+            }
+            fn first_seen_all(&self) -> Option<Vec<([u8; 32], u64)>> {
+                let disk = self.disk();
+                Some(
+                    disk.first_seen
+                        .iter()
+                        .filter(|(k, _)| disk.entries.contains_key(*k))
+                        .map(|(k, t)| (*k, *t))
+                        .collect(),
+                )
+            }
+        }
+
+        let disk = StampingCold::default();
+        {
+            // Hot capacity 1: the first value is demoted into cold by the
+            // second, and demotion is where the stamp is written.
+            let mut store = TieredStore::with_cold(1, Box::new(disk.clone()));
+            store.put([1u8; 32], vec![0u8; 10]);
+            store.put([2u8; 32], vec![0u8; 10]);
+            assert!(store.contains(&[1u8; 32]));
+        }
+
+        // The record was first seen an hour ago. Backdate the stamp the way
+        // the passage of time would.
+        {
+            let mut d = disk.disk();
+            let stamped = veil_util::unix_secs_now_u64().saturating_sub(3600);
+            for v in d.first_seen.values_mut() {
+                *v = stamped;
+            }
+        }
+
+        // Reopened: everything this session learned in memory is gone.
+        let mut reopened = TieredStore::with_cold(1, Box::new(disk.clone()));
+        reopened.retain_fresh_age_only(Instant::now(), std::time::Duration::from_secs(600));
+        assert!(
+            !reopened.contains(&[1u8; 32]),
+            "a record an hour old under a ten-minute lifetime survived a \
+             restart: the age was aged from zero, which is another full \
+             lifetime for the price of restarting"
+        );
+
+        // And a record inside its lifetime is NOT swept, or the assertion
+        // above would pass by deleting everything.
+        let fresh = StampingCold::default();
+        let mut store = TieredStore::with_cold(1, Box::new(fresh.clone()));
+        store.put([3u8; 32], vec![0u8; 10]);
+        store.put([4u8; 32], vec![0u8; 10]);
+        drop(store);
+        let mut reopened = TieredStore::with_cold(1, Box::new(fresh));
+        reopened.retain_fresh_age_only(Instant::now(), std::time::Duration::from_secs(600));
+        assert!(
+            reopened.contains(&[3u8; 32]),
+            "a record well inside its lifetime must survive"
+        );
     }
 
     /// A backend that remembers publishers seeds the per-origin counters.
