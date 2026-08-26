@@ -1455,6 +1455,7 @@ pub fn verify_remote_peer_identity_reports_mismatch_readably() {
         )
         .expect("node id"),
         nonce: id.nonce,
+        row_transport_at_dial: "tcp://10.0.0.7:5555".to_owned(),
     };
 
     let error = verify_remote_peer_identity(&remote, &expected).expect_err("mismatch");
@@ -1493,6 +1494,7 @@ pub fn verify_remote_peer_identity_reports_nonce_mismatch_readably() {
         public_key: test_handshake_identity().public_key,
         node_id: test_handshake_identity().node_id,
         nonce: "AAAAAAAAAAAAAAAAAAAAAA==".to_owned(),
+        row_transport_at_dial: "tcp://10.0.0.8:5555".to_owned(),
     };
 
     // NonceMismatch now carries no message (the caller builds the log line).

@@ -5259,23 +5259,16 @@ mod reserved_apply_slot_tests {
         drop(held);
         assert_eq!(sem.available_permits(), total);
     }
-
-    /// The reserve must be smaller than any cap an operator can set, or a low
-    /// `admin_max_connections` would leave ordinary commands unable to run at
-    /// all.
-    ///
-    /// Pinned to the config minimum rather than to a number written here. The
-    /// old version compared against a hand-written "smallest sane cap" of 4,
-    /// which asserted nothing about what an operator could actually WRITE —
-    /// and 0, 1 and 2 all passed validation, reserving the entire pool
-    /// (report16 V16-L1). Now the two move together or this fails.
-    #[test]
-    fn the_reserve_leaves_room_for_ordinary_commands() {
-        assert!(
-            ADMIN_SLOTS_RESERVED_FOR_APPLY < veil_cfg::MIN_ADMIN_MAX_CONNECTIONS,
-            "the reserve ({ADMIN_SLOTS_RESERVED_FOR_APPLY}) swallows the \
-             smallest cap validation permits ({})",
-            veil_cfg::MIN_ADMIN_MAX_CONNECTIONS
-        );
-    }
 }
+
+/// The reserve must be smaller than any cap an operator can set, or a low
+/// `admin_max_connections` would leave ordinary commands unable to run at all.
+///
+/// Pinned to the config minimum rather than to a number written here. The old
+/// version compared against a hand-written "smallest sane cap" of 4, which
+/// asserted nothing about what an operator could actually WRITE — and 0, 1 and
+/// 2 all passed validation, reserving the entire pool (report16 V16-L1).
+///
+/// Both sides are constants, so this is checked when the crate is BUILT rather
+/// than when its tests are run: the two move together or nothing compiles.
+const _: () = assert!(ADMIN_SLOTS_RESERVED_FOR_APPLY < veil_cfg::MIN_ADMIN_MAX_CONNECTIONS);

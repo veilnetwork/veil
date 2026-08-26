@@ -212,17 +212,35 @@ pub fn spawn_outbound_peers(
                 // not a one-shot permit, so a stale wake cannot cancel the
                 // first reconnect after that session eventually closes.
                 refresh_rx.borrow_and_update();
-                // A PEX-learned row that has since been evicted takes its
-                // connector with it. Only `Exchanged` is retired this way:
-                // configured, bootstrap and synthetic gateway peers keep their
-                // task whether or not they are in `NodeState::peers`, which is
-                // where the gateway range lives outside the map entirely.
+                // WHICH row currently stands for this node id. A `PeerId` is
+                // a local slot, not an identity: a peer that comes back at a
+                // new address gets a NEW slot, and the per-node-id claim below
+                // stops a second connector being spawned for it — so this task
+                // went on dialling a slot nobody would fill again, and the
+                // replacement was dialled by nobody until the process
+                // restarted (report16 V16-M6). None for the synthetic gateway
+                // range, which lives outside the map; those keep the slot they
+                // were spawned with.
+                let dial_peer_id = access
+                    .current_peer_slot(&peer_node_id)
+                    .unwrap_or(peer.peer_id);
+
+                // A learned row that has since been evicted takes its
+                // connector with it. Only rows we learned OURSELVES are retired
+                // this way: configured and bootstrap peers keep their task
+                // whether or not they are in `NodeState::peers`.
                 //
-                // Without this the exchanged table could not be capped in any
+                // Autodiscovered belongs here for the same reason Exchanged
+                // does — the identity-mismatch path drops both, and the mesh
+                // poll re-inserts and re-spawns if the peer comes back — and
+                // leaving it out was half of the wedge above: the row went and
+                // the dial stayed.
+                //
+                // Without this the learned table could not be capped in any
                 // meaningful sense. Dropping a row freed a little memory and
                 // left the expensive half — an indefinitely retrying dial —
                 // running until the process ended.
-                if peer.source == crate::types::PeerSource::Exchanged
+                if crate::runtime::peer_handshake::identity_mismatch_drops_record(peer.source)
                     && !access.holds_peer_row(&peer_node_id)
                 {
                     break;
@@ -317,7 +335,7 @@ pub fn spawn_outbound_peers(
                         first_failure_at = None;
                         continue;
                     }
-                    result = access.connect_peer_active(peer.peer_id) => {
+                    result = access.connect_peer_active(dial_peer_id) => {
                         match result {
                             Ok(session) => {
                                 // Reset backoff on a successful connection.
@@ -873,6 +891,109 @@ mod tests {
         owner.changed().await.expect("second refresh is observable");
         assert_eq!(*owner.borrow_and_update(), 2);
         assert_eq!(lock!(slots).len(), 1);
+    }
+
+    /// The wedge, in the two facts that made it.
+    ///
+    /// A peer whose row was dropped and then rediscovered comes back under a
+    /// NEW `PeerId` — the slot is a local number, not an identity. The
+    /// per-node-id claim means no second connector is spawned for it: the
+    /// existing one is only woken. So the connector that already owns the slot
+    /// is the ONLY thing that can dial the replacement, and it captured the old
+    /// number when it spawned (report16 V16-M6).
+    #[test]
+    fn a_rediscovered_peer_comes_back_under_a_new_slot_and_no_new_connector() {
+        use crate::runtime::persistence::existing_slot_for;
+        use crate::types::PeerId;
+        use std::collections::BTreeMap;
+
+        let node_id = [0xC7u8; 32];
+        let row = |slot: u32| PeerConfigEntry {
+            peer_id: PeerId::new(slot),
+            node_id: veil_cfg::NodeId::from(node_id),
+            public_key: String::new(),
+            nonce: String::new(),
+            transport: format!("tcp://10.0.0.{slot}:5555"),
+            algo: veil_cfg::SignatureAlgorithm::Ed25519,
+            tls_cert: None,
+            tls_key: None,
+            tls_ca_cert: None,
+            bootstrap_only: true,
+            source: crate::types::PeerSource::Autodiscovered,
+        };
+
+        let mut peers = BTreeMap::new();
+        peers.insert(PeerId::new(1), row(1));
+        assert_eq!(existing_slot_for(&peers, &node_id), Some(PeerId::new(1)));
+
+        // The mismatch drops it; the mesh poll rediscovers it at a new address.
+        peers.remove(&PeerId::new(1));
+        assert_eq!(
+            existing_slot_for(&peers, &node_id),
+            None,
+            "premise: the row this connector was spawned for is gone"
+        );
+        peers.insert(PeerId::new(2), row(2));
+        assert_eq!(
+            existing_slot_for(&peers, &node_id),
+            Some(PeerId::new(2)),
+            "the per-pass lookup must follow the row, not the number"
+        );
+
+        // And nothing else will dial it: the claim only wakes the owner.
+        let slots: ConnectorRefreshSlots = Arc::new(Mutex::new(std::collections::HashMap::new()));
+        let _owner = claim_or_refresh_connector(&slots, node_id).expect("the owner");
+        assert!(
+            claim_or_refresh_connector(&slots, node_id).is_none(),
+            "a second connector would have covered for the stale one"
+        );
+    }
+
+    /// The production half of this file.
+    ///
+    /// The assertions below quote the very expressions they are about, and
+    /// `include_str!` reads the whole file — so searching all of it finds the
+    /// assertion's own string literal and passes on a file where the code was
+    /// deleted. Both source checks here were written that way first and both
+    /// stayed green when broken.
+    fn production_source() -> &'static str {
+        let source = include_str!("outbound_connector.rs");
+        let cut = source
+            .find("#[cfg(test)]")
+            .expect("this file has a test module");
+        let production = &source[..cut];
+        assert!(
+            production.contains("pub fn spawn_outbound_peers"),
+            "the cut removed the code instead of the tests"
+        );
+        production
+    }
+
+    /// The connector must ASK which row stands for its node id each pass, and
+    /// retire when there is none.
+    ///
+    /// Read from the source because the decision lives inside a spawned task
+    /// that needs a live `NodeServices`, a transport and a peer to reach — and
+    /// what is wrong when it is wrong is a single expression, not a behaviour
+    /// a fake can produce here. The two facts in the test above are what make
+    /// this one matter.
+    #[test]
+    fn the_dial_target_is_resolved_per_pass_and_the_retirement_covers_both_sources() {
+        let source = production_source();
+
+        assert!(
+            source.contains("current_peer_slot(&peer_node_id)"),
+            "the connector never asks which row currently stands for this node id"
+        );
+        assert!(
+            !source.contains("connect_peer_active(peer.peer_id)"),
+            "the connector dials the slot it captured when it spawned"
+        );
+        assert!(
+            source.contains("identity_mismatch_drops_record(peer.source)"),
+            "the retirement rule is narrower than the rule that drops the row, \
+             so a dropped Autodiscovered row keeps its dial forever"
+        );
     }
 
     #[test]

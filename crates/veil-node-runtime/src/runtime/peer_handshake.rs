@@ -94,6 +94,16 @@ pub struct ExpectedPeerIdentity {
     pub public_key: String,
     pub node_id: NodeId,
     pub nonce: String,
+    /// The row's address as it stood when this dial started.
+    ///
+    /// A `PeerId` is a local slot, and a slot outlives the row in it: an
+    /// endpoint refresh rewrites the address, and an eviction plus a
+    /// rediscovery can put a different peer entirely at the same number. A
+    /// handshake that started before either then carried a verdict about a row
+    /// that no longer exists — and the identity-mismatch path acted on it,
+    /// deleting the refreshed row (report16 V16-M6). Carried so the verdict
+    /// can be matched to the row it was actually about.
+    pub row_transport_at_dial: String,
 }
 
 pub enum PeerVerificationError {
@@ -865,7 +875,7 @@ pub async fn register_connection_session(
                 let dropped_node_id = {
                     let mut state = lock_state(&runtime.state);
                     match state.peers.get(&expected_peer.peer_id) {
-                        Some(entry) if identity_mismatch_drops_record(entry.source) => {
+                        Some(entry) if identity_mismatch_removes_row(entry, expected_peer) => {
                             let node_id = *entry.node_id.as_bytes();
                             state.peers.remove(&expected_peer.peer_id);
                             // Out of the proof set as well, or the next
@@ -1420,6 +1430,31 @@ pub fn identity_mismatch_drops_record(source: PeerSource) -> bool {
     !matches!(source, PeerSource::Configured | PeerSource::Bootstrap)
 }
 
+/// Whether an identity mismatch should remove THIS row.
+///
+/// Two questions, and only the first used to be asked.
+///
+/// Is the record ours to delete — see [`identity_mismatch_drops_record`].
+///
+/// And is it still the record this handshake was about. A `PeerId` is a local
+/// slot that outlives the row occupying it: between the dial and the verdict an
+/// endpoint refresh can rewrite the address, or an eviction plus a rediscovery
+/// can put a different peer at the same number. The verdict was applied to
+/// whatever was at the slot when it arrived, so a stale handshake deleted a row
+/// that had already been corrected — and the correction is exactly what would
+/// have made the next dial work (report16 V16-M6).
+///
+/// The node id and the address at dial time are the fingerprint. Neither is
+/// rewritten in place for a row that stayed the same thing.
+pub fn identity_mismatch_removes_row(
+    entry: &PeerConfigEntry,
+    expected: &ExpectedPeerIdentity,
+) -> bool {
+    identity_mismatch_drops_record(entry.source)
+        && entry.node_id == expected.node_id
+        && entry.transport == expected.row_transport_at_dial
+}
+
 pub fn peer_transport_context(
     base: &TransportContext,
     peer: &PeerConfigEntry,
@@ -1436,8 +1471,89 @@ pub fn peer_transport_context(
 
 #[cfg(test)]
 mod identity_mismatch_drop_tests {
-    use super::identity_mismatch_drops_record;
-    use crate::types::PeerSource;
+    use super::{
+        ExpectedPeerIdentity, identity_mismatch_drops_record, identity_mismatch_removes_row,
+    };
+    use crate::types::{PeerConfigEntry, PeerId, PeerSource};
+
+    const ADDR: &str = "tcp://10.0.0.7:5555";
+
+    fn row(source: PeerSource, node: u8, transport: &str) -> PeerConfigEntry {
+        PeerConfigEntry {
+            peer_id: PeerId::new(7),
+            node_id: veil_cfg::NodeId::from([node; 32]),
+            public_key: String::new(),
+            nonce: String::new(),
+            transport: transport.to_owned(),
+            algo: veil_cfg::SignatureAlgorithm::Ed25519,
+            tls_cert: None,
+            tls_key: None,
+            tls_ca_cert: None,
+            bootstrap_only: false,
+            source,
+        }
+    }
+
+    fn expectation(node: u8, transport: &str) -> ExpectedPeerIdentity {
+        ExpectedPeerIdentity {
+            peer_id: PeerId::new(7),
+            public_key: String::new(),
+            node_id: veil_cfg::NodeId::from([node; 32]),
+            nonce: String::new(),
+            row_transport_at_dial: transport.to_owned(),
+        }
+    }
+
+    /// A verdict applies to the row it was about, and to no other.
+    ///
+    /// The removal looked the slot up by `PeerId` and deleted whatever was
+    /// there. A `PeerId` is a local slot that outlives its occupant: an
+    /// endpoint refresh rewrites the address, and an eviction plus a
+    /// rediscovery can put a different peer at the same number. So a handshake
+    /// that started before either came back and deleted the CORRECTED row —
+    /// the one that would have made the next dial work (report16 V16-M6).
+    #[test]
+    fn a_stale_verdict_does_not_delete_the_row_that_replaced_it() {
+        let expected = expectation(0xAA, ADDR);
+
+        assert!(
+            identity_mismatch_removes_row(&row(PeerSource::Exchanged, 0xAA, ADDR), &expected),
+            "premise: the unchanged row is still removed"
+        );
+
+        assert!(
+            !identity_mismatch_removes_row(
+                &row(PeerSource::Exchanged, 0xAA, "tcp://10.0.0.9:5555"),
+                &expected
+            ),
+            "the address was refreshed while this handshake was in flight, and \
+             the refresh was deleted"
+        );
+
+        assert!(
+            !identity_mismatch_removes_row(&row(PeerSource::Exchanged, 0xBB, ADDR), &expected),
+            "the slot was reused by a different peer, and that peer was deleted"
+        );
+    }
+
+    /// And the source rule still governs: a matching fingerprint does not make
+    /// an operator's line deletable.
+    #[test]
+    fn a_matching_fingerprint_does_not_override_the_operators_line() {
+        let expected = expectation(0xAA, ADDR);
+        for source in [PeerSource::Configured, PeerSource::Bootstrap] {
+            assert!(
+                !identity_mismatch_removes_row(&row(source, 0xAA, ADDR), &expected),
+                "{source} row deleted"
+            );
+        }
+        for source in [PeerSource::Exchanged, PeerSource::Autodiscovered] {
+            assert!(
+                identity_mismatch_removes_row(&row(source, 0xAA, ADDR), &expected),
+                "{source} row kept"
+            );
+        }
+    }
 
     #[test]
     fn a_record_we_learned_ourselves_is_dropped() {
