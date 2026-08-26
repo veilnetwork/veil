@@ -346,6 +346,7 @@ mod tests {
             mlkem_pubkey: ek,
             ratchet_x25519_pubkey: [0x5A; 32],
             cert_version: 1,
+            valid_until_unix: u64::MAX,
         };
         (cert, node_id, instance_id, dk_seed)
     }
@@ -364,6 +365,7 @@ mod tests {
                 mlkem_pubkey: ek,
                 ratchet_x25519_pubkey: [0x5A; 32],
                 cert_version: 1,
+                valid_until_unix: u64::MAX,
             },
             instance_id,
             dk_seed,

@@ -69,6 +69,7 @@ fn local_verified_cert(
         mlkem_pubkey: ek.to_vec(),
         ratchet_x25519_pubkey,
         cert_version: LOCAL_MLKEM_CERT_VERSION,
+        valid_until_unix: u64::MAX,
     })
 }
 

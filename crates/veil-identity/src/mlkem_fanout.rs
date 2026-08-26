@@ -117,6 +117,14 @@ pub struct VerifiedMlkemCert {
     /// *verified* structure rather than re-parsing unverified wire bytes.
     pub ratchet_x25519_pubkey: [u8; 32],
     pub cert_version: u64,
+    /// When this certificate stops being valid.
+    ///
+    /// Carried THROUGH, because verification checks it once and the receive
+    /// path keeps what it learns. A device key cached from a certificate that
+    /// has since expired went on authenticating conversations forever
+    /// (report16 V16-H1); with the stamp beside the key, the answer can be
+    /// asked again at every use.
+    pub valid_until_unix: u64,
 }
 
 /// Verify an `MlKemKeyCert` against a (separately-verified)
@@ -186,6 +194,7 @@ pub fn verify_mlkem_cert(
         mlkem_pubkey: cert.mlkem_pubkey.clone(),
         ratchet_x25519_pubkey: cert.ratchet_x25519_pubkey,
         cert_version: cert.cert_version,
+        valid_until_unix: cert.valid_until_unix,
     })
 }
 
