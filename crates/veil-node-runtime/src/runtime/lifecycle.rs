@@ -536,6 +536,10 @@ impl NodeRuntime {
         // above is what writes the new `device_identity_sk.bin` these derive
         // from. An ordinary reload (same identity) still clones, which is what
         // keeps already-published directory entries valid.
+        // The id this runtime is CURRENTLY published under in the embedded
+        // registry. Taken before the swap below, because after it there is no
+        // way to ask what the stub was (report16 V16-L3).
+        let published_node_id = *self.identity.local_identity.node_id.as_bytes();
         let identity_changed = new_local_identity.node_id != self.identity.local_identity.node_id;
         let (promoted_mlkem, promoted_anonymity) = if identity_changed {
             self.rederive_identity_bound_keys(&config)
@@ -949,7 +953,15 @@ impl NodeRuntime {
         // onion-stream Phase 1d: re-publish the LIVE (post-reload) services for
         // the embedded FFI — a deferred-init node reloads from an empty stub to
         // the real config, and this overwrites the stub's empty-DHT services.
-        crate::runtime::services::publish_embedded_services(self.access());
+        //
+        // RE-publish, not publish: the same reload can PROMOTE the identity, so
+        // the view goes in under a different node id than the one this runtime
+        // is already published under. A plain publish left the stub id in the
+        // registry for the life of the process, holding Arc clones of live node
+        // state and answering an FFI handle that still carried it — the defect
+        // the stop path's withdraw exists for, arriving by another door
+        // (report16 V16-L3).
+        crate::runtime::services::republish_embedded_services(published_node_id, self.access());
         Ok(())
     }
 

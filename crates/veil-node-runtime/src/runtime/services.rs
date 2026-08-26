@@ -38,11 +38,70 @@ use veil_util::lock;
 /// Keep a `latest` fallback for old single-node callers, but key the production
 /// lookup by node_id so multi-identity and local two-node embedded tests use the
 /// right circuit context.
-#[derive(Default)]
-struct EmbeddedServicesRegistry {
-    latest: Option<NodeServices>,
-    by_node: BTreeMap<[u8; 32], NodeServices>,
+/// The bookkeeping, with no knowledge of what it holds.
+///
+/// Generic ONLY so it can be tested. Every rule here is about node ids and map
+/// entries rather than about services, but with `T` fixed to [`NodeServices`] —
+/// a bundle of live node state a unit test cannot assemble — the only honest
+/// test was a source check, and the rules went unexercised.
+///
+/// `latest` carries its id rather than asking the value for one, so the same
+/// reason holds for it.
+struct ServicesRegistry<T> {
+    latest: Option<([u8; 32], T)>,
+    by_node: BTreeMap<[u8; 32], T>,
 }
+
+impl<T> Default for ServicesRegistry<T> {
+    fn default() -> Self {
+        Self {
+            latest: None,
+            by_node: BTreeMap::new(),
+        }
+    }
+}
+
+impl<T: Clone> ServicesRegistry<T> {
+    /// Overwrite the entry for `node_id`, and make it the fallback.
+    fn publish(&mut self, node_id: [u8; 32], value: T) {
+        self.by_node.insert(node_id, value.clone());
+        self.latest = Some((node_id, value));
+    }
+
+    /// Drop the entry for `node_id`, falling the fallback back to whatever
+    /// else is still published rather than to nothing.
+    fn withdraw(&mut self, node_id: &[u8; 32]) {
+        self.by_node.remove(node_id);
+        if self.latest.as_ref().is_some_and(|(id, _)| id == node_id) {
+            self.latest = self
+                .by_node
+                .iter()
+                .next()
+                .map(|(id, value)| (*id, value.clone()));
+        }
+    }
+
+    /// Publish under `node_id`, retiring what the SAME runtime published under
+    /// `previous`.
+    ///
+    /// A runtime's node id is not fixed for its lifetime: a deferred boot
+    /// starts under a throwaway stub key and the reload promotes it to the real
+    /// one. Publishing alone left the stub id in the map for the life of the
+    /// PROCESS — holding `Arc` clones of live node state, and answering an FFI
+    /// handle that still carried the stub id, which is the same defect the
+    /// stop path's withdraw was written for (report16 V16-L3).
+    ///
+    /// Publish first, then retire: that way the fallback is already the new
+    /// view and retiring the old one cannot leave it pointing at nothing.
+    fn republish(&mut self, previous: [u8; 32], node_id: [u8; 32], value: T) {
+        self.publish(node_id, value);
+        if previous != node_id {
+            self.withdraw(&previous);
+        }
+    }
+}
+
+type EmbeddedServicesRegistry = ServicesRegistry<NodeServices>;
 
 /// The most PEX-learned peer rows this node keeps.
 ///
@@ -66,8 +125,19 @@ fn embedded_services_registry() -> &'static Mutex<EmbeddedServicesRegistry> {
 pub fn publish_embedded_services(services: NodeServices) {
     let node_id = services.local_node_id();
     if let Ok(mut g) = embedded_services_registry().lock() {
-        g.by_node.insert(node_id, services.clone());
-        g.latest = Some(services);
+        g.publish(node_id, services);
+    }
+}
+
+/// Publish this runtime's view and retire the one it published under
+/// `previous_node_id`.
+///
+/// For the reload path, where a deferred boot's throwaway stub identity is
+/// promoted to the real one. See [`ServicesRegistry::republish`].
+pub fn republish_embedded_services(previous_node_id: [u8; 32], services: NodeServices) {
+    let node_id = services.local_node_id();
+    if let Ok(mut g) = embedded_services_registry().lock() {
+        g.republish(previous_node_id, node_id, services);
     }
 }
 
@@ -85,16 +155,7 @@ pub fn publish_embedded_services(services: NodeServices) {
 /// would break the single-node callers `latest` exists for.
 pub fn withdraw_embedded_services(node_id: &[u8; 32]) {
     if let Ok(mut g) = embedded_services_registry().lock() {
-        g.by_node.remove(node_id);
-        if g.latest
-            .as_ref()
-            .is_some_and(|s| &s.local_node_id() == node_id)
-        {
-            // Fall back to whatever else is still published rather than to
-            // nothing: a surviving node is a better answer for an old
-            // single-node caller than "no embedded node".
-            g.latest = g.by_node.values().next().cloned();
-        }
+        g.withdraw(node_id);
     }
 }
 
@@ -113,7 +174,7 @@ pub fn embedded_services() -> Option<NodeServices> {
     embedded_services_registry()
         .lock()
         .ok()
-        .and_then(|g| g.latest.clone())
+        .and_then(|g| g.latest.as_ref().map(|(_, services)| services.clone()))
 }
 
 #[allow(unused_imports)]
@@ -1716,6 +1777,122 @@ mod m5_persist_tests {
 }
 
 #[cfg(test)]
+mod services_registry_tests {
+    use super::ServicesRegistry;
+
+    const STUB: [u8; 32] = [0x01; 32];
+    const REAL: [u8; 32] = [0x02; 32];
+    const OTHER: [u8; 32] = [0x03; 32];
+
+    fn latest(registry: &ServicesRegistry<&'static str>) -> Option<&'static str> {
+        registry.latest.as_ref().map(|(_, v)| *v)
+    }
+
+    /// A runtime's node id is not fixed for its lifetime.
+    ///
+    /// A deferred boot starts under a throwaway stub key and the reload
+    /// PROMOTES it to the real one. The reload published under the new id and
+    /// said nothing about the old, so the stub entry stayed for the life of the
+    /// PROCESS — holding `Arc` clones of live node state, and still answering
+    /// an FFI handle that carried the stub id (report16 V16-L3).
+    #[test]
+    fn a_promoted_runtime_leaves_no_entry_under_the_id_it_grew_out_of() {
+        let mut registry = ServicesRegistry::default();
+        registry.publish(STUB, "stub");
+        assert_eq!(registry.by_node.get(&STUB), Some(&"stub"), "premise");
+
+        registry.republish(STUB, REAL, "real");
+
+        assert_eq!(
+            registry.by_node.get(&STUB),
+            None,
+            "the id this runtime grew out of still answers"
+        );
+        assert_eq!(registry.by_node.get(&REAL), Some(&"real"));
+        assert_eq!(latest(&registry), Some("real"));
+    }
+
+    /// Vacuity guard: a reload that does NOT promote must keep its entry. The
+    /// ordinary case is a republish under the SAME id, and retiring it there
+    /// would unpublish every node that reloads.
+    #[test]
+    fn a_reload_that_changes_nothing_keeps_the_node_published() {
+        let mut registry = ServicesRegistry::default();
+        registry.publish(REAL, "before");
+
+        registry.republish(REAL, REAL, "after");
+
+        assert_eq!(
+            registry.by_node.get(&REAL),
+            Some(&"after"),
+            "the node unpublished itself by reloading"
+        );
+        assert_eq!(latest(&registry), Some("after"));
+    }
+
+    /// And a promotion must not disturb another identity in the same process.
+    #[test]
+    fn another_nodes_entry_survives_a_promotion() {
+        let mut registry = ServicesRegistry::default();
+        registry.publish(OTHER, "other");
+        registry.publish(STUB, "stub");
+
+        registry.republish(STUB, REAL, "real");
+
+        assert_eq!(registry.by_node.get(&OTHER), Some(&"other"));
+        assert_eq!(registry.by_node.len(), 2, "{:?}", registry.by_node.len());
+    }
+
+    /// Withdrawing the fallback falls back to a surviving node rather than to
+    /// nothing — a live node is a better answer for an old single-node caller
+    /// than "no embedded node".
+    #[test]
+    fn withdrawing_the_fallback_falls_back_to_whoever_is_left() {
+        let mut registry = ServicesRegistry::default();
+        registry.publish(OTHER, "other");
+        registry.publish(REAL, "real");
+        assert_eq!(latest(&registry), Some("real"), "premise");
+
+        registry.withdraw(&REAL);
+        assert_eq!(latest(&registry), Some("other"));
+
+        registry.withdraw(&OTHER);
+        assert_eq!(latest(&registry), None, "nothing is left to fall back to");
+    }
+
+    /// Withdrawing somebody ELSE must not move the fallback.
+    ///
+    /// The fixture is built so the two answers differ. Written first with two
+    /// nodes, it could not tell the guard from no guard: recomputing the
+    /// fallback over the survivors returned the same node either way, and
+    /// deleting the `latest` check left the test green. The fallback here is
+    /// the LAST published and the map's first key belongs to somebody else, so
+    /// recomputing gives a different answer than keeping.
+    #[test]
+    fn withdrawing_another_node_leaves_the_fallback_alone() {
+        let mut registry = ServicesRegistry::default();
+        registry.publish(STUB, "stub"); // 0x01 — first by key
+        registry.publish(REAL, "real"); // 0x02
+        registry.publish(OTHER, "other"); // 0x03 — and the fallback
+        assert_eq!(latest(&registry), Some("other"), "premise");
+        assert_eq!(
+            registry.by_node.keys().next(),
+            Some(&STUB),
+            "premise: the fallback is not the map's first entry, or this test \
+             cannot tell keeping from recomputing"
+        );
+
+        registry.withdraw(&STUB);
+
+        assert_eq!(
+            latest(&registry),
+            Some("other"),
+            "somebody else stopping moved this caller to a different node"
+        );
+    }
+}
+
+#[cfg(test)]
 mod v08_withdraw_tests {
     /// Publishing must keep its counterpart on the stop path.
     ///
@@ -1741,6 +1918,48 @@ mod v08_withdraw_tests {
              stopped node stays in the registry for the life of the process, \
              holding Arc clones of its state, and a stale FFI id can still \
              find and drive it (report9 V-08)"
+        );
+    }
+
+    /// The reload path must RE-publish, not publish.
+    ///
+    /// A source check for the same reason as the one above: the wiring is what
+    /// rots. The rules it wires up are exercised directly in
+    /// `services_registry_tests`; this is the one fact about the file those
+    /// cannot reach.
+    ///
+    /// Read from `lifecycle.rs`, so the assertion strings below live in a
+    /// different file than the text being searched — a check that reads its
+    /// OWN file finds its own literals and passes on deleted code.
+    #[test]
+    fn the_reload_path_retires_the_id_it_was_published_under() {
+        let lifecycle = include_str!("lifecycle.rs");
+        let start = lifecycle
+            .find("async fn apply_reload_after_stop")
+            .expect("apply_reload_after_stop moved — this guard watches nothing");
+        let body = &lifecycle[start..];
+        // The next item's doc comment ends the body: `///` at this indent
+        // cannot appear inside one.
+        let end = body[1..]
+            .find("\n    /// ")
+            .map(|i| i + 1)
+            .unwrap_or(body.len());
+        let body = &body[..end];
+        assert!(
+            body.contains("spawn_all_services"),
+            "the cut took the body with it"
+        );
+
+        assert!(
+            body.contains("republish_embedded_services(published_node_id"),
+            "the reload publishes without saying what it was published as: a \
+             promoted identity leaves the stub id in the registry for the life \
+             of the process, holding Arc clones of live node state and still \
+             answering an FFI handle that carries it (report16 V16-L3)"
+        );
+        assert!(
+            !body.contains("publish_embedded_services(self.access())"),
+            "the plain publish is still there"
         );
     }
 

@@ -250,29 +250,25 @@ struct RuntimeBundle {
     /// request timed out the flush failed and the ratchet went DEGRADED, which
     /// on a phone looked like a node that had stopped answering.
     ///
-    /// KNOWN LIMIT — audit report9 finding 4, and the reasoning that was
-    /// written here before it was wrong.
+    /// What makes a stale value safe: services for an id no node holds any
+    /// more do not exist, so the lookup MISSES, this is forgotten, and the id
+    /// is refetched.
     ///
-    /// The claim was that a stale value cannot pass silently, because services
-    /// for an id this node no longer has do not exist, so the lookup misses and
-    /// the entry is refetched. The registry it looks in
-    /// (`veil_node_runtime::publish_embedded_services`) is keyed by node id and
-    /// only ever INSERTS: it overwrites on republish, which is what deferred
-    /// init needs, but an identity PROMOTION publishes under a NEW id and
-    /// leaves the old entry in place for the life of the process. So the miss
-    /// this cache was justified by never happens, and after a promotion the
-    /// lookup can hand back the superseded node's services.
+    /// That reasoning was written here, then found to be false, and is true
+    /// again. It rested on the registry not answering for a superseded id, and
+    /// the registry only ever inserted: an identity PROMOTION — a deferred boot
+    /// reloading from its throwaway stub key to the real one — published under
+    /// the NEW id and left the old entry answering for the life of the process.
+    /// So the miss never happened, and after a promotion the lookup could hand
+    /// back the superseded node's services: onion registration or withdrawal
+    /// through a detached DHT, and old identity graphs held alive (audit
+    /// report9 finding 4, report16 V16-L3).
     ///
-    /// What that costs is bounded but real: onion registration or withdrawal
-    /// through a detached DHT, and old identity graphs held alive. The ratchet
-    /// — the caller this cache exists for — shares one `Arc` that survives a
-    /// reload, so its state is not at risk; that is why this is a limit rather
-    /// than a live corruption.
-    ///
-    /// The fix is in the registry, not here: entries want handle scope and a
-    /// generation, with the superseded id removed when a promotion publishes.
-    /// Inventing a validity check on this side would have to guess which node
-    /// belongs to which handle, and in all-online mode there are several.
+    /// The fix is in the registry, which is where it belonged — a promotion
+    /// retires the id it grew out of, exactly as `stop` retires the id it is
+    /// leaving. Inventing a validity check on this side would have had to guess
+    /// which node belongs to which handle, and in all-online mode there are
+    /// several.
     ///
     /// Gated with its only reader: `embedded_services_for_bundle` is
     /// `node-embedded`, and without that feature this is a mutex nothing
@@ -4999,11 +4995,9 @@ fn embedded_services_for_bundle(
         if let Some(services) = services_for(me) {
             return Ok(services);
         }
-        // A miss means the id belongs to no published node at all. It does
-        // NOT mean a hit is current: the registry never removes a superseded
-        // id (see `cached_node_id`), so a promotion leaves the old entry
-        // answering. Forgetting on a miss is still right; it is simply not the
-        // whole guarantee this once claimed to be.
+        // A miss means the id belongs to no published node: it stopped, or it
+        // was promoted and the registry retired the id it grew out of. Forget
+        // it and ask the node what it is called now.
         *cached(bundle) = None;
     }
 
