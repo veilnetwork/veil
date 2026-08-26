@@ -27,7 +27,7 @@ mod mobile_state;
 mod nickname;
 mod offline_seal;
 mod p_net_ban_sync;
-mod peer_handshake;
+pub(crate) mod peer_handshake;
 mod persist_tasks;
 pub(crate) mod persistence;
 mod pex_runtime;
@@ -4415,8 +4415,20 @@ impl NodeServices {
     /// made the exchanged-peer table unboundable — a cap can only evict if
     /// eviction actually retires the work the row was paying for.
     pub(crate) fn holds_peer_row(&self, node_id: &[u8; 32]) -> bool {
+        self.current_peer_slot(node_id).is_some()
+    }
+
+    /// WHICH row currently represents `node_id`, if any.
+    ///
+    /// A `PeerId` is a local slot, not an identity: a node rediscovered at a
+    /// new address gets a NEW slot, and the old one is gone. An outbound
+    /// connector captured its slot when it spawned and dialled that number for
+    /// the life of the task, while the per-node-id claim stopped a second task
+    /// from being spawned for the replacement — so a peer that came back under
+    /// a new row was dialled by nobody until the process restarted (report16
+    /// V16-M6). The connector asks this every pass instead.
+    pub(crate) fn current_peer_slot(&self, node_id: &[u8; 32]) -> Option<veil_cfg::PeerId> {
         crate::runtime::persistence::existing_slot_for(&lock_state(&self.state).peers, node_id)
-            .is_some()
     }
 
     pub async fn dht_get_replicated(
@@ -5884,6 +5896,7 @@ impl NodeServices {
                     public_key: peer.public_key.clone(),
                     node_id: peer.node_id,
                     nonce: peer.nonce.clone(),
+                    row_transport_at_dial: peer.transport.clone(),
                 }),
                 None,
                 SessionState::Active,
@@ -6350,6 +6363,7 @@ impl NodeServices {
                 public_key: peer.public_key,
                 node_id: peer.node_id,
                 nonce: peer.nonce,
+                row_transport_at_dial: peer.transport,
             }),
             None,
             session_state,
