@@ -165,6 +165,38 @@ async fn create_udp_stream(socket_queue: &Option<Arc<SocketQueue>>, peer: Socket
 /// * `shutdown_token` - The token to exit the server
 /// # Returns
 /// * The number of sessions while exiting
+/// One session slot, given back when this is dropped.
+///
+/// Counting by hand is what leaked. The count was incremented before the proxy
+/// handler was built, and the paths that left in between — a selector timeout,
+/// a proxy that refuses UDP, which an HTTP profile does by design — did not
+/// give it back. The tunnel reached `max_sessions` and then dropped ALL new
+/// traffic, TCP included, for the life of the process (report15 V15-M1).
+///
+/// A slot that is an OBJECT cannot be forgotten on a branch: every exit runs
+/// `Drop`, including the ones nobody thought about.
+struct SessionPermit(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+
+impl SessionPermit {
+    fn take(count: &std::sync::Arc<std::sync::atomic::AtomicUsize>) -> Self {
+        let now = count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            .saturating_add(1);
+        log::trace!("Session count {now}");
+        Self(count.clone())
+    }
+}
+
+impl Drop for SessionPermit {
+    fn drop(&mut self) {
+        let now = self
+            .0
+            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed)
+            .saturating_sub(1);
+        log::trace!("Session count {now}");
+    }
+}
+
 pub async fn run<D>(device: D, mtu: u16, args: Args, shutdown_token: CancellationToken) -> crate::Result<usize>
 where
     D: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -301,7 +333,7 @@ where
                     log::warn!("Too many sessions that over {max_sessions}, dropping new session");
                     continue;
                 }
-                log::trace!("Session count {}", task_count.fetch_add(1, Relaxed).saturating_add(1));
+                let permit = SessionPermit::take(&task_count);
                 let info = SessionInfo::new(tcp.local_addr(), tcp.peer_addr(), IpProtocol::Tcp);
                 let domain_name = if let Some(virtual_dns) = &virtual_dns {
                     let mut virtual_dns = virtual_dns.lock().await;
@@ -310,13 +342,25 @@ where
                 } else {
                     None
                 };
-                let proxy_handler = mgr.new_proxy_handler(info, domain_name, false).await?;
+                // NOT `?`. This is inside the accept loop, so a setup error for ONE
+                // flow — a selector timeout, a proxy that will not answer — returned
+                // from `run` and took the whole tunnel down with it, for every
+                // application on the device (report15 V15-M1). And the count above
+                // has already been incremented, so leaving without giving it back
+                // is a session slot gone for the life of the process.
+                let proxy_handler = match mgr.new_proxy_handler(info, domain_name, false).await {
+                    Ok(handler) => handler,
+                    Err(e) => {
+                        log::error!("{info} could not be set up: {e}");
+                        continue; // `permit` is dropped here
+                    }
+                };
                 let socket_queue = socket_queue.clone();
                 tokio::spawn(async move {
                     if let Err(err) = handle_tcp_session(tcp, proxy_handler, socket_queue).await {
                         log::error!("{info} error \"{err}\"");
                     }
-                    log::trace!("Session count {}", task_count.fetch_sub(1, Relaxed).saturating_sub(1));
+                    drop(permit);
                 });
             }
             IpStackStream::Udp(udp) => {
@@ -328,7 +372,7 @@ where
                     log::warn!("Too many sessions that over {max_sessions}, dropping new session");
                     continue;
                 }
-                log::trace!("Session count {}", task_count.fetch_add(1, Relaxed).saturating_add(1));
+                let permit = SessionPermit::take(&task_count);
                 let mut info = SessionInfo::new(udp.local_addr(), udp.peer_addr(), IpProtocol::Udp);
                 if info.dst.port() == DNS_PORT {
                     if is_private_ip(info.dst.ip()) {
@@ -336,13 +380,21 @@ where
                     }
                     if args.dns == ArgDns::OverTcp {
                         info.protocol = IpProtocol::Tcp;
-                        let proxy_handler = mgr.new_proxy_handler(info, None, false).await?;
+                        // Same as the TCP branch above: one flow's setup error is
+                        // not the tunnel's.
+                        let proxy_handler = match mgr.new_proxy_handler(info, None, false).await {
+                            Ok(handler) => handler,
+                            Err(e) => {
+                                log::error!("{info} could not be set up: {e}");
+                                continue; // `permit` is dropped here
+                            }
+                        };
                         let socket_queue = socket_queue.clone();
                         tokio::spawn(async move {
                             if let Err(err) = handle_dns_over_tcp_session(udp, proxy_handler, socket_queue, ipv6_enabled).await {
                                 log::error!("{info} error \"{err}\"");
                             }
-                            log::trace!("Session count {}", task_count.fetch_sub(1, Relaxed).saturating_sub(1));
+                            drop(permit);
                         });
                         continue;
                     }
@@ -353,7 +405,7 @@ where
                                     log::error!("{info} error \"{err}\"");
                                 }
                             }
-                            log::trace!("Session count {}", task_count.fetch_sub(1, Relaxed).saturating_sub(1));
+                            drop(permit);
                         });
                         continue;
                     }
@@ -373,7 +425,13 @@ where
                         SocketAddr::V6(_) => SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, 0, 0, 0)),
                     };
                     let tcpinfo = SessionInfo::new(tcp_src, udpgw.get_udpgw_server_addr(), IpProtocol::Tcp);
-                    let proxy_handler = mgr.new_proxy_handler(tcpinfo, None, false).await?;
+                    let proxy_handler = match mgr.new_proxy_handler(tcpinfo, None, false).await {
+                        Ok(handler) => handler,
+                        Err(e) => {
+                            log::error!("{info} could not reach the udp gateway: {e}");
+                            continue; // `permit` is dropped here
+                        }
+                    };
                     let queue = socket_queue.clone();
                     tokio::spawn(async move {
                         let dst = info.dst; // real UDP destination address
@@ -384,7 +442,7 @@ where
                         if let Err(e) = handle_udp_gateway_session(udp, udpgw, &dst_addr, proxy_handler, queue, ipv6_enabled).await {
                             log::info!("Ending {info} with \"{e}\"");
                         }
-                        log::trace!("Session count {}", task_count.fetch_sub(1, Relaxed).saturating_sub(1));
+                        drop(permit);
                     });
                     continue;
                 }
@@ -396,11 +454,17 @@ where
                             if let Err(err) = handle_udp_associate_session(udp, ty, proxy_handler, socket_queue, ipv6_enabled).await {
                                 log::info!("Ending {info} with \"{err}\"");
                             }
-                            log::trace!("Session count {}", task_count.fetch_sub(1, Relaxed).saturating_sub(1));
+                            drop(permit);
                         });
                     }
                     Err(e) => {
+                        // The count was incremented before this. Without giving
+                        // it back, every refused UDP flow costs a session slot
+                        // permanently — and an HTTP proxy profile refuses UDP by
+                        // design, so the tunnel reached `max_sessions` and then
+                        // dropped ALL new traffic, TCP included.
                         log::error!("Failed to create UDP connection: {e}");
+                        // `permit` is dropped at the end of this arm.
                     }
                 }
             }
