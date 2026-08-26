@@ -848,6 +848,54 @@ pub async fn register_connection_session(
                 if let Some(metrics) = &runtime.metrics {
                     metrics.inc_outbound_connect_failures();
                 }
+                // A DISCOVERED record whose address now answers as a different
+                // node is a fossil: that identity is not there any more, and no
+                // number of retries will bring it back. It stays in the map
+                // otherwise, so the reconnect scheduler dials it forever —
+                // observed on a production seed, which had two records for one
+                // transport (the node had been redeployed with a new identity)
+                // and warned on every reconnect for days.
+                //
+                // Only what we learned OURSELVES. An operator's `[[peers]]`
+                // line is not ours to delete: a stranger answering at a
+                // configured address is a security signal, and the right
+                // response there is exactly what happens now — refuse, shout,
+                // and leave the operator's file alone. Bootstrap entries stay
+                // too; they are the operator's list of ways in.
+                let dropped_node_id = {
+                    let mut state = lock_state(&runtime.state);
+                    match state.peers.get(&expected_peer.peer_id) {
+                        Some(entry) if identity_mismatch_drops_record(entry.source) => {
+                            let node_id = *entry.node_id.as_bytes();
+                            state.peers.remove(&expected_peer.peer_id);
+                            // Out of the proof set as well, or the next
+                            // snapshot writes it back the moment anything else
+                            // re-adds the id.
+                            state.handshaked.remove(&node_id);
+                            Some(node_id)
+                        }
+                        _ => None,
+                    }
+                };
+                if let Some(node_id) = dropped_node_id {
+                    runtime.logger.info(
+                        "peer.discovered_dropped",
+                        format!(
+                            "peer_id={} node_id={} reason=identity_mismatch — the \
+                             address answers as someone else now",
+                            expected_peer.peer_id,
+                            node_id
+                                .iter()
+                                .map(|b| format!("{b:02x}"))
+                                .collect::<String>()
+                        ),
+                    );
+                    let config_path = runtime.config_path.clone();
+                    let state_for_persist = Arc::clone(&runtime.state);
+                    tokio::task::spawn_blocking(move || {
+                        persistence::persist_discovered_peers(&state_for_persist, &config_path);
+                    });
+                }
                 let _ = stream.shutdown().await;
                 return Err(NodeError::Handshake(message));
             }
@@ -1352,6 +1400,26 @@ pub fn inbound_bypasses_directional(matched_source: Option<PeerSource>) -> bool 
     )
 }
 
+/// Whether an identity mismatch should DROP our record of this peer.
+///
+/// A record we learned OURSELVES (`Exchanged` via PEX, `Autodiscovered` via
+/// beacon) names a node at an address. When that address answers as somebody
+/// else, the node it named is not there any more and no number of retries
+/// brings it back — the record is a fossil, and the reconnect scheduler dials
+/// it forever. Observed on a production seed: two records for one transport,
+/// because the machine had been redeployed with a new identity, and a
+/// `peer.identity_mismatch` warning on every reconnect for days.
+///
+/// An operator's `[[peers]]` line is NOT ours to delete. A stranger answering
+/// at a configured address is a security signal — an address takeover, a
+/// misdirected DNS name — and deleting the line would erase the evidence and
+/// silently accept the new occupant at the next opportunity. Refuse, shout,
+/// leave the file alone. `Bootstrap` is the operator's list of ways in and is
+/// treated the same.
+pub fn identity_mismatch_drops_record(source: PeerSource) -> bool {
+    !matches!(source, PeerSource::Configured | PeerSource::Bootstrap)
+}
+
 pub fn peer_transport_context(
     base: &TransportContext,
     peer: &PeerConfigEntry,
@@ -1364,6 +1432,39 @@ pub fn peer_transport_context(
         ctx = ctx.with_client_identity_from_files(Path::new(cert), Path::new(key))?;
     }
     Ok(ctx)
+}
+
+#[cfg(test)]
+mod identity_mismatch_drop_tests {
+    use super::identity_mismatch_drops_record;
+    use crate::types::PeerSource;
+
+    #[test]
+    fn a_record_we_learned_ourselves_is_dropped() {
+        // The address answers as someone else: the node this record names is
+        // gone, and retrying it can never succeed.
+        assert!(identity_mismatch_drops_record(PeerSource::Exchanged));
+        assert!(identity_mismatch_drops_record(PeerSource::Autodiscovered));
+    }
+
+    #[test]
+    fn the_operators_own_lines_are_never_deleted() {
+        // A stranger at a configured address is a SIGNAL — an address
+        // takeover, a misdirected name. Deleting the line would erase the
+        // evidence and accept the new occupant at the next opportunity.
+        assert!(!identity_mismatch_drops_record(PeerSource::Configured));
+        assert!(!identity_mismatch_drops_record(PeerSource::Bootstrap));
+    }
+
+    #[test]
+    fn the_two_answers_do_not_collapse() {
+        // Vacuity guard: a predicate returning one answer for everything would
+        // satisfy exactly one of the tests above and look fine in isolation.
+        assert_ne!(
+            identity_mismatch_drops_record(PeerSource::Exchanged),
+            identity_mismatch_drops_record(PeerSource::Configured)
+        );
+    }
 }
 
 #[cfg(test)]
