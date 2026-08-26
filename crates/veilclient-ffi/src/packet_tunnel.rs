@@ -11,7 +11,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::os::fd::{FromRawFd, IntoRawFd, OwnedFd};
 use std::os::raw::{c_char, c_int, c_ushort, c_void};
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
@@ -317,6 +317,22 @@ fn tunnel_args(proxy_url: &str, dns_ip: &str, mtu: u16, route_dns: bool) -> Resu
     })
 }
 
+/// Runtimes taken down with work still running, since this process started.
+///
+/// Each one is a thread that did not come back. Zero is the expected value:
+/// blocking work that observes the cancellation token finishes inside
+/// [`RUNTIME_SHUTDOWN_GRACE`]. A number that climbs means something is parked
+/// in a syscall nothing here can interrupt, and that is worth being able to
+/// read rather than infer from memory use.
+static ABANDONED_WORKERS: AtomicUsize = AtomicUsize::new(0);
+
+/// How many runtimes were abandoned with work still running. See
+/// [`ABANDONED_WORKERS`].
+#[unsafe(no_mangle)]
+pub extern "C" fn veil_packet_tunnel_abandoned_workers() -> u32 {
+    u32::try_from(ABANDONED_WORKERS.load(Ordering::Acquire)).unwrap_or(u32::MAX)
+}
+
 fn launch_tunnel<F>(
     packet_tx: Option<mpsc::Sender<Vec<u8>>>,
     sink: Option<Arc<WriteSink>>,
@@ -385,7 +401,27 @@ where
             // Abandons a blocking task that will not finish rather than
             // waiting on it. What leaks is a thread; what it buys is a slot
             // that frees, so the next start is a start and not a refusal.
+            //
+            // The token is already cancelled by the time this runs, so
+            // blocking work that LOOKS at it finishes inside the grace and
+            // costs nothing. What cannot be woken is abandoned — and counted,
+            // because the alternative is silent: repeated start/stop with a
+            // wedged reader parks one more thread every cycle, and nothing
+            // said so (report15 V15-M6, measured at four for four).
+            //
+            // Counted rather than prevented, deliberately. Preventing it means
+            // waking the reader, and which task parks is not established: the
+            // blocking read lives in a crate this tree does not own. A number
+            // that grows is what lets that be diagnosed instead of inferred.
+            let began = std::time::Instant::now();
             runtime.shutdown_timeout(RUNTIME_SHUTDOWN_GRACE);
+            // Read ONCE. Asking twice measures whatever happened in between as
+            // well, which is how a diagnostic print made this report two
+            // abandoned workers that were not.
+            let took = began.elapsed();
+            if took >= RUNTIME_SHUTDOWN_GRACE {
+                ABANDONED_WORKERS.fetch_add(1, Ordering::Release);
+            }
         }) {
         Ok(thread) => thread,
         Err(_) => return crate::VEIL_ERR,
@@ -1037,6 +1073,104 @@ mod tests {
             "the slot was still held, so the VPN could not be restarted"
         );
         assert_eq!(veil_packet_tunnel_stop(), crate::VEIL_OK);
+    }
+
+    /// report15 V15-M6: the slot frees, and what it cost was a thread.
+    ///
+    /// `shutdown_timeout` abandons a blocking task rather than waiting on it,
+    /// so before the token reached that task nothing woke it: four start/stop
+    /// cycles left four workers parked, measured. Before the slot fix a wedge
+    /// was self-limiting, because the VPN could never be started again.
+    ///
+    /// The contract now is that blocking work which LOOKS at the cancellation
+    /// token finishes inside the grace and costs nothing at all.
+    #[test]
+    fn cancellable_blocking_work_does_not_pile_up_across_cycles() {
+        let _serial = SLOT_SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        use std::sync::atomic::AtomicUsize;
+        static LIVE: AtomicUsize = AtomicUsize::new(0);
+        LIVE.store(0, Ordering::SeqCst);
+        let abandoned_before = veil_packet_tunnel_abandoned_workers();
+
+        const CYCLES: usize = 4;
+        for _ in 0..CYCLES {
+            let started = launch_tunnel(None, None, 1280, |runtime, cancel| {
+                let watching = cancel.clone();
+                runtime.spawn_blocking(move || {
+                    LIVE.fetch_add(1, Ordering::SeqCst);
+                    // A blocking read that can be woken looks like this: it
+                    // comes up for air and asks whether it is still wanted.
+                    //
+                    // Longer than a moment on purpose, so the task is still
+                    // alive when the teardown starts and this measures a
+                    // wake-up rather than a coincidence.
+                    while !watching.is_cancelled() {
+                        std::thread::sleep(Duration::from_millis(250));
+                    }
+                    LIVE.fetch_sub(1, Ordering::SeqCst);
+                });
+                runtime.block_on(async move { cancel.cancelled().await });
+                Ok(0)
+            });
+            assert_eq!(started, crate::VEIL_OK, "a cycle failed to start");
+            assert_eq!(veil_packet_tunnel_stop(), crate::VEIL_OK);
+        }
+
+        std::thread::sleep(Duration::from_millis(400));
+        let live = LIVE.load(Ordering::SeqCst);
+        assert_eq!(
+            live, 0,
+            "{live} workers still parked after {CYCLES} cycles - each is a \
+             thread this process cannot get back"
+        );
+        // And none of them was recorded as abandoned, which is the other half
+        // of the contract: work that can be woken costs nothing.
+        //
+        // Note what this does NOT pin: the value of the grace. Measured,
+        // `shutdown_timeout` returns in tens of microseconds here whatever the
+        // grace is, because it does not wait on blocking tasks that are gone -
+        // so shrinking the grace to 1ms leaves this green. The grace matters
+        // for work still running, and that is the test below.
+        assert_eq!(
+            veil_packet_tunnel_abandoned_workers(),
+            abandoned_before,
+            "cancellable work was abandoned instead of being waited for"
+        );
+    }
+
+    /// And work that CANNOT be woken is counted rather than lost quietly.
+    ///
+    /// This is the honest half. Which task parks in production is not
+    /// established (the blocking read lives in a crate this tree does not
+    /// own), so the guarantee here is not that it never happens. It is that it
+    /// is visible when it does: a number that climbs can be diagnosed, memory
+    /// that climbs cannot.
+    #[test]
+    fn work_that_cannot_be_woken_is_counted() {
+        let _serial = SLOT_SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        let before = veil_packet_tunnel_abandoned_workers();
+
+        let started = launch_tunnel(None, None, 1280, |runtime, cancel| {
+            runtime.spawn_blocking(|| std::thread::sleep(Duration::from_secs(3600)));
+            runtime.block_on(async move { cancel.cancelled().await });
+            Ok(0)
+        });
+        assert_eq!(started, crate::VEIL_OK);
+        assert_eq!(veil_packet_tunnel_stop(), crate::VEIL_OK);
+        // The worker finishes its teardown after stop returns; the count is
+        // published at the end of it.
+        std::thread::sleep(RUNTIME_SHUTDOWN_GRACE + Duration::from_millis(400));
+
+        assert!(
+            veil_packet_tunnel_abandoned_workers() > before,
+            "a thread was abandoned and nothing recorded it"
+        );
     }
 
     /// Premise for the test above: a worker that ends cleanly frees the slot
