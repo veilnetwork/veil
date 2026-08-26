@@ -1,5 +1,39 @@
 # Changelog
 
+## v0.8.1 — 2026-08-26
+
+A patch release whose whole point is that the version now tells you which build
+you have. Everything here was already on `main`; none of it was in a tag, so
+two servers reporting `veil-cli 0.8.0` could differ on whether an exit checks
+who it carries.
+
+**An exit now knows whose traffic it carries.** A node with the exit switch on
+served every peer that could reach it: there was no allowlist, so anyone who
+turned it on was running an open proxy for the whole network.
+`[proxy.exit]` gains `allowed_node_ids` and `allow_all`, admission is checked
+BEFORE the destination header is read, and a node that is enabled but admits
+nobody says so at startup (`proxy.exit.closed`) instead of failing every stream
+in silence.
+
+Read the compatibility note before upgrading a server: an exit configured
+before this release names nobody, and an empty allowlist means NOBODY. Give
+every exit its `allowed_node_ids` first, or set `allow_all = true` if an open
+exit is what you want. Nodes that do not enable the exit are unaffected.
+
+**A refused stream now says so.** Eight failure paths in the exit closed the
+connection without answering, so the client waited out its own timeout and
+reported a hang where the exit had made a decision. Each of them now writes a
+status byte: denied, resolve failed, connect failed.
+
+**A config the daemon cannot READ is not "no reflector".** An unreadable
+config was treated as an empty one, so a permissions problem looked like a
+deliberately empty reflector list.
+
+**The hygiene gate can start again.** `fuzz/` is not part of the workspace, so
+the v0.8.0 version bump left its lockfile pinning 0.7.0; `--locked` then killed
+the FIRST step of the gate on every push, and fmt, clippy, policy and audit had
+not run since the last release.
+
 ## v0.8.0 — 2026-08-25
 
 The minor digit moves because two wire surfaces gain a field, both additively:
