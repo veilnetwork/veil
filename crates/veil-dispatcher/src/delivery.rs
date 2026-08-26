@@ -3908,7 +3908,7 @@ mod ratchet_terminal_tests {
         wlock!(who.runtime.peer_ratchet_keys)
             .entry(peer.node_id)
             .or_default()
-            .remember(peer.ring.current_ratchet_pk());
+            .remember(peer.instance_id, peer.ring.current_ratchet_pk());
     }
 
     fn seal(from: &Party, to: &Party, plaintext: &[u8]) -> Vec<u8> {
