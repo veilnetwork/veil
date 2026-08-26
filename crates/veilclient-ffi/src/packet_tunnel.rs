@@ -1075,6 +1075,63 @@ mod tests {
         assert_eq!(veil_packet_tunnel_stop(), crate::VEIL_OK);
     }
 
+    /// report15 V15-M1: one flow's setup error is not the tunnel's, and a
+    /// refused flow gives its session slot back.
+    ///
+    /// Structural, and in THIS crate rather than in the vendored engine: the
+    /// accept loop needs a live tun device and an ip stack to run at all, and
+    /// a guard living inside `third_party/tun2proxy` is one an upstream sync
+    /// can carry away.
+    ///
+    /// Two shapes were wrong. `new_proxy_handler(…).await?` sits inside the
+    /// accept loop, so a selector timeout or an unreachable proxy for ONE flow
+    /// returned from `run` and stopped the tunnel for every application on the
+    /// device. And the session count was incremented BEFORE the handler was
+    /// built, so an error path that left in between kept the slot — an HTTP
+    /// proxy profile refuses UDP by design, so the tunnel reached
+    /// `max_sessions` and then dropped ALL new traffic, TCP included.
+    ///
+    /// The second one is why the slot is an OBJECT now. A first attempt at
+    /// this test looked for a `fetch_sub` near each setup site and passed with
+    /// the one on the failure side deleted, because it found the one belonging
+    /// to the spawned task on the success side. Hand-written bookkeeping is
+    /// hard to check for the same reason it was easy to get wrong; a permit
+    /// that gives itself back on `Drop` cannot be forgotten on a branch, and
+    /// the check becomes "is anybody still counting by hand".
+    #[test]
+    fn a_failed_flow_setup_neither_stops_the_tunnel_nor_leaks_a_slot() {
+        let source = std::fs::read_to_string("../../third_party/tun2proxy/src/lib.rs")
+            .expect("the vendored engine moved");
+        let loop_start = source
+            .find("let max_sessions = args.max_sessions;")
+            .expect("the accept loop moved");
+        let body = &source[loop_start..];
+
+        assert!(
+            !body.contains("new_proxy_handler(info, domain_name, false).await?")
+                && !body.contains("new_proxy_handler(info, None, false).await?")
+                && !body.contains("new_proxy_handler(tcpinfo, None, false).await?"),
+            "a setup error here returns from `run` and stops the whole tunnel"
+        );
+        assert!(
+            !body.contains("task_count.fetch_sub") && !body.contains("task_count.fetch_add"),
+            "the session count is being kept by hand again; use SessionPermit, \
+             which gives the slot back on every exit including the ones nobody \
+             thought about"
+        );
+        assert!(
+            source.contains("impl Drop for SessionPermit"),
+            "the permit stopped giving the slot back"
+        );
+
+        // And every branch that admits a flow takes one.
+        let takes = body.matches("SessionPermit::take(&task_count)").count();
+        assert!(
+            takes >= 2,
+            "only {takes} branches take a permit; TCP and UDP both must"
+        );
+    }
+
     /// report15 V15-M6: the slot frees, and what it cost was a thread.
     ///
     /// `shutdown_timeout` abandons a blocking task rather than waiting on it,
