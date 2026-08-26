@@ -29,6 +29,12 @@ pub const VEIL_TUNNEL_RUNNING: c_int = 2;
 pub const VEIL_TUNNEL_ERROR: c_int = 3;
 
 const STOP_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// How long the worker waits for its own runtime to wind down before
+/// abandoning what is left. Shorter than [`STOP_TIMEOUT`] on purpose: a stop
+/// polls for the phase, and the phase is published before this wait begins, so
+/// the caller is never held for the sum of the two.
+const RUNTIME_SHUTDOWN_GRACE: Duration = Duration::from_millis(500);
 const PACKET_QUEUE_CAPACITY: usize = 64;
 
 /// Host callback for one raw IP packet emitted by the userspace stack.
@@ -318,7 +324,7 @@ fn launch_tunnel<F>(
     run: F,
 ) -> c_int
 where
-    F: FnOnce(tokio::runtime::Runtime, CancellationToken) -> std::io::Result<usize>
+    F: FnOnce(&tokio::runtime::Runtime, CancellationToken) -> std::io::Result<usize>
         + Send
         + 'static,
 {
@@ -353,7 +359,21 @@ where
                 }
             };
             worker_phase.store(VEIL_TUNNEL_RUNNING as u8, Ordering::Release);
-            let result = run(runtime, worker_cancel.clone());
+            let result = run(&runtime, worker_cancel.clone());
+            // The phase is published BEFORE the runtime is taken down, and the
+            // teardown is BOUNDED. Both halves matter, and both were missing.
+            //
+            // The runtime used to be moved into `run`, so `Runtime::drop` ran
+            // inside it — and drop waits for every blocking task. tun2proxy
+            // reads the TUN descriptor from one, and the engine owns a
+            // duplicate of that descriptor, so closing the host's copy does
+            // not wake it: the worker parked in drop forever, the phase never
+            // reached STOPPED, `veil_packet_tunnel_stop` polled for
+            // STOP_TIMEOUT and gave up with the slot still occupied, and every
+            // later start answered VEIL_ERR_REENTRANT. Measured on a phone:
+            // after stopping the VPN from the UI, it could not be started
+            // again for the life of the process — only killing the app cured
+            // it, three times over.
             if worker_cancel.is_cancelled() {
                 worker_phase.store(VEIL_TUNNEL_STOPPED as u8, Ordering::Release);
             } else if let Err(error) = result {
@@ -362,6 +382,10 @@ where
             } else {
                 worker_phase.store(VEIL_TUNNEL_STOPPED as u8, Ordering::Release);
             }
+            // Abandons a blocking task that will not finish rather than
+            // waiting on it. What leaks is a thread; what it buys is a slot
+            // that frees, so the next start is a start and not a refusal.
+            runtime.shutdown_timeout(RUNTIME_SHUTDOWN_GRACE);
         }) {
         Ok(thread) => thread,
         Err(_) => return crate::VEIL_ERR,
@@ -967,6 +991,70 @@ mod tests {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .push(packet);
+    }
+
+    /// A blocking task that will not finish must not hold the tunnel slot.
+    ///
+    /// tun2proxy reads the TUN descriptor from a blocking task, and the engine
+    /// owns a DUPLICATE of that descriptor — so closing the host's copy does
+    /// not wake it. `Runtime::drop` waits for such a task forever. With the
+    /// runtime dropped inside the worker closure, the worker parked there, the
+    /// phase never reached STOPPED, stop gave up after STOP_TIMEOUT with the
+    /// slot still occupied, and every later start answered REENTRANT.
+    ///
+    /// Measured on a phone before the fix: after stopping the VPN from the UI
+    /// it could not be started again for the life of the process. Only killing
+    /// the app cured it — three separate times.
+    #[test]
+    fn a_blocking_task_that_never_finishes_does_not_hold_the_slot() {
+        let _serial = SLOT_SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        let parked = launch_tunnel(None, None, 1280, |runtime, cancel| {
+            // Exactly the shape that wedged: a blocking task nothing can
+            // interrupt, still parked when the cancelled loop returns.
+            runtime.spawn_blocking(|| std::thread::sleep(Duration::from_secs(3600)));
+            runtime.block_on(async move { cancel.cancelled().await });
+            Ok(0)
+        });
+        assert_eq!(parked, crate::VEIL_OK, "the tunnel did not start");
+
+        assert_eq!(
+            veil_packet_tunnel_stop(),
+            crate::VEIL_OK,
+            "stop gave up on a worker whose only obstacle was a blocking task"
+        );
+
+        // The whole point: the NEXT start is a start, not a refusal.
+        let again = launch_tunnel(None, None, 1280, |runtime, cancel| {
+            runtime.block_on(async move { cancel.cancelled().await });
+            Ok(0)
+        });
+        assert_eq!(
+            again,
+            crate::VEIL_OK,
+            "the slot was still held, so the VPN could not be restarted"
+        );
+        assert_eq!(veil_packet_tunnel_stop(), crate::VEIL_OK);
+    }
+
+    /// Premise for the test above: a worker that ends cleanly frees the slot
+    /// too, so the assertions there are not passing on a slot that is never
+    /// taken in the first place.
+    #[test]
+    fn an_ordinary_worker_frees_the_slot() {
+        let _serial = SLOT_SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        let started = launch_tunnel(None, None, 1280, |runtime, cancel| {
+            runtime.block_on(async move { cancel.cancelled().await });
+            Ok(0)
+        });
+        assert_eq!(started, crate::VEIL_OK);
+        assert_eq!(veil_packet_tunnel_stop(), crate::VEIL_OK);
+        assert_eq!(veil_packet_tunnel_status(), VEIL_TUNNEL_STOPPED);
     }
 
     #[test]
