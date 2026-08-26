@@ -302,7 +302,7 @@ impl DhtMlKemEkResolver {
         // (report14 V14-M6).
         keys.entry(target_node_id)
             .or_default()
-            .remember(cert.ratchet_x25519_pubkey);
+            .remember(cert.instance_id, cert.ratchet_x25519_pubkey);
     }
 
     /// The remembered certificate of one device, for a walk that came back
