@@ -300,9 +300,11 @@ impl DhtMlKemEkResolver {
         // publishes two of these; overwriting meant whichever sibling resolved
         // last was the only one the receive path could authenticate
         // (report14 V14-M6).
-        keys.entry(target_node_id)
-            .or_default()
-            .remember(cert.instance_id, cert.ratchet_x25519_pubkey);
+        keys.entry(target_node_id).or_default().remember(
+            cert.instance_id,
+            cert.ratchet_x25519_pubkey,
+            cert.valid_until_unix,
+        );
     }
 
     /// The remembered certificate of one device, for a walk that came back
@@ -1870,6 +1872,31 @@ mod tests {
         dummy_cert_with_instance(node_id, [0xab; 16])
     }
 
+    /// report16 V16-H1: the expiry has to travel WITH the key.
+    ///
+    /// Structural, and this is why: building a resolver needs a runtime, a DHT
+    /// and a certificate store, while what is under test is one line. And the
+    /// behavioural tests cannot see it — they construct the device cache
+    /// directly, so replacing `cert.valid_until_unix` with "forever" here left
+    /// every one of them green. Measured, on the first attempt at breaking it.
+    #[test]
+    fn the_published_key_carries_its_certificate_expiry() {
+        let source = include_str!("mlkem_resolver.rs");
+        let at = source
+            .find("fn publish_ratchet_key")
+            .expect("the publish moved");
+        let body = &source[at..(at + 1400).min(source.len())];
+
+        assert!(
+            body.contains("cert.valid_until_unix"),
+            "the key is published with no expiry, so it authenticates forever"
+        );
+        assert!(
+            !body.contains("u64::MAX"),
+            "the expiry was replaced by \"forever\""
+        );
+    }
+
     fn dummy_cert_with_instance(node_id: [u8; 32], instance_id: [u8; 16]) -> VerifiedMlkemCert {
         VerifiedMlkemCert {
             node_id,
@@ -1878,6 +1905,7 @@ mod tests {
             mlkem_pubkey: vec![0x42; 32],
             ratchet_x25519_pubkey: [0x5A; 32],
             cert_version: 7,
+            valid_until_unix: u64::MAX,
         }
     }
 

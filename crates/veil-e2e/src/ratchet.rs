@@ -1380,7 +1380,7 @@ fn open_inner(
     // instance publishes a certificate saying so, and re-resolving it restores
     // the pair — so this heals rather than latches.
     let proves_authorship = message.as_ref().is_some_and(|m| {
-        peer_devices.is_some_and(|d| d.contains(&sender_instance_id, m.initiator_ik()))
+        peer_devices.is_some_and(|d| d.contains(&sender_instance_id, m.initiator_ik(), now_unix))
     });
 
     // Whether an entry may be replaced by this prologue. Cheap, and read at
@@ -1428,9 +1428,9 @@ fn open_inner(
                     // aiming garbage at whichever conversation it wants kept.
                     entry.last_used_at = now_unix;
                     if !entry.authenticated
-                        && (peer_devices
-                            .is_some_and(|d| d.contains(&sender_instance_id, &entry.peer_ik))
-                            || proves_authorship)
+                        && (peer_devices.is_some_and(|d| {
+                            d.contains(&sender_instance_id, &entry.peer_ik, now_unix)
+                        }) || proves_authorship)
                     {
                         entry.authenticated = true;
                     }
@@ -1521,8 +1521,8 @@ fn open_inner(
         ) {
             Ok((plaintext, session)) => {
                 let peer_ik = *message.initiator_ik();
-                let authenticated =
-                    peer_devices.is_some_and(|d| d.contains(&sender_instance_id, &peer_ik));
+                let authenticated = peer_devices
+                    .is_some_and(|d| d.contains(&sender_instance_id, &peer_ik, now_unix));
                 let mut g = store.lock();
                 // Ask the store again. Another thread may have opened this
                 // conversation while the agreement above ran unlocked, and the
@@ -1617,7 +1617,14 @@ pub struct PeerDeviceKeys {
     /// left the weaker statement "this identity published this key somewhere" —
     /// which one verified key turns into an unlimited supply of authenticated
     /// conversations, one per made-up sender instance (report15 V15-M5).
-    keys: Vec<([u8; 16], [u8; 32])>,
+    ///
+    /// The third field is WHEN the certificate stops saying it. Verification
+    /// checks validity once, at resolve time, and this cache is what the
+    /// receive path consults afterwards — so a key from a certificate that has
+    /// since expired went on authenticating conversations for as long as the
+    /// process lived, and the authenticated bit is persisted, so it outlived
+    /// that too (report16 V16-H1).
+    keys: Vec<([u8; 16], [u8; 32], u64)>,
 }
 
 impl PeerDeviceKeys {
@@ -1628,36 +1635,40 @@ impl PeerDeviceKeys {
     /// since we last spoke, still authenticates.
     pub const MAX: usize = 8;
 
-    /// Record a key from a verified certificate, with the device it named.
-    /// Newest wins the room.
-    pub fn remember(&mut self, instance_id: [u8; 16], key: [u8; 32]) {
+    /// Record a key from a verified certificate, with the device it named and
+    /// the moment that certificate stops saying so. Newest wins the room.
+    pub fn remember(&mut self, instance_id: [u8; 16], key: [u8; 32], valid_until: u64) {
         if let Some(at) = self
             .keys
             .iter()
-            .position(|(i, k)| *i == instance_id && *k == key)
+            .position(|(i, k, _)| *i == instance_id && *k == key)
         {
             self.keys.remove(at);
         }
-        self.keys.insert(0, (instance_id, key));
+        self.keys.insert(0, (instance_id, key, valid_until));
         self.keys.truncate(Self::MAX);
     }
 
     /// Whether `key` came from a certificate this peer published FOR THIS
     /// DEVICE.
     ///
-    /// Both halves, because the certificate binds both. Asking only about the
-    /// key answers a question nobody needs: any device of this identity, which
-    /// is precisely the licence to invent instances.
+    /// All three, because the certificate binds all three. Asking only about
+    /// the key answers a question nobody needs: any device of this identity,
+    /// which is precisely the licence to invent instances. And asking without
+    /// `now` answers a question about the past: a certificate said this once,
+    /// and it may have stopped saying it since.
     #[must_use]
-    pub fn contains(&self, instance_id: &[u8; 16], key: &[u8; 32]) -> bool {
-        self.keys.iter().any(|(i, k)| i == instance_id && k == key)
+    pub fn contains(&self, instance_id: &[u8; 16], key: &[u8; 32], now_unix: u64) -> bool {
+        self.keys
+            .iter()
+            .any(|(i, k, until)| i == instance_id && k == key && now_unix <= *until)
     }
 
     /// The most recently published key, for callers that need ONE — a
     /// diagnostic, or a readiness check.
     #[must_use]
     pub fn newest(&self) -> Option<[u8; 32]> {
-        self.keys.first().map(|(_, k)| *k)
+        self.keys.first().map(|(_, k, _)| *k)
     }
 
     #[must_use]
@@ -1877,7 +1888,7 @@ mod tests {
     /// published what.
     fn dev(instance_id: [u8; 16], pk: &[u8; 32]) -> PeerDeviceKeys {
         let mut d = PeerDeviceKeys::default();
-        d.remember(instance_id, *pk);
+        d.remember(instance_id, *pk, u64::MAX);
         d
     }
 
@@ -1977,8 +1988,8 @@ mod tests {
 
         // What the directory holds after both certificates have been resolved.
         let mut published = PeerDeviceKeys::default();
-        published.remember(phone.instance_id, phone.ratchet_pk());
-        published.remember(laptop.instance_id, laptop.ratchet_pk());
+        published.remember(phone.instance_id, phone.ratchet_pk(), u64::MAX);
+        published.remember(laptop.instance_id, laptop.ratchet_pk(), u64::MAX);
         assert_eq!(published.len(), 2, "one slot per node is the defect");
 
         let seal_to_me = |from: &Device, body: &[u8]| {
@@ -2034,7 +2045,7 @@ mod tests {
     fn the_device_directory_is_bounded_and_newest_first() {
         let mut d = PeerDeviceKeys::default();
         for i in 0..(PeerDeviceKeys::MAX as u8 + 3) {
-            d.remember([i; 16], [i; 32]);
+            d.remember([i; 16], [i; 32], u64::MAX);
         }
         assert_eq!(
             d.len(),
@@ -2047,7 +2058,7 @@ mod tests {
             "the key that arrived last is the one a caller wanting ONE gets"
         );
         assert!(
-            !d.contains(&[0u8; 16], &[0u8; 32]),
+            !d.contains(&[0u8; 16], &[0u8; 32], NOW),
             "the oldest fell out, which is what bounded means"
         );
 
@@ -2055,7 +2066,7 @@ mod tests {
         let held = d.len();
         let existing = d.newest().expect("something");
         let existing_instance = [PeerDeviceKeys::MAX as u8 + 2; 16];
-        d.remember(existing_instance, existing);
+        d.remember(existing_instance, existing, u64::MAX);
         assert_eq!(d.len(), held);
         assert_eq!(d.newest(), Some(existing));
     }
@@ -2600,6 +2611,71 @@ mod tests {
         )
         .expect("open");
         assert!(got.authenticated);
+    }
+
+    /// report16 V16-H1: a certificate stops saying it, and the cache did not
+    /// notice.
+    ///
+    /// Validity is checked once, when the certificate is resolved. This cache
+    /// is what the receive path consults afterwards, and it kept the key with
+    /// no expiry at all — so a device whose certificate ran out went on
+    /// authenticating new conversations for as long as the process lived. The
+    /// authenticated bit is persisted, so it outlived that too.
+    ///
+    /// Authenticated is not a label: it is what makes a conversation
+    /// untouchable by eviction and what marks a delivery as coming from a
+    /// device this identity vouches for. Neither should survive the vouching.
+    #[test]
+    fn a_key_whose_certificate_expired_no_longer_authenticates() {
+        let (a, b) = (device(0xA8), device(0xB8));
+        let a_pk = a.ratchet_pk();
+        let expires = NOW + 3600;
+
+        // While the certificate still says so.
+        let (ek, pk) = (b.ek(), b.ratchet_pk());
+        let payload = seal(&a.store, &a.me(), keys(&b, &ek, &pk), b"hello", NOW)
+            .expect("seal")
+            .0;
+        let mut published = PeerDeviceKeys::default();
+        published.remember(a.instance_id, a_pk, expires);
+        let live = open(
+            &b.store,
+            &b.me(),
+            &a.node_id,
+            &payload,
+            Some(&published),
+            NOW,
+        )
+        .expect("open");
+        assert!(
+            live.authenticated,
+            "a live certificate must still authenticate, or this test is \
+             about nothing"
+        );
+
+        // The same key, the same device, one second past the certificate.
+        let (c, d) = (device(0xC8), device(0xD8));
+        let c_pk = c.ratchet_pk();
+        let (ek2, pk2) = (d.ek(), d.ratchet_pk());
+        let later = seal(&c.store, &c.me(), keys(&d, &ek2, &pk2), b"hello", NOW)
+            .expect("seal")
+            .0;
+        let mut stale = PeerDeviceKeys::default();
+        stale.remember(c.instance_id, c_pk, expires);
+        let got = open(
+            &d.store,
+            &d.me(),
+            &c.node_id,
+            &later,
+            Some(&stale),
+            expires + 1,
+        )
+        .expect("open");
+
+        assert!(
+            !got.authenticated,
+            "a certificate that has run out still vouched for its device"
+        );
     }
 
     /// report15 V15-M5: a certificate names a DEVICE and a key. Keeping only

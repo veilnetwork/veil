@@ -1676,7 +1676,7 @@ mod ratchet_send_tests {
         wlock!(peer_rt.peer_ratchet_keys)
             .entry(ME)
             .or_default()
-            .remember(MY_INSTANCE, my_ring.current_ratchet_pk());
+            .remember(MY_INSTANCE, my_ring.current_ratchet_pk(), u64::MAX);
         Fixture {
             outbox: Arc::new(Outbox {
                 live: live_peers,
@@ -1720,7 +1720,7 @@ mod ratchet_send_tests {
         wlock!(sibling_rt.peer_ratchet_keys)
             .entry(ME)
             .or_default()
-            .remember(MY_INSTANCE, my_ratchet_pk);
+            .remember(MY_INSTANCE, my_ratchet_pk, u64::MAX);
         // Singular answer = the LAST row = the sibling: the accident row and
         // the session's device must differ for the test to say anything.
         fx.certs = Arc::new(FamilyCerts(vec![session_row, sibling_row]));
