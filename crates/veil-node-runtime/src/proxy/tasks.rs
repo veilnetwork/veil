@@ -155,6 +155,30 @@ pub(crate) fn spawn_exit_proxy(ctx: ExitProxySpawnCtx<'_>) -> Option<JoinHandle<
     ));
     let exit_enabled = ctx.config.proxy.exit.enabled;
     let allow_private = ctx.config.proxy.exit.allow_private;
+    // Who this exit carries traffic for. An enabled exit that names nobody and
+    // does not say `allow_all` stays CLOSED and says so once, here: before
+    // this existed it served every peer that could reach the node, and an
+    // operator who simply had not finished configuring was running an open
+    // proxy under their own address.
+    let admission = Arc::new(if ctx.config.proxy.exit.allow_all {
+        veil_proxy::exit::ExitAdmission::allow_all()
+    } else {
+        veil_proxy::exit::ExitAdmission::from_hex_ids(&ctx.config.proxy.exit.allowed_node_ids)
+    });
+    if admission.is_closed() {
+        ctx.logger.warn(
+            "proxy.exit.closed",
+            "exit proxy is enabled but admits nobody: set proxy.exit.allowed_node_ids \
+             (64-hex source node ids) or proxy.exit.allow_all = true. Until then every \
+             incoming proxy stream is refused.",
+        );
+    } else if ctx.config.proxy.exit.allow_all {
+        ctx.logger.warn(
+            "proxy.exit.open",
+            "exit proxy admits EVERY peer (proxy.exit.allow_all = true): this node's \
+             address answers for their traffic.",
+        );
+    }
     let logger = Arc::clone(ctx.logger);
     // pass metrics into the exit handler so destination
     // denials are counted for ops visibility.
@@ -220,14 +244,20 @@ pub(crate) fn spawn_exit_proxy(ctx: ExitProxySpawnCtx<'_>) -> Option<JoinHandle<
 
                     // Exit handler: client_half ↔ TCP. Same
                     // lifecycle rule as above.
-                    let _connect =
-                        tokio::spawn(veil_proxy::exit::handle_proxy_connect_stream_with_metrics(
+                    let admission = Arc::clone(&admission);
+                    let stream_metrics = metrics.clone();
+                    let _connect = tokio::spawn(async move {
+                        veil_proxy::exit::handle_proxy_connect_stream_with_metrics(
                             role,
                             exit_enabled,
                             allow_private,
-                            metrics.clone(),
+                            &admission,
+                            src_node_id,
+                            stream_metrics,
                             client_half,
-                        ));
+                        )
+                        .await
+                    });
                 }
                 AppMessage::StreamData { stream_id, data } => {
                     if let Some(tx) = stream_data_txs.get(&stream_id) {

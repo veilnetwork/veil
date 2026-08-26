@@ -414,6 +414,29 @@ pub struct ExitProxyConfig {
     /// in isolated testbeds where the exit is trusted to probe internal nets.
     #[serde(default)]
     pub allow_private: bool,
+    /// Who may use this node as an exit, by source node_id (64 hex chars).
+    ///
+    /// An exit spends the operator's bandwidth and answers for the traffic
+    /// with their address, so it has to know whose traffic it is carrying.
+    /// Until this existed the answer was "anyone who can reach the node":
+    /// `enabled = true` served every peer on the network, which is an open
+    /// proxy nobody asked for.
+    ///
+    /// Empty means NOBODY, not everybody — see [`ExitProxyConfig::allow_all`].
+    /// That is the same shape, and the same reasoning, as `oproxy`'s
+    /// admission, whose template spells the trap out: an operator reads an
+    /// empty list as "no one" while the code reads it as "all veil peers".
+    #[serde(default)]
+    pub allowed_node_ids: Vec<String>,
+    /// Serve EVERY peer, as a statement rather than as the meaning of an empty
+    /// list. Default `false`.
+    ///
+    /// An exit enabled with neither an allowlist nor this flag stays closed
+    /// and says so at startup: "I have not finished configuring" and "I meant
+    /// everyone" are different intentions, and only one of them is safe to
+    /// guess.
+    #[serde(default)]
+    pub allow_all: bool,
 }
 
 /// Configuration for the local mesh UDP realm.
