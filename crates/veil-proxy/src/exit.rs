@@ -42,6 +42,86 @@ pub enum ProxyRequest {
     UdpAssociation,
 }
 
+/// Who this exit will carry traffic for.
+///
+/// An exit spends the operator's bandwidth and answers for the traffic with
+/// their address. Until this existed there was no answer at all: a node with
+/// `proxy.exit.enabled = true` served EVERY peer that could reach it, which is
+/// an open proxy the operator never agreed to run.
+///
+/// Empty and not `allow_all` means CLOSED, deliberately. The two ways to
+/// arrive at an empty list — "I have not finished configuring this" and "I
+/// meant everyone" — want opposite answers, and guessing the second one wrong
+/// hands the operator's address to strangers.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ExitAdmission {
+    allow_all: bool,
+    allowed: std::collections::BTreeSet<[u8; 32]>,
+}
+
+impl ExitAdmission {
+    /// Serve everyone. The caller is saying so out loud; nothing infers it.
+    pub fn allow_all() -> Self {
+        Self {
+            allow_all: true,
+            allowed: Default::default(),
+        }
+    }
+
+    /// Serve exactly these node ids. Entries that are not 64 hex characters
+    /// are DROPPED rather than tolerated: a typo that silently widened
+    /// admission would be the same failure as guessing, and one that narrows
+    /// it is visible the moment the peer is refused.
+    pub fn from_hex_ids<I, S>(ids: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        let mut allowed = std::collections::BTreeSet::new();
+        for id in ids {
+            if let Some(bytes) = parse_node_id_hex(id.as_ref()) {
+                allowed.insert(bytes);
+            }
+        }
+        Self {
+            allow_all: false,
+            allowed,
+        }
+    }
+
+    /// Nobody — what an enabled exit falls back to when it was told neither
+    /// who may use it nor that everyone may.
+    pub fn closed() -> Self {
+        Self::default()
+    }
+
+    pub fn is_closed(&self) -> bool {
+        !self.allow_all && self.allowed.is_empty()
+    }
+
+    pub fn admits(&self, node_id: &[u8; 32]) -> bool {
+        self.allow_all || self.allowed.contains(node_id)
+    }
+}
+
+fn hex_node_id(id: &[u8; 32]) -> String {
+    id.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+fn parse_node_id_hex(s: &str) -> Option<[u8; 32]> {
+    let s = s.trim();
+    if s.len() != 64 || !s.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    let mut out = [0u8; 32];
+    for (i, chunk) in s.as_bytes().chunks(2).enumerate() {
+        let hi = (chunk[0] as char).to_digit(16)? as u8;
+        let lo = (chunk[1] as char).to_digit(16)? as u8;
+        out[i] = (hi << 4) | lo;
+    }
+    Some(out)
+}
+
 /// Refusal codes answered on the readiness byte the client is already waiting
 /// for (`veil_proxy::veil_connector::await_exit_ready`).
 ///
@@ -267,6 +347,13 @@ pub fn encode_udp_associate_header() -> Vec<u8> {
 /// * `role` — local node role (must be Core or Gateway).
 /// * `exit_enabled` — `config.proxy.exit.enabled`.
 /// * `veil_stream` — the bidirectional veil stream (already fully opened).
+///
+/// Test/bench entry point that admits EVERY caller.
+///
+/// Spelled `allow_all()` rather than defaulted, because a convenience overload
+/// that quietly serves everyone is how an exit ends up open in production:
+/// the short signature is the one people reach for. Production goes through
+/// [`handle_proxy_connect_stream_with_metrics`], which has no default.
 pub async fn handle_proxy_connect_stream<S>(
     role: NodeRole,
     exit_enabled: bool,
@@ -276,8 +363,16 @@ pub async fn handle_proxy_connect_stream<S>(
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
-    handle_proxy_connect_stream_with_metrics(role, exit_enabled, allow_private, None, veil_stream)
-        .await
+    handle_proxy_connect_stream_with_metrics(
+        role,
+        exit_enabled,
+        allow_private,
+        &ExitAdmission::allow_all(),
+        [0u8; 32],
+        None,
+        veil_stream,
+    )
+    .await
 }
 
 /// metric-enabled variant — called from the production spawn
@@ -287,6 +382,8 @@ pub async fn handle_proxy_connect_stream_with_metrics<S>(
     role: NodeRole,
     exit_enabled: bool,
     allow_private: bool,
+    admission: &ExitAdmission,
+    src_node_id: [u8; 32],
     metrics: Option<std::sync::Arc<dyn crate::ProxyMetrics>>,
     veil_stream: S,
 ) -> std::io::Result<()>
@@ -302,6 +399,27 @@ where
             std::io::Error::new(
                 std::io::ErrorKind::PermissionDenied,
                 "this node is not configured as an exit proxy",
+            ),
+        )
+        .await);
+    }
+
+    // Admission BEFORE the header is read: an unauthorised peer must not be
+    // able to make this node resolve a hostname on its behalf, which is a
+    // side effect the exit performs with the operator's resolver and address.
+    if !admission.admits(&src_node_id) {
+        if let Some(m) = &metrics {
+            m.inc_exit_proxy_dest_denied();
+        }
+        return Err(refuse(
+            &mut veil_w,
+            EXIT_STATUS_DENIED,
+            std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                format!(
+                    "exit-proxy: {} is not on this exit's allowlist",
+                    hex_node_id(&src_node_id)
+                ),
             ),
         )
         .await);
@@ -1016,5 +1134,124 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(status[0], EXIT_STATUS_OK);
+    }
+
+    // ── Who the exit will carry traffic for ─────────────────────────────────
+    //
+    // Before this existed there was no answer: a node with
+    // `proxy.exit.enabled = true` served EVERY peer that could reach it. An
+    // exit spends the operator's bandwidth and answers for the traffic with
+    // their address, so "anyone" was never a setting anybody chose — it was
+    // the absence of one.
+    //
+    // The refusal is answered on the readiness byte, so an unauthorised peer
+    // learns it immediately instead of waiting out the client's 15-second
+    // timeout.
+
+    const PEER_A: [u8; 32] = [0xAA; 32];
+    const PEER_B: [u8; 32] = [0xBB; 32];
+
+    fn hex_of(id: &[u8; 32]) -> String {
+        id.iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    /// Drive one exit stream to an echo server and report what the client saw:
+    /// the readiness byte, and whether the bridge actually carried bytes.
+    async fn attempt(admission: ExitAdmission, src: [u8; 32]) -> (u8, bool) {
+        use tokio::net::TcpListener;
+        let echo = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = echo.local_addr().unwrap();
+        tokio::spawn(async move {
+            if let Ok((mut s, _)) = echo.accept().await {
+                let (mut r, mut w) = s.split();
+                tokio::io::copy(&mut r, &mut w).await.ok();
+            }
+        });
+        let (client_half, server_half) = tokio::io::duplex(4096);
+        tokio::spawn(async move {
+            handle_proxy_connect_stream_with_metrics(
+                NodeRole::Core,
+                true,
+                true, // loopback echo target
+                &admission,
+                src,
+                None,
+                server_half,
+            )
+            .await
+        });
+        let (mut client_r, mut client_w) = tokio::io::split(client_half);
+        client_w
+            .write_all(&encode_proxy_header("127.0.0.1", addr.port()))
+            .await
+            .unwrap();
+        let mut status = [0u8; 1];
+        tokio::time::timeout(Duration::from_secs(2), client_r.read_exact(&mut status))
+            .await
+            .expect("the exit must ANSWER, not leave an unauthorised peer waiting")
+            .expect("a status byte must arrive before the stream closes");
+        if status[0] != EXIT_STATUS_OK {
+            return (status[0], false);
+        }
+        client_w.write_all(b"ping").await.unwrap();
+        let mut buf = [0u8; 4];
+        let carried = tokio::time::timeout(Duration::from_secs(2), client_r.read_exact(&mut buf))
+            .await
+            .is_ok_and(|r| r.is_ok() && &buf == b"ping");
+        (status[0], carried)
+    }
+
+    #[tokio::test]
+    async fn a_peer_on_the_allowlist_is_carried() {
+        let admission = ExitAdmission::from_hex_ids([hex_of(&PEER_A)]);
+        assert_eq!(attempt(admission, PEER_A).await, (EXIT_STATUS_OK, true));
+    }
+
+    #[tokio::test]
+    async fn a_peer_not_on_the_allowlist_is_refused() {
+        let admission = ExitAdmission::from_hex_ids([hex_of(&PEER_A)]);
+        let (status, carried) = attempt(admission, PEER_B).await;
+        assert_eq!(status, EXIT_STATUS_DENIED);
+        assert!(!carried, "a refused peer must not reach the destination");
+    }
+
+    #[tokio::test]
+    async fn an_enabled_exit_that_names_nobody_carries_nobody() {
+        // The whole point: an empty list is CLOSED, not open. This is the
+        // configuration an operator lands in by enabling the exit and not
+        // finishing, and it used to mean "serve the entire network".
+        let closed = ExitAdmission::closed();
+        assert!(closed.is_closed());
+        assert_eq!(attempt(closed, PEER_A).await.0, EXIT_STATUS_DENIED);
+    }
+
+    #[tokio::test]
+    async fn allow_all_is_honoured_when_it_is_actually_said() {
+        // Vacuity guard for the three tests above: the same peer, the same
+        // echo target, admitted — so their refusals are about admission and
+        // not about anything else in the path.
+        assert_eq!(
+            attempt(ExitAdmission::allow_all(), PEER_B).await,
+            (EXIT_STATUS_OK, true)
+        );
+    }
+
+    #[test]
+    fn a_malformed_entry_narrows_admission_rather_than_widening_it() {
+        let admission = ExitAdmission::from_hex_ids([
+            hex_of(&PEER_A),
+            "not-hex".to_owned(),
+            "abc".to_owned(),
+            String::new(),
+            format!("{}zz", &hex_of(&PEER_B)[..62]),
+        ]);
+        assert!(admission.admits(&PEER_A), "the good entry still admits");
+        assert!(!admission.admits(&PEER_B), "the typo must not admit anyone");
+        assert!(
+            !admission.is_closed(),
+            "one valid entry is still an allowlist, not a closed exit",
+        );
+        // And a list of nothing BUT rubbish is closed, never open.
+        assert!(ExitAdmission::from_hex_ids(["nonsense"]).is_closed());
     }
 }
