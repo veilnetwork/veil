@@ -53,6 +53,16 @@ pub const ADMIN_SLOTS_RESERVED_FOR_APPLY: usize = 2;
 /// could reach WITHOUT being able to touch the authenticated pool.
 pub const ADMIN_MAX_PREAUTH_CONNECTIONS: usize = 8;
 
+/// How long an authenticated connection may take to say what it wants.
+///
+/// A client sends its request straight after connecting; there is no admin
+/// command that connects and then thinks. Without a deadline a connection that
+/// authenticated and then went quiet held a task and a file descriptor for the
+/// life of the process — and one that arrives while the pool is at its reserve
+/// holds NO permit, so the semaphore did not bound how many of them there
+/// could be (report15 V15-M2).
+pub const ADMIN_REQUEST_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
+
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct AdminRequest {
     pub version: u32,
@@ -1418,8 +1428,10 @@ where
                         } else {
                             None
                         };
-                        drop(preauth_permit);
-                        // Permit drops on task exit and releases the slot.
+                        // NOT dropped here. It is handed on and released once
+                        // the request has been read, so classification is
+                        // bounded by the same small pool the handshake is —
+                        // see `AdminSlot::preauth`.
                         let _ = handle_admin_connection(
                             stream,
                             runtime,
@@ -1428,6 +1440,7 @@ where
                             config_path,
                             AdminSlot {
                                 permit,
+                                preauth: Some(preauth_permit),
                                 semaphore: main_semaphore,
                                 max_connections: admin_max_connections,
                             },
@@ -2016,6 +2029,48 @@ pub const ADMIN_PIPE_FILENAME: &str = "admin.pipe";
 /// over-cap request, or non-UTF-8 input (all of which the caller treats as
 /// "close the connection"); `Ok(Some(line))` with the newline stripped
 /// otherwise.
+/// Whether the client opened with a JSON admin request, within [deadline].
+///
+/// Binary IPC clients that connected to the wrong socket start with `OVL1`;
+/// closing on anything but `{` gives them a clear error instead of a deadlock.
+///
+/// The deadline is a PARAMETER rather than a constant read inside, so a test
+/// can hold a real silent socket against a short one — the property is "gives
+/// up", and a 30-second wait is not a thing a test should sit through.
+async fn looks_like_json_request<R>(reader: &mut R, deadline: std::time::Duration) -> Result<bool>
+where
+    R: tokio::io::AsyncBufRead + Unpin,
+{
+    use tokio::io::AsyncBufReadExt as _;
+    let Ok(peeked) = tokio::time::timeout(deadline, reader.fill_buf()).await else {
+        // Authenticated, connected, and said nothing. Without this it held a
+        // task and a file descriptor for the life of the process, and a
+        // connection that arrived while the pool was at its reserve holds no
+        // permit — so nothing bounded how many there could be.
+        return Ok(false);
+    };
+    let buf = peeked?;
+    Ok(!buf.is_empty() && buf[0] == b'{')
+}
+
+/// [read_bounded_admin_line] with a deadline.
+///
+/// The byte cap bounds SIZE. A request delivered one byte at a time is the
+/// same denial as one never delivered at all, and only this bounds that.
+async fn read_admin_request_line<R>(
+    reader: &mut R,
+    max_bytes: usize,
+    deadline: std::time::Duration,
+) -> std::io::Result<Option<String>>
+where
+    R: tokio::io::AsyncBufRead + Unpin,
+{
+    match tokio::time::timeout(deadline, read_bounded_admin_line(reader, max_bytes)).await {
+        Ok(result) => result,
+        Err(_) => Ok(None),
+    }
+}
+
 async fn read_bounded_admin_line<R>(
     reader: &mut R,
     max_bytes: usize,
@@ -2066,6 +2121,16 @@ struct AdminSlot {
     /// read, and keeps going only if its request turns out to be the one the
     /// reserve is for.
     permit: Option<tokio::sync::OwnedSemaphorePermit>,
+    /// Held until the request has been READ, not only until the handshake is
+    /// done.
+    ///
+    /// Classifying a connection — peeking at the first byte, reading the
+    /// request line — is pre-classification work like the handshake, and it
+    /// used to happen with no permit of any kind: a connection that arrived
+    /// while the pool was at its reserve carried none, so nothing bounded how
+    /// many could sit in that state. Bounded by the pool that already exists
+    /// for exactly this, rather than by a second one.
+    preauth: Option<tokio::sync::OwnedSemaphorePermit>,
     semaphore: Arc<tokio::sync::Semaphore>,
     max_connections: usize,
 }
@@ -2080,6 +2145,7 @@ async fn handle_admin_connection(
 ) -> Result<()> {
     let AdminSlot {
         permit: _permit,
+        preauth,
         semaphore: connection_semaphore,
         max_connections: admin_max_connections,
     } = slot;
@@ -2090,16 +2156,8 @@ async fn handle_admin_connection(
     // OVL1 frames start with b"OVL1" (0x4F …); JSON requests start with '{'.
     // If we see anything other than '{' we close immediately so the client gets
     // a clear ConnectionError rather than deadlocking forever.
-    {
-        use tokio::io::AsyncBufReadExt as _;
-        let buf = reader.fill_buf().await?;
-        if buf.is_empty() {
-            return Ok(());
-        }
-        if buf[0] != b'{' {
-            // Not a JSON admin request — close the connection.
-            return Ok(());
-        }
+    if !looks_like_json_request(&mut reader, ADMIN_REQUEST_DEADLINE).await? {
+        return Ok(());
     }
 
     // Audit batch 2026-05-25 phase L + audit cycle-8: bound the admin request
@@ -2108,12 +2166,18 @@ async fn handle_admin_connection(
     // is generous. An over-cap / EOF-without-newline / non-UTF-8 request returns
     // `None` → we silently close (logging would amplify adversary noise).
     const MAX_ADMIN_REQUEST_BYTES: usize = 64 * 1024;
-    let line = match read_bounded_admin_line(&mut reader, MAX_ADMIN_REQUEST_BYTES).await? {
-        Some(l) => l,
-        None => return Ok(()),
-    };
+    let line =
+        match read_admin_request_line(&mut reader, MAX_ADMIN_REQUEST_BYTES, ADMIN_REQUEST_DEADLINE)
+            .await?
+        {
+            Some(l) => l,
+            None => return Ok(()),
+        };
 
     let request: AdminRequest = serde_json::from_str(line.trim_end())?;
+    // Classified. The small pre-auth pool is free for the next arrival; from
+    // here the connection is charged to the main one, or to the reserve below.
+    drop(preauth);
 
     // V-06: this connection arrived while the pool was down to its reserve. Now
     // that the request is parsed, the reserve can be spent on what it is for.
@@ -3733,6 +3797,75 @@ async fn run_debug_capture(
 
 #[cfg(test)]
 mod tests {
+    /// report15 V15-M2: an authenticated connection that says nothing.
+    ///
+    /// The pre-auth pool bounds the handshake and used to be released the
+    /// moment it finished. A connection arriving while the main pool is down
+    /// to its reserve then carries NO permit at all, and the reads that
+    /// classify it had no deadline — so it held a task and a file descriptor
+    /// for the life of the process, and nothing bounded how many such
+    /// connections there could be.
+    ///
+    /// Both reads are covered, because a request delivered one byte at a time
+    /// is the same denial as one never delivered: the byte cap bounds SIZE and
+    /// says nothing about time.
+    #[tokio::test]
+    async fn a_silent_client_is_given_up_on() {
+        let brief = std::time::Duration::from_millis(50);
+
+        let mut silent = tokio::io::BufReader::new(Silent);
+        assert!(
+            !looks_like_json_request(&mut silent, brief)
+                .await
+                .expect("no io error"),
+            "the peek waited for a client that was never going to speak"
+        );
+
+        let mut half = tokio::io::BufReader::new(Silent);
+        assert_eq!(
+            read_admin_request_line(&mut half, 64 * 1024, brief)
+                .await
+                .expect("no io error"),
+            None,
+            "the request read waited for a line that was never going to arrive"
+        );
+    }
+
+    /// And a client that DOES speak is read, not cut off.
+    ///
+    /// Vacuity guard: a pair of functions that always gave up would satisfy
+    /// the test above and refuse every admin command there is.
+    #[tokio::test]
+    async fn an_ordinary_request_is_read() {
+        let brief = std::time::Duration::from_millis(50);
+        let request = b"{\"command\":\"status\"}\n";
+
+        let mut peek = tokio::io::BufReader::new(&request[..]);
+        assert!(looks_like_json_request(&mut peek, brief).await.expect("io"));
+
+        let mut reader = tokio::io::BufReader::new(&request[..]);
+        assert_eq!(
+            read_admin_request_line(&mut reader, 64 * 1024, brief)
+                .await
+                .expect("io")
+                .as_deref(),
+            Some("{\"command\":\"status\"}"),
+        );
+    }
+
+    /// A socket that is open and silent — a client that stopped talking.
+    struct Silent;
+
+    impl tokio::io::AsyncRead for Silent {
+        fn poll_read(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            _buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Pending
+        }
+    }
+
     use crate::test_support;
     use std::{
         fs,
