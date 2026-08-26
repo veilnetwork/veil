@@ -42,6 +42,39 @@ pub enum ProxyRequest {
     UdpAssociation,
 }
 
+/// Refusal codes answered on the readiness byte the client is already waiting
+/// for (`veil_proxy::veil_connector::await_exit_ready`).
+///
+/// The exit used to answer only SUCCESS: every failure path returned `Err`
+/// without writing anything, so the client sat in `read_exact` until its
+/// 15-second `EXIT_READY_TIMEOUT` and reported "exit connect timeout" — a
+/// message about the exit being unreachable for something the exit had already
+/// decided and could have said at once. Measured on a live phone: an exit host
+/// with no IPv6 turned every IPv6 destination into a 15-second stall, more
+/// than twenty of them in a few hours, and the same message appeared for a
+/// destination the exit had DENIED by policy.
+///
+/// The client already understands this: anything other than 0x00 is reported
+/// as `exit rejected destination (status=0x..)`. Only the exit's half was
+/// missing, so answering is compatible with clients already deployed.
+const EXIT_STATUS_OK: u8 = 0x00;
+const EXIT_STATUS_DENIED: u8 = 0x01;
+const EXIT_STATUS_RESOLVE_FAILED: u8 = 0x02;
+const EXIT_STATUS_CONNECT_FAILED: u8 = 0x03;
+
+/// Answer `code`, then hand back `error` unchanged.
+///
+/// The write is best-effort on purpose: the reason we are here may be that the
+/// stream is already gone, and failing to explain a failure must not replace
+/// the failure with a different one.
+async fn refuse<W>(veil_w: &mut W, code: u8, error: std::io::Error) -> std::io::Error
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    let _ = veil_w.write_all(&[code]).await;
+    error
+}
+
 /// Connection timeout for the outgoing TCP leg.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -260,14 +293,19 @@ pub async fn handle_proxy_connect_stream_with_metrics<S>(
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
-    if !can_act_as_exit(role, exit_enabled) {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::PermissionDenied,
-            "this node is not configured as an exit proxy",
-        ));
-    }
-
     let (mut veil_r, mut veil_w) = tokio::io::split(veil_stream);
+
+    if !can_act_as_exit(role, exit_enabled) {
+        return Err(refuse(
+            &mut veil_w,
+            EXIT_STATUS_DENIED,
+            std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "this node is not configured as an exit proxy",
+            ),
+        )
+        .await);
+    }
 
     // Read the destination header from the veil stream, bounded by
     // HEADER_TIMEOUT so a silent peer cannot hold an exit slot forever.
@@ -288,17 +326,36 @@ where
     // Resolving explicitly (rather than deferring to `TcpStream::connect`)
     // gives us a chance to enforce the deny-list; `connect((host, port))`
     // would happily race through every resolved address silently.
-    let candidates: Vec<std::net::SocketAddr> =
-        timeout(CONNECT_TIMEOUT, lookup_host((host.as_str(), port)))
-            .await
-            .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "resolve timeout"))?
-            .map_err(|e| std::io::Error::new(e.kind(), format!("resolve {host}:{port}: {e}")))?
-            .collect();
+    let resolved = match timeout(CONNECT_TIMEOUT, lookup_host((host.as_str(), port))).await {
+        Err(_) => {
+            return Err(refuse(
+                &mut veil_w,
+                EXIT_STATUS_RESOLVE_FAILED,
+                std::io::Error::new(std::io::ErrorKind::TimedOut, "resolve timeout"),
+            )
+            .await);
+        }
+        Ok(Err(e)) => {
+            return Err(refuse(
+                &mut veil_w,
+                EXIT_STATUS_RESOLVE_FAILED,
+                std::io::Error::new(e.kind(), format!("resolve {host}:{port}: {e}")),
+            )
+            .await);
+        }
+        Ok(Ok(addrs)) => addrs,
+    };
+    let candidates: Vec<std::net::SocketAddr> = resolved.collect();
     if candidates.is_empty() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::AddrNotAvailable,
-            format!("no addresses resolved for {host}:{port}"),
-        ));
+        return Err(refuse(
+            &mut veil_w,
+            EXIT_STATUS_RESOLVE_FAILED,
+            std::io::Error::new(
+                std::io::ErrorKind::AddrNotAvailable,
+                format!("no addresses resolved for {host}:{port}"),
+            ),
+        )
+        .await);
     }
     let picked = candidates
         .into_iter()
@@ -307,24 +364,37 @@ where
         if let Some(m) = &metrics {
             m.inc_exit_proxy_dest_denied();
         }
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::PermissionDenied,
-            format!(
-                "exit-proxy denied {host}:{port}: all resolved addresses are \
-                 private/loopback/link-local (override via proxy.exit.allow_private)"
+        return Err(refuse(
+            &mut veil_w,
+            EXIT_STATUS_DENIED,
+            std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                format!(
+                    "exit-proxy denied {host}:{port}: all resolved addresses are \
+                     private/loopback/link-local (override via proxy.exit.allow_private)"
+                ),
             ),
-        ));
+        )
+        .await);
     };
 
     // Open an outgoing TCP connection to the filtered target. On Windows the
     // socket must be pinned before connect so an xVeil full-tunnel route does
     // not recursively feed an exit node's own egress back into its SOCKS.
-    let socket = if addr.is_ipv4() {
+    // Creating the socket already fails on a host with no stack for that
+    // family — the ordinary case for IPv6 on a v4-only exit — and that is a
+    // refusal the client can act on immediately.
+    let socket = match if addr.is_ipv4() {
         TcpSocket::new_v4()
     } else {
         TcpSocket::new_v6()
-    }?;
-    if !addr.ip().is_loopback() {
+    } {
+        Ok(socket) => socket,
+        Err(e) => return Err(refuse(&mut veil_w, EXIT_STATUS_CONNECT_FAILED, e).await),
+    };
+    let pin = if addr.ip().is_loopback() {
+        Ok(())
+    } else {
         veil_util::outbound_interface::configure_outbound_socket(
             &socket,
             if addr.is_ipv4() {
@@ -332,15 +402,33 @@ where
             } else {
                 veil_util::outbound_interface::SocketFamilies::V6
             },
-        )?;
+        )
+    };
+    if let Err(e) = pin {
+        return Err(refuse(&mut veil_w, EXIT_STATUS_CONNECT_FAILED, e).await);
     }
-    let tcp = timeout(CONNECT_TIMEOUT, socket.connect(addr))
-        .await
-        .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "connect timeout"))?
-        .map_err(|e| std::io::Error::new(e.kind(), format!("tcp connect to {addr}: {e}")))?;
+    let tcp = match timeout(CONNECT_TIMEOUT, socket.connect(addr)).await {
+        Err(_) => {
+            return Err(refuse(
+                &mut veil_w,
+                EXIT_STATUS_CONNECT_FAILED,
+                std::io::Error::new(std::io::ErrorKind::TimedOut, "connect timeout"),
+            )
+            .await);
+        }
+        Ok(Err(e)) => {
+            return Err(refuse(
+                &mut veil_w,
+                EXIT_STATUS_CONNECT_FAILED,
+                std::io::Error::new(e.kind(), format!("tcp connect to {addr}: {e}")),
+            )
+            .await);
+        }
+        Ok(Ok(tcp)) => tcp,
+    };
 
     // Acknowledge success.
-    veil_w.write_all(&[0x00]).await?;
+    veil_w.write_all(&[EXIT_STATUS_OK]).await?;
 
     let (mut tcp_r, mut tcp_w) = tcp.into_split();
 
@@ -842,5 +930,91 @@ mod tests {
             result.unwrap_err().kind(),
             std::io::ErrorKind::PermissionDenied
         );
+    }
+
+    // ── The exit answers a refusal instead of going silent ───────────────────
+    //
+    // The client waits for one readiness byte
+    // (`veil_connector::await_exit_ready`) and gives up after
+    // EXIT_READY_TIMEOUT — 15 seconds. Every failure path here used to return
+    // `Err` without writing anything, so a destination the exit had already
+    // REFUSED cost the client the full timeout and was reported as "exit
+    // connect timeout": a message about an unreachable exit, for a decision
+    // the exit had made instantly.
+    //
+    // Measured on a live phone against an exit with no IPv6: every IPv6
+    // destination stalled 15 seconds, twenty-plus times in a few hours.
+    //
+    // Each test reads the byte under a SHORT timeout on purpose. If the exit
+    // goes silent again the read never completes and the test fails there —
+    // which is the defect, expressed as a test.
+    async fn refusal_byte(role: NodeRole, allow_private: bool, host: &str) -> u8 {
+        let (client_half, server_half) = tokio::io::duplex(4096);
+        tokio::spawn(handle_proxy_connect_stream(
+            role,
+            true,
+            allow_private,
+            server_half,
+        ));
+        let (mut client_r, mut client_w) = tokio::io::split(client_half);
+        let header = encode_proxy_header(host, 80);
+        client_w.write_all(&header).await.unwrap();
+        let mut status = [0u8; 1];
+        tokio::time::timeout(Duration::from_secs(2), client_r.read_exact(&mut status))
+            .await
+            .expect("the exit must ANSWER a refusal, not leave the client waiting")
+            .expect("the refusal byte must arrive before the stream closes");
+        status[0]
+    }
+
+    #[tokio::test]
+    async fn a_denied_destination_is_answered_not_ignored() {
+        // Loopback with allow_private = false is the SSRF denial path.
+        let status = refusal_byte(NodeRole::Core, false, "127.0.0.1").await;
+        assert_eq!(status, EXIT_STATUS_DENIED);
+        assert_ne!(
+            status, EXIT_STATUS_OK,
+            "a refusal that reads as success would be worse than silence"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_node_that_is_not_an_exit_answers_too() {
+        let status = refusal_byte(NodeRole::Leaf, true, "127.0.0.1").await;
+        assert_eq!(status, EXIT_STATUS_DENIED);
+    }
+
+    #[tokio::test]
+    async fn success_still_answers_zero() {
+        // The premise for all of the above: the ONE byte the client reads is
+        // the same byte on both paths, so a refusal code cannot be mistaken
+        // for the acknowledgement.
+        use tokio::net::TcpListener;
+        let echo = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = echo.local_addr().unwrap();
+        tokio::spawn(async move {
+            if let Ok((mut s, _)) = echo.accept().await {
+                let (mut r, mut w) = s.split();
+                tokio::io::copy(&mut r, &mut w).await.ok();
+            }
+        });
+        let (client_half, server_half) = tokio::io::duplex(4096);
+        tokio::spawn(handle_proxy_connect_stream(
+            NodeRole::Core,
+            true,
+            true,
+            server_half,
+        ));
+        let (mut client_r, mut client_w) = tokio::io::split(client_half);
+        client_w
+            .write_all(&encode_proxy_header("127.0.0.1", addr.port()))
+            .await
+            .unwrap();
+        let mut status = [0u8; 1];
+        tokio::time::timeout(Duration::from_secs(2), client_r.read_exact(&mut status))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(status[0], EXIT_STATUS_OK);
     }
 }
