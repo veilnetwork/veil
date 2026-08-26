@@ -1567,12 +1567,14 @@ impl TieredStore {
             }
         }
 
-        // 1. Drop the previous value's bytes for this key (if any) — done
-        //    by calling remove(), which adjusts total_bytes and origin_bytes
-        //    appropriately.
-        self.remove(&key);
-
-        // 2. Byte-cap check: refuse single values that exceed the cap.
+        // 1. Byte-cap check: refuse single values that exceed the cap.
+        //    BEFORE the removal below, not after.  This depends only on the
+        //    value being offered, so running it second made a refused put
+        //    destructive: replacing a key with an oversized value dropped the
+        //    incumbent and then declined to store anything, and the caller was
+        //    told `false` — which reads as "nothing happened" (report16
+        //    V16-L2).  Every check that can be made without touching the store
+        //    is made before the store is touched.
         if let Some(cap) = self.max_bytes
             && new_bytes > cap
         {
@@ -1581,6 +1583,11 @@ impl TieredStore {
             // distinguish "won't fit" from "succeeded but evicted others".
             return false;
         }
+
+        // 2. Drop the previous value's bytes for this key (if any) — done
+        //    by calling remove(), which adjusts total_bytes and origin_bytes
+        //    appropriately.
+        self.remove(&key);
 
         // 3. Evict oldest entries until the new value fits.  Cold first
         //    (cheapest data — already demoted), then hot (demote-and-
@@ -2385,6 +2392,69 @@ mod tests {
             "store state must be unchanged on refused put"
         );
         assert!(store.get(&[1u8; 32]).is_some(), "existing entry preserved");
+    }
+
+    /// A refused put must not be destructive — including when it REPLACES an
+    /// existing key.
+    ///
+    /// The test above uses a fresh key, so it never reached the case that
+    /// mattered: the removal of the incumbent ran BEFORE the cap check, so
+    /// offering an oversized replacement deleted what was there and then
+    /// returned `false`.  A caller reading that answer as "the store is
+    /// unchanged" had already lost the value (report16 V16-L2).
+    #[test]
+    fn refused_oversized_replacement_keeps_the_incumbent() {
+        let mut store = TieredStore::new(8, 8).with_max_bytes(100);
+        store.put([1u8; 32], vec![7u8; 50]);
+
+        let accepted = store.put_with_origin([1u8; 32], vec![9u8; 200], ORIGIN_INTERNAL);
+
+        assert!(!accepted, "premise: the oversized value must be refused");
+        assert_eq!(
+            store.get(&[1u8; 32]).map(|v| v.to_vec()),
+            Some(vec![7u8; 50]),
+            "a refused put deleted the value it failed to replace"
+        );
+        assert_eq!(store.total_bytes(), 50, "accounting followed the deletion");
+    }
+
+    /// The same rule for the other refusal: a per-origin cap that rejects a
+    /// replacement must leave the incumbent alone too.
+    #[test]
+    fn refused_over_origin_cap_replacement_keeps_the_incumbent() {
+        let mut store = TieredStore::new(8, 8).with_per_origin_max_bytes(100);
+        let origin = [3u8; 32];
+        assert!(
+            store.put_with_origin([1u8; 32], vec![7u8; 50], origin),
+            "premise: the first put fits"
+        );
+
+        let accepted = store.put_with_origin([1u8; 32], vec![9u8; 200], origin);
+
+        assert!(!accepted, "premise: the replacement must be refused");
+        assert_eq!(
+            store.get(&[1u8; 32]).map(|v| v.to_vec()),
+            Some(vec![7u8; 50]),
+            "a refused put deleted the value it failed to replace"
+        );
+    }
+
+    /// Vacuity guard: an oversized value must still be REFUSED, and an
+    /// ordinary replacement must still go through.  Refusing to mutate is only
+    /// correct for the puts that are actually refused.
+    #[test]
+    fn an_accepted_replacement_still_replaces() {
+        let mut store = TieredStore::new(8, 8).with_max_bytes(100);
+        store.put([1u8; 32], vec![7u8; 50]);
+
+        assert!(store.put_with_origin([1u8; 32], vec![9u8; 60], ORIGIN_INTERNAL));
+
+        assert_eq!(
+            store.get(&[1u8; 32]).map(|v| v.to_vec()),
+            Some(vec![9u8; 60]),
+            "the new value never landed"
+        );
+        assert_eq!(store.total_bytes(), 60, "the old bytes were never released");
     }
 
     /// Updating an existing key uses the delta semantics — already-counted

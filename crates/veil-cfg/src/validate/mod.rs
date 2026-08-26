@@ -126,6 +126,73 @@ mod tests {
             );
         }
 
+        /// An admin cap that reserves the whole pool is refused.
+        ///
+        /// The runtime holds two slots back for `apply-config`, so 0, 1 and 2
+        /// left nothing an ordinary command could take — and at 0 not even
+        /// `apply-config` could connect, which is a setting the node cannot be
+        /// talked out of. Validation accepted all three (report16 V16-L1).
+        #[test]
+        fn reports_an_admin_cap_that_admits_no_ordinary_command() {
+            for cap in 0..crate::MIN_ADMIN_MAX_CONNECTIONS {
+                let mut config = Config::default();
+                config.global.admin_max_connections = cap;
+
+                let report = validate(&config);
+                assert!(
+                    report
+                        .issues
+                        .iter()
+                        .any(|i| i.code == "admin_max_connections_admits_ordinary_commands"),
+                    "a cap of {cap} was accepted; issues: {:?}",
+                    report.issues.iter().map(|i| i.code).collect::<Vec<_>>()
+                );
+            }
+        }
+
+        /// Vacuity guard: the rule must not fire on the minimum or the
+        /// default, or every ordinary config would carry the issue and the
+        /// assertion above would pass on an always-true rule.
+        #[test]
+        fn an_admin_cap_that_works_is_not_reported() {
+            for cap in [crate::MIN_ADMIN_MAX_CONNECTIONS, 8, 32] {
+                let mut config = Config::default();
+                config.global.admin_max_connections = cap;
+
+                let report = validate(&config);
+                assert!(
+                    !report
+                        .issues
+                        .iter()
+                        .any(|i| i.code == "admin_max_connections_admits_ordinary_commands"),
+                    "a usable cap of {cap} was flagged"
+                );
+            }
+        }
+
+        /// And the fix puts back a cap that works, rather than the smallest
+        /// one that happens to pass.
+        #[test]
+        fn fixing_an_admin_cap_restores_the_default() {
+            let mut config = Config::default();
+            config.global.admin_max_connections = 0;
+
+            validate_and_fix(&mut config).expect("fix must apply");
+
+            assert!(
+                config.global.admin_max_connections >= crate::MIN_ADMIN_MAX_CONNECTIONS,
+                "the fix left a cap that still admits nothing: {}",
+                config.global.admin_max_connections
+            );
+            assert!(
+                validate(&config)
+                    .issues
+                    .iter()
+                    .all(|i| i.code != "admin_max_connections_admits_ordinary_commands"),
+                "the fixed config still carries the issue"
+            );
+        }
+
         #[test]
         fn reports_invalid_current_thread_worker_setting() {
             let mut config = Config::default();

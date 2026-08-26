@@ -3684,6 +3684,10 @@ pub struct GlobalConfig {
     /// "how many connections a single authorised UID can hold at
     /// once" — protects against a bug or mis-tooling that spawns
     /// hundreds of admin clients simultaneously.
+    ///
+    /// Must be at least [`MIN_ADMIN_MAX_CONNECTIONS`]: the runtime holds two
+    /// of these slots back for `apply-config`, so a smaller cap leaves no
+    /// slot an ordinary command can ever take.
     #[serde(default = "GlobalConfig::default_admin_max_connections")]
     pub admin_max_connections: usize,
     #[serde(default)]
@@ -3936,6 +3940,22 @@ pub struct GlobalConfig {
 fn is_default_legacy_allow(v: &bool) -> bool {
     !*v
 }
+
+/// The smallest `global.admin_max_connections` that still admits an ordinary
+/// admin command.
+///
+/// `veil_node_runtime::admin::ADMIN_SLOTS_RESERVED_FOR_APPLY` holds two slots
+/// back so that pushing a corrected config always has somewhere to land. A cap
+/// of 0, 1 or 2 therefore reserved the ENTIRE pool: every ordinary command was
+/// refused, and at 0 even `apply-config` — the command that would undo the
+/// setting — could not connect, which is a config a node cannot be talked out
+/// of. Validation refused none of it (report16 V16-L1).
+///
+/// Zero is not a disable switch. Admin is disabled by leaving
+/// `global.admin_socket` unset; a cap of zero only breaks the socket that was
+/// asked for. A test in the runtime pins this to the reserve it is derived
+/// from, so the two cannot drift apart.
+pub const MIN_ADMIN_MAX_CONNECTIONS: usize = 3;
 
 impl GlobalConfig {
     pub(crate) fn default_admin_max_connections() -> usize {

@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 
-use crate::{Config, LogsConfig, NodeId, RuntimeFlavor};
+use crate::{Config, GlobalConfig, LogsConfig, NodeId, RuntimeFlavor};
 use veil_crypto::Base64PublicKey;
 use veil_transport::{TransportRegistry, TransportUri};
 
@@ -56,6 +56,15 @@ pub const VALIDATION_RULES: &[ValidationRule] = &[
         message: "must be greater than zero",
         check: positive_thread_stack_size,
         fix: Some(fix_positive_thread_stack_size),
+    },
+    ValidationRule {
+        code: "admin_max_connections_admits_ordinary_commands",
+        key: "global.admin_max_connections",
+        message: "must be at least 3: two slots are reserved for apply-config, \
+                  so a smaller cap refuses every ordinary admin command (set \
+                  global.admin_socket to disable admin instead)",
+        check: admin_max_connections_too_small,
+        fix: Some(fix_admin_max_connections_too_small),
     },
     ValidationRule {
         code: "global_admin_socket_is_unix_or_tcp_transport",
@@ -501,6 +510,10 @@ fn positive_thread_stack_size(config: &Config) -> bool {
     config.global.thread_stack_size == Some(0)
 }
 
+fn admin_max_connections_too_small(config: &Config) -> bool {
+    config.global.admin_max_connections < crate::MIN_ADMIN_MAX_CONNECTIONS
+}
+
 fn invalid_admin_socket(config: &Config) -> bool {
     let Some(value) = config.global.admin_socket.as_deref() else {
         return false;
@@ -667,6 +680,14 @@ fn fix_non_empty_thread_name(config: &mut Config) -> bool {
 
 fn fix_positive_thread_stack_size(config: &mut Config) -> bool {
     config.global.thread_stack_size = None;
+    true
+}
+
+fn fix_admin_max_connections_too_small(config: &mut Config) -> bool {
+    // Back to the default rather than up to the minimum: an operator who wrote
+    // 0 meant something other than "the smallest cap that works", and the
+    // default is the only value here that is known to be sane.
+    config.global.admin_max_connections = GlobalConfig::default_admin_max_connections();
     true
 }
 
