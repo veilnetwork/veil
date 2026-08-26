@@ -378,6 +378,25 @@ pub mod rocks {
     }
 
     impl RocksDbCold {
+        /// How many rows the two side column families hold, counting the ones
+        /// whose value is gone.
+        ///
+        /// Every ordinary reader hides those on purpose — an origin row for a
+        /// key with no value describes nothing and must not charge anybody —
+        /// which is precisely why rows outliving their value were invisible to
+        /// all of them while the files grew (report15 V15-M4). Nothing but a
+        /// direct count can see that, so a test needs this.
+        #[doc(hidden)]
+        pub fn side_row_count(&self) -> (usize, usize) {
+            let count = |cf| {
+                self.db
+                    .iterator_cf(cf, rocksdb::IteratorMode::Start)
+                    .filter(|item| item.is_ok())
+                    .count()
+            };
+            (count(self.cf_origin()), count(self.cf_first_seen()))
+        }
+
         pub fn open(
             path: impl AsRef<std::path::Path>,
             capacity: usize,
@@ -703,6 +722,20 @@ pub mod rocks {
             let mut batch = rocksdb::WriteBatch::default();
             let was_indexed = self.stage_unindex(&mut batch, key);
             batch.delete(key);
+            // The SIDE columns go in the same batch.
+            //
+            // They were not deleted at all, by any path: an entry's origin and
+            // its first-seen stamp outlived the value on every delete —
+            // ordinary removal, entry-cap eviction, expiry. Unique-key churn
+            // therefore grew two column families that no cap counts and no
+            // sweep visits (report15 V15-M4). `forget_origin` /
+            // `forget_first_seen` exist and were called from one promotion
+            // path only.
+            //
+            // Here rather than at each caller, because there are three of them
+            // and this is what they all go through.
+            batch.delete_cf(self.cf_origin(), key);
+            batch.delete_cf(self.cf_first_seen(), key);
             if let Err(e) = self.db.write(batch) {
                 log::warn!("dht.cold.rocksdb: entry delete failed: {e}");
                 return false;
@@ -2559,6 +2592,52 @@ mod tests {
     /// safely skip it — it persists across restart by itself (see
     /// `rocksdb_cold_tier_persists_across_reopen`), and re-serialising it every
     /// 120 s would defeat the disk tier.
+    /// report15 V15-M4: an entry's origin and its first-seen stamp outlived
+    /// the value.
+    ///
+    /// No delete path touched the side column families — not ordinary removal,
+    /// not entry-cap eviction, not expiry. `forget_origin` and
+    /// `forget_first_seen` exist and were called from one promotion path only.
+    /// So unique-key churn grew two column families that no cap counts and no
+    /// sweep visits, and after a restart those rows are what the quota and the
+    /// TTL are computed from.
+    #[cfg(feature = "rocksdb-cold")]
+    #[test]
+    fn deleting_an_entry_takes_its_origin_and_age_with_it() {
+        use super::rocks::RocksDbCold;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut cold =
+            RocksDbCold::open(dir.path().join("cold").to_str().unwrap(), 0).expect("open");
+
+        let key = [9u8; 32];
+        cold.put(key, b"value".to_vec());
+        cold.set_origin(&key, &[1u8; 32]);
+        cold.set_first_seen(&key, 1_700_000_000);
+
+        // Counted DIRECTLY. `origins()` and every other reader skip a row
+        // whose value is gone — deliberately, because such a row describes
+        // nothing and must not charge anybody — so the leak was invisible to
+        // all of them while the files grew. A first version of this test
+        // asserted through `origins()` and passed against the defect.
+        assert_eq!(
+            cold.side_row_count(),
+            (1, 1),
+            "the side rows were never written, so what follows proves nothing"
+        );
+
+        // Through the trait, which is what every caller uses.
+        cold.remove(&key);
+        assert!(!cold.contains(&key), "the value is still there");
+
+        assert_eq!(
+            cold.side_row_count(),
+            (0, 0),
+            "an origin or first-seen row outlived the value it describes; \
+             nothing counts them and no sweep visits them"
+        );
+    }
+
     #[cfg(feature = "rocksdb-cold")]
     #[test]
     fn rocksdb_cold_reports_durable() {
