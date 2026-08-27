@@ -609,6 +609,27 @@ final int Function(Pointer<VeilHandle>,
                 )>>('veil_lookup_relay_x25519')
         .asFunction();
 
+/// [veilLookupRelayX25519], plus the moment that key stops being the relay's
+/// (`out_valid_until_unix`, 0 = the daemon did not say).
+///
+/// The stamp is what lets the ad built from this key be clipped to it: an ad
+/// may run for thirty days while the key behind it does not, so a key resolved
+/// shortly before an expiry or a revocation was advertised for the month
+/// afterwards (report17 V17-M1).
+final int Function(Pointer<VeilHandle>, Pointer<Uint8>, Pointer<Uint8>,
+        Pointer<Uint64>, Pointer<Pointer<Utf8>>)
+    veilLookupRelayX25519WithExpiry = nativeLib
+        .lookup<
+            NativeFunction<
+                Int32 Function(
+                  Pointer<VeilHandle>,
+                  Pointer<Uint8>,
+                  Pointer<Uint8>,
+                  Pointer<Uint64>,
+                  Pointer<Pointer<Utf8>>,
+                )>>('veil_lookup_relay_x25519_with_expiry')
+        .asFunction();
+
 final int Function(Pointer<VeilHandle>, int, Pointer<Pointer<Utf8>>)
     veilRegisterOnionService = nativeLib
         .lookup<
@@ -695,6 +716,27 @@ final int Function(Pointer<VeilHandle>, Pointer<Uint8>, Pointer<Uint8>, int,
                   IntPtr,
                   Pointer<Pointer<Utf8>>,
                 )>>('veil_register_rendezvous_publisher')
+        .asFunction();
+
+/// [veilRegisterRendezvousPublisher], plus the relay key's expiry
+/// (`relay_kem_valid_until_unix`, 0 = not known). The daemon clips the
+/// published ad's validity to it (report17 V17-M1).
+final int Function(Pointer<VeilHandle>, Pointer<Uint8>, Pointer<Uint8>, int,
+        int, Pointer<Uint8>, int, int, Pointer<Pointer<Utf8>>)
+    veilRegisterRendezvousPublisherWithExpiry = nativeLib
+        .lookup<
+            NativeFunction<
+                Int32 Function(
+                  Pointer<VeilHandle>,
+                  Pointer<Uint8>,
+                  Pointer<Uint8>,
+                  Uint64,
+                  Uint8,
+                  Pointer<Uint8>,
+                  IntPtr,
+                  Uint64,
+                  Pointer<Pointer<Utf8>>,
+                )>>('veil_register_rendezvous_publisher_with_expiry')
         .asFunction();
 
 final int Function(
@@ -1472,7 +1514,8 @@ const int veilMailboxPutQuotaPerReceiver = abi.veilMailboxPutQuotaPerReceiver;
 const int veilMailboxPutQuotaGlobal = abi.veilMailboxPutQuotaGlobal;
 const int veilMailboxPutRateLimited = abi.veilMailboxPutRateLimited;
 const int veilMailboxPutNotRelay = abi.veilMailboxPutNotRelay;
-const int veilMailboxPutCapabilityRequired = abi.veilMailboxPutCapabilityRequired;
+const int veilMailboxPutCapabilityRequired =
+    abi.veilMailboxPutCapabilityRequired;
 const int veilMailboxPutCapabilityInvalid = abi.veilMailboxPutCapabilityInvalid;
 const int veilMailboxPutQuotaPerSender = abi.veilMailboxPutQuotaPerSender;
 
