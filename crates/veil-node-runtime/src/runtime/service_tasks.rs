@@ -5271,10 +5271,26 @@ pub fn resolve_bootstrap_candidates(
     config: &veil_cfg::Config,
     my_pubkey: &str,
 ) -> Vec<veil_cfg::BootstrapPeer> {
+    resolve_bootstrap_candidates_from(config, my_pubkey, veil_bootstrap::builtin_seeds())
+}
+
+/// [`resolve_bootstrap_candidates`] against an EXPLICIT seed list.
+///
+/// The list is a build-feature decision — `allow-empty-seeds` makes
+/// `builtin_seeds()` empty — and the tests around this are about what happens
+/// to a list, not about which list this binary shipped with. Four of them
+/// asserted their own premise ("test needs a non-empty builtin seed list") and
+/// failed on it under exactly the features CI passes, so the suite was red for
+/// a reason that had nothing to do with the behaviour under test.
+pub fn resolve_bootstrap_candidates_from(
+    config: &veil_cfg::Config,
+    my_pubkey: &str,
+    seeds: Vec<veil_cfg::BootstrapPeer>,
+) -> Vec<veil_cfg::BootstrapPeer> {
     let contributed = builtin_seed_contribution(
         config.global.builtin_seed_policy,
         config.bootstrap_peers.is_empty() && config.peers.is_empty(),
-        veil_bootstrap::builtin_seeds(),
+        seeds,
     );
     let mut out = filter_self_seeds(config.bootstrap_peers.clone(), my_pubkey);
     let known: std::collections::HashSet<String> =
@@ -5984,17 +6000,24 @@ mod tests {
         );
     }
 
+    /// A seed list these tests own.
+    ///
+    /// NOT `veil_bootstrap::builtin_seeds()`: that is empty under
+    /// `allow-empty-seeds`, which is one of the features CI builds with — so
+    /// every test below asserted its own premise and failed on it there, red
+    /// for a reason unrelated to what it was checking. What these tests are
+    /// about is what resolution does to a list.
+    fn seed_fixture() -> Vec<veil_cfg::BootstrapPeer> {
+        vec![peer("SEED-A"), peer("SEED-B"), peer("SEED-C")]
+    }
+
     #[test]
     fn a_configured_alternative_no_longer_disables_the_builtin_seeds() {
         // The defect this closes: `bootstrap_peers` REPLACED the builtin list,
         // so one non-seed entry point silently cost the node every seed.
-        let seeds = veil_bootstrap::builtin_seeds();
-        assert!(
-            !seeds.is_empty(),
-            "test needs a non-empty builtin seed list to be meaningful",
-        );
+        let seeds = seed_fixture();
         let cfg = config_with(vec![peer("ALT")], veil_cfg::BuiltinSeedPolicy::Always);
-        let resolved = resolve_bootstrap_candidates(&cfg, "ME");
+        let resolved = resolve_bootstrap_candidates_from(&cfg, "ME", seeds.clone());
 
         assert_eq!(
             resolved.len(),
@@ -6017,32 +6040,24 @@ mod tests {
         // `config.bootstrap_peers.is_empty()`, which is the state of every
         // stock install — the seeds live in a local clone it never sees. Those
         // nodes got no partition recovery at all.
-        assert!(
-            !veil_bootstrap::builtin_seeds().is_empty(),
-            "test needs a non-empty builtin seed list to be meaningful",
-        );
         let cfg = config_with(Vec::new(), veil_cfg::BuiltinSeedPolicy::Auto);
         assert!(
             cfg.bootstrap_peers.is_empty(),
             "precondition: the raw field the watchdog used to read is empty",
         );
         assert!(
-            !resolve_bootstrap_candidates(&cfg, "ME").is_empty(),
+            !resolve_bootstrap_candidates_from(&cfg, "ME", seed_fixture()).is_empty(),
             "watchdog would have nothing to re-dial for a seed-only node",
         );
     }
 
     #[test]
     fn resolve_dedups_a_peer_that_is_both_configured_and_builtin() {
-        let seeds = veil_bootstrap::builtin_seeds();
-        assert!(
-            !seeds.is_empty(),
-            "test needs a non-empty builtin seed list"
-        );
+        let seeds = seed_fixture();
         // Pin the first builtin seed in `bootstrap_peers` too — the operator
         // curating a host that is also a seed must not double-dial it.
         let cfg = config_with(vec![seeds[0].clone()], veil_cfg::BuiltinSeedPolicy::Always);
-        let resolved = resolve_bootstrap_candidates(&cfg, "ME");
+        let resolved = resolve_bootstrap_candidates_from(&cfg, "ME", seeds.clone());
 
         assert_eq!(resolved.len(), seeds.len(), "duplicate was dialed twice");
         let occurrences = resolved
@@ -6064,10 +6079,10 @@ mod tests {
             veil_cfg::BuiltinSeedPolicy::Auto,
         ] {
             let cfg = config_with(vec![peer("ALT")], policy);
-            let once = resolve_bootstrap_candidates(&cfg, "ME");
+            let once = resolve_bootstrap_candidates_from(&cfg, "ME", seed_fixture());
             let mut next = cfg.clone();
             next.bootstrap_peers = once.clone();
-            let twice = resolve_bootstrap_candidates(&next, "ME");
+            let twice = resolve_bootstrap_candidates_from(&next, "ME", seed_fixture());
             assert_eq!(
                 twice.len(),
                 once.len(),
@@ -6079,16 +6094,12 @@ mod tests {
 
     #[test]
     fn resolve_drops_our_own_key_from_both_sources() {
-        let seeds = veil_bootstrap::builtin_seeds();
-        assert!(
-            !seeds.is_empty(),
-            "test needs a non-empty builtin seed list"
-        );
+        let seeds = seed_fixture();
         // A seed host bootstrapping itself: its own key appears in the builtin
         // list, and must not be dialed from either source.
         let me = seeds[0].public_key.clone();
         let cfg = config_with(vec![peer("ALT")], veil_cfg::BuiltinSeedPolicy::Always);
-        let resolved = resolve_bootstrap_candidates(&cfg, &me);
+        let resolved = resolve_bootstrap_candidates_from(&cfg, &me, seeds.clone());
         assert!(resolved.iter().all(|p| p.public_key != me));
     }
 

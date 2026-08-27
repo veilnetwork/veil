@@ -1011,6 +1011,27 @@ mod reverse_path_tests {
     /// response, result — because the echo is carried by state the terminal
     /// node keeps between the challenge and the answer, and a test that
     /// short-circuits that carries nothing.
+    /// The origin's proof-of-work, searched far enough that finding one is
+    /// not a coin flip.
+    ///
+    /// Production stops at 4× expected because a peer that will not answer
+    /// must not cost a core; a test that needs an answer to proceed cannot
+    /// share that budget. The fixture runs at difficulty 16 — 65 536 expected
+    /// attempts — so 4× fails about one run in fifty, which is exactly the
+    /// rate this test flaked at. 64× puts it at e^-64, and four million
+    /// BLAKE3 hashes is a fraction of a second.
+    fn solve_with_budget(challenge_nonce: &[u8; 32], difficulty: u8) -> Option<[u8; 32]> {
+        let mut solution = [0u8; 32];
+        for i in 0..(1u64 << (u32::from(difficulty) + 6)) {
+            solution[0..8].copy_from_slice(&i.to_le_bytes());
+            let hash = blake3::hash(&[challenge_nonce.as_slice(), solution.as_slice()].concat());
+            if veil_util::leading_zero_bits(hash.as_bytes()) >= u32::from(difficulty) {
+                return Some(solution);
+            }
+        }
+        None
+    }
+
     #[test]
     fn a_terminal_node_echoes_the_walks_nonce_into_its_result() {
         use ed25519_dalek::{Signer, SigningKey};
@@ -1041,10 +1062,23 @@ mod reverse_path_tests {
         let challenge =
             veil_proto::pex::PexChallenge::decode(&challenge_body).expect("a challenge");
 
-        // Solved and signed the way the origin does it.
-        let solution =
-            crate::initiator::solve_pex_pow(&challenge.challenge_nonce, challenge.difficulty)
-                .expect("the fixture difficulty is solvable");
+        // Solved and signed the way the origin does it — but with a budget
+        // this test controls.
+        //
+        // `solve_pex_pow` gives up after FOUR TIMES the expected attempts,
+        // which is right for production (a peer that will not answer must not
+        // burn a core) and wrong here: four times expected means it fails
+        // about one run in fifty, and the nonce is freshly random every time.
+        // This test flaked at that rate from the day it was written — caught
+        // by running the gate's own command rather than `cargo test`.
+        assert!(
+            challenge.difficulty <= 20,
+            "the fixture difficulty is {} — the search below is exponential \
+             in it and this test would become a miner",
+            challenge.difficulty,
+        );
+        let solution = solve_with_budget(&challenge.challenge_nonce, challenge.difficulty)
+            .expect("a solution exists at this difficulty; the search gave up");
         let msg = [
             challenge.walk_id.to_be_bytes().as_slice(),
             challenge.challenge_nonce.as_slice(),

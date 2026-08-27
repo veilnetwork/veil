@@ -212,19 +212,30 @@ async fn deferred_stub_boot_dials_no_builtin_seed() {
     let stub = veil_cfg::build_stub_config_with_ephemeral_identity(false).unwrap();
 
     // A floor first. This whole test is "a set stayed empty", and the loudest
-    // way for it to pass is for the compiled-in list to have become empty —
-    // which is a real build configuration here (`allow-empty-seeds`), not a
-    // hypothetical.
-    assert!(
-        !veil_bootstrap::builtin_seeds().is_empty(),
-        "this build has no builtin seeds at all, so an empty peer table proves \
-         nothing about the stub"
-    );
+    // way for it to pass is for the seed list to be empty — which is a real
+    // build configuration here (`allow-empty-seeds`), and it is the one CI
+    // builds with.
+    //
+    // So the floor is supplied rather than assumed: resolution is asked with a
+    // list that definitely HAS seeds in it, and the stub must still contribute
+    // nothing. That is a stronger statement than the original — which asserted
+    // its own premise and then failed on it under exactly the features CI
+    // passes, red for a reason unrelated to the stub (report17, found while
+    // running the gate's own command).
+    let seeds = vec![veil_cfg::BootstrapPeer {
+        transport: "tcp://198.51.100.7:5555".to_owned(),
+        public_key: "SEED-FIXTURE".to_owned(),
+        nonce: "AAAA".to_owned(),
+        algo: veil_cfg::SignatureAlgorithm::Ed25519,
+        tls_cert: None,
+        tls_ca_cert: None,
+    }];
     // The decision, on the exact value the boot below is about to use.
     assert!(
-        super::service_tasks::resolve_bootstrap_candidates(
+        super::service_tasks::resolve_bootstrap_candidates_from(
             &stub,
             &stub.identity.as_ref().expect("stub identity").public_key,
+            seeds,
         )
         .is_empty(),
         "the stub must contribute no bootstrap candidate of any kind"
@@ -291,12 +302,33 @@ async fn the_applied_config_is_what_puts_a_deferred_node_on_the_network() {
         "a keeper's composed config leaves the policy alone — only a refusal \
          writes one"
     );
-    let builtin = veil_bootstrap::builtin_seeds();
-    assert!(!builtin.is_empty(), "floor: this build compiles in seeds");
+    // The seed list is SUPPLIED, not read out of the build: `allow-empty-seeds`
+    // makes the compiled-in one empty, and that is the configuration CI builds
+    // with — so a floor asserted about `builtin_seeds()` fails there for a
+    // reason that has nothing to do with keepers.
+    let builtin = vec![
+        veil_cfg::BootstrapPeer {
+            transport: "tcp://198.51.100.7:5555".to_owned(),
+            public_key: "SEED-FIXTURE-A".to_owned(),
+            nonce: "AAAA".to_owned(),
+            algo: veil_cfg::SignatureAlgorithm::Ed25519,
+            tls_cert: None,
+            tls_ca_cert: None,
+        },
+        veil_cfg::BootstrapPeer {
+            transport: "tcp://198.51.100.8:5555".to_owned(),
+            public_key: "SEED-FIXTURE-B".to_owned(),
+            nonce: "AAAA".to_owned(),
+            algo: veil_cfg::SignatureAlgorithm::Ed25519,
+            tls_cert: None,
+            tls_ca_cert: None,
+        },
+    ];
     assert_eq!(
-        super::service_tasks::resolve_bootstrap_candidates(
+        super::service_tasks::resolve_bootstrap_candidates_from(
             &keeper,
             &test_support::valid_identity().public_key,
+            builtin.clone(),
         )
         .len(),
         builtin.len(),
