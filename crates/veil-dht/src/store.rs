@@ -146,6 +146,41 @@ pub trait ColdBackend: Send + Sync + std::fmt::Debug {
     /// nothing to remember. The default does nothing.
     fn set_origin(&mut self, _key: &[u8; 32], _origin: &[u8; 32]) {}
 
+    /// Store `value` at `key` together with everything known about it, so a
+    /// crash cannot leave one without the others.
+    ///
+    /// The value and its two side rows describe the SAME record: the origin is
+    /// what the per-origin quota charges, the first-seen stamp is what the TTL
+    /// ages from. Written as three separate calls, a crash between them left a
+    /// value nobody is charged for and that ages from the moment it is read
+    /// back — and an overwrite left the previous publisher's row behind
+    /// (report16 V16-M4).
+    ///
+    /// The default is the three calls, which is what every backend that cannot
+    /// batch has always done and what an in-memory one loses nothing by. A
+    /// backend that CAN write them atomically overrides this.
+    fn put_with_side(
+        &mut self,
+        key: [u8; 32],
+        value: Vec<u8>,
+        origin: Option<[u8; 32]>,
+        first_seen_unix: Option<u64>,
+    ) -> ColdPut {
+        let put = self.put(key, value);
+        if matches!(put, ColdPut::Stored(_)) {
+            match origin {
+                Some(origin) => self.set_origin(&key, &origin),
+                // An overwrite by a publisher this node cannot name must not
+                // leave the PREVIOUS one charged for it.
+                None => self.forget_origin(&key),
+            }
+            if let Some(secs) = first_seen_unix {
+                self.set_first_seen(&key, secs);
+            }
+        }
+        put
+    }
+
     /// Forget `key`'s origin, when the value it described is gone.
     fn forget_origin(&mut self, _key: &[u8; 32]) {}
 
@@ -808,6 +843,24 @@ pub mod rocks {
         }
 
         fn put(&mut self, key: [u8; 32], value: Vec<u8>) -> ColdPut {
+            self.put_with_side(key, value, None, None)
+        }
+
+        /// The value and BOTH side rows in the one batch.
+        ///
+        /// The three value rows were already atomic together; the origin and
+        /// the first-seen stamp went afterwards as two independent writes, so a
+        /// crash between them left a value charged to nobody and aged from the
+        /// moment it is read back — and an overwrite by an unnamed publisher
+        /// left the PREVIOUS one's row behind to be charged for a value that is
+        /// no longer theirs (report16 V16-M4).
+        fn put_with_side(
+            &mut self,
+            key: [u8; 32],
+            value: Vec<u8>,
+            origin: Option<[u8; 32]>,
+            first_seen_unix: Option<u64>,
+        ) -> ColdPut {
             let byte_len = value.len() as u64;
             let ts = Self::now_secs();
             // ONE batch per logical put. A stored entry is three rows — the
@@ -830,6 +883,20 @@ pub mod rocks {
             batch.put(key, &value);
             batch.put_cf(self.cf_kt(), key, Self::kt_value(ts, byte_len));
             batch.put_cf(self.cf_ix(), Self::ix_key(ts, &key), []);
+            match origin {
+                Some(origin) => batch.put_cf(self.cf_origin(), key, origin),
+                // An overwrite by a publisher this node cannot name must not
+                // leave the previous one charged for it.
+                None => batch.delete_cf(self.cf_origin(), key),
+            }
+            match first_seen_unix {
+                Some(secs) => {
+                    batch.put_cf(self.cf_first_seen(), key, secs.to_be_bytes());
+                }
+                // No stamp offered: drop a stale one rather than let the new
+                // value inherit the age of whatever was here before.
+                None => batch.delete_cf(self.cf_first_seen(), key),
+            }
             if let Err(e) = self.db.write(batch) {
                 // Hand the value BACK rather than dropping it. Returning
                 // `None` here was indistinguishable from "stored, nothing
@@ -2027,28 +2094,30 @@ impl TieredStore {
         {
             self.hot_order.remove(&(ts, key));
             let first_seen = entry.2;
-            match self.cold.put(key, entry.0) {
+            // WHO published it and HOW OLD it is go down WITH the value, in one
+            // operation. Both were separate writes after the value's: the
+            // per-origin counters live in memory, so a restart handed every
+            // publisher a fresh allowance while its rows were still on disk
+            // (report14 V14-L3); `first_seen` is an `Instant` that dies with
+            // the process, so a restart aged every cold entry from zero and
+            // handed it another full lifetime (report14 V14-L2). Three writes
+            // meant a crash between them could leave the value with neither —
+            // charged to nobody, aged from the moment it is read back
+            // (report16 V16-M4).
+            let origin = self.entry_origin.get(&key).copied();
+            let age = Instant::now().saturating_duration_since(first_seen);
+            let unix_now = veil_util::unix_secs_now_u64();
+            let first_seen_unix = unix_now.saturating_sub(age.as_secs());
+            match self
+                .cold
+                .put_with_side(key, entry.0, origin, Some(first_seen_unix))
+            {
                 ColdPut::Stored(evicted) => {
-                    // The record's own age goes with it. Without this the cold
-                    // tier only knows when it was DEMOTED, so a promotion hands
-                    // it a fresh lifetime and a tier move became a way to
-                    // outlive the retention its publisher asked for.
+                    // The cold tier only knows when it was DEMOTED, so without
+                    // this a promotion hands the record a fresh lifetime and a
+                    // tier move became a way to outlive the retention its
+                    // publisher asked for.
                     self.cold_first_seen.insert(key, first_seen);
-                    // And WHO published it, for the same reason one level up:
-                    // the per-origin counters live in memory, so a restart
-                    // handed every publisher a fresh allowance while its rows
-                    // were still on disk (report14 V14-L3).
-                    if let Some(origin) = self.entry_origin.get(&key).copied() {
-                        self.cold.set_origin(&key, &origin);
-                    }
-                    // And HOW OLD it is, as a wall-clock second. `first_seen`
-                    // is an `Instant` and dies with the process, so a restart
-                    // aged every cold entry from zero and handed it another
-                    // full lifetime (report14 V14-L2).
-                    let age = Instant::now().saturating_duration_since(first_seen);
-                    let unix_now = veil_util::unix_secs_now_u64();
-                    self.cold
-                        .set_first_seen(&key, unix_now.saturating_sub(age.as_secs()));
                     if let Some((evicted_key, evicted_val)) = evicted {
                         self.account_eviction(&evicted_key, evicted_val.len() as u64);
                     }
@@ -2671,6 +2740,76 @@ mod tests {
     /// So unique-key churn grew two column families that no cap counts and no
     /// sweep visits, and after a restart those rows are what the quota and the
     /// TTL are computed from.
+    /// report16 V16-M4: the value and its two side rows go down together.
+    ///
+    /// The three VALUE rows were already atomic; the origin and the first-seen
+    /// stamp went afterwards as two independent writes. A crash between them
+    /// left a value charged to nobody and aged from the moment it is read
+    /// back — the quota and the TTL both computed from what is on disk after a
+    /// restart.
+    ///
+    /// Atomicity across a crash cannot be shown from inside the process. What
+    /// CAN be, and is the property the fix is: one operation carries all
+    /// three, so there is no window between them for anything to observe.
+    #[cfg(feature = "rocksdb-cold")]
+    #[test]
+    fn a_value_and_its_side_rows_are_one_operation() {
+        use super::rocks::RocksDbCold;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut cold =
+            RocksDbCold::open(dir.path().join("cold").to_str().unwrap(), 0).expect("open");
+
+        let key = [7u8; 32];
+        let put = cold.put_with_side(key, b"value".to_vec(), Some([3u8; 32]), Some(1_700_000_000));
+
+        assert!(matches!(put, ColdPut::Stored(_)));
+        assert_eq!(
+            cold.side_row_count(),
+            (1, 1),
+            "the side rows did not travel with the value"
+        );
+        assert_eq!(
+            cold.origins().unwrap().first().map(|o| o.1),
+            Some([3u8; 32])
+        );
+        assert_eq!(
+            cold.first_seen_all().unwrap().first().map(|(_, s)| *s),
+            Some(1_700_000_000)
+        );
+    }
+
+    /// And an overwrite by a publisher this node cannot name does not leave
+    /// the previous one charged for it.
+    ///
+    /// The side write was skipped when there was no origin to write, so the
+    /// row from the value that USED to be at that key stayed — and the quota
+    /// went on charging somebody for bytes that are not theirs.
+    #[cfg(feature = "rocksdb-cold")]
+    #[test]
+    fn an_unattributed_overwrite_does_not_inherit_the_previous_publisher() {
+        use super::rocks::RocksDbCold;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut cold =
+            RocksDbCold::open(dir.path().join("cold").to_str().unwrap(), 0).expect("open");
+
+        let key = [7u8; 32];
+        cold.put_with_side(key, b"first".to_vec(), Some([3u8; 32]), Some(1_700_000_000));
+        assert_eq!(cold.side_row_count(), (1, 1), "premise");
+
+        // The same key, written by nobody this node can name.
+        cold.put_with_side(key, b"second".to_vec(), None, None);
+
+        assert_eq!(
+            cold.side_row_count(),
+            (0, 0),
+            "the previous publisher is still charged for a value that is no \
+             longer theirs, and the new value inherited the old age"
+        );
+        assert_eq!(cold.get(&key).as_deref(), Some(b"second".as_slice()));
+    }
+
     #[cfg(feature = "rocksdb-cold")]
     #[test]
     fn deleting_an_entry_takes_its_origin_and_age_with_it() {
