@@ -964,16 +964,43 @@ pub struct RendezvousPublisherEntry {
 /// from a location-anonymous service's per-service registration keypair.
 /// `pseudo_node_id == BLAKE3(public_key bytes)`, matching the ad verifier's
 /// issuer↔node_id binding, so the pseudo-signed ad verifies normally.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Clone, PartialEq)]
 pub struct EphemeralAdIdentity {
     /// `BLAKE3(decoded public_key)` — the ad's `receiver_node_id` + DHT key base.
     pub pseudo_node_id: [u8; NODE_ID_LEN],
     /// Base64 Ed25519 public key (the ad's issuer pk).
     pub public_key: String,
     /// Base64 Ed25519 private key (signs the ad).
-    pub private_key: String,
+    ///
+    /// Wrapped, so the copy this registry keeps is erased when the entry goes
+    /// rather than left in a freed heap block (report17 V17-L9). The registry
+    /// is cloned on the maintenance tick and the entry is dropped at
+    /// unregister; without this every one of those left the signing key
+    /// behind.
+    pub private_key: zeroize::Zeroizing<String>,
     /// Signature algorithm (Ed25519 for onion-service registration keys).
     pub algo: SignatureAlgorithm,
+}
+
+impl core::fmt::Debug for EphemeralAdIdentity {
+    /// REDACTED. The derive printed the base64 signing key, and this type is
+    /// carried inside a registry entry that a `{:?}` on any diagnostic path
+    /// would render whole — the same shape as the write-op redaction in
+    /// hidden-volume (report17 V17-L9). The public half is shown in full: it
+    /// is what the ad publishes.
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("EphemeralAdIdentity")
+            .field("pseudo_node_id", &hex_prefix(&self.pseudo_node_id))
+            .field("public_key", &self.public_key)
+            .field("private_key", &"<redacted>")
+            .field("algo", &self.algo)
+            .finish()
+    }
+}
+
+/// First four bytes of an id, for a diagnostic line that should not carry 32.
+fn hex_prefix(id: &[u8; NODE_ID_LEN]) -> String {
+    id.iter().take(4).map(|b| format!("{b:02x}")).collect()
 }
 
 impl EphemeralAdIdentity {
@@ -991,7 +1018,7 @@ impl EphemeralAdIdentity {
         Some(Self {
             pseudo_node_id,
             public_key,
-            private_key,
+            private_key: zeroize::Zeroizing::new(private_key),
             algo,
         })
     }
@@ -2002,6 +2029,58 @@ mod tests {
         let raw = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, issuer_pk_b64)
             .expect("test issuer_pk must be valid base64");
         *blake3::hash(&raw).as_bytes()
+    }
+
+    /// The signing key of an ephemeral ad identity never reaches a log
+    /// (report17 V17-L9).
+    ///
+    /// The type derived `Debug`, so a `{:?}` anywhere on a diagnostic path
+    /// would have rendered the base64 private key in full — and this type is
+    /// carried inside a registry entry that gets formatted as a whole.
+    #[test]
+    fn the_ephemeral_signer_is_redacted_in_debug() {
+        let kp = generate_keypair(SignatureAlgorithm::Ed25519);
+        let id = EphemeralAdIdentity::from_b64_keypair(
+            kp.public_key.clone(),
+            kp.private_key.clone(),
+            SignatureAlgorithm::Ed25519,
+        )
+        .expect("a generated keypair is valid base64");
+
+        let rendered = format!("{id:?}");
+
+        assert!(
+            !rendered.contains(kp.private_key.as_str()),
+            "the signing key was printed"
+        );
+        assert!(rendered.contains("<redacted>"));
+        // The public half IS shown: it is what the ad publishes, and a
+        // redaction that hides everything makes the type undiagnosable.
+        assert!(
+            rendered.contains(kp.public_key.as_str()),
+            "the public key should still be visible"
+        );
+    }
+
+    /// And the copy this registry keeps is erased when the entry goes.
+    ///
+    /// A compile-time assertion, deliberately: proving the wipe at runtime
+    /// means reading a freed allocation, while the property that actually
+    /// matters — that the field carries a type whose drop erases it — is one
+    /// the compiler can hold. A change back to a plain `String` fails here.
+    #[test]
+    fn the_ephemeral_signer_is_wiped_when_dropped() {
+        fn only_accepts_zeroizing(_: &zeroize::Zeroizing<String>) {}
+
+        let kp = generate_keypair(SignatureAlgorithm::Ed25519);
+        let id = EphemeralAdIdentity::from_b64_keypair(
+            kp.public_key,
+            kp.private_key,
+            SignatureAlgorithm::Ed25519,
+        )
+        .expect("a generated keypair is valid base64");
+
+        only_accepts_zeroizing(&id.private_key);
     }
 
     fn fixture_ed25519() -> (Vec<u8>, RendezvousAd, String) {
