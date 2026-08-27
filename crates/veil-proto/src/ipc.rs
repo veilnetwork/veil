@@ -1768,6 +1768,16 @@ pub mod ipc_send_err {
     /// its one-time reply block expired (default 300 s TTL). The app must obtain
     /// a fresh `reply_id` from a newer inbound message.
     pub const REPLY_UNKNOWN: u16 = 10;
+    /// Every rendezvous publisher slot this node can actually publish is
+    /// taken.
+    ///
+    /// The registry used to be an unbounded `Vec` while the maintenance tick
+    /// published only the first `MAX_RENDEZVOUS_AD_SLOTS` of it — so a
+    /// registration past the eighth was answered with success and then never
+    /// signed or published, and the caller had no way to learn that its
+    /// mailbox was undiscoverable. Every unique `(relay, cookie)` also stayed
+    /// in memory and was cloned in full on every tick (report17 V17-M6).
+    pub const RENDEZVOUS_SLOTS_FULL: u16 = 11;
 }
 
 // ── RegisterOnionServicePayload ──────────────────────────────────────────────

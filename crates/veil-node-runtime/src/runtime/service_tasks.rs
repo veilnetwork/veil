@@ -647,31 +647,26 @@ pub(crate) fn rendezvous_register_with(
 /// Register/refresh a rendezvous publisher entry (the maintenance tick publishes
 /// the signed ad from it). Dedups by (relay, cookie). Inlines
 /// `NodeRuntime::register_rendezvous_publisher`.
-pub(crate) fn rendezvous_register_publisher(
-    anonymity: &Arc<super::anonymity_state::AnonymityState>,
-    relay: &[u8; 32],
-    cookie: [u8; 16],
-    validity_window_secs: u64,
-    ephemeral_ad_identity: Option<veil_anonymity::rendezvous::EphemeralAdIdentity>,
-) {
-    let entry = veil_anonymity::rendezvous::RendezvousPublisherEntry {
-        rendezvous_node_id: *relay,
-        auth_cookie: cookie,
-        validity_window_secs,
-        push_envelope: Vec::new(),
-        wake_hmac_envelope: Vec::new(),
-        // Onion/ephemeral ads are reached via the blinded descriptor, not
-        // mailbox PUTs — they advertise no relay KEM key.
-        rendezvous_kem_algo: 0,
-        rendezvous_kem_pk: Vec::new(),
-        ephemeral_ad_identity,
-        rendezvous_kem_valid_until_unix: 0,
-    };
-    let mut entries = lock!(anonymity.rendezvous_publisher_entries);
-    if let Some(pos) = entries
-        .iter()
-        .position(|e| e.rendezvous_node_id == *relay && e.auth_cookie == cookie)
-    {
+/// Put `entry` into the registry, or refuse because there is no slot for it.
+///
+/// Refuse, rather than accept and drop it later. The tick publishes only the
+/// first `MAX_RENDEZVOUS_AD_SLOTS` entries, so a ninth was accepted, kept in
+/// memory, cloned on every tick, and never published — the caller was told its
+/// mailbox was live when it was undiscoverable (report17 V17-M6).
+///
+/// An entry that REPLACES one already held always fits: it takes a slot that
+/// is already accounted for. That is also the path the built-in recipient task
+/// takes on every tick, so refusing it would break a working publisher.
+///
+/// Returns whether the registry now holds this entry.
+fn insert_publisher_entry(
+    entries: &mut Vec<veil_anonymity::rendezvous::RendezvousPublisherEntry>,
+    entry: veil_anonymity::rendezvous::RendezvousPublisherEntry,
+) -> bool {
+    let slots = veil_anonymity::rendezvous::MAX_RENDEZVOUS_AD_SLOTS as usize;
+    if let Some(pos) = entries.iter().position(|e| {
+        e.rendezvous_node_id == entry.rendezvous_node_id && e.auth_cookie == entry.auth_cookie
+    }) {
         // PRESERVE a KEM key already advertised for this (relay, cookie). The app
         // registers the relay's KEM pk (mailbox-by-discovery, the deposit target)
         // and the built-in recipient task re-registers the SAME (relay, cookie)
@@ -685,11 +680,41 @@ pub(crate) fn rendezvous_register_publisher(
         if !existing.rendezvous_kem_pk.is_empty() {
             entry.rendezvous_kem_algo = existing.rendezvous_kem_algo;
             entry.rendezvous_kem_pk = existing.rendezvous_kem_pk.clone();
+            if entry.rendezvous_kem_valid_until_unix == 0 {
+                entry.rendezvous_kem_valid_until_unix = existing.rendezvous_kem_valid_until_unix;
+            }
         }
         entries[pos] = entry;
-    } else {
-        entries.push(entry);
+        return true;
     }
+    if entries.len() >= slots {
+        return false;
+    }
+    entries.push(entry);
+    true
+}
+
+pub(crate) fn rendezvous_register_publisher(
+    anonymity: &Arc<super::anonymity_state::AnonymityState>,
+    relay: &[u8; 32],
+    cookie: [u8; 16],
+    validity_window_secs: u64,
+    ephemeral_ad_identity: Option<veil_anonymity::rendezvous::EphemeralAdIdentity>,
+) -> bool {
+    let entry = veil_anonymity::rendezvous::RendezvousPublisherEntry {
+        rendezvous_node_id: *relay,
+        auth_cookie: cookie,
+        validity_window_secs,
+        push_envelope: Vec::new(),
+        wake_hmac_envelope: Vec::new(),
+        // Onion/ephemeral ads are reached via the blinded descriptor, not
+        // mailbox PUTs — they advertise no relay KEM key.
+        rendezvous_kem_algo: 0,
+        rendezvous_kem_pk: Vec::new(),
+        ephemeral_ad_identity,
+        rendezvous_kem_valid_until_unix: 0,
+    };
+    insert_publisher_entry(&mut lock!(anonymity.rendezvous_publisher_entries), entry)
 }
 
 /// Like [`rendezvous_register_publisher`] but for a PLAIN (sovereign-signed)
@@ -705,7 +730,7 @@ pub(crate) fn rendezvous_register_publisher_with_kem(
     relay_kem_algo: u8,
     relay_kem_pk: Vec<u8>,
     relay_kem_valid_until_unix: u64,
-) {
+) -> bool {
     let entry = veil_anonymity::rendezvous::RendezvousPublisherEntry {
         rendezvous_node_id: *relay,
         auth_cookie: cookie,
@@ -719,15 +744,7 @@ pub(crate) fn rendezvous_register_publisher_with_kem(
         // senders discover it by the receiver's real node_id.
         ephemeral_ad_identity: None,
     };
-    let mut entries = lock!(anonymity.rendezvous_publisher_entries);
-    if let Some(pos) = entries
-        .iter()
-        .position(|e| e.rendezvous_node_id == *relay && e.auth_cookie == cookie)
-    {
-        entries[pos] = entry;
-    } else {
-        entries.push(entry);
-    }
+    insert_publisher_entry(&mut lock!(anonymity.rendezvous_publisher_entries), entry)
 }
 
 /// Shared cold-path re-pick + re-register for the rendezvous-recipient task.
@@ -4892,7 +4909,7 @@ impl veil_types::AnonOnionSender for RuntimeAnonOnionSender {
         relay_kem_algo: u8,
         relay_kem_pk: Vec<u8>,
         relay_kem_valid_until_unix: u64,
-    ) {
+    ) -> bool {
         rendezvous_register_publisher_with_kem(
             &self.access.anonymity,
             &rendezvous_node_id,
@@ -4901,7 +4918,7 @@ impl veil_types::AnonOnionSender for RuntimeAnonOnionSender {
             relay_kem_algo,
             relay_kem_pk,
             relay_kem_valid_until_unix,
-        );
+        )
     }
 
     fn send_to_onion_service<'a>(
@@ -6104,6 +6121,98 @@ mod tests {
     }
 
     // ── deterministic rendezvous cookie + relay anchor ────────────────────
+
+    /// report17 V17-M6: an accepted registration must own a slot that is
+    /// actually published.
+    ///
+    /// The registry was an unbounded `Vec` while the maintenance tick signed
+    /// only the first `MAX_RENDEZVOUS_AD_SLOTS` of it. Every registration past
+    /// that was answered with success and never published: the caller believed
+    /// its mailbox was discoverable while nothing signed an ad for it, and the
+    /// entry stayed in memory to be cloned on every tick — one `Vec` grown by
+    /// anything that can reach the IPC socket.
+    #[test]
+    fn the_publisher_registry_is_no_larger_than_what_gets_published() {
+        use veil_anonymity::rendezvous::MAX_RENDEZVOUS_AD_SLOTS;
+        let slots = MAX_RENDEZVOUS_AD_SLOTS as usize;
+        let mut entries = Vec::new();
+
+        let entry = |n: u8| veil_anonymity::rendezvous::RendezvousPublisherEntry {
+            rendezvous_node_id: [n; 32],
+            auth_cookie: [n; 16],
+            validity_window_secs: 3600,
+            push_envelope: Vec::new(),
+            wake_hmac_envelope: Vec::new(),
+            rendezvous_kem_algo: 0,
+            rendezvous_kem_pk: Vec::new(),
+            rendezvous_kem_valid_until_unix: 0,
+            ephemeral_ad_identity: None,
+        };
+
+        for n in 0..slots as u8 {
+            assert!(
+                insert_publisher_entry(&mut entries, entry(n)),
+                "registration {n} was refused inside the slot count"
+            );
+        }
+        assert_eq!(entries.len(), slots, "premise: the slots are full");
+
+        assert!(
+            !insert_publisher_entry(&mut entries, entry(0xEE)),
+            "a registration past the publishable slots was accepted: it will \
+             never be signed, and the caller was told its mailbox is live"
+        );
+        assert_eq!(entries.len(), slots, "the refused entry was kept anyway");
+
+        // A REPLACEMENT still fits — it takes a slot already accounted for.
+        // The built-in recipient task re-registers the same (relay, cookie) on
+        // every tick, so refusing this would break a working publisher.
+        assert!(
+            insert_publisher_entry(&mut entries, entry(0)),
+            "re-registering an existing (relay, cookie) was refused, which \
+             breaks the publisher that already holds that slot"
+        );
+        assert_eq!(entries.len(), slots);
+    }
+
+    /// And a replacement keeps the KEM key the app registered.
+    ///
+    /// The built-in task re-registers KEM-LESS on its tick; a full overwrite
+    /// drops the deposit target and senders can no longer leave offline mail.
+    #[test]
+    fn a_kemless_re_registration_keeps_the_key_the_app_supplied() {
+        let mut entries = Vec::new();
+        let base =
+            |kem: Vec<u8>, until: u64| veil_anonymity::rendezvous::RendezvousPublisherEntry {
+                rendezvous_node_id: [7; 32],
+                auth_cookie: [7; 16],
+                validity_window_secs: 3600,
+                push_envelope: Vec::new(),
+                wake_hmac_envelope: Vec::new(),
+                rendezvous_kem_algo: if kem.is_empty() { 0 } else { 1 },
+                rendezvous_kem_pk: kem,
+                rendezvous_kem_valid_until_unix: until,
+                ephemeral_ad_identity: None,
+            };
+
+        assert!(insert_publisher_entry(
+            &mut entries,
+            base(vec![9; 32], 1_700_000_000)
+        ));
+        assert!(insert_publisher_entry(&mut entries, base(Vec::new(), 0)));
+
+        assert_eq!(entries.len(), 1);
+        assert_eq!(
+            entries[0].rendezvous_kem_pk,
+            vec![9; 32],
+            "the KEM was dropped"
+        );
+        assert_eq!(
+            entries[0].rendezvous_kem_valid_until_unix, 1_700_000_000,
+            "the KEM survived but its expiry did not, so the ad stops being \
+             clipped to it (V17-M1)"
+        );
+    }
 
     #[test]
     fn rendezvous_cookie_is_deterministic_xor_fold() {

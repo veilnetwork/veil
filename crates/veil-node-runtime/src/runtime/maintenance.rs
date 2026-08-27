@@ -928,7 +928,19 @@ impl NodeRuntime {
         if veil_session::rt_trace::publish_pause_enabled() {
             return 0;
         }
-        let snapshot = lock!(entries).clone();
+        // Only what can actually be published is copied.
+        //
+        // The whole registry was cloned on every tick — every entry with its
+        // KEM key, its push envelope and its ephemeral signing key — and then
+        // the first `MAX_RENDEZVOUS_AD_SLOTS` of it were used. The registry is
+        // bounded now, so this is a small copy either way; taking the bound
+        // here keeps it small no matter what a future caller does to that Vec
+        // (report17 V17-M6).
+        let snapshot: Vec<_> = lock!(entries)
+            .iter()
+            .take(MAX_RENDEZVOUS_AD_SLOTS as usize)
+            .cloned()
+            .collect();
         if snapshot.is_empty() {
             return 0;
         }

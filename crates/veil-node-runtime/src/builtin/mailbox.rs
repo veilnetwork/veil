@@ -1884,7 +1884,7 @@ mod tests {
             _: u8,
             _: Vec<u8>,
             _: u64,
-        ) {
+        ) -> bool {
             unimplemented!()
         }
         fn send_to_onion_service<'a>(
