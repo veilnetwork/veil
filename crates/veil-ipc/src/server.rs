@@ -2756,6 +2756,7 @@ async fn handle_ipc_client(
                                         p.validity_window_secs,
                                         p.relay_kem_algo,
                                         p.relay_kem_pk,
+                                        p.relay_kem_valid_until_unix,
                                     );
                                     0
                                 }

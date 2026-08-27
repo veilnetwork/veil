@@ -665,6 +665,7 @@ pub(crate) fn rendezvous_register_publisher(
         rendezvous_kem_algo: 0,
         rendezvous_kem_pk: Vec::new(),
         ephemeral_ad_identity,
+        rendezvous_kem_valid_until_unix: 0,
     };
     let mut entries = lock!(anonymity.rendezvous_publisher_entries);
     if let Some(pos) = entries
@@ -695,6 +696,7 @@ pub(crate) fn rendezvous_register_publisher(
 /// publisher that ALSO advertises the relay's KEM key — so a sender resolving
 /// the v5 ad can anonymously deposit a mailbox PUT at the relay. Dedups by
 /// (relay, cookie). The app-IPC entry point for mailbox-by-discovery.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn rendezvous_register_publisher_with_kem(
     anonymity: &Arc<super::anonymity_state::AnonymityState>,
     relay: &[u8; 32],
@@ -702,6 +704,7 @@ pub(crate) fn rendezvous_register_publisher_with_kem(
     validity_window_secs: u64,
     relay_kem_algo: u8,
     relay_kem_pk: Vec<u8>,
+    relay_kem_valid_until_unix: u64,
 ) {
     let entry = veil_anonymity::rendezvous::RendezvousPublisherEntry {
         rendezvous_node_id: *relay,
@@ -711,6 +714,7 @@ pub(crate) fn rendezvous_register_publisher_with_kem(
         wake_hmac_envelope: Vec::new(),
         rendezvous_kem_algo: relay_kem_algo,
         rendezvous_kem_pk: relay_kem_pk,
+        rendezvous_kem_valid_until_unix: relay_kem_valid_until_unix,
         // Plain rendezvous receiver — signed under the sovereign identity so
         // senders discover it by the receiver's real node_id.
         ephemeral_ad_identity: None,
@@ -4887,6 +4891,7 @@ impl veil_types::AnonOnionSender for RuntimeAnonOnionSender {
         validity_window_secs: u64,
         relay_kem_algo: u8,
         relay_kem_pk: Vec<u8>,
+        relay_kem_valid_until_unix: u64,
     ) {
         rendezvous_register_publisher_with_kem(
             &self.access.anonymity,
@@ -4895,6 +4900,7 @@ impl veil_types::AnonOnionSender for RuntimeAnonOnionSender {
             validity_window_secs,
             relay_kem_algo,
             relay_kem_pk,
+            relay_kem_valid_until_unix,
         );
     }
 
@@ -5687,7 +5693,7 @@ mod tests {
         let cookie = [0xCD; 16];
         let kem = vec![0x42u8; 32];
 
-        rendezvous_register_publisher_with_kem(&state, &relay, cookie, 3600, 1, kem.clone());
+        rendezvous_register_publisher_with_kem(&state, &relay, cookie, 3600, 1, kem.clone(), 0);
         rendezvous_register_publisher(&state, &relay, cookie, 3600, None);
 
         let entries = lock!(state.rendezvous_publisher_entries);
@@ -5716,7 +5722,7 @@ mod tests {
         let kem = vec![0x55u8; 32];
 
         rendezvous_register_publisher(&state, &relay, cookie, 3600, None);
-        rendezvous_register_publisher_with_kem(&state, &relay, cookie, 3600, 1, kem.clone());
+        rendezvous_register_publisher_with_kem(&state, &relay, cookie, 3600, 1, kem.clone(), 0);
 
         let entries = lock!(state.rendezvous_publisher_entries);
         assert_eq!(entries.len(), 1);

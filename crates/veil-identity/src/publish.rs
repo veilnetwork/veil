@@ -352,6 +352,23 @@ pub fn sign_relay_key(
             n: doc.identity_keys.len(),
         });
     }
+    // Clipped to the delegation, exactly as `sign_mlkem_cert` is: a record
+    // that outlives the subkey signing it is a claim this node's own peers
+    // will not honour (report17 V17-M1).
+    let key = &doc.identity_keys[idx];
+    let valid_from_unix = valid_from_unix
+        .max(key.valid_from_unix)
+        .max(doc.issued_at_unix);
+    let valid_until_unix = valid_until_unix
+        .min(key.valid_until_unix)
+        .min(doc.valid_until_unix);
+    if valid_until_unix < valid_from_unix {
+        return Err(PublishError::DelegationWindowEmpty {
+            from: valid_from_unix,
+            parent_until: valid_until_unix,
+        });
+    }
+
     let mut record = RelayKeyRecord {
         node_id,
         relay_kem_algo: RELAY_KEM_ALGO_X25519,

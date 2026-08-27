@@ -437,6 +437,10 @@ pub(crate) async fn run_writer_task<W: tokio::io::AsyncWrite + Unpin>(
 /// Created by [`VeilClient::connect`]. The underlying Unix-domain socket
 /// is split into a shared write half (used by all [`AppHandle`]s) and a read
 /// half that is drained by an internal dispatcher task.
+/// One in-flight `LookupRelayKey`: the request it answers, and where to put
+/// the verified key together with the moment it stops being the relay's.
+pub type PendingRelayKey = (u32, tokio::sync::oneshot::Sender<Option<([u8; 32], u64)>>);
+
 pub struct VeilClient {
     /// Shared write half — cloned by each `AppHandle`.
     pub(crate) writer: SharedWriter,
@@ -592,8 +596,7 @@ pub(crate) struct DispatchTable {
         tokio::sync::oneshot::Sender<Vec<RendezvousReplicaInfo>>,
     )>,
     /// Pending oneshot replies for `LookupRelayKey` (relay X25519 by node_id).
-    pub pending_lookup_relay_key:
-        std::collections::VecDeque<(u32, tokio::sync::oneshot::Sender<Option<[u8; 32]>>)>,
+    pub pending_lookup_relay_key: std::collections::VecDeque<PendingRelayKey>,
     /// push event sink. When set by [`VeilClient::events`]
     /// every incoming `LocalAppMsg::Event` is decoded and forwarded
     /// here. Single-subscriber by design — the Flutter UI fans the
@@ -1166,6 +1169,12 @@ impl VeilClient {
     /// PUT at the relay. Replaces any existing entry with the same
     /// `(rendezvous_node_id, auth_cookie)`. Pass an empty `relay_kem_pk` to
     /// advertise no key. `Ok(())` once the daemon records the entry.
+    ///
+    /// `relay_kem_valid_until_unix` is what [`Self::lookup_relay_x25519`]
+    /// returned beside the key: the daemon clips the ad's own validity to it,
+    /// so a key resolved shortly before its expiry is not advertised for the
+    /// month afterwards (report17 V17-M1). `0` means "not known", and the ad
+    /// then runs on its own window alone.
     pub async fn register_rendezvous_publisher(
         &self,
         rendezvous_node_id: [u8; 32],
@@ -1173,6 +1182,7 @@ impl VeilClient {
         validity_window_secs: u64,
         relay_kem_algo: u8,
         relay_kem_pk: Vec<u8>,
+        relay_kem_valid_until_unix: u64,
     ) -> Result<(), ClientError> {
         let (tx, rx) = tokio::sync::oneshot::channel();
         let request_id = self.writer.alloc_request_id();
@@ -1193,6 +1203,7 @@ impl VeilClient {
             validity_window_secs,
             relay_kem_algo,
             relay_kem_pk,
+            relay_kem_valid_until_unix,
         };
         self.writer
             .write_request_frame(
@@ -1732,13 +1743,19 @@ impl VeilClient {
     ///
     /// The daemon fetches + verifies the node's signed `RelayKeyRecord` against
     /// its `IdentityDocument`. Returns `Ok(Some(pk))` with the verified 32-byte
-    /// key, or `Ok(None)` if unresolved (DHT miss / no record / verification
-    /// failed — indistinguishable by design). Lets a receiver advertise an
-    /// always-on third-party relay as its mailbox host knowing only its node_id.
+    /// key AND the moment it stops being that relay's, or `Ok(None)` if
+    /// unresolved (DHT miss / no record / verification failed —
+    /// indistinguishable by design). Lets a receiver advertise an always-on
+    /// third-party relay as its mailbox host knowing only its node_id.
+    ///
+    /// The stamp comes back because the ad built from this key may be valid
+    /// for thirty days while the key is not: pass it to
+    /// [`Self::register_rendezvous_publisher`] so the ad is clipped to it
+    /// (report17 V17-M1). A daemon that predates the stamp reports `0`.
     pub async fn lookup_relay_x25519(
         &self,
         node_id: [u8; 32],
-    ) -> Result<Option<[u8; 32]>, ClientError> {
+    ) -> Result<Option<([u8; 32], u64)>, ClientError> {
         let (tx, rx) = tokio::sync::oneshot::channel();
         let request_id = self.writer.alloc_request_id();
         {
@@ -3118,7 +3135,7 @@ async fn reader_task(
                     let mut d = dispatch.lock().await;
                     if let Some(tx) = take_pending(&mut d.pending_lookup_relay_key, hdr.request_id)
                     {
-                        let _ = tx.send(p.relay_x25519);
+                        let _ = tx.send(p.relay_x25519.map(|pk| (pk, p.valid_until_unix)));
                     }
                 }
             }

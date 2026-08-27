@@ -1883,6 +1883,7 @@ mod tests {
             _: u64,
             _: u8,
             _: Vec<u8>,
+            _: u64,
         ) {
             unimplemented!()
         }

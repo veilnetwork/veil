@@ -4905,9 +4905,83 @@ pub unsafe extern "C" fn veil_lookup_relay_x25519(
         client.lookup_relay_x25519(node_id).await
     });
     match res {
-        Ok(Some(pk)) => {
+        Ok(Some((pk, _valid_until))) => {
             unsafe {
                 ptr::copy_nonoverlapping(pk.as_ptr(), out_pubkey_32, 32);
+            }
+            VEIL_OK
+        }
+        Ok(None) => VEIL_RELAY_X25519_UNAVAILABLE,
+        Err(e) => {
+            unsafe {
+                write_err(err_out, format!("lookup_relay_x25519 failed: {e}"));
+            }
+            VEIL_ERR
+        }
+    }
+}
+
+/// [`veil_lookup_relay_x25519`], plus the moment that key stops being the
+/// relay's.
+///
+/// A separate export rather than a wider one: the shorter form is already
+/// compiled into shipped callers, and widening it would be a flag day on the
+/// wrong side of the boundary.
+///
+/// The stamp matters because the ad built from this key can be valid for
+/// thirty days while the key is not. Pass it to
+/// [`veil_register_rendezvous_publisher_with_expiry`] and the daemon clips the
+/// ad to it, so a key resolved shortly before an expiry or a revocation is not
+/// advertised for the month afterwards — which either sends deposits to
+/// whoever holds the old private key, or to nobody at all (report17 V17-M1).
+///
+/// `0` in `out_valid_until_unix` means the daemon did not say — an older one,
+/// or a record with no window the verifier could compute.
+///
+/// # Safety
+/// `handle` must be a live `VeilHandle*` from `veil_connect`.
+/// `node_id_32` must point to 32 readable bytes; `out_pubkey_32` to 32
+/// writable; `out_valid_until_unix` to 8 writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn veil_lookup_relay_x25519_with_expiry(
+    handle: *mut VeilHandle,
+    node_id_32: *const u8,
+    out_pubkey_32: *mut u8,
+    out_valid_until_unix: *mut u64,
+    err_out: *mut *mut c_char,
+) -> c_int {
+    if let Err(rc) = unsafe { guard::ffi_prelude(err_out, "veil_lookup_relay_x25519_with_expiry") }
+    {
+        return rc;
+    }
+    null_check!(err_out,
+        "handle" => handle,
+        "node_id_32" => node_id_32,
+        "out_pubkey_32" => out_pubkey_32,
+        "out_valid_until_unix" => out_valid_until_unix,
+    );
+    get_or_return!(
+        handle_live,
+        handle_table(),
+        handle,
+        err_out,
+        VEIL_ERR_INVALID_ARG,
+        "VeilHandle"
+    );
+    let mut node_id = [0u8; 32];
+    unsafe {
+        ptr::copy_nonoverlapping(node_id_32, node_id.as_mut_ptr(), 32);
+    }
+    let bundle = Arc::clone(&handle_live.bundle);
+    let res = bundle.runtime.block_on(async {
+        let client = bundle.client.lock().await;
+        client.lookup_relay_x25519(node_id).await
+    });
+    match res {
+        Ok(Some((pk, valid_until))) => {
+            unsafe {
+                ptr::copy_nonoverlapping(pk.as_ptr(), out_pubkey_32, 32);
+                *out_valid_until_unix = valid_until;
             }
             VEIL_OK
         }
@@ -5276,6 +5350,102 @@ pub unsafe extern "C" fn veil_register_rendezvous_publisher(
                 validity_window_secs,
                 relay_kem_algo,
                 kem_pk,
+                // Not known through this export — the ad runs on its own
+                // window, as it always did. See the `_with_expiry` twin.
+                0,
+            )
+            .await
+    });
+    match res {
+        Ok(()) => VEIL_OK,
+        Err(e) => {
+            unsafe {
+                write_err(
+                    err_out,
+                    format!("register_rendezvous_publisher failed: {e}"),
+                );
+            }
+            VEIL_ERR
+        }
+    }
+}
+
+/// [`veil_register_rendezvous_publisher`], plus the relay key's expiry.
+///
+/// The daemon clips the published ad's `valid_until` to
+/// `relay_kem_valid_until_unix`, so an ad cannot go on advertising a relay key
+/// past the point that key stopped being the relay's — thirty days of deposits
+/// to a key nobody holds, or to whoever holds the old private half (report17
+/// V17-M1). Take the value from
+/// [`veil_lookup_relay_x25519_with_expiry`]; `0` means "not known" and leaves
+/// the ad on its own window.
+///
+/// A separate export rather than a wider one, for the same reason as its
+/// lookup twin: the shorter form is already compiled into shipped callers.
+///
+/// # Safety
+/// As [`veil_register_rendezvous_publisher`].
+#[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn veil_register_rendezvous_publisher_with_expiry(
+    handle: *mut VeilHandle,
+    rendezvous_node_id: *const u8,
+    auth_cookie: *const u8,
+    validity_window_secs: u64,
+    relay_kem_algo: u8,
+    relay_kem_pk: *const u8,
+    kem_len: size_t,
+    relay_kem_valid_until_unix: u64,
+    err_out: *mut *mut c_char,
+) -> c_int {
+    if let Err(rc) =
+        unsafe { guard::ffi_prelude(err_out, "veil_register_rendezvous_publisher_with_expiry") }
+    {
+        return rc;
+    }
+    null_check!(err_out,
+        "handle" => handle,
+        "rendezvous_node_id" => rendezvous_node_id,
+        "auth_cookie" => auth_cookie,
+    );
+    if relay_kem_pk.is_null() && kem_len > 0 {
+        unsafe {
+            write_err(err_out, "relay_kem_pk is NULL but kem_len > 0");
+        }
+        return VEIL_ERR_INVALID_ARG;
+    }
+    get_or_return!(
+        handle_live,
+        handle_table(),
+        handle,
+        err_out,
+        VEIL_ERR_INVALID_ARG,
+        "VeilHandle"
+    );
+    let mut node_id = [0u8; 32];
+    let mut cookie = [0u8; 16];
+    // SAFETY: both pointers NULL-checked; caller guarantees the documented byte
+    // counts.
+    unsafe {
+        ptr::copy_nonoverlapping(rendezvous_node_id, node_id.as_mut_ptr(), 32);
+        ptr::copy_nonoverlapping(auth_cookie, cookie.as_mut_ptr(), 16);
+    }
+    let kem_pk: Vec<u8> = if kem_len == 0 {
+        Vec::new()
+    } else {
+        unsafe { std::slice::from_raw_parts(relay_kem_pk, kem_len) }.to_vec()
+    };
+    let bundle = Arc::clone(&handle_live.bundle);
+    let res = bundle.runtime.block_on(async {
+        let client = bundle.client.lock().await;
+        client
+            .register_rendezvous_publisher(
+                node_id,
+                cookie,
+                validity_window_secs,
+                relay_kem_algo,
+                kem_pk,
+                relay_kem_valid_until_unix,
             )
             .await
     });

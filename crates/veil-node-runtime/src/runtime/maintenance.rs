@@ -40,6 +40,29 @@ pub struct PrimaryEvictionCounts {
     pub dht_evicted: usize,
 }
 
+/// How long a rendezvous ad may claim to be good for.
+///
+/// The ad's own window is what the receiver asked for — up to thirty days.
+/// The relay key it advertises has a window of its own, and it is usually much
+/// shorter: it is published under a device delegation the master endorses for
+/// about a week. Advertising the key past that point sends every deposit made
+/// from this ad either to whoever holds the old private half or to nobody at
+/// all, for the rest of the month (report17 V17-M1).
+///
+/// `relay_key_until == 0` is "nobody said" — an app that predates the stamp —
+/// and leaves the ad on its own window, which is what it always did.
+///
+/// `None` when there is no future left to publish: the relay key is already
+/// past its end, and an ad claiming otherwise is worse than no ad.
+fn ad_valid_until(valid_from: u64, ad_until: u64, relay_key_until: u64) -> Option<u64> {
+    let until = if relay_key_until == 0 {
+        ad_until
+    } else {
+        ad_until.min(relay_key_until)
+    };
+    (until > valid_from).then_some(until)
+}
+
 impl NodeRuntime {
     pub fn spawn_maintenance_tick(
         &mut self,
@@ -1023,6 +1046,21 @@ impl NodeRuntime {
             }
             let valid_from = now_unix;
             let valid_until = now_unix.saturating_add(entry.validity_window_secs);
+            let Some(valid_until) = ad_valid_until(
+                valid_from,
+                valid_until,
+                entry.rendezvous_kem_valid_until_unix,
+            ) else {
+                logger.warn(
+                    "anonymity.rendezvous_ad.relay_key_expired",
+                    format!(
+                        "slot={idx} relay key valid_until={} is not in the future; \
+                         not republishing this ad",
+                        entry.rendezvous_kem_valid_until_unix,
+                    ),
+                );
+                continue;
+            };
             // mint a capability token and stash
             // it in the ad alongside the existing push_envelope. Senders
             // that read the ad via DHT include the token in their PUTs;
@@ -1572,6 +1610,7 @@ mod tests {
             rendezvous_kem_algo: 0,
             rendezvous_kem_pk: Vec::new(),
             ephemeral_ad_identity: None,
+            rendezvous_kem_valid_until_unix: 0,
         }]));
 
         let count =
@@ -1618,6 +1657,7 @@ mod tests {
             rendezvous_kem_algo: 0,
             rendezvous_kem_pk: Vec::new(),
             ephemeral_ad_identity: None,
+            rendezvous_kem_valid_until_unix: 0,
         }]));
 
         let n =
@@ -1683,6 +1723,7 @@ mod tests {
             rendezvous_kem_algo: 0,
             rendezvous_kem_pk: Vec::new(),
             ephemeral_ad_identity: None,
+            rendezvous_kem_valid_until_unix: 0,
         }]));
 
         // First tick — publishes.
@@ -1729,6 +1770,7 @@ mod tests {
             rendezvous_kem_algo: 0,
             rendezvous_kem_pk: Vec::new(),
             ephemeral_ad_identity: None,
+            rendezvous_kem_valid_until_unix: 0,
         }]));
 
         let first =
@@ -1785,6 +1827,7 @@ mod tests {
             rendezvous_kem_algo: 0,
             rendezvous_kem_pk: Vec::new(),
             ephemeral_ad_identity: Some(eph),
+            rendezvous_kem_valid_until_unix: 0,
         }]));
 
         let n =
@@ -1907,5 +1950,69 @@ mod tests {
             refreshed.min_responder_prefix_bits, expected
         );
         assert_eq!(expected, 2, "sanity: log2(64)-4 = 2");
+    }
+}
+
+#[cfg(test)]
+mod ad_window_tests {
+    use super::ad_valid_until;
+
+    /// The ad is clipped to the relay key, never the other way round.
+    ///
+    /// Thirty days of ad over a key that has a week left is thirty days of
+    /// deposits going somewhere the receiver cannot read (report17 V17-M1).
+    #[test]
+    fn the_ad_cannot_outlive_the_relay_key_it_advertises() {
+        let now = 1_700_000_000;
+        let month = now + 30 * 86_400;
+        let week = now + 7 * 86_400;
+        assert_eq!(ad_valid_until(now, month, week), Some(week));
+    }
+
+    /// And the ad's own window still wins when it is the shorter one — the
+    /// clip is a minimum, not a replacement.
+    #[test]
+    fn a_shorter_ad_is_left_alone() {
+        let now = 1_700_000_000;
+        let day = now + 86_400;
+        let month = now + 30 * 86_400;
+        assert_eq!(ad_valid_until(now, day, month), Some(day));
+    }
+
+    /// Nobody said: an app that predates the stamp. The ad runs on its own
+    /// window, exactly as it did before — this is what keeps the change from
+    /// silently shortening every existing publisher.
+    #[test]
+    fn an_unknown_relay_key_window_changes_nothing() {
+        let now = 1_700_000_000;
+        let month = now + 30 * 86_400;
+        assert_eq!(ad_valid_until(now, month, 0), Some(month));
+    }
+
+    /// A key that is already over publishes NO ad. An ad claiming a window
+    /// that ends before it starts is worse than none: senders would read it,
+    /// deposit, and be unreachable.
+    #[test]
+    fn an_expired_relay_key_publishes_nothing() {
+        let now = 1_700_000_000;
+        let month = now + 30 * 86_400;
+        assert_eq!(ad_valid_until(now, month, now), None);
+        assert_eq!(ad_valid_until(now, month, now - 1), None);
+    }
+
+    /// The tick has to ASK. A helper nothing calls is a decision that is not
+    /// being made, and this file is 1400 lines long.
+    #[test]
+    fn the_publish_tick_uses_it() {
+        let source = include_str!("maintenance.rs");
+        let at = source
+            .find("fn tick_publish_rendezvous_ads")
+            .expect("the tick moved");
+        let body = &source[at..];
+        let end = body.find("\n    }\n").expect("no end of function");
+        assert!(
+            body[..end].contains("ad_valid_until("),
+            "the tick publishes an ad window nothing clipped"
+        );
     }
 }

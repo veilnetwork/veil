@@ -940,6 +940,16 @@ pub struct RendezvousPublisherEntry {
     /// via the blinded descriptor, not mailbox PUTs).
     pub rendezvous_kem_algo: u8,
     pub rendezvous_kem_pk: Vec<u8>,
+    /// When the relay key above stops being that relay's — the end of the
+    /// window its verifier computed. `0` when nobody said.
+    ///
+    /// The ad's own validity is clipped to it. An ad may run for thirty days
+    /// and the relay key is re-published on a much shorter cycle, so a key
+    /// resolved shortly before an expiry or a revocation used to be advertised
+    /// for the rest of the month: senders keep depositing to a key the relay
+    /// no longer holds, which either reaches whoever holds the old private key
+    /// or reaches nobody at all (report17 V17-M1).
+    pub rendezvous_kem_valid_until_unix: u64,
     /// Per-service EPHEMERAL signing identity (diff-audit Δ2-c). `Some` for a
     /// LOCATION-ANONYMOUS (onion) service: the ad is signed + DHT-keyed under
     /// this pseudo identity instead of the real sovereign node_id, so it no
@@ -3160,6 +3170,7 @@ mod tests {
             rendezvous_kem_algo: 0,
             rendezvous_kem_pk: Vec::new(),
             ephemeral_ad_identity: None,
+            rendezvous_kem_valid_until_unix: 0,
         };
         let e2 = e1.clone();
         assert_eq!(e1, e2);
