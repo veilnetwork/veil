@@ -36,6 +36,30 @@ mod tests {
     ///
     /// Returns whatever it has at the deadline so the CALLER's assertion is
     /// still the one that fails, with its own message.
+    /// Wait for `runtime` to hold the value at `key`, or give up at the limit.
+    ///
+    /// Three onion-service scenarios slept a fixed 250 ms after
+    /// `register_onion_service` and then asserted the descriptor was stored.
+    /// A fixed sleep is a guess about the machine: on a loaded host the
+    /// publish had not landed, and the scenario reported the load as a
+    /// product failure — red under `cargo test --workspace` at full
+    /// parallelism, green at `--test-threads=4` and green in isolation, which
+    /// is the signature of a test measuring the host.
+    ///
+    /// The same shape `republish_until` was written for, without the
+    /// re-trigger: this publish is local to the node that made it, so waiting
+    /// is all that is owed. Returns nothing — the CALLER's `expect` is the one
+    /// that should fail, with its own message.
+    async fn stored_locally_until(runtime: &veil_node_runtime::NodeRuntime, key: &[u8; 32]) {
+        let deadline = tokio::time::Instant::now() + SIM_WAIT_LIMIT;
+        while runtime.dht_get_local(key).is_none() {
+            if tokio::time::Instant::now() >= deadline {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
     /// Wait for `check` to hold on some node, RE-TRIGGERING the publish while
     /// it waits.
     ///
@@ -6779,8 +6803,29 @@ mod tests {
             .debug_force_publish_rendezvous_ads()
             .await;
         assert_eq!(n_ads, 1, "service publishes exactly one ad");
-        // Let the CircuitBuild (over direct sessions) install at N1 + N3.
-        tokio::time::sleep(Duration::from_millis(250)).await;
+
+        // Wait for the CircuitBuild (over direct sessions) to install at
+        // N1 + N3, rather than sleeping a fixed 250 ms and hoping. The sleep
+        // was a guess about the host: on a loaded machine the build had not
+        // arrived, and the scenario reported the load as a location-hiding
+        // failure.
+        {
+            let deadline = tokio::time::Instant::now() + SIM_WAIT_LIMIT;
+            loop {
+                let installed = net
+                    .node(3)
+                    .runtime
+                    .access()
+                    .dispatcher
+                    .circuit_rendezvous
+                    .as_ref()
+                    .is_some_and(|c| c.lookup(&cookie).is_some());
+                if installed || tokio::time::Instant::now() >= deadline {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }
 
         // R bound the cookie to a CIRCUIT (not a session): the presence-of-circuit
         // + absence-of-session is the location-hiding property.
@@ -7207,7 +7252,6 @@ mod tests {
             .runtime
             .register_onion_service(2)
             .expect("register_onion_service");
-        tokio::time::sleep(Duration::from_millis(250)).await;
 
         // The client knows the service's Ed25519 IDENTITY (shared out-of-band,
         // like a .onion address). It derives the descriptor's DHT key + decrypts.
@@ -7232,6 +7276,10 @@ mod tests {
         assert_ne!(dht_key, net.node(4).node_id(), "descriptor key ≠ node_id");
 
         // Fetch (mirror) the descriptor + open it.
+        // The publish is local to node 4, so waiting is all that is owed —
+        // and a fixed sleep here was a guess about the host, not about the
+        // product.
+        stored_locally_until(&net.node(4).runtime, &dht_key).await;
         let desc = net
             .node(4)
             .runtime
@@ -7371,7 +7419,6 @@ mod tests {
             .runtime
             .register_onion_service(2)
             .expect("register_onion_service");
-        tokio::time::sleep(Duration::from_millis(250)).await;
 
         // The client addresses the service by its Ed25519 IDENTITY (the .onion-
         // like handle), never by node_id. Mirror the descriptor into the client's
@@ -7393,6 +7440,10 @@ mod tests {
         let period = veil_anonymity::blinded_descriptor::current_period(now);
         let dht_key =
             veil_anonymity::blinded_descriptor::descriptor_dht_key(&identity_vk, period).unwrap();
+        // The publish is local to node 4, so waiting is all that is owed —
+        // and a fixed sleep here was a guess about the host, not about the
+        // product.
+        stored_locally_until(&net.node(4).runtime, &dht_key).await;
         let desc = net
             .node(4)
             .runtime
@@ -7478,7 +7529,6 @@ mod tests {
             .runtime
             .register_onion_service(2)
             .expect("register_onion_service");
-        tokio::time::sleep(Duration::from_millis(250)).await;
 
         let identity_vk = *net
             .node(4)
@@ -7496,6 +7546,10 @@ mod tests {
         let period = veil_anonymity::blinded_descriptor::current_period(now);
         let dht_key =
             veil_anonymity::blinded_descriptor::descriptor_dht_key(&identity_vk, period).unwrap();
+        // The publish is local to node 4, so waiting is all that is owed —
+        // and a fixed sleep here was a guess about the host, not about the
+        // product.
+        stored_locally_until(&net.node(4).runtime, &dht_key).await;
         let desc = net
             .node(4)
             .runtime
