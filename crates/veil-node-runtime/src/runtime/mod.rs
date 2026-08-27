@@ -9082,7 +9082,7 @@ impl NodeServices {
             }
         };
         match confirmed {
-            Some(flag) => self.publish_after_circuit_confirmed(flag, publish),
+            Some(flag) => self.publish_after_circuit_confirmed(cookie, flag, publish),
             // Entry already evicted (slot-cap race) — nothing to wait on;
             // publish now, matching the old behavior.
             None => publish(self),
@@ -9170,13 +9170,46 @@ impl NodeServices {
 
     fn publish_after_circuit_confirmed(
         &self,
+        cookie: [u8; 16],
         confirmed: std::sync::Arc<std::sync::atomic::AtomicBool>,
         publish: impl FnOnce(&NodeServices) + Send + 'static,
     ) {
         const CONFIRM_TIMEOUT_MS: u64 = 3_000;
         const POLL_MS: u64 = 20;
+        /// The most publishes that may be waiting on an ACK at once.
+        ///
+        /// Generous against the honest case — every service may be registering
+        /// at the same moment, twice over — and finite, which the old code was
+        /// not: `withdraw` frees the service slot at once and leaves the
+        /// waiter behind, so register-then-withdraw in a loop grew threads
+        /// without any cap applying (report17 V17-M7).
+        const MAX_PENDING: usize = 16;
+
         let this = self.clone();
+        let pending = std::sync::Arc::clone(&self.anonymity.pending_confirm_publishes);
+        if !claim_confirm_waiter(&pending, MAX_PENDING) {
+            self.logger.warn(
+                "anonymity.publish.confirm_waiters_full",
+                format!(
+                    "{MAX_PENDING} publishes are already waiting for an ACK — \
+                     publishing this one immediately"
+                ),
+            );
+            // Immediately rather than never: the barrier is an optimisation
+            // against a narrow race, and dropping the publish would cost this
+            // service its discoverability outright.
+            publish(self);
+            return;
+        }
         std::thread::spawn(move || {
+            // Decremented on EVERY exit path below.
+            struct Waiting(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+            impl Drop for Waiting {
+                fn drop(&mut self) {
+                    self.0.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+                }
+            }
+            let _waiting = Waiting(pending);
             let mut waited_ms = 0u64;
             while !confirmed.load(std::sync::atomic::Ordering::Relaxed)
                 && waited_ms < CONFIRM_TIMEOUT_MS
@@ -9197,6 +9230,25 @@ impl NodeServices {
                          anyway (ad may briefly black-hole until the rebuild tick)"
                     ),
                 );
+            }
+            // The service may have been WITHDRAWN while this waited.
+            //
+            // `withdraw_ephemeral_onion_service` drops the entry and its
+            // publisher row and returns; this thread carried neither a
+            // cancellation nor any notion of which registration it belonged
+            // to, so it went on to re-add the publisher and put a fresh
+            // blinded descriptor into the DHT — new ciphertext for a service
+            // the owner had revoked, discoverable until it ages out, with the
+            // ephemeral signing key kept alive beside it (report17 V17-M7).
+            //
+            // The cookie identifies the registration: a later one gets its own.
+            if !service_with_cookie_present(&lock!(this.anonymity.onion_services), cookie) {
+                this.logger.info(
+                    "anonymity.publish.withdrawn_before_publish",
+                    "the service was withdrawn while its publish waited for the \
+                     circuit ACK — not publishing",
+                );
+                return;
             }
             publish(&this);
         });
@@ -9655,16 +9707,23 @@ impl NodeServices {
                     // cookie the relay has never seen — publishing it before
                     // the rebuild's CircuitBuilt ACK reopens the race there.
                     Ok(new_confirmed) => {
-                        self.publish_after_circuit_confirmed(new_confirmed, move |this| {
-                            if let Some(seed) = publish_seed.as_deref() {
-                                this.publish_blinded_descriptor_for(
-                                    seed,
-                                    rendezvous,
-                                    cookie_now,
-                                    publish_slot,
-                                );
-                            }
-                        });
+                        // `cookie_now` is the registration this refresh is
+                        // for: a service withdrawn while the rebuild's ACK is
+                        // outstanding must not be republished.
+                        self.publish_after_circuit_confirmed(
+                            cookie_now,
+                            new_confirmed,
+                            move |this: &NodeServices| {
+                                if let Some(seed) = publish_seed.as_deref() {
+                                    this.publish_blinded_descriptor_for(
+                                        seed,
+                                        rendezvous,
+                                        cookie_now,
+                                        publish_slot,
+                                    );
+                                }
+                            },
+                        );
                     }
                     // Build failed: publish immediately, matching the old
                     // "decoupled from the rebuild result" behavior —
@@ -11544,5 +11603,147 @@ impl NodeServices {
             }
         }
         Ok(())
+    }
+}
+
+/// Is a service with this cookie still registered?
+///
+/// The question a deferred publish has to ask before it runs: `withdraw`
+/// removes the entry and returns, while the publish waiting on the circuit ACK
+/// carried neither a cancellation nor any notion of which registration it
+/// belonged to — so it re-added the publisher and put fresh ciphertext in the
+/// DHT for a service the owner had revoked (report17 V17-M7). The cookie
+/// identifies the registration; a later one gets its own.
+fn service_with_cookie_present(
+    services: &[crate::runtime::anonymity_state::OnionServiceEntry],
+    cookie: [u8; 16],
+) -> bool {
+    services.iter().any(|e| e.cookie == cookie)
+}
+
+/// Take one of `max` waiter slots, or refuse.
+///
+/// Each waiter is a detached thread sleeping up to three seconds. `withdraw`
+/// frees the SERVICE slot immediately and leaves the waiter behind, so the cap
+/// on services bounded nothing: register-then-withdraw in a loop grew threads
+/// without limit (report17 V17-M7).
+fn claim_confirm_waiter(pending: &std::sync::atomic::AtomicUsize, max: usize) -> bool {
+    // `fetch_add` then give back on refusal: two callers racing at the
+    // boundary both see the raised value, so neither is admitted over the cap.
+    if pending.fetch_add(1, std::sync::atomic::Ordering::AcqRel) >= max {
+        pending.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+        return false;
+    }
+    true
+}
+
+#[cfg(test)]
+mod deferred_publish_tests {
+    use super::{claim_confirm_waiter, service_with_cookie_present};
+    use crate::runtime::anonymity_state::OnionServiceEntry;
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+
+    fn entry(cookie: [u8; 16]) -> OnionServiceEntry {
+        OnionServiceEntry {
+            relay_path: vec![[0x11; 32]],
+            cookie,
+            built_unix: 0,
+            reg_keypair: veil_crypto::GeneratedKeyPair {
+                public_key: String::new(),
+                private_key: String::new(),
+                algo: veil_types::SignatureAlgorithm::Ed25519,
+            },
+            confirmed: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            registration_epoch: std::sync::Arc::new(AtomicU64::new(0)),
+            descriptor_identity_seed: None,
+            descriptor_provider_slot: None,
+            ephemeral: true,
+        }
+    }
+
+    /// A publish waiting on a circuit ACK must not run for a service that has
+    /// been withdrawn in the meantime.
+    ///
+    /// `withdraw` drops the entry and returns; the waiter used to carry no
+    /// notion of which registration it belonged to, so it re-added the
+    /// publisher and put fresh ciphertext in the DHT for a service the owner
+    /// had revoked (report17 V17-M7).
+    #[test]
+    fn a_withdrawn_service_is_not_republished_by_a_waiting_publish() {
+        let cookie = [0xAB; 16];
+        let mut services = vec![entry(cookie)];
+        assert!(
+            service_with_cookie_present(&services, cookie),
+            "premise: the registration is live while the publish waits"
+        );
+
+        // Withdrawn while the ACK was outstanding.
+        services.retain(|e| e.cookie != cookie);
+        assert!(
+            !service_with_cookie_present(&services, cookie),
+            "a revoked service is still publishable"
+        );
+
+        // A LATER registration is its own: the cookie is what identifies one,
+        // so a stale waiter must not be revived by a fresh service either.
+        services.push(entry([0xCD; 16]));
+        assert!(
+            !service_with_cookie_present(&services, cookie),
+            "the waiter for a withdrawn registration was satisfied by a \
+             different one"
+        );
+    }
+
+    /// The waiters are bounded, because nothing else bounds them.
+    ///
+    /// Each is a detached thread sleeping up to three seconds; `withdraw`
+    /// frees the SERVICE slot at once and leaves the thread, so the cap of
+    /// eight services bounded nothing at all.
+    #[test]
+    fn confirm_waiters_are_capped_and_the_slot_comes_back() {
+        let pending = AtomicUsize::new(0);
+        const MAX: usize = 3;
+
+        for i in 0..MAX {
+            assert!(
+                claim_confirm_waiter(&pending, MAX),
+                "waiter {i} was refused inside the cap"
+            );
+        }
+        assert!(
+            !claim_confirm_waiter(&pending, MAX),
+            "an unbounded number of waiters can be created"
+        );
+        assert_eq!(
+            pending.load(Ordering::Acquire),
+            MAX,
+            "a refused claim left its slot taken, so the cap ratchets down to \
+             zero and every publish becomes immediate"
+        );
+
+        // One finishes; the slot is usable again.
+        pending.fetch_sub(1, Ordering::AcqRel);
+        assert!(claim_confirm_waiter(&pending, MAX));
+    }
+
+    /// And the deferred publish actually ASKS both questions.
+    #[test]
+    fn the_deferred_publish_checks_the_cap_and_the_withdrawal() {
+        let source = include_str!("mod.rs");
+        let at = source
+            .find("fn publish_after_circuit_confirmed")
+            .expect("the deferred publish moved");
+        let body = &source[at..];
+        let end = body.find("\n    }\n").expect("no end of function");
+        let body = &body[..end];
+
+        assert!(
+            body.contains("claim_confirm_waiter(&pending, MAX_PENDING)"),
+            "the waiters are unbounded again"
+        );
+        assert!(
+            body.contains("service_with_cookie_present("),
+            "a withdrawn service is published again"
+        );
     }
 }
