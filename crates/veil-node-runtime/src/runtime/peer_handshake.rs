@@ -918,32 +918,60 @@ pub async fn register_connection_session(
                         expected_peer.peer_id, link_id, source, expected_peer.nonce, new_nonce,
                     ),
                 );
-                {
+                // THE SAME ROW, OR NOTHING (report17 V17-L3). The slot may
+                // hold a different peer by now — an endpoint refresh, or an
+                // eviction and a rediscovery — and this used to write the
+                // relearned nonce into whatever was there, handing one peer's
+                // anti-sybil nonce to another. The identity-mismatch arm above
+                // has carried this check since report16 V16-M6; the nonce arm
+                // did not.
+                let wrote_nonce = {
                     let mut state = lock_state(&runtime.state);
-                    if let Some(entry) = state.peers.get_mut(&expected_peer.peer_id) {
-                        entry.nonce = new_nonce.clone();
+                    match state.peers.get_mut(&expected_peer.peer_id) {
+                        Some(entry) if row_is_still_the_one_dialled(entry, expected_peer) => {
+                            entry.nonce = new_nonce.clone();
+                            true
+                        }
+                        _ => false,
                     }
-                }
-                let config_path = runtime.config_path.clone();
-                let peer_key_for_persist = expected_peer.public_key.clone();
-                let nonce_for_persist = new_nonce;
-                let state_for_persist = Arc::clone(&runtime.state);
-                tokio::task::spawn_blocking(move || {
-                    // audit V-03/V-05: a relearned peer nonce is state we picked
-                    // up off the wire, not policy the operator wrote, so it goes
-                    // to the runtime-state sidecar. It used to be written back
-                    // into `config.toml`, which invalidated the operator's
-                    // signature and made the next enforced boot refuse to start.
-                    // Keyed by public key, not `peer_id`: peer ids are positional
-                    // and an operator reordering `[[peers]]` would otherwise hand
-                    // this nonce to a different peer.
-                    let _ = veil_cfg::runtime_state::record_peer_nonce(
-                        &config_path,
-                        &peer_key_for_persist,
-                        &nonce_for_persist,
+                };
+                if wrote_nonce {
+                    let config_path = runtime.config_path.clone();
+                    let peer_key_for_persist = expected_peer.public_key.clone();
+                    let nonce_for_persist = new_nonce;
+                    let state_for_persist = Arc::clone(&runtime.state);
+                    tokio::task::spawn_blocking(move || {
+                        // audit V-03/V-05: a relearned peer nonce is state we
+                        // picked up off the wire, not policy the operator
+                        // wrote, so it goes to the runtime-state sidecar. It
+                        // used to be written back into `config.toml`, which
+                        // invalidated the operator's signature and made the
+                        // next enforced boot refuse to start. Keyed by public
+                        // key, not `peer_id`: peer ids are positional and an
+                        // operator reordering `[[peers]]` would otherwise hand
+                        // this nonce to a different peer.
+                        let _ = veil_cfg::runtime_state::record_peer_nonce(
+                            &config_path,
+                            &peer_key_for_persist,
+                            &nonce_for_persist,
+                        );
+                        persistence::persist_discovered_peers(&state_for_persist, &config_path);
+                    });
+                } else {
+                    // Not a refusal: the remote proved who it is and the
+                    // session is fine. What cannot be done is filing its nonce
+                    // against a row that belongs to somebody else, so the
+                    // write and its persist are skipped and the handshake
+                    // carries on.
+                    runtime.logger.info(
+                        "peer.nonce_stale_row",
+                        format!(
+                            "peer_id={} link_id={} — the slot holds a different row now, \
+                             so the relearned nonce was not written",
+                            expected_peer.peer_id, link_id,
+                        ),
                     );
-                    persistence::persist_discovered_peers(&state_for_persist, &config_path);
-                });
+                }
             }
         }
     }
@@ -1446,13 +1474,27 @@ pub fn identity_mismatch_drops_record(source: PeerSource) -> bool {
 ///
 /// The node id and the address at dial time are the fingerprint. Neither is
 /// rewritten in place for a row that stayed the same thing.
+/// Whether the row at this slot is still the one the dial went out to.
+///
+/// A `PeerId` is a local slot and a slot outlives the row in it: an endpoint
+/// refresh rewrites the address, and an eviction plus a rediscovery can put a
+/// different peer entirely at the same number. Every verdict a handshake
+/// carries is about the row as it stood at dial time, so acting on it without
+/// this check writes one peer's answer onto another's record.
+pub fn row_is_still_the_one_dialled(
+    entry: &PeerConfigEntry,
+    expected: &ExpectedPeerIdentity,
+) -> bool {
+    // The key needs no separate comparison: a node id IS BLAKE3 of the peer's
+    // public key, so two rows that agree on the id agree on the key.
+    entry.node_id == expected.node_id && entry.transport == expected.row_transport_at_dial
+}
+
 pub fn identity_mismatch_removes_row(
     entry: &PeerConfigEntry,
     expected: &ExpectedPeerIdentity,
 ) -> bool {
-    identity_mismatch_drops_record(entry.source)
-        && entry.node_id == expected.node_id
-        && entry.transport == expected.row_transport_at_dial
+    identity_mismatch_drops_record(entry.source) && row_is_still_the_one_dialled(entry, expected)
 }
 
 pub fn peer_transport_context(
@@ -1473,6 +1515,7 @@ pub fn peer_transport_context(
 mod identity_mismatch_drop_tests {
     use super::{
         ExpectedPeerIdentity, identity_mismatch_drops_record, identity_mismatch_removes_row,
+        row_is_still_the_one_dialled,
     };
     use crate::types::{PeerConfigEntry, PeerId, PeerSource};
 
@@ -1580,6 +1623,76 @@ mod identity_mismatch_drop_tests {
             identity_mismatch_drops_record(PeerSource::Exchanged),
             identity_mismatch_drops_record(PeerSource::Configured)
         );
+    }
+
+    /// The relearned nonce goes to the row it was learned from.
+    ///
+    /// The nonce arm looked the slot up by `PeerId` and wrote into whatever
+    /// was there. The identity-mismatch arm beside it has checked the row
+    /// since report16 V16-M6; this one did not, so a handshake that finished
+    /// after an endpoint refresh — or after an eviction and a rediscovery put
+    /// somebody else at the same slot — filed one peer's anti-sybil nonce
+    /// against another peer's record (report17 V17-L3).
+    #[test]
+    fn a_relearned_nonce_is_only_written_to_the_row_it_came_from() {
+        let expected = expectation(0xAA, ADDR);
+
+        assert!(
+            row_is_still_the_one_dialled(&row(PeerSource::Configured, 0xAA, ADDR), &expected),
+            "premise: the unchanged row still takes the nonce"
+        );
+        assert!(
+            !row_is_still_the_one_dialled(
+                &row(PeerSource::Configured, 0xAA, "tcp://10.0.0.9:5555"),
+                &expected
+            ),
+            "an endpoint refresh replaced the address; the nonce is about the old one"
+        );
+        assert!(
+            !row_is_still_the_one_dialled(&row(PeerSource::Configured, 0xBB, ADDR), &expected),
+            "a different peer occupies the slot now, and its nonce is not ours to set"
+        );
+    }
+
+    /// And the nonce arm asks it.
+    ///
+    /// Structural: the write happens several awaits into a live handshake, so
+    /// what is pinned here is that the slot lookup is guarded at all — an
+    /// unguarded `get_mut` there is the defect.
+    #[test]
+    fn the_nonce_arm_checks_the_row_before_writing() {
+        let src = include_str!("peer_handshake.rs");
+        // Split so the needle exists in this file ONLY at the call site: a
+        // whole literal here would be found in the assertion itself, and the
+        // check would pass with the guard deleted.
+        let needle = concat!(
+            "Some(entry) if row_is_still",
+            "_the_one_dialled(entry, expected_peer)"
+        );
+        assert!(
+            src.contains(needle),
+            "the relearned nonce is written into whatever occupies the slot"
+        );
+    }
+
+    /// Unlike the removal, this one does not care WHERE the row came from.
+    ///
+    /// The drop refuses to touch an operator's `[[peers]]` line; a nonce is
+    /// wire-learned state that every source keeps, so the only question here
+    /// is whether the row is the same one.
+    #[test]
+    fn the_nonce_check_is_about_the_row_not_its_source() {
+        let expected = expectation(0xAA, ADDR);
+        for source in [
+            PeerSource::Configured,
+            PeerSource::Exchanged,
+            PeerSource::Bootstrap,
+        ] {
+            assert!(
+                row_is_still_the_one_dialled(&row(source, 0xAA, ADDR), &expected),
+                "{source:?} row was refused its own relearned nonce"
+            );
+        }
     }
 }
 
