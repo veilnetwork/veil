@@ -877,6 +877,30 @@ pub mod rocks {
         ) -> ColdPut {
             let byte_len = value.len() as u64;
             let ts = Self::now_secs();
+            // Make room BEFORE inserting, the way `InMemoryCold::put` already
+            // does.
+            //
+            // The ts-index key is `ts_secs(8) ‖ key(32)`, so entries written
+            // in the SAME second are ordered by key — and "the oldest" is then
+            // whichever key sorts first, not whichever arrived first. Insert a
+            // low key into a full tier inside one second and the entry the cap
+            // evicts is the one just written. The old code evicted after
+            // inserting and then said `Stored(None)` when the victim was the
+            // new key, on the stated reasoning that this "can't happen"; what
+            // the caller got was "stored, nothing evicted" for a value already
+            // off the disk, and its bytes and its first-seen stamp stayed on
+            // the books (report17 V17-M3).
+            //
+            // Evicting first makes that impossible by construction rather than
+            // by argument: the new key is not in the index yet, so it cannot
+            // be chosen.
+            let mut evicted: Option<([u8; 32], Vec<u8>)> = None;
+            if self.capacity > 0
+                && self.count >= self.capacity
+                && !matches!(self.db.get_cf(self.cf_kt(), key), Ok(Some(_)))
+            {
+                evicted = self.evict_oldest();
+            }
             // ONE batch per logical put. A stored entry is three rows — the
             // value, the reverse map, the ts-index — and they used to go to
             // disk as three independent writes of which only the FIRST was
@@ -924,19 +948,9 @@ pub mod rocks {
             if !was_indexed {
                 self.count += 1;
             }
-            // Entry-cap: evict the single oldest entry if over capacity
-            // (amortised one-per-put, matching InMemoryCold). Returns the
-            // evicted entry for the caller's byte-counter bookkeeping.
-            if self.capacity > 0
-                && self.count > self.capacity
-                && let Some((ev_key, ev_val)) = self.evict_oldest()
-                // Don't report self-eviction (can't happen — we just inserted
-                // `key`, and the oldest is strictly older).
-                && ev_key != key
-            {
-                return ColdPut::Stored(Some((ev_key, ev_val)));
-            }
-            ColdPut::Stored(None)
+            // Room was made above, so anything reported here is a different
+            // entry by construction.
+            ColdPut::Stored(evicted)
         }
 
         fn set_origin(&mut self, key: &[u8; 32], origin: &[u8; 32]) {
@@ -3044,6 +3058,65 @@ mod tests {
             "the new value inherited the age of whatever was here before it, \
              so a fresh record is swept as though it were old"
         );
+    }
+
+    /// report17 V17-M3: a put could evict the value it had just written, and
+    /// report it as "stored, nothing evicted".
+    ///
+    /// The ts-index key is `ts_secs(8) ‖ key(32)`, so entries written in the
+    /// same second are ordered BY KEY. A low key arriving at a full tier is
+    /// therefore "the oldest" the moment it lands — the cap evicts it, the
+    /// guard `ev_key != key` swallowed the event on the stated reasoning that
+    /// it cannot happen, and the caller went on believing it holds a value
+    /// that is no longer on disk: its bytes stay on the global and per-origin
+    /// counters and its first-seen stamp stays in the sweep's map.
+    ///
+    /// One wall-clock second is all the collision needs, and a DHT node under
+    /// load writes many entries a second.
+    #[cfg(feature = "rocksdb-cold")]
+    #[test]
+    fn a_put_never_evicts_the_value_it_just_wrote() {
+        use super::rocks::RocksDbCold;
+
+        let dir = tempfile::tempdir().unwrap();
+        let cap = 3usize;
+        let mut cold =
+            RocksDbCold::open(dir.path().join("cold").to_str().unwrap(), cap).expect("open");
+
+        // Three high keys first, then a low one — the shape from the report.
+        for lead in [0x03u8, 0x04, 0x05] {
+            let mut key = [0u8; 32];
+            key[0] = lead;
+            cold.put(key, vec![lead; 32]);
+        }
+        let mut newcomer = [0u8; 32];
+        newcomer[0] = 0x01;
+        let put = cold.put(newcomer, b"the newcomer".to_vec());
+
+        // It is THERE. Whatever the cap did, it did not do it to this value.
+        assert!(
+            cold.contains(&newcomer),
+            "the put evicted the value it had just written"
+        );
+        assert_eq!(
+            cold.get(&newcomer).as_deref(),
+            Some(b"the newcomer".as_slice()),
+        );
+
+        // And what came back names the entry that actually left, so the
+        // caller's byte counters follow the disk.
+        match put {
+            ColdPut::Stored(Some((ev_key, _))) => assert_ne!(
+                ev_key, newcomer,
+                "the eviction reported was of the value just stored"
+            ),
+            ColdPut::Stored(None) => panic!(
+                "a full tier took a new entry and reported no eviction: \
+                 something left the disk that nobody was told about"
+            ),
+            ColdPut::Failed(_) => panic!("the put failed"),
+        }
+        assert_eq!(cold.len(), cap, "the cap was not held");
     }
 
     /// report17 V17-M2: EVICTION dropped the value and kept the entry's
