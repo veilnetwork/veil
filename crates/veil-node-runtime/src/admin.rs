@@ -380,6 +380,59 @@ pub enum AdminCommand {
 pub fn default_per_peer_disabled() -> i64 {
     -1
 }
+/// Server-side ceilings for the diagnostic probes (report17 V17-L7).
+///
+/// The request carried `count`, `interval_ms`, `timeout_ms` and `max_hops`
+/// straight from the caller with nothing to bound them, so an admin — or
+/// anything that reached the admin socket as the same user — could ask the
+/// node to emit frames for as long as it liked. These are not a security
+/// boundary against a caller who already has admin; they are the difference
+/// between a diagnostic tool and an open-ended sender that outlives the
+/// question it was asked.
+pub const MAX_PING_COUNT: u32 = 1_000;
+/// Floor as well as ceiling: an interval of zero is a tight send loop.
+pub const MIN_PING_INTERVAL_MS: u64 = 20;
+pub const MAX_PING_INTERVAL_MS: u64 = 60_000;
+pub const MAX_PROBE_TIMEOUT_MS: u64 = 30_000;
+pub const MAX_TRACE_HOPS: u8 = 32;
+
+/// Wire sequence numbers for in-flight diagnostic probes.
+///
+/// Every operation used to number its own probes from zero — ping from 0, and
+/// trace from its TTL — against ONE registry of waiting channels. Two
+/// operations at once therefore collided on the same small integers:
+/// registering overwrote the other's waiter and finishing removed it, so a
+/// concurrent ping and traceroute stole each other's replies and each reported
+/// losses that had not happened (report17 V17-L7). A single allocator gives
+/// every probe a number nobody else is using, which also means a reply has to
+/// name a 32-bit value it cannot guess.
+static NEXT_DIAG_SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
+
+/// What the node will actually do with a ping request.
+///
+/// A function rather than three inline `min`s so the bound is one thing that
+/// can be driven with real values — an assertion about `u32::MAX.min(CONST)`
+/// is a statement about constants, not about the request path.
+pub fn clamp_ping_params(count: u32, interval_ms: u64, timeout_ms: u64) -> (u32, u64, u64) {
+    (
+        count.min(MAX_PING_COUNT),
+        interval_ms.clamp(MIN_PING_INTERVAL_MS, MAX_PING_INTERVAL_MS),
+        timeout_ms.min(MAX_PROBE_TIMEOUT_MS),
+    )
+}
+
+/// The same for a traceroute.
+pub fn clamp_trace_params(max_hops: u8, timeout_ms: u64) -> (u8, u64) {
+    (
+        max_hops.min(MAX_TRACE_HOPS),
+        timeout_ms.min(MAX_PROBE_TIMEOUT_MS),
+    )
+}
+
+fn next_diag_seq() -> u32 {
+    NEXT_DIAG_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
 pub fn default_ping_count() -> u32 {
     4
 }
@@ -2505,6 +2558,10 @@ async fn execute_admin_command(
                 Ok(id) => id,
                 Err(e) => return AdminConnectionOutcome::Response(AdminResponse::err(e)),
             };
+            // Clamped here, so the acknowledgement quotes what the node will
+            // actually do rather than what was asked for (report17 V17-L7).
+            let (count, interval_ms, timeout_ms) =
+                clamp_ping_params(count, interval_ms, timeout_ms);
             let (event_tx, event_rx) = tokio::sync::mpsc::channel::<AdminResult>(64);
             let access = { runtime.lock().await.access() };
             tokio::spawn(run_debug_ping(
@@ -2532,6 +2589,7 @@ async fn execute_admin_command(
                 Ok(id) => id,
                 Err(e) => return AdminConnectionOutcome::Response(AdminResponse::err(e)),
             };
+            let (max_hops, timeout_ms) = clamp_trace_params(max_hops, timeout_ms);
             let (event_tx, event_rx) = tokio::sync::mpsc::channel::<AdminResult>(64);
             let access = { runtime.lock().await.access() };
             tokio::spawn(run_debug_trace(
@@ -3580,9 +3638,27 @@ async fn run_debug_ping(
 
     let mut sent = 0u32;
     let mut received = 0u32;
-    let mut rtts: Vec<u64> = Vec::new();
+    // Running, not collected (report17 V17-L7). The list grew one entry per
+    // reply for the whole run, which is memory a diagnostic has no reason to
+    // hold: min, max and a mean need four numbers.
+    let mut rtt_min_us = u64::MAX;
+    let mut rtt_max_us = 0u64;
+    let mut rtt_total_us = 0u128;
 
-    for seq in 0..count {
+    for probe in 0..count {
+        // A NUMBER NOBODY ELSE IS USING. Every probe used to be numbered from
+        // zero within its own operation, against one shared registry of
+        // waiters, so a second operation running at the same time overwrote
+        // this one's channel and removed it on the way out.
+        let seq = next_diag_seq();
+        // The person asked for N pings; the wire number is an implementation
+        // detail, so what is reported stays 0..N.
+        let reported_seq = probe;
+        if tx.is_closed() {
+            // The admin client is gone. Nothing will read another reply, and
+            // the node has no reason to keep sending on its behalf.
+            break;
+        }
         let ts_us = now_us();
         let ping = DiagPingPayload {
             seq,
@@ -3618,39 +3694,38 @@ async fn run_debug_ping(
             })) => {
                 let rtt_us = now_us().saturating_sub(echo_ts_us);
                 received += 1;
-                rtts.push(rtt_us);
-                let _ = tx
+                rtt_min_us = rtt_min_us.min(rtt_us);
+                rtt_max_us = rtt_max_us.max(rtt_us);
+                rtt_total_us += u128::from(rtt_us);
+                if tx
                     .send(AdminResult::PingReply {
-                        seq,
+                        seq: reported_seq,
                         rtt_us,
                         peer_id: node_id_hex(&responder),
                     })
-                    .await;
+                    .await
+                    .is_err()
+                {
+                    access.remove_diag_seq(seq);
+                    break;
+                }
             }
             _ => { /* timeout or channel error — counted as lost */ }
         }
 
         access.remove_diag_seq(seq);
 
-        if seq + 1 < count {
+        if probe + 1 < count {
             tokio::time::sleep(std::time::Duration::from_millis(interval_ms)).await;
         }
     }
 
     let lost = sent - received;
-    let (rtt_min_us, rtt_avg_us, rtt_max_us) = if rtts.is_empty() {
+    let (rtt_min_us, rtt_avg_us, rtt_max_us) = if received == 0 {
         (0, 0, 0)
     } else {
-        let min = *rtts
-            .iter()
-            .min()
-            .expect("rtts non-empty — checked by is_empty() above");
-        let max = *rtts
-            .iter()
-            .max()
-            .expect("rtts non-empty — checked by is_empty() above");
-        let avg = rtts.iter().sum::<u64>() / rtts.len() as u64;
-        (min, avg, max)
+        let avg = (rtt_total_us / u128::from(received)) as u64;
+        (rtt_min_us, avg, rtt_max_us)
     };
     let _ = tx
         .send(AdminResult::PingStats {
@@ -3677,7 +3752,13 @@ async fn run_debug_trace(
 
     let mut hops_received = 0u8;
     for ttl in 1..=max_hops {
-        let seq = ttl as u32;
+        // Numbered from the shared allocator, not from the TTL: a trace and a
+        // ping running at once used to register under the same small integers
+        // and take each other's replies (report17 V17-L7).
+        let seq = next_diag_seq();
+        if tx.is_closed() {
+            break;
+        }
         let ts_us = now_us();
         let probe = DiagTraceProbePayload {
             seq,
@@ -3713,13 +3794,17 @@ async fn run_debug_trace(
             })) => {
                 let rtt_us = now_us().saturating_sub(echo_ts_us);
                 hops_received += 1;
-                let _ = tx
+                if tx
                     .send(AdminResult::TraceHop {
                         idx: hop_idx,
                         node_id: node_id_hex(&node_id),
                         rtt_us,
                     })
-                    .await;
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
                 // Stop as soon as we hear back from the target itself.
                 if node_id == target_id {
                     break;
@@ -3727,13 +3812,17 @@ async fn run_debug_trace(
             }
             _ => {
                 // Timed out for this TTL — report as * and continue.
-                let _ = tx
+                if tx
                     .send(AdminResult::TraceHop {
                         idx: ttl,
                         node_id: "*".to_owned(),
                         rtt_us: 0,
                     })
-                    .await;
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
             }
         }
     }
@@ -5272,3 +5361,119 @@ mod reserved_apply_slot_tests {
 /// Both sides are constants, so this is checked when the crate is BUILT rather
 /// than when its tests are run: the two move together or nothing compiles.
 const _: () = assert!(ADMIN_SLOTS_RESERVED_FOR_APPLY < veil_cfg::MIN_ADMIN_MAX_CONNECTIONS);
+
+#[cfg(test)]
+mod diag_probe_bounds_tests {
+    use super::*;
+
+    /// Two diagnostic operations at once must not take each other's replies
+    /// (report17 V17-L7).
+    ///
+    /// Every probe used to be numbered within its own operation — ping from
+    /// zero, trace from its TTL — against ONE registry of waiting channels.
+    /// Registering overwrote whatever held that number and finishing removed
+    /// it, so a concurrent ping and traceroute stole each other's replies and
+    /// each reported losses that had not happened.
+    #[test]
+    fn every_probe_gets_a_number_of_its_own() {
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..1_000 {
+            assert!(
+                seen.insert(next_diag_seq()),
+                "two probes were handed the same wire sequence number"
+            );
+        }
+    }
+
+    /// And they keep going up across operations, which is what makes the
+    /// number unguessable to anything composing a reply.
+    #[test]
+    fn the_allocator_does_not_restart_per_operation() {
+        let first = next_diag_seq();
+        // A whole "operation" worth of probes.
+        for _ in 0..8 {
+            let _ = next_diag_seq();
+        }
+        assert!(
+            next_diag_seq() > first + 8,
+            "the sequence restarted, so a second operation collides again"
+        );
+    }
+
+    /// The node bounds what it was asked to send.
+    ///
+    /// `count`, `interval_ms`, `timeout_ms` and `max_hops` arrived from the
+    /// caller with nothing to clamp them: a diagnostic could be asked to emit
+    /// frames for as long as the asker liked, at whatever rate.
+    #[test]
+    fn the_probe_parameters_are_bounded() {
+        let (count, interval, timeout) = clamp_ping_params(u32::MAX, 0, u64::MAX);
+        assert_eq!(
+            count, MAX_PING_COUNT,
+            "a ping could be asked to run forever"
+        );
+        assert_eq!(
+            interval, MIN_PING_INTERVAL_MS,
+            "an interval of zero is a tight send loop"
+        );
+        assert_eq!(timeout, MAX_PROBE_TIMEOUT_MS);
+
+        let (hops, trace_timeout) = clamp_trace_params(u8::MAX, u64::MAX);
+        assert_eq!(hops, MAX_TRACE_HOPS);
+        assert_eq!(trace_timeout, MAX_PROBE_TIMEOUT_MS);
+
+        // A slow interval is clamped from ABOVE too, or a probe scheduled once
+        // a day is a task the node keeps for a day.
+        let (_, slow, _) = clamp_ping_params(1, u64::MAX, 1);
+        assert_eq!(slow, MAX_PING_INTERVAL_MS);
+    }
+
+    /// And an ordinary request passes through untouched — a ceiling that
+    /// changes the default answer is a different tool, not a bound.
+    #[test]
+    fn the_default_request_is_not_altered() {
+        assert_eq!(
+            clamp_ping_params(
+                default_ping_count(),
+                default_interval_ms(),
+                default_timeout_ms()
+            ),
+            (
+                default_ping_count(),
+                default_interval_ms(),
+                default_timeout_ms()
+            )
+        );
+        assert_eq!(
+            clamp_trace_params(default_max_hops(), default_timeout_ms()),
+            (default_max_hops(), default_timeout_ms())
+        );
+    }
+
+    /// The dispatch clamps before it answers, so the acknowledgement quotes
+    /// what the node will do rather than what was asked.
+    ///
+    /// Structural: the clamp sits inside an async dispatch that needs a live
+    /// runtime, and what is pinned is that it happens before the Ack is built.
+    #[test]
+    fn the_ack_quotes_the_clamped_count() {
+        let src = include_str!("admin.rs");
+        let dispatch = src
+            .split_once("AdminCommand::DebugPing {")
+            .expect("the ping dispatch moved; re-anchor this test")
+            .1;
+        let clamp = dispatch
+            .find(concat!(
+                "clamp_ping",
+                "_params(count, interval_ms, timeout_ms)"
+            ))
+            .expect("the ping count is not bounded at dispatch");
+        let ack = dispatch
+            .find("pinging {} ({} packets)")
+            .expect("the acknowledgement moved");
+        assert!(
+            clamp < ack,
+            "the acknowledgement is built from the unclamped count"
+        );
+    }
+}
