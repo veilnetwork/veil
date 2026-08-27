@@ -26,38 +26,112 @@ mod tests {
     /// That is the right trade against a suite that flakes.
     const SIM_WAIT_LIMIT: Duration = Duration::from_secs(60);
 
-    /// Charlie's view of every instance behind `node_id`, once it has settled.
+    /// Wait for a service's blinded descriptor to be stored locally, and
+    /// report the period it actually landed under.
     ///
-    /// Sessions are established by the time a scenario asks, but each one's
-    /// sovereign identity is validated on its own task — so asking straight
-    /// away saw one device or two depending on how busy the machine was. It
-    /// failed as "fan-out resolved 1, expected 2", which reads like the
-    /// fan-out being broken rather than the question being asked early.
+    /// The scenarios computed `current_period(now)` immediately after
+    /// `register_onion_service` and then waited on THAT key. The production
+    /// publish is deferred — until the circuit ACK, or up to three seconds —
+    /// and recomputes the period when it runs. A registration a few seconds
+    /// before a 24-hour period boundary therefore publishes under P+1 while
+    /// the scenario waits out its full sixty seconds on P, and reports a
+    /// correct runtime as a failure. Rare per run and certain over enough
+    /// runs, which is the worst kind of red: it lands on somebody else's
+    /// change (report17 V17-L5).
     ///
-    /// Returns whatever it has at the deadline so the CALLER's assertion is
-    /// still the one that fails, with its own message.
-    /// Wait for `runtime` to hold the value at `key`, or give up at the limit.
+    /// So the KEY is recomputed on every pass, and the neighbouring periods
+    /// are asked as well: the publish can be one period ahead of the wait, and
+    /// a slow wait can be one period ahead of the publish.
     ///
-    /// Three onion-service scenarios slept a fixed 250 ms after
-    /// `register_onion_service` and then asserted the descriptor was stored.
-    /// A fixed sleep is a guess about the machine: on a loaded host the
-    /// publish had not landed, and the scenario reported the load as a
-    /// product failure — red under `cargo test --workspace` at full
-    /// parallelism, green at `--test-threads=4` and green in isolation, which
-    /// is the signature of a test measuring the host.
+    /// This replaces `stored_locally_until`, which replaced a fixed 250 ms
+    /// sleep — a guess about the machine that reported host load as a product
+    /// failure. Waiting on a key that can no longer appear is the same mistake
+    /// one level up: patient about the clock, wrong about the question.
     ///
-    /// The same shape `republish_until` was written for, without the
-    /// re-trigger: this publish is local to the node that made it, so waiting
-    /// is all that is owed. Returns nothing — the CALLER's `expect` is the one
-    /// that should fail, with its own message.
-    async fn stored_locally_until(runtime: &veil_node_runtime::NodeRuntime, key: &[u8; 32]) {
+    /// Returns `(period, key, bytes)` so the caller opens the descriptor with
+    /// the period it was actually sealed under, or `None` at the deadline so
+    /// the CALLER's `expect` is the one that fails.
+    async fn stored_descriptor_until(
+        runtime: &veil_node_runtime::NodeRuntime,
+        identity_vk: &[u8; 32],
+    ) -> Option<(u64, [u8; 32], Vec<u8>)> {
         let deadline = tokio::time::Instant::now() + SIM_WAIT_LIMIT;
-        while runtime.dht_get_local(key).is_none() {
+        loop {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            for (period, key) in descriptor_key_candidates(identity_vk, now) {
+                if let Some(bytes) = runtime.dht_get_local(&key) {
+                    return Some((period, key, bytes));
+                }
+            }
             if tokio::time::Instant::now() >= deadline {
-                return;
+                return None;
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
+    }
+
+    /// Every period a descriptor published "around now" could be under, with
+    /// its DHT key.
+    ///
+    /// The period this instant falls in, plus its neighbours: a deferred
+    /// publish can run a period after the wait began, and a wait can outlive
+    /// the period the publish used.
+    fn descriptor_key_candidates(identity_vk: &[u8; 32], now_unix: u64) -> Vec<(u64, [u8; 32])> {
+        use veil_anonymity::blinded_descriptor as bd;
+        let here = bd::current_period(now_unix);
+        [here, here.saturating_add(1), here.saturating_sub(1)]
+            .into_iter()
+            .filter_map(|period| bd::descriptor_dht_key(identity_vk, period).map(|k| (period, k)))
+            .collect()
+    }
+
+    /// A descriptor published one second the other side of a period boundary
+    /// is still found.
+    ///
+    /// The publish is deferred and recomputes its period when it runs, so the
+    /// scenario and the runtime can disagree by one — and the descriptor is
+    /// keyed by period, so a wait on the wrong one runs out its full sixty
+    /// seconds and reports a correct runtime as broken (report17 V17-L5).
+    #[test]
+    fn a_descriptor_published_across_a_period_boundary_is_still_waited_for() {
+        use veil_anonymity::blinded_descriptor as bd;
+        // A REAL verifying key: blinding refuses anything that is not a point
+        // on the curve, so a made-up 32 bytes makes every candidate None and
+        // the assertions below pass on an empty list.
+        let identity_vk = veil_crypto::key_blinding::ed25519_public_from_seed(&[7u8; 32]);
+        let boundary = bd::PERIOD_SECS * 20_000;
+
+        // A second before the boundary: the publish lands a second later, in
+        // the NEXT period.
+        let just_before = descriptor_key_candidates(&identity_vk, boundary - 1);
+        let published_under = bd::current_period(boundary);
+        assert!(
+            just_before.iter().any(|(p, _)| *p == published_under),
+            "a wait started a second before a period boundary never asks for \
+             the period the publish will use"
+        );
+
+        // And a second after: the publish may already have happened in the
+        // period that just ended.
+        let just_after = descriptor_key_candidates(&identity_vk, boundary + 1);
+        let published_under = bd::current_period(boundary - 1);
+        assert!(
+            just_after.iter().any(|(p, _)| *p == published_under),
+            "a wait that outlived the publish's period stops asking for it"
+        );
+
+        // The keys really are distinct per period — otherwise the assertions
+        // above are satisfied by a function that ignores its argument.
+        let keys: std::collections::HashSet<_> = just_before.iter().map(|(_, k)| *k).collect();
+        assert_eq!(
+            keys.len(),
+            just_before.len(),
+            "the period does not change the DHT key, so this whole question \
+             is about nothing"
+        );
     }
 
     /// Wait for `check` to hold on some node, RE-TRIGGERING the publish while
@@ -90,6 +164,22 @@ mod tests {
         }
     }
 
+    /// Charlie's view of every instance behind `node_id`, once it has settled.
+    ///
+    /// Sessions are established by the time a scenario asks, but each one's
+    /// sovereign identity is validated on its own task — so asking straight
+    /// away saw one device or two depending on how busy the machine was. It
+    /// failed as "fan-out resolved 1, expected 2", which reads like the
+    /// fan-out being broken rather than the question being asked early.
+    ///
+    /// Returns whatever it has at the deadline so the CALLER's assertion is
+    /// still the one that fails, with its own message.
+    ///
+    /// (This block described this function and sat above `stored_locally_until`
+    /// instead, where a second, unrelated doc block followed it immediately —
+    /// so rustdoc and the next maintainer both read it as belonging to the
+    /// wrong helper, and the function it IS about had no explanation at all.
+    /// report17 V17-L6.)
     async fn resolved_instances(
         runtime: &veil_node_runtime::NodeRuntime,
         node_id: [u8; 32],
@@ -6283,9 +6373,15 @@ mod tests {
             .expect("send_via_rendezvous must succeed");
 
         // Wait for the receiver's app to receive.
-        let msg = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+        //
+        // The suite's own limit, not a five-second guess: under
+        // `cargo test --workspace` at full parallelism this delivery has been
+        // seen to take longer than five seconds, and a scenario that reports
+        // host load as a routing failure is worse than one that takes a minute
+        // to say a genuinely stuck path is stuck.
+        let msg = tokio::time::timeout(SIM_WAIT_LIMIT, rx.recv())
             .await
-            .expect("rendezvous-routed message did not arrive in 5s")
+            .expect("rendezvous-routed message did not arrive")
             .expect("receiver channel closed");
 
         match msg {
@@ -6972,7 +7068,18 @@ mod tests {
             .expect("stream circuit to R must open");
 
         // Let the CircuitBuild install at N1 + N2 and the ACK come back.
-        tokio::time::sleep(Duration::from_millis(400)).await;
+        //
+        // WAITED FOR, not slept through. Four hundred milliseconds is a guess
+        // about the machine: under `cargo test --workspace` at full
+        // parallelism the ACK arrives later than that and the assertion below
+        // reports host load as a product failure — measured here, twice, on
+        // scenarios nothing had touched. Same shape as `stored_descriptor_until`
+        // and `resolved_instances`: ask the question until it can be answered,
+        // and let the CALLER's assertion be the one that fails.
+        let deadline = tokio::time::Instant::now() + SIM_WAIT_LIMIT;
+        while !circuit.is_confirmed() && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
 
         // (1) R bound THIS node's stream cookie to a circuit. Without this the
         //     splice below has nowhere to send and the live path is dark.
@@ -7264,27 +7371,16 @@ mod tests {
             .expect("ed25519 identity")
             .verifying_key()
             .as_bytes();
-        // Same wall-clock period the service sealed under (both within ms).
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        let period = bd::current_period(now);
-        let dht_key = bd::descriptor_dht_key(&identity_vk, period).unwrap();
+        // Whichever period the publish landed under: it is deferred and
+        // recomputes the period when it runs, so computing one here and
+        // waiting on it fails across a period boundary (report17 V17-L5).
+        let (period, dht_key, desc) = stored_descriptor_until(&net.node(4).runtime, &identity_vk)
+            .await
+            .expect("service stored its blinded descriptor");
 
         // The descriptor's DHT key is NOT the service node_id (unlinkable).
         assert_ne!(dht_key, net.node(4).node_id(), "descriptor key ≠ node_id");
 
-        // Fetch (mirror) the descriptor + open it.
-        // The publish is local to node 4, so waiting is all that is owed —
-        // and a fixed sleep here was a guess about the host, not about the
-        // product.
-        stored_locally_until(&net.node(4).runtime, &dht_key).await;
-        let desc = net
-            .node(4)
-            .runtime
-            .dht_get_local(&dht_key)
-            .expect("service stored its blinded descriptor");
         net.node(0).runtime.dht_put_local(dht_key, desc.clone());
         let body = bd::open_descriptor(&identity_vk, period, &desc)
             .expect("client decrypts the descriptor with the known identity");
@@ -7433,21 +7529,9 @@ mod tests {
             .expect("ed25519 identity")
             .verifying_key()
             .as_bytes();
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        let period = veil_anonymity::blinded_descriptor::current_period(now);
-        let dht_key =
-            veil_anonymity::blinded_descriptor::descriptor_dht_key(&identity_vk, period).unwrap();
-        // The publish is local to node 4, so waiting is all that is owed —
-        // and a fixed sleep here was a guess about the host, not about the
-        // product.
-        stored_locally_until(&net.node(4).runtime, &dht_key).await;
-        let desc = net
-            .node(4)
-            .runtime
-            .dht_get_local(&dht_key)
+        // Whichever period the deferred publish landed under (V17-L5).
+        let (_period, dht_key, desc) = stored_descriptor_until(&net.node(4).runtime, &identity_vk)
+            .await
             .expect("service stored its blinded descriptor");
         net.node(0).runtime.dht_put_local(dht_key, desc);
 
@@ -7539,21 +7623,9 @@ mod tests {
             .expect("ed25519 identity")
             .verifying_key()
             .as_bytes();
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        let period = veil_anonymity::blinded_descriptor::current_period(now);
-        let dht_key =
-            veil_anonymity::blinded_descriptor::descriptor_dht_key(&identity_vk, period).unwrap();
-        // The publish is local to node 4, so waiting is all that is owed —
-        // and a fixed sleep here was a guess about the host, not about the
-        // product.
-        stored_locally_until(&net.node(4).runtime, &dht_key).await;
-        let desc = net
-            .node(4)
-            .runtime
-            .dht_get_local(&dht_key)
+        // Whichever period the deferred publish landed under (V17-L5).
+        let (_period, dht_key, desc) = stored_descriptor_until(&net.node(4).runtime, &identity_vk)
+            .await
             .expect("service stored its blinded descriptor");
         net.node(0).runtime.dht_put_local(dht_key, desc);
 
