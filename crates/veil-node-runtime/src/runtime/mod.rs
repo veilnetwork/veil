@@ -3831,6 +3831,7 @@ impl NodeRuntime {
             rendezvous_kem_pk: Vec::new(),
             // Plain rendezvous receiver — signed under the sovereign identity.
             ephemeral_ad_identity: None,
+            rendezvous_kem_valid_until_unix: 0,
         };
         let mut entries = lock!(self.anonymity.rendezvous_publisher_entries);
         // Replace existing entry with same (rendezvous, cookie) pair.

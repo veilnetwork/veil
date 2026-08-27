@@ -256,11 +256,27 @@ pub enum RelayKeyError {
 ///
 /// The caller is responsible for verifying `doc` itself (chain to master) and
 /// for picking the highest `record_version` when several records resolve.
+/// A relay key that verified, and how long it may be used.
+///
+/// The key used to come back on its own. Whoever held it had no way to ask
+/// when it stops being the peer's key, so one resolved shortly before an
+/// expiry or a revocation could be advertised in a rendezvous ad for another
+/// thirty days — long enough that the old private key still reads deposits, or
+/// that a rotation turns the ad into a black hole (report17 V17-M1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VerifiedRelayKey {
+    /// The peer's relay X25519 public key.
+    pub pk: [u8; 32],
+    /// When the record, its signing subkey, or the document behind them stops
+    /// vouching for it — whichever comes first.
+    pub valid_until_unix: u64,
+}
+
 pub fn verify_relay_key(
     record: &RelayKeyRecord,
     doc: &IdentityDocument,
     now_unix_secs: u64,
-) -> Result<[u8; 32], RelayKeyError> {
+) -> Result<VerifiedRelayKey, RelayKeyError> {
     if record.node_id != doc.node_id {
         return Err(RelayKeyError::NodeIdMismatch {
             record: record.node_id,
@@ -277,10 +293,22 @@ pub fn verify_relay_key(
     if record.relay_kem_algo != RELAY_KEM_ALGO_X25519 {
         return Err(RelayKeyError::UnsupportedKemAlgo(record.relay_kem_algo));
     }
-    if !record.is_valid_at(now_unix_secs) {
+    // The same containment the ML-KEM certificate gets (V17-H2), and for the
+    // same reason: this record is signed by a device subkey the master
+    // endorses for about a week, and nothing stopped it naming a window
+    // reaching past that.
+    let effective_from = record
+        .valid_from_unix
+        .max(subkey.valid_from_unix)
+        .max(doc.issued_at_unix);
+    let effective_until = record
+        .valid_until_unix
+        .min(subkey.valid_until_unix)
+        .min(doc.valid_until_unix);
+    if now_unix_secs < effective_from || now_unix_secs > effective_until {
         return Err(RelayKeyError::NotValidNow {
-            from: record.valid_from_unix,
-            until: record.valid_until_unix,
+            from: effective_from,
+            until: effective_until,
             now: now_unix_secs,
         });
     }
@@ -296,7 +324,10 @@ pub fn verify_relay_key(
         .as_slice()
         .try_into()
         .map_err(|_| RelayKeyError::UnsupportedKemAlgo(record.relay_kem_algo))?;
-    Ok(pk)
+    Ok(VerifiedRelayKey {
+        pk,
+        valid_until_unix: effective_until,
+    })
 }
 
 enum SubkeySigErr {
@@ -817,7 +848,34 @@ mod tests {
         let kem = [0x5Au8; X25519_PK_LEN];
         let rec = build_relay_record(&env, kem);
         let got = verify_relay_key(&rec, &env.doc, env.now_unix_secs).unwrap();
-        assert_eq!(got, kem, "verify returns the advertised X25519 key");
+        assert_eq!(got.pk, kem, "verify returns the advertised X25519 key");
+    }
+
+    /// The relay key gets the same containment as the ML-KEM certificate, and
+    /// the caller is told when it ends.
+    ///
+    /// It matters more here than it looks: the key is put into a rendezvous ad
+    /// that may be valid for thirty days, so one resolved just before a
+    /// revocation was advertised for a month afterwards — long enough that the
+    /// old private key still reads deposits, or that a rotation turns the ad
+    /// into a black hole (report17 V17-M1).
+    #[test]
+    fn relay_key_cannot_outlive_the_subkey_that_signed_it() {
+        let env = build_env();
+        let subkey_until = env.doc.identity_keys[0].valid_until_unix;
+        let mut rec = build_relay_record(&env, [0x5A; X25519_PK_LEN]);
+        rec.valid_until_unix = u64::MAX;
+        rec.sig = env.sub_sk.sign(&rec.signing_message()).to_bytes().to_vec();
+
+        let got = verify_relay_key(&rec, &env.doc, env.now_unix_secs).unwrap();
+        assert_eq!(
+            got.valid_until_unix, subkey_until,
+            "the caller was handed the record's own claim to advertise"
+        );
+        assert!(
+            verify_relay_key(&rec, &env.doc, subkey_until + 1).is_err(),
+            "an expired delegation still vouched for a relay key"
+        );
     }
 
     #[test]

@@ -85,11 +85,15 @@ pub(crate) async fn lookup_relay_key_reply_body(
     relay_key_resolver: Option<Arc<dyn veil_types::RelayKeyResolver>>,
     req: LookupRelayKeyPayload,
 ) -> Vec<u8> {
-    let relay_x25519 = match relay_key_resolver {
+    let resolved = match relay_key_resolver {
         Some(r) => r.resolve_relay_x25519(req.node_id).await,
         None => None,
     };
-    LookupRelayKeyRespPayload { relay_x25519 }.encode()
+    LookupRelayKeyRespPayload {
+        relay_x25519: resolved.map(|r| r.pk),
+        valid_until_unix: resolved.map_or(0, |r| r.valid_until_unix),
+    }
+    .encode()
 }
 
 /// Slow half of `AttemptHolePunch` — one bounded explicit hole-punch

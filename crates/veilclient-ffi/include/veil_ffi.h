@@ -1565,6 +1565,37 @@ int veil_lookup_relay_x25519(VeilHandle *handle,
 ;
 
 /**
+ * [`veil_lookup_relay_x25519`], plus the moment that key stops being the
+ * relay's.
+ *
+ * A separate export rather than a wider one: the shorter form is already
+ * compiled into shipped callers, and widening it would be a flag day on the
+ * wrong side of the boundary.
+ *
+ * The stamp matters because the ad built from this key can be valid for
+ * thirty days while the key is not. Pass it to
+ * [`veil_register_rendezvous_publisher_with_expiry`] and the daemon clips the
+ * ad to it, so a key resolved shortly before an expiry or a revocation is not
+ * advertised for the month afterwards — which either sends deposits to
+ * whoever holds the old private key, or to nobody at all (report17 V17-M1).
+ *
+ * `0` in `out_valid_until_unix` means the daemon did not say — an older one,
+ * or a record with no window the verifier could compute.
+ *
+ * # Safety
+ * `handle` must be a live `VeilHandle*` from `veil_connect`.
+ * `node_id_32` must point to 32 readable bytes; `out_pubkey_32` to 32
+ * writable; `out_valid_until_unix` to 8 writable.
+ */
+
+int veil_lookup_relay_x25519_with_expiry(VeilHandle *handle,
+                                         const uint8_t *node_id_32,
+                                         uint8_t *out_pubkey_32,
+                                         uint64_t *out_valid_until_unix,
+                                         char **err_out)
+;
+
+/**
  * Register this node as a LOCATION-anonymous (onion) service: the daemon picks
  * relays, builds an onion circuit to a rendezvous relay (which never learns
  * this node's location), and publishes the ad so clients can reach this node by
@@ -1667,6 +1698,35 @@ int veil_register_rendezvous_publisher(VeilHandle *handle,
                                        const uint8_t *relay_kem_pk,
                                        size_t kem_len,
                                        char **err_out)
+;
+
+/**
+ * [`veil_register_rendezvous_publisher`], plus the relay key's expiry.
+ *
+ * The daemon clips the published ad's `valid_until` to
+ * `relay_kem_valid_until_unix`, so an ad cannot go on advertising a relay key
+ * past the point that key stopped being the relay's — thirty days of deposits
+ * to a key nobody holds, or to whoever holds the old private half (report17
+ * V17-M1). Take the value from
+ * [`veil_lookup_relay_x25519_with_expiry`]; `0` means "not known" and leaves
+ * the ad on its own window.
+ *
+ * A separate export rather than a wider one, for the same reason as its
+ * lookup twin: the shorter form is already compiled into shipped callers.
+ *
+ * # Safety
+ * As [`veil_register_rendezvous_publisher`].
+ */
+
+int veil_register_rendezvous_publisher_with_expiry(VeilHandle *handle,
+                                                   const uint8_t *rendezvous_node_id,
+                                                   const uint8_t *auth_cookie,
+                                                   uint64_t validity_window_secs,
+                                                   uint8_t relay_kem_algo,
+                                                   const uint8_t *relay_kem_pk,
+                                                   size_t kem_len,
+                                                   uint64_t relay_kem_valid_until_unix,
+                                                   char **err_out)
 ;
 
 /**

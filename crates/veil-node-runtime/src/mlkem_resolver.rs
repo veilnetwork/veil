@@ -884,7 +884,10 @@ impl DhtMlKemEkResolver {
     ///
     /// Reuses the same document fetch + recursive-get the ML-KEM walk uses, so
     /// the relay-key resolve shares the mirror-cache-poison-resistant fast path.
-    pub async fn fetch_relay_x25519(&self, target_node_id: [u8; 32]) -> Option<[u8; 32]> {
+    pub async fn fetch_relay_x25519(
+        &self,
+        target_node_id: [u8; 32],
+    ) -> Option<veil_types::ResolvedRelayKey> {
         // Relay-key resolves are the cold-restart hot path: the target IS the
         // relay we're connected to and about to register a mailbox with, so steer
         // BOTH the document and the relay-key lookups straight at it (it answers
@@ -920,7 +923,7 @@ impl DhtMlKemEkResolver {
                 )
             })
             .ok()?;
-        let pk = verify_relay_key(&rec, &doc, now_unix)
+        let verified = verify_relay_key(&rec, &doc, now_unix)
             .map_err(|e| {
                 self.log_dbg(
                     "relay_key_resolver.verify_failed",
@@ -931,9 +934,19 @@ impl DhtMlKemEkResolver {
             .ok()?;
         self.logger.debug(
             "relay_key_resolver.resolved",
-            format!("target={} relay_x25519 resolved", hex8(&target_node_id)),
+            format!(
+                "target={} relay_x25519 resolved valid_until={}",
+                hex8(&target_node_id),
+                verified.valid_until_unix,
+            ),
         );
-        Some(pk)
+        // The stamp goes with the key. Everything downstream — the IPC reply,
+        // and the rendezvous ad built from it — needs to know when this stops
+        // being the peer's key, and had no way to ask.
+        Some(veil_types::ResolvedRelayKey {
+            pk: verified.pk,
+            valid_until_unix: verified.valid_until_unix,
+        })
     }
 
     /// Multi-replica FIND_VALUE: ask every directly-reachable replication
@@ -1493,7 +1506,9 @@ impl RelayKeyResolver for DhtMlKemEkResolver {
     fn resolve_relay_x25519(
         &self,
         target_node_id: NodeIdBytes,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<[u8; 32]>> + Send + '_>> {
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Option<veil_types::ResolvedRelayKey>> + Send + '_>,
+    > {
         Box::pin(self.fetch_relay_x25519(target_node_id))
     }
 }

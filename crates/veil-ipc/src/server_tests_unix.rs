@@ -2302,11 +2302,16 @@ impl veil_types::RelayKeyResolver for SlowRelayKeyResolver {
     fn resolve_relay_x25519(
         &self,
         _target_node_id: [u8; 32],
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<[u8; 32]>> + Send + '_>> {
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Option<veil_types::ResolvedRelayKey>> + Send + '_>,
+    > {
         let delay = self.delay;
         Box::pin(async move {
             tokio::time::sleep(delay).await;
-            Some([0xAB; 32])
+            Some(veil_types::ResolvedRelayKey {
+                pk: [0xAB; 32],
+                valid_until_unix: u64::MAX,
+            })
         })
     }
 }
@@ -2428,12 +2433,16 @@ async fn request_id_same_arc_replies_out_of_order_by_id() {
         fn resolve_relay_x25519(
             &self,
             target_node_id: [u8; 32],
-        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<[u8; 32]>> + Send + '_>>
-        {
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Option<veil_types::ResolvedRelayKey>> + Send + '_>,
+        > {
             Box::pin(async move {
                 // target[0] encodes the delay in units of 10 ms.
                 tokio::time::sleep(Duration::from_millis(u64::from(target_node_id[0]) * 10)).await;
-                Some(target_node_id)
+                Some(veil_types::ResolvedRelayKey {
+                    pk: target_node_id,
+                    valid_until_unix: u64::MAX,
+                })
             })
         }
     }

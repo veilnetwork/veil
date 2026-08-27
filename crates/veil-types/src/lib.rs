@@ -267,7 +267,24 @@ pub trait RelayKeyResolver: Send + Sync {
     fn resolve_relay_x25519(
         &self,
         target_node_id: [u8; 32],
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<[u8; 32]>> + Send + '_>>;
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<ResolvedRelayKey>> + Send + '_>>;
+}
+
+/// A peer's relay X25519 key, and when it stops being theirs.
+///
+/// The key travelled alone, so whoever received it could only assume it stays
+/// good — and the rendezvous ad built from it is valid for up to thirty days.
+/// A key resolved shortly before an expiry or a revocation was therefore
+/// advertised long past both: the old private key goes on reading deposits, or
+/// a rotation turns the ad into a black hole nobody can reach (report17
+/// V17-M1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResolvedRelayKey {
+    /// The verified 32-byte X25519 relay KEM key.
+    pub pk: [u8; 32],
+    /// The end of the window the verifier computed: the record's own, clipped
+    /// to the signing subkey's and the document's.
+    pub valid_until_unix: u64,
 }
 
 // ── AnonOnionSender — authenticated anonymous send over rendezvous ────────────
@@ -390,6 +407,11 @@ pub trait AnonOnionSender: Send + Sync {
     /// mailbox PUT at `rendezvous_node_id`. Replaces any existing entry with the
     /// same `(rendezvous_node_id, auth_cookie)`. Empty `relay_kem_pk` advertises
     /// no key. Local + infallible — just records the entry.
+    ///
+    /// `relay_kem_valid_until_unix` is when the relay key stops being that
+    /// relay's, as the resolver reported it; the published ad's validity is
+    /// clipped to it. `0` means "not known" and leaves the ad on its own
+    /// window (report17 V17-M1).
     fn register_rendezvous_publisher(
         &self,
         rendezvous_node_id: [u8; 32],
@@ -397,6 +419,7 @@ pub trait AnonOnionSender: Send + Sync {
         validity_window_secs: u64,
         relay_kem_algo: u8,
         relay_kem_pk: Vec<u8>,
+        relay_kem_valid_until_unix: u64,
     );
 
     /// Send `data` to a LOCATION-anonymous service addressed by its Ed25519

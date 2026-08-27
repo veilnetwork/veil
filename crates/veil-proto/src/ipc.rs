@@ -1810,6 +1810,10 @@ pub struct RegisterRendezvousPublisherPayload {
     pub validity_window_secs: u64,
     pub relay_kem_algo: u8,
     pub relay_kem_pk: Vec<u8>,
+    /// When the relay key stops being that relay's, as the resolver reported
+    /// it. `0` from an app that predates the field, and the ad is then
+    /// published on its own window alone — which is what it always did.
+    pub relay_kem_valid_until_unix: u64,
 }
 
 impl RegisterRendezvousPublisherPayload {
@@ -1826,6 +1830,9 @@ impl RegisterRendezvousPublisherPayload {
         buf.push(self.relay_kem_algo);
         buf.extend_from_slice(&(kem_len as u16).to_be_bytes());
         buf.extend_from_slice(&self.relay_kem_pk[..kem_len]);
+        // APPENDED after the variable-length key, so a daemon that stops at
+        // the key reads everything before it exactly as it always did.
+        buf.extend_from_slice(&self.relay_kem_valid_until_unix.to_be_bytes());
         buf
     }
 
@@ -1855,12 +1862,20 @@ impl RegisterRendezvousPublisherPayload {
                 got: buf.len(),
             });
         }
+        // Absent from an app that predates the stamp: the ad then runs on its
+        // own window, as before.
+        let relay_kem_valid_until_unix = if buf.len() >= kem_end + 8 {
+            super::read_u64_be(buf, kem_end)?
+        } else {
+            0
+        };
         Ok(Self {
             rendezvous_node_id,
             auth_cookie,
             validity_window_secs,
             relay_kem_algo,
             relay_kem_pk: buf[Self::HEADER_SIZE..kem_end].to_vec(),
+            relay_kem_valid_until_unix,
         })
     }
 }
@@ -3713,15 +3728,28 @@ impl LookupRelayKeyPayload {
 pub struct LookupRelayKeyRespPayload {
     /// The verified 32-byte X25519 relay KEM key, or `None` if unresolved.
     pub relay_x25519: Option<[u8; 32]>,
+    /// When that key stops being the peer's — the record's own window, clipped
+    /// by the verifier to the signing subkey's and the document's.
+    ///
+    /// `0` from a daemon that predates the field. A caller reading 0 knows it
+    /// was not told, which is different from being told "forever": the key
+    /// used to arrive with no end at all, and the rendezvous ad built from it
+    /// is good for up to thirty days, so one resolved just before an expiry
+    /// or a revocation went on being advertised long past both (report17
+    /// V17-M1).
+    pub valid_until_unix: u64,
 }
 
 impl LookupRelayKeyRespPayload {
     pub fn encode(&self) -> Vec<u8> {
         match self.relay_x25519 {
             Some(pk) => {
-                let mut b = Vec::with_capacity(33);
+                let mut b = Vec::with_capacity(41);
                 b.push(1);
                 b.extend_from_slice(&pk);
+                // APPENDED, so a reader that stops after the key still reads
+                // the key correctly.
+                b.extend_from_slice(&self.valid_until_unix.to_be_bytes());
                 b
             }
             None => vec![0u8],
@@ -3730,7 +3758,10 @@ impl LookupRelayKeyRespPayload {
 
     pub fn decode(buf: &[u8]) -> Result<Self, ProtoError> {
         match buf.first() {
-            Some(0) => Ok(Self { relay_x25519: None }),
+            Some(0) => Ok(Self {
+                relay_x25519: None,
+                valid_until_unix: 0,
+            }),
             Some(1) => {
                 if buf.len() < 33 {
                     return Err(ProtoError::BufferTooShort {
@@ -3738,8 +3769,16 @@ impl LookupRelayKeyRespPayload {
                         got: buf.len(),
                     });
                 }
+                // A daemon that predates the stamp sends 33 bytes; one that
+                // has it sends 41. Both are read here.
+                let valid_until_unix = if buf.len() >= 41 {
+                    u64::from_be_bytes(super::read_array::<8>(buf, 33)?)
+                } else {
+                    0
+                };
                 Ok(Self {
                     relay_x25519: Some(super::read_array::<32>(buf, 1)?),
+                    valid_until_unix,
                 })
             }
             _ => Err(ProtoError::Malformed(
@@ -8824,5 +8863,63 @@ mod tests {
             assert_eq!(SetWakeHmacEnvelopeStatus::from_wire(byte).unwrap(), s);
         }
         assert!(SetWakeHmacEnvelopeStatus::from_wire(99).is_err());
+    }
+
+    /// The relay key's expiry travels with it, both ways, and an older peer on
+    /// either side still reads what it always read.
+    ///
+    /// Both payloads gained a stamp: the ad built from a relay key can be
+    /// valid for thirty days while the key is not (report17 V17-M1). Appending
+    /// is what keeps a daemon and an app of different vintages talking.
+    #[test]
+    fn relay_key_reply_carries_its_expiry_and_stays_readable_without_it() {
+        let with = LookupRelayKeyRespPayload {
+            relay_x25519: Some([0x5A; 32]),
+            valid_until_unix: 1_700_000_000,
+        };
+        let bytes = with.encode();
+        assert_eq!(LookupRelayKeyRespPayload::decode(&bytes).unwrap(), with);
+
+        // What a daemon that predates the stamp sends: present byte + key.
+        let older = &bytes[..33];
+        let back = LookupRelayKeyRespPayload::decode(older).unwrap();
+        assert_eq!(back.relay_x25519, Some([0x5A; 32]));
+        assert_eq!(
+            back.valid_until_unix, 0,
+            "an unstamped reply must read as \"not told\", never as forever"
+        );
+
+        // And "no key" is still one byte.
+        let none = LookupRelayKeyRespPayload {
+            relay_x25519: None,
+            valid_until_unix: 0,
+        };
+        assert_eq!(none.encode(), vec![0u8]);
+    }
+
+    #[test]
+    fn register_publisher_carries_the_relay_key_expiry() {
+        let p = RegisterRendezvousPublisherPayload {
+            rendezvous_node_id: [0x11; 32],
+            auth_cookie: [0x22; 16],
+            validity_window_secs: 3600,
+            relay_kem_algo: 0,
+            relay_kem_pk: vec![0x33; 32],
+            relay_kem_valid_until_unix: 1_700_000_000,
+        };
+        let bytes = p.encode();
+        assert_eq!(
+            RegisterRendezvousPublisherPayload::decode(&bytes).unwrap(),
+            p
+        );
+
+        // What an app that predates the stamp sends: everything up to the key.
+        let older = &bytes[..bytes.len() - 8];
+        let back = RegisterRendezvousPublisherPayload::decode(older).unwrap();
+        assert_eq!(back.relay_kem_pk, vec![0x33; 32]);
+        assert_eq!(
+            back.relay_kem_valid_until_unix, 0,
+            "an unstamped registration must leave the ad on its own window"
+        );
     }
 }
