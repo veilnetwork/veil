@@ -131,8 +131,7 @@ int _openStreamWorker(int appAddr, Uint8List dstNode, Uint8List dstApp,
   // Pre-set to the fail-closed value: if the native call ever returned without
   // writing it, the caller must read "unverified", not whatever the allocator
   // left behind (X/V-01).
-  final outProvenance = calloc<Uint8>(1)
-    ..value = ffi.veilProvenanceClaimed;
+  final outProvenance = calloc<Uint8>(1)..value = ffi.veilProvenanceClaimed;
   final errOut = calloc<Pointer<Utf8>>();
   try {
     final ptr =
@@ -476,24 +475,34 @@ List<String> _listenTransportsWorker(int handleAddr) {
   }
 }
 
-Uint8List? _lookupRelayX25519Worker(int handleAddr, Uint8List nodeId) {
+({Uint8List key, int validUntilUnix})? _lookupRelayX25519Worker(
+    int handleAddr, Uint8List nodeId) {
   final handle = Pointer<ffi.VeilHandle>.fromAddress(handleAddr);
   final node = calloc<Uint8>(32);
   final out = calloc<Uint8>(32);
+  final until = calloc<Uint64>();
   final errOut = calloc<Pointer<Utf8>>();
   try {
     node.asTypedList(32).setAll(0, nodeId);
-    final rc = ffi.veilLookupRelayX25519(handle, node, out, errOut);
+    // The stamped export. It answers the question the bare one could not: how
+    // long this is the relay's key. Without it the ad built from the key runs
+    // for its own thirty days regardless (report17 V17-M1).
+    final rc =
+        ffi.veilLookupRelayX25519WithExpiry(handle, node, out, until, errOut);
     if (rc == ffi.veilRelayX25519Unavailable) return null;
     if (rc != ffi.veilOk) {
       throw VeilException(
           'lookup_relay_x25519 failed: ${_readErrAndFree(errOut)}',
           code: rc);
     }
-    return Uint8List.fromList(out.asTypedList(32));
+    return (
+      key: Uint8List.fromList(out.asTypedList(32)),
+      validUntilUnix: until.value,
+    );
   } finally {
     calloc.free(node);
     calloc.free(out);
+    calloc.free(until);
     calloc.free(errOut);
   }
 }
@@ -541,6 +550,7 @@ void _registerRendezvousPublisherWorker(
   int validityWindowSecs,
   int relayKemAlgo,
   Uint8List kem,
+  int relayKemValidUntilUnix,
 ) {
   final handle = Pointer<ffi.VeilHandle>.fromAddress(handleAddr);
   final nodeId = calloc<Uint8>(32);
@@ -551,8 +561,16 @@ void _registerRendezvousPublisherWorker(
     nodeId.asTypedList(32).setAll(0, rendezvousNodeId);
     cookie.asTypedList(16).setAll(0, authCookie);
     if (kem.isNotEmpty) kemPtr.asTypedList(kem.length).setAll(0, kem);
-    final rc = ffi.veilRegisterRendezvousPublisher(handle, nodeId, cookie,
-        validityWindowSecs, relayKemAlgo, kemPtr, kem.length, errOut);
+    final rc = ffi.veilRegisterRendezvousPublisherWithExpiry(
+        handle,
+        nodeId,
+        cookie,
+        validityWindowSecs,
+        relayKemAlgo,
+        kemPtr,
+        kem.length,
+        relayKemValidUntilUnix,
+        errOut);
     if (rc != ffi.veilOk) {
       throw VeilException(
           'register_rendezvous_publisher failed: ${_readErrAndFree(errOut)}',
@@ -1294,7 +1312,13 @@ class VeilClient implements Finalizable {
   /// record published / DHT miss / verification failed). Lets a receiver
   /// advertise an always-on third-party relay as its mailbox host knowing only
   /// that relay's node_id.
-  Future<Uint8List?> lookupRelayX25519(Uint8List nodeId) async {
+  ///
+  /// Returns the key AND when it stops being that relay's, so the ad built
+  /// from it can be clipped to that: an ad may be valid for thirty days while
+  /// the key behind it is published under a delegation good for about a week
+  /// (report17 V17-M1). `validUntilUnix == 0` means the daemon did not say.
+  Future<({Uint8List key, int validUntilUnix})?> lookupRelayX25519(
+      Uint8List nodeId) async {
     _ensureOpen();
     if (nodeId.length != 32) {
       throw ArgumentError('nodeId must be 32 bytes, got ${nodeId.length}');
@@ -1425,12 +1449,18 @@ class VeilClient implements Finalizable {
   /// [VeilMailbox.lookupRendezvousReplicas] can anonymously deposit a mailbox
   /// PUT. Replaces any existing entry with the same ([rendezvousNodeId],
   /// [authCookie]). Pass an empty [relayKemPk] to advertise no key.
+  ///
+  /// [relayKemValidUntilUnix] is what [lookupRelayX25519] returned beside the
+  /// key; the daemon clips the ad's own validity to it, so the ad stops
+  /// advertising a key when that key stops being the relay's (report17
+  /// V17-M1). `0` means "not known" and leaves the ad on its own window.
   Future<void> registerRendezvousPublisher({
     required Uint8List rendezvousNodeId,
     required Uint8List authCookie,
     required int validityWindowSecs,
     int relayKemAlgo = 0,
     Uint8List? relayKemPk,
+    int relayKemValidUntilUnix = 0,
   }) async {
     _ensureOpen();
     if (rendezvousNodeId.length != 32 || authCookie.length != 16) {
@@ -1449,6 +1479,7 @@ class VeilClient implements Finalizable {
           validityWindowSecs,
           relayKemAlgo,
           kem,
+          relayKemValidUntilUnix,
         ));
   }
 
@@ -2486,8 +2517,8 @@ class AppHandle implements Finalizable {
       throw ArgumentError('my_node_id and dst_app_id must be 32 bytes');
     }
     final appAddr = _app.address;
-    return Isolate.run(() =>
-        _sendToMyDevicesWorker(appAddr, myNodeId, dstAppId, dstEndpointId, data));
+    return Isolate.run(() => _sendToMyDevicesWorker(
+        appAddr, myNodeId, dstAppId, dstEndpointId, data));
   }
 
   /// Send a loss-tolerant datagram over an already-active direct peer session
