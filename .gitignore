@@ -70,3 +70,6 @@ ab-data/
 /TASKS.md
 /TASKS_ARCHIVE.md
 /the local release checklist
+
+# Working notes kept beside the tree and never published.
+*.local.md
