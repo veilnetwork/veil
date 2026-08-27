@@ -317,13 +317,18 @@ fn tunnel_args(proxy_url: &str, dns_ip: &str, mtu: u16, route_dns: bool) -> Resu
     })
 }
 
-/// Runtimes taken down with work still running, since this process started.
+/// Runtime THREADS that did not come back, since this process started.
 ///
-/// Each one is a thread that did not come back. Zero is the expected value:
-/// blocking work that observes the cancellation token finishes inside
-/// [`RUNTIME_SHUTDOWN_GRACE`]. A number that climbs means something is parked
-/// in a syscall nothing here can interrupt, and that is worth being able to
-/// read rather than infer from memory use.
+/// Zero is the expected value: blocking work that observes the cancellation
+/// token finishes inside [`RUNTIME_SHUTDOWN_GRACE`]. A number that climbs
+/// means something is parked in a syscall nothing here can interrupt, and
+/// that is worth being able to read rather than infer from memory use.
+///
+/// Counted from the threads themselves — a thread that never returns never
+/// runs its stop hook — and not from how long the shutdown took. The elapsed
+/// time measures a timeout: a machine the scheduler paused for half a second
+/// reported an abandonment that did not happen, and it could only ever say
+/// "at least one" for a teardown that stranded several (report16 V16-M5).
 static ABANDONED_WORKERS: AtomicUsize = AtomicUsize::new(0);
 
 /// How many runtimes were abandoned with work still running. See
@@ -362,8 +367,27 @@ where
     let thread = match std::thread::Builder::new()
         .name("veil-packet-tunnel".to_owned())
         .spawn(move || {
+            // Every thread this runtime starts, counted in and counted out.
+            //
+            // What follows the shutdown used to be inferred from ELAPSED TIME:
+            // if `shutdown_timeout` took as long as the grace, something was
+            // assumed to have been abandoned. That measures a timeout, not a
+            // thread — a machine paused by the scheduler for half a second
+            // reports an abandonment that did not happen, and a thread
+            // abandoned quickly reports none (report16 V16-M5). The threads
+            // themselves say so: one that never returns never runs its stop
+            // hook.
+            let live_threads = Arc::new(AtomicUsize::new(0));
+            let started = Arc::clone(&live_threads);
+            let stopped = Arc::clone(&live_threads);
             let runtime = match tokio::runtime::Builder::new_multi_thread()
                 .worker_threads(2)
+                .on_thread_start(move || {
+                    started.fetch_add(1, Ordering::AcqRel);
+                })
+                .on_thread_stop(move || {
+                    stopped.fetch_sub(1, Ordering::AcqRel);
+                })
                 .enable_all()
                 .build()
             {
@@ -413,14 +437,16 @@ where
             // waking the reader, and which task parks is not established: the
             // blocking read lives in a crate this tree does not own. A number
             // that grows is what lets that be diagnosed instead of inferred.
-            let began = std::time::Instant::now();
             runtime.shutdown_timeout(RUNTIME_SHUTDOWN_GRACE);
-            // Read ONCE. Asking twice measures whatever happened in between as
-            // well, which is how a diagnostic print made this report two
-            // abandoned workers that were not.
-            let took = began.elapsed();
-            if took >= RUNTIME_SHUTDOWN_GRACE {
-                ABANDONED_WORKERS.fetch_add(1, Ordering::Release);
+            // Counted from the threads, not from the clock. `shutdown_timeout`
+            // returns once every thread it could join has joined, so whatever
+            // this still counts is a thread that did not come back — one
+            // increment per thread rather than one per teardown, which is what
+            // makes a number that grows say how much is parked rather than how
+            // many times something was slow.
+            let left = live_threads.load(Ordering::Acquire);
+            if left > 0 {
+                ABANDONED_WORKERS.fetch_add(left, Ordering::Release);
             }
         }) {
         Ok(thread) => thread,
@@ -1073,6 +1099,72 @@ mod tests {
             "the slot was still held, so the VPN could not be restarted"
         );
         assert_eq!(veil_packet_tunnel_stop(), crate::VEIL_OK);
+    }
+
+    /// report16 V16-M5: what the counter counts is THREADS, not timeouts.
+    ///
+    /// It used to compare the shutdown's elapsed time against the grace and
+    /// add one if it ran over. That measures a timeout: a machine the
+    /// scheduler paused for half a second reported an abandonment that did not
+    /// happen, and a teardown that stranded three threads could only ever say
+    /// one. The threads themselves say so — one that never returns never runs
+    /// its stop hook.
+    ///
+    /// Two parked tasks, so the difference between "one per teardown" and
+    /// "one per thread" is visible in the number.
+    #[test]
+    fn abandoned_workers_counts_threads_not_teardowns() {
+        let _serial = SLOT_SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        let before = veil_packet_tunnel_abandoned_workers();
+
+        let parked = launch_tunnel(None, None, 1280, |runtime, cancel| {
+            // Neither can be woken, and both outlive the grace.
+            runtime.spawn_blocking(|| std::thread::sleep(Duration::from_secs(3600)));
+            runtime.spawn_blocking(|| std::thread::sleep(Duration::from_secs(3600)));
+            runtime.block_on(async move { cancel.cancelled().await });
+            Ok(0)
+        });
+        assert_eq!(parked, crate::VEIL_OK, "the tunnel did not start");
+        assert_eq!(veil_packet_tunnel_stop(), crate::VEIL_OK);
+
+        // `stop` joins the worker thread, which does the shutdown, so the
+        // count is settled by the time stop returns.
+        let added = veil_packet_tunnel_abandoned_workers() - before;
+        assert!(
+            added >= 2,
+            "counted {added} for two threads that did not come back — the \
+             number says how many teardowns were slow, not how much is parked"
+        );
+    }
+
+    /// CONTROL: a teardown that strands nothing counts nothing.
+    ///
+    /// Without this the test above is satisfied by a counter that adds the
+    /// thread count on every stop, which is worse than the elapsed-time proxy
+    /// it replaced.
+    #[test]
+    fn a_clean_teardown_counts_nothing() {
+        let _serial = SLOT_SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        let before = veil_packet_tunnel_abandoned_workers();
+
+        let clean = launch_tunnel(None, None, 1280, |runtime, cancel| {
+            runtime.block_on(async move { cancel.cancelled().await });
+            Ok(0)
+        });
+        assert_eq!(clean, crate::VEIL_OK, "the tunnel did not start");
+        assert_eq!(veil_packet_tunnel_stop(), crate::VEIL_OK);
+
+        assert_eq!(
+            veil_packet_tunnel_abandoned_workers(),
+            before,
+            "a teardown that stranded nothing was counted as an abandonment"
+        );
     }
 
     /// report15 V15-M1: one flow's setup error is not the tunnel's, and a
