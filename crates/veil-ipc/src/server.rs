@@ -2750,15 +2750,23 @@ async fn handle_ipc_client(
                         } else if let Ok(p) = RegisterRendezvousPublisherPayload::decode(&body) {
                             match anon_onion_sender.as_deref() {
                                 Some(s) => {
-                                    s.register_rendezvous_publisher(
+                                    // A node publishes a bounded number of
+                                    // ads. Registering past that used to
+                                    // answer 0 and never publish, so the
+                                    // caller believed its mailbox was
+                                    // discoverable (report17 V17-M6).
+                                    if s.register_rendezvous_publisher(
                                         p.rendezvous_node_id,
                                         p.auth_cookie,
                                         p.validity_window_secs,
                                         p.relay_kem_algo,
                                         p.relay_kem_pk,
                                         p.relay_kem_valid_until_unix,
-                                    );
-                                    0
+                                    ) {
+                                        0
+                                    } else {
+                                        ipc_send_err::RENDEZVOUS_SLOTS_FULL
+                                    }
                                 }
                                 None => ipc_send_err::NO_RENDEZVOUS,
                             }

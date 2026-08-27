@@ -412,6 +412,12 @@ pub trait AnonOnionSender: Send + Sync {
     /// relay's, as the resolver reported it; the published ad's validity is
     /// clipped to it. `0` means "not known" and leaves the ad on its own
     /// window (report17 V17-M1).
+    ///
+    /// Returns whether the node actually holds a publisher slot for it. A node
+    /// publishes a bounded number of rendezvous ads; the registry used to
+    /// accept every registration and publish only the first few, so a caller
+    /// past that point was told its mailbox was live when nothing ever signed
+    /// it (report17 V17-M6).
     fn register_rendezvous_publisher(
         &self,
         rendezvous_node_id: [u8; 32],
@@ -420,7 +426,7 @@ pub trait AnonOnionSender: Send + Sync {
         relay_kem_algo: u8,
         relay_kem_pk: Vec<u8>,
         relay_kem_valid_until_unix: u64,
-    );
+    ) -> bool;
 
     /// Send `data` to a LOCATION-anonymous service addressed by its Ed25519
     /// IDENTITY key (the unlinkable analogue of [`Self::send_authenticated`],

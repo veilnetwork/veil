@@ -8170,13 +8170,22 @@ impl NodeServices {
     /// learn `R` and the receiver X25519 key, then address circuit cells to the
     /// deterministic stream cookie.
     pub fn publish_stream_rendezvous_ad(&self, relay: [u8; 32], cookie: [u8; 16]) {
-        service_tasks::rendezvous_register_publisher(
+        if !service_tasks::rendezvous_register_publisher(
             &self.anonymity,
             &relay,
             cookie,
             service_tasks::RENDEZVOUS_AD_VALIDITY_SECS,
             None,
-        );
+        ) {
+            // Said out loud rather than swallowed: this receiver's stream ad
+            // will not be published, and every sender resolving it finds
+            // nothing (report17 V17-M6).
+            self.logger.warn(
+                "anonymity.rendezvous_ad.slots_full",
+                "no publisher slot left for the stream rendezvous ad — it will \
+                 not be published",
+            );
+        }
         let published = NodeRuntime::tick_publish_rendezvous_ads(
             &self.anonymity.rendezvous_publisher_entries,
             self.anonymity.x25519_sk.as_ref(),
@@ -9063,7 +9072,7 @@ impl NodeServices {
         let publish_seed = identity_seed.clone();
         let publish_slot = descriptor_provider_slot;
         let publish = move |this: &NodeServices| {
-            service_tasks::rendezvous_register_publisher(
+            let registered = service_tasks::rendezvous_register_publisher(
                 &this.anonymity,
                 &relay,
                 cookie,
@@ -9074,6 +9083,15 @@ impl NodeServices {
                 service_tasks::RENDEZVOUS_AD_VALIDITY_SECS,
                 ephemeral_ad_identity,
             );
+            if !registered {
+                // Nothing will sign this service's ad, so it is undiscoverable
+                // by the rendezvous path however well the rest of the
+                // registration went (report17 V17-M6).
+                this.logger.warn(
+                    "anonymity.rendezvous_ad.slots_full",
+                    "no publisher slot left for this service's rendezvous ad",
+                );
+            }
             // Also publish a BLINDED descriptor (3c): identity-unlinkable in the
             // DHT. Capability services use their random per-share identity here,
             // never the host's sovereign key.
