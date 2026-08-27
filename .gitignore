@@ -10,7 +10,6 @@ temp.md
 **/dht_values.json
 
 # Loop-state lock + ad-hoc planning notes from interactive sessions
-/.agent/
 /temp
 
 # Release-signing secrets — backstop only. PREFER keeping these OUTSIDE the
@@ -66,10 +65,4 @@ flutter/veil_media/build/
 # A/B snapshot CSVs (scripts/ab-dht-fallback-snapshot.sh) — transient testnet data
 ab-data/
 
-# Local working notes — see the xVeil .gitignore for why.
-/TASKS.md
-/TASKS_ARCHIVE.md
-/the local release checklist
 
-# Working notes kept beside the tree and never published.
-*.local.md
