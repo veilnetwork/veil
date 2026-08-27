@@ -54,6 +54,12 @@ const MAX_POW_PER_WALK: usize = 1;
 /// PoW for it.
 struct WalkTicket {
     issued_at: Instant,
+    /// What the far end must echo for its answer to be believed.
+    ///
+    /// Zero when this node minted none — it always does now, so a zero here
+    /// would be a bug rather than a state; the ACCEPTANCE rule below is what
+    /// handles a zero coming back from a responder too old to echo.
+    nonce: [u8; 32],
     /// The hop this walk was handed to.
     ///
     /// A Result travels back along the path the Walk took, so at the origin it
@@ -99,7 +105,7 @@ impl PexState {
     }
 
     /// Record a walk this node put on the wire, and the hop it went to.
-    fn note_walk_sent(&mut self, walk_id: u64, sent_to: [u8; 32]) {
+    fn note_walk_sent(&mut self, walk_id: u64, sent_to: [u8; 32], nonce: [u8; 32]) {
         let now = Instant::now();
         self.outstanding_walks
             .retain(|_, t| now.duration_since(t.issued_at) < WALK_CHALLENGE_WINDOW);
@@ -121,6 +127,7 @@ impl PexState {
             WalkTicket {
                 issued_at: now,
                 sent_to,
+                nonce,
                 paid: HashSet::new(),
             },
         );
@@ -169,7 +176,7 @@ impl PexState {
     /// that needs an end-to-end challenge the wire format has no room for
     /// today, and every contact in a Result is still checked for its
     /// node_id↔public_key binding before it is kept.
-    fn consume_walk(&mut self, walk_id: u64, from_peer: [u8; 32]) -> bool {
+    fn consume_walk(&mut self, walk_id: u64, from_peer: [u8; 32], echoed: [u8; 32]) -> bool {
         let now = Instant::now();
         let Some(ticket) = self.outstanding_walks.get(&walk_id) else {
             return false;
@@ -183,6 +190,21 @@ impl PexState {
             // Deliberately NOT removed. Dropping the ticket here would let any
             // peer cancel a walk it was not part of simply by naming its id
             // first, which trades one injection for a denial.
+            return false;
+        }
+        // The far end's proof, when it offered one.
+        //
+        // All zeros means the responder is too old to echo — the field is
+        // appended to the wire format and a pre-field node simply does not
+        // send it. Those are accepted exactly as before, which is what makes
+        // this a rolling upgrade rather than a flag day; once no such node is
+        // left the `is_none` arm below becomes the refusal it wants to be
+        // (report16 V16-M3).
+        //
+        // A WRONG echo is refused outright: nobody honest sends one. And like
+        // the wrong-peer case above, the ticket stays — otherwise naming a
+        // live walk with a bad echo would cancel it.
+        if echoed != [0u8; 32] && echoed != ticket.nonce {
             return false;
         }
         self.outstanding_walks.remove(&walk_id);
@@ -460,6 +482,12 @@ fn send_walks(
     let parallelism = config.walk_parallelism as usize;
     for _ in 0..parallelism {
         let walk_id = OsRng.next_u64();
+        // A number only this origin knows, for the far end to echo. The ticket
+        // proves a Result answers OUR walk and came from the hop we handed it
+        // to; this is what separates the far end's answer from one composed by
+        // that hop, which sees the walk_id (report16 V16-M3).
+        let mut walk_nonce = [0u8; 32];
+        OsRng.fill_bytes(&mut walk_nonce);
         let mut target_node_id = [0u8; 32];
         OsRng.fill_bytes(&mut target_node_id);
         let ttl = 4 + (OsRng.next_u32() % 9) as u8; // 4..12
@@ -484,6 +512,7 @@ fn send_walks(
             // can learn + dial us back — the path that lets an under-connected
             // origin become reachable cluster-wide.
             origin_transport: local_advertise.to_string(),
+            walk_nonce,
         };
 
         let frame = encode_pex_frame(PexMsg::Walk, &walk.encode());
@@ -519,7 +548,7 @@ fn send_walks(
             // incremented here whether or not there was a peer to send to, so
             // an isolated node reported walks it never made.
             let mut state = pex_state.lock().unwrap_or_else(|p| p.into_inner());
-            state.note_walk_sent(walk_id, first_hop);
+            state.note_walk_sent(walk_id, first_hop, walk_nonce);
             state.last_walk_at = Some(Instant::now());
         }
     }
@@ -705,7 +734,7 @@ async fn handle_result(
         let mut state = pex_state.lock().unwrap_or_else(|p| p.into_inner());
         // The ticket, or nothing. An answer to a question this node did not
         // ask is not an answer.
-        if !state.consume_walk(result.walk_id, from_peer) {
+        if !state.consume_walk(result.walk_id, from_peer, result.walk_nonce) {
             drop(state);
             logger.warn(
                 "pex.result.unsolicited",
@@ -778,7 +807,7 @@ fn handle_learned_peer(
 /// Returns `None` if no solution found within the iteration limit.
 /// The limit is `2^(difficulty+2)` (4× the expected average), capped at 2^33
 /// to keep worst-case runtime under a few minutes on slow devices.
-fn solve_pex_pow(challenge_nonce: &[u8; 32], difficulty: u8) -> Option<[u8; 32]> {
+pub(crate) fn solve_pex_pow(challenge_nonce: &[u8; 32], difficulty: u8) -> Option<[u8; 32]> {
     // 4× expected attempts for the given difficulty, capped at ~8 billion.
     let max_iterations: u64 = if difficulty >= 31 {
         1u64 << 33
@@ -926,7 +955,7 @@ mod tests {
         state
             .lock()
             .unwrap_or_else(|p| p.into_inner())
-            .note_walk_sent(walk_id, CHALLENGER);
+            .note_walk_sent(walk_id, CHALLENGER, WALK_NONCE);
 
         let challenge = veil_proto::pex::PexChallenge {
             walk_id,
@@ -986,7 +1015,7 @@ mod tests {
     #[test]
     fn a_sent_walk_pays_one_hop() {
         let mut state = PexState::new();
-        state.note_walk_sent(42, FIRST_HOP);
+        state.note_walk_sent(42, FIRST_HOP, WALK_NONCE);
         assert_eq!(state.active_walks, 1);
 
         let hop_a = [1u8; 32];
@@ -1010,7 +1039,7 @@ mod tests {
     #[test]
     fn one_walk_cannot_be_milked_past_its_ceiling() {
         let mut state = PexState::new();
-        state.note_walk_sent(9, FIRST_HOP);
+        state.note_walk_sent(9, FIRST_HOP, WALK_NONCE);
         for i in 0..MAX_POW_PER_WALK {
             let mut hop = [0u8; 32];
             hop[0] = i as u8;
@@ -1030,7 +1059,7 @@ mod tests {
     fn outstanding_walks_are_bounded() {
         let mut state = PexState::new();
         for id in 0..(MAX_OUTSTANDING_WALKS as u64 * 3) {
-            state.note_walk_sent(id, FIRST_HOP);
+            state.note_walk_sent(id, FIRST_HOP, WALK_NONCE);
         }
         assert!(
             state.outstanding_walks.len() <= MAX_OUTSTANDING_WALKS,
@@ -1044,23 +1073,26 @@ mod tests {
     /// which one it was.
     const FIRST_HOP: [u8; 32] = [0xF1; 32];
 
+    /// The number the far end must echo, for the tests that do not care which.
+    const WALK_NONCE: [u8; 32] = [0x9E; 32];
+
     /// The gauge used to be decremented for ANY Result, so an unsolicited one
     /// naming an invented walk_id drove it toward zero while real walks were
     /// still open.
     #[test]
     fn retiring_a_walk_we_never_sent_moves_nothing() {
         let mut state = PexState::new();
-        state.note_walk_sent(1, FIRST_HOP);
-        state.note_walk_sent(2, FIRST_HOP);
+        state.note_walk_sent(1, FIRST_HOP, WALK_NONCE);
+        state.note_walk_sent(2, FIRST_HOP, WALK_NONCE);
         assert_eq!(state.active_walks, 2);
 
         assert!(
-            !state.consume_walk(0xABCD, FIRST_HOP),
+            !state.consume_walk(0xABCD, FIRST_HOP, WALK_NONCE),
             "an unknown walk_id is not ours to retire"
         );
         assert_eq!(state.active_walks, 2, "an unknown walk_id retires nothing");
 
-        assert!(state.consume_walk(1, FIRST_HOP));
+        assert!(state.consume_walk(1, FIRST_HOP, WALK_NONCE));
         assert_eq!(state.active_walks, 1);
     }
 
@@ -1072,11 +1104,11 @@ mod tests {
     #[test]
     fn a_result_from_a_peer_the_walk_never_went_to_is_refused() {
         let mut state = PexState::new();
-        state.note_walk_sent(7, FIRST_HOP);
+        state.note_walk_sent(7, FIRST_HOP, WALK_NONCE);
 
         let stranger = [0x5A; 32];
         assert!(
-            !state.consume_walk(7, stranger),
+            !state.consume_walk(7, stranger, WALK_NONCE),
             "a peer the walk was never handed to answered it"
         );
         assert_eq!(
@@ -1086,9 +1118,114 @@ mod tests {
         );
 
         assert!(
-            state.consume_walk(7, FIRST_HOP),
+            state.consume_walk(7, FIRST_HOP, WALK_NONCE),
             "the real answer must still be accepted after the attempt"
         );
+    }
+
+    /// The relay in the middle sees the walk_id. It does not see the nonce.
+    ///
+    /// The ticket already binds a Result to a walk this node sent and to the
+    /// hop it was handed to — and that hop is the FIRST one, which forwards
+    /// the walk and relays the answer back. Nothing in a Result proved it came
+    /// from the node that TERMINATED the walk rather than from that relay,
+    /// which could compose one of its own from the walk_id it can read
+    /// (report16 V16-M3). Only a node that read the walk knows this number.
+    #[test]
+    fn a_result_echoing_the_wrong_number_is_refused() {
+        let mut state = PexState::new();
+        state.note_walk_sent(7, FIRST_HOP, WALK_NONCE);
+
+        assert!(
+            !state.consume_walk(7, FIRST_HOP, [0x11; 32]),
+            "a Result from the right hop with the wrong nonce was believed"
+        );
+        assert_eq!(
+            state.active_walks, 1,
+            "and it cancelled the walk we are still waiting on — which trades \
+             an injection for a denial"
+        );
+
+        assert!(
+            state.consume_walk(7, FIRST_HOP, WALK_NONCE),
+            "the real answer must still be accepted after the attempt"
+        );
+    }
+
+    /// A responder too old to echo is accepted, and that is what makes this a
+    /// rolling upgrade rather than a flag day.
+    ///
+    /// The field is appended to the wire format, so a node on the previous
+    /// version simply does not send it and the decoder reads zeros. Refusing
+    /// those would take every un-upgraded peer's answers off the table the
+    /// moment one node updated.
+    #[test]
+    fn a_result_from_a_node_too_old_to_echo_is_still_accepted() {
+        let mut state = PexState::new();
+        state.note_walk_sent(7, FIRST_HOP, WALK_NONCE);
+
+        assert!(
+            state.consume_walk(7, FIRST_HOP, [0u8; 32]),
+            "an answer carrying no proof was refused, which is a flag day"
+        );
+        assert_eq!(state.active_walks, 0, "and the ticket is still consumed");
+    }
+
+    /// And the branch that would have to judge a zero ticket nonce is
+    /// unreachable, because the origin always mints one.
+    ///
+    /// This started as a test of what SHOULD happen when the ticket holds no
+    /// nonce and the answer carries one. There is no such state: the nonce
+    /// comes from the CSPRNG on every walk. Asserting a preference for a case
+    /// that cannot occur is how a rule gets written for a situation nobody
+    /// will ever be in; what is worth holding is the invariant that keeps it
+    /// out of reach.
+    #[test]
+    fn every_walk_this_node_sends_carries_a_nonce() {
+        const PEER: [u8; 32] = [0xAB; 32];
+
+        struct Accepting;
+        impl FrameBroadcaster for Accepting {
+            fn send_to(&self, _peer_id: &[u8; 32], _priority: u8, _bytes: Vec<u8>) -> bool {
+                true
+            }
+            fn send_to_all_with_priority(&self, _priority: u8, _bytes: std::sync::Arc<[u8]>) {}
+            fn active_node_ids(&self) -> Vec<[u8; 32]> {
+                vec![PEER]
+            }
+        }
+
+        struct Quiet;
+        impl PexLogger for Quiet {
+            fn info(&self, _: &str, _: &str) {}
+            fn warn(&self, _: &str, _: &str) {}
+        }
+
+        let config = PexConfig {
+            walk_parallelism: 4,
+            ..PexConfig::default()
+        };
+        let state = Arc::new(Mutex::new(PexState::new()));
+        send_walks(
+            &[1u8; 32],
+            &[2u8; 32],
+            0,
+            None,
+            &config,
+            &Accepting,
+            &state,
+            "tcp://10.0.0.1:5555",
+            &Quiet,
+        );
+
+        let held = state.lock().unwrap();
+        assert_eq!(held.outstanding_walks.len(), 4, "premise: four walks left");
+        for (id, ticket) in held.outstanding_walks.iter() {
+            assert_ne!(
+                ticket.nonce, [0u8; 32],
+                "walk {id} went out with nothing for the far end to echo"
+            );
+        }
     }
 
     /// Once-only: the ticket is CONSUMED, so a replay of a genuine Result
@@ -1096,14 +1233,14 @@ mod tests {
     #[test]
     fn a_result_answers_its_walk_exactly_once() {
         let mut state = PexState::new();
-        state.note_walk_sent(7, FIRST_HOP);
+        state.note_walk_sent(7, FIRST_HOP, WALK_NONCE);
 
         assert!(
-            state.consume_walk(7, FIRST_HOP),
+            state.consume_walk(7, FIRST_HOP, WALK_NONCE),
             "premise: the first answer"
         );
         assert!(
-            !state.consume_walk(7, FIRST_HOP),
+            !state.consume_walk(7, FIRST_HOP, WALK_NONCE),
             "the same Result was accepted twice"
         );
         assert_eq!(state.active_walks, 0);
@@ -1113,7 +1250,7 @@ mod tests {
     #[test]
     fn a_result_past_the_window_is_refused_and_the_ticket_goes() {
         let mut state = PexState::new();
-        state.note_walk_sent(7, FIRST_HOP);
+        state.note_walk_sent(7, FIRST_HOP, WALK_NONCE);
         // Reach past the window without sleeping through it.
         state
             .outstanding_walks
@@ -1122,7 +1259,7 @@ mod tests {
             .issued_at -= WALK_CHALLENGE_WINDOW;
 
         assert!(
-            !state.consume_walk(7, FIRST_HOP),
+            !state.consume_walk(7, FIRST_HOP, WALK_NONCE),
             "an expired walk answered"
         );
         assert_eq!(state.active_walks, 0, "the dead ticket was kept");
@@ -1204,6 +1341,7 @@ mod tests {
         let result = PexResult {
             walk_id: 1,
             peers: vec![good, bad],
+            walk_nonce: [0u8; 32],
         };
         let pex_state = Arc::new(Mutex::new(PexState::new()));
         // Premise: these ARE answers to walks this node sent to that peer.
@@ -1212,8 +1350,8 @@ mod tests {
         // while proving nothing about the filters they are about.
         {
             let mut state = pex_state.lock().unwrap();
-            state.note_walk_sent(1, [0u8; 32]);
-            state.note_walk_sent(2, [0u8; 32]);
+            state.note_walk_sent(1, [0u8; 32], WALK_NONCE);
+            state.note_walk_sent(2, [0u8; 32], WALK_NONCE);
         }
         let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<PexPeer>>(4);
         let config = PexConfig::default();
@@ -1341,6 +1479,7 @@ mod tests {
             &PexResult {
                 walk_id: 1,
                 peers: vec![peer.clone()],
+                walk_nonce: [0u8; 32],
             },
             STRANGER,
             &config,
@@ -1356,11 +1495,15 @@ mod tests {
         assert!(rx.try_recv().is_err(), "and handed to the runtime to dial");
 
         // 2. A live walk of ours, answered by a peer it never went to.
-        pex_state.lock().unwrap().note_walk_sent(1, FIRST_HOP);
+        pex_state
+            .lock()
+            .unwrap()
+            .note_walk_sent(1, FIRST_HOP, WALK_NONCE);
         handle_result(
             &PexResult {
                 walk_id: 1,
                 peers: vec![peer.clone()],
+                walk_nonce: [0u8; 32],
             },
             STRANGER,
             &config,
@@ -1387,6 +1530,7 @@ mod tests {
             &PexResult {
                 walk_id: 1,
                 peers: vec![peer],
+                walk_nonce: [0u8; 32],
             },
             FIRST_HOP,
             &config,
@@ -1444,8 +1588,8 @@ mod tests {
         // while proving nothing about the filters they are about.
         {
             let mut state = pex_state.lock().unwrap();
-            state.note_walk_sent(1, [0u8; 32]);
-            state.note_walk_sent(2, [0u8; 32]);
+            state.note_walk_sent(1, [0u8; 32], WALK_NONCE);
+            state.note_walk_sent(2, [0u8; 32], WALK_NONCE);
         }
         let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<PexPeer>>(4);
         let config = PexConfig::default();
@@ -1454,6 +1598,7 @@ mod tests {
             &PexResult {
                 walk_id: 1,
                 peers: offered.clone(),
+                walk_nonce: [0u8; 32],
             },
             [0u8; 32],
             &config,
@@ -1482,6 +1627,7 @@ mod tests {
             &PexResult {
                 walk_id: 2,
                 peers: offered,
+                walk_nonce: [0u8; 32],
             },
             [0u8; 32],
             &config,

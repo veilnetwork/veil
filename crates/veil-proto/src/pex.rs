@@ -52,13 +52,32 @@ pub struct PexWalk {
     /// OVL1 handshake (which verifies `origin_node_id`), so the worst case is a
     /// single wasted dial — it cannot impersonate the origin.
     pub origin_transport: String,
+
+    /// A number the ORIGIN chose for this walk, echoed back in the Result.
+    ///
+    /// The ticket the origin holds binds a Result to the walk it answers and
+    /// to the hop the walk was handed to — but the hop is the FIRST one, and
+    /// nothing in a Result proves it came from the node that terminated the
+    /// walk rather than from the relay in between (report16 V16-M3). This is
+    /// what a terminating node can echo and a relay cannot guess.
+    ///
+    /// Appended at the END of the wire format and NOT covered by
+    /// `origin_sig`, exactly like `origin_transport` above and for the same
+    /// reason: a pre-field decoder ignores the trailing bytes and a new
+    /// decoder of an old frame defaults it to zeros, so the field crosses a
+    /// rolling upgrade without a flag day.
+    ///
+    /// All zeros means "not offered" — an origin too old to mint one. It is
+    /// not a value an origin picks: the ticket refuses to accept a zero echo
+    /// as proof of anything.
+    pub walk_nonce: [u8; 32],
 }
 
 impl PexWalk {
     pub fn encode(&self) -> Vec<u8> {
         let pk_len = self.origin_pubkey.len();
         let tr_len = self.origin_transport.len();
-        let total = 8 + 32 + 32 + 2 + pk_len + 8 + 64 + 1 + 2 + tr_len;
+        let total = 8 + 32 + 32 + 2 + pk_len + 8 + 64 + 1 + 2 + tr_len + 32;
         let mut buf = Vec::with_capacity(total);
         buf.extend_from_slice(&self.walk_id.to_be_bytes());
         buf.extend_from_slice(&self.target_node_id);
@@ -72,6 +91,8 @@ impl PexWalk {
         // the original layout so pre-field decoders ignore it (backward-compat).
         buf.extend_from_slice(&(tr_len as u16).to_be_bytes());
         buf.extend_from_slice(self.origin_transport.as_bytes());
+        // Trailing after THAT, same rule: a pre-field decoder stops before it.
+        buf.extend_from_slice(&self.walk_nonce);
         buf
     }
 
@@ -124,6 +145,18 @@ impl PexWalk {
         } else {
             String::new()
         };
+        // And the nonce after it. Absent on a pre-field frame → zeros, which
+        // the origin's ticket reads as "this responder offered no proof".
+        let nonce_off = if buf.len() >= tr_off + 2 {
+            let tr_len = u16::from_be_bytes([buf[tr_off], buf[tr_off + 1]]) as usize;
+            tr_off + 2 + tr_len
+        } else {
+            tr_off
+        };
+        let mut walk_nonce = [0u8; 32];
+        if let Some(bytes) = buf.get(nonce_off..nonce_off + 32) {
+            walk_nonce.copy_from_slice(bytes);
+        }
         Ok(Self {
             walk_id,
             target_node_id,
@@ -133,6 +166,7 @@ impl PexWalk {
             origin_sig,
             ttl,
             origin_transport,
+            walk_nonce,
         })
     }
 
@@ -363,11 +397,26 @@ impl PexPeer {
 /// [0..8] walk_id u64 BE
 /// [8..10] count u16 BE
 /// [10..] peers PexPeer × count
+/// [..+32] walk_nonce, trailing and optional
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PexResult {
     pub walk_id: u64,
     pub peers: Vec<PexPeer>,
+
+    /// The walk's own nonce, echoed by the node that TERMINATED it.
+    ///
+    /// The origin's ticket already proves a Result answers a walk it sent and
+    /// arrived from the hop that walk was handed to. It does not prove the
+    /// answer came from the far end rather than from that hop, which sees the
+    /// walk_id and could compose a Result of its own (report16 V16-M3). Only
+    /// a node that read the WALK knows this number.
+    ///
+    /// Appended at the END, like `PexWalk::walk_nonce` and `origin_transport`
+    /// before it: a pre-field decoder ignores it, and a new decoder of an old
+    /// frame gets zeros. Zeros mean "no proof offered" — a responder too old
+    /// to echo — and are never a value that proves anything.
+    pub walk_nonce: [u8; 32],
 }
 
 impl PexResult {
@@ -379,6 +428,7 @@ impl PexResult {
         for peer in self.peers.iter().take(MAX_PEX_PEERS) {
             buf.extend_from_slice(&peer.encode());
         }
+        buf.extend_from_slice(&self.walk_nonce);
         buf
     }
 
@@ -407,7 +457,16 @@ impl PexResult {
             peers.push(peer);
             off += consumed;
         }
-        Ok(Self { walk_id, peers })
+        // Trailing, optional. Absent on a pre-field frame → zeros.
+        let mut walk_nonce = [0u8; 32];
+        if let Some(bytes) = buf.get(off..off + 32) {
+            walk_nonce.copy_from_slice(bytes);
+        }
+        Ok(Self {
+            walk_id,
+            peers,
+            walk_nonce,
+        })
     }
 }
 
@@ -448,6 +507,7 @@ mod tests {
             origin_sig: [0xCC; 64],
             ttl: 7,
             origin_transport: "obfs4-tcp://1.2.3.4:5556".to_string(),
+            walk_nonce: [0u8; 32],
         };
         let encoded = walk.encode();
         let decoded = PexWalk::decode(&encoded).unwrap();
@@ -465,6 +525,7 @@ mod tests {
             origin_sig: [0; 64],
             ttl: 4,
             origin_transport: String::new(),
+            walk_nonce: [0u8; 32],
         };
         assert_eq!(PexWalk::decode(&walk.encode()).unwrap(), walk);
     }
@@ -482,14 +543,31 @@ mod tests {
             origin_sig: [7; 64],
             ttl: 9,
             origin_transport: "obfs4-tcp://5.6.7.8:5556".to_string(),
+            walk_nonce: [0u8; 32],
         };
-        let mut legacy = walk.encode();
-        // Strip the trailing [u16 len][transport] to simulate a pre-field frame.
-        legacy.truncate(legacy.len() - 2 - walk.origin_transport.len());
-        let decoded = PexWalk::decode(&legacy).unwrap();
+        let encoded = walk.encode();
+
+        // The oldest shape: neither trailing field. Strip the nonce AND the
+        // [u16 len][transport] behind it.
+        let mut oldest = encoded.clone();
+        oldest.truncate(oldest.len() - 32 - 2 - walk.origin_transport.len());
+        let decoded = PexWalk::decode(&oldest).unwrap();
         assert_eq!(decoded.origin_transport, "");
+        assert_eq!(decoded.walk_nonce, [0u8; 32]);
         assert_eq!(decoded.walk_id, 7);
         assert_eq!(decoded.ttl, 9);
+
+        // And the shape a rolling upgrade actually meets: the previous
+        // version, which has the transport and not the nonce. This is the one
+        // that decides whether the new field needs a flag day.
+        let mut previous = encoded.clone();
+        previous.truncate(previous.len() - 32);
+        let decoded = PexWalk::decode(&previous).unwrap();
+        assert_eq!(decoded.origin_transport, walk.origin_transport);
+        assert_eq!(
+            decoded.walk_nonce, [0u8; 32],
+            "a walk from a node too old to mint one must read as no proof"
+        );
     }
 
     #[test]
@@ -523,6 +601,7 @@ mod tests {
         let result = PexResult {
             walk_id: 1,
             peers: vec![],
+            walk_nonce: [0u8; 32],
         };
         let encoded = result.encode();
         let decoded = PexResult::decode(&encoded).unwrap();
@@ -547,10 +626,35 @@ mod tests {
                     nonce: 200,
                 },
             ],
+            walk_nonce: [0x5A; 32],
         };
         let encoded = result.encode();
         let decoded = PexResult::decode(&encoded).unwrap();
         assert_eq!(decoded, result);
+    }
+
+    #[test]
+    fn pex_result_from_a_node_too_old_to_echo_decodes_as_no_proof() {
+        // The rolling-upgrade shape on the answer side: a Result with peers
+        // and no trailing nonce. It must decode, and the nonce must read as
+        // zeros rather than as somebody else's number.
+        let result = PexResult {
+            walk_id: 9,
+            peers: vec![PexPeer {
+                node_id: [0x33; 32],
+                transport: "tcp://10.0.0.1:5555".into(),
+                public_key: vec![0xCC; 32],
+                nonce: 7,
+            }],
+            walk_nonce: [0x77; 32],
+        };
+        let mut previous = result.encode();
+        previous.truncate(previous.len() - 32);
+
+        let decoded = PexResult::decode(&previous).unwrap();
+        assert_eq!(decoded.walk_id, 9);
+        assert_eq!(decoded.peers.len(), 1);
+        assert_eq!(decoded.walk_nonce, [0u8; 32]);
     }
 
     #[test]

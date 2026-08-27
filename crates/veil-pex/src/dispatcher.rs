@@ -492,6 +492,13 @@ impl PexDispatcher {
         let result = PexResult {
             walk_id: response.walk_id,
             peers,
+            // Echoed from the WALK this node terminated. Only a node that read
+            // the walk knows it; the relay in between sees the walk_id and
+            // could compose a Result, but not this (report16 V16-M3).
+            //
+            // Zeros when the walk carried none — an origin too old to mint
+            // one — and zeros are never proof of anything on the other side.
+            walk_nonce: pending.walk.walk_nonce,
         };
 
         // Send result back to origin.
@@ -659,6 +666,7 @@ mod walk_origin_auth_tests {
             origin_sig: [0u8; 64],
             ttl: 5,
             origin_transport: "obfs4-tcp://1.2.3.4:5556".to_string(),
+            walk_nonce: [0u8; 32],
         };
         let sig = veil_crypto::signature::sign_message(
             SignatureAlgorithm::Ed25519,
@@ -779,9 +787,17 @@ mod reverse_path_tests {
     const RELAY: [u8; 32] = [0x02; 32];
     const TERMINAL: [u8; 32] = [0x03; 32];
 
+    /// One frame the wire carried: to whom, of what kind, and its payload.
+    type SentFrame = ([u8; 32], u16, Vec<u8>);
+
     #[derive(Default)]
     struct Wire {
         sent: StdMutex<Vec<([u8; 32], u16)>>,
+        /// The frames themselves, for a test that needs what was SAID and not
+        /// only that something was. Kept beside `sent` rather than replacing
+        /// it, so the tests that only ask "which kinds went where" stay as
+        /// they read.
+        bodies: StdMutex<Vec<SentFrame>>,
         /// Peers this node has a session with. A `send_to` to anybody else
         /// fails, which is the whole shape of the finding: the terminal node
         /// has no session with the origin.
@@ -792,8 +808,19 @@ mod reverse_path_tests {
         fn with(reachable: Vec<[u8; 32]>) -> Self {
             Self {
                 sent: StdMutex::new(Vec::new()),
+                bodies: StdMutex::new(Vec::new()),
                 reachable,
             }
+        }
+
+        /// The payload of the first frame of `kind` sent to `peer`.
+        fn body_of(&self, peer: [u8; 32], kind: u16) -> Option<Vec<u8>> {
+            self.bodies
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .iter()
+                .find(|(p, k, _)| *p == peer && *k == kind)
+                .map(|(_, _, body)| body.clone())
         }
         fn to(&self, peer: [u8; 32]) -> Vec<u16> {
             self.sent
@@ -821,6 +848,15 @@ mod reverse_path_tests {
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
                 .push((*peer_id, msg));
+            // The payload is everything after the fixed header.
+            let body = bytes
+                .get(veil_proto::HEADER_SIZE..)
+                .map(<[u8]>::to_vec)
+                .unwrap_or_default();
+            self.bodies
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .push((*peer_id, msg, body));
             true
         }
         fn send_to_all_with_priority(&self, _priority: u8, _bytes: Arc<[u8]>) {}
@@ -844,6 +880,13 @@ mod reverse_path_tests {
         )
     }
 
+    fn walk_with_nonce(walk_id: u64, ttl: u8, target: [u8; 32], nonce: [u8; 32]) -> PexWalk {
+        PexWalk {
+            walk_nonce: nonce,
+            ..walk(walk_id, ttl, target)
+        }
+    }
+
     fn walk(walk_id: u64, ttl: u8, target: [u8; 32]) -> PexWalk {
         PexWalk {
             walk_id,
@@ -854,6 +897,7 @@ mod reverse_path_tests {
             origin_sig: [0u8; 64],
             ttl,
             origin_transport: String::new(),
+            walk_nonce: [0u8; 32],
         }
     }
 
@@ -952,6 +996,88 @@ mod reverse_path_tests {
             wire.to(RELAY).contains(&(PexMsg::Challenge as u16)),
             "the challenge was addressed to a node this one cannot reach, so \
              it went nowhere"
+        );
+    }
+    /// The node that TERMINATES a walk echoes its nonce into the Result.
+    ///
+    /// The origin refuses a Result whose echo is wrong and accepts one with no
+    /// echo at all — the rolling-upgrade shape. So a responder that quietly
+    /// stopped echoing would look exactly like an old peer, the proof would go
+    /// inert, and nothing anywhere would say so: reverting the echo left every
+    /// other test in this crate green. This is the one that reddens
+    /// (report16 V16-M3).
+    ///
+    /// Driven the whole way round — walk, challenge, a solved and SIGNED
+    /// response, result — because the echo is carried by state the terminal
+    /// node keeps between the challenge and the answer, and a test that
+    /// short-circuits that carries nothing.
+    #[test]
+    fn a_terminal_node_echoes_the_walks_nonce_into_its_result() {
+        use ed25519_dalek::{Signer, SigningKey};
+
+        const NONCE: [u8; 32] = [0x5C; 32];
+        let signing = SigningKey::from_bytes(&[7u8; 32]);
+        let origin_pubkey = signing.verifying_key().as_bytes().to_vec();
+
+        let (terminal, _rx) = dispatcher(TERMINAL);
+        let wire = Wire::with(vec![RELAY]);
+        let known = VouchedPeers::from_sessions(&[], &Default::default());
+
+        // ttl 1 terminates here, and the challenge goes back to the relay.
+        let mut w = walk_with_nonce(91, 1, TERMINAL, NONCE);
+        w.origin_pubkey = origin_pubkey;
+        terminal.dispatch(
+            PexMsg::Walk as u16,
+            &w.encode(),
+            RELAY,
+            Some(&wire),
+            &[],
+            &known,
+        );
+
+        let challenge_body = wire
+            .body_of(RELAY, PexMsg::Challenge as u16)
+            .expect("the terminal challenged");
+        let challenge =
+            veil_proto::pex::PexChallenge::decode(&challenge_body).expect("a challenge");
+
+        // Solved and signed the way the origin does it.
+        let solution =
+            crate::initiator::solve_pex_pow(&challenge.challenge_nonce, challenge.difficulty)
+                .expect("the fixture difficulty is solvable");
+        let msg = [
+            challenge.walk_id.to_be_bytes().as_slice(),
+            challenge.challenge_nonce.as_slice(),
+            solution.as_slice(),
+        ]
+        .concat();
+        let response = veil_proto::pex::PexResponse {
+            walk_id: challenge.walk_id,
+            challenge_nonce: challenge.challenge_nonce,
+            pow_solution: solution,
+            origin_sig: signing.sign(&msg).to_bytes(),
+        };
+
+        let outcome = terminal.dispatch(
+            PexMsg::Response as u16,
+            &response.encode(),
+            RELAY,
+            Some(&wire),
+            &[],
+            &known,
+        );
+
+        let body = match outcome {
+            PexDispatchOutcome::Response(frame) => frame,
+            other => panic!("the terminal did not answer with a Result: {other:?}"),
+        };
+        let header = veil_proto::codec::decode_header(&body).expect("a pex frame");
+        assert_eq!(header.msg_type, PexMsg::Result as u16);
+        let result = PexResult::decode(&body[veil_proto::HEADER_SIZE..]).expect("a result");
+
+        assert_eq!(
+            result.walk_nonce, NONCE,
+            "the far end answered without the proof only it could give"
         );
     }
 }
