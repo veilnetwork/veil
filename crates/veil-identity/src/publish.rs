@@ -99,6 +99,11 @@ pub enum PublishError {
          carrying it authenticates nobody"
     )]
     RatchetKeyNotContributory,
+    #[error(
+        "the signing delegation is already over: subkey/document window ends \
+         at {parent_until}, and the certificate would start at {from}"
+    )]
+    DelegationWindowEmpty { from: u64, parent_until: u64 },
 }
 
 // ── InstanceRegistry ─────────────────────────────────────────────────────────
@@ -273,6 +278,29 @@ pub fn sign_mlkem_cert(
     // be able to publish a certificate its own peers will throw away.
     if ratchet_x25519_pubkey == [0u8; 32] {
         return Err(PublishError::RatchetKeyNotContributory);
+    }
+
+    // A child may not reach past what delegated it.
+    //
+    // The runtime asks for thirty days; the subkey signing this is endorsed
+    // for about seven, and re-issued at half of that. Publishing the thirty
+    // means publishing a claim every verifier now clips anyway — and a node
+    // holding a still-valid subkey could otherwise sign `u64::MAX` and have it
+    // honoured until a restart (report17 V17-H2). Clipped here so what is
+    // signed is what will be believed, and so the republish loop, which
+    // rebuilds this on every tick, keeps it rolling forward.
+    let key = &doc.identity_keys[idx];
+    let valid_from_unix = valid_from_unix
+        .max(key.valid_from_unix)
+        .max(doc.issued_at_unix);
+    let valid_until_unix = valid_until_unix
+        .min(key.valid_until_unix)
+        .min(doc.valid_until_unix);
+    if valid_until_unix < valid_from_unix {
+        return Err(PublishError::DelegationWindowEmpty {
+            from: valid_from_unix,
+            parent_until: valid_until_unix,
+        });
     }
 
     let mut cert = MlKemKeyCert {
@@ -857,6 +885,98 @@ mod tests {
         let verified = verify_mlkem_cert(&cert, &out.document, 1_700_000_000).unwrap();
         assert_eq!(verified.node_id, out.node_id);
         assert_eq!(verified.instance_id, out.instance.instance_id);
+    }
+
+    /// A delegation may not outlive what delegated it.
+    ///
+    /// The fixture is the shipped shape: a subkey the master endorses for
+    /// seven days, and the thirty-day certificate the runtime asks for. The
+    /// device signing it is legitimate TODAY — the attack needs nothing more
+    /// than a still-valid subkey and a `valid_until` of its choosing, and the
+    /// decoder takes the whole u64 (report17 V17-H2).
+    #[test]
+    fn mlkem_cert_cannot_outlive_the_subkey_that_signed_it() {
+        let (out, sk) = fresh_identity();
+        let (ek, _) = generate_prekey();
+        let now = 1_700_000_000;
+        let subkey_until = out.document.identity_keys[0].valid_until_unix;
+        assert!(
+            subkey_until < now + 30 * 86_400,
+            "premise: the subkey expires before the cert the runtime asks for"
+        );
+
+        // Signed with the most generous window a caller can name.
+        let cert = sign_mlkem_cert(
+            out.node_id,
+            out.instance.instance_id,
+            ek,
+            [0x5A; 32],
+            now - 60,
+            u64::MAX,
+            1,
+            0,
+            &sk,
+            &out.document,
+        )
+        .unwrap();
+
+        // What was SIGNED is already clipped, so the claim on the wire is one
+        // its own peers will honour rather than one they must argue with.
+        assert!(
+            cert.valid_until_unix <= subkey_until,
+            "a node published a certificate outliving its own delegation: \
+             {} > {subkey_until}",
+            cert.valid_until_unix,
+        );
+
+        // And what a VERIFIER hands its caller is the intersection, not the
+        // certificate's claim: this is the stamp the resolver caches.
+        let verified = verify_mlkem_cert(&cert, &out.document, now).unwrap();
+        assert!(verified.valid_until_unix <= subkey_until);
+
+        // One second past the delegation, the certificate is no longer good —
+        // which is the whole point of the delegation having an end.
+        let err = verify_mlkem_cert(&cert, &out.document, subkey_until + 1)
+            .expect_err("an expired delegation still authorized a device");
+        assert!(matches!(
+            err,
+            crate::mlkem_fanout::MlkemFanoutError::CertNotValidNow { .. }
+        ));
+    }
+
+    /// The same guard, with the signer bypassed: a certificate that reaches
+    /// past its delegation can be MINTED by anything that speaks the wire —
+    /// clipping at signing time protects our own publishing, not the receiver.
+    #[test]
+    fn a_handmade_cert_past_the_delegation_is_refused() {
+        let (out, sk) = fresh_identity();
+        let (ek, _) = generate_prekey();
+        let now = 1_700_000_000;
+        let subkey_until = out.document.identity_keys[0].valid_until_unix;
+
+        let mut cert = MlKemKeyCert {
+            node_id: out.node_id,
+            instance_id: out.instance.instance_id,
+            mlkem_algo: ALGO_ML_KEM_768,
+            mlkem_pubkey: ek,
+            ratchet_x25519_pubkey: [0x5A; 32],
+            valid_from_unix: now - 60,
+            valid_until_unix: u64::MAX,
+            cert_version: 1,
+            signing_identity_key_idx: 0,
+            sig: Vec::new(),
+        };
+        cert.sig = sk.sign(&cert.signing_message());
+
+        // Valid now, because the delegation is valid now.
+        let verified = verify_mlkem_cert(&cert, &out.document, now).unwrap();
+        assert_eq!(
+            verified.valid_until_unix, subkey_until,
+            "the caller was handed the certificate's own claim to cache"
+        );
+
+        // Not valid once the delegation is over, however far the claim reaches.
+        assert!(verify_mlkem_cert(&cert, &out.document, subkey_until + 1).is_err());
     }
 
     #[test]
