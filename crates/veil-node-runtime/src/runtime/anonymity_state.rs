@@ -700,6 +700,15 @@ pub struct AnonymityState {
     /// otherwise built once and idle-GC'd). Empty unless the node registered an
     /// onion service via `register_onion_circuit`.
     pub onion_services: Arc<Mutex<Vec<OnionServiceEntry>>>,
+    /// How many deferred publishes are waiting for a `CircuitBuilt` ACK right
+    /// now.
+    ///
+    /// Each one is a detached thread that sleeps up to three seconds and then
+    /// publishes. Registering and withdrawing in a loop frees the service slot
+    /// immediately while leaving the thread behind, so the cap of eight
+    /// services bounded nothing — the waiters did (report17 V17-M7). Bounded
+    /// here, where they are created.
+    pub pending_confirm_publishes: Arc<std::sync::atomic::AtomicUsize>,
 
     /// `Some(hops)` when `[anonymity].onion_service` is enabled — the maintenance
     /// tick auto-registers a location-anonymous service of this circuit length
@@ -799,6 +808,7 @@ impl AnonymityState {
                 veil_identity::auth_deliver::AuthDeliverReplayCache::new(),
             ),
             onion_services: Arc::new(Mutex::new(Vec::new())),
+            pending_confirm_publishes: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             onion_service_hops,
             pinned_rendezvous_relays,
             send_stall: Arc::new(AnonSendStallTracker::new()),
