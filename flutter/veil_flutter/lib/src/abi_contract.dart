@@ -17,7 +17,7 @@
 /// Compare against `veil_abi_contract_hash()` from the loaded library
 /// BEFORE using it. See `native.dart`.
 const String veilAbiContractHash =
-    'e784ee811261f2ac188234c9670b994f49e6b052592ce59727e5582a4caa5376';
+    'bb854304aef031aca5caf72c3c092bb365d70910904be3b0d6c6bac7cfcc63e3';
 
 // -- Constants lifted from the generated header --------------------------
 
@@ -217,6 +217,8 @@ const int veilRatchetMaxStateLen = 262144;
 const int veilErrRatchetNoConversation = -20;
 /// `VEIL_ERR_RATCHET_BUFFER_TOO_SMALL`
 const int veilErrRatchetBufferTooSmall = -21;
+/// `VEIL_ERR_TUNNEL_WORKERS_STRANDED`
+const int veilErrTunnelWorkersStranded = -23;
 /// `VEIL_ERR_RATCHET_STORE_FULL`
 const int veilErrRatchetStoreFull = -22;
 /// `VEIL_RATCHET_MAX_CONVERSATIONS`
