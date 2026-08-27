@@ -17,7 +17,7 @@
 /// Compare against `veil_abi_contract_hash()` from the loaded library
 /// BEFORE using it. See `native.dart`.
 const String veilAbiContractHash =
-    'cd2ee484e3254dbc45193d4bae08130388284432e3e2080624ba1771ef3ffea0';
+    'f38d79a18abc1178c7616321d7d9daa4b9400db3b0f6b47a19120560637578ec';
 
 // -- Constants lifted from the generated header --------------------------
 
@@ -135,8 +135,7 @@ const int veilHolePunchRefusedAnonymous = 6;
 const int veilHolePunchUnknownPeer = 7;
 /// `VEIL_HOLE_PUNCH_UNSUPPORTED`
 const int veilHolePunchUnsupported = 8;
-
-/// The daemon could not read its own config to answer the request.
+/// `VEIL_HOLE_PUNCH_CONFIG_UNAVAILABLE`
 const int veilHolePunchConfigUnavailable = 9;
 /// `VEIL_CREATE_INVITE_OK`
 const int veilCreateInviteOk = 0;

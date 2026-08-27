@@ -296,6 +296,11 @@
 #define VEIL_HOLE_PUNCH_UNSUPPORTED 8
 
 /**
+ * The daemon could not read its own config to answer the request.
+ */
+#define VEIL_HOLE_PUNCH_CONFIG_UNAVAILABLE 9
+
+/**
  * Create-bootstrap-invite status codes (Epic 489.7 generator side).
  * Mirror `veil_proto::create_invite_status`.
  */
@@ -3780,6 +3785,17 @@ int veil_node_apply_config(const VeilNode *node,
  * `node` must be a handle returned by `veil_node_start*` and not yet stopped.
  */
  void veil_node_stop(VeilNode *node) ;
+#endif
+
+#if defined(VEIL_FFI_PACKET_TUNNEL)
+/**
+ * How many runtime THREADS did not come back, since this process started.
+ *
+ * One per thread, not one per teardown: a thread that never returns never
+ * runs its stop hook, and that is what this counts. See
+ * [`ABANDONED_WORKERS`].
+ */
+ uint32_t veil_packet_tunnel_abandoned_workers(void) ;
 #endif
 
 #if defined(VEIL_FFI_PACKET_TUNNEL)

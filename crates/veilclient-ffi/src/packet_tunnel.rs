@@ -331,7 +331,10 @@ fn tunnel_args(proxy_url: &str, dns_ip: &str, mtu: u16, route_dns: bool) -> Resu
 /// "at least one" for a teardown that stranded several (report16 V16-M5).
 static ABANDONED_WORKERS: AtomicUsize = AtomicUsize::new(0);
 
-/// How many runtimes were abandoned with work still running. See
+/// How many runtime THREADS did not come back, since this process started.
+///
+/// One per thread, not one per teardown: a thread that never returns never
+/// runs its stop hook, and that is what this counts. See
 /// [`ABANDONED_WORKERS`].
 #[unsafe(no_mangle)]
 pub extern "C" fn veil_packet_tunnel_abandoned_workers() -> u32 {
