@@ -174,8 +174,16 @@ pub trait ColdBackend: Send + Sync + std::fmt::Debug {
                 // leave the PREVIOUS one charged for it.
                 None => self.forget_origin(&key),
             }
-            if let Some(secs) = first_seen_unix {
-                self.set_first_seen(&key, secs);
+            match first_seen_unix {
+                Some(secs) => self.set_first_seen(&key, secs),
+                // SYMMETRIC with the origin above, and for the same reason: an
+                // overwrite with no stamp must not leave the value aged from
+                // whenever the PREVIOUS one at this key was first seen. The
+                // asymmetry was here only in the default — the RocksDB
+                // override already cleared both — so it was a trap for the
+                // next durable backend rather than a live defect (report17
+                // V17-L1).
+                None => self.forget_first_seen(&key),
             }
         }
         put
@@ -749,28 +757,34 @@ pub mod rocks {
             }
         }
 
-        /// Delete an entry — value and both index rows — in ONE batch, and
-        /// move the maintained count only if the write landed. Returns whether
-        /// it did: a caller that credits bytes back for a delete that failed
-        /// drifts its byte counter DOWN against a value that is still on disk.
-        fn delete_entry(&mut self, key: &[u8; 32]) -> bool {
-            let mut batch = rocksdb::WriteBatch::default();
-            let was_indexed = self.stage_unindex(&mut batch, key);
+        /// Stage EVERY row an entry owns: the value, both index rows, and the
+        /// two side columns. Returns whether the entry was indexed, so a
+        /// caller can move the maintained count only when its write lands.
+        ///
+        /// One function because there is more than one way an entry leaves,
+        /// and each of them has to take the whole entry with it. The side
+        /// columns were not deleted at all until report15 V15-M4, and the fix
+        /// then went into ordinary deletion only — so cap EVICTION still left
+        /// an origin and a first-seen stamp behind for every value it dropped.
+        /// Unique-key churn holds the logical entry count at N while two
+        /// column families nothing counts and nothing sweeps grow without
+        /// bound (report17 V17-M2).
+        fn stage_full_delete(&self, batch: &mut rocksdb::WriteBatch, key: &[u8; 32]) -> bool {
+            let was_indexed = self.stage_unindex(batch, key);
             batch.delete(key);
-            // The SIDE columns go in the same batch.
-            //
-            // They were not deleted at all, by any path: an entry's origin and
-            // its first-seen stamp outlived the value on every delete —
-            // ordinary removal, entry-cap eviction, expiry. Unique-key churn
-            // therefore grew two column families that no cap counts and no
-            // sweep visits (report15 V15-M4). `forget_origin` /
-            // `forget_first_seen` exist and were called from one promotion
-            // path only.
-            //
-            // Here rather than at each caller, because there are three of them
-            // and this is what they all go through.
             batch.delete_cf(self.cf_origin(), key);
             batch.delete_cf(self.cf_first_seen(), key);
+            was_indexed
+        }
+
+        /// Delete an entry — value, both index rows and both side rows — in
+        /// ONE batch, and move the maintained count only if the write landed.
+        /// Returns whether it did: a caller that credits bytes back for a
+        /// delete that failed drifts its byte counter DOWN against a value
+        /// that is still on disk.
+        fn delete_entry(&mut self, key: &[u8; 32]) -> bool {
+            let mut batch = rocksdb::WriteBatch::default();
+            let was_indexed = self.stage_full_delete(&mut batch, key);
             if let Err(e) = self.db.write(batch) {
                 log::warn!("dht.cold.rocksdb: entry delete failed: {e}");
                 return false;
@@ -1168,16 +1182,20 @@ pub mod rocks {
                 }
             }
             let (ix_key, key, value) = victim?;
-            // One batch again: the value and both index rows leave together
-            // or the eviction did not happen and must not be reported.
+            // One batch again: everything the entry owns leaves together or
+            // the eviction did not happen and must not be reported.
+            //
+            // The SAME staging as an ordinary delete, which is the point: an
+            // eviction that dropped the value and kept the entry's origin and
+            // first-seen stamp is how two uncounted column families grew
+            // without bound under churn (report17 V17-M2).
             let mut batch = rocksdb::WriteBatch::default();
-            let was_indexed = self.stage_unindex(&mut batch, &key);
+            let was_indexed = self.stage_full_delete(&mut batch, &key);
             // Delete THIS row directly as well: `stage_unindex` reaches the
             // ts-index through the reverse map's ts, so a missing or drifted
             // reverse map would otherwise leave the row behind as a fresh
             // dangler.
             batch.delete_cf(self.cf_ix(), &ix_key);
-            batch.delete(key);
             if let Err(e) = self.db.write(batch) {
                 log::warn!("dht.cold.rocksdb: eviction of the oldest entry failed: {e}");
                 return None;
@@ -1756,11 +1774,21 @@ impl TieredStore {
             self.hot_order.remove(&(ts, *key));
             removed_bytes = removed_bytes.saturating_add(val.len() as u64);
         }
-        self.cold_first_seen.remove(key);
         // Cold doesn't return the removed value from its `remove` API.
         // Get the value first so we can subtract its bytes from the total.
         let cold_bytes = self.cold.get(key).map(|v| v.len() as u64).unwrap_or(0);
         self.cold.remove(key);
+        // The in-memory stamp goes only once the value really has.
+        //
+        // It used to be dropped BEFORE the delete was attempted, so a delete
+        // the backend could not perform — reported by the trait as nothing at
+        // all — left the value on disk with its age forgotten. `retain_fresh`
+        // then ages it from now, which hands a record that should have expired
+        // another full lifetime; `release_cold` already got this right and
+        // this path did not (report17 V17-L2).
+        if !self.cold.contains(key) {
+            self.cold_first_seen.remove(key);
+        }
         // Credit the cold bytes back ONLY once the value is really gone. A
         // backend delete can fail (a disk error is reported by the trait as
         // nothing at all), and subtracting bytes for a value still on disk
@@ -2844,6 +2872,258 @@ mod tests {
             (0, 0),
             "an origin or first-seen row outlived the value it describes; \
              nothing counts them and no sweep visits them"
+        );
+    }
+
+    /// report17 V17-L2: a delete the backend could not perform forgot the
+    /// entry's age, and the value on disk then became invisible to the sweep.
+    ///
+    /// The in-memory stamp was dropped BEFORE the delete was attempted. The
+    /// trait reports a failed delete as nothing at all, so the value stayed —
+    /// and the cold half of the age sweep walks `cold_first_seen`, which no
+    /// longer had it. Nothing ages it, nothing evicts it, and it comes back at
+    /// every restart. `release_cold` already kept the stamp on a failed
+    /// delete; `remove` did not.
+    #[test]
+    fn a_delete_that_failed_keeps_the_age_it_will_be_swept_by() {
+        #[derive(Debug, Default)]
+        struct Inner {
+            entries: HashMap<[u8; 32], Vec<u8>>,
+            fail_deletes: bool,
+        }
+        #[derive(Debug, Clone, Default)]
+        struct FlakyCold(std::sync::Arc<std::sync::Mutex<Inner>>);
+        impl FlakyCold {
+            fn disk(&self) -> std::sync::MutexGuard<'_, Inner> {
+                self.0.lock().unwrap_or_else(|p| p.into_inner())
+            }
+        }
+        impl ColdBackend for FlakyCold {
+            fn get(&self, key: &[u8; 32]) -> Option<Vec<u8>> {
+                self.disk().entries.get(key).cloned()
+            }
+            fn put(&mut self, key: [u8; 32], value: Vec<u8>) -> ColdPut {
+                self.disk().entries.insert(key, value);
+                ColdPut::Stored(None)
+            }
+            fn remove(&mut self, key: &[u8; 32]) {
+                let mut d = self.disk();
+                if !d.fail_deletes {
+                    d.entries.remove(key);
+                }
+            }
+            fn contains(&self, key: &[u8; 32]) -> bool {
+                self.disk().entries.contains_key(key)
+            }
+            fn len(&self) -> usize {
+                self.disk().entries.len()
+            }
+            fn iter_entries(&self) -> Vec<([u8; 32], Vec<u8>)> {
+                self.disk()
+                    .entries
+                    .iter()
+                    .map(|(k, v)| (*k, v.clone()))
+                    .collect()
+            }
+            fn retain(&mut self, _f: &dyn Fn(&[u8; 32], &[u8]) -> bool) -> Vec<([u8; 32], u64)> {
+                Vec::new()
+            }
+        }
+
+        let disk = FlakyCold::default();
+        // Hot capacity 1: the second put demotes the first into cold, which is
+        // where the stamp is written.
+        let mut store = TieredStore::with_cold(1, Box::new(disk.clone()));
+        let doomed = [1u8; 32];
+        store.put(doomed, b"value".to_vec());
+        store.put([2u8; 32], b"other".to_vec());
+        assert!(store.contains(&doomed), "premise: the value is in cold");
+
+        // The disk refuses the delete, exactly as a RocksDB error looks from
+        // above.
+        disk.disk().fail_deletes = true;
+        store.remove(&doomed);
+        assert!(
+            store.contains(&doomed),
+            "the fixture stopped modelling a failed delete, so this test is \
+             about nothing"
+        );
+
+        // The disk recovers, and the sweep runs well past the lifetime.
+        disk.disk().fail_deletes = false;
+        let ttl = std::time::Duration::from_secs(1);
+        store.retain_fresh_age_only(Instant::now() + ttl * 10, ttl);
+
+        assert!(
+            !store.contains(&doomed),
+            "the value outlived its lifetime on disk because the sweep had no \
+             age for it: the stamp was dropped when the delete failed, and \
+             nothing ages an entry it cannot see"
+        );
+    }
+
+    /// report17 V17-L1: the DEFAULT `put_with_side` forgot an origin nobody
+    /// named and kept a first-seen stamp nobody offered.
+    ///
+    /// The RocksDB override already cleared both, so this was a trap for the
+    /// next durable backend rather than a live defect — and a trap of the
+    /// worst kind, because what it produces is a value that ages from
+    /// whenever the PREVIOUS value at that key was first seen. Under a
+    /// ten-minute lifetime that is a record swept while it is new.
+    ///
+    /// Driven through the default implementation on purpose: a backend that
+    /// stores the two side facts and does NOT override the batched write is
+    /// exactly the shape the trait is meant to serve.
+    #[test]
+    fn the_default_side_write_clears_both_facts_when_neither_is_offered() {
+        #[derive(Debug, Default)]
+        struct PlainCold {
+            entries: std::collections::HashMap<[u8; 32], Vec<u8>>,
+            origin: std::collections::HashMap<[u8; 32], [u8; 32]>,
+            first_seen: std::collections::HashMap<[u8; 32], u64>,
+        }
+        impl ColdBackend for PlainCold {
+            fn put(&mut self, key: [u8; 32], value: Vec<u8>) -> ColdPut {
+                self.entries.insert(key, value);
+                ColdPut::Stored(None)
+            }
+            fn get(&self, key: &[u8; 32]) -> Option<Vec<u8>> {
+                self.entries.get(key).cloned()
+            }
+            fn remove(&mut self, key: &[u8; 32]) {
+                self.entries.remove(key);
+            }
+            fn contains(&self, key: &[u8; 32]) -> bool {
+                self.entries.contains_key(key)
+            }
+            fn len(&self) -> usize {
+                self.entries.len()
+            }
+            fn iter_entries(&self) -> Vec<([u8; 32], Vec<u8>)> {
+                self.entries.iter().map(|(k, v)| (*k, v.clone())).collect()
+            }
+            fn retain(&mut self, _f: &dyn Fn(&[u8; 32], &[u8]) -> bool) -> Vec<([u8; 32], u64)> {
+                Vec::new()
+            }
+            fn set_origin(&mut self, key: &[u8; 32], origin: &[u8; 32]) {
+                self.origin.insert(*key, *origin);
+            }
+            fn forget_origin(&mut self, key: &[u8; 32]) {
+                self.origin.remove(key);
+            }
+            fn set_first_seen(&mut self, key: &[u8; 32], unix_secs: u64) {
+                self.first_seen.insert(*key, unix_secs);
+            }
+            fn forget_first_seen(&mut self, key: &[u8; 32]) {
+                self.first_seen.remove(key);
+            }
+        }
+
+        let mut cold = PlainCold::default();
+        let key = [7u8; 32];
+        cold.put_with_side(
+            key,
+            b"first".to_vec(),
+            Some([0xAA; 32]),
+            Some(1_700_000_000),
+        );
+        assert_eq!(cold.origin.len(), 1, "premise: both facts were written");
+        assert_eq!(cold.first_seen.len(), 1, "premise: both facts were written");
+
+        // The same key again, by a publisher this node cannot name and with no
+        // stamp to offer.
+        cold.put_with_side(key, b"second".to_vec(), None, None);
+
+        assert!(
+            cold.origin.is_empty(),
+            "the previous publisher is still charged for a value that is no \
+             longer theirs"
+        );
+        assert!(
+            cold.first_seen.is_empty(),
+            "the new value inherited the age of whatever was here before it, \
+             so a fresh record is swept as though it were old"
+        );
+    }
+
+    /// report17 V17-M2: EVICTION dropped the value and kept the entry's
+    /// origin and first-seen stamp.
+    ///
+    /// The delete path was fixed for V15-M4 and the eviction path was not, so
+    /// under unique-key churn the logical entry count sits at the cap forever
+    /// while two column families nothing counts and nothing sweeps grow
+    /// without bound. Nothing reads those rows — every reader skips a row
+    /// whose value is gone — so the only symptom is a database that keeps
+    /// growing on a node whose entry count never moves.
+    ///
+    /// Counted DIRECTLY for that reason: a version of this asserted through
+    /// `origins()` would pass against the defect.
+    #[cfg(feature = "rocksdb-cold")]
+    #[test]
+    fn evicting_an_entry_takes_its_origin_and_age_with_it() {
+        use super::rocks::RocksDbCold;
+
+        let dir = tempfile::tempdir().unwrap();
+        // Capacity one, so the second put evicts the first.
+        let mut cold =
+            RocksDbCold::open(dir.path().join("cold").to_str().unwrap(), 1).expect("open");
+
+        let first = [1u8; 32];
+        cold.put_with_side(
+            first,
+            b"first".to_vec(),
+            Some([0xAA; 32]),
+            Some(1_700_000_000),
+        );
+        assert_eq!(
+            cold.side_row_count(),
+            (1, 1),
+            "the side rows were never written, so what follows proves nothing"
+        );
+
+        // Through `evict_oldest`, which is what the entry cap and the byte cap
+        // both call.
+        let evicted = cold.evict_oldest().expect("something to evict");
+        assert_eq!(evicted.0, first, "the wrong entry was evicted");
+        assert!(!cold.contains(&first), "the value survived its eviction");
+
+        assert_eq!(
+            cold.side_row_count(),
+            (0, 0),
+            "an evicted entry left its origin and first-seen stamp behind: \
+             unique-key churn then grows two uncounted column families while \
+             the entry count stays at the cap"
+        );
+    }
+
+    /// And the same over the CAP, not the primitive: a node taking unique keys
+    /// forever holds its entry count at N with nothing accumulating beside it.
+    #[cfg(feature = "rocksdb-cold")]
+    #[test]
+    fn churn_at_the_entry_cap_leaves_nothing_behind() {
+        use super::rocks::RocksDbCold;
+
+        let dir = tempfile::tempdir().unwrap();
+        let cap = 4usize;
+        let mut cold =
+            RocksDbCold::open(dir.path().join("cold").to_str().unwrap(), cap).expect("open");
+
+        for i in 0..64u8 {
+            let mut key = [0u8; 32];
+            key[0] = i;
+            cold.put_with_side(
+                key,
+                vec![i; 64],
+                Some([i; 32]),
+                Some(1_700_000_000 + u64::from(i)),
+            );
+        }
+
+        let (origins, first_seen) = cold.side_row_count();
+        assert!(
+            origins <= cap && first_seen <= cap,
+            "sixty-four unique keys through a cap of {cap} left {origins} \
+             origin rows and {first_seen} first-seen rows on disk"
         );
     }
 
