@@ -467,6 +467,12 @@ pub async fn spawn_pex_initiator(
     }
 }
 
+/// How many peers one walk may try before giving up on this round.
+///
+/// Bounded on purpose: a node whose sessions are all dead should finish the
+/// round quickly rather than march through the whole table for every walk.
+const WALK_SEND_ATTEMPTS: usize = 3;
+
 #[allow(clippy::too_many_arguments)]
 fn send_walks(
     local_node_id: &[u8; 32],
@@ -519,38 +525,59 @@ fn send_walks(
 
         // Send to a random connected peer.
         let peer_ids = broadcaster.active_node_ids();
-        if !peer_ids.is_empty() {
-            let idx = (OsRng.next_u32() as usize) % peer_ids.len();
-            let first_hop = peer_ids[idx];
+        if peer_ids.is_empty() {
+            continue;
+        }
+
+        // A REFUSED SEND COSTS THIS WALK, NOT THE ROUND (report17 V17-L4).
+        //
+        // The peer list is a snapshot, and a session can go between reading it
+        // and sending — ordinary churn, not an error. This used to `return`,
+        // so one such peer abandoned every remaining walk of the round: at the
+        // default parallelism an under-connected node lost most of the
+        // discovery it was trying to do, silently, for the most common reason
+        // there is.
+        //
+        // A few candidates, not the whole table: a round that genuinely cannot
+        // deliver should end quickly rather than walk every dead session.
+        let start = (OsRng.next_u32() as usize) % peer_ids.len();
+        let attempts = peer_ids.len().min(WALK_SEND_ATTEMPTS);
+        let mut first_hop = None;
+        for step in 0..attempts {
+            let candidate = peer_ids[(start + step) % peer_ids.len()];
             // The outcome is checked. The comment below already said only a
             // walk that actually left counts, but the send's answer was
             // discarded, so a frame the transport refused still opened a
             // ticket — and now that the ticket names the hop, a ticket for a
             // walk nobody received would accept a Result from a peer that
             // never saw one.
-            if !broadcaster.send_to(&first_hop, TrafficClass::Background as u8, frame) {
-                logger.warn(
-                    "pex.walk.undeliverable",
-                    &format!("walk_id={walk_id} — the chosen peer has no live session"),
-                );
-                return;
+            if broadcaster.send_to(&candidate, TrafficClass::Background as u8, frame.clone()) {
+                first_hop = Some(candidate);
+                break;
             }
-
-            logger.info(
-                "pex.walk.sent",
-                &format!(
-                    "walk_id={walk_id} target={:02x}{:02x}.. ttl={ttl}",
-                    target_node_id[0], target_node_id[1]
-                ),
-            );
-
-            // Only a walk that actually left counts. The counter used to be
-            // incremented here whether or not there was a peer to send to, so
-            // an isolated node reported walks it never made.
-            let mut state = pex_state.lock().unwrap_or_else(|p| p.into_inner());
-            state.note_walk_sent(walk_id, first_hop, walk_nonce);
-            state.last_walk_at = Some(Instant::now());
         }
+        let Some(first_hop) = first_hop else {
+            logger.warn(
+                "pex.walk.undeliverable",
+                &format!("walk_id={walk_id} — no live session among {attempts} candidate(s)"),
+            );
+            continue;
+        };
+
+        logger.info(
+            "pex.walk.sent",
+            &format!(
+                "walk_id={walk_id} target={:02x}{:02x}.. ttl={ttl}",
+                target_node_id[0], target_node_id[1]
+            ),
+        );
+
+        // Only a walk that actually left counts. The counter used to be
+        // incremented here whether or not there was a peer to send to, so
+        // an isolated node reported walks it never made.
+        let mut state = pex_state.lock().unwrap_or_else(|p| p.into_inner());
+        state.note_walk_sent(walk_id, first_hop, walk_nonce);
+        state.last_walk_at = Some(Instant::now());
     }
 }
 
@@ -1226,6 +1253,131 @@ mod tests {
                 "walk {id} went out with nothing for the far end to echo"
             );
         }
+    }
+
+    /// A peer that will not take the frame costs THIS walk, not the round.
+    ///
+    /// The peer list is a snapshot and a session can go between reading it and
+    /// sending — ordinary churn, not an error. The loop used to `return` on
+    /// that, so one such peer abandoned every remaining walk: at the default
+    /// parallelism an under-connected node lost most of the discovery it was
+    /// trying to do, silently, for the most common reason there is
+    /// (report17 V17-L4).
+    #[test]
+    fn a_refused_send_does_not_abandon_the_rest_of_the_round() {
+        use std::sync::Mutex as StdMutex;
+
+        const LIVE: [u8; 32] = [0xAA; 32];
+        const DEAD: [u8; 32] = [0xDD; 32];
+
+        /// Refuses the FIRST send it is ever asked to make, then accepts.
+        /// Deterministic on purpose: refusing a particular peer would leave
+        /// the outcome to the random first pick.
+        #[derive(Default)]
+        struct RefusesOnce {
+            calls: StdMutex<usize>,
+        }
+        impl FrameBroadcaster for RefusesOnce {
+            fn send_to(&self, _peer_id: &[u8; 32], _priority: u8, _bytes: Vec<u8>) -> bool {
+                let mut n = self.calls.lock().unwrap();
+                *n += 1;
+                *n > 1
+            }
+            fn send_to_all_with_priority(&self, _priority: u8, _bytes: std::sync::Arc<[u8]>) {}
+            fn active_node_ids(&self) -> Vec<[u8; 32]> {
+                vec![LIVE, DEAD]
+            }
+        }
+
+        struct Quiet;
+        impl PexLogger for Quiet {
+            fn info(&self, _: &str, _: &str) {}
+            fn warn(&self, _: &str, _: &str) {}
+        }
+
+        let config = PexConfig {
+            walk_parallelism: 4,
+            ..PexConfig::default()
+        };
+        let state = Arc::new(Mutex::new(PexState::new()));
+        let broadcaster = RefusesOnce::default();
+        send_walks(
+            &[1u8; 32],
+            &[2u8; 32],
+            0,
+            None,
+            &config,
+            &broadcaster,
+            &state,
+            "tcp://10.0.0.1:5555",
+            &Quiet,
+        );
+
+        assert_eq!(
+            state.lock().unwrap().outstanding_walks.len(),
+            4,
+            "one refused send took the rest of the round with it"
+        );
+    }
+
+    /// And a node whose sessions are ALL dead gives up quickly.
+    ///
+    /// The retry is bounded so the round ends rather than marching through
+    /// every stale session for every walk.
+    #[test]
+    fn a_round_with_no_live_session_is_bounded_and_records_nothing() {
+        use std::sync::Mutex as StdMutex;
+
+        #[derive(Default)]
+        struct AllDead {
+            calls: StdMutex<usize>,
+        }
+        impl FrameBroadcaster for AllDead {
+            fn send_to(&self, _peer_id: &[u8; 32], _priority: u8, _bytes: Vec<u8>) -> bool {
+                *self.calls.lock().unwrap() += 1;
+                false
+            }
+            fn send_to_all_with_priority(&self, _priority: u8, _bytes: std::sync::Arc<[u8]>) {}
+            fn active_node_ids(&self) -> Vec<[u8; 32]> {
+                (0u8..10).map(|i| [i; 32]).collect()
+            }
+        }
+
+        struct Quiet;
+        impl PexLogger for Quiet {
+            fn info(&self, _: &str, _: &str) {}
+            fn warn(&self, _: &str, _: &str) {}
+        }
+
+        let config = PexConfig {
+            walk_parallelism: 4,
+            ..PexConfig::default()
+        };
+        let state = Arc::new(Mutex::new(PexState::new()));
+        let broadcaster = AllDead::default();
+        send_walks(
+            &[1u8; 32],
+            &[2u8; 32],
+            0,
+            None,
+            &config,
+            &broadcaster,
+            &state,
+            "tcp://10.0.0.1:5555",
+            &Quiet,
+        );
+
+        let tried = *broadcaster.calls.lock().unwrap();
+        assert_eq!(
+            tried,
+            4 * WALK_SEND_ATTEMPTS,
+            "the retry is not bounded: ten dead sessions were walked instead \
+             of {WALK_SEND_ATTEMPTS} candidates per walk"
+        );
+        assert!(
+            state.lock().unwrap().outstanding_walks.is_empty(),
+            "a walk nobody received still opened a ticket"
+        );
     }
 
     /// Once-only: the ticket is CONSUMED, so a replay of a genuine Result

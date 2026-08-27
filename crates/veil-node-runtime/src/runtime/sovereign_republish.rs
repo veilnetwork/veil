@@ -156,11 +156,20 @@ impl NodeRuntime {
                 // means a peer can seal something we can open. Different means
                 // every peer is sealing to keys we cannot answer, and no amount
                 // of looking at our own publish path would ever show it.
-                {
+                let _selfcheck = {
                     let resolver = Arc::clone(&selfcheck_resolver);
                     let ring = Arc::clone(&selfcheck_ring);
                     let lg = Arc::clone(&logger);
-                    tokio::spawn(async move {
+                    // OWNED, not detached (report17 V17-L8). Aborting this
+                    // republish task does not touch what it spawned, so a
+                    // 45-second sleeper outlived every reload: a node that
+                    // reloaded its identity a few times in a minute ended up
+                    // with several of them, each waking to make a network
+                    // resolve and warn on behalf of a service that was gone.
+                    // The guard lives to the end of the task body, so the
+                    // child goes when the task does — by return, by panic or
+                    // by abort.
+                    crate::runtime::AbortOnDrop(tokio::spawn(async move {
                         tokio::time::sleep(std::time::Duration::from_secs(45)).await;
                         let held_pk = veil_util::bytes_to_hex(&ring.current_ratchet_pk()[..4]);
                         let held_ek = veil_util::bytes_to_hex(&ring.current_ek()[..4]);
@@ -188,8 +197,8 @@ impl NodeRuntime {
                                 ),
                             ),
                         }
-                    });
-                }
+                    }))
+                };
                 // target routing-table density at which we
                 // use the base republish cadence. Above target → less
                 // frequent (save bandwidth); below → more frequent
