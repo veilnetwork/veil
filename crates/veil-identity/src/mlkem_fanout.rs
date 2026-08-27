@@ -137,7 +137,10 @@ pub struct VerifiedMlkemCert {
 ///    `doc.identity_keys`.
 /// 3. `cert.mlkem_algo` is supported (currently only
 ///    [`ALGO_ML_KEM_768`]).
-/// 4. `cert.valid_from_unix ≤ now_unix_secs ≤ cert.valid_until_unix`.
+/// 4. `now_unix_secs` lies inside the INTERSECTION of the certificate's own
+///    window, the signing subkey's window, and the document's — a delegation
+///    may not reach past what delegated it, and the caller is handed that
+///    intersection rather than the certificate's own claim.
 /// 5. Signature `cert.sig` verifies over `cert.signing_message`
 ///    under the selected subkey.
 ///
@@ -172,10 +175,33 @@ pub fn verify_mlkem_cert(
         return Err(MlkemFanoutError::UnsupportedKemAlgo(cert.mlkem_algo));
     }
 
-    if !cert.is_valid_at(now_unix_secs) {
+    // A delegated certificate cannot outlive what delegated it.
+    //
+    // Only the cert's own window was checked, and the cert's own
+    // `valid_until` was handed out. But the subkey that signs it is endorsed
+    // by the master for about seven days, while the runtime issues these for
+    // about thirty — and the decoder accepts the whole u64, so a device
+    // holding a still-valid subkey could sign one with `valid_until =
+    // u64::MAX`. The receiver took it, the resolver cached that stamp, and the
+    // device went on authorizing new conversations after the subkey that
+    // vouched for it had expired or been revoked (report17 V17-H2).
+    //
+    // So the window a verifier acts on is the INTERSECTION: the certificate,
+    // the subkey that signed it, and the document that endorses the subkey.
+    // Every one of those is checked at its own layer; what was missing is that
+    // a child may not reach past its parent.
+    let effective_from = cert
+        .valid_from_unix
+        .max(subkey.valid_from_unix)
+        .max(doc.issued_at_unix);
+    let effective_until = cert
+        .valid_until_unix
+        .min(subkey.valid_until_unix)
+        .min(doc.valid_until_unix);
+    if now_unix_secs < effective_from || now_unix_secs > effective_until {
         return Err(MlkemFanoutError::CertNotValidNow {
-            from: cert.valid_from_unix,
-            until: cert.valid_until_unix,
+            from: effective_from,
+            until: effective_until,
             now: now_unix_secs,
         });
     }
@@ -194,7 +220,10 @@ pub fn verify_mlkem_cert(
         mlkem_pubkey: cert.mlkem_pubkey.clone(),
         ratchet_x25519_pubkey: cert.ratchet_x25519_pubkey,
         cert_version: cert.cert_version,
-        valid_until_unix: cert.valid_until_unix,
+        // The intersection, not the certificate's own claim: what the caller
+        // caches is how long this key may be TRUSTED, and that ends when the
+        // subkey or the document that vouches for it does.
+        valid_until_unix: effective_until,
     })
 }
 
