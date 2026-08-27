@@ -221,9 +221,23 @@ pub fn spawn_outbound_peers(
                 // restarted (report16 V16-M6). None for the synthetic gateway
                 // range, which lives outside the map; those keep the slot they
                 // were spawned with.
-                let dial_peer_id = access
-                    .current_peer_slot(&peer_node_id)
-                    .unwrap_or(peer.peer_id);
+                // The whole row, not only the slot.
+                //
+                // Dialling followed the replacement already; everything done
+                // AFTER a successful handshake still described the row this
+                // task was BORN with — so the trusted routing contact, the
+                // cold-start bootstrap cache and the rotation's primary URI
+                // were written from an address and keys that are no longer the
+                // peer's, while the session they describe was established to
+                // the current ones (report17 V17-M4).
+                //
+                // Taken once per attempt: one snapshot, used for the dial and
+                // for everything the dial's success then publishes, so the two
+                // cannot disagree.
+                let attempt = access
+                    .current_peer_entry(&peer_node_id)
+                    .unwrap_or_else(|| peer.clone());
+                let dial_peer_id = attempt.peer_id;
 
                 // A learned row that has since been evicted takes its
                 // connector with it. Only rows we learned OURSELVES are retired
@@ -502,7 +516,7 @@ pub fn spawn_outbound_peers(
                                     // the rotation-deadline trigger can do same-URI
                                     // make-before-break without requiring a separate
                                     // alt_uri (Q.7 audit batch).
-                                    primary_uri: Some(peer.transport.clone()),
+                                    primary_uri: Some(attempt.transport.clone()),
                                 };
                                 // bootstrap-only peers — send FIND_NODE(self)
                                 // and collect contacts into the local DHT, then let
@@ -574,8 +588,8 @@ pub fn spawn_outbound_peers(
                                 // hidden from DHT-walks.
                                 access.dht.add_contact_trusted(
                                     veil_dht::routing::Contact::from_handshake(
-                                        *peer.node_id.as_bytes(),
-                                        &peer.transport,
+                                        *attempt.node_id.as_bytes(),
+                                        &attempt.transport,
                                         session.remote_caps_stated.then_some((
                                             session.remote_discovery_mode,
                                             session.remote_dht_service,
@@ -587,14 +601,14 @@ pub fn spawn_outbound_peers(
                                 // table — handshake completion is the proof of
                                 // key ownership the 2-tier scheme requires.
                                 let _ = access.dht.promote_contact_if_pending(
-                                    peer.node_id.as_bytes(),
+                                    attempt.node_id.as_bytes(),
                                 );
                                 access.logger.info(
                                     "dht.peer_added",
                                     format!(
                                         "outbound handshake → peer={} transport={} dht_service={}",
-                                        veil_util::hex_short(peer.node_id.as_bytes()),
-                                        veil_util::redact_addr_for_log(&peer.transport),
+                                        veil_util::hex_short(attempt.node_id.as_bytes()),
+                                        veil_util::redact_addr_for_log(&attempt.transport),
                                         // "unstated" is not a synonym for the
                                         // synthesized `true` a resumed
                                         // handshake carries — printing the
@@ -640,18 +654,21 @@ pub fn spawn_outbound_peers(
                                 // because their `peer.transport` came from a
                                 // beacon (already cached separately by
                                 // `AutoDiscoveredPeers`).
-                                if peer.peer_id.get() < 0xC000_0000 {
+                                if attempt.peer_id.get() < 0xC000_0000 {
                                     let now = std::time::SystemTime::now()
                                         .duration_since(std::time::UNIX_EPOCH)
                                         .map(|d| d.as_secs())
                                         .unwrap_or(0);
+                                    // From the row this handshake actually
+                                    // proved, so a cold start dials what
+                                    // answered rather than what used to.
                                     let bp = veil_cfg::BootstrapPeer {
-                                        transport: peer.transport.clone(),
-                                        public_key: peer.public_key.clone(),
-                                        nonce: peer.nonce.clone(),
-                                        algo: peer.algo,
-                                        tls_cert: peer.tls_cert.clone(),
-                                        tls_ca_cert: peer.tls_ca_cert.clone(),
+                                        transport: attempt.transport.clone(),
+                                        public_key: attempt.public_key.clone(),
+                                        nonce: attempt.nonce.clone(),
+                                        algo: attempt.algo,
+                                        tls_cert: attempt.tls_cert.clone(),
+                                        tls_ca_cert: attempt.tls_ca_cert.clone(),
                                     };
                                     lock!(access.discovered_peers_cache).upsert(bp, now);
                                 }
@@ -940,6 +957,18 @@ mod tests {
             "the per-pass lookup must follow the row, not the number"
         );
 
+        // And the whole ROW follows too, not only the number. Everything the
+        // connector publishes after a successful handshake is built from this
+        // — an address and keys taken from the row it was spawned with
+        // describe a peer that has since moved (report17 V17-M4).
+        use crate::runtime::persistence::existing_entry_for;
+        assert_eq!(
+            existing_entry_for(&peers, &node_id).map(|e| e.transport.as_str()),
+            Some("tcp://10.0.0.2:5555"),
+            "the per-pass lookup returns the replacement's slot but the old \
+             row's address"
+        );
+
         // And nothing else will dial it: the claim only wakes the owner.
         let slots: ConnectorRefreshSlots = Arc::new(Mutex::new(std::collections::HashMap::new()));
         let _owner = claim_or_refresh_connector(&slots, node_id).expect("the owner");
@@ -969,6 +998,56 @@ mod tests {
         production
     }
 
+    /// report17 V17-M4: the dial followed the replacement row and everything
+    /// published afterwards described the row the task was BORN with.
+    ///
+    /// A peer that comes back at a new address gets a new slot, and the
+    /// per-node-id claim keeps one connector for it — so this task dials the
+    /// current row (V16-M6) and then wrote the OLD row's transport and keys
+    /// into the trusted routing table, the cold-start bootstrap cache and the
+    /// rotation's primary URI. Every one of those is a durable statement about
+    /// where this peer can be reached, made from a snapshot the handshake did
+    /// not use.
+    ///
+    /// Structural for the same reason as the test below: the decision lives
+    /// inside a spawned task that needs a live `NodeServices`, and what is
+    /// wrong when it is wrong is which binding each line reads.
+    #[test]
+    fn what_the_handshake_publishes_comes_from_the_row_it_dialled() {
+        let source = production_source();
+
+        // One snapshot per attempt, and the dial comes out of it.
+        assert!(
+            source.contains("let dial_peer_id = attempt.peer_id;"),
+            "the dial no longer comes from the attempt's own snapshot"
+        );
+
+        for published in [
+            "primary_uri: Some(attempt.transport.clone())",
+            "*attempt.node_id.as_bytes(),",
+            "transport: attempt.transport.clone(),",
+            "public_key: attempt.public_key.clone(),",
+        ] {
+            assert!(
+                source.contains(published),
+                "a durable statement about this peer is written from the row \
+                 the task was born with, not the one it dialled: {published}"
+            );
+        }
+
+        // And none of the old bindings are left in the success path.
+        for stale in [
+            "primary_uri: Some(peer.transport.clone())",
+            "transport: peer.transport.clone(),",
+            "&peer.transport,",
+        ] {
+            assert!(
+                !source.contains(stale),
+                "the stale snapshot is still published: {stale}"
+            );
+        }
+    }
+
     /// The connector must ASK which row stands for its node id each pass, and
     /// retire when there is none.
     ///
@@ -982,7 +1061,7 @@ mod tests {
         let source = production_source();
 
         assert!(
-            source.contains("current_peer_slot(&peer_node_id)"),
+            source.contains("current_peer_entry(&peer_node_id)"),
             "the connector never asks which row currently stands for this node id"
         );
         assert!(

@@ -104,6 +104,22 @@ pub struct DiscoveredPeerSnapshot {
 /// Linear in the map, which is the point: bounded by the number of DISTINCT
 /// peers once callers use it, and called once per newly-learned peer rather
 /// than per frame.
+/// The whole row this node currently occupies, if any.
+///
+/// Beside [`existing_slot_for`] because a connector needs both and they must
+/// agree: it dials the slot and then publishes durable statements — a trusted
+/// routing contact, the cold-start bootstrap cache, the rotation's primary URI
+/// — describing where that peer can be reached. Taking the slot from here and
+/// the address from a snapshot captured when the task spawned is how those
+/// statements came to describe a row the handshake never used (report17
+/// V17-M4).
+pub(crate) fn existing_entry_for<'a>(
+    peers: &'a std::collections::BTreeMap<veil_cfg::PeerId, PeerConfigEntry>,
+    node_id: &[u8; 32],
+) -> Option<&'a PeerConfigEntry> {
+    peers.values().find(|e| e.node_id.as_bytes() == node_id)
+}
+
 pub(crate) fn existing_slot_for(
     peers: &std::collections::BTreeMap<veil_cfg::PeerId, PeerConfigEntry>,
     node_id: &[u8; 32],
