@@ -4432,6 +4432,25 @@ impl NodeServices {
         crate::runtime::persistence::existing_slot_for(&lock_state(&self.state).peers, node_id)
     }
 
+    /// The WHOLE row that currently stands for `node_id`, not just its slot.
+    ///
+    /// A connector task is spawned with a snapshot of the row it was born
+    /// with, and that row can be replaced while the task lives — a peer that
+    /// comes back at a new address gets a new slot, and the per-node-id claim
+    /// stops a second connector being spawned for it. Dialling already
+    /// followed the replacement (report16 V16-M6); everything the task did
+    /// AFTER a successful handshake still described the row it started with,
+    /// so the trusted routing contact, the cold-start bootstrap cache and the
+    /// rotation's primary URI were all written from an address and keys that
+    /// are no longer the peer's (report17 V17-M4).
+    pub(crate) fn current_peer_entry(
+        &self,
+        node_id: &[u8; 32],
+    ) -> Option<crate::types::PeerConfigEntry> {
+        crate::runtime::persistence::existing_entry_for(&lock_state(&self.state).peers, node_id)
+            .cloned()
+    }
+
     pub async fn dht_get_replicated(
         &self,
         key: [u8; 32],
