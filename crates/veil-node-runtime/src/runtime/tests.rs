@@ -3648,3 +3648,75 @@ fn the_sustained_probe_rate_is_one_per_ten_minutes() {
         "expected 6 probes an hour, got {per_hour}"
     );
 }
+
+/// A task spawned inside a supervised one must not outlive it
+/// (report17 V17-L8).
+///
+/// Aborting a supervisor does not touch what the supervisor spawned. The
+/// identity republish task started a detached 45-second sleeper, so a node
+/// that reloaded its identity a few times in a minute ended up with several of
+/// them, each waking to make a network resolve and warn on behalf of a service
+/// that was already gone.
+#[tokio::test]
+async fn a_guarded_child_task_dies_with_its_scope() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let woke = std::sync::Arc::new(AtomicBool::new(false));
+    {
+        let flag = std::sync::Arc::clone(&woke);
+        let _guard = super::AbortOnDrop(tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+            flag.store(true, Ordering::SeqCst);
+        }));
+    }
+
+    tokio::time::sleep(std::time::Duration::from_millis(160)).await;
+
+    assert!(
+        !woke.load(Ordering::SeqCst),
+        "the child outlived the scope that owned it"
+    );
+}
+
+/// CONTROL: the same child, detached, DOES wake.
+///
+/// Without this the assertion above is satisfied by a test that simply never
+/// waits long enough — which is how a lifecycle test passes over a leak.
+#[tokio::test]
+async fn an_unguarded_child_task_outlives_its_scope() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let woke = std::sync::Arc::new(AtomicBool::new(false));
+    {
+        let flag = std::sync::Arc::clone(&woke);
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+            flag.store(true, Ordering::SeqCst);
+        });
+    }
+
+    tokio::time::sleep(std::time::Duration::from_millis(160)).await;
+
+    assert!(
+        woke.load(Ordering::SeqCst),
+        "the detached child did not run, so the guarded case proves nothing"
+    );
+}
+
+/// And the identity self-check is the one that was detached.
+///
+/// Structural: the sleeper lives inside a supervised task's body, several
+/// awaits deep, and what is being pinned is that it is OWNED — a bare
+/// `tokio::spawn` there is the defect.
+#[test]
+fn the_identity_selfcheck_is_owned_by_its_task() {
+    let src = include_str!("sovereign_republish.rs");
+    assert!(
+        src.contains("AbortOnDrop(tokio::spawn("),
+        "the self-check is spawned detached again"
+    );
+    assert!(
+        !src.contains("\n                    tokio::spawn(async move {"),
+        "a detached spawn came back into the republish task"
+    );
+}

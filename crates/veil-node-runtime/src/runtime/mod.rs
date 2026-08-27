@@ -1012,6 +1012,27 @@ impl Drop for NodeRuntime {
 ///
 /// The current caller is still responsible for pushing the returned
 /// `JoinHandle` into the runtime's task-set so that graceful shutdown awaits it.
+/// A spawned task that is aborted when this guard goes.
+///
+/// The shape a `tokio::spawn` inside a supervised task should have. Aborting
+/// the supervisor does not touch what the supervisor itself spawned, so a
+/// child that sleeps — a delayed self-check, a debounce — outlives the thing
+/// that owned it, and a service that reloads quickly accumulates them
+/// (report17 V17-L8). Holding the handle here ties the child's life to the
+/// scope that created it, including every early return and abort, which is
+/// what an explicit `.abort()` at the end of a loop misses.
+///
+/// `veil-ipc`'s server keeps its own copy of this for its read-half task;
+/// they are not shared because `veil-util`, the crate both could import from,
+/// deliberately does not depend on tokio.
+pub(crate) struct AbortOnDrop(pub tokio::task::JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 pub fn supervised_spawn<F>(
     logger: Arc<NodeLogger>,
     task_name: &'static str,

@@ -43,15 +43,15 @@ compile_error!(
 ///
 /// **Build-feature semantics**:
 /// * `production-seeds` (or `debug_assertions` / `cfg(test)`) — return
-/// the real production seed list compiled in below. Operators
-/// update by editing the entries and rebuilding.
+///   the real production seed list compiled in below. Operators
+///   update by editing the entries and rebuilding.
 /// * `allow-empty-seeds` — return `Vec::new`. This keeps testnet /
-/// custom-deployment builds from accidentally dialing the production
-/// seed nodes at startup, which would leak DNS + TLS-handshake
-/// attempts to production infrastructure (a censorship-evasion
-/// leak when the build is supposed to be isolated).
-/// bug surfaced by 5-node devnet smoke: node-0 ran with empty
-/// `peers`/`bootstrap_peers` and fell back to the prod seeds.
+///   custom-deployment builds from accidentally dialing the production
+///   seed nodes at startup, which would leak DNS + TLS-handshake
+///   attempts to production infrastructure (a censorship-evasion
+///   leak when the build is supposed to be isolated).
+///   bug surfaced by 5-node devnet smoke: node-0 ran with empty
+///   `peers`/`bootstrap_peers` and fell back to the prod seeds.
 ///
 /// In a no-default-features release build the workspace `compile_error!`
 /// at the top of the file refuses to build without one of the two
