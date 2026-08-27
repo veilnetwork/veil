@@ -244,6 +244,14 @@ pub struct PeerRatchetKeys<'a> {
     pub mlkem_ek: &'a [u8],
     /// The device's rotating X25519 public key.
     pub ratchet_pk: &'a [u8; 32],
+    /// When the certificate these keys came out of stops vouching for them.
+    ///
+    /// Carried in so the conversation can record HOW LONG the peer is proven
+    /// rather than merely that it was, which is what let a revoked device keep
+    /// its authenticated standing across restarts (report17 V17-H1). Already
+    /// clipped by the verifier to the delegation and document behind it
+    /// (V17-H2).
+    pub authorized_until_unix: u64,
 }
 
 /// Our own half: who we are and what we can decrypt with.
@@ -362,13 +370,25 @@ struct Entry {
     session: RatchetSession,
     /// The peer's device X25519 key this session was keyed to.
     peer_ik: [u8; 32],
-    /// `true` once that key is known to be the one the peer published.
+    /// How long the evidence that keyed this conversation stays good.
     ///
-    /// Always `true` on the side that initiated — it read the key out of a
-    /// verified certificate before deriving anything. On the side that
-    /// accepted it starts `false` and is raised the first time the peer's
-    /// certificate is in hand, which may be several frames later.
-    authenticated: bool,
+    /// `0` means nothing has vouched for the key yet. Otherwise it is the
+    /// `valid_until` of the certificate that did — clipped, by the verifier,
+    /// to the delegation and the document behind it.
+    ///
+    /// A BIT lived here before, and a bit only ever went up. A device that was
+    /// legitimate when the conversation started kept its authenticated
+    /// standing after the certificate expired, after the delegation lapsed and
+    /// after the owner revoked the device — across restarts too, because the
+    /// bit was persisted and restored without asking anything (report17
+    /// V17-H1). Whether a session can still DECRYPT is a fact about keys and
+    /// does not change; whether the sender may still be shown as proven is a
+    /// question about now, and now keeps moving.
+    ///
+    /// On the side that initiated, this is set from the certificate it read
+    /// before deriving anything. On the side that accepted it starts at 0 and
+    /// is filled the first time the peer's certificate is in hand.
+    authenticated_until: u64,
     /// The PQXDH prologue to re-attach to outgoing frames until the peer
     /// answers. `None` once anything of theirs has opened.
     pending_prologue: Option<Vec<u8>>,
@@ -413,8 +433,28 @@ impl Entry {
     /// peer's side is proven and answered, [`open`]'s displacement rule
     /// (correctly) refuses to let any prologue re-key it, and both ends are
     /// stuck for good with no message on the wire that could recover them.
+    /// Is the peer PROVEN, as of `now`?
+    ///
+    /// Never "was it ever": that is the question the persisted bit answered,
+    /// and the answer outlived every way an owner has of taking a device away.
+    fn is_authenticated(&self, now_unix: u64) -> bool {
+        self.authenticated_until != 0 && now_unix <= self.authenticated_until
+    }
+
+    /// Has anything EVER vouched for this key?
+    ///
+    /// Deliberately not the same question as [`Self::is_authenticated`], and
+    /// this is what eviction and displacement ask. A conversation whose
+    /// evidence has merely gone stale still decrypts, still belongs to the
+    /// peer it was agreed with, and must not become a slot an inbound prologue
+    /// may take — that would turn every expiry into an opening for a stranger.
+    /// What expiry costs is standing, not the session.
+    fn ever_proven(&self) -> bool {
+        self.authenticated_until != 0
+    }
+
     fn droppable(&self) -> bool {
-        !self.authenticated
+        !self.ever_proven()
     }
 
     fn encode(&self) -> Zeroizing<Vec<u8>> {
@@ -425,7 +465,11 @@ impl Entry {
         out.extend_from_slice(&CONVERSATION_BLOB_MAGIC);
         out.push(CONVERSATION_BLOB_V2);
         out.extend_from_slice(&self.peer_ik);
-        out.push(u8::from(self.authenticated));
+        // The byte stays where it was, and still says only "was there ever
+        // evidence" — a build that predates the stamp reads this file and gets
+        // the same answer it always did. The stamp itself is APPENDED, so an
+        // older reader stops where it always stopped.
+        out.push(u8::from(self.authenticated_until != 0));
         out.extend_from_slice(&self.last_used_at.to_be_bytes());
         match &self.pending_prologue {
             Some(p) => {
@@ -437,6 +481,9 @@ impl Entry {
         }
         out.extend_from_slice(&(session.len() as u32).to_be_bytes());
         out.extend_from_slice(&session);
+        // Appended LAST, after the session, for the ordinary reason: it is how
+        // a field is added without a flag day.
+        out.extend_from_slice(&self.authenticated_until.to_be_bytes());
         Zeroizing::new(out)
     }
 
@@ -462,7 +509,7 @@ impl Entry {
         }
         let mut peer_ik = [0u8; 32];
         peer_ik.copy_from_slice(take(32)?);
-        let authenticated = match take(1)?[0] {
+        let ever_authenticated = match take(1)?[0] {
             0 => false,
             1 => true,
             _ => return Err(RatchetSpliceError::Malformed("bad boolean")),
@@ -490,6 +537,24 @@ impl Entry {
                 .map_err(|_| RatchetSpliceError::Malformed("session length"))?,
         ) as usize;
         let session = RatchetSession::import_state(take(session_len)?)?;
+        // Written by a build that had only the bit. It said this peer was
+        // proven ONCE and cannot say for how long, so the conversation is
+        // restored able to decrypt and NOT proven: the next certificate in
+        // hand fills the stamp in, and until then a sender is shown as what it
+        // can be shown to be. Demoting is the direction that cannot be wrong.
+        // Last use of the reader, so the borrow it holds on the cursor ends
+        // here and the trailing-bytes check below can read it.
+        let stamp = take(8).ok().map(<[u8; 8]>::try_from);
+        let authenticated_until = match stamp {
+            None => {
+                let _ = ever_authenticated;
+                0
+            }
+            Some(Ok(bytes)) => u64::from_be_bytes(bytes),
+            Some(Err(_)) => {
+                return Err(RatchetSpliceError::Malformed("authorization stamp"));
+            }
+        };
         if at != bytes.len() {
             return Err(RatchetSpliceError::Malformed(
                 "trailing bytes in conversation blob",
@@ -498,7 +563,7 @@ impl Entry {
         Ok(Self {
             session,
             peer_ik,
-            authenticated,
+            authenticated_until,
             pending_prologue,
             last_used_at,
             // Never encoded: a restart forgives a wedged conversation anyway.
@@ -1147,7 +1212,7 @@ fn seal_inner(
     if let Some((matches_certificate, proven)) = g
         .entries
         .get(&key)
-        .map(|e| (e.peer_ik == *peer.ratchet_pk, e.authenticated))
+        .map(|e| (e.peer_ik == *peer.ratchet_pk, e.is_authenticated(now_unix)))
         && !proven
     {
         if matches_certificate {
@@ -1156,7 +1221,9 @@ fn seal_inner(
             // peer is proven from here on and a later rotation of theirs must
             // not be read as a contradiction.
             if let Some(entry) = g.entries.get_mut(&key) {
-                entry.authenticated = true;
+                // For as long as the certificate we just checked says so, and
+                // no longer.
+                entry.authenticated_until = peer.authorized_until_unix;
             }
         } else {
             // It was not: an unverified claim against a verified certificate.
@@ -1221,8 +1288,9 @@ fn seal_inner(
                     session,
                     peer_ik: *peer.ratchet_pk,
                     // Read out of a certificate whose signature chain the
-                    // caller verified, so the peer is proven from the reply on.
-                    authenticated: true,
+                    // caller verified — proven from the reply on, and only for
+                    // as long as that certificate is good for.
+                    authenticated_until: peer.authorized_until_unix,
                     pending_prologue: Some(blob[..PQXDH_PROLOGUE_LEN].to_vec()),
                     last_used_at: now_unix,
                     frame_failures: 0,
@@ -1400,7 +1468,7 @@ fn open_inner(
     // and a replay of the peer's own both stop here — the second could
     // otherwise rewind a live chain.
     let displaceable =
-        |e: &Entry| proves_authorship && (!e.authenticated || e.pending_prologue.is_some());
+        |e: &Entry| proves_authorship && (!e.ever_proven() || e.pending_prologue.is_some());
 
     // An established conversation is never re-keyed by an inbound prologue.
     // Anyone can produce one — a prologue is sealed to our *published* key —
@@ -1427,14 +1495,18 @@ fn open_inner(
                     // eviction order becomes something an attacker writes by
                     // aiming garbage at whichever conversation it wants kept.
                     entry.last_used_at = now_unix;
-                    if !entry.authenticated
-                        && (peer_devices.is_some_and(|d| {
-                            d.contains(&sender_instance_id, &entry.peer_ik, now_unix)
-                        }) || proves_authorship)
+                    // Refreshed on EVERY frame that opens, not only the first
+                    // time. The stamp is the certificate's, so a peer that
+                    // re-published moves it forward and a peer whose
+                    // certificate lapsed lets it run out — which is the whole
+                    // difference between asking "was this ever proven" and
+                    // "is it proven now".
+                    if let Some(until) = peer_devices
+                        .and_then(|d| d.authorized_until(&sender_instance_id, &entry.peer_ik))
                     {
-                        entry.authenticated = true;
+                        entry.authenticated_until = entry.authenticated_until.max(until);
                     }
-                    let authenticated = entry.authenticated;
+                    let authenticated = entry.is_authenticated(now_unix);
                     g.commit_change(key);
                     // A frame that opened may have banked keys for the ones it
                     // arrived ahead of. Checked HERE, after the tag verified,
@@ -1521,8 +1593,10 @@ fn open_inner(
         ) {
             Ok((plaintext, session)) => {
                 let peer_ik = *message.initiator_ik();
-                let authenticated = peer_devices
-                    .is_some_and(|d| d.contains(&sender_instance_id, &peer_ik, now_unix));
+                let authenticated_until = peer_devices
+                    .and_then(|d| d.authorized_until(&sender_instance_id, &peer_ik))
+                    .unwrap_or(0);
+                let authenticated = authenticated_until != 0 && now_unix <= authenticated_until;
                 let mut g = store.lock();
                 // Ask the store again. Another thread may have opened this
                 // conversation while the agreement above ran unlocked, and the
@@ -1553,7 +1627,7 @@ fn open_inner(
                         Entry {
                             session,
                             peer_ik,
-                            authenticated,
+                            authenticated_until,
                             pending_prologue: None,
                             last_used_at: now_unix,
                             frame_failures: 0,
@@ -1659,9 +1733,21 @@ impl PeerDeviceKeys {
     /// and it may have stopped saying it since.
     #[must_use]
     pub fn contains(&self, instance_id: &[u8; 16], key: &[u8; 32], now_unix: u64) -> bool {
+        self.authorized_until(instance_id, key)
+            .is_some_and(|until| now_unix <= until)
+    }
+
+    /// When the certificate that named this (device, key) pair stops saying
+    /// so, or `None` if none did.
+    ///
+    /// The conversation keeps this rather than a bit, so "proven" can stop
+    /// being true the way the certificate behind it does (report17 V17-H1).
+    #[must_use]
+    pub fn authorized_until(&self, instance_id: &[u8; 16], key: &[u8; 32]) -> Option<u64> {
         self.keys
             .iter()
-            .any(|(i, k, until)| i == instance_id && k == key && now_unix <= *until)
+            .find(|(i, k, _)| i == instance_id && k == key)
+            .map(|(_, _, until)| *until)
     }
 
     /// The most recently published key, for callers that need ONE — a
@@ -1809,16 +1895,22 @@ impl RatchetRuntime {
     /// Diagnostic: is a conversation with this peer stored, and has it ever
     /// opened anything?
     ///
-    /// `authenticated` is what makes a conversation untouchable by an inbound
-    /// prologue (see `displaceable` in [`open`]), so when frames from a peer
-    /// stop opening it is the one bit that says whether the conversation can
-    /// still recover or is wedged for good. Read-only, no key material.
+    /// Having been proven is what makes a conversation untouchable by an
+    /// inbound prologue (see `displaceable` in [`open`]), so when frames from
+    /// a peer stop opening it is the one fact that says whether the
+    /// conversation can still recover or is wedged for good. Read-only, no key
+    /// material.
+    ///
+    /// EVER proven, not proven now: the caller is asking whether a prologue
+    /// could rescue this conversation, and the answer to that does not change
+    /// when a certificate lapses. What lapsing changes is the provenance shown
+    /// for a message, which is [`Opened::authenticated`].
     pub fn peer_entry_authenticated(&self, peer_node_id: &[u8; 32]) -> Option<bool> {
         let g = self.store.lock();
         g.entries
             .iter()
             .find(|(k, _)| &k.peer_node_id == peer_node_id)
-            .map(|(_, e)| e.authenticated)
+            .map(|(_, e)| e.ever_proven())
     }
 
     /// The most recent device key this peer published, for callers that need
@@ -1932,6 +2024,10 @@ mod tests {
             instance_id: &d.instance_id,
             mlkem_ek: ek,
             ratchet_pk: pk,
+            // The tests run around 0 and 1_000; far enough out that a
+            // certificate's own end never decides a case that is about
+            // something else, and every case that IS about it says so.
+            authorized_until_unix: u64::MAX,
         }
     }
 
@@ -1950,6 +2046,131 @@ mod tests {
             Some(&dev(a.instance_id, &a_pk)),
             NOW,
         )
+    }
+
+    /// A device that was legitimate stops being proven when its certificate
+    /// stops saying so.
+    ///
+    /// The conversation still DECRYPTS — the keys are the keys, and revoking a
+    /// device does not un-agree a root. What ends is the standing: the sender
+    /// is no longer shown as proven, so it no longer bypasses the budget for
+    /// unproven senders. A bit could not express that, and a bit is what was
+    /// persisted (report17 V17-H1).
+    #[test]
+    fn a_proven_peer_stops_being_proven_when_its_certificate_does() {
+        let a = device(1);
+        let b = device(2);
+        let expires = NOW + 100;
+
+        // A seals to B out of a certificate good until `expires`.
+        let (ek, pk) = (b.ek(), b.ratchet_pk());
+        let payload = seal(
+            &a.store,
+            &a.me(),
+            PeerRatchetKeys {
+                node_id: &b.node_id,
+                instance_id: &b.instance_id,
+                mlkem_ek: &ek,
+                ratchet_pk: &pk,
+                authorized_until_unix: expires,
+            },
+            b"hello",
+            NOW,
+        )
+        .expect("seal")
+        .0;
+        let a_pk = a.ratchet_pk();
+        open(
+            &b.store,
+            &b.me(),
+            &a.node_id,
+            &payload,
+            Some(&dev(a.instance_id, &a_pk)),
+            NOW,
+        )
+        .expect("B opens");
+
+        // B answers twice: once inside the certificate's window, once after.
+        let reply = |at: u64| {
+            let (ek, pk) = (a.ek(), a.ratchet_pk());
+            seal(
+                &b.store,
+                &b.me(),
+                PeerRatchetKeys {
+                    node_id: &a.node_id,
+                    instance_id: &a.instance_id,
+                    mlkem_ek: &ek,
+                    ratchet_pk: &pk,
+                    authorized_until_unix: u64::MAX,
+                },
+                b"and back",
+                at,
+            )
+            .expect("seal")
+            .0
+        };
+        let inside = reply(NOW);
+        let outside = reply(NOW + 1);
+
+        // Inside: proven, as it always was.
+        let opened =
+            open(&a.store, &a.me(), &b.node_id, &inside, None, expires - 1).expect("A opens");
+        assert!(
+            opened.authenticated,
+            "premise: a live certificate proves the peer"
+        );
+
+        // Outside: the same session, the same keys — it opens, and it is no
+        // longer proven.
+        let opened = open(&a.store, &a.me(), &b.node_id, &outside, None, expires + 1)
+            .expect("the conversation still decrypts after the certificate lapses");
+        assert!(
+            !opened.authenticated,
+            "a device kept its proven standing after its certificate expired"
+        );
+    }
+
+    /// And it survives a restart the same way, because the stamp is what is
+    /// written down.
+    #[test]
+    fn the_authorization_stamp_is_persisted_and_a_bare_bit_is_not_believed() {
+        // A real conversation, so the session inside the blob is a real one.
+        let a = device(3);
+        let b = device(4);
+        let (ek, pk) = (b.ek(), b.ratchet_pk());
+        seal(&a.store, &a.me(), keys(&b, &ek, &pk), b"x", NOW).expect("seal");
+        let blob = {
+            let mut g = a.store.lock();
+            let entry = g.entries.values_mut().next().expect("entry");
+            entry.authenticated_until = NOW + 500;
+            entry.encode()
+        };
+        let back = Entry::decode(&blob).expect("decode");
+        assert_eq!(
+            back.authenticated_until,
+            NOW + 500,
+            "the stamp did not survive being written down"
+        );
+        assert!(back.is_authenticated(NOW));
+        assert!(
+            !back.is_authenticated(NOW + 501),
+            "a restored conversation is proven forever again"
+        );
+
+        // A blob from a build that had only the bit: everything up to the
+        // stamp, and the byte still says "yes, once".
+        let older = &blob[..blob.len() - 8];
+        assert_eq!(older[4 + 1 + 32], 1, "premise: the bit says proven");
+        let restored = Entry::decode(older).expect("an older blob still loads");
+        assert_eq!(
+            restored.authenticated_until, 0,
+            "a bit with no expiry was restored as proof, which is what \
+             outlived every revocation"
+        );
+        assert!(
+            !restored.is_authenticated(NOW),
+            "the peer is shown as proven on the strength of a bit"
+        );
     }
 
     /// One peer, two devices, and both of them are that peer.
@@ -2172,7 +2393,7 @@ mod tests {
         // anything sweepable.
         {
             let mut g = a.store.lock();
-            g.entries.get_mut(&key).unwrap().authenticated = true;
+            g.entries.get_mut(&key).unwrap().authenticated_until = u64::MAX;
             assert_eq!(
                 g.enforce_skipped_budget_to(0),
                 0,
@@ -2182,7 +2403,7 @@ mod tests {
             assert!(g.entries[&key].session.skipped_len() > 0);
 
             // The same conversation unproven is exactly what a flood produces.
-            g.entries.get_mut(&key).unwrap().authenticated = false;
+            g.entries.get_mut(&key).unwrap().authenticated_until = 0;
             let freed = g.enforce_skipped_budget_to(0);
             assert!(
                 freed > 0,
@@ -3826,7 +4047,7 @@ mod tests {
             };
             key.peer_node_id[..8].copy_from_slice(&(i as u64).to_be_bytes());
             let mut entry = Entry::decode(&blob).expect("decode");
-            entry.authenticated = authenticated;
+            entry.authenticated_until = if authenticated { u64::MAX } else { 0 };
             entry.pending_prologue = None;
             entry.last_used_at = stamp;
             g.entries.insert(key, entry);

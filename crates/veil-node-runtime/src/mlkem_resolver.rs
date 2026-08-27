@@ -1440,6 +1440,7 @@ fn to_peer_cert(cert: VerifiedMlkemCert) -> veil_types::VerifiedPeerCert {
         mlkem_ek: cert.mlkem_pubkey,
         ratchet_x25519_pk: cert.ratchet_x25519_pubkey,
         cert_version: cert.cert_version,
+        valid_until_unix: cert.valid_until_unix,
     }
 }
 

@@ -3920,6 +3920,7 @@ mod ratchet_terminal_tests {
                     instance_id: &to.instance_id,
                     mlkem_ek: &ek,
                     ratchet_pk: &pk,
+                    authorized_until_unix: u64::MAX,
                 },
                 plaintext,
                 veil_util::unix_secs_now_u64(),

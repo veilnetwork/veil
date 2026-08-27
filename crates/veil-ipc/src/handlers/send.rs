@@ -428,6 +428,7 @@ async fn try_ratchet_seal(
             instance_id: &cert.instance_id,
             mlkem_ek: &cert.mlkem_ek,
             ratchet_pk: &cert.ratchet_x25519_pk,
+            authorized_until_unix: cert.valid_until_unix,
         },
         data,
         veil_util::unix_secs_now_u64(),
@@ -1661,6 +1662,7 @@ mod ratchet_send_tests {
             mlkem_ek: peer_ring.current_ek().to_vec(),
             ratchet_x25519_pk: peer_ring.current_ratchet_pk(),
             cert_version: 1,
+            valid_until_unix: u64::MAX,
         };
         let route_cache = RwLock::new(veil_routing::RouteCache::new(
             std::time::Duration::from_secs(60),
@@ -1707,6 +1709,7 @@ mod ratchet_send_tests {
             mlkem_ek: peer_ring.current_ek().to_vec(),
             ratchet_x25519_pk: peer_ring.current_ratchet_pk(),
             cert_version: 1,
+            valid_until_unix: u64::MAX,
         };
         let sibling_row = veil_types::VerifiedPeerCert {
             node_id: PEER,
@@ -1714,6 +1717,7 @@ mod ratchet_send_tests {
             mlkem_ek: sibling_ring.current_ek().to_vec(),
             ratchet_x25519_pk: sibling_ring.current_ratchet_pk(),
             cert_version: 1,
+            valid_until_unix: u64::MAX,
         };
         let my_ratchet_pk = fx.me.seed_ring.read().expect("ring").current_ratchet_pk();
         let sibling_rt = ratchet_runtime(PEER, SIBLING_INSTANCE, sibling_ring);
