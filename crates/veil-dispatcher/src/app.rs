@@ -543,6 +543,7 @@ mod tests {
                     instance_id: &[0x0C; 16], // a sibling, not our [0x0B; 16]
                     mlkem_ek: &ek,
                     ratchet_pk: &ratchet_pk,
+                    authorized_until_unix: u64::MAX,
                 },
                 b"keyed to the wrong device",
                 veil_util::unix_secs_now_u64(),

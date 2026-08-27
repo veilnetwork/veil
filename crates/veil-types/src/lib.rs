@@ -229,6 +229,15 @@ pub struct VerifiedPeerCert {
     pub ratchet_x25519_pk: [u8; 32],
     /// Monotonic rotation counter, for choosing between replicas.
     pub cert_version: u64,
+    /// When the certificate this row was built from stops vouching for the
+    /// key — already clipped to the delegation and document behind it.
+    ///
+    /// Travels WITH the row for the reason the same stamp travels with a
+    /// remembered device key: verification happens once, and everything after
+    /// it reads a cache. Without the stamp a conversation could only record
+    /// that a peer had been proven, never for how long, and a revoked device
+    /// kept its standing until the process ended (report17 V17-H1/H2).
+    pub valid_until_unix: u64,
 }
 
 /// Names the device at the far end of the live direct session to a peer
