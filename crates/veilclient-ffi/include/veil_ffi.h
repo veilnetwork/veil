@@ -469,6 +469,25 @@
 #define VEIL_ERR_RATCHET_BUFFER_TOO_SMALL -21
 #endif
 
+/**
+ * Returned when too many runtime threads from previous tunnels never came
+ * back, so starting another would strand more.
+ *
+ * Every tunnel teardown that cannot wake a blocking read abandons the thread
+ * parked in it — counted by
+ * [`veil_packet_tunnel_abandoned_workers`](crate::packet_tunnel::veil_packet_tunnel_abandoned_workers).
+ * The slot was freed regardless, so start/stop in a loop against a wedged
+ * reader parked one more thread per cycle with nothing to stop it: threads
+ * and their stacks grow until the process dies (report17 V17-M5).
+ *
+ * Refusing is the honest answer available here. Waking the reader would be
+ * better and is not possible from this tree — the blocking read lives in a
+ * crate it does not own — so the choice is between a tunnel that will not
+ * start and a process that will eventually be killed. The remedy belongs to
+ * the host: restart the process.
+ */
+#define VEIL_ERR_TUNNEL_WORKERS_STRANDED -23
+
 #if defined(VEIL_FFI_NODE_EMBEDDED)
 /**
  * Returned when the store is at [`VEIL_RATCHET_MAX_CONVERSATIONS`] and every

@@ -331,6 +331,20 @@ fn tunnel_args(proxy_url: &str, dns_ip: &str, mtu: u16, route_dns: bool) -> Resu
 /// "at least one" for a teardown that stranded several (report16 V16-M5).
 static ABANDONED_WORKERS: AtomicUsize = AtomicUsize::new(0);
 
+/// How many stranded threads this process tolerates before refusing to start
+/// another tunnel.
+///
+/// Generous against the honest case — a healthy teardown strands none, and a
+/// one-off strand costs a thread rather than a feature — and finite, which the
+/// old behaviour was not. At 32 the parked stacks are tens of megabytes: worth
+/// refusing over, and far below what it takes to be killed for.
+pub(crate) const MAX_STRANDED_WORKERS: usize = 32;
+
+/// The counter, as a number rather than a C int.
+fn abandoned_workers() -> usize {
+    ABANDONED_WORKERS.load(Ordering::Acquire)
+}
+
 /// How many runtime THREADS did not come back, since this process started.
 ///
 /// One per thread, not one per teardown: a thread that never returns never
@@ -358,6 +372,18 @@ where
     cleanup_finished(&mut slot);
     if slot.is_some() {
         return crate::VEIL_ERR_REENTRANT;
+    }
+    // A budget, because the slot is not one.
+    //
+    // The slot is freed the moment the tunnel thread returns, and it returns
+    // whether or not the runtime's blocking workers did. So a wedged reader
+    // costs one parked thread per start/stop cycle and nothing stops the next
+    // start: threads and their 2 MiB stacks accumulate until the process is
+    // killed (report17 V17-M5). Waking that reader is the real fix and is not
+    // available from here — the blocking read is in a crate this tree does not
+    // own — so what is left is to stop digging.
+    if abandoned_workers() >= MAX_STRANDED_WORKERS {
+        return crate::VEIL_ERR_TUNNEL_WORKERS_STRANDED;
     }
 
     let cancel = CancellationToken::new();
@@ -1225,6 +1251,63 @@ mod tests {
             takes >= 2,
             "only {takes} branches take a permit; TCP and UDP both must"
         );
+    }
+
+    /// report17 V17-M5: the budget the slot never was.
+    ///
+    /// A tunnel thread returns whether or not the runtime's blocking workers
+    /// did, and the slot frees with it — so a reader nothing can wake costs one
+    /// parked thread per start/stop cycle, forever. Waking it is not available
+    /// from this tree; refusing to add to the pile is.
+    ///
+    /// Driven through the counter rather than by actually stranding
+    /// thirty-two threads: stranding them is what the defect DOES, and a test
+    /// that reproduced it would leave this suite carrying the cost.
+    #[test]
+    fn a_process_that_has_stranded_too_many_workers_refuses_to_start_another() {
+        let _serial = SLOT_SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        let before = ABANDONED_WORKERS.load(Ordering::Acquire);
+        // A tunnel starts fine below the budget — the control, and it also
+        // proves the refusal is about the budget and not about the fixture.
+        let started = launch_tunnel(None, None, 1280, |runtime, cancel| {
+            runtime.block_on(async move { cancel.cancelled().await });
+            Ok(0)
+        });
+        assert_eq!(
+            started,
+            crate::VEIL_OK,
+            "a tunnel below the budget must start"
+        );
+        assert_eq!(veil_packet_tunnel_stop(), crate::VEIL_OK);
+
+        // Now the process looks like one that has stranded a pile.
+        ABANDONED_WORKERS.store(MAX_STRANDED_WORKERS, Ordering::Release);
+        let refused = launch_tunnel(None, None, 1280, |runtime, cancel| {
+            runtime.block_on(async move { cancel.cancelled().await });
+            Ok(0)
+        });
+        assert_eq!(
+            refused,
+            crate::VEIL_ERR_TUNNEL_WORKERS_STRANDED,
+            "the tunnel started again with {MAX_STRANDED_WORKERS} threads \
+             already parked: every cycle from here adds one more"
+        );
+        // And the refusal did not claim the slot — a refusal that left the
+        // slot taken would turn this into a permanent reentrancy error.
+        ABANDONED_WORKERS.store(before, Ordering::Release);
+        let after = launch_tunnel(None, None, 1280, |runtime, cancel| {
+            runtime.block_on(async move { cancel.cancelled().await });
+            Ok(0)
+        });
+        assert_eq!(
+            after,
+            crate::VEIL_OK,
+            "the refusal left the slot claimed, so nothing can start again"
+        );
+        assert_eq!(veil_packet_tunnel_stop(), crate::VEIL_OK);
     }
 
     /// report15 V15-M6: the slot frees, and what it cost was a thread.
