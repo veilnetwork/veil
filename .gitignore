@@ -65,3 +65,8 @@ flutter/veil_media/build/
 
 # A/B snapshot CSVs (scripts/ab-dht-fallback-snapshot.sh) — transient testnet data
 ab-data/
+
+# Local working notes — see the xVeil .gitignore for why.
+/TASKS.md
+/TASKS_ARCHIVE.md
+/the local release checklist
