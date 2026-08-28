@@ -3711,12 +3711,27 @@ async fn an_unguarded_child_task_outlives_its_scope() {
 #[test]
 fn the_identity_selfcheck_is_owned_by_its_task() {
     let src = include_str!("sovereign_republish.rs");
-    assert!(
-        src.contains("AbortOnDrop(tokio::spawn("),
-        "the self-check is spawned detached again"
-    );
-    assert!(
-        !src.contains("\n                    tokio::spawn(async move {"),
-        "a detached spawn came back into the republish task"
+
+    // Every task this file starts is owned by the one that started it.
+    //
+    // This half used to read `!src.contains("\n<20 spaces>tokio::spawn(...")`
+    // — a negative on one exact rendering, which is a guard that can only
+    // catch the line it was written against. Measured: the same detached
+    // spawn indented by twelve spaces instead of twenty passed it. Counted
+    // and anchored instead, so whitespace and wording are not what decides
+    // (report17 V17-L8).
+    let mut owned = 0;
+    for form in ["tokio::spawn(", "tokio::task::spawn("] {
+        for (at, _) in src.match_indices(form) {
+            assert!(
+                src[..at].ends_with("AbortOnDrop("),
+                "a detached {form} came back into the republish task at byte {at}"
+            );
+            owned += 1;
+        }
+    }
+    assert_eq!(
+        owned, 1,
+        "the self-check spawn is gone, or another one appeared beside it"
     );
 }
