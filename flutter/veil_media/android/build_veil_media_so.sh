@@ -59,7 +59,13 @@ cmd=cmd.replace(s,src); cmd=re.sub(r'-o\s+\S+','-o '+out,cmd)
 # introduced in 26, and libwebrtc is built at a lower min API (23) which makes
 # those calls -Werror,-Wunguarded-availability. veil's AAudio path is API 26+
 # by design (mirrors the old .so), so compile the veil TUs at 26.
-cmd=re.sub(r'(--target=aarch64-linux-android)\d+', r'\g<1>26', cmd)
+#
+# ANY android triple, not just arm64: this named `aarch64-linux-android` and so
+# raised the API for exactly one of the three ABIs. On armeabi-v7a and x86_64
+# the target stayed at 23 while `-D__ANDROID_API__` below moved to 26 — the
+# header says the symbol exists, the target says it does not, and the two
+# disagree about the same translation unit.
+cmd=re.sub(r'(--target=\w+-linux-android(?:eabi)?)\d+', r'\g<1>26', cmd)
 cmd=re.sub(r'-D__ANDROID_API__=\d+', '-D__ANDROID_API__=26', cmd)
 # Keep deprecation warnings non-fatal when the Android WebRTC checkout exposes
 # a legacy API that the macOS checkout still accepts.
@@ -108,9 +114,39 @@ print(cmd.split(' ',1)[0], tgt.group(0) if tgt else '', sr.group(1) if sr else '
 PY
 )
 EOF
+# The sysroot's library directories are PER ABI: `usr/lib/<triple>/<api>`. The
+# triple is the one clang was told to build for, so read it out of --target
+# rather than naming one — this line said `aarch64-linux-android` for every
+# ABI, and armeabi-v7a / x86_64 then linked against a directory belonging to
+# another architecture (or, when it does not exist, against nothing at all).
+#
+# `--target=x86_64-linux-android23` → triple `x86_64-linux-android`, api `23`.
+# The 32-bit ARM triple ends in `eabi` and clang spells the API level after it
+# (`armv7a-linux-androideabi23`), which the same strip handles.
+# Strip the TRAILING api digits only — every android arch name has digits in
+# it (`aarch64`, `x86_64`, `armv7a`), so cutting at the first one leaves
+# `aarch`, `x` and `armv`.
+TARGET_TRIPLE="$(printf '%s' "${TGT#--target=}" | sed -E 's/[0-9]+$//')"
+SYSROOT_LIBS="$SYSROOT/usr/lib/$TARGET_TRIPLE"
 # AAudio's libaaudio.so lives only in the API 26+ lib dir; add it to the search path.
-AAUDIO_L="$SYSROOT/usr/lib/aarch64-linux-android/26"
-echo "==> linking libveil_media.so ($TGT, sysroot + api26 aaudio)"
+AAUDIO_L="$SYSROOT_LIBS/26"
+echo "==> linking libveil_media.so ($TGT, sysroot=$SYSROOT, libs=$SYSROOT_LIBS)"
+# The C runtime objects the driver adds implicitly come from the same per-ABI
+# directory. When the toolchain does not carry this ABI the link fails deep in
+# lld with `cannot open crtbegin_so.o: No such file or directory` — which names
+# a file rather than the reason, and reads like a broken build instead of a
+# toolchain that was never fetched for this architecture. Say it here, where
+# the answer is one `ls` away, and list what the sysroot DOES carry.
+if ! ls "$SYSROOT_LIBS"/*/crtbegin_so.o >/dev/null 2>&1; then
+  echo "no C runtime for $TARGET_TRIPLE under $SYSROOT_LIBS —" >&2
+  echo "this toolchain does not carry the $ANDROID_TARGET ABI. It has:" >&2
+  find "$SYSROOT/usr/lib" -maxdepth 1 -mindepth 1 -exec basename {} \; 2>/dev/null | sed 's/^/  /' >&2
+  exit 1
+fi
+if [ ! -d "$AAUDIO_L" ]; then
+  echo "no API-26 lib dir at $AAUDIO_L — libaaudio.so will not resolve" >&2
+  exit 1
+fi
 # shellcheck disable=SC2086
 "$CLANGXX" -shared -o "$DEST/libveil_media.so" \
   $TGT --sysroot="$SYSROOT" -nostdlib++ -unwindlib=none \
