@@ -46,9 +46,13 @@
 
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdarg>
 #include <cstdint>
 #include <cstdlib>
+#include <deque>
+#include <functional>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
@@ -104,18 +108,93 @@ class ComPtr {
 // recorder, which owns its own capturer. Hold the platform up for the life of
 // the module instead: the cost is one idle MF instance, the alternative is a
 // shutdown under a live ReadSample on another thread.
-struct MfPlatform {
+//
+// ON A THREAD THIS FILE STARTS, always. A COM apartment is per-thread, and
+// `CoInitializeEx` on a thread we did not create changes it for everything
+// else that thread will ever do. This was a function-local static, so the
+// FIRST caller to touch a camera — an FFI call arriving from Dart, on whatever
+// thread the app happened to use — was moved to MTA and left there.
+//
+// WebRTC's Windows audio device module then asks for STA on that same thread,
+// and treats the mismatch as fatal rather than as an error to report:
+//
+//   Fatal error in ..\..\rtc_base\win\scoped_com_initializer.cc, line 43
+//   Check failed: ((HRESULT)0x80010106L) != hr_
+//   Invalid COM thread model change (MTA->STA)
+//
+// Measured on Windows 11 with 0.13.4: the answering side accepted a call and
+// the process died before a frame. Whoever ran first won the apartment — which
+// is why the caller survived and the answerer did not. The old code also threw
+// the `CoInitializeEx` result away (`com_ok_` was assigned and never read), so
+// the other direction — our MTA refused on an already-STA thread — was silent.
+//
+// MTA rather than STA: the reader is pumped from a capture thread of ours with
+// no message loop, and an STA apartment without one deadlocks the first
+// cross-apartment call MF makes internally.
+class MfPlatform {
+ public:
   MfPlatform() {
-    // MTA: the reader is pumped from our own capture thread, not a UI thread
-    // with a message loop, and an STA apartment without one deadlocks the
-    // first cross-apartment call MF makes internally.
-    com_ok_ = SUCCEEDED(CoInitializeEx(nullptr, COINIT_MULTITHREADED));
-    started_ = SUCCEEDED(MFStartup(MF_VERSION, MFSTARTUP_LITE));
-    if (!started_) vcam_log("MFStartup failed — no camera on this host");
+    std::unique_lock<std::mutex> lock(m_);
+    std::thread([this] { Serve(); }).detach();
+    ready_cv_.wait(lock, [this] { return ready_; });
   }
-  bool ok() const { return started_; }
-  bool com_ok_ = false;
-  bool started_ = false;
+
+  bool ok() const { return started_.load(); }
+
+  // Run `fn` on the MF thread and block until it has finished. Never call this
+  // FROM the MF thread — nothing here does, and it would deadlock.
+  void Run(std::function<void()> fn) {
+    std::mutex done_m;
+    std::condition_variable done_cv;
+    bool done = false;
+    {
+      std::lock_guard<std::mutex> lock(m_);
+      queue_.push_back([&] {
+        fn();
+        {
+          std::lock_guard<std::mutex> l(done_m);
+          done = true;
+        }
+        done_cv.notify_one();
+      });
+    }
+    task_cv_.notify_one();
+    std::unique_lock<std::mutex> l(done_m);
+    done_cv.wait(l, [&] { return done; });
+  }
+
+ private:
+  // Never returns: the platform is held up for the life of the module, so this
+  // thread is never joined and the object is never destroyed. That is the same
+  // lifetime the static had — only the apartment it touches has moved.
+  [[noreturn]] void Serve() {
+    const bool com_ok = SUCCEEDED(CoInitializeEx(nullptr, COINIT_MULTITHREADED));
+    if (!com_ok) vcam_log("CoInitializeEx(MTA) failed on the MF thread");
+    started_.store(com_ok && SUCCEEDED(MFStartup(MF_VERSION, MFSTARTUP_LITE)));
+    if (!started_.load()) vcam_log("MFStartup failed — no camera on this host");
+    {
+      std::lock_guard<std::mutex> lock(m_);
+      ready_ = true;
+    }
+    ready_cv_.notify_all();
+    for (;;) {
+      std::function<void()> task;
+      {
+        std::unique_lock<std::mutex> lock(m_);
+        task_cv_.wait(lock, [this] { return !queue_.empty(); });
+        task = std::move(queue_.front());
+        queue_.pop_front();
+      }
+      task();
+    }
+  }
+
+  std::mutex m_;
+  std::condition_variable ready_cv_;
+  std::condition_variable task_cv_;
+  std::deque<std::function<void()>> queue_;
+  bool ready_ = false;
+  std::atomic<bool> started_{false};
 };
 
 MfPlatform& mf() {
@@ -203,6 +282,14 @@ class MfCameraCapturer : public CameraCapturer {
   explicit MfCameraCapturer(CameraFrameCb cb) : cb_(std::move(cb)) {}
   ~MfCameraCapturer() override { Stop(); }
 
+  // The reader is CREATED, pumped and released on one thread — this object's
+  // own capture thread, whose apartment it initialises itself.
+  //
+  // It used to be created here, on the caller's thread, and only pumped on the
+  // capture thread. That is two faults in one: an MF object crossing an
+  // apartment boundary, and — because opening a source is what first touches
+  // [MfPlatform] — the caller's thread being moved to MTA behind its back. See
+  // the note above [MfPlatform] for what that cost.
   bool Start(int width, int height, int fps,
              const char* device_id) override {
     if (running_.load()) return true;
@@ -211,11 +298,71 @@ class MfCameraCapturer : public CameraCapturer {
     if (height <= 0) height = 288;
     if (fps <= 0) fps = 15;
     target_w_ = width;
+    min_interval_us_ = 1000000 / fps;
 
+    // Copied, not borrowed: the capture thread outlives this call, and
+    // `device_id` belongs to the caller.
     const char* dev = device_id;
     if (dev == nullptr || *dev == '\0') dev = std::getenv("VEIL_MEDIA_CAMERA");
+    const std::string device = dev != nullptr ? std::string(dev) : std::string();
+
+    // Opening happens on the capture thread, so `Start` has to wait for its
+    // verdict to keep answering the same question it always did: did the
+    // camera open? The thread touches these locals only before it signals,
+    // and this function does not return until then.
+    std::mutex m;
+    std::condition_variable cv;
+    bool settled = false;
+    bool opened = false;
+
+    running_.store(true);
+    thread_ = std::thread([this, device, width, height, &m, &cv, &settled,
+                           &opened] {
+      const bool com_ok =
+          SUCCEEDED(CoInitializeEx(nullptr, COINIT_MULTITHREADED));
+      if (!com_ok) vcam_log("CoInitializeEx(MTA) failed on the capture thread");
+      const bool ok = com_ok && OpenReader(device, width, height);
+      {
+        std::lock_guard<std::mutex> lock(m);
+        opened = ok;
+        settled = true;
+      }
+      cv.notify_one();
+      if (ok) CaptureLoop();
+      // Released inside the apartment that created it, before it goes away.
+      reader_.Reset();
+      if (com_ok) CoUninitialize();
+    });
+    {
+      std::unique_lock<std::mutex> lock(m);
+      cv.wait(lock, [&] { return settled; });
+    }
+    if (!opened) {
+      running_.store(false);
+      if (thread_.joinable()) thread_.join();
+      return false;
+    }
+    vcam_log("started MF camera: capture %dx%d (stride %d, fmt %d) -> target %d",
+             cap_w_, cap_h_, cap_stride_, static_cast<int>(fmt_), target_w_);
+    return true;
+  }
+
+  void Stop() override {
+    running_.store(false);
+    // The thread releases the reader itself. Doing it here would touch a COM
+    // object from a thread in another apartment — the very thing this class
+    // now exists to avoid.
+    if (thread_.joinable()) thread_.join();
+  }
+
+ private:
+  // Everything Media Foundation, on the capture thread. Returns false with
+  // nothing held.
+  bool OpenReader(const std::string& device, int width, int height) {
     ComPtr<IMFMediaSource> source;
-    *(&source) = activate_source(utf8_to_wide(dev));
+    // utf8_to_wide answers an empty string for both nullptr and "", and
+    // activate_source reads an empty symlink as "the first camera".
+    *(&source) = activate_source(utf8_to_wide(device.c_str()));
     if (!source) return false;
 
     // ENABLE_VIDEO_PROCESSING is what makes the NV12 request below succeed on
@@ -231,30 +378,13 @@ class MfCameraCapturer : public CameraCapturer {
       vcam_log("MFCreateSourceReaderFromMediaSource failed");
       return false;
     }
-
     if (!NegotiateFormat(width, height)) {
       reader_.Reset();
       return false;
     }
-
-    running_.store(true);
-    min_interval_us_ = 1000000 / fps;
-    thread_ = std::thread([this] { CaptureLoop(); });
-    vcam_log("started MF camera: capture %dx%d (stride %d, fmt %d) -> target %d",
-             cap_w_, cap_h_, cap_stride_, static_cast<int>(fmt_), target_w_);
     return true;
   }
 
-  void Stop() override {
-    if (!running_.exchange(false)) {
-      reader_.Reset();
-      return;
-    }
-    if (thread_.joinable()) thread_.join();
-    reader_.Reset();
-  }
-
- private:
   enum class Fmt { kUnknown, kNv12, kYuy2, kRgb32 };
 
   // Ask for NV12 at the requested size, then read back what we actually got.
@@ -327,9 +457,10 @@ class MfCameraCapturer : public CameraCapturer {
     return true;
   }
 
+  // Runs on the capture thread, inside the apartment [Start]'s thread body
+  // established — and which that body also tears down. Nothing here touches
+  // COM setup: one thread, one apartment, one owner.
   void CaptureLoop() {
-    // The reader is pumped from this thread only; it needs its own apartment.
-    const bool com_ok = SUCCEEDED(CoInitializeEx(nullptr, COINIT_MULTITHREADED));
     int64_t last_us = 0;
     while (running_.load()) {
       DWORD stream_index = 0, flags = 0;
@@ -360,7 +491,6 @@ class MfCameraCapturer : public CameraCapturer {
         Deliver(sample.Get());
       }
     }
-    if (com_ok) CoUninitialize();
   }
 
   void Deliver(IMFSample* sample) {
@@ -444,14 +574,8 @@ class MfCameraCapturer : public CameraCapturer {
   std::vector<uint8_t> sy_, su_, sv_;  // downscaled I420 (encoder input)
 };
 
-}  // namespace
-
-CameraCapturer* CreatePlatformCamera(CameraFrameCb cb) {
-  return new MfCameraCapturer(std::move(cb));
-}
-
-std::string ListPlatformCamerasJson() {
-  if (!mf().ok()) return "[]";
+// Runs on the MF thread only.
+std::string EnumerateCamerasJson() {
   ComPtr<IMFAttributes> attrs;
   if (FAILED(MFCreateAttributes(&attrs, 1))) return "[]";
   if (FAILED(attrs->SetGUID(MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE,
@@ -493,5 +617,25 @@ std::string ListPlatformCamerasJson() {
   out.push_back(']');
   return out;
 }
+
+
+}  // namespace
+
+CameraCapturer* CreatePlatformCamera(CameraFrameCb cb) {
+  return new MfCameraCapturer(std::move(cb));
+}
+
+// Enumeration is Media Foundation work, so it runs on the MF thread — the
+// only thread in this module whose apartment is ours. Called from an FFI
+// thread it would either fail with CO_E_NOTINITIALIZED or, as it used to,
+// silently move that thread to MTA and take the audio device module down
+// with it later.
+std::string ListPlatformCamerasJson() {
+  if (!mf().ok()) return "[]";
+  std::string result = "[]";
+  mf().Run([&result] { result = EnumerateCamerasJson(); });
+  return result;
+}
+
 
 }  // namespace veil_media
