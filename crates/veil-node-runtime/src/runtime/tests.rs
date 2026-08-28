@@ -3465,54 +3465,79 @@ async fn a_key_encrypted_at_rest_reports_as_configured() {
     let _ = fs::remove_dir_all(&dir);
 }
 
-/// A message must not fragment just to cross the introduce path.
+/// A fragment must fit BOTH cells that carry it, and waste neither.
 ///
 /// Two different cells carry an introduce: the sender -> rendezvous leg rides
 /// one `CELL_SIZE` ANONYMOUS cell, and the rendezvous -> receiver leg rides one
-/// fixed `CIRCUIT_PAYLOAD_BYTES` circuit-data cell. They were never tied
-/// together. The circuit cell was bumped 384 -> 4096 -> 16384 on 2026-07-02 for
-/// onion-stream throughput while the anonymous cell stayed at 512, which left a
-/// 3-hop fragment carrying 135 usable bytes into a 16 KiB cell — so every
-/// message over 135 B fragmented, each fragment paid a whole cell inbound, and
-/// three-or-more-fragment messages paid it three times (bulk redundancy).
-/// Measured on two live devices, 2026-08-07: 41 MB to deliver ten 7-byte chat
-/// messages out of a mailbox, about 3.7 MB apiece.
+/// circuit-data cell. They were never tied together, and this test used to
+/// guard only the first — which is how BOTH failures below happened.
 ///
-/// The 2026-08-07 bump to 8192 closes it. What this test holds is the PROPERTY,
-/// not the constant: the largest thing that rides this path is a signed
-/// AuthDeliver, and one fragment must carry a whole one. Raising
-/// `MAX_AUTH_DELIVER_MSG_BYTES` past the cell, or shrinking the cell, brings
-/// the fragmentation back — and fails here first.
+/// 2026-07-02, the cell too big for the fragment: the circuit cell was bumped
+/// 384 -> 4096 -> 16384 for onion-stream throughput while the anonymous cell
+/// stayed at 512, leaving a 3-hop fragment of 135 usable bytes inside a 16 KiB
+/// cell. Every message over 135 B fragmented, each fragment paid a whole cell
+/// inbound, and bulk messages paid it three times. Measured on two live
+/// devices 2026-08-07: 41 MB to deliver ten 7-byte chat messages, ~3.7 MB
+/// apiece. The 2026-08-07 anonymous-cell bump to 8192 closed it.
+///
+/// 2026-08-20, the fragment too big for the cell — the same drift, reversed.
+/// Circuits stopped sharing one global 16384 and now choose their own size
+/// (2048 today, 1024 the protocol minimum), while the introduce cap stayed at
+/// the 8192-cell's 8058. The sender happily sealed one 4368-byte fragment; the
+/// last relay could not wrap it into the receiver's cell and dropped it
+/// (`anonymity.relay_chain.introduce.circuit_oversize`). Measured live
+/// 2026-08-28 on all three production relays: a mailbox answer fetched 58
+/// times, never delivered, never acked — a contact request that vanished.
+///
+/// So the property is not "one fragment carries everything" — that was the
+/// assumption the second failure lived inside. It is: a fragment fits the
+/// SMALLEST cell any receiver may negotiate, and fills a useful share of it.
 #[test]
-fn one_fragment_carries_a_whole_auth_deliver() {
-    use veil_anonymity::circuit_data::CIRCUIT_PAYLOAD_BYTES;
+fn one_fragment_fits_the_smallest_cell_a_receiver_may_choose() {
+    use veil_anonymity::circuit_data::{LEN_PREFIX, MIN_CIRCUIT_CELL_BYTES};
+    use veil_anonymity::circuit_origin::choose_cell_bytes;
+    use veil_anonymity::rendezvous::{INTRODUCE_OVERHEAD, MAX_INTRODUCE_CIPHERTEXT};
 
     // The budget the sender packs into, from the real helper both send paths use.
-    assert_eq!(
-        super::introduce_plaintext_budget(3),
-        Some(7836),
-        "3-hop sealed introduce plaintext budget"
-    );
+    let budget = super::introduce_plaintext_budget(3).expect("3 hops fit a cell");
     let chunk = super::introduce_fragment_chunk_size(3).expect("3 hops fit a cell");
-    assert_eq!(chunk, 7815, "signed bytes carried by one 3-hop fragment");
 
-    // THE property: the largest message this path carries fits one fragment,
-    // so nothing that a client actually sends is cut up at all.
+    // THE property, stated as the wire states it: what the sender seals is
+    // `chunk + headers + INTRODUCE_OVERHEAD` of ciphertext, and the relay must
+    // be able to wrap that whole ciphertext into one receiver-side cell.
+    let sealed = budget + INTRODUCE_OVERHEAD;
     assert!(
-        chunk >= veil_proto::MAX_AUTH_DELIVER_MSG_BYTES,
-        "a full {} B AuthDeliver must ride ONE fragment; at {chunk} B per \
-         fragment it needs {}",
-        veil_proto::MAX_AUTH_DELIVER_MSG_BYTES,
-        veil_proto::MAX_AUTH_DELIVER_MSG_BYTES.div_ceil(chunk),
+        sealed <= MIN_CIRCUIT_CELL_BYTES - LEN_PREFIX,
+        "a sealed introduce of {sealed} B cannot be forwarded down a \
+         {MIN_CIRCUIT_CELL_BYTES} B circuit — the relay will drop it as oversize",
+    );
+    assert!(
+        sealed <= choose_cell_bytes().get() - LEN_PREFIX,
+        "a sealed introduce of {sealed} B does not fit the {} B cell circuits \
+         negotiate today",
+        choose_cell_bytes().get(),
+    );
+    assert!(
+        budget <= MAX_INTRODUCE_CIPHERTEXT,
+        "the per-hop budget must stay inside the wire cap it derives from",
     );
 
-    // And the cell that fragment arrives in is no longer mostly padding: one
-    // fragment now fills a useful share of it instead of 0.8%.
-    assert_eq!(CIRCUIT_PAYLOAD_BYTES, 16384, "circuit-data cell is fixed");
+    // And the cell that fragment arrives in is not mostly padding: the failure
+    // this test was WRITTEN for was a fragment filling 0.8% of its cell.
     assert!(
-        chunk * 3 >= CIRCUIT_PAYLOAD_BYTES,
-        "one fragment fills only 1/{} of the cell it rides",
-        CIRCUIT_PAYLOAD_BYTES / chunk.max(1),
+        chunk * 2 >= MIN_CIRCUIT_CELL_BYTES,
+        "one fragment fills only 1/{} of the smallest cell it may ride",
+        MIN_CIRCUIT_CELL_BYTES / chunk.max(1),
+    );
+
+    // A whole AuthDeliver no longer rides one fragment, and must not pretend
+    // to: name the real cost so a future bump is a decision, not a surprise.
+    let frags = veil_proto::MAX_AUTH_DELIVER_MSG_BYTES.div_ceil(chunk);
+    assert!(
+        (2..=16).contains(&frags),
+        "a full {} B AuthDeliver now takes {frags} fragments of {chunk} B — \
+         outside the range this path was tuned for",
+        veil_proto::MAX_AUTH_DELIVER_MSG_BYTES,
     );
 }
 

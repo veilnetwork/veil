@@ -1100,10 +1100,49 @@ pub mod final_hop_kind {
 /// the cell grew, the cap did not, and it silently became the binding limit:
 /// every message over ~135 B fragmented (see [`crate::cell::CELL_SIZE`]).
 /// Deriving it means the two can no longer drift apart.
-pub const MAX_INTRODUCE_CIPHERTEXT: usize = crate::cell::MAX_PAYLOAD_PER_CELL
-    - crate::circuit::PER_HOP_OVERHEAD
-    - 1
-    - IntroducePayload::FIXED_SIZE;
+///
+/// # An introduce has TWO legs, and both bind
+///
+/// The cell above is only the sender → rendezvous leg. The rendezvous then
+/// forwards the SAME `ciphertext` down the receiver's circuit, and there it
+/// must fit ONE circuit-data cell: `circuit_introduce_forward` calls
+/// [`crate::circuit_data::wrap_payload`], which refuses anything past
+/// `cell - LEN_PREFIX` and drops the introduce
+/// (`anonymity.relay_chain.introduce.circuit_oversize`).
+///
+/// Nothing tied the two numbers together, and on 2026-08-20 they crossed: cells
+/// stopped being one global 16384 and are now chosen per circuit at 2048
+/// ([`crate::circuit_origin::choose_cell_bytes`]), while this cap stayed at the
+/// 8192-byte anonymous cell's ~8058. Every introduce between ~2 KB and ~8 KB was
+/// then accepted by the sender, sealed, routed — and dropped by the last relay.
+///
+/// Measured live on 2026-08-28: a mailbox FETCH answer of `ct=4368 B` died that
+/// way on all three production relays, so a contact request deposited for an
+/// offline peer was fetched 58 times, never delivered and never acked, while an
+/// EMPTY 2-byte answer from a relay with nothing to send arrived every time.
+///
+/// So take the SMALLER of the two legs. The receiver's cell is its own choice
+/// and the sender never learns it, so the only safe number is the smallest one
+/// any circuit may negotiate ([`crate::circuit_data::MIN_CIRCUIT_CELL_BYTES`]).
+/// A message past the cap is not refused — it FRAGMENTS, which is what it did
+/// before the cell bumps; the cost is fragments, and the alternative is silence.
+pub const MAX_INTRODUCE_CIPHERTEXT: usize = {
+    // Leg 1 — sender → rendezvous: one anonymous cell, minus the onion layer,
+    // the final-hop kind tag and the introduce's fixed header.
+    let to_rendezvous: usize = crate::cell::MAX_PAYLOAD_PER_CELL
+        - crate::circuit::PER_HOP_OVERHEAD
+        - 1
+        - IntroducePayload::FIXED_SIZE;
+    // Leg 2 — rendezvous → receiver: the ciphertext alone, inside one
+    // circuit-data cell of the smallest size the wire permits.
+    let down_the_circuit: usize =
+        crate::circuit_data::MIN_CIRCUIT_CELL_BYTES - crate::circuit_data::LEN_PREFIX;
+    if to_rendezvous < down_the_circuit {
+        to_rendezvous
+    } else {
+        down_the_circuit
+    }
+};
 
 const INTRODUCE_DOMAIN: &[u8] = b"veil-introduce-v1\0";
 const INTRODUCE_NONCE_LEN: usize = 12;
@@ -2011,6 +2050,73 @@ impl RendezvousRegistry {
 
     pub fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+}
+
+#[cfg(test)]
+mod introduce_fits_both_legs {
+    //! The cap on a sealed introduce belongs to TWO cells, not one.
+    //!
+    //! The sender sizes it against the anonymous cell it rides to the
+    //! rendezvous. The rendezvous then puts the SAME bytes into one
+    //! circuit-data cell on the receiver's leg — a cell whose size the
+    //! receiver chose and the sender never learns. When those two numbers
+    //! crossed (2026-08-20: circuits went from one global 16384 to 2048 while
+    //! the cap stayed at the 8192-cell's 8058), every introduce in the gap was
+    //! sealed, routed, and dropped by the last relay with `circuit_oversize` —
+    //! measured live at `ct=4368 B` on all three production relays, which is
+    //! why a mailbox answer was fetched 58 times and never arrived.
+    //!
+    //! These are not assertions about a number. They call the very function
+    //! that did the dropping, with the largest introduce the wire permits and
+    //! the smallest cell it permits.
+    use crate::circuit_data::{CircuitCellBytes, MIN_CIRCUIT_CELL_BYTES, wrap_payload};
+    use crate::circuit_origin::choose_cell_bytes;
+    use crate::rendezvous::MAX_INTRODUCE_CIPHERTEXT;
+
+    /// The exact call `circuit_introduce_forward` makes before forwarding.
+    fn forwards(ciphertext_len: usize, cell: usize) -> bool {
+        let cell = CircuitCellBytes::new(cell).expect("cell size within protocol bounds");
+        wrap_payload(&vec![0u8; ciphertext_len], cell).is_ok()
+    }
+
+    #[test]
+    fn the_largest_introduce_fits_the_smallest_cell_a_receiver_may_choose() {
+        assert!(
+            forwards(MAX_INTRODUCE_CIPHERTEXT, MIN_CIRCUIT_CELL_BYTES),
+            "an introduce of {MAX_INTRODUCE_CIPHERTEXT} B is accepted by the sender but \
+             cannot be forwarded down a {MIN_CIRCUIT_CELL_BYTES} B circuit — it will be \
+             sealed, routed, and dropped at the last relay",
+        );
+    }
+
+    #[test]
+    fn and_the_cell_circuits_actually_choose_today() {
+        // Belt and braces: the minimum is what makes the cap SAFE, but a
+        // regression that moved `choose_cell_bytes` below the cap would be the
+        // same defect wearing the other constant's clothes.
+        let chosen = choose_cell_bytes().get();
+        assert!(
+            forwards(MAX_INTRODUCE_CIPHERTEXT, chosen),
+            "circuits negotiate {chosen} B, which cannot carry a {MAX_INTRODUCE_CIPHERTEXT} B \
+             introduce",
+        );
+    }
+
+    #[test]
+    fn control_one_byte_more_than_the_cap_is_exactly_what_gets_dropped() {
+        // Vacuity guard. Both assertions above would also pass if
+        // `wrap_payload` accepted everything — then they would prove nothing
+        // and this defect could return unseen. It refuses at the boundary.
+        assert!(
+            !forwards(MIN_CIRCUIT_CELL_BYTES, MIN_CIRCUIT_CELL_BYTES),
+            "a payload the size of the whole cell leaves no room for the length prefix",
+        );
+        assert!(
+            !forwards(MIN_CIRCUIT_CELL_BYTES - 1, MIN_CIRCUIT_CELL_BYTES),
+            "one byte short of the cell still needs a 2-byte prefix — wrap_payload accepts \
+             more than the cell holds, so the guards above prove nothing",
+        );
     }
 }
 
