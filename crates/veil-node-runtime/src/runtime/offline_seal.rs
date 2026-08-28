@@ -733,6 +733,106 @@ fn now_unix() -> u64 {
 mod tests {
     use super::*;
 
+    /// Does the sealing module's status line agree with the calls made here?
+    ///
+    /// A pure function so both directions can be exercised on inputs that are
+    /// not this tree: a status the code has outgrown is only half of it, and
+    /// the half that never gets tested is the one that says WIRED after the
+    /// wiring is gone.
+    fn wiring_and_status_disagree(production: &str, status: &str) -> Option<String> {
+        let wired = production.contains("mailbox_seal")
+            && production.contains("seal_mailbox_blob")
+            && production.contains("open_mailbox_blob");
+        let claims_wired = status.contains("WIRED");
+        let claims_dormant = status.contains("DORMANT");
+
+        if claims_wired == claims_dormant {
+            return Some(format!("status is neither WIRED nor DORMANT: {status:?}"));
+        }
+        if wired != claims_wired {
+            return Some(format!(
+                "status says {status:?} while the caller {} it",
+                if wired {
+                    "seals and opens with"
+                } else {
+                    "no longer calls"
+                }
+            ));
+        }
+        None
+    }
+
+    /// The sealing module's status line has to match what this file does.
+    ///
+    /// It said "Status: DORMANT — not yet wired into any runtime or FFI path"
+    /// while the calls above sealed and opened every mailbox blob the node
+    /// handles, and had said so since the wiring landed. A header that tells a
+    /// maintainer nothing depends on a module is the sentence that authorises
+    /// changing its contract or deleting it outright (report17).
+    #[test]
+    fn the_sealing_module_says_whether_it_is_wired_and_is_right() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let ours =
+            std::fs::read_to_string(root.join("src/runtime/offline_seal.rs")).expect("this file");
+        let theirs = std::fs::read_to_string(root.join("../veil-identity/src/mailbox_seal.rs"))
+            .expect("the sealing module");
+
+        // Everything above the first module-level `#[cfg(test)]`. An indented
+        // one sits on a test-only field far above the calls, so splitting on
+        // the attribute alone would cut the production half off at it — and a
+        // guard that reads the tests instead of the code proves nothing.
+        let production = ours
+            .split("\n#[cfg(test)]\nmod ")
+            .next()
+            .expect("a production half");
+        assert!(
+            production.contains("MailboxCryptoSink"),
+            "the production half stopped where it should not have"
+        );
+
+        let status = theirs
+            .lines()
+            .find(|l| l.contains("## Status:"))
+            .expect("mailbox_seal states a status");
+
+        assert_eq!(wiring_and_status_disagree(production, status), None);
+    }
+
+    /// And the comparison itself answers in both directions.
+    ///
+    /// Without this the guard above could only ever have caught the drift that
+    /// already happened; the case where the calls go away and the header keeps
+    /// saying WIRED would never have been run.
+    #[test]
+    fn a_status_that_outlived_the_wiring_is_caught_either_way() {
+        let calls = "use veil_identity::mailbox_seal;\n seal_mailbox_blob(); open_mailbox_blob();";
+        let none = "nothing here";
+
+        assert_eq!(
+            wiring_and_status_disagree(calls, "//! ## Status: WIRED"),
+            None
+        );
+        assert_eq!(
+            wiring_and_status_disagree(none, "//! ## Status: DORMANT"),
+            None
+        );
+
+        assert!(
+            wiring_and_status_disagree(calls, "//! ## Status: DORMANT")
+                .is_some_and(|w| w.contains("seals and opens")),
+            "a module called by the caller must not read as dormant"
+        );
+        assert!(
+            wiring_and_status_disagree(none, "//! ## Status: WIRED")
+                .is_some_and(|w| w.contains("no longer calls")),
+            "a status that outlived the wiring must not read as current"
+        );
+        assert!(
+            wiring_and_status_disagree(calls, "//! ## Status: under review").is_some(),
+            "a status that says neither is not an answer"
+        );
+    }
+
     /// The two failures a seal can have when it has no certificate, told apart.
     ///
     /// A recipient that has run its certificates past their signed window is
