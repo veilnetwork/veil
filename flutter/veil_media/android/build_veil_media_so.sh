@@ -137,11 +137,45 @@ echo "==> linking libveil_media.so ($TGT, sysroot=$SYSROOT, libs=$SYSROOT_LIBS)"
 # a file rather than the reason, and reads like a broken build instead of a
 # toolchain that was never fetched for this architecture. Say it here, where
 # the answer is one `ls` away, and list what the sysroot DOES carry.
+#
+# And it is not always OUR mistake to fix here. Chromium's bundled
+# `third_party/android_toolchain` is pruned to the ABIs Chromium itself LINKS:
+# measured 2026-08-28, its sysroot carries `aarch64-linux-android` and nothing
+# else. WebRTC still COMPILES fine for armeabi-v7a and x86_64 — it only ever
+# produces a static archive for them, so it never needs a C runtime — and the
+# gap shows up here, at the one step that actually links.
+#
+# So when the compiler's own sysroot cannot serve this ABI, link against a real
+# NDK instead. Compilation is untouched (it keeps Chromium's clang, headers and
+# flags — that is what makes the objects match libwebrtc.a); only the link-time
+# sysroot moves, and bionic's ABI at a given API level is the same in both.
+# VEIL_ANDROID_LINK_SYSROOT names it explicitly; otherwise the standard NDK
+# environment a CI image already exports is used.
+LINK_SYSROOT="$SYSROOT"
 if ! ls "$SYSROOT_LIBS"/*/crtbegin_so.o >/dev/null 2>&1; then
-  echo "no C runtime for $TARGET_TRIPLE under $SYSROOT_LIBS —" >&2
-  echo "this toolchain does not carry the $ANDROID_TARGET ABI. It has:" >&2
-  find "$SYSROOT/usr/lib" -maxdepth 1 -mindepth 1 -exec basename {} \; 2>/dev/null | sed 's/^/  /' >&2
-  exit 1
+  echo "no C runtime for $TARGET_TRIPLE under $SYSROOT_LIBS" >&2
+  echo "  (this toolchain carries: $(find "$SYSROOT/usr/lib" -maxdepth 1 -mindepth 1 -exec basename {} \; 2>/dev/null | tr '\n' ' '))" >&2
+  for candidate in \
+    "${VEIL_ANDROID_LINK_SYSROOT:-}" \
+    "${ANDROID_NDK_LATEST_HOME:-}/toolchains/llvm/prebuilt/linux-x86_64/sysroot" \
+    "${ANDROID_NDK_HOME:-}/toolchains/llvm/prebuilt/linux-x86_64/sysroot" \
+    "${ANDROID_NDK_ROOT:-}/toolchains/llvm/prebuilt/linux-x86_64/sysroot"
+  do
+    [ -n "$candidate" ] || continue
+    if ls "$candidate/usr/lib/$TARGET_TRIPLE"/*/crtbegin_so.o >/dev/null 2>&1; then
+      LINK_SYSROOT="$candidate"
+      break
+    fi
+  done
+  if [ "$LINK_SYSROOT" = "$SYSROOT" ]; then
+    echo "and no NDK carrying $TARGET_TRIPLE was found either. Point" >&2
+    echo "VEIL_ANDROID_LINK_SYSROOT at an NDK sysroot that has" >&2
+    echo "  usr/lib/$TARGET_TRIPLE/<api>/crtbegin_so.o" >&2
+    exit 1
+  fi
+  SYSROOT_LIBS="$LINK_SYSROOT/usr/lib/$TARGET_TRIPLE"
+  AAUDIO_L="$SYSROOT_LIBS/26"
+  echo "==> linking against the NDK sysroot instead: $LINK_SYSROOT" >&2
 fi
 if [ ! -d "$AAUDIO_L" ]; then
   echo "no API-26 lib dir at $AAUDIO_L — libaaudio.so will not resolve" >&2
@@ -149,7 +183,7 @@ if [ ! -d "$AAUDIO_L" ]; then
 fi
 # shellcheck disable=SC2086
 "$CLANGXX" -shared -o "$DEST/libveil_media.so" \
-  $TGT --sysroot="$SYSROOT" -nostdlib++ -unwindlib=none \
+  $TGT --sysroot="$LINK_SYSROOT" -nostdlib++ -unwindlib=none \
   "$TMP/engine.o" "$TMP/shim.o" "$TMP/aaudio_adm.o" "$TMP/record.o" "$TMP/play.o" "$TMP/vnote.o" obj/libwebrtc.a $CXX_OBJS $UNWIND_OBJS \
   -L"$AAUDIO_L" \
   -Wl,--gc-sections -Wl,--version-script,"$TMP/exports.map" \
