@@ -1067,17 +1067,11 @@ pub(crate) async fn recursive_dht_get(
     // point (keeps the future `Send` regardless of its captures).
     drop(is_valid);
 
-    let mut peers: Vec<[u8; 32]> = rlock!(session_tx_registry).peer_ids();
+    let peers: Vec<[u8; 32]> = rlock!(session_tx_registry).peer_ids();
     if peers.is_empty() {
         return None;
     }
-    peers.sort_by_key(|pid| {
-        let mut xor = [0u8; 32];
-        for i in 0..32 {
-            xor[i] = pid[i] ^ key[i];
-        }
-        xor
-    });
+    let peers = dht_candidate_peers(peers, &dht_opted_out(dht), key);
 
     let query_id: [u8; 16] = {
         let mut id = [0u8; 16];
@@ -1161,6 +1155,58 @@ pub(crate) async fn recursive_dht_get(
 ///
 /// Each peer gets a distinct query id. A shared query id would complete on the
 /// first response and reproduce the original first-replica-wins bug.
+/// Which session peers may carry a recursive DHT query, closest to `key` first.
+///
+/// A peer that asked not to be given DHT work CANNOT answer one, and picking it
+/// spends a slot of a budget of only K. `Contact::dht_service` says in as many
+/// words that it gates "store target, walk hop, FIND_NODE referral" — a
+/// recursive GET is all three at once — and neither selection consulted it.
+///
+/// Ordering made it worse rather than diluting it: peers are sorted by XOR
+/// distance to the key, so an opted-out neighbour that happens to sit close to
+/// it is picked FIRST. A phone opts out by default, and behind one NAT it is
+/// exactly such a neighbour of its owner's desktop. Measured on the production
+/// network: a contact request could not be sealed because the recipient's
+/// instance registry "did not resolve", while the record sat on all three seeds
+/// the whole time — so the request was never deposited and never arrived.
+///
+/// Filtered, not merely deprioritised: a node whose every session peer has
+/// opted out still asks them rather than asking nobody — a query that cannot be
+/// answered beats a query that is never sent.
+fn dht_candidate_peers(
+    peers: Vec<[u8; 32]>,
+    opted_out: &std::collections::HashSet<[u8; 32]>,
+    key: [u8; 32],
+) -> Vec<[u8; 32]> {
+    let mut peers = if opted_out.is_empty() {
+        peers
+    } else {
+        let serving: Vec<[u8; 32]> = peers
+            .iter()
+            .copied()
+            .filter(|p| !opted_out.contains(p))
+            .collect();
+        if serving.is_empty() { peers } else { serving }
+    };
+    peers.sort_by_key(|pid| {
+        let mut xor = [0u8; 32];
+        for i in 0..32 {
+            xor[i] = pid[i] ^ key[i];
+        }
+        xor
+    });
+    peers
+}
+
+/// The peers of `dht`'s routing table that have opted out of DHT work.
+fn dht_opted_out(dht: &Arc<KademliaService>) -> std::collections::HashSet<[u8; 32]> {
+    dht.routing_table_contacts()
+        .into_iter()
+        .filter(|c| !c.dht_service())
+        .map(|c| c.node_id)
+        .collect()
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn recursive_dht_get_candidates<F>(
     dht: &Arc<KademliaService>,
@@ -1182,14 +1228,8 @@ where
         out.push(value);
     }
 
-    let mut peers: Vec<[u8; 32]> = rlock!(session_tx_registry).peer_ids();
-    peers.sort_by_key(|pid| {
-        let mut xor = [0u8; 32];
-        for i in 0..32 {
-            xor[i] = pid[i] ^ key[i];
-        }
-        xor
-    });
+    let peers: Vec<[u8; 32]> = rlock!(session_tx_registry).peer_ids();
+    let mut peers = dht_candidate_peers(peers, &dht_opted_out(dht), key);
     peers.truncate(max_peers.clamp(1, veil_proto::budget::DHT_REPLICATION_K));
     if peers.is_empty() {
         return out;
@@ -1585,6 +1625,68 @@ fn registry_freshness(r: &InstanceRegistry) -> (u64, u64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A peer that opted out of DHT work must not be asked to carry a query.
+    ///
+    /// The selection sorted session peers by XOR distance to the key and took
+    /// the closest K, without ever consulting `Contact::dht_service` — whose
+    /// own documentation says it gates exactly this. So an opted-out peer that
+    /// happened to sit close to the key was picked FIRST, and the query went
+    /// to a node that cannot answer while the seeds holding the record were
+    /// never asked.
+    ///
+    /// Not hypothetical: on the production network a contact request could not
+    /// be sealed because the recipient's instance registry "did not resolve",
+    /// while that record sat on all three seeds. A phone opts out by default,
+    /// and behind one NAT it is the desktop's nearest session peer.
+    #[test]
+    fn an_opted_out_peer_is_not_asked_to_carry_a_query() {
+        // `near` is one bit from the key; `far` is its complement. Sorting
+        // alone would always choose `near` first.
+        let key = [0x55u8; 32];
+        let mut near = key;
+        near[31] ^= 0x01;
+        let far = [0xAAu8; 32];
+
+        let opted_out: std::collections::HashSet<[u8; 32]> = [near].into_iter().collect();
+        let picked = dht_candidate_peers(vec![near, far], &opted_out, key);
+
+        assert_eq!(
+            picked,
+            vec![far],
+            "the closest peer had opted out of DHT work and was asked anyway"
+        );
+    }
+
+    /// And distance still decides among the peers that DO serve.
+    #[test]
+    fn among_serving_peers_the_closest_is_still_first() {
+        let key = [0x55u8; 32];
+        let mut near = key;
+        near[31] ^= 0x01;
+        let far = [0xAAu8; 32];
+
+        let picked = dht_candidate_peers(vec![far, near], &Default::default(), key);
+
+        assert_eq!(picked, vec![near, far], "the ordering by distance was lost");
+    }
+
+    /// A node whose every peer opted out asks them rather than asking nobody.
+    ///
+    /// The filter must not be able to empty the list: a query that cannot be
+    /// answered is still better than one that is never sent, and this is the
+    /// state a lone phone talking only to another phone is in.
+    #[test]
+    fn a_node_with_only_opted_out_peers_still_asks_them() {
+        let key = [0x55u8; 32];
+        let a = [0x11u8; 32];
+        let b = [0x22u8; 32];
+        let opted_out: std::collections::HashSet<[u8; 32]> = [a, b].into_iter().collect();
+
+        let picked = dht_candidate_peers(vec![a, b], &opted_out, key);
+
+        assert_eq!(picked.len(), 2, "the filter emptied the candidate list");
+    }
 
     /// Both registries below are correctly signed by a key that is still in
     /// the document — that is the whole difficulty. Nothing about the old one
