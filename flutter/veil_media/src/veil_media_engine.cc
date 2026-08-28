@@ -61,11 +61,7 @@
 #include "api/audio/audio_device.h"
 #include "api/audio/builtin_audio_processing_builder.h"
 #include "api/audio/create_audio_device_module.h"
-#if defined(_WIN32)
-// The Core Audio ADM factory. Its header carries the apartment contract
-// this file follows; see create_audio_device below.
-#include "modules/audio_device/include/audio_device_factory.h"
-#endif
+
 #include "api/audio_codecs/audio_format.h"
 #include "api/audio_codecs/builtin_audio_decoder_factory.h"
 #include "api/audio_codecs/builtin_audio_encoder_factory.h"
@@ -1094,47 +1090,54 @@ struct VeilGroupMediaEngine {
 #if defined(VEIL_MEDIA_HAVE_WEBRTC)
 
 #if defined(_WIN32)
-// The Windows audio device module is built on a thread whose apartment is OURS.
+// The Windows audio device module is built on a thread THIS FILE created.
 //
-// There are two Windows ADMs in WebRTC and they want opposite apartments:
+// `kPlatformDefaultAudio` gives `AudioDeviceWindowsCore`, whose FIRST member is
+// `ScopedCOMInitializer _comInit` — default-constructed, i.e. STA. On a thread
+// already in the MTA that request returns RPC_E_CHANGED_MODE, and
+// ScopedCOMInitializer turns that into an `RTC_CHECK`: it KILLS THE PROCESS.
 //
-//   * `kPlatformDefaultAudio` gives `AudioDeviceWindowsCore`, whose FIRST
-//     member is `ScopedCOMInitializer _comInit` — default-constructed, i.e.
-//     STA. On a thread already in the MTA that request returns
-//     RPC_E_CHANGED_MODE, and ScopedCOMInitializer turns that into an
-//     `RTC_CHECK`: it KILLS THE PROCESS.
-//
-//         Fatal error in ..\..\rtc_base\win\scoped_com_initializer.cc, line 43
-//         Check failed: ((HRESULT)0x80010106L) != hr_
-//         Invalid COM thread model change (MTA->STA)
-//
-//   * `CreateWindowsCoreAudioAudioDeviceModule` is the Core Audio ADM, and its
-//     own header documents the opposite: "Tell COM that this thread shall live
-//     in the MTA", and "the creating thread must be a COM thread; otherwise
-//     nullptr will be returned". It reports failure instead of aborting.
+//   Fatal error in ..\..\rtc_base\win\scoped_com_initializer.cc, line 43
+//   Check failed: ((HRESULT)0x80010106L) != hr_
+//   Invalid COM thread model change (MTA->STA)
 //
 // Measured on Windows 11: answering a call killed the app on 0.13.4 and again
-// on 0.13.7 — the second time with the camera backend already fixed and the
-// engine DLL confirmed by sha256, which is what ruled the camera out. Asking
-// the calling thread what apartment it is in and hoping was not enough either:
-// a thread that has touched COM without initialising it is placed in the
-// process's IMPLICIT MTA, and the answer depends on when you ask.
+// on 0.13.7 — the second time with this library's camera backend already fixed
+// and the shipped DLL confirmed by sha256, which is what ruled the camera out.
 //
-// So stop asking. This thread is created here and put in the MTA here, which
-// is the apartment the Core Audio ADM asks for, and MTA objects have no thread
-// affinity — the ADM is then usable from any thread with no marshalling and no
-// message pump. It is never joined: the ADM relies on the creating thread's COM
-// initialisation staying alive, exactly as the header's example keeps its
-// `com_initializer_` as a member.
-class ComMtaThread {
+// The process HAS an MTA and cannot not have one: Media Foundation needs it,
+// and a thread that touches COM without initialising it is placed in that
+// MTA implicitly. So asking the calling thread what apartment it is in and
+// hoping cannot work — the answer depends on when you ask, and the ADM's own
+// ScopedCOMInitializer asks after we do.
+//
+// A thread nobody has touched yet belongs to NO apartment. Create the ADM
+// there and `_comInit` establishes the STA it wants, on its first try, with
+// nothing to collide with. This file deliberately does NOT initialise COM on
+// this thread: the apartment is the ADM's to choose, and choosing it here is
+// how the two disagree again.
+//
+// The thread is never joined, because `_comInit` lives as long as the ADM and
+// its CoUninitialize belongs to the thread that initialised. Later ADM calls
+// still happen on whatever thread the engine is driven from, exactly as
+// before: the MMDevice and WASAPI objects it holds are registered
+// ThreadingModel="Both", which is what makes WebRTC's own design work.
+//
+// WebRTC's other Windows ADM — `CreateWindowsCoreAudioAudioDeviceModule`,
+// whose header asks for the MTA and returns nullptr instead of aborting —
+// would have suited this process better. It is not in the prebuilt library:
+// checked with llvm-nm against webrtc-win-x64.lib, which defines
+// `CreateAudioDeviceModule` and `AudioDeviceWindowsCore::CoreAudioIsSupported`
+// but not that factory, and carries the string "Use the
+// CreateWindowsCoreAudioAudioDeviceModule() factory method instead" only as
+// the message that rejects the option.
+class AdmHostThread {
  public:
-  ComMtaThread() {
+  AdmHostThread() {
     std::unique_lock<std::mutex> lock(m_);
     std::thread([this] { Serve(); }).detach();
     ready_cv_.wait(lock, [this] { return ready_; });
   }
-
-  bool ok() const { return com_ok_.load(); }
 
   void Run(std::function<void()> fn) {
     std::mutex done_m;
@@ -1158,10 +1161,6 @@ class ComMtaThread {
 
  private:
   [[noreturn]] void Serve() {
-    // A thread nobody has touched yet belongs to no apartment, so this cannot
-    // collide with a mode somebody else chose — the failure that this whole
-    // class exists to make impossible.
-    com_ok_.store(SUCCEEDED(CoInitializeEx(nullptr, COINIT_MULTITHREADED)));
     {
       std::lock_guard<std::mutex> lock(m_);
       ready_ = true;
@@ -1184,11 +1183,10 @@ class ComMtaThread {
   std::condition_variable task_cv_;
   std::deque<std::function<void()>> queue_;
   bool ready_ = false;
-  std::atomic<bool> com_ok_{false};
 };
 
-ComMtaThread& com_mta_thread() {
-  static ComMtaThread instance;
+AdmHostThread& adm_host_thread() {
+  static AdmHostThread instance;
   return instance;
 }
 #endif  // _WIN32
@@ -1196,16 +1194,12 @@ ComMtaThread& com_mta_thread() {
 webrtc::scoped_refptr<webrtc::AudioDeviceModule> create_audio_device(
     const webrtc::Environment& env) {
 #if defined(_WIN32)
-  if (!com_mta_thread().ok()) {
-    vlog("adm: no MTA thread for the audio device module — the call continues "
-         "without audio rather than taking the process down");
-    return nullptr;
-  }
   webrtc::scoped_refptr<webrtc::AudioDeviceModule> adm;
-  com_mta_thread().Run([&env, &adm] {
-    adm = webrtc::CreateWindowsCoreAudioAudioDeviceModule(env);
+  adm_host_thread().Run([&env, &adm] {
+    adm = webrtc::CreateAudioDeviceModule(
+        env, webrtc::AudioDeviceModule::kPlatformDefaultAudio);
   });
-  vlog("adm: windows core audio module created on the engine's MTA thread: %s",
+  vlog("adm: windows module created on the engine's own thread: %s",
        adm ? "ok" : "NULL (no audio in this call)");
   return adm;
 #elif defined(__APPLE__)
