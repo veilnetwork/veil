@@ -133,6 +133,15 @@ jobs:
         # vector). See scripts/check-cyrillic-runtime-strings.sh.
         run: ./scripts/check-cyrillic-runtime-strings.sh
 
+      - name: COM apartment ownership (windows media backend)
+        # CoInitializeEx configures THE CALLING THREAD, permanently. Doing it
+        # on a thread we were handed reaches out of this library: the camera
+        # backend used to move the first FFI caller to MTA and leave it there,
+        # and WebRTC's Windows audio device module then asked for STA on that
+        # same thread and killed the process on the mismatch. Measured on
+        # Windows 11 with 0.13.4, on answering a call.
+        run: ./scripts/check-com-apartment-ownership.sh
+
       - name: Native media diagnostics are explicit opt-in
         run: |
           c++ -std=c++17 -Wall -Wextra -Werror \

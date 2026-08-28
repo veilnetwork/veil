@@ -39,6 +39,16 @@
 #include <TargetConditionals.h>
 #endif
 
+#if defined(_WIN32)
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+// WIN32_LEAN_AND_MEAN drops the OLE half of windows.h, and CoGetApartmentType
+// lives there. Only the apartment query below needs it.
+#include <objbase.h>
+#endif
+
 #if defined(__ANDROID__)
 #include <jni.h>
 #include <android/native_window.h>
@@ -1075,8 +1085,48 @@ struct VeilGroupMediaEngine {
 };
 
 #if defined(VEIL_MEDIA_HAVE_WEBRTC)
+
+#if defined(_WIN32)
+// True when this thread is already in a COM apartment the Windows audio device
+// module cannot live in.
+//
+// WebRTC's ADM constructs a `ScopedCOMInitializer` asking for STA, and an STA
+// request on an MTA thread returns RPC_E_CHANGED_MODE — which that class turns
+// into `RTC_CHECK`, i.e. it KILLS THE PROCESS:
+//
+//   Fatal error in ..\..\rtc_base\win\scoped_com_initializer.cc, line 43
+//   Check failed: ((HRESULT)0x80010106L) != hr_
+//   Invalid COM thread model change (MTA->STA)
+//
+// Measured on Windows 11 with 0.13.4: the answering side accepted a call and
+// the app vanished. The MTA came from this library's own camera backend, which
+// used to initialise COM on whatever thread first touched it; that is fixed at
+// the source in veil_mf_camera.cc. This check is the second line: whatever
+// else may have claimed the caller's apartment — another plugin, a host we do
+// not control, a future one of ours — a call should lose its microphone and
+// say so, not take the process down.
+bool com_apartment_forbids_adm() {
+  APTTYPE type = APTTYPE_CURRENT;
+  APTTYPEQUALIFIER qualifier = APTTYPEQUALIFIER_NONE;
+  const HRESULT hr = CoGetApartmentType(&type, &qualifier);
+  // CO_E_NOTINITIALIZED: no apartment yet, so the ADM's own STA request is the
+  // one that establishes it. That is the healthy case, not a refusal.
+  if (FAILED(hr)) return false;
+  return type == APTTYPE_MTA;
+}
+#endif  // _WIN32
+
 webrtc::scoped_refptr<webrtc::AudioDeviceModule> create_audio_device(
     const webrtc::Environment& env) {
+#if defined(_WIN32)
+  if (com_apartment_forbids_adm()) {
+    vlog("adm: REFUSING to create the Windows ADM — this thread is already in "
+         "the MTA apartment and WebRTC's ADM asks for STA, which is a fatal "
+         "check inside WebRTC. The call continues without audio. Whatever put "
+         "this thread in MTA did so behind the caller's back.");
+    return nullptr;
+  }
+#endif
 #if defined(__APPLE__)
 #if TARGET_OS_IPHONE
   // The custom ADM also owns AVAudioSession/VoiceChat posture on iOS.
