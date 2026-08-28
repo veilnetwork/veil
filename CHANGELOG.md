@@ -1,5 +1,48 @@
 # Changelog
 
+## v0.8.2 — 2026-08-28
+
+The audit pass behind this release closed the low and medium findings of
+report17 in this repository, and then went back and proved each fix is held
+by a test that fails when the fix is removed.
+
+**A refused send no longer costs a whole discovery round.** A PEX walk gave
+up its entire round on the first peer that would not take the frame; it now
+tries the next candidate, up to three attempts, so one unreachable neighbour
+stops costing every neighbour behind it. The identity self-check spawned
+alongside the republish task is owned by it as well, and dies with it instead
+of outliving the runtime that started it.
+
+**A relearned handshake nonce goes to the row it was learned from.** The
+anti-replay write followed the peer's current row, so a peer that reconnected
+at a new address had the nonce written against the wrong record. The row is
+compared with the one that was dialled before anything is written or
+persisted; a stale row skips the write without refusing the session.
+
+**Diagnostic probes are bounded, numbered and stop when asked.** Ping and
+trace took their count, interval, timeout and hop budget from the caller with
+no ceiling, numbered their replies from a global counter that could collide
+between concurrent operations, and kept running after the requester was gone.
+Every parameter is clamped, sequence numbers come from a per-operation
+allocator, and each loop stops as soon as its channel is closed. Latency
+statistics are accumulated as running min/max/sum rather than a growing
+vector.
+
+**The ephemeral rendezvous signing key stops being printable.** It was a
+`String` behind a derived `Debug`, so anything that formatted the
+advertisement carried the private key into the log; it is now wrapped so it
+is wiped on drop, and its `Debug` shows a redacted field.
+
+**A put at the cold tier's cap cannot evict what it just wrote**, and the
+overwrite of a key already on disk evicts nobody — the second half had no
+test, and this release adds one that reads the bytes back through the
+allocation rather than trusting the length.
+
+**Documentation that had outgrown the code.** `mailbox_seal` announced itself
+as wired into nothing while the node sealed and opened every mailbox blob
+through it; the header now says so and a guard fails if the two disagree in
+either direction.
+
 ## v0.8.1 — 2026-08-26
 
 A patch release whose whole point is that the version now tells you which build
