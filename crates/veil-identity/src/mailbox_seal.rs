@@ -9,19 +9,31 @@
 //! into one blob the sender drops at a mailbox relay. The recipient fetches,
 //! opens, verifies, and delivers it on reconnect.
 //!
-//! ## Status: DORMANT
-//! Not yet wired into any runtime or FFI path. It composes only already-reviewed
-//! primitives — [`SovereignIdentity::sign_auth_deliver`](crate::sovereign::SovereignIdentity::sign_auth_deliver),
-//! [`fanout_encrypt`]/[`fanout_decrypt_one`], [`verify_auth_deliver`] — plus the
-//! fan-out blob codec. It is landed ahead of the runtime/FFI wiring so the
-//! composition can be reviewed on its own.
+//! ## Status: WIRED
+//! `veil-node-runtime`'s `runtime::offline_seal` calls [`seal_mailbox_blob`]
+//! and [`open_mailbox_blob`] from `RuntimeMailboxCrypto`, which the node
+//! installs on the IPC server as its `MailboxCryptoSink`
+//! (`runtime::service_tasks`); the IPC mailbox handlers are what an app calls
+//! to leave a message for a recipient who is offline and to collect one on
+//! reconnect.
 //!
-//! ## Security boundary (for the wiring that comes later)
+//! It composes only already-reviewed primitives —
+//! [`SovereignIdentity::sign_auth_deliver`](crate::sovereign::SovereignIdentity::sign_auth_deliver),
+//! [`fanout_encrypt`]/[`fanout_decrypt_one`], [`verify_auth_deliver`] — plus
+//! the fan-out blob codec, and was landed ahead of that wiring so the
+//! composition could be reviewed on its own. This section said the module was
+//! not wired into any runtime path, and went on saying it after the wiring
+//! arrived: a header that tells a maintainer nothing depends on the module is
+//! what authorises changing or deleting one that five production call sites
+//! do (report17). The line is now derived rather than remembered — a guard in
+//! `offline_seal.rs` fails if it disagrees with whether those calls exist.
+//!
+//! ## Security boundary
 //! - The security-bearing BINDING — which `dst_node_id` / `app_id` /
 //!   `endpoint_id` the signature covers, plus `timestamp` / `nonce` — is the
 //!   CALLER's responsibility: [`seal_mailbox_blob`] seals whatever signed `auth`
 //!   it is handed, and [`open_mailbox_blob`] reports the verified auth so the
-//!   caller routes it. The runtime method that signs must bind correctly.
+//!   caller routes it. The runtime method that signs binds it.
 //! - `dk_seed` is the recipient instance's ML-KEM decapsulation seed. It MUST
 //!   stay inside the runtime — never logged, never crossed over an FFI boundary.
 //!   The recovered inner plaintext is held in a `Zeroizing` buffer by
