@@ -1,5 +1,43 @@
 # Changelog
 
+## v0.8.4 — 2026-08-28
+
+One fix, and it is why mail deposited for an offline peer never reached them.
+
+**A sealed introduce has to fit TWO cells, and only one of them was checked.**
+The sender packs an introduce into one 8192-byte anonymous cell on the way to
+the rendezvous. The rendezvous then forwards that same ciphertext down the
+RECEIVER's circuit, where it must fit one circuit-data cell. Nothing tied the
+two numbers together — the cap's own documentation said as much — and on
+2026-08-20 they crossed: circuits stopped sharing one global 16384-byte cell
+and began choosing their own (2048 today, 1024 the protocol minimum), while
+`MAX_INTRODUCE_CIPHERTEXT` stayed at 8058.
+
+Everything in that gap was accepted by the sender, sealed, routed, and dropped
+by the last relay, which cannot wrap it:
+
+    anonymity.relay_chain.introduce.circuit_oversize
+    introduce ct=4368 B exceeds one return cell; dropped
+
+Measured live against all three production relays on 2026-08-28. A contact
+request deposited for an offline peer was answered by the relay 58 times over
+two hours and not one answer arrived, so the receiver never acked and the relay
+kept re-serving it. The only answers that got through were the 2-byte EMPTY
+ones from the relay that had nothing to send, which is why the mailbox looked
+healthy from every angle except delivery.
+
+The cap now takes the smaller of the two legs. A receiver's cell size is its
+own choice and the sender never learns it, so the safe number is the smallest
+any circuit may negotiate. Messages past the cap are not refused — they
+fragment, as they did before the cell bumps.
+
+**The android media-engine build named one ABI for all three.** Two lines in
+`build_veil_media_so.sh` spelled `aarch64` by hand: the sysroot library path
+and the API-26 retarget. armeabi-v7a and x86_64 searched an arm64 library
+directory and failed at link with `cannot open crtbegin_so.o`, and compiled
+against API 23 while `-D__ANDROID_API__` said 26. Both now read the triple
+clang was actually given, and a toolchain missing an ABI says so by name.
+
 ## v0.8.3 — 2026-08-28
 
 One fix, and it is why a contact request could not be sent on the production
