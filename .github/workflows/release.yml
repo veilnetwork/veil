@@ -70,7 +70,14 @@ env:
   # Attaching to an existing Release is an explicit dispatch choice; a tag push
   # always produces a DRAFT, because publishing is a decision a person makes
   # after looking at the artifacts.
-  RELEASE_DRAFT: ${{ github.event_name != 'workflow_dispatch' || !inputs.release_existing }}
+  # Published, not drafted, the way hidden-volume has always released. A tag
+  # push used to leave a draft: v0.8.2 built green across six targets and then
+  # sat there, so `latest` answered v0.8.1 and a server reading it upgraded to
+  # a version older than the one that had been cut. What decides whether a tag
+  # deserves a release is the matrix above; holding the result back afterwards
+  # adds a step, not a check. `release_existing` still attaches to a release
+  # that is already there rather than making another.
+  RELEASE_DRAFT: false
 
 jobs:
   build:
