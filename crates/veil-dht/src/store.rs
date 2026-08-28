@@ -3073,6 +3073,55 @@ mod tests {
     ///
     /// One wall-clock second is all the collision needs, and a DHT node under
     /// load writes many entries a second.
+    /// Overwriting a key already on disk is not a reason to drop somebody
+    /// else's entry.
+    ///
+    /// The cap is a count of ENTRIES, and an overwrite adds none: the pre-insert
+    /// eviction is guarded by "is this key already here" for that reason. That
+    /// guard was carrying no test — removing it left all 207 of them green —
+    /// while what it prevents is a plain overwrite at capacity silently
+    /// deleting an unrelated value and leaving the tier one entry short.
+    #[cfg(feature = "rocksdb-cold")]
+    #[test]
+    fn overwriting_a_key_already_here_evicts_nobody() {
+        use super::rocks::RocksDbCold;
+
+        let dir = tempfile::tempdir().unwrap();
+        let cap = 3usize;
+        let mut cold =
+            RocksDbCold::open(dir.path().join("cold").to_str().unwrap(), cap).expect("open");
+
+        let keys: Vec<[u8; 32]> = [0x11u8, 0x22, 0x33]
+            .iter()
+            .map(|lead| {
+                let mut k = [0u8; 32];
+                k[0] = *lead;
+                cold.put(k, vec![*lead; 32]);
+                k
+            })
+            .collect();
+        assert_eq!(cold.len(), cap, "premise: the tier is full");
+
+        let put = cold.put(keys[0], b"second thoughts".to_vec());
+
+        assert!(
+            matches!(put, ColdPut::Stored(None)),
+            "an overwrite reported an eviction: {put:?}"
+        );
+        assert_eq!(cold.len(), cap, "the tier lost an entry to an overwrite");
+        for k in &keys {
+            assert!(
+                cold.contains(k),
+                "an overwrite of one key dropped another: {k:02x?}"
+            );
+        }
+        assert_eq!(
+            cold.get(&keys[0]).as_deref(),
+            Some(b"second thoughts".as_slice()),
+            "the overwrite itself did not land"
+        );
+    }
+
     #[cfg(feature = "rocksdb-cold")]
     #[test]
     fn a_put_never_evicts_the_value_it_just_wrote() {
