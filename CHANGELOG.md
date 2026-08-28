@@ -1,5 +1,32 @@
 # Changelog
 
+## v0.8.3 — 2026-08-28
+
+One fix, and it is why a contact request could not be sent on the production
+network at all.
+
+**A recursive DHT query went to peers that had opted out of serving one.**
+`Contact::dht_service` says in as many words that it gates "store target, walk
+hop, FIND_NODE referral" — a recursive GET is all three at once — and neither
+candidate selection in the resolver consulted it. Both sorted the session peers
+by XOR distance to the key and took the closest K.
+
+The ordering made it worse rather than diluting it: an opted-out peer that
+happens to sit close to the key is picked FIRST. A phone opts out by default,
+so behind one NAT it is precisely the desktop's nearest session peer, and two
+such peers exhaust a budget of K before a seed is ever asked.
+
+What that looked like from the app: sealing a mailbox blob needs the
+recipient's instance registry to know which devices to seal an envelope for.
+The registry "did not resolve" while the record sat on all three seeds the
+whole time, so nothing could be sealed, nothing was deposited, and a friend
+request never arrived. Reproduced on two stand nodes against the production
+seeds before the fix, and confirmed arriving after it.
+
+Both selections now drop opted-out peers before sorting, and the filter cannot
+empty the list: a node whose every session peer has opted out still asks them,
+because a query that cannot be answered beats one that is never sent.
+
 ## v0.8.2 — 2026-08-28
 
 The audit pass behind this release closed the low and medium findings of
