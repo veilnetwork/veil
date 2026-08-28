@@ -59,9 +59,17 @@ pub const LEN_PREFIX: usize = 2;
 /// Largest real payload that fits a `CIRCUIT_PAYLOAD_BYTES` cell.
 pub const MAX_CIRCUIT_INNER: usize = CIRCUIT_PAYLOAD_BYTES - LEN_PREFIX;
 
-/// Smallest cell a circuit may negotiate. Must comfortably hold the largest
-/// sealed introduce (`MAX_INTRODUCE_CIPHERTEXT` = 320) plus the length prefix,
-/// with room for the registration payloads that share the path.
+/// Smallest cell a circuit may negotiate. Must hold the largest sealed
+/// introduce ([`crate::rendezvous::MAX_INTRODUCE_CIPHERTEXT`]) plus the length
+/// prefix, with room for the registration payloads that share the path.
+///
+/// That introduce cap is now DERIVED from this number rather than compared
+/// against it by hand — the hand-written version said "= 320" and went stale
+/// the moment the cap started deriving itself from the anonymous cell, which
+/// is how an ~8 KB introduce came to be handed to a 2048-byte circuit and
+/// dropped mid-path (see the cap's own docs). Lowering this value therefore
+/// shrinks the introduce cap with it; raising it must not raise the cap past
+/// what a receiver on the OLD minimum can still carry.
 pub const MIN_CIRCUIT_CELL_BYTES: usize = 1024;
 
 /// The size of every data cell on ONE circuit, chosen when the circuit is built
