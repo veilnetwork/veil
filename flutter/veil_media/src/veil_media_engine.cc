@@ -1343,6 +1343,27 @@ VeilMediaEngine* veil_media_engine_create(uint64_t veil_chan,
     vlog("adm: Init=%d Initialized=%d recDevs=%d playDevs=%d recAvail=%d "
          "playAvail=%d",
          init_rc, initialized, rec_devs, play_devs, rec_avail, play_avail);
+    // WHICH devices, by name. "playing=1" and silence are the same line
+    // otherwise: the engine can be playing correctly into an output nobody is
+    // listening to, and no counter can tell those apart. Names can.
+    run_on_adm_thread([&] {
+      for (int i = 0; i < play_devs; ++i) {
+        char name[webrtc::kAdmMaxDeviceNameSize] = {0};
+        char guid[webrtc::kAdmMaxGuidSize] = {0};
+        if (ws->adm->PlayoutDeviceName(static_cast<uint16_t>(i), name, guid) ==
+            0) {
+          vlog("adm: playout device %d: %s", i, name);
+        }
+      }
+      for (int i = 0; i < rec_devs; ++i) {
+        char name[webrtc::kAdmMaxDeviceNameSize] = {0};
+        char guid[webrtc::kAdmMaxGuidSize] = {0};
+        if (ws->adm->RecordingDeviceName(static_cast<uint16_t>(i), name,
+                                         guid) == 0) {
+          vlog("adm: recording device %d: %s", i, name);
+        }
+      }
+    });
   }
   ws->apm = webrtc::BuiltinAudioProcessingBuilder().Build(ws->env);
 
