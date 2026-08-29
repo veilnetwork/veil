@@ -142,6 +142,14 @@ jobs:
         # Windows 11 with 0.13.4, on answering a call.
         run: ./scripts/check-com-apartment-ownership.sh
 
+      - name: pqcrypto-falcon features are chosen, not inherited
+        # Cargo unifies features across the graph, so ONE crate taking this
+        # dependency with its defaults turns avx2 and neon on for the whole
+        # workspace -- including the six crates that asked for neither. That
+        # was invisible until an arm64 Windows host tried to compile pqclean's
+        # aarch64 NEON sources with MSVC, which rejects them outright.
+        run: ./scripts/check-falcon-features.sh
+
       - name: Native media diagnostics are explicit opt-in
         run: |
           c++ -std=c++17 -Wall -Wextra -Werror \
