@@ -2797,9 +2797,15 @@ int veil_media_engine_set_speaker_muted(VeilMediaEngine* engine, int muted) {
 #if defined(VEIL_MEDIA_HAVE_WEBRTC)
 namespace {
 // JSON [{"id","label","kind"}] from the ADM. `recording` = inputs.
+// Enumerating is an ADM call like any other, and on Windows the module is
+// bound to the thread that created it: asked from anywhere else,
+// PlayoutDeviceName answers an error, every device is skipped, and the caller
+// gets an empty list. That is what an empty output picker looked like —
+// "Audio has no output" — while `playDevs=4` sat in the same log.
 char* adm_devices_json(webrtc::AudioDeviceModule* adm, bool recording) {
   std::string out = "[";
   if (adm) {
+    run_on_adm_thread([&] {
     const int16_t n = recording ? adm->RecordingDevices() : adm->PlayoutDevices();
     for (int16_t i = 0; i < n; ++i) {
       char name[webrtc::kAdmMaxDeviceNameSize] = {0};
@@ -2819,6 +2825,7 @@ char* adm_devices_json(webrtc::AudioDeviceModule* adm, bool recording) {
       out += recording ? "input" : "output";
       out += "\"}";
     }
+    });
   }
   out += "]";
   return dup_cstr(out);
@@ -2887,11 +2894,18 @@ int veil_media_engine_select_audio_input(VeilMediaEngine* engine,
   const uint16_t idx = static_cast<uint16_t>(std::atoi(id));
   // Stop -> switch -> restart so the change takes effect mid-call.
   webrtc::AudioDeviceModule* adm = engine->ws->adm.get();
-  const bool was_recording = adm->Recording();
-  adm->StopRecording();
-  if (adm->SetRecordingDevice(idx) != 0) return VEIL_MEDIA_ERR_DEVICE;
-  adm->InitRecording();
-  if (was_recording) adm->StartRecording();
+  bool ok = true;
+  run_on_adm_thread([&] {
+    const bool was_recording = adm->Recording();
+    adm->StopRecording();
+    if (adm->SetRecordingDevice(idx) != 0) {
+      ok = false;
+      return;
+    }
+    adm->InitRecording();
+    if (was_recording) adm->StartRecording();
+  });
+  if (!ok) return VEIL_MEDIA_ERR_DEVICE;
 #endif
   return VEIL_MEDIA_OK;
 }
@@ -2903,11 +2917,18 @@ int veil_media_engine_select_audio_output(VeilMediaEngine* engine,
   if (!engine->ws || !engine->ws->adm) return VEIL_MEDIA_ERR_DEVICE;
   const uint16_t idx = static_cast<uint16_t>(std::atoi(id));
   webrtc::AudioDeviceModule* adm = engine->ws->adm.get();
-  const bool was_playing = adm->Playing();
-  adm->StopPlayout();
-  if (adm->SetPlayoutDevice(idx) != 0) return VEIL_MEDIA_ERR_DEVICE;
-  adm->InitPlayout();
-  if (was_playing) adm->StartPlayout();
+  bool ok = true;
+  run_on_adm_thread([&] {
+    const bool was_playing = adm->Playing();
+    adm->StopPlayout();
+    if (adm->SetPlayoutDevice(idx) != 0) {
+      ok = false;
+      return;
+    }
+    adm->InitPlayout();
+    if (was_playing) adm->StartPlayout();
+  });
+  if (!ok) return VEIL_MEDIA_ERR_DEVICE;
 #endif
   return VEIL_MEDIA_OK;
 }
