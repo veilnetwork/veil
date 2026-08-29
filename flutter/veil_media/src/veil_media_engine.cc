@@ -1224,18 +1224,33 @@ void run_on_adm_thread(std::function<void()> fn) { fn(); }
 // camera and NO audio output at all — so on every machine where nobody had
 // picked one by hand, playout was initialised against no device.
 //
-// Ask for the COMMUNICATIONS default: the output Windows reserves for calls,
-// which is what a person expects a call to come out of. Fall back to the plain
-// default on a machine with no communications role set.
+// THE PLAIN DEFAULT, not the communications one.
+//
+// Windows keeps two separate defaults for output, and they are routinely
+// different devices. Measured on a live machine 2026-08-29:
+//
+//   eConsole / eMultimedia : Динамики (RSQ-319)   <- headphones; the browser
+//   eCommunications        : Динамики (2- ME6S)   <- where this call went
+//
+// Asking for the communications default is defensible on paper — it is the
+// role Windows names for calls — and it is wrong in practice: almost nobody
+// sets it deliberately, so Windows fills it with whatever it likes, and the
+// call comes out of a device the person is not wearing. Everything looked
+// healthy from inside: the module reported playing=1, packets arrived and
+// decoded with zero loss, and there was silence.
+//
+// So take the output the person means by "my output" — the one their browser
+// uses — and keep the communications default only as a fallback. Whoever wants
+// the other one has the picker.
 void start_playout(webrtc::AudioDeviceModule* adm) {
   if (adm == nullptr) return;
   int32_t set_rc = 0, init_rc = 0, start_rc = 0;
   run_on_adm_thread([&] {
 #if defined(_WIN32)
-    set_rc = adm->SetPlayoutDevice(
-        webrtc::AudioDeviceModule::kDefaultCommunicationDevice);
+    set_rc = adm->SetPlayoutDevice(webrtc::AudioDeviceModule::kDefaultDevice);
     if (set_rc != 0) {
-      set_rc = adm->SetPlayoutDevice(webrtc::AudioDeviceModule::kDefaultDevice);
+      set_rc = adm->SetPlayoutDevice(
+          webrtc::AudioDeviceModule::kDefaultCommunicationDevice);
     }
 #endif
     init_rc = adm->InitPlayout();
