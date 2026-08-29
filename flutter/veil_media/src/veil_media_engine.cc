@@ -1189,6 +1189,25 @@ AdmHostThread& adm_host_thread() {
   static AdmHostThread instance;
   return instance;
 }
+
+// Every call into the ADM goes to the thread that CREATED it.
+//
+// `AudioDeviceWindowsCore` establishes an STA on its creating thread and holds
+// COM interfaces from it. STA objects have thread affinity: reached from
+// another apartment without marshalling they answer RPC_E_WRONG_THREAD, which
+// this ADM surfaces as -1. Measured on Windows 11 after the crash was fixed —
+// the module built and initialised fine and then
+//
+//   adm: Init=0 Initialized=1 recDevs=3 playDevs=4 recAvail=0 playAvail=0
+//   adm start: capture start FAILED init=-1 start=-1
+//
+// so the call carried video and no sound. One thread creates it, the same
+// thread drives it.
+void run_on_adm_thread(std::function<void()> fn) { adm_host_thread().Run(std::move(fn)); }
+#else
+// Elsewhere the ADM has no apartment to belong to; the call runs where it was
+// made, exactly as it always did.
+void run_on_adm_thread(std::function<void()> fn) { fn(); }
 #endif  // _WIN32
 
 webrtc::scoped_refptr<webrtc::AudioDeviceModule> create_audio_device(
@@ -1315,7 +1334,10 @@ void veil_media_engine_destroy(VeilMediaEngine* engine) {
   if (engine->ws) {
     if (engine->ws->shim) engine->ws->shim->Stop();
     engine->ws->call.reset();  // after streams (stop_audio) + shim->Stop()
-    if (engine->ws->adm) engine->ws->adm->Terminate();
+    if (engine->ws->adm) {
+      auto* adm = engine->ws->adm.get();
+      run_on_adm_thread([adm] { adm->Terminate(); });
+    }
   }
 #endif
   delete engine;
@@ -1334,7 +1356,7 @@ VeilGroupMediaEngine* veil_media_group_engine_create(
   ws->network_tq = ws->env.task_queue_factory().CreateTaskQueue(
       "veil-group-net", webrtc::TaskQueueFactory::Priority::kHigh);
   ws->adm = create_audio_device(ws->env);
-  if (ws->adm) ws->adm->Init();
+  if (ws->adm) run_on_adm_thread([&] { ws->adm->Init(); });
   ws->apm = webrtc::BuiltinAudioProcessingBuilder().Build(ws->env);
   webrtc::AudioState::Config asc;
   asc.audio_mixer = webrtc::AudioMixerImpl::Create();
@@ -1575,8 +1597,10 @@ int veil_media_group_engine_stop_audio(VeilGroupMediaEngine* engine) {
   if (engine->ws && engine->ws->call) {
     GroupWebrtcState* ws = engine->ws.get();
     if (ws->adm) {
-      if (ws->adm->Recording()) ws->adm->StopRecording();
-      if (ws->adm->Playing()) ws->adm->StopPlayout();
+      run_on_adm_thread([&] {
+        if (ws->adm->Recording()) ws->adm->StopRecording();
+        if (ws->adm->Playing()) ws->adm->StopPlayout();
+      });
     }
     if (!run_on(ws->worker_tq.get(), [&]() {
           if (ws->send_stream) {
@@ -1961,7 +1985,10 @@ void veil_media_group_engine_destroy(VeilGroupMediaEngine* engine) {
     }
     engine->ws->peers.clear();
     engine->ws->call.reset();
-    if (engine->ws->adm) engine->ws->adm->Terminate();
+    if (engine->ws->adm) {
+      auto* adm = engine->ws->adm.get();
+      run_on_adm_thread([adm] { adm->Terminate(); });
+    }
   }
 #endif
   delete engine;
@@ -2073,8 +2100,10 @@ int veil_media_engine_stop_audio(VeilMediaEngine* engine) {
     // Stop the ADM off the worker queue (see start_audio — StartRecording/
     // StopRecording can block CoreAudio and must not wedge the Call worker).
     if (ws->adm) {
-      if (ws->adm->Recording()) ws->adm->StopRecording();
-      if (ws->adm->Playing()) ws->adm->StopPlayout();
+      run_on_adm_thread([&] {
+        if (ws->adm->Recording()) ws->adm->StopRecording();
+        if (ws->adm->Playing()) ws->adm->StopPlayout();
+      });
     }
     if (!run_on(ws->worker_tq.get(), [&]() {
           if (ws->send_stream) {
