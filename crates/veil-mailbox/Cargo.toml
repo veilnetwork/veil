@@ -16,11 +16,34 @@ veil-bloom = { path = "../veil-bloom" }
 # functionally a small standalone primitive.
 blake3 = "1.5"
 ed25519-dalek = { version = "2", features = ["std"] }
-pqcrypto-falcon = "0.4"
 pqcrypto-traits = "0.3"
 redb = "2"
 thiserror = "2.0"
 tracing = "0.1"
+
+# pqcrypto-falcon, per target.
+#
+# Every other crate in this workspace takes it with
+# `default-features = false, features = ["std"]`; this one took the defaults,
+# and cargo unifies features across the graph, so this single line is what
+# turned `avx2` and `neon` on for the WHOLE workspace.
+#
+# Harmless until a target appears where the optimised C does not compile. On
+# aarch64-pc-windows-msvc it does not: pqclean's aarch64 sources are written
+# for GCC/Clang NEON intrinsics and MSVC rejects them outright ("cannot convert
+# from '__n128' to 'uint32x4_t'"), which is what stopped the first native arm64
+# Windows build. The crate's own build.rs already guards its avx2 path with a
+# `target_env == "msvc"` check; the aarch64 path carries no such guard.
+#
+# Narrowed rather than switched off everywhere: dropping the defaults outright
+# would take the optimised implementations away from x86_64 and from arm64
+# Linux as well, which nobody asked for and which this crate — fifty lines of
+# verify-only code — has no standing to decide for the workspace.
+[target.'cfg(not(all(target_arch = "aarch64", target_env = "msvc")))'.dependencies]
+pqcrypto-falcon = "0.4"
+
+[target.'cfg(all(target_arch = "aarch64", target_env = "msvc"))'.dependencies]
+pqcrypto-falcon = { version = "0.4", default-features = false, features = ["std"] }
 
 [dev-dependencies]
 tempfile = "3"
