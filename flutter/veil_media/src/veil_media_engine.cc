@@ -1250,18 +1250,39 @@ void start_playout(webrtc::AudioDeviceModule* adm) {
   }
 }
 
-// Start capture on the ADM's own thread, reporting both codes.
+// Start capture on the ADM's own thread, reporting every code.
+//
+// The INPUT is chosen here for the same reason the output is. Nothing ever
+// chose one: recording was started against whatever the module defaulted to,
+// and on a machine with a webcam, a headset and a monitor that is a coin toss.
+// Measured on Windows 2026-08-29: with the microphone left to the default, the
+// call sent 153 packets carrying 4917 bytes — the same packet count as a
+// working call and HALF its bytes, which is the signature of a codec sending
+// silence, not of a broken stream. Nothing in the log said which microphone
+// that was, because nothing had asked.
+//
+// The communications default, like the output: it is what Windows reserves for
+// calls, and a person who has plugged in a headset expects a call to use it.
 bool start_capture(webrtc::AudioDeviceModule* adm, const char* who) {
-  int32_t init_rc = 0, start_rc = 0;
+  int32_t set_rc = 0, init_rc = 0, start_rc = 0;
   run_on_adm_thread([&] {
+#if defined(_WIN32)
+    set_rc = adm->SetRecordingDevice(
+        webrtc::AudioDeviceModule::kDefaultCommunicationDevice);
+    if (set_rc != 0) {
+      set_rc =
+          adm->SetRecordingDevice(webrtc::AudioDeviceModule::kDefaultDevice);
+    }
+#endif
     init_rc = adm->InitRecording();
     start_rc = init_rc == 0 ? adm->StartRecording() : -1;
   });
   if (init_rc != 0 || start_rc != 0) {
-    vlog("%s: capture start FAILED init=%d start=%d", who, (int)init_rc,
-         (int)start_rc);
+    vlog("%s: capture start FAILED set=%d init=%d start=%d", who, (int)set_rc,
+         (int)init_rc, (int)start_rc);
     return false;
   }
+  vlog("%s: capture ok (device set rc=%d)", who, (int)set_rc);
   return true;
 }
 
@@ -2163,8 +2184,16 @@ int veil_media_engine_start_audio(VeilMediaEngine* engine, int send, int recv) {
         [ws]() {
           if (ws->send_stream) {
             const auto s = ws->send_stream->GetStats();
-            vlog("sendstream @3s: packets_sent=%lld bytes=%lld",
-                 (long long)s.packets_sent, (long long)s.payload_bytes_sent);
+            // audio_level and input energy are what separate "the microphone
+            // is silent" from "the stream is broken". Byte counts cannot: a
+            // codec sending silence produces the same packet count and half
+            // the bytes, which reads as a healthy stream until someone weighs
+            // it against a working call.
+            vlog("sendstream @3s: packets_sent=%lld bytes=%lld level=%d "
+                 "input_energy=%.4f input_seconds=%.1f",
+                 (long long)s.packets_sent, (long long)s.payload_bytes_sent,
+                 (int)s.audio_level, s.total_input_energy,
+                 s.total_input_duration);
           }
           if (ws->recv_stream) {
             const auto r = ws->recv_stream->GetStats(false);
