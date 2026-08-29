@@ -2108,6 +2108,13 @@ int veil_media_engine_start_audio(VeilMediaEngine* engine, int send, int recv) {
   // AVAudioEngine ADM's start is non-blocking + idempotent (all engine work is
   // serialized on its own GCD queue), so this is safe on the calling thread and
   // AudioState toggling it too on the worker queue just no-ops.
+  // What was ASKED for, before anything acts on it. The playout branch below
+  // is conditional, and a conditional that does not fire leaves no trace at
+  // all: measured on Windows 2026-08-29, `recording=1 playing=0` with not one
+  // line from start_playout, which cannot distinguish "playout refused" from
+  // "playout never attempted". Now it can.
+  vlog("adm start: asked send=%d recv=%d micMuted=%d adm=%s", (int)send,
+       (int)recv, (int)engine->mic_muted, ws->adm ? "yes" : "NULL");
   bool capture_failed = false;
   if (ws->adm) {
     if (send && !engine->mic_muted) {
