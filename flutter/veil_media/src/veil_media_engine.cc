@@ -1210,6 +1210,61 @@ void run_on_adm_thread(std::function<void()> fn) { adm_host_thread().Run(std::mo
 void run_on_adm_thread(std::function<void()> fn) { fn(); }
 #endif  // _WIN32
 
+// Start playout, and SAY WHY when it does not.
+//
+// Both return codes used to be discarded. A device that refuses is then
+// completely silent: the call connects, the microphone works, packets go out,
+// and the other side is never heard. Measured on Windows 2026-08-29 —
+// `adm start: recording=1 playing=0`, with nothing in the log to explain the
+// zero.
+//
+// And on Windows a playout device has to be CHOSEN before playout can be
+// initialised. Nothing here ever chose one: `SetPlayoutDevice` was called only
+// from the explicit device picker, and the call UI offers a microphone and a
+// camera and NO audio output at all — so on every machine where nobody had
+// picked one by hand, playout was initialised against no device.
+//
+// Ask for the COMMUNICATIONS default: the output Windows reserves for calls,
+// which is what a person expects a call to come out of. Fall back to the plain
+// default on a machine with no communications role set.
+void start_playout(webrtc::AudioDeviceModule* adm) {
+  if (adm == nullptr) return;
+  int32_t set_rc = 0, init_rc = 0, start_rc = 0;
+  run_on_adm_thread([&] {
+#if defined(_WIN32)
+    set_rc = adm->SetPlayoutDevice(
+        webrtc::AudioDeviceModule::kDefaultCommunicationDevice);
+    if (set_rc != 0) {
+      set_rc = adm->SetPlayoutDevice(webrtc::AudioDeviceModule::kDefaultDevice);
+    }
+#endif
+    init_rc = adm->InitPlayout();
+    start_rc = init_rc == 0 ? adm->StartPlayout() : -1;
+  });
+  if (init_rc != 0 || start_rc != 0) {
+    vlog("adm start: PLAYOUT FAILED set=%d init=%d start=%d — the call carries "
+         "our voice and none of theirs",
+         (int)set_rc, (int)init_rc, (int)start_rc);
+  } else {
+    vlog("adm start: playout ok (device set rc=%d)", (int)set_rc);
+  }
+}
+
+// Start capture on the ADM's own thread, reporting both codes.
+bool start_capture(webrtc::AudioDeviceModule* adm, const char* who) {
+  int32_t init_rc = 0, start_rc = 0;
+  run_on_adm_thread([&] {
+    init_rc = adm->InitRecording();
+    start_rc = init_rc == 0 ? adm->StartRecording() : -1;
+  });
+  if (init_rc != 0 || start_rc != 0) {
+    vlog("%s: capture start FAILED init=%d start=%d", who, (int)init_rc,
+         (int)start_rc);
+    return false;
+  }
+  return true;
+}
+
 webrtc::scoped_refptr<webrtc::AudioDeviceModule> create_audio_device(
     const webrtc::Environment& env) {
 #if defined(_WIN32)
@@ -1274,14 +1329,20 @@ VeilMediaEngine* veil_media_engine_create(uint64_t veil_chan,
   // path while iOS retains the AVAudioSession-aware custom ADM.
   ws->adm = create_audio_device(ws->env);
   if (ws->adm) {
-    const int32_t init_rc = ws->adm->Init();
+    int32_t init_rc = 0;
     bool rec_avail = false, play_avail = false;
-    ws->adm->RecordingIsAvailable(&rec_avail);
-    ws->adm->PlayoutIsAvailable(&play_avail);
+    int initialized = 0, rec_devs = 0, play_devs = 0;
+    run_on_adm_thread([&] {
+      init_rc = ws->adm->Init();
+      ws->adm->RecordingIsAvailable(&rec_avail);
+      ws->adm->PlayoutIsAvailable(&play_avail);
+      initialized = ws->adm->Initialized();
+      rec_devs = static_cast<int>(ws->adm->RecordingDevices());
+      play_devs = static_cast<int>(ws->adm->PlayoutDevices());
+    });
     vlog("adm: Init=%d Initialized=%d recDevs=%d playDevs=%d recAvail=%d "
          "playAvail=%d",
-         init_rc, ws->adm->Initialized(), (int)ws->adm->RecordingDevices(),
-         (int)ws->adm->PlayoutDevices(), rec_avail, play_avail);
+         init_rc, initialized, rec_devs, play_devs, rec_avail, play_avail);
   }
   ws->apm = webrtc::BuiltinAudioProcessingBuilder().Build(ws->env);
 
@@ -1570,16 +1631,9 @@ int veil_media_group_engine_start_audio(VeilGroupMediaEngine* engine) {
       // Align with set_mic_muted: a capture device that cannot start must be
       // loud, not a silently dead microphone. Playout still comes up below so
       // the room stays audible while the caller decides what to do.
-      const int32_t init_rc = ws->adm->InitRecording();
-      const int32_t start_rc = init_rc == 0 ? ws->adm->StartRecording() : -1;
-      if (init_rc != 0 || start_rc != 0) {
-        capture_failed = true;
-        vlog("group audio: capture start FAILED init=%d start=%d",
-             (int)init_rc, (int)start_rc);
-      }
+      if (!start_capture(ws->adm.get(), "group audio")) capture_failed = true;
     }
-    ws->adm->InitPlayout();
-    ws->adm->StartPlayout();
+    start_playout(ws->adm.get());
   }
   engine->audio_running.store(true);
   if (capture_failed) return VEIL_MEDIA_ERR_DEVICE;
@@ -1642,12 +1696,18 @@ int veil_media_group_engine_set_mic_muted(VeilGroupMediaEngine* engine,
     // stream. This prevents both a stale-frame leak and muted AudioRecord CPU.
     if (engine->mic_muted) {
       if (ws->send_stream) ws->send_stream->SetMuted(true);
-      if (engine->audio_running.load() && ws->adm && ws->adm->Recording())
-        ws->adm->StopRecording();
+      if (engine->audio_running.load() && ws->adm) {
+        run_on_adm_thread([&] {
+          if (ws->adm->Recording()) ws->adm->StopRecording();
+        });
+      }
     } else {
-      if (engine->audio_running.load() && ws->adm && !ws->adm->Recording()) {
-        ws->adm->InitRecording();
-        if (ws->adm->StartRecording() != 0) return VEIL_MEDIA_ERR_DEVICE;
+      bool needs_start = false;
+      if (engine->audio_running.load() && ws->adm) {
+        run_on_adm_thread([&] { needs_start = !ws->adm->Recording(); });
+      }
+      if (needs_start && !start_capture(ws->adm.get(), "mic unmute")) {
+        return VEIL_MEDIA_ERR_DEVICE;
       }
       if (ws->send_stream) ws->send_stream->SetMuted(false);
     }
@@ -2053,20 +2113,15 @@ int veil_media_engine_start_audio(VeilMediaEngine* engine, int send, int recv) {
     if (send && !engine->mic_muted) {
       // Same contract as set_mic_muted/group start: surface a capture device
       // that refuses to start instead of silently sending nothing.
-      const int32_t init_rc = ws->adm->InitRecording();
-      const int32_t start_rc = init_rc == 0 ? ws->adm->StartRecording() : -1;
-      if (init_rc != 0 || start_rc != 0) {
-        capture_failed = true;
-        vlog("adm start: capture start FAILED init=%d start=%d",
-             (int)init_rc, (int)start_rc);
-      }
+      if (!start_capture(ws->adm.get(), "adm start")) capture_failed = true;
     }
-    if (recv) {
-      ws->adm->InitPlayout();
-      ws->adm->StartPlayout();
-    }
-    vlog("adm start: recording=%d playing=%d", ws->adm->Recording(),
-         ws->adm->Playing());
+    if (recv) start_playout(ws->adm.get());
+    int recording = 0, playing = 0;
+    run_on_adm_thread([&] {
+      recording = ws->adm->Recording();
+      playing = ws->adm->Playing();
+    });
+    vlog("adm start: recording=%d playing=%d", recording, playing);
   }
   // A few seconds in, log the send stream's packet counters — the definitive
   // "is audio actually going out" check.
@@ -2665,12 +2720,18 @@ int veil_media_engine_set_mic_muted(VeilMediaEngine* engine, int muted) {
     WebrtcState* ws = engine->ws.get();
     if (engine->mic_muted) {
       if (ws->send_stream) ws->send_stream->SetMuted(true);
-      if (engine->audio_running.load() && ws->adm && ws->adm->Recording())
-        ws->adm->StopRecording();
+      if (engine->audio_running.load() && ws->adm) {
+        run_on_adm_thread([&] {
+          if (ws->adm->Recording()) ws->adm->StopRecording();
+        });
+      }
     } else {
-      if (engine->audio_running.load() && ws->adm && !ws->adm->Recording()) {
-        ws->adm->InitRecording();
-        if (ws->adm->StartRecording() != 0) return VEIL_MEDIA_ERR_DEVICE;
+      bool needs_start = false;
+      if (engine->audio_running.load() && ws->adm) {
+        run_on_adm_thread([&] { needs_start = !ws->adm->Recording(); });
+      }
+      if (needs_start && !start_capture(ws->adm.get(), "mic unmute")) {
+        return VEIL_MEDIA_ERR_DEVICE;
       }
       if (ws->send_stream) ws->send_stream->SetMuted(false);
     }
