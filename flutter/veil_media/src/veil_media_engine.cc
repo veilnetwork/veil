@@ -2130,15 +2130,31 @@ int veil_media_engine_start_audio(VeilMediaEngine* engine, int send, int recv) {
     });
     vlog("adm start: recording=%d playing=%d", recording, playing);
   }
-  // A few seconds in, log the send stream's packet counters — the definitive
-  // "is audio actually going out" check.
-  if (ws->send_stream) {
+  // A few seconds in, log BOTH directions' packet counters.
+  //
+  // Only the send side was logged, and that cannot answer the question a
+  // person actually asks — "I cannot hear them". Sending is ours to see;
+  // hearing depends on packets ARRIVING, and the log said nothing about those
+  // beyond a single "first inbound" marker. So a silent call looked identical
+  // whether the peer sent nothing or we failed to play what it sent.
+  if (ws->send_stream || ws->recv_stream) {
     ws->worker_tq->PostDelayedTask(
         [ws]() {
           if (ws->send_stream) {
             const auto s = ws->send_stream->GetStats();
             vlog("sendstream @3s: packets_sent=%lld bytes=%lld",
                  (long long)s.packets_sent, (long long)s.payload_bytes_sent);
+          }
+          if (ws->recv_stream) {
+            const auto r = ws->recv_stream->GetStats(false);
+            vlog("recvstream @3s: packets_received=%u bytes=%lld lost=%d "
+                 "jitter_ms=%u concealed_samples=%llu",
+                 (unsigned)r.packets_received,
+                 (long long)r.payload_bytes_received, (int)r.packets_lost,
+                 (unsigned)r.jitter_ms,
+                 (unsigned long long)r.concealed_samples);
+          } else {
+            vlog("recvstream @3s: NO RECEIVE STREAM — nothing can be heard");
           }
         },
         webrtc::TimeDelta::Seconds(3));
