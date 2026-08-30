@@ -1,16 +1,21 @@
 name: PR hygiene
 
-# Lightweight pre-submit gate (audit follow-up 2026-06-03). The full CI
-# (ci.yml) stays tag-only for budget reasons (Phase Q.6); this job runs ONLY
-# the cheap, build-once hygiene checks — fmt + clippy(-D warnings) + the policy
-# scripts + cargo-audit — on every PR and on non-tag branch pushes, so a
-# style/lint/poison/dead-code/advisory regression is caught before it lands
-# instead of only at release. No test matrix, no Windows, no bench, no devnet.
+# Lightweight pre-submit gate (audit follow-up 2026-06-03). Cheap, build-once
+# hygiene only — fmt + clippy(-D warnings) + the policy scripts + cargo-audit —
+# so a style/lint/poison/dead-code/advisory regression is caught before it
+# lands. No test matrix, no Windows, no bench, no devnet.
+#
+# NOT on main. ci.yml runs on every push to main since 2026-08-30 and its
+# hygiene job is these same checks, so leaving main here ran the whole set
+# twice per push with two cache keys — and two copies of a policy check can
+# disagree, which is worse than the minutes (report19 V19-L1). The two
+# comments this replaces both described the arrangement before that change:
+# the full CI is no longer tag-only, and a tag no longer triggers it at all.
 on:
   pull_request:
   push:
     branches-ignore:
-      # tag pushes already trigger the full ci.yml; don't double-run.
+      - main
       - 'gh-readonly-queue/**'
 
 # Cancel superseded runs on the same ref so rapid pushes don't pile up minutes.
