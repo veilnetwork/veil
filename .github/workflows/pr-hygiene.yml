@@ -63,6 +63,14 @@ jobs:
       - name: '#[allow(dead_code)] anchor policy'
         run: ./scripts/check-allow-dead-code-anchors.sh
 
+      - name: The triggers name a branch that exists
+        # Cheapest question in the file, and the one nothing else asks: is
+        # anything watching the branch the work lands on? This repository ran
+        # for three months with the full CI reachable only by hand.
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: ./scripts/check-workflow-branches.sh
+
       - name: Cyrillic policy (runtime strings + CI tooling)
         run: ./scripts/check-cyrillic-runtime-strings.sh
 

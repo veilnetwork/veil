@@ -1,27 +1,36 @@
 name: CI
 
 on:
+  push:
+    branches: [main]
   workflow_dispatch:
 
-# 2026-07-28: the tag trigger is gone. Tag-time CI cost over an hour of runner
-# time per release while re-proving what the local pre-tag gate had already
-# proven minutes earlier — and the gate is not optional, it is how hygiene is
-# enforced here (see the note below). What a tag still starts is artifact
-# building only: mobile-build.yml on 'v*', and release.yml by hand. Run this
-# workflow with `gh workflow run ci.yml` when a change deserves the full
-# multi-OS matrix.
+# One run per ref. A series of pushes only needs the last one gated, and a
+# cancelled run costs nothing but the seconds it had already spent.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
 
-# Audit batch 2026-05-27 Phase Q.6: reverted to tag-only triggering
-# after PR/branch-push runs exhausted the org's GitHub Actions
-# minutes budget.  Hygiene (clippy `-D warnings`, mutex-poison policy,
-# dead-code-anchor policy) is enforced locally and revalidated on release;
-# the cost of one regression slipping past a push is a pre-release
-# `gh workflow run ci.yml` (or just bump the tag if a fix is needed).
+# 2026-08-30: this runs on every push to main again, and the reason it stopped
+# is worth keeping because it was a good reason that stopped being true.
 #
-# History: Phase E19 (2026-05-21) added PR + branch triggers because
-# tag-only CI had let 4 mutex + 3 dead-code + 7 cfg-warning violations
-# slip in.  Phase Q.6 (2026-05-27) is the budget-driven rollback —
-# tradeoff is conscious, not accidental.
+# Phase Q.6 (2026-05-27) removed the PR and branch triggers after those runs
+# exhausted the ORG'S ACTIONS MINUTES BUDGET. That is a real cost and the
+# rollback was deliberate, not an oversight. This repository is public, and
+# GitHub-hosted standard runners are free for public repositories — so the
+# budget that decision was made against does not exist here any more. The
+# constraint outlived its cause by three months.
+#
+# What it cost meanwhile is on the record too. Phase E19 (2026-05-21) added
+# those triggers in the first place BECAUSE tag-only CI had let 4 mutex, 3
+# dead-code and 7 cfg-warning violations slip in, and 2026-07-28 removed the
+# tag trigger as well — leaving hygiene enforced by a local gate that lives in
+# a checklist, which is to say by whoever remembers it.
+#
+# Pull requests are not listed here on purpose: pr-gate.yml is the fast lane
+# for those and running both would only duplicate the same clippy pass. Tags
+# still start artifact building alone (mobile-build.yml, release.yml), which
+# is right — by then this workflow has already gated the commit being tagged.
 
 env:
   CARGO_TERM_COLOR: always
