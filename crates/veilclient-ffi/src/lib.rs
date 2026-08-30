@@ -2363,6 +2363,29 @@ pub unsafe extern "C" fn veil_media_start_direct_receiver(
             // peers must not grow an unbounded source-id map.
             let expected = direct_media_source_app(&src_node_id, &namespace, &name);
             if src_app_id != expected {
+                // SAY SO. This demux dropped every mismatching frame in
+                // silence, and silence here is indistinguishable from "the
+                // network delivered nothing": the engine reports
+                // packets_received=0, `dispatch MISS` never fires because the
+                // frame never reaches the dispatch, and every layer above
+                // looks healthy while sending works perfectly.
+                //
+                // Counted, not logged per frame: media arrives at about fifty
+                // frames a second, and an unthrottled line would bury the
+                // answer it is meant to give.
+                use std::sync::atomic::{AtomicU64, Ordering};
+                static MISMATCHES: AtomicU64 = AtomicU64::new(0);
+                let n = MISMATCHES.fetch_add(1, Ordering::Relaxed) + 1;
+                if n == 1 || n % 500 == 0 {
+                    log::warn!(
+                        "media.source_app.mismatch dropped {n} frame(s) from \
+                         peer={} — src_app_id={} expected={} (ns={namespace} \
+                         name={name})",
+                        veil_util::bytes_to_hex(&src_node_id[..4]),
+                        veil_util::bytes_to_hex(&src_app_id[..8]),
+                        veil_util::bytes_to_hex(&expected[..8]),
+                    );
+                }
                 continue;
             }
             media::dispatch_inbound_auto(src_node_id, &data);
