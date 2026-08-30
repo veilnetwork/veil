@@ -158,8 +158,14 @@ impl BuiltinAppHost {
         // Tokio's JoinHandle::await never panics — it returns
         // JoinError if the task panicked, which we log and discard.
         let tasks = std::mem::take(&mut self.tasks);
-        for h in tasks {
-            match tokio::time::timeout(std::time::Duration::from_secs(2), h).await {
+        for mut h in tasks {
+            // `&mut h`, not `h`: passing the handle by value gives it to the
+            // timeout, which drops it on expiry — and dropping a `JoinHandle`
+            // DETACHES the task, it does not abort it. The comment here used to
+            // say the opposite, and a service that ignored the shutdown signal
+            // outlived the shutdown that reported it gone, still holding its
+            // endpoints (report18 V18-M9).
+            match tokio::time::timeout(std::time::Duration::from_secs(2), &mut h).await {
                 Ok(Ok(())) => {}
                 Ok(Err(e)) if e.is_panic() => {
                     log::warn!("builtin-app: service panicked during shutdown: {e}");
@@ -169,8 +175,10 @@ impl BuiltinAppHost {
                 }
                 Err(_) => {
                     log::warn!("builtin-app: service did not exit within 2s — aborting");
-                    // Timeout dropped the JoinHandle; tokio aborts
-                    // the task on drop.
+                    h.abort();
+                    // Awaited, so "aborted" is a fact by the time this returns
+                    // rather than a request that has been made.
+                    let _ = h.await;
                 }
             }
         }
@@ -224,6 +232,49 @@ mod tests {
 
     fn fresh() -> (BuiltinAppHost, Arc<AppEndpointRegistry>) {
         (BuiltinAppHost::new(), Arc::new(AppEndpointRegistry::new()))
+    }
+
+    /// A service that ignores the signal is stopped, not merely let go of.
+    ///
+    /// `shutdown` waited on each task with `timeout(2s, handle)` — by VALUE, so
+    /// the timeout owned the handle and dropped it on expiry. Dropping a
+    /// `JoinHandle` DETACHES the task; only `abort()` stops it. So a service
+    /// that never noticed the shutdown signal kept running, holding its
+    /// endpoints, after the host reported the shutdown complete — and the
+    /// comment in that arm said the opposite (report18 V18-M9).
+    ///
+    /// The guard is an `Arc` the task owns: when it is really gone, the count
+    /// falls back to one. This waits out the real two-second grace — tokio's
+    /// paused clock needs the `test-util` feature, and turning that on for the
+    /// whole crate to save two seconds in one test is the wrong trade.
+    #[tokio::test]
+    async fn a_service_that_ignores_shutdown_is_aborted_not_detached() {
+        let (mut host, reg) = fresh();
+        let ctx = host.make_context([0u8; 32], Arc::clone(&reg));
+        let alive = Arc::new(());
+        let held = Arc::clone(&alive);
+        host.spawn(
+            ctx,
+            ServiceSpec {
+                name: "deaf",
+                app_id: [2u8; 32],
+                endpoints: vec![],
+            },
+            move |_ctx, _rxs| async move {
+                let _guard = held;
+                // Never returns, and never looks at `ctx.shutdown`.
+                std::future::pending::<()>().await;
+            },
+        );
+        assert_eq!(host.task_count(), 1);
+
+        host.shutdown().await;
+
+        assert_eq!(
+            Arc::strong_count(&alive),
+            1,
+            "the service outlived the shutdown that reported it gone"
+        );
     }
 
     #[tokio::test]
