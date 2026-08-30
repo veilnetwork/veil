@@ -389,6 +389,21 @@ struct Entry {
     /// before deriving anything. On the side that accepted it starts at 0 and
     /// is filled the first time the peer's certificate is in hand.
     authenticated_until: u64,
+    /// Was this conversation EVER vouched for, whatever the stamp says now?
+    ///
+    /// Separate from the stamp because the two answer different questions and
+    /// one blob shape can only carry one of them. A build older than the stamp
+    /// wrote a bare bit: "proven once, cannot say for how long". Restoring
+    /// that as `authenticated_until = 0` is right and is what stops a bit
+    /// outliving a revocation — but it also made [`Self::ever_proven`] false,
+    /// and that is the question EVICTION asks. So an upgrade turned a proven
+    /// conversation into a droppable one, and the doc on `ever_proven` says in
+    /// as many words that this must not happen (report18 V18-H1).
+    ///
+    /// Costs nothing in the format: the byte this is written to is the same
+    /// one the bit was always written to, so an older reader sees what it
+    /// always saw.
+    proven_before: bool,
     /// The PQXDH prologue to re-attach to outgoing frames until the peer
     /// answers. `None` once anything of theirs has opened.
     pending_prologue: Option<Vec<u8>>,
@@ -450,7 +465,7 @@ impl Entry {
     /// may take — that would turn every expiry into an opening for a stranger.
     /// What expiry costs is standing, not the session.
     fn ever_proven(&self) -> bool {
-        self.authenticated_until != 0
+        self.authenticated_until != 0 || self.proven_before
     }
 
     fn droppable(&self) -> bool {
@@ -469,7 +484,7 @@ impl Entry {
         // evidence" — a build that predates the stamp reads this file and gets
         // the same answer it always did. The stamp itself is APPENDED, so an
         // older reader stops where it always stopped.
-        out.push(u8::from(self.authenticated_until != 0));
+        out.push(u8::from(self.ever_proven()));
         out.extend_from_slice(&self.last_used_at.to_be_bytes());
         match &self.pending_prologue {
             Some(p) => {
@@ -546,10 +561,7 @@ impl Entry {
         // here and the trailing-bytes check below can read it.
         let stamp = take(8).ok().map(<[u8; 8]>::try_from);
         let authenticated_until = match stamp {
-            None => {
-                let _ = ever_authenticated;
-                0
-            }
+            None => 0,
             Some(Ok(bytes)) => u64::from_be_bytes(bytes),
             Some(Err(_)) => {
                 return Err(RatchetSpliceError::Malformed("authorization stamp"));
@@ -564,6 +576,7 @@ impl Entry {
             session,
             peer_ik,
             authenticated_until,
+            proven_before: ever_authenticated,
             pending_prologue,
             last_used_at,
             // Never encoded: a restart forgives a wedged conversation anyway.
@@ -1291,6 +1304,9 @@ fn seal_inner(
                     // caller verified — proven from the reply on, and only for
                     // as long as that certificate is good for.
                     authenticated_until: peer.authorized_until_unix,
+                    // A fresh conversation is proven exactly as far as its
+                    // stamp says; nothing older is being restored here.
+                    proven_before: false,
                     pending_prologue: Some(blob[..PQXDH_PROLOGUE_LEN].to_vec()),
                     last_used_at: now_unix,
                     frame_failures: 0,
@@ -1628,6 +1644,7 @@ fn open_inner(
                             session,
                             peer_ik,
                             authenticated_until,
+                            proven_before: false,
                             pending_prologue: None,
                             last_used_at: now_unix,
                             frame_failures: 0,
@@ -2170,6 +2187,57 @@ mod tests {
         assert!(
             !restored.is_authenticated(NOW),
             "the peer is shown as proven on the strength of a bit"
+        );
+    }
+
+    /// A bare bit is not proof of standing, and it is still proof of history.
+    ///
+    /// The migration answered the first question and, by answering it with the
+    /// same field, answered the second one too: `ever_proven` was derived from
+    /// the stamp, so a conversation restored from an older blob came back
+    /// droppable. That is exactly what the doc on `ever_proven` forbids — a
+    /// conversation whose evidence has merely gone stale must not become a
+    /// slot an inbound prologue may take — and an upgrade is the one moment
+    /// when every conversation on the device is in that state at once
+    /// (report18 V18-H1).
+    #[test]
+    fn a_legacy_bit_costs_standing_and_not_the_conversation() {
+        let a = device(5);
+        let b = device(6);
+        let (ek, pk) = (b.ek(), b.ratchet_pk());
+        seal(&a.store, &a.me(), keys(&b, &ek, &pk), b"x", NOW).expect("seal");
+        let blob = {
+            let mut g = a.store.lock();
+            let entry = g.entries.values_mut().next().expect("entry");
+            entry.authenticated_until = NOW + 500;
+            entry.encode()
+        };
+
+        let older = &blob[..blob.len() - 8];
+        assert_eq!(older[4 + 1 + 32], 1, "premise: the bit says proven");
+        let restored = Entry::decode(older).expect("an older blob still loads");
+
+        assert_eq!(
+            restored.authenticated_until, 0,
+            "a bit with no expiry was restored as standing"
+        );
+        assert!(!restored.is_authenticated(NOW), "shown as proven on a bit");
+        assert!(
+            restored.ever_proven(),
+            "an upgrade forgot that this conversation was ever vouched for"
+        );
+        assert!(
+            !restored.droppable(),
+            "an upgrade made a proven conversation a slot a stranger may take"
+        );
+
+        // And it survives being written down again, or the next save undoes
+        // the migration.
+        let again = Entry::decode(&restored.encode()).expect("round trip");
+        assert!(again.ever_proven(), "re-encoding dropped the history");
+        assert!(
+            !again.is_authenticated(NOW),
+            "re-encoding invented standing"
         );
     }
 
@@ -4047,6 +4115,12 @@ mod tests {
             };
             key.peer_node_id[..8].copy_from_slice(&(i as u64).to_be_bytes());
             let mut entry = Entry::decode(&blob).expect("decode");
+            // Said outright rather than implied by a zero stamp. The blob this
+            // is cut from belongs to a conversation that WAS proven, so its
+            // history bit is set; zeroing the stamp alone now describes a
+            // conversation restored from an older build, which is a different
+            // thing and deliberately not droppable.
+            entry.proven_before = false;
             entry.authenticated_until = if authenticated { u64::MAX } else { 0 };
             entry.pending_prologue = None;
             entry.last_used_at = stamp;
