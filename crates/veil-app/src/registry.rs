@@ -199,6 +199,16 @@ struct EndpointSlot {
 struct RegistryInner {
     endpoints: HashMap<EndpointKey, EndpointSlot>,
     next_generation: EndpointGen,
+    /// How many messages have been dropped for an endpoint nobody registered,
+    /// per key. See the `else` branch of [`AppRegistry::send_to`]: that case
+    /// used to be a bare `false` — the only one of the three failure modes
+    /// that said nothing at all, while "channel full" and "channel closed"
+    /// both warn.
+    ///
+    /// Counted rather than logged every time: real-time media arrives around
+    /// fifty frames a second, and an unthrottled warning would bury the log it
+    /// is meant to explain.
+    unroutable: HashMap<EndpointKey, u64>,
 }
 
 impl AppEndpointRegistry {
@@ -502,6 +512,25 @@ impl AppEndpointRegistry {
                 }
             }
         } else {
+            // NOT REGISTERED. This is where inbound media went to die: the
+            // node received the frames, had no endpoint to hand them to, and
+            // dropped them without a word — so the engine reported
+            // `packets_received=0` and every layer above it looked healthy
+            // while sending worked perfectly, because sending needs no
+            // registration (report19 follow-up, 2026-08-30).
+            let mut inner = inner;
+            let seen = inner.unroutable.entry(key).or_insert(0);
+            *seen += 1;
+            let count = *seen;
+            if count == 1 || count % 500 == 0 {
+                log::warn!(
+                    "app_endpoint: NO ENDPOINT — dropped {count} message(s) for \
+                     app_id={} endpoint_id={}; nothing is registered to receive \
+                     them",
+                    veil_util::bytes_to_hex(&key.app_id),
+                    key.endpoint_id,
+                );
+            }
             false
         }
     }
