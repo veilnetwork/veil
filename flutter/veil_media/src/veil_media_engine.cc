@@ -1242,12 +1242,42 @@ void run_on_adm_thread(std::function<void()> fn) { fn(); }
 // So take the output the person means by "my output" — the one their browser
 // uses — and keep the communications default only as a fallback. Whoever wants
 // the other one has the picker.
+// What the person CHOSE, if they chose anything.
+//
+// Every start reset the device to a default. So the picker worked exactly
+// once: mute and unmute, or any restart of the stream, and the call went back
+// to whatever Windows nominates — silently, because a reset looks like a
+// successful start (report19 V19-M2).
+//
+// Indices, not names, because that is what the ADM takes, and -1 for "nobody
+// has said". Only ever touched on the ADM thread, which is where both the
+// selection and the starts below run, so no lock is needed. One value rather
+// than one per engine: the device holds one call at a time — that exclusion is
+// what the call slot exists for — and the choice belongs to the person, not to
+// the call they happened to make it during.
+int g_chosen_playout = -1;
+int g_chosen_recording = -1;
+
 void start_playout(webrtc::AudioDeviceModule* adm) {
   if (adm == nullptr) return;
   int32_t set_rc = 0, init_rc = 0, start_rc = 0;
   run_on_adm_thread([&] {
 #if defined(_WIN32)
-    set_rc = adm->SetPlayoutDevice(webrtc::AudioDeviceModule::kDefaultDevice);
+    set_rc = -1;
+    if (g_chosen_playout >= 0) {
+      set_rc = adm->SetPlayoutDevice(
+          static_cast<uint16_t>(g_chosen_playout));
+      if (set_rc != 0) {
+        // The chosen device is gone — unplugged between the choice and this
+        // start. Fall through to the defaults rather than refusing to play.
+        vlog("adm start: chosen playout device %d is unavailable (rc=%d)",
+             g_chosen_playout, (int)set_rc);
+        g_chosen_playout = -1;
+      }
+    }
+    if (set_rc != 0) {
+      set_rc = adm->SetPlayoutDevice(webrtc::AudioDeviceModule::kDefaultDevice);
+    }
     if (set_rc != 0) {
       set_rc = adm->SetPlayoutDevice(
           webrtc::AudioDeviceModule::kDefaultCommunicationDevice);
@@ -1282,8 +1312,20 @@ bool start_capture(webrtc::AudioDeviceModule* adm, const char* who) {
   int32_t set_rc = 0, init_rc = 0, start_rc = 0;
   run_on_adm_thread([&] {
 #if defined(_WIN32)
-    set_rc = adm->SetRecordingDevice(
-        webrtc::AudioDeviceModule::kDefaultCommunicationDevice);
+    set_rc = -1;
+    if (g_chosen_recording >= 0) {
+      set_rc = adm->SetRecordingDevice(
+          static_cast<uint16_t>(g_chosen_recording));
+      if (set_rc != 0) {
+        vlog("%s: chosen recording device %d is unavailable (rc=%d)", who,
+             g_chosen_recording, (int)set_rc);
+        g_chosen_recording = -1;
+      }
+    }
+    if (set_rc != 0) {
+      set_rc = adm->SetRecordingDevice(
+          webrtc::AudioDeviceModule::kDefaultCommunicationDevice);
+    }
     if (set_rc != 0) {
       set_rc =
           adm->SetRecordingDevice(webrtc::AudioDeviceModule::kDefaultDevice);
@@ -2946,6 +2988,8 @@ int veil_media_engine_select_audio_input(VeilMediaEngine* engine,
       ok = false;
       return;
     }
+    // Remembered, so the next start does not undo it.
+    g_chosen_recording = idx;
     adm->InitRecording();
     if (was_recording) adm->StartRecording();
   });
@@ -2969,6 +3013,7 @@ int veil_media_engine_select_audio_output(VeilMediaEngine* engine,
       ok = false;
       return;
     }
+    g_chosen_playout = idx;
     adm->InitPlayout();
     if (was_playing) adm->StartPlayout();
   });
