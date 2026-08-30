@@ -76,6 +76,15 @@ jobs:
         # `#[allow(…)]`-d with a rationale comment before merge.
         run: cargo clippy --workspace --all-targets -- -D warnings
 
+      - name: The triggers name a branch that exists
+        # Also in pr-hygiene, and it has to be in both: that workflow stopped
+        # running on main when this one started, so leaving the check only
+        # there would have taken it off the branch the work lands on — which
+        # is the exact question it asks (report19 V19-L1).
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: ./scripts/check-workflow-branches.sh
+
       - name: cargo check (cfg-warnings deny)
         # Audit batch 2026-05-21 Phase E19: catch `unexpected_cfgs`
         # warnings (e.g. references to features that have not been
@@ -157,7 +166,12 @@ jobs:
         # workspace -- including the six crates that asked for neither. That
         # was invisible until an arm64 Windows host tried to compile pqclean's
         # aarch64 NEON sources with MSVC, which rejects them outright.
-        run: ./scripts/check-falcon-features.sh
+        run: |
+          # The classifier first, against its own fixtures: it decides which
+          # target sections are an excuse, and a wrong answer there is a guard
+          # that passes the one manifest that must not pass.
+          ./scripts/check-falcon-features.sh --self-test
+          ./scripts/check-falcon-features.sh
 
       - name: Native media diagnostics are explicit opt-in
         run: |

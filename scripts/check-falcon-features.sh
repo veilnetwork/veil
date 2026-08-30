@@ -34,6 +34,72 @@ from pathlib import Path
 
 CRATE = "pqcrypto-falcon"
 
+
+DANGEROUS_TRIPLE = "aarch64-pc-windows-msvc"
+
+
+def excludes_arm64_msvc(section: str) -> bool:
+    """Can this `[target...]` header NOT match aarch64-pc-windows-msvc?
+
+    Two shapes are provable, and nothing else is assumed safe:
+
+      * an explicit triple that is not the dangerous one —
+        `[target.x86_64-unknown-linux-gnu.dependencies]`;
+      * a cfg that is a NOT over something naming both the architecture and
+        the environment —
+        `[target.'cfg(not(all(target_arch = "aarch64", target_env = "msvc")))'...]`.
+
+    A bare `cfg(target_arch = "aarch64")` is neither: it MATCHES the dangerous
+    target, which is the whole point.
+    """
+    if not section.startswith("[target."):
+        return False
+    inner = section[len("[target."):].rstrip("]")
+    for suffix in (".dependencies", ".dev-dependencies", ".build-dependencies"):
+        if inner.endswith(suffix):
+            inner = inner[: -len(suffix)]
+    inner = inner.strip().strip("'\"")
+    if not inner.startswith("cfg("):
+        # An explicit target triple.
+        return inner != DANGEROUS_TRIPLE
+    # Searched in the WHOLE header, not in a `cfg(...)` body carved out with
+    # rstrip(")"): that strips the closing paren of the `not(...)` too, and the
+    # pattern below then matches nothing — the self-test caught exactly that.
+    negations = re.findall(r"not\s*\((.*)\)", inner, re.S)
+    return any(
+        "aarch64" in negated and "msvc" in negated for negated in negations
+    )
+
+
+def _self_test() -> int:
+    """Fixtures, because a classifier nobody exercises is a guess."""
+    cases = [
+        ('[target.\'cfg(not(all(target_arch = "aarch64", target_env = "msvc")))\'.dependencies]', True),
+        ('[target.\'cfg(all(target_arch = "aarch64", target_env = "msvc"))\'.dependencies]', False),
+        ('[target.\'cfg(target_arch = "aarch64")\'.dependencies]', False),
+        ('[target.\'cfg(windows)\'.dependencies]', False),
+        ("[target.x86_64-unknown-linux-gnu.dependencies]", True),
+        ("[target.aarch64-pc-windows-msvc.dependencies]", False),
+        ("[dependencies]", False),
+    ]
+    bad = [
+        (section, excludes_arm64_msvc(section), want)
+        for section, want in cases
+        if excludes_arm64_msvc(section) != want
+    ]
+    for section, got, want in bad:
+        print(f"  {section} -> {got}, expected {want}", file=sys.stderr)
+    if bad:
+        print("the target-section classifier is wrong", file=sys.stderr)
+        return 1
+    print(f"target-section classifier: OK ({len(cases)} fixtures)")
+    return 0
+
+
+if "--self-test" in sys.argv:
+    sys.exit(_self_test())
+
+
 sites = 0
 violations = []
 
@@ -56,9 +122,12 @@ for manifest in sorted(Path(".").rglob("Cargo.toml")):
             continue
         sites += 1
 
-        # A target table that cannot match aarch64-msvc is free to use the
-        # optimised sources: that is the whole point of narrowing it there.
-        narrowed = section.startswith("[target.") and "aarch64" in section
+        # A target table is only an excuse if it CANNOT match the target that
+        # breaks. `"aarch64" in section` said the opposite of what it meant:
+        # `cfg(target_arch = "aarch64")` contains the word and matches
+        # aarch64-pc-windows-msvc exactly, so the one section that must never
+        # take the defaults was the one this called safe (report19 V19-L2).
+        narrowed = excludes_arm64_msvc(section)
         disabled = "default-features" in line and "false" in line
         if not (narrowed or disabled):
             violations.append(f"{manifest}:{lineno}: {line}")
