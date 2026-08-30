@@ -1,5 +1,38 @@
 # Changelog
 
+## v0.8.5 — 2026-08-30
+
+One fix, from the report18 audit, and it is about what an upgrade quietly
+forgets.
+
+**A bare authorization bit costs standing, not the conversation.** A build
+older than the authorization stamp wrote a single bit: this peer was proven
+once, and it cannot say for how long. Restoring that as `authenticated_until =
+0` is right, and it is what stops a bit outliving a revocation — the test that
+pins it says so and still does.
+
+But `ever_proven()` was derived from that same field, and `ever_proven` is the
+question EVICTION asks. So the migration also answered a question nobody meant
+to answer: a conversation that had been vouched for came back **droppable**.
+The documentation on `ever_proven` says in as many words that this must not
+happen — a conversation whose evidence has merely gone stale still decrypts,
+still belongs to the peer it was agreed with, and must not become a slot an
+inbound prologue may take — and an upgrade is the one moment when every
+conversation on the device is in that state at once. Under TTL or quota
+pressure the proven session is dropped, the peer no longer attaches a
+recoverable prologue, and the channel has no way back.
+
+So the two questions get two fields. The history bit goes into
+`proven_before`, restored from the byte the legacy blob already carried and
+written back to that same byte: **no format change**, and an older reader sees
+exactly what it always saw. Standing still comes from the stamp alone.
+
+One test fixture had to say what it means. `plant` made an "unproven"
+conversation by zeroing the stamp of a blob cut from a proven one — which under
+these semantics is precisely a migrated legacy conversation, and deliberately
+not droppable. It now clears the history bit too, so the five eviction tests
+keep testing eviction.
+
 ## v0.8.4 — 2026-08-28
 
 One fix, and it is why mail deposited for an offline peer never reached them.
