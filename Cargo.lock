@@ -4573,6 +4573,7 @@ dependencies = [
  "veil-invite",
  "veil-ipc",
  "veil-mailbox",
+ "veil-mainline",
  "veil-node-runtime",
  "veil-obfs4",
  "veil-observability",
