@@ -1828,6 +1828,176 @@ impl NodeRuntime {
     /// cache fallbacks are deliberately skipped here because they're
     /// discovery mechanisms for *initial* bootstrap; they belong in startup,
     /// not in steady-state partition recovery.
+    /// Bootstrap layer 6: look for peers on the local network, and tell it we
+    /// are here.
+    ///
+    /// Off unless `global.local_discovery` says otherwise, and that default is
+    /// the point rather than caution — announcing tells whatever network this
+    /// machine is plugged into that a machine on it runs veil, and only the
+    /// person at the keyboard knows whose network that is.
+    ///
+    /// Unlike the DNS and HTTPS layers this one does not stop after a first
+    /// answer: a laptop that joins a LAN an hour after boot should still find
+    /// the node that was already there, and the node already there should hear
+    /// the laptop. It runs for the life of the node, capped at
+    /// [`MAX_LAN_PEERS`] contributions so a talkative neighbour cannot fill
+    /// the peer table by itself.
+    pub fn spawn_lan_discovery_task(&mut self, config: &veil_cfg::Config) {
+        if !config.global.local_discovery {
+            return;
+        }
+        let my_pubkey = self.identity.local_identity.public_key.clone();
+        let Some(announce) =
+            lan_announce_for(config, &my_pubkey, &self.identity.local_identity.nonce)
+        else {
+            self.logger.info(
+                "lan_discovery.nothing_to_say",
+                "local discovery is on, but no listener is reachable from the \
+                 wire: nothing was announced",
+            );
+            return;
+        };
+
+        let logger = self.logger.clone();
+        let state = Arc::clone(&self.state);
+        let dht = Arc::clone(&self.dht);
+        let access = self.access();
+        let shutdown_tx = self.shutdown_tx.clone();
+        let tasks = Arc::clone(&self.tasks);
+
+        let handle = supervised_spawn(Arc::clone(&self.logger), "lan_discovery", async move {
+            let discovery = match veil_bootstrap::LanDiscovery::bind(announce).await {
+                Ok(d) => d,
+                Err(e) => {
+                    // A host with no multicast-capable interface, or a port
+                    // held by something that refuses to share it. Neither is
+                    // this node's fault and neither should end its startup.
+                    logger.warn(
+                        "lan_discovery.bind_failed",
+                        format!("local discovery is off for this run: {e}"),
+                    );
+                    return;
+                }
+            };
+            logger.info(
+                "lan_discovery.listening",
+                format!(
+                    "announcing on the local network: a few times in the first \
+                     minute, then every {}s",
+                    veil_bootstrap::DEFAULT_ANNOUNCE_INTERVAL.as_secs()
+                ),
+            );
+
+            // The loop is driven HERE rather than inside veil-bootstrap. A
+            // driver spawned from in there would be owned by a `JoinHandle`,
+            // and a handle dropped when this task is aborted DETACHES rather
+            // than aborting -- which is how a socket outlives the node that
+            // opened it. Aborting this one task stops everything.
+            let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+            let mut capped_logged = false;
+            let mut sent: u32 = 0;
+            // Absolute deadlines rather than a repeating timer: the receive
+            // branch runs between them, and an absolute deadline cannot drift
+            // however long a datagram takes to handle.
+            let mut next_announce = tokio::time::Instant::now();
+            loop {
+                let bp = tokio::select! {
+                    _ = tokio::time::sleep_until(next_announce) => {
+                        if let Err(e) = discovery.announce_once().await {
+                            // A LAN that will not take a multicast datagram is
+                            // an ordinary state (no route, interface down, a
+                            // laptop with the lid shut). It must not end the
+                            // layer -- the next tick may find the wire back.
+                            logger.debug(
+                                "lan_discovery.announce_failed",
+                                format!("{e}"),
+                            );
+                        }
+                        sent = sent.saturating_add(1);
+                        next_announce =
+                            tokio::time::Instant::now() + veil_bootstrap::announce_delay(sent);
+                        continue;
+                    }
+                    heard = discovery.recv_peer() => match heard {
+                        Ok(Some(bp)) => bp,
+                        Ok(None) => continue,
+                        Err(e) => {
+                            logger.warn(
+                                "lan_discovery.recv_failed",
+                                format!("local discovery is off for this run: {e}"),
+                            );
+                            return;
+                        }
+                    },
+                };
+
+                if !admit_lan_peer(&bp.public_key, &my_pubkey, &seen) {
+                    // Said once, at the ceiling, and then not again: the whole
+                    // point of a cap is that the log does not grow with the
+                    // thing it is capping.
+                    if seen.len() >= MAX_LAN_PEERS && !capped_logged {
+                        capped_logged = true;
+                        logger.warn(
+                            "lan_discovery.capped",
+                            format!(
+                                "already took {MAX_LAN_PEERS} peer(s) from this \
+                                 network; ignoring further announces"
+                            ),
+                        );
+                    }
+                    continue;
+                }
+                seen.insert(bp.public_key.clone());
+                let Some(node_id_bytes) = derive_node_id_from_bootstrap_peer(&bp) else {
+                    continue;
+                };
+                let hex = veil_util::hex_str(&node_id_bytes);
+                let Ok(node_id) = <veil_cfg::NodeId as std::str::FromStr>::from_str(&hex) else {
+                    continue;
+                };
+                logger.info(
+                    "lan_discovery.found",
+                    format!(
+                        "a peer on the local network: {} at {}",
+                        &hex[..16],
+                        bp.transport
+                    ),
+                );
+
+                dht.add_contact(veil_dht::routing::Contact::new(
+                    node_id_bytes,
+                    &bp.transport,
+                ));
+
+                // Its own PeerId range. The other bootstrap sources share
+                // 0x8000_0000 because they are mutually exclusive within
+                // `spawn_bootstrap_task`; this one runs alongside all of them,
+                // so reusing that base would overwrite their entries.
+                let peer_id = PeerId::new(0x9000_0000u32.wrapping_add(seen.len() as u32));
+                let entry = PeerConfigEntry {
+                    peer_id,
+                    node_id,
+                    public_key: bp.public_key.clone(),
+                    nonce: bp.nonce.clone(),
+                    transport: bp.transport.clone(),
+                    algo: bp.algo,
+                    tls_cert: bp.tls_cert.clone(),
+                    tls_key: None,
+                    tls_ca_cert: bp.tls_ca_cert.clone(),
+                    bootstrap_only: true,
+                    source: crate::types::PeerSource::Bootstrap,
+                };
+                lock_state(&state).peers.insert(peer_id, entry.clone());
+                if let Some(ref stx) = shutdown_tx {
+                    let handles =
+                        crate::outbound_connector::spawn_outbound_peers(vec![entry], &access, stx);
+                    lock_tasks(&tasks).sessions.extend(handles);
+                }
+            }
+        });
+        lock_tasks(&self.tasks).sessions.push(handle);
+    }
+
     pub fn spawn_bootstrap_watchdog_task(&mut self, config: &veil_cfg::Config) {
         let Some(shutdown_tx) = &self.shutdown_tx else {
             return;
@@ -5274,6 +5444,94 @@ pub fn builtin_seed_contribution(
     }
 }
 
+/// How many peers one LAN may contribute before this node stops listening to it.
+///
+/// Anyone on the segment can announce, and an announce is cheap: without a
+/// ceiling a single machine could fill this node's peer table with entries of
+/// its choosing simply by talking. Smaller than the per-source cap for the
+/// other layers because a LAN is a smaller place — a home or office segment
+/// with eight veil nodes on it is already unusual.
+const MAX_LAN_PEERS: usize = 8;
+
+/// Whether to take a peer heard on the LAN, given who has already been taken.
+///
+/// Separate from the loop because the bound is the part worth testing, and the
+/// bound is the part that was wrong: recording the announcer BEFORE checking
+/// the ceiling meant a neighbour rotating keys grew this set forever while
+/// none of those peers was ever attached. `taken` is only ever added to here,
+/// so a cap enforced here is a cap on its size.
+///
+/// Returns `false` for our own announce, for one already taken, and for
+/// anything past the ceiling.
+pub fn admit_lan_peer(
+    public_key: &str,
+    my_pubkey: &str,
+    taken: &std::collections::HashSet<String>,
+) -> bool {
+    public_key != my_pubkey && !taken.contains(public_key) && taken.len() < MAX_LAN_PEERS
+}
+
+/// What this node should say about itself on the local network, or `None` when
+/// it has nothing a neighbour could dial.
+///
+/// The listener it picks is the one it would advertise anyway: `advertise`
+/// when the operator set it (that field exists precisely because the bind
+/// address and the reachable address differ behind a proxy), otherwise
+/// `transport`. A listener bound to loopback with no override is skipped — a
+/// neighbour that dialled it would reach its own machine, and an announce that
+/// can only fail is worse than silence.
+pub fn lan_announce_for(
+    config: &veil_cfg::Config,
+    identity_public_key: &str,
+    identity_nonce: &str,
+) -> Option<veil_bootstrap::LanAnnounce> {
+    use base64::Engine as _;
+    let b64 = base64::engine::general_purpose::STANDARD;
+
+    let public_key: [u8; 32] = b64.decode(identity_public_key).ok()?.try_into().ok()?;
+    let pow_nonce: [u8; 4] = b64.decode(identity_nonce).ok()?.try_into().ok()?;
+
+    for listener in &config.listen {
+        let uri = listener.advertise.as_deref().unwrap_or(&listener.transport);
+        let Some((scheme_str, rest)) = uri.split_once("://") else {
+            continue;
+        };
+        let Some(scheme) = veil_bootstrap::LanScheme::ALL
+            .iter()
+            .copied()
+            .find(|s| s.uri_scheme() == scheme_str)
+        else {
+            continue;
+        };
+        // Authority ends at the path, if any: `ws://host:port/veil`.
+        let authority = rest.split('/').next().unwrap_or(rest);
+        let (host, port_str) = authority.rsplit_once(':')?;
+        let Ok(port) = port_str.parse::<u16>() else {
+            continue;
+        };
+        if port == 0 {
+            continue;
+        }
+        // A loopback bind the operator did not override is not reachable from
+        // the wire, and saying otherwise wastes a neighbour's dial.
+        let host = host.trim_start_matches('[').trim_end_matches(']');
+        if listener.advertise.is_none()
+            && host
+                .parse::<std::net::IpAddr>()
+                .is_ok_and(|ip| ip.is_loopback())
+        {
+            continue;
+        }
+        return Some(veil_bootstrap::LanAnnounce {
+            public_key,
+            pow_nonce,
+            port,
+            scheme,
+        });
+    }
+    None
+}
+
 /// Every bootstrap peer this node may dial: the operator's `[[bootstrap_peers]]`
 /// plus whatever the builtin-seed policy contributes, self dropped and
 /// deduplicated by public key (operator-curated entries win the position).
@@ -5891,6 +6149,141 @@ mod tests {
     // blocked the operator's answer is to name other hosts — but naming them
     // used to switch the seeds OFF, so the node swapped one single point of
     // failure for another. These pin the policy that lets it hold both.
+
+    fn listener(uri: &str, advertise: Option<&str>) -> veil_cfg::ListenConfig {
+        veil_cfg::ListenConfig {
+            id: crate::types::ListenId::new(1),
+            transport: uri.to_owned(),
+            advertise: advertise.map(str::to_owned),
+            tls_cert: None,
+            tls_key: None,
+            tls_ca_cert: None,
+            relay: None,
+            ..Default::default()
+        }
+    }
+
+    /// A 32-byte key and 4-byte nonce, base64, as the identity carries them.
+    fn identity_b64() -> (String, String) {
+        use base64::Engine as _;
+        let b64 = base64::engine::general_purpose::STANDARD;
+        (b64.encode([7u8; 32]), b64.encode([1u8, 2, 3, 4]))
+    }
+
+    fn announce_for_listeners(
+        listeners: Vec<veil_cfg::ListenConfig>,
+    ) -> Option<veil_bootstrap::LanAnnounce> {
+        let (key, nonce) = identity_b64();
+        let mut c = veil_cfg::Config::default();
+        c.listen = listeners;
+        lan_announce_for(&c, &key, &nonce)
+    }
+
+    #[test]
+    fn a_talkative_neighbour_cannot_grow_this_nodes_memory_without_bound() {
+        // The defect this closes was mine: the announcer was recorded BEFORE
+        // the ceiling was checked, so somebody rotating keys on the segment
+        // grew the set forever while none of those peers was ever attached.
+        // The set is what the cap has to bound, not the attach count.
+        let mut taken: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for i in 0..1000 {
+            let key = format!("neighbour-{i}");
+            if admit_lan_peer(&key, "ME", &taken) {
+                taken.insert(key);
+            }
+        }
+        assert_eq!(
+            taken.len(),
+            MAX_LAN_PEERS,
+            "the set a LAN can grow is not bounded by the cap"
+        );
+    }
+
+    #[test]
+    fn we_do_not_take_ourselves_or_the_same_neighbour_twice() {
+        let mut taken: std::collections::HashSet<String> = std::collections::HashSet::new();
+        assert!(
+            !admit_lan_peer("ME", "ME", &taken),
+            "a node took its own announce"
+        );
+        assert!(admit_lan_peer("THEM", "ME", &taken));
+        taken.insert("THEM".to_owned());
+        assert!(
+            !admit_lan_peer("THEM", "ME", &taken),
+            "the same neighbour was taken twice, which spawns a second connector"
+        );
+        // Vacuity: with the ceiling not yet reached, a NEW key is still taken —
+        // otherwise the two assertions above would pass on a function that
+        // refuses everything.
+        assert!(admit_lan_peer("SOMEBODY-ELSE", "ME", &taken));
+    }
+
+    #[test]
+    fn what_we_tell_the_lan_is_a_listener_a_neighbour_could_actually_dial() {
+        let a = announce_for_listeners(vec![listener("obfs4-tcp://0.0.0.0:5556", None)])
+            .expect("a bound listener should be announceable");
+        assert_eq!(a.port, 5556);
+        assert_eq!(a.scheme, veil_bootstrap::LanScheme::Obfs4Tcp);
+
+        // A path after the authority is not part of the port.
+        let ws = announce_for_listeners(vec![listener("ws://192.168.1.5:7001/veil", None)])
+            .expect("a ws listener should be announceable");
+        assert_eq!(ws.port, 7001);
+        assert_eq!(ws.scheme, veil_bootstrap::LanScheme::Ws);
+    }
+
+    #[test]
+    fn a_loopback_listener_is_not_offered_to_the_wire() {
+        // A neighbour dialling 127.0.0.1 reaches its own machine. Announcing
+        // it costs somebody else a failed dial and tells them nothing.
+        assert!(
+            announce_for_listeners(vec![listener("tcp://127.0.0.1:5556", None)]).is_none(),
+            "a loopback-only listener was announced"
+        );
+        // Unless the operator said otherwise: `advertise` exists for exactly
+        // the case where the bind address and the reachable one differ.
+        let a = announce_for_listeners(vec![listener(
+            "tcp://127.0.0.1:5556",
+            Some("tcp://192.168.1.5:443"),
+        )])
+        .expect("an advertised address should win over the bind address");
+        assert_eq!(a.port, 443, "the advertised port was ignored");
+    }
+
+    #[test]
+    fn a_node_with_nothing_dialable_says_nothing() {
+        assert!(announce_for_listeners(Vec::new()).is_none(), "no listeners");
+        assert!(
+            announce_for_listeners(vec![listener("memory://whatever:1", None)]).is_none(),
+            "a transport the wire format cannot name was announced anyway"
+        );
+        assert!(
+            announce_for_listeners(vec![listener("tcp://0.0.0.0:0", None)]).is_none(),
+            "port 0 is what the kernel assigns, not what a neighbour dials"
+        );
+        // A bad identity is not announceable either, and must not panic.
+        let mut c = veil_cfg::Config::default();
+        c.listen = vec![listener("tcp://0.0.0.0:5556", None)];
+        assert!(lan_announce_for(&c, "not base64!!", "AE1JRw==").is_none());
+        assert!(
+            lan_announce_for(&c, "c2hvcnQ=", "AE1JRw==").is_none(),
+            "a key of the wrong length"
+        );
+    }
+
+    #[test]
+    fn the_first_dialable_listener_wins_and_the_undialable_ones_are_skipped() {
+        // Order matters: a node whose first listener is loopback must still
+        // announce its second, or a common config (localhost admin + public
+        // transport) announces nothing at all.
+        let a = announce_for_listeners(vec![
+            listener("tcp://127.0.0.1:9999", None),
+            listener("memory://x:1", None),
+            listener("obfs4-tcp://0.0.0.0:5556", None),
+        ])
+        .expect("the third listener should have been reached");
+        assert_eq!(a.port, 5556);
+    }
 
     fn config_with(
         bootstrap: Vec<BootstrapPeer>,

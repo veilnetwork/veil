@@ -4,12 +4,15 @@
 //! # Sharing the port
 //!
 //! This binds the port a real BitTorrent client also wants, and that is
-//! deliberate — it is the same group, so it has to be. The bind therefore
-//! asks for address reuse (and port reuse where the platform has it) before
-//! it asks for the port: a node that took 6771 exclusively would break the
-//! user's torrent client, and a machine that suddenly stopped doing LSD the
-//! day veil was installed is a more interesting event than either program on
-//! its own.
+//! deliberate — it is the same group, so it has to be. The bind therefore asks
+//! for `SO_REUSEADDR` before it asks for the port: a node that took 6771
+//! exclusively would break the user's torrent client, and a machine that
+//! suddenly stopped doing LSD the day veil was installed is a more interesting
+//! event than either program on its own.
+//!
+//! `SO_REUSEPORT` goes with it on the platforms that have it, because on BSD
+//! a second bind fails without it — see the note at the bind for what was
+//! measured.
 //!
 //! # What this costs when idle
 //!
@@ -35,7 +38,34 @@ use crate::lan::{
 /// BEP 14 asks clients not to announce more often than every five minutes.
 /// We are a guest on that group; keeping its own manners is both polite and
 /// the least remarkable thing to do.
+///
+/// The loop that uses this lives in the node runtime rather than here, on
+/// purpose: a driver spawned from inside this crate would have to be owned by
+/// somebody, and a `JoinHandle` dropped on shutdown DETACHES rather than
+/// aborting — which is how a socket outlives the node that opened it.
 pub const DEFAULT_ANNOUNCE_INTERVAL: Duration = Duration::from_secs(300);
+
+/// How long to wait before announce number `already_sent`.
+///
+/// Not a flat interval, because a flat one leaves a real gap: a node that
+/// starts six seconds after its neighbour missed that neighbour's only
+/// announce and waits five minutes for the next. Measured, not imagined --
+/// two nodes on this machine, and the second one found nothing for exactly
+/// that reason.
+///
+/// So the first few come quickly and then back off to BEP 14's cadence: a
+/// node joining a quiet LAN is heard within a minute, and a node that has
+/// been up for an hour costs the segment one small datagram every five
+/// minutes.
+pub fn announce_delay(already_sent: u32) -> Duration {
+    match already_sent {
+        0 => Duration::from_secs(0),
+        1 => Duration::from_secs(3),
+        2 => Duration::from_secs(12),
+        3 => Duration::from_secs(45),
+        _ => DEFAULT_ANNOUNCE_INTERVAL,
+    }
+}
 
 /// A bound LAN discovery socket.
 pub struct LanDiscovery {
@@ -60,6 +90,16 @@ impl LanDiscovery {
             Some(socket2::Protocol::UDP),
         )?;
         // Reuse BEFORE bind, or the option does not apply to it.
+        //
+        // Both options, and SO_REUSEPORT is not optional on BSD: measured on
+        // macOS 15, a second bind of this port with SO_REUSEADDR alone fails
+        // with EADDRINUSE, which would mean the second veil node on a host --
+        // or veil beside a torrent client -- simply has no local discovery.
+        //
+        // Fan-out survives it. The worry that SO_REUSEPORT makes the kernel
+        // hand each datagram to ONE socket of the group is real for unicast
+        // UDP on Linux; measured here with two listeners on 0.0.0.0:6771, both
+        // received every datagram.
         sock.set_reuse_address(true)?;
         #[cfg(unix)]
         sock.set_reuse_port(true)?;
@@ -122,45 +162,6 @@ impl LanDiscovery {
         }
         Some(heard.into_bootstrap_peer(from))
     }
-
-    /// Announce on a timer and report what is heard, until the channel is
-    /// dropped.
-    ///
-    /// Returns when the receiver goes away, which is what makes this stoppable:
-    /// the caller drops its end and this returns rather than being aborted
-    /// mid-send.
-    pub async fn run(
-        self,
-        interval: Duration,
-        found: tokio::sync::mpsc::Sender<BootstrapPeer>,
-    ) -> io::Result<()> {
-        let mut ticker = tokio::time::interval(interval);
-        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        loop {
-            tokio::select! {
-                _ = ticker.tick() => {
-                    if let Err(e) = self.announce_once().await {
-                        // A LAN that will not take a multicast datagram is a
-                        // normal state (no route, interface down); it must not
-                        // end the layer.
-                        log::debug!("lan_discovery: announce failed: {e}");
-                    }
-                }
-                heard = self.recv_peer() => {
-                    match heard {
-                        Ok(Some(peer)) => {
-                            if found.send(peer).await.is_err() {
-                                return Ok(());
-                            }
-                        }
-                        Ok(None) => {}
-                        Err(e) => return Err(e),
-                    }
-                }
-                _ = found.closed() => return Ok(()),
-            }
-        }
-    }
 }
 
 #[cfg(test)]
@@ -190,6 +191,46 @@ mod tests {
         // A host with no multicast-capable interface cannot bind this; say so
         // rather than failing, and let the caller decide.
         LanDiscovery::bind(announce(key)).await.ok()
+    }
+
+    #[test]
+    fn the_announce_schedule_starts_quick_and_settles() {
+        // A node joining a quiet LAN has to be heard soon; a node that has been
+        // up for an hour must not keep talking. Both halves, plus the
+        // monotonicity that makes "settles" mean anything.
+        let delays: Vec<Duration> = (0..8).map(announce_delay).collect();
+        assert_eq!(delays[0], Duration::from_secs(0), "the first is immediate");
+        for pair in delays.windows(2) {
+            assert!(
+                pair[1] >= pair[0],
+                "the schedule goes backwards: {:?} then {:?}",
+                pair[0],
+                pair[1]
+            );
+        }
+        assert_eq!(
+            *delays.last().unwrap(),
+            DEFAULT_ANNOUNCE_INTERVAL,
+            "the schedule never settles at the BEP's cadence"
+        );
+        // The early ones have to fit inside a minute, or "heard soon" is not
+        // true and this schedule buys nothing over a flat interval.
+        let early: Duration = delays
+            .iter()
+            .take_while(|d| **d < DEFAULT_ANNOUNCE_INTERVAL)
+            .sum();
+        assert!(
+            early <= Duration::from_secs(60),
+            "the early announces span {early:?}, which is not soon"
+        );
+        assert!(
+            delays
+                .iter()
+                .filter(|d| **d < DEFAULT_ANNOUNCE_INTERVAL)
+                .count()
+                >= 3,
+            "one early announce is not a burst"
+        );
     }
 
     #[tokio::test]
