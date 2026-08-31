@@ -1479,6 +1479,27 @@ pub enum NodeCommand {
     /// domain, and peers cached from previous runs. Answers "if a censor
     /// blocks my known seed IPs tomorrow, what do I fall back to?".
     BootstrapStatus,
+    /// Ask BitTorrent's Mainline DHT who else is at veil's rendezvous.
+    ///
+    /// Runs the lookup this node's bootstrap layer 7 runs, and prints what
+    /// comes back — so an operator can see whether the layer would find
+    /// anybody before trusting it to. Talks to the DHT directly and needs no
+    /// running node.
+    ///
+    /// With `--announce`, also tells the DHT that this machine is reachable at
+    /// the given port. That publishes this machine's address on a public index
+    /// anyone can read: it is the same decision `global.bootstrap` governs,
+    /// and here it is spelled out on the command line so it cannot happen by
+    /// accident.
+    Rendezvous {
+        /// Which network's rendezvous. Production and the testnet are separate
+        /// points on purpose.
+        #[arg(long, default_value = "production")]
+        network: String,
+        /// Announce this machine at this port as well as looking.
+        #[arg(long)]
+        announce: Option<u16>,
+    },
     /// Show the software-update status without touching the network.
     ///
     /// Reports whether updates are configured, the installed release, the

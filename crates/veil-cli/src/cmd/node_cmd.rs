@@ -121,6 +121,9 @@ pub fn handle_node_command<I: CommandIo, O: ConfigOps>(
         NodeCommand::MeshStatus => {
             request_node_command(&mut context, node::AdminCommand::MeshStatus)
         }
+        NodeCommand::Rendezvous { network, announce } => {
+            rendezvous_probe(&mut context, &network, announce)
+        }
         NodeCommand::BootstrapStatus => {
             request_node_command(&mut context, node::AdminCommand::BootstrapStatus)
         }
@@ -174,6 +177,113 @@ pub fn handle_node_command<I: CommandIo, O: ConfigOps>(
             },
         ),
     }
+}
+
+/// Which network a `node rendezvous` argument names.
+///
+/// Its own function so the refusal is testable: a typo that silently fell
+/// through to production would put a testnet operator on the production
+/// rendezvous, which is the one mixing this project has paid for before.
+fn parse_rendezvous_network(name: &str) -> veil_cfg::Result<veil_mainline::rendezvous::Network> {
+    use veil_mainline::rendezvous::Network;
+    match name {
+        "production" => Ok(Network::Production),
+        "testnet" => Ok(Network::Testnet),
+        other => Err(veil_cfg::ConfigError::CommandFailed(format!(
+            "unknown network `{other}` — expected `production` or `testnet`"
+        ))),
+    }
+}
+
+/// Ask the Mainline DHT who is at veil's rendezvous, and optionally say we
+/// are here too.
+///
+/// Runs entirely in this process: no admin socket, no running node. What it
+/// does is what bootstrap layer 7 will do, so an operator can see whether the
+/// layer would find anybody before trusting it to.
+fn rendezvous_probe<I: CommandIo, O: ConfigOps>(
+    context: &mut CommandContext<'_, I, O>,
+    network: &str,
+    announce_port: Option<u16>,
+) -> veil_cfg::Result<()> {
+    use veil_mainline::client::{Client, PUBLIC_ROUTERS, random_node_id};
+    use veil_mainline::lookup::{Limits, announce, find_peers};
+    use veil_mainline::rendezvous::{current_infohashes, epoch_of};
+
+    let network = parse_rendezvous_network(network)?;
+
+    let runtime = build_runtime(&veil_cfg::GlobalConfig::default())?;
+    let report = runtime.block_on(async move {
+        let mut out = String::new();
+        let client = match Client::bind(random_node_id()).await {
+            Ok(c) => c,
+            Err(e) => return format!("cannot open a UDP socket for the DHT: {e}"),
+        };
+
+        let mut seeds = Vec::new();
+        for router in PUBLIC_ROUTERS {
+            match tokio::net::lookup_host(*router).await {
+                Ok(addrs) => seeds.extend(addrs.filter(std::net::SocketAddr::is_ipv4)),
+                Err(e) => out.push_str(&format!("  {router}: does not resolve ({e})\n")),
+            }
+        }
+        if seeds.is_empty() {
+            return format!(
+                "{out}no public DHT router resolved — this machine has no DNS, or they are blocked"
+            );
+        }
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        out.push_str(&format!(
+            "RENDEZVOUS ON THE MAINLINE DHT\n\n\
+             network : {network:?}\n\
+             epoch   : {}\n\
+             routers : {} address(es)\n\n\
+             An address here is a CLAIM, not a veil node. The DHT stores what \n\
+             it is told, some of its nodes answer any question with addresses, \n\
+             and the only thing that makes one of these real is a handshake \n\
+             that succeeds.\n\n",
+            epoch_of(now),
+            seeds.len(),
+        ));
+
+        let net = (&client, std::time::Duration::from_secs(4));
+        for (which, info_hash) in ["this epoch", "the one before"]
+            .into_iter()
+            .zip(current_infohashes(network, now))
+        {
+            let found = find_peers(&net, info_hash, &seeds, Limits::default()).await;
+            out.push_str(&format!(
+                "{which}: {} quer(ies), {} DHT node(s) answered, {} address(es) at this point\n",
+                found.queries,
+                found.closest.len(),
+                found.peers.len(),
+            ));
+            for peer in &found.peers {
+                out.push_str(&format!("  {peer}\n"));
+            }
+            if let Some(port) = announce_port
+                && which == "this epoch"
+            {
+                let accepted = announce(&net, info_hash, port, &found.closest).await;
+                out.push_str(&format!(
+                    "announced port {port} to {accepted} of {} node(s)\n",
+                    found.closest.len()
+                ));
+                if accepted == 0 && !found.closest.is_empty() {
+                    out.push_str("  nothing accepted it — the announce did not land\n");
+                }
+            }
+            out.push('\n');
+        }
+        out
+    });
+
+    context.io.emit(OutputEvent::message(report));
+    Ok(())
 }
 
 fn run_node<I: CommandIo, O: ConfigOps>(
@@ -1343,6 +1453,32 @@ mod tests {
             r.contains("single bootstrap layer"),
             "a node with only the LAN layer has one layer, not none: {r}"
         );
+    }
+
+    #[test]
+    fn every_network_can_be_named_and_a_typo_cannot_be_mistaken_for_one() {
+        use veil_mainline::rendezvous::Network;
+        // Walks the variants, so a third network added without a name here
+        // fails rather than being unreachable from the command line.
+        for network in Network::ALL {
+            let name = match network {
+                Network::Production => "production",
+                Network::Testnet => "testnet",
+            };
+            assert_eq!(
+                parse_rendezvous_network(name).expect("a named network"),
+                *network,
+                "`{name}` does not name {network:?}"
+            );
+        }
+        // And nothing else is accepted. A typo falling through to production
+        // would put a testnet operator on the production rendezvous.
+        for typo in ["", "Production", "prod", "test", "testnet ", "mainnet"] {
+            assert!(
+                parse_rendezvous_network(typo).is_err(),
+                "`{typo}` was accepted as a network"
+            );
+        }
     }
 
     // ── update-status renderer ────────────────────────────────
