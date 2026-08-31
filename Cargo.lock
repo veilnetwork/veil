@@ -4875,6 +4875,7 @@ dependencies = [
 name = "veil-mainline"
 version = "0.8.5"
 dependencies = [
+ "blake3",
  "log",
  "rand_core 0.6.4",
  "tokio",
