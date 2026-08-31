@@ -18,6 +18,7 @@ pub enum ConfigKey {
     GlobalLogFile,
     GlobalBootstrap,
     GlobalLocalDiscovery,
+    GlobalMainlineDiscovery,
     IpcEnabled,
     IpcSocketUri,
     IpcAppSocketDir,
@@ -51,6 +52,7 @@ impl ConfigKey {
             "global.log_file" => Ok(Self::GlobalLogFile),
             "global.bootstrap" => Ok(Self::GlobalBootstrap),
             "global.local_discovery" => Ok(Self::GlobalLocalDiscovery),
+            "global.mainline_discovery" => Ok(Self::GlobalMainlineDiscovery),
             "ipc.enabled" => Ok(Self::IpcEnabled),
             "ipc.socket_uri" => Ok(Self::IpcSocketUri),
             "ipc.app_socket_dir" => Ok(Self::IpcAppSocketDir),
@@ -86,6 +88,7 @@ impl ConfigKey {
             Self::GlobalLogFile => "global.log_file",
             Self::GlobalBootstrap => "global.bootstrap",
             Self::GlobalLocalDiscovery => "global.local_discovery",
+            Self::GlobalMainlineDiscovery => "global.mainline_discovery",
             Self::IpcEnabled => "ipc.enabled",
             Self::IpcSocketUri => "ipc.socket_uri",
             Self::IpcAppSocketDir => "ipc.app_socket_dir",
@@ -111,7 +114,7 @@ mod every_key_is_reachable {
 
     /// How many keys there are. Bump it when you add one, and give the new
     /// variant the next ordinal below.
-    const KEY_COUNT: usize = 26;
+    const KEY_COUNT: usize = 27;
 
     /// A distinct number per variant.
     ///
@@ -133,21 +136,22 @@ mod every_key_is_reachable {
             ConfigKey::GlobalLogFile => 8,
             ConfigKey::GlobalBootstrap => 9,
             ConfigKey::GlobalLocalDiscovery => 10,
-            ConfigKey::IpcEnabled => 11,
-            ConfigKey::IpcSocketUri => 12,
-            ConfigKey::IpcAppSocketDir => 13,
-            ConfigKey::IdentityAlgo => 14,
-            ConfigKey::IdentityRole => 15,
-            ConfigKey::IdentityPublicKey => 16,
-            ConfigKey::IdentityPrivateKey => 17,
-            ConfigKey::IdentityNonce => 18,
-            ConfigKey::IdentityNodeId => 19,
-            ConfigKey::NatEnabled => 20,
-            ConfigKey::NatPunchTimeoutMs => 21,
-            ConfigKey::NatRelayEnabled => 22,
-            ConfigKey::NatUdpReflectors => 23,
-            ConfigKey::NatUdpReflectorBind => 24,
-            ConfigKey::TransportTlsClientConnectTimeoutMs => 25,
+            ConfigKey::GlobalMainlineDiscovery => 11,
+            ConfigKey::IpcEnabled => 12,
+            ConfigKey::IpcSocketUri => 13,
+            ConfigKey::IpcAppSocketDir => 14,
+            ConfigKey::IdentityAlgo => 15,
+            ConfigKey::IdentityRole => 16,
+            ConfigKey::IdentityPublicKey => 17,
+            ConfigKey::IdentityPrivateKey => 18,
+            ConfigKey::IdentityNonce => 19,
+            ConfigKey::IdentityNodeId => 20,
+            ConfigKey::NatEnabled => 21,
+            ConfigKey::NatPunchTimeoutMs => 22,
+            ConfigKey::NatRelayEnabled => 23,
+            ConfigKey::NatUdpReflectors => 24,
+            ConfigKey::NatUdpReflectorBind => 25,
+            ConfigKey::TransportTlsClientConnectTimeoutMs => 26,
         }
     }
 
@@ -170,6 +174,7 @@ mod every_key_is_reachable {
             ConfigKey::GlobalLogFile,
             ConfigKey::GlobalBootstrap,
             ConfigKey::GlobalLocalDiscovery,
+            ConfigKey::GlobalMainlineDiscovery,
             ConfigKey::IpcEnabled,
             ConfigKey::IpcSocketUri,
             ConfigKey::IpcAppSocketDir,

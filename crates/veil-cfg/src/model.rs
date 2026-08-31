@@ -3747,6 +3747,27 @@ pub struct GlobalConfig {
     /// less than the word "obfuscation" invites people to assume.
     #[serde(default, skip_serializing_if = "is_false")]
     pub local_discovery: bool,
+    /// Bootstrap layer 7: whether this node looks for peers on BitTorrent's
+    /// Mainline DHT, and when.
+    ///
+    /// NOT the same thing as `dht.participate`, which governs veil's OWN
+    /// distributed hash table. This is about a foreign network of millions of
+    /// nodes that knows nothing about veil, indexes twenty-byte keys, and
+    /// cannot be served notice about a veil developer because it is not run by
+    /// anybody.
+    ///
+    /// Three states rather than a flag, because the right answer differs by
+    /// what the node is. An app on somebody's phone should reach the DHT only
+    /// when nothing else worked — asking it costs a little exposure, and a
+    /// user whose seeds answer has no reason to pay it. A node an operator
+    /// runs deliberately should be there all the time, because a rendezvous
+    /// with somebody already at it is worth more to everyone else than it
+    /// costs that operator.
+    ///
+    /// See [`Self::bootstrap`] for the other half: looking is one decision,
+    /// being findable is a different one.
+    #[serde(default)]
+    pub mainline_discovery: MainlineDiscovery,
 
     /// Base64 public keys this node will accept from DNS bootstrap discovery.
     ///
@@ -4034,6 +4055,81 @@ impl GlobalConfig {
     }
 }
 
+/// When bootstrap layer 7 reaches for the Mainline DHT.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MainlineDiscovery {
+    /// Never. Nothing is sent to the DHT and nothing is expected from it.
+    Off,
+    /// Only when layers 1 to 6 produced no entry point at all — the state the
+    /// log already calls `bootstrap.none`.
+    ///
+    /// The default, and the right one for an app: a user whose seeds answer
+    /// never touches the DHT, and a user whose seeds are blocked gets a way in
+    /// rather than a node that sits offline.
+    #[default]
+    Fallback,
+    /// Always, at startup and on a timer.
+    ///
+    /// What an operator sets on a node they run deliberately. A rendezvous is
+    /// only useful if somebody is at it, so a node that is always there is
+    /// worth more to everyone else than the exposure costs the operator — and
+    /// the operator is the one who gets to weigh that.
+    Always,
+}
+
+impl MainlineDiscovery {
+    /// Every state, so a guard can walk them rather than trust a list.
+    pub const ALL: &'static [MainlineDiscovery] = &[Self::Off, Self::Fallback, Self::Always];
+
+    /// The dotted-config spelling.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Fallback => "fallback",
+            Self::Always => "always",
+        }
+    }
+
+    /// Whether this state reaches the DHT when the other layers HAVE produced
+    /// an entry point.
+    pub const fn runs_even_when_other_layers_worked(self) -> bool {
+        matches!(self, Self::Always)
+    }
+
+    /// Whether this state reaches the DHT at all.
+    pub const fn ever_runs(self) -> bool {
+        !matches!(self, Self::Off)
+    }
+}
+
+impl std::fmt::Display for MainlineDiscovery {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for MainlineDiscovery {
+    type Err = String;
+
+    fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
+        Self::ALL
+            .iter()
+            .copied()
+            .find(|candidate| candidate.as_str() == value)
+            .ok_or_else(|| {
+                format!(
+                    "expected one of {}",
+                    Self::ALL
+                        .iter()
+                        .map(|c| c.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            })
+    }
+}
+
 impl Default for GlobalConfig {
     fn default() -> Self {
         Self {
@@ -4054,6 +4150,7 @@ impl Default for GlobalConfig {
             // never a default.
             bootstrap: false,
             local_discovery: false,
+            mainline_discovery: MainlineDiscovery::Fallback,
             bootstrap_dns_pinned_keys: Vec::new(),
             bootstrap_dns_allow_system: true,
             allow_identity_fallback: false,
@@ -5719,6 +5816,63 @@ mod epic_117_defaults {
             !AnonymityConfig::default().relay_capable,
             "relaying stays off — the entry-point flag must not imply it"
         );
+    }
+
+    #[test]
+    fn reaching_the_mainline_dht_has_three_states_and_the_default_is_the_quiet_one() {
+        // The boolean walk below cannot see this one -- it is not a boolean --
+        // so the default is asserted here by name. A tri-state has no generic
+        // "off", and the guard that walks `true`s would go on passing beside a
+        // setting that defaults to talking to the open internet.
+        assert_eq!(
+            GlobalConfig::default().mainline_discovery,
+            MainlineDiscovery::Fallback,
+            "the default must not reach the DHT while the other layers work"
+        );
+        assert!(
+            !MainlineDiscovery::default().runs_even_when_other_layers_worked(),
+            "the default reaches the DHT even when the node already has a peer"
+        );
+
+        // Every state, walked rather than listed: a fourth added without a
+        // spelling or a meaning fails here.
+        assert_eq!(MainlineDiscovery::ALL.len(), 3);
+        for state in MainlineDiscovery::ALL {
+            let spelled = state.as_str();
+            assert_eq!(
+                spelled.parse::<MainlineDiscovery>().ok(),
+                Some(*state),
+                "`{spelled}` does not parse back to {state:?}"
+            );
+            // And it survives the config file, which is a separate question
+            // from parsing a command-line word.
+            let g = GlobalConfig {
+                mainline_discovery: *state,
+                ..GlobalConfig::default()
+            };
+            let back: GlobalConfig =
+                serde_json::from_str(&serde_json::to_string(&g).unwrap()).unwrap();
+            assert_eq!(
+                back.mainline_discovery, *state,
+                "{state:?} did not round-trip"
+            );
+        }
+
+        // The two questions the runtime actually asks.
+        assert!(!MainlineDiscovery::Off.ever_runs());
+        assert!(MainlineDiscovery::Fallback.ever_runs());
+        assert!(MainlineDiscovery::Always.ever_runs());
+        assert!(!MainlineDiscovery::Off.runs_even_when_other_layers_worked());
+        assert!(!MainlineDiscovery::Fallback.runs_even_when_other_layers_worked());
+        assert!(MainlineDiscovery::Always.runs_even_when_other_layers_worked());
+
+        // A word nobody defined is refused, not read as the default.
+        for typo in ["", "on", "true", "Always", "fall_back"] {
+            assert!(
+                typo.parse::<MainlineDiscovery>().is_err(),
+                "`{typo}` was accepted as a discovery state"
+            );
+        }
     }
 
     #[test]
