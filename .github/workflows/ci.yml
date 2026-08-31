@@ -220,6 +220,20 @@ jobs:
           cargo metadata --manifest-path fuzz/Cargo.toml --locked --format-version 1 > /dev/null
           cargo audit --deny warnings --file fuzz/Cargo.lock
 
+      - name: The local mirror of this job still mirrors it
+        # `scripts/run-ci-hygiene.py` runs this job on a developer's machine by
+        # READING the steps out of this file, so that a local run cannot be a
+        # subset of the real one. That property is worth exactly as much as the
+        # parser, and a parser that reads zero steps would report every step
+        # green. This runs its fixtures — it does not re-run the job.
+        #
+        # 2026-08-31, why it exists: three CI cycles in a row were spent on a
+        # local check that was narrower than this job. First clippy was not run
+        # at all; then clippy was run but not check-feature-gated-lints.sh,
+        # which compiles code the default-feature clippy never sees; then ten
+        # further steps were missing and a stale fuzz/Cargo.lock shipped.
+        run: ./scripts/run-ci-hygiene.py --self-test
+
       - name: Install cargo-deny
         run: cargo install cargo-deny --version "^0.19" --locked
 

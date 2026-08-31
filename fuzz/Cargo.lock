@@ -2987,6 +2987,7 @@ dependencies = [
  "rand_core 0.6.4",
  "serde",
  "serde_json",
+ "socket2",
  "subtle",
  "thiserror 2.0.19",
  "tokio",
