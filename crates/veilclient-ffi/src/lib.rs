@@ -2376,7 +2376,7 @@ pub unsafe extern "C" fn veil_media_start_direct_receiver(
                 use std::sync::atomic::{AtomicU64, Ordering};
                 static MISMATCHES: AtomicU64 = AtomicU64::new(0);
                 let n = MISMATCHES.fetch_add(1, Ordering::Relaxed) + 1;
-                if n == 1 || n % 500 == 0 {
+                if n == 1 || n.is_multiple_of(500) {
                     log::warn!(
                         "media.source_app.mismatch dropped {n} frame(s) from \
                          peer={} — src_app_id={} expected={} (ns={namespace} \
