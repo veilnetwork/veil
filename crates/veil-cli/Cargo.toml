@@ -43,6 +43,7 @@ veil-identity = { path = "../veil-identity" }
 veil-invite = { path = "../veil-invite" }
 veil-ipc = { path = "../veil-ipc" }
 veil-mailbox = { path = "../veil-mailbox" }
+veil-mainline = { path = "../veil-mainline" }
 veil-node-runtime = { path = "../veil-node-runtime" }
 veil-obfs4 = { path = "../veil-obfs4" }
 veil-observability = { path = "../veil-observability" }
