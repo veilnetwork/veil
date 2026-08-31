@@ -12,3 +12,4 @@
 //! millions.
 
 pub mod bencode;
+pub mod krpc;
