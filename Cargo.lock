@@ -4874,6 +4874,11 @@ dependencies = [
 [[package]]
 name = "veil-mainline"
 version = "0.8.5"
+dependencies = [
+ "log",
+ "rand_core 0.6.4",
+ "tokio",
+]
 
 [[package]]
 name = "veil-memory"
