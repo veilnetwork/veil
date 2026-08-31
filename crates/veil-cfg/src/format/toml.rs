@@ -122,6 +122,7 @@ fn update_document(document: &mut DocumentMut, config: &Config) -> Result<()> {
     // and read as a decision somebody took rather than a default.
     set_bool(global, "bootstrap", g.bootstrap);
     set_bool(global, "local_discovery", g.local_discovery);
+    set_string(global, "mainline_discovery", g.mainline_discovery.as_str());
 
     set_transport(document, &config.transport)?;
 
@@ -1045,38 +1046,49 @@ mod every_settable_key_survives_a_save {
     /// untested. `None` is for `[identity]`, whose fields the patcher writes
     /// from a different branch and which a half-filled identity would make the
     /// loader reject.
-    fn sample(key: ConfigKey) -> Option<&'static str> {
+    /// A distinct number and a value worth writing, for each key.
+    ///
+    /// One exhaustive match doing both jobs on purpose. A key added to
+    /// `ConfigKey` without a line here does not compile, and the ordinal makes
+    /// the list below provably complete -- an earlier version had only the
+    /// sample, so `global.mainline_discovery` got a sample, never reached the
+    /// list, and was never exercised. `None` is for `[identity]`, whose fields
+    /// the patcher writes from a different branch and which a half-filled
+    /// identity would make the loader reject.
+    fn ordinal_and_sample(key: ConfigKey) -> (usize, Option<&'static str>) {
         match key {
-            ConfigKey::GlobalRuntimeFlavor => Some("current_thread"),
-            ConfigKey::GlobalWorkerThreads => Some("7"),
-            ConfigKey::GlobalMaxBlockingThreads => Some("9"),
-            ConfigKey::GlobalThreadKeepAliveMs => Some("1234"),
-            ConfigKey::GlobalThreadName => Some("weaver"),
-            ConfigKey::GlobalThreadStackSize => Some("262144"),
-            ConfigKey::GlobalAdminSocket => Some("unix:///tmp/a.sock"),
-            // `file` and a `log_file` go together: structural validation
-            // rejects either one without the other.
-            ConfigKey::GlobalLogs => Some("file"),
-            ConfigKey::GlobalLogFile => Some("/tmp/veil.log"),
-            ConfigKey::GlobalBootstrap => Some("true"),
-            ConfigKey::GlobalLocalDiscovery => Some("true"),
-            ConfigKey::IpcEnabled => Some("true"),
-            ConfigKey::IpcSocketUri => Some("unix:///tmp/b.sock"),
-            ConfigKey::IpcAppSocketDir => Some("/tmp/apps"),
-            ConfigKey::IdentityAlgo => None,
-            ConfigKey::IdentityRole => None,
-            ConfigKey::IdentityPublicKey => None,
-            ConfigKey::IdentityPrivateKey => None,
-            ConfigKey::IdentityNonce => None,
-            ConfigKey::IdentityNodeId => None,
-            ConfigKey::NatEnabled => Some("false"),
-            ConfigKey::NatPunchTimeoutMs => Some("4321"),
-            ConfigKey::NatRelayEnabled => Some("true"),
-            ConfigKey::NatUdpReflectors => Some(r#"["1.2.3.4:1234"]"#),
-            ConfigKey::NatUdpReflectorBind => Some("0.0.0.0:5678"),
-            ConfigKey::TransportTlsClientConnectTimeoutMs => Some("9876"),
+            ConfigKey::GlobalRuntimeFlavor => (0, Some("current_thread")),
+            ConfigKey::GlobalWorkerThreads => (1, Some("7")),
+            ConfigKey::GlobalMaxBlockingThreads => (2, Some("9")),
+            ConfigKey::GlobalThreadKeepAliveMs => (3, Some("1234")),
+            ConfigKey::GlobalThreadName => (4, Some("weaver")),
+            ConfigKey::GlobalThreadStackSize => (5, Some("262144")),
+            ConfigKey::GlobalAdminSocket => (6, Some("unix:///tmp/a.sock")),
+            ConfigKey::GlobalLogs => (7, Some("file")),
+            ConfigKey::GlobalLogFile => (8, Some("/tmp/veil.log")),
+            ConfigKey::GlobalBootstrap => (9, Some("true")),
+            ConfigKey::GlobalLocalDiscovery => (10, Some("true")),
+            ConfigKey::GlobalMainlineDiscovery => (11, Some("always")),
+            ConfigKey::IpcEnabled => (12, Some("true")),
+            ConfigKey::IpcSocketUri => (13, Some("unix:///tmp/b.sock")),
+            ConfigKey::IpcAppSocketDir => (14, Some("/tmp/apps")),
+            ConfigKey::IdentityAlgo => (15, None),
+            ConfigKey::IdentityRole => (16, None),
+            ConfigKey::IdentityPublicKey => (17, None),
+            ConfigKey::IdentityPrivateKey => (18, None),
+            ConfigKey::IdentityNonce => (19, None),
+            ConfigKey::IdentityNodeId => (20, None),
+            ConfigKey::NatEnabled => (21, Some("false")),
+            ConfigKey::NatPunchTimeoutMs => (22, Some("4321")),
+            ConfigKey::NatRelayEnabled => (23, Some("true")),
+            ConfigKey::NatUdpReflectors => (24, Some(r#"["1.2.3.4:1234"]"#)),
+            ConfigKey::NatUdpReflectorBind => (25, Some("0.0.0.0:5678")),
+            ConfigKey::TransportTlsClientConnectTimeoutMs => (26, Some("9876")),
         }
     }
+
+    /// How many keys there are. Bump it when you add one.
+    const KEY_COUNT: usize = 27;
 
     #[test]
     fn a_value_you_set_is_still_there_after_the_file_is_rewritten() {
@@ -1110,6 +1122,7 @@ mod every_settable_key_survives_a_save {
             ConfigKey::GlobalLogFile,
             ConfigKey::GlobalBootstrap,
             ConfigKey::GlobalLocalDiscovery,
+            ConfigKey::GlobalMainlineDiscovery,
             ConfigKey::IpcEnabled,
             ConfigKey::IpcSocketUri,
             ConfigKey::IpcAppSocketDir,
@@ -1126,9 +1139,21 @@ mod every_settable_key_survives_a_save {
             ConfigKey::NatUdpReflectorBind,
             ConfigKey::TransportTlsClientConnectTimeoutMs,
         ];
+        // The list is complete, or the loop below proves nothing about the
+        // key somebody forgot to add to it.
+        for i in 0..KEY_COUNT {
+            assert!(
+                keys.iter().any(|k| ordinal_and_sample(*k).0 == i),
+                "key number {i} is missing from this test's list"
+            );
+        }
+        assert_eq!(keys.len(), KEY_COUNT, "the list has a duplicate or a stray");
+
         let mut exercised = 0;
         for key in keys {
-            let Some(value) = sample(key) else { continue };
+            let Some(value) = ordinal_and_sample(key).1 else {
+                continue;
+            };
             access::set(&mut config, key.as_str(), value)
                 .unwrap_or_else(|e| panic!("set {} = {value}: {e}", key.as_str()));
             exercised += 1;
@@ -1142,7 +1167,9 @@ mod every_settable_key_survives_a_save {
         let final_config = load_config(&path).expect("load it back");
 
         for key in keys {
-            let Some(value) = sample(key) else { continue };
+            let Some(value) = ordinal_and_sample(key).1 else {
+                continue;
+            };
             let got = access::get(&final_config, key.as_str())
                 .unwrap_or_else(|e| panic!("get {}: {e}", key.as_str()));
             assert_eq!(

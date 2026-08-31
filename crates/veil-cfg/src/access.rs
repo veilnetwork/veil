@@ -24,6 +24,7 @@ pub fn get(config: &Config, key: &str) -> Result<String> {
         ConfigKey::GlobalLogFile => Ok(option_to_string(config.global.log_file.as_deref())),
         ConfigKey::GlobalBootstrap => Ok(config.global.bootstrap.to_string()),
         ConfigKey::GlobalLocalDiscovery => Ok(config.global.local_discovery.to_string()),
+        ConfigKey::GlobalMainlineDiscovery => Ok(config.global.mainline_discovery.to_string()),
         ConfigKey::IpcEnabled => Ok(config.ipc.enabled.to_string()),
         ConfigKey::IpcSocketUri => Ok(option_to_string(config.ipc.socket_uri.as_deref())),
         ConfigKey::IpcAppSocketDir => Ok(option_to_string(
@@ -152,6 +153,17 @@ pub fn set(config: &mut Config, key: &str, value: &str) -> Result<()> {
         }
         ConfigKey::GlobalLocalDiscovery => {
             config.global.local_discovery = parse_bool(key, value)?;
+            Ok(())
+        }
+        ConfigKey::GlobalMainlineDiscovery => {
+            config.global.mainline_discovery =
+                value
+                    .parse::<crate::MainlineDiscovery>()
+                    .map_err(|reason| ConfigError::InvalidValue {
+                        key: key.as_str().to_owned(),
+                        value: value.to_owned(),
+                        reason,
+                    })?;
             Ok(())
         }
         ConfigKey::IpcEnabled => {
