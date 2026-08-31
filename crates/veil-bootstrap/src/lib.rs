@@ -12,6 +12,7 @@ pub mod dns;
 pub mod encrypted_invite;
 pub mod https;
 pub mod invite;
+pub mod lan;
 pub mod seeds;
 pub mod signed_bundle;
 pub mod signed_invite;
@@ -32,6 +33,12 @@ pub use https::{
 pub use invite::{
     BOOTSTRAP_URI_SCHEME, BootstrapUriError, MAX_BOOTSTRAP_URI_BYTES,
     decode_uri as decode_bootstrap_uri, encode_uri as encode_bootstrap_uri,
+};
+pub use lan::{
+    CURRENT_EXCHANGE_VERSION as LAN_EXCHANGE_VERSION,
+    KNOWN_EXCHANGE_VERSIONS as LAN_KNOWN_VERSIONS, LSD_GROUP_V4, LSD_GROUP_V6, LSD_PORT,
+    LanAnnounce, LanScheme, MAX_ANNOUNCE_BYTES, decode_announce as decode_lan_announce,
+    encode_announce as encode_lan_announce,
 };
 pub use seeds::{
     bootstrap_bundle_dht_key, builtin_seeds, decode_bootstrap_bundle, encode_bootstrap_bundle,
