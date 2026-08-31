@@ -240,32 +240,44 @@ pub fn decode_message(datagram: &[u8]) -> Result<Message, KrpcError> {
                 Some(raw) => parse_compact_nodes(raw)?,
                 None => Vec::new(),
             };
+            // The TOKEN decides, not `values`. BEP 5 answers a get_peers with
+            // a token and `values` when it knows peers, and with a token and
+            // `nodes` when it does not -- and the token is the half that
+            // matters, because it is what an announce has to carry. Requiring
+            // `values` before believing a token dropped every token the live
+            // DHT sent: twenty-one real nodes answered and this read none of
+            // them as having offered one.
+            //
             // `values` is a LIST of 6-byte strings, not one long string. A
             // reader that accepts either is a reader two implementations can
             // disagree with.
-            match (r.get(b"values"), r.get(b"token").and_then(Value::as_bytes)) {
-                (Some(values), Some(token)) => {
+            let peers = match r.get(b"values") {
+                Some(values) => {
                     let list = values.as_list().ok_or(KrpcError::NotKrpc)?;
                     let mut peers = Vec::with_capacity(list.len());
                     for entry in list {
                         let raw = entry.as_bytes().ok_or(KrpcError::NotKrpc)?;
                         peers.extend(parse_compact_peers(raw)?);
                     }
-                    Ok(Message::Response {
-                        transaction,
-                        response: Response::Peers {
-                            id,
-                            token: token.to_vec(),
-                            peers,
-                            nodes,
-                        },
-                    })
+                    peers
                 }
-                _ if !nodes.is_empty() => Ok(Message::Response {
+                None => Vec::new(),
+            };
+            match r.get(b"token").and_then(Value::as_bytes) {
+                Some(token) => Ok(Message::Response {
+                    transaction,
+                    response: Response::Peers {
+                        id,
+                        token: token.to_vec(),
+                        peers,
+                        nodes,
+                    },
+                }),
+                None if !nodes.is_empty() => Ok(Message::Response {
                     transaction,
                     response: Response::Nodes { id, nodes },
                 }),
-                _ => Ok(Message::Response {
+                None => Ok(Message::Response {
                     transaction,
                     response: Response::Id { id },
                 }),
@@ -367,19 +379,27 @@ pub fn encode_message(message: &Message) -> Vec<u8> {
                     for n in nodes {
                         flat.extend_from_slice(&compact_node(n));
                     }
-                    if nodes.is_empty() {
-                        dict([
+                    // `values` is written only when there are peers, and
+                    // `nodes` only when there are nodes -- an empty list of
+                    // either is a key a real client does not send.
+                    match (nodes.is_empty(), peers.is_empty()) {
+                        (true, true) => dict([(b"id", bytes(id.0)), (b"token", bytes(token))]),
+                        (true, false) => dict([
                             (b"id", bytes(id.0)),
                             (b"token", bytes(token)),
                             (b"values", values),
-                        ])
-                    } else {
-                        dict([
+                        ]),
+                        (false, true) => dict([
+                            (b"id", bytes(id.0)),
+                            (b"nodes", Value::Bytes(flat)),
+                            (b"token", bytes(token)),
+                        ]),
+                        (false, false) => dict([
                             (b"id", bytes(id.0)),
                             (b"nodes", Value::Bytes(flat)),
                             (b"token", bytes(token)),
                             (b"values", values),
-                        ])
+                        ]),
                     }
                 }
             };
@@ -493,6 +513,57 @@ mod tests {
             code: 201,
             message: b"A Generic Error Ocurred".to_vec(),
         });
+    }
+
+    #[test]
+    fn a_get_peers_answer_with_a_token_and_no_peers_still_carries_the_token() {
+        // What the live DHT actually sends when it knows no peers for a
+        // target: a token AND nodes, no `values`. Requiring `values` before
+        // believing the token read twenty-one real answers as having offered
+        // none, and an announce needs a token.
+        let node = NodeInfo {
+            id: id(9),
+            addr: "192.0.2.7:6881".parse().unwrap(),
+        };
+        round_trip(Message::Response {
+            transaction: b"aa".to_vec(),
+            response: Response::Peers {
+                id: id(1),
+                token: b"tok".to_vec(),
+                peers: Vec::new(),
+                nodes: vec![node],
+            },
+        });
+        // And with neither peers nor nodes, which a saturated node may send.
+        round_trip(Message::Response {
+            transaction: b"aa".to_vec(),
+            response: Response::Peers {
+                id: id(1),
+                token: b"tok".to_vec(),
+                peers: Vec::new(),
+                nodes: Vec::new(),
+            },
+        });
+        // A response with nodes and NO token stays what it is: a find_node
+        // answer, which cannot be announced to.
+        let wire = crate::bencode::encode(&dict([
+            (
+                b"r",
+                dict([
+                    (b"id", bytes([1u8; 20])),
+                    (b"nodes", Value::Bytes(vec![0u8; COMPACT_NODE_LEN])),
+                ]),
+            ),
+            (b"t", bytes("aa")),
+            (b"y", bytes("r")),
+        ]));
+        assert!(matches!(
+            decode_message(&wire),
+            Ok(Message::Response {
+                response: Response::Nodes { .. },
+                ..
+            })
+        ));
     }
 
     #[test]

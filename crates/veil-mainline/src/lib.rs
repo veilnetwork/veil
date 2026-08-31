@@ -14,3 +14,4 @@
 pub mod bencode;
 pub mod client;
 pub mod krpc;
+pub mod lookup;

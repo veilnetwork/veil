@@ -389,11 +389,13 @@ mod tests {
         let client = Client::bind(random_node_id()).await.expect("bind");
         let mut answered = Vec::new();
         for router in PUBLIC_ROUTERS {
-            let Ok(addrs) = tokio::net::lookup_host(*router).await else {
+            let Ok(mut addrs) = tokio::net::lookup_host(*router).await else {
                 eprintln!("{router}: does not resolve");
                 continue;
             };
-            for addr in addrs.filter(|a| a.is_ipv4()) {
+            // One address per router: if the first v4 answer does not
+            // work, the next router is a better bet than the same host again.
+            if let Some(addr) = addrs.find(|a| a.is_ipv4()) {
                 match client
                     .query(
                         addr,
@@ -420,7 +422,6 @@ mod tests {
                     Ok(other) => eprintln!("{router}: unexpected {other:?}"),
                     Err(e) => eprintln!("{router} ({addr}): {e}"),
                 }
-                break;
             }
         }
         assert!(
