@@ -3727,6 +3727,26 @@ pub struct GlobalConfig {
     /// makes the operator visible.
     #[serde(default, skip_serializing_if = "is_false")]
     pub bootstrap: bool,
+    /// When `true`, this node looks for peers on its own local network and
+    /// tells that network it is there.
+    ///
+    /// Bootstrap layer 6. Every layer above it ends at somebody's
+    /// infrastructure — a compiled-in seed list, an HTTPS URL, a DNS domain.
+    /// This one ends at the wire in the building, which is the only entry
+    /// point no project can be asked to take down.
+    ///
+    /// Default `false`, and for the same reason as [`Self::bootstrap`] rather
+    /// than a different one: announcing on a LAN tells that LAN a machine on it
+    /// runs veil. On the operator's own network that is nothing; on a hotel,
+    /// campus or office network it is exactly the fact worth keeping. Only the
+    /// person at the keyboard knows which network they are on.
+    ///
+    /// The announce is deliberately shaped like BitTorrent's own local
+    /// discovery so that joining the group is unremarkable — see
+    /// `veil_bootstrap::lan` for what that does and does not buy, which is
+    /// less than the word "obfuscation" invites people to assume.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub local_discovery: bool,
 
     /// Base64 public keys this node will accept from DNS bootstrap discovery.
     ///
@@ -4033,6 +4053,7 @@ impl Default for GlobalConfig {
             // Off. Announcing makes the operator visible, and that is
             // never a default.
             bootstrap: false,
+            local_discovery: false,
             bootstrap_dns_pinned_keys: Vec::new(),
             bootstrap_dns_allow_system: true,
             allow_identity_fallback: false,
@@ -5697,6 +5718,76 @@ mod epic_117_defaults {
         assert!(
             !AnonymityConfig::default().relay_capable,
             "relaying stays off — the entry-point flag must not imply it"
+        );
+    }
+
+    #[test]
+    fn nothing_in_the_global_defaults_exposes_this_node_without_being_asked() {
+        // The generalisation of the test above, and the reason it exists: that
+        // one names `bootstrap`, so it would have gone on passing beside a
+        // seventh flag that defaults to on. This walks whatever the struct
+        // actually serialises, so a new switch has to argue for itself HERE
+        // before it can ship enabled.
+        //
+        // Every `true` needs a line in this table saying why it is not an
+        // exposure. Everything else must default off.
+        let excused: std::collections::HashMap<&str, &str> = [
+            (
+                "bootstrap_dns_allow_system",
+                "reads the system resolver; asks, never publishes, and every existing config already says this (report14 V14-M9)",
+            ),
+            (
+                "tls_ech_grease",
+                "sends GREASE ECH extensions so this node's TLS resembles traffic that uses ECH -- a blending measure, the opposite of an exposure",
+            ),
+        ]
+        .into_iter()
+        .collect();
+
+        let value = serde_json::to_value(GlobalConfig::default()).unwrap();
+        let object = value
+            .as_object()
+            .expect("GlobalConfig serialises to an object");
+        let enabled: Vec<&str> = object
+            .iter()
+            .filter(|(_, v)| v.as_bool() == Some(true))
+            .map(|(k, _)| k.as_str())
+            .collect();
+        for key in &enabled {
+            assert!(
+                excused.contains_key(key),
+                "global.{key} defaults to true and nothing here says why it is                  safe to turn on for everybody. If it exposes the operator, the                  default is wrong; if it does not, add it to `excused` with the                  reason."
+            );
+        }
+        // And the table must not outlive its entries, or it becomes a place
+        // where a removed flag's excuse quietly justifies the next one.
+        for key in excused.keys() {
+            assert!(
+                object.contains_key(*key),
+                "`excused` still lists global.{key}, which no longer serialises"
+            );
+        }
+        // Vacuity: if the walk found no booleans at all, the loop above proved
+        // nothing. The struct has some.
+        let bools = object.values().filter(|v| v.is_boolean()).count();
+        assert!(bools > 0, "no booleans were examined; the guard is empty");
+
+        assert!(
+            !GlobalConfig::default().local_discovery,
+            "a node must not announce itself on whatever LAN it is plugged into"
+        );
+        let g = GlobalConfig {
+            local_discovery: true,
+            ..GlobalConfig::default()
+        };
+        let back: GlobalConfig = serde_json::from_str(&serde_json::to_string(&g).unwrap()).unwrap();
+        assert!(
+            back.local_discovery,
+            "the opt-in has to survive a round trip"
+        );
+        assert!(
+            !back.bootstrap,
+            "asking the LAN is not the same offer as being a public entry point"
         );
     }
 
