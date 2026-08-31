@@ -213,6 +213,83 @@ pub async fn find_peers<N: GetPeers>(
     found
 }
 
+/// The other half: telling the nodes we found that we are here.
+pub trait AnnouncePeer {
+    fn announce_peer(
+        &self,
+        addr: SocketAddr,
+        info_hash: NodeId,
+        port: u16,
+        token: Vec<u8>,
+    ) -> impl Future<Output = Result<Response, QueryError>> + Send;
+}
+
+impl AnnouncePeer for (&Client, Duration) {
+    async fn announce_peer(
+        &self,
+        addr: SocketAddr,
+        info_hash: NodeId,
+        port: u16,
+        token: Vec<u8>,
+    ) -> Result<Response, QueryError> {
+        self.0
+            .query(
+                addr,
+                Query::AnnouncePeer {
+                    id: self.0.id(),
+                    info_hash,
+                    port,
+                    // FALSE, and this is the one place where the obvious answer
+                    // is the wrong one. `implied_port` tells the storing node to
+                    // record the port the datagram CAME FROM, which is the NAT
+                    // mapping of this DHT socket -- not the port anything veil
+                    // listens on. Measured on the live DHT 2026-08-31: with it
+                    // set, three nodes stored the DHT socket's mapped port and
+                    // one stored the port we claimed, so a peer dialling what
+                    // the DHT gave back would reach a UDP socket that speaks
+                    // KRPC and nothing else.
+                    //
+                    // With it clear, the address is still the one the datagram
+                    // came from -- which is right, it is the only address a
+                    // node behind NAT can be reached at -- and the PORT is the
+                    // one we name.
+                    implied_port: false,
+                    token,
+                },
+                self.1,
+            )
+            .await
+    }
+}
+
+/// Tell the nodes a lookup found that this node is at `port`.
+///
+/// Returns how many accepted. Partial success is the normal outcome and not an
+/// error: a rendezvous held by six of eight nodes is a rendezvous.
+pub async fn announce<N: AnnouncePeer>(
+    net: &N,
+    info_hash: NodeId,
+    port: u16,
+    targets: &[(NodeInfo, Vec<u8>)],
+) -> usize {
+    let mut accepted = 0;
+    for (node, token) in targets {
+        // A token is what makes an announce legitimate to the node storing it;
+        // one we never received cannot be invented.
+        if token.is_empty() {
+            continue;
+        }
+        if net
+            .announce_peer(SocketAddr::V4(node.addr), info_hash, port, token.clone())
+            .await
+            .is_ok()
+        {
+            accepted += 1;
+        }
+    }
+    accepted
+}
+
 fn id_distance(a: &NodeId, b: &NodeId) -> [u8; 20] {
     a.distance(b)
 }
@@ -547,6 +624,91 @@ mod tests {
         );
     }
 
+    /// Records what it was told to announce, and can be made to refuse.
+    #[derive(Default)]
+    struct Announces {
+        seen: Mutex<Vec<(SocketAddr, u16, Vec<u8>)>>,
+        refuse: HashSet<SocketAddr>,
+    }
+
+    impl AnnouncePeer for Announces {
+        async fn announce_peer(
+            &self,
+            addr: SocketAddr,
+            _info_hash: NodeId,
+            port: u16,
+            token: Vec<u8>,
+        ) -> Result<Response, QueryError> {
+            if self.refuse.contains(&addr) {
+                return Err(QueryError::TimedOut);
+            }
+            self.seen
+                .lock()
+                .expect("sim lock")
+                .push((addr, port, token));
+            Ok(Response::Id {
+                id: NodeId([0u8; 20]),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn an_announce_goes_to_each_node_with_the_token_that_node_gave() {
+        // A token belongs to the node that issued it. Sending one node's token
+        // to another is an announce that is refused, and worse, an announce
+        // this node would count as having landed.
+        let targets: Vec<(NodeInfo, Vec<u8>)> = (1..=3)
+            .map(|n| (node(n as u8, addr(n)), vec![n as u8; 4]))
+            .collect();
+        let net = Announces::default();
+        let accepted = announce(&net, id(0xFF), 5556, &targets).await;
+        assert_eq!(accepted, 3);
+        let seen = net.seen.lock().expect("sim lock").clone();
+        assert_eq!(seen.len(), 3);
+        for (i, (at, port, token)) in seen.iter().enumerate() {
+            let n = i as u16 + 1;
+            assert_eq!(*at, addr(n), "announce {n} went to the wrong node");
+            assert_eq!(*port, 5556);
+            assert_eq!(
+                *token,
+                vec![n as u8; 4],
+                "announce {n} carried another node's token"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_node_that_refuses_does_not_stop_the_others() {
+        // Partial success is the normal outcome here: a rendezvous held by
+        // some of the nodes is a rendezvous.
+        let targets: Vec<(NodeInfo, Vec<u8>)> = (1..=4)
+            .map(|n| (node(n as u8, addr(n)), vec![n as u8; 4]))
+            .collect();
+        let mut net = Announces::default();
+        net.refuse.insert(addr(2));
+        let accepted = announce(&net, id(0xFF), 5556, &targets).await;
+        assert_eq!(accepted, 3, "a refusal ended the round");
+        let seen = net.seen.lock().expect("sim lock").clone();
+        assert!(
+            seen.iter().any(|(at, _, _)| *at == addr(4)),
+            "the node after the refusal was never asked"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_node_that_gave_no_token_is_not_announced_to() {
+        // A token cannot be invented, and an announce without one is refused
+        // by the node storing it -- so spending the query is pure waste.
+        let targets = vec![(node(1, addr(1)), Vec::new())];
+        let net = Announces::default();
+        let accepted = announce(&net, id(0xFF), 5556, &targets).await;
+        assert_eq!(accepted, 0);
+        assert!(
+            net.seen.lock().expect("sim lock").is_empty(),
+            "an announce went out with an empty token"
+        );
+    }
+
     #[tokio::test]
     #[ignore = "runs a real lookup on the live Mainline DHT; run with --ignored"]
     async fn a_real_lookup_converges_on_the_live_dht() {
@@ -601,5 +763,97 @@ mod tests {
             found.queries
         );
         assert!(found.queries > 1, "the lookup stopped at its seeds");
+    }
+
+    #[tokio::test]
+    #[ignore = "announces on the live Mainline DHT; run with --ignored"]
+    async fn the_live_dht_stores_what_this_node_announces() {
+        // The write half, end to end, against the network that exists.
+        //
+        // The infohash is RANDOM and deliberately not veil's rendezvous. The
+        // mechanism under test is identical either way, and announcing on the
+        // veil point would put this machine's address on a public index
+        // labelled as a veil node -- which is a decision for whoever owns the
+        // machine (`global.bootstrap`), not for a test. Against a random
+        // infohash the announcement says nothing except that some address is a
+        // peer for twenty bytes of noise, which is what every BitTorrent
+        // client on the internet is saying constantly.
+        use crate::client::{Client, PUBLIC_ROUTERS, random_node_id};
+
+        let client = Client::bind(random_node_id()).await.expect("bind");
+        let mut seeds = Vec::new();
+        for router in PUBLIC_ROUTERS {
+            if let Ok(addrs) = tokio::net::lookup_host(*router).await {
+                seeds.extend(addrs.filter(std::net::SocketAddr::is_ipv4));
+            }
+        }
+        assert!(!seeds.is_empty(), "no router resolved");
+
+        let target = random_node_id();
+        let net = (&client, Duration::from_secs(4));
+        let first = find_peers(&net, target, &seeds, Limits::default()).await;
+        eprintln!(
+            "lookup: {} queries, {} token(s), {} peer(s)",
+            first.queries,
+            first.closest.len(),
+            first.peers.len()
+        );
+        assert!(
+            !first.closest.is_empty(),
+            "no node gave a write token, so there is nobody to announce to"
+        );
+        // NOT asserted empty. A random infohash should have no peers, and
+        // usually does -- but the live DHT contains nodes that answer any
+        // get_peers with values, and one run of this test met one. An
+        // assertion about what strangers say is an assertion about the
+        // network, not about this code; what is measured below instead is
+        // what appeared AFTER the announce that was not there before.
+        let before: HashSet<std::net::SocketAddrV4> = first.peers.iter().copied().collect();
+        if !before.is_empty() {
+            eprintln!("note: {} peer(s) present before announcing", before.len());
+        }
+
+        let accepted = announce(&net, target, 5556, &first.closest).await;
+        eprintln!("announced to {}/{} node(s)", accepted, first.closest.len());
+        assert!(accepted > 0, "not one node accepted the announcement");
+
+        tokio::time::sleep(Duration::from_secs(2)).await;
+
+        // Ask the very nodes that took it, one at a time. A fresh iterative
+        // lookup asks whoever it converges on, which need not be the same
+        // eight -- so a lookup that comes back empty cannot tell "nobody
+        // stored it" from "we asked somebody else". This can.
+        let mut direct_hits = 0;
+        for (node, _) in &first.closest {
+            match net
+                .get_peers(std::net::SocketAddr::V4(node.addr), target)
+                .await
+            {
+                Ok(Response::Peers { peers, .. }) if peers.iter().any(|p| !before.contains(p)) => {
+                    eprintln!("  {} gave back {:?}", node.addr, peers);
+                    direct_hits += 1;
+                }
+                Ok(_) => eprintln!("  {} stored nothing", node.addr),
+                Err(e) => eprintln!("  {}: {e}", node.addr),
+            }
+        }
+        eprintln!(
+            "{direct_hits}/{} node(s) gave the announcement back",
+            first.closest.len()
+        );
+
+        // And the iterative path, for comparison.
+        let second = find_peers(&net, target, &seeds, Limits::default()).await;
+        eprintln!(
+            "a fresh lookup found {} peer(s) {:?}",
+            second.peers.len(),
+            second.peers
+        );
+
+        assert!(
+            direct_hits > 0,
+            "all {accepted} node(s) accepted the announcement and not one of \
+             them gave it back when asked directly"
+        );
     }
 }
