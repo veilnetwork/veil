@@ -1828,6 +1828,139 @@ impl NodeRuntime {
     /// cache fallbacks are deliberately skipped here because they're
     /// discovery mechanisms for *initial* bootstrap; they belong in startup,
     /// not in steady-state partition recovery.
+    /// Bootstrap layer 7: find peers through BitTorrent's Mainline DHT.
+    ///
+    /// Three states, because the right answer differs by what the node is —
+    /// see `global.mainline_discovery`. `Fallback` runs only when nothing else
+    /// offers a way in, which is the state an app should be in; `Always` runs
+    /// regardless, which is what an operator sets on a node they run.
+    ///
+    /// Announcing is a separate decision and stays with `global.bootstrap`:
+    /// looking costs a little exposure to the DHT nodes asked, being listed
+    /// costs exposure to everyone.
+    pub fn spawn_mainline_discovery_task(&mut self, config: &veil_cfg::Config) {
+        let mode = config.global.mainline_discovery;
+        if !mode.ever_runs() {
+            return;
+        }
+        let my_pubkey = self.identity.local_identity.public_key.clone();
+        if !mode.runs_even_when_other_layers_worked() {
+            let cached = lock!(self.discovered_peers_cache).len();
+            if other_layers_offer_an_entry_point(config, &my_pubkey, cached) {
+                self.logger.info(
+                    "mainline.not_needed",
+                    "another bootstrap layer offers a way in; the DHT is not asked \
+                     (global.mainline_discovery = fallback)",
+                );
+                return;
+            }
+        }
+
+        // What we would tell the LAN about ourselves answers the same question
+        // here: which listener a stranger could dial. The DHT carries no scheme,
+        // so the one we advertise is the one we expect of others -- a network
+        // runs one transport.
+        let me = lan_announce_for(config, &my_pubkey, &self.identity.local_identity.nonce);
+        let network = if cfg!(feature = "testnet-seeds") {
+            veil_mainline::rendezvous::Network::Testnet
+        } else {
+            veil_mainline::rendezvous::Network::Production
+        };
+        let announce_self = config.global.bootstrap;
+
+        let logger = self.logger.clone();
+        let access = self.access();
+        let state = Arc::clone(&self.state);
+
+        let handle = supervised_spawn(Arc::clone(&self.logger), "mainline_discovery", async move {
+            use veil_mainline::client::{Client, PUBLIC_ROUTERS, random_node_id};
+            use veil_mainline::lookup::{Limits, announce, find_peers};
+            use veil_mainline::rendezvous::current_infohashes;
+
+            let client = match Client::bind(random_node_id()).await {
+                Ok(c) => c,
+                Err(e) => {
+                    logger.warn(
+                        "mainline.bind_failed",
+                        format!("layer 7 is off for this run: {e}"),
+                    );
+                    return;
+                }
+            };
+            let mut seeds = Vec::new();
+            for router in PUBLIC_ROUTERS {
+                if let Ok(addrs) = tokio::net::lookup_host(*router).await {
+                    seeds.extend(addrs.filter(std::net::SocketAddr::is_ipv4));
+                }
+            }
+            if seeds.is_empty() {
+                logger.warn(
+                    "mainline.no_routers",
+                    "no public DHT router resolved; layer 7 has no way in",
+                );
+                return;
+            }
+
+            let net = (&client, std::time::Duration::from_secs(4));
+            let mut taken = 0usize;
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+
+            for info_hash in current_infohashes(network, now) {
+                let found = find_peers(&net, info_hash, &seeds, Limits::default()).await;
+                logger.info(
+                    "mainline.looked",
+                    format!(
+                        "{} quer(ies), {} DHT node(s) answered, {} address(es) at the rendezvous",
+                        found.queries,
+                        found.closest.len(),
+                        found.peers.len()
+                    ),
+                );
+
+                if announce_self && let Some(ref me) = me {
+                    let accepted = announce(&net, info_hash, me.port, &found.closest).await;
+                    logger.info(
+                        "mainline.announced",
+                        format!(
+                            "this node is listed at port {} with {accepted} of {} DHT node(s)",
+                            me.port,
+                            found.closest.len()
+                        ),
+                    );
+                }
+
+                let Some(ref me) = me else { continue };
+                for addr in found.peers.iter().take(MAX_RENDEZVOUS_PEERS) {
+                    if taken >= MAX_RENDEZVOUS_PEERS {
+                        break;
+                    }
+                    let transport = format!("{}://{addr}", me.scheme.uri_scheme());
+                    match dial_and_learn(&access, &state, &transport, taken).await {
+                        Ok(node) => {
+                            taken += 1;
+                            logger.info(
+                                "mainline.met",
+                                format!("met {node} at {transport}, learned from the rendezvous"),
+                            );
+                        }
+                        Err(e) => logger.debug("mainline.unreachable", format!("{transport}: {e}")),
+                    }
+                }
+            }
+
+            if taken == 0 {
+                logger.info(
+                    "mainline.nobody",
+                    "the rendezvous named nobody this node could reach",
+                );
+            }
+        });
+        lock_tasks(&self.tasks).sessions.push(handle);
+    }
+
     /// Bootstrap layer 6: look for peers on the local network, and tell it we
     /// are here.
     ///
@@ -5444,6 +5577,136 @@ pub fn builtin_seed_contribution(
     }
 }
 
+/// How many peers one rendezvous may contribute in a run.
+///
+/// A public index is writable by anyone: without a ceiling, whoever announces
+/// most gets to fill this node's peer table. Small on purpose — a way in needs
+/// one peer that works, not eight.
+const MAX_RENDEZVOUS_PEERS: usize = 4;
+
+/// Dial an address nobody vouched for, and write down whoever answered.
+///
+/// The row goes in with no identity, which is what makes the dial carry no
+/// expectation (see `outbound_expects_an_identity`). If the handshake
+/// succeeds it proved a public key, a nonce and a node id, and the row is
+/// rewritten from that proof before anything durable is said about the peer.
+/// If it fails the row goes away again: an address from a public index that
+/// does not answer is not a peer, and leaving it behind would have the
+/// reconnect scheduler dialling a stranger's socket forever.
+async fn dial_and_learn(
+    access: &crate::runtime::NodeServices,
+    state: &Arc<std::sync::Mutex<crate::state::NodeState>>,
+    transport: &str,
+    slot: usize,
+) -> std::result::Result<String, String> {
+    let peer_id = PeerId::new(0x9200_0000u32.wrapping_add(slot as u32));
+    // A placeholder id, unique per address so two rendezvous rows cannot
+    // collide, and not a claim about anybody: it is a hash of the address we
+    // are about to dial, replaced the moment the handshake says who is there.
+    let placeholder = {
+        let digest = blake3::hash(transport.as_bytes());
+        veil_cfg::NodeId::from(*digest.as_bytes())
+    };
+    let row = PeerConfigEntry {
+        peer_id,
+        node_id: placeholder,
+        public_key: String::new(),
+        nonce: String::new(),
+        transport: transport.to_owned(),
+        algo: veil_cfg::SignatureAlgorithm::Ed25519,
+        tls_cert: None,
+        tls_key: None,
+        tls_ca_cert: None,
+        bootstrap_only: true,
+        source: crate::types::PeerSource::Rendezvous,
+    };
+    lock_state(state).peers.insert(peer_id, row);
+
+    let session = match access.connect_peer_active(peer_id).await {
+        Ok(session) => session,
+        Err(e) => {
+            lock_state(state).peers.remove(&peer_id);
+            return Err(format!("{e}"));
+        }
+    };
+
+    // Everything durable about this peer, from what the handshake proved.
+    let proven = PeerConfigEntry {
+        peer_id,
+        node_id: session.peer_id,
+        public_key: session.peer_public_key.clone(),
+        nonce: session.peer_nonce.clone(),
+        transport: transport.to_owned(),
+        algo: veil_cfg::SignatureAlgorithm::Ed25519,
+        tls_cert: None,
+        tls_key: None,
+        tls_ca_cert: None,
+        // No longer bootstrap-only: it has an identity now, and the whole
+        // point of layer 7 is that the NEXT cold start does not need the DHT.
+        bootstrap_only: false,
+        source: crate::types::PeerSource::Rendezvous,
+    };
+    let named = veil_util::hex_str(session.peer_id.as_bytes());
+    lock_state(state).peers.insert(peer_id, proven.clone());
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    lock!(access.discovered_peers_cache).upsert(
+        veil_cfg::BootstrapPeer {
+            transport: proven.transport,
+            public_key: proven.public_key,
+            nonce: proven.nonce,
+            algo: proven.algo,
+            tls_cert: None,
+            tls_ca_cert: None,
+        },
+        now,
+    );
+    Ok(named[..16.min(named.len())].to_owned())
+}
+
+/// Whether anything other than the Mainline DHT offers this node a way in.
+///
+/// The question `MainlineDiscovery::Fallback` asks. Deliberately the same
+/// layers `bootstrap-status` counts, and deliberately NOT layer 6: local
+/// discovery may or may not find a neighbour, nobody knows at startup, and a
+/// LAN with no other veil node on it would otherwise silence layer 7 for a
+/// machine that has nothing else.
+pub fn other_layers_offer_an_entry_point(
+    config: &veil_cfg::Config,
+    my_pubkey: &str,
+    discovered_cache_entries: usize,
+) -> bool {
+    other_layers_offer_an_entry_point_from(
+        config,
+        my_pubkey,
+        discovered_cache_entries,
+        veil_bootstrap::builtin_seeds(),
+    )
+}
+
+/// [`other_layers_offer_an_entry_point`] against an EXPLICIT seed list.
+///
+/// Split for the same reason `resolve_bootstrap_candidates_from` is: which
+/// seeds a binary shipped with is a build-feature decision, and a test that
+/// says "a node with nothing configured" cannot say it at all in a build whose
+/// seed list is non-empty. Asserting its own premise is how four tests in this
+/// file once failed under exactly the features CI passes.
+pub fn other_layers_offer_an_entry_point_from(
+    config: &veil_cfg::Config,
+    my_pubkey: &str,
+    discovered_cache_entries: usize,
+    seeds: Vec<veil_cfg::BootstrapPeer>,
+) -> bool {
+    !config.peers.is_empty()
+        || !resolve_bootstrap_candidates_from(config, my_pubkey, seeds).is_empty()
+        || !config.global.bootstrap_https_urls.is_empty()
+        || dns_seed_discovery_domain(config).is_some()
+        || discovered_cache_entries > 0
+}
+
 /// How many peers one LAN may contribute before this node stops listening to it.
 ///
 /// Anyone on the segment can announce, and an announce is cheap: without a
@@ -6216,6 +6479,91 @@ mod tests {
         // otherwise the two assertions above would pass on a function that
         // refuses everything.
         assert!(admit_lan_peer("SOMEBODY-ELSE", "ME", &taken));
+    }
+
+    #[test]
+    fn the_dht_is_asked_only_when_nothing_else_offers_a_way_in() {
+        // The whole meaning of `mainline_discovery = fallback`: a user whose
+        // seeds answer never touches the DHT and never pays the exposure of
+        // asking it.
+        let bare = veil_cfg::Config::default();
+        assert!(
+            !other_layers_offer_an_entry_point_from(&bare, "ME", 0, Vec::new()),
+            "a node with nothing configured must be allowed to ask the DHT"
+        );
+
+        // And a build that ships seeds has a way in, which is the case this
+        // test cannot state with the seed list its own binary happens to
+        // carry -- hence the explicit list above.
+        assert!(
+            other_layers_offer_an_entry_point_from(&bare, "ME", 0, vec![peer("SEED")]),
+            "a builtin seed is a way in"
+        );
+
+        // Each layer on its own is enough to make the ask unnecessary.
+        let mut with_peers = veil_cfg::Config::default();
+        with_peers.peers.push(veil_cfg::PeerConfig::default());
+        assert!(
+            other_layers_offer_an_entry_point_from(&with_peers, "ME", 0, Vec::new()),
+            "peers"
+        );
+
+        let with_bootstrap = config_with(vec![peer("SEED")], veil_cfg::BuiltinSeedPolicy::Always);
+        assert!(
+            other_layers_offer_an_entry_point_from(&with_bootstrap, "ME", 0, Vec::new()),
+            "bootstrap peers"
+        );
+
+        let mut with_https = veil_cfg::Config::default();
+        with_https
+            .global
+            .bootstrap_https_urls
+            .push("https://example.invalid/seeds.json".to_owned());
+        assert!(
+            other_layers_offer_an_entry_point_from(&with_https, "ME", 0, Vec::new()),
+            "https"
+        );
+
+        let mut with_dns = veil_cfg::Config::default();
+        with_dns.global.bootstrap_dns_domain = Some("example.invalid".to_owned());
+        assert!(
+            other_layers_offer_an_entry_point_from(&with_dns, "ME", 0, Vec::new()),
+            "dns"
+        );
+
+        assert!(
+            other_layers_offer_an_entry_point_from(&bare, "ME", 1, Vec::new()),
+            "a cached peer from a previous run is a way in"
+        );
+
+        // Layer 6 deliberately does NOT count. Local discovery may or may not
+        // find a neighbour and nobody knows at startup; a LAN with no other
+        // veil node on it would otherwise silence layer 7 for a machine that
+        // has nothing else at all.
+        let mut with_lan = veil_cfg::Config::default();
+        with_lan.global.local_discovery = true;
+        assert!(
+            !other_layers_offer_an_entry_point_from(&with_lan, "ME", 0, Vec::new()),
+            "local discovery silenced the DHT on the strength of a maybe"
+        );
+    }
+
+    #[test]
+    fn the_three_discovery_states_mean_what_the_service_reads_them_as() {
+        // The service asks the setting two questions and nothing else. If the
+        // answers ever disagree with the names, a node would talk to the open
+        // internet under a setting whose name says it does not.
+        use veil_cfg::MainlineDiscovery as M;
+        assert!(!M::Off.ever_runs(), "off asked the DHT");
+        assert!(M::Fallback.ever_runs());
+        assert!(M::Always.ever_runs());
+        assert!(!M::Fallback.runs_even_when_other_layers_worked());
+        assert!(M::Always.runs_even_when_other_layers_worked());
+        assert_eq!(
+            M::default(),
+            M::Fallback,
+            "the default must be the one that stays quiet while other layers work"
+        );
     }
 
     #[test]

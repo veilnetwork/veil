@@ -890,6 +890,7 @@ fn render_bootstrap_status(s: &node::AdminBootstrapStatus) -> String {
          L4 DNS bootstrap domain   : {}\n\
          L5 discovered-peer cache  : {}\n\
          L6 local network          : {}\n\
+         L7 public rendezvous      : {}\n\
          \n\
          public entry point        : {}\n\
          \n\
@@ -907,6 +908,17 @@ fn render_bootstrap_status(s: &node::AdminBootstrapStatus) -> String {
         } else {
             "off (default) — nothing is sent to or expected from the local \
              network"
+        },
+        match s.mainline_discovery.as_str() {
+            "always" =>
+                "always — asks BitTorrent's Mainline DHT for veil peers on every start".to_owned(),
+            "fallback" => "fallback (default) — asks the Mainline DHT only when no other layer \
+                           offers a way in"
+                .to_owned(),
+            "off" => "off — the Mainline DHT is never asked".to_owned(),
+            // A newer daemon than this CLI. Say what it said rather than
+            // guessing, and do not pretend the row is missing.
+            other => format!("{other} — this CLI does not know that state"),
         },
         // Below the layers and outside the verdict on purpose: this is what
         // the node OFFERS others, not a way it finds its own first peer.
@@ -1218,6 +1230,7 @@ mod tests {
             + (cache_entries > 0) as u8;
         node::AdminBootstrapStatus {
             local_discovery: false,
+            mainline_discovery: "fallback".to_owned(),
             config_peers,
             builtin_seeds: builtin,
             https_urls,
@@ -1230,7 +1243,12 @@ mod tests {
                 oldest_secs_ago: None,
             },
             healthy_layers: healthy,
-            total_layers: 5,
+            // The real number. It was 5 here long after the renderer grew a
+            // sixth and a seventh row, which made the loop in
+            // `every_layer_the_status_counts_has_a_row_an_operator_can_read`
+            // stop at L5 and see neither -- the guard passed a break that hid
+            // L7 entirely.
+            total_layers: 7,
             announces_publicly: false,
         }
     }
@@ -1335,17 +1353,22 @@ mod tests {
 
     #[test]
     fn epic484_4_bootstrap_status_multi_layer_reports_resilient() {
-        let r = render_bootstrap_status(&sample_bootstrap_status(
-            2,
-            5,
-            1,
-            Some("veil.example"),
-            8,
-            true,
-        ));
+        // The counts come from the status, not from a literal. This test said
+        // "5/5" and went on saying it while the chain grew a sixth and a
+        // seventh layer -- it failed the day the helper stopped lying about
+        // `total_layers`, which is later than it should have noticed.
+        let status = sample_bootstrap_status(2, 5, 1, Some("veil.example"), 8, true);
+        let r = render_bootstrap_status(&status);
         assert!(
-            r.contains("5/5 layers healthy"),
-            "all 5 layers should report healthy: {r}"
+            r.contains(&format!(
+                "{}/{} layers healthy",
+                status.healthy_layers, status.total_layers
+            )),
+            "the verdict does not report the counts it was given: {r}"
+        );
+        assert!(
+            status.healthy_layers >= 2,
+            "this sample is meant to have several layers up"
         );
         assert!(
             r.contains("resilient"),
@@ -1421,6 +1444,20 @@ mod tests {
                 st.total_layers
             );
         }
+        // And exactly as many rows as layers: a renderer with more rows than
+        // the status counts is claiming a layer nobody counted, and a status
+        // counting more than it renders hides one.
+        let rows = r
+            .lines()
+            .filter(|l| l.starts_with('L') && l.chars().nth(1).is_some_and(|c| c.is_ascii_digit()))
+            .count();
+        assert_eq!(
+            rows,
+            usize::from(st.total_layers),
+            "the renderer draws {rows} layer rows and the status counts {}",
+            st.total_layers
+        );
+
         let l6 = r
             .lines()
             .find(|l| l.starts_with("L6 "))

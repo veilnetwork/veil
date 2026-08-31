@@ -91,6 +91,12 @@ pub enum RuntimeService {
     /// to be findable then, not only at the moment somebody started a daemon.
     /// No-op unless `global.local_discovery` is on.
     LanDiscovery,
+    /// Bootstrap layer 7: peers found through BitTorrent's Mainline DHT.
+    ///
+    /// Three states rather than on/off — see `global.mainline_discovery`. In
+    /// `fallback`, the state an app should be in, it returns immediately
+    /// unless nothing else offers a way in.
+    MainlineDiscovery,
 
     // ── Sovereign identity ──────────────────────────────────
     /// Periodic re-publish of the node's sovereign `IdentityDocument`
@@ -215,6 +221,7 @@ impl RuntimeService {
         Self::SrflxProbe,
         Self::BootstrapWatchdog,
         Self::LanDiscovery,
+        Self::MainlineDiscovery,
         Self::SovereignIdentityRepublish,
         Self::TicketKeyRotation,
         Self::MlKemKeyRotation,
@@ -252,7 +259,7 @@ mod all_covers_every_service {
 
     /// How many services there are. Bump it when you add one, and give the new
     /// variant the next ordinal below.
-    const SERVICE_COUNT: usize = 48;
+    const SERVICE_COUNT: usize = 49;
 
     /// A distinct number and a name per variant.
     ///
@@ -285,32 +292,33 @@ mod all_covers_every_service {
             RuntimeService::SrflxProbe => (19, "SrflxProbe"),
             RuntimeService::BootstrapWatchdog => (20, "BootstrapWatchdog"),
             RuntimeService::LanDiscovery => (21, "LanDiscovery"),
-            RuntimeService::SovereignIdentityRepublish => (22, "SovereignIdentityRepublish"),
-            RuntimeService::TicketKeyRotation => (23, "TicketKeyRotation"),
-            RuntimeService::MlKemKeyRotation => (24, "MlKemKeyRotation"),
-            RuntimeService::AuthDeliverHandler => (25, "AuthDeliverHandler"),
-            RuntimeService::RendezvousRecipient => (26, "RendezvousRecipient"),
-            RuntimeService::RendezvousResolveRefresh => (27, "RendezvousResolveRefresh"),
-            RuntimeService::PNetBanSync => (28, "PNetBanSync"),
-            RuntimeService::UpdateCheck => (29, "UpdateCheck"),
-            RuntimeService::DiscoveryInitiator => (30, "DiscoveryInitiator"),
-            RuntimeService::RoutedAppFrames => (31, "RoutedAppFrames"),
-            RuntimeService::Socks5 => (32, "Socks5"),
-            RuntimeService::ExitProxy => (33, "ExitProxy"),
-            RuntimeService::IpcServer => (34, "IpcServer"),
-            RuntimeService::PendingAckTick => (35, "PendingAckTick"),
-            RuntimeService::GatewayFailover => (36, "GatewayFailover"),
-            RuntimeService::LazyMiner => (37, "LazyMiner"),
-            RuntimeService::PexInitiator => (38, "PexInitiator"),
-            RuntimeService::PersistRouteCache => (39, "PersistRouteCache"),
-            RuntimeService::PersistRtt => (40, "PersistRtt"),
-            RuntimeService::PersistVivaldi => (41, "PersistVivaldi"),
-            RuntimeService::PersistDhtRouting => (42, "PersistDhtRouting"),
-            RuntimeService::PersistDhtValues => (43, "PersistDhtValues"),
-            RuntimeService::PersistAutodiscover => (44, "PersistAutodiscover"),
-            RuntimeService::PersistGatewayList => (45, "PersistGatewayList"),
-            RuntimeService::PersistPeerPubkeys => (46, "PersistPeerPubkeys"),
-            RuntimeService::PersistTransportAnnouncements => (47, "PersistTransportAnnouncements"),
+            RuntimeService::MainlineDiscovery => (22, "MainlineDiscovery"),
+            RuntimeService::SovereignIdentityRepublish => (23, "SovereignIdentityRepublish"),
+            RuntimeService::TicketKeyRotation => (24, "TicketKeyRotation"),
+            RuntimeService::MlKemKeyRotation => (25, "MlKemKeyRotation"),
+            RuntimeService::AuthDeliverHandler => (26, "AuthDeliverHandler"),
+            RuntimeService::RendezvousRecipient => (27, "RendezvousRecipient"),
+            RuntimeService::RendezvousResolveRefresh => (28, "RendezvousResolveRefresh"),
+            RuntimeService::PNetBanSync => (29, "PNetBanSync"),
+            RuntimeService::UpdateCheck => (30, "UpdateCheck"),
+            RuntimeService::DiscoveryInitiator => (31, "DiscoveryInitiator"),
+            RuntimeService::RoutedAppFrames => (32, "RoutedAppFrames"),
+            RuntimeService::Socks5 => (33, "Socks5"),
+            RuntimeService::ExitProxy => (34, "ExitProxy"),
+            RuntimeService::IpcServer => (35, "IpcServer"),
+            RuntimeService::PendingAckTick => (36, "PendingAckTick"),
+            RuntimeService::GatewayFailover => (37, "GatewayFailover"),
+            RuntimeService::LazyMiner => (38, "LazyMiner"),
+            RuntimeService::PexInitiator => (39, "PexInitiator"),
+            RuntimeService::PersistRouteCache => (40, "PersistRouteCache"),
+            RuntimeService::PersistRtt => (41, "PersistRtt"),
+            RuntimeService::PersistVivaldi => (42, "PersistVivaldi"),
+            RuntimeService::PersistDhtRouting => (43, "PersistDhtRouting"),
+            RuntimeService::PersistDhtValues => (44, "PersistDhtValues"),
+            RuntimeService::PersistAutodiscover => (45, "PersistAutodiscover"),
+            RuntimeService::PersistGatewayList => (46, "PersistGatewayList"),
+            RuntimeService::PersistPeerPubkeys => (47, "PersistPeerPubkeys"),
+            RuntimeService::PersistTransportAnnouncements => (48, "PersistTransportAnnouncements"),
         }
     }
 
@@ -339,6 +347,7 @@ mod all_covers_every_service {
             RuntimeService::SrflxProbe,
             RuntimeService::BootstrapWatchdog,
             RuntimeService::LanDiscovery,
+            RuntimeService::MainlineDiscovery,
             RuntimeService::SovereignIdentityRepublish,
             RuntimeService::TicketKeyRotation,
             RuntimeService::MlKemKeyRotation,
