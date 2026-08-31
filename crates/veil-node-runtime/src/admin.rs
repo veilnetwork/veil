@@ -959,6 +959,16 @@ pub struct AdminBootstrapStatus {
     pub dns_domain: Option<String>,
     /// Layer 5: discovered-peer cache from prior runs.
     pub discovered_cache: AdminDiscoveredCacheStatus,
+    /// Layer 6: whether this node looks for peers on its own local network
+    /// (`global.local_discovery`).
+    ///
+    /// Counted in [`Self::healthy_layers`], unlike [`Self::announces_publicly`]
+    /// — this one IS a way this node finds its first peer, which is what the
+    /// count means. Configured, not probed: whether a neighbour is actually
+    /// out there is a question only the wire can answer, and the operator can
+    /// read `lan_discovery.found` in the log.
+    #[serde(default)]
+    pub local_discovery: bool,
     /// Whether this node OFFERS ITSELF as a public entry point
     /// (`global.bootstrap`). Deliberately not one of the layers and
     /// deliberately not counted in [`Self::healthy_layers`]: the layers are
@@ -973,7 +983,7 @@ pub struct AdminBootstrapStatus {
     /// doesn't have to re-derive verdict criteria.
     pub healthy_layers: u8,
     /// Total layer count — surfaced so a future binary adding a layer
-    /// can render correctly against an older operator UI. Currently 5.
+    /// can render correctly against an older operator UI. Currently 6.
     pub total_layers: u8,
 }
 

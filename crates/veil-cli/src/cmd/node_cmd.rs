@@ -779,6 +779,7 @@ fn render_bootstrap_status(s: &node::AdminBootstrapStatus) -> String {
          L3 HTTPS bootstrap URLs   : {}\n\
          L4 DNS bootstrap domain   : {}\n\
          L5 discovered-peer cache  : {}\n\
+         L6 local network          : {}\n\
          \n\
          public entry point        : {}\n\
          \n\
@@ -788,6 +789,15 @@ fn render_bootstrap_status(s: &node::AdminBootstrapStatus) -> String {
         https_row,
         dns_row,
         cache_row,
+        // A layer, and counted as one: this is a way this node finds its first
+        // peer, which is what the layers mean.
+        if s.local_discovery {
+            "on — asks the local network for peers, and tells it this machine \
+             runs a node"
+        } else {
+            "off (default) — nothing is sent to or expected from the local \
+             network"
+        },
         // Below the layers and outside the verdict on purpose: this is what
         // the node OFFERS others, not a way it finds its own first peer.
         if s.announces_publicly {
@@ -1097,6 +1107,7 @@ mod tests {
             + dns.is_some() as u8
             + (cache_entries > 0) as u8;
         node::AdminBootstrapStatus {
+            local_discovery: false,
             config_peers,
             builtin_seeds: builtin,
             https_urls,
@@ -1282,6 +1293,55 @@ mod tests {
         assert!(
             l3.contains("not configured"),
             "L3 with 0 URLs must say `not configured`: {l3}"
+        );
+    }
+
+    #[test]
+    fn every_layer_the_status_counts_has_a_row_an_operator_can_read() {
+        // The failure this catches is a layer that exists in the count and
+        // nowhere on screen: `healthy_layers` would say 2/6 while the operator
+        // could only find five rows and had no way to tell which two.
+        let mut st = sample_bootstrap_status(1, 0, 0, None, 0, false);
+        st.local_discovery = true;
+        let r = render_bootstrap_status(&st);
+        for n in 1..=st.total_layers {
+            assert!(
+                r.contains(&format!("L{n} ")),
+                "layer {n} of {} has no row: {r}",
+                st.total_layers
+            );
+        }
+        let l6 = r
+            .lines()
+            .find(|l| l.starts_with("L6 "))
+            .unwrap_or_else(|| panic!("L6 row missing: {r}"));
+        assert!(l6.contains("on"), "L6 must say it is on: {l6}");
+
+        // And off is a state that says so, rather than an empty row.
+        st.local_discovery = false;
+        let off = render_bootstrap_status(&st);
+        let l6_off = off
+            .lines()
+            .find(|l| l.starts_with("L6 "))
+            .unwrap_or_else(|| panic!("L6 row missing when off: {off}"));
+        assert!(
+            l6_off.contains("off (default)"),
+            "L6 off must name itself the default: {l6_off}"
+        );
+    }
+
+    #[test]
+    fn the_local_network_layer_counts_toward_the_verdict() {
+        // It is a way this node finds its first peer, which is what the
+        // verdict is about -- unlike the public-entry-point line, which is
+        // what it offers others and is deliberately outside the count.
+        let mut only_lan = sample_bootstrap_status(0, 0, 0, None, 0, false);
+        only_lan.local_discovery = true;
+        only_lan.healthy_layers = 1;
+        let r = render_bootstrap_status(&only_lan);
+        assert!(
+            r.contains("single bootstrap layer"),
+            "a node with only the LAN layer has one layer, not none: {r}"
         );
     }
 

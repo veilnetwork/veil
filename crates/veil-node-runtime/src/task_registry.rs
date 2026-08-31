@@ -84,6 +84,13 @@ pub enum RuntimeService {
     /// configurable streak of zero-session ticks (with cool-down between
     /// retries), respawns outbound connectors for `config.bootstrap_peers`.
     BootstrapWatchdog,
+    /// Bootstrap layer 6: peers found on the local network.
+    ///
+    /// Unlike `Bootstrap`, which is one-shot at startup, this runs for the
+    /// life of the node — a laptop that joins the LAN an hour after boot has
+    /// to be findable then, not only at the moment somebody started a daemon.
+    /// No-op unless `global.local_discovery` is on.
+    LanDiscovery,
 
     // ── Sovereign identity ──────────────────────────────────
     /// Periodic re-publish of the node's sovereign `IdentityDocument`
@@ -207,6 +214,7 @@ impl RuntimeService {
         Self::UdpPunchResponder,
         Self::SrflxProbe,
         Self::BootstrapWatchdog,
+        Self::LanDiscovery,
         Self::SovereignIdentityRepublish,
         Self::TicketKeyRotation,
         Self::MlKemKeyRotation,
@@ -236,4 +244,157 @@ impl RuntimeService {
         Self::PersistPeerPubkeys,
         Self::PersistTransportAnnouncements,
     ];
+}
+
+#[cfg(test)]
+mod all_covers_every_service {
+    use super::RuntimeService;
+
+    /// How many services there are. Bump it when you add one, and give the new
+    /// variant the next ordinal below.
+    const SERVICE_COUNT: usize = 48;
+
+    /// A distinct number and a name per variant.
+    ///
+    /// Exhaustive on purpose: a service added to the enum without a line here
+    /// does not compile, which is how the author is made to add it to the list
+    /// in the test as well. The dispatch in `services.rs` is exhaustive for the
+    /// same reason, so the ONE way a new service can go missing silently is by
+    /// being left out of `ALL` — where nothing fails, it simply never starts.
+    fn ordinal_and_name(service: RuntimeService) -> (usize, &'static str) {
+        match service {
+            RuntimeService::Listeners => (0, "Listeners"),
+            RuntimeService::OutboundPeers => (1, "OutboundPeers"),
+            RuntimeService::PinnedRelays => (2, "PinnedRelays"),
+            RuntimeService::MetricsExporter => (3, "MetricsExporter"),
+            RuntimeService::HealthWatchdog => (4, "HealthWatchdog"),
+            RuntimeService::MaintenanceTick => (5, "MaintenanceTick"),
+            RuntimeService::PowPendingCleanup => (6, "PowPendingCleanup"),
+            RuntimeService::GatewayEviction => (7, "GatewayEviction"),
+            RuntimeService::HandoffPrune => (8, "HandoffPrune"),
+            RuntimeService::TxRegistryPrune => (9, "TxRegistryPrune"),
+            RuntimeService::RouteProbe => (10, "RouteProbe"),
+            RuntimeService::RouteRefresh => (11, "RouteRefresh"),
+            RuntimeService::CongestionWithdraw => (12, "CongestionWithdraw"),
+            RuntimeService::Mesh => (13, "Mesh"),
+            RuntimeService::DhtRepublish => (14, "DhtRepublish"),
+            RuntimeService::RouteMissHandler => (15, "RouteMissHandler"),
+            RuntimeService::Bootstrap => (16, "Bootstrap"),
+            RuntimeService::UdpReflector => (17, "UdpReflector"),
+            RuntimeService::UdpPunchResponder => (18, "UdpPunchResponder"),
+            RuntimeService::SrflxProbe => (19, "SrflxProbe"),
+            RuntimeService::BootstrapWatchdog => (20, "BootstrapWatchdog"),
+            RuntimeService::LanDiscovery => (21, "LanDiscovery"),
+            RuntimeService::SovereignIdentityRepublish => (22, "SovereignIdentityRepublish"),
+            RuntimeService::TicketKeyRotation => (23, "TicketKeyRotation"),
+            RuntimeService::MlKemKeyRotation => (24, "MlKemKeyRotation"),
+            RuntimeService::AuthDeliverHandler => (25, "AuthDeliverHandler"),
+            RuntimeService::RendezvousRecipient => (26, "RendezvousRecipient"),
+            RuntimeService::RendezvousResolveRefresh => (27, "RendezvousResolveRefresh"),
+            RuntimeService::PNetBanSync => (28, "PNetBanSync"),
+            RuntimeService::UpdateCheck => (29, "UpdateCheck"),
+            RuntimeService::DiscoveryInitiator => (30, "DiscoveryInitiator"),
+            RuntimeService::RoutedAppFrames => (31, "RoutedAppFrames"),
+            RuntimeService::Socks5 => (32, "Socks5"),
+            RuntimeService::ExitProxy => (33, "ExitProxy"),
+            RuntimeService::IpcServer => (34, "IpcServer"),
+            RuntimeService::PendingAckTick => (35, "PendingAckTick"),
+            RuntimeService::GatewayFailover => (36, "GatewayFailover"),
+            RuntimeService::LazyMiner => (37, "LazyMiner"),
+            RuntimeService::PexInitiator => (38, "PexInitiator"),
+            RuntimeService::PersistRouteCache => (39, "PersistRouteCache"),
+            RuntimeService::PersistRtt => (40, "PersistRtt"),
+            RuntimeService::PersistVivaldi => (41, "PersistVivaldi"),
+            RuntimeService::PersistDhtRouting => (42, "PersistDhtRouting"),
+            RuntimeService::PersistDhtValues => (43, "PersistDhtValues"),
+            RuntimeService::PersistAutodiscover => (44, "PersistAutodiscover"),
+            RuntimeService::PersistGatewayList => (45, "PersistGatewayList"),
+            RuntimeService::PersistPeerPubkeys => (46, "PersistPeerPubkeys"),
+            RuntimeService::PersistTransportAnnouncements => (47, "PersistTransportAnnouncements"),
+        }
+    }
+
+    #[test]
+    fn every_service_is_actually_started() {
+        let every = [
+            RuntimeService::Listeners,
+            RuntimeService::OutboundPeers,
+            RuntimeService::PinnedRelays,
+            RuntimeService::MetricsExporter,
+            RuntimeService::HealthWatchdog,
+            RuntimeService::MaintenanceTick,
+            RuntimeService::PowPendingCleanup,
+            RuntimeService::GatewayEviction,
+            RuntimeService::HandoffPrune,
+            RuntimeService::TxRegistryPrune,
+            RuntimeService::RouteProbe,
+            RuntimeService::RouteRefresh,
+            RuntimeService::CongestionWithdraw,
+            RuntimeService::Mesh,
+            RuntimeService::DhtRepublish,
+            RuntimeService::RouteMissHandler,
+            RuntimeService::Bootstrap,
+            RuntimeService::UdpReflector,
+            RuntimeService::UdpPunchResponder,
+            RuntimeService::SrflxProbe,
+            RuntimeService::BootstrapWatchdog,
+            RuntimeService::LanDiscovery,
+            RuntimeService::SovereignIdentityRepublish,
+            RuntimeService::TicketKeyRotation,
+            RuntimeService::MlKemKeyRotation,
+            RuntimeService::AuthDeliverHandler,
+            RuntimeService::RendezvousRecipient,
+            RuntimeService::RendezvousResolveRefresh,
+            RuntimeService::PNetBanSync,
+            RuntimeService::UpdateCheck,
+            RuntimeService::DiscoveryInitiator,
+            RuntimeService::RoutedAppFrames,
+            RuntimeService::Socks5,
+            RuntimeService::ExitProxy,
+            RuntimeService::IpcServer,
+            RuntimeService::PendingAckTick,
+            RuntimeService::GatewayFailover,
+            RuntimeService::LazyMiner,
+            RuntimeService::PexInitiator,
+            RuntimeService::PersistRouteCache,
+            RuntimeService::PersistRtt,
+            RuntimeService::PersistVivaldi,
+            RuntimeService::PersistDhtRouting,
+            RuntimeService::PersistDhtValues,
+            RuntimeService::PersistAutodiscover,
+            RuntimeService::PersistGatewayList,
+            RuntimeService::PersistPeerPubkeys,
+            RuntimeService::PersistTransportAnnouncements,
+        ];
+        // The list is complete, or the loop below proves nothing about the
+        // service somebody forgot to add to it.
+        for i in 0..SERVICE_COUNT {
+            assert!(
+                every.iter().any(|s| ordinal_and_name(*s).0 == i),
+                "service number {i} is missing from this test's list"
+            );
+        }
+        assert_eq!(
+            every.len(),
+            SERVICE_COUNT,
+            "the list has a duplicate or a stray"
+        );
+
+        let listed: std::collections::HashSet<usize> = RuntimeService::ALL
+            .iter()
+            .map(|s| ordinal_and_name(*s).0)
+            .collect();
+        for service in every {
+            let (ordinal, name) = ordinal_and_name(service);
+            assert!(
+                listed.contains(&ordinal),
+                "RuntimeService::{name} is not in ALL, so it never starts"
+            );
+        }
+        assert_eq!(
+            RuntimeService::ALL.len(),
+            listed.len(),
+            "ALL lists a service twice, which starts it twice"
+        );
+    }
 }
