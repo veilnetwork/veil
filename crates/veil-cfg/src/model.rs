@@ -3706,6 +3706,28 @@ pub struct GlobalConfig {
     /// Default: `veil.example`. Set to a real domain with `_veil._bootstrap.<domain>` TXT records.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bootstrap_dns_domain: Option<String>,
+    /// When `true`, this node offers itself as a PUBLIC ENTRY POINT: it
+    /// announces its address on permissionless discovery networks so a client
+    /// that ships no seed list can still find its first peer.
+    ///
+    /// Default `false`, and that default is the whole point. Announcing puts
+    /// this node's address on a public, world-readable index that anyone can
+    /// enumerate — including whoever would rather the operator were not doing
+    /// this. That is a decision for the person running the node, taken in the
+    /// open, not something a client should acquire by upgrading.
+    ///
+    /// INDEPENDENT of [`Self::relay_capable`] and of `dht_service`. Carrying
+    /// other peers' circuits, serving the DHT, and being findable from outside
+    /// are three separate offers, and a node may make any of them without the
+    /// others. This flag governs the ANNOUNCE and nothing else: it does not
+    /// change what the node accepts, relays or stores.
+    ///
+    /// A node with this off still USES the permissionless layers — it asks and
+    /// it listens. Only publishing is opt-in, because only publishing is what
+    /// makes the operator visible.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub bootstrap: bool,
+
     /// Base64 public keys this node will accept from DNS bootstrap discovery.
     ///
     /// A TXT record is not signed: DoT and DoH authenticate the RESOLVER, and
@@ -4008,6 +4030,9 @@ impl Default for GlobalConfig {
             log_level: LogLevel::default(),
             log_format: LogFormat::default(),
             bootstrap_dns_domain: None,
+            // Off. Announcing makes the operator visible, and that is
+            // never a default.
+            bootstrap: false,
             bootstrap_dns_pinned_keys: Vec::new(),
             bootstrap_dns_allow_system: true,
             allow_identity_fallback: false,
@@ -5640,6 +5665,39 @@ mod epic_117_defaults {
         };
         let back: GlobalConfig = serde_json::from_str(&serde_json::to_string(&g).unwrap()).unwrap();
         assert!(back.allow_unpinned_signed_bootstrap, "opt-in roundtrips");
+    }
+
+    #[test]
+    fn being_a_public_entry_point_is_opt_in_and_says_nothing_else() {
+        // Announcing puts the operator's address on a world-readable index
+        // anyone can enumerate. That is a decision for the person running the
+        // node, and the one way it must never be taken is silently, by an
+        // upgrade — so the default is asserted here rather than trusted to
+        // whoever edits the struct next.
+        assert!(
+            !GlobalConfig::default().bootstrap,
+            "a node must not offer itself as a public entry point by default"
+        );
+
+        // And it is about the ANNOUNCE alone. Carrying other peers' circuits
+        // and serving the DHT are separate offers; a config that turns one on
+        // must leave the others exactly where they were, or an operator who
+        // agreed to be findable has also agreed to two things nobody named.
+        let g = GlobalConfig {
+            bootstrap: true,
+            ..GlobalConfig::default()
+        };
+        let back: GlobalConfig = serde_json::from_str(&serde_json::to_string(&g).unwrap()).unwrap();
+        assert!(back.bootstrap, "the opt-in has to survive a round trip");
+        assert_eq!(
+            AnonymityConfig::default(),
+            AnonymityConfig::default(),
+            "sanity: anonymity defaults are their own thing"
+        );
+        assert!(
+            !AnonymityConfig::default().relay_capable,
+            "relaying stays off — the entry-point flag must not imply it"
+        );
     }
 
     #[test]

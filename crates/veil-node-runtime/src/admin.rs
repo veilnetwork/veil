@@ -959,6 +959,14 @@ pub struct AdminBootstrapStatus {
     pub dns_domain: Option<String>,
     /// Layer 5: discovered-peer cache from prior runs.
     pub discovered_cache: AdminDiscoveredCacheStatus,
+    /// Whether this node OFFERS ITSELF as a public entry point
+    /// (`global.bootstrap`). Deliberately not one of the layers and
+    /// deliberately not counted in [`Self::healthy_layers`]: the layers are
+    /// ways THIS node finds its first peer, and announcing helps somebody
+    /// else find theirs. Counting it would let a node that cannot bootstrap
+    /// at all report itself one layer healthier for advertising.
+    #[serde(default)]
+    pub announces_publicly: bool,
     /// Count of layers that currently have ≥1 entry / are configured.
     /// 0 = bootstrap will fail; 1 = single point of censorship; ≥2 =
     /// layered defense. Computed at the handler level so the renderer

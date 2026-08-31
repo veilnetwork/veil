@@ -4105,27 +4105,31 @@ impl NodeRuntime {
     pub fn bootstrap_status(&self) -> crate::admin::AdminBootstrapStatus {
         use crate::admin::{AdminBootstrapStatus, AdminDiscoveredCacheStatus};
 
-        let (config_peers, dns_domain, https_urls) = match veil_cfg::load_config(&self.config_path)
-        {
-            Ok(c) => (
-                c.bootstrap_peers.len(),
-                c.global
-                    .bootstrap_dns_domain
-                    .clone()
-                    .filter(|s| !s.trim().is_empty()),
-                c.global.bootstrap_https_urls.len(),
-            ),
-            // Reload failure shouldn't bring down the diag — fall back
-            // to "0 / None" so the operator at least sees the cache and
-            // builtin counts. A separate err log surfaces the cause.
-            Err(e) => {
-                self.logger.warn(
-                    "bootstrap.status.config_load_failed",
-                    format!("falling back to in-runtime view: {e}"),
-                );
-                (0, None, 0)
-            }
-        };
+        let (config_peers, dns_domain, https_urls, announces_publicly) =
+            match veil_cfg::load_config(&self.config_path) {
+                Ok(c) => (
+                    c.bootstrap_peers.len(),
+                    c.global
+                        .bootstrap_dns_domain
+                        .clone()
+                        .filter(|s| !s.trim().is_empty()),
+                    c.global.bootstrap_https_urls.len(),
+                    c.global.bootstrap,
+                ),
+                // Reload failure shouldn't bring down the diag — fall back
+                // to "0 / None" so the operator at least sees the cache and
+                // builtin counts. A separate err log surfaces the cause.
+                Err(e) => {
+                    self.logger.warn(
+                        "bootstrap.status.config_load_failed",
+                        format!("falling back to in-runtime view: {e}"),
+                    );
+                    // False on a read failure, and that is the safe direction:
+                    // claiming "I announce" when the config could not be read
+                    // would tell an operator they are visible when nobody knows.
+                    (0, None, 0, false)
+                }
+            };
 
         let builtin_seeds = veil_bootstrap::builtin_seeds().len();
 
@@ -4176,6 +4180,7 @@ impl NodeRuntime {
             discovered_cache,
             healthy_layers,
             total_layers: 5,
+            announces_publicly,
         }
     }
 
