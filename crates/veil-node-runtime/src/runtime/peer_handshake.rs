@@ -1312,6 +1312,8 @@ pub async fn register_connection_session(
         link_id,
         source,
         stream,
+        peer_public_key: remote_identity.public_key.clone(),
+        peer_nonce: remote_identity.nonce.clone(),
         // Never send media into a side channel an older peer does not read.
         // Fast-resumed handshakes currently synthesize zero capabilities, so
         // they also preserve the ordered-stream fallback conservatively.
@@ -1438,6 +1440,27 @@ pub fn inbound_bypasses_directional(matched_source: Option<PeerSource>) -> bool 
     )
 }
 
+/// Whether an outbound dial to this row carries an expectation about who will
+/// answer.
+///
+/// Yes for every row that names an identity, which is every row this node has
+/// ever had until bootstrap layer 7: an operator's `[[peers]]` line, a seed, a
+/// PEX entry, a mesh beacon. Checking the handshake against the claim is what
+/// catches an address takeover, and none of that changes.
+///
+/// No in exactly one case: a [`PeerSource::Rendezvous`] row that has not
+/// learned an identity yet. A public index gives an address and no claim, so
+/// there is nothing to check — demanding a claim would mean inventing one,
+/// which would then mismatch every time, or never dialling at all.
+///
+/// Note what this is NOT: it is not "rendezvous peers are unchecked". The
+/// handshake still proves who answered; the caller writes its record from that
+/// proof, and from then on the row has an identity and IS checked — including
+/// on the next reconnect to the same address.
+pub fn outbound_expects_an_identity(entry: &PeerConfigEntry) -> bool {
+    !(matches!(entry.source, PeerSource::Rendezvous) && entry.public_key.is_empty())
+}
+
 /// Whether an identity mismatch should DROP our record of this peer.
 ///
 /// A record we learned OURSELVES (`Exchanged` via PEX, `Autodiscovered` via
@@ -1515,7 +1538,7 @@ pub fn peer_transport_context(
 mod identity_mismatch_drop_tests {
     use super::{
         ExpectedPeerIdentity, identity_mismatch_drops_record, identity_mismatch_removes_row,
-        row_is_still_the_one_dialled,
+        outbound_expects_an_identity, row_is_still_the_one_dialled,
     };
     use crate::types::{PeerConfigEntry, PeerId, PeerSource};
 
@@ -1535,6 +1558,46 @@ mod identity_mismatch_drop_tests {
             bootstrap_only: false,
             source,
         }
+    }
+
+    #[test]
+    fn only_an_identity_less_rendezvous_row_dials_without_an_expectation() {
+        // The change this guards let a dial go out with no expectation about
+        // who would answer. That is right for exactly one row -- an address
+        // from a public index, which carries no claim to check -- and wrong
+        // for every other, where dropping the check would silently accept
+        // whoever took the address over.
+        //
+        // Walks the sources rather than naming two, so a sixth added later
+        // has to decide rather than inherit.
+        let with_key = |source| {
+            let mut e = row(source, 0xAA, "tcp://198.51.100.1:5555");
+            e.public_key = "AAAA".to_owned();
+            e
+        };
+        for source in PeerSource::ALL {
+            assert!(
+                outbound_expects_an_identity(&with_key(*source)),
+                "{source} names an identity and the dial did not check it"
+            );
+        }
+
+        // Without a key, only the rendezvous source is excused.
+        for source in PeerSource::ALL {
+            let bare = row(*source, 0xAA, "tcp://198.51.100.1:5555");
+            assert_eq!(
+                outbound_expects_an_identity(&bare),
+                !matches!(source, PeerSource::Rendezvous),
+                "{source} with no identity: wrong answer"
+            );
+        }
+
+        // And a rendezvous row that HAS learned an identity is checked from
+        // then on -- including on the next reconnect to the same address.
+        assert!(
+            outbound_expects_an_identity(&with_key(PeerSource::Rendezvous)),
+            "a rendezvous peer stayed unchecked after its identity was proven"
+        );
     }
 
     fn expectation(node: u8, transport: &str) -> ExpectedPeerIdentity {
