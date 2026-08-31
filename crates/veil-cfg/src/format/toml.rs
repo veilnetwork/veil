@@ -116,6 +116,12 @@ fn update_document(document: &mut DocumentMut, config: &Config) -> Result<()> {
         "mlkem_rotation_secs",
         Some(g.mlkem_rotation_secs as i64),
     );
+    // The two switches an operator sets to say what this node offers. They are
+    // `skip_serializing_if = is_false`, so `false` must REMOVE the key rather
+    // than write it — otherwise turning one off would leave `= false` behind
+    // and read as a decision somebody took rather than a default.
+    set_bool(global, "bootstrap", g.bootstrap);
+    set_bool(global, "local_discovery", g.local_discovery);
 
     set_transport(document, &config.transport)?;
 
@@ -243,6 +249,25 @@ fn set_string_array(table: &mut Table, key: &str, values: &[String]) {
         array.push(v.as_str());
     }
     table[key] = value(array);
+}
+
+/// Write a boolean, or remove the key when it is `false`.
+///
+/// Removal rather than `= false` because these keys are
+/// `skip_serializing_if = "is_false"`: a file that never mentions them and a
+/// file that says `false` mean the same thing to the loader, and the shorter
+/// one does not look like somebody's decision.
+fn set_bool(table: &mut Table, key: &str, new_value: bool) {
+    if !new_value {
+        table.remove(key);
+        return;
+    }
+    match table.get_mut(key).and_then(Item::as_value_mut) {
+        Some(existing) => replace_value(existing, Value::from(true)),
+        None => {
+            table[key] = value(true);
+        }
+    }
 }
 
 fn set_integer(table: &mut Table, key: &str, new_value: Option<i64>) {
@@ -1004,5 +1029,129 @@ mod tests {
             "tls_fingerprint section must always appear, got: {rendered}"
         );
         assert!(rendered.contains("mode = \"rotate\""));
+    }
+}
+
+#[cfg(test)]
+mod every_settable_key_survives_a_save {
+    use crate::keys::ConfigKey;
+    use crate::{Config, access, load_config, save_config};
+
+    /// A value worth writing for each key, or `None` for the keys this guard
+    /// cannot exercise.
+    ///
+    /// The match is exhaustive on purpose: a key added to `ConfigKey` without a
+    /// line here does not compile, so nobody can add one and quietly leave it
+    /// untested. `None` is for `[identity]`, whose fields the patcher writes
+    /// from a different branch and which a half-filled identity would make the
+    /// loader reject.
+    fn sample(key: ConfigKey) -> Option<&'static str> {
+        match key {
+            ConfigKey::GlobalRuntimeFlavor => Some("current_thread"),
+            ConfigKey::GlobalWorkerThreads => Some("7"),
+            ConfigKey::GlobalMaxBlockingThreads => Some("9"),
+            ConfigKey::GlobalThreadKeepAliveMs => Some("1234"),
+            ConfigKey::GlobalThreadName => Some("weaver"),
+            ConfigKey::GlobalThreadStackSize => Some("262144"),
+            ConfigKey::GlobalAdminSocket => Some("unix:///tmp/a.sock"),
+            // `file` and a `log_file` go together: structural validation
+            // rejects either one without the other.
+            ConfigKey::GlobalLogs => Some("file"),
+            ConfigKey::GlobalLogFile => Some("/tmp/veil.log"),
+            ConfigKey::GlobalBootstrap => Some("true"),
+            ConfigKey::GlobalLocalDiscovery => Some("true"),
+            ConfigKey::IpcEnabled => Some("true"),
+            ConfigKey::IpcSocketUri => Some("unix:///tmp/b.sock"),
+            ConfigKey::IpcAppSocketDir => Some("/tmp/apps"),
+            ConfigKey::IdentityAlgo => None,
+            ConfigKey::IdentityRole => None,
+            ConfigKey::IdentityPublicKey => None,
+            ConfigKey::IdentityPrivateKey => None,
+            ConfigKey::IdentityNonce => None,
+            ConfigKey::IdentityNodeId => None,
+            ConfigKey::NatEnabled => Some("false"),
+            ConfigKey::NatPunchTimeoutMs => Some("4321"),
+            ConfigKey::NatRelayEnabled => Some("true"),
+            ConfigKey::NatUdpReflectors => Some(r#"["1.2.3.4:1234"]"#),
+            ConfigKey::NatUdpReflectorBind => Some("0.0.0.0:5678"),
+            ConfigKey::TransportTlsClientConnectTimeoutMs => Some("9876"),
+        }
+    }
+
+    #[test]
+    fn a_value_you_set_is_still_there_after_the_file_is_rewritten() {
+        // `[global]` is MANUALLY_OWNED by the TOML patcher, which means a field
+        // it does not name is DROPPED the next time anything saves. The file
+        // says so, and it has bitten this repository before. It bit again with
+        // `global.bootstrap` and `global.local_discovery`: `config set` printed
+        // the path and reported success, and `config get` right afterwards said
+        // `false`. Nothing failed; the value simply was not there.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+
+        // The order is what makes this a guard. A config saved to a path that
+        // does not exist yet is rendered whole by serde, and every field is in
+        // it; the patcher is only reached when the file ALREADY exists, and a
+        // key it does not name is one the patch never adds. That is the shape
+        // of `config set`: load the operator's file, change one field in
+        // memory, write it back through the patcher. So: write the file first,
+        // THEN edit.
+        save_config(&path, &Config::default()).expect("write the file first");
+        let mut config = load_config(&path).expect("load the file we just wrote");
+        let keys = [
+            ConfigKey::GlobalRuntimeFlavor,
+            ConfigKey::GlobalWorkerThreads,
+            ConfigKey::GlobalMaxBlockingThreads,
+            ConfigKey::GlobalThreadKeepAliveMs,
+            ConfigKey::GlobalThreadName,
+            ConfigKey::GlobalThreadStackSize,
+            ConfigKey::GlobalAdminSocket,
+            ConfigKey::GlobalLogs,
+            ConfigKey::GlobalLogFile,
+            ConfigKey::GlobalBootstrap,
+            ConfigKey::GlobalLocalDiscovery,
+            ConfigKey::IpcEnabled,
+            ConfigKey::IpcSocketUri,
+            ConfigKey::IpcAppSocketDir,
+            ConfigKey::IdentityAlgo,
+            ConfigKey::IdentityRole,
+            ConfigKey::IdentityPublicKey,
+            ConfigKey::IdentityPrivateKey,
+            ConfigKey::IdentityNonce,
+            ConfigKey::IdentityNodeId,
+            ConfigKey::NatEnabled,
+            ConfigKey::NatPunchTimeoutMs,
+            ConfigKey::NatRelayEnabled,
+            ConfigKey::NatUdpReflectors,
+            ConfigKey::NatUdpReflectorBind,
+            ConfigKey::TransportTlsClientConnectTimeoutMs,
+        ];
+        let mut exercised = 0;
+        for key in keys {
+            let Some(value) = sample(key) else { continue };
+            access::set(&mut config, key.as_str(), value)
+                .unwrap_or_else(|e| panic!("set {} = {value}: {e}", key.as_str()));
+            exercised += 1;
+        }
+        assert!(
+            exercised >= 15,
+            "only {exercised} keys were set; the guard is thin"
+        );
+
+        save_config(&path, &config).expect("save the edited config");
+        let final_config = load_config(&path).expect("load it back");
+
+        for key in keys {
+            let Some(value) = sample(key) else { continue };
+            let got = access::get(&final_config, key.as_str())
+                .unwrap_or_else(|e| panic!("get {}: {e}", key.as_str()));
+            assert_eq!(
+                got,
+                value,
+                "`{}` was set to `{value}` and came back `{got}` after a save: \
+                 the TOML patcher does not write this field",
+                key.as_str()
+            );
+        }
     }
 }

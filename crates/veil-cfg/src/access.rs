@@ -22,6 +22,8 @@ pub fn get(config: &Config, key: &str) -> Result<String> {
         ConfigKey::GlobalAdminSocket => Ok(option_to_string(config.global.admin_socket.as_deref())),
         ConfigKey::GlobalLogs => Ok(config.global.logs.to_string()),
         ConfigKey::GlobalLogFile => Ok(option_to_string(config.global.log_file.as_deref())),
+        ConfigKey::GlobalBootstrap => Ok(config.global.bootstrap.to_string()),
+        ConfigKey::GlobalLocalDiscovery => Ok(config.global.local_discovery.to_string()),
         ConfigKey::IpcEnabled => Ok(config.ipc.enabled.to_string()),
         ConfigKey::IpcSocketUri => Ok(option_to_string(config.ipc.socket_uri.as_deref())),
         ConfigKey::IpcAppSocketDir => Ok(option_to_string(
@@ -138,6 +140,18 @@ pub fn set(config: &mut Config, key: &str, value: &str) -> Result<()> {
         }
         ConfigKey::GlobalLogFile => {
             config.global.log_file = parse_optional_string(value);
+            Ok(())
+        }
+        // The two switches that decide what this node tells the world about
+        // itself. Reachable from `config set` because the operator is the
+        // only one who may turn them on, and a flag that can be edited only
+        // by hand in a TOML file is a flag most operators never find.
+        ConfigKey::GlobalBootstrap => {
+            config.global.bootstrap = parse_bool(key, value)?;
+            Ok(())
+        }
+        ConfigKey::GlobalLocalDiscovery => {
+            config.global.local_discovery = parse_bool(key, value)?;
             Ok(())
         }
         ConfigKey::IpcEnabled => {
