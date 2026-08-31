@@ -969,6 +969,14 @@ pub struct AdminBootstrapStatus {
     /// read `lan_discovery.found` in the log.
     #[serde(default)]
     pub local_discovery: bool,
+    /// Layer 7: whether this node looks for peers on BitTorrent's Mainline
+    /// DHT, and when (`global.mainline_discovery`).
+    ///
+    /// Counted in [`Self::healthy_layers`] whenever it is not `off`, including
+    /// `fallback` — a layer that runs only when the others failed is still a
+    /// way this node can find its first peer, which is what the count means.
+    #[serde(default)]
+    pub mainline_discovery: String,
     /// Whether this node OFFERS ITSELF as a public entry point
     /// (`global.bootstrap`). Deliberately not one of the layers and
     /// deliberately not counted in [`Self::healthy_layers`]: the layers are
@@ -983,7 +991,7 @@ pub struct AdminBootstrapStatus {
     /// doesn't have to re-derive verdict criteria.
     pub healthy_layers: u8,
     /// Total layer count — surfaced so a future binary adding a layer
-    /// can render correctly against an older operator UI. Currently 6.
+    /// can render correctly against an older operator UI. Currently 7.
     pub total_layers: u8,
 }
 

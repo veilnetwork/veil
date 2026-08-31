@@ -4981,6 +4981,7 @@ dependencies = [
  "veil-ipc",
  "veil-local-transport",
  "veil-mailbox",
+ "veil-mainline",
  "veil-memory",
  "veil-mesh",
  "veil-nat",
