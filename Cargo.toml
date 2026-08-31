@@ -25,6 +25,7 @@ members = [
     "crates/veil-ipc",
     "crates/veil-local-transport",
     "crates/veil-mailbox",
+    "crates/veil-mainline",
     "crates/veil-memory",
     "crates/veil-mesh",
     "crates/veil-node-runtime",
