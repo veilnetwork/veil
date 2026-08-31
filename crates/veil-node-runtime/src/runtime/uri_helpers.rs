@@ -243,7 +243,7 @@ mod reach_tests {
     fn a_hostname_is_treated_as_global() {
         assert_eq!(host_reach("tcp://seed.example.org:9000"), HostReach::Global);
         assert_eq!(
-            host_reach("obfs4-tcp://198.51.100.11:5557"),
+            host_reach("obfs4-tcp://203.0.113.146:5557"),
             HostReach::Global
         );
         assert_eq!(host_reach("not-a-uri"), HostReach::Global);
@@ -259,7 +259,7 @@ mod reach_tests {
                 "a loopback address cannot name another node, whatever we are"
             );
             assert!(
-                !is_undialable_from_here("tcp://198.51.100.11:5557", site_local),
+                !is_undialable_from_here("tcp://203.0.113.146:5557", site_local),
                 "a public address is always worth keeping"
             );
         }

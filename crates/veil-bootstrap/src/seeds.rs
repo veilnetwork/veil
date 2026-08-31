@@ -98,84 +98,39 @@ pub fn builtin_seeds() -> Vec<BootstrapPeer> {
 /// `assets/testnet/seeds.json` and checked against this list in both
 /// directions by `test/bundled_seeds_match_builtin_test.dart` over there.
 pub fn testnet_seeds() -> Vec<BootstrapPeer> {
-    vec![
-        // TESTNET_SEEDS_BEGIN
-        veil_types::BootstrapPeer {
-            transport: "obfs4-tcp://198.51.100.11:5557".to_owned(),
-            public_key: "w/WPXT94DKI4CfgvJo3ti828dx/iYgncgOvXrbA8aBQ=".to_owned(),
-            nonce: "AE1JRw==".to_owned(),
-            algo: veil_types::SignatureAlgorithm::Ed25519,
-            tls_cert: None,
-            tls_ca_cert: None,
-        },
-        veil_types::BootstrapPeer {
-            transport: "obfs4-tcp://198.51.100.11:5557".to_owned(),
-            public_key: "muTNaMipdTGItwXorxG9sdJuJ91+YM8CSU7xhdmv/TE=".to_owned(),
-            nonce: "AQdiPQ==".to_owned(),
-            algo: veil_types::SignatureAlgorithm::Ed25519,
-            tls_cert: None,
-            tls_ca_cert: None,
-        },
-        veil_types::BootstrapPeer {
-            transport: "obfs4-tcp://198.51.100.11:5557".to_owned(),
-            public_key: "mZneNgnM8qo9aqxzB6EDt7fC1BA4Plwqr/+p8Pj7ORc=".to_owned(),
-            nonce: "AAAzoQ==".to_owned(),
-            algo: veil_types::SignatureAlgorithm::Ed25519,
-            tls_cert: None,
-            tls_ca_cert: None,
-        },
-        // TESTNET_SEEDS_END
-    ]
+    // Empty for the same reason as the production list, and it matters as
+    // much: the testnet ran on the SAME three hosts, so leaving these here
+    // would have published exactly the addresses the production list stopped
+    // publishing.
+    //
+    // A testnet node is given its peers with `peers add`, or finds them at the
+    // testnet's own rendezvous — `veil_mainline::rendezvous::Network::Testnet`
+    // derives a different point from production on purpose, so the two
+    // networks still cannot meet.
+    Vec::new()
 }
 
 #[cfg(feature = "production-seeds")]
 pub fn builtin_seeds() -> Vec<BootstrapPeer> {
-    // The public source ships with NO built-in seed nodes. Operators running
-    // their own network populate this list with their bootstrap nodes'
-    // transport URIs + Ed25519 pubkeys/nonces and build with
-    // `--features production-seeds`; until then a release build must use
-    // `--features allow-empty-seeds` and supply peers via config /
-    // `peers add` / DNS / an out-of-band bootstrap bundle.
+    // EMPTY, and that is the shipped state rather than an oversight.
     //
-    // veilnetwork production seed nodes (seed-a/2/3). obfs4-tcp, advertised by
-    // IP; the deployment-wide obfs4 PSK is supplied at runtime (it is a network
-    // anti-probe secret, NOT compiled in here). Ed25519 identity pubkey + PoW
-    // nonce per node (`config init -d 24`, lazy_mining pinned off so these stay
-    // stable). Built into the binary under `--features production-seeds`.
-    vec![
-        veil_types::BootstrapPeer {
-            transport: "obfs4-tcp://198.51.100.11:5556".to_owned(),
-            public_key: "VVxxLVptuXZ/qFV94aPP1daiz6ZYg2yf1JLbc1VHXhQ=".to_owned(),
-            nonce: "AdW8kw==".to_owned(),
-            algo: veil_types::SignatureAlgorithm::Ed25519,
-            tls_cert: None,
-            tls_ca_cert: None,
-        },
-        veil_types::BootstrapPeer {
-            transport: "obfs4-tcp://198.51.100.11:5556".to_owned(),
-            public_key: "9j/nd+Bm/lao9M+W/Bq+oee7X3H2JmR4w4vJ2ji2tU4=".to_owned(),
-            nonce: "AMiD9w==".to_owned(),
-            algo: veil_types::SignatureAlgorithm::Ed25519,
-            tls_cert: None,
-            tls_ca_cert: None,
-        },
-        veil_types::BootstrapPeer {
-            transport: "obfs4-tcp://198.51.100.11:5556".to_owned(),
-            public_key: "cjuRf8cH3KLWqwAT89NRn+8QG7JsXc6PH4jXjOM7SJM=".to_owned(),
-            nonce: "ACr87g==".to_owned(),
-            algo: veil_types::SignatureAlgorithm::Ed25519,
-            tls_cert: None,
-            tls_ca_cert: None,
-        },
-        veil_types::BootstrapPeer {
-            transport: "obfs4-tcp://198.51.100.14:5556".to_owned(),
-            public_key: "+RJLf6DKWlA9mib0Iv0lcmeNwZGkdnYFI4bxl1WKvjQ=".to_owned(),
-            nonce: "ASju2g==".to_owned(),
-            algo: veil_types::SignatureAlgorithm::Ed25519,
-            tls_cert: None,
-            tls_ca_cert: None,
-        },
-    ]
+    // A compiled-in seed list is a list of addresses the project publishes,
+    // and a list the project publishes is a list somebody can be served notice
+    // about. It also named, in the open, the machines the people who write
+    // this software run. Bootstrap layers 6 and 7 exist so that a node can
+    // find its first peer without one: the local network, and a rendezvous on
+    // a public index nobody operates.
+    //
+    // An operator running their own network populates this and builds with
+    // `--features production-seeds`, exactly as the module doc says. The
+    // doc said "the public source ships with NO built-in seed nodes" for a
+    // long time while four entries sat here; now it is true.
+    //
+    // A node with nothing here still has: `[[bootstrap_peers]]` an operator
+    // wrote, `bootstrap_https_urls`, `bootstrap_dns_domain`, the
+    // discovered-peer cache from previous runs, the LAN, and the Mainline DHT
+    // rendezvous.
+    Vec::new()
 }
 
 /// DHT key under which the dynamically-published bootstrap bundle lives
