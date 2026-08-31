@@ -739,11 +739,11 @@ mod walk_origin_auth_tests {
     fn a_peer_we_never_reached_is_not_passed_on() {
         let known = vec![
             (
-                pex_peer(0x11, "obfs4-tcp://198.51.100.11:5556"),
+                pex_peer(0x11, "obfs4-tcp://203.0.113.145:5556"),
                 Instant::now(),
             ),
             (
-                pex_peer(0x22, "obfs4-tcp://198.51.100.11:5557"),
+                pex_peer(0x22, "obfs4-tcp://203.0.113.145:5557"),
                 Instant::now(),
             ),
         ];
@@ -758,7 +758,7 @@ mod walk_origin_auth_tests {
             .collect();
         assert_eq!(
             served,
-            vec!["obfs4-tcp://198.51.100.11:5556"],
+            vec!["obfs4-tcp://203.0.113.145:5556"],
             "only the peer we hold a session with may be handed on"
         );
     }

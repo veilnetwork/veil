@@ -656,7 +656,7 @@ mod tests {
         let public = state_with(
             vec![listen_entry(
                 "obfs4-tcp://0.0.0.0:5556",
-                Some("tcp://198.51.100.11:5556"),
+                Some("tcp://203.0.113.146:5556"),
             )],
             vec![],
             &dir,
@@ -700,12 +700,12 @@ mod tests {
         let state = state_with(
             vec![listen_entry(
                 "obfs4-tcp://0.0.0.0:5556",
-                Some("tcp://198.51.100.11:5556"),
+                Some("tcp://203.0.113.146:5556"),
             )],
             vec![
                 peer_entry(1, [0x01u8; 32], "tcp://127.0.0.1:9000"),
                 peer_entry(2, [0x02u8; 32], "obfs4-tcp://192.168.1.70:5599"),
-                peer_entry(3, [0x03u8; 32], "obfs4-tcp://198.51.100.11:5556"),
+                peer_entry(3, [0x03u8; 32], "obfs4-tcp://203.0.113.145:5556"),
             ],
             &config_path,
         );
@@ -716,7 +716,7 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
 
         assert!(
-            written.contains("198.51.100.11"),
+            written.contains("203.0.113.145"),
             "a reachable peer must survive: {written}"
         );
         assert!(
@@ -752,11 +752,11 @@ mod tests {
         let state = state_with(
             vec![listen_entry(
                 "obfs4-tcp://0.0.0.0:5556",
-                Some("tcp://198.51.100.11:5556"),
+                Some("tcp://203.0.113.146:5556"),
             )],
             vec![
-                peer_entry(1, reached, "obfs4-tcp://198.51.100.11:5556"),
-                peer_entry(2, rumoured, "obfs4-tcp://198.51.100.11:5557"),
+                peer_entry(1, reached, "obfs4-tcp://203.0.113.145:5556"),
+                peer_entry(2, rumoured, "obfs4-tcp://203.0.113.145:5557"),
             ],
             &config_path,
         );
@@ -799,9 +799,9 @@ mod tests {
         let state = state_with(
             vec![listen_entry(
                 "obfs4-tcp://0.0.0.0:5556",
-                Some("tcp://198.51.100.11:5556"),
+                Some("tcp://203.0.113.146:5556"),
             )],
-            vec![peer_entry(1, tracked, "obfs4-tcp://198.51.100.11:5556")],
+            vec![peer_entry(1, tracked, "obfs4-tcp://203.0.113.145:5556")],
             &config_path,
         );
         lock_state(&state).handshaked.insert(stranger);
