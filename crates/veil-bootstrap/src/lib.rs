@@ -13,6 +13,7 @@ pub mod encrypted_invite;
 pub mod https;
 pub mod invite;
 pub mod lan;
+pub mod lan_service;
 pub mod seeds;
 pub mod signed_bundle;
 pub mod signed_invite;
@@ -40,6 +41,7 @@ pub use lan::{
     LanAnnounce, LanScheme, MAX_ANNOUNCE_BYTES, decode_announce as decode_lan_announce,
     encode_announce as encode_lan_announce,
 };
+pub use lan_service::{DEFAULT_ANNOUNCE_INTERVAL, LanDiscovery};
 pub use seeds::{
     bootstrap_bundle_dht_key, builtin_seeds, decode_bootstrap_bundle, encode_bootstrap_bundle,
 };
