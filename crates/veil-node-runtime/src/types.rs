@@ -139,6 +139,25 @@ pub enum PeerSource {
     Exchanged,
     /// Discovered via mesh beacon autodiscovery.
     Autodiscovered,
+    /// Found at a rendezvous on a public index nobody operates (bootstrap
+    /// layer 7).
+    ///
+    /// The index gives an address and no identity, so this node dials with no
+    /// expectation and writes down whoever the handshake proved. That is why
+    /// this is its own source and not `Autodiscovered`: a beacon names a node,
+    /// a public index names a socket.
+    Rendezvous,
+}
+
+impl PeerSource {
+    /// Every source, so a guard can walk them rather than trust a list.
+    pub const ALL: &'static [PeerSource] = &[
+        Self::Configured,
+        Self::Bootstrap,
+        Self::Exchanged,
+        Self::Autodiscovered,
+        Self::Rendezvous,
+    ];
 }
 
 impl std::fmt::Display for PeerSource {
@@ -148,6 +167,7 @@ impl std::fmt::Display for PeerSource {
             Self::Bootstrap => f.write_str("bootstrap"),
             Self::Exchanged => f.write_str("exchanged"),
             Self::Autodiscovered => f.write_str("autodiscovered"),
+            Self::Rendezvous => f.write_str("rendezvous"),
         }
     }
 }

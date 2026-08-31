@@ -388,6 +388,15 @@ pub struct AttachedDebugSession {
     pub metrics: Option<Arc<NodeMetrics>>,
     /// Authenticated peer node_id from the handshake.
     pub peer_id: NodeId,
+    /// The peer's Ed25519 public key and PoW nonce, base64, AS PROVEN by this
+    /// handshake — not as any row claimed them beforehand.
+    ///
+    /// Carried because a peer can be met with no prior claim at all. A peer
+    /// found on a public index is an address and nothing else; everything
+    /// durable this node then says about it has to come from what the other
+    /// side proved, and this is where that arrives.
+    pub peer_public_key: String,
+    pub peer_nonce: String,
     /// WHICH DEVICE of `peer_id` this session ends at, when the handshake
     /// proved one (or a resumption ticket named one). `None` for peers with no
     /// sovereign identity, and for a resumption that could not resolve the
@@ -6404,16 +6413,35 @@ impl NodeServices {
             .info("peer.connect.success", format!("peer_id={peer_id}"));
         // Outbound sessions never hit the handoff-bound path (that branch
         // is inbound-only), so `Ok(None)` here is a defensive impossibility.
-        register_connection_session(
-            session_ctx,
-            SessionSource::Outbound(peer_id),
+        // An expectation only when the row HAS one.
+        //
+        // Every other way this node learns of a peer comes with a claimed
+        // identity, and checking the handshake against it is what catches an
+        // address takeover. A peer found on a public index comes with an
+        // address and nothing else -- there is no claim to check, so demanding
+        // one would mean either inventing a claim (which would then always
+        // "mismatch") or never dialling at all.
+        //
+        // What is NOT weakened: the handshake still proves who answered, and
+        // the caller writes its record from that proof. An adversary at the
+        // announced address gets to be a peer of ours, exactly as one at a
+        // seed address does -- and being an entry point is all either of them
+        // becomes.
+        let expected = if peer_handshake::outbound_expects_an_identity(&peer) {
             Some(ExpectedPeerIdentity {
                 peer_id,
                 public_key: peer.public_key,
                 node_id: peer.node_id,
                 nonce: peer.nonce,
                 row_transport_at_dial: peer.transport,
-            }),
+            })
+        } else {
+            None
+        };
+        register_connection_session(
+            session_ctx,
+            SessionSource::Outbound(peer_id),
+            expected,
             None,
             session_state,
             connection,
