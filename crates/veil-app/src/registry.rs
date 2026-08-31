@@ -522,7 +522,7 @@ impl AppEndpointRegistry {
             let seen = inner.unroutable.entry(key).or_insert(0);
             *seen += 1;
             let count = *seen;
-            if count == 1 || count % 500 == 0 {
+            if count == 1 || count.is_multiple_of(500) {
                 log::warn!(
                     "app_endpoint: NO ENDPOINT — dropped {count} message(s) for \
                      app_id={} endpoint_id={}; nothing is registered to receive \
