@@ -780,8 +780,22 @@ fn render_bootstrap_status(s: &node::AdminBootstrapStatus) -> String {
          L4 DNS bootstrap domain   : {}\n\
          L5 discovered-peer cache  : {}\n\
          \n\
+         public entry point        : {}\n\
+         \n\
          {verdict}",
-        s.config_peers, s.builtin_seeds, https_row, dns_row, cache_row,
+        s.config_peers,
+        s.builtin_seeds,
+        https_row,
+        dns_row,
+        cache_row,
+        // Below the layers and outside the verdict on purpose: this is what
+        // the node OFFERS others, not a way it finds its own first peer.
+        if s.announces_publicly {
+            "yes — this node's address is announced on public discovery \
+             networks and can be enumerated by anyone"
+        } else {
+            "no (default) — this node asks and listens, and publishes nothing"
+        },
     )
 }
 
@@ -1096,6 +1110,7 @@ mod tests {
             },
             healthy_layers: healthy,
             total_layers: 5,
+            announces_publicly: false,
         }
     }
 
