@@ -1975,7 +1975,10 @@ impl NodeRuntime {
                         // Already ours, by any route. See `rendezvous_address_is_new`.
                         let known: Vec<PeerConfigEntry> =
                             lock_state(&state).peers.values().cloned().collect();
-                        let live = live_session_addresses(&live_sessions);
+                        let live = addresses_we_already_hold(
+                            &live_sessions,
+                            &access.discovered_peers_cache,
+                        );
                         if !rendezvous_address_is_new(&known, &live, &transport) {
                             already_had += 1;
                             logger.debug(
@@ -2204,7 +2207,10 @@ impl NodeRuntime {
                             }
                             let known: Vec<PeerConfigEntry> =
                                 lock_state(&state).peers.values().cloned().collect();
-                            let live = live_session_addresses(&live_sessions);
+                            let live = addresses_we_already_hold(
+                                &live_sessions,
+                                &access.discovered_peers_cache,
+                            );
                             if !rendezvous_address_is_new(&known, &live, &transport) {
                                 already_had += 1;
                                 logger.debug(
@@ -5885,20 +5891,49 @@ pub fn builtin_seed_contribution(
 /// Measured on a live host: it found all three announcing nodes at the
 /// rendezvous, was already in session with every one of them, dialled all
 /// three anyway, and logged three timeouts.
-/// Every address this node currently holds a session to, as the session layer
-/// knows it — its transport URI and, when the two differ, the address the
-/// connection actually came from.
-fn live_session_addresses(
+/// Every address this node already holds a session to.
+///
+/// Two sources, because one is not enough and finding that out cost a
+/// production round-trip. An OUTBOUND session reports the address it dialled,
+/// which is the answer. An INBOUND one reports OUR OWN listener --
+/// `obfs4-tcp://0.0.0.0:5556`, the same string for every peer that ever
+/// connects -- and its `remote_addr` carries the far side's ephemeral source
+/// port, not the port it listens on. So an inbound session says nothing about
+/// where its peer can be dialled, and seeds, which meet each other inbound,
+/// went on re-dialling peers they were already talking to.
+///
+/// The missing half is identity. A session knows its peer's `node_id`, and the
+/// discovered-peer cache maps address to public key -- `dial_and_learn` writes
+/// that entry on every success. Deriving the id from the key joins the two.
+fn addresses_we_already_hold(
     live: &Arc<
         std::sync::Mutex<
             std::collections::BTreeMap<crate::types::LinkId, crate::types::SessionInfo>,
         >,
     >,
+    cache: &Arc<std::sync::Mutex<veil_bootstrap::DiscoveredPeerCache>>,
 ) -> Vec<String> {
-    lock!(live)
-        .values()
+    let sessions: Vec<crate::types::SessionInfo> = lock!(live).values().cloned().collect();
+    let mut out: Vec<String> = sessions
+        .iter()
         .flat_map(|s| std::iter::once(s.transport.clone()).chain(s.remote_addr.iter().cloned()))
-        .collect()
+        .collect();
+
+    let held: std::collections::HashSet<[u8; 32]> = sessions
+        .iter()
+        .filter_map(|s| s.node_id.map(|n| *n.as_bytes()))
+        .collect();
+    if held.is_empty() {
+        return out;
+    }
+    for peer in lock!(cache).snapshot() {
+        if let Ok(id) = veil_cfg::NodeId::from_public_key(peer.algo, &peer.public_key)
+            && held.contains(id.as_bytes())
+        {
+            out.push(peer.transport);
+        }
+    }
+    out
 }
 
 pub fn rendezvous_address_is_new(
@@ -7100,6 +7135,91 @@ mod tests {
         // otherwise the two assertions above would pass on a function that
         // refuses everything.
         assert!(admit_lan_peer("SOMEBODY-ELSE", "ME", &taken));
+    }
+
+    #[test]
+    fn an_inbound_peer_is_recognised_by_identity_not_by_address() {
+        // The half the first attempt missed. An inbound session reports OUR
+        // listener as its transport, so address comparison alone learns
+        // nothing from it -- and seeds meet each other inbound. The join is
+        // the peer's node_id, which the session knows, against the
+        // discovered-peer cache, which maps address to public key.
+        use veil_bootstrap::DiscoveredPeerCache;
+        use veil_cfg::{NodeId, SignatureAlgorithm};
+
+        // A real key, so the id derives the way production derives it.
+        let key = "fyU1fAlyHVNMat6NZBJ+KBU/aeJhCP+OBsomlgJ1Cjo=";
+        let their_id =
+            NodeId::from_public_key(SignatureAlgorithm::Ed25519, key).expect("a valid ed25519 key");
+
+        let mut cache = DiscoveredPeerCache::in_memory();
+        cache.upsert(
+            veil_cfg::BootstrapPeer {
+                transport: "obfs4-tcp://198.51.100.7:5556".to_owned(),
+                public_key: key.to_owned(),
+                nonce: "AOCZRA==".to_owned(),
+                algo: SignatureAlgorithm::Ed25519,
+                tls_cert: None,
+                tls_ca_cert: None,
+            },
+            1_700_000_000,
+        );
+        // A second entry, for a peer we are NOT talking to. Everything below
+        // that says "still dialled" is about this one.
+        cache.upsert(
+            veil_cfg::BootstrapPeer {
+                transport: "obfs4-tcp://198.51.100.9:5556".to_owned(),
+                public_key: "VVxxLVptuXZ/qFV94aPP1daiz6ZYg2yf1JLbc1VHXhQ=".to_owned(),
+                nonce: "AdW8kw==".to_owned(),
+                algo: SignatureAlgorithm::Ed25519,
+                tls_cert: None,
+                tls_ca_cert: None,
+            },
+            1_700_000_000,
+        );
+
+        // The session as an INBOUND one actually looks: our own listener, and
+        // no useful address anywhere in it.
+        let inbound = crate::types::SessionInfo {
+            link_id: crate::types::LinkId::new(1),
+            node_id: Some(their_id),
+            nonce: None,
+            matched_peer_id: None,
+            source: crate::types::SessionSource::Inbound(crate::types::ListenId::new(2)),
+            listener_handle: None,
+            state: crate::types::SessionState::Active,
+            transport: "obfs4-tcp://0.0.0.0:5556".to_owned(),
+            remote_addr: None,
+            description: String::new(),
+        };
+        let mut live = std::collections::BTreeMap::new();
+        live.insert(inbound.link_id, inbound);
+        let live = Arc::new(std::sync::Mutex::new(live));
+        let cache = Arc::new(std::sync::Mutex::new(cache));
+
+        let held = addresses_we_already_hold(&live, &cache);
+        assert!(
+            !rendezvous_address_is_new(&[], &held, "obfs4-tcp://198.51.100.7:5556"),
+            "a peer we hold an INBOUND session with was dialled again; that is \
+             the churn between two seeds, once per rendezvous pass"
+        );
+
+        // A cached address whose peer we are NOT in session with is still
+        // dialled, or the cache would silence the layer for everybody it has
+        // ever met. It has to be IN THE CACHE for this to test anything --
+        // an address the cache never heard of proves nothing about the join.
+        assert!(
+            rendezvous_address_is_new(&[], &held, "obfs4-tcp://198.51.100.9:5556"),
+            "an address we merely have in cache stopped being dialled"
+        );
+
+        // With no sessions at all the cache contributes nothing.
+        let empty = Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::new()));
+        assert!(rendezvous_address_is_new(
+            &[],
+            &addresses_we_already_hold(&empty, &cache),
+            "obfs4-tcp://198.51.100.7:5556"
+        ));
     }
 
     #[test]
