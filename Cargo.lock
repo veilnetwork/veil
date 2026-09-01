@@ -5110,12 +5110,16 @@ name = "veil-nostr"
 version = "0.9.1"
 dependencies = [
  "blake3",
+ "futures",
  "k256",
  "log",
  "rand_core 0.6.4",
  "serde",
  "serde_json",
  "sha2",
+ "tokio",
+ "tokio-tungstenite",
+ "veil-transport",
 ]
 
 [[package]]
