@@ -162,7 +162,8 @@ pub fn tag_value<'a>(event: &'a Event, name: &str) -> Option<&'a str> {
         .map(String::as_str)
 }
 
-fn hex_lower(bytes: &[u8]) -> String {
+/// Lower-case hex, as every field Nostr carries in JSON is written.
+pub fn hex_lower(bytes: &[u8]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut s = String::with_capacity(bytes.len() * 2);
     for b in bytes {
