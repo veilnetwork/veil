@@ -4119,8 +4119,8 @@ impl NodeRuntime {
             dns_domain,
             https_urls,
             announces_publicly,
-            local_discovery,
-            mainline_discovery,
+            meeting_points,
+            meeting_policy,
         ) = match veil_cfg::load_config(&self.config_path) {
             Ok(c) => (
                 c.bootstrap_peers.len(),
@@ -4130,8 +4130,8 @@ impl NodeRuntime {
                     .filter(|s| !s.trim().is_empty()),
                 c.global.bootstrap_https_urls.len(),
                 c.global.bootstrap,
-                c.global.local_discovery,
-                c.global.mainline_discovery,
+                c.global.meeting_points.clone(),
+                c.global.meeting_policy,
             ),
             // Reload failure shouldn't bring down the diag — fall back
             // to "0 / None" so the operator at least sees the cache and
@@ -4144,7 +4144,14 @@ impl NodeRuntime {
                 // False on a read failure, and that is the safe direction:
                 // claiming "I announce" when the config could not be read
                 // would tell an operator they are visible when nobody knows.
-                (0, None, 0, false, false, veil_cfg::MainlineDiscovery::Off)
+                (
+                    0,
+                    None,
+                    0,
+                    false,
+                    veil_cfg::MeetingPoints::Preset(veil_cfg::MeetingPointsPreset::Off),
+                    veil_cfg::MeetingPolicy::default(),
+                )
             }
         };
 
@@ -4188,8 +4195,7 @@ impl NodeRuntime {
             + (https_urls > 0) as u8
             + dns_domain.is_some() as u8
             + (discovered_cache.entries > 0) as u8
-            + local_discovery as u8
-            + mainline_discovery.ever_runs() as u8;
+            + meeting_points.enabled().len() as u8;
 
         AdminBootstrapStatus {
             config_peers,
@@ -4198,10 +4204,11 @@ impl NodeRuntime {
             dns_domain,
             discovered_cache,
             healthy_layers,
-            total_layers: 7,
+            total_layers: 5 + veil_cfg::MeetingPoint::ALL.len() as u8,
             announces_publicly,
-            local_discovery,
-            mainline_discovery: mainline_discovery.to_string(),
+            meeting_points_enabled: meeting_points.enabled().len() as u8,
+            meeting_points: meeting_points.to_string(),
+            meeting_policy: meeting_policy.to_string(),
         }
     }
 

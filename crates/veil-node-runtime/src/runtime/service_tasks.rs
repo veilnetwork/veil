@@ -1839,22 +1839,14 @@ impl NodeRuntime {
     /// looking costs a little exposure to the DHT nodes asked, being listed
     /// costs exposure to everyone.
     pub fn spawn_mainline_discovery_task(&mut self, config: &veil_cfg::Config) {
-        let mode = config.global.mainline_discovery;
-        if !mode.ever_runs() {
+        if !config
+            .global
+            .meeting_points
+            .includes(veil_cfg::MeetingPoint::DhtBitTorrent)
+        {
             return;
         }
         let my_pubkey = self.identity.local_identity.public_key.clone();
-        if !mode.runs_even_when_other_layers_worked() {
-            let cached = lock!(self.discovered_peers_cache).len();
-            if other_layers_offer_an_entry_point(config, &my_pubkey, cached) {
-                self.logger.info(
-                    "mainline.not_needed",
-                    "another bootstrap layer offers a way in; the DHT is not asked \
-                     (global.mainline_discovery = fallback)",
-                );
-                return;
-            }
-        }
 
         // What we would tell the LAN about ourselves answers the same question
         // here: which listener a stranger could dial. The DHT carries no scheme,
@@ -1867,6 +1859,8 @@ impl NodeRuntime {
             veil_mainline::rendezvous::Network::Production
         };
         let announce_self = config.global.bootstrap;
+        let policy = config.global.meeting_policy;
+        let live_sessions = Arc::clone(&self.live_sessions);
         let dial_scheme = rendezvous_dial_scheme(config, me.as_ref());
 
         let logger = self.logger.clone();
@@ -1898,6 +1892,21 @@ impl NodeRuntime {
                 logger.warn(
                     "mainline.no_routers",
                     "no public DHT router resolved; layer 7 has no way in",
+                );
+                return;
+            }
+
+            // WHEN, as opposed to where. Checked here rather than at spawn
+            // time: at spawn this node has no sessions yet, so a startup check
+            // would always read "nobody" and `fallback` would mean nothing.
+            let has_live_peer = !lock!(live_sessions).is_empty();
+            if !policy.permits_looking(has_live_peer, announce_self) {
+                logger.info(
+                    "mainline.not_needed",
+                    format!(
+                        "this node has peers and global.meeting_policy is {policy}; \
+                         the rendezvous is not asked"
+                    ),
                 );
                 return;
             }
@@ -2004,7 +2013,11 @@ impl NodeRuntime {
     /// [`MAX_LAN_PEERS`] contributions so a talkative neighbour cannot fill
     /// the peer table by itself.
     pub fn spawn_lan_discovery_task(&mut self, config: &veil_cfg::Config) {
-        if !config.global.local_discovery {
+        if !config
+            .global
+            .meeting_points
+            .includes(veil_cfg::MeetingPoint::LocalNetwork)
+        {
             return;
         }
         let my_pubkey = self.identity.local_identity.public_key.clone();
@@ -5750,46 +5763,6 @@ async fn dial_and_learn(
     Ok(named[..16.min(named.len())].to_owned())
 }
 
-/// Whether anything other than the Mainline DHT offers this node a way in.
-///
-/// The question `MainlineDiscovery::Fallback` asks. Deliberately the same
-/// layers `bootstrap-status` counts, and deliberately NOT layer 6: local
-/// discovery may or may not find a neighbour, nobody knows at startup, and a
-/// LAN with no other veil node on it would otherwise silence layer 7 for a
-/// machine that has nothing else.
-pub fn other_layers_offer_an_entry_point(
-    config: &veil_cfg::Config,
-    my_pubkey: &str,
-    discovered_cache_entries: usize,
-) -> bool {
-    other_layers_offer_an_entry_point_from(
-        config,
-        my_pubkey,
-        discovered_cache_entries,
-        veil_bootstrap::builtin_seeds(),
-    )
-}
-
-/// [`other_layers_offer_an_entry_point`] against an EXPLICIT seed list.
-///
-/// Split for the same reason `resolve_bootstrap_candidates_from` is: which
-/// seeds a binary shipped with is a build-feature decision, and a test that
-/// says "a node with nothing configured" cannot say it at all in a build whose
-/// seed list is non-empty. Asserting its own premise is how four tests in this
-/// file once failed under exactly the features CI passes.
-pub fn other_layers_offer_an_entry_point_from(
-    config: &veil_cfg::Config,
-    my_pubkey: &str,
-    discovered_cache_entries: usize,
-    seeds: Vec<veil_cfg::BootstrapPeer>,
-) -> bool {
-    !config.peers.is_empty()
-        || !resolve_bootstrap_candidates_from(config, my_pubkey, seeds).is_empty()
-        || !config.global.bootstrap_https_urls.is_empty()
-        || dns_seed_discovery_domain(config).is_some()
-        || discovered_cache_entries > 0
-}
-
 /// How many peers one LAN may contribute before this node stops listening to it.
 ///
 /// Anyone on the segment can announce, and an announce is cheap: without a
@@ -6666,88 +6639,33 @@ mod tests {
     }
 
     #[test]
-    fn the_dht_is_asked_only_when_nothing_else_offers_a_way_in() {
-        // The whole meaning of `mainline_discovery = fallback`: a user whose
-        // seeds answer never touches the DHT and never pays the exposure of
-        // asking it.
-        let bare = veil_cfg::Config::default();
-        assert!(
-            !other_layers_offer_an_entry_point_from(&bare, "ME", 0, Vec::new()),
-            "a node with nothing configured must be allowed to ask the DHT"
-        );
+    fn each_layer_runs_exactly_when_its_meeting_point_is_named() {
+        // One setting decides both layers now, and the mapping is the whole of
+        // it: a config that names one point must not start the other.
+        use veil_cfg::{MeetingPoint as P, MeetingPoints as M, MeetingPointsPreset as Pre};
 
-        // And a build that ships seeds has a way in, which is the case this
-        // test cannot state with the seed list its own binary happens to
-        // carry -- hence the explicit list above.
-        assert!(
-            other_layers_offer_an_entry_point_from(&bare, "ME", 0, vec![peer("SEED")]),
-            "a builtin seed is a way in"
-        );
+        let all = M::default();
+        for point in P::ALL {
+            assert!(all.includes(*point), "`all` does not run {point:?}");
+        }
 
-        // Each layer on its own is enough to make the ask unnecessary.
-        let mut with_peers = veil_cfg::Config::default();
-        with_peers.peers.push(veil_cfg::PeerConfig::default());
-        assert!(
-            other_layers_offer_an_entry_point_from(&with_peers, "ME", 0, Vec::new()),
-            "peers"
-        );
+        let off = M::Preset(Pre::Off);
+        for point in P::ALL {
+            assert!(!off.includes(*point), "`off` runs {point:?}");
+        }
 
-        let with_bootstrap = config_with(vec![peer("SEED")], veil_cfg::BuiltinSeedPolicy::Always);
-        assert!(
-            other_layers_offer_an_entry_point_from(&with_bootstrap, "ME", 0, Vec::new()),
-            "bootstrap peers"
-        );
-
-        let mut with_https = veil_cfg::Config::default();
-        with_https
-            .global
-            .bootstrap_https_urls
-            .push("https://example.invalid/seeds.json".to_owned());
-        assert!(
-            other_layers_offer_an_entry_point_from(&with_https, "ME", 0, Vec::new()),
-            "https"
-        );
-
-        let mut with_dns = veil_cfg::Config::default();
-        with_dns.global.bootstrap_dns_domain = Some("example.invalid".to_owned());
-        assert!(
-            other_layers_offer_an_entry_point_from(&with_dns, "ME", 0, Vec::new()),
-            "dns"
-        );
-
-        assert!(
-            other_layers_offer_an_entry_point_from(&bare, "ME", 1, Vec::new()),
-            "a cached peer from a previous run is a way in"
-        );
-
-        // Layer 6 deliberately does NOT count. Local discovery may or may not
-        // find a neighbour and nobody knows at startup; a LAN with no other
-        // veil node on it would otherwise silence layer 7 for a machine that
-        // has nothing else at all.
-        let mut with_lan = veil_cfg::Config::default();
-        with_lan.global.local_discovery = true;
-        assert!(
-            !other_layers_offer_an_entry_point_from(&with_lan, "ME", 0, Vec::new()),
-            "local discovery silenced the DHT on the strength of a maybe"
-        );
-    }
-
-    #[test]
-    fn the_three_discovery_states_mean_what_the_service_reads_them_as() {
-        // The service asks the setting two questions and nothing else. If the
-        // answers ever disagree with the names, a node would talk to the open
-        // internet under a setting whose name says it does not.
-        use veil_cfg::MainlineDiscovery as M;
-        assert!(!M::Off.ever_runs(), "off asked the DHT");
-        assert!(M::Fallback.ever_runs());
-        assert!(M::Always.ever_runs());
-        assert!(!M::Fallback.runs_even_when_other_layers_worked());
-        assert!(M::Always.runs_even_when_other_layers_worked());
-        assert_eq!(
-            M::default(),
-            M::Fallback,
-            "the default must be the one that stays quiet while other layers work"
-        );
+        // Named subsets, walked over every point so a third one added later
+        // has to be decided rather than inherited.
+        for point in P::ALL {
+            let only = M::Only(vec![*point]);
+            for other in P::ALL {
+                assert_eq!(
+                    only.includes(*other),
+                    other == point,
+                    "naming {point:?} alone got {other:?} wrong"
+                );
+            }
+        }
     }
 
     #[test]

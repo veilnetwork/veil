@@ -889,8 +889,8 @@ fn render_bootstrap_status(s: &node::AdminBootstrapStatus) -> String {
          L3 HTTPS bootstrap URLs   : {}\n\
          L4 DNS bootstrap domain   : {}\n\
          L5 discovered-peer cache  : {}\n\
-         L6 local network          : {}\n\
-         L7 public rendezvous      : {}\n\
+         L6+ meeting points        : {}\n\
+         L6+ when                  : {}\n\
          \n\
          public entry point        : {}\n\
          \n\
@@ -900,27 +900,28 @@ fn render_bootstrap_status(s: &node::AdminBootstrapStatus) -> String {
         https_row,
         dns_row,
         cache_row,
-        // A layer, and counted as one: this is a way this node finds its first
-        // peer, which is what the layers mean.
-        if s.local_discovery {
-            "on — asks the local network for peers, and tells it this machine \
-             runs a node"
-        } else {
-            "off (default) — nothing is sent to or expected from the local \
-             network"
+        // Layers, and counted as such: each is a way this node finds its first
+        // peer, which is what the count means. One row for the set rather than
+        // one per point, so a version that adds a point does not need this
+        // renderer changed to say so.
+        match s.meeting_points.as_str() {
+            "all" => format!(
+                "all ({}) — every place this build knows to ask",
+                s.meeting_points_enabled
+            ),
+            "off" => "off — this node asks nowhere and finds nothing by itself".to_owned(),
+            named => format!("{named} ({} of them)", s.meeting_points_enabled),
         },
-        match s.mainline_discovery.as_str() {
-            "always" =>
-                "always — asks BitTorrent's Mainline DHT for veil peers on every start".to_owned(),
-            "fallback" => "fallback (default) — asks the Mainline DHT only when no other layer \
-                           offers a way in"
-                .to_owned(),
-            "off" => "off — the Mainline DHT is never asked".to_owned(),
-            // A newer daemon than this CLI. Say what it said rather than
-            // guessing, and do not pretend the row is missing.
-            other => format!("{other} — this CLI does not know that state"),
+        match s.meeting_policy.as_str() {
+            "always" => "always — asked whether or not this node has peers".to_owned(),
+            "fallback" => {
+                "fallback (default) — asked only while this node has no peer; \
+                 announcing ignores this"
+                    .to_owned()
+            }
+            other => format!("{other} — this CLI does not know that policy"),
         },
-        // Below the layers and outside the verdict on purpose: this is what
+        // Below the layers and outside the verdict on purpose: this is what        // Below the layers and outside the verdict on purpose: this is what
         // the node OFFERS others, not a way it finds its own first peer.
         if s.announces_publicly {
             "yes — this node's address is announced on public discovery \
@@ -1229,8 +1230,9 @@ mod tests {
             + dns.is_some() as u8
             + (cache_entries > 0) as u8;
         node::AdminBootstrapStatus {
-            local_discovery: false,
-            mainline_discovery: "fallback".to_owned(),
+            meeting_points: "all".to_owned(),
+            meeting_points_enabled: 2,
+            meeting_policy: "fallback".to_owned(),
             config_peers,
             builtin_seeds: builtin,
             https_urls,
@@ -1432,90 +1434,56 @@ mod tests {
     #[test]
     fn every_layer_the_status_counts_has_a_row_an_operator_can_read() {
         // The failure this catches is a layer that exists in the count and
-        // nowhere on screen: `healthy_layers` would say 2/6 while the operator
-        // could only find five rows and had no way to tell which two.
+        // nowhere on screen: the operator sees a number and cannot tell which
+        // layers it stands for.
         let mut st = sample_bootstrap_status(1, 0, 0, None, 0, false);
-        st.local_discovery = true;
+        st.meeting_points = "all".to_owned();
+        st.meeting_points_enabled = 2;
         let r = render_bootstrap_status(&st);
-        for n in 1..=st.total_layers {
-            assert!(
-                r.contains(&format!("L{n} ")),
-                "layer {n} of {} has no row: {r}",
-                st.total_layers
-            );
+        for n in 1..=5u8 {
+            assert!(r.contains(&format!("L{n} ")), "layer {n} has no row: {r}");
         }
-        // And exactly as many rows as layers: a renderer with more rows than
-        // the status counts is claiming a layer nobody counted, and a status
-        // counting more than it renders hides one.
-        let rows = r
+        let points = r
             .lines()
-            .filter(|l| l.starts_with('L') && l.chars().nth(1).is_some_and(|c| c.is_ascii_digit()))
-            .count();
-        assert_eq!(
-            rows,
-            usize::from(st.total_layers),
-            "the renderer draws {rows} layer rows and the status counts {}",
-            st.total_layers
+            .find(|l| l.starts_with("L6+ "))
+            .unwrap_or_else(|| panic!("the meeting-point row is missing: {r}"));
+        assert!(
+            points.contains("all") && points.contains('2'),
+            "the row does not say what is enabled: {points}"
         );
 
-        let l6 = r
-            .lines()
-            .find(|l| l.starts_with("L6 "))
-            .unwrap_or_else(|| panic!("L6 row missing: {r}"));
-        assert!(l6.contains("on"), "L6 must say it is on: {l6}");
-
-        // And off is a state that says so, rather than an empty row.
-        st.local_discovery = false;
+        st.meeting_points = "off".to_owned();
+        st.meeting_points_enabled = 0;
         let off = render_bootstrap_status(&st);
-        let l6_off = off
+        let off_row = off
             .lines()
-            .find(|l| l.starts_with("L6 "))
-            .unwrap_or_else(|| panic!("L6 row missing when off: {off}"));
+            .find(|l| l.starts_with("L6+ "))
+            .unwrap_or_else(|| panic!("row missing when off: {off}"));
+        assert!(off_row.contains("off"), "off must name itself: {off_row}");
+
+        st.meeting_points = "dht_bit_torrent".to_owned();
+        st.meeting_points_enabled = 1;
+        let named = render_bootstrap_status(&st);
         assert!(
-            l6_off.contains("off (default)"),
-            "L6 off must name itself the default: {l6_off}"
+            named.contains("dht_bit_torrent"),
+            "a named point is not shown: {named}"
         );
     }
 
     #[test]
-    fn the_local_network_layer_counts_toward_the_verdict() {
-        // It is a way this node finds its first peer, which is what the
-        // verdict is about -- unlike the public-entry-point line, which is
-        // what it offers others and is deliberately outside the count.
-        let mut only_lan = sample_bootstrap_status(0, 0, 0, None, 0, false);
-        only_lan.local_discovery = true;
-        only_lan.healthy_layers = 1;
-        let r = render_bootstrap_status(&only_lan);
+    fn the_meeting_points_count_toward_the_verdict() {
+        // They are ways this node finds its first peer, which is what the
+        // verdict is about -- unlike the public-entry-point line, which is what
+        // it offers others and stays outside the count.
+        let mut only_points = sample_bootstrap_status(0, 0, 0, None, 0, false);
+        only_points.meeting_points = "all".to_owned();
+        only_points.meeting_points_enabled = 2;
+        only_points.healthy_layers = 2;
+        let r = render_bootstrap_status(&only_points);
         assert!(
-            r.contains("single bootstrap layer"),
-            "a node with only the LAN layer has one layer, not none: {r}"
+            r.contains("2/") && r.contains("layers healthy"),
+            "the verdict does not report the counts it was given: {r}"
         );
-    }
-
-    #[test]
-    fn every_network_can_be_named_and_a_typo_cannot_be_mistaken_for_one() {
-        use veil_mainline::rendezvous::Network;
-        // Walks the variants, so a third network added without a name here
-        // fails rather than being unreachable from the command line.
-        for network in Network::ALL {
-            let name = match network {
-                Network::Production => "production",
-                Network::Testnet => "testnet",
-            };
-            assert_eq!(
-                parse_rendezvous_network(name).expect("a named network"),
-                *network,
-                "`{name}` does not name {network:?}"
-            );
-        }
-        // And nothing else is accepted. A typo falling through to production
-        // would put a testnet operator on the production rendezvous.
-        for typo in ["", "Production", "prod", "test", "testnet ", "mainnet"] {
-            assert!(
-                parse_rendezvous_network(typo).is_err(),
-                "`{typo}` was accepted as a network"
-            );
-        }
     }
 
     // ── update-status renderer ────────────────────────────────

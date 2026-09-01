@@ -3727,47 +3727,33 @@ pub struct GlobalConfig {
     /// makes the operator visible.
     #[serde(default, skip_serializing_if = "is_false")]
     pub bootstrap: bool,
-    /// When `true`, this node looks for peers on its own local network and
-    /// tells that network it is there.
+    /// Where this node looks for its first peer — see [`MeetingPoints`].
     ///
-    /// Bootstrap layer 6. Every layer above it ends at somebody's
-    /// infrastructure — a compiled-in seed list, an HTTPS URL, a DNS domain.
-    /// This one ends at the wire in the building, which is the only entry
-    /// point no project can be asked to take down.
+    /// `"all"` by default, and that default carries weight now: the compiled-in
+    /// seed list is empty, so a node with no operator-named peers has these and
+    /// nothing else. A later version that adds a meeting point gives it to
+    /// every node on `"all"` without anybody editing a config, which is the
+    /// reason the default is a word and not a list.
     ///
-    /// Default `false`, and for the same reason as [`Self::bootstrap`] rather
-    /// than a different one: announcing on a LAN tells that LAN a machine on it
-    /// runs veil. On the operator's own network that is nothing; on a hotel,
-    /// campus or office network it is exactly the fact worth keeping. Only the
-    /// person at the keyboard knows which network they are on.
+    /// This is where a node LOOKS. Whether it offers itself at the same places
+    /// is [`Self::bootstrap`], and the two stay apart on purpose: asking costs
+    /// the address you ask from, being listed costs it to everyone.
     ///
-    /// The announce is deliberately shaped like BitTorrent's own local
-    /// discovery so that joining the group is unremarkable — see
-    /// `veil_bootstrap::lan` for what that does and does not buy, which is
-    /// less than the word "obfuscation" invites people to assume.
-    #[serde(default, skip_serializing_if = "is_false")]
-    pub local_discovery: bool,
-    /// Bootstrap layer 7: whether this node looks for peers on BitTorrent's
-    /// Mainline DHT, and when.
-    ///
-    /// NOT the same thing as `dht.participate`, which governs veil's OWN
-    /// distributed hash table. This is about a foreign network of millions of
-    /// nodes that knows nothing about veil, indexes twenty-byte keys, and
-    /// cannot be served notice about a veil developer because it is not run by
-    /// anybody.
-    ///
-    /// Three states rather than a flag, because the right answer differs by
-    /// what the node is. An app on somebody's phone should reach the DHT only
-    /// when nothing else worked — asking it costs a little exposure, and a
-    /// user whose seeds answer has no reason to pay it. A node an operator
-    /// runs deliberately should be there all the time, because a rendezvous
-    /// with somebody already at it is worth more to everyone else than it
-    /// costs that operator.
-    ///
-    /// See [`Self::bootstrap`] for the other half: looking is one decision,
-    /// being findable is a different one.
+    /// Note what `"all"` includes: the local network. Joining that group tells
+    /// the segment this machine speaks a peer-discovery protocol — mitigated by
+    /// it being BitTorrent's group, which is the least remarkable thing a host
+    /// can be doing, but not nothing. `meeting_points = ["dht_bit_torrent"]`
+    /// is the setting for somebody who minds.
     #[serde(default)]
-    pub mainline_discovery: MainlineDiscovery,
+    pub meeting_points: MeetingPoints,
+    /// When this node uses those points — see [`MeetingPolicy`].
+    ///
+    /// `fallback` by default: look while you have nobody, stop once you have
+    /// somebody. An operator running a node others rely on sets `always`.
+    /// Announcing (`global.bootstrap`) ignores this, on purpose: a node that
+    /// offers itself has to keep being there.
+    #[serde(default)]
+    pub meeting_policy: MeetingPolicy,
 
     /// Base64 public keys this node will accept from DNS bootstrap discovery.
     ///
@@ -4055,68 +4041,51 @@ impl GlobalConfig {
     }
 }
 
-/// When bootstrap layer 7 reaches for the Mainline DHT.
-#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+/// One place veil nodes agree to meet, on a network that is not veil's.
+///
+/// A meeting point is somewhere a node can ask "who else is here?" without the
+/// project running anything. That is the whole reason they exist: the seed
+/// list left the source, and something has to take its place that nobody can
+/// be served notice about.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
-pub enum MainlineDiscovery {
-    /// Never. Nothing is sent to the DHT and nothing is expected from it.
-    Off,
-    /// Only when layers 1 to 6 produced no entry point at all — the state the
-    /// log already calls `bootstrap.none`.
-    ///
-    /// The default, and the right one for an app: a user whose seeds answer
-    /// never touches the DHT, and a user whose seeds are blocked gets a way in
-    /// rather than a node that sits offline.
-    #[default]
-    Fallback,
-    /// Always, at startup and on a timer.
-    ///
-    /// What an operator sets on a node they run deliberately. A rendezvous is
-    /// only useful if somebody is at it, so a node that is always there is
-    /// worth more to everyone else than the exposure costs the operator — and
-    /// the operator is the one who gets to weigh that.
-    Always,
+pub enum MeetingPoint {
+    /// BitTorrent's Mainline DHT: millions of nodes, no operator, a twenty-byte
+    /// key it does not care about the meaning of.
+    DhtBitTorrent,
+    /// The wire in this building, over BitTorrent's local-discovery group.
+    /// Costs nothing to anybody outside it and cannot leave the segment.
+    LocalNetwork,
 }
 
-impl MainlineDiscovery {
-    /// Every state, so a guard can walk them rather than trust a list.
-    pub const ALL: &'static [MainlineDiscovery] = &[Self::Off, Self::Fallback, Self::Always];
+impl MeetingPoint {
+    /// Every point this build knows, so a guard can walk them rather than
+    /// trust a list somebody remembered to extend.
+    pub const ALL: &'static [MeetingPoint] = &[Self::DhtBitTorrent, Self::LocalNetwork];
 
-    /// The dotted-config spelling.
+    /// The config spelling.
     pub const fn as_str(self) -> &'static str {
         match self {
-            Self::Off => "off",
-            Self::Fallback => "fallback",
-            Self::Always => "always",
+            Self::DhtBitTorrent => "dht_bit_torrent",
+            Self::LocalNetwork => "local_network",
         }
-    }
-
-    /// Whether this state reaches the DHT when the other layers HAVE produced
-    /// an entry point.
-    pub const fn runs_even_when_other_layers_worked(self) -> bool {
-        matches!(self, Self::Always)
-    }
-
-    /// Whether this state reaches the DHT at all.
-    pub const fn ever_runs(self) -> bool {
-        !matches!(self, Self::Off)
     }
 }
 
-impl std::fmt::Display for MainlineDiscovery {
+impl std::fmt::Display for MeetingPoint {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(self.as_str())
     }
 }
 
-impl std::str::FromStr for MainlineDiscovery {
+impl std::str::FromStr for MeetingPoint {
     type Err = String;
 
     fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
         Self::ALL
             .iter()
             .copied()
-            .find(|candidate| candidate.as_str() == value)
+            .find(|c| c.as_str() == value)
             .ok_or_else(|| {
                 format!(
                     "expected one of {}",
@@ -4127,6 +4096,202 @@ impl std::str::FromStr for MainlineDiscovery {
                         .join(", ")
                 )
             })
+    }
+}
+
+/// The two words that stand for a whole set.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MeetingPointsPreset {
+    /// Every point this build knows — including ones a later version adds.
+    ///
+    /// The default, and the reason it is: a node that names its points
+    /// explicitly is frozen at the set that existed when somebody wrote the
+    /// line, and the whole point of adding meeting points is that a node with
+    /// no seed list gets more ways in, not the same one forever.
+    #[default]
+    All,
+    /// None. This node asks nobody and finds nothing by itself; it speaks only
+    /// to what an operator named.
+    Off,
+}
+
+/// WHEN a node uses its meeting points, as opposed to which ones.
+///
+/// Two axes on purpose. [`MeetingPoints`] says where this node is willing to
+/// look; this says whether it looks all the time or only when it has nobody.
+/// An app on somebody's phone has no reason to ask strangers anything while it
+/// is connected; a node an operator runs deliberately should be there whether
+/// or not it personally needs a peer, because somebody else does.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MeetingPolicy {
+    /// Look only while this node has no live peer at all.
+    ///
+    /// The default. A node that is connected asks nobody, which costs the
+    /// meeting points nothing and tells strangers nothing; a node that loses
+    /// every peer starts looking again on its own.
+    #[default]
+    Fallback,
+    /// Look every time, connected or not.
+    Always,
+}
+
+impl MeetingPolicy {
+    /// Every policy, so a guard can walk them.
+    pub const ALL: &'static [MeetingPolicy] = &[Self::Fallback, Self::Always];
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Fallback => "fallback",
+            Self::Always => "always",
+        }
+    }
+
+    /// Whether to LOOK right now.
+    ///
+    /// `announcing` forces it, and that is not a special case but the point:
+    /// a node that offers itself at a meeting point has to keep being there.
+    /// Gating the announce on "do I personally need a peer" would empty the
+    /// rendezvous exactly when the network is healthy — every node that had
+    /// found its peers would stop being findable, and the next node to arrive
+    /// would find nobody.
+    pub const fn permits_looking(self, has_live_peer: bool, announcing: bool) -> bool {
+        match self {
+            Self::Always => true,
+            Self::Fallback => announcing || !has_live_peer,
+        }
+    }
+}
+
+impl std::fmt::Display for MeetingPolicy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for MeetingPolicy {
+    type Err = String;
+
+    fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
+        Self::ALL
+            .iter()
+            .copied()
+            .find(|c| c.as_str() == value)
+            .ok_or_else(|| {
+                format!(
+                    "expected one of {}",
+                    Self::ALL
+                        .iter()
+                        .map(|c| c.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            })
+    }
+}
+
+/// Which meeting points this node uses to find its first peer.
+///
+/// Three shapes in the config file, and the middle one is the point:
+///
+/// ```toml
+/// meeting_points = "all"                              # the default
+/// meeting_points = "off"
+/// meeting_points = ["dht_bit_torrent", "local_network"]
+/// ```
+///
+/// LOOKING, not announcing. Whether this node offers ITSELF at these points is
+/// [`GlobalConfig::bootstrap`], and it stays a separate decision: asking costs
+/// the address you ask from, being listed costs it to everyone.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(untagged)]
+pub enum MeetingPoints {
+    /// `"all"` or `"off"`.
+    Preset(MeetingPointsPreset),
+    /// An explicit list. An empty list means the same as `"off"` and is
+    /// accepted rather than refused — a config that lists none is saying so.
+    Only(Vec<MeetingPoint>),
+}
+
+impl Default for MeetingPoints {
+    fn default() -> Self {
+        Self::Preset(MeetingPointsPreset::All)
+    }
+}
+
+impl MeetingPoints {
+    /// Whether `point` is one this node uses.
+    pub fn includes(&self, point: MeetingPoint) -> bool {
+        match self {
+            Self::Preset(MeetingPointsPreset::All) => true,
+            Self::Preset(MeetingPointsPreset::Off) => false,
+            Self::Only(list) => list.contains(&point),
+        }
+    }
+
+    /// Every point this node uses, in the order [`MeetingPoint::ALL`] declares
+    /// them so two nodes with the same config behave the same way.
+    pub fn enabled(&self) -> Vec<MeetingPoint> {
+        MeetingPoint::ALL
+            .iter()
+            .copied()
+            .filter(|p| self.includes(*p))
+            .collect()
+    }
+
+    /// Whether this node looks anywhere at all.
+    pub fn any(&self) -> bool {
+        !self.enabled().is_empty()
+    }
+
+    /// How the TOML patcher writes it: a bare word, or a list.
+    pub fn to_toml_value(&self) -> String {
+        match self {
+            Self::Preset(MeetingPointsPreset::All) => "\"all\"".to_owned(),
+            Self::Preset(MeetingPointsPreset::Off) => "\"off\"".to_owned(),
+            Self::Only(list) => format!(
+                "[{}]",
+                list.iter()
+                    .map(|p| format!("\"{}\"", p.as_str()))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        }
+    }
+}
+
+impl std::fmt::Display for MeetingPoints {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Preset(MeetingPointsPreset::All) => f.write_str("all"),
+            Self::Preset(MeetingPointsPreset::Off) => f.write_str("off"),
+            Self::Only(list) => f.write_str(
+                &list
+                    .iter()
+                    .map(|p| p.as_str())
+                    .collect::<Vec<_>>()
+                    .join(","),
+            ),
+        }
+    }
+}
+
+impl std::str::FromStr for MeetingPoints {
+    type Err = String;
+
+    /// Parses what `config set` accepts: `all`, `off`, or a comma-separated
+    /// list. The comma form exists because a command line has no arrays.
+    fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
+        match value.trim() {
+            "all" => Ok(Self::Preset(MeetingPointsPreset::All)),
+            "off" | "" => Ok(Self::Preset(MeetingPointsPreset::Off)),
+            list => list
+                .split(',')
+                .map(|name| name.trim().parse::<MeetingPoint>())
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .map(Self::Only),
+        }
     }
 }
 
@@ -4149,8 +4314,8 @@ impl Default for GlobalConfig {
             // Off. Announcing makes the operator visible, and that is
             // never a default.
             bootstrap: false,
-            local_discovery: false,
-            mainline_discovery: MainlineDiscovery::Fallback,
+            meeting_points: MeetingPoints::default(),
+            meeting_policy: MeetingPolicy::default(),
             bootstrap_dns_pinned_keys: Vec::new(),
             bootstrap_dns_allow_system: true,
             allow_identity_fallback: false,
@@ -5819,58 +5984,140 @@ mod epic_117_defaults {
     }
 
     #[test]
-    fn reaching_the_mainline_dht_has_three_states_and_the_default_is_the_quiet_one() {
-        // The boolean walk below cannot see this one -- it is not a boolean --
-        // so the default is asserted here by name. A tri-state has no generic
-        // "off", and the guard that walks `true`s would go on passing beside a
-        // setting that defaults to talking to the open internet.
-        assert_eq!(
-            GlobalConfig::default().mainline_discovery,
-            MainlineDiscovery::Fallback,
-            "the default must not reach the DHT while the other layers work"
+    fn the_policy_says_when_and_never_silences_an_announcing_node() {
+        use MeetingPolicy as P;
+
+        // The default keeps a connected node quiet and lets a stranded one
+        // look — which is the whole reason there are two axes.
+        assert_eq!(P::default(), P::Fallback);
+        assert!(
+            P::Fallback.permits_looking(false, false),
+            "a node with nobody must look"
         );
         assert!(
-            !MainlineDiscovery::default().runs_even_when_other_layers_worked(),
-            "the default reaches the DHT even when the node already has a peer"
+            !P::Fallback.permits_looking(true, false),
+            "a connected node kept asking"
         );
+        assert!(
+            P::Always.permits_looking(true, false),
+            "`always` stopped looking"
+        );
+        assert!(P::Always.permits_looking(false, false));
 
-        // Every state, walked rather than listed: a fourth added without a
-        // spelling or a meaning fails here.
-        assert_eq!(MainlineDiscovery::ALL.len(), 3);
-        for state in MainlineDiscovery::ALL {
-            let spelled = state.as_str();
-            assert_eq!(
-                spelled.parse::<MainlineDiscovery>().ok(),
-                Some(*state),
-                "`{spelled}` does not parse back to {state:?}"
+        // ANNOUNCING overrides the policy, and this is the assertion that
+        // matters most here. Gating the announce on "do I personally need a
+        // peer" would empty the rendezvous exactly when the network is
+        // healthy: every node that had found its peers would stop being
+        // findable, and the next arrival would find nobody.
+        for policy in P::ALL {
+            assert!(
+                policy.permits_looking(true, true),
+                "{policy} stopped an announcing node that already had peers"
             );
-            // And it survives the config file, which is a separate question
-            // from parsing a command-line word.
+        }
+
+        // Every policy is spellable and parses back.
+        assert!(!P::ALL.is_empty());
+        for policy in P::ALL {
+            assert_eq!(policy.as_str().parse::<P>().ok(), Some(*policy));
             let g = GlobalConfig {
-                mainline_discovery: *state,
+                meeting_policy: *policy,
                 ..GlobalConfig::default()
             };
             let back: GlobalConfig =
                 serde_json::from_str(&serde_json::to_string(&g).unwrap()).unwrap();
-            assert_eq!(
-                back.mainline_discovery, *state,
-                "{state:?} did not round-trip"
+            assert_eq!(back.meeting_policy, *policy, "{policy} did not round-trip");
+        }
+        for typo in ["", "on", "Always", "never"] {
+            assert!(
+                typo.parse::<P>().is_err(),
+                "`{typo}` was accepted as a policy"
             );
         }
+    }
 
-        // The two questions the runtime actually asks.
-        assert!(!MainlineDiscovery::Off.ever_runs());
-        assert!(MainlineDiscovery::Fallback.ever_runs());
-        assert!(MainlineDiscovery::Always.ever_runs());
-        assert!(!MainlineDiscovery::Off.runs_even_when_other_layers_worked());
-        assert!(!MainlineDiscovery::Fallback.runs_even_when_other_layers_worked());
-        assert!(MainlineDiscovery::Always.runs_even_when_other_layers_worked());
+    #[test]
+    fn meeting_points_default_to_all_and_every_shape_the_file_allows_round_trips() {
+        // The boolean walk below cannot see this one -- it is not a boolean --
+        // so the default is asserted here by name.
+        assert_eq!(
+            GlobalConfig::default().meeting_points,
+            MeetingPoints::Preset(MeetingPointsPreset::All),
+            "a node with no seed list must look everywhere it knows how to"
+        );
+        assert!(MeetingPoints::default().any());
 
-        // A word nobody defined is refused, not read as the default.
-        for typo in ["", "on", "true", "Always", "fall_back"] {
+        // Every point, walked rather than listed: a third added without a
+        // spelling fails here, and `all` must pick it up without anybody
+        // editing a config -- which is the whole reason `all` is a word.
+        assert!(!MeetingPoint::ALL.is_empty());
+        for point in MeetingPoint::ALL {
+            assert_eq!(
+                point.as_str().parse::<MeetingPoint>().ok(),
+                Some(*point),
+                "{point:?} does not parse back from its own spelling"
+            );
             assert!(
-                typo.parse::<MainlineDiscovery>().is_err(),
-                "`{typo}` was accepted as a discovery state"
+                MeetingPoints::default().includes(*point),
+                "`all` does not include {point:?}"
+            );
+            assert!(
+                !MeetingPoints::Preset(MeetingPointsPreset::Off).includes(*point),
+                "`off` includes {point:?}"
+            );
+        }
+        assert_eq!(
+            MeetingPoints::default().enabled().len(),
+            MeetingPoint::ALL.len()
+        );
+
+        // A named subset takes exactly what it names.
+        let only = MeetingPoints::Only(vec![MeetingPoint::DhtBitTorrent]);
+        assert!(only.includes(MeetingPoint::DhtBitTorrent));
+        assert!(!only.includes(MeetingPoint::LocalNetwork));
+        assert!(only.any());
+        // An empty list is a way of saying off, and is accepted as one.
+        assert!(!MeetingPoints::Only(Vec::new()).any());
+
+        // All three file shapes survive the config, which is what `untagged`
+        // has to buy: a word and an array in the same key.
+        for shape in [
+            MeetingPoints::Preset(MeetingPointsPreset::All),
+            MeetingPoints::Preset(MeetingPointsPreset::Off),
+            MeetingPoints::Only(vec![MeetingPoint::LocalNetwork]),
+            MeetingPoints::Only(MeetingPoint::ALL.to_vec()),
+        ] {
+            let g = GlobalConfig {
+                meeting_points: shape.clone(),
+                ..GlobalConfig::default()
+            };
+            let back: GlobalConfig =
+                serde_json::from_str(&serde_json::to_string(&g).unwrap()).unwrap();
+            assert_eq!(back.meeting_points, shape, "{shape:?} did not round-trip");
+        }
+
+        // And the command-line spelling, which has no arrays.
+        assert_eq!(
+            "all".parse::<MeetingPoints>().unwrap(),
+            MeetingPoints::Preset(MeetingPointsPreset::All)
+        );
+        assert_eq!(
+            "off".parse::<MeetingPoints>().unwrap(),
+            MeetingPoints::Preset(MeetingPointsPreset::Off)
+        );
+        assert_eq!(
+            "dht_bit_torrent, local_network"
+                .parse::<MeetingPoints>()
+                .unwrap(),
+            MeetingPoints::Only(vec![
+                MeetingPoint::DhtBitTorrent,
+                MeetingPoint::LocalNetwork
+            ])
+        );
+        for typo in ["ALL", "dht", "bittorrent", "dht_bit_torrent,nope"] {
+            assert!(
+                typo.parse::<MeetingPoints>().is_err(),
+                "`{typo}` was accepted as a meeting-point setting"
             );
         }
     }
@@ -5926,22 +6173,18 @@ mod epic_117_defaults {
         let bools = object.values().filter(|v| v.is_boolean()).count();
         assert!(bools > 0, "no booleans were examined; the guard is empty");
 
-        assert!(
-            !GlobalConfig::default().local_discovery,
-            "a node must not announce itself on whatever LAN it is plugged into"
-        );
+        // Looking is on by default; ANNOUNCING is the decision, and it is a
+        // separate one. A config that looks everywhere must still publish
+        // nothing until somebody says so.
         let g = GlobalConfig {
-            local_discovery: true,
+            meeting_points: MeetingPoints::default(),
             ..GlobalConfig::default()
         };
         let back: GlobalConfig = serde_json::from_str(&serde_json::to_string(&g).unwrap()).unwrap();
-        assert!(
-            back.local_discovery,
-            "the opt-in has to survive a round trip"
-        );
+        assert!(back.meeting_points.any(), "the default looks nowhere");
         assert!(
             !back.bootstrap,
-            "asking the LAN is not the same offer as being a public entry point"
+            "looking everywhere turned into offering itself everywhere"
         );
     }
 

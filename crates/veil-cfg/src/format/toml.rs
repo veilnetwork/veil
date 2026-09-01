@@ -121,8 +121,8 @@ fn update_document(document: &mut DocumentMut, config: &Config) -> Result<()> {
     // than write it — otherwise turning one off would leave `= false` behind
     // and read as a decision somebody took rather than a default.
     set_bool(global, "bootstrap", g.bootstrap);
-    set_bool(global, "local_discovery", g.local_discovery);
-    set_string(global, "mainline_discovery", g.mainline_discovery.as_str());
+    set_raw(global, "meeting_points", &g.meeting_points.to_toml_value());
+    set_string(global, "meeting_policy", g.meeting_policy.as_str());
 
     set_transport(document, &config.transport)?;
 
@@ -258,6 +258,25 @@ fn set_string_array(table: &mut Table, key: &str, values: &[String]) {
 /// `skip_serializing_if = "is_false"`: a file that never mentions them and a
 /// file that says `false` mean the same thing to the loader, and the shorter
 /// one does not look like somebody's decision.
+/// Write a value that is ALREADY TOML — a quoted word, or an array.
+///
+/// `meeting_points` is either, and rendering it through `set_string` would
+/// quote the array into a string the loader then refuses.
+fn set_raw(table: &mut Table, key: &str, toml_value: &str) {
+    match toml_value.parse::<Value>() {
+        Ok(parsed) => match table.get_mut(key).and_then(Item::as_value_mut) {
+            Some(existing) => replace_value(existing, parsed),
+            None => {
+                table[key] = Item::Value(parsed);
+            }
+        },
+        // Unparseable is a bug in the caller, not something to write half of.
+        Err(_) => {
+            table.remove(key);
+        }
+    }
+}
+
 fn set_bool(table: &mut Table, key: &str, new_value: bool) {
     if !new_value {
         table.remove(key);
@@ -1067,8 +1086,8 @@ mod every_settable_key_survives_a_save {
             ConfigKey::GlobalLogs => (7, Some("file")),
             ConfigKey::GlobalLogFile => (8, Some("/tmp/veil.log")),
             ConfigKey::GlobalBootstrap => (9, Some("true")),
-            ConfigKey::GlobalLocalDiscovery => (10, Some("true")),
-            ConfigKey::GlobalMainlineDiscovery => (11, Some("always")),
+            ConfigKey::GlobalMeetingPoints => (10, Some("dht_bit_torrent")),
+            ConfigKey::GlobalMeetingPolicy => (11, Some("always")),
             ConfigKey::IpcEnabled => (12, Some("true")),
             ConfigKey::IpcSocketUri => (13, Some("unix:///tmp/b.sock")),
             ConfigKey::IpcAppSocketDir => (14, Some("/tmp/apps")),
@@ -1121,8 +1140,8 @@ mod every_settable_key_survives_a_save {
             ConfigKey::GlobalLogs,
             ConfigKey::GlobalLogFile,
             ConfigKey::GlobalBootstrap,
-            ConfigKey::GlobalLocalDiscovery,
-            ConfigKey::GlobalMainlineDiscovery,
+            ConfigKey::GlobalMeetingPoints,
+            ConfigKey::GlobalMeetingPolicy,
             ConfigKey::IpcEnabled,
             ConfigKey::IpcSocketUri,
             ConfigKey::IpcAppSocketDir,

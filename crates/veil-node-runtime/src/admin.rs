@@ -959,24 +959,22 @@ pub struct AdminBootstrapStatus {
     pub dns_domain: Option<String>,
     /// Layer 5: discovered-peer cache from prior runs.
     pub discovered_cache: AdminDiscoveredCacheStatus,
-    /// Layer 6: whether this node looks for peers on its own local network
-    /// (`global.local_discovery`).
+    /// Layers 6 and 7 together: which meeting points this node uses to find
+    /// its first peer (`global.meeting_points`), rendered as the config says
+    /// it — `all`, `off`, or the names.
     ///
-    /// Counted in [`Self::healthy_layers`], unlike [`Self::announces_publicly`]
-    /// — this one IS a way this node finds its first peer, which is what the
-    /// count means. Configured, not probed: whether a neighbour is actually
-    /// out there is a question only the wire can answer, and the operator can
-    /// read `lan_discovery.found` in the log.
+    /// Each named point counts in [`Self::healthy_layers`], because each is a
+    /// way this node can find a peer, which is what the count means.
     #[serde(default)]
-    pub local_discovery: bool,
-    /// Layer 7: whether this node looks for peers on BitTorrent's Mainline
-    /// DHT, and when (`global.mainline_discovery`).
-    ///
-    /// Counted in [`Self::healthy_layers`] whenever it is not `off`, including
-    /// `fallback` — a layer that runs only when the others failed is still a
-    /// way this node can find its first peer, which is what the count means.
+    pub meeting_points: String,
+    /// How many of them there are, so a renderer can say "2 of 2" without
+    /// parsing the string above.
     #[serde(default)]
-    pub mainline_discovery: String,
+    pub meeting_points_enabled: u8,
+    /// When those points are used (`global.meeting_policy`): `fallback` or
+    /// `always`. Announcing ignores it — see `MeetingPolicy::permits_looking`.
+    #[serde(default)]
+    pub meeting_policy: String,
     /// Whether this node OFFERS ITSELF as a public entry point
     /// (`global.bootstrap`). Deliberately not one of the layers and
     /// deliberately not counted in [`Self::healthy_layers`]: the layers are
