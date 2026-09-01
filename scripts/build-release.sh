@@ -90,13 +90,15 @@ EOF
 }
 
 target=""
-# Phase 6.50.b audit fix: default to `production-seeds`.  Pre-fix the
-# default was `allow-empty-seeds`, which produced a binary that won't
-# bootstrap without operator-supplied peers — a production-deploy footgun
-# for a CI artifact that LOOKS production-ready.  Override with
-# `--features veil-bootstrap/allow-empty-seeds` for testnet builds.
-# When `--sign` is also set, allow-empty-seeds is rejected (see policy
-# block below).
+# Default to `production-seeds`, which now names a NETWORK rather than a
+# seed list: the public source compiles in no address under any of the three
+# flags, and a node finds its first peer at a meeting point instead.  The
+# flag still matters, because it is what says which network this binary
+# belongs to — and the networks are kept apart by their obfs4 PSK, so a
+# binary built for the wrong one cannot complete a handshake on the other.
+# Override with `--features veil-bootstrap/allow-empty-seeds` for a custom
+# deployment.  When `--sign` is also set, allow-empty-seeds is rejected
+# (see policy block below).
 features="veil-bootstrap/production-seeds"
 source_date_epoch="$DEFAULT_SOURCE_DATE_EPOCH"
 sign=false
@@ -137,15 +139,17 @@ if "$sign"; then
     echo "ERROR: at least one --binary-url required when --sign" >&2
     exit 2
   fi
-  # Phase 6.50.b audit fix: signed releases MUST NOT bundle
-  # `allow-empty-seeds` — that flag produces a binary that won't
-  # bootstrap without operator-supplied peers and is a production-deploy
-  # footgun.  Pre-fix nothing prevented a CI/operator from signing
-  # such an artifact.  Now the build script refuses to sign.
+  # A signed release is a PRODUCTION artifact, so it must say so: the
+  # network a binary belongs to is compiled in, and `allow-empty-seeds`
+  # names a custom deployment rather than production.  Signing one would
+  # hand people an artifact that looks official and speaks a network they
+  # did not ask for.  (Pre-2026-09 the reason given here was that the flag
+  # produced a binary with no seeds — true then, true of every flag now,
+  # and no longer what separates them.)
   if [[ "$features" == *"allow-empty-seeds"* ]]; then
     echo "ERROR: --sign incompatible with features='$features'" >&2
-    echo "       allow-empty-seeds builds will not bootstrap on their own;" >&2
-    echo "       signing such a binary creates a production-deploy footgun." >&2
+    echo "       allow-empty-seeds names a custom deployment, not production;" >&2
+    echo "       a signed artifact must say which network it belongs to." >&2
     echo "       Use --features veil-bootstrap/production-seeds for signed releases," >&2
     echo "       OR drop --sign for a testnet build." >&2
     exit 2

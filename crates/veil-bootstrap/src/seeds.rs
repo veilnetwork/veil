@@ -5,15 +5,23 @@
 //!
 //! # Updating seeds
 //!
-//! Edit the entries in `builtin_seeds` below. Each seed needs the node's
-//! public key (base64), nonce (base64), transport URI, and signature
-//! algorithm. Rebuild with `--features production-seeds` after changes.
+//! The public source ships NO seeds, on purpose: a compiled-in list is a
+//! list of addresses this project publishes, and one somebody can be served
+//! notice about. Public builds find their first peer at a meeting point
+//! instead (`global.meeting_points`).
+//!
+//! An operator running their OWN network populates `builtin_seeds` below --
+//! each entry needs the node's public key (base64), nonce (base64), transport
+//! URI and signature algorithm -- and rebuilds with
+//! `--features production-seeds`. The guard in this file's tests will fail
+//! until they say so there too, which is the intended way to notice.
 
 use veil_types::BootstrapPeer;
 
 // fail the build if the seed list is empty AND the operator
 // did not opt into an explicit stance. Requires one of:
-// * `production-seeds` — real seed entries populated in `builtin_seeds`.
+// * `production-seeds` — the production network. Ships with an EMPTY list;
+//   an operator running their own network populates `builtin_seeds`.
 // * `allow-empty-seeds` — testnet / custom-deployment, no builtins.
 // Dev builds (`debug_assertions`) and tests are exempt.
 //
@@ -29,10 +37,11 @@ use veil_types::BootstrapPeer;
     not(feature = "allow-empty-seeds"),
 ))]
 compile_error!(
-    "release build without seeds: populate `builtin_seeds()` in \
-     node/bootstrap/seeds.rs and build with `--features production-seeds`, \
-     `--features testnet-seeds` for the testnet, or opt in to \
-     `--features allow-empty-seeds` for a custom deployment."
+    "release build with no network chosen: pass `--features production-seeds` \
+     for the production network, `--features testnet-seeds` for the testnet, \
+     or `--features allow-empty-seeds` for a custom deployment. None of the \
+     three compiles in any address any more -- the choice is which network \
+     this binary belongs to, not whether it carries a seed list."
 );
 
 /// Hardcoded bootstrap seed list.
@@ -53,10 +62,11 @@ compile_error!(
 ///   bug surfaced by 5-node devnet smoke: node-0 ran with empty
 ///   `peers`/`bootstrap_peers` and fell back to the prod seeds.
 ///
-/// In a no-default-features release build the workspace `compile_error!`
-/// at the top of the file refuses to build without one of the two
-/// stances explicitly chosen, so production binaries can't accidentally
-/// ship with empty seeds either.
+/// In a no-default-features release build the `compile_error!` at the top
+/// of the file refuses to build until one of the three is chosen. What that
+/// choice settles is which NETWORK the binary belongs to; every one of them
+/// now ships an empty list, and a node finds its first peer at a meeting
+/// point instead.
 // under `allow-empty-seeds` (and not `production-seeds`
 // not test, not debug) the builtin list is empty by design — testnet
 // operators provide peers via `peers add` / DNS / OOB-bundle, and we
@@ -165,6 +175,35 @@ pub fn decode_bootstrap_bundle(blob: &[u8]) -> Result<Vec<BootstrapPeer>, String
 mod tests {
     use super::*;
     use veil_types::SignatureAlgorithm;
+
+    #[test]
+    fn the_public_source_publishes_no_address() {
+        // The invariant the seed lists were emptied FOR: a compiled-in list is
+        // a list of addresses this project publishes, and one somebody can be
+        // served notice about. It also named, in the open, the machines the
+        // people who write this software run.
+        //
+        // Nothing in the build enforces it -- `production-seeds` compiles
+        // whether the list has four entries or none, which is how it sat
+        // populated for months under a module doc that said it was empty. So
+        // it is enforced here.
+        //
+        // An operator running their OWN network is expected to populate
+        // `builtin_seeds` and change this test in the same commit. That is the
+        // point: the addresses go in deliberately, with the guard as the place
+        // it has to be said out loud, rather than by a merge nobody read.
+        assert!(
+            builtin_seeds().is_empty(),
+            "the build compiled in {} address(es); the public source ships none",
+            builtin_seeds().len()
+        );
+        assert!(
+            testnet_seeds().is_empty(),
+            "the testnet list has {} address(es) -- and it named the SAME hosts \
+             as production, so publishing it publishes them",
+            testnet_seeds().len()
+        );
+    }
 
     fn sample_peer() -> BootstrapPeer {
         BootstrapPeer {
