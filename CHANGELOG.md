@@ -1,5 +1,17 @@
 # Changelog
 
+## v0.10.2 — 2026-09-01
+
+**A peer is recognised by who it is, not only by where we dialled it.** 0.10.1
+stopped a node re-dialling peers it already had a session with, but only for
+sessions it had opened itself: an inbound session reports our own listener as
+its transport, and its remote address is the far side's ephemeral source port.
+Seeds meet each other inbound, so they went on meeting each other again on
+every rendezvous pass and rebuilding a session that was already working. The
+check now derives the peer's id from the discovered-peer cache, which
+`dial_and_learn` fills on every success, and compares that against the ids the
+session layer holds.
+
 ## v0.10.1 — 2026-09-01
 
 Two defects that 0.10.0 shipped and production found within the hour.
