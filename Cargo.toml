@@ -30,6 +30,7 @@ members = [
     "crates/veil-mesh",
     "crates/veil-node-runtime",
     "crates/veil-nat",
+    "crates/veil-nostr",
     "crates/veil-obfs4",
     "crates/veil-obfs4-smoke",
     "crates/veil-observability",
