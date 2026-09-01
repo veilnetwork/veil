@@ -17,8 +17,8 @@ pub enum ConfigKey {
     GlobalLogs,
     GlobalLogFile,
     GlobalBootstrap,
-    GlobalLocalDiscovery,
-    GlobalMainlineDiscovery,
+    GlobalMeetingPoints,
+    GlobalMeetingPolicy,
     IpcEnabled,
     IpcSocketUri,
     IpcAppSocketDir,
@@ -51,8 +51,8 @@ impl ConfigKey {
             "global.logs" => Ok(Self::GlobalLogs),
             "global.log_file" => Ok(Self::GlobalLogFile),
             "global.bootstrap" => Ok(Self::GlobalBootstrap),
-            "global.local_discovery" => Ok(Self::GlobalLocalDiscovery),
-            "global.mainline_discovery" => Ok(Self::GlobalMainlineDiscovery),
+            "global.meeting_points" => Ok(Self::GlobalMeetingPoints),
+            "global.meeting_policy" => Ok(Self::GlobalMeetingPolicy),
             "ipc.enabled" => Ok(Self::IpcEnabled),
             "ipc.socket_uri" => Ok(Self::IpcSocketUri),
             "ipc.app_socket_dir" => Ok(Self::IpcAppSocketDir),
@@ -87,8 +87,8 @@ impl ConfigKey {
             Self::GlobalLogs => "global.logs",
             Self::GlobalLogFile => "global.log_file",
             Self::GlobalBootstrap => "global.bootstrap",
-            Self::GlobalLocalDiscovery => "global.local_discovery",
-            Self::GlobalMainlineDiscovery => "global.mainline_discovery",
+            Self::GlobalMeetingPoints => "global.meeting_points",
+            Self::GlobalMeetingPolicy => "global.meeting_policy",
             Self::IpcEnabled => "ipc.enabled",
             Self::IpcSocketUri => "ipc.socket_uri",
             Self::IpcAppSocketDir => "ipc.app_socket_dir",
@@ -135,8 +135,8 @@ mod every_key_is_reachable {
             ConfigKey::GlobalLogs => 7,
             ConfigKey::GlobalLogFile => 8,
             ConfigKey::GlobalBootstrap => 9,
-            ConfigKey::GlobalLocalDiscovery => 10,
-            ConfigKey::GlobalMainlineDiscovery => 11,
+            ConfigKey::GlobalMeetingPoints => 10,
+            ConfigKey::GlobalMeetingPolicy => 11,
             ConfigKey::IpcEnabled => 12,
             ConfigKey::IpcSocketUri => 13,
             ConfigKey::IpcAppSocketDir => 14,
@@ -173,8 +173,8 @@ mod every_key_is_reachable {
             ConfigKey::GlobalLogs,
             ConfigKey::GlobalLogFile,
             ConfigKey::GlobalBootstrap,
-            ConfigKey::GlobalLocalDiscovery,
-            ConfigKey::GlobalMainlineDiscovery,
+            ConfigKey::GlobalMeetingPoints,
+            ConfigKey::GlobalMeetingPolicy,
             ConfigKey::IpcEnabled,
             ConfigKey::IpcSocketUri,
             ConfigKey::IpcAppSocketDir,
@@ -218,7 +218,7 @@ mod every_key_is_reachable {
         // Named on purpose, beside the general rule: these two are the ones an
         // operator MUST be able to turn on themselves, so their absence would
         // be a policy failure and not only a wiring one.
-        for key in ["global.bootstrap", "global.local_discovery"] {
+        for key in ["global.bootstrap", "global.meeting_points"] {
             assert!(
                 ConfigKey::parse(key).is_ok(),
                 "{key} cannot be set from the command line"

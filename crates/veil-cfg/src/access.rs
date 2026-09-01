@@ -23,8 +23,8 @@ pub fn get(config: &Config, key: &str) -> Result<String> {
         ConfigKey::GlobalLogs => Ok(config.global.logs.to_string()),
         ConfigKey::GlobalLogFile => Ok(option_to_string(config.global.log_file.as_deref())),
         ConfigKey::GlobalBootstrap => Ok(config.global.bootstrap.to_string()),
-        ConfigKey::GlobalLocalDiscovery => Ok(config.global.local_discovery.to_string()),
-        ConfigKey::GlobalMainlineDiscovery => Ok(config.global.mainline_discovery.to_string()),
+        ConfigKey::GlobalMeetingPoints => Ok(config.global.meeting_points.to_string()),
+        ConfigKey::GlobalMeetingPolicy => Ok(config.global.meeting_policy.to_string()),
         ConfigKey::IpcEnabled => Ok(config.ipc.enabled.to_string()),
         ConfigKey::IpcSocketUri => Ok(option_to_string(config.ipc.socket_uri.as_deref())),
         ConfigKey::IpcAppSocketDir => Ok(option_to_string(
@@ -151,19 +151,26 @@ pub fn set(config: &mut Config, key: &str, value: &str) -> Result<()> {
             config.global.bootstrap = parse_bool(key, value)?;
             Ok(())
         }
-        ConfigKey::GlobalLocalDiscovery => {
-            config.global.local_discovery = parse_bool(key, value)?;
-            Ok(())
-        }
-        ConfigKey::GlobalMainlineDiscovery => {
-            config.global.mainline_discovery =
-                value
-                    .parse::<crate::MainlineDiscovery>()
-                    .map_err(|reason| ConfigError::InvalidValue {
+        ConfigKey::GlobalMeetingPoints => {
+            config.global.meeting_points =
+                value.parse::<crate::MeetingPoints>().map_err(|reason| {
+                    ConfigError::InvalidValue {
                         key: key.as_str().to_owned(),
                         value: value.to_owned(),
                         reason,
-                    })?;
+                    }
+                })?;
+            Ok(())
+        }
+        ConfigKey::GlobalMeetingPolicy => {
+            config.global.meeting_policy =
+                value.parse::<crate::MeetingPolicy>().map_err(|reason| {
+                    ConfigError::InvalidValue {
+                        key: key.as_str().to_owned(),
+                        value: value.to_owned(),
+                        reason,
+                    }
+                })?;
             Ok(())
         }
         ConfigKey::IpcEnabled => {
