@@ -2180,7 +2180,7 @@ impl NodeRuntime {
                             // address check below catches it too, but only when
                             // this node has an address to compare -- and a node
                             // that announces always has an author.
-                            if my_authors.iter().any(|a| *a == event.pubkey) {
+                            if my_authors.contains(&event.pubkey) {
                                 logger.debug(
                                     "nostr.self",
                                     format!("{transport} is this node's own record"),
