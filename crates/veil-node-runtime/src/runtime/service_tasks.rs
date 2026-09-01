@@ -1941,6 +1941,16 @@ impl NodeRuntime {
                         break;
                     }
                     let transport = format!("{dial_scheme}://{addr}");
+                    // Already ours, by any route. See `rendezvous_address_is_new`.
+                    let known: Vec<PeerConfigEntry> =
+                        lock_state(&state).peers.values().cloned().collect();
+                    if !rendezvous_address_is_new(&known, &transport) {
+                        logger.debug(
+                            "mainline.already_known",
+                            format!("{transport} is already a peer; not dialled"),
+                        );
+                        continue;
+                    }
                     match dial_and_learn(&access, &state, &transport, taken).await {
                         Ok(node) => {
                             taken += 1;
@@ -5580,6 +5590,29 @@ pub fn builtin_seed_contribution(
     }
 }
 
+/// Whether a rendezvous address is worth a dial, given who this node already
+/// has.
+///
+/// The rendezvous names addresses, and a node that has been running for a
+/// while very likely already knows some of them — through PEX, through its
+/// cache, or because an operator wrote them down. Dialling one of those again
+/// does not add a peer: the second connection is a duplicate the far side
+/// drops, and this side reports it as `handshake timed out after 10s`, which
+/// reads like a network fault and is not one.
+///
+/// Measured on a live host: it found all three announcing nodes at the
+/// rendezvous, was already in session with every one of them, dialled all
+/// three anyway, and logged three timeouts.
+pub fn rendezvous_address_is_new(known: &[PeerConfigEntry], transport: &str) -> bool {
+    let authority = |uri: &str| uri.split_once("://").map(|(_, rest)| rest.to_owned());
+    let Some(want) = authority(transport) else {
+        return false;
+    };
+    !known
+        .iter()
+        .any(|p| authority(&p.transport).is_some_and(|have| have == want))
+}
+
 /// The transport scheme to dial a rendezvous address with.
 ///
 /// The DHT carries an address and no scheme, so this node has to supply one.
@@ -6448,6 +6481,22 @@ mod tests {
     // used to switch the seeds OFF, so the node swapped one single point of
     // failure for another. These pin the policy that lets it hold both.
 
+    fn row(source: crate::types::PeerSource, node: u8, transport: &str) -> PeerConfigEntry {
+        PeerConfigEntry {
+            peer_id: PeerId::new(7),
+            node_id: veil_cfg::NodeId::from([node; 32]),
+            public_key: String::new(),
+            nonce: String::new(),
+            transport: transport.to_owned(),
+            algo: veil_cfg::SignatureAlgorithm::Ed25519,
+            tls_cert: None,
+            tls_key: None,
+            tls_ca_cert: None,
+            bootstrap_only: false,
+            source,
+        }
+    }
+
     fn listener(uri: &str, advertise: Option<&str>) -> veil_cfg::ListenConfig {
         veil_cfg::ListenConfig {
             id: crate::types::ListenId::new(1),
@@ -6514,6 +6563,54 @@ mod tests {
         // otherwise the two assertions above would pass on a function that
         // refuses everything.
         assert!(admit_lan_peer("SOMEBODY-ELSE", "ME", &taken));
+    }
+
+    #[test]
+    fn an_address_this_node_already_has_is_not_dialled_again() {
+        // Measured, not imagined: a live host found all three announcing nodes
+        // at the rendezvous, was already in session with every one of them
+        // through PEX, dialled all three anyway, and logged three
+        // "handshake timed out after 10s" — which reads like a network fault
+        // and was a duplicate connection the far side dropped.
+        let known = vec![
+            row(
+                crate::types::PeerSource::Exchanged,
+                0xAA,
+                "obfs4-tcp://198.51.100.7:5556",
+            ),
+            row(
+                crate::types::PeerSource::Configured,
+                0xBB,
+                "tcp://198.51.100.8:5556",
+            ),
+        ];
+        assert!(
+            !rendezvous_address_is_new(&known, "obfs4-tcp://198.51.100.7:5556"),
+            "an address already held was treated as new"
+        );
+        // The AUTHORITY decides, not the whole URI: the same host reached over
+        // a different transport is the same machine, and a second session to
+        // it is the same duplicate.
+        assert!(
+            !rendezvous_address_is_new(&known, "tcp://198.51.100.7:5556"),
+            "the same host under another scheme was treated as new"
+        );
+        // A different port is a different node, and a genuinely new address is
+        // still worth a dial — or the guard would silence the whole layer.
+        assert!(rendezvous_address_is_new(
+            &known,
+            "obfs4-tcp://198.51.100.7:5557"
+        ));
+        assert!(rendezvous_address_is_new(
+            &known,
+            "obfs4-tcp://203.0.113.9:5556"
+        ));
+        assert!(
+            rendezvous_address_is_new(&[], "obfs4-tcp://203.0.113.9:5556"),
+            "a node with no peers must dial what it finds"
+        );
+        // Something unparseable is not dialled rather than dialled blindly.
+        assert!(!rendezvous_address_is_new(&known, "no-scheme-here"));
     }
 
     #[test]
