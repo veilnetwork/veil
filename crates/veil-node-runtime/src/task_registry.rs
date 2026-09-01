@@ -97,6 +97,12 @@ pub enum RuntimeService {
     /// `fallback`, the state an app should be in, it returns immediately
     /// unless nothing else offers a way in.
     MainlineDiscovery,
+    /// Bootstrap layer 8: peers found through public Nostr relays.
+    ///
+    /// Same policy as layer 7 and a different network underneath: WebSocket
+    /// over TLS on 443, which is the only one of the three meeting points a
+    /// network that drops UDP leaves working.
+    NostrDiscovery,
 
     // ── Sovereign identity ──────────────────────────────────
     /// Periodic re-publish of the node's sovereign `IdentityDocument`
@@ -222,6 +228,7 @@ impl RuntimeService {
         Self::BootstrapWatchdog,
         Self::LanDiscovery,
         Self::MainlineDiscovery,
+        Self::NostrDiscovery,
         Self::SovereignIdentityRepublish,
         Self::TicketKeyRotation,
         Self::MlKemKeyRotation,
@@ -293,6 +300,10 @@ mod all_covers_every_service {
             RuntimeService::BootstrapWatchdog => (20, "BootstrapWatchdog"),
             RuntimeService::LanDiscovery => (21, "LanDiscovery"),
             RuntimeService::MainlineDiscovery => (22, "MainlineDiscovery"),
+            // Appended rather than slotted next to 22: the ordinals are a
+            // fingerprint the guard compares against, and renumbering every
+            // service below would make an unrelated diff look like a change.
+            RuntimeService::NostrDiscovery => (49, "NostrDiscovery"),
             RuntimeService::SovereignIdentityRepublish => (23, "SovereignIdentityRepublish"),
             RuntimeService::TicketKeyRotation => (24, "TicketKeyRotation"),
             RuntimeService::MlKemKeyRotation => (25, "MlKemKeyRotation"),
@@ -348,6 +359,7 @@ mod all_covers_every_service {
             RuntimeService::BootstrapWatchdog,
             RuntimeService::LanDiscovery,
             RuntimeService::MainlineDiscovery,
+            RuntimeService::NostrDiscovery,
             RuntimeService::SovereignIdentityRepublish,
             RuntimeService::TicketKeyRotation,
             RuntimeService::MlKemKeyRotation,
