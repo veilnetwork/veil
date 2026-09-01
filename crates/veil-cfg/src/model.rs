@@ -4073,18 +4073,24 @@ pub enum MeetingPoint {
     /// The wire in this building, over BitTorrent's local-discovery group.
     /// Costs nothing to anybody outside it and cannot leave the segment.
     LocalNetwork,
+    /// Public Nostr relays, over TLS on 443. Reaches out of networks that
+    /// swallow UDP entirely, which is the half of the world the other two
+    /// points cannot serve.
+    Nostr,
 }
 
 impl MeetingPoint {
     /// Every point this build knows, so a guard can walk them rather than
     /// trust a list somebody remembered to extend.
-    pub const ALL: &'static [MeetingPoint] = &[Self::DhtBitTorrent, Self::LocalNetwork];
+    pub const ALL: &'static [MeetingPoint] =
+        &[Self::DhtBitTorrent, Self::LocalNetwork, Self::Nostr];
 
     /// The config spelling.
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::DhtBitTorrent => "dht_bit_torrent",
             Self::LocalNetwork => "local_network",
+            Self::Nostr => "nostr",
         }
     }
 }

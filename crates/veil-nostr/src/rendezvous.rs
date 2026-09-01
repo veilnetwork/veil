@@ -66,15 +66,26 @@ pub fn current_labels(network: Network, unix_seconds: u64) -> [String; 2] {
     ]
 }
 
-/// The Nostr identity this node posts as, derived from its veil identity.
+/// The Nostr identity this node posts as this epoch, derived from its veil
+/// identity and the epoch together.
 ///
 /// DERIVED, not reused. The veil identity signs things that matter; a Nostr
 /// key is a public handle posted to strangers' servers, and the two should not
 /// be the same secret even though nothing here would leak it. Derivation also
-/// means the node needs no extra key file, and that the same node reappears
-/// under the same handle after a restart — which is what makes a relay REPLACE
-/// its announcement instead of accumulating them.
-pub fn identity_from_seed(veil_secret: &[u8]) -> SigningKey {
+/// means the node needs no extra key file.
+///
+/// PER EPOCH, and that is not a detail. [`label`] moves every day so that
+/// nobody can watch one address and see who keeps arriving; a constant author
+/// key would hand back exactly what the rotation takes away, because a relay
+/// will happily serve every event by an author forever. An observer who sees
+/// this node once could then follow it across every epoch and every change of
+/// address, which is a better handle on it than the seed list it replaced.
+///
+/// Nothing is lost by moving it: peers filter on the label, never on the
+/// author, and within one epoch the key is fixed — so a node that restarts
+/// still REPLACES its own announcement rather than accumulating them, which is
+/// the one property the stable key was there for.
+pub fn identity_from_seed(veil_secret: &[u8], epoch: u64) -> SigningKey {
     // Counter loop: a 32-byte hash is a valid secp256k1 scalar with
     // overwhelming probability, but "overwhelming" is not "always", and a node
     // that panicked once in a billion starts would be impossible to diagnose.
@@ -83,6 +94,7 @@ pub fn identity_from_seed(veil_secret: &[u8]) -> SigningKey {
         h.update(DOMAIN);
         h.update(b"/identity");
         h.update(veil_secret);
+        h.update(&epoch.to_be_bytes());
         h.update(&counter.to_be_bytes());
         if let Ok(key) = SigningKey::from_bytes(h.finalize().as_bytes()) {
             return key;
@@ -97,6 +109,48 @@ mod tests {
     use std::collections::HashSet;
 
     const DAY: u64 = 24 * 60 * 60;
+
+    #[test]
+    fn the_author_moves_with_the_label_and_holds_still_inside_an_epoch() {
+        // The label rotates daily so nobody can watch one rendezvous and see
+        // who keeps arriving. An author key that did NOT rotate would give
+        // that back in full: relays serve every event by an author on request,
+        // so one sighting would follow this node across every epoch and every
+        // address it ever has.
+        let seed = [7u8; 32];
+        let mut authors = HashSet::new();
+        for epoch in 0..8u64 {
+            let a = hex_pubkey(&identity_from_seed(&seed, epoch));
+            assert!(
+                authors.insert(a),
+                "epoch {epoch} posts under an author some other epoch also uses; \
+                 the daily label rotation is then decorative"
+            );
+        }
+
+        // ...and STILL for the length of one, or a node that restarts posts a
+        // second announcement instead of replacing its own.
+        assert_eq!(
+            hex_pubkey(&identity_from_seed(&seed, 3)),
+            hex_pubkey(&identity_from_seed(&seed, 3)),
+            "the author is not stable within an epoch; announcements accumulate"
+        );
+
+        // Two nodes are two authors, in the same epoch.
+        assert_ne!(
+            hex_pubkey(&identity_from_seed(&seed, 3)),
+            hex_pubkey(&identity_from_seed(&[9u8; 32], 3)),
+            "two different veil identities share a Nostr handle"
+        );
+    }
+
+    fn hex_pubkey(key: &SigningKey) -> String {
+        key.verifying_key()
+            .to_bytes()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect()
+    }
 
     #[test]
     fn the_two_networks_never_meet_and_the_label_moves_daily() {
@@ -161,27 +215,18 @@ mod tests {
     }
 
     #[test]
-    fn the_nostr_handle_is_derived_stably_and_is_not_the_veil_key() {
-        // Stable: the same node must come back as the same handle, or a relay
-        // stores a new announcement each restart instead of replacing one.
+    fn the_nostr_handle_is_not_the_veil_key() {
+        // Stability and distinctness live in the rotation guard above; the
+        // claim here is the one that would be a leak rather than a nuisance.
+        // A public handle posted to strangers' servers must not be the key
+        // that signs things that matter.
         let seed = [7u8; 32];
-        let a = identity_from_seed(&seed);
-        let b = identity_from_seed(&seed);
-        assert_eq!(a.verifying_key().to_bytes(), b.verifying_key().to_bytes());
-
-        // Different nodes, different handles.
-        let other = identity_from_seed(&[8u8; 32]);
-        assert_ne!(
-            a.verifying_key().to_bytes(),
-            other.verifying_key().to_bytes()
-        );
-
-        // And NOT the veil secret itself: a public handle posted to strangers'
-        // servers should not be the key that signs things that matter.
-        assert_ne!(
-            a.to_bytes().as_slice(),
-            seed.as_slice(),
-            "the Nostr key is the veil secret"
-        );
+        for epoch in 0..4u64 {
+            assert_ne!(
+                identity_from_seed(&seed, epoch).to_bytes().as_slice(),
+                seed.as_slice(),
+                "epoch {epoch} posts under the veil secret itself"
+            );
+        }
     }
 }

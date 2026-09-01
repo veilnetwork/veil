@@ -5087,6 +5087,7 @@ dependencies = [
  "veil-memory",
  "veil-mesh",
  "veil-nat",
+ "veil-nostr",
  "veil-obfs4",
  "veil-observability",
  "veil-pending-ack",

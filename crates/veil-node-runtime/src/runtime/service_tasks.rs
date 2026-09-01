@@ -2012,6 +2012,195 @@ impl NodeRuntime {
         lock_tasks(&self.tasks).sessions.push(handle);
     }
 
+    /// Bootstrap layer 8: find peers through public Nostr relays.
+    ///
+    /// The same shape as layer 7 and for a different network: a node posts a
+    /// small signed record under a rendezvous label that moves daily, and
+    /// reads the records other nodes posted under it. What this one buys that
+    /// the DHT does not is TLS on 443 — the DHT is UDP, and a network that
+    /// drops UDP leaves layers 6 and 7 with nothing.
+    ///
+    /// Announcing stays with `global.bootstrap`, as it does at every meeting
+    /// point: looking costs exposure to the relays asked, being listed costs
+    /// exposure to anyone who reads them.
+    pub fn spawn_nostr_discovery_task(&mut self, config: &veil_cfg::Config) {
+        if !config
+            .global
+            .meeting_points
+            .includes(veil_cfg::MeetingPoint::Nostr)
+        {
+            return;
+        }
+        let my_pubkey = self.identity.local_identity.public_key.clone();
+        let me = lan_announce_for(config, &my_pubkey, &self.identity.local_identity.nonce);
+        // Separate from `me`, and needed only here: see `public_address_for`.
+        let my_address = public_address_for(config);
+        let network = if cfg!(feature = "testnet-seeds") {
+            veil_nostr::rendezvous::Network::Testnet
+        } else {
+            veil_nostr::rendezvous::Network::Production
+        };
+        let announce_self = config.global.bootstrap;
+        let policy = config.global.meeting_policy;
+        let want_peers = config.global.meeting_min_peers;
+        let live_sessions = Arc::clone(&self.live_sessions);
+        let dial_scheme = rendezvous_dial_scheme(config, me.as_ref());
+        let secret = self.identity.local_identity.private_key.clone();
+
+        let logger = self.logger.clone();
+        let access = self.access();
+        let state = Arc::clone(&self.state);
+        let ctx = Arc::clone(&self.transport_ctx);
+
+        let handle = supervised_spawn(Arc::clone(&self.logger), "nostr_discovery", async move {
+            use veil_nostr::client::{DEFAULT_TIMEOUT, PUBLIC_RELAYS, publish, query};
+            use veil_nostr::event::{KIND_APP_DATA, sign};
+            use veil_nostr::rendezvous::{current_labels, epoch_of, identity_from_seed};
+
+            let mut ticker = tokio::time::interval(RENDEZVOUS_INTERVAL);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                ticker.tick().await;
+                // Per pass, not at spawn: at spawn there are no sessions yet,
+                // so `fallback` would read "nobody" every time and mean nothing.
+                let live_peers = lock!(live_sessions).len();
+                if !policy.permits_looking(live_peers, want_peers, announce_self) {
+                    logger.debug(
+                        "nostr.not_needed",
+                        format!(
+                            "{live_peers} peer(s), wanted {want_peers}, policy \
+                             {policy}: the relays are not asked this round"
+                        ),
+                    );
+                    continue;
+                }
+
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                let labels = current_labels(network, now);
+
+                if announce_self && let Some((ref host, port)) = my_address {
+                    // Under THIS epoch's label only. Re-posting under the
+                    // previous one would leave this node's address at a
+                    // rendezvous it has already left.
+                    let key = identity_from_seed(secret.as_bytes(), epoch_of(now));
+                    let event = sign(
+                        &key,
+                        now as i64,
+                        KIND_APP_DATA,
+                        vec![vec!["d".to_owned(), labels[0].clone()]],
+                        &format!("{host}:{port}"),
+                    );
+                    let mut stored = 0usize;
+                    for relay in PUBLIC_RELAYS {
+                        match publish(&ctx, relay, &event, DEFAULT_TIMEOUT).await {
+                            Ok(()) => stored += 1,
+                            Err(e) => logger.debug("nostr.publish_failed", format!("{relay}: {e}")),
+                        }
+                    }
+                    logger.info(
+                        "nostr.announced",
+                        format!(
+                            "this node is listed as {host}:{port} with {stored} of {} relay(s)",
+                            PUBLIC_RELAYS.len()
+                        ),
+                    );
+                }
+
+                let mut taken = 0usize;
+                let mut already_had = 0usize;
+                let mut seen = std::collections::HashSet::new();
+                for label in &labels {
+                    for relay in PUBLIC_RELAYS {
+                        let events = match query(
+                            &ctx,
+                            relay,
+                            KIND_APP_DATA,
+                            label,
+                            MAX_RENDEZVOUS_PEERS * 4,
+                            DEFAULT_TIMEOUT,
+                        )
+                        .await
+                        {
+                            Ok(events) => events,
+                            Err(e) => {
+                                logger.debug("nostr.query_failed", format!("{relay}: {e}"));
+                                continue;
+                            }
+                        };
+                        logger.info(
+                            "nostr.looked",
+                            format!("{relay}: {} record(s) at the rendezvous", events.len()),
+                        );
+
+                        for event in events {
+                            if taken >= MAX_RENDEZVOUS_PEERS {
+                                break;
+                            }
+                            // A relay is a stranger's server and the content is
+                            // whatever somebody signed. Take an address from it
+                            // and nothing else: the scheme is OURS, as it is at
+                            // the DHT, because a network runs one transport and
+                            // a stranger does not get to choose ours.
+                            let Some((host, port)) = event.content.rsplit_once(':') else {
+                                continue;
+                            };
+                            if host.is_empty() || port.parse::<u16>().is_err() {
+                                continue;
+                            }
+                            let transport = format!("{dial_scheme}://{host}:{port}");
+                            if !seen.insert(transport.clone()) {
+                                continue;
+                            }
+                            let known: Vec<PeerConfigEntry> =
+                                lock_state(&state).peers.values().cloned().collect();
+                            if !rendezvous_address_is_new(&known, &transport) {
+                                already_had += 1;
+                                logger.debug(
+                                    "nostr.already_known",
+                                    format!("{transport} is already a peer; not dialled"),
+                                );
+                                continue;
+                            }
+                            match dial_and_learn(&access, &state, &transport, taken).await {
+                                Ok(node) => {
+                                    taken += 1;
+                                    logger.info(
+                                        "nostr.met",
+                                        format!("met {node} at {transport}, learned from a relay"),
+                                    );
+                                }
+                                Err(e) => {
+                                    logger.debug("nostr.unreachable", format!("{transport}: {e}"))
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if taken == 0 {
+                    if already_had > 0 {
+                        logger.info(
+                            "nostr.already_connected",
+                            format!(
+                                "everybody at the rendezvous ({already_had}) is \
+                                 already a peer of this node"
+                            ),
+                        );
+                    } else {
+                        logger.info(
+                            "nostr.nobody",
+                            "the relays named nobody this node could reach",
+                        );
+                    }
+                }
+            }
+        });
+        lock_tasks(&self.tasks).sessions.push(handle);
+    }
+
     /// Bootstrap layer 6: look for peers on the local network, and tell it we
     /// are here.
     ///
@@ -5827,6 +6016,52 @@ pub fn admit_lan_peer(
 /// `transport`. A listener bound to loopback with no override is skipped — a
 /// neighbour that dialled it would reach its own machine, and an announce that
 /// can only fail is worse than silence.
+/// The address this node would give a stranger, for a meeting point that
+/// cannot work it out for itself.
+///
+/// Layers 6 and 7 never need this: a LAN datagram and a DHT query both arrive
+/// from an address, so the host is observed rather than claimed. A relay is
+/// neither — it knows the address the record was posted from and does not put
+/// it in the record, and taking it from a relay would mean trusting a
+/// stranger's server to say where we are. So the node states its own, and can
+/// only do that from a listener an operator configured to advertise.
+///
+/// `None` when there is nothing honest to say: no listener, a port of zero, or
+/// a host that is true only from where this node is standing — the wildcard,
+/// or loopback. Publishing `0.0.0.0` puts an address at the rendezvous that
+/// works for nobody, and the node would look listed while being unreachable.
+pub fn public_address_for(config: &veil_cfg::Config) -> Option<(String, u16)> {
+    for listener in &config.listen {
+        let uri = listener.advertise.as_deref().unwrap_or(&listener.transport);
+        let Some((_, rest)) = uri.split_once("://") else {
+            continue;
+        };
+        let authority = rest.split('/').next().unwrap_or(rest);
+        // `[::1]:5556` as well as `1.2.3.4:5556`.
+        let (host, port_str) = match authority.rsplit_once(':') {
+            Some(split) => split,
+            None => continue,
+        };
+        let host = host.trim_start_matches('[').trim_end_matches(']');
+        let Ok(port) = port_str.parse::<u16>() else {
+            continue;
+        };
+        if port == 0 || host.is_empty() {
+            continue;
+        }
+        if let Ok(ip) = host.parse::<std::net::IpAddr>()
+            && (ip.is_unspecified() || ip.is_loopback())
+        {
+            continue;
+        }
+        if host == "localhost" {
+            continue;
+        }
+        return Some((host.to_owned(), port));
+    }
+    None
+}
+
 pub fn lan_announce_for(
     config: &veil_cfg::Config,
     identity_public_key: &str,
@@ -6540,6 +6775,77 @@ mod tests {
         let mut c = veil_cfg::Config::default();
         c.listen = listeners;
         lan_announce_for(&c, &key, &nonce)
+    }
+
+    fn address_for_listeners(uris: &[(&str, Option<&str>)]) -> Option<(String, u16)> {
+        let mut c = veil_cfg::Config::default();
+        c.listen = uris.iter().map(|(u, a)| listener(u, *a)).collect();
+        public_address_for(&c)
+    }
+
+    #[test]
+    fn a_node_never_publishes_an_address_that_is_true_only_where_it_stands() {
+        // Layers 6 and 7 observe the host from the packet. A relay does not
+        // tell us ours and must not be asked to, so this is the one place the
+        // node claims its own address -- and a claim of `0.0.0.0` would list
+        // it at a rendezvous while being unreachable from every one of them,
+        // which reads in the log exactly like a node that is listed and fine.
+        for bad in [
+            "obfs4://0.0.0.0:5556",
+            "obfs4://127.0.0.1:5556",
+            "obfs4://localhost:5556",
+            "obfs4://[::]:5556",
+            "obfs4://[::1]:5556",
+            "obfs4://1.2.3.4:0",
+            "obfs4://:5556",
+            "not-a-uri",
+        ] {
+            assert_eq!(
+                address_for_listeners(&[(bad, None)]),
+                None,
+                "{bad} was offered to strangers as this node's address"
+            );
+        }
+
+        assert_eq!(
+            address_for_listeners(&[("obfs4://203.0.113.9:5556", None)]),
+            Some(("203.0.113.9".to_owned(), 5556)),
+            "a listener with a real address was not usable"
+        );
+        // `advertise` wins: the bind address is where the socket is, the
+        // advertised one is where the world can reach it, and behind NAT they
+        // are not the same string.
+        assert_eq!(
+            address_for_listeners(&[("obfs4://0.0.0.0:5556", Some("obfs4://203.0.113.9:443"))]),
+            Some(("203.0.113.9".to_owned(), 443)),
+            "the bind address was published instead of the advertised one"
+        );
+        // An unusable listener does not veto a usable one behind it -- and
+        // once per REASON it can be unusable, because "skip" and "give up" are
+        // one keyword apart and each branch has its own.
+        for first in [
+            "obfs4://0.0.0.0:5556",
+            "obfs4://127.0.0.1:5556",
+            "obfs4://203.0.113.7:0",
+            "obfs4://:5556",
+            "obfs4://203.0.113.7:not-a-port",
+            "no-scheme-here",
+        ] {
+            assert_eq!(
+                address_for_listeners(&[(first, None), ("obfs4://203.0.113.9:5556", None)]),
+                Some(("203.0.113.9".to_owned(), 5556)),
+                "a listener of {first} hid the usable one after it"
+            );
+        }
+        // Paths and IPv6 brackets both survive the split.
+        assert_eq!(
+            address_for_listeners(&[("ws://203.0.113.9:8080/veil", None)]),
+            Some(("203.0.113.9".to_owned(), 8080))
+        );
+        assert_eq!(
+            address_for_listeners(&[("obfs4://[2001:db8::1]:5556", None)]),
+            Some(("2001:db8::1".to_owned(), 5556))
+        );
     }
 
     #[test]

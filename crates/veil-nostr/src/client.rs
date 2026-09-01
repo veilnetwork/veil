@@ -341,7 +341,7 @@ mod tests {
             use rand_core::RngCore as _;
             rand_core::OsRng.fill_bytes(&mut seed);
         }
-        let key = identity_from_seed(&seed);
+        let key = identity_from_seed(&seed, 0);
         let label = format!("veil-selftest-{}", hex16(&seed));
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
