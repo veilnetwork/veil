@@ -1,5 +1,34 @@
 # Changelog
 
+## v0.10.3 — 2026-09-02
+
+**A peer met at a rendezvous kept losing its row, and its session with it.**
+The slot a learned peer occupied was `BASE + taken`, where `taken` counted
+successful dials in the current pass and restarted every pass. Whoever was
+dialled first each round took `BASE + 0` and overwrote the row of whoever held
+it — the "two allocators, one concrete id" failure `synthetic_peer_id` exists
+to prevent, arrived at from a single allocator using an ad-hoc literal outside
+that list.
+
+The overwritten peer's connector then found no row for its node id, which is
+how a connector learns it has been retired, exited, and took a live session
+down with it. From outside this looked like two seeds meeting each other again
+at every rendezvous and rebuilding a link every few seconds.
+
+A rendezvous address now keeps its slot: an address that has a row keeps it, a
+new one takes the lowest free slot in a bounded window, and a full window
+refuses to learn one more peer rather than evict one we are talking to.
+
+Measured on a production seed, same node, comparable elapsed time: reconnects
+to the busiest peer fell from 0.81/min to 0.19/min, `met` stopped repeating for
+the same peer, and the peer table stopped emptying itself. Residual reconnects
+remain and are not explained by this.
+
+The two previous releases aimed at the same symptom (0.10.1, 0.10.2) changed
+the rendezvous task's "already ours" check. That check was not the path the
+re-dial came through; both fixes stand on their own merits and neither was the
+cause.
+
 ## v0.10.2 — 2026-09-01
 
 **A peer is recognised by who it is, not only by where we dialled it.** 0.10.1

@@ -18,6 +18,23 @@ pub use veil_cfg::{ListenId, NodeId, NodeRole, PeerId};
 /// synthetic-gateway range (force-reconnect / mesh behaviour); gateway-class
 /// bases stay at or above it, non-gateway bases stay below.
 pub mod synthetic_peer_id {
+    /// Peers met at a meeting point (DHT / Nostr / LAN rendezvous).
+    ///
+    /// Was an ad-hoc literal in `dial_and_learn`, outside this list, and the
+    /// slot inside the window was `BASE + taken` where `taken` counted
+    /// successes IN THE CURRENT PASS. Every pass restarted the numbering, so
+    /// the peer dialled first each time took `BASE + 0` and overwrote whoever
+    /// held it before -- the exact "two allocators, one concrete id" failure
+    /// this module exists to prevent, arrived at from one allocator.
+    ///
+    /// The orphaned row's connector then found no row for its node_id, exited,
+    /// and took a working session with it: seeds rebuilt their links every few
+    /// seconds and met each other again on every pass.
+    pub const RENDEZVOUS_BASE: u32 = 0x9200_0000;
+    /// How many rendezvous rows may exist at once. Rows outlive a pass, so
+    /// this bounds the table rather than the dials; `MAX_RENDEZVOUS_PEERS`
+    /// bounds those.
+    pub const RENDEZVOUS_WINDOW: u32 = 32;
     /// DNS-seeded bootstrap peers.
     pub const DNS_BASE: u32 = 0x8000_0000;
     /// App-added bootstrap peers (`JoinBootstrapUri` IPC).
