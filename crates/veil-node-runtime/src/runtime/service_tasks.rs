@@ -1987,8 +1987,7 @@ impl NodeRuntime {
                             );
                             continue;
                         }
-                        match dial_and_learn(&access, &state, &transport, taken, &shutdown_tx).await
-                        {
+                        match dial_and_learn(&access, &state, &transport, &shutdown_tx).await {
                             Ok(node) => {
                                 taken += 1;
                                 logger.info(
@@ -2219,9 +2218,7 @@ impl NodeRuntime {
                                 );
                                 continue;
                             }
-                            match dial_and_learn(&access, &state, &transport, taken, &shutdown_tx)
-                                .await
-                            {
+                            match dial_and_learn(&access, &state, &transport, &shutdown_tx).await {
                                 Ok(node) => {
                                     taken += 1;
                                     logger.info(
@@ -6045,10 +6042,13 @@ async fn dial_and_learn(
     access: &crate::runtime::NodeServices,
     state: &Arc<std::sync::Mutex<crate::state::NodeState>>,
     transport: &str,
-    slot: usize,
     shutdown_tx: &tokio::sync::watch::Sender<bool>,
 ) -> std::result::Result<String, String> {
-    let peer_id = PeerId::new(0x9200_0000u32.wrapping_add(slot as u32));
+    let peer_id = {
+        let known: Vec<PeerConfigEntry> = lock_state(state).peers.values().cloned().collect();
+        rendezvous_slot_for(&known, transport)
+            .ok_or_else(|| "no free rendezvous slot; not learning this peer".to_owned())?
+    };
     // A placeholder id, unique per address so two rendezvous rows cannot
     // collide, and not a claim about anybody: it is a hash of the address we
     // are about to dial, replaced the moment the handshake says who is there.
@@ -6192,6 +6192,47 @@ pub fn admit_lan_peer(
 /// result as a peer that could not be reached -- which is what layer 8 did on
 /// its first live run, once every fifteen minutes, for the whole life of the
 /// node.
+/// Which peer slot a rendezvous address owns.
+///
+/// STABLE FOR THE ADDRESS, and that is the whole point. The slot used to be
+/// `BASE + taken`, where `taken` counted successful dials in the CURRENT pass
+/// and reset every pass: the peer dialled first each round took `BASE + 0` and
+/// its `state.peers.insert` overwrote whoever held that slot before. The
+/// overwritten peer's connector then found no row for its node_id, exited --
+/// `holds_peer_row` is how a connector learns it has been retired -- and took
+/// a live session down with it. Two seeds rebuilt their link every few seconds
+/// and met each other again at every rendezvous, which is what this looked
+/// like from the outside.
+///
+/// So: an address that already has a row keeps it, and a new address takes the
+/// lowest free slot in the window. `None` when the window is full, because
+/// refusing to learn one more peer is a great deal better than evicting one we
+/// are talking to.
+pub fn rendezvous_slot_for(known: &[PeerConfigEntry], transport: &str) -> Option<PeerId> {
+    use crate::types::synthetic_peer_id::{RENDEZVOUS_BASE, RENDEZVOUS_WINDOW};
+    let want = transport
+        .split_once("://")
+        .and_then(|(_, rest)| rendezvous_authority(rest))?;
+
+    let in_window = |id: u32| (RENDEZVOUS_BASE..RENDEZVOUS_BASE + RENDEZVOUS_WINDOW).contains(&id);
+
+    if let Some(existing) = known.iter().find(|p| {
+        in_window(p.peer_id.get())
+            && rendezvous_authority(&p.transport).is_some_and(|have| have == want)
+    }) {
+        return Some(existing.peer_id);
+    }
+
+    let taken: std::collections::HashSet<u32> = known
+        .iter()
+        .map(|p| p.peer_id.get())
+        .filter(|id| in_window(*id))
+        .collect();
+    (RENDEZVOUS_BASE..RENDEZVOUS_BASE + RENDEZVOUS_WINDOW)
+        .find(|id| !taken.contains(id))
+        .map(PeerId::new)
+}
+
 pub fn rendezvous_address_is_self(mine: Option<&(String, u16)>, transport: &str) -> bool {
     let Some((host, port)) = mine else {
         return false;
@@ -6958,6 +6999,100 @@ mod tests {
         let mut c = veil_cfg::Config::default();
         c.listen = uris.iter().map(|(u, a)| listener(u, *a)).collect();
         public_address_for(&c)
+    }
+
+    #[test]
+    fn a_rendezvous_address_keeps_its_slot_across_passes() {
+        use crate::types::synthetic_peer_id::{RENDEZVOUS_BASE, RENDEZVOUS_WINDOW};
+
+        fn rz(id: u32, transport: &str) -> PeerConfigEntry {
+            PeerConfigEntry {
+                peer_id: PeerId::new(id),
+                node_id: veil_cfg::NodeId::from([id as u8; 32]),
+                public_key: "k".to_owned(),
+                nonce: "n".to_owned(),
+                transport: transport.to_owned(),
+                algo: veil_cfg::SignatureAlgorithm::Ed25519,
+                tls_cert: None,
+                tls_key: None,
+                tls_ca_cert: None,
+                bootstrap_only: false,
+                source: crate::types::PeerSource::Rendezvous,
+            }
+        }
+
+        // THE defect. The slot was `BASE + taken`, and `taken` restarted every
+        // pass: whoever was dialled first took `BASE + 0` and overwrote the
+        // row of whoever held it. The overwritten peer's connector then found
+        // no row for its node_id, exited, and dropped a live session -- two
+        // seeds rebuilt their link every few seconds because of it.
+        let a = "obfs4-tcp://198.51.100.7:5556";
+        let b = "obfs4-tcp://198.51.100.8:5556";
+        let first = rendezvous_slot_for(&[], a).expect("an empty table has room");
+        let known = vec![rz(first.get(), a)];
+        assert_eq!(
+            rendezvous_slot_for(&known, a),
+            Some(first),
+            "the same address took a different slot on a later pass; the row it \
+             overwrites belongs to a peer whose session then dies"
+        );
+        assert_ne!(
+            rendezvous_slot_for(&known, b),
+            Some(first),
+            "a second address was handed the slot the first one is using"
+        );
+
+        // The scheme is ours to choose and must not decide identity.
+        assert_eq!(
+            rendezvous_slot_for(&known, "tcp://198.51.100.7:5556"),
+            Some(first)
+        );
+        // A neighbour that merely looks similar is a different peer.
+        for near in [
+            "obfs4-tcp://198.51.100.70:5556",
+            "obfs4-tcp://198.51.100.7:55560",
+        ] {
+            assert_ne!(
+                rendezvous_slot_for(&known, near),
+                Some(first),
+                "{near} was given the slot of 198.51.100.7:5556"
+            );
+        }
+
+        // A row OUTSIDE the window belongs to another allocator and must not
+        // be reused, however well its address matches. (That it also does not
+        // occupy a slot is true by construction rather than by this check --
+        // it cannot fall inside the range being scanned.)
+        let foreign = vec![rz(0xD100_0000, a)];
+        let fresh = rendezvous_slot_for(&foreign, a).expect("room");
+        assert!(
+            (RENDEZVOUS_BASE..RENDEZVOUS_BASE + RENDEZVOUS_WINDOW).contains(&fresh.get()),
+            "allocated outside the rendezvous window"
+        );
+
+        // A full window REFUSES rather than evicting a peer we may be talking
+        // to -- the whole failure being fixed here is an overwrite.
+        let full: Vec<PeerConfigEntry> = (0..RENDEZVOUS_WINDOW)
+            .map(|i| {
+                rz(
+                    RENDEZVOUS_BASE + i,
+                    &format!("obfs4-tcp://198.51.100.7:{}", 6000 + i),
+                )
+            })
+            .collect();
+        assert_eq!(
+            rendezvous_slot_for(&full, "obfs4-tcp://203.0.113.9:5556"),
+            None,
+            "a full window handed out a slot that is in use"
+        );
+        // ...but an address already in a full window still finds its own row.
+        assert_eq!(
+            rendezvous_slot_for(&full, "obfs4-tcp://198.51.100.7:6000"),
+            Some(PeerId::new(RENDEZVOUS_BASE))
+        );
+
+        // Something unparseable gets nothing rather than slot zero.
+        assert_eq!(rendezvous_slot_for(&[], "no-scheme-here"), None);
     }
 
     #[test]
