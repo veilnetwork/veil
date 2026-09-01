@@ -584,8 +584,7 @@ pub async fn register_connection_session(
                     let _ = tx.send(ev);
                 }
             };
-        let known_remote_id: Option<[u8; 32]> =
-            expected_peer.as_ref().map(|ep| *ep.node_id.as_bytes());
+        let known_remote_id: Option<[u8; 32]> = handshake_remote_id(source, expected_peer.as_ref());
         // Session-resumption fast-path. RE-ENABLED (audit cycle-2): the prior
         // CRITICAL — resumption restored the ORIGINAL session's tx/rx keys into a
         // counter-0 `SessionCipher`, repeating the original session's exact
@@ -1520,6 +1519,44 @@ pub fn identity_mismatch_removes_row(
     identity_mismatch_drops_record(entry.source) && row_is_still_the_one_dialled(entry, expected)
 }
 
+/// What `perform_ovl1_handshake` is told about the far side -- and, because
+/// the same value decides it, WHICH SIDE OF THE PROTOCOL WE ARE.
+///
+/// `perform_ovl1_handshake` reads `inbound_side = known_remote_id.is_none()`:
+/// the accepting side reads the peer's HELLO before writing its own, so a
+/// prober that says nothing gets nothing back. That is a good rule and this
+/// function exists because one value was carrying two unrelated facts.
+///
+/// Derived straight from `expected_peer`, it meant a dialler that does not
+/// know who it is calling took the ACCEPTING side and waited -- while the real
+/// accepting side, correctly, also waited. Both sides silent, ten seconds,
+/// then `read OVL1 frame header: early eof`. It is invisible in a log: nobody
+/// errors, nobody logs, the dial just does not happen.
+///
+/// That is every peer found at a meeting point, because a rendezvous hands
+/// over an address and no identity. Layers 7 and 8 could find the network and
+/// never join it; layer 6 worked only because a LAN announcement happens to
+/// carry the peer's key.
+///
+/// So: WE DIALLED, WE WRITE FIRST -- known peer or not. The identity half is
+/// unchanged, and deliberately so: `None` from `outbound_expects_an_identity`
+/// still means "assert nothing about who answers", and the handshake still
+/// proves who did.
+pub fn handshake_remote_id(
+    source: SessionSource,
+    expected_peer: Option<&ExpectedPeerIdentity>,
+) -> Option<[u8; 32]> {
+    match source {
+        // The zero id is what the handshake already uses internally for
+        // "not known yet" (`known_remote_id.unwrap_or([0u8; 32])`), so this
+        // claims nothing it does not know -- it only says who speaks first.
+        SessionSource::Outbound(_) => {
+            Some(expected_peer.map_or([0u8; 32], |ep| *ep.node_id.as_bytes()))
+        }
+        SessionSource::Inbound(_) => None,
+    }
+}
+
 pub fn peer_transport_context(
     base: &TransportContext,
     peer: &PeerConfigEntry,
@@ -1532,6 +1569,63 @@ pub fn peer_transport_context(
         ctx = ctx.with_client_identity_from_files(Path::new(cert), Path::new(key))?;
     }
     Ok(ctx)
+}
+
+#[cfg(test)]
+mod who_writes_first_tests {
+    use super::{ExpectedPeerIdentity, handshake_remote_id};
+    use crate::types::{ListenId, PeerId, SessionSource};
+
+    fn expected() -> ExpectedPeerIdentity {
+        ExpectedPeerIdentity {
+            peer_id: PeerId::new(1),
+            public_key: "k".to_owned(),
+            node_id: veil_cfg::NodeId::from([9u8; 32]),
+            nonce: "n".to_owned(),
+            row_transport_at_dial: "tcp://198.51.100.1:5556".to_owned(),
+        }
+    }
+
+    #[test]
+    fn a_dialler_writes_first_even_when_it_does_not_know_who_it_called() {
+        // The whole meeting-point epic died here. `perform_ovl1_handshake`
+        // reads `inbound_side = known_remote_id.is_none()`, so a `None` here
+        // does not merely mean "expect nobody in particular" -- it means "wait
+        // for them to speak". Both sides then wait, for exactly the handshake
+        // timeout, and neither logs anything at all.
+        let outbound = SessionSource::Outbound(PeerId::new(0x9200_0000));
+        assert!(
+            handshake_remote_id(outbound, None).is_some(),
+            "a dial with no expected identity took the accepting side; both \
+             ends now wait for the other and the handshake dies of timeout"
+        );
+
+        // Knowing the peer must still carry the peer through.
+        assert_eq!(
+            handshake_remote_id(outbound, Some(&expected())),
+            Some([9u8; 32]),
+            "the expected peer's node_id was dropped on the way to the handshake"
+        );
+
+        // ...and an unknown one claims nothing: the zero id is what the
+        // handshake already means by "not known yet".
+        assert_eq!(handshake_remote_id(outbound, None), Some([0u8; 32]));
+
+        // The accepting side keeps the silent-server behaviour, which is a
+        // DPI-resistance property and not an implementation detail: a prober
+        // that sends no valid OVL1 frame must see zero bytes from us.
+        let inbound = SessionSource::Inbound(ListenId::new(1));
+        assert_eq!(
+            handshake_remote_id(inbound, None),
+            None,
+            "the accepting side would write first and answer probers"
+        );
+        assert_eq!(
+            handshake_remote_id(inbound, Some(&expected())),
+            None,
+            "an inbound session with an expectation still must not write first"
+        );
+    }
 }
 
 #[cfg(test)]
