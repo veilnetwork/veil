@@ -25,6 +25,7 @@ pub fn get(config: &Config, key: &str) -> Result<String> {
         ConfigKey::GlobalBootstrap => Ok(config.global.bootstrap.to_string()),
         ConfigKey::GlobalMeetingPoints => Ok(config.global.meeting_points.to_string()),
         ConfigKey::GlobalMeetingPolicy => Ok(config.global.meeting_policy.to_string()),
+        ConfigKey::GlobalMeetingMinPeers => Ok(config.global.meeting_min_peers.to_string()),
         ConfigKey::IpcEnabled => Ok(config.ipc.enabled.to_string()),
         ConfigKey::IpcSocketUri => Ok(option_to_string(config.ipc.socket_uri.as_deref())),
         ConfigKey::IpcAppSocketDir => Ok(option_to_string(
@@ -171,6 +172,17 @@ pub fn set(config: &mut Config, key: &str, value: &str) -> Result<()> {
                         reason,
                     }
                 })?;
+            Ok(())
+        }
+        ConfigKey::GlobalMeetingMinPeers => {
+            config.global.meeting_min_peers =
+                value
+                    .parse::<u32>()
+                    .map_err(|_| ConfigError::InvalidValue {
+                        key: key.as_str().to_owned(),
+                        value: value.to_owned(),
+                        reason: "expected a whole number of peers".to_owned(),
+                    })?;
             Ok(())
         }
         ConfigKey::IpcEnabled => {

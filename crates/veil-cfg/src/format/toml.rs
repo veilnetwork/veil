@@ -123,6 +123,11 @@ fn update_document(document: &mut DocumentMut, config: &Config) -> Result<()> {
     set_bool(global, "bootstrap", g.bootstrap);
     set_raw(global, "meeting_points", &g.meeting_points.to_toml_value());
     set_string(global, "meeting_policy", g.meeting_policy.as_str());
+    set_integer(
+        global,
+        "meeting_min_peers",
+        Some(i64::from(g.meeting_min_peers)),
+    );
 
     set_transport(document, &config.transport)?;
 
@@ -1088,26 +1093,27 @@ mod every_settable_key_survives_a_save {
             ConfigKey::GlobalBootstrap => (9, Some("true")),
             ConfigKey::GlobalMeetingPoints => (10, Some("dht_bit_torrent")),
             ConfigKey::GlobalMeetingPolicy => (11, Some("always")),
-            ConfigKey::IpcEnabled => (12, Some("true")),
-            ConfigKey::IpcSocketUri => (13, Some("unix:///tmp/b.sock")),
-            ConfigKey::IpcAppSocketDir => (14, Some("/tmp/apps")),
-            ConfigKey::IdentityAlgo => (15, None),
-            ConfigKey::IdentityRole => (16, None),
-            ConfigKey::IdentityPublicKey => (17, None),
-            ConfigKey::IdentityPrivateKey => (18, None),
-            ConfigKey::IdentityNonce => (19, None),
-            ConfigKey::IdentityNodeId => (20, None),
-            ConfigKey::NatEnabled => (21, Some("false")),
-            ConfigKey::NatPunchTimeoutMs => (22, Some("4321")),
-            ConfigKey::NatRelayEnabled => (23, Some("true")),
-            ConfigKey::NatUdpReflectors => (24, Some(r#"["1.2.3.4:1234"]"#)),
-            ConfigKey::NatUdpReflectorBind => (25, Some("0.0.0.0:5678")),
-            ConfigKey::TransportTlsClientConnectTimeoutMs => (26, Some("9876")),
+            ConfigKey::GlobalMeetingMinPeers => (12, Some("7")),
+            ConfigKey::IpcEnabled => (13, Some("true")),
+            ConfigKey::IpcSocketUri => (14, Some("unix:///tmp/b.sock")),
+            ConfigKey::IpcAppSocketDir => (15, Some("/tmp/apps")),
+            ConfigKey::IdentityAlgo => (16, None),
+            ConfigKey::IdentityRole => (17, None),
+            ConfigKey::IdentityPublicKey => (18, None),
+            ConfigKey::IdentityPrivateKey => (19, None),
+            ConfigKey::IdentityNonce => (20, None),
+            ConfigKey::IdentityNodeId => (21, None),
+            ConfigKey::NatEnabled => (22, Some("false")),
+            ConfigKey::NatPunchTimeoutMs => (23, Some("4321")),
+            ConfigKey::NatRelayEnabled => (24, Some("true")),
+            ConfigKey::NatUdpReflectors => (25, Some(r#"["1.2.3.4:1234"]"#)),
+            ConfigKey::NatUdpReflectorBind => (26, Some("0.0.0.0:5678")),
+            ConfigKey::TransportTlsClientConnectTimeoutMs => (27, Some("9876")),
         }
     }
 
     /// How many keys there are. Bump it when you add one.
-    const KEY_COUNT: usize = 27;
+    const KEY_COUNT: usize = 28;
 
     #[test]
     fn a_value_you_set_is_still_there_after_the_file_is_rewritten() {
@@ -1142,6 +1148,7 @@ mod every_settable_key_survives_a_save {
             ConfigKey::GlobalBootstrap,
             ConfigKey::GlobalMeetingPoints,
             ConfigKey::GlobalMeetingPolicy,
+            ConfigKey::GlobalMeetingMinPeers,
             ConfigKey::IpcEnabled,
             ConfigKey::IpcSocketUri,
             ConfigKey::IpcAppSocketDir,
