@@ -1870,6 +1870,9 @@ impl NodeRuntime {
         let access = self.access();
         let state = Arc::clone(&self.state);
 
+        let Some(shutdown_tx) = self.shutdown_tx.clone() else {
+            return;
+        };
         let handle = supervised_spawn(Arc::clone(&self.logger), "mainline_discovery", async move {
             use veil_mainline::client::{Client, PUBLIC_ROUTERS, random_node_id};
             use veil_mainline::lookup::{Limits, announce, find_peers};
@@ -1980,7 +1983,8 @@ impl NodeRuntime {
                             );
                             continue;
                         }
-                        match dial_and_learn(&access, &state, &transport, taken).await {
+                        match dial_and_learn(&access, &state, &transport, taken, &shutdown_tx).await
+                        {
                             Ok(node) => {
                                 taken += 1;
                                 logger.info(
@@ -2061,6 +2065,9 @@ impl NodeRuntime {
         let state = Arc::clone(&self.state);
         let ctx = Arc::clone(&self.transport_ctx);
 
+        let Some(shutdown_tx) = self.shutdown_tx.clone() else {
+            return;
+        };
         let handle = supervised_spawn(Arc::clone(&self.logger), "nostr_discovery", async move {
             use veil_nostr::client::{DEFAULT_TIMEOUT, PUBLIC_RELAYS, publish, query};
             use veil_nostr::event::{KIND_APP_DATA, hex_lower, sign};
@@ -2204,7 +2211,9 @@ impl NodeRuntime {
                                 );
                                 continue;
                             }
-                            match dial_and_learn(&access, &state, &transport, taken).await {
+                            match dial_and_learn(&access, &state, &transport, taken, &shutdown_tx)
+                                .await
+                            {
                                 Ok(node) => {
                                     taken += 1;
                                     logger.info(
@@ -5951,6 +5960,7 @@ async fn dial_and_learn(
     state: &Arc<std::sync::Mutex<crate::state::NodeState>>,
     transport: &str,
     slot: usize,
+    shutdown_tx: &tokio::sync::watch::Sender<bool>,
 ) -> std::result::Result<String, String> {
     let peer_id = PeerId::new(0x9200_0000u32.wrapping_add(slot as u32));
     // A placeholder id, unique per address so two rendezvous rows cannot
@@ -6001,6 +6011,24 @@ async fn dial_and_learn(
     };
     let named = veil_util::hex_str(session.peer_id.as_bytes());
     lock_state(state).peers.insert(peer_id, proven.clone());
+
+    // A LASTING connection, which this dial is not. `connect_peer_active`
+    // hands back an `AttachedDebugSession`: it completes the handshake, and
+    // closing it is what dropping it means. That is the right shape for
+    // proving who is at an address and the wrong one for joining a network --
+    // the log said `session.open` and `session.close` eight milliseconds
+    // apart, three times, and the node sat at zero sessions having just met
+    // every peer it was looking for.
+    //
+    // The row is a full peer now: the handshake proved the key and the nonce,
+    // so the ordinary reconnect loop can own it from here. It claims one slot
+    // per node_id, so a peer met at two meeting points -- or met again on the
+    // next pass -- still gets exactly one.
+    let handles =
+        crate::outbound_connector::spawn_outbound_peers(vec![proven.clone()], access, shutdown_tx);
+    // Detached on purpose: each loop watches the same shutdown channel and
+    // ends with it, and this task has no task-set of its own to park them in.
+    drop(handles);
 
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
