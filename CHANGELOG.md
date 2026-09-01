@@ -1,5 +1,55 @@
 # Changelog
 
+## v0.10.0 — 2026-09-01
+
+A node can now find the network and actually join it. Until this release it
+could only do the first half, and nothing said so.
+
+**A dialler that does not know who it called was waiting to be spoken to.**
+`perform_ovl1_handshake` picks which side writes its HELLO first from whether
+the remote identity is known — the accepting side reads first, so a prober
+that says nothing gets nothing back. That rule is worth keeping. But a peer
+found at a meeting point comes with an address and no identity, so the dialler
+took the accepting side and waited, while the real accepting side also waited.
+Ten seconds of mutual silence, then `read OVL1 frame header: early eof`,
+reported as a peer that could not be reached. One value was carrying two
+unrelated facts; direction now comes from the session source, which knows it.
+
+This is why local-network discovery worked and the DHT did not: a LAN
+announcement happens to carry the peer's key, and six bytes of compact peer do
+not.
+
+**A rendezvous dial hung up on the peer it had just met.** It connected through
+the debug-session path, where closing the handle is what dropping it means:
+`session.open` and `session.close` eight milliseconds apart, and a node at zero
+sessions having met everybody it was looking for. The row is a full peer by
+then, so it goes to the ordinary reconnect loop.
+
+Measured from a node with no peers, no bootstrap peers, no listener and no
+compiled-in seeds: three peers met at the rendezvous and the sessions held.
+
+**A third meeting point, on public Nostr relays.** The other two are UDP, so a
+network that drops UDP leaves a node with no way in at all — an ordinary shape
+for a hotel or an office. Relays speak WebSocket over TLS on 443.
+
+Two things the specification does not mention, found while building it. The
+event id is signed RAW: `k256`'s `Signer::sign` hashes the message first, and
+signing `sha256(id)` produces signatures this code verified happily and every
+relay rejected. And the author key is derived per epoch — the rendezvous label
+rotates daily so nobody can watch one place and see who keeps arriving, and a
+fixed author would have handed that straight back.
+
+**A node no longer dials its own announcement.** A meeting point does not know
+who is asking, so a node that announces itself reads its own record back on the
+next pass. It was dialling its own listener and logging the timeout as an
+unreachable peer, every fifteen minutes, for as long as it ran.
+
+**The seed lists are empty, and now the build says so.** `production-seeds`
+compiled whether the list held four entries or none, while the module doc said
+the source shipped none — which is how it sat populated for months. The three
+network flags settle which network a binary belongs to; none of them compiles
+in an address, and a test requires both lists to stay empty.
+
 ## v0.8.5 — 2026-08-30
 
 One fix, from the report18 audit, and it is about what an upgrade quietly
