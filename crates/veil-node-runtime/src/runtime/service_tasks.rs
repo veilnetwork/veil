@@ -1975,7 +1975,8 @@ impl NodeRuntime {
                         // Already ours, by any route. See `rendezvous_address_is_new`.
                         let known: Vec<PeerConfigEntry> =
                             lock_state(&state).peers.values().cloned().collect();
-                        if !rendezvous_address_is_new(&known, &transport) {
+                        let live = live_session_addresses(&live_sessions);
+                        if !rendezvous_address_is_new(&known, &live, &transport) {
                             already_had += 1;
                             logger.debug(
                                 "mainline.already_known",
@@ -2203,7 +2204,8 @@ impl NodeRuntime {
                             }
                             let known: Vec<PeerConfigEntry> =
                                 lock_state(&state).peers.values().cloned().collect();
-                            if !rendezvous_address_is_new(&known, &transport) {
+                            let live = live_session_addresses(&live_sessions);
+                            if !rendezvous_address_is_new(&known, &live, &transport) {
                                 already_had += 1;
                                 logger.debug(
                                     "nostr.already_known",
@@ -5883,14 +5885,63 @@ pub fn builtin_seed_contribution(
 /// Measured on a live host: it found all three announcing nodes at the
 /// rendezvous, was already in session with every one of them, dialled all
 /// three anyway, and logged three timeouts.
-pub fn rendezvous_address_is_new(known: &[PeerConfigEntry], transport: &str) -> bool {
-    let authority = |uri: &str| uri.split_once("://").map(|(_, rest)| rest.to_owned());
-    let Some(want) = authority(transport) else {
+/// Every address this node currently holds a session to, as the session layer
+/// knows it — its transport URI and, when the two differ, the address the
+/// connection actually came from.
+fn live_session_addresses(
+    live: &Arc<
+        std::sync::Mutex<
+            std::collections::BTreeMap<crate::types::LinkId, crate::types::SessionInfo>,
+        >,
+    >,
+) -> Vec<String> {
+    lock!(live)
+        .values()
+        .flat_map(|s| std::iter::once(s.transport.clone()).chain(s.remote_addr.iter().cloned()))
+        .collect()
+}
+
+pub fn rendezvous_address_is_new(
+    known: &[PeerConfigEntry],
+    live: &[String],
+    transport: &str,
+) -> bool {
+    // STRICT for the candidate: an address off a meeting point that does not
+    // parse as `scheme://host:port` is not dialled blindly. Lenient for what
+    // we compare it against, because a session reports its observed address
+    // bare.
+    let Some(want) = transport
+        .split_once("://")
+        .and_then(|(_, rest)| rendezvous_authority(rest))
+    else {
         return false;
     };
-    !known
+    let in_table = known
         .iter()
-        .any(|p| authority(&p.transport).is_some_and(|have| have == want))
+        .any(|p| rendezvous_authority(&p.transport).is_some_and(|have| have == want));
+    // LIVE SESSIONS TOO, and that is the half that was missing. The peer table
+    // is not a record of who we are talking to: a row learned at a rendezvous
+    // sits in the autodiscovered range and gets scored out between passes,
+    // and then the next pass reads "not known" about a peer this node has an
+    // open session with. It dials, the far side dedups the duplicate, and the
+    // session that was already working is torn down and rebuilt -- once every
+    // pass, for as long as both nodes are up. Measured between two production
+    // seeds, which met each other again on every single round.
+    let in_session = live
+        .iter()
+        .any(|t| rendezvous_authority(t).is_some_and(|have| have == want));
+    !(in_table || in_session)
+}
+
+/// `host:port` from either a full URI or a bare address.
+///
+/// A peer row carries `scheme://host:port`; a session carries its transport
+/// the same way but its observed `remote_addr` bare, and both have to compare
+/// against an address from a meeting point.
+fn rendezvous_authority(uri: &str) -> Option<String> {
+    let rest = uri.split_once("://").map_or(uri, |(_, rest)| rest);
+    let authority = rest.split('/').next().unwrap_or(rest);
+    (!authority.is_empty()).then(|| authority.to_owned())
 }
 
 /// The transport scheme to dial a rendezvous address with.
@@ -7052,6 +7103,67 @@ mod tests {
     }
 
     #[test]
+    fn a_peer_we_are_talking_to_is_not_dialled_again_when_its_row_is_gone() {
+        // The peer TABLE is not the record of who we are talking to. A row
+        // learned at a rendezvous lives in the autodiscovered range and gets
+        // scored out between passes, so the next pass read "not known" about a
+        // peer with an open session, dialled it, and the far side dedupped the
+        // duplicate -- tearing down the session that was already working.
+        // Two production seeds met each other again on every single round.
+        let known: Vec<PeerConfigEntry> = vec![];
+        let live = vec!["obfs4-tcp://198.51.100.7:5556".to_owned()];
+        assert!(
+            !rendezvous_address_is_new(&known, &live, "obfs4-tcp://198.51.100.7:5556"),
+            "an address this node holds a session to was dialled again"
+        );
+
+        // The observed remote address is bare, and it has to compare too.
+        let bare = vec!["198.51.100.7:5556".to_owned()];
+        assert!(
+            !rendezvous_address_is_new(&known, &bare, "obfs4-tcp://198.51.100.7:5556"),
+            "the address a session actually came from did not count as ours"
+        );
+
+        // ...and this must not become a filter that silences the layer: a
+        // different port, a different host, and an empty session list all
+        // still dial.
+        assert!(rendezvous_address_is_new(
+            &known,
+            &live,
+            "obfs4-tcp://198.51.100.7:5557"
+        ));
+        assert!(rendezvous_address_is_new(
+            &known,
+            &live,
+            "obfs4-tcp://203.0.113.9:5556"
+        ));
+        assert!(rendezvous_address_is_new(
+            &known,
+            &[],
+            "obfs4-tcp://198.51.100.7:5556"
+        ));
+        // An address that merely CONTAINS ours, or is contained by it, is not
+        // ours -- both directions, because a containment test reads as right
+        // and is wrong on one side each way.
+        for near in [
+            "obfs4-tcp://198.51.100.70:5556",
+            "obfs4-tcp://198.51.100.7:55560",
+            "obfs4-tcp://8.198.51.100.7:5556",
+        ] {
+            let held = vec![near.to_owned()];
+            assert!(
+                rendezvous_address_is_new(&known, &held, "obfs4-tcp://198.51.100.7:5556"),
+                "a session to {near} was mistaken for one to 198.51.100.7:5556"
+            );
+        }
+        let held = vec!["obfs4-tcp://198.51.100.7:5556".to_owned()];
+        assert!(
+            rendezvous_address_is_new(&known, &held, "obfs4-tcp://198.51.100.7:55560"),
+            "a session to :5556 was mistaken for one to :55560"
+        );
+    }
+
+    #[test]
     fn an_address_this_node_already_has_is_not_dialled_again() {
         // Measured, not imagined: a live host found all three announcing nodes
         // at the rendezvous, was already in session with every one of them
@@ -7071,32 +7183,34 @@ mod tests {
             ),
         ];
         assert!(
-            !rendezvous_address_is_new(&known, "obfs4-tcp://198.51.100.7:5556"),
+            !rendezvous_address_is_new(&known, &[], "obfs4-tcp://198.51.100.7:5556"),
             "an address already held was treated as new"
         );
         // The AUTHORITY decides, not the whole URI: the same host reached over
         // a different transport is the same machine, and a second session to
         // it is the same duplicate.
         assert!(
-            !rendezvous_address_is_new(&known, "tcp://198.51.100.7:5556"),
+            !rendezvous_address_is_new(&known, &[], "tcp://198.51.100.7:5556"),
             "the same host under another scheme was treated as new"
         );
         // A different port is a different node, and a genuinely new address is
         // still worth a dial — or the guard would silence the whole layer.
         assert!(rendezvous_address_is_new(
             &known,
+            &[],
             "obfs4-tcp://198.51.100.7:5557"
         ));
         assert!(rendezvous_address_is_new(
             &known,
+            &[],
             "obfs4-tcp://203.0.113.9:5556"
         ));
         assert!(
-            rendezvous_address_is_new(&[], "obfs4-tcp://203.0.113.9:5556"),
+            rendezvous_address_is_new(&[], &[], "obfs4-tcp://203.0.113.9:5556"),
             "a node with no peers must dial what it finds"
         );
         // Something unparseable is not dialled rather than dialled blindly.
-        assert!(!rendezvous_address_is_new(&known, "no-scheme-here"));
+        assert!(!rendezvous_address_is_new(&known, &[], "no-scheme-here"));
     }
 
     #[test]
