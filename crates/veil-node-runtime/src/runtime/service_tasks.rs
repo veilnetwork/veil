@@ -1853,6 +1853,8 @@ impl NodeRuntime {
         // so the one we advertise is the one we expect of others -- a network
         // runs one transport.
         let me = lan_announce_for(config, &my_pubkey, &self.identity.local_identity.nonce);
+        // So the layer can tell its own announcement from a stranger's.
+        let my_address = public_address_for(config);
         let network = if cfg!(feature = "testnet-seeds") {
             veil_mainline::rendezvous::Network::Testnet
         } else {
@@ -1960,6 +1962,13 @@ impl NodeRuntime {
                             break;
                         }
                         let transport = format!("{dial_scheme}://{addr}");
+                        if rendezvous_address_is_self(my_address.as_ref(), &transport) {
+                            logger.debug(
+                                "mainline.self",
+                                format!("{transport} is this node's own announcement"),
+                            );
+                            continue;
+                        }
                         // Already ours, by any route. See `rendezvous_address_is_new`.
                         let known: Vec<PeerConfigEntry> =
                             lock_state(&state).peers.values().cloned().collect();
@@ -2054,7 +2063,7 @@ impl NodeRuntime {
 
         let handle = supervised_spawn(Arc::clone(&self.logger), "nostr_discovery", async move {
             use veil_nostr::client::{DEFAULT_TIMEOUT, PUBLIC_RELAYS, publish, query};
-            use veil_nostr::event::{KIND_APP_DATA, sign};
+            use veil_nostr::event::{KIND_APP_DATA, hex_lower, sign};
             use veil_nostr::rendezvous::{current_labels, epoch_of, identity_from_seed};
 
             let mut ticker = tokio::time::interval(RENDEZVOUS_INTERVAL);
@@ -2080,6 +2089,19 @@ impl NodeRuntime {
                     .map(|d| d.as_secs())
                     .unwrap_or(0);
                 let labels = current_labels(network, now);
+                // One per label, because the previous epoch's record was signed
+                // by the previous epoch's key -- which is the whole point of
+                // rotating it, and the reason a single author would not match.
+                let epoch = epoch_of(now);
+                let my_authors: Vec<String> = (0..labels.len() as u64)
+                    .map(|back| {
+                        hex_lower(
+                            &identity_from_seed(secret.as_bytes(), epoch.saturating_sub(back))
+                                .verifying_key()
+                                .to_bytes(),
+                        )
+                    })
+                    .collect();
 
                 if announce_self && let Some((ref host, port)) = my_address {
                     // Under THIS epoch's label only. Re-posting under the
@@ -2152,6 +2174,24 @@ impl NodeRuntime {
                             }
                             let transport = format!("{dial_scheme}://{host}:{port}");
                             if !seen.insert(transport.clone()) {
+                                continue;
+                            }
+                            // Ours, by the one field that says so exactly. The
+                            // address check below catches it too, but only when
+                            // this node has an address to compare -- and a node
+                            // that announces always has an author.
+                            if my_authors.iter().any(|a| *a == event.pubkey) {
+                                logger.debug(
+                                    "nostr.self",
+                                    format!("{transport} is this node's own record"),
+                                );
+                                continue;
+                            }
+                            if rendezvous_address_is_self(my_address.as_ref(), &transport) {
+                                logger.debug(
+                                    "nostr.self",
+                                    format!("{transport} is this node's own address"),
+                                );
                                 continue;
                             }
                             let known: Vec<PeerConfigEntry> =
@@ -6030,6 +6070,29 @@ pub fn admit_lan_peer(
 /// a host that is true only from where this node is standing — the wildcard,
 /// or loopback. Publishing `0.0.0.0` puts an address at the rendezvous that
 /// works for nobody, and the node would look listed while being unreachable.
+/// True when a rendezvous named US.
+///
+/// A meeting point does not know who is asking, so a node that announces
+/// itself reads its own record back on the very next pass. Without this it
+/// dials its own listener, waits out the full handshake timeout and logs the
+/// result as a peer that could not be reached -- which is what layer 8 did on
+/// its first live run, once every fifteen minutes, for the whole life of the
+/// node.
+pub fn rendezvous_address_is_self(mine: Option<&(String, u16)>, transport: &str) -> bool {
+    let Some((host, port)) = mine else {
+        return false;
+    };
+    let Some((_, rest)) = transport.split_once("://") else {
+        return false;
+    };
+    let authority = rest.split('/').next().unwrap_or(rest);
+    let Some((their_host, their_port)) = authority.rsplit_once(':') else {
+        return false;
+    };
+    their_host.trim_start_matches('[').trim_end_matches(']') == host
+        && their_port.parse::<u16>() == Ok(*port)
+}
+
 pub fn public_address_for(config: &veil_cfg::Config) -> Option<(String, u16)> {
     for listener in &config.listen {
         let uri = listener.advertise.as_deref().unwrap_or(&listener.transport);
@@ -6781,6 +6844,79 @@ mod tests {
         let mut c = veil_cfg::Config::default();
         c.listen = uris.iter().map(|(u, a)| listener(u, *a)).collect();
         public_address_for(&c)
+    }
+
+    #[test]
+    fn a_node_does_not_dial_its_own_announcement() {
+        // Found live, on layer 8's first real run: the node announced itself,
+        // read its own record back on the same pass, dialled its own listener
+        // and sat out the full ten-second handshake timeout -- then logged the
+        // result as a peer that could not be reached. Every fifteen minutes,
+        // for as long as the node runs.
+        let me = ("203.0.113.9".to_owned(), 5556);
+        assert!(rendezvous_address_is_self(
+            Some(&me),
+            "obfs4://203.0.113.9:5556"
+        ));
+        // The scheme is ours to choose, so it must not decide this.
+        assert!(rendezvous_address_is_self(
+            Some(&me),
+            "tcp://203.0.113.9:5556"
+        ));
+        assert!(rendezvous_address_is_self(
+            Some(&me),
+            "ws://203.0.113.9:5556/veil"
+        ));
+
+        // A different port on the same host is a different node -- two nodes
+        // behind one address is an ordinary way to run them.
+        assert!(!rendezvous_address_is_self(
+            Some(&me),
+            "obfs4://203.0.113.9:5557"
+        ));
+        assert!(!rendezvous_address_is_self(
+            Some(&me),
+            "obfs4://203.0.113.8:5556"
+        ));
+        // A host that merely CONTAINS ours, or is contained by it, is not
+        // ours -- in both directions, because a prefix test reads as correct
+        // and is wrong on one side each way. `.90` and `.9` are neighbours on
+        // a real subnet, and mistaking one for this node makes it invisible.
+        for near in [
+            "obfs4://203.0.113.99:5556",
+            "obfs4://1203.0.113.9:5556",
+            "obfs4://203.0.113.9:55560",
+        ] {
+            assert!(
+                !rendezvous_address_is_self(Some(&me), near),
+                "{near} was mistaken for this node and skipped"
+            );
+        }
+        let long = ("203.0.113.90".to_owned(), 5556);
+        assert!(
+            !rendezvous_address_is_self(Some(&long), "obfs4://203.0.113.9:5556"),
+            "a neighbour whose address is a prefix of ours was skipped as us"
+        );
+        assert!(
+            !rendezvous_address_is_self(Some(&me), "obfs4://203.0.113.90:5556"),
+            "a neighbour whose address extends ours was skipped as us"
+        );
+
+        let v6 = ("2001:db8::1".to_owned(), 5556);
+        assert!(rendezvous_address_is_self(
+            Some(&v6),
+            "obfs4://[2001:db8::1]:5556"
+        ));
+
+        // A node with no address of its own recognises nothing, rather than
+        // everything: this must never become a filter that skips real peers.
+        for any in [
+            "obfs4://203.0.113.9:5556",
+            "obfs4://198.51.100.1:5556",
+            "nonsense",
+        ] {
+            assert!(!rendezvous_address_is_self(None, any));
+        }
     }
 
     #[test]
