@@ -390,6 +390,76 @@ mod tests {
             found > 0,
             "no relay that accepted the event would return it"
         );
+
+        // A rendezvous is not one node posting. Two must be visible under the
+        // one label, or this is a place where nobody meets anybody.
+        let mut other_seed = [0u8; 32];
+        {
+            use rand_core::RngCore as _;
+            rand_core::OsRng.fill_bytes(&mut other_seed);
+        }
+        let other = sign(
+            &identity_from_seed(&other_seed, 0),
+            now,
+            KIND_APP_DATA,
+            vec![vec!["d".to_owned(), label.clone()]],
+            "tcp://198.51.100.9:5556",
+        );
+        // And the FIRST node moves. Kind 30078 is addressable, so a relay is
+        // supposed to REPLACE per (author, kind, d) rather than keep both --
+        // and the announce loop re-posts every fifteen minutes, so a relay
+        // that appends instead would grow one node's stale addresses forever
+        // and hand them to everybody arriving.
+        let moved = sign(
+            &key,
+            now + 1,
+            KIND_APP_DATA,
+            vec![vec!["d".to_owned(), label.clone()]],
+            "tcp://198.51.100.77:5556",
+        );
+
+        let mut checked = 0usize;
+        for relay in &posted {
+            if publish(&ctx, relay, &other, DEFAULT_TIMEOUT).await.is_err() {
+                continue;
+            }
+            if publish(&ctx, relay, &moved, DEFAULT_TIMEOUT).await.is_err() {
+                continue;
+            }
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            let Ok(events) = query(&ctx, relay, KIND_APP_DATA, &label, 16, DEFAULT_TIMEOUT).await
+            else {
+                continue;
+            };
+            let addresses: Vec<&str> = events.iter().map(|e| e.content.as_str()).collect();
+            eprintln!("{relay}: at the rendezvous -> {addresses:?}");
+
+            let mine: Vec<&&str> = addresses
+                .iter()
+                .filter(|a| a.contains("198.51.100.4:") || a.contains("198.51.100.77:"))
+                .collect();
+            assert_eq!(
+                mine.len(),
+                1,
+                "{relay} kept {} records for one author under one label; \
+                 re-announcing accumulates instead of replacing",
+                mine.len()
+            );
+            assert!(
+                addresses.contains(&"tcp://198.51.100.77:5556"),
+                "{relay} still serves the address this node moved away from"
+            );
+            assert!(
+                addresses.contains(&"tcp://198.51.100.9:5556"),
+                "{relay} does not show the second node; nobody meets anybody here"
+            );
+            checked += 1;
+        }
+        assert!(
+            checked > 0,
+            "no relay could be checked for replacement — the result above says \
+             the point works for one node, and nothing about two"
+        );
     }
 
     fn hex16(bytes: &[u8]) -> String {
