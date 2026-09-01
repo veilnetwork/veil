@@ -60,16 +60,89 @@ fn spawn_memory_stats_reporter() {
 ///
 /// Restoring the default disposition is the smallest fix that covers every
 /// print in the binary; the alternative is auditing several hundred `println!`
-/// sites for `BrokenPipe`. It is confined to the CLI entry point: a library or
-/// an embedded host must keep Rust's default, or an unrelated socket write
-/// would take the whole process down.
+/// sites for `BrokenPipe`.
+///
+/// NOT FOR THE DAEMON. The comment here used to say this was "confined to the
+/// CLI entry point", and that a long-lived host must keep Rust's default "or
+/// an unrelated socket write would take the whole process down". That is
+/// exactly right and it did not hold, because `node run` enters through this
+/// same `main`: the seed at 2026-09-01 17:22 was killed by SIGPIPE from a
+/// relay closing a socket, and stayed dead, because systemd counts SIGPIPE as
+/// a clean exit and `Restart=on-failure` does not fire for it. Fifteen
+/// minutes of uptime, no error logged by anyone.
+///
+/// So the disposition is restored only for the short-lived, printing
+/// invocations. A daemon keeps Rust's `SIG_IGN` and gets `EPIPE` as an error
+/// value, which is what every socket write in it already handles.
 #[cfg(unix)]
 fn die_quietly_on_broken_pipe() {
+    if runs_the_node() {
+        return;
+    }
     // SAFETY: called at the top of `main`, before any thread is spawned, and
     // `SIG_DFL` for SIGPIPE is what the process would have had without Rust's
     // pre-main override.
     unsafe {
         libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
+}
+
+/// Whether this invocation is the long-running node rather than a command that
+/// prints and exits.
+///
+/// Read from the raw arguments rather than the parsed ones because the choice
+/// has to be made before `main` does anything else, and clap has not run yet.
+/// `veil-cli [--config FILE] node run [...]` is the shape; a `FILE` that
+/// happens to end in `node` followed by a literal `run` would read as the
+/// daemon, and the cost of that is a piped CLI call reporting `EPIPE` instead
+/// of dying quietly — the harmless direction of this decision.
+#[cfg(unix)]
+fn runs_the_node() -> bool {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    args.windows(2).any(|w| w[0] == "node" && w[1] == "run")
+}
+
+#[cfg(all(unix, test))]
+mod sigpipe_disposition_tests {
+    /// The predicate, over the raw arguments, so the test drives what `main`
+    /// drives rather than a copy of it.
+    fn runs_the_node(argv: &[&str]) -> bool {
+        argv.windows(2).any(|w| w[0] == "node" && w[1] == "run")
+    }
+
+    #[test]
+    fn the_daemon_keeps_sigpipe_ignored_and_a_printing_command_does_not() {
+        // A seed died of SIGPIPE and stayed dead: systemd counts SIGPIPE as a
+        // clean exit, so `Restart=on-failure` never fired. The disposition
+        // that killed it exists so `dht list | head` does not panic, which is
+        // a want of the printing commands and of nothing else.
+        for daemon in [
+            ["node", "run"].as_slice(),
+            ["--config", "/etc/veil/node.toml", "node", "run"].as_slice(),
+            ["node", "run", "--foreground"].as_slice(),
+            ["-c", "/x.toml", "node", "run", "--foreground"].as_slice(),
+        ] {
+            assert!(
+                runs_the_node(daemon),
+                "{daemon:?} is the daemon and would have taken SIG_DFL"
+            );
+        }
+
+        for cli in [
+            ["node", "show"].as_slice(),
+            ["node", "dht", "list"].as_slice(),
+            ["peers", "add", "k", "n", "tcp://198.51.100.1:1"].as_slice(),
+            ["run"].as_slice(),
+            ["node"].as_slice(),
+            [].as_slice(),
+            // `run` before `node` is not the daemon; order is the whole claim.
+            ["run", "node"].as_slice(),
+        ] {
+            assert!(
+                !runs_the_node(cli),
+                "{cli:?} would keep SIG_IGN and panic on a closed pipe"
+            );
+        }
     }
 }
 
