@@ -3754,6 +3754,18 @@ pub struct GlobalConfig {
     /// offers itself has to keep being there.
     #[serde(default)]
     pub meeting_policy: MeetingPolicy,
+    /// How many live peers count as enough, under
+    /// [`MeetingPolicy::Fallback`].
+    ///
+    /// Five by default rather than one. One peer is not a supply — it is a
+    /// single point of failure, and the node holding it is one timeout away
+    /// from having none, at which point the meeting points are the only way
+    /// back. A node keeps asking until it has a margin.
+    ///
+    /// Parametric because the right number depends on what the node is: a
+    /// phone on a metered link may want fewer, a node others rely on more.
+    #[serde(default = "GlobalConfig::default_meeting_min_peers")]
+    pub meeting_min_peers: u32,
 
     /// Base64 public keys this node will accept from DNS bootstrap discovery.
     ///
@@ -4011,6 +4023,11 @@ impl GlobalConfig {
         32
     }
 
+    /// Five. See [`Self::meeting_min_peers`] for why not one.
+    const fn default_meeting_min_peers() -> u32 {
+        5
+    }
+
     /// Eight days — comfortably over `veil_e2e::MLKEM_SEED_MIN_OVERLAP_SECS`
     /// (7d 7h), so at most one retired key is ever live and the exposure of a
     /// leaked mailbox seed is bounded to roughly a fortnight instead of the
@@ -4150,16 +4167,21 @@ impl MeetingPolicy {
 
     /// Whether to LOOK right now.
     ///
+    /// `live_peers` against `want`, not "have I got one". One peer is not a
+    /// supply, it is a single point of failure: the node that has it is one
+    /// timeout away from having none, and by then the meeting points are the
+    /// only way back. A node keeps looking until it has a margin.
+    ///
     /// `announcing` forces it, and that is not a special case but the point:
     /// a node that offers itself at a meeting point has to keep being there.
     /// Gating the announce on "do I personally need a peer" would empty the
     /// rendezvous exactly when the network is healthy — every node that had
     /// found its peers would stop being findable, and the next node to arrive
     /// would find nobody.
-    pub const fn permits_looking(self, has_live_peer: bool, announcing: bool) -> bool {
+    pub const fn permits_looking(self, live_peers: usize, want: u32, announcing: bool) -> bool {
         match self {
             Self::Always => true,
-            Self::Fallback => announcing || !has_live_peer,
+            Self::Fallback => announcing || (live_peers as u64) < want as u64,
         }
     }
 }
@@ -4316,6 +4338,7 @@ impl Default for GlobalConfig {
             bootstrap: false,
             meeting_points: MeetingPoints::default(),
             meeting_policy: MeetingPolicy::default(),
+            meeting_min_peers: Self::default_meeting_min_peers(),
             bootstrap_dns_pinned_keys: Vec::new(),
             bootstrap_dns_allow_system: true,
             allow_identity_fallback: false,
@@ -5986,37 +6009,56 @@ mod epic_117_defaults {
     #[test]
     fn the_policy_says_when_and_never_silences_an_announcing_node() {
         use MeetingPolicy as P;
+        const WANT: u32 = 5;
 
-        // The default keeps a connected node quiet and lets a stranded one
-        // look — which is the whole reason there are two axes.
         assert_eq!(P::default(), P::Fallback);
+        assert_eq!(GlobalConfig::default().meeting_min_peers, WANT);
+
+        // A FLOOR, not "have I got one". One peer is a single point of
+        // failure, and the node holding it is one timeout from having none —
+        // at which point the meeting points are the only way back.
         assert!(
-            P::Fallback.permits_looking(false, false),
-            "a node with nobody must look"
+            P::Fallback.permits_looking(0, WANT, false),
+            "a stranded node must look"
         );
         assert!(
-            !P::Fallback.permits_looking(true, false),
-            "a connected node kept asking"
+            P::Fallback.permits_looking(1, WANT, false),
+            "one peer is not a supply"
         );
         assert!(
-            P::Always.permits_looking(true, false),
+            P::Fallback.permits_looking(4, WANT, false),
+            "below the floor is below it"
+        );
+        assert!(
+            !P::Fallback.permits_looking(5, WANT, false),
+            "the floor was not enough"
+        );
+        assert!(!P::Fallback.permits_looking(50, WANT, false));
+
+        // Parametric: a node told to want one behaves as the old rule did.
+        assert!(P::Fallback.permits_looking(0, 1, false));
+        assert!(!P::Fallback.permits_looking(1, 1, false));
+        // And zero means "never look on my own account", which is a thing an
+        // operator may mean.
+        assert!(!P::Fallback.permits_looking(0, 0, false));
+
+        assert!(
+            P::Always.permits_looking(50, WANT, false),
             "`always` stopped looking"
         );
-        assert!(P::Always.permits_looking(false, false));
 
         // ANNOUNCING overrides the policy, and this is the assertion that
-        // matters most here. Gating the announce on "do I personally need a
-        // peer" would empty the rendezvous exactly when the network is
-        // healthy: every node that had found its peers would stop being
-        // findable, and the next arrival would find nobody.
+        // matters most. Gating the announce on "do I personally need a peer"
+        // would empty the rendezvous exactly when the network is healthy:
+        // every node that had found its peers would stop being findable, and
+        // the next arrival would find nobody.
         for policy in P::ALL {
             assert!(
-                policy.permits_looking(true, true),
+                policy.permits_looking(1_000, WANT, true),
                 "{policy} stopped an announcing node that already had peers"
             );
         }
 
-        // Every policy is spellable and parses back.
         assert!(!P::ALL.is_empty());
         for policy in P::ALL {
             assert_eq!(policy.as_str().parse::<P>().ok(), Some(*policy));

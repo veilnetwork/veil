@@ -19,6 +19,7 @@ pub enum ConfigKey {
     GlobalBootstrap,
     GlobalMeetingPoints,
     GlobalMeetingPolicy,
+    GlobalMeetingMinPeers,
     IpcEnabled,
     IpcSocketUri,
     IpcAppSocketDir,
@@ -53,6 +54,7 @@ impl ConfigKey {
             "global.bootstrap" => Ok(Self::GlobalBootstrap),
             "global.meeting_points" => Ok(Self::GlobalMeetingPoints),
             "global.meeting_policy" => Ok(Self::GlobalMeetingPolicy),
+            "global.meeting_min_peers" => Ok(Self::GlobalMeetingMinPeers),
             "ipc.enabled" => Ok(Self::IpcEnabled),
             "ipc.socket_uri" => Ok(Self::IpcSocketUri),
             "ipc.app_socket_dir" => Ok(Self::IpcAppSocketDir),
@@ -89,6 +91,7 @@ impl ConfigKey {
             Self::GlobalBootstrap => "global.bootstrap",
             Self::GlobalMeetingPoints => "global.meeting_points",
             Self::GlobalMeetingPolicy => "global.meeting_policy",
+            Self::GlobalMeetingMinPeers => "global.meeting_min_peers",
             Self::IpcEnabled => "ipc.enabled",
             Self::IpcSocketUri => "ipc.socket_uri",
             Self::IpcAppSocketDir => "ipc.app_socket_dir",
@@ -114,7 +117,7 @@ mod every_key_is_reachable {
 
     /// How many keys there are. Bump it when you add one, and give the new
     /// variant the next ordinal below.
-    const KEY_COUNT: usize = 27;
+    const KEY_COUNT: usize = 28;
 
     /// A distinct number per variant.
     ///
@@ -137,21 +140,22 @@ mod every_key_is_reachable {
             ConfigKey::GlobalBootstrap => 9,
             ConfigKey::GlobalMeetingPoints => 10,
             ConfigKey::GlobalMeetingPolicy => 11,
-            ConfigKey::IpcEnabled => 12,
-            ConfigKey::IpcSocketUri => 13,
-            ConfigKey::IpcAppSocketDir => 14,
-            ConfigKey::IdentityAlgo => 15,
-            ConfigKey::IdentityRole => 16,
-            ConfigKey::IdentityPublicKey => 17,
-            ConfigKey::IdentityPrivateKey => 18,
-            ConfigKey::IdentityNonce => 19,
-            ConfigKey::IdentityNodeId => 20,
-            ConfigKey::NatEnabled => 21,
-            ConfigKey::NatPunchTimeoutMs => 22,
-            ConfigKey::NatRelayEnabled => 23,
-            ConfigKey::NatUdpReflectors => 24,
-            ConfigKey::NatUdpReflectorBind => 25,
-            ConfigKey::TransportTlsClientConnectTimeoutMs => 26,
+            ConfigKey::GlobalMeetingMinPeers => 12,
+            ConfigKey::IpcEnabled => 13,
+            ConfigKey::IpcSocketUri => 14,
+            ConfigKey::IpcAppSocketDir => 15,
+            ConfigKey::IdentityAlgo => 16,
+            ConfigKey::IdentityRole => 17,
+            ConfigKey::IdentityPublicKey => 18,
+            ConfigKey::IdentityPrivateKey => 19,
+            ConfigKey::IdentityNonce => 20,
+            ConfigKey::IdentityNodeId => 21,
+            ConfigKey::NatEnabled => 22,
+            ConfigKey::NatPunchTimeoutMs => 23,
+            ConfigKey::NatRelayEnabled => 24,
+            ConfigKey::NatUdpReflectors => 25,
+            ConfigKey::NatUdpReflectorBind => 26,
+            ConfigKey::TransportTlsClientConnectTimeoutMs => 27,
         }
     }
 
@@ -175,6 +179,7 @@ mod every_key_is_reachable {
             ConfigKey::GlobalBootstrap,
             ConfigKey::GlobalMeetingPoints,
             ConfigKey::GlobalMeetingPolicy,
+            ConfigKey::GlobalMeetingMinPeers,
             ConfigKey::IpcEnabled,
             ConfigKey::IpcSocketUri,
             ConfigKey::IpcAppSocketDir,

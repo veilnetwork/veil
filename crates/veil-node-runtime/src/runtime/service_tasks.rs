@@ -1860,6 +1860,7 @@ impl NodeRuntime {
         };
         let announce_self = config.global.bootstrap;
         let policy = config.global.meeting_policy;
+        let want_peers = config.global.meeting_min_peers;
         let live_sessions = Arc::clone(&self.live_sessions);
         let dial_scheme = rendezvous_dial_scheme(config, me.as_ref());
 
@@ -1896,102 +1897,115 @@ impl NodeRuntime {
                 return;
             }
 
-            // WHEN, as opposed to where. Checked here rather than at spawn
-            // time: at spawn this node has no sessions yet, so a startup check
-            // would always read "nobody" and `fallback` would mean nothing.
-            let has_live_peer = !lock!(live_sessions).is_empty();
-            if !policy.permits_looking(has_live_peer, announce_self) {
-                logger.info(
-                    "mainline.not_needed",
-                    format!(
-                        "this node has peers and global.meeting_policy is {policy}; \
-                         the rendezvous is not asked"
-                    ),
-                );
-                return;
-            }
-
-            let net = (&client, std::time::Duration::from_secs(4));
-            let mut taken = 0usize;
-            let mut already_had = 0usize;
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs())
-                .unwrap_or(0);
-
-            for info_hash in current_infohashes(network, now) {
-                let found = find_peers(&net, info_hash, &seeds, Limits::default()).await;
-                logger.info(
-                    "mainline.looked",
-                    format!(
-                        "{} quer(ies), {} DHT node(s) answered, {} address(es) at the rendezvous",
-                        found.queries,
-                        found.closest.len(),
-                        found.peers.len()
-                    ),
-                );
-
-                if announce_self && let Some(ref me) = me {
-                    let accepted = announce(&net, info_hash, me.port, &found.closest).await;
-                    logger.info(
-                        "mainline.announced",
+            let mut ticker = tokio::time::interval(RENDEZVOUS_INTERVAL);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                ticker.tick().await;
+                // WHEN, as opposed to where. Asked once per pass rather than at
+                // spawn: at spawn this node has no sessions yet, so a startup
+                // check would always read "nobody" and `fallback` would mean
+                // nothing at all.
+                let live_peers = lock!(live_sessions).len();
+                if !policy.permits_looking(live_peers, want_peers, announce_self) {
+                    // NEXT pass, not never. A node that has peers now may have
+                    // none in fifteen minutes, and that is exactly the case
+                    // `fallback` exists for.
+                    logger.debug(
+                        "mainline.not_needed",
                         format!(
-                            "this node is listed at port {} with {accepted} of {} DHT node(s)",
-                            me.port,
-                            found.closest.len()
+                            "{live_peers} peer(s), wanted {want_peers}, policy \
+                             {policy}: the rendezvous is not asked this round"
                         ),
                     );
+                    continue;
                 }
 
-                // NOT gated on `me`. Announcing needs something to announce;
-                // dialling needs only a scheme, and a node with no listener --
-                // every client -- has one to dial with and nothing to offer.
-                for addr in found.peers.iter().take(MAX_RENDEZVOUS_PEERS) {
-                    if taken >= MAX_RENDEZVOUS_PEERS {
-                        break;
-                    }
-                    let transport = format!("{dial_scheme}://{addr}");
-                    // Already ours, by any route. See `rendezvous_address_is_new`.
-                    let known: Vec<PeerConfigEntry> =
-                        lock_state(&state).peers.values().cloned().collect();
-                    if !rendezvous_address_is_new(&known, &transport) {
-                        already_had += 1;
-                        logger.debug(
-                            "mainline.already_known",
-                            format!("{transport} is already a peer; not dialled"),
+                let net = (&client, std::time::Duration::from_secs(4));
+                let mut taken = 0usize;
+                let mut already_had = 0usize;
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+
+                for info_hash in current_infohashes(network, now) {
+                    let found = find_peers(&net, info_hash, &seeds, Limits::default()).await;
+                    logger.info(
+                        "mainline.looked",
+                        format!(
+                            "{} quer(ies), {} DHT node(s) answered, {} address(es) at the rendezvous",
+                            found.queries,
+                            found.closest.len(),
+                            found.peers.len()
+                        ),
+                    );
+
+                    if announce_self && let Some(ref me) = me {
+                        let accepted = announce(&net, info_hash, me.port, &found.closest).await;
+                        logger.info(
+                            "mainline.announced",
+                            format!(
+                                "this node is listed at port {} with {accepted} of {} DHT node(s)",
+                                me.port,
+                                found.closest.len()
+                            ),
                         );
-                        continue;
                     }
-                    match dial_and_learn(&access, &state, &transport, taken).await {
-                        Ok(node) => {
-                            taken += 1;
-                            logger.info(
-                                "mainline.met",
-                                format!("met {node} at {transport}, learned from the rendezvous"),
-                            );
+
+                    // NOT gated on `me`. Announcing needs something to announce;
+                    // dialling needs only a scheme, and a node with no listener --
+                    // every client -- has one to dial with and nothing to offer.
+                    for addr in found.peers.iter().take(MAX_RENDEZVOUS_PEERS) {
+                        if taken >= MAX_RENDEZVOUS_PEERS {
+                            break;
                         }
-                        Err(e) => logger.debug("mainline.unreachable", format!("{transport}: {e}")),
+                        let transport = format!("{dial_scheme}://{addr}");
+                        // Already ours, by any route. See `rendezvous_address_is_new`.
+                        let known: Vec<PeerConfigEntry> =
+                            lock_state(&state).peers.values().cloned().collect();
+                        if !rendezvous_address_is_new(&known, &transport) {
+                            already_had += 1;
+                            logger.debug(
+                                "mainline.already_known",
+                                format!("{transport} is already a peer; not dialled"),
+                            );
+                            continue;
+                        }
+                        match dial_and_learn(&access, &state, &transport, taken).await {
+                            Ok(node) => {
+                                taken += 1;
+                                logger.info(
+                                    "mainline.met",
+                                    format!(
+                                        "met {node} at {transport}, learned from the rendezvous"
+                                    ),
+                                );
+                            }
+                            Err(e) => {
+                                logger.debug("mainline.unreachable", format!("{transport}: {e}"))
+                            }
+                        }
                     }
                 }
-            }
 
-            if taken == 0 {
-                // Two different facts, and the old message told the wrong one:
-                // a node already in session with everybody at the rendezvous
-                // was reported as unable to reach anyone.
-                if already_had > 0 {
-                    logger.info(
-                        "mainline.already_connected",
-                        format!(
-                            "everybody at the rendezvous ({already_had}) is \
-                             already a peer of this node"
-                        ),
-                    );
-                } else {
-                    logger.info(
-                        "mainline.nobody",
-                        "the rendezvous named nobody this node could reach",
-                    );
+                if taken == 0 {
+                    // Two different facts, and the old message told the wrong one:
+                    // a node already in session with everybody at the rendezvous
+                    // was reported as unable to reach anyone.
+                    if already_had > 0 {
+                        logger.info(
+                            "mainline.already_connected",
+                            format!(
+                                "everybody at the rendezvous ({already_had}) is \
+                                 already a peer of this node"
+                            ),
+                        );
+                    } else {
+                        logger.info(
+                            "mainline.nobody",
+                            "the rendezvous named nobody this node could reach",
+                        );
+                    }
                 }
             }
         });
@@ -5672,6 +5686,20 @@ pub fn rendezvous_dial_scheme(
         .find_map(|uri| uri.split_once("://").map(|(scheme, _)| scheme.to_owned()))
         .unwrap_or_else(|| "obfs4-tcp".to_owned())
 }
+
+/// How often layer 7 goes back to the rendezvous.
+///
+/// NOT a nicety. A DHT announcement expires — thirty minutes in most
+/// implementations — so a node that announces once at startup is gone from the
+/// rendezvous by the afternoon, and the whole layer decays into nothing
+/// without a single error anywhere. Measured the hard way: the first version
+/// of this task ran once and stopped, and the only reason that was noticed is
+/// that `meeting_policy = fallback` never got a second pass in which to say
+/// "not needed".
+///
+/// Fifteen minutes leaves a wide margin under the shortest expiry seen in the
+/// wild, and costs a handful of UDP packets.
+const RENDEZVOUS_INTERVAL: std::time::Duration = std::time::Duration::from_secs(15 * 60);
 
 /// How many peers one rendezvous may contribute in a run.
 ///
