@@ -1867,6 +1867,7 @@ impl NodeRuntime {
             veil_mainline::rendezvous::Network::Production
         };
         let announce_self = config.global.bootstrap;
+        let dial_scheme = rendezvous_dial_scheme(config, me.as_ref());
 
         let logger = self.logger.clone();
         let access = self.access();
@@ -1932,12 +1933,14 @@ impl NodeRuntime {
                     );
                 }
 
-                let Some(ref me) = me else { continue };
+                // NOT gated on `me`. Announcing needs something to announce;
+                // dialling needs only a scheme, and a node with no listener --
+                // every client -- has one to dial with and nothing to offer.
                 for addr in found.peers.iter().take(MAX_RENDEZVOUS_PEERS) {
                     if taken >= MAX_RENDEZVOUS_PEERS {
                         break;
                     }
-                    let transport = format!("{}://{addr}", me.scheme.uri_scheme());
+                    let transport = format!("{dial_scheme}://{addr}");
                     match dial_and_learn(&access, &state, &transport, taken).await {
                         Ok(node) => {
                             taken += 1;
@@ -5577,6 +5580,38 @@ pub fn builtin_seed_contribution(
     }
 }
 
+/// The transport scheme to dial a rendezvous address with.
+///
+/// The DHT carries an address and no scheme, so this node has to supply one.
+/// Three sources, in order of how much they know:
+///
+/// 1. what this node advertises about itself — a network runs one transport,
+///    and the one we offer is the one we expect;
+/// 2. the scheme of a peer the operator already named, for a node that
+///    advertises nothing;
+/// 3. obfs4-tcp, which is what a veil network runs.
+///
+/// The reason this is not simply the first: a node with NO listener has
+/// nothing to advertise, and that is the ordinary shape of a client. Tying the
+/// dial to having something to announce made layer 7 useless to exactly the
+/// nodes it is for — measured on a live host that found three addresses at the
+/// rendezvous and dialled none of them, because it listens for nobody.
+pub fn rendezvous_dial_scheme(
+    config: &veil_cfg::Config,
+    me: Option<&veil_bootstrap::LanAnnounce>,
+) -> String {
+    if let Some(me) = me {
+        return me.scheme.uri_scheme().to_owned();
+    }
+    config
+        .peers
+        .iter()
+        .map(|p| p.transport.as_str())
+        .chain(config.bootstrap_peers.iter().map(|p| p.transport.as_str()))
+        .find_map(|uri| uri.split_once("://").map(|(scheme, _)| scheme.to_owned()))
+        .unwrap_or_else(|| "obfs4-tcp".to_owned())
+}
+
 /// How many peers one rendezvous may contribute in a run.
 ///
 /// A public index is writable by anyone: without a ceiling, whoever announces
@@ -6479,6 +6514,43 @@ mod tests {
         // otherwise the two assertions above would pass on a function that
         // refuses everything.
         assert!(admit_lan_peer("SOMEBODY-ELSE", "ME", &taken));
+    }
+
+    #[test]
+    fn a_node_with_no_listener_still_knows_how_to_dial_what_it_found() {
+        // The defect this closes was measured on a live host: it found three
+        // addresses at the rendezvous and dialled none of them, because the
+        // dial was gated on having something to ANNOUNCE. A client listens for
+        // nobody -- that is the ordinary shape, not an edge case -- so the
+        // gate made layer 7 useless to exactly the nodes it is for.
+        let bare = veil_cfg::Config::default();
+        assert_eq!(
+            rendezvous_dial_scheme(&bare, None),
+            "obfs4-tcp",
+            "a node with nothing at all must still have a scheme to dial with"
+        );
+
+        // What the operator already named wins over the default: a network
+        // running plain tcp must not be dialled with obfs4.
+        let mut named = veil_cfg::Config::default();
+        named.bootstrap_peers.push(veil_cfg::BootstrapPeer {
+            transport: "tcp://198.51.100.4:5556".to_owned(),
+            public_key: "K".to_owned(),
+            nonce: "N".to_owned(),
+            algo: veil_cfg::SignatureAlgorithm::Ed25519,
+            tls_cert: None,
+            tls_ca_cert: None,
+        });
+        assert_eq!(rendezvous_dial_scheme(&named, None), "tcp");
+
+        // And what this node advertises about itself wins over both.
+        let me = veil_bootstrap::LanAnnounce {
+            public_key: [7u8; 32],
+            pow_nonce: [1, 2, 3, 4],
+            port: 5556,
+            scheme: veil_bootstrap::LanScheme::Quic,
+        };
+        assert_eq!(rendezvous_dial_scheme(&named, Some(&me)), "quic");
     }
 
     #[test]
