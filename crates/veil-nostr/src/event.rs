@@ -5,7 +5,7 @@
 //! stores anything, so an implementation that is nearly right is an
 //! implementation whose events are silently dropped.
 
-use k256::schnorr::signature::{Signer as _, Verifier as _};
+use k256::schnorr::signature::hazmat::{PrehashSigner as _, PrehashVerifier as _};
 use k256::schnorr::{Signature, SigningKey, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -94,7 +94,14 @@ pub fn sign(
 ) -> Event {
     let pubkey = hex_lower(&key.verifying_key().to_bytes());
     let id = event_id(&pubkey, created_at, kind, &tags, content);
-    let sig: Signature = key.sign(&id);
+    // PREHASH, not `sign`. `k256`'s `Signer::sign` hashes the message with
+    // SHA-256 first; Nostr signs the id RAW, because the id already is a
+    // SHA-256 and BIP-340 takes it as the message. Signing `sha256(id)`
+    // produces a signature this code verifies happily and every relay rejects
+    // with "invalid: bad signature" — which is what two of them said.
+    let sig: Signature = key
+        .sign_prehash(&id)
+        .expect("a 32-byte prehash is signable");
     Event {
         id: hex_lower(&id),
         pubkey,
@@ -138,8 +145,10 @@ pub fn verify(event: &Event) -> Result<(), EventError> {
         return Err(EventError::Malformed);
     }
     let signature = Signature::try_from(raw.as_slice()).map_err(|_| EventError::Malformed)?;
+    // Prehash on this side too, for the same reason: the message BIP-340
+    // signs here is the id itself.
     verifying
-        .verify(&id, &signature)
+        .verify_prehash(&id, &signature)
         .map_err(|_| EventError::BadSignature)
 }
 
@@ -235,6 +244,38 @@ mod tests {
         assert_eq!(event.sig.len(), 128, "a schnorr signature is 64 bytes");
         assert_eq!(tag_value(&event, "d"), Some("veil-rendezvous"));
         assert_eq!(tag_value(&event, "missing"), None);
+    }
+
+    #[test]
+    fn the_id_is_signed_raw_and_not_hashed_again() {
+        // The defect this pins cost a live run to find, and no unit test could
+        // have: `k256`'s `Signer::sign` hashes the message with SHA-256 first,
+        // Nostr signs the id RAW. Doing it the hashing way produces signatures
+        // this crate verified happily and every relay rejected with
+        // "invalid: bad signature" — our reader agreed with our writer and
+        // both were wrong.
+        //
+        // So: a signature made the hashing way must NOT verify here.
+        use k256::schnorr::signature::Signer as _;
+        let k = key(21);
+        let mut event = sign(&k, 1700000000, KIND_APP_DATA, vec![], "x");
+        assert_eq!(verify(&event), Ok(()));
+
+        let id = event_id(
+            &event.pubkey,
+            event.created_at,
+            event.kind,
+            &event.tags,
+            &event.content,
+        );
+        let hashed: Signature = k.sign(&id);
+        event.sig = hex_lower(&hashed.to_bytes());
+        assert_eq!(
+            verify(&event),
+            Err(EventError::BadSignature),
+            "a signature over sha256(id) was accepted; that is the one every \
+             relay refuses"
+        );
     }
 
     #[test]

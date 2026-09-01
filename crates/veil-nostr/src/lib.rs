@@ -25,5 +25,6 @@
 //! a PUBLIC ENTRY POINT, not private discovery, and publishing is opt-in
 //! (`global.bootstrap`) for exactly that reason.
 
+pub mod client;
 pub mod event;
 pub mod rendezvous;
