@@ -1904,6 +1904,7 @@ impl NodeRuntime {
 
             let net = (&client, std::time::Duration::from_secs(4));
             let mut taken = 0usize;
+            let mut already_had = 0usize;
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_secs())
@@ -1945,6 +1946,7 @@ impl NodeRuntime {
                     let known: Vec<PeerConfigEntry> =
                         lock_state(&state).peers.values().cloned().collect();
                     if !rendezvous_address_is_new(&known, &transport) {
+                        already_had += 1;
                         logger.debug(
                             "mainline.already_known",
                             format!("{transport} is already a peer; not dialled"),
@@ -1965,10 +1967,23 @@ impl NodeRuntime {
             }
 
             if taken == 0 {
-                logger.info(
-                    "mainline.nobody",
-                    "the rendezvous named nobody this node could reach",
-                );
+                // Two different facts, and the old message told the wrong one:
+                // a node already in session with everybody at the rendezvous
+                // was reported as unable to reach anyone.
+                if already_had > 0 {
+                    logger.info(
+                        "mainline.already_connected",
+                        format!(
+                            "everybody at the rendezvous ({already_had}) is \
+                             already a peer of this node"
+                        ),
+                    );
+                } else {
+                    logger.info(
+                        "mainline.nobody",
+                        "the rendezvous named nobody this node could reach",
+                    );
+                }
             }
         });
         lock_tasks(&self.tasks).sessions.push(handle);
