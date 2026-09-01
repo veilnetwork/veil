@@ -1,5 +1,27 @@
 # Changelog
 
+## v0.10.1 — 2026-09-01
+
+Two defects that 0.10.0 shipped and production found within the hour.
+
+**A CLI convenience was killing the daemon.** `main` restored SIGPIPE to
+`SIG_DFL` so that `veil-cli node dht list | head` ends in ten lines instead of a
+panic. The comment beside it said this was confined to the CLI entry point, and
+that a long-lived host must keep Rust's default "or an unrelated socket write
+would take the whole process down". Both halves were right except the first:
+`node run` enters through the same `main`. A seed was killed by SIGPIPE fifteen
+minutes after starting, right after announcing itself to a Nostr relay, and
+stayed down — systemd counts SIGPIPE among the clean exits, so
+`Restart=on-failure` never fired and nothing logged anything at all. The
+disposition is now restored only for invocations that print and exit.
+
+**The peer table is not the record of who we are talking to.** Two seeds met
+each other again on every rendezvous pass and rebuilt a session they already
+had. A row learned at a meeting point lives in the autodiscovered range and is
+scored out between passes, so the next pass read "not known" about a peer with
+an open session, dialled it, and the far side dedupped the duplicate — taking
+the working session with it. The check now also asks the session layer.
+
 ## v0.10.0 — 2026-09-01
 
 A node can now find the network and actually join it. Until this release it
