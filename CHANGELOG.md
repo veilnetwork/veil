@@ -1,5 +1,30 @@
 # Changelog
 
+## v0.11.2 — 2026-09-02
+
+**A cached certificate now expires when its owner said it would.** Two clocks
+govern the ML-KEM certificate cache and only one was consulted: the TTL says
+how long ago a row was verified, `valid_until_unix` is what the device's owner
+signed. A certificate expiring in a minute entered the cache and was then
+sealed to for the remaining twenty-nine of the half-hour TTL — to a key its
+owner had already stopped standing behind. The field exists for exactly this:
+its own documentation says it is carried through "so the answer can be asked
+again at every use", and the two cache fast paths never asked. The store
+already prunes on the same rule; this is the read path catching up with it.
+
+Two findings from the same registry were checked and NOT taken, because each
+contradicts a decision the code states outright:
+
+`dht_candidate_peers` falling back to peers that opted out of DHT service is
+deliberate — "a query that cannot be answered beats a query that is never
+sent", written beside a measurement from the production network where a
+contact request could not be sealed while the record sat on all three seeds.
+
+And a node with `[dht] participate = false` still answering recursive queries
+is what that flag promises: "a pure DHT router (responds to FIND_NODE /
+FIND_VALUE but refuses to store values)". The lever for other people's traffic
+is the byte budget beside it, and that one is enforced.
+
 ## v0.11.1 — 2026-09-02
 
 Three from the report20 registry, each checked against the code first.
