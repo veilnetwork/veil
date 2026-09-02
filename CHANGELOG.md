@@ -1,5 +1,26 @@
 # Changelog
 
+## v0.11.5 — 2026-09-02
+
+**A read that failed is not a value that is gone.**
+
+Every repair the disk cold tier makes is a DELETE decided by a read — an
+orphaned index row, a dangling one, a victim to evict — and each of them folded
+an I/O error into "the value is not there". One transient failure was therefore
+enough to take the index away from a value that was perfectly alive: nothing
+counts it afterwards, nothing can evict it, the byte and entry caps stop seeing
+it, and only the next successful open notices. The same fold decided whether a
+put was an overwrite, so an unreadable reverse map moved the entry count in the
+wrong direction and left a stale index row behind.
+
+`Ok(None)` alone now means absence. The staging helpers hand their error back
+rather than answering with a bool that cannot tell the two apart; the eviction
+scan abstains for a pass instead of repairing on a picture it could not read;
+open-time reconciliation keeps a verdict on whether it saw the whole tier and
+DISCARDS its staged repairs when it did not, leaving the tier as it was for the
+next open to retry; and a put whose reverse map cannot be read hands the value
+back to its caller.
+
 ## v0.11.4 — 2026-09-02
 
 **The meeting points, read as a stranger would write them.**
