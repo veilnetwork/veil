@@ -3731,7 +3731,7 @@ impl NodeRuntime {
         rendezvous_node_id: [u8; 32],
         auth_cookie: [u8; 16],
         validity_window_secs: u64,
-    ) {
+    ) -> bool {
         self.register_rendezvous_publisher_with_push(
             rendezvous_node_id,
             auth_cookie,
@@ -3844,13 +3844,17 @@ impl NodeRuntime {
     /// embedded in every signed ad refresh until [`Self::set_rendezvous_push_envelope`]
     /// updates it OR the entry is unregistered. Empty `push_envelope`
     /// is equivalent to the no-push API.
+    ///
+    /// Returns whether the registry now holds this entry: the publisher slots
+    /// are bounded, and a registration past them would be cloned on every
+    /// publish tick and never signed.
     pub fn register_rendezvous_publisher_with_push(
         &self,
         rendezvous_node_id: [u8; 32],
         auth_cookie: [u8; 16],
         validity_window_secs: u64,
         push_envelope: Vec<u8>,
-    ) {
+    ) -> bool {
         let entry = veil_anonymity::rendezvous::RendezvousPublisherEntry {
             rendezvous_node_id,
             auth_cookie,
@@ -3867,15 +3871,29 @@ impl NodeRuntime {
             ephemeral_ad_identity: None,
             rendezvous_kem_valid_until_unix: 0,
         };
+        // THROUGH THE ONE ADMISSION. This kept its own copy of "replace or
+        // push", which meant it kept none of what that helper had been taught:
+        // the slot bound (past it, an entry is cloned on every publish tick and
+        // never signed), and the rule that a KEM-less re-registration must not
+        // erase the key the app supplied — the erasure this very entry commits,
+        // since it registers with `rendezvous_kem_pk: Vec::new()` and the
+        // comment above it says the key arrives separately (report21 V18-L1).
+        //
+        // `insert_publisher_entry` refuses when the slots are full, and a
+        // refusal is reported rather than silently pushed past.
         let mut entries = lock!(self.anonymity.rendezvous_publisher_entries);
-        // Replace existing entry with same (rendezvous, cookie) pair.
-        if let Some(pos) = entries.iter().position(|e| {
-            e.rendezvous_node_id == rendezvous_node_id && e.auth_cookie == auth_cookie
-        }) {
-            entries[pos] = entry;
-        } else {
-            entries.push(entry);
+        if !service_tasks::insert_publisher_entry(&mut entries, entry) {
+            self.logger.info(
+                "anonymity.rendezvous_publisher.no_slot",
+                format!(
+                    "a publisher registration took no slot (all {} in use); it \
+                     would never have been published",
+                    veil_anonymity::rendezvous::MAX_RENDEZVOUS_AD_SLOTS,
+                ),
+            );
+            return false;
         }
+        true
     }
 
     /// update only the push envelope on an existing
@@ -3952,8 +3970,19 @@ impl NodeRuntime {
             .iter_mut()
             .find(|e| e.rendezvous_node_id == rendezvous_node_id && e.auth_cookie == auth_cookie)
         {
+            // The key, its algorithm AND its expiry move together, because
+            // this call cannot say when the NEW key dies: leaving the old
+            // stamp behind advertises a fresh key under the lifetime of the
+            // one it replaced, which is the defect fixed in 0.11.3 arriving
+            // through a different door (report21 V18-L1). Zero means "nobody
+            // said", and the ad then runs on its own window until the caller
+            // that knows the answer supplies it.
+            let rotated = entry.rendezvous_kem_pk != relay_kem_pk;
             entry.rendezvous_kem_algo = relay_kem_algo;
             entry.rendezvous_kem_pk = relay_kem_pk;
+            if rotated {
+                entry.rendezvous_kem_valid_until_unix = 0;
+            }
             true
         } else {
             false

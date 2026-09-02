@@ -1,5 +1,23 @@
 # Changelog
 
+## v0.11.6 — 2026-09-02
+
+**Every publisher registration goes through the one admission.**
+
+`register_rendezvous_publisher_with_push` kept its own copy of "replace or
+push", so it kept none of what the shared helper had been taught. It pushed
+past the slot bound — an entry past it is cloned on every publish tick and
+never signed, which is the growth report17 bounded and 0.11.3 made honest —
+and its replace overwrote the relay key with the empty one it registers with,
+the erasure 0.11.3 taught the helper to prevent. Both arrived through this
+door instead. It now goes through `insert_publisher_entry` and reports a
+refusal rather than pushing past it.
+
+And setting a relay key clears the expiry of the key it replaces. This call
+cannot say when the NEW key dies, so leaving the old stamp behind advertised a
+fresh key under the lifetime of the one it superseded — the same defect, once
+more through a different door.
+
 ## v0.11.5 — 2026-09-02
 
 **A read that failed is not a value that is gone.**
