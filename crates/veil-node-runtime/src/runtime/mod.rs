@@ -8988,51 +8988,11 @@ impl NodeServices {
     }
 
     pub fn withdraw_ephemeral_onion_service(&self, identity_vk: [u8; 32]) -> bool {
-        let mut services = lock!(self.anonymity.onion_services);
-        let mut removed = Vec::new();
-        services.retain(|entry| {
-            let matches = entry.ephemeral
-                && entry
-                    .descriptor_identity_seed
-                    .as_deref()
-                    .map(|seed| {
-                        veil_crypto::key_blinding::ed25519_public_from_seed(seed) == identity_vk
-                    })
-                    .unwrap_or(false);
-            if matches && let Some(&relay) = entry.relay_path.last() {
-                removed.push((relay, entry.cookie));
-            }
-            !matches
-        });
-        // The services lock is HELD across the publisher removal.
-        //
-        // The cookie is derived per (identity, period), not minted per
-        // registration, so a withdraw and a re-registration inside one period
-        // produce the same `(relay, cookie)`. Letting go of `services` here
-        // opened a window in which a re-registration could put its service
-        // entry back and this loop would then delete the PUBLISHER row it had
-        // just made — leaving a service that is registered and never
-        // advertised, silently (report20 V18-M5). `register_onion_service_
-        // with_identity` takes these two locks in this order, so holding both
-        // here is the order that already exists and cannot invert.
-        //
-        // It narrows the window rather than closing it: the publisher row is
-        // written by a DEFERRED closure that runs when the circuit's
-        // `confirmed` flag flips, and that closure takes only the publisher
-        // lock. A registration whose confirm lands between these two
-        // statements is still able to leave a row behind. Closing that means
-        // giving a registration an identity of its own — the cookie is not one
-        // — and deciding a lock order for the three registries that hold parts
-        // of it; the note in the changelog says so rather than pretending this
-        // is the whole fix.
-        for (relay, cookie) in &removed {
-            let mut publishers = lock!(self.anonymity.rendezvous_publisher_entries);
-            publishers.retain(|entry| {
-                !(entry.rendezvous_node_id == *relay && entry.auth_cookie == *cookie)
-            });
-        }
-        drop(services);
-        !removed.is_empty()
+        withdraw_ephemeral_service(
+            &self.anonymity.onion_services,
+            &self.anonymity.rendezvous_publisher_entries,
+            identity_vk,
+        )
     }
 
     fn sovereign_onion_identity_seed(
@@ -9143,9 +9103,19 @@ impl NodeServices {
             descriptor_provider_slot,
         );
 
+        // Δ2-c: sign + DHT-key the ad under a per-service EPHEMERAL pseudo
+        // identity (derived from this service's registration keypair), NOT our
+        // sovereign node_id — otherwise the ad would publicly link our identity
+        // to our live rendezvous point, defeating the blinded descriptor's
+        // unlinkability. Taken from the keypair in hand, not looked up by
+        // cookie afterwards: the cookie does not name a registration.
+        let ephemeral_ad_identity = ephemeral_ad_identity_for(&reg_keypair);
         // Build + register the circuit (no session register — that is the leak),
         // then publish the ad so clients can find us.
-        self.register_onion_circuit_with_identity(
+        let OnionRegistration {
+            id: registration,
+            confirmed,
+        } = self.register_onion_circuit_with_identity(
             &relay_path,
             reg_keypair,
             cookie,
@@ -9166,21 +9136,6 @@ impl NodeServices {
             period,
             veil_util::hex_short(self.identity.local_identity.node_id.as_bytes()),
         );
-        // Δ2-c: sign + DHT-key the ad under a per-service EPHEMERAL pseudo
-        // identity (derived from this service's registration keypair, minted by
-        // register_onion_circuit above), NOT our sovereign node_id — otherwise
-        // the ad would publicly link our identity to our live rendezvous point,
-        // defeating the blinded descriptor's unlinkability.
-        let ephemeral_ad_identity = lock!(self.anonymity.onion_services)
-            .iter()
-            .find(|e| e.cookie == cookie)
-            .and_then(|e| {
-                veil_anonymity::rendezvous::EphemeralAdIdentity::from_b64_keypair(
-                    e.reg_keypair.public_key.clone(),
-                    e.reg_keypair.private_key.clone(),
-                    veil_types::SignatureAlgorithm::Ed25519,
-                )
-            });
         // ORDERING BARRIER (publish-before-register race): the descriptor/ad
         // must not become resolvable before the relay has BOUND the cookie —
         // `register_onion_circuit` fires the build and returns immediately,
@@ -9191,14 +9146,13 @@ impl NodeServices {
         // 60 introduces silently dropped as cookie_unknown, recovery deferred
         // to the sender's next stall window — the churn minute-outliers).
         // Defer both publishes until the entry's `confirmed` flag flips.
-        let confirmed = lock!(self.anonymity.onion_services)
-            .iter()
-            .find(|e| e.cookie == cookie)
-            .map(|e| std::sync::Arc::clone(&e.confirmed));
         let relay = r;
         let publish_seed = identity_seed.clone();
         let publish_slot = descriptor_provider_slot;
-        let publish = move |this: &NodeServices| {
+        // The publisher row is written UNDER the services lock, in one step
+        // with the check that this registration is still on the books (see
+        // `publish_row_if_registered`).
+        let publish_row = move |this: &NodeServices| {
             let registered = service_tasks::rendezvous_register_publisher(
                 &this.anonymity,
                 &relay,
@@ -9219,19 +9173,22 @@ impl NodeServices {
                     "no publisher slot left for this service's rendezvous ad",
                 );
             }
-            // Also publish a BLINDED descriptor (3c): identity-unlinkable in the
-            // DHT. Capability services use their random per-share identity here,
-            // never the host's sovereign key.
+        };
+        // The BLINDED descriptor (3c) goes to the DHT after the lock is let
+        // go: identity-unlinkable, and a DHT write holds no registry of ours.
+        // Capability services use their random per-share identity here, never
+        // the host's sovereign key.
+        let publish_descriptor = move |this: &NodeServices| {
             if let Some(seed) = publish_seed.as_deref() {
                 this.publish_blinded_descriptor_for(seed, relay, cookie, publish_slot);
             }
         };
-        match confirmed {
-            Some(flag) => self.publish_after_circuit_confirmed(cookie, flag, publish),
-            // Entry already evicted (slot-cap race) — nothing to wait on;
-            // publish now, matching the old behavior.
-            None => publish(self),
-        }
+        self.publish_after_circuit_confirmed(
+            registration,
+            confirmed,
+            publish_row,
+            publish_descriptor,
+        );
 
         Ok((cookie, identity_vk))
     }
@@ -9315,9 +9272,10 @@ impl NodeServices {
 
     fn publish_after_circuit_confirmed(
         &self,
-        cookie: [u8; 16],
+        registration: u64,
         confirmed: std::sync::Arc<std::sync::atomic::AtomicBool>,
-        publish: impl FnOnce(&NodeServices) + Send + 'static,
+        publish_row: impl FnOnce(&NodeServices) + Send + 'static,
+        publish_descriptor: impl FnOnce(&NodeServices) + Send + 'static,
     ) {
         const CONFIRM_TIMEOUT_MS: u64 = 3_000;
         const POLL_MS: u64 = 20;
@@ -9343,7 +9301,11 @@ impl NodeServices {
             // Immediately rather than never: the barrier is an optimisation
             // against a narrow race, and dropping the publish would cost this
             // service its discoverability outright.
-            publish(self);
+            if publish_row_if_registered(&self.anonymity.onion_services, registration, || {
+                publish_row(self)
+            }) {
+                publish_descriptor(self);
+            }
             return;
         }
         std::thread::spawn(move || {
@@ -9386,8 +9348,18 @@ impl NodeServices {
             // the owner had revoked, discoverable until it ages out, with the
             // ephemeral signing key kept alive beside it (report17 V17-M7).
             //
-            // The cookie identifies the registration: a later one gets its own.
-            if !service_with_cookie_present(&lock!(this.anonymity.onion_services), cookie) {
+            // Two things it then still got wrong (report20 V18-M5). It asked
+            // by COOKIE, and a re-registration inside the same period has the
+            // same cookie, so a stale waiter was satisfied by a service it
+            // did not belong to and wrote a row for the OLD relay. And it
+            // asked, let go of the lock, and only then wrote the row, so a
+            // withdraw fitting between the two left a row behind that every
+            // tick re-signed. The registration number answers the first; the
+            // row going in under the same lock as the question answers the
+            // second.
+            if !publish_row_if_registered(&this.anonymity.onion_services, registration, || {
+                publish_row(&this)
+            }) {
                 this.logger.info(
                     "anonymity.publish.withdrawn_before_publish",
                     "the service was withdrawn while its publish waited for the \
@@ -9395,7 +9367,7 @@ impl NodeServices {
                 );
                 return;
             }
-            publish(&this);
+            publish_descriptor(&this);
         });
     }
 
@@ -9591,7 +9563,7 @@ impl NodeServices {
         descriptor_identity_seed: Option<std::sync::Arc<zeroize::Zeroizing<[u8; 32]>>>,
         ephemeral: bool,
         descriptor_provider_slot: Option<u8>,
-    ) -> std::result::Result<(), veil_types::AnonOnionSendError> {
+    ) -> std::result::Result<OnionRegistration, veil_types::AnonOnionSendError> {
         // Registration keypair: seed-derived per blinded-descriptor period, and
         // the cookie is derived from it (L1 kept the key stable across REBUILDS;
         // deriving it from the seed makes it stable across PROCESS RESTARTS
@@ -9622,9 +9594,21 @@ impl NodeServices {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
+        let registration = next_onion_registration();
         let mut svcs = lock!(self.anonymity.onion_services);
         // Replace any prior entry for the same cookie (re-register), else push.
+        // The entry it displaces takes its publisher row with it: the new
+        // registration may sit at another relay, and a row nobody owns is
+        // re-signed every tick for as long as the process lives.
+        let displaced: Vec<([u8; 32], [u8; 16])> = svcs
+            .iter()
+            .filter(|e| e.cookie == cookie)
+            .filter_map(|e| e.relay_path.last().map(|r| (*r, e.cookie)))
+            .collect();
         svcs.retain(|e| e.cookie != cookie);
+        if !displaced.is_empty() {
+            remove_publisher_rows(&self.anonymity.rendezvous_publisher_entries, &displaced);
+        }
         // diff-audit S3: bound the live-service set. Each `register_onion_service`
         // mints a FRESH cookie, so an IPC client looping the call would otherwise
         // grow this Vec without limit — and every maintenance tick rebuilds AND
@@ -9642,15 +9626,19 @@ impl NodeServices {
         svcs.push(anonymity_state::OnionServiceEntry {
             relay_path: relay_path.to_vec(),
             cookie,
+            registration,
             built_unix: now,
             reg_keypair,
-            confirmed,
+            confirmed: std::sync::Arc::clone(&confirmed),
             registration_epoch,
             descriptor_identity_seed,
             descriptor_provider_slot,
             ephemeral,
         });
-        Ok(())
+        Ok(OnionRegistration {
+            id: registration,
+            confirmed,
+        })
     }
 
     /// Maintenance: rebuild any hosted onion-service circuit that is older than
@@ -9725,6 +9713,7 @@ impl NodeServices {
         // Refresh at half the relay-side circuit idle TTL (300 s) → 150 s.
         const REFRESH_SECS: u64 = veil_anonymity::circuit_table::DEFAULT_CIRCUIT_TTL_SECS / 2;
         type DueEntry = (
+            u64,
             [u8; 16],
             Vec<[u8; 32]>,
             veil_crypto::GeneratedKeyPair,
@@ -9739,6 +9728,7 @@ impl NodeServices {
                 .filter(|e| now_unix.saturating_sub(e.built_unix) >= REFRESH_SECS)
                 .map(|e| {
                     (
+                        e.registration,
                         e.cookie,
                         e.relay_path.clone(),
                         e.reg_keypair.clone(),
@@ -9751,6 +9741,7 @@ impl NodeServices {
                 .collect()
         };
         for (
+            registration,
             cookie,
             relay_path,
             reg_keypair,
@@ -9825,14 +9816,32 @@ impl NodeServices {
                     veil_util::hex_short(self.identity.local_identity.node_id.as_bytes()),
                 );
                 let mut svcs = lock!(self.anonymity.onion_services);
-                // Locate by the OLD cookie (the due-tuple value), then re-key the
-                // entry to cookie_now so subsequent ticks track the current period.
-                if let Some(e) = svcs.iter_mut().find(|e| e.cookie == cookie) {
+                // Locate by registration (a withdrawn-and-re-registered
+                // service has the same cookie and is not this entry), then
+                // re-key the entry to cookie_now so subsequent ticks track the
+                // current period.
+                if let Some(e) = svcs.iter_mut().find(|e| e.registration == registration) {
+                    let was = e.relay_path.last().map(|r| (*r, e.cookie));
                     e.built_unix = now_unix;
                     e.relay_path = path.clone();
                     e.confirmed = std::sync::Arc::clone(new_confirmed);
                     e.cookie = cookie_now;
                     e.reg_keypair = reg_keypair.clone();
+                    // The publisher row follows the entry, in the same step.
+                    // A path re-selection or a period boundary changes what
+                    // the row is keyed by, and a row left under the old
+                    // (relay, cookie) is one `withdraw` can no longer find —
+                    // re-signed every tick for a service that is gone
+                    // (report20 V18-M5). Same lock order as everywhere else:
+                    // services, then publishers.
+                    if let (Some(was), Some(&relay_now)) = (was, path.last()) {
+                        rekey_publisher_row(
+                            &mut lock!(self.anonymity.rendezvous_publisher_entries),
+                            was,
+                            (relay_now, cookie_now),
+                            ephemeral_ad_identity_for(&reg_keypair),
+                        );
+                    }
                 }
             }
             let relay_path = path;
@@ -9852,12 +9861,13 @@ impl NodeServices {
                     // cookie the relay has never seen — publishing it before
                     // the rebuild's CircuitBuilt ACK reopens the race there.
                     Ok(new_confirmed) => {
-                        // `cookie_now` is the registration this refresh is
-                        // for: a service withdrawn while the rebuild's ACK is
-                        // outstanding must not be republished.
+                        // A service withdrawn while the rebuild's ACK is
+                        // outstanding must not be republished. The row was
+                        // re-keyed above; only the descriptor is deferred.
                         self.publish_after_circuit_confirmed(
-                            cookie_now,
+                            registration,
                             new_confirmed,
+                            |_: &NodeServices| {},
                             move |this: &NodeServices| {
                                 if let Some(seed) = publish_seed.as_deref() {
                                     this.publish_blinded_descriptor_for(
@@ -11751,19 +11761,157 @@ impl NodeServices {
     }
 }
 
-/// Is a service with this cookie still registered?
+/// What a caller gets back from registering an onion circuit: which
+/// registration it made, and the flag the relay's `CircuitBuilt` ACK flips.
+struct OnionRegistration {
+    id: u64,
+    confirmed: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+/// A number no other registration in this process has had.
+///
+/// The cookie could not serve: it is derived per (identity, period, slot), so
+/// withdraw-and-register-again inside one period hands the new registration
+/// the old one's cookie (report20 V18-M5).
+fn next_onion_registration() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// The pseudo identity a service's ad is signed under: derived from its
+/// registration keypair, never from the sovereign node id, so the ad does not
+/// link the node to its live rendezvous point.
+fn ephemeral_ad_identity_for(
+    reg_keypair: &veil_crypto::GeneratedKeyPair,
+) -> Option<veil_anonymity::rendezvous::EphemeralAdIdentity> {
+    veil_anonymity::rendezvous::EphemeralAdIdentity::from_b64_keypair(
+        reg_keypair.public_key.clone(),
+        reg_keypair.private_key.clone(),
+        veil_types::SignatureAlgorithm::Ed25519,
+    )
+}
+
+/// Is this registration still on the books?
 ///
 /// The question a deferred publish has to ask before it runs: `withdraw`
 /// removes the entry and returns, while the publish waiting on the circuit ACK
 /// carried neither a cancellation nor any notion of which registration it
 /// belonged to — so it re-added the publisher and put fresh ciphertext in the
-/// DHT for a service the owner had revoked (report17 V17-M7). The cookie
-/// identifies the registration; a later one gets its own.
-fn service_with_cookie_present(
+/// DHT for a service the owner had revoked (report17 V17-M7). Asked by
+/// registration number, not by cookie: a later registration of the same
+/// identity in the same period has the same cookie (report20 V18-M5).
+fn service_with_registration_present(
     services: &[crate::runtime::anonymity_state::OnionServiceEntry],
-    cookie: [u8; 16],
+    registration: u64,
 ) -> bool {
-    services.iter().any(|e| e.cookie == cookie)
+    services.iter().any(|e| e.registration == registration)
+}
+
+/// Write `registration`'s publisher row, if it is still registered — and hold
+/// the services lock across BOTH, so a withdraw cannot fit between the
+/// question and the row.
+///
+/// `publish_row` takes the publishers lock inside. Services-then-publishers
+/// is the order `withdraw_ephemeral_service` and the circuit registration
+/// already use, and no path takes the two the other way round, so this
+/// nesting cannot invert. What must NOT run under here is the DHT write of
+/// the blinded descriptor: that is the caller's next step, after the lock is
+/// gone. A withdraw landing in that gap leaves a descriptor in the DHT until
+/// it ages out — which is what a withdraw after an ordinary publish leaves
+/// too, and all a DHT without delete can offer. It leaves no ROW, and the row
+/// was the part that was re-signed forever.
+fn publish_row_if_registered(
+    services: &std::sync::Mutex<Vec<crate::runtime::anonymity_state::OnionServiceEntry>>,
+    registration: u64,
+    publish_row: impl FnOnce(),
+) -> bool {
+    let services = lock!(services);
+    if !service_with_registration_present(&services, registration) {
+        return false;
+    }
+    publish_row();
+    drop(services);
+    true
+}
+
+/// Drop the publisher rows keyed by these `(relay, cookie)` pairs.
+fn remove_publisher_rows(
+    publishers: &std::sync::Mutex<Vec<veil_anonymity::rendezvous::RendezvousPublisherEntry>>,
+    keys: &[([u8; 32], [u8; 16])],
+) {
+    lock!(publishers).retain(|entry| {
+        !keys.iter().any(|(relay, cookie)| {
+            entry.rendezvous_node_id == *relay && entry.auth_cookie == *cookie
+        })
+    });
+}
+
+/// Move a service's publisher row from the `(relay, cookie)` it was written
+/// under to the one its entry now has, keeping the ad signed by the identity
+/// that goes with the new key. `false` when no such row exists — a service
+/// that never got a slot, or one whose row was already dropped.
+fn rekey_publisher_row(
+    publishers: &mut [veil_anonymity::rendezvous::RendezvousPublisherEntry],
+    was: ([u8; 32], [u8; 16]),
+    now: ([u8; 32], [u8; 16]),
+    identity: Option<veil_anonymity::rendezvous::EphemeralAdIdentity>,
+) -> bool {
+    if was == now {
+        return publishers
+            .iter()
+            .any(|e| e.rendezvous_node_id == was.0 && e.auth_cookie == was.1);
+    }
+    let Some(row) = publishers
+        .iter_mut()
+        .find(|e| e.rendezvous_node_id == was.0 && e.auth_cookie == was.1)
+    else {
+        return false;
+    };
+    row.rendezvous_node_id = now.0;
+    row.auth_cookie = now.1;
+    if row.ephemeral_ad_identity.is_some() {
+        row.ephemeral_ad_identity = identity;
+    }
+    true
+}
+
+/// Stop hosting every ephemeral service of `identity_vk`, and take their
+/// publisher rows with them.
+///
+/// The services lock is HELD across the row removal. The cookie is derived
+/// per (identity, period), not minted per registration, so a withdraw and a
+/// re-registration inside one period produce the same `(relay, cookie)`.
+/// Letting go of `services` between the two steps opened a window in which a
+/// re-registration could put its entry back and this would then delete the
+/// publisher row it had just made — a service registered and never
+/// advertised, silently (report20 V18-M5). Services-then-publishers is the
+/// order the circuit registration and `publish_row_if_registered` use too.
+fn withdraw_ephemeral_service(
+    services: &std::sync::Mutex<Vec<crate::runtime::anonymity_state::OnionServiceEntry>>,
+    publishers: &std::sync::Mutex<Vec<veil_anonymity::rendezvous::RendezvousPublisherEntry>>,
+    identity_vk: [u8; 32],
+) -> bool {
+    let mut services = lock!(services);
+    let mut removed = Vec::new();
+    services.retain(|entry| {
+        let matches = entry.ephemeral
+            && entry
+                .descriptor_identity_seed
+                .as_deref()
+                .map(|seed| {
+                    veil_crypto::key_blinding::ed25519_public_from_seed(seed) == identity_vk
+                })
+                .unwrap_or(false);
+        if matches && let Some(&relay) = entry.relay_path.last() {
+            removed.push((relay, entry.cookie));
+        }
+        !matches
+    });
+    if !removed.is_empty() {
+        remove_publisher_rows(publishers, &removed);
+    }
+    drop(services);
+    !removed.is_empty()
 }
 
 /// Take one of `max` waiter slots, or refuse.
@@ -11784,59 +11932,214 @@ fn claim_confirm_waiter(pending: &std::sync::atomic::AtomicUsize, max: usize) ->
 
 #[cfg(test)]
 mod deferred_publish_tests {
-    use super::{claim_confirm_waiter, service_with_cookie_present};
+    use super::{
+        claim_confirm_waiter, publish_row_if_registered, rekey_publisher_row,
+        service_with_registration_present, withdraw_ephemeral_service,
+    };
     use crate::runtime::anonymity_state::OnionServiceEntry;
     use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+    use std::sync::{Arc, Barrier, Mutex};
+    use veil_anonymity::rendezvous::RendezvousPublisherEntry;
 
-    fn entry(cookie: [u8; 16]) -> OnionServiceEntry {
+    const RELAY: [u8; 32] = [0x11; 32];
+
+    fn seed() -> Arc<zeroize::Zeroizing<[u8; 32]>> {
+        Arc::new(zeroize::Zeroizing::new([0x42; 32]))
+    }
+
+    fn identity_vk() -> [u8; 32] {
+        veil_crypto::key_blinding::ed25519_public_from_seed(&seed())
+    }
+
+    fn entry(registration: u64, cookie: [u8; 16]) -> OnionServiceEntry {
         OnionServiceEntry {
-            relay_path: vec![[0x11; 32]],
+            relay_path: vec![RELAY],
             cookie,
+            registration,
             built_unix: 0,
             reg_keypair: veil_crypto::GeneratedKeyPair {
                 public_key: String::new(),
                 private_key: String::new(),
                 algo: veil_types::SignatureAlgorithm::Ed25519,
             },
-            confirmed: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            registration_epoch: std::sync::Arc::new(AtomicU64::new(0)),
-            descriptor_identity_seed: None,
+            confirmed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            registration_epoch: Arc::new(AtomicU64::new(0)),
+            descriptor_identity_seed: Some(seed()),
             descriptor_provider_slot: None,
             ephemeral: true,
         }
     }
 
+    fn row(relay: [u8; 32], cookie: [u8; 16]) -> RendezvousPublisherEntry {
+        RendezvousPublisherEntry {
+            rendezvous_node_id: relay,
+            auth_cookie: cookie,
+            validity_window_secs: 60,
+            push_envelope: Vec::new(),
+            wake_hmac_envelope: Vec::new(),
+            rendezvous_kem_algo: 0,
+            rendezvous_kem_pk: Vec::new(),
+            rendezvous_kem_valid_until_unix: 0,
+            ephemeral_ad_identity: None,
+        }
+    }
+
     /// A publish waiting on a circuit ACK must not run for a service that has
-    /// been withdrawn in the meantime.
+    /// been withdrawn in the meantime — and a service registered AGAIN in the
+    /// same period is not the one it waited for.
     ///
     /// `withdraw` drops the entry and returns; the waiter used to carry no
-    /// notion of which registration it belonged to, so it re-added the
-    /// publisher and put fresh ciphertext in the DHT for a service the owner
-    /// had revoked (report17 V17-M7).
+    /// notion of which registration it belonged to (report17 V17-M7), and
+    /// then asked by cookie — which the successor shares, because the cookie
+    /// is derived per (identity, period), not minted per registration
+    /// (report20 V18-M5).
     #[test]
-    fn a_withdrawn_service_is_not_republished_by_a_waiting_publish() {
+    fn a_re_registration_with_the_same_cookie_is_not_the_old_registration() {
         let cookie = [0xAB; 16];
-        let mut services = vec![entry(cookie)];
+        let mut services = vec![entry(1, cookie)];
         assert!(
-            service_with_cookie_present(&services, cookie),
+            service_with_registration_present(&services, 1),
             "premise: the registration is live while the publish waits"
         );
 
         // Withdrawn while the ACK was outstanding.
-        services.retain(|e| e.cookie != cookie);
+        services.retain(|e| e.registration != 1);
         assert!(
-            !service_with_cookie_present(&services, cookie),
+            !service_with_registration_present(&services, 1),
             "a revoked service is still publishable"
         );
 
-        // A LATER registration is its own: the cookie is what identifies one,
-        // so a stale waiter must not be revived by a fresh service either.
-        services.push(entry([0xCD; 16]));
+        // Registered again inside the same period: the SAME cookie, its own
+        // registration.
+        services.push(entry(2, cookie));
         assert!(
-            !service_with_cookie_present(&services, cookie),
-            "the waiter for a withdrawn registration was satisfied by a \
-             different one"
+            !service_with_registration_present(&services, 1),
+            "the waiter for a withdrawn registration was satisfied by its \
+             successor, which shares its cookie — and would write a row for \
+             the OLD relay"
         );
+        assert!(
+            service_with_registration_present(&services, 2),
+            "vacuity: the successor itself is registered"
+        );
+    }
+
+    /// A withdraw cannot fit between "is it still registered?" and the row.
+    ///
+    /// The publish answers its question and writes the row under the same
+    /// lock; a withdraw arriving in between waits, then removes the row it
+    /// finds. With the lock let go in between, the withdraw ran in the gap
+    /// and the row went in after it — re-signed every tick for a service that
+    /// was gone (report20 V18-M5).
+    #[test]
+    fn a_withdraw_cannot_slip_between_the_question_and_the_row() {
+        let cookie = [0xAB; 16];
+        let services = Arc::new(Mutex::new(vec![entry(7, cookie)]));
+        let publishers: Arc<Mutex<Vec<RendezvousPublisherEntry>>> =
+            Arc::new(Mutex::new(Vec::new()));
+        // Meets once the publish has its answer and the withdraw is about to
+        // start.
+        let asked = Arc::new(Barrier::new(2));
+
+        let publish = {
+            let services = Arc::clone(&services);
+            let publishers = Arc::clone(&publishers);
+            let asked = Arc::clone(&asked);
+            std::thread::spawn(move || {
+                publish_row_if_registered(&services, 7, || {
+                    asked.wait();
+                    // Give the withdraw every chance to go first.
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                    publishers.lock().unwrap().push(row(RELAY, cookie));
+                })
+            })
+        };
+        asked.wait();
+        let withdrawn = withdraw_ephemeral_service(&services, &publishers, identity_vk());
+        assert!(withdrawn, "premise: the service was registered");
+        assert!(
+            publish.join().unwrap(),
+            "premise: the publish found its registration live"
+        );
+        assert!(
+            publishers.lock().unwrap().is_empty(),
+            "a withdraw fitted between the question and the row: the row of \
+             a withdrawn service is left behind for every tick to re-sign"
+        );
+        assert!(services.lock().unwrap().is_empty());
+    }
+
+    /// A withdraw takes its own rows and nobody else's.
+    #[test]
+    fn a_withdraw_takes_only_its_own_rows() {
+        let mine = [0xAB; 16];
+        let theirs = [0xEF; 16];
+        let mut other = entry(9, theirs);
+        other.descriptor_identity_seed = Some(Arc::new(zeroize::Zeroizing::new([0x43; 32])));
+        let services = Mutex::new(vec![entry(8, mine), other]);
+        let publishers = Mutex::new(vec![row(RELAY, mine), row(RELAY, theirs)]);
+
+        assert!(withdraw_ephemeral_service(
+            &services,
+            &publishers,
+            identity_vk()
+        ));
+        {
+            let rows = publishers.lock().unwrap();
+            assert_eq!(rows.len(), 1, "a withdraw took another service's row");
+            assert_eq!(rows[0].auth_cookie, theirs);
+            assert_eq!(services.lock().unwrap().len(), 1);
+        }
+        // Nothing left to withdraw says so.
+        assert!(!withdraw_ephemeral_service(
+            &services,
+            &publishers,
+            identity_vk()
+        ));
+    }
+
+    /// A rebuild that re-selects the path or crosses a period boundary changes
+    /// the entry's `(relay, cookie)`; the row has to come along, or the
+    /// withdraw can no longer find it.
+    #[test]
+    fn a_rebuilt_entry_takes_its_publisher_row_along() {
+        let was = (RELAY, [0xAB; 16]);
+        let now = ([0x22; 32], [0xCD; 16]);
+        let mut publishers = vec![row(was.0, was.1)];
+        assert!(rekey_publisher_row(&mut publishers, was, now, None));
+        assert_eq!(publishers.len(), 1, "the rebuild duplicated the row");
+        assert_eq!(
+            (publishers[0].rendezvous_node_id, publishers[0].auth_cookie),
+            now,
+            "the row still carries the (relay, cookie) its entry no longer \
+             has: withdraw cannot find it and the tick re-signs it"
+        );
+
+        // And the withdraw finds it under the new key.
+        let rebuilt = {
+            let mut e = entry(3, now.1);
+            e.relay_path = vec![now.0];
+            e
+        };
+        let services = Mutex::new(vec![rebuilt]);
+        let publishers = Mutex::new(publishers);
+        assert!(withdraw_ephemeral_service(
+            &services,
+            &publishers,
+            identity_vk()
+        ));
+        assert!(
+            publishers.lock().unwrap().is_empty(),
+            "the rebuilt service's row survived its withdraw"
+        );
+
+        // Nothing to move is reported as such; an unchanged key is a no-op
+        // that still answers whether the row exists.
+        let mut none: Vec<RendezvousPublisherEntry> = Vec::new();
+        assert!(!rekey_publisher_row(&mut none, was, now, None));
+        let mut same = vec![row(was.0, was.1)];
+        assert!(rekey_publisher_row(&mut same, was, was, None));
+        assert_eq!((same[0].rendezvous_node_id, same[0].auth_cookie), was);
     }
 
     /// The waiters are bounded, because nothing else bounds them.
@@ -11871,7 +12174,8 @@ mod deferred_publish_tests {
         assert!(claim_confirm_waiter(&pending, MAX));
     }
 
-    /// And the deferred publish actually ASKS both questions.
+    /// And the deferred publish actually ASKS both questions — on both of
+    /// its paths, with the row written by the same call that asks.
     #[test]
     fn the_deferred_publish_checks_the_cap_and_the_withdrawal() {
         let source = include_str!("mod.rs");
@@ -11886,9 +12190,54 @@ mod deferred_publish_tests {
             body.contains("claim_confirm_waiter(&pending, MAX_PENDING)"),
             "the waiters are unbounded again"
         );
+        assert_eq!(
+            body.matches("publish_row_if_registered(").count(),
+            2,
+            "one of the two publish paths no longer asks, under the lock, \
+             whether the registration is still there"
+        );
+        assert_eq!(
+            body.matches("publish_row(").count(),
+            2,
+            "a row is written somewhere other than inside \
+             publish_row_if_registered"
+        );
+    }
+
+    /// The rebuild moves the row with the entry, and the withdraw removes
+    /// rows before it lets go of the services lock.
+    #[test]
+    fn the_rebuild_and_the_withdraw_keep_rows_with_their_entries() {
+        let source = include_str!("mod.rs");
+        let function = |name: &str| {
+            let at = source.find(name).unwrap_or_else(|| panic!("{name} moved"));
+            let body = &source[at..];
+            let end = body.find("\n    }\n").expect("no end of function");
+            &body[..end]
+        };
+
         assert!(
-            body.contains("service_with_cookie_present("),
-            "a withdrawn service is published again"
+            function("fn maintain_onion_circuits(").contains("rekey_publisher_row("),
+            "a rebuild that re-selects the path or crosses a period boundary \
+             leaves the publisher row under the old (relay, cookie), where \
+             withdraw cannot find it"
+        );
+
+        let withdraw = source
+            .find("fn withdraw_ephemeral_service(")
+            .expect("the withdraw moved");
+        let withdraw = &source[withdraw..];
+        let withdraw = &withdraw[..withdraw.find("\n}\n").expect("no end of function")];
+        let rows = withdraw
+            .find("remove_publisher_rows(")
+            .expect("the withdraw no longer removes rows");
+        let unlock = withdraw
+            .find("drop(services)")
+            .expect("the withdraw no longer holds the services lock explicitly");
+        assert!(
+            rows < unlock,
+            "the withdraw lets go of the services lock before removing the \
+             rows: a re-registration fits in between and loses its row"
         );
     }
 }

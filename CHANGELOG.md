@@ -1,5 +1,44 @@
 # Changelog
 
+## v0.11.11 — 2026-09-02
+
+**A rendezvous registration has an identity of its own.**
+
+The cookie is derived per (identity, period, slot), so a service withdrawn and
+registered again inside one period comes back with the SAME cookie — and
+everything that told registrations apart by cookie took the new one for the
+old (report20 V18-M5). Each hosted service now carries a registration number,
+minted once and kept across rebuilds. What that changes:
+
+*The deferred publish asks by number, and writes its row under the same lock
+as the question.* It waited for the circuit ACK, asked "is a service with this
+cookie still here?", let go of the lock, then wrote the publisher row. A
+withdraw fitting between the two left a row behind that every tick re-signed,
+for a service that was gone; and a successor with the same cookie satisfied
+the old waiter, which then wrote a row for the OLD relay — an ad a sender
+could resolve straight into `cookie_unknown`. The row now goes in with the
+services lock held, so a withdraw waits and then removes what it finds. The
+blinded descriptor's DHT write stays outside the lock: a withdraw landing
+there leaves a descriptor to age out, which is what a withdraw after any
+publish leaves, and all a DHT without delete can offer.
+
+*A rebuild takes the publisher row along.* A path re-selection or a period
+boundary re-keys the entry's `(relay, cookie)`; the row stayed under the old
+pair, where a withdraw could no longer find it. It is re-keyed in the same
+step as the entry, and an entry a re-registration displaces takes its row
+with it too.
+
+*Nothing is looked up by cookie any more.* The circuit registration hands back
+its own number and confirm flag, so the "entry already evicted — publish
+anyway" arm, which published for a service that was not there, is gone.
+
+The lock order is one and the same everywhere — services, then publishers —
+and no path takes the two the other way round. The fix was broken four ways
+(the lock let go before the row, any registration satisfying the question,
+the rebuild leaving the row behind, the withdraw unlocking before removing
+rows) and the tests went red for each. This closes what the 0.11.10 note said
+it had only narrowed.
+
 ## v0.11.10 — 2026-09-02
 
 **A publisher slot goes to an entry that can become an ad.**

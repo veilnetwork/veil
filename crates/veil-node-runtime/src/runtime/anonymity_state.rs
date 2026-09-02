@@ -735,6 +735,16 @@ pub struct OnionServiceEntry {
     pub relay_path: Vec<[u8; 32]>,
     /// Rendezvous cookie bound to this service's circuit.
     pub cookie: [u8; 16],
+    /// Which registration this entry is.
+    ///
+    /// The cookie is not one: it is derived per (identity, period, slot), so
+    /// a service withdrawn and registered again inside a period comes back
+    /// with the SAME cookie, and anything that told registrations apart by
+    /// cookie — the deferred publish waiting on the circuit ACK, above all —
+    /// took the new one for the old (report20 V18-M5). Minted once by
+    /// `register_onion_circuit_with_identity`; a rebuild re-keys the entry in
+    /// place and keeps it.
+    pub registration: u64,
     /// Unix secs of the last (re)build, for the refresh cadence.
     pub built_unix: u64,
     /// STABLE Ed25519 registration keypair for this service (diff-audit L1).
