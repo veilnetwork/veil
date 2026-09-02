@@ -404,9 +404,22 @@ pub const MAX_TRACE_HOPS: u8 = 32;
 /// registering overwrote the other's waiter and finishing removed it, so a
 /// concurrent ping and traceroute stole each other's replies and each reported
 /// losses that had not happened (report17 V17-L7). A single allocator gives
-/// every probe a number nobody else is using, which also means a reply has to
-/// name a 32-bit value it cannot guess.
-static NEXT_DIAG_SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
+/// every probe a number nobody else is using.
+///
+/// It starts at a RANDOM point, which is the half that was missing. The reply
+/// carries no signature — a diagnostic probe is routed through the overlay and
+/// its answer legitimately arrives via relays — so the sequence number is the
+/// only thing the answer has to name. Counting from 1 made it the one value
+/// any peer could guess: send `Pong { seq: 1, responder: <the target> }` at a
+/// node whose operator just typed a ping, and the diagnostic reports a reply
+/// from a node that never answered. (A relay ON the path sees the number and
+/// can still forge; that is inherent to an unsigned overlay probe. What this
+/// closes is forgery by a peer that is not on the path at all.)
+static NEXT_DIAG_SEQ: std::sync::LazyLock<std::sync::atomic::AtomicU32> =
+    std::sync::LazyLock::new(|| {
+        use rand_core::RngCore;
+        std::sync::atomic::AtomicU32::new(rand_core::OsRng.next_u32())
+    });
 
 /// What the node will actually do with a ping request.
 ///
@@ -3715,7 +3728,12 @@ async fn run_debug_ping(
                 echo_ts_us,
                 responder,
                 ..
-            })) => {
+            })) if responder == target_id => {
+                // Only the node that was asked can answer for it: the target
+                // sets `responder` to itself, so a Pong naming anybody else is
+                // not a reply to this probe. Counted as lost rather than
+                // reported, or `ping <peer>` prints a round-trip to a node it
+                // never reached (report20 V18-M6).
                 let rtt_us = now_us().saturating_sub(echo_ts_us);
                 received += 1;
                 rtt_min_us = rtt_min_us.min(rtt_us);
@@ -5409,8 +5427,8 @@ mod diag_probe_bounds_tests {
         }
     }
 
-    /// And they keep going up across operations, which is what makes the
-    /// number unguessable to anything composing a reply.
+    /// And they keep going up across operations, so a second operation never
+    /// reuses the numbers the first is waiting on.
     #[test]
     fn the_allocator_does_not_restart_per_operation() {
         let first = next_diag_seq();
@@ -5418,9 +5436,69 @@ mod diag_probe_bounds_tests {
         for _ in 0..8 {
             let _ = next_diag_seq();
         }
-        assert!(
-            next_diag_seq() > first + 8,
+        // Wrapping arithmetic: the counter starts at a random point and a run
+        // that begins near the top of the range is exactly as valid.
+        assert_eq!(
+            next_diag_seq().wrapping_sub(first),
+            9,
             "the sequence restarted, so a second operation collides again"
+        );
+    }
+
+    /// report20 V18-M6: the probe number is a CHALLENGE, so it may not start
+    /// at a value anybody can name.
+    ///
+    /// The reply to a diagnostic ping carries no signature — the probe is
+    /// routed through the overlay and its answer legitimately comes back via
+    /// relays — so the sequence number is the whole of what an answer has to
+    /// know. Counting from 1 meant any peer could compose `Pong { seq: 1 }`
+    /// for a node whose operator had just typed a ping. A process-wide static
+    /// is drawn once and cannot be re-observed from a test, so the guard is on
+    /// where it is drawn FROM.
+    #[test]
+    fn the_probe_number_starts_somewhere_nobody_can_name() {
+        let src = include_str!("admin.rs");
+        let init = src
+            .split("static NEXT_DIAG_SEQ")
+            .nth(1)
+            .and_then(|t| t.split("fn next_diag_seq").next())
+            .expect("the allocator and its initialiser");
+        assert!(
+            init.contains("OsRng"),
+            "the diagnostic sequence no longer starts from the OS random \
+             source: its value is a challenge and a counted start is guessable"
+        );
+        assert!(
+            !init.contains("AtomicU32::new(1)"),
+            "the allocator counts from a fixed point again"
+        );
+    }
+
+    /// And only the node that was asked may answer for it.
+    ///
+    /// The target sets `responder` to itself, so a Pong naming anybody else is
+    /// not a reply to this probe. Without the check a forged Pong made `ping
+    /// <peer>` print a round-trip to a node it never reached. `run_debug_ping`
+    /// wants a live `NodeServices` to call, so the guard is on the arm.
+    #[test]
+    fn a_pong_from_somebody_else_is_not_an_answer() {
+        let src = include_str!("admin.rs");
+        let arm = src
+            .split("async fn run_debug_ping")
+            .nth(1)
+            .and_then(|t| t.split("DiagEvent::Pong").nth(1))
+            .expect("the ping reply arm");
+        // Everything between the variant and its body: the destructuring and
+        // whatever guard stands in front of it.
+        let head = arm.split("=>").next().unwrap_or_default();
+        assert!(
+            head.contains("echo_ts_us"),
+            "the reply arm changed shape; this guard has to be re-aimed"
+        );
+        assert!(
+            head.contains("if responder == target_id"),
+            "a Pong is accepted without checking who sent it, so anybody who \
+             can compose one answers for the node that was pinged"
         );
     }
 

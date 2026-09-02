@@ -1,5 +1,87 @@
 # Changelog
 
+## v0.11.3 — 2026-09-02
+
+**Eight defects out of the standing audit registry, all in the housekeeping
+that runs while a node is idle.**
+
+*An eviction now travels with the entry it makes room for.* The disk cold tier
+wrote them as two batches: the oldest value left, and only then did the new one
+arrive. Between the two is a state with neither — a crash there loses a value
+to admit nothing, and when the second write failed the caller returned "not
+stored" while dropping the victim from its answer, so the tier went on charging
+bytes for a value it no longer had and evicted harder against a number that
+only grew. One batch now, and the peer slot an eviction frees is handed back by
+number rather than by counting rows, which is the same thing only while nothing
+ever leaves.
+
+*A rotated relay key replaces the one it supersedes.* Re-registering a meeting
+point KEM-less deliberately keeps the key the app had supplied — that is what
+stops the built-in tick from erasing a mailbox. But an entry that brought its
+OWN key was treated the same way: the old key was kept and the NEW key's expiry
+stamped onto it. The rotation reached no sender at all, and the key the
+receiver had retired stayed advertised for another full window.
+
+*A refused advertisement slot is no longer reported as a meeting point.* The
+publisher slots are bounded and the re-pick loop threw the answer away, so a
+relay that got no ad could still become the one the node waited at — a meeting
+point no sender was ever told about.
+
+*A clipped advertisement stops being re-signed every tick.* An ad whose life is
+cut short by a shorter-lived relay key was measured against the window the
+receiver had asked for, which it can never match. It was therefore never fresh:
+new signatures and new DHT puts on every maintenance tick, forever, for an ad
+that had not changed. Both halves of the question are asked of the ad's own
+span now.
+
+*Eight datagrams no longer close local discovery for the run.* The LAN cap
+counted announcements, and an announcement costs nothing to send: anybody on
+the segment could name eight keys, fill every slot before a single handshake,
+and the real neighbour that announced ninth was ignored until restart. A slot
+is held by a neighbour that CONNECTED; one that never did gives its slot back
+after five minutes, and a neighbour we are talking to keeps its own however
+long it holds it.
+
+*What a node publishes is the port it BOUND.* Both publishers read the port an
+operator had written down, and there are two ways for that not to be the port
+in use: a listener configured on port 0 asks the system to choose one, so there
+was nothing in the config to publish and such a node advertised itself at no
+meeting point at all; and an ephemeral listener rotates to a fresh port every
+interval while the config goes on naming the one it started with. The bound
+address is recorded on every rebind, so it is the one that answers now — except
+where an operator stated an `advertise` address, which is a claim about the
+outside world and stands as written.
+
+*A relay answers the question it was asked, or its answer is dropped.* The
+filter names a kind and a label, and both go to a stranger's server. The
+signature on what comes back proves who wrote it, not that it answers this
+query — and nothing local checked, so a relay could hand back other kinds,
+other labels, and four times as many events as were asked for, each one a
+bootstrap dial attempt. The kind, the label and the caller's own limit are all
+enforced on this side now.
+
+*A diagnostic ping's sequence number starts somewhere nobody can name.* The
+reply to an overlay probe carries no signature — it legitimately comes back
+through relays — so the number is the whole of what an answer has to know, and
+it counted up from 1. A peer could compose a reply for a probe it never saw.
+The allocator now starts at a random point, and a reply naming a responder
+other than the node that was pinged is not counted as an answer.
+
+Three further findings from the same registry were checked and NOT taken:
+
+The conversation-blob format was reported as a rollback hazard — a writer that
+appends bytes while keeping the version 2 tag, against a reader that refuses
+trailing bytes. The dates say otherwise: the strict reader and the appended
+authorization stamp are both first released in v0.10.0, so no shipped build
+ever sees a blob with a suffix it does not know. Loosening the reader would
+also delete a guard the project put there on purpose. The layout is now
+documented as CLOSED instead: the next field bumps the tag.
+
+Unbounded peer accumulation in a Mainline lookup, and meeting-point
+destinations reaching private and loopback addresses, are both already fixed —
+`max_peers` bounds the collection inside the lookup, and every public-sourced
+destination passes a globally-routable filter before it is dialled.
+
 ## v0.11.2 — 2026-09-02
 
 **A cached certificate now expires when its owner said it would.** Two clocks
