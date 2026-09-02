@@ -24,15 +24,15 @@
 //! nanoseconds of BLAKE3.
 
 use std::io;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::time::Duration;
 
 use tokio::net::UdpSocket;
 use veil_types::BootstrapPeer;
 
 use crate::lan::{
-    CURRENT_EXCHANGE_VERSION, LSD_GROUP_V4, LSD_PORT, LanAnnounce, MAX_ANNOUNCE_BYTES, SALT_LEN,
-    decode_announce, encode_announce,
+    CURRENT_EXCHANGE_VERSION, LSD_GROUP_V4, LSD_GROUP_V6, LSD_PORT, LanAnnounce,
+    MAX_ANNOUNCE_BYTES, SALT_LEN, decode_announce, encode_announce,
 };
 
 /// BEP 14 asks clients not to announce more often than every five minutes.
@@ -70,6 +70,12 @@ pub fn announce_delay(already_sent: u32) -> Duration {
 /// A bound LAN discovery socket.
 pub struct LanDiscovery {
     socket: UdpSocket,
+    /// The IPv6 half, on `LSD_GROUP_V6`. `None` where the host has no IPv6.
+    ///
+    /// The group has been exported and covered by an encoding test since this
+    /// layer was written, and nothing ever bound it: the code read as though
+    /// it spoke both families and spoke one.
+    socket6: Option<UdpSocket>,
     /// What this node says about itself.
     announce: LanAnnounce,
 }
@@ -111,10 +117,39 @@ impl LanDiscovery {
         sock.set_multicast_ttl_v4(1)?;
 
         let std_sock: std::net::UdpSocket = sock.into();
+        // The v6 half, on the group this crate has exported and never used.
+        // Attempted, not required: a host with no IPv6 is ordinary, and the v4
+        // half is what local discovery has always run on.
+        let socket6 = Self::bind_v6().ok();
         Ok(Self {
             socket: UdpSocket::from_std(std_sock)?,
+            socket6,
             announce,
         })
+    }
+
+    /// The IPv6 listener: same port, same scope guarantee, `ff15::efc0:988f`.
+    fn bind_v6() -> io::Result<UdpSocket> {
+        let sock = socket2::Socket::new(
+            socket2::Domain::IPV6,
+            socket2::Type::DGRAM,
+            Some(socket2::Protocol::UDP),
+        )?;
+        sock.set_reuse_address(true)?;
+        #[cfg(unix)]
+        sock.set_reuse_port(true)?;
+        sock.set_nonblocking(true)?;
+        // v6-only: the v4 half has its own socket, and a dual-stack bind would
+        // fight it for the port.
+        sock.set_only_v6(true)?;
+        let bind_addr = SocketAddr::from(SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, LSD_PORT, 0, 0));
+        sock.bind(&bind_addr.into())?;
+        // Interface 0 asks the kernel to pick; a host with several is joined on
+        // its default, which is the same promise the v4 side makes.
+        sock.join_multicast_v6(&LSD_GROUP_V6, 0)?;
+        sock.set_multicast_hops_v6(1)?;
+        let std_sock: std::net::UdpSocket = sock.into();
+        UdpSocket::from_std(std_sock)
     }
 
     /// The address this socket is bound to — for tests and diagnostics.
@@ -135,6 +170,22 @@ impl LanDiscovery {
         );
         let dest = SocketAddr::from(SocketAddrV4::new(LSD_GROUP_V4, LSD_PORT));
         self.socket.send_to(wire.as_bytes(), dest).await?;
+
+        // And the same announce on the v6 group, with its own salt, so the two
+        // datagrams are not linkable to each other. A host without IPv6 skips
+        // it; a failure there does not spoil an announce that already went out.
+        if let Some(sock6) = &self.socket6 {
+            let mut salt6 = [0u8; SALT_LEN];
+            rand_core::OsRng.fill_bytes(&mut salt6);
+            let wire6 = encode_announce(
+                &self.announce,
+                salt6,
+                CURRENT_EXCHANGE_VERSION,
+                IpAddr::V6(LSD_GROUP_V6),
+            );
+            let dest6 = SocketAddr::from(SocketAddrV6::new(LSD_GROUP_V6, LSD_PORT, 0, 0));
+            let _ = sock6.send_to(wire6.as_bytes(), dest6).await;
+        }
         Ok(())
     }
 
@@ -166,6 +217,42 @@ impl LanDiscovery {
 
 #[cfg(test)]
 mod tests {
+
+    #[tokio::test]
+    async fn the_v6_group_is_bound_and_not_merely_exported() {
+        // `LSD_GROUP_V6` has been a public constant with an encoding test
+        // since this layer was written, and nothing ever bound it -- the code
+        // read as though it spoke both families and spoke one. On a host with
+        // no IPv6 the absence is ordinary and the v4 half must still work.
+        let announce = LanAnnounce {
+            public_key: [7u8; 32],
+            pow_nonce: [1, 2, 3, 4],
+            port: 5556,
+            scheme: crate::lan::LanScheme::Obfs4Tcp,
+        };
+        let d = LanDiscovery::bind(announce)
+            .await
+            .expect("v4 bind is required");
+        assert!(
+            d.local_addr().is_ok(),
+            "the v4 half stopped working when the v6 half was added"
+        );
+        // Announcing must not fail because of the v6 half, whether or not this
+        // host has IPv6.
+        d.announce_once().await.expect("an announce still goes out");
+
+        // And when the host does have IPv6, the socket is really bound to the
+        // discovery port rather than an ephemeral one.
+        if let Some(sock6) = &d.socket6 {
+            let addr = sock6.local_addr().expect("bound");
+            assert!(addr.is_ipv6(), "the v6 socket is not v6");
+            assert_eq!(
+                addr.port(),
+                LSD_PORT,
+                "the v6 half bound a port nobody is listening on"
+            );
+        }
+    }
     use super::*;
     use crate::lan::LanScheme;
 
