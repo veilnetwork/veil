@@ -397,6 +397,10 @@ pub struct AttachedDebugSession {
     /// side proved, and this is where that arrives.
     pub peer_public_key: String,
     pub peer_nonce: String,
+    /// The signature algorithm the handshake actually proved, not the one the
+    /// caller would otherwise have assumed. `None` when the wire named an
+    /// algorithm this build does not know.
+    pub peer_algo: Option<veil_cfg::SignatureAlgorithm>,
     /// WHICH DEVICE of `peer_id` this session ends at, when the handshake
     /// proved one (or a resumption ticket named one). `None` for peers with no
     /// sovereign identity, and for a resumption that could not resolve the
