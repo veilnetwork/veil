@@ -510,9 +510,18 @@ class MfCameraCapturer : public CameraCapturer {
     switch (fmt_) {
       case Fmt::kNv12: {
         const int stride = cap_stride_ > 0 ? cap_stride_ : w;
-        // The chroma plane follows the luma plane in a contiguous NV12 buffer.
+        // The chroma plane follows the luma plane in a contiguous NV12 buffer,
+        // interleaved UV at the same stride over half the rows.
         const size_t luma = static_cast<size_t>(stride) * h;
-        if (len < luma) break;  // truncated sample; drop it
+        const size_t chroma = static_cast<size_t>(stride) * ch;
+        // BOTH PLANES. Checking only the luma left `NV12ToI420` free to read
+        // `chroma` bytes past the end of a short buffer: the guard proved the
+        // start of the chroma plane was inside the sample and said nothing
+        // about its length. The YUY2 and RGB32 arms beside this one always
+        // required their whole plane, so this was an oversight rather than a
+        // decision -- and the sample comes from a driver, which is not a place
+        // to take lengths on trust.
+        if (len < luma || len - luma < chroma) break;  // truncated; drop it
         rc = libyuv::NV12ToI420(data, stride, data + luma, stride, y_.data(), w,
                                 u_.data(), cw, v_.data(), cw, w, h);
         break;
