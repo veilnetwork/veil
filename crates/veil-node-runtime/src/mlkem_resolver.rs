@@ -161,6 +161,18 @@ pub enum ResolveStage {
 /// Both, therefore: recently verified AND not past its signed life. The store
 /// applies the same rule when it prunes rows (`valid_until_unix >= now`), so
 /// this is the read path catching up with the one beside it.
+/// Wall-clock seconds, or 0 when the clock is before the epoch.
+///
+/// 0 makes every signed window look open, which is the same answer the code
+/// gave before any of this existed: a broken clock must not turn into a
+/// refusal to talk to anybody.
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
 fn cert_is_still_usable(
     cert: &VerifiedMlkemCert,
     cached_at: &std::time::Instant,
@@ -289,7 +301,13 @@ impl DhtMlKemEkResolver {
         lru_insert(
             &self.peer_mlkem_keys,
             target_node_id,
-            (cert.mlkem_pubkey.clone(), std::time::Instant::now()),
+            (
+                veil_e2e::PeerMlKemKey::signed_until(
+                    cert.mlkem_pubkey.clone(),
+                    cert.valid_until_unix,
+                ),
+                std::time::Instant::now(),
+            ),
         );
         lru_insert(
             &self.cert_cache,
@@ -645,9 +663,15 @@ impl DhtMlKemEkResolver {
         // The per-device cache first; then the node-keyed cache, but only when
         // the row it holds already names this device (common for the
         // single-instance peer, where the two questions coincide).
+        // BOTH clocks, here as in the node-keyed walk beside it: these two
+        // branches tested the cache TTL alone, and the production send path
+        // prefers exactly them whenever a live session names the recipient's
+        // device — so the expiry check added for the singular walk was the
+        // one nobody's messages went through (report20 V18-M12).
+        let now_for_cache = unix_now();
         if let Some((cert, ts)) =
             rlock!(self.instance_cert_cache).get(&(target_node_id, instance_id))
-            && ts.elapsed() < self.cert_ttl
+            && cert_is_still_usable(cert, ts, self.cert_ttl, now_for_cache)
         {
             let cert = cert.clone();
             self.log_dbg(
@@ -659,7 +683,7 @@ impl DhtMlKemEkResolver {
             return Some(cert);
         }
         if let Some((cert, ts)) = rlock!(self.cert_cache).get(&target_node_id)
-            && ts.elapsed() < self.cert_ttl
+            && cert_is_still_usable(cert, ts, self.cert_ttl, now_for_cache)
             && cert.instance_id == instance_id
         {
             let cert = cert.clone();
@@ -1450,9 +1474,11 @@ impl DhtMlKemEkResolver {
         target_node_id: [u8; 32],
         instance_id: [u8; 16],
     ) -> Option<VerifiedMlkemCert> {
+        // Both clocks, as in the async twin above.
+        let now_for_cache = unix_now();
         if let Some((cert, ts)) =
             rlock!(self.instance_cert_cache).get(&(target_node_id, instance_id))
-            && ts.elapsed() < self.cert_ttl
+            && cert_is_still_usable(cert, ts, self.cert_ttl, now_for_cache)
         {
             let cert = cert.clone();
             self.publish_ratchet_key(target_node_id, &cert);
@@ -1461,7 +1487,7 @@ impl DhtMlKemEkResolver {
         // The node-keyed row, only when it happens to name this device — a
         // mismatch is a miss, never a substitution.
         if let Some((cert, ts)) = rlock!(self.cert_cache).get(&target_node_id)
-            && ts.elapsed() < self.cert_ttl
+            && cert_is_still_usable(cert, ts, self.cert_ttl, now_for_cache)
             && cert.instance_id == instance_id
         {
             let cert = cert.clone();
@@ -2227,6 +2253,113 @@ mod tests {
         );
     }
 
+    /// The per-device caches ask the OWNER's clock too, not only their own.
+    ///
+    /// These two branches tested `ts.elapsed() < cert_ttl` and nothing else,
+    /// and the production send path prefers exactly them whenever a live
+    /// session names the recipient's device — so the expiry check added to the
+    /// node-keyed walk was the one nobody's messages went through (report20
+    /// V18-M12). Behavioural, on the surface `try_ratchet_seal` calls: the
+    /// helper's own unit test stayed green through the whole defect.
+    #[test]
+    fn a_device_cache_row_past_its_signed_expiry_is_not_served() {
+        let target = [9u8; 32];
+        let device = [0xcd; 16];
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        let fresh_row = |valid_until_unix: u64| {
+            let dht = Arc::new(KademliaService::new([1u8; 32]));
+            let resolver = make_test_resolver(dht);
+            let mut cert = dummy_cert_with_instance(target, device);
+            cert.valid_until_unix = valid_until_unix;
+            wlock!(resolver.instance_cert_cache)
+                .insert((target, device), (cert, std::time::Instant::now()));
+            resolver
+        };
+
+        // Inside the signed window: served, or this test proves nothing.
+        assert!(
+            fresh_row(now + 600)
+                .resolve_cert_for_instance_cached(target, device)
+                .is_some(),
+            "vacuity: a live certificate must still be served from the cache"
+        );
+        // The last second is still inside it.
+        assert!(
+            fresh_row(now)
+                .resolve_cert_for_instance_cached(target, device)
+                .is_some(),
+            "the last second the owner signed for was refused"
+        );
+        // Past it: a miss. The row is recent — only the OWNER's clock says no.
+        assert!(
+            fresh_row(now - 1)
+                .resolve_cert_for_instance_cached(target, device)
+                .is_none(),
+            "a certificate its owner had stopped standing behind was served \
+             to the send path, which seals to whatever it is handed"
+        );
+
+        // And the node-keyed row that happens to name this device is judged
+        // the same way — it is the second branch of both functions.
+        let dht = Arc::new(KademliaService::new([1u8; 32]));
+        let cert_cache = Arc::new(RwLock::new(PeerMlKemCertCache::new()));
+        let mut expired = dummy_cert_with_instance(target, device);
+        expired.valid_until_unix = now - 1;
+        wlock!(cert_cache).insert(target, (expired, std::time::Instant::now()));
+        let resolver = make_test_resolver_with_cert_cache(dht, cert_cache);
+        assert!(
+            resolver
+                .resolve_cert_for_instance_cached(target, device)
+                .is_none(),
+            "the node-keyed row was served for this device past its expiry"
+        );
+    }
+
+    /// The async twin asks the same question.
+    ///
+    /// With no peers configured a real walk yields `None`, so a `Some(_)` can
+    /// only have come from the cache — the same proof shape the fast-path
+    /// tests beside it use.
+    #[tokio::test]
+    async fn the_async_device_walk_refuses_an_expired_cache_row() {
+        let target = [9u8; 32];
+        let device = [0xcd; 16];
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        let with_expiry = |valid_until_unix: u64| {
+            let dht = Arc::new(KademliaService::new([1u8; 32]));
+            let resolver = make_test_resolver(dht);
+            let mut cert = dummy_cert_with_instance(target, device);
+            cert.valid_until_unix = valid_until_unix;
+            wlock!(resolver.instance_cert_cache)
+                .insert((target, device), (cert, std::time::Instant::now()));
+            resolver
+        };
+
+        assert!(
+            with_expiry(now + 600)
+                .fetch_verified_cert_for_instance(target, device)
+                .await
+                .is_some(),
+            "vacuity: a live row must still short-circuit the walk"
+        );
+        assert!(
+            with_expiry(now - 1)
+                .fetch_verified_cert_for_instance(target, device)
+                .await
+                .is_none(),
+            "an expired row short-circuited the walk that would have fetched \
+             a current certificate"
+        );
+    }
+
     // The sender-side half of the AppSendUnopenable feedback: after the peer
     // refuses a frame, EVERY cached row for it must go — cert, per-device
     // certs, and the EK — or the 30-minute TTL re-issues the refused material
@@ -2252,8 +2385,13 @@ mod tests {
                 ),
             );
         }
-        wlock!(resolver.peer_mlkem_keys)
-            .insert(target, (vec![0x42; 32], std::time::Instant::now()));
+        wlock!(resolver.peer_mlkem_keys).insert(
+            target,
+            (
+                veil_e2e::PeerMlKemKey::unattested(vec![0x42; 32]),
+                std::time::Instant::now(),
+            ),
+        );
 
         resolver.invalidate_peer(&target);
 

@@ -1300,10 +1300,14 @@ impl SessionRunner {
                 {
                     c.remove(&oldest);
                 }
+                // A rekey on a live session: authenticated by the session
+                // itself, carrying no certificate window of its own, so the
+                // cache TTL is the whole of its life and it says so
+                // (report20 V18-M12).
                 c.insert(
                     self.peer_id,
                     (
-                        payload.encapsulation_key.to_vec(),
+                        veil_e2e::PeerMlKemKey::unattested(payload.encapsulation_key.to_vec()),
                         std::time::Instant::now(),
                     ),
                 );

@@ -3676,10 +3676,13 @@ async fn mlkem_rekey_triggered_by_byte_threshold() {
     let (peer_mlkem_keys, per_session_mlkem_dk) = make_mlkem_state();
     // Pre-populate a dummy peer EK so the runner can update it on ACK.
     let (dummy_ek, _) = veil_e2e::generate_keypair();
-    peer_mlkem_keys
-        .write()
-        .unwrap()
-        .insert(peer_id, (dummy_ek.to_vec(), std::time::Instant::now()));
+    peer_mlkem_keys.write().unwrap().insert(
+        peer_id,
+        (
+            veil_e2e::PeerMlKemKey::unattested(dummy_ek.to_vec()),
+            std::time::Instant::now(),
+        ),
+    );
 
     let (client, server) = tokio::io::duplex(4 * 1024 * 1024);
     let mut runner = make_mlkem_runner(server, peer_id, peer_mlkem_keys, per_session_mlkem_dk);
@@ -3790,7 +3793,7 @@ async fn mlkem_rekey_responder_updates_cache_and_acks() {
         .read()
         .unwrap()
         .get(&peer_id)
-        .map(|(ek, _)| ek.clone());
+        .map(|(key, _)| key.ek.clone());
     assert_eq!(
         cached,
         Some(new_ek.to_vec()),
@@ -3821,10 +3824,13 @@ async fn mlkem_rekey_initiator_commits_dk_seed_after_ack() {
 
     // Give the runner a dummy EK for the peer so it can update it.
     let (dummy_ek, _) = veil_e2e::generate_keypair();
-    peer_mlkem_keys
-        .write()
-        .unwrap()
-        .insert(peer_id, (dummy_ek.to_vec(), std::time::Instant::now()));
+    peer_mlkem_keys.write().unwrap().insert(
+        peer_id,
+        (
+            veil_e2e::PeerMlKemKey::unattested(dummy_ek.to_vec()),
+            std::time::Instant::now(),
+        ),
+    );
 
     // Manually trigger an ML-KEM rekey by sending a MlKemRekeyEk from the
     // "client" to the runner (runner acts as responder), getting the Ack

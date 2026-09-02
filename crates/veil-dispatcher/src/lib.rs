@@ -4820,7 +4820,7 @@ mod tests {
             .read()
             .unwrap()
             .get(&target_id)
-            .map(|(ek, _): &(Vec<u8>, _)| ek.clone());
+            .map(|(key, _): &(veil_e2e::PeerMlKemKey, _)| key.ek.clone());
         assert_eq!(
             cached_ek,
             Some(fake_ek),
@@ -4883,7 +4883,7 @@ mod tests {
             .read()
             .unwrap()
             .get(&target_id)
-            .map(|(ek, _): &(Vec<u8>, _)| ek.clone());
+            .map(|(key, _): &(veil_e2e::PeerMlKemKey, _)| key.ek.clone());
         assert_eq!(
             cached_ek,
             Some(fake_ek),
