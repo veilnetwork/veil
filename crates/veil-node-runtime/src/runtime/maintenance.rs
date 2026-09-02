@@ -63,6 +63,37 @@ fn ad_valid_until(valid_from: u64, ad_until: u64, relay_key_until: u64) -> Optio
     (until > valid_from).then_some(until)
 }
 
+/// Whether a published ad is still the one this entry would publish, and
+/// still has enough life left not to be re-signed.
+///
+/// The two halves both used the entry's REQUESTED window, and an ad clipped to
+/// a shorter-lived relay key satisfies neither: its span is not the requested
+/// window, so the projection check failed, and half of the requested window is
+/// more than the whole of the clipped one, so the half-life check said "refresh"
+/// as well. A clipped ad was therefore re-signed and re-published on EVERY
+/// maintenance tick, forever — signatures and DHT puts for an ad that had not
+/// changed (report20 V18-M3). Both questions are asked of the EFFECTIVE window
+/// now: what the publisher would compute from these same inputs, and how long
+/// this ad actually claims to be good for.
+fn ad_is_current(
+    ad_from: u64,
+    ad_until: u64,
+    window_secs: u64,
+    relay_key_until: u64,
+    now_unix: u64,
+) -> bool {
+    let expected = ad_valid_until(
+        ad_from,
+        ad_from.saturating_add(window_secs),
+        relay_key_until,
+    );
+    if expected != Some(ad_until) {
+        return false;
+    }
+    let effective_window = ad_until.saturating_sub(ad_from);
+    !veil_anonymity::rendezvous::rendezvous_ad_needs_refresh(ad_until, now_unix, effective_window)
+}
+
 impl NodeRuntime {
     pub fn spawn_maintenance_tick(
         &mut self,
@@ -920,8 +951,7 @@ impl NodeRuntime {
         // since the maintenance period is short.
         use veil_anonymity::rendezvous::{
             MAX_RENDEZVOUS_AD_SLOTS, decode_rendezvous_ad, is_currently_valid,
-            rendezvous_ad_dht_key_at, rendezvous_ad_needs_refresh, sign_rendezvous_ad_v5,
-            verify_rendezvous_ad,
+            rendezvous_ad_dht_key_at, sign_rendezvous_ad_v5, verify_rendezvous_ad,
         };
         // Call-RTT-spike experiment switch: skip the refresh tick entirely
         // while publish is paused (see veil_session::rt_trace::publish_pause).
@@ -988,12 +1018,12 @@ impl NodeRuntime {
                     && ad.wake_hmac_envelope == entry.wake_hmac_envelope
                     && ad.rendezvous_kem_algo == entry.rendezvous_kem_algo
                     && ad.rendezvous_kem_pk == entry.rendezvous_kem_pk
-                    && ad.valid_until_unix.saturating_sub(ad.valid_from_unix)
-                        == entry.validity_window_secs
-                    && !rendezvous_ad_needs_refresh(
+                    && ad_is_current(
+                        ad.valid_from_unix,
                         ad.valid_until_unix,
-                        now_unix,
                         entry.validity_window_secs,
+                        entry.rendezvous_kem_valid_until_unix,
+                        now_unix,
                     ))
                 .then_some(ad.valid_from_unix)
             };
@@ -1419,6 +1449,60 @@ mod tests {
     use veil_cfg::SignatureAlgorithm;
     use veil_dht::kademlia::KademliaService;
     use veil_observability::NodeLogger;
+
+    /// report20 V18-M3: an ad clipped to a short-lived relay key was
+    /// re-signed and re-published on EVERY maintenance tick.
+    ///
+    /// Both halves of the freshness question were asked of the window the
+    /// receiver REQUESTED. A clipped ad answers neither: its span is not the
+    /// requested window, and half the requested window is longer than the
+    /// whole of the clipped one. So the ad was never fresh — signatures and
+    /// DHT puts, for the life of the node, for an ad that had not changed.
+    #[test]
+    fn a_clipped_ad_is_still_fresh_for_half_of_its_own_life() {
+        const DAY: u64 = 86_400;
+        let month = 30 * DAY;
+        let from = 1_700_000_000;
+        // The relay key dies in a day, so that is what the publisher wrote.
+        let key_until = from + DAY;
+        let until = super::ad_valid_until(from, from + month, key_until).expect("a future");
+        assert_eq!(until, key_until, "premise: the ad was clipped to the key");
+
+        assert!(
+            super::ad_is_current(from, until, month, key_until, from + 1),
+            "a freshly published clipped ad was already due for re-signing, \
+             so every maintenance tick re-signs and re-publishes it"
+        );
+        assert!(
+            super::ad_is_current(from, until, month, key_until, from + DAY / 2 - 1),
+            "the clipped ad went stale before half its own life"
+        );
+        // Past half of ITS OWN span it genuinely is due.
+        assert!(
+            !super::ad_is_current(from, until, month, key_until, from + DAY / 2 + 1),
+            "an ad past half its life was not refreshed"
+        );
+
+        // An unclipped ad behaves exactly as it always did.
+        let plain = super::ad_valid_until(from, from + month, 0).expect("a future");
+        assert_eq!(plain, from + month);
+        assert!(super::ad_is_current(from, plain, month, 0, from + 1));
+        assert!(!super::ad_is_current(
+            from,
+            plain,
+            month,
+            0,
+            from + month / 2 + 1
+        ));
+
+        // And an ad whose expiry is NOT what this entry would publish is not
+        // this entry's ad, however much life it has left.
+        assert!(
+            !super::ad_is_current(from, from + month, month, key_until, from + 1),
+            "an ad advertising the relay key past its end was accepted as a \
+             current projection of the entry"
+        );
+    }
 
     fn fresh_identity() -> HandshakeIdentity {
         let kp = veil_crypto::generate_keypair(SignatureAlgorithm::Ed25519);

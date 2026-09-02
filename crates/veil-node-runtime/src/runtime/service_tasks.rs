@@ -675,14 +675,19 @@ fn insert_publisher_entry(
         // (observed on-device as a persistent stash failure). Carry the existing
         // KEM forward; this entry still functions as a rendezvous publisher, it
         // just keeps the mailbox KEM it already had.
+        //
+        // Only a KEM-LESS re-registration inherits. An entry that carries its
+        // OWN key is a rotation and must replace the key, its algorithm and
+        // its expiry AS ONE: carrying them separately advertised the OLD key
+        // under the NEW key's lifetime, so a rotated-out key stayed sealable
+        // for another full window (report20 V18-M2) and the rotation itself
+        // never reached a single sender.
         let mut entry = entry;
         let existing = &entries[pos];
-        if !existing.rendezvous_kem_pk.is_empty() {
+        if entry.rendezvous_kem_pk.is_empty() && !existing.rendezvous_kem_pk.is_empty() {
             entry.rendezvous_kem_algo = existing.rendezvous_kem_algo;
             entry.rendezvous_kem_pk = existing.rendezvous_kem_pk.clone();
-            if entry.rendezvous_kem_valid_until_unix == 0 {
-                entry.rendezvous_kem_valid_until_unix = existing.rendezvous_kem_valid_until_unix;
-            }
+            entry.rendezvous_kem_valid_until_unix = existing.rendezvous_kem_valid_until_unix;
         }
         entries[pos] = entry;
         return true;
@@ -788,13 +793,29 @@ pub(crate) async fn rendezvous_recipient_recheck(
     let mut registered = Vec::with_capacity(candidates.len());
     for relay in candidates {
         if rendezvous_register_with(session_tx_registry, anonymity, &relay, cookie) {
-            rendezvous_register_publisher(
+            // The publisher slots are BOUNDED, and a refusal means this relay
+            // gets no ad — so it is not a relay we are reachable through and
+            // must not be counted as one. Counting it anyway put a relay with
+            // no advertisement in `current`, and the node then waited at a
+            // meeting point no sender was ever told about (report20 V18-M13).
+            if !rendezvous_register_publisher(
                 anonymity,
                 &relay,
                 cookie,
                 RENDEZVOUS_AD_VALIDITY_SECS,
                 None,
-            );
+            ) {
+                logger.info(
+                    "anonymity.rendezvous_recipient.no_ad_slot",
+                    format!(
+                        "relay {} took no publisher slot (all {} in use); not counted \
+                         as registered",
+                        veil_util::hex_short(&relay),
+                        veil_anonymity::rendezvous::MAX_RENDEZVOUS_AD_SLOTS,
+                    ),
+                );
+                continue;
+            }
             registered.push(relay);
         } else {
             logger.info(
@@ -1852,9 +1873,17 @@ impl NodeRuntime {
         // here: which listener a stranger could dial. The DHT carries no scheme,
         // so the one we advertise is the one we expect of others -- a network
         // runs one transport.
-        let me = lan_announce_for(config, &my_pubkey, &self.identity.local_identity.nonce);
+        // What is BOUND, not what was written down: a listener on port 0 or
+        // one that has rotated is not on the port the config names.
+        let bound = bound_ports(&self.listens());
+        let me = lan_announce_for(
+            config,
+            &my_pubkey,
+            &self.identity.local_identity.nonce,
+            &bound,
+        );
         // So the layer can tell its own announcement from a stranger's.
-        let my_address = public_address_for(config);
+        let my_address = public_address_for(config, &bound);
         let network = if cfg!(feature = "testnet-seeds") {
             veil_mainline::rendezvous::Network::Testnet
         } else {
@@ -2075,9 +2104,15 @@ impl NodeRuntime {
             return;
         }
         let my_pubkey = self.identity.local_identity.public_key.clone();
-        let me = lan_announce_for(config, &my_pubkey, &self.identity.local_identity.nonce);
+        let bound = bound_ports(&self.listens());
+        let me = lan_announce_for(
+            config,
+            &my_pubkey,
+            &self.identity.local_identity.nonce,
+            &bound,
+        );
         // Separate from `me`, and needed only here: see `public_address_for`.
-        let my_address = public_address_for(config);
+        let my_address = public_address_for(config, &bound);
         let network = if cfg!(feature = "testnet-seeds") {
             veil_nostr::rendezvous::Network::Testnet
         } else {
@@ -2326,9 +2361,12 @@ impl NodeRuntime {
             return;
         }
         let my_pubkey = self.identity.local_identity.public_key.clone();
-        let Some(announce) =
-            lan_announce_for(config, &my_pubkey, &self.identity.local_identity.nonce)
-        else {
+        let Some(announce) = lan_announce_for(
+            config,
+            &my_pubkey,
+            &self.identity.local_identity.nonce,
+            &bound_ports(&self.listens()),
+        ) else {
             self.logger.info(
                 "lan_discovery.nothing_to_say",
                 "local discovery is on, but no listener is reachable from the \
@@ -2378,7 +2416,8 @@ impl NodeRuntime {
             // and a handle dropped when this task is aborted DETACHES rather
             // than aborting -- which is how a socket outlives the node that
             // opened it. Aborting this one task stops everything.
-            let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+            let mut seen: std::collections::BTreeMap<String, LanCandidate> =
+                std::collections::BTreeMap::new();
             let mut capped_logged = false;
             let mut sent: u32 = 0;
             // Absolute deadlines rather than a repeating timer: the receive
@@ -2416,6 +2455,30 @@ impl NodeRuntime {
                     },
                 };
 
+                // Give back the slots of announces that never became peers,
+                // BEFORE deciding on this one: otherwise eight datagrams are
+                // all it takes to close local discovery for the run.
+                if !seen.is_empty() {
+                    let connected: std::collections::HashSet<[u8; 32]> = {
+                        let g = lock!(access.live_sessions);
+                        g.values()
+                            .filter(|i| i.state == crate::types::SessionState::Active)
+                            .filter_map(|i| i.node_id.as_ref().map(|n| *n.as_bytes()))
+                            .collect()
+                    };
+                    for key in stale_lan_candidates(
+                        &seen,
+                        &connected,
+                        LAN_CANDIDATE_GRACE,
+                        std::time::Instant::now(),
+                    ) {
+                        seen.remove(&key);
+                        logger.debug(
+                            "lan_discovery.slot_reclaimed",
+                            "an announced neighbour never connected; its slot is free again",
+                        );
+                    }
+                }
                 if !admit_lan_peer(&bp.public_key, &my_pubkey, &seen) {
                     // Said once, at the ceiling, and then not again: the whole
                     // point of a cap is that the log does not grow with the
@@ -2432,10 +2495,22 @@ impl NodeRuntime {
                     }
                     continue;
                 }
-                seen.insert(bp.public_key.clone());
+                // Derive FIRST: an announce this node cannot turn into an
+                // identity is not a neighbour and must not spend a slot.
                 let Some(node_id_bytes) = derive_node_id_from_bootstrap_peer(&bp) else {
                     continue;
                 };
+                let Some(slot) = free_lan_slot(&seen) else {
+                    continue;
+                };
+                seen.insert(
+                    bp.public_key.clone(),
+                    LanCandidate {
+                        node_id: node_id_bytes,
+                        slot,
+                        admitted: std::time::Instant::now(),
+                    },
+                );
                 let hex = veil_util::hex_str(&node_id_bytes);
                 let Ok(node_id) = <veil_cfg::NodeId as std::str::FromStr>::from_str(&hex) else {
                     continue;
@@ -2458,7 +2533,7 @@ impl NodeRuntime {
                 // 0x8000_0000 because they are mutually exclusive within
                 // `spawn_bootstrap_task`; this one runs alongside all of them,
                 // so reusing that base would overwrite their entries.
-                let peer_id = PeerId::new(0x9000_0000u32.wrapping_add(seen.len() as u32));
+                let peer_id = PeerId::new(0x9000_0000u32.wrapping_add(slot));
                 let entry = PeerConfigEntry {
                     peer_id,
                     node_id,
@@ -6269,9 +6344,58 @@ const MAX_LAN_PEERS: usize = 8;
 pub fn admit_lan_peer(
     public_key: &str,
     my_pubkey: &str,
-    taken: &std::collections::HashSet<String>,
+    taken: &std::collections::BTreeMap<String, LanCandidate>,
 ) -> bool {
-    public_key != my_pubkey && !taken.contains(public_key) && taken.len() < MAX_LAN_PEERS
+    public_key != my_pubkey && !taken.contains_key(public_key) && taken.len() < MAX_LAN_PEERS
+}
+
+/// A LAN announce this node acted on: the identity it derived from it, the
+/// peer slot it was given, and when.
+#[derive(Clone, Debug)]
+pub struct LanCandidate {
+    pub node_id: [u8; 32],
+    pub slot: u32,
+    pub admitted: std::time::Instant,
+}
+
+/// How long an admitted LAN announce may hold its slot without the peer ever
+/// connecting.
+pub const LAN_CANDIDATE_GRACE: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// The admitted keys whose slot may be reclaimed.
+///
+/// The cap used to be spent by ANNOUNCEMENTS. Eight datagrams naming eight
+/// distinct keys filled it before a single handshake and nothing ever left,
+/// so any machine on the segment could lock this node out of local discovery
+/// until it restarted (report20 V20-M2). A slot is held by a peer that
+/// CONNECTED; one that has not connected within the grace is a claim rather
+/// than a peer, and its slot goes back.
+///
+/// Connected peers are never reclaimed however old — the cap is on how many
+/// LAN neighbours this node takes, and a neighbour it is talking to is one.
+pub fn stale_lan_candidates(
+    taken: &std::collections::BTreeMap<String, LanCandidate>,
+    connected: &std::collections::HashSet<[u8; 32]>,
+    grace: std::time::Duration,
+    now: std::time::Instant,
+) -> Vec<String> {
+    taken
+        .iter()
+        .filter(|(_, c)| {
+            !connected.contains(&c.node_id) && now.saturating_duration_since(c.admitted) >= grace
+        })
+        .map(|(k, _)| k.clone())
+        .collect()
+}
+
+/// The lowest peer slot no admitted LAN candidate is using.
+///
+/// Was `seen.len()`, which is the same number only while nothing ever leaves.
+/// Once a slot can be reclaimed, the length repeats and a new neighbour
+/// overwrites a live one's peer entry.
+pub fn free_lan_slot(taken: &std::collections::BTreeMap<String, LanCandidate>) -> Option<u32> {
+    let used: std::collections::BTreeSet<u32> = taken.values().map(|c| c.slot).collect();
+    (0..MAX_LAN_PEERS as u32).find(|s| !used.contains(s))
 }
 
 /// What this node should say about itself on the local network, or `None` when
@@ -6476,7 +6600,56 @@ pub fn rendezvous_address_is_self(mine: Option<&(String, u16)>, transport: &str)
         && their_port.parse::<u16>() == Ok(*port)
 }
 
-pub fn public_address_for(config: &veil_cfg::Config) -> Option<(String, u16)> {
+/// The port each listener is ACTUALLY bound on, by its configured transport.
+///
+/// [`public_address_for`] and [`lan_announce_for`] read the port an operator
+/// WROTE DOWN, and there are two ways for that not to be the port in use. A
+/// listener configured on port 0 asks the OS to choose, so the config has no
+/// port to publish and such a node advertised itself nowhere at all; an
+/// ephemeral listener rotates to a fresh port on every interval and the config
+/// goes on naming the first one (report20 V20-M3). The state entry carries the
+/// address the listener bound and is rewritten on every rebind, so it is the
+/// one that can answer.
+///
+/// Only ACTIVE listeners: an entry that is not bound has no port to speak of,
+/// and its stale `local_addr` would be worse than the config.
+pub fn bound_ports(listens: &[crate::types::ListenConfigEntry]) -> Vec<(String, u16)> {
+    listens
+        .iter()
+        .filter(|l| l.active)
+        .filter_map(|l| {
+            let addr = l.local_addr.as_deref()?;
+            let authority = addr.split_once("://").map_or(addr, |(_, rest)| rest);
+            let authority = authority.split('/').next().unwrap_or(authority);
+            let (_, port) = authority.rsplit_once(':')?;
+            let port = port.parse::<u16>().ok()?;
+            (port != 0).then(|| (l.transport.clone(), port))
+        })
+        .collect()
+}
+
+/// The port to publish for `listener`: what it bound, unless the operator
+/// stated an `advertise` address, which is a claim about the outside world and
+/// stands as written.
+fn published_port(
+    listener: &veil_cfg::ListenConfig,
+    configured: u16,
+    bound: &[(String, u16)],
+) -> u16 {
+    if listener.advertise.is_some() {
+        return configured;
+    }
+    bound
+        .iter()
+        .find(|(t, _)| *t == listener.transport)
+        .map(|(_, p)| *p)
+        .unwrap_or(configured)
+}
+
+pub fn public_address_for(
+    config: &veil_cfg::Config,
+    bound: &[(String, u16)],
+) -> Option<(String, u16)> {
     for listener in &config.listen {
         // The SAME gate `build_advertised_transports` applies, and for the same
         // stated reason: "Trusted and Hidden listeners stay invisible on the
@@ -6501,6 +6674,7 @@ pub fn public_address_for(config: &veil_cfg::Config) -> Option<(String, u16)> {
         let Ok(port) = port_str.parse::<u16>() else {
             continue;
         };
+        let port = published_port(listener, port, bound);
         if port == 0 || host.is_empty() {
             continue;
         }
@@ -6521,6 +6695,7 @@ pub fn lan_announce_for(
     config: &veil_cfg::Config,
     identity_public_key: &str,
     identity_nonce: &str,
+    bound: &[(String, u16)],
 ) -> Option<veil_bootstrap::LanAnnounce> {
     use base64::Engine as _;
     let b64 = base64::engine::general_purpose::STANDARD;
@@ -6551,6 +6726,7 @@ pub fn lan_announce_for(
         let Ok(port) = port_str.parse::<u16>() else {
             continue;
         };
+        let port = published_port(listener, port, bound);
         if port == 0 {
             continue;
         }
@@ -7234,13 +7410,13 @@ mod tests {
         let (key, nonce) = identity_b64();
         let mut c = veil_cfg::Config::default();
         c.listen = listeners;
-        lan_announce_for(&c, &key, &nonce)
+        lan_announce_for(&c, &key, &nonce, &[])
     }
 
     fn address_for_listeners(uris: &[(&str, Option<&str>)]) -> Option<(String, u16)> {
         let mut c = veil_cfg::Config::default();
         c.listen = uris.iter().map(|(u, a)| listener(u, *a)).collect();
-        public_address_for(&c)
+        public_address_for(&c, &[])
     }
 
     #[test]
@@ -7348,6 +7524,36 @@ mod tests {
     /// green.
     fn production_source(file: &str) -> &str {
         file.split("#[cfg(test)]").next().unwrap_or(file)
+    }
+
+    /// report20 V18-M13: a refused publisher slot must stop the relay from
+    /// being counted as one we are reachable through.
+    ///
+    /// `insert_publisher_entry` returns whether the entry actually took a
+    /// slot, and the re-pick loop threw that answer away: the relay went into
+    /// `registered`, `current` could become a relay carrying NO ad, and the
+    /// node then sat at a meeting point no sender was ever told about. There
+    /// is no seam to call this loop through — it wants a live session
+    /// registry, a DHT and an outbox — so the guard is on the source: the
+    /// answer has to be read.
+    #[test]
+    fn the_repick_loop_reads_the_publisher_slot_answer() {
+        let src = production_source(include_str!("service_tasks.rs"));
+        // The definition itself matches the same shape; only CALLS count.
+        let calls = src.matches("rendezvous_register_publisher(\n").count()
+            - src.matches("fn rendezvous_register_publisher(\n").count();
+        assert!(
+            calls >= 1,
+            "the re-pick loop no longer registers a publisher at all; this \
+             guard is now vacuous and has to be re-aimed"
+        );
+        assert_eq!(
+            src.matches("if !rendezvous_register_publisher(\n").count(),
+            calls,
+            "a call to rendezvous_register_publisher ignores its answer: a \
+             refused slot means no ad, and the relay must not be counted as \
+             one this node is reachable through"
+        );
     }
 
     #[test]
@@ -7686,12 +7892,12 @@ mod tests {
                 hidden.clone(),
             )];
             assert_eq!(
-                public_address_for(&c),
+                public_address_for(&c, &[]),
                 None,
                 "a {hidden:?} listener was offered as this node's public address"
             );
             assert!(
-                lan_announce_for(&c, &key, &nonce).is_none(),
+                lan_announce_for(&c, &key, &nonce, &[]).is_none(),
                 "a {hidden:?} listener was announced on the local network"
             );
         }
@@ -7703,10 +7909,10 @@ mod tests {
             Visibility::Public,
         )];
         assert_eq!(
-            public_address_for(&c),
+            public_address_for(&c, &[]),
             Some(("203.0.113.9".to_owned(), 5556))
         );
-        assert!(lan_announce_for(&c, &key, &nonce).is_some());
+        assert!(lan_announce_for(&c, &key, &nonce, &[]).is_some());
 
         // A hidden listener does not veto a public one standing behind it.
         let mut c = veil_cfg::Config::default();
@@ -7715,7 +7921,7 @@ mod tests {
             listener_seen_as("obfs4-tcp://203.0.113.9:5557", Visibility::Public),
         ];
         assert_eq!(
-            public_address_for(&c),
+            public_address_for(&c, &[]),
             Some(("203.0.113.9".to_owned(), 5557)),
             "the hidden listener hid the public one behind it"
         );
@@ -7786,17 +7992,114 @@ mod tests {
         );
     }
 
+    /// A candidate with no history: `admit_lan_peer` only counts and dedups.
+    fn lan_slot(slot: u32) -> LanCandidate {
+        LanCandidate {
+            node_id: [slot as u8; 32],
+            slot,
+            admitted: std::time::Instant::now(),
+        }
+    }
+
+    /// report20 V20-M3: what gets published is the port the listener BOUND.
+    ///
+    /// Both publishers read the config. A listener configured on port 0 asks
+    /// the OS to choose, so there was no port in the config to publish and the
+    /// node advertised itself nowhere; an ephemeral listener rotates and the
+    /// config goes on naming the port it started on, so every meeting point
+    /// held a dead one.
+    #[test]
+    fn the_port_we_publish_is_the_port_we_bound() {
+        let mut c = veil_cfg::Config::default();
+        c.listen = vec![veil_cfg::ListenConfig {
+            transport: "obfs4://203.0.113.7:0".to_owned(),
+            ..Default::default()
+        }];
+        assert_eq!(
+            public_address_for(&c, &[]),
+            None,
+            "premise: with nothing bound there is no port to publish"
+        );
+
+        let bound = vec![("obfs4://203.0.113.7:0".to_owned(), 41337u16)];
+        assert_eq!(
+            public_address_for(&c, &bound),
+            Some(("203.0.113.7".to_owned(), 41337)),
+            "an OS-chosen port was never published, so the node advertised \
+             itself at no meeting point at all"
+        );
+
+        // A rotated listener: the config still names the first port.
+        c.listen[0].transport = "obfs4://203.0.113.7:5556".to_owned();
+        let rotated = vec![("obfs4://203.0.113.7:5556".to_owned(), 47001u16)];
+        assert_eq!(
+            public_address_for(&c, &rotated),
+            Some(("203.0.113.7".to_owned(), 47001)),
+            "the config port was published over the one the listener rotated to"
+        );
+
+        // An operator's `advertise` is a claim about the outside world — a
+        // published port behind a proxy has nothing to do with the bound one.
+        c.listen[0].advertise = Some("obfs4://example.test:443".to_owned());
+        assert_eq!(
+            public_address_for(&c, &rotated),
+            Some(("example.test".to_owned(), 443)),
+            "a bound port overrode the address the operator stated"
+        );
+    }
+
+    /// And the bound ports come only from listeners that are actually bound.
+    #[test]
+    fn only_a_bound_listener_offers_a_port() {
+        let entry =
+            |transport: &str, addr: Option<&str>, active: bool| crate::types::ListenConfigEntry {
+                listen_id: crate::types::ListenId::new(1),
+                listener_handle: None,
+                transport: transport.to_owned(),
+                advertise: None,
+                relay: None,
+                tls_cert: None,
+                tls_key: None,
+                tls_ca_cert: None,
+                psk_file: None,
+                visibility: veil_cfg::Visibility::Public,
+                allowlist_node_ids: vec![],
+                group_label: None,
+                ephemeral: None,
+                on_demand: None,
+                local_addr: addr.map(str::to_owned),
+                active,
+            };
+        let listens = vec![
+            entry("obfs4://0.0.0.0:0", Some("obfs4://0.0.0.0:41337"), true),
+            // Not bound: its address is whatever it was last time, and that is
+            // worse than the config.
+            entry("tcp://0.0.0.0:0", Some("tcp://0.0.0.0:5000"), false),
+            // Bound but with no address recorded, and a port of zero says
+            // nothing.
+            entry("ws://0.0.0.0:0", None, true),
+            entry("wss://0.0.0.0:0", Some("wss://0.0.0.0:0"), true),
+        ];
+        assert_eq!(
+            bound_ports(&listens),
+            vec![("obfs4://0.0.0.0:0".to_owned(), 41337u16)],
+            "a listener that is not bound, or has no address, offered a port"
+        );
+    }
+
     #[test]
     fn a_talkative_neighbour_cannot_grow_this_nodes_memory_without_bound() {
         // The defect this closes was mine: the announcer was recorded BEFORE
         // the ceiling was checked, so somebody rotating keys on the segment
         // grew the set forever while none of those peers was ever attached.
         // The set is what the cap has to bound, not the attach count.
-        let mut taken: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut taken: std::collections::BTreeMap<String, LanCandidate> =
+            std::collections::BTreeMap::new();
         for i in 0..1000 {
             let key = format!("neighbour-{i}");
             if admit_lan_peer(&key, "ME", &taken) {
-                taken.insert(key);
+                let slot = free_lan_slot(&taken).expect("a slot the admit just allowed");
+                taken.insert(key, lan_slot(slot));
             }
         }
         assert_eq!(
@@ -7806,15 +8109,186 @@ mod tests {
         );
     }
 
+    /// report20 V20-M2: eight announces must not close local discovery for
+    /// the rest of the run.
+    ///
+    /// The cap counted ANNOUNCEMENTS, and an announcement costs a datagram.
+    /// Anybody on the segment could send eight naming eight keys, fill every
+    /// slot before a handshake, and the real neighbour that announced ninth
+    /// was ignored until the node restarted.
+    #[test]
+    fn announces_that_never_connect_give_their_slots_back() {
+        let t0 = std::time::Instant::now();
+        let mut taken: std::collections::BTreeMap<String, LanCandidate> =
+            std::collections::BTreeMap::new();
+        for i in 0..MAX_LAN_PEERS as u32 {
+            let key = format!("flood-{i}");
+            assert!(admit_lan_peer(&key, "ME", &taken));
+            taken.insert(
+                key,
+                LanCandidate {
+                    node_id: [i as u8; 32],
+                    slot: free_lan_slot(&taken).expect("a free slot below the cap"),
+                    admitted: t0,
+                },
+            );
+        }
+        assert!(
+            !admit_lan_peer("the-real-neighbour", "ME", &taken),
+            "premise: the cap is full, so a real neighbour is refused"
+        );
+
+        // Nothing connected. One grace later every slot is a claim, not a peer.
+        let connected = std::collections::HashSet::new();
+        let stale = stale_lan_candidates(
+            &taken,
+            &connected,
+            LAN_CANDIDATE_GRACE,
+            t0 + LAN_CANDIDATE_GRACE,
+        );
+        assert_eq!(
+            stale.len(),
+            MAX_LAN_PEERS,
+            "a flood that never connected still holds the cap: local \
+             discovery stays closed for the life of the process"
+        );
+        for key in stale {
+            taken.remove(&key);
+        }
+        assert!(
+            admit_lan_peer("the-real-neighbour", "ME", &taken),
+            "the reclaimed slots did not let a real neighbour in"
+        );
+
+        // Before the grace nothing is reclaimed — a slot is not taken away
+        // from an announce that simply has not finished connecting yet.
+        let mut fresh: std::collections::BTreeMap<String, LanCandidate> =
+            std::collections::BTreeMap::new();
+        fresh.insert(
+            "dialling".to_owned(),
+            LanCandidate {
+                node_id: [42; 32],
+                slot: 0,
+                admitted: t0,
+            },
+        );
+        assert!(
+            stale_lan_candidates(
+                &fresh,
+                &connected,
+                LAN_CANDIDATE_GRACE,
+                t0 + LAN_CANDIDATE_GRACE - std::time::Duration::from_secs(1),
+            )
+            .is_empty(),
+            "a slot was taken from an announce still inside its grace"
+        );
+    }
+
+    /// And a CONNECTED neighbour keeps its slot however long it holds it.
+    /// The cap is on how many LAN peers this node takes; one it is talking to
+    /// is one of them, and reclaiming its slot would hand the peer table to
+    /// whoever announces next.
+    #[test]
+    fn a_connected_neighbour_never_loses_its_slot() {
+        let t0 = std::time::Instant::now();
+        let mut taken: std::collections::BTreeMap<String, LanCandidate> =
+            std::collections::BTreeMap::new();
+        taken.insert(
+            "live".to_owned(),
+            LanCandidate {
+                node_id: [1; 32],
+                slot: 0,
+                admitted: t0,
+            },
+        );
+        taken.insert(
+            "silent".to_owned(),
+            LanCandidate {
+                node_id: [2; 32],
+                slot: 1,
+                admitted: t0,
+            },
+        );
+        let connected: std::collections::HashSet<[u8; 32]> = [[1u8; 32]].into_iter().collect();
+        assert_eq!(
+            stale_lan_candidates(
+                &taken,
+                &connected,
+                LAN_CANDIDATE_GRACE,
+                t0 + LAN_CANDIDATE_GRACE * 100,
+            ),
+            vec!["silent".to_owned()],
+            "the reclaim does not separate a peer we are talking to from one \
+             that never answered"
+        );
+    }
+
+    /// A reclaimed slot must not be handed out twice.
+    ///
+    /// The peer id was `seen.len()`, which equals the free slot only while
+    /// nothing ever leaves. With reclamation the length repeats, and the same
+    /// peer id would overwrite a live neighbour's entry in the peer table.
+    #[test]
+    fn a_reclaimed_slot_is_reused_without_colliding_with_a_live_one() {
+        let t0 = std::time::Instant::now();
+        let mut taken: std::collections::BTreeMap<String, LanCandidate> =
+            std::collections::BTreeMap::new();
+        for (i, key) in ["a", "b", "c"].iter().enumerate() {
+            taken.insert(
+                (*key).to_owned(),
+                LanCandidate {
+                    node_id: [i as u8; 32],
+                    slot: i as u32,
+                    admitted: t0,
+                },
+            );
+        }
+        taken.remove("b"); // slot 1 goes back
+        assert_eq!(
+            free_lan_slot(&taken),
+            Some(1),
+            "the free slot is not the reclaimed one"
+        );
+        taken.insert(
+            "d".to_owned(),
+            LanCandidate {
+                node_id: [9; 32],
+                slot: 1,
+                admitted: t0,
+            },
+        );
+        let slots: std::collections::BTreeSet<u32> = taken.values().map(|c| c.slot).collect();
+        assert_eq!(slots.len(), taken.len(), "two neighbours share a peer id");
+        // And a full ledger offers nothing.
+        let mut full: std::collections::BTreeMap<String, LanCandidate> =
+            std::collections::BTreeMap::new();
+        for i in 0..MAX_LAN_PEERS as u32 {
+            full.insert(
+                format!("n{i}"),
+                LanCandidate {
+                    node_id: [i as u8; 32],
+                    slot: i,
+                    admitted: t0,
+                },
+            );
+        }
+        assert_eq!(
+            free_lan_slot(&full),
+            None,
+            "a slot past the cap was offered"
+        );
+    }
+
     #[test]
     fn we_do_not_take_ourselves_or_the_same_neighbour_twice() {
-        let mut taken: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut taken: std::collections::BTreeMap<String, LanCandidate> =
+            std::collections::BTreeMap::new();
         assert!(
             !admit_lan_peer("ME", "ME", &taken),
             "a node took its own announce"
         );
         assert!(admit_lan_peer("THEM", "ME", &taken));
-        taken.insert("THEM".to_owned());
+        taken.insert("THEM".to_owned(), lan_slot(0));
         assert!(
             !admit_lan_peer("THEM", "ME", &taken),
             "the same neighbour was taken twice, which spawns a second connector"
@@ -8134,9 +8608,9 @@ mod tests {
         // A bad identity is not announceable either, and must not panic.
         let mut c = veil_cfg::Config::default();
         c.listen = vec![listener("tcp://0.0.0.0:5556", None)];
-        assert!(lan_announce_for(&c, "not base64!!", "AE1JRw==").is_none());
+        assert!(lan_announce_for(&c, "not base64!!", "AE1JRw==", &[]).is_none());
         assert!(
-            lan_announce_for(&c, "c2hvcnQ=", "AE1JRw==").is_none(),
+            lan_announce_for(&c, "c2hvcnQ=", "AE1JRw==", &[]).is_none(),
             "a key of the wrong length"
         );
     }
@@ -8474,6 +8948,57 @@ mod tests {
             entries[0].rendezvous_kem_valid_until_unix, 1_700_000_000,
             "the KEM survived but its expiry did not, so the ad stops being \
              clipped to it (V17-M1)"
+        );
+    }
+
+    /// But a re-registration that brings its OWN key ROTATES.
+    ///
+    /// The inheritance above is for the KEM-less tick only. When the app hands
+    /// in a new key it also hands in that key's expiry, and the two belong
+    /// together: keeping the old key while adopting the new key's lifetime
+    /// re-published a rotated-out key for another full window, and no sender
+    /// ever saw the new one (report20 V18-M2).
+    #[test]
+    fn a_rotated_kem_key_replaces_the_one_it_supersedes() {
+        let mut entries = Vec::new();
+        let base =
+            |kem: Vec<u8>, until: u64| veil_anonymity::rendezvous::RendezvousPublisherEntry {
+                rendezvous_node_id: [7; 32],
+                auth_cookie: [7; 16],
+                validity_window_secs: 3600,
+                push_envelope: Vec::new(),
+                wake_hmac_envelope: Vec::new(),
+                rendezvous_kem_algo: if kem.is_empty() { 0 } else { 1 },
+                rendezvous_kem_pk: kem,
+                rendezvous_kem_valid_until_unix: until,
+                ephemeral_ad_identity: None,
+            };
+
+        assert!(insert_publisher_entry(
+            &mut entries,
+            base(vec![9; 32], 1_700_000_000)
+        ));
+        assert!(insert_publisher_entry(
+            &mut entries,
+            base(vec![4; 32], 1_800_000_000)
+        ));
+
+        assert_eq!(entries.len(), 1);
+        assert_eq!(
+            entries[0].rendezvous_kem_pk,
+            vec![4; 32],
+            "the rotation was discarded: senders keep sealing to the key the \
+             receiver replaced"
+        );
+        assert_eq!(
+            entries[0].rendezvous_kem_valid_until_unix, 1_800_000_000,
+            "the rotated-in key kept the old expiry"
+        );
+        assert!(
+            !(entries[0].rendezvous_kem_pk == vec![9; 32]
+                && entries[0].rendezvous_kem_valid_until_unix == 1_800_000_000),
+            "the SUPERSEDED key is advertised under the NEW key's lifetime — \
+             it stays sealable for a window it was retired before"
         );
     }
 

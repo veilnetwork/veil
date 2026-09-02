@@ -482,8 +482,7 @@ impl Entry {
         out.extend_from_slice(&self.peer_ik);
         // The byte stays where it was, and still says only "was there ever
         // evidence" — a build that predates the stamp reads this file and gets
-        // the same answer it always did. The stamp itself is APPENDED, so an
-        // older reader stops where it always stopped.
+        // the same answer it always did.
         out.push(u8::from(self.ever_proven()));
         out.extend_from_slice(&self.last_used_at.to_be_bytes());
         match &self.pending_prologue {
@@ -496,8 +495,17 @@ impl Entry {
         }
         out.extend_from_slice(&(session.len() as u32).to_be_bytes());
         out.extend_from_slice(&session);
-        // Appended LAST, after the session, for the ordinary reason: it is how
-        // a field is added without a flag day.
+        // Appended LAST, after the session.
+        //
+        // THE V2 LAYOUT IS CLOSED. Appending was free exactly once, because
+        // the reader that refuses trailing bytes and the reader that tolerates
+        // this stamp are the same one and shipped together — no released build
+        // ever saw a V2 blob with a suffix it did not know. The next field is
+        // not free: every build from v0.10.0 onward rejects a longer V2 blob
+        // outright ("trailing bytes in conversation blob"), so a downgrade
+        // after it would find every conversation on the device unreadable.
+        // Add one by bumping to a V3 tag and teaching THIS reader to accept
+        // both — never by extending V2 again (report20 V18-M11).
         out.extend_from_slice(&self.authenticated_until.to_be_bytes());
         Zeroizing::new(out)
     }

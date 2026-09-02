@@ -181,6 +181,21 @@ pub async fn publish(
 /// Every event is verified before it is returned. A relay is a stranger's
 /// server: it can hand back anything, and an unverified event is a claim
 /// somebody else signed for.
+/// Whether an event a relay handed back is an answer to the query that was
+/// asked: the kind and the `d` tag the filter named.
+///
+/// A signature proves who wrote an event, not that it answers this question.
+/// The filter goes to the relay and the relay is a stranger's server — it is
+/// free to send a different kind, or somebody else's label, and only the asker
+/// can tell (report20 V20-M8).
+pub fn event_answers_query(event: &Event, kind: u16, label: &str) -> bool {
+    event.kind == kind
+        && event
+            .tags
+            .iter()
+            .any(|t| t.len() >= 2 && t[0] == "d" && t[1] == label)
+}
+
 pub async fn query(
     ctx: &TransportContext,
     url: &str,
@@ -204,6 +219,12 @@ pub async fn query(
             .await
             .map_err(|e| RelayError::Connect(format!("{e}")))?;
 
+        // What the CALLER asked for, not what the relay is willing to send.
+        // The filter carried this number and the reader did not: a relay that
+        // ignores the filter — and a relay is a stranger's server — could hand
+        // back four times as many events as were asked for, and every one of
+        // them became a bootstrap dial attempt (report20 V20-M8).
+        let cap = limit.min(MAX_EVENTS);
         let mut out = Vec::new();
         while let Some(msg) = socket.next().await {
             let Ok(Message::Text(text)) = msg else {
@@ -228,8 +249,20 @@ pub async fn query(
                         log::debug!("nostr: {url} sent an event that does not verify");
                         continue;
                     }
+                    // A signature proves who wrote it, not that it answers
+                    // THIS question. The filter named a kind and a `d` tag;
+                    // the relay is free to send something else, and only the
+                    // asker can tell. Checked locally so a relay cannot widen
+                    // its own answer.
+                    if !event_answers_query(&event, kind, label) {
+                        log::debug!(
+                            "nostr: {url} sent kind {} for a {kind}/{label} query",
+                            event.kind
+                        );
+                        continue;
+                    }
                     out.push(event);
-                    if out.len() >= MAX_EVENTS {
+                    if out.len() >= cap {
                         break;
                     }
                 }
@@ -260,6 +293,103 @@ pub async fn query(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn ev(kind: u16, tags: Vec<Vec<String>>) -> Event {
+        Event {
+            id: String::new(),
+            pubkey: String::new(),
+            created_at: 0,
+            kind,
+            tags,
+            content: String::new(),
+            sig: String::new(),
+        }
+    }
+
+    fn d(label: &str) -> Vec<Vec<String>> {
+        vec![vec!["d".to_owned(), label.to_owned()]]
+    }
+
+    /// report20 V20-M8: a relay may answer a different question, and only the
+    /// asker can tell.
+    ///
+    /// The filter names a kind and a `d` tag, and both go to the relay — a
+    /// stranger's server, free to send whatever it likes. The signature it
+    /// carries proves who wrote the event, not that it answers this query, and
+    /// nothing local checked. Every event that came back became a bootstrap
+    /// dial attempt.
+    #[test]
+    fn an_event_that_answers_a_different_question_is_not_an_answer() {
+        assert!(
+            event_answers_query(&ev(30078, d("veil:abc")), 30078, "veil:abc"),
+            "vacuity: the genuine answer must pass, or every case below is \
+             passing on a function that refuses everything"
+        );
+        assert!(
+            !event_answers_query(&ev(1, d("veil:abc")), 30078, "veil:abc"),
+            "a relay substituted another kind of event"
+        );
+        assert!(
+            !event_answers_query(&ev(30078, d("veil:someone-else")), 30078, "veil:abc"),
+            "a relay answered with somebody else's label"
+        );
+        assert!(
+            !event_answers_query(&ev(30078, Vec::new()), 30078, "veil:abc"),
+            "an event with no d tag was taken as tagged"
+        );
+        assert!(
+            !event_answers_query(
+                &ev(30078, vec![vec!["e".to_owned(), "veil:abc".to_owned()]]),
+                30078,
+                "veil:abc"
+            ),
+            "the label was matched under the wrong tag name"
+        );
+        assert!(
+            !event_answers_query(&ev(30078, vec![vec!["d".to_owned()]]), 30078, "veil:abc"),
+            "a bare d tag with no value was taken as a match"
+        );
+        // The right tag among several still answers.
+        assert!(event_answers_query(
+            &ev(
+                30078,
+                vec![
+                    vec!["e".to_owned(), "x".to_owned()],
+                    vec!["d".to_owned(), "veil:abc".to_owned()],
+                ]
+            ),
+            30078,
+            "veil:abc"
+        ));
+    }
+
+    /// And the reader stops at the number the CALLER asked for.
+    ///
+    /// The filter carried the caller's limit and the loop counted to the
+    /// relay's ceiling instead, so a relay that ignores its filter could hand
+    /// back four times as many events as were wanted.
+    #[test]
+    fn the_reader_stops_at_the_limit_that_was_asked_for() {
+        let src = include_str!("client.rs");
+        let body = src
+            .split("pub async fn query(")
+            .nth(1)
+            .and_then(|t| t.split("\n#[cfg(test)]").next())
+            .expect("the query body");
+        assert!(
+            body.contains("let cap = limit.min(MAX_EVENTS);"),
+            "the caller's limit is no longer computed"
+        );
+        assert!(
+            body.contains("out.len() >= cap"),
+            "the reader counts to something other than the caller's limit"
+        );
+        assert!(
+            !body.contains("out.len() >= MAX_EVENTS"),
+            "the reader counts to the relay ceiling again, so a relay that \
+             ignores its filter decides how many events this node acts on"
+        );
+    }
 
     #[test]
     fn a_relay_url_is_split_the_way_a_connection_needs_it() {
