@@ -1891,7 +1891,13 @@ impl NodeRuntime {
             let mut seeds = Vec::new();
             for router in PUBLIC_ROUTERS {
                 if let Ok(addrs) = tokio::net::lookup_host(*router).await {
-                    seeds.extend(addrs.filter(std::net::SocketAddr::is_ipv4));
+                    // BOTH families. The filter that used to stand here dropped
+                    // every AAAA the routers publish, and the reason had never
+                    // been written down: the client simply could not parse an
+                    // IPv6 contact. It can now, so a host with IPv6 uses it and
+                    // a host without one is unaffected -- the client keeps only
+                    // the families it managed to bind.
+                    seeds.extend(addrs.filter(|a| a.is_ipv4() || client.has_ipv6()));
                 }
             }
             if seeds.is_empty() {

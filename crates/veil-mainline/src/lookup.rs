@@ -63,7 +63,7 @@ impl Default for Limits {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Found {
     /// Peers holding the target, in the order they were heard of.
-    pub peers: Vec<std::net::SocketAddrV4>,
+    pub peers: Vec<SocketAddr>,
     /// The closest nodes that answered, nearest first, with the write token
     /// each gave. These are who an announce goes to.
     pub closest: Vec<(NodeInfo, Vec<u8>)>,
@@ -92,6 +92,9 @@ impl GetPeers for (&Client, Duration) {
             .query(
                 addr,
                 Query::GetPeers {
+                    // Both families: this node speaks each over its own socket
+                    // and one search spans the two overlays.
+                    want_both: true,
                     id: self.0.id(),
                     info_hash,
                 },
@@ -116,7 +119,7 @@ pub async fn find_peers<N: GetPeers>(
     // because two nodes may claim one id and both still need asking.
     let mut candidates: BTreeMap<([u8; 20], SocketAddr), NodeInfo> = BTreeMap::new();
     let mut asked: HashSet<SocketAddr> = HashSet::new();
-    let mut heard_peers: HashSet<std::net::SocketAddrV4> = HashSet::new();
+    let mut heard_peers: HashSet<SocketAddr> = HashSet::new();
 
     // Seeds have no id yet — that is what the first query is for. A zero id
     // sorts them first, which is right: they are all we have.
@@ -125,12 +128,10 @@ pub async fn find_peers<N: GetPeers>(
             ([0u8; 20], *addr),
             NodeInfo {
                 id: NodeId([0u8; 20]),
-                addr: match addr {
-                    SocketAddr::V4(v4) => *v4,
-                    // A v6 seed cannot be named in a compact v4 answer; keep
-                    // it dialable but out of the compact bookkeeping.
-                    SocketAddr::V6(_) => "0.0.0.0:0".parse().expect("literal"),
-                },
+                // Both families, since BEP 32 makes IPv6 a peer of IPv4 here
+                // rather than a separate thing: the two overlays share one key
+                // space and a response may name nodes from either.
+                addr: *addr,
             },
         );
     }
@@ -183,13 +184,7 @@ pub async fn find_peers<N: GetPeers>(
                 }
             }
             if let Some(token) = token {
-                let who = NodeInfo {
-                    id,
-                    addr: match addr {
-                        SocketAddr::V4(v4) => v4,
-                        SocketAddr::V6(_) => continue,
-                    },
-                };
+                let who = NodeInfo { id, addr };
                 found.closest.push((who, token));
             }
             for node in nodes {
@@ -198,7 +193,7 @@ pub async fn find_peers<N: GetPeers>(
                 if node.addr.port() == 0 || node.addr.ip().is_unspecified() {
                     continue;
                 }
-                let key = (id_distance(&node.id, &info_hash), SocketAddr::V4(node.addr));
+                let key = (id_distance(&node.id, &info_hash), node.addr);
                 if !asked.contains(&key.1) && candidates.insert(key, node).is_none() {
                     learned_closer = true;
                 }
@@ -293,7 +288,7 @@ pub async fn announce<N: AnnouncePeer>(
             continue;
         }
         if net
-            .announce_peer(SocketAddr::V4(node.addr), info_hash, port, token.clone())
+            .announce_peer(node.addr, info_hash, port, token.clone())
             .await
             .is_ok()
         {
@@ -328,7 +323,10 @@ mod tests {
                     token: vec![1],
                     peers: (0..self.0)
                         .map(|i| {
-                            SocketAddrV4::new(std::net::Ipv4Addr::new(203, 0, 113, 9), 1024 + i)
+                            SocketAddr::V4(SocketAddrV4::new(
+                                std::net::Ipv4Addr::new(203, 0, 113, 9),
+                                1024 + i,
+                            ))
                         })
                         .collect(),
                     nodes: Vec::new(),
@@ -398,7 +396,7 @@ mod tests {
         NodeInfo {
             id: id(id_byte),
             addr: match at {
-                SocketAddr::V4(v4) => v4,
+                SocketAddr::V4(v4) => SocketAddr::V4(v4),
                 SocketAddr::V6(_) => unreachable!("tests use v4"),
             },
         }
@@ -411,7 +409,7 @@ mod tests {
         let target = id(0xFF);
         let seed = addr(1);
         let middle = addr(2);
-        let peer: SocketAddrV4 = "203.0.113.5:51413".parse().unwrap();
+        let peer: SocketAddr = "203.0.113.5:51413".parse().unwrap();
 
         let mut sim = Sim::default();
         sim.nodes.insert(
@@ -506,10 +504,10 @@ mod tests {
                     nodes: (0..3)
                         .map(|k| NodeInfo {
                             id: NodeId([(255 - (n % 200) as u8); 20]),
-                            addr: SocketAddrV4::new(
+                            addr: SocketAddr::V4(SocketAddrV4::new(
                                 Ipv4Addr::new(10, (n / 250) as u8, (n % 250) as u8, k + 1),
                                 4000 + n as u16,
-                            ),
+                            )),
                         })
                         .collect(),
                 })
@@ -570,11 +568,11 @@ mod tests {
                 nodes: vec![
                     NodeInfo {
                         id: id(0xF0),
-                        addr: SocketAddrV4::new(Ipv4Addr::new(203, 0, 113, 1), 0),
+                        addr: SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(203, 0, 113, 1), 0)),
                     },
                     NodeInfo {
                         id: id(0xF1),
-                        addr: SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 6881),
+                        addr: SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 6881)),
                     },
                 ],
             },
@@ -863,7 +861,7 @@ mod tests {
         // assertion about what strangers say is an assertion about the
         // network, not about this code; what is measured below instead is
         // what appeared AFTER the announce that was not there before.
-        let before: HashSet<std::net::SocketAddrV4> = first.peers.iter().copied().collect();
+        let before: HashSet<std::net::SocketAddr> = first.peers.iter().copied().collect();
         if !before.is_empty() {
             eprintln!("note: {} peer(s) present before announcing", before.len());
         }
@@ -880,10 +878,7 @@ mod tests {
         // stored it" from "we asked somebody else". This can.
         let mut direct_hits = 0;
         for (node, _) in &first.closest {
-            match net
-                .get_peers(std::net::SocketAddr::V4(node.addr), target)
-                .await
-            {
+            match net.get_peers(node.addr, target).await {
                 Ok(Response::Peers { peers, .. }) if peers.iter().any(|p| !before.contains(p)) => {
                     eprintln!("  {} gave back {:?}", node.addr, peers);
                     direct_hits += 1;

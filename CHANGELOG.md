@@ -1,5 +1,35 @@
 # Changelog
 
+## v0.11.0 — 2026-09-02
+
+**Both meeting points now speak IPv6.** Neither did, and neither said so.
+
+Mainline is two overlays over one key space: BEP 5 carries IPv4, BEP 32 carries
+IPv6 in `nodes6` beside `nodes`, with eighteen-byte `values` entries beside the
+six-byte ones. Only the first half was implemented, and the consequence was a
+filter that quietly threw away every AAAA the public routers publish — two of
+the four have one. A host with IPv6 only could not use the layer at all: the
+routers resolved, the filter emptied the list, and the layer switched itself
+off with "no router resolved". Nothing recorded that as a decision, because it
+was not one.
+
+Now: a second UDP socket, both compact formats, `nodes6` read and written, and
+`want` asking for contacts of both families. A host without IPv6 binds what it
+can and is unaffected.
+
+`want` is part of the message rather than something the encoder adds, and that
+matters more than it looks. Adding it unconditionally made this client's bytes
+differ from the BEP's own examples — and a client whose bytes differ from the
+specification differs from every other client on the wire, which is the one
+thing a protocol built to blend in must not do. The round-trip test against
+those examples caught it.
+
+Local discovery had the same shape: `LSD_GROUP_V6` has been a public constant
+with an encoding test since the layer was written, and nothing ever bound it.
+It is bound now, on the same port with the same one-hop scope, and announces
+carry their own salt per family so the two datagrams are not linkable to each
+other.
+
 ## v0.10.7 — 2026-09-02
 
 Four follow-ups from the review of 0.10.5 and 0.10.6, all confirmed against the

@@ -11,7 +11,7 @@
 //! of clients omit it, and a veil-specific value in it would be a beacon
 //! saying exactly which nodes to look at.
 
-use std::net::{Ipv4Addr, SocketAddrV4};
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 
 use crate::bencode::{DecodeError, Value, bytes, dict};
 
@@ -34,12 +34,23 @@ impl NodeId {
 pub const COMPACT_NODE_LEN: usize = 26;
 /// An entry of a `values` list: 4 bytes of address, 2 of port.
 pub const COMPACT_PEER_LEN: usize = 6;
+/// An entry of a `nodes6` string (BEP 32): 20 bytes of id, 16 of address, 2 of
+/// port.
+pub const COMPACT_NODE6_LEN: usize = 38;
+/// An IPv6 entry of a `values` list (BEP 32): 16 bytes of address, 2 of port.
+pub const COMPACT_PEER6_LEN: usize = 18;
 
 /// A node as the wire carries it.
+///
+/// The address is family-agnostic because Mainline is two overlays sharing one
+/// key space: BEP 5 carries IPv4 in `nodes`, BEP 32 carries IPv6 in `nodes6`,
+/// and a response may hold both. Pinning this to `SocketAddrV4` is what made
+/// the whole client IPv4-only, and the reason had never been written down --
+/// it was simply the half that got implemented.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct NodeInfo {
     pub id: NodeId,
-    pub addr: SocketAddrV4,
+    pub addr: SocketAddr,
 }
 
 /// The four queries. Nothing else is sent, and anything else received is
@@ -52,10 +63,20 @@ pub enum Query {
     FindNode {
         id: NodeId,
         target: NodeId,
+        /// Ask for contacts of both families (BEP 32 `want: ["n4","n6"]`).
+        ///
+        /// PART OF THE MESSAGE, not something the encoder adds. A query
+        /// decoded from a datagram that carried no `want` must re-encode
+        /// without one, or this client's bytes differ from the BEP's own
+        /// examples -- and a client whose bytes differ from the spec differs
+        /// from every other client on the wire.
+        want_both: bool,
     },
     GetPeers {
         id: NodeId,
         info_hash: NodeId,
+        /// See [`Query::FindNode::want_both`].
+        want_both: bool,
     },
     AnnouncePeer {
         id: NodeId,
@@ -80,7 +101,7 @@ pub enum Response {
     Peers {
         id: NodeId,
         token: Vec<u8>,
-        peers: Vec<SocketAddrV4>,
+        peers: Vec<SocketAddr>,
         /// A response may carry both; nodes are how the search continues.
         nodes: Vec<NodeInfo>,
     },
@@ -163,7 +184,7 @@ pub fn parse_compact_nodes(raw: &[u8]) -> Result<Vec<NodeInfo>, KrpcError> {
 }
 
 /// Parse a `values` entry (or a whole compact peer string).
-pub fn parse_compact_peers(raw: &[u8]) -> Result<Vec<SocketAddrV4>, KrpcError> {
+pub fn parse_compact_peers(raw: &[u8]) -> Result<Vec<SocketAddr>, KrpcError> {
     if !raw.len().is_multiple_of(COMPACT_PEER_LEN) {
         return Err(KrpcError::BadLength);
     }
@@ -173,19 +194,108 @@ pub fn parse_compact_peers(raw: &[u8]) -> Result<Vec<SocketAddrV4>, KrpcError> {
         .collect())
 }
 
-fn socket_from(six: &[u8]) -> SocketAddrV4 {
-    SocketAddrV4::new(
+fn socket_from(six: &[u8]) -> SocketAddr {
+    SocketAddr::V4(SocketAddrV4::new(
         Ipv4Addr::new(six[0], six[1], six[2], six[3]),
         u16::from_be_bytes([six[4], six[5]]),
-    )
+    ))
 }
 
-fn compact_node(node: &NodeInfo) -> [u8; COMPACT_NODE_LEN] {
+/// 16 bytes of address and 2 of port, as BEP 32 writes them.
+fn socket6_from(eighteen: &[u8]) -> SocketAddr {
+    let mut octets = [0u8; 16];
+    octets.copy_from_slice(&eighteen[..16]);
+    SocketAddr::V6(SocketAddrV6::new(
+        Ipv6Addr::from(octets),
+        u16::from_be_bytes([eighteen[16], eighteen[17]]),
+        0,
+        0,
+    ))
+}
+
+/// Parse a `nodes6` string. Same shape as [`parse_compact_nodes`], sixteen
+/// bytes of address instead of four.
+pub fn parse_compact_nodes6(raw: &[u8]) -> Result<Vec<NodeInfo>, KrpcError> {
+    if !raw.len().is_multiple_of(COMPACT_NODE6_LEN) {
+        return Err(KrpcError::BadLength);
+    }
+    Ok(raw
+        .chunks_exact(COMPACT_NODE6_LEN)
+        .map(|c| NodeInfo {
+            id: NodeId(c[..20].try_into().expect("chunk is 38 bytes")),
+            addr: socket6_from(&c[20..38]),
+        })
+        .collect())
+}
+
+/// One `values` entry, whichever family it is.
+///
+/// A responder may mix them in one list, so length decides: six bytes is IPv4,
+/// eighteen is IPv6, anything else is a disagreement about the format and is
+/// refused rather than guessed at.
+pub fn parse_compact_peer_entry(raw: &[u8]) -> Result<SocketAddr, KrpcError> {
+    match raw.len() {
+        COMPACT_PEER_LEN => Ok(socket_from(raw)),
+        COMPACT_PEER6_LEN => Ok(socket6_from(raw)),
+        _ => Err(KrpcError::BadLength),
+    }
+}
+
+/// A node in its own family's compact form, or `None` for a family the caller
+/// asked to encode into the wrong list.
+fn compact_node(node: &NodeInfo) -> Option<[u8; COMPACT_NODE_LEN]> {
+    let SocketAddr::V4(v4) = node.addr else {
+        return None;
+    };
     let mut out = [0u8; COMPACT_NODE_LEN];
     out[..20].copy_from_slice(&node.id.0);
-    out[20..24].copy_from_slice(&node.addr.ip().octets());
-    out[24..26].copy_from_slice(&node.addr.port().to_be_bytes());
-    out
+    out[20..24].copy_from_slice(&v4.ip().octets());
+    out[24..26].copy_from_slice(&v4.port().to_be_bytes());
+    Some(out)
+}
+
+fn compact_node6(node: &NodeInfo) -> Option<[u8; COMPACT_NODE6_LEN]> {
+    let SocketAddr::V6(v6) = node.addr else {
+        return None;
+    };
+    let mut out = [0u8; COMPACT_NODE6_LEN];
+    out[..20].copy_from_slice(&node.id.0);
+    out[20..36].copy_from_slice(&v6.ip().octets());
+    out[36..38].copy_from_slice(&v6.port().to_be_bytes());
+    Some(out)
+}
+
+/// Both compact node strings for a set of nodes: `nodes` (IPv4) and `nodes6`
+/// (IPv6). Either may be empty, and an empty one is simply not written.
+fn compact_node_strings(nodes: &[NodeInfo]) -> (Vec<u8>, Vec<u8>) {
+    let mut v4 = Vec::new();
+    let mut v6 = Vec::new();
+    for n in nodes {
+        if let Some(c) = compact_node(n) {
+            v4.extend_from_slice(&c);
+        } else if let Some(c) = compact_node6(n) {
+            v6.extend_from_slice(&c);
+        }
+    }
+    (v4, v6)
+}
+
+/// One `values` entry, in whichever family the address is.
+fn compact_peer_entry(addr: &SocketAddr) -> Vec<u8> {
+    match addr {
+        SocketAddr::V4(v4) => {
+            let mut six = [0u8; COMPACT_PEER_LEN];
+            six[..4].copy_from_slice(&v4.ip().octets());
+            six[4..].copy_from_slice(&v4.port().to_be_bytes());
+            six.to_vec()
+        }
+        SocketAddr::V6(v6) => {
+            let mut eighteen = [0u8; COMPACT_PEER6_LEN];
+            eighteen[..16].copy_from_slice(&v6.ip().octets());
+            eighteen[16..].copy_from_slice(&v6.port().to_be_bytes());
+            eighteen.to_vec()
+        }
+    }
 }
 
 /// Decode one datagram.
@@ -204,10 +314,12 @@ pub fn decode_message(datagram: &[u8]) -> Result<Message, KrpcError> {
             let query = match value.get(b"q").and_then(Value::as_bytes) {
                 Some(b"ping") => Query::Ping { id },
                 Some(b"find_node") => Query::FindNode {
+                    want_both: wants_both(args),
                     id,
                     target: node_id(args.get(b"target"))?,
                 },
                 Some(b"get_peers") => Query::GetPeers {
+                    want_both: wants_both(args),
                     id,
                     info_hash: node_id(args.get(b"info_hash"))?,
                 },
@@ -236,10 +348,16 @@ pub fn decode_message(datagram: &[u8]) -> Result<Message, KrpcError> {
         Some(b"r") => {
             let r = value.get(b"r").ok_or(KrpcError::NotKrpc)?;
             let id = node_id(r.get(b"id"))?;
-            let nodes = match r.get(b"nodes").and_then(Value::as_bytes) {
+            // BOTH families. BEP 32 puts IPv6 contacts in `nodes6` beside the
+            // IPv4 ones in `nodes`, and a responder asked for both answers with
+            // both. Reading only `nodes` is what made this client IPv4-only.
+            let mut nodes = match r.get(b"nodes").and_then(Value::as_bytes) {
                 Some(raw) => parse_compact_nodes(raw)?,
                 None => Vec::new(),
             };
+            if let Some(raw) = r.get(b"nodes6").and_then(Value::as_bytes) {
+                nodes.extend(parse_compact_nodes6(raw)?);
+            }
             // The TOKEN decides, not `values`. BEP 5 answers a get_peers with
             // a token and `values` when it knows peers, and with a token and
             // `nodes` when it does not -- and the token is the half that
@@ -248,16 +366,17 @@ pub fn decode_message(datagram: &[u8]) -> Result<Message, KrpcError> {
             // DHT sent: twenty-one real nodes answered and this read none of
             // them as having offered one.
             //
-            // `values` is a LIST of 6-byte strings, not one long string. A
+            // `values` is a LIST of per-peer strings, not one long string. A
             // reader that accepts either is a reader two implementations can
-            // disagree with.
+            // disagree with. Each entry is six bytes for IPv4 or eighteen for
+            // IPv6, and one list may hold both.
             let peers = match r.get(b"values") {
                 Some(values) => {
                     let list = values.as_list().ok_or(KrpcError::NotKrpc)?;
                     let mut peers = Vec::with_capacity(list.len());
                     for entry in list {
                         let raw = entry.as_bytes().ok_or(KrpcError::NotKrpc)?;
-                        peers.extend(parse_compact_peers(raw)?);
+                        peers.push(parse_compact_peer_entry(raw)?);
                     }
                     peers
                 }
@@ -308,18 +427,64 @@ pub fn decode_message(datagram: &[u8]) -> Result<Message, KrpcError> {
 }
 
 /// Encode one message.
+/// Whether a decoded query asked for both families.
+fn wants_both(args: &Value) -> bool {
+    args.get(b"want").and_then(Value::as_list).is_some_and(|l| {
+        let has = |w: &[u8]| l.iter().any(|v| v.as_bytes() == Some(w));
+        has(b"n4") && has(b"n6")
+    })
+}
+
+/// `want` asking for contacts of both families, as BEP 32 spells it.
+fn want_list() -> Value {
+    Value::List(vec![
+        Value::Bytes(b"n4".to_vec()),
+        Value::Bytes(b"n6".to_vec()),
+    ])
+}
+
 pub fn encode_message(message: &Message) -> Vec<u8> {
     let value = match message {
         Message::Query { transaction, query } => {
             let (method, args): (&[u8], Value) = match query {
                 Query::Ping { id } => (b"ping", dict([(b"id", bytes(id.0))])),
-                Query::FindNode { id, target } => (
+                // `want` is how BEP 32 asks for the other family. Without it a
+                // responder answers with contacts of the family the query
+                // arrived over and nothing else, so a v4-only socket would
+                // never hear of a v6 node however many of them there are.
+                // Asking for both from both sockets is what makes the two
+                // overlays one search.
+                Query::FindNode {
+                    id,
+                    target,
+                    want_both,
+                } => (
                     b"find_node",
-                    dict([(b"id", bytes(id.0)), (b"target", bytes(target.0))]),
+                    if *want_both {
+                        dict([
+                            (b"id", bytes(id.0)),
+                            (b"target", bytes(target.0)),
+                            (b"want", want_list()),
+                        ])
+                    } else {
+                        dict([(b"id", bytes(id.0)), (b"target", bytes(target.0))])
+                    },
                 ),
-                Query::GetPeers { id, info_hash } => (
+                Query::GetPeers {
+                    id,
+                    info_hash,
+                    want_both,
+                } => (
                     b"get_peers",
-                    dict([(b"id", bytes(id.0)), (b"info_hash", bytes(info_hash.0))]),
+                    if *want_both {
+                        dict([
+                            (b"id", bytes(id.0)),
+                            (b"info_hash", bytes(info_hash.0)),
+                            (b"want", want_list()),
+                        ])
+                    } else {
+                        dict([(b"id", bytes(id.0)), (b"info_hash", bytes(info_hash.0))])
+                    },
                 ),
                 Query::AnnouncePeer {
                     id,
@@ -352,11 +517,18 @@ pub fn encode_message(message: &Message) -> Vec<u8> {
             let r = match response {
                 Response::Id { id } => dict([(b"id", bytes(id.0))]),
                 Response::Nodes { id, nodes } => {
-                    let mut flat = Vec::with_capacity(nodes.len() * COMPACT_NODE_LEN);
-                    for n in nodes {
-                        flat.extend_from_slice(&compact_node(n));
+                    let (flat, flat6) = compact_node_strings(nodes);
+                    if flat6.is_empty() {
+                        dict([(b"id", bytes(id.0)), (b"nodes", Value::Bytes(flat))])
+                    } else if flat.is_empty() {
+                        dict([(b"id", bytes(id.0)), (b"nodes6", Value::Bytes(flat6))])
+                    } else {
+                        dict([
+                            (b"id", bytes(id.0)),
+                            (b"nodes", Value::Bytes(flat)),
+                            (b"nodes6", Value::Bytes(flat6)),
+                        ])
                     }
-                    dict([(b"id", bytes(id.0)), (b"nodes", Value::Bytes(flat))])
                 }
                 Response::Peers {
                     id,
@@ -367,18 +539,10 @@ pub fn encode_message(message: &Message) -> Vec<u8> {
                     let values = Value::List(
                         peers
                             .iter()
-                            .map(|p| {
-                                let mut six = [0u8; COMPACT_PEER_LEN];
-                                six[..4].copy_from_slice(&p.ip().octets());
-                                six[4..].copy_from_slice(&p.port().to_be_bytes());
-                                Value::Bytes(six.to_vec())
-                            })
+                            .map(|p| Value::Bytes(compact_peer_entry(p)))
                             .collect(),
                     );
-                    let mut flat = Vec::with_capacity(nodes.len() * COMPACT_NODE_LEN);
-                    for n in nodes {
-                        flat.extend_from_slice(&compact_node(n));
-                    }
+                    let (flat, _flat6) = compact_node_strings(nodes);
                     // `values` is written only when there are peers, and
                     // `nodes` only when there are nodes -- an empty list of
                     // either is a key a real client does not send.
@@ -423,6 +587,126 @@ pub fn encode_message(message: &Message) -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn ipv6_contacts_survive_the_wire_in_both_directions() {
+        use std::net::Ipv6Addr;
+        // BEP 32 is the other half of Mainline: the same key space reached
+        // over IPv6, with `nodes6` beside `nodes` and eighteen-byte `values`
+        // entries beside the six-byte ones. Reading only the v4 halves is what
+        // made this client v4-only, and nothing had ever said so.
+        let v6 = SocketAddr::V6(SocketAddrV6::new(
+            "2001:db8::1".parse::<Ipv6Addr>().unwrap(),
+            6881,
+            0,
+            0,
+        ));
+        let v4: SocketAddr = "203.0.113.9:6881".parse().unwrap();
+
+        // A node string of each family, round-tripped through the codec.
+        let nodes = vec![
+            NodeInfo {
+                id: NodeId([1u8; 20]),
+                addr: v4,
+            },
+            NodeInfo {
+                id: NodeId([2u8; 20]),
+                addr: v6,
+            },
+        ];
+        let wire = encode_message(&Message::Response {
+            transaction: b"aa".to_vec(),
+            response: Response::Nodes {
+                id: NodeId([9u8; 20]),
+                nodes: nodes.clone(),
+            },
+        });
+        let Message::Response {
+            response: Response::Nodes { nodes: back, .. },
+            ..
+        } = decode_message(&wire).expect("decodes")
+        else {
+            panic!("not a nodes response");
+        };
+        assert_eq!(back.len(), 2, "a family was dropped on the way through");
+        assert!(
+            back.iter().any(|n| n.addr == v6),
+            "the IPv6 contact was lost"
+        );
+        assert!(
+            back.iter().any(|n| n.addr == v4),
+            "the IPv4 contact was lost"
+        );
+
+        // `values` may mix families in one list, and length is what says which.
+        let wire = encode_message(&Message::Response {
+            transaction: b"bb".to_vec(),
+            response: Response::Peers {
+                id: NodeId([9u8; 20]),
+                token: b"t".to_vec(),
+                peers: vec![v4, v6],
+                nodes: Vec::new(),
+            },
+        });
+        let Message::Response {
+            response: Response::Peers { peers, .. },
+            ..
+        } = decode_message(&wire).expect("decodes")
+        else {
+            panic!("not a peers response");
+        };
+        assert_eq!(peers, vec![v4, v6], "a mixed values list did not survive");
+
+        // Sizes are the BEP's, not ours.
+        assert_eq!(COMPACT_NODE6_LEN, 38);
+        assert_eq!(COMPACT_PEER6_LEN, 18);
+        // An entry of neither length is a disagreement about the format and is
+        // refused rather than guessed at.
+        assert!(parse_compact_peer_entry(&[0u8; 7]).is_err());
+    }
+
+    #[test]
+    fn a_query_carries_want_only_when_it_was_asked_for() {
+        // `want` is part of the message. Adding it at encode time made this
+        // client's bytes differ from the BEP's own examples -- and a client
+        // whose bytes differ from the spec differs from every other client on
+        // the wire, which is the one thing a blending-in protocol must not do.
+        let plain = encode_message(&Message::Query {
+            transaction: b"aa".to_vec(),
+            query: Query::FindNode {
+                id: NodeId([1u8; 20]),
+                target: NodeId([2u8; 20]),
+                want_both: false,
+            },
+        });
+        assert!(
+            !plain.windows(4).any(|w| w == b"want"),
+            "a query that did not ask for both families carried `want` anyway"
+        );
+
+        let asking = encode_message(&Message::Query {
+            transaction: b"aa".to_vec(),
+            query: Query::GetPeers {
+                id: NodeId([1u8; 20]),
+                info_hash: NodeId([2u8; 20]),
+                want_both: true,
+            },
+        });
+        assert!(
+            asking.windows(4).any(|w| w == b"want"),
+            "asking for both families produced no `want`, so no responder \
+             will ever answer with IPv6 contacts"
+        );
+        // ...and it survives a round trip rather than being re-invented.
+        let Message::Query {
+            query: Query::GetPeers { want_both, .. },
+            ..
+        } = decode_message(&asking).expect("decodes")
+        else {
+            panic!("not a get_peers");
+        };
+        assert!(want_both, "the decoder did not see the `want` we wrote");
+    }
     use super::*;
 
     fn id(b: u8) -> NodeId {
@@ -450,6 +734,7 @@ mod tests {
         round_trip(Message::Query {
             transaction: b"bb".to_vec(),
             query: Query::FindNode {
+                want_both: false,
                 id: id(1),
                 target: id(2),
             },
@@ -457,6 +742,7 @@ mod tests {
         round_trip(Message::Query {
             transaction: b"cc".to_vec(),
             query: Query::GetPeers {
+                want_both: false,
                 id: id(1),
                 info_hash: id(3),
             },
@@ -664,6 +950,7 @@ mod tests {
         let real = encode_message(&Message::Query {
             transaction: b"aa".to_vec(),
             query: Query::GetPeers {
+                want_both: false,
                 id: id(1),
                 info_hash: id(2),
             },
