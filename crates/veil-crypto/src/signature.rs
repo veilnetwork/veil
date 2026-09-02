@@ -28,7 +28,20 @@ pub struct GeneratedKeyPair {
 
 /// Raw hybrid keypair for callers that must never materialise private key
 /// bytes as an ordinary base64 `String` (encrypted sovereign bundles, HSM
-/// bridges). The Ed25519 half is deterministic from [seed]; the Falcon-512
+/// bridges).
+///
+/// THIS is the shape that removes the residue, and the reason
+/// [`GeneratedKeyPair`] above was left with a plain `String` when report21
+/// V18-L3 asked for `Zeroizing` there. `Zeroizing` cannot be moved out of, so
+/// wrapping that field wipes the buffer at the mint and forces every consumer
+/// that needs an owned `String` to clone — minting a fresh unwiped copy where
+/// today it receives the original by move. The residue moves; it does not go.
+/// A `Drop` impl is worse still: it forbids the moves outright and every one
+/// of the twelve sites answers with the same clone.
+///
+/// Removing it means giving the other algorithms this shape and migrating the
+/// callers that hold secrets long enough to matter — a piece of work driven by
+/// which callers those are, not by a blanket type change. The Ed25519 half is deterministic from [seed]; the Falcon-512
 /// half is freshly generated and therefore must be preserved by the caller.
 pub struct GeneratedHybrid512RawKeyPair {
     pub public_key: Vec<u8>,
