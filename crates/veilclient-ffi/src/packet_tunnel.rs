@@ -331,6 +331,34 @@ fn tunnel_args(proxy_url: &str, dns_ip: &str, mtu: u16, route_dns: bool) -> Resu
 /// "at least one" for a teardown that stranded several (report16 V16-M5).
 static ABANDONED_WORKERS: AtomicUsize = AtomicUsize::new(0);
 
+/// The thread counters of teardowns that left something behind.
+///
+/// A stranded thread is not stranded forever: the reader it is blocked in may
+/// return an hour later, and the thread then runs its stop hook and decrements
+/// the counter it shares with its runtime. Holding those counters is what lets
+/// this tell "parked right now" from "was ever parked".
+///
+/// The distinction is the whole point. `ABANDONED_WORKERS` counts since the
+/// process started, which is what its own documentation promises and what the
+/// FFI reporter should keep saying -- but the START GATE was reading it, so
+/// thirty-two stalls at any time in the life of a long-running app forbade
+/// every tunnel afterwards, including on a machine where nothing was parked
+/// any more.
+static STRANDED_GROUPS: Mutex<Vec<Arc<AtomicUsize>>> = Mutex::new(Vec::new());
+
+/// How many threads are parked RIGHT NOW, across every teardown that left any.
+///
+/// Groups that have drained are forgotten as they are found: a thread that came
+/// back late has already decremented its own group, and a group at zero is a
+/// teardown that finished after all.
+fn stranded_now() -> usize {
+    let mut groups = STRANDED_GROUPS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    groups.retain(|g| g.load(Ordering::Acquire) > 0);
+    groups.iter().map(|g| g.load(Ordering::Acquire)).sum()
+}
+
 /// How many stranded threads this process tolerates before refusing to start
 /// another tunnel.
 ///
@@ -339,11 +367,6 @@ static ABANDONED_WORKERS: AtomicUsize = AtomicUsize::new(0);
 /// old behaviour was not. At 32 the parked stacks are tens of megabytes: worth
 /// refusing over, and far below what it takes to be killed for.
 pub(crate) const MAX_STRANDED_WORKERS: usize = 32;
-
-/// The counter, as a number rather than a C int.
-fn abandoned_workers() -> usize {
-    ABANDONED_WORKERS.load(Ordering::Acquire)
-}
 
 /// How many runtime THREADS did not come back, since this process started.
 ///
@@ -382,7 +405,7 @@ where
     // killed (report17 V17-M5). Waking that reader is the real fix and is not
     // available from here — the blocking read is in a crate this tree does not
     // own — so what is left is to stop digging.
-    if abandoned_workers() >= MAX_STRANDED_WORKERS {
+    if stranded_now() >= MAX_STRANDED_WORKERS {
         return crate::VEIL_ERR_TUNNEL_WORKERS_STRANDED;
     }
 
@@ -475,7 +498,15 @@ where
             // many times something was slow.
             let left = live_threads.load(Ordering::Acquire);
             if left > 0 {
+                // The cumulative metric, which says "since this process
+                // started" and means it.
                 ABANDONED_WORKERS.fetch_add(left, Ordering::Release);
+                // ...and the group itself, so the start gate can ask what is
+                // parked NOW rather than what ever was.
+                STRANDED_GROUPS
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push(Arc::clone(&live_threads));
             }
         }) {
         Ok(thread) => thread,
@@ -1270,6 +1301,11 @@ mod tests {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
 
         let before = ABANDONED_WORKERS.load(Ordering::Acquire);
+        // The gate reads what is parked NOW, so the fixture parks a group
+        // rather than bumping the lifetime counter. A group is exactly what a
+        // teardown leaves behind: a live-thread count that its threads
+        // decrement if they ever come back.
+        let parked = Arc::new(AtomicUsize::new(MAX_STRANDED_WORKERS));
         // A tunnel starts fine below the budget — the control, and it also
         // proves the refusal is about the budget and not about the fixture.
         let started = launch_tunnel(None, None, 1280, |runtime, cancel| {
@@ -1284,7 +1320,10 @@ mod tests {
         assert_eq!(veil_packet_tunnel_stop(), crate::VEIL_OK);
 
         // Now the process looks like one that has stranded a pile.
-        ABANDONED_WORKERS.store(MAX_STRANDED_WORKERS, Ordering::Release);
+        STRANDED_GROUPS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(Arc::clone(&parked));
         let refused = launch_tunnel(None, None, 1280, |runtime, cancel| {
             runtime.block_on(async move { cancel.cancelled().await });
             Ok(0)
@@ -1295,9 +1334,23 @@ mod tests {
             "the tunnel started again with {MAX_STRANDED_WORKERS} threads \
              already parked: every cycle from here adds one more"
         );
+        // THE THREADS COME BACK. A stranded reader may return an hour later,
+        // and then nothing is parked any more -- the gate has to notice. It
+        // used to read a counter that only ever grew, so thirty-two stalls at
+        // any point in a long-running app forbade every tunnel afterwards.
+        parked.store(0, Ordering::Release);
+        assert_eq!(
+            stranded_now(),
+            0,
+            "threads that came back are still counted against the next start"
+        );
+        assert!(
+            ABANDONED_WORKERS.load(Ordering::Acquire) >= before,
+            "the lifetime metric must keep saying how many were ever stranded"
+        );
+
         // And the refusal did not claim the slot — a refusal that left the
         // slot taken would turn this into a permanent reentrancy error.
-        ABANDONED_WORKERS.store(before, Ordering::Release);
         let after = launch_tunnel(None, None, 1280, |runtime, cancel| {
             runtime.block_on(async move { cancel.cancelled().await });
             Ok(0)

@@ -21,14 +21,27 @@ use crate::event::{Event, verify};
 /// Relays this build asks when the operator names none.
 ///
 /// Public, free, run by unrelated people. The list is plural because any one
-/// of them may be down, rate-limiting, or gone for good — and losing one is
+/// of them may be down -- and measured, they are: on one pass two answered and
+/// three did not, on another four answered. The ones behind a CDN fail as a
+/// connection reset or a 503 when their origin is unwell, which reads like a
+/// fault on this side and is not one. `relay.nostr.band` was dropped after
+/// timing out on every attempt for a day, from this client and from `curl`
+/// alike: a relay that never answers spends the pass's budget and returns
+/// nothing.
+///
+/// Any one of them may also be lying. Every event they hand back is verified
+/// before a word of it is believed, so a hostile relay costs a wasted query
+/// and nothing else. That is why the list can be long without being a trust
+/// decision, rate-limiting, or gone for good — and losing one is
 /// supposed to cost nothing.
 pub const PUBLIC_RELAYS: &[&str] = &[
     "wss://relay.damus.io",
     "wss://nos.lol",
-    "wss://relay.nostr.band",
     "wss://nostr.mom",
     "wss://relay.primal.net",
+    "wss://nostr.oxtr.dev",
+    "wss://offchain.pub",
+    "wss://relay.snort.social",
 ];
 
 /// Longest a single relay exchange may take.
