@@ -16,6 +16,12 @@ pub unsafe extern "C" fn tun2proxy_set_traffic_status_callback(
     } else {
         log::error!("set traffic status callback failed");
     }
+    // AND THEN WAIT for the previous one to finish — see the same wait in
+    // `tun2proxy_set_log_callback`. `send_traffic_stat` calls with the registry
+    // lock released, which it must, and that leaves a window where the host can
+    // unregister and free a `ctx` a thread is about to hand back to it
+    // (report20 V18-M10).
+    IN_FLIGHT.wait_for_quiet();
     if send_interval_secs > 0 {
         SEND_INTERVAL_SECS.store(send_interval_secs as u64, std::sync::atomic::Ordering::Relaxed);
     }
@@ -44,6 +50,9 @@ unsafe impl Sync for TrafficStatusCallback {}
 
 static TRAFFIC_STATUS_CALLBACK: std::sync::Mutex<Option<TrafficStatusCallback>> = std::sync::Mutex::new(None);
 static SEND_INTERVAL_SECS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// Threads currently inside the traffic callback. See [`crate::ffi_callback`].
+static IN_FLIGHT: crate::ffi_callback::InFlight = crate::ffi_callback::InFlight::new();
 
 /// The running totals AND when they were last reported, under one lock.
 ///
@@ -130,6 +139,9 @@ fn send_traffic_stat(traffic_status: &TrafficStatus) -> Result<()> {
     // it registered runs.
     let cb = TRAFFIC_STATUS_CALLBACK.lock().ok().and_then(|g| g.clone());
     if let Some(cb) = cb {
+        // Counted for the whole call, so an unregister that starts now waits
+        // for this to return before it lets the host free `ctx`.
+        let _in_flight = IN_FLIGHT.enter();
         unsafe { cb.call(traffic_status) };
     }
     Ok(())
@@ -248,6 +260,64 @@ mod reentrancy_tests {
     }
 
     unsafe extern "C" fn quiet_cb(_status: *const TrafficStatus, _ctx: *mut c_void) {}
+
+    /// report20 V18-M10: unregistering WAITS for the call in flight.
+    ///
+    /// The call runs with the registry lock released — it has to, or a
+    /// callback that registers another takes the lock its own caller holds —
+    /// and that left a window where the host could unregister and free the
+    /// `ctx` a thread was about to pass back to it. The setter returning is
+    /// what tells the host its ctx is free to release, and it used to return
+    /// while a call was still holding one.
+    static SLOW_CB_ENTERED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    static SLOW_CB_LEFT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    static RELEASE_SLOW_CB: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+    unsafe extern "C" fn slow_cb(_status: *const TrafficStatus, _ctx: *mut c_void) {
+        SLOW_CB_ENTERED.store(true, std::sync::atomic::Ordering::SeqCst);
+        while !RELEASE_SLOW_CB.load(std::sync::atomic::Ordering::SeqCst) {
+            std::thread::yield_now();
+        }
+        SLOW_CB_LEFT.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    #[test]
+    fn unregistering_waits_for_the_call_already_running() {
+        unsafe {
+            tun2proxy_set_traffic_status_callback(0, Some(slow_cb), std::ptr::null_mut());
+        }
+
+        // A reporting thread enters the callback and parks inside it.
+        let reporter = std::thread::spawn(|| {
+            send_traffic_stat(&TrafficStatus { tx: 1, rx: 2 }).expect("send");
+        });
+        while !SLOW_CB_ENTERED.load(std::sync::atomic::Ordering::SeqCst) {
+            std::thread::yield_now();
+        }
+        assert!(
+            !SLOW_CB_LEFT.load(std::sync::atomic::Ordering::SeqCst),
+            "premise: the callback is still inside"
+        );
+
+        // The host unregisters from ANOTHER thread and would free its ctx the
+        // moment this returns.
+        let unregister = std::thread::spawn(|| unsafe {
+            tun2proxy_set_traffic_status_callback(0, None, std::ptr::null_mut());
+        });
+
+        // Let the parked callback finish, then the unregister may return.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert!(
+            !unregister.is_finished(),
+            "the unregister returned while a thread was still inside the old \
+             callback: the host frees its ctx there, and the call lands on \
+             freed memory"
+        );
+        RELEASE_SLOW_CB.store(true, std::sync::atomic::Ordering::SeqCst);
+        unregister.join().expect("unregister");
+        reporter.join().expect("reporter");
+        assert!(SLOW_CB_LEFT.load(std::sync::atomic::Ordering::SeqCst));
+    }
 
     #[test]
     fn a_callback_that_registers_another_does_not_deadlock() {
