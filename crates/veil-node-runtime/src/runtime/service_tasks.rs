@@ -659,7 +659,7 @@ pub(crate) fn rendezvous_register_with(
 /// takes on every tick, so refusing it would break a working publisher.
 ///
 /// Returns whether the registry now holds this entry.
-fn insert_publisher_entry(
+pub(crate) fn insert_publisher_entry(
     entries: &mut Vec<veil_anonymity::rendezvous::RendezvousPublisherEntry>,
     entry: veil_anonymity::rendezvous::RendezvousPublisherEntry,
 ) -> bool {
@@ -7620,6 +7620,46 @@ mod tests {
 
     fn production_source(file: &str) -> &str {
         file.split("#[cfg(test)]").next().unwrap_or(file)
+    }
+
+    /// report21 V18-L1: every registration goes through the one admission.
+    ///
+    /// `NodeRuntime::register_rendezvous_publisher_with_push` kept its own copy
+    /// of "replace or push", so it kept none of what the shared helper had been
+    /// taught: it pushed past the slot bound (an entry past it is cloned on
+    /// every publish tick and never signed), and its replace overwrote the KEM
+    /// key with the empty one it registers with — the erasure the helper exists
+    /// to prevent, arriving through a different door.
+    #[test]
+    fn the_runtime_registration_uses_the_bounded_admission() {
+        let src = include_str!("../runtime/mod.rs");
+        let f = src
+            .split("pub fn register_rendezvous_publisher_with_push")
+            .nth(1)
+            .and_then(|t| t.split("\n    ///").next())
+            .expect("the registration");
+        assert!(
+            f.contains("insert_publisher_entry(&mut entries, entry)"),
+            "the registration keeps its own admission again, so the slot bound \
+             and the KEM-preservation rule do not apply to it"
+        );
+        assert!(
+            !f.contains("entries.push(entry)"),
+            "an entry is pushed past the slot bound: it is cloned on every \
+             publish tick and never signed"
+        );
+
+        // And setting a relay key moves its expiry with it, or a fresh key is
+        // advertised under the lifetime of the one it replaced.
+        let setter = src
+            .split("pub fn set_rendezvous_relay_kem")
+            .nth(1)
+            .and_then(|t| t.split("\n    ///").next())
+            .expect("the relay-key setter");
+        assert!(
+            setter.contains("entry.rendezvous_kem_valid_until_unix = 0;"),
+            "a rotated relay key keeps the previous key's expiry"
+        );
     }
 
     /// report20 V18-M13: a refused publisher slot must stop the relay from
