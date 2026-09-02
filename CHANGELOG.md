@@ -1,5 +1,38 @@
 # Changelog
 
+## v0.11.8 — 2026-09-02
+
+**A traffic report never goes backwards.**
+
+The running totals and the timestamp of the last report were separate mutexes,
+taken one after the other. Two threads updating at once each copied their own
+totals, then each read the timestamp and each decided to report — so the one
+holding the SMALLER total could reach the callback second, and a consumer
+watching a monotonic counter saw it go down. Anything computing a delta from it
+got a negative one. The same check-then-act also let both of them report inside
+a single interval.
+
+One critical section decides everything now: the delta lands, and if the
+interval has passed the slot is CLAIMED — the timestamp moves under the same
+lock that read the totals, so a thread arriving behind adds its bytes and is
+told to stay quiet. The lock is released before the callback runs, which is the
+other half of this function's history: foreign code may reach back in, and
+holding anything across it is a deadlock.
+
+What that leaves, said plainly rather than papered over: two claims an interval
+apart could still reach the callback out of order if the scheduler parks the
+first between claiming and calling. Closing that means serialising the calls
+themselves, which is the thing the deadlock fix forbids.
+
+One finding from the same registry was checked and NOT taken. Wrapping a
+generated keypair's base64 secret in `Zeroizing` MOVES the residue rather than
+removing it: `Zeroizing` cannot be moved out of, so every consumer that needs
+an owned `String` clones — minting a fresh unwiped copy where today it receives
+the original by move. A `Drop` impl is worse, forbidding the moves outright so
+that all twelve sites answer with the same clone. The shape that actually
+removes it is the raw-bytes keypair this crate already has for exactly that
+reason; the reasoning is now written beside it.
+
 ## v0.11.7 — 2026-09-02
 
 **A conversation's exported state never outgrows the buffer it is written
