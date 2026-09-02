@@ -47,19 +47,49 @@ impl std::fmt::Display for QueryError {
 
 impl std::error::Error for QueryError {}
 
-/// A bound socket that speaks KRPC.
+/// Bound sockets that speak KRPC.
+///
+/// TWO, because Mainline is two overlays over one key space: BEP 5 carries
+/// IPv4 and BEP 32 carries IPv6, and a datagram has to leave by a socket of
+/// the family it is addressed to. One socket meant every IPv6 contact the DHT
+/// offered was unreachable, and a host with no IPv4 at all could not use the
+/// layer for anything.
 pub struct Client {
     socket: UdpSocket,
+    /// `None` where the host has no IPv6 at all, which is an ordinary state
+    /// and not a failure: the v4 half works on its own, as it always did.
+    socket6: Option<UdpSocket>,
     id: NodeId,
 }
 
 impl Client {
-    /// Bind an ephemeral port on every interface.
+    /// Bind an ephemeral port on every interface, in both families.
+    ///
+    /// IPv4 is required -- without it there is no DHT to speak of on most of
+    /// the internet. IPv6 is attempted and its absence recorded rather than
+    /// raised: plenty of hosts have none, and refusing to start there would
+    /// trade a working layer for a principle.
     pub async fn bind(id: NodeId) -> io::Result<Self> {
+        let socket6 = UdpSocket::bind("[::]:0").await.ok();
         Ok(Self {
             socket: UdpSocket::bind("0.0.0.0:0").await?,
+            socket6,
             id,
         })
+    }
+
+    /// Whether this client can reach IPv6 peers at all.
+    pub fn has_ipv6(&self) -> bool {
+        self.socket6.is_some()
+    }
+
+    /// The socket that can reach `addr`, or `None` when this host has no
+    /// address of that family.
+    fn socket_for(&self, addr: SocketAddr) -> Option<&UdpSocket> {
+        match addr {
+            SocketAddr::V4(_) => Some(&self.socket),
+            SocketAddr::V6(_) => self.socket6.as_ref(),
+        }
     }
 
     /// This client's own node id, as it puts in every query.
@@ -88,10 +118,17 @@ impl Client {
             transaction: transaction.clone(),
             query,
         });
-        self.socket
-            .send_to(&wire, to)
-            .await
-            .map_err(QueryError::Io)?;
+        // The socket of the destination's own family. A datagram cannot leave
+        // an IPv4 socket for an IPv6 address, and a host with no IPv6 simply
+        // cannot reach one -- said plainly here rather than surfacing as an
+        // I/O error nobody can read.
+        let socket = self.socket_for(to).ok_or_else(|| {
+            QueryError::Io(io::Error::new(
+                io::ErrorKind::AddrNotAvailable,
+                "no socket of that address family on this host",
+            ))
+        })?;
+        socket.send_to(&wire, to).await.map_err(QueryError::Io)?;
 
         let deadline = tokio::time::Instant::now() + timeout;
         let mut buf = vec![0u8; MAX_BYTES_LEN];
@@ -100,12 +137,11 @@ impl Client {
             if remaining.is_zero() {
                 return Err(QueryError::TimedOut);
             }
-            let received =
-                match tokio::time::timeout(remaining, self.socket.recv_from(&mut buf)).await {
-                    Err(_) => return Err(QueryError::TimedOut),
-                    Ok(Err(e)) => return Err(QueryError::Io(e)),
-                    Ok(Ok((n, from))) => (n, from),
-                };
+            let received = match tokio::time::timeout(remaining, socket.recv_from(&mut buf)).await {
+                Err(_) => return Err(QueryError::TimedOut),
+                Ok(Err(e)) => return Err(QueryError::Io(e)),
+                Ok(Ok((n, from))) => (n, from),
+            };
             let (n, from) = received;
             if from != to {
                 continue;
@@ -359,6 +395,7 @@ mod tests {
             .query(
                 addr,
                 Query::FindNode {
+                    want_both: true,
                     id: client.id(),
                     target: NodeId([0xCC; 20]),
                 },
@@ -400,6 +437,7 @@ mod tests {
                     .query(
                         addr,
                         Query::FindNode {
+                            want_both: true,
                             id: client.id(),
                             target: client.id(),
                         },
