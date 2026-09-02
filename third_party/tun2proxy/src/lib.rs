@@ -179,9 +179,7 @@ struct SessionPermit(std::sync::Arc<std::sync::atomic::AtomicUsize>);
 
 impl SessionPermit {
     fn take(count: &std::sync::Arc<std::sync::atomic::AtomicUsize>) -> Self {
-        let now = count
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-            .saturating_add(1);
+        let now = count.fetch_add(1, std::sync::atomic::Ordering::Relaxed).saturating_add(1);
         log::trace!("Session count {now}");
         Self(count.clone())
     }
@@ -189,10 +187,7 @@ impl SessionPermit {
 
 impl Drop for SessionPermit {
     fn drop(&mut self) {
-        let now = self
-            .0
-            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed)
-            .saturating_sub(1);
+        let now = self.0.fetch_sub(1, std::sync::atomic::Ordering::Relaxed).saturating_sub(1);
         log::trace!("Session count {now}");
     }
 }
