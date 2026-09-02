@@ -1,5 +1,34 @@
 # Changelog
 
+## v0.11.10 — 2026-09-02
+
+**A publisher slot goes to an entry that can become an ad.**
+
+The slots are bounded and the publish tick signs what is in them, so an entry
+the signer refuses — a validity window of zero or past the cap, an envelope or
+a relay key over its limit, an algorithm named with no key behind it — took a
+slot a working publisher could have had. Silently: the refusal landed later, on
+a tick, in a log line nobody reads, while the registration itself had answered
+"registered". The bounds are checked before anything is taken, and they are the
+signer's own constants rather than numbers copied beside them.
+
+*A withdraw no longer lets go between deciding and removing.* The rendezvous
+cookie is derived per (identity, period), not minted per registration, so a
+withdraw and a re-registration inside one period produce the same
+`(relay, cookie)`. Releasing the service lock before clearing the publisher
+rows left a window where a re-registration could put its service entry back and
+the withdraw would then delete the publisher row it had just made — a service
+registered and never advertised.
+
+**Said plainly: that narrows the window, it does not close it.** The publisher
+row is written by a deferred closure that runs when the circuit's `confirmed`
+flag flips, and that closure takes only the publisher lock. A registration
+whose confirm lands inside the withdraw can still leave a row behind. Closing
+it means giving a registration an identity of its own — the cookie is not one,
+which is the whole of report20 V18-M5 — and settling a lock order across the
+three registries that each hold part of a registration. That is a design
+decision, not an edit, and it is not in this release.
+
 ## v0.11.9 — 2026-09-02
 
 **Two ways the tunnel's C boundary could be told a lie.**
