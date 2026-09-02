@@ -1149,7 +1149,8 @@ pub async fn register_connection_session(
         // SAME `inbound_bypasses_directional` classifier (6d390ef) that excludes
         // the mutually-dialing mesh, so this cannot reintroduce the seed-mesh
         // glare loop that the un-gated replace-on-dedup caused (reverted f053067).
-        let evict_stale_on_dedup = !new_is_outbound && inbound_bypasses_directional(matched_source);
+        let evict_stale_on_dedup =
+            !new_is_outbound && inbound_may_replace_live_session(matched_source);
         let reserved_outbox_rx = {
             let mut reg = runtime
                 .session_tx_registry
@@ -1439,6 +1440,44 @@ pub fn inbound_bypasses_directional(matched_source: Option<PeerSource>) -> bool 
     )
 }
 
+/// Whether an inbound connection may take the place of a session that is still
+/// OPEN.
+///
+/// A SEPARATE QUESTION from the directional bypass, and it was not asked
+/// separately. `evict_stale_on_dedup` was derived from
+/// `inbound_bypasses_directional`, which is a negative list -- so every source
+/// added after it was written inherited, silently, the right to evict a live
+/// session. `PeerSource::Rendezvous` arrived that way.
+///
+/// The eviction exists for a real case: a learned peer whose old link died
+/// without either side noticing reconnects, and refusing it would strand both
+/// until a reaper notices. The registry calls the victim "open-but-likely-
+/// zombie", and likely is the whole of the evidence -- nothing checks.
+///
+/// A rendezvous dial is not that case. It arrives on a schedule, and arriving
+/// while we hold a healthy session is proof the peer did NOT abandon the old
+/// connection. Granting it the eviction cost a working session every time:
+/// the far side refuses its own duplicate and closes the socket, so the
+/// newcomer that just displaced a live sender is dead on arrival, and both are
+/// gone.
+///
+/// Exhaustive on purpose. A new source must say which of the two it wants
+/// rather than inherit either.
+pub fn inbound_may_replace_live_session(matched_source: Option<PeerSource>) -> bool {
+    match matched_source {
+        // A peer we learned of and dial mutually. Its reconnect is the case
+        // this was built for.
+        Some(PeerSource::Exchanged) | Some(PeerSource::Autodiscovered) => true,
+        // The operator's own rows: first-wins, and a reaper clears a zombie.
+        Some(PeerSource::Configured) | Some(PeerSource::Bootstrap) => false,
+        // Scheduled, not a reconnect. See above.
+        Some(PeerSource::Rendezvous) => false,
+        // No row at all: a stranger has not earned the right to end a session
+        // this node is holding.
+        None => false,
+    }
+}
+
 /// Whether an outbound dial to this row carries an expectation about who will
 /// answer.
 ///
@@ -1636,6 +1675,61 @@ mod who_writes_first_tests {
             None,
             "an inbound session with an expectation still must not write first"
         );
+    }
+}
+
+#[cfg(test)]
+mod live_session_eviction_tests {
+    use super::{inbound_bypasses_directional, inbound_may_replace_live_session};
+    use crate::types::PeerSource;
+
+    #[test]
+    fn arriving_on_a_schedule_does_not_end_a_session_we_are_holding() {
+        // `evict_stale_on_dedup` used to be derived from
+        // `inbound_bypasses_directional`, a NEGATIVE list, so every source
+        // added after it was written inherited the right to displace a live
+        // session. `Rendezvous` arrived that way, and the cost was exact: the
+        // far side refuses its own duplicate and closes the socket, so the
+        // newcomer that just displaced a live sender is dead on arrival and
+        // both connections are gone.
+        assert!(
+            !inbound_may_replace_live_session(Some(PeerSource::Rendezvous)),
+            "a scheduled rendezvous dial may end a healthy session"
+        );
+        assert!(
+            !inbound_may_replace_live_session(None),
+            "a peer with no row may end a healthy session"
+        );
+
+        // The case it was built for still works: a learned peer whose old link
+        // died silently reconnects, and refusing it would strand both ends.
+        assert!(inbound_may_replace_live_session(Some(
+            PeerSource::Exchanged
+        )));
+        assert!(inbound_may_replace_live_session(Some(
+            PeerSource::Autodiscovered
+        )));
+
+        // And the two questions are genuinely different: the rendezvous still
+        // bypasses the directional rule, because a first meeting has to be
+        // able to land at all.
+        assert!(
+            inbound_bypasses_directional(Some(PeerSource::Rendezvous)),
+            "the directional bypass was removed along with the eviction; a \
+             first meeting can then never land"
+        );
+        assert!(!inbound_bypasses_directional(Some(PeerSource::Configured)));
+
+        // Every variant is answered, so a new one cannot inherit either right.
+        for s in [
+            PeerSource::Configured,
+            PeerSource::Bootstrap,
+            PeerSource::Exchanged,
+            PeerSource::Autodiscovered,
+            PeerSource::Rendezvous,
+        ] {
+            let _ = inbound_may_replace_live_session(Some(s));
+        }
     }
 }
 
