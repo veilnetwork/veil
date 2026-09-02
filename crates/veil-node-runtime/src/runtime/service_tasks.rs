@@ -659,10 +659,78 @@ pub(crate) fn rendezvous_register_with(
 /// takes on every tick, so refusing it would break a working publisher.
 ///
 /// Returns whether the registry now holds this entry.
+/// Whether an entry can ever become an ad, checked BEFORE it takes a slot.
+///
+/// The slots are bounded and the publish tick signs what is in them, so an
+/// entry the signer will refuse costs a slot that a working publisher could
+/// have had — and costs it silently, because the refusal happens later, on a
+/// tick, in a log line nobody is reading. The registration itself answered
+/// "registered" (report20 V18-M4).
+///
+/// The bounds are the SIGNER'S, named from its own constants rather than
+/// copied as numbers, so an entry that passes here is one `sign_rendezvous_ad_v5`
+/// accepts. `now_unix == 0` means "do not judge the expiry" — the clock is not
+/// always available where this is called from, and a stale stamp is the one
+/// thing here that stops being true on its own.
+pub(crate) fn publisher_entry_is_publishable(
+    entry: &veil_anonymity::rendezvous::RendezvousPublisherEntry,
+    now_unix: u64,
+) -> Result<(), &'static str> {
+    use veil_anonymity::rendezvous::{
+        MAX_PUSH_ENVELOPE_LEN, MAX_RENDEZVOUS_KEM_PK_LEN, MAX_VALIDITY_WINDOW_SECS,
+        MAX_WAKE_HMAC_ENVELOPE_LEN, RENDEZVOUS_KEM_ALGO_X25519,
+    };
+    if entry.validity_window_secs == 0 {
+        return Err("a validity window of zero is an ad that is expired when signed");
+    }
+    if entry.validity_window_secs > MAX_VALIDITY_WINDOW_SECS {
+        return Err("validity window past the signer's cap");
+    }
+    if entry.push_envelope.len() > MAX_PUSH_ENVELOPE_LEN {
+        return Err("push envelope past the signer's cap");
+    }
+    if entry.wake_hmac_envelope.len() > MAX_WAKE_HMAC_ENVELOPE_LEN {
+        return Err("wake HMAC envelope past the signer's cap");
+    }
+    if entry.rendezvous_kem_pk.len() > MAX_RENDEZVOUS_KEM_PK_LEN {
+        return Err("relay KEM key past the signer's cap");
+    }
+    // The algorithm and the key are one fact. An algorithm with no key
+    // advertises nothing, and a key under the "no key advertised" algorithm is
+    // a key no sender will use.
+    if entry.rendezvous_kem_algo != RENDEZVOUS_KEM_ALGO_X25519 && entry.rendezvous_kem_pk.is_empty()
+    {
+        return Err("a relay KEM algorithm was named with no key to go with it");
+    }
+    // A relay key that has already expired makes `ad_valid_until` refuse the
+    // ad on every tick, for as long as the entry sits in its slot.
+    if now_unix > 0
+        && entry.rendezvous_kem_valid_until_unix > 0
+        && entry.rendezvous_kem_valid_until_unix <= now_unix
+    {
+        return Err("the relay key's stamp is already in the past");
+    }
+    Ok(())
+}
+
 pub(crate) fn insert_publisher_entry(
     entries: &mut Vec<veil_anonymity::rendezvous::RendezvousPublisherEntry>,
     entry: veil_anonymity::rendezvous::RendezvousPublisherEntry,
 ) -> bool {
+    // VALIDATED BEFORE IT TAKES ANYTHING. The slots are bounded and the publish
+    // tick signs what is in them, so an entry the signer will refuse costs a
+    // slot a working publisher could have had — and costs it silently, because
+    // the refusal happens later, on a tick, in a log line nobody reads, while
+    // the registration itself answered "registered" (report20 V18-M4).
+    //
+    // The clock is deliberately not consulted here: this runs under the
+    // registry lock on paths that have no reason to read the time, and the one
+    // check that needs it — a relay stamp already in the past — is a fact that
+    // changes on its own. The callers that hold a clock pass it.
+    if let Err(why) = publisher_entry_is_publishable(&entry, 0) {
+        log::warn!("anonymity.rendezvous_publisher: registration refused — {why}");
+        return false;
+    }
     let slots = veil_anonymity::rendezvous::MAX_RENDEZVOUS_AD_SLOTS as usize;
     if let Some(pos) = entries.iter().position(|e| {
         e.rendezvous_node_id == entry.rendezvous_node_id && e.auth_cookie == entry.auth_cookie
@@ -7620,6 +7688,107 @@ mod tests {
 
     fn production_source(file: &str) -> &str {
         file.split("#[cfg(test)]").next().unwrap_or(file)
+    }
+
+    /// report20 V18-M4: an entry that can never be published takes no slot.
+    ///
+    /// The slots are bounded and the publish tick signs what is in them, so an
+    /// entry the signer refuses costs a slot a working publisher could have
+    /// had — silently, because the refusal lands later, on a tick, in a log
+    /// line nobody reads, while the registration answered "registered".
+    #[test]
+    fn an_entry_the_signer_would_refuse_never_takes_a_slot() {
+        use veil_anonymity::rendezvous::{
+            MAX_PUSH_ENVELOPE_LEN, MAX_RENDEZVOUS_KEM_PK_LEN, MAX_VALIDITY_WINDOW_SECS,
+            MAX_WAKE_HMAC_ENVELOPE_LEN,
+        };
+        let base = || veil_anonymity::rendezvous::RendezvousPublisherEntry {
+            rendezvous_node_id: [3; 32],
+            auth_cookie: [3; 16],
+            validity_window_secs: 3600,
+            push_envelope: Vec::new(),
+            wake_hmac_envelope: Vec::new(),
+            rendezvous_kem_algo: 0,
+            rendezvous_kem_pk: Vec::new(),
+            rendezvous_kem_valid_until_unix: 0,
+            ephemeral_ad_identity: None,
+        };
+
+        // Vacuity first: the ordinary entry is admitted, or every refusal
+        // below is passing on a function that refuses everything.
+        let mut entries = Vec::new();
+        assert!(
+            insert_publisher_entry(&mut entries, base()),
+            "a publishable entry was refused"
+        );
+        assert_eq!(entries.len(), 1);
+
+        let unpublishable: Vec<(&str, veil_anonymity::rendezvous::RendezvousPublisherEntry)> = vec![
+            ("a window of zero is expired the moment it is signed", {
+                let mut e = base();
+                e.validity_window_secs = 0;
+                e
+            }),
+            ("a window past the signer's cap", {
+                let mut e = base();
+                e.validity_window_secs = MAX_VALIDITY_WINDOW_SECS + 1;
+                e
+            }),
+            ("a push envelope past the cap", {
+                let mut e = base();
+                e.push_envelope = vec![0u8; MAX_PUSH_ENVELOPE_LEN + 1];
+                e
+            }),
+            ("a wake envelope past the cap", {
+                let mut e = base();
+                e.wake_hmac_envelope = vec![0u8; MAX_WAKE_HMAC_ENVELOPE_LEN + 1];
+                e
+            }),
+            ("a relay key past the cap", {
+                let mut e = base();
+                e.rendezvous_kem_algo = 1;
+                e.rendezvous_kem_pk = vec![0u8; MAX_RENDEZVOUS_KEM_PK_LEN + 1];
+                e
+            }),
+            ("an algorithm named with no key behind it", {
+                let mut e = base();
+                e.rendezvous_kem_algo = 1;
+                e
+            }),
+        ];
+
+        for (why, entry) in unpublishable {
+            // A DIFFERENT (relay, cookie) each time, so a refusal cannot be
+            // mistaken for the replace path.
+            let mut entry = entry;
+            entry.rendezvous_node_id = [9; 32];
+            let mut fresh = Vec::new();
+            assert!(
+                !insert_publisher_entry(&mut fresh, entry),
+                "{why}: it was registered anyway"
+            );
+            assert!(fresh.is_empty(), "{why}: it took a slot anyway");
+        }
+
+        // And the clock-dependent one, which the admission does not judge
+        // because it has no clock: a relay stamp already in the past makes
+        // every tick refuse the ad.
+        let mut stale = base();
+        stale.rendezvous_kem_algo = 1;
+        stale.rendezvous_kem_pk = vec![7u8; 32];
+        stale.rendezvous_kem_valid_until_unix = 1_000;
+        assert!(
+            publisher_entry_is_publishable(&stale, 2_000).is_err(),
+            "a relay key whose stamp has passed was called publishable"
+        );
+        assert!(
+            publisher_entry_is_publishable(&stale, 0).is_ok(),
+            "with no clock offered, the stamp is not judged"
+        );
+        assert!(
+            publisher_entry_is_publishable(&stale, 500).is_ok(),
+            "a stamp still in the future is fine"
+        );
     }
 
     /// report21 V18-L1: every registration goes through the one admission.
