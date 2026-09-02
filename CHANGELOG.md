@@ -1,5 +1,32 @@
 # Changelog
 
+## v0.11.7 — 2026-09-02
+
+**A conversation's exported state never outgrows the buffer it is written
+into.**
+
+`export_state` reserved `1_300 + skipped * 68` and then wrote the session into
+it. Measured, an established session in either direction is **1 338 bytes** —
+the number this function's own documentation gives — so the buffer grew
+mid-write on every established conversation, not in some corner. A `Vec` that
+grows COPIES what it already holds into a new allocation and abandons the old
+one; by that point the old one holds the DH secret, the root key and both
+chain keys. `Zeroizing` wraps the buffer that comes back. It never wraps the
+one left behind.
+
+The size is computed exactly now, so growth is unreachable rather than
+unlikely, and an assertion keeps the arithmetic honest as fields are added.
+The guard asserts capacity equals length — the property that says no growth
+happened — and states, from a measurement rather than an argument, that the
+old reservation really was short.
+
+Two findings from the same registry were checked and NOT taken, because both
+are already closed: the rendezvous encoders validate every length against the
+caps their own decoder applies and return typed errors — there is no
+debug-only check and no panicking path — and the provisioning script stages
+its deployment PSK in a `0700 root:root` directory, splitting a `1770` corner
+for the service account, with the reasoning written out beside it.
+
 ## v0.11.6 — 2026-09-02
 
 **Every publisher registration goes through the one admission.**

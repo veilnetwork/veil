@@ -1,6 +1,6 @@
 [package]
 name = "veil-nostr"
-version = "0.11.6"
+version = "0.11.7"
 edition = "2024"
 description = "A veil meeting point on Nostr relays: the one that survives a network where UDP is gone."
 license = "AGPL-3.0-or-later"
