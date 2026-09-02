@@ -15,7 +15,19 @@ pub unsafe extern "C" fn tun2proxy_set_log_callback(
     ctx: *mut c_void,
 ) {
     *DUMP_CALLBACK.lock().unwrap() = Some(DumpCallback(callback, ctx));
+    // AND THEN WAIT for the previous one to finish.
+    //
+    // The call below runs with the registry lock RELEASED — it has to, or a
+    // callback that logs takes the lock its own caller holds (report14
+    // V14-L5) — which leaves a window where the host can unregister and free
+    // the `ctx` a thread is about to pass back to it. Returning from this
+    // setter now means no thread is still inside the old callback, so the ctx
+    // it was given is the host's to free (report20 V18-M10).
+    IN_FLIGHT.wait_for_quiet();
 }
+
+/// Threads currently inside the dump callback. See [`crate::ffi_callback`].
+static IN_FLIGHT: crate::ffi_callback::InFlight = crate::ffi_callback::InFlight::new();
 
 #[derive(Clone)]
 pub struct DumpCallback(Option<unsafe extern "C" fn(ArgVerbosity, *const c_char, *mut c_void)>, *mut c_void);
@@ -68,6 +80,9 @@ impl DumpLogger {
         // mutex its own caller is holding (report14 V14-L5).
         let cb = DUMP_CALLBACK.lock().ok().and_then(|g| g.clone());
         if let Some(cb) = cb {
+            // Counted for the whole call, so an unregister that starts now
+            // waits for this to return before it lets the host free `ctx`.
+            let _in_flight = IN_FLIGHT.enter();
             unsafe {
                 cb.call(record.level().into(), ptr);
             }

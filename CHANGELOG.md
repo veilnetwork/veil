@@ -1,5 +1,28 @@
 # Changelog
 
+## v0.11.9 — 2026-09-02
+
+**Two ways the tunnel's C boundary could be told a lie.**
+
+*Unregistering a callback waits for the call already inside it.* The call runs
+with the registry lock released — it has to, or a callback that logs takes the
+lock its own caller is holding — and that left a window: the host unregisters,
+frees the `ctx` it passed, and a thread already past the copy hands that freed
+pointer straight back to it. The setter returning is what tells a host its
+`ctx` is free, and it used to return while a call still held one. Both
+registries, the log callback and the traffic callback, now wait — skipping the
+calling thread, so a callback that installs another still does not wait for
+itself.
+
+*A finished run gives back its own slot, not whatever is in it.* The teardown
+at the end of a tunnel run cleared the run token unconditionally, and there is
+a window where what it holds belongs to somebody else: the run finishes, a stop
+takes and cancels its token, a NEW run starts and installs the next one — and
+the first run's teardown, resuming, removes it. The second tunnel then runs
+with nothing able to stop it, and `tun2proxy_stop` answers -1 for the rest of
+the process. The slot carries a generation now, and a run releases only its
+own.
+
 ## v0.11.8 — 2026-09-02
 
 **A traffic report never goes backwards.**
