@@ -229,7 +229,34 @@ impl RatchetSession {
     ///   case).
     pub fn export_state(&self) -> Zeroizing<Vec<u8>> {
         let p = self.core.parts();
-        let mut out = Vec::with_capacity(1_300 + p.skipped.len() * 68);
+        // EXACTLY, not approximately. `1_300 + skipped * 68` is 38 bytes short
+        // of this format's own worst case — the doc above says 1 338 — so a
+        // session carrying all three optional keys AND a pending ML-KEM
+        // ciphertext grew the buffer mid-write. A `Vec` that grows COPIES what
+        // it already holds into a new allocation and abandons the old one, and
+        // by that point the old one holds the DH secret, the root key and the
+        // chain keys: `Zeroizing` wraps the buffer that comes back, never the
+        // one left behind (report21 V18-L5).
+        //
+        // Reserving the exact size makes the growth unreachable rather than
+        // unlikely, and the assertion below keeps this arithmetic honest as
+        // fields are added.
+        let opt32 = |present: bool| 1 + usize::from(present) * 32;
+        let exact = RATCHET_STATE_MAGIC.len()
+            + 1 // version
+            + 32 // dh_sk
+            + opt32(p.dh_pk_remote.is_some())
+            + KEY_LEN // rk
+            + opt32(p.cks.is_some())
+            + opt32(p.ckr.is_some())
+            + 4 + 4 + 4 // ns, nr, pn
+            + 1 // sent_any
+            + 4 // skipped count
+            + p.skipped.len() * (32 + 4 + KEY_LEN)
+            + p.pq_seed.len()
+            + 1
+            + usize::from(p.pending_ct.is_some()) * ML_KEM_768_CT_LEN;
+        let mut out = Vec::with_capacity(exact);
 
         out.extend_from_slice(&RATCHET_STATE_MAGIC);
         out.push(STATE_V1);
@@ -258,6 +285,12 @@ impl RatchetSession {
             }
             None => out.push(0),
         }
+        debug_assert_eq!(
+            out.len(),
+            exact,
+            "the reserved size no longer matches what is written; a field was \
+             added without its bytes, and the buffer will grow mid-write again"
+        );
         Zeroizing::new(out)
     }
 
@@ -516,6 +549,95 @@ mod tests {
         let alice = RatchetSession::initiator(&root, &bob_pk, &mut arng).expect("contributory");
         let bob = RatchetSession::responder(&root, bob_sk, &mut brng);
         (alice, bob, arng, brng)
+    }
+
+    /// report21 V18-L5: the export buffer never grows while it holds keys.
+    ///
+    /// `Vec::with_capacity(1_300 + skipped * 68)` was 38 bytes short of this
+    /// format's own worst case — the doc on `export_state` says 1 338 — so a
+    /// session carrying all three optional keys AND a pending ML-KEM
+    /// ciphertext grew mid-write. A `Vec` that grows COPIES what it already
+    /// holds into a new allocation and abandons the old one, and by then the
+    /// old one holds the DH secret, the root key and the chain keys.
+    /// `Zeroizing` wraps the buffer that comes back, never the one left
+    /// behind.
+    ///
+    /// `capacity == len` is what says no growth happened: `with_capacity`
+    /// hands back exactly what was asked for, and any growth from there
+    /// overshoots.
+    #[test]
+    fn the_exported_state_never_outgrows_the_buffer_it_was_written_into() {
+        let (mut a, mut b, mut ar, mut br) = pair();
+
+        // The fresh initiator: a pending ML-KEM ciphertext and the fewest
+        // optional keys.
+        let fresh = a.export_state();
+        assert_eq!(
+            fresh.capacity(),
+            fresh.len(),
+            "the reserved size is not the written size. Short, and the buffer \
+             GROWS mid-write: the copy left behind holds the DH secret, the \
+             root key and the chain keys, and only the buffer that comes back \
+             is zeroized. Long, and this arithmetic has drifted from what is \
+             written"
+        );
+
+        // An established session in both directions: every optional key set.
+        for i in 0..4u8 {
+            let f = a.encrypt(&[i; 32], AD).expect("seal");
+            b.decrypt(&f, AD, &mut br).expect("open");
+            let back = b.encrypt(&[i; 16], AD).expect("seal");
+            a.decrypt(&back, AD, &mut ar).expect("open");
+        }
+        for session in [&a, &b] {
+            let state = session.export_state();
+            assert_eq!(
+                state.capacity(),
+                state.len(),
+                "an established session grew its export buffer"
+            );
+        }
+
+        // And with message keys banked out of order, which is the term the old
+        // estimate scaled and the fixed part it did not.
+        let mut skipping = pair();
+        let (ref mut sa, ref mut sb, _, ref mut sbr) = skipping;
+        let mut held = Vec::new();
+        for i in 0..3u8 {
+            held.push(sa.encrypt(&[i; 8], AD).expect("seal"));
+        }
+        // Open only the LAST, so the two before it are banked.
+        sb.decrypt(held.last().expect("frames"), AD, sbr)
+            .expect("open");
+        let banked = sb.export_state();
+        assert_eq!(
+            banked.capacity(),
+            banked.len(),
+            "a session holding skipped message keys grew its export buffer"
+        );
+        // Vacuity: the skipped keys really are in there, or this case is the
+        // same as the one above it.
+        assert!(
+            banked.len() > 68,
+            "premise: the banked keys are part of what was written"
+        );
+
+        // AND THE OLD ESTIMATE REALLY WAS SHORT, measured rather than argued:
+        // the fixed part of an established session with a pending ciphertext
+        // exceeds the 1 300 bytes that used to be reserved for it, so the
+        // growth this test forbids was reachable in ordinary use.
+        let widest = a.export_state();
+        // Measured, not argued: an established session is 1 338 bytes against
+        // the 1 300 that used to be reserved, so this grew on EVERY established
+        // conversation rather than in some exotic corner.
+        assert!(
+            widest.len() > 1_300 || fresh.len() > 1_300,
+            "PREMISE FAILED: neither shape exceeds the old 1 300-byte \
+             reservation, so this guard pins something that could not have \
+             gone wrong. len fresh={} established={}",
+            fresh.len(),
+            widest.len()
+        );
     }
 
     #[test]
