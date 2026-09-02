@@ -149,6 +149,27 @@ pub enum ResolveStage {
     RegistryUnresolved,
 }
 
+/// Whether a cached certificate is still one this node may seal to.
+///
+/// TWO CLOCKS, and only one of them was consulted. The cache TTL says how long
+/// ago this row was verified; `valid_until_unix` is what the OWNER signed, and
+/// it is the half that says whether the key is still theirs. A certificate
+/// expiring in a minute entered the cache and was then used to seal for the
+/// remaining twenty-nine of the TTL -- to a key its owner had already stopped
+/// standing behind.
+///
+/// Both, therefore: recently verified AND not past its signed life. The store
+/// applies the same rule when it prunes rows (`valid_until_unix >= now`), so
+/// this is the read path catching up with the one beside it.
+fn cert_is_still_usable(
+    cert: &VerifiedMlkemCert,
+    cached_at: &std::time::Instant,
+    ttl: std::time::Duration,
+    now_unix: u64,
+) -> bool {
+    cached_at.elapsed() < ttl && cert.valid_until_unix >= now_unix
+}
+
 impl ResolvedCerts {
     /// One resolved certificate — the shape the caller that already holds a
     /// cert needs to speak the same language as a fan-out.
@@ -468,8 +489,12 @@ impl DhtMlKemEkResolver {
         // (which walked the DHT on *every* seal) fast + resilient to a
         // transient DHT miss, since a live encrypt to the same peer will
         // have warmed this cache moments earlier.
+        let now_for_cache = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
         if let Some((cert, ts)) = rlock!(self.cert_cache).get(&target_node_id)
-            && ts.elapsed() < self.cert_ttl
+            && cert_is_still_usable(cert, ts, self.cert_ttl, now_for_cache)
         {
             let cert = cert.clone();
             self.log_dbg("mlkem_resolver.cert.cache_hit", &target_node_id, "");
@@ -1372,7 +1397,7 @@ impl DhtMlKemEkResolver {
             .as_secs();
 
         if let Some((cert, ts)) = rlock!(self.cert_cache).get(&target_node_id)
-            && ts.elapsed() < self.cert_ttl
+            && cert_is_still_usable(cert, ts, self.cert_ttl, now_unix)
         {
             let cert = cert.clone();
             self.publish_ratchet_key(target_node_id, &cert);
@@ -1624,6 +1649,50 @@ fn registry_freshness(r: &InstanceRegistry) -> (u64, u64) {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_cached_certificate_expires_when_its_owner_said_it_would() {
+        use std::time::{Duration, Instant};
+        // Two clocks, and only the local one was consulted. The TTL says how
+        // long ago this row was verified; `valid_until_unix` is what the OWNER
+        // signed. A certificate expiring in a minute entered the cache and was
+        // then sealed to for the remaining twenty-nine of the TTL -- to a key
+        // its owner had already stopped standing behind.
+        let ttl = Duration::from_secs(30 * 60);
+        let now: u64 = 1_700_000_000;
+        let fresh = Instant::now();
+
+        let mut cert = VerifiedMlkemCert {
+            node_id: [1u8; 32],
+            instance_id: [2u8; 16],
+            mlkem_algo: 1,
+            mlkem_pubkey: vec![3u8; 8],
+            ratchet_x25519_pubkey: [4u8; 32],
+            cert_version: 1,
+            valid_until_unix: now + 600,
+        };
+        assert!(
+            super::cert_is_still_usable(&cert, &fresh, ttl, now),
+            "a recently verified certificate inside its signed life was refused"
+        );
+
+        cert.valid_until_unix = now - 1;
+        assert!(
+            !super::cert_is_still_usable(&cert, &fresh, ttl, now),
+            "a certificate past the life its owner signed was still sealed to, \
+             because only the cache TTL was checked"
+        );
+
+        // The TTL still counts on its own: a row verified long ago is stale
+        // even while the signature says the key lives on.
+        cert.valid_until_unix = now + 86_400;
+        let old = Instant::now() - Duration::from_secs(31 * 60);
+        assert!(!super::cert_is_still_usable(&cert, &old, ttl, now));
+
+        // The boundary is inclusive, matching the store's own prune rule.
+        cert.valid_until_unix = now;
+        assert!(super::cert_is_still_usable(&cert, &fresh, ttl, now));
+    }
     use super::*;
 
     /// A peer that opted out of DHT work must not be asked to carry a query.
