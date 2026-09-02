@@ -374,7 +374,16 @@ impl PendingPeerState {
             {
                 cache.remove(&oldest);
             }
-            cache.insert(peer_id, (ek.clone(), std::time::Instant::now()));
+            // No certificate window on an ATTACH key either — the TTL is the
+            // whole of its life, and recording that keeps it apart from a key
+            // an owner actually dated (report20 V18-M12).
+            cache.insert(
+                peer_id,
+                (
+                    veil_e2e::PeerMlKemKey::unattested(ek.clone()),
+                    std::time::Instant::now(),
+                ),
+            );
         }
         // Update peer battery level from ATTACH TLV.
         if let Some(bat) = self.battery {

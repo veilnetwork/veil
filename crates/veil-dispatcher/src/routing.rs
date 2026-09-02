@@ -770,8 +770,17 @@ impl FrameDispatcher {
             if let Some(ref ek) = p.mlkem_pubkey
                 && ek.len() == veil_e2e::EK_BYTES
             {
-                wlock!(self.crypto.peer_mlkem_keys)
-                    .insert(p.target_node_id, (ek.clone(), Instant::now()));
+                // Signed by the target, but a `RouteResponse` carries no
+                // certificate window — so this key is bounded by the cache
+                // TTL and says so, rather than passing for one nobody has
+                // put an end date on (report20 V18-M12).
+                wlock!(self.crypto.peer_mlkem_keys).insert(
+                    p.target_node_id,
+                    (
+                        veil_e2e::PeerMlKemKey::unattested(ek.clone()),
+                        Instant::now(),
+                    ),
+                );
             }
             // Wake up any IPC send that is waiting for this route.
             self.route_updated.notify_waiters();

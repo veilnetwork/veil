@@ -1,5 +1,35 @@
 # Changelog
 
+## v0.11.12 — 2026-09-02
+
+**A certificate stops being sealed to when its owner says it does.**
+
+Two clocks decide whether a peer's key may still be used: how long ago this
+node verified the row, and the window the OWNER signed on it. The second was
+consulted on two of the four cache branches — and not on the two the ordinary
+send path actually takes. Whenever a live session names which device of a
+recipient's family a message is for, the send prefers the per-device caches,
+and those tested the local read age alone. So a message went out sealed to a
+certificate whose owner had stopped standing behind it, by up to a full cache
+lifetime, to a key a retired device may still hold (report20 V18-M12).
+
+Both per-device branches now ask both clocks, on the synchronous path and the
+asynchronous one alike. The raw encapsulation-key cache carries the signed
+window with the key rather than the key alone, so a read past it is a miss and
+a miss walks the directory for a current certificate; keys learned from a route
+answer, an ATTACH or a session rekey carry no such window and say so, instead
+of passing for keys nobody put an end date on. The maintenance sweep drops them
+on either clock.
+
+**And the seal itself refuses.** Every one of those caches has its own idea of
+freshness, and one of them was wrong for months while a unit test on the helper
+they were meant to call stayed green. The refusal now sits where every caller
+passes: before the lock, before anything is derived or written, so the
+conversation is untouched and a send under a renewed certificate finds the
+state it left. The boundary is the second the owner signed for, inclusive — a
+check one second early would drop live traffic at every rotation — and each
+half was broken in turn and the tests went red for each.
+
 ## v0.11.11 — 2026-09-02
 
 **A rendezvous registration has an identity of its own.**

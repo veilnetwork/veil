@@ -160,9 +160,10 @@ impl RoutedFrameBroadcaster {
         // A routed proxy frame is never allowed to fall back to plaintext.
         // Route discovery responses populate this cache with the recipient's
         // signed ML-KEM key; until then the caller retries the APP_OPEN.
+        let now_unix = veil_util::unix_secs_now_u64();
         let recipient_ek = rlock!(self.dispatcher.crypto.peer_mlkem_keys)
             .get(destination)
-            .map(|(key, _)| key.clone());
+            .and_then(|(key, _)| key.usable_at(now_unix).map(<[u8]>::to_vec));
         let Some(recipient_ek) = recipient_ek else {
             // Route discovery carries the next hop, but it does not by itself
             // populate the recipient's verified ML-KEM key. Start the same DHT
