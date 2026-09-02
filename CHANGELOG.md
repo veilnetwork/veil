@@ -1,5 +1,36 @@
 # Changelog
 
+## v0.11.1 — 2026-09-02
+
+Three from the report20 registry, each checked against the code first.
+
+**A camera could read past the end of a sample.** The NV12 path proved the
+luma plane fitted in the buffer and then handed `NV12ToI420` a chroma pointer
+whose length it had never checked, so a short sample was read `stride * h/2`
+bytes past the end. The YUY2 and RGB32 arms beside it always required their
+whole plane, which is what makes this an oversight rather than a decision --
+and the sample comes from a driver, which is not a place to take lengths on
+trust.
+
+**Thirty-two stalls at any point in a process forbade every tunnel
+afterwards.** The counter that gated new packet tunnels only ever grew: a
+thread stranded in a blocking read that returned an hour later still counted
+against the limit for the life of the app. What is parked now and what was
+ever parked are two different numbers; the gate reads the first, the FFI
+metric keeps reporting the second, exactly as its own documentation promises.
+
+**The Nostr relay list has been re-measured.** `relay.nostr.band` timed out on
+every attempt for a day, from this client and from `curl` alike -- a relay
+that never answers spends the pass's budget and returns nothing, so it is
+dropped. Three that do answer are added, and all seven were verified live:
+each accepted a published event and gave it back.
+
+Also, the resets from `relay.damus.io` and `relay.primal.net` this project has
+been logging are not a fault on this side. Both sit behind a CDN that answers
+with a reset or a 503 when the relay's own origin is unwell; a plain TLS
+handshake to them succeeds, and on re-measurement both accepted and returned
+events. Nothing was changed for them.
+
 ## v0.11.0 — 2026-09-02
 
 **Both meeting points now speak IPv6.** Neither did, and neither said so.
