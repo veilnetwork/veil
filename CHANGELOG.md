@@ -1,5 +1,34 @@
 # Changelog
 
+## v0.10.6 — 2026-09-02
+
+**An inbound connection could end a session that was working.** Two different
+questions had one answer: whether an inbound may bypass the directional rule,
+and whether it may take the place of a session that is still open. The second
+was derived from the first, which is a NEGATIVE list — so every peer source
+added after that list was written inherited, silently, the right to displace a
+live session. `PeerSource::Rendezvous` arrived that way.
+
+The eviction exists for a real case, and keeps it: a learned peer whose old
+link died without either side noticing reconnects, and refusing it would strand
+both until a reaper notices. The registry calls its victim "open-but-likely-
+zombie", and *likely* is the whole of the evidence — nothing checks.
+
+A rendezvous dial is not that case. It arrives on a schedule, and arriving
+while we hold a healthy session is proof the peer did not abandon the old
+connection. It cost one every time: the far side refuses its own duplicate and
+closes the socket, so the newcomer that just displaced a live sender was dead
+on arrival and both connections were gone. That is the mechanism behind the
+session losses 0.10.5 measured and could not explain.
+
+The two questions are now asked separately, and the answer is an exhaustive
+match: a source added later must say which of the two rights it wants rather
+than inherit either.
+
+Found by an external review of 0.10.5, and confirmed here against the registry,
+which states the rule it was breaking: "Don't replace a live policy-compliant
+session — the first to register wins for that direction."
+
 ## v0.10.5 — 2026-09-02
 
 **Both ends of a pair were calling each other.** For any two nodes exactly one
