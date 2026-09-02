@@ -542,29 +542,27 @@ pub fn encode_message(message: &Message) -> Vec<u8> {
                             .map(|p| Value::Bytes(compact_peer_entry(p)))
                             .collect(),
                     );
-                    let (flat, _flat6) = compact_node_strings(nodes);
-                    // `values` is written only when there are peers, and
-                    // `nodes` only when there are nodes -- an empty list of
-                    // either is a key a real client does not send.
-                    match (nodes.is_empty(), peers.is_empty()) {
-                        (true, true) => dict([(b"id", bytes(id.0)), (b"token", bytes(token))]),
-                        (true, false) => dict([
-                            (b"id", bytes(id.0)),
-                            (b"token", bytes(token)),
-                            (b"values", values),
-                        ]),
-                        (false, true) => dict([
-                            (b"id", bytes(id.0)),
-                            (b"nodes", Value::Bytes(flat)),
-                            (b"token", bytes(token)),
-                        ]),
-                        (false, false) => dict([
-                            (b"id", bytes(id.0)),
-                            (b"nodes", Value::Bytes(flat)),
-                            (b"token", bytes(token)),
-                            (b"values", values),
-                        ]),
+                    // BOTH families. The v6 half was computed and dropped, so
+                    // this encoder answered a `want: n6` query by silently
+                    // losing every v6 node it had been given -- the `Nodes`
+                    // arm two matches up writes both (report21 V21-L2).
+                    let (flat, flat6) = compact_node_strings(nodes);
+                    // Keys are written only when they carry something: an
+                    // empty `values`, `nodes` or `nodes6` is a key a real
+                    // client does not send.
+                    let mut fields: Vec<(&[u8], Value)> = Vec::with_capacity(5);
+                    fields.push((b"id", bytes(id.0)));
+                    if !flat.is_empty() {
+                        fields.push((b"nodes", Value::Bytes(flat)));
                     }
+                    if !flat6.is_empty() {
+                        fields.push((b"nodes6", Value::Bytes(flat6)));
+                    }
+                    fields.push((b"token", bytes(token)));
+                    if !peers.is_empty() {
+                        fields.push((b"values", values));
+                    }
+                    crate::bencode::dict_of(fields)
                 }
             };
             dict([(b"r", r), (b"t", bytes(transaction)), (b"y", bytes("r"))])
@@ -656,6 +654,64 @@ mod tests {
             panic!("not a peers response");
         };
         assert_eq!(peers, vec![v4, v6], "a mixed values list did not survive");
+
+        // AND A PEERS RESPONSE CARRIES ITS v6 NODES. The v6 half was computed
+        // and dropped here, so an answer to `want: n6` lost every v6 contact
+        // it had been given while the `Nodes` response two arms up wrote both
+        // (report21 V21-L2).
+        let n4 = NodeInfo {
+            id: NodeId([1u8; 20]),
+            addr: v4,
+        };
+        let n6 = NodeInfo {
+            id: NodeId([2u8; 20]),
+            addr: v6,
+        };
+        for (label, given) in [
+            ("both families", vec![n4, n6]),
+            ("v6 only", vec![n6]),
+            ("v4 only", vec![n4]),
+        ] {
+            let wire = encode_message(&Message::Response {
+                transaction: b"cc".to_vec(),
+                response: Response::Peers {
+                    id: NodeId([9u8; 20]),
+                    token: b"t".to_vec(),
+                    peers: vec![v4],
+                    nodes: given.clone(),
+                },
+            });
+            let Message::Response {
+                response: Response::Peers { nodes, peers, .. },
+                ..
+            } = decode_message(&wire).expect("decodes")
+            else {
+                panic!("not a peers response");
+            };
+            for want in &given {
+                assert!(
+                    nodes.iter().any(|n| n.addr == want.addr),
+                    "{label}: {} was dropped by the encoder",
+                    want.addr
+                );
+            }
+            assert_eq!(peers, vec![v4], "{label}: the values list changed");
+        }
+
+        // An empty node list still writes no `nodes` key at all.
+        let wire = encode_message(&Message::Response {
+            transaction: b"dd".to_vec(),
+            response: Response::Peers {
+                id: NodeId([9u8; 20]),
+                token: b"t".to_vec(),
+                peers: vec![v4],
+                nodes: Vec::new(),
+            },
+        });
+        assert!(
+            !String::from_utf8_lossy(&wire).contains("5:nodes"),
+            "an empty nodes key was written, which a real client does not send"
+        );
 
         // Sizes are the BEP's, not ours.
         assert_eq!(COMPACT_NODE6_LEN, 38);

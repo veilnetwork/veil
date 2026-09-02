@@ -1,6 +1,6 @@
 [package]
 name = "veil-mainline"
-version = "0.11.3"
+version = "0.11.4"
 edition = "2024"
 description = "Client for BitTorrent's Mainline DHT (BEP 5): a permissionless rendezvous nobody operates, used as a veil bootstrap layer."
 license = "AGPL-3.0-or-later"
@@ -9,7 +9,7 @@ license = "AGPL-3.0-or-later"
 blake3 = "1.5"
 log = "0.4"
 rand_core = { version = "0.6", features = ["getrandom"] }
-tokio = { version = "1.42", features = ["net", "rt", "time", "macros"] }
+tokio = { version = "1.42", features = ["net", "rt", "sync", "time", "macros"] }
 
 [dev-dependencies]
 

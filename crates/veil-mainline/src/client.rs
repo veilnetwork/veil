@@ -60,6 +60,16 @@ pub struct Client {
     /// and not a failure: the v4 half works on its own, as it always did.
     socket6: Option<UdpSocket>,
     id: NodeId,
+    /// One query at a time per socket.
+    ///
+    /// A query owns its socket for the length of its own window: it sends,
+    /// then reads until a datagram carrying ITS transaction id arrives.
+    /// Anything else is dropped on the floor — including, with two queries in
+    /// flight on one socket, the other one's answer, which then times out
+    /// having actually been replied to. The runtime asks sequentially today,
+    /// so this changes nothing it does; it is what stops a second caller from
+    /// being a bug rather than a slowdown (report21 V21-L1).
+    turn: tokio::sync::Mutex<()>,
 }
 
 impl Client {
@@ -75,6 +85,7 @@ impl Client {
             socket: UdpSocket::bind("0.0.0.0:0").await?,
             socket6,
             id,
+            turn: tokio::sync::Mutex::new(()),
         })
     }
 
@@ -128,6 +139,10 @@ impl Client {
                 "no socket of that address family on this host",
             ))
         })?;
+        // Held across the send AND the read: the window in which a datagram
+        // for somebody else's transaction would be thrown away is exactly the
+        // window in which this one is reading.
+        let _turn = self.turn.lock().await;
         socket.send_to(&wire, to).await.map_err(QueryError::Io)?;
 
         let deadline = tokio::time::Instant::now() + timeout;

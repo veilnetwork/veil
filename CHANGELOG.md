@@ -1,5 +1,59 @@
 # Changelog
 
+## v0.11.4 — 2026-09-02
+
+**The meeting points, read as a stranger would write them.**
+
+*A v4 address wearing a v6 coat is a v4 address.* `::ffff:127.0.0.1` is not
+`Ipv6Addr::is_loopback` — only `::1` is — and none of the v6 rules looked at
+the octets a mapped address carries. So every private, loopback and
+metadata-endpoint refusal this node makes could be stepped around by writing
+the address the other way. There is one predicate for "somebody's inside" now,
+it normalises first, and both the DHT ingress and the dial path ask it.
+
+*And it is asked ON INGRESS.* A lookup checked only that an address had a port
+and was not unspecified, then sent it a KRPC datagram in the next round: a
+responder could have this host probe its own network on its behalf. Its peer
+list was not checked at all until the caller got it, so a hostile first answer
+filled all sixty-four peer slots with addresses that would be thrown away and
+an honest node answering later had nowhere to be recorded.
+
+*Local discovery listens on both families, and announces on each
+independently.* The v6 socket was bound, joined to its group and sent on — and
+never read, so a neighbour on a segment with no IPv4 announced into silence.
+On that same segment the v4 send failed first and returned, so the v6 announce
+was never even composed.
+
+*A node with nothing to announce still listens.* Having no advertisable
+listener, or an identity key the LAN payload cannot carry, ended the whole task
+before the socket was bound — the opposite of this layer's own rule that a node
+which does not publish still asks and listens.
+
+*What a node publishes about itself is public, and readable.* The helper
+refused only "unspecified or loopback", so a listener on `192.168.1.5` was
+posted to seven public relays. And it strips the brackets from a v6 literal, so
+`{host}:{port}` produced `2001:db8::1:5556`, whose last colon belongs to the
+address: every receiver split it in the wrong place.
+
+*A rendezvous slot is claimed on terms the caller can see.* Taking a slot back
+from a row that never learned who was there was indistinguishable from finding
+a row that already held the address, so nothing replaced it: the dial went to
+the previous tenant's URI, and whoever answered THAT was written down beside
+the address we meant to call. And the rollback removed the row by number, so a
+dial that failed could delete a proven peer the other pass had just written
+into the same slot while ours was waiting.
+
+*A `get_peers` response carries its IPv6 nodes.* The v6 half was computed and
+dropped, so an answer to `want: n6` lost every v6 contact it had been given —
+while the `nodes` response two arms above wrote both.
+
+*One query at a time per socket.* A query owns its socket for its own window:
+it reads until a datagram carrying ITS transaction id arrives and drops the
+rest — including, with two in flight, the other one's answer, which then times
+out having actually been replied to. The runtime asks sequentially, so this
+changes nothing it does; it stops a second caller from being a bug. `ALPHA`
+now says what the loop does rather than what it was going to do.
+
 ## v0.11.3 — 2026-09-02
 
 **Eight defects out of the standing audit registry, all in the housekeeping
