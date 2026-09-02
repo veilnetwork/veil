@@ -600,10 +600,22 @@ pub mod rocks {
             let mut count = 0usize;
             let mut summed = 0u64;
             let (mut orphans, mut adopted, mut dangling, mut relengths) = (0usize, 0, 0, 0);
+            // EVERY repair below is a DELETE decided by a read. A read that
+            // failed is not an answer, and folding one into "the value is not
+            // there" takes the index away from a value that is perfectly alive
+            // — after which nothing counts it, nothing evicts it, and only the
+            // next successful open notices (report21 V21-L3). One unreadable
+            // row therefore abandons the whole repair: nothing is written, the
+            // tier stays as it was, and the next open tries again. The seed
+            // numbers are still returned so the tier opens.
+            let mut readable = true;
 
             // Pass 1 — reverse map against the values.
             for item in db.iterator_cf(cf_kt, rocksdb::IteratorMode::Start) {
-                let Ok((k, kt)) = item else { break };
+                let Ok((k, kt)) = item else {
+                    readable = false;
+                    break;
+                };
                 let Ok(key) = <[u8; 32]>::try_from(k.as_ref()) else {
                     batch.delete_cf(cf_kt, &k);
                     continue;
@@ -613,6 +625,10 @@ pub mod rocks {
                     .and_then(|s| <[u8; 8]>::try_from(s).ok())
                     .map(u64::from_be_bytes);
                 match db.get_pinned(key) {
+                    Err(_) => {
+                        readable = false;
+                        break;
+                    }
                     Ok(Some(value)) => {
                         let actual = value.len() as u64;
                         count += 1;
@@ -629,7 +645,7 @@ pub mod rocks {
                             relengths += 1;
                         }
                     }
-                    _ => {
+                    Ok(None) => {
                         if let Some(ts) = ts {
                             batch.delete_cf(cf_ix, Self::ix_key(ts, &key));
                         }
@@ -645,12 +661,24 @@ pub mod rocks {
             // this iteration does not produce.
             let now = Self::now_secs();
             for item in db.iterator(rocksdb::IteratorMode::Start) {
-                let Ok((k, value)) = item else { break };
+                if !readable {
+                    break;
+                }
+                let Ok((k, value)) = item else {
+                    readable = false;
+                    break;
+                };
                 let Ok(key) = <[u8; 32]>::try_from(k.as_ref()) else {
                     continue;
                 };
-                if matches!(db.get_pinned_cf(cf_kt, key), Ok(Some(_))) {
-                    continue; // already accounted for in pass 1
+                match db.get_pinned_cf(cf_kt, key) {
+                    // Already accounted for in pass 1.
+                    Ok(Some(_)) => continue,
+                    Ok(None) => {}
+                    Err(_) => {
+                        readable = false;
+                        break;
+                    }
                 }
                 let len = value.len() as u64;
                 batch.put_cf(cf_kt, key, Self::kt_value(now, len));
@@ -664,15 +692,28 @@ pub mod rocks {
             // adopted in pass 2 are still only in the batch, so they are not
             // seen here and cannot be mistaken for dangling.
             for item in db.iterator_cf(cf_ix, rocksdb::IteratorMode::Start) {
-                let Ok((ix, _)) = item else { break };
-                let vouched = <[u8; 32]>::try_from(ix.get(8..40).unwrap_or_default())
-                    .ok()
-                    .is_some_and(|key| match db.get_pinned_cf(cf_kt, key) {
+                if !readable {
+                    break;
+                }
+                let Ok((ix, _)) = item else {
+                    readable = false;
+                    break;
+                };
+                let vouched = match <[u8; 32]>::try_from(ix.get(8..40).unwrap_or_default()) {
+                    // A row too short to name a key vouches for nothing and is
+                    // a leftover by its shape alone.
+                    Err(_) => false,
+                    Ok(key) => match db.get_pinned_cf(cf_kt, key) {
                         // The ts prefix must agree, or this row is a leftover
                         // from an overwrite whose delete never landed.
                         Ok(Some(kt)) => kt.get(..8) == ix.get(..8),
-                        _ => false,
-                    });
+                        Ok(None) => false,
+                        Err(_) => {
+                            readable = false;
+                            break;
+                        }
+                    },
+                };
                 if !vouched {
                     batch.delete_cf(cf_ix, &ix);
                     dangling += 1;
@@ -680,6 +721,12 @@ pub mod rocks {
             }
 
             let repairs = orphans + adopted + dangling + relengths;
+            if !readable {
+                log::error!(
+                    "dht.cold.rocksdb: the cold tier could not be read to the end on open;                      {repairs} staged repair(s) DISCARDED rather than applied on a partial                      picture, and the next open will try again"
+                );
+                return (count, summed);
+            }
             if repairs > 0 {
                 if let Err(e) = db.write(batch) {
                     log::error!(
@@ -754,8 +801,16 @@ pub mod rocks {
         /// unindexed while one row survived. Its four callers now fold it into
         /// the same `WriteBatch` as the value write/delete, which is what makes
         /// a logical operation all-or-nothing.
-        fn stage_unindex(&self, batch: &mut rocksdb::WriteBatch, key: &[u8; 32]) -> bool {
-            if let Ok(Some(old_kt)) = self.db.get_cf(self.cf_kt(), key) {
+        fn stage_unindex(
+            &self,
+            batch: &mut rocksdb::WriteBatch,
+            key: &[u8; 32],
+        ) -> Result<bool, rocksdb::Error> {
+            // `Err` IS NOT `None`. A read that failed says nothing about
+            // whether this key is indexed, and folding it into "it is not"
+            // told the caller to count a fresh entry over an existing one and
+            // left the stale ts-index row behind (report21 V21-L3).
+            if let Some(old_kt) = self.db.get_cf(self.cf_kt(), key)? {
                 // Value is `ts(8)` (legacy v1) or `ts(8)‖len(8)` (v2); the ts
                 // prefix is what locates the stale ts-index entry.
                 if old_kt.len() >= 8 {
@@ -765,9 +820,9 @@ pub mod rocks {
                     batch.delete_cf(self.cf_ix(), Self::ix_key(old_ts, key));
                 }
                 batch.delete_cf(self.cf_kt(), key);
-                true
+                Ok(true)
             } else {
-                false
+                Ok(false)
             }
         }
 
@@ -798,12 +853,16 @@ pub mod rocks {
         /// Unique-key churn holds the logical entry count at N while two
         /// column families nothing counts and nothing sweeps grow without
         /// bound (report17 V17-M2).
-        fn stage_full_delete(&self, batch: &mut rocksdb::WriteBatch, key: &[u8; 32]) -> bool {
-            let was_indexed = self.stage_unindex(batch, key);
+        fn stage_full_delete(
+            &self,
+            batch: &mut rocksdb::WriteBatch,
+            key: &[u8; 32],
+        ) -> Result<bool, rocksdb::Error> {
+            let was_indexed = self.stage_unindex(batch, key)?;
             batch.delete(key);
             batch.delete_cf(self.cf_origin(), key);
             batch.delete_cf(self.cf_first_seen(), key);
-            was_indexed
+            Ok(was_indexed)
         }
 
         /// Pick the oldest live entry and stage its removal into `batch`,
@@ -838,18 +897,38 @@ pub mod rocks {
                 .db
                 .iterator_cf(self.cf_ix(), rocksdb::IteratorMode::Start)
             {
-                let Ok((ix_key, _)) = item else { break };
+                // A READ THAT FAILED IS NOT AN ANSWER. Every branch below acts
+                // on "the value is not there" by DELETING this row, and a
+                // transient I/O error folded into that verdict took the index
+                // away from a value that was perfectly alive — after which
+                // nothing counts it, nothing evicts it, and only the next
+                // successful reconciliation notices (report21 V21-L3). On any
+                // error the scan stops and repairs nothing: eviction is
+                // best-effort and the next call retries.
+                let Ok((ix_key, _)) = item else {
+                    log::warn!(
+                        "dht.cold.rocksdb: the ts-index could not be read to the end;                          evicting nothing this pass"
+                    );
+                    return None;
+                };
                 // Row layout is `ts_be(8) ‖ key(32)`; a short row is corrupt
                 // and is treated exactly like a dangling one.
-                let live = <[u8; 32]>::try_from(ix_key.get(8..40).unwrap_or_default())
-                    .ok()
-                    .and_then(|key| self.db.get(key).ok().flatten().map(|v| (key, v)));
-                match live {
-                    Some((key, value)) => {
+                let Ok(key) = <[u8; 32]>::try_from(ix_key.get(8..40).unwrap_or_default()) else {
+                    dangling.push(ix_key);
+                    continue;
+                };
+                match self.db.get(key) {
+                    Ok(Some(value)) => {
                         victim = Some((ix_key, key, value));
                         break;
                     }
-                    None => dangling.push(ix_key),
+                    Ok(None) => dangling.push(ix_key),
+                    Err(e) => {
+                        log::warn!(
+                            "dht.cold.rocksdb: a value could not be read while choosing an                              eviction ({e}); evicting nothing this pass"
+                        );
+                        return None;
+                    }
                 }
             }
             // Drop every dangling row walked past, so the next call does not
@@ -870,7 +949,15 @@ pub mod rocks {
             // eviction that dropped the value and kept the entry's origin and
             // first-seen stamp is how two uncounted column families grew
             // without bound under churn (report17 V17-M2).
-            let was_indexed = self.stage_full_delete(batch, &key);
+            let was_indexed = match self.stage_full_delete(batch, &key) {
+                Ok(indexed) => indexed,
+                Err(e) => {
+                    log::warn!(
+                        "dht.cold.rocksdb: an eviction could not be staged ({e});                          evicting nothing this pass"
+                    );
+                    return None;
+                }
+            };
             // Delete THIS row directly as well: `stage_unindex` reaches the
             // ts-index through the reverse map's ts, so a missing or drifted
             // reverse map would otherwise leave the row behind as a fresh
@@ -886,7 +973,16 @@ pub mod rocks {
         /// that is still on disk.
         fn delete_entry(&mut self, key: &[u8; 32]) -> bool {
             let mut batch = rocksdb::WriteBatch::default();
-            let was_indexed = self.stage_full_delete(&mut batch, key);
+            let was_indexed = match self.stage_full_delete(&mut batch, key) {
+                Ok(indexed) => indexed,
+                Err(e) => {
+                    // The delete is not staged completely, so it is not made
+                    // at all: a half-delete is the torn state reconciliation
+                    // exists to repair.
+                    log::warn!("dht.cold.rocksdb: entry delete could not be staged: {e}");
+                    return false;
+                }
+            };
             if let Err(e) = self.write_batch(batch) {
                 log::warn!("dht.cold.rocksdb: entry delete failed: {e}");
                 return false;
@@ -1006,10 +1102,11 @@ pub mod rocks {
             let mut batch = rocksdb::WriteBatch::default();
             let mut evicted: Option<([u8; 32], Vec<u8>)> = None;
             let mut evicted_was_indexed = false;
-            if self.capacity > 0
-                && self.count >= self.capacity
-                && !matches!(self.db.get_cf(self.cf_kt(), key), Ok(Some(_)))
-            {
+            // `Ok(None)` alone means "this key is new". An `Err` says nothing,
+            // and reading it as "new" makes room by evicting somebody for an
+            // entry that may be a plain overwrite.
+            let key_is_new = matches!(self.db.get_cf(self.cf_kt(), key), Ok(None));
+            if self.capacity > 0 && self.count >= self.capacity && key_is_new {
                 // The `victim != key` arm: staged deletes for the very key
                 // being written would be overwritten by the puts below — the
                 // entry would still be there, so reporting it evicted would
@@ -1040,7 +1137,19 @@ pub mod rocks {
             // Drop any stale (old_ts, key) row first. Same batch, applied in
             // insertion order, so an overwrite within the same wall-clock
             // second still ends with the fresh rows rather than deleting them.
-            let was_indexed = self.stage_unindex(&mut batch, &key);
+            let was_indexed = match self.stage_unindex(&mut batch, &key) {
+                Ok(indexed) => indexed,
+                Err(e) => {
+                    // Whether this key is already indexed decides both the
+                    // stale rows to drop and the direction the count moves.
+                    // Guessing "it is not" writes a fresh entry over an
+                    // existing one and leaves its old ts-index row behind, so
+                    // the value goes BACK to the caller instead (report21
+                    // V21-L3).
+                    log::warn!("dht.cold.rocksdb: put failed ({e}); not stored");
+                    return ColdPut::Failed(value);
+                }
+            };
             batch.put(key, &value);
             batch.put_cf(self.cf_kt(), key, Self::kt_value(ts, byte_len));
             batch.put_cf(self.cf_ix(), Self::ix_key(ts, &key), []);
@@ -3687,6 +3796,83 @@ mod tests {
             "the adopted ghost is evictable now"
         );
         assert_eq!(cold.len(), 0);
+    }
+
+    /// report21 V21-L3: a read that FAILED is not a read that said "absent".
+    ///
+    /// Every repair in this tier is a DELETE decided by a read — an orphan, a
+    /// dangling row, a victim to evict — and each of them folded an I/O error
+    /// into "the value is not there". One transient failure therefore took the
+    /// index away from a value that was perfectly alive: nothing counts it,
+    /// nothing evicts it, the byte and entry caps stop seeing it, and only the
+    /// next successful open notices.
+    ///
+    /// The absence side is covered by the tests around this one, which plant
+    /// real orphans and real danglers and require them repaired. What cannot
+    /// be reached from a test is the ERROR side: RocksDB has no supported way
+    /// to make a read fail on demand, and a fixture that corrupted an SST
+    /// would fail the open rather than the read. So this asserts the shape
+    /// that keeps the two apart.
+    #[cfg(feature = "rocksdb-cold")]
+    #[test]
+    fn a_read_that_failed_is_not_a_value_that_is_gone() {
+        let src = include_str!("store.rs");
+        let rocks = src
+            .split("pub mod rocks {")
+            .nth(1)
+            .and_then(|t| t.split("\n#[cfg(test)]").next())
+            .expect("the rocksdb backend");
+
+        // The staging helpers hand the error back rather than answering with
+        // a bool that cannot tell the two apart.
+        assert!(
+            rocks.contains("        ) -> Result<bool, rocksdb::Error> {"),
+            "a staging helper answers a failed read with a bool again, so the \
+             caller cannot tell 'not indexed' from 'could not look'"
+        );
+
+        // Reconciliation keeps a verdict on whether it saw the whole tier, and
+        // discards its repairs when it did not.
+        assert!(
+            rocks.contains("let mut readable = true;"),
+            "reconciliation no longer tracks whether it could read the tier"
+        );
+        assert!(
+            rocks.contains("if !readable {") && rocks.contains("return (count, summed);"),
+            "reconciliation applies its repairs on a partial picture: a value \
+             it could not read is deleted from the index as an orphan"
+        );
+
+        // And nothing in the repair paths turns an error into absence by
+        // catch-all. `Ok(None)` is written out where a decision to delete is
+        // taken, so an `Err` cannot arrive there by falling through.
+        for banned in [
+            "self.db.get(key).ok().flatten().map(|v| (key, v))",
+            "match db.get_pinned(key) {\n                    Ok(Some(value)) => {",
+        ] {
+            assert!(
+                !rocks.contains(banned),
+                "a repair path folds a failed read into absence again: {banned}"
+            );
+        }
+        // The eviction scan abstains instead of repairing on an error.
+        let evict = rocks
+            .split("fn stage_evict_oldest")
+            .nth(1)
+            .and_then(|t| t.split("\n        /// ").next())
+            .expect("the eviction scan");
+        assert!(
+            evict.contains("Ok(None) => dangling.push(ix_key),"),
+            "the eviction scan no longer separates a value that is gone from \
+             one it could not read"
+        );
+        assert_eq!(
+            evict.matches("return None;").count(),
+            3,
+            "the eviction scan has stopped abstaining on one of its three \
+             read failures, and abstaining is what stops it deleting the index \
+             of a live value"
+        );
     }
 
     /// audit report5: the mirror state — index rows for a value that is not
