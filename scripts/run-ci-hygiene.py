@@ -35,6 +35,19 @@ ROOT = Path(__file__).resolve().parent.parent
 WORKFLOW = ROOT / ".github/workflows/ci.yml"
 JOB = "hygiene"
 
+# The name says `hygiene`, and hygiene is ONE job. CI also has a test job, and
+# this script has never run it: fmt, clippy, check and the policy scripts pass
+# while a unit test is red, and "16 of 16 green" reads like the tree is clean.
+# It rode four releases that way. So the tail of every run says, out loud, what
+# was not checked.
+TEST_JOB_HINT = (
+    "NOT TESTS. This is CI's `hygiene` job only. The unit suite is a separate\n"
+    "job; run it before tagging:\n"
+    "  cargo nextest run --workspace \\\n"
+    "    --features veilcore/test-low-difficulty,veilcore/allow-empty-seeds \\\n"
+    "    --lib --bins --tests --test-threads=2"
+)
+
 
 def steps_of_job(text, job):
     """Every (name, script) of `job`, in order. Hand-rolled: pulling in a YAML
@@ -166,6 +179,8 @@ def main():
             print(f"  {name}  →  {logs}/{n:02d}-{slug}.err")
         return 1
     print(f"OK: all {len(runnable)} steps green.")
+    print()
+    print(TEST_JOB_HINT)
     return 0
 
 
