@@ -58,8 +58,17 @@ async fn try_lookup_or_discover(
     // RouteAnnounce gossip that carries no ML-KEM key), fall through to reactive
     // discovery so a RouteRequest triggers a RouteResponse that brings both the
     // confirmed route and the ML-KEM encapsulation key in one atomic step.
+    // A key past its signed window is not a key: treating it as one meant
+    // taking the cached route and sealing to a certificate its owner had
+    // stopped standing behind (report20 V18-M12). Not ready means the
+    // reactive discovery below, which fetches a current one.
+    let now_unix = veil_util::unix_secs_now_u64();
     let mlkem_ready = peer_mlkem_keys
-        .map(|k| rlock!(k).get(dst).is_some())
+        .map(|k| {
+            rlock!(k)
+                .get(dst)
+                .is_some_and(|(key, _)| key.usable_at(now_unix).is_some())
+        })
         .unwrap_or(true); // if no E2E infrastructure, route alone is sufficient
     if mlkem_ready
         && let Some(cache) = route_cache
@@ -762,9 +771,13 @@ pub(crate) async fn handle_ipc_send(
                     // packet can fit one hop-level QUIC DATAGRAM.
                     (*send.data).to_vec()
                 } else if let Some(keys) = peer_mlkem_keys {
+                    // Only while its owner still vouches for it; an expired
+                    // one is a miss, and a miss walks the DHT for a current
+                    // certificate (report20 V18-M12).
+                    let now_unix = veil_util::unix_secs_now_u64();
                     let mut recipient_ek = rlock!(keys)
                         .get(&send.dst_node_id)
-                        .map(|(ek, _)| ek.clone());
+                        .and_then(|(key, _)| key.usable_at(now_unix).map(<[u8]>::to_vec));
 
                     // Epic 486.1 slice 3 (audit batch 2026-05-23): cold-start
                     // cache miss → attempt DHT-based EK resolution.  The
@@ -1671,7 +1684,10 @@ mod ratchet_send_tests {
         let peer_mlkem = std::sync::RwLock::new(veil_e2e::PeerMlKemCache::new());
         wlock!(peer_mlkem).insert(
             PEER,
-            (peer_ring.current_ek().to_vec(), std::time::Instant::now()),
+            (
+                veil_e2e::PeerMlKemKey::unattested(peer_ring.current_ek().to_vec()),
+                std::time::Instant::now(),
+            ),
         );
         // The peer knows our device key, as it would after resolving us.
         let peer_rt = ratchet_runtime(PEER, PEER_INSTANCE, peer_ring);

@@ -44,11 +44,63 @@ pub const EK_BYTES: usize = 1184;
 /// Size of a ML-KEM-768 decapsulation-key seed, in bytes.
 pub const DK_SEED_BYTES: usize = 64;
 
-/// Cached peer ML-KEM-768 encapsulation key: `peer_id → (ek_bytes, cached_at)`.
+/// A peer's ML-KEM-768 encapsulation key as this node holds it.
+///
+/// TWO CLOCKS, and the cache only ever knew one. `cached_at` beside it says
+/// how long ago we learned the key; `valid_until_unix` is what its OWNER
+/// signed, and that is the half that says whether the key is still theirs. A
+/// key whose certificate expired a minute after it entered the cache went on
+/// being sealed to for the rest of the TTL (report20 V18-M12).
+///
+/// `None` is not "forever": it is "nobody said". A key learned from a
+/// `RouteResponse` or an ATTACH carries a signature but no certificate window,
+/// so the TTL is genuinely all there is for those — recording that as an
+/// absence keeps the two cases from being confused.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PeerMlKemKey {
+    /// The encapsulation key bytes.
+    pub ek: Vec<u8>,
+    /// End of the window the key's owner signed for it, when one is known.
+    pub valid_until_unix: Option<u64>,
+}
+
+impl PeerMlKemKey {
+    /// A key out of a verified certificate, good until the certificate says.
+    pub fn signed_until(ek: Vec<u8>, valid_until_unix: u64) -> Self {
+        Self {
+            ek,
+            valid_until_unix: Some(valid_until_unix),
+        }
+    }
+
+    /// A key nobody attached a signed window to — a `RouteResponse` or an
+    /// ATTACH. The cache TTL is the only bound it has.
+    pub fn unattested(ek: Vec<u8>) -> Self {
+        Self {
+            ek,
+            valid_until_unix: None,
+        }
+    }
+
+    /// The key, if its owner still stands behind it at `now_unix`.
+    ///
+    /// `None` once the signed window has closed, so a caller reaches its own
+    /// "no key for this peer" path — which everywhere in this tree means
+    /// refusing to send rather than sending in the clear.
+    pub fn usable_at(&self, now_unix: u64) -> Option<&[u8]> {
+        match self.valid_until_unix {
+            Some(until) if now_unix > until => None,
+            _ => Some(&self.ek),
+        }
+    }
+}
+
+/// Cached peer ML-KEM-768 encapsulation keys: `peer_id → (key, cached_at)`.
 ///
 /// The `cached_at` timestamp is used for TTL-based eviction in the maintenance
-/// loop (see `IpcConfig::e2e_key_ttl_secs`).
-pub type PeerMlKemCache = std::collections::HashMap<[u8; 32], (Vec<u8>, std::time::Instant)>;
+/// loop (see `IpcConfig::e2e_key_ttl_secs`); the key's own signed window is
+/// checked at every read (see [`PeerMlKemKey::usable_at`]).
+pub type PeerMlKemCache = std::collections::HashMap<[u8; 32], (PeerMlKemKey, std::time::Instant)>;
 
 type DK768 = DecapsulationKey<MlKem768>;
 
@@ -1616,5 +1668,41 @@ mod tests {
         wire.extend_from_slice(&short_env.encode());
         let err = meta_decrypt(&dk, &dst_id, &wire).unwrap_err();
         assert!(matches!(err, E2eError::MetaPlaintextTooShort(50)));
+    }
+}
+
+#[cfg(test)]
+mod peer_mlkem_key_tests {
+    use super::PeerMlKemKey;
+
+    /// A key is usable through the last second its owner signed for, and not
+    /// after — and a key nobody dated stays usable, because for those the
+    /// cache TTL really is the whole bound (report20 V18-M12).
+    #[test]
+    fn a_signed_window_ends_where_it_says_and_an_absent_one_does_not_exist() {
+        let dated = PeerMlKemKey::signed_until(vec![7; 4], 1_000);
+        assert_eq!(
+            dated.usable_at(999),
+            Some(&[7u8; 4][..]),
+            "a key inside its window was refused"
+        );
+        assert_eq!(
+            dated.usable_at(1_000),
+            Some(&[7u8; 4][..]),
+            "the last second of the window is still inside it"
+        );
+        assert_eq!(
+            dated.usable_at(1_001),
+            None,
+            "a key past the window its owner signed was handed out anyway"
+        );
+
+        let undated = PeerMlKemKey::unattested(vec![9; 4]);
+        assert_eq!(
+            undated.usable_at(u64::MAX),
+            Some(&[9u8; 4][..]),
+            "a key nobody put an end date on was treated as expired, which \
+             would refuse every RouteResponse and ATTACH key there is"
+        );
     }
 }

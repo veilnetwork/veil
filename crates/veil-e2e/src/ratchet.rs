@@ -185,6 +185,22 @@ pub enum RatchetSpliceError {
     #[error("peer certificate carries no ratchet key")]
     NoRatchetKey,
 
+    /// The certificate these keys came out of has stopped vouching for them.
+    ///
+    /// The caller decided which certificate to seal to; this is the last
+    /// place that decision can still be judged, and the only one that sees
+    /// EVERY caller. Refused rather than sealed, because the owner published
+    /// an end date exactly so that others would stop after it — a device it
+    /// retired may still hold the secret this would encrypt to (report20
+    /// V18-M12). Recoverable: resolve a current certificate and send again.
+    #[error("peer certificate expired at {valid_until_unix} (now {now_unix})")]
+    CertificateExpired {
+        /// End of the window the owner signed.
+        valid_until_unix: u64,
+        /// The local clock the refusal was made against.
+        now_unix: u64,
+    },
+
     /// This node has no sovereign device identity, so it has no instance a
     /// peer could address and no ratchet key it could have published. Running
     /// without one is a supported configuration, not a fault.
@@ -1205,6 +1221,24 @@ fn seal_inner(
         // than derive a root from a value someone else picked.
         return Err(RatchetSpliceError::NoRatchetKey);
     }
+    // And the window the owner signed, before the lock is taken and before
+    // anything is derived or written.
+    //
+    // Every cache in front of this one had its own idea of freshness, and one
+    // of them was wrong for months: the caches keyed by device tested how long
+    // ago a row was read and never what its owner signed, so a live session
+    // named a device and the send sealed to a certificate that had expired up
+    // to a cache TTL earlier (report20 V18-M12). Those are fixed; this is the
+    // check that does not depend on their being fixed, because it is the one
+    // place every caller passes through. Fail-closed: the conversation is not
+    // touched, so a later send with a current certificate finds the state it
+    // left behind.
+    if now_unix > peer.authorized_until_unix {
+        return Err(RatchetSpliceError::CertificateExpired {
+            valid_until_unix: peer.authorized_until_unix,
+            now_unix,
+        });
+    }
     let key = ConversationKey {
         local_instance_id: me.local_instance_id,
         peer_node_id: *peer.node_id,
@@ -2071,6 +2105,81 @@ mod tests {
             Some(&dev(a.instance_id, &a_pk)),
             NOW,
         )
+    }
+
+    /// Sealing to a certificate that has stopped vouching is refused, and the
+    /// conversation is left exactly as it was.
+    ///
+    /// Every cache in front of the seal has its own idea of freshness, and the
+    /// two keyed by device tested only how long ago a row was read — so a live
+    /// session named a device and the send sealed to a certificate that had
+    /// expired up to a cache TTL earlier (report20 V18-M12). This is the check
+    /// that does not depend on those caches being right.
+    #[test]
+    fn a_certificate_that_has_expired_is_not_sealed_to() {
+        let a = device(1);
+        let b = device(2);
+        let (ek, pk) = (b.ek(), b.ratchet_pk());
+        let until = NOW + 100;
+        let seal_at = |at: u64| {
+            seal(
+                &a.store,
+                &a.me(),
+                PeerRatchetKeys {
+                    node_id: &b.node_id,
+                    instance_id: &b.instance_id,
+                    mlkem_ek: &ek,
+                    ratchet_pk: &pk,
+                    authorized_until_unix: until,
+                },
+                b"hello",
+                at,
+            )
+        };
+
+        // The last second of the window is still inside it: a boundary that
+        // refuses one second early would drop live traffic every rotation.
+        seal_at(until).expect("the last second the owner signed for is still theirs");
+
+        // One second past it is not.
+        assert_eq!(
+            seal_at(until + 1),
+            Err(RatchetSpliceError::CertificateExpired {
+                valid_until_unix: until,
+                now_unix: until + 1,
+            }),
+            "a message was sealed to a certificate whose owner had stopped \
+             standing behind it"
+        );
+
+        // Fail-CLOSED, not fail-broken: the refusal touched nothing, so a send
+        // under a current certificate still works and B can still read it.
+        let payload = seal(
+            &a.store,
+            &a.me(),
+            PeerRatchetKeys {
+                node_id: &b.node_id,
+                instance_id: &b.instance_id,
+                mlkem_ek: &ek,
+                ratchet_pk: &pk,
+                authorized_until_unix: until + 1_000,
+            },
+            b"after renewal",
+            until + 1,
+        )
+        .expect("a renewed certificate seals")
+        .0;
+        let a_pk = a.ratchet_pk();
+        let opened = open(
+            &b.store,
+            &b.me(),
+            &a.node_id,
+            &payload,
+            Some(&dev(a.instance_id, &a_pk)),
+            until + 1,
+        )
+        .expect("B opens what the renewed certificate sealed");
+        assert_eq!(opened.plaintext.as_slice(), b"after renewal");
     }
 
     /// A device that was legitimate stops being proven when its certificate

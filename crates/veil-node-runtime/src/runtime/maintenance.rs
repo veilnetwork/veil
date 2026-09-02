@@ -778,9 +778,17 @@ impl NodeRuntime {
             bl.len()
         };
         lock!(violation_tracker).evict_stale();
-        wlock!(peer_mlkem_keys).retain(|_, (_, cached_at): &mut (Vec<u8>, std::time::Instant)| {
-            cached_at.elapsed() < e2e_key_ttl
-        });
+        // Both clocks: the TTL says how long ago we learned the key, and the
+        // key's own signed window says whether its owner still stands behind
+        // it. A key whose certificate closed is dead weight the reads already
+        // refuse, so it goes here too rather than sitting until the TTL
+        // (report20 V18-M12).
+        let now_unix = veil_util::unix_secs_now_u64();
+        wlock!(peer_mlkem_keys).retain(
+            |_, (key, cached_at): &mut (veil_e2e::PeerMlKemKey, std::time::Instant)| {
+                cached_at.elapsed() < e2e_key_ttl && key.usable_at(now_unix).is_some()
+            },
+        );
         (route_cache_size, banned_peers)
     }
 
