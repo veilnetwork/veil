@@ -1,5 +1,47 @@
 # Changelog
 
+## v0.10.4 — 2026-09-02
+
+An external audit (report20) went through the meeting-point work. Four of its
+findings were real, and this release closes them.
+
+**A listener the operator hid was published at a meeting point.**
+`build_advertised_transports` filters by `Visibility::is_advertisable()` and
+says why: "Trusted and Hidden listeners stay invisible on the network — peers
+learn about them only through invite-bundles." The two helpers that feed the
+DHT, Nostr and LAN layers walked every listener with no such gate, so a
+`hidden` or `trusted` endpoint was announced on the most public index there is,
+and a `stealth` one could advertise a port that is not bound.
+
+**`bootstrap = false` did not stop the LAN from announcing.** The flag's own
+documentation is explicit — "this flag governs the ANNOUNCE and nothing else…
+a node with this off still USES the permissionless layers: it asks and it
+listens. Only publishing is opt-in." Layers 7 and 8 honoured that. Layer 6 put
+a stable identity key, PoW nonce, port and scheme on the wire for every machine
+on the segment regardless. It now listens either way and transmits only on the
+opt-in.
+
+**An address a stranger named could point into the private network.** A record
+at a meeting point carries whatever its author wrote, and a DHT node answers
+with whatever it likes; nothing checked that the address was globally routable
+before dialling it. Loopback, RFC 1918, link-local (including the cloud
+metadata address) and carrier-NAT destinations are now refused from public
+sources. A private deployment reaches its peers through configured peers or the
+local-network layer, which observes an address rather than being told one.
+
+**A pass could be spent on attempts that never succeed.** The cap counted peers
+met, so a failing address cost nothing against it; a rendezvous full of records
+could hold a node in a dial loop for the length of a pass. Attempts are now
+budgeted too, and one lookup keeps a bounded number of addresses rather than
+every one it is handed.
+
+Also: a placeholder row no longer overwrites a proven one — with slots stable
+per address since 0.10.3, it would have traded a real identity for a hash and
+then deleted the row on failure — and `SERVICE_COUNT` was one short of the
+service list, which had left a unit test red since 0.10.0. The local gate now
+prints, after its own green result, that it is the hygiene job and not the
+tests.
+
 ## v0.10.3 — 2026-09-02
 
 **A peer met at a rendezvous kept losing its row, and its session with it.**
