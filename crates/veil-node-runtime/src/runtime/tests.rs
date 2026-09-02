@@ -1461,6 +1461,7 @@ pub fn runtime_config_with_mismatched_peer_nonce_transport(transport: String) ->
 pub fn verify_remote_peer_identity_reports_mismatch_readably() {
     let id = test_handshake_identity();
     let remote = RemoteHandshakeInfo {
+        algo: Some(veil_cfg::SignatureAlgorithm::Ed25519),
         node_id: id.node_id,
         public_key: id.public_key.clone(),
         nonce: id.nonce.clone(),
@@ -1505,6 +1506,7 @@ pub fn verify_remote_peer_identity_reports_mismatch_readably() {
 pub fn verify_remote_peer_identity_reports_nonce_mismatch_readably() {
     let id = test_handshake_identity();
     let remote = RemoteHandshakeInfo {
+        algo: Some(veil_cfg::SignatureAlgorithm::Ed25519),
         node_id: id.node_id,
         public_key: id.public_key.clone(),
         nonce: id.nonce.clone(),

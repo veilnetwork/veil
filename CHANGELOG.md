@@ -1,5 +1,37 @@
 # Changelog
 
+## v0.10.7 — 2026-09-02
+
+Four follow-ups from the review of 0.10.5 and 0.10.6, all confirmed against the
+code before being taken.
+
+**Choosing a peer slot and claiming it were two separate lock acquisitions.**
+The Mainline and Nostr passes run concurrently, so both could see the same slot
+free and the loser then dialled on the winner's row — writing a proven identity
+against somebody else's address. Selection and reservation are now one critical
+section.
+
+**A peer was recorded under the algorithm we assumed rather than the one it
+proved.** The handshake knows which signature algorithm was used and dropped it;
+everything downstream wrote Ed25519 down as fact. That is not a label: the node
+id the direction rule compares derives from the key and its algorithm, so a
+mislabelled Falcon or hybrid peer puts the pair back to both ends dialling each
+other. The proved algorithm now travels handshake → session → row → cache.
+
+**A window full of tombstones could never admit another peer.** A dial refused
+as a duplicate keeps its row on purpose — that is what stops the address being
+dialled again — but such a row holds a hash of the address and no key, and
+enough aliases for one host would have walled the window off for the life of
+the process. A full window may now reclaim the lowest identity-less row; a row
+that proved an identity is never taken, because something may be holding that
+session.
+
+**And two guards were passing on their own text.** Both read their own source
+file to check a call site, and the string they searched for appears in the
+assertion itself, so they matched regardless of what the production code did —
+the break-check that should have caught it stayed green. They now read the file
+with its test module removed.
+
 ## v0.10.6 — 2026-09-02
 
 **An inbound connection could end a session that was working.** Two different

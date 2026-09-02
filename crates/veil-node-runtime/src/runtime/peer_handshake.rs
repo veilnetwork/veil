@@ -52,6 +52,19 @@ pub struct RemoteHandshakeInfo {
     /// Base64-encoded public key (same encoding as `PeerConfigEntry.public_key`).
     pub public_key: String,
     pub nonce: String,
+    /// Which signature algorithm the peer actually proved, as it appeared on
+    /// the wire.
+    ///
+    /// Carried because everything downstream used to assume Ed25519 and write
+    /// it down as fact. A Falcon or hybrid peer was then recorded under the
+    /// wrong algorithm, and every later derivation from that row -- the node id
+    /// the direction rule compares, what the cache says, what a promotion would
+    /// read -- was derived from a lie this node told itself.
+    ///
+    /// `None` when the byte on the wire names an algorithm this build does not
+    /// know: the handshake still proved a key, and refusing to guess is the
+    /// point of the field.
+    pub algo: Option<veil_cfg::SignatureAlgorithm>,
     /// Session keying material derived from the X25519/ML-KEM shared secret.
     pub session_keys: SessionKeys,
     /// Peer's last-known DHT discoverability preference extracted from
@@ -797,6 +810,9 @@ pub async fn register_connection_session(
                         node_id: r.node_id,
                         public_key: r.public_key,
                         nonce: r.nonce,
+                        algo: veil_cfg::SignatureAlgorithm::from_wire_byte(
+                            r.remote_identity_payload.algo,
+                        ),
                         session_keys: r.session_keys,
                         remote_discovery_mode,
                         remote_dht_service,
@@ -1313,6 +1329,7 @@ pub async fn register_connection_session(
         source,
         stream,
         peer_public_key: remote_identity.public_key.clone(),
+        peer_algo: remote_identity.algo,
         peer_nonce: remote_identity.nonce.clone(),
         // Never send media into a side channel an older peer does not read.
         // Fast-resumed handshakes currently synthesize zero capabilities, so
