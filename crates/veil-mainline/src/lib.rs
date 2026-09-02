@@ -13,6 +13,7 @@
 
 pub mod bencode;
 pub mod client;
+pub mod endpoint;
 pub mod krpc;
 pub mod lookup;
 pub mod rendezvous;
