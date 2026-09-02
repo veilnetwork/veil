@@ -76,8 +76,12 @@ pub struct LanDiscovery {
     /// layer was written, and nothing ever bound it: the code read as though
     /// it spoke both families and spoke one.
     socket6: Option<UdpSocket>,
-    /// What this node says about itself.
-    announce: LanAnnounce,
+    /// What this node says about itself, or `None` when it has nothing to
+    /// say. A node with no listener a stranger could dial still LISTENS —
+    /// "it asks and it listens; only publishing is opt-in" — and until this
+    /// was optional, having nothing to announce meant the whole layer, receive
+    /// included, never started (report21 V20-M4).
+    announce: Option<LanAnnounce>,
 }
 
 impl LanDiscovery {
@@ -90,6 +94,15 @@ impl LanDiscovery {
     /// only cost is not being heard on the other segments, never being heard
     /// wrongly.
     pub async fn bind(announce: LanAnnounce) -> io::Result<Self> {
+        Self::bind_inner(Some(announce)).await
+    }
+
+    /// Bind the same sockets with nothing to announce: receive only.
+    pub async fn bind_listen_only() -> io::Result<Self> {
+        Self::bind_inner(None).await
+    }
+
+    async fn bind_inner(announce: Option<LanAnnounce>) -> io::Result<Self> {
         let sock = socket2::Socket::new(
             socket2::Domain::IPV4,
             socket2::Type::DGRAM,
@@ -160,43 +173,80 @@ impl LanDiscovery {
     /// Send one announce, with a fresh salt.
     pub async fn announce_once(&self) -> io::Result<()> {
         use rand_core::RngCore as _;
+        let Some(self_announce) = &self.announce else {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "this node has no listener to announce",
+            ));
+        };
         let mut salt = [0u8; SALT_LEN];
         rand_core::OsRng.fill_bytes(&mut salt);
         let wire = encode_announce(
-            &self.announce,
+            self_announce,
             salt,
             CURRENT_EXCHANGE_VERSION,
             IpAddr::V4(LSD_GROUP_V4),
         );
         let dest = SocketAddr::from(SocketAddrV4::new(LSD_GROUP_V4, LSD_PORT));
-        self.socket.send_to(wire.as_bytes(), dest).await?;
+        // The two families are announced INDEPENDENTLY. `?` here meant a v4
+        // send that fails -- which is what a segment with no IPv4 route gives
+        // on every attempt -- returned before the v6 announce was composed, so
+        // the half that could have worked never ran (report21 V20-L1).
+        let sent4 = self.socket.send_to(wire.as_bytes(), dest).await;
 
-        // And the same announce on the v6 group, with its own salt, so the two
+        // The same announce on the v6 group, with its own salt, so the two
         // datagrams are not linkable to each other. A host without IPv6 skips
-        // it; a failure there does not spoil an announce that already went out.
-        if let Some(sock6) = &self.socket6 {
-            let mut salt6 = [0u8; SALT_LEN];
-            rand_core::OsRng.fill_bytes(&mut salt6);
-            let wire6 = encode_announce(
-                &self.announce,
-                salt6,
-                CURRENT_EXCHANGE_VERSION,
-                IpAddr::V6(LSD_GROUP_V6),
-            );
-            let dest6 = SocketAddr::from(SocketAddrV6::new(LSD_GROUP_V6, LSD_PORT, 0, 0));
-            let _ = sock6.send_to(wire6.as_bytes(), dest6).await;
+        // it.
+        let sent6 = match &self.socket6 {
+            Some(sock6) => {
+                let mut salt6 = [0u8; SALT_LEN];
+                rand_core::OsRng.fill_bytes(&mut salt6);
+                let wire6 = encode_announce(
+                    self_announce,
+                    salt6,
+                    CURRENT_EXCHANGE_VERSION,
+                    IpAddr::V6(LSD_GROUP_V6),
+                );
+                let dest6 = SocketAddr::from(SocketAddrV6::new(LSD_GROUP_V6, LSD_PORT, 0, 0));
+                Some(sock6.send_to(wire6.as_bytes(), dest6).await)
+            }
+            None => None,
+        };
+
+        // An announce went out if EITHER family carried it. Only when every
+        // family this host has refused is there nothing to report but the
+        // failure, and then it is the v4 error -- the one the caller has
+        // always seen.
+        if sent6.is_some_and(|r| r.is_ok()) {
+            return Ok(());
         }
-        Ok(())
+        sent4.map(|_| ())
     }
 
     /// Wait for one datagram and say what it was.
     ///
     /// `Ok(None)` means the datagram was not a veil announce, or was our own —
     /// both ordinary on a shared group, neither an error.
+    /// BOTH families, whichever speaks first. The v6 socket was bound, joined
+    /// to its group and sent on, and then never read: a neighbour on a segment
+    /// with no IPv4 announced into silence (report21 V20-L1).
     pub async fn recv_peer(&self) -> io::Result<Option<BootstrapPeer>> {
-        let mut buf = [0u8; MAX_ANNOUNCE_BYTES];
-        let (n, from) = self.socket.recv_from(&mut buf).await?;
-        Ok(self.interpret(&buf[..n], from.ip()))
+        let mut buf4 = [0u8; MAX_ANNOUNCE_BYTES];
+        let mut buf6 = [0u8; MAX_ANNOUNCE_BYTES];
+        let Some(sock6) = &self.socket6 else {
+            let (n, from) = self.socket.recv_from(&mut buf4).await?;
+            return Ok(self.interpret(&buf4[..n], from.ip()));
+        };
+        tokio::select! {
+            r = self.socket.recv_from(&mut buf4) => {
+                let (n, from) = r?;
+                Ok(self.interpret(&buf4[..n], from.ip()))
+            }
+            r = sock6.recv_from(&mut buf6) => {
+                let (n, from) = r?;
+                Ok(self.interpret(&buf6[..n], from.ip()))
+            }
+        }
     }
 
     /// The decision `recv_peer` makes, with the socket taken out of it.
@@ -207,7 +257,11 @@ impl LanDiscovery {
     /// worse than no test.
     pub fn interpret(&self, datagram: &[u8], from: IpAddr) -> Option<BootstrapPeer> {
         let heard = decode_announce(datagram)?;
-        if heard.public_key == self.announce.public_key {
+        if self
+            .announce
+            .as_ref()
+            .is_some_and(|mine| heard.public_key == mine.public_key)
+        {
             // Our own announce, arriving back through multicast loopback.
             return None;
         }
@@ -253,6 +307,90 @@ mod tests {
             );
         }
     }
+    /// report21 V20-M4: a node with nothing to announce still listens.
+    ///
+    /// The layer's own rule is that a node which does not publish still "asks
+    /// and listens" — and having no advertisable listener, or an identity key
+    /// the LAN payload cannot carry, used to end the whole task before the
+    /// socket was bound. A client that only wanted to FIND the machine down
+    /// the hall found nothing, for the reason that it had nothing to offer.
+    #[tokio::test]
+    async fn a_node_with_nothing_to_announce_still_binds_and_listens() {
+        let d = LanDiscovery::bind_listen_only()
+            .await
+            .expect("the receive half must not depend on having something to say");
+        assert!(
+            d.local_addr().is_ok(),
+            "listen-only did not bind the discovery socket"
+        );
+
+        // It hears a neighbour exactly as an announcing node does.
+        let neighbour = announce(0x5A);
+        let wire = wire_from(&neighbour);
+        let heard = d
+            .interpret(
+                wire.as_bytes(),
+                "192.168.1.9".parse().expect("a neighbour address"),
+            )
+            .expect("a listen-only node heard nothing");
+        assert_eq!(heard.transport, "obfs4-tcp://192.168.1.9:5556");
+
+        // And it refuses to announce rather than sending something empty.
+        let err = d
+            .announce_once()
+            .await
+            .expect_err("a node with nothing to say announced anyway");
+        assert_eq!(err.kind(), io::ErrorKind::Unsupported);
+    }
+
+    /// report21 V20-L1: the v6 half is READ, and the two announces are
+    /// independent of each other.
+    ///
+    /// The socket was bound, joined to its group and sent on — and then never
+    /// read, so a neighbour on a segment with no IPv4 announced into silence
+    /// while this node's changelog said dual-stack. And the v4 send carried a
+    /// `?`, so on exactly that segment it returned before the v6 announce was
+    /// even composed.
+    ///
+    /// Structural, because the behaviour needs two hosts on one v6 segment:
+    /// a unit test on a machine that may have no IPv6 at all cannot tell a
+    /// working v6 path from an absent one.
+    #[test]
+    fn both_families_are_read_and_announced_independently() {
+        let src = include_str!("lan_service.rs");
+        let production = src.split("#[cfg(test)]").next().expect("production half");
+
+        let recv = production
+            .split("pub async fn recv_peer")
+            .nth(1)
+            .and_then(|t| t.split("\n    pub fn interpret").next())
+            .expect("the receive path");
+        assert!(
+            recv.contains("self.socket.recv_from"),
+            "the v4 half is no longer read; this guard has to be re-aimed"
+        );
+        assert!(
+            recv.contains("sock6.recv_from"),
+            "the v6 socket is bound, joined and sent on, and nothing reads \
+             it: an IPv6-only neighbour announces into silence"
+        );
+
+        let announce = production
+            .split("pub async fn announce_once")
+            .nth(1)
+            .and_then(|t| t.split("\n    /// BOTH families").next())
+            .expect("the announce path");
+        assert!(
+            announce.contains("IpAddr::V6(LSD_GROUP_V6)"),
+            "the v6 announce is gone; this guard has to be re-aimed"
+        );
+        assert!(
+            !announce.contains("self.socket.send_to(wire.as_bytes(), dest).await?"),
+            "the v4 send returns early again, so a segment with no IPv4 route \
+             never gets as far as composing the v6 announce"
+        );
+    }
+
     use super::*;
     use crate::lan::LanScheme;
 

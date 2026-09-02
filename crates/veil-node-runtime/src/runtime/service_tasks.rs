@@ -2185,7 +2185,16 @@ impl NodeRuntime {
                         now as i64,
                         KIND_APP_DATA,
                         vec![vec!["d".to_owned(), labels[0].clone()]],
-                        &format!("{host}:{port}"),
+                        // Through `SocketAddr`, so a v6 address keeps its
+                        // brackets. `public_address_for` strips them, and
+                        // `{host}:{port}` then produced `2001:db8::1:5556` —
+                        // a string whose last colon is part of the address, so
+                        // every receiver split it in the wrong place and the
+                        // record was unusable (report21 V20-M3b).
+                        &match host.parse::<std::net::IpAddr>() {
+                            Ok(ip) => std::net::SocketAddr::new(ip, port).to_string(),
+                            Err(_) => format!("{host}:{port}"),
+                        },
                     );
                     let mut stored = 0usize;
                     for relay in PUBLIC_RELAYS {
@@ -2361,26 +2370,32 @@ impl NodeRuntime {
             return;
         }
         let my_pubkey = self.identity.local_identity.public_key.clone();
-        let Some(announce) = lan_announce_for(
+        let announce = lan_announce_for(
             config,
             &my_pubkey,
             &self.identity.local_identity.nonce,
             &bound_ports(&self.listens()),
-        ) else {
+        );
+        if announce.is_none() {
+            // Not a reason to stop. Having nothing to SAY is not having
+            // nothing to HEAR: an outbound-only node, or one whose identity
+            // key the LAN payload cannot carry, still wants to find the
+            // neighbour that does listen. Returning here made passive
+            // discovery depend on the ability to announce, which is the
+            // opposite of what the rule below says (report21 V20-M4).
             self.logger.info(
                 "lan_discovery.nothing_to_say",
-                "local discovery is on, but no listener is reachable from the \
-                 wire: nothing was announced",
+                "local discovery is on and no listener of this node is \
+                 reachable from the wire: listening without announcing",
             );
-            return;
-        };
+        }
 
         // `global.bootstrap` governs THE ANNOUNCE, in its own words, and "a node
         // with this off still USES the permissionless layers -- it asks and it
         // listens. Only publishing is opt-in." Layers 7 and 8 honoured that;
         // this one transmitted regardless, putting a stable identity key, PoW
         // nonce, port and scheme on the wire for every machine on the segment.
-        let announce_self = config.global.bootstrap;
+        let announce_self = config.global.bootstrap && announce.is_some();
         let logger = self.logger.clone();
         let state = Arc::clone(&self.state);
         let dht = Arc::clone(&self.dht);
@@ -2389,7 +2404,11 @@ impl NodeRuntime {
         let tasks = Arc::clone(&self.tasks);
 
         let handle = supervised_spawn(Arc::clone(&self.logger), "lan_discovery", async move {
-            let discovery = match veil_bootstrap::LanDiscovery::bind(announce).await {
+            let bound = match announce {
+                Some(a) => veil_bootstrap::LanDiscovery::bind(a).await,
+                None => veil_bootstrap::LanDiscovery::bind_listen_only().await,
+            };
+            let discovery = match bound {
                 Ok(d) => d,
                 Err(e) => {
                     // A host with no multicast-capable interface, or a port
@@ -6195,45 +6214,51 @@ async fn dial_and_learn(
     // The placeholder node id is a hash of the address: unique per address, and
     // not a claim about anybody. It is replaced the moment the handshake says
     // who actually answered.
+    let placeholder = {
+        let digest = blake3::hash(transport.as_bytes());
+        veil_cfg::NodeId::from(*digest.as_bytes())
+    };
     let (peer_id, we_minted_the_row) = {
         let mut st = lock_state(state);
         let known: Vec<PeerConfigEntry> = st.peers.values().cloned().collect();
-        let id = rendezvous_slot_for(&known, transport)
+        let slot = rendezvous_slot_claim(&known, transport)
             .ok_or_else(|| "no free rendezvous slot; not learning this peer".to_owned())?;
-        // ONLY IF THE SLOT IS FREE. The slot belongs to this address now, so a
-        // row already sitting in it is this same peer, proven on an earlier
-        // pass -- and the placeholder would trade a real identity for a hash of
-        // the address and set `bootstrap_only`, which exempts the row from the
-        // direction policy. Worse, the failure path below would then delete it,
-        // orphaning a connector that may be holding a live session.
-        //
-        // Dialling the existing row is also strictly better: it carries the
-        // peer's key, so the handshake verifies who answers rather than taking
-        // whoever does.
-        let vacant = !st.peers.contains_key(&id);
-        if vacant {
-            let placeholder = {
-                let digest = blake3::hash(transport.as_bytes());
-                veil_cfg::NodeId::from(*digest.as_bytes())
-            };
-            st.peers.insert(
-                id,
-                PeerConfigEntry {
-                    peer_id: id,
-                    node_id: placeholder,
-                    public_key: String::new(),
-                    nonce: String::new(),
-                    transport: transport.to_owned(),
-                    algo: veil_cfg::SignatureAlgorithm::Ed25519,
-                    tls_cert: None,
-                    tls_key: None,
-                    tls_ca_cert: None,
-                    bootstrap_only: true,
-                    source: crate::types::PeerSource::Rendezvous,
-                },
-            );
+        match slot {
+            // HELD: the row already holds this address -- this same peer,
+            // proven on an earlier pass. A placeholder would trade a real
+            // identity for a hash of the address and set `bootstrap_only`,
+            // which exempts the row from the direction policy; and the failure
+            // path below would then delete it, orphaning a connector that may
+            // be holding a live session. Dialling the existing row is also
+            // strictly better: it carries the peer's key, so the handshake
+            // verifies who answers rather than taking whoever does.
+            RendezvousSlot::Held(id) => (id, false),
+            // FREE, or RECLAIMED from a row that never learned who was there.
+            // Both are ours to fill, and a reclaimed one MUST be filled: it
+            // still carries the previous tenant's address, so leaving it there
+            // sends this dial to a URI nobody asked for and writes whoever
+            // answers it down beside the address we meant to call (report21
+            // V20-M7b).
+            RendezvousSlot::Free(id) | RendezvousSlot::Reclaimed(id) => {
+                st.peers.insert(
+                    id,
+                    PeerConfigEntry {
+                        peer_id: id,
+                        node_id: placeholder,
+                        public_key: String::new(),
+                        nonce: String::new(),
+                        transport: transport.to_owned(),
+                        algo: veil_cfg::SignatureAlgorithm::Ed25519,
+                        tls_cert: None,
+                        tls_key: None,
+                        tls_ca_cert: None,
+                        bootstrap_only: true,
+                        source: crate::types::PeerSource::Rendezvous,
+                    },
+                );
+                (id, true)
+            }
         }
-        (id, vacant)
     };
 
     let session = match access.connect_peer_active(peer_id).await {
@@ -6251,10 +6276,22 @@ async fn dial_and_learn(
             if refusal.contains(crate::runtime::peer_handshake::DUPLICATE_SESSION) {
                 return Err(refusal);
             }
-            // Retire only what this call created. Removing a row we found here
-            // would delete a peer somebody else is talking to.
+            // Retire only what this call created, AND only if it is still
+            // what this call created. The lock that claimed the slot was let
+            // go before the dial: the other pass may have taken the same
+            // address, completed its handshake and written a proven row into
+            // this very id in the meantime, and an unconditional remove then
+            // deletes a peer somebody is talking to -- on the strength of a
+            // dial that was ours (report21 V20-M7a).
             if we_minted_the_row {
-                lock_state(state).peers.remove(&peer_id);
+                let mut st = lock_state(state);
+                if rendezvous_row_is_our_placeholder(
+                    st.peers.get(&peer_id),
+                    &placeholder,
+                    transport,
+                ) {
+                    st.peers.remove(&peer_id);
+                }
             }
             return Err(refusal);
         }
@@ -6450,27 +6487,19 @@ pub fn rendezvous_destination_is_dialable(host: &str) -> bool {
         // this node uses carries addresses.
         return false;
     };
-    match ip {
-        std::net::IpAddr::V4(v4) => {
-            !(v4.is_loopback()
-                || v4.is_private()
-                || v4.is_link_local()
-                || v4.is_unspecified()
-                || v4.is_broadcast()
-                || v4.is_multicast()
-                || v4.is_documentation()
-                // Carrier NAT (100.64.0.0/10): another operator's inside, not
-                // a place the public internet can reach.
-                || (v4.octets()[0] == 100 && (64..128).contains(&v4.octets()[1])))
-        }
-        std::net::IpAddr::V6(v6) => {
-            !(v6.is_loopback()
-                || v6.is_unspecified()
-                || v6.is_multicast()
-                // fc00::/7 unique-local and fe80::/10 link-local.
-                || (v6.segments()[0] & 0xfe00) == 0xfc00
-                || (v6.segments()[0] & 0xffc0) == 0xfe80)
-        }
+    // ONE definition of "somebody's inside", shared with the DHT ingress that
+    // decides which addresses are worth a query at all. Two copies of this
+    // rule is how `::ffff:127.0.0.1` passed one of them (report21 V20-M1a).
+    if veil_mainline::endpoint::is_internal(ip) {
+        return false;
+    }
+    // The dial path refuses MORE than the ingress does, and for a different
+    // reason: a documentation address is nobody's inside, so probing it harms
+    // no one, but dialling one costs a full handshake timeout for an address
+    // that by definition names no host.
+    match veil_mainline::endpoint::normalize(ip) {
+        std::net::IpAddr::V4(v4) => !v4.is_documentation(),
+        std::net::IpAddr::V6(v6) => v6.segments()[..2] != [0x2001, 0x0db8],
     }
 }
 
@@ -6543,7 +6572,41 @@ fn proven_algorithm(
 /// lowest free slot in the window. `None` when the window is full, because
 /// refusing to learn one more peer is a great deal better than evicting one we
 /// are talking to.
-pub fn rendezvous_slot_for(known: &[PeerConfigEntry], transport: &str) -> Option<PeerId> {
+/// Which slot a rendezvous dial gets, and on what terms.
+///
+/// The three cases are not interchangeable, and reading them as "occupied or
+/// not" is what made a reclaimed slot dial the WRONG address (report21
+/// V20-M7b): the row was there, so nothing replaced it, so the dial went to
+/// the URI the previous tenant had left behind — and on success the identity
+/// of whoever answered THAT address was written down beside the transport of
+/// the candidate we meant to call.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RendezvousSlot {
+    /// A row that already holds this address. Dial it as it stands: it may
+    /// carry a proven key, and then the handshake verifies who answers rather
+    /// than taking whoever does.
+    Held(PeerId),
+    /// An empty slot in the window.
+    Free(PeerId),
+    /// Taken from a row that never learned who was there. Its address is not
+    /// ours and must be replaced before dialling.
+    Reclaimed(PeerId),
+}
+
+impl RendezvousSlot {
+    /// The slot number, whichever way it was obtained. Production code always
+    /// wants the case as well and matches on it; this is for the tests that
+    /// only assert WHICH slot.
+    #[cfg(test)]
+    pub fn peer_id(self) -> PeerId {
+        match self {
+            Self::Held(id) | Self::Free(id) | Self::Reclaimed(id) => id,
+        }
+    }
+}
+
+/// The slot for `transport`, and how it was obtained.
+pub fn rendezvous_slot_claim(known: &[PeerConfigEntry], transport: &str) -> Option<RendezvousSlot> {
     use crate::types::synthetic_peer_id::{RENDEZVOUS_BASE, RENDEZVOUS_WINDOW};
     let want = transport
         .split_once("://")
@@ -6555,7 +6618,7 @@ pub fn rendezvous_slot_for(known: &[PeerConfigEntry], transport: &str) -> Option
         in_window(p.peer_id.get())
             && rendezvous_authority(&p.transport).is_some_and(|have| have == want)
     }) {
-        return Some(existing.peer_id);
+        return Some(RendezvousSlot::Held(existing.peer_id));
     }
 
     let taken: std::collections::HashSet<u32> = known
@@ -6566,7 +6629,7 @@ pub fn rendezvous_slot_for(known: &[PeerConfigEntry], transport: &str) -> Option
     if let Some(free) =
         (RENDEZVOUS_BASE..RENDEZVOUS_BASE + RENDEZVOUS_WINDOW).find(|id| !taken.contains(id))
     {
-        return Some(PeerId::new(free));
+        return Some(RendezvousSlot::Free(PeerId::new(free)));
     }
 
     // A FULL WINDOW MAY STILL YIELD, but only a row that never learned who was
@@ -6583,6 +6646,28 @@ pub fn rendezvous_slot_for(known: &[PeerConfigEntry], transport: &str) -> Option
         .filter(|p| in_window(p.peer_id.get()) && p.public_key.is_empty())
         .map(|p| p.peer_id)
         .min_by_key(|id| id.get())
+        .map(RendezvousSlot::Reclaimed)
+}
+
+/// Whether the row in a rendezvous slot is still the placeholder THIS dial put
+/// there.
+///
+/// The lock that claimed the slot is let go before the dial, and the other
+/// meeting-point pass may take the same address in that window: it finds the
+/// placeholder, dials it, completes a handshake and writes a proven row into
+/// the same id. An unconditional rollback then deletes a peer somebody is
+/// talking to, on the strength of a dial that was ours (report21 V20-M7a).
+///
+/// A row is ours only while it carries the address-hash we minted, no key, and
+/// the address we meant — the three things a successful pass replaces.
+pub fn rendezvous_row_is_our_placeholder(
+    row: Option<&PeerConfigEntry>,
+    placeholder: &veil_cfg::NodeId,
+    transport: &str,
+) -> bool {
+    row.is_some_and(|p| {
+        p.node_id == *placeholder && p.public_key.is_empty() && p.transport == transport
+    })
 }
 
 pub fn rendezvous_address_is_self(mine: Option<&(String, u16)>, transport: &str) -> bool {
@@ -6678,8 +6763,14 @@ pub fn public_address_for(
         if port == 0 || host.is_empty() {
             continue;
         }
+        // The SAME rule that decides whether a stranger's address is worth
+        // dialling decides whether ours is worth publishing. This checked only
+        // "unspecified or loopback", so a node whose listener is on
+        // `192.168.1.5` posted that to seven public relays: a record no
+        // stranger can use, and this network's shape written down where anyone
+        // can read it (report21 V20-M3b).
         if let Ok(ip) = host.parse::<std::net::IpAddr>()
-            && (ip.is_unspecified() || ip.is_loopback())
+            && veil_mainline::endpoint::is_internal(ip)
         {
             continue;
         }
@@ -7522,6 +7613,11 @@ mod tests {
     /// hypothetical: the first version of the algorithm guard below did
     /// exactly this, and the break-check that should have reddened stayed
     /// green.
+    /// The slot alone, for the assertions that only care WHICH one.
+    fn rendezvous_slot_for(known: &[PeerConfigEntry], transport: &str) -> Option<PeerId> {
+        rendezvous_slot_claim(known, transport).map(RendezvousSlot::peer_id)
+    }
+
     fn production_source(file: &str) -> &str {
         file.split("#[cfg(test)]").next().unwrap_or(file)
     }
@@ -7589,6 +7685,75 @@ mod tests {
             here.contains("proven_algorithm(session.peer_algo)"),
             "the row no longer asks what was proved"
         );
+    }
+
+    /// report21 V20-M7a: a failed dial retires ITS OWN placeholder and
+    /// nothing else.
+    ///
+    /// The lock that claims the slot is let go before the dial. The other
+    /// meeting-point pass can take the same address in that window, complete
+    /// a handshake and write a proven row into the same id — and the rollback
+    /// removed the row by id regardless, deleting a peer somebody is talking
+    /// to on the strength of a dial that was ours.
+    #[test]
+    fn a_failed_dial_retires_only_the_row_it_minted() {
+        let transport = "obfs4-tcp://198.51.100.7:5556";
+        let placeholder = veil_cfg::NodeId::from(*blake3::hash(transport.as_bytes()).as_bytes());
+        let mine = PeerConfigEntry {
+            peer_id: PeerId::new(0x9200_0000),
+            node_id: placeholder,
+            public_key: String::new(),
+            nonce: String::new(),
+            transport: transport.to_owned(),
+            algo: veil_cfg::SignatureAlgorithm::Ed25519,
+            tls_cert: None,
+            tls_key: None,
+            tls_ca_cert: None,
+            bootstrap_only: true,
+            source: crate::types::PeerSource::Rendezvous,
+        };
+
+        assert!(
+            rendezvous_row_is_our_placeholder(Some(&mine), &placeholder, transport),
+            "vacuity: the row this dial minted must be retirable, or a failed \
+             dial leaves a slot claimed forever"
+        );
+
+        // The other pass got there first and proved who is at that address.
+        let mut proven = mine.clone();
+        proven.node_id = veil_cfg::NodeId::from([0xAB; 32]);
+        proven.public_key = "their-key".to_owned();
+        proven.bootstrap_only = false;
+        assert!(
+            !rendezvous_row_is_our_placeholder(Some(&proven), &placeholder, transport),
+            "a proven row written by the other pass was deleted by our failure"
+        );
+
+        // A key alone is enough: a row that learned an identity is not ours.
+        let mut keyed = mine.clone();
+        keyed.public_key = "their-key".to_owned();
+        assert!(!rendezvous_row_is_our_placeholder(
+            Some(&keyed),
+            &placeholder,
+            transport
+        ));
+
+        // The slot was reclaimed for a DIFFERENT address while we waited.
+        let mut elsewhere = mine.clone();
+        elsewhere.transport = "obfs4-tcp://203.12.31.146:5556".to_owned();
+        elsewhere.node_id =
+            veil_cfg::NodeId::from(*blake3::hash(elsewhere.transport.as_bytes()).as_bytes());
+        assert!(
+            !rendezvous_row_is_our_placeholder(Some(&elsewhere), &placeholder, transport),
+            "another pass's claim on this slot was retired by our failure"
+        );
+
+        // And a slot already empty has nothing to retire.
+        assert!(!rendezvous_row_is_our_placeholder(
+            None,
+            &placeholder,
+            transport
+        ));
     }
 
     #[test]
@@ -7712,6 +7877,34 @@ mod tests {
 
         // Something unparseable gets nothing rather than slot zero.
         assert_eq!(rendezvous_slot_for(&[], "no-scheme-here"), None);
+
+        // AND THE CALLER HAS TO KNOW WHICH OF THE THREE IT GOT. The number
+        // alone reads a reclaimed slot as an occupied one, so the row keeps
+        // the previous tenant's address, the dial goes to a URI nobody asked
+        // for, and whoever answers THAT is written down beside the address we
+        // meant to call (report21 V20-M7b).
+        assert_eq!(
+            rendezvous_slot_claim(&known, a),
+            Some(RendezvousSlot::Held(first)),
+            "a row already holding this address must be dialled as it stands"
+        );
+        assert!(
+            matches!(
+                rendezvous_slot_claim(&known, b),
+                Some(RendezvousSlot::Free(_))
+            ),
+            "a new address in a window with room takes a free slot"
+        );
+        assert_eq!(
+            rendezvous_slot_claim(&tombstones, "obfs4-tcp://203.0.113.9:5556"),
+            Some(RendezvousSlot::Reclaimed(PeerId::new(RENDEZVOUS_BASE))),
+            "a slot taken from an identity-less row is indistinguishable from \
+             one that already held this address"
+        );
+        assert_eq!(
+            rendezvous_slot_claim(&full, "obfs4-tcp://203.0.113.9:5556"),
+            None
+        );
     }
 
     #[test]
@@ -7737,6 +7930,24 @@ mod tests {
             "[fe80::1]",
             "[fc00::1]",
             "veil.example.com", // a NAME resolves later, and could resolve anywhere
+            // The SAME addresses written in the other notation. A v4 address
+            // wearing a v6 coat is a v4 address, and none of the v6 rules look
+            // at the octets it carries — so every one of the refusals above
+            // could be had simply by spelling it this way (report21 V20-M1a).
+            "[::ffff:127.0.0.1]",
+            "[::ffff:10.1.2.3]",
+            "[::ffff:192.168.1.54]",
+            "[::ffff:169.254.169.254]",
+            "[::ffff:100.64.0.1]",
+            "[::ffff:0.0.0.0]",
+            "[::ffff:224.0.0.1]",
+            // ::a.b.c.d, the deprecated compatible form, carries the same
+            // address without the ffff to key off.
+            "[::127.0.0.1]",
+            "[::10.1.2.3]",
+            // Documentation and NAT64: neither is a host on this internet.
+            "[2001:db8::1]",
+            "[64:ff9b::7f00:1]",
         ] {
             assert!(
                 !rendezvous_destination_is_dialable(private),
@@ -7750,6 +7961,10 @@ mod tests {
             "203.12.31.146",
             "1.1.1.1",
             "[2001:4860:4860::8888]",
+            // A mapped PUBLIC address is still public: the normalisation must
+            // not refuse everything it touches.
+            "[::ffff:8.8.8.8]",
+            "[::ffff:203.12.31.146]",
         ] {
             assert!(
                 rendezvous_destination_is_dialable(public),
@@ -7999,6 +8214,109 @@ mod tests {
             slot,
             admitted: std::time::Instant::now(),
         }
+    }
+
+    /// report21 V20-M3b: what this node publishes about itself is a public
+    /// address, written so a stranger can read it back.
+    ///
+    /// Two halves. The helper refused only "unspecified or loopback", so a
+    /// node whose listener sits on `192.168.1.5` posted that to seven public
+    /// relays — a record nobody can use, and this network's shape written down
+    /// where anyone can read it. And the helper strips the brackets from a v6
+    /// literal, so `{host}:{port}` produced `2001:db8::1:5556`, whose last
+    /// colon belongs to the address: every receiver split it in the wrong
+    /// place.
+    #[test]
+    fn what_we_publish_about_ourselves_is_public_and_unambiguous() {
+        let listener = |uri: &str| veil_cfg::Config {
+            listen: vec![veil_cfg::ListenConfig {
+                transport: uri.to_owned(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        for inside in [
+            "obfs4://192.168.1.5:5556",
+            "obfs4://10.0.0.4:5556",
+            "obfs4://172.16.9.9:5556",
+            "obfs4://169.254.169.254:5556",
+            "obfs4://100.64.0.1:5556",
+            "obfs4://[fe80::1]:5556",
+            "obfs4://[fc00::1]:5556",
+            "obfs4://[::ffff:192.168.1.5]:5556",
+            "obfs4://localhost:5556",
+        ] {
+            assert_eq!(
+                public_address_for(&listener(inside), &[]),
+                None,
+                "{inside} would have been published to the public relays"
+            );
+        }
+
+        // Vacuity: a real public listener is still published, or the node
+        // never announces itself anywhere.
+        assert_eq!(
+            public_address_for(&listener("obfs4://203.12.31.146:5556"), &[]),
+            Some(("203.12.31.146".to_owned(), 5556))
+        );
+
+        // The helper hands back a BARE v6 host, which is why the publisher has
+        // to put the brackets back rather than interpolating.
+        let (host, port) = public_address_for(&listener("obfs4://[2001:4860::1]:5556"), &[])
+            .expect("a public v6 listener is publishable");
+        assert_eq!(host, "2001:4860::1", "premise: the brackets are stripped");
+        let published = match host.parse::<std::net::IpAddr>() {
+            Ok(ip) => std::net::SocketAddr::new(ip, port).to_string(),
+            Err(_) => format!("{host}:{port}"),
+        };
+        assert_eq!(
+            published, "[2001:4860::1]:5556",
+            "the published record is ambiguous: its last colon is part of the \
+             address, so a receiver splits it in the wrong place"
+        );
+        // And a receiver reading it back finds the address that was meant.
+        let (h, p) = published.rsplit_once(':').expect("a record splits");
+        assert_eq!(p, "5556");
+        assert!(rendezvous_destination_is_dialable(h), "unreadable by us");
+    }
+
+    /// report21 V20-M4: having nothing to announce does not switch the layer
+    /// off.
+    ///
+    /// The task returned before binding when `lan_announce_for` said `None` —
+    /// no advertisable listener, or an identity key the payload cannot carry —
+    /// so a node that only wanted to FIND the machine down the hall found
+    /// nothing, because it had nothing to offer. That is the opposite of the
+    /// rule stated two lines below it.
+    #[test]
+    fn nothing_to_announce_is_not_a_reason_to_stop_listening() {
+        let src = production_source(include_str!("service_tasks.rs"));
+        let spawn = src
+            .split("pub fn spawn_lan_discovery_task")
+            .nth(1)
+            .and_then(|t| t.split("\npub ").next())
+            .expect("the lan task");
+        let head = spawn.split("supervised_spawn").next().unwrap_or_default();
+        assert!(
+            head.contains("lan_announce_for("),
+            "the task no longer composes an announce; re-aim this guard"
+        );
+        assert!(
+            !head.contains("let Some(announce) = lan_announce_for("),
+            "having nothing to announce ends the task again, so passive \
+             discovery depends on the ability to publish"
+        );
+        assert!(
+            spawn.contains("bind_listen_only()"),
+            "there is no receive-only path left, so a node with no \
+             advertisable listener never binds the socket"
+        );
+        assert!(
+            head.contains("config.global.bootstrap && announce.is_some()"),
+            "the announce ticker no longer requires something to announce: it \
+             will call announce_once on a node that has nothing to say"
+        );
     }
 
     /// report20 V20-M3: what gets published is the port the listener BOUND.

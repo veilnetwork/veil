@@ -290,6 +290,12 @@ impl Value {
 
 /// Build a dictionary without spelling out `BTreeMap` at every call site.
 pub fn dict<const N: usize>(entries: [(&[u8], Value); N]) -> Value {
+    dict_of(entries)
+}
+
+/// The same, from anything iterable — for a message whose set of keys is
+/// decided at run time rather than written out.
+pub fn dict_of<'a>(entries: impl IntoIterator<Item = (&'a [u8], Value)>) -> Value {
     Value::Dict(
         entries
             .into_iter()

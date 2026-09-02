@@ -22,7 +22,16 @@ use crate::krpc::{NodeId, NodeInfo, Query, Response};
 /// How many nodes a lookup keeps and eventually announces to. BEP 5's `k`.
 pub const K: usize = 8;
 
-/// How many queries are in flight at once. BEP 5's `α`.
+/// How many nodes one round asks. BEP 5's `α`.
+///
+/// It is the width of a ROUND, not a count of queries in flight: the loop
+/// below awaits each of the three in turn on one socket, because that socket
+/// serves one transaction at a time (see `Client::query`). The comment used
+/// to promise concurrency the code does not attempt, which also hid the one
+/// consequence of asking sequentially — the last query of a round may start
+/// close enough to the deadline to overrun it by up to `per_query`
+/// (report21 V20-L2). Both limits are checked before each query, so the
+/// overrun is bounded by one query, not by the round.
 pub const ALPHA: usize = 3;
 
 /// Ceilings. A lookup that reaches one returns what it found.
@@ -179,6 +188,16 @@ pub async fn find_peers<N: GetPeers>(
                 if found.peers.len() >= limits.max_peers {
                     break;
                 }
+                // Validated ON INGRESS, not by whoever reads `found.peers`.
+                // A hostile responder that answers first with sixty-four
+                // addresses inside somebody's network fills the cap before an
+                // honest node is heard from, and every one of them is dropped
+                // later by a caller that has nothing left to use (report21
+                // V20-M6). An address that cannot be acted on must not occupy
+                // a slot an honest one could have had.
+                if crate::endpoint::is_internal(peer.ip()) {
+                    continue;
+                }
                 if heard_peers.insert(peer) {
                     found.peers.push(peer);
                 }
@@ -191,6 +210,14 @@ pub async fn find_peers<N: GetPeers>(
                 // A node that names itself, or names an unroutable address, is
                 // not a lead worth spending a query on.
                 if node.addr.port() == 0 || node.addr.ip().is_unspecified() {
+                    continue;
+                }
+                // And a lead pointing INSIDE is not a lead at all. The next
+                // round sends this address a KRPC datagram, so a responder
+                // that fills its `nodes` list with loopback, RFC1918 or a
+                // metadata endpoint has this host probe its own network on
+                // its behalf (report21 V20-M1b).
+                if crate::endpoint::is_internal(node.addr.ip()) {
                     continue;
                 }
                 let key = (id_distance(&node.id, &info_hash), node.addr);
@@ -354,9 +381,87 @@ mod tests {
     use std::net::{Ipv4Addr, SocketAddrV4};
     use std::sync::Mutex;
 
+    // 11.0.0.0/8 is globally routable, which these fixtures have to be: an
+    // address inside somebody's network is refused on ingress now, and a
+    // fixture built out of 10.x would be testing the filter rather than the
+    // walk.
+    /// report21 V20-M6/V20-M1b: an address inside somebody's network never
+    /// gets a query and never takes a peer slot.
+    ///
+    /// The lookup checked only `port != 0` and "not unspecified", so a hostile
+    /// responder had two things for free. Its `nodes` list aimed this host's
+    /// KRPC datagrams at loopback, at RFC1918, at a metadata endpoint — the
+    /// probing done by us, on its behalf. And its `values` filled all
+    /// sixty-four peer slots with addresses the caller must throw away, so an
+    /// honest node answering later had nowhere to be recorded.
+    #[tokio::test]
+    async fn a_lead_pointing_inside_our_network_is_not_followed_or_kept() {
+        use std::sync::Mutex;
+
+        struct Hostile(Mutex<Vec<SocketAddr>>);
+        impl GetPeers for Hostile {
+            async fn get_peers(
+                &self,
+                addr: SocketAddr,
+                _info_hash: NodeId,
+            ) -> Result<Response, QueryError> {
+                self.0.lock().expect("asked").push(addr);
+                Ok(Response::Peers {
+                    id: NodeId([1u8; 20]),
+                    token: vec![9],
+                    // Every kind of inside, plus one honest address so the
+                    // test cannot pass by refusing everything.
+                    peers: vec![
+                        "127.0.0.1:6881".parse().unwrap(),
+                        "10.0.0.5:6881".parse().unwrap(),
+                        "192.168.1.9:6881".parse().unwrap(),
+                        "169.254.169.254:80".parse().unwrap(),
+                        "[::ffff:127.0.0.1]:6881".parse().unwrap(),
+                        "[::1]:6881".parse().unwrap(),
+                        "11.9.9.9:6881".parse().unwrap(),
+                    ],
+                    nodes: vec![
+                        NodeInfo {
+                            id: NodeId([2u8; 20]),
+                            addr: "127.0.0.1:1234".parse().unwrap(),
+                        },
+                        NodeInfo {
+                            id: NodeId([3u8; 20]),
+                            addr: "10.0.0.7:22".parse().unwrap(),
+                        },
+                        NodeInfo {
+                            id: NodeId([4u8; 20]),
+                            addr: "[::ffff:192.168.0.1]:6881".parse().unwrap(),
+                        },
+                    ],
+                })
+            }
+        }
+
+        let net = Hostile(Mutex::new(Vec::new()));
+        let seeds = vec![SocketAddr::V4(SocketAddrV4::new(
+            Ipv4Addr::new(203, 0, 113, 1),
+            6881,
+        ))];
+        let found = find_peers(&net, NodeId([7u8; 20]), &seeds, Limits::default()).await;
+
+        assert_eq!(
+            found.peers,
+            vec!["11.9.9.9:6881".parse::<SocketAddr>().unwrap()],
+            "an address inside somebody's network took a peer slot, which is \
+             how a hostile first answer starves the honest ones"
+        );
+        let asked = net.0.lock().expect("asked").clone();
+        assert_eq!(
+            asked, seeds,
+            "the lookup sent a datagram somewhere other than the seed: a \
+             stranger chose which host on our side of the network we probe"
+        );
+    }
+
     fn addr(n: u16) -> SocketAddr {
         SocketAddr::V4(SocketAddrV4::new(
-            Ipv4Addr::new(10, 0, 0, (n % 250) as u8 + 1),
+            Ipv4Addr::new(11, 0, 0, (n % 250) as u8 + 1),
             n,
         ))
     }
@@ -505,7 +610,7 @@ mod tests {
                         .map(|k| NodeInfo {
                             id: NodeId([(255 - (n % 200) as u8); 20]),
                             addr: SocketAddr::V4(SocketAddrV4::new(
-                                Ipv4Addr::new(10, (n / 250) as u8, (n % 250) as u8, k + 1),
+                                Ipv4Addr::new(11, (n / 250) as u8, (n % 250) as u8, k + 1),
                                 4000 + n as u16,
                             )),
                         })
