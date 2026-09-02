@@ -266,7 +266,7 @@ mod all_covers_every_service {
 
     /// How many services there are. Bump it when you add one, and give the new
     /// variant the next ordinal below.
-    const SERVICE_COUNT: usize = 49;
+    const SERVICE_COUNT: usize = 50;
 
     /// A distinct number and a name per variant.
     ///

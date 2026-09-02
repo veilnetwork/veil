@@ -36,6 +36,15 @@ pub struct Limits {
     pub deadline: Duration,
     /// Wall clock for one query.
     pub per_query: Duration,
+    /// Most peer addresses to keep, across the whole lookup.
+    ///
+    /// Every address here came from a stranger: one `get_peers` response may
+    /// carry a full 64-KiB page of them, and a lookup makes up to `queries` of
+    /// those. Collecting them all and letting the caller take four means the
+    /// hostile case is bounded only by the deadline. Keeping a fixed number
+    /// costs nothing in the honest case -- a rendezvous with more than a few
+    /// dozen live nodes is one where the first few are as good as any.
+    pub max_peers: usize,
 }
 
 impl Default for Limits {
@@ -45,6 +54,7 @@ impl Default for Limits {
             queries: 96,
             deadline: Duration::from_secs(30),
             per_query: Duration::from_secs(4),
+            max_peers: 64,
         }
     }
 }
@@ -165,6 +175,9 @@ pub async fn find_peers<N: GetPeers>(
             };
 
             for peer in peers {
+                if found.peers.len() >= limits.max_peers {
+                    break;
+                }
                 if heard_peers.insert(peer) {
                     found.peers.push(peer);
                 }
@@ -296,6 +309,48 @@ fn id_distance(a: &NodeId, b: &NodeId) -> [u8; 20] {
 
 #[cfg(test)]
 mod tests {
+
+    #[tokio::test]
+    async fn one_lookup_keeps_a_bounded_number_of_addresses() {
+        // Every address in a `get_peers` reply came from a stranger, one reply
+        // may carry a 64-KiB page of them, and a lookup makes up to 96
+        // queries. Collecting all of them and letting the caller take four
+        // bounds the hostile case by the deadline alone.
+        struct Flood(u16);
+        impl GetPeers for Flood {
+            async fn get_peers(
+                &self,
+                _addr: SocketAddr,
+                _info_hash: NodeId,
+            ) -> Result<Response, QueryError> {
+                Ok(Response::Peers {
+                    id: NodeId([0u8; 20]),
+                    token: vec![1],
+                    peers: (0..self.0)
+                        .map(|i| {
+                            SocketAddrV4::new(std::net::Ipv4Addr::new(203, 0, 113, 9), 1024 + i)
+                        })
+                        .collect(),
+                    nodes: Vec::new(),
+                })
+            }
+        }
+
+        let limits = Limits {
+            max_peers: 8,
+            ..Default::default()
+        };
+        let seeds = vec![SocketAddr::V4(SocketAddrV4::new(
+            std::net::Ipv4Addr::new(203, 0, 113, 1),
+            6881,
+        ))];
+        let found = find_peers(&Flood(500), NodeId([7u8; 20]), &seeds, limits).await;
+        assert!(
+            found.peers.len() <= 8,
+            "a lookup kept {} addresses against a cap of 8",
+            found.peers.len()
+        );
+    }
     use super::*;
     use std::collections::HashMap;
     use std::net::{Ipv4Addr, SocketAddrV4};

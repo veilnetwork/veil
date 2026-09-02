@@ -1927,6 +1927,8 @@ impl NodeRuntime {
 
                 let net = (&client, std::time::Duration::from_secs(4));
                 let mut taken = 0usize;
+                // Every dial spends budget, success or not. See MAX_RENDEZVOUS_ATTEMPTS.
+                let mut tried = 0usize;
                 let mut already_had = 0usize;
                 let now = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
@@ -1960,9 +1962,16 @@ impl NodeRuntime {
                     // NOT gated on `me`. Announcing needs something to announce;
                     // dialling needs only a scheme, and a node with no listener --
                     // every client -- has one to dial with and nothing to offer.
-                    for addr in found.peers.iter().take(MAX_RENDEZVOUS_PEERS) {
-                        if taken >= MAX_RENDEZVOUS_PEERS {
+                    for addr in found.peers.iter().take(MAX_RENDEZVOUS_ATTEMPTS) {
+                        if taken >= MAX_RENDEZVOUS_PEERS || tried >= MAX_RENDEZVOUS_ATTEMPTS {
                             break;
+                        }
+                        if !rendezvous_destination_is_dialable(&addr.ip().to_string()) {
+                            logger.debug(
+                                "mainline.not_dialable",
+                                format!("{addr} is not a public address; not dialled"),
+                            );
+                            continue;
                         }
                         let transport = format!("{dial_scheme}://{addr}");
                         if rendezvous_address_is_self(my_address.as_ref(), &transport) {
@@ -1987,6 +1996,7 @@ impl NodeRuntime {
                             );
                             continue;
                         }
+                        tried += 1;
                         match dial_and_learn(&access, &state, &transport, &shutdown_tx).await {
                             Ok(node) => {
                                 taken += 1;
@@ -2142,6 +2152,8 @@ impl NodeRuntime {
                 }
 
                 let mut taken = 0usize;
+                // Every dial spends budget, success or not. See MAX_RENDEZVOUS_ATTEMPTS.
+                let mut tried = 0usize;
                 let mut already_had = 0usize;
                 let mut seen = std::collections::HashSet::new();
                 for label in &labels {
@@ -2168,7 +2180,7 @@ impl NodeRuntime {
                         );
 
                         for event in events {
-                            if taken >= MAX_RENDEZVOUS_PEERS {
+                            if taken >= MAX_RENDEZVOUS_PEERS || tried >= MAX_RENDEZVOUS_ATTEMPTS {
                                 break;
                             }
                             // A relay is a stranger's server and the content is
@@ -2180,6 +2192,13 @@ impl NodeRuntime {
                                 continue;
                             };
                             if host.is_empty() || port.parse::<u16>().is_err() {
+                                continue;
+                            }
+                            if !rendezvous_destination_is_dialable(host) {
+                                logger.debug(
+                                    "nostr.not_dialable",
+                                    format!("{host} is not a public address; not dialled"),
+                                );
                                 continue;
                             }
                             let transport = format!("{dial_scheme}://{host}:{port}");
@@ -2218,6 +2237,7 @@ impl NodeRuntime {
                                 );
                                 continue;
                             }
+                            tried += 1;
                             match dial_and_learn(&access, &state, &transport, &shutdown_tx).await {
                                 Ok(node) => {
                                     taken += 1;
@@ -2289,6 +2309,12 @@ impl NodeRuntime {
             return;
         };
 
+        // `global.bootstrap` governs THE ANNOUNCE, in its own words, and "a node
+        // with this off still USES the permissionless layers -- it asks and it
+        // listens. Only publishing is opt-in." Layers 7 and 8 honoured that;
+        // this one transmitted regardless, putting a stable identity key, PoW
+        // nonce, port and scheme on the wire for every machine on the segment.
+        let announce_self = config.global.bootstrap;
         let logger = self.logger.clone();
         let state = Arc::clone(&self.state);
         let dht = Arc::clone(&self.dht);
@@ -2333,7 +2359,7 @@ impl NodeRuntime {
             let mut next_announce = tokio::time::Instant::now();
             loop {
                 let bp = tokio::select! {
-                    _ = tokio::time::sleep_until(next_announce) => {
+                    _ = tokio::time::sleep_until(next_announce), if announce_self => {
                         if let Err(e) = discovery.announce_once().await {
                             // A LAN that will not take a multicast datagram is
                             // an ordinary state (no route, interface down, a
@@ -6029,6 +6055,19 @@ const RENDEZVOUS_INTERVAL: std::time::Duration = std::time::Duration::from_secs(
 /// one peer that works, not eight.
 const MAX_RENDEZVOUS_PEERS: usize = 4;
 
+/// How many addresses one pass may TRY, successful or not.
+///
+/// `MAX_RENDEZVOUS_PEERS` counts peers actually met, so an address that fails
+/// costs nothing against it -- and every address at a meeting point is one a
+/// stranger put there. Two labels across five relays, each answering with a
+/// full page of records, is several hundred consecutive dials this node would
+/// sit through before the pass ended, which is not an attack on anyone else
+/// but is a fine way to keep a node from ever bootstrapping.
+///
+/// Generous next to the four we keep: a rendezvous full of stale addresses is
+/// ordinary, and giving up after four failures would be worse than the problem.
+const MAX_RENDEZVOUS_ATTEMPTS: usize = 24;
+
 /// Dial an address nobody vouched for, and write down whoever answered.
 ///
 /// The row goes in with no identity, which is what makes the dial carry no
@@ -6069,12 +6108,32 @@ async fn dial_and_learn(
         bootstrap_only: true,
         source: crate::types::PeerSource::Rendezvous,
     };
-    lock_state(state).peers.insert(peer_id, row);
+    // ONLY IF THE SLOT IS FREE. The slot belongs to this address now, so a row
+    // already sitting in it is this same peer, proven on an earlier pass --
+    // and the placeholder would trade a real identity for a hash of the
+    // address and set `bootstrap_only`, which exempts the row from the
+    // direction policy. Worse, the failure path below would then delete it,
+    // orphaning a connector that may be holding a live session.
+    //
+    // Dialling the existing row is also strictly better: it carries the peer's
+    // key, so the handshake verifies who answers instead of taking whoever does.
+    let we_minted_the_row = {
+        let mut st = lock_state(state);
+        let vacant = !st.peers.contains_key(&peer_id);
+        if vacant {
+            st.peers.insert(peer_id, row);
+        }
+        vacant
+    };
 
     let session = match access.connect_peer_active(peer_id).await {
         Ok(session) => session,
         Err(e) => {
-            lock_state(state).peers.remove(&peer_id);
+            // Retire only what this call created. Removing a row we found here
+            // would delete a peer somebody else is talking to.
+            if we_minted_the_row {
+                lock_state(state).peers.remove(&peer_id);
+            }
             return Err(format!("{e}"));
         }
     };
@@ -6192,6 +6251,51 @@ pub fn admit_lan_peer(
 /// result as a peer that could not be reached -- which is what layer 8 did on
 /// its first live run, once every fifteen minutes, for the whole life of the
 /// node.
+/// Whether an address a stranger named is somewhere this node may dial.
+///
+/// A meeting point is an open index: the address in a record is whatever its
+/// author put there, and a DHT node can answer with anything at all. Without
+/// this, a signed Nostr author or a hostile DHT node could point the dial at
+/// `127.0.0.1`, at the RFC 1918 machine next to us, or at a cloud metadata
+/// endpoint, and the node would faithfully open a connection there. The
+/// handshake fails, so nothing is impersonated -- but which ports answered is
+/// itself the answer somebody wanted, and it is our host doing the probing.
+///
+/// Public sources may name public addresses. A peer on the LAN is reached
+/// through layer 6, which observes the address rather than being told it, and
+/// an operator who wants a private destination writes it in the config.
+pub fn rendezvous_destination_is_dialable(host: &str) -> bool {
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    let Ok(ip) = host.parse::<std::net::IpAddr>() else {
+        // A NAME, not an address. It resolves later and could resolve
+        // anywhere, so this layer does not accept one: every meeting point
+        // this node uses carries addresses.
+        return false;
+    };
+    match ip {
+        std::net::IpAddr::V4(v4) => {
+            !(v4.is_loopback()
+                || v4.is_private()
+                || v4.is_link_local()
+                || v4.is_unspecified()
+                || v4.is_broadcast()
+                || v4.is_multicast()
+                || v4.is_documentation()
+                // Carrier NAT (100.64.0.0/10): another operator's inside, not
+                // a place the public internet can reach.
+                || (v4.octets()[0] == 100 && (64..128).contains(&v4.octets()[1])))
+        }
+        std::net::IpAddr::V6(v6) => {
+            !(v6.is_loopback()
+                || v6.is_unspecified()
+                || v6.is_multicast()
+                // fc00::/7 unique-local and fe80::/10 link-local.
+                || (v6.segments()[0] & 0xfe00) == 0xfc00
+                || (v6.segments()[0] & 0xffc0) == 0xfe80)
+        }
+    }
+}
+
 /// Which peer slot a rendezvous address owns.
 ///
 /// STABLE FOR THE ADDRESS, and that is the whole point. The slot used to be
@@ -6250,6 +6354,15 @@ pub fn rendezvous_address_is_self(mine: Option<&(String, u16)>, transport: &str)
 
 pub fn public_address_for(config: &veil_cfg::Config) -> Option<(String, u16)> {
     for listener in &config.listen {
+        // The SAME gate `build_advertised_transports` applies, and for the same
+        // stated reason: "Trusted and Hidden listeners stay invisible on the
+        // network -- peers learn about them only through invite-bundles." A
+        // meeting point is the most public index there is, so a listener the
+        // operator marked unadvertisable must not reach one. Stealth is not
+        // even bound at startup, so publishing it would advertise a dead port.
+        if !listener.visibility.is_advertisable() {
+            continue;
+        }
         let uri = listener.advertise.as_deref().unwrap_or(&listener.transport);
         let Some((_, rest)) = uri.split_once("://") else {
             continue;
@@ -6292,6 +6405,11 @@ pub fn lan_announce_for(
     let pow_nonce: [u8; 4] = b64.decode(identity_nonce).ok()?.try_into().ok()?;
 
     for listener in &config.listen {
+        // See `public_address_for`: an unadvertisable listener is not offered
+        // at a meeting point, and a LAN announce is one.
+        if !listener.visibility.is_advertisable() {
+            continue;
+        }
         let uri = listener.advertise.as_deref().unwrap_or(&listener.transport);
         let Some((scheme_str, rest)) = uri.split_once("://") else {
             continue;
@@ -7096,6 +7214,50 @@ mod tests {
     }
 
     #[test]
+    fn an_address_a_stranger_named_is_not_dialled_into_this_network() {
+        // A meeting point is an open index. The address in a record is
+        // whatever its author wrote, and a DHT node answers with whatever it
+        // likes, so without this a stranger could aim this host's dial at
+        // loopback, at the machine next to it, or at a cloud metadata
+        // endpoint. The handshake fails either way -- but which ports answered
+        // is the answer they were after, and our host did the probing.
+        for private in [
+            "127.0.0.1",
+            "10.1.2.3",
+            "192.168.1.54",
+            "172.16.0.1",
+            "169.254.169.254", // the cloud metadata address
+            "100.64.0.1",      // carrier NAT
+            "0.0.0.0",
+            "255.255.255.255",
+            "224.0.0.1",
+            "203.0.113.9", // documentation range
+            "::1",
+            "[fe80::1]",
+            "[fc00::1]",
+            "veil.example.com", // a NAME resolves later, and could resolve anywhere
+        ] {
+            assert!(
+                !rendezvous_destination_is_dialable(private),
+                "{private} was accepted from a public meeting point"
+            );
+        }
+
+        // ...and a real public address still is, or the layer finds nobody.
+        for public in [
+            "8.8.8.8",
+            "203.12.31.146",
+            "1.1.1.1",
+            "[2001:4860:4860::8888]",
+        ] {
+            assert!(
+                rendezvous_destination_is_dialable(public),
+                "{public} is a public address and was refused"
+            );
+        }
+    }
+
+    #[test]
     fn a_node_does_not_dial_its_own_announcement() {
         // Found live, on layer 8's first real run: the node announced itself,
         // read its own record back on the same pass, dialled its own listener
@@ -7166,6 +7328,102 @@ mod tests {
         ] {
             assert!(!rendezvous_address_is_self(None, any));
         }
+    }
+
+    fn listener_seen_as(uri: &str, visibility: veil_cfg::Visibility) -> veil_cfg::ListenConfig {
+        let mut l = listener(uri, None);
+        l.visibility = visibility;
+        l
+    }
+
+    #[test]
+    fn every_meeting_point_asks_freely_and_publishes_only_on_opt_in() {
+        // `global.bootstrap` says of itself: "This flag governs the ANNOUNCE
+        // and nothing else... A node with this off still USES the
+        // permissionless layers -- it asks and it listens. Only publishing is
+        // opt-in." Layers 7 and 8 read it; layer 6 transmitted regardless,
+        // putting a stable identity key, PoW nonce, port and scheme on the
+        // wire for every machine on the segment.
+        //
+        // Read from the source, so a layer that stops consulting the flag
+        // fails here rather than on somebody's network.
+        let src = include_str!("service_tasks.rs");
+        let span = |name: &str| {
+            let at = src
+                .find(name)
+                .unwrap_or_else(|| panic!("{name} is gone; this guard is stale"));
+            let body = &src[at..];
+            let end = body.find("\n    }\n").unwrap_or(body.len());
+            &body[..end]
+        };
+        for task in [
+            "pub fn spawn_lan_discovery_task",
+            "pub fn spawn_mainline_discovery_task",
+            "pub fn spawn_nostr_discovery_task",
+        ] {
+            assert!(
+                span(task).contains("config.global.bootstrap"),
+                "{task} never consults `global.bootstrap`, so it publishes \
+                 whether or not the operator opted in"
+            );
+        }
+        // ...and the LAN transmit specifically is conditioned on it, rather
+        // than merely mentioning it somewhere.
+        assert!(
+            span("pub fn spawn_lan_discovery_task").contains("if announce_self"),
+            "the LAN announce timer is not gated on the opt-in"
+        );
+    }
+
+    #[test]
+    fn a_listener_the_operator_hid_is_not_offered_at_a_meeting_point() {
+        use veil_cfg::Visibility;
+        // `build_advertised_transports` states the contract: "Trusted and
+        // Hidden listeners stay invisible on the network -- peers learn about
+        // them only through invite-bundles." A meeting point is the most public
+        // index there is. Stealth is not even bound at startup, so publishing
+        // it would advertise a port that answers nobody.
+        let (key, nonce) = identity_b64();
+        for hidden in [Visibility::Trusted, Visibility::Hidden, Visibility::Stealth] {
+            let mut c = veil_cfg::Config::default();
+            c.listen = vec![listener_seen_as(
+                "obfs4-tcp://203.0.113.9:5556",
+                hidden.clone(),
+            )];
+            assert_eq!(
+                public_address_for(&c),
+                None,
+                "a {hidden:?} listener was offered as this node's public address"
+            );
+            assert!(
+                lan_announce_for(&c, &key, &nonce).is_none(),
+                "a {hidden:?} listener was announced on the local network"
+            );
+        }
+
+        // Public still works, or the gate would silence every layer.
+        let mut c = veil_cfg::Config::default();
+        c.listen = vec![listener_seen_as(
+            "obfs4-tcp://203.0.113.9:5556",
+            Visibility::Public,
+        )];
+        assert_eq!(
+            public_address_for(&c),
+            Some(("203.0.113.9".to_owned(), 5556))
+        );
+        assert!(lan_announce_for(&c, &key, &nonce).is_some());
+
+        // A hidden listener does not veto a public one standing behind it.
+        let mut c = veil_cfg::Config::default();
+        c.listen = vec![
+            listener_seen_as("obfs4-tcp://198.51.100.1:5556", Visibility::Hidden),
+            listener_seen_as("obfs4-tcp://203.0.113.9:5557", Visibility::Public),
+        ];
+        assert_eq!(
+            public_address_for(&c),
+            Some(("203.0.113.9".to_owned(), 5557)),
+            "the hidden listener hid the public one behind it"
+        );
     }
 
     #[test]
