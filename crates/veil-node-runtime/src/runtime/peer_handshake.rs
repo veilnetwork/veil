@@ -1195,7 +1195,7 @@ pub async fn register_connection_session(
                     ),
                 );
                 return Err(NodeError::Handshake(format!(
-                    "duplicate session to node {} — rejected link_id={}",
+                    "{DUPLICATE_SESSION} to node {} — rejected link_id={}",
                     veil_util::hex_short(&remote_nid),
                     link_id,
                 )));
@@ -1556,6 +1556,17 @@ pub fn handshake_remote_id(
         SessionSource::Inbound(_) => None,
     }
 }
+
+/// How a refused duplicate says so.
+///
+/// A CONTRACT, not a log line. A dial refused for this reason is not a failure
+/// to retry: it is the answer "you already have a session with whoever is at
+/// that address", and the rendezvous layer reads it that way -- without it,
+/// the node redials the same peer at every pass forever, because the thing
+/// that would teach it otherwise only happens on a dial that succeeds.
+///
+/// Shared so the producer and the reader cannot drift apart silently.
+pub const DUPLICATE_SESSION: &str = "duplicate session";
 
 pub fn peer_transport_context(
     base: &TransportContext,

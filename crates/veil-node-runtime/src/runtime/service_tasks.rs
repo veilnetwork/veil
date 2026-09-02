@@ -1996,6 +1996,17 @@ impl NodeRuntime {
                             );
                             continue;
                         }
+                        if !we_should_place_the_call(
+                            &access.local_node_id,
+                            &access.discovered_peers_cache,
+                            &transport,
+                        ) {
+                            logger.debug(
+                                "mainline.theirs_to_call",
+                                format!("{transport} keeps the outbound; not dialled"),
+                            );
+                            continue;
+                        }
                         tried += 1;
                         match dial_and_learn(&access, &state, &transport, &shutdown_tx).await {
                             Ok(node) => {
@@ -2234,6 +2245,17 @@ impl NodeRuntime {
                                 logger.debug(
                                     "nostr.already_known",
                                     format!("{transport} is already a peer; not dialled"),
+                                );
+                                continue;
+                            }
+                            if !we_should_place_the_call(
+                                &access.local_node_id,
+                                &access.discovered_peers_cache,
+                                &transport,
+                            ) {
+                                logger.debug(
+                                    "nostr.theirs_to_call",
+                                    format!("{transport} keeps the outbound; not dialled"),
                                 );
                                 continue;
                             }
@@ -6129,12 +6151,24 @@ async fn dial_and_learn(
     let session = match access.connect_peer_active(peer_id).await {
         Ok(session) => session,
         Err(e) => {
+            let refusal = format!("{e}");
+            // "Already yours" is an ANSWER, not a failure. Keeping the row is
+            // what makes it stick: `rendezvous_address_is_new` reads the peer
+            // table, so the next pass skips this address instead of dialling
+            // it again. Without this the larger-node-id side of every pair
+            // redials forever -- the only thing that would teach it otherwise
+            // is a successful dial, and its dials are all refused as
+            // duplicates. Measured: 24 refusals in 54 minutes, and `already_*`
+            // never once.
+            if refusal.contains(crate::runtime::peer_handshake::DUPLICATE_SESSION) {
+                return Err(refusal);
+            }
             // Retire only what this call created. Removing a row we found here
             // would delete a peer somebody else is talking to.
             if we_minted_the_row {
                 lock_state(state).peers.remove(&peer_id);
             }
-            return Err(format!("{e}"));
+            return Err(refusal);
         }
     };
 
@@ -6294,6 +6328,41 @@ pub fn rendezvous_destination_is_dialable(host: &str) -> bool {
                 || (v6.segments()[0] & 0xffc0) == 0xfe80)
         }
     }
+}
+
+/// Whether this node is the one that should place the call.
+///
+/// For a pair, exactly one side dials: `we_keep_outbound = ours < theirs`, and
+/// the other waits. `outbound_connector` has always honoured it; the rendezvous
+/// dial goes straight to `connect_peer_active` and never did, so both ends of
+/// every pair called each other at every pass. The larger id's dial is then
+/// refused as a duplicate -- and around each refusal the working sessions were
+/// observed closing and re-opening.
+///
+/// Only answerable once the address has an identity. The discovered-peer cache
+/// holds `address -> public key` for every peer we have completed a dial with,
+/// and a first meeting has no entry: then this says yes, because somebody has
+/// to call first and that is how the mapping is learned at all.
+pub fn we_should_place_the_call(
+    local_node_id: &[u8; 32],
+    cache: &std::sync::Arc<std::sync::Mutex<veil_bootstrap::DiscoveredPeerCache>>,
+    transport: &str,
+) -> bool {
+    let Some(want) = transport
+        .split_once("://")
+        .and_then(|(_, rest)| rendezvous_authority(rest))
+    else {
+        return false;
+    };
+    for peer in lock!(cache).snapshot() {
+        if rendezvous_authority(&peer.transport).is_none_or(|have| have != want) {
+            continue;
+        }
+        if let Ok(id) = veil_cfg::NodeId::from_public_key(peer.algo, &peer.public_key) {
+            return local_node_id.as_slice() < id.as_bytes().as_slice();
+        }
+    }
+    true
 }
 
 /// Which peer slot a rendezvous address owns.
@@ -7117,6 +7186,102 @@ mod tests {
         let mut c = veil_cfg::Config::default();
         c.listen = uris.iter().map(|(u, a)| listener(u, *a)).collect();
         public_address_for(&c)
+    }
+
+    #[test]
+    fn exactly_one_side_of_a_pair_places_the_call() {
+        use veil_bootstrap::DiscoveredPeerCache;
+        use veil_cfg::{NodeId, SignatureAlgorithm};
+
+        // A pair dials one way: `ours < theirs`. `outbound_connector` has
+        // always honoured that; the rendezvous dial went straight to
+        // `connect_peer_active` and never did, so both ends called each other
+        // at every pass. Measured on a production seed with the largest id:
+        // 24 dials in 54 minutes, every one refused as a duplicate.
+        let key = "fyU1fAlyHVNMat6NZBJ+KBU/aeJhCP+OBsomlgJ1Cjo=";
+        let theirs = NodeId::from_public_key(SignatureAlgorithm::Ed25519, key).expect("valid");
+        let addr = "obfs4-tcp://198.51.100.7:5556";
+
+        let mut c = DiscoveredPeerCache::in_memory();
+        c.upsert(
+            veil_cfg::BootstrapPeer {
+                transport: addr.to_owned(),
+                public_key: key.to_owned(),
+                nonce: "AOCZRA==".to_owned(),
+                algo: SignatureAlgorithm::Ed25519,
+                tls_cert: None,
+                tls_ca_cert: None,
+            },
+            1_700_000_000,
+        );
+        let cache = Arc::new(std::sync::Mutex::new(c));
+
+        let mut smaller = *theirs.as_bytes();
+        smaller[0] = smaller[0].wrapping_sub(1);
+        let mut larger = *theirs.as_bytes();
+        larger[0] = larger[0].wrapping_add(1);
+
+        assert!(
+            we_should_place_the_call(&smaller, &cache, addr),
+            "the smaller id must call, or nobody does"
+        );
+        assert!(
+            !we_should_place_the_call(&larger, &cache, addr),
+            "the larger id called anyway; its dial is refused as a duplicate \
+             and the working session goes down around the refusal"
+        );
+
+        // A first meeting has no mapping, and somebody has to call or the
+        // mapping is never learned at all.
+        let empty = Arc::new(std::sync::Mutex::new(DiscoveredPeerCache::in_memory()));
+        assert!(we_should_place_the_call(&larger, &empty, addr));
+        // An address the cache knows nothing about is a first meeting too.
+        assert!(we_should_place_the_call(
+            &larger,
+            &cache,
+            "obfs4-tcp://203.0.113.9:5556"
+        ));
+        // Nothing dialable, nothing to decide.
+        assert!(!we_should_place_the_call(
+            &smaller,
+            &cache,
+            "no-scheme-here"
+        ));
+    }
+
+    #[test]
+    fn a_refused_duplicate_is_an_answer_and_keeps_its_row() {
+        // The producer and the reader of this refusal live in different files,
+        // and the reader matches on the text. Pin them together, or a reworded
+        // message turns "you already have this peer" back into "retry next
+        // pass" -- which is the loop that was measured.
+        let produced = include_str!("peer_handshake.rs");
+        assert!(
+            produced.contains("{DUPLICATE_SESSION} to node"),
+            "the refusal no longer carries the shared marker"
+        );
+        let reader = include_str!("service_tasks.rs");
+        assert!(
+            reader.contains("refusal.contains(crate::runtime::peer_handshake::DUPLICATE_SESSION)"),
+            "the rendezvous dial no longer recognises the refusal"
+        );
+        // And the row survives it: removing it is what made the next pass
+        // dial the same peer again.
+        let at = reader
+            .find("let refusal = format!(\"{e}\");")
+            .expect("the failure arm is gone; this guard is stale");
+        let arm = &reader[at..];
+        let recognise = arm
+            .find("DUPLICATE_SESSION")
+            .expect("the failure arm no longer recognises a duplicate");
+        let remove = arm
+            .find("peers.remove(&peer_id)")
+            .expect("the failure arm no longer removes anything; guard is stale");
+        assert!(
+            recognise < remove,
+            "the row is removed before the duplicate case is recognised, so the \
+             next pass dials the same peer again"
+        );
     }
 
     #[test]

@@ -1,5 +1,32 @@
 # Changelog
 
+## v0.10.5 — 2026-09-02
+
+**Both ends of a pair were calling each other.** For any two nodes exactly one
+places the call — `we_keep_outbound = ours < theirs` — and the other waits.
+`outbound_connector` has always honoured that. The rendezvous dial goes
+straight to `connect_peer_active` and never did, so the node that should only
+have been answering dialled too, at every pass, forever.
+
+Its dial is refused as a duplicate, which is correct. What was not correct is
+that the refusal was treated as a failure: the peer row was deleted, so the
+next pass saw the address as unknown and dialled it again. The one thing that
+would have taught it otherwise — a completed dial, which writes the
+address-to-identity mapping — could never happen, because every dial was
+refused. A closed loop, and around each refusal the working sessions were
+observed closing and re-opening.
+
+A refusal for that reason is now read as the answer it is: this address is
+already ours, keep the row, stop dialling. And the direction rule reaches the
+rendezvous dial as soon as the identity behind an address is known; a first
+meeting still dials, because somebody has to call or the mapping is never
+learned.
+
+Measured on the production seeds, on the link that churned every 57 seconds:
+reconnects went from 23 in 54 minutes to four, all inside the first 22 seconds
+of start, and then none for the following 22 minutes. The node with the largest
+id went from 24 refused dials to two, one per address, and then stopped.
+
 ## v0.10.4 — 2026-09-02
 
 An external audit (report20) went through the meeting-point work. Four of its
