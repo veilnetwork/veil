@@ -418,6 +418,16 @@ pub mod rocks {
         /// recorded in the reverse map — a recorded length that has drifted
         /// away from its value is one of the states reconciliation repairs.
         seed_bytes: u64,
+        /// Test-only: how many `WriteBatch`es this store has pushed to disk.
+        ///
+        /// The instrument for atomicity. "The eviction and the entry it makes
+        /// room for travel together" is a statement about the NUMBER of
+        /// durable writes, and nothing else observes it: with two batches the
+        /// end state after a SUCCESSFUL put is identical, and the divergence
+        /// only appears at a crash or a failure between them — neither of
+        /// which a test can stand in the middle of (report20 V18-M1).
+        #[cfg(test)]
+        writes: std::sync::atomic::AtomicUsize,
     }
 
     impl RocksDbCold {
@@ -498,6 +508,8 @@ pub mod rocks {
                 capacity,
                 count,
                 seed_bytes,
+                #[cfg(test)]
+                writes: std::sync::atomic::AtomicUsize::new(0),
             })
         }
 
@@ -524,6 +536,8 @@ pub mod rocks {
                 capacity,
                 count,
                 seed_bytes,
+                #[cfg(test)]
+                writes: std::sync::atomic::AtomicUsize::new(0),
             })
         }
 
@@ -757,6 +771,21 @@ pub mod rocks {
             }
         }
 
+        /// The ONE place a batch reaches the disk, so the count of durable
+        /// writes per operation is a thing a test can assert.
+        fn write_batch(&self, batch: rocksdb::WriteBatch) -> Result<(), rocksdb::Error> {
+            #[cfg(test)]
+            self.writes
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.db.write(batch)
+        }
+
+        /// Test-only: durable writes since `open`.
+        #[cfg(test)]
+        pub fn durable_write_count(&self) -> usize {
+            self.writes.load(std::sync::atomic::Ordering::Relaxed)
+        }
+
         /// Stage EVERY row an entry owns: the value, both index rows, and the
         /// two side columns. Returns whether the entry was indexed, so a
         /// caller can move the maintained count only when its write lands.
@@ -777,6 +806,79 @@ pub mod rocks {
             was_indexed
         }
 
+        /// Pick the oldest live entry and stage its removal into `batch`,
+        /// WITHOUT writing anything. Returns the victim and whether it was
+        /// indexed (so the caller moves the count only once its batch lands).
+        ///
+        /// Separate from the write so that an eviction made to admit a new
+        /// entry travels in the SAME batch as that entry (report20 V18-M1).
+        /// Two batches meant the victim could leave and the newcomer never
+        /// arrive: on a failed put the caller returned `Failed` and dropped
+        /// the victim on the floor, so the tier's byte accounting kept
+        /// charging for a value that was already gone, and a crash in the
+        /// window lost the old value to make room for nothing.
+        fn stage_evict_oldest(
+            &mut self,
+            batch: &mut rocksdb::WriteBatch,
+        ) -> Option<([u8; 32], Vec<u8>, bool)> {
+            // Walk the ts-index oldest-first. A row whose value is already
+            // gone — a torn write, or a value delete whose index delete failed
+            // — must be DROPPED AND SKIPPED, never read as "there is nothing
+            // to evict". Such a row is by construction the SMALLEST index key,
+            // so bailing out on it (the old `?` on the value lookup) stopped
+            // eviction for the whole cold tier permanently: the entry cap and
+            // the cold half of `TieredStore`'s byte-cap loop stayed frozen
+            // while the loop chewed through the hot tier on every put, until
+            // the node degenerated to an almost-empty hot tier in front of a
+            // frozen, over-full cold one — with no recovery short of deleting
+            // the database (audit report5).
+            let mut victim: Option<Victim> = None;
+            let mut dangling: Vec<Box<[u8]>> = Vec::new();
+            for item in self
+                .db
+                .iterator_cf(self.cf_ix(), rocksdb::IteratorMode::Start)
+            {
+                let Ok((ix_key, _)) = item else { break };
+                // Row layout is `ts_be(8) ‖ key(32)`; a short row is corrupt
+                // and is treated exactly like a dangling one.
+                let live = <[u8; 32]>::try_from(ix_key.get(8..40).unwrap_or_default())
+                    .ok()
+                    .and_then(|key| self.db.get(key).ok().flatten().map(|v| (key, v)));
+                match live {
+                    Some((key, value)) => {
+                        victim = Some((ix_key, key, value));
+                        break;
+                    }
+                    None => dangling.push(ix_key),
+                }
+            }
+            // Drop every dangling row walked past, so the next call does not
+            // pay for them again. `unindex` cannot do this: it locates the
+            // ts-index row THROUGH the reverse map, which is precisely what a
+            // dangling row is missing.
+            if !dangling.is_empty() {
+                let mut repair = rocksdb::WriteBatch::default();
+                for ix_key in &dangling {
+                    repair.delete_cf(self.cf_ix(), ix_key);
+                }
+                if let Err(e) = self.write_batch(repair) {
+                    log::warn!("dht.cold.rocksdb: dangling ts-index cleanup failed: {e}");
+                }
+            }
+            let (ix_key, key, value) = victim?;
+            // The SAME staging as an ordinary delete, which is the point: an
+            // eviction that dropped the value and kept the entry's origin and
+            // first-seen stamp is how two uncounted column families grew
+            // without bound under churn (report17 V17-M2).
+            let was_indexed = self.stage_full_delete(batch, &key);
+            // Delete THIS row directly as well: `stage_unindex` reaches the
+            // ts-index through the reverse map's ts, so a missing or drifted
+            // reverse map would otherwise leave the row behind as a fresh
+            // dangler.
+            batch.delete_cf(self.cf_ix(), &ix_key);
+            Some((key, value, was_indexed))
+        }
+
         /// Delete an entry — value, both index rows and both side rows — in
         /// ONE batch, and move the maintained count only if the write landed.
         /// Returns whether it did: a caller that credits bytes back for a
@@ -785,7 +887,7 @@ pub mod rocks {
         fn delete_entry(&mut self, key: &[u8; 32]) -> bool {
             let mut batch = rocksdb::WriteBatch::default();
             let was_indexed = self.stage_full_delete(&mut batch, key);
-            if let Err(e) = self.db.write(batch) {
+            if let Err(e) = self.write_batch(batch) {
                 log::warn!("dht.cold.rocksdb: entry delete failed: {e}");
                 return false;
             }
@@ -894,12 +996,33 @@ pub mod rocks {
             // Evicting first makes that impossible by construction rather than
             // by argument: the new key is not in the index yet, so it cannot
             // be chosen.
+            //
+            // And it travels in the SAME batch as the entry it makes room for
+            // (report20 V18-M1). Two batches had two bad ends: the write in
+            // between could crash, losing the victim to admit nothing, and a
+            // failed put returned `Failed` while the victim — already gone
+            // from disk — was dropped from the return value, so the tier went
+            // on charging bytes for a value it no longer had.
+            let mut batch = rocksdb::WriteBatch::default();
             let mut evicted: Option<([u8; 32], Vec<u8>)> = None;
+            let mut evicted_was_indexed = false;
             if self.capacity > 0
                 && self.count >= self.capacity
                 && !matches!(self.db.get_cf(self.cf_kt(), key), Ok(Some(_)))
             {
-                evicted = self.evict_oldest();
+                // The `victim != key` arm: staged deletes for the very key
+                // being written would be overwritten by the puts below — the
+                // entry would still be there, so reporting it evicted would
+                // credit its bytes back twice. It cannot normally be chosen
+                // (it has no reverse-map row, checked just above), but a torn
+                // legacy row could put it in the index, and the caller's
+                // accounting must not depend on that not happening.
+                if let Some((victim, value, was_indexed)) = self.stage_evict_oldest(&mut batch)
+                    && victim != key
+                {
+                    evicted_was_indexed = was_indexed;
+                    evicted = Some((victim, value));
+                }
             }
             // ONE batch per logical put. A stored entry is three rows — the
             // value, the reverse map, the ts-index — and they used to go to
@@ -913,7 +1036,7 @@ pub mod rocks {
             // used to freeze eviction for the whole tier (audit report5).
             // RocksDB applies a WriteBatch atomically across column families,
             // so the only two outcomes now are all three rows or none.
-            let mut batch = rocksdb::WriteBatch::default();
+            //
             // Drop any stale (old_ts, key) row first. Same batch, applied in
             // insertion order, so an overwrite within the same wall-clock
             // second still ends with the fresh rows rather than deleting them.
@@ -935,7 +1058,7 @@ pub mod rocks {
                 // value inherit the age of whatever was here before.
                 None => batch.delete_cf(self.cf_first_seen(), key),
             }
-            if let Err(e) = self.db.write(batch) {
+            if let Err(e) = self.write_batch(batch) {
                 // Hand the value BACK rather than dropping it. Returning
                 // `None` here was indistinguishable from "stored, nothing
                 // evicted", so a disk-full write silently lost a DHT value
@@ -944,7 +1067,12 @@ pub mod rocks {
                 log::warn!("dht.cold.rocksdb: put failed ({e}); not stored");
                 return ColdPut::Failed(value);
             }
-            // The entry is real only now, so only now does it count.
+            // The entry is real only now, so only now does it count — and
+            // the eviction landed in the very same write, so its count moves
+            // here too or not at all.
+            if evicted_was_indexed {
+                self.count = self.count.saturating_sub(1);
+            }
             if !was_indexed {
                 self.count += 1;
             }
@@ -1150,67 +1278,13 @@ pub mod rocks {
             removed
         }
 
+        /// Evict on its own — the maintenance path, where there is no
+        /// newcomer to travel with. Everything the entry owns leaves in one
+        /// batch or the eviction did not happen and must not be reported.
         fn evict_oldest(&mut self) -> Option<([u8; 32], Vec<u8>)> {
-            // Walk the ts-index oldest-first. A row whose value is already
-            // gone — a torn write, or a value delete whose index delete failed
-            // — must be DROPPED AND SKIPPED, never read as "there is nothing
-            // to evict". Such a row is by construction the SMALLEST index key,
-            // so bailing out on it (the old `?` on the value lookup) stopped
-            // eviction for the whole cold tier permanently: the entry cap and
-            // the cold half of `TieredStore`'s byte-cap loop stayed frozen
-            // while the loop chewed through the hot tier on every put, until
-            // the node degenerated to an almost-empty hot tier in front of a
-            // frozen, over-full cold one — with no recovery short of deleting
-            // the database (audit report5).
-            let mut victim: Option<Victim> = None;
-            let mut dangling: Vec<Box<[u8]>> = Vec::new();
-            for item in self
-                .db
-                .iterator_cf(self.cf_ix(), rocksdb::IteratorMode::Start)
-            {
-                let Ok((ix_key, _)) = item else { break };
-                // Row layout is `ts_be(8) ‖ key(32)`; a short row is corrupt
-                // and is treated exactly like a dangling one.
-                let live = <[u8; 32]>::try_from(ix_key.get(8..40).unwrap_or_default())
-                    .ok()
-                    .and_then(|key| self.db.get(key).ok().flatten().map(|v| (key, v)));
-                match live {
-                    Some((key, value)) => {
-                        victim = Some((ix_key, key, value));
-                        break;
-                    }
-                    None => dangling.push(ix_key),
-                }
-            }
-            // Drop every dangling row walked past, so the next call does not
-            // pay for them again. `unindex` cannot do this: it locates the
-            // ts-index row THROUGH the reverse map, which is precisely what a
-            // dangling row is missing.
-            if !dangling.is_empty() {
-                let mut repair = rocksdb::WriteBatch::default();
-                for ix_key in &dangling {
-                    repair.delete_cf(self.cf_ix(), ix_key);
-                }
-                if let Err(e) = self.db.write(repair) {
-                    log::warn!("dht.cold.rocksdb: dangling ts-index cleanup failed: {e}");
-                }
-            }
-            let (ix_key, key, value) = victim?;
-            // One batch again: everything the entry owns leaves together or
-            // the eviction did not happen and must not be reported.
-            //
-            // The SAME staging as an ordinary delete, which is the point: an
-            // eviction that dropped the value and kept the entry's origin and
-            // first-seen stamp is how two uncounted column families grew
-            // without bound under churn (report17 V17-M2).
             let mut batch = rocksdb::WriteBatch::default();
-            let was_indexed = self.stage_full_delete(&mut batch, &key);
-            // Delete THIS row directly as well: `stage_unindex` reaches the
-            // ts-index through the reverse map's ts, so a missing or drifted
-            // reverse map would otherwise leave the row behind as a fresh
-            // dangler.
-            batch.delete_cf(self.cf_ix(), &ix_key);
-            if let Err(e) = self.db.write(batch) {
+            let (key, value, was_indexed) = self.stage_evict_oldest(&mut batch)?;
+            if let Err(e) = self.write_batch(batch) {
                 log::warn!("dht.cold.rocksdb: eviction of the oldest entry failed: {e}");
                 return None;
             }
@@ -3744,6 +3818,86 @@ mod tests {
         );
         assert_eq!(cold.reverse_map_row_count(), 1);
         assert_eq!(cold.ts_index_row_count(), 1);
+        assert_eq!(cold.cold_total_bytes(), Some(6));
+    }
+
+    /// report20 V18-M1: the eviction that makes room and the entry it makes
+    /// room FOR are one durable write.
+    ///
+    /// They used to be two. Between them the victim was already off the disk
+    /// while the newcomer was not yet on it, and the window has two ends: a
+    /// crash there loses the old value to admit nothing, and a failed put
+    /// returns `Failed` — dropping the victim from the return value — so the
+    /// tier goes on charging bytes for a value it no longer holds and the
+    /// byte cap evicts against a number that only grows.
+    ///
+    /// A successful put ends in the same state either way, so the end state
+    /// proves nothing; the number of writes is the property.
+    #[cfg(feature = "rocksdb-cold")]
+    #[test]
+    fn rocksdb_cold_an_eviction_travels_in_the_batch_of_the_entry_it_admits() {
+        use super::ColdBackend;
+        let dir = tempfile::tempdir().unwrap();
+        let mut cold = super::rocks::RocksDbCold::open(dir.path().join("c"), 2).unwrap();
+        cold.put([1u8; 32], b"one".to_vec());
+        cold.put([2u8; 32], b"two".to_vec());
+        assert_eq!(cold.len(), 2, "premise: the tier is at its cap");
+
+        let before = cold.durable_write_count();
+        let outcome = cold.put([3u8; 32], b"three".to_vec());
+        let writes = cold.durable_write_count() - before;
+
+        assert!(
+            matches!(&outcome, super::ColdPut::Stored(Some(_))),
+            "premise: this put had to evict to fit: {outcome:?}"
+        );
+        assert_eq!(
+            writes, 1,
+            "the eviction and the insertion reached the disk as {writes} \
+             separate writes: everything between them is a state where the \
+             victim is gone and the newcomer never arrived"
+        );
+
+        // And the tier is consistent afterwards, on disk as well as in memory.
+        assert_eq!(cold.len(), 2);
+        assert!(cold.contains(&[3u8; 32]), "the newcomer is stored");
+        assert_eq!(cold.reverse_map_row_count(), 2);
+        assert_eq!(cold.ts_index_row_count(), 2);
+    }
+
+    /// The return contract at the cap: a put that fails reports no eviction
+    /// and leaves every victim in place.
+    ///
+    /// This one does NOT prove the atomicity — a read-only handle refuses
+    /// both writes, so the two-batch code reaches the same end state. It pins
+    /// the contract; the write count above is what pins them together.
+    #[cfg(feature = "rocksdb-cold")]
+    #[test]
+    fn rocksdb_cold_a_failed_put_evicts_nobody() {
+        use super::ColdBackend;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("c");
+        {
+            let mut cold = super::rocks::RocksDbCold::open(&path, 2).unwrap();
+            cold.put([1u8; 32], b"one".to_vec());
+            cold.put([2u8; 32], b"two".to_vec());
+        }
+        {
+            let mut cold = super::rocks::RocksDbCold::open_read_only(&path, 2).unwrap();
+            assert_eq!(cold.len(), 2, "premise: at the cap, so a put must evict");
+            let outcome = cold.put([3u8; 32], b"three".to_vec());
+            assert!(
+                matches!(&outcome, super::ColdPut::Failed(v) if v.as_slice() == b"three"),
+                "a refused disk must hand the value back: {outcome:?}"
+            );
+            assert_eq!(cold.len(), 2, "and must not move the count");
+        }
+        let cold = super::rocks::RocksDbCold::open(&path, 2).unwrap();
+        assert!(
+            cold.contains(&[1u8; 32]) && cold.contains(&[2u8; 32]),
+            "the put failed, so nothing was evicted to make room for it"
+        );
+        assert!(!cold.contains(&[3u8; 32]));
         assert_eq!(cold.cold_total_bytes(), Some(6));
     }
 
