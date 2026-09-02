@@ -37,11 +37,50 @@ pub unsafe extern "C" fn tun2proxy_run_with_cli_args(cli_args: *const c_char, tu
     general_run_for_api(args, tun_mtu, packet_information)
 }
 
-static TUN_QUIT: std::sync::Mutex<Option<tokio_util::sync::CancellationToken>> = std::sync::Mutex::new(None);
+/// The running tunnel's cancellation token, and WHICH run installed it.
+///
+/// The generation is what makes the slot ownable. Without it the teardown at
+/// the end of a run cleared whatever was in here, and there is a window where
+/// that is not its own: a run finishes, a stop takes and cancels its token,
+/// a NEW run starts and installs the next one — and then the first run's
+/// teardown, resuming, removes it. The second tunnel is then running with
+/// nothing to stop it, and `tun2proxy_stop` answers -1 for the life of the
+/// process (report20 V18-M7).
+static TUN_QUIT: std::sync::Mutex<Option<(u64, tokio_util::sync::CancellationToken)>> = std::sync::Mutex::new(None);
+
+static NEXT_RUN_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Take the run slot, or `None` when a tunnel is already in it.
+fn claim_run_slot() -> Option<(u64, tokio_util::sync::CancellationToken)> {
+    let mut lock = TUN_QUIT.lock().ok()?;
+    if lock.is_some() {
+        return None;
+    }
+    let generation = NEXT_RUN_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let token = tokio_util::sync::CancellationToken::new();
+    *lock = Some((generation, token.clone()));
+    Some((generation, token))
+}
+
+/// Give the slot back — only if it still holds THIS run.
+///
+/// Returns whether it did, which is the difference between "I cleaned up after
+/// myself" and "somebody else's tunnel is in there now and I nearly unhooked
+/// its stop".
+fn release_run_slot(generation: u64) -> bool {
+    let Ok(mut lock) = TUN_QUIT.lock() else {
+        return false;
+    };
+    if lock.as_ref().is_some_and(|(g, _)| *g == generation) {
+        lock.take();
+        return true;
+    }
+    false
+}
 
 pub(crate) fn tun2proxy_stop_internal() -> c_int {
     if let Ok(mut lock) = TUN_QUIT.lock() {
-        if let Some(shutdown_token) = lock.take() {
+        if let Some((_, shutdown_token)) = lock.take() {
             shutdown_token.cancel();
             return 0;
         }
@@ -55,17 +94,10 @@ pub fn general_run_for_api(args: Args, tun_mtu: u16, packet_information: bool) -
         log::debug!("set logger error: {err}");
     }
 
-    let shutdown_token = tokio_util::sync::CancellationToken::new();
-    if let Ok(mut lock) = TUN_QUIT.lock() {
-        if lock.is_some() {
-            log::error!("tun2proxy already started");
-            return -1;
-        }
-        *lock = Some(shutdown_token.clone());
-    } else {
-        log::error!("failed to lock tun2proxy quit token");
-        return -2;
-    }
+    let Some((generation, shutdown_token)) = claim_run_slot() else {
+        log::error!("tun2proxy already started, or its quit token could not be locked");
+        return -1;
+    };
 
     let Ok(rt) = tokio::runtime::Builder::new_multi_thread().enable_all().build() else {
         log::error!("failed to create tokio runtime with");
@@ -98,8 +130,10 @@ pub fn general_run_for_api(args: Args, tun_mtu: u16, packet_information: bool) -
         }
     };
 
-    if let Ok(mut lock) = TUN_QUIT.lock() {
-        lock.take();
+    // Only THIS run's slot. Clearing whatever is there unhooks the stop of a
+    // tunnel that started while this one was on its way out.
+    if !release_run_slot(generation) {
+        log::debug!("tun2proxy run {generation} finished after its slot was taken over");
     }
 
     res
@@ -282,5 +316,53 @@ mod tests {
             out.status,
             String::from_utf8_lossy(&out.stderr)
         );
+    }
+}
+
+#[cfg(test)]
+mod run_slot_tests {
+    use super::*;
+
+    /// report20 V18-M7: a finished run gives back ITS OWN slot, not whatever
+    /// is in it.
+    ///
+    /// The teardown at the end of a run cleared the slot unconditionally, and
+    /// there is a window where what it holds is not that run's: the run
+    /// finishes, a stop takes and cancels its token, a NEW run starts and
+    /// installs the next one — and the first run's teardown, resuming, removes
+    /// it. The second tunnel is then running with nothing able to stop it, and
+    /// `tun2proxy_stop` answers -1 for the rest of the process.
+    #[test]
+    fn a_finished_run_does_not_unhook_the_one_that_replaced_it() {
+        // Run A takes the slot.
+        let (gen_a, token_a) = claim_run_slot().expect("the slot is free");
+        assert!(claim_run_slot().is_none(), "premise: one tunnel at a time");
+
+        // A stop takes and cancels it — the slot is free again.
+        assert_eq!(tun2proxy_stop_internal(), 0);
+        assert!(token_a.is_cancelled());
+
+        // Run B starts in the window before A's teardown runs.
+        let (gen_b, token_b) = claim_run_slot().expect("the slot was freed by the stop");
+        assert_ne!(gen_a, gen_b);
+
+        // A's teardown finally runs. It must not touch B.
+        assert!(!release_run_slot(gen_a), "run A reported clearing a slot that was not its own");
+
+        // B is still stoppable, which is the whole of what was lost.
+        assert_eq!(
+            tun2proxy_stop_internal(),
+            0,
+            "the running tunnel has nothing to stop it: its token was removed \
+             by the teardown of a run that had already ended"
+        );
+        assert!(token_b.is_cancelled());
+
+        // Vacuity: a run that IS the current one does give its slot back, or
+        // the slot would never be released at all.
+        let (gen_c, _token_c) = claim_run_slot().expect("free again");
+        assert!(release_run_slot(gen_c), "the owner could not release its own");
+        assert!(claim_run_slot().is_some(), "the slot was not actually freed");
+        assert_eq!(tun2proxy_stop_internal(), 0);
     }
 }

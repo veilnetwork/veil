@@ -51,6 +51,7 @@ mod directions;
 mod dns;
 mod dump_logger;
 mod error;
+mod ffi_callback;
 mod general_api;
 mod http;
 mod no_proxy;
