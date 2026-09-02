@@ -9004,13 +9004,34 @@ impl NodeServices {
             }
             !matches
         });
-        drop(services);
+        // The services lock is HELD across the publisher removal.
+        //
+        // The cookie is derived per (identity, period), not minted per
+        // registration, so a withdraw and a re-registration inside one period
+        // produce the same `(relay, cookie)`. Letting go of `services` here
+        // opened a window in which a re-registration could put its service
+        // entry back and this loop would then delete the PUBLISHER row it had
+        // just made — leaving a service that is registered and never
+        // advertised, silently (report20 V18-M5). `register_onion_service_
+        // with_identity` takes these two locks in this order, so holding both
+        // here is the order that already exists and cannot invert.
+        //
+        // It narrows the window rather than closing it: the publisher row is
+        // written by a DEFERRED closure that runs when the circuit's
+        // `confirmed` flag flips, and that closure takes only the publisher
+        // lock. A registration whose confirm lands between these two
+        // statements is still able to leave a row behind. Closing that means
+        // giving a registration an identity of its own — the cookie is not one
+        // — and deciding a lock order for the three registries that hold parts
+        // of it; the note in the changelog says so rather than pretending this
+        // is the whole fix.
         for (relay, cookie) in &removed {
             let mut publishers = lock!(self.anonymity.rendezvous_publisher_entries);
             publishers.retain(|entry| {
                 !(entry.rendezvous_node_id == *relay && entry.auth_cookie == *cookie)
             });
         }
+        drop(services);
         !removed.is_empty()
     }
 
