@@ -6105,47 +6105,54 @@ async fn dial_and_learn(
     transport: &str,
     shutdown_tx: &tokio::sync::watch::Sender<bool>,
 ) -> std::result::Result<String, String> {
-    let peer_id = {
-        let known: Vec<PeerConfigEntry> = lock_state(state).peers.values().cloned().collect();
-        rendezvous_slot_for(&known, transport)
-            .ok_or_else(|| "no free rendezvous slot; not learning this peer".to_owned())?
-    };
-    // A placeholder id, unique per address so two rendezvous rows cannot
-    // collide, and not a claim about anybody: it is a hash of the address we
-    // are about to dial, replaced the moment the handshake says who is there.
-    let placeholder = {
-        let digest = blake3::hash(transport.as_bytes());
-        veil_cfg::NodeId::from(*digest.as_bytes())
-    };
-    let row = PeerConfigEntry {
-        peer_id,
-        node_id: placeholder,
-        public_key: String::new(),
-        nonce: String::new(),
-        transport: transport.to_owned(),
-        algo: veil_cfg::SignatureAlgorithm::Ed25519,
-        tls_cert: None,
-        tls_key: None,
-        tls_ca_cert: None,
-        bootstrap_only: true,
-        source: crate::types::PeerSource::Rendezvous,
-    };
-    // ONLY IF THE SLOT IS FREE. The slot belongs to this address now, so a row
-    // already sitting in it is this same peer, proven on an earlier pass --
-    // and the placeholder would trade a real identity for a hash of the
-    // address and set `bootstrap_only`, which exempts the row from the
-    // direction policy. Worse, the failure path below would then delete it,
-    // orphaning a connector that may be holding a live session.
+    // CHOSEN AND CLAIMED UNDER ONE LOCK. Reading the table to pick a free slot
+    // and then inserting into it under a second lock is a gap two tasks fit
+    // through: the Mainline and Nostr passes run concurrently, both saw the
+    // same slot free, and the loser then dialled on the winner's row -- writing
+    // a proven identity against somebody else's address.
     //
-    // Dialling the existing row is also strictly better: it carries the peer's
-    // key, so the handshake verifies who answers instead of taking whoever does.
-    let we_minted_the_row = {
+    // The placeholder node id is a hash of the address: unique per address, and
+    // not a claim about anybody. It is replaced the moment the handshake says
+    // who actually answered.
+    let (peer_id, we_minted_the_row) = {
         let mut st = lock_state(state);
-        let vacant = !st.peers.contains_key(&peer_id);
+        let known: Vec<PeerConfigEntry> = st.peers.values().cloned().collect();
+        let id = rendezvous_slot_for(&known, transport)
+            .ok_or_else(|| "no free rendezvous slot; not learning this peer".to_owned())?;
+        // ONLY IF THE SLOT IS FREE. The slot belongs to this address now, so a
+        // row already sitting in it is this same peer, proven on an earlier
+        // pass -- and the placeholder would trade a real identity for a hash of
+        // the address and set `bootstrap_only`, which exempts the row from the
+        // direction policy. Worse, the failure path below would then delete it,
+        // orphaning a connector that may be holding a live session.
+        //
+        // Dialling the existing row is also strictly better: it carries the
+        // peer's key, so the handshake verifies who answers rather than taking
+        // whoever does.
+        let vacant = !st.peers.contains_key(&id);
         if vacant {
-            st.peers.insert(peer_id, row);
+            let placeholder = {
+                let digest = blake3::hash(transport.as_bytes());
+                veil_cfg::NodeId::from(*digest.as_bytes())
+            };
+            st.peers.insert(
+                id,
+                PeerConfigEntry {
+                    peer_id: id,
+                    node_id: placeholder,
+                    public_key: String::new(),
+                    nonce: String::new(),
+                    transport: transport.to_owned(),
+                    algo: veil_cfg::SignatureAlgorithm::Ed25519,
+                    tls_cert: None,
+                    tls_key: None,
+                    tls_ca_cert: None,
+                    bootstrap_only: true,
+                    source: crate::types::PeerSource::Rendezvous,
+                },
+            );
         }
-        vacant
+        (id, vacant)
     };
 
     let session = match access.connect_peer_active(peer_id).await {
@@ -6173,13 +6180,20 @@ async fn dial_and_learn(
     };
 
     // Everything durable about this peer, from what the handshake proved.
+    // WHAT THE HANDSHAKE PROVED, not what we would have assumed. Writing
+    // Ed25519 down as fact for every peer meant a Falcon or hybrid one was
+    // recorded under the wrong algorithm -- and the node id derived from that
+    // row is what the direction rule compares, so the wrong algorithm puts the
+    // pair back to both sides dialling. A peer whose algorithm this build does
+    // not recognise keeps the row's current value rather than being relabelled.
+    let proven_algo = proven_algorithm(session.peer_algo);
     let proven = PeerConfigEntry {
         peer_id,
         node_id: session.peer_id,
         public_key: session.peer_public_key.clone(),
         nonce: session.peer_nonce.clone(),
         transport: transport.to_owned(),
-        algo: veil_cfg::SignatureAlgorithm::Ed25519,
+        algo: proven_algo,
         tls_cert: None,
         tls_key: None,
         tls_ca_cert: None,
@@ -6365,6 +6379,24 @@ pub fn we_should_place_the_call(
     true
 }
 
+/// The algorithm to write down for a peer the handshake just proved.
+///
+/// Everything downstream used to assume Ed25519 and record it as fact, so a
+/// Falcon or hybrid peer went into the row and the cache under the wrong name.
+/// That is not cosmetic: the node id the direction rule compares is derived
+/// from the key AND its algorithm, so a mislabelled peer puts the pair back to
+/// both sides dialling each other.
+///
+/// A wire byte this build does not know falls back to Ed25519 rather than
+/// refusing the peer: the handshake still proved a key, the session is real,
+/// and dropping it would be a worse answer than an imperfect label. The
+/// fallback is here, named, rather than spread as a literal at each use.
+fn proven_algorithm(
+    from_handshake: Option<veil_cfg::SignatureAlgorithm>,
+) -> veil_cfg::SignatureAlgorithm {
+    from_handshake.unwrap_or(veil_cfg::SignatureAlgorithm::Ed25519)
+}
+
 /// Which peer slot a rendezvous address owns.
 ///
 /// STABLE FOR THE ADDRESS, and that is the whole point. The slot used to be
@@ -6401,9 +6433,26 @@ pub fn rendezvous_slot_for(known: &[PeerConfigEntry], transport: &str) -> Option
         .map(|p| p.peer_id.get())
         .filter(|id| in_window(*id))
         .collect();
-    (RENDEZVOUS_BASE..RENDEZVOUS_BASE + RENDEZVOUS_WINDOW)
-        .find(|id| !taken.contains(id))
-        .map(PeerId::new)
+    if let Some(free) =
+        (RENDEZVOUS_BASE..RENDEZVOUS_BASE + RENDEZVOUS_WINDOW).find(|id| !taken.contains(id))
+    {
+        return Some(PeerId::new(free));
+    }
+
+    // A FULL WINDOW MAY STILL YIELD, but only a row that never learned who was
+    // there. A dial refused as a duplicate keeps its row on purpose -- that is
+    // what stops the address being dialled again -- and such a row holds a
+    // hash of the address and no key. Enough of them, from a rendezvous full
+    // of aliases for one host, would otherwise wall the window off for the
+    // life of the process and no new peer could ever be learned.
+    //
+    // A row that HAS an identity is never taken: something completed a
+    // handshake with it, and a connector may be holding that session.
+    known
+        .iter()
+        .filter(|p| in_window(p.peer_id.get()) && p.public_key.is_empty())
+        .map(|p| p.peer_id)
+        .min_by_key(|id| id.get())
 }
 
 pub fn rendezvous_address_is_self(mine: Option<&(String, u16)>, transport: &str) -> bool {
@@ -7260,7 +7309,7 @@ mod tests {
             produced.contains("{DUPLICATE_SESSION} to node"),
             "the refusal no longer carries the shared marker"
         );
-        let reader = include_str!("service_tasks.rs");
+        let reader = production_source(include_str!("service_tasks.rs"));
         assert!(
             reader.contains("refusal.contains(crate::runtime::peer_handshake::DUPLICATE_SESSION)"),
             "the rendezvous dial no longer recognises the refusal"
@@ -7281,6 +7330,52 @@ mod tests {
             recognise < remove,
             "the row is removed before the duplicate case is recognised, so the \
              next pass dials the same peer again"
+        );
+    }
+
+    /// The file WITHOUT its test module.
+    ///
+    /// A guard that greps its own file finds its own assertion string and
+    /// passes no matter what the production code does. That is not a
+    /// hypothetical: the first version of the algorithm guard below did
+    /// exactly this, and the break-check that should have reddened stayed
+    /// green.
+    fn production_source(file: &str) -> &str {
+        file.split("#[cfg(test)]").next().unwrap_or(file)
+    }
+
+    #[test]
+    fn a_peer_is_recorded_under_the_algorithm_it_proved() {
+        use veil_cfg::SignatureAlgorithm;
+        // Ed25519 was written down as fact for every peer met at a meeting
+        // point. The node id the direction rule compares derives from the key
+        // and its algorithm, so a mislabelled Falcon peer puts the pair back to
+        // both ends dialling each other.
+        for proved in [SignatureAlgorithm::Ed25519, SignatureAlgorithm::Falcon512] {
+            assert_eq!(
+                proven_algorithm(Some(proved)),
+                proved,
+                "the handshake proved {proved:?} and the row said otherwise"
+            );
+        }
+        // An algorithm this build cannot name still yields a session; the row
+        // takes the historical default rather than the peer being dropped.
+        assert_eq!(proven_algorithm(None), SignatureAlgorithm::Ed25519);
+
+        // And the value actually travels: handshake -> session -> row.
+        let hs = include_str!("peer_handshake.rs");
+        assert!(
+            hs.contains("pub algo: Option<veil_cfg::SignatureAlgorithm>"),
+            "the handshake no longer carries the proved algorithm"
+        );
+        assert!(
+            hs.contains("peer_algo: remote_identity.algo"),
+            "the session no longer receives the proved algorithm"
+        );
+        let here = production_source(include_str!("service_tasks.rs"));
+        assert!(
+            here.contains("proven_algorithm(session.peer_algo)"),
+            "the row no longer asks what was proved"
         );
     }
 
@@ -7372,6 +7467,35 @@ mod tests {
         assert_eq!(
             rendezvous_slot_for(&full, "obfs4-tcp://198.51.100.7:6000"),
             Some(PeerId::new(RENDEZVOUS_BASE))
+        );
+
+        // A full window of rows that never learned an identity is a different
+        // matter: those are refused duplicates, kept only so the address is not
+        // dialled again. Enough aliases for one host would otherwise wall the
+        // window off for the life of the process, so the lowest one yields.
+        let tombstones: Vec<PeerConfigEntry> = (0..RENDEZVOUS_WINDOW)
+            .map(|i| {
+                let mut r = rz(
+                    RENDEZVOUS_BASE + i,
+                    &format!("obfs4-tcp://198.51.100.7:{}", 6000 + i),
+                );
+                r.public_key = String::new();
+                r
+            })
+            .collect();
+        assert_eq!(
+            rendezvous_slot_for(&tombstones, "obfs4-tcp://203.0.113.9:5556"),
+            Some(PeerId::new(RENDEZVOUS_BASE)),
+            "a window full of identity-less rows refused a new peer forever"
+        );
+        // A single row WITH an identity is never the one taken: something
+        // completed a handshake with it and may be holding that session.
+        let mut mixed = tombstones.clone();
+        mixed[0] = rz(RENDEZVOUS_BASE, "obfs4-tcp://198.51.100.7:6000");
+        assert_eq!(
+            rendezvous_slot_for(&mixed, "obfs4-tcp://203.0.113.9:5556"),
+            Some(PeerId::new(RENDEZVOUS_BASE + 1)),
+            "a row that had proved an identity was reclaimed"
         );
 
         // Something unparseable gets nothing rather than slot zero.
