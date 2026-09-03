@@ -870,7 +870,26 @@ pub async fn register_connection_session(
 
     if let Some(ref expected_peer) = expected_peer {
         match verify_remote_peer_identity(&remote_identity, expected_peer) {
-            Ok(()) => {}
+            Ok(()) => {
+                // THE PROOF, written down. `persist_discovered_peers` keeps
+                // only peers this node actually reached, and it reads that
+                // from `handshaked` — but nothing outside the snapshot RESTORE
+                // ever put anything in. On a fresh install the set therefore
+                // started empty and stayed empty, so no peer learned at a
+                // meeting point, by exchange, or any other way was ever
+                // written to disk. Every cold start walked the rendezvous
+                // again from nothing.
+                //
+                // The removal beside it has always been here — an identity
+                // mismatch takes the id back out — which is what a set with
+                // only takers looks like.
+                //
+                // Recorded for every proven row; the snapshot's own filters
+                // decide which of them are ours to persist.
+                lock_state(&runtime.state)
+                    .handshaked
+                    .insert(*remote_identity.node_id.as_bytes());
+            }
             Err(PeerVerificationError::IdentityMismatch(message)) => {
                 runtime.logger.warn(
                     "peer.identity_mismatch",
@@ -1493,7 +1512,11 @@ pub fn inbound_may_replace_live_session(matched_source: Option<PeerSource>) -> b
     match matched_source {
         // A peer we learned of and dial mutually. Its reconnect is the case
         // this was built for.
-        Some(PeerSource::Exchanged) | Some(PeerSource::Autodiscovered) => true,
+        // A peer on this broadcast domain is the same case: we learned of it
+        // and dial it mutually, so its reconnect is a reconnect.
+        Some(PeerSource::Exchanged) | Some(PeerSource::Autodiscovered) | Some(PeerSource::Lan) => {
+            true
+        }
         // The operator's own rows: first-wins, and a reaper clears a zombie.
         Some(PeerSource::Configured) | Some(PeerSource::Bootstrap) => false,
         // Scheduled, not a reconnect. See above.
@@ -1542,7 +1565,17 @@ pub fn outbound_expects_an_identity(entry: &PeerConfigEntry) -> bool {
 /// leave the file alone. `Bootstrap` is the operator's list of ways in and is
 /// treated the same.
 pub fn identity_mismatch_drops_record(source: PeerSource) -> bool {
-    !matches!(source, PeerSource::Configured | PeerSource::Bootstrap)
+    // EXHAUSTIVE, not `!matches!`. A negative list hands the right to delete
+    // to every source added later, silently — and this one deletes rows.
+    match source {
+        // The operator's own lines. Refuse, shout, leave the file alone.
+        PeerSource::Configured | PeerSource::Bootstrap => false,
+        // Ours: learned at runtime, and a fossil dialled forever otherwise.
+        PeerSource::Exchanged
+        | PeerSource::Autodiscovered
+        | PeerSource::Rendezvous
+        | PeerSource::Lan => true,
+    }
 }
 
 /// Whether an identity mismatch should remove THIS row.
