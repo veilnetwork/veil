@@ -1,5 +1,49 @@
 # Changelog
 
+## v0.11.19 — 2026-09-04
+
+**A discovered peer was never written down, so every cold start walked the
+rendezvous again from nothing.**
+
+`persist_discovered_peers` keeps a peer only if it is in `NodeState::handshaked`
+— persist what we actually reached, so an unproven peer-exchange entry does not
+seed the next boot with dial targets nobody can reach. Nothing in production
+ever put anything in that set. The only insert was the snapshot RESTORE path,
+which re-adds ids that were already in a snapshot; the only other writers were a
+`retain` and a `remove`. On a fresh install the set started empty and stayed
+empty, so no peer learned at a meeting point, by exchange, or by any other route
+was ever written to disk.
+
+The identity-mismatch path has always removed from that set, with a comment
+explaining why. A set with only takers is what that leaves. The verified
+handshake now records the id it proved; the snapshot's own filters still decide
+which of those are ours to keep.
+
+**An evicted LAN candidate left its row, its contact and its task behind.**
+
+Reclaiming the slot of an announced neighbour that never connected deleted the
+local bookkeeping and nothing else. The next eight announces reused the same
+fixed slots, so an attacker on the broadcast domain added up to eight more rows,
+contacts and reconnect tasks every five minutes, without bound, for the life of
+the process. A candidate now owns what its admission created and eviction takes
+all of it — the row only while it is still that candidate's, because a `PeerId`
+is a local slot that outlives its occupant.
+
+LAN peers also get a `PeerSource` of their own instead of borrowing `Bootstrap`.
+As the operator's list they were not ours to retire, so an identity mismatch
+could not drop a LAN row at all. `identity_mismatch_drops_record` is exhaustive
+now rather than a negative match: a list of who may NOT delete hands the right to
+every source added later, silently.
+
+**The media singletons registered an exit destructor against a live thread.**
+
+`AdmHostThread` and `MfPlatform` each start a thread with `.detach()` and park it
+in `task_cv_.wait` holding the object's own mutex, and both carried a comment
+saying the object is never destroyed. That was true of the thread and false of
+the object: a function-local static with non-trivially destructible members has
+its destructor registered for process exit. The heap form registers nothing,
+which is the lifetime both comments always claimed.
+
 ## v0.11.18 — 2026-09-03
 
 **The Windows CI job's two test steps were running zero tests.**
