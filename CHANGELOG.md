@@ -1,5 +1,23 @@
 # Changelog
 
+## v0.11.17 — 2026-09-03
+
+**A test behind an opt-in feature stopped compiling, and nothing local said
+so.**
+
+0.11.12 changed what the peer key cache holds — the key now carries the window
+its owner signed — and one insert was missed: a test in `veil-ipc` that lives
+behind `veilcore-internals-test`. The workspace passes resolve every crate to
+its DEFAULT features, so that file is not merely untested there, it is never
+handed to the compiler at all. The gate was 16/16, the workspace suite was
+5673 green, and `main` went red on the step that builds it.
+
+The insert is fixed. The reason it was missed is worth more than the fix, so
+the hint the gate prints at the end now lists the WHOLE test job — four
+commands, not one — and says why the workspace pass cannot see the other
+three: the two single-crate feature runs, and the doctest pass that nextest
+does not run at all.
+
 ## v0.11.16 — 2026-09-03
 
 **A node now bounds its own fan-out, not just each sender's.**
