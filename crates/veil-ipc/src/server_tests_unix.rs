@@ -1608,10 +1608,13 @@ async fn anonymous_send_payload_starts_with_meta_e2e_marker() {
     // Populate peer_mlkem_keys with C's encapsulation key.
     let mlkem_cache: Arc<std::sync::RwLock<veil_e2e::PeerMlKemCache>> =
         Arc::new(std::sync::RwLock::new(std::collections::HashMap::new()));
-    mlkem_cache
-        .write()
-        .unwrap()
-        .insert(c_id, (ek_bytes.to_vec(), std::time::Instant::now()));
+    mlkem_cache.write().unwrap().insert(
+        c_id,
+        (
+            veil_e2e::PeerMlKemKey::unattested(ek_bytes.to_vec()),
+            std::time::Instant::now(),
+        ),
+    );
 
     // Route: c_id → via b_id.
     let route_cache = Arc::new(RwLock::new(RouteCache::new(Duration::from_secs(60))));

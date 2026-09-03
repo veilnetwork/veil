@@ -42,10 +42,26 @@ JOB = "hygiene"
 # was not checked.
 TEST_JOB_HINT = (
     "NOT TESTS. This is CI's `hygiene` job only. The unit suite is a separate\n"
-    "job; run it before tagging:\n"
+    "job, and it is FOUR commands, not one. Run all of them before tagging:\n"
+    "\n"
     "  cargo nextest run --workspace \\\n"
     "    --features veilcore/test-low-difficulty,veilcore/allow-empty-seeds \\\n"
-    "    --lib --bins --tests --test-threads=2"
+    "    --lib --bins --tests --test-threads=2\n"
+    "\n"
+    "  # The workspace pass above resolves every crate to its DEFAULT\n"
+    "  # features, so code behind an opt-in feature is not merely untested —\n"
+    "  # it is never handed to the compiler. A change that breaks it compiles\n"
+    "  # and tests clean here and turns CI red (2026-09-03: a cache value type\n"
+    "  # changed, every local check passed, `main` went red on this step).\n"
+    "  cargo nextest run -p veilclient-ffi \\\n"
+    "    --features node-embedded,packet-tunnel --lib --tests --test-threads=2\n"
+    "  cargo nextest run -p veil-ipc \\\n"
+    "    --features veilcore-internals-test --lib --tests --test-threads=2\n"
+    "\n"
+    "  # And doctests, which nextest does not run at all.\n"
+    "  cargo test --workspace \\\n"
+    "    --features veilcore/test-low-difficulty,veilcore/allow-empty-seeds \\\n"
+    "    --doc"
 )
 
 
