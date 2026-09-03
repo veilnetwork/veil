@@ -1094,6 +1094,12 @@ impl NodeRuntime {
                 unsigned_route_request_budget: Arc::clone(
                     &self.dispatcher.abuse.unsigned_route_request_budget,
                 ),
+                // Carried over for the same reason: rebuilding the bucket
+                // refills it, and a reload must not hand a flooder a fresh
+                // pot of fan-out.
+                route_request_forward_budget: Arc::clone(
+                    &self.dispatcher.abuse.route_request_forward_budget,
+                ),
                 // Reused across reloads for the same reason the others are: a
                 // reload must not hand a flooder a fresh pot.
                 unproven_ratchet_open_budget: Arc::clone(

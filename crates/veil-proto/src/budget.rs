@@ -821,6 +821,30 @@ pub const UNSIGNED_ROUTE_REQUEST_BURST: u32 = 32;
 /// Refill period for [`UNSIGNED_ROUTE_REQUEST_BURST`], in seconds.
 pub const UNSIGNED_ROUTE_REQUEST_REFILL_SECS: u64 = 60;
 
+/// `RouteRequest` frames a node will FAN OUT per window, over all senders.
+///
+/// Forwarding one request costs a send to every session this node holds, so
+/// the traffic a node emits is (requests admitted) × (peers). The gate in
+/// front of it is keyed by the peer the frame arrived from, which bounds each
+/// sender and not the node: with `n` peers each pushing at their own limit the
+/// node still fans out `n` times what any one of them was allowed, and the
+/// forward path is unauthenticated — a relay never learns who asked
+/// (report5b R5b-C-01).
+///
+/// Held by the FORWARDER and not keyed at all, for the same reason
+/// [`UNSIGNED_ROUTE_REQUEST_BURST`] is: what needs bounding is this node's own
+/// emission, whoever prompted it.
+///
+/// Generous against honest discovery. A node's own requests do not come out of
+/// this pot — only frames it relays for somebody else — and route discovery is
+/// a cold-start event per destination, not a steady flow: 256 relayed requests
+/// a minute is far past what a healthy neighbourhood generates, while still
+/// capping the amplification a flood can buy.
+pub const ROUTE_REQUEST_FORWARD_BURST: u32 = 256;
+
+/// Refill period for [`ROUTE_REQUEST_FORWARD_BURST`], in seconds.
+pub const ROUTE_REQUEST_FORWARD_REFILL_SECS: u64 = 60;
+
 /// Ratchet opens a node will attempt for senders it has never proven, per
 /// window.
 ///
