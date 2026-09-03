@@ -1,6 +1,6 @@
 [package]
 name = "veil-ratchet"
-version = "0.11.13"
+version = "0.11.14"
 edition = "2024"
 description = "Hybrid (X25519 + ML-KEM-768) Double Ratchet and PQXDH key agreement for one-to-one messaging: forward secrecy, post-compromise recovery, deniability (no signatures in the transcript), and asynchronous first contact against pre-published keys."
 license = "AGPL-3.0-or-later"
