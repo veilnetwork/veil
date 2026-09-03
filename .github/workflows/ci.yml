@@ -504,13 +504,39 @@ jobs:
         # The admin_tcp_* tests are #[ignore]-marked by default because their
         # parallel flakiness on Linux hides real Windows regressions; running
         # them explicitly here is their reason to exist.
-        run: cargo test -p veilcore --lib --no-default-features node::admin::tests::admin_tcp -- --ignored --test-threads=1
+        #
+        # THE CRATE IS `veil-node-runtime`, and this step named `veilcore` —
+        # which holds none of them. `cargo test` with a filter that matches
+        # nothing exits 0, so the step reported success while running ZERO
+        # tests, for as long as it has existed. Found by running it on a real
+        # Windows machine: "0 passed; 107 filtered out" (2026-09-03).
+        #
+        # The guard below is the point: a filter is a name, and a name goes
+        # stale silently. Anything that selects no test fails this step now.
+        shell: pwsh
+        run: |
+          $out = cargo test -p veil-node-runtime --lib --no-default-features admin_tcp -- --ignored --test-threads=1 2>&1
+          $out | ForEach-Object { Write-Host $_ }
+          if ($LASTEXITCODE -ne 0) { throw "admin_tcp tests failed" }
+          if (-not ($out -match 'test result: ok\. [1-9]')) {
+            throw "the admin_tcp filter selected no tests — this step validated nothing"
+          }
 
       - name: Run token_file helpers
         env:
           CC: clang-cl
           CXX: clang-cl
-        run: cargo test -p veilcore --lib --no-default-features node::admin_transport::tests -- --test-threads=1
+        # Same defect as the step above, same crate: these live in
+        # `veil-node-runtime`. Measured on a Windows machine 2026-09-03 — as
+        # written it selected 0 of 107; against the right crate, 7 of 531.
+        shell: pwsh
+        run: |
+          $out = cargo test -p veil-node-runtime --lib --no-default-features admin_transport::tests -- --test-threads=1 2>&1
+          $out | ForEach-Object { Write-Host $_ }
+          if ($LASTEXITCODE -ne 0) { throw "admin_transport tests failed" }
+          if (-not ($out -match 'test result: ok\. [1-9]')) {
+            throw "the admin_transport filter selected no tests — this step validated nothing"
+          }
 
   bench:
     name: Benchmark regression guard
