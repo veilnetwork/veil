@@ -1619,3 +1619,101 @@ mod v01_quiescence_tests {
         );
     }
 }
+
+/// The two process-lifetime media singletons must register NO exit destructor.
+///
+/// Both `AdmHostThread` (veil_media_engine.cc) and `MfPlatform`
+/// (veil_mf_camera.cc) start a thread with `.detach()` and park it forever in
+/// `task_cv_.wait(...)` holding the object's own mutex. Their comments say the
+/// object "is never destroyed" — which is true of the THREAD and was false of
+/// the OBJECT: a function-local static of a type with non-trivially
+/// destructible members (`std::mutex`, `std::condition_variable`,
+/// `std::deque<std::function<void()>>`) has its destructor registered for
+/// process exit. Running it against a live waiter destroys a held mutex and a
+/// waited-on condition variable, and the shape users saw was the tray's Quit
+/// tearing down the window and leaving xveil.exe resident (report19 V19-M4,
+/// V19-M5).
+///
+/// The heap form registers nothing, so this asserts the heap form. A comment
+/// cannot hold this: `static T instance;` compiles, runs, and only misbehaves
+/// on the way out, which is the one moment nothing is watching.
+#[cfg(test)]
+mod detached_singleton_lifetime_tests {
+    use std::path::PathBuf;
+
+    /// `crates/veilclient-ffi` -> the repo root the C++ sits under.
+    fn engine_source(name: &str) -> (PathBuf, String) {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../flutter/veil_media/src")
+            .join(name);
+        let text = std::fs::read_to_string(&path).unwrap_or_else(|e| {
+            panic!(
+                "{} is unreadable ({e}) — this guard cannot check the file it \
+                 exists to check; re-aim it, do not delete it",
+                path.display()
+            )
+        });
+        (path, text)
+    }
+
+    /// Everything between `fn_name` and the first `}` at column 0 after it.
+    fn accessor_body<'a>(text: &'a str, fn_name: &str) -> &'a str {
+        let start = text.find(fn_name).unwrap_or_else(|| {
+            panic!(
+                "{fn_name} is gone or renamed — re-aim this guard at whatever \
+                 hands out the singleton now"
+            )
+        });
+        let rest = &text[start..];
+        let end = rest.find("\n}").unwrap_or_else(|| {
+            panic!("{fn_name} has no closing brace at column 0; re-aim this guard")
+        });
+        &rest[..end]
+    }
+
+    fn assert_never_destroyed(file: &str, fn_name: &str, ty: &str) {
+        let (path, text) = engine_source(file);
+        let body = accessor_body(&text, fn_name);
+
+        // Vacuity: the accessor must actually be handing out THIS type, or
+        // both assertions below would hold over an empty search.
+        assert!(
+            body.contains(ty),
+            "{} :: {fn_name} no longer mentions {ty}; re-aim this guard",
+            path.display()
+        );
+
+        assert!(
+            body.contains(&format!("static {ty}* const instance = new {ty}()")),
+            "{} :: {fn_name} must hand out a heap {ty} that is never deleted. \
+             A by-value function-local static registers ~{ty} for process \
+             exit, and it runs against the detached Serve() thread parked in \
+             task_cv_.wait under the object's own mutex — the app then stops \
+             exiting (V19-M4/M5).",
+            path.display()
+        );
+
+        // The by-value form spelled out, so a revert is named rather than
+        // merely failing the positive check above.
+        assert!(
+            !body.contains(&format!("static {ty} instance;")),
+            "{} :: {fn_name} went back to a by-value static {ty}, which \
+             registers an exit-time destructor",
+            path.display()
+        );
+    }
+
+    #[test]
+    fn the_audio_host_thread_owner_is_never_destroyed() {
+        assert_never_destroyed(
+            "veil_media_engine.cc",
+            "AdmHostThread& adm_host_thread()",
+            "AdmHostThread",
+        );
+    }
+
+    #[test]
+    fn the_media_foundation_owner_is_never_destroyed() {
+        assert_never_destroyed("veil_mf_camera.cc", "MfPlatform& mf()", "MfPlatform");
+    }
+}
