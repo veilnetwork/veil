@@ -164,6 +164,14 @@ pub enum PeerSource {
     /// this is its own source and not `Autodiscovered`: a beacon names a node,
     /// a public index names a socket.
     Rendezvous,
+    /// Announced on this broadcast domain by local discovery.
+    ///
+    /// Its own source rather than `Bootstrap`, which it borrowed. That was
+    /// wrong twice: the operator's bootstrap list is not ours to delete, so
+    /// an identity mismatch could not retire a LAN row; and a candidate that
+    /// never connects has to be evicted with its row, its contact and its
+    /// connector task, which only a source of its own can identify.
+    Lan,
 }
 
 impl PeerSource {
@@ -174,6 +182,7 @@ impl PeerSource {
         Self::Exchanged,
         Self::Autodiscovered,
         Self::Rendezvous,
+        Self::Lan,
     ];
 }
 
@@ -185,6 +194,7 @@ impl std::fmt::Display for PeerSource {
             Self::Exchanged => f.write_str("exchanged"),
             Self::Autodiscovered => f.write_str("autodiscovered"),
             Self::Rendezvous => f.write_str("rendezvous"),
+            Self::Lan => f.write_str("lan"),
         }
     }
 }
