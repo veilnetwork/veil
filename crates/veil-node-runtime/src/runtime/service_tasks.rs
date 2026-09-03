@@ -2559,10 +2559,19 @@ impl NodeRuntime {
                         LAN_CANDIDATE_GRACE,
                         std::time::Instant::now(),
                     ) {
-                        seen.remove(&key);
+                        let Some(candidate) = seen.remove(&key) else {
+                            continue;
+                        };
+                        {
+                            let mut st = lock_state(&state);
+                            evict_lan_candidate(&mut st.peers, candidate, |id| {
+                                dht.remove_contact(id);
+                            });
+                        }
                         logger.debug(
                             "lan_discovery.slot_reclaimed",
-                            "an announced neighbour never connected; its slot is free again",
+                            "an announced neighbour never connected; its row, \
+                             contact and reconnect task are gone with its slot",
                         );
                     }
                 }
@@ -2590,14 +2599,9 @@ impl NodeRuntime {
                 let Some(slot) = free_lan_slot(&seen) else {
                     continue;
                 };
-                seen.insert(
-                    bp.public_key.clone(),
-                    LanCandidate {
-                        node_id: node_id_bytes,
-                        slot,
-                        admitted: std::time::Instant::now(),
-                    },
-                );
+                // Inserted below, once the row and the task exist: the
+                // candidate is the record of what this admission owns.
+                let admitted_at = std::time::Instant::now();
                 let hex = veil_util::hex_str(&node_id_bytes);
                 let Ok(node_id) = <veil_cfg::NodeId as std::str::FromStr>::from_str(&hex) else {
                     continue;
@@ -2632,14 +2636,32 @@ impl NodeRuntime {
                     tls_key: None,
                     tls_ca_cert: bp.tls_ca_cert.clone(),
                     bootstrap_only: true,
-                    source: crate::types::PeerSource::Bootstrap,
+                    // Its own source. As `Bootstrap` this row was the
+                    // operator's as far as every other rule was concerned, so
+                    // an identity mismatch could not retire it.
+                    source: crate::types::PeerSource::Lan,
                 };
                 lock_state(&state).peers.insert(peer_id, entry.clone());
+                let mut abort = None;
                 if let Some(ref stx) = shutdown_tx {
                     let handles =
                         crate::outbound_connector::spawn_outbound_peers(vec![entry], &access, stx);
+                    // The abort handle stays with the candidate; the join
+                    // handle stays with the task list, so shutdown still
+                    // waits for it.
+                    abort = handles.first().map(|h| h.abort_handle());
                     lock_tasks(&tasks).sessions.extend(handles);
                 }
+                seen.insert(
+                    bp.public_key.clone(),
+                    LanCandidate {
+                        node_id: node_id_bytes,
+                        slot,
+                        admitted: admitted_at,
+                        peer_id,
+                        abort,
+                    },
+                );
             }
         });
         lock_tasks(&self.tasks).sessions.push(handle);
@@ -6461,6 +6483,52 @@ pub struct LanCandidate {
     pub node_id: [u8; 32],
     pub slot: u32,
     pub admitted: std::time::Instant,
+    /// The row this admission wrote, so eviction removes THAT one.
+    ///
+    /// Reclaiming the slot used to delete the local `seen` entry and nothing
+    /// else: the `NodeState` row, the DHT contact and the reconnect task all
+    /// stayed. The next eight announces reused the same fixed slots, so an
+    /// attacker on the broadcast domain added up to eight more of each every
+    /// five minutes, without bound, for the life of the process.
+    pub peer_id: crate::types::PeerId,
+    /// Stops the reconnect loop this admission spawned. The connector's own
+    /// RAII guard releases its per-node-id claim when the task is dropped, so
+    /// aborting is what gives the claim back too.
+    pub abort: Option<tokio::task::AbortHandle>,
+}
+
+/// Take back everything ONE LAN admission created.
+///
+/// Reclaiming the slot used to delete the local `seen` entry and nothing
+/// else, so the `NodeState` row, the DHT contact and the reconnect task all
+/// survived. The next eight announces reused the same fixed slots, which is
+/// how an attacker on the broadcast domain added up to eight more of each
+/// every five minutes, without bound, for the life of the process.
+///
+/// The row is removed only if it is still THIS candidate's. A `PeerId` is a
+/// local slot that outlives whoever occupies it: between the admission and
+/// this eviction an endpoint refresh or a rediscovery can put a different
+/// peer at the same number, and deleting that one would take out a row that
+/// had already been corrected.
+pub fn evict_lan_candidate<F: FnMut(&[u8; 32])>(
+    peers: &mut std::collections::BTreeMap<crate::types::PeerId, PeerConfigEntry>,
+    candidate: LanCandidate,
+    mut drop_contact: F,
+) {
+    let ours = peers.get(&candidate.peer_id).is_some_and(|e| {
+        e.source == crate::types::PeerSource::Lan && e.node_id.as_bytes() == &candidate.node_id
+    });
+    if ours {
+        peers.remove(&candidate.peer_id);
+    }
+    // The contact goes either way: it names the node, not the slot, and this
+    // candidate is the only reason it was added.
+    drop_contact(&candidate.node_id);
+    // Dropping the task also drops the connector's RAII guard, which is what
+    // gives its per-node-id claim back.
+    if let Some(abort) = candidate.abort {
+        abort.abort();
+    }
 }
 
 /// How long an admitted LAN announce may hold its slot without the peer ever
@@ -8416,12 +8484,140 @@ mod tests {
         );
     }
 
+    /// A hundred rounds of announce-and-evict must leave nothing behind.
+    ///
+    /// The cap counted SLOTS, and reclaiming one deleted only the local
+    /// bookkeeping. The row, the DHT contact and the reconnect task the
+    /// admission had created all stayed, and the next eight announces reused
+    /// the same fixed slots — so an attacker on the broadcast domain added up
+    /// to eight more of each every five minutes, without bound, for the life
+    /// of the process (report22 V-02).
+    #[test]
+    fn a_hundred_lan_rounds_leave_no_rows_or_contacts() {
+        use crate::types::PeerId;
+        let mut peers: std::collections::BTreeMap<PeerId, PeerConfigEntry> = Default::default();
+        let mut contacts: std::collections::HashSet<[u8; 32]> = Default::default();
+
+        for round in 0..100u32 {
+            let mut admitted = Vec::new();
+            for slot in 0..MAX_LAN_PEERS as u32 {
+                let node_id = [(round as u8).wrapping_add((slot as u8).wrapping_mul(37)); 32];
+                let peer_id = PeerId::new(0x9000_0000u32.wrapping_add(slot));
+                let mut entry = lan_entry(node_id);
+                entry.peer_id = peer_id;
+                peers.insert(peer_id, entry);
+                contacts.insert(node_id);
+                admitted.push(LanCandidate {
+                    node_id,
+                    slot,
+                    admitted: std::time::Instant::now(),
+                    peer_id,
+                    abort: None,
+                });
+            }
+            assert_eq!(
+                peers.len(),
+                MAX_LAN_PEERS,
+                "round {round}: the admissions themselves are already over the cap"
+            );
+            for candidate in admitted {
+                evict_lan_candidate(&mut peers, candidate, |id| {
+                    contacts.remove(id);
+                });
+            }
+            assert!(
+                peers.is_empty(),
+                "round {round}: {} row(s) survived their eviction",
+                peers.len()
+            );
+            assert!(
+                contacts.is_empty(),
+                "round {round}: {} contact(s) survived their eviction",
+                contacts.len()
+            );
+        }
+    }
+
+    /// The slot is local and gets reused, so eviction must check the OCCUPANT.
+    #[test]
+    fn eviction_leaves_a_row_that_is_no_longer_ours() {
+        use crate::types::PeerId;
+        let peer_id = PeerId::new(0x9000_0000);
+        let mine = [7u8; 32];
+        let someone_else = [9u8; 32];
+
+        let mut peers: std::collections::BTreeMap<PeerId, PeerConfigEntry> = Default::default();
+        let mut entry = lan_entry(someone_else);
+        entry.peer_id = peer_id;
+        peers.insert(peer_id, entry);
+
+        let mut dropped = Vec::new();
+        evict_lan_candidate(
+            &mut peers,
+            LanCandidate {
+                node_id: mine,
+                slot: 0,
+                admitted: std::time::Instant::now(),
+                peer_id,
+                abort: None,
+            },
+            |id| dropped.push(*id),
+        );
+        assert!(
+            peers.contains_key(&peer_id),
+            "a stale eviction deleted the row that had already replaced it"
+        );
+        assert_eq!(
+            dropped,
+            vec![mine],
+            "the contact removed must be the evicted candidate's own"
+        );
+
+        // Vacuity: the same shape where the row IS ours does get removed, or
+        // the assertion above would hold over a function that removes nothing.
+        let mut ours = lan_entry(mine);
+        ours.peer_id = peer_id;
+        peers.insert(peer_id, ours);
+        evict_lan_candidate(
+            &mut peers,
+            LanCandidate {
+                node_id: mine,
+                slot: 0,
+                admitted: std::time::Instant::now(),
+                peer_id,
+                abort: None,
+            },
+            |_| {},
+        );
+        assert!(peers.is_empty());
+    }
+
+    /// A row a LAN admission would write, with only the fields these rules read.
+    fn lan_entry(node_id: [u8; 32]) -> PeerConfigEntry {
+        let hex = veil_util::hex_str(&node_id);
+        PeerConfigEntry {
+            peer_id: crate::types::PeerId::new(0),
+            node_id: <veil_cfg::NodeId as std::str::FromStr>::from_str(&hex).unwrap(),
+            public_key: String::new(),
+            nonce: String::new(),
+            transport: String::new(),
+            algo: Default::default(),
+            tls_cert: None,
+            tls_key: None,
+            tls_ca_cert: None,
+            bootstrap_only: true,
+            source: crate::types::PeerSource::Lan,
+        }
+    }
+
     /// A candidate with no history: `admit_lan_peer` only counts and dedups.
     fn lan_slot(slot: u32) -> LanCandidate {
         LanCandidate {
             node_id: [slot as u8; 32],
             slot,
             admitted: std::time::Instant::now(),
+            peer_id: crate::types::PeerId::new(0),
+            abort: None,
         }
     }
 
@@ -8657,6 +8853,8 @@ mod tests {
                     node_id: [i as u8; 32],
                     slot: free_lan_slot(&taken).expect("a free slot below the cap"),
                     admitted: t0,
+                    peer_id: crate::types::PeerId::new(0),
+                    abort: None,
                 },
             );
         }
@@ -8697,6 +8895,8 @@ mod tests {
                 node_id: [42; 32],
                 slot: 0,
                 admitted: t0,
+                peer_id: crate::types::PeerId::new(0),
+                abort: None,
             },
         );
         assert!(
@@ -8726,6 +8926,8 @@ mod tests {
                 node_id: [1; 32],
                 slot: 0,
                 admitted: t0,
+                peer_id: crate::types::PeerId::new(0),
+                abort: None,
             },
         );
         taken.insert(
@@ -8734,6 +8936,8 @@ mod tests {
                 node_id: [2; 32],
                 slot: 1,
                 admitted: t0,
+                peer_id: crate::types::PeerId::new(0),
+                abort: None,
             },
         );
         let connected: std::collections::HashSet<[u8; 32]> = [[1u8; 32]].into_iter().collect();
@@ -8767,6 +8971,8 @@ mod tests {
                     node_id: [i as u8; 32],
                     slot: i as u32,
                     admitted: t0,
+                    peer_id: crate::types::PeerId::new(0),
+                    abort: None,
                 },
             );
         }
@@ -8782,6 +8988,8 @@ mod tests {
                 node_id: [9; 32],
                 slot: 1,
                 admitted: t0,
+                peer_id: crate::types::PeerId::new(0),
+                abort: None,
             },
         );
         let slots: std::collections::BTreeSet<u32> = taken.values().map(|c| c.slot).collect();
@@ -8796,6 +9004,8 @@ mod tests {
                     node_id: [i as u8; 32],
                     slot: i,
                     admitted: t0,
+                    peer_id: crate::types::PeerId::new(0),
+                    abort: None,
                 },
             );
         }
