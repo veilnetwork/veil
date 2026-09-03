@@ -64,11 +64,20 @@ pub fn flush_json_snapshot_sync<T: serde::Serialize + ?Sized>(
 /// `flush` is `Fn` (not `FnOnce`) because we call it on every tick AND on
 /// shutdown — wrapped in `Arc` so we can hand a shared reference into
 /// successive `spawn_blocking` calls.
+///
+/// BUILDING the snapshot happens inside `spawn_blocking` too, not before it.
+/// One of these loops snapshots the DHT value store: it clones every value
+/// while holding the store's lock, and the store is capped at 400 MB by
+/// default. Doing that on the async task stalled every other task on that
+/// worker for as long as the clone took, once every two minutes (report6
+/// V6-H6b). Said plainly, this moves the cost off the executor; it does not
+/// make the clone cheaper, and the DHT's own lock is still held while it
+/// runs, so DHT work still waits. What stops waiting is everything else.
 pub fn spawn_persist_loop<S, B, F>(
     tasks: &Arc<Mutex<RuntimeTasks>>,
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
     interval: std::time::Duration,
-    mut build_snapshot: B,
+    build_snapshot: B,
     flush: F,
 ) where
     S: Send + 'static,
@@ -76,6 +85,10 @@ pub fn spawn_persist_loop<S, B, F>(
     F: Fn(S) + Send + Sync + 'static,
 {
     let flush = Arc::new(flush);
+    // Behind a lock only to satisfy `FnMut` from several call sites: the loop
+    // awaits each blocking call before starting the next, so there is never a
+    // second caller to contend with.
+    let build = Arc::new(Mutex::new(build_snapshot));
     let handle = tokio::spawn(async move {
         let mut ticker = tokio::time::interval(interval);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -86,23 +99,38 @@ pub fn spawn_persist_loop<S, B, F>(
             tokio::select! {
                 Ok(_) = shutdown_rx.changed() => {
                     if *shutdown_rx.borrow() {
-                        let snap = build_snapshot();
-                        let f = Arc::clone(&flush);
-                        tokio::task::spawn_blocking(move || f(snap)).await
-                            .unwrap_or_else(|e| log::error!("persist flush panicked: {e}"));
+                        snapshot_and_flush(&build, &flush).await;
                         break;
                     }
                 }
                 _ = ticker.tick() => {
-                    let snap = build_snapshot();
-                    let f = Arc::clone(&flush);
-                    tokio::task::spawn_blocking(move || f(snap)).await
-                        .unwrap_or_else(|e| log::error!("persist flush panicked: {e}"));
+                    snapshot_and_flush(&build, &flush).await;
                 }
             }
         }
     });
     lock_tasks(tasks).background.push(handle);
+}
+
+/// Build the snapshot and write it, both on a blocking thread.
+///
+/// One call, so the tick arm and the shutdown arm cannot drift into doing
+/// this differently — which is how the build ended up outside the blocking
+/// call in the first place.
+async fn snapshot_and_flush<S, B, F>(build: &Arc<Mutex<B>>, flush: &Arc<F>)
+where
+    S: Send + 'static,
+    B: FnMut() -> S + Send + 'static,
+    F: Fn(S) + Send + Sync + 'static,
+{
+    let b = Arc::clone(build);
+    let f = Arc::clone(flush);
+    tokio::task::spawn_blocking(move || {
+        let snap = (lock!(b))();
+        f(snap);
+    })
+    .await
+    .unwrap_or_else(|e| log::error!("persist flush panicked: {e}"));
 }
 
 impl NodeRuntime {
@@ -889,6 +917,68 @@ mod dht_values_path_tests {
         assert!(
             NodeRuntime::load_dht_values_snapshot(&config, &logger()).is_empty(),
             "a snapshot from a newer schema must be ignored",
+        );
+    }
+
+    /// Building the snapshot must not stall the executor.
+    ///
+    /// One of these loops clones the whole DHT value store — capped at 400 MB
+    /// by default — while holding that store's lock. That used to happen on
+    /// the async task, so every other task on the worker stopped for as long
+    /// as the clone took, once every two minutes (report6 V6-H6b).
+    ///
+    /// A current-thread runtime is the whole point: on one, work done in the
+    /// async task starves everything, and work handed to `spawn_blocking`
+    /// does not. The snapshot builder below blocks the thread it runs on, and
+    /// a plain async ticker beside it has to keep counting.
+    #[tokio::test(flavor = "current_thread")]
+    async fn building_a_snapshot_does_not_starve_the_runtime() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let tasks = Arc::new(Mutex::new(RuntimeTasks::default()));
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let built = Arc::new(AtomicUsize::new(0));
+        let ticks = Arc::new(AtomicUsize::new(0));
+
+        let built_in_builder = Arc::clone(&built);
+        spawn_persist_loop(
+            &tasks,
+            shutdown_rx,
+            std::time::Duration::from_millis(10),
+            move || {
+                // Blocking, deliberately: this stands for the clone of a
+                // large value store.
+                std::thread::sleep(std::time::Duration::from_millis(200));
+                built_in_builder.fetch_add(1, Ordering::SeqCst);
+                42u32
+            },
+            |_snap: u32| {},
+        );
+
+        // An ordinary async task on the same single thread.
+        let ticks_in_task = Arc::clone(&ticks);
+        let counter = tokio::spawn(async move {
+            for _ in 0..40 {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                ticks_in_task.fetch_add(1, Ordering::SeqCst);
+            }
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        let ticked = ticks.load(Ordering::SeqCst);
+        let snapshots = built.load(Ordering::SeqCst);
+        let _ = shutdown_tx.send(true);
+        counter.abort();
+
+        assert!(
+            snapshots >= 1,
+            "the snapshot builder never ran, so this test is about nothing",
+        );
+        assert!(
+            ticked >= 10,
+            "the async task got {ticked} turns while a snapshot was being \
+             built — the build is back on the executor, and everything else \
+             on this worker waits for it",
         );
     }
 }
