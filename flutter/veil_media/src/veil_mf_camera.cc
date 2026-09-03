@@ -197,9 +197,17 @@ class MfPlatform {
   std::atomic<bool> started_{false};
 };
 
+// LEAKED ON PURPOSE — see the same note on `adm_host_thread()`.
+//
+// `Serve()` above says "the object is never destroyed", and as a by-value
+// function-local static that was simply false: every member here is
+// non-trivially destructible, so the compiler registered `~MfPlatform` for
+// exit and it ran against a detached thread waiting on `task_cv_` under
+// `m_`. The pointer form registers no destructor, which is the lifetime the
+// comment always claimed.
 MfPlatform& mf() {
-  static MfPlatform instance;
-  return instance;
+  static MfPlatform* const instance = new MfPlatform();
+  return *instance;
 }
 
 std::string wide_to_utf8(const wchar_t* value, int len) {
