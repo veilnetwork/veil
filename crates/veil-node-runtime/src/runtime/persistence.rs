@@ -680,6 +680,51 @@ mod tests {
         Arc::new(Mutex::new(st))
     }
 
+    /// A SET WITH ONLY TAKERS PERSISTS NOTHING.
+    ///
+    /// `persist_discovered_peers` keeps a peer only if it is in
+    /// `NodeState::handshaked` — "persist what we actually reached". For a
+    /// long time the only production writer was the snapshot RESTORE path, so
+    /// a fresh install started with an empty set and stayed empty: no peer
+    /// learned at a meeting point, by exchange, or by any other route was
+    /// ever written down, and every cold start walked the rendezvous again
+    /// from nothing. The identity-mismatch REMOVAL had been there all along.
+    ///
+    /// Written against the source because the thing that broke was the
+    /// absence of a call, and no behavioural test can see a call that is not
+    /// there: the filter has its own tests and they all passed.
+    #[test]
+    fn a_proven_handshake_is_recorded_somewhere_that_is_not_the_restore() {
+        let handshake = include_str!("peer_handshake.rs");
+        let production = handshake
+            .split("#[cfg(test)]")
+            .next()
+            .expect("peer_handshake.rs has no production half");
+        assert!(
+            production.contains("handshaked"),
+            "the handshake path does not touch the proof set at all"
+        );
+        assert!(
+            production.contains(
+                ".handshaked
+                    .insert("
+            ) || production.contains(".handshaked.insert("),
+            "the handshake path only REMOVES from the proof set. Nothing else              in production adds to it except loading a snapshot, so a fresh              install persists no discovered peer, ever."
+        );
+
+        // Vacuity: the filter this feeds must still be the gate, or the
+        // assertion above guards a set nobody reads.
+        let here = include_str!("persistence.rs");
+        let production_here = here
+            .split("#[cfg(test)]")
+            .next()
+            .expect("persistence.rs has no production half");
+        assert!(
+            production_here.contains("st.handshaked.contains(e.node_id.as_bytes())"),
+            "the snapshot no longer gates on the proof set; re-aim this guard"
+        );
+    }
+
     /// Our posture comes from what we ADVERTISE, not from what we bind.
     #[test]
     fn a_wildcard_bind_does_not_make_us_a_lan_node() {
