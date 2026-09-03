@@ -1185,9 +1185,22 @@ class AdmHostThread {
   bool ready_ = false;
 };
 
+// LEAKED ON PURPOSE, and the leak is what makes the paragraph above true.
+//
+// A function-local static of a type with a non-trivial destructor is NOT
+// "never destroyed": the compiler registers `~AdmHostThread` with the exit
+// handler list, and it runs while `Serve()` is parked in `task_cv_.wait`
+// holding `m_`. Destroying a mutex someone holds and a condition variable
+// someone waits on is undefined, and on the MSVC runtime the observed shape
+// is a process that stops exiting — the window is gone, the tray icon is
+// gone, and xveil.exe is still in the task list.
+//
+// The pointer form registers nothing, so exit reaches `ExitProcess` and the
+// OS reclaims the thread. The object's storage is never reclaimed, which is
+// the intent: it is process-lifetime state.
 AdmHostThread& adm_host_thread() {
-  static AdmHostThread instance;
-  return instance;
+  static AdmHostThread* const instance = new AdmHostThread();
+  return *instance;
 }
 
 // Every call into the ADM goes to the thread that CREATED it.
