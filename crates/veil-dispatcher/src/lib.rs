@@ -335,6 +335,13 @@ pub struct AbuseContext {
     /// just out of a bounded pot. See
     /// [`veil_proto::budget::UNSIGNED_ROUTE_REQUEST_BURST`].
     pub unsigned_route_request_budget: Arc<Mutex<veil_abuse::rate_limiter::TokenBucket>>,
+    /// Budget for `RouteRequest` frames this node FANS OUT for other people.
+    ///
+    /// Not keyed by peer, unlike `dht_quota` beside it: that one bounds each
+    /// sender, and the cost being bounded here is this node's own emission,
+    /// which is (admitted requests) × (peers) whoever sent them. See
+    /// [`veil_proto::budget::ROUTE_REQUEST_FORWARD_BURST`].
+    pub route_request_forward_budget: Arc<Mutex<veil_abuse::rate_limiter::TokenBucket>>,
     /// Budget for opening ratchet payloads from senders this node has never
     /// proven.
     ///
@@ -1944,6 +1951,13 @@ pub fn make_test_dispatcher(role: NodeRole) -> FrameDispatcher {
                     1.0 / veil_proto::budget::UNSIGNED_ROUTE_REQUEST_REFILL_SECS as f64,
                 ),
             )),
+            route_request_forward_budget: Arc::new(Mutex::new(
+                veil_abuse::rate_limiter::TokenBucket::new(
+                    veil_proto::budget::ROUTE_REQUEST_FORWARD_BURST as f64,
+                    veil_proto::budget::ROUTE_REQUEST_FORWARD_BURST as f64
+                        / veil_proto::budget::ROUTE_REQUEST_FORWARD_REFILL_SECS as f64,
+                ),
+            )),
             unproven_ratchet_open_budget: Arc::new(Mutex::new(
                 veil_abuse::rate_limiter::TokenBucket::new(
                     veil_proto::budget::UNPROVEN_RATCHET_OPEN_BURST as f64,
@@ -2761,6 +2775,13 @@ mod tests {
                     veil_abuse::rate_limiter::TokenBucket::new(
                         veil_proto::budget::UNSIGNED_ROUTE_REQUEST_BURST as f64,
                         1.0 / veil_proto::budget::UNSIGNED_ROUTE_REQUEST_REFILL_SECS as f64,
+                    ),
+                )),
+                route_request_forward_budget: Arc::new(Mutex::new(
+                    veil_abuse::rate_limiter::TokenBucket::new(
+                        veil_proto::budget::ROUTE_REQUEST_FORWARD_BURST as f64,
+                        veil_proto::budget::ROUTE_REQUEST_FORWARD_BURST as f64
+                            / veil_proto::budget::ROUTE_REQUEST_FORWARD_REFILL_SECS as f64,
                     ),
                 )),
                 unproven_ratchet_open_budget: Arc::new(Mutex::new(
@@ -3961,6 +3982,67 @@ mod tests {
             disp.route_cache.read().unwrap().lookup(&origin),
             None,
             "a RouteUpdate frame still installed a route — the plane is back",
+        );
+    }
+
+    /// Many peers cannot together buy more fan-out than this node allows
+    /// itself.
+    ///
+    /// Forwarding a `RouteRequest` costs a send to every session held, and the
+    /// gate in front of it is keyed by the peer the frame arrived from — so it
+    /// bounds each sender and not this node. With enough senders each staying
+    /// inside their own allowance, the node's emission grows with the number
+    /// of senders (report5b R5b-C-01). The forward path never learns who the
+    /// requester is, so the only thing left to bound is our own output.
+    #[test]
+    fn many_senders_cannot_outrun_this_nodes_own_fanout_budget() {
+        use ed25519_dalek::SigningKey;
+        use veil_proto::routing::RouteRequestPayload;
+
+        let relay = [0x11u8; 32];
+        let onward = [0xDDu8; 32];
+        let relay_sk = Arc::new(SigningKey::from_bytes(&[0x11u8; 32]));
+
+        let tx_reg = Arc::new(RwLock::new(veil_session::SessionTxRegistry::new()));
+        let mut rx_onward = tx_reg.write().unwrap().register(onward);
+        let disp =
+            make_gossip_dispatcher(relay, Arc::clone(&relay_sk), Arc::clone(&tx_reg), vec![]);
+        let hdr = FrameHeader::new(FrameFamily::Routing as u8, RoutingMsg::RouteRequest as u16);
+
+        // A small pot, so the test does not have to send hundreds of frames.
+        // 2 tokens, refilling slowly enough not to matter inside the test.
+        *disp.abuse.route_request_forward_budget.lock().unwrap() =
+            veil_abuse::rate_limiter::TokenBucket::new(2.0, 0.001);
+
+        // Each frame comes from a DIFFERENT peer, so the per-peer gate is
+        // never the thing refusing: every sender is well inside its own
+        // allowance, which is exactly the case the per-peer gate cannot see.
+        let mut forwarded = 0;
+        for i in 0..8u8 {
+            let sender = [0x40 + i; 32];
+            let req = RouteRequestPayload {
+                target_node_id: [0x22u8; 32],
+                requester_node_id: sender,
+                request_id: 1000 + i as u32,
+                ttl: 7,
+                signature: [0u8; 64],
+            };
+            disp.dispatch(&hdr, &req.encode(), sender);
+            if rx_onward.try_recv().is_ok() {
+                forwarded += 1;
+            }
+        }
+
+        assert!(
+            forwarded >= 1,
+            "nothing was forwarded at all, so this test says nothing about a \
+             budget",
+        );
+        assert!(
+            forwarded <= 2,
+            "eight senders, each well inside its own per-peer allowance, made \
+             this node fan out {forwarded} times against a pot of 2 — the \
+             node's own emission is unbounded",
         );
     }
 

@@ -1,5 +1,25 @@
 # Changelog
 
+## v0.11.16 — 2026-09-03
+
+**A node now bounds its own fan-out, not just each sender's.**
+
+Forwarding a `RouteRequest` costs a send to every session this node holds. The
+gate in front of that was keyed by the peer the frame arrived from, which
+bounds each sender and says nothing about the node: with enough peers each
+staying comfortably inside their own allowance, the traffic this node emits
+grows with the number of peers (report5b R5b-C-01). Nothing on the forward path
+knows who the requester is — a relay never learns that — so the only thing left
+to bound is our own output, and now it is: one pot, not keyed at all, spent
+only on frames relayed for somebody else.
+
+A refusal drops the frame rather than charging the peer that handed it over.
+That peer is a courier and is not the reason the pot is empty; its own rate is
+already answered for by the per-peer gate above.
+
+Carried across a config reload rather than rebuilt, like every bucket beside
+it: rebuilding refills, and a reload must not hand a flooder a fresh pot.
+
 ## v0.11.15 — 2026-09-03
 
 **A snapshot is built on a blocking thread, not on the executor.**
