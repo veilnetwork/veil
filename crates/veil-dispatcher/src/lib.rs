@@ -3305,9 +3305,16 @@ mod tests {
 
     // ── tests ────────────────────────────────────────────────────────
 
-    /// SEC-004b: A PowChallenge with an invalid acceptor signature must be rejected.
+    /// SEC-004b: A PowChallenge with an invalid acceptor signature is refused
+    /// — and the peer that CARRIED it is not charged for it.
+    ///
+    /// It used to be a violation against the delivering peer, and a challenge
+    /// is a relayed frame: the acceptor signs it, somebody else hands it over.
+    /// Five violations ban a peer, so a stranger could pick which of our
+    /// neighbours we cut ourselves off from by naming us as the requester in
+    /// an unsigned RouteRequest (report5b R5b-V-04).
     #[test]
-    fn pow_challenge_invalid_sig_is_violation() {
+    fn pow_challenge_invalid_sig_is_refused_without_blaming_the_courier() {
         use ed25519_dalek::SigningKey;
         use veil_proto::routing::PowChallengePayload;
 
@@ -3343,8 +3350,68 @@ mod tests {
         let hdr = FrameHeader::new(FrameFamily::Routing as u8, RoutingMsg::PowChallenge as u16);
         let result = disp_a.dispatch(&hdr, &challenge.encode(), c_id);
         assert!(
-            matches!(result, DispatchResult::Violation(_)),
-            "invalid acceptor sig must be Violation, got {result:?}",
+            matches!(result, DispatchResult::NoResponse),
+            "a forged acceptor signature was charged to the peer that carried \
+             the frame, which is how a stranger picks our next ban, got \
+             {result:?}",
+        );
+        // Vacuity: the challenge is still REFUSED. A dispatch that solved it
+        // would satisfy the assertion above just as well.
+        assert!(
+            !matches!(result, DispatchResult::SolvePow(_)),
+            "a challenge with a forged signature was solved",
+        );
+    }
+
+    /// The same frame from a peer we have never handshaked with is dropped
+    /// too — and this is the shape that actually reaches a node.
+    ///
+    /// A challenge arrives from several hops away, so the acceptor's key is
+    /// ordinarily one we do not hold. That used to be a violation as well, on
+    /// the reasoning that a challenge only ever arrives from a peer we know;
+    /// the relay branch a few lines below it says otherwise.
+    #[test]
+    fn a_challenge_from_an_unknown_acceptor_does_not_charge_the_relay() {
+        use ed25519_dalek::SigningKey;
+        use veil_proto::routing::PowChallengePayload;
+
+        let a_id = [0xAAu8; 32]; // us, the requester
+        let c_id = [0xCCu8; 32]; // the acceptor, whom we have never met
+        let relay_id = [0xDDu8; 32]; // the neighbour that handed it over
+        let c_sk = SigningKey::from_bytes(&[0xCCu8; 32]);
+        let tx_reg = Arc::new(RwLock::new(veil_session::SessionTxRegistry::new()));
+
+        // The dispatcher knows the RELAY's key, and nothing about C.
+        let disp_a = make_gossip_dispatcher(
+            a_id,
+            Arc::new(SigningKey::from_bytes(&[0xAAu8; 32])),
+            Arc::clone(&tx_reg),
+            vec![(
+                relay_id,
+                SigningKey::from_bytes(&[0xDDu8; 32]).verifying_key(),
+            )],
+        );
+
+        let mut challenge = PowChallengePayload {
+            requester_node_id: a_id,
+            acceptor_node_id: c_id,
+            challenge_nonce: [0x11u8; 32],
+            difficulty: 1,
+            signature: [0u8; 64],
+        };
+        {
+            use ed25519_dalek::Signer;
+            // Honestly signed by C — we simply cannot check it.
+            challenge.signature = c_sk.sign(&challenge.signable_bytes()).to_bytes();
+        }
+
+        let hdr = FrameHeader::new(FrameFamily::Routing as u8, RoutingMsg::PowChallenge as u16);
+        let result = disp_a.dispatch(&hdr, &challenge.encode(), relay_id);
+        assert!(
+            matches!(result, DispatchResult::NoResponse),
+            "an unverifiable challenge banned the relay that carried it — \
+             repeat five times and the node has cut off its own route, got \
+             {result:?}",
         );
     }
 
@@ -3393,11 +3460,19 @@ mod tests {
             "first dispatch must succeed, got {r1:?}",
         );
 
-        // Second dispatch with same peer immediately: rate limit must fire.
+        // Second dispatch with same peer immediately: the rate limit must
+        // fire — and must not be charged to the peer, which only carried the
+        // frames somebody else chose to send (report5b R5b-V-04).
         let r2 = disp_a.dispatch(&hdr, &challenge.encode(), c_id);
         assert!(
-            matches!(r2, DispatchResult::Violation(_)),
-            "second dispatch must be rate-limited, got {r2:?}",
+            matches!(r2, DispatchResult::NoResponse),
+            "the flood was charged to the courier, so an attacker chooses \
+             which neighbour we ban by aiming challenges through it, got \
+             {r2:?}",
+        );
+        assert!(
+            !matches!(r2, DispatchResult::SolvePow(_)),
+            "vacuity: the second challenge was solved, so nothing was limited",
         );
     }
 
@@ -3456,8 +3531,15 @@ mod tests {
         let pr_hdr = FrameHeader::new(FrameFamily::Routing as u8, RoutingMsg::PowResponse as u16);
         let result = disp_c.dispatch(&pr_hdr, &pow_resp.encode(), b_id);
         assert!(
-            matches!(result, DispatchResult::Violation(_)),
-            "PowResponse with mismatched requester_node_id must be Violation, got {result:?}",
+            matches!(result, DispatchResult::NoResponse),
+            "a mismatched requester was charged to whoever delivered the \
+             response, and a response is relayed too, got {result:?}",
+        );
+        // Vacuity: the response is still REFUSED — no RouteResponse goes out.
+        assert!(
+            rx_a.try_recv().is_err(),
+            "a PowResponse claiming the wrong requester still earned a \
+             RouteResponse",
         );
     }
 
@@ -7702,6 +7784,123 @@ mod tests {
         assert!(s.check_and_insert(RouteSeenSet::KIND_WITHDRAW, o, v, seq));
         // Replay layer still collapses a different via under the same kind.
         assert!(s.check_and_insert(RouteSeenSet::KIND_ANNOUNCE, o, [9u8; 32], seq));
+    }
+
+    /// A peer cannot take over a destination it merely CLAIMS to be next to.
+    ///
+    /// The score a `RouteAnnounce` earns used to be clamped only above one
+    /// hop, on the reading that "one hop" means the peer is directly attached
+    /// to the origin and its cheaper score is therefore accurate. Nothing
+    /// checks that. A peer says which origin it is one hop from, so any peer
+    /// with a session could name any node in the network, score 10_000 against
+    /// a confirmed route's 20_000, and pull that node's traffic through
+    /// itself — to watch who talks to whom, and to drop it (report5b
+    /// R5b-V-02).
+    #[test]
+    fn a_one_hop_claim_does_not_beat_a_confirmed_route() {
+        use ed25519_dalek::SigningKey;
+
+        let me = [0xAAu8; 32];
+        let confirmed_hop = [0xBBu8; 32]; // where a confirmed route points
+        let attacker = [0xEEu8; 32];
+        let victim = [0xCCu8; 32]; // the destination being fought over
+
+        let e_sk = Arc::new(SigningKey::from_bytes(&[0xEEu8; 32]));
+        let tx_reg = Arc::new(RwLock::new(veil_session::SessionTxRegistry::new()));
+        let disp = make_gossip_dispatcher(
+            me,
+            Arc::new(SigningKey::from_bytes(&[0xAAu8; 32])),
+            Arc::clone(&tx_reg),
+            vec![(attacker, e_sk.verifying_key())],
+        );
+
+        // A route we confirmed ourselves, at the score a signed RouteResponse
+        // earns.
+        disp.route_cache.write().unwrap().insert(
+            victim,
+            confirmed_hop,
+            crate::routing::MIN_DIRECT_RELAY_SCORE,
+            2,
+        );
+        assert_eq!(
+            disp.route_cache.read().unwrap().lookup(&victim),
+            Some(confirmed_hop),
+            "premise: the confirmed route is the one in use",
+        );
+
+        // The attacker announces "I am one hop from the victim".
+        let (hdr, body) = build_announce_frame(victim, attacker, 1, 7, 1, &e_sk);
+        disp.dispatch(&hdr, &body, attacker);
+
+        assert_eq!(
+            disp.route_cache.read().unwrap().lookup(&victim),
+            Some(confirmed_hop),
+            "a peer took a destination away from a confirmed route by \
+             claiming to be next to it",
+        );
+
+        // Vacuity: the announcement was not simply thrown away — with no
+        // confirmed route in the way it IS the route, or this test would pass
+        // against a dispatcher that ignores announcements altogether.
+        let other = [0x77u8; 32];
+        let (hdr, body) = build_announce_frame(other, attacker, 1, 7, 1, &e_sk);
+        disp.dispatch(&hdr, &body, attacker);
+        assert_eq!(
+            disp.route_cache.read().unwrap().lookup(&other),
+            Some(attacker),
+            "an announcement about an otherwise unknown destination must \
+             still be usable",
+        );
+    }
+
+    /// And the floor must not flatten honest relays into each other.
+    ///
+    /// The obvious way to stop an unverifiable claim from beating a confirmed
+    /// route is to clamp every such claim to one number — and that makes a
+    /// three-hop relay look exactly as good as a one-hop one, so traffic stops
+    /// preferring the shorter path. Adding the floor keeps the order; clamping
+    /// to it does not, and nothing else in this file would notice.
+    #[test]
+    fn the_floor_keeps_relays_ordered_by_how_far_they_say_it_is() {
+        use ed25519_dalek::SigningKey;
+
+        let me = [0xAAu8; 32];
+        let far = [0xEEu8; 32];
+        let near = [0xBBu8; 32];
+        let victim = [0xCCu8; 32];
+
+        let far_sk = Arc::new(SigningKey::from_bytes(&[0xEEu8; 32]));
+        let near_sk = Arc::new(SigningKey::from_bytes(&[0xBBu8; 32]));
+        let tx_reg = Arc::new(RwLock::new(veil_session::SessionTxRegistry::new()));
+        let disp = make_gossip_dispatcher(
+            me,
+            Arc::new(SigningKey::from_bytes(&[0xAAu8; 32])),
+            Arc::clone(&tx_reg),
+            vec![
+                (far, far_sk.verifying_key()),
+                (near, near_sk.verifying_key()),
+            ],
+        );
+
+        // The WORSE one first, so a tie would leave it in front and this test
+        // fails rather than passing by insertion order.
+        // Distinct sequence numbers: the two relays keep their own counters,
+        // and the dedup set in front of this path is allowed to mistake a
+        // repeat for one it has seen.
+        // Two hops against one. These are the counts where a CLAMP collapses:
+        // both land under the floor and become the same number, while adding
+        // the floor keeps them apart.
+        let (hdr, body) = build_announce_frame(victim, far, 2, 7, 1, &far_sk);
+        disp.dispatch(&hdr, &body, far);
+        let (hdr, body) = build_announce_frame(victim, near, 1, 7, 2, &near_sk);
+        disp.dispatch(&hdr, &body, near);
+
+        assert_eq!(
+            disp.route_cache.read().unwrap().lookup(&victim),
+            Some(near),
+            "a one-hop relay and a two-hop relay were scored the same, so \
+             traffic no longer prefers the shorter path",
+        );
     }
 
     #[test]
