@@ -1,5 +1,32 @@
 # Changelog
 
+## v0.11.14 — 2026-09-03
+
+**A gossiped contact cannot move where we dial a peer we were told about
+another way.**
+
+The peer table is keyed by a local slot number, so "do we already know this
+node" is answered by searching it for the node id — and that search returned
+whichever row held the id, whoever had written it. The gossip loop then
+overwrote that row: source, address and all. A peer on our walk path could
+therefore rewrite the address of a peer from `[[peers]]`, mark it as
+PEX-learned, and have the rewrite persisted to disk for the next restart
+(report12 V-M1). A rumour carries an address nobody signed for; a configured
+row is the operator's word.
+
+The question now has three answers instead of two — refresh the row PEX minted
+itself, leave alone the row somebody else owns, or mint a new one — and the
+gossip loop skips the contact entirely in the middle case. There is nothing to
+learn there: we already know how to reach that node.
+
+The rule is walked over every peer source rather than written as a list of the
+ones to refuse, so a source added later is pinned by default instead of
+silently becoming overwritable. And because the call site is inside the gossip
+task, where no unit test reaches, a structural guard checks that the loop
+SKIPS a pinned row rather than folding it into "no row here" — which would
+mint a second slot and dial the rumour regardless, with every other test still
+green.
+
 ## v0.11.13 — 2026-09-03
 
 **Two ways a stranger could aim this node's routing.**

@@ -120,6 +120,37 @@ pub(crate) fn existing_entry_for<'a>(
     peers.values().find(|e| e.node_id.as_bytes() == node_id)
 }
 
+/// What PEX is allowed to do with the slot a node id already occupies.
+///
+/// A gossiped contact carries an address nobody signed for, so it may refresh
+/// a row PEX itself minted and must not touch one the operator wrote. The two
+/// used to be the same answer: the lookup found whichever row held the node
+/// id, and the caller overwrote it with `source: Exchanged`, `bootstrap_only:
+/// false` and the rumoured transport — so a peer on our walk path could
+/// rewrite where we dial a peer from `[[peers]]`, and the rewrite was
+/// persisted (report12 V-M1).
+pub(crate) enum PexSlot {
+    /// No row for this node id. Mint one.
+    Vacant,
+    /// A row PEX minted before. Refresh it in place.
+    Refresh(veil_cfg::PeerId),
+    /// A row somebody else owns — configured, bootstrap, a beacon, a
+    /// rendezvous. Leave it exactly as it is.
+    Pinned,
+}
+
+/// Which of the three [`PexSlot`] cases a gossiped contact falls into.
+pub(crate) fn pex_slot_for(
+    peers: &std::collections::BTreeMap<veil_cfg::PeerId, PeerConfigEntry>,
+    node_id: &[u8; 32],
+) -> PexSlot {
+    match peers.iter().find(|(_, e)| e.node_id.as_bytes() == node_id) {
+        None => PexSlot::Vacant,
+        Some((id, e)) if e.source == crate::types::PeerSource::Exchanged => PexSlot::Refresh(*id),
+        Some(_) => PexSlot::Pinned,
+    }
+}
+
 pub(crate) fn existing_slot_for(
     peers: &std::collections::BTreeMap<veil_cfg::PeerId, PeerConfigEntry>,
     node_id: &[u8; 32],
@@ -817,6 +848,106 @@ mod tests {
         assert!(
             !st.handshaked.contains(&stranger),
             "a node we do not track must not be held in memory for the rest of the run"
+        );
+    }
+
+    /// A gossiped contact refreshes only the rows PEX itself minted.
+    ///
+    /// The lookup used to answer with whichever row held the node id, and the
+    /// caller then overwrote it — source, transport and all. So a peer on our
+    /// walk path could rewrite where we dial a peer the operator put in
+    /// `[[peers]]`, and the rewrite was persisted to disk (report12 V-M1). A
+    /// rumour carries an address nobody signed for; a configured row is the
+    /// operator's word.
+    #[test]
+    fn a_rumour_may_refresh_its_own_row_and_no_other() {
+        use crate::types::PeerSource;
+
+        let learned = [0x11u8; 32];
+        let configured = [0x22u8; 32];
+        let unknown = [0x33u8; 32];
+
+        let mut peers = std::collections::BTreeMap::new();
+        peers.insert(
+            veil_cfg::PeerId::new(1),
+            peer_entry(1, learned, "tcp://198.51.100.1:5556"),
+        );
+        let mut operator_row = peer_entry(2, configured, "tcp://203.0.113.9:5556");
+        operator_row.source = PeerSource::Configured;
+        peers.insert(veil_cfg::PeerId::new(2), operator_row);
+
+        assert!(
+            matches!(
+                pex_slot_for(&peers, &learned),
+                PexSlot::Refresh(id) if id == veil_cfg::PeerId::new(1)
+            ),
+            "PEX can no longer refresh the row it minted itself, so every \
+             gossip round mints another slot for the same node",
+        );
+        assert!(
+            matches!(pex_slot_for(&peers, &configured), PexSlot::Pinned),
+            "a rumour was allowed to take over the operator's row, which is \
+             how a peer on our walk path moves where we dial",
+        );
+        assert!(
+            matches!(pex_slot_for(&peers, &unknown), PexSlot::Vacant),
+            "a node nothing knows about must still be admissible, or PEX \
+             learns nothing at all",
+        );
+
+        // Every source that is NOT Exchanged is pinned — walked rather than
+        // listed, so a source added later is refused by default instead of
+        // silently becoming overwritable.
+        for source in PeerSource::ALL {
+            let mut row = peer_entry(9, unknown, "tcp://198.51.100.9:5556");
+            row.source = *source;
+            let mut one = std::collections::BTreeMap::new();
+            one.insert(veil_cfg::PeerId::new(9), row);
+            let slot = pex_slot_for(&one, &unknown);
+            if *source == PeerSource::Exchanged {
+                assert!(matches!(slot, PexSlot::Refresh(_)), "{source:?}");
+            } else {
+                assert!(
+                    matches!(slot, PexSlot::Pinned),
+                    "a {source:?} row was left open to a rumour",
+                );
+            }
+        }
+    }
+
+    /// And the gossip loop REFUSES a pinned row rather than folding it into
+    /// "no row here".
+    ///
+    /// The predicate above is only half the fix: a caller that treated
+    /// `Pinned` as `Vacant` would mint a second slot for the same node and
+    /// dial the rumoured address anyway, and the test above would still pass.
+    /// Structural because the call site is inside the gossip task — an async
+    /// loop over a live PEX walk, which a unit test cannot reach.
+    #[test]
+    fn the_gossip_loop_refuses_a_pinned_row() {
+        let source = include_str!("services.rs");
+        let production = source.split("#[cfg(test)]").next().unwrap_or(source);
+        let at = production
+            .find("PexSlot::Pinned =>")
+            .expect("the gossip loop no longer asks about pinned rows");
+        let arm = &production[at..at + 40];
+        assert!(
+            arm.contains("continue"),
+            "the pinned arm does something other than skip the contact: \
+             folding it into `None` mints a second slot for a node the \
+             operator already configured, and dials the rumour anyway — got \
+             {arm:?}",
+        );
+        assert_eq!(
+            production.matches("pex_slot_for(").count(),
+            1,
+            "a second caller appeared; it needs the same refusal, and this \
+             guard only watches the first",
+        );
+        assert!(
+            !production.contains("persistence::existing_slot_for(\n"),
+            "the gossip loop went back to the lookup that answers with any \
+             row whatever wrote it",
         );
     }
 

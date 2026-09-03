@@ -427,10 +427,27 @@ impl NodeRuntime {
                                             // dial attempts on the next restart. The dedup that
                                             // WAS thought about (the comment above) covers the
                                             // connector task, not the map.
-                                            let existing = crate::runtime::persistence::existing_slot_for(
+                                            use crate::runtime::persistence::PexSlot;
+                                            let slot = crate::runtime::persistence::pex_slot_for(
                                                 &lock_state(&state).peers,
                                                 &p.node_id,
                                             );
+                                            let existing = match slot {
+                                                PexSlot::Refresh(id) => Some(id),
+                                                PexSlot::Vacant => None,
+                                                // A row the operator wrote, or
+                                                // one a beacon or a rendezvous
+                                                // proved. A rumour carries an
+                                                // address nobody signed for, so
+                                                // it does not get to move where
+                                                // we dial a peer we were told
+                                                // about by other means
+                                                // (report12 V-M1). We already
+                                                // know how to reach this node;
+                                                // there is nothing here to
+                                                // learn.
+                                                PexSlot::Pinned => continue,
+                                            };
                                             let peer_id = match existing {
                                                 Some(id) => id,
                                                 None => {
