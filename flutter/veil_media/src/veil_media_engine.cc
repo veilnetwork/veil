@@ -1258,8 +1258,16 @@ void run_on_adm_thread(std::function<void()> fn) { fn(); }
 int g_chosen_playout = -1;
 int g_chosen_recording = -1;
 
-void start_playout(webrtc::AudioDeviceModule* adm) {
-  if (adm == nullptr) return;
+// Start playout on the ADM's own thread, and SAY whether it worked.
+//
+// This returned `void` and only logged, while `start_capture` beside it
+// returned a bool the callers acted on. So a call whose playout refused —
+// no output device, a driver that would not initialise, an ADM that was
+// never created — reported success, set `audio_running`, and the person
+// heard nothing while the interface showed a live call. A second start was
+// then a no-op, because running was already true (report19 V19-M3).
+bool start_playout(webrtc::AudioDeviceModule* adm) {
+  if (adm == nullptr) return false;
   int32_t set_rc = 0, init_rc = 0, start_rc = 0;
   run_on_adm_thread([&] {
 #if defined(_WIN32)
@@ -1290,9 +1298,10 @@ void start_playout(webrtc::AudioDeviceModule* adm) {
     vlog("adm start: PLAYOUT FAILED set=%d init=%d start=%d — the call carries "
          "our voice and none of theirs",
          (int)set_rc, (int)init_rc, (int)start_rc);
-  } else {
-    vlog("adm start: playout ok (device set rc=%d)", (int)set_rc);
+    return false;
   }
+  vlog("adm start: playout ok (device set rc=%d)", (int)set_rc);
+  return true;
 }
 
 // Start capture on the ADM's own thread, reporting every code.
@@ -1725,6 +1734,7 @@ int veil_media_group_engine_start_audio(VeilGroupMediaEngine* engine) {
   });
   if (ws->send_stream == nullptr) return VEIL_MEDIA_ERR_STATE;
   bool capture_failed = false;
+  bool playout_failed = false;
   if (ws->adm) {
     if (!engine->mic_muted) {
       // Align with set_mic_muted: a capture device that cannot start must be
@@ -1732,10 +1742,13 @@ int veil_media_group_engine_start_audio(VeilGroupMediaEngine* engine) {
       // the room stays audible while the caller decides what to do.
       if (!start_capture(ws->adm.get(), "group audio")) capture_failed = true;
     }
-    start_playout(ws->adm.get());
+    // A playout that refused is reported exactly as a capture that refused.
+    // Ignoring it said the room was audible when it was not (report19
+    // V19-M3).
+    if (!start_playout(ws->adm.get())) playout_failed = true;
   }
   engine->audio_running.store(true);
-  if (capture_failed) return VEIL_MEDIA_ERR_DEVICE;
+  if (capture_failed || playout_failed) return VEIL_MEDIA_ERR_DEVICE;
   vlog("group audio: started peers=%zu", ws->peers.size());
   return VEIL_MEDIA_OK;
 #else
@@ -2215,13 +2228,16 @@ int veil_media_engine_start_audio(VeilMediaEngine* engine, int send, int recv) {
   vlog("adm start: asked send=%d recv=%d micMuted=%d adm=%s", (int)send,
        (int)recv, (int)engine->mic_muted, ws->adm ? "yes" : "NULL");
   bool capture_failed = false;
+  bool playout_failed = false;
   if (ws->adm) {
     if (send && !engine->mic_muted) {
       // Same contract as set_mic_muted/group start: surface a capture device
       // that refuses to start instead of silently sending nothing.
       if (!start_capture(ws->adm.get(), "adm start")) capture_failed = true;
     }
-    if (recv) start_playout(ws->adm.get());
+    // Same contract as capture: a playout that refused is a device failure
+    // the caller has to hear about, not a line in a log (report19 V19-M3).
+    if (recv && !start_playout(ws->adm.get())) playout_failed = true;
     int recording = 0, playing = 0;
     run_on_adm_thread([&] {
       recording = ws->adm->Recording();
@@ -2267,7 +2283,7 @@ int veil_media_engine_start_audio(VeilMediaEngine* engine, int send, int recv) {
         webrtc::TimeDelta::Seconds(3));
   }
   engine->audio_running.store(true);
-  if (capture_failed) return VEIL_MEDIA_ERR_DEVICE;
+  if (capture_failed || playout_failed) return VEIL_MEDIA_ERR_DEVICE;
   return VEIL_MEDIA_OK;
 #else
   (void)send;
