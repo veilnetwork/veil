@@ -348,16 +348,35 @@ impl FrameDispatcher {
             .max(MIN_REACHABILITY);
         let raw_score = (base_score_f / reachability * SCORE_MILLIUNIT_SCALE)
             .clamp(0.0, u32::MAX as f32) as u32;
-        let score = if p.hop_count > 1 && &p.origin_node_id != peer_id.as_bytes() {
-            // for relay hops (hop_count > 1, i.e., peer is
-            // acting as a multi-hop relay), clamp the score to
-            // MIN_DIRECT_RELAY_SCORE so a spoofed low hop-count claim
-            // cannot appear cheaper than a confirmed RouteResponse (which
-            // scores 20_000). hop_count=1 announces are NOT clamped —
-            // they represent a direct peer-to-origin connection and their
-            // lower score is accurate.
-            raw_score.max(MIN_DIRECT_RELAY_SCORE)
+        let score = if &p.origin_node_id != peer_id.as_bytes() {
+            // An announcement ABOUT SOMEBODY ELSE is a claim, whatever hop
+            // count it carries, so it is clamped to MIN_DIRECT_RELAY_SCORE and
+            // can never look cheaper than a RouteResponse we confirmed
+            // ourselves (which scores 20_000).
+            //
+            // `hop_count > 1` used to be the condition, on the reading that
+            // "one hop" means the peer is directly attached to the origin and
+            // its lower score is therefore accurate. Nothing checks that. A
+            // peer says which origin it is one hop from, so any peer with a
+            // session could claim to be next to any node in the network, score
+            // 10_000 against a confirmed route's 20_000, and take that node's
+            // traffic through itself — not to read it, since the payload is
+            // sealed end to end, but to see who talks to whom and to drop it
+            // (report5b R5b-V-02).
+            //
+            // hop_count = 0 for a foreign origin is refused outright above:
+            // that one is self-contradictory rather than merely unverifiable.
+            //
+            // ADDED to the floor rather than clamped to it, so honest relays
+            // still rank against each other by how far they say the origin is.
+            // A clamp collapses every claim onto one number, which would make
+            // a three-hop relay look exactly as good as a one-hop one — the
+            // old code had that flaw above hop_count 1, and simply widening
+            // the clamp would have spread it to every announcement.
+            MIN_DIRECT_RELAY_SCORE.saturating_add(raw_score)
         } else {
+            // The peer announcing ITSELF. Its signature, checked above, is
+            // exactly the proof that claim needs.
             raw_score
         };
         wlock!(self.route_cache).insert(p.origin_node_id, p.via_node_id, score, p.hop_count);
@@ -810,6 +829,32 @@ impl FrameDispatcher {
         DispatchResult::NoResponse
     }
 
+    /// A `PowChallenge`/`PowResponse` is RELAYED, so the peer that handed it
+    /// over is a courier and not its author.
+    ///
+    /// A violation is charged to whoever delivered the frame, and five of them
+    /// ban that peer. Everything the two handlers below can find wrong with a
+    /// challenge — whose signature it carries, what difficulty it names, how
+    /// many arrived — is chosen by a party several hops away, so charging the
+    /// courier let a stranger pick which of our neighbours we would cut
+    /// ourselves off from: name a victim as the requester in an unsigned
+    /// `RouteRequest`, and the challenges come back through the victim's own
+    /// relay until the victim bans it (report5b R5b-V-04).
+    ///
+    /// Dropped instead, and said in the log. The only thing a courier IS
+    /// answerable for is handing us bytes that are not a frame, and that stays
+    /// a violation: it decoded the frame itself before forwarding it.
+    fn drop_relayed(&self, what: &str, peer_id: NodeId) -> DispatchResult {
+        self.logger.warn(
+            "routing.pow.dropped",
+            format!(
+                "{what} — dropped; the peer that carried it ({}) did not write it",
+                veil_util::hex_short(peer_id.as_bytes()),
+            ),
+        );
+        DispatchResult::NoResponse
+    }
+
     fn handle_pow_challenge(&self, body: &[u8], peer_id: NodeId) -> DispatchResult {
         let p = match PowChallengePayload::decode(body) {
             Ok(p) => p,
@@ -818,17 +863,24 @@ impl FrameDispatcher {
         if p.requester_node_id == self.local_node_id {
             // SEC-004a: Rate-limit PowChallenge per sender before any CPU work.
             if !lock!(self.abuse.pow_challenge_limiter).allow(*peer_id.as_bytes()) {
-                return DispatchResult::Violation("PowChallenge: rate limit exceeded".to_owned());
+                // The limiter still does its job — this returns before any CPU
+                // work — but it counts frames a relay CARRIED, and an attacker
+                // chooses how many of those there are.
+                return self.drop_relayed("PowChallenge: rate limit exceeded", peer_id);
             }
             // SEC-004c: Reject absurdly high difficulty values before any CPU work.
             // A malicious acceptor setting difficulty=255 would lock the solver
             // for 2^255 iterations — effectively a permanent denial-of-service.
             if p.difficulty > veil_proto::budget::MAX_POW_DIFFICULTY {
-                return DispatchResult::Violation(format!(
-                    "PowChallenge: difficulty {} exceeds maximum {}",
-                    p.difficulty,
-                    veil_proto::budget::MAX_POW_DIFFICULTY,
-                ));
+                // The ACCEPTOR chose this number.
+                return self.drop_relayed(
+                    &format!(
+                        "PowChallenge: difficulty {} exceeds maximum {}",
+                        p.difficulty,
+                        veil_proto::budget::MAX_POW_DIFFICULTY,
+                    ),
+                    peer_id,
+                );
             }
             // SEC-004b: Verify acceptor's signature before spawning solver.
             // The signature covers requester||acceptor||nonce||difficulty and
@@ -836,12 +888,17 @@ impl FrameDispatcher {
             // in our peer_pubkeys cache (set during handshake with acceptor).
             // UnknownKey treated as Violation: we must have exchanged keys with
             // the acceptor during the session handshake before a challenge arrives.
+            // Both failures belong to the acceptor, not to the courier: a bad
+            // signature is the acceptor's forgery, and an unknown key means we
+            // have simply never handshaked with the acceptor — which is the
+            // ordinary case for a challenge that came several hops. The
+            // neighbouring `RouteRequest` path already reasons this way about
+            // its own unknown keys; this one did not.
             match self.check_routing_sig(&p.acceptor_node_id, &p.signable_bytes(), &p.signature) {
                 SigResult::Valid => {}
                 _ => {
-                    return DispatchResult::Violation(
-                        "PowChallenge: invalid acceptor signature".to_owned(),
-                    );
+                    return self
+                        .drop_relayed("PowChallenge: acceptor signature not verifiable", peer_id);
                 }
             }
             // Deduplicate challenge nonces to prevent replay flooding.
@@ -881,12 +938,13 @@ impl FrameDispatcher {
             // We are the acceptor — look up and verify the challenge.
             let pending = lock!(self.pow_pending).remove(&p.challenge_nonce);
             let Some((expected_requester, difficulty, request_id)) = pending else {
-                return DispatchResult::Violation(
-                    "PowResponse: unknown challenge nonce".to_owned(),
-                );
+                // Ordinary, not abusive: a challenge that timed out and was
+                // dropped from `pow_pending` produces exactly this when the
+                // solution finally arrives.
+                return self.drop_relayed("PowResponse: unknown challenge nonce", peer_id);
             };
             if expected_requester != p.requester_node_id {
-                return DispatchResult::Violation("PowResponse: requester_id mismatch".to_owned());
+                return self.drop_relayed("PowResponse: requester_id mismatch", peer_id);
             }
             use veil_routing::pow::verify_pow;
             if !verify_pow(
@@ -895,7 +953,8 @@ impl FrameDispatcher {
                 &p.solution_nonce,
                 difficulty,
             ) {
-                return DispatchResult::Violation("PowResponse: invalid PoW solution".to_owned());
+                // The requester computed this, and the frame was relayed.
+                return self.drop_relayed("PowResponse: invalid PoW solution", peer_id);
             }
 
             // ── Level 1: deferred RouteResponse ──

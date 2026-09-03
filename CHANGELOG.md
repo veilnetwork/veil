@@ -1,5 +1,38 @@
 # Changelog
 
+## v0.11.13 — 2026-09-03
+
+**Two ways a stranger could aim this node's routing.**
+
+*A courier is no longer charged for what it carried.* A `PowChallenge` and a
+`PowResponse` are relayed frames: the acceptor signs the one, the requester
+solves the other, and somebody else hands it over. Every fault the two
+handlers could find — a signature that does not verify, a signature from a key
+we have never held, a difficulty past the cap, a solution that does not check
+out, a nonce nothing is waiting for, too many arriving at once — was recorded
+as a violation against whoever delivered the frame, and five violations ban a
+peer. So a stranger could choose which of our neighbours we would cut
+ourselves off from: name the victim as the requester in an unsigned
+`RouteRequest`, and the challenges come back through the victim's own relay
+until the victim bans it (report5b R5b-V-04). Those are dropped and logged
+now. A frame that does not decode is still a violation — the courier parsed it
+before forwarding it, so that one is its own.
+
+*A one-hop claim no longer beats a route we confirmed.* An announcement says
+how far away the origin is, and the score used to be floored only above one
+hop, on the reading that "one hop" means the peer is genuinely attached to the
+origin. Nothing checks that. Any peer with a session could name any node,
+score better than a signed `RouteResponse`, and pull that node's traffic
+through itself — not to read it, since the payload is sealed end to end, but to
+learn who talks to whom and to drop it (report5b R5b-V-02). Every announcement
+about somebody else is now floored, at any hop count.
+
+The floor is ADDED rather than clamped to, so honest relays still rank against
+each other by distance. Clamping would have made a two-hop relay look exactly
+as good as a one-hop one, and the old code already had that flaw above one
+hop; widening the clamp would have spread it to every announcement instead of
+fixing it.
+
 ## v0.11.12 — 2026-09-02
 
 **A certificate stops being sealed to when its owner says it does.**
