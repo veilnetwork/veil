@@ -1,5 +1,27 @@
 # Changelog
 
+## v0.11.15 — 2026-09-03
+
+**A snapshot is built on a blocking thread, not on the executor.**
+
+The persistence loops hand their writes to `spawn_blocking`, but each one
+BUILT its snapshot first, on the async task. One of them snapshots the DHT
+value store: it clones every value while holding that store's lock, and the
+store is capped at 400 MB by default. So every two minutes a node with a full
+store stopped every other task on that worker for as long as the clone took
+(report6 V6-H6b). Both halves now run on the blocking thread, through one
+call the tick arm and the shutdown arm share, so they cannot drift apart again
+— which is how the build ended up outside the blocking call in the first
+place.
+
+Said plainly: this moves the cost off the executor. It does not make the clone
+cheaper, and the DHT's own lock is still held while it runs, so DHT work still
+waits on it. What stops waiting is everything else.
+
+Reachable only where `values_persist_path` is set without `cold_store_path` —
+the docker image and `install-bootstrap.sh` both do that. Checked against the
+three production seeds: none of them enables it, so none was affected.
+
 ## v0.11.14 — 2026-09-03
 
 **A gossiped contact cannot move where we dial a peer we were told about
