@@ -681,6 +681,27 @@ impl FrameDispatcher {
             if !lock!(self.abuse.dht_quota).allow(*peer_id.as_bytes()) {
                 return DispatchResult::Violation("RouteRequest DHT quota exceeded".to_string());
             }
+            // And a cap on what this node emits IN TOTAL, whoever asked.
+            //
+            // The gate above is keyed by the peer the frame arrived from, so
+            // it bounds each sender and not this node: forwarding costs a send
+            // to every session held, and with n peers each pushing at their
+            // own limit the fan-out is n times what any one of them was
+            // allowed. Nothing on this path knows who the requester is — a
+            // relay never learns that — so the only thing left to bound is our
+            // own emission (report5b R5b-C-01).
+            //
+            // Dropped rather than charged: the peer that handed us this frame
+            // is a courier, and it is not the reason the pot is empty. Its own
+            // rate is already answered for by the per-peer gate above.
+            if !lock!(self.abuse.route_request_forward_budget).allow_at(Instant::now()) {
+                self.logger.warn(
+                    "routing.route_request.forward_budget",
+                    "the node-wide fan-out budget for relayed route requests \
+                     is empty — not forwarding this one",
+                );
+                return DispatchResult::NoResponse;
+            }
             let fwd = RouteRequestPayload { ttl: ttl - 1, ..p };
             let frame = encode_routing_frame(RoutingMsg::RouteRequest, &fwd.encode());
             if let Some(reg) = &self.session_tx_registry {

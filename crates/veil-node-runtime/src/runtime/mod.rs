@@ -2080,6 +2080,13 @@ impl NodeRuntime {
                         1.0 / veil_proto::budget::UNSIGNED_ROUTE_REQUEST_REFILL_SECS as f64,
                     ),
                 )),
+                route_request_forward_budget: Arc::new(Mutex::new(
+                    veil_abuse::rate_limiter::TokenBucket::new(
+                        veil_proto::budget::ROUTE_REQUEST_FORWARD_BURST as f64,
+                        veil_proto::budget::ROUTE_REQUEST_FORWARD_BURST as f64
+                            / veil_proto::budget::ROUTE_REQUEST_FORWARD_REFILL_SECS as f64,
+                    ),
+                )),
                 unproven_ratchet_open_budget: Arc::new(Mutex::new(
                     veil_abuse::rate_limiter::TokenBucket::new(
                         veil_proto::budget::UNPROVEN_RATCHET_OPEN_BURST as f64,
