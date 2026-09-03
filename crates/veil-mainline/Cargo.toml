@@ -1,6 +1,6 @@
 [package]
 name = "veil-mainline"
-version = "0.11.18"
+version = "0.11.19"
 edition = "2024"
 description = "Client for BitTorrent's Mainline DHT (BEP 5): a permissionless rendezvous nobody operates, used as a veil bootstrap layer."
 license = "AGPL-3.0-or-later"
