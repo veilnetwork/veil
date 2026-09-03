@@ -1,5 +1,35 @@
 # Changelog
 
+## v0.11.18 — 2026-09-03
+
+**The Windows CI job's two test steps were running zero tests.**
+
+Both filtered by a module path inside `veilcore` — a crate that holds neither
+set. `cargo test` with a filter that matches nothing exits 0 and prints
+`test result: ok. 0 passed`, which to a workflow is a pass. So the step whose
+own comment says the `admin_tcp` tests are `#[ignore]`-marked "because their
+parallel flakiness on Linux hides real Windows regressions; running them
+explicitly here is their reason to exist" had never run one.
+
+Measured on a Windows machine rather than argued: as written, 0 of 107
+selected; against `veil-node-runtime`, where they live, 3 of 535 for the admin
+tests and 7 of 531 for the token-file helpers. All ten pass.
+
+Both steps now name the right crate, and both fail when they select nothing. A
+filter is a name, and a name goes stale in silence; the exit code cannot tell
+you that, so the count is what is checked.
+
+**And playout says whether it started.**
+
+`start_playout` returned `void` and only logged, while `start_capture` beside
+it returned a bool both callers acted on. A call whose playout refused — no
+output device, a driver that would not initialise, an ADM that was never
+created — therefore reported success and set `audio_running`, so the interface
+showed a live call while the person heard nothing, and a second start was a
+no-op because running was already true (report19 V19-M3). It returns a bool
+now, and both the direct and group paths report a refused playout exactly as
+they already reported a refused capture.
+
 ## v0.11.17 — 2026-09-03
 
 **A test behind an opt-in feature stopped compiling, and nothing local said
