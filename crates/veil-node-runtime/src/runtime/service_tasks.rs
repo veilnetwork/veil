@@ -1961,7 +1961,7 @@ impl NodeRuntime {
         let policy = config.global.meeting_policy;
         let want_peers = config.global.meeting_min_peers;
         let live_sessions = Arc::clone(&self.live_sessions);
-        let dial_scheme = rendezvous_dial_scheme(config, me.as_ref());
+        let dial_scheme = rendezvous_dial_scheme(config);
 
         let logger = self.logger.clone();
         let access = self.access();
@@ -2171,15 +2171,10 @@ impl NodeRuntime {
         {
             return;
         }
-        let my_pubkey = self.identity.local_identity.public_key.clone();
         let bound = bound_ports(&self.listens());
-        let me = lan_announce_for(
-            config,
-            &my_pubkey,
-            &self.identity.local_identity.nonce,
-            &bound,
-        );
-        // Separate from `me`, and needed only here: see `public_address_for`.
+        // What this node ADVERTISES is no longer consulted for how it DIALS —
+        // see `rendezvous_dial_scheme`. Only the address it publishes about
+        // itself is still needed here.
         let my_address = public_address_for(config, &bound);
         let network = if cfg!(feature = "testnet-seeds") {
             veil_nostr::rendezvous::Network::Testnet
@@ -2190,7 +2185,7 @@ impl NodeRuntime {
         let policy = config.global.meeting_policy;
         let want_peers = config.global.meeting_min_peers;
         let live_sessions = Arc::clone(&self.live_sessions);
-        let dial_scheme = rendezvous_dial_scheme(config, me.as_ref());
+        let dial_scheme = rendezvous_dial_scheme(config);
         let secret = self.identity.local_identity.private_key.clone();
 
         let logger = self.logger.clone();
@@ -6216,27 +6211,34 @@ fn rendezvous_authority(uri: &str) -> Option<String> {
 
 /// The transport scheme to dial a rendezvous address with.
 ///
-/// The DHT carries an address and no scheme, so this node has to supply one.
-/// Three sources, in order of how much they know:
+/// A meeting point carries an address and no scheme — the DHT has nowhere to
+/// put one, and a relay record is a stranger's, so its scheme is not ours to
+/// take. This node has to supply it, from what it knows about the NETWORK:
 ///
-/// 1. what this node advertises about itself — a network runs one transport,
-///    and the one we offer is the one we expect;
-/// 2. the scheme of a peer the operator already named, for a node that
-///    advertises nothing;
-/// 3. obfs4-tcp, which is what a veil network runs.
+/// 1. the scheme of a peer the operator already named — the operator is
+///    saying what this network runs;
+/// 2. obfs4-tcp, which is what a veil network runs.
 ///
-/// The reason this is not simply the first: a node with NO listener has
-/// nothing to advertise, and that is the ordinary shape of a client. Tying the
-/// dial to having something to announce made layer 7 useless to exactly the
-/// nodes it is for — measured on a live host that found three addresses at the
-/// rendezvous and dialled none of them, because it listens for nobody.
-pub fn rendezvous_dial_scheme(
-    config: &veil_cfg::Config,
-    me: Option<&veil_bootstrap::LanAnnounce>,
-) -> String {
-    if let Some(me) = me {
-        return me.scheme.uri_scheme().to_owned();
-    }
+/// WHAT THIS NODE LISTENS ON IS NOT EVIDENCE, and using it was the defect.
+/// A listener says what this node ACCEPTS; the dial needs what the other end
+/// SERVES, and on a client those are chosen by different people for different
+/// reasons. The app gives every phone `quic://0.0.0.0:9000` for its own
+/// inbound while every seed serves obfs4-tcp on 5556 — so a phone found all
+/// three seeds at the rendezvous, rewrote each address to `quic://…:5556`,
+/// and timed out against them forever:
+///
+/// ```text
+/// nostr.looked          wss://nos.lol: 3 record(s) at the rendezvous
+/// peer.connect.attempt  peer_id=0x92000000 transport=quic://…:5556
+/// peer.connect.failure  error=connection timed out after 10s
+/// ```
+///
+/// The rule it replaces read "a network runs one transport, and the one we
+/// offer is the one we expect". The first half is true and the second does not
+/// follow: a node that offers nothing at all fell through to obfs4-tcp and
+/// worked, while a node that offered the wrong thing was confidently wrong —
+/// so having a listener was worse than having none.
+pub fn rendezvous_dial_scheme(config: &veil_cfg::Config) -> String {
     config
         .peers
         .iter()
@@ -9241,7 +9243,7 @@ mod tests {
         // gate made layer 7 useless to exactly the nodes it is for.
         let bare = veil_cfg::Config::default();
         assert_eq!(
-            rendezvous_dial_scheme(&bare, None),
+            rendezvous_dial_scheme(&bare),
             "obfs4-tcp",
             "a node with nothing at all must still have a scheme to dial with"
         );
@@ -9257,16 +9259,56 @@ mod tests {
             tls_cert: None,
             tls_ca_cert: None,
         });
-        assert_eq!(rendezvous_dial_scheme(&named, None), "tcp");
+        assert_eq!(rendezvous_dial_scheme(&named), "tcp");
+    }
 
-        // And what this node advertises about itself wins over both.
-        let me = veil_bootstrap::LanAnnounce {
-            public_key: [7u8; 32],
-            pow_nonce: [1, 2, 3, 4],
-            port: 5556,
-            scheme: veil_bootstrap::LanScheme::Quic,
-        };
-        assert_eq!(rendezvous_dial_scheme(&named, Some(&me)), "quic");
+    /// WHAT THIS NODE LISTENS ON MUST NOT DECIDE HOW IT DIALS.
+    ///
+    /// It used to, and it won over everything else — including a transport
+    /// the operator had named. A listener says what this node ACCEPTS; the
+    /// dial needs what the other end SERVES, and on a client those are chosen
+    /// by different people. The app gives every phone `quic://0.0.0.0:9000`
+    /// for its own inbound while every seed serves obfs4-tcp on 5556, so a
+    /// phone found all three seeds at the rendezvous, rewrote each address to
+    /// `quic://…:5556` and timed out against them forever. Measured on a
+    /// device: `nostr.looked … 3 record(s)`, then `peer.connect.attempt
+    /// transport=quic://…:5556`, then `connection timed out after 10s`, on a
+    /// loop.
+    ///
+    /// A node that offered NOTHING fell through to obfs4-tcp and worked, so
+    /// having a listener was strictly worse than having none.
+    #[test]
+    fn a_quic_listener_does_not_make_this_node_dial_quic() {
+        // The exact shape the app composes for a phone: a QUIC listener of
+        // its own, and no peer anybody named.
+        let mut phone = veil_cfg::Config::default();
+        phone.listen.push(veil_cfg::ListenConfig {
+            transport: "quic://0.0.0.0:9000".to_owned(),
+            ..Default::default()
+        });
+        assert_eq!(
+            rendezvous_dial_scheme(&phone),
+            "obfs4-tcp",
+            "a phone rewrote every seed address to its own listener's scheme \
+             and timed out against all of them"
+        );
+
+        // And the operator's own answer still wins over the default, which is
+        // the case the local listener used to override.
+        let mut named = phone.clone();
+        named.bootstrap_peers.push(veil_cfg::BootstrapPeer {
+            transport: "tcp://198.51.100.4:5556".to_owned(),
+            public_key: "K".to_owned(),
+            nonce: "N".to_owned(),
+            algo: veil_cfg::SignatureAlgorithm::Ed25519,
+            tls_cert: None,
+            tls_ca_cert: None,
+        });
+        assert_eq!(
+            rendezvous_dial_scheme(&named),
+            "tcp",
+            "a network the operator said runs plain tcp was dialled otherwise"
+        );
     }
 
     #[test]
