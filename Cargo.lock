@@ -5153,6 +5153,7 @@ dependencies = [
 name = "veil-observability"
 version = "0.11.19"
 dependencies = [
+ "log",
  "veil-abuse",
  "veil-app",
  "veil-dht",

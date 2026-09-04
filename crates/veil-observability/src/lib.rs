@@ -572,7 +572,7 @@ impl NodeLogger {
         format: LogFormat,
     ) -> std::io::Result<Self> {
         let sink: Box<dyn Write + Send> = match logs {
-            LogsConfig::Stderr => Box::new(io::stderr()),
+            LogsConfig::Stderr => default_console_sink(),
             LogsConfig::File => {
                 let path = log_file.ok_or_else(|| {
                     io::Error::new(
@@ -619,6 +619,78 @@ impl NodeLogger {
             let _ = sink.write_all(b"\n");
             let _ = sink.flush();
         }
+    }
+}
+
+/// Where `logs = "stderr"` actually goes.
+///
+/// Everywhere but Android, stderr. On Android stderr goes NOWHERE — the
+/// process has no console and nothing captures the fd — so the node's own
+/// log, the only thing that says whether it looked for peers and what it
+/// found, could not be read on the one platform where that question is
+/// hardest to answer. Measured: a phone with zero peers, and the only
+/// evidence available was a socket count.
+///
+/// `android_logger` is initialised by the FFI with tag `veilnode`, so this
+/// reaches `adb logcat` with no further setup.
+fn default_console_sink() -> Box<dyn Write + Send> {
+    #[cfg(target_os = "android")]
+    {
+        Box::new(LogcatSink::default())
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        Box::new(io::stderr())
+    }
+}
+
+/// Line-buffered bridge from the node's log sink to logcat.
+///
+/// logcat is a RECORD-oriented sink: one call is one entry, and a partial
+/// write would be one entry too. So bytes are held until a newline, which is
+/// what the formatter emits at the end of every line.
+#[cfg(target_os = "android")]
+#[derive(Default)]
+struct LogcatSink {
+    line: Vec<u8>,
+}
+
+#[cfg(target_os = "android")]
+impl LogcatSink {
+    /// Beyond this a line is emitted as it stands rather than buffered
+    /// further: a sink that grows without bound on a device with no console
+    /// is a worse failure than a split line.
+    const MAX_LINE: usize = 8 * 1024;
+
+    fn emit(&mut self) {
+        if self.line.is_empty() {
+            return;
+        }
+        let line = String::from_utf8_lossy(&self.line).into_owned();
+        self.line.clear();
+        log::info!("{line}");
+    }
+}
+
+#[cfg(target_os = "android")]
+impl Write for LogcatSink {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        for &byte in buf {
+            if byte == b'\n' {
+                self.emit();
+            } else {
+                self.line.push(byte);
+                if self.line.len() >= Self::MAX_LINE {
+                    self.emit();
+                }
+            }
+        }
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.emit();
+        Ok(())
     }
 }
 

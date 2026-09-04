@@ -19,5 +19,13 @@ veil-routing = { path = "../veil-routing" }
 veil-types = { path = "../veil-types" }
 veil-update = { path = "../veil-update" }
 
+# Android only, and only so the node's own log can be READ there. `stderr`
+# goes nowhere on Android, so the one log that says why discovery happened or
+# did not was invisible on the platform where that is hardest to answer.
+# `android_logger` (initialised by veilclient-ffi, tag `veilnode`) bridges the
+# `log` crate to logcat.
+[target.'cfg(target_os = "android")'.dependencies]
+log = "0.4"
+
 [lints]
 workspace = true
