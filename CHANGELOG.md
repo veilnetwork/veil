@@ -1,5 +1,45 @@
 # Changelog
 
+## v0.11.20 — 2026-09-05
+
+**A phone dialled every seed it found with its own listener's transport.**
+
+A meeting point carries an address and no scheme — the DHT has nowhere to put
+one, and a relay record belongs to a stranger, so its scheme is not ours to
+take. The node supplies it, and the first source it consulted was what this
+node ADVERTISES about itself, ahead of everything else including a transport
+the operator had named.
+
+A listener says what this node ACCEPTS. The dial needs what the other end
+SERVES, and on a client those are chosen by different people: the app gives
+every phone `quic://0.0.0.0:9000` for its own inbound while every seed serves
+obfs4-tcp on 5556. So a phone found all three seeds and could reach none of
+them — measured on a device, and reproduced exactly on a desktop by adding one
+QUIC listener to a config that had just joined in under a second:
+
+```text
+nostr.looked          wss://nos.lol: 3 record(s) at the rendezvous
+peer.connect.attempt  peer_id=0x92000000 transport=quic://…:5556
+peer.connect.failure  error=connection timed out after 10s
+```
+
+on a loop, forever. A node that advertised NOTHING fell through to obfs4-tcp
+and joined immediately, so having a listener was strictly worse than having
+none — which is why no desktop stand ever saw this.
+
+What the node listens on is no longer consulted: the operator's own peer
+answers first, obfs4-tcp otherwise. Verified end to end with the phone's exact
+shape — `role = "leaf"`, a QUIC listener, no peers — which now meets all three
+seeds and holds three sessions.
+
+**And on Android the node's own log went nowhere.**
+
+`logs = "stderr"` is the default; Android has no console and nothing captures
+that fd, so every line the node wrote about itself was discarded on the one
+platform where the question is hardest to answer. Debugging a phone meant
+counting sockets. `stderr` now resolves to logcat there, under the tag the FFI
+already registers.
+
 ## v0.11.19 — 2026-09-04
 
 **A discovered peer was never written down, so every cold start walked the
