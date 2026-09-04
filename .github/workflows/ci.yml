@@ -513,9 +513,17 @@ jobs:
         #
         # The guard below is the point: a filter is a name, and a name goes
         # stale silently. Anything that selects no test fails this step now.
+        #
+        # AND `test-low-difficulty`, for the same reason the workspace test job
+        # passes it. `test_support::valid_identity` mines the real 24-bit
+        # identity PoW against a 300s timeout, which a shared Windows runner
+        # loses: "did not reach target 24 bits within timeout (best=23 bits)"
+        # (2026-09-05). Pointing these steps at the crate that actually holds
+        # the tests is what exposed that — while they selected nothing, they
+        # could not be slow either.
         shell: pwsh
         run: |
-          $out = cargo test -p veil-node-runtime --lib --no-default-features admin_tcp -- --ignored --test-threads=1 2>&1
+          $out = cargo test -p veil-node-runtime --lib --no-default-features --features test-low-difficulty admin_tcp -- --ignored --test-threads=1 2>&1
           $out | ForEach-Object { Write-Host $_ }
           if ($LASTEXITCODE -ne 0) { throw "admin_tcp tests failed" }
           if (-not ($out -match 'test result: ok\. [1-9]')) {
@@ -531,7 +539,7 @@ jobs:
         # written it selected 0 of 107; against the right crate, 7 of 531.
         shell: pwsh
         run: |
-          $out = cargo test -p veil-node-runtime --lib --no-default-features admin_transport::tests -- --test-threads=1 2>&1
+          $out = cargo test -p veil-node-runtime --lib --no-default-features --features test-low-difficulty admin_transport::tests -- --test-threads=1 2>&1
           $out | ForEach-Object { Write-Host $_ }
           if ($LASTEXITCODE -ne 0) { throw "admin_transport tests failed" }
           if (-not ($out -match 'test result: ok\. [1-9]')) {
