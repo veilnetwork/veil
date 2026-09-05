@@ -263,7 +263,20 @@ class VnoteDecodeSink : public webrtc::DecodedImageCallback {
     auto buf = frame.video_frame_buffer()->ToI420();
     if (buf == nullptr) return 0;
     const int w = buf->width(), h = buf->height();
-    if (w <= 0 || h <= 0) return 0;
+    // THE DECODER'S ANSWER, bounded by the same ceiling as the header.
+    //
+    // `veil_media_vnote_player_create` refuses a container that declares more
+    // than kMaxVnoteSide, and that check was the only one: the size libvpx
+    // reports comes from the VP8 KEYFRAME, which on a received clip is chosen
+    // by whoever sent it and need not agree with the header at all. So the
+    // buffer below was sized from an unbounded number — 16383 x 16383 x 4 is
+    // a gigabyte — and these builds are `-fno-exceptions`, where a refused
+    // allocation is an abort, not something a caller can catch.
+    //
+    // Refusing the frame, not the clip: a note whose stream disagrees with its
+    // own header has nothing to render, and the player already treats "no
+    // frame decoded" as an ordinary outcome.
+    if (w <= 0 || h <= 0 || w > kMaxVnoteSide || h > kMaxVnoteSide) return 0;
     const size_t need = (size_t)w * h * 4;
     std::lock_guard<std::mutex> lk(mu_);
     if (rgba_.size() < need) rgba_.resize(need);
