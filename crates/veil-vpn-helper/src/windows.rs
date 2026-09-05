@@ -124,11 +124,11 @@ struct Status<'a> {
     detail: Option<&'a str>,
 }
 
-pub(crate) fn run(config_path: PathBuf) -> Result<i32, String> {
+pub(crate) fn run(config_path: PathBuf, expected_sha256: &str) -> Result<i32, String> {
     if config_path.as_os_str().is_empty() {
         return Err("empty Windows VPN request path".to_owned());
     }
-    let (config, request_dir) = load_config(&config_path)?;
+    let (config, request_dir) = load_config(&config_path, expected_sha256)?;
     let status_path = request_dir.join("status.json");
     let stop_path = request_dir.join("stop");
     let result = run_inner(&config, &config_path, &stop_path, &status_path);
@@ -197,7 +197,7 @@ fn run_inner(
     Ok(())
 }
 
-fn load_config(path: &Path) -> Result<(HelperConfig, PathBuf), String> {
+fn load_config(path: &Path, expected_sha256: &str) -> Result<(HelperConfig, PathBuf), String> {
     let metadata = fs::symlink_metadata(path)
         .map_err(|error| format!("read Windows VPN request metadata: {error}"))?;
     if !metadata.is_file() || metadata.file_type().is_symlink() {
@@ -219,6 +219,16 @@ fn load_config(path: &Path) -> Result<(HelperConfig, PathBuf), String> {
     }
     let bytes =
         fs::read(&canonical).map_err(|error| format!("read Windows VPN request: {error}"))?;
+    // BEFORE it is parsed, and against the bytes actually read — not a second
+    // read, which would leave the window this check exists to close. The host
+    // hashed what it wrote and passed the digest on the elevated command line,
+    // which nothing of the user's can change once UAC has returned.
+    if !crate::integrity::digest_matches(expected_sha256, &bytes) {
+        return Err(
+            "Windows VPN request does not match the approved launch; refusing to apply it"
+                .to_owned(),
+        );
+    }
     let config = serde_json::from_slice::<HelperConfig>(&bytes)
         .map_err(|error| format!("parse Windows VPN request: {error}"))?;
     Ok((config, parent))
