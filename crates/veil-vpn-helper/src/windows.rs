@@ -15,7 +15,8 @@ use tokio::runtime::Runtime;
 use tun::{AbstractDevice, Layer};
 use tun2proxy::{ArgDns, ArgProxy, ArgVerbosity, Args, CancellationToken, Error as TunnelError};
 use windows_sys::Win32::Foundation::{
-    CloseHandle, ERROR_ALREADY_EXISTS, ERROR_OBJECT_ALREADY_EXISTS, HANDLE, LocalFree, WAIT_TIMEOUT,
+    CloseHandle, ERROR_ALREADY_EXISTS, ERROR_OBJECT_ALREADY_EXISTS, ERROR_PIPE_CONNECTED, HANDLE,
+    INVALID_HANDLE_VALUE, LocalFree, WAIT_TIMEOUT,
 };
 use windows_sys::Win32::NetworkManagement::IpHelper::{
     CreateIpForwardEntry2, DeleteIpForwardEntry2, FreeMibTable, GetBestRoute2, GetIpForwardTable2,
@@ -32,7 +33,13 @@ use windows_sys::Win32::Security::{
     GetTokenInformation, PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES, TOKEN_ELEVATION, TOKEN_QUERY,
     TokenElevation,
 };
-use windows_sys::Win32::Storage::FileSystem::{CreateDirectoryW, FILE_ATTRIBUTE_REPARSE_POINT};
+use windows_sys::Win32::Storage::FileSystem::{
+    CreateDirectoryW, FILE_ATTRIBUTE_REPARSE_POINT, PIPE_ACCESS_INBOUND, ReadFile,
+};
+use windows_sys::Win32::System::Pipes::{
+    ConnectNamedPipe, CreateNamedPipeW, GetNamedPipeClientProcessId, PIPE_READMODE_BYTE,
+    PIPE_TYPE_BYTE, PIPE_WAIT,
+};
 use windows_sys::Win32::System::Threading::{
     GetCurrentProcess, OpenProcess, OpenProcessToken, PROCESS_QUERY_LIMITED_INFORMATION,
     PROCESS_SYNCHRONIZE, QueryFullProcessImageNameW, WaitForSingleObject,
@@ -139,12 +146,9 @@ pub(crate) fn run(config_path: PathBuf, expected_sha256: &str) -> Result<i32, St
     // reads back has to come from somewhere that user cannot write.
     let status_dir = protected_status_dir(&request_dir)?;
     let status_path = status_dir.join("status.json");
-    // The stop signal stays where the host can create it, because the host is
-    // unelevated and has to. That direction is still forgeable by a process of
-    // the same user, which is a denial of service and not a forged verdict —
-    // closing it needs a named pipe with a DACL, not a file.
-    let stop_path = request_dir.join("stop");
-    let result = run_inner(&config, &config_path, &stop_path, &status_path);
+    // The stop travels on a named pipe named after this session, not as a file
+    // in it: see [stop_requested_by_host].
+    let result = run_inner(&config, &config_path, &request_dir, &status_path);
     if let Err(error) = &result {
         let _ = write_status(&status_path, &config.token, "error", Some(error));
     }
@@ -157,7 +161,7 @@ pub(crate) fn run(config_path: PathBuf, expected_sha256: &str) -> Result<i32, St
 fn run_inner(
     config: &HelperConfig,
     config_path: &Path,
-    stop_path: &Path,
+    session_dir: &Path,
     status_path: &Path,
 ) -> Result<(), String> {
     require_elevated()?;
@@ -188,21 +192,37 @@ fn run_inner(
     install_routes(&policy, defaults, tunnel_index, &mut routes)?;
 
     let _ = fs::remove_file(config_path);
-    let _ = fs::remove_file(stop_path);
     let cancel = CancellationToken::new();
     let monitor_cancel = cancel.clone();
-    let monitor_stop = stop_path.to_owned();
     write_status(status_path, &config.token, "running", None)?;
     let monitor = std::thread::Builder::new()
         .name("xveil-vpn-windows-control".to_owned())
-        .spawn(move || monitor_host(host, &monitor_stop, monitor_cancel))
+        .spawn(move || monitor_host(host, monitor_cancel))
         .map_err(|error| format!("start Windows VPN control thread: {error}"))?;
+    // The explicit stop, on a pipe rather than a file: a file in a directory
+    // the user can write is a stop button for every process of that user, and
+    // taking down an administrator-level tunnel sends the traffic outside it.
+    // The pipe is writable by that user too — same user, same access — but it
+    // can say WHO connected, and only the host is accepted.
+    let stop_pipe = control_pipe_name(session_dir).and_then(|name| {
+        create_control_pipe(&name).map(|pipe| {
+            let stop_cancel = cancel.clone();
+            let host_pid = config.host_pid;
+            std::thread::Builder::new()
+                .name("xveil-vpn-windows-stop".to_owned())
+                .spawn(move || monitor_control_pipe(pipe, host_pid, stop_cancel))
+        })
+    });
 
     let tunnel_result = runtime.block_on(tun2proxy::run(device, policy.mtu, args, cancel.clone()));
     cancel.cancel();
     monitor
         .join()
         .map_err(|_| "Windows VPN control thread panicked".to_owned())?;
+    // NOT joined: the stop thread is parked in a blocking connect that only a
+    // client can release, and the tunnel is already down. Its handle closes
+    // with the process, which is moments away.
+    drop(stop_pipe);
     drop(routes);
     match tunnel_result {
         Ok(_) => {}
@@ -558,14 +578,149 @@ fn unspecified_sockaddr(family: IpAddr) -> SOCKADDR_INET {
     }
 }
 
-fn monitor_host(host: Handle, stop_path: &Path, cancel: CancellationToken) {
+/// The control pipe's security, and every clause of it is load-bearing.
+///
+///   `D:` SY/BA full, and `IU` (interactive users) read+write — the host is
+///        UNELEVATED and has to be able to say "stop";
+///   `S:(ML;;NW;;;ME)` a MEDIUM mandatory label. Without it the pipe inherits
+///        this process's HIGH integrity, Windows' no-write-up rule applies,
+///        and the very process that needs to write to it cannot.
+///
+/// Granting the interactive user write access grants it to EVERY process of
+/// that user, which is why the DACL is not the check. The check is who is on
+/// the other end: [`stop_requested_by_host`] asks the pipe for its client's
+/// PID and accepts only the host this run was launched for.
+const CONTROL_PIPE_SDDL: &str = "D:(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGW;;;IU)S:(ML;;NW;;;ME)";
+
+/// The control pipe for one run, named after its session directory.
+fn control_pipe_name(session: &Path) -> Option<String> {
+    let name = session.file_name()?.to_string_lossy().into_owned();
+    // The session directory is already named `xveil-vpn-<random>`, so the
+    // name goes in as it is rather than carrying the prefix twice.
+    Some(format!(r"\\.\pipe\{name}"))
+}
+
+/// Create this run's control pipe, or None when it cannot be made.
+///
+/// None is not fatal: the host-exit watch still ends the tunnel, and a helper
+/// that refused to run because a pipe would not open would be a worse failure
+/// than one that cannot be asked to stop early.
+fn create_control_pipe(name: &str) -> Option<Handle> {
+    let mut wide: Vec<u16> = name.encode_utf16().collect();
+    wide.push(0);
+    let mut sddl: Vec<u16> = CONTROL_PIPE_SDDL.encode_utf16().collect();
+    sddl.push(0);
+    let mut descriptor: PSECURITY_DESCRIPTOR = ptr::null_mut();
+    // SAFETY: both inputs are NUL-terminated UTF-16; the descriptor is an out
+    // parameter freed below.
+    let converted = unsafe {
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            sddl.as_ptr(),
+            SDDL_REVISION_1,
+            &mut descriptor,
+            ptr::null_mut(),
+        )
+    };
+    if converted == 0 {
+        return None;
+    }
+    let attributes = SECURITY_ATTRIBUTES {
+        nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
+        lpSecurityDescriptor: descriptor,
+        bInheritHandle: 0,
+    };
+    // SAFETY: `wide` is NUL-terminated and `attributes` outlives the call.
+    // One instance: this run has exactly one host, and a second server would
+    // be a second thing able to stop it.
+    let pipe = unsafe {
+        CreateNamedPipeW(
+            wide.as_ptr(),
+            PIPE_ACCESS_INBOUND,
+            PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
+            1,
+            0,
+            64,
+            0,
+            &attributes,
+        )
+    };
+    // SAFETY: the descriptor came from the converter, which allocates with
+    // LocalAlloc.
+    unsafe { LocalFree(descriptor as *mut _) };
+    if pipe == INVALID_HANDLE_VALUE || pipe.is_null() {
+        return None;
+    }
+    Some(Handle(pipe))
+}
+
+/// Wait for a stop from the HOST — and from nothing else.
+///
+/// The stop used to be a file in the session directory. That directory has to
+/// be writable by the user (the host is unelevated when it stages the
+/// request), so any process of that user could create the file and take down
+/// an administrator-level tunnel — traffic then leaves outside it, which is
+/// the part that matters (report5 R5-X-03).
+///
+/// A pipe cannot be locked to one process by permissions either: same user,
+/// same access. What it can do that a file cannot is say WHO connected.
+/// `GetNamedPipeClientProcessId` names the client, and the only client this
+/// accepts is `host_pid` — the process whose image `validate_host` already
+/// bound to this helper's own before anything was applied.
+///
+/// Returns true when the host asked to stop; false on any error, so a pipe
+/// that cannot be created or read leaves the tunnel up rather than tearing it
+/// down on a failure nobody asked for. The host-exit watch is unaffected and
+/// remains the backstop.
+fn stop_requested_by_host(pipe: HANDLE, host_pid: u32) -> bool {
+    // SAFETY: `pipe` is a live server handle owned by the caller.
+    let connected = unsafe { ConnectNamedPipe(pipe, ptr::null_mut()) };
+    if connected == 0 {
+        let err = io::Error::last_os_error().raw_os_error().unwrap_or(0);
+        // ERROR_PIPE_CONNECTED: a client got there between the create and the
+        // connect. That is a connection, not a failure.
+        if err != ERROR_PIPE_CONNECTED as i32 {
+            return false;
+        }
+    }
+    let mut client = 0u32;
+    // SAFETY: `client` is a valid out parameter for the duration of the call.
+    let named = unsafe { GetNamedPipeClientProcessId(pipe, &mut client) };
+    if named == 0 || client != host_pid {
+        return false;
+    }
+    let mut buf = [0u8; 16];
+    let mut read = 0u32;
+    // SAFETY: the buffer outlives the call and its length is passed exactly.
+    let ok = unsafe {
+        ReadFile(
+            pipe,
+            buf.as_mut_ptr().cast(),
+            buf.len() as u32,
+            &mut read,
+            ptr::null_mut(),
+        )
+    };
+    ok != 0 && buf[..read as usize].starts_with(b"stop")
+}
+
+fn monitor_host(host: Handle, cancel: CancellationToken) {
     while !cancel.is_cancelled() {
         // SAFETY: the handle remains owned by this thread for the whole loop.
-        if unsafe { WaitForSingleObject(host.0, 0) } != WAIT_TIMEOUT || stop_path.exists() {
+        if unsafe { WaitForSingleObject(host.0, 0) } != WAIT_TIMEOUT {
             cancel.cancel();
             break;
         }
         std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// The explicit stop, on its own thread because the connect blocks.
+///
+/// Separate from [`monitor_host`] deliberately: that one is the backstop and
+/// must keep working whether or not a pipe could be made.
+fn monitor_control_pipe(pipe: Handle, host_pid: u32, cancel: CancellationToken) {
+    if stop_requested_by_host(pipe.0, host_pid) {
+        cancel.cancel();
     }
 }
 
@@ -878,6 +1033,106 @@ mod tests {
             again.is_err(),
             "a second run adopted the first run's directory"
         );
+    }
+
+    /// Open the control pipe as a client would, and write `payload`.
+    ///
+    /// CREATE_ALWAYS on purpose: that is the disposition `dart:io` uses for
+    /// `FileMode.write`, and the host is Dart. Measured on a Windows 11 ARM64
+    /// stand — it opens a pipe client, and so does OPEN_ALWAYS.
+    fn connect_and_write(name: &str, payload: &[u8]) {
+        use windows_sys::Win32::Foundation::GENERIC_WRITE;
+        use windows_sys::Win32::Storage::FileSystem::{
+            CREATE_ALWAYS, CreateFileW, FILE_ATTRIBUTE_NORMAL, WriteFile,
+        };
+        let mut wide: Vec<u16> = name.encode_utf16().collect();
+        wide.push(0);
+        // SAFETY: `wide` is NUL-terminated for the call.
+        let handle = unsafe {
+            CreateFileW(
+                wide.as_ptr(),
+                GENERIC_WRITE,
+                0,
+                ptr::null(),
+                CREATE_ALWAYS,
+                FILE_ATTRIBUTE_NORMAL,
+                ptr::null_mut(),
+            )
+        };
+        assert_ne!(handle, INVALID_HANDLE_VALUE, "the client could not connect");
+        let mut wrote = 0u32;
+        // SAFETY: the buffer outlives the call and its length is exact.
+        unsafe {
+            WriteFile(
+                handle,
+                payload.as_ptr(),
+                payload.len() as u32,
+                &mut wrote,
+                ptr::null_mut(),
+            );
+            CloseHandle(handle);
+        }
+    }
+
+    fn probe_pipe(tag: &str) -> (String, Handle) {
+        let session = std::env::temp_dir().join(format!(
+            "xveil-vpn-pipe-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let name = control_pipe_name(&session).expect("a pipe name");
+        let pipe = create_control_pipe(&name).expect("the pipe");
+        (name, pipe)
+    }
+
+    #[test]
+    fn the_host_can_stop_the_tunnel_over_the_pipe() {
+        let (name, pipe) = probe_pipe("ok");
+        let client = std::thread::spawn(move || connect_and_write(&name, b"stop"));
+        let stopped = stop_requested_by_host(pipe.0, std::process::id());
+        client.join().unwrap();
+        assert!(stopped, "the host's stop did not arrive");
+    }
+
+    #[test]
+    fn a_stop_from_any_other_process_is_refused() {
+        // The whole reason this is a pipe and not a file. The DACL cannot tell
+        // two processes of one user apart — same user, same access — so the
+        // check is WHO connected, and only the host this run was launched for
+        // is accepted (report5 R5-X-03).
+        let (name, pipe) = probe_pipe("wrongpid");
+        let client = std::thread::spawn(move || connect_and_write(&name, b"stop"));
+        // Our own pid, deliberately not the one the helper was told to trust.
+        let impostor = std::process::id().wrapping_add(1);
+        let stopped = stop_requested_by_host(pipe.0, impostor);
+        client.join().unwrap();
+        assert!(
+            !stopped,
+            "a stop from a process that is not the host was taken"
+        );
+    }
+
+    #[test]
+    fn a_connection_that_says_something_else_is_not_a_stop() {
+        let (name, pipe) = probe_pipe("garbage");
+        let client = std::thread::spawn(move || connect_and_write(&name, b"go"));
+        let stopped = stop_requested_by_host(pipe.0, std::process::id());
+        client.join().unwrap();
+        assert!(!stopped);
+    }
+
+    #[test]
+    fn the_pipe_is_named_after_its_session_and_nothing_else() {
+        // Two runs must not share a control pipe: the name is the session's,
+        // which is random per launch.
+        let a = control_pipe_name(Path::new(r"C:\Temp\xveil-vpn-aaa")).unwrap();
+        let b = control_pipe_name(Path::new(r"C:\Temp\xveil-vpn-bbb")).unwrap();
+        assert_ne!(a, b);
+        assert!(a.ends_with("xveil-vpn-aaa"), "{a}");
+        assert!(a.starts_with(r"\\.\pipe\"), "{a}");
     }
 
     #[test]
