@@ -1,5 +1,45 @@
 # Changelog
 
+## v0.11.21 — 2026-09-05
+
+**Findings from the audit backlog, most of them checked on a real Windows
+machine rather than reasoned about.**
+
+*The elevated VPN helper applied whatever request.json said at read time.* The
+request is staged in the user's own `%TEMP%` — the host is unelevated when it
+writes it, so it has to be — and the helper read it back after UAC returned,
+checking only that it was a regular file of sane size in the right directory.
+Nothing bound the CONTENTS. A process of the same user could rewrite it while
+the person was looking at the prompt and have administrator-level routes, DNS
+and a SOCKS endpoint applied from a file nobody approved. The host now passes
+the SHA-256 of the bytes it wrote on the elevated command line, which is fixed
+when the approved process is created, and the helper refuses anything else.
+
+*And the helper's own status could be written by any process of that user.*
+It was published beside the request, in the same user-writable directory, so a
+forged `running` for a tunnel that never came up — or a forged `error` that
+tears down a working one — cost nothing. The token in the file was never a
+defence: it is in the request the same user can read. Status now goes under
+`%ProgramData%` in a directory this process creates with a protected DACL:
+Administrators and SYSTEM write, Users read.
+
+*A camera pulled mid-call could never be started again.* Starting the camera
+answered OK on the existence of the capturer object, and the capturer outlives
+its camera — the capture loop ends on its own when the device goes away. Every
+retry after an unplug reported success and no frame ever came for the rest of
+the call. Measured on the stand: pulling the camera returns
+`MF_E_VIDEO_RECORDING_DEVICE_INVALIDATED` from the pending read in 292 ms.
+
+*A decoded frame's size was the sender's to choose.* Both media containers
+bound what their header declares; nothing bound what the DECODER reports, and
+libvpx takes that from the VP8 keyframe — which on a receive path belongs to
+whoever sent it. Three sinks sized a buffer from it, up to a gigabyte from a
+few crafted bytes, in builds where a refused allocation is an abort.
+
+*The Windows CI steps mined a real 24-bit proof of work against a 300s
+timeout* and lost the race on a shared runner — a consequence of pointing them
+at the crate that actually holds their tests.
+
 ## v0.11.20 — 2026-09-05
 
 **A phone dialled every seed it found with its own listener's transport.**
