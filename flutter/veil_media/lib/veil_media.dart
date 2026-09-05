@@ -69,6 +69,20 @@ bool requestPlatformScreenCaptureAccess() =>
     ffi.veilMediaRequestScreenCaptureAccess?.call() == 1;
 
 /// A decoded remote video frame: tightly-packed RGBA (width*height*4 bytes).
+/// The largest frame this side will allocate for, per side.
+///
+/// Two ceilings because there are two containers, and each mirrors a constant
+/// in the native sources — `kMaxVideoSide` in `src/veil_media_engine.cc` and
+/// `kMaxVnoteSide` in `src/veil_video_note.cc`. The same fact written twice, so
+/// a test holds the pairs together.
+///
+/// Why this side checks at all when the native side now does: the numbers that
+/// reach the retry paths below come from a DECODER, and on a receive path that
+/// decoder is fed by a peer. "The other end validated it" is exactly the
+/// assumption that made a 17 GB `calloc` reachable from a 24-byte file.
+const int kVeilMaxVideoSide = 4096;
+const int kVeilMaxVnoteSide = 1920;
+
 class VeilVideoFrame {
   const VeilVideoFrame(
       {required this.rgba, required this.width, required this.height});
@@ -393,7 +407,14 @@ class VeilMediaEngine {
       var seq = pull(_ptr, frameBuf, frameCap, wp, hp);
       if (seq == -1) {
         // Buffer too small — grow to the reported dimensions and retry once.
-        final need = wp.value * hp.value * 4;
+        // BOUNDED: on the remote path these are the peer's decoded dimensions.
+        final rw = wp.value, rh = hp.value;
+        final need = rw > 0 &&
+                rh > 0 &&
+                rw <= kVeilMaxVideoSide &&
+                rh <= kVeilMaxVideoSide
+            ? rw * rh * 4
+            : 0;
         if (need > 0) {
           calloc.free(frameBuf);
           frameCap = need;
@@ -741,7 +762,14 @@ class _GroupFrameBuffer {
       }
       var seq = pull(buffer, _capacity, width, height);
       if (seq == -1) {
-        final need = width.value * height.value * 4;
+        // Same rule as the 1-1 engine: these come from a peer's decoder.
+        final rw = width.value, rh = height.value;
+        final need = rw > 0 &&
+                rh > 0 &&
+                rw <= kVeilMaxVideoSide &&
+                rh <= kVeilMaxVideoSide
+            ? rw * rh * 4
+            : 0;
         if (need > 0) {
           calloc.free(buffer);
           _capacity = need;
@@ -942,7 +970,15 @@ class VeilVnoteRecorder {
       }
       var seq = ffi.veilVnoteRecorderFrame(_ptr, buf, _frameCap, wp, hp);
       if (seq == -1) {
-        final need = wp.value * hp.value * 4;
+        // Our own camera here, bounded by the clip's own ceiling so the
+        // recorder and the player answer to one number.
+        final rw = wp.value, rh = hp.value;
+        final need = rw > 0 &&
+                rh > 0 &&
+                rw <= kVeilMaxVnoteSide &&
+                rh <= kVeilMaxVnoteSide
+            ? rw * rh * 4
+            : 0;
         if (need > 0) {
           calloc.free(buf);
           _frameCap = need;
@@ -1067,7 +1103,7 @@ class VeilVnotePlayer {
         // network. The parser now refuses an absurd one, but this side must not
         // depend on that: a header alone should never decide the size of an
         // allocation. 65535 x 65535 x 4 is a 17 GB calloc from a 24-byte file.
-        const maxSide = 1920;
+        const maxSide = kVeilMaxVnoteSide;
         final w = width > 0 && width <= maxSide ? width : 480;
         final h = height > 0 && height <= maxSide ? height : 480;
         _frameCap = w * h * 4;
@@ -1076,7 +1112,17 @@ class VeilVnotePlayer {
       }
       var seq = ffi.veilVnotePlayerFrameAt(_ptr, ms, buf, _frameCap, wp, hp);
       if (seq == -1) {
-        final need = wp.value * hp.value * 4;
+        // THE ONE THAT ARRIVES OVER THE NETWORK. The header was bounded by
+        // the parser, but these are the DECODER's dimensions — libvpx reports
+        // the size in the VP8 keyframe, which the sender chose and which need
+        // not agree with the header at all.
+        final rw = wp.value, rh = hp.value;
+        final need = rw > 0 &&
+                rh > 0 &&
+                rw <= kVeilMaxVnoteSide &&
+                rh <= kVeilMaxVnoteSide
+            ? rw * rh * 4
+            : 0;
         if (need > 0) {
           calloc.free(buf);
           _frameCap = need;
