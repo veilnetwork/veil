@@ -2330,6 +2330,19 @@ impl TieredStore {
             // charged to nobody, aged from the moment it is read back
             // (report16 V16-M4).
             let origin = self.entry_origin.get(&key).copied();
+            // WHAT THE PUT IS ABOUT TO REPLACE. A cold put overwrites, and the
+            // copy it overwrites stops existing — but `ColdPut::Stored` cannot
+            // say so, and `total_bytes` went on counting it.
+            //
+            // Normally there is nothing here and this is zero. There IS
+            // something whenever a promotion left a stale cold copy behind:
+            // `release_cold` does not subtract when the backend delete failed,
+            // because at that moment the node really does hold two copies. The
+            // second one dies HERE, silently, and the accounting never learned
+            // — so it climbed by one value on every such round trip until the
+            // byte cap evicted live records for space nothing was using
+            // (report18 V-07).
+            let replaced = self.cold.get(&key).map(|v| v.len() as u64).unwrap_or(0);
             let age = Instant::now().saturating_duration_since(first_seen);
             let unix_now = veil_util::unix_secs_now_u64();
             let first_seen_unix = unix_now.saturating_sub(age.as_secs());
@@ -2338,6 +2351,8 @@ impl TieredStore {
                 .put_with_side(key, entry.0, origin, Some(first_seen_unix))
             {
                 ColdPut::Stored(evicted) => {
+                    // The overwritten copy is gone; stop counting it.
+                    self.total_bytes = self.total_bytes.saturating_sub(replaced);
                     // The cold tier only knows when it was DEMOTED, so without
                     // this a promotion hands the record a fresh lifetime and a
                     // tier move became a way to outlive the retention its
@@ -3156,6 +3171,104 @@ mod tests {
             "the value outlived its lifetime on disk because the sweep had no \
              age for it: the stamp was dropped when the delete failed, and \
              nothing ages an entry it cannot see"
+        );
+    }
+
+    /// report18 V-07: a promotion whose delete failed leaves a second copy,
+    /// and the demotion that overwrites it never told the accounting.
+    ///
+    /// Both halves are individually honest. `release_cold` does not subtract
+    /// when the backend delete fails, because at that moment the node really
+    /// does hold two copies. The demotion then overwrites the stale one — and
+    /// `ColdPut::Stored` cannot report a replaced length, so the bytes of a
+    /// copy that no longer exists stayed on the books. Round trip that key and
+    /// the total climbs every time, until the byte cap evicts live records to
+    /// make room for space nothing is using.
+    #[test]
+    fn a_stale_cold_copy_stops_being_counted_when_it_is_overwritten() {
+        #[derive(Default, Debug)]
+        struct Inner {
+            entries: std::collections::HashMap<[u8; 32], Vec<u8>>,
+            fail_deletes: bool,
+        }
+        #[derive(Clone, Default, Debug)]
+        struct FlakyCold(std::sync::Arc<std::sync::Mutex<Inner>>);
+        impl FlakyCold {
+            fn disk(&self) -> std::sync::MutexGuard<'_, Inner> {
+                self.0.lock().unwrap_or_else(|p| p.into_inner())
+            }
+        }
+        impl ColdBackend for FlakyCold {
+            fn get(&self, key: &[u8; 32]) -> Option<Vec<u8>> {
+                self.disk().entries.get(key).cloned()
+            }
+            fn put(&mut self, key: [u8; 32], value: Vec<u8>) -> ColdPut {
+                self.disk().entries.insert(key, value);
+                ColdPut::Stored(None)
+            }
+            fn remove(&mut self, key: &[u8; 32]) {
+                let mut d = self.disk();
+                if !d.fail_deletes {
+                    d.entries.remove(key);
+                }
+            }
+            fn contains(&self, key: &[u8; 32]) -> bool {
+                self.disk().entries.contains_key(key)
+            }
+            fn len(&self) -> usize {
+                self.disk().entries.len()
+            }
+            fn iter_entries(&self) -> Vec<([u8; 32], Vec<u8>)> {
+                self.disk()
+                    .entries
+                    .iter()
+                    .map(|(k, v)| (*k, v.clone()))
+                    .collect()
+            }
+            fn retain(&mut self, _f: &dyn Fn(&[u8; 32], &[u8]) -> bool) -> Vec<([u8; 32], u64)> {
+                Vec::new()
+            }
+        }
+
+        let disk = FlakyCold::default();
+        // Hot capacity 1, so every put demotes whatever was hot.
+        let mut store = TieredStore::with_cold(1, Box::new(disk.clone()));
+        let key = [7u8; 32];
+        let value = vec![0xAA; 100];
+        store.put(key, value.clone());
+        store.put([8u8; 32], vec![0xBB; 10]);
+        assert!(store.contains(&key), "premise: the value is in cold");
+        let settled = store.total_bytes();
+
+        // The disk refuses deletes, so the promotion below leaves its cold
+        // copy behind — and the node then genuinely holds two.
+        disk.disk().fail_deletes = true;
+        assert_eq!(store.get(&key).map(|v| v.len()), Some(100));
+        assert!(
+            store.total_bytes() > settled,
+            "the fixture stopped modelling a failed delete: nothing was \
+             double-counted, so what follows is about nothing"
+        );
+
+        // Now the round trip completes: this put demotes `key` back to cold,
+        // where its own stale copy is overwritten.
+        disk.disk().fail_deletes = false;
+        store.put([9u8; 32], vec![0xCC; 10]);
+
+        assert_eq!(
+            disk.disk().entries.get(&key).map(|v| v.len()),
+            Some(100),
+            "premise: one copy on disk, the stale one overwritten"
+        );
+        // Three values are held: the 100-byte one and the two 10-byte ones.
+        // Written out rather than derived from `settled`, because arithmetic
+        // on a number the test also measured is a place to be wrong twice and
+        // notice neither.
+        assert_eq!(
+            store.total_bytes(),
+            100 + 10 + 10,
+            "the overwritten copy is still counted; round-trip the key again \
+             and the total climbs until the byte cap evicts live records"
         );
     }
 
