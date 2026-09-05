@@ -312,6 +312,17 @@ class GroupFanoutTransport : public webrtc::Transport {
   std::vector<uint64_t> channels_;
 };
 
+// The largest frame this engine will hold, per side.
+//
+// A decoded frame's dimensions come from the VP8 keyframe, and on the receive
+// path that stream is the PEER's — the size is theirs to choose and nothing
+// here bounded it. `rgba_.resize(w * h * 4)` at libvpx's own 16383 ceiling is
+// 1.07 GB from a few crafted bytes, and these builds are `-fno-exceptions`,
+// where a refused allocation is an abort rather than something a caller can
+// handle. Calls here negotiate 352x288 by default and never ask for more than
+// a 4K width, so this refuses only what no call would send.
+constexpr int kMaxVideoSide = 4096;
+
 // Sink for decoded remote video frames. Android can attach a native texture:
 // OnFrame then retains only the latest I420 buffer and a dedicated worker
 // coalesces/converts/posts it without blocking WebRTC's decode thread. Other
@@ -334,6 +345,11 @@ class VeilVideoSink : public webrtc::VideoSinkInterface<webrtc::VideoFrame> {
   void OnFrame(const webrtc::VideoFrame& frame) override {
     auto buf = frame.video_frame_buffer()->ToI420();
     if (buf == nullptr) return;
+    // The peer's number, checked before anything is sized from it.
+    if (buf->width() <= 0 || buf->height() <= 0 ||
+        buf->width() > kMaxVideoSide || buf->height() > kMaxVideoSide) {
+      return;
+    }
     std::lock_guard<std::mutex> l(m_);
 #if defined(__ANDROID__)
     if (native_window_ != nullptr) {
@@ -355,7 +371,10 @@ class VeilVideoSink : public webrtc::VideoSinkInterface<webrtc::VideoFrame> {
   void store_i420(const uint8_t* y, const uint8_t* u, const uint8_t* v, int w,
                   int h, int stride_y, int stride_u, int stride_v) {
     if (y == nullptr || u == nullptr || v == nullptr) return;
-    if (w <= 0 || h <= 0) return;
+    // The local capture path reaches this one, where the size comes from a
+    // camera rather than from a peer — bounded all the same, so the buffer
+    // below has one rule and not two.
+    if (w <= 0 || h <= 0 || w > kMaxVideoSide || h > kMaxVideoSide) return;
     std::lock_guard<std::mutex> l(m_);
     latest_i420_ = nullptr;
     store_i420_locked(y, u, v, w, h, stride_y, stride_u, stride_v);
