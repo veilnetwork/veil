@@ -1830,9 +1830,29 @@ impl RegisterRendezvousPublisherPayload {
     /// Fixed prefix size before the variable-length KEM pubkey.
     pub const HEADER_SIZE: usize = 32 + 16 + 8 + 1 + 2;
 
-    pub fn encode(&self) -> Vec<u8> {
-        debug_assert!(self.relay_kem_pk.len() <= MAX_RENDEZVOUS_KEM_PK_BYTES);
-        let kem_len = self.relay_kem_pk.len().min(u16::MAX as usize);
+    /// Refuses what [`Self::decode`] would refuse, with the same error.
+    ///
+    /// This used to `debug_assert!` the bound and then clamp the length to
+    /// `u16::MAX` — which is not the bound. So a debug build PANICKED across
+    /// an `extern "C"` boundary, and a release build encoded a key the decoder
+    /// then rejected: the caller learned about its own oversized input from
+    /// the far end, as a late typed error, instead of at the call that made it
+    /// (report18 V18-L4).
+    ///
+    /// A `Result` where its siblings return `Vec<u8>` is deliberate. An
+    /// encoder that can emit what its own decoder refuses is a bug with a
+    /// convention wrapped around it, and there is exactly one caller.
+    pub fn encode(&self) -> Result<Vec<u8>, ProtoError> {
+        if self.relay_kem_pk.len() > MAX_RENDEZVOUS_KEM_PK_BYTES {
+            // The SAME error the decoder raises for the same value, so both
+            // ends of this frame name the failure identically.
+            return Err(ProtoError::ValueTooLarge {
+                field: "register_rendezvous_publisher.relay_kem_pk_len",
+                value: self.relay_kem_pk.len() as u64,
+                max: MAX_RENDEZVOUS_KEM_PK_BYTES as u64,
+            });
+        }
+        let kem_len = self.relay_kem_pk.len();
         let mut buf = Vec::with_capacity(Self::HEADER_SIZE + kem_len);
         buf.extend_from_slice(&self.rendezvous_node_id);
         buf.extend_from_slice(&self.auth_cookie);
@@ -1843,7 +1863,7 @@ impl RegisterRendezvousPublisherPayload {
         // APPENDED after the variable-length key, so a daemon that stops at
         // the key reads everything before it exactly as it always did.
         buf.extend_from_slice(&self.relay_kem_valid_until_unix.to_be_bytes());
-        buf
+        Ok(buf)
     }
 
     pub fn decode(buf: &[u8]) -> Result<Self, ProtoError> {
@@ -6341,6 +6361,50 @@ impl MailboxOpenResultPayload {
 
 #[cfg(test)]
 mod tests {
+
+    /// An encoder that can emit what its own decoder refuses is a bug with a
+    /// convention wrapped around it (report18 V18-L4).
+    #[test]
+    fn a_rendezvous_ad_encoder_refuses_what_its_decoder_would() {
+        let payload = RegisterRendezvousPublisherPayload {
+            rendezvous_node_id: [7u8; 32],
+            auth_cookie: [9u8; 16],
+            validity_window_secs: 3600,
+            relay_kem_algo: 1,
+            relay_kem_pk: vec![0u8; MAX_RENDEZVOUS_KEM_PK_BYTES + 1],
+            relay_kem_valid_until_unix: 42,
+        };
+        let err = payload.encode().expect_err("an oversized key was encoded");
+        // The SAME error the far end raises for the same value: a caller that
+        // matches on one matches on both.
+        match err {
+            ProtoError::ValueTooLarge { field, value, max } => {
+                assert_eq!(field, "register_rendezvous_publisher.relay_kem_pk_len");
+                assert_eq!(value as usize, MAX_RENDEZVOUS_KEM_PK_BYTES + 1);
+                assert_eq!(max as usize, MAX_RENDEZVOUS_KEM_PK_BYTES);
+            }
+            other => panic!("wrong error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_rendezvous_ad_at_the_bound_round_trips() {
+        // The vacuity guard: the test above passes on an encoder that refuses
+        // everything, so the largest ACCEPTABLE key has to survive.
+        let payload = RegisterRendezvousPublisherPayload {
+            rendezvous_node_id: [1u8; 32],
+            auth_cookie: [2u8; 16],
+            validity_window_secs: 600,
+            relay_kem_algo: 3,
+            relay_kem_pk: vec![4u8; MAX_RENDEZVOUS_KEM_PK_BYTES],
+            relay_kem_valid_until_unix: 1234,
+        };
+        let bytes = payload.encode().expect("the largest legal key was refused");
+        let back = RegisterRendezvousPublisherPayload::decode(&bytes).expect("decode");
+        assert_eq!(back.relay_kem_pk.len(), MAX_RENDEZVOUS_KEM_PK_BYTES);
+        assert_eq!(back.rendezvous_node_id, payload.rendezvous_node_id);
+        assert_eq!(back.relay_kem_valid_until_unix, 1234);
+    }
     use super::*;
 
     #[test]
@@ -8917,7 +8981,7 @@ mod tests {
             relay_kem_pk: vec![0x33; 32],
             relay_kem_valid_until_unix: 1_700_000_000,
         };
-        let bytes = p.encode();
+        let bytes = p.encode().expect("a legal payload was refused");
         assert_eq!(
             RegisterRendezvousPublisherPayload::decode(&bytes).unwrap(),
             p
