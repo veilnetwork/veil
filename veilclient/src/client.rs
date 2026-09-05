@@ -1205,11 +1205,18 @@ impl VeilClient {
             relay_kem_pk,
             relay_kem_valid_until_unix,
         };
+        // Encoded BEFORE the frame is written, and its refusal is the caller's
+        // answer: an oversized key used to be learned about from the daemon,
+        // as a late typed error, after this side had already queued a pending
+        // op for a request it could not send correctly.
+        let body = payload
+            .encode()
+            .map_err(|e| ClientError::Protocol(format!("register_rendezvous_publisher: {e}")))?;
         self.writer
             .write_request_frame(
                 LocalAppMsg::RegisterRendezvousPublisher as u16,
                 request_id,
-                &payload.encode(),
+                &body,
             )
             .await?;
         match tokio::time::timeout(std::time::Duration::from_secs(10), rx).await {
