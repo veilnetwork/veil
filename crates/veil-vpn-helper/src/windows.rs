@@ -2,7 +2,8 @@ use std::ffi::OsString;
 use std::fs;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
-use std::os::windows::ffi::OsStringExt;
+use std::os::windows::ffi::{OsStrExt, OsStringExt};
+use std::os::windows::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::ptr;
@@ -14,7 +15,7 @@ use tokio::runtime::Runtime;
 use tun::{AbstractDevice, Layer};
 use tun2proxy::{ArgDns, ArgProxy, ArgVerbosity, Args, CancellationToken, Error as TunnelError};
 use windows_sys::Win32::Foundation::{
-    CloseHandle, ERROR_OBJECT_ALREADY_EXISTS, HANDLE, WAIT_TIMEOUT,
+    CloseHandle, ERROR_ALREADY_EXISTS, ERROR_OBJECT_ALREADY_EXISTS, HANDLE, LocalFree, WAIT_TIMEOUT,
 };
 use windows_sys::Win32::NetworkManagement::IpHelper::{
     CreateIpForwardEntry2, DeleteIpForwardEntry2, FreeMibTable, GetBestRoute2, GetIpForwardTable2,
@@ -24,9 +25,14 @@ use windows_sys::Win32::Networking::WinSock::{
     AF_INET, AF_INET6, AF_UNSPEC, IN_ADDR, IN_ADDR_0, IN6_ADDR, IN6_ADDR_0, MIB_IPPROTO_NETMGMT,
     SOCKADDR_IN, SOCKADDR_IN6, SOCKADDR_IN6_0, SOCKADDR_INET,
 };
-use windows_sys::Win32::Security::{
-    GetTokenInformation, TOKEN_ELEVATION, TOKEN_QUERY, TokenElevation,
+use windows_sys::Win32::Security::Authorization::{
+    ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
 };
+use windows_sys::Win32::Security::{
+    GetTokenInformation, PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES, TOKEN_ELEVATION, TOKEN_QUERY,
+    TokenElevation,
+};
+use windows_sys::Win32::Storage::FileSystem::{CreateDirectoryW, FILE_ATTRIBUTE_REPARSE_POINT};
 use windows_sys::Win32::System::Threading::{
     GetCurrentProcess, OpenProcess, OpenProcessToken, PROCESS_QUERY_LIMITED_INFORMATION,
     PROCESS_SYNCHRONIZE, QueryFullProcessImageNameW, WaitForSingleObject,
@@ -129,12 +135,22 @@ pub(crate) fn run(config_path: PathBuf, expected_sha256: &str) -> Result<i32, St
         return Err("empty Windows VPN request path".to_owned());
     }
     let (config, request_dir) = load_config(&config_path, expected_sha256)?;
-    let status_path = request_dir.join("status.json");
+    // NOT in the session directory. See [protected_status_dir]: what the host
+    // reads back has to come from somewhere that user cannot write.
+    let status_dir = protected_status_dir(&request_dir)?;
+    let status_path = status_dir.join("status.json");
+    // The stop signal stays where the host can create it, because the host is
+    // unelevated and has to. That direction is still forgeable by a process of
+    // the same user, which is a denial of service and not a forged verdict —
+    // closing it needs a named pipe with a DACL, not a file.
     let stop_path = request_dir.join("stop");
     let result = run_inner(&config, &config_path, &stop_path, &status_path);
     if let Err(error) = &result {
         let _ = write_status(&status_path, &config.token, "error", Some(error));
     }
+    // The directory is this run's; nothing else may inherit it.
+    let _ = fs::remove_file(&status_path);
+    let _ = fs::remove_dir(&status_dir);
     result.map(|()| 0)
 }
 
@@ -553,6 +569,107 @@ fn monitor_host(host: Handle, stop_path: &Path, cancel: CancellationToken) {
     }
 }
 
+/// The DACL every directory below carries, and it is PROTECTED (`D:P`) — it
+/// inherits nothing from whatever the parent happens to grant.
+///
+///   SY  local SYSTEM          FA  full control
+///   BA  builtin Administrators FA
+///   BU  builtin Users          FR  read only
+///
+/// Read for Users on purpose: the host is UNELEVATED and has to poll the
+/// status. What it must not be able to do — and what nothing running as that
+/// user must be able to do — is write one.
+const STATUS_DIR_SDDL: &str = "D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FR;;;BU)";
+
+/// Create `path` with [STATUS_DIR_SDDL]. `Ok(false)` when it already existed.
+fn create_protected_dir(path: &Path) -> Result<bool, String> {
+    let mut wide: Vec<u16> = path.as_os_str().encode_wide().collect();
+    wide.push(0);
+    let mut sddl: Vec<u16> = STATUS_DIR_SDDL.encode_utf16().collect();
+    sddl.push(0);
+    let mut descriptor: PSECURITY_DESCRIPTOR = ptr::null_mut();
+    // SAFETY: both inputs are NUL-terminated UTF-16; the descriptor is an out
+    // parameter freed below.
+    let converted = unsafe {
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            sddl.as_ptr(),
+            SDDL_REVISION_1,
+            &mut descriptor,
+            ptr::null_mut(),
+        )
+    };
+    if converted == 0 {
+        return Err(format!(
+            "build the Windows VPN status DACL: {}",
+            io::Error::last_os_error()
+        ));
+    }
+    let attributes = SECURITY_ATTRIBUTES {
+        nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
+        lpSecurityDescriptor: descriptor,
+        bInheritHandle: 0,
+    };
+    // SAFETY: `wide` is NUL-terminated and `attributes` outlives the call.
+    let made = unsafe { CreateDirectoryW(wide.as_ptr(), &attributes) };
+    let error = io::Error::last_os_error();
+    // SAFETY: the descriptor came from the converter, which allocates with
+    // LocalAlloc.
+    unsafe { LocalFree(descriptor as *mut _) };
+    if made != 0 {
+        return Ok(true);
+    }
+    if error.raw_os_error() == Some(ERROR_ALREADY_EXISTS as i32) {
+        return Ok(false);
+    }
+    Err(format!("create {}: {error}", path.display()))
+}
+
+/// Where this run publishes its status: a directory only an elevated process
+/// can write.
+///
+/// The status used to be written into the session directory in the user's own
+/// %TEMP%, beside the request. That directory MUST be user-writable — the host
+/// is unelevated when it stages the request — so any process of that user could
+/// write a status of its own: a forged `running` for a tunnel that never came
+/// up, or a forged `error` that makes the app tear down a working one. The
+/// token in the status is no defence: it is in the request file, which the same
+/// user can read.
+///
+/// So the direction that must not be forgeable — helper to host — moves under
+/// %ProgramData%, where this process can write and that user cannot. The leaf
+/// is named after the session directory, which is random per launch, and it
+/// must NOT already exist: a name nobody can predict and a create that refuses
+/// to reuse leaves nothing to squat on. Its DACL is protected, so a parent
+/// somebody else made grants nothing here.
+fn protected_status_dir(session: &Path) -> Result<PathBuf, String> {
+    let program_data = std::env::var_os("ProgramData")
+        .ok_or_else(|| "ProgramData is not set; refusing a forgeable status".to_owned())?;
+    let name = session
+        .file_name()
+        .ok_or_else(|| "the Windows VPN session directory has no name".to_owned())?;
+    let base = PathBuf::from(program_data).join("xVeil");
+    let vpn = base.join("vpn");
+    // The two parents may legitimately exist from an earlier run. Their DACL
+    // does not matter to the leaf, which is protected.
+    create_protected_dir(&base)?;
+    create_protected_dir(&vpn)?;
+    let leaf = vpn.join(name);
+    if !create_protected_dir(&leaf)? {
+        return Err(format!(
+            "{} already exists; refusing to publish status into a directory \
+             this run did not create",
+            leaf.display()
+        ));
+    }
+    // A parent somebody redirected cannot weaken the leaf's DACL, but it can
+    // move it somewhere the host will never look. Say so rather than run blind.
+    let meta = fs::metadata(&leaf).map_err(|e| format!("stat {}: {e}", leaf.display()))?;
+    if meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        return Err(format!("{} is a reparse point", leaf.display()));
+    }
+    Ok(leaf)
+}
+
 fn write_status(path: &Path, token: &str, phase: &str, detail: Option<&str>) -> Result<(), String> {
     let temp = path.with_extension(format!("{}.tmp", std::process::id()));
     let bytes = serde_json::to_vec(&Status {
@@ -646,6 +763,121 @@ mod tests {
         // above would pass on the parser, not on the digest.
         let value = serde_json::from_str::<HelperConfig>(TAMPERED).expect("tampered parses");
         assert_eq!(value.socks5_listen, "10.66.66.66:1080");
+    }
+
+    /// The DACL Windows actually stored on `path`, as SDDL.
+    fn dacl_of(path: &Path) -> String {
+        use windows_sys::Win32::Security::Authorization::{
+            ConvertSecurityDescriptorToStringSecurityDescriptorW, GetNamedSecurityInfoW,
+            SE_FILE_OBJECT,
+        };
+        use windows_sys::Win32::Security::DACL_SECURITY_INFORMATION;
+
+        let mut wide: Vec<u16> = path.as_os_str().encode_wide().collect();
+        wide.push(0);
+        let mut descriptor: PSECURITY_DESCRIPTOR = ptr::null_mut();
+        // SAFETY: `wide` is NUL-terminated; every unused out parameter is null.
+        let rc = unsafe {
+            GetNamedSecurityInfoW(
+                wide.as_ptr(),
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION,
+                ptr::null_mut(),
+                ptr::null_mut(),
+                ptr::null_mut(),
+                ptr::null_mut(),
+                &mut descriptor,
+            )
+        };
+        assert_eq!(rc, 0, "GetNamedSecurityInfoW failed for {}", path.display());
+        let mut text: *mut u16 = ptr::null_mut();
+        // SAFETY: the descriptor came back from the call above.
+        let ok = unsafe {
+            ConvertSecurityDescriptorToStringSecurityDescriptorW(
+                descriptor,
+                SDDL_REVISION_1,
+                DACL_SECURITY_INFORMATION,
+                &mut text,
+                ptr::null_mut(),
+            )
+        };
+        assert_ne!(ok, 0, "could not render the DACL as SDDL");
+        let mut len = 0usize;
+        // SAFETY: the converter returns a NUL-terminated string.
+        while unsafe { *text.add(len) } != 0 {
+            len += 1;
+        }
+        // SAFETY: `len` units precede the terminator.
+        let out = String::from_utf16_lossy(unsafe { std::slice::from_raw_parts(text, len) });
+        // SAFETY: both allocations came from LocalAlloc.
+        unsafe {
+            LocalFree(text as *mut _);
+            LocalFree(descriptor as *mut _);
+        }
+        out
+    }
+
+    #[test]
+    fn the_status_directory_is_one_this_user_cannot_write() {
+        // The point of the whole change, read back from Windows rather than
+        // assumed: an ACL you have not asked for is an ACL you are guessing at.
+        let session = std::env::temp_dir().join(format!(
+            "xveil-vpn-acltest-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let dir = protected_status_dir(&session).expect("create the status dir");
+        let sddl = dacl_of(&dir);
+        let _ = fs::remove_dir(&dir);
+
+        assert!(
+            sddl.starts_with("D:P"),
+            "the DACL is not protected, so it inherits whatever the parent \
+             grants: {sddl}"
+        );
+        assert!(
+            sddl.contains("(A;OICI;FA;;;SY)"),
+            "SYSTEM lost full control: {sddl}"
+        );
+        assert!(
+            sddl.contains("(A;OICI;FA;;;BA)"),
+            "Administrators lost full control: {sddl}"
+        );
+        assert!(
+            sddl.contains("(A;OICI;FR;;;BU)"),
+            "Users cannot READ the status, so the unelevated host cannot poll \
+             it: {sddl}"
+        );
+        assert!(
+            !sddl.contains("FA;;;BU") && !sddl.contains("FW;;;BU"),
+            "Users can WRITE the status — the forgery this move exists to \
+             stop: {sddl}"
+        );
+    }
+
+    #[test]
+    fn a_status_directory_that_already_exists_is_refused() {
+        // Nothing to squat on: the name is the session's, and a create that
+        // would reuse an existing directory is an error rather than a silent
+        // adoption of somebody else's ACL.
+        let session = std::env::temp_dir().join(format!(
+            "xveil-vpn-acltest2-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let dir = protected_status_dir(&session).expect("first create");
+        let again = protected_status_dir(&session);
+        let _ = fs::remove_dir(&dir);
+        assert!(
+            again.is_err(),
+            "a second run adopted the first run's directory"
+        );
     }
 
     #[test]
