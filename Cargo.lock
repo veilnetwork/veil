@@ -5435,6 +5435,7 @@ dependencies = [
  "ipnet",
  "serde",
  "serde_json",
+ "sha2",
  "tokio",
  "tun 0.8.13",
  "tun2proxy",
