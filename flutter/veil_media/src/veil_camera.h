@@ -40,6 +40,19 @@ class CameraCapturer {
                      const char* device_id = nullptr) = 0;
   // Stop delivering frames and release the device. Idempotent.
   virtual void Stop() = 0;
+  // Whether frames are actually flowing right now.
+  //
+  // NOT "was Start called and did it succeed". A capturer stops on its own
+  // when the device goes away — the Media Foundation read returns
+  // MF_E_VIDEO_RECORDING_DEVICE_INVALIDATED, v4l2 fails a select or a dequeue
+  // — and the object outlives that with nothing behind it. Callers that keep
+  // a capturer across a call have to be able to tell the two apart, or a
+  // camera that died can never be restarted: the retry looks like a no-op
+  // because the pointer is still there (report19 V19-M6, measured on Windows
+  // 11 ARM64 2026-09-05).
+  //
+  // Pure, so a new backend cannot forget to answer it.
+  virtual bool Capturing() const = 0;
 };
 
 // Creates the platform camera capturer, or null if this platform has none.

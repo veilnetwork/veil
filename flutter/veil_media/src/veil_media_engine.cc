@@ -1998,7 +1998,21 @@ int veil_media_group_engine_start_camera(VeilGroupMediaEngine* engine,
   GroupWebrtcState* ws = engine->ws.get();
   if (!ws || !ws->video_source || !engine->video_running.load())
     return VEIL_MEDIA_ERR_STATE;
-  if (ws->camera) return VEIL_MEDIA_OK;
+  // EXISTENCE IS NOT CAPTURE. The capturer's loop ends on its own when the
+  // device goes away, and the object stays behind holding nothing. Answering
+  // OK on the pointer alone meant a camera that had died could never be
+  // started again for the rest of the call: every retry reported success and
+  // no frame ever came. Measured on a Windows 11 ARM64 stand 2026-09-05 —
+  // disabling the camera mid-capture returns
+  // MF_E_VIDEO_RECORDING_DEVICE_INVALIDATED (0xc00d3ea2) from the pending
+  // synchronous read in 292 ms, so this is the ordinary unplug (report19
+  // V19-M6).
+  if (ws->camera && ws->camera->Capturing()) return VEIL_MEDIA_OK;
+  if (ws->camera) {
+    // Reap the finished capture thread before the object is dropped.
+    ws->camera->Stop();
+    ws->camera.reset();
+  }
   if (width <= 0) width = 352;
   if (height <= 0) height = 198;
   if (fps <= 0) fps = 15;
@@ -2648,7 +2662,20 @@ int veil_media_engine_start_camera_device(VeilMediaEngine* engine,
      defined(_WIN32))
   WebrtcState* ws = engine->ws.get();
   if (!ws || !ws->video_source) return VEIL_MEDIA_ERR_STATE;
-  if (ws->camera) return VEIL_MEDIA_OK;  // already capturing
+  // EXISTENCE IS NOT CAPTURE. The capturer's loop ends on its own when the
+  // device goes away, and the object stays behind holding nothing. Answering
+  // OK on the pointer alone meant a camera that had died could never be
+  // started again for the rest of the call: every retry reported success and
+  // no frame ever came. Measured on a Windows 11 ARM64 stand 2026-09-05 —
+  // disabling the camera mid-capture returns
+  // MF_E_VIDEO_RECORDING_DEVICE_INVALIDATED (0xc00d3ea2) from the pending
+  // synchronous read in 292 ms, so this is the ordinary unplug (report19
+  // V19-M6).
+  if (ws->camera && ws->camera->Capturing()) return VEIL_MEDIA_OK;
+  if (ws->camera) {
+    ws->camera->Stop();
+    ws->camera.reset();
+  }
   if (width <= 0) width = 352;
   if (height <= 0) height = 288;
   if (fps <= 0) fps = 15;
