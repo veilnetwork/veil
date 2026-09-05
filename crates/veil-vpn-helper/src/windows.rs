@@ -584,3 +584,78 @@ fn clear_dns_servers(interface_index: u32) {
             .status();
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    /// A well-formed request, as the host writes it.
+    const REQUEST: &str = concat!(
+        r#"{"hostPid":42,"token":"tok","socks5Listen":"127.0.0.1:1080","#,
+        r#""policy":{"routeMode":"allTraffic","includedCidrs":[],"#,
+        r#""excludedCidrs":[],"routeDns":true,"dnsServers":["1.1.1.1"],"#,
+        r#""allowLan":false,"mtu":1500}}"#
+    );
+
+    /// The same request with ONE field changed — the SOCKS endpoint an
+    /// administrator-level tunnel would be pointed at. This is the attack:
+    /// same shape, same length class, different destination, swapped into the
+    /// user's own %TEMP% while the UAC prompt is on screen.
+    const TAMPERED: &str = concat!(
+        r#"{"hostPid":42,"token":"tok","socks5Listen":"10.66.66.66:1080","#,
+        r#""policy":{"routeMode":"allTraffic","includedCidrs":[],"#,
+        r#""excludedCidrs":[],"routeDns":true,"dnsServers":["1.1.1.1"],"#,
+        r#""allowLan":false,"mtu":1500}}"#
+    );
+
+    fn staged(name: &str, body: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("veil-vpn-helper-test-{name}"));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("staging dir");
+        let path = dir.join("request.json");
+        fs::write(&path, body).expect("write request");
+        path
+    }
+
+    #[test]
+    fn the_request_the_launch_approved_is_loaded() {
+        let path = staged("good", REQUEST);
+        let digest = crate::integrity::request_digest(REQUEST.as_bytes());
+        let (config, dir) = load_config(&path, &digest).expect("load");
+        assert_eq!(config.socks5_listen, "127.0.0.1:1080");
+        assert_eq!(dir, path.parent().unwrap().canonicalize().unwrap());
+    }
+
+    #[test]
+    fn a_request_swapped_after_the_prompt_is_refused() {
+        // The digest is taken over what the host WROTE; the file then holds
+        // something else by the time the elevated helper reads it.
+        let digest = crate::integrity::request_digest(REQUEST.as_bytes());
+        let path = staged("tampered", TAMPERED);
+        let error = load_config(&path, &digest).expect_err("tampered request loaded");
+        assert!(
+            error.contains("does not match the approved launch"),
+            "refused for the wrong reason: {error}"
+        );
+    }
+
+    #[test]
+    fn the_tampered_request_would_otherwise_have_parsed() {
+        // Vacuity guard. If the swapped body were simply invalid JSON the test
+        // above would pass on the parser, not on the digest.
+        let value = serde_json::from_str::<HelperConfig>(TAMPERED).expect("tampered parses");
+        assert_eq!(value.socks5_listen, "10.66.66.66:1080");
+    }
+
+    #[test]
+    fn an_absent_or_short_expectation_is_not_a_way_to_skip_the_check() {
+        let path = staged("nodigest", REQUEST);
+        for expected in ["", "0", &"a".repeat(63)] {
+            assert!(
+                load_config(&path, expected).is_err(),
+                "{expected:?} was accepted as an expectation"
+            );
+        }
+    }
+}
