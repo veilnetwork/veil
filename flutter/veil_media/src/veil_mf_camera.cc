@@ -301,6 +301,12 @@ class MfCameraCapturer : public CameraCapturer {
   bool Start(int width, int height, int fps,
              const char* device_id) override {
     if (running_.load()) return true;
+    // A PREVIOUS run that ended on its own. [CaptureLoop] returns without
+    // anybody asking when the device is invalidated, when the stream ends, or
+    // when a renegotiated format cannot be read, and the thread then finishes
+    // — but stays JOINABLE. Assigning over a joinable `std::thread` below is
+    // `std::terminate`, so the corpse has to be reaped first.
+    if (thread_.joinable()) thread_.join();
     if (!mf().ok()) return false;
     if (width <= 0) width = 352;
     if (height <= 0) height = 288;
@@ -337,6 +343,21 @@ class MfCameraCapturer : public CameraCapturer {
       }
       cv.notify_one();
       if (ok) CaptureLoop();
+      // CAPTURE HAS ENDED, and not necessarily because anyone asked. The loop
+      // also returns when ReadSample fails, when the stream ends, or when a
+      // format renegotiation cannot be read — and `running_` was left standing
+      // in all three. `Start` answers `true` on that flag, so a camera that
+      // had stopped reported itself as already running: video could never come
+      // back for the life of this capturer, and the caller was told the
+      // restart had worked.
+      //
+      // Measured on a Windows 11 ARM64 stand, 2026-09-05: disabling the camera
+      // mid-capture returns MF_E_VIDEO_RECORDING_DEVICE_INVALIDATED
+      // (0xc00d3ea2) from a pending synchronous ReadSample in 292 ms, so this
+      // is the ordinary unplug, not a corner. With the flag left set, a
+      // restart after the device came back captured zero frames and said it
+      // had succeeded; with it cleared, video comes back.
+      running_.store(false);
       // Released inside the apartment that created it, before it goes away.
       reader_.Reset();
       if (com_ok) CoUninitialize();
@@ -354,6 +375,8 @@ class MfCameraCapturer : public CameraCapturer {
              cap_w_, cap_h_, cap_stride_, static_cast<int>(fmt_), target_w_);
     return true;
   }
+
+  bool Capturing() const override { return running_.load(); }
 
   void Stop() override {
     running_.store(false);

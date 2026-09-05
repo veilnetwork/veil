@@ -255,6 +255,13 @@ class AvfCameraCapturer : public CameraCapturer {
     return true;
   }
 
+  // AVCaptureSession has no loop of ours to fall out of: it is torn down by
+  // [Stop] and by nothing else, so holding a session IS capturing here. A
+  // session that fails at runtime posts AVCaptureSessionRuntimeError, which
+  // this class does not observe — if that is ever wired up, this is where the
+  // answer changes.
+  bool Capturing() const override { return session_ != nil; }
+
   void Stop() override {
     @autoreleasepool {
       AVCaptureSession* session = session_;

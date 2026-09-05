@@ -80,6 +80,10 @@ class V4l2CameraCapturer : public CameraCapturer {
   bool Start(int width, int height, int fps,
              const char* device_id) override {
     if (running_.load()) return true;
+    // A previous run that ended on its own leaves the thread joinable and the
+    // device open. [Stop] reaps both; without it `thread_ =` below assigns
+    // over a joinable thread, which is `std::terminate`, and the old fd leaks.
+    if (thread_.joinable()) Stop();
     if (width <= 0) width = 352;
     if (height <= 0) height = 288;
     if (fps <= 0) fps = 15;
@@ -184,23 +188,32 @@ class V4l2CameraCapturer : public CameraCapturer {
 
     running_.store(true);
     min_interval_us_ = 1000000 / fps;
-    thread_ = std::thread([this] { CaptureLoop(); });
+    // The flag is cleared BY THE THREAD, because the loop can end without
+    // anybody asking: a failed `select`, or a `VIDIOC_DQBUF` that is not
+    // EAGAIN — an unplugged webcam, a driver reset. It used to be left
+    // standing, and `Start` answers `true` on it, so a camera that had died
+    // reported itself as already running and could never be restarted. Same
+    // defect as the Media Foundation capturer's, same fix.
+    thread_ = std::thread([this] {
+      CaptureLoop();
+      running_.store(false);
+    });
     vcam_log("started %s: capture %dx%d (stride %d) -> target %d, %dfps",
              dev, cap_w_, cap_h_, cap_stride_, target_w_, fps);
     return true;
   }
 
+  bool Capturing() const override { return running_.load(); }
+
   void Stop() override {
-    if (!running_.exchange(false)) {
-      // Never started (or already stopped): still release a half-open fd.
-      if (fd_ >= 0) {
-        close(fd_);
-        fd_ = -1;
-      }
-      return;
-    }
+    const bool was_streaming = running_.exchange(false);
+    // JOINED FIRST, and whether or not the flag was still standing. Now that
+    // the loop clears it on its way out, "not running" no longer means "no
+    // thread" — and a joinable `std::thread` reaching its destructor is
+    // `std::terminate`. This used to return early on the flag alone, which
+    // after a driver failure meant the destructor met a live thread.
     if (thread_.joinable()) thread_.join();
-    if (fd_ >= 0) {
+    if (was_streaming && fd_ >= 0) {
       v4l2_buf_type type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
       xioctl(fd_, VIDIOC_STREAMOFF, &type);
     }
