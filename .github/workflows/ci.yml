@@ -165,6 +165,18 @@ jobs:
         # Windows 11 with 0.13.4, on answering a call.
         run: ./scripts/check-com-apartment-ownership.sh
 
+      - name: A capturer that exists is not a camera that is capturing
+        # This engine cannot be compiled here — it needs a WebRTC checkout — so
+        # the fact is guarded at the source. `start_camera` used to answer OK
+        # on the existence of the capturer object, and the capturer outlives
+        # its device: the loop returns when the camera is invalidated and the
+        # object stays behind holding nothing. Measured on a Windows 11 ARM64
+        # stand 2026-09-05, driving the shipped DLL — pull the camera, put it
+        # back, retry: "STILL NOTHING" before, "VIDEO IS BACK" after.
+        run: |
+          ./scripts/check-camera-restart.sh --self-test
+          ./scripts/check-camera-restart.sh
+
       - name: pqcrypto-falcon features are chosen, not inherited
         # Cargo unifies features across the graph, so ONE crate taking this
         # dependency with its defaults turns avx2 and neon on for the whole
