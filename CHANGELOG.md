@@ -1,5 +1,40 @@
 # Changelog
 
+## v0.11.22 — 2026-09-06
+
+*A bootstrap dial that could not ask for contacts said nothing at all.* A peer
+found at a rendezvous is dialled for one reason — to be asked for contacts, and
+then broken. The ask waits for the session outbox to register, so a session
+that ends first takes the ask with it, and the task then returned in silence.
+Measured on a fresh identity with nothing configured: three seeds dialled,
+three `peer.connect.success`, three sessions opened and closed inside the same
+millisecond, and not one `bootstrap.find_node_done`. The node reported itself
+connected with zero peers for the rest of the process, which reads exactly like
+having no network at all. It now logs `bootstrap.find_node_skipped` and returns
+there rather than asking on a dead session — an ask that could not happen used
+to be reported as a peer that answered with nothing.
+
+*A session said that it ended, never how long it lived.* `session.close` is
+written by our own teardown after the runner returns, so a far end that hung up
+and an orderly local wind-down produce the same line. `session.ended` now
+carries `lived_ms` and whether the peer was bootstrap-only: for a bootstrap
+dial that is the whole diagnosis, since a millisecond means it taught us
+nothing.
+
+*An overwritten cold copy stayed on the byte books forever.* Demoting a hot
+entry over an existing cold one counted the new bytes without discounting the
+copy it replaced, so the store's total drifted upward for the life of the
+process and evicted against a number that was never true.
+
+*A rendezvous ad encoder could emit what its own decoder refuses.* The KEM key
+size was checked when reading and not when writing, so an oversized key was
+encoded happily and rejected at the far end.
+
+*Any process of that user could stop an elevated VPN tunnel.* The helper took
+its stop signal from a file any process could create. It travels on a control
+pipe that names the asking process, the status moved out of reach, and the
+request is bound to the launch that was approved.
+
 ## v0.11.21 — 2026-09-05
 
 **Findings from the audit backlog, most of them checked on a real Windows
