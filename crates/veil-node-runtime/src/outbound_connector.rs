@@ -543,9 +543,40 @@ pub fn spawn_outbound_peers(
                                         // Wait for SessionRunner to register the outbox
                                         // channel. Retry a few times rather than relying
                                         // on a single fixed delay.
+                                        //
+                                        // AND SAY SO WHEN IT NEVER REGISTERS. This burst is
+                                        // the entire reason a rendezvous peer is dialled: the
+                                        // session exists to be asked for contacts and is
+                                        // broken straight after. If it ends before the outbox
+                                        // appears, the ask never happens — no contacts, no
+                                        // peers, and (until this line) no trace either. A
+                                        // node in that state reports itself connected with
+                                        // zero peers forever, which is indistinguishable
+                                        // from having no network at all. Measured on a fresh
+                                        // identity with nothing configured: three seeds
+                                        // dialled, three sessions opened and closed inside
+                                        // the same millisecond, and not one
+                                        // `bootstrap.find_node_done` in the log to say the
+                                        // burst had been skipped.
+                                        let mut registered = false;
                                         for _ in 0..5 {
                                             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                                            if session_outbox.peer_ids().contains(&peer_node_id) { break; }
+                                            if session_outbox.peer_ids().contains(&peer_node_id) {
+                                                registered = true;
+                                                break;
+                                            }
+                                        }
+                                        if !registered {
+                                            logger.info(
+                                                "bootstrap.find_node_skipped",
+                                                format!(
+                                                    "peer={} — the session was gone before it \
+                                                     could be asked for contacts, so this dial \
+                                                     taught us nothing",
+                                                    veil_util::hex_short(&peer_node_id)
+                                                ),
+                                            );
+                                            return;
                                         }
 
                                         let contacts: Vec<veil_dht::routing::Contact> = querier.find_node(peer_node_id, local_node_id).await;
@@ -681,7 +712,24 @@ pub fn spawn_outbound_peers(
                                 // swap_rx keyed by session_id; guard auto-
                                 // unregisters on runner exit.
                                 let _swap_guard = runner.register_swap_channel(&access.handoff.swap_registry);
+                                let session_began = std::time::Instant::now();
                                 runner.run().await;
+                                // HOW LONG IT LIVED, because `session.close` says only
+                                // that it did. That line is written by our own teardown
+                                // after `run()` returns, so it looks identical whether
+                                // the far end hung up or we wound down — and the
+                                // difference is the whole diagnosis. A bootstrap dial
+                                // that lives a millisecond taught us nothing; one that
+                                // lives seconds did its job.
+                                access.logger.info(
+                                    "session.ended",
+                                    format!(
+                                        "peer={} lived_ms={} bootstrap_only={}",
+                                        veil_util::hex_short(attempt.node_id.as_bytes()),
+                                        session_began.elapsed().as_millis(),
+                                        peer.bootstrap_only
+                                    ),
+                                );
                                 drop(_swap_guard);
                                 // Owner-aware teardown: our own registrations
                                 // always, the peer-wide state only if no
