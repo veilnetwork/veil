@@ -7966,6 +7966,80 @@ mod tests {
         );
     }
 
+    /// A bootstrap dial that could not ask for contacts must SAY so.
+    ///
+    /// A rendezvous peer is dialled for exactly one reason: to be asked for
+    /// contacts, and then broken. The ask is spawned behind a wait for the
+    /// session outbox, so a session that ends first takes the ask with it —
+    /// no contacts, no peers, and the node then reports itself connected with
+    /// zero peers for the rest of the process, which reads exactly like having
+    /// no network at all.
+    ///
+    /// Measured on a fresh identity with nothing configured: three seeds
+    /// dialled, three sessions opened and closed inside the same millisecond,
+    /// and not one `bootstrap.find_node_done` line — the burst was skipped and
+    /// nothing recorded that it had been.
+    #[test]
+    fn a_bootstrap_burst_that_never_ran_leaves_a_trace() {
+        let src = production_source(include_str!("../outbound_connector.rs"));
+        assert!(
+            src.contains("bootstrap.find_node_skipped"),
+            "a bootstrap dial that lost its session before it could ask for \
+             contacts is silent again, and silence there is indistinguishable \
+             from a node that simply has no peers"
+        );
+        let at = src
+            .find("bootstrap.find_node_skipped")
+            .expect("checked above");
+
+        // And it has to be REACHABLE. A line behind `if false` reads exactly
+        // like a line behind the real condition, and the first version of this
+        // test could not tell them apart: it asked whether the string was in
+        // the file, which is existence, not a decision.
+        let condition = src[..at]
+            .rmatch_indices("if ")
+            .map(|(i, _)| src[i..].lines().next().unwrap_or_default())
+            .next()
+            .expect("no condition governs the skip");
+        assert!(
+            condition.contains("registered"),
+            "the skip is governed by `{}` rather than by whether the session \
+             ever registered, so it cannot fire for the case it exists for",
+            condition.trim()
+        );
+
+        // The skip has to END the task. Falling through to `find_node` on a
+        // session that is gone logs `find_node_done contacts_received=0`,
+        // which says the peer answered with nothing — a different and wrong
+        // story about the same failure.
+        let after = &src[at..];
+        let ret = after.find("return;").unwrap_or(usize::MAX);
+        let ask = after.find("querier.find_node").unwrap_or(usize::MAX);
+        assert!(
+            ret < ask,
+            "the skipped burst falls through and asks anyway, so an ask that \
+             could not happen is reported as a peer that answered with nothing"
+        );
+    }
+
+    /// `session.close` says only THAT a session ended, never why or for how
+    /// long, and it is written by our own teardown after `run()` returns — so
+    /// a far end that hung up and an orderly local wind-down produce the same
+    /// line. The lifetime is what separates them, and separating them is the
+    /// whole diagnosis for a bootstrap dial that taught us nothing.
+    #[test]
+    fn a_session_says_how_long_it_lived() {
+        let src = production_source(include_str!("../outbound_connector.rs"));
+        assert!(
+            src.contains("\"session.ended\""),
+            "the session lifetime is unrecorded again"
+        );
+        assert!(
+            src.contains("lived_ms="),
+            "session.ended no longer carries the one field it exists for"
+        );
+    }
+
     /// report21 V20-M7a: a failed dial retires ITS OWN placeholder and
     /// nothing else.
     ///
