@@ -1,5 +1,29 @@
 # Changelog
 
+## v0.11.24 — 2026-09-08
+
+*A file can now be opened, and created, beneath a granted root without its name
+being looked up twice.* `veil_fs_open_beneath` and `veil_fs_create_beneath`
+walk to the parent one component at a time — each step opened relative to the
+descriptor before it, and refusing to follow a link rather than traversing one
+— and then read or write through that descriptor alone. A caller that checked a
+path and then acted on the name was trusting that nothing moved in between;
+these entry points remove the second lookup, so a component swapped after the
+check cannot redirect the read or the write. A refusal is told apart from an
+inability: `ENOTDIR` on macOS and `ELOOP` on Linux mean the same thing here, so
+the classification asks `fstatat` what the component is instead of reading the
+error text.
+
+*The same walk exists on Windows.* Win32 has no `openat`, but `NtCreateFile`
+resolves a name against a directory handle, and `OBJ_DONT_REPARSE` refuses a
+junction or a symlink where `O_NOFOLLOW` would. Its tests ran on a Windows
+machine rather than under cross-compilation: six of them, the junction case
+carrying a control that proves an ordinary read does walk through what the
+guarded one refuses. Windows also declines to rename a directory that holds an
+open file, so the swap the POSIX test performs cannot even be staged there —
+that test asserts both halves, since either alone would be satisfied by a
+descriptor that had already died.
+
 ## v0.11.23 — 2026-09-08
 
 *The documented way to sign a config had been failing since it changed.*
