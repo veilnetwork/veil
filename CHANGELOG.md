@@ -1,5 +1,22 @@
 # Changelog
 
+## v0.11.23 — 2026-09-08
+
+*The documented way to sign a config had been failing since it changed.*
+`OPERATIONS.md` told an operator to sign with the active `[identity]` keypair
+and printed a command with no `--signer-key` — a flag that became required when
+signing moved to an offline key. Both language pages now mint the key first and
+say why the config's own identity may not be used: a signature made with a key
+stored inside the signed file attests only that the file agrees with itself.
+
+*Every tool CI installs is pinned.* `cargo install cargo-ndk` took whatever
+crates.io served at the moment the job ran, so two runs of the same commit
+could build the mobile artifacts with different tooling — somebody else's code
+deciding what a release is made of, changing without a commit here to point at.
+`scripts/check-workflow-pins.sh` is a step in the hygiene job, not a script
+beside it: this repository derives its local gate FROM that job, so a check
+that is not a step is a check nobody runs.
+
 ## v0.11.22 — 2026-09-06
 
 *A bootstrap dial that could not ask for contacts said nothing at all.* A peer
