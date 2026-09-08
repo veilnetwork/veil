@@ -76,6 +76,9 @@ jobs:
         # `#[allow(…)]`-d with a rationale comment before merge.
         run: cargo clippy --workspace --all-targets -- -D warnings
 
+      - name: Every tool CI installs is pinned
+        run: ./scripts/check-workflow-pins.sh
+
       - name: The triggers name a branch that exists
         # Also in pr-hygiene, and it has to be in both: that workflow stopped
         # running on main when this one started, so leaving the check only
