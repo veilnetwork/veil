@@ -58,7 +58,7 @@ jobs:
         run: rustup target add ${{ matrix.triple }}
 
       - name: Install cargo-ndk
-        run: cargo install cargo-ndk --locked
+        run: cargo install cargo-ndk --version "^4.1" --locked
 
       - name: Set up Android NDK
         id: ndk
