@@ -603,6 +603,15 @@ typedef struct VeilAnonStreamFfi VeilAnonStreamFfi;
 typedef struct VeilApp VeilApp;
 
 /**
+ * An open file, held by descriptor. The name it was opened by is not kept:
+ * nothing here ever looks at a path again.
+ *
+ * `Debug` prints the descriptor and the length and no path, because there is
+ * no path to print — which is the property this whole module exists for.
+ */
+typedef struct VeilFsFile VeilFsFile;
+
+/**
  * Opaque connection handle returned by [`veil_connect`].
  *
  * Wraps a strong `Arc` over [`RuntimeBundle`]; cloning an internal `Arc`
@@ -3468,6 +3477,56 @@ int veil_ratchet_import(VeilHandle *handle,
  */
  int veil_ratchet_forget(VeilHandle *handle, const uint8_t *key_64, char **err_out) ;
 #endif
+
+/**
+ * Open `relative` beneath `root`, following no symlink on the way.
+ *
+ * `root` is opened by name — it is the anchor the caller already trusts and
+ * re-validates, and a root that is itself a symlink is an ordinary
+ * configuration. Everything below it is walked by descriptor.
+ *
+ * Returns null and writes `*err_out` on any refusal. Writes the file's size
+ * to `*out_len` on success, read from the DESCRIPTOR, so it describes the
+ * object this call is returning rather than whatever the name means later.
+ *
+ * # Safety
+ * `root` and `relative` must be NUL-terminated C strings; `out_len` and
+ * `err_out` must be writable or null. The returned handle is freed with
+ * [`veil_fs_close`].
+ */
+
+VeilFsFile *veil_fs_open_beneath(const char *root,
+                                 const char *relative,
+                                 uint64_t *out_len,
+                                 char **err_out)
+;
+
+/**
+ * Read up to `len` bytes at `offset` from an open handle. Returns the number
+ * read, or -1 with `*err_out` set.
+ *
+ * Positional, so concurrent reads on one handle cannot move each other's
+ * cursor — the host serves ranges out of order.
+ *
+ * # Safety
+ * `handle` must come from [`veil_fs_open_beneath`] and not have been closed;
+ * `buf` must be writable for `len` bytes.
+ */
+
+intptr_t veil_fs_read(VeilFsFile *handle,
+                      uint64_t offset,
+                      uint8_t *buf,
+                      size_t len,
+                      char **err_out)
+;
+
+/**
+ * Close a handle from [`veil_fs_open_beneath`]. Null is a no-op.
+ *
+ * # Safety
+ * `handle` must not be used again.
+ */
+ void veil_fs_close(VeilFsFile *handle) ;
 
 #if defined(VEIL_FFI_NODE_EMBEDDED)
 /**
