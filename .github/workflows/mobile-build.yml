@@ -5,9 +5,20 @@ name: mobile-cross-compile
 # a ready-to-bundle artifact per target so the Flutter plugin's
 # `android/build.gradle` + iOS Podspec can pull straight from the run.
 #
-# Manually triggered or on git tag push (release flow).  Skipped on
-# regular pushes — full matrix takes ~15-20 min and isn't load-bearing
-# for the daemon-side CI.
+# Manually triggered or on git tag push (release flow), and ONE leg on every
+# push to main.
+#
+# It used to skip ordinary pushes entirely, with the reason written here: the
+# matrix "isn't load-bearing for the daemon-side CI".  That was wrong, and
+# 0.11.24 is the proof — `st_mode` was compared with `S_IFMT` directly, which
+# type-checks where both are the same width and does not on a 32-bit Android.
+# Every gate before the tag was green because none of them ever asked that
+# target a question, and the break was found in the release itself.
+#
+# So the full matrix still runs on a tag, and `armv7-linux-androideabi` — the
+# only 32-bit target here, and the one that broke — runs on main as well.  One
+# leg is ~14 min; a phone build discovered broken at the tag costs a re-cut of
+# two repositories.
 #
 # Every leg calls `scripts/build-mobile.sh`, the same script a developer runs,
 # rather than spelling out its own `cargo build`.  It used to spell them out,
@@ -26,6 +37,12 @@ on:
     tags:
       - 'mobile-v*'
       - 'v*'
+    branches:
+      - main
+    # No `paths` filter on purpose. It would apply to the tag push as well as
+    # the branch push, and a release cut from a commit that happened to touch
+    # nothing in the list would skip this workflow ENTIRELY, in silence — the
+    # failure mode this file is being changed to prevent.
 
 # Least privilege (audit V-03/V-05): nothing here publishes, so nothing here
 # needs a token that can write to the repository.
@@ -35,6 +52,7 @@ permissions:
 jobs:
   android:
     name: android-${{ matrix.triple }}
+    if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -84,8 +102,44 @@ jobs:
             target/${{ matrix.triple }}/release/libveilclient_ffi.so
             target/${{ matrix.triple }}/release/libveilclient_ffi.a
 
+  android-32bit-guard:
+    # The one leg that runs OUTSIDE the release flow, because it is the one
+    # that can be broken by code that compiles everywhere else: `off_t` and the
+    # `S_IF*` constants are not the same width here as on any machine this is
+    # developed or tested on. It builds through the same script as the matrix
+    # above, so it cannot drift from what a release ships; it just does not
+    # upload, because nothing consumes a branch build.
+    name: android-armv7 (32-bit guard)
+    if: github.event_name == 'push' && !startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          targets: armv7-linux-androideabi
+
+      - name: Add the cross target to the PINNED toolchain
+        run: rustup target add armv7-linux-androideabi
+
+      - name: Install cargo-ndk
+        run: cargo install cargo-ndk --version "^4.1" --locked
+
+      - name: Set up Android NDK
+        id: ndk
+        uses: nttld/setup-ndk@ed92fe6cadad69be94a966a7ee3271275e62f779 # v1
+        with:
+          ndk-version: r26d
+
+      - name: Cross-compile ffi
+        env:
+          ANDROID_NDK_HOME: ${{ steps.ndk.outputs.ndk-path }}
+        run: scripts/build-mobile.sh --target armv7-linux-androideabi
+
   ios-and-macos:
     name: apple-${{ matrix.triple }}
+    if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
     runs-on: macos-14
     strategy:
       fail-fast: false
@@ -127,6 +181,7 @@ jobs:
     # the Flutter plugin's Podspec consumes.  Runs after the apple-* legs
     # finish so it can pull their artifacts.
     name: ios-xcframework
+    if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
     runs-on: macos-14
     needs: ios-and-macos
     steps:
@@ -161,6 +216,7 @@ jobs:
 
   linux-desktop:
     name: linux-${{ matrix.triple }}
+    if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false

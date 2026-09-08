@@ -1,5 +1,26 @@
 # Changelog
 
+## v0.11.25 — 2026-09-08
+
+*0.11.24 did not build for a 32-bit phone.* `st_mode` was compared with
+`S_IFMT` directly: both are `u16` on macOS, both are `u32` on Linux, and on
+`armv7-linux-androideabi` the field is `u32` while the constants are `u16`.
+Every gate before that tag was green because not one of them ever asked that
+target a question — the mobile matrix runs on the tag, which is to say after
+the release exists. Both sides now widen through `Into` rather than `as`, so a
+widening cannot quietly become a truncation, and the matrix's 32-bit leg runs
+on every push to `main`: this class now fails on a branch instead of in a
+release.
+
+*A positional read on such a phone could have returned the wrong bytes.*
+`offset as off_t` wraps in silence where `off_t` is 32 bits — an offset of
+4 GiB + 5 becomes 5, and the caller is handed a SUCCESSFUL read of a different
+part of the file. Linux and Android now use `pread64`/`pwrite64`, whose offset
+is 64-bit whatever the word size is; everywhere else the conversion is checked
+and refuses an offset it cannot express. The test asserts that refusal by its
+words, because a wrapping cast fails the same call too — with the system's
+EINVAL, while leaving the wrap in place on the one platform where it happens.
+
 ## v0.11.24 — 2026-09-08
 
 *A file can now be opened, and created, beneath a granted root without its name
