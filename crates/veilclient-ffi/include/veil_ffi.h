@@ -3502,6 +3502,42 @@ VeilFsFile *veil_fs_open_beneath(const char *root,
 ;
 
 /**
+ * Create `relative` beneath `root` for writing, following no symlink and
+ * refusing a name that already exists.
+ *
+ * The write side of the same gap. Folder sync checks that a mirrored path is
+ * inside its root and then opens it — and `File.open` follows a link, so a
+ * component turned into a symlink between the check and the open sent the
+ * download outside the mirrored tree, truncating whatever it aimed at. The
+ * scratch file has the same shape and documents the same remainder: it wants
+ * `O_NOFOLLOW` with `O_EXCL`, which `dart:io` does not expose.
+ *
+ * `O_EXCL` is not an optimisation here. Without it a name an attacker
+ * pre-created is opened and truncated; with it the create fails and the caller
+ * picks another name, which is what the random scratch name was already for.
+ *
+ * # Safety
+ * Same contract as [`veil_fs_open_beneath`].
+ */
+ VeilFsFile *veil_fs_create_beneath(const char *root, const char *relative, char **err_out) ;
+
+/**
+ * Write `len` bytes at `offset` through an open handle. Returns the number
+ * written, or -1 with `*err_out` set.
+ *
+ * # Safety
+ * `handle` must come from [`veil_fs_create_beneath`]; `buf` must be readable
+ * for `len` bytes.
+ */
+
+intptr_t veil_fs_write(VeilFsFile *handle,
+                       uint64_t offset,
+                       const uint8_t *buf,
+                       size_t len,
+                       char **err_out)
+;
+
+/**
  * Read up to `len` bytes at `offset` from an open handle. Returns the number
  * read, or -1 with `*err_out` set.
  *
