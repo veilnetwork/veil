@@ -115,6 +115,20 @@ serde = { version = "1", features = ["derive"], optional = true }
 serde_json = { version = "1", optional = true }
 tempfile = { version = "3", optional = true }
 
+# Windows: the descriptor-relative walk in `fs_beneath`. `NtCreateFile` with a
+# RootDirectory handle is the only true `openat` on this platform — everything
+# in Win32 proper takes a path and looks it up again, which is the thing being
+# got rid of. `Wdk_*` is where the NT layer lives; narrow features, no umbrella.
+[target.'cfg(target_os = "windows")'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Wdk_Foundation",
+    "Wdk_Storage_FileSystem",
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+] }
+
 # Android: route the embedded node's `log` output to logcat so the in-process
 # node is debuggable on-device (Rust stderr is NOT captured by logcat).
 [target.'cfg(target_os = "android")'.dependencies]
