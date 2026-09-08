@@ -84,8 +84,16 @@ mod anon_stream;
 // security decision nobody is checking. The module is dead weight in a
 // client-only build (a few KiB, no dependencies of its own beyond crypto that
 // is already linked) — a fair price for having its tests run every time.
+/// Descriptor-relative file access, so a host with no `openat` can still bind
+/// the name it checked to the object it opened. See the module for the finding
+/// this closes.
+///
+/// Feature-free on purpose: it needs libc and nothing else, and every host that
+/// serves a file wants it.
+mod fs_beneath;
 #[cfg_attr(not(feature = "node-embedded"), allow(dead_code))]
 mod media;
+
 // Opt-in message-authorship signature FFI (needs veil-cfg to parse the caller's
 // identity TOML — enabled by node-embedded).
 #[cfg(feature = "node-embedded")]
