@@ -331,14 +331,27 @@ pinned-issuer setup additionally surfaces "wrong issuer" tamper.
 
 ### Signing a config file
 
-Use the active `[identity]` keypair to sign the file in place:
+Signing needs an **offline** key, kept somewhere the daemon's config is not.
+Mint one first, then sign with it:
 
 ```sh
-veil-cli -c /etc/veil/config.toml config sign
+veil-cli config signer-key /etc/veil/config-signer.key
+# → writes a keypair, mode 0600. Keep it off the host if you can: overwriting
+#   it later orphans every config signed with the old one, which is why
+#   `--force` is required to replace it.
+
+veil-cli -c /etc/veil/config.toml config sign \
+  --signer-key /etc/veil/config-signer.key
 # → emits an INFO line with the issuer pubkey fingerprint and issued_at;
 #   atomically rewrites the file with a `# VEIL_CONFIG_SIGNATURE_V1: …`
 #   comment header at the top.
 ```
+
+The key may NOT be the config's own `[identity]`, and this page used to say it
+was — the command as written here has been failing since `--signer-key` became
+required (audit R2-V-03). Signing a file with a key stored inside that same
+file proves nothing: whoever can rewrite the file can re-sign it, and the
+signature then attests only that the file is self-consistent.
 
 Re-signing the same file replaces the previous signature header
 (idempotent).  Use `--issued-at <UNIX_SECS>` to embed a specific
