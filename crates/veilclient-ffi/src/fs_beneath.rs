@@ -190,14 +190,31 @@ pub unsafe extern "C" fn veil_fs_open_beneath(
 fn read_at(file: &VeilFsFile, offset: u64, out: &mut [u8]) -> std::io::Result<usize> {
     #[cfg(unix)]
     {
-        // SAFETY: `out` is a valid slice; `fd` is this module's open file.
-        let n = unsafe {
-            libc::pread(
-                file.fd,
-                out.as_mut_ptr() as *mut libc::c_void,
-                out.len(),
-                offset as libc::off_t,
-            )
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        let n = {
+            let off = libc::off64_t::try_from(offset).map_err(offset_beyond_reach)?;
+            // SAFETY: `out` is a valid slice; `fd` is this module's open file.
+            unsafe {
+                libc::pread64(
+                    file.fd,
+                    out.as_mut_ptr() as *mut libc::c_void,
+                    out.len(),
+                    off,
+                )
+            }
+        };
+        #[cfg(not(any(target_os = "linux", target_os = "android")))]
+        let n = {
+            let off = libc::off_t::try_from(offset).map_err(offset_beyond_reach)?;
+            // SAFETY: `out` is a valid slice; `fd` is this module's open file.
+            unsafe {
+                libc::pread(
+                    file.fd,
+                    out.as_mut_ptr() as *mut libc::c_void,
+                    out.len(),
+                    off,
+                )
+            }
         };
         if n < 0 {
             return Err(std::io::Error::last_os_error());
@@ -211,19 +228,40 @@ fn read_at(file: &VeilFsFile, offset: u64, out: &mut [u8]) -> std::io::Result<us
     }
 }
 
+/// An offset this platform's file offsets cannot express.
+///
+/// `off_t` is 64-bit on macOS and on 64-bit Linux — and 32-bit on a 32-bit
+/// Android, where `offset as off_t` wraps in silence: an offset of 4 GiB + 5
+/// becomes 5, and the caller is handed the WRONG BYTES with a success code.
+/// Linux and Android both carry `pread64`/`pwrite64`, whose offset is 64-bit
+/// whatever the word size is, so those are used there; everywhere else the
+/// conversion is checked and an offset that will not fit is refused rather
+/// than wrapped. Silence is the thing being removed: a refusal is a fault the
+/// caller can see.
+#[cfg(unix)]
+fn offset_beyond_reach(_: std::num::TryFromIntError) -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::InvalidInput,
+        "offset beyond what this platform's file offsets can address",
+    )
+}
+
 /// Positional write, the same way round.
 #[cfg(any(unix, windows))]
 fn write_at(file: &VeilFsFile, offset: u64, src: &[u8]) -> std::io::Result<usize> {
     #[cfg(unix)]
     {
-        // SAFETY: `src` is a valid slice; `fd` is this module's open file.
-        let n = unsafe {
-            libc::pwrite(
-                file.fd,
-                src.as_ptr() as *const libc::c_void,
-                src.len(),
-                offset as libc::off_t,
-            )
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        let n = {
+            let off = libc::off64_t::try_from(offset).map_err(offset_beyond_reach)?;
+            // SAFETY: `src` is a valid slice; `fd` is this module's open file.
+            unsafe { libc::pwrite64(file.fd, src.as_ptr() as *const libc::c_void, src.len(), off) }
+        };
+        #[cfg(not(any(target_os = "linux", target_os = "android")))]
+        let n = {
+            let off = libc::off_t::try_from(offset).map_err(offset_beyond_reach)?;
+            // SAFETY: `src` is a valid slice; `fd` is this module's open file.
+            unsafe { libc::pwrite(file.fd, src.as_ptr() as *const libc::c_void, src.len(), off) }
         };
         if n < 0 {
             return Err(std::io::Error::last_os_error());
@@ -493,7 +531,7 @@ fn open_beneath(root: &str, relative: &str) -> Result<VeilFsFile, String> {
     // A directory, a device or a fifo is not a file to send. `O_NOFOLLOW`
     // already refused a symlink; this refuses the rest, so a caller cannot be
     // made to read from something that blocks forever.
-    if st.st_mode & libc::S_IFMT != libc::S_IFREG {
+    if widen(st.st_mode) & widen(libc::S_IFMT) != widen(libc::S_IFREG) {
         unsafe { libc::close(fd) };
         return Err("not a regular file".to_owned());
     }
@@ -597,13 +635,28 @@ fn create_beneath(root: &str, relative: &str) -> Result<VeilFsFile, String> {
 /// for ELOOP — and a symlink to a directory refused by `O_NOFOLLOW |
 /// O_DIRECTORY` reports ENOTDIR on macOS, so the refusal was right and the
 /// sentence was wrong.
+/// Widen a mode word to `u32`, because it is not one width everywhere.
+///
+/// `st_mode` and the `S_IF*` constants are `u16` on macOS, `u32` on Linux —
+/// and on 32-bit Android the field is `u32` while the constants are `u16`.
+/// Comparing them directly therefore compiles on the machine this was written
+/// on, and on the machines CI checks, and fails to compile for a phone: it did
+/// exactly that in 0.11.24, on `armv7-linux-androideabi`, and nothing before
+/// the tag had asked that target a question. Both sides go through here so the
+/// comparison has one width on every target, and through `Into` rather than
+/// `as` so that a widening cannot quietly become a truncation.
+#[cfg(unix)]
+fn widen(value: impl Into<u32>) -> u32 {
+    value.into()
+}
+
 #[cfg(unix)]
 fn component_is_symlink(dir: c_int, name: &CStr) -> bool {
     let mut st: libc::stat = unsafe { std::mem::zeroed() };
     // SAFETY: `dir` is an open directory descriptor, `name` is NUL-terminated,
     // `st` is writable.
     let rc = unsafe { libc::fstatat(dir, name.as_ptr(), &mut st, libc::AT_SYMLINK_NOFOLLOW) };
-    rc == 0 && (st.st_mode & libc::S_IFMT) == libc::S_IFLNK
+    rc == 0 && (widen(st.st_mode) & widen(libc::S_IFMT)) == widen(libc::S_IFLNK)
 }
 
 #[cfg(unix)]
@@ -816,6 +869,35 @@ mod tests {
         let file = open_beneath(root.to_str().unwrap(), "sub/f.txt").expect("open");
         assert_eq!(file.len, 5);
         assert_eq!(read_all(&file), b"hello");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// An offset this platform cannot express is refused, not wrapped.
+    ///
+    /// On a 32-bit Android `off_t` is 32 bits, and `offset as off_t` turns
+    /// 4 GiB + 5 into 5: a read that SUCCEEDS, holding somebody else's bytes.
+    /// The conversion is checked instead, and this asserts the refusal BY ITS
+    /// WORDS — a wrapping cast would fail here too, but with the system's
+    /// EINVAL, and would leave the silent wrap in place on the one platform
+    /// where it can actually happen.
+    #[test]
+    fn an_offset_this_platform_cannot_express_is_refused() {
+        let root = scratch();
+        write(&root.join("f.txt"), b"hello");
+        let file = open_beneath(root.to_str().unwrap(), "f.txt").expect("open");
+
+        let mut out = [0u8; 4];
+        let err = read_at(&file, u64::MAX, &mut out).expect_err("must refuse");
+        assert!(
+            err.to_string().contains("beyond what this platform"),
+            "refused for the wrong reason: {err}"
+        );
+
+        // The control, so the refusal above is about the offset and not about
+        // the file: the same call at a reachable offset reads.
+        assert_eq!(read_at(&file, 1, &mut out).expect("read"), 4);
+        assert_eq!(&out, b"ello");
+
         std::fs::remove_dir_all(&root).ok();
     }
 
