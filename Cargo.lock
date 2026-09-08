@@ -5511,6 +5511,7 @@ dependencies = [
  "veil-types",
  "veil-util",
  "veilclient",
+ "windows-sys 0.59.0",
  "zeroize",
 ]
 

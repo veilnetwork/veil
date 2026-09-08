@@ -34,14 +34,22 @@
 //!
 //! ## Windows
 //!
-//! Not implemented, and it says so rather than pretending: there is no
-//! `openat`, the equivalent needs `NtCreateFile` with a root handle, and this
-//! machine cannot run a test of it. The host keeps its stamped open there — the
-//! same weaker check it already documents on Windows, where the stamp degrades
-//! to size and mtime anyway. An honest refusal is what lets the caller know
-//! which guarantee it has.
+//! The same guarantee by the same means, spelled in the NT layer. Win32 proper
+//! has no `openat` — every entry point takes a path and looks it up again,
+//! which is the thing being got rid of — but `NtCreateFile` accepts a
+//! RootDirectory HANDLE and resolves the name relative to it, exactly as
+//! `openat` resolves relative to a descriptor. `OBJ_DONT_REPARSE` is the
+//! `O_NOFOLLOW`: a junction or a symlink on the way is refused with
+//! STATUS_REPARSE_POINT_ENCOUNTERED rather than followed.
+//!
+//! An earlier version of this module said Windows could not be done here and
+//! that this machine could not test it. The first half was wrong and the second
+//! was about the wrong machine: the build and the test run on the Windows ARM
+//! stand.
 
-use std::ffi::{CStr, CString, c_char, c_int};
+#[cfg(unix)]
+use std::ffi::c_int;
+use std::ffi::{CStr, CString, c_char};
 
 use libc::size_t;
 
@@ -54,6 +62,11 @@ use libc::size_t;
 pub struct VeilFsFile {
     #[cfg(unix)]
     fd: c_int,
+    /// Windows has no descriptor to keep as an integer, and no `pread`: the
+    /// handle becomes a `File` and positional IO goes through `seek_read` /
+    /// `seek_write`, which do not move a shared cursor either.
+    #[cfg(windows)]
+    file: std::fs::File,
     len: u64,
 }
 
@@ -116,19 +129,14 @@ pub unsafe extern "C" fn veil_fs_open_beneath(
     out_len: *mut u64,
     err_out: *mut *mut c_char,
 ) -> *mut VeilFsFile {
-    #[cfg(not(unix))]
+    #[cfg(not(any(unix, windows)))]
     {
         let _ = (root, relative, out_len);
-        unsafe {
-            set_err(
-                err_out,
-                "veil_fs_open_beneath is POSIX-only; the caller keeps its own check on this host",
-            )
-        };
+        unsafe { set_err(err_out, "veil_fs_open_beneath is POSIX-only") };
         std::ptr::null_mut()
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     {
         if root.is_null() || relative.is_null() {
             unsafe { set_err(err_out, "null path") };
@@ -161,6 +169,289 @@ pub unsafe extern "C" fn veil_fs_open_beneath(
             }
         }
     }
+}
+
+// ---- Windows -------------------------------------------------------------
+//
+// `NtCreateFile` is the only entry point on this platform that resolves a name
+// relative to an open DIRECTORY rather than to the filesystem root, which is
+// what makes the walk below mean the same thing it means on POSIX.
+//
+// The constants are declared here rather than imported: `windows-sys` exposes
+// the function and the structures, and these two object-attribute bits live in
+// the DDK headers. Their values are part of the NT ABI and have not moved since
+// Windows 8, which is also when `OBJ_DONT_REPARSE` appeared.
+/// Positional read, so concurrent reads on one handle cannot move each other's
+/// cursor — the host serves ranges out of order.
+///
+/// One name for two spellings: `pread` on POSIX, `seek_read` on Windows.
+/// Neither touches a shared file position.
+#[cfg(any(unix, windows))]
+fn read_at(file: &VeilFsFile, offset: u64, out: &mut [u8]) -> std::io::Result<usize> {
+    #[cfg(unix)]
+    {
+        // SAFETY: `out` is a valid slice; `fd` is this module's open file.
+        let n = unsafe {
+            libc::pread(
+                file.fd,
+                out.as_mut_ptr() as *mut libc::c_void,
+                out.len(),
+                offset as libc::off_t,
+            )
+        };
+        if n < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(n as usize)
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::FileExt as _;
+        file.file.seek_read(out, offset)
+    }
+}
+
+/// Positional write, the same way round.
+#[cfg(any(unix, windows))]
+fn write_at(file: &VeilFsFile, offset: u64, src: &[u8]) -> std::io::Result<usize> {
+    #[cfg(unix)]
+    {
+        // SAFETY: `src` is a valid slice; `fd` is this module's open file.
+        let n = unsafe {
+            libc::pwrite(
+                file.fd,
+                src.as_ptr() as *const libc::c_void,
+                src.len(),
+                offset as libc::off_t,
+            )
+        };
+        if n < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(n as usize)
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::FileExt as _;
+        file.file.seek_write(src, offset)
+    }
+}
+
+/// Split `relative` into the components to walk, refusing the shapes that
+/// cannot be trusted. Shared, so the two platforms cannot come to disagree
+/// about what a path may contain.
+fn split_components(relative: &str) -> Result<Vec<&str>, String> {
+    if relative.starts_with('/') || relative.starts_with('\\') {
+        return Err("path is absolute; it must be relative to the root".to_owned());
+    }
+    // Both separators, because Windows accepts either and a backslash must not
+    // hide a component boundary from the checks below.
+    let components: Vec<&str> = relative
+        .split(['/', '\\'])
+        .filter(|c| !c.is_empty())
+        .collect();
+    if components.is_empty() {
+        return Err("path names the root itself, not a file in it".to_owned());
+    }
+    for c in &components {
+        if let Some(why) = component_is_refused(c) {
+            return Err(format!("refused component {c:?}: {why}"));
+        }
+    }
+    Ok(components)
+}
+
+#[cfg(windows)]
+const OBJ_CASE_INSENSITIVE: u32 = 0x0000_0040;
+/// Refuse a reparse point instead of following it — the `O_NOFOLLOW` of this
+/// platform. Without it a junction under a granted folder is walked through
+/// exactly as a symlink would be.
+#[cfg(windows)]
+const OBJ_DONT_REPARSE: u32 = 0x0000_1000;
+
+#[cfg(windows)]
+fn win_open_root(root: &str) -> Result<windows_sys::Win32::Foundation::HANDLE, String> {
+    use std::os::windows::ffi::OsStrExt as _;
+    use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+    use windows_sys::Win32::Storage::FileSystem::{
+        CreateFileW, FILE_FLAG_BACKUP_SEMANTICS, FILE_LIST_DIRECTORY, FILE_SHARE_DELETE,
+        FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
+    };
+
+    let wide: Vec<u16> = std::ffi::OsStr::new(root)
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    // FILE_FLAG_BACKUP_SEMANTICS is what lets a DIRECTORY be opened at all.
+    // SAFETY: `wide` is NUL-terminated and outlives the call.
+    let handle = unsafe {
+        CreateFileW(
+            wide.as_ptr(),
+            FILE_LIST_DIRECTORY,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            std::ptr::null(),
+            OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS,
+            std::ptr::null_mut(),
+        )
+    };
+    if handle == INVALID_HANDLE_VALUE || handle.is_null() {
+        return Err(format!("cannot open the root: {}", last_error()));
+    }
+    Ok(handle)
+}
+
+/// One step of the walk: open `name` relative to `dir`, refusing a reparse
+/// point. `directory` picks between a directory component and the leaf.
+#[cfg(windows)]
+fn win_open_at(
+    dir: windows_sys::Win32::Foundation::HANDLE,
+    name: &str,
+    directory: bool,
+    create: bool,
+) -> Result<windows_sys::Win32::Foundation::HANDLE, String> {
+    use std::os::windows::ffi::OsStrExt as _;
+    use windows_sys::Wdk::Foundation::OBJECT_ATTRIBUTES;
+    use windows_sys::Wdk::Storage::FileSystem::NtCreateFile;
+    use windows_sys::Win32::Foundation::{STATUS_SUCCESS, UNICODE_STRING};
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_ATTRIBUTE_NORMAL, FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_SHARE_DELETE,
+        FILE_SHARE_READ, FILE_SHARE_WRITE, SYNCHRONIZE,
+    };
+
+    // NT create dispositions and options, from the DDK. `FILE_CREATE` is the
+    // `O_CREAT | O_EXCL` of this platform: it fails if the name exists, which
+    // is what keeps a pre-created name from being opened and truncated.
+    const FILE_OPEN: u32 = 0x0000_0001;
+    const FILE_CREATE: u32 = 0x0000_0002;
+    const FILE_DIRECTORY_FILE: u32 = 0x0000_0001;
+    const FILE_NON_DIRECTORY_FILE: u32 = 0x0000_0040;
+    const FILE_SYNCHRONOUS_IO_NONALERT: u32 = 0x0000_0020;
+    const STATUS_REPARSE_POINT_ENCOUNTERED: i32 = 0xC000_050B_u32 as i32;
+
+    let mut wide: Vec<u16> = std::ffi::OsStr::new(name).encode_wide().collect();
+    let bytes = (wide.len() * 2) as u16;
+    let mut unicode = UNICODE_STRING {
+        Length: bytes,
+        MaximumLength: bytes,
+        Buffer: wide.as_mut_ptr(),
+    };
+    let mut attrs = OBJECT_ATTRIBUTES {
+        Length: std::mem::size_of::<OBJECT_ATTRIBUTES>() as u32,
+        RootDirectory: dir,
+        ObjectName: &mut unicode,
+        // The whole point: the name is resolved under `dir`, and a reparse
+        // point encountered on the way is an error rather than a hop.
+        Attributes: OBJ_CASE_INSENSITIVE | OBJ_DONT_REPARSE,
+        SecurityDescriptor: std::ptr::null_mut(),
+        SecurityQualityOfService: std::ptr::null_mut(),
+    };
+    let mut handle = std::ptr::null_mut();
+    let mut iosb = unsafe { std::mem::zeroed() };
+    let access = if create {
+        FILE_GENERIC_WRITE | SYNCHRONIZE
+    } else {
+        FILE_GENERIC_READ | SYNCHRONIZE
+    };
+    let options = FILE_SYNCHRONOUS_IO_NONALERT
+        | if directory {
+            FILE_DIRECTORY_FILE
+        } else {
+            FILE_NON_DIRECTORY_FILE
+        };
+    // SAFETY: every pointer above is valid for the duration of the call, and
+    // `wide`/`unicode`/`attrs` outlive it.
+    let status = unsafe {
+        NtCreateFile(
+            &mut handle,
+            access,
+            &mut attrs,
+            &mut iosb,
+            std::ptr::null(),
+            FILE_ATTRIBUTE_NORMAL,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            if create { FILE_CREATE } else { FILE_OPEN },
+            options,
+            std::ptr::null(),
+            0,
+        )
+    };
+    if status != STATUS_SUCCESS {
+        return Err(if status == STATUS_REPARSE_POINT_ENCOUNTERED {
+            format!("{name:?} is a reparse point; it was not followed")
+        } else {
+            format!("cannot open {name:?} beneath the root (NTSTATUS {status:#x})")
+        });
+    }
+    Ok(handle)
+}
+
+/// The walk, Windows spelling. Same rule as [`walk_to_parent`]: components are
+/// refused before any call, and each step resolves under the handle the last
+/// one returned.
+#[cfg(windows)]
+fn win_walk_to_parent(
+    root: &str,
+    relative: &str,
+) -> Result<(windows_sys::Win32::Foundation::HANDLE, String), String> {
+    use windows_sys::Win32::Foundation::CloseHandle;
+
+    let components = split_components(relative)?;
+    let mut dir = win_open_root(root)?;
+    let leaf = components[components.len() - 1].to_owned();
+    for comp in &components[..components.len() - 1] {
+        let next = match win_open_at(dir, comp, true, false) {
+            Ok(h) => h,
+            Err(e) => {
+                // SAFETY: `dir` is a handle this function opened.
+                unsafe { CloseHandle(dir) };
+                return Err(e);
+            }
+        };
+        // SAFETY: closing the handle this step walked away from.
+        unsafe { CloseHandle(dir) };
+        dir = next;
+    }
+    Ok((dir, leaf))
+}
+
+#[cfg(windows)]
+fn open_beneath(root: &str, relative: &str) -> Result<VeilFsFile, String> {
+    use std::os::windows::io::FromRawHandle as _;
+    use windows_sys::Win32::Foundation::CloseHandle;
+
+    let (dir, leaf) = win_walk_to_parent(root, relative)?;
+    let handle = win_open_at(dir, &leaf, false, false);
+    // SAFETY: `dir` is open and finished with.
+    unsafe { CloseHandle(dir) };
+    let handle = handle?;
+    // SAFETY: `handle` is a fresh file handle this module owns.
+    let file = unsafe { std::fs::File::from_raw_handle(handle as *mut _) };
+    let len = file
+        .metadata()
+        .map_err(|e| format!("cannot stat the opened file: {e}"))?
+        .len();
+    Ok(VeilFsFile { file, len })
+}
+
+#[cfg(windows)]
+fn create_beneath(root: &str, relative: &str) -> Result<VeilFsFile, String> {
+    use std::os::windows::io::FromRawHandle as _;
+    use windows_sys::Win32::Foundation::CloseHandle;
+
+    let (dir, leaf) = win_walk_to_parent(root, relative)?;
+    let handle = win_open_at(dir, &leaf, false, true);
+    // SAFETY: `dir` is open and finished with.
+    unsafe { CloseHandle(dir) };
+    let handle = handle?;
+    // SAFETY: `handle` is a fresh file handle this module owns.
+    let file = unsafe { std::fs::File::from_raw_handle(handle as *mut _) };
+    Ok(VeilFsFile { file, len: 0 })
+}
+
+#[cfg(windows)]
+fn last_error() -> String {
+    std::io::Error::last_os_error().to_string()
 }
 
 #[cfg(unix)]
@@ -222,18 +513,7 @@ fn open_beneath(root: &str, relative: &str) -> Result<VeilFsFile, String> {
 fn walk_to_parent(root: &str, relative: &str) -> Result<(c_int, CString), String> {
     use std::os::unix::ffi::OsStrExt as _;
 
-    if relative.starts_with('/') {
-        return Err("path is absolute; it must be relative to the root".to_owned());
-    }
-    let components: Vec<&str> = relative.split('/').filter(|c| !c.is_empty()).collect();
-    if components.is_empty() {
-        return Err("path names the root itself, not a file in it".to_owned());
-    }
-    for c in &components {
-        if let Some(why) = component_is_refused(c) {
-            return Err(format!("refused component {c:?}: {why}"));
-        }
-    }
+    let components = split_components(relative)?;
 
     let root_c = CString::new(std::ffi::OsStr::new(root).as_bytes())
         .map_err(|_| "NUL in root".to_owned())?;
@@ -353,19 +633,14 @@ pub unsafe extern "C" fn veil_fs_create_beneath(
     relative: *const c_char,
     err_out: *mut *mut c_char,
 ) -> *mut VeilFsFile {
-    #[cfg(not(unix))]
+    #[cfg(not(any(unix, windows)))]
     {
         let _ = (root, relative);
-        unsafe {
-            set_err(
-                err_out,
-                "veil_fs_create_beneath is POSIX-only; the caller keeps its own check on this host",
-            )
-        };
+        unsafe { set_err(err_out, "veil_fs_create_beneath is POSIX-only") };
         std::ptr::null_mut()
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     {
         if root.is_null() || relative.is_null() {
             unsafe { set_err(err_out, "null path") };
@@ -409,14 +684,14 @@ pub unsafe extern "C" fn veil_fs_write(
     len: size_t,
     err_out: *mut *mut c_char,
 ) -> isize {
-    #[cfg(not(unix))]
+    #[cfg(not(any(unix, windows)))]
     {
         let _ = (handle, offset, buf, len);
         unsafe { set_err(err_out, "veil_fs_write is POSIX-only") };
         -1
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     {
         if handle.is_null() || buf.is_null() {
             unsafe { set_err(err_out, "null handle or buffer") };
@@ -425,19 +700,14 @@ pub unsafe extern "C" fn veil_fs_write(
         // SAFETY: the caller guarantees `handle` is live and unclosed.
         let file = unsafe { &*handle };
         // SAFETY: `buf` is readable for `len` bytes per the contract above.
-        let n = unsafe {
-            libc::pwrite(
-                file.fd,
-                buf as *const libc::c_void,
-                len,
-                offset as libc::off_t,
-            )
-        };
-        if n < 0 {
-            unsafe { set_err(err_out, &format!("write failed: {}", last_error())) };
-            return -1;
+        let src = unsafe { std::slice::from_raw_parts(buf, len) };
+        match write_at(file, offset, src) {
+            Ok(n) => n as isize,
+            Err(e) => {
+                unsafe { set_err(err_out, &format!("write failed: {e}")) };
+                -1
+            }
         }
-        n as isize
     }
 }
 
@@ -458,14 +728,14 @@ pub unsafe extern "C" fn veil_fs_read(
     len: size_t,
     err_out: *mut *mut c_char,
 ) -> isize {
-    #[cfg(not(unix))]
+    #[cfg(not(any(unix, windows)))]
     {
         let _ = (handle, offset, buf, len);
         unsafe { set_err(err_out, "veil_fs_read is POSIX-only") };
         -1
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     {
         if handle.is_null() || buf.is_null() {
             unsafe { set_err(err_out, "null handle or buffer") };
@@ -474,19 +744,14 @@ pub unsafe extern "C" fn veil_fs_read(
         // SAFETY: the caller guarantees `handle` is live and unclosed.
         let file = unsafe { &*handle };
         // SAFETY: `buf` is writable for `len` bytes per the contract above.
-        let n = unsafe {
-            libc::pread(
-                file.fd,
-                buf as *mut libc::c_void,
-                len,
-                offset as libc::off_t,
-            )
-        };
-        if n < 0 {
-            unsafe { set_err(err_out, &format!("read failed: {}", last_error())) };
-            return -1;
+        let out = unsafe { std::slice::from_raw_parts_mut(buf, len) };
+        match read_at(file, offset, out) {
+            Ok(n) => n as isize,
+            Err(e) => {
+                unsafe { set_err(err_out, &format!("read failed: {e}")) };
+                -1
+            }
         }
-        n as isize
     }
 }
 
@@ -734,6 +999,179 @@ mod tests {
             b"authorized",
             "the read followed the name rather than the descriptor"
         );
+        std::fs::remove_dir_all(&root).ok();
+    }
+}
+
+#[cfg(all(test, windows))]
+mod windows_tests {
+    use super::*;
+
+    /// A directory nobody else in this run will get. Same reason as the POSIX
+    /// side: these run in parallel threads of one process.
+    fn scratch() -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let mut p = std::env::temp_dir();
+        p.push(format!(
+            "veil-fs-beneath-win-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&p).unwrap();
+        p
+    }
+
+    fn read_all(file: &VeilFsFile) -> Vec<u8> {
+        let mut out = vec![0u8; file.len as usize];
+        let n = read_at(file, 0, &mut out).unwrap();
+        out.truncate(n);
+        out
+    }
+
+    /// A JUNCTION, which is what a symlink to a directory is on this platform
+    /// that an ordinary user can actually create — `mklink /D` needs the
+    /// developer mode or an elevated shell, `mklink /J` does not. It is also
+    /// the shape that matters: a reparse point under a granted folder.
+    fn junction(link: &std::path::Path, target: &std::path::Path) -> bool {
+        std::process::Command::new("cmd")
+            .args([
+                "/C",
+                "mklink",
+                "/J",
+                &link.to_string_lossy(),
+                &target.to_string_lossy(),
+            ])
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    }
+
+    /// The ordinary case, so every refusal below means something.
+    #[test]
+    fn a_real_file_beneath_the_root_opens_and_reads() {
+        let root = scratch();
+        std::fs::create_dir(root.join("sub")).unwrap();
+        std::fs::write(root.join("sub/f.txt"), b"hello").unwrap();
+
+        let file = open_beneath(root.to_str().unwrap(), "sub/f.txt").expect("open");
+        assert_eq!(file.len, 5);
+        assert_eq!(read_all(&file), b"hello");
+        drop(file);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// A reparse point on the way is REFUSED, not walked through.
+    ///
+    /// This is the whole Windows claim. `OBJ_DONT_REPARSE` is what makes
+    /// `NtCreateFile` fail here instead of resolving the junction, and without
+    /// it the walk would leave the granted folder exactly as a symlink walk
+    /// does on POSIX.
+    #[test]
+    fn a_junction_component_is_refused() {
+        let root = scratch();
+        let outside = scratch();
+        std::fs::write(outside.join("f.txt"), b"not yours").unwrap();
+        if !junction(&root.join("link"), &outside) {
+            // Nothing to say if the host would not make one; a silent pass
+            // would be worse than saying so.
+            eprintln!("SKIP: mklink /J unavailable on this host");
+            return;
+        }
+
+        let err = open_beneath(root.to_str().unwrap(), "link/f.txt").unwrap_err();
+        assert!(
+            err.contains("reparse point"),
+            "a junction must be refused as one: {err}"
+        );
+        // CONTROL: the ordinary path DOES walk through it, which is the gap.
+        assert_eq!(
+            std::fs::read(root.join("link/f.txt")).unwrap(),
+            b"not yours",
+            "if the plain read also refused, this test would prove nothing"
+        );
+        std::fs::remove_dir_all(&root).ok();
+        std::fs::remove_dir_all(&outside).ok();
+    }
+
+    /// `..` is refused rather than resolved, as on POSIX.
+    #[test]
+    fn a_parent_component_is_refused() {
+        let root = scratch();
+        std::fs::create_dir(root.join("sub")).unwrap();
+        std::fs::write(root.join("f.txt"), b"inside").unwrap();
+        let err = open_beneath(root.to_str().unwrap(), "sub/../f.txt").unwrap_err();
+        assert!(err.contains(".."), "{err}");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// A backslash is a separator here too, so it cannot hide a component.
+    #[test]
+    fn a_backslash_separates_components_as_well() {
+        let root = scratch();
+        std::fs::create_dir(root.join("sub")).unwrap();
+        std::fs::write(root.join("sub/f.txt"), b"hello").unwrap();
+        let file = open_beneath(root.to_str().unwrap(), r"sub\f.txt").expect("open");
+        assert_eq!(read_all(&file), b"hello");
+        drop(file);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// Creating: the ordinary case, and then the two refusals.
+    #[test]
+    fn a_new_file_is_created_and_an_existing_name_is_refused() {
+        let root = scratch();
+        let file = create_beneath(root.to_str().unwrap(), "new.bin").expect("create");
+        assert_eq!(write_at(&file, 0, b"written").unwrap(), 7);
+        drop(file);
+        assert_eq!(std::fs::read(root.join("new.bin")).unwrap(), b"written");
+
+        let err = create_beneath(root.to_str().unwrap(), "new.bin").unwrap_err();
+        assert!(err.contains("cannot open"), "{err}");
+        assert_eq!(
+            std::fs::read(root.join("new.bin")).unwrap(),
+            b"written",
+            "the existing file was truncated"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// THE POINT OF THE WALK, and on this platform the OS states it first.
+    ///
+    /// The POSIX twin of this test renames the directory out from under the
+    /// open handle and checks that the read is unaffected. Windows does not
+    /// allow the rename at all while a file inside is open — it answers
+    /// ACCESS_DENIED — so the substitution the finding describes cannot even
+    /// be staged here. That is a stronger guarantee than POSIX gives, not a
+    /// weaker one, and this test asserts what actually happens rather than
+    /// carrying over a scenario the platform forbids.
+    ///
+    /// Both halves matter: the rename must fail AND the handle must keep
+    /// answering with the authorized bytes. A refusal alone would also be
+    /// satisfied by a handle that had died.
+    #[test]
+    fn an_open_handle_blocks_the_swap_outright() {
+        let root = scratch();
+        std::fs::create_dir(root.join("a")).unwrap();
+        std::fs::write(root.join("a/f.txt"), b"authorized").unwrap();
+        std::fs::create_dir(root.join("evil")).unwrap();
+        std::fs::write(root.join("evil/f.txt"), b"substituted").unwrap();
+
+        let file = open_beneath(root.to_str().unwrap(), "a/f.txt").expect("open");
+        assert!(
+            std::fs::rename(root.join("a"), root.join("gone")).is_err(),
+            "the directory was renamed while a file inside it was open"
+        );
+        assert_eq!(
+            read_all(&file),
+            b"authorized",
+            "the handle stopped answering, so the refusal above proves nothing"
+        );
+        drop(file);
+        // And once the handle is gone the rename is ordinary again — the
+        // control for the assertion above, which would otherwise pass on a
+        // filesystem that refuses every rename.
+        assert!(std::fs::rename(root.join("a"), root.join("gone")).is_ok());
         std::fs::remove_dir_all(&root).ok();
     }
 }
