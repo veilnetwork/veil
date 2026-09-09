@@ -20,6 +20,7 @@ mod identity_loaders;
 mod identity_publish;
 mod identity_state;
 mod ip_slot;
+mod ipc_bridges;
 mod lifecycle;
 mod mailbox_state;
 mod maintenance;
