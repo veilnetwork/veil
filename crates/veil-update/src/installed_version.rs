@@ -61,6 +61,13 @@ pub enum InstalledVersionError {
     /// [`Self::Malformed`] or [`Self::MacFailure`].
     #[error("parse installed-version file: {0}")]
     Parse(String),
+    /// A commit would have moved the anti-downgrade floor DOWN. See
+    /// [`InstalledVersionStore::commit`].
+    #[error(
+        "refusing to record release {offered}: {recorded} is already installed and the \
+         anti-downgrade floor does not move backwards"
+    )]
+    WouldLowerFloor { recorded: u64, offered: u64 },
 }
 
 /// JSON shape on disk. Public for callers that want to read a
@@ -298,6 +305,35 @@ impl InstalledVersionStore {
         bytes.push(b'\n');
         atomic_write(&self.path, &bytes)?;
         Ok(())
+    }
+
+    /// Record `release_unix` as installed, refusing to move the floor DOWN.
+    ///
+    /// [`Self::write`] replaces whatever is there; this one COMMITS. The
+    /// difference is what an apply needs: two applies of correctly signed
+    /// releases can overlap — neither the library nor the CLI serialises them
+    /// — and the older one, having read the floor before the newer one moved
+    /// it, would finish afterwards and write its own smaller timestamp over
+    /// the top. A floor that goes down is the anti-downgrade invariant itself,
+    /// and the re-signed older release it re-admits is a downgrade that passes
+    /// every signature check (report24 UPDATE-P4-M2).
+    ///
+    /// So the value is re-read HERE, inside the commit, rather than trusted
+    /// from the read that started the apply several file operations ago.
+    /// Equal is allowed: re-applying the release that is already installed is
+    /// idempotent, not a downgrade.
+    ///
+    /// Returns what was recorded before.
+    pub fn commit(&self, release_unix: u64) -> Result<u64, InstalledVersionError> {
+        let recorded = self.read_release_unix_for_apply()?.unwrap_or(0);
+        if release_unix < recorded {
+            return Err(InstalledVersionError::WouldLowerFloor {
+                recorded,
+                offered: release_unix,
+            });
+        }
+        self.write(release_unix)?;
+        Ok(recorded)
     }
 
     /// Convenience: read just the `release_unix` value, mapping
@@ -694,5 +730,99 @@ mod tests {
         let path = unique_path("c08-missing");
         let store = InstalledVersionStore::with_hmac_key(path, [0u8; 32]);
         assert_eq!(store.read_release_unix_for_apply().unwrap(), None);
+    }
+}
+
+#[cfg(test)]
+mod commit_floor_tests {
+    use super::*;
+
+    /// Removes the record when the test ends, however it ends.
+    struct Cleanup(std::path::PathBuf);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+    fn scopeguard(path: &std::path::Path) -> Cleanup {
+        Cleanup(path.to_path_buf())
+    }
+
+    /// Its own, rather than the neighbouring module's private one: reaching
+    /// into another test module is how a helper acquires callers it was never
+    /// written for.
+    fn record_path(label: &str) -> std::path::PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::SystemTime::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        std::env::temp_dir().join(format!(
+            "veil-commit-floor-{label}-{}-{nanos}.json",
+            std::process::id()
+        ))
+    }
+
+    /// The floor moves up, or it does not move.
+    ///
+    /// Two applies of correctly signed releases can overlap — the CLI starts
+    /// one per invocation and the library serialises nothing — and the older
+    /// one reads the floor BEFORE the newer one commits, then writes its own
+    /// smaller timestamp on the way out. `write` did exactly as it was told;
+    /// this is the call the apply path makes instead (report24 UPDATE-P4-M2).
+    #[test]
+    fn a_commit_cannot_move_the_floor_backwards() {
+        let path = record_path("plain");
+        let s = InstalledVersionStore::new(path.clone());
+        let _cleanup = scopeguard(&path);
+
+        assert_eq!(s.commit(2_000_000_000).expect("first commit"), 0);
+        // The overtaking apply.
+        assert_eq!(
+            s.commit(2_100_000_000).expect("newer commit"),
+            2_000_000_000
+        );
+
+        // The older one, finishing late.
+        let refused = s
+            .commit(2_000_000_000)
+            .expect_err("a lower commit must be refused");
+        assert!(
+            matches!(
+                refused,
+                InstalledVersionError::WouldLowerFloor {
+                    recorded: 2_100_000_000,
+                    offered: 2_000_000_000,
+                }
+            ),
+            "refused for the wrong reason: {refused}",
+        );
+        assert_eq!(
+            s.read_release_unix().expect("read").unwrap_or(0),
+            2_100_000_000,
+            "the refusal still left the older value on disk",
+        );
+
+        // Re-applying what is already installed is idempotent, not a
+        // downgrade — an interrupted apply retries through exactly this.
+        assert_eq!(
+            s.commit(2_100_000_000).expect("equal commit"),
+            2_100_000_000
+        );
+    }
+
+    /// The same, with the record authenticated: the MAC is over the value, so
+    /// a refusal must not be reachable by writing an unauthenticated one.
+    #[test]
+    fn a_keyed_store_commits_by_the_same_rule() {
+        let path = record_path("keyed");
+        let s = InstalledVersionStore::with_hmac_key(path.clone(), [0x11; 32]);
+        let _cleanup = scopeguard(&path);
+
+        s.commit(2_100_000_000).expect("commit");
+        assert!(matches!(
+            s.commit(1_000_000_000),
+            Err(InstalledVersionError::WouldLowerFloor { .. })
+        ));
+        assert_eq!(s.read_release_unix().expect("read"), Some(2_100_000_000));
     }
 }

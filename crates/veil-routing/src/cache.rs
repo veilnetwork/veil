@@ -66,6 +66,16 @@ pub struct CacheEntrySnapshot {
     /// added so that old files remain valid.
     #[serde(default)]
     pub contact_count: u32,
+    /// The provenance half of `score` — see [`RouteCacheEntry::policy_penalty`].
+    ///
+    /// Persisted for the same reason it is kept in memory: a restored route is
+    /// rescored by the first probe reply that reaches its next hop, and a
+    /// penalty that did not survive the restart would be dropped there. Old
+    /// snapshots read as `0`, which restores them exactly as they were written
+    /// — their `score` already carries whatever floor applied at the time, and
+    /// the first fresh announcement replaces the entry outright.
+    #[serde(default)]
+    pub policy_penalty: u32,
 }
 
 // ── RouteCacheEntry ───────────────────────────────────────────────────────────
@@ -85,6 +95,22 @@ pub struct RouteCacheEntry {
     /// Typical range: `hop_count * 10_000` (direct peer = 10 000) up to
     /// `~250_000_000` for a high-latency, low-reachability multi-hop path.
     pub score: u32,
+    /// The part of [`Self::score`] that is a POLICY decision about where this
+    /// route came from, rather than a measurement of how it is doing.
+    ///
+    /// A neighbour's announcement about a third node is a claim: its signature
+    /// proves the neighbour said it, not that the path exists. The dispatcher
+    /// therefore adds a fixed floor so such a route can never look cheaper than
+    /// one this node confirmed itself — and then a probe reply rescored the
+    /// entry from hop count and reachability alone and the floor was gone, on
+    /// the evidence that the NEIGHBOUR answered, which was never the thing in
+    /// doubt (report24 V4-ROUTE-01).
+    ///
+    /// So it is kept, and [`RouteCache::rescore_via`] re-adds it. Zero for a
+    /// route this node confirmed. The cache does not decide the number: what
+    /// counts as unconfirmed is the dispatcher's policy, and this is the seam
+    /// that keeps it from being recomputed by a formula that never knew.
+    pub policy_penalty: u32,
     /// Number of hops from this node to `dst` via `next_hop`.
     /// `1` for directly connected peers.
     pub hop_count: u8,
@@ -125,6 +151,7 @@ impl Clone for RouteCacheEntry {
         Self {
             next_hop: self.next_hop,
             score: self.score,
+            policy_penalty: self.policy_penalty,
             hop_count: self.hop_count,
             expires_at: self.expires_at,
             last_used: AtomicU64::new(self.last_used.load(Ordering::Relaxed)),
@@ -333,10 +360,29 @@ impl RouteCache {
         hop_count: u8,
         labels: Vec<[u8; veil_proto::budget::LABEL_WIDTH]>,
     ) {
+        self.insert_scored(dst_node_id, next_hop, score, 0, hop_count, labels);
+    }
+
+    /// [`Self::insert_labelled`] with the two halves of the cost apart.
+    ///
+    /// `dynamic_score` is what a rescore may recompute — hop count, measured
+    /// reachability. `policy_penalty` is what it must not: see
+    /// [`RouteCacheEntry::policy_penalty`]. The entry's `score` is their sum,
+    /// so ordering is unchanged and only the memory of WHY is new.
+    pub fn insert_scored(
+        &mut self,
+        dst_node_id: [u8; 32],
+        next_hop: [u8; 32],
+        dynamic_score: u32,
+        policy_penalty: u32,
+        hop_count: u8,
+        labels: Vec<[u8; veil_proto::budget::LABEL_WIDTH]>,
+    ) {
         let now = Instant::now();
         let new_entry = RouteCacheEntry {
             next_hop,
-            score,
+            score: dynamic_score.saturating_add(policy_penalty),
+            policy_penalty,
             hop_count,
             expires_at: now + self.ttl,
             // fresh insert gets the latest access token so LRU
@@ -684,7 +730,11 @@ impl RouteCache {
                 let mut changed = false;
                 for entry in bucket.iter_mut() {
                     if &entry.next_hop == via {
-                        entry.score = score_fn(entry.hop_count);
+                        // The formula recomputes the DYNAMIC half; the fixed
+                        // half is a fact about the route's provenance and a
+                        // reachable neighbour is not evidence against it.
+                        entry.score =
+                            score_fn(entry.hop_count).saturating_add(entry.policy_penalty);
                         changed = true;
                     }
                 }
@@ -720,6 +770,7 @@ impl RouteCache {
                         score: e.score,
                         hop_count: e.hop_count,
                         contact_count: contact_counts.get(&e.next_hop).copied().unwrap_or(0),
+                        policy_penalty: e.policy_penalty,
                     });
                 }
             }
@@ -752,6 +803,7 @@ impl RouteCache {
             let entry = RouteCacheEntry {
                 next_hop: snap.next_hop,
                 score: snap.score,
+                policy_penalty: snap.policy_penalty,
                 hop_count: snap.hop_count,
                 expires_at: now + self.ttl,
                 // restored stale entries get a fresh access

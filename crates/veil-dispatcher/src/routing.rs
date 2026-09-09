@@ -348,7 +348,13 @@ impl FrameDispatcher {
             .max(MIN_REACHABILITY);
         let raw_score = (base_score_f / reachability * SCORE_MILLIUNIT_SCALE)
             .clamp(0.0, u32::MAX as f32) as u32;
-        let score = if &p.origin_node_id != peer_id.as_bytes() {
+        // The floor is a POLICY component and travels as one, so a later
+        // rescore can put it back. It used to be folded into `score` and lost
+        // there: a probe reply from this neighbour rescored the entry from hop
+        // count and reachability alone, on the evidence that the NEIGHBOUR
+        // answered — which was never what the floor was about (report24
+        // V4-ROUTE-01).
+        let policy_penalty = if &p.origin_node_id != peer_id.as_bytes() {
             // An announcement ABOUT SOMEBODY ELSE is a claim, whatever hop
             // count it carries, so it is clamped to MIN_DIRECT_RELAY_SCORE and
             // can never look cheaper than a RouteResponse we confirmed
@@ -373,13 +379,23 @@ impl FrameDispatcher {
             // a three-hop relay look exactly as good as a one-hop one — the
             // old code had that flaw above hop_count 1, and simply widening
             // the clamp would have spread it to every announcement.
-            MIN_DIRECT_RELAY_SCORE.saturating_add(raw_score)
+            //
+            // The cache adds the two, so the entry's score is what it always
+            // was; what is new is that it remembers which half is which.
+            MIN_DIRECT_RELAY_SCORE
         } else {
             // The peer announcing ITSELF. Its signature, checked above, is
             // exactly the proof that claim needs.
-            raw_score
+            0
         };
-        wlock!(self.route_cache).insert(p.origin_node_id, p.via_node_id, score, p.hop_count);
+        wlock!(self.route_cache).insert_scored(
+            p.origin_node_id,
+            p.via_node_id,
+            raw_score,
+            policy_penalty,
+            p.hop_count,
+            Vec::new(),
+        );
         // Forward if TTL allows, and if this is NEWS rather than repetition.
         if p.ttl > 0
             && p.hop_count < self.max_gossip_hops
