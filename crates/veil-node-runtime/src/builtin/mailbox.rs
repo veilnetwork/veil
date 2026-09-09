@@ -1127,12 +1127,15 @@ pub fn handle_put_message(
     }
 }
 
+/// The first eight bytes of a node id, as sixteen lowercase hex characters.
+///
+/// NOT `veil_util::hex_short`, which takes FOUR bytes and prints eight
+/// characters: substituting it here would silently shorten every id this
+/// module has ever logged. One implementation for the sixteen-character form,
+/// and it is the shared byte formatter rather than a `format!` per byte
+/// (report24, dead-code table).
 pub fn hex_short(node_id: &[u8; 32]) -> String {
-    let mut s = String::with_capacity(16);
-    for b in node_id.iter().take(8) {
-        s.push_str(&format!("{b:02x}"));
-    }
-    s
+    veil_util::bytes_to_hex(&node_id[..8])
 }
 
 #[cfg(test)]

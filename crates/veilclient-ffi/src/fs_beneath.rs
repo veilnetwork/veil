@@ -88,10 +88,19 @@ unsafe fn set_err(err_out: *mut *mut c_char, msg: &str) {
 
 /// Why a path is refused before a single syscall is made.
 ///
-/// Rejected rather than normalised. A caller that meant one of these has a bug,
-/// and quietly reinterpreting it is how a check comes to disagree with what it
-/// checked: `..` in particular is legal to *resolve* and impossible to *trust*,
-/// because the directory it resolves through can be renamed after the check.
+/// Rejected rather than normalised, with ONE exception that belongs to the
+/// caller rather than to this: `split_components` drops empty components, so
+/// `a//b` is read as `a/b`, the way every filesystem this runs on reads it.
+/// The empty arm below is this helper's own floor — its production caller can
+/// never reach it, and a future one that does not filter should not be the
+/// first to discover that (report24, dead-code table). Its behaviour is pinned
+/// by `an_empty_component_is_refused_by_the_helper`.
+///
+/// Everything else is refused outright. A caller that meant one of these has a
+/// bug, and quietly reinterpreting it is how a check comes to disagree with
+/// what it checked: `..` in particular is legal to *resolve* and impossible to
+/// *trust*, because the directory it resolves through can be renamed after the
+/// check.
 fn component_is_refused(c: &str) -> Option<&'static str> {
     if c.is_empty() {
         return Some("empty path component");
@@ -1074,13 +1083,46 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
-    /// A directory, a fifo or a device is not a file to send.
+    /// The refusal helper's own floor, which its caller never reaches.
     ///
-    /// Without this a caller could be pointed at a fifo and would block for as
-    /// long as the other end stayed silent — a stall with no error, which is
-    /// the worst shape a refusal can take.
+    /// `split_components` filters empty components out before asking, so the
+    /// empty arm is unreachable from `open_beneath` / `create_beneath` — which
+    /// is fine, and is not the same as untested. A caller added later that does
+    /// not filter should meet a refusal, not a component that passes every
+    /// check by being nothing at all (report24, dead-code table).
     #[test]
-    fn only_a_regular_file_is_returned() {
+    fn an_empty_component_is_refused_by_the_helper() {
+        assert_eq!(
+            component_is_refused(""),
+            Some("empty path component"),
+            "the helper accepts an empty component, so a caller that does not \
+             filter would resolve one",
+        );
+        assert_eq!(component_is_refused("ok"), None);
+    }
+
+    /// And the caller's side of that contract: repeated separators are the
+    /// filesystem's own reading, not something this refuses.
+    #[test]
+    fn repeated_separators_are_read_the_way_a_filesystem_reads_them() {
+        assert_eq!(split_components("a//b").unwrap(), vec!["a", "b"]);
+        assert_eq!(split_components("a\\\\b").unwrap(), vec!["a", "b"]);
+        assert!(
+            split_components("//").is_err(),
+            "the root itself is not a file"
+        );
+    }
+
+    /// A DIRECTORY is not a file to send.
+    ///
+    /// Named for what it builds. It used to be called
+    /// `only_a_regular_file_is_returned` and its doc spoke of fifos and
+    /// devices, while the fixture created a directory and nothing else — so
+    /// the fifo case, which is the one that STALLS rather than errors, was
+    /// covered by a sentence (report24, dead-code table). It has its own test
+    /// now: `a_fifo_is_refused_without_waiting_for_a_writer`.
+    #[test]
+    fn a_directory_is_refused() {
         let root = scratch();
         std::fs::create_dir(root.join("sub")).unwrap();
         let err = open_beneath(root.to_str().unwrap(), "sub").unwrap_err();
