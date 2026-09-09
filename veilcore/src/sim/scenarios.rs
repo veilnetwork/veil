@@ -3787,10 +3787,8 @@ mod tests {
         // recursive-STORE receiver runs `validate_store_value_by_magic` and
         // drops any payload without a known 2-byte magic prefix (audit cycle-7
         // / N1 signed-store gate), so an arbitrary blob never replicates. Use
-        // node 0's own IdentityDocument bytes — they carry IDENTITY_DOCUMENT_
-        // MAGIC, structurally decode at the gate, and id-type records pass
-        // `mirror_cache_key_ok` for ANY key, so we can place them under an
-        // arbitrary `key` to isolate the on-PUT fan-out path.
+        // node 0's own IdentityDocument bytes — they carry
+        // IDENTITY_DOCUMENT_MAGIC and structurally decode at the gate.
         net.node(0)
             .runtime
             .debug_republish_sovereign_identity()
@@ -3808,10 +3806,27 @@ mod tests {
             .runtime
             .dht_get_local(&doc_key)
             .expect("node 0's IdentityDocument is in its local DHT after republish");
-        // Arbitrary mirror-cache key (id records pass the key-binding gate for
-        // any key); distinct from `doc_key` so we measure the fan-out, not the
-        // canonical-key republish.
-        let key: [u8; 32] = [0xAAu8; 32];
+        // Under its OWN key. This used to publish under an arbitrary one, on
+        // the ground that id-type records passed the key-binding gate for any
+        // key — the pass-through report24 V4-STORE-01 closed, because a write
+        // evicts whatever is in the slot and a record admitted to a slot its
+        // content does not name is how one kind takes another's place.
+        //
+        // What the arbitrary key bought was isolation: nothing else publishes
+        // there, so an arrival could only be this fan-out. The `before` count
+        // below buys the same thing at the canonical key, and the periodic
+        // republish cannot supply it either — this scenario leaves
+        // `republish_interval_secs` at its 1800-second default, while the
+        // scenarios that exercise that path set it to 2.
+        let key = doc_key;
+        let before = (1..n)
+            .filter(|i| net.node(*i).runtime.debug_dht_raw_value(&key).is_some())
+            .count();
+        assert_eq!(
+            before, 0,
+            "{before} peers already held the record before the fan-out ran, so \
+             its arrival afterwards proves nothing",
+        );
 
         // Publish via the K-closest fan-out path (NOT the periodic republish
         // path — this test specifically exercises the synchronous on-PUT

@@ -3218,8 +3218,7 @@ mod tests {
         }
 
         let disk = StuckCold::default();
-        let mut store =
-            TieredStore::with_cold(1, Box::new(disk.clone())).with_max_bytes(100);
+        let mut store = TieredStore::with_cold(1, Box::new(disk.clone())).with_max_bytes(100);
 
         let old = [1u8; 32];
         assert!(
@@ -3231,8 +3230,7 @@ mod tests {
         disk.disk().refuse_eviction = true;
 
         let before = store.total_bytes();
-        let accepted =
-            store.put_with_origin([2u8; 32], vec![0u8; 40], ORIGIN_INTERNAL);
+        let accepted = store.put_with_origin([2u8; 32], vec![0u8; 40], ORIGIN_INTERNAL);
 
         assert!(
             !accepted,

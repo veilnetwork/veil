@@ -469,9 +469,12 @@ impl FrameDispatcher {
                             // record (`put_with_origin_at` overwrites), and getting
                             // re-broadcast network-wide by the republish task.
                             // `mirror_cache_key_ok` enforces canonical-key ==
-                            // `payload.key` for the derivable owner-verified types
-                            // (AP/AT/SB); nc/id/ir/mc pass through unchanged
-                            // (re-verified on the resolver read path). This is the
+                            // `payload.key` for every type whose key its content
+                            // derives — the owner-verified ones (AP/AT/SB) and,
+                            // since report24 V4-STORE-01, the decode-only ones
+                            // too, because a write EVICTS whatever it lands on
+                            // and the resolver's refusal to believe a record does
+                            // not restore the one it displaced. This is the
                             // same binding the FIND_VALUE mirror-cache already applies
                             // (cycle-6 A8) — previously missing on the STORE write
                             // path. Legitimate cross-DHT replication by intermediate
@@ -713,11 +716,14 @@ impl FrameDispatcher {
     /// showed up as a measurable share of an idle node's signature work.
     ///
     /// `None` for every other type, which must keep going through
-    /// `mirror_cache_key_ok` unchanged: either the canonical key is not a
-    /// function of the value, or this gate only decodes the record structurally
-    /// (nc/id/ir/mc) and the resolver read path is the real bound. Only a key
-    /// this call derived from content it verified is ever reported, so a caller
-    /// cannot use `canonical_out` to weaken the binding.
+    /// `mirror_cache_key_ok`: either the canonical key is not a function of the
+    /// value at all (ra/rd), or this gate only DECODES the record (nc/id/ir/mc/
+    /// rk) and cannot report a key it did not verify. Those still get bound —
+    /// `mirror_cache_key_ok` derives the key from the decoded content — because
+    /// a write evicts the incumbent whether or not the writer's record is
+    /// believable (report24 V4-STORE-01). Only a key this call derived from
+    /// content it VERIFIED is reported here, so a caller cannot use
+    /// `canonical_out` to weaken the binding.
     #[allow(clippy::result_large_err)]
     pub(crate) fn validate_store_value_capturing_key(
         &self,
@@ -1159,19 +1165,78 @@ impl FrameDispatcher {
                 Some(record) => record.route.dht_key() == *target_key,
                 None => false,
             }
+        } else if magic == &veil_proto::mlkem_cert::MLKEM_CERT_MAGIC[..] {
+            // DECODE-ONLY types, bound anyway — see the note below.
+            match veil_proto::mlkem_cert::MlKemKeyCert::decode(payload) {
+                Ok(c) => {
+                    veil_proto::mlkem_cert::MlKemKeyCert::dht_key(&c.node_id, &c.instance_id)
+                        == *target_key
+                }
+                Err(_) => false,
+            }
+        } else if magic == &veil_proto::identity_document::IDENTITY_DOCUMENT_MAGIC[..] {
+            match veil_proto::identity_document::IdentityDocument::decode(payload) {
+                Ok(d) => {
+                    veil_proto::identity_document::IdentityDocument::dht_key(&d.node_id)
+                        == *target_key
+                }
+                Err(_) => false,
+            }
+        } else if magic == &veil_proto::instance_registry::INSTANCE_REGISTRY_MAGIC[..] {
+            match veil_proto::instance_registry::InstanceRegistry::decode(payload) {
+                Ok(r) => {
+                    veil_proto::instance_registry::InstanceRegistry::dht_key(&r.node_id)
+                        == *target_key
+                }
+                Err(_) => false,
+            }
+        } else if magic == &veil_proto::relay_key::RELAY_KEY_MAGIC[..] {
+            match veil_proto::relay_key::RelayKeyRecord::decode(payload) {
+                Ok(r) => veil_proto::relay_key::RelayKeyRecord::dht_key(&r.node_id) == *target_key,
+                Err(_) => false,
+            }
+        } else if magic == &veil_proto::name_claim_v2::NAME_CLAIM_MAGIC[..] {
+            // The claim's own name, normalised the way the publisher normalises
+            // it before keying — the wire field is already normalised ASCII, and
+            // running it through again costs nothing and accepts both shapes.
+            match veil_proto::name_claim_v2::NameClaim::decode(payload) {
+                Ok(claim) => match veil_proto::name_claim_v2::normalize_name(&claim.name) {
+                    Ok(name) => veil_proto::name_claim_v2::NameClaim::dht_key(&name) == *target_key,
+                    Err(_) => false,
+                },
+                Err(_) => false,
+            }
         } else {
-            // nc / id / ir / mc: caching left unchanged (returns true). The
-            // canonical key IS structurally derivable from the record's
-            // node_id (+ name / instance) fields, but at THIS gate those fields
-            // are attacker-controlled (the record is structurally decoded, not
-            // signature-verified — verification happens on the resolver read
-            // path, which is the real bound). Adding a key-derivation check here
-            // would not meaningfully help: an attacker can set node_id to make
-            // the derived key equal target_key, and the resolver re-verifies and
-            // rejects the forged record regardless. (The owner-VERIFIED types
-            // above — AppEndpoint / Attachment — are different: they ARE
-            // verified at this gate, so binding their key to target_key is the
-            // one missing check, which this method adds.)
+            // ra / rd: left unchanged. Their keys are not a function of the
+            // record's own content — a rendezvous advertisement is keyed by the
+            // meeting point, a relay directory by the directory itself — so
+            // there is nothing here to compare a target against.
+            //
+            // The five arms above USED to be here, under this reasoning: the
+            // record is decoded structurally rather than signature-verified, its
+            // node_id is therefore attacker-controlled, and "an attacker can set
+            // node_id to make the derived key equal target_key" — so the check
+            // buys nothing and the resolver read path is the real bound.
+            //
+            // That argument answers the wrong question. It is about a FORGED
+            // record being believed, which the resolver does refuse. This gate
+            // decides where a record may be WRITTEN, and a write replaces
+            // whatever was there: `put_with_origin_at` removes the incumbent
+            // before inserting, with no comparison of the previous value's type,
+            // owner or signature. So a peer's own perfectly valid ML-KEM
+            // certificate, stored under a victim's AppEndpoint key, evicted that
+            // AppEndpoint — and the resolver's refusal to read the certificate as
+            // an endpoint does not bring the endpoint back (report24 V4-STORE-01).
+            //
+            // Setting node_id does not help the attacker either, and that is the
+            // half the old note got backwards: the derived key is a hash of the
+            // fields, so hitting a CHOSEN target key means finding a preimage.
+            // Binding the key to the content means an attacker can only write
+            // where their own record belongs. Every publisher already stores
+            // these at exactly this key (`veil-identity/src/publish.rs`), and the
+            // resolver already refuses a document served for a different
+            // identity than the slot asked for, so this is the write-side half
+            // of a binding the read side has all along.
             true
         }
     }

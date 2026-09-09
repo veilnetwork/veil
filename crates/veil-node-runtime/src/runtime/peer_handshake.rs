@@ -871,24 +871,26 @@ pub async fn register_connection_session(
     if let Some(ref expected_peer) = expected_peer {
         match verify_remote_peer_identity(&remote_identity, expected_peer) {
             Ok(()) => {
-                // THE PROOF, written down. `persist_discovered_peers` keeps
-                // only peers this node actually reached, and it reads that
-                // from `handshaked` — but nothing outside the snapshot RESTORE
-                // ever put anything in. On a fresh install the set therefore
-                // started empty and stayed empty, so no peer learned at a
-                // meeting point, by exchange, or any other way was ever
-                // written to disk. Every cold start walked the rendezvous
-                // again from nothing.
+                // NOT WRITTEN DOWN HERE, and that is the point.
                 //
-                // The removal beside it has always been here — an identity
-                // mismatch takes the id back out — which is what a set with
-                // only takers looks like.
+                // This used to record the proof, on the reading that nothing
+                // outside the snapshot restore ever put anything into
+                // `handshaked` — so a peer learned at a meeting point was
+                // never persisted and every cold start walked the rendezvous
+                // again. The reading was wrong: the insert further down this
+                // same function has been there all along, and it is the one
+                // whose return value decides whether to WRITE THE FILE.
                 //
-                // Recorded for every proven row; the snapshot's own filters
-                // decide which of them are ours to persist.
-                lock_state(&runtime.state)
-                    .handshaked
-                    .insert(*remote_identity.node_id.as_bytes());
+                // So this line did not add a proof, it consumed one. The set
+                // already held the id by the time that insert ran, `insert`
+                // returned false, `newly_proven` was false, and the first peer
+                // this node reached was never written out — the precise
+                // failure it was added to fix, moved one step later
+                // (report24 RUNTIME-1).
+                //
+                // One decision, at the point that has the whole answer: after
+                // the listener's allowlist has accepted the peer, which is
+                // where "we actually reached them" becomes true.
             }
             Err(PeerVerificationError::IdentityMismatch(message)) => {
                 runtime.logger.warn(

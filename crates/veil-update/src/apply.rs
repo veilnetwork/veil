@@ -408,6 +408,31 @@ pub fn apply_update(
     let tmp_path = veil_util::write_executable_staged(install_path, binary_bytes)?;
     let binary_marked_executable = cfg!(unix);
 
+    // Step 3′: THE FLOOR AGAIN, immediately before anything destructive.
+    //
+    // The check in step 2 is now several file operations old — a download's
+    // worth of wall clock in the caller, plus staging a whole binary here — and
+    // nothing serialises two applies. A concurrent apply of a NEWER release
+    // that committed in that window has moved the floor, and continuing would
+    // replace its binary with this older one (report24 UPDATE-P4-M2).
+    //
+    // This narrows the window to the rename itself rather than closing it: two
+    // applies can still interleave between this read and the rename below, and
+    // the binary that lands is then whichever renamed last. What CANNOT happen
+    // either way is a lowered floor — `store.commit` re-reads and refuses —
+    // so a re-signed older release is never re-admitted afterwards. Closing the
+    // remaining window needs a lock the two processes share, which is a
+    // platform decision this crate has not made.
+    let floor_now =
+        crate::installed_version::anti_downgrade_floor(store.read_release_unix_for_apply()?);
+    if manifest.release_unix <= floor_now {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(ApplyError::AntiDowngrade {
+            manifest: manifest.release_unix,
+            installed: floor_now,
+        });
+    }
+
     // Step 3a (Windows-only):.old-shuffle to make room for the
     // new binary BEFORE the rename. Windows' MoveFileEx with
     // REPLACE_EXISTING fails ERROR_ACCESS_DENIED when the target
@@ -497,7 +522,12 @@ pub fn apply_update(
     // is updated but state file lags — next apply re-runs cleanly
     // (sha256 still matches; anti-downgrade still passes against
     // OLD installed value); no silent corruption.
-    store.write(manifest.release_unix)?;
+    //
+    // `commit`, not `write`: it re-reads and refuses to move the floor down,
+    // so an apply that lost a race to a newer release cannot un-commit it
+    // (report24 UPDATE-P4-M2). The binary is already in place at this point,
+    // which is why this is the second guard rather than the only one.
+    store.commit(manifest.release_unix)?;
 
     Ok(ApplyOutcome {
         previous_release_unix: previous,
@@ -820,6 +850,64 @@ mod tests {
         let mut h = Sha256::new();
         h.update(data);
         h.finalize().into()
+    }
+
+    /// The floor is read again after staging and BEFORE anything destructive.
+    ///
+    /// A source-order check, and deliberately so. Two applies racing is a
+    /// schedule, not a state: the second read only differs from the first when
+    /// another process commits in the window between them, and there is no
+    /// hook here to make that happen at a chosen moment — a test that spawned a
+    /// thread and hoped to land inside a microsecond-wide staging window would
+    /// pass by luck and fail by load. What CAN be checked exactly is the thing
+    /// that was wrong: the floor was consulted once, at the top, and the binary
+    /// was replaced on the strength of a value several file operations old
+    /// (report24 UPDATE-P4-M2).
+    ///
+    /// The other half of that fix — a commit that cannot move the floor down —
+    /// is behaviour, and `installed_version::commit_floor_tests` runs it.
+    #[test]
+    fn the_floor_is_re_read_before_the_binary_is_touched() {
+        let src = include_str!("apply.rs");
+        let body = &src[src
+            .find("pub fn apply_update(")
+            .expect("apply_update is in this file")..];
+
+        let first_read = body
+            .find("store.read_release_unix_for_apply()?")
+            .expect("the floor is read at the top");
+        let staged = body
+            .find("write_executable_staged(install_path, binary_bytes)")
+            .expect("the new binary is staged");
+        let second_read = body[staged..]
+            .find("store.read_release_unix_for_apply()?")
+            .map(|i| staged + i)
+            .expect(
+                "the floor is never read again after staging, so the binary is \
+                 replaced on a value read before the download",
+            );
+        let relocate = body
+            .find("relocate_running_binary_if_needed(install_path)")
+            .expect("the running binary is relocated on Windows");
+        let rename = body
+            .find("rename_durable(&tmp_path, install_path)")
+            .expect("the staged binary is renamed into place");
+
+        assert!(first_read < staged, "premise: the first read is at the top");
+        assert!(
+            second_read < relocate && second_read < rename,
+            "the floor is re-read at {second_read}, after the destructive \
+             steps at {relocate} / {rename} — which is no earlier than the \
+             commit that already refuses",
+        );
+        assert!(
+            body[second_read..relocate].contains("ApplyError::AntiDowngrade"),
+            "the second read is not followed by a refusal, so nothing acts on it",
+        );
+        assert!(
+            body[second_read..relocate].contains("remove_file(&tmp_path)"),
+            "refusing there leaks the staged binary it had already written",
+        );
     }
 
     // ── V13-H4: deleting the state file must not buy a downgrade ──

@@ -693,6 +693,20 @@ mod tests {
     /// Written against the source because the thing that broke was the
     /// absence of a call, and no behavioural test can see a call that is not
     /// there: the filter has its own tests and they all passed.
+    ///
+    /// And recorded ONCE. `newly_proven` is an insert's return value — "this
+    /// is the first time we reached this peer" — and it is what decides to
+    /// write the file. A second insert earlier on the same path makes that
+    /// answer false forever after, so the first peer a node reaches is never
+    /// written out and every cold start walks the rendezvous again: the same
+    /// symptom this guard is about, one step further along. There was one,
+    /// added for that symptom, and it caused it (report24 RUNTIME-1).
+    ///
+    /// Counted rather than matched against a spelling: the previous version of
+    /// this assertion looked for `.handshaked` followed by twenty spaces and
+    /// `.insert(`, which is the exact indentation of the line that had to go —
+    /// so removing the defect would have failed the guard that was meant to
+    /// protect against it.
     #[test]
     fn a_proven_handshake_is_recorded_somewhere_that_is_not_the_restore() {
         let handshake = include_str!("peer_handshake.rs");
@@ -704,12 +718,37 @@ mod tests {
             production.contains("handshaked"),
             "the handshake path does not touch the proof set at all"
         );
+        let inserts: Vec<usize> = production
+            .match_indices("handshaked")
+            .filter(|(at, _)| {
+                production[at + "handshaked".len()..]
+                    .trim_start()
+                    .starts_with(".insert(")
+            })
+            .map(|(at, _)| at)
+            .collect();
+        assert_eq!(
+            inserts.len(),
+            1,
+            "the handshake path records the proof {} times. None means a fresh \
+             install persists no discovered peer, ever; more than one means the \
+             insert that DECIDES to persist always answers `already there`, \
+             which is the same thing by a longer road.",
+            inserts.len(),
+        );
+        let decides = production
+            .find("let newly_proven = lock_state")
+            .expect("the persist decision is an insert's return value");
         assert!(
-            production.contains(
-                ".handshaked
-                    .insert("
-            ) || production.contains(".handshaked.insert("),
-            "the handshake path only REMOVES from the proof set. Nothing else              in production adds to it except loading a snapshot, so a fresh              install persists no discovered peer, ever."
+            decides < inserts[0],
+            "the one insert is not the one whose answer decides to persist",
+        );
+        // AFTER the insert, not the first one in the file: the identity-
+        // mismatch and nonce-relearn branches call it earlier, and a `find`
+        // that stops at those compares the wrong pair.
+        assert!(
+            production[inserts[0]..].contains("persist_discovered_peers("),
+            "the decision leads to no write",
         );
 
         // Vacuity: the filter this feeds must still be the gate, or the
