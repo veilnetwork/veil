@@ -25,7 +25,7 @@ use super::ipc_bridges::{MailboxIpcBridge, OutboxIpcBridge, RendezvousPushEnvelo
 use super::push_tasks::{
     HotReloadDispatcher, build_push_dispatcher, push_creds_watch_task, push_dispatch_task,
 };
-use super::service_tasks::{RendezvousResolverImpl, RuntimeAnonOnionSender};
+use super::rendezvous_resolver::{RendezvousResolverImpl, RuntimeAnonOnionSender};
 use super::{NodeRuntime, lock_tasks};
 
 impl NodeRuntime {
