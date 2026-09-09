@@ -246,6 +246,25 @@ fn offset_beyond_reach(_: std::num::TryFromIntError) -> std::io::Error {
     )
 }
 
+/// Put the written bytes on the disk: `fsync` on POSIX, `FlushFileBuffers` on
+/// Windows. Both mean the same promise and neither is implied by a write.
+#[cfg(any(unix, windows))]
+fn sync_file(file: &VeilFsFile) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        // SAFETY: `fd` is this module's open file.
+        let rc = unsafe { libc::fsync(file.fd) };
+        if rc != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(())
+    }
+    #[cfg(windows)]
+    {
+        file.file.sync_all()
+    }
+}
+
 /// Positional write, the same way round.
 #[cfg(any(unix, windows))]
 fn write_at(file: &VeilFsFile, offset: u64, src: &[u8]) -> std::io::Result<usize> {
@@ -759,6 +778,54 @@ pub unsafe extern "C" fn veil_fs_write(
             Err(e) => {
                 unsafe { set_err(err_out, &format!("write failed: {e}")) };
                 -1
+            }
+        }
+    }
+}
+
+/// Ask the operating system to put what was written on the DISK. Returns true,
+/// or false with `*err_out` set.
+///
+/// `veil_fs_write` is a positional write: it reaches the kernel, and the kernel
+/// decides when it reaches the platter. That distinction is the whole of this
+/// function. A downloader writes a scratch file, flushes it and renames it over
+/// the real name — and without a barrier between the writes and the rename, a
+/// power loss can leave the new NAME pointing at a file whose contents were
+/// never written, which is the one outcome the rename dance exists to prevent.
+///
+/// The Dart sink this replaced called `RandomAccessFile.flush`, which does the
+/// same thing; when the writes moved to descriptors the barrier was quietly
+/// dropped and the flush became a no-op that still looked like one
+/// (report24 XV24-04).
+///
+/// # Safety
+/// `handle` must come from [`veil_fs_create_beneath`] or
+/// [`veil_fs_open_beneath`] and not have been closed.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn veil_fs_sync(
+    handle: *mut VeilFsFile,
+    err_out: *mut *mut c_char,
+) -> bool {
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = handle;
+        unsafe { set_err(err_out, "veil_fs_sync is POSIX-only") };
+        false
+    }
+
+    #[cfg(any(unix, windows))]
+    {
+        if handle.is_null() {
+            unsafe { set_err(err_out, "null handle") };
+            return false;
+        }
+        // SAFETY: the caller guarantees `handle` is live and unclosed.
+        let file = unsafe { &*handle };
+        match sync_file(file) {
+            Ok(()) => true,
+            Err(e) => {
+                unsafe { set_err(err_out, &format!("sync failed: {e}")) };
+                false
             }
         }
     }
