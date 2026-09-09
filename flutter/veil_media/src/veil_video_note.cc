@@ -17,6 +17,7 @@
 #include "veil_video_note.h"
 #include "veil_diag_log.h"
 #include "veil_media_guard.h"
+#include "veil_vp8_header.h"
 
 #include <algorithm>
 #include <atomic>
@@ -939,6 +940,28 @@ extern "C" int veil_media_vnote_player_audio(VeilVnotePlayer* p,
 namespace {
 // Decode one indexed frame into the sink. Caller holds p->mu.
 void vnote_decode_one(VeilVnotePlayer* p, const VnoteFrameRef& f) {
+  // THE SIZE THE FRAME ITSELF DECLARES, before the decoder is given it.
+  //
+  // The header's dimensions are checked when the note is opened, and the sink
+  // bounds the buffer it fills afterwards — and libvpx allocates between those
+  // two. It reads this keyframe's own 14-bit dimensions and sizes four YV12
+  // reference buffers from them, which at the codec's 16383 square is about
+  // 1.5 GiB of requests, from a clip whose sender chose the number. A
+  // malformed frame may never reach the sink at all, so the later guard cannot
+  // be the only one (report24 MEDIA-3).
+  //
+  // Only a keyframe carries a size, and only a keyframe can change one.
+  if (f.key) {
+    const VeilVp8Size declared =
+        veil_vp8_keyframe_size(p->bytes.data() + f.off, f.len);
+    // Refusing the FRAME, not the clip: the player already treats "nothing
+    // decoded" as an ordinary outcome, and a frame the index calls a keyframe
+    // while its bytes say otherwise is one no reference chain can start from.
+    if (!declared.ok || declared.w > kMaxVnoteSide ||
+        declared.h > kMaxVnoteSide) {
+      return;
+    }
+  }
   webrtc::EncodedImage img;
   img.SetEncodedData(
       webrtc::EncodedImageBuffer::Create(p->bytes.data() + f.off, f.len));

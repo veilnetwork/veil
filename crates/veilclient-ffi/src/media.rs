@@ -1703,6 +1703,99 @@ mod detached_singleton_lifetime_tests {
         );
     }
 
+    /// A received frame's own geometry is read BEFORE a decoder is given it.
+    ///
+    /// The note's header is bounded when the clip is opened and the RGBA sink
+    /// is bounded when a frame comes back, and libvpx allocates between those
+    /// two: it reads the keyframe's 14-bit dimensions and sizes four YV12
+    /// reference buffers from them, which at the codec's 16383 square is about
+    /// 1.5 GiB of requests from a clip somebody sent. A malformed frame may
+    /// never reach the sink at all, so the later guard cannot be the only one
+    /// (report24 MEDIA-3).
+    ///
+    /// The parser itself is checked where it lives — `veil_vp8_header.h`
+    /// carries `static_assert`s that run on every compilation. What cannot be
+    /// checked there is WHERE it is called, which is the half that was wrong,
+    /// so this reads the decode path.
+    #[test]
+    fn a_frames_declared_size_is_checked_before_it_is_decoded() {
+        let (path, text) = engine_source("veil_video_note.cc");
+        let body = accessor_body(&text, "void vnote_decode_one(");
+        let checked = body.find("veil_vp8_keyframe_size(").unwrap_or_else(|| {
+            panic!(
+                "{} :: vnote_decode_one hands a received frame to the decoder \
+                 without reading the size it declares",
+                path.display()
+            )
+        });
+        let decoded = body.find("->Decode(").unwrap_or_else(|| {
+            panic!(
+                "{} :: vnote_decode_one decodes nothing; re-aim this guard",
+                path.display()
+            )
+        });
+        assert!(
+            checked < decoded,
+            "{} :: the size is read after the decoder already has the frame, \
+             which is where the allocation happens",
+            path.display()
+        );
+        assert!(
+            body[checked..decoded].contains("kMaxVnoteSide"),
+            "{} :: the declared size is read and not bounded by anything",
+            path.display()
+        );
+        assert!(
+            body[checked..decoded].contains("return"),
+            "{} :: an oversized frame is noted and decoded anyway",
+            path.display()
+        );
+
+        // The parser's own bench, named here so deleting it is a deliberate act
+        // rather than a file nobody references.
+        let header = engine_source("veil_vp8_header.h").1;
+        assert!(
+            header.contains("static_assert(veil_vp8_keyframe_size("),
+            "the keyframe parser lost the build-time checks that are the only \
+             test bench this plugin's native half has"
+        );
+    }
+
+    /// And a CALL's decoder carries the same bound, at the same place.
+    ///
+    /// The video-note player owns its decoder and can check a frame on the way
+    /// in. A call's decoder is built by WebRTC from a factory and fed by the
+    /// jitter buffer, so the only seam that sees an assembled frame and still
+    /// sits above the codec is the decoder itself — which is why the bound is
+    /// a wrapper around the factory rather than a check at a call site
+    /// (report24 MEDIA-3). An RTP fragment is not a frame and is the wrong
+    /// place to ask.
+    #[test]
+    fn every_call_decoder_factory_carries_the_bound() {
+        let (path, text) = engine_source("veil_media_engine.cc");
+        let raw = text.matches("VideoDecoderFactoryTemplate<").count();
+        let wrapped = text.matches("BoundedVp8DecoderFactory>(").count();
+        assert!(
+            wrapped > 0,
+            "{} :: no decoder factory is bounded, so a peer's keyframe sizes \
+             libvpx's reference buffers with nothing in the way",
+            path.display()
+        );
+        assert_eq!(
+            raw,
+            wrapped,
+            "{} :: {raw} decoder factories are created and {wrapped} of them \
+             are bounded — the unwrapped one hands libvpx whatever a peer sends",
+            path.display()
+        );
+        assert!(
+            text.contains("kMaxVideoSide)"),
+            "{} :: the wrapper is given some other ceiling than the one the \
+             frame sink uses",
+            path.display()
+        );
+    }
+
     #[test]
     fn the_audio_host_thread_owner_is_never_destroyed() {
         assert_never_destroyed(
