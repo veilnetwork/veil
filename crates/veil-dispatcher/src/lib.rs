@@ -7355,8 +7355,11 @@ mod tests {
         assert!(dispatcher.mirror_cache_admissible(&signed, &canonical_key));
         assert!(!dispatcher.mirror_cache_admissible(&signed, &victim_key));
 
-        // A pass-through type reports no key, so the binding must fall back to
-        // `mirror_cache_key_ok` and keep its documented pass-through verdict.
+        // A decode-only type reports no key, so the binding must fall back to
+        // `mirror_cache_key_ok` — and agree with it, whatever it now answers.
+        // It used to wave these through; it derives their key from the decoded
+        // content now (report24 V4-STORE-01), and this pins the two together
+        // rather than either verdict.
         let mut nc_payload = veil_proto::name_claim_v2::NAME_CLAIM_MAGIC.to_vec();
         nc_payload.extend_from_slice(&[0u8; 32]);
         let mut nc_canonical = None;
@@ -7370,6 +7373,91 @@ mod tests {
             dispatcher.canonical_key_binds(nc_canonical, &nc_payload, &victim_key),
             dispatcher.mirror_cache_key_ok(&nc_payload, &victim_key),
         );
+    }
+
+    /// A decode-only record may only be written where its own content puts it.
+    ///
+    /// The gate used to wave these through, on the argument that the record is
+    /// not signature-verified here, so its `node_id` is attacker-chosen and a
+    /// derived key proves nothing — the resolver re-verifies on read anyway.
+    /// That answers whether a FORGED record is BELIEVED. This gate decides
+    /// where one may be WRITTEN, and a write evicts: `put_with_origin_at`
+    /// removes the incumbent before inserting, comparing neither type nor owner
+    /// nor signature. So a peer's own valid ML-KEM certificate, stored under a
+    /// victim's AppEndpoint key, took that endpoint out of the store — and the
+    /// resolver refusing to read a certificate as an endpoint does not put the
+    /// endpoint back (report24 V4-STORE-01).
+    ///
+    /// Choosing `node_id` does not help either: the key is a hash of the
+    /// fields, so aiming at a chosen slot means finding a preimage.
+    #[test]
+    fn a_decode_only_record_binds_to_the_key_its_content_derives() {
+        use veil_proto::mlkem_cert::MlKemKeyCert;
+        use veil_proto::name_claim_v2::NameClaim;
+        use veil_proto::prekey_bundle::{ALGO_ML_KEM_768, ML_KEM_768_EK_LEN};
+
+        let dispatcher = make_test_dispatcher(veil_cfg::NodeRole::Core);
+
+        // The victim: an ordinary AppEndpoint slot belonging to somebody else.
+        let victim_key = veil_proto::discovery::app_endpoint_key(&[0xAB; 32], &[0xCD; 32], 7);
+
+        // Not signed. It does not have to be — this gate decodes structurally,
+        // which is exactly the shape the old pass-through covered.
+        let cert = MlKemKeyCert {
+            node_id: [0x11; 32],
+            instance_id: [0x22; 16],
+            mlkem_algo: ALGO_ML_KEM_768,
+            mlkem_pubkey: vec![0x33; ML_KEM_768_EK_LEN],
+            ratchet_x25519_pubkey: [0x44; 32],
+            valid_from_unix: 1_000,
+            valid_until_unix: 2_000,
+            cert_version: 1,
+            signing_identity_key_idx: 0,
+            sig: vec![0x55; 64],
+        };
+        let encoded = cert.encode();
+        let canonical = MlKemKeyCert::dht_key(&cert.node_id, &cert.instance_id);
+
+        assert!(
+            dispatcher.mirror_cache_key_ok(&encoded, &canonical),
+            "a certificate must still be storable where it belongs",
+        );
+        assert!(
+            !dispatcher.mirror_cache_key_ok(&encoded, &victim_key),
+            "a certificate stored under somebody else's key evicts their record",
+        );
+        // And through the gate the STORE planes actually call: a decode-only
+        // type reports no canonical key, so the binding delegates here.
+        let mut reported = None;
+        let _ = dispatcher.validate_store_value_capturing_key(&encoded, false, &mut reported);
+        assert_eq!(reported, None, "a decode-only type reports no key");
+        assert!(!dispatcher.canonical_key_binds(reported, &encoded, &victim_key));
+        assert!(dispatcher.canonical_key_binds(reported, &encoded, &canonical));
+
+        // The same for a name claim, whose key comes from the NAME rather than
+        // the node — the one of these five whose derivation is not a node_id.
+        let claim = NameClaim {
+            name: "alice".to_owned(),
+            node_id: [0x66; 32],
+            claimed_at_unix: 1_700_000_000,
+            pow_nonce: [0x77; 16],
+            freshness_hour: 472_222,
+            signing_identity_key_idx: 0,
+            sig: vec![0x88; 64],
+        };
+        let claim_bytes = claim.encode();
+        assert!(dispatcher.mirror_cache_key_ok(&claim_bytes, &NameClaim::dht_key("alice")));
+        assert!(
+            !dispatcher.mirror_cache_key_ok(&claim_bytes, &NameClaim::dht_key("bob")),
+            "a claim for one name must not take another name's slot",
+        );
+        assert!(!dispatcher.mirror_cache_key_ok(&claim_bytes, &victim_key));
+
+        // A record this build cannot decode names no key at all, so it cannot
+        // be written anywhere — the same answer the owner-verified types give.
+        let mut truncated = encoded.clone();
+        truncated.truncate(8);
+        assert!(!dispatcher.mirror_cache_key_ok(&truncated, &canonical));
     }
 
     #[test]
@@ -7409,18 +7497,46 @@ mod tests {
     /// has to be revisited here (the test will need updating, surfacing the
     /// decision) rather than silently becoming a poisoning vector.
     #[test]
-    fn mirror_cache_key_ok_passthrough_for_unverified_record_types_invariant() {
+    fn mirror_cache_key_ok_binds_unverified_record_types_invariant() {
         let dispatcher = make_test_dispatcher(veil_cfg::NodeRole::Core);
-        // A NameClaim ("NM") payload is structurally decoded, NOT owner-verified
-        // at this gate. Any target_key (even an attacker-chosen one) is accepted
-        // here BY DESIGN — the resolver is the real bound.
-        let mut nc_payload = veil_proto::name_claim_v2::NAME_CLAIM_MAGIC.to_vec();
-        nc_payload.extend_from_slice(&[0u8; 32]); // arbitrary body bytes
-        let any_key = [0xABu8; 32];
+        // This assertion used to read the other way round: a NameClaim is
+        // structurally decoded and NOT owner-verified at this gate, so any
+        // target key was accepted here BY DESIGN and the resolver was called
+        // the real bound. It left a note asking whoever changed it to revisit
+        // that invariant, so: the resolver invariant is untouched and still
+        // the bound on BELIEVING a record. This gate decides where one may be
+        // WRITTEN, and a write evicts whatever is in the slot before anybody
+        // reads anything — which the resolver cannot undo (report24
+        // V4-STORE-01).
+        //
+        // A record this build cannot decode names no key at all, so it can be
+        // written nowhere. That is the same answer the owner-verified types
+        // give to a payload they cannot verify.
+        let mut malformed = veil_proto::name_claim_v2::NAME_CLAIM_MAGIC.to_vec();
+        malformed.extend_from_slice(&[0u8; 32]);
         assert!(
-            dispatcher.mirror_cache_key_ok(&nc_payload, &any_key),
-            "nc/id/ir/mc are pass-through at the mirror-cache gate (resolver re-verifies); \
-             if this assertion ever needs to change, revisit the resolver re-verify invariant",
+            !dispatcher.mirror_cache_key_ok(&malformed, &[0xABu8; 32]),
+            "an undecodable record was admitted to a slot it named itself",
+        );
+
+        // And a well-formed one is admitted to its own slot and no other.
+        let claim = veil_proto::name_claim_v2::NameClaim {
+            name: "alice".to_owned(),
+            node_id: [0x66; 32],
+            claimed_at_unix: 1_700_000_000,
+            pow_nonce: [0x77; 16],
+            freshness_hour: 472_222,
+            signing_identity_key_idx: 0,
+            sig: vec![0x88; 64],
+        };
+        let encoded = claim.encode();
+        assert!(dispatcher.mirror_cache_key_ok(
+            &encoded,
+            &veil_proto::name_claim_v2::NameClaim::dht_key("alice"),
+        ));
+        assert!(
+            !dispatcher.mirror_cache_key_ok(&encoded, &[0xABu8; 32]),
+            "a claim was admitted to a slot its own content does not name",
         );
     }
 
@@ -7746,11 +7862,17 @@ mod tests {
         use veil_cfg::sovereign_flow::{CreateIdentityOptions, create_identity};
         use veil_proto::name_claim_v2::{NAME_CLAIM_MAGIC, NameClaim};
 
-        // Fabricate a dir, provision identity, sign a NameClaim
-        // then drive it through the dispatcher as an unsigned
-        // STORE for an arbitrary key. The whitelist path must
-        // accept on magic+decode without needing to verify the
-        // signature chain (the resolver runs that later).
+        // Fabricate a dir, provision identity, sign a NameClaim then drive it
+        // through the dispatcher as an unsigned STORE. The whitelist path must
+        // accept on magic+decode without needing to verify the signature chain
+        // (the resolver runs that later).
+        //
+        // Under the claim's OWN key. This used to store under an arbitrary one
+        // and assert acceptance, which is the pass-through report24 V4-STORE-01
+        // closed: a write evicts whatever is in the slot, so admitting a record
+        // to a slot its content does not name is how a valid record of one kind
+        // takes another's place. The signature chain is still not verified
+        // here, which is what this test is about.
         let dir =
             std::env::temp_dir().join(format!("veil-dispatcher-sov-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -7776,12 +7898,23 @@ mod tests {
 
         use veil_proto::discovery::StorePayload;
         let dispatcher = make_test_dispatcher(veil_cfg::NodeRole::Core);
-        let payload = StorePayload::unsigned([0xEEu8; 32], encoded);
+        let canonical = NameClaim::dht_key("alice");
+        let payload = StorePayload::unsigned(canonical, encoded.clone());
         let (hdr, body) = make_store_frame(&payload);
         let result = dispatcher.dispatch(&hdr, &body, [0x88u8; 32]);
         assert!(
             matches!(result, DispatchResult::NoResponse),
             "valid NameClaim STORE must be accepted, got {result:?}",
+        );
+
+        // And the same claim, offered for somebody else's slot.
+        let elsewhere = StorePayload::unsigned([0xEEu8; 32], encoded);
+        let (hdr, body) = make_store_frame(&elsewhere);
+        let refused = dispatcher.dispatch(&hdr, &body, [0x88u8; 32]);
+        assert!(
+            matches!(refused, DispatchResult::Violation(_)),
+            "a claim for `alice` was admitted to a slot its own content does \
+             not name, got {refused:?}",
         );
         let _ = out.node_id; // suppress unused-binding warning
         let _ = std::fs::remove_dir_all(&dir);
@@ -7932,6 +8065,99 @@ mod tests {
             Some(attacker),
             "an announcement about an otherwise unknown destination must \
              still be usable",
+        );
+    }
+
+    /// And the floor must SURVIVE a probe of the peer that made the claim.
+    ///
+    /// A route reply proves the neighbour is reachable. It does not touch the
+    /// thing the floor is about — whether the path that neighbour described to
+    /// a THIRD node exists — and `update_scores_for_peer` rescored the entry
+    /// from hop count and reachability alone, which put the claim back below
+    /// the confirmed route it had been kept under (report24 V4-ROUTE-01).
+    #[test]
+    fn a_probe_of_the_claimant_does_not_erase_the_claim_floor() {
+        use ed25519_dalek::SigningKey;
+
+        let me = [0xAAu8; 32];
+        let confirmed_hop = [0xBBu8; 32];
+        let attacker = [0xEEu8; 32];
+        let victim = [0xCCu8; 32];
+
+        let e_sk = Arc::new(SigningKey::from_bytes(&[0xEEu8; 32]));
+        let tx_reg = Arc::new(RwLock::new(veil_session::SessionTxRegistry::new()));
+        let disp = make_gossip_dispatcher(
+            me,
+            Arc::new(SigningKey::from_bytes(&[0xAAu8; 32])),
+            Arc::clone(&tx_reg),
+            vec![(attacker, e_sk.verifying_key())],
+        );
+
+        disp.route_cache.write().unwrap().insert(
+            victim,
+            confirmed_hop,
+            crate::routing::MIN_DIRECT_RELAY_SCORE,
+            2,
+        );
+        let (hdr, body) = build_announce_frame(victim, attacker, 1, 7, 1, &e_sk);
+        disp.dispatch(&hdr, &body, attacker);
+        assert_eq!(
+            disp.route_cache.read().unwrap().lookup(&victim),
+            Some(confirmed_hop),
+            "premise: the claim is held under the confirmed route",
+        );
+
+        // An ordinary ROUTE_REPLY from that same peer. Nothing dishonest: the
+        // neighbour answered a probe, which is exactly what a reachable
+        // neighbour does.
+        disp.update_scores_for_peer(veil_cfg::NodeId::from(attacker));
+
+        assert_eq!(
+            disp.route_cache.read().unwrap().lookup(&victim),
+            Some(confirmed_hop),
+            "answering a probe bought the claimant the destination — the \
+             floor was recomputed away by a formula that only knows hop \
+             count and reachability",
+        );
+
+        // Vacuity, and the distinction itself: the SAME rescore, on a route
+        // the same peer announced about ITSELF, does drop below the floor —
+        // because there is nothing unverified about that one. If the rescore
+        // had not run at all, or treated both alike, this pair could not hold.
+        let (hdr, body) = build_announce_frame(attacker, attacker, 1, 7, 2, &e_sk);
+        disp.dispatch(&hdr, &body, attacker);
+        disp.update_scores_for_peer(veil_cfg::NodeId::from(attacker));
+
+        let claim_score = disp
+            .route_cache
+            .read()
+            .unwrap()
+            .lookup_all_with_scores_and_hops(&victim)
+            .into_iter()
+            .find(|(hop, _, _)| *hop == attacker)
+            .map(|(_, score, _)| score)
+            .expect("the claim is still in the cache");
+        let self_score = disp
+            .route_cache
+            .read()
+            .unwrap()
+            .lookup_all_with_scores_and_hops(&attacker)
+            .into_iter()
+            .find(|(hop, _, _)| *hop == attacker)
+            .map(|(_, score, _)| score)
+            .expect("the peer's route to itself is in the cache");
+
+        assert!(
+            self_score < crate::routing::MIN_DIRECT_RELAY_SCORE,
+            "a peer's route to ITSELF scored {self_score}, at or above the \
+             floor — the rescore is not producing the numbers this test is \
+             about",
+        );
+        assert!(
+            claim_score >= crate::routing::MIN_DIRECT_RELAY_SCORE,
+            "the claim rescored to {claim_score}, below the floor it was \
+             inserted with, while the same peer's own route rescored to \
+             {self_score}",
         );
     }
 

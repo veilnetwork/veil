@@ -809,10 +809,7 @@ pub unsafe extern "C" fn veil_fs_write(
 /// `handle` must come from [`veil_fs_create_beneath`] or
 /// [`veil_fs_open_beneath`] and not have been closed.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn veil_fs_sync(
-    handle: *mut VeilFsFile,
-    err_out: *mut *mut c_char,
-) -> bool {
+pub unsafe extern "C" fn veil_fs_sync(handle: *mut VeilFsFile, err_out: *mut *mut c_char) -> bool {
     #[cfg(not(any(unix, windows)))]
     {
         let _ = handle;
