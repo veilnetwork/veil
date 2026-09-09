@@ -1,5 +1,77 @@
 # Changelog
 
+## v0.11.26 — 2026-09-09
+
+*Findings from report24, and the guards that would have caught them.*
+
+**A record could be written to a slot its own content does not name.** Five
+types reach the DHT store gate decoded but not signature-verified — ML-KEM
+certificate, identity document, instance registry, relay key, name claim — and
+the gate waved them through, on the argument that their fields are
+attacker-chosen so a derived key proves nothing, and the resolver re-verifies
+on read anyway. That answers whether a forged record is BELIEVED. This gate
+decides where one may be WRITTEN, and a write evicts: the store removes the
+incumbent before inserting, comparing neither type nor owner nor signature. So
+a peer's own valid certificate, stored under a victim's AppEndpoint key, took
+that endpoint out of the store — and refusing to read a certificate as an
+endpoint does not put the endpoint back. Each of the five is bound to the key
+its content derives, which an attacker cannot aim: the key is a hash of the
+fields (V4-STORE-01).
+
+**A probe reply erased the penalty on an unverified route.** An announcement
+about a third node is a claim — the signature proves the neighbour said it, not
+that the path exists — so it carries a floor that keeps it under a route we
+confirmed ourselves. A route reply from that same neighbour then rescored the
+entry from hop count and reachability alone, and the floor was gone, on the
+evidence that the NEIGHBOUR answered: never the thing in doubt. Broken
+deliberately in a test, the claimant takes the destination away from the
+confirmed route. The cache keeps the fixed half of the cost apart from the
+dynamic half now, and a snapshot carries it, so a restart does not drop it
+either (V4-ROUTE-01).
+
+**Two concurrent updates could lower the anti-rollback floor.** The older apply
+reads the floor, is overtaken by a newer release that installs and commits, and
+then writes its own smaller timestamp over the top — re-admitting the release
+it just recorded as superseded, with every signature still valid. The state
+write is a commit now: it re-reads and refuses to move the floor down. The
+apply also re-reads the floor after staging and before anything destructive,
+which narrows the binary-ordering window to the rename itself (UPDATE-P4-M2).
+
+**Discovery kept publishing the port it saw at startup.** All three publishers
+— mainline, Nostr and the LAN announcer — composed what they say about this
+node once, before their loop, and repeated it for the life of the process. A
+listener that rotates takes a new port and the old one closes when its grace
+ends, so a stranger who found this node at a meeting point could not reach it.
+Each asks per pass now, and the LAN announcement is replaceable so its payload
+follows (RUNTIME-3).
+
+**A LAN neighbour could end up admitted with no connector at all.** Reclaiming
+a stale candidate aborts its reconnect task, and an abort is scheduled rather
+than immediate: the task's guard gives its per-node-id claim back at some later
+poll. The announce that triggered the reclaim is admitted in the same turn,
+finds the claim still held, wakes a task that is already dying, and spawns
+nothing — after which every later announce is dropped as already seen. The
+eviction gives the claim back synchronously, and a connector's guard gives back
+only the claim it made (RUNTIME-2).
+
+**The first peer a node reached was never written down.** The persist decision
+is an insert's return value, and an insert added earlier on the same path — for
+that very symptom — consumed the answer, so the discovered-peer file was never
+written and every cold start walked the rendezvous again (RUNTIME-1).
+
+**A received keyframe sized libvpx's buffers before anything of ours ran.**
+Both video paths bounded a frame where it ARRIVES, and libvpx allocates before
+either: it reads the keyframe's own 14-bit dimensions and sizes four YV12
+reference buffers from them, about 1.5 GiB of requests at the codec's ceiling,
+in builds compiled `-fno-exceptions` where a refused allocation aborts. The
+geometry is read from the frame before a decoder is given it — in the
+video-note player, and through a bounded decoder wrapper for calls (MEDIA-3).
+
+Four low findings ride along: an unreachable refusal arm that now has a test
+and an honest contract, a test named for a fixture it did not build, two
+identical short-id formatters merged into one call, and a dead-code allow
+narrowed to the builds where it is true.
+
 ## v0.11.25 — 2026-09-08
 
 *0.11.24 did not build for a 32-bit phone.* `st_mode` was compared with
