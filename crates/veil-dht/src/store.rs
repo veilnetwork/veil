@@ -131,6 +131,16 @@ pub trait ColdBackend: Send + Sync + std::fmt::Debug {
     /// a per-key byte-length index returns `Some(sum)` here so the store can
     /// seed `total_bytes` on open. In-memory backends start empty and return
     /// `None` (nothing to seed).
+    /// Whether the byte and entry totals above describe the WHOLE tier.
+    ///
+    /// A backend that could not read itself to the end still has to open — the
+    /// data is there and refusing would lose it — but it must not have its
+    /// partial numbers taken for the total. Default true: an in-memory tier
+    /// always knows what it holds.
+    fn cold_tally_is_complete(&self) -> bool {
+        true
+    }
+
     fn cold_total_bytes(&self) -> Option<u64> {
         None
     }
@@ -418,6 +428,10 @@ pub mod rocks {
         /// recorded in the reverse map — a recorded length that has drifted
         /// away from its value is one of the states reconciliation repairs.
         seed_bytes: u64,
+        /// Whether [`Self::reconcile`] saw the whole tier. False means every
+        /// number above is a LOWER BOUND, and the tier says so rather than
+        /// letting a quota believe a prefix (report24 V24-DHT-01).
+        tally_complete: bool,
         /// Test-only: how many `WriteBatch`es this store has pushed to disk.
         ///
         /// The instrument for atomicity. "The eviction and the entry it makes
@@ -502,12 +516,13 @@ pub mod rocks {
                 rocksdb::ColumnFamilyDescriptor::new(CF_KEY_FIRST_SEEN, cf_opts),
             ];
             let db = rocksdb::DB::open_cf_descriptors(&opts, path, cfs)?;
-            let (count, seed_bytes) = Self::reconcile(&db, side_cfs_existed);
+            let (count, seed_bytes, complete) = Self::reconcile(&db, side_cfs_existed);
             Ok(Self {
                 db,
                 capacity,
                 count,
                 seed_bytes,
+                tally_complete: complete,
                 #[cfg(test)]
                 writes: std::sync::atomic::AtomicUsize::new(0),
             })
@@ -530,12 +545,13 @@ pub mod rocks {
                 rocksdb::ColumnFamilyDescriptor::new(CF_KEY_FIRST_SEEN, cf_opts),
             ];
             let db = rocksdb::DB::open_cf_descriptors_read_only(&opts, path, cfs, false)?;
-            let (count, seed_bytes) = Self::reconcile(&db, true);
+            let (count, seed_bytes, complete) = Self::reconcile(&db, true);
             Ok(Self {
                 db,
                 capacity,
                 count,
                 seed_bytes,
+                tally_complete: complete,
                 #[cfg(test)]
                 writes: std::sync::atomic::AtomicUsize::new(0),
             })
@@ -592,7 +608,13 @@ pub mod rocks {
         /// merely stop being exempt. It is also what makes the signal above
         /// one-shot: after this pass no unindexed value exists, so any that
         /// appears later is unambiguously a ghost.
-        fn reconcile(db: &rocksdb::DB, side_cfs_existed: bool) -> (usize, u64) {
+        /// Walk the tier, repairing what it can prove. The third value says
+        /// whether the WHOLE tier was seen: a read error stops the walk, and
+        /// the counts up to that point used to be returned as if they were the
+        /// total. Two 100-byte rows whose second read failed opened as
+        /// `(1, 100)`, and the byte cap then believed in room that is not there
+        /// (report24 V24-DHT-01).
+        fn reconcile(db: &rocksdb::DB, side_cfs_existed: bool) -> (usize, u64, bool) {
             let cf_kt = db.cf_handle(CF_KEY_TS).expect("CF_KEY_TS just created");
             let cf_ix = db.cf_handle(CF_TS_INDEX).expect("CF_TS_INDEX just created");
 
@@ -725,7 +747,7 @@ pub mod rocks {
                 log::error!(
                     "dht.cold.rocksdb: the cold tier could not be read to the end on open;                      {repairs} staged repair(s) DISCARDED rather than applied on a partial                      picture, and the next open will try again"
                 );
-                return (count, summed);
+                return (count, summed, false);
             }
             if repairs > 0 {
                 if let Err(e) = db.write(batch) {
@@ -748,7 +770,7 @@ pub mod rocks {
                     );
                 }
             }
-            (count, summed)
+            (count, summed, true)
         }
 
         /// Build the `CF_KEY_TS` value (`ts_be(8) ‖ len_be(8)`).
@@ -1283,6 +1305,10 @@ pub mod rocks {
             Some(self.seed_bytes)
         }
 
+        fn cold_tally_is_complete(&self) -> bool {
+            self.tally_complete
+        }
+
         fn is_durable(&self) -> bool {
             true
         }
@@ -1601,6 +1627,17 @@ impl TieredStore {
                 "DHT cold tier: seeded total_bytes={total_bytes} from persisted disk tier on open"
             );
         }
+        if !cold.cold_tally_is_complete() {
+            // Not fatal and not silent. The tier opens — the rows are there and
+            // refusing to open would lose them — but every cap below is now
+            // working from a lower bound, and the next successful open is what
+            // corrects it.
+            log::error!(
+                "DHT cold tier: opened from a PARTIAL scan — total_bytes={total_bytes} and the \
+                 entry count are lower bounds, so the byte and entry caps are being applied to \
+                 less than what is on disk until the next clean open"
+            );
+        }
         // Per-origin bytes are seeded too, from what the backend remembers.
         // They used to start empty however much was on disk, so a restart
         // handed every publisher a fresh allowance while its rows were still
@@ -1866,14 +1903,20 @@ impl TieredStore {
             return false;
         }
 
-        // 2. Drop the previous value's bytes for this key (if any) — done
-        //    by calling remove(), which adjusts total_bytes and origin_bytes
-        //    appropriately.
-        self.remove(&key);
-
-        // 3. Evict oldest entries until the new value fits.  Cold first
+        // 2. Make room BEFORE dropping the incumbent.
+        //
+        //    The other order looks cheaper — the incumbent's bytes might be
+        //    all the room needed — and it is the order that made a refusal
+        //    destructive: the old value was already gone by the time the store
+        //    found out it could not hold the new one. Freeing first costs at
+        //    most one extra eviction when a key is replaced in a nearly-full
+        //    store, and it means a refusal leaves the tier exactly as it was
+        //    (report16 V16-L2 fixed the same shape for oversized values;
+        //    report24 V24-DHT-02 is the eviction-failure half of it).
+        //
+        //    Evict oldest entries until the new value fits. Cold first
         //    (cheapest data — already demoted), then hot (demote-and-
-        //    evict).  Each eviction strictly decreases total_bytes.
+        //    evict). Each eviction strictly decreases total_bytes.
         if let Some(cap) = self.max_bytes {
             while self.total_bytes.saturating_add(new_bytes) > cap {
                 if let Some((evicted_key, evicted_val)) = self.cold.evict_oldest() {
@@ -1890,15 +1933,34 @@ impl TieredStore {
                     }
                     continue;
                 }
-                // Both tiers empty but the cap is still exceeded — the
-                // cap is smaller than `new_bytes`.  Already handled by
-                // the explicit `new_bytes > cap` check above, but defence
-                // in depth: bail out of the loop.
+                // Nothing could be freed. TWO different situations reach
+                // here, and the old comment named only the harmless one:
+                // both tiers really are empty (the cap is smaller than
+                // `new_bytes`, already refused above), OR the cold tier
+                // REFUSED to evict — `evict_oldest` answers `None` for a
+                // write or read error just as it does for "nothing left".
+                // The second one used to fall through and insert anyway,
+                // putting the store past a cap its operator had set
+                // (report24 V24-DHT-02).
                 break;
             }
         }
 
-        // 4. Insert into hot.  insert_hot maintains total_bytes for the
+        // 3. And if the room is still not there, refuse — with the tier
+        //    untouched, because nothing has been removed yet.
+        if let Some(cap) = self.max_bytes
+            && self.total_bytes.saturating_add(new_bytes) > cap
+        {
+            return false;
+        }
+
+        // 4. Drop the previous value's bytes for this key (if any) — done
+        //    by calling remove(), which adjusts total_bytes and origin_bytes
+        //    appropriately. It may have been evicted above already, in which
+        //    case this is a no-op.
+        self.remove(&key);
+
+        // 5. Insert into hot.  insert_hot maintains total_bytes for the
         //    hot side and handles hot-overflow demotion.
         self.entry_origin.insert(key, origin);
         *self.origin_bytes.entry(origin).or_insert(0) += new_bytes;
@@ -3096,6 +3158,102 @@ mod tests {
     /// longer had it. Nothing ages it, nothing evicts it, and it comes back at
     /// every restart. `release_cold` already kept the stamp on a failed
     /// delete; `remove` did not.
+    /// A cold tier that cannot evict must not have the cap written past it,
+    /// and a refusal must leave the incumbent where it was.
+    ///
+    /// `evict_oldest` answers `None` for a write or read error exactly as it
+    /// does for "nothing left to evict", and the loop treated both as "both
+    /// tiers are empty" — then inserted anyway. The store went past a cap its
+    /// operator had set (report24 V24-DHT-02).
+    #[test]
+    fn a_failed_eviction_refuses_the_put_and_keeps_what_was_there() {
+        #[derive(Debug, Default)]
+        struct Inner {
+            entries: HashMap<[u8; 32], Vec<u8>>,
+            refuse_eviction: bool,
+        }
+        #[derive(Debug, Clone, Default)]
+        struct StuckCold(std::sync::Arc<std::sync::Mutex<Inner>>);
+        impl StuckCold {
+            fn disk(&self) -> std::sync::MutexGuard<'_, Inner> {
+                self.0.lock().unwrap_or_else(|p| p.into_inner())
+            }
+        }
+        impl ColdBackend for StuckCold {
+            fn get(&self, key: &[u8; 32]) -> Option<Vec<u8>> {
+                self.disk().entries.get(key).cloned()
+            }
+            fn put(&mut self, key: [u8; 32], value: Vec<u8>) -> ColdPut {
+                self.disk().entries.insert(key, value);
+                ColdPut::Stored(None)
+            }
+            fn remove(&mut self, key: &[u8; 32]) {
+                self.disk().entries.remove(key);
+            }
+            fn contains(&self, key: &[u8; 32]) -> bool {
+                self.disk().entries.contains_key(key)
+            }
+            fn len(&self) -> usize {
+                self.disk().entries.len()
+            }
+            fn evict_oldest(&mut self) -> Option<([u8; 32], Vec<u8>)> {
+                // The failure this is about: the disk said no.
+                if self.disk().refuse_eviction {
+                    return None;
+                }
+                let key = *self.disk().entries.keys().next()?;
+                let value = self.disk().entries.remove(&key)?;
+                Some((key, value))
+            }
+            fn iter_entries(&self) -> Vec<([u8; 32], Vec<u8>)> {
+                self.disk()
+                    .entries
+                    .iter()
+                    .map(|(k, v)| (*k, v.clone()))
+                    .collect()
+            }
+            fn retain(&mut self, _f: &dyn Fn(&[u8; 32], &[u8]) -> bool) -> Vec<([u8; 32], u64)> {
+                Vec::new()
+            }
+        }
+
+        let disk = StuckCold::default();
+        let mut store =
+            TieredStore::with_cold(1, Box::new(disk.clone())).with_max_bytes(100);
+
+        let old = [1u8; 32];
+        assert!(
+            store.put_with_origin(old, vec![0u8; 100], ORIGIN_INTERNAL),
+            "premise: the tier fills up"
+        );
+        // Demote it into cold so the eviction path is the cold one.
+        store.put([9u8; 32], vec![0u8; 0]);
+        disk.disk().refuse_eviction = true;
+
+        let before = store.total_bytes();
+        let accepted =
+            store.put_with_origin([2u8; 32], vec![0u8; 40], ORIGIN_INTERNAL);
+
+        assert!(
+            !accepted,
+            "a put that could not make room was accepted anyway"
+        );
+        assert!(
+            store.total_bytes() <= 100,
+            "the store went past its cap: {} bytes",
+            store.total_bytes()
+        );
+        assert_eq!(
+            store.total_bytes(),
+            before,
+            "a refusal changed the tier it refused to write to"
+        );
+        assert!(
+            store.contains(&old),
+            "the incumbent was dropped for a value that was never stored"
+        );
+    }
+
     #[test]
     fn a_delete_that_failed_keeps_the_age_it_will_be_swept_by() {
         #[derive(Debug, Default)]
@@ -3951,9 +4109,19 @@ mod tests {
             "reconciliation no longer tracks whether it could read the tier"
         );
         assert!(
-            rocks.contains("if !readable {") && rocks.contains("return (count, summed);"),
-            "reconciliation applies its repairs on a partial picture: a value \
-             it could not read is deleted from the index as an orphan"
+            rocks.contains("if !readable {") && rocks.contains("return (count, summed, false);"),
+            "reconciliation applies its repairs on a partial picture, or stops \
+             telling its caller that the picture was partial: a value it could \
+             not read is deleted from the index as an orphan, or a prefix of \
+             the tier is reported as its total"
+        );
+        // And the caller can ask. Without this the flag exists and nobody
+        // reads it, which is the same as not having it.
+        assert!(
+            rocks.contains("fn cold_tally_is_complete(&self) -> bool {")
+                && rocks.contains("self.tally_complete"),
+            "the cold tier no longer reports whether its totals cover the \
+             whole tier (report24 V24-DHT-01)"
         );
 
         // And nothing in the repair paths turns an error into absence by
