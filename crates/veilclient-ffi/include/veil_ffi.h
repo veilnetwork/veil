@@ -241,40 +241,6 @@
 #define VEIL_RELAY_X25519_UNAVAILABLE -10
 
 /**
- * Status return codes [`veil_mailbox_put`]. Mirrors
- * `MailboxPutStatus` on the wire (0..8 byte).
- */
-#define VEIL_MAILBOX_PUT_STORED 0
-
-#define VEIL_MAILBOX_PUT_DUPLICATE 1
-
-#define VEIL_MAILBOX_PUT_QUOTA_PER_RECEIVER 2
-
-#define VEIL_MAILBOX_PUT_QUOTA_GLOBAL 3
-
-#define VEIL_MAILBOX_PUT_RATE_LIMITED 4
-
-#define VEIL_MAILBOX_PUT_NOT_RELAY 5
-
-/**
- * relay configured with
- * `require_capability_token = true` rejected a PUT that arrived
- * without a capability token.
- */
-#define VEIL_MAILBOX_PUT_CAPABILITY_REQUIRED 6
-
-/**
- * capability token decode or verify
- * failed (expired, wrong receiver, or bad signature).
- */
-#define VEIL_MAILBOX_PUT_CAPABILITY_INVALID 7
-
-/**
- * per-sender byte cap exceeded.
- */
-#define VEIL_MAILBOX_PUT_QUOTA_PER_SENDER 8
-
-/**
  * Status codes returned by `veil_join_bootstrap_uri` via `out_status`.
  * Mirror `veil_proto::join_status` constants exactly.
  */
@@ -448,6 +414,40 @@
 #if defined(VEIL_FFI_PACKET_TUNNEL)
 #define VEIL_TUNNEL_ERROR 3
 #endif
+
+/**
+ * Status return codes [`veil_mailbox_put`]. Mirrors
+ * `MailboxPutStatus` on the wire (0..8 byte).
+ */
+#define VEIL_MAILBOX_PUT_STORED 0
+
+#define VEIL_MAILBOX_PUT_DUPLICATE 1
+
+#define VEIL_MAILBOX_PUT_QUOTA_PER_RECEIVER 2
+
+#define VEIL_MAILBOX_PUT_QUOTA_GLOBAL 3
+
+#define VEIL_MAILBOX_PUT_RATE_LIMITED 4
+
+#define VEIL_MAILBOX_PUT_NOT_RELAY 5
+
+/**
+ * relay configured with
+ * `require_capability_token = true` rejected a PUT that arrived
+ * without a capability token.
+ */
+#define VEIL_MAILBOX_PUT_CAPABILITY_REQUIRED 6
+
+/**
+ * capability token decode or verify
+ * failed (expired, wrong receiver, or bad signature).
+ */
+#define VEIL_MAILBOX_PUT_CAPABILITY_INVALID 7
+
+/**
+ * per-sender byte cap exceeded.
+ */
+#define VEIL_MAILBOX_PUT_QUOTA_PER_SENDER 8
 
 /**
  * Wire-byte status codes for Source-side pairing ops.  Mirror
@@ -714,23 +714,6 @@ typedef void (*VeilRecvCb)(void *user,
                            size_t len);
 
 /**
- * Mailbox blob descriptor returned by [`veil_mailbox_fetch_into`].
- * `blob` is a borrow into a buffer the caller provided to the fetch
- * call; valid until the caller frees that buffer.
- */
-typedef struct {
-  uint8_t sender_id[32];
-  uint8_t content_id[32];
-  uint64_t deposited_at;
-  /**
-   * Pointer into caller-provided `blob_buf` (NOT separately allocated).
-   */
-  const uint8_t *blob;
-  uint32_t blob_len;
-  uint32_t _reserved;
-} VeilMailboxBlob;
-
-/**
  * Snapshot of the daemon's mobile/battery state, populated by
  * `veil_get_mobile_status`. All fields are scalar wire bytes;
  * apps interpret sentinels themselves (`battery_level_pct == 100`
@@ -822,6 +805,23 @@ typedef void (*VeilEventCb)(void *user, uint8_t kind, const uint8_t *payload, si
  */
 typedef void (*PacketWriteFn)(void*, const uint8_t*, uintptr_t);
 #endif
+
+/**
+ * Mailbox blob descriptor returned by [`veil_mailbox_fetch_into`].
+ * `blob` is a borrow into a buffer the caller provided to the fetch
+ * call; valid until the caller frees that buffer.
+ */
+typedef struct {
+  uint8_t sender_id[32];
+  uint8_t content_id[32];
+  uint64_t deposited_at;
+  /**
+   * Pointer into caller-provided `blob_buf` (NOT separately allocated).
+   */
+  const uint8_t *blob;
+  uint32_t blob_len;
+  uint32_t _reserved;
+} VeilMailboxBlob;
 
 #ifdef __cplusplus
 extern "C" {
@@ -1839,109 +1839,6 @@ int veil_send_anonymous_direct(VeilHandle *handle,
 ;
 
 /**
- * Deposit `blob` for an offline `receiver_id` at the daemon's mailbox
- *. No `auth_cookie` required.
- *
- * `push_envelope` / `push_envelope_len` are optional (pass NULL / 0
- * to skip). When supplied and storage succeeds, the relay fires a
- * wake-push to the receiver after this call returns.
- *
- * Returns one of `VEIL_MAILBOX_PUT_*` (≥0) on a structured outcome
- * or a negative `VEIL_ERR_*` on transport / argument errors.
- * `out_evicted` (may be NULL) receives the count of older blobs the
- * relay had to evict to fit (only nonzero on `VEIL_MAILBOX_PUT_STORED`).
- *
- * # Safety
- * `handle` must be a live `VeilHandle*` from `veil_connect`.
- * `receiver_id`, `content_id`, `sender_id` must each point to ≥32
- * readable bytes. `blob` must point to ≥`blob_len` readable bytes
- * (or NULL if `blob_len == 0`). `push_envelope` must point to
- * ≥`push_envelope_len` readable bytes (or NULL if 0).
- */
-
-int veil_mailbox_put(VeilHandle *handle,
-                     const uint8_t *receiver_id,
-                     const uint8_t *content_id,
-                     const uint8_t *sender_id,
-                     const uint8_t *blob,
-                     size_t blob_len,
-                     const uint8_t *push_envelope,
-                     size_t push_envelope_len,
-                     uint32_t *out_evicted,
-                     char **err_out)
-;
-
-/**
- * `veil_mailbox_put` variant that forwards
- * a receiver-signed capability token. Required when targeting a
- * relay running with `MailboxConfig::require_capability_token = true`.
- *
- * `capability_token` / `capability_token_len` are the bytes obtained
- * from the receiver's `RendezvousAd` (surfaced on the SDK side as
- * `RendezvousReplicaInfo::capability_token`). Pass `NULL` / `0` to
- * fall back to the no-token path (equivalent to calling the original
- * `veil_mailbox_put`). Maximum length is
- * [`veilclient::MAX_MAILBOX_CAPABILITY_TOKEN_BYTES`].
- *
- * All other parameters and safety contracts are identical to
- * [`veil_mailbox_put`].
- */
-
-int veil_mailbox_put_with_capability(VeilHandle *handle,
-                                     const uint8_t *receiver_id,
-                                     const uint8_t *content_id,
-                                     const uint8_t *sender_id,
-                                     const uint8_t *blob,
-                                     size_t blob_len,
-                                     const uint8_t *push_envelope,
-                                     size_t push_envelope_len,
-                                     const uint8_t *capability_token,
-                                     size_t capability_token_len,
-                                     uint32_t *out_evicted,
-                                     char **err_out)
-;
-
-/**
- * `veil_mailbox_put` variant that forwards BOTH a receiver-signed
- * capability token AND the receiver's sealed wake-HMAC envelope (Epic
- * 489.10 slice 4.3.4).  This is the export a mobile sender uses to
- * forward the wake-HMAC envelope so the relay can mint a receiver-
- * verifiable wake-HMAC tag on the push.
- *
- * `capability_token` / `capability_token_len` are as in
- * [`veil_mailbox_put_with_capability`] (pass `NULL` / `0` to skip).
- *
- * `wake_hmac_envelope` / `wake_hmac_envelope_len` are the bytes the
- * receiver published in its `RendezvousAd` (surfaced SDK-side as
- * `RendezvousReplicaInfo::wake_hmac_envelope` and returned over the C
- * ABI by [`veil_lookup_rendezvous_replicas`]).  Pass `NULL` / `0`
- * to fall back to an unauthenticated wake (equivalent to
- * [`veil_mailbox_put_with_capability`]).  Maximum length is
- * [`veilclient::MAX_WAKE_HMAC_ENVELOPE_BYTES`]; overflow returns
- * `VEIL_ERR_INVALID_ARG`.
- *
- * All other parameters and safety contracts are identical to
- * [`veil_mailbox_put`].  `wake_hmac_envelope` MUST point to
- * ≥`wake_hmac_envelope_len` readable bytes (or NULL if 0).
- */
-
-int veil_mailbox_put_with_wake_hmac(VeilHandle *handle,
-                                    const uint8_t *receiver_id,
-                                    const uint8_t *content_id,
-                                    const uint8_t *sender_id,
-                                    const uint8_t *blob,
-                                    size_t blob_len,
-                                    const uint8_t *push_envelope,
-                                    size_t push_envelope_len,
-                                    const uint8_t *capability_token,
-                                    size_t capability_token_len,
-                                    const uint8_t *wake_hmac_envelope,
-                                    size_t wake_hmac_envelope_len,
-                                    uint32_t *out_evicted,
-                                    char **err_out)
-;
-
-/**
  * Look up candidate mailbox-relays for `receiver_id` and return each
  * verified replica's relay id, ad-expiry, and the three sealed blobs a
  * sender forwards on the put: `push_envelope`, `capability_token`, and
@@ -2004,56 +1901,6 @@ int veil_lookup_rendezvous_replicas(VeilHandle *handle,
  void veil_free_replica_buf(uint8_t *ptr, size_t len) ;
 
 /**
- * Normalize a candidate nickname. On VEIL_OK, `*out_buf`/`*out_len` hold the
- * normalized ASCII bytes (free with `veil_free_buf`); returns
- * VEIL_ERR_INVALID_ARG if the name cannot be normalized (bad charset/length).
- */
-
-int veil_nickname_normalize(const uint8_t *name,
-                            size_t name_len,
-                            uint8_t **out_buf,
-                            size_t *out_len,
-                            char **err_out)
-;
-
-/**
- * The cumulative PoW weight a name of this length must carry (the anti-squat
- * floor) — the host mines until it reaches this. 0 on a bad name.
- */
- uint64_t veil_nickname_length_floor(const uint8_t *name, size_t name_len) ;
-
-/**
- * Mine PoW seeds for `name` under `owner_node_id`, continuing from
- * `prior_seeds` (a concatenation of 32-byte seeds; may be NULL/0), until the
- * cumulative weight reaches `target_weight` or `max_hashes` is spent. The
- * call is bounded by `max_hashes` — the host loops (fresh call = fresh random
- * salt) and cancels by simply not calling again, threading the returned seed
- * set back in as `prior_seeds`.
- *
- * On VEIL_OK, `*out_buf`/`*out_len` hold a serialized outcome (free with
- * `veil_free_buf`): `hit_target:u8 | weight:u64 LE | hashes:u64 LE |
- * seed_count:u32 LE | seeds (count*32)`.
- */
-
-int veil_nickname_mine(const uint8_t *name,
-                       size_t name_len,
-                       const uint8_t *owner_node_id,
-                       const uint8_t *prior_seeds,
-                       size_t prior_seeds_len,
-                       uint64_t target_weight,
-                       uint64_t max_hashes,
-                       uint8_t **out_buf,
-                       size_t *out_len,
-                       char **err_out)
-;
-
-/**
- * Verify a serialized nickname record (from `NicknameRecord::to_bytes`).
- * Returns VEIL_OK if valid; VEIL_ERR with a reason in `err_out` otherwise.
- */
- int veil_nickname_verify(const uint8_t *record, size_t record_len, char **err_out) ;
-
-/**
  * Free a callback buffer handed to a recv- or event-handler callback.
  * `ptr` MUST be the base pointer the callback received — for recv that is the
  * `src_node_id` pointer (layout `[node_id(32) | app_id(32) | data]`); for
@@ -2068,128 +1915,6 @@ int veil_nickname_mine(const uint8_t *name,
  * and has NOT already freed, and `len` MUST equal that buffer's total length.
  */
  void veil_free_buf(uint8_t *ptr, size_t len) ;
-
-/**
- * Seal `data` for `recipient`'s `(app_id, endpoint_id)` into an offline-mailbox
- * blob (node-side E2E crypto: sign + DHT-resolve the recipient cert +
- * fan-out-encrypt). On success returns [`VEIL_OK`] and writes a heap-allocated
- * buffer to `*out_buf` (its length to `*out_len`); free it with
- * [`veil_free_buf`]. On error returns a negative `VEIL_ERR_*`, sets `*err_out`,
- * and leaves `*out_buf = NULL` / `*out_len = 0`.
- *
- * `recipient` and `app_id` MUST point to ≥32 readable bytes; `data` to
- * ≥`data_len` (may be NULL iff `data_len == 0`). `out_buf` / `out_len` MUST be
- * valid writable pointers.
- */
-
-int veil_mailbox_seal(VeilHandle *handle,
-                      const uint8_t *recipient,
-                      const uint8_t *app_id,
-                      uint32_t endpoint_id,
-                      const uint8_t *data,
-                      size_t data_len,
-                      uint8_t **out_buf,
-                      size_t *out_len,
-                      char **err_out)
-;
-
-/**
- * Open + verify a fetched offline-mailbox `blob`, decrypting under our current
- * cert version `our_cert_version`. The sender is RECOVERED from the blob's
- * sidecar (the anonymous mailbox deposit carries no usable wire sender) and,
- * once crypto-verified, written to `out_sender` (32 bytes). On success returns
- * [`VEIL_OK`], writes the verified destination app id to `out_app_id` (32 bytes)
- * and the endpoint id to `*out_endpoint_id`. A heap-allocated data buffer is written
- * to `*out_data` (length to `*out_data_len`); free with [`veil_free_buf`].
- *
- * `blob` MUST point to ≥`blob_len`. `out_sender` / `out_app_id` MUST each point
- * to ≥32 writable bytes; the other out-pointers MUST be writable.
- */
-
-int veil_mailbox_open(VeilHandle *handle,
-                      uint64_t our_cert_version,
-                      const uint8_t *blob,
-                      size_t blob_len,
-                      uint8_t *out_sender,
-                      uint8_t *out_app_id,
-                      uint32_t *out_endpoint_id,
-                      uint8_t **out_data,
-                      size_t *out_data_len,
-                      char **err_out)
-;
-
-/**
- * Fetch all blobs currently stored for `receiver_id`. `auth_cookie`
- * must match a previously-registered rendezvous-publisher entry.
- *
- * On success returns ≥0 (the count of blobs returned) and populates
- * `out_blobs` (allocated via `veil_mailbox_blobs_alloc`-style
- * caller-managed buffer). Apps fetch blobs into a length-aware
- * container by calling [`veil_mailbox_fetch_count`] first to size
- * their array, then [`veil_mailbox_fetch_into`] to copy.
- *
- * Two-call API avoids hidden allocations through the FFI boundary —
- * callers control all memory lifetimes.
- *
- * # Safety
- * `handle`, `receiver_id` (32 B), `auth_cookie` (16 B), `out_count`
- * must all be valid pointers. `out_count` receives the count.
- */
-
-int veil_mailbox_fetch_count(VeilHandle *handle,
-                             const uint8_t *receiver_id,
-                             const uint8_t *auth_cookie,
-                             uint32_t *out_count,
-                             char **err_out)
-;
-
-/**
- * Copy the most-recently-fetched blob list (cached by
- * [`veil_mailbox_fetch_count`]) into caller-provided buffers.
- *
- * `descriptors_out` must point to ≥`max_descriptors` `VeilMailboxBlob`
- * slots. `blob_buf` is a contiguous byte buffer where blob payloads
- * are concatenated; descriptors' `blob` pointers index into it.
- * `blob_buf_len` must be ≥ sum of all blob_len; if too small, returns
- * `VEIL_ERR_INVALID_ARG` and the cached fetch list is kept (caller
- * can re-call with a larger buffer without re-fetching).
- *
- * On success returns the count of descriptors written and clears the
- * cache.
- *
- * # Safety
- * All output pointers must be writable for at least the documented
- * extents. After this call, the descriptor `blob` pointers are valid
- * only as long as `blob_buf` is alive and unmodified.
- */
-
-int veil_mailbox_fetch_into(VeilHandle *handle,
-                            VeilMailboxBlob *descriptors_out,
-                            uint32_t max_descriptors,
-                            uint8_t *blob_buf,
-                            size_t blob_buf_len,
-                            char **err_out)
-;
-
-/**
- * Acknowledge end-to-end receipt of a mailbox blob. Daemon deletes
- * the blob and frees its quota slice. Idempotent.
- *
- * Returns 1 if the blob was removed, 0 if no-op (already acked /
- * not present / wrong cookie), or negative on transport error.
- *
- * # Safety
- * `handle` must be a live `VeilHandle*`; `receiver_id` (32 B)
- * `content_id` (32 B), `auth_cookie` (16 B) must point to readable
- * storage of at least the documented length.
- */
-
-int veil_mailbox_ack(VeilHandle *handle,
-                     const uint8_t *receiver_id,
-                     const uint8_t *content_id,
-                     const uint8_t *auth_cookie,
-                     char **err_out)
-;
 
 /**
  * Read the daemon's own `node_id` (32 bytes) into `out`. Returns
@@ -3631,6 +3356,281 @@ int veil_space_discovery_resolve(const uint8_t *self_node_id,
                                  char **err_out)
 ;
 #endif
+
+/**
+ * Deposit `blob` for an offline `receiver_id` at the daemon's mailbox
+ *. No `auth_cookie` required.
+ *
+ * `push_envelope` / `push_envelope_len` are optional (pass NULL / 0
+ * to skip). When supplied and storage succeeds, the relay fires a
+ * wake-push to the receiver after this call returns.
+ *
+ * Returns one of `VEIL_MAILBOX_PUT_*` (≥0) on a structured outcome
+ * or a negative `VEIL_ERR_*` on transport / argument errors.
+ * `out_evicted` (may be NULL) receives the count of older blobs the
+ * relay had to evict to fit (only nonzero on `VEIL_MAILBOX_PUT_STORED`).
+ *
+ * # Safety
+ * `handle` must be a live `VeilHandle*` from `veil_connect`.
+ * `receiver_id`, `content_id`, `sender_id` must each point to ≥32
+ * readable bytes. `blob` must point to ≥`blob_len` readable bytes
+ * (or NULL if `blob_len == 0`). `push_envelope` must point to
+ * ≥`push_envelope_len` readable bytes (or NULL if 0).
+ */
+
+int veil_mailbox_put(VeilHandle *handle,
+                     const uint8_t *receiver_id,
+                     const uint8_t *content_id,
+                     const uint8_t *sender_id,
+                     const uint8_t *blob,
+                     size_t blob_len,
+                     const uint8_t *push_envelope,
+                     size_t push_envelope_len,
+                     uint32_t *out_evicted,
+                     char **err_out)
+;
+
+/**
+ * `veil_mailbox_put` variant that forwards
+ * a receiver-signed capability token. Required when targeting a
+ * relay running with `MailboxConfig::require_capability_token = true`.
+ *
+ * `capability_token` / `capability_token_len` are the bytes obtained
+ * from the receiver's `RendezvousAd` (surfaced on the SDK side as
+ * `RendezvousReplicaInfo::capability_token`). Pass `NULL` / `0` to
+ * fall back to the no-token path (equivalent to calling the original
+ * `veil_mailbox_put`). Maximum length is
+ * [`veilclient::MAX_MAILBOX_CAPABILITY_TOKEN_BYTES`].
+ *
+ * All other parameters and safety contracts are identical to
+ * [`veil_mailbox_put`].
+ */
+
+int veil_mailbox_put_with_capability(VeilHandle *handle,
+                                     const uint8_t *receiver_id,
+                                     const uint8_t *content_id,
+                                     const uint8_t *sender_id,
+                                     const uint8_t *blob,
+                                     size_t blob_len,
+                                     const uint8_t *push_envelope,
+                                     size_t push_envelope_len,
+                                     const uint8_t *capability_token,
+                                     size_t capability_token_len,
+                                     uint32_t *out_evicted,
+                                     char **err_out)
+;
+
+/**
+ * `veil_mailbox_put` variant that forwards BOTH a receiver-signed
+ * capability token AND the receiver's sealed wake-HMAC envelope (Epic
+ * 489.10 slice 4.3.4).  This is the export a mobile sender uses to
+ * forward the wake-HMAC envelope so the relay can mint a receiver-
+ * verifiable wake-HMAC tag on the push.
+ *
+ * `capability_token` / `capability_token_len` are as in
+ * [`veil_mailbox_put_with_capability`] (pass `NULL` / `0` to skip).
+ *
+ * `wake_hmac_envelope` / `wake_hmac_envelope_len` are the bytes the
+ * receiver published in its `RendezvousAd` (surfaced SDK-side as
+ * `RendezvousReplicaInfo::wake_hmac_envelope` and returned over the C
+ * ABI by [`veil_lookup_rendezvous_replicas`]).  Pass `NULL` / `0`
+ * to fall back to an unauthenticated wake (equivalent to
+ * [`veil_mailbox_put_with_capability`]).  Maximum length is
+ * [`veilclient::MAX_WAKE_HMAC_ENVELOPE_BYTES`]; overflow returns
+ * `VEIL_ERR_INVALID_ARG`.
+ *
+ * All other parameters and safety contracts are identical to
+ * [`veil_mailbox_put`].  `wake_hmac_envelope` MUST point to
+ * ≥`wake_hmac_envelope_len` readable bytes (or NULL if 0).
+ */
+
+int veil_mailbox_put_with_wake_hmac(VeilHandle *handle,
+                                    const uint8_t *receiver_id,
+                                    const uint8_t *content_id,
+                                    const uint8_t *sender_id,
+                                    const uint8_t *blob,
+                                    size_t blob_len,
+                                    const uint8_t *push_envelope,
+                                    size_t push_envelope_len,
+                                    const uint8_t *capability_token,
+                                    size_t capability_token_len,
+                                    const uint8_t *wake_hmac_envelope,
+                                    size_t wake_hmac_envelope_len,
+                                    uint32_t *out_evicted,
+                                    char **err_out)
+;
+
+/**
+ * Seal `data` for `recipient`'s `(app_id, endpoint_id)` into an offline-mailbox
+ * blob (node-side E2E crypto: sign + DHT-resolve the recipient cert +
+ * fan-out-encrypt). On success returns [`VEIL_OK`] and writes a heap-allocated
+ * buffer to `*out_buf` (its length to `*out_len`); free it with
+ * [`veil_free_buf`]. On error returns a negative `VEIL_ERR_*`, sets `*err_out`,
+ * and leaves `*out_buf = NULL` / `*out_len = 0`.
+ *
+ * `recipient` and `app_id` MUST point to ≥32 readable bytes; `data` to
+ * ≥`data_len` (may be NULL iff `data_len == 0`). `out_buf` / `out_len` MUST be
+ * valid writable pointers.
+ */
+
+int veil_mailbox_seal(VeilHandle *handle,
+                      const uint8_t *recipient,
+                      const uint8_t *app_id,
+                      uint32_t endpoint_id,
+                      const uint8_t *data,
+                      size_t data_len,
+                      uint8_t **out_buf,
+                      size_t *out_len,
+                      char **err_out)
+;
+
+/**
+ * Open + verify a fetched offline-mailbox `blob`, decrypting under our current
+ * cert version `our_cert_version`. The sender is RECOVERED from the blob's
+ * sidecar (the anonymous mailbox deposit carries no usable wire sender) and,
+ * once crypto-verified, written to `out_sender` (32 bytes). On success returns
+ * [`VEIL_OK`], writes the verified destination app id to `out_app_id` (32 bytes)
+ * and the endpoint id to `*out_endpoint_id`. A heap-allocated data buffer is written
+ * to `*out_data` (length to `*out_data_len`); free with [`veil_free_buf`].
+ *
+ * `blob` MUST point to ≥`blob_len`. `out_sender` / `out_app_id` MUST each point
+ * to ≥32 writable bytes; the other out-pointers MUST be writable.
+ */
+
+int veil_mailbox_open(VeilHandle *handle,
+                      uint64_t our_cert_version,
+                      const uint8_t *blob,
+                      size_t blob_len,
+                      uint8_t *out_sender,
+                      uint8_t *out_app_id,
+                      uint32_t *out_endpoint_id,
+                      uint8_t **out_data,
+                      size_t *out_data_len,
+                      char **err_out)
+;
+
+/**
+ * Fetch all blobs currently stored for `receiver_id`. `auth_cookie`
+ * must match a previously-registered rendezvous-publisher entry.
+ *
+ * On success returns ≥0 (the count of blobs returned) and populates
+ * `out_blobs` (allocated via `veil_mailbox_blobs_alloc`-style
+ * caller-managed buffer). Apps fetch blobs into a length-aware
+ * container by calling [`veil_mailbox_fetch_count`] first to size
+ * their array, then [`veil_mailbox_fetch_into`] to copy.
+ *
+ * Two-call API avoids hidden allocations through the FFI boundary —
+ * callers control all memory lifetimes.
+ *
+ * # Safety
+ * `handle`, `receiver_id` (32 B), `auth_cookie` (16 B), `out_count`
+ * must all be valid pointers. `out_count` receives the count.
+ */
+
+int veil_mailbox_fetch_count(VeilHandle *handle,
+                             const uint8_t *receiver_id,
+                             const uint8_t *auth_cookie,
+                             uint32_t *out_count,
+                             char **err_out)
+;
+
+/**
+ * Copy the most-recently-fetched blob list (cached by
+ * [`veil_mailbox_fetch_count`]) into caller-provided buffers.
+ *
+ * `descriptors_out` must point to ≥`max_descriptors` `VeilMailboxBlob`
+ * slots. `blob_buf` is a contiguous byte buffer where blob payloads
+ * are concatenated; descriptors' `blob` pointers index into it.
+ * `blob_buf_len` must be ≥ sum of all blob_len; if too small, returns
+ * `VEIL_ERR_INVALID_ARG` and the cached fetch list is kept (caller
+ * can re-call with a larger buffer without re-fetching).
+ *
+ * On success returns the count of descriptors written and clears the
+ * cache.
+ *
+ * # Safety
+ * All output pointers must be writable for at least the documented
+ * extents. After this call, the descriptor `blob` pointers are valid
+ * only as long as `blob_buf` is alive and unmodified.
+ */
+
+int veil_mailbox_fetch_into(VeilHandle *handle,
+                            VeilMailboxBlob *descriptors_out,
+                            uint32_t max_descriptors,
+                            uint8_t *blob_buf,
+                            size_t blob_buf_len,
+                            char **err_out)
+;
+
+/**
+ * Acknowledge end-to-end receipt of a mailbox blob. Daemon deletes
+ * the blob and frees its quota slice. Idempotent.
+ *
+ * Returns 1 if the blob was removed, 0 if no-op (already acked /
+ * not present / wrong cookie), or negative on transport error.
+ *
+ * # Safety
+ * `handle` must be a live `VeilHandle*`; `receiver_id` (32 B)
+ * `content_id` (32 B), `auth_cookie` (16 B) must point to readable
+ * storage of at least the documented length.
+ */
+
+int veil_mailbox_ack(VeilHandle *handle,
+                     const uint8_t *receiver_id,
+                     const uint8_t *content_id,
+                     const uint8_t *auth_cookie,
+                     char **err_out)
+;
+
+/**
+ * Normalize a candidate nickname. On VEIL_OK, `*out_buf`/`*out_len` hold the
+ * normalized ASCII bytes (free with `veil_free_buf`); returns
+ * VEIL_ERR_INVALID_ARG if the name cannot be normalized (bad charset/length).
+ */
+
+int veil_nickname_normalize(const uint8_t *name,
+                            size_t name_len,
+                            uint8_t **out_buf,
+                            size_t *out_len,
+                            char **err_out)
+;
+
+/**
+ * The cumulative PoW weight a name of this length must carry (the anti-squat
+ * floor) — the host mines until it reaches this. 0 on a bad name.
+ */
+ uint64_t veil_nickname_length_floor(const uint8_t *name, size_t name_len) ;
+
+/**
+ * Mine PoW seeds for `name` under `owner_node_id`, continuing from
+ * `prior_seeds` (a concatenation of 32-byte seeds; may be NULL/0), until the
+ * cumulative weight reaches `target_weight` or `max_hashes` is spent. The
+ * call is bounded by `max_hashes` — the host loops (fresh call = fresh random
+ * salt) and cancels by simply not calling again, threading the returned seed
+ * set back in as `prior_seeds`.
+ *
+ * On VEIL_OK, `*out_buf`/`*out_len` hold a serialized outcome (free with
+ * `veil_free_buf`): `hit_target:u8 | weight:u64 LE | hashes:u64 LE |
+ * seed_count:u32 LE | seeds (count*32)`.
+ */
+
+int veil_nickname_mine(const uint8_t *name,
+                       size_t name_len,
+                       const uint8_t *owner_node_id,
+                       const uint8_t *prior_seeds,
+                       size_t prior_seeds_len,
+                       uint64_t target_weight,
+                       uint64_t max_hashes,
+                       uint8_t **out_buf,
+                       size_t *out_len,
+                       char **err_out)
+;
+
+/**
+ * Verify a serialized nickname record (from `NicknameRecord::to_bytes`).
+ * Returns VEIL_OK if valid; VEIL_ERR with a reason in `err_out` otherwise.
+ */
+ int veil_nickname_verify(const uint8_t *record, size_t record_len, char **err_out) ;
 
 /**
  * Open a short-lived sovereign signer from a recovery phrase.
