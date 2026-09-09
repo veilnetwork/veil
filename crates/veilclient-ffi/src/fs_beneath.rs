@@ -522,7 +522,14 @@ fn open_beneath(root: &str, relative: &str) -> Result<VeilFsFile, String> {
         libc::openat(
             dir,
             leaf.as_ptr(),
-            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            // O_NONBLOCK is not about the reads: on a regular file it changes
+            // nothing. It is about the OPEN. Opening a FIFO with no writer
+            // blocks in `open` itself — before the fstat below ever runs — so
+            // a named pipe sitting in a granted folder held the calling thread
+            // for as long as nobody wrote to it. The type check below promised
+            // to refuse "something that blocks forever" and could not be
+            // reached to do it (report24 V24-FS-01).
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK,
         )
     };
     if fd < 0 {
@@ -548,8 +555,8 @@ fn open_beneath(root: &str, relative: &str) -> Result<VeilFsFile, String> {
         return Err(format!("cannot stat the opened file: {err}"));
     }
     // A directory, a device or a fifo is not a file to send. `O_NOFOLLOW`
-    // already refused a symlink; this refuses the rest, so a caller cannot be
-    // made to read from something that blocks forever.
+    // already refused a symlink; this refuses the rest. Reachable for a FIFO
+    // only because the open above does not block — the two work as a pair.
     if widen(st.st_mode) & widen(libc::S_IFMT) != widen(libc::S_IFREG) {
         unsafe { libc::close(fd) };
         return Err("not a regular file".to_owned());
@@ -965,6 +972,39 @@ mod tests {
         assert_eq!(read_at(&file, 1, &mut out).expect("read"), 4);
         assert_eq!(&out, b"ello");
 
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// A FIFO in the folder must be REFUSED, and refused quickly.
+    ///
+    /// Not the same test as the directory case below: a directory fails the
+    /// type check, while a FIFO with no writer never reaches it — `open`
+    /// blocks in the kernel until somebody opens the other end. Bounded here
+    /// on purpose, because the failure mode of this defect is a thread that
+    /// never comes back, and a test that simply calls the function would hang
+    /// the suite rather than fail it (report24 V24-FS-01).
+    #[test]
+    fn a_fifo_is_refused_without_waiting_for_a_writer() {
+        let root = scratch();
+        let path = root.join("pipe");
+        let c_path = CString::new(path.to_str().unwrap()).unwrap();
+        // SAFETY: `c_path` is NUL-terminated and names a path in a scratch dir.
+        let rc = unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) };
+        assert_eq!(rc, 0, "could not create the fifo: {}", last_error());
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let root_str = root.to_str().unwrap().to_owned();
+        std::thread::spawn(move || {
+            let _ = tx.send(open_beneath(&root_str, "pipe").is_err());
+        });
+
+        match rx.recv_timeout(std::time::Duration::from_secs(5)) {
+            Ok(refused) => assert!(refused, "a fifo is not a file to send"),
+            Err(_) => panic!(
+                "open_beneath blocked on a fifo with no writer — the type \
+                 check cannot refuse what the open never returns from"
+            ),
+        }
         std::fs::remove_dir_all(&root).ok();
     }
 
