@@ -15,6 +15,7 @@
 use super::*;
 // The families that moved to files of their own; the tests came with
 // neither, because they reach across several of them.
+use crate::mailbox::*;
 use crate::sovereign_sign::*;
 use std::ffi::CStr;
 
