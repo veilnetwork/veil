@@ -67,6 +67,25 @@
 #define VEIL_ERR_REENTRANT -4
 
 /**
+ * Returned when too many runtime threads from previous tunnels never came
+ * back, so starting another would strand more.
+ *
+ * Every tunnel teardown that cannot wake a blocking read abandons the thread
+ * parked in it — counted by
+ * [`veil_packet_tunnel_abandoned_workers`](crate::packet_tunnel::veil_packet_tunnel_abandoned_workers).
+ * The slot was freed regardless, so start/stop in a loop against a wedged
+ * reader parked one more thread per cycle with nothing to stop it: threads
+ * and their stacks grow until the process dies (report17 V17-M5).
+ *
+ * Refusing is the honest answer available here. Waking the reader would be
+ * better and is not possible from this tree — the blocking read lives in a
+ * crate it does not own — so the choice is between a tunnel that will not
+ * start and a process that will eventually be killed. The remedy belongs to
+ * the host: restart the process.
+ */
+#define VEIL_ERR_TUNNEL_WORKERS_STRANDED -23
+
+/**
  * hard cap on `data` byte length accepted by
  * FFI calls that allocate from caller-supplied len. Sits BELOW the daemon's
  * `MAX_FRAME_BODY` (16 MiB) by enough headroom for the largest IPC send-payload
@@ -384,6 +403,52 @@
  */
 #define VEIL_DEFAULT_RESTORE_VALIDITY_SECS ((30 * 24) * 3600)
 
+#if defined(VEIL_FFI_NODE_EMBEDDED)
+#define STREAM_ENDPOINT_ID 12
+#endif
+
+/**
+ * First byte of every media cell on the onion transport. Distinct from
+ * `veil_onion_stream::wire::PROTO_VER` (= 1), so a media cell is already an
+ * invalid stream frame (`Frame::decode` → `None`) and the reliable demux would
+ * reject it outright — media and stream coexist on one circuit with zero
+ * collision, separated only by this byte.
+ */
+#define MEDIA_MAGIC 77
+
+/**
+ * First byte of a *plaintext* media cell containing several RTP/RTCP
+ * datagrams. It lives INSIDE the seal: a batch envelope is media content, not
+ * routing, so no one on the path may see it, rewrite it, or fan it out.
+ * Distinct from the 0x80..0xBF range that opens a real RTP/RTCP packet, so the
+ * receiver can tell a batch from a lone datagram by this byte alone.
+ */
+#define MEDIA_BATCH_MAGIC 66
+
+#if defined(VEIL_FFI_NODE_EMBEDDED)
+/**
+ * `veil_nickname_resolve`: positive verdict for "the name is free" (no valid
+ * owner record found) — not an error.
+ */
+#define NICKNAME_FREE 1
+#endif
+
+#if defined(VEIL_FFI_PACKET_TUNNEL)
+#define VEIL_TUNNEL_STOPPED 0
+#endif
+
+#if defined(VEIL_FFI_PACKET_TUNNEL)
+#define VEIL_TUNNEL_STARTING 1
+#endif
+
+#if defined(VEIL_FFI_PACKET_TUNNEL)
+#define VEIL_TUNNEL_RUNNING 2
+#endif
+
+#if defined(VEIL_FFI_PACKET_TUNNEL)
+#define VEIL_TUNNEL_ERROR 3
+#endif
+
 /**
  * Wire-byte status codes for Source-side pairing ops.  Mirror
  * `veil_proto::pair_source_status`.
@@ -469,25 +534,6 @@
 #define VEIL_ERR_RATCHET_BUFFER_TOO_SMALL -21
 #endif
 
-/**
- * Returned when too many runtime threads from previous tunnels never came
- * back, so starting another would strand more.
- *
- * Every tunnel teardown that cannot wake a blocking read abandons the thread
- * parked in it — counted by
- * [`veil_packet_tunnel_abandoned_workers`](crate::packet_tunnel::veil_packet_tunnel_abandoned_workers).
- * The slot was freed regardless, so start/stop in a loop against a wedged
- * reader parked one more thread per cycle with nothing to stop it: threads
- * and their stacks grow until the process dies (report17 V17-M5).
- *
- * Refusing is the honest answer available here. Waking the reader would be
- * better and is not possible from this tree — the blocking read lives in a
- * crate it does not own — so the choice is between a tunnel that will not
- * start and a process that will eventually be killed. The remedy belongs to
- * the host: restart the process.
- */
-#define VEIL_ERR_TUNNEL_WORKERS_STRANDED -23
-
 #if defined(VEIL_FFI_NODE_EMBEDDED)
 /**
  * Returned when the store is at [`VEIL_RATCHET_MAX_CONVERSATIONS`] and every
@@ -527,52 +573,6 @@
  * buffer, and a bogus one must be refused rather than followed.
  */
 #define VEIL_RATCHET_MAX_ACK_KEYS 4096
-#endif
-
-#if defined(VEIL_FFI_NODE_EMBEDDED)
-#define STREAM_ENDPOINT_ID 12
-#endif
-
-/**
- * First byte of every media cell on the onion transport. Distinct from
- * `veil_onion_stream::wire::PROTO_VER` (= 1), so a media cell is already an
- * invalid stream frame (`Frame::decode` → `None`) and the reliable demux would
- * reject it outright — media and stream coexist on one circuit with zero
- * collision, separated only by this byte.
- */
-#define MEDIA_MAGIC 77
-
-/**
- * First byte of a *plaintext* media cell containing several RTP/RTCP
- * datagrams. It lives INSIDE the seal: a batch envelope is media content, not
- * routing, so no one on the path may see it, rewrite it, or fan it out.
- * Distinct from the 0x80..0xBF range that opens a real RTP/RTCP packet, so the
- * receiver can tell a batch from a lone datagram by this byte alone.
- */
-#define MEDIA_BATCH_MAGIC 66
-
-#if defined(VEIL_FFI_NODE_EMBEDDED)
-/**
- * `veil_nickname_resolve`: positive verdict for "the name is free" (no valid
- * owner record found) — not an error.
- */
-#define NICKNAME_FREE 1
-#endif
-
-#if defined(VEIL_FFI_PACKET_TUNNEL)
-#define VEIL_TUNNEL_STOPPED 0
-#endif
-
-#if defined(VEIL_FFI_PACKET_TUNNEL)
-#define VEIL_TUNNEL_STARTING 1
-#endif
-
-#if defined(VEIL_FFI_PACKET_TUNNEL)
-#define VEIL_TUNNEL_RUNNING 2
-#endif
-
-#if defined(VEIL_FFI_PACKET_TUNNEL)
-#define VEIL_TUNNEL_ERROR 3
 #endif
 
 typedef struct Option_MediaRecvFn Option_MediaRecvFn;
@@ -2934,551 +2934,6 @@ int veil_restore_identity_from_phrase_zeroize_with_password(uint8_t *phrase,
 ;
 
 /**
- * Open a short-lived sovereign signer from a recovery phrase.
- *
- * The writable phrase buffer is wiped on every path. Only an opaque handle,
- * the public key, and its node id cross back to the caller; the decoded master
- * seed and derived signing seed remain in native memory and zeroize on drop.
- * Call [`veil_sovereign_signer_close`] immediately after the membership-signing
- * burst.
- */
-
-int veil_sovereign_signer_open_from_phrase_zeroize(uint8_t *phrase,
-                                                   size_t phrase_len,
-                                                   VeilSovereignSigner **out_signer,
-                                                   uint8_t *out_node_id,
-                                                   size_t out_node_id_cap,
-                                                   uint8_t *out_public_key,
-                                                   size_t out_public_key_cap,
-                                                   char **err_out)
-;
-
-/**
- * Sign one message during an open sovereign burst. The output is a raw
- * 64-byte Ed25519 signature.
- */
-
-int veil_sovereign_signer_sign(VeilSovereignSigner *signer,
-                               const uint8_t *message,
-                               size_t message_len,
-                               uint8_t *out_signature,
-                               size_t out_signature_cap,
-                               char **err_out)
-;
-
-/**
- * Create a portable Ed25519+Falcon512 sovereign bundle encrypted with the
- * recovery phrase. The mutable phrase is wiped on every path. The returned
- * ciphertext buffer is freed with [`veil_free_buf`].
- */
-
-int veil_sovereign_bundle_create_hybrid512_zeroize(uint8_t *phrase,
-                                                   size_t phrase_len,
-                                                   uint8_t **out_bundle,
-                                                   size_t *out_bundle_len,
-                                                   char **err_out)
-;
-
-/**
- * Re-wrap an existing XVSB or XVRC credential into a fresh XVRC recovery
- * certificate while preserving the exact full public key and derived node id.
- * Current-secret and new-code buffers are wiped on every path; only encrypted
- * certificate bytes return.
- */
-
-int veil_sovereign_recovery_certificate_export_zeroize(const uint8_t *bundle,
-                                                       size_t bundle_len,
-                                                       uint8_t *phrase,
-                                                       size_t phrase_len,
-                                                       uint8_t *recovery_code,
-                                                       size_t recovery_code_len,
-                                                       uint8_t **out_certificate,
-                                                       size_t *out_certificate_len,
-                                                       char **err_out)
-;
-
-/**
- * Open an XVRC with its independent recovery code as a short-lived hybrid
- * signer. The code is wiped before return and plaintext material stays native.
- */
-
-int veil_sovereign_signer_open_recovery_certificate_zeroize(const uint8_t *certificate,
-                                                            size_t certificate_len,
-                                                            uint8_t *recovery_code,
-                                                            size_t recovery_code_len,
-                                                            VeilSovereignSigner **out_signer,
-                                                            uint8_t *out_algorithm,
-                                                            uint8_t *out_node_id,
-                                                            size_t out_node_id_cap,
-                                                            uint8_t *out_public_key,
-                                                            size_t out_public_key_cap,
-                                                            size_t *out_public_key_len,
-                                                            char **err_out)
-;
-
-/**
- * Decrypt a local sovereign bundle and open a short-lived variable-algorithm
- * signer. Neither phrase nor plaintext key material crosses back to the host.
- */
-
-int veil_sovereign_signer_open_bundle_zeroize(const uint8_t *bundle,
-                                              size_t bundle_len,
-                                              uint8_t *phrase,
-                                              size_t phrase_len,
-                                              VeilSovereignSigner **out_signer,
-                                              uint8_t *out_algorithm,
-                                              uint8_t *out_node_id,
-                                              size_t out_node_id_cap,
-                                              uint8_t *out_public_key,
-                                              size_t out_public_key_cap,
-                                              size_t *out_public_key_len,
-                                              char **err_out)
-;
-
-/**
- * Variable-length sovereign signature API. `out_signature_len` receives the
- * exact number of bytes written (64 for Ed25519, ~700-830 for hybrid-512).
- */
-
-int veil_sovereign_signer_sign_into(VeilSovereignSigner *signer,
-                                    const uint8_t *message,
-                                    size_t message_len,
-                                    uint8_t *out_signature,
-                                    size_t out_signature_cap,
-                                    size_t *out_signature_len,
-                                    char **err_out)
-;
-
-/**
- * Verify an algorithm-tagged sovereign signature and bind the supplied node
- * id to the full public key. Invalid signatures return VEIL_OK + false.
- */
-
-int veil_sovereign_verify(uint8_t algorithm,
-                          const uint8_t *node_id,
-                          const uint8_t *public_key,
-                          size_t public_key_len,
-                          const uint8_t *message,
-                          size_t message_len,
-                          const uint8_t *signature,
-                          size_t signature_len,
-                          bool *out_valid,
-                          char **err_out)
-;
-
-/**
- * Close a sovereign signing burst. Double-close and stale handles are safe
- * no-ops; the generational table prevents ABA reuse.
- */
- void veil_sovereign_signer_close(VeilSovereignSigner *signer) ;
-
-/**
- * Source-side: generate a pair-invite URI + initialize ceremony.
- * On success, `*out_uri` receives a malloc'd NUL-terminated UTF-8
- * string — caller frees with [`veil_free_string`].  `password` is the
- * master_sk decryption passphrase as `(ptr, len)` UTF-8; pass a NULL pointer
- * (length ignored) for a standalone identity with no encrypted master.
- */
-
-int veil_pair_source_create_invite(VeilHandle *handle,
-                                   const uint8_t *password,
-                                   uintptr_t password_len,
-                                   uint8_t *out_status,
-                                   char **out_uri,
-                                   char **err_out)
-;
-
-/**
- * Source-side: process Hello bytes from Target.  Returns Cert bytes
- * (via caller buffer) + 6-digit OOB code.  `out_cert_buf` must be
- * writable for ≥ `out_cert_buf_cap` bytes (recommend
- * `VEIL_MAX_PAIR_CEREMONY_BYTES` = 64 KiB so a fixed-size buffer
- * always fits the Cert).  `out_oob_6` MUST point to a 6-byte buffer.
- */
-
-int veil_pair_source_handle_hello(VeilHandle *handle,
-                                  const uint8_t *hello_bytes,
-                                  size_t hello_len,
-                                  uint8_t *out_status,
-                                  uint8_t *out_oob_6,
-                                  uint8_t *out_cert_buf,
-                                  size_t out_cert_buf_cap,
-                                  size_t *out_cert_len,
-                                  char **err_out)
-;
-
-/**
- * Source-side: process Confirm bytes — finalizes the ceremony.
- *
- * Phase 6.49 exemplar: uses [`guard::ffi_prelude`] + [`null_check!`]
- * for the boundary checks so that the consistent error messages
- * land on every FFI fn after incremental migration.
- */
-
-int veil_pair_source_handle_confirm(VeilHandle *handle,
-                                    const uint8_t *confirm_bytes,
-                                    size_t confirm_len,
-                                    uint8_t *out_status,
-                                    char **err_out)
-;
-
-/**
- * Target-side: consume scanned URI, build Hello bytes.
- */
-
-int veil_pair_target_consume_uri(VeilHandle *handle,
-                                 const uint8_t *uri,
-                                 uintptr_t uri_len,
-                                 uint8_t *out_status,
-                                 uint8_t *out_hello_buf,
-                                 size_t out_hello_buf_cap,
-                                 size_t *out_hello_len,
-                                 char **err_out)
-;
-
-/**
- * Target-side: process Cert bytes, return OOB code.
- *
- * Phase 6.49 exemplar (second after `veil_pair_source_handle_confirm`).
- */
-
-int veil_pair_target_handle_cert(VeilHandle *handle,
-                                 const uint8_t *cert_bytes,
-                                 size_t cert_len,
-                                 uint8_t *out_status,
-                                 uint8_t *out_oob_6,
-                                 char **err_out)
-;
-
-/**
- * Target-side: emit Confirm bytes based on user's OOB-compare
- * decision.  `confirmed = 1` triggers identity persistence.
- */
-
-int veil_pair_target_build_confirm(VeilHandle *handle,
-                                   uint8_t confirmed,
-                                   uint8_t *out_status,
-                                   uint8_t *out_confirm_buf,
-                                   size_t out_confirm_buf_cap,
-                                   size_t *out_confirm_len,
-                                   char **err_out)
-;
-
-#if defined(VEIL_FFI_NODE_EMBEDDED)
-/**
- * How many ratchet operations this node has committed since it started.
- *
- * Monotonic, never reset, and moved only by work that actually completed — a
- * forged frame that failed its tag moves nothing. A host that samples this
- * can tell "no conversation changed" from "one changed and I read it twice",
- * which a dirty list alone cannot say.
- *
- * # Safety
- *
- * `handle` must be a live handle. `out_version` MUST be writable.
- */
- int veil_ratchet_state_version(VeilHandle *handle, uint64_t *out_version, char **err_out) ;
-#endif
-
-#if defined(VEIL_FFI_NODE_EMBEDDED)
-/**
- * Name up to `out_buf_cap / VEIL_RATCHET_KEY_LEN` conversations waiting to be
- * persisted, WITHOUT clearing anything.
- *
- * `*out_written` receives how many keys were written — a COUNT OF KEYS, not a
- * byte length. `*out_remaining` receives how many are still waiting beyond
- * them, so a host with a small buffer loops until it reads zero.
- * `*out_generation` receives the store's version at the moment of the read,
- * and is what the host hands to [`veil_ratchet_ack_dirty`].
- *
- * The host's contract is peek, persist, THEN acknowledge, and it must persist
- * before it treats the send or receive that produced the change as complete.
- * Reading the list is deliberately not what discharges the obligation: between
- * here and a durable write there is an export, a worker hop and a commit, and
- * a failure at any of them would otherwise lose the only notice these
- * conversations get until they change again.
- *
- * # Safety
- *
- * `handle` must be live. `out_buf` MUST be writable for `out_buf_cap` bytes.
- * `out_written`, `out_remaining` and `out_generation` MUST be writable.
- */
-
-int veil_ratchet_peek_dirty(VeilHandle *handle,
-                            uint8_t *out_buf,
-                            size_t out_buf_cap,
-                            size_t *out_written,
-                            size_t *out_remaining,
-                            uint64_t *out_generation,
-                            char **err_out)
-;
-#endif
-
-#if defined(VEIL_FFI_NODE_EMBEDDED)
-/**
- * Clear the marks of `key_count` conversations whose state is now durable.
- *
- * `generation` is the value [`veil_ratchet_peek_dirty`] reported for the read
- * these keys came from. A conversation that has changed since was re-marked at
- * a later generation and KEEPS its mark: the bytes the host just wrote do not
- * contain that change, and clearing it would discard the only notice it gets.
- * `*out_cleared` receives how many marks were actually cleared, which is how a
- * host sees that a conversation moved under it.
- *
- * Acknowledging a conversation nobody marked is not an error.
- *
- * Returns [`VEIL_ERR_INVALID_ARG`] when `key_count` exceeds
- * [`VEIL_RATCHET_MAX_ACK_KEYS`], in which case nothing was read or cleared.
- *
- * # Safety
- *
- * `handle` must be live. `keys` MUST point to
- * `key_count * VEIL_RATCHET_KEY_LEN` readable bytes. `out_cleared` MUST be
- * writable.
- */
-
-int veil_ratchet_ack_dirty(VeilHandle *handle,
-                           const uint8_t *keys,
-                           size_t key_count,
-                           uint64_t generation,
-                           size_t *out_cleared,
-                           char **err_out)
-;
-#endif
-
-#if defined(VEIL_FFI_NODE_EMBEDDED)
-/**
- * List the conversations this node holds, for a full save at shutdown.
- *
- * `*out_total` receives the TOTAL number held, which may exceed what fit in
- * `out_buf`; nothing is consumed, so a host may call this as often as it
- * likes.
- *
- * # Safety
- *
- * `handle` must be live. `out_buf` MUST be writable for `out_buf_cap` bytes.
- * `out_total` MUST be writable.
- */
-
-int veil_ratchet_list(VeilHandle *handle,
-                      uint8_t *out_buf,
-                      size_t out_buf_cap,
-                      size_t *out_total,
-                      char **err_out)
-;
-#endif
-
-#if defined(VEIL_FFI_NODE_EMBEDDED)
-/**
- * One page of the conversations this node holds, in key order, resuming
- * strictly after `after_key_64`.
- *
- * Pass `NULL` for `after_key_64` to start the walk, then pass the LAST key of
- * the page just returned to continue it. A page shorter than
- * `out_buf_cap / VEIL_RATCHET_KEY_LEN` is the end; a page of zero keys is the
- * end with nothing in it. `*out_written` receives the count of keys written.
- *
- * This is what [`veil_ratchet_list`] cannot do. That call writes as many keys
- * as fit and reports the total, so a host whose buffer is smaller than the
- * store can never reach the tail — it can only allocate for the whole set and
- * try again. Here the cost of a page is the page: the walk seeks in
- * logarithmic time and holds the store's lock for the length of the page
- * rather than the length of the store, so a full save streams instead of
- * stopping every other send and receive while it copies.
- *
- * The cursor is a key rather than an offset because the store moves between
- * pages — a conversation opens, another is evicted by the quota — and an
- * offset would then skip or repeat whatever crossed it. Resuming at a key is
- * well-defined whether or not that key is still held.
- *
- * # Safety
- *
- * `handle` must be live. `after_key_64`, when not NULL, MUST point to exactly
- * [`VEIL_RATCHET_KEY_LEN`] readable bytes. `out_buf` MUST be writable for
- * `out_buf_cap` bytes. `out_written` MUST be writable.
- */
-
-int veil_ratchet_list_page(VeilHandle *handle,
-                           const uint8_t *after_key_64,
-                           uint8_t *out_buf,
-                           size_t out_buf_cap,
-                           size_t *out_written,
-                           char **err_out)
-;
-#endif
-
-#if defined(VEIL_FFI_NODE_EMBEDDED)
-/**
- * Drop every unproven conversation that has gone unused for longer than the
- * ratchet's time-to-live, and mark each so the host deletes its stored blob.
- * `*out_dropped` receives how many went.
- *
- * For a host to call on a timer, or when it comes back to the foreground.
- * Without it the sweep only runs when the store is full, so a device that has
- * been flooded once keeps carrying the wreckage until something else needs
- * the room.
- *
- * "Unproven" means a conversation this device has never sent a message on:
- * somebody opened it, and nothing has confirmed they are who they named. Only
- * those are aged out. A conversation that has carried traffic is never
- * dropped by time, at any age — the peer's copy of it cannot be restarted by
- * anything on the wire, so aging one out would wedge both ends for good. The
- * host decides those with [`veil_ratchet_forget`].
- *
- * The clock is this device's own, read here. There is no parameter for it,
- * because there must be no way for a value that came off the network to
- * decide which conversations are old enough to disappear.
- *
- * # Safety
- *
- * `handle` must be live. `out_dropped` MUST be writable.
- */
- int veil_ratchet_expire(VeilHandle *handle, size_t *out_dropped, char **err_out) ;
-#endif
-
-#if defined(VEIL_FFI_NODE_EMBEDDED)
-/**
- * Export one conversation's whole state.
- *
- * EVERY BYTE IS KEY MATERIAL. The host must store it encrypted and must not
- * log, copy to temporary files, or transmit it. In this project that store is
- * the hidden volume.
- *
- * Returns [`VEIL_ERR_RATCHET_NO_CONVERSATION`] when the key names nothing
- * held, and [`VEIL_ERR_RATCHET_BUFFER_TOO_SMALL`] when the buffer cannot take
- * the state — in which case `*out_len` receives the length required and
- * nothing was written or consumed.
- *
- * # Safety
- *
- * `handle` must be live. `key_64` MUST point to exactly
- * [`VEIL_RATCHET_KEY_LEN`] readable bytes. `out_buf` MUST be writable for
- * `out_buf_cap` bytes. `out_len` MUST be writable.
- */
-
-int veil_ratchet_export(VeilHandle *handle,
-                        const uint8_t *key_64,
-                        uint8_t *out_buf,
-                        size_t out_buf_cap,
-                        size_t *out_len,
-                        char **err_out)
-;
-#endif
-
-#if defined(VEIL_FFI_NODE_EMBEDDED)
-/**
- * Where a conversation's sending chain stands: the chain it is on, and the
- * index the next sealed message will carry.
- *
- * A host records this durably BEFORE it publishes a ciphertext, so that a
- * state write which never lands cannot let a restart re-derive a key this
- * session already spent on the wire (report12 X-H5). It is 36 bytes against
- * the state's kilobytes, which is what makes it affordable on the send path —
- * and a host reserving a small run of indices at a time pays it once per run
- * rather than once per message.
- *
- * Returns [`VEIL_ERR_RATCHET_NO_CONVERSATION`] when the key names nothing
- * held, or names a conversation with no sending chain yet — there is then no
- * position to reserve, and nothing has been published either.
- *
- * # Safety
- *
- * `handle` must be live. `key_64` MUST point to exactly
- * [`VEIL_RATCHET_KEY_LEN`] readable bytes. `out_chain_32` MUST be writable
- * for 32 bytes. `out_next` MUST be writable.
- */
-
-int veil_ratchet_send_position(VeilHandle *handle,
-                               const uint8_t *key_64,
-                               uint8_t *out_chain_32,
-                               uint32_t *out_next,
-                               char **err_out)
-;
-#endif
-
-#if defined(VEIL_FFI_NODE_EMBEDDED)
-/**
- * Step a conversation's sending chain past every index that might already
- * have been spent, and report how many keys were burned.
- *
- * The recovery half of [`veil_ratchet_send_position`]: on start, a state
- * restored from before an unwritten send is fast-forwarded to the last
- * position the host recorded. Keys burned this way were never emitted, so the
- * peer sees a gap its skipped-key window absorbs.
- *
- * A position naming a chain this conversation is no longer on, or an index it
- * has already passed, burns nothing and is not an error — keys from a chain
- * we no longer hold cannot collide with keys from the one we do.
- *
- * Returns [`VEIL_ERR_RATCHET_NO_CONVERSATION`] when the key names nothing
- * held, and [`VEIL_ERR_INVALID_ARG`] when the position asks for a jump past
- * what a host reserving indices could legitimately have got ahead — a
- * corrupted or hostile mark. Nothing is burned in either case.
- *
- * # Safety
- *
- * `handle` must be live. `key_64` MUST point to exactly
- * [`VEIL_RATCHET_KEY_LEN`] readable bytes. `chain_32` MUST point to 32
- * readable bytes. `out_burned` MUST be writable.
- */
-
-int veil_ratchet_skip_send_to(VeilHandle *handle,
-                              const uint8_t *key_64,
-                              const uint8_t *chain_32,
-                              uint32_t next,
-                              uint32_t *out_burned,
-                              char **err_out)
-;
-#endif
-
-#if defined(VEIL_FFI_NODE_EMBEDDED)
-/**
- * Restore one conversation from bytes [`veil_ratchet_export`] produced.
- *
- * Called for every stored conversation at startup, BEFORE traffic flows: a
- * frame that arrives for a conversation not yet restored cannot be opened,
- * and — unlike a lost network packet — the sender has already advanced its
- * chain, so nothing will re-send it in a form this node can read.
- *
- * Replaces whatever is held under that key. Rejects a blob it does not fully
- * understand rather than salvaging part of one: a partially-understood
- * session is a session with the wrong keys.
- *
- * # Safety
- *
- * `handle` must be live. `key_64` MUST point to exactly
- * [`VEIL_RATCHET_KEY_LEN`] readable bytes. `blob` MUST point to `blob_len`
- * readable bytes.
- */
-
-int veil_ratchet_import(VeilHandle *handle,
-                        const uint8_t *key_64,
-                        const uint8_t *blob,
-                        size_t blob_len,
-                        char **err_out)
-;
-#endif
-
-#if defined(VEIL_FFI_NODE_EMBEDDED)
-/**
- * Drop one conversation.
- *
- * Irreversible: nothing public can rebuild the chain, so every message the
- * peer has already sealed to it is unreadable from here on. For when the host
- * deletes a chat or removes a device — not for eviction, which would cost
- * every message that peer sends afterwards.
- *
- * Returns [`VEIL_ERR_RATCHET_NO_CONVERSATION`] if nothing was held.
- *
- * # Safety
- *
- * `handle` must be live. `key_64` MUST point to exactly
- * [`VEIL_RATCHET_KEY_LEN`] readable bytes.
- */
- int veil_ratchet_forget(VeilHandle *handle, const uint8_t *key_64, char **err_out) ;
-#endif
-
-/**
  * Open `relative` beneath `root`, following no symlink on the way.
  *
  * `root` is opened by name — it is the anchor the caller already trusts and
@@ -4175,6 +3630,551 @@ int veil_space_discovery_resolve(const uint8_t *self_node_id,
                                  size_t *out_len,
                                  char **err_out)
 ;
+#endif
+
+/**
+ * Open a short-lived sovereign signer from a recovery phrase.
+ *
+ * The writable phrase buffer is wiped on every path. Only an opaque handle,
+ * the public key, and its node id cross back to the caller; the decoded master
+ * seed and derived signing seed remain in native memory and zeroize on drop.
+ * Call [`veil_sovereign_signer_close`] immediately after the membership-signing
+ * burst.
+ */
+
+int veil_sovereign_signer_open_from_phrase_zeroize(uint8_t *phrase,
+                                                   size_t phrase_len,
+                                                   VeilSovereignSigner **out_signer,
+                                                   uint8_t *out_node_id,
+                                                   size_t out_node_id_cap,
+                                                   uint8_t *out_public_key,
+                                                   size_t out_public_key_cap,
+                                                   char **err_out)
+;
+
+/**
+ * Sign one message during an open sovereign burst. The output is a raw
+ * 64-byte Ed25519 signature.
+ */
+
+int veil_sovereign_signer_sign(VeilSovereignSigner *signer,
+                               const uint8_t *message,
+                               size_t message_len,
+                               uint8_t *out_signature,
+                               size_t out_signature_cap,
+                               char **err_out)
+;
+
+/**
+ * Create a portable Ed25519+Falcon512 sovereign bundle encrypted with the
+ * recovery phrase. The mutable phrase is wiped on every path. The returned
+ * ciphertext buffer is freed with [`veil_free_buf`].
+ */
+
+int veil_sovereign_bundle_create_hybrid512_zeroize(uint8_t *phrase,
+                                                   size_t phrase_len,
+                                                   uint8_t **out_bundle,
+                                                   size_t *out_bundle_len,
+                                                   char **err_out)
+;
+
+/**
+ * Re-wrap an existing XVSB or XVRC credential into a fresh XVRC recovery
+ * certificate while preserving the exact full public key and derived node id.
+ * Current-secret and new-code buffers are wiped on every path; only encrypted
+ * certificate bytes return.
+ */
+
+int veil_sovereign_recovery_certificate_export_zeroize(const uint8_t *bundle,
+                                                       size_t bundle_len,
+                                                       uint8_t *phrase,
+                                                       size_t phrase_len,
+                                                       uint8_t *recovery_code,
+                                                       size_t recovery_code_len,
+                                                       uint8_t **out_certificate,
+                                                       size_t *out_certificate_len,
+                                                       char **err_out)
+;
+
+/**
+ * Open an XVRC with its independent recovery code as a short-lived hybrid
+ * signer. The code is wiped before return and plaintext material stays native.
+ */
+
+int veil_sovereign_signer_open_recovery_certificate_zeroize(const uint8_t *certificate,
+                                                            size_t certificate_len,
+                                                            uint8_t *recovery_code,
+                                                            size_t recovery_code_len,
+                                                            VeilSovereignSigner **out_signer,
+                                                            uint8_t *out_algorithm,
+                                                            uint8_t *out_node_id,
+                                                            size_t out_node_id_cap,
+                                                            uint8_t *out_public_key,
+                                                            size_t out_public_key_cap,
+                                                            size_t *out_public_key_len,
+                                                            char **err_out)
+;
+
+/**
+ * Decrypt a local sovereign bundle and open a short-lived variable-algorithm
+ * signer. Neither phrase nor plaintext key material crosses back to the host.
+ */
+
+int veil_sovereign_signer_open_bundle_zeroize(const uint8_t *bundle,
+                                              size_t bundle_len,
+                                              uint8_t *phrase,
+                                              size_t phrase_len,
+                                              VeilSovereignSigner **out_signer,
+                                              uint8_t *out_algorithm,
+                                              uint8_t *out_node_id,
+                                              size_t out_node_id_cap,
+                                              uint8_t *out_public_key,
+                                              size_t out_public_key_cap,
+                                              size_t *out_public_key_len,
+                                              char **err_out)
+;
+
+/**
+ * Variable-length sovereign signature API. `out_signature_len` receives the
+ * exact number of bytes written (64 for Ed25519, ~700-830 for hybrid-512).
+ */
+
+int veil_sovereign_signer_sign_into(VeilSovereignSigner *signer,
+                                    const uint8_t *message,
+                                    size_t message_len,
+                                    uint8_t *out_signature,
+                                    size_t out_signature_cap,
+                                    size_t *out_signature_len,
+                                    char **err_out)
+;
+
+/**
+ * Verify an algorithm-tagged sovereign signature and bind the supplied node
+ * id to the full public key. Invalid signatures return VEIL_OK + false.
+ */
+
+int veil_sovereign_verify(uint8_t algorithm,
+                          const uint8_t *node_id,
+                          const uint8_t *public_key,
+                          size_t public_key_len,
+                          const uint8_t *message,
+                          size_t message_len,
+                          const uint8_t *signature,
+                          size_t signature_len,
+                          bool *out_valid,
+                          char **err_out)
+;
+
+/**
+ * Close a sovereign signing burst. Double-close and stale handles are safe
+ * no-ops; the generational table prevents ABA reuse.
+ */
+ void veil_sovereign_signer_close(VeilSovereignSigner *signer) ;
+
+/**
+ * Source-side: generate a pair-invite URI + initialize ceremony.
+ * On success, `*out_uri` receives a malloc'd NUL-terminated UTF-8
+ * string — caller frees with [`veil_free_string`].  `password` is the
+ * master_sk decryption passphrase as `(ptr, len)` UTF-8; pass a NULL pointer
+ * (length ignored) for a standalone identity with no encrypted master.
+ */
+
+int veil_pair_source_create_invite(VeilHandle *handle,
+                                   const uint8_t *password,
+                                   uintptr_t password_len,
+                                   uint8_t *out_status,
+                                   char **out_uri,
+                                   char **err_out)
+;
+
+/**
+ * Source-side: process Hello bytes from Target.  Returns Cert bytes
+ * (via caller buffer) + 6-digit OOB code.  `out_cert_buf` must be
+ * writable for ≥ `out_cert_buf_cap` bytes (recommend
+ * `VEIL_MAX_PAIR_CEREMONY_BYTES` = 64 KiB so a fixed-size buffer
+ * always fits the Cert).  `out_oob_6` MUST point to a 6-byte buffer.
+ */
+
+int veil_pair_source_handle_hello(VeilHandle *handle,
+                                  const uint8_t *hello_bytes,
+                                  size_t hello_len,
+                                  uint8_t *out_status,
+                                  uint8_t *out_oob_6,
+                                  uint8_t *out_cert_buf,
+                                  size_t out_cert_buf_cap,
+                                  size_t *out_cert_len,
+                                  char **err_out)
+;
+
+/**
+ * Source-side: process Confirm bytes — finalizes the ceremony.
+ *
+ * Phase 6.49 exemplar: uses [`guard::ffi_prelude`] + [`null_check!`]
+ * for the boundary checks so that the consistent error messages
+ * land on every FFI fn after incremental migration.
+ */
+
+int veil_pair_source_handle_confirm(VeilHandle *handle,
+                                    const uint8_t *confirm_bytes,
+                                    size_t confirm_len,
+                                    uint8_t *out_status,
+                                    char **err_out)
+;
+
+/**
+ * Target-side: consume scanned URI, build Hello bytes.
+ */
+
+int veil_pair_target_consume_uri(VeilHandle *handle,
+                                 const uint8_t *uri,
+                                 uintptr_t uri_len,
+                                 uint8_t *out_status,
+                                 uint8_t *out_hello_buf,
+                                 size_t out_hello_buf_cap,
+                                 size_t *out_hello_len,
+                                 char **err_out)
+;
+
+/**
+ * Target-side: process Cert bytes, return OOB code.
+ *
+ * Phase 6.49 exemplar (second after `veil_pair_source_handle_confirm`).
+ */
+
+int veil_pair_target_handle_cert(VeilHandle *handle,
+                                 const uint8_t *cert_bytes,
+                                 size_t cert_len,
+                                 uint8_t *out_status,
+                                 uint8_t *out_oob_6,
+                                 char **err_out)
+;
+
+/**
+ * Target-side: emit Confirm bytes based on user's OOB-compare
+ * decision.  `confirmed = 1` triggers identity persistence.
+ */
+
+int veil_pair_target_build_confirm(VeilHandle *handle,
+                                   uint8_t confirmed,
+                                   uint8_t *out_status,
+                                   uint8_t *out_confirm_buf,
+                                   size_t out_confirm_buf_cap,
+                                   size_t *out_confirm_len,
+                                   char **err_out)
+;
+
+#if defined(VEIL_FFI_NODE_EMBEDDED)
+/**
+ * How many ratchet operations this node has committed since it started.
+ *
+ * Monotonic, never reset, and moved only by work that actually completed — a
+ * forged frame that failed its tag moves nothing. A host that samples this
+ * can tell "no conversation changed" from "one changed and I read it twice",
+ * which a dirty list alone cannot say.
+ *
+ * # Safety
+ *
+ * `handle` must be a live handle. `out_version` MUST be writable.
+ */
+ int veil_ratchet_state_version(VeilHandle *handle, uint64_t *out_version, char **err_out) ;
+#endif
+
+#if defined(VEIL_FFI_NODE_EMBEDDED)
+/**
+ * Name up to `out_buf_cap / VEIL_RATCHET_KEY_LEN` conversations waiting to be
+ * persisted, WITHOUT clearing anything.
+ *
+ * `*out_written` receives how many keys were written — a COUNT OF KEYS, not a
+ * byte length. `*out_remaining` receives how many are still waiting beyond
+ * them, so a host with a small buffer loops until it reads zero.
+ * `*out_generation` receives the store's version at the moment of the read,
+ * and is what the host hands to [`veil_ratchet_ack_dirty`].
+ *
+ * The host's contract is peek, persist, THEN acknowledge, and it must persist
+ * before it treats the send or receive that produced the change as complete.
+ * Reading the list is deliberately not what discharges the obligation: between
+ * here and a durable write there is an export, a worker hop and a commit, and
+ * a failure at any of them would otherwise lose the only notice these
+ * conversations get until they change again.
+ *
+ * # Safety
+ *
+ * `handle` must be live. `out_buf` MUST be writable for `out_buf_cap` bytes.
+ * `out_written`, `out_remaining` and `out_generation` MUST be writable.
+ */
+
+int veil_ratchet_peek_dirty(VeilHandle *handle,
+                            uint8_t *out_buf,
+                            size_t out_buf_cap,
+                            size_t *out_written,
+                            size_t *out_remaining,
+                            uint64_t *out_generation,
+                            char **err_out)
+;
+#endif
+
+#if defined(VEIL_FFI_NODE_EMBEDDED)
+/**
+ * Clear the marks of `key_count` conversations whose state is now durable.
+ *
+ * `generation` is the value [`veil_ratchet_peek_dirty`] reported for the read
+ * these keys came from. A conversation that has changed since was re-marked at
+ * a later generation and KEEPS its mark: the bytes the host just wrote do not
+ * contain that change, and clearing it would discard the only notice it gets.
+ * `*out_cleared` receives how many marks were actually cleared, which is how a
+ * host sees that a conversation moved under it.
+ *
+ * Acknowledging a conversation nobody marked is not an error.
+ *
+ * Returns [`VEIL_ERR_INVALID_ARG`] when `key_count` exceeds
+ * [`VEIL_RATCHET_MAX_ACK_KEYS`], in which case nothing was read or cleared.
+ *
+ * # Safety
+ *
+ * `handle` must be live. `keys` MUST point to
+ * `key_count * VEIL_RATCHET_KEY_LEN` readable bytes. `out_cleared` MUST be
+ * writable.
+ */
+
+int veil_ratchet_ack_dirty(VeilHandle *handle,
+                           const uint8_t *keys,
+                           size_t key_count,
+                           uint64_t generation,
+                           size_t *out_cleared,
+                           char **err_out)
+;
+#endif
+
+#if defined(VEIL_FFI_NODE_EMBEDDED)
+/**
+ * List the conversations this node holds, for a full save at shutdown.
+ *
+ * `*out_total` receives the TOTAL number held, which may exceed what fit in
+ * `out_buf`; nothing is consumed, so a host may call this as often as it
+ * likes.
+ *
+ * # Safety
+ *
+ * `handle` must be live. `out_buf` MUST be writable for `out_buf_cap` bytes.
+ * `out_total` MUST be writable.
+ */
+
+int veil_ratchet_list(VeilHandle *handle,
+                      uint8_t *out_buf,
+                      size_t out_buf_cap,
+                      size_t *out_total,
+                      char **err_out)
+;
+#endif
+
+#if defined(VEIL_FFI_NODE_EMBEDDED)
+/**
+ * One page of the conversations this node holds, in key order, resuming
+ * strictly after `after_key_64`.
+ *
+ * Pass `NULL` for `after_key_64` to start the walk, then pass the LAST key of
+ * the page just returned to continue it. A page shorter than
+ * `out_buf_cap / VEIL_RATCHET_KEY_LEN` is the end; a page of zero keys is the
+ * end with nothing in it. `*out_written` receives the count of keys written.
+ *
+ * This is what [`veil_ratchet_list`] cannot do. That call writes as many keys
+ * as fit and reports the total, so a host whose buffer is smaller than the
+ * store can never reach the tail — it can only allocate for the whole set and
+ * try again. Here the cost of a page is the page: the walk seeks in
+ * logarithmic time and holds the store's lock for the length of the page
+ * rather than the length of the store, so a full save streams instead of
+ * stopping every other send and receive while it copies.
+ *
+ * The cursor is a key rather than an offset because the store moves between
+ * pages — a conversation opens, another is evicted by the quota — and an
+ * offset would then skip or repeat whatever crossed it. Resuming at a key is
+ * well-defined whether or not that key is still held.
+ *
+ * # Safety
+ *
+ * `handle` must be live. `after_key_64`, when not NULL, MUST point to exactly
+ * [`VEIL_RATCHET_KEY_LEN`] readable bytes. `out_buf` MUST be writable for
+ * `out_buf_cap` bytes. `out_written` MUST be writable.
+ */
+
+int veil_ratchet_list_page(VeilHandle *handle,
+                           const uint8_t *after_key_64,
+                           uint8_t *out_buf,
+                           size_t out_buf_cap,
+                           size_t *out_written,
+                           char **err_out)
+;
+#endif
+
+#if defined(VEIL_FFI_NODE_EMBEDDED)
+/**
+ * Drop every unproven conversation that has gone unused for longer than the
+ * ratchet's time-to-live, and mark each so the host deletes its stored blob.
+ * `*out_dropped` receives how many went.
+ *
+ * For a host to call on a timer, or when it comes back to the foreground.
+ * Without it the sweep only runs when the store is full, so a device that has
+ * been flooded once keeps carrying the wreckage until something else needs
+ * the room.
+ *
+ * "Unproven" means a conversation this device has never sent a message on:
+ * somebody opened it, and nothing has confirmed they are who they named. Only
+ * those are aged out. A conversation that has carried traffic is never
+ * dropped by time, at any age — the peer's copy of it cannot be restarted by
+ * anything on the wire, so aging one out would wedge both ends for good. The
+ * host decides those with [`veil_ratchet_forget`].
+ *
+ * The clock is this device's own, read here. There is no parameter for it,
+ * because there must be no way for a value that came off the network to
+ * decide which conversations are old enough to disappear.
+ *
+ * # Safety
+ *
+ * `handle` must be live. `out_dropped` MUST be writable.
+ */
+ int veil_ratchet_expire(VeilHandle *handle, size_t *out_dropped, char **err_out) ;
+#endif
+
+#if defined(VEIL_FFI_NODE_EMBEDDED)
+/**
+ * Export one conversation's whole state.
+ *
+ * EVERY BYTE IS KEY MATERIAL. The host must store it encrypted and must not
+ * log, copy to temporary files, or transmit it. In this project that store is
+ * the hidden volume.
+ *
+ * Returns [`VEIL_ERR_RATCHET_NO_CONVERSATION`] when the key names nothing
+ * held, and [`VEIL_ERR_RATCHET_BUFFER_TOO_SMALL`] when the buffer cannot take
+ * the state — in which case `*out_len` receives the length required and
+ * nothing was written or consumed.
+ *
+ * # Safety
+ *
+ * `handle` must be live. `key_64` MUST point to exactly
+ * [`VEIL_RATCHET_KEY_LEN`] readable bytes. `out_buf` MUST be writable for
+ * `out_buf_cap` bytes. `out_len` MUST be writable.
+ */
+
+int veil_ratchet_export(VeilHandle *handle,
+                        const uint8_t *key_64,
+                        uint8_t *out_buf,
+                        size_t out_buf_cap,
+                        size_t *out_len,
+                        char **err_out)
+;
+#endif
+
+#if defined(VEIL_FFI_NODE_EMBEDDED)
+/**
+ * Where a conversation's sending chain stands: the chain it is on, and the
+ * index the next sealed message will carry.
+ *
+ * A host records this durably BEFORE it publishes a ciphertext, so that a
+ * state write which never lands cannot let a restart re-derive a key this
+ * session already spent on the wire (report12 X-H5). It is 36 bytes against
+ * the state's kilobytes, which is what makes it affordable on the send path —
+ * and a host reserving a small run of indices at a time pays it once per run
+ * rather than once per message.
+ *
+ * Returns [`VEIL_ERR_RATCHET_NO_CONVERSATION`] when the key names nothing
+ * held, or names a conversation with no sending chain yet — there is then no
+ * position to reserve, and nothing has been published either.
+ *
+ * # Safety
+ *
+ * `handle` must be live. `key_64` MUST point to exactly
+ * [`VEIL_RATCHET_KEY_LEN`] readable bytes. `out_chain_32` MUST be writable
+ * for 32 bytes. `out_next` MUST be writable.
+ */
+
+int veil_ratchet_send_position(VeilHandle *handle,
+                               const uint8_t *key_64,
+                               uint8_t *out_chain_32,
+                               uint32_t *out_next,
+                               char **err_out)
+;
+#endif
+
+#if defined(VEIL_FFI_NODE_EMBEDDED)
+/**
+ * Step a conversation's sending chain past every index that might already
+ * have been spent, and report how many keys were burned.
+ *
+ * The recovery half of [`veil_ratchet_send_position`]: on start, a state
+ * restored from before an unwritten send is fast-forwarded to the last
+ * position the host recorded. Keys burned this way were never emitted, so the
+ * peer sees a gap its skipped-key window absorbs.
+ *
+ * A position naming a chain this conversation is no longer on, or an index it
+ * has already passed, burns nothing and is not an error — keys from a chain
+ * we no longer hold cannot collide with keys from the one we do.
+ *
+ * Returns [`VEIL_ERR_RATCHET_NO_CONVERSATION`] when the key names nothing
+ * held, and [`VEIL_ERR_INVALID_ARG`] when the position asks for a jump past
+ * what a host reserving indices could legitimately have got ahead — a
+ * corrupted or hostile mark. Nothing is burned in either case.
+ *
+ * # Safety
+ *
+ * `handle` must be live. `key_64` MUST point to exactly
+ * [`VEIL_RATCHET_KEY_LEN`] readable bytes. `chain_32` MUST point to 32
+ * readable bytes. `out_burned` MUST be writable.
+ */
+
+int veil_ratchet_skip_send_to(VeilHandle *handle,
+                              const uint8_t *key_64,
+                              const uint8_t *chain_32,
+                              uint32_t next,
+                              uint32_t *out_burned,
+                              char **err_out)
+;
+#endif
+
+#if defined(VEIL_FFI_NODE_EMBEDDED)
+/**
+ * Restore one conversation from bytes [`veil_ratchet_export`] produced.
+ *
+ * Called for every stored conversation at startup, BEFORE traffic flows: a
+ * frame that arrives for a conversation not yet restored cannot be opened,
+ * and — unlike a lost network packet — the sender has already advanced its
+ * chain, so nothing will re-send it in a form this node can read.
+ *
+ * Replaces whatever is held under that key. Rejects a blob it does not fully
+ * understand rather than salvaging part of one: a partially-understood
+ * session is a session with the wrong keys.
+ *
+ * # Safety
+ *
+ * `handle` must be live. `key_64` MUST point to exactly
+ * [`VEIL_RATCHET_KEY_LEN`] readable bytes. `blob` MUST point to `blob_len`
+ * readable bytes.
+ */
+
+int veil_ratchet_import(VeilHandle *handle,
+                        const uint8_t *key_64,
+                        const uint8_t *blob,
+                        size_t blob_len,
+                        char **err_out)
+;
+#endif
+
+#if defined(VEIL_FFI_NODE_EMBEDDED)
+/**
+ * Drop one conversation.
+ *
+ * Irreversible: nothing public can rebuild the chain, so every message the
+ * peer has already sealed to it is unreadable from here on. For when the host
+ * deletes a chat or removes a device — not for eviction, which would cost
+ * every message that peer sends afterwards.
+ *
+ * Returns [`VEIL_ERR_RATCHET_NO_CONVERSATION`] if nothing was held.
+ *
+ * # Safety
+ *
+ * `handle` must be live. `key_64` MUST point to exactly
+ * [`VEIL_RATCHET_KEY_LEN`] readable bytes.
+ */
+ int veil_ratchet_forget(VeilHandle *handle, const uint8_t *key_64, char **err_out) ;
 #endif
 
 #ifdef __cplusplus
