@@ -11,6 +11,7 @@
  * single-control-thread run is workable.
  */
 
+#include "veil_bounded_vp8.h"
 #include "veil_media_engine.h"
 
 #include <algorithm>
@@ -1045,8 +1046,13 @@ void ensure_group_video_codecs(GroupWebrtcState* ws) {
             webrtc::LibvpxVp8EncoderTemplateAdapter>>();
   if (!ws->video_decoder_factory)
     ws->video_decoder_factory =
-        std::make_unique<webrtc::VideoDecoderFactoryTemplate<
-            webrtc::LibvpxVp8DecoderTemplateAdapter>>();
+        // BOUNDED. `VeilVideoSink` refuses an oversized frame where it
+        // arrives, and libvpx has already sized four reference buffers from the
+        // keyframe by then — see `veil_bounded_vp8.h` (report24 MEDIA-3).
+        std::make_unique<veil_media::BoundedVp8DecoderFactory>(
+            std::make_unique<webrtc::VideoDecoderFactoryTemplate<
+                  webrtc::LibvpxVp8DecoderTemplateAdapter>>(),
+            kMaxVideoSide);
   if (!ws->video_bitrate_alloc_factory)
     ws->video_bitrate_alloc_factory =
         webrtc::CreateBuiltinVideoBitrateAllocatorFactory();
@@ -2418,8 +2424,13 @@ int veil_media_engine_start_video(VeilMediaEngine* engine, int send, int recv,
               webrtc::LibvpxVp8EncoderTemplateAdapter>>();
     if (!ws->video_decoder_factory)
       ws->video_decoder_factory =
-          std::make_unique<webrtc::VideoDecoderFactoryTemplate<
-              webrtc::LibvpxVp8DecoderTemplateAdapter>>();
+          // BOUNDED. `VeilVideoSink` refuses an oversized frame where it
+          // arrives, and libvpx has already sized four reference buffers from the
+          // keyframe by then — see `veil_bounded_vp8.h` (report24 MEDIA-3).
+          std::make_unique<veil_media::BoundedVp8DecoderFactory>(
+              std::make_unique<webrtc::VideoDecoderFactoryTemplate<
+                      webrtc::LibvpxVp8DecoderTemplateAdapter>>(),
+              kMaxVideoSide);
     if (!ws->video_bitrate_alloc_factory)
       ws->video_bitrate_alloc_factory =
           webrtc::CreateBuiltinVideoBitrateAllocatorFactory();
