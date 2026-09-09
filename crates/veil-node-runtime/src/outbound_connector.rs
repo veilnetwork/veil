@@ -98,6 +98,48 @@ pub fn jittered(base: Duration) -> Duration {
 
 type ConnectorRefreshSlots = Arc<Mutex<std::collections::HashMap<[u8; 32], watch::Sender<u64>>>>;
 
+/// Give back `node_id`'s claim, whoever holds it.
+///
+/// For a caller that has just ABORTED the connector: an abort is scheduled,
+/// not immediate, so the task's guard gives the claim back at some later poll.
+/// A caller that re-admits the same peer in the same turn — which is exactly
+/// what the LAN layer does when a stale candidate is reclaimed and the
+/// announce that triggered it is then admitted — found the slot still held,
+/// took the "refresh the existing owner" branch, and woke a task that was
+/// already dying. The peer was left admitted with no connector at all, and
+/// every later announce was dropped as already seen (report24 RUNTIME-2).
+///
+/// Safe to pair with the abort because [`SlotGuard`] gives back only the claim
+/// it made: the dying task can no longer remove the one its replacement took.
+pub fn release_connector_claim(slots: &ConnectorRefreshSlots, node_id: &[u8; 32]) {
+    lock!(slots).remove(node_id);
+}
+
+/// Give back `node_id`'s claim IF it is still the one `claimed` was made from.
+///
+/// The rule a connector's guard applies on its way out. It used to remove by
+/// node id alone, which is only correct while nothing ever replaces a claim —
+/// and an aborted connector's guard runs at some later poll, by which time the
+/// slot can belong to the connector spawned in its place. Removing it there
+/// left that peer with no reconnect loop and nothing to spawn another
+/// (report24 RUNTIME-2).
+///
+/// A free function rather than a method on the guard so the rule can be
+/// exercised without spawning a connector.
+fn release_claim_if_still_ours(
+    slots: &ConnectorRefreshSlots,
+    node_id: &[u8; 32],
+    claimed: &watch::Receiver<u64>,
+) {
+    let mut slots = lock!(slots);
+    let ours = slots
+        .get(node_id)
+        .is_some_and(|tx| tx.subscribe().same_channel(claimed));
+    if ours {
+        slots.remove(node_id);
+    }
+}
+
 /// Claim the sole reconnect loop for `node_id`, or notify its current owner
 /// that the corresponding NodeState entry was refreshed.
 ///
@@ -161,15 +203,26 @@ pub fn spawn_outbound_peers(
             struct SlotGuard {
                 slots: Arc<Mutex<std::collections::HashMap<[u8; 32], watch::Sender<u64>>>>,
                 node_id: [u8; 32],
+                /// A receiver on the channel THIS task claimed, so the guard
+                /// can tell its own claim from a successor's.
+                ///
+                /// It used to remove by node id alone, which is only correct
+                /// while nothing replaces a claim: an aborted task's guard runs
+                /// at some later poll, and by then the slot can belong to the
+                /// connector spawned in its place — which it then deleted,
+                /// leaving a peer with no reconnect loop and no way to get one
+                /// (report24 RUNTIME-2).
+                claimed: watch::Receiver<u64>,
             }
             impl Drop for SlotGuard {
                 fn drop(&mut self) {
-                    lock!(self.slots).remove(&self.node_id);
+                    release_claim_if_still_ours(&self.slots, &self.node_id, &self.claimed);
                 }
             }
             let _slot_guard = SlotGuard {
                 slots: Arc::clone(&access.outbound_connector_refresh),
                 node_id: peer_node_id,
+                claimed: refresh_rx.clone(),
             };
             let backoff_min = access.defaults.reconnect_backoff_min;
             let backoff_max = access.defaults.reconnect_backoff_max;
@@ -930,6 +983,54 @@ pub fn spawn_outbound_peers(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A retired connector must not take its replacement's claim with it.
+    ///
+    /// Aborting a connector is scheduled, not immediate: the task's guard runs
+    /// at some later poll. The LAN layer reclaims a stale candidate and admits
+    /// the announce that triggered it IN THE SAME TURN, so without an explicit
+    /// release the re-admission found the slot still held and only refreshed a
+    /// task that was dying — the peer stayed admitted with no connector, and
+    /// every later announce was dropped as already seen (report24 RUNTIME-2).
+    ///
+    /// Releasing on eviction is half of it. The other half is here: the dying
+    /// guard removed by node id alone, which would then have deleted the claim
+    /// its successor had just made.
+    #[test]
+    fn a_retired_claim_does_not_take_its_successors_slot() {
+        let slots: ConnectorRefreshSlots = Arc::new(Mutex::new(Default::default()));
+        let node_id = [0x5Au8; 32];
+
+        let retiring = claim_or_refresh_connector(&slots, node_id).expect("first claim");
+        assert!(
+            claim_or_refresh_connector(&slots, node_id).is_none(),
+            "premise: a second claim refreshes the owner rather than spawning",
+        );
+
+        // The eviction path: abort, and give the claim back at once.
+        release_connector_claim(&slots, &node_id);
+        let successor = claim_or_refresh_connector(&slots, node_id)
+            .expect("the slot is free for the peer that was just re-admitted");
+        assert!(
+            !successor.same_channel(&retiring),
+            "the re-admission got the retiring task's channel back",
+        );
+
+        // NOW the aborted task's guard finally runs.
+        release_claim_if_still_ours(&slots, &node_id, &retiring);
+        assert!(
+            lock!(slots).contains_key(&node_id),
+            "the retiring connector took its successor's claim with it, so the \
+             peer has no reconnect loop and nothing will spawn one",
+        );
+
+        // And the successor's own guard still works, or the slot leaks.
+        release_claim_if_still_ours(&slots, &node_id, &successor);
+        assert!(
+            !lock!(slots).contains_key(&node_id),
+            "a connector's guard no longer gives back its own claim",
+        );
+    }
     use veil_proto::{
         codec::decode_header,
         family::{FrameFamily, SessionMsg},

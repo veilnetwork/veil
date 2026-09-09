@@ -1941,17 +1941,13 @@ impl NodeRuntime {
         // here: which listener a stranger could dial. The DHT carries no scheme,
         // so the one we advertise is the one we expect of others -- a network
         // runs one transport.
-        // What is BOUND, not what was written down: a listener on port 0 or
-        // one that has rotated is not on the port the config names.
-        let bound = bound_ports(&self.listens());
-        let me = lan_announce_for(
-            config,
-            &my_pubkey,
-            &self.identity.local_identity.nonce,
-            &bound,
-        );
-        // So the layer can tell its own announcement from a stranger's.
-        let my_address = public_address_for(config, &bound);
+        //
+        // Recomputed INSIDE the loop, from the listener table, because a
+        // listener rotates: captured here once, it was published for the life
+        // of the process, and the port it named closed with the old listener's
+        // grace (report24 RUNTIME-3).
+        let my_nonce = self.identity.local_identity.nonce.clone();
+        let announce_config = config.clone();
         let network = if cfg!(feature = "testnet-seeds") {
             veil_mainline::rendezvous::Network::Testnet
         } else {
@@ -2009,6 +2005,11 @@ impl NodeRuntime {
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
                 ticker.tick().await;
+                // WHERE, asked once per pass for the same reason WHEN is: the
+                // listener a stranger could dial is a fact about now, not about
+                // startup.
+                let (me, my_address) =
+                    current_announcement(&state, &announce_config, &my_pubkey, &my_nonce);
                 // WHEN, as opposed to where. Asked once per pass rather than at
                 // spawn: at spawn this node has no sessions yet, so a startup
                 // check would always read "nobody" and `fallback` would mean
@@ -2171,11 +2172,14 @@ impl NodeRuntime {
         {
             return;
         }
-        let bound = bound_ports(&self.listens());
         // What this node ADVERTISES is no longer consulted for how it DIALS —
         // see `rendezvous_dial_scheme`. Only the address it publishes about
-        // itself is still needed here.
-        let my_address = public_address_for(config, &bound);
+        // itself is still needed here, and it is read per pass rather than at
+        // spawn: a rotated listener leaves a captured one naming a closed port
+        // (report24 RUNTIME-3).
+        let my_pubkey = self.identity.local_identity.public_key.clone();
+        let my_nonce = self.identity.local_identity.nonce.clone();
+        let announce_config = config.clone();
         let network = if cfg!(feature = "testnet-seeds") {
             veil_nostr::rendezvous::Network::Testnet
         } else {
@@ -2205,6 +2209,9 @@ impl NodeRuntime {
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
                 ticker.tick().await;
+                // The listener a stranger could dial, as it is now.
+                let (_, my_address) =
+                    current_announcement(&state, &announce_config, &my_pubkey, &my_nonce);
                 // Per pass, not at spawn: at spawn there are no sessions yet,
                 // so `fallback` would read "nobody" every time and mean nothing.
                 let live_peers = lock!(live_sessions).len();
@@ -2459,6 +2466,12 @@ impl NodeRuntime {
         // this one transmitted regardless, putting a stable identity key, PoW
         // nonce, port and scheme on the wire for every machine on the segment.
         let announce_self = config.global.bootstrap && announce.is_some();
+        // What is announced is refreshed per pass — a listener rotates, and
+        // the payload built here names the port it had at startup
+        // (report24 RUNTIME-3).
+        let my_pubkey = self.identity.local_identity.public_key.clone();
+        let my_nonce = self.identity.local_identity.nonce.clone();
+        let announce_config = config.clone();
         let logger = self.logger.clone();
         let state = Arc::clone(&self.state);
         let dht = Arc::clone(&self.dht);
@@ -2471,7 +2484,7 @@ impl NodeRuntime {
                 Some(a) => veil_bootstrap::LanDiscovery::bind(a).await,
                 None => veil_bootstrap::LanDiscovery::bind_listen_only().await,
             };
-            let discovery = match bound {
+            let mut discovery = match bound {
                 Ok(d) => d,
                 Err(e) => {
                     // A host with no multicast-capable interface, or a port
@@ -2509,6 +2522,17 @@ impl NodeRuntime {
             loop {
                 let bp = tokio::select! {
                     _ = tokio::time::sleep_until(next_announce), if announce_self => {
+                        // The listener may have rotated since the last one.
+                        // Set whatever is current, including nothing: a stale
+                        // port is worse than a pass that says nothing, because
+                        // a neighbour acts on it.
+                        let (fresh, _) = current_announcement(
+                            &state,
+                            &announce_config,
+                            &my_pubkey,
+                            &my_nonce,
+                        );
+                        discovery.set_announce(fresh);
                         if let Err(e) = discovery.announce_once().await {
                             // A LAN that will not take a multicast datagram is
                             // an ordinary state (no route, interface down, a
@@ -2559,9 +2583,17 @@ impl NodeRuntime {
                         };
                         {
                             let mut st = lock_state(&state);
-                            evict_lan_candidate(&mut st.peers, candidate, |id| {
-                                dht.remove_contact(id);
-                            });
+                            evict_lan_candidate(
+                                &mut st.peers,
+                                candidate,
+                                |id| dht.remove_contact(id),
+                                |id| {
+                                    crate::outbound_connector::release_connector_claim(
+                                        &access.outbound_connector_refresh,
+                                        id,
+                                    );
+                                },
+                            );
                         }
                         logger.debug(
                             "lan_discovery.slot_reclaimed",
@@ -6512,10 +6544,11 @@ pub struct LanCandidate {
 /// this eviction an endpoint refresh or a rediscovery can put a different
 /// peer at the same number, and deleting that one would take out a row that
 /// had already been corrected.
-pub fn evict_lan_candidate<F: FnMut(&[u8; 32])>(
+pub fn evict_lan_candidate<F: FnMut(&[u8; 32]), G: FnOnce(&[u8; 32])>(
     peers: &mut std::collections::BTreeMap<crate::types::PeerId, PeerConfigEntry>,
     candidate: LanCandidate,
     mut drop_contact: F,
+    release_connector: G,
 ) {
     let ours = peers.get(&candidate.peer_id).is_some_and(|e| {
         e.source == crate::types::PeerSource::Lan && e.node_id.as_bytes() == &candidate.node_id
@@ -6527,10 +6560,18 @@ pub fn evict_lan_candidate<F: FnMut(&[u8; 32])>(
     // candidate is the only reason it was added.
     drop_contact(&candidate.node_id);
     // Dropping the task also drops the connector's RAII guard, which is what
-    // gives its per-node-id claim back.
+    // gives its per-node-id claim back — LATER, whenever the runtime gets
+    // round to the cancellation. This node may re-admit the same peer before
+    // then (the announce that triggered this reclaim is usually about to be),
+    // and the claim it finds must not be the dying task's: that path only
+    // refreshes an existing owner, so the re-admitted peer got no connector at
+    // all and every later announce was dropped as already seen
+    // (report24 RUNTIME-2). Given back HERE, synchronously; the guard knows
+    // not to take a successor's claim with it.
     if let Some(abort) = candidate.abort {
         abort.abort();
     }
+    release_connector(&candidate.node_id);
 }
 
 /// How long an admitted LAN announce may hold its slot without the peer ever
@@ -6836,6 +6877,34 @@ pub fn rendezvous_address_is_self(mine: Option<&(String, u16)>, transport: &str)
 ///
 /// Only ACTIVE listeners: an entry that is not bound has no port to speak of,
 /// and its stale `local_addr` would be worse than the config.
+/// What this node would tell a stranger about itself, AS IT IS NOW:
+/// `(announcement, public address)`.
+///
+/// Read from the listener table on every call, which is the whole point. The
+/// discovery tasks used to compute this once, before their loop, and then
+/// publish the same port for the life of the process — so a listener that
+/// rotated left them advertising a port that closed when its grace ended, and
+/// a stranger who found the node at a meeting point could not reach it. The
+/// startup case was fixed by reading BOUND ports instead of configured ones;
+/// rotation is the same defect one step later (report24 RUNTIME-3).
+pub fn current_announcement(
+    state: &std::sync::Arc<std::sync::Mutex<crate::state::NodeState>>,
+    config: &veil_cfg::Config,
+    identity_public_key: &str,
+    identity_nonce: &str,
+) -> (Option<veil_bootstrap::LanAnnounce>, Option<(String, u16)>) {
+    let listens: Vec<crate::types::ListenConfigEntry> = crate::runtime::lock_state(state)
+        .listens
+        .values()
+        .cloned()
+        .collect();
+    let bound = bound_ports(&listens);
+    (
+        lan_announce_for(config, identity_public_key, identity_nonce, &bound),
+        public_address_for(config, &bound),
+    )
+}
+
 pub fn bound_ports(listens: &[crate::types::ListenConfigEntry]) -> Vec<(String, u16)> {
     listens
         .iter()
@@ -8573,6 +8642,11 @@ mod tests {
         use crate::types::PeerId;
         let mut peers: std::collections::BTreeMap<PeerId, PeerConfigEntry> = Default::default();
         let mut contacts: std::collections::HashSet<[u8; 32]> = Default::default();
+        // Every eviction gives the connector claim back too, synchronously —
+        // the abort alone gives it back at some later poll, and a re-admission
+        // before then finds the slot held by a task that is dying
+        // (report24 RUNTIME-2).
+        let mut released: Vec<[u8; 32]> = Vec::new();
 
         for round in 0..100u32 {
             let mut admitted = Vec::new();
@@ -8597,15 +8671,30 @@ mod tests {
                 "round {round}: the admissions themselves are already over the cap"
             );
             for candidate in admitted {
-                evict_lan_candidate(&mut peers, candidate, |id| {
-                    contacts.remove(id);
-                });
+                evict_lan_candidate(
+                    &mut peers,
+                    candidate,
+                    |id| {
+                        contacts.remove(id);
+                    },
+                    |id| {
+                        released.push(*id);
+                    },
+                );
             }
             assert!(
                 peers.is_empty(),
                 "round {round}: {} row(s) survived their eviction",
                 peers.len()
             );
+            assert_eq!(
+                released.len(),
+                MAX_LAN_PEERS,
+                "round {round}: {} of the evicted connector claims were left \
+                 for the aborted task to give back",
+                released.len(),
+            );
+            released.clear();
             assert!(
                 contacts.is_empty(),
                 "round {round}: {} contact(s) survived their eviction",
@@ -8638,6 +8727,7 @@ mod tests {
                 abort: None,
             },
             |id| dropped.push(*id),
+            |_| {},
         );
         assert!(
             peers.contains_key(&peer_id),
@@ -8663,6 +8753,7 @@ mod tests {
                 peer_id,
                 abort: None,
             },
+            |_| {},
             |_| {},
         );
         assert!(peers.is_empty());
@@ -8845,6 +8936,124 @@ mod tests {
             Some(("example.test".to_owned(), 443)),
             "a bound port overrode the address the operator stated"
         );
+    }
+
+    /// What is published follows the listener, pass by pass.
+    ///
+    /// `bound_ports` reading the listener table instead of the config fixed the
+    /// startup case — an OS-chosen port was published as zero. Rotation is the
+    /// same question later: the discovery tasks computed the announcement once,
+    /// before their loop, so a listener that took a new port left them naming
+    /// the old one for the life of the process, and it closes when the old
+    /// listener's grace ends (report24 RUNTIME-3).
+    #[test]
+    fn the_announcement_follows_a_listener_that_rotates() {
+        use std::sync::{Arc, Mutex};
+
+        let mut c = veil_cfg::Config::default();
+        c.listen = vec![veil_cfg::ListenConfig {
+            transport: "obfs4-tcp://203.0.113.7:0".to_owned(),
+            ..Default::default()
+        }];
+        let key = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, [0x11u8; 32]);
+        let nonce =
+            base64::Engine::encode(&base64::engine::general_purpose::STANDARD, [0u8, 1, 2, 3]);
+
+        let listen = |addr: &str| crate::types::ListenConfigEntry {
+            listen_id: crate::types::ListenId::new(1),
+            listener_handle: None,
+            transport: "obfs4-tcp://203.0.113.7:0".to_owned(),
+            advertise: None,
+            relay: None,
+            tls_cert: None,
+            tls_key: None,
+            tls_ca_cert: None,
+            psk_file: None,
+            visibility: veil_cfg::Visibility::Public,
+            allowlist_node_ids: vec![],
+            group_label: None,
+            ephemeral: None,
+            on_demand: None,
+            local_addr: Some(addr.to_owned()),
+            active: true,
+        };
+
+        let state = Arc::new(Mutex::new(crate::state::NodeState::new(
+            veil_cfg::NodeId::from([0xAAu8; 32]),
+            crate::types::NodeRole::Core,
+            std::path::PathBuf::from("/nonexistent/veil.toml"),
+            true,
+            std::time::Instant::now(),
+            false,
+            None,
+            vec![],
+            vec![listen("obfs4-tcp://203.0.113.7:41337")],
+        )));
+
+        let (announce, address) = current_announcement(&state, &c, &key, &nonce);
+        assert_eq!(
+            address,
+            Some(("203.0.113.7".to_owned(), 41337)),
+            "premise: the bound port is what is published"
+        );
+        assert_eq!(announce.map(|a| a.port), Some(41337));
+
+        // The listener rotates: same entry, new bound address.
+        {
+            let mut st = crate::runtime::lock_state(&state);
+            for entry in st.listens.values_mut() {
+                entry.local_addr = Some("obfs4-tcp://203.0.113.7:47001".to_owned());
+            }
+        }
+
+        let (announce, address) = current_announcement(&state, &c, &key, &nonce);
+        assert_eq!(
+            address,
+            Some(("203.0.113.7".to_owned(), 47001)),
+            "the address still names the port the listener left behind"
+        );
+        assert_eq!(
+            announce.map(|a| a.port),
+            Some(47001),
+            "the LAN announcement still names the port the listener left behind"
+        );
+    }
+
+    /// And the tasks ASK per pass rather than carrying an answer in.
+    ///
+    /// The helper above cannot prove that by itself: a task that called it once
+    /// before its loop would pass every assertion there and still publish one
+    /// port forever. Driving three long-lived discovery tasks to a second pass
+    /// is not something a unit test can do, so this reads where the call is.
+    #[test]
+    fn the_discovery_tasks_ask_for_the_announcement_inside_their_loop() {
+        let src = production_source(include_str!("service_tasks.rs"));
+        for task in [
+            "pub fn spawn_mainline_discovery_task",
+            "pub fn spawn_nostr_discovery_task",
+            "pub fn spawn_lan_discovery_task",
+        ] {
+            let body = src
+                .split(task)
+                .nth(1)
+                .and_then(|t| t.split("\npub ").next())
+                .unwrap_or_else(|| panic!("{task} is in this file"));
+            let spawned = body
+                .split("supervised_spawn")
+                .nth(1)
+                .unwrap_or_else(|| panic!("{task} spawns nothing"));
+            assert!(
+                spawned.contains("current_announcement("),
+                "{task} does not recompute what it publishes, so a rotated \
+                 listener leaves it announcing a closed port",
+            );
+            let head = body.split("supervised_spawn").next().unwrap_or_default();
+            assert!(
+                !head.contains("current_announcement("),
+                "{task} computes the announcement before spawning, which is \
+                 the capture this replaced",
+            );
+        }
     }
 
     /// And the bound ports come only from listeners that are actually bound.
