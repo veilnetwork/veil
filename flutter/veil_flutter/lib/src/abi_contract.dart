@@ -17,7 +17,7 @@
 /// Compare against `veil_abi_contract_hash()` from the loaded library
 /// BEFORE using it. See `native.dart`.
 const String veilAbiContractHash =
-    'c7997d500ba70b24a1cb87edaf1efc43d7ea60a659e803cb149827acbb5bcd89';
+    'd7b09ba647f462186c65d61f9e054aaeb111a43aacde283178d180c727391068';
 
 // -- Constants lifted from the generated header --------------------------
 
@@ -31,6 +31,8 @@ const int veilErrInvalidArg = -2;
 const int veilErrClosed = -3;
 /// `VEIL_ERR_REENTRANT`
 const int veilErrReentrant = -4;
+/// `VEIL_ERR_TUNNEL_WORKERS_STRANDED`
+const int veilErrTunnelWorkersStranded = -23;
 /// `VEIL_MAX_DATA_LEN`
 const int veilMaxDataLen = 16776960;
 /// `VEIL_MAILBOX_MAX_FETCH_BYTES`
@@ -175,6 +177,22 @@ const int veilEventMailboxDrained = 3;
 const int veilEventMailboxWake = 5;
 /// `VEIL_DEFAULT_RESTORE_VALIDITY_SECS`
 const int veilDefaultRestoreValiditySecs = 2592000;
+/// `STREAM_ENDPOINT_ID`
+const int veilStreamEndpointId = 12;
+/// `MEDIA_MAGIC`
+const int veilMediaMagic = 77;
+/// `MEDIA_BATCH_MAGIC`
+const int veilMediaBatchMagic = 66;
+/// `NICKNAME_FREE`
+const int veilNicknameFree = 1;
+/// `VEIL_TUNNEL_STOPPED`
+const int veilTunnelStopped = 0;
+/// `VEIL_TUNNEL_STARTING`
+const int veilTunnelStarting = 1;
+/// `VEIL_TUNNEL_RUNNING`
+const int veilTunnelRunning = 2;
+/// `VEIL_TUNNEL_ERROR`
+const int veilTunnelError = 3;
 /// `VEIL_PAIR_SOURCE_OK`
 const int veilPairSourceOk = 0;
 /// `VEIL_PAIR_SOURCE_NOT_CONFIGURED`
@@ -217,27 +235,9 @@ const int veilRatchetMaxStateLen = 262144;
 const int veilErrRatchetNoConversation = -20;
 /// `VEIL_ERR_RATCHET_BUFFER_TOO_SMALL`
 const int veilErrRatchetBufferTooSmall = -21;
-/// `VEIL_ERR_TUNNEL_WORKERS_STRANDED`
-const int veilErrTunnelWorkersStranded = -23;
 /// `VEIL_ERR_RATCHET_STORE_FULL`
 const int veilErrRatchetStoreFull = -22;
 /// `VEIL_RATCHET_MAX_CONVERSATIONS`
 const int veilRatchetMaxConversations = 1024;
 /// `VEIL_RATCHET_MAX_ACK_KEYS`
 const int veilRatchetMaxAckKeys = 4096;
-/// `STREAM_ENDPOINT_ID`
-const int veilStreamEndpointId = 12;
-/// `MEDIA_MAGIC`
-const int veilMediaMagic = 77;
-/// `MEDIA_BATCH_MAGIC`
-const int veilMediaBatchMagic = 66;
-/// `NICKNAME_FREE`
-const int veilNicknameFree = 1;
-/// `VEIL_TUNNEL_STOPPED`
-const int veilTunnelStopped = 0;
-/// `VEIL_TUNNEL_STARTING`
-const int veilTunnelStarting = 1;
-/// `VEIL_TUNNEL_RUNNING`
-const int veilTunnelRunning = 2;
-/// `VEIL_TUNNEL_ERROR`
-const int veilTunnelError = 3;

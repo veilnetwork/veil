@@ -13,6 +13,9 @@
 //! that can move without the header noticing, and this checks that it did not.
 
 use super::*;
+// The families that moved to files of their own; the tests came with
+// neither, because they reach across several of them.
+use crate::sovereign_sign::*;
 use std::ffi::CStr;
 
 /// The compiled-in contract hash must be the hash of the header actually
