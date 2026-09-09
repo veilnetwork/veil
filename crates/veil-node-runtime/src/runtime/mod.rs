@@ -12,6 +12,7 @@
 )]
 
 mod anonymity_state;
+mod bootstrap;
 mod dht_republish;
 mod discovery;
 mod ephemeral_rotator;
@@ -21,11 +22,14 @@ mod identity_publish;
 mod identity_state;
 mod ip_slot;
 mod ipc_bridges;
+mod ipc_server;
+mod key_rotation;
 mod lifecycle;
 mod mailbox_state;
 mod maintenance;
 mod mesh_gateway;
 mod mobile_state;
+mod nat_traversal;
 mod nickname;
 mod offline_seal;
 mod p_net_ban_sync;
