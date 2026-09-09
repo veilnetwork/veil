@@ -85,11 +85,18 @@ def cfg_test_module_files(roots) -> set[str]:
                         text = f.read()
                 except OSError:
                     continue
+                # Where rustc looks: a child of `mod.rs` (or of a crate root)
+                # sits beside it; a child of `foo.rs` sits in `foo/`.
+                stem = os.path.splitext(fn)[0]
+                bases = [dirpath]
+                if stem not in ("mod", "lib", "main"):
+                    bases.append(os.path.join(dirpath, stem))
                 for name in decl.findall(text):
-                    for candidate in (
-                        os.path.join(dirpath, f"{name}.rs"),
-                        os.path.join(dirpath, name, "mod.rs"),
-                    ):
+                    for candidate in [
+                        os.path.join(base, part)
+                        for base in bases
+                        for part in (f"{name}.rs", os.path.join(name, "mod.rs"))
+                    ]:
                         if os.path.isfile(candidate):
                             found.add(os.path.normpath(candidate))
     return found
