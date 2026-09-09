@@ -13,6 +13,7 @@
 
 mod anonymity_state;
 mod dht_republish;
+mod discovery;
 mod ephemeral_rotator;
 mod handoff_runtime;
 mod identity_loaders;
