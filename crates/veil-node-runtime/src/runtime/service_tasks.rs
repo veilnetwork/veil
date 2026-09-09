@@ -6080,12 +6080,13 @@ async fn push_dispatch_task(
     }
 }
 
+/// The first eight bytes of a node id, as sixteen lowercase hex characters.
+///
+/// The same string `builtin::mailbox::hex_short` produces, and the same
+/// warning applies: `veil_util::hex_short` is the FOUR-byte form and would
+/// quietly halve every id logged here (report24, dead-code table).
 pub fn hex_short(node_id: &[u8; 32]) -> String {
-    let mut out = String::with_capacity(16);
-    for b in node_id.iter().take(8) {
-        out.push_str(&format!("{b:02x}"));
-    }
-    out
+    veil_util::bytes_to_hex(&node_id[..8])
 }
 
 /// Drop bootstrap-peer entries whose `public_key` matches our own. Prevents
@@ -9054,6 +9055,35 @@ mod tests {
                  the capture this replaced",
             );
         }
+    }
+
+    /// The short id in a log line is SIXTEEN characters, in both places that
+    /// write one.
+    ///
+    /// Two identical implementations stood here and in `builtin::mailbox`,
+    /// each formatting a byte at a time. They are one call now — and the
+    /// obvious shared helper is the wrong one: `veil_util::hex_short` takes
+    /// FOUR bytes, so reaching for it by name would have halved every id in
+    /// these logs without a single test noticing (report24, dead-code table).
+    #[test]
+    fn the_short_id_is_sixteen_characters_in_both_writers() {
+        let mut id = [0u8; 32];
+        for (i, b) in id.iter_mut().enumerate() {
+            *b = i as u8;
+        }
+        let here = hex_short(&id);
+        assert_eq!(here, "0001020304050607", "the short id changed shape");
+        assert_eq!(here.len(), 16);
+        assert_eq!(
+            here,
+            crate::builtin::mailbox::hex_short(&id),
+            "the two log writers no longer print the same id",
+        );
+        assert_ne!(
+            here,
+            veil_util::hex_short(&id),
+            "the four-byte helper was substituted for the eight-byte one",
+        );
     }
 
     /// And the bound ports come only from listeners that are actually bound.
