@@ -171,6 +171,19 @@ impl LanDiscovery {
     }
 
     /// Send one announce, with a fresh salt.
+    /// Replace what this node says about itself.
+    ///
+    /// The announcement is built from the ports a listener is BOUND to, and a
+    /// listener rotates — an ephemeral bind takes a new port and the old one
+    /// closes when its grace ends. An announcement composed once at startup
+    /// keeps naming the closed one, so a neighbour who hears this node cannot
+    /// reach it (report24 RUNTIME-3). `None` for a node that currently has no
+    /// listener a stranger could dial: it keeps listening, and
+    /// [`Self::announce_once`] says there is nothing to send.
+    pub fn set_announce(&mut self, announce: Option<LanAnnounce>) {
+        self.announce = announce;
+    }
+
     pub async fn announce_once(&self) -> io::Result<()> {
         use rand_core::RngCore as _;
         let Some(self_announce) = &self.announce else {
