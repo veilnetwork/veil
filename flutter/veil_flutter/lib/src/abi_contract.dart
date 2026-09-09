@@ -17,7 +17,7 @@
 /// Compare against `veil_abi_contract_hash()` from the loaded library
 /// BEFORE using it. See `native.dart`.
 const String veilAbiContractHash =
-    'd7b09ba647f462186c65d61f9e054aaeb111a43aacde283178d180c727391068';
+    '3176c83d5ff8ce1284282cd61539bdfb9398cfc476445e801a1b90fd6ad88a89';
 
 // -- Constants lifted from the generated header --------------------------
 
@@ -87,24 +87,6 @@ const int veilWakeHmacKeyLen = 32;
 const int veilWakePayloadLen = 72;
 /// `VEIL_RELAY_X25519_UNAVAILABLE`
 const int veilRelayX25519Unavailable = -10;
-/// `VEIL_MAILBOX_PUT_STORED`
-const int veilMailboxPutStored = 0;
-/// `VEIL_MAILBOX_PUT_DUPLICATE`
-const int veilMailboxPutDuplicate = 1;
-/// `VEIL_MAILBOX_PUT_QUOTA_PER_RECEIVER`
-const int veilMailboxPutQuotaPerReceiver = 2;
-/// `VEIL_MAILBOX_PUT_QUOTA_GLOBAL`
-const int veilMailboxPutQuotaGlobal = 3;
-/// `VEIL_MAILBOX_PUT_RATE_LIMITED`
-const int veilMailboxPutRateLimited = 4;
-/// `VEIL_MAILBOX_PUT_NOT_RELAY`
-const int veilMailboxPutNotRelay = 5;
-/// `VEIL_MAILBOX_PUT_CAPABILITY_REQUIRED`
-const int veilMailboxPutCapabilityRequired = 6;
-/// `VEIL_MAILBOX_PUT_CAPABILITY_INVALID`
-const int veilMailboxPutCapabilityInvalid = 7;
-/// `VEIL_MAILBOX_PUT_QUOTA_PER_SENDER`
-const int veilMailboxPutQuotaPerSender = 8;
 /// `VEIL_JOIN_OK`
 const int veilJoinOk = 0;
 /// `VEIL_JOIN_INVALID_URI`
@@ -193,6 +175,24 @@ const int veilTunnelStarting = 1;
 const int veilTunnelRunning = 2;
 /// `VEIL_TUNNEL_ERROR`
 const int veilTunnelError = 3;
+/// `VEIL_MAILBOX_PUT_STORED`
+const int veilMailboxPutStored = 0;
+/// `VEIL_MAILBOX_PUT_DUPLICATE`
+const int veilMailboxPutDuplicate = 1;
+/// `VEIL_MAILBOX_PUT_QUOTA_PER_RECEIVER`
+const int veilMailboxPutQuotaPerReceiver = 2;
+/// `VEIL_MAILBOX_PUT_QUOTA_GLOBAL`
+const int veilMailboxPutQuotaGlobal = 3;
+/// `VEIL_MAILBOX_PUT_RATE_LIMITED`
+const int veilMailboxPutRateLimited = 4;
+/// `VEIL_MAILBOX_PUT_NOT_RELAY`
+const int veilMailboxPutNotRelay = 5;
+/// `VEIL_MAILBOX_PUT_CAPABILITY_REQUIRED`
+const int veilMailboxPutCapabilityRequired = 6;
+/// `VEIL_MAILBOX_PUT_CAPABILITY_INVALID`
+const int veilMailboxPutCapabilityInvalid = 7;
+/// `VEIL_MAILBOX_PUT_QUOTA_PER_SENDER`
+const int veilMailboxPutQuotaPerSender = 8;
 /// `VEIL_PAIR_SOURCE_OK`
 const int veilPairSourceOk = 0;
 /// `VEIL_PAIR_SOURCE_NOT_CONFIGURED`
