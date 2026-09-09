@@ -262,7 +262,12 @@ pub(crate) enum SendReply<'a> {
     /// the handler this way so they can read the reply frame back without a
     /// loop to run; no production path constructs it, which is the point of the
     /// change above.
-    #[allow(dead_code)]
+    ///
+    /// The allow is narrowed to the builds where it is TRUE. A blanket one
+    /// covers the test build too, where this variant does have constructors —
+    /// so if those ever go, nothing would say the variant had stopped being a
+    /// seam and started being dead (report24, dead-code table).
+    #[cfg_attr(not(test), allow(dead_code))]
     Inline(&'a mut crate::transport::IpcWriteHalf),
     /// Handed to the loop's writer. Owned, so the send can outlive the frame
     /// that started it.
