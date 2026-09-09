@@ -40,6 +40,7 @@ pub(crate) mod persistence;
 mod pex_runtime;
 mod push_tasks;
 mod rendezvous_binder;
+mod rendezvous_resolver;
 mod resumption_state;
 mod routing_health;
 mod routing_state;
