@@ -2644,7 +2644,7 @@ impl NodeServices {
 
         const AD_RESOLVE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(3500);
 
-        let ads = service_tasks::resolve_fresh_rendezvous_ads(
+        let ads = rendezvous_resolver::resolve_fresh_rendezvous_ads(
             &self.dht,
             &self.session_tx_registry,
             &self.dispatcher.pending_recursive,
@@ -4705,7 +4705,7 @@ impl NodeServices {
         // a relay that no longer owns the cookie (`cookie_unknown`). Compare
         // independently-served candidates on a short cadence and repair the
         // local mirror with the newest publication.
-        let mut ads = service_tasks::resolve_fresh_rendezvous_ads(
+        let mut ads = rendezvous_resolver::resolve_fresh_rendezvous_ads(
             &self.dht,
             &self.session_tx_registry,
             &self.dispatcher.pending_recursive,
