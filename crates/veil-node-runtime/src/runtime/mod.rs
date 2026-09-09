@@ -32,6 +32,7 @@ pub(crate) mod peer_handshake;
 mod persist_tasks;
 pub(crate) mod persistence;
 mod pex_runtime;
+mod push_tasks;
 mod rendezvous_binder;
 mod resumption_state;
 mod routing_health;
