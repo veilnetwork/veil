@@ -370,3 +370,222 @@ impl veil_ipc::OutboxBackend for OutboxIpcBridge {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use veil_ipc::{MailboxBackend, PushEnvelopeSink};
+
+    // Nothing exercised these three when they were a region in the middle of
+    // ten thousand lines, and every property below is one their own comments
+    // already claim. The comments are not the guard; these are.
+
+    fn entry(
+        node: [u8; 32],
+        cookie: [u8; 16],
+    ) -> veil_anonymity::rendezvous::RendezvousPublisherEntry {
+        veil_anonymity::rendezvous::RendezvousPublisherEntry {
+            rendezvous_node_id: node,
+            auth_cookie: cookie,
+            validity_window_secs: 1800,
+            push_envelope: Vec::new(),
+            wake_hmac_envelope: Vec::new(),
+            rendezvous_kem_algo: 0,
+            rendezvous_kem_pk: Vec::new(),
+            rendezvous_kem_valid_until_unix: 0,
+            ephemeral_ad_identity: None,
+        }
+    }
+
+    fn forwarder(
+        rows: Vec<veil_anonymity::rendezvous::RendezvousPublisherEntry>,
+    ) -> (
+        RendezvousPushEnvelopeForwarder,
+        Arc<std::sync::Mutex<Vec<veil_anonymity::rendezvous::RendezvousPublisherEntry>>>,
+    ) {
+        let entries = Arc::new(std::sync::Mutex::new(rows));
+        (
+            RendezvousPushEnvelopeForwarder::new(Arc::clone(&entries)),
+            entries,
+        )
+    }
+
+    /// The cookie is the authorisation, not decoration.
+    ///
+    /// Both halves of the pair have to match. Matching on the node id alone
+    /// would let anyone who can read a published ad — the node id is IN it —
+    /// replace the push envelope of a receiver they are not, and every wake
+    /// for that receiver would then be sealed to the wrong operator's key.
+    #[test]
+    fn a_push_envelope_lands_only_on_the_row_that_matches_both_halves() {
+        let mine = [1u8; 32];
+        let cookie = [9u8; 16];
+        let (fwd, entries) = forwarder(vec![entry(mine, cookie), entry([2u8; 32], [8u8; 16])]);
+
+        assert!(
+            fwd.set_rendezvous_push_envelope(mine, cookie, b"sealed".to_vec()),
+            "the row that matches both halves was not found"
+        );
+        assert_eq!(lock!(entries)[0].push_envelope, b"sealed".to_vec());
+        assert!(
+            lock!(entries)[1].push_envelope.is_empty(),
+            "the envelope landed on somebody else's row as well"
+        );
+
+        assert!(
+            !fwd.set_rendezvous_push_envelope(mine, [7u8; 16], b"forged".to_vec()),
+            "the right node id with the WRONG cookie was accepted"
+        );
+        assert!(
+            !fwd.set_rendezvous_push_envelope([3u8; 32], cookie, b"forged".to_vec()),
+            "the right cookie against the WRONG node id was accepted"
+        );
+        assert_eq!(
+            lock!(entries)[0].push_envelope,
+            b"sealed".to_vec(),
+            "a refused call still overwrote the envelope"
+        );
+    }
+
+    /// The two setters write two different fields.
+    ///
+    /// They are near-identical methods next to each other, which is the shape
+    /// a copy-paste crosses silently: the wake-HMAC key would be stored where
+    /// the push token belongs, the relay would sign wake payloads with
+    /// something the receiver cannot verify, and every push would be dropped
+    /// by the receiver's own authentication as forged.
+    #[test]
+    fn the_wake_hmac_setter_does_not_write_the_push_envelope() {
+        let node = [4u8; 32];
+        let cookie = [5u8; 16];
+        let (fwd, entries) = forwarder(vec![entry(node, cookie)]);
+
+        assert!(fwd.set_rendezvous_wake_hmac_envelope(node, cookie, b"wake-key".to_vec()));
+        assert_eq!(lock!(entries)[0].wake_hmac_envelope, b"wake-key".to_vec());
+        assert!(
+            lock!(entries)[0].push_envelope.is_empty(),
+            "the wake-HMAC setter wrote the push envelope"
+        );
+
+        assert!(fwd.set_rendezvous_push_envelope(node, cookie, b"push-token".to_vec()));
+        assert_eq!(lock!(entries)[0].push_envelope, b"push-token".to_vec());
+        assert_eq!(
+            lock!(entries)[0].wake_hmac_envelope,
+            b"wake-key".to_vec(),
+            "the push setter overwrote the wake-HMAC envelope"
+        );
+    }
+
+    struct MailboxFixture {
+        bridge: MailboxIpcBridge,
+        _dir: tempfile::TempDir,
+        _rx: tokio::sync::mpsc::Receiver<PushTrigger>,
+    }
+
+    fn mailbox_bridge(registered: Option<([u8; 32], [u8; 16])>) -> MailboxFixture {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mailbox = Arc::new(
+            veil_mailbox::Mailbox::open(dir.path(), veil_mailbox::MailboxConfig::default())
+                .expect("mailbox"),
+        );
+        let registry = registered.map(|(receiver, cookie)| {
+            let mut reg = veil_anonymity::mailbox_cookie_registry::MailboxCookieRegistry::new(16);
+            reg.register(receiver, cookie, 1_700_000_000);
+            Arc::new(std::sync::RwLock::new(reg))
+        });
+        let (tx, rx) = tokio::sync::mpsc::channel::<PushTrigger>(4);
+        MailboxFixture {
+            bridge: MailboxIpcBridge::new(mailbox, registry, tx, None),
+            _dir: dir,
+            _rx: rx,
+        }
+    }
+
+    fn deposit(fixture: &MailboxFixture, receiver: [u8; 32], content: [u8; 32]) {
+        // Deposited underneath the bridge on purpose: what is under test is
+        // the fetch/ack authorisation, not the deposit policy.
+        fixture
+            .bridge
+            .mailbox
+            .put(receiver, content, [7u8; 32], b"ciphertext".to_vec())
+            .expect("deposit");
+    }
+
+    /// A wrong cookie must be indistinguishable from an empty mailbox.
+    ///
+    /// `Some(empty)` rather than an error or a refusal is the whole point: an
+    /// answer that told the two apart would turn the fetch call into an oracle
+    /// for "does this receiver have mail waiting here", which is exactly the
+    /// metadata a relay exists not to leak. And it must not DRAIN — a probe
+    /// that emptied the mailbox would be a denial of service with no cookie
+    /// at all.
+    #[test]
+    fn a_wrong_fetch_cookie_reads_as_an_empty_mailbox_and_takes_nothing() {
+        let receiver = [1u8; 32];
+        let cookie = [2u8; 16];
+        let f = mailbox_bridge(Some((receiver, cookie)));
+        deposit(&f, receiver, [3u8; 32]);
+
+        assert_eq!(
+            f.bridge.fetch(receiver, [0xEEu8; 16]).map(|b| b.len()),
+            Some(0),
+            "a wrong cookie answered something other than an empty mailbox"
+        );
+
+        let got = f.bridge.fetch(receiver, cookie).expect("authorised fetch");
+        assert_eq!(
+            got.len(),
+            1,
+            "the wrong-cookie probe drained the mailbox it was refused"
+        );
+    }
+
+    /// The same for ack, where the damage is deletion rather than disclosure.
+    #[test]
+    fn a_wrong_ack_cookie_removes_nothing() {
+        let receiver = [1u8; 32];
+        let cookie = [2u8; 16];
+        let content = [3u8; 32];
+        let f = mailbox_bridge(Some((receiver, cookie)));
+        deposit(&f, receiver, content);
+
+        assert_eq!(
+            f.bridge.ack(receiver, content, [0xEEu8; 16]),
+            Some(false),
+            "a wrong cookie was allowed to ack"
+        );
+        assert_eq!(
+            f.bridge.fetch(receiver, cookie).map(|b| b.len()),
+            Some(1),
+            "the refused ack removed the blob anyway"
+        );
+        assert_eq!(
+            f.bridge.ack(receiver, content, cookie),
+            Some(true),
+            "the authorised ack did not remove it"
+        );
+    }
+
+    /// A node that is not a mailbox relay authorises nobody.
+    ///
+    /// `None` for the registry is the state of every node that never opted in,
+    /// and the fail-open reading of it — "no registry, no check" — would make
+    /// every such node serve any cookie presented to it.
+    #[test]
+    fn without_a_cookie_registry_no_fetch_is_authorised() {
+        let receiver = [1u8; 32];
+        let f = mailbox_bridge(None);
+        deposit(&f, receiver, [3u8; 32]);
+
+        assert_eq!(
+            f.bridge.fetch(receiver, [2u8; 16]).map(|b| b.len()),
+            Some(0),
+            "a node with no cookie registry served a fetch"
+        );
+        assert_eq!(
+            f.bridge.ack(receiver, [3u8; 32], [2u8; 16]),
+            Some(false),
+            "a node with no cookie registry allowed an ack"
+        );
+    }
+}
