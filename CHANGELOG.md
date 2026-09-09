@@ -1,5 +1,54 @@
 # Changelog
 
+## v0.11.27 — 2026-09-09
+
+*Four modules nobody could hold in their head, and the things that came out
+from under them.*
+
+**The three biggest files in the crate are half what they were.**
+`runtime/service_tasks.rs` 10 647 → 2 868, `runtime/mod.rs` 12 257 → 4 702,
+`veilclient-ffi/src/lib.rs` 14 209 → 9 758. Twelve new modules, each a bounded
+lifecycle rather than a line range: discovery, push, the IPC bridges, NAT
+traversal, key rotation, bootstrap, the IPC server, `NodeServices`, the
+rendezvous resolver, the boot sequence, and three FFI families. Every move was
+checked line by line against the original — no line lost, nothing changed but
+the visibility the callers that stayed behind required.
+
+**The FFI split changes the ABI contract hash**, c7997d50… → d7b09ba6…. The
+generated header is reordered and nothing else: it holds the same multiset of
+lines before and after (4 185 = 4 185, none unique to either side), and the
+Dart bindings differ in exactly one line. The hash is the pairing between a
+library and the bindings that ship with it, not a wire format; an installed
+build carries its own pair and is unaffected. Declared `pub mod` deliberately:
+cbindgen skips `pub` items it finds in a private module, and the first attempt
+dropped the `VEIL_JOIN_*` constants from the header without a word.
+
+**Five tests where there were none.** The three IPC bridges — the whole surface
+an app on this machine uses for offline mail and the outbox — had no test at
+all, and every security property they have was written in a comment and checked
+by nobody: that a push envelope lands only on the row matching BOTH the
+rendezvous node id and the auth cookie, that the wake-HMAC setter does not write
+the push field, that a wrong fetch cookie reads as an empty mailbox and takes
+nothing, that a wrong ack cookie removes nothing, and that a node with no cookie
+registry authorises nobody.
+
+**Two gates were reading the wrong thing.** `check-mutex-poison-policy.sh`
+decided what counted as test code by FILE NAME, so a test file moved unchanged
+became a production violation; it now reads the declaration — a module the
+compiler only builds under `cfg(test)` is test code wherever it sits — and
+resolves a child of `foo.rs` in `foo/`, which the first version of that rule did
+not. And a source guard in `runtime/mod.rs` searched a whole file for a function
+name, found the literal inside its own `assert!`, and went on passing against
+its own text; both guards there now anchor on the indentation a definition is
+written with and ignore commented-out lines.
+
+**A doc comment was on the wrong function.** `rotate_and_announce` carried a
+paragraph describing `spawn_ticket_key_rotation_task` — orphaned long before
+this work and invisible while both lived in the same ten thousand lines.
+
+No behaviour changed. 5724 workspace tests, 175 FFI, 86 IPC, doctests, hygiene
+18/18 — all green, and unchanged in count from the release before.
+
 ## v0.11.26 — 2026-09-09
 
 *Findings from report24, and the guards that would have caught them.*
