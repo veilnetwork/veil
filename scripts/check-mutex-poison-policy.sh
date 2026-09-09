@@ -58,6 +58,43 @@ TEST_FILE_PATTERNS = (
 )
 
 
+def cfg_test_module_files(roots) -> set[str]:
+    """Files whose module is declared `#[cfg(test)] mod name;` somewhere.
+
+    The name patterns above are the older answer to the same question, and
+    they are a NAME: a test-only file called something else is production as
+    far as this script is concerned, which is how `v01_close_quiescence.rs`
+    became a violation the moment it moved out of `lib.rs` unchanged.
+
+    The declaration is the fact. A module the compiler only builds under
+    `cfg(test)` is test code wherever its file happens to sit and whatever it
+    happens to be called.
+    """
+    decl = re.compile(
+        r"#\[cfg\((?:test|[^\]]*\btest\b[^\]]*)\)\]\s*(?:#\[[^\]]*\]\s*)*mod\s+(\w+)\s*;"
+    )
+    found: set[str] = set()
+    for root in roots:
+        for dirpath, _dirnames, filenames in os.walk(root):
+            for fn in filenames:
+                if not fn.endswith(".rs"):
+                    continue
+                declaring = os.path.join(dirpath, fn)
+                try:
+                    with open(declaring, encoding="utf-8", errors="replace") as f:
+                        text = f.read()
+                except OSError:
+                    continue
+                for name in decl.findall(text):
+                    for candidate in (
+                        os.path.join(dirpath, f"{name}.rs"),
+                        os.path.join(dirpath, name, "mod.rs"),
+                    ):
+                        if os.path.isfile(candidate):
+                            found.add(os.path.normpath(candidate))
+    return found
+
+
 def find_test_mod_start(path: str) -> int | None:
     """Return the 1-based line number where `mod tests {` (or similar) starts."""
     pattern = re.compile(r"^\s*mod\s+(tests?|integration_tests|.+_tests)\b.*\{?\s*$")
@@ -82,13 +119,13 @@ _POISON_RE = re.compile(
 )
 
 
-def find_violations(path: str):
+def find_violations(path: str, cfg_test_files: set[str] = frozenset()):
     """Return list of (line_no, code) for raw Mutex/RwLock guard
     acquisitions that bypass the poison-recovering macros, outside the
     file's `mod tests` block.  Handles single-line AND multiline forms."""
     test_start = find_test_mod_start(path)
     is_test_file = any(p in path for p in TEST_FILE_PATTERNS)
-    if is_test_file:
+    if is_test_file or os.path.normpath(path) in cfg_test_files:
         return []
     with open(path, encoding="utf-8", errors="replace") as f:
         text = f.read()
@@ -115,8 +152,11 @@ def find_violations(path: str):
     return out
 
 
+ROOTS = ("veilcore/src", "crates", "veilclient/src")
+CFG_TEST_FILES = cfg_test_module_files(d for d in ROOTS if os.path.isdir(d))
+
 violations = []
-for d in ("veilcore/src", "crates", "veilclient/src"):
+for d in ROOTS:
     if not os.path.isdir(d):
         continue
     for root, _, files in os.walk(d):
@@ -133,7 +173,7 @@ for d in ("veilcore/src", "crates", "veilclient/src"):
             path = f"{root}/{fn}"
             if any(frag in path for frag in IGNORE_PATH_FRAGMENTS):
                 continue
-            for ln, src in find_violations(path):
+            for ln, src in find_violations(path, CFG_TEST_FILES):
                 violations.append((path, ln, src.strip()))
 
 if violations:
