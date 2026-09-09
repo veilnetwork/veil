@@ -3538,6 +3538,28 @@ intptr_t veil_fs_write(VeilFsFile *handle,
 ;
 
 /**
+ * Ask the operating system to put what was written on the DISK. Returns true,
+ * or false with `*err_out` set.
+ *
+ * `veil_fs_write` is a positional write: it reaches the kernel, and the kernel
+ * decides when it reaches the platter. That distinction is the whole of this
+ * function. A downloader writes a scratch file, flushes it and renames it over
+ * the real name — and without a barrier between the writes and the rename, a
+ * power loss can leave the new NAME pointing at a file whose contents were
+ * never written, which is the one outcome the rename dance exists to prevent.
+ *
+ * The Dart sink this replaced called `RandomAccessFile.flush`, which does the
+ * same thing; when the writes moved to descriptors the barrier was quietly
+ * dropped and the flush became a no-op that still looked like one
+ * (report24 XV24-04).
+ *
+ * # Safety
+ * `handle` must come from [`veil_fs_create_beneath`] or
+ * [`veil_fs_open_beneath`] and not have been closed.
+ */
+ bool veil_fs_sync(VeilFsFile *handle, char **err_out) ;
+
+/**
  * Read up to `len` bytes at `offset` from an open handle. Returns the number
  * read, or -1 with `*err_out` set.
  *
