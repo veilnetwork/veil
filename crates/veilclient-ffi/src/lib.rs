@@ -106,6 +106,7 @@ mod nickname_net;
 mod node;
 #[cfg(feature = "packet-tunnel")]
 mod packet_tunnel;
+pub mod path_acl;
 #[cfg(feature = "node-embedded")]
 mod space_discovery_net;
 

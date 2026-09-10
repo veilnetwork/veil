@@ -2894,6 +2894,27 @@ int veil_packet_tunnel_start_packets(const char *proxy_url,
  int veil_packet_tunnel_run_linux_helper(const char *config_path) ;
 #endif
 
+/**
+ * Owner and DACL of `path`, read from a handle rather than from the name.
+ *
+ * Writes a NUL-terminated JSON object to `*out_json` — either
+ * `{"owner":…,"finalPath":…,"rules":[…]}` or `{"error":…}` — which the caller
+ * frees with `veil_free_string`. A path that is a junction or symbolic link
+ * is reported as an error rather than resolved: see the module docs.
+ *
+ * Returns [`VEIL_OK`] when `*out_json` was written, [`VEIL_ERR`] otherwise.
+ *
+ * # Safety
+ * `path` must point at `path_len` bytes of UTF-8. `out_json` and `err_out`
+ * must be valid, writable pointers.
+ */
+
+int veil_path_security_facts(const uint8_t *path,
+                             uintptr_t path_len,
+                             char **out_json,
+                             char **err_out)
+;
+
 #if defined(VEIL_FFI_NODE_EMBEDDED)
 /**
  * Publish one already-signed `XS` public-Space discovery carrier through the
