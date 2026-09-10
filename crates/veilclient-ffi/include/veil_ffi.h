@@ -648,29 +648,6 @@ typedef struct VeilSovereignSigner VeilSovereignSigner;
  */
 typedef struct VeilStreamFfi VeilStreamFfi;
 
-#if defined(VEIL_FFI_NODE_EMBEDDED)
-/**
- * Stable C snapshot returned by `veil_media_channel_get_stats`. All fields
- * are cumulative channel-lifetime counters/maxima except `video_queue_depth`.
- * Keep this plain-u64 layout in lockstep with Dart's FFI struct.
- */
-typedef struct {
-  uint64_t video_frames_enqueued;
-  uint64_t video_frames_started;
-  uint64_t video_queue_depth;
-  uint64_t video_queue_max_depth;
-  uint64_t video_queue_age_max_ms;
-  uint64_t video_queue_holds_75ms;
-  uint64_t sender_lock_max_ms;
-  uint64_t sender_lock_holds_16ms;
-  uint64_t video_frame_ipc_max_ms;
-  uint64_t video_frame_ipc_holds_33ms;
-  uint64_t ipc_cell_max_ms;
-  uint64_t ipc_cell_holds_16ms;
-  uint64_t ipc_send_failures;
-} VeilMediaChannelStats;
-#endif
-
 /**
  * Recv callback signature — invoked from a tokio worker thread.
  *
@@ -806,6 +783,29 @@ typedef void (*VeilEventCb)(void *user, uint8_t kind, const uint8_t *payload, si
 typedef void (*PacketWriteFn)(void*, const uint8_t*, uintptr_t);
 #endif
 
+#if defined(VEIL_FFI_NODE_EMBEDDED)
+/**
+ * Stable C snapshot returned by `veil_media_channel_get_stats`. All fields
+ * are cumulative channel-lifetime counters/maxima except `video_queue_depth`.
+ * Keep this plain-u64 layout in lockstep with Dart's FFI struct.
+ */
+typedef struct {
+  uint64_t video_frames_enqueued;
+  uint64_t video_frames_started;
+  uint64_t video_queue_depth;
+  uint64_t video_queue_max_depth;
+  uint64_t video_queue_age_max_ms;
+  uint64_t video_queue_holds_75ms;
+  uint64_t sender_lock_max_ms;
+  uint64_t sender_lock_holds_16ms;
+  uint64_t video_frame_ipc_max_ms;
+  uint64_t video_frame_ipc_holds_33ms;
+  uint64_t ipc_cell_max_ms;
+  uint64_t ipc_cell_holds_16ms;
+  uint64_t ipc_send_failures;
+} VeilMediaChannelStats;
+#endif
+
 /**
  * Mailbox blob descriptor returned by [`veil_mailbox_fetch_into`].
  * `blob` is a borrow into a buffer the caller provided to the fetch
@@ -899,100 +899,6 @@ int32_t veil_anon_stream_warm_peer(VeilHandle *handle,
 ;
 #endif
 
-#if defined(VEIL_FFI_NODE_EMBEDDED)
-/**
- * Open a lossy MEDIA datagram channel to `peer` over the anonymous circuit
- * (reuses the reliable stream's rendezvous/pool and warms the circuit in the
- * background). Per-packet RTP/RTCP then flows native↔native via
- * [`veil_media_send_datagram`] / [`veil_media_set_recv_callback`], sealed
- * end-to-end with `tx_key`/`rx_key`: two distinct, non-zero 32-byte
- * directional call-media keys, required, copied into zeroizing native state
- * (the caller may wipe its buffers as soon as this returns). Returns an
- * opaque channel id (> 0), or 0 on error.
- */
-
-uint64_t veil_media_open_channel(VeilHandle *handle,
-                                 const uint8_t *peer_node_id,
-                                 const uint8_t *tx_key,
-                                 const uint8_t *rx_key,
-                                 char **err_out)
-;
-#endif
-
-#if defined(VEIL_FFI_NODE_EMBEDDED)
-/**
- * Open a lossy MEDIA datagram channel to `peer` over a direct app endpoint.
- * Outbound RTP/RTCP is sealed with the required `tx_key`/`rx_key` (see
- * [`veil_media_open_channel`]) and sent from `app` to `(peer_node_id,
- * peer_app_id, peer_endpoint_id)`. Inbound direct media datagrams must be
- * received by the host on the same app endpoint and fed to
- * [`veil_media_dispatch_direct_datagram`].
- *
- * The session under a "direct" channel is encrypted hop-to-hop to whatever
- * node terminates it, which is not the same thing as end-to-end, so this path
- * seals exactly like the other two.
- */
-
-uint64_t veil_media_open_direct_channel(VeilApp *app,
-                                        const uint8_t *peer_node_id,
-                                        const uint8_t *peer_app_id,
-                                        uint32_t peer_endpoint_id,
-                                        const uint8_t *tx_key,
-                                        const uint8_t *rx_key,
-                                        char **err_out)
-;
-#endif
-
-#if defined(VEIL_FFI_NODE_EMBEDDED)
-/**
- * Open a lossy MEDIA channel forced through the ordinary Delivery relay path
- * (no onion circuit), sealed end-to-end with the required `tx_key`/`rx_key`
- * (see [`veil_media_open_channel`]). Relay nodes see addressing metadata but
- * never RTP/RTCP bytes. Intended only for direct-identity calls when the
- * preferred P2P route is unavailable.
- */
-
-uint64_t veil_media_open_relay_channel(VeilApp *app,
-                                       const uint8_t *peer_node_id,
-                                       const uint8_t *peer_app_id,
-                                       uint32_t peer_endpoint_id,
-                                       const uint8_t *tx_key,
-                                       const uint8_t *rx_key,
-                                       char **err_out)
-;
-#endif
-
-#if defined(VEIL_FFI_NODE_EMBEDDED)
-/**
- * Enqueue one media datagram (RTP/RTCP) on `chan`. NON-BLOCKING: returns 0 if
- * queued, 1 if dropped (queue full / channel closing) — the caller's real-time
- * media thread must never block. Returns -1 on a NULL/zero-length payload or an
- * unknown `chan`.
- */
- int veil_media_send_datagram(uint64_t chan, const uint8_t *ptr, size_t len) ;
-#endif
-
-#if defined(VEIL_FFI_NODE_EMBEDDED)
-/**
- * Snapshot per-channel relay drain diagnostics. Direct/onion channels return
- * a zeroed snapshot. Returns -1 for an invalid channel or null output.
- */
- int veil_media_channel_get_stats(uint64_t chan, VeilMediaChannelStats *out) ;
-#endif
-
-#if defined(VEIL_FFI_NODE_EMBEDDED)
-/**
- * Request a make-before-break anonymous route refresh for an open media
- * channel. This is deliberately separate from send success: an onion packet
- * can enter the first-hop queue successfully and still be black-holed farther
- * along the circuit. The peer reports that end-to-end silence over the live
- * call heartbeat, and the host forwards it here. Returns 0 when queued, 1 when
- * an equivalent repair is already pending, and -1 for an unknown/direct
- * channel.
- */
- int veil_media_repair_channel(uint64_t chan) ;
-#endif
-
 /**
  * Runtime toggle for the slow-inbound-dispatch trace
  * (`veil_session::rt_trace`) — the embedded-node twin of the
@@ -1010,96 +916,6 @@ uint64_t veil_media_open_relay_channel(VeilApp *app,
  * their validity horizon; see `veil_session::rt_trace::set_publish_pause`.
  */
  void veil_debug_set_publish_pause(int on) ;
-
-#if defined(VEIL_FFI_NODE_EMBEDDED)
-/**
- * Select media batching for a direct or relay channel: 0 = off, 1 = legacy
- * audio+video batching, 2 = compact relay audio-only batching. Mode 2 is
- * rejected for non-relay channels. This is a WIRE-FORMAT selector, not a
- * security one — every mode seals identically, and the batch envelope now
- * travels inside the seal, so a peer on the path cannot see or rewrite it.
- * Returns 0 on success, -1 for an unknown/unsupported channel or mode.
- */
- int veil_media_channel_set_batching(uint64_t chan, int mode) ;
-#endif
-
-#if defined(VEIL_FFI_NODE_EMBEDDED)
-/**
- * Feed one direct-P2P media datagram received by the host on the media app
- * endpoint into the shared native media ingress. Whatever the host believes
- * about the source, the cell is opened with the channel's own key before a
- * byte of it reaches the engine.
- */
-
-int veil_media_dispatch_direct_datagram(const uint8_t *peer_node_id,
-                                        const uint8_t *ptr,
-                                        size_t len)
-;
-#endif
-
-#if defined(VEIL_FFI_NODE_EMBEDDED)
-/**
- * Drain one bound app endpoint directly into the native media callback
- * registry, bypassing the host language's event loop entirely.
- *
- * `source_namespace` + `source_name` identify the well-known named app that a
- * remote media sender must use. The delivery's `src_node_id` is combined with
- * those names to derive the only accepted `src_app_id`; frames from another
- * app on the same peer are silently dropped. This preserves the source-app
- * check previously performed in Dart without copying every RTP packet through
- * the UI isolate.
- *
- * X/V-01, stated plainly because the sentence above used to call that id "the
- * authenticated session `src_node_id`" and nothing here checks it: the derived
- * app id is a function OF `src_node_id`, so anyone who can claim a node id can
- * also compute its media app id. This demux is not, and never was, a sender
- * gate. `provenance` is deliberately NOT consulted here either — media
- * legitimately arrives over anonymous ingress, which is `Claimed` by design, so
- * refusing it would break calls rather than secure them. What authenticates a
- * media sender is the per-channel `MediaCipher` seal, which every channel now
- * has and which [`media::dispatch_inbound_auto`] applies to every cell on every
- * transport.
- *
- * This function takes exclusive ownership of the app's datagram receiver. It
- * must be called before [`veil_app_set_recv_handler`].
- */
-
-int veil_media_start_direct_receiver(VeilApp *app,
-                                     const uint8_t *source_namespace,
-                                     size_t source_namespace_len,
-                                     const uint8_t *source_name,
-                                     size_t source_name_len,
-                                     char **err_out)
-;
-#endif
-
-#if defined(VEIL_FFI_NODE_EMBEDDED)
-/**
- * Install the C recv callback invoked (native↔native, from a tokio worker)
- * once per inbound media datagram from `chan`'s peer, with the wire magic
- * already stripped. Replaces any prior callback; `cb == NULL` clears it.
- * Returns 0, or -1 on an unknown `chan`.
- */
- int veil_media_set_recv_callback(uint64_t chan, Option_MediaRecvFn cb, void *ctx) ;
-#endif
-
-#if defined(VEIL_FFI_NODE_EMBEDDED)
-/**
- * Close a media channel: stops the drain task, drops the outbound queue, and
- * clears the peer's recv callback. Idempotent (unknown `chan` is a no-op).
- */
- void veil_media_close_channel(uint64_t chan) ;
-#endif
-
-#if defined(VEIL_FFI_NODE_EMBEDDED)
-/**
- * Diagnostic: number of inbound media datagrams received from `peer_node_id`
- * (32 bytes) since process start. Lets a host confirm receipt without wiring a
- * cross-thread recv callback (used by the Phase 2 two-node datagram probe).
- * Returns 0 on a NULL pointer.
- */
- uint64_t veil_media_recv_count(const uint8_t *peer_node_id) ;
-#endif
 
 #if defined(VEIL_FFI_NODE_EMBEDDED)
 /**
@@ -3355,6 +3171,190 @@ int veil_space_discovery_resolve(const uint8_t *self_node_id,
                                  size_t *out_len,
                                  char **err_out)
 ;
+#endif
+
+#if defined(VEIL_FFI_NODE_EMBEDDED)
+/**
+ * Open a lossy MEDIA datagram channel to `peer` over the anonymous circuit
+ * (reuses the reliable stream's rendezvous/pool and warms the circuit in the
+ * background). Per-packet RTP/RTCP then flows native↔native via
+ * [`veil_media_send_datagram`] / [`veil_media_set_recv_callback`], sealed
+ * end-to-end with `tx_key`/`rx_key`: two distinct, non-zero 32-byte
+ * directional call-media keys, required, copied into zeroizing native state
+ * (the caller may wipe its buffers as soon as this returns). Returns an
+ * opaque channel id (> 0), or 0 on error.
+ */
+
+uint64_t veil_media_open_channel(VeilHandle *handle,
+                                 const uint8_t *peer_node_id,
+                                 const uint8_t *tx_key,
+                                 const uint8_t *rx_key,
+                                 char **err_out)
+;
+#endif
+
+#if defined(VEIL_FFI_NODE_EMBEDDED)
+/**
+ * Open a lossy MEDIA datagram channel to `peer` over a direct app endpoint.
+ * Outbound RTP/RTCP is sealed with the required `tx_key`/`rx_key` (see
+ * [`veil_media_open_channel`]) and sent from `app` to `(peer_node_id,
+ * peer_app_id, peer_endpoint_id)`. Inbound direct media datagrams must be
+ * received by the host on the same app endpoint and fed to
+ * [`veil_media_dispatch_direct_datagram`].
+ *
+ * The session under a "direct" channel is encrypted hop-to-hop to whatever
+ * node terminates it, which is not the same thing as end-to-end, so this path
+ * seals exactly like the other two.
+ */
+
+uint64_t veil_media_open_direct_channel(VeilApp *app,
+                                        const uint8_t *peer_node_id,
+                                        const uint8_t *peer_app_id,
+                                        uint32_t peer_endpoint_id,
+                                        const uint8_t *tx_key,
+                                        const uint8_t *rx_key,
+                                        char **err_out)
+;
+#endif
+
+#if defined(VEIL_FFI_NODE_EMBEDDED)
+/**
+ * Open a lossy MEDIA channel forced through the ordinary Delivery relay path
+ * (no onion circuit), sealed end-to-end with the required `tx_key`/`rx_key`
+ * (see [`veil_media_open_channel`]). Relay nodes see addressing metadata but
+ * never RTP/RTCP bytes. Intended only for direct-identity calls when the
+ * preferred P2P route is unavailable.
+ */
+
+uint64_t veil_media_open_relay_channel(VeilApp *app,
+                                       const uint8_t *peer_node_id,
+                                       const uint8_t *peer_app_id,
+                                       uint32_t peer_endpoint_id,
+                                       const uint8_t *tx_key,
+                                       const uint8_t *rx_key,
+                                       char **err_out)
+;
+#endif
+
+#if defined(VEIL_FFI_NODE_EMBEDDED)
+/**
+ * Enqueue one media datagram (RTP/RTCP) on `chan`. NON-BLOCKING: returns 0 if
+ * queued, 1 if dropped (queue full / channel closing) — the caller's real-time
+ * media thread must never block. Returns -1 on a NULL/zero-length payload or an
+ * unknown `chan`.
+ */
+ int veil_media_send_datagram(uint64_t chan, const uint8_t *ptr, size_t len) ;
+#endif
+
+#if defined(VEIL_FFI_NODE_EMBEDDED)
+/**
+ * Snapshot per-channel relay drain diagnostics. Direct/onion channels return
+ * a zeroed snapshot. Returns -1 for an invalid channel or null output.
+ */
+ int veil_media_channel_get_stats(uint64_t chan, VeilMediaChannelStats *out) ;
+#endif
+
+#if defined(VEIL_FFI_NODE_EMBEDDED)
+/**
+ * Request a make-before-break anonymous route refresh for an open media
+ * channel. This is deliberately separate from send success: an onion packet
+ * can enter the first-hop queue successfully and still be black-holed farther
+ * along the circuit. The peer reports that end-to-end silence over the live
+ * call heartbeat, and the host forwards it here. Returns 0 when queued, 1 when
+ * an equivalent repair is already pending, and -1 for an unknown/direct
+ * channel.
+ */
+ int veil_media_repair_channel(uint64_t chan) ;
+#endif
+
+#if defined(VEIL_FFI_NODE_EMBEDDED)
+/**
+ * Select media batching for a direct or relay channel: 0 = off, 1 = legacy
+ * audio+video batching, 2 = compact relay audio-only batching. Mode 2 is
+ * rejected for non-relay channels. This is a WIRE-FORMAT selector, not a
+ * security one — every mode seals identically, and the batch envelope now
+ * travels inside the seal, so a peer on the path cannot see or rewrite it.
+ * Returns 0 on success, -1 for an unknown/unsupported channel or mode.
+ */
+ int veil_media_channel_set_batching(uint64_t chan, int mode) ;
+#endif
+
+#if defined(VEIL_FFI_NODE_EMBEDDED)
+/**
+ * Feed one direct-P2P media datagram received by the host on the media app
+ * endpoint into the shared native media ingress. Whatever the host believes
+ * about the source, the cell is opened with the channel's own key before a
+ * byte of it reaches the engine.
+ */
+
+int veil_media_dispatch_direct_datagram(const uint8_t *peer_node_id,
+                                        const uint8_t *ptr,
+                                        size_t len)
+;
+#endif
+
+#if defined(VEIL_FFI_NODE_EMBEDDED)
+/**
+ * Drain one bound app endpoint directly into the native media callback
+ * registry, bypassing the host language's event loop entirely.
+ *
+ * `source_namespace` + `source_name` identify the well-known named app that a
+ * remote media sender must use. The delivery's `src_node_id` is combined with
+ * those names to derive the only accepted `src_app_id`; frames from another
+ * app on the same peer are silently dropped. This preserves the source-app
+ * check previously performed in Dart without copying every RTP packet through
+ * the UI isolate.
+ *
+ * X/V-01, stated plainly because the sentence above used to call that id "the
+ * authenticated session `src_node_id`" and nothing here checks it: the derived
+ * app id is a function OF `src_node_id`, so anyone who can claim a node id can
+ * also compute its media app id. This demux is not, and never was, a sender
+ * gate. `provenance` is deliberately NOT consulted here either — media
+ * legitimately arrives over anonymous ingress, which is `Claimed` by design, so
+ * refusing it would break calls rather than secure them. What authenticates a
+ * media sender is the per-channel `MediaCipher` seal, which every channel now
+ * has and which [`media::dispatch_inbound_auto`] applies to every cell on every
+ * transport.
+ *
+ * This function takes exclusive ownership of the app's datagram receiver. It
+ * must be called before [`veil_app_set_recv_handler`].
+ */
+
+int veil_media_start_direct_receiver(VeilApp *app,
+                                     const uint8_t *source_namespace,
+                                     size_t source_namespace_len,
+                                     const uint8_t *source_name,
+                                     size_t source_name_len,
+                                     char **err_out)
+;
+#endif
+
+#if defined(VEIL_FFI_NODE_EMBEDDED)
+/**
+ * Install the C recv callback invoked (native↔native, from a tokio worker)
+ * once per inbound media datagram from `chan`'s peer, with the wire magic
+ * already stripped. Replaces any prior callback; `cb == NULL` clears it.
+ * Returns 0, or -1 on an unknown `chan`.
+ */
+ int veil_media_set_recv_callback(uint64_t chan, Option_MediaRecvFn cb, void *ctx) ;
+#endif
+
+#if defined(VEIL_FFI_NODE_EMBEDDED)
+/**
+ * Close a media channel: stops the drain task, drops the outbound queue, and
+ * clears the peer's recv callback. Idempotent (unknown `chan` is a no-op).
+ */
+ void veil_media_close_channel(uint64_t chan) ;
+#endif
+
+#if defined(VEIL_FFI_NODE_EMBEDDED)
+/**
+ * Diagnostic: number of inbound media datagrams received from `peer_node_id`
+ * (32 bytes) since process start. Lets a host confirm receipt without wiring a
+ * cross-thread recv callback (used by the Phase 2 two-node datagram probe).
+ * Returns 0 on a NULL pointer.
+ */
+ uint64_t veil_media_recv_count(const uint8_t *peer_node_id) ;
 #endif
 
 /**
