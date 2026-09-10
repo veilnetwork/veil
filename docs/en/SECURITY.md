@@ -31,7 +31,7 @@ few terms used in the table:
 |--------|-----------|--------|
 | **Sybil** | PoW difficulty (default 16, adaptive/epoch-based; `MAX_POW_DIFFICULTY=24` hard cap) | Implemented |
 | **Eclipse (DHT)** | Subnet /24 diversity in k-buckets (K/4=5 max per subnet) | Implemented |
-| **Mailbox Flood** | Reject when full (no eviction); per-sender quota; global 100K cap | Implemented |
+| **Mailbox Flood** | Per-receiver quota (100 MiB), per-relay cap (10 GiB) with oldest-first eviction on hit, 60 puts/receiver/minute, 7-day TTL | Implemented |
 | **Replay (routing)** | Two-layer dedup: per-(origin,via,seq) + per-(origin,seq); `MAX_ROUTE_ANNOUNCE_AGE_SECS=300` | Implemented |
 | **DHT Poisoning** | `expires_at` validation; signed STORE announcements | Implemented |
 | **DHT Delete abuse** | `DeletePayload` requires `(algo, pubkey, signature)`; `BLAKE3(pubkey)==key` (self-owned only) | Implemented |

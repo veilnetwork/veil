@@ -1,5 +1,50 @@
 # Changelog
 
+## v0.11.28 — 2026-09-10
+
+*A path's permissions now come from the object, not from its name.*
+
+**The Windows launch guard read permissions by NAME**, through PowerShell
+`Get-Acl`, and the code saying so also said what it was: the part of the fix
+that could be written without a Windows host to verify on. Reading by name is
+wrong twice — the name is resolved once to read the permissions and again to
+use the file, and a name can cross a junction whose target's permissions say
+nothing about who can repoint it.
+
+`veil_path_security_facts` opens the path once and answers from that one
+handle: `CreateFileW` with `FILE_FLAG_OPEN_REPARSE_POINT` so a link is seen
+rather than followed, `GetFinalPathNameByHandleW` so a link ABOVE the leaf
+shows up as a path that does not match the one asked about, and
+`GetSecurityInfo` — the handle-based call, not its named twin, which would
+look the name up again.
+
+Measured on a Windows 11 ARM64 host rather than reasoned about: real ACLs on
+`C:\Windows` and `C:\Program Files`, a user-writable directory reported as
+such, a `mklink /J` junction refused with its reason, and a path THROUGH that
+junction answered with `finalPath=\\?\C:\Windows\System32` — the fact
+PowerShell could never report. The crate itself does not build on that host
+(its BoringSSL dependency fails under CMake for the target), so the same Win32
+code ran there in a standalone harness.
+
+**Five more families leave the FFI surface.** `veilclient-ffi/src/lib.rs`
+9 758 → 6 544: the mailbox, the nicknames, the media entry points with the
+plane they drive, the anonymous stream, and the onion services. Each was
+chosen by what the C names say rather than by the banners in the file — the
+third cut found eight anonymous-stream calls sitting in two runs with three
+hundred lines of media queue internals wedged between them.
+
+**Sending and NAT traversal leave the services facade.**
+`runtime/node_services.rs` 6 066 → 3 216, into `sending.rs` and
+`nat_punch.rs`, each a family where the ORDER or the CHOICE is the content: a
+descent through fallbacks that each give away more than the last, and five
+roads out of the node that share one failure — every one resolves something
+first, and every one can find an answer still signed and no longer true.
+
+**A doc promised a limit that does not exist.** `SECURITY.md` said the mailbox
+rejects when full with no eviction and a global 100K cap. There is no such
+cap, and it evicts oldest-first at 10 GiB. Corrected in both languages with
+the numbers the code actually has.
+
 ## v0.11.27 — 2026-09-09
 
 *Four modules nobody could hold in their head, and the things that came out

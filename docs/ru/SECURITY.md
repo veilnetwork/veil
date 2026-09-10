@@ -32,7 +32,7 @@
 |--------|-----------|--------|
 | **Sybil** | PoW-сложность (по умолчанию 16, adaptive/epoch-based; `MAX_POW_DIFFICULTY=24` — жёсткий потолок) | Реализовано |
 | **Eclipse (DHT)** | /24 subnet diversity в k-bucket'ах (K/4=5 max на subnet) | Реализовано |
-| **Mailbox flood** | Reject при заполнении (без eviction); per-sender квота; global 100K cap | Реализовано |
+| **Mailbox flood** | Квота на получателя (100 МиБ), потолок на реле (10 ГиБ) с вытеснением самого старого при достижении, 60 депозитов на получателя в минуту, TTL 7 суток | Реализовано |
 | **Replay (routing)** | Двухуровневый dedup: per-(origin,via,seq) + per-(origin,seq); `MAX_ROUTE_ANNOUNCE_AGE_SECS=300` | Реализовано |
 | **DHT poisoning** | Валидация `expires_at`; подписанные STORE-анонсы | Реализовано |
 | **DHT delete abuse** | `DeletePayload` требует `(algo, pubkey, signature)`; `BLAKE3(pubkey)==key` (только self-owned) | Реализовано |
