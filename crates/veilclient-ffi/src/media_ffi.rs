@@ -1120,3 +1120,377 @@ pub unsafe extern "C" fn veil_media_recv_count(peer_node_id: *const u8) -> u64 {
     }
     media::recv_count(peer)
 }
+
+// ── the plane these calls drive ──────────────────────────────────────
+//
+// Lifted out of `lib.rs` together with the calls above: the bounded
+// outbound queue, the relay video-frame assembler and the wire-cell
+// builder have no caller anywhere else.
+
+// ---------------------------------------------------------------------------
+// Media datagram channel (Phase 2 of calls): a lossy RTP/RTCP path over the
+// anonymous onion circuit. Per-packet flow is native↔native (a C++/ObjC++
+// `webrtc::Transport` shim calls `veil_media_send_datagram` and receives via
+// `veil_media_set_recv_callback`); Dart drives control only (open/close). See
+// `media.rs` for the wire magic + inbound registry and `veil_media_abi.h` for
+// the shared header.
+// ---------------------------------------------------------------------------
+
+/// One open media channel. Holds a BOUNDED outbound queue and the drain task
+/// that pumps it into the hub's lossy datagram send. Bounded because real-time
+/// media must drop rather than buffer when it outpaces the circuit.
+#[cfg(feature = "node-embedded")]
+struct MediaChannel {
+    tx_hi: mpsc::Sender<Vec<u8>>,
+    video: MediaVideoIngress,
+    /// Anonymous channels accept an out-of-band end-to-end repair request.
+    /// The receiver of the media asks the sender to refresh its outbound
+    /// rendezvous pool when RTP/RTCP has gone dark even though signaling is
+    /// still alive. Direct channels leave this `None`.
+    repair_tx: Option<mpsc::Sender<()>>,
+    peer: [u8; 32],
+    task: tokio::task::JoinHandle<()>,
+    /// Opt-in media batching on direct/RELAY send paths (see
+    /// `veil_media_channel_set_batching`). Off by default: a batched cell is
+    /// silent noise to a legacy receiver, so the host enables it only after
+    /// call signaling proves the peer's protocol version understands
+    /// MEDIA_BATCH_MAGIC on this path. `None` on onion channels (their own
+    /// transport already batches).
+    batching: Option<Arc<std::sync::atomic::AtomicU8>>,
+    /// The channel's end-to-end media cipher — required, on every transport.
+    /// The same object is installed with the receive callback, so route
+    /// rebuilds do not race separate TX/RX cipher ownership, and there is no
+    /// state in which a channel exists but its media is in the clear.
+    cipher: Arc<media::MediaCipher>,
+    /// Relay-only drain telemetry. Atomics keep the real-time ingress ABI
+    /// non-blocking while letting the host distinguish a local queue stall
+    /// from delay after the frame has entered the node/session path.
+    relay_stats: Option<Arc<RelayMediaStats>>,
+}
+
+/// Packet ingress is sufficient for onion/P2P because their drain paths accept
+/// packets as quickly as WebRTC emits them. A relayed send performs more work
+/// per packet (E2E envelope + relay routing), so a tiny packet FIFO can retain
+/// only the first few fragments of a VP8 keyframe. Buffer relay video by RTP
+/// frame instead: a frame is either admitted whole or dropped whole.
+#[cfg(feature = "node-embedded")]
+enum MediaVideoIngress {
+    Packets(mpsc::Sender<Vec<u8>>),
+    RelayFrames {
+        tx: mpsc::Sender<RelayVideoFrame>,
+        assembler: RelayVideoFrameAssembler,
+        stats: Arc<RelayMediaStats>,
+    },
+}
+
+#[cfg(feature = "node-embedded")]
+struct RelayVideoFrame {
+    packets: Vec<Vec<u8>>,
+    enqueued_at: std::time::Instant,
+}
+
+/// Stable C snapshot returned by `veil_media_channel_get_stats`. All fields
+/// are cumulative channel-lifetime counters/maxima except `video_queue_depth`.
+/// Keep this plain-u64 layout in lockstep with Dart's FFI struct.
+#[cfg(feature = "node-embedded")]
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct VeilMediaChannelStats {
+    pub video_frames_enqueued: u64,
+    pub video_frames_started: u64,
+    pub video_queue_depth: u64,
+    pub video_queue_max_depth: u64,
+    pub video_queue_age_max_ms: u64,
+    pub video_queue_holds_75ms: u64,
+    pub sender_lock_max_ms: u64,
+    pub sender_lock_holds_16ms: u64,
+    pub video_frame_ipc_max_ms: u64,
+    pub video_frame_ipc_holds_33ms: u64,
+    pub ipc_cell_max_ms: u64,
+    pub ipc_cell_holds_16ms: u64,
+    pub ipc_send_failures: u64,
+}
+
+#[cfg(feature = "node-embedded")]
+#[derive(Default)]
+struct RelayMediaStats {
+    video_frames_enqueued: std::sync::atomic::AtomicU64,
+    video_frames_started: std::sync::atomic::AtomicU64,
+    video_queue_depth: std::sync::atomic::AtomicU64,
+    video_queue_max_depth: std::sync::atomic::AtomicU64,
+    video_queue_age_max_ms: std::sync::atomic::AtomicU64,
+    video_queue_holds_75ms: std::sync::atomic::AtomicU64,
+    sender_lock_max_ms: std::sync::atomic::AtomicU64,
+    sender_lock_holds_16ms: std::sync::atomic::AtomicU64,
+    video_frame_ipc_max_ms: std::sync::atomic::AtomicU64,
+    video_frame_ipc_holds_33ms: std::sync::atomic::AtomicU64,
+    ipc_cell_max_ms: std::sync::atomic::AtomicU64,
+    ipc_cell_holds_16ms: std::sync::atomic::AtomicU64,
+    ipc_send_failures: std::sync::atomic::AtomicU64,
+}
+
+#[cfg(feature = "node-embedded")]
+impl RelayMediaStats {
+    fn millis(elapsed: std::time::Duration) -> u64 {
+        elapsed.as_millis().min(u64::MAX as u128) as u64
+    }
+
+    fn enqueue_frame(&self) {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.video_frames_enqueued.fetch_add(1, Relaxed);
+        let depth = self.video_queue_depth.fetch_add(1, Relaxed) + 1;
+        self.video_queue_max_depth.fetch_max(depth, Relaxed);
+    }
+
+    fn undo_enqueue_frame(&self) {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.video_frames_enqueued.fetch_sub(1, Relaxed);
+        self.video_queue_depth.fetch_sub(1, Relaxed);
+    }
+
+    fn start_frame(&self, queued_for: std::time::Duration) {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.video_queue_depth.fetch_sub(1, Relaxed);
+        self.video_frames_started.fetch_add(1, Relaxed);
+        let ms = Self::millis(queued_for);
+        self.video_queue_age_max_ms.fetch_max(ms, Relaxed);
+        if ms >= 75 {
+            self.video_queue_holds_75ms.fetch_add(1, Relaxed);
+        }
+    }
+
+    fn observe_sender_lock(&self, elapsed: std::time::Duration) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let ms = Self::millis(elapsed);
+        self.sender_lock_max_ms.fetch_max(ms, Relaxed);
+        if ms >= 16 {
+            self.sender_lock_holds_16ms.fetch_add(1, Relaxed);
+        }
+    }
+
+    fn observe_frame_ipc(&self, elapsed: std::time::Duration) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let ms = Self::millis(elapsed);
+        self.video_frame_ipc_max_ms.fetch_max(ms, Relaxed);
+        if ms >= 33 {
+            self.video_frame_ipc_holds_33ms.fetch_add(1, Relaxed);
+        }
+    }
+
+    fn observe_ipc_cell(&self, elapsed: std::time::Duration, failed: bool) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let ms = Self::millis(elapsed);
+        self.ipc_cell_max_ms.fetch_max(ms, Relaxed);
+        if ms >= 16 {
+            self.ipc_cell_holds_16ms.fetch_add(1, Relaxed);
+        }
+        if failed {
+            self.ipc_send_failures.fetch_add(1, Relaxed);
+        }
+    }
+
+    fn snapshot(&self) -> VeilMediaChannelStats {
+        use std::sync::atomic::Ordering::Relaxed;
+        VeilMediaChannelStats {
+            video_frames_enqueued: self.video_frames_enqueued.load(Relaxed),
+            video_frames_started: self.video_frames_started.load(Relaxed),
+            video_queue_depth: self.video_queue_depth.load(Relaxed),
+            video_queue_max_depth: self.video_queue_max_depth.load(Relaxed),
+            video_queue_age_max_ms: self.video_queue_age_max_ms.load(Relaxed),
+            video_queue_holds_75ms: self.video_queue_holds_75ms.load(Relaxed),
+            sender_lock_max_ms: self.sender_lock_max_ms.load(Relaxed),
+            sender_lock_holds_16ms: self.sender_lock_holds_16ms.load(Relaxed),
+            video_frame_ipc_max_ms: self.video_frame_ipc_max_ms.load(Relaxed),
+            video_frame_ipc_holds_33ms: self.video_frame_ipc_holds_33ms.load(Relaxed),
+            ipc_cell_max_ms: self.ipc_cell_max_ms.load(Relaxed),
+            ipc_cell_holds_16ms: self.ipc_cell_holds_16ms.load(Relaxed),
+            ipc_send_failures: self.ipc_send_failures.load(Relaxed),
+        }
+    }
+}
+
+/// Open media channels keyed by the opaque id handed to the host.
+#[cfg(feature = "node-embedded")]
+static MEDIA_CHANNELS: std::sync::LazyLock<StdMutex<std::collections::HashMap<u64, MediaChannel>>> =
+    std::sync::LazyLock::new(|| StdMutex::new(std::collections::HashMap::new()));
+
+/// Monotonic channel-id source (never reuses 0, which the ABI reserves for
+/// "error / invalid").
+#[cfg(feature = "node-embedded")]
+static MEDIA_NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// Outbound queue depth per media channel. Keep this bounded: media is a real-
+/// time path, and a deep FIFO turns transient overload into stale audio/video.
+/// Split audio/RTCP/unknown from VP8 RTP so a video keyframe burst cannot put
+/// audio behind it. Queue-full is reported as loss to WebRTC; a later
+/// keyframe/Opus PLC recovers without replaying an old tail.
+///
+/// Sizing (real-P2P freeze fix): the VIDEO queue must absorb one keyframe's
+/// packet burst. The relay path assembles whole frames before queueing
+/// (`RELAY_VIDEO_FRAME_QUEUE` frames × up to 512 packets), but the
+/// direct/onion paths queue raw RTP packets — with the old 4-packet cap a
+/// single VP8 keyframe (~25-50 MTU packets at 900 kbps) overflowed the queue
+/// EVERY time it coincided with a stalled drain, dropping mid-frame packets.
+/// Each drop corrupted the frame downstream (receiver froze until the next
+/// keyframe, its jitter buffer inflating then flushing) and incremented
+/// `tx_drops`, which the bitrate adapter treats as a bad sample — so the
+/// ladder oscillated 900↔675 kbps, and every retune forced ANOTHER keyframe:
+/// a self-sustaining freeze cycle on an otherwise clean LAN path. 64 packets
+/// ≈ one large keyframe; the pacer upstream keeps standing depth near zero,
+/// so this does not re-introduce a stale-media FIFO under real congestion.
+#[cfg(feature = "node-embedded")]
+const MEDIA_TX_HI_QUEUE: usize = 32;
+#[cfg(feature = "node-embedded")]
+const MEDIA_TX_VIDEO_QUEUE: usize = 64;
+
+/// Max packets a direct-channel drain iteration sends under one sender lock.
+/// Eight is roughly one small VP8 frame (or part of a keyframe): the former
+/// 32-packet critical section emitted several frames as one IPC burst and was
+/// visible on a physical P2P call as a smooth encoder cadence followed by
+/// 75-335 ms arrival gaps. The queue still absorbs a complete keyframe, while
+/// yielding between groups lets the embedded session writer and audio lane run.
+/// There is no timer/prefill — a queued continuation is selected immediately.
+#[cfg(feature = "node-embedded")]
+const MEDIA_TX_BURST_MAX: usize = 8;
+
+/// Sixteen frames absorb a keyframe drain plus roughly 500 ms of 30 fps camera
+/// output. Four frames were only ~130 ms after the direct profile moved above
+/// 20 fps: the relay queue then dropped whole VP8 inter-frames while draining a
+/// keyframe, and the receiver froze until the next keyframe. Including the
+/// frame currently being drained and the in-progress assembler, pathological
+/// output remains bounded to ~3 MiB per channel. Ordinary 640x360 VP8 frames
+/// are much smaller; the cap keeps malformed/self-buggy output from turning the
+/// realtime path into an allocator sink. This is a capacity ceiling, not a
+/// prefill target: the drain receives every complete frame immediately.
+#[cfg(feature = "node-embedded")]
+const RELAY_VIDEO_FRAME_QUEUE: usize = 16;
+#[cfg(feature = "node-embedded")]
+const RELAY_VIDEO_FRAME_MAX_PACKETS: usize = 512;
+#[cfg(feature = "node-embedded")]
+const RELAY_VIDEO_FRAME_MAX_BYTES: usize = 512 * 1024;
+/// A complete relay video frame is already available here, so packet groups
+/// can be encoded immediately without the 20 ms gather used for audio. Four
+/// MTU-sized packets stay comfortably below the relay realtime-class ceiling
+/// and preserve the existing audio-interleave cadence.
+#[cfg(feature = "node-embedded")]
+const RELAY_VIDEO_BATCH_MAX_PACKETS: usize = 4;
+#[cfg(feature = "node-embedded")]
+const RELAY_VIDEO_BATCH_BODY_MAX: usize = 7168;
+#[cfg(feature = "node-embedded")]
+const MEDIA_BATCHING_OFF: u8 = 0;
+#[cfg(feature = "node-embedded")]
+const MEDIA_BATCHING_LEGACY: u8 = 1;
+#[cfg(feature = "node-embedded")]
+const MEDIA_BATCHING_COMPACT_RELAY: u8 = 2;
+/// Maximum plaintext media cell in compact relay mode. After the 36-byte
+/// symmetric seal and fixed Delivery/session framing this remains below the
+/// negotiated 1382-byte QUIC DATAGRAM ceiling, with margin for extensions.
+#[cfg(feature = "node-embedded")]
+const COMPACT_RELAY_MEDIA_CELL_MAX: usize = 1000;
+
+#[cfg(feature = "node-embedded")]
+#[derive(Default)]
+struct RelayVideoFrameAssembler {
+    timestamp: Option<u32>,
+    packets: Vec<Vec<u8>>,
+    bytes: usize,
+}
+
+#[cfg(feature = "node-embedded")]
+enum RelayVideoFramePush {
+    Pending,
+    Complete(Vec<Vec<u8>>),
+    Dropped,
+}
+
+#[cfg(feature = "node-embedded")]
+impl RelayVideoFrameAssembler {
+    fn push(&mut self, packet: Vec<u8>) -> RelayVideoFramePush {
+        if packet.len() < 8 || (packet[0] >> 6) != 2 {
+            self.reset();
+            return RelayVideoFramePush::Dropped;
+        }
+        let timestamp = u32::from_be_bytes([packet[4], packet[5], packet[6], packet[7]]);
+        if self.timestamp.is_some_and(|current| current != timestamp) {
+            // A new frame started before the previous marker arrived. Never
+            // forward the orphan prefix: it cannot be decoded and only adds
+            // latency ahead of the next complete frame.
+            self.reset();
+        }
+        self.timestamp = Some(timestamp);
+        let next_bytes = self.bytes.saturating_add(packet.len());
+        if self.packets.len() >= RELAY_VIDEO_FRAME_MAX_PACKETS
+            || next_bytes > RELAY_VIDEO_FRAME_MAX_BYTES
+        {
+            self.reset();
+            return RelayVideoFramePush::Dropped;
+        }
+        let marker = packet[1] & 0x80 != 0;
+        self.bytes = next_bytes;
+        self.packets.push(packet);
+        if !marker {
+            return RelayVideoFramePush::Pending;
+        }
+        self.timestamp = None;
+        self.bytes = 0;
+        RelayVideoFramePush::Complete(std::mem::take(&mut self.packets))
+    }
+
+    fn reset(&mut self) {
+        self.timestamp = None;
+        self.packets.clear();
+        self.bytes = 0;
+    }
+}
+
+#[cfg(feature = "node-embedded")]
+fn flush_media_batch_chunk(chunk: &mut Vec<Vec<u8>>, cells: &mut Vec<Vec<u8>>) {
+    let packets = std::mem::take(chunk);
+    if packets.len() < 2 {
+        cells.extend(packets);
+        return;
+    }
+    if let Some(body) = media::encode_batch(&packets, RELAY_VIDEO_BATCH_BODY_MAX) {
+        let mut cell = Vec::with_capacity(1 + body.len());
+        cell.push(media::MEDIA_BATCH_MAGIC);
+        cell.extend_from_slice(&body);
+        cells.push(cell);
+    } else {
+        // Defensive fallback: never lose a frame because a future encoder
+        // constraint changed. The packets are still sent in their RTP order.
+        cells.extend(packets);
+    }
+}
+
+/// Convert one complete VP8 frame into relay wire cells. This is a capacity
+/// optimization, not a gather buffer: the frame is emitted immediately. Old
+/// peers get the original one-RTP-packet-per-cell representation.
+#[cfg(feature = "node-embedded")]
+fn media_wire_cells(frame: Vec<Vec<u8>>, batching: bool) -> Vec<Vec<u8>> {
+    if !batching {
+        return frame;
+    }
+    let mut cells = Vec::with_capacity(frame.len().div_ceil(RELAY_VIDEO_BATCH_MAX_PACKETS));
+    let mut chunk = Vec::with_capacity(RELAY_VIDEO_BATCH_MAX_PACKETS);
+    let mut body_bytes = 2usize; // batch packet-count prefix
+    for packet in frame {
+        let encoded_bytes = 2usize.saturating_add(packet.len());
+        if encoded_bytes.saturating_add(2) > RELAY_VIDEO_BATCH_BODY_MAX {
+            flush_media_batch_chunk(&mut chunk, &mut cells);
+            cells.push(packet);
+            body_bytes = 2;
+            continue;
+        }
+        if !chunk.is_empty()
+            && (chunk.len() >= RELAY_VIDEO_BATCH_MAX_PACKETS
+                || body_bytes.saturating_add(encoded_bytes) > RELAY_VIDEO_BATCH_BODY_MAX)
+        {
+            flush_media_batch_chunk(&mut chunk, &mut cells);
+            body_bytes = 2;
+        }
+        body_bytes = body_bytes.saturating_add(encoded_bytes);
+        chunk.push(packet);
+    }
+    flush_media_batch_chunk(&mut chunk, &mut cells);
+    cells
+}
