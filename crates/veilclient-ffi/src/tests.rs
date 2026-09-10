@@ -16,6 +16,8 @@ use super::*;
 // The families that moved to files of their own; the tests came with
 // neither, because they reach across several of them.
 use crate::mailbox::*;
+#[cfg(feature = "node-embedded")]
+use crate::media_ffi::direct_media_source_app;
 use crate::sovereign_sign::*;
 use std::ffi::CStr;
 
