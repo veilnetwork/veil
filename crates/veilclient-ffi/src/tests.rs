@@ -18,6 +18,8 @@ use super::*;
 use crate::mailbox::*;
 #[cfg(feature = "node-embedded")]
 use crate::media_ffi::direct_media_source_app;
+#[cfg(feature = "node-embedded")]
+use crate::onion_services::*;
 use crate::sovereign_sign::*;
 use std::ffi::CStr;
 

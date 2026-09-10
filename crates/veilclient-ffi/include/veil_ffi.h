@@ -853,52 +853,6 @@ extern "C" {
  */
  const char *veil_abi_contract_hash(void) ;
 
-#if defined(VEIL_FFI_NODE_EMBEDDED)
-/**
- * Open an anonymous reliable byte-stream to a peer. `dst_app_id` is the peer's
- * onion-stream endpoint app id (`deriveAppId(peer_node, "xveil",
- * "onion-stream")` — the Dart caller derives it, mirroring `veil_stream_open`).
- * Returns NULL on error.
- */
-
-VeilAnonStreamFfi *veil_anon_stream_open(VeilHandle *handle,
-                                         const uint8_t *dst_node_id,
-                                         const uint8_t *dst_app_id,
-                                         char **err_out)
-;
-#endif
-
-#if defined(VEIL_FFI_NODE_EMBEDDED)
-/**
- * Accept the next inbound anonymous stream, or NULL on timeout (no error) /
- * error. On success writes the initiator's 32-byte node id + onion-stream app
- * id into the out params (caller-allocated, 32 B each).
- */
-
-VeilAnonStreamFfi *veil_anon_stream_accept(VeilHandle *handle,
-                                           uint64_t timeout_ms,
-                                           uint8_t *out_src_node_id,
-                                           uint8_t *out_src_app_id,
-                                           char **err_out)
-;
-#endif
-
-#if defined(VEIL_FFI_NODE_EMBEDDED)
-/**
- * Pre-warm the anonymous-stream outbound circuit pool toward a peer.
- * Fire-and-forget: kicks the background pool open (resolve ads + open +
- * confirm) and returns immediately, so a freshly-restarted node's first
- * serve/pull does not pay the cold-pool price inside the peer's manifest
- * window. Idempotent; cheap when the pool is already up. Returns 0 on
- * dispatch, -1 on error (NULL args / dead handle / hub bind failure).
- */
-
-int32_t veil_anon_stream_warm_peer(VeilHandle *handle,
-                                   const uint8_t *dst_node_id,
-                                   char **err_out)
-;
-#endif
-
 /**
  * Runtime toggle for the slow-inbound-dispatch trace
  * (`veil_session::rt_trace`) — the embedded-node twin of the
@@ -916,59 +870,6 @@ int32_t veil_anon_stream_warm_peer(VeilHandle *handle,
  * their validity horizon; see `veil_session::rt_trace::set_publish_pause`.
  */
  void veil_debug_set_publish_pause(int on) ;
-
-#if defined(VEIL_FFI_NODE_EMBEDDED)
-/**
- * Read up to `cap` bytes. Returns the count (0 = clean EOF), or a negative
- * error code (the stream was reset → the app should resume).
- */
-
-ssize_t veil_anon_stream_read(VeilAnonStreamFfi *stream,
-                              uint8_t *buf,
-                              size_t cap,
-                              char **err_out)
-;
-#endif
-
-#if defined(VEIL_FFI_NODE_EMBEDDED)
-/**
- * Queue `len` bytes for reliable delivery. Returns `VEIL_OK` / a negative code.
- */
-
-int veil_anon_stream_write(VeilAnonStreamFfi *stream,
-                           const uint8_t *data,
-                           size_t len,
-                           char **err_out)
-;
-#endif
-
-#if defined(VEIL_FFI_NODE_EMBEDDED)
-/**
- * Half-close the send direction (a FIN follows the last queued byte). The peer
- * reads EOF. Returns `VEIL_OK` / a negative code.
- */
- int veil_anon_stream_finish(VeilAnonStreamFfi *stream, char **err_out) ;
-#endif
-
-#if defined(VEIL_FFI_NODE_EMBEDDED)
-/**
- * Close + free the stream handle (idempotent, NULL-safe). This is the graceful
- * resource-release path: dropping the write half closes the command channel, so
- * the driver finishes the send direction rather than resetting normal EOF.
- */
- void veil_anon_stream_close(VeilAnonStreamFfi *stream) ;
-#endif
-
-#if defined(VEIL_FFI_NODE_EMBEDDED)
-/**
- * Abort + free the stream handle (idempotent, NULL-safe). Use for timeout /
- * retry cancellation. A Dart timeout may call this while another FFI worker is
- * blocked inside `read()`, and removing the generational handle alone does not
- * wake that already-cloned Arc. First signal the local read half, then send a
- * best-effort RST through the driver so the peer/route settle too.
- */
- void veil_anon_stream_abort(VeilAnonStreamFfi *stream) ;
-#endif
 
 /**
  * Free a C string returned by this library (error messages, etc.).
@@ -1437,140 +1338,6 @@ int veil_lookup_relay_x25519_with_expiry(VeilHandle *handle,
                                          uint8_t *out_pubkey_32,
                                          uint64_t *out_valid_until_unix,
                                          char **err_out)
-;
-
-/**
- * Register this node as a LOCATION-anonymous (onion) service: the daemon picks
- * relays, builds an onion circuit to a rendezvous relay (which never learns
- * this node's location), and publishes the ad so clients can reach this node by
- * its identity. `hop_count` is clamped to ≥ 2 by the daemon (2 = node→mid→relay).
- *
- * `VEIL_OK` once the daemon accepts; `VEIL_ERR` with a detail otherwise (e.g.
- * no relays available yet — retry after a short back-off). Connection-level:
- * hosts the whole node as a service; any bound endpoint can then receive.
- *
- * # Safety
- * `handle` must be a live `VeilHandle*` from `veil_connect`.
- */
- int veil_register_onion_service(VeilHandle *handle, uint32_t hop_count, char **err_out) ;
-
-#if defined(VEIL_FFI_NODE_EMBEDDED)
-/**
- * Register a location-anonymous service under a caller-owned random Ed25519
- * seed rather than the node's sovereign key. The seed buffer is writable and
- * is ZEROED immediately on every post-validation path. On success writes the
- * corresponding 32-byte public service identity to `out_identity_vk`; this is
- * the only address that belongs in a public capability link. The blinded DHT
- * descriptor and rendezvous advert contain no sovereign public key/node id.
- *
- * Embedded-node only: the service circuit lives in this process's node
- * runtime. Re-register the same seed after restart; registration is idempotent
- * within a descriptor period. At most the runtime's bounded hosted-service cap
- * may be active.
- *
- * # Safety
- * `identity_seed_32` must point to 32 WRITABLE bytes; they are zeroized.
- * `out_identity_vk_32` must point to 32 writable bytes.
- */
-
-int veil_register_ephemeral_onion_service_zeroize(VeilHandle *handle,
-                                                  uint8_t *identity_seed_32,
-                                                  uint32_t hop_count,
-                                                  uint8_t *out_identity_vk_32,
-                                                  char **err_out)
-;
-#endif
-
-#if defined(VEIL_FFI_NODE_EMBEDDED)
-/**
- * Provider-slotted form of
- * [`veil_register_ephemeral_onion_service_zeroize`]. Linked devices hosting
- * the same capability seed must use distinct slots in `0..8`; the runtime
- * publishes a collision-free descriptor for that slot while retaining the
- * legacy descriptor for old resolvers.
- */
-
-int veil_register_ephemeral_onion_service_zeroize_v2(VeilHandle *handle,
-                                                     uint8_t *identity_seed_32,
-                                                     uint32_t hop_count,
-                                                     uint8_t provider_slot,
-                                                     uint8_t *out_identity_vk_32,
-                                                     char **err_out)
-;
-#endif
-
-#if defined(VEIL_FFI_NODE_EMBEDDED)
-/**
- * Stop maintaining one caller-owned ephemeral onion service. Idempotent:
- * unknown/already-withdrawn public keys return `VEIL_OK` too, so this local
- * lifecycle API never becomes a remote existence oracle. DHT ciphertext and
- * the circuit age out naturally; the host must reject capability requests as
- * soon as its encrypted registry marks the share revoked.
- */
-
-int veil_withdraw_ephemeral_onion_service(VeilHandle *handle,
-                                          const uint8_t *identity_vk_32,
-                                          char **err_out)
-;
-#endif
-
-/**
- * Register a PLAIN rendezvous-publisher entry (mailbox-by-discovery): the
- * daemon's maintenance tick signs + publishes a v5 `RendezvousAd` under THIS
- * node's real id at `rendezvous_node_id`'s rendezvous slot, advertising the
- * relay's KEM key so a sender resolving the ad (`veil_lookup_rendezvous_replicas`)
- * can anonymously deposit a mailbox PUT at the relay. Replaces any existing
- * entry with the same `(rendezvous_node_id, auth_cookie)`.
- *
- * `relay_kem_algo` is the KEM tag (`0` = X25519); `relay_kem_pk` / `kem_len`
- * the relay's KEM pubkey (32-byte X25519 for algo 0; obtain a self-relay key
- * via `veil_get_relay_x25519_pubkey`). Pass `kem_len = 0` to advertise no key.
- *
- * `VEIL_OK` once the daemon records the entry; `VEIL_ERR` otherwise.
- *
- * # Safety
- * `handle` must be a live `VeilHandle*`. `rendezvous_node_id` must be readable
- * for 32 bytes, `auth_cookie` for 16. `relay_kem_pk` must be readable for
- * `kem_len` bytes (or NULL iff `kem_len == 0`).
- */
-
-int veil_register_rendezvous_publisher(VeilHandle *handle,
-                                       const uint8_t *rendezvous_node_id,
-                                       const uint8_t *auth_cookie,
-                                       uint64_t validity_window_secs,
-                                       uint8_t relay_kem_algo,
-                                       const uint8_t *relay_kem_pk,
-                                       size_t kem_len,
-                                       char **err_out)
-;
-
-/**
- * [`veil_register_rendezvous_publisher`], plus the relay key's expiry.
- *
- * The daemon clips the published ad's `valid_until` to
- * `relay_kem_valid_until_unix`, so an ad cannot go on advertising a relay key
- * past the point that key stopped being the relay's — thirty days of deposits
- * to a key nobody holds, or to whoever holds the old private half (report17
- * V17-M1). Take the value from
- * [`veil_lookup_relay_x25519_with_expiry`]; `0` means "not known" and leaves
- * the ad on its own window.
- *
- * A separate export rather than a wider one, for the same reason as its
- * lookup twin: the shorter form is already compiled into shipped callers.
- *
- * # Safety
- * As [`veil_register_rendezvous_publisher`].
- */
-
-int veil_register_rendezvous_publisher_with_expiry(VeilHandle *handle,
-                                                   const uint8_t *rendezvous_node_id,
-                                                   const uint8_t *auth_cookie,
-                                                   uint64_t validity_window_secs,
-                                                   uint8_t relay_kem_algo,
-                                                   const uint8_t *relay_kem_pk,
-                                                   size_t kem_len,
-                                                   uint64_t relay_kem_valid_until_unix,
-                                                   char **err_out)
 ;
 
 /**
@@ -3175,6 +2942,105 @@ int veil_space_discovery_resolve(const uint8_t *self_node_id,
 
 #if defined(VEIL_FFI_NODE_EMBEDDED)
 /**
+ * Open an anonymous reliable byte-stream to a peer. `dst_app_id` is the peer's
+ * onion-stream endpoint app id (`deriveAppId(peer_node, "xveil",
+ * "onion-stream")` — the Dart caller derives it, mirroring `veil_stream_open`).
+ * Returns NULL on error.
+ */
+
+VeilAnonStreamFfi *veil_anon_stream_open(VeilHandle *handle,
+                                         const uint8_t *dst_node_id,
+                                         const uint8_t *dst_app_id,
+                                         char **err_out)
+;
+#endif
+
+#if defined(VEIL_FFI_NODE_EMBEDDED)
+/**
+ * Accept the next inbound anonymous stream, or NULL on timeout (no error) /
+ * error. On success writes the initiator's 32-byte node id + onion-stream app
+ * id into the out params (caller-allocated, 32 B each).
+ */
+
+VeilAnonStreamFfi *veil_anon_stream_accept(VeilHandle *handle,
+                                           uint64_t timeout_ms,
+                                           uint8_t *out_src_node_id,
+                                           uint8_t *out_src_app_id,
+                                           char **err_out)
+;
+#endif
+
+#if defined(VEIL_FFI_NODE_EMBEDDED)
+/**
+ * Pre-warm the anonymous-stream outbound circuit pool toward a peer.
+ * Fire-and-forget: kicks the background pool open (resolve ads + open +
+ * confirm) and returns immediately, so a freshly-restarted node's first
+ * serve/pull does not pay the cold-pool price inside the peer's manifest
+ * window. Idempotent; cheap when the pool is already up. Returns 0 on
+ * dispatch, -1 on error (NULL args / dead handle / hub bind failure).
+ */
+
+int32_t veil_anon_stream_warm_peer(VeilHandle *handle,
+                                   const uint8_t *dst_node_id,
+                                   char **err_out)
+;
+#endif
+
+#if defined(VEIL_FFI_NODE_EMBEDDED)
+/**
+ * Read up to `cap` bytes. Returns the count (0 = clean EOF), or a negative
+ * error code (the stream was reset → the app should resume).
+ */
+
+ssize_t veil_anon_stream_read(VeilAnonStreamFfi *stream,
+                              uint8_t *buf,
+                              size_t cap,
+                              char **err_out)
+;
+#endif
+
+#if defined(VEIL_FFI_NODE_EMBEDDED)
+/**
+ * Queue `len` bytes for reliable delivery. Returns `VEIL_OK` / a negative code.
+ */
+
+int veil_anon_stream_write(VeilAnonStreamFfi *stream,
+                           const uint8_t *data,
+                           size_t len,
+                           char **err_out)
+;
+#endif
+
+#if defined(VEIL_FFI_NODE_EMBEDDED)
+/**
+ * Half-close the send direction (a FIN follows the last queued byte). The peer
+ * reads EOF. Returns `VEIL_OK` / a negative code.
+ */
+ int veil_anon_stream_finish(VeilAnonStreamFfi *stream, char **err_out) ;
+#endif
+
+#if defined(VEIL_FFI_NODE_EMBEDDED)
+/**
+ * Close + free the stream handle (idempotent, NULL-safe). This is the graceful
+ * resource-release path: dropping the write half closes the command channel, so
+ * the driver finishes the send direction rather than resetting normal EOF.
+ */
+ void veil_anon_stream_close(VeilAnonStreamFfi *stream) ;
+#endif
+
+#if defined(VEIL_FFI_NODE_EMBEDDED)
+/**
+ * Abort + free the stream handle (idempotent, NULL-safe). Use for timeout /
+ * retry cancellation. A Dart timeout may call this while another FFI worker is
+ * blocked inside `read()`, and removing the generational handle alone does not
+ * wake that already-cloned Arc. First signal the local read half, then send a
+ * best-effort RST through the driver so the peer/route settle too.
+ */
+ void veil_anon_stream_abort(VeilAnonStreamFfi *stream) ;
+#endif
+
+#if defined(VEIL_FFI_NODE_EMBEDDED)
+/**
  * Open a lossy MEDIA datagram channel to `peer` over the anonymous circuit
  * (reuses the reliable stream's rendezvous/pool and warms the circuit in the
  * background). Per-packet RTP/RTCP then flows native↔native via
@@ -3356,6 +3222,140 @@ int veil_media_start_direct_receiver(VeilApp *app,
  */
  uint64_t veil_media_recv_count(const uint8_t *peer_node_id) ;
 #endif
+
+/**
+ * Register this node as a LOCATION-anonymous (onion) service: the daemon picks
+ * relays, builds an onion circuit to a rendezvous relay (which never learns
+ * this node's location), and publishes the ad so clients can reach this node by
+ * its identity. `hop_count` is clamped to ≥ 2 by the daemon (2 = node→mid→relay).
+ *
+ * `VEIL_OK` once the daemon accepts; `VEIL_ERR` with a detail otherwise (e.g.
+ * no relays available yet — retry after a short back-off). Connection-level:
+ * hosts the whole node as a service; any bound endpoint can then receive.
+ *
+ * # Safety
+ * `handle` must be a live `VeilHandle*` from `veil_connect`.
+ */
+ int veil_register_onion_service(VeilHandle *handle, uint32_t hop_count, char **err_out) ;
+
+#if defined(VEIL_FFI_NODE_EMBEDDED)
+/**
+ * Register a location-anonymous service under a caller-owned random Ed25519
+ * seed rather than the node's sovereign key. The seed buffer is writable and
+ * is ZEROED immediately on every post-validation path. On success writes the
+ * corresponding 32-byte public service identity to `out_identity_vk`; this is
+ * the only address that belongs in a public capability link. The blinded DHT
+ * descriptor and rendezvous advert contain no sovereign public key/node id.
+ *
+ * Embedded-node only: the service circuit lives in this process's node
+ * runtime. Re-register the same seed after restart; registration is idempotent
+ * within a descriptor period. At most the runtime's bounded hosted-service cap
+ * may be active.
+ *
+ * # Safety
+ * `identity_seed_32` must point to 32 WRITABLE bytes; they are zeroized.
+ * `out_identity_vk_32` must point to 32 writable bytes.
+ */
+
+int veil_register_ephemeral_onion_service_zeroize(VeilHandle *handle,
+                                                  uint8_t *identity_seed_32,
+                                                  uint32_t hop_count,
+                                                  uint8_t *out_identity_vk_32,
+                                                  char **err_out)
+;
+#endif
+
+#if defined(VEIL_FFI_NODE_EMBEDDED)
+/**
+ * Provider-slotted form of
+ * [`veil_register_ephemeral_onion_service_zeroize`]. Linked devices hosting
+ * the same capability seed must use distinct slots in `0..8`; the runtime
+ * publishes a collision-free descriptor for that slot while retaining the
+ * legacy descriptor for old resolvers.
+ */
+
+int veil_register_ephemeral_onion_service_zeroize_v2(VeilHandle *handle,
+                                                     uint8_t *identity_seed_32,
+                                                     uint32_t hop_count,
+                                                     uint8_t provider_slot,
+                                                     uint8_t *out_identity_vk_32,
+                                                     char **err_out)
+;
+#endif
+
+#if defined(VEIL_FFI_NODE_EMBEDDED)
+/**
+ * Stop maintaining one caller-owned ephemeral onion service. Idempotent:
+ * unknown/already-withdrawn public keys return `VEIL_OK` too, so this local
+ * lifecycle API never becomes a remote existence oracle. DHT ciphertext and
+ * the circuit age out naturally; the host must reject capability requests as
+ * soon as its encrypted registry marks the share revoked.
+ */
+
+int veil_withdraw_ephemeral_onion_service(VeilHandle *handle,
+                                          const uint8_t *identity_vk_32,
+                                          char **err_out)
+;
+#endif
+
+/**
+ * Register a PLAIN rendezvous-publisher entry (mailbox-by-discovery): the
+ * daemon's maintenance tick signs + publishes a v5 `RendezvousAd` under THIS
+ * node's real id at `rendezvous_node_id`'s rendezvous slot, advertising the
+ * relay's KEM key so a sender resolving the ad (`veil_lookup_rendezvous_replicas`)
+ * can anonymously deposit a mailbox PUT at the relay. Replaces any existing
+ * entry with the same `(rendezvous_node_id, auth_cookie)`.
+ *
+ * `relay_kem_algo` is the KEM tag (`0` = X25519); `relay_kem_pk` / `kem_len`
+ * the relay's KEM pubkey (32-byte X25519 for algo 0; obtain a self-relay key
+ * via `veil_get_relay_x25519_pubkey`). Pass `kem_len = 0` to advertise no key.
+ *
+ * `VEIL_OK` once the daemon records the entry; `VEIL_ERR` otherwise.
+ *
+ * # Safety
+ * `handle` must be a live `VeilHandle*`. `rendezvous_node_id` must be readable
+ * for 32 bytes, `auth_cookie` for 16. `relay_kem_pk` must be readable for
+ * `kem_len` bytes (or NULL iff `kem_len == 0`).
+ */
+
+int veil_register_rendezvous_publisher(VeilHandle *handle,
+                                       const uint8_t *rendezvous_node_id,
+                                       const uint8_t *auth_cookie,
+                                       uint64_t validity_window_secs,
+                                       uint8_t relay_kem_algo,
+                                       const uint8_t *relay_kem_pk,
+                                       size_t kem_len,
+                                       char **err_out)
+;
+
+/**
+ * [`veil_register_rendezvous_publisher`], plus the relay key's expiry.
+ *
+ * The daemon clips the published ad's `valid_until` to
+ * `relay_kem_valid_until_unix`, so an ad cannot go on advertising a relay key
+ * past the point that key stopped being the relay's — thirty days of deposits
+ * to a key nobody holds, or to whoever holds the old private half (report17
+ * V17-M1). Take the value from
+ * [`veil_lookup_relay_x25519_with_expiry`]; `0` means "not known" and leaves
+ * the ad on its own window.
+ *
+ * A separate export rather than a wider one, for the same reason as its
+ * lookup twin: the shorter form is already compiled into shipped callers.
+ *
+ * # Safety
+ * As [`veil_register_rendezvous_publisher`].
+ */
+
+int veil_register_rendezvous_publisher_with_expiry(VeilHandle *handle,
+                                                   const uint8_t *rendezvous_node_id,
+                                                   const uint8_t *auth_cookie,
+                                                   uint64_t validity_window_secs,
+                                                   uint8_t relay_kem_algo,
+                                                   const uint8_t *relay_kem_pk,
+                                                   size_t kem_len,
+                                                   uint64_t relay_kem_valid_until_unix,
+                                                   char **err_out)
+;
 
 /**
  * Deposit `blob` for an offline `receiver_id` at the daemon's mailbox
