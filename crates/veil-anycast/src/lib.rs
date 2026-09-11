@@ -159,6 +159,69 @@ pub fn verify_record_owner_binding(record: &AnycastRecord) -> Result<(), ProtoEr
     Ok(())
 }
 
+/// Delegated owner-binding: the record was signed by a DEVICE SUBKEY of the
+/// identity that owns `node_id`, not by its master.
+///
+/// Every device of one identity answers on the SAME address — that is what an
+/// identity address is — but only one of them could ever hold the master key.
+/// Requiring the master to sign each advertisement therefore disabled anycast
+/// for every multi-device identity, which is precisely the case anycast exists
+/// for: several nodes behind one address.
+///
+/// The binding is not weakened, it is proved one step further out. The record
+/// carries the SUBKEY as `owner_pubkey`, so its signature verifies on its own
+/// bytes; what ties that subkey to the address is the identity document, whose
+/// verifier has already established `node_id == BLAKE3(master_pubkey)` and that
+/// every key it names is master-certified. The caller passes the two facts it
+/// read off that validated document.
+///
+/// `document_node_id` and `subkey_pubkey` MUST come from a document that
+/// `verify_identity_document` accepted. Handing in an unverified document
+/// forges exactly the binding this closes.
+pub fn verify_record_owner_binding_delegated(
+    record: &AnycastRecord,
+    document_node_id: &[u8; 32],
+    subkey_pubkey: &[u8],
+) -> Result<(), ProtoError> {
+    verify_record_signature(record)?;
+    let sig = record.signature.as_ref().ok_or_else(|| {
+        ProtoError::Malformed("anycast record: owner-binding requires a signature".to_string())
+    })?;
+    // The document has to be the one for THIS record's address, or a valid
+    // document of some other identity would authorise any node_id.
+    if document_node_id != &record.node_id {
+        return Err(ProtoError::Malformed(
+            "anycast record: the identity document is for a different node_id".to_string(),
+        ));
+    }
+    // And the key that signed has to be the one the document names at the
+    // index the record claims — not merely SOME key of that identity.
+    if sig.owner_pubkey.as_slice() != subkey_pubkey {
+        return Err(ProtoError::Malformed(
+            "anycast record: signing key is not the document's key at this sig_key_idx".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+/// Resolves the one fact a DELEGATED record needs: which device key the
+/// identity that owns `node_id` names at `sig_key_idx`.
+///
+/// A hook rather than a dependency. Establishing it means fetching an identity
+/// document and running the verifier ladder over it, which belongs to the
+/// layer that owns identities; this crate stays on `veil-proto` and is handed
+/// the answer. It is synchronous because the resolve filter is, so an
+/// implementation answers from what it already holds — a cache, the local DHT
+/// shard — and returns `None` rather than blocking.
+///
+/// `None` means "cannot establish", and the record is dropped under a binding
+/// policy. That is also the default: a node that installs no lookup behaves
+/// exactly as before this existed.
+///
+/// An implementation MUST have verified the document it answers from. Handing
+/// back a key off an unverified document forges the binding this proves.
+pub type AnycastDelegationLookup = Arc<dyn Fn(&[u8; 32], u8) -> Option<Vec<u8>> + Send + Sync>;
+
 /// Detached signer: maps an anycast record's canonical bytes to a raw signature
 /// of the owner's algorithm. The secret key stays captured inside the closure.
 pub type AnycastSignFn = Arc<dyn Fn(&[u8]) -> Vec<u8> + Send + Sync>;
@@ -305,6 +368,10 @@ pub struct AnycastService {
     /// `Some`, it takes precedence over `signing_key` so a PQ-only sovereign
     /// identity can own-sign its advertisements. Set via [`Self::with_signer`].
     generic_signer: Option<AnycastSigner>,
+    /// Resolves a delegated record's signing key from the owner's identity
+    /// document. `None` drops every delegated record under a binding policy —
+    /// which is what this node did before delegation existed.
+    delegation_lookup: Option<AnycastDelegationLookup>,
 }
 
 impl AnycastService {
@@ -316,6 +383,7 @@ impl AnycastService {
             policy: AnycastResolvePolicy::default(),
             signing_key: None,
             generic_signer: None,
+            delegation_lookup: None,
         }
     }
 
@@ -335,6 +403,7 @@ impl AnycastService {
             policy: AnycastResolvePolicy::default(),
             signing_key: None,
             generic_signer: None,
+            delegation_lookup: None,
         }
     }
 
@@ -382,6 +451,15 @@ impl AnycastService {
     #[must_use]
     pub fn with_signer(mut self, signer: AnycastSigner) -> Self {
         self.generic_signer = Some(signer);
+        self
+    }
+
+    /// Install the lookup that admits DELEGATED records — those signed by a
+    /// device key of the identity that owns the address, rather than by its
+    /// master. Without it such records are dropped under a binding policy, and
+    /// every multi-device identity is invisible to this resolver.
+    pub fn with_delegation_lookup(mut self, lookup: AnycastDelegationLookup) -> Self {
+        self.delegation_lookup = Some(lookup);
         self
     }
 
@@ -648,12 +726,35 @@ impl AnycastService {
                             return false;
                         }
                         if require_binding {
-                            // Strictest gate: drop unless signature is valid
-                            // AND owner-binding holds. The algo-generic path
-                            // admits v3 (Falcon-512 / hybrid) records too, not
-                            // just Ed25519 v2. `verify_record_owner_binding`
-                            // calls `verify_record_signature` internally.
-                            return verify_record_owner_binding(r).is_ok();
+                            // Strictest gate: drop unless the signature is
+                            // valid AND the owner-binding holds. The
+                            // algo-generic path admits v3 (Falcon-512 /
+                            // hybrid) records too, not just Ed25519 v2. Both
+                            // binding checks call `verify_record_signature`
+                            // internally.
+                            //
+                            // Which binding applies is the record's own claim:
+                            // index 0 says the signer IS the master, so its
+                            // hash must be the address; any other index says a
+                            // device of that identity signed, and the identity
+                            // document is what ties it to the address. Only
+                            // one device of an identity can hold the master,
+                            // so refusing the second case refuses every
+                            // multi-device identity — the case anycast is for.
+                            let idx = r.signature.as_ref().map(|s| s.sig_key_idx);
+                            return match idx {
+                                Some(0) | None => verify_record_owner_binding(r).is_ok(),
+                                Some(idx) => self
+                                    .delegation_lookup
+                                    .as_ref()
+                                    .and_then(|lookup| lookup(&r.node_id, idx))
+                                    .is_some_and(|subkey| {
+                                        verify_record_owner_binding_delegated(
+                                            r, &r.node_id, &subkey,
+                                        )
+                                        .is_ok()
+                                    }),
+                            };
                         }
                         if !require_signed {
                             return true;
@@ -727,6 +828,95 @@ mod tests {
     use ed25519_dalek::SigningKey;
     use veil_dht::KademliaService;
     use veil_proto::anycast::{ANYCAST_MAGIC_V3, ANYCAST_RECORD_SIZE, ANYCAST_RECORD_V2_SIZE};
+
+    /// A DEVICE subkey can advertise for its identity's address.
+    ///
+    /// This is the multi-device case anycast exists for and could not serve:
+    /// several nodes behind one address, only one of which could ever hold the
+    /// master key. The record is signed by the subkey and bound to the address
+    /// by the document, not by the master signing every advertisement.
+    #[test]
+    fn a_device_subkey_may_advertise_for_its_identity() {
+        // The identity is named by its MASTER key; the device holds a subkey.
+        let master = SigningKey::from_bytes(&[3u8; 32]);
+        let master_pk = master.verifying_key().to_bytes().to_vec();
+        let node_id: [u8; 32] = blake3::hash(&master_pk).into();
+        let device = SigningKey::from_bytes(&[4u8; 32]);
+        let device_pk = device.verifying_key().to_bytes().to_vec();
+        assert_ne!(device_pk, master_pk, "the fixture must have two keys");
+
+        let signer = AnycastSigner::new(SignatureAlgorithm::Ed25519, device_pk.clone(), 2, {
+            let sk = device.clone();
+            Arc::new(move |msg: &[u8]| {
+                use ed25519_dalek::Signer as _;
+                sk.sign(msg).to_bytes().to_vec()
+            })
+        });
+        let rec = signer
+            .sign_record(*b"mbox", node_id, 5, 3600)
+            .expect("sign");
+
+        // The old rule refuses it: the signing key is not the master, so its
+        // hash is not the address.
+        assert!(
+            verify_record_owner_binding(&rec).is_err(),
+            "a subkey must not satisfy the self-signed master binding"
+        );
+        // The delegated rule admits it, given what a validated document says.
+        assert!(
+            verify_record_owner_binding_delegated(&rec, &node_id, &device_pk).is_ok(),
+            "the document names this key for this address — it may advertise"
+        );
+    }
+
+    /// A document for a DIFFERENT identity authorises nothing.
+    #[test]
+    fn a_document_for_another_identity_cannot_authorise_this_address() {
+        let device = SigningKey::from_bytes(&[5u8; 32]);
+        let device_pk = device.verifying_key().to_bytes().to_vec();
+        let node_id: [u8; 32] = [7u8; 32];
+        let signer = AnycastSigner::new(SignatureAlgorithm::Ed25519, device_pk.clone(), 1, {
+            let sk = device.clone();
+            Arc::new(move |msg: &[u8]| {
+                use ed25519_dalek::Signer as _;
+                sk.sign(msg).to_bytes().to_vec()
+            })
+        });
+        let rec = signer
+            .sign_record(*b"mbox", node_id, 5, 3600)
+            .expect("sign");
+        let other_identity: [u8; 32] = [8u8; 32];
+        assert!(
+            verify_record_owner_binding_delegated(&rec, &other_identity, &device_pk).is_err(),
+            "a valid document of another identity would otherwise authorise any address"
+        );
+    }
+
+    /// Some other key of the same identity is not the key that signed.
+    #[test]
+    fn another_key_of_the_same_identity_does_not_stand_in() {
+        let device = SigningKey::from_bytes(&[9u8; 32]);
+        let device_pk = device.verifying_key().to_bytes().to_vec();
+        let node_id: [u8; 32] = [10u8; 32];
+        let signer = AnycastSigner::new(SignatureAlgorithm::Ed25519, device_pk, 1, {
+            let sk = device.clone();
+            Arc::new(move |msg: &[u8]| {
+                use ed25519_dalek::Signer as _;
+                sk.sign(msg).to_bytes().to_vec()
+            })
+        });
+        let rec = signer
+            .sign_record(*b"mbox", node_id, 5, 3600)
+            .expect("sign");
+        let sibling = SigningKey::from_bytes(&[11u8; 32])
+            .verifying_key()
+            .to_bytes()
+            .to_vec();
+        assert!(
+            verify_record_owner_binding_delegated(&rec, &node_id, &sibling).is_err(),
+            "the check must be against the key at the claimed index, not any key"
+        );
+    }
 
     /// Falcon-512 (v3) owner-signing round-trips through the wire and verifies —
     /// the core of the A1 fix: a PQ-only identity can own-sign anycast records,
@@ -1368,9 +1558,13 @@ mod tests {
 
     #[test]
     fn resolve_signed_bound_drops_subkey_records() {
-        // Even with a valid BLAKE3 binding, sig_key_idx > 0 must be
-        // dropped under SignedBound (async identity-doc lookup
-        // required, not in-scope for the sync resolve path).
+        // A delegated record with NO lookup installed is dropped: this node
+        // cannot establish that the signing key belongs to the address, and a
+        // binding policy admits nothing it cannot establish. That is also the
+        // default, so a resolver that never installs one behaves exactly as it
+        // did before delegation existed.
+        // See `resolve_signed_bound_admits_a_delegated_record_when_it_can_check`
+        // for the other half.
         let key = make_signing_key(0x66);
         let derived_id = bound_node_id_for(&key);
 
@@ -1388,6 +1582,70 @@ mod tests {
         assert!(
             svc.resolve_signed_bound(*b"sub1", 32).node_ids.is_empty(),
             "SignedBound must drop sig_key_idx > 0 records"
+        );
+    }
+
+    /// With a lookup installed, a DEVICE of an identity is admitted.
+    ///
+    /// This is the half that makes several nodes answer on one address. The
+    /// record is signed by a device key; what admits it is the identity
+    /// document saying that key is the one at the claimed index.
+    #[test]
+    fn resolve_signed_bound_admits_a_delegated_record_when_it_can_check() {
+        let device = make_signing_key(0x71);
+        let device_pk = device.verifying_key().to_bytes().to_vec();
+        // The ADDRESS is the identity's, not the device's — that is the point.
+        let identity_id = [0x77u8; 32];
+        assert_ne!(
+            bound_node_id_for(&device),
+            identity_id,
+            "the device key must not hash to the address, or this proves nothing"
+        );
+
+        let dht = Arc::new(KademliaService::new([0xA1; 32]));
+        let dht_key = AnycastRecord::dht_key(*b"vip1");
+        let mut list = AnycastList::default();
+        list.upsert(AnycastRecord::sign(
+            *b"vip1",
+            identity_id,
+            5,
+            3600,
+            3,
+            &device,
+        ));
+        dht.store_local(dht_key, list.encode());
+
+        // No lookup: dropped.
+        let bare = AnycastService::new(Arc::clone(&dht), [0xA1; 32]);
+        assert!(
+            bare.resolve_signed_bound(*b"vip1", 32).node_ids.is_empty(),
+            "without a way to check, a binding policy must admit nothing"
+        );
+
+        // With a lookup that answers from a verified document: admitted.
+        let pk = device_pk.clone();
+        let svc = AnycastService::new(Arc::clone(&dht), [0xA1; 32]).with_delegation_lookup(
+            Arc::new(move |node_id: &[u8; 32], idx: u8| {
+                (*node_id == identity_id && idx == 3).then(|| pk.clone())
+            }),
+        );
+        assert_eq!(
+            svc.resolve_signed_bound(*b"vip1", 32).node_ids,
+            vec![identity_id],
+            "a device of the identity may answer on the identity's address"
+        );
+
+        // A lookup that names a DIFFERENT key does not admit it: the record
+        // must be signed by the key the document names, not by any key.
+        let other = make_signing_key(0x72).verifying_key().to_bytes().to_vec();
+        let svc_wrong = AnycastService::new(Arc::clone(&dht), [0xA1; 32])
+            .with_delegation_lookup(Arc::new(move |_, _| Some(other.clone())));
+        assert!(
+            svc_wrong
+                .resolve_signed_bound(*b"vip1", 32)
+                .node_ids
+                .is_empty(),
+            "a mismatched document key must not admit the record"
         );
     }
 
