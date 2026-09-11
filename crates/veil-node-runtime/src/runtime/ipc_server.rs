@@ -196,16 +196,18 @@ impl NodeRuntime {
         )
         .with_policy(anycast_policy);
         if let Some(sov) = self.identity.sovereign_identity.get() {
-            // A1 (audit) fix: algo-generic owner-signer — signs v2 (Ed25519) OR
-            // v3 (Falcon-512 / hybrid) records, so a PQ-only sovereign signs too
-            // instead of falling back to unsigned advertise. `sig_key_idx = 0`
-            // (master) follows the IdentityDocument convention and is required
-            // for the BLAKE3(owner_pubkey)==node_id owner-binding.
-            if let Some((algo_byte, owner_pubkey, sign)) = sov.anycast_owner_signer() {
+            // Algo-generic owner-signer: signs v2 (Ed25519) OR v3 (Falcon-512 /
+            // hybrid) records, so a PQ-only sovereign signs too instead of
+            // falling back to unsigned advertise. The index comes WITH the key:
+            // 0 on a device whose own key is the master (self-signed binding),
+            // its own index on every other device (the document proves the
+            // binding). Several nodes answering on one identity address is what
+            // anycast is for, and pinning this to 0 disabled exactly that.
+            if let Some((algo_byte, owner_pubkey, sig_key_idx, sign)) = sov.anycast_owner_signer() {
                 match veil_types::SignatureAlgorithm::from_wire_byte(algo_byte) {
                     Some(algo) => {
                         anycast_svc_builder = anycast_svc_builder.with_signer(
-                            veil_anycast::AnycastSigner::new(algo, owner_pubkey, 0, sign),
+                            veil_anycast::AnycastSigner::new(algo, owner_pubkey, sig_key_idx, sign),
                         );
                     }
                     None => {
@@ -220,22 +222,58 @@ impl NodeRuntime {
                     }
                 }
             } else {
-                // `anycast_owner_signer` returns `None` only for a non-standalone
-                // (multi-device subkey) identity: its key is NOT the master, so a
-                // signed record's owner_pubkey could not satisfy the binding and
-                // verifiers would reject it. Such records would go out effectively
-                // unverifiable, so we publish UNSIGNED instead — peers on the
-                // default `SignedBound` resolve policy drop those, so anycast
-                // advertise is disabled for subkey identities. Surface it.
+                // A device of an identity signs with its own key at its own
+                // index, so this is no longer the multi-device case — that one
+                // advertises. What is left is an identity whose active key sits
+                // past index 255, which the record's `sig_key_idx` field cannot
+                // name. Nothing can be signed for it; say so rather than let
+                // unsigned records go out and be dropped in silence.
                 self.logger.warn(
-                    "anycast.signing.subkey_cannot_bind",
-                    "sovereign identity is a multi-device subkey (not standalone \
-                     master): it cannot satisfy the anycast owner-binding, so \
-                     records are published UNSIGNED and dropped by peers running \
-                     the default SignedBound resolve policy — anycast advertise is \
-                     effectively disabled for this identity",
+                    "anycast.signing.index_out_of_range",
+                    "sovereign identity's active device key is past index 255, \
+                     which an anycast record cannot name: records are published \
+                     UNSIGNED and dropped by peers running the default \
+                     SignedBound resolve policy",
                 );
             }
+        }
+        // Admit records signed by a DEVICE of an identity, not only by its
+        // master. Every device of one identity answers on the same address, so
+        // without this the strict resolve policy drops every multi-device
+        // identity — which is the arrangement anycast exists to serve.
+        //
+        // The local shard only, on purpose: the filter it feeds is
+        // synchronous, and a resolve must not block on a DHT walk. A node that
+        // does not hold the document answers `None` and drops the record, the
+        // same conservative outcome as before delegation existed. The K-closest
+        // to an identity DO hold it, and so does a node that has talked to that
+        // identity.
+        {
+            let dht = Arc::clone(&self.dht);
+            anycast_svc_builder = anycast_svc_builder.with_delegation_lookup(std::sync::Arc::new(
+                move |node_id: &[u8; 32], idx: u8| {
+                    let key = veil_proto::identity_document::IdentityDocument::dht_key(node_id);
+                    let bytes = dht.get_local(&key)?;
+                    let doc =
+                        veil_proto::identity_document::IdentityDocument::decode(&bytes).ok()?;
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0);
+                    // The FULL ladder, clock included. This document came
+                    // off the network: it is exactly the case the
+                    // time-checked verifier is for, and an expired
+                    // delegation must not keep advertising.
+                    veil_identity::verify::verify_identity_document(&doc, now).ok()?;
+                    // The verifier has established node_id == BLAKE3(master)
+                    // and that every key here is master-certified, so the
+                    // key at this index is authorised to speak for the
+                    // address.
+                    doc.identity_keys
+                        .get(idx as usize)
+                        .map(|k| k.pubkey.clone())
+                },
+            ));
         }
         let anycast_svc = Arc::new(anycast_svc_builder);
         server = server.with_anycast_service(anycast_svc);
