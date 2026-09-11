@@ -1,5 +1,49 @@
 # Changelog
 
+## v0.11.29 — 2026-09-11
+
+*A nickname belonged to a device, so no real identity could hold one.*
+
+The design says a nickname is owned by the sovereign identity "so a name
+survives device changes". The code bound it to a device key instead, and the
+gap was not a corner case. `create_identity` mints the per-device subkey from
+`OsRng` and has the master certify it — for every algorithm, on the FIRST
+device, before any second device exists. `is_standalone()` is therefore false
+for every identity made through the master ceremony, and the claim refused all
+of them: on every device, including the only one. A hybrid master could not
+even be expressed, its public key being 929 bytes where the owner field held
+32.
+
+The record now names the IDENTITY. `owner_pubkey` is the master key,
+`owner_node_id` is BLAKE3 of it — the address contacts already use — and the
+signature is in that key's own algorithm, so a hybrid identity signs with its
+hybrid master. Record version 2; v1 is refused rather than grandfathered,
+because a v1 record names a DEVICE and honouring one would let it contest an
+identity-owned name by weight forever. For the single case that could have
+published a valid v1 record — a standalone identity, master == device — the
+owner id is unchanged, so mined seeds keep their full weight and re-claiming
+costs one signature rather than a re-mine.
+
+The master secret never reaches the node. `nickname_claim` takes a public key
+and a closure; the FFI passes an open sovereign signer handle and asks it for
+one signature; the host opens its encrypted credential for that moment and
+closes it again. A caller whose key lives behind a handle — one day a hardware
+token — satisfies the same interface without materialising bytes.
+
+Mining moves to the identity id too (`veil_nickname_owner_node_id`). The
+proof-of-work is bound to the owner (`blake3(name ‖ owner ‖ seed)`), so mining
+under the device id proved nothing for the record that would be published: on
+any identity whose master lives elsewhere the work was lost before the refusal
+was even reached.
+
+Guarded: a hybrid identity owns a name end to end; a device subkey is refused
+by the binding; a v1 record is refused at parse; the ceremony identity is
+shown to be non-standalone — the premise that made this unreachable; and the
+claim is structurally barred from taking its owner from `local_node_id`.
+Break-checked three ways: binding only the ed half reddens the hybrid test,
+dropping the binding reddens the device test, and restoring `local_node_id` as
+the owner reddens the structural guard.
+
 ## v0.11.28 — 2026-09-10
 
 *A path's permissions now come from the object, not from its name.*
