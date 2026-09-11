@@ -282,24 +282,37 @@ impl SovereignIdentity {
     ///
     /// Returns `None` unless this identity is **standalone**. Anycast
     /// owner-binding requires the MASTER key: the record's owner_pubkey must
-    /// satisfy `BLAKE3(owner_pubkey) == node_id` with `sig_key_idx == 0`. Only
-    /// a standalone device holds the master key as its `identity_sk` (see
-    /// [`is_standalone`]); a multi-device subkey can't satisfy the binding, so
-    /// it must NOT advertise signed records (verifiers would reject them).
+    /// satisfy the owner-binding, and the returned index says WHICH of the two
+    /// bindings a verifier must apply.
+    ///
+    /// The key handed out is this device's ACTIVE key, whatever it is. On a
+    /// standalone device that key IS the master, the index is 0, and the
+    /// self-signed binding `BLAKE3(owner_pubkey) == node_id` holds directly.
+    /// On every other device it is a subkey at its own index, and the binding
+    /// is proved through the identity document instead — see
+    /// `veil_anycast::verify_record_owner_binding_delegated`.
+    ///
+    /// This used to return `None` for anything but a standalone device, which
+    /// disabled anycast advertising for every multi-device identity: records
+    /// went out unsigned and peers on the default `SignedBound` policy dropped
+    /// them. That is the opposite of what anycast is for — several nodes
+    /// answering on one address — and only one device of an identity can ever
+    /// hold the master key.
+    ///
+    /// `None` only when the active index does not fit the record's `u8` field,
+    /// which would be an identity with more than 255 device keys.
     ///
     /// [`ed25519_signing_key`]: Self::ed25519_signing_key
     /// [`is_standalone`]: Self::is_standalone
     pub fn anycast_owner_signer(
         self: &std::sync::Arc<Self>,
-    ) -> Option<(u8, Vec<u8>, IdentitySignFn)> {
-        if !self.is_standalone() {
-            return None;
-        }
+    ) -> Option<(u8, Vec<u8>, u8, IdentitySignFn)> {
+        let sig_key_idx = u8::try_from(self.sig_key_idx).ok()?;
         let algo = self.identity_sk.algo();
         let owner_pubkey = self.identity_sk.public_key_bytes();
         let me = std::sync::Arc::clone(self);
         let sign: IdentitySignFn = std::sync::Arc::new(move |msg: &[u8]| me.identity_sk.sign(msg));
-        Some((algo, owner_pubkey, sign))
+        Some((algo, owner_pubkey, sig_key_idx, sign))
     }
 
     /// Convenience: use `document.sig_key_idx` as the active index.
@@ -1595,9 +1608,10 @@ mod tests {
         let (dir, _) = fresh_standalone_dir();
         let sov = std::sync::Arc::new(SovereignIdentity::load_from_dir(&dir).unwrap());
 
-        let (algo_byte, owner_pubkey, sign) = sov
+        let (algo_byte, owner_pubkey, sig_key_idx, sign) = sov
             .anycast_owner_signer()
             .expect("standalone identity must yield an owner-signer");
+        assert_eq!(sig_key_idx, 0, "the master's own index is 0");
 
         // Standalone seed is Ed25519 → wire byte 0, owner_pubkey == master_pubkey.
         assert_eq!(algo_byte, 0, "standalone seed identity is Ed25519");
@@ -1622,15 +1636,38 @@ mod tests {
             .expect("owner-signer signature must verify under owner_pubkey");
     }
 
+    /// A multi-device identity advertises too — with its own key, at its own
+    /// index.
+    ///
+    /// This test replaces one that asserted the opposite. That rule disabled
+    /// anycast for every identity made through the master ceremony, which is
+    /// every identity that has more than one device: exactly the case several
+    /// nodes behind one address exists to serve.
     #[test]
-    fn anycast_owner_signer_none_for_subkey() {
-        // A multi-device subkey identity is NOT standalone: it cannot satisfy
-        // the owner-binding, so it must not hand out an owner-signer.
+    fn anycast_owner_signer_hands_a_subkey_its_own_index() {
         let (dir, _out) = fresh_dir_with_identity();
         let sov = std::sync::Arc::new(SovereignIdentity::load_from_dir(&dir).unwrap());
         assert!(
-            sov.anycast_owner_signer().is_none(),
-            "non-standalone (subkey) identity must yield no owner-signer",
+            !sov.is_standalone(),
+            "the fixture must be a ceremony identity, or this proves nothing"
+        );
+        let (_algo, owner_pubkey, sig_key_idx, _sign) = sov
+            .anycast_owner_signer()
+            .expect("a device of an identity must be able to advertise for it");
+
+        // The key handed out is the DEVICE's, and the document names it at the
+        // index returned — the two facts a verifier checks against the
+        // document.
+        assert_eq!(
+            owner_pubkey, sov.document.identity_keys[sig_key_idx as usize].pubkey,
+            "the signer must hand out the key the document names at this index",
+        );
+        // And it is NOT the master, so the self-signed binding must not be the
+        // one a verifier applies.
+        assert_ne!(
+            blake3::hash(&owner_pubkey).as_bytes(),
+            sov.node_id(),
+            "a device key that hashed to the address would be the master",
         );
     }
 
