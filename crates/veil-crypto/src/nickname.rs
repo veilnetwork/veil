@@ -15,9 +15,19 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 use blake3::Hasher;
-use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
+use ed25519_dalek::{Signature, Signer, SigningKey};
+use veil_types::SignatureAlgorithm;
 use veil_util::leading_zero_bits;
+
+/// Upper bound on `owner_pubkey`. The largest key the record can name is an
+/// Ed25519+Falcon-1024 master (32 + 1793); the cap is what stops a parsed
+/// record from carrying an arbitrary allocation.
+pub const MAX_OWNER_PUBKEY_LEN: usize = 2048;
+
+/// Upper bound on `sig`, sized the same way for the largest hybrid signature.
+pub const MAX_OWNER_SIG_LEN: usize = 4096;
 
 /// Max seeds kept in a record. The weight of one seed is `2^bits`, so the 64
 /// heaviest seeds dominate any realistic contest while bounding record size.
@@ -38,7 +48,23 @@ pub const MAX_NICKNAME_LEN: usize = 32;
 
 /// Record format version (weight math + canonical bytes). Bumped on any
 /// change that alters verification.
-pub const NICKNAME_RECORD_VERSION: u8 = 1;
+///
+/// v2 moved ownership from a DEVICE key to the IDENTITY. v1 pinned the owner
+/// to a bare 32-byte ed25519 key and required `blake3(that key) ==
+/// owner_node_id`, which only a device whose own key IS the identity master
+/// can satisfy. Every identity created through the master ceremony gets a
+/// RANDOM per-device subkey (`create_identity`), so under v1 no such identity
+/// could ever own a name — not on a second device, not on its first. A hybrid
+/// master could not even be expressed: its public key is 929 bytes and the
+/// field held 32.
+///
+/// v1 records are refused rather than grandfathered: a v1 record names a
+/// DEVICE as owner, and honouring it would let a device-owned record contest
+/// an identity-owned one by weight forever. For the one case that could have
+/// published a valid v1 record — a standalone identity, master == device —
+/// `owner_node_id` is the SAME value under v2, so its mined seeds keep their
+/// full weight and re-claiming costs one signature, not a re-mine.
+pub const NICKNAME_RECORD_VERSION: u8 = 2;
 
 /// Source of a record's ownership weight. Forward-compatible with a future
 /// cryptocurrency stake — a stake simply becomes a heavier weight class.
@@ -88,10 +114,19 @@ pub struct NicknameRecord {
     pub version: u8,
     /// Normalized name (see [`normalize_name`]).
     pub name: String,
-    /// Sovereign node id: MUST equal `blake3(owner_sign_pk)`.
+    /// The owning IDENTITY's node id: MUST equal `blake3(owner_pubkey)`.
+    ///
+    /// This is the address contacts already use for the identity, and it is
+    /// the same value on every device the identity has — which is what makes
+    /// a name survive a device change, as the design intends.
     pub owner_node_id: [u8; 32],
-    /// ed25519 verifying key of the owner.
-    pub owner_sign_pk: [u8; 32],
+    /// Wire byte of the identity master key's signature algorithm
+    /// ([`SignatureAlgorithm::wire_byte`]).
+    pub owner_algo: u8,
+    /// The identity's MASTER public key — 32 bytes for ed25519, 929 for
+    /// Ed25519+Falcon-512, and so on. NOT a device subkey: `owner_node_id` is
+    /// derived from this key, so only the master satisfies the binding.
+    pub owner_pubkey: Vec<u8>,
     pub weight_kind: WeightKind,
     /// CUMULATIVE claimed weight (Σ 2^bits over `pow_seeds`).
     pub weight: u64,
@@ -99,8 +134,10 @@ pub struct NicknameRecord {
     pub pow_seeds: Vec<[u8; 32]>,
     /// Unix seconds — freshness for a same-owner refresh (no re-mine).
     pub issued_at_unix: u64,
-    /// ed25519 signature over the canonical bytes.
-    pub sig: [u8; 64],
+    /// Signature over the canonical bytes by the master key named in
+    /// `owner_pubkey`, in that key's algorithm (64 bytes for ed25519, longer
+    /// for a hybrid).
+    pub sig: Vec<u8>,
 }
 
 /// Normalize a candidate name to canonical form, or `None` if it cannot be:
@@ -333,6 +370,9 @@ impl<'a> Reader<'a> {
     fn u8(&mut self) -> Option<u8> {
         Some(self.take(1)?[0])
     }
+    fn u16(&mut self) -> Option<u16> {
+        Some(u16::from_le_bytes(self.take(2)?.try_into().ok()?))
+    }
     fn u32(&mut self) -> Option<u32> {
         Some(u32::from_le_bytes(self.take(4)?.try_into().ok()?))
     }
@@ -341,9 +381,6 @@ impl<'a> Reader<'a> {
     }
     fn arr32(&mut self) -> Option<[u8; 32]> {
         self.take(32)?.try_into().ok()
-    }
-    fn arr64(&mut self) -> Option<[u8; 64]> {
-        self.take(64)?.try_into().ok()
     }
 }
 
@@ -357,7 +394,9 @@ impl NicknameRecord {
         out.extend_from_slice(&(name.len() as u32).to_le_bytes());
         out.extend_from_slice(name);
         out.extend_from_slice(&self.owner_node_id);
-        out.extend_from_slice(&self.owner_sign_pk);
+        out.push(self.owner_algo);
+        out.extend_from_slice(&(self.owner_pubkey.len() as u16).to_le_bytes());
+        out.extend_from_slice(&self.owner_pubkey);
         out.push(self.weight_kind.tag());
         out.extend_from_slice(&self.weight.to_le_bytes());
         out.extend_from_slice(&(self.pow_seeds.len() as u32).to_le_bytes());
@@ -377,6 +416,7 @@ impl NicknameRecord {
         let mut out = Vec::with_capacity(2 + 160 + self.pow_seeds.len() * 32);
         out.extend_from_slice(&NICKNAME_DHT_MAGIC);
         out.extend_from_slice(&self.canonical_bytes());
+        out.extend_from_slice(&(self.sig.len() as u16).to_le_bytes());
         out.extend_from_slice(&self.sig);
         out
     }
@@ -390,10 +430,22 @@ impl NicknameRecord {
             return None;
         }
         let version = r.u8()?;
+        // Refuse an unknown version HERE rather than at verify time: the
+        // layout below is version-specific, so parsing v1 bytes as v2 would
+        // read the owner key's first byte as an algorithm and the rest as a
+        // length. A wrong version is a framing error, not a policy one.
+        if version != NICKNAME_RECORD_VERSION {
+            return None;
+        }
         let name_len = r.u32()? as usize;
         let name = String::from_utf8(r.take(name_len)?.to_vec()).ok()?;
         let owner_node_id = r.arr32()?;
-        let owner_sign_pk = r.arr32()?;
+        let owner_algo = r.u8()?;
+        let owner_pubkey_len = r.u16()? as usize;
+        if owner_pubkey_len > MAX_OWNER_PUBKEY_LEN {
+            return None;
+        }
+        let owner_pubkey = r.take(owner_pubkey_len)?.to_vec();
         let weight_kind = WeightKind::from_tag(r.u8()?)?;
         let weight = r.u64()?;
         let seed_count = r.u32()? as usize;
@@ -405,7 +457,11 @@ impl NicknameRecord {
             pow_seeds.push(r.arr32()?);
         }
         let issued_at_unix = r.u64()?;
-        let sig = r.arr64()?;
+        let sig_len = r.u16()? as usize;
+        if sig_len > MAX_OWNER_SIG_LEN {
+            return None;
+        }
+        let sig = r.take(sig_len)?.to_vec();
         if r.at != bytes.len() {
             return None; // trailing garbage
         }
@@ -413,7 +469,8 @@ impl NicknameRecord {
             version,
             name,
             owner_node_id,
-            owner_sign_pk,
+            owner_algo,
+            owner_pubkey,
             weight_kind,
             weight,
             pow_seeds,
@@ -422,9 +479,59 @@ impl NicknameRecord {
         })
     }
 
-    /// Build and sign a record for an already-mined seed set. `signing_key` is
-    /// the owner's sovereign ed25519 key; `owner_node_id` MUST be
-    /// `blake3(verifying_key)` (asserted at verify time).
+    /// Build and sign a record for an already-mined seed set with the
+    /// identity's MASTER key, whatever its algorithm.
+    ///
+    /// `sign_canonical` receives the canonical bytes and returns the master's
+    /// signature over them. It is a closure and not a key because the master
+    /// secret does not live in this crate, and on most devices it does not
+    /// live in the process at all — the caller unlocks it for the moment of
+    /// the claim and drops it again.
+    ///
+    /// `owner_node_id` MUST be `blake3(owner_pubkey)`; that is checked at
+    /// verify time, and the record is verified here before it is returned, so
+    /// a mismatch cannot leave this function as a publishable record.
+    pub fn sign_with_master<F>(
+        name: &str,
+        owner_algo: SignatureAlgorithm,
+        owner_pubkey: Vec<u8>,
+        owner_node_id: [u8; 32],
+        pow_seeds: Vec<[u8; 32]>,
+        issued_at_unix: u64,
+        sign_canonical: F,
+    ) -> Option<Self>
+    where
+        F: FnOnce(&[u8]) -> Option<Vec<u8>>,
+    {
+        if owner_pubkey.len() > MAX_OWNER_PUBKEY_LEN {
+            return None;
+        }
+        let norm = normalize_name(name)?;
+        let weight = cumulative_weight(&norm, &owner_node_id, &pow_seeds)?;
+        let mut rec = NicknameRecord {
+            version: NICKNAME_RECORD_VERSION,
+            name: norm,
+            owner_node_id,
+            owner_algo: owner_algo.wire_byte(),
+            owner_pubkey,
+            weight_kind: WeightKind::PowV1,
+            weight,
+            pow_seeds,
+            issued_at_unix,
+            sig: Vec::new(),
+        };
+        let sig = sign_canonical(&rec.canonical_bytes())?;
+        if sig.len() > MAX_OWNER_SIG_LEN {
+            return None;
+        }
+        rec.sig = sig;
+        Some(rec)
+    }
+
+    /// The ed25519 case of [`Self::sign_with_master`]: an identity whose
+    /// master IS a bare ed25519 key, which is every identity created without
+    /// the master ceremony (`save_standalone_identity_to_dir`). `signing_key`
+    /// is that master key, NOT a device subkey.
     pub fn sign(
         name: &str,
         signing_key: &SigningKey,
@@ -432,22 +539,18 @@ impl NicknameRecord {
         pow_seeds: Vec<[u8; 32]>,
         issued_at_unix: u64,
     ) -> Option<Self> {
-        let norm = normalize_name(name)?;
-        let weight = cumulative_weight(&norm, &owner_node_id, &pow_seeds)?;
-        let mut rec = NicknameRecord {
-            version: NICKNAME_RECORD_VERSION,
-            name: norm,
+        Self::sign_with_master(
+            name,
+            SignatureAlgorithm::Ed25519,
+            signing_key.verifying_key().to_bytes().to_vec(),
             owner_node_id,
-            owner_sign_pk: signing_key.verifying_key().to_bytes(),
-            weight_kind: WeightKind::PowV1,
-            weight,
             pow_seeds,
             issued_at_unix,
-            sig: [0u8; 64],
-        };
-        let sig: Signature = signing_key.sign(&rec.canonical_bytes());
-        rec.sig = sig.to_bytes();
-        Some(rec)
+            |msg| {
+                let sig: Signature = signing_key.sign(msg);
+                Some(sig.to_bytes().to_vec())
+            },
+        )
     }
 
     /// Full validity check: version, name form, owner binding, signature,
@@ -463,16 +566,28 @@ impl NicknameRecord {
         if norm != self.name {
             return Err(NicknameError::BadName);
         }
-        // Owner binding: node id is blake3 of the signing pubkey.
-        if *blake3::hash(&self.owner_sign_pk).as_bytes() != self.owner_node_id {
+        // Owner binding: the node id is blake3 of the IDENTITY's master
+        // public key. This is the whole ownership model in one line — the
+        // name belongs to whoever holds that key, on any device, and the
+        // identity's address is derived from the same key, so a name cannot
+        // be published for an identity it does not belong to.
+        if self.owner_pubkey.len() > MAX_OWNER_PUBKEY_LEN || self.sig.len() > MAX_OWNER_SIG_LEN {
+            return Err(NicknameError::Unsupported);
+        }
+        if *blake3::hash(&self.owner_pubkey).as_bytes() != self.owner_node_id {
             return Err(NicknameError::OwnerMismatch);
         }
-        // Signature over the canonical bytes.
-        let vk = VerifyingKey::from_bytes(&self.owner_sign_pk)
-            .map_err(|_| NicknameError::BadSignature)?;
-        let sig = Signature::from_bytes(&self.sig);
-        vk.verify(&self.canonical_bytes(), &sig)
-            .map_err(|_| NicknameError::BadSignature)?;
+        // Signature over the canonical bytes, in the master key's own
+        // algorithm — a hybrid identity signs with the hybrid master.
+        let algo = SignatureAlgorithm::from_wire_byte(self.owner_algo)
+            .ok_or(NicknameError::Unsupported)?;
+        crate::signature::verify_message(
+            algo,
+            &STANDARD.encode(&self.owner_pubkey),
+            &self.canonical_bytes(),
+            &self.sig,
+        )
+        .map_err(|_| NicknameError::BadSignature)?;
         // Cumulative PoW must actually back the claimed weight.
         let recomputed = cumulative_weight(&norm, &self.owner_node_id, &self.pow_seeds)
             .ok_or(NicknameError::BadPow)?;
@@ -650,6 +765,109 @@ mod tests {
         assert_eq!(rec.verify(), Err(NicknameError::OwnerMismatch));
     }
 
+    /// A HYBRID identity can own a name.
+    ///
+    /// This is the case the record could not express before: a hybrid master
+    /// public key is 929 bytes and the owner field held 32, so `blake3(owner)`
+    /// could never equal the identity's node id. Every identity the app mints
+    /// through the master ceremony is hybrid, which made the whole feature
+    /// unreachable for them — on every device, including the first.
+    #[test]
+    fn a_hybrid_identity_owns_its_name() {
+        let pair = crate::signature::hybrid512_keypair_from_ed25519_seed(&[11u8; 32]);
+        // The identity's address is derived from the WHOLE master key.
+        let node_id = *blake3::hash(&pair.public_key).as_bytes();
+        assert_eq!(
+            pair.public_key.len(),
+            32 + 897,
+            "hybrid master is 929 bytes"
+        );
+
+        let pk_b64 = STANDARD.encode(&pair.public_key);
+        let sk_b64 = STANDARD.encode(&pair.private_key[..]);
+        let name = "longenoughname";
+        let seeds = mine(name, &node_id, length_weight_floor(name.len()));
+        let rec = NicknameRecord::sign_with_master(
+            name,
+            SignatureAlgorithm::Ed25519Falcon512Hybrid,
+            pair.public_key.clone(),
+            node_id,
+            seeds,
+            1000,
+            |msg| {
+                crate::signature::sign_message(
+                    SignatureAlgorithm::Ed25519Falcon512Hybrid,
+                    &pk_b64,
+                    &sk_b64,
+                    msg,
+                )
+                .ok()
+            },
+        )
+        .expect("hybrid master signs the record");
+
+        assert_eq!(rec.verify(), Ok(()));
+        // And it survives the wire, signature length and all.
+        let back = NicknameRecord::from_bytes(&rec.to_bytes()).expect("round-trips");
+        assert_eq!(back, rec);
+        assert_eq!(back.verify(), Ok(()));
+    }
+
+    /// A DEVICE subkey may not own a name — only the identity's master.
+    ///
+    /// The device key is a real, valid ed25519 key that the identity's master
+    /// certified; what it is not is the key the identity's address derives
+    /// from. Publishing under it would bind the name to one device, which is
+    /// exactly what a name must outlive.
+    #[test]
+    fn a_device_subkey_cannot_own_a_name() {
+        let pair = crate::signature::hybrid512_keypair_from_ed25519_seed(&[12u8; 32]);
+        let identity_node_id = *blake3::hash(&pair.public_key).as_bytes();
+        // A per-device subkey, as `create_identity` mints it: random, and
+        // unrelated to the identity's address.
+        let device_sk = SigningKey::from_bytes(&[13u8; 32]);
+        let name = "longenoughname";
+        let seeds = mine(name, &identity_node_id, length_weight_floor(name.len()));
+
+        // Signing the identity's name with the device key: the binding fails
+        // before the signature is ever considered.
+        let forged = NicknameRecord::sign_with_master(
+            name,
+            SignatureAlgorithm::Ed25519,
+            device_sk.verifying_key().to_bytes().to_vec(),
+            identity_node_id,
+            seeds.clone(),
+            1000,
+            |msg| Some(device_sk.sign(msg).to_bytes().to_vec()),
+        )
+        .expect("a record can be built; it must not verify");
+        assert_eq!(forged.verify(), Err(NicknameError::OwnerMismatch));
+
+        // Nor can the device claim the name under its OWN id and have that
+        // pass for the identity: the owner id is a different address, so the
+        // name it wins is not the identity's.
+        let device_node_id = *blake3::hash(&device_sk.verifying_key().to_bytes()).as_bytes();
+        assert_ne!(device_node_id, identity_node_id);
+    }
+
+    /// A v1 record is refused rather than grandfathered.
+    ///
+    /// v1 named a DEVICE as owner. Honouring one would let a device-owned
+    /// record contest an identity-owned one by weight forever, so the version
+    /// is a hard gate at parse time.
+    #[test]
+    fn a_v1_record_is_refused() {
+        let (sk, node_id) = test_key();
+        let name = "longenoughname";
+        let seeds = mine(name, &node_id, length_weight_floor(name.len()));
+        let rec = NicknameRecord::sign(name, &sk, node_id, seeds, 1000).unwrap();
+        let mut bytes = rec.to_bytes();
+        // The version byte sits right after the two magic bytes.
+        assert_eq!(bytes[2], NICKNAME_RECORD_VERSION);
+        bytes[2] = 1;
+        assert_eq!(NicknameRecord::from_bytes(&bytes), None);
+    }
+
     #[test]
     fn inflated_weight_rejected() {
         let (sk, node_id) = test_key();
@@ -660,7 +878,7 @@ mod tests {
         // (not the signature) is what rejects it.
         rec.weight = rec.weight.saturating_mul(4);
         let sig = sk.sign(&rec.canonical_bytes());
-        rec.sig = sig.to_bytes();
+        rec.sig = sig.to_bytes().to_vec();
         assert_eq!(rec.verify(), Err(NicknameError::BadPow));
     }
 

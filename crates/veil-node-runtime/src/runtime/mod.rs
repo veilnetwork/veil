@@ -31,7 +31,7 @@ mod mesh_gateway;
 mod mobile_state;
 mod nat_punch;
 mod nat_traversal;
-mod nickname;
+pub mod nickname;
 mod node_services;
 mod offline_seal;
 mod p_net_ban_sync;
