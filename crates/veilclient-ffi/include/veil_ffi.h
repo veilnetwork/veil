@@ -2434,24 +2434,62 @@ int veil_identity_document_authorizes(const uint8_t *doc_ptr,
 
 #if defined(VEIL_FFI_NODE_EMBEDDED)
 /**
- * Sign an already-mined seed set with the sovereign key of the embedded node
- * running as `owner_node_id`, and publish the nickname record to the DHT
- * (store-local + K-closest fan-out; auto-renewal rides the periodic
- * republish). `seeds` is a concatenation of 32-byte seeds from
- * `veil_nickname_mine`. On VEIL_OK writes the published record's cumulative
- * weight to `*out_weight`.
+ * The node id a nickname must be mined and claimed under: the IDENTITY's,
+ * not this device's.
+ *
+ * The proof-of-work is bound to the owner id (`blake3(name ‖ owner ‖ seed)`),
+ * so mining under the wrong one produces seeds that prove nothing for the
+ * record that gets published. On a device whose own key is the identity's
+ * master the two ids are equal and this is a no-op; on every other device
+ * they differ, and that difference is the whole reason a name outlives a
+ * device.
+ *
+ * `node_node_id` is the running node's own id (what the host already knows);
+ * the identity's id is written to `out_owner_node_id`.
+ *
+ * # Safety
+ * `node_node_id` must point to 32 readable bytes, `out_owner_node_id` to 32
+ * writable bytes; `err_out` (if non-null) a writable `*mut c_char` slot.
+ */
+
+int veil_nickname_owner_node_id(const uint8_t *node_node_id,
+                                uint8_t *out_owner_node_id,
+                                char **err_out)
+;
+#endif
+
+#if defined(VEIL_FFI_NODE_EMBEDDED)
+/**
+ * Sign an already-mined seed set with the IDENTITY's master key and publish
+ * the nickname record to the DHT (store-local + K-closest fan-out;
+ * auto-renewal rides the periodic republish). `seeds` is a concatenation of
+ * 32-byte seeds from `veil_nickname_mine`. On VEIL_OK writes the published
+ * record's cumulative weight to `*out_weight`.
+ *
+ * `signer` is an open sovereign signer (see
+ * `veil_sovereign_signer_open_bundle_zeroize` and friends) holding the
+ * identity's MASTER key. The name belongs to the identity, so the master is
+ * what signs; a device subkey cannot, on any device. Pass NULL only for an
+ * identity whose master IS this node's own key — the node then signs with
+ * it, and says so plainly if it turns out not to hold one.
+ *
+ * No secret crosses this call: the signer stays a handle, and the claim asks
+ * it for one signature.
  *
  * Errors (VEIL_ERR, reason in `*err_out` — free with `veil_free_string`):
  * invalid name/seed set, weight under the per-length floor, no embedded node
- * for this identity, non-sovereign/multi-device key, or the name is owned by
- * a heavier foreign record (the message carries the weight to beat).
+ * for this identity, a signer that is closed or belongs to a DIFFERENT
+ * identity, no signer on a device that does not hold the master, or the name
+ * is owned by a heavier foreign record (the message carries the weight to
+ * beat).
  *
  * # Safety
  * `owner_node_id` must point to 32 readable bytes; `name` to `name_len`
  * readable bytes; `seeds` to `seeds_len` readable bytes (multiple of 32, may
  * be NULL iff `seeds_len == 0` — though an empty set never clears the
- * floor); `out_weight` must be a writable `u64` slot; `err_out` (if
- * non-null) a writable `*mut c_char` slot.
+ * floor); `signer` must be a live handle from one of the
+ * `veil_sovereign_signer_open_*` calls or NULL; `out_weight` must be a
+ * writable `u64` slot; `err_out` (if non-null) a writable `*mut c_char` slot.
  */
 
 int veil_nickname_claim(const uint8_t *owner_node_id,
@@ -2460,6 +2498,7 @@ int veil_nickname_claim(const uint8_t *owner_node_id,
                         const uint8_t *seeds,
                         size_t seeds_len,
                         uint64_t timeout_ms,
+                        VeilSovereignSigner *signer,
                         uint64_t *out_weight,
                         char **err_out)
 ;

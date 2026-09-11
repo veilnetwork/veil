@@ -22,6 +22,7 @@ export 'src/nickname.dart'
         NicknameMineOutcome,
         ResolvedNickname,
         claimNickname,
+        nicknameOwnerNodeId,
         claimNicknameAsync,
         mineNicknameChunk,
         mineNicknameChunkAsync,

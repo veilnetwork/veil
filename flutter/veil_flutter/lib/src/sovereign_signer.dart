@@ -44,6 +44,15 @@ final class VeilSovereignSigner implements Finalizable {
 
   bool get isClosed => _handle == nullptr;
 
+  /// The opaque native handle as an integer address.
+  ///
+  /// For passing this signer to another entry point in the SAME process —
+  /// notably `claimNickname`, which runs on a worker isolate and so cannot
+  /// receive a `Pointer`. An address is meaningless outside this process and
+  /// carries no key material; the secret stays behind the handle.
+  /// Zero once [close] has run.
+  int get handleAddress => _handle.address;
+
   /// Decode [phrase] and open an opaque native signer.
   ///
   /// The immutable Dart [String] remains subject to Dart's normal lifetime;

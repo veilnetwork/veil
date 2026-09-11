@@ -2559,11 +2559,31 @@ final int Function(
             )>>('veil_nickname_verify')
     .asFunction();
 
-// Sign an already-mined seed set with the sovereign key of the embedded node
-// running as owner_node_id and publish to the DHT. On VEIL_OK writes the
-// published record's cumulative weight to *out_weight. Errors carry the
-// node-side reason (under-floor / taken-with-weight-W / multi-device subkey /
-// no embedded node) in *err_out.
+// The node id a nickname must be mined and claimed under: the IDENTITY's, not
+// this device's. The PoW is bound to the owner id, so mining under the wrong
+// one proves nothing for the record that gets published.
+final int Function(
+  Pointer<Uint8>, // node_node_id (32 B, this node's own id)
+  Pointer<Uint8>, // out_owner_node_id (32 B)
+  Pointer<Pointer<Utf8>>, // err_out
+) veilNicknameOwnerNodeId = nativeLib
+    .lookup<
+        NativeFunction<
+            Int32 Function(
+              Pointer<Uint8>,
+              Pointer<Uint8>,
+              Pointer<Pointer<Utf8>>,
+            )>>('veil_nickname_owner_node_id')
+    .asFunction();
+
+// Sign an already-mined seed set with the IDENTITY's master key and publish to
+// the DHT. On VEIL_OK writes the published record's cumulative weight to
+// *out_weight. `signer` is an open sovereign signer holding that master key —
+// the name belongs to the identity, not to a device, so a device subkey never
+// signs one. nullptr is for an identity whose master IS this node's own key.
+// Errors carry the node-side reason (under-floor / taken-with-weight-W /
+// signer closed or from another identity / no master on this device / no
+// embedded node) in *err_out.
 final int Function(
   Pointer<Uint8>, // owner_node_id (32 B)
   Pointer<Uint8>, // name (UTF-8)
@@ -2571,6 +2591,7 @@ final int Function(
   Pointer<Uint8>, // seeds (count*32 B, may be nullptr)
   int, // seeds_len
   int, // timeout_ms (u64; 0 = default)
+  Pointer<VeilSovereignSigner>, // signer (may be nullptr)
   Pointer<Uint64>, // out_weight
   Pointer<Pointer<Utf8>>, // err_out
 ) veilNicknameClaim = nativeLib
@@ -2583,6 +2604,7 @@ final int Function(
               Pointer<Uint8>,
               IntPtr,
               Uint64,
+              Pointer<VeilSovereignSigner>,
               Pointer<Uint64>,
               Pointer<Pointer<Utf8>>,
             )>>('veil_nickname_claim')

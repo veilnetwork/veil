@@ -173,16 +173,55 @@ NicknameMineOutcome mineNicknameChunk({
   }
 }
 
-/// Sign an already-mined seed set with the sovereign key of the embedded
-/// node running as `ownerNodeId` and publish the nickname record to the
-/// DHT. Returns the published cumulative weight. Throws [VeilException]
-/// with the node-side reason on failure (weight under the per-length
-/// floor, name taken with weight W — mine strictly more, multi-device
-/// subkey, no embedded node). Blocking — call through `Isolate.run`.
+/// The node id a nickname must be mined and claimed under: the IDENTITY's, not
+/// this device's.
+///
+/// Ask before mining. The proof-of-work is bound to the owner id, so seeds
+/// mined under the device id prove nothing for the record that gets published,
+/// and the work is lost. On a device whose own key is the identity's master
+/// the two are equal; on every other device they differ.
+///
+/// Throws [VeilException] when no embedded node runs for [selfNodeId] or the
+/// node has no sovereign identity.
+Uint8List nicknameOwnerNodeId(Uint8List selfNodeId) {
+  if (selfNodeId.length != 32) {
+    throw VeilException('selfNodeId must be 32 bytes');
+  }
+  final selfC = calloc<Uint8>(32);
+  final outC = calloc<Uint8>(32);
+  final errOut = calloc<Pointer<Utf8>>();
+  try {
+    selfC.asTypedList(32).setAll(0, selfNodeId);
+    final rc = ffi.veilNicknameOwnerNodeId(selfC, outC, errOut);
+    if (rc != ffi.veilOk) {
+      throw VeilException(_takeErr(errOut, rc), code: rc);
+    }
+    return Uint8List.fromList(outC.asTypedList(32));
+  } finally {
+    calloc.free(selfC);
+    calloc.free(outC);
+    calloc.free(errOut);
+  }
+}
+
+/// Sign an already-mined seed set with the IDENTITY's master key and publish
+/// the nickname record to the DHT. Returns the published cumulative weight.
+///
+/// `signerAddress` is [VeilSovereignSigner.handleAddress] for a signer holding
+/// that master key — an address rather than a pointer because this runs on a
+/// worker isolate. The name belongs to the identity, so the master signs it; a
+/// device subkey cannot, on any device. 0 means "this node already holds the
+/// master", which is true only for an identity whose master IS its own key.
+///
+/// Throws [VeilException] with the node-side reason on failure (weight under
+/// the per-length floor, name taken with weight W — mine strictly more, signer
+/// closed or from another identity, no master on this device, no embedded
+/// node). Blocking — call through `Isolate.run`.
 int claimNickname({
   required Uint8List ownerNodeId,
   required String name,
   required Uint8List seeds,
+  int signerAddress = 0,
   int timeoutMs = 0,
 }) {
   if (ownerNodeId.length != 32) {
@@ -208,6 +247,7 @@ int claimNickname({
       seedsC,
       seeds.length,
       timeoutMs,
+      Pointer<ffi.VeilSovereignSigner>.fromAddress(signerAddress),
       outWeight,
       errOut,
     );
@@ -250,12 +290,14 @@ Future<int> claimNicknameAsync({
   required Uint8List ownerNodeId,
   required String name,
   required Uint8List seeds,
+  int signerAddress = 0,
   int timeoutMs = 0,
 }) {
   return Isolate.run(() => claimNickname(
         ownerNodeId: ownerNodeId,
         name: name,
         seeds: seeds,
+        signerAddress: signerAddress,
         timeoutMs: timeoutMs,
       ));
 }
