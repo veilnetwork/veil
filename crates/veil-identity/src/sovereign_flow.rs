@@ -1584,14 +1584,22 @@ const MASTER_FALCON_MAX_BYTES: usize = 8 * 1024;
 /// Caller is responsible for emitting an operator warning that this
 /// file is the SOLE copy of the Falcon master keypair — the BIP-39
 /// phrase only recovers the Ed25519 half.
-pub fn save_master_falcon_keypair(
-    veil_dir: &std::path::Path,
+/// Frame a Falcon master keypair into the `master_falcon.bin` bundle shape,
+/// without writing it anywhere.
+///
+/// Split out of [`save_master_falcon_keypair`] because the bytes are needed in
+/// memory too: an identity whose master lives in an encrypted credential has
+/// its Falcon half there rather than in a file, and
+/// [`RestoreIdentityOptions::master_falcon_keypair_bytes`] takes exactly this
+/// framing.
+pub fn encode_master_falcon_keypair(
     falcon_sk_bytes: &[u8],
     falcon_pk_bytes: &[u8],
-) -> std::io::Result<()> {
-    // audit cycle-8: the framed bundle carries the Falcon master SK — the single
-    // highest-value, non-BIP-39-recoverable secret. Hold it in `Zeroizing` so it
-    // is wiped from the heap on drop rather than lingering in freed memory.
+) -> std::io::Result<zeroize::Zeroizing<Vec<u8>>> {
+    // audit cycle-8: the framed bundle carries the Falcon master SK — the
+    // single highest-value, non-BIP-39-recoverable secret. Hold it in
+    // `Zeroizing` so it is wiped from the heap on drop rather than lingering
+    // in freed memory.
     let mut framed = zeroize::Zeroizing::new(Vec::with_capacity(
         MASTER_FALCON_MAGIC.len() + 1 + 4 + falcon_sk_bytes.len() + 4 + falcon_pk_bytes.len(),
     ));
@@ -1611,6 +1619,18 @@ pub fn save_master_falcon_keypair(
             ),
         ));
     }
+    Ok(framed)
+}
+
+pub fn save_master_falcon_keypair(
+    veil_dir: &std::path::Path,
+    falcon_sk_bytes: &[u8],
+    falcon_pk_bytes: &[u8],
+) -> std::io::Result<()> {
+    // audit cycle-8: the framed bundle carries the Falcon master SK — the single
+    // highest-value, non-BIP-39-recoverable secret. Hold it in `Zeroizing` so it
+    // is wiped from the heap on drop rather than lingering in freed memory.
+    let framed = encode_master_falcon_keypair(falcon_sk_bytes, falcon_pk_bytes)?;
 
     // cycle-7 MH3: hardened atomic write (O_EXCL + O_NOFOLLOW + 0o600 +
     // fsync + parent-dir fsync) instead of the predictable-tmp + rename dance.
