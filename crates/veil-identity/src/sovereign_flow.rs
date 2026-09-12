@@ -1744,6 +1744,15 @@ pub enum DelegateDeviceError {
     #[error("MAX_IDENTITY_KEYS ({max}) would be exceeded (document already has {current})")]
     TooManyKeys { max: usize, current: usize },
     #[error(
+        "device {device_id} is not named by this document — renewal refreshes an \
+         existing delegation, it does not admit a new device"
+    )]
+    NotPresent { device_id: String },
+    #[error("renewal must move the window forward: current {current}, proposed {proposed}")]
+    NotForward { current: u64, proposed: u64 },
+    #[error("internal: {0}")]
+    Internal(String),
+    #[error(
         "master seed does not match this identity: it derives node_id {computed}, \
          the document carries {document}"
     )]
@@ -1779,6 +1788,78 @@ pub enum MasterSecret {
     Seed(Zeroizing<[u8; 32]>),
     /// The already-derived Ed25519 master secret.
     SigningKey(Zeroizing<[u8; 32]>),
+    /// A hybrid master, BOTH halves.
+    ///
+    /// The Ed25519 half is reproducible from the phrase and the Falcon half is
+    /// not — it is random at creation and exists only in the identity's
+    /// encrypted credential. So a hybrid master cannot be handed over as a
+    /// seed: whoever signs with it must have opened that credential, and what
+    /// comes out is the keypair itself.
+    Hybrid512 {
+        /// The full 929-byte `ed25519 ‖ falcon512` public key. `node_id` is
+        /// BLAKE3 of exactly these bytes.
+        public_key: Vec<u8>,
+        private_key: Zeroizing<Vec<u8>>,
+    },
+}
+
+impl MasterSecret {
+    /// Wire byte of this master's signature algorithm.
+    pub fn algo(&self) -> u8 {
+        match self {
+            Self::Seed(_) | Self::SigningKey(_) => ALGO_ED25519,
+            Self::Hybrid512 { .. } => ALGO_ED25519_FALCON512_HYBRID,
+        }
+    }
+
+    /// The master PUBLIC key — the bytes `node_id` is BLAKE3 of.
+    pub fn public_key(&self) -> Vec<u8> {
+        match self {
+            Self::Seed(seed) => SigningKey::from_bytes(&derive_master_sk_ed25519(seed))
+                .verifying_key()
+                .to_bytes()
+                .to_vec(),
+            Self::SigningKey(sk) => SigningKey::from_bytes(sk)
+                .verifying_key()
+                .to_bytes()
+                .to_vec(),
+            Self::Hybrid512 { public_key, .. } => public_key.clone(),
+        }
+    }
+
+    /// Sign with the master, in the master's own algorithm.
+    ///
+    /// This is what a delegation cert is: the only signature that can admit a
+    /// device to an identity. A hybrid master signs with BOTH halves, and the
+    /// verifier already requires both to check out.
+    pub fn sign(&self, message: &[u8]) -> Result<Vec<u8>, DelegateDeviceError> {
+        match self {
+            Self::Seed(seed) => Ok(SigningKey::from_bytes(&derive_master_sk_ed25519(seed))
+                .sign(message)
+                .to_bytes()
+                .to_vec()),
+            Self::SigningKey(sk) => {
+                Ok(SigningKey::from_bytes(sk).sign(message).to_bytes().to_vec())
+            }
+            Self::Hybrid512 {
+                public_key,
+                private_key,
+            } => {
+                use base64::Engine as _;
+                let pk_b64 = base64::engine::general_purpose::STANDARD.encode(public_key);
+                let sk_b64 = Zeroizing::new(
+                    base64::engine::general_purpose::STANDARD.encode(&private_key[..]),
+                );
+                veil_crypto::sign_message(
+                    veil_types::SignatureAlgorithm::Ed25519Falcon512Hybrid,
+                    &pk_b64,
+                    &sk_b64,
+                    message,
+                )
+                .map_err(|e| DelegateDeviceError::Internal(format!("hybrid master sign: {e}")))
+            }
+        }
+    }
 }
 
 pub struct DelegateDeviceOptions {
@@ -1838,6 +1919,139 @@ pub struct DelegateDeviceOutput {
 /// freshness window and the pubkey length. Split out so the in-memory core
 /// and the on-disk wrapper reject the same inputs, and so the wrapper keeps
 /// rejecting them BEFORE it touches the filesystem.
+/// Refresh the window on a delegation the document ALREADY names, and re-sign
+/// it with the master.
+///
+/// [`delegate_device`] cannot do this: it refuses a key the document already
+/// carries (`AlreadyPresent`), because admitting the same device twice would
+/// put two live entries under one `device_id`. And the runtime's
+/// [`SovereignIdentity::reissue_self_delegation`] cannot either — it re-signs
+/// with the device's own key, which is only the master on a standalone
+/// identity. So for every identity with a real master there was no way at all
+/// to renew a device that had aged out, and a device whose delegation lapsed
+/// stayed lapsed.
+///
+/// `device_pubkey` is `None` for the ordinary call: renew THIS device, whose
+/// key is read from `device_identity_sk.bin`. The caller then handles no key
+/// material — it supplies the master and the new window, nothing else.
+///
+/// The device key is untouched: this is a re-signature, not a re-enrolment.
+/// The device keeps its address, its `device_id` and its place in the
+/// document; only `valid_until_unix` and the master's certificate over it
+/// move forward.
+pub fn reissue_device_delegation(
+    opts: ReissueDelegationOptions,
+) -> Result<DelegateDeviceOutput, DelegateDeviceError> {
+    let doc_path = opts.veil_dir.join(IDENTITY_DOCUMENT_FILE);
+    if !doc_path.exists() {
+        return Err(DelegateDeviceError::NoDocument(doc_path));
+    }
+    let mut doc = IdentityDocument::decode(&std::fs::read(&doc_path)?)
+        .map_err(|e| DelegateDeviceError::DocumentDecode(e.to_string()))?;
+    let local_seed = load_identity_sk(&opts.veil_dir)?;
+    let local_sk = SigningKey::from_bytes(local_seed.as_array());
+
+    let device_pubkey = match opts.device_pubkey {
+        Some(pk) => pk,
+        None => local_sk.verifying_key().to_bytes().to_vec(),
+    };
+    check_delegation_inputs(&device_pubkey, opts.now_unix, opts.valid_until_unix)?;
+
+    // The master the caller holds must be the kind and the one this document
+    // names — same two refusals as a first delegation, for the same reasons.
+    if doc.master_algo != opts.master.algo() {
+        return Err(DelegateDeviceError::UnsupportedMasterAlgo {
+            algo: doc.master_algo,
+        });
+    }
+    let computed_node_id = compute_node_id(&opts.master.public_key());
+    if computed_node_id != doc.node_id {
+        return Err(DelegateDeviceError::WrongMaster {
+            computed: hex_encode(&computed_node_id),
+            document: hex_encode(&doc.node_id),
+        });
+    }
+
+    let device_id = compute_node_id(&device_pubkey);
+    // A tombstoned device may never come back, and renewal is not the way
+    // around that: `delegate_device` refuses it for the same reason, and a
+    // document naming a key both live and revoked does not decode at all.
+    if doc.revoked_devices.iter().any(|r| r.device_id == device_id) {
+        return Err(DelegateDeviceError::Revoked {
+            device_id: hex_encode(&device_id),
+        });
+    }
+
+    let idx = doc
+        .identity_keys
+        .iter()
+        .position(|k| k.pubkey == device_pubkey)
+        .ok_or(DelegateDeviceError::NotPresent {
+            device_id: hex_encode(&device_id),
+        })?;
+
+    // Forward only. Renewal that moved a window BACKWARDS would be a way to
+    // retire a device without a tombstone, and the caller asking for it has
+    // misread its own clock.
+    if opts.valid_until_unix <= doc.identity_keys[idx].valid_until_unix {
+        return Err(DelegateDeviceError::NotForward {
+            current: doc.identity_keys[idx].valid_until_unix,
+            proposed: opts.valid_until_unix,
+        });
+    }
+
+    let valid_from = doc.identity_keys[idx].valid_from_unix;
+    let cert_sig = opts.master.sign(&build_certify(
+        &doc.node_id,
+        ALGO_ED25519,
+        &device_pubkey,
+        &device_id,
+        valid_from,
+        opts.valid_until_unix,
+    ))?;
+    doc.identity_keys[idx].valid_until_unix = opts.valid_until_unix;
+    doc.identity_keys[idx].master_sig = cert_sig;
+
+    doc.issued_at_unix = opts.now_unix;
+    if opts.valid_until_unix > doc.valid_until_unix {
+        doc.valid_until_unix = opts.valid_until_unix;
+    }
+
+    // The document must be signed by a key that is itself in-window, or a
+    // verifier refuses it at the active-key rung. The key just renewed is such
+    // a key when it is this device's; say so rather than leave sig_key_idx
+    // pointing at a delegation that may have lapsed.
+    let signed_by_renewed = local_sk.verifying_key().as_bytes()[..] == device_pubkey[..];
+    if signed_by_renewed {
+        doc.sig_key_idx = idx as u16;
+    }
+    let mut doc_msg = Vec::with_capacity(DOC_SIG_CONTEXT.len() + 512);
+    doc_msg.extend_from_slice(DOC_SIG_CONTEXT);
+    doc_msg.extend_from_slice(&doc.canonical_signing_bytes());
+    doc.document_sig = local_sk.sign(&doc_msg).to_bytes().to_vec();
+
+    atomic_write(opts.out_path.as_ref().unwrap_or(&doc_path), &doc.encode())?;
+    Ok(DelegateDeviceOutput {
+        document: doc,
+        new_key_idx: idx as u16,
+        signed_by_new_key: signed_by_renewed,
+    })
+}
+
+/// Inputs for [`reissue_device_delegation`].
+pub struct ReissueDelegationOptions {
+    pub veil_dir: PathBuf,
+    /// Only the master can extend a delegation — that is what makes the
+    /// window mean anything.
+    pub master: MasterSecret,
+    /// `None` renews THIS device, read from `device_identity_sk.bin`.
+    pub device_pubkey: Option<Vec<u8>>,
+    pub now_unix: u64,
+    pub valid_until_unix: u64,
+    /// `None` replaces the document in `veil_dir`.
+    pub out_path: Option<PathBuf>,
+}
+
 fn check_delegation_inputs(
     device_pubkey: &[u8],
     now_unix: u64,
@@ -1918,7 +2132,11 @@ fn delegate_into_document(
     // hypothetical. Naming the algorithm is a refusal, not support: signing
     // the cert with a hybrid master needs the Falcon half plumbed through
     // MasterSecret and a hybrid cert on the wire.
-    if doc.master_algo != ALGO_ED25519 {
+    // The master the CALLER holds must be the kind this document names. A
+    // hybrid identity handed an Ed25519 seed would otherwise hash 32 bytes
+    // where the document names 929 and report a wrong phrase for a correct
+    // one.
+    if doc.master_algo != master.algo() {
         return Err(DelegateDeviceError::UnsupportedMasterAlgo {
             algo: doc.master_algo,
         });
@@ -1928,12 +2146,8 @@ fn delegate_into_document(
     // wrong phrase produces a document that verifies against a different
     // identity entirely, and the failure surfaces much later as peers refusing
     // a node they cannot resolve.
-    let master_sk = match master {
-        MasterSecret::Seed(seed) => SigningKey::from_bytes(&derive_master_sk_ed25519(seed)),
-        MasterSecret::SigningKey(sk) => SigningKey::from_bytes(sk),
-    };
-    let master_pk = master_sk.verifying_key();
-    let computed_node_id = compute_node_id(master_pk.as_bytes());
+    let master_pubkey = master.public_key();
+    let computed_node_id = compute_node_id(&master_pubkey);
     if computed_node_id != doc.node_id {
         return Err(DelegateDeviceError::WrongMaster {
             computed: hex_encode(&computed_node_id),
@@ -1942,21 +2156,24 @@ fn delegate_into_document(
     }
 
     let device_id = delegated_device_id;
-    let cert_sig = master_sk.sign(&build_certify(
+    // The ALGO in the certify message is the DEVICE key's, which is always
+    // Ed25519 — a subkey is what signs in the hot path. What changes with a
+    // hybrid identity is who SIGNS the message, not the message.
+    let cert_sig = master.sign(&build_certify(
         &doc.node_id,
         ALGO_ED25519,
         device_pubkey,
         &device_id,
         now_unix,
         valid_until_unix,
-    ));
+    ))?;
     doc.identity_keys.push(IdentityKey {
         algo: ALGO_ED25519,
         pubkey: device_pubkey.to_vec(),
         device_id,
         valid_from_unix: now_unix,
         valid_until_unix,
-        master_sig: cert_sig.to_bytes().to_vec(),
+        master_sig: cert_sig,
     });
     let new_key_idx = (doc.identity_keys.len() - 1) as u16;
 
@@ -2186,7 +2403,7 @@ pub fn adopt_identity_document(
     // hashed over its 929-byte pubkey, and "this is a different identity" is
     // the wrong thing to tell an operator whose phrase is right. Nothing has
     // been written at this point.
-    if incoming.master_algo != ALGO_ED25519 {
+    if incoming.master_algo != master.algo() {
         return Err(AdoptDocumentError::Delegate(
             DelegateDeviceError::UnsupportedMasterAlgo {
                 algo: incoming.master_algo,
@@ -2194,11 +2411,7 @@ pub fn adopt_identity_document(
         ));
     }
 
-    let master_sk = match &master {
-        MasterSecret::Seed(seed) => SigningKey::from_bytes(&derive_master_sk_ed25519(seed)),
-        MasterSecret::SigningKey(sk) => SigningKey::from_bytes(sk),
-    };
-    let mine = compute_node_id(master_sk.verifying_key().as_bytes());
+    let mine = compute_node_id(&master.public_key());
     if mine != incoming.node_id {
         return Err(AdoptDocumentError::DifferentIdentity {
             incoming: hex_encode(&incoming.node_id),
@@ -2415,7 +2628,7 @@ pub fn revoke_identity_device(
     // compromised device is the operation you least want reported as "wrong
     // phrase". Checked before the tombstone is minted and long before
     // `resign_and_store_document` writes anything.
-    if doc.master_algo != ALGO_ED25519 {
+    if doc.master_algo != master.algo() {
         return Err(AdoptDocumentError::Delegate(
             DelegateDeviceError::UnsupportedMasterAlgo {
                 algo: doc.master_algo,
@@ -2423,11 +2636,7 @@ pub fn revoke_identity_device(
         ));
     }
 
-    let master_sk = match &master {
-        MasterSecret::Seed(seed) => SigningKey::from_bytes(&derive_master_sk_ed25519(seed)),
-        MasterSecret::SigningKey(sk) => SigningKey::from_bytes(sk),
-    };
-    let mine = compute_node_id(master_sk.verifying_key().as_bytes());
+    let mine = compute_node_id(&master.public_key());
     if mine != doc.node_id {
         return Err(AdoptDocumentError::DifferentIdentity {
             incoming: hex_encode(&doc.node_id),
@@ -2453,10 +2662,15 @@ pub fn revoke_identity_device(
     }
 
     doc.identity_keys.retain(|k| &k.device_id != device_id);
-    let sig = master_sk.sign(&RevokedDevice::signing_message(&doc.node_id, device_id));
+    // The tombstone carries the MASTER's signature, in the master's own
+    // algorithm — a hybrid identity revokes with both halves, exactly as it
+    // certifies with both.
+    let sig = master
+        .sign(&RevokedDevice::signing_message(&doc.node_id, device_id))
+        .map_err(AdoptDocumentError::Delegate)?;
     let tombstone = RevokedDevice {
         device_id: *device_id,
-        master_sig: sig.to_bytes().to_vec(),
+        master_sig: sig,
     };
     let at = doc
         .revoked_devices
@@ -3890,6 +4104,13 @@ mod tests {
         }
     }
 
+    /// An Ed25519 seed cannot act for a HYBRID identity.
+    ///
+    /// It used to be the whole story — a hybrid master could not delegate at
+    /// all. Now it is the narrower rule it should always have been: the seed
+    /// reproduces only the Ed25519 half, and half a master is not the master.
+    /// A hybrid identity delegates with both halves; see
+    /// `a_hybrid_master_delegates_a_second_device`.
     #[test]
     fn delegating_from_a_hybrid_master_names_the_algorithm() {
         let dir = tempdir();
@@ -4284,6 +4505,187 @@ mod tests {
              refuses it, and the operator has to be told at creation"
         );
         assert_eq!(hybrid.document.master_algo, ALGO_ED25519_FALCON512_HYBRID);
+    }
+
+    /// A hybrid identity can admit a second device.
+    ///
+    /// Without this a hybrid master was an identity that could never have more
+    /// than one device: the certificate that admits a device is a MASTER
+    /// signature, and the signing side refused any master that was not a bare
+    /// Ed25519 key. The verifier already accepted hybrid certificates — only
+    /// the half that produces them was missing.
+    #[test]
+    fn a_hybrid_master_delegates_a_second_device() {
+        use veil_proto::identity_document::ALGO_ED25519_FALCON512_HYBRID;
+
+        let dir = tempdir();
+        let out = create_identity(hybrid_opts(dir.clone())).expect("hybrid create");
+        assert_eq!(out.document.master_algo, ALGO_ED25519_FALCON512_HYBRID);
+
+        // Reassemble the master: the Ed25519 half from the seed (the phrase
+        // reproduces it), the Falcon half from the file create_identity
+        // persisted because nothing else can reproduce it.
+        let falcon_path = out
+            .master_falcon_path
+            .clone()
+            .expect("a hybrid create persists the Falcon half");
+        let (falcon_sk, _falcon_pk) =
+            parse_master_falcon_keypair(&std::fs::read(&falcon_path).unwrap()).unwrap();
+        let ed_sk = derive_master_sk_ed25519(&out.master_seed);
+        let mut private_key = Vec::with_capacity(32 + 2 + falcon_sk.len());
+        private_key.extend_from_slice(&ed_sk[..]);
+        private_key.extend_from_slice(&(falcon_sk.len() as u16).to_le_bytes());
+        private_key.extend_from_slice(&falcon_sk);
+        let master = MasterSecret::Hybrid512 {
+            public_key: out.document.master_pubkey.clone(),
+            private_key: Zeroizing::new(private_key),
+        };
+        assert_eq!(master.algo(), ALGO_ED25519_FALCON512_HYBRID);
+        assert_eq!(master.public_key(), out.document.master_pubkey);
+
+        let device: SensitiveBytesN<32> = SensitiveBytesN::from_bytes([0x31u8; 32]);
+        let device_pk = ed25519_dalek::SigningKey::from_bytes(device.as_array())
+            .verifying_key()
+            .as_bytes()
+            .to_vec();
+        let now = out.document.issued_at_unix;
+        let delegated = delegate_device(DelegateDeviceOptions {
+            veil_dir: dir.clone(),
+            master,
+            device_pubkey: device_pk.clone(),
+            now_unix: now,
+            valid_until_unix: now + 7 * 86_400,
+            out_path: None,
+        })
+        .expect("a hybrid master must be able to admit a device");
+
+        // Two devices under one address, and the document still verifies —
+        // which means the hybrid certificate over the new subkey checks out.
+        assert_eq!(delegated.document.identity_keys.len(), 2);
+        assert_eq!(delegated.document.node_id, out.document.node_id);
+        crate::verify::verify_identity_document(&delegated.document, now)
+            .expect("the delegated document must verify");
+        // The admitted key is the one we asked for, and its cert is a HYBRID
+        // signature — far longer than the 64 bytes an Ed25519 master produces.
+        let added = &delegated.document.identity_keys[delegated.new_key_idx as usize];
+        assert_eq!(added.pubkey, device_pk);
+        assert!(
+            added.master_sig.len() > 64,
+            "an Ed25519-length cert means the Falcon half never signed: {}",
+            added.master_sig.len()
+        );
+    }
+
+    /// A device whose delegation has LAPSED renews itself with one secret.
+    ///
+    /// This is the whole point of the primitive: before it existed, an
+    /// identity with a real master had no way to renew a device at all —
+    /// `delegate_device` refuses a key already in the document, and the
+    /// runtime's self-reissue re-signs with the device key, which is the
+    /// master only on a standalone identity. A device that went quiet stayed
+    /// quiet.
+    ///
+    /// Note what is NOT needed: no other device, no network, no new key. The
+    /// device keeps its address and its place in the document.
+    #[test]
+    fn a_lapsed_device_renews_itself_without_being_re_added() {
+        let dir = tempdir();
+        let out = create_identity(test_opts(dir.clone())).expect("create");
+        let issued = out.document.issued_at_unix;
+        let was = out.document.identity_keys[0].clone();
+
+        // Well past the original window — the state a device comes back in.
+        let now = was.valid_until_unix + 86_400;
+        let renewed = reissue_device_delegation(ReissueDelegationOptions {
+            veil_dir: dir.clone(),
+            master: MasterSecret::Seed(out.master_seed.clone()),
+            device_pubkey: None, // this device's own key
+            now_unix: now,
+            valid_until_unix: now + 7 * 86_400,
+            out_path: None,
+        })
+        .expect("a lapsed device must be able to renew itself");
+
+        let after = &renewed.document.identity_keys[renewed.new_key_idx as usize];
+        // Same key, same device, same address — only the window moved.
+        assert_eq!(after.pubkey, was.pubkey, "the device key must not change");
+        assert_eq!(after.device_id, was.device_id);
+        assert_eq!(renewed.document.node_id, out.document.node_id);
+        assert_eq!(renewed.document.identity_keys.len(), 1, "no second entry");
+        assert!(after.valid_until_unix > was.valid_until_unix);
+        assert_ne!(
+            after.master_sig, was.master_sig,
+            "the certificate must be re-signed for the new window"
+        );
+        assert_ne!(issued, renewed.document.issued_at_unix);
+
+        // And it verifies AT THE NEW TIME, which is what "back on the network"
+        // means.
+        crate::verify::verify_identity_document(&renewed.document, now)
+            .expect("the renewed document must verify now");
+    }
+
+    /// Renewal refreshes; it never admits.
+    #[test]
+    fn renewal_refuses_a_device_the_document_does_not_name() {
+        let dir = tempdir();
+        let out = create_identity(test_opts(dir.clone())).expect("create");
+        let stranger = ed25519_dalek::SigningKey::from_bytes(&[0x44u8; 32])
+            .verifying_key()
+            .to_bytes()
+            .to_vec();
+        let now = out.document.issued_at_unix;
+        let err = reissue_device_delegation(ReissueDelegationOptions {
+            veil_dir: dir,
+            master: MasterSecret::Seed(out.master_seed.clone()),
+            device_pubkey: Some(stranger),
+            now_unix: now,
+            valid_until_unix: now + 7 * 86_400,
+            out_path: None,
+        })
+        .unwrap_err();
+        assert!(
+            matches!(err, DelegateDeviceError::NotPresent { .. }),
+            "renewal must not become a back door for admitting a device: {err:?}"
+        );
+    }
+
+    /// A tombstoned device may never come back — renewal is not a way around
+    /// the revocation that retired it.
+    ///
+    /// The fixture revokes through the real flow on purpose: a hand-made
+    /// document naming a key both live and revoked does not even decode, so
+    /// the only reachable shape is the true one — the key gone from
+    /// `identity_keys`, its tombstone behind it.
+    #[test]
+    fn renewal_refuses_a_revoked_device() {
+        let seed = create_identity(test_opts(tempdir())).unwrap().master_seed;
+        let a = tempdir();
+        let b = tempdir();
+        provision(a.clone(), seed.clone());
+        provision(b.clone(), seed.clone());
+
+        let b_pk = device_pubkey(&b);
+        delegate_device(delegate_opts(a.clone(), seed.clone(), b_pk.clone())).unwrap();
+        let b_id = veil_crypto::identity::compute_node_id(&b_pk);
+        assert!(
+            revoke_identity_device(&a, MasterSecret::Seed(seed.clone()), &b_id, DELEGATE_NOW)
+                .expect("revoke"),
+        );
+
+        let err = reissue_device_delegation(ReissueDelegationOptions {
+            veil_dir: a,
+            master: MasterSecret::Seed(seed),
+            device_pubkey: Some(b_pk),
+            now_unix: DELEGATE_NOW,
+            valid_until_unix: DELEGATE_NOW + 7 * 86_400,
+            out_path: None,
+        })
+        .unwrap_err();
+        assert!(
+            matches!(err, DelegateDeviceError::Revoked { .. }),
+            "a revoked device must not be renewable: {err:?}"
+        );
     }
 
     #[test]
