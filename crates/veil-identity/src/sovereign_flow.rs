@@ -157,21 +157,27 @@ pub struct CreateIdentityOptions {
 // Keep this in sync if secret-bearing fields are added (diff-audit defect M7).
 /// Whether an identity with this master algorithm can add or remove devices.
 ///
-/// It is not a property of the device flows themselves — `delegate_device`,
-/// `adopt_identity_document` and `revoke_identity_device` all refuse anything
-/// but Ed25519 with `UnsupportedMasterAlgo`, because a hybrid master cannot
-/// match a node_id hashed over its 929-byte public key and the lifecycle has
-/// no algorithm-generic signer behind it yet.
+/// It is a property of the SIGNER behind the device flows, not of the flows:
+/// `delegate_device`, `adopt_identity_document` and `revoke_identity_device`
+/// each check `doc.master_algo == master.algo()` and then ask the master to
+/// sign, so an algorithm can join the lifecycle the moment [`MasterSecret`]
+/// can produce a signature for it.
 ///
-/// The refusals are fail-fast and write nothing, so nothing is CORRUPTED by
-/// this. What was missing is that an operator learned it at the moment they
-/// tried to link a second phone, or to revoke a stolen one — long after the
-/// identity was created and the choice was expensive to unmake
-/// (report14 V14-M12). Creation reports it now, in
+/// Ed25519 always could. The HYBRID master can since the Falcon half was
+/// plumbed through [`MasterSecret::Hybrid512`] — it certifies a subkey with
+/// both halves and revokes with both — so a hybrid identity is no longer
+/// single-device. Standalone Falcon-512 still is: nothing holds that key in a
+/// form these flows can sign with.
+///
+/// The refusals are fail-fast and write nothing, so nothing is CORRUPTED when
+/// an algorithm is outside this. What was missing is that an operator learned
+/// it at the moment they tried to link a second phone, or to revoke a stolen
+/// one — long after the identity was created and the choice was expensive to
+/// unmake (report14 V14-M12). Creation reports it, in
 /// [`CreateIdentityOutput::supports_device_lifecycle`].
 #[must_use]
 pub fn master_algo_supports_device_lifecycle(master_algo: u8) -> bool {
-    master_algo == ALGO_ED25519
+    master_algo == ALGO_ED25519 || master_algo == ALGO_ED25519_FALCON512_HYBRID
 }
 
 pub struct CreateIdentityOutput {
@@ -200,10 +206,11 @@ pub struct CreateIdentityOutput {
     pub encrypted_master_path: Option<PathBuf>,
     /// Whether this identity can add or remove DEVICES.
     ///
-    /// `false` for a hybrid or standalone-Falcon master: the device lifecycle
-    /// refuses those, so such an identity is single-device for as long as that
+    /// `false` for a standalone-Falcon master: the device lifecycle has no
+    /// signer for it, so such an identity is single-device for as long as that
     /// is true — a phone linked to it cannot be added, and one that is stolen
-    /// cannot be revoked. See
+    /// cannot be revoked. True for Ed25519 and for the hybrid master, which
+    /// signs with both halves. See
     /// [`master_algo_supports_device_lifecycle`] (report14 V14-M12).
     ///
     /// Reported HERE because this is the only moment the choice is cheap.
@@ -1645,6 +1652,44 @@ pub fn save_master_falcon_keypair(
     veil_util::atomic_write_owner_only(&path, &framed)
 }
 
+/// The hybrid master, assembled from the two halves an operator actually holds.
+///
+/// The Ed25519 half comes from the recovery seed — the 24 words reproduce it —
+/// and the Falcon half from a `master_falcon.bin` bundle, which nothing
+/// reproduces: it is minted once and that file (or the encrypted credential
+/// carrying the same bytes) is its only copy. Losing it does not lose the
+/// identity's *words*, it loses the identity's *address*, because the address
+/// is BLAKE3 over both halves.
+///
+/// Here rather than at each caller: the layout is positional on both sides —
+/// public `ed_pk ‖ falcon_pk`, private `ed_sk ‖ u16-LE len ‖ falcon_sk` — and a
+/// second hand-rolled copy of a positional layout is a silent wrong answer,
+/// not a compile error. `create_identity` writes it, `sovereign_bundle` reads
+/// it back out of a credential, and this is how a caller holding the FILE
+/// builds the same thing.
+pub fn hybrid512_master_from_parts(
+    master_seed: &[u8; MASTER_SEED_LEN],
+    falcon_keypair_bundle: &[u8],
+) -> std::io::Result<MasterSecret> {
+    let (falcon_sk, falcon_pk) = parse_master_falcon_keypair(falcon_keypair_bundle)?;
+    let ed_sk = derive_master_sk_ed25519(master_seed);
+    let ed_pk = SigningKey::from_bytes(&ed_sk).verifying_key();
+
+    let mut public_key = Vec::with_capacity(32 + falcon_pk.len());
+    public_key.extend_from_slice(ed_pk.as_bytes());
+    public_key.extend_from_slice(&falcon_pk);
+
+    let mut private_key = Vec::with_capacity(32 + 2 + falcon_sk.len());
+    private_key.extend_from_slice(&ed_sk[..]);
+    private_key.extend_from_slice(&(falcon_sk.len() as u16).to_le_bytes());
+    private_key.extend_from_slice(&falcon_sk);
+
+    Ok(MasterSecret::Hybrid512 {
+        public_key,
+        private_key: Zeroizing::new(private_key),
+    })
+}
+
 /// parse the framed `master_falcon.bin` bundle into
 /// `(sk_bytes, pk_bytes)`. Caller is the one that already loaded the
 /// file's contents — splitting parse from I/O makes the function
@@ -1777,10 +1822,17 @@ pub enum DelegateDeviceError {
          the document carries {document}"
     )]
     WrongMaster { computed: String, document: String },
+    // Says which master the DOCUMENT wants, because the failure is almost
+    // always a caller that brought the wrong kind — not an identity that
+    // cannot do this. The old text said the device lifecycle was Ed25519-only
+    // and advised re-creating the identity, which stopped being true when the
+    // hybrid master gained a signer, and would have cost the operator their
+    // address for nothing.
     #[error(
-        "this identity's master is algo {algo} (1 = Ed25519); the multi-device \
-         operations sign with an Ed25519 master only, so they cannot act on it. \
-         Re-create the identity as Ed25519 to use several devices"
+        "this identity's master is algo {algo} (1 = Ed25519, \
+         3 = Ed25519+Falcon-512) and the secret offered is not that kind. \
+         A hybrid identity signs with the credential — open it and pass it \
+         alongside the secret; the words alone build only the Ed25519 half"
     )]
     UnsupportedMasterAlgo { algo: u8 },
     #[error(
@@ -4490,8 +4542,14 @@ mod tests {
         use veil_types::SignatureAlgorithm;
 
         assert!(master_algo_supports_device_lifecycle(ALGO_ED25519));
-        assert!(!master_algo_supports_device_lifecycle(
+        // The hybrid master joined the lifecycle when its Falcon half gained a
+        // signer; `a_hybrid_master_delegates_a_second_device` is the proof.
+        // Standalone Falcon-512 has none, and is the case this still reports.
+        assert!(master_algo_supports_device_lifecycle(
             ALGO_ED25519_FALCON512_HYBRID
+        ));
+        assert!(!master_algo_supports_device_lifecycle(
+            veil_proto::identity_document::ALGO_FALCON512
         ));
 
         let issued = 1_700_000_000u64;
@@ -4520,9 +4578,9 @@ mod tests {
 
         let hybrid = make(SignatureAlgorithm::Ed25519Falcon512Hybrid);
         assert!(
-            !hybrid.supports_device_lifecycle,
-            "a hybrid identity is single-device for as long as the lifecycle \
-             refuses it, and the operator has to be told at creation"
+            hybrid.supports_device_lifecycle,
+            "a hybrid identity admits and revokes devices — saying otherwise \
+             at creation sends the operator to a weaker master for no reason"
         );
         assert_eq!(hybrid.document.master_algo, ALGO_ED25519_FALCON512_HYBRID);
     }
@@ -4542,26 +4600,28 @@ mod tests {
         let out = create_identity(hybrid_opts(dir.clone())).expect("hybrid create");
         assert_eq!(out.document.master_algo, ALGO_ED25519_FALCON512_HYBRID);
 
-        // Reassemble the master: the Ed25519 half from the seed (the phrase
-        // reproduces it), the Falcon half from the file create_identity
-        // persisted because nothing else can reproduce it.
+        // Reassemble the master from the two halves an operator holds: the
+        // Ed25519 one from the seed (the phrase reproduces it), the Falcon one
+        // from the file create_identity persisted because nothing else can.
+        //
+        // Through the shared constructor on purpose. It used to be assembled
+        // by hand here, which meant the test could not tell a correct layout
+        // from one that merely agreed with itself — the assertion below is now
+        // a real check that what a FILE-holding caller builds is the master the
+        // document names.
         let falcon_path = out
             .master_falcon_path
             .clone()
             .expect("a hybrid create persists the Falcon half");
-        let (falcon_sk, _falcon_pk) =
-            parse_master_falcon_keypair(&std::fs::read(&falcon_path).unwrap()).unwrap();
-        let ed_sk = derive_master_sk_ed25519(&out.master_seed);
-        let mut private_key = Vec::with_capacity(32 + 2 + falcon_sk.len());
-        private_key.extend_from_slice(&ed_sk[..]);
-        private_key.extend_from_slice(&(falcon_sk.len() as u16).to_le_bytes());
-        private_key.extend_from_slice(&falcon_sk);
-        let master = MasterSecret::Hybrid512 {
-            public_key: out.document.master_pubkey.clone(),
-            private_key: Zeroizing::new(private_key),
-        };
+        let master =
+            hybrid512_master_from_parts(&out.master_seed, &std::fs::read(&falcon_path).unwrap())
+                .expect("the two halves reassemble");
         assert_eq!(master.algo(), ALGO_ED25519_FALCON512_HYBRID);
-        assert_eq!(master.public_key(), out.document.master_pubkey);
+        assert_eq!(
+            master.public_key(),
+            out.document.master_pubkey,
+            "the reassembled master must be the one the document is named by"
+        );
 
         let device: SensitiveBytesN<32> = SensitiveBytesN::from_bytes([0x31u8; 32]);
         let device_pk = ed25519_dalek::SigningKey::from_bytes(device.as_array())

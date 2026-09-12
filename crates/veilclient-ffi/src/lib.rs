@@ -5766,96 +5766,21 @@ pub unsafe extern "C" fn veil_delegate_device_from_phrase_zeroize(
     device_pubkey_len: usize,
     err_out: *mut *mut c_char,
 ) -> c_int {
+    // ONE body. This is [`veil_delegate_device_zeroize`] with no credential,
+    // so the phrase path and the credential path cannot drift on what they
+    // refuse, what they wipe, or which master they end up using.
     unsafe {
-        clear_err(err_out);
-    }
-    if phrase.is_null() {
-        unsafe {
-            write_err(err_out, "phrase is NULL");
-        }
-        return VEIL_ERR_INVALID_ARG;
-    }
-    if phrase_len > MAX_FFI_CSTR_LEN {
-        unsafe {
-            write_err(err_out, "phrase too long (>4 KiB)");
-        }
-        return VEIL_ERR_INVALID_ARG;
-    }
-
-    let Some(_guard) = (unsafe { ZeroOnDrop::arm(phrase, phrase_len) }) else {
-        unsafe { write_err(err_out, "phrase is NULL or too long (>4 KiB)") };
-        return VEIL_ERR_INVALID_ARG;
-    };
-
-    let phrase_bytes = unsafe { std::slice::from_raw_parts(phrase as *const u8, phrase_len) };
-    let phrase_str = match std::str::from_utf8(phrase_bytes) {
-        Ok(s) => s,
-        Err(_) => {
-            unsafe {
-                write_err(err_out, "phrase is not valid UTF-8");
-            }
-            return VEIL_ERR_INVALID_ARG;
-        }
-    };
-    let Some(dir_str) = (unsafe { slice_to_str(veil_dir, veil_dir_len) }) else {
-        unsafe {
-            write_err(err_out, "veil_dir is NULL or invalid UTF-8");
-        }
-        return VEIL_ERR_INVALID_ARG;
-    };
-    let dir = std::path::PathBuf::from(dir_str);
-
-    // NULL means "my own key". Resolved here rather than left to the caller so
-    // an application never has to load, carry or pass a signing key.
-    let pubkey: Vec<u8> = if device_pubkey.is_null() {
-        match veil_identity::sovereign_flow::load_identity_sk(&dir) {
-            Ok(seed) => ed25519_dalek::SigningKey::from_bytes(seed.as_array())
-                .verifying_key()
-                .as_bytes()
-                .to_vec(),
-            Err(e) => {
-                unsafe {
-                    write_err(err_out, format!("load own device key: {e}"));
-                }
-                return VEIL_ERR;
-            }
-        }
-    } else {
-        unsafe { std::slice::from_raw_parts(device_pubkey, device_pubkey_len) }.to_vec()
-    };
-
-    let master_seed = match veil_identity::master_seed::decode_master_seed_from_phrase(phrase_str) {
-        Ok(s) => s,
-        Err(e) => {
-            unsafe {
-                write_err(err_out, format!("decode phrase: {e}"));
-            }
-            return VEIL_ERR;
-        }
-    };
-
-    let now_unix = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-
-    match veil_identity::sovereign_flow::delegate_device(
-        veil_identity::sovereign_flow::DelegateDeviceOptions {
-            veil_dir: dir,
-            master: veil_identity::sovereign_flow::MasterSecret::Seed(master_seed),
-            device_pubkey: pubkey,
-            now_unix,
-            valid_until_unix: now_unix + VEIL_DEFAULT_RESTORE_VALIDITY_SECS,
-            out_path: None,
-        },
-    ) {
-        Ok(_output) => VEIL_OK,
-        Err(e) => {
-            unsafe {
-                write_err(err_out, format!("delegate_device: {e}"));
-            }
-            VEIL_ERR
-        }
+        veil_delegate_device_zeroize(
+            std::ptr::null(),
+            0,
+            phrase,
+            phrase_len,
+            veil_dir,
+            veil_dir_len,
+            device_pubkey,
+            device_pubkey_len,
+            err_out,
+        )
     }
 }
 
@@ -5976,6 +5901,176 @@ pub unsafe extern "C" fn veil_reissue_device_delegation_zeroize(
         Ok(_) => VEIL_OK,
         Err(e) => {
             unsafe { write_err(err_out, format!("reissue_device_delegation: {e}")) };
+            VEIL_ERR
+        }
+    }
+}
+
+/// The master a device-lifecycle call signs with.
+///
+/// Chosen the way the boot chooses which identity a secret names: a
+/// `credential` means the HYBRID master, opened with `secret`; none means the
+/// Ed25519 master `secret` gives as a BIP-39 phrase.
+///
+/// In ONE place on purpose. The three entry points that amend a document under
+/// the master used to choose separately, and the two that ADD and REMOVE a
+/// device chose "the phrase, always". A hybrid master is 929 bytes of
+/// Ed25519+Falcon-512 and the identity's address is BLAKE3 over all of them,
+/// so those two refused every hybrid identity with `UnsupportedMasterAlgo`: an
+/// app that creates hybrid identities — xVeil does, by default — could never
+/// link a second device to one, nor revoke a stolen one. The flows underneath
+/// had been algorithm-generic for a while; only the choice of master here was
+/// not, and nothing noticed because the two stands it takes to see it are two
+/// devices.
+///
+/// # Safety
+/// `credential` readable for `credential_len` or NULL; `err_out` a writable
+/// slot.
+unsafe fn master_secret_for_device_lifecycle(
+    credential: *const u8,
+    credential_len: usize,
+    secret_bytes: &[u8],
+    err_out: *mut *mut c_char,
+) -> Result<veil_identity::sovereign_flow::MasterSecret, c_int> {
+    if credential.is_null() || credential_len == 0 {
+        // No credential: the classic identity, whose master the words give.
+        let Ok(phrase_str) = std::str::from_utf8(secret_bytes) else {
+            unsafe { write_err(err_out, "secret is not valid UTF-8") };
+            return Err(VEIL_ERR_INVALID_ARG);
+        };
+        return match veil_identity::master_seed::decode_master_seed_from_phrase(phrase_str) {
+            Ok(seed) => Ok(veil_identity::sovereign_flow::MasterSecret::Seed(seed)),
+            Err(e) => {
+                unsafe { write_err(err_out, format!("decode phrase: {e}")) };
+                Err(VEIL_ERR)
+            }
+        };
+    }
+    let credential_bytes = unsafe { std::slice::from_raw_parts(credential, credential_len) };
+    let opened = if credential_bytes.starts_with(b"XVRC") {
+        veil_identity::sovereign_bundle::open_recovery_certificate(credential_bytes, secret_bytes)
+    } else {
+        veil_identity::sovereign_bundle::open(credential_bytes, secret_bytes)
+    };
+    match opened {
+        Ok(material) => match material.as_master_secret() {
+            Some(m) => Ok(m),
+            None => {
+                unsafe {
+                    write_err(
+                        err_out,
+                        "this credential is not Ed25519+Falcon-512, so it names no \
+                         hybrid master",
+                    )
+                };
+                Err(VEIL_ERR_INVALID_ARG)
+            }
+        },
+        Err(e) => {
+            unsafe { write_err(err_out, format!("credential did not open: {e}")) };
+            Err(VEIL_ERR_INVALID_ARG)
+        }
+    }
+}
+
+/// Admit a device into this identity's document under the master — hybrid or
+/// classic.
+///
+/// The call an application should make. Everything
+/// `veil_delegate_device_from_phrase_zeroize` documents holds here; the one
+/// difference is WHICH master signs the new subkey's certificate, and it
+/// follows the credential exactly as renewal and the boot decide it. The
+/// phrase-only sibling stays for a classic identity and forwards here with no
+/// credential, so the two can no longer disagree.
+///
+/// `credential` may be NULL (a classic identity, `secret` is the phrase) or a
+/// sovereign bundle / `XVRC` recovery certificate, which `secret` opens.
+///
+/// `device_pubkey` may be NULL, and for an embedding application that is the
+/// usual call: it means "this device's own key", read from
+/// `device_identity_sk.bin` in `veil_dir`.
+///
+/// `secret` is SECRET — a writable `(*mut u8, len)` buffer, overwritten with
+/// `0` before return on EVERY path.
+///
+/// # Safety
+/// `credential` readable for `credential_len` or NULL; `secret` writable for
+/// `secret_len` and wiped on every path; `veil_dir` readable for its length;
+/// `device_pubkey` readable for its length or NULL; `err_out` a writable slot.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn veil_delegate_device_zeroize(
+    credential: *const u8,
+    credential_len: usize,
+    secret: *mut u8,
+    secret_len: usize,
+    veil_dir: *const u8,
+    veil_dir_len: usize,
+    device_pubkey: *const u8,
+    device_pubkey_len: usize,
+    err_out: *mut *mut c_char,
+) -> c_int {
+    unsafe {
+        clear_err(err_out);
+    }
+    let Some(_guard) = (unsafe { ZeroOnDrop::arm(secret, secret_len) }) else {
+        unsafe { write_err(err_out, "secret is NULL or too long (>4 KiB)") };
+        return VEIL_ERR_INVALID_ARG;
+    };
+    let Some(dir_str) = (unsafe { slice_to_str(veil_dir, veil_dir_len) }) else {
+        unsafe {
+            write_err(err_out, "veil_dir is NULL or invalid UTF-8");
+        }
+        return VEIL_ERR_INVALID_ARG;
+    };
+    let dir = std::path::PathBuf::from(dir_str);
+    let secret_bytes = unsafe { std::slice::from_raw_parts(secret as *const u8, secret_len) };
+
+    // NULL means "my own key". Resolved here rather than left to the caller so
+    // an application never has to load, carry or pass a signing key.
+    let pubkey: Vec<u8> = if device_pubkey.is_null() {
+        match veil_identity::sovereign_flow::load_identity_sk(&dir) {
+            Ok(seed) => ed25519_dalek::SigningKey::from_bytes(seed.as_array())
+                .verifying_key()
+                .as_bytes()
+                .to_vec(),
+            Err(e) => {
+                unsafe {
+                    write_err(err_out, format!("load own device key: {e}"));
+                }
+                return VEIL_ERR;
+            }
+        }
+    } else {
+        unsafe { std::slice::from_raw_parts(device_pubkey, device_pubkey_len) }.to_vec()
+    };
+
+    let master = match unsafe {
+        master_secret_for_device_lifecycle(credential, credential_len, secret_bytes, err_out)
+    } {
+        Ok(m) => m,
+        Err(code) => return code,
+    };
+
+    let now_unix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+
+    match veil_identity::sovereign_flow::delegate_device(
+        veil_identity::sovereign_flow::DelegateDeviceOptions {
+            veil_dir: dir,
+            master,
+            device_pubkey: pubkey,
+            now_unix,
+            valid_until_unix: now_unix + VEIL_DEFAULT_RESTORE_VALIDITY_SECS,
+            out_path: None,
+        },
+    ) {
+        Ok(_output) => VEIL_OK,
+        Err(e) => {
+            unsafe {
+                write_err(err_out, format!("delegate_device: {e}"));
+            }
             VEIL_ERR
         }
     }
@@ -6378,18 +6473,63 @@ pub unsafe extern "C" fn veil_revoke_identity_device_from_phrase_zeroize(
     changed_out: *mut u8,
     err_out: *mut *mut c_char,
 ) -> c_int {
+    // ONE body. This is [`veil_revoke_identity_device_zeroize`] with no
+    // credential, so the phrase path and the credential path cannot drift on
+    // what they refuse, what they wipe, or which master they end up using.
+    unsafe {
+        veil_revoke_identity_device_zeroize(
+            std::ptr::null(),
+            0,
+            phrase,
+            phrase_len,
+            veil_dir,
+            veil_dir_len,
+            device_id,
+            changed_out,
+            err_out,
+        )
+    }
+}
+
+/// Tombstone a device in this identity's document under the master — hybrid or
+/// classic.
+///
+/// The call an application should make, and the twin of
+/// [`veil_delegate_device_zeroize`]: everything
+/// `veil_revoke_identity_device_from_phrase_zeroize` documents holds, and the
+/// master that signs the tombstone follows the credential rather than being
+/// assumed to be a phrase. Revoking a stolen device is the operation an
+/// identity can least afford to refuse, and on a hybrid identity it did.
+///
+/// `credential` may be NULL (a classic identity, `secret` is the phrase) or a
+/// sovereign bundle / `XVRC` recovery certificate, which `secret` opens.
+/// `device_id` is the 32-byte device address (BLAKE3 of its pubkey). Writes 1
+/// to `changed_out` when the document changed, 0 when the device was already
+/// tombstoned.
+///
+/// # Safety
+/// `credential` readable for `credential_len` or NULL; `secret` writable for
+/// `secret_len` and wiped on every path; `veil_dir` readable for its length;
+/// `device_id` readable for 32 bytes; `changed_out` a writable byte or NULL;
+/// `err_out` a writable slot.
+#[cfg(feature = "node-embedded")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn veil_revoke_identity_device_zeroize(
+    credential: *const u8,
+    credential_len: usize,
+    secret: *mut u8,
+    secret_len: usize,
+    veil_dir: *const u8,
+    veil_dir_len: usize,
+    device_id: *const u8,
+    changed_out: *mut u8,
+    err_out: *mut *mut c_char,
+) -> c_int {
     unsafe {
         clear_err(err_out);
     }
-    if phrase_len > MAX_FFI_CSTR_LEN {
-        unsafe {
-            write_err(err_out, "phrase too long (>4 KiB)");
-        }
-        return VEIL_ERR_INVALID_ARG;
-    }
-
-    let Some(_guard) = (unsafe { ZeroOnDrop::arm(phrase, phrase_len) }) else {
-        unsafe { write_err(err_out, "phrase is NULL or too long (>4 KiB)") };
+    let Some(_guard) = (unsafe { ZeroOnDrop::arm(secret, secret_len) }) else {
+        unsafe { write_err(err_out, "secret is NULL or too long (>4 KiB)") };
         return VEIL_ERR_INVALID_ARG;
     };
 
@@ -6397,35 +6537,26 @@ pub unsafe extern "C" fn veil_revoke_identity_device_from_phrase_zeroize(
     // error with the caller's secret still sitting in their memory (report14
     // V14-M14). The secret's own pointer and length are `arm`'s business
     // above; this is only about the rest.
-    if phrase.is_null() || device_id.is_null() {
+    if device_id.is_null() {
         unsafe {
-            write_err(err_out, "phrase or device_id is NULL");
+            write_err(err_out, "device_id is NULL");
         }
         return VEIL_ERR_INVALID_ARG;
     }
-
-    let bytes = unsafe { std::slice::from_raw_parts(phrase as *const u8, phrase_len) };
-    let Ok(text) = std::str::from_utf8(bytes) else {
-        unsafe {
-            write_err(err_out, "phrase is not valid UTF-8");
-        }
-        return VEIL_ERR_INVALID_ARG;
-    };
     let Some(dir_str) = (unsafe { slice_to_str(veil_dir, veil_dir_len) }) else {
         unsafe {
             write_err(err_out, "veil_dir is NULL or invalid UTF-8");
         }
         return VEIL_ERR_INVALID_ARG;
     };
-    let seed = match veil_identity::master_seed::decode_master_seed_from_phrase(text) {
-        Ok(s) => s,
-        Err(e) => {
-            unsafe {
-                write_err(err_out, format!("decode phrase: {e}"));
-            }
-            return VEIL_ERR;
-        }
+    let secret_bytes = unsafe { std::slice::from_raw_parts(secret as *const u8, secret_len) };
+    let master = match unsafe {
+        master_secret_for_device_lifecycle(credential, credential_len, secret_bytes, err_out)
+    } {
+        Ok(m) => m,
+        Err(code) => return code,
     };
+
     let mut id = [0u8; 32];
     id.copy_from_slice(unsafe { std::slice::from_raw_parts(device_id, 32) });
 
@@ -6436,7 +6567,7 @@ pub unsafe extern "C" fn veil_revoke_identity_device_from_phrase_zeroize(
 
     match veil_identity::sovereign_flow::revoke_identity_device(
         std::path::Path::new(dir_str),
-        veil_identity::sovereign_flow::MasterSecret::Seed(seed),
+        master,
         &id,
         now_unix,
     ) {
