@@ -733,17 +733,35 @@ impl AnycastService {
                             // binding checks call `verify_record_signature`
                             // internally.
                             //
-                            // Which binding applies is the record's own claim:
-                            // index 0 says the signer IS the master, so its
-                            // hash must be the address; any other index says a
-                            // device of that identity signed, and the identity
-                            // document is what ties it to the address. Only
-                            // one device of an identity can hold the master,
-                            // so refusing the second case refuses every
-                            // multi-device identity — the case anycast is for.
+                            // Two ways to tie a record to its address, and
+                            // the index does not choose between them — it
+                            // only says WHERE in the document to look.
+                            //
+                            // The direct one first because it needs nothing
+                            // off the network: `BLAKE3(owner_pubkey) ==
+                            // node_id` proves the signer holds the master,
+                            // which is the whole binding. That is the legacy
+                            // and standalone shape, where the device key IS
+                            // the master.
+                            //
+                            // Otherwise the identity document is what ties
+                            // the signing key to the address — AT ANY INDEX,
+                            // index 0 included. `create_identity` mints a
+                            // device subkey and files it at index 0, so the
+                            // FIRST device of every identity the CLI or the
+                            // app ever created signs at index 0 with a key
+                            // that is not the master. Reading index 0 as "the
+                            // signer is the master" and stopping there
+                            // refused exactly those records — not only the
+                            // second device and later, as the multi-device
+                            // case was meant to cover, but every device of
+                            // every real identity.
+                            if verify_record_owner_binding(r).is_ok() {
+                                return true;
+                            }
                             let idx = r.signature.as_ref().map(|s| s.sig_key_idx);
                             return match idx {
-                                Some(0) | None => verify_record_owner_binding(r).is_ok(),
+                                None => false,
                                 Some(idx) => self
                                     .delegation_lookup
                                     .as_ref()
@@ -1646,6 +1664,74 @@ mod tests {
                 .node_ids
                 .is_empty(),
             "a mismatched document key must not admit the record"
+        );
+    }
+
+    /// Index 0 is a device key too, and the document is what binds it.
+    ///
+    /// `create_identity` mints a device subkey and files it at index 0 — the
+    /// master is a separate field of the document, not an entry in the key
+    /// list. So the FIRST device of every identity the CLI or the app ever
+    /// created signs at index 0 with a key that does not hash to the address.
+    /// Reading index 0 as "the signer must BE the master" refused those
+    /// records: not only the second device and later, but every device of
+    /// every real identity — leaving anycast working for legacy and
+    /// auto-built standalone nodes alone, which are the only ones whose
+    /// device key IS their master.
+    #[test]
+    fn resolve_signed_bound_admits_the_first_device_at_index_zero() {
+        let device = make_signing_key(0x81);
+        let device_pk = device.verifying_key().to_bytes().to_vec();
+        let identity_id = [0x88u8; 32];
+        assert_ne!(
+            bound_node_id_for(&device),
+            identity_id,
+            "the device key must not hash to the address, or this proves nothing"
+        );
+
+        let dht = Arc::new(KademliaService::new([0xA1; 32]));
+        let dht_key = AnycastRecord::dht_key(*b"vip0");
+        let mut list = AnycastList::default();
+        list.upsert(AnycastRecord::sign(
+            *b"vip0",
+            identity_id,
+            5,
+            3600,
+            0,
+            &device,
+        ));
+        dht.store_local(dht_key, list.encode());
+
+        let pk = device_pk.clone();
+        let svc = AnycastService::new(Arc::clone(&dht), [0xA1; 32]).with_delegation_lookup(
+            Arc::new(move |node_id: &[u8; 32], idx: u8| {
+                (*node_id == identity_id && idx == 0).then(|| pk.clone())
+            }),
+        );
+        assert_eq!(
+            svc.resolve_signed_bound(*b"vip0", 32).node_ids,
+            vec![identity_id],
+            "the identity's first device must be admitted on its own address"
+        );
+
+        // And the proof is still a proof: a lookup naming a different key
+        // refuses, exactly as at any other index.
+        let other = make_signing_key(0x82).verifying_key().to_bytes().to_vec();
+        let svc_wrong = AnycastService::new(Arc::clone(&dht), [0xA1; 32])
+            .with_delegation_lookup(Arc::new(move |_, _| Some(other.clone())));
+        assert!(
+            svc_wrong
+                .resolve_signed_bound(*b"vip0", 32)
+                .node_ids
+                .is_empty(),
+            "index 0 must be bound by the document, not waved through"
+        );
+
+        // A resolver holding nothing still admits nothing.
+        let bare = AnycastService::new(Arc::clone(&dht), [0xA1; 32]);
+        assert!(
+            bare.resolve_signed_bound(*b"vip0", 32).node_ids.is_empty(),
+            "without a document there is no binding to check"
         );
     }
 

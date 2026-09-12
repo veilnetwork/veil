@@ -171,112 +171,7 @@ impl NodeRuntime {
         if let Some(ref m) = self.metrics {
             server = server.with_metrics(Arc::clone(m) as Arc<dyn veil_ipc::IpcMetrics>);
         }
-        let anycast_policy = match config.anycast.resolve_policy {
-            veil_cfg::AnycastResolvePolicyKind::BestEffort => {
-                veil_anycast::AnycastResolvePolicy::BestEffort
-            }
-            veil_cfg::AnycastResolvePolicyKind::SignedOnly => {
-                veil_anycast::AnycastResolvePolicy::SignedOnly
-            }
-            veil_cfg::AnycastResolvePolicyKind::SignedBound => {
-                veil_anycast::AnycastResolvePolicy::SignedBound
-            }
-        };
-        // Audit batch 2026-05-25 phase O (cross-audit #3 closure):
-        // if sovereign identity wired AND uses Ed25519, configure
-        // anycast to auto-sign all advertise calls (including those
-        // initiated through IPC `AnycastAdvertise`).  Resolvers running
-        // `SignedOnly` / `SignedBound` will admit our records.  PQ-only
-        // sovereign identities (Falcon-512) fall through to unsigned
-        // v1 advertise — caller-side opt-in to sign would require Falcon
-        // anycast support, which is a separate wire-compat exercise.
-        let mut anycast_svc_builder = veil_anycast::AnycastService::new(
-            Arc::clone(&self.dht),
-            *self.identity.local_identity.node_id.as_bytes(),
-        )
-        .with_policy(anycast_policy);
-        if let Some(sov) = self.identity.sovereign_identity.get() {
-            // Algo-generic owner-signer: signs v2 (Ed25519) OR v3 (Falcon-512 /
-            // hybrid) records, so a PQ-only sovereign signs too instead of
-            // falling back to unsigned advertise. The index comes WITH the key:
-            // 0 on a device whose own key is the master (self-signed binding),
-            // its own index on every other device (the document proves the
-            // binding). Several nodes answering on one identity address is what
-            // anycast is for, and pinning this to 0 disabled exactly that.
-            if let Some((algo_byte, owner_pubkey, sig_key_idx, sign)) = sov.anycast_owner_signer() {
-                match veil_types::SignatureAlgorithm::from_wire_byte(algo_byte) {
-                    Some(algo) => {
-                        anycast_svc_builder = anycast_svc_builder.with_signer(
-                            veil_anycast::AnycastSigner::new(algo, owner_pubkey, sig_key_idx, sign),
-                        );
-                    }
-                    None => {
-                        // Unreachable in practice: `identity_sk.algo()` only ever
-                        // yields a known wire byte. Guard rather than panic.
-                        self.logger.warn(
-                            "anycast.signing.unknown_algo",
-                            "sovereign identity reports an unrecognized signature \
-                             algorithm byte: anycast records will be published \
-                             UNSIGNED",
-                        );
-                    }
-                }
-            } else {
-                // A device of an identity signs with its own key at its own
-                // index, so this is no longer the multi-device case — that one
-                // advertises. What is left is an identity whose active key sits
-                // past index 255, which the record's `sig_key_idx` field cannot
-                // name. Nothing can be signed for it; say so rather than let
-                // unsigned records go out and be dropped in silence.
-                self.logger.warn(
-                    "anycast.signing.index_out_of_range",
-                    "sovereign identity's active device key is past index 255, \
-                     which an anycast record cannot name: records are published \
-                     UNSIGNED and dropped by peers running the default \
-                     SignedBound resolve policy",
-                );
-            }
-        }
-        // Admit records signed by a DEVICE of an identity, not only by its
-        // master. Every device of one identity answers on the same address, so
-        // without this the strict resolve policy drops every multi-device
-        // identity — which is the arrangement anycast exists to serve.
-        //
-        // The local shard only, on purpose: the filter it feeds is
-        // synchronous, and a resolve must not block on a DHT walk. A node that
-        // does not hold the document answers `None` and drops the record, the
-        // same conservative outcome as before delegation existed. The K-closest
-        // to an identity DO hold it, and so does a node that has talked to that
-        // identity.
-        {
-            let dht = Arc::clone(&self.dht);
-            anycast_svc_builder = anycast_svc_builder.with_delegation_lookup(std::sync::Arc::new(
-                move |node_id: &[u8; 32], idx: u8| {
-                    let key = veil_proto::identity_document::IdentityDocument::dht_key(node_id);
-                    let bytes = dht.get_local(&key)?;
-                    let doc =
-                        veil_proto::identity_document::IdentityDocument::decode(&bytes).ok()?;
-                    let now = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map(|d| d.as_secs())
-                        .unwrap_or(0);
-                    // The FULL ladder, clock included. This document came
-                    // off the network: it is exactly the case the
-                    // time-checked verifier is for, and an expired
-                    // delegation must not keep advertising.
-                    veil_identity::verify::verify_identity_document(&doc, now).ok()?;
-                    // The verifier has established node_id == BLAKE3(master)
-                    // and that every key here is master-certified, so the
-                    // key at this index is authorised to speak for the
-                    // address.
-                    doc.identity_keys
-                        .get(idx as usize)
-                        .map(|k| k.pubkey.clone())
-                },
-            ));
-        }
-        let anycast_svc = Arc::new(anycast_svc_builder);
-        server = server.with_anycast_service(anycast_svc);
+        server = server.with_anycast_service(self.build_anycast_service(config));
         // share the hint registry so IPC clients can query it.
         server = server.with_hint_registry(Arc::clone(&self.hint_registry));
         // reuse the runtime-wide push-event bus. IpcServer
@@ -730,5 +625,130 @@ impl NodeRuntime {
             }
         });
         lock_tasks(&self.tasks).sessions.push(handle);
+    }
+
+    /// Build the anycast service exactly as the IPC server installs it.
+    ///
+    /// Its own function because the address it publishes under is a decision,
+    /// not wiring, and a decision inside a six-hundred-line assembly is a
+    /// decision nothing can test. Called from `spawn_ipc_server`; the tests
+    /// call this same function rather than a copy of its body.
+    pub(crate) fn build_anycast_service(
+        &self,
+        config: &veil_cfg::Config,
+    ) -> Arc<veil_anycast::AnycastService> {
+        let anycast_policy = match config.anycast.resolve_policy {
+            veil_cfg::AnycastResolvePolicyKind::BestEffort => {
+                veil_anycast::AnycastResolvePolicy::BestEffort
+            }
+            veil_cfg::AnycastResolvePolicyKind::SignedOnly => {
+                veil_anycast::AnycastResolvePolicy::SignedOnly
+            }
+            veil_cfg::AnycastResolvePolicyKind::SignedBound => {
+                veil_anycast::AnycastResolvePolicy::SignedBound
+            }
+        };
+        // Audit batch 2026-05-25 phase O (cross-audit #3 closure):
+        // if sovereign identity wired AND uses Ed25519, configure
+        // anycast to auto-sign all advertise calls (including those
+        // initiated through IPC `AnycastAdvertise`).  Resolvers running
+        // `SignedOnly` / `SignedBound` will admit our records.  PQ-only
+        // sovereign identities (Falcon-512) fall through to unsigned
+        // v1 advertise — caller-side opt-in to sign would require Falcon
+        // anycast support, which is a separate wire-compat exercise.
+        // The address the record must carry is the one a resolver can bind it
+        // to, and for a sovereign node that is the IDENTITY, not this device.
+        // Both binding checks a resolver runs take the record's `node_id` as
+        // the identity: index 0 demands `BLAKE3(owner_pubkey) == node_id`, and
+        // any other index looks up the identity document AT that node_id. A
+        // device transport id satisfies neither — there is no document at it,
+        // and its hash is of the wrong key — so every record this node
+        // published was dropped by every resolver running the DEFAULT
+        // `SignedBound` policy. `receiver_node_id` is the same choice the
+        // mailbox and rendezvous paths already make.
+        let mut anycast_svc_builder =
+            veil_anycast::AnycastService::new(Arc::clone(&self.dht), self.receiver_node_id())
+                .with_policy(anycast_policy);
+        if let Some(sov) = self.identity.sovereign_identity.get() {
+            // Algo-generic owner-signer: signs v2 (Ed25519) OR v3 (Falcon-512 /
+            // hybrid) records, so a PQ-only sovereign signs too instead of
+            // falling back to unsigned advertise. The index comes WITH the key:
+            // 0 on a device whose own key is the master (self-signed binding),
+            // its own index on every other device (the document proves the
+            // binding). Several nodes answering on one identity address is what
+            // anycast is for, and pinning this to 0 disabled exactly that.
+            if let Some((algo_byte, owner_pubkey, sig_key_idx, sign)) = sov.anycast_owner_signer() {
+                match veil_types::SignatureAlgorithm::from_wire_byte(algo_byte) {
+                    Some(algo) => {
+                        anycast_svc_builder = anycast_svc_builder.with_signer(
+                            veil_anycast::AnycastSigner::new(algo, owner_pubkey, sig_key_idx, sign),
+                        );
+                    }
+                    None => {
+                        // Unreachable in practice: `identity_sk.algo()` only ever
+                        // yields a known wire byte. Guard rather than panic.
+                        self.logger.warn(
+                            "anycast.signing.unknown_algo",
+                            "sovereign identity reports an unrecognized signature \
+                                 algorithm byte: anycast records will be published \
+                                 UNSIGNED",
+                        );
+                    }
+                }
+            } else {
+                // A device of an identity signs with its own key at its own
+                // index, so this is no longer the multi-device case — that one
+                // advertises. What is left is an identity whose active key sits
+                // past index 255, which the record's `sig_key_idx` field cannot
+                // name. Nothing can be signed for it; say so rather than let
+                // unsigned records go out and be dropped in silence.
+                self.logger.warn(
+                    "anycast.signing.index_out_of_range",
+                    "sovereign identity's active device key is past index 255, \
+                         which an anycast record cannot name: records are published \
+                         UNSIGNED and dropped by peers running the default \
+                         SignedBound resolve policy",
+                );
+            }
+        }
+        // Admit records signed by a DEVICE of an identity, not only by its
+        // master. Every device of one identity answers on the same address, so
+        // without this the strict resolve policy drops every multi-device
+        // identity — which is the arrangement anycast exists to serve.
+        //
+        // The local shard only, on purpose: the filter it feeds is
+        // synchronous, and a resolve must not block on a DHT walk. A node that
+        // does not hold the document answers `None` and drops the record, the
+        // same conservative outcome as before delegation existed. The K-closest
+        // to an identity DO hold it, and so does a node that has talked to that
+        // identity.
+        {
+            let dht = Arc::clone(&self.dht);
+            anycast_svc_builder = anycast_svc_builder.with_delegation_lookup(std::sync::Arc::new(
+                move |node_id: &[u8; 32], idx: u8| {
+                    let key = veil_proto::identity_document::IdentityDocument::dht_key(node_id);
+                    let bytes = dht.get_local(&key)?;
+                    let doc =
+                        veil_proto::identity_document::IdentityDocument::decode(&bytes).ok()?;
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0);
+                    // The FULL ladder, clock included. This document came
+                    // off the network: it is exactly the case the
+                    // time-checked verifier is for, and an expired
+                    // delegation must not keep advertising.
+                    veil_identity::verify::verify_identity_document(&doc, now).ok()?;
+                    // The verifier has established node_id == BLAKE3(master)
+                    // and that every key here is master-certified, so the
+                    // key at this index is authorised to speak for the
+                    // address.
+                    doc.identity_keys
+                        .get(idx as usize)
+                        .map(|k| k.pubkey.clone())
+                },
+            ));
+        }
+        Arc::new(anycast_svc_builder)
     }
 }

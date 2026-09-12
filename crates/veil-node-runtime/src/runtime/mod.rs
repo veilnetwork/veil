@@ -2908,9 +2908,6 @@ impl NodeRuntime {
         }
     }
 
-    /// Return all anycast service tags this node is advertising in the DHT.
-    ///
-    /// Returns `(service_tag_hex, candidate_count)` pairs.
     /// PEX status snapshot for the admin socket.
     pub fn pex_status(&self) -> (usize, u32, Option<std::time::Instant>) {
         let state = lock!(self.pex.state);
