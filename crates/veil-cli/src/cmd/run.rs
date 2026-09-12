@@ -4,6 +4,7 @@ use veil_cfg;
 
 use super::{
     adapters::CliRuntime,
+    anycast_cmd::handle_anycast_command,
     bootstrap_cmd::handle_bootstrap_command,
     cli::{Cli, Command, ServiceCommand},
     debug::handle_debug_command,
@@ -37,6 +38,7 @@ pub fn run() -> veil_cfg::Result<()> {
         Command::Sessions(args) => handle_sessions_command(context, args),
         Command::Debug(args) => handle_debug_command(cli.config.as_deref(), args.command),
         Command::Pex(args) => handle_pex_command(context, args),
+        Command::Anycast(args) => handle_anycast_command(context, args),
         Command::Bootstrap(args) => handle_bootstrap_command(context, args),
         Command::Invite(args) => handle_invite_command(context, args),
         Command::Network(args) => handle_network_command(&mut { context }, args),

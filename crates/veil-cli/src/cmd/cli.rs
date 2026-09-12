@@ -46,6 +46,9 @@ pub enum Command {
     /// PEX is the gossip layer that lets nodes swap lists of peers they
     /// know about, so you find new peers without a central directory.
     Pex(PexArgs),
+    /// Advertise and resolve anycast service tags — several nodes answering
+    /// under one name.
+    Anycast(AnycastArgs),
     /// Manage your sovereign identity (your long-lived cryptographic name).
     Identity(IdentityArgs),
     /// Create and redeem bootstrap invites that get a brand-new node onto
@@ -978,6 +981,45 @@ pub struct SessionsArgs {
 pub struct PexArgs {
     #[command(subcommand)]
     pub command: PexCommand,
+}
+
+#[derive(Args, Debug)]
+pub struct AnycastArgs {
+    #[command(subcommand)]
+    pub command: AnycastCommand,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum AnycastCommand {
+    /// Advertise this node as a provider of a service tag.
+    ///
+    /// The record is written locally and reaches other nodes on the next DHT
+    /// republish — a resolve on THIS node sees it at once, elsewhere it takes
+    /// up to `[dht] republish_interval_secs`.
+    Advertise {
+        /// Four ASCII bytes, e.g. `MBOX`.
+        tag: String,
+        /// Lower sorts better. A hint, not a fact: it is peer-controlled, and
+        /// a resolver stacks its own reputation penalty on top.
+        #[arg(long, default_value_t = 0)]
+        score: u16,
+        /// How long this record stays fresh.
+        #[arg(long, default_value_t = 3600)]
+        ttl_secs: u32,
+    },
+    /// Resolve a service tag to candidate nodes, under this node's policy.
+    Resolve {
+        /// Four ASCII bytes, e.g. `MBOX`.
+        tag: String,
+        /// Upper bound on candidates returned.
+        #[arg(long, default_value_t = 8)]
+        max_results: u8,
+    },
+    /// Withdraw this node's advertisement for a tag.
+    Withdraw {
+        /// Four ASCII bytes, e.g. `MBOX`.
+        tag: String,
+    },
 }
 
 #[derive(Subcommand, Debug)]
