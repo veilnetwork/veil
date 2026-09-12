@@ -987,6 +987,115 @@ fn a_lapsed_device_renews_through_the_ffi_with_one_secret() {
     );
 }
 
+/// The expiry reported is THIS device's, and renewal moves it.
+///
+/// Asked of veil rather than parsed in the host: a second reader of the
+/// document's wire format is a second thing to keep in step, and the symptom
+/// of letting it drift is a device that goes quiet.
+#[cfg(feature = "node-embedded")]
+#[test]
+fn delegation_expiry_is_reported_and_renewal_moves_it() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let dir_s = dir.path().to_str().unwrap().to_string();
+    let phrase = fresh_phrase();
+    let phrase_str = phrase.to_str().unwrap().to_string();
+
+    let mut buf: Vec<u8> = phrase_str.as_bytes().to_vec();
+    let n = buf.len();
+    let label = "expiry";
+    let mut err: *mut c_char = ptr::null_mut();
+    assert_eq!(
+        unsafe {
+            veil_restore_identity_from_phrase_zeroize(
+                buf.as_mut_ptr(),
+                n,
+                dir_s.as_ptr(),
+                dir_s.len(),
+                label.as_ptr(),
+                label.len(),
+                &mut err,
+            )
+        },
+        VEIL_OK,
+    );
+
+    let mut before_until: u64 = 0;
+    let mut err: *mut c_char = ptr::null_mut();
+    let rc = unsafe {
+        veil_device_delegation_valid_until(dir_s.as_ptr(), dir_s.len(), &mut before_until, &mut err)
+    };
+    assert_eq!(rc, VEIL_OK);
+    assert!(before_until > 0, "a provisioned device has a window");
+
+    // Wind it back so renewal has somewhere to go, both ends together.
+    {
+        use veil_proto::identity_document::IdentityDocument;
+        let mut doc = IdentityDocument::decode(
+            &std::fs::read(dir.path().join("identity_document.bin")).unwrap(),
+        )
+        .unwrap();
+        doc.identity_keys[0].valid_from_unix = doc.issued_at_unix - 100;
+        doc.identity_keys[0].valid_until_unix = doc.issued_at_unix - 1;
+        std::fs::write(dir.path().join("identity_document.bin"), doc.encode()).unwrap();
+    }
+
+    let mut lapsed_until: u64 = 0;
+    let mut err: *mut c_char = ptr::null_mut();
+    assert_eq!(
+        unsafe {
+            veil_device_delegation_valid_until(
+                dir_s.as_ptr(),
+                dir_s.len(),
+                &mut lapsed_until,
+                &mut err,
+            )
+        },
+        VEIL_OK,
+    );
+    assert!(
+        lapsed_until < before_until,
+        "the reported window must follow the document, not a cached answer",
+    );
+
+    let mut secret: Vec<u8> = phrase_str.as_bytes().to_vec();
+    let sn = secret.len();
+    let mut err: *mut c_char = ptr::null_mut();
+    assert_eq!(
+        unsafe {
+            veil_reissue_device_delegation_zeroize(
+                ptr::null(),
+                0,
+                secret.as_mut_ptr(),
+                sn,
+                dir_s.as_ptr(),
+                dir_s.len(),
+                ptr::null(),
+                0,
+                &mut err,
+            )
+        },
+        VEIL_OK,
+    );
+
+    let mut after_until: u64 = 0;
+    let mut err: *mut c_char = ptr::null_mut();
+    assert_eq!(
+        unsafe {
+            veil_device_delegation_valid_until(
+                dir_s.as_ptr(),
+                dir_s.len(),
+                &mut after_until,
+                &mut err,
+            )
+        },
+        VEIL_OK,
+    );
+    assert!(
+        after_until > lapsed_until,
+        "renewal must move the window the query reports",
+    );
+}
+
 #[test]
 fn phase647_h8_validate_zeroize_rejects_null() {
     let mut err: *mut c_char = ptr::null_mut();

@@ -17,7 +17,7 @@
 /// Compare against `veil_abi_contract_hash()` from the loaded library
 /// BEFORE using it. See `native.dart`.
 const String veilAbiContractHash =
-    '8f910634a3ff1cdfd7ff65285e1da50cd933e673a137caf84b8de15c6cfd1f99';
+    '260d670600ff859dc3010e09d759d9060df4cb72fdf91953af4c435f71a61ecb';
 
 // -- Constants lifted from the generated header --------------------------
 
