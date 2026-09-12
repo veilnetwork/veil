@@ -6645,22 +6645,17 @@ mod tests {
             .expect("ad must decode");
         assert_eq!(id_ad.receiver_node_id, bob_node_id);
 
-        // The send goes out and the message does NOT arrive, and that is the
-        // state of the last step rather than a defect in the three above it.
+        // And it ARRIVES — the whole point of the four steps. The ad is
+        // published at the identity address, a sender can bind it to that
+        // address through the identity document, the receiver accepts a
+        // message addressed there, and the relay finds a subscriber under it
+        // because the registration is keyed by the address the peer answers
+        // for, not only the one it connected as.
         //
-        // The relay keys its subscribers by `(peer_node_id, cookie)`, and
-        // `peer_node_id` is the SESSION peer — the device — not something the
-        // registration carries. So an introduce naming the identity finds no
-        // subscriber (`relay_chain.introduce.cookie_unknown`) even though the
-        // ad is published, the binding verifies, and the receiver would accept
-        // the address. Closing it means the registration naming the address it
-        // answers for, and the relay checking that claim against the identity
-        // document — a wire change on a third party.
-        //
-        // **This asserts the WRONG behaviour on purpose.** It runs as a
-        // tripwire rather than sitting in a report: if the message starts
-        // arriving, the last step is done — assert the delivery and delete this
-        // paragraph. The wait is short because a pass here is a timeout.
+        // This assertion replaces a tripwire that asserted the opposite while
+        // the last step was missing. If it starts failing, one of the four is
+        // gone — the relay's own log says which: `cookie_unknown` is the
+        // registration, `auth_deliver.verify_failed` is the recipient binding.
         let id_payload = b"authenticated hi, addressed to the identity";
         net.node(0)
             .runtime
@@ -6677,15 +6672,29 @@ mod tests {
                 false,
             )
             .await
-            .expect("the send itself succeeds — the ad is real and resolvable");
-        assert!(
-            tokio::time::timeout(Duration::from_secs(3), rx.recv())
-                .await
-                .is_err(),
-            "a message addressed to the IDENTITY arrived — the relay now \
-             forwards it, so the last step is closed and this tripwire asserts \
-             the wrong thing",
-        );
+            .expect("a send addressed to the identity must succeed");
+
+        let msg = tokio::time::timeout(Duration::from_secs(8), rx.recv())
+            .await
+            .expect("a message addressed to the IDENTITY did not arrive in 8s")
+            .expect("receiver channel closed");
+        match msg {
+            veil_app::registry::AppMessage::Deliver {
+                src_node_id, data, ..
+            } => {
+                assert_eq!(
+                    src_node_id, alice_node_id,
+                    "the receiver must still learn the VERIFIED sender",
+                );
+                assert_eq!(
+                    data.as_ref(),
+                    id_payload.as_slice(),
+                    "a contact writing to the identity address reaches the \
+                     device that answers for it",
+                );
+            }
+            other => panic!("expected AppMessage::Deliver, got {other:?}"),
+        }
 
         net.stop().await;
     }
