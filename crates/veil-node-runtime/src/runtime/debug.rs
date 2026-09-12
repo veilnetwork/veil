@@ -59,14 +59,23 @@ impl NodeRuntime {
     /// `RendezvousPublisherEntry` is registered, otherwise typically 1
     /// since one ad covers the receiver's slot).
     pub async fn debug_force_publish_rendezvous_ads(&self) -> usize {
-        NodeRuntime::tick_publish_rendezvous_ads(
-            &self.anonymity.rendezvous_publisher_entries,
-            self.anonymity.x25519_sk.as_ref(),
-            &self.identity.local_identity,
-            &self.dht,
-            &self.logger,
-            None, // documented as local-only force-publish
+        super::rendezvous_ad_binding::receiver_addresses(
+            *self.identity.local_identity.node_id.as_bytes(),
+            &self.identity.sovereign_identity,
         )
+        .iter()
+        .map(|receiver| {
+            NodeRuntime::tick_publish_rendezvous_ads(
+                &self.anonymity.rendezvous_publisher_entries,
+                self.anonymity.x25519_sk.as_ref(),
+                &self.identity.local_identity,
+                receiver,
+                &self.dht,
+                &self.logger,
+                None, // documented as local-only force-publish
+            )
+        })
+        .sum()
     }
 
     /// test-only helper — force immediate DHT replication of

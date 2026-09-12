@@ -1607,14 +1607,23 @@ impl NodeServices {
                  not be published",
             );
         }
-        let published = NodeRuntime::tick_publish_rendezvous_ads(
-            &self.anonymity.rendezvous_publisher_entries,
-            self.anonymity.x25519_sk.as_ref(),
-            self.identity.local_identity.as_ref(),
-            &self.dht,
-            &self.logger,
-            Some(&self.session_tx_registry),
-        );
+        let published: usize = super::rendezvous_ad_binding::receiver_addresses(
+            *self.identity.local_identity.node_id.as_bytes(),
+            &self.identity.sovereign_identity,
+        )
+        .iter()
+        .map(|receiver| {
+            NodeRuntime::tick_publish_rendezvous_ads(
+                &self.anonymity.rendezvous_publisher_entries,
+                self.anonymity.x25519_sk.as_ref(),
+                self.identity.local_identity.as_ref(),
+                receiver,
+                &self.dht,
+                &self.logger,
+                Some(&self.session_tx_registry),
+            )
+        })
+        .sum();
         if published > 0 {
             self.logger.info(
                 "anonymity.stream_rendezvous_ad.published",

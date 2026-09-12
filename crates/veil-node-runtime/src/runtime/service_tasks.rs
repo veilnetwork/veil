@@ -86,7 +86,13 @@ async fn process_auth_deliver(
     access: &super::NodeServices,
     logger: &Arc<veil_observability::NodeLogger>,
     replay_cache: &veil_identity::auth_deliver::AuthDeliverReplayCache,
-    local_node_id: &[u8; 32],
+    // EVERY address this node receives at, not just its transport id. The
+    // recipient binding is cryptographic — the sender signs over the address it
+    // addressed, which is the one its contact holds — so a receiver that only
+    // ever reconstructs its device id rejects, as a bad signature, every
+    // message addressed to its identity. Same list the ads are published under
+    // (`rendezvous_ad_binding::receiver_addresses`).
+    self_node_ids: &[[u8; 32]],
     freshness_window: u64,
     now_unix: u64,
     // True when the message arrived DOWN one of OUR ephemeral reply circuits —
@@ -121,13 +127,24 @@ async fn process_auth_deliver(
     //    member device that actually signed. Endpoint handlers that must act
     //    per-device (the mailbox keys boxes by fetcher id) get it from this
     //    proof, not from anything the sender claims.
-    let sender_device_id = match veil_identity::auth_deliver::verify_auth_deliver(
-        &auth,
-        &sender_doc,
-        local_node_id,
-        now_unix,
-        freshness_window,
-    ) {
+    // Whichever of our addresses the sender wrote to. The first is the
+    // transport id, so a node with one address pays exactly one verify.
+    let verified = self_node_ids
+        .iter()
+        .map(|self_id| {
+            veil_identity::auth_deliver::verify_auth_deliver(
+                &auth,
+                &sender_doc,
+                self_id,
+                now_unix,
+                freshness_window,
+            )
+        })
+        .reduce(|acc, next| acc.or(next))
+        .unwrap_or(Err(
+            veil_identity::auth_deliver::AuthDeliverError::BadSignature,
+        ));
+    let sender_device_id = match verified {
         Ok(dev) => dev,
         Err(e) => {
             logger.info(
@@ -921,14 +938,26 @@ pub(crate) async fn rendezvous_recipient_recheck(
                 .join(","),
         ),
     );
-    let published = super::NodeRuntime::tick_publish_rendezvous_ads(
-        &anonymity.rendezvous_publisher_entries,
-        anonymity.x25519_sk.as_ref(),
-        identity.local_identity.as_ref(),
-        dht,
-        logger,
-        Some(session_tx_registry),
-    );
+    // Once per address the receiver must be findable at: the device id every
+    // sender knows how to verify, and — when a sovereign identity's address is
+    // a different value — the identity address its contacts actually look up.
+    let published: usize = super::rendezvous_ad_binding::receiver_addresses(
+        *identity.local_identity.node_id.as_bytes(),
+        &identity.sovereign_identity,
+    )
+    .iter()
+    .map(|receiver| {
+        super::NodeRuntime::tick_publish_rendezvous_ads(
+            &anonymity.rendezvous_publisher_entries,
+            anonymity.x25519_sk.as_ref(),
+            identity.local_identity.as_ref(),
+            receiver,
+            dht,
+            logger,
+            Some(session_tx_registry),
+        )
+    })
+    .sum();
     if published > 0 {
         logger.info(
             "anonymity.rendezvous_recipient.published_immediate",
@@ -1141,7 +1170,14 @@ impl NodeRuntime {
         let mut shutdown_rx = shutdown_tx.subscribe();
         let access = self.access();
         let logger = Arc::clone(&self.logger);
-        let local_node_id = *self.identity.local_identity.node_id.as_bytes();
+        // Every address this node receives at — the transport id, plus the
+        // identity address when a sovereign identity makes it a different
+        // value. The sender signs the address it wrote to, so a receiver that
+        // knows only one of them rejects the other as a forgery.
+        let self_node_ids = super::rendezvous_ad_binding::receiver_addresses(
+            *self.identity.local_identity.node_id.as_bytes(),
+            &self.identity.sovereign_identity,
+        );
         // Δ2-b: clone the PERSISTENT replay cache off AnonymityState (which
         // survives reload) rather than building a fresh one per spawn — so a
         // config reload no longer resets the (sender, nonce) replay window.
@@ -1240,7 +1276,7 @@ impl NodeRuntime {
                                     &access,
                                     &logger,
                                     &replay_cache,
-                                    &local_node_id,
+                                    &self_node_ids,
                                     freshness_window,
                                     now_unix,
                                     via_reply,
