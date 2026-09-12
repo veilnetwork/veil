@@ -2436,6 +2436,35 @@ pub fn is_self_authenticating_rejects_short_values() {
     assert!(!NodeRuntime::is_self_authenticating_dht_value(b"A"));
 }
 
+/// An anycast service list must be republished, or it never leaves the node.
+///
+/// `advertise` writes with `store_local`, so the only thing that ever carries
+/// an advertisement to another node is this filter saying yes. It said no —
+/// for every one of the three anycast magics — and the receiving STORE gate
+/// had no arm for them either, so a resolver anywhere else got nothing, always.
+/// All three versions are named because a list's first two bytes are its FIRST
+/// record's magic, and which version that is depends on who advertised.
+#[test]
+pub fn is_self_authenticating_accepts_every_anycast_magic() {
+    for magic in [
+        veil_proto::anycast::ANYCAST_MAGIC,
+        veil_proto::anycast::ANYCAST_MAGIC_V2,
+        veil_proto::anycast::ANYCAST_MAGIC_V3,
+    ] {
+        let mut v = Vec::new();
+        v.extend_from_slice(&magic);
+        v.extend_from_slice(&[0u8; 42]);
+        assert!(
+            NodeRuntime::is_self_authenticating_dht_value(&v),
+            "anycast magic {magic:?} must be republished",
+        );
+    }
+    // And the neighbouring two-byte values are not anycast: "AB" and "AF"
+    // bracket the three magics, so a range check written by mistake shows up.
+    assert!(!NodeRuntime::is_self_authenticating_dht_value(b"ABxxxx"));
+    assert!(!NodeRuntime::is_self_authenticating_dht_value(b"AFxxxx"));
+}
+
 #[test]
 pub fn is_self_authenticating_rejects_ap_prefix_impostor() {
     // "AP" as magic requires the exact 2-byte sequence; "Ax" must not

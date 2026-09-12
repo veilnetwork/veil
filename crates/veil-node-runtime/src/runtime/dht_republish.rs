@@ -94,6 +94,17 @@ impl NodeRuntime {
             // holder-signed and canonical-key-bound at the dispatcher. The
             // application still verifies the strict descriptor/holder payload.
             || magic == &veil_crypto::space_discovery::SPACE_DISCOVERY_DHT_MAGIC[..]
+            // Anycast service list ("AC"/"AD"/"AE"): every record in it carries
+            // its own owner signature, re-verified at the STORE gate
+            // (`anycast_store_gate`, which also merges rather than replaces so
+            // a republish cannot erase other providers) and again at resolve
+            // under the reader's own policy. Without this arm an advertisement
+            // was `store_local`-only at the advertiser and reached no other
+            // node at all: the republish driver skipped it, the receiving gate
+            // had no arm for it, and a resolver anywhere else therefore
+            // returned nothing, always. Anycast had never distributed anything
+            // across the network.
+            || veil_proto::anycast::is_anycast_blob(value)
     }
 
     /// Republish only records that are still valid at the current wall clock.

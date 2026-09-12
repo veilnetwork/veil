@@ -15,6 +15,11 @@ relay-trace = []
 [dependencies]
 veil-abuse = { path = "../veil-abuse" }
 veil-anonymity = { path = "../veil-anonymity" }
+# The anycast STORE gate verifies each record in an incoming service list with
+# the algo-generic verifier that lives with the anycast rules themselves, rather
+# than keeping a second copy of them here. veil-anycast depends only on
+# veil-{dht,proto,util,types,crypto}, so this stays acyclic.
+veil-anycast = { path = "../veil-anycast" }
 veil-app = { path = "../veil-app" }
 veil-bootstrap = { path = "../veil-bootstrap" }
 veil-bufpool = { path = "../veil-bufpool" }
