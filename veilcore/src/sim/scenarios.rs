@@ -6326,6 +6326,10 @@ mod tests {
             .runtime
             .debug_force_publish_rendezvous_ads()
             .await;
+        // ONE: this scenario's nodes have no sovereign identity of their own,
+        // so the auto-built standalone document names the device key as its
+        // master and the two addresses are one value. A receiver publishes per
+        // ADDRESS, not per identity, so there is nothing to publish twice.
         assert_eq!(n_ads, 1, "receiver must publish exactly one rendezvous-ad");
 
         // Step 1b: receiver tells the rendezvous "forward to me on
@@ -6484,7 +6488,17 @@ mod tests {
             .runtime
             .debug_force_publish_rendezvous_ads()
             .await;
-        assert_eq!(n_ads, 1, "receiver must publish exactly one rendezvous-ad");
+        // TWO: one per address this receiver is findable at. The device id,
+        // which this scenario's sender asks for below and which every sender on
+        // the old code asks for; and the receiver's IDENTITY address, which is
+        // the one a contact is actually given. These nodes carry real sovereign
+        // identities, so the two are different values — and until the ad was
+        // published at both, there was nothing at the address a contact looks
+        // up.
+        assert_eq!(
+            n_ads, 2,
+            "receiver must publish an ad at each address it receives at"
+        );
         net.node(4)
             .runtime
             .register_with_rendezvous(rendezvous_node_id.into(), auth_cookie);
@@ -6590,6 +6604,89 @@ mod tests {
             other => panic!("expected AppMessage::Deliver, got {other:?}"),
         }
 
+        // And again through the ad at the receiver's IDENTITY address — the
+        // address a contact is given, and the one that had no ad at all. The
+        // sender needs the receiver's identity document to bind an ad signed by
+        // a device key to that address, which is the same document it would
+        // hold from resolving the contact; mirror it in rather than wait on
+        // organic replication.
+        let bob_node_id = *net
+            .node(4)
+            .runtime
+            .sovereign_identity()
+            .expect("receiver has a sovereign identity")
+            .node_id();
+        assert_ne!(
+            bob_node_id,
+            net.node(4).node_id(),
+            "this half proves nothing unless the two addresses differ"
+        );
+        net.node(4)
+            .runtime
+            .debug_republish_sovereign_identity()
+            .await
+            .expect("publish receiver identity");
+        let bob_doc_key = IdentityDocument::dht_key(&bob_node_id);
+        let bob_doc = net
+            .node(4)
+            .runtime
+            .dht_get_local(&bob_doc_key)
+            .expect("receiver's own identity document in its local shard");
+        net.node(0).runtime.dht_put_local(bob_doc_key, bob_doc);
+
+        let id_ad_bytes = net
+            .node(4)
+            .runtime
+            .dht_get_local(&crate::node::anonymity::rendezvous::rendezvous_ad_dht_key(
+                &bob_node_id,
+            ))
+            .expect("an ad at the receiver's identity address");
+        let id_ad = crate::node::anonymity::rendezvous::decode_rendezvous_ad(&id_ad_bytes)
+            .expect("ad must decode");
+        assert_eq!(id_ad.receiver_node_id, bob_node_id);
+
+        // The send goes out and the message does NOT arrive, and that is the
+        // state of the last step rather than a defect in the three above it.
+        //
+        // The relay keys its subscribers by `(peer_node_id, cookie)`, and
+        // `peer_node_id` is the SESSION peer — the device — not something the
+        // registration carries. So an introduce naming the identity finds no
+        // subscriber (`relay_chain.introduce.cookie_unknown`) even though the
+        // ad is published, the binding verifies, and the receiver would accept
+        // the address. Closing it means the registration naming the address it
+        // answers for, and the relay checking that claim against the identity
+        // document — a wire change on a third party.
+        //
+        // **This asserts the WRONG behaviour on purpose.** It runs as a
+        // tripwire rather than sitting in a report: if the message starts
+        // arriving, the last step is done — assert the delivery and delete this
+        // paragraph. The wait is short because a pass here is a timeout.
+        let id_payload = b"authenticated hi, addressed to the identity";
+        net.node(0)
+            .runtime
+            .access()
+            .send_via_rendezvous_authenticated(
+                &id_ad,
+                &[],
+                app_id,
+                endpoint_id,
+                id_payload,
+                2,
+                None,
+                1,
+                false,
+            )
+            .await
+            .expect("the send itself succeeds — the ad is real and resolvable");
+        assert!(
+            tokio::time::timeout(Duration::from_secs(3), rx.recv())
+                .await
+                .is_err(),
+            "a message addressed to the IDENTITY arrived — the relay now \
+             forwards it, so the last step is closed and this tripwire asserts \
+             the wrong thing",
+        );
+
         net.stop().await;
     }
 
@@ -6649,7 +6746,12 @@ mod tests {
             .runtime
             .debug_force_publish_rendezvous_ads()
             .await;
-        assert_eq!(n_ads, 1, "receiver must publish exactly one rendezvous-ad");
+        // Two: this scenario's nodes carry real sovereign identities, so the
+        // receiver is findable at its device id AND at its identity address.
+        assert_eq!(
+            n_ads, 2,
+            "receiver must publish an ad at each address it receives at"
+        );
         net.node(4)
             .runtime
             .register_with_rendezvous(rendezvous_b.into(), cookie_b);
@@ -6913,7 +7015,14 @@ mod tests {
             .runtime
             .debug_force_publish_rendezvous_ads()
             .await;
-        assert_eq!(n_ads, 1, "service publishes exactly one ad");
+        // Two: the service node carries a real sovereign identity, so its ad
+        // goes up at its device id AND at its identity address. The ad here is
+        // an ordinary one — `register_rendezvous_publisher`, not a pseudo
+        // identity — so both passes publish it.
+        assert_eq!(
+            n_ads, 2,
+            "service publishes an ad at each address it receives at"
+        );
 
         // Wait for the CircuitBuild (over direct sessions) to install at
         // N1 + N3, rather than sleeping a fixed 250 ms and hoping. The sleep

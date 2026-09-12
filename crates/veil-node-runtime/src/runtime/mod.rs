@@ -40,6 +40,7 @@ mod persist_tasks;
 pub(crate) mod persistence;
 mod pex_runtime;
 mod push_tasks;
+mod rendezvous_ad_binding;
 mod rendezvous_binder;
 mod rendezvous_resolver;
 mod resumption_state;
@@ -2194,6 +2195,12 @@ impl NodeRuntime {
     /// corresponding `RendezvousAd` periodically (half-life refresh)
     /// so senders looking up `rendezvous_ad_dht_key(local_node_id)`
     /// always see a fresh entry.
+    ///
+    /// Under EVERY address this node receives at, not only the device one —
+    /// see `rendezvous_ad_binding::receiver_addresses`. A sovereign identity
+    /// whose device key is not its master is known to its contacts by the
+    /// identity address, and an ad only at the device address is an ad at an
+    /// address nobody asks for.
     ///
     /// Caller MUST also have an OVL1 session open to `rendezvous_node_id`
     /// and have called `register_with_rendezvous` to register the cookie

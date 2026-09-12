@@ -173,6 +173,10 @@ impl NodeRuntime {
         let anonymity_advertised_bps = self.anonymity.advertised_bps;
         let anonymity_x25519_sk = Arc::clone(&self.anonymity.x25519_sk);
         let local_identity_for_publish = Arc::clone(&self.identity.local_identity);
+        // The identity STATE, not just the handshake key: the sovereign cell is
+        // hot-swapped when a document is re-issued, so which addresses this node
+        // advertises at is a question to ask each tick rather than at boot.
+        let identity_for_publish = Arc::clone(&self.identity);
         let dht_for_publish = Arc::clone(&self.dht);
         let publish_logger = Arc::clone(&self.logger);
         // receiver-controlled rendezvous-publisher state.
@@ -421,14 +425,22 @@ impl NodeRuntime {
                         // active rendezvous-publisher entries near
                         // half-life. No-op when receiver has not
                         // called `register_rendezvous_publisher`.
-                        Self::tick_publish_rendezvous_ads(
-                            &rendezvous_publisher_entries,
-                            &anonymity_x25519_sk,
-                            &local_identity_for_publish,
-                            &dht_for_publish,
-                            &publish_logger,
-                            Some(&session_tx_registry_for_tick),
-                        );
+                        for receiver in
+                            super::rendezvous_ad_binding::receiver_addresses(
+                                *identity_for_publish.local_identity.node_id.as_bytes(),
+                                &identity_for_publish.sovereign_identity,
+                            )
+                        {
+                            Self::tick_publish_rendezvous_ads(
+                                &rendezvous_publisher_entries,
+                                &anonymity_x25519_sk,
+                                &local_identity_for_publish,
+                                &receiver,
+                                &dht_for_publish,
+                                &publish_logger,
+                                Some(&session_tx_registry_for_tick),
+                            );
+                        }
                         // Proactively populate the local relay-directory cache
                         // for the CONNECTED relays (the onion-circuit hop
                         // candidates). The onion-service build resolves each
@@ -939,6 +951,14 @@ impl NodeRuntime {
         entries: &Arc<Mutex<Vec<veil_anonymity::rendezvous::RendezvousPublisherEntry>>>,
         anonymity_x25519_sk: &x25519_dalek::StaticSecret,
         local_identity: &crate::local_identity::HandshakeIdentity,
+        // The address the ad NAMES, which is not always the address that signs
+        // it. A sovereign identity whose device key is not its master — every
+        // hybrid one, every device restored from a certificate — is known to
+        // its contacts by the identity address and must advertise there; the
+        // signing key is still this device's, and the identity document is what
+        // ties the two (`rendezvous_ad_binding::ad_binding_ok`). Callers publish
+        // once per address in `receiver_addresses`.
+        receiver_node_id: &[u8; 32],
         dht: &Arc<veil_dht::kademlia::KademliaService>,
         logger: &Arc<veil_observability::NodeLogger>,
         // When wired, NON-ephemeral ads are also replicated to their K-closest
@@ -959,7 +979,7 @@ impl NodeRuntime {
         // since the maintenance period is short.
         use veil_anonymity::rendezvous::{
             MAX_RENDEZVOUS_AD_SLOTS, decode_rendezvous_ad, is_currently_valid,
-            rendezvous_ad_dht_key_at, sign_rendezvous_ad_v5, verify_rendezvous_ad,
+            rendezvous_ad_dht_key_at, sign_rendezvous_ad_v5,
         };
         // Call-RTT-spike experiment switch: skip the refresh tick entirely
         // while publish is paused (see veil_session::rt_trace::publish_pause).
@@ -986,7 +1006,7 @@ impl NodeRuntime {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
-        let receiver_node_id = *local_identity.node_id.as_bytes();
+        let receiver_node_id = *receiver_node_id;
         let receiver_x25519_pk = x25519_dalek::PublicKey::from(anonymity_x25519_sk).to_bytes();
         // Cap per-receiver slots at MAX_RENDEZVOUS_AD_SLOTS to bound
         // DHT footprint when the entries vec grows pathologically.
@@ -1014,7 +1034,10 @@ impl NodeRuntime {
                 let dht_key = rendezvous_ad_dht_key_at(&ad_node_id, idx as u8);
                 let existing_bytes = dht.get_local(&dht_key)?;
                 let ad = decode_rendezvous_ad(&existing_bytes).ok()?;
-                (verify_rendezvous_ad(&ad).is_ok()
+                // The SAME rule the sender's resolver applies, so a node
+                // cannot sit re-signing an ad every tick that senders accept,
+                // nor keep one they refuse.
+                (super::rendezvous_ad_binding::ad_binding_ok(dht, &ad)
                     && is_currently_valid(&ad, now_unix).is_ok()
                     && ad.receiver_node_id == ad_node_id
                     && ad.issuer_pk == issuer_pk
@@ -1062,6 +1085,17 @@ impl NodeRuntime {
         };
         let mut published = 0usize;
         for (idx, entry) in snapshot.iter().take(n_slots).enumerate() {
+            // A location-anonymous entry's ad is keyed and signed under its own
+            // PSEUDO identity, which has nothing to do with the address this
+            // pass is publishing for. Publishing it once per receiver address
+            // would write the same key twice — and, worse, the point of that
+            // pseudo identity is that the ad is NOT linked to the service's
+            // sovereign address. So it belongs to the device pass only.
+            if entry.ephemeral_ad_identity.is_some()
+                && receiver_node_id != *local_identity.node_id.as_bytes()
+            {
+                continue;
+            }
             // Δ2-c: a LOCATION-ANONYMOUS service signs + DHT-keys its ad under a
             // per-service PSEUDO identity, so the ad never reveals the sovereign
             // node_id (which would link the identity to its live rendezvous
@@ -1674,8 +1708,15 @@ mod tests {
         let entries = Arc::new(Mutex::new(Vec::new()));
         let dht_keys_before = dht.stored_keys();
 
-        let count =
-            NodeRuntime::tick_publish_rendezvous_ads(&entries, &sk, &identity, &dht, &logger, None);
+        let count = NodeRuntime::tick_publish_rendezvous_ads(
+            &entries,
+            &sk,
+            &identity,
+            identity.node_id.as_bytes(),
+            &dht,
+            &logger,
+            None,
+        );
 
         assert_eq!(count, 0, "no publisher entries → tick must report 0");
         assert_eq!(
@@ -1717,8 +1758,15 @@ mod tests {
             rendezvous_kem_valid_until_unix: 0,
         }]));
 
-        let count =
-            NodeRuntime::tick_publish_rendezvous_ads(&entries, &sk, &identity, &dht, &logger, None);
+        let count = NodeRuntime::tick_publish_rendezvous_ads(
+            &entries,
+            &sk,
+            &identity,
+            identity.node_id.as_bytes(),
+            &dht,
+            &logger,
+            None,
+        );
         assert_eq!(count, 1);
 
         // Fetch by deterministic DHT key derived from RECEIVER's node_id.
@@ -1764,8 +1812,15 @@ mod tests {
             rendezvous_kem_valid_until_unix: 0,
         }]));
 
-        let n =
-            NodeRuntime::tick_publish_rendezvous_ads(&entries, &sk, &identity, &dht, &logger, None);
+        let n = NodeRuntime::tick_publish_rendezvous_ads(
+            &entries,
+            &sk,
+            &identity,
+            identity.node_id.as_bytes(),
+            &dht,
+            &logger,
+            None,
+        );
         assert_eq!(n, 1, "tick must publish exactly one ad");
 
         let key = rendezvous_ad_dht_key(identity.node_id.as_bytes());
@@ -1831,16 +1886,30 @@ mod tests {
         }]));
 
         // First tick — publishes.
-        let n1 =
-            NodeRuntime::tick_publish_rendezvous_ads(&entries, &sk, &identity, &dht, &logger, None);
+        let n1 = NodeRuntime::tick_publish_rendezvous_ads(
+            &entries,
+            &sk,
+            &identity,
+            identity.node_id.as_bytes(),
+            &dht,
+            &logger,
+            None,
+        );
         assert_eq!(n1, 1);
         let key = rendezvous_ad_dht_key(identity.node_id.as_bytes());
         let bytes_after_first = dht.get_local(&key).expect("ad in DHT").to_vec();
 
         // Second tick without passage of time — ad is still very fresh
         // tick must skip and leave bytes byte-equal.
-        let n2 =
-            NodeRuntime::tick_publish_rendezvous_ads(&entries, &sk, &identity, &dht, &logger, None);
+        let n2 = NodeRuntime::tick_publish_rendezvous_ads(
+            &entries,
+            &sk,
+            &identity,
+            identity.node_id.as_bytes(),
+            &dht,
+            &logger,
+            None,
+        );
         assert_eq!(n2, 0, "still-fresh ad must NOT trigger republish");
         let bytes_after_second = dht.get_local(&key).expect("ad still in DHT").to_vec();
         assert_eq!(
@@ -1877,15 +1946,29 @@ mod tests {
             rendezvous_kem_valid_until_unix: 0,
         }]));
 
-        let first =
-            NodeRuntime::tick_publish_rendezvous_ads(&entries, &sk, &identity, &dht, &logger, None);
+        let first = NodeRuntime::tick_publish_rendezvous_ads(
+            &entries,
+            &sk,
+            &identity,
+            identity.node_id.as_bytes(),
+            &dht,
+            &logger,
+            None,
+        );
         assert_eq!(first, 1);
 
         // Fail over immediately, long before the old 10-minute ad reaches its
         // five-minute half-life.
         lock!(entries)[0].rendezvous_node_id = new_relay;
-        let second =
-            NodeRuntime::tick_publish_rendezvous_ads(&entries, &sk, &identity, &dht, &logger, None);
+        let second = NodeRuntime::tick_publish_rendezvous_ads(
+            &entries,
+            &sk,
+            &identity,
+            identity.node_id.as_bytes(),
+            &dht,
+            &logger,
+            None,
+        );
         assert_eq!(second, 1, "route change must force immediate republish");
 
         let key = rendezvous_ad_dht_key(identity.node_id.as_bytes());
@@ -1934,8 +2017,15 @@ mod tests {
             rendezvous_kem_valid_until_unix: 0,
         }]));
 
-        let n =
-            NodeRuntime::tick_publish_rendezvous_ads(&entries, &sk, &identity, &dht, &logger, None);
+        let n = NodeRuntime::tick_publish_rendezvous_ads(
+            &entries,
+            &sk,
+            &identity,
+            identity.node_id.as_bytes(),
+            &dht,
+            &logger,
+            None,
+        );
         assert_eq!(n, 1);
 
         // The ad is NOT at the sovereign node_id's key (no identity leak)...

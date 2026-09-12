@@ -711,6 +711,53 @@ pub fn verify_rendezvous_ad(ad: &RendezvousAd) -> Result<(), RendezvousError> {
     if blake3::hash(&issuer_pk_bytes).as_bytes() != &ad.receiver_node_id {
         return Err(RendezvousError::Verify);
     }
+    verify_ad_signature(ad)
+}
+
+/// Verify an ad whose issuer is a DEVICE of the identity the ad names.
+///
+/// The strict binding above is `BLAKE3(issuer_pk) == receiver_node_id`, which
+/// says the signer IS the address. That holds for a node whose identity key is
+/// its master and for nothing else: a HYBRID identity's address is
+/// `BLAKE3(ed25519 ‖ falcon512)`, which no device key hashes to, and a device
+/// provisioned from a recovery certificate mints its own transport key. Those
+/// receivers could not publish a verifiable ad at the address their contacts
+/// know them by — so an ad existed at an address nobody looks up, and inbound
+/// delivery had nowhere to land.
+///
+/// The binding is not weakened, it is proved one step further out, exactly as
+/// for anycast records: what ties the signing key to the address is the
+/// identity document, whose verifier has already established
+/// `node_id == BLAKE3(master_pubkey)` and that every key it names is
+/// master-certified. The caller passes the two facts it read off a document
+/// that `verify_identity_document` ACCEPTED — handing in an unverified
+/// document forges exactly the binding this closes.
+///
+/// The ad's wire format is unchanged: only `receiver_node_id` differs, and it
+/// is already inside the signed payload.
+pub fn verify_rendezvous_ad_delegated(
+    ad: &RendezvousAd,
+    document_node_id: &[u8; NODE_ID_LEN],
+    device_pubkeys: &[Vec<u8>],
+) -> Result<(), RendezvousError> {
+    // The document has to be the one for THIS ad's receiver, or a valid
+    // document of some other identity would authorise any address.
+    if document_node_id != &ad.receiver_node_id {
+        return Err(RendezvousError::Verify);
+    }
+    let issuer_pk_bytes =
+        base64::Engine::decode(&base64::engine::general_purpose::STANDARD, &ad.issuer_pk)
+            .map_err(|_| RendezvousError::Verify)?;
+    if !device_pubkeys.iter().any(|k| k == &issuer_pk_bytes) {
+        return Err(RendezvousError::Verify);
+    }
+    verify_ad_signature(ad)
+}
+
+/// The signature half, shared by the two bindings above. Never public: an ad
+/// whose signature verifies but whose issuer is tied to no address is exactly
+/// the forgery both of them exist to refuse.
+fn verify_ad_signature(ad: &RendezvousAd) -> Result<(), RendezvousError> {
     let canonical = match ad.wire_version {
         VERSION => canonical_message_v5(
             &ad.receiver_node_id,
