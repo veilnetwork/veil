@@ -185,6 +185,27 @@ pub enum AdminCommand {
         /// Payload bytes (hex-encoded).
         data_hex: String,
     },
+    /// Advertise this node as a provider of an anycast service tag.
+    ///
+    /// The tag is four ASCII bytes — it is an application-chosen name, not a
+    /// hash, and four bytes is what the wire record carries.
+    AnycastAdvertise {
+        tag: String,
+        /// Lower sorts better. Peer-controlled, so a resolver treats it as a
+        /// hint and not a fact — see `veil_anycast`.
+        score: u16,
+        ttl_secs: u32,
+    },
+    /// Resolve an anycast service tag to candidate node_ids, under THIS node's
+    /// configured resolve policy.
+    AnycastResolve {
+        tag: String,
+        max_results: u8,
+    },
+    /// Withdraw this node's advertisement for a tag.
+    AnycastWithdraw {
+        tag: String,
+    },
     /// Store a key-value pair directly in the local DHT (hex key + hex value).
     DhtPut {
         key: String,
@@ -565,6 +586,11 @@ pub enum AdminResult {
         contacts: Vec<AdminDhtContact>,
     },
     /// Result of a local DHT key lookup.
+    /// Candidates for an anycast tag, best first.
+    AnycastCandidates {
+        service_tag: String,
+        node_ids: Vec<String>,
+    },
     DhtValue {
         key: String,
         value_hex: Option<String>,
@@ -2315,6 +2341,7 @@ async fn handle_admin_connection(
             runtime,
             shutdown_tx.clone(),
             admin_socket.clone(),
+            config_path.clone(),
         )
         .await
     };
@@ -2385,11 +2412,35 @@ pub enum AdminConnectionOutcome {
     },
 }
 
+/// Parse an anycast service tag: exactly four ASCII bytes.
+///
+/// Four because that is what the wire record carries, and ASCII because the
+/// tag is a name an operator types and reads back in a resolve result — a hex
+/// form would be accepted here and printed back unrecognizable.
+fn parse_service_tag(tag: &str) -> std::result::Result<[u8; 4], String> {
+    let bytes = tag.as_bytes();
+    if bytes.len() != 4 {
+        return Err(format!(
+            "a service tag is exactly 4 bytes; `{tag}` is {}",
+            bytes.len()
+        ));
+    }
+    if !tag.is_ascii() {
+        return Err(format!("a service tag must be ASCII; `{tag}` is not"));
+    }
+    let mut out = [0u8; 4];
+    out.copy_from_slice(bytes);
+    Ok(out)
+}
+
 async fn execute_admin_command(
     command: AdminCommand,
     runtime: Arc<Mutex<NodeRuntime>>,
     shutdown_tx: watch::Sender<bool>,
     admin_socket: PathBuf,
+    // The anycast arms build the service the way the node itself does, and
+    // that takes the config — which the connection already holds.
+    config_path: PathBuf,
 ) -> AdminConnectionOutcome {
     // keep a clone of the command + runtime handle so the
     // audit hook at the end of the function can build an event AFTER
@@ -2874,6 +2925,79 @@ async fn execute_admin_command(
                 })
                 .collect();
             Ok(AdminResult::DhtContacts { contacts })
+        }
+
+        AdminCommand::AnycastAdvertise {
+            tag,
+            score,
+            ttl_secs,
+        } => {
+            let tag = match parse_service_tag(&tag) {
+                Ok(t) => t,
+                Err(e) => return AdminConnectionOutcome::Response(AdminResponse::err(e)),
+            };
+            let config = match veil_cfg::load_config(&config_path) {
+                Ok(c) => c,
+                Err(e) => {
+                    return AdminConnectionOutcome::Response(AdminResponse::err(format!(
+                        "reading the config to build the anycast service: {e}"
+                    )));
+                }
+            };
+            let runtime = runtime.lock().await;
+            runtime
+                .build_anycast_service(&config)
+                .advertise(tag, score, ttl_secs);
+            Ok(AdminResult::Ack {
+                message: format!(
+                    "advertising `{}` (score {score}, ttl {ttl_secs}s); it reaches other \
+                     nodes on the next DHT republish",
+                    String::from_utf8_lossy(&tag),
+                ),
+            })
+        }
+
+        AdminCommand::AnycastResolve { tag, max_results } => {
+            let tag = match parse_service_tag(&tag) {
+                Ok(t) => t,
+                Err(e) => return AdminConnectionOutcome::Response(AdminResponse::err(e)),
+            };
+            let config = match veil_cfg::load_config(&config_path) {
+                Ok(c) => c,
+                Err(e) => {
+                    return AdminConnectionOutcome::Response(AdminResponse::err(format!(
+                        "reading the config to build the anycast service: {e}"
+                    )));
+                }
+            };
+            let runtime = runtime.lock().await;
+            let result = runtime
+                .build_anycast_service(&config)
+                .resolve(tag, max_results);
+            Ok(AdminResult::AnycastCandidates {
+                service_tag: String::from_utf8_lossy(&result.service_tag).into_owned(),
+                node_ids: result.node_ids.iter().map(|n| bytes_to_hex(n)).collect(),
+            })
+        }
+
+        AdminCommand::AnycastWithdraw { tag } => {
+            let tag = match parse_service_tag(&tag) {
+                Ok(t) => t,
+                Err(e) => return AdminConnectionOutcome::Response(AdminResponse::err(e)),
+            };
+            let config = match veil_cfg::load_config(&config_path) {
+                Ok(c) => c,
+                Err(e) => {
+                    return AdminConnectionOutcome::Response(AdminResponse::err(format!(
+                        "reading the config to build the anycast service: {e}"
+                    )));
+                }
+            };
+            let runtime = runtime.lock().await;
+            runtime.build_anycast_service(&config).withdraw(tag);
+            Ok(AdminResult::Ack {
+                message: format!("withdrew `{}`", String::from_utf8_lossy(&tag)),
+            })
         }
 
         AdminCommand::DhtGet { key } => {
@@ -4476,6 +4600,130 @@ mod tests {
             reread.listen.len(),
             2,
             "persist=true must write the new listen entry to disk",
+        );
+
+        let _ = send_request(&socket, AdminCommand::Stop).await.unwrap();
+        server.await.unwrap().unwrap();
+        let _ = fs::remove_file(path);
+    }
+
+    /// An operator can advertise a tag on a live node and ask what it
+    /// resolves to — over the same socket every other command uses.
+    ///
+    /// Until this command existed nothing outside the node could reach anycast
+    /// at all: the capability sat behind IPC opcodes whose only caller was a
+    /// test module. That is also why nobody noticed that an advertisement
+    /// never left the node it was made on.
+    ///
+    /// The node answers with the address it advertises UNDER, which for a
+    /// sovereign identity is the identity and not the device — so this is also
+    /// the end-to-end check that the operator is handed the address a contact
+    /// would use.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn anycast_advertise_then_resolve_over_the_admin_socket() {
+        let path = save_admin_config("node-admin-anycast", config_with_admin_socket()).unwrap();
+        let socket =
+            admin_socket_path(&veil_cfg::load_config(&path).unwrap(), path.parent()).unwrap();
+        let server_path = path.clone();
+        let server = tokio::spawn(async move { run_foreground(server_path, true).await });
+        wait_for_socket(&socket).await;
+
+        // Nothing advertised yet.
+        let empty = send_request(
+            &socket,
+            AdminCommand::AnycastResolve {
+                tag: "LOAD".to_owned(),
+                max_results: 8,
+            },
+        )
+        .await
+        .unwrap();
+        let Some(AdminResult::AnycastCandidates { node_ids, .. }) = empty.result else {
+            panic!("unexpected resolve response: {empty:?}");
+        };
+        assert!(node_ids.is_empty(), "control: nothing advertises this tag");
+
+        let ack = send_request(
+            &socket,
+            AdminCommand::AnycastAdvertise {
+                tag: "LOAD".to_owned(),
+                score: 0,
+                ttl_secs: 3600,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(ack.result, Some(AdminResult::Ack { .. })),
+            "advertise must be acknowledged: {ack:?}",
+        );
+
+        let resolved = send_request(
+            &socket,
+            AdminCommand::AnycastResolve {
+                tag: "LOAD".to_owned(),
+                max_results: 8,
+            },
+        )
+        .await
+        .unwrap();
+        let Some(AdminResult::AnycastCandidates {
+            service_tag,
+            node_ids,
+        }) = resolved.result
+        else {
+            panic!("unexpected resolve response: {resolved:?}");
+        };
+        assert_eq!(
+            service_tag, "LOAD",
+            "the tag is echoed as the operator typed it"
+        );
+        assert_eq!(
+            node_ids.len(),
+            1,
+            "the node must resolve the tag it just advertised",
+        );
+
+        // And withdrawing takes it back out.
+        let _ = send_request(
+            &socket,
+            AdminCommand::AnycastWithdraw {
+                tag: "LOAD".to_owned(),
+            },
+        )
+        .await
+        .unwrap();
+        let after = send_request(
+            &socket,
+            AdminCommand::AnycastResolve {
+                tag: "LOAD".to_owned(),
+                max_results: 8,
+            },
+        )
+        .await
+        .unwrap();
+        let Some(AdminResult::AnycastCandidates { node_ids, .. }) = after.result else {
+            panic!("unexpected resolve response: {after:?}");
+        };
+        assert!(
+            node_ids.is_empty(),
+            "withdraw must remove the advertisement"
+        );
+
+        // A tag that is not four bytes is refused with a reason, not a panic.
+        let bad = send_request(
+            &socket,
+            AdminCommand::AnycastResolve {
+                tag: "TOOLONG".to_owned(),
+                max_results: 8,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(
+            bad.error.is_some_and(|e| e.contains("exactly 4 bytes")),
+            "a malformed tag must say what is wrong with it",
         );
 
         let _ = send_request(&socket, AdminCommand::Stop).await.unwrap();

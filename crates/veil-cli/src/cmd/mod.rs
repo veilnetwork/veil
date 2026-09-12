@@ -1,4 +1,5 @@
 mod adapters;
+mod anycast_cmd;
 mod background;
 mod bootstrap_cmd;
 pub mod cli;
