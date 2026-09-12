@@ -633,7 +633,7 @@ impl NodeRuntime {
     /// not wiring, and a decision inside a six-hundred-line assembly is a
     /// decision nothing can test. Called from `spawn_ipc_server`; the tests
     /// call this same function rather than a copy of its body.
-    pub(crate) fn build_anycast_service(
+    pub fn build_anycast_service(
         &self,
         config: &veil_cfg::Config,
     ) -> Arc<veil_anycast::AnycastService> {

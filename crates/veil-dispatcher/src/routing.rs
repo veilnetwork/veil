@@ -2365,6 +2365,22 @@ impl FrameDispatcher {
                         }
                         return DispatchResult::NoResponse;
                     }
+                    // Anycast service list: merged, not replaced — same
+                    // reason as the direct STORE arm.
+                    if veil_proto::anycast::is_anycast_blob(&q.payload) {
+                        let (merged, origin) =
+                            match self.anycast_store_gate(&q.target_key, &q.payload) {
+                                Ok(pair) => pair,
+                                Err(disposition) => return disposition,
+                            };
+                        if !self.dht.store_with_origin(q.target_key, merged, origin) {
+                            return DispatchResult::NoResponse;
+                        }
+                        if let Some(resp) = build_signed(vec![1]) {
+                            send_response(resp);
+                        }
+                        return DispatchResult::NoResponse;
+                    }
                     if q.payload.get(..2)
                         == Some(&veil_crypto::space_discovery::SPACE_DISCOVERY_DHT_MAGIC[..])
                     {

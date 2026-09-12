@@ -1380,6 +1380,24 @@ Node: looks up the DHT by anycast_key(service_name) → gets a candidate list �
 Node → Client: AnycastResult(node_id + endpoint)
 ```
 
+The candidate list is read from the node's OWN shard, so what puts a provider
+in front of a resolver is replication, not the lookup: `advertise` writes
+locally and the periodic DHT republish fans the list to the key's K-closest
+peers.
+
+That value is shared by every provider of the tag, which is why the receiving
+side merges instead of storing. A plain store would let each republish delete
+the other providers, and the tag would belong to whoever wrote last. The
+merge verifies each record's own signature, drops records past their own TTL,
+and refuses a newcomer when the list is full rather than evicting a live
+provider.
+
+The address in a record is the IDENTITY's, not the device's: a resolver binds
+a record by hashing the signing key to it, or by looking up the identity
+document AT it, and a device transport id answers to neither. Several devices
+of one identity therefore advertise under one address — which is what lets
+the layer below distribute the work between them.
+
 ### 18.6 E2E in IPC
 
 The client requests E2E by setting `encrypt: true` in `AppIpcSend`. The node then:

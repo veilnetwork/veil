@@ -1514,6 +1514,15 @@ pub const ORIGIN_UNSIGNED: [u8; 32] = [0xFFu8; 32];
 /// owner instead, matching the direct STORE path's per-signer accounting.
 pub const ORIGIN_RECURSIVE_BUNDLE: [u8; 32] = [0xEEu8; 32];
 
+/// Synthetic origin id for anycast service lists.
+///
+/// An anycast DHT value is ONE list shared by every provider of a service
+/// tag, so there is no single owner to charge the bytes to — and charging the
+/// first record's owner would hand an attacker the choice of whose bucket to
+/// fill. All anycast lists share this bucket, so the per-origin byte cap still
+/// bounds them collectively.
+pub const ORIGIN_ANYCAST_LIST: [u8; 32] = [0xEAu8; 32];
+
 /// One stored entry together with the two facts a `(key, value)` pair drops on
 /// the floor: the origin that authorised the write, and how long the entry has
 /// already lived.

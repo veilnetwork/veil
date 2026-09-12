@@ -7844,4 +7844,156 @@ mod tests {
 
         net.stop().await;
     }
+
+    /// An advertisement must reach a node that did not make it.
+    ///
+    /// `AnycastService::advertise` writes with `store_local`, which is purely
+    /// local, so the only thing that ever carries an advertisement to another
+    /// node is the republish driver — and its filter had no arm for the
+    /// anycast magics, while the receiving STORE gate had none either. A
+    /// resolver anywhere else therefore got nothing, always: in-process the
+    /// crate's own tests passed because advertise and resolve shared one
+    /// store, and across the network anycast had never distributed anything.
+    ///
+    /// Two real nodes over loopback, one advertising and the other resolving,
+    /// is the smallest arrangement in which that claim is a measurement rather
+    /// than a reading of the code.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_anycast_advertisement_reaches_another_node() {
+        // Short republish interval: the production default is half an hour,
+        // and the scenario is about whether the record travels at all, not
+        // about when.
+        let dht = crate::cfg::DhtConfig {
+            republish_interval_secs: 4,
+            ..Default::default()
+        };
+        let mut net = SimNetwork::builder()
+            .nodes(2)
+            .role(NodeRole::Core)
+            .dht(dht)
+            .build()
+            .await;
+        net.wire_ring().await;
+        assert!(
+            net.node(0).wait_sessions(1, SIM_WAIT_LIMIT).await,
+            "the two nodes must be talking before anything can travel between them"
+        );
+
+        const TAG: [u8; 4] = *b"LOAD";
+        // Everything here is observed through the capability itself rather
+        // than through the store behind it: what matters is what a resolver
+        // on the other node can hand out.
+        let resolve_on_the_other_node = |net: &SimNetwork| {
+            let cfg = net.node(1).config.clone();
+            net.node(1)
+                .runtime
+                .build_anycast_service(&cfg)
+                .resolve(TAG, 8)
+                .node_ids
+        };
+        assert!(
+            resolve_on_the_other_node(&net).is_empty(),
+            "control: the resolver must have nothing for this tag yet"
+        );
+
+        let advertiser_id = net.node(0).node_id();
+        let cfg = net.node(0).config.clone();
+        net.node(0)
+            .runtime
+            .build_anycast_service(&cfg)
+            .advertise(TAG, 0, 3600);
+
+        let deadline = std::time::Instant::now() + SIM_WAIT_LIMIT;
+        let mut resolved = Vec::new();
+        while std::time::Instant::now() < deadline {
+            resolved = resolve_on_the_other_node(&net);
+            if !resolved.is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+        assert_eq!(
+            resolved,
+            vec![advertiser_id],
+            "the other node must resolve the tag to the advertiser under the \
+             shipped default policy; an empty result means the advertisement \
+             never left the node that made it"
+        );
+
+        net.stop().await;
+    }
+
+    /// Two providers of one tag, and a third node that must see BOTH.
+    ///
+    /// This is what anycast is for: several nodes answering under one service
+    /// name, so a resolver has something to distribute load across. The DHT
+    /// value is ONE list shared by every provider, and a store replaces a
+    /// value — so without a merging STORE gate the two advertisements delete
+    /// each other on every republish interval and the tag ends up owned by
+    /// whoever wrote last. One candidate coming back is that failure, and it
+    /// is indistinguishable from success unless the scenario names the count.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn two_providers_of_one_tag_both_reach_a_third_node() {
+        let dht = crate::cfg::DhtConfig {
+            republish_interval_secs: 4,
+            ..Default::default()
+        };
+        let mut net = SimNetwork::builder()
+            .nodes(3)
+            .role(NodeRole::Core)
+            .dht(dht)
+            .build()
+            .await;
+        net.wire_full_mesh().await;
+        for i in 0..3 {
+            assert!(
+                net.node(i).wait_sessions(2, SIM_WAIT_LIMIT).await,
+                "node {i} must be talking to both others"
+            );
+        }
+
+        const TAG: [u8; 4] = *b"SHRD";
+        let resolve_on_the_third = |net: &SimNetwork| {
+            let cfg = net.node(2).config.clone();
+            let mut ids = net
+                .node(2)
+                .runtime
+                .build_anycast_service(&cfg)
+                .resolve(TAG, 8)
+                .node_ids;
+            ids.sort();
+            ids
+        };
+        assert!(
+            resolve_on_the_third(&net).is_empty(),
+            "control: nothing advertised yet"
+        );
+
+        let mut expected = vec![net.node(0).node_id(), net.node(1).node_id()];
+        expected.sort();
+        for i in 0..2 {
+            let cfg = net.node(i).config.clone();
+            net.node(i)
+                .runtime
+                .build_anycast_service(&cfg)
+                .advertise(TAG, 0, 3600);
+        }
+
+        let deadline = std::time::Instant::now() + SIM_WAIT_LIMIT;
+        let mut resolved = Vec::new();
+        while std::time::Instant::now() < deadline {
+            resolved = resolve_on_the_third(&net);
+            if resolved.len() >= 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+        assert_eq!(
+            resolved, expected,
+            "the third node must see BOTH providers; one of them means the \
+             stores are replacing each other instead of merging"
+        );
+
+        net.stop().await;
+    }
 }
