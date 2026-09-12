@@ -3762,3 +3762,125 @@ fn the_identity_selfcheck_is_owned_by_its_task() {
         "the self-check spawn is gone, or another one appeared beside it"
     );
 }
+
+/// An anycast record this node publishes must name the IDENTITY, not the device.
+///
+/// A resolver binds a record to an address before it will hand it out, and
+/// under the DEFAULT `SignedBound` policy the record's own `node_id` is what it
+/// binds: `sig_key_idx == 0` demands `BLAKE3(owner_pubkey) == node_id`, and any
+/// other index looks up the identity document AT that node_id. The device's
+/// transport id satisfies neither — its hash is of the wrong key, and no
+/// document is stored at it. So publishing under it did not merely name the
+/// wrong thing: every record this node advertised was dropped by every peer,
+/// and the node was a provider nobody could resolve.
+///
+/// The control is the point of the test: a node with NO sovereign identity is
+/// unchanged and still resolvable, so the fix is not "always use the document".
+#[tokio::test(flavor = "current_thread")]
+async fn an_anycast_record_names_the_identity_so_a_resolver_admits_it() {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!("anycast-identity-{unique}"));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("node.toml");
+
+    const TAG: [u8; 4] = *b"LOAD";
+    let config = runtime_config_with_listen();
+    veil_cfg::save_config(&path, &config).unwrap();
+
+    // Control FIRST, on the very same config: a legacy node (no document on
+    // disk) advertises and resolves. Whatever the fix does, it must not cost
+    // this.
+    {
+        let mut runtime = NodeRuntime::start(&path, true)
+            .await
+            .expect("a node with no sovereign identity starts");
+        let svc = runtime.build_anycast_service(&config);
+        svc.advertise(TAG, 0, 300);
+        let resolver = veil_anycast::AnycastService::new(Arc::clone(&runtime.dht), [0xA5; 32])
+            .with_policy(veil_anycast::AnycastResolvePolicy::SignedBound);
+        assert_eq!(
+            resolver.resolve(TAG, 8).node_ids.len(),
+            1,
+            "a legacy node's own record must still survive the default policy",
+        );
+        runtime.stop().await.expect("runtime stops");
+    }
+
+    // Now provision a real sovereign identity NEXT TO the config, so the
+    // document's node_id and the node's transport node_id are two different
+    // values — which is every multi-device identity, and every identity
+    // restored onto a device that mined its own transport key.
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    veil_identity::sovereign_flow::create_identity(
+        veil_identity::sovereign_flow::CreateIdentityOptions {
+            veil_dir: dir.clone(),
+            save_encrypted_with_password: None,
+            // The cheapest KDF the API allows: this fixture is about which
+            // address the record carries, not about Argon2.
+            argon2_params_override: Some((8, 1, 1)),
+            extra_entropy: None,
+            instance_label: "anycast-test".to_string(),
+            pow_difficulty: 0,
+            issued_at_unix: now,
+            valid_until_unix: now + 7 * 24 * 3600,
+            algo: SignatureAlgorithm::Ed25519,
+        },
+    )
+    .expect("create_identity");
+
+    let mut runtime = NodeRuntime::start(&path, true)
+        .await
+        .expect("a node with a sovereign identity starts");
+    let sov = runtime
+        .identity
+        .sovereign_identity
+        .get()
+        .expect("the document on disk must be loaded");
+    let identity_address = *sov.node_id();
+    let device_address = *runtime.identity.local_identity.node_id.as_bytes();
+    assert_ne!(
+        identity_address, device_address,
+        "fixture is vacuous unless the identity and the device are two addresses",
+    );
+
+    let svc = runtime.build_anycast_service(&config);
+    svc.advertise(TAG, 0, 300);
+
+    // A resolver that holds NOTHING gets nothing, and that is the shipped
+    // limit, not a defect: a real identity's device key is named by its
+    // document, so a resolver with no document cannot tie the record to the
+    // address and refuses it. Pinned here so the limit is stated where the
+    // capability is, and so a future async lookup reddens this line.
+    let stranger = veil_anycast::AnycastService::new(Arc::clone(&runtime.dht), [0xA5; 32])
+        .with_policy(veil_anycast::AnycastResolvePolicy::SignedBound);
+    assert!(
+        stranger.resolve(TAG, 8).node_ids.is_empty(),
+        "a resolver that does not hold the identity document cannot bind the \
+         record, and must not hand it out",
+    );
+
+    // A resolver wired the way the daemon wires one — which is the same
+    // function, so this is the production filter and not a copy of it.
+    let resolved = runtime.build_anycast_service(&config).resolve(TAG, 8);
+    assert_eq!(
+        resolved.node_ids,
+        vec![identity_address],
+        "a resolver running the default policy must get this node's IDENTITY \
+         address back; got {:?} (device address is {})",
+        resolved
+            .node_ids
+            .iter()
+            .map(|id| veil_util::bytes_to_hex(id))
+            .collect::<Vec<_>>(),
+        veil_util::bytes_to_hex(&device_address),
+    );
+
+    runtime.stop().await.expect("runtime stops");
+    let _ = fs::remove_dir_all(&dir);
+}
