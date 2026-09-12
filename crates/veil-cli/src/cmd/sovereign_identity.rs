@@ -706,7 +706,7 @@ fn restore<I: CommandIo>(
     }
     let opts = RestoreIdentityOptions {
         veil_dir: veil_dir.clone(),
-        master_seed,
+        master: veil_cfg::sovereign_flow::MasterRecovery::Seed(master_seed),
         // Audit L-15: the field is now Option<Zeroizing<Vec<u8>>>; `.map` moves
         // the password Vec into Zeroizing so the in-flight copy is wiped on drop.
         save_encrypted_with_password: save_encrypted_password.map(zeroize::Zeroizing::new),
@@ -2006,7 +2006,7 @@ fn import_qr_backup<I: CommandIo>(
     let now = now_unix_secs();
     let out = restore_identity(RestoreIdentityOptions {
         veil_dir: veil_dir.clone(),
-        master_seed,
+        master: veil_cfg::sovereign_flow::MasterRecovery::Seed(master_seed),
         save_encrypted_with_password: None,
         argon2_params_override: None,
         instance_label: args.label.clone(),

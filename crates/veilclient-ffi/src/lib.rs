@@ -5418,7 +5418,7 @@ unsafe fn restore_from_phrase_inner(
 
     let opts = veil_identity::sovereign_flow::RestoreIdentityOptions {
         veil_dir: std::path::PathBuf::from(dir_str),
-        master_seed,
+        master: veil_identity::sovereign_flow::MasterRecovery::Seed(master_seed),
         save_encrypted_with_password: None,
         argon2_params_override: None,
         instance_label: label_str.chars().take(64).collect::<String>(),
@@ -5651,6 +5651,166 @@ pub unsafe extern "C" fn veil_provision_hybrid_identity_from_credential_zeroize(
             instance_label_len,
             err_out,
         )
+    }
+}
+
+/// Provision this device under the identity a RECOVERY CERTIFICATE names.
+///
+/// The half that made a certificate a keepsake rather than a recovery medium.
+/// An XVRC is re-wrapped under its own high-entropy code precisely so the
+/// exported file is not openable by the words — and every provisioning path
+/// opened credentials with the PHRASE, so a device that stored a certificate
+/// booted DEGENERATE: no sovereign document, and the identity's address gone
+/// while the certificate sat right there. Measured against the real library on
+/// 2026-09-12: `ensureSovereignIdentity` returned null for exactly the blob
+/// the app writes when someone recovers.
+///
+/// It works because the certificate carries the WHOLE master. What it does not
+/// carry is the BIP-39 seed behind the Ed25519 half — `derive_master_sk_ed25519`
+/// is one-way — so this restores the identity exactly, same `node_id`, and
+/// cannot write a `master.enc`. [`MasterRecovery`] is where that distinction
+/// lives.
+///
+/// `identity_toml` names the key THIS device signs with, exactly as the
+/// phrase-taking sibling uses it: the device key is the host's, the identity is
+/// the certificate's.
+///
+/// `code` is the certificate's own recovery code, SECRET, and wiped in place
+/// before return on every path. It is not a phrase and is never decoded as one.
+///
+/// # Safety
+/// `certificate` readable for its length; `code` writable for `code_len` and
+/// wiped on every path; `veil_dir`, `instance_label` and `identity_toml`
+/// readable for their lengths; `err_out` a writable slot.
+#[cfg(feature = "node-embedded")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn veil_provision_identity_from_certificate_zeroize(
+    certificate: *const u8,
+    certificate_len: usize,
+    code: *mut u8,
+    code_len: usize,
+    veil_dir: *const u8,
+    veil_dir_len: usize,
+    instance_label: *const u8,
+    instance_label_len: usize,
+    identity_toml: *const u8,
+    identity_toml_len: usize,
+    err_out: *mut *mut c_char,
+) -> c_int {
+    unsafe { clear_err(err_out) };
+    // ARMED FIRST: every refusal below used to be a path that left the
+    // caller's secret where they put it (report14 V14-M14).
+    let Some(_code_guard) = (unsafe { ZeroOnDrop::arm(code, code_len) }) else {
+        unsafe { write_err(err_out, "code is NULL or too long (>4 KiB)") };
+        return VEIL_ERR_INVALID_ARG;
+    };
+    if certificate.is_null() || certificate_len == 0 {
+        unsafe { write_err(err_out, "certificate is NULL or empty") };
+        return VEIL_ERR_INVALID_ARG;
+    }
+    let Some(dir_str) = (unsafe { slice_to_str(veil_dir, veil_dir_len) }) else {
+        unsafe { write_err(err_out, "veil_dir is NULL or invalid UTF-8") };
+        return VEIL_ERR_INVALID_ARG;
+    };
+    let Some(label_str) = (unsafe { slice_to_str(instance_label, instance_label_len) }) else {
+        unsafe { write_err(err_out, "instance_label is NULL or invalid UTF-8") };
+        return VEIL_ERR_INVALID_ARG;
+    };
+    let Some(toml_str) = (unsafe { slice_to_str(identity_toml, identity_toml_len) }) else {
+        unsafe { write_err(err_out, "identity_toml is NULL or invalid UTF-8") };
+        return VEIL_ERR_INVALID_ARG;
+    };
+
+    let cert_bytes = unsafe { std::slice::from_raw_parts(certificate, certificate_len) };
+    if !cert_bytes.starts_with(b"XVRC") {
+        // Named, because the near miss is handing this the sovereign BUNDLE:
+        // that one opens with the phrase and has its own entry point.
+        unsafe {
+            write_err(
+                err_out,
+                "this is not an XVRC recovery certificate. A sovereign bundle \
+                 opens with the phrase — use \
+                 veil_provision_hybrid_identity_from_credential_zeroize for it.",
+            )
+        };
+        return VEIL_ERR_INVALID_ARG;
+    }
+    let code_bytes = unsafe { std::slice::from_raw_parts(code as *const u8, code_len) };
+    let material =
+        match veil_identity::sovereign_bundle::open_recovery_certificate(cert_bytes, code_bytes) {
+            Ok(m) => m,
+            Err(e) => {
+                unsafe { write_err(err_out, format!("certificate did not open: {e}")) };
+                return VEIL_ERR_INVALID_ARG;
+            }
+        };
+    let Some(falcon_bundle) = material.master_falcon_bundle() else {
+        unsafe {
+            write_err(
+                err_out,
+                "this certificate is not Ed25519+Falcon-512, so it names no \
+                 hybrid master",
+            )
+        };
+        return VEIL_ERR_INVALID_ARG;
+    };
+    let Some(master_ed_sk) = material.master_ed25519_secret_key() else {
+        unsafe { write_err(err_out, "this certificate carries no Ed25519 master half") };
+        return VEIL_ERR_INVALID_ARG;
+    };
+
+    // The device key is the HOST's, read from the node config it already runs
+    // on — the same rule the phrase-taking sibling follows, and the reason two
+    // devices of one identity are told apart at all.
+    let config = match veil_cfg::parse_toml_str(toml_str) {
+        Ok(c) => c,
+        Err(e) => {
+            unsafe { write_err(err_out, format!("identity_toml parse failed: {e}")) };
+            return VEIL_ERR_INVALID_ARG;
+        }
+    };
+    let Some(identity) = config.identity else {
+        unsafe { write_err(err_out, "identity_toml has no [identity] section") };
+        return VEIL_ERR_INVALID_ARG;
+    };
+    use base64::{Engine as _, engine::general_purpose::STANDARD};
+    let device_seed = match STANDARD.decode(identity.private_key.as_bytes()) {
+        Ok(bytes) if bytes.len() == 32 => {
+            let mut seed = [0u8; 32];
+            seed.copy_from_slice(&bytes);
+            zeroize::Zeroizing::new(seed)
+        }
+        _ => {
+            unsafe { write_err(err_out, "identity_toml key is not a 32-byte Ed25519 seed") };
+            return VEIL_ERR_INVALID_ARG;
+        }
+    };
+
+    let now_unix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+
+    match veil_identity::sovereign_flow::restore_identity(
+        veil_identity::sovereign_flow::RestoreIdentityOptions {
+            veil_dir: std::path::PathBuf::from(dir_str),
+            master: veil_identity::sovereign_flow::MasterRecovery::Ed25519SecretKey(master_ed_sk),
+            save_encrypted_with_password: None,
+            argon2_params_override: None,
+            instance_label: label_str.chars().take(64).collect::<String>(),
+            pow_difficulty: 0,
+            now_unix,
+            valid_until_unix: now_unix + VEIL_DEFAULT_RESTORE_VALIDITY_SECS,
+            algo: veil_types::SignatureAlgorithm::Ed25519Falcon512Hybrid,
+            master_falcon_keypair_bytes: Some(falcon_bundle.to_vec()),
+            device_sk_seed: Some(device_seed),
+        },
+    ) {
+        Ok(_) => VEIL_OK,
+        Err(e) => {
+            unsafe { write_err(err_out, format!("restore_identity: {e}")) };
+            VEIL_ERR
+        }
     }
 }
 
@@ -6976,7 +7136,7 @@ pub unsafe extern "C" fn veil_restore_identity_from_phrase_zeroize_with_password
 
     let opts = veil_identity::sovereign_flow::RestoreIdentityOptions {
         veil_dir: std::path::PathBuf::from(dir_str),
-        master_seed,
+        master: veil_identity::sovereign_flow::MasterRecovery::Seed(master_seed),
         save_encrypted_with_password: pw_bytes,
         argon2_params_override: None,
         instance_label: label_str.chars().take(64).collect::<String>(),

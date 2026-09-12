@@ -1101,6 +1101,194 @@ fn a_hybrid_identity_admits_and_revokes_a_second_device_through_the_ffi() {
         .expect("the document must still verify after a revocation");
 }
 
+/// A RECOVERY CERTIFICATE restores the identity — the same address, not a
+/// lookalike.
+///
+/// This is what the certificate was offered for, and it did not work. An XVRC
+/// is re-wrapped under its own high-entropy code so the exported file is not
+/// openable by the words; every provisioning path opened credentials with the
+/// PHRASE. A device that stored a certificate therefore booted degenerate —
+/// no sovereign document at all — with the certificate sitting right there.
+/// Measured through the app's own boot on 2026-09-12: `material=NULL`.
+///
+/// The control is the point: the same certificate through the phrase-taking
+/// entry point must still be refused, or this test would pass in a world where
+/// the defect never existed.
+#[cfg(feature = "node-embedded")]
+#[test]
+fn a_recovery_certificate_restores_the_same_identity() {
+    use veil_proto::identity_document::{ALGO_ED25519_FALCON512_HYBRID, IdentityDocument};
+
+    let phrase = fresh_phrase();
+    let phrase_str = phrase.to_str().unwrap().to_string();
+
+    // The identity, as the app creates it: hybrid, credential minted at birth.
+    let origin = tempfile::tempdir().expect("tempdir");
+    let origin_s = origin.path().to_str().unwrap().to_string();
+    let mut buf: Vec<u8> = phrase_str.as_bytes().to_vec();
+    let n = buf.len();
+    let mut err: *mut c_char = ptr::null_mut();
+    let toml_ptr = unsafe {
+        crate::node::veil_config_init_from_phrase_zeroize(buf.as_mut_ptr(), n, 1, &mut err)
+    };
+    assert!(!toml_ptr.is_null(), "node config from phrase");
+    let node_toml = unsafe { std::ffi::CStr::from_ptr(toml_ptr) }
+        .to_str()
+        .unwrap()
+        .to_string();
+    unsafe { veil_free_string(toml_ptr) };
+
+    let bundle = veil_identity::sovereign_bundle::create_hybrid512(phrase_str.as_bytes())
+        .expect("hybrid credential");
+    let label = "origin";
+    let mut secret: Vec<u8> = phrase_str.as_bytes().to_vec();
+    let sn = secret.len();
+    let rc = unsafe {
+        veil_provision_hybrid_identity_from_credential_zeroize(
+            bundle.as_ptr(),
+            bundle.len(),
+            secret.as_mut_ptr(),
+            sn,
+            origin_s.as_ptr(),
+            origin_s.len(),
+            label.as_ptr(),
+            label.len(),
+            node_toml.as_ptr(),
+            node_toml.len(),
+            &mut err,
+        )
+    };
+    assert_eq!(rc, VEIL_OK, "provisioning the origin device");
+    let want = IdentityDocument::decode(
+        &std::fs::read(origin.path().join("identity_document.bin")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(want.master_algo, ALGO_ED25519_FALCON512_HYBRID);
+
+    // What the operator actually exports: an XVRC under a code of its own.
+    // 32 bytes is the floor the module enforces; a fixed value keeps the test
+    // deterministic and the code is not what is under test here.
+    let code = "a-recovery-code-of-at-least-32-bytes!!".to_string();
+    let certificate = veil_identity::sovereign_bundle::export_recovery_certificate(
+        &bundle,
+        phrase_str.as_bytes(),
+        code.as_bytes(),
+    )
+    .expect("export certificate");
+    assert!(certificate.starts_with(b"XVRC"));
+
+    // A FRESH machine: its own node config, so its own device key.
+    let fresh = tempfile::tempdir().expect("tempdir");
+    let fresh_s = fresh.path().to_str().unwrap().to_string();
+    let other_phrase = fresh_phrase();
+    let mut buf2: Vec<u8> = other_phrase.to_str().unwrap().as_bytes().to_vec();
+    let n2 = buf2.len();
+    let mut err: *mut c_char = ptr::null_mut();
+    let toml2_ptr = unsafe {
+        crate::node::veil_config_init_from_phrase_zeroize(buf2.as_mut_ptr(), n2, 1, &mut err)
+    };
+    assert!(!toml2_ptr.is_null());
+    let fresh_toml = unsafe { std::ffi::CStr::from_ptr(toml2_ptr) }
+        .to_str()
+        .unwrap()
+        .to_string();
+    unsafe { veil_free_string(toml2_ptr) };
+
+    // THE CONTROL: the phrase-taking path cannot open an XVRC. If this ever
+    // returns VEIL_OK the defect is gone by another route and the assertion
+    // below is measuring nothing.
+    let mut wrong: Vec<u8> = phrase_str.as_bytes().to_vec();
+    let wn = wrong.len();
+    let mut err: *mut c_char = ptr::null_mut();
+    let rc = unsafe {
+        veil_provision_hybrid_identity_from_credential_zeroize(
+            certificate.as_ptr(),
+            certificate.len(),
+            wrong.as_mut_ptr(),
+            wn,
+            fresh_s.as_ptr(),
+            fresh_s.len(),
+            label.as_ptr(),
+            label.len(),
+            fresh_toml.as_ptr(),
+            fresh_toml.len(),
+            &mut err,
+        )
+    };
+    assert_eq!(
+        rc, VEIL_ERR_INVALID_ARG,
+        "an XVRC opens with its CODE; taking the phrase for it would provision \
+         a different identity"
+    );
+    if !err.is_null() {
+        unsafe { veil_free_string(err) };
+    }
+    assert!(
+        !fresh.path().join("identity_document.bin").exists(),
+        "a refused provisioning must leave nothing behind"
+    );
+
+    // And now the certificate, with its own code.
+    let mut code_buf: Vec<u8> = code.as_bytes().to_vec();
+    let cn = code_buf.len();
+    let mut err: *mut c_char = ptr::null_mut();
+    let rc = unsafe {
+        veil_provision_identity_from_certificate_zeroize(
+            certificate.as_ptr(),
+            certificate.len(),
+            code_buf.as_mut_ptr(),
+            cn,
+            fresh_s.as_ptr(),
+            fresh_s.len(),
+            label.as_ptr(),
+            label.len(),
+            fresh_toml.as_ptr(),
+            fresh_toml.len(),
+            &mut err,
+        )
+    };
+    if !err.is_null() {
+        let msg = unsafe { std::ffi::CStr::from_ptr(err) }
+            .to_string_lossy()
+            .into_owned();
+        unsafe { veil_free_string(err) };
+        panic!("a certificate must restore its identity: {msg}");
+    }
+    assert_eq!(rc, VEIL_OK);
+    assert!(
+        code_buf.iter().all(|&b| b == 0),
+        "the code must be wiped on the success path too"
+    );
+
+    let got = IdentityDocument::decode(
+        &std::fs::read(fresh.path().join("identity_document.bin")).unwrap(),
+    )
+    .unwrap();
+
+    // THE POINT: the same address, restored from the certificate alone.
+    assert_eq!(
+        got.node_id, want.node_id,
+        "the certificate has to restore the identity's ADDRESS — recovering to \
+         a lookalike is what makes the 24 words pointless"
+    );
+    assert_eq!(got.master_pubkey, want.master_pubkey);
+    assert_eq!(got.master_algo, ALGO_ED25519_FALCON512_HYBRID);
+
+    // ...and it is a DIFFERENT device under it, not a clone of the first.
+    assert_ne!(
+        got.identity_keys[0].pubkey, want.identity_keys[0].pubkey,
+        "the device key is the host's; sharing one would make the two machines \
+         a single device"
+    );
+    veil_identity::verify::verify_identity_document(&got, got.issued_at_unix)
+        .expect("the restored document must verify");
+
+    // No master.enc, and that is deliberate: a certificate carries the KEY and
+    // not the seed behind it, so a file claiming to hold the seed would be a
+    // file that does not open this identity.
+    assert!(!fresh.path().join("master.enc").exists());
+}
+
 /// A device that came back from a week offline renews itself — one secret, no
 /// other device, no new key.
 ///
