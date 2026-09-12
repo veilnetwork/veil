@@ -941,23 +941,15 @@ pub(crate) async fn rendezvous_recipient_recheck(
     // Once per address the receiver must be findable at: the device id every
     // sender knows how to verify, and — when a sovereign identity's address is
     // a different value — the identity address its contacts actually look up.
-    let published: usize = super::rendezvous_ad_binding::receiver_addresses(
-        *identity.local_identity.node_id.as_bytes(),
+    let published = super::NodeRuntime::tick_publish_rendezvous_ads(
+        &anonymity.rendezvous_publisher_entries,
+        anonymity.x25519_sk.as_ref(),
+        identity.local_identity.as_ref(),
         &identity.sovereign_identity,
-    )
-    .iter()
-    .map(|receiver| {
-        super::NodeRuntime::tick_publish_rendezvous_ads(
-            &anonymity.rendezvous_publisher_entries,
-            anonymity.x25519_sk.as_ref(),
-            identity.local_identity.as_ref(),
-            receiver,
-            dht,
-            logger,
-            Some(session_tx_registry),
-        )
-    })
-    .sum();
+        dht,
+        logger,
+        Some(session_tx_registry),
+    );
     if published > 0 {
         logger.info(
             "anonymity.rendezvous_recipient.published_immediate",

@@ -425,22 +425,15 @@ impl NodeRuntime {
                         // active rendezvous-publisher entries near
                         // half-life. No-op when receiver has not
                         // called `register_rendezvous_publisher`.
-                        for receiver in
-                            super::rendezvous_ad_binding::receiver_addresses(
-                                *identity_for_publish.local_identity.node_id.as_bytes(),
-                                &identity_for_publish.sovereign_identity,
-                            )
-                        {
-                            Self::tick_publish_rendezvous_ads(
-                                &rendezvous_publisher_entries,
-                                &anonymity_x25519_sk,
-                                &local_identity_for_publish,
-                                &receiver,
-                                &dht_for_publish,
-                                &publish_logger,
-                                Some(&session_tx_registry_for_tick),
-                            );
-                        }
+                        Self::tick_publish_rendezvous_ads(
+                            &rendezvous_publisher_entries,
+                            &anonymity_x25519_sk,
+                            &local_identity_for_publish,
+                            &identity_for_publish.sovereign_identity,
+                            &dht_for_publish,
+                            &publish_logger,
+                            Some(&session_tx_registry_for_tick),
+                        );
                         // Proactively populate the local relay-directory cache
                         // for the CONNECTED relays (the onion-circuit hop
                         // candidates). The onion-service build resolves each
@@ -947,7 +940,43 @@ impl NodeRuntime {
     ///
     /// Returns the count of ads refreshed this tick (for metrics +
     /// tests). Empty `entries` → 0 with no DHT mutation.
+    /// Publish this receiver's ads under EVERY address it receives at.
+    ///
+    /// The address list is not a parameter on purpose. It was, for four call
+    /// sites, and a receiver that is findable at one address and not the other
+    /// is exactly the defect this exists to close — so the one thing a caller
+    /// could get wrong is the one thing it no longer passes. Hand it the
+    /// identity cell this node already holds; which addresses that means is
+    /// `rendezvous_ad_binding::receiver_addresses`, in one place.
     pub fn tick_publish_rendezvous_ads(
+        entries: &Arc<Mutex<Vec<veil_anonymity::rendezvous::RendezvousPublisherEntry>>>,
+        anonymity_x25519_sk: &x25519_dalek::StaticSecret,
+        local_identity: &crate::local_identity::HandshakeIdentity,
+        sovereign: &super::identity_state::SovereignIdentityCell,
+        dht: &Arc<veil_dht::kademlia::KademliaService>,
+        logger: &Arc<veil_observability::NodeLogger>,
+        session_tx_registry: Option<&Arc<RwLock<veil_session::tx_registry::SessionTxRegistry>>>,
+    ) -> usize {
+        super::rendezvous_ad_binding::receiver_addresses(
+            *local_identity.node_id.as_bytes(),
+            sovereign,
+        )
+        .iter()
+        .map(|receiver| {
+            Self::publish_rendezvous_ads_at(
+                entries,
+                anonymity_x25519_sk,
+                local_identity,
+                receiver,
+                dht,
+                logger,
+                session_tx_registry,
+            )
+        })
+        .sum()
+    }
+
+    pub(crate) fn publish_rendezvous_ads_at(
         entries: &Arc<Mutex<Vec<veil_anonymity::rendezvous::RendezvousPublisherEntry>>>,
         anonymity_x25519_sk: &x25519_dalek::StaticSecret,
         local_identity: &crate::local_identity::HandshakeIdentity,
@@ -1087,10 +1116,15 @@ impl NodeRuntime {
         for (idx, entry) in snapshot.iter().take(n_slots).enumerate() {
             // A location-anonymous entry's ad is keyed and signed under its own
             // PSEUDO identity, which has nothing to do with the address this
-            // pass is publishing for. Publishing it once per receiver address
-            // would write the same key twice — and, worse, the point of that
-            // pseudo identity is that the ad is NOT linked to the service's
-            // sovereign address. So it belongs to the device pass only.
+            // pass publishes for — so every pass would produce the same ad at
+            // the same key, and only the first of them writes anything. Skip
+            // the rest.
+            //
+            // WORK, not safety, and the difference is worth stating: what keeps
+            // the pseudo identity unlinked is that the ad's KEY is the pseudo
+            // id, which is true whichever pass writes it. Removing this line
+            // changes nothing observable — the later pass finds its own ad
+            // fresh and skips — which is why no test can hold it in place.
             if entry.ephemeral_ad_identity.is_some()
                 && receiver_node_id != *local_identity.node_id.as_bytes()
             {
@@ -1712,7 +1746,7 @@ mod tests {
             &entries,
             &sk,
             &identity,
-            identity.node_id.as_bytes(),
+            &crate::runtime::identity_state::SovereignIdentityCell::new(None),
             &dht,
             &logger,
             None,
@@ -1762,7 +1796,7 @@ mod tests {
             &entries,
             &sk,
             &identity,
-            identity.node_id.as_bytes(),
+            &crate::runtime::identity_state::SovereignIdentityCell::new(None),
             &dht,
             &logger,
             None,
@@ -1816,7 +1850,7 @@ mod tests {
             &entries,
             &sk,
             &identity,
-            identity.node_id.as_bytes(),
+            &crate::runtime::identity_state::SovereignIdentityCell::new(None),
             &dht,
             &logger,
             None,
@@ -1890,7 +1924,7 @@ mod tests {
             &entries,
             &sk,
             &identity,
-            identity.node_id.as_bytes(),
+            &crate::runtime::identity_state::SovereignIdentityCell::new(None),
             &dht,
             &logger,
             None,
@@ -1905,7 +1939,7 @@ mod tests {
             &entries,
             &sk,
             &identity,
-            identity.node_id.as_bytes(),
+            &crate::runtime::identity_state::SovereignIdentityCell::new(None),
             &dht,
             &logger,
             None,
@@ -1950,7 +1984,7 @@ mod tests {
             &entries,
             &sk,
             &identity,
-            identity.node_id.as_bytes(),
+            &crate::runtime::identity_state::SovereignIdentityCell::new(None),
             &dht,
             &logger,
             None,
@@ -1964,7 +1998,7 @@ mod tests {
             &entries,
             &sk,
             &identity,
-            identity.node_id.as_bytes(),
+            &crate::runtime::identity_state::SovereignIdentityCell::new(None),
             &dht,
             &logger,
             None,
@@ -2021,7 +2055,7 @@ mod tests {
             &entries,
             &sk,
             &identity,
-            identity.node_id.as_bytes(),
+            &crate::runtime::identity_state::SovereignIdentityCell::new(None),
             &dht,
             &logger,
             None,
@@ -2196,12 +2230,18 @@ mod ad_window_tests {
 
     /// The tick has to ASK. A helper nothing calls is a decision that is not
     /// being made, and this file is 1400 lines long.
+    ///
+    /// It names `publish_rendezvous_ads_at`, which is where an ad is actually
+    /// signed; `tick_publish_rendezvous_ads` above it only walks the addresses
+    /// the receiver answers at. A guard that names a function goes stale in
+    /// silence when the function is split — this one did, on exactly that
+    /// split, which is the whole reason it is written as a guard.
     #[test]
     fn the_publish_tick_uses_it() {
         let source = include_str!("maintenance.rs");
         let at = source
-            .find("fn tick_publish_rendezvous_ads")
-            .expect("the tick moved");
+            .find("fn publish_rendezvous_ads_at")
+            .expect("the publishing function moved");
         let body = &source[at..];
         let end = body.find("\n    }\n").expect("no end of function");
         assert!(
