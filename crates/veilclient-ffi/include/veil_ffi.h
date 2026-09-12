@@ -2096,6 +2096,32 @@ int veil_reissue_device_delegation_zeroize(const uint8_t *credential,
 
 #if defined(VEIL_FFI_NODE_EMBEDDED)
 /**
+ * When THIS device's delegation runs out, in Unix seconds.
+ *
+ * The one question a host needs to answer both of its own: whether to renew
+ * now, and whether to warn. Asked here rather than parsed in the host because
+ * the document's layout is veil's, and a second reader of a wire format is a
+ * second thing to keep in step — the drift would be silent and the symptom
+ * would be a device that went quiet.
+ *
+ * Writes `0` when this device is not named by the document at all, which is
+ * not an error: a node with no sovereign identity has no delegation to
+ * expire.
+ *
+ * # Safety
+ * `veil_dir` readable for its length; `out_valid_until_unix` a writable
+ * `u64` slot; `err_out` a writable slot.
+ */
+
+int veil_device_delegation_valid_until(const uint8_t *veil_dir,
+                                       uintptr_t veil_dir_len,
+                                       uint64_t *out_valid_until_unix,
+                                       char **err_out)
+;
+#endif
+
+#if defined(VEIL_FFI_NODE_EMBEDDED)
+/**
  * Admit a device using the master secret an application already holds: the
  * `[identity]` keypair of its own node config.
  *

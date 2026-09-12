@@ -5981,6 +5981,76 @@ pub unsafe extern "C" fn veil_reissue_device_delegation_zeroize(
     }
 }
 
+/// When THIS device's delegation runs out, in Unix seconds.
+///
+/// The one question a host needs to answer both of its own: whether to renew
+/// now, and whether to warn. Asked here rather than parsed in the host because
+/// the document's layout is veil's, and a second reader of a wire format is a
+/// second thing to keep in step — the drift would be silent and the symptom
+/// would be a device that went quiet.
+///
+/// Writes `0` when this device is not named by the document at all, which is
+/// not an error: a node with no sovereign identity has no delegation to
+/// expire.
+///
+/// # Safety
+/// `veil_dir` readable for its length; `out_valid_until_unix` a writable
+/// `u64` slot; `err_out` a writable slot.
+#[cfg(feature = "node-embedded")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn veil_device_delegation_valid_until(
+    veil_dir: *const u8,
+    veil_dir_len: usize,
+    out_valid_until_unix: *mut u64,
+    err_out: *mut *mut c_char,
+) -> c_int {
+    unsafe { clear_err(err_out) };
+    if out_valid_until_unix.is_null() {
+        unsafe { write_err(err_out, "out_valid_until_unix is NULL") };
+        return VEIL_ERR_INVALID_ARG;
+    }
+    let Some(dir_str) = (unsafe { slice_to_str(veil_dir, veil_dir_len) }) else {
+        unsafe { write_err(err_out, "veil_dir is NULL or invalid UTF-8") };
+        return VEIL_ERR_INVALID_ARG;
+    };
+    let dir = std::path::PathBuf::from(dir_str);
+    let doc_bytes = match std::fs::read(dir.join("identity_document.bin")) {
+        Ok(b) => b,
+        Err(e) => {
+            unsafe { write_err(err_out, format!("read identity_document.bin: {e}")) };
+            return VEIL_ERR;
+        }
+    };
+    let doc = match veil_proto::identity_document::IdentityDocument::decode(&doc_bytes) {
+        Ok(d) => d,
+        Err(e) => {
+            unsafe { write_err(err_out, format!("document decode: {e}")) };
+            return VEIL_ERR;
+        }
+    };
+    // This device's own key, not the document's active one: on a device that
+    // is not the signer those differ, and the window that matters here is the
+    // one that decides whether THIS device is still admitted.
+    let own = match veil_identity::sovereign_flow::load_identity_sk(&dir) {
+        Ok(seed) => ed25519_dalek::SigningKey::from_bytes(seed.as_array())
+            .verifying_key()
+            .to_bytes()
+            .to_vec(),
+        Err(e) => {
+            unsafe { write_err(err_out, format!("load own device key: {e}")) };
+            return VEIL_ERR;
+        }
+    };
+    let valid_until = doc
+        .identity_keys
+        .iter()
+        .find(|k| k.pubkey == own)
+        .map(|k| k.valid_until_unix)
+        .unwrap_or(0);
+    unsafe { *out_valid_until_unix = valid_until };
+    VEIL_OK
+}
+
 /// Admit a device using the master secret an application already holds: the
 /// `[identity]` keypair of its own node config.
 ///
