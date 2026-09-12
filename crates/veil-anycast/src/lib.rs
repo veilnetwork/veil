@@ -14,6 +14,21 @@
 //! Nodes that are no longer reachable age out naturally when their TTL
 //! causes the DHT entry to expire.
 //!
+//! ## How a record reaches another node
+//!
+//! [`AnycastService::advertise`] writes LOCALLY. What carries the list to the
+//! rest of the network is the node's periodic DHT republish, which fans every
+//! self-authenticating value to the key's K-closest peers; the receiving side
+//! runs [`anycast_store_decision`] instead of a plain store.
+//!
+//! It has to, and that is the part worth reading twice: the value under an
+//! anycast key belongs to EVERY provider of the tag at once, so a store that
+//! replaced it would have providers deleting each other on every republish
+//! interval, and the tag would end up owned by whoever wrote last. The
+//! decision therefore merges — per-record signature checked, records past
+//! their own TTL aged out, a full list refusing a newcomer rather than
+//! evicting a live provider.
+//!
 //! # Security considerations — secure-by-default, with an opt-down discovery mode
 //!
 //! `AnycastRecord.score` is **peer-controlled**: a node can sign its own record
@@ -202,6 +217,88 @@ pub fn verify_record_owner_binding_delegated(
         ));
     }
     Ok(())
+}
+
+/// What a node should do with an anycast list that arrived from the network.
+///
+/// The decision is here, next to the rules it applies, rather than inside the
+/// dispatcher's STORE arm: the merge is the interesting half and a gate that
+/// owns it cannot be tested without a whole dispatcher.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AnycastStoreDecision {
+    /// Write this value. It is the existing list with the incoming records
+    /// merged into it — never the incoming value as it stands.
+    Merge(Vec<u8>),
+    /// Nothing usable arrived: undecodable, or every record failed its own
+    /// signature. Not attributable to the sender, which may be relaying a list
+    /// it merged from others — drop it without calling it misbehaviour.
+    Drop,
+    /// A record's `service_tag` does not hash to the key it arrived under. A
+    /// valid list for one tag planted under another tag's key is the sender
+    /// misbehaving.
+    NonCanonicalKey,
+}
+
+/// Decide what to store when an anycast list arrives from another node.
+///
+/// Every other DHT record is one owner's, and a store replaces it. An anycast
+/// value is ONE list shared by every provider of a service tag, so replacing
+/// would let any node erase every other provider — the moment lists start
+/// travelling between nodes, which is the point of replicating them at all.
+///
+/// `existing` is the value this node already holds under `key` together with
+/// how long it has been held — the same `(blob, age)` pair [`AnycastService::
+/// resolve`] reads, because the merge applies the same per-record TTL rule:
+/// records already past their own TTL are dropped first, so nothing a resolver
+/// would still return is lost and the freed slots go to live providers.
+///
+/// Signatures are verified per record and failures are dropped. The owner
+/// BINDING is deliberately NOT checked here: it needs the identity document,
+/// which the storing node may not hold, and every reader re-checks it under
+/// its own [`AnycastResolvePolicy`] anyway. A record that cannot be bound is
+/// therefore stored and then refused at resolve, rather than never reaching
+/// the node that CAN bind it.
+///
+/// A remote store never evicts a live provider. With the list already full,
+/// first-come wins rather than last-writer wins.
+pub fn anycast_store_decision(
+    key: &[u8; 32],
+    existing: Option<(&[u8], std::time::Duration)>,
+    incoming: &[u8],
+) -> AnycastStoreDecision {
+    let records = AnycastList::decode(incoming).0;
+    if records.is_empty() {
+        return AnycastStoreDecision::Drop;
+    }
+    let mut admitted = Vec::with_capacity(records.len());
+    for r in records {
+        if AnycastRecord::dht_key(r.service_tag) != *key {
+            return AnycastStoreDecision::NonCanonicalKey;
+        }
+        if verify_record_signature(&r).is_ok() {
+            admitted.push(r);
+        }
+    }
+    if admitted.is_empty() {
+        return AnycastStoreDecision::Drop;
+    }
+    let mut list = match existing {
+        Some((blob, age)) => {
+            let mut held = AnycastList::decode(blob);
+            held.0
+                .retain(|r| r.ttl == 0 || age.as_secs() < r.ttl as u64);
+            held
+        }
+        None => AnycastList::default(),
+    };
+    for r in admitted {
+        if let Some(pos) = list.0.iter().position(|e| e.node_id == r.node_id) {
+            list.0[pos] = r;
+        } else if list.0.len() < MAX_ANYCAST_CANDIDATES {
+            list.0.insert(0, r);
+        }
+    }
+    AnycastStoreDecision::Merge(list.encode())
 }
 
 /// Resolves the one fact a DELEGATED record needs: which device key the
@@ -1732,6 +1829,188 @@ mod tests {
         assert!(
             bare.resolve_signed_bound(*b"vip0", 32).node_ids.is_empty(),
             "without a document there is no binding to check"
+        );
+    }
+
+    /// A list that arrives from the network is MERGED, never substituted.
+    ///
+    /// The value under an anycast key belongs to every provider of the tag at
+    /// once. Replacing it — which is what a store does for every other record
+    /// type — would mean the first node to publish after you erases you, and
+    /// the last writer owns the tag. That is not a corner case once lists
+    /// travel between nodes: the republish driver re-fans whatever a node
+    /// holds, so a straight replace would have providers deleting each other
+    /// on every republish interval.
+    #[test]
+    fn a_list_from_the_network_is_merged_into_the_one_we_hold() {
+        let tag = *b"mrg1";
+        let key = AnycastRecord::dht_key(tag);
+        let ours = make_signing_key(0x91);
+        let theirs = make_signing_key(0x92);
+
+        let mut held = AnycastList::default();
+        held.upsert(AnycastRecord::sign(tag, [0x91; 32], 5, 3600, 0, &ours));
+        let held_blob = held.encode();
+
+        let mut arriving = AnycastList::default();
+        arriving.upsert(AnycastRecord::sign(tag, [0x92; 32], 5, 3600, 0, &theirs));
+
+        let decision = anycast_store_decision(
+            &key,
+            Some((&held_blob, std::time::Duration::from_secs(1))),
+            &arriving.encode(),
+        );
+        let AnycastStoreDecision::Merge(merged) = decision else {
+            panic!("a valid list must be stored, got {decision:?}");
+        };
+        let ids: Vec<[u8; 32]> = AnycastList::decode(&merged)
+            .0
+            .into_iter()
+            .map(|r| r.node_id)
+            .collect();
+        assert!(
+            ids.contains(&[0x91; 32]) && ids.contains(&[0x92; 32]),
+            "both providers must survive the store; got {} records",
+            ids.len(),
+        );
+    }
+
+    /// A full list does not let a newcomer from the network evict anyone.
+    #[test]
+    fn a_full_list_refuses_a_newcomer_rather_than_evicting_a_provider() {
+        let tag = *b"mrg2";
+        let key = AnycastRecord::dht_key(tag);
+        let mut held = AnycastList::default();
+        for i in 0..MAX_ANYCAST_CANDIDATES {
+            let k = make_signing_key(0xB0u8.wrapping_add(i as u8));
+            held.upsert(AnycastRecord::sign(
+                tag,
+                [0xB0u8.wrapping_add(i as u8); 32],
+                5,
+                3600,
+                0,
+                &k,
+            ));
+        }
+        assert_eq!(held.0.len(), MAX_ANYCAST_CANDIDATES);
+        let held_blob = held.encode();
+
+        let newcomer = make_signing_key(0x5A);
+        let mut arriving = AnycastList::default();
+        arriving.upsert(AnycastRecord::sign(tag, [0x5A; 32], 0, 3600, 0, &newcomer));
+
+        let decision = anycast_store_decision(
+            &key,
+            Some((&held_blob, std::time::Duration::from_secs(1))),
+            &arriving.encode(),
+        );
+        let AnycastStoreDecision::Merge(merged) = decision else {
+            panic!("got {decision:?}");
+        };
+        let ids: Vec<[u8; 32]> = AnycastList::decode(&merged)
+            .0
+            .into_iter()
+            .map(|r| r.node_id)
+            .collect();
+        assert_eq!(ids.len(), MAX_ANYCAST_CANDIDATES, "the cap still holds");
+        assert!(
+            !ids.contains(&[0x5A; 32]),
+            "a remote store must not push a live provider out of a full list"
+        );
+    }
+
+    /// Records past their own TTL make room; nothing a resolver would still
+    /// hand out is dropped.
+    #[test]
+    fn the_merge_ages_out_what_resolve_would_already_refuse() {
+        let tag = *b"mrg3";
+        let key = AnycastRecord::dht_key(tag);
+        let gone = make_signing_key(0xC1);
+        let newcomer = make_signing_key(0xC2);
+
+        let mut held = AnycastList::default();
+        held.upsert(AnycastRecord::sign(tag, [0xC1; 32], 5, 1, 0, &gone));
+        let held_blob = held.encode();
+
+        let mut arriving = AnycastList::default();
+        arriving.upsert(AnycastRecord::sign(tag, [0xC2; 32], 5, 3600, 0, &newcomer));
+
+        // Held for longer than the departed provider's own TTL.
+        let decision = anycast_store_decision(
+            &key,
+            Some((&held_blob, std::time::Duration::from_secs(5))),
+            &arriving.encode(),
+        );
+        let AnycastStoreDecision::Merge(merged) = decision else {
+            panic!("got {decision:?}");
+        };
+        let ids: Vec<[u8; 32]> = AnycastList::decode(&merged)
+            .0
+            .into_iter()
+            .map(|r| r.node_id)
+            .collect();
+        assert_eq!(ids, vec![[0xC2; 32]], "the expired record must not survive");
+
+        // And within the TTL it does survive — or the rule is just deletion.
+        let decision = anycast_store_decision(
+            &key,
+            Some((&held_blob, std::time::Duration::from_millis(100))),
+            &arriving.encode(),
+        );
+        let AnycastStoreDecision::Merge(merged) = decision else {
+            panic!("got {decision:?}");
+        };
+        assert_eq!(
+            AnycastList::decode(&merged).0.len(),
+            2,
+            "a record still inside its TTL must be kept"
+        );
+    }
+
+    /// A list for one tag may not be planted under another tag's key.
+    #[test]
+    fn a_list_under_another_tags_key_is_refused() {
+        let signer = make_signing_key(0xD1);
+        let mut arriving = AnycastList::default();
+        arriving.upsert(AnycastRecord::sign(
+            *b"real", [0xD1; 32], 5, 3600, 0, &signer,
+        ));
+        assert_eq!(
+            anycast_store_decision(&AnycastRecord::dht_key(*b"othr"), None, &arriving.encode()),
+            AnycastStoreDecision::NonCanonicalKey,
+        );
+    }
+
+    /// Unsigned or unverifiable records are dropped, and a list of nothing
+    /// else is not stored at all.
+    #[test]
+    fn records_that_do_not_verify_are_dropped_not_stored() {
+        let tag = *b"mrg4";
+        let key = AnycastRecord::dht_key(tag);
+        let mut arriving = AnycastList::default();
+        arriving.upsert(AnycastRecord {
+            service_tag: tag,
+            node_id: [0xE1; 32],
+            score: 0,
+            ttl: 3600,
+            signature: None,
+        });
+        assert_eq!(
+            anycast_store_decision(&key, None, &arriving.encode()),
+            AnycastStoreDecision::Drop,
+            "an unsigned list must not be written by a remote store",
+        );
+
+        // A forged signature is dropped the same way: sign one record, then
+        // claim a different node_id under the same bytes.
+        let signer = make_signing_key(0xE2);
+        let mut forged = AnycastRecord::sign(tag, [0xE2; 32], 5, 3600, 0, &signer);
+        forged.node_id = [0xE3; 32];
+        let mut list = AnycastList::default();
+        list.upsert(forged);
+        assert_eq!(
+            anycast_store_decision(&key, None, &list.encode()),
+            AnycastStoreDecision::Drop,
         );
     }
 

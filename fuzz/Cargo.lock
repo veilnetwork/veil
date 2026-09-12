@@ -3223,6 +3223,7 @@ dependencies = [
  "tokio",
  "veil-abuse",
  "veil-anonymity",
+ "veil-anycast",
  "veil-app",
  "veil-bootstrap",
  "veil-bufpool",

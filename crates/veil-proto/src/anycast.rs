@@ -47,6 +47,21 @@ pub const ANYCAST_MAGIC_V2: [u8; 2] = [0x41, 0x44]; // "AD"
 /// resolvers that predate v3 (they skip the unknown v3 magic).
 pub const ANYCAST_MAGIC_V3: [u8; 2] = [0x41, 0x45]; // "AE"
 
+/// Whether a DHT value is an anycast service list.
+///
+/// A list is a concatenation of records, so its first two bytes are the first
+/// record's magic — v1, v2 or v3. One place to ask, because the answer is
+/// needed by the STORE gate, by the republish filter and by the resolver, and
+/// three hand-written copies of "one of these three constants" is how the v3
+/// magic gets forgotten in one of them.
+#[must_use]
+pub fn is_anycast_blob(value: &[u8]) -> bool {
+    matches!(
+        value.get(..2),
+        Some(m) if m == ANYCAST_MAGIC || m == ANYCAST_MAGIC_V2 || m == ANYCAST_MAGIC_V3
+    )
+}
+
 /// Wire size of a **v1 (unsigned)** record.
 pub const ANYCAST_RECORD_SIZE: usize = 44;
 

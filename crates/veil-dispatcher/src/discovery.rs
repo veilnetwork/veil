@@ -417,6 +417,23 @@ impl FrameDispatcher {
                             }
                             return DispatchResult::NoResponse;
                         }
+                        // An anycast service list ("AC"/"AD"/"AE") is ONE
+                        // value shared by every provider of a tag, so a plain
+                        // last-write-wins store would let any peer erase the
+                        // rest. Its gate returns the MERGED value to write.
+                        if payload.key != self_key
+                            && veil_proto::anycast::is_anycast_blob(&payload.value)
+                        {
+                            let (merged, origin) =
+                                match self.anycast_store_gate(&payload.key, &payload.value) {
+                                    Ok(pair) => pair,
+                                    Err(disposition) => return disposition,
+                                };
+                            if !self.dht.store_with_origin(payload.key, merged, origin) {
+                                return DispatchResult::RateLimited;
+                            }
+                            return DispatchResult::NoResponse;
+                        }
                         if payload.key != self_key
                             && payload.value.get(..2)
                                 == Some(
@@ -1238,6 +1255,37 @@ impl FrameDispatcher {
             // identity than the slot asked for, so this is the write-side half
             // of a binding the read side has all along.
             true
+        }
+    }
+
+    /// STORE gate for an anycast service list, returning the value to WRITE.
+    ///
+    /// Wiring only: the rule is [`veil_anycast::anycast_store_decision`], which
+    /// lives with the other anycast rules and is tested there. This reads what
+    /// the node already holds — value AND age, because the merge applies the
+    /// same per-record TTL rule `resolve` does — and turns the decision into
+    /// this plane's dispositions.
+    #[allow(clippy::result_large_err)]
+    pub fn anycast_store_gate(
+        &self,
+        key: &[u8; 32],
+        value: &[u8],
+    ) -> Result<(Vec<u8>, [u8; 32]), DispatchResult> {
+        let held = self.dht.get_local_with_meta(key);
+        let existing = held.as_ref().map(|(blob, at)| {
+            (
+                blob.as_slice(),
+                std::time::Instant::now().duration_since(*at),
+            )
+        });
+        match veil_anycast::anycast_store_decision(key, existing, value) {
+            veil_anycast::AnycastStoreDecision::Merge(merged) => {
+                Ok((merged, veil_dht::store::ORIGIN_ANYCAST_LIST))
+            }
+            veil_anycast::AnycastStoreDecision::Drop => Err(DispatchResult::NoResponse),
+            veil_anycast::AnycastStoreDecision::NonCanonicalKey => Err(DispatchResult::Violation(
+                "Store: anycast record stored under a non-canonical DHT key".to_owned(),
+            )),
         }
     }
 
