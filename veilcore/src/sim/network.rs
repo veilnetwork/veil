@@ -164,7 +164,7 @@ fn provision_restored_sovereign_identity_for_sim(
         .unwrap_or(0);
     restore_identity(RestoreIdentityOptions {
         veil_dir: veil_dir.clone(),
-        master_seed: master_seed.clone(),
+        master: crate::cfg::sovereign_flow::MasterRecovery::Seed(master_seed.clone()),
         save_encrypted_with_password: None,
         argon2_params_override: None,
         instance_label: "sim-restored".into(),
