@@ -2056,6 +2056,46 @@ int veil_delegate_device_from_phrase_zeroize(uint8_t *phrase,
 
 #if defined(VEIL_FFI_NODE_EMBEDDED)
 /**
+ * Move a device's delegation window forward, re-signed by the master.
+ *
+ * What a device needs when it comes back from a week offline, and it is not
+ * a re-enrolment: the device keeps its key, its `device_id` and its address,
+ * and only the window and the master's certificate over it move. Nothing
+ * else on the device changes, and no other device has to be present.
+ *
+ * Which master signs follows the same rule the boot uses to decide which
+ * identity a phrase names: a `credential` means the hybrid master, and it is
+ * opened here with `secret`; without one the master is the Ed25519 key
+ * `secret` derives as a phrase. Passing a credential that does not belong to
+ * this document is refused rather than guessed.
+ *
+ * `device_pubkey` may be NULL, and for an application that is the usual call:
+ * it means this device's own key, read from `device_identity_sk.bin`, so the
+ * caller never handles key material.
+ *
+ * Refuses a device the document does not name (renewal never admits one), a
+ * revoked device, and a window that does not move forward.
+ *
+ * # Safety
+ * `credential` readable for `credential_len` or NULL; `secret` writable for
+ * `secret_len` and wiped on every path; `veil_dir` readable for its length;
+ * `device_pubkey` readable for its length or NULL; `err_out` a writable slot.
+ */
+
+int veil_reissue_device_delegation_zeroize(const uint8_t *credential,
+                                           uintptr_t credential_len,
+                                           uint8_t *secret,
+                                           uintptr_t secret_len,
+                                           const uint8_t *veil_dir,
+                                           uintptr_t veil_dir_len,
+                                           const uint8_t *device_pubkey,
+                                           uintptr_t device_pubkey_len,
+                                           char **err_out)
+;
+#endif
+
+#if defined(VEIL_FFI_NODE_EMBEDDED)
+/**
  * Admit a device using the master secret an application already holds: the
  * `[identity]` keypair of its own node config.
  *
