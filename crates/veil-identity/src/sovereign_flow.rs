@@ -645,14 +645,59 @@ pub fn create_identity(
 /// decrypted from `master.enc`) and wants to bring up a fresh
 /// per-device `identity_sk` under that seed's identity.
 #[derive(Debug)]
+/// What a restore knows the identity's master by.
+///
+/// Not one field with two meanings, because the two media do not carry the
+/// same thing and only one of them can be written back to `master.enc`.
+#[derive(Clone)]
+pub enum MasterRecovery {
+    /// The 32-byte BIP-39 master seed: what the words reproduce, and what
+    /// `create_identity` minted. Everything downstream can be derived from it,
+    /// including the copy `save_encrypted_with_password` writes.
+    Seed(Zeroizing<[u8; MASTER_SEED_LEN]>),
+
+    /// The master's Ed25519 SECRET KEY, for a medium that carries the key
+    /// rather than the words behind it.
+    ///
+    /// A sovereign credential stores `derive_master_sk_ed25519(seed)`, and that
+    /// derivation is one-way: a recovery CERTIFICATE can hand over this and can
+    /// never hand over the seed. Restoring from one therefore reproduces the
+    /// identity exactly — same master, same `node_id` — while being unable to
+    /// re-create `master.enc`, which is why asking for both is refused rather
+    /// than quietly writing a file that would not open the identity.
+    Ed25519SecretKey(Zeroizing<[u8; 32]>),
+}
+
+impl MasterRecovery {
+    /// The master's Ed25519 secret key, however this restore came to know it.
+    #[must_use]
+    pub fn ed25519_secret_key(&self) -> Zeroizing<[u8; 32]> {
+        match self {
+            Self::Seed(seed) => derive_master_sk_ed25519(seed),
+            Self::Ed25519SecretKey(sk) => sk.clone(),
+        }
+    }
+
+    /// The BIP-39 seed, when there is one. `None` for a credential-carried
+    /// master — see the variant's own note.
+    #[must_use]
+    pub fn seed(&self) -> Option<&Zeroizing<[u8; MASTER_SEED_LEN]>> {
+        match self {
+            Self::Seed(seed) => Some(seed),
+            Self::Ed25519SecretKey(_) => None,
+        }
+    }
+}
+
 pub struct RestoreIdentityOptions {
     /// Directory where per-identity state is persisted (created
     /// if missing).
     pub veil_dir: PathBuf,
 
-    /// Recovered master seed — same identity layer as the original
-    /// `create_identity` produced.
-    pub master_seed: Zeroizing<[u8; MASTER_SEED_LEN]>,
+    /// What this restore knows the master by.
+    ///
+    /// Two media, and they are not interchangeable — see [`MasterRecovery`].
+    pub master: MasterRecovery,
 
     /// If `Some`, re-save the master seed to `master.enc` under
     /// this password (typical when the recovery medium was the
@@ -760,6 +805,13 @@ pub struct RestoreIdentityOutput {
 pub enum RestoreIdentityError {
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
+    #[error(
+        "this master was recovered from a credential, which carries the \
+         Ed25519 KEY and not the BIP-39 seed behind it — there is nothing to \
+         write to master.enc. Restore without a password, or restore from the \
+         phrase if you want that file."
+    )]
+    NoSeedToSave,
     #[error("instance state: {0}")]
     Instance(#[from] crate::instance::InstanceFileError),
     #[error("master file: {0}")]
@@ -809,7 +861,7 @@ pub fn restore_identity(
     // classical and hybrid paths, recoverable from BIP-39).
     // Standalone Falcon-512 doesn't use it (master_seed is informational
     // only) but we still derive for structural simplicity.
-    let master_sk_bytes = derive_master_sk_ed25519(&opts.master_seed);
+    let master_sk_bytes = opts.master.ed25519_secret_key();
     let master_sk = SigningKey::from_bytes(&master_sk_bytes);
     let master_ed_pk = master_sk.verifying_key();
 
@@ -1078,12 +1130,19 @@ pub fn restore_identity(
     };
 
     let encrypted_master_path = if let Some(pw) = &opts.save_encrypted_with_password {
+        // `master.enc` holds the SEED, and a credential-carried master has
+        // none. Refused rather than written from something else: a master.enc
+        // that does not reproduce this identity is worse than no master.enc,
+        // because it is the file its owner would reach for.
+        let Some(seed) = opts.master.seed() else {
+            return Err(RestoreIdentityError::NoSeedToSave);
+        };
         let path = opts.veil_dir.join("master.enc");
         match opts.argon2_params_override {
             Some((m, t, p)) => {
-                save_master_seed_encrypted_with(&path, &opts.master_seed, pw, m, t, p)?;
+                save_master_seed_encrypted_with(&path, seed, pw, m, t, p)?;
             }
-            None => save_master_seed_encrypted(&path, &opts.master_seed, pw)?,
+            None => save_master_seed_encrypted(&path, seed, pw)?,
         }
         Some(path)
     } else {
@@ -3418,7 +3477,7 @@ mod tests {
     fn provision(dir: PathBuf, seed: Zeroizing<[u8; MASTER_SEED_LEN]>) -> RestoreIdentityOutput {
         restore_identity(RestoreIdentityOptions {
             veil_dir: dir,
-            master_seed: seed,
+            master: MasterRecovery::Seed(seed),
             save_encrypted_with_password: None,
             argon2_params_override: None,
             instance_label: "device".into(),
@@ -5033,7 +5092,7 @@ mod tests {
         let now = 1_700_800_000u64;
         let restored = restore_identity(RestoreIdentityOptions {
             veil_dir: fresh_dir,
-            master_seed: Zeroizing::new([0u8; MASTER_SEED_LEN]),
+            master: MasterRecovery::Seed(Zeroizing::new([0u8; MASTER_SEED_LEN])),
             save_encrypted_with_password: None,
             argon2_params_override: None,
             instance_label: "falcon-only-restored".into(),
@@ -5072,7 +5131,7 @@ mod tests {
         let now = 1_700_800_000u64;
         let err = restore_identity(RestoreIdentityOptions {
             veil_dir: dir,
-            master_seed: Zeroizing::new([0u8; MASTER_SEED_LEN]),
+            master: MasterRecovery::Seed(Zeroizing::new([0u8; MASTER_SEED_LEN])),
             save_encrypted_with_password: None,
             argon2_params_override: None,
             instance_label: "falcon-fail".into(),
@@ -5565,7 +5624,7 @@ mod tests {
         let now = 1_700_800_000u64;
         RestoreIdentityOptions {
             veil_dir: dir,
-            master_seed,
+            master: MasterRecovery::Seed(master_seed),
             save_encrypted_with_password: None,
             argon2_params_override: None,
             instance_label: "restored-device".into(),
@@ -5648,7 +5707,7 @@ mod tests {
         let now = 1_700_800_000u64;
         let restored = restore_identity(RestoreIdentityOptions {
             veil_dir: fresh_dir.clone(),
-            master_seed: recovered_seed,
+            master: MasterRecovery::Seed(recovered_seed),
             save_encrypted_with_password: None,
             argon2_params_override: None,
             instance_label: "restored-hybrid-laptop".into(),
@@ -5694,7 +5753,7 @@ mod tests {
         let dummy_seed = Zeroizing::new([0u8; MASTER_SEED_LEN]);
         let err = restore_identity(RestoreIdentityOptions {
             veil_dir: dir,
-            master_seed: dummy_seed,
+            master: MasterRecovery::Seed(dummy_seed),
             save_encrypted_with_password: None,
             argon2_params_override: None,
             instance_label: "nope".into(),

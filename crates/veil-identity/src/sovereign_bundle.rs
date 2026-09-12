@@ -84,6 +84,28 @@ impl SovereignMaterial {
         crate::sovereign_flow::encode_master_falcon_keypair(falcon_sk, falcon_pk).ok()
     }
 
+    /// The master's Ed25519 SECRET KEY out of a hybrid credential.
+    ///
+    /// What a certificate can give and the BIP-39 seed behind it cannot be
+    /// recovered from: `create_hybrid512` stores
+    /// `derive_master_sk_ed25519(seed)`, and that derivation is one-way. A
+    /// restore driven by a certificate therefore reproduces the identity
+    /// exactly and can never write `master.enc` — see
+    /// [`crate::sovereign_flow::MasterRecovery`].
+    ///
+    /// Leaves this module because `restore_identity` needs the key itself, not
+    /// a signer: it is building the document the key will certify. `None` for a
+    /// credential that is not Ed25519+Falcon-512.
+    pub fn master_ed25519_secret_key(&self) -> Option<Zeroizing<[u8; 32]>> {
+        if self.algorithm != SignatureAlgorithm::Ed25519Falcon512Hybrid {
+            return None;
+        }
+        let ed = self.private_key.get(..32)?;
+        let mut out = Zeroizing::new([0u8; 32]);
+        out.copy_from_slice(ed);
+        Some(out)
+    }
+
     /// This credential as the thing that SIGNS, rather than as bytes.
     ///
     /// The private key does not leave this module: what leaves is a
