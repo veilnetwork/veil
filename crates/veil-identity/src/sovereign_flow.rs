@@ -1888,7 +1888,7 @@ pub enum DelegateDeviceError {
     // hybrid master gained a signer, and would have cost the operator their
     // address for nothing.
     #[error(
-        "this identity's master is algo {algo} (1 = Ed25519, \
+        "this identity's master is algo {algo} (0 = Ed25519, \
          3 = Ed25519+Falcon-512) and the secret offered is not that kind. \
          A hybrid identity signs with the credential — open it and pass it \
          alongside the secret; the words alone build only the Ed25519 half"

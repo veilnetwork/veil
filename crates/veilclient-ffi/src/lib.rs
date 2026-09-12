@@ -6994,6 +6994,84 @@ pub unsafe extern "C" fn veil_identity_document_node_id(
     }
 }
 
+/// The MASTER a signed document is named by — its algorithm and its public key.
+///
+/// The invite a person hands out carries a KEY, and whoever redeems it computes
+/// `BLAKE3(key)` to get the address. That arithmetic only works if the key is
+/// the one the identity is named by. For a classic identity it always was: the
+/// master IS the 32-byte Ed25519 key the node config holds. For a HYBRID
+/// identity the master is 929 bytes and the app had no way to reach it at boot
+/// — so the invite carried the Ed25519 half (or, for a created identity with no
+/// master config at all, the DEVICE's own key), and a contact addressed
+/// somewhere the identity does not listen. Measured on one identity:
+/// contacts sent to e794a118…, the mailbox was registered at d7a78850…
+///
+/// Reading it from the DOCUMENT rather than re-deriving it: the document is
+/// what the network was told, so it is what an invite must agree with. Handed
+/// out here rather than parsed in the host — the layout is veil's, and a second
+/// reader of a wire format is a second thing to keep in step.
+///
+/// Writes the algorithm byte to `out_algo` and up to `out_cap` key bytes to
+/// `out_pubkey`, with the true length in `out_len`. A `out_cap` too small is an
+/// error and writes nothing, so a caller cannot mistake a truncated key for a
+/// short one.
+///
+/// # Safety
+/// `document` readable for its length; `out_algo` a writable byte; `out_pubkey`
+/// writable for `out_cap`; `out_len` a writable `usize`; `err_out` a writable
+/// slot.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn veil_identity_document_master(
+    document: *const u8,
+    document_len: usize,
+    out_algo: *mut u8,
+    out_pubkey: *mut u8,
+    out_cap: usize,
+    out_len: *mut usize,
+    err_out: *mut *mut c_char,
+) -> c_int {
+    unsafe {
+        clear_err(err_out);
+    }
+    if document.is_null() || out_algo.is_null() || out_pubkey.is_null() || out_len.is_null() {
+        unsafe {
+            write_err(err_out, "document, out_algo, out_pubkey or out_len is NULL");
+        }
+        return VEIL_ERR_INVALID_ARG;
+    }
+    let bytes = unsafe { std::slice::from_raw_parts(document, document_len) };
+    match veil_proto::identity_document::IdentityDocument::decode(bytes) {
+        Ok(doc) => {
+            let key = &doc.master_pubkey;
+            unsafe { *out_len = key.len() };
+            if key.len() > out_cap {
+                unsafe {
+                    write_err(
+                        err_out,
+                        format!(
+                            "master public key is {} bytes, buffer holds {out_cap} — a hybrid \
+                             master is 929",
+                            key.len()
+                        ),
+                    );
+                }
+                return VEIL_ERR_INVALID_ARG;
+            }
+            unsafe {
+                *out_algo = doc.master_algo;
+                std::ptr::copy_nonoverlapping(key.as_ptr(), out_pubkey, key.len());
+            }
+            VEIL_OK
+        }
+        Err(e) => {
+            unsafe {
+                write_err(err_out, format!("document decode: {e}"));
+            }
+            VEIL_ERR
+        }
+    }
+}
+
 /// Restore identity AND write an encrypted master-seed backup
 /// ([`veil_restore_identity_from_phrase_zeroize`] + passphrase-protected
 /// `master.enc` file in `veil_dir`).
