@@ -84,6 +84,26 @@ impl SovereignMaterial {
         crate::sovereign_flow::encode_master_falcon_keypair(falcon_sk, falcon_pk).ok()
     }
 
+    /// This credential as the thing that SIGNS, rather than as bytes.
+    ///
+    /// The private key does not leave this module: what leaves is a
+    /// [`MasterSecret`], which callers can sign with and cannot read. The
+    /// difference matters because the alternative — an accessor returning the
+    /// key — puts the identity's only irreplaceable secret in every caller's
+    /// hands to hold, log or copy.
+    ///
+    /// `None` for a credential that is not Ed25519+Falcon-512: there is no
+    /// hybrid master here to act as.
+    pub fn as_master_secret(&self) -> Option<crate::sovereign_flow::MasterSecret> {
+        if self.algorithm != SignatureAlgorithm::Ed25519Falcon512Hybrid {
+            return None;
+        }
+        Some(crate::sovereign_flow::MasterSecret::Hybrid512 {
+            public_key: self.public_key.clone(),
+            private_key: Zeroizing::new(self.private_key.to_vec()),
+        })
+    }
+
     pub fn node_id(&self) -> [u8; 32] {
         veil_crypto::identity::compute_node_id(&self.public_key)
     }

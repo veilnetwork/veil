@@ -891,6 +891,102 @@ fn hybrid_identity_is_provisioned_from_the_credential_and_named_by_both_halves()
         .expect("a hybrid-rooted document must verify");
 }
 
+/// A device that came back from a week offline renews itself — one secret, no
+/// other device, no new key.
+///
+/// The state under test is the one that matters: the delegation has ALREADY
+/// lapsed. A renewal that only worked before expiry would be no use to the
+/// device that needs it.
+#[cfg(feature = "node-embedded")]
+#[test]
+fn a_lapsed_device_renews_through_the_ffi_with_one_secret() {
+    use veil_proto::identity_document::IdentityDocument;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let dir_s = dir.path().to_str().unwrap().to_string();
+    let phrase = fresh_phrase();
+    let phrase_str = phrase.to_str().unwrap().to_string();
+
+    // A classic identity: no credential, so the master is what the words give.
+    let mut buf: Vec<u8> = phrase_str.as_bytes().to_vec();
+    let n = buf.len();
+    let label = "renew-me";
+    let mut err: *mut c_char = ptr::null_mut();
+    let rc = unsafe {
+        veil_restore_identity_from_phrase_zeroize(
+            buf.as_mut_ptr(),
+            n,
+            dir_s.as_ptr(),
+            dir_s.len(),
+            label.as_ptr(),
+            label.len(),
+            &mut err,
+        )
+    };
+    assert_eq!(rc, VEIL_OK, "provisioning the classic identity");
+
+    // Wind the delegation back so the device is in the state this exists for:
+    // LAPSED. Renewing a window that is still fresh is correctly refused — it
+    // would not move forward — so a test that skipped this would exercise the
+    // refusal and call it the feature.
+    let mut before =
+        IdentityDocument::decode(&std::fs::read(dir.path().join("identity_document.bin")).unwrap())
+            .unwrap();
+    // BOTH ends move: the decoder refuses a window that ends before it starts,
+    // and rightly — that is a malformed key, not an expired one.
+    before.identity_keys[0].valid_from_unix = before.issued_at_unix - 100;
+    before.identity_keys[0].valid_until_unix = before.issued_at_unix - 1;
+    std::fs::write(dir.path().join("identity_document.bin"), before.encode()).unwrap();
+    let was = before.identity_keys[0].clone();
+
+    let mut secret: Vec<u8> = phrase_str.as_bytes().to_vec();
+    let sn = secret.len();
+    let mut err: *mut c_char = ptr::null_mut();
+    let rc = unsafe {
+        veil_reissue_device_delegation_zeroize(
+            ptr::null(), // no credential: the classic identity
+            0,
+            secret.as_mut_ptr(),
+            sn,
+            dir_s.as_ptr(),
+            dir_s.len(),
+            ptr::null(), // NULL: this device's own key
+            0,
+            &mut err,
+        )
+    };
+    if !err.is_null() {
+        let msg = unsafe { std::ffi::CStr::from_ptr(err) }
+            .to_string_lossy()
+            .into_owned();
+        unsafe { veil_free_string(err) };
+        panic!("renewal failed: {msg}");
+    }
+    assert_eq!(rc, VEIL_OK);
+    assert!(
+        secret.iter().all(|&b| b == 0),
+        "the secret must be wiped on the success path too",
+    );
+
+    let after =
+        IdentityDocument::decode(&std::fs::read(dir.path().join("identity_document.bin")).unwrap())
+            .unwrap();
+    let now = after.identity_keys[0].clone();
+    // Same device, same address — a re-signature, not a re-enrolment.
+    assert_eq!(now.pubkey, was.pubkey, "the device key must not change");
+    assert_eq!(now.device_id, was.device_id);
+    assert_eq!(after.node_id, before.node_id);
+    assert_eq!(after.identity_keys.len(), 1, "no second entry");
+    assert!(
+        now.valid_until_unix > was.valid_until_unix,
+        "the window moved"
+    );
+    assert_ne!(
+        now.master_sig, was.master_sig,
+        "the certificate must be re-signed for the new window",
+    );
+}
+
 #[test]
 fn phase647_h8_validate_zeroize_rejects_null() {
     let mut err: *mut c_char = ptr::null_mut();
