@@ -2004,6 +2004,52 @@ int veil_provision_hybrid_identity_from_credential_zeroize(const uint8_t *creden
 #endif
 
 #if defined(VEIL_FFI_NODE_EMBEDDED)
+/**
+ * Provision this device under the identity a RECOVERY CERTIFICATE names.
+ *
+ * The half that made a certificate a keepsake rather than a recovery medium.
+ * An XVRC is re-wrapped under its own high-entropy code precisely so the
+ * exported file is not openable by the words — and every provisioning path
+ * opened credentials with the PHRASE, so a device that stored a certificate
+ * booted DEGENERATE: no sovereign document, and the identity's address gone
+ * while the certificate sat right there. Measured against the real library on
+ * 2026-09-12: `ensureSovereignIdentity` returned null for exactly the blob
+ * the app writes when someone recovers.
+ *
+ * It works because the certificate carries the WHOLE master. What it does not
+ * carry is the BIP-39 seed behind the Ed25519 half — `derive_master_sk_ed25519`
+ * is one-way — so this restores the identity exactly, same `node_id`, and
+ * cannot write a `master.enc`. [`MasterRecovery`] is where that distinction
+ * lives.
+ *
+ * `identity_toml` names the key THIS device signs with, exactly as the
+ * phrase-taking sibling uses it: the device key is the host's, the identity is
+ * the certificate's.
+ *
+ * `code` is the certificate's own recovery code, SECRET, and wiped in place
+ * before return on every path. It is not a phrase and is never decoded as one.
+ *
+ * # Safety
+ * `certificate` readable for its length; `code` writable for `code_len` and
+ * wiped on every path; `veil_dir`, `instance_label` and `identity_toml`
+ * readable for their lengths; `err_out` a writable slot.
+ */
+
+int veil_provision_identity_from_certificate_zeroize(const uint8_t *certificate,
+                                                     uintptr_t certificate_len,
+                                                     uint8_t *code,
+                                                     uintptr_t code_len,
+                                                     const uint8_t *veil_dir,
+                                                     uintptr_t veil_dir_len,
+                                                     const uint8_t *instance_label,
+                                                     uintptr_t instance_label_len,
+                                                     const uint8_t *identity_toml,
+                                                     uintptr_t identity_toml_len,
+                                                     char **err_out)
+;
+#endif
+
+#if defined(VEIL_FFI_NODE_EMBEDDED)
 
 int veil_restore_identity_from_phrase_zeroize_with_node_key(uint8_t *phrase,
                                                             uintptr_t phrase_len,
