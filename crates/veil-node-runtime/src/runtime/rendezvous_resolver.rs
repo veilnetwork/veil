@@ -132,9 +132,9 @@ pub(super) async fn resolve_fresh_rendezvous_ads(
     // receiver as send-active (the refresher must not keep itself alive).
     force_refresh: bool,
 ) -> Vec<veil_anonymity::rendezvous::RendezvousAd> {
+    use super::rendezvous_ad_binding::ad_binding_ok;
     use veil_anonymity::rendezvous::{
-        MAX_RENDEZVOUS_AD_SLOTS, decode_rendezvous_ad, is_currently_valid,
-        rendezvous_ad_dht_key_at, verify_rendezvous_ad,
+        MAX_RENDEZVOUS_AD_SLOTS, decode_rendezvous_ad, is_currently_valid, rendezvous_ad_dht_key_at,
     };
 
     let now = std::time::SystemTime::now()
@@ -197,7 +197,10 @@ pub(super) async fn resolve_fresh_rendezvous_ads(
                 .filter_map(|idx| dht.get_local(&rendezvous_ad_dht_key_at(&receiver_id, idx)))
                 .filter_map(|bytes| decode_rendezvous_ad(&bytes).ok())
                 .filter(|ad| ad.receiver_node_id == receiver_id)
-                .filter(|ad| verify_rendezvous_ad(ad).is_ok())
+                // Strictly bound, or bound by the receiver's identity document
+                // — a device of an identity advertising at the identity's own
+                // address, which is the only address its contacts know it by.
+                .filter(|ad| ad_binding_ok(dht, ad))
                 .filter(|ad| is_currently_valid(ad, now).is_ok()),
         );
     }
@@ -221,7 +224,7 @@ pub(super) async fn resolve_fresh_rendezvous_ads(
                     decode_rendezvous_ad(bytes)
                         .ok()
                         .filter(|ad| ad.receiver_node_id == receiver_id)
-                        .filter(|ad| verify_rendezvous_ad(ad).is_ok())
+                        .filter(|ad| ad_binding_ok(dht, ad))
                         .filter(|ad| is_currently_valid(ad, now).is_ok())
                         .is_some()
                 },
