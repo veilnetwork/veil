@@ -245,18 +245,38 @@ mod tests {
             rendezvous_kem_valid_until_unix: 0,
         }]));
 
+        // Through the PUBLIC entry point with the identity cell a node holds,
+        // so the wiring is covered too: the caller no longer chooses an
+        // address, and nothing it passes can leave one of the two unpublished.
+        std::fs::write(
+            dir.join("device_identity_sk.bin"),
+            out.identity_sk_seed.as_array(),
+        )
+        .unwrap();
+        let sov = std::sync::Arc::new(
+            veil_identity::sovereign::SovereignIdentity::load_from_dir(&dir)
+                .expect("the identity just written must load"),
+        );
+        let cell = crate::runtime::identity_state::SovereignIdentityCell::new(Some(sov));
+
         let published = crate::runtime::NodeRuntime::tick_publish_rendezvous_ads(
             &entries,
             &x25519_sk,
             &device_identity,
-            &out.node_id,
+            &cell,
             &dht,
             &logger,
             None,
         );
         assert_eq!(
-            published, 1,
-            "the ad must be published at the address asked for"
+            published, 2,
+            "one ad per address the receiver is findable at"
+        );
+        assert!(
+            dht.get_local(&rendezvous_ad_dht_key(device_identity.node_id.as_bytes()))
+                .is_some(),
+            "the device address keeps its ad — that is what every sender on \
+             today's code resolves by",
         );
 
         let bytes = dht
@@ -287,12 +307,15 @@ mod tests {
              address",
         );
 
-        // A LOCATION-ANONYMOUS entry belongs to the device pass alone. Its ad
-        // is keyed and signed under a per-service PSEUDO identity that has
-        // nothing to do with this address — publishing it once per address
-        // would write the same key twice, and the pseudo identity exists
-        // precisely so the ad is NOT linked to the service's sovereign
-        // address.
+        // A LOCATION-ANONYMOUS entry does not gain an address. Its ad is keyed
+        // and signed under a per-service PSEUDO identity, so publishing for two
+        // addresses still produces ONE ad, at that pseudo key and nowhere else.
+        //
+        // This documents the shape rather than guarding it: the skip in
+        // `publish_rendezvous_ads_at` saves the second pass some work, and
+        // removing it changes nothing here, because the second pass would find
+        // its own ad fresh. What keeps the pseudo identity unlinked is the key,
+        // not the skip.
         {
             use veil_anonymity::rendezvous::EphemeralAdIdentity;
             let eph_sk = ed25519_dalek::SigningKey::from_bytes(&[0x5E; 32]);
@@ -328,27 +351,23 @@ mod tests {
                     &eph_entries,
                     &x25519_sk,
                     &device_identity,
-                    &out.node_id,
-                    &fresh,
-                    &logger,
-                    None,
-                ),
-                0,
-                "the identity pass must leave a location-anonymous ad alone",
-            );
-            assert_eq!(
-                crate::runtime::NodeRuntime::tick_publish_rendezvous_ads(
-                    &eph_entries,
-                    &x25519_sk,
-                    &device_identity,
-                    device_identity.node_id.as_bytes(),
+                    &cell,
                     &fresh,
                     &logger,
                     None,
                 ),
                 1,
-                "and the device pass still publishes it — or the assertion \
-                 above is about an entry nothing would publish",
+                "ONE, not two: the ordinary entry above went up at both \
+                 addresses, but a location-anonymous ad has only its pseudo \
+                 key to go to",
+            );
+            assert!(
+                fresh
+                    .get_local(&rendezvous_ad_dht_key(&out.node_id))
+                    .is_none(),
+                "nothing may be written at the identity address for a \
+                 location-anonymous entry — the pseudo identity exists so the \
+                 ad is NOT linked to it",
             );
         }
 
