@@ -781,6 +781,116 @@ fn a_refusal_over_another_argument_still_wipes_the_secret() {
     );
 }
 
+/// A hybrid identity is provisioned from the credential, and it is named by
+/// the WHOLE master.
+///
+/// This is the shape the sovereign identity is meant to have: `node_id` over
+/// `ed25519 ‖ falcon512`, so the words alone cannot reproduce the address and
+/// the credential is what restores it. The device keeps the key it already
+/// runs on — naming a different one would leave every signature it makes
+/// failing its own author binding, silently.
+// Only where the entry point exists: `veil-cfg` and the provisioning path are
+// behind `node-embedded`, and a test that ignored that broke a plain
+// `cargo clippy --workspace` exactly as the entry point it tests once did.
+#[cfg(feature = "node-embedded")]
+#[test]
+fn hybrid_identity_is_provisioned_from_the_credential_and_named_by_both_halves() {
+    use veil_proto::identity_document::{ALGO_ED25519_FALCON512_HYBRID, IdentityDocument};
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let dir_s = dir.path().to_str().unwrap().to_string();
+    let phrase = fresh_phrase();
+    let phrase_str = phrase.to_str().unwrap().to_string();
+
+    // The node key this device already runs on. Difficulty 1: what is under
+    // test is the document, not the nonce search.
+    let mut buf: Vec<u8> = phrase_str.as_bytes().to_vec();
+    let n = buf.len();
+    let mut err: *mut c_char = ptr::null_mut();
+    let toml_ptr = unsafe {
+        crate::node::veil_config_init_from_phrase_zeroize(buf.as_mut_ptr(), n, 1, &mut err)
+    };
+    assert!(!toml_ptr.is_null(), "node config from phrase");
+    let node_toml = unsafe { std::ffi::CStr::from_ptr(toml_ptr) }
+        .to_str()
+        .unwrap()
+        .to_string();
+    unsafe { veil_free_string(toml_ptr) };
+
+    // The credential: this is where the Falcon half comes into being, and the
+    // only place it will ever exist.
+    let credential = veil_identity::sovereign_bundle::create_hybrid512(phrase_str.as_bytes())
+        .expect("hybrid credential");
+
+    let label = "test-device";
+    let mut secret: Vec<u8> = phrase_str.as_bytes().to_vec();
+    let sn = secret.len();
+    let mut err: *mut c_char = ptr::null_mut();
+    let rc = unsafe {
+        veil_provision_hybrid_identity_from_credential_zeroize(
+            credential.as_ptr(),
+            credential.len(),
+            secret.as_mut_ptr(),
+            sn,
+            dir_s.as_ptr(),
+            dir_s.len(),
+            label.as_ptr(),
+            label.len(),
+            node_toml.as_ptr(),
+            node_toml.len(),
+            &mut err,
+        )
+    };
+    if !err.is_null() {
+        let msg = unsafe { std::ffi::CStr::from_ptr(err) }
+            .to_string_lossy()
+            .into_owned();
+        unsafe { veil_free_string(err) };
+        panic!("provisioning failed: {msg}");
+    }
+    assert_eq!(rc, VEIL_OK);
+    assert!(
+        secret.iter().all(|&b| b == 0),
+        "the secret must be wiped on the success path too: {secret:?}"
+    );
+
+    let doc_bytes =
+        std::fs::read(dir.path().join("identity_document.bin")).expect("document written");
+    let doc = IdentityDocument::decode(&doc_bytes).expect("document decodes");
+
+    // Named by BOTH halves — the whole reason the credential is needed.
+    assert_eq!(doc.master_algo, ALGO_ED25519_FALCON512_HYBRID);
+    assert_eq!(doc.master_pubkey.len(), 32 + 897);
+    assert_eq!(
+        doc.node_id,
+        *blake3::hash(&doc.master_pubkey).as_bytes(),
+        "node_id must be BLAKE3 over the whole master",
+    );
+    // And NOT the address the words alone would produce.
+    assert_ne!(
+        doc.node_id,
+        *blake3::hash(&doc.master_pubkey[..32]).as_bytes(),
+        "if the Ed25519 half named the identity, the credential would be optional",
+    );
+
+    // The device is named by the key it already runs on.
+    let config = veil_cfg::parse_toml_str(&node_toml).expect("node toml parses");
+    use base64::Engine as _;
+    let node_pk = base64::engine::general_purpose::STANDARD
+        .decode(config.identity.expect("identity").public_key.as_bytes())
+        .expect("node pubkey");
+    assert_eq!(doc.identity_keys.len(), 1);
+    assert_eq!(
+        doc.identity_keys[0].pubkey, node_pk,
+        "the document must name the key this device signs with",
+    );
+
+    // The document verifies, which means the hybrid master actually certified
+    // that subkey.
+    veil_identity::verify::verify_identity_document(&doc, doc.issued_at_unix)
+        .expect("a hybrid-rooted document must verify");
+}
+
 #[test]
 fn phase647_h8_validate_zeroize_rejects_null() {
     let mut err: *mut c_char = ptr::null_mut();

@@ -57,6 +57,33 @@ pub struct SovereignMaterial {
 }
 
 impl SovereignMaterial {
+    /// The Falcon master keypair inside a HYBRID credential, framed the way
+    /// `master_falcon.bin` is.
+    ///
+    /// The Falcon half is the part of a hybrid master that nothing reproduces:
+    /// the phrase gives the Ed25519 half and this is random at creation, so the
+    /// credential is its only copy. Provisioning a device under such a master
+    /// needs exactly these bytes, and they leave through here rather than by
+    /// making the private key public — the split knowledge of the layout stays
+    /// in the module that wrote it.
+    ///
+    /// `None` for a credential that is not Ed25519+Falcon-512: there is no
+    /// Falcon half to hand out.
+    ///
+    /// Layout, as `create_hybrid512` builds it: the public key is
+    /// `ed25519(32) ‖ falcon_pk`, the private key `ed25519(32) ‖ len(u16 LE) ‖
+    /// falcon_sk`.
+    pub fn master_falcon_bundle(&self) -> Option<Zeroizing<Vec<u8>>> {
+        if self.algorithm != SignatureAlgorithm::Ed25519Falcon512Hybrid {
+            return None;
+        }
+        let falcon_pk = self.public_key.get(32..)?;
+        let len_bytes: [u8; 2] = self.private_key.get(32..34)?.try_into().ok()?;
+        let falcon_sk_len = u16::from_le_bytes(len_bytes) as usize;
+        let falcon_sk = self.private_key.get(34..34 + falcon_sk_len)?;
+        crate::sovereign_flow::encode_master_falcon_keypair(falcon_sk, falcon_pk).ok()
+    }
+
     pub fn node_id(&self) -> [u8; 32] {
         veil_crypto::identity::compute_node_id(&self.public_key)
     }

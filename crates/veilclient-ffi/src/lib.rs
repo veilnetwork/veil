@@ -5338,6 +5338,11 @@ pub unsafe extern "C" fn veil_validate_bip39_phrase_zeroize(
 #[allow(clippy::too_many_arguments)]
 unsafe fn restore_from_phrase_inner(
     device_seed: Option<zeroize::Zeroizing<[u8; 32]>>,
+    // The identity's Falcon master half, framed as `master_falcon.bin` is.
+    // `Some` makes this a HYBRID provisioning: `node_id` is then BLAKE3 over
+    // the whole 929-byte master, not over its Ed25519 half, so the two are
+    // different identities and the caller must mean the one it asks for.
+    falcon_bundle: Option<Vec<u8>>,
     phrase: *mut u8,
     phrase_len: usize,
     veil_dir: *const u8,
@@ -5420,8 +5425,12 @@ unsafe fn restore_from_phrase_inner(
         pow_difficulty: 0,
         now_unix,
         valid_until_unix: now_unix + VEIL_DEFAULT_RESTORE_VALIDITY_SECS,
-        algo: veil_types::SignatureAlgorithm::Ed25519,
-        master_falcon_keypair_bytes: None,
+        algo: if falcon_bundle.is_some() {
+            veil_types::SignatureAlgorithm::Ed25519Falcon512Hybrid
+        } else {
+            veil_types::SignatureAlgorithm::Ed25519
+        },
+        master_falcon_keypair_bytes: falcon_bundle,
         // ADOPT THE NODE'S OWN KEY when the host offers one, so the document
         // names the key this device actually signs and handshakes with.
         //
@@ -5468,6 +5477,7 @@ pub unsafe extern "C" fn veil_restore_identity_from_phrase_zeroize(
     unsafe {
         restore_from_phrase_inner(
             None,
+            None,
             phrase,
             phrase_len,
             veil_dir,
@@ -5508,6 +5518,142 @@ pub unsafe extern "C" fn veil_restore_identity_from_phrase_zeroize(
 // without the gate, it compiled everywhere xVeil builds — which always turns
 // the feature on — and broke a plain `cargo clippy --workspace` that nothing
 // had run since the hygiene gate started failing at `cargo fmt`.
+#[cfg(feature = "node-embedded")]
+/// Provision this device under a HYBRID sovereign identity, taking the master
+/// from the identity's encrypted credential.
+///
+/// The identity this writes is named by the WHOLE master — `node_id` is
+/// BLAKE3 over `ed25519 ‖ falcon512`, 929 bytes — so it is a different
+/// identity from the one the same phrase produces on its own. That is the
+/// point: the Ed25519 half is reproducible from the phrase and the Falcon half
+/// is not, so an identity rooted in both cannot be restored from the words
+/// alone, and the credential is what restores it.
+///
+/// The credential goes in, not the key. `credential` is the stored XVSB or
+/// XVRC blob and `secret` the phrase or recovery code that opens it; the
+/// master is assembled inside and never crosses back. `secret` is a writable
+/// buffer, wiped on every return path, exactly like `phrase` elsewhere.
+///
+/// `identity_toml` is THE KEY THIS DEVICE ALREADY RUNS ON — the same reason
+/// `veil_restore_identity_from_phrase_zeroize_with_node_key` takes it. Without
+/// it the provisioning mints a second device key and names that one, while the
+/// node goes on signing with its own, and every signature fails its own author
+/// binding in silence.
+///
+/// # Safety
+/// `credential` readable for `credential_len`; `secret` writable for
+/// `secret_len`; `veil_dir`, `instance_label` and `identity_toml` readable for
+/// their lengths; `err_out` a writable slot.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn veil_provision_hybrid_identity_from_credential_zeroize(
+    credential: *const u8,
+    credential_len: usize,
+    secret: *mut u8,
+    secret_len: usize,
+    veil_dir: *const u8,
+    veil_dir_len: usize,
+    instance_label: *const u8,
+    instance_label_len: usize,
+    identity_toml: *const u8,
+    identity_toml_len: usize,
+    err_out: *mut *mut c_char,
+) -> c_int {
+    unsafe { clear_err(err_out) };
+    // Armed before anything can refuse: every early return below used to be a
+    // path that left the caller's secret in memory.
+    let Some(_secret_guard) = (unsafe { ZeroOnDrop::arm(secret, secret_len) }) else {
+        unsafe { write_err(err_out, "secret is NULL or too long (>4 KiB)") };
+        return VEIL_ERR_INVALID_ARG;
+    };
+    if credential.is_null() || credential_len == 0 {
+        unsafe { write_err(err_out, "credential is NULL or empty") };
+        return VEIL_ERR_INVALID_ARG;
+    }
+    let credential_bytes = unsafe { std::slice::from_raw_parts(credential, credential_len) };
+    let secret_bytes = unsafe { std::slice::from_raw_parts(secret, secret_len) };
+
+    // XVSB opens with the phrase, XVRC with its own high-entropy code. Which
+    // one this is, is in the blob — not something the caller has to declare
+    // and could get wrong.
+    let material = if credential_bytes.starts_with(b"XVRC") {
+        veil_identity::sovereign_bundle::open_recovery_certificate(credential_bytes, secret_bytes)
+    } else {
+        veil_identity::sovereign_bundle::open(credential_bytes, secret_bytes)
+    };
+    let material = match material {
+        Ok(m) => m,
+        Err(e) => {
+            unsafe { write_err(err_out, format!("credential did not open: {e}")) };
+            return VEIL_ERR_INVALID_ARG;
+        }
+    };
+    let Some(falcon_bundle) = material.master_falcon_bundle() else {
+        unsafe {
+            write_err(
+                err_out,
+                "this credential is not Ed25519+Falcon-512, so it names no hybrid master",
+            )
+        };
+        return VEIL_ERR_INVALID_ARG;
+    };
+
+    let Some(toml_str) = (unsafe { slice_to_str(identity_toml, identity_toml_len) }) else {
+        unsafe { write_err(err_out, "identity_toml is NULL or invalid UTF-8") };
+        return VEIL_ERR_INVALID_ARG;
+    };
+    let config = match veil_cfg::parse_toml_str(toml_str) {
+        Ok(c) => c,
+        Err(e) => {
+            unsafe { write_err(err_out, format!("identity_toml parse failed: {e}")) };
+            return VEIL_ERR_INVALID_ARG;
+        }
+    };
+    let Some(identity) = config.identity else {
+        unsafe { write_err(err_out, "identity_toml carries no [identity]") };
+        return VEIL_ERR_INVALID_ARG;
+    };
+    if identity.algo != veil_types::SignatureAlgorithm::Ed25519 {
+        unsafe {
+            write_err(
+                err_out,
+                "only an Ed25519 node key can be named as a device subkey",
+            )
+        };
+        return VEIL_ERR_INVALID_ARG;
+    }
+    use base64::{Engine as _, engine::general_purpose::STANDARD};
+    let device_seed = match STANDARD.decode(identity.private_key.as_bytes()) {
+        Ok(bytes) if bytes.len() == 32 => {
+            let mut seed = [0u8; 32];
+            seed.copy_from_slice(&bytes);
+            zeroize::Zeroizing::new(seed)
+        }
+        _ => {
+            unsafe { write_err(err_out, "identity_toml key is not a 32-byte Ed25519 seed") };
+            return VEIL_ERR_INVALID_ARG;
+        }
+    };
+
+    // The Ed25519 half still comes from the phrase, which is what makes the
+    // two halves one master rather than two keys that happen to travel
+    // together. For an XVRC credential the secret is a code and not a phrase,
+    // and that case is refused here rather than silently provisioning a
+    // different identity.
+    unsafe {
+        restore_from_phrase_inner(
+            Some(device_seed),
+            Some(falcon_bundle.to_vec()),
+            secret,
+            secret_len,
+            veil_dir,
+            veil_dir_len,
+            instance_label,
+            instance_label_len,
+            err_out,
+        )
+    }
+}
+
 #[cfg(feature = "node-embedded")]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn veil_restore_identity_from_phrase_zeroize_with_node_key(
@@ -5573,6 +5719,7 @@ pub unsafe extern "C" fn veil_restore_identity_from_phrase_zeroize_with_node_key
     unsafe {
         restore_from_phrase_inner(
             Some(seed),
+            None,
             phrase,
             phrase_len,
             veil_dir,
