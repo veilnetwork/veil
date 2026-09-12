@@ -1957,7 +1957,32 @@ impl RendezvousRegistry {
         cookie: [u8; AUTH_COOKIE_LEN],
         subscriber: RendezvousSubscriber,
     ) -> Result<(), RegistryError> {
-        let key: RegistrationKey = (subscriber.peer_node_id, cookie);
+        self.register_as(subscriber.peer_node_id, cookie, subscriber)
+    }
+
+    /// As [`Self::register`], but keyed under an address the registrant
+    /// ANSWERS FOR rather than the one it connected as.
+    ///
+    /// The two are the same value for a legacy node and for an identity whose
+    /// device key is its master. They differ for every other sovereign
+    /// identity: a device connects under its own transport id and is known to
+    /// its contacts by the IDENTITY address, so an introduce names the
+    /// identity and finds nothing keyed under it. The subscriber's
+    /// `peer_node_id` still names the DEVICE, because that is the session the
+    /// introduce is forwarded over — only the key changes.
+    ///
+    /// `owner` MUST be an address the caller has PROVED the registrant
+    /// answers for: the session peer itself, or an identity whose validated
+    /// document names that peer's device key. Passing an unproven address
+    /// hands an attacker exactly the cookie-squatting this key exists to
+    /// stop — see [`RendezvousRegistry`].
+    pub fn register_as(
+        &self,
+        owner: [u8; NODE_ID_LEN],
+        cookie: [u8; AUTH_COOKIE_LEN],
+        subscriber: RendezvousSubscriber,
+    ) -> Result<(), RegistryError> {
+        let key: RegistrationKey = (owner, cookie);
         let mut g = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         if let Some(existing) = g.cookies.get(&key) {
             // Same (peer_node_id, cookie) — peer matches by key
@@ -1977,7 +2002,10 @@ impl RendezvousRegistry {
         // but didn't stop a single peer monopolizing the table). Bound each
         // peer's footprint: at its own cap, evict THIS peer's oldest entry rather
         // than the global oldest, so a flood churns only the attacker's own slots.
-        let peer = subscriber.peer_node_id;
+        // The fairness cap counts by the KEY's owner, which is what the table
+        // is indexed by — counting the device instead would let one identity's
+        // two keys evict each other's slots.
+        let peer = owner;
         // O(1) per-peer count (audit cycle-10). The oldest-own eviction below
         // still scans the table, but only fires when this peer is AT its cap —
         // a flood path, not every register.
@@ -3452,6 +3480,84 @@ mod tests {
             reg.len() <= MAX_COOKIES_PER_PEER + 1,
             "attacker footprint must be capped, registry len = {}",
             reg.len()
+        );
+    }
+
+    /// A registration may be keyed under an address the peer ANSWERS FOR,
+    /// while still being ROUTED to the device that made it.
+    ///
+    /// The two are one value for a legacy node. For a sovereign identity they
+    /// are not: the device connects under its transport id and its contacts
+    /// know it by the identity address, so an introduce names the identity —
+    /// and found nothing, because the key was the address the peer connected
+    /// as. The subscriber keeps naming the device, because that is the session
+    /// the introduce is forwarded over and an identity is not a session.
+    #[test]
+    fn a_registration_can_be_keyed_by_the_address_it_answers_for() {
+        let reg = RendezvousRegistry::with_capacity(64);
+        let device = [0xD1u8; NODE_ID_LEN];
+        let identity = [0x1Du8; NODE_ID_LEN];
+        let cookie = [0xC0u8; AUTH_COOKIE_LEN];
+        let subscriber = RendezvousSubscriber {
+            peer_node_id: device,
+            receiver_x25519_pk: [0x01; X25519_PK_LEN],
+            registered_at_unix: 1,
+        };
+
+        reg.register_as(identity, cookie, subscriber.clone())
+            .expect("registering under a proved address must succeed");
+
+        let found = reg
+            .lookup(&identity, &cookie)
+            .expect("an introduce naming the identity must find it");
+        assert_eq!(
+            found.peer_node_id, device,
+            "the forward still goes to the DEVICE — the identity is a key, not a session",
+        );
+        assert!(
+            reg.lookup(&device, &cookie).is_none(),
+            "keying under one address must not silently key under the other",
+        );
+
+        // And the device slot is a SEPARATE registration, as the relay makes
+        // it: a peer keeps the slot it had before any of this existed.
+        reg.register(cookie, subscriber).expect("device slot");
+        assert!(reg.lookup(&device, &cookie).is_some());
+        assert!(reg.lookup(&identity, &cookie).is_some());
+    }
+
+    /// Cookie-squatting protection is unchanged by the new key.
+    ///
+    /// The whole reason the table is keyed by a pair is that the cookie is
+    /// public: anyone who scraped a victim's ad could otherwise take the slot.
+    /// An owner that a caller did not prove is exactly that attack, so the
+    /// rule the relay follows — only an identity the handshake VALIDATED — is
+    /// what keeps this sound; here we pin the half the registry owns, that two
+    /// owners never share a slot.
+    #[test]
+    fn two_owners_of_one_cookie_keep_separate_slots() {
+        let reg = RendezvousRegistry::with_capacity(64);
+        let cookie = [0xC0u8; AUTH_COOKIE_LEN];
+        let victim = [0x11u8; NODE_ID_LEN];
+        let squatter = [0x22u8; NODE_ID_LEN];
+        for (owner, pk) in [(victim, 0x01u8), (squatter, 0x02u8)] {
+            reg.register_as(
+                owner,
+                cookie,
+                RendezvousSubscriber {
+                    peer_node_id: owner,
+                    receiver_x25519_pk: [pk; X25519_PK_LEN],
+                    registered_at_unix: 1,
+                },
+            )
+            .expect("each owner gets its own slot");
+        }
+        assert_eq!(
+            reg.lookup(&victim, &cookie)
+                .expect("victim keeps its slot")
+                .receiver_x25519_pk,
+            [0x01; X25519_PK_LEN],
+            "a squatter must not overwrite the victim's binding",
         );
     }
 

@@ -676,6 +676,48 @@ impl FrameDispatcher {
             receiver_x25519_pk: req.receiver_x25519_pk,
             registered_at_unix: now,
         };
+        // The address this peer ANSWERS FOR, when it is not the one it
+        // connected as. A device connects under its own transport id; its
+        // contacts know it by the IDENTITY address, so an introduce names the
+        // identity and finds nothing keyed under the device. The proof is
+        // already here — the handshake validated the peer's sovereign binding
+        // and the session carries it — so this asks rather than takes anything
+        // on trust, and a peer with no sovereign identity is unaffected.
+        let answers_for = self
+            .session_registry
+            .as_ref()
+            .and_then(|reg| {
+                let g = reg.lock().unwrap_or_else(|p| p.into_inner());
+                // BY PEER ID, which is what a registration arrives under. The
+                // by-identity index is keyed by the sovereign address and
+                // misses a lookup made with the transport id — the session is
+                // there, under the other key.
+                g.node_id_for_peer(&node_id)
+            })
+            .filter(|identity| identity != node_id.as_bytes());
+        if let Some(identity) = answers_for {
+            // Keyed under the identity, but still ROUTED to this device: the
+            // subscriber's peer_node_id is the session the introduce is
+            // forwarded over, and an identity is not a session.
+            match reg.register_as(identity, req.auth_cookie, subscriber.clone()) {
+                Ok(()) => {}
+                Err(e) => {
+                    // The device registration below is what the node had
+                    // before this existed, so a refusal here costs nothing
+                    // that was working — log and carry on rather than deny
+                    // the peer its own slot.
+                    self.logger.info(
+                        "anonymity.relay_chain.register.identity_refused",
+                        format!(
+                            "cookie from peer={} could not also be keyed under \
+                             its identity {}: {e:?}",
+                            veil_util::hex_short(node_id.as_bytes()),
+                            veil_util::hex_short(&identity),
+                        ),
+                    );
+                }
+            }
+        }
         match reg.register(req.auth_cookie, subscriber) {
             Ok(()) => {
                 // INSTRUMENT (`relay-trace` feature, OFF in prod): include the
