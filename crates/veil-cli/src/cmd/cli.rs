@@ -649,6 +649,17 @@ pub struct IdentityDelegateDeviceArgs {
     #[arg(long)]
     pub phrase_file: Option<PathBuf>,
 
+    /// The Falcon half of a HYBRID master — `master_falcon.bin`, written by
+    /// `identity create --algo=hybrid`.
+    ///
+    /// Required for a hybrid identity and meaningless for an Ed25519 one. The
+    /// words reproduce only the Ed25519 half, and a hybrid identity's address
+    /// is hashed over BOTH, so without this the delegation is refused: the
+    /// master offered is not the kind the document names. Same file
+    /// `identity restore --algo=hybrid` asks for.
+    #[arg(long)]
+    pub master_falcon_file: Option<PathBuf>,
+
     /// Validity window in seconds for the delegation. Capped by
     /// protocol to 30 days. Default 7 days matches the runtime's
     /// auto-reissue half-validity tick.

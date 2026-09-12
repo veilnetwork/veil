@@ -495,13 +495,19 @@ fn emit_creation_summary<I: CommandIo>(
     }
     if !out.supports_device_lifecycle {
         // Said HERE because this is the only moment the choice is cheap. The
-        // device flows refuse a non-Ed25519 master fail-fast, so nothing is
-        // corrupted — but an operator used to learn it when they tried to link
-        // a second phone, or to revoke a stolen one, and by then the identity
-        // was published and the phrase was written down (report14 V14-M12).
+        // device flows refuse a master they have no signer for, fail-fast, so
+        // nothing is corrupted — but an operator used to learn it when they
+        // tried to link a second phone, or to revoke a stolen one, and by then
+        // the identity was published and the phrase was written down
+        // (report14 V14-M12).
+        //
+        // This is now only standalone Falcon-512. The HYBRID master joined the
+        // lifecycle when its Falcon half gained a signer, so it is the one to
+        // recommend here: post-quantum like falcon512, and it can still hold
+        // several devices.
         io.emit(OutputEvent::message(String::new()));
         io.emit(OutputEvent::message(
-            "NOTE: this identity is SINGLE-DEVICE. Its master algorithm has no              device lifecycle yet, so `identity delegate`, `identity adopt` and              `identity revoke-device` will refuse it — a second device cannot              be linked, and a lost one cannot be revoked. Create with the              default Ed25519 master if you need either."
+            "NOTE: this identity is SINGLE-DEVICE. Its master algorithm has no              signer behind the device lifecycle, so `identity delegate-device`              will refuse it and a second device cannot be linked. Use              --algo=hybrid for a post-quantum master that can (pass its              master_falcon.bin to delegate-device), or the default Ed25519."
                 .to_string(),
         ));
     }
@@ -2145,13 +2151,39 @@ fn delegate_device<I: CommandIo>(
         ));
     };
 
+    // WHICH master signs the new subkey's certificate. The seed alone is the
+    // Ed25519 one; with the Falcon half it is the hybrid master this identity
+    // may actually be named by. Refused rather than guessed: a hybrid document
+    // handed an Ed25519 seed reports "wrong master" for a correct phrase, and
+    // `identity create --algo=hybrid` makes such identities today.
+    let master = match &args.master_falcon_file {
+        None => veil_cfg::sovereign_flow::MasterSecret::Seed(master_seed),
+        Some(path) => {
+            let bundle = fs::read(path).map_err(|e| {
+                IdentityCliError::DelegateDevice(format!(
+                    "delegate-device: failed to read --master-falcon-file {}: {e}",
+                    path.display()
+                ))
+            })?;
+            veil_cfg::sovereign_flow::hybrid512_master_from_parts(&master_seed, &bundle).map_err(
+                |e| {
+                    IdentityCliError::DelegateDevice(format!(
+                        "delegate-device: --master-falcon-file {} is not a master_falcon \
+                         bundle: {e}",
+                        path.display()
+                    ))
+                },
+            )?
+        }
+    };
+
     let used_out_override = args.out.is_some();
     let doc_path = veil_dir.join(IDENTITY_DOCUMENT_FILE);
     let out_path = args.out.clone().unwrap_or_else(|| doc_path.clone());
     let delegated = veil_cfg::sovereign_flow::delegate_device(
         veil_cfg::sovereign_flow::DelegateDeviceOptions {
             veil_dir: veil_dir.clone(),
-            master: veil_cfg::sovereign_flow::MasterSecret::Seed(master_seed),
+            master,
             device_pubkey: device_pubkey.clone(),
             now_unix: now,
             valid_until_unix: valid_until,
@@ -3929,9 +3961,101 @@ mod tests {
             pubkey_file,
             password_file: None,
             phrase_file: Some(phrase_file),
+            master_falcon_file: None,
             valid_for_secs: 7 * 24 * 3600,
             out: None,
         }
+    }
+
+    /// `delegate-device` on a HYBRID identity — with the Falcon half, and
+    /// without it.
+    ///
+    /// `identity create --algo=hybrid` has made such identities for a while,
+    /// and this command could not act on a single one of them: it built the
+    /// master from the words alone, which reproduce 32 of the 929 bytes the
+    /// address is hashed over, so every call was refused. The CLI thus offered
+    /// a master it could not manage a second device for.
+    ///
+    /// The phrase-only call is asserted first, as the control: without it a
+    /// green test here would prove nothing about whether the flag did the work.
+    #[test]
+    fn delegate_device_on_a_hybrid_identity_needs_the_falcon_half() {
+        use ed25519_dalek::SigningKey;
+        use rand_core::{OsRng, RngCore};
+        use veil_identity::verify::verify_identity_document;
+
+        let dir = tempdir();
+        use veil_cfg::sovereign_flow::{CreateIdentityOptions, create_identity};
+        let now = now_unix_secs();
+        let out = create_identity(CreateIdentityOptions {
+            veil_dir: dir.clone(),
+            save_encrypted_with_password: None,
+            argon2_params_override: None,
+            extra_entropy: None,
+            instance_label: "src".into(),
+            pow_difficulty: 8,
+            issued_at_unix: now,
+            valid_until_unix: now + 7 * 86_400,
+            algo: veil_types::SignatureAlgorithm::Ed25519Falcon512Hybrid,
+        })
+        .unwrap();
+        let falcon_path = out
+            .master_falcon_path
+            .clone()
+            .expect("a hybrid create persists the Falcon half");
+
+        let phrase_path = dir.join("phrase.txt");
+        fs::write(&phrase_path, out.master_seed_phrase.to_string()).unwrap();
+
+        let mut tgt_seed = [0u8; 32];
+        OsRng.fill_bytes(&mut tgt_seed);
+        let tgt_pk = SigningKey::from_bytes(&tgt_seed).verifying_key();
+        let pubkey_path = dir.join("target_pubkey.hex");
+        fs::write(&pubkey_path, hex_encode(tgt_pk.as_bytes())).unwrap();
+
+        // THE CONTROL: the words alone cannot speak for this master.
+        let mut io = RecordingIo::default();
+        let refused = delegate_device(
+            &mut io,
+            delegate_args(dir.clone(), pubkey_path.clone(), phrase_path.clone()),
+        )
+        .expect_err("a hybrid identity must refuse an Ed25519-only master");
+        let text = refused.to_string();
+        assert!(
+            text.contains("algo 3") || text.contains("credential") || text.contains("Falcon"),
+            "the refusal has to name the ALGORITHM, or it reads as a wrong \
+             phrase and sends the operator hunting for a correct one: {text}"
+        );
+        let untouched = fs::read(dir.join(IDENTITY_DOCUMENT_FILE)).unwrap();
+        assert_eq!(
+            IdentityDocument::decode(&untouched)
+                .unwrap()
+                .identity_keys
+                .len(),
+            1,
+            "a refused delegation must leave the document alone"
+        );
+
+        // And with the Falcon half, the same call works.
+        let mut args = delegate_args(dir.clone(), pubkey_path, phrase_path);
+        args.master_falcon_file = Some(falcon_path);
+        let mut io = RecordingIo::default();
+        delegate_device(&mut io, args).expect("the hybrid master admits a device");
+
+        let bytes = fs::read(dir.join(IDENTITY_DOCUMENT_FILE)).unwrap();
+        let doc = IdentityDocument::decode(&bytes).unwrap();
+        assert_eq!(doc.identity_keys.len(), 2);
+        assert_eq!(doc.identity_keys[1].pubkey, tgt_pk.as_bytes());
+        assert_eq!(
+            doc.node_id, out.document.node_id,
+            "a second device must not move the identity's address"
+        );
+        assert!(
+            doc.identity_keys[1].master_sig.len() > 64,
+            "an Ed25519-length certificate means the Falcon half never signed: {}",
+            doc.identity_keys[1].master_sig.len()
+        );
+        verify_identity_document(&doc, now + 100).expect("doc verifies");
     }
 
     #[test]
