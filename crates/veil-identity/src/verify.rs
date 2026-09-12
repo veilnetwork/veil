@@ -251,27 +251,56 @@ fn verify_document_inner(
                 key: key.device_id,
             });
         }
-        // 4b. Per-delegation expiry — even if doc is fresh, an
-        // individual subkey may have aged out.
+        // 4b. Per-delegation window — even if the document is fresh, an
+        // individual subkey may have aged out or not started yet.
+        //
+        // A key outside its window DROPS OUT; it does not take the document
+        // with it. The difference matters because one device per identity is
+        // the exception, not the rule: under the old rule a laptop left in a
+        // drawer past its delegation made the WHOLE identity unresolvable, so
+        // every other device of that person went quiet too.
+        //
+        // That inverted the property the window exists for. Its own
+        // documentation says a compromised device's cert "ages out within
+        // <= 7 days even without an explicit revocation" — presented as the
+        // way to retire a device you could not revoke by hand. Retiring it
+        // took the owner off the network instead.
+        //
+        // Nothing is admitted by this. The window is enforced where a key is
+        // USED, not merely where it is listed: `verify_mlkem_cert` intersects
+        // the certificate's window with this subkey's and the document's
+        // before accepting it (report17 V17-H2), and the active key below is
+        // still refused when it has aged out. What changes is only the blast
+        // radius of a key nobody is using.
+        //
+        // The ACTIVE key is not droppable: it signed this document, and a
+        // signature from an expired delegation authenticates nothing.
         if let Some(now_unix_secs) = now {
-            if now_unix_secs > key.valid_until_unix {
-                return Err(VerifyError::KeyExpired {
-                    idx,
-                    now: now_unix_secs,
-                    valid_until: key.valid_until_unix,
-                });
-            }
-            // 4b'. Per-delegation lower bound.
-            // Same legacy-sentinel handling as the document level.
-            if key.valid_from_unix > 0
-                && now_unix_secs + TIME_VALIDITY_SKEW_SECS < key.valid_from_unix
-            {
-                return Err(VerifyError::KeyNotYetValid {
-                    idx,
-                    now: now_unix_secs,
-                    valid_from: key.valid_from_unix,
-                    skew: TIME_VALIDITY_SKEW_SECS,
-                });
+            // Only the ACTIVE key's window is fatal. Every key's CERT is
+            // still checked below, dropped or not: skipping 4c for a key that
+            // happens to be outside its window would let a tampered document
+            // carry a forged key as long as it wore expired dates.
+            let is_active = idx == doc.sig_key_idx as usize;
+            if is_active {
+                if now_unix_secs > key.valid_until_unix {
+                    return Err(VerifyError::KeyExpired {
+                        idx,
+                        now: now_unix_secs,
+                        valid_until: key.valid_until_unix,
+                    });
+                }
+                // 4b'. Per-delegation lower bound.
+                // Same legacy-sentinel handling as the document level.
+                if key.valid_from_unix > 0
+                    && now_unix_secs + TIME_VALIDITY_SKEW_SECS < key.valid_from_unix
+                {
+                    return Err(VerifyError::KeyNotYetValid {
+                        idx,
+                        now: now_unix_secs,
+                        valid_from: key.valid_from_unix,
+                        skew: TIME_VALIDITY_SKEW_SECS,
+                    });
+                }
             }
         }
         // 4c. Master cert.
@@ -866,6 +895,99 @@ mod tests {
         doc_msg.extend_from_slice(DOC_SIG_CONTEXT);
         doc_msg.extend_from_slice(&doc.canonical_signing_bytes());
         doc.document_sig = sub_sk.sign(&doc_msg).to_bytes().to_vec();
+    }
+
+    /// Add a SECOND device key to `f.doc`, certified by the master, with the
+    /// window the caller asks for. Returns its index.
+    ///
+    /// Most of an identity's keys are not the active one — that is what having
+    /// more than one device means — so a fixture with a single key cannot
+    /// exercise the rule that a key nobody is signing with does not take the
+    /// document down.
+    fn add_sibling_key(f: &mut Fixture, valid_from: u64, valid_until: u64) -> usize {
+        let sib_sk = SigningKey::from_bytes(&[0x5A; 32]);
+        let sib_pk = sib_sk.verifying_key();
+        let device_id = compute_node_id(sib_pk.as_bytes());
+        let mut key = IdentityKey {
+            algo: ALGO_ED25519,
+            pubkey: sib_pk.as_bytes().to_vec(),
+            device_id,
+            valid_from_unix: valid_from,
+            valid_until_unix: valid_until,
+            master_sig: Vec::new(),
+        };
+        let msg = key.certify_message(&f.doc.node_id);
+        key.master_sig = f.master_sk.sign(&msg).to_bytes().to_vec();
+        f.doc.identity_keys.push(key);
+        f.doc.identity_keys.len() - 1
+    }
+
+    /// A device that aged out takes ITSELF off the network, not its owner.
+    ///
+    /// Under the old rule one expired key failed the whole document, so a
+    /// laptop left in a drawer past its delegation made the identity
+    /// unresolvable — every other device of that person went quiet with it.
+    /// That inverted the very property the window exists for: letting a
+    /// compromised device's cert age out is documented as the way to retire
+    /// it, and it retired the owner instead.
+    #[test]
+    fn an_expired_sibling_key_drops_out_and_the_document_still_verifies() {
+        let mut f = build_fixture();
+        let expired_at = f.now_unix_secs - 1;
+        let idx = add_sibling_key(&mut f, 0, expired_at);
+        assert_ne!(idx, f.doc.sig_key_idx as usize, "the sibling is not active");
+        resign_document(&f._sub_sk, &mut f.doc);
+
+        let v = verify_identity_document(&f.doc, f.now_unix_secs)
+            .expect("an aged-out sibling must not take the identity down");
+        // And the identity still answers as itself, through the ACTIVE key.
+        assert_eq!(v.active_key_idx, f.doc.sig_key_idx);
+    }
+
+    /// The key that SIGNED the document may not be expired.
+    ///
+    /// Its signature is what makes the document a document; accepting one
+    /// signed by a delegation that has aged out would authenticate nothing.
+    #[test]
+    fn an_expired_active_key_still_fails_the_document() {
+        let mut f = build_fixture();
+        f.doc.identity_keys[0].valid_until_unix = f.now_unix_secs - 1;
+        // Re-cert it so this is the WINDOW failing, not the master signature.
+        let msg = f.doc.identity_keys[0].certify_message(&f.doc.node_id);
+        f.doc.identity_keys[0].master_sig = f.master_sk.sign(&msg).to_bytes().to_vec();
+        resign_document(&f._sub_sk, &mut f.doc);
+
+        assert!(
+            matches!(
+                verify_identity_document(&f.doc, f.now_unix_secs),
+                Err(VerifyError::KeyExpired { .. })
+            ),
+            "a document signed by an aged-out delegation must be refused"
+        );
+    }
+
+    /// Dropping a key out of the WINDOW must not drop it out of the CERT
+    /// check.
+    ///
+    /// The first cut of the rule above `continue`d past the master-cert
+    /// verification for any key outside its window, which would have let a
+    /// tampered document carry a forged key as long as it wore expired dates.
+    #[test]
+    fn a_forged_sibling_key_is_refused_even_when_it_is_expired() {
+        let mut f = build_fixture();
+        let expired_at = f.now_unix_secs - 1;
+        let idx = add_sibling_key(&mut f, 0, expired_at);
+        // Same expired key, but its master certification is garbage.
+        f.doc.identity_keys[idx].master_sig = vec![0u8; 64];
+        resign_document(&f._sub_sk, &mut f.doc);
+
+        assert!(
+            matches!(
+                verify_identity_document(&f.doc, f.now_unix_secs),
+                Err(VerifyError::CertSigInvalid { .. })
+            ),
+            "an expired key still has to be one the master actually certified"
+        );
     }
 
     // ── Happy path ───────────────────────────────────────────────────────────
