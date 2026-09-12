@@ -2094,6 +2094,44 @@ int veil_reissue_device_delegation_zeroize(const uint8_t *credential,
 ;
 #endif
 
+/**
+ * Admit a device into this identity's document under the master — hybrid or
+ * classic.
+ *
+ * The call an application should make. Everything
+ * `veil_delegate_device_from_phrase_zeroize` documents holds here; the one
+ * difference is WHICH master signs the new subkey's certificate, and it
+ * follows the credential exactly as renewal and the boot decide it. The
+ * phrase-only sibling stays for a classic identity and forwards here with no
+ * credential, so the two can no longer disagree.
+ *
+ * `credential` may be NULL (a classic identity, `secret` is the phrase) or a
+ * sovereign bundle / `XVRC` recovery certificate, which `secret` opens.
+ *
+ * `device_pubkey` may be NULL, and for an embedding application that is the
+ * usual call: it means "this device's own key", read from
+ * `device_identity_sk.bin` in `veil_dir`.
+ *
+ * `secret` is SECRET — a writable `(*mut u8, len)` buffer, overwritten with
+ * `0` before return on EVERY path.
+ *
+ * # Safety
+ * `credential` readable for `credential_len` or NULL; `secret` writable for
+ * `secret_len` and wiped on every path; `veil_dir` readable for its length;
+ * `device_pubkey` readable for its length or NULL; `err_out` a writable slot.
+ */
+
+int veil_delegate_device_zeroize(const uint8_t *credential,
+                                 uintptr_t credential_len,
+                                 uint8_t *secret,
+                                 uintptr_t secret_len,
+                                 const uint8_t *veil_dir,
+                                 uintptr_t veil_dir_len,
+                                 const uint8_t *device_pubkey,
+                                 uintptr_t device_pubkey_len,
+                                 char **err_out)
+;
+
 #if defined(VEIL_FFI_NODE_EMBEDDED)
 /**
  * When THIS device's delegation runs out, in Unix seconds.
@@ -2238,6 +2276,43 @@ int veil_revoke_identity_device_from_phrase_zeroize(uint8_t *phrase,
                                                     const uint8_t *device_id,
                                                     uint8_t *changed_out,
                                                     char **err_out)
+;
+#endif
+
+#if defined(VEIL_FFI_NODE_EMBEDDED)
+/**
+ * Tombstone a device in this identity's document under the master — hybrid or
+ * classic.
+ *
+ * The call an application should make, and the twin of
+ * [`veil_delegate_device_zeroize`]: everything
+ * `veil_revoke_identity_device_from_phrase_zeroize` documents holds, and the
+ * master that signs the tombstone follows the credential rather than being
+ * assumed to be a phrase. Revoking a stolen device is the operation an
+ * identity can least afford to refuse, and on a hybrid identity it did.
+ *
+ * `credential` may be NULL (a classic identity, `secret` is the phrase) or a
+ * sovereign bundle / `XVRC` recovery certificate, which `secret` opens.
+ * `device_id` is the 32-byte device address (BLAKE3 of its pubkey). Writes 1
+ * to `changed_out` when the document changed, 0 when the device was already
+ * tombstoned.
+ *
+ * # Safety
+ * `credential` readable for `credential_len` or NULL; `secret` writable for
+ * `secret_len` and wiped on every path; `veil_dir` readable for its length;
+ * `device_id` readable for 32 bytes; `changed_out` a writable byte or NULL;
+ * `err_out` a writable slot.
+ */
+
+int veil_revoke_identity_device_zeroize(const uint8_t *credential,
+                                        uintptr_t credential_len,
+                                        uint8_t *secret,
+                                        uintptr_t secret_len,
+                                        const uint8_t *veil_dir,
+                                        uintptr_t veil_dir_len,
+                                        const uint8_t *device_id,
+                                        uint8_t *changed_out,
+                                        char **err_out)
 ;
 #endif
 

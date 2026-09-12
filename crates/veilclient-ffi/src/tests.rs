@@ -891,6 +891,216 @@ fn hybrid_identity_is_provisioned_from_the_credential_and_named_by_both_halves()
         .expect("a hybrid-rooted document must verify");
 }
 
+/// A HYBRID identity admits a second device, and revokes it — through the FFI.
+///
+/// The flows underneath had been algorithm-generic for a while; the FFI was
+/// not. `veil_delegate_device_from_phrase_zeroize` and its revoke twin built
+/// `MasterSecret::Seed` from the words and nothing else, so on a hybrid
+/// identity — the kind xVeil creates by default — they hashed 32 bytes where
+/// the document names 929 and refused with `UnsupportedMasterAlgo`, every
+/// time. An identity that could never hold two devices, nor disown a stolen
+/// one, and every closed-loop test green: the app has only one entry point per
+/// operation, and both were the phrase-only ones. Found by standing two
+/// daemons up on 2026-09-12.
+///
+/// The phrase-only call is exercised HERE as the control, because a test that
+/// only shows the new path working would pass just as well if the old one had
+/// never been broken.
+#[cfg(feature = "node-embedded")]
+#[test]
+fn a_hybrid_identity_admits_and_revokes_a_second_device_through_the_ffi() {
+    use veil_proto::identity_document::IdentityDocument;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let dir_s = dir.path().to_str().unwrap().to_string();
+    let phrase = fresh_phrase();
+    let phrase_str = phrase.to_str().unwrap().to_string();
+
+    let mut buf: Vec<u8> = phrase_str.as_bytes().to_vec();
+    let n = buf.len();
+    let mut err: *mut c_char = ptr::null_mut();
+    let toml_ptr = unsafe {
+        crate::node::veil_config_init_from_phrase_zeroize(buf.as_mut_ptr(), n, 1, &mut err)
+    };
+    assert!(!toml_ptr.is_null(), "node config from phrase");
+    let node_toml = unsafe { std::ffi::CStr::from_ptr(toml_ptr) }
+        .to_str()
+        .unwrap()
+        .to_string();
+    unsafe { veil_free_string(toml_ptr) };
+
+    let credential = veil_identity::sovereign_bundle::create_hybrid512(phrase_str.as_bytes())
+        .expect("hybrid credential");
+
+    let label = "first-device";
+    let mut secret: Vec<u8> = phrase_str.as_bytes().to_vec();
+    let sn = secret.len();
+    let mut err: *mut c_char = ptr::null_mut();
+    let rc = unsafe {
+        veil_provision_hybrid_identity_from_credential_zeroize(
+            credential.as_ptr(),
+            credential.len(),
+            secret.as_mut_ptr(),
+            sn,
+            dir_s.as_ptr(),
+            dir_s.len(),
+            label.as_ptr(),
+            label.len(),
+            node_toml.as_ptr(),
+            node_toml.len(),
+            &mut err,
+        )
+    };
+    assert_eq!(rc, VEIL_OK, "provisioning the hybrid identity");
+    assert!(err.is_null());
+
+    let doc_path = dir.path().join("identity_document.bin");
+    let before = IdentityDocument::decode(&std::fs::read(&doc_path).unwrap()).unwrap();
+    assert_eq!(before.identity_keys.len(), 1);
+
+    // The second device's key. A fixed seed: what is under test is the
+    // certificate over it, not where it came from.
+    let second_pk = ed25519_dalek::SigningKey::from_bytes(&[0x31u8; 32])
+        .verifying_key()
+        .to_bytes()
+        .to_vec();
+
+    // THE CONTROL, first: the phrase-only entry point cannot serve this
+    // identity. If this ever returns VEIL_OK the bug is gone by some other
+    // route and the rest of this test is measuring nothing.
+    let mut words: Vec<u8> = phrase_str.as_bytes().to_vec();
+    let wn = words.len();
+    let mut err: *mut c_char = ptr::null_mut();
+    let rc = unsafe {
+        veil_delegate_device_from_phrase_zeroize(
+            words.as_mut_ptr(),
+            wn,
+            dir_s.as_ptr(),
+            dir_s.len(),
+            second_pk.as_ptr(),
+            second_pk.len(),
+            &mut err,
+        )
+    };
+    assert_eq!(
+        rc, VEIL_ERR,
+        "a hybrid document names a 929-byte master; the words alone build 32 \
+         bytes of it and must not be taken for the whole"
+    );
+    assert!(!err.is_null());
+    let msg = unsafe { std::ffi::CStr::from_ptr(err) }
+        .to_string_lossy()
+        .into_owned();
+    unsafe { veil_free_string(err) };
+    assert!(
+        msg.contains("master algorithm") || msg.contains("algo"),
+        "the refusal must name the ALGORITHM, or it reads as a wrong phrase \
+         and sends the operator hunting for a correct one: {msg}"
+    );
+    assert!(
+        words.iter().all(|&b| b == 0),
+        "a refusal must not cost the caller their phrase"
+    );
+    assert_eq!(
+        std::fs::read(&doc_path).unwrap(),
+        before.encode(),
+        "a refused delegation must leave the document alone"
+    );
+
+    // And now the same admission with the credential, which is the whole fix.
+    let mut secret: Vec<u8> = phrase_str.as_bytes().to_vec();
+    let sn = secret.len();
+    let mut err: *mut c_char = ptr::null_mut();
+    let rc = unsafe {
+        veil_delegate_device_zeroize(
+            credential.as_ptr(),
+            credential.len(),
+            secret.as_mut_ptr(),
+            sn,
+            dir_s.as_ptr(),
+            dir_s.len(),
+            second_pk.as_ptr(),
+            second_pk.len(),
+            &mut err,
+        )
+    };
+    if !err.is_null() {
+        let msg = unsafe { std::ffi::CStr::from_ptr(err) }
+            .to_string_lossy()
+            .into_owned();
+        unsafe { veil_free_string(err) };
+        panic!("a hybrid master must be able to admit a device: {msg}");
+    }
+    assert_eq!(rc, VEIL_OK);
+    assert!(
+        secret.iter().all(|&b| b == 0),
+        "the secret must be wiped on the success path too"
+    );
+
+    let two = IdentityDocument::decode(&std::fs::read(&doc_path).unwrap()).unwrap();
+    assert_eq!(two.identity_keys.len(), 2, "two devices under one identity");
+    assert_eq!(
+        two.node_id, before.node_id,
+        "THE POINT: a second device does not mean a second address"
+    );
+    let added = two
+        .identity_keys
+        .iter()
+        .find(|k| k.pubkey == second_pk)
+        .expect("the document names the key we asked for");
+    assert!(
+        added.master_sig.len() > 64,
+        "an Ed25519-length certificate means the Falcon half never signed: {}",
+        added.master_sig.len()
+    );
+    veil_identity::verify::verify_identity_document(&two, two.issued_at_unix)
+        .expect("the grown document must still verify");
+
+    // Revocation, the operation this identity could least afford to refuse.
+    let device_id = veil_crypto::identity::compute_node_id(&second_pk);
+    let mut secret: Vec<u8> = phrase_str.as_bytes().to_vec();
+    let sn = secret.len();
+    let mut changed: u8 = 0;
+    let mut err: *mut c_char = ptr::null_mut();
+    let rc = unsafe {
+        veil_revoke_identity_device_zeroize(
+            credential.as_ptr(),
+            credential.len(),
+            secret.as_mut_ptr(),
+            sn,
+            dir_s.as_ptr(),
+            dir_s.len(),
+            device_id.as_ptr(),
+            &mut changed,
+            &mut err,
+        )
+    };
+    if !err.is_null() {
+        let msg = unsafe { std::ffi::CStr::from_ptr(err) }
+            .to_string_lossy()
+            .into_owned();
+        unsafe { veil_free_string(err) };
+        panic!("a hybrid master must be able to revoke a device: {msg}");
+    }
+    assert_eq!(rc, VEIL_OK);
+    assert_eq!(changed, 1, "the document changed");
+
+    let after = IdentityDocument::decode(&std::fs::read(&doc_path).unwrap()).unwrap();
+    assert!(
+        after.identity_keys.iter().all(|k| k.pubkey != second_pk),
+        "the revoked device must no longer be certified"
+    );
+    assert!(
+        after
+            .revoked_devices
+            .iter()
+            .any(|r| r.device_id == device_id),
+        "and a master-signed tombstone must outlive every stale sibling copy"
+    );
+    veil_identity::verify::verify_identity_document(&after, after.issued_at_unix)
+        .expect("the document must still verify after a revocation");
+}
+
 /// A device that came back from a week offline renews itself — one secret, no
 /// other device, no new key.
 ///
