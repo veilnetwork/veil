@@ -1,5 +1,64 @@
 # Changelog
 
+## v0.11.30 — 2026-09-13
+
+*An identity was a name the network could not use.*
+
+A sovereign identity is meant to be the thing a contact knows you by: an
+address that survives losing a phone, shared by every device you own. Three
+strands of this release found that it was not one. Each was measured against
+running nodes rather than read off the code, and in every case the reading had
+been wrong about at least one step.
+
+**A hybrid identity could hold exactly one device.** `delegate_device`,
+`revoke_identity_device` and the renewal path each rebuilt the master key from
+the 24 words — which reproduce the Ed25519 half and nothing else, so a hybrid
+master (`ed25519 ‖ falcon512`, 929 bytes) never matched its own document and
+every device operation was refused. One place now decides which master signs,
+and it takes the master the document names. A device that let its delegation
+lapse can renew itself with the one secret it already has, instead of taking
+the identity down with it; a recovery certificate provisions a device under a
+hybrid identity without the phrase; and the FFI can be asked when a delegation
+runs out rather than discovering it at the refusal.
+
+**Nothing was reachable at an identity address.** A rendezvous ad was
+published under the DEVICE's transport key while every contact looks it up by
+the identity — true since hybrid masters and certificate restore existed, and
+invisible before them because the two values coincided. Delivery turned out to
+be four steps, and an end-to-end scenario found three of them: the ad now goes
+up at both addresses (the device id stays, so no sender loses reachability),
+the identity document binds a device key to the address it answers for, the
+recipient binding accepts either of a receiver's addresses, and a relay finds
+the subscriber an introduce names — that last without a wire change, because
+the handshake had already validated the peer's identity and nobody had asked
+it. Store-and-forward mail was never affected: the deposit names the identity
+and the fetch proves the asker, so the box was always filled and opened under
+the same address.
+
+**Anycast had never distributed anything.** `advertise` wrote to the local
+store, the republish filter had no arm for its magic, and the receiving STORE
+gate had none either — so a resolver on any other node got nothing, always,
+while forty in-process tests passed because advertise and resolve shared one
+store. The list is now replicated and MERGED on arrival rather than replaced,
+which it has to be: one value belongs to every provider of a tag, and a plain
+store would have them deleting each other on every republish. The record also
+named the device rather than the identity, and index 0 was read as "the master
+signed" when `create_identity` files a device subkey there — so the first
+device of every real identity was refused. And `veil-cli anycast
+advertise|resolve|withdraw` now exists: until this release nothing outside a
+node could reach the capability at all, which is why none of the above was
+noticed sooner.
+
+Guarded: two simulation scenarios carry the cross-node anycast claims (an
+advertisement reaching another node, and two providers of one tag that a third
+node sees BOTH of); the authenticated-rendezvous scenario now sends to the
+receiver's identity address and asserts it arrives; the admin-socket test runs
+advertise → resolve → withdraw against a real node. Every one of them
+break-checked.
+
+Gate 18/18 and the four test commands green after the bump: 5761, 184, 86,
+doctests.
+
 ## v0.11.29 — 2026-09-11
 
 *A nickname belonged to a device, so no real identity could hold one.*
