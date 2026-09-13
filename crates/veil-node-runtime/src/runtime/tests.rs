@@ -2436,6 +2436,49 @@ pub fn is_self_authenticating_rejects_short_values() {
     assert!(!NodeRuntime::is_self_authenticating_dht_value(b"A"));
 }
 
+/// A record this node would REFUSE must not be sent to peers that will.
+///
+/// Measured on the production seeds the day 0.11.30 rolled out. One stale v1
+/// `NicknameRecord` — a name claimed before v2 existed — sat in every holder's
+/// store. Each holder re-fanned it every republish interval; each recipient
+/// refused it as `Store: invalid NicknameRecord`, counted the refusal as a
+/// session violation, and after enough of them one seed auto-banned another.
+/// Four honest nodes made each other look like attackers over a record none of
+/// them would have accepted.
+///
+/// The control is the point: a VALID record must still go out, or the fix is
+/// just "stop republishing nicknames".
+#[test]
+pub fn a_record_this_node_would_refuse_is_not_republished() {
+    use veil_crypto::nickname::NICKNAME_DHT_MAGIC;
+
+    let now_ms = 1_700_000_000_000u64;
+
+    // A v1 record: the magic, then the version byte that v2 replaced. This is
+    // the shape that was on the seeds — refused at every STORE gate since the
+    // nickname became the identity's rather than a device's.
+    let mut v1 = Vec::new();
+    v1.extend_from_slice(&NICKNAME_DHT_MAGIC);
+    v1.push(1);
+    v1.extend_from_slice(&[0u8; 64]);
+    assert!(
+        NodeRuntime::is_self_authenticating_dht_value(&v1),
+        "the magic is still one the republish driver carries — otherwise this \
+         test proves nothing about the filter that matters",
+    );
+    assert!(
+        !NodeRuntime::is_republishable_dht_value_at(&v1, now_ms),
+        "a record this node would refuse on arrival must not be sent to a peer \
+         that will refuse it and count the refusal against us",
+    );
+
+    // And garbage under the same magic is refused for the same reason.
+    let mut junk = Vec::new();
+    junk.extend_from_slice(&NICKNAME_DHT_MAGIC);
+    junk.extend_from_slice(b"not a nickname record at all");
+    assert!(!NodeRuntime::is_republishable_dht_value_at(&junk, now_ms));
+}
+
 /// An anycast service list must be republished, or it never leaves the node.
 ///
 /// `advertise` writes with `store_local`, so the only thing that ever carries
