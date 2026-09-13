@@ -113,6 +113,19 @@ impl NodeRuntime {
     /// lifecycle checks on resolve. `XS` is deliberately short-lived: sending
     /// an expired cached sample would make a correct peer classify a benign
     /// stale cache entry as an invalid STORE.
+    ///
+    /// DO NOT SEND WHAT YOU WOULD REFUSE, and this is not a tidiness rule.
+    /// Measured on the production seeds the day 0.11.30 rolled out: ONE stale
+    /// v1 `NicknameRecord` left in every holder's store — a name claimed
+    /// before v2 existed — was re-fanned by each of them every republish
+    /// interval, refused by every recipient as `Store: invalid NicknameRecord`,
+    /// counted as a session VIOLATION, and after enough of them one seed
+    /// auto-banned another. Four honest nodes made each other look like
+    /// attackers over a record none of them would have accepted.
+    ///
+    /// A format change turns every holder into a violator unless the sender
+    /// applies the receiver's rule first. `nickname_store_decision` is that
+    /// rule, and it is the same call the STORE gate makes.
     pub fn is_republishable_dht_value_at(value: &[u8], now_unix_ms: u64) -> bool {
         if !Self::is_self_authenticating_dht_value(value) {
             return false;
@@ -120,6 +133,17 @@ impl NodeRuntime {
         if value.get(..2) == Some(&veil_crypto::space_discovery::SPACE_DISCOVERY_DHT_MAGIC[..]) {
             return veil_crypto::space_discovery::SpaceDiscoveryRecord::from_bytes(value)
                 .is_some_and(|record| record.verify_at(now_unix_ms).is_ok());
+        }
+        if value.get(..2) == Some(&veil_crypto::nickname::NICKNAME_DHT_MAGIC[..]) {
+            // `None` for the incumbent: this asks only "would a peer holding
+            // nothing accept this record", which is the weakest form of the
+            // question and the one a sender can answer. A peer that holds a
+            // heavier incumbent still refuses, and that refusal is benign —
+            // `RejectKeepExisting` is not a violation.
+            return matches!(
+                veil_crypto::nickname::nickname_store_decision(None, value),
+                veil_crypto::nickname::StoreDecision::Accept
+            );
         }
         true
     }

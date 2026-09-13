@@ -1,5 +1,39 @@
 # Changelog
 
+## v0.11.31 — 2026-09-13
+
+*Four honest nodes made each other look like attackers.*
+
+Found by rolling 0.11.30 onto the production seeds and reading their logs.
+Within minutes every seed was refusing its neighbours' stores as
+`Store: invalid NicknameRecord`, counting each refusal as a session violation,
+and auto-banning — 5 seconds at first, 45 seconds twenty minutes later, the
+duration escalating with the count.
+
+ONE record caused it: a v1 `NicknameRecord` for a name claimed before v2
+existed, left in every holder's store. 0.11.29 made the record name the
+IDENTITY and refuses v1 rather than grandfathering it, which is right — and
+the republish driver kept re-fanning that record to every peer anyway, because
+its filter asked whether the TYPE is self-authenticating and never whether
+THIS record would be accepted.
+
+So a sender was posting what it would itself refuse, and taking the blame for
+it. Any format change does this: the moment a type gains a version, every node
+still holding an old record becomes, to its peers, a source of invalid stores.
+
+The republish filter now applies the receiver's own rule before sending —
+`nickname_store_decision`, the same call the STORE gate makes. A record this
+node would refuse on arrival does not go out. `XS` already worked this way for
+its own reason; nicknames now do, and the shape generalises to whatever gains
+a version next.
+
+Guarded by `a_record_this_node_would_refuse_is_not_republished`, with the
+control that a valid record still goes out — otherwise the fix is just "stop
+republishing nicknames".
+
+Gate 18/18 and the four test commands green after the bump: 5762, 184, 86,
+doctests.
+
 ## v0.11.30 — 2026-09-13
 
 *An identity was a name the network could not use.*
