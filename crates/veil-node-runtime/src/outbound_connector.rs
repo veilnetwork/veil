@@ -372,9 +372,14 @@ pub fn spawn_outbound_peers(
                 // a bootstrap has no prior knowledge of us and never dials IN,
                 // so the larger-node_id side MUST still initiate or it can
                 // never join. tx_registry mirrors this bypass on both sides.
+                // `outbound_ignores_directional` names the same exemption for a
+                // row whose SOURCE makes it one-sided — a peer met at a public
+                // index we only read holds no row for us either, and keying the
+                // exemption on `bootstrap_only` alone lost it the moment the
+                // handshake proved an identity.
                 // No glare: once our outbound lands the bootstrap sees it as
                 // inbound and dedups any later dial via the has_session check.
-                if !we_keep_outbound && !peer.bootstrap_only {
+                if !crate::runtime::peer_handshake::outbound_dial_is_ours(we_keep_outbound, &peer) {
                     // Phase E20 policy violation guard: skip dial and
                     // wait for peer-initiated inbound.  Same wake set
                     // as the `has_session` branch — `force_reconnect_
