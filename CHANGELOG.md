@@ -1,5 +1,37 @@
 # Changelog
 
+## v0.11.32 — 2026-09-14
+
+*Whether a node could join at all was decided by how its name sorted.*
+
+A client finds its first peer at a public meeting point, dials whoever it
+finds, and proves who answered. Then the rule that decides which side of a
+pair makes the lasting dial — ours sorts before theirs — cancelled the dial on
+one side and waited for the other side to make it. A seed found that way holds
+no row for the client that found it: this layer only READS the index, it
+announces nothing there. The dial it waited for did not exist.
+
+So a client whose node id sorted after every seed sat at zero sessions
+forever, and one whose id fell between them reached only the seeds above it.
+On the production network, with seeds at `3d3575c9`, `c6ace22e` and
+`c92b85df`, that is roughly one identity in five that could not reach the
+network at all — drawn fresh with every new identity, which is why it looked
+like it used to work.
+
+Measured, same config and same clean state, only the binary differing: an
+identity minted to sort after all three went from 0 sessions to 3; a control
+at `827ba8f2` went from 2 to 3.
+
+`bootstrap_only` used to carry the exemption, and `dial_and_learn` clears that
+flag the moment the handshake proves an identity — right for what the flag
+otherwise means, fatal for this. The question now belongs to the row's SOURCE
+and is answered exhaustively, so a source added later has to decide rather
+than inherit; and the handshake and the reconnect loop, which used to answer
+it apart, now share one answer.
+
+Client-side only: a seed already accepts an inbound from a peer it has no
+record of, which is why the two reachable seeds were reachable.
+
 ## v0.11.31 — 2026-09-13
 
 *Four honest nodes made each other look like attackers.*

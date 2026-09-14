@@ -1181,7 +1181,7 @@ pub async fn register_connection_session(
                         lock_state(&runtime.state)
                             .peers
                             .get(&pid)
-                            .is_some_and(|e| e.bootstrap_only)
+                            .is_some_and(outbound_row_bypasses_directional)
                     })
                     .unwrap_or(false)
             } else {
@@ -1485,6 +1485,67 @@ pub fn inbound_bypasses_directional(matched_source: Option<PeerSource>) -> bool 
         matched_source,
         Some(PeerSource::Configured) | Some(PeerSource::Bootstrap)
     )
+}
+
+/// The same question for an OUTBOUND dial: may the tiebreak decide this row,
+/// or must this node dial it however the two ids sort?
+///
+/// THE TIEBREAK NEEDS TWO SIDES. It cancels one of two dials and relies on the
+/// other side making the one it cancelled. A row the far side does not hold
+/// has no other side, so the rule resolves to "wait for an inbound that cannot
+/// come" and the larger-id node sits at zero sessions forever.
+///
+/// Measured on the production network (2026-09-14). A client whose node id was
+/// `ff03c2cd…` met all three seeds at the rendezvous, proved every one of them,
+/// and then dialled none: `3d3575c9`, `c6ace22e` and `c92b85df` all sort before
+/// it. A control node at `827ba8f2…` held sessions to exactly the two seeds
+/// above it and none to the one below — the ordering, and nothing else, decided
+/// who could join. Roughly one client in five drew an id past every seed and
+/// could never reach the network at all.
+///
+/// `bootstrap_only` used to carry this, and `dial_and_learn` clears it the
+/// moment the handshake proves an identity — which is right for what that flag
+/// otherwise means (a row worth keeping and persisting) and wrong for this.
+/// Two different questions, so two different answers.
+///
+/// Exhaustive on purpose: a new source must say which it is rather than
+/// inherit an answer.
+pub fn outbound_ignores_directional(source: PeerSource) -> bool {
+    match source {
+        // A public index this node only READS. It announces nothing there —
+        // the layer's log has `nostr.looked` and `nostr.met` and no third
+        // line — so whoever we found cannot have found us, holds no row for
+        // us, and will never dial. One-sided by construction.
+        PeerSource::Rendezvous => true,
+        // Learned, but mutually: both sides hear of each other the same way
+        // and both dial, so the tiebreak has the second dial it exists to
+        // cancel. A LAN row additionally carries `bootstrap_only`, which
+        // exempts it anyway.
+        PeerSource::Exchanged | PeerSource::Autodiscovered | PeerSource::Lan => false,
+        // The operator's own mesh — the mutual-dial case the rule was
+        // written for, and the dedup storm it was written against.
+        PeerSource::Configured | PeerSource::Bootstrap => false,
+    }
+}
+
+/// The whole of the exemption for one ROW, so the handshake and the reconnect
+/// loop cannot answer it differently.
+///
+/// They did: the loop read `bootstrap_only` and so did the handshake, and when
+/// only one of them learned about a second reason the other would have
+/// cancelled the dial the first had just decided to make. One function, two
+/// call sites, one answer.
+pub fn outbound_row_bypasses_directional(entry: &PeerConfigEntry) -> bool {
+    entry.bootstrap_only || outbound_ignores_directional(entry.source)
+}
+
+/// Whether THIS node makes the dial for this row — the decision the reconnect
+/// loop acts on, in the place it can be tested.
+///
+/// `we_keep_outbound` is the tiebreak's answer (`ours < theirs`); the row says
+/// whether the tiebreak gets to answer at all.
+pub fn outbound_dial_is_ours(we_keep_outbound: bool, entry: &PeerConfigEntry) -> bool {
+    we_keep_outbound || outbound_row_bypasses_directional(entry)
 }
 
 /// Whether an inbound connection may take the place of a session that is still
@@ -1791,6 +1852,99 @@ mod live_session_eviction_tests {
         ] {
             let _ = inbound_may_replace_live_session(Some(s));
         }
+    }
+}
+
+#[cfg(test)]
+mod outbound_direction_tests {
+    use super::{outbound_dial_is_ours, outbound_ignores_directional};
+    use crate::types::{PeerConfigEntry, PeerId, PeerSource};
+
+    fn row(source: PeerSource) -> PeerConfigEntry {
+        PeerConfigEntry {
+            peer_id: PeerId::new(0x9200_0000),
+            node_id: veil_cfg::NodeId::from([0x3d; 32]),
+            public_key: "AAAA".to_owned(),
+            nonce: String::new(),
+            transport: "obfs4-tcp://203.0.113.9:5556".to_owned(),
+            algo: veil_cfg::SignatureAlgorithm::Ed25519,
+            tls_cert: None,
+            tls_key: None,
+            tls_ca_cert: None,
+            bootstrap_only: false,
+            source,
+        }
+    }
+
+    /// The regression, in one line.
+    ///
+    /// A client that met every seed at the rendezvous and proved every one of
+    /// them dialled none of them, because its own node id happened to sort
+    /// after all three. The row is a full peer by then -- `dial_and_learn`
+    /// clears `bootstrap_only` the moment the handshake proves an identity --
+    /// so the only exemption the loop had was gone, and the tiebreak handed
+    /// the dial to a seed that has no row for us and never dials out.
+    #[test]
+    fn a_peer_met_at_a_public_index_is_dialled_from_the_far_side_too() {
+        let met = row(PeerSource::Rendezvous);
+        assert!(
+            outbound_dial_is_ours(false, &met),
+            "a rendezvous row must be dialled by the larger-id side too; \
+             nobody on the other side holds a row to dial back on"
+        );
+    }
+
+    /// And the rule it must not repeal.
+    #[test]
+    fn a_mutually_dialling_row_still_obeys_the_tiebreak() {
+        for source in PeerSource::ALL {
+            if matches!(source, PeerSource::Rendezvous) {
+                continue;
+            }
+            assert!(
+                !outbound_dial_is_ours(false, &row(*source)),
+                "{source:?} dials mutually, so the larger-id side must wait \
+                 for the inbound rather than add a second dial to cancel"
+            );
+        }
+    }
+
+    #[test]
+    fn the_side_that_sorts_first_always_dials() {
+        for source in PeerSource::ALL {
+            assert!(
+                outbound_dial_is_ours(true, &row(*source)),
+                "{source:?}: the tiebreak already chose us"
+            );
+        }
+    }
+
+    /// The exemption `bootstrap_only` used to be the whole of.
+    #[test]
+    fn a_bootstrap_row_keeps_the_exemption_it_always_had() {
+        for source in PeerSource::ALL {
+            let mut e = row(*source);
+            e.bootstrap_only = true;
+            assert!(
+                outbound_dial_is_ours(false, &e),
+                "{source:?}: a bootstrap-only row has never obeyed the tiebreak"
+            );
+        }
+    }
+
+    /// The walk above is only worth running if the sources disagree.
+    #[test]
+    fn the_sources_do_not_all_answer_alike() {
+        let exempt = PeerSource::ALL
+            .iter()
+            .filter(|s| outbound_ignores_directional(**s))
+            .count();
+        assert!(
+            exempt > 0 && exempt < PeerSource::ALL.len(),
+            "a classifier that answers the same for every source tests nothing; \
+             {exempt} of {} are exempt",
+            PeerSource::ALL.len()
+        );
     }
 }
 
