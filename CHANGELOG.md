@@ -1,5 +1,36 @@
 # Changelog
 
+## v0.11.33 — 2026-09-15
+
+*A thousand hosts at the meeting point, and everyone rang the same door.*
+
+A node that knows nobody asks a public index — Nostr relays, the Mainline DHT —
+and calls whoever it finds there. WHICH of them it called had no answer: both
+loops walked the index's own list from the top. A relay honours `limit` by
+returning the NEWEST records, and the DHT walk towards a rotating infohash is
+deterministic, so two clients that look in the same minute get near-identical
+lists. At four announcing hosts that is invisible. At a thousand it means the
+few that republished most recently carry everyone, and a position at the front
+is bought with a cron job rather than earned.
+
+The order is now the node's own: a fresh random point each pass, and each
+candidate's place derived from it. The nearest is tried first and the walk
+widens outward as dials fail, under the budget that was already there.
+
+The point is drawn fresh and is never this node's identity, though Kademlia
+invites exactly that. Peers-you-ring as a function of who-you-are is a
+fingerprint that a relay operator or a DHT node could read off the dials, and
+one that survives a new address, a restart and a fresh relay key.
+
+Measured rather than assumed: the obvious XOR-distance version of this is
+biased — candidates sit in a trie and a random point lands in Voronoi cells of
+very different sizes — and the fairness test caught it at 650 and 1215 leads
+out of 10000 where 1000 was expected. The key is hashed from the point and the
+address together instead.
+
+Also: rustls 0.23.45 for RUSTSEC-2026-0285, TLS 1.3 handshake messages accepted
+across encryption level boundaries.
+
 ## v0.11.32 — 2026-09-14
 
 *Whether a node could join at all was decided by how its name sorted.*
