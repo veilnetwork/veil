@@ -28,6 +28,7 @@ use veil_util::lock;
 
 use crate::types::{PeerConfigEntry, PeerId};
 
+use super::rendezvous_order::{MeetingProbe, nearest_first};
 use super::service_tasks::{
     LAN_CANDIDATE_GRACE, LanCandidate, MAX_LAN_PEERS, MAX_RENDEZVOUS_ATTEMPTS,
     MAX_RENDEZVOUS_PEERS, RENDEZVOUS_INTERVAL, addresses_we_already_hold, admit_lan_peer,
@@ -153,6 +154,12 @@ impl NodeRuntime {
                     .map(|d| d.as_secs())
                     .unwrap_or(0);
 
+                // Collected across BOTH infohashes before anything is
+                // dialled, because the order is drawn once for the pass and an
+                // order per infohash would leave the first epoch's addresses
+                // permanently ahead of the second's.
+                let mut candidates: Vec<String> = Vec::new();
+                let mut seen = std::collections::HashSet::new();
                 for info_hash in current_infohashes(network, now) {
                     let found = find_peers(&net, info_hash, &seeds, Limits::default()).await;
                     logger.info(
@@ -180,10 +187,12 @@ impl NodeRuntime {
                     // NOT gated on `me`. Announcing needs something to announce;
                     // dialling needs only a scheme, and a node with no listener --
                     // every client -- has one to dial with and nothing to offer.
-                    for addr in found.peers.iter().take(MAX_RENDEZVOUS_ATTEMPTS) {
-                        if taken >= MAX_RENDEZVOUS_PEERS || tried >= MAX_RENDEZVOUS_ATTEMPTS {
-                            break;
-                        }
+                    //
+                    // No `take` here any more: the budget is spent below, on an
+                    // order this node drew. Truncating the INDEX's order first
+                    // would hand the same few addresses the front of the queue
+                    // before the draw could reach the rest.
+                    for addr in &found.peers {
                         if !rendezvous_destination_is_dialable(&addr.ip().to_string()) {
                             logger.debug(
                                 "mainline.not_dialable",
@@ -192,56 +201,72 @@ impl NodeRuntime {
                             continue;
                         }
                         let transport = format!("{dial_scheme}://{addr}");
-                        if rendezvous_address_is_self(my_address.as_ref(), &transport) {
-                            logger.debug(
-                                "mainline.self",
-                                format!("{transport} is this node's own announcement"),
-                            );
-                            continue;
-                        }
-                        // Already ours, by any route. See `rendezvous_address_is_new`.
-                        let known: Vec<PeerConfigEntry> =
-                            lock_state(&state).peers.values().cloned().collect();
-                        let live = addresses_we_already_hold(
-                            &live_sessions,
-                            &access.discovered_peers_cache,
-                        );
-                        if !rendezvous_address_is_new(&known, &live, &transport) {
-                            already_had += 1;
-                            logger.debug(
-                                "mainline.already_known",
-                                format!("{transport} is already a peer; not dialled"),
-                            );
-                            continue;
-                        }
-                        if !we_should_place_the_call(
-                            &access.local_node_id,
-                            &access.discovered_peers_cache,
-                            &transport,
-                        ) {
-                            logger.debug(
-                                "mainline.theirs_to_call",
-                                format!("{transport} keeps the outbound; not dialled"),
-                            );
-                            continue;
-                        }
-                        tried += 1;
-                        match dial_and_learn(&access, &state, &transport, &shutdown_tx).await {
-                            Ok(node) => {
-                                taken += 1;
-                                logger.info(
-                                    "mainline.met",
-                                    format!(
-                                        "met {node} at {transport}, learned from the rendezvous"
-                                    ),
-                                );
-                            }
-                            Err(e) => {
-                                logger.debug("mainline.unreachable", format!("{transport}: {e}"))
-                            }
+                        if seen.insert(transport.clone()) {
+                            candidates.push(transport);
                         }
                     }
                 }
+
+                // WHO GETS CALLED, and it is not whoever the index listed first.
+                // See `rendezvous_order`: a fresh probe per pass, nearest
+                // first, widening outward as dials fail until the budget runs
+                // out or four peers answer.
+                let considered = candidates.len();
+                for transport in nearest_first(&MeetingProbe::fresh(), candidates) {
+                    if taken >= MAX_RENDEZVOUS_PEERS || tried >= MAX_RENDEZVOUS_ATTEMPTS {
+                        break;
+                    }
+                    let transport = transport.as_str();
+                    if rendezvous_address_is_self(my_address.as_ref(), transport) {
+                        logger.debug(
+                            "mainline.self",
+                            format!("{transport} is this node's own announcement"),
+                        );
+                        continue;
+                    }
+                    // Already ours, by any route. See `rendezvous_address_is_new`.
+                    let known: Vec<PeerConfigEntry> =
+                        lock_state(&state).peers.values().cloned().collect();
+                    let live =
+                        addresses_we_already_hold(&live_sessions, &access.discovered_peers_cache);
+                    if !rendezvous_address_is_new(&known, &live, transport) {
+                        already_had += 1;
+                        logger.debug(
+                            "mainline.already_known",
+                            format!("{transport} is already a peer; not dialled"),
+                        );
+                        continue;
+                    }
+                    if !we_should_place_the_call(
+                        &access.local_node_id,
+                        &access.discovered_peers_cache,
+                        transport,
+                    ) {
+                        logger.debug(
+                            "mainline.theirs_to_call",
+                            format!("{transport} keeps the outbound; not dialled"),
+                        );
+                        continue;
+                    }
+                    tried += 1;
+                    match dial_and_learn(&access, &state, transport, &shutdown_tx).await {
+                        Ok(node) => {
+                            taken += 1;
+                            logger.info(
+                                "mainline.met",
+                                format!("met {node} at {transport}, learned from the rendezvous"),
+                            );
+                        }
+                        Err(e) => logger.debug("mainline.unreachable", format!("{transport}: {e}")),
+                    }
+                }
+                logger.debug(
+                    "mainline.considered",
+                    format!(
+                        "{considered} dialable address(es) at the rendezvous, \
+                         {tried} tried in this pass's own order"
+                    ),
+                );
 
                 if taken == 0 {
                     // Two different facts, and the old message told the wrong one:
@@ -401,6 +426,10 @@ impl NodeRuntime {
                 let mut tried = 0usize;
                 let mut already_had = 0usize;
                 let mut seen = std::collections::HashSet::new();
+                // Every relay and both labels, gathered before a single dial:
+                // the draw has to run over the whole rendezvous, not over
+                // whichever relay answered first.
+                let mut candidates: Vec<String> = Vec::new();
                 for label in &labels {
                     for relay in PUBLIC_RELAYS {
                         let events = match query(
@@ -425,9 +454,12 @@ impl NodeRuntime {
                         );
 
                         for event in events {
-                            if taken >= MAX_RENDEZVOUS_PEERS || tried >= MAX_RENDEZVOUS_ATTEMPTS {
-                                break;
-                            }
+                            // No budget check here any more: this loop only
+                            // COLLECTS. Stopping it early would mean the
+                            // relays asked first decide who is in the draw,
+                            // which is the bias one layer up from the one this
+                            // change removes.
+                            //
                             // A relay is a stranger's server and the content is
                             // whatever somebody signed. Take an address from it
                             // and nothing else: the scheme is OURS, as it is at
@@ -461,54 +493,71 @@ impl NodeRuntime {
                                 );
                                 continue;
                             }
-                            if rendezvous_address_is_self(my_address.as_ref(), &transport) {
-                                logger.debug(
-                                    "nostr.self",
-                                    format!("{transport} is this node's own address"),
-                                );
-                                continue;
-                            }
-                            let known: Vec<PeerConfigEntry> =
-                                lock_state(&state).peers.values().cloned().collect();
-                            let live = addresses_we_already_hold(
-                                &live_sessions,
-                                &access.discovered_peers_cache,
-                            );
-                            if !rendezvous_address_is_new(&known, &live, &transport) {
-                                already_had += 1;
-                                logger.debug(
-                                    "nostr.already_known",
-                                    format!("{transport} is already a peer; not dialled"),
-                                );
-                                continue;
-                            }
-                            if !we_should_place_the_call(
-                                &access.local_node_id,
-                                &access.discovered_peers_cache,
-                                &transport,
-                            ) {
-                                logger.debug(
-                                    "nostr.theirs_to_call",
-                                    format!("{transport} keeps the outbound; not dialled"),
-                                );
-                                continue;
-                            }
-                            tried += 1;
-                            match dial_and_learn(&access, &state, &transport, &shutdown_tx).await {
-                                Ok(node) => {
-                                    taken += 1;
-                                    logger.info(
-                                        "nostr.met",
-                                        format!("met {node} at {transport}, learned from a relay"),
-                                    );
-                                }
-                                Err(e) => {
-                                    logger.debug("nostr.unreachable", format!("{transport}: {e}"))
-                                }
-                            }
+                            candidates.push(transport);
                         }
                     }
                 }
+
+                // WHO GETS CALLED. A relay honours `limit` by returning the
+                // NEWEST records, so walking the relays' order means the hosts
+                // that republished most recently are rung by everybody at once.
+                // The order below is this node's own: see `rendezvous_order`.
+                let considered = candidates.len();
+                for transport in nearest_first(&MeetingProbe::fresh(), candidates) {
+                    if taken >= MAX_RENDEZVOUS_PEERS || tried >= MAX_RENDEZVOUS_ATTEMPTS {
+                        break;
+                    }
+                    let transport = transport.as_str();
+                    if rendezvous_address_is_self(my_address.as_ref(), transport) {
+                        logger.debug(
+                            "nostr.self",
+                            format!("{transport} is this node's own address"),
+                        );
+                        continue;
+                    }
+                    let known: Vec<PeerConfigEntry> =
+                        lock_state(&state).peers.values().cloned().collect();
+                    let live =
+                        addresses_we_already_hold(&live_sessions, &access.discovered_peers_cache);
+                    if !rendezvous_address_is_new(&known, &live, transport) {
+                        already_had += 1;
+                        logger.debug(
+                            "nostr.already_known",
+                            format!("{transport} is already a peer; not dialled"),
+                        );
+                        continue;
+                    }
+                    if !we_should_place_the_call(
+                        &access.local_node_id,
+                        &access.discovered_peers_cache,
+                        transport,
+                    ) {
+                        logger.debug(
+                            "nostr.theirs_to_call",
+                            format!("{transport} keeps the outbound; not dialled"),
+                        );
+                        continue;
+                    }
+                    tried += 1;
+                    match dial_and_learn(&access, &state, transport, &shutdown_tx).await {
+                        Ok(node) => {
+                            taken += 1;
+                            logger.info(
+                                "nostr.met",
+                                format!("met {node} at {transport}, learned from a relay"),
+                            );
+                        }
+                        Err(e) => logger.debug("nostr.unreachable", format!("{transport}: {e}")),
+                    }
+                }
+
+                logger.debug(
+                    "nostr.considered",
+                    format!(
+                        "{considered} address(es) at the relays, {tried} tried \
+                         in this pass's own order"
+                    ),
+                );
 
                 if taken == 0 {
                     if already_had > 0 {
