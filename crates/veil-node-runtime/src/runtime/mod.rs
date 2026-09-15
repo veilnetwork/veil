@@ -42,6 +42,7 @@ mod pex_runtime;
 mod push_tasks;
 mod rendezvous_ad_binding;
 mod rendezvous_binder;
+mod rendezvous_order;
 mod rendezvous_resolver;
 mod resumption_state;
 mod routing_health;
