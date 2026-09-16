@@ -132,7 +132,11 @@ fn update_document(document: &mut DocumentMut, config: &Config) -> Result<()> {
     // first time anything re-saves the config, with no error anywhere. Both of
     // these decide whether a node is findable at all, which is the worst thing
     // to lose silently.
-    set_string(global, "announce_schedule", &g.announce_schedule.to_string());
+    set_string(
+        global,
+        "announce_schedule",
+        &g.announce_schedule.to_string(),
+    );
     set_string_array(global, "remembered_peers", &g.remembered_peers);
 
     set_transport(document, &config.transport)?;
@@ -1104,10 +1108,7 @@ mod every_settable_key_survives_a_save {
             ConfigKey::IpcSocketUri => (14, Some("unix:///tmp/b.sock")),
             ConfigKey::IpcAppSocketDir => (15, Some("/tmp/apps")),
             ConfigKey::GlobalAnnounceSchedule => (28, Some("01:00-09:00")),
-            ConfigKey::GlobalRememberedPeers => (
-                29,
-                Some("obfs4-tcp://198.51.100.7:5555"),
-            ),
+            ConfigKey::GlobalRememberedPeers => (29, Some("obfs4-tcp://198.51.100.7:5555")),
             ConfigKey::IdentityAlgo => (16, None),
             ConfigKey::IdentityRole => (17, None),
             ConfigKey::IdentityPublicKey => (18, None),

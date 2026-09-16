@@ -703,8 +703,9 @@ impl NodeRuntime {
                                 format!("met {node} at {transport}, remembered from before"),
                             );
                         }
-                        Err(e) => logger
-                            .debug("remembered.unreachable", format!("{transport}: {e}")),
+                        Err(e) => {
+                            logger.debug("remembered.unreachable", format!("{transport}: {e}"))
+                        }
                     }
                 }
                 logger.debug(
