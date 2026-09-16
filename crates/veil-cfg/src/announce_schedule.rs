@@ -75,8 +75,8 @@ impl AnnounceSchedule {
     /// do not flip together — a synchronised flip across several hosts is
     /// itself a signature, and the thing it signs is "these belong together".
     pub fn announcing_at(self, unix_secs: u64, node_id: &[u8; 32]) -> bool {
-        let minute_of_day = u32::try_from((unix_secs / 60) % u64::from(MINUTES_PER_DAY))
-            .unwrap_or(0);
+        let minute_of_day =
+            u32::try_from((unix_secs / 60) % u64::from(MINUTES_PER_DAY)).unwrap_or(0);
         match self {
             Self::Always => true,
             Self::Window { start_min, end_min } => {
@@ -175,9 +175,10 @@ impl FromStr for AnnounceSchedule {
         }
         if let Some(rest) = value.strip_prefix("derived") {
             let hours = match rest.trim().strip_prefix(':') {
-                Some(d) => parse_duration(d.trim())
-                    .ok_or_else(|| format!("bad derived window: {rest}"))?
-                    / 60,
+                Some(d) => {
+                    parse_duration(d.trim()).ok_or_else(|| format!("bad derived window: {rest}"))?
+                        / 60
+                }
                 None => 8,
             };
             if hours == 0 || hours > 24 {
@@ -307,17 +308,18 @@ mod tests {
         // THE ARRANGEMENT THIS EXISTS FOR, checked minute by minute rather
         // than reasoned about: four windows of eight hours starting every six,
         // which overlap by two and cover the day twice over.
-        let shifts: Vec<AnnounceSchedule> = ["00:00-08:00", "06:00-14:00", "12:00-20:00", "18:00-02:00"]
-            .iter()
-            .map(|s| s.parse().expect("parses"))
-            .collect();
+        let shifts: Vec<AnnounceSchedule> =
+            ["00:00-08:00", "06:00-14:00", "12:00-20:00", "18:00-02:00"]
+                .iter()
+                .map(|s| s.parse().expect("parses"))
+                .collect();
         for minute in 0..MINUTES_PER_DAY {
             let now = DAY + u64::from(minute) * 60;
-            let live = shifts
-                .iter()
-                .filter(|s| s.announcing_at(now, &ID))
-                .count();
-            assert!(live >= 1, "minute {minute} of the day has no seed announcing");
+            let live = shifts.iter().filter(|s| s.announcing_at(now, &ID)).count();
+            assert!(
+                live >= 1,
+                "minute {minute} of the day has no seed announcing"
+            );
             assert!(
                 live <= 2,
                 "minute {minute} has {live} seeds up — the overlap is meant to be one neighbour"
