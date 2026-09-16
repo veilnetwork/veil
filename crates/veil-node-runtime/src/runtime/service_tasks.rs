@@ -2405,6 +2405,41 @@ pub fn rendezvous_destination_is_dialable(host: &str) -> bool {
 /// holds `address -> public key` for every peer we have completed a dial with,
 /// and a first meeting has no entry: then this says yes, because somebody has
 /// to call first and that is how the mapping is learned at all.
+/// Whether the RENDEZVOUS pass should dial this address.
+///
+/// THE TIEBREAK NEEDS TWO SIDES, and at a public index this node only reads,
+/// there is only one. `we_should_place_the_call` cancels our dial and waits for
+/// the far side to make the one it cancelled — but whoever we found at a
+/// meeting point holds no row for us and never heard of us, so that dial can
+/// never come. `outbound_ignores_directional` says exactly this about
+/// `PeerSource::Rendezvous` and has since 0.11.32; the rendezvous pass itself
+/// went on applying the raw comparison, so the two halves of one rule gave
+/// opposite answers and the pass won: it is the half that decides whether the
+/// row is ever created again after a session ends.
+///
+/// Measured on the production network (2026-09-16): a phone held three of the
+/// four seeds and never the fourth, and the missing one was `1c3ec09b…` — the
+/// SMALLEST of the four ids, which is the one the most clients sort after. The
+/// first meeting works (an empty cache answers "we call"), so this looks like
+/// a network that worked and then lost a seed, rather than one that refused.
+///
+/// `we_announce` is what makes a node callable at all: a node that publishes
+/// no address at any meeting point — every app, every phone, anything not a
+/// bootstrap node — cannot be dialled by a stranger, so it must keep the
+/// outbound however the ids sort. A node that DOES announce is in the mutual
+/// case the tiebreak was written for, and keeps it.
+pub fn rendezvous_dial_is_ours(
+    we_announce: bool,
+    local_node_id: &[u8; 32],
+    cache: &std::sync::Arc<std::sync::Mutex<veil_bootstrap::DiscoveredPeerCache>>,
+    transport: &str,
+) -> bool {
+    if !we_announce {
+        return true;
+    }
+    we_should_place_the_call(local_node_id, cache, transport)
+}
+
 pub fn we_should_place_the_call(
     local_node_id: &[u8; 32],
     cache: &std::sync::Arc<std::sync::Mutex<veil_bootstrap::DiscoveredPeerCache>>,
