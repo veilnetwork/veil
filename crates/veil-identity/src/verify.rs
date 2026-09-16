@@ -156,6 +156,58 @@ pub enum VerifyError {
 
 // ── Entry point ──────────────────────────────────────────────────────────────
 
+/// The key at `idx`, IF it may act for this identity right now.
+///
+/// `verify_identity_document` enforces the window of the ACTIVE key — the one
+/// that signed the document — and deliberately tolerates a sibling whose own
+/// window has passed, so one expired delegation does not invalidate an
+/// otherwise good document. Consumers then read `identity_keys` and treated
+/// every entry as a current right: the holder of an expired device secret kept
+/// authority in delegation lookups, discovery bindings and name claims
+/// (report27 V02).
+///
+/// This is the one place that asks the narrower question. A key is returned
+/// only when the document verifies, the key exists at `idx`, and the key's OWN
+/// validity window contains `now_unix_secs` — the same bounds, sentinels and
+/// skew the active key is held to.
+///
+/// For AUTHORSHIP of something signed in the past, this is the wrong question:
+/// a key that was valid then is not required to be valid now. Such a caller
+/// wants the time the signature was made, and must say so explicitly rather
+/// than reach for this.
+pub fn authorize_device_key_at(
+    doc: &veil_proto::identity_document::IdentityDocument,
+    idx: usize,
+    now_unix_secs: u64,
+) -> Result<&veil_proto::identity_document::IdentityKey, VerifyError> {
+    verify_identity_document(doc, now_unix_secs)?;
+    let key = doc
+        .identity_keys
+        .get(idx)
+        .ok_or(VerifyError::SigKeyIdxOutOfBounds {
+            sig_key_idx: idx as u16,
+            n_keys: doc.identity_keys.len(),
+        })?;
+    if now_unix_secs > key.valid_until_unix {
+        return Err(VerifyError::KeyExpired {
+            idx,
+            now: now_unix_secs,
+            valid_until: key.valid_until_unix,
+        });
+    }
+    // Legacy sentinel: a zero lower bound is "no lower bound", exactly as the
+    // document level treats it.
+    if key.valid_from_unix > 0 && now_unix_secs + TIME_VALIDITY_SKEW_SECS < key.valid_from_unix {
+        return Err(VerifyError::KeyNotYetValid {
+            idx,
+            now: now_unix_secs,
+            valid_from: key.valid_from_unix,
+            skew: TIME_VALIDITY_SKEW_SECS,
+        });
+    }
+    Ok(key)
+}
+
 /// Verify a wire-decoded [`IdentityDocument`].
 ///
 /// `now_unix_secs` is passed in explicitly so tests can pin clock state
@@ -942,6 +994,54 @@ mod tests {
             .expect("an aged-out sibling must not take the identity down");
         // And the identity still answers as itself, through the ACTIVE key.
         assert_eq!(v.active_key_idx, f.doc.sig_key_idx);
+    }
+
+    /// An aged-out sibling is tolerated by the DOCUMENT and refused as an
+    /// AUTHORITY.
+    ///
+    /// Those are two different questions and they were answered by one call:
+    /// consumers verified the document and then read `identity_keys` as a list
+    /// of current rights, so the holder of an expired device secret kept
+    /// advertising, claiming names and being resolved (report27 V02).
+    #[test]
+    fn an_expired_sibling_is_not_authorized_to_act() {
+        let mut f = build_fixture();
+        let expired_at = f.now_unix_secs - 1;
+        let idx = add_sibling_key(&mut f, 0, expired_at);
+        resign_document(&f._sub_sk, &mut f.doc);
+
+        // The document is fine — that is the tolerance, and it stays.
+        verify_identity_document(&f.doc, f.now_unix_secs).expect("document verifies");
+
+        assert!(
+            matches!(
+                authorize_device_key_at(&f.doc, idx, f.now_unix_secs),
+                Err(VerifyError::KeyExpired { .. })
+            ),
+            "an expired delegation was handed back as a current right",
+        );
+        // And the active key, which is inside its window, still is one.
+        assert!(
+            authorize_device_key_at(&f.doc, f.doc.sig_key_idx as usize, f.now_unix_secs).is_ok(),
+            "the key that signed this document must still be able to act",
+        );
+    }
+
+    /// A key whose window has not opened yet is not one either.
+    #[test]
+    fn a_future_dated_sibling_is_not_authorized_to_act() {
+        let mut f = build_fixture();
+        let starts = f.now_unix_secs + TIME_VALIDITY_SKEW_SECS + 3600;
+        let idx = add_sibling_key(&mut f, starts, starts + 86_400);
+        resign_document(&f._sub_sk, &mut f.doc);
+
+        assert!(
+            matches!(
+                authorize_device_key_at(&f.doc, idx, f.now_unix_secs),
+                Err(VerifyError::KeyNotYetValid { .. })
+            ),
+            "a delegation that has not started was handed back as a right",
+        );
     }
 
     /// The key that SIGNED the document may not be expired.
