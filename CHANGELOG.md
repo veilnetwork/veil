@@ -1,5 +1,27 @@
 # Changelog
 
+## v0.11.35 — 2026-09-16
+
+### Fixed
+
+- **A client lost the seed whose id sorted below its own, and never got it
+  back.** The rule that decides which side of a pair places the call —
+  `ours < theirs` — needs two sides. At a public meeting point this node only
+  READS, there is only one: whoever was found there holds no row for the finder
+  and has never heard of it, so the dial this rule cancels can never be made by
+  anybody else. `outbound_ignores_directional` has said exactly that about
+  `PeerSource::Rendezvous` since 0.11.32, but the rendezvous pass itself went
+  on applying the raw comparison — and that is the half that decides whether
+  the row is created again at all after a session ends. The first meeting
+  worked (an empty cache answers "we call"), so it looked like a network that
+  had worked yesterday and lost a seed today.
+
+  Measured on the production network: a phone held three of the four seeds and
+  never the fourth, and the missing one was `1c3ec09b…`, the smallest of the
+  four ids — the one the most clients sort after. A node that announces nothing
+  now keeps every outbound, whatever the ids say; a node that announces is in
+  the mutual case the tiebreak was written for and keeps it.
+
 ## v0.11.34 — 2026-09-16
 
 *A node remembers where it has been, and a seed can choose when to be findable.*

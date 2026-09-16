@@ -34,8 +34,8 @@ use super::service_tasks::{
     MAX_RENDEZVOUS_PEERS, RENDEZVOUS_INTERVAL, addresses_we_already_hold, admit_lan_peer,
     bound_ports, current_announcement, dial_and_learn, evict_lan_candidate, free_lan_slot,
     lan_announce_for, rendezvous_address_is_new, rendezvous_address_is_self,
-    rendezvous_destination_is_dialable, rendezvous_dial_scheme, stale_lan_candidates,
-    we_should_place_the_call,
+    rendezvous_destination_is_dialable, rendezvous_dial_is_ours, rendezvous_dial_scheme,
+    stale_lan_candidates,
 };
 use super::{
     NodeRuntime, derive_node_id_from_bootstrap_peer, lock_state, lock_tasks, supervised_spawn,
@@ -249,7 +249,8 @@ impl NodeRuntime {
                         );
                         continue;
                     }
-                    if !we_should_place_the_call(
+                    if !rendezvous_dial_is_ours(
+                        announce_self,
                         &access.local_node_id,
                         &access.discovered_peers_cache,
                         transport,
@@ -548,7 +549,8 @@ impl NodeRuntime {
                         );
                         continue;
                     }
-                    if !we_should_place_the_call(
+                    if !rendezvous_dial_is_ours(
+                        announce_self,
                         &access.local_node_id,
                         &access.discovered_peers_cache,
                         transport,
@@ -645,6 +647,10 @@ impl NodeRuntime {
         let want_peers = config.global.meeting_min_peers;
         let live_sessions = Arc::clone(&self.live_sessions);
         let announce_config = config.clone();
+        // Whether anybody could dial US — the same fact the meeting-point
+        // passes carry, and the reason the direction tiebreak may apply at
+        // all. A node that announces nothing has to keep every outbound.
+        let announce_self = config.global.bootstrap;
         let my_pubkey = self.identity.local_identity.public_key.clone();
         let my_nonce = self.identity.local_identity.nonce.clone();
         let logger = self.logger.clone();
@@ -687,7 +693,8 @@ impl NodeRuntime {
                     if !rendezvous_address_is_new(&known, &live, transport) {
                         continue;
                     }
-                    if !we_should_place_the_call(
+                    if !rendezvous_dial_is_ours(
+                        announce_self,
                         &access.local_node_id,
                         &access.discovered_peers_cache,
                         transport,
