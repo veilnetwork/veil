@@ -107,6 +107,17 @@ ext.cargoTargetMap = [
     'x86'          : 'i686-linux-android',
 ]
 
+// WHERE CARGO ACTUALLY WRITES.
+//
+// `CARGO_TARGET_DIR` redirects every crate's output into one directory — how a
+// machine with a small system disk builds at all — and then
+// `<repo>/target/<triple>/release` never appears. The copy below used to look
+// only there and skip itself when the file was missing, so a build that had
+// just produced a fresh library packaged whatever was left in `jniLibs` from
+// an earlier one. A phone got app code from today against a native library
+// from eight days before, and could not start.
+def cargoTargetRoot = System.getenv('CARGO_TARGET_DIR') ?: "${veilRepoRoot}/target"
+
 cargoTargetMap.each { abi, triple ->
     // 1. Run cargo-ndk for this ABI.  We do NOT use cargo-ndk's `-o`
     // output flag — it copies к а directory that gradle already
@@ -144,16 +155,31 @@ cargoTargetMap.each { abi, triple ->
     // plugin's jniLibs/<abi>/ where gradle bundles it into the AAR.
     tasks.register("copyNative_${abi}", Copy) {
         dependsOn "cargoBuild_${abi}"
-        from "${veilRepoRoot}/target/${triple}/release/libveilclient_ffi.so"
+        def built = "${cargoTargetRoot}/${triple}/release/libveilclient_ffi.so"
+        from built
         into "src/main/jniLibs/${abi}/"
-        // Gracefully handle the VEIL_SKIP_CARGO case: when the
-        // .so is pre-built (CI artifact, manual build-mobile.sh), the
-        // file may already be in place; the Copy task is a no-op
-        // when source doesn't exist (instead of failing) so callers
-        // can stage `.so` files directly into jniLibs/<abi>/ before
-        // running gradle.
+        // The VEIL_SKIP_CARGO case is the ONLY one allowed to proceed without
+        // a freshly built library: there, a caller staged the .so into
+        // jniLibs/<abi>/ on purpose. When cargo DID run, a missing artifact
+        // means it went somewhere this task does not know about — and
+        // continuing packages whatever is left in jniLibs from an earlier
+        // build, silently, which is how a phone ended up running app code
+        // from today against a native library from eight days before.
         onlyIf {
-            file("${veilRepoRoot}/target/${triple}/release/libveilclient_ffi.so").exists()
+            if (file(built).exists()) {
+                return true
+            }
+            if (cargoSkip) {
+                logger.lifecycle("veil: VEIL_SKIP_CARGO — using pre-staged jniLibs/${abi}")
+                return false
+            }
+            throw new GradleException(
+                "veil: cargo built no library at ${built} for ${abi}.\n" +
+                "  Cargo writes to CARGO_TARGET_DIR when it is set" +
+                " (here: ${System.getenv('CARGO_TARGET_DIR') ?: '<unset>'}).\n" +
+                "  Packaging would ship whatever jniLibs/${abi} still holds," +
+                " which is not this build."
+            )
         }
     }
 }

@@ -143,6 +143,15 @@ fn derived_start(node_id: &[u8; 32], day: u64) -> u32 {
     raw % MINUTES_PER_DAY
 }
 
+/// The shortest appearance that can actually be observed.
+///
+/// Both announcers check this schedule once per rendezvous pass
+/// (`RENDEZVOUS_INTERVAL`, 15 minutes), so anything shorter can fall entirely
+/// between two checks. Kept here rather than imported from the runtime: this
+/// crate is what refuses the config, and a number that lives in two places
+/// drifts.
+pub const MIN_WINDOW_MINUTES: u32 = 15;
+
 fn parse_hhmm(text: &str) -> Option<u32> {
     let (h, m) = text.split_once(':')?;
     let h: u32 = h.parse().ok()?;
@@ -154,13 +163,20 @@ fn parse_hhmm(text: &str) -> Option<u32> {
 }
 
 /// `90m`, `2h`, `8h` → minutes.
+///
+/// Split on the CHARACTER, not on the byte before the end: `split_at` panics
+/// when the index is not a char boundary, and a config file is text somebody
+/// typed. `2ч` — a Cyrillic unit two bytes wide — took the parser's own
+/// process down with it (report27 V04). A bad unit is a configuration mistake
+/// and must read as one.
 fn parse_duration(text: &str) -> Option<u32> {
     let text = text.trim();
-    let (digits, unit) = text.split_at(text.len().checked_sub(1)?);
+    let unit = text.chars().next_back()?;
+    let digits = &text[..text.len() - unit.len_utf8()];
     let n: u32 = digits.parse().ok()?;
     match unit {
-        "m" => Some(n),
-        "h" => n.checked_mul(60),
+        'm' => Some(n),
+        'h' => n.checked_mul(60),
         _ => None,
     }
 }
@@ -206,6 +222,21 @@ impl FromStr for AnnounceSchedule {
             if for_min == 0 || for_min > period_min {
                 return Err(format!(
                     "appearance ({for_min}m) must fit inside the period ({period_min}m)"
+                ));
+            }
+            if for_min < MIN_WINDOW_MINUTES {
+                // A WINDOW NOBODY WILL BE LOOKING AT IS NOT A WINDOW.
+                //
+                // The announcers consult this schedule on the rendezvous
+                // cadence — once every 15 minutes — so a two-minute window can
+                // open and close entirely between two checks, and a config
+                // that reads as correct then announces nothing at all
+                // (report27 V20). Refused at the point it is written rather
+                // than discovered as silence on a seed.
+                return Err(format!(
+                    "an appearance of {for_min}m is shorter than the \
+                     {MIN_WINDOW_MINUTES}m the announcers check on, so it can \
+                     pass unseen: make it {MIN_WINDOW_MINUTES}m or longer"
                 ));
             }
             return Ok(Self::Every {
@@ -390,10 +421,24 @@ mod tests {
             "01:00",
             "every 2h",
             "every 0h for 5m",
+            // Shorter than the cadence the announcers check on: it would read
+            // as a correct config and announce nothing (report27 V20).
+            "every 2h for 5m",
+            "every 2h for 1m",
             "every 10m for 20m",
             "derived:0h",
             "derived:48h",
             "sometimes",
+            // A config file is text somebody typed, and a unit outside ASCII
+            // is a mistake — not a reason to take the process down. Splitting
+            // one byte before the end panicked on every multi-byte unit
+            // (report27 V04); these are the cheapest ones to write by
+            // accident on a Russian keyboard.
+            "2ч",
+            "90м",
+            "every 2ч for 20m",
+            "derived:8ч",
+            "2h⏰",
         ] {
             assert!(
                 bad.parse::<AnnounceSchedule>().is_err(),
