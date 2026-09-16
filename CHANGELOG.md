@@ -1,5 +1,37 @@
 # Changelog
 
+## v0.11.34 — 2026-09-16
+
+*A node remembers where it has been, and a seed can choose when to be findable.*
+
+A peer met at a meeting point used to live in memory and nowhere else —
+`save_config` is called from an admin command and from tests, from nothing on
+any discovery path — so every launch paid the whole discovery round again.
+`global.remembered_peers` is a list of addresses and nothing else: no key, no
+claim about who is there. They take the road a rendezvous address takes, dial
+and let the handshake say who answered, which is why they are plain strings
+rather than `[[bootstrap_peers]]` and why this costs no wire or ABI change.
+
+`global.announce_schedule` decides WHEN a node offers itself, as opposed to
+whether. `always`, a daily UTC window like `01:00-09:00` that may wrap
+midnight, `every 2h for 20m`, or `derived:8h` — a window drawn from the node's
+own id and today's date, needing no coordination and moving every night.
+
+This matters most to a seed, because the production seed list ships empty: a
+client learns a seed at a meeting point or not at all, so an address that is
+not announced right now is unobtainable rather than merely quiet. Four seeds on
+eight-hour shifts show an index-watcher one or two at a time, and not the same
+one or two tomorrow.
+
+Said plainly where it is defined: `derived` does not guarantee coverage — four
+nodes can land in the same eight hours by chance. A window does, and a test
+walks the four-seed schedule minute by minute to prove it. Nodes sharing a
+schedule do not flip together either; the offset comes from the node id,
+because a synchronised flip across several hosts is itself a signature.
+
+Announcing is all this governs. A seed outside its window still accepts, still
+relays, and still serves every node that already knows it.
+
 ## v0.11.33 — 2026-09-15
 
 *A thousand hosts at the meeting point, and everyone rang the same door.*
