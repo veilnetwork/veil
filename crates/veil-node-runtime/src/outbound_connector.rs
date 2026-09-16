@@ -126,6 +126,32 @@ pub fn release_connector_claim(slots: &ConnectorRefreshSlots, node_id: &[u8; 32]
 ///
 /// A free function rather than a method on the guard so the rule can be
 /// exercised without spawning a connector.
+/// RAII guard: releases the connector slot on every exit path — the shutdown
+/// ban, a panic, and the abort that lands before the task's first poll.
+///
+/// It used to be declared and constructed inside the spawned future, which
+/// covered every exit from the BODY and none of the paths that never reach it.
+/// See where it is built for what that cost.
+struct SlotGuard {
+    slots: Arc<Mutex<std::collections::HashMap<[u8; 32], watch::Sender<u64>>>>,
+    node_id: [u8; 32],
+    /// A receiver on the channel THIS task claimed, so the guard can tell its
+    /// own claim from a successor's.
+    ///
+    /// It used to remove by node id alone, which is only correct while nothing
+    /// replaces a claim: an aborted task's guard runs at some later poll, and
+    /// by then the slot can belong to the connector spawned in its place —
+    /// which it then deleted, leaving a peer with no reconnect loop and no way
+    /// to get one (report24 RUNTIME-2).
+    claimed: watch::Receiver<u64>,
+}
+
+impl Drop for SlotGuard {
+    fn drop(&mut self) {
+        release_claim_if_still_ours(&self.slots, &self.node_id, &self.claimed);
+    }
+}
+
 fn release_claim_if_still_ours(
     slots: &ConnectorRefreshSlots,
     node_id: &[u8; 32],
@@ -196,34 +222,21 @@ pub fn spawn_outbound_peers(
         };
         let access = access.clone();
         let mut shutdown_rx = shutdown_tx.subscribe();
+        // BUILT BEFORE THE SPAWN, and moved in. A guard constructed inside the
+        // `async move` block does not exist until the first poll — and a
+        // future that is aborted before it is ever polled is dropped without
+        // one. The claim then stayed in the map with no task behind it, and
+        // the next `spawn_outbound_peers` saw a live claim, refreshed it, and
+        // spawned nothing: a peer with no reconnect loop and no way to get one
+        // (report27 V17). Owned by the future's captured state instead, the
+        // drop covers the unpolled case as well as every exit from the body.
+        let slot_guard = SlotGuard {
+            slots: Arc::clone(&access.outbound_connector_refresh),
+            node_id: peer_node_id,
+            claimed: refresh_rx.clone(),
+        };
         let handle = tokio::spawn(async move {
-            // RAII guard: releases the slot on every exit path (shutdown
-            // ban, panic). Inlined so the slot lifecycle is visible
-            // alongside the task body without crossing a module boundary.
-            struct SlotGuard {
-                slots: Arc<Mutex<std::collections::HashMap<[u8; 32], watch::Sender<u64>>>>,
-                node_id: [u8; 32],
-                /// A receiver on the channel THIS task claimed, so the guard
-                /// can tell its own claim from a successor's.
-                ///
-                /// It used to remove by node id alone, which is only correct
-                /// while nothing replaces a claim: an aborted task's guard runs
-                /// at some later poll, and by then the slot can belong to the
-                /// connector spawned in its place — which it then deleted,
-                /// leaving a peer with no reconnect loop and no way to get one
-                /// (report24 RUNTIME-2).
-                claimed: watch::Receiver<u64>,
-            }
-            impl Drop for SlotGuard {
-                fn drop(&mut self) {
-                    release_claim_if_still_ours(&self.slots, &self.node_id, &self.claimed);
-                }
-            }
-            let _slot_guard = SlotGuard {
-                slots: Arc::clone(&access.outbound_connector_refresh),
-                node_id: peer_node_id,
-                claimed: refresh_rx.clone(),
-            };
+            let _slot_guard = slot_guard;
             let backoff_min = access.defaults.reconnect_backoff_min;
             let backoff_max = access.defaults.reconnect_backoff_max;
             let quiet_after = access.defaults.reconnect_quiet_after_failures;
@@ -493,6 +506,15 @@ pub fn spawn_outbound_peers(
                                     if ka_interval.as_secs() > 0 {
                                         let ka_tx_registry = Arc::clone(&access.session_tx_registry);
                                         let ka_peer_id = *peer_id.as_bytes();
+                                        // The SESSION this keepalive belongs
+                                        // to, not just the peer. A peer_id is
+                                        // a slot a reconnect hands to the next
+                                        // session, and this task addressed it
+                                        // by slot: after a fast reconnect the
+                                        // old loop went on writing into the
+                                        // successor, which had a loop of its
+                                        // own (report27 V19).
+                                        let ka_owner = session_id;
                                         tokio::spawn(async move {
                                             let mut ticker = tokio::time::interval(ka_interval);
                                             loop {
@@ -501,14 +523,28 @@ pub fn spawn_outbound_peers(
                                                 let sent = ka_tx_registry
                                                     .read()
                                                     .unwrap_or_else(|p| p.into_inner())
-                                                    .send_to(
+                                                    .send_to_owned_result(
                                                         &ka_peer_id,
+                                                        &ka_owner,
                                                         veil_proto::priority::INTERACTIVE,
                                                         frame,
                                                     );
-                                                // Exit when the session is gone.
-                                                if !sent {
-                                                    break;
+                                                match sent {
+                                                    Ok(()) => {},
+                                                    // A FULL QUEUE IS LOAD, NOT
+                                                    // A DEAD SESSION, and `send_to`
+                                                    // answered `false` for both —
+                                                    // so a burst of traffic ended
+                                                    // the keepalive of a session
+                                                    // that was perfectly alive, and
+                                                    // the lease it holds lapsed.
+                                                    // Skip the tick and keep the
+                                                    // loop.
+                                                    Err(veil_session::tx_registry::SendToError::Full) => {},
+                                                    // Gone, or the slot belongs to
+                                                    // a successor now. Either way
+                                                    // this loop is over.
+                                                    Err(_) => break,
                                                 }
                                             }
                                         });
@@ -988,6 +1024,79 @@ pub fn spawn_outbound_peers(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A connector aborted before its first poll still releases its claim.
+    ///
+    /// The claim is taken synchronously, before the spawn; the guard that
+    /// releases it used to be CONSTRUCTED inside the spawned future, which
+    /// means it did not exist until the first poll. A future aborted before
+    /// then is dropped without ever running a line of its body, so the claim
+    /// stayed in the map with nothing behind it — and the next
+    /// `spawn_outbound_peers` saw a live claim, refreshed it, and spawned no
+    /// task: a peer with no reconnect loop and no way to get one (report27
+    /// V17).
+    #[tokio::test]
+    async fn a_connector_aborted_before_its_first_poll_releases_its_claim() {
+        let slots: ConnectorRefreshSlots = Arc::new(Mutex::new(Default::default()));
+        let node_id = [0xA7u8; 32];
+        let refresh_rx = claim_or_refresh_connector(&slots, node_id).expect("a fresh claim");
+
+        // Exactly what `spawn_outbound_peers` does: build the guard, then move
+        // it into the future.
+        let guard = SlotGuard {
+            slots: Arc::clone(&slots),
+            node_id,
+            claimed: refresh_rx.clone(),
+        };
+        let handle = tokio::spawn(async move {
+            let _slot_guard = guard;
+            // Never completes; the abort is what ends this.
+            std::future::pending::<()>().await;
+        });
+        // Aborted without ever yielding to the runtime, so the task is
+        // dropped before it is polled.
+        handle.abort();
+        let _ = handle.await;
+
+        assert!(
+            claim_or_refresh_connector(&slots, node_id).is_some(),
+            "the claim survived a task that never ran, so the next spawn \
+             refreshes a connector that does not exist and the peer is left \
+             with no reconnect loop"
+        );
+    }
+
+    /// The guard is built BEFORE the spawn, and that is the whole fix.
+    ///
+    /// The behaviour above holds for any guard in the future's captured state;
+    /// what it cannot see is the construction moving back inside the `async
+    /// move` block, which is where it was (report27 V17). Source-level, and
+    /// scoped to the one function.
+    #[test]
+    fn the_slot_guard_is_owned_before_the_task_is_spawned() {
+        let src = include_str!("outbound_connector.rs");
+        let at = src
+            .find("pub fn spawn_outbound_peers")
+            .expect("spawn_outbound_peers moved — this guard watches nothing");
+        let body = &src[at..];
+        let end = body
+            .find("\n#[cfg(test)]")
+            .expect("could not bound the spawn function");
+        let body = &body[..end];
+
+        let built = body
+            .find("let slot_guard = SlotGuard {")
+            .expect("the slot guard is not built in this function at all");
+        let spawned = body
+            .find("tokio::spawn(async move {")
+            .expect("the connector task is not spawned here any more");
+        assert!(
+            built < spawned,
+            "the guard is constructed at {built}, inside the future spawned \
+             at {spawned} — it will not exist until the first poll, and a \
+             future aborted before then leaves the claim behind"
+        );
+    }
 
     /// A retired connector must not take its replacement's claim with it.
     ///

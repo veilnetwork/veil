@@ -1224,6 +1224,43 @@ fn dht_publish_replicated_via(
     sent
 }
 
+/// The peer rows a `[[pinned_relays]]` list becomes.
+///
+/// A free function so the rows can be inspected without standing up a runtime:
+/// what they carry decides whether the pin's promised connection is ever
+/// dialled, and that was wrong for something close to half of all clients
+/// without anything failing (report27 V18).
+pub(crate) fn pinned_relay_entries(pinned: &[veil_cfg::PinnedRelay]) -> Vec<PeerConfigEntry> {
+    pinned
+        .iter()
+        .enumerate()
+        .filter_map(|(i, relay)| {
+            let node_id = veil_cfg::NodeId::from_public_key(relay.algo, &relay.public_key).ok()?;
+            // Synthetic peer_id in the pinned-relay window (cycle-7 M3:
+            // disjoint from PEX / gateway-failover, which used to share
+            // 0xD000_0000). See `types::synthetic_peer_id`.
+            let peer_id = veil_cfg::PeerId::new(
+                crate::types::synthetic_peer_id::PINNED_RELAY_BASE.wrapping_add(i as u32),
+            );
+            Some(PeerConfigEntry {
+                peer_id,
+                node_id,
+                public_key: relay.public_key.clone(),
+                nonce: relay.nonce.clone(),
+                transport: relay.transport.clone(),
+                algo: relay.algo,
+                tls_cert: relay.tls_cert.clone(),
+                tls_key: None,
+                tls_ca_cert: relay.tls_ca_cert.clone(),
+                bootstrap_only: false,
+                // Not `Configured`: this pin is one-sided, and the dial
+                // direction turns on exactly that (report27 V18).
+                source: crate::types::PeerSource::PinnedRelay,
+            })
+        })
+        .collect()
+}
+
 impl NodeRuntime {
     /// The address this node RECEIVES under: mailbox drops, rendezvous ads,
     /// the cookie that ties the two together.
@@ -1354,34 +1391,7 @@ impl NodeRuntime {
         let Some(shutdown_tx) = &self.shutdown_tx else {
             return;
         };
-        let entries: Vec<PeerConfigEntry> = config
-            .pinned_relays
-            .iter()
-            .enumerate()
-            .filter_map(|(i, relay)| {
-                let node_id =
-                    veil_cfg::NodeId::from_public_key(relay.algo, &relay.public_key).ok()?;
-                // Synthetic peer_id in the pinned-relay window (cycle-7 M3:
-                // disjoint from PEX / gateway-failover, which used to share
-                // 0xD000_0000). See `types::synthetic_peer_id`.
-                let peer_id = veil_cfg::PeerId::new(
-                    crate::types::synthetic_peer_id::PINNED_RELAY_BASE.wrapping_add(i as u32),
-                );
-                Some(PeerConfigEntry {
-                    peer_id,
-                    node_id,
-                    public_key: relay.public_key.clone(),
-                    nonce: relay.nonce.clone(),
-                    transport: relay.transport.clone(),
-                    algo: relay.algo,
-                    tls_cert: relay.tls_cert.clone(),
-                    tls_key: None,
-                    tls_ca_cert: relay.tls_ca_cert.clone(),
-                    bootstrap_only: false,
-                    source: crate::types::PeerSource::Configured,
-                })
-            })
-            .collect();
+        let entries = pinned_relay_entries(&config.pinned_relays);
         // cycle-7 M2: register pinned relays in `state.peers` BEFORE spawning
         // their connectors — every other `spawn_outbound_peers` caller does
         // this. The connector itself dials from the captured `PeerConfigEntry`,

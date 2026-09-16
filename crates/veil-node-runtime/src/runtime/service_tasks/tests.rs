@@ -567,6 +567,60 @@ fn the_two_halves_of_the_direction_rule_agree_about_a_rendezvous_peer() {
     );
 }
 
+/// A pinned relay is pinned by ONE side, so the tiebreak has nothing to cancel.
+///
+/// `[[pinned_relays]]` promises a connection "maintained unconditionally".
+/// The rows it became were `PeerSource::Configured` with `bootstrap_only`
+/// false, which is the operator's own mesh — both ends list each other, both
+/// dial, and `ours < theirs` cancels the second dial. A pinned relay holds no
+/// row for the client and has no reason to dial it, so for every client whose
+/// node id sorts after the relay's the rule resolved to "wait for an inbound
+/// that cannot come" and the promised connection was never made. The same
+/// shape as the rendezvous seed a client lost, reached by a different route
+/// (report27 V18).
+#[test]
+fn a_pinned_relay_is_dialled_whichever_way_the_ids_sort() {
+    use crate::PeerSource;
+    use crate::runtime::peer_handshake::{
+        outbound_ignores_directional, outbound_row_bypasses_directional,
+    };
+    use crate::runtime::pinned_relay_entries;
+
+    let relay = veil_cfg::PinnedRelay {
+        transport: "obfs4-tcp://198.51.100.9:5556".to_owned(),
+        public_key: "fyU1fAlyHVNMat6NZBJ+KBU/aeJhCP+OBsomlgJ1Cjo=".to_owned(),
+        nonce: "AOCZRA==".to_owned(),
+        algo: veil_cfg::SignatureAlgorithm::Ed25519,
+        priority: 128,
+        tls_cert: None,
+        tls_ca_cert: None,
+    };
+    let rows = pinned_relay_entries(std::slice::from_ref(&relay));
+    let row = rows.first().expect("one pinned relay becomes one row");
+
+    assert_eq!(
+        row.source,
+        PeerSource::PinnedRelay,
+        "the row says `{}`, which is the operator's MUTUAL mesh — the \
+         tiebreak then waits for a dial the relay has no reason to make",
+        row.source
+    );
+    assert!(
+        !row.bootstrap_only,
+        "a pin is not one FIND_NODE and close; exempting it that way would \
+         change what the row means"
+    );
+    // The pair, so neither half can drift from the other.
+    assert!(
+        outbound_ignores_directional(row.source),
+        "the reconnect loop applies the tiebreak to a one-sided pin"
+    );
+    assert!(
+        outbound_row_bypasses_directional(row),
+        "the row's own answer disagrees with its source's"
+    );
+}
+
 #[test]
 fn a_refused_duplicate_is_an_answer_and_keeps_its_row() {
     // The producer and the reader of this refusal live in different files,
