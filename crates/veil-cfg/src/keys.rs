@@ -19,6 +19,8 @@ pub enum ConfigKey {
     GlobalBootstrap,
     GlobalMeetingPoints,
     GlobalMeetingPolicy,
+    GlobalAnnounceSchedule,
+    GlobalRememberedPeers,
     GlobalMeetingMinPeers,
     IpcEnabled,
     IpcSocketUri,
@@ -55,6 +57,8 @@ impl ConfigKey {
             "global.meeting_points" => Ok(Self::GlobalMeetingPoints),
             "global.meeting_policy" => Ok(Self::GlobalMeetingPolicy),
             "global.meeting_min_peers" => Ok(Self::GlobalMeetingMinPeers),
+            "global.announce_schedule" => Ok(Self::GlobalAnnounceSchedule),
+            "global.remembered_peers" => Ok(Self::GlobalRememberedPeers),
             "ipc.enabled" => Ok(Self::IpcEnabled),
             "ipc.socket_uri" => Ok(Self::IpcSocketUri),
             "ipc.app_socket_dir" => Ok(Self::IpcAppSocketDir),
@@ -92,6 +96,8 @@ impl ConfigKey {
             Self::GlobalMeetingPoints => "global.meeting_points",
             Self::GlobalMeetingPolicy => "global.meeting_policy",
             Self::GlobalMeetingMinPeers => "global.meeting_min_peers",
+            Self::GlobalAnnounceSchedule => "global.announce_schedule",
+            Self::GlobalRememberedPeers => "global.remembered_peers",
             Self::IpcEnabled => "ipc.enabled",
             Self::IpcSocketUri => "ipc.socket_uri",
             Self::IpcAppSocketDir => "ipc.app_socket_dir",
@@ -117,7 +123,7 @@ mod every_key_is_reachable {
 
     /// How many keys there are. Bump it when you add one, and give the new
     /// variant the next ordinal below.
-    const KEY_COUNT: usize = 28;
+    const KEY_COUNT: usize = 30;
 
     /// A distinct number per variant.
     ///
@@ -156,6 +162,11 @@ mod every_key_is_reachable {
             ConfigKey::NatUdpReflectors => 25,
             ConfigKey::NatUdpReflectorBind => 26,
             ConfigKey::TransportTlsClientConnectTimeoutMs => 27,
+            // Appended rather than slotted in beside their neighbours: the
+            // numbers are identity, not order, and renumbering twenty-eight
+            // keys to make two look tidy is a diff nobody can review.
+            ConfigKey::GlobalAnnounceSchedule => 28,
+            ConfigKey::GlobalRememberedPeers => 29,
         }
     }
 
@@ -195,6 +206,8 @@ mod every_key_is_reachable {
             ConfigKey::NatUdpReflectors,
             ConfigKey::NatUdpReflectorBind,
             ConfigKey::TransportTlsClientConnectTimeoutMs,
+            ConfigKey::GlobalAnnounceSchedule,
+            ConfigKey::GlobalRememberedPeers,
         ];
         // The list is complete, or the loop below proves nothing about the key
         // somebody forgot to add to it.

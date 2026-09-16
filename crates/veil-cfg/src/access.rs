@@ -26,6 +26,10 @@ pub fn get(config: &Config, key: &str) -> Result<String> {
         ConfigKey::GlobalMeetingPoints => Ok(config.global.meeting_points.to_string()),
         ConfigKey::GlobalMeetingPolicy => Ok(config.global.meeting_policy.to_string()),
         ConfigKey::GlobalMeetingMinPeers => Ok(config.global.meeting_min_peers.to_string()),
+        ConfigKey::GlobalAnnounceSchedule => Ok(config.global.announce_schedule.to_string()),
+        // Comma-separated, which is how every other list this layer reads and
+        // writes is spelled on the command line.
+        ConfigKey::GlobalRememberedPeers => Ok(config.global.remembered_peers.join(",")),
         ConfigKey::IpcEnabled => Ok(config.ipc.enabled.to_string()),
         ConfigKey::IpcSocketUri => Ok(option_to_string(config.ipc.socket_uri.as_deref())),
         ConfigKey::IpcAppSocketDir => Ok(option_to_string(
@@ -183,6 +187,29 @@ pub fn set(config: &mut Config, key: &str, value: &str) -> Result<()> {
                         value: value.to_owned(),
                         reason: "expected a whole number of peers".to_owned(),
                     })?;
+            Ok(())
+        }
+        ConfigKey::GlobalAnnounceSchedule => {
+            config.global.announce_schedule =
+                value
+                    .parse()
+                    .map_err(|reason: String| ConfigError::InvalidValue {
+                        key: key.as_str().to_owned(),
+                        value: value.to_owned(),
+                        reason,
+                    })?;
+            Ok(())
+        }
+        ConfigKey::GlobalRememberedPeers => {
+            // Empty clears the list rather than storing one empty address:
+            // `config set global.remembered_peers ""` is how an operator says
+            // "forget them", and an entry nobody can dial is worse than none.
+            config.global.remembered_peers = value
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned)
+                .collect();
             Ok(())
         }
         ConfigKey::IpcEnabled => {
