@@ -172,6 +172,22 @@ pub enum PeerSource {
     /// never connects has to be evicted with its row, its contact and its
     /// connector task, which only a source of its own can identify.
     Lan,
+    /// A relay this node PINS, from `[[pinned_relays]]`.
+    ///
+    /// Its own source rather than `Configured`, which it borrowed, because the
+    /// two differ in the one way the dial direction depends on. A configured
+    /// peer is the operator's own mesh: both ends list each other, both dial,
+    /// and the `ours < theirs` tiebreak exists to cancel the second dial. A
+    /// pinned relay is listed by the CLIENT alone. The relay holds no row for
+    /// it, has no reason to dial it, and the tiebreak therefore resolves to
+    /// "wait for an inbound that cannot come" whenever the client's node id
+    /// sorts after the relay's — so the persistent connection the pin promises
+    /// was simply never made, for something close to half of all clients
+    /// (report27 V18).
+    ///
+    /// Not `bootstrap_only`, which would also have exempted it: that flag says
+    /// "one FIND_NODE and close", which is the opposite of what a pin is for.
+    PinnedRelay,
 }
 
 impl PeerSource {
@@ -183,6 +199,7 @@ impl PeerSource {
         Self::Autodiscovered,
         Self::Rendezvous,
         Self::Lan,
+        Self::PinnedRelay,
     ];
 }
 
@@ -195,6 +212,7 @@ impl std::fmt::Display for PeerSource {
             Self::Autodiscovered => f.write_str("autodiscovered"),
             Self::Rendezvous => f.write_str("rendezvous"),
             Self::Lan => f.write_str("lan"),
+            Self::PinnedRelay => f.write_str("pinned_relay"),
         }
     }
 }

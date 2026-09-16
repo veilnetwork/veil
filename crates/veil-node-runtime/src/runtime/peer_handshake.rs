@@ -1525,6 +1525,14 @@ pub fn outbound_ignores_directional(source: PeerSource) -> bool {
         // The operator's own mesh — the mutual-dial case the rule was
         // written for, and the dedup storm it was written against.
         PeerSource::Configured | PeerSource::Bootstrap => false,
+        // Pinned by the CLIENT, and by the client alone. The relay holds no
+        // row for it and has no reason to dial back, so the tiebreak has no
+        // second dial to cancel and resolves to "wait for an inbound that
+        // cannot come" — the same shape as `Rendezvous`, reached by a
+        // different route, and the reason the pin's promised connection was
+        // never made for a client whose id sorts after the relay's
+        // (report27 V18).
+        PeerSource::PinnedRelay => true,
     }
 }
 
@@ -1584,6 +1592,11 @@ pub fn inbound_may_replace_live_session(matched_source: Option<PeerSource>) -> b
         Some(PeerSource::Configured) | Some(PeerSource::Bootstrap) => false,
         // Scheduled, not a reconnect. See above.
         Some(PeerSource::Rendezvous) => false,
+        // A pin this node holds and the far side does not. An inbound
+        // claiming to be it is not a reconnect of anything we dialled, and
+        // this node is the only one with a reason to keep the link — so it is
+        // not the far side's to end.
+        Some(PeerSource::PinnedRelay) => false,
         // No row at all: a stranger has not earned the right to end a session
         // this node is holding.
         None => false,
@@ -1632,7 +1645,10 @@ pub fn identity_mismatch_drops_record(source: PeerSource) -> bool {
     // to every source added later, silently — and this one deletes rows.
     match source {
         // The operator's own lines. Refuse, shout, leave the file alone.
-        PeerSource::Configured | PeerSource::Bootstrap => false,
+        // A pinned relay is one of them: `[[pinned_relays]]` is a file the
+        // operator wrote, and a stranger answering at that address is the
+        // same security signal, not a fossil to sweep.
+        PeerSource::Configured | PeerSource::Bootstrap | PeerSource::PinnedRelay => false,
         // Ours: learned at runtime, and a fossil dialled forever otherwise.
         PeerSource::Exchanged
         | PeerSource::Autodiscovered
@@ -1898,7 +1914,11 @@ mod outbound_direction_tests {
     #[test]
     fn a_mutually_dialling_row_still_obeys_the_tiebreak() {
         for source in PeerSource::ALL {
-            if matches!(source, PeerSource::Rendezvous) {
+            // The two ONE-SIDED sources, named rather than filtered through
+            // the predicate under test: a walk that asks the classifier which
+            // rows to skip agrees with itself whatever it answers. See
+            // `exactly_these_sources_are_one_sided` for what pins the pair.
+            if matches!(source, PeerSource::Rendezvous | PeerSource::PinnedRelay) {
                 continue;
             }
             assert!(
@@ -1930,6 +1950,29 @@ mod outbound_direction_tests {
                 "{source:?}: a bootstrap-only row has never obeyed the tiebreak"
             );
         }
+    }
+
+    /// WHICH sources are one-sided, by name.
+    ///
+    /// The walks above skip the exempt ones, so on their own they say nothing
+    /// about which those are — and the set is the whole of the rule. A source
+    /// added to it is a row that stops obeying the tiebreak; a source removed
+    /// is a peer that waits for a dial nobody will make, which is how a client
+    /// lost a seed (report27 V18, and the rendezvous case before it).
+    #[test]
+    fn exactly_these_sources_are_one_sided() {
+        let exempt: Vec<PeerSource> = PeerSource::ALL
+            .iter()
+            .copied()
+            .filter(|s| outbound_ignores_directional(*s))
+            .collect();
+        assert_eq!(
+            exempt,
+            vec![PeerSource::Rendezvous, PeerSource::PinnedRelay],
+            "the set of sources that ignore the dial tiebreak changed; each \
+             one is a peer that either dials when it should wait or waits for \
+             a dial that cannot come",
+        );
     }
 
     /// The walk above is only worth running if the sources disagree.
