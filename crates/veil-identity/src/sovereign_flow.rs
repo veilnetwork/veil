@@ -853,6 +853,17 @@ pub fn restore_identity(
         return Err(RestoreIdentityError::FreshnessWindowTooLong { secs: window });
     }
 
+    // "Write master.enc from a master that has no seed" is inadmissible, and
+    // it is knowable from the ARGUMENTS — no file has to be touched to find
+    // out. It used to be discovered at the last step, after the document, the
+    // device key and the Falcon material had all been written: the caller got
+    // an error and the directory got a half-restored identity, which is the
+    // one state a restore must never leave behind (report27 V13). Every check
+    // that can be made before the directory is touched is made here.
+    if opts.save_encrypted_with_password.is_some() && opts.master.seed().is_none() {
+        return Err(RestoreIdentityError::NoSeedToSave);
+    }
+
     use veil_types::SignatureAlgorithm;
 
     std::fs::create_dir_all(&opts.veil_dir)?;
@@ -1134,6 +1145,8 @@ pub fn restore_identity(
         // none. Refused rather than written from something else: a master.enc
         // that does not reproduce this identity is worse than no master.enc,
         // because it is the file its owner would reach for.
+        // Already refused at the top, before anything was written — this is
+        // the binding, and a second guard on the same fact.
         let Some(seed) = opts.master.seed() else {
             return Err(RestoreIdentityError::NoSeedToSave);
         };
@@ -1874,6 +1887,18 @@ pub enum DelegateDeviceError {
     NotPresent { device_id: String },
     #[error("renewal must move the window forward: current {current}, proposed {proposed}")]
     NotForward { current: u64, proposed: u64 },
+    /// The key that would sign the document is not one the document names.
+    ///
+    /// `sig_key_idx` has to point at the key that produced `document_sig`, and
+    /// finding that index means finding the SIGNER in the key set. A device
+    /// whose own subkey is missing cannot produce a document any verifier will
+    /// accept, and writing one anyway is how an unverifiable document reaches
+    /// the network (report27 V11).
+    #[error(
+        "the signing key is not named by this document — it cannot produce a \
+         document any verifier will accept"
+    )]
+    SignerNotInDocument,
     #[error("internal: {0}")]
     Internal(String),
     #[error(
@@ -2152,10 +2177,20 @@ pub fn reissue_device_delegation(
     // verifier refuses it at the active-key rung. The key just renewed is such
     // a key when it is this device's; say so rather than leave sig_key_idx
     // pointing at a delegation that may have lapsed.
-    let signed_by_renewed = local_sk.verifying_key().as_bytes()[..] == device_pubkey[..];
-    if signed_by_renewed {
-        doc.sig_key_idx = idx as u16;
-    }
+    //
+    // WHO SIGNS AND WHICH INDEX SAYS SO ARE ONE QUESTION, and one flag used to
+    // answer both. `sig_key_idx` moved only when the key being renewed was
+    // this device's own — so renewing ANOTHER device left the index where it
+    // was while the document was signed by the local key. On a paired target
+    // "where it was" is the SOURCE's index: the document went out signed by B
+    // and claiming A, and every verifier answered DocumentSigInvalid
+    // (report27 V11). The index names the signer, always.
+    let signer_pk = local_sk.verifying_key().as_bytes().to_vec();
+    let Some(signer_idx) = doc.identity_keys.iter().position(|k| k.pubkey == signer_pk) else {
+        return Err(DelegateDeviceError::SignerNotInDocument);
+    };
+    doc.sig_key_idx = signer_idx as u16;
+    let signed_by_renewed = signer_idx == idx;
     let mut doc_msg = Vec::with_capacity(DOC_SIG_CONTEXT.len() + 512);
     doc_msg.extend_from_slice(DOC_SIG_CONTEXT);
     doc_msg.extend_from_slice(&doc.canonical_signing_bytes());
@@ -2310,10 +2345,15 @@ fn delegate_into_document(
 
     // Whose secret re-signs the document. The local subkey normally; the newly
     // delegated one when it IS the local subkey (self-delegation).
-    let signed_by_new_key = local_sk.verifying_key().as_bytes()[..] == device_pubkey[..];
-    if signed_by_new_key {
-        doc.sig_key_idx = new_key_idx;
-    }
+    // The index names the signer, always — see the renewal path above, where
+    // one flag answered both questions and a delegation of ANOTHER device
+    // left `sig_key_idx` pointing at whoever signed last (report27 V11).
+    let signer_pk = local_sk.verifying_key().as_bytes().to_vec();
+    let Some(signer_idx) = doc.identity_keys.iter().position(|k| k.pubkey == signer_pk) else {
+        return Err(DelegateDeviceError::SignerNotInDocument);
+    };
+    doc.sig_key_idx = signer_idx as u16;
+    let signed_by_new_key = signer_idx as u16 == new_key_idx;
 
     doc.issued_at_unix = now_unix;
     if valid_until_unix > doc.valid_until_unix {
@@ -2431,7 +2471,7 @@ fn union_identity_keys(
     Vec<IdentityKey>,
     Vec<veil_proto::identity_document::RevokedDevice>,
 )> {
-    use veil_proto::identity_document::RevokedDevice;
+    use veil_proto::identity_document::{MAX_IDENTITY_KEYS, MAX_REVOKED_DEVICE_IDS, RevokedDevice};
     // Tombstones first: a grow-only set, kept strictly ascending (the wire's
     // canonical order). The lattice is what makes the merge order-free —
     // sets only grow, keys only leave through tombstone membership, so any
@@ -2465,10 +2505,52 @@ fn union_identity_keys(
         if is_revoked(&k.device_id) {
             continue; // never resurrect a revoked key
         }
-        if !keys.iter().any(|have| have.pubkey == k.pubkey) {
-            keys.push(k.clone());
-            changed = true;
+        match keys.iter_mut().find(|have| have.pubkey == k.pubkey) {
+            None => {
+                keys.push(k.clone());
+                changed = true;
+            }
+            // SAME PUBKEY IS NOT THE SAME CERTIFICATE. A renewal re-issues the
+            // master's endorsement of a key the device keeps — same bytes, new
+            // `valid_until_unix`, new `master_sig` — and matching on the pubkey
+            // alone called that "already have it" and kept the OLD cert. The
+            // adoption then reported success while the renewal it was carrying
+            // went no further, and the family's copies expired on the schedule
+            // the renewal existed to move (report27 V10).
+            //
+            // Later WINS, and only later: the certs are both master-signed, so
+            // the one that endorses further into the future is the newer
+            // issue. Taking it unconditionally would let a stale announcement
+            // roll the endorsement BACK, which is the whole reason this
+            // function exists.
+            Some(have) if k.valid_until_unix > have.valid_until_unix => {
+                *have = k.clone();
+                changed = true;
+            }
+            Some(_) => {}
         }
+    }
+    // THE OUTPUT HAS TO BE DECODABLE. Both lists are unions, so either can
+    // come out longer than the wire format admits — two branches each within
+    // the cap can union past it, and a revocation on top of a full tombstone
+    // list is one more. `canonical_signing_bytes` and the writer had no
+    // opinion about that, so the document was signed and saved, and then the
+    // decoder that every reader uses — this device included, at its next
+    // start — refused it. A document nobody can read is worse than a merge
+    // that did not happen (report27 V12).
+    //
+    // Refused rather than truncated: dropping a live key silently retires a
+    // device, and dropping a tombstone RE-ADMITS a revoked one. Which of them
+    // to give up is the operator's decision and it needs the master.
+    if keys.len() > MAX_IDENTITY_KEYS || revoked.len() > MAX_REVOKED_DEVICE_IDS {
+        log::warn!(
+            "identity: refusing to merge a document past the wire caps — \
+             {} keys (max {MAX_IDENTITY_KEYS}), {} tombstones (max \
+             {MAX_REVOKED_DEVICE_IDS}); the merged document would not decode",
+            keys.len(),
+            revoked.len(),
+        );
+        return None;
     }
     changed.then_some((keys, revoked))
 }
@@ -3545,6 +3627,64 @@ mod tests {
         assert_eq!(reread.identity_keys.len(), 2);
     }
 
+    /// The index must name the key that SIGNED, not the one that signed last.
+    ///
+    /// A device holding a document signed by ANOTHER device — which is every
+    /// paired target, and any device that adopted a sibling's copy — signs
+    /// with its own subkey when it delegates or renews a third device. The
+    /// index moved only when the key being delegated happened to be the local
+    /// one, so in this case the document went out signed by B while
+    /// `sig_key_idx` still named A. It wrote and it published, and every
+    /// verifier answered DocumentSigInvalid (report27 V11).
+    #[test]
+    fn delegating_a_third_device_names_the_key_that_actually_signs() {
+        let seed = create_identity(test_opts(tempdir())).unwrap().master_seed;
+        let a = tempdir();
+        let b = tempdir();
+        let c = tempdir();
+        provision(a.clone(), seed.clone());
+        provision(b.clone(), seed.clone());
+        provision(c.clone(), seed.clone());
+
+        // A admits B; the document A writes is signed by A at index 0.
+        let out = delegate_device(delegate_opts(a.clone(), seed.clone(), device_pubkey(&b)))
+            .expect("delegate B");
+        assert_eq!(out.document.sig_key_idx, 0, "premise: A signed it");
+        // B takes that document — the paired-target shape: a document signed
+        // by the source, and a local signer of its own at another index.
+        std::fs::copy(
+            a.join(IDENTITY_DOCUMENT_FILE),
+            b.join(IDENTITY_DOCUMENT_FILE),
+        )
+        .unwrap();
+        let b_idx = out
+            .document
+            .identity_keys
+            .iter()
+            .position(|k| k.pubkey == device_pubkey(&b))
+            .expect("B is in the document") as u16;
+        assert_ne!(b_idx, 0, "premise: B is not the key the document names");
+
+        // Now B admits C. B signs, because B's is the only device secret here.
+        let out = delegate_device(delegate_opts(b.clone(), seed.clone(), device_pubkey(&c)))
+            .expect("delegate C");
+
+        assert!(
+            !out.signed_by_new_key,
+            "premise: the key being delegated is C's, not the signer's"
+        );
+        assert_eq!(
+            out.document.sig_key_idx, b_idx,
+            "the document is signed by B and names identity_keys[{}] — a \
+             verifier checks B's signature against that key and refuses",
+            out.document.sig_key_idx
+        );
+        verify_identity_document(&out.document, DELEGATE_NOW).expect(
+            "a document a device wrote for its own family must verify — this \
+             one went out unverifiable",
+        );
+    }
+
     // THE CASE AN APP NEEDS. A device restored from the phrase holds the master
     // and its own fresh key, receives the other device's document, and must add
     // itself — it cannot sign with the previous signer's subkey, because that
@@ -4062,6 +4202,120 @@ mod tests {
     }
 
     // ── revoke_identity_device ─────────────────────────────────
+
+    /// Bare documents for the merge itself. The union reads key sets and
+    /// tombstones and nothing else, so signatures are not what these are
+    /// about — the ceremonies above cover those.
+    fn doc_with(keys: Vec<veil_proto::identity_document::IdentityKey>) -> IdentityDocument {
+        IdentityDocument {
+            node_id: [7u8; 32],
+            master_algo: veil_proto::identity_document::ALGO_ED25519,
+            master_pubkey: vec![1u8; 32],
+            issued_at_unix: 1_000,
+            valid_until_unix: 2_000,
+            sig_key_idx: 0,
+            identity_keys: keys,
+            revoked_devices: Vec::new(),
+            document_sig: vec![0u8; 64],
+        }
+    }
+
+    fn key_valid_until(n: u8, until: u64) -> veil_proto::identity_document::IdentityKey {
+        let pubkey = vec![n; 32];
+        veil_proto::identity_document::IdentityKey {
+            algo: veil_proto::identity_document::ALGO_ED25519,
+            device_id: veil_crypto::identity::compute_node_id(&pubkey),
+            pubkey,
+            valid_from_unix: 0,
+            valid_until_unix: until,
+            // The cert differs with the renewal, which is the point: same key,
+            // new endorsement.
+            master_sig: vec![until as u8; 64],
+        }
+    }
+
+    /// A renewal of a key the device keeps must reach the merged document.
+    ///
+    /// A renewal re-issues the master's endorsement over the SAME pubkey with
+    /// a later `valid_until_unix` and a fresh `master_sig`. The union matched
+    /// on the pubkey alone, called it "already have it", and kept the old
+    /// cert — so adoption reported success while the renewal went no further
+    /// and every copy expired on the schedule the renewal existed to move
+    /// (report27 V10).
+    #[test]
+    fn a_renewal_of_a_key_we_already_hold_replaces_its_certificate() {
+        let local = doc_with(vec![key_valid_until(0xAA, 1_000)]);
+        let incoming = doc_with(vec![key_valid_until(0xAA, 9_000)]);
+
+        let (keys, _revoked) = union_identity_keys(&local, &incoming)
+            .expect("a renewal is a change — the merge must report one");
+        assert_eq!(keys.len(), 1, "the renewal added a second copy of the key");
+        assert_eq!(
+            keys[0].valid_until_unix, 9_000,
+            "the merged document kept the OLD endorsement, so the renewal \
+             stops here and the family expires on the old schedule"
+        );
+        assert_eq!(
+            keys[0].master_sig,
+            vec![9_000u64 as u8; 64],
+            "the validity moved but the certificate proving it did not",
+        );
+
+        // And not the other way: a stale announcement must not roll the
+        // endorsement back, which is the whole reason this merge exists.
+        assert!(
+            union_identity_keys(&incoming, &local).is_none(),
+            "an older certificate was taken as a change and would replace the \
+             newer one"
+        );
+    }
+
+    /// A merge that cannot be decoded must not be written.
+    ///
+    /// Both lists are unions, so either can come out longer than the wire
+    /// format admits: two branches each inside the cap union past it. The
+    /// writer had no opinion, so the document was signed and saved — and the
+    /// decoder every reader uses, this device included at its next start,
+    /// refused it (report27 V12).
+    #[test]
+    fn a_merge_past_the_wire_caps_is_refused_rather_than_written() {
+        use veil_proto::identity_document::MAX_IDENTITY_KEYS;
+
+        let local = doc_with(
+            (0..MAX_IDENTITY_KEYS as u8)
+                .map(|n| key_valid_until(n, 1_000))
+                .collect(),
+        );
+        let incoming = doc_with(vec![key_valid_until(0xF0, 1_000)]);
+        assert_eq!(local.identity_keys.len(), MAX_IDENTITY_KEYS);
+
+        assert!(
+            union_identity_keys(&local, &incoming).is_none(),
+            "the merge produced {} keys, past the cap of {MAX_IDENTITY_KEYS} — \
+             it would be signed, saved, and then refused by every decoder \
+             that reads it back",
+            MAX_IDENTITY_KEYS + 1
+        );
+
+        // Vacuity: one below the cap still merges, or the refusal above is
+        // only saying that the merge never happens.
+        let local = doc_with(
+            (0..MAX_IDENTITY_KEYS as u8 - 1)
+                .map(|n| key_valid_until(n, 1_000))
+                .collect(),
+        );
+        let (keys, _) =
+            union_identity_keys(&local, &incoming).expect("a merge that fits must still happen");
+        assert_eq!(keys.len(), MAX_IDENTITY_KEYS);
+        // And the result really does decode, which is the property the cap
+        // stands in for.
+        let mut merged = local;
+        merged.identity_keys = keys;
+        assert!(
+            IdentityDocument::decode(&merged.encode()).is_ok(),
+            "the merged document does not decode",
+        );
+    }
 
     #[test]
     fn revoking_a_device_tombstones_it_and_the_union_cannot_resurrect_it() {
@@ -5768,6 +6022,56 @@ mod tests {
         assert!(
             matches!(err, RestoreIdentityError::MissingFalconMaster),
             "expected MissingFalconMaster, got {err:?}"
+        );
+    }
+
+    /// A restore that cannot finish must not have started.
+    ///
+    /// "Write master.enc from a master that carries no seed" is inadmissible
+    /// and is knowable from the ARGUMENTS — no file has to be touched to find
+    /// out. It was discovered at the last step, after the document, the device
+    /// key and the Falcon material had been written, so the caller got an
+    /// error and the directory got a half-restored identity: exactly the state
+    /// a restore exists to avoid, and one whose files look like a working
+    /// identity to everything that reads them (report27 V13).
+    #[test]
+    fn a_restore_refused_for_its_arguments_writes_nothing() {
+        use veil_types::SignatureAlgorithm;
+
+        let dir = tempdir();
+        let now = 1_700_800_000u64;
+        // A credential-carried master: the key, never the seed behind it.
+        let err = restore_identity(RestoreIdentityOptions {
+            veil_dir: dir.clone(),
+            master: MasterRecovery::Ed25519SecretKey(Zeroizing::new([7u8; 32])),
+            save_encrypted_with_password: Some(Zeroizing::new(b"a password".to_vec())),
+            argon2_params_override: None,
+            instance_label: "nope".into(),
+            pow_difficulty: TEST_POW_DIFFICULTY,
+            now_unix: now,
+            valid_until_unix: now + 7 * 86_400,
+            algo: SignatureAlgorithm::Ed25519,
+            master_falcon_keypair_bytes: None,
+            device_sk_seed: None,
+        })
+        .expect_err("asking for master.enc without a seed must be refused");
+        assert!(
+            matches!(err, RestoreIdentityError::NoSeedToSave),
+            "expected NoSeedToSave, got {err:?}"
+        );
+
+        let left: Vec<String> = std::fs::read_dir(&dir)
+            .map(|rd| {
+                rd.filter_map(|e| e.ok())
+                    .map(|e| e.file_name().to_string_lossy().into_owned())
+                    .collect()
+            })
+            .unwrap_or_default();
+        assert!(
+            left.is_empty(),
+            "the refused restore left {left:?} behind — an identity document \
+             and a device key that nothing will finish, and that every reader \
+             takes for a working identity"
         );
     }
 
