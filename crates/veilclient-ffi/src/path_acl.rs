@@ -38,6 +38,60 @@ use std::ffi::c_int;
 
 use crate::{VEIL_ERR, VEIL_OK, write_err};
 
+/// What this probe may conclude from an ACE of a given type.
+///
+/// The probe reads a plain mask at a fixed offset, which only two ACE types
+/// have. Everything else used to be SKIPPED — and a skipped entry disappears
+/// before the Dart side ever sees the list, so an ACL that grants an ordinary
+/// user write through a CONDITIONAL allow (type 9, which Windows resolves at
+/// access time) arrived as an ACL that grants nobody anything, and the launch
+/// guard passed a path it exists to refuse (report27 V14).
+///
+/// Skipping is only safe for an entry that cannot GRANT. The Dart side already
+/// ignores deny entries on purpose — ignoring a deny can only refuse more
+/// often — so a deny this side cannot parse changes nothing. An allow it
+/// cannot parse changes everything, and an ACL holding one is not a set of
+/// facts; it is an unknown, and the answer is an error.
+#[derive(Debug, PartialEq, Eq)]
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) enum AceReading {
+    /// `ACCESS_ALLOWED_ACE` / `ACCESS_DENIED_ACE`: header, u32 mask, inline
+    /// SID. The only layout this probe reads.
+    Plain { allow: bool },
+    /// Cannot grant anything: an audit, an alarm, or a deny in a shape this
+    /// probe does not parse. Dropping it cannot make the answer more
+    /// permissive.
+    CannotGrant,
+    /// Might grant, in a shape this probe cannot read. The whole answer is
+    /// incomplete.
+    Unknown,
+}
+
+/// Classify one ACE type. Portable on purpose: this is the decision, and it is
+/// testable on any host — only the pointer walk around it is Windows-only.
+// Compiled everywhere, called only on Windows. The point of splitting the
+// DECISION out of the syscall is that it can be tested on any host — the
+// project has no Windows CI runner that would otherwise exercise it.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) fn ace_reading(ace_type: u8) -> AceReading {
+    match ace_type {
+        // ACCESS_ALLOWED_ACE_TYPE / ACCESS_DENIED_ACE_TYPE.
+        0 => AceReading::Plain { allow: true },
+        1 => AceReading::Plain { allow: false },
+        // SYSTEM_AUDIT / SYSTEM_ALARM and their object forms: they record, they
+        // do not grant.
+        2 | 3 | 7 | 8 => AceReading::CannotGrant,
+        // ACCESS_DENIED_OBJECT / _CALLBACK / _CALLBACK_OBJECT, SYSTEM_AUDIT_
+        // CALLBACK and friends: denials and audits in layouts this probe does
+        // not parse. Ignored exactly as a parsed deny would be.
+        6 | 10 | 13 | 15 | 16 => AceReading::CannotGrant,
+        // ACCESS_ALLOWED_OBJECT (5), ACCESS_ALLOWED_CALLBACK (9),
+        // ACCESS_ALLOWED_CALLBACK_OBJECT (11) — and anything this list does
+        // not name. Each of these can grant.
+        _ => AceReading::Unknown,
+    }
+}
+
 /// JSON-escape into a string that is only ever consumed by a JSON parser.
 ///
 /// Windows paths are full of backslashes and an error message can hold
@@ -91,10 +145,6 @@ mod imp {
     /// `SE_FILE_OBJECT`. Declared here rather than pulled in with another
     /// `windows-sys` feature for a single enum value.
     const SE_FILE_OBJECT: i32 = 1;
-
-    /// `ACCESS_ALLOWED_ACE_TYPE`. Lives under `Win32_System_SystemServices` in
-    /// `windows-sys`, which is a whole feature for one byte.
-    const ACCESS_ALLOWED_ACE_TYPE: u8 = 0;
 
     /// An owned handle that closes itself, so no early return leaks it.
     struct Handle(windows_sys::Win32::Foundation::HANDLE);
@@ -168,7 +218,7 @@ mod imp {
     ///
     /// # Safety
     /// `acl` must point at a valid ACL owned by a live descriptor.
-    unsafe fn rules_json(acl: *mut ACL) -> String {
+    unsafe fn rules_json(acl: *mut ACL) -> Result<String, String> {
         let mut out = String::from("[");
         if acl.is_null() {
             // A NULL DACL grants everyone everything. Saying "no rules" here
@@ -177,7 +227,7 @@ mod imp {
                 "{\"sid\":\"S-1-1-0\",\"rights\":268435456,\"allow\":true,\"inheritOnly\":false}",
             );
             out.push(']');
-            return out;
+            return Ok(out);
         }
         // SAFETY: valid ACL.
         let count = unsafe { (*acl).AceCount } as u32;
@@ -186,18 +236,27 @@ mod imp {
             let mut ace: *mut core::ffi::c_void = std::ptr::null_mut();
             // SAFETY: index < AceCount.
             if unsafe { GetAce(acl, index, &mut ace) } == 0 || ace.is_null() {
-                continue;
+                // An entry we could not read at all. It may be the one that
+                // grants; the list without it is not the ACL (report27 V14).
+                return Err(format!("ACL entry {index} could not be read"));
             }
             let header = ace.cast::<ACE_HEADER>();
             // SAFETY: every ACE begins with its header.
             let (ace_type, ace_flags) = unsafe { ((*header).AceType, (*header).AceFlags) };
             // Only the two ACE kinds that carry a plain mask + SID at fixed
-            // offsets are read. An object/callback ACE has a different layout
-            // and is skipped rather than misparsed.
-            let allow = ace_type == ACCESS_ALLOWED_ACE_TYPE;
-            if !allow && ace_type != 1 {
-                continue;
-            }
+            // offsets can be read. One that cannot grant is dropped, exactly
+            // as the Dart side drops a parsed deny; one that MIGHT grant makes
+            // the whole answer an unknown. See `ace_reading`.
+            let allow = match crate::path_acl::ace_reading(ace_type) {
+                crate::path_acl::AceReading::Plain { allow } => allow,
+                crate::path_acl::AceReading::CannotGrant => continue,
+                crate::path_acl::AceReading::Unknown => {
+                    return Err(format!(
+                        "ACL entry {index} is of type {ace_type}, which this \
+                         probe cannot read and which can grant access"
+                    ));
+                }
+            };
             // ACCESS_ALLOWED_ACE / ACCESS_DENIED_ACE: header, then a u32 mask,
             // then the SID inline.
             // SAFETY: layout fixed by the ACE type checked above.
@@ -205,7 +264,9 @@ mod imp {
             let sid = unsafe { ace.cast::<u8>().add(8).cast::<core::ffi::c_void>() };
             // SAFETY: the SID lives inside the ACE, which lives in the ACL.
             let Some(sid_text) = (unsafe { sid_string(sid) }) else {
-                continue;
+                // An entry we cannot attribute. If it is an allow, dropping it
+                // hides a grant.
+                return Err(format!("ACL entry {index} has an unreadable SID"));
             };
             let inherit_only = (ace_flags & INHERIT_ONLY_ACE as u8) != 0;
             if !first {
@@ -324,7 +385,13 @@ mod imp {
             return error_json("the owner could not be read");
         };
         // SAFETY: same.
-        let rules = unsafe { rules_json(dacl) };
+        let rules = match unsafe { rules_json(dacl) } {
+            Ok(rules) => rules,
+            // Incomplete facts are not facts. The Dart side reads `error` as
+            // undetermined and refuses, which is the answer an ACL this probe
+            // cannot fully account for deserves (report27 V14).
+            Err(why) => return error_json(&why),
+        };
 
         let mut out = String::from("{\"owner\":\"");
         json_escape(&owner, &mut out);
@@ -415,6 +482,54 @@ mod tests {
         let mut out = String::new();
         json_escape("say \"hi\"\n\u{7}", &mut out);
         assert_eq!(out, "say \\\"hi\\\"\\n\\u0007");
+    }
+
+    /// An ACE this probe cannot read is only droppable if it cannot GRANT.
+    ///
+    /// Everything but types 0 and 1 used to be skipped, and a skipped entry
+    /// disappears before the Dart side sees the list: an ACL granting an
+    /// ordinary user write through a CONDITIONAL allow (type 9, resolved by
+    /// Windows at access time) arrived as an ACL granting nobody anything, and
+    /// the launch guard passed a path it exists to refuse (report27 V14).
+    ///
+    /// The classification is the decision, and it runs on any host — only the
+    /// pointer walk around it is Windows-only.
+    #[test]
+    fn an_unreadable_ace_that_could_grant_is_not_droppable() {
+        use super::{AceReading, ace_reading};
+
+        assert_eq!(ace_reading(0), AceReading::Plain { allow: true });
+        assert_eq!(ace_reading(1), AceReading::Plain { allow: false });
+
+        // The ones the report names, and their family: each can GRANT in a
+        // layout this probe does not parse.
+        for t in [5u8, 9, 11] {
+            assert_eq!(
+                ace_reading(t),
+                AceReading::Unknown,
+                "ACE type {t} can grant access and was being dropped silently"
+            );
+        }
+        // And anything not named at all.
+        for t in [4u8, 12, 14, 200, 255] {
+            assert_eq!(
+                ace_reading(t),
+                AceReading::Unknown,
+                "an unnamed ACE type must be an unknown, not a skip"
+            );
+        }
+
+        // Audits, alarms and denies this probe cannot parse: dropping one
+        // cannot make the answer more permissive, and the Dart side already
+        // drops every deny on purpose.
+        for t in [2u8, 3, 6, 7, 8, 10, 13, 15, 16] {
+            assert_eq!(
+                ace_reading(t),
+                AceReading::CannotGrant,
+                "ACE type {t} cannot grant; refusing on it would fail a normal \
+                 installation for nothing"
+            );
+        }
     }
 
     #[test]

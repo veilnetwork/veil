@@ -367,6 +367,20 @@ fn win_open_root(root: &str) -> Result<windows_sys::Win32::Foundation::HANDLE, S
     Ok(handle)
 }
 
+/// The byte length an NT `UNICODE_STRING` carries for a name of `units`
+/// UTF-16 code units, or `None` when it does not fit.
+///
+/// Portable on purpose: the arithmetic is the decision and it is testable on
+/// any host — only the syscall around it is Windows-only. It used to be
+/// `(units * 2) as u16`, which wraps silently (report27 V15).
+// Compiled everywhere, called only on Windows. The point of splitting the
+// DECISION out of the syscall is that it can be tested on any host — the
+// project has no Windows CI runner that would otherwise exercise it.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn nt_name_byte_len(units: usize) -> Option<u16> {
+    u16::try_from(units.checked_mul(2)?).ok()
+}
+
 /// One step of the walk: open `name` relative to `dir`, refusing a reparse
 /// point. `directory` picks between a directory component and the leaf.
 #[cfg(windows)]
@@ -396,7 +410,18 @@ fn win_open_at(
     const STATUS_REPARSE_POINT_ENCOUNTERED: i32 = 0xC000_050B_u32 as i32;
 
     let mut wide: Vec<u16> = std::ffi::OsStr::new(name).encode_wide().collect();
-    let bytes = (wide.len() * 2) as u16;
+    // CHECKED, not cast. A `UNICODE_STRING` carries its length in BYTES as a
+    // `u16`, so a component past 32767 UTF-16 units wrapped — and NT then
+    // resolved the PREFIX the truncated length described, which is a different
+    // name than the caller asked about. Nothing in the public API bounds this
+    // (report27 V15).
+    let Some(bytes) = nt_name_byte_len(wide.len()) else {
+        return Err(format!(
+            "path component is {} UTF-16 units, past what an NT name can \
+             carry",
+            wide.len()
+        ));
+    };
     let mut unicode = UNICODE_STRING {
         Length: bytes,
         MaximumLength: bytes,
@@ -903,6 +928,40 @@ pub unsafe extern "C" fn veil_fs_close(handle: *mut VeilFsFile) {
 
 #[cfg(all(test, unix))]
 mod tests {
+
+    /// A name too long for an NT `UNICODE_STRING` is refused, not truncated.
+    ///
+    /// The length is carried in BYTES as a `u16`, and it was computed as
+    /// `(units * 2) as u16`. Past 32767 units that wraps, and NT then resolves
+    /// the PREFIX the truncated length describes — a different name than the
+    /// caller asked about, opened without anything saying so. Nothing in the
+    /// public API bounds the component length (report27 V15).
+    ///
+    /// Testable on any host because the arithmetic is the decision; the
+    /// syscall around it is Windows-only and is not what was wrong.
+    #[test]
+    fn an_nt_name_past_the_length_field_is_refused_rather_than_wrapped() {
+        use super::nt_name_byte_len;
+
+        assert_eq!(nt_name_byte_len(0), Some(0));
+        assert_eq!(nt_name_byte_len(1), Some(2));
+        // The last one that fits, and the first that does not.
+        assert_eq!(nt_name_byte_len(32_767), Some(65_534));
+        assert_eq!(
+            nt_name_byte_len(32_768),
+            None,
+            "32768 units is 65536 bytes — it wrapped to 0, and NT resolved an \
+             empty name instead of the one asked for"
+        );
+        assert_eq!(
+            nt_name_byte_len(32_769),
+            None,
+            "and this one wrapped to 2: a one-character prefix of the \
+             component, opened as if it were the component"
+        );
+        // And the multiply itself cannot overflow into a small answer.
+        assert_eq!(nt_name_byte_len(usize::MAX), None);
+    }
     use super::*;
     use std::io::Write as _;
 
