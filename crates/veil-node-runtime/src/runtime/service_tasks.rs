@@ -2392,6 +2392,34 @@ pub fn rendezvous_destination_is_dialable(host: &str) -> bool {
     }
 }
 
+/// One spelling per endpoint, built from the PARSED address and port.
+///
+/// The admission validated the port with `parse::<u16>()` and then kept the
+/// text it had been given. `443`, `00443` and `000443` all parse to the same
+/// port and gave three different transport strings — three entries in the
+/// dedup set, three places in the shuffled order, up to three of the pass's
+/// twenty-four attempts, and three different keys wherever a known or live
+/// address is compared by string. The URI parser downstream turns all three
+/// back into the same `u16`, so the duplicates are only visible as wasted
+/// attempts and a shorter list of distinct endpoints actually reached
+/// (report27 V27).
+///
+/// IPv6 the same way, and for a bigger family of spellings: `[::1]`,
+/// `[0:0:0:0:0:0:0:1]` and `[0::1]` are one address written three ways, and
+/// `IpAddr`'s own `Display` is the canonical one.
+///
+/// `None` when the host is not an address at all — which this layer already
+/// refuses; see [`rendezvous_destination_is_dialable`].
+pub fn canonical_rendezvous_transport(scheme: &str, host: &str, port: &str) -> Option<String> {
+    let port: u16 = port.parse().ok()?;
+    let bare = host.trim_start_matches('[').trim_end_matches(']');
+    let ip: std::net::IpAddr = bare.parse().ok()?;
+    Some(match ip {
+        std::net::IpAddr::V4(v4) => format!("{scheme}://{v4}:{port}"),
+        std::net::IpAddr::V6(v6) => format!("{scheme}://[{v6}]:{port}"),
+    })
+}
+
 /// Whether this node is the one that should place the call.
 ///
 /// For a pair, exactly one side dials: `we_keep_outbound = ours < theirs`, and

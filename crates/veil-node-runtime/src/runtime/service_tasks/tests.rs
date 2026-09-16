@@ -567,6 +567,56 @@ fn the_two_halves_of_the_direction_rule_agree_about_a_rendezvous_peer() {
     );
 }
 
+/// One endpoint gets one spelling, whatever the record said.
+///
+/// The admission checked the port with `parse::<u16>()` and kept the text it
+/// was given, so `443`, `00443` and `000443` were three candidates for one
+/// socket: three entries in the dedup set, three places in the shuffled order,
+/// up to three of the pass's twenty-four attempts, and three different keys
+/// wherever a known or live address is compared as a string (report27 V27).
+#[test]
+fn equivalent_spellings_of_one_endpoint_collapse_to_one_candidate() {
+    use crate::runtime::service_tasks::canonical_rendezvous_transport;
+
+    let canonical = canonical_rendezvous_transport("obfs4-tcp", "198.51.100.7", "443")
+        .expect("a public address and a numeric port");
+    for spelling in ["443", "00443", "000443"] {
+        assert_eq!(
+            canonical_rendezvous_transport("obfs4-tcp", "198.51.100.7", spelling).as_deref(),
+            Some(canonical.as_str()),
+            "port {spelling:?} became a candidate of its own"
+        );
+    }
+
+    // IPv6, where one address has more spellings than a port does.
+    let v6 = canonical_rendezvous_transport("obfs4-tcp", "[2001:db9::1]", "5556")
+        .expect("a bracketed v6 literal");
+    for spelling in ["[2001:db9::1]", "2001:db9::1", "[2001:0db9:0:0:0:0:0:1]"] {
+        assert_eq!(
+            canonical_rendezvous_transport("obfs4-tcp", spelling, "5556").as_deref(),
+            Some(v6.as_str()),
+            "{spelling} became a candidate of its own"
+        );
+    }
+    assert!(
+        v6.contains('['),
+        "a v6 transport must keep its brackets or the URI parser loses the port"
+    );
+
+    // Vacuity: different endpoints still differ, and a non-address is refused
+    // here as it is downstream.
+    assert_ne!(
+        canonical_rendezvous_transport("obfs4-tcp", "198.51.100.8", "443"),
+        Some(canonical.clone())
+    );
+    assert_ne!(
+        canonical_rendezvous_transport("obfs4-tcp", "198.51.100.7", "444"),
+        Some(canonical)
+    );
+    assert!(canonical_rendezvous_transport("obfs4-tcp", "seed.example", "443").is_none());
+    assert!(canonical_rendezvous_transport("obfs4-tcp", "198.51.100.7", "70000").is_none());
+}
+
 /// A pinned relay is pinned by ONE side, so the tiebreak has nothing to cancel.
 ///
 /// `[[pinned_relays]]` promises a connection "maintained unconditionally".
