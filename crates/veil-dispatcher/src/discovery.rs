@@ -408,11 +408,30 @@ impl FrameDispatcher {
                                     Ok(origin) => origin,
                                     Err(disposition) => return disposition,
                                 };
-                            if !self
-                                .dht
-                                .store_with_origin(payload.key, payload.value, origin)
-                            {
-                                // per-origin byte cap exceeded — soft-drop.
+                            // CONDITIONAL, because the gate above read the
+                            // incumbent in a lock section of its own: two
+                            // records that each beat the OLD incumbent both
+                            // passed it, and whichever wrote last won
+                            // regardless of weight (report27 V21). The
+                            // comparison is re-run against whatever is there
+                            // when the write takes the lock.
+                            let value = payload.value;
+                            if !self.dht.store_with_origin_if(
+                                payload.key,
+                                value.clone(),
+                                origin,
+                                |current| {
+                                    matches!(
+                                        veil_crypto::nickname::nickname_store_decision(
+                                            current, &value,
+                                        ),
+                                        veil_crypto::nickname::StoreDecision::Accept
+                                    )
+                                },
+                            ) {
+                                // Either the per-origin byte cap, or a heavier
+                                // record arrived first. Both are "we did not
+                                // take it", and neither is the sender's fault.
                                 return DispatchResult::RateLimited;
                             }
                             return DispatchResult::NoResponse;

@@ -2477,6 +2477,37 @@ pub fn a_record_this_node_would_refuse_is_not_republished() {
     junk.extend_from_slice(&NICKNAME_DHT_MAGIC);
     junk.extend_from_slice(b"not a nickname record at all");
     assert!(!NodeRuntime::is_republishable_dht_value_at(&junk, now_ms));
+
+    // THE CONTROL, which this test promised and did not have: a record this
+    // node WOULD accept has to go out. Without it the filter could answer
+    // "no" to every nickname record ever written and both assertions above
+    // would still pass — and the fix would be "stop republishing nicknames",
+    // which is not a fix (report27 V22).
+    let sk = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
+    let owner = *blake3::hash(&sk.verifying_key().to_bytes()).as_bytes();
+    let name = "longenoughname";
+    let mined = veil_crypto::nickname::mine_seeds(
+        name,
+        &owner,
+        veil_crypto::nickname::length_weight_floor(name.chars().count()),
+        5_000_000,
+        0,
+        &std::sync::atomic::AtomicBool::new(false),
+    )
+    .expect("the fixture must reach the length floor");
+    assert!(mined.hit_target, "the fixture stopped short of the floor");
+    let valid =
+        veil_crypto::nickname::NicknameRecord::sign(name, &sk, owner, mined.seeds, now_ms / 1_000)
+            .expect("a record this node would accept");
+    assert!(
+        valid.verify().is_ok(),
+        "premise: the control record must be one this node accepts"
+    );
+    assert!(
+        NodeRuntime::is_republishable_dht_value_at(&valid.to_bytes(), now_ms),
+        "a VALID nickname record is not republished either — the filter \
+         refuses every record, so nothing about a name ever leaves this node",
+    );
 }
 
 /// An anycast service list must be republished, or it never leaves the node.

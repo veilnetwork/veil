@@ -2113,6 +2113,44 @@ pub fn make_test_dispatcher(role: NodeRole) -> FrameDispatcher {
 
 #[cfg(test)]
 mod tests {
+
+    /// Both nickname STORE arms write under the comparison, not beside it.
+    ///
+    /// `nickname_store_gate` reads the incumbent in a lock section of its own
+    /// and the write takes another. Two valid records that each beat the OLD
+    /// incumbent both passed the gate, and the one that wrote last won
+    /// regardless of weight — so a lighter record could displace a heavier one
+    /// locally, both signatures perfectly valid (report27 V21).
+    ///
+    /// Source-level because what would have to be staged is an interleaving
+    /// between two lock acquisitions in another thread; the primitive's own
+    /// behaviour is driven in `veil-dht`'s
+    /// `a_conditional_store_compares_against_what_is_there_at_write_time`.
+    #[test]
+    fn both_nickname_store_arms_write_conditionally() {
+        for (file, src) in [
+            ("discovery.rs", include_str!("discovery.rs")),
+            ("routing.rs", include_str!("routing.rs")),
+        ] {
+            let at = src
+                .find("nickname_store_gate(")
+                .unwrap_or_else(|| panic!("{file}: the nickname STORE arm moved"));
+            // The arm, as far as its write. Bounded so the needle cannot match
+            // some other record kind's store further down.
+            let arm = &src[at..src.len().min(at + 1800)];
+            assert!(
+                arm.contains("store_with_origin_if("),
+                "{file}: the nickname arm writes with an unconditional store, \
+                 so the gate's comparison is against a value that may already \
+                 have been replaced"
+            );
+            assert!(
+                !arm.contains(".store_with_origin("),
+                "{file}: an unconditional store is back beside the conditional \
+                 one"
+            );
+        }
+    }
     use std::sync::{Arc, Mutex, RwLock};
 
     use super::make_test_dispatcher;
