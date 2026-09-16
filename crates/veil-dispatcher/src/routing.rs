@@ -2353,11 +2353,25 @@ impl FrameDispatcher {
                             Ok(origin) => origin,
                             Err(disposition) => return disposition,
                         };
-                        if !self
-                            .dht
-                            .store_with_origin(q.target_key, q.payload.clone(), origin)
-                        {
-                            // per-origin byte cap exceeded — drop silently.
+                        // Conditional for the reason the direct arm is: the
+                        // gate's read and this write were two lock sections,
+                        // so the lighter of two valid records could land last
+                        // and win (report27 V21).
+                        let value = q.payload.clone();
+                        if !self.dht.store_with_origin_if(
+                            q.target_key,
+                            value.clone(),
+                            origin,
+                            |current| {
+                                matches!(
+                                    veil_crypto::nickname::nickname_store_decision(
+                                        current, &value,
+                                    ),
+                                    veil_crypto::nickname::StoreDecision::Accept
+                                )
+                            },
+                        ) {
+                            // Byte cap, or a heavier record got here first.
                             return DispatchResult::NoResponse;
                         }
                         if let Some(resp) = build_signed(vec![1]) {

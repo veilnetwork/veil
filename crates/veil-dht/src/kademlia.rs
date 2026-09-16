@@ -1086,6 +1086,30 @@ impl KademliaService {
         }
     }
 
+    /// [`Self::store_local`] under the caller's own comparison, taken inside
+    /// the write's lock.
+    ///
+    /// See [`Self::store_with_origin_if`]: read-decide-write across two lock
+    /// sections lets the lighter of two valid records land last and win
+    /// (report27 V21).
+    pub fn store_local_if(
+        &self,
+        key: [u8; 32],
+        value: Vec<u8>,
+        still_wins: impl FnOnce(Option<&[u8]>) -> bool,
+    ) -> bool {
+        let mut inner = lock!(self.inner);
+        let current = inner.store.get(&key);
+        if !still_wins(current.as_ref().map(|v| v.as_slice())) {
+            return false;
+        }
+        inner.store_insert(key, value);
+        if let Some(m) = &self.metrics {
+            m.inc_dht_store();
+        }
+        true
+    }
+
     /// Store a value attributed to a caller-derived `origin` accounting bucket,
     /// applying the per-origin byte cap (`[dht] per_origin_max_bytes`).
     ///
@@ -1097,6 +1121,40 @@ impl KademliaService {
     /// per-origin cap would be exceeded (caller drops the value).
     pub fn store_with_origin(&self, key: [u8; 32], value: Vec<u8>, origin: [u8; 32]) -> bool {
         let mut inner = lock!(self.inner);
+        let accepted = inner.store_insert_with_origin(key, value, origin);
+        if accepted && let Some(m) = &self.metrics {
+            m.inc_dht_store();
+        }
+        accepted
+    }
+
+    /// Store only if `still_wins` agrees with what is there RIGHT NOW.
+    ///
+    /// Read-decide-write across two lock sections is not arbitration. Every
+    /// nickname STORE read the incumbent through `get_local`, decided against
+    /// it, and wrote through `store_with_origin` — two separate acquisitions —
+    /// so two records that each beat the OLD incumbent both passed, and the
+    /// one that landed last won regardless of weight. A lighter record could
+    /// displace a heavier one locally, with both signatures perfectly valid
+    /// (report27 V21).
+    ///
+    /// The predicate is handed the value currently under `key` and re-runs the
+    /// caller's own comparison inside the same lock the write takes. Returns
+    /// `false` when it declines — the same answer as a refused store, because
+    /// from the caller's side "somebody better got here first" and "the store
+    /// would not take it" are the same outcome.
+    pub fn store_with_origin_if(
+        &self,
+        key: [u8; 32],
+        value: Vec<u8>,
+        origin: [u8; 32],
+        still_wins: impl FnOnce(Option<&[u8]>) -> bool,
+    ) -> bool {
+        let mut inner = lock!(self.inner);
+        let current = inner.store.get(&key);
+        if !still_wins(current.as_ref().map(|v| v.as_slice())) {
+            return false;
+        }
         let accepted = inner.store_insert_with_origin(key, value, origin);
         if accepted && let Some(m) = &self.metrics {
             m.inc_dht_store();
@@ -1932,6 +1990,60 @@ fn verify_store_ownership(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Read, decide, write — under ONE lock, or it is not arbitration.
+    ///
+    /// The nickname STORE gate read the incumbent through `get_local` and
+    /// wrote through `store_with_origin`: two acquisitions. Two records that
+    /// each beat the OLD incumbent therefore both passed, and the one that
+    /// wrote last won regardless of weight — a lighter valid record could
+    /// displace a heavier one locally (report27 V21).
+    ///
+    /// Driven without threads: the predicate runs inside the lock, so what it
+    /// is HANDED is the whole of the question. A comparison made outside sees
+    /// the value from before; this one sees the value that is there.
+    #[test]
+    fn a_conditional_store_compares_against_what_is_there_at_write_time() {
+        let svc = KademliaService::new([0u8; 32]);
+        let key = [9u8; 32];
+
+        svc.store_local(key, b"heavy".to_vec());
+
+        // A writer that decided against an EMPTY store — the read it made
+        // before "heavy" landed.
+        let stale_decision = svc.store_local_if(key, b"light".to_vec(), |current| {
+            // What the caller would have concluded from its own earlier read.
+            current.is_none()
+        });
+        assert!(
+            !stale_decision,
+            "the write went ahead on a comparison made before the incumbent \
+             existed"
+        );
+        assert_eq!(
+            svc.get_local(&key).as_deref(),
+            Some(&b"heavy"[..]),
+            "a lighter record replaced a heavier one"
+        );
+
+        // Vacuity: a writer whose comparison still holds does write.
+        assert!(svc.store_local_if(key, b"heavier".to_vec(), |current| {
+            current == Some(&b"heavy"[..])
+        }));
+        assert_eq!(svc.get_local(&key).as_deref(), Some(&b"heavier"[..]));
+
+        // And the origin-carrying twin behaves the same way.
+        let origin = [1u8; 32];
+        assert!(!svc.store_with_origin_if(key, b"light".to_vec(), origin, |_| false));
+        assert_eq!(svc.get_local(&key).as_deref(), Some(&b"heavier"[..]));
+        assert!(
+            svc.store_with_origin_if(key, b"heaviest".to_vec(), origin, |current| {
+                current == Some(&b"heavier"[..])
+            })
+        );
+        assert_eq!(svc.get_local(&key).as_deref(), Some(&b"heaviest"[..]));
+    }
+
     use crate::iterative::{FindValueResult, PeerQuerier};
     use crate::routing::Contact;
     use veil_proto::discovery::{DeletePayload, FindValuePayload, StorePayload, attachment_key};

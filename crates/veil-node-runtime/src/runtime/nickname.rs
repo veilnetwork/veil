@@ -262,13 +262,16 @@ impl NodeServices {
         let key = nickname_dht_key(&norm).expect("normalized name always derives a key");
         let bytes = rec.to_bytes();
         // Local shard first, through the same replace-on-heavier decision the
-        // STORE gate applies (never clobber a heavier record we hold).
-        if matches!(
-            nickname_store_decision(self.dht.get_local(&key).as_deref(), &bytes),
-            StoreDecision::Accept
-        ) {
-            self.dht.store_local(key, bytes.clone());
-        }
+        // STORE gate applies (never clobber a heavier record we hold) — and
+        // taken INSIDE the write's lock. Read here and write there is two lock
+        // sections, so a heavier record arriving between them was overwritten
+        // by this one (report27 V21).
+        self.dht.store_local_if(key, bytes.clone(), |current| {
+            matches!(
+                nickname_store_decision(current, &bytes),
+                StoreDecision::Accept
+            )
+        });
         // Fan out to the K-closest over the recursive STORE plane — the same
         // plane the sovereign identity publisher uses; receivers re-verify
         // and re-apply displacement in `nickname_store_gate`. Periodic
