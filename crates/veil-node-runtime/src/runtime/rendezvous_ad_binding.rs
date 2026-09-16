@@ -52,7 +52,19 @@ fn identity_device_keys(dht: &Arc<KademliaService>, node_id: &[u8; 32]) -> Optio
         .map(|d| d.as_secs())
         .unwrap_or(0);
     veil_identity::verify::verify_identity_document(&doc, now).ok()?;
-    Some(doc.identity_keys.into_iter().map(|k| k.pubkey).collect())
+    // EACH key's own window, not just the active one's. The document verifier
+    // tolerates an aged-out sibling on purpose; handing the whole list back as
+    // "the devices this identity has" turned that tolerance into authority for
+    // an expired device secret (report27 V02).
+    Some(
+        (0..doc.identity_keys.len())
+            .filter_map(|idx| {
+                veil_identity::verify::authorize_device_key_at(&doc, idx, now)
+                    .ok()
+                    .map(|k| k.pubkey.clone())
+            })
+            .collect(),
+    )
 }
 
 /// Every address this node must be findable at as a RECEIVER.

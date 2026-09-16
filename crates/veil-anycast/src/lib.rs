@@ -293,7 +293,28 @@ pub fn anycast_store_decision(
     };
     for r in admitted {
         if let Some(pos) = list.0.iter().position(|e| e.node_id == r.node_id) {
-            list.0[pos] = r;
+            // A VALID SIGNATURE IS NOT A RIGHT TO EVICT.
+            //
+            // Everything here verified under the key the record carries — that
+            // the bytes were not tampered with, and nothing more. Whether the
+            // signer may speak for THIS `node_id` is established at resolve,
+            // where an identity document can be fetched; by then the incumbent
+            // has already been replaced, so a peer allowed to STORE could
+            // clear a service's real providers out of discovery with records
+            // nobody can bind (report27 V01).
+            //
+            // The binding that needs nothing external is the self-signed one:
+            // `BLAKE3(owner_pubkey) == node_id`. A record that proves it may
+            // replace anything. A record that cannot — every legitimate
+            // multi-device advertisement signed by a device subkey — may still
+            // replace an incumbent that cannot prove it either, which is how
+            // one identity's devices keep refreshing their own entry. What it
+            // may not do is displace a record that DID prove it.
+            let ours = verify_record_owner_binding(&r).is_ok();
+            let theirs = verify_record_owner_binding(&list.0[pos]).is_ok();
+            if ours || !theirs {
+                list.0[pos] = r;
+            }
         } else if list.0.len() < MAX_ANYCAST_CANDIDATES {
             list.0.insert(0, r);
         }
@@ -1873,6 +1894,87 @@ mod tests {
             "both providers must survive the store; got {} records",
             ids.len(),
         );
+    }
+
+    /// A record nobody can bind to the address may not displace one that can.
+    ///
+    /// Everything admitted here verified under the key the record CARRIES.
+    /// Whether that key may speak for the `node_id` is established at resolve,
+    /// where an identity document can be fetched — and by then the incumbent
+    /// has already been replaced. A peer allowed to STORE could therefore
+    /// clear a service's real providers out of discovery with records nobody
+    /// can bind (report27 V01).
+    #[test]
+    fn an_unbound_record_does_not_evict_a_bound_incumbent() {
+        let tag = *b"own1";
+        let key = AnycastRecord::dht_key(tag);
+
+        // The incumbent proves the binding that needs nothing external:
+        // BLAKE3(owner_pubkey) == node_id, signed by that key.
+        let owner = make_signing_key(0x31);
+        let owner_id: [u8; 32] = *blake3::hash(owner.verifying_key().as_bytes()).as_bytes();
+        let incumbent = AnycastRecord::sign(tag, owner_id, 5, 3600, 0, &owner);
+        assert!(verify_record_owner_binding(&incumbent).is_ok());
+        let mut held = AnycastList::default();
+        held.upsert(incumbent);
+        let held_blob = held.encode();
+
+        // The impostor signs correctly under its OWN key and claims the same
+        // address. Its signature verifies; its right to that address does not.
+        let impostor = make_signing_key(0x32);
+        let mut arriving = AnycastList::default();
+        arriving.upsert(AnycastRecord::sign(tag, owner_id, 9, 3600, 0, &impostor));
+
+        let AnycastStoreDecision::Merge(merged) = anycast_store_decision(
+            &key,
+            Some((&held_blob, std::time::Duration::from_secs(1))),
+            &arriving.encode(),
+        ) else {
+            panic!("a signed list is still stored");
+        };
+        let kept = AnycastList::decode(&merged).0;
+        assert_eq!(kept.len(), 1);
+        assert!(
+            verify_record_owner_binding(&kept[0]).is_ok(),
+            "the provider that proved this address was evicted by one that \
+             did not, and discovery now answers with it",
+        );
+        assert_eq!(
+            kept[0].score, 5,
+            "the incumbent's own advertisement was overwritten",
+        );
+    }
+
+    /// And a device subkey keeps refreshing its identity's own entry.
+    ///
+    /// Every device of one identity answers on the same address and only one
+    /// of them holds the master key, so most legitimate advertisements cannot
+    /// prove the self-signed binding either. Refusing THOSE would disable
+    /// anycast for exactly the case it exists for.
+    #[test]
+    fn an_unbound_record_still_replaces_an_unbound_one() {
+        let tag = *b"own2";
+        let key = AnycastRecord::dht_key(tag);
+        let device = make_signing_key(0x41);
+        let node_id = [0x99; 32]; // an identity address, not this key's hash
+
+        let mut held = AnycastList::default();
+        held.upsert(AnycastRecord::sign(tag, node_id, 5, 3600, 0, &device));
+        let held_blob = held.encode();
+
+        let mut arriving = AnycastList::default();
+        arriving.upsert(AnycastRecord::sign(tag, node_id, 7, 3600, 0, &device));
+
+        let AnycastStoreDecision::Merge(merged) = anycast_store_decision(
+            &key,
+            Some((&held_blob, std::time::Duration::from_secs(1))),
+            &arriving.encode(),
+        ) else {
+            panic!("a valid refresh is stored");
+        };
+        let kept = AnycastList::decode(&merged).0;
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].score, 7, "a device could not refresh its own entry");
     }
 
     /// A full list does not let a newcomer from the network evict anyone.

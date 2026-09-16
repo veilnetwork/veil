@@ -734,17 +734,15 @@ impl NodeRuntime {
                         .duration_since(std::time::UNIX_EPOCH)
                         .map(|d| d.as_secs())
                         .unwrap_or(0);
-                    // The FULL ladder, clock included. This document came
-                    // off the network: it is exactly the case the
-                    // time-checked verifier is for, and an expired
-                    // delegation must not keep advertising.
-                    veil_identity::verify::verify_identity_document(&doc, now).ok()?;
-                    // The verifier has established node_id == BLAKE3(master)
-                    // and that every key here is master-certified, so the
-                    // key at this index is authorised to speak for the
-                    // address.
-                    doc.identity_keys
-                        .get(idx as usize)
+                    // The FULL ladder, clock included, AND this key's own
+                    // window. The document verifier is deliberately tolerant
+                    // of a sibling key that has aged out — one expired
+                    // delegation should not invalidate a good document — so
+                    // reading `identity_keys` directly handed back an expired
+                    // device as a current right, and its holder went on
+                    // advertising for the address (report27 V02).
+                    veil_identity::verify::authorize_device_key_at(&doc, idx as usize, now)
+                        .ok()
                         .map(|k| k.pubkey.clone())
                 },
             ));

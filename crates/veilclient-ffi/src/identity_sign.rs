@@ -242,6 +242,18 @@ pub unsafe extern "C" fn veil_identity_document_authorizes(
     if veil_identity::verify::verify_identity_document(&doc, now).is_err() {
         return VERIFY_INVALID;
     }
+    // WHAT THIS DOES NOT PROVE: that the key may act NOW.
+    //
+    // The document verifier enforces the window of the key that signed the
+    // document and tolerates a sibling whose own window has passed. This
+    // function is used to check AUTHORSHIP — a signature made at some point in
+    // the past — where requiring the key to be valid today would reject
+    // history that was legitimate when it was written. Revocation still
+    // applies: a document that no longer lists a key does not authorise it.
+    //
+    // A caller authorising a NEW action wants `authorize_device_key_at`
+    // instead, which is what the delegation lookup, the rendezvous binding and
+    // name claims now use (report27 V02).
     if doc.identity_keys.iter().any(|key| key.pubkey == pubkey) {
         VERIFY_VALID
     } else {

@@ -652,7 +652,13 @@ impl<B: ResolverBackend> NameResolver<B> {
             return Err(ResolveError::NameClaimPowTooWeak { required });
         }
 
-        // Signing-subkey selection.
+        // Signing-subkey selection — and the subkey's OWN window.
+        //
+        // A name claim is a claim about NOW: this name resolves to this
+        // identity today. The document verifier tolerates an aged-out sibling
+        // key so one expired delegation does not invalidate a good document,
+        // and reading the list directly turned that into "an expired device
+        // may still claim names" (report27 V02).
         let subkey = doc
             .identity_keys
             .get(claim.signing_identity_key_idx as usize)
@@ -660,6 +666,15 @@ impl<B: ResolverBackend> NameResolver<B> {
                 idx: claim.signing_identity_key_idx,
                 n_keys: doc.identity_keys.len(),
             })?;
+        if now_unix_secs > subkey.valid_until_unix
+            || (subkey.valid_from_unix > 0
+                && now_unix_secs + crate::verify::TIME_VALIDITY_SKEW_SECS < subkey.valid_from_unix)
+        {
+            return Err(ResolveError::NameClaimSigKeyOutOfBounds {
+                idx: claim.signing_identity_key_idx,
+                n_keys: doc.identity_keys.len(),
+            });
+        }
 
         // Actual signature verify.
         let mut msg = Vec::with_capacity(NAME_CLAIM_SIG_CONTEXT.len() + 256);
