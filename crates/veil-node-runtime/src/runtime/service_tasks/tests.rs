@@ -1491,8 +1491,8 @@ fn a_node_never_publishes_an_address_that_is_true_only_where_it_stands() {
 /// the same fixed slots — so an attacker on the broadcast domain added up
 /// to eight more of each every five minutes, without bound, for the life
 /// of the process (report22 V-02).
-#[test]
-fn a_hundred_lan_rounds_leave_no_rows_or_contacts() {
+#[tokio::test]
+async fn a_hundred_lan_rounds_leave_no_rows_or_contacts() {
     use crate::types::PeerId;
     let mut peers: std::collections::BTreeMap<PeerId, PeerConfigEntry> = Default::default();
     let mut contacts: std::collections::HashSet<[u8; 32]> = Default::default();
@@ -1500,6 +1500,12 @@ fn a_hundred_lan_rounds_leave_no_rows_or_contacts() {
     // the abort alone gives it back at some later poll, and a re-admission
     // before then finds the slot held by a task that is dying
     // (report24 RUNTIME-2).
+    //
+    // Each candidate carries an abort handle, because that is what an
+    // admission that SPAWNED a connector looks like — and only such an
+    // admission holds a claim to give back. The fixture used to pass `None`
+    // and assert the release anyway, which was true of a release that ran
+    // unconditionally and is the thing report27 V16 was about.
     let mut released: Vec<[u8; 32]> = Vec::new();
 
     for round in 0..100u32 {
@@ -1511,12 +1517,13 @@ fn a_hundred_lan_rounds_leave_no_rows_or_contacts() {
             entry.peer_id = peer_id;
             peers.insert(peer_id, entry);
             contacts.insert(node_id);
+            let spawned = tokio::spawn(std::future::pending::<()>());
             admitted.push(LanCandidate {
                 node_id,
                 slot,
                 admitted: std::time::Instant::now(),
                 peer_id,
-                abort: None,
+                abort: Some(spawned.abort_handle()),
             });
         }
         assert_eq!(
@@ -1611,6 +1618,73 @@ fn eviction_leaves_a_row_that_is_no_longer_ours() {
         |_| {},
     );
     assert!(peers.is_empty());
+}
+
+/// An eviction gives back its OWN claim, and nobody else's.
+///
+/// A LAN announce for a node this host already dials — a configured peer that
+/// also happens to be on the segment — does not spawn a connector: the claim
+/// is already held, and `spawn_outbound_peers` refreshes it and returns no
+/// handle. When that candidate then aged out, the eviction released the claim
+/// anyway. Dropping the sole `watch::Sender` closes the channel, the configured
+/// connector's `changed()` returns `Err`, and the loop exits — leaving a
+/// configured row with no reconnect loop and nothing to spawn another, because
+/// an unrelated LAN announce for the same node timed out (report27 V16).
+///
+/// `abort` is the token: it is `Some` exactly when this admission created the
+/// connector, which is the same condition under which it took the claim.
+#[tokio::test]
+async fn an_eviction_releases_only_the_claim_its_own_admission_made() {
+    use crate::runtime::service_tasks::{LanCandidate, evict_lan_candidate};
+
+    let node = [0x5Cu8; 32];
+    let peer_id = crate::types::PeerId::new(0x9000_0001);
+    let mut peers = std::collections::BTreeMap::new();
+
+    // No abort handle: this admission found the connector already there.
+    let mut released = Vec::new();
+    evict_lan_candidate(
+        &mut peers,
+        LanCandidate {
+            node_id: node,
+            slot: 0,
+            admitted: std::time::Instant::now(),
+            peer_id,
+            abort: None,
+        },
+        |_| {},
+        |id| released.push(*id),
+    );
+    assert!(
+        released.is_empty(),
+        "the eviction gave back a claim it never took — the connector that \
+         holds it is somebody else's, and losing it leaves that peer with no \
+         reconnect loop"
+    );
+
+    // Vacuity: an admission that DID spawn one still gives its claim back, or
+    // the assertion above only says the function releases nothing.
+    let task = tokio::spawn(std::future::pending::<()>());
+    let handle = task.abort_handle();
+    let mut released = Vec::new();
+    evict_lan_candidate(
+        &mut peers,
+        LanCandidate {
+            node_id: node,
+            slot: 0,
+            admitted: std::time::Instant::now(),
+            peer_id,
+            abort: Some(handle),
+        },
+        |_| {},
+        |id| released.push(*id),
+    );
+    assert_eq!(
+        released,
+        vec![node],
+        "an admission that spawned the connector must give its claim back, or \
+         the slot is held for the life of the process"
+    );
 }
 
 /// A row a LAN admission would write, with only the fields these rules read.
