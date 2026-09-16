@@ -91,6 +91,19 @@ pub enum ApplyError {
     AntiDowngrade { manifest: u64, installed: u64 },
     #[error("installed-version state: {0}")]
     InstalledVersion(#[from] InstalledVersionError),
+    /// Another process is inside an install transaction.
+    ///
+    /// Two applies that overlap can lower the anti-downgrade floor between
+    /// them, each with a correct signature, and a startup sweep that overlaps
+    /// one can delete the binary it had just staged. Both are closed by one
+    /// lock, and a lock that is held is an answer rather than a wait: an
+    /// installer that blocks on another installer is one that can hang a
+    /// startup (report27 V06/V08).
+    #[error(
+        "another install is in progress (lock held at {lock_path}) — \
+         retry once it finishes"
+    )]
+    AnotherInstallInProgress { lock_path: PathBuf },
     /// The new binary is in place but its directory entry could not be made
     /// durable, so the installed-version record was deliberately NOT advanced.
     ///
@@ -323,6 +336,119 @@ pub struct ApplyOutcome {
 /// `CARGO_PKG_VERSION` so the gate never compares against the wrong crate's
 /// version once the product is versioned independently of `veil-update`
 /// (C-07).
+/// One installer at a time, across processes.
+///
+/// The anti-downgrade floor is a read-modify-write — `commit` re-reads it and
+/// refuses to move it down — and a re-read is not a lock. Two applies of
+/// correctly signed releases, which neither this library nor the CLI
+/// serialised, could both read floor F, and then the newer write H and the
+/// older write L: F < L < H, so the older one's check passes and the floor
+/// ENDS UP LOWER than the release already installed. Every signature verifies;
+/// the invariant that keeps a re-signed old release from being re-admitted is
+/// the thing that breaks (report27 V06).
+///
+/// The same lock answers the cleanup sweep. `cleanup_stale_update_artifacts`
+/// deletes every `<install>.update-tmp.*` sibling it finds, and a concurrent
+/// apply's staging file is one of those — a startup sweep could delete the
+/// binary another process had just written and was about to rename (report27
+/// V08).
+///
+/// The comment this replaces said closing the window "needs a lock the two
+/// processes share, which is a platform decision this crate has not made".
+/// It no longer has to: `File::try_lock` is std, and is `flock` on Unix and
+/// `LockFileEx` on Windows. The lock file is a sibling of the install path
+/// rather than of the state file, because the sweep knows only the install
+/// path — and it is never removed, since deleting a lock file is how a third
+/// process ends up holding a lock on nothing.
+struct InstallLock {
+    _file: std::fs::File,
+}
+
+impl InstallLock {
+    /// Take the lock, or answer who has it. Never blocks: an installer that
+    /// waits on another installer is an installer that can hang a startup.
+    fn acquire(install_path: &Path) -> Result<Self, ApplyError> {
+        let path = with_lock_suffix(install_path);
+        // The install directory is allowed not to exist yet — a first install
+        // into a fresh prefix is an ordinary case, and staging creates it. The
+        // lock has to be taken BEFORE that, so it creates it too, with the
+        // same helper staging uses.
+        if let Some(parent) = install_path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            veil_util::create_dir_all_with_eacces_retry(parent)?;
+        }
+        let mut opts = std::fs::OpenOptions::new();
+        opts.create(true).truncate(false).write(true).read(true);
+        // The install directory may be writable by a less-trusted user — the
+        // staging path is `O_EXCL`+`O_NOFOLLOW` for exactly that reason. A
+        // lock file at a PREDICTABLE name is the one artifact here that has
+        // to exist under a known name, so it gets the `O_NOFOLLOW` half:
+        // without it a pre-placed symlink redirects this open somewhere else
+        // entirely.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            opts.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+        }
+        let file = opts.open(&path)?;
+        match file.try_lock() {
+            Ok(()) => Ok(Self { _file: file }),
+            Err(std::fs::TryLockError::WouldBlock) => {
+                Err(ApplyError::AnotherInstallInProgress { lock_path: path })
+            }
+            // The filesystem does not honour locks. Proceeding is what this
+            // code did before there was a lock at all, and refusing every
+            // update on such a mount would be worse than the race it closes.
+            Err(std::fs::TryLockError::Error(_)) => Ok(Self { _file: file }),
+        }
+    }
+}
+
+/// The staging file, owned.
+///
+/// Every way out of `apply_update` between staging and the rename has to
+/// remove it, and one did not: the SECOND floor read propagates an I/O, MAC or
+/// parse error with `?`, leaving a full copy of the new binary next to the
+/// install path under an unpredictable name that nothing cleans up until the
+/// next startup sweep (report27 V07). An owner rather than another
+/// `let _ = remove_file` at each site — that is the arrangement that already
+/// missed one.
+struct StagedBinary {
+    path: PathBuf,
+    armed: bool,
+}
+
+impl StagedBinary {
+    fn new(path: PathBuf) -> Self {
+        Self { path, armed: true }
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// The rename consumed it; there is nothing left to remove.
+    fn published(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for StagedBinary {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+}
+
+/// `<install_path>.update-lock` — see [`InstallLock`].
+fn with_lock_suffix(path: &Path) -> PathBuf {
+    let mut name = path.as_os_str().to_owned();
+    name.push(".update-lock");
+    PathBuf::from(name)
+}
+
 pub fn apply_update(
     manifest: &VerifiedManifest,
     binary_bytes: &[u8],
@@ -330,6 +456,11 @@ pub fn apply_update(
     store: &InstalledVersionStore,
     current_version: &str,
 ) -> Result<ApplyOutcome, ApplyError> {
+    // Step 0: the transaction. Everything from the floor read to the state
+    // commit is one, and until now nothing said so — see [`InstallLock`].
+    // Held for the whole of this function; released when it returns.
+    let _install_lock = InstallLock::acquire(install_path)?;
+
     // Step 1: recompute SHA-256 (defence in depth).
     let mut hasher = Sha256::new();
     hasher.update(binary_bytes);
@@ -405,7 +536,10 @@ pub fn apply_update(
     // fsync'd, and chmod'd executable BEFORE the rename — so a less-trusted user
     // with write access to the install directory cannot pre-place a symlink at a
     // predictable tmp path to capture or clobber the privileged write.
-    let tmp_path = veil_util::write_executable_staged(install_path, binary_bytes)?;
+    let mut staged = StagedBinary::new(veil_util::write_executable_staged(
+        install_path,
+        binary_bytes,
+    )?);
     let binary_marked_executable = cfg!(unix);
 
     // Step 3′: THE FLOOR AGAIN, immediately before anything destructive.
@@ -426,7 +560,6 @@ pub fn apply_update(
     let floor_now =
         crate::installed_version::anti_downgrade_floor(store.read_release_unix_for_apply()?);
     if manifest.release_unix <= floor_now {
-        let _ = std::fs::remove_file(&tmp_path);
         return Err(ApplyError::AntiDowngrade {
             manifest: manifest.release_unix,
             installed: floor_now,
@@ -451,13 +584,7 @@ pub fn apply_update(
     // existing install_path and the kernel keeps the old inode
     // alive on the running process. See module-level rustdoc.
     let previous_binary_relocated_to =
-        relocate_running_binary_if_needed(install_path).map_err(|e| {
-            // Cleanup staging file on the relocate failure path so
-            // we don't leak it across retries (next apply retries
-            // from a clean state).
-            let _ = std::fs::remove_file(&tmp_path);
-            ApplyError::Io(e)
-        })?;
+        relocate_running_binary_if_needed(install_path).map_err(ApplyError::Io)?;
 
     // Step 3b: atomic rename of staging → install_path. After
     // 3a the install_path either doesn't exist (Windows
@@ -467,10 +594,7 @@ pub fn apply_update(
     // gets `MOVEFILE_WRITE_THROUGH` inside this call. The Windows path had
     // neither, and advanced the installed-state floor anyway (report14
     // V14-L4).
-    if let Err(e) = veil_util::rename_durable(&tmp_path, install_path) {
-        // Best-effort cleanup of the staging file so we don't
-        // leak it across retries.
-        let _ = std::fs::remove_file(&tmp_path);
+    if let Err(e) = veil_util::rename_durable(staged.path(), install_path) {
         // Best-effort: if Windows shuffle-out succeeded but
         // rename-in failed, try to put the old binary back so the
         // running process / future restart still has something to
@@ -481,6 +605,9 @@ pub fn apply_update(
         }
         return Err(ApplyError::Io(e));
     }
+    // The name is the installed binary's now; there is nothing left to remove,
+    // and unlinking it would take the install itself.
+    staged.published();
 
     // fsync the parent directory. `rename` is
     // atomic in kernel but not durable until the directory entry is
@@ -553,6 +680,20 @@ pub fn apply_update(
 /// (for caller to log / report — empty list = nothing to clean).
 pub fn cleanup_stale_update_artifacts(install_path: &Path) -> Vec<PathBuf> {
     let mut cleaned = Vec::new();
+    // Under the install lock, and it is not optional. The `.update-tmp.*`
+    // sweep below cannot tell a crashed apply's leftovers from a LIVE apply's
+    // staging file — both are siblings with an unpredictable suffix — and a
+    // startup sweep that ran beside one deleted the binary that apply had just
+    // written and was about to rename (report27 V08). An age or a random name
+    // does not make an artifact stale; the lock being free does.
+    //
+    // Held, not just taken: the guard lives to the end of the function.
+    let Ok(_lock) = InstallLock::acquire(install_path) else {
+        // Somebody is installing. Everything here is best-effort by contract,
+        // and "leave it until next startup" is the right answer when the
+        // alternative is deleting a live transaction's file.
+        return cleaned;
+    };
     // Deterministic artifacts: `.update-old` (Windows shuffle-out) and the
     // legacy fixed `.update-tmp` staging name.
     for path in [with_old_suffix(install_path), with_tmp_suffix(install_path)] {
@@ -872,12 +1013,22 @@ mod tests {
         let body = &src[src
             .find("pub fn apply_update(")
             .expect("apply_update is in this file")..];
+        // Bounded to the function. Unbounded, every needle below could match
+        // inside the test module further down — which is how a guard ends up
+        // measuring its own assertions.
+        let body = &body[..body
+            .find("\n/// Cleanup leftover")
+            .expect("could not bound apply_update")];
 
         let first_read = body
             .find("store.read_release_unix_for_apply()?")
             .expect("the floor is read at the top");
+        // Anchored on the owner's constructor, which rustfmt keeps on one
+        // line — the argument list it wraps does not survive a reformat, and
+        // a needle that does not survive one is a guard that fails for a
+        // reason nobody can read.
         let staged = body
-            .find("write_executable_staged(install_path, binary_bytes)")
+            .find("StagedBinary::new(veil_util::write_executable_staged(")
             .expect("the new binary is staged");
         let second_read = body[staged..]
             .find("store.read_release_unix_for_apply()?")
@@ -890,7 +1041,7 @@ mod tests {
             .find("relocate_running_binary_if_needed(install_path)")
             .expect("the running binary is relocated on Windows");
         let rename = body
-            .find("rename_durable(&tmp_path, install_path)")
+            .find("rename_durable(staged.path(), install_path)")
             .expect("the staged binary is renamed into place");
 
         assert!(first_read < staged, "premise: the first read is at the top");
@@ -904,9 +1055,74 @@ mod tests {
             body[second_read..relocate].contains("ApplyError::AntiDowngrade"),
             "the second read is not followed by a refusal, so nothing acts on it",
         );
+        // The refusal used to have to remove the staging file by hand, and
+        // the line beside it — the `?` on the read itself — did not, so an
+        // I/O or MAC error there leaked a full copy of the new binary under
+        // an unpredictable name (report27 V07). Both are the owner's job now,
+        // so what this asserts is that the owner exists and that nothing in
+        // the window removes the file behind its back.
         assert!(
-            body[second_read..relocate].contains("remove_file(&tmp_path)"),
-            "refusing there leaks the staged binary it had already written",
+            body.contains("StagedBinary::new(veil_util::write_executable_staged("),
+            "the staging file is not owned, so every early return between here \
+             and the rename has to remember to remove it — and one did not",
+        );
+        assert!(
+            !body[..rename].contains("remove_file(&tmp_path)"),
+            "a by-hand removal is back beside the owner; the two will disagree",
+        );
+    }
+
+    /// The transaction is one transaction, and the sweep knows it.
+    ///
+    /// The floor is a read-modify-write across two processes, and `commit`
+    /// re-reading it is not a lock: two applies could both read F and then
+    /// write H and L, leaving the floor BELOW the release already installed,
+    /// with every signature correct (report27 V06). The same lock stops the
+    /// startup sweep from deleting a live apply's staging file, which it
+    /// could not tell from a crashed one (report27 V08).
+    ///
+    /// Structural for the same reason as the guard above: what would have to
+    /// be staged is an interleaving at a chosen instruction in another
+    /// process.
+    #[test]
+    fn the_install_and_the_sweep_take_the_same_lock() {
+        let src = include_str!("apply.rs");
+        let apply = &src[src
+            .find("pub fn apply_update(")
+            .expect("apply_update is in this file")..];
+        let apply = &apply[..apply
+            .find("\n/// Cleanup leftover")
+            .expect("could not bound apply_update")];
+        let sweep = &src[src
+            .find("pub fn cleanup_stale_update_artifacts(")
+            .expect("the sweep is in this file")..];
+        let sweep = &sweep[..sweep.find("\n/// Windows-only:").unwrap_or(sweep.len())];
+
+        let taken = apply
+            .find("InstallLock::acquire(install_path)")
+            .expect("apply_update runs outside the install lock");
+        let first_read = apply
+            .find("store.read_release_unix_for_apply()?")
+            .expect("the floor is read");
+        assert!(
+            taken < first_read,
+            "the lock is taken at {taken}, after the floor read at \
+             {first_read} — the read-modify-write it protects starts there",
+        );
+        assert!(
+            sweep.contains("InstallLock::acquire(install_path)"),
+            "the sweep deletes `.update-tmp.*` siblings without the lock, and \
+             a live apply's staging file is one of those",
+        );
+        let guard_at = sweep
+            .find("InstallLock::acquire(install_path)")
+            .expect("checked above");
+        let sweep_at = sweep
+            .find("starts_with(&marker)")
+            .expect("the sweep no longer sweeps by prefix");
+        assert!(
+            guard_at < sweep_at,
+            "the sweep takes the lock after it has already started deleting",
         );
     }
 
@@ -1268,6 +1484,155 @@ mod tests {
             matches!(err, ApplyError::AntiDowngrade { .. }),
             "equal release_unix must be rejected as anti-downgrade"
         );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A failure after staging leaves no copy of the new binary behind.
+    ///
+    /// Everything between staging and the rename has to remove the staging
+    /// file, and the sites that remembered did it by hand — so the one that
+    /// did not, the `?` on the second floor read, left a full copy of the new
+    /// binary beside the install path under an unpredictable name until the
+    /// next startup sweep (report27 V07). The owner covers every exit,
+    /// including the ones nobody has written yet.
+    ///
+    /// Driven through a failure that needs no race: a DIRECTORY at the install
+    /// path stages fine and cannot be renamed over.
+    #[test]
+    fn a_failure_after_staging_leaves_no_staged_binary() {
+        let dir = unique_dir("staging-owner");
+        let install = dir.join("veil");
+        // A non-empty directory where the binary goes: staging succeeds, the
+        // rename cannot.
+        std::fs::create_dir_all(install.join("occupied")).unwrap();
+        let store = InstalledVersionStore::new(dir.join("installed.json"));
+        store.write(1_500_000_000).unwrap();
+
+        let payload = b"a binary that cannot land";
+        let manifest = fixture_manifest(2_000_000_000, sha256_of(payload));
+        let err = apply_update(
+            &manifest,
+            payload,
+            &install,
+            &store,
+            env!("CARGO_PKG_VERSION"),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, ApplyError::Io(_)),
+            "premise: the rename must be what fails, not something earlier: {err:?}"
+        );
+
+        let leftovers: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with("veil.update-tmp."))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "a failed apply left the new binary on disk under an \
+             unpredictable name: {leftovers:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A second install does not start while one is running.
+    ///
+    /// The floor is a read-modify-write and `commit` re-reading it is not a
+    /// lock: two applies could both read F, then write H and L, and leave the
+    /// floor BELOW the release already installed — every signature correct,
+    /// the anti-downgrade invariant gone, and a re-signed older release
+    /// admissible again (report27 V06).
+    ///
+    /// Testable in one process because a POSIX lock belongs to the open file
+    /// DESCRIPTION, not the process: a second open of the same path is a
+    /// second description, and `LockFileEx` is per-handle in the same way.
+    #[test]
+    fn a_second_install_refuses_while_one_holds_the_lock() {
+        let dir = unique_dir("install-lock");
+        let install = dir.join("veil");
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = InstalledVersionStore::new(dir.join("installed.json"));
+        store.write(1_500_000_000).unwrap();
+
+        let held = InstallLock::acquire(&install).expect("the first installer takes the lock");
+
+        let payload = b"NEW binary while another install runs";
+        let manifest = fixture_manifest(2_000_000_000, sha256_of(payload));
+        let err = apply_update(
+            &manifest,
+            payload,
+            &install,
+            &store,
+            env!("CARGO_PKG_VERSION"),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, ApplyError::AnotherInstallInProgress { .. }),
+            "a second apply ran beside the first and answered {err:?} — both \
+             read the floor, and the one that commits last decides it"
+        );
+        assert!(
+            !install.exists(),
+            "the refused apply installed its binary anyway"
+        );
+
+        // Vacuity: the same apply succeeds once the lock is free, so what the
+        // assertion above caught is the LOCK and not a broken fixture.
+        drop(held);
+        apply_update(
+            &manifest,
+            payload,
+            &install,
+            &store,
+            env!("CARGO_PKG_VERSION"),
+        )
+        .expect("the same apply must succeed once the lock is released");
+        assert_eq!(std::fs::read(&install).unwrap(), payload);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The startup sweep leaves a live apply's staging file alone.
+    ///
+    /// The sweep deletes every `<install>.update-tmp.*` sibling it finds, and
+    /// cannot tell a crashed apply's leftovers from the file a running apply
+    /// has just written and is about to rename. Running beside one, it deleted
+    /// the new binary out from under it (report27 V08).
+    #[test]
+    fn the_sweep_leaves_a_live_installs_staging_alone() {
+        let dir = unique_dir("sweep-lock");
+        let install = dir.join("veil");
+        std::fs::create_dir_all(&dir).unwrap();
+        // Exactly what `write_executable_staged` leaves behind mid-apply.
+        let staging = dir.join("veil.update-tmp.a1b2c3d4e5f60718");
+        std::fs::write(&staging, b"the binary another apply is about to rename").unwrap();
+
+        let held = InstallLock::acquire(&install).expect("the installer takes the lock");
+        let cleaned = cleanup_stale_update_artifacts(&install);
+        assert!(
+            cleaned.is_empty(),
+            "the sweep deleted {cleaned:?} while an install held the lock"
+        );
+        assert!(
+            staging.exists(),
+            "the sweep deleted the staging file of a running install"
+        );
+
+        // Vacuity: with nobody installing, the same sweep DOES take it — or
+        // the assertion above is only saying that the sweep does nothing.
+        drop(held);
+        let cleaned = cleanup_stale_update_artifacts(&install);
+        assert_eq!(
+            cleaned,
+            vec![staging.clone()],
+            "with the lock free the sweep must still collect a stale staging \
+             file, or it has stopped sweeping at all"
+        );
+        assert!(!staging.exists());
 
         let _ = std::fs::remove_dir_all(&dir);
     }
