@@ -2053,9 +2053,36 @@ impl RendezvousRegistry {
         cookie: &[u8; AUTH_COOKIE_LEN],
         requesting_peer: &[u8; NODE_ID_LEN],
     ) -> bool {
-        let key: RegistrationKey = (*requesting_peer, *cookie);
         let mut g = self.inner.lock().unwrap_or_else(|p| p.into_inner());
-        g.remove_cookie(&key).is_some()
+        // EVERY entry under this cookie that delivers to the caller, not just
+        // the one keyed by its own address.
+        //
+        // A register can create two: the device's own key and an ALIAS keyed
+        // by the identity it answers for, both pointing at the same session.
+        // Removing only `(caller, cookie)` left the alias resolving to a live
+        // session the receiver had just asked to stop using — until a TTL, a
+        // close or an eviction got to it (report27 V26).
+        //
+        // `sub.peer_node_id == requesting_peer` is what keeps this from
+        // becoming a way to delete somebody else's registration: an entry that
+        // a successor has re-pointed elsewhere no longer delivers here, and
+        // the peer that used to hold it has no say over it any more.
+        //
+        // A scan, because the alias is keyed by an address this call does not
+        // know and there is no reverse index. Bounded by `max_registrations`
+        // and paid on a control message a receiver sends by hand — not on the
+        // introduce path.
+        let doomed: Vec<RegistrationKey> = g
+            .cookies
+            .iter()
+            .filter(|((_, c), sub)| c == cookie && &sub.peer_node_id == requesting_peer)
+            .map(|(key, _)| *key)
+            .collect();
+        let mut removed = false;
+        for key in doomed {
+            removed |= g.remove_cookie(&key).is_some();
+        }
+        removed
     }
 
     /// Look up the subscriber that registered `cookie` under
@@ -2108,11 +2135,33 @@ impl RendezvousRegistry {
     /// closes. Returns the number of cookies dropped.
     pub fn drop_subscriber(&self, peer_node_id: &[u8; NODE_ID_LEN]) -> usize {
         let mut g = self.inner.lock().unwrap_or_else(|p| p.into_inner());
-        let before = g.cookies.len();
-        g.cookies.retain(|_, sub| &sub.peer_node_id != peer_node_id);
-        // All of this peer's entries are gone → its per-peer count is 0.
-        g.per_peer.remove(peer_node_id);
-        before - g.cookies.len()
+        // THE KEY'S OWNER IS NOT THE SUBSCRIBER. A registration is keyed by
+        // the identity that owns it and carries the DEVICE it delivers to, and
+        // the two are allowed to differ: `register_as` takes both. This sweep
+        // removes by destination, so the entries it takes can belong to any
+        // number of owners — and it used to adjust exactly one count, the
+        // departing device's.
+        //
+        // That was wrong in both directions. Every other owner kept a count
+        // for a cookie that no longer exists, so its fairness cap stayed
+        // consumed forever and its next reconnect evicted its own live slots
+        // to make room it already had. And the departing device, if it also
+        // OWNED registrations pointing at somebody else, had those forgotten —
+        // an undercount, which is the cap not applying at all (report27 V25).
+        //
+        // Field-borrow both maps, exactly as the TTL sweep above does, so each
+        // removed cookie decrements the count of ITS OWN owner.
+        let RendezvousRegistryInner { cookies, per_peer } = &mut *g;
+        let before = cookies.len();
+        cookies.retain(|(owner, _), sub| {
+            let keep = &sub.peer_node_id != peer_node_id;
+            if !keep && let Some(c) = per_peer.get_mut(owner) {
+                *c -= 1;
+            }
+            keep
+        });
+        per_peer.retain(|_, c| *c > 0);
+        before - cookies.len()
     }
 
     pub fn len(&self) -> usize {
@@ -3492,6 +3541,135 @@ mod tests {
     /// and found nothing, because the key was the address the peer connected
     /// as. The subscriber keeps naming the device, because that is the session
     /// the introduce is forwarded over and an identity is not a session.
+    /// Unregistering a cookie retires the alias that answers for it.
+    ///
+    /// A register can create two entries for one session: the device's own key
+    /// and an alias keyed by the identity it answers for. Unregister removed
+    /// only `(caller, cookie)`, so the alias went on resolving to a live
+    /// session the receiver had just asked to stop using — until a TTL, a
+    /// close or an eviction got to it (report27 V26).
+    #[test]
+    fn unregistering_a_cookie_retires_the_alias_that_answers_for_it() {
+        let reg = RendezvousRegistry::with_capacity(64);
+        let device = [0xD1u8; NODE_ID_LEN];
+        let identity = [0x1Du8; NODE_ID_LEN];
+        let cookie = [0xC0u8; AUTH_COOKIE_LEN];
+        let sub = RendezvousSubscriber {
+            peer_node_id: device,
+            receiver_x25519_pk: [0x01; X25519_PK_LEN],
+            registered_at_unix: 1,
+        };
+        // Both halves of one registration, as the relay makes them.
+        reg.register_as(device, cookie, sub.clone()).expect("own");
+        reg.register_as(identity, cookie, sub.clone())
+            .expect("alias");
+        assert!(reg.lookup(&identity, &cookie).is_some(), "premise");
+
+        assert!(
+            reg.unregister(&cookie, &device),
+            "the receiver asked to stop"
+        );
+
+        assert!(
+            reg.lookup(&device, &cookie).is_none(),
+            "the caller's own entry survived its own unregister"
+        );
+        assert!(
+            reg.lookup(&identity, &cookie).is_none(),
+            "an introduce naming the identity still reaches a session the \
+             receiver asked to stop using"
+        );
+
+        // And it is not a way to take somebody else's entry: an alias a
+        // successor has re-pointed no longer delivers to this caller.
+        let successor = [0xE2u8; NODE_ID_LEN];
+        reg.register_as(
+            identity,
+            [0xC3u8; AUTH_COOKIE_LEN],
+            RendezvousSubscriber {
+                peer_node_id: successor,
+                receiver_x25519_pk: [0x02; X25519_PK_LEN],
+                registered_at_unix: 2,
+            },
+        )
+        .expect("the successor registers");
+        assert!(
+            !reg.unregister(&[0xC3u8; AUTH_COOKIE_LEN], &device),
+            "the retired device removed a registration that now delivers \
+             somewhere else"
+        );
+        assert!(reg.lookup(&identity, &[0xC3u8; AUTH_COOKIE_LEN]).is_some());
+    }
+
+    /// A session closing must not leave counts for registrations it removed.
+    ///
+    /// The sweep removes by DESTINATION and the fairness counter is kept by
+    /// OWNER, and those are allowed to differ — that is the whole of what
+    /// `register_as` exists for. It adjusted exactly one count, the departing
+    /// device's, so every other owner kept a count for a cookie that no longer
+    /// exists: its cap stayed consumed for the life of the process, and its
+    /// next reconnect evicted its own live slots to make room it already had
+    /// (report27 V25).
+    #[test]
+    fn a_closing_session_clears_the_counts_of_every_owner_it_removed() {
+        let reg = RendezvousRegistry::with_capacity(64);
+        let device = [0xD1u8; NODE_ID_LEN];
+        let identity = [0x1Du8; NODE_ID_LEN];
+        let other_identity = [0x2Du8; NODE_ID_LEN];
+        let to_device = |x: u8| RendezvousSubscriber {
+            peer_node_id: device,
+            receiver_x25519_pk: [x; X25519_PK_LEN],
+            registered_at_unix: 1,
+        };
+
+        // Two identities, both delivering to the same device — one session,
+        // several owners, which is the ordinary sovereign-identity shape.
+        reg.register_as(identity, [0xC0u8; AUTH_COOKIE_LEN], to_device(1))
+            .expect("register");
+        reg.register_as(other_identity, [0xC1u8; AUTH_COOKIE_LEN], to_device(2))
+            .expect("register");
+        // And one owned BY the device, pointing somewhere else entirely.
+        reg.register_as(
+            device,
+            [0xC2u8; AUTH_COOKIE_LEN],
+            RendezvousSubscriber {
+                peer_node_id: [0xE1u8; NODE_ID_LEN],
+                receiver_x25519_pk: [3; X25519_PK_LEN],
+                registered_at_unix: 1,
+            },
+        )
+        .expect("register");
+
+        let dropped = reg.drop_subscriber(&device);
+        assert_eq!(dropped, 2, "premise: the two entries bound for the device");
+
+        let g = reg.inner.lock().unwrap_or_else(|p| p.into_inner());
+        assert_eq!(
+            g.peer_count(&identity),
+            0,
+            "an identity still counts a registration that was removed — its \
+             fairness cap is consumed for the life of the process and its next \
+             reconnect evicts its own live slots"
+        );
+        assert_eq!(g.peer_count(&other_identity), 0, "and the second owner too");
+        assert_eq!(
+            g.peer_count(&device),
+            1,
+            "the departing device OWNED a registration pointing elsewhere, \
+             which survives — forgetting its count is the cap not applying"
+        );
+        assert_eq!(g.cookies.len(), 1, "exactly the surviving registration");
+        // The invariant the map exists to keep, checked directly.
+        for (owner, _) in g.cookies.keys() {
+            assert!(g.peer_count(owner) > 0, "a live cookie with a zero count");
+        }
+        assert_eq!(
+            g.per_peer.values().sum::<usize>(),
+            g.cookies.len(),
+            "the counts and the table disagree"
+        );
+    }
+
     #[test]
     fn a_registration_can_be_keyed_by_the_address_it_answers_for() {
         let reg = RendezvousRegistry::with_capacity(64);
