@@ -3744,6 +3744,38 @@ pub struct GlobalConfig {
     /// it being BitTorrent's group, which is the least remarkable thing a host
     /// can be doing, but not nothing. `meeting_points = ["dht_bit_torrent"]`
     /// is the setting for somebody who minds.
+    /// WHEN this node offers itself at the meeting points, as opposed to
+    /// whether ([`Self::bootstrap`]).
+    ///
+    /// A node that announces around the clock is one whose address can be
+    /// collected once and blocked forever — and for a seed that matters more
+    /// than for anyone else, because the production seed list ships EMPTY: a
+    /// client learns a seed at a meeting point or not at all. An address that
+    /// is not announced right now is therefore not merely quieter, it is
+    /// unobtainable.
+    ///
+    /// Announcing is all this governs. A seed outside its window still
+    /// accepts, still relays, and still serves every node that already knows
+    /// it.
+    #[serde(default)]
+    pub announce_schedule: crate::announce_schedule::AnnounceSchedule,
+
+    /// Addresses this node reached before, kept so a restart does not start
+    /// from nothing.
+    ///
+    /// NOT vouched-for peers: no key, no nonce, nothing claimed about who is
+    /// there. They are places to look, exactly as a rendezvous address is, and
+    /// they go through the same dial — the identity is learned at the
+    /// handshake or the address is dropped. That is why this is a list of
+    /// strings and not `[[bootstrap_peers]]`, which requires a public key the
+    /// discovering node never had.
+    ///
+    /// Written by whoever runs the node (the app keeps a bounded set in its
+    /// container), because the config a node boots from is composed fresh and
+    /// the runtime does not write it back.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub remembered_peers: Vec<String>,
+
     #[serde(default)]
     pub meeting_points: MeetingPoints,
     /// When this node uses those points — see [`MeetingPolicy`].
@@ -4327,6 +4359,8 @@ impl Default for GlobalConfig {
     fn default() -> Self {
         Self {
             runtime_flavor: RuntimeFlavor::MultiThread,
+            announce_schedule: crate::announce_schedule::AnnounceSchedule::Always,
+            remembered_peers: Vec::new(),
             worker_threads: None,
             max_blocking_threads: None,
             thread_keep_alive_ms: None,

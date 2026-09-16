@@ -91,6 +91,12 @@ pub enum RuntimeService {
     /// to be findable then, not only at the moment somebody started a daemon.
     /// No-op unless `global.local_discovery` is on.
     LanDiscovery,
+    /// Bootstrap layer 6b: the addresses this node reached before.
+    ///
+    /// Places to look, not vouched-for peers — the same road a rendezvous
+    /// address takes. No-op unless `global.remembered_peers` holds any, which
+    /// is how a node that has never met anybody skips it entirely.
+    RememberedPeers,
     /// Bootstrap layer 7: peers found through BitTorrent's Mainline DHT.
     ///
     /// Three states rather than on/off — see `global.mainline_discovery`. In
@@ -227,6 +233,7 @@ impl RuntimeService {
         Self::SrflxProbe,
         Self::BootstrapWatchdog,
         Self::LanDiscovery,
+        Self::RememberedPeers,
         Self::MainlineDiscovery,
         Self::NostrDiscovery,
         Self::SovereignIdentityRepublish,
@@ -266,7 +273,7 @@ mod all_covers_every_service {
 
     /// How many services there are. Bump it when you add one, and give the new
     /// variant the next ordinal below.
-    const SERVICE_COUNT: usize = 50;
+    const SERVICE_COUNT: usize = 51;
 
     /// A distinct number and a name per variant.
     ///
@@ -299,6 +306,8 @@ mod all_covers_every_service {
             RuntimeService::SrflxProbe => (19, "SrflxProbe"),
             RuntimeService::BootstrapWatchdog => (20, "BootstrapWatchdog"),
             RuntimeService::LanDiscovery => (21, "LanDiscovery"),
+            // Appended: the numbers are identity, not order.
+            RuntimeService::RememberedPeers => (50, "RememberedPeers"),
             RuntimeService::MainlineDiscovery => (22, "MainlineDiscovery"),
             // Appended rather than slotted next to 22: the ordinals are a
             // fingerprint the guard compares against, and renumbering every
@@ -358,6 +367,7 @@ mod all_covers_every_service {
             RuntimeService::SrflxProbe,
             RuntimeService::BootstrapWatchdog,
             RuntimeService::LanDiscovery,
+            RuntimeService::RememberedPeers,
             RuntimeService::MainlineDiscovery,
             RuntimeService::NostrDiscovery,
             RuntimeService::SovereignIdentityRepublish,
