@@ -1926,39 +1926,80 @@ impl TieredStore {
         //    Evict oldest entries until the new value fits. Cold first
         //    (cheapest data — already demoted), then hot (demote-and-
         //    evict). Each eviction strictly decreases total_bytes.
+        //    The incumbent at `key` is REFUNDED rather than evicted. It is
+        //    about to be replaced, so its bytes are room this put already has
+        //    — counting them as occupied made the loop free more than it
+        //    needed, and the entry it would have taken first is the incumbent
+        //    itself, whose loss is invisible to a caller that then hears
+        //    `false` (report27 V05).
+        let incumbent_bytes = self.value_bytes(&key);
         if let Some(cap) = self.max_bytes {
-            while self.total_bytes.saturating_add(new_bytes) > cap {
+            while self
+                .total_bytes
+                .saturating_sub(incumbent_bytes)
+                .saturating_add(new_bytes)
+                > cap
+            {
                 if let Some((evicted_key, evicted_val)) = self.cold.evict_oldest() {
                     self.account_eviction(&evicted_key, evicted_val.len() as u64);
                     continue;
                 }
+                // `None` from the cold tier is TWO answers, and they call for
+                // opposite responses. "Nothing left" means move on to hot.
+                // "I hold entries and could not part with one" — a RocksDB
+                // write error, logged and flattened to `None` — means STOP:
+                // continuing demotes live hot records to make room a broken
+                // cold tier would not free, and the put very likely refuses
+                // afterwards anyway, having destroyed them for nothing
+                // (report27 V05). The tier can be asked which it was.
+                if !self.cold.is_empty() {
+                    break;
+                }
                 // Cold drained — fall back to demoting hot's oldest and
                 // immediately dropping it (instead of into cold) so the
-                // bytes actually free.
-                if let Some(&(old_ts, old_key)) = self.hot_order.keys().next() {
+                // bytes actually free. Never the incumbent: it is refunded
+                // above, so taking it here would free bytes this put has
+                // already been given and lose the value a refusal claims to
+                // have left alone.
+                let oldest = self
+                    .hot_order
+                    .keys()
+                    .find(|(_, hot_key)| *hot_key != key)
+                    .copied();
+                if let Some((old_ts, old_key)) = oldest {
                     self.hot_order.remove(&(old_ts, old_key));
                     if let Some((old_val, _, _)) = self.hot.remove(&old_key) {
                         self.account_eviction(&old_key, old_val.len() as u64);
                     }
                     continue;
                 }
-                // Nothing could be freed. TWO different situations reach
-                // here, and the old comment named only the harmless one:
-                // both tiers really are empty (the cap is smaller than
-                // `new_bytes`, already refused above), OR the cold tier
-                // REFUSED to evict — `evict_oldest` answers `None` for a
-                // write or read error just as it does for "nothing left".
-                // The second one used to fall through and insert anyway,
-                // putting the store past a cap its operator had set
+                // Both tiers really are empty apart from the incumbent. The
+                // cap is smaller than `new_bytes`, which step 1 already
+                // refused, so this is unreachable in practice and a `break`
+                // rather than an insert: the old code fell through and stored
+                // anyway, putting the store past a cap its operator had set
                 // (report24 V24-DHT-02).
                 break;
             }
         }
 
-        // 3. And if the room is still not there, refuse — with the tier
-        //    untouched, because nothing has been removed yet.
+        // 3. And if the room is still not there, refuse.
+        //
+        //    What this leaves behind is NOT "the tier exactly as it was", and
+        //    the comment here used to say it was. The loop above evicts as it
+        //    goes, so a refusal that follows a partial sweep has already
+        //    destroyed whatever it managed to free — that much is inherent in
+        //    freeing before inserting, and the alternative (freeing after) is
+        //    the destructive order report16 V16-L2 removed. What IS true, and
+        //    is the part a caller can rely on, is that the value at `key` is
+        //    still there: it is refunded rather than evicted, and neither tier
+        //    takes it (report27 V05).
         if let Some(cap) = self.max_bytes
-            && self.total_bytes.saturating_add(new_bytes) > cap
+            && self
+                .total_bytes
+                .saturating_sub(incumbent_bytes)
+                .saturating_add(new_bytes)
+                > cap
         {
             return false;
         }
@@ -3176,56 +3217,6 @@ mod tests {
     /// operator had set (report24 V24-DHT-02).
     #[test]
     fn a_failed_eviction_refuses_the_put_and_keeps_what_was_there() {
-        #[derive(Debug, Default)]
-        struct Inner {
-            entries: HashMap<[u8; 32], Vec<u8>>,
-            refuse_eviction: bool,
-        }
-        #[derive(Debug, Clone, Default)]
-        struct StuckCold(std::sync::Arc<std::sync::Mutex<Inner>>);
-        impl StuckCold {
-            fn disk(&self) -> std::sync::MutexGuard<'_, Inner> {
-                self.0.lock().unwrap_or_else(|p| p.into_inner())
-            }
-        }
-        impl ColdBackend for StuckCold {
-            fn get(&self, key: &[u8; 32]) -> Option<Vec<u8>> {
-                self.disk().entries.get(key).cloned()
-            }
-            fn put(&mut self, key: [u8; 32], value: Vec<u8>) -> ColdPut {
-                self.disk().entries.insert(key, value);
-                ColdPut::Stored(None)
-            }
-            fn remove(&mut self, key: &[u8; 32]) {
-                self.disk().entries.remove(key);
-            }
-            fn contains(&self, key: &[u8; 32]) -> bool {
-                self.disk().entries.contains_key(key)
-            }
-            fn len(&self) -> usize {
-                self.disk().entries.len()
-            }
-            fn evict_oldest(&mut self) -> Option<([u8; 32], Vec<u8>)> {
-                // The failure this is about: the disk said no.
-                if self.disk().refuse_eviction {
-                    return None;
-                }
-                let key = *self.disk().entries.keys().next()?;
-                let value = self.disk().entries.remove(&key)?;
-                Some((key, value))
-            }
-            fn iter_entries(&self) -> Vec<([u8; 32], Vec<u8>)> {
-                self.disk()
-                    .entries
-                    .iter()
-                    .map(|(k, v)| (*k, v.clone()))
-                    .collect()
-            }
-            fn retain(&mut self, _f: &dyn Fn(&[u8; 32], &[u8]) -> bool) -> Vec<([u8; 32], u64)> {
-                Vec::new()
-            }
-        }
-
         let disk = StuckCold::default();
         let mut store = TieredStore::with_cold(1, Box::new(disk.clone())).with_max_bytes(100);
 
@@ -3259,6 +3250,138 @@ mod tests {
             store.contains(&old),
             "the incumbent was dropped for a value that was never stored"
         );
+    }
+
+    #[derive(Debug, Default)]
+    struct Inner {
+        entries: HashMap<[u8; 32], Vec<u8>>,
+        refuse_eviction: bool,
+    }
+    #[derive(Debug, Clone, Default)]
+    struct StuckCold(std::sync::Arc<std::sync::Mutex<Inner>>);
+    impl StuckCold {
+        fn disk(&self) -> std::sync::MutexGuard<'_, Inner> {
+            self.0.lock().unwrap_or_else(|p| p.into_inner())
+        }
+    }
+    impl ColdBackend for StuckCold {
+        fn get(&self, key: &[u8; 32]) -> Option<Vec<u8>> {
+            self.disk().entries.get(key).cloned()
+        }
+        fn put(&mut self, key: [u8; 32], value: Vec<u8>) -> ColdPut {
+            self.disk().entries.insert(key, value);
+            ColdPut::Stored(None)
+        }
+        fn remove(&mut self, key: &[u8; 32]) {
+            self.disk().entries.remove(key);
+        }
+        fn contains(&self, key: &[u8; 32]) -> bool {
+            self.disk().entries.contains_key(key)
+        }
+        fn len(&self) -> usize {
+            self.disk().entries.len()
+        }
+        fn evict_oldest(&mut self) -> Option<([u8; 32], Vec<u8>)> {
+            // The failure this is about: the disk said no.
+            if self.disk().refuse_eviction {
+                return None;
+            }
+            let key = *self.disk().entries.keys().next()?;
+            let value = self.disk().entries.remove(&key)?;
+            Some((key, value))
+        }
+        fn iter_entries(&self) -> Vec<([u8; 32], Vec<u8>)> {
+            self.disk()
+                .entries
+                .iter()
+                .map(|(k, v)| (*k, v.clone()))
+                .collect()
+        }
+        fn retain(&mut self, _f: &dyn Fn(&[u8; 32], &[u8]) -> bool) -> Vec<([u8; 32], u64)> {
+            Vec::new()
+        }
+    }
+
+    /// A broken cold tier must not be paid for out of the hot one.
+    ///
+    /// `evict_oldest` flattens a backend write error into `None`, and the loop
+    /// read that as "cold is drained" and moved on to demoting hot entries —
+    /// destroying LIVE records to free room a broken disk would not free. The
+    /// put then either squeezed in over records it should not have taken, or
+    /// refused anyway, having destroyed them for nothing (report27 V05).
+    ///
+    /// The existing `a_failed_eviction_refuses_the_put_and_keeps_what_was_
+    /// there` could not see this: its hot tier held a ZERO-byte entry, so the
+    /// fallback freed nothing and the totals matched either way.
+    #[test]
+    fn a_cold_tier_that_cannot_evict_does_not_cost_the_hot_one() {
+        let disk = StuckCold::default();
+        // One hot slot, so the first put is demoted by the second.
+        let mut store = TieredStore::with_cold(1, Box::new(disk.clone())).with_max_bytes(100);
+
+        let demoted = [1u8; 32];
+        let live = [2u8; 32];
+        assert!(store.put_with_origin(demoted, vec![0u8; 50], ORIGIN_INTERNAL));
+        assert!(store.put_with_origin(live, vec![0u8; 30], ORIGIN_INTERNAL));
+        assert!(
+            disk.disk().entries.contains_key(&demoted),
+            "premise: the first value is in the cold tier"
+        );
+        assert_eq!(store.total_bytes(), 80, "premise: 50 cold + 30 hot");
+
+        disk.disk().refuse_eviction = true;
+        let accepted = store.put_with_origin([3u8; 32], vec![0u8; 40], ORIGIN_INTERNAL);
+
+        assert!(
+            !accepted,
+            "the put made room the broken cold tier never freed"
+        );
+        assert!(
+            store.contains(&live),
+            "a live hot record was destroyed to compensate for a cold tier \
+             that could not evict"
+        );
+        assert!(store.contains(&demoted), "the cold value went too");
+        assert_eq!(
+            store.total_bytes(),
+            80,
+            "a refusal cost the tier {} bytes",
+            80u64.saturating_sub(store.total_bytes())
+        );
+    }
+
+    /// A refused put leaves the value it was replacing where it was.
+    ///
+    /// The incumbent's bytes were counted as occupied while deciding how much
+    /// to free, so the loop set out to free more than the put needed — and the
+    /// first entry it could take was the incumbent itself. The caller then
+    /// heard `false`, which says nothing happened, with its previous value
+    /// gone (report27 V05).
+    #[test]
+    fn a_refused_replacement_keeps_the_value_it_would_have_replaced() {
+        let disk = StuckCold::default();
+        let mut store = TieredStore::with_cold(1, Box::new(disk.clone())).with_max_bytes(100);
+
+        let other = [1u8; 32];
+        let key = [2u8; 32];
+        assert!(store.put_with_origin(other, vec![0u8; 50], ORIGIN_INTERNAL));
+        assert!(store.put_with_origin(key, vec![0u8; 40], ORIGIN_INTERNAL));
+        assert_eq!(store.total_bytes(), 90, "premise: 50 cold + 40 hot");
+
+        disk.disk().refuse_eviction = true;
+        // Too big even with its own bytes refunded (90 - 40 + 70 = 120), and
+        // the only tier that could free more has stopped answering.
+        let accepted = store.put_with_origin(key, vec![0u8; 70], ORIGIN_INTERNAL);
+
+        assert!(!accepted, "premise: this put has to be refused");
+        assert_eq!(
+            store.get(&key).map(|v| v.len()),
+            Some(40),
+            "the value at the key was destroyed by the put that refused to \
+             replace it — the caller was told `false`, which reads as \
+             `nothing happened`"
+        );
+        assert!(store.contains(&other), "the other value went too");
     }
 
     #[test]
