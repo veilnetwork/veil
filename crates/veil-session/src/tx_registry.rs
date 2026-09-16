@@ -453,6 +453,35 @@ impl SessionTxRegistry {
         self.send_to_result(peer_id, priority, bytes).is_ok()
     }
 
+    /// Send only while `owner` still holds this peer's slot.
+    ///
+    /// A `peer_id` is a SLOT, and a reconnect gives it to a new session. A
+    /// detached task that addresses by peer id alone therefore keeps writing
+    /// after the session it belongs to is gone — into its successor, which has
+    /// its own task doing the same thing. The owner token is what tells the
+    /// two apart, and it is the same one `unregister_owned` already uses
+    /// (report27 V19).
+    ///
+    /// `Missing` covers both "no slot" and "the slot is somebody else's": to a
+    /// caller holding a token that no longer owns anything, the two are the
+    /// same fact.
+    pub fn send_to_owned_result(
+        &self,
+        peer_id: &NodeIdBytes,
+        owner: &SessionTxOwner,
+        priority: u8,
+        bytes: Vec<u8>,
+    ) -> Result<(), SendToError> {
+        if self
+            .senders
+            .get(peer_id)
+            .is_none_or(|entry| entry.owner.as_ref() != Some(owner))
+        {
+            return Err(SendToError::Missing);
+        }
+        self.send_to_result(peer_id, priority, bytes)
+    }
+
     /// Detailed sibling of [`Self::send_to`] for diagnostics-sensitive callers.
     pub fn send_to_result(
         &self,
@@ -685,6 +714,72 @@ impl SessionTxRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A send from a session that no longer owns the slot goes nowhere.
+    ///
+    /// A `peer_id` is a slot, and a reconnect hands it to the next session.
+    /// The gateway keepalive addressed it by slot alone, so after a fast
+    /// reconnect the OLD loop kept writing into the successor — which had a
+    /// keepalive of its own (report27 V19).
+    #[tokio::test]
+    async fn a_send_tied_to_a_session_stops_when_the_slot_changes_hands() {
+        let mut reg = SessionTxRegistry::new();
+        let peer = [9u8; 32];
+        let old_session: SessionTxOwner = [0xA1u8; 32];
+        let new_session: SessionTxOwner = [0xB2u8; 32];
+
+        let mut old_rx = reg.register_owned(peer, old_session);
+        assert!(
+            reg.send_to_owned_result(&peer, &old_session, INTERACTIVE, b"tick".to_vec())
+                .is_ok(),
+            "premise: the owner can send while it holds the slot"
+        );
+        assert!(old_rx.try_recv().is_ok());
+
+        // The reconnect: a new session takes the same slot.
+        let mut new_rx = reg.register_owned(peer, new_session);
+
+        assert_eq!(
+            reg.send_to_owned_result(&peer, &old_session, INTERACTIVE, b"tick".to_vec()),
+            Err(SendToError::Missing),
+            "the retired session is still addressing the slot, and what it \
+             writes now reaches the session that replaced it"
+        );
+        assert!(
+            new_rx.try_recv().is_err(),
+            "a frame from the retired session arrived in the successor's queue"
+        );
+        // Vacuity: the successor's own sends still work.
+        assert!(
+            reg.send_to_owned_result(&peer, &new_session, INTERACTIVE, b"tick".to_vec())
+                .is_ok()
+        );
+        assert!(new_rx.try_recv().is_ok());
+    }
+
+    /// A full queue is load, and the caller can tell it from a dead session.
+    ///
+    /// `send_to` answered `false` for both, so the keepalive loop — whose only
+    /// exit condition was that `false` — ended on a burst of traffic and let
+    /// the lease of a perfectly live session lapse (report27 V19).
+    #[tokio::test]
+    async fn a_full_queue_is_distinguishable_from_a_gone_session() {
+        let mut reg = SessionTxRegistry::with_capacity(1);
+        let peer = [3u8; 32];
+        let owner: SessionTxOwner = [0xC3u8; 32];
+        let _rx = reg.register_owned(peer, owner);
+
+        assert!(
+            reg.send_to_owned_result(&peer, &owner, INTERACTIVE, b"one".to_vec())
+                .is_ok()
+        );
+        // Nothing drains, so the next one has nowhere to go.
+        assert_eq!(
+            reg.send_to_owned_result(&peer, &owner, INTERACTIVE, b"two".to_vec()),
+            Err(SendToError::Full),
+            "a full queue must not look like a session that ended",
+        );
+    }
 
     #[tokio::test]
     async fn register_and_send() {
