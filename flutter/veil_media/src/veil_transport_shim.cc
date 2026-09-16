@@ -57,7 +57,16 @@ VeilTransportShim::VeilTransportShim(uint64_t veil_chan,
                                      webrtc::TaskQueueBase* network_queue)
     : veil_chan_(veil_chan), call_(call), network_queue_(network_queue) {}
 
-VeilTransportShim::~VeilTransportShim() { Stop(); }
+VeilTransportShim::~VeilTransportShim() {
+  Stop();
+  // AFTER Stop, and this is the part Stop cannot do: Stop gives up after a
+  // second and returns, so a task posted to the network queue may still be
+  // waiting to run. Clearing the flag under the lock makes that task harmless
+  // — it either already finished (the destructor waited for it here) or it
+  // will find `alive == false` and touch nothing (report27 V23).
+  std::lock_guard<std::mutex> lock(task_guard_->mu);
+  task_guard_->alive = false;
+}
 
 void VeilTransportShim::MarkVideoFrame(std::span<const uint8_t> packet,
                                        AtomicVideoCadence* cadence) {
@@ -213,7 +222,11 @@ void VeilTransportShim::OnVeilDatagram(void* ctx, const uint8_t* ptr,
   self->inbound_pending_packets_.fetch_add(1, std::memory_order_release);
   self->inbound_pending_bytes_.fetch_add(owned.size(), std::memory_order_release);
   self->network_queue_->PostTask(
-      [self, buf = std::move(owned)]() mutable {
+      [self, guard = self->task_guard_, buf = std::move(owned)]() mutable {
+        // The guard outlives the shim; the shim does not outlive the guard's
+        // flag. Everything below touches `self`, so all of it is inside.
+        std::lock_guard<std::mutex> lock(guard->mu);
+        if (!guard->alive) return;
         if (self->started_.load(std::memory_order_acquire)) {
           self->DeliverOnNetworkThread(std::span<const uint8_t>(buf));
         }

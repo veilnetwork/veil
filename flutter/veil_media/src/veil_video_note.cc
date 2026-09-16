@@ -950,24 +950,43 @@ void vnote_decode_one(VeilVnotePlayer* p, const VnoteFrameRef& f) {
   // malformed frame may never reach the sink at all, so the later guard cannot
   // be the only one (report24 MEDIA-3).
   //
-  // Only a keyframe carries a size, and only a keyframe can change one.
-  if (f.key) {
-    const VeilVp8Size declared =
-        veil_vp8_keyframe_size(p->bytes.data() + f.off, f.len);
+  // ASKED OF THE BYTES, not of the index.
+  //
+  // `f.key` comes from the VNOTE1 index, which is the sender's own claim, and
+  // the decoder does not consult it: libvpx reads the frame tag out of the
+  // payload and sizes its reference buffers from that frame's own dimensions.
+  // Gating this check on the index therefore let a real VP8 keyframe carrying
+  // 16383 square through by labelling it a delta frame — about 1.5 GiB of
+  // allocation requests from a clip whose sender chose the number (report27
+  // V09, the half report24 MEDIA-3 left open).
+  //
+  // `ok` is true only for a payload whose frame tag says keyframe AND whose
+  // start code is intact, so an interframe simply does not answer here — and
+  // an interframe declares no size, which is the case this does not need to
+  // cover.
+  const VeilVp8Size declared =
+      veil_vp8_keyframe_size(p->bytes.data() + f.off, f.len);
+  if (declared.ok &&
+      (declared.w > kMaxVnoteSide || declared.h > kMaxVnoteSide)) {
     // Refusing the FRAME, not the clip: the player already treats "nothing
-    // decoded" as an ordinary outcome, and a frame the index calls a keyframe
-    // while its bytes say otherwise is one no reference chain can start from.
-    if (!declared.ok || declared.w > kMaxVnoteSide ||
-        declared.h > kMaxVnoteSide) {
-      return;
-    }
+    // decoded" as an ordinary outcome.
+    return;
+  }
+  // A frame the index calls a keyframe while its bytes say otherwise is one no
+  // reference chain can start from.
+  if (f.key && !declared.ok) {
+    return;
   }
   webrtc::EncodedImage img;
   img.SetEncodedData(
       webrtc::EncodedImageBuffer::Create(p->bytes.data() + f.off, f.len));
   img.SetRtpTimestamp(f.ts_ms * 90);
-  img.SetFrameType(f.key ? webrtc::VideoFrameType::kVideoFrameKey
-                         : webrtc::VideoFrameType::kVideoFrameDelta);
+  // The payload decides this too, where it says: a frame whose tag is a
+  // keyframe IS one, whatever the index called it, and telling WebRTC
+  // otherwise only desynchronises its own bookkeeping from libvpx's.
+  img.SetFrameType((f.key || declared.ok)
+                       ? webrtc::VideoFrameType::kVideoFrameKey
+                       : webrtc::VideoFrameType::kVideoFrameDelta);
   img._encodedWidth = (uint32_t)p->width;
   img._encodedHeight = (uint32_t)p->height;
   p->dec->Decode(img, /*render_time_ms=*/f.ts_ms);
