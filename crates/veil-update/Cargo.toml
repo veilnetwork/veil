@@ -27,5 +27,10 @@ subtle = "2"
 thiserror = "2.0"
 tokio = { version = "1.42", features = ["fs", "io-util", "rt", "time", "macros"] }
 
+# Unix only, and for one flag: `O_NOFOLLOW` on the install lock, whose name has
+# to be predictable and whose directory may be writable by a less-trusted user.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [lints]
 workspace = true
