@@ -1,5 +1,6 @@
 mod access;
 pub mod adaptive;
+pub mod announce_schedule;
 mod error;
 mod file_format;
 mod format;

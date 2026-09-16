@@ -69,6 +69,7 @@ impl NodeRuntime {
             veil_mainline::rendezvous::Network::Production
         };
         let announce_self = config.global.bootstrap;
+        let announce_schedule = config.global.announce_schedule;
         let policy = config.global.meeting_policy;
         let want_peers = config.global.meeting_min_peers;
         let live_sessions = Arc::clone(&self.live_sessions);
@@ -172,7 +173,18 @@ impl NodeRuntime {
                         ),
                     );
 
-                    if announce_self && let Some(ref me) = me {
+                    // ASKED EVERY PASS, like WHERE and WHEN above. A window
+                    // decided at spawn would hold this node open all night
+                    // because it happened to start inside its shift.
+                    let announcing = announce_self
+                        && announce_schedule.announcing_at(
+                            std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .map(|d| d.as_secs())
+                                .unwrap_or(0),
+                            &access.local_node_id,
+                        );
+                    if announcing && let Some(ref me) = me {
                         let accepted = announce(&net, info_hash, me.port, &found.closest).await;
                         logger.info(
                             "mainline.announced",
@@ -325,6 +337,7 @@ impl NodeRuntime {
             veil_nostr::rendezvous::Network::Production
         };
         let announce_self = config.global.bootstrap;
+        let announce_schedule = config.global.announce_schedule;
         let policy = config.global.meeting_policy;
         let want_peers = config.global.meeting_min_peers;
         let live_sessions = Arc::clone(&self.live_sessions);
@@ -384,7 +397,15 @@ impl NodeRuntime {
                     })
                     .collect();
 
-                if announce_self && let Some((ref host, port)) = my_address {
+                let announcing = announce_self
+                    && announce_schedule.announcing_at(
+                        std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_secs())
+                            .unwrap_or(0),
+                        &access.local_node_id,
+                    );
+                if announcing && let Some((ref host, port)) = my_address {
                     // Under THIS epoch's label only. Re-posting under the
                     // previous one would leave this node's address at a
                     // rendezvous it has already left.
@@ -594,6 +615,110 @@ impl NodeRuntime {
     /// the laptop. It runs for the life of the node, capped at
     /// [`MAX_LAN_PEERS`] contributions so a talkative neighbour cannot fill
     /// the peer table by itself.
+    /// Bootstrap layer 6b: the addresses this node reached before.
+    ///
+    /// A node that finds its first peer at a meeting point forgets it the
+    /// moment it stops: the peer table lives in memory and the config a node
+    /// boots from is composed fresh, so nothing carries a met address across a
+    /// restart. Every launch therefore paid the whole discovery cost again —
+    /// reported from the field as "узлы, которые получаем через Nostr /
+    /// mainline DHT не сохраняются между перезапусками, клиент их заново
+    /// набирает".
+    ///
+    /// These are NOT vouched-for peers. No key, no nonce, nothing claimed
+    /// about who is there — they are places to look, exactly as a rendezvous
+    /// address is, and they take the same road: dial, and let the handshake
+    /// say who answered or drop the row. That is why they are plain strings
+    /// and not `[[bootstrap_peers]]`, which demands a public key the
+    /// discovering node never had.
+    ///
+    /// Filtered exactly as a rendezvous find is, and for the same reasons: a
+    /// remembered address that has since become this node's own, or one it is
+    /// already in session with, or one whose side of the pair holds the
+    /// outbound, must not be dialled twice over.
+    pub fn spawn_remembered_peers_task(&mut self, config: &veil_cfg::Config) {
+        let remembered = config.global.remembered_peers.clone();
+        if remembered.is_empty() {
+            return;
+        }
+        let policy = config.global.meeting_policy;
+        let want_peers = config.global.meeting_min_peers;
+        let live_sessions = Arc::clone(&self.live_sessions);
+        let announce_config = config.clone();
+        let my_pubkey = self.identity.local_identity.public_key.clone();
+        let my_nonce = self.identity.local_identity.nonce.clone();
+        let logger = self.logger.clone();
+        let access = self.access();
+        let state = Arc::clone(&self.state);
+        let Some(shutdown_tx) = self.shutdown_tx.clone() else {
+            return;
+        };
+        let handle = supervised_spawn(Arc::clone(&self.logger), "remembered_peers", async move {
+            // Straight away, and then on the rendezvous cadence: the point is
+            // to be in session BEFORE the first meeting-point pass, so a
+            // restart costs a dial rather than a discovery round.
+            let mut ticker = tokio::time::interval(RENDEZVOUS_INTERVAL);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                ticker.tick().await;
+                let live_peers = lock!(live_sessions).len();
+                // `announce_self: false` — remembering costs nothing to anyone
+                // else and offers nothing, so the fallback policy asks only
+                // whether this node still needs peers.
+                if !policy.permits_looking(live_peers, want_peers, false) {
+                    continue;
+                }
+                let (_, my_address) =
+                    current_announcement(&state, &announce_config, &my_pubkey, &my_nonce);
+                let mut taken = 0usize;
+                let mut tried = 0usize;
+                for transport in nearest_first(&MeetingProbe::fresh(), remembered.clone()) {
+                    if taken >= MAX_RENDEZVOUS_PEERS || tried >= MAX_RENDEZVOUS_ATTEMPTS {
+                        break;
+                    }
+                    let transport = transport.as_str();
+                    if rendezvous_address_is_self(my_address.as_ref(), transport) {
+                        continue;
+                    }
+                    let known: Vec<PeerConfigEntry> =
+                        lock_state(&state).peers.values().cloned().collect();
+                    let live =
+                        addresses_we_already_hold(&live_sessions, &access.discovered_peers_cache);
+                    if !rendezvous_address_is_new(&known, &live, transport) {
+                        continue;
+                    }
+                    if !we_should_place_the_call(
+                        &access.local_node_id,
+                        &access.discovered_peers_cache,
+                        transport,
+                    ) {
+                        continue;
+                    }
+                    tried += 1;
+                    match dial_and_learn(&access, &state, transport, &shutdown_tx).await {
+                        Ok(node) => {
+                            taken += 1;
+                            logger.info(
+                                "remembered.met",
+                                format!("met {node} at {transport}, remembered from before"),
+                            );
+                        }
+                        Err(e) => logger
+                            .debug("remembered.unreachable", format!("{transport}: {e}")),
+                    }
+                }
+                logger.debug(
+                    "remembered.pass",
+                    format!(
+                        "{} remembered address(es), {tried} tried, {taken} met",
+                        remembered.len()
+                    ),
+                );
+            }
+        });
+        lock_tasks(&self.tasks).sessions.push(handle);
+    }
+
     pub fn spawn_lan_discovery_task(&mut self, config: &veil_cfg::Config) {
         if !config
             .global
@@ -907,6 +1032,27 @@ mod tests {
             span("pub fn spawn_lan_discovery_task").contains("if announce_self"),
             "the LAN announce timer is not gated on the opt-in"
         );
+
+        // THE SCHEDULE REACHES BOTH PUBLIC INDEXES. A seed that keeps
+        // announcing at one of them while resting at the other is worse than
+        // one that never rested: the rest looks like coverage and is not, and
+        // the address is collectable at the index nobody remembered to gate.
+        // The LAN is deliberately not on this list — a schedule for a segment
+        // this machine is plugged into protects nobody.
+        for task in [
+            "pub fn spawn_mainline_discovery_task",
+            "pub fn spawn_nostr_discovery_task",
+        ] {
+            let body = span(task);
+            assert!(
+                body.contains("announce_schedule.announcing_at("),
+                "{task} publishes without consulting `global.announce_schedule`"
+            );
+            assert!(
+                !body.contains("if announce_self && let"),
+                "{task} still has the ungated announce beside the scheduled one"
+            );
+        }
     }
 
     /// report21 V20-M4: having nothing to announce does not switch the layer

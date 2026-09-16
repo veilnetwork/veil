@@ -273,6 +273,7 @@ impl NodeRuntime {
             S::SrflxProbe => self.spawn_srflx_probe_task(),
             S::BootstrapWatchdog => self.spawn_bootstrap_watchdog_task(config),
             S::LanDiscovery => self.spawn_lan_discovery_task(config),
+            S::RememberedPeers => self.spawn_remembered_peers_task(config),
             S::MainlineDiscovery => self.spawn_mainline_discovery_task(config),
             S::NostrDiscovery => self.spawn_nostr_discovery_task(config),
             S::SovereignIdentityRepublish => self.spawn_sovereign_identity_republish_task(),
