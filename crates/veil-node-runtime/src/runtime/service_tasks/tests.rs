@@ -462,6 +462,112 @@ fn exactly_one_side_of_a_pair_places_the_call() {
 }
 
 #[test]
+fn a_node_nobody_can_dial_keeps_every_outbound() {
+    // MEASURED ON THE PRODUCTION NETWORK, 16.09.2026: a phone held three of
+    // the four seeds and never the fourth, and the missing one was
+    // `1c3ec09b…` — the SMALLEST of the four ids, which is the one the most
+    // clients sort after.
+    //
+    // The tiebreak cancels our dial and waits for the far side to make the
+    // one it cancelled. At a public index this node only READS, that dial can
+    // never come: whoever we found there holds no row for us and has never
+    // heard of us. `outbound_ignores_directional` has said exactly this about
+    // `PeerSource::Rendezvous` since 0.11.32 — but the rendezvous pass itself
+    // went on applying the raw comparison, and it is the half that decides
+    // whether the row is created again at all once a session ends. So the
+    // first meeting worked and the seed was lost on the first reconnect,
+    // which is why it looked like a network that had worked yesterday.
+    use veil_bootstrap::DiscoveredPeerCache;
+    use veil_cfg::{NodeId, SignatureAlgorithm};
+
+    let key = "fyU1fAlyHVNMat6NZBJ+KBU/aeJhCP+OBsomlgJ1Cjo=";
+    let theirs = NodeId::from_public_key(SignatureAlgorithm::Ed25519, key).expect("valid");
+    let addr = "obfs4-tcp://198.51.100.7:5556";
+
+    let mut c = DiscoveredPeerCache::in_memory();
+    c.upsert(
+        veil_cfg::BootstrapPeer {
+            transport: addr.to_owned(),
+            public_key: key.to_owned(),
+            nonce: "AOCZRA==".to_owned(),
+            algo: SignatureAlgorithm::Ed25519,
+            tls_cert: None,
+            tls_ca_cert: None,
+        },
+        1_700_000_000,
+    );
+    let cache = Arc::new(std::sync::Mutex::new(c));
+
+    let mut larger = *theirs.as_bytes();
+    larger[0] = larger[0].wrapping_add(1);
+    let mut smaller = *theirs.as_bytes();
+    smaller[0] = smaller[0].wrapping_sub(1);
+
+    // A node that announces NOTHING — every app, every phone, anything that is
+    // not a bootstrap node — cannot be called back, so it dials whatever the
+    // ids say.
+    assert!(
+        rendezvous_dial_is_ours(false, &larger, &cache, addr),
+        "a node nobody can dial waited for a call that cannot come: this is \
+         the seed a client loses on its first reconnect and never sees again"
+    );
+
+    // A node that DOES announce is in the mutual case the tiebreak was written
+    // for, and keeps it — both sides are at the meeting point, both would dial,
+    // and one of the two dials has to be cancelled.
+    assert!(
+        !rendezvous_dial_is_ours(true, &larger, &cache, addr),
+        "two announcing nodes must not both dial; the duplicate is refused \
+         and the working session goes down around the refusal"
+    );
+    assert!(rendezvous_dial_is_ours(true, &smaller, &cache, addr));
+}
+
+#[test]
+fn the_two_halves_of_the_direction_rule_agree_about_a_rendezvous_peer() {
+    // The defect was not a wrong answer, it was TWO answers. The reconnect
+    // loop exempted `PeerSource::Rendezvous` from the tiebreak and the
+    // rendezvous pass applied it, so whether a client kept a seed depended on
+    // which half ran — and the pass wins, because a row that is never created
+    // is never reconnected.
+    //
+    // Asserted as a PAIR on purpose: either both say "a rendezvous peer is
+    // ours to dial" or this test names the half that drifted.
+    use crate::PeerSource;
+    use crate::runtime::peer_handshake::outbound_ignores_directional;
+    use veil_bootstrap::DiscoveredPeerCache;
+    use veil_cfg::{NodeId, SignatureAlgorithm};
+
+    let key = "fyU1fAlyHVNMat6NZBJ+KBU/aeJhCP+OBsomlgJ1Cjo=";
+    let theirs = NodeId::from_public_key(SignatureAlgorithm::Ed25519, key).expect("valid");
+    let addr = "obfs4-tcp://198.51.100.7:5556";
+    let mut c = DiscoveredPeerCache::in_memory();
+    c.upsert(
+        veil_cfg::BootstrapPeer {
+            transport: addr.to_owned(),
+            public_key: key.to_owned(),
+            nonce: "AOCZRA==".to_owned(),
+            algo: SignatureAlgorithm::Ed25519,
+            tls_cert: None,
+            tls_ca_cert: None,
+        },
+        1_700_000_000,
+    );
+    let cache = Arc::new(std::sync::Mutex::new(c));
+    let mut larger = *theirs.as_bytes();
+    larger[0] = larger[0].wrapping_add(1);
+
+    assert!(
+        outbound_ignores_directional(PeerSource::Rendezvous),
+        "the reconnect loop stopped exempting a rendezvous row"
+    );
+    assert!(
+        rendezvous_dial_is_ours(false, &larger, &cache, addr),
+        "the rendezvous pass cancels a dial the reconnect loop would make"
+    );
+}
+
+#[test]
 fn a_refused_duplicate_is_an_answer_and_keeps_its_row() {
     // The producer and the reader of this refusal live in different files,
     // and the reader matches on the text. Pin them together, or a reworded
