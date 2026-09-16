@@ -500,7 +500,19 @@ impl NodeRuntime {
                                 );
                                 continue;
                             }
-                            let transport = format!("{dial_scheme}://{host}:{port}");
+                            // ONE spelling per endpoint, and every key below
+                            // derives from it — the dedup set, the shuffled
+                            // order, the known/live comparisons (report27
+                            // V27).
+                            let Some(transport) =
+                                crate::runtime::service_tasks::canonical_rendezvous_transport(
+                                    &dial_scheme,
+                                    host,
+                                    port,
+                                )
+                            else {
+                                continue;
+                            };
                             if !seen.insert(transport.clone()) {
                                 continue;
                             }

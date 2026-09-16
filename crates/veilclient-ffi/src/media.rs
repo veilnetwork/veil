@@ -134,7 +134,18 @@ impl MediaReplayWindow {
             };
             self.highest = sequence;
         } else {
-            self.bitmap |= 1u128 << (self.highest - sequence);
+            let delta = self.highest - sequence;
+            // BOUNDED HERE, not only at the caller. `accepts` refuses anything
+            // this far behind, so the two agreed as long as every commit was
+            // preceded by the accepts that admitted it — and the window
+            // between them is exactly what a second receiver can move
+            // (report27 V24). `1u128 << 128` is a panic under overflow checks
+            // and a masked shift without them, which is a silently WRONG
+            // bitmap: the wrong sequence marked as played.
+            if delta >= u128::BITS as u64 {
+                return;
+            }
+            self.bitmap |= 1u128 << delta;
         }
     }
 }
@@ -272,6 +283,32 @@ fn replay_state_for(peer: &[u8; 32]) -> SharedReplayState {
     state
 }
 
+// Test-only: runs between the AEAD and the replay commit, once.
+//
+// That gap is the whole of report27 V24 and it cannot be driven from outside:
+// `open` takes `&mut self`, so two receivers cannot be stepped through it from
+// two threads in any controlled way, and the interleave that matters is one
+// instruction wide. The hook puts the other receiver's whole `open` exactly
+// where the race would be.
+//
+// Thread-local so a parallel test cannot fire it inside an unrelated open.
+#[cfg(test)]
+thread_local! {
+    static AFTER_AEAD: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn run_after_aead_hook() {
+    let armed = AFTER_AEAD.with(|h| h.borrow_mut().take());
+    if let Some(hook) = armed {
+        hook();
+    }
+}
+
+#[cfg(not(test))]
+fn run_after_aead_hook() {}
+
 struct MediaCipherRx {
     master: Zeroizing<[u8; 32]>,
     /// Per-epoch derived keys, cached so a steady flow costs one AEAD and not
@@ -347,10 +384,27 @@ impl MediaCipherRx {
                 plaintext
             }
         };
-        self.replay
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .commit(salt, sequence);
+        run_after_aead_hook();
+        // THE SECOND CHECK, under the same guard as the commit.
+        //
+        // The pre-check above releases the lock before the AEAD runs, and the
+        // replay window is SHARED per peer — `replay_state_for` hands the same
+        // `Arc` to every receiver built for one peer, which is what makes the
+        // history survive a channel rebuild. So two receivers can both pass
+        // `accepts` for one cell and then both commit it, and both deliver it:
+        // the window said "not played" to each of them, truthfully, before
+        // either had played it (report27 V24).
+        //
+        // Re-asking after the AEAD costs one uncontended lock on the delivery
+        // path and makes the admission and the record one step. The cheap
+        // rejection stays where it is — its job is to keep an obvious replay
+        // away from the AEAD, not to reserve anything.
+        let mut window = self.replay.lock().unwrap_or_else(|p| p.into_inner());
+        if !window.accepts(salt, sequence) {
+            return None;
+        }
+        window.commit(salt, sequence);
+        drop(window);
         Some(plaintext)
     }
 }
@@ -896,6 +950,82 @@ mod tests {
     extern "C" fn record(_ctx: *mut c_void, _ptr: *const u8, len: usize) {
         RX_CALLS.fetch_add(1, Ordering::SeqCst);
         RX_BYTES.fetch_add(len, Ordering::SeqCst);
+    }
+
+    /// One cell is delivered once, even when two receivers admit it together.
+    ///
+    /// The replay window is SHARED per peer — `replay_state_for` hands the same
+    /// `Arc` to every receiver built for one peer, which is what makes the
+    /// history survive a channel rebuild — and the pre-check released it
+    /// before the AEAD ran. Two receivers could therefore both be told "not
+    /// played" for one cell, truthfully, before either had played it, and both
+    /// deliver it (report27 V24).
+    ///
+    /// The interleave is one instruction wide and `open` takes `&mut self`, so
+    /// it is placed rather than raced: the hook runs the OTHER receiver's whole
+    /// open at exactly the point the second admission has to notice.
+    #[test]
+    fn two_receivers_sharing_a_window_deliver_one_cell_once() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let peer = [0x7Au8; 32];
+        let a_to_b = [0x41u8; 32];
+        let b_to_a = [0x42u8; 32];
+
+        // Two channels for ONE peer: the main onion handle and a dedicated
+        // media handle are exactly this, and they share the replay history.
+        let first = MediaCipher::new(&peer, &a_to_b, &b_to_a).expect("usable keys");
+        let second = MediaCipher::new(&peer, &a_to_b, &b_to_a).expect("usable keys");
+        let sender = peer_cipher(b_to_a, a_to_b);
+
+        let sealed = sender.seal(&[0x80u8; 160]).expect("peer seals");
+        let bytes = sealed.into_vec();
+
+        // `second` opens the cell in the window between `first`'s AEAD and its
+        // commit — the state the shared window really can be in.
+        let racer = bytes.clone();
+        AFTER_AEAD.with(|h| {
+            *h.borrow_mut() = Some(Box::new(move || {
+                let delivered = second.open(&racer);
+                assert!(
+                    delivered.is_some(),
+                    "premise: the second receiver must be the one that gets it \
+                     first, or this drives nothing"
+                );
+            }));
+        });
+
+        let delivered = first.open(&bytes);
+        assert!(
+            delivered.is_none(),
+            "both receivers delivered the same cell: each was told it had not \
+             been played, truthfully, before the other had played it"
+        );
+
+        // Vacuity: with nothing racing, a cell IS delivered — and only once.
+        let sealed = sender.seal(&[0x81u8; 160]).expect("peer seals");
+        let bytes = sealed.into_vec();
+        assert!(first.open(&bytes).is_some(), "an honest cell must arrive");
+        assert!(first.open(&bytes).is_none(), "and must not arrive twice");
+    }
+
+    /// A commit for a sequence past the window's reach does not shift by 128.
+    ///
+    /// `accepts` refuses anything that far behind, so the two agreed as long as
+    /// every commit was preceded by the accepts that admitted it — and the gap
+    /// between them is exactly what a second receiver can move. `1u128 << 128`
+    /// is a panic under overflow checks and a masked shift without them, which
+    /// marks the WRONG sequence as played (report27 V24).
+    #[test]
+    fn a_commit_far_behind_the_window_is_ignored_rather_than_shifted() {
+        let mut window = MediaReplayWindow::default();
+        window.commit(1_000);
+        // 200 behind: outside the 128-bit window entirely.
+        window.commit(800);
+        assert_eq!(window.highest, 1_000, "a stale commit moved the window");
+        assert!(
+            window.accepts(999),
+            "a stale commit marked a sequence that was never played"
+        );
     }
 
     /// Replacing the callback on the SAME channel must wait for a dispatch
