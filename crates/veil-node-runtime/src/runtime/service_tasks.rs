@@ -2278,10 +2278,22 @@ pub fn evict_lan_candidate<F: FnMut(&[u8; 32]), G: FnOnce(&[u8; 32])>(
     // all and every later announce was dropped as already seen
     // (report24 RUNTIME-2). Given back HERE, synchronously; the guard knows
     // not to take a successor's claim with it.
+    //
+    // AND ONLY THE CLAIM THIS ADMISSION MADE. `abort` is `Some` exactly when
+    // `spawn_outbound_peers` created a connector here, which is the same
+    // condition under which the claim was TAKEN rather than an existing
+    // owner's refreshed — the spawn skips a peer whose slot is already held.
+    // Releasing unconditionally therefore took a claim this admission never
+    // made: for a peer that already had a configured connector, the release
+    // dropped the sole `watch::Sender`, which closes the channel, which makes
+    // that connector's `changed()` return `Err` and the loop exit. A
+    // configured row was left with no reconnect loop and nothing to spawn
+    // another, because an unrelated LAN announce for the same node aged out
+    // (report27 V16).
     if let Some(abort) = candidate.abort {
         abort.abort();
+        release_connector(&candidate.node_id);
     }
-    release_connector(&candidate.node_id);
 }
 
 /// How long an admitted LAN announce may hold its slot without the peer ever
