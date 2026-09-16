@@ -30,6 +30,8 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <memory>
+#include <mutex>
 #include <span>
 
 #include "api/call/transport.h"  // webrtc::Transport, webrtc::PacketOptions
@@ -124,6 +126,24 @@ class VeilTransportShim : public webrtc::Transport {
   static void OnVeilDatagram(void* ctx, const uint8_t* ptr, size_t len);
   // Runs on `network_queue_`: demux RTP vs RTCP and deliver into the Call.
   void DeliverOnNetworkThread(std::span<const uint8_t> packet);
+
+  // WHAT A QUEUED TASK IS ALLOWED TO TOUCH AFTER THIS OBJECT IS GONE.
+  //
+  // `OnVeilDatagram` copies a packet and posts it to the network queue with a
+  // raw `this`. `Stop` waits up to a second for the pending count to drain and
+  // then RETURNS ANYWAY — so a delayed task could run against a shim its owner
+  // had already freed, reading `started_` and decrementing counters that no
+  // longer exist (report27 V23). Waiting longer is not the fix: the task has
+  // to be able to find out, safely, that it must not run.
+  //
+  // The destructor takes this lock and clears the flag, so a task either
+  // completes while the destructor waits, or sees `alive == false` and touches
+  // nothing. Held across the delivery, which is bounded by one packet.
+  struct TaskGuard {
+    std::mutex mu;
+    bool alive = true;
+  };
+  const std::shared_ptr<TaskGuard> task_guard_ = std::make_shared<TaskGuard>();
 
   const uint64_t veil_chan_;
   webrtc::Call* const call_;
