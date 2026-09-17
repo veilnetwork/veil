@@ -249,6 +249,26 @@ jobs:
         # further steps were missing and a stale fuzz/Cargo.lock shipped.
         run: ./scripts/run-ci-hygiene.py --self-test
 
+      - name: Install the Windows cross toolchain
+        # mingw-w64 only — no linking happens, `cargo check` needs a C compiler
+        # for ring / aws-lc-sys / pqcrypto-internals build scripts and nothing
+        # more. Bounded and non-interactive: an apt that can prompt or hang has
+        # wedged this repo's releases before.
+        run: |
+          sudo DEBIAN_FRONTEND=noninteractive timeout 300 apt-get update -qq
+          sudo DEBIAN_FRONTEND=noninteractive timeout 600 apt-get install -y --no-install-recommends mingw-w64
+          rustup target add x86_64-pc-windows-gnu
+
+      - name: windows type-check (veilclient-ffi)
+        # `path_acl.rs` and `fs_beneath.rs` are `#[cfg(windows)]` in their
+        # entirety, and until 2026-09-17 nothing here ever handed them to a
+        # compiler. A one-line type error in `rules_json` — a tail returned as
+        # `String` where the signature said `Result<String, String>` — passed
+        # every gate, every test and a tag, and failed 57 minutes into xVeil's
+        # release run, in the Windows bundle, where it is most expensive to
+        # find.
+        run: ./scripts/check-windows-typecheck.sh
+
       - name: Install cargo-deny
         run: cargo install cargo-deny --version "^0.19" --locked
 
