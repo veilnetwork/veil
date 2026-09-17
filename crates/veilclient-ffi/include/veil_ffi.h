@@ -2700,6 +2700,50 @@ int veil_identity_document_authorizes(const uint8_t *doc_ptr,
 
 #if defined(VEIL_FFI_NODE_EMBEDDED)
 /**
+ * Did this document authorise `pubkey_32` for something written at
+ * `at_unix_secs`?
+ *
+ * The receive-time answer to the question [`veil_identity_document_authorizes`]
+ * cannot ask. That one checks that the key is LISTED and deliberately ignores
+ * its window, because requiring a key to be valid today would reject history
+ * that was legitimate when it was written — and the cost of that tolerance is
+ * that a device secret keeps its authorship authority forever, long after the
+ * delegation that granted it lapsed (report27 V02).
+ *
+ * The two halves are asked at different times on purpose:
+ *
+ *   * the DOCUMENT is verified at `now`. It is the identity's current
+ *     statement about itself — master binding, its own freshness window, every
+ *     certificate — and a document re-issued last week cannot be verified "as
+ *     of" last year: `issued_at` bounds it from below.
+ *   * the KEY's own window is checked at `at_unix_secs`. That is the question
+ *     actually being asked — could this key act THEN — and it survives
+ *     renewal, because a renewal moves `valid_until` and leaves `valid_from`
+ *     where it was.
+ *
+ * Revocation still applies at `now`, and still wins: a document that no longer
+ * lists a key does not authorise it, whenever the row was written.
+ *
+ * Returns 0 when it authorises, 1 when it does not, -1 on a bad argument.
+ * `at_unix_secs` of 0 means "no receive time recorded" and falls back to the
+ * listed-only answer, so a caller with nothing better is no worse off than
+ * before.
+ *
+ * # Safety
+ * `doc_ptr` must be readable for `doc_len` bytes; `node_id_32` and `pubkey_32`
+ * for 32 bytes each.
+ */
+
+int veil_identity_document_authorized_at(const uint8_t *doc_ptr,
+                                         size_t doc_len,
+                                         const uint8_t *node_id_32,
+                                         const uint8_t *pubkey_32,
+                                         uint64_t at_unix_secs)
+;
+#endif
+
+#if defined(VEIL_FFI_NODE_EMBEDDED)
+/**
  * The node id a nickname must be mined and claimed under: the IDENTITY's,
  * not this device's.
  *
