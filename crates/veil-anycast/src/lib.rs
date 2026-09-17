@@ -261,6 +261,51 @@ pub enum AnycastStoreDecision {
 ///
 /// A remote store never evicts a live provider. With the list already full,
 /// first-come wins rather than last-writer wins.
+/// How old an anycast record is, in seconds.
+///
+/// Two clocks, and which one applies is the whole of report9 V-06 / report27
+/// V03. `blob_age` is how long ago THE VALUE was written, and every provider
+/// under a service tag shares it — so any one provider's refresh resets the
+/// clock for all of them, including one that departed and will never publish
+/// again. A v4 record carries its own signed `issued_at` and is aged by that
+/// instead, which is the only way a departed provider expires while its
+/// neighbours keep publishing.
+///
+/// A future-dated `issued_at` reads as age 0. That is not a new power: the
+/// owner already chooses its own `ttl`, so an owner wanting to be unexpirable
+/// publishes `ttl = 0` and needs no clock tricks. And the timestamp is SIGNED,
+/// so only the owner can set it — which is exactly why an unsigned one must
+/// never ride the wire (see [`AnycastRecord::issued_at`]): a back-dated
+/// timestamp on somebody else's record is an eviction.
+#[must_use]
+pub fn anycast_record_age_secs(
+    record: &AnycastRecord,
+    blob_age: std::time::Duration,
+    now_unix: u64,
+) -> u64 {
+    match record.issued_at {
+        Some(issued_at) => now_unix.saturating_sub(issued_at),
+        None => blob_age.as_secs(),
+    }
+}
+
+/// Whether `incoming` is an OLDER publication of a record already held.
+///
+/// Only answerable when both sides carry a signed `issued_at`: then the owner
+/// itself ordered them, and letting an older one replace a newer one is a
+/// replay that back-dates a live provider into early expiry — the eviction the
+/// per-record timestamp would otherwise hand to anyone who kept a copy of an
+/// old blob. With a timestamp missing on either side there is nothing to
+/// compare, and the "a valid signature is not a right to evict" rule below
+/// stands alone; that is also the upgrade path, since a v4 record has to be
+/// able to replace the v2 record it succeeds.
+fn is_stale_replay(incoming: &AnycastRecord, held: &AnycastRecord) -> bool {
+    match (incoming.issued_at, held.issued_at) {
+        (Some(arriving), Some(present)) => arriving < present,
+        _ => false,
+    }
+}
+
 pub fn anycast_store_decision(
     key: &[u8; 32],
     existing: Option<(&[u8], std::time::Duration)>,
@@ -282,11 +327,12 @@ pub fn anycast_store_decision(
     if admitted.is_empty() {
         return AnycastStoreDecision::Drop;
     }
+    let now_unix = veil_util::unix_secs_now_u64();
     let mut list = match existing {
         Some((blob, age)) => {
             let mut held = AnycastList::decode(blob);
             held.0
-                .retain(|r| r.ttl == 0 || age.as_secs() < r.ttl as u64);
+                .retain(|r| r.ttl == 0 || anycast_record_age_secs(r, age, now_unix) < r.ttl as u64);
             held
         }
         None => AnycastList::default(),
@@ -312,7 +358,7 @@ pub fn anycast_store_decision(
             // may not do is displace a record that DID prove it.
             let ours = verify_record_owner_binding(&r).is_ok();
             let theirs = verify_record_owner_binding(&list.0[pos]).is_ok();
-            if ours || !theirs {
+            if (ours || !theirs) && !is_stale_replay(&r, &list.0[pos]) {
                 list.0[pos] = r;
             }
         } else if list.0.len() < MAX_ANYCAST_CANDIDATES {
@@ -384,14 +430,18 @@ impl AnycastSigner {
         }
     }
 
-    /// Build + sign an anycast record. Ed25519 serializes to the v2 wire,
-    /// Falcon-512 / hybrid to v3 (chosen by `AnycastRecord::encode`).
+    /// Build + sign an anycast record. `issued_at` puts it on the v4 wire
+    /// whatever the algorithm; without it the record stays on v2 (Ed25519) or
+    /// v3 (everything else), which is what an un-upgraded network can read.
+    /// See `AnycastService::with_timestamped_records` for why that is a
+    /// decision and not a default.
     fn sign_record(
         &self,
         service_tag: [u8; 4],
         node_id: [u8; 32],
         score: u16,
         ttl: u32,
+        issued_at: Option<u64>,
     ) -> Option<AnycastRecord> {
         let mut rec = AnycastRecord {
             service_tag,
@@ -405,6 +455,7 @@ impl AnycastSigner {
                 // placeholder; canonical_bytes() excludes the signature itself.
                 signature: Vec::new(),
             }),
+            issued_at,
         };
         let canonical = rec.canonical_bytes();
         rec.signature.as_mut()?.signature = (self.sign)(&canonical);
@@ -490,6 +541,9 @@ pub struct AnycastService {
     /// document. `None` drops every delegated record under a binding policy —
     /// which is what this node did before delegation existed.
     delegation_lookup: Option<AnycastDelegationLookup>,
+    /// Whether a signed advertise carries `issued_at` — i.e. publishes on the
+    /// v4 wire. Off by default; see [`Self::with_timestamped_records`].
+    publish_timestamps: bool,
 }
 
 impl AnycastService {
@@ -502,6 +556,7 @@ impl AnycastService {
             signing_key: None,
             generic_signer: None,
             delegation_lookup: None,
+            publish_timestamps: false,
         }
     }
 
@@ -522,6 +577,7 @@ impl AnycastService {
             signing_key: None,
             generic_signer: None,
             delegation_lookup: None,
+            publish_timestamps: false,
         }
     }
 
@@ -572,6 +628,40 @@ impl AnycastService {
         self
     }
 
+    /// Publish owner-signed records on the **v4 wire**, carrying a signed
+    /// `issued_at`.
+    ///
+    /// This is the half of report9 V-06 / report27 V03 that cannot be switched
+    /// on by one node alone, which is why it is a decision and not a default.
+    /// Reading v4 is unconditional — this build accepts, merges and republishes
+    /// v4 records whether or not it publishes them. WRITING v4 is what has to
+    /// wait, because a resolver that predates v4 does not recognise the magic:
+    /// a list whose first record is v4 does not read as an anycast list to it
+    /// at all, so it stops the walk, keeps nothing, and rewrites the key with
+    /// only its own record. One early publisher can empty a service tag for
+    /// every peer that has not upgraded.
+    ///
+    /// So the rollout is two releases, not one. Ship the reader everywhere
+    /// first; turn this on only once no resolver that still matters is on the
+    /// older build. `veil-cfg`'s `anycast.publish_timestamps` is the switch.
+    ///
+    /// Until then a node keeps publishing v2/v3 and keeps being aged by the
+    /// shared blob clock — the defect stands, knowingly, rather than being
+    /// traded for a partition.
+    #[must_use]
+    pub fn with_timestamped_records(mut self, on: bool) -> Self {
+        self.publish_timestamps = on;
+        self
+    }
+
+    /// The `issued_at` to stamp on a record we are about to publish, or `None`
+    /// to stay on the pre-v4 wire. One place to ask, so the Ed25519 and the
+    /// algo-generic advertise paths cannot disagree about which wire this node
+    /// writes.
+    fn issued_at_for_publish(&self) -> Option<u64> {
+        self.publish_timestamps.then(veil_util::unix_secs_now_u64)
+    }
+
     /// Install the lookup that admits DELEGATED records — those signed by a
     /// device key of the identity that owns the address, rather than by its
     /// master. Without it such records are dropped under a binding policy, and
@@ -579,6 +669,16 @@ impl AnycastService {
     pub fn with_delegation_lookup(mut self, lookup: AnycastDelegationLookup) -> Self {
         self.delegation_lookup = Some(lookup);
         self
+    }
+
+    /// Whether this service publishes on the v4 wire. Surfaced so the wiring
+    /// from config to service is testable at all: which wire a node WRITES is
+    /// a fleet-wide decision (see [`Self::with_timestamped_records`]), and a
+    /// decision that silently fails to arrive is the same as not having made
+    /// it.
+    #[must_use]
+    pub fn publishes_timestamps(&self) -> bool {
+        self.publish_timestamps
     }
 
     /// Current resolve policy.  Surfaced for diagnostic /
@@ -631,16 +731,26 @@ impl AnycastService {
             node_id: self.local_node_id,
             score,
             ttl: ttl_secs,
-            // Legacy v1 advertise — see `advertise_signed` for v2 owner-signed records.
+            // Legacy v1 advertise — see `advertise_signed` for owner-signed records.
             signature: None,
+            // An unsigned record cannot carry a trustworthy publication time,
+            // so it keeps being aged by the shared blob. That is the V-06
+            // defect, and it stays for exactly as long as a node advertises
+            // without a key to sign with.
+            issued_at: None,
         });
         self.dht.store_local(key, list.encode());
     }
 
-    /// **v2 owner-signed** advertise. Publishes a record signed with the
+    /// **Owner-signed** advertise. Publishes a v4 record signed with the
     /// supplied Ed25519 key; resolvers with trust-sensitive policy can
     /// reject unsigned (v1) records or records with signatures that don't
     /// verify. Recommended for service-discovery in production.
+    ///
+    /// With [`Self::with_timestamped_records`] enabled the record is stamped
+    /// with the current time (v4), so a resolver ages it by when THIS node
+    /// published rather than by when the shared blob was last written by
+    /// anybody. Off — the default — it stays on the v2 wire.
     ///
     /// Caller is responsible for making sure `signing_key`'s pubkey is
     /// bound to `self.local_node_id` (typically through a sovereign
@@ -660,22 +770,35 @@ impl AnycastService {
             .get_local(&key)
             .map(|b| AnycastList::decode(&b))
             .unwrap_or_default();
-        let signed_record = AnycastRecord::sign(
-            service_tag,
-            self.local_node_id,
-            score,
-            ttl_secs,
-            sig_key_idx,
-            signing_key,
-        );
+        let signed_record = match self.issued_at_for_publish() {
+            Some(issued_at) => AnycastRecord::sign_at(
+                service_tag,
+                self.local_node_id,
+                score,
+                ttl_secs,
+                sig_key_idx,
+                signing_key,
+                issued_at,
+            ),
+            None => AnycastRecord::sign(
+                service_tag,
+                self.local_node_id,
+                score,
+                ttl_secs,
+                sig_key_idx,
+                signing_key,
+            ),
+        };
         list.upsert(signed_record);
         self.dht.store_local(key, list.encode());
     }
 
     /// Algo-generic owner-signed advertise (v2 Ed25519 / v3 Falcon-512 /
-    /// hybrid). Signs the record with the wired [`AnycastSigner`]. On malformed
-    /// signer key material the advertise is SKIPPED (we never downgrade to an
-    /// unsigned record), and the existing list is left untouched.
+    /// hybrid, or v4 for either once [`Self::with_timestamped_records`] is
+    /// enabled). Signs the record with the wired [`AnycastSigner`]. On
+    /// malformed signer key material the advertise is SKIPPED (we never
+    /// downgrade to an unsigned record), and the existing list is left
+    /// untouched.
     fn advertise_with_signer(
         &self,
         service_tag: [u8; 4],
@@ -683,8 +806,13 @@ impl AnycastService {
         ttl_secs: u32,
         signer: &AnycastSigner,
     ) {
-        let Some(record) = signer.sign_record(service_tag, self.local_node_id, score, ttl_secs)
-        else {
+        let Some(record) = signer.sign_record(
+            service_tag,
+            self.local_node_id,
+            score,
+            ttl_secs,
+            self.issued_at_for_publish(),
+        ) else {
             return;
         };
         let key = AnycastRecord::dht_key(service_tag);
@@ -805,25 +933,24 @@ impl AnycastService {
         // age, and drop records where `age >= record.ttl`.  No wire
         // change — the `ttl` field always existed in the record.
         //
-        // HOW FAR THAT GOES, and it is less far than it reads (report9 V-06).
-        // `inserted_at` belongs to the BLOB, and every provider for a service
-        // tag shares it: an advertise is a read-modify-write of the whole
-        // `AnycastList`, so any provider's refresh restarts the clock for
-        // every record in it. A provider that departs is therefore held for
-        // its TTL after the LAST write by ANYONE, not after its own — which
-        // for a busy tag is indefinitely. The blackhole is narrowed, not
-        // closed; it is closed only for a tag with one publisher.
+        // WHICH CLOCK, and for a long time it was the wrong one (report9 V-06,
+        // closed by report27 V03). `inserted_at` belongs to the BLOB, and every
+        // provider for a service tag shares it: an advertise is a
+        // read-modify-write of the whole `AnycastList`, so any provider's
+        // refresh restarted the clock for every record in it. A provider that
+        // departed was therefore held for its TTL after the LAST write by
+        // ANYONE, not after its own — on a busy tag, indefinitely.
         //
-        // It cannot be closed from this side. A record carries no timestamp,
-        // `upsert` replaces it in place, and Ed25519 over identical fields is
-        // deterministic — a provider refreshing produces byte-identical
-        // bytes, so nothing observable here separates "still publishing" from
-        // "left behind". A signed per-record `issued_at`, or one DHT key per
-        // provider, is what closes it. `v06_a_departed_provider_still_
-        // outlives_its_ttl` pins the current behaviour and fails the day
-        // either lands.
+        // A v4 record carries a SIGNED `issued_at` and is aged by that instead;
+        // see `anycast_record_age_secs`, which is also what the STORE gate
+        // uses, because a record dropped at resolve but kept in the store comes
+        // back on the next read. The blob clock remains for v1/v2/v3 records,
+        // which have no publication time to be aged by — so the defect survives
+        // exactly as long as a publisher advertises on the old wire, and
+        // `an_unsigned_record_still_rides_the_shared_clock` pins that.
         let entry = self.dht.get_local_with_meta(&key);
         let now = std::time::Instant::now();
+        let now_unix = veil_util::unix_secs_now_u64();
         // (node_id, effective_score) — effective_score = peer-claimed score
         // PLUS resolver-local reputation penalty. u32 not u16 because
         // saturating-add of repeated failures can overflow the u16 score
@@ -840,7 +967,7 @@ impl AnycastService {
                         // wire format means "no TTL", treated as
                         // "always fresh" for backwards compatibility
                         // with pre-fix records.
-                        if r.ttl > 0 && age.as_secs() >= r.ttl as u64 {
+                        if r.ttl > 0 && anycast_record_age_secs(r, age, now_unix) >= r.ttl as u64 {
                             return false;
                         }
                         if require_binding {
@@ -963,7 +1090,10 @@ mod tests {
     use super::*;
     use ed25519_dalek::SigningKey;
     use veil_dht::KademliaService;
-    use veil_proto::anycast::{ANYCAST_MAGIC_V3, ANYCAST_RECORD_SIZE, ANYCAST_RECORD_V2_SIZE};
+    use veil_proto::anycast::{
+        ANYCAST_MAGIC_V2, ANYCAST_MAGIC_V3, ANYCAST_MAGIC_V4, ANYCAST_RECORD_SIZE,
+        ANYCAST_RECORD_V2_SIZE,
+    };
 
     /// A DEVICE subkey can advertise for its identity's address.
     ///
@@ -989,7 +1119,7 @@ mod tests {
             })
         });
         let rec = signer
-            .sign_record(*b"mbox", node_id, 5, 3600)
+            .sign_record(*b"mbox", node_id, 5, 3600, Some(1_700_000_000))
             .expect("sign");
 
         // The old rule refuses it: the signing key is not the master, so its
@@ -1019,7 +1149,7 @@ mod tests {
             })
         });
         let rec = signer
-            .sign_record(*b"mbox", node_id, 5, 3600)
+            .sign_record(*b"mbox", node_id, 5, 3600, Some(1_700_000_000))
             .expect("sign");
         let other_identity: [u8; 32] = [8u8; 32];
         assert!(
@@ -1042,7 +1172,7 @@ mod tests {
             })
         });
         let rec = signer
-            .sign_record(*b"mbox", node_id, 5, 3600)
+            .sign_record(*b"mbox", node_id, 5, 3600, Some(1_700_000_000))
             .expect("sign");
         let sibling = SigningKey::from_bytes(&[11u8; 32])
             .verifying_key()
@@ -1054,11 +1184,15 @@ mod tests {
         );
     }
 
-    /// Falcon-512 (v3) owner-signing round-trips through the wire and verifies —
+    /// Falcon-512 owner-signing round-trips through the wire and verifies —
     /// the core of the A1 fix: a PQ-only identity can own-sign anycast records,
     /// and a resolver admits them under the strictest (binding) policy.
+    ///
+    /// The signer stamps `issued_at`, so what it produces is v4; the v3 wire it
+    /// used to produce is still decoded and still verifies, which
+    /// `a_falcon_record_on_the_old_v3_wire_still_verifies` covers.
     #[test]
-    fn falcon_v3_sign_verify_and_binding_roundtrip() {
+    fn falcon_sign_verify_and_binding_roundtrip() {
         let kp = veil_crypto::generate_keypair(SignatureAlgorithm::Falcon512);
         let pubkey_bytes = base64::engine::general_purpose::STANDARD
             .decode(&kp.public_key)
@@ -1072,12 +1206,17 @@ mod tests {
             })
         });
         let rec = signer
-            .sign_record(*b"mbox", node_id, 5, 3600)
+            .sign_record(*b"mbox", node_id, 5, 3600, Some(1_700_000_000))
             .expect("falcon sign");
 
-        // Serializes as v3 and round-trips exactly through the wire.
+        // Serializes as v4 and round-trips exactly through the wire.
         let enc = rec.encode();
-        assert_eq!(&enc[0..2], &ANYCAST_MAGIC_V3, "Falcon record is v3");
+        assert_eq!(
+            &enc[0..2],
+            &ANYCAST_MAGIC_V4,
+            "a signed, stamped Falcon record is v4"
+        );
+        assert_eq!(rec.issued_at, Some(1_700_000_000));
         let dec = AnycastRecord::decode(&enc).unwrap();
         assert_eq!(dec, rec);
 
@@ -1099,6 +1238,54 @@ mod tests {
             verify_record_owner_binding(&forged).is_err(),
             "BLAKE3(owner_pubkey) != node_id must be rejected",
         );
+    }
+
+    /// A Falcon record on the OLD v3 wire — no `issued_at` — still verifies.
+    ///
+    /// This is the rollout half of V03 that nothing else asserts: every node
+    /// that has not upgraded keeps publishing v3, and a resolver that drops
+    /// those has partitioned the network rather than fixed a TTL. Built by
+    /// hand because `AnycastSigner` now always stamps, which is exactly the
+    /// difference under test.
+    #[test]
+    fn a_falcon_record_on_the_old_v3_wire_still_verifies() {
+        let kp = veil_crypto::generate_keypair(SignatureAlgorithm::Falcon512);
+        let pubkey_bytes = base64::engine::general_purpose::STANDARD
+            .decode(&kp.public_key)
+            .unwrap();
+        let node_id: [u8; 32] = blake3::hash(&pubkey_bytes).into();
+        let mut rec = AnycastRecord {
+            service_tag: *b"mbox",
+            node_id,
+            score: 5,
+            ttl: 3600,
+            signature: Some(AnycastRecordSig {
+                sig_algo: SignatureAlgorithm::Falcon512.wire_byte(),
+                owner_pubkey: pubkey_bytes,
+                sig_key_idx: 0,
+                signature: Vec::new(),
+            }),
+            issued_at: None,
+        };
+        let canonical = rec.canonical_bytes();
+        rec.signature.as_mut().unwrap().signature = veil_crypto::sign_message(
+            SignatureAlgorithm::Falcon512,
+            &kp.public_key,
+            &kp.private_key,
+            &canonical,
+        )
+        .unwrap();
+
+        let enc = rec.encode();
+        assert_eq!(&enc[0..2], &ANYCAST_MAGIC_V3, "no timestamp ⇒ still v3");
+        let dec = AnycastRecord::decode(&enc).unwrap();
+        assert_eq!(dec, rec);
+        assert!(
+            verify_record_signature(&dec).is_ok(),
+            "a pre-v4 publisher's record must keep verifying, or the rollout \
+             drops every node that has not upgraded"
+        );
+        assert!(verify_record_owner_binding(&dec).is_ok());
     }
 
     /// The strictest resolve policy (`SignedBound`) admits a Falcon-signed v3
@@ -1201,6 +1388,7 @@ mod tests {
             score: 5,
             ttl: 3600,
             signature: None,
+            issued_at: None,
         };
         // v1 is unsigned by construction; verify_signature MUST error.
         assert!(r.verify_signature().is_err());
@@ -1217,6 +1405,7 @@ mod tests {
             score: 10,
             ttl: 3600,
             signature: None,
+            issued_at: None,
         };
         let v2 = AnycastRecord::sign(*b"mbox", [0xB2; 32], 5, 3600, 0, &key);
         let mut blob = Vec::new();
@@ -1374,60 +1563,112 @@ mod tests {
         );
     }
 
-    /// report9 V-06 — the per-record TTL is enforced against a clock the
-    /// records SHARE, and this pins the consequence until the format can fix
-    /// it.
+    /// Publishing v4 is OFF unless asked for.
+    ///
+    /// Not a preference — a resolver that predates v4 abandons the record walk
+    /// at the first v4 entry and rewrites the key with only its own record, so
+    /// one early publisher empties a service tag for every peer that has not
+    /// upgraded. A default that flips this on ships that partition to whoever
+    /// updates first, which is the shape of a flag day.
+    #[test]
+    fn publishing_the_new_wire_is_off_by_default() {
+        let dht = Arc::new(KademliaService::new([0xE7; 32]));
+        let svc = AnycastService::new(Arc::clone(&dht), [0xE7; 32])
+            .with_policy(AnycastResolvePolicy::BestEffort)
+            .with_signing_key(Arc::new(make_signing_key(0xE7)), 0);
+        svc.advertise(*b"dflt", 5, 3600);
+
+        let blob = dht
+            .get_local(&AnycastRecord::dht_key(*b"dflt"))
+            .expect("the advertise wrote something");
+        assert_eq!(
+            &blob[0..2],
+            &ANYCAST_MAGIC_V2,
+            "a default build published the v4 wire — every un-upgraded \
+             resolver just lost this service tag"
+        );
+        let rec = &AnycastList::decode(&blob).0[0];
+        assert!(rec.signature.is_some(), "premise: it is signed at all");
+        assert_eq!(rec.issued_at, None, "and carries no publication time");
+    }
+
+    /// report9 V-06 / report27 V03 — a provider that departs expires on ITS OWN
+    /// clock, not on whenever the busiest provider last refreshed.
     ///
     /// Every provider for a service tag lives in one `AnycastList` under one
-    /// DHT key, and an advertise is a read-modify-write of that whole blob.
-    /// The store stamps `inserted_at` on the BLOB, so any provider's
-    /// re-advertise restarts the TTL clock for every other record in it —
-    /// including one belonging to a provider that departed and will never
-    /// publish again. That is the blackhole the per-record TTL was added to
-    /// stop. `resolve_drops_records_past_their_ttl` above does not see it
-    /// because it has a single advertiser, which is the one arrangement where
-    /// a shared clock is the right clock.
+    /// DHT key, and an advertise is a read-modify-write of that whole blob. The
+    /// store stamps `inserted_at` on the BLOB, so for a long time any
+    /// provider's re-advertise restarted the TTL clock for every other record
+    /// in it — including one belonging to a provider that departed and will
+    /// never publish again. That is the blackhole the per-record TTL was added
+    /// to stop, and for a busy tag it never stopped it.
     ///
-    /// **Why this asserts the WRONG behaviour.** Closing it locally is not
-    /// possible: a record carries no timestamp, `upsert` replaces it in place,
-    /// and Ed25519 over identical fields is deterministic — so a provider
-    /// refreshing its advertisement produces BYTE-IDENTICAL bytes. Nothing a
-    /// resolver can observe distinguishes "still here, republishing" from
-    /// "gone, left behind by someone else's write". The fix is a signed
-    /// per-record `issued_at`, or one DHT key per provider; both are wire
-    /// changes.
-    ///
-    /// So this runs as a tripwire rather than sitting in a report. **If it
-    /// starts failing, the defect is fixed** — invert the assertion to expect
-    /// one candidate and delete this paragraph.
+    /// A v4 record carries a signed `issued_at`, so the resolver ages each
+    /// record by when its own owner published. `resolve_drops_records_past_
+    /// their_ttl` does not see any of this because it has a single advertiser,
+    /// which is the one arrangement where a shared clock IS the right clock.
     #[test]
-    fn v06_a_departed_provider_still_outlives_its_ttl() {
+    fn a_departed_provider_expires_on_its_own_clock() {
         let dht = Arc::new(KademliaService::new([0xE3; 32]));
         let leaving = AnycastService::new(Arc::clone(&dht), [0xE3; 32])
-            .with_policy(AnycastResolvePolicy::BestEffort);
+            .with_policy(AnycastResolvePolicy::BestEffort)
+            .with_signing_key(Arc::new(make_signing_key(0xE3)), 0)
+            .with_timestamped_records(true);
         let staying = AnycastService::new(Arc::clone(&dht), [0xE4; 32])
-            .with_policy(AnycastResolvePolicy::BestEffort);
+            .with_policy(AnycastResolvePolicy::BestEffort)
+            .with_signing_key(Arc::new(make_signing_key(0xE4)), 0)
+            .with_timestamped_records(true);
 
         leaving.advertise(*b"ttl2", 7, 1); // 1 s record TTL, then departs
         staying.advertise(*b"ttl2", 7, 60);
-        assert_eq!(leaving.resolve(*b"ttl2", 8).node_ids.len(), 2);
+        assert_eq!(
+            leaving.resolve(*b"ttl2", 8).node_ids.len(),
+            2,
+            "both providers start out visible"
+        );
 
         // Past the departed provider's TTL, and the one still here republishes
-        // as it would on any refresh interval.
+        // as it would on any refresh interval. Pre-fix that republish reset the
+        // blob clock and carried the departed record along with it.
         std::thread::sleep(std::time::Duration::from_millis(1200));
         staying.advertise(*b"ttl2", 7, 60);
 
         let ids = leaving.resolve(*b"ttl2", 8).node_ids;
-        assert_eq!(
-            ids.len(),
-            2,
-            "only one candidate came back, so the shared TTL clock is gone — \
-             report9 V-06 is fixed and this test now asserts the wrong thing"
+        assert!(
+            !ids.contains(&[0xE3; 32]),
+            "the departed provider outlived its own TTL on somebody else's \
+             refresh — the shared blob clock is back"
         );
         assert!(
-            ids.contains(&[0xE3; 32]),
-            "the departed provider is the one that must still be here for this \
-             to be the V-06 case at all"
+            ids.contains(&[0xE4; 32]),
+            "the provider that is still here must survive its neighbour expiring"
+        );
+    }
+
+    /// The residual, and it is deliberate: an UNSIGNED record still rides the
+    /// shared blob clock, because an unsigned timestamp is peer-controlled and
+    /// a back-dated one would let any publisher evict a live provider. A node
+    /// closes V-06 for itself by advertising with a key AND publishing on the
+    /// v4 wire — not by upgrading its resolver.
+    #[test]
+    fn an_unsigned_record_still_rides_the_shared_clock() {
+        let dht = Arc::new(KademliaService::new([0xE5; 32]));
+        let leaving = AnycastService::new(Arc::clone(&dht), [0xE5; 32])
+            .with_policy(AnycastResolvePolicy::BestEffort);
+        let staying = AnycastService::new(Arc::clone(&dht), [0xE6; 32])
+            .with_policy(AnycastResolvePolicy::BestEffort);
+
+        leaving.advertise(*b"ttl3", 7, 1);
+        staying.advertise(*b"ttl3", 7, 60);
+        std::thread::sleep(std::time::Duration::from_millis(1200));
+        staying.advertise(*b"ttl3", 7, 60);
+
+        let ids = leaving.resolve(*b"ttl3", 8).node_ids;
+        assert!(
+            ids.contains(&[0xE5; 32]),
+            "if the unsigned record expired too, an unsigned `issued_at` is \
+             riding the wire somewhere — check that nothing has started \
+             trusting it"
         );
     }
 
@@ -1620,6 +1861,7 @@ mod tests {
             score: 1,
             ttl: 3600,
             signature: None,
+            issued_at: None,
         });
         dht.store_local(dht_key, list.encode());
 
@@ -2021,6 +2263,108 @@ mod tests {
         );
     }
 
+    /// The merge ages a v4 record by its own signed `issued_at`, not by the
+    /// blob's age — the STORE half of V03. A record dropped at resolve but kept
+    /// in the store is not dropped: it comes back on the next read.
+    #[test]
+    fn the_merge_ages_a_stamped_record_on_its_own_clock() {
+        let tag = *b"mrg5";
+        let key = AnycastRecord::dht_key(tag);
+        let gone = make_signing_key(0xD1);
+        let newcomer = make_signing_key(0xD2);
+        let now = veil_util::unix_secs_now_u64();
+
+        // Published an hour ago with a 60 s TTL — long gone, even though the
+        // BLOB was written a moment ago by whoever advertised last.
+        let mut held = AnycastList::default();
+        held.upsert(AnycastRecord::sign_at(
+            tag,
+            [0xD1; 32],
+            5,
+            60,
+            0,
+            &gone,
+            now - 3600,
+        ));
+        let held_blob = held.encode();
+
+        let mut arriving = AnycastList::default();
+        arriving.upsert(AnycastRecord::sign_at(
+            tag, [0xD2; 32], 5, 3600, 0, &newcomer, now,
+        ));
+
+        let decision = anycast_store_decision(
+            &key,
+            Some((&held_blob, std::time::Duration::from_millis(50))),
+            &arriving.encode(),
+        );
+        let AnycastStoreDecision::Merge(merged) = decision else {
+            panic!("got {decision:?}");
+        };
+        let ids: Vec<[u8; 32]> = AnycastList::decode(&merged)
+            .0
+            .into_iter()
+            .map(|r| r.node_id)
+            .collect();
+        assert_eq!(
+            ids,
+            vec![[0xD2; 32]],
+            "a fresh blob kept a record its own owner published an hour past \
+             its TTL — the store is still on the blob clock"
+        );
+    }
+
+    /// A back-dated republish cannot evict a live provider.
+    ///
+    /// The signed timestamp is what gives a record an order, and an order is
+    /// something to roll back: keep a copy of an old blob, re-store it, and the
+    /// incumbent's `issued_at` goes backwards until a resolver ages it out.
+    /// Both sides are signed by the same owner here, so nothing else in the
+    /// merge rules stops it.
+    #[test]
+    fn a_back_dated_republish_cannot_evict_a_live_record() {
+        let tag = *b"mrg6";
+        let key = AnycastRecord::dht_key(tag);
+        let owner = make_signing_key(0xD3);
+        let now = veil_util::unix_secs_now_u64();
+
+        let mut held = AnycastList::default();
+        held.upsert(AnycastRecord::sign_at(
+            tag, [0xD3; 32], 5, 60, 0, &owner, now,
+        ));
+        let held_blob = held.encode();
+
+        // The owner's own record from an hour ago, replayed by anyone holding
+        // a copy. It verifies — it is genuinely the owner's signature.
+        let mut replay = AnycastList::default();
+        replay.upsert(AnycastRecord::sign_at(
+            tag,
+            [0xD3; 32],
+            5,
+            60,
+            0,
+            &owner,
+            now - 3600,
+        ));
+
+        let decision = anycast_store_decision(
+            &key,
+            Some((&held_blob, std::time::Duration::from_millis(50))),
+            &replay.encode(),
+        );
+        let AnycastStoreDecision::Merge(merged) = decision else {
+            panic!("got {decision:?}");
+        };
+        let kept = AnycastList::decode(&merged);
+        assert_eq!(kept.0.len(), 1, "one provider, one record");
+        assert_eq!(
+            kept.0[0].issued_at,
+            Some(now),
+            "the stored record was rolled back to an older publication — a \
+             replayed blob now expires a provider that is still here"
+        );
+    }
+
     /// Records past their own TTL make room; nothing a resolver would still
     /// hand out is dropped.
     #[test]
@@ -2096,6 +2440,7 @@ mod tests {
             score: 0,
             ttl: 3600,
             signature: None,
+            issued_at: None,
         });
         assert_eq!(
             anycast_store_decision(&key, None, &arriving.encode()),

@@ -668,7 +668,12 @@ impl NodeRuntime {
         // mailbox and rendezvous paths already make.
         let mut anycast_svc_builder =
             veil_anycast::AnycastService::new(Arc::clone(&self.dht), self.receiver_node_id())
-                .with_policy(anycast_policy);
+                .with_policy(anycast_policy)
+                // Reading v4 is unconditional; WRITING it partitions us from
+                // every resolver still on an older build, so it waits for the
+                // operator to say the fleet is ready. See
+                // `AnycastService::with_timestamped_records`.
+                .with_timestamped_records(config.anycast.publish_timestamps);
         if let Some(sov) = self.identity.sovereign_identity.get() {
             // Algo-generic owner-signer: signs v2 (Ed25519) OR v3 (Falcon-512 /
             // hybrid) records, so a PQ-only sovereign signs too instead of
