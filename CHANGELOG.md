@@ -1,5 +1,25 @@
 # Changelog
 
+## v0.11.37 — 2026-09-17
+
+### Fixed
+
+- **The Windows half of `veilclient-ffi` compiles.** `rules_json` returned its
+  tail as a `String` where the signature says `Result<String, String>` — a
+  one-line type error in code that is `#[cfg(windows)]` in its entirety, so no
+  gate, no test and no reviewer on macOS or Linux had ever handed it to a
+  compiler. It shipped in v0.11.36 and failed 57 minutes into xVeil's release
+  run, in the Windows bundle, which is the most expensive place to find it.
+
+### Added
+
+- **A Windows type-check in the hygiene job** (`scripts/check-windows-typecheck.sh`).
+  `cargo check -p veilclient-ffi --target x86_64-pc-windows-gnu` with the
+  feature set the Windows bundle actually builds. It reddens on exactly the
+  error above, verified by putting it back. The local mirror of the job skips
+  the toolchain install alongside it: a hygiene CHECK has no business needing
+  root, so a step that does belongs to the runner.
+
 ## v0.11.36 — 2026-09-17
 
 ### Fixed

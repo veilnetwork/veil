@@ -117,6 +117,10 @@ jobs:
           ./scripts/a.sh
       - name: an install
         run: cargo install cbindgen --version "^0.29" --locked
+      - name: a toolchain the runner provides
+        run: |
+          sudo apt-get install -y --no-install-recommends mingw-w64
+          rustup target add x86_64-pc-windows-gnu
   other:
     steps:
       - name: not ours
@@ -132,10 +136,23 @@ def self_test():
     first."""
     steps = steps_of_job(SELF_TEST_WORKFLOW, "hygiene")
     names = [n for n, _ in steps]
-    assert names == ["one liner", "a block", "an install"], names
+    assert names == [
+        "one liner",
+        "a block",
+        "an install",
+        "a toolchain the runner provides",
+    ], names
     assert steps[0][1] == "cargo fmt --all --check", steps[0]
     assert steps[1][1] == "./scripts/a.sh --self-test\n./scripts/a.sh", repr(steps[1][1])
     assert steps[2][1].startswith("cargo install "), steps[2]
+
+    # Both shapes of provisioning are skipped, and a real check is not. A rule
+    # that let the apt step through would have a macOS mirror asking for a
+    # password; one that swallowed a check would report green on nothing.
+    assert is_provisioning(steps[2][1]), "cargo install is provisioning"
+    assert is_provisioning(steps[3][1]), "a sudo step is provisioning"
+    assert not is_provisioning(steps[0][1]), "cargo fmt is a check, not a setup"
+    assert not is_provisioning(steps[1][1]), "a script step is a check"
 
     # A job that is not there, and a job with no steps, must both exit rather
     # than return an empty list that reads as success.
@@ -153,6 +170,20 @@ def self_test():
     return 0
 
 
+def is_provisioning(script):
+    """Whether a step INSTALLS a tool rather than checking the tree.
+
+    `cargo install` was the whole rule until the Windows cross-toolchain step
+    arrived: CI puts mingw-w64 on a fresh Ubuntu runner with `sudo apt-get`,
+    and a local mirror that ran that would ask a macOS developer for their
+    password and then fail. Root is the marker, and it is the right one — a
+    hygiene CHECK has no business needing it, so a step that does is
+    provisioning and belongs to the runner, not to this.
+    """
+    first = script.splitlines()[0] if script else ""
+    return first.startswith("cargo install ") or first.startswith("sudo ")
+
+
 def main():
     if "--self-test" in sys.argv:
         return self_test()
@@ -160,7 +191,7 @@ def main():
 
     runnable, installs = [], []
     for name, script in steps:
-        (installs if script.startswith("cargo install ") else runnable).append((name, script))
+        (installs if is_provisioning(script) else runnable).append((name, script))
 
     if "--list" in sys.argv:
         for name, script in runnable:

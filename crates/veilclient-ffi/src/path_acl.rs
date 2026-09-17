@@ -280,7 +280,7 @@ mod imp {
             ));
         }
         out.push(']');
-        out
+        Ok(out)
     }
 
     /// The whole answer for one path.
