@@ -1140,9 +1140,9 @@ provider of someone else's `node_id`.
 | Key | Type | Default | Description |
 |------|-----|-------------|----------|
 | `resolve_policy` | enum | `"signed_bound"` | Which anycast records to accept. Values: `"signed_bound"` (default — signed and owner-bound), `"signed_only"` (reject unsigned), `"best_effort"` (accept anything — legacy, not recommended) |
-| `publish_timestamps` | bool | `false` | Publish this node's records on the v4 wire, carrying a signed publication time. **Fleet-wide switch — see below.** |
+| `publish_timestamps` | bool | `true` | Publish this node's records on the v4 wire, carrying a signed publication time. **A deliberate flag day — see below.** |
 
-**`publish_timestamps` is a two-release rollout, not a per-node preference.**
+**`publish_timestamps` defaults to ON, and that was a decision.**
 Anycast records for one service tag share a single DHT value, and the store can
 only date the value: any provider's refresh resets the expiry clock for every
 record in it, so a provider that departs is held alive by its neighbours'
@@ -1150,16 +1150,19 @@ refreshes. A v4 record carries its own signed `issued_at` and is aged by that
 instead, which closes it.
 
 Reading v4 is unconditional — every build that has this key accepts, merges and
-republishes v4 records. Writing it is what has to wait. A resolver on an older
-build does not recognise the v4 magic, abandons the record walk at the first v4
-entry, keeps nothing, and rewrites the key with only its own record. One early
-publisher can therefore empty a service tag for every peer that has not
-upgraded, and the damage is mutual once both sides republish.
+republishes v4 records. Writing it is a flag day, taken on purpose on
+2026-09-17. A resolver on an older build does not recognise the v4 magic,
+abandons the record walk at the first v4 entry, keeps nothing, and rewrites the
+key with only its own record. So while the network is mixed, a node on this
+build empties a service tag for every peer that is not, and once both sides
+republish the damage is mutual. The window closes as the fleet updates; the
+alternative was shipping the fix dormant behind a switch nobody would remember
+to throw.
 
-So: deploy the reader everywhere first, confirm no resolver that still matters
-is on an older build, and only then set `publish_timestamps = true` — on the
-seeds and the clients together. Until then the shared-clock behaviour stands,
-knowingly.
+Set `publish_timestamps = false` on a node that must stay legible to peers on an
+older build — a seed kept deliberately compatible during a staged rollout, for
+instance. Its own records then go back to being aged by the shared blob's write
+time, which is the defect, kept deliberately.
 
 **Default lockdown.** `signed_bound` is secure-by-default: a record is accepted
 only if it carries a valid owner signature **and** is bound to the advertising

@@ -3879,13 +3879,12 @@ fn the_identity_selfcheck_is_owned_by_its_task() {
 /// binds: `sig_key_idx == 0` demands `BLAKE3(owner_pubkey) == node_id`, and any
 /// `anycast.publish_timestamps` reaches the service the daemon installs.
 ///
-/// Which anycast wire this node WRITES is a fleet-wide decision — publishing v4
+/// Which anycast wire this node WRITES is a fleet-wide matter — publishing v4
 /// while peers are still on the older build empties a service tag for them (see
-/// `AnycastService::with_timestamped_records`). An operator who sets the key and
-/// gets the old wire anyway has had the decision taken away silently, and an
-/// operator who does NOT set it and gets v4 has shipped a flag day. Both
-/// directions are asserted, because a builder that ignores the field passes
-/// either one alone.
+/// `AnycastService::with_timestamped_records`). The default is ON by the
+/// owner's decision of 2026-09-17; an operator who needs to stay legible to
+/// older peers turns it off. Both directions are asserted, because a builder
+/// that ignores the field passes either one alone.
 #[tokio::test(flavor = "current_thread")]
 async fn the_config_key_reaches_the_anycast_service() {
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -3901,24 +3900,23 @@ async fn the_config_key_reaches_the_anycast_service() {
     let mut runtime = NodeRuntime::start(&path, true).await.expect("node starts");
 
     assert!(
-        !config.anycast.publish_timestamps,
-        "premise: the shipped default must be off",
+        config.anycast.publish_timestamps,
+        "premise: the shipped default is ON (owner's decision, 2026-09-17)",
     );
-    assert!(
-        !runtime
-            .build_anycast_service(&config)
-            .publishes_timestamps(),
-        "the default build published the new wire — that is a flag day for \
-         every peer still on the older one",
-    );
-
-    config.anycast.publish_timestamps = true;
     assert!(
         runtime
             .build_anycast_service(&config)
             .publishes_timestamps(),
-        "the operator asked for the new wire and the builder dropped it — the \
-         fix is unreachable from config",
+        "the default build fell back to the old wire — the fix ships inert",
+    );
+
+    config.anycast.publish_timestamps = false;
+    assert!(
+        !runtime
+            .build_anycast_service(&config)
+            .publishes_timestamps(),
+        "an operator who must stay legible to older peers said so and the \
+         builder dropped it — the switch is unreachable from config",
     );
 
     runtime.stop().await.expect("runtime stops");

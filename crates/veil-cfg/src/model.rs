@@ -845,7 +845,7 @@ impl AnonymityConfig {
 /// owner-signature AND a provable `BLAKE3(owner_pubkey) == node_id`
 /// binding are returned). Opt into `best_effort` explicitly for
 /// discovery-only deployments that must accept legacy unsigned (v1) records.
-#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct AnycastConfig {
     /// String form (TOML-friendly): `"signed_bound"` (default),
     /// `"signed_only"`, or `"best_effort"`.  See [`AnycastResolvePolicyKind`].
@@ -854,24 +854,40 @@ pub struct AnycastConfig {
     /// Publish this node's own anycast records on the **v4 wire**, carrying a
     /// signed publication time.
     ///
-    /// Default `false`, and it stays false until a whole network is on a build
-    /// that READS v4 — which every build carrying this key already does. A
-    /// resolver that predates v4 does not recognise the magic and abandons the
-    /// record walk at the first v4 entry, so one early publisher can empty a
-    /// service tag for every peer that has not upgraded. Turning this on is
-    /// therefore a fleet-wide decision, not a per-node preference.
+    /// **Default `true` since 2026-09-17, and that is a deliberate flag day.**
+    /// A resolver that predates v4 does not recognise the magic: it abandons
+    /// the record walk at the first v4 entry, keeps nothing, and rewrites the
+    /// key with only its own record. So while the network is mixed, a node on
+    /// this build empties a service tag for every peer that is not, and once
+    /// both sides republish the damage is mutual. The owner chose that over
+    /// waiting: the fix ships working rather than dormant, and the window
+    /// closes as the fleet updates.
     ///
-    /// Left off, this node's records are aged by the shared blob's write time,
-    /// so a provider that departs is held alive by its neighbours' refreshes
-    /// (report9 V-06). That is the known cost of not having partitioned the
-    /// network.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    /// Set it to `false` on a node that must stay legible to peers on an older
+    /// build. Its own records are then aged by the shared blob's write time, so
+    /// a provider that departs is held alive by its neighbours' refreshes
+    /// (report9 V-06) — which is the defect, kept deliberately.
+    #[serde(default = "default_true")]
     pub publish_timestamps: bool,
+}
+
+/// `true`, for `#[serde(default = ...)]` on a field whose absence means yes.
+fn default_true() -> bool {
+    true
+}
+
+impl Default for AnycastConfig {
+    fn default() -> Self {
+        Self {
+            resolve_policy: AnycastResolvePolicyKind::default(),
+            publish_timestamps: default_true(),
+        }
+    }
 }
 
 impl AnycastConfig {
     pub fn is_default(c: &Self) -> bool {
-        AnycastResolvePolicyKind::is_default(&c.resolve_policy) && !c.publish_timestamps
+        AnycastResolvePolicyKind::is_default(&c.resolve_policy) && c.publish_timestamps
     }
 }
 

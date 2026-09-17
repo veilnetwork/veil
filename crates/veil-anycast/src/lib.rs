@@ -542,7 +542,7 @@ pub struct AnycastService {
     /// which is what this node did before delegation existed.
     delegation_lookup: Option<AnycastDelegationLookup>,
     /// Whether a signed advertise carries `issued_at` — i.e. publishes on the
-    /// v4 wire. Off by default; see [`Self::with_timestamped_records`].
+    /// v4 wire. ON by default; see [`Self::with_timestamped_records`].
     publish_timestamps: bool,
 }
 
@@ -556,7 +556,7 @@ impl AnycastService {
             signing_key: None,
             generic_signer: None,
             delegation_lookup: None,
-            publish_timestamps: false,
+            publish_timestamps: true,
         }
     }
 
@@ -577,7 +577,7 @@ impl AnycastService {
             signing_key: None,
             generic_signer: None,
             delegation_lookup: None,
-            publish_timestamps: false,
+            publish_timestamps: true,
         }
     }
 
@@ -629,25 +629,22 @@ impl AnycastService {
     }
 
     /// Publish owner-signed records on the **v4 wire**, carrying a signed
-    /// `issued_at`.
+    /// `issued_at`. **On by default** (`veil-cfg`'s
+    /// `anycast.publish_timestamps`); this turns it off.
     ///
-    /// This is the half of report9 V-06 / report27 V03 that cannot be switched
-    /// on by one node alone, which is why it is a decision and not a default.
-    /// Reading v4 is unconditional — this build accepts, merges and republishes
-    /// v4 records whether or not it publishes them. WRITING v4 is what has to
-    /// wait, because a resolver that predates v4 does not recognise the magic:
-    /// a list whose first record is v4 does not read as an anycast list to it
-    /// at all, so it stops the walk, keeps nothing, and rewrites the key with
-    /// only its own record. One early publisher can empty a service tag for
-    /// every peer that has not upgraded.
+    /// Reading v4 is unconditional — every node on this build accepts, merges
+    /// and republishes v4 records regardless. WRITING it is a flag day, and the
+    /// owner chose to take it on 2026-09-17 rather than ship the fix dormant: a
+    /// resolver that predates v4 does not recognise the magic, so a list whose
+    /// first record is v4 does not read as an anycast list to it at all. It
+    /// stops the walk, keeps nothing, and rewrites the key with only its own
+    /// record — one publisher on this build empties a service tag for every
+    /// peer that is not, and once both sides republish the damage is mutual.
+    /// The window closes as the fleet updates.
     ///
-    /// So the rollout is two releases, not one. Ship the reader everywhere
-    /// first; turn this on only once no resolver that still matters is on the
-    /// older build. `veil-cfg`'s `anycast.publish_timestamps` is the switch.
-    ///
-    /// Until then a node keeps publishing v2/v3 and keeps being aged by the
-    /// shared blob clock — the defect stands, knowingly, rather than being
-    /// traded for a partition.
+    /// Turning it off leaves this node publishing v2/v3 and being aged by the
+    /// shared blob clock — report9 V-06, kept deliberately, in exchange for
+    /// staying legible to older peers.
     #[must_use]
     pub fn with_timestamped_records(mut self, on: bool) -> Self {
         self.publish_timestamps = on;
@@ -1563,15 +1560,17 @@ mod tests {
         );
     }
 
-    /// Publishing v4 is OFF unless asked for.
+    /// Publishing v4 is ON by default, and OFF is reachable.
     ///
-    /// Not a preference — a resolver that predates v4 abandons the record walk
-    /// at the first v4 entry and rewrites the key with only its own record, so
-    /// one early publisher empties a service tag for every peer that has not
-    /// upgraded. A default that flips this on ships that partition to whoever
-    /// updates first, which is the shape of a flag day.
+    /// The default is a decision the owner took on 2026-09-17 (report27 V03):
+    /// ship the fix working rather than dormant, and accept that while the
+    /// network is mixed a node on this build empties a service tag for every
+    /// peer that is not. Pinned in both directions because each half can break
+    /// on its own — a default silently back to v2 leaves the fix inert, and a
+    /// switch that cannot turn it off leaves an operator no way to stay legible
+    /// to older peers.
     #[test]
-    fn publishing_the_new_wire_is_off_by_default() {
+    fn publishing_the_new_wire_is_on_by_default_and_can_be_turned_off() {
         let dht = Arc::new(KademliaService::new([0xE7; 32]));
         let svc = AnycastService::new(Arc::clone(&dht), [0xE7; 32])
             .with_policy(AnycastResolvePolicy::BestEffort)
@@ -1583,13 +1582,29 @@ mod tests {
             .expect("the advertise wrote something");
         assert_eq!(
             &blob[0..2],
-            &ANYCAST_MAGIC_V2,
-            "a default build published the v4 wire — every un-upgraded \
-             resolver just lost this service tag"
+            &ANYCAST_MAGIC_V4,
+            "a default build fell back to the old wire — the fix ships inert"
         );
-        let rec = &AnycastList::decode(&blob).0[0];
-        assert!(rec.signature.is_some(), "premise: it is signed at all");
-        assert_eq!(rec.issued_at, None, "and carries no publication time");
+        assert!(
+            AnycastList::decode(&blob).0[0].issued_at.is_some(),
+            "and the record carries no publication time to be aged by"
+        );
+
+        let quiet = AnycastService::new(Arc::clone(&dht), [0xE8; 32])
+            .with_policy(AnycastResolvePolicy::BestEffort)
+            .with_signing_key(Arc::new(make_signing_key(0xE8)), 0)
+            .with_timestamped_records(false);
+        quiet.advertise(*b"dfl2", 5, 3600);
+        let old_wire = dht
+            .get_local(&AnycastRecord::dht_key(*b"dfl2"))
+            .expect("the advertise wrote something");
+        assert_eq!(
+            &old_wire[0..2],
+            &ANYCAST_MAGIC_V2,
+            "turning it off must reach the wire, or an operator who needs to \
+             stay readable to older peers has no way to say so"
+        );
+        assert_eq!(AnycastList::decode(&old_wire).0[0].issued_at, None);
     }
 
     /// report9 V-06 / report27 V03 — a provider that departs expires on ITS OWN
@@ -1612,12 +1627,10 @@ mod tests {
         let dht = Arc::new(KademliaService::new([0xE3; 32]));
         let leaving = AnycastService::new(Arc::clone(&dht), [0xE3; 32])
             .with_policy(AnycastResolvePolicy::BestEffort)
-            .with_signing_key(Arc::new(make_signing_key(0xE3)), 0)
-            .with_timestamped_records(true);
+            .with_signing_key(Arc::new(make_signing_key(0xE3)), 0);
         let staying = AnycastService::new(Arc::clone(&dht), [0xE4; 32])
             .with_policy(AnycastResolvePolicy::BestEffort)
-            .with_signing_key(Arc::new(make_signing_key(0xE4)), 0)
-            .with_timestamped_records(true);
+            .with_signing_key(Arc::new(make_signing_key(0xE4)), 0);
 
         leaving.advertise(*b"ttl2", 7, 1); // 1 s record TTL, then departs
         staying.advertise(*b"ttl2", 7, 60);
