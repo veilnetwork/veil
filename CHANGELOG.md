@@ -1,5 +1,49 @@
 # Changelog
 
+## v0.11.36 — 2026-09-17
+
+### Fixed
+
+- **An anycast advertisement now says when its own owner published it.**
+  Records for one service tag share a single DHT value and the store can only
+  date the value, so any provider's refresh restarted the expiry clock for every
+  record in it — including one belonging to a provider that departed and will
+  never publish again. On a busy tag that provider was held alive indefinitely,
+  which is the blackhole the per-record TTL was added to stop. A v4 record
+  (magic "AF") carries a signed `issued_at`, and both the resolver and the STORE
+  gate age such a record by that instead of by the blob. The timestamp is inside
+  the signature and rides only a signed record: an unsigned one is
+  peer-controlled, and a back-dated one would be an eviction of somebody else's
+  live record. For the same reason the merge refuses a record that is an older
+  publication of one it already holds (report9 V-06, report27 V03).
+
+- **A control row can be judged by the key's window at the moment it arrived.**
+  `veil_identity_document_authorizes` answers "is this key listed" and ignores
+  the key's own validity window, so a device secret kept the authority its
+  delegation granted long after the delegation lapsed.
+  `veil_identity_document_authorized_at` verifies the DOCUMENT at now and the
+  KEY's window at a given moment, which survives renewal. `at = 0` gives the
+  listed-only answer, so a caller with nothing honest to pass is unchanged
+  (report27 V02).
+
+- The rest of report27's veil findings: an install is one transaction with its
+  staging file owned; a one-sided pinned relay, a claim nobody released and a
+  keepalive addressed by slot; an eviction that gives back its own claim and
+  nobody else's; one cell delivered once and one endpoint with one spelling; a
+  config unit outside ASCII that panicked the parser.
+
+### Changed
+
+- **A node publishes the timestamped anycast wire by default**
+  (`anycast.publish_timestamps`). READING v4 is unconditional in this build;
+  writing it is a deliberate flag day. A resolver that predates v4 does not
+  recognise the magic, abandons the record walk at the first v4 entry, keeps
+  nothing, and rewrites the key with only its own record — so while the network
+  is mixed, a node on this build empties a service tag for every peer that is
+  not, and once both sides republish the damage is mutual. The window closes as
+  the fleet updates. Set the key to `false` on a node that must stay legible to
+  peers on an older build.
+
 ## v0.11.35 — 2026-09-16
 
 ### Fixed
