@@ -2514,16 +2514,19 @@ pub fn a_record_this_node_would_refuse_is_not_republished() {
 ///
 /// `advertise` writes with `store_local`, so the only thing that ever carries
 /// an advertisement to another node is this filter saying yes. It said no —
-/// for every one of the three anycast magics — and the receiving STORE gate
-/// had no arm for them either, so a resolver anywhere else got nothing, always.
-/// All three versions are named because a list's first two bytes are its FIRST
-/// record's magic, and which version that is depends on who advertised.
+/// for every one of the anycast magics — and the receiving STORE gate had no
+/// arm for them either, so a resolver anywhere else got nothing, always.
+/// Every version is named because a list's first two bytes are its FIRST
+/// record's magic, and which version that is depends on who advertised: a v4
+/// list dropped here would mean an upgraded node advertises into the void
+/// while the un-upgraded ones around it still work.
 #[test]
 pub fn is_self_authenticating_accepts_every_anycast_magic() {
     for magic in [
         veil_proto::anycast::ANYCAST_MAGIC,
         veil_proto::anycast::ANYCAST_MAGIC_V2,
         veil_proto::anycast::ANYCAST_MAGIC_V3,
+        veil_proto::anycast::ANYCAST_MAGIC_V4,
     ] {
         let mut v = Vec::new();
         v.extend_from_slice(&magic);
@@ -2533,10 +2536,13 @@ pub fn is_self_authenticating_accepts_every_anycast_magic() {
             "anycast magic {magic:?} must be republished",
         );
     }
-    // And the neighbouring two-byte values are not anycast: "AB" and "AF"
-    // bracket the three magics, so a range check written by mistake shows up.
+    // And the neighbouring two-byte values are not anycast: "AB" and "AG"
+    // bracket the four magics, so a range check written by mistake shows up.
+    // "AF" used to sit in this half of the assertion and is now v4 — a magic
+    // added without moving the bracket reddens here rather than silently
+    // turning a negative into a tautology.
     assert!(!NodeRuntime::is_self_authenticating_dht_value(b"ABxxxx"));
-    assert!(!NodeRuntime::is_self_authenticating_dht_value(b"AFxxxx"));
+    assert!(!NodeRuntime::is_self_authenticating_dht_value(b"AGxxxx"));
 }
 
 #[test]
@@ -3871,6 +3877,54 @@ fn the_identity_selfcheck_is_owned_by_its_task() {
 /// A resolver binds a record to an address before it will hand it out, and
 /// under the DEFAULT `SignedBound` policy the record's own `node_id` is what it
 /// binds: `sig_key_idx == 0` demands `BLAKE3(owner_pubkey) == node_id`, and any
+/// `anycast.publish_timestamps` reaches the service the daemon installs.
+///
+/// Which anycast wire this node WRITES is a fleet-wide decision — publishing v4
+/// while peers are still on the older build empties a service tag for them (see
+/// `AnycastService::with_timestamped_records`). An operator who sets the key and
+/// gets the old wire anyway has had the decision taken away silently, and an
+/// operator who does NOT set it and gets v4 has shipped a flag day. Both
+/// directions are asserted, because a builder that ignores the field passes
+/// either one alone.
+#[tokio::test(flavor = "current_thread")]
+async fn the_config_key_reaches_the_anycast_service() {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!("anycast-publish-flag-{unique}"));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("node.toml");
+
+    let mut config = runtime_config_with_listen();
+    veil_cfg::save_config(&path, &config).unwrap();
+    let mut runtime = NodeRuntime::start(&path, true).await.expect("node starts");
+
+    assert!(
+        !config.anycast.publish_timestamps,
+        "premise: the shipped default must be off",
+    );
+    assert!(
+        !runtime
+            .build_anycast_service(&config)
+            .publishes_timestamps(),
+        "the default build published the new wire — that is a flag day for \
+         every peer still on the older one",
+    );
+
+    config.anycast.publish_timestamps = true;
+    assert!(
+        runtime
+            .build_anycast_service(&config)
+            .publishes_timestamps(),
+        "the operator asked for the new wire and the builder dropped it — the \
+         fix is unreachable from config",
+    );
+
+    runtime.stop().await.expect("runtime stops");
+    let _ = fs::remove_dir_all(&dir);
+}
+
 /// other index looks up the identity document AT that node_id. The device's
 /// transport id satisfies neither — its hash is of the wrong key, and no
 /// document is stored at it. So publishing under it did not merely name the

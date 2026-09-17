@@ -851,11 +851,27 @@ pub struct AnycastConfig {
     /// `"signed_only"`, or `"best_effort"`.  See [`AnycastResolvePolicyKind`].
     #[serde(default, skip_serializing_if = "AnycastResolvePolicyKind::is_default")]
     pub resolve_policy: AnycastResolvePolicyKind,
+    /// Publish this node's own anycast records on the **v4 wire**, carrying a
+    /// signed publication time.
+    ///
+    /// Default `false`, and it stays false until a whole network is on a build
+    /// that READS v4 — which every build carrying this key already does. A
+    /// resolver that predates v4 does not recognise the magic and abandons the
+    /// record walk at the first v4 entry, so one early publisher can empty a
+    /// service tag for every peer that has not upgraded. Turning this on is
+    /// therefore a fleet-wide decision, not a per-node preference.
+    ///
+    /// Left off, this node's records are aged by the shared blob's write time,
+    /// so a provider that departs is held alive by its neighbours' refreshes
+    /// (report9 V-06). That is the known cost of not having partitioned the
+    /// network.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub publish_timestamps: bool,
 }
 
 impl AnycastConfig {
     pub fn is_default(c: &Self) -> bool {
-        AnycastResolvePolicyKind::is_default(&c.resolve_policy)
+        AnycastResolvePolicyKind::is_default(&c.resolve_policy) && !c.publish_timestamps
     }
 }
 

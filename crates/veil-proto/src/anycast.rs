@@ -19,11 +19,22 @@
 //! ```
 //! Total: 44 bytes per record.
 //!
+//! Three signed versions layer on top: v2 ("AD", fixed 141 B, Ed25519), v3
+//! ("AE", length-prefixed, any other algorithm) and v4 ("AF", length-prefixed,
+//! any algorithm, carrying a signed `issued_at`).
+//!
 //! # DHT value format
 //! Multiple records can be stored under the same DHT key (one per advertising node).
-//! The DHT value is a concatenation of `AnycastRecord` entries, each 44 bytes.
-//! Up to `MAX_ANYCAST_CANDIDATES` records are stored; older entries are evicted
-//! when the list is full.
+//! The DHT value is a concatenation of `AnycastRecord` entries — 44 bytes for a
+//! v1 record, and self-describing lengths for the rest (see
+//! [`AnycastRecord::wire_len`]). Up to `MAX_ANYCAST_CANDIDATES` records are
+//! stored; older entries are evicted when the list is full.
+//!
+//! Because the records SHARE one value, the store can only date the value, not
+//! the records in it: any provider's refresh rewrites the whole blob. That is
+//! what `issued_at` exists to fix — a v4 record says when ITS owner published
+//! it, so a departed provider ages out on its own TTL rather than on the busiest
+//! provider's refresh interval.
 
 use crate::ProtoError;
 
@@ -47,18 +58,35 @@ pub const ANYCAST_MAGIC_V2: [u8; 2] = [0x41, 0x44]; // "AD"
 /// resolvers that predate v3 (they skip the unknown v3 magic).
 pub const ANYCAST_MAGIC_V3: [u8; 2] = [0x41, 0x45]; // "AE"
 
+/// Magic bytes identifying a **v4 (timestamped, owner-signed)** AnycastRecord.
+/// V4 is v3's layout plus a SIGNED `issued_at` — the one field that lets a
+/// resolver age a record by when ITS OWNER published it rather than by when the
+/// shared blob was last written by anybody (report9 V-06, report27 V03).
+///
+/// Unlike v3 this carries ANY algorithm, Ed25519 included: the timestamp is the
+/// point, and a v4 record is variable-length regardless, so there is nothing
+/// left for a fixed-size Ed25519 wire to buy.
+///
+/// ROLLOUT. A resolver that predates v4 skips the unknown magic, so a list
+/// whose FIRST record is v4 does not read as an anycast list to it at all.
+/// Publishers stay on v2/v3 until `issued_at` is set — see [`AnycastRecord::encode`].
+pub const ANYCAST_MAGIC_V4: [u8; 2] = [0x41, 0x46]; // "AF"
+
 /// Whether a DHT value is an anycast service list.
 ///
 /// A list is a concatenation of records, so its first two bytes are the first
-/// record's magic — v1, v2 or v3. One place to ask, because the answer is
+/// record's magic — v1, v2, v3 or v4. One place to ask, because the answer is
 /// needed by the STORE gate, by the republish filter and by the resolver, and
-/// three hand-written copies of "one of these three constants" is how the v3
+/// three hand-written copies of "one of these constants" is how a newly added
 /// magic gets forgotten in one of them.
 #[must_use]
 pub fn is_anycast_blob(value: &[u8]) -> bool {
     matches!(
         value.get(..2),
-        Some(m) if m == ANYCAST_MAGIC || m == ANYCAST_MAGIC_V2 || m == ANYCAST_MAGIC_V3
+        Some(m) if m == ANYCAST_MAGIC
+            || m == ANYCAST_MAGIC_V2
+            || m == ANYCAST_MAGIC_V3
+            || m == ANYCAST_MAGIC_V4
     )
 }
 
@@ -82,6 +110,10 @@ pub const MAX_ANYCAST_SIG_LEN: usize = 4096;
 /// pubkey_len = 47.
 const ANYCAST_V3_PREFIX_LEN: usize = 47;
 
+/// Fixed prefix length of a v4 record up to (not including) `owner_pubkey`:
+/// the v3 prefix plus the 8-byte `issued_at` = 55.
+const ANYCAST_V4_PREFIX_LEN: usize = ANYCAST_V3_PREFIX_LEN + 8;
+
 /// Maximum number of candidate records stored per service tag in the DHT.
 pub const MAX_ANYCAST_CANDIDATES: usize = 32;
 
@@ -95,11 +127,12 @@ pub const MAX_ANYCAST_CANDIDATES: usize = 32;
 /// `node_id == BLAKE3(owner_pubkey)`, but advanced sovereign-identity flows may
 /// use a subkey indicated by `sig_key_idx`.
 ///
-/// `sig_algo` is a [`veil_types::SignatureAlgorithm::wire_byte`]: Ed25519
-/// records ride the fixed-size v2 wire (32-byte pubkey, 64-byte sig); any other
-/// algorithm (Falcon-512, hybrid) rides the length-prefixed v3 wire. The struct
-/// holds `Vec`s so a single shape covers both — for v2 they are always exactly
-/// 32 / 64 bytes.
+/// `sig_algo` is a [`veil_types::SignatureAlgorithm::wire_byte`]: an untimestamped
+/// Ed25519 record rides the fixed-size v2 wire (32-byte pubkey, 64-byte sig);
+/// any other algorithm (Falcon-512, hybrid) rides the length-prefixed v3 wire;
+/// and anything carrying an `issued_at` rides v4, whatever its algorithm. The
+/// struct holds `Vec`s so a single shape covers all of them — for v2 they are
+/// always exactly 32 / 64 bytes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AnycastRecordSig {
     /// Signature algorithm wire-byte ([`veil_types::SignatureAlgorithm::wire_byte`]).
@@ -135,6 +168,21 @@ pub struct AnycastRecord {
     pub ttl: u32,
     /// Owner-binding signature (v2 only). `None` ⇒ legacy v1 record.
     pub signature: Option<AnycastRecordSig>,
+    /// Unix seconds at which the OWNER published this advertisement (v4 only).
+    ///
+    /// This is the field that makes a per-record TTL mean what it says. Records
+    /// for one service tag share a DHT blob, and the store times the BLOB — so
+    /// without this, any provider's refresh restarts the clock for a provider
+    /// that departed and will never publish again (report9 V-06). With it, a
+    /// resolver ages each record by its own publication time.
+    ///
+    /// It is covered by the signature, and only carried on a SIGNED record.
+    /// An unsigned timestamp is peer-controlled like `score`, and would hand a
+    /// hostile publisher an eviction it does not have today: back-date someone
+    /// else's record and a resolver drops a live provider. [`Self::encode`]
+    /// therefore emits it only alongside a signature, and v1/v2/v3 decode to
+    /// `None`.
+    pub issued_at: Option<u64>,
 }
 
 /// Whether a `sig_algo` wire-byte denotes Ed25519 (the v2 algorithm). `1` is the
@@ -157,12 +205,28 @@ impl AnycastRecord {
         *h.finalize().as_bytes()
     }
 
-    /// Encode the record. Unsigned → v1 (44 B). Signed with Ed25519 → v2
-    /// (141 B, backward-compatible). Signed with any other algorithm
+    /// Encode the record. Unsigned → v1 (44 B). Signed and timestamped → v4
+    /// (length-prefixed, any algorithm). Signed with Ed25519 and no timestamp →
+    /// v2 (141 B, backward-compatible). Signed with any other algorithm
     /// (Falcon-512, hybrid) → v3 (length-prefixed, variable). Returns a
     /// `Vec<u8>` because the length depends on version.
+    ///
+    /// `issued_at` selects v4 and nothing else does, which is what keeps the
+    /// rollout staged: a publisher that does not set it keeps emitting exactly
+    /// the bytes it emitted before, and resolvers that predate v4 keep reading
+    /// them. An `issued_at` on an UNSIGNED record is dropped rather than
+    /// written — see the field doc for why it must not ride the wire alone.
     pub fn encode(&self) -> Vec<u8> {
         match &self.signature {
+            Some(sig) if self.issued_at.is_some() => {
+                let mut buf = Vec::with_capacity(
+                    ANYCAST_V4_PREFIX_LEN + sig.owner_pubkey.len() + 1 + 2 + sig.signature.len(),
+                );
+                self.encode_canonical_v4(&mut buf, sig);
+                buf.extend_from_slice(&(sig.signature.len() as u16).to_be_bytes());
+                buf.extend_from_slice(&sig.signature);
+                buf
+            }
             Some(sig) if is_ed25519_wire_algo(sig.sig_algo) => {
                 let mut buf = Vec::with_capacity(ANYCAST_RECORD_V2_SIZE);
                 self.encode_canonical_v2(&mut buf, sig);
@@ -200,12 +264,30 @@ impl AnycastRecord {
             return Vec::new();
         };
         let mut buf = Vec::new();
-        if is_ed25519_wire_algo(sig.sig_algo) {
+        if self.issued_at.is_some() {
+            self.encode_canonical_v4(&mut buf, sig);
+        } else if is_ed25519_wire_algo(sig.sig_algo) {
             self.encode_canonical_v2(&mut buf, sig);
         } else {
             self.encode_canonical_v3(&mut buf, sig);
         }
         buf
+    }
+
+    /// Write the canonical-bytes prefix of a v4 record (magic … sig_key_idx).
+    /// Identical to v3 with `issued_at` spliced in after `ttl`, so the
+    /// timestamp is inside what the signature covers.
+    fn encode_canonical_v4(&self, buf: &mut Vec<u8>, sig: &AnycastRecordSig) {
+        buf.extend_from_slice(&ANYCAST_MAGIC_V4);
+        buf.extend_from_slice(&self.service_tag);
+        buf.extend_from_slice(&self.node_id);
+        buf.extend_from_slice(&self.score.to_be_bytes());
+        buf.extend_from_slice(&self.ttl.to_be_bytes());
+        buf.extend_from_slice(&self.issued_at.unwrap_or(0).to_be_bytes());
+        buf.push(sig.sig_algo);
+        buf.extend_from_slice(&(sig.owner_pubkey.len() as u16).to_be_bytes());
+        buf.extend_from_slice(&sig.owner_pubkey);
+        buf.push(sig.sig_key_idx);
     }
 
     /// Write the canonical-bytes prefix of a v3 record (magic … sig_key_idx).
@@ -253,6 +335,7 @@ impl AnycastRecord {
             (a, b) if [a, b] == ANYCAST_MAGIC => Self::decode_v1(buf),
             (a, b) if [a, b] == ANYCAST_MAGIC_V2 => Self::decode_v2(buf),
             (a, b) if [a, b] == ANYCAST_MAGIC_V3 => Self::decode_v3(buf),
+            (a, b) if [a, b] == ANYCAST_MAGIC_V4 => Self::decode_v4(buf),
             _ => Err(ProtoError::InvalidMagic([buf[0], buf[1], 0, 0])),
         }
     }
@@ -283,6 +366,24 @@ impl AnycastRecord {
                 }
                 sig_len_off.checked_add(2)?.checked_add(sig_len)
             }
+            (a, b) if [a, b] == ANYCAST_MAGIC_V4 => {
+                // v3's shape with `issued_at` spliced in after `ttl`, so every
+                // length field sits 8 bytes further along.
+                // [..53 fixed..][pubkey_len u16 @53][pubkey][sig_key_idx u8]
+                // [sig_len u16][sig]
+                let pubkey_len = super::read_u16_be(buf, 53).ok()? as usize;
+                if pubkey_len > MAX_ANYCAST_PUBKEY_LEN {
+                    return None;
+                }
+                let sig_len_off = ANYCAST_V4_PREFIX_LEN
+                    .checked_add(pubkey_len)?
+                    .checked_add(1)?;
+                let sig_len = super::read_u16_be(buf, sig_len_off).ok()? as usize;
+                if sig_len > MAX_ANYCAST_SIG_LEN {
+                    return None;
+                }
+                sig_len_off.checked_add(2)?.checked_add(sig_len)
+            }
             _ => None,
         }
     }
@@ -304,6 +405,7 @@ impl AnycastRecord {
             score,
             ttl,
             signature: None,
+            issued_at: None,
         })
     }
 
@@ -333,6 +435,7 @@ impl AnycastRecord {
                 sig_key_idx,
                 signature: signature.to_vec(),
             }),
+            issued_at: None,
         })
     }
 
@@ -399,6 +502,74 @@ impl AnycastRecord {
                 sig_key_idx,
                 signature: buf[sig_start..sig_end].to_vec(),
             }),
+            issued_at: None,
+        })
+    }
+
+    /// Decode a v4 record: v3's layout with a signed `issued_at` after `ttl`.
+    ///
+    /// Unlike v3 this accepts EVERY algorithm, Ed25519 included. v3 refuses
+    /// Ed25519 to keep the v2/v3 split unambiguous, and that reasoning does not
+    /// carry: there is no fixed-size v4 wire for Ed25519 to be ambiguous with,
+    /// and `issued_at` alone decides that a record is v4.
+    fn decode_v4(buf: &[u8]) -> Result<Self, ProtoError> {
+        if buf.len() < ANYCAST_V4_PREFIX_LEN {
+            return Err(ProtoError::BufferTooShort {
+                need: ANYCAST_V4_PREFIX_LEN,
+                got: buf.len(),
+            });
+        }
+        let service_tag = super::read_array::<4>(buf, 2)?;
+        let node_id = super::read_array::<32>(buf, 6)?;
+        let score = super::read_u16_be(buf, 38)?;
+        let ttl = super::read_u32_be(buf, 40)?;
+        let issued_at = super::read_u64_be(buf, 44)?;
+        let sig_algo = buf[52];
+        let pubkey_len = super::read_u16_be(buf, 53)? as usize;
+        if pubkey_len > MAX_ANYCAST_PUBKEY_LEN {
+            return Err(ProtoError::Malformed(format!(
+                "anycast v4 owner_pubkey too long: {pubkey_len} > {MAX_ANYCAST_PUBKEY_LEN}"
+            )));
+        }
+        let pubkey_end = ANYCAST_V4_PREFIX_LEN + pubkey_len;
+        // need pubkey + sig_key_idx(1) + sig_len(2)
+        if buf.len() < pubkey_end + 3 {
+            return Err(ProtoError::BufferTooShort {
+                need: pubkey_end + 3,
+                got: buf.len(),
+            });
+        }
+        let owner_pubkey = buf[ANYCAST_V4_PREFIX_LEN..pubkey_end].to_vec();
+        let sig_key_idx = buf[pubkey_end];
+        let sig_len = super::read_u16_be(buf, pubkey_end + 1)? as usize;
+        if sig_len > MAX_ANYCAST_SIG_LEN {
+            return Err(ProtoError::Malformed(format!(
+                "anycast v4 signature too long: {sig_len} > {MAX_ANYCAST_SIG_LEN}"
+            )));
+        }
+        let sig_start = pubkey_end + 3;
+        let sig_end = sig_start + sig_len;
+        // Exact length, for the same reason v3 insists on it: the list decoder
+        // slices to `wire_len`, so trailing bytes mean the record is not what
+        // it declared itself to be.
+        if buf.len() != sig_end {
+            return Err(ProtoError::Malformed(format!(
+                "anycast v4 wrong length: have {}, expected exactly {sig_end}",
+                buf.len()
+            )));
+        }
+        Ok(AnycastRecord {
+            service_tag,
+            node_id,
+            score,
+            ttl,
+            signature: Some(AnycastRecordSig {
+                sig_algo,
+                owner_pubkey,
+                sig_key_idx,
+                signature: buf[sig_start..sig_end].to_vec(),
+            }),
+            issued_at: Some(issued_at),
         })
     }
 
@@ -513,8 +684,12 @@ impl AnycastRecord {
         Ok(())
     }
 
-    /// Construct a v2 (signed) record. Caller supplies the Ed25519
-    /// signing key; pubkey is derived and embedded automatically.
+    /// Construct a v2 (signed, untimestamped) record. Caller supplies the
+    /// Ed25519 signing key; pubkey is derived and embedded automatically.
+    ///
+    /// Prefer [`Self::sign_at`] for anything a resolver will age: a v2 record
+    /// carries no publication time, so it can only be aged by the shared blob's
+    /// age, which is the wrong clock as soon as a tag has two providers.
     pub fn sign(
         service_tag: [u8; 4],
         node_id: [u8; 32],
@@ -523,9 +698,55 @@ impl AnycastRecord {
         sig_key_idx: u8,
         signing_key: &ed25519_dalek::SigningKey,
     ) -> Self {
+        Self::sign_inner(
+            service_tag,
+            node_id,
+            score,
+            ttl,
+            sig_key_idx,
+            signing_key,
+            None,
+        )
+    }
+
+    /// Construct a v4 (signed, timestamped) Ed25519 record: as [`Self::sign`],
+    /// with `issued_at` covered by the signature so a resolver can age this
+    /// record by when its owner published it.
+    pub fn sign_at(
+        service_tag: [u8; 4],
+        node_id: [u8; 32],
+        score: u16,
+        ttl: u32,
+        sig_key_idx: u8,
+        signing_key: &ed25519_dalek::SigningKey,
+        issued_at: u64,
+    ) -> Self {
+        Self::sign_inner(
+            service_tag,
+            node_id,
+            score,
+            ttl,
+            sig_key_idx,
+            signing_key,
+            Some(issued_at),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn sign_inner(
+        service_tag: [u8; 4],
+        node_id: [u8; 32],
+        score: u16,
+        ttl: u32,
+        sig_key_idx: u8,
+        signing_key: &ed25519_dalek::SigningKey,
+        issued_at: Option<u64>,
+    ) -> Self {
         use ed25519_dalek::Signer;
         let owner_pubkey = signing_key.verifying_key().to_bytes().to_vec();
-        // Build placeholder sig to get canonical bytes via encode_canonical_v2.
+        // Build a placeholder sig to get canonical bytes; `issued_at` decides
+        // whether those are the v2 or the v4 layout, so it has to be set here
+        // and not patched in afterwards.
         let mut placeholder = Self {
             service_tag,
             node_id,
@@ -537,6 +758,7 @@ impl AnycastRecord {
                 sig_key_idx,
                 signature: vec![0u8; 64],
             }),
+            issued_at,
         };
         // unwrap: we just set signature to Some above.
         let canonical = placeholder.canonical_bytes();
@@ -561,8 +783,12 @@ pub struct AnycastList(pub Vec<AnycastRecord>);
 impl AnycastList {
     /// Decode all records from a DHT value blob.
     ///
-    /// Auto-detects v1 (44 B), v2 (141 B) and v3 (variable, length-prefixed)
-    /// records by magic prefix. Silently skips records that fail to decode
+    /// Auto-detects v1 (44 B), v2 (141 B), v3 and v4 (variable,
+    /// length-prefixed) records by magic prefix. Sizing goes through
+    /// [`AnycastRecord::wire_len`], so a version added there is stepped over
+    /// here without further work — but a version it does NOT know aborts the
+    /// walk, which is what makes a v4 record invisible to a resolver that
+    /// predates it. Silently skips records that fail to decode
     /// (wrong magic, stale format, truncated tail). DOES NOT verify signatures
     /// here — caller decides trust policy.
     pub fn decode(blob: &[u8]) -> Self {
@@ -844,6 +1070,7 @@ mod tests {
             score: 100,
             ttl: 3600,
             signature: None,
+            issued_at: None,
         }
     }
 
@@ -877,6 +1104,7 @@ mod tests {
                 sig_key_idx: 0,
                 signature: vec![0xCD; sig_len],
             }),
+            issued_at: None,
         }
     }
 
@@ -1081,6 +1309,133 @@ mod tests {
     }
 
     // ── verify_owner_binding (audit batch 2026-05-23) ────────────────
+
+    // ── v4: the signed publication time ─────────────────────────────────────
+
+    fn v4_key() -> ed25519_dalek::SigningKey {
+        ed25519_dalek::SigningKey::from_bytes(&[0x64; 32])
+    }
+
+    #[test]
+    fn v4_roundtrips_and_carries_the_publication_time() {
+        let r = AnycastRecord::sign_at(*b"mbox", [0x64; 32], 5, 3600, 0, &v4_key(), 1_700_000_000);
+        let enc = r.encode();
+        assert_eq!(
+            &enc[0..2],
+            &ANYCAST_MAGIC_V4,
+            "issued_at selects the v4 wire"
+        );
+        assert_eq!(
+            AnycastRecord::wire_len(&enc),
+            Some(enc.len()),
+            "wire_len must size a v4 record exactly, or the list walk slides"
+        );
+        let dec = AnycastRecord::decode(&enc).expect("v4 decodes");
+        assert_eq!(dec, r);
+        assert_eq!(dec.issued_at, Some(1_700_000_000));
+        dec.verify_signature()
+            .expect("v4 Ed25519 signature verifies");
+    }
+
+    /// The whole point of the version: a timestamp nobody signed is a timestamp
+    /// anybody can set, and setting it back expires a live provider early.
+    #[test]
+    fn v4_signature_covers_the_publication_time() {
+        let r = AnycastRecord::sign_at(*b"mbox", [0x64; 32], 5, 3600, 0, &v4_key(), 1_700_000_000);
+        let mut enc = r.encode();
+        // `issued_at` sits at [44..52] — back-date it by a day.
+        let backdated = (1_700_000_000u64 - 86_400).to_be_bytes();
+        enc[44..52].copy_from_slice(&backdated);
+        let tampered = AnycastRecord::decode(&enc).expect("still well-formed");
+        assert_eq!(
+            tampered.issued_at,
+            Some(1_700_000_000 - 86_400),
+            "the edit landed on the timestamp, or this test proves nothing"
+        );
+        assert!(
+            tampered.verify_signature().is_err(),
+            "a back-dated issued_at must break the signature"
+        );
+    }
+
+    /// Ed25519 is refused on v3 (it belongs on the fixed-size v2 wire) and
+    /// admitted on v4, where there is no fixed-size alternative to be ambiguous
+    /// with. Without this, no Ed25519 node could ever publish a timestamp.
+    #[test]
+    fn v4_admits_the_ed25519_algo_that_v3_refuses() {
+        let r = AnycastRecord::sign_at(*b"mbox", [0x64; 32], 5, 3600, 0, &v4_key(), 1_700_000_000);
+        assert_eq!(r.signature.as_ref().unwrap().sig_algo, 1, "Ed25519");
+        let mut as_v3 = r.encode();
+        as_v3[0..2].copy_from_slice(&ANYCAST_MAGIC_V3);
+        assert!(
+            AnycastRecord::decode(&as_v3).is_err(),
+            "v3 refuses an Ed25519 algo byte"
+        );
+        assert!(AnycastRecord::decode(&r.encode()).is_ok(), "v4 admits it");
+    }
+
+    /// An `issued_at` without a signature is dropped rather than written. It
+    /// would otherwise be a field any relaying peer could rewrite, and a
+    /// back-dated one evicts a live provider — see the field doc.
+    #[test]
+    fn an_unsigned_record_never_writes_its_timestamp() {
+        let mut r = sample_record(0x11);
+        r.issued_at = Some(1_700_000_000);
+        let enc = r.encode();
+        assert_eq!(&enc[0..2], &ANYCAST_MAGIC, "unsigned stays on v1");
+        assert_eq!(enc.len(), ANYCAST_RECORD_SIZE, "and stays 44 bytes");
+        assert_eq!(
+            AnycastRecord::decode(&enc).unwrap().issued_at,
+            None,
+            "the timestamp must not survive the round trip"
+        );
+    }
+
+    /// A publisher that sets no `issued_at` emits byte-for-byte what it emitted
+    /// before v4 existed. That is what keeps the rollout staged rather than a
+    /// flag day for every resolver at once.
+    #[test]
+    fn without_a_timestamp_the_bytes_are_unchanged() {
+        let key = v4_key();
+        let v2 = AnycastRecord::sign(*b"mbox", [0x64; 32], 5, 3600, 0, &key);
+        let enc = v2.encode();
+        assert_eq!(&enc[0..2], &ANYCAST_MAGIC_V2);
+        assert_eq!(enc.len(), ANYCAST_RECORD_V2_SIZE);
+    }
+
+    /// The list walk sizes each record independently, so a v4 record between
+    /// two older ones neither hides them nor derails the walk.
+    #[test]
+    fn a_list_steps_over_a_v4_record() {
+        let key = v4_key();
+        let mut list = AnycastList::default();
+        list.upsert(sample_record(0x01));
+        list.upsert(AnycastRecord::sign_at(
+            *b"mbox",
+            [0x02; 32],
+            5,
+            3600,
+            0,
+            &key,
+            1_700_000_000,
+        ));
+        list.upsert(AnycastRecord::sign(*b"mbox", [0x03; 32], 5, 3600, 0, &key));
+        let blob = list.encode();
+        assert!(is_anycast_blob(&blob), "a list led by a v1 record is one");
+        let back = AnycastList::decode(&blob);
+        assert_eq!(back.0.len(), 3, "all three records survive the walk");
+        assert_eq!(back.0, list.0);
+    }
+
+    #[test]
+    fn a_v4_blob_reads_as_an_anycast_list() {
+        let r = AnycastRecord::sign_at(*b"mbox", [0x64; 32], 5, 3600, 0, &v4_key(), 1_700_000_000);
+        assert!(
+            is_anycast_blob(&r.encode()),
+            "the STORE gate, the republish filter and the resolver all ask this \
+             one question — a v4 magic missing from it drops the record silently"
+        );
+    }
 
     fn signed_record_for(node_id: [u8; 32], sig_key_idx: u8) -> AnycastRecord {
         // Synthesize a signing key whose BLAKE3 pubkey-hash gives the
