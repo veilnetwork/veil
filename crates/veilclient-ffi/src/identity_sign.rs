@@ -261,6 +261,71 @@ pub unsafe extern "C" fn veil_identity_document_authorizes(
     }
 }
 
+/// Did this document authorise `pubkey_32` for something written at
+/// `at_unix_secs`?
+///
+/// The receive-time answer to the question [`veil_identity_document_authorizes`]
+/// cannot ask. That one checks that the key is LISTED and deliberately ignores
+/// its window, because requiring a key to be valid today would reject history
+/// that was legitimate when it was written — and the cost of that tolerance is
+/// that a device secret keeps its authorship authority forever, long after the
+/// delegation that granted it lapsed (report27 V02).
+///
+/// The two halves are asked at different times on purpose:
+///
+///   * the DOCUMENT is verified at `now`. It is the identity's current
+///     statement about itself — master binding, its own freshness window, every
+///     certificate — and a document re-issued last week cannot be verified "as
+///     of" last year: `issued_at` bounds it from below.
+///   * the KEY's own window is checked at `at_unix_secs`. That is the question
+///     actually being asked — could this key act THEN — and it survives
+///     renewal, because a renewal moves `valid_until` and leaves `valid_from`
+///     where it was.
+///
+/// Revocation still applies at `now`, and still wins: a document that no longer
+/// lists a key does not authorise it, whenever the row was written.
+///
+/// Returns 0 when it authorises, 1 when it does not, -1 on a bad argument.
+/// `at_unix_secs` of 0 means "no receive time recorded" and falls back to the
+/// listed-only answer, so a caller with nothing better is no worse off than
+/// before.
+///
+/// # Safety
+/// `doc_ptr` must be readable for `doc_len` bytes; `node_id_32` and `pubkey_32`
+/// for 32 bytes each.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn veil_identity_document_authorized_at(
+    doc_ptr: *const u8,
+    doc_len: size_t,
+    node_id_32: *const u8,
+    pubkey_32: *const u8,
+    at_unix_secs: u64,
+) -> c_int {
+    let listed =
+        unsafe { veil_identity_document_authorizes(doc_ptr, doc_len, node_id_32, pubkey_32) };
+    if listed != VERIFY_VALID || at_unix_secs == 0 {
+        return listed;
+    }
+    let doc_bytes = unsafe { std::slice::from_raw_parts(doc_ptr, doc_len) };
+    let pubkey = unsafe { std::slice::from_raw_parts(pubkey_32, 32) };
+    let Ok(doc) = veil_proto::identity_document::IdentityDocument::decode(doc_bytes) else {
+        return VERIFY_INVALID;
+    };
+    let Some(key) = doc.identity_keys.iter().find(|k| k.pubkey == pubkey) else {
+        return VERIFY_INVALID;
+    };
+    if at_unix_secs > key.valid_until_unix {
+        return VERIFY_INVALID;
+    }
+    // Zero is "no lower bound", exactly as the document level treats it.
+    if key.valid_from_unix > 0
+        && at_unix_secs + veil_identity::verify::TIME_VALIDITY_SKEW_SECS < key.valid_from_unix
+    {
+        return VERIFY_INVALID;
+    }
+    VERIFY_VALID
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -310,6 +375,82 @@ mod tests {
                 pubkey.as_ptr(),
             )
         }
+    }
+
+    fn authorized_at(doc: &[u8], node_id: &[u8; 32], pubkey: &[u8; 32], at: u64) -> c_int {
+        unsafe {
+            veil_identity_document_authorized_at(
+                doc.as_ptr(),
+                doc.len(),
+                node_id.as_ptr(),
+                pubkey.as_ptr(),
+                at,
+            )
+        }
+    }
+
+    /// Authorship is judged by the key's window AT THE TIME THE ROW ARRIVED.
+    ///
+    /// `veil_identity_document_authorizes` answers "is this key listed" and
+    /// ignores the window on purpose, so that history written while a
+    /// delegation was live stays readable after it lapses. The cost was that a
+    /// device secret kept its authorship authority for ever (report27 V02).
+    /// This entry point asks the question the caller actually has: could this
+    /// key act at the moment this device accepted the row.
+    #[test]
+    fn a_row_is_authorised_by_the_window_at_the_time_it_arrived() {
+        let (doc_bytes, node_id, subkey) = standalone_document();
+        let doc = veil_proto::identity_document::IdentityDocument::decode(&doc_bytes)
+            .expect("the fixture must decode");
+        let key = &doc.identity_keys[0];
+        assert!(
+            key.valid_from_unix > 0 && key.valid_until_unix > key.valid_from_unix,
+            "premise: the fixture's key has a real window",
+        );
+
+        // Inside the window: authorised.
+        let inside = key.valid_from_unix + (key.valid_until_unix - key.valid_from_unix) / 2;
+        assert_eq!(
+            authorized_at(&doc_bytes, &node_id, &subkey, inside),
+            VERIFY_VALID,
+            "a row written while the delegation was live must stay verifiable",
+        );
+
+        // After it: NOT authorised. This is the whole point — the key is still
+        // listed, and `authorizes` still says yes.
+        assert_eq!(
+            authorized_at(&doc_bytes, &node_id, &subkey, key.valid_until_unix + 1),
+            VERIFY_INVALID,
+            "a key out of its window still authorised a row dated past it",
+        );
+        assert_eq!(
+            authorizes(&doc_bytes, &node_id, &subkey),
+            VERIFY_VALID,
+            "premise: the listed-only answer is unchanged, so this really is \
+             the window and not revocation",
+        );
+
+        // Before it: a key delegated later could not have signed then.
+        assert_eq!(
+            authorized_at(&doc_bytes, &node_id, &subkey, 1),
+            VERIFY_INVALID,
+            "a row dated before the delegation existed was authorised by it",
+        );
+
+        // No receive time recorded: the listed-only answer, so a caller with
+        // nothing better is no worse off than before.
+        assert_eq!(
+            authorized_at(&doc_bytes, &node_id, &subkey, 0),
+            VERIFY_VALID,
+        );
+
+        // Revocation still wins over any time: a key the document does not
+        // list is not authorised for any moment.
+        let stranger = [0x9Au8; 32];
+        assert_eq!(
+            authorized_at(&doc_bytes, &node_id, &stranger, inside),
+            VERIFY_INVALID,
+        );
     }
 
     /// The case the whole entry point exists for: a key that is NOT the hash
