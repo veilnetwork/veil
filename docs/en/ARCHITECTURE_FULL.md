@@ -895,7 +895,6 @@ From [`crates/veil-mailbox/src/lib.rs`](../../crates/veil-mailbox/src/lib.rs) an
 | Global cap | 100,000 records (an absolute limit) |
 | Per-recipient cap | config; default 1000 |
 | Per-sender daily quota | `DEFAULT_MAX_MAILBOX_SENDERS` wraps the set |
-| `MAX_MAILBOX_ACK_BATCH` | 256 seqs per batch |
 | `MAX_MAILBOXES` | 32 mailbox references in an attachment |
 
 On overflow, a new PUT is rejected with `status=REJECTED` instead of evicting old entries. This closes off race-based eviction attacks that would otherwise threaten data durability.

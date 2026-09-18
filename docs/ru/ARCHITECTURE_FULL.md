@@ -893,7 +893,6 @@ Mailbox — фиксированное **redb**-хранилище «ключ �
 | Global cap | 100 000 записей (абсолютный лимит) |
 | Per-recipient cap | конфиг; по умолчанию 1000 |
 | Per-sender daily quota | размер множества ограничен `DEFAULT_MAX_MAILBOX_SENDERS` |
-| `MAX_MAILBOX_ACK_BATCH` | 256 seq за пакет |
 | `MAX_MAILBOXES` | 32 ссылки на mailbox в attachment |
 
 При переполнении новый PUT отклоняется (`status=REJECTED`), а не вытесняет старые записи. Это закрывает атаки на сохранность данных через вытеснение по гонке (race).
