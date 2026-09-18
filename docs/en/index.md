@@ -32,10 +32,21 @@ Veil is a decentralized hybrid open-source network written in Rust, implementing
 | [Crate Architecture](CRATE_ARCHITECTURE.md) | Project developers | How the workspace crates are split and what each one owns |
 | [Capacity](CAPACITY.md) | Operators, engineers | Capacity planning: limits, budgets, and scaling characteristics |
 | [Contracts](CONTRACTS.md) | Project developers | Cross-module contracts and invariants that callers rely on |
+| [Contributing](CONTRIBUTING.md) | Project developers | From a fresh checkout to a clean pull request, assuming no prior work on Veil |
+| [Messenger dev guide](messenger-dev.md) | App developers | Building a Signal-style messenger on veil: sovereign identity plus async delivery |
+| [Adaptive failover](adaptive-failover.md) | Operators, engineers | How a dead path is scored and re-routed automatically |
+| [Hot-standby transport handover](hot-standby.md) | Operators, engineers | Keeping a second transport warm so a session moves without dropping |
+| [Hybrid identity backup & recovery](identity-hybrid-backup.md) | Operators | Creating a post-quantum `ed25519+falcon512` identity, what to back up, and restoring it |
+| [Release-manifest signing](release-signing.md) | Maintainers | Installer supply-chain authenticity: the pinned key and where it is verified |
+| [Publishing checklist](publishing-checklist.md) | Maintainers | What must be filled in before the tree is published at all |
 
 ## Additional Materials
 
 - [Architectural invariants](../architecture/foundation.md) — foundational decisions that are not revisited
+- [Hot-standby manual test plan — Windows](hot-standby-test-plan-windows.md) — the hardware regression suite for hot-standby
+- [Windows NamedPipe runtime test plan](windows-named-pipe-test-plan.md) — admin and IPC sockets over a named pipe, on real hardware
+- [IPC stream-forwarding plan](PLAN_IPC_STREAM_FORWARDING.md) — implemented; kept as the record of how cross-node `STREAM_OPEN` was bridged
+- [veilcore extraction plan](PLAN_VEILCORE_EXTRACTION.md) — complete; kept as the record of the crate split
 - [RFC-0001: Hybrid architecture](../rfcs/0001-hybrid-veil-architecture.md)
 - [Specification (original, RU)](../../specification.md)
 
