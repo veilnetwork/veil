@@ -94,4 +94,4 @@ Honest gaps. Each is a known weakness with a plan, not a surprise.
 | Shard filtering bypass | `shard_filtering` is opt-in (default false) | Enable by default when network > 1M nodes |
 | Reputation cold start | New nodes start at score 0 → can't transit immediately | Mitigation TBD (peer vouches via `ReputationAttestation` provide some acceleration) |
 | Key material in memory | Master & identity seeds mlocked (`SensitiveBytesN`) + `madvise(MADV_DONTDUMP)`; some session-scoped AEAD keys still on the heap | Implemented (seeds); session keys pending |
-| Protocol version gap | `OVL1_MINOR_VERSION = 1` but features gate at >=5 | Bump version with full test coverage |
+| Protocol version gap | Closed: the minor-version field and the gates that read it were removed in the single-version cleanup | — |

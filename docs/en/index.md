@@ -52,6 +52,6 @@ Veil is a decentralized hybrid open-source network written in Rust, implementing
 
 ## Protocol Version
 
-Current OVL1 version: **v1** (magic `0x4F564C31`, version byte `0x01`).
+Current OVL1 version: **v2** (magic `0x4F564C31`, version byte `0x02`).
 
 IPC protocol: version **1** (`IPC_PROTOCOL_VERSION = 1`).

@@ -97,4 +97,4 @@
 | Shard filtering bypass | `shard_filtering` — opt-in (default false) | Включить по умолчанию когда сеть > 1M узлов |
 | Reputation cold start | Новые узлы стартуют со score 0 → не могут transit'ить сразу | Меры защиты TBD (peer vouches через `ReputationAttestation` дают некоторое ускорение) |
 | Ключевой материал в памяти | Master- и identity-seed'ы mlock'нуты (`SensitiveBytesN`) + `madvise(MADV_DONTDUMP)`; часть session-AEAD-ключей всё ещё в heap | Реализовано (seed'ы); session-ключи в работе |
-| Разрыв в версии протокола | `OVL1_MINOR_VERSION = 1`, но фичи gate'ятся при >=5 | Поднять версию с полным test coverage |
+| Разрыв в версии протокола | Закрыто: поле минорной версии и читавшие его gate'ы вырезаны в single-version cleanup | — |
