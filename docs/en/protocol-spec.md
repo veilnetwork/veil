@@ -592,7 +592,7 @@ The recipient is a fixed-49-byte `Recipient` (`encode_fixed_into`): a 32-byte `n
 [34..]   seqs[]             u64 LE × count
 ```
 
-Acknowledges specific seq numbers, which need not be consecutive. A single batch holds at most `MAX_MAILBOX_ACK_BATCH = 256` of them.
+Acknowledges specific seq numbers, which need not be consecutive. The wire puts no named constant on the batch size — the frame-body ceiling bounds it.
 
 ### 6.4 DeliveryStatusPayload
 
@@ -991,9 +991,13 @@ These are the hard caps that keep a node's memory and CPU bounded under load. Al
 | `MAX_ROUTE_CACHE_SIZE` | 1024 | Entries in the RouteCache |
 | `MAX_ROUTES_PER_DST` | 4 | Paths per recipient |
 | `MAX_ROUTES_PER_VIA` | 256 | Routes through one next-hop |
-| `DEFAULT_MAX_QUEUE_DEPTH` | 1000 | Messages in the queue per recipient |
-| `MAX_MAILBOX_RECIPIENTS` | 4096 | Distinct recipients in a mailbox |
-| `MAX_MAILBOX_ACK_BATCH` | 256 | ACKs per message |
+| `DEFAULT_QUOTA_PER_RECEIVER_BYTES` | 100 MiB | What one receiver's undelivered mail may occupy. The mailbox bounds BYTES, not message or recipient counts — there is no per-recipient queue depth and no cap on how many distinct recipients it holds |
+| `DEFAULT_QUOTA_PER_SENDER_BYTES` | 10 MiB | The same bound applied to one sender |
+| `DEFAULT_QUOTA_GLOBAL_BYTES` | 10 GiB | The whole store |
+| `MAX_BLOB_BYTES` | 1 MiB | One deposited blob |
+| `MAX_FETCH_COUNT` / `MAX_FETCH_BYTES` | 1024 / 8 MiB | What one FETCH may return |
+| `MAX_FETCH_SKIP` | 64 | Content ids a fetcher may ask the relay to pass over |
+| `DEFAULT_TTL_SECS` | 7 days | How long an unacked blob is kept |
 | `MAX_CONCURRENT_SESSIONS` | 65,536 | Active sessions |
 | `MAX_SESSIONS_PER_IP` | 32 | Sessions from one IP |
 | `MAX_BAN_LIST_SIZE` | 8192 | Entries in the BanList |
