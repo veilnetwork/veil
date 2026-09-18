@@ -824,7 +824,7 @@ survives, full identity recovery is possible:
 
 ```bash
 # On a fresh host, re-create identity from the saved phrase
-veil-cli identity import --phrase-file /path/to/phrase.txt --veil-dir /var/lib/veil/
+veil-cli identity restore --phrase-file /path/to/phrase.txt --veil-dir /var/lib/veil/
 
 # Verify identity_id matches the original
 veil-cli identity show --veil-dir /var/lib/veil
