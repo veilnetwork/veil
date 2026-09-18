@@ -371,7 +371,7 @@ into **`veil-cli`**.
 
 ### Where we stand
 
-The extraction is **complete**. There are now **53 workspace members**: 51
+The extraction is **complete**. There are now **57 workspace members**: 55
 crates under `crates/`, plus the top-level `veilcore` and `veilclient`.
 `veilcore` is now a thin remainder — sim, integration glue, and a few `node/*`
 shims — and the extracted node runtime lives in **`veil-node-runtime`**.
@@ -379,23 +379,26 @@ Per-crate test counts move quickly, so check `cargo nextest list` for the live
 numbers.
 
 ```
-crates/  (51)
+crates/  (55)
   foundation      veil-error  veil-types  veil-util  veil-memory
                   veil-bloom  veil-bufpool  veil-congestion
                   veil-observability  veil-adaptive
   protocol/crypto veil-proto  veil-crypto  veil-e2e  veil-pending-ack
-  transport       veil-transport  veil-transfer  veil-local-transport
+                  veil-ratchet
+  transport       veil-transport  veil-local-transport
                   veil-obfs4  veil-obfs4-smoke  veil-udp-obfs
                   veil-webtunnel  veil-fingerprint
   networking      veil-dht  veil-discovery  veil-mesh  veil-nat
                   veil-pex  veil-routing  veil-anonymity  veil-anycast
                   veil-gateway  veil-bootstrap  veil-invite
-                  veil-reputation  veil-proxy
+                  veil-reputation  veil-proxy  veil-mainline
+                  veil-nostr  veil-onion-stream
   identity/cfg    veil-identity  veil-cfg  veil-abuse
   app/session     veil-app  veil-session  veil-session-integration-tests
                   veil-dispatcher  veil-dispatcher-state  veil-ipc
                   veil-mailbox  veil-push  veil-update
   runtime/bins    veil-node-runtime  veil-cli  ogate  oproxy  veilclient-ffi
+                  veil-vpn-helper
 veilcore/      residual: sim + integration glue + a few node/* shims
 veilclient/    high-level SDK client
 ```
