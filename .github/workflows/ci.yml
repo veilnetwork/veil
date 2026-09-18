@@ -269,6 +269,19 @@ jobs:
         # find.
         run: ./scripts/check-windows-typecheck.sh
 
+      - name: documentation (links, index, translation parity)
+        # Nothing else notices when documentation rots: a moved file leaves a
+        # link that still looks like a link, a new document is simply absent
+        # from the table of contents, and a translation falls a version behind
+        # in silence. One sweep in September found 46 dead links, two indexes
+        # that had stopped naming a third of their own tree, and a Russian
+        # document describing a migration that had finished in May. The gate
+        # carries its own --self-test, run first, so a checker that has
+        # stopped checking cannot pass the thing it is guarding.
+        run: |
+          python3 scripts/check-docs.py --self-test
+          python3 scripts/check-docs.py
+
       - name: Install cargo-deny
         run: cargo install cargo-deny --version "^0.19" --locked
 
