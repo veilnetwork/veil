@@ -85,14 +85,21 @@ bit 3 — CORE
 | Бит | Константа | Смысл |
 |-----|-----------|-------|
 | 0 | `CAN_RELAY` | Готов пересылать чужой трафик |
-| 1 | `CAN_MAILBOX` | Готов принимать Mailbox-записи |
-| 2 | `CAN_GATEWAY_LOCAL_MESH` | Работает мостом между mesh и Veil |
-| 3 | `CAN_PARTICIPATE_DHT` | Участвует в DHT-таблице |
-| 4 | `CAN_ACCEPT_APP_STREAMS` | Принимает AppOpen/AppData |
-| 5 | `CAN_STORE` | Хранит DHT-значения локально |
-| 6 | `SUPPORTS_TRANSIT` | Умеет `DeliveryMsg::Transit` (ретрансляция без состояния) |
+| 1 | `SUPPORTS_SOVEREIGN_IDENTITY` | Держит подписанный документ личности и обменяется кадром `IdentityProof` — только если бит выставлен У ОБЕИХ сторон |
+| 2 | `ANONYMITY_RELAY` | Согласился ретранслировать onion-ячейки (`[anonymity] relay_capable`); намеренно отделён от `CAN_RELAY`, который этого не разрешает |
+| 3 | `SUPPORTS_HYBRID_KEX` | Постквантовый гибридный вывод сессионных ключей; вставляет `HybridKexCt`, когда бит у обоих и есть материал ML-KEM |
+| 4 | `SUPPORTS_REALTIME_DATAGRAMS` | Понимает аутентифицированную realtime-полосу в QUIC DATAGRAM |
+| 5 | `NO_DHT_SERVICE` | ОТРИЦАТЕЛЬНЫЙ: узел НЕ обслуживает DHT (`[dht] serve_dht = false`). Отрицательный намеренно — иначе устаревший пир, шлющий 0, читался бы как отказавший |
+| 6 | `SUPPORTS_REALTIME_REKEY` | Перевыводит ключ realtime-полосы при каждом rekey, а не держит полученный на рукопожатии |
 
-У Core-узла по умолчанию: `CAN_RELAY | CAN_PARTICIPATE_DHT | CAN_STORE | CAN_MAILBOX`. У Leaf — всё в ноль: это пассивный потребитель.
+Обратите внимание на полярность бита 5: он говорит, чего узел НЕ делает.
+Утвердительный `CAN_DHT` прочитал бы каждого старого пира как отказавшего.
+
+Флаги `CAN_MAILBOX` / `CAN_GATEWAY_LOCAL_MESH` / `CAN_PARTICIPATE_DHT` /
+`CAN_ACCEPT_APP_STREAMS` / `CAN_STORE` / `SUPPORTS_TRANSIT`, которые стояли в
+этой таблице, вырезаны в single-version cleanup: они всегда объявлялись и
+никогда не читались. Их биты с тех пор заняты флагами выше, так что клиент,
+написанный по старой таблице, объявит совсем не то.
 
 ---
 
@@ -1075,7 +1082,7 @@ verify_message(algo, pubkey_b64, msg, signature)
 
 IoT-устройство или любой узел без интернета всё ещё может:
 - Найти соседей локально через UDP multicast или broadcast.
-- Передать сообщение в глобальный Veil через mesh-мост — Core-узел с `CAN_GATEWAY_LOCAL_MESH`.
+- Передать сообщение в глобальный Veil через mesh-мост — Core-узел, несущий роль шлюза (`[gateway] enabled`, включено по умолчанию).
 
 ### 14.2 MeshBeacon
 
@@ -1108,7 +1115,7 @@ MESH_HEADER_SIZE = 83 Б:
 
 ### 14.5 Gateway bridge
 
-Core-узел с `CAN_GATEWAY_LOCAL_MESH`:
+Core-узел, несущий роль шлюза:
 - На mesh-стороне слушает UDP-маяки и mesh-фреймы.
 - Из mesh в Veil: достаёт `DeliveryEnvelope` из `MeshFrame.payload` и подаёт его в свой диспетчер.
 - Из Veil в mesh: когда `recipient_node_id` — известный mesh-сосед, упаковывает сообщение в `MeshFrame` и шлёт по UDP.

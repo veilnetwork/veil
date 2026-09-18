@@ -138,7 +138,10 @@ ChaCha20-Poly1305. 24-байтный заголовок остаётся отк�
 ```
 [0]      roles_supported u8  (bit 0=LEAF, bit 3=CORE)
 [1]      flags           u8  (CAN_RELAY=0x01, SUPPORTS_SOVEREIGN_IDENTITY=0x02,
-                             ANONYMITY_RELAY=0x04, SUPPORTS_HYBRID_KEX=0x08)
+                             ANONYMITY_RELAY=0x04, SUPPORTS_HYBRID_KEX=0x08,
+                             SUPPORTS_REALTIME_DATAGRAMS=0x10,
+                             NO_DHT_SERVICE=0x20 (отрицательный: узел НЕ
+                             обслуживает DHT), SUPPORTS_REALTIME_REKEY=0x40)
 [2]      discovery_mode  u8  (0=Public, 1=ContactsOnly)
 ```
 > Wire v3 убрал старую 12-байтную форму. Исчезли поля `transports_supported`,
