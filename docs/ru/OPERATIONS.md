@@ -832,7 +832,7 @@ Sovereign identities деривируются из 24-словной BIP-39 phra
 
 ```bash
 # На fresh-хосте пере-создайте identity из сохранённой phrase
-veil-cli identity import --phrase-file /path/to/phrase.txt --veil-dir /var/lib/veil/
+veil-cli identity restore --phrase-file /path/to/phrase.txt --veil-dir /var/lib/veil/
 
 # Проверьте, что identity_id совпадает с оригинальным
 veil-cli identity show --veil-dir /var/lib/veil
