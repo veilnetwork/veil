@@ -85,14 +85,22 @@ Bits `1 (RELAY)`, `2 (GATEWAY)`, and `4 (CORE_ROUTER)` were once standalone role
 | Bit | Constant | Meaning |
 |-----|----------|---------|
 | 0 | `CAN_RELAY` | Willing to forward third-party traffic |
-| 1 | `CAN_MAILBOX` | Willing to accept Mailbox records |
-| 2 | `CAN_GATEWAY_LOCAL_MESH` | Acts as a bridge between mesh and veil |
-| 3 | `CAN_PARTICIPATE_DHT` | Participates in the DHT table |
-| 4 | `CAN_ACCEPT_APP_STREAMS` | Accepts AppOpen/AppData |
-| 5 | `CAN_STORE` | Stores DHT values locally |
-| 6 | `SUPPORTS_TRANSIT` | Can handle `DeliveryMsg::Transit` (stateless relay) |
+| 1 | `SUPPORTS_SOVEREIGN_IDENTITY` | Holds a signed identity document and will exchange an `IdentityProof` frame — only when BOTH sides set it |
+| 2 | `ANONYMITY_RELAY` | Opted in to relaying onion cells (`[anonymity] relay_capable`); deliberately separate from `CAN_RELAY`, which does not authorise it |
+| 3 | `SUPPORTS_HYBRID_KEX` | Post-quantum hybrid session-key derivation; inserts `HybridKexCt` when both sides set it and have ML-KEM material |
+| 4 | `SUPPORTS_REALTIME_DATAGRAMS` | Understands the authenticated realtime lane in QUIC DATAGRAMs |
+| 5 | `NO_DHT_SERVICE` | NEGATIVE: this peer does not serve the DHT (`[dht] serve_dht = false`). Negative on purpose, so a legacy peer that sends 0 reads as willing |
+| 6 | `SUPPORTS_REALTIME_REKEY` | Re-derives the realtime lane's key at each rekey rather than keeping the handshake one |
 
-A Core node defaults to `CAN_RELAY | CAN_PARTICIPATE_DHT | CAN_STORE | CAN_MAILBOX`. A Leaf sets nothing — it is a passive consumer.
+Note bit 5's polarity: it says what the peer will NOT do. An affirmative
+`CAN_DHT` would have read every legacy peer as refusing service.
+
+The `CAN_MAILBOX` / `CAN_GATEWAY_LOCAL_MESH` / `CAN_PARTICIPATE_DHT` /
+`CAN_ACCEPT_APP_STREAMS` / `CAN_STORE` / `SUPPORTS_TRANSIT` flags this table
+used to list were removed in the single-version cleanup: they were always
+advertised and never read. Their bit positions have since been reused by the
+flags above, so a client written against the old table would advertise
+something else entirely.
 
 ---
 
@@ -1078,7 +1086,7 @@ File: [`crates/veil-mesh/src/`](../../crates/veil-mesh/src/). Family 5.
 
 An IoT device or any node without internet can still:
 - Find neighbors locally over UDP multicast or broadcast.
-- Relay a message into the global Veil through a mesh bridge — a Core node with `CAN_GATEWAY_LOCAL_MESH`.
+- Relay a message into the global Veil through a mesh bridge — a Core node running gateway duty (`[gateway] enabled`, on by default).
 
 ### 14.2 MeshBeacon
 
@@ -1111,7 +1119,7 @@ A `Realm` is a logical group of mesh nodes, identified by a UUID. One physical s
 
 ### 14.5 Gateway bridge
 
-A Core node with `CAN_GATEWAY_LOCAL_MESH`:
+A Core node running gateway duty:
 - On the mesh side, listens for UDP beacons and mesh frames.
 - Mesh into Veil: it pulls the `DeliveryEnvelope` out of `MeshFrame.payload` and feeds it into its own dispatcher.
 - Veil into mesh: when the `recipient_node_id` is a known mesh peer, it wraps the message in a `MeshFrame` and sends it over UDP.

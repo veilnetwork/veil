@@ -139,7 +139,10 @@ excluded), and the same big-endian convention as the header.
 ```
 [0]      roles_supported u8  (bit 0=LEAF, bit 3=CORE)
 [1]      flags           u8  (CAN_RELAY=0x01, SUPPORTS_SOVEREIGN_IDENTITY=0x02,
-                             ANONYMITY_RELAY=0x04, SUPPORTS_HYBRID_KEX=0x08)
+                             ANONYMITY_RELAY=0x04, SUPPORTS_HYBRID_KEX=0x08,
+                             SUPPORTS_REALTIME_DATAGRAMS=0x10,
+                             NO_DHT_SERVICE=0x20 (negative: peer does NOT serve
+                             the DHT), SUPPORTS_REALTIME_REKEY=0x40)
 [2]      discovery_mode  u8  (0=Public, 1=ContactsOnly)
 ```
 > Wire v3 dropped the old 12-byte form. Gone are the fields `transports_supported`,
