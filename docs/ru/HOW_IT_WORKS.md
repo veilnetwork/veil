@@ -320,13 +320,14 @@ IPC, локальный канал между двумя программами 
 
 ```
 [0..4]   magic        = "OVL1" (0x4F564C31)
-[4..5]   version      = 0x01
+[4..5]   version      = 0x02
 [5..6]   family       = u8  (Session, Control, Discovery, Delivery, ...)
 [6..8]   msg_type     = u16 BE (variant within family)
-[8..12]  reserved     = 0x00000000
+[8..10]  flags        = u16 BE (bits[1:0] = priority class)
+[10..12] header_len   = u16 BE (24 without TLV extensions)
 [12..16] body_len     = u32 BE
-[16..20] trace_id     = u32 BE (sampled tracing)
-[20..24] flags+prio   = u8 prio | u8 traffic_class | u16 reserved
+[16..20] stream_id    = u32 BE (multiplexing)
+[20..24] request_id   = u32 BE (request/response correlation)
 [24..]   body         = msg_type-specific payload
 ```
 
@@ -408,8 +409,8 @@ Wi-Fi находили друг друга напрямую, вообще не �
 
 ## 12. Версионирование
 
-Всё описанное выше — это **OVL1 v1** (magic `0x4F564C31`, version byte
-`0x01`). Протокол растёт за счёт того, что узлы согласуют между собой,
+Всё описанное выше — это **OVL1 v2** (magic `0x4F564C31`, version byte
+`0x02`). Протокол растёт за счёт того, что узлы согласуют между собой,
 какие возможности они поддерживают, и растёт безопасно: старый узел,
 встретив незнакомое семейство кадров, просто пропускает его
 (`Unknown → forward-compatible`), а не спотыкается о него.

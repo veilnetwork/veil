@@ -66,5 +66,5 @@ When you add a new doc:
 
 ## Protocol version
 
-Current OVL1 protocol: **v1** (magic `0x4F564C31`, version byte `0x01`).
+Current OVL1 protocol: **v2** (magic `0x4F564C31`, version byte `0x02`).
 IPC protocol: version **1** (`IPC_PROTOCOL_VERSION = 1`).

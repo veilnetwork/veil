@@ -14,7 +14,7 @@
 ```
 Offset  Size  Field        Description
 0       4     magic        "OVL1" (0x4F564C31)
-4       1     version      Protocol version (1)
+4       1     version      Protocol version (2)
 5       1     family       FrameFamily discriminant (0..11)
 6       2     msg_type     Message type within family (BE u16)
 8       2     flags        Frame flags (BE u16); bits[1:0] = priority class
@@ -26,7 +26,9 @@ Offset  Size  Field        Description
 
 Константы (`proto/codec.rs`, `proto/header.rs`):
 - `MAGIC = "OVL1"`
-- `VERSION = 1`
+- `VERSION = 2` (была 1 до 2026-08-02: связываемые данные AEAD выросли
+  с трёх байт до всего 24-байтного заголовка, и версии несовместимы —
+  пир на v1 отвергается в `decode_header` с `UnsupportedVersion`)
 - `HEADER_SIZE = 24`
 - `MAX_FRAME_BODY = 16 MiB`
 - `DEFAULT_MAX_FRAME_BODY = 1 MiB` (мягкий предел на каждый слушающий сокет)
@@ -213,12 +215,10 @@ ChaCha20-Poly1305. 24-байтный заголовок остаётся отк�
 | `FRAME_HEADER_SIZE` | 24 |
 | `MAX_FRAME_BODY` | 16 MiB |
 | `DEFAULT_MAX_FRAME_BODY` | 1 MiB |
-| `OVL1_MINOR_VERSION` | 1 |
 | `MAX_POW_DIFFICULTY` | 24 |
 | `MAX_CONCURRENT_POW_SOLVERS` | 4 |
 | `SESSION_TICKET_TTL_SECS` | 3600 |
 | `SESSION_TICKET_MAX_AGE_SECS` | 7200 |
-| `MAX_MAILBOX_ACK_BATCH` | 256 |
 | `MAX_TRANSPORT_ADDRS` | 32 |
 | `MAX_RELAY_IDS` | 32 |
 | `MAX_MLKEM_PK_LEN` | 1600 |

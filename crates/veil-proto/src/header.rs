@@ -59,7 +59,7 @@ impl From<TrafficClass> for u8 {
 /// Layout (big-endian):
 /// ```text
 /// [0..4] magic "OVL1"
-/// [4] version 1
+/// [4] version — [`VERSION`], currently 2
 /// [5] family FrameFamily discriminant
 /// [6..8] msg_type per-family message type
 /// [8..10] flags frame flags (bits[1:0] = priority class)
