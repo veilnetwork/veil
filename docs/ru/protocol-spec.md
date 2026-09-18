@@ -592,7 +592,7 @@ BLAKE3( "epic475.4c/transport_announce/v1" || node_id ||
 [34..]   seqs[]             u64 LE × count
 ```
 
-Подтверждает конкретные seq-номера, не обязательно идущие подряд. В одной пачке их не больше `MAX_MAILBOX_ACK_BATCH = 256`.
+Подтверждает конкретные seq-номера, не обязательно идущие подряд. Размер пачки провод отдельной константой не ограничивает — её держит общий потолок тела кадра.
 
 ### 6.4 DeliveryStatusPayload
 
@@ -991,9 +991,13 @@ content_id = BLAKE3(payload)              // 32 байта
 | `MAX_ROUTE_CACHE_SIZE` | 1024 | Записей в RouteCache |
 | `MAX_ROUTES_PER_DST` | 4 | Путей на одного получателя |
 | `MAX_ROUTES_PER_VIA` | 256 | Маршрутов через одного next-hop |
-| `DEFAULT_MAX_QUEUE_DEPTH` | 1000 | Сообщений в очереди на получателя |
-| `MAX_MAILBOX_RECIPIENTS` | 4096 | Различных получателей в mailbox |
-| `MAX_MAILBOX_ACK_BATCH` | 256 | ACK за одно сообщение |
+| `DEFAULT_QUOTA_PER_RECEIVER_BYTES` | 100 МиБ | Сколько может занимать недоставленная почта одного получателя. Ящик ограничивает БАЙТЫ, а не число сообщений и получателей — ни глубины очереди на получателя, ни потолка на число получателей нет |
+| `DEFAULT_QUOTA_PER_SENDER_BYTES` | 10 МиБ | То же для одного отправителя |
+| `DEFAULT_QUOTA_GLOBAL_BYTES` | 10 ГиБ | Всё хранилище целиком |
+| `MAX_BLOB_BYTES` | 1 МиБ | Один положенный блоб |
+| `MAX_FETCH_COUNT` / `MAX_FETCH_BYTES` | 1024 / 8 МиБ | Что может вернуть один FETCH |
+| `MAX_FETCH_SKIP` | 64 | Сколько content id можно попросить реле пропустить |
+| `DEFAULT_TTL_SECS` | 7 дней | Сколько хранится неподтверждённый блоб |
 | `MAX_CONCURRENT_SESSIONS` | 65 536 | Активных сессий |
 | `MAX_SESSIONS_PER_IP` | 32 | Сессий от одного IP |
 | `MAX_BAN_LIST_SIZE` | 8192 | Записей в BanList |
