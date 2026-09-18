@@ -243,7 +243,7 @@ An unknown `family` yields `ProtoError::UnknownFamily`; an unknown `msg_type` yi
 
 ### 5.4 Unified minor version
 
-`OVL1_MINOR_VERSION = 1` (see `proto/budget.rs`). Features used to sit behind version gates, but every gate is now open unconditionally. The field stays on the wire in case it is needed again.
+There is no minor-version field any more. `ovl1_minor` was one of six capability fields that were always advertised and never read; the single-version cleanup removed them, taking `CapabilitiesPayload` from 12 bytes to 2 (3 once `discovery_mode` was added). The version gates they fed are gone with them — see `proto/budget.rs` and the CapabilitiesPayload section of [WIRE_PROTOCOL.md](WIRE_PROTOCOL.md).
 
 ---
 
