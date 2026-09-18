@@ -148,7 +148,7 @@ git remote -v   # should point at the anonymous GitHub repo before any push
 > checkout (e.g. `~/.config/veil/`) and pass the path explicitly
 > (`veil-cli ... update --identity ~/.config/veil/release-identity.toml`). The
 > `.gitignore` globs the conventional secret filenames as a backstop only — see
-> [`docs/en/release-signing.md`](docs/en/release-signing.md).
+> [`docs/en/release-signing.md`](release-signing.md).
 
 This file (`PUBLISHING.md`) can be deleted before or kept after publication —
 it contains no sensitive data.
