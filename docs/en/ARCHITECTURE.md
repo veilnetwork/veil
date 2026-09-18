@@ -44,8 +44,10 @@ and mines proof-of-work of at least 24 bits.
 
 All core nodes are equal — none is more privileged than another. Gateway duty
 (holding attachment records on behalf of leaf nodes) is the one optional extra:
-it turns on when the `CAN_GATEWAY_LOCAL_MESH` capability flag is set, and you can
-disable it with `[gateway] enabled = false`.
+it is on by default for a Core node and you turn it off with
+`[gateway] enabled = false`. There is no capability flag behind it — the
+`CAN_GATEWAY_LOCAL_MESH` bit this once named was removed in the single-version
+cleanup, along with five others that were advertised and never read.
 
 The older role names `Relay / Gateway / CoreRouter` are not part of the protocol.
 Two roles, nothing more.
