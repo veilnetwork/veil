@@ -147,17 +147,19 @@ pub async fn dispatch(
 
 ```
 dispatcher/
-├── mod.rs                    # Main dispatch + pending_diag
+├── lib.rs                    # Main dispatch
 ├── app.rs                    # App plane (streams)
 ├── control.rs                # Control plane (ping, neighbor, probe)
-├── delivery.rs               # Delivery plane (mailbox, forward, trace)
+├── delivery.rs               # Delivery plane (forward, transit, trace)
 ├── discovery.rs              # DHT (FindNode, Store, Delete, Announce)
 ├── routing.rs                # RouteAnnounce, RouteRequest, PoW
 ├── session.rs                # Keepalive, Rekey, Detach
 ├── diag.rs                   # DiagPing, DiagTrace
-├── pending_ack.rs            # Tracking of require_ack messages
-├── pending_fetch_replica.rs  # Tracking of reseed MAILBOX_FETCH to replica nodes
-└── pending_replica.rs        # Tracking of MAILBOX_REPLICATE between Core nodes
+├── anonymity.rs              # Onion-plane frames
+├── envelope_chunks.rs        # Chunked envelopes over Forward
+├── service_budget.rs         # Per-service admission budgets
+├── sink_impl.rs              # Frame sink wiring
+└── pending_ack.rs            # Tracking of require_ack messages
 ```
 
 **When adding a new frame type:**
