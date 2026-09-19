@@ -38,7 +38,16 @@ CONFIG = {
     "skip_files": {"TASKS_ARCHIVE.md"},
     # Link targets that are SUPPOSED not to resolve, each with its reason.
     # A dangling link not listed here fails the gate.
-    "allowed_dangling": {},
+    # Each exception is a FACT about the repository, not a way to quieten the
+    # gate.
+    "allowed_dangling": {
+        # TASKS.md and TASKS_ARCHIVE.md have never been committed here —
+        # `git cat-file -e HEAD:TASKS_ARCHIVE.md` fails. They are the owner's
+        # working notes and live on one machine, so this link resolves for
+        # nobody who clones. Recorded rather than silently dropped: closing it
+        # means either publishing the file or rewording the sentence.
+        "docs/internal/ANTICENSORSHIP_STRATEGY.md": {"../../TASKS_ARCHIVE.md"},
+    },
     # docs/<lang> roots whose index.md must name every sibling document.
     "index_langs": ["docs/en", "docs/ru"],
     # (from, to) language pairs that must stay in step.
