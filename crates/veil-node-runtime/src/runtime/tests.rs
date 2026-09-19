@@ -1475,6 +1475,7 @@ pub fn verify_remote_peer_identity_reports_mismatch_readably() {
         remote_caps_stated: true,
         supports_realtime_datagrams: false,
         supports_realtime_rekey: false,
+        sovereign_node_id: None,
         udp_reflector_port: None,
         shared_udp_reflectors: Vec::new(),
     };
@@ -1502,6 +1503,130 @@ pub fn verify_remote_peer_identity_reports_mismatch_readably() {
     assert!(message.contains("0x00000007"));
 }
 
+/// A DEVICE of the identity an app-added row names is that identity.
+///
+/// The fixture is the shape measured on the stand: an endpoint invite named
+/// the contact's identity, the wire proved the contact's DEVICE key, and the
+/// sovereign proof-frame said the two belong together. Every direct dial
+/// between two sovereign installs failed here, with the answer already
+/// verified in the same handshake result.
+///
+/// The three `_refuses_` tests below are the other half: this must be an
+/// acceptance of a PROOF, not of a failure.
+#[test]
+pub fn sovereign_proof_admits_a_device_of_the_expected_identity() {
+    let device = test_handshake_identity();
+    let identity = NodeId::from([0x5au8; 32]);
+    let remote = sovereign_remote(&device, Some(identity));
+    let expected = app_added_expectation(identity, &device);
+
+    assert!(
+        verify_remote_peer_identity(&remote, &expected).is_ok(),
+        "a device that PROVED this identity must be admitted",
+    );
+}
+
+/// A proof of some OTHER identity is not a proof of this one.
+#[test]
+pub fn sovereign_proof_refuses_a_different_identity() {
+    let device = test_handshake_identity();
+    let expected_identity = NodeId::from([0x5au8; 32]);
+    let other_identity = NodeId::from([0x5bu8; 32]);
+    let remote = sovereign_remote(&device, Some(other_identity));
+    let expected = app_added_expectation(expected_identity, &device);
+
+    let error = match verify_remote_peer_identity(&remote, &expected) {
+        Ok(()) => panic!("a proof naming another identity must NOT admit"),
+        Err(e) => e,
+    };
+    match error {
+        PeerVerificationError::IdentityMismatch(msg) => {
+            assert!(msg.contains("peer identity mismatch"), "got {msg}");
+        }
+        PeerVerificationError::NonceMismatch => panic!("expected IdentityMismatch"),
+    }
+}
+
+/// No proof at all is not permission. `None` is the pre-sovereign peer and the
+/// peer that never ran the exchange; reading it as "close enough" would admit
+/// anyone answering at the address.
+#[test]
+pub fn sovereign_absence_is_not_permission() {
+    let device = test_handshake_identity();
+    let identity = NodeId::from([0x5au8; 32]);
+    let remote = sovereign_remote(&device, None);
+    let expected = app_added_expectation(identity, &device);
+
+    assert!(
+        verify_remote_peer_identity(&remote, &expected).is_err(),
+        "no proof must NOT admit a device under another node_id",
+    );
+}
+
+/// An operator's own `[[peers]]` line names ONE key on purpose. A sibling
+/// device of that identity is not the key they wrote down, and the sovereign
+/// path must not widen their line.
+#[test]
+pub fn sovereign_proof_does_not_widen_an_operator_row() {
+    let device = test_handshake_identity();
+    let identity = NodeId::from([0x5au8; 32]);
+    let remote = sovereign_remote(&device, Some(identity));
+    let mut expected = app_added_expectation(identity, &device);
+    // Below the app-added base: a configured/bootstrap row.
+    expected.peer_id = PeerId::new(7);
+
+    assert!(
+        verify_remote_peer_identity(&remote, &expected).is_err(),
+        "an operator-configured row must not accept a sibling device",
+    );
+}
+
+/// The wire half of the stand fixture: a peer whose handshake proves
+/// `device`, carrying `sovereign` as the identity it belongs to.
+fn sovereign_remote(device: &HandshakeIdentity, sovereign: Option<NodeId>) -> RemoteHandshakeInfo {
+    RemoteHandshakeInfo {
+        algo: Some(veil_cfg::SignatureAlgorithm::Ed25519),
+        node_id: device.node_id,
+        public_key: device.public_key.clone(),
+        nonce: device.nonce.clone(),
+        session_keys: veil_crypto::session_kdf::SessionKeys {
+            tx_key: [0u8; 32],
+            rx_key: [0u8; 32],
+            session_id: [0u8; 32],
+        },
+        remote_discovery_mode: veil_cfg::DiscoveryMode::Public,
+        remote_dht_service: true,
+        remote_caps_stated: true,
+        supports_realtime_datagrams: false,
+        supports_realtime_rekey: false,
+        sovereign_node_id: sovereign,
+        udp_reflector_port: None,
+        shared_udp_reflectors: Vec::new(),
+    }
+}
+
+/// The row half: an APP-ADDED peer whose expectation names `identity` — an
+/// endpoint invite, not an operator line. `public_key`/`nonce` are the
+/// identity's, so the raw comparison against a device key cannot pass; only
+/// the sovereign proof can.
+fn app_added_expectation(identity: NodeId, device: &HandshakeIdentity) -> ExpectedPeerIdentity {
+    use base64::{Engine as _, engine::general_purpose::STANDARD};
+    let master = test_support::ed25519_keypair();
+    assert_ne!(
+        device.public_key,
+        STANDARD.encode(&master.public_key),
+        "fixture must not accidentally make the raw check pass",
+    );
+    ExpectedPeerIdentity {
+        peer_id: PeerId::new(crate::bootstrap_join::APP_ADDED_PEER_ID_BASE),
+        public_key: STANDARD.encode(&master.public_key),
+        node_id: identity,
+        // Identity-only invites carry no nonce — see `veil_stack.dart`.
+        nonce: String::new(),
+        row_transport_at_dial: "quic://192.168.1.111:9000".to_owned(),
+    }
+}
+
 #[test]
 pub fn verify_remote_peer_identity_reports_nonce_mismatch_readably() {
     let id = test_handshake_identity();
@@ -1520,6 +1645,7 @@ pub fn verify_remote_peer_identity_reports_nonce_mismatch_readably() {
         remote_caps_stated: true,
         supports_realtime_datagrams: false,
         supports_realtime_rekey: false,
+        sovereign_node_id: None,
         udp_reflector_port: None,
         shared_udp_reflectors: Vec::new(),
     };
@@ -2620,6 +2746,7 @@ pub fn session_guard_drop_removes_only_its_owned_tx_sender() {
         SessionInfo {
             link_id: LinkId::new(link),
             node_id: Some(NodeId::from(node)),
+            sovereign_node_id: None,
             nonce: None,
             matched_peer_id: None,
             source: SessionSource::Outbound(PeerId::new(0u32)),

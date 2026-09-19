@@ -16,8 +16,6 @@
 
 use std::sync::Arc;
 
-use veil_util::wlock;
-
 use crate::builtin::PushTrigger;
 use veil_ipc::{IpcServer, path::default_ipc_socket_path};
 
@@ -65,15 +63,62 @@ impl NodeRuntime {
                 Ok(p) => p,
                 Err(_) => default_ipc_socket_path(),
             };
-        self.logger
-            .info("ipc.start", format!("anchor={}", anchor_for_log.display()));
+        // THE ADDRESS PEERS SEND TO, so it has to be the one peers know.
+        //
+        // Every app endpoint's `app_id` is derived from this value
+        // (`handlers/bind.rs` → `veil_app::address::app_id(node_id, ns, name)`),
+        // and a sender derives the SAME formula from the address it has for the
+        // recipient — which is the IDENTITY, because that is what an invite, a
+        // certificate and a contact list all carry. Deriving the listener's
+        // half from this DEVICE meant the two never matched: measured on the
+        // stand 2026-09-19 as `app.rt_control.route … routed=false` on every
+        // call-signalling frame and `realtimeRxCount: 0` for a whole run, with
+        // the callee sitting in `active` while the caller never learned it.
+        // Chat hid the same fault behind the mailbox, which does not route by
+        // `app_id` at all.
+        //
+        // Safe to read here: this runs once per boot and AFTER the sovereign
+        // identity is promoted (`ipc.start` follows
+        // `node.sovereign_identity.loaded` in the same reload). The fallback is
+        // for a node with no document, which IS its own identity. Both values
+        // are logged rather than assumed, so an ordering that ever changes
+        // shows up as a wrong address instead of silence.
+        // node_id is this node's identity toward its LOCAL clients: the FFI
+        // looks its embedded services up by it. Changing it broke that lookup
+        // outright — `veil_ratchet_list failed: embedded node services
+        // unavailable for this handle`, and the node shut down behind the
+        // client that gave up. It stays the device.
         let node_id = *self.identity.local_identity.node_id.as_bytes();
+        // bind_node_id is the OTHER thing entirely: the address peers derive
+        // an endpoint's `app_id` from. That one has to be the identity.
+        let bind_node_id = self
+            .identity
+            .sovereign_identity
+            .get()
+            .map(|sov| *sov.node_id())
+            .unwrap_or(node_id);
+        self.logger.info(
+            "ipc.start",
+            format!(
+                "anchor={} app_ids_under={} (device {})",
+                anchor_for_log.display(),
+                veil_util::hex_short(&bind_node_id),
+                veil_util::hex_short(&node_id),
+            ),
+        );
+
         let app_registry = Arc::clone(&self.app_registry);
         // veil-ipc's IpcServer takes Arc<dyn FrameBroadcaster>.
         // Wrap our concrete Arc<RwLock<SessionTxRegistry>> in the production
         // SessionTxBroadcaster adapter so the trait dispatch matches.
+        // WITH the session registry, because this is the adapter the IPC send
+        // path and the mailbox deposit-wake both use, and both address their
+        // destination by IDENTITY. Without it `devices_of` answers empty and
+        // an identity address finds no session — which is precisely how a live
+        // direct session sat unused while messages went to the mailbox.
         let session_tx_broadcaster: Arc<dyn veil_types::FrameBroadcaster> = Arc::new(
-            veil_session::glue::SessionTxBroadcaster::new(Arc::clone(&self.session_tx_registry)),
+            veil_session::glue::SessionTxBroadcaster::new(Arc::clone(&self.session_tx_registry))
+                .with_sessions(Arc::clone(&self.session_registry)),
         );
         let route_cache = Arc::clone(&self.routing.route_cache);
         let route_updated = Arc::clone(&self.dispatcher.route_updated);
@@ -132,6 +177,7 @@ impl NodeRuntime {
                 config.anonymity.default_hop_count.unwrap_or(2).max(1) as usize,
             ));
         let mut server = IpcServer::new(endpoint, shutdown_rx, app_registry, node_id)
+            .with_bind_node_id(bind_node_id)
             .with_session_tx_registry(session_tx_broadcaster)
             // Cross-node IPC STREAM_OPEN forwarding: share the dispatcher's
             // inbound routing tables + the runtime-wide wire stream-id counter
@@ -528,7 +574,26 @@ impl NodeRuntime {
                 let wake_sender: crate::builtin::MailboxWakeSender = {
                     const WAKE_DEBOUNCE: std::time::Duration = std::time::Duration::from_secs(2);
                     const MAX_WAKE_DEBOUNCE_ENTRIES: usize = 1024;
-                    let tx_registry = Arc::clone(&self.session_tx_registry);
+                    // THE BROADCASTER, not the raw tx registry.
+                    //
+                    // A deposit is addressed to the receiver's IDENTITY, and
+                    // the receiver's session with this relay is registered
+                    // under a DEVICE of it — so `send_to(receiver)` on the raw
+                    // registry found nothing and the wake was never sent, for
+                    // every deposit, to every sovereign client. Measured on the
+                    // stand 2026-09-19: receiver holding a live session with
+                    // the very relay that stored the blob, zero wakes in its
+                    // log, mail collected 103 s later on the cold poll.
+                    //
+                    // The broadcaster resolves the identity and offers the
+                    // frame to EVERY live device — which is what a wake wants:
+                    // any of them may be the instance about to poll.
+                    let tx_registry: Arc<dyn veil_types::FrameBroadcaster> = Arc::new(
+                        veil_session::glue::SessionTxBroadcaster::new(Arc::clone(
+                            &self.session_tx_registry,
+                        ))
+                        .with_sessions(Arc::clone(&self.session_registry)),
+                    );
                     let last_wake: std::sync::Mutex<
                         std::collections::HashMap<[u8; 32], std::time::Instant>,
                     > = std::sync::Mutex::new(std::collections::HashMap::new());
@@ -561,8 +626,11 @@ impl NodeRuntime {
                         hdr.set_priority(veil_proto::priority::INTERACTIVE);
                         let mut frame = veil_proto::codec::encode_header(&hdr).to_vec();
                         frame.extend_from_slice(&body);
-                        let guard = wlock!(tx_registry);
-                        guard.send_to(receiver, veil_proto::priority::INTERACTIVE, frame)
+                        tx_registry.send_to_peer_or_identity(
+                            receiver,
+                            veil_proto::priority::INTERACTIVE,
+                            frame,
+                        )
                     })
                 };
                 crate::builtin::spawn_mailbox_app_service(

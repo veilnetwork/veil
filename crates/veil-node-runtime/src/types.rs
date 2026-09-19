@@ -285,6 +285,21 @@ pub struct ListenConfigEntry {
 pub struct SessionInfo {
     pub link_id: LinkId,
     pub node_id: Option<NodeId>,
+    /// The IDENTITY this session's peer proved it belongs to, when the OVL1
+    /// sovereign proof-frame exchange ran.
+    ///
+    /// `node_id` above is the DEVICE: `BLAKE3` of the key the handshake
+    /// proved. An app asks about its CONTACT, and a contact is an identity —
+    /// so a live direct session to someone's phone answered "no session" to
+    /// every question asked by the address that person actually published.
+    /// Measured on the stand 2026-09-19: LAN session `state=active` under
+    /// `fe9c1b06…`, `admitted=false` for `56d3769d…`, call negotiated to relay.
+    ///
+    /// `None` for a peer that proved no identity — a legacy node, or one with
+    /// no sovereign material. Kept separate from `node_id` rather than
+    /// overwriting it: routing, dedup and the session registry all key on the
+    /// device, and two devices of one identity must stay distinguishable.
+    pub sovereign_node_id: Option<NodeId>,
     pub nonce: Option<String>,
     pub matched_peer_id: Option<PeerId>,
     pub source: SessionSource,

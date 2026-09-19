@@ -694,8 +694,10 @@ pub(crate) async fn handle_ipc_send(
         let mut frame = codec::encode_header(&hdr).to_vec();
         frame.extend_from_slice(&payload_bytes);
 
+        // `dst_node_id` is whatever the APP addressed, and an app addresses a
+        // contact — an identity. The session under it is registered by device.
         let sent = !relay_realtime
-            && reg.send_to(
+            && reg.send_to_peer_or_identity(
                 &send.dst_node_id,
                 veil_proto::header::priority::INTERACTIVE,
                 frame,
@@ -1325,7 +1327,9 @@ pub(crate) async fn handle_rt_send(
     let mut frame = codec::encode_header(&hdr).to_vec();
     frame.extend_from_slice(&payload_bytes);
 
-    let sent = reg.send_to(
+    // Same reason as the interactive path: the destination may name an
+    // identity, and the session is registered under a device of it.
+    let sent = reg.send_to_peer_or_identity(
         &send.dst_node_id,
         veil_proto::header::priority::REALTIME,
         frame,

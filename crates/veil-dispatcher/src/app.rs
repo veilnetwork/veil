@@ -9,6 +9,7 @@ use veil_proto::{
     family::{AppMsg, FrameFamily},
     header::FrameHeader,
 };
+use veil_util::lock;
 
 impl FrameDispatcher {
     pub fn dispatch_app(
@@ -17,6 +18,26 @@ impl FrameDispatcher {
         body: &[u8],
         node_id: NodeId,
     ) -> DispatchResult {
+        // WHO THIS FRAME IS FROM, as the application knows them.
+        //
+        // `node_id` is the SESSION peer, and on a sovereign install that is the
+        // DEVICE key the handshake proved. Everything above this line addresses
+        // a CONTACT, and a contact is an identity: the ratchet keys its
+        // conversations by `(my device, peer IDENTITY)` and carries the peer's
+        // device in the payload header instead, and the app was told an address
+        // its user has never seen.
+        //
+        // Passing the device meant `peer_devices()` found no published keys and
+        // the conversation lookup found no conversation, so every sealed frame
+        // that arrived over a DIRECT session was dropped — measured on the
+        // stand 2026-09-19 as `app.ratchet.open_failed … published peer key
+        // known: false, stored conversation authenticated: None`, while the
+        // same messages arrived fine through the relay path that had the
+        // identity all along.
+        //
+        // Falls back to the session peer exactly as `node_id_for_peer`
+        // documents: a legacy peer proves no identity and IS its own address.
+        let sender = sovereign_sender_of(self.session_registry.as_deref(), &node_id);
         // All node roles can receive App frames for local endpoint delivery.
         // Role restrictions apply to relay/DHT participation, not to receiving
         // messages addressed to this node's own registered app endpoints.
@@ -121,7 +142,7 @@ impl FrameDispatcher {
                 // it is a real identity — the one case that earns
                 // `SessionPeer` outright.
                 self.app_registry.route_ipc_deliver(
-                    *node_id.as_bytes(),
+                    sender,
                     veil_app::registry::SenderProvenance::SessionPeer,
                     payload.src_app_id,
                     payload.app_id,
@@ -165,7 +186,7 @@ impl FrameDispatcher {
                     return DispatchResult::NoResponse;
                 };
                 let now_unix = veil_util::unix_secs_now_u64();
-                match ratchet.open_payload(node_id.as_bytes(), &payload.data, now_unix) {
+                match ratchet.open_payload(&sender, &payload.data, now_unix) {
                     Ok(opened) => {
                         // `SessionPeer` is the floor, not the answer: the frame
                         // did arrive on an authenticated session with this
@@ -178,7 +199,7 @@ impl FrameDispatcher {
                             veil_app::registry::SenderProvenance::SessionPeer
                         };
                         self.app_registry.route_ipc_deliver(
-                            *node_id.as_bytes(),
+                            sender,
                             provenance,
                             payload.src_app_id,
                             payload.app_id,
@@ -210,9 +231,9 @@ impl FrameDispatcher {
                                 "sealed app frame from {} DROPPED — {e} \
                                  (published peer key known: {}, stored conversation \
                                  authenticated: {:?})",
-                                veil_util::bytes_to_hex(&node_id.as_bytes()[..4]),
-                                ratchet.published_ik(node_id.as_bytes()).is_some(),
-                                ratchet.peer_entry_authenticated(node_id.as_bytes()),
+                                veil_util::bytes_to_hex(&sender[..4]),
+                                ratchet.published_ik(&sender).is_some(),
+                                ratchet.peer_entry_authenticated(&sender),
                             ) + &format!(
                                 " kind={} we-hold ratchet_pk={} ek={}",
                                 payload.data.get(2).copied().unwrap_or(255),
@@ -292,7 +313,7 @@ impl FrameDispatcher {
             // conversation for good.
             AppMsg::AppSendUnopenable => {
                 if let Some(ratchet) = &self.crypto.ratchet {
-                    let dropped = ratchet.forget_peer(node_id.as_bytes());
+                    let dropped = ratchet.forget_peer(&sender);
                     self.logger.warn(
                         "app.ratchet.peer_cannot_open",
                         format!(
@@ -466,13 +487,22 @@ impl FrameDispatcher {
                 let endpoint_id = payload.endpoint_id;
                 let app_prefix = veil_util::bytes_to_hex(&payload.app_id[..4]);
                 let payload_len = payload.payload.len();
-                let routed = self
-                    .app_registry
-                    .route_rt_data(*node_id.as_bytes(), payload);
+                // THE SENDER, same as both branches above — and this is the
+                // one that carries call signalling.
+                //
+                // The app registers its realtime endpoint under the CONTACT,
+                // and a contact is an identity. Routing by the session peer
+                // handed the registry a DEVICE id it had never seen, so every
+                // `XVSG` frame was received, counted, and dropped: measured on
+                // the stand 2026-09-19 as `app.rt_control.route peer=8313f2f7
+                // … routed=false` while the callee sat in `active tr=p2p` and
+                // the caller stayed in `dialing` until it gave up. The offer
+                // survived only because it also travels the message path.
+                let routed = self.app_registry.route_rt_data(sender, payload);
                 if is_xveil_signal {
                     log::info!(
                         "app.rt_control.route peer={} app={} endpoint_id={} bytes={} routed={}",
-                        veil_util::bytes_to_hex(&node_id.as_bytes()[..4]),
+                        veil_util::bytes_to_hex(&sender[..4]),
                         app_prefix,
                         endpoint_id,
                         payload_len,
@@ -645,5 +675,114 @@ mod tests {
             }
             other => panic!("expected a StreamOpen, got {other:?}"),
         }
+    }
+}
+
+/// The address an APPLICATION knows this session's peer by.
+///
+/// Split out of `dispatch_app` so the choice can be exercised without standing
+/// up a dispatcher, a ratchet and a live session: it is one decision — which of
+/// a peer's TWO names to hand upward — and it is the decision that was wrong.
+///
+/// Returns the peer's sovereign identity when the OVL1 handshake proved one,
+/// and the session peer itself otherwise. The fallback is the contract
+/// `SessionRegistry::node_id_for_peer` states: a legacy peer proves no identity
+/// and IS its own address.
+pub(crate) fn sovereign_sender_of(
+    session_registry: Option<&std::sync::Mutex<veil_session::SessionRegistry>>,
+    peer: &NodeId,
+) -> [u8; 32] {
+    session_registry
+        .and_then(|reg| lock!(reg).node_id_for_peer(peer))
+        .unwrap_or(*peer.as_bytes())
+}
+
+#[cfg(test)]
+mod sender_identity_tests {
+    use super::*;
+    use std::sync::Mutex;
+    use veil_proto::session::{
+        AttachPayload, CapabilitiesPayload, IdentityPayload, cap_flags, role_bits,
+    };
+
+    const DEVICE: [u8; 32] = [0x01u8; 32];
+    const IDENTITY: [u8; 32] = [0x56u8; 32];
+
+    /// The defect: the app was handed the DEVICE, so the ratchet looked its
+    /// conversation up under an address the user has never seen.
+    #[test]
+    fn a_proved_peer_is_named_by_its_identity() {
+        let reg = Mutex::new(registry_with(Some(IDENTITY)));
+        assert_eq!(
+            sovereign_sender_of(Some(&reg), &NodeId::from(DEVICE)),
+            IDENTITY,
+            "a peer that PROVED an identity must be named by it",
+        );
+    }
+
+    /// A legacy peer proves nothing and IS its own address — the fallback
+    /// `node_id_for_peer` documents. Silently renaming it would break every
+    /// pre-sovereign conversation.
+    #[test]
+    fn an_unproved_peer_stays_its_own_address() {
+        let reg = Mutex::new(registry_with(None));
+        assert_eq!(
+            sovereign_sender_of(Some(&reg), &NodeId::from(DEVICE)),
+            DEVICE,
+            "without a proof the peer is its own name",
+        );
+    }
+
+    /// A dispatcher built without a session registry (test wiring, sovereign
+    /// routing bypassed) must keep the behaviour it had, not lose the sender.
+    #[test]
+    fn without_a_registry_the_peer_is_its_own_address() {
+        assert_eq!(
+            sovereign_sender_of(None, &NodeId::from(DEVICE)),
+            DEVICE,
+            "no registry must not mean no sender",
+        );
+    }
+
+    fn registry_with(sovereign: Option<[u8; 32]>) -> veil_session::SessionRegistry {
+        let mut reg = veil_session::SessionRegistry::new();
+        reg.insert(veil_session::SessionEntry {
+            session_id: [0x77; 32],
+            remote_node_id: DEVICE,
+            remote_identity: IdentityPayload {
+                algo: 1,
+                public_key: DEVICE.to_vec(),
+                nonce: b"nonce".to_vec(),
+                node_id: DEVICE,
+                mlkem_pubkey: None,
+            },
+            remote_capabilities: CapabilitiesPayload {
+                roles_supported: role_bits::CORE,
+                flags: cap_flags::CAN_RELAY,
+                discovery_mode: 0,
+            },
+            remote_attach: AttachPayload {
+                role: 3,
+                realm_id: 0,
+                attach_epoch: 1,
+                mailbox_preference_count: 0,
+                gateway_preference_count: 0,
+                flags: 0,
+            },
+            remote_role: veil_session::RemoteRole::Core,
+            validated_sovereign_identity: sovereign.map(|node_id| {
+                veil_identity::verify::ValidatedIdentity {
+                    node_id,
+                    master_algo: 0,
+                    master_pubkey: vec![0xEE; 32],
+                    active_identity_pubkey: vec![0xFF; 32],
+                    active_identity_algo: 0,
+                    active_key_idx: 0,
+                    active_device_id: DEVICE,
+                    active_instance_id: [0xCC; 16],
+                }
+            }),
+        });
+        reg
     }
 }
