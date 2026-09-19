@@ -71,16 +71,23 @@ bandwidth cost stays tiny:
 
 *Proof of Work* (PoW) is the small math puzzle a node solves to mint an identity.
 It costs a bit of compute, which keeps honest sign-ups cheap while making it
-expensive to churn out fake identities in bulk. The difficulty rises with network
-size; the times below show how long that puzzle takes on a CPU versus a GPU.
+expensive to churn out fake identities in bulk.
 
-| Network Size | Difficulty | Mining Time (CPU) | Mining Time (GPU) |
-|-------------|-----------|-------------------|-------------------|
-| 100K | 24 bits | ~0.3s | ~0.01s |
-| 1M | 28 bits | ~5s | ~0.1s |
-| 10M | 31 bits | ~40s | ~1s |
-| 1B | 38 bits | ~5 hours | ~10 min |
-| 10B | 41 bits | ~40 hours | ~80 min |
+**The difficulty does not scale with network size.** It is a configuration
+value, `pow_difficulty`, defaulting to 24 bits;
+`RECOMMENDED_PRODUCTION_POW_DIFFICULTY` is 16 for a node carrying real traffic,
+and the session layer refuses an inbound `PowChallenge` above
+`MAX_POW_DIFFICULTY = 24` so a peer cannot make you grind an arbitrary one.
+This section used to carry a table of difficulties per network size, from 24
+bits at 100K nodes to 41 at 10B. Nothing computes that: an operator planning
+around "38 bits at a billion nodes" was planning around a mechanism that does
+not exist.
+
+What DOES adapt to the estimated network size is `AdaptiveParams`
+([`veil-adaptive`](../../crates/veil-adaptive/src/lib.rs)): the Kademlia `k`,
+the gossip TTL, the epidemic fanout, the route-cache and route-seen
+capacities, the peer-pubkey cache, and the per-bucket subnet cap. PoW is not
+among them.
 
 ## Memory Budget Breakdown (256MB default)
 
