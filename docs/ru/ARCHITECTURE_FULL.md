@@ -630,14 +630,14 @@ Leaf объявляет, через какие Core-узлы к нему мож�
 
 Пара «запрос — ответ»: по node_id вернуть список gateway и mailbox.
 
-### 9.3 MailboxSet и GetMailboxSet
+### 9.3 GetMailboxSet — удалён
 
-`MailboxSet` — список node_id, хранящих реплики mailbox для узла `X`. Помогает офлайн-доставке.
-
-```
-GetMailboxSetPayload:  target_node_id[32] + epoch[4]
-MailboxSetResponse:    count[2] + node_id[32][]
-```
+Слот discovery 6 когда-то нёс `GetMailboxSet`, возвращавший node_id, которые
+держат реплики ящика для узла. Он ушёл вместе с репликами: ни
+`GetMailboxSetPayload`, ни `MailboxSetResponse` не существует, а слот оставлен
+нераспределённым, чтобы возвращение было прослеживаемым
+([`proto/family.rs`](../../crates/veil-proto/src/family.rs)). Офлайн-доставка
+идёт через запись привязки — §9.2 и §12.4.
 
 ### 9.4 AppEndpoint и GetAppEndpoint
 
@@ -873,7 +873,9 @@ Accepted → Stored → Fetched → Delivered → AppAcked
 
 ### 12.1 Модель
 
-`MailboxService` принимает от Core-узлов три операции:
+Служба ящика (`veil.mailbox.v1`, поверх типа `Mailbox` из
+[`veil-mailbox`](../../crates/veil-mailbox/src/lib.rs)) принимает на своих
+эндпоинтах три операции:
 - **PUT** — отложить `DeliveryEnvelope` для офлайн-получателя.
 - **FETCH** — получатель онлайн и забирает своё, листая с курсора `after_seq`.
 - **ACK** — подтвердить, какие seq прочитаны.
@@ -1161,14 +1163,19 @@ priority: local_relay > global_core > None
 
 ### 16.3 Violation tracker
 
-`MAX_VIOLATION_TRACKER_SIZE = 8192`. Категории нарушений, среди прочих:
-- `BadFrame` — неверный формат в канале.
-- `SenderMismatch` — отправитель в конверте не совпадает с аутентифицированным соседом.
-- `PoWFail` — неверное решение.
-- `RateExceeded` — корзина токенов пуста.
-- и другие.
+`MAX_VIOLATION_TRACKER_SIZE = 8192`.
 
-Как только сосед набирает `VIOLATION_THRESHOLD = 5` в окне `VIOLATION_WINDOW_SECS = 300`, он попадает в бан.
+Трекер не классифицирует. `ViolationTracker::record(peer_id, ban_list)`
+принимает id соседа и больше ничего: перечисления видов нарушения нет, а
+категорий `BadFrame` / `SenderMismatch` / `PoWFail` / `RateExceeded`, которые
+здесь перечислялись, не существует. (`SenderMismatch` существует, но как
+вариант `AuthDeliverError` в `veil-identity` — это другое.) Решает, было ли
+нарушение, вызывающая сторона; трекер считает их по соседу, даёт счёту затухать
+и банит, когда счёт переходит порог.
+
+Порог и окно — параметры конструктора, а не константы; см.
+[`violation_tracker.rs`](../../crates/veil-abuse/src/violation_tracker.rs).
+Искать `VIOLATION_THRESHOLD` или `VIOLATION_WINDOW_SECS` негде.
 
 ### 16.4 Ban list
 
@@ -1541,9 +1548,9 @@ Admin-интерфейс — это Unix-сокет из `global.admin_socket` (
 | Session runner | `veil-session` (`runner.rs`) | `SessionRunner`, `SessionTxRegistry` |
 | Dispatcher | `veil-dispatcher` | `FrameDispatcher`, `DispatchResult` |
 | DHT | `veil-dht` | `KademliaService`, `RoutingTable`, `IterativeParams` |
-| Discovery | `veil-discovery` | `DirectoryService`, `AnnounceAttachmentPayload` |
+| Discovery | `veil-discovery` | `DiscoveryService`, `StaticDirectory`, `AnnounceAttachmentPayload` |
 | Routing | `veil-routing` | `RouteCache`, `RouteAnnouncePayload` |
-| Mailbox | `veil-mailbox` | `MailboxService` (redb) |
+| Mailbox | `veil-mailbox` | `Mailbox` (redb) |
 | NAT | `veil-nat` | `NatCoordinator`, `NatPuncher`, `RelayFallback` |
 | Mesh | `veil-mesh` | `MeshForwarder`, `BeaconSender` |
 | PEX | `veil-pex` | dispatcher, initiator |

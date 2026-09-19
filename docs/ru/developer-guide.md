@@ -327,10 +327,11 @@ pub trait MailboxBackend: Send + Sync {
 }
 ```
 
-Добавление нового бэкенда:
-1. Реализуйте `MailboxBackend` в `node/mailbox/`
-2. Добавьте вариант в enum `MailboxBackendKind`
-3. Добавьте строку `"yourbackend"` в разбор внутри `MailboxService::new()`
+Добавлять бэкенд некуда. Хранилище — redb, фиксированное; см. §12.2
+[ARCHITECTURE_FULL](ARCHITECTURE_FULL.md): ключа `backend` нет, enum
+`MailboxBackendKind` нет, каталога `node/mailbox/` нет. (`MailboxBackend`
+существует, но как внутренний trait IPC-сервера поверх хранилища, а не как
+сменный движок.)
 
 ### AppEndpointRegistry (`node/app/registry.rs`)
 

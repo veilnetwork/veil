@@ -328,10 +328,11 @@ pub trait MailboxBackend: Send + Sync {
 }
 ```
 
-Adding a new backend:
-1. Implement `MailboxBackend` in `node/mailbox/`
-2. Add a variant to the `MailboxBackendKind` enum
-3. Add a `"yourbackend"` string to the parser in `MailboxService::new()`
+There is no backend to add. The store is redb, fixed — see §12.2 of
+[ARCHITECTURE_FULL](ARCHITECTURE_FULL.md): there is no `backend` config key, no
+`MailboxBackendKind` enum and no `node/mailbox/` directory. (`MailboxBackend`
+does exist, but as the IPC server's internal trait over the store, not a
+swappable engine.)
 
 ### AppEndpointRegistry (`node/app/registry.rs`)
 
