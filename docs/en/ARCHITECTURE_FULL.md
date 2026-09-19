@@ -1389,7 +1389,8 @@ The main groups follow (for the full list, see [admin-guide.md](admin-guide.md#a
 - Transport: `veil_active_sessions`, `veil_inbound_sessions_total`,
   `veil_transport_bytes_rx_total`, `veil_transport_bytes_tx_total`.
 - Session: `veil_session_handshake_failures_total`, `veil_session_tx_drops_total`.
-- Delivery: `veil_delivery_rejects_total`, `veil_chunks_reassembled_total`.
+- Delivery: `veil_ipc_delivery_drops_total`, `veil_chunks_reassembled_total`,
+  `veil_recursive_relay_delivered_total`.
 - DHT / Routing: `veil_dht_store_total`, `veil_dht_lookup_total`,
   `veil_route_cache_hits_total`, `veil_route_miss_total`,
   `veil_recursive_relay_initiated_total`.

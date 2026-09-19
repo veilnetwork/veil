@@ -265,8 +265,10 @@ now.)
 | Transport | `veil_transport_bytes_rx_total` | counter | Bytes received on the transport |
 | Transport | `veil_transport_bytes_tx_total` | counter | Bytes sent on the transport |
 | Session | `veil_session_handshake_failures_total` | counter | Handshake rejections |
-| Delivery | `veil_mailbox_fetches_total` | counter | MAILBOX_FETCH operations |
-| Delivery | `veil_delivery_rejects_total` | counter | Rejected Delivery frames |
+| Mailbox | `veil_mailbox_fetch_count` | counter | FETCH operations served |
+| Mailbox | `veil_mailbox_ack` | counter | ACKs applied |
+| Mailbox | `veil_mailbox_put_with_capability` | counter | Deposits carrying a capability token |
+| Mailbox | `veil_mailbox_open` / `veil_mailbox_seal` | counter | Blobs opened / sealed |
 | Delivery | `veil_chunks_reassembled_total` | counter | Reassembled chunked transfers |
 | Delivery | `veil_multi_path_sends_total` | counter | Parallel multi-path sends |
 | DHT | `veil_dht_store_total` | counter | STORE operations in DHT |
@@ -296,10 +298,8 @@ now.)
 | Session-queue | `veil_session_tx_drops_total` | counter | Dropped from the per-session TX queue |
 | Session-queue | `veil_session_outbox_drops_total` | counter | Dropped from SessionOutbox |
 | IPC | `veil_ipc_delivery_drops_total` | counter | Dropped into the client IPC channel |
-| Sleep | `veil_sleeping_recipients` | gauge | Recipients in sleep state on the host |
 | Sleep | `veil_sleep_advertisements_accepted_total` | counter | SleepAdvertisement accepted |
-| Sleep | `veil_sleep_advertisements_emitted_total` | counter | SleepAdvertisement emitted |
-| Sleep | `veil_wakeup_fetches_total` | counter | Wake-up MAILBOX_FETCH on session open |
+| Push | `veil_owned_push_suppressed_total` | counter | Own-device push suppressed |
 
 > **Mailbox depth.** One number is missing from Prometheus: how many blobs the
 > mailbox currently holds. To see it, read the `mailbox_entries` field in the
