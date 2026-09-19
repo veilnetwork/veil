@@ -19,8 +19,15 @@ set -euo pipefail
 
 WEBRTC_SRC="${WEBRTC_SRC:-$HOME/Projects/veilnetwork/webrtc-checkout/src}"
 WEBRTC_OUT="${WEBRTC_OUT:-out/mac-arm64}"
-SRCDIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../src" && pwd)"
-DEST="${1:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/Frameworks}"
+# Resolved BEFORE anything cds anywhere. `$BASH_SOURCE` is relative whenever the
+# script is invoked by a relative path, so a `cd` further down (line ~73 enters
+# the WebRTC out dir) silently invalidates it — and the failure surfaces much
+# later as `cd: macos: No such file or directory`, which reads like a missing
+# directory rather than a stale path. Cost this twice on 2026-09-19.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SRCDIR="$SCRIPT_DIR/../src"
+SRCDIR="$(cd "$SRCDIR" && pwd)"
+DEST="${1:-$SCRIPT_DIR/Frameworks}"
 mkdir -p "$DEST"
 
 CLANGXX="$WEBRTC_SRC/third_party/llvm-build/Release+Asserts/bin/clang++"
@@ -91,7 +98,6 @@ DEADSTRIP="-Wl,-dead_strip"
 # Derived from the same command the objects were compiled with, exactly as
 # the Windows wrapper derives /MACHINE: the bundle knows what it is, and
 # nothing else here should be guessing.
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 MAC_TARGET="$(python3 "$SCRIPT_DIR/_mac_target.py" \
   "$WEBRTC_SRC/$WEBRTC_OUT/compile_commands.json")"
 echo "==> linking for $MAC_TARGET"
