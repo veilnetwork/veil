@@ -3,7 +3,7 @@ name = "veil-transport"
 version = "0.11.37"
 edition = "2024"
 description = "Veil network transport layer: TCP, QUIC, TLS (rustls + optional BoringSSL), WebSocket, SOCKS proxy, Unix domain sockets. Phase 4 extraction from veilcore — pure transport primitives, no veil-protocol or session-runtime coupling."
-license = "AGPL-3.0-or-later"
+license = "MIT OR Apache-2.0"
 
 [features]
 # Anti-DPI BoringSSL TLS backend (Chrome-like JA3/JA4 fingerprint).

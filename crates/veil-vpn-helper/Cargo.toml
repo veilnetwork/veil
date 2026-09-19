@@ -2,7 +2,7 @@
 name = "veil-vpn-helper"
 version = "0.1.0"
 edition = "2024"
-license = "AGPL-3.0-or-later"
+license = "MIT OR Apache-2.0"
 description = "Privileged same-binary Windows packet-tunnel helper for xVeil"
 
 [lib]

@@ -2,7 +2,7 @@
 name = "veil-obfs4-smoke"
 version = "0.11.37"
 edition = "2024"
-license = "AGPL-3.0-or-later"
+license = "MIT OR Apache-2.0"
 
 [dependencies]
 base64 = "0.22"

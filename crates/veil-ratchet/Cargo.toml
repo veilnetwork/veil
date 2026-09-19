@@ -3,7 +3,7 @@ name = "veil-ratchet"
 version = "0.11.37"
 edition = "2024"
 description = "Hybrid (X25519 + ML-KEM-768) Double Ratchet and PQXDH key agreement for one-to-one messaging: forward secrecy, post-compromise recovery, deniability (no signatures in the transcript), and asynchronous first contact against pre-published keys."
-license = "AGPL-3.0-or-later"
+license = "MIT OR Apache-2.0"
 
 [dependencies]
 chacha20poly1305 = "0.10"
