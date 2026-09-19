@@ -130,6 +130,38 @@ namespace {
 
 const char* kVersion = "veil_media 0.0.3 (group-video)";
 constexpr int kOpusPayloadType = 111;  // SDP convention (Opus, 48k, stereo)
+
+// What the encoder is ASKED for, in one place, because the default is not the
+// right answer for a call.
+//
+// `SdpAudioFormat("opus", 48000, 2)` with no parameters gets WebRTC's Opus
+// defaults: FEC off, DTX off, stereo negotiated. For a voice call on a mobile
+// link every one of those is wrong:
+//
+//  * `stereo=0` — a microphone is one channel. Offering two doubled the bill
+//    and carried nothing.
+//  * `useinbandfec=1` — Opus LBRR embeds a low-rate copy of the PREVIOUS frame
+//    in each packet, so one lost packet is reconstructed from the next rather
+//    than concealed. This is the direct answer to dropouts, and it costs bitrate
+//    only in proportion to the loss the encoder is told about (WebRTC feeds it
+//    the RTCP loss fraction). Measured on the stand 2026-09-19, a link losing
+//    a third of its packets in 0.6-2s bursts drove NetEQ's buffer to 1.1-1.4s
+//    — the "strong delay" a listener hears is the jitter buffer growing to
+//    cover holes that FEC would have filled.
+//  * `usedtx=1` — silence stops costing ~35 kbit/s.
+//
+// NOT a flag day: these are encoder-side choices carried inside a
+// self-describing Opus bitstream. A peer on an older build decodes mono, LBRR
+// and DTX without knowing anything changed, and nothing here alters what WE
+// accept. `ptime` is deliberately left at 20 ms: a longer frame would cut the
+// packet rate further but adds its own latency, and latency is the complaint.
+webrtc::SdpAudioFormat VeilOpusSendFormat() {
+  return webrtc::SdpAudioFormat("opus", 48000, 2,
+                                {{"stereo", "0"},
+                                 {"useinbandfec", "1"},
+                                 {"usedtx", "1"}});
+}
+
 #if defined(VEIL_MEDIA_HAVE_WEBRTC)
 constexpr int kVideoNackHistoryMs = 1000;
 // A 60-frame interval produced a full VP8 intra-frame burst every ~2 seconds
@@ -1750,7 +1782,7 @@ int veil_media_group_engine_start_audio(VeilGroupMediaEngine* engine) {
           webrtc::RtpHeaderExtensionId(1));
       sc.encoder_factory = webrtc::CreateBuiltinAudioEncoderFactory();
       sc.send_codec_spec = webrtc::AudioSendStream::Config::SendCodecSpec(
-          kOpusPayloadType, webrtc::SdpAudioFormat("opus", 48000, 2));
+          kOpusPayloadType, VeilOpusSendFormat());
       ws->send_stream = ws->call->CreateAudioSendStream(sc);
       if (ws->send_stream) {
         ws->send_stream->SetMuted(engine->mic_muted);
@@ -2243,7 +2275,7 @@ int veil_media_engine_start_audio(VeilMediaEngine* engine, int send, int recv) {
           webrtc::RtpHeaderExtensionId(1));
       sc.encoder_factory = webrtc::CreateBuiltinAudioEncoderFactory();
       sc.send_codec_spec = webrtc::AudioSendStream::Config::SendCodecSpec(
-          kOpusPayloadType, webrtc::SdpAudioFormat("opus", 48000, 2));
+          kOpusPayloadType, VeilOpusSendFormat());
       ws->send_stream = ws->call->CreateAudioSendStream(sc);
       if (ws->send_stream) ws->send_stream->Start();
     }
