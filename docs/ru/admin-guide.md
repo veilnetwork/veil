@@ -271,10 +271,6 @@ curl http://127.0.0.1:9090/metrics
 | Transport | `veil_transport_bytes_rx_total` | counter | Байт принято на транспорте |
 | Transport | `veil_transport_bytes_tx_total` | counter | Байт отправлено на транспорте |
 | Session | `veil_session_handshake_failures_total` | counter | Отказов в handshake |
-| Mailbox | `veil_mailbox_fetch_count` | counter | Обслуженных операций FETCH |
-| Mailbox | `veil_mailbox_ack` | counter | Применённых ACK |
-| Mailbox | `veil_mailbox_put_with_capability` | counter | Вкладов с capability-токеном |
-| Mailbox | `veil_mailbox_open` / `veil_mailbox_seal` | counter | Блобов открыто / запечатано |
 | Delivery | `veil_chunks_reassembled_total` | counter | Собранных chunked-трансферов |
 | Delivery | `veil_multi_path_sends_total` | counter | Параллельных рассылок по путям |
 | DHT | `veil_dht_store_total` | counter | STORE операций в DHT |

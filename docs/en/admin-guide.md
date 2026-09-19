@@ -265,10 +265,6 @@ now.)
 | Transport | `veil_transport_bytes_rx_total` | counter | Bytes received on the transport |
 | Transport | `veil_transport_bytes_tx_total` | counter | Bytes sent on the transport |
 | Session | `veil_session_handshake_failures_total` | counter | Handshake rejections |
-| Mailbox | `veil_mailbox_fetch_count` | counter | FETCH operations served |
-| Mailbox | `veil_mailbox_ack` | counter | ACKs applied |
-| Mailbox | `veil_mailbox_put_with_capability` | counter | Deposits carrying a capability token |
-| Mailbox | `veil_mailbox_open` / `veil_mailbox_seal` | counter | Blobs opened / sealed |
 | Delivery | `veil_chunks_reassembled_total` | counter | Reassembled chunked transfers |
 | Delivery | `veil_multi_path_sends_total` | counter | Parallel multi-path sends |
 | DHT | `veil_dht_store_total` | counter | STORE operations in DHT |
