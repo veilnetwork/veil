@@ -2,7 +2,7 @@
 # `cargo deny check` failed at the license stage on every MIT/Apache dep).
 #
 # Scope of this gate: THIRD-PARTY dependency hygiene — advisories, sources, and
-# license compliance. First-party (workspace) crates are AGPL-3.0-or-later (the
+# license compliance. First-party (workspace) crates are MIT OR Apache-2.0 (the
 # project license) and are skipped via `private.ignore` below; their license
 # field is a packaging concern, not a dependency-policy one.
 #
@@ -58,16 +58,13 @@ ignore = [
 
 [licenses]
 version = 2
-# Skip our own workspace crates (AGPL-3.0-or-later; a few have no license field
-# yet — packaging cleanup, tracked separately). This gate is about deps.
+# Skip our own workspace crates (MIT OR Apache-2.0). This gate is about deps.
 private = { ignore = true }
 confidence-threshold = 0.9
 # Permissive licenses present in the dependency tree (enumerated from
 # `cargo deny list` 2026-05-31). Anything outside this set must be reviewed
 # and added deliberately — a strong-copyleft dep (e.g. GPL) would be rejected.
 allow = [
-    # First-party workspace crates (the project license).
-    "AGPL-3.0-or-later",
     # Permissive third-party licenses present in the dependency tree.
     "MIT",
     "MIT-0",
@@ -85,13 +82,21 @@ allow = [
     "Unlicense",
     "WTFPL",
 ]
-# xVeil and veil are AGPL-3.0-or-later, so this narrowly-scoped GPL-3.0+
-# dependency is license-compatible with the distributed work. Keep GPL out of
-# the global allow-list: only tun2proxy's pinned SOCKS protocol implementation
-# is accepted, and a second GPL dependency will still fail the gate.
-exceptions = [
-    { crate = "socks5-impl@0.8.7", allow = ["GPL-3.0-or-later"] },
-]
+# No exceptions, and that is the point.
+#
+# `socks5-impl` (GPL-3.0-or-later) used to sit here. It was compatible while
+# the workspace was AGPL-3.0-or-later and stopped being so under
+# MIT OR Apache-2.0: a binary that links GPL code is GPL, whatever the source
+# license field says. It reached two crates — veil-vpn-helper on Windows and
+# veilclient-ffi under `packet-tunnel` — and SOCKS5 is how the tunnel talks to
+# veil's own proxy, so it could not simply be dropped. It was replaced by a
+# clean-room codec written from RFC 1928/1929
+# (`third_party/tun2proxy/src/socks5_proto.rs`).
+#
+# Keep this list EMPTY. An exception is a licence decision wearing the clothes
+# of a config line: the next GPL dependency must fail this gate and be argued
+# for, not inherit a precedent set for a crate that is no longer here.
+exceptions = []
 
 [bans]
 # Surface NEW first-party duplicate-version deps (WARN, non-blocking) without

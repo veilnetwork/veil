@@ -2,7 +2,7 @@
 name = "veilclient"
 version = "0.8.3"
 edition = "2024"
-license = "AGPL-3.0-or-later"
+license = "MIT OR Apache-2.0"
 description = "High-level Rust client SDK for the Veil network"
 
 [dependencies]

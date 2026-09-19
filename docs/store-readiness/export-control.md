@@ -56,7 +56,7 @@ Hash algorithms:
   - SHA-256
   - SHA-3
 
-Source code public availability:    Yes (open-source under AGPL-3.0-or-later)
+Source code public availability:    Yes (open-source under MIT OR Apache-2.0)
 Source code repository:             https://github.com/<org>/veil
 
 Contact for technical questions:    <operator email>

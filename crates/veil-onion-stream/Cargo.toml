@@ -3,7 +3,7 @@ name = "veil-onion-stream"
 version = "0.1.0"
 edition = "2024"
 description = "Reliable, congestion-controlled byte-stream over an anonymous onion circuit's lossy fixed-size cell channel (end-to-end ARQ + AIMD CC + clean EOF/RST for resumable transfers). Sans-IO core: deterministic, transport-agnostic."
-license = "AGPL-3.0-or-later"
+license = "MIT OR Apache-2.0"
 
 [dependencies]
 log = "0.4"
