@@ -271,8 +271,10 @@ curl http://127.0.0.1:9090/metrics
 | Transport | `veil_transport_bytes_rx_total` | counter | Байт принято на транспорте |
 | Transport | `veil_transport_bytes_tx_total` | counter | Байт отправлено на транспорте |
 | Session | `veil_session_handshake_failures_total` | counter | Отказов в handshake |
-| Delivery | `veil_mailbox_fetches_total` | counter | MAILBOX_FETCH операций |
-| Delivery | `veil_delivery_rejects_total` | counter | Отвергнутых Delivery-фреймов |
+| Mailbox | `veil_mailbox_fetch_count` | counter | Обслуженных операций FETCH |
+| Mailbox | `veil_mailbox_ack` | counter | Применённых ACK |
+| Mailbox | `veil_mailbox_put_with_capability` | counter | Вкладов с capability-токеном |
+| Mailbox | `veil_mailbox_open` / `veil_mailbox_seal` | counter | Блобов открыто / запечатано |
 | Delivery | `veil_chunks_reassembled_total` | counter | Собранных chunked-трансферов |
 | Delivery | `veil_multi_path_sends_total` | counter | Параллельных рассылок по путям |
 | DHT | `veil_dht_store_total` | counter | STORE операций в DHT |
@@ -302,10 +304,8 @@ curl http://127.0.0.1:9090/metrics
 | Session-queue | `veil_session_tx_drops_total` | counter | Сброшено из per-session TX-очереди |
 | Session-queue | `veil_session_outbox_drops_total` | counter | Сброшено из SessionOutbox |
 | IPC | `veil_ipc_delivery_drops_total` | counter | Сброшено в IPC-канал клиента |
-| Sleep | `veil_sleeping_recipients` | gauge | Получателей в sleep-state на хосте |
 | Sleep | `veil_sleep_advertisements_accepted_total` | counter | Принятых SleepAdvertisement |
-| Sleep | `veil_sleep_advertisements_emitted_total` | counter | Отправленных SleepAdvertisement |
-| Sleep | `veil_wakeup_fetches_total` | counter | Wake-up MAILBOX_FETCH при открытии сессии |
+| Push | `veil_owned_push_suppressed_total` | counter | Подавлено push на собственное устройство |
 
 > **Сколько в почтовом ящике.** Одного числа в Prometheus нет: сколько блобов
 > сейчас лежит в почтовом ящике. Чтобы его увидеть, посмотрите поле

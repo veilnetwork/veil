@@ -236,10 +236,12 @@ stalled — confirm `veil-cli node show | grep uptime` lines up with how fresh
 the metric counters look. As a last resort, restart the node.
 
 ### Sleeping recipient never wakes
-Check that the wake-up advertisement was both emitted
-(`veil_sleep_advertisements_emitted_total`) and accepted
-(`veil_sleep_advertisements_accepted_total`). If it was emitted but not
-accepted, the gateway or recipient channel is broken.
+Check `veil_sleep_advertisements_accepted_total` on the gateway: it counts the
+advertisements that actually landed. There is no companion counter for
+advertisements SENT — the sending side is not instrumented — so a flat
+`accepted` tells you the advertisement did not arrive, but not whether it was
+sent and lost or never sent. To tell those apart, read the sender's log rather
+than reaching for a metric that does not exist.
 
 ---
 
