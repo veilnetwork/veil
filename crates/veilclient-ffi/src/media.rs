@@ -747,11 +747,73 @@ pub(crate) fn clear_recv_callback_by_chan(chan: u64) {
 /// in [`IN_FLIGHT`] while the registry is still held: clearing then waits for
 /// it. Without that, "the callback is no longer registered" said nothing about
 /// whether one was running (report9 V-01).
+/// Inter-arrival spacing of inbound media cells AT THE NATIVE BOUNDARY, before
+/// a byte reaches the engine.
+///
+/// The engine's `jitter_ms` says the stream arrives clumped; it cannot say
+/// WHERE the clumping happened. Measured here, one layer below, the same
+/// question splits in two: spacing that is already ragged came off the wire or
+/// out of the sender, and spacing that is clean here but ragged in the engine
+/// was made by our own delivery hop. Nothing else in the path could tell those
+/// apart.
+///
+/// A 20 ms stream should sit almost entirely in the 0-30 ms bucket.
+fn note_arrival_gap() {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::Instant;
+    static LAST: Mutex<Option<Instant>> = Mutex::new(None);
+    static N: AtomicU64 = AtomicU64::new(0);
+    static OVER_40: AtomicU64 = AtomicU64::new(0);
+    static OVER_75: AtomicU64 = AtomicU64::new(0);
+    static OVER_150: AtomicU64 = AtomicU64::new(0);
+    static MAX_US: AtomicU64 = AtomicU64::new(0);
+    static SUM_US: AtomicU64 = AtomicU64::new(0);
+
+    let now = Instant::now();
+    let gap = {
+        let mut last = LAST.lock().unwrap_or_else(|p| p.into_inner());
+        let gap = last.map(|t| now.duration_since(t));
+        *last = Some(now);
+        gap
+    };
+    let Some(gap) = gap else { return };
+    let us = gap.as_micros().min(u128::from(u64::MAX)) as u64;
+    SUM_US.fetch_add(us, Ordering::Relaxed);
+    MAX_US.fetch_max(us, Ordering::Relaxed);
+    if us > 40_000 {
+        OVER_40.fetch_add(1, Ordering::Relaxed);
+    }
+    if us > 75_000 {
+        OVER_75.fetch_add(1, Ordering::Relaxed);
+    }
+    if us > 150_000 {
+        OVER_150.fetch_add(1, Ordering::Relaxed);
+    }
+    let n = N.fetch_add(1, Ordering::Relaxed) + 1;
+    if !n.is_multiple_of(250) {
+        return;
+    }
+    // Reported as a WINDOW, not a lifetime total: a running average over a
+    // whole call hides exactly the bursts this is meant to find.
+    let over40 = OVER_40.swap(0, Ordering::Relaxed);
+    let over75 = OVER_75.swap(0, Ordering::Relaxed);
+    let over150 = OVER_150.swap(0, Ordering::Relaxed);
+    let max_us = MAX_US.swap(0, Ordering::Relaxed);
+    let sum_us = SUM_US.swap(0, Ordering::Relaxed);
+    log::info!(
+        "media.ingress.spacing n={n} window=250 mean={:.1}ms max={:.1}ms \
+         over40={over40} over75={over75} over150={over150}",
+        sum_us as f64 / 250.0 / 1000.0,
+        max_us as f64 / 1000.0,
+    );
+}
+
 fn dispatch_inbound(peer: [u8; 32], payload: &[u8]) {
     {
         let mut counts = RECV_COUNT.lock().unwrap_or_else(|p| p.into_inner());
         *counts.entry(peer).or_insert(0) += 1;
     }
+    note_arrival_gap();
     // `hits` counts within the CURRENT registration (reset by set), so the
     // trace shows whether each nominally-live window actually delivered into
     // the engine — the process-lifetime counters could not (a healthy first
@@ -893,6 +955,50 @@ fn dispatch_inbound_batch(peer: [u8; 32], body: &[u8]) {
 /// `sender_node_id` is an unauthenticated claim), and demanding a long-lived
 /// sender identity here would break anonymity rather than fix injection. The
 /// seal is what proves "whoever sent this holds this call's key".
+/// Throttled note for an inbound media cell that was dropped before it could
+/// reach the engine, naming WHICH of the two silent gates took it and what is
+/// registered instead. One line per reason, then every 500th.
+fn media_drop_note(reason: &str, peer: [u8; 32], len: usize) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NO_CHANNEL: AtomicU64 = AtomicU64::new(0);
+    static SEAL: AtomicU64 = AtomicU64::new(0);
+    let counter = if reason == "no-channel" {
+        &NO_CHANNEL
+    } else {
+        &SEAL
+    };
+    let n = counter.fetch_add(1, Ordering::Relaxed) + 1;
+    if n != 1 && !n.is_multiple_of(500) {
+        return;
+    }
+    // Formatted the way the rest of this file formats a peer, and NOT with
+    // `veil_util::bytes_to_hex`: that crate is an optional dependency behind
+    // the `node-embedded` feature, while this module compiles unconditionally.
+    // Reaching for it built fine under the feature set the stand happened to
+    // use and broke `cargo clippy`/`cargo check` with default features — the
+    // shape of defect that only the build nobody ran locally would have shown.
+    let registered = {
+        let map = RECV.lock().unwrap_or_else(|p| p.into_inner());
+        map.iter()
+            .map(|(p, c)| {
+                format!(
+                    "{:02x}{:02x}{:02x}{:02x}@chan{}",
+                    p[0], p[1], p[2], p[3], c.chan
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",")
+    };
+    log::warn!(
+        "media.ingress.drop reason={reason} n={n} \
+         peer={:02x}{:02x}{:02x}{:02x} len={len} registered=[{registered}]",
+        peer[0],
+        peer[1],
+        peer[2],
+        peer[3],
+    );
+}
+
 pub(crate) fn dispatch_inbound_auto(peer: [u8; 32], payload: &[u8]) {
     // Resolve the channel's cipher BEFORE looking at the packet, so the
     // decision comes from our state and not from bytes the sender chose.
@@ -902,10 +1008,20 @@ pub(crate) fn dispatch_inbound_auto(peer: [u8; 32], payload: &[u8]) {
     };
     // No open channel for this peer: nothing to open the cell with, and the
     // engine has nowhere to put it either. Drop.
+    //
+    // SAY SO, throttled. Both drops below were silent, and `dispatch MISS`
+    // cannot cover either of them: it lives INSIDE `dispatch_inbound`, which
+    // is reached only once the key was found and the seal opened. A key
+    // mismatch — the exact shape an identity/device split produces — left no
+    // counter, no log and no difference from "the wire delivered nothing"
+    // (measured on the stand 2026-09-19: rx_pkts=0 with recv_count=0 on BOTH
+    // sides of a live p2p call).
     let Some(cipher) = cipher else {
+        media_drop_note("no-channel", peer, payload.len());
         return;
     };
     let Some(plaintext) = cipher.open(payload) else {
+        media_drop_note("seal-open-failed", peer, payload.len());
         return;
     };
     if plaintext.first() == Some(&MEDIA_BATCH_MAGIC) {

@@ -1024,6 +1024,22 @@ pub unsafe extern "C" fn veil_media_start_direct_receiver(
             // Compute rather than cache by untrusted sender id: the media
             // endpoint is long-lived, so a stream of one-shot authenticated
             // peers must not grow an unbounded source-id map.
+            // Count what ARRIVES, not only what is refused. "No mismatch
+            // logged" was read as "the demux is fine" when it equally meant
+            // "nothing ever reached the demux" — the two are opposite
+            // diagnoses and the instrument could not tell them apart.
+            {
+                use std::sync::atomic::{AtomicU64, Ordering};
+                static ARRIVED: AtomicU64 = AtomicU64::new(0);
+                let n = ARRIVED.fetch_add(1, Ordering::Relaxed) + 1;
+                if n == 1 || n.is_multiple_of(500) {
+                    log::info!(
+                        "media.ingress.arrived n={n} from={} bytes={}",
+                        veil_util::bytes_to_hex(&src_node_id[..4]),
+                        data.len(),
+                    );
+                }
+            }
             let expected = direct_media_source_app(&src_node_id, &namespace, &name);
             if src_app_id != expected {
                 // SAY SO. This demux dropped every mismatching frame in
