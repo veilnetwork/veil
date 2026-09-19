@@ -68,6 +68,55 @@ pub trait FrameBroadcaster: Send + Sync {
     /// available for any future module that needs to enumerate connected
     /// peers without importing veilcore's `SessionTxRegistry` concretely.
     fn active_node_ids(&self) -> Vec<[u8; 32]>;
+
+    /// Live sessions belonging to the IDENTITY `identity`, as device node_ids.
+    ///
+    /// A sovereign peer holds ONE identity and one or more devices. The
+    /// handshake proves the DEVICE key, so that is what a session is
+    /// registered under — while an application addresses a CONTACT, and a
+    /// contact is published as an identity. Nothing bridged the two on the
+    /// send path: a live direct session to someone's phone could not be found
+    /// by the only name that person had ever handed out. Measured on the stand
+    /// 2026-09-19: direct LAN session `state=active`, `admitted=true`, and the
+    /// message still deposited in the mailbox to wait out a 301 s poll.
+    ///
+    /// EMPTY IS THE HONEST DEFAULT, and it means "I cannot answer this", not
+    /// "there are none": an implementation with no identity index (the test
+    /// doubles, the routed-frame wrapper) keeps the pre-existing behaviour
+    /// rather than silently claiming a peer is offline. Empty is also the
+    /// correct answer for a `identity` that is really a device id — devices do
+    /// not contain devices — which is what makes [`Self::send_to_peer_or_identity`]
+    /// safe to call on either kind of address.
+    fn devices_of(&self, _identity: &[u8; 32]) -> Vec<[u8; 32]> {
+        Vec::new()
+    }
+
+    /// Send `bytes` to `dst`, which may name either a device or an identity.
+    ///
+    /// Resolution first, because it is the cheap one: `devices_of` is an O(1)
+    /// index probe that returns empty for a device id, so an ordinary
+    /// device-addressed send pays one HashMap lookup and takes the same path
+    /// it always did. Only an address that IS an identity with live devices
+    /// takes the fan-out branch.
+    ///
+    /// SENDS TO EVERY DEVICE, not to a chosen one. An identity's devices are
+    /// separate app instances and each is meant to receive; picking one would
+    /// deliver a message to a person's laptop and not their phone. Returns
+    /// whether ANY device accepted the frame — one device with a full queue
+    /// must not report the whole send as failed.
+    fn send_to_peer_or_identity(&self, dst: &[u8; 32], priority: u8, bytes: Vec<u8>) -> bool {
+        let devices = self.devices_of(dst);
+        let Some((last, rest)) = devices.split_last() else {
+            return self.send_to(dst, priority, bytes);
+        };
+        let mut delivered = false;
+        for device in rest {
+            // `|=`, not `||`: every device is offered the frame. Short-circuit
+            // would stop at the first one that took it.
+            delivered |= self.send_to(device, priority, bytes.clone());
+        }
+        delivered | self.send_to(last, priority, bytes)
+    }
 }
 
 // ── MlKemEkResolver — reactive cold-start ML-KEM-768 EK fetch ─────────────────
