@@ -886,154 +886,107 @@ Mailbox — фиксированное **redb**-хранилище «ключ �
 
 ### 12.3 Квоты и лимиты
 
-Из [`crates/veil-mailbox/src/lib.rs`](../../crates/veil-mailbox/src/lib.rs) и `crates/veil-proto/src/budget.rs`:
+Из [`crates/veil-mailbox/src/lib.rs`](../../crates/veil-mailbox/src/lib.rs).
+Хранилище ограничивает **байты**, а не число записей: нет ни глобального
+потолка на записи, ни глубины очереди на получателя, ни предела на число
+различных получателей.
 
 | Параметр | Значение |
 |----------|----------|
-| Global cap | 100 000 записей (абсолютный лимит) |
-| Per-recipient cap | конфиг; по умолчанию 1000 |
-| Per-sender daily quota | размер множества ограничен `DEFAULT_MAX_MAILBOX_SENDERS` |
-| `MAX_MAILBOXES` | 32 ссылки на mailbox в attachment |
+| `DEFAULT_QUOTA_PER_RECEIVER_BYTES` | 100 МиБ недоставленной почты на одного получателя |
+| `DEFAULT_QUOTA_PER_SENDER_BYTES` | 10 МиБ от одного отправителя |
+| `DEFAULT_QUOTA_GLOBAL_BYTES` | 10 ГиБ на всё хранилище |
+| `MAX_BLOB_BYTES` | 1 МиБ на один положенный блоб |
+| `MAX_FETCH_COUNT` / `MAX_FETCH_BYTES` | 1024 блоба / 8 МиБ в одном ответе FETCH |
+| `MAX_FETCH_SKIP` | 64 content id, которые можно попросить пропустить |
+| `DEFAULT_TTL_SECS` | 7 дней, после чего `prune_expired` убирает неподтверждённый блоб |
+| `MIN_EVICTION_AGE_SECS` | 1 час: младше этого блоб не вытесняется никогда |
 
-При переполнении новый PUT отклоняется (`status=REJECTED`), а не вытесняет старые записи. Это закрывает атаки на сохранность данных через вытеснение по гонке (race).
+PUT сверх квоты отвергается, а не обслуживается вытеснением чужой почты.
+Вытеснение существует только ради глобального потолка, идёт от старых к новым и
+предпочитает анонимный пул — чтобы поток вкладов без токена не выдавливал
+идентифицированные, — и даже тогда не трогает ничего моложе
+`MIN_EVICTION_AGE_SECS`.
 
 ### 12.4 Как определяются узлы-хранители
 
-Идея в том, что ни отправителю, ни получателю не нужно заранее знать конкретные
-mailbox-хосты. Оба выводят их независимо из `recipient_node_id` через DHT.
+Замысел: ни отправителю, ни получателю не нужно знать конкретных хозяев ящика
+заранее. Обе стороны выводят их независимо из `recipient_node_id` через DHT.
 
-#### Primary (attachment gateway)
+#### Первичный (attachment-шлюз)
 
-При подключении получатель объявляет свой набор gateway через
-`AnnounceAttachmentPayload`, подписанный ключом его личности. Запись
-оседает в DHT под ключом `attachment_key(recipient_node_id)`.
+При подключении получатель объявляет свой набор шлюзов через
+`AnnounceAttachmentPayload`, подписанный ключом личности. Запись оседает в DHT
+под ключом `attachment_key(recipient_node_id)`.
 
-Отправитель, у которого нет прямой сессии до получателя, затем:
+Отправитель без прямой сессии к получателю затем:
 
-1. Вызывает `GetAttachment(recipient_node_id)` и получает список gateway.
-2. Открывает сессию к одному из них, в порядке приоритета по weight и flags.
-3. Шлёт `MAILBOX_PUT` с `DeliveryEnvelope` внутри.
+1. Выполняет `GetAttachment(recipient_node_id)` и получает список шлюзов.
+2. Открывает сессию к одному из них, по весу и флагам.
+3. Кладёт `DeliveryEnvelope` на PUT-эндпоинт службы ящика.
 
-#### Replicas (детерминированный выбор по DHT)
+#### Реплик нет
 
-Приняв PUT, primary выбирает до `replica_count - 1` дополнительных
-хранителей через [`select_quorum_replicas`](../../crates/veil-dispatcher/src/delivery.rs):
+Прежние редакции этого документа описывали второй шаг: первичный узел выбирает
+дополнительных хранителей по `BLAKE3("shard" ‖ recipient ‖ shard_id)`,
+реплицирует им и отвечает отправителю только по кворуму записи. **Ничего из
+этого не реализовано.** `select_quorum_replicas`, `shard_target`,
+`MailboxReplicationConfig`, `mailbox_dht_replication` и
+`try_fetch_from_replicas` не встречаются в `crates/` ни разу, а секции
+`[mailbox.replication]` для настройки не существует. PUT хранит тот узел,
+который его принял, и больше никто.
 
-```text
-shard_target = BLAKE3("shard" ‖ recipient_node_id ‖ shard_id_be_bytes)
-                                                    └ обычно 0 ┘
-pool         = DHT.find_closest_nodes(shard_target, (replica_count - 1) × 4)
-candidates   = pool.filter:
-                 id != self
-                 id != origin_peer (кто прислал PUT)
-                 battery_level ≥ 20                  (если известен)
-                 relay_success_ema ≥ 0.5             (если relay_attempts > 0)
-                 not in circuit_breaker              (трекает подряд
-                                                      идущие failures)
-replicas     = candidates.take(replica_count - 1)
-```
+Избыточность, если она нужна, — дело кладущего клиента: он может положить блоб
+на несколько реле, умеющих ящик. Реле этого не координирует и об этом не знает.
 
-Главное здесь — **детерминизм**: `shard_target` и ближайшие к нему по XOR
-узлы не зависят от того, кто смотрит. Любой Core-узел, зная
-`recipient_node_id`, вычислит тот же target и через свой DHT выйдет на тот же
-набор кандидатов (с точностью до фильтров живости). Поэтому *получатель*
-и *любой будущий gateway* найдут те же реплики без дополнительного
-обмена адресами.
+### 12.5 Ящик — служба приложения, а не семейство кадров
 
-Шардирование по `shard_id` позволяет разбить очередь одного
-получателя на несколько независимых наборов реплик: `shard_id=0, 1, 2 …`
-дают разные `shard_target`, а значит, и разные реплики. Это снижает
-риск коррелированных отказов для крупных почтовых ящиков. На сегодня используется один шард (`shard_id=0`).
+Он регистрируется как `veil.mailbox.v1`
+([`builtin/mailbox.rs`](../../crates/veil-node-runtime/src/builtin/mailbox.rs))
+под `MAILBOX_APP_ID`, с эндпоинтами PUT, FETCH и ACK плюс эндпоинт побудки —
+толкнуть получателя, у которого есть живая сессия.
 
-### 12.5 Репликация
+Слоты `DeliveryMsg` 0, 1, 2, 5 и 6, когда-то занятые
+`MailboxPut/Fetch/Ack/Replicate/FetchReplica`, намеренно оставлены
+нераспределёнными, чтобы будущее возвращение было прослеживаемым — см.
+[`proto/family.rs`](../../crates/veil-proto/src/family.rs). Любой документ или
+клиент, который всё ещё говорит о кадре `MAILBOX_PUT` в плоскости доставки,
+описывает провод, которого больше нет.
 
-`MailboxReplicationConfig`:
-
-```toml
-[mailbox.replication]
-replica_count = 3         # кол-во реплик, включая primary
-write_quorum  = 2         # минимум success-ов для ACK отправителю
-replica_timeout_ms = 500  # таймаут на replica-write
-```
-
-#### Write-path
+#### Путь записи
 
 ```
-Sender ── MAILBOX_PUT ──► Primary (attachment gateway получателя)
-                          │
-                          ├─ сохранить локально (InMemory или WAL backend)
-                          ├─ select_quorum_replicas(recipient) → [R1, R2]
-                          │   (зашифровать envelope — см. §12.6)
-                          ├─ MAILBOX_REPLICATE ──► R1
-                          ├─ MAILBOX_REPLICATE ──► R2
-                          │   ожидать DeliveryStatus::QUEUED
-                          │   timeout = replica_timeout_ms
-                          │
-                          └─ ≥ write_quorum успехов?
-                                да  → DeliveryStatus::QUEUED sender'у
-                                нет → DeliveryStatus::REJECTED sender'у
+Отправитель ── PUT(envelope) ──► attachment-шлюз получателя
+                                 │
+                                 ├─ проверки квот (получатель / отправитель / глобально)
+                                 ├─ запись в redb
+                                 └─ ответ отправителю
 ```
 
-При `replica_count = 1` шаг с репликами пропускается, и PUT живёт только на primary.
-
-#### Read-path
+#### Путь чтения
 
 ```
-Recipient онлайн ── MAILBOX_FETCH(after_seq) ──► Primary gateway
-                                                 │
-                                                 ├ SEC-проверка:
-                                                 │  payload.recipient_node_id
-                                                 │  == authenticated peer_id
-                                                 │  (иначе Violation)
-                                                 │
-                                                 ├ backend.fetch(recipient, after_seq)
-                                                 │   непусто? → вернуть entries
-                                                 │
-                                                 ├ (пусто) Если mailbox_dht_replication:
-                                                 │   DHT.get_local(recipient) → envelope
-                                                 │
-                                                 └ (всё ещё пусто) try_fetch_from_replicas:
-                                                   ├─ те же replica_ids через select_quorum_replicas
-                                                   ├─ fan-out: MAILBOX_FETCH_REPLICA на каждую
-                                                   ├─ первый непустой ответ → entries
-                                                   └─ все пусто / таймаут → empty response
+Получатель ── FETCH(skip[]) ──► свой шлюз
+                                │
+                                ├ проверка аутентифицированного запрашивающего
+                                ├ fetch_skipping(receiver, skip)
+                                │   от старых к новым, в пределах MAX_FETCH_COUNT
+                                │   и MAX_FETCH_BYTES; названное в `skip`
+                                │   пропускается
+                                └ блобы
+
+Получатель ── ACK(content_id) ──► свой шлюз
+                                  └ удаляет (receiver, content_id)
 ```
 
-После `MAILBOX_FETCH` клиент отправляет `MAILBOX_ACK { recipient, seqs[] }`.
-Primary удаляет подтверждённые seq локально; до реплик Ack доходит
-лениво, а сами реплики чистятся сборщиком мусора (GC) по TTL.
+`ack` удаляет по получателю и content id и ни по чему больше — он не отличит
+одно тело от другого под тем же id, поэтому клиент не должен подтверждать блоб
+только потому, что тот не открылся. Всё неподтверждённое уходит по TTL в 7 дней.
 
-**Почему это безопасно:**
-- Забрать сообщения может только аутентифицированный получатель — за счёт проверки
-  `recipient_node_id == peer_id`.
-- Исходный `sender_node_id` в конверте знает только первоначальный отправитель —
-  это проверяется в `MAILBOX_PUT::handle_put`.
-- Реплики держат конверт зашифрованным (см. §12.6), поэтому не могут прочитать
-  полезную нагрузку, даже если их скомпрометировать.
-
-### 12.6 Envelope encryption для реплик
-
-Хосту-реплике незачем видеть содержимое, поэтому конверт шифруется прямо перед `MAILBOX_REPLICATE`:
-
-```
-encrypted_blob = ChaCha20-Poly1305.Seal(
-    key  = HKDF(primary_mlkem_dk, info="replica-v1"),
-    aad  = recipient_node_id || seq,
-    plaintext = DeliveryEnvelope.encode()
-)
-```
-
-Реплика хранит blob как есть; при fetch primary расшифровывает его обратно.
-
-### 12.7 WAL-структура
-
-WAL — это последовательность строк, дописываемых только в конец (append-only):
-
-```
-magic[4] + version[1] + op_type[1] + len[4] + body[len] + crc32[4]
-```
-
-`op_type` — это Put, Ack или Compact. При старте узел проигрывает журнал заново и восстанавливает текущее состояние. Как только `wal_size > compact_threshold` (по умолчанию 64 MiB), запускается уплотнение (compaction): оно делает снимок активных записей и удаляет старый WAL.
+**Почему это безопасно:** забрать и подтвердить может только аутентифицированный
+получатель, и проверяется это по личности запрашивающего, а не по содержимому
+запроса; блоб запечатан сквозным шифрованием, так что реле хранит байты, которых
+не может прочесть.
 
 ---
 

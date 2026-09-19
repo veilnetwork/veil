@@ -888,16 +888,26 @@ The mailbox is a fixed **redb** key-value store at `<veil_dir>/mailbox/blobs.db`
 
 ### 12.3 Quotas and limits
 
-From [`crates/veil-mailbox/src/lib.rs`](../../crates/veil-mailbox/src/lib.rs) and `crates/veil-proto/src/budget.rs`:
+From [`crates/veil-mailbox/src/lib.rs`](../../crates/veil-mailbox/src/lib.rs).
+The store bounds **bytes**, not record counts: there is no global record cap, no
+per-recipient queue depth, and no cap on how many distinct recipients it holds.
 
 | Parameter | Value |
 |-----------|-------|
-| Global cap | 100,000 records (an absolute limit) |
-| Per-recipient cap | config; default 1000 |
-| Per-sender daily quota | `DEFAULT_MAX_MAILBOX_SENDERS` wraps the set |
-| `MAX_MAILBOXES` | 32 mailbox references in an attachment |
+| `DEFAULT_QUOTA_PER_RECEIVER_BYTES` | 100 MiB of undelivered mail for one receiver |
+| `DEFAULT_QUOTA_PER_SENDER_BYTES` | 10 MiB from one sender |
+| `DEFAULT_QUOTA_GLOBAL_BYTES` | 10 GiB for the whole store |
+| `MAX_BLOB_BYTES` | 1 MiB for one deposited blob |
+| `MAX_FETCH_COUNT` / `MAX_FETCH_BYTES` | 1024 blobs / 8 MiB in one FETCH reply |
+| `MAX_FETCH_SKIP` | 64 content ids a fetcher may ask to be passed over |
+| `DEFAULT_TTL_SECS` | 7 days before `prune_expired` retires an unacked blob |
+| `MIN_EVICTION_AGE_SECS` | 1 hour: a blob younger than this is never displaced |
 
-On overflow, a new PUT is rejected with `status=REJECTED` instead of evicting old entries. This closes off race-based eviction attacks that would otherwise threaten data durability.
+An over-quota PUT is refused rather than served by evicting someone else's
+mail. Eviction exists for the global ceiling only, runs oldest-first, and
+prefers the anonymous pool so a flood of tokenless deposits cannot displace
+identified ones — and even then it will not touch anything younger than
+`MIN_EVICTION_AGE_SECS`.
 
 ### 12.4 How storage nodes are determined
 
@@ -915,129 +925,71 @@ A sender with no direct session to the recipient then:
 
 1. Runs `GetAttachment(recipient_node_id)` to get the list of gateways.
 2. Opens a session to one of them, in priority order by weight and flags.
-3. Sends a `MAILBOX_PUT` with the `DeliveryEnvelope` inside.
+3. Deposits the `DeliveryEnvelope` on the mailbox service's PUT endpoint.
 
-#### Replicas (deterministic DHT selection)
+#### There are no replicas
 
-Once the primary accepts the PUT, it picks up to `replica_count - 1`
-extra storage nodes via [`select_quorum_replicas`](../../crates/veil-dispatcher/src/delivery.rs):
+Earlier revisions of this document described a second step: the primary
+picking further storage nodes by `BLAKE3("shard" ‖ recipient ‖ shard_id)`,
+replicating to them and answering the sender only on a write quorum. **None of
+that is implemented.** `select_quorum_replicas`, `shard_target`,
+`MailboxReplicationConfig`, `mailbox_dht_replication` and
+`try_fetch_from_replicas` do not exist anywhere in `crates/`, and there is no
+`[mailbox.replication]` section to configure. A PUT is stored by the node that
+accepts it and by nobody else.
 
-```text
-shard_target = BLAKE3("shard" ‖ recipient_node_id ‖ shard_id_be_bytes)
-                                                    └ usually 0 ┘
-pool         = DHT.find_closest_nodes(shard_target, (replica_count - 1) × 4)
-candidates   = pool.filter:
-                 id != self
-                 id != origin_peer (whoever sent the PUT)
-                 battery_level ≥ 20                  (if known)
-                 relay_success_ema ≥ 0.5             (if relay_attempts > 0)
-                 not in circuit_breaker              (tracks consecutive
-                                                      failures)
-replicas     = candidates.take(replica_count - 1)
-```
+Redundancy, where it is wanted, is the depositing client's business: it may
+deposit at more than one mailbox-capable relay. The relay neither coordinates
+that nor knows about it.
 
-The point of this is **determinism**: `shard_target` and the XOR-nearest nodes
-to it do not depend on who is looking. Any Core node that knows
-`recipient_node_id` computes the same target and, through its own
-DHT, lands on the same set of candidates (give or take the liveness filters). So
-the *recipient* and any *future gateway* find the same replicas
-without ever swapping addresses.
+### 12.5 The mailbox is an app service, not a wire family
 
-Sharding by `shard_id` lets a single recipient's backlog split
-into several independent replica sets: `shard_id=0, 1, 2 …`
-give different `shard_target`s, hence different replicas. That lowers the
-correlated-failure risk for large mailboxes. Today only a single shard (`shard_id=0`)
-is in use.
+It is registered as `veil.mailbox.v1`
+([`builtin/mailbox.rs`](../../crates/veil-node-runtime/src/builtin/mailbox.rs))
+under `MAILBOX_APP_ID`, with endpoints for PUT, FETCH and ACK, plus a wake
+endpoint used to nudge a recipient that holds a live session.
 
-### 12.5 Replication
-
-`MailboxReplicationConfig`:
-
-```toml
-[mailbox.replication]
-replica_count = 3         # number of replicas, including the primary
-write_quorum  = 2         # minimum successes for an ACK to the sender
-replica_timeout_ms = 500  # timeout for a replica write
-```
+The `DeliveryMsg` slots 0, 1, 2, 5 and 6 that once carried
+`MailboxPut/Fetch/Ack/Replicate/FetchReplica` are deliberately left
+unallocated, so a future re-introduction is traceable — see
+[`proto/family.rs`](../../crates/veil-proto/src/family.rs). Any document or
+client that still speaks of a `MAILBOX_PUT` delivery-plane frame is describing
+a wire that no longer exists.
 
 #### Write-path
 
 ```
-Sender ── MAILBOX_PUT ──► Primary (the recipient's attachment gateway)
-                          │
-                          ├─ store locally (InMemory or WAL backend)
-                          ├─ select_quorum_replicas(recipient) → [R1, R2]
-                          │   (encrypt the envelope — see §12.6)
-                          ├─ MAILBOX_REPLICATE ──► R1
-                          ├─ MAILBOX_REPLICATE ──► R2
-                          │   await DeliveryStatus::QUEUED
-                          │   timeout = replica_timeout_ms
-                          │
-                          └─ ≥ write_quorum successes?
-                                yes → DeliveryStatus::QUEUED to the sender
-                                no  → DeliveryStatus::REJECTED to the sender
+Sender ── PUT(envelope) ──► the recipient's attachment gateway
+                            │
+                            ├─ quota checks (receiver / sender / global)
+                            ├─ store in redb
+                            └─ answer the sender
 ```
-
-With `replica_count = 1`, the replica step is skipped and the PUT lives only on the primary.
 
 #### Read-path
 
 ```
-Recipient online ── MAILBOX_FETCH(after_seq) ──► Primary gateway
-                                                 │
-                                                 ├ SEC check:
-                                                 │  payload.recipient_node_id
-                                                 │  == authenticated peer_id
-                                                 │  (otherwise Violation)
-                                                 │
-                                                 ├ backend.fetch(recipient, after_seq)
-                                                 │   non-empty? → return entries
-                                                 │
-                                                 ├ (empty) If mailbox_dht_replication:
-                                                 │   DHT.get_local(recipient) → envelope
-                                                 │
-                                                 └ (still empty) try_fetch_from_replicas:
-                                                   ├─ the same replica_ids via select_quorum_replicas
-                                                   ├─ fan-out: MAILBOX_FETCH_REPLICA to each
-                                                   ├─ first non-empty response → entries
-                                                   └─ all empty / timeout → empty response
+Recipient ── FETCH(skip[]) ──► its gateway
+                               │
+                               ├ authenticated requester check
+                               ├ fetch_skipping(receiver, skip)
+                               │   oldest-first, bounded by MAX_FETCH_COUNT
+                               │   and MAX_FETCH_BYTES; anything named in
+                               │   `skip` is passed over
+                               └ blobs
+
+Recipient ── ACK(content_id) ──► its gateway
+                                 └ removes (receiver, content_id)
 ```
 
-After a `MAILBOX_FETCH`, the client sends `MAILBOX_ACK { recipient, seqs[] }`.
-The primary deletes the confirmed seqs locally; the Ack to the replicas
-happens lazily, and the replicas garbage-collect (GC) by TTL.
+`ack` deletes by receiver and content id and nothing else — it cannot tell one
+body from another under the same id, which is why a client must not ack a blob
+merely because it failed to open. Whatever is never acked leaves on the 7-day
+TTL.
 
-**Why this is safe:**
-- Only an authenticated recipient can fetch, thanks to the
-  `recipient_node_id == peer_id` check.
-- Only the original sender knows the `sender_node_id` in the envelope,
-  checked in `MAILBOX_PUT::handle_put`.
-- Replicas hold the envelope encrypted (see §12.6), so they cannot read the
-  payload even if compromised.
-
-### 12.6 Envelope encryption for replicas
-
-A replica host has no need to see the contents, so the envelope is encrypted just before `MAILBOX_REPLICATE`:
-
-```
-encrypted_blob = ChaCha20-Poly1305.Seal(
-    key  = HKDF(primary_mlkem_dk, info="replica-v1"),
-    aad  = recipient_node_id || seq,
-    plaintext = DeliveryEnvelope.encode()
-)
-```
-
-The replica stores the blob as-is; on fetch, the primary decrypts it back.
-
-### 12.7 WAL structure
-
-The WAL is a sequence of append-only lines:
-
-```
-magic[4] + version[1] + op_type[1] + len[4] + body[len] + crc32[4]
-```
-
-The `op_type` is one of Put, Ack, or Compact. On startup, the node replays the log to rebuild the current state. Once `wal_size > compact_threshold` (default 64 MiB), compaction runs: it snapshots the active records and deletes the old WAL.
+**Why this is safe:** only an authenticated recipient can fetch or ack, checked
+against the requester identity rather than anything in the payload; the blob is
+sealed end to end, so the relay stores bytes it cannot read.
 
 ---
 
