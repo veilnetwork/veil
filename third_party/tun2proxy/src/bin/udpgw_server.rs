@@ -1,4 +1,3 @@
-use socks5_impl::protocol::AsyncStreamOperation;
 use std::net::SocketAddr;
 use tokio::{
     io::AsyncWriteExt,
@@ -8,6 +7,7 @@ use tokio::{
     },
     sync::mpsc::{Receiver, Sender},
 };
+use tun2proxy::socks5_proto::AsyncStreamOperation;
 use tun2proxy::{
     ArgVerbosity, BoxError, Error, Result,
     udpgw::{Packet, UdpFlag},

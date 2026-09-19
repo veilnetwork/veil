@@ -111,13 +111,8 @@ features = ["derive"]
 [dependencies.shlex]
 version = "2.0.1"
 
-[dependencies.socks5-impl]
-version = "0.8.3"
-features = [
-    "tokio",
-    "serde",
-]
-default-features = false
+[dependencies.bytes]
+version = "1"
 
 [dependencies.thiserror]
 version = "2.0.18"

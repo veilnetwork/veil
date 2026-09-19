@@ -1,3 +1,4 @@
+use crate::socks5_proto::Version::V5;
 use crate::{
     ArgProxy, ProxyType,
     args::ProxySelectorConfig,
@@ -5,7 +6,6 @@ use crate::{
     session_info::{IpProtocol, SessionInfo},
     socks::SocksProxyManager,
 };
-use socks5_impl::protocol::Version::V5;
 use std::{net::SocketAddr, sync::Arc, time::Duration};
 use tokio::{
     io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
@@ -81,6 +81,27 @@ impl RoutingProxyManager {
     }
 }
 
+#[async_trait::async_trait]
+impl ProxyHandlerManager for RoutingProxyManager {
+    async fn new_proxy_handler(
+        &self,
+        info: SessionInfo,
+        domain_name: Option<String>,
+        udp_associate: bool,
+    ) -> std::io::Result<Arc<Mutex<dyn ProxyHandler>>> {
+        let selected = self.select(info).await?;
+        if selected.proxy_type != ProxyType::Socks5 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "flow selector supports SOCKS5 only",
+            ));
+        }
+        SocksProxyManager::new(selected.addr, V5, selected.credentials)
+            .new_proxy_handler(info, domain_name, udp_associate)
+            .await
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -136,26 +157,5 @@ mod tests {
 
         assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
         server.await.unwrap();
-    }
-}
-
-#[async_trait::async_trait]
-impl ProxyHandlerManager for RoutingProxyManager {
-    async fn new_proxy_handler(
-        &self,
-        info: SessionInfo,
-        domain_name: Option<String>,
-        udp_associate: bool,
-    ) -> std::io::Result<Arc<Mutex<dyn ProxyHandler>>> {
-        let selected = self.select(info).await?;
-        if selected.proxy_type != ProxyType::Socks5 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "flow selector supports SOCKS5 only",
-            ));
-        }
-        SocksProxyManager::new(selected.addr, V5, selected.credentials)
-            .new_proxy_handler(info, domain_name, udp_associate)
-            .await
     }
 }

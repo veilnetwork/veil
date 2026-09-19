@@ -1,10 +1,10 @@
+use crate::socks5_proto::{self as protocol, Address, AuthMethod, StreamOperation, UserKey, Version, handshake, password_method};
 use crate::{
     directions::{IncomingDataEvent, IncomingDirection, OutgoingDataEvent, OutgoingDirection},
     error::{Error, Result},
     proxy_handler::{ProxyHandler, ProxyHandlerManager},
     session_info::SessionInfo,
 };
-use socks5_impl::protocol::{self, Address, AuthMethod, StreamOperation, UserKey, Version, handshake, password_method};
 use std::{collections::VecDeque, net::SocketAddr, sync::Arc};
 use tokio::sync::Mutex;
 
@@ -214,7 +214,7 @@ impl SocksProxyImpl {
         let addr = if self.command == protocol::Command::UdpAssociate {
             Address::unspecified()
         } else if let Some(domain_name) = &self.domain_name {
-            Address::DomainAddress(domain_name.clone().into(), self.info.dst.port())
+            Address::DomainAddress(domain_name.clone(), self.info.dst.port())
         } else {
             self.info.dst.into()
         };
@@ -356,7 +356,7 @@ impl ProxyHandlerManager for SocksProxyManager {
         domain_name: Option<String>,
         udp_associate: bool,
     ) -> std::io::Result<Arc<Mutex<dyn ProxyHandler>>> {
-        use socks5_impl::protocol::Command::{Connect, UdpAssociate};
+        use crate::socks5_proto::Command::{Connect, UdpAssociate};
         let command = if udp_associate { UdpAssociate } else { Connect };
         let credentials = self.credentials.clone();
         Ok(Arc::new(Mutex::new(SocksProxyImpl::new(
