@@ -2248,6 +2248,7 @@ fn an_inbound_peer_is_recognised_by_identity_not_by_address() {
     let inbound = crate::types::SessionInfo {
         link_id: crate::types::LinkId::new(1),
         node_id: Some(their_id),
+        sovereign_node_id: None,
         nonce: None,
         matched_peer_id: None,
         source: crate::types::SessionSource::Inbound(crate::types::ListenId::new(2)),
@@ -3013,6 +3014,7 @@ fn rendezvous_replica_picker_keeps_all_connected_pins_up_to_slot_cap() {
             SessionInfo {
                 link_id: LinkId::new(idx as u64 + 1),
                 node_id: Some(NodeId::from(*node)),
+                sovereign_node_id: None,
                 nonce: None,
                 matched_peer_id: None,
                 source: SessionSource::Inbound(crate::types::ListenId::new(1)),
@@ -3048,6 +3050,7 @@ fn rendezvous_replica_picker_requires_anonymity_relay_capability() {
             SessionInfo {
                 link_id: LinkId::new(idx as u64 + 1),
                 node_id: Some(NodeId::from(*node)),
+                sovereign_node_id: None,
                 nonce: None,
                 matched_peer_id: None,
                 source: SessionSource::Inbound(crate::types::ListenId::new(1)),

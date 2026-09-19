@@ -569,15 +569,38 @@ impl NodeRuntime {
         // direction. `local_instance_id` already followed the swap; these are
         // the rest of the same identity and follow it here.
         if identity_changed && let Some(ratchet) = self.dispatcher.crypto.ratchet.as_ref() {
-            ratchet.adopt_identity(
-                *self.identity.local_identity.node_id.as_bytes(),
-                Arc::clone(&self.identity.mlkem_keys),
-            );
+            // THE IDENTITY, NOT THE DEVICE — and the difference is the whole
+            // conversation.
+            //
+            // `local_identity.node_id` is this DEVICE's id. The ratchet's
+            // `local_node_id` is not a label: it goes into the AEAD associated
+            // data on both ends (`associated_data(sender, sender_instance,
+            // recipient, recipient_instance)`), and a sender fills the
+            // recipient half from the CERTIFICATE it resolved — whose
+            // `node_id` is the IDENTITY. Adopting the device put the two sides
+            // on different values and the tag never verified: measured on a
+            // clean two-identity stand 2026-09-19 as `app.ratchet.open_failed
+            // … published peer key known: true, stored conversation
+            // authenticated: None` — the keys were found, the AEAD was not
+            // satisfied, and every sealed frame over a DIRECT session was
+            // dropped while the mailbox path (which seals differently) worked.
+            //
+            // Falls back to the node's own id when there is no sovereign
+            // document: a legacy node IS its own identity, and there the two
+            // values were never different.
+            let ratchet_node_id = self
+                .identity
+                .sovereign_identity
+                .get()
+                .map(|sov| *sov.node_id())
+                .unwrap_or(*self.identity.local_identity.node_id.as_bytes());
+            ratchet.adopt_identity(ratchet_node_id, Arc::clone(&self.identity.mlkem_keys));
             self.logger.info(
                 "node.ratchet.identity_adopted",
                 format!(
-                    "ratchet now opens as {}",
-                    veil_util::bytes_to_hex(&self.identity.local_identity.node_id.as_bytes()[..4])
+                    "ratchet now opens as {} (device {})",
+                    veil_util::bytes_to_hex(&ratchet_node_id[..4]),
+                    veil_util::bytes_to_hex(&self.identity.local_identity.node_id.as_bytes()[..4]),
                 ),
             );
         }

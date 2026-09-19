@@ -96,6 +96,7 @@ mod tests {
         SessionInfo {
             link_id: LinkId::new(link_id),
             node_id: Some(nid),
+            sovereign_node_id: None,
             nonce: None,
             matched_peer_id: None,
             source,

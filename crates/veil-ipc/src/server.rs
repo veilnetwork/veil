@@ -941,6 +941,19 @@ pub struct IpcServer {
     stream_table: Arc<IpcStreamTable>,
     /// Node identity — used to derive `app_id = BLAKE3(node_id || ns || name)`.
     node_id: [u8; 32],
+    /// The id every app endpoint's `app_id` is derived from.
+    ///
+    /// SEPARATE from `node_id`, which is this node's identity toward its LOCAL
+    /// clients — the FFI looks its embedded services up by that value, and
+    /// changing it made `veil_ratchet_list` fail with "embedded node services
+    /// unavailable for this handle" and the node shut down behind it (measured
+    /// 2026-09-19, and the reason this is two fields rather than one).
+    ///
+    /// This one is an ADDRESS ON THE WIRE: a peer derives the same `app_id` from
+    /// the address it holds for us, which is the sovereign identity. Deriving our
+    /// half from the device left the two halves of one formula on different
+    /// inputs, so no frame a peer sent ever matched an endpoint.
+    bind_node_id: [u8; 32],
     /// Maximum APP_SEND frames per second per client (0 = unlimited).
     max_send_rate: u32,
     /// Session outbox registry — used to route datagrams to remote peers.
@@ -1157,6 +1170,9 @@ impl IpcServer {
             app_registry,
             stream_table: Arc::new(IpcStreamTable::new()),
             node_id,
+            // Defaults to `node_id`, because for a node with no sovereign
+            // document the two ARE the same value.
+            bind_node_id: node_id,
             // IPC APP_SEND rate cap. 1000 fps × MTU 65 KB = ~520 Mbps —
             // exactly the testnet ceiling we observed on ogate iperf.
             // For tunnel-style high-throughput apps (ogate) 1000 fps is
@@ -1207,6 +1223,16 @@ impl IpcServer {
     }
 
     /// Attach the Source-side multi-device pairing sink (Epic 489.8).
+    /// Derive app endpoint ids from `id` instead of this node's own node id.
+    ///
+    /// For a sovereign install that is the IDENTITY: peers address us by it, so
+    /// our listener has to be derived from it too. Left unset, app ids keep
+    /// coming from the node id, which is right for a node with no document.
+    pub fn with_bind_node_id(mut self, id: [u8; 32]) -> Self {
+        self.bind_node_id = id;
+        self
+    }
+
     pub fn with_pair_source_sink(mut self, sink: Arc<dyn crate::PairSourceSink>) -> Self {
         self.pair_source_sink = Some(sink);
         self
@@ -1803,6 +1829,7 @@ impl IpcServer {
                         let registry = Arc::clone(&self.app_registry);
                         let streams = Arc::clone(&self.stream_table);
                         let node_id = self.node_id;
+                        let bind_node_id = self.bind_node_id;
                         let max_rate = self.max_send_rate;
                         let tx_reg = self.session_tx_registry.clone();
                         let stream_bridge = self.stream_bridge.clone();
@@ -1875,7 +1902,7 @@ impl IpcServer {
                             // operators can diagnose IPC disconnects without
                             // strace. Tracing is wired in at log-level WARN
                             // by the daemon binary.
-                            if let Err(e) = handle_ipc_client(stream, registry, streams, node_id, max_rate, tx_reg, route_cache, route_updated, peer_mlkem_keys, mlkem_ek_resolver, session_instance_lookup, ratchet, anon_onion_sender, capture_tx, trace_sample_rate, pending_ack, pending_recursive, app_socket_dir, metrics, anycast_service, hint_registry, mobile_event_sink, local_identity_algo, local_identity_pubkey, local_relay_x25519_pubkey, peer_list_provider, bootstrap_join_sink, mobile_status_provider, event_bus, push_envelope_sink, mailbox_backend, mailbox_crypto_sink, outbox_backend, rendezvous_resolver, relay_key_resolver, bootstrap_invite_create_sink, pair_source_sink, pair_target_sink, pnet_status_provider, listen_transports_provider, hole_punch_driver, stream_bridge).await {
+                            if let Err(e) = handle_ipc_client(stream, registry, streams, node_id, bind_node_id, max_rate, tx_reg, route_cache, route_updated, peer_mlkem_keys, mlkem_ek_resolver, session_instance_lookup, ratchet, anon_onion_sender, capture_tx, trace_sample_rate, pending_ack, pending_recursive, app_socket_dir, metrics, anycast_service, hint_registry, mobile_event_sink, local_identity_algo, local_identity_pubkey, local_relay_x25519_pubkey, peer_list_provider, bootstrap_join_sink, mobile_status_provider, event_bus, push_envelope_sink, mailbox_backend, mailbox_crypto_sink, outbox_backend, rendezvous_resolver, relay_key_resolver, bootstrap_invite_create_sink, pair_source_sink, pair_target_sink, pnet_status_provider, listen_transports_provider, hole_punch_driver, stream_bridge).await {
                                 eprintln!("[veil-ipc] client disconnected: {e} (kind={:?})", e.kind());
                             }
                             };
@@ -2063,6 +2090,8 @@ async fn handle_ipc_client(
     app_registry: Arc<AppEndpointRegistry>,
     stream_table: Arc<IpcStreamTable>,
     node_id: [u8; 32],
+    // See `IpcServer::bind_node_id` — the ADDRESS half, not the local one.
+    bind_node_id: [u8; 32],
     max_send_rate: u32,
     session_tx_registry: Option<Arc<dyn FrameBroadcaster>>,
     route_cache: Option<Arc<RwLock<veil_routing::RouteCache>>>,
@@ -2388,7 +2417,7 @@ async fn handle_ipc_client(
                     Ok(LocalAppMsg::AppBind) => {
                         {
                             let token = client_state.client_token;
-                            handle_bind(&mut wh, &body, &mut client_state, &app_registry, &node_id, &token, app_socket_dir.as_deref()).await?;
+                            handle_bind(&mut wh, &body, &mut client_state, &app_registry, &bind_node_id, &token, app_socket_dir.as_deref()).await?;
                         }
                     }
                     Ok(LocalAppMsg::AppUnbind) => {

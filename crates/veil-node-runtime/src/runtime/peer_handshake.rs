@@ -92,6 +92,21 @@ pub struct RemoteHandshakeInfo {
     /// Bounded UDP reflector port advertised by this authenticated peer.
     /// The runtime combines it with transport metadata only after all session
     /// admission gates pass.
+    /// The IDENTITY this peer proved it belongs to, when the OVL1 sovereign
+    /// proof-frame exchange ran (`SovereignHandshakeCtx` / `ValidatedIdentity`).
+    ///
+    /// DIFFERENT from [`Self::node_id`], and that difference is the whole
+    /// reason this field exists. `node_id` is what the IDENTITY frame carried:
+    /// `BLAKE3` of the key the handshake actually proved, which on a sovereign
+    /// install is the DEVICE key. `sovereign_node_id` is `BLAKE3(master_pubkey)`
+    /// — the address a contact knows, the one an endpoint invite names, and the
+    /// one that survives both key rotation and a change of device.
+    ///
+    /// `None` means the exchange did not run: no sovereign material on one
+    /// side, or a peer that does not advertise `SUPPORTS_SOVEREIGN_IDENTITY`.
+    /// Recorded rather than inferred, so "the peer proved nothing" and "the
+    /// peer proved a different identity" stay tellable apart.
+    pub sovereign_node_id: Option<NodeId>,
     pub udp_reflector_port: Option<u16>,
     /// Public endpoints this peer relayed from other authenticated peers.
     pub shared_udp_reflectors: Vec<std::net::SocketAddr>,
@@ -791,6 +806,11 @@ pub async fn register_connection_session(
                 // Derived only — nothing reaches a shared cache until
                 // `commit` below the accept gates.
                 let pending_peer_state = prepare_peer_handshake_state(&runtime, &r, &transport);
+                // Read BEFORE the struct literal below moves fields out of `r`.
+                let sovereign_node_id = r
+                    .validated_sovereign_identity
+                    .as_ref()
+                    .map(|v| NodeId::from(v.node_id));
                 let remote_discovery_mode = r.remote_capabilities.parse_discovery_mode();
                 let remote_dht_service = r.remote_capabilities.dht_service();
                 let mut udp_reflector_port = None;
@@ -830,6 +850,7 @@ pub async fn register_connection_session(
                             .remote_capabilities
                             .supports_realtime_datagrams(),
                         supports_realtime_rekey: r.remote_capabilities.supports_realtime_rekey(),
+                        sovereign_node_id,
                         udp_reflector_port,
                         shared_udp_reflectors,
                     },
@@ -893,11 +914,26 @@ pub async fn register_connection_session(
                 // where "we actually reached them" becomes true.
             }
             Err(PeerVerificationError::IdentityMismatch(message)) => {
+                // WHAT THE PEER PROVED, beside what we expected.
+                //
+                // Without this the message names two ids and neither of them
+                // is the one that would settle the question: a sovereign
+                // install proves its DEVICE key on the wire while an endpoint
+                // invite names the IDENTITY, so a legitimate peer and an
+                // impostor produce the same line. Saying whether a sovereign
+                // proof arrived — and whose — is what tells them apart.
                 runtime.logger.warn(
                     "peer.identity_mismatch",
                     format!(
-                        "peer_id={} link_id={} source={} error={}",
-                        expected_peer.peer_id, link_id, source, message
+                        "peer_id={} link_id={} source={} sovereign_proof={} error={}",
+                        expected_peer.peer_id,
+                        link_id,
+                        source,
+                        match remote_identity.sovereign_node_id {
+                            Some(id) => format!("{id}"),
+                            None => "absent".to_owned(),
+                        },
+                        message
                     ),
                 );
                 if let Some(metrics) = &runtime.metrics {
@@ -1271,6 +1307,7 @@ pub async fn register_connection_session(
                     SessionInfo {
                         link_id,
                         node_id: Some(remote_identity.node_id),
+                        sovereign_node_id: remote_identity.sovereign_node_id,
                         nonce: Some(remote_identity.nonce.clone()),
                         matched_peer_id,
                         source,
@@ -1418,6 +1455,40 @@ pub fn verify_remote_peer_identity(
     remote_identity: &RemoteHandshakeInfo,
     expected_peer: &ExpectedPeerIdentity,
 ) -> std::result::Result<(), PeerVerificationError> {
+    // A DEVICE OF THE IDENTITY WE ASKED FOR IS THE IDENTITY WE ASKED FOR.
+    //
+    // An app-added row is dialled from an endpoint invite, and that invite
+    // names the IDENTITY — the address a contact actually knows. The OVL1
+    // handshake proves the key it was configured with, which on a sovereign
+    // install is the DEVICE key: `BLAKE3(master)` on one side,
+    // `BLAKE3(device subkey)` on the other, never equal. Comparing those two
+    // failed every direct dial between two sovereign installs, with the answer
+    // sitting unread in the same handshake result — the sovereign proof-frame
+    // exchange had already verified, cryptographically, which identity this
+    // device belongs to (`SovereignHandshakeCtx` → `ValidatedIdentity`).
+    // Measured on the stand 2026-09-19: LAN QUIC up in 0.48 s,
+    // `sovereign_proof` equal to the expectation, session discarded anyway.
+    //
+    // THREE things are required, and none of them is "the raw check failed":
+    //   * a proof actually arrived (`Some`) — absence proves nothing and must
+    //     not be read as permission;
+    //   * it names THIS expectation's node_id, not merely some identity;
+    //   * the row is APP-ADDED. An operator's `[[peers]]` line names one key
+    //     on purpose; a sibling device of that identity is not the key they
+    //     wrote down, and widening their line is not ours to do. Same boundary
+    //     the endpoint-refresh path already draws
+    //     (`bootstrap_join.rs`: "app-added entries only").
+    //
+    // The nonce check below is skipped on this path for the same reason it is
+    // skipped for beacon-discovered peers: the nonce is proof-of-work over the
+    // DEVICE key, and the expectation carries the identity's (empty, on an
+    // identity-only invite). The sovereign proof is the stronger statement.
+    if expected_peer.peer_id.get() >= crate::bootstrap_join::APP_ADDED_PEER_ID_BASE
+        && remote_identity.sovereign_node_id == Some(expected_peer.node_id)
+    {
+        return Ok(());
+    }
+
     // When `public_key` is empty the peer was discovered dynamically
     // (e.g. via mesh beacon) and we perform node-id-only verification:
     // confirm that `blake3(handshake_public_key) == expected node_id`.
