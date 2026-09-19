@@ -633,14 +633,14 @@ The DHT key is `attachment_key(leaf_node_id)`. To reach a Leaf, a sender first r
 
 A request-response pair: given a node_id, return its list of gateways and mailboxes.
 
-### 9.3 MailboxSet and GetMailboxSet
+### 9.3 GetMailboxSet — removed
 
-`MailboxSet` is the list of node_ids holding mailbox replicas for node `X`. It supports offline delivery.
-
-```
-GetMailboxSetPayload:  target_node_id[32] + epoch[4]
-MailboxSetResponse:    count[2] + node_id[32][]
-```
+Discovery slot 6 once carried `GetMailboxSet`, which returned the node_ids
+holding mailbox replicas for a node. It went with the replicas: neither
+`GetMailboxSetPayload` nor `MailboxSetResponse` exists, and the slot is left
+unallocated so a re-introduction would be traceable
+([`proto/family.rs`](../../crates/veil-proto/src/family.rs)). Offline delivery
+is reached through the attachment record instead — §9.2 and §12.4.
 
 ### 9.4 AppEndpoint and GetAppEndpoint
 
@@ -875,7 +875,9 @@ File: [`crates/veil-mailbox/src/`](../../crates/veil-mailbox/src/).
 
 ### 12.1 Model
 
-The `MailboxService` accepts three operations from Core nodes:
+The mailbox service (`veil.mailbox.v1`, backed by `Mailbox` in
+[`veil-mailbox`](../../crates/veil-mailbox/src/lib.rs)) accepts three
+operations on its app endpoints:
 - **PUT** — park a `DeliveryEnvelope` for an offline recipient.
 - **FETCH** — an online recipient pulls its own messages, paging from an `after_seq` cursor.
 - **ACK** — confirm which seqs were read.
@@ -1164,14 +1166,19 @@ priority: local_relay > global_core > None
 
 ### 16.3 Violation tracker
 
-`MAX_VIOLATION_TRACKER_SIZE = 8192`. The violation categories include:
-- `BadFrame` — the wire format is invalid.
-- `SenderMismatch` — the envelope's sender does not match the authenticated peer.
-- `PoWFail` — an incorrect solution.
-- `RateExceeded` — the token bucket is empty.
-- and more.
+`MAX_VIOLATION_TRACKER_SIZE = 8192`.
 
-Once a peer hits `VIOLATION_THRESHOLD = 5` within the `VIOLATION_WINDOW_SECS = 300` window, it is banned.
+The tracker does not classify. `ViolationTracker::record(peer_id, ban_list)`
+takes a peer id and nothing else: there is no violation-kind enum, and the
+`BadFrame` / `SenderMismatch` / `PoWFail` / `RateExceeded` categories this
+section used to list do not exist. (`SenderMismatch` does, but as an
+`AuthDeliverError` variant in `veil-identity`, which is a different thing.) What
+a caller decides is *whether* something was a violation; the tracker counts
+them per peer, decays them, and bans when the count crosses its threshold.
+
+The threshold and window are constructor parameters, not constants — see
+[`violation_tracker.rs`](../../crates/veil-abuse/src/violation_tracker.rs).
+There is no `VIOLATION_THRESHOLD` or `VIOLATION_WINDOW_SECS` to look up.
 
 ### 16.4 Ban list
 
@@ -1562,9 +1569,9 @@ For the full description — [config-reference.md](config-reference.md).
 | Session runner | `veil-session` (`runner.rs`) | `SessionRunner`, `SessionTxRegistry` |
 | Dispatcher | `veil-dispatcher` | `FrameDispatcher`, `DispatchResult` |
 | DHT | `veil-dht` | `KademliaService`, `RoutingTable`, `IterativeParams` |
-| Discovery | `veil-discovery` | `DirectoryService`, `AnnounceAttachmentPayload` |
+| Discovery | `veil-discovery` | `DiscoveryService`, `StaticDirectory`, `AnnounceAttachmentPayload` |
 | Routing | `veil-routing` | `RouteCache`, `RouteAnnouncePayload` |
-| Mailbox | `veil-mailbox` | `MailboxService` (redb) |
+| Mailbox | `veil-mailbox` | `Mailbox` (redb) |
 | NAT | `veil-nat` | `NatCoordinator`, `NatPuncher`, `RelayFallback` |
 | Mesh | `veil-mesh` | `MeshForwarder`, `BeaconSender` |
 | PEX | `veil-pex` | dispatcher, initiator |
