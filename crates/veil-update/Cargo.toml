@@ -3,7 +3,7 @@ name = "veil-update"
 version = "0.11.37"
 edition = "2024"
 description = "Veil network self-update: signed manifest fetch (multi-CDN failover), HTTPS bridge to veil-bootstrap, atomic binary swap, periodic check task. Phase 6 extraction from veilcore (Epic 484.3)."
-license = "AGPL-3.0-or-later"
+license = "MIT OR Apache-2.0"
 
 [features]
 tls-boring = ["veil-bootstrap/tls-boring", "veil-transport/tls-boring"]

@@ -3,7 +3,7 @@ name = "veil-discovery"
 version = "0.11.37"
 edition = "2024"
 description = "Veil DiscoveryService: signed attachment announcements, app-endpoint registry forwarder, static directory.  Bridges sovereign-identity / app-endpoint payloads into the DHT layer.  Phase 6 extraction from veilcore."
-license = "AGPL-3.0-or-later"
+license = "MIT OR Apache-2.0"
 
 [dependencies]
 veil-crypto = { path = "../veil-crypto" }

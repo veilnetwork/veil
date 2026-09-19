@@ -3,7 +3,7 @@ name = "veil-cfg"
 version = "0.11.37"
 edition = "2024"
 description = "Veil configuration types, file format, validators, and identity-config helpers. Phase 1 of veilcore extraction (see docs/en/PLAN_VEILCORE_EXTRACTION.md)."
-license = "AGPL-3.0-or-later"
+license = "MIT OR Apache-2.0"
 
 [features]
 # Phase 6.45 / Epic test-low-difficulty: opt the identity-PoW chain into
