@@ -15,7 +15,7 @@ Throughout, a **contract** means a promise the network makes about its behavior 
 | Guarantee | Condition |
 |-----------|-----------|
 | **Best-effort delivery** | Always. The network makes one forwarding attempt down a single path. There are no retransmissions at the network layer. |
-| **At-least-once ACK** | When the sender sets `IPC_SEND_FLAG_REQUIRE_ACK`. The node then retransmits until the destination mailbox returns a `DELIVERY_ACK`. |
+| **At-least-once, BOUNDED** | When the sender sets `IPC_SEND_FLAG_REQUIRE_ACK`. The final recipient answers with `DeliveryStatus(DELIVERED)`; until that arrives the originator retransmits, but only up to `MAX_DELIVERY_ATTEMPTS = 3`. After the third the entry fails and the application is told. It does not retry forever, and there is no `DELIVERY_ACK` message — that name belongs to the mailbox family that left the delivery plane. |
 | **Duplicate suppression at destination** | The destination node drops duplicates by `content_id` (a 32-byte identifier). Applications that bypass the mailbox layer may still see duplicates. |
 
 ### What is NOT guaranteed
@@ -28,6 +28,7 @@ Throughout, a **contract** means a promise the network makes about its behavior 
 
 - `MAX_CLOCK_SKEW_SECS = 300` — envelope `created_at` may not be more than 5 minutes in the future.
 - `MAX_RELAY_HOPS = 16` — envelopes exceeding this hop count are dropped by relay nodes.
+- `MAX_DELIVERY_ATTEMPTS = 3` — how many times an unacknowledged envelope is retransmitted before the originator is told it failed.
 
 ---
 
@@ -106,7 +107,7 @@ When a client sets `IPC_SEND_FLAG_ANONYMOUS` in `IPC_SEND`:
 
 | Guarantee | Condition |
 |-----------|-----------|
-| **k-replication** | Each DHT value is stored on up to `k = 20` of the nodes closest to its key. |
+| **k-replication** | Each DHT value is stored on up to `k` of the nodes closest to its key. `k` is 20 by default and by the Kademlia paper, but it is a FLOOR, not a fixed number: `AdaptiveParams` computes `k = max(20, ceil(log2(N)))` from the estimated network size, so it grows past 20 once the network exceeds about a million nodes. |
 | **TTL-bounded storage** | Values don't live forever. Each expires after the TTL (time-to-live) set by the node that published it. |
 | **O(log N) lookup** | A `FIND_VALUE` lookup converges in `O(log N)` rounds, as long as fewer than `k/2` nodes in every k-bucket are misbehaving. (A *k-bucket* is the set of known peers in one slice of the address space; *misbehaving*, or Byzantine, nodes may lie or drop requests rather than just go offline.) |
 | **Iterative routing** | The initiator drives the lookup itself, contacting each node directly rather than asking one node to chase the answer on its behalf. So a single malicious node can spoil at most one step of the lookup, not the whole thing. |
@@ -119,7 +120,7 @@ When a client sets `IPC_SEND_FLAG_ANONYMOUS` in `IPC_SEND`:
 
 ### Key constants
 
-- `K = 20` — number of closest nodes per bucket; replication factor.
+- `K = 20` (`veil-dht`) — the default bucket size and replication floor; the effective `k` is the adaptive one above. Not to be confused with `K = 8` in `veil-mainline`, which is BitTorrent BEP 5's own `k` for the Mainline-DHT bootstrap layer.
 - `MAX_NODES_PER_RESPONSE = 32` — maximum contacts returned in a single `FIND_NODE` response.
 
 ---
