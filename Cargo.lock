@@ -3653,21 +3653,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "socks5-impl"
-version = "0.8.7"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9791d88383282983f29c649ecedece00fbaf31cbfb8f1c6e633c022b97918eaa"
-dependencies = [
- "async-trait",
- "bytes",
- "percent-encoding",
- "serde",
- "thiserror 2.0.18",
- "tokio",
- "url",
-]
-
-[[package]]
 name = "spki"
 version = "0.7.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4318,6 +4303,7 @@ dependencies = [
  "async-trait",
  "base64easy",
  "bincode-next",
+ "bytes",
  "chrono",
  "clap",
  "ctrlc2",
@@ -4336,7 +4322,6 @@ dependencies = [
  "serde",
  "serde_json",
  "shlex 2.0.1",
- "socks5-impl",
  "thiserror 2.0.18",
  "tokio",
  "tokio-util",

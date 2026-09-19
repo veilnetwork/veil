@@ -1,6 +1,7 @@
 #[cfg(target_os = "linux")]
 extern crate bincode_next as bincode;
 
+pub use crate::socks5_proto::UserKey;
 #[cfg(feature = "udpgw")]
 use crate::udpgw::UdpGwClient;
 use crate::{
@@ -14,7 +15,6 @@ pub use clap::ValueEnum;
 use ipstack::{IpStackStream, IpStackTcpStream, IpStackUdpStream};
 use proxy_handler::{ProxyHandler, ProxyHandlerManager};
 use socks::SocksProxyManager;
-pub use socks5_impl::protocol::UserKey;
 #[cfg(feature = "udpgw")]
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddrV4, SocketAddrV6};
 use std::{
@@ -60,6 +60,7 @@ mod routing;
 mod session_info;
 pub mod socket_transfer;
 mod socks;
+pub mod socks5_proto;
 mod traffic_status;
 #[cfg(feature = "udpgw")]
 pub mod udpgw;
@@ -261,7 +262,7 @@ where
     #[cfg(not(target_os = "linux"))]
     let socket_queue = None;
 
-    use socks5_impl::protocol::Version::{V4, V5};
+    use crate::socks5_proto::Version::{V4, V5};
     let mgr: Arc<dyn ProxyHandlerManager> = if let Some(selector) = args.proxy_selector.clone() {
         Arc::new(routing::RoutingProxyManager::new(args.proxy.clone(), selector))
     } else {
@@ -432,7 +433,7 @@ where
                     tokio::spawn(async move {
                         let dst = info.dst; // real UDP destination address
                         let dst_addr = match domain_name {
-                            Some(ref d) => socks5_impl::protocol::Address::from((d.clone(), dst.port())),
+                            Some(ref d) => crate::socks5_proto::Address::from((d.clone(), dst.port())),
                             None => dst.into(),
                         };
                         if let Err(e) = handle_udp_gateway_session(udp, udpgw, &dst_addr, proxy_handler, queue, ipv6_enabled).await {
@@ -570,7 +571,7 @@ async fn handle_tcp_session(
 async fn handle_udp_gateway_session(
     mut udp_stack: IpStackUdpStream,
     udpgw_client: Arc<UdpGwClient>,
-    udp_dst: &socks5_impl::protocol::Address,
+    udp_dst: &crate::socks5_proto::Address,
     proxy_handler: Arc<Mutex<dyn ProxyHandler>>,
     socket_queue: Option<Arc<SocketQueue>>,
     ipv6_enabled: bool,
@@ -601,7 +602,7 @@ async fn handle_udp_gateway_session(
     let tcp_local_addr = stream.local_addr();
     let sn = stream.serial_number();
 
-    log::info!("[UdpGw] Beginning stream {} {} -> {}", sn, &tcp_local_addr, udp_dst);
+    log::info!("[UdpGw] Beginning stream {} {} -> {}", sn, tcp_local_addr, udp_dst);
 
     let Some(mut reader) = stream.get_reader() else {
         return Err("get reader failed".into());
@@ -618,22 +619,22 @@ async fn handle_udp_gateway_session(
             len = udp_stack.read(&mut tmp_buf) => {
                 let read_len = match len {
                     Ok(0) => {
-                        log::info!("[UdpGw] Ending stream {} {} <> {}", sn, &tcp_local_addr, udp_dst);
+                        log::info!("[UdpGw] Ending stream {} {} <> {}", sn, tcp_local_addr, udp_dst);
                         break;
                     }
                     Ok(n) => n,
                     Err(e) => {
-                        log::info!("[UdpGw] Ending stream {} {} <> {} with udp stack \"{}\"", sn, &tcp_local_addr, udp_dst, e);
+                        log::info!("[UdpGw] Ending stream {} {} <> {} with udp stack \"{}\"", sn, tcp_local_addr, udp_dst, e);
                         break;
                     }
                 };
                 crate::traffic_status::traffic_status_update(read_len, 0)?;
                 let sn = stream.serial_number();
                 if let Err(e) = UdpGwClient::send_udpgw_packet(ipv6_enabled, &tmp_buf[0..read_len], udp_dst, sn, &mut writer).await {
-                    log::info!("[UdpGw] Ending stream {} {} <> {} with send_udpgw_packet {}", sn, &tcp_local_addr, udp_dst, e);
+                    log::info!("[UdpGw] Ending stream {} {} <> {} with send_udpgw_packet {}", sn, tcp_local_addr, udp_dst, e);
                     break;
                 }
-                log::debug!("[UdpGw] stream {} {} -> {} send len {}", sn, &tcp_local_addr, udp_dst, read_len);
+                log::debug!("[UdpGw] stream {} {} -> {} send len {}", sn, tcp_local_addr, udp_dst, read_len);
                 stream.update_activity();
             }
             ret = UdpGwClient::recv_udpgw_packet(udp_mtu, udp_timeout, &mut reader) => {
@@ -642,35 +643,35 @@ async fn handle_udp_gateway_session(
                 }
                 match ret {
                     Err(e) => {
-                        log::warn!("[UdpGw] Ending stream {} {} <> {} with recv_udpgw_packet {}", sn, &tcp_local_addr, udp_dst, e);
+                        log::warn!("[UdpGw] Ending stream {} {} <> {} with recv_udpgw_packet {}", sn, tcp_local_addr, udp_dst, e);
                         stream.close();
                         break;
                     }
                     Ok((_, packet)) => match packet {
                         //should not received keepalive
                         UdpGwResponse::KeepAlive => {
-                            log::error!("[UdpGw] Ending stream {} {} <> {} with recv keepalive", sn, &tcp_local_addr, udp_dst);
+                            log::error!("[UdpGw] Ending stream {} {} <> {} with recv keepalive", sn, tcp_local_addr, udp_dst);
                             stream.close();
                             break;
                         }
                         //server udp may be timeout,can continue to receive udp data?
                         UdpGwResponse::Error => {
-                            log::info!("[UdpGw] Ending stream {} {} <> {} with recv udp error", sn, &tcp_local_addr, udp_dst);
+                            log::info!("[UdpGw] Ending stream {} {} <> {} with recv udp error", sn, tcp_local_addr, udp_dst);
                             stream.update_activity();
                             continue;
                         }
                         UdpGwResponse::TcpClose => {
-                            log::error!("[UdpGw] Ending stream {} {} <> {} with tcp closed", sn, &tcp_local_addr, udp_dst);
+                            log::error!("[UdpGw] Ending stream {} {} <> {} with tcp closed", sn, tcp_local_addr, udp_dst);
                             stream.close();
                             break;
                         }
                         UdpGwResponse::Data(data) => {
-                            use socks5_impl::protocol::StreamOperation;
+                            use crate::socks5_proto::StreamOperation;
                             let len = data.len();
                             let f = data.header.flags;
-                            log::debug!("[UdpGw] stream {sn} {} <- {} receive {f} len {len}", &tcp_local_addr, udp_dst);
+                            log::debug!("[UdpGw] stream {sn} {} <- {} receive {f} len {len}", tcp_local_addr, udp_dst);
                             if let Err(e) = udp_stack.write_all(&data.data).await {
-                                log::error!("[UdpGw] Ending stream {} {} <> {} with send_udp_packet {}", sn, &tcp_local_addr, udp_dst, e);
+                                log::error!("[UdpGw] Ending stream {} {} <> {} with send_udp_packet {}", sn, tcp_local_addr, udp_dst, e);
                                 break;
                             }
                         }
@@ -695,7 +696,7 @@ async fn handle_udp_associate_session(
     socket_queue: Option<Arc<SocketQueue>>,
     ipv6_enabled: bool,
 ) -> crate::Result<()> {
-    use socks5_impl::protocol::{Address, StreamOperation, UdpHeader};
+    use crate::socks5_proto::{Address, StreamOperation, UdpHeader};
 
     let (session_info, server_addr, domain_name, udp_addr) = {
         let handler = proxy_handler.lock().await;
@@ -737,7 +738,7 @@ async fn handle_udp_associate_session(
 
                 if let ProxyType::Socks4 | ProxyType::Socks5 = proxy_type {
                     let s5addr = if let Some(domain_name) = &domain_name {
-                        Address::DomainAddress(domain_name.clone().into(), session_info.dst.port())
+                        Address::DomainAddress(domain_name.clone(), session_info.dst.port())
                     } else {
                         session_info.dst.into()
                     };

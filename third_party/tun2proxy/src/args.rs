@@ -1,5 +1,5 @@
+use crate::socks5_proto::UserKey;
 use crate::{Error, Result};
-use socks5_impl::protocol::UserKey;
 use tproxy_config::IpCidr;
 
 #[cfg(target_os = "linux")]
@@ -420,9 +420,9 @@ impl std::fmt::Display for ArgProxy {
             None => "".to_owned(),
         };
         if auth.is_empty() {
-            write!(f, "{}://{}", &self.proxy_type, &self.addr)
+            write!(f, "{}://{}", self.proxy_type, self.addr)
         } else {
-            write!(f, "{}://{}@{}", &self.proxy_type, auth, &self.addr)
+            write!(f, "{}://{}@{}", self.proxy_type, auth, self.addr)
         }
     }
 }

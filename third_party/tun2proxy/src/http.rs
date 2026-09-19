@@ -1,3 +1,4 @@
+use crate::socks5_proto::UserKey;
 use crate::{
     directions::{IncomingDataEvent, IncomingDirection, OutgoingDataEvent, OutgoingDirection},
     error::{Error, Result},
@@ -5,7 +6,6 @@ use crate::{
     session_info::{IpProtocol, SessionInfo},
 };
 use httparse::Response;
-use socks5_impl::protocol::UserKey;
 use std::{
     collections::{HashMap, VecDeque, hash_map::RandomState},
     iter::FromIterator,
