@@ -219,29 +219,28 @@ Sender → FORWARD(dst) → cache miss → RecursiveRelay(dst, hop=20)
 directly, the message is left in a mailbox to be picked up later. This one has a
 few more moving parts, so the steps are spelled out below:
 ```
-Sender → MAILBOX_PUT → Primary (recipient's attachment gateway from DHT)
-  Primary:
-    store locally
-    select_quorum_replicas:
-      shard_target = BLAKE3("shard" || recipient_id || shard_id)
-      pool         = DHT.find_closest_nodes(shard_target, (replica_count-1)*4)
-      filter out   self, origin, low-battery, unreliable relays
-      take         replica_count - 1 replicas
-    MAILBOX_REPLICATE → replicas (envelope encrypted for privacy)
-    wait for write_quorum DeliveryStatus::QUEUED → ACK sender
+Sender:
+  GetAttachment(recipient_id) → the gateways the recipient announced in the DHT
+  open a session to one of them
+  PUT(envelope) on the mailbox service's endpoint
+    the gateway checks its quotas and stores the blob in redb
 
 Recipient comes online:
-  MAILBOX_FETCH → primary gateway
-    local store → DHT fallback → fan-out MAILBOX_FETCH_REPLICA on replicas
-    SEC check: recipient_node_id == authenticated peer_id
+  FETCH(skip[]) → its gateway
+    authenticated-requester check, then oldest-first within the reply budget
+  ACK(content_id) → the gateway removes it
+  anything never acked leaves on the 7-day TTL
 ```
 
-The clever part is that the backup holders (the **replicas**) are chosen by a
-formula, not by negotiation — the selection is **deterministic**. Any core node
-that can see the DHT computes the same `shard_target` and arrives at the same set
-of closest replicas. So the sender and the recipient never have to swap host
-addresses or agree on anything in advance; the math points them both at the same
-mailboxes.
+What makes this work without prior agreement is the **attachment record**: the
+recipient announces its gateways in the DHT under
+`attachment_key(recipient_node_id)`, signed with its identity key, and any
+sender looks them up there. Neither side has to swap host addresses.
+
+There are no replicas. A PUT is held by the gateway that accepted it and by
+nobody else; if a sender wants redundancy it deposits at more than one
+mailbox-capable relay, which is its own choice and not something the relays
+coordinate.
 
 ## The shared address book (DHT)
 

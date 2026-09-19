@@ -146,17 +146,19 @@ pub async fn dispatch(
 
 ```
 dispatcher/
-├── mod.rs                    # Основной dispatch + pending_diag
+├── lib.rs                    # Основной dispatch
 ├── app.rs                    # App-plane (потоки)
 ├── control.rs                # Control-plane (ping, neighbor, probe)
-├── delivery.rs               # Delivery-plane (mailbox, forward, trace)
+├── delivery.rs               # Delivery-plane (forward, transit, trace)
 ├── discovery.rs              # DHT (FindNode, Store, Delete, Announce)
 ├── routing.rs                # RouteAnnounce, RouteRequest, PoW
 ├── session.rs                # Keepalive, Rekey, Detach
 ├── diag.rs                   # DiagPing, DiagTrace
-├── pending_ack.rs            # Трекинг require_ack сообщений
-├── pending_fetch_replica.rs  # Трекинг reseed MAILBOX_FETCH на replica-ноды
-└── pending_replica.rs        # Трекинг MAILBOX_REPLICATE между Core-нодами
+├── anonymity.rs              # Кадры onion-плоскости
+├── envelope_chunks.rs        # Нарезанные envelope поверх Forward
+├── service_budget.rs         # Бюджеты допуска по службам
+├── sink_impl.rs              # Обвязка приёмника кадров
+└── pending_ack.rs            # Трекинг require_ack сообщений
 ```
 
 **При добавлении нового типа фрейма:**
