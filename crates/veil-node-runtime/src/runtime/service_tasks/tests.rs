@@ -3037,6 +3037,64 @@ fn rendezvous_replica_picker_keeps_all_connected_pins_up_to_slot_cap() {
     );
 }
 
+/// The REPLY-PATH picker accepts a connected peer that advertised
+/// ANONYMITY_RELAY, without its relay-directory entry being in our local DHT.
+///
+/// It read `dht.get_local` alone, and that entry is exactly what this module's
+/// own comments call unreliable on a sparse network — it has not replicated to
+/// our shard yet, or the cached copy expired. The cost was not latency: the
+/// mailbox drain could not build a reply circuit at all
+/// (`mailbox.fetch.reply_path_failed hops=2 err=NoRelays`), measured
+/// 2026-09-20 against THREE connected relays that had each published
+/// `relay_x25519 advertised`. Its sibling picker had taken both signals since
+/// it was written.
+#[test]
+fn reply_path_picker_accepts_a_connected_anonymity_relay_without_its_rd() {
+    use crate::types::{LinkId, NodeId, SessionInfo, SessionSource, SessionState};
+
+    let ordinary_relay = [0x33u8; 32];
+    let anonymity_relay = [0x44u8; 32];
+    let mut sessions = std::collections::BTreeMap::new();
+    for (idx, node) in [ordinary_relay, anonymity_relay].iter().enumerate() {
+        sessions.insert(
+            LinkId::new(idx as u64 + 1),
+            SessionInfo {
+                link_id: LinkId::new(idx as u64 + 1),
+                node_id: Some(NodeId::from(*node)),
+                sovereign_node_id: None,
+                nonce: None,
+                matched_peer_id: None,
+                source: SessionSource::Inbound(crate::types::ListenId::new(1)),
+                listener_handle: None,
+                state: SessionState::Active,
+                transport: "test".to_owned(),
+                remote_addr: None,
+                description: String::new(),
+            },
+        );
+    }
+    let live = Arc::new(std::sync::Mutex::new(sessions));
+    // EMPTY on purpose: no relay-directory entry has reached this node.
+    let dht = Arc::new(veil_dht::KademliaService::new([9u8; 32]));
+    let caps = Arc::new(std::sync::RwLock::new(std::collections::HashMap::from([
+        (ordinary_relay, veil_proto::session::cap_flags::CAN_RELAY),
+        (
+            anonymity_relay,
+            veil_proto::session::cap_flags::CAN_RELAY
+                | veil_proto::session::cap_flags::ANONYMITY_RELAY,
+        ),
+    ])));
+
+    let got = pick_rendezvous_relay(&live, &dht, &caps, &[]);
+    assert_eq!(
+        got,
+        Some(anonymity_relay),
+        "a connected peer advertising ANONYMITY_RELAY is a relay whether or not \
+         its directory entry has replicated to us; demanding the entry leaves \
+         the mailbox drain with no reply path at all"
+    );
+}
+
 #[test]
 fn rendezvous_replica_picker_requires_anonymity_relay_capability() {
     use crate::types::{LinkId, NodeId, SessionInfo, SessionSource, SessionState};

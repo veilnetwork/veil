@@ -394,6 +394,7 @@ pub(crate) fn peer_advertised_anonymity_relay(
 pub(crate) fn pick_rendezvous_relay(
     live: &LiveSessions,
     dht: &Arc<veil_dht::KademliaService>,
+    cap_flags: &PeerCapFlags,
     pinned: &[[u8; 32]],
 ) -> Option<[u8; 32]> {
     let connected: Vec<[u8; 32]> = {
@@ -415,9 +416,22 @@ pub(crate) fn pick_rendezvous_relay(
     // registered by this node — concentrating load on one relay and making the
     // node's rendezvous choice predictable. Each new registration now draws an
     // independent R from the published-eligible set.
+    // BOTH signals, like [`pick_rendezvous_relays_deterministic`] already uses.
+    // This one read `dht.get_local` alone, and that lookup is exactly what its
+    // own sibling documents as unreliable: on a sparse network the relay
+    // directory entry has not replicated to our shard, and the cached copy
+    // expires. The consequence was not a slower path but no path at all —
+    // `mailbox.fetch.reply_path_failed hops=2 err=NoRelays` on every drain,
+    // measured 2026-09-20 with THREE connected relays that had each published
+    // `relay_x25519 advertised`. A peer we are connected to that advertised
+    // ANONYMITY_RELAY in its handshake is a relay whether or not its RD has
+    // reached us; `warm_connected_relay_directory` exists to paper over the
+    // same gap and cannot close it, because it races the expiry.
     let eligible: Vec<[u8; 32]> = connected
         .into_iter()
-        .filter(|c| rendezvous_relay_published(dht, c))
+        .filter(|c| {
+            rendezvous_relay_published(dht, c) || peer_advertised_anonymity_relay(cap_flags, c)
+        })
         .collect();
     if eligible.is_empty() {
         return None;

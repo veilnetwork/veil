@@ -2124,6 +2124,7 @@ impl NodeServices {
         let r = service_tasks::pick_rendezvous_relay(
             &self.live_sessions,
             &self.dht,
+            &self.dispatcher.crypto.peer_cap_flags,
             &self.anonymity.pinned_rendezvous_relays,
         )
         .ok_or_else(|| {
