@@ -1,6 +1,6 @@
 [package]
 name = "veil-app"
-version = "0.11.37"
+version = "0.11.38"
 edition = "2024"
 description = "Application-endpoint registry: per-app endpoint addressing, message channels, stream window tracking. Phase 6 extraction from veilcore."
 license = "MIT OR Apache-2.0"

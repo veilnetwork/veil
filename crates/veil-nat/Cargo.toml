@@ -1,6 +1,6 @@
 [package]
 name = "veil-nat"
-version = "0.11.37"
+version = "0.11.38"
 edition = "2024"
 description = "NAT traversal: ICE-style candidate discovery, UDP hole-punch, relay fallback. Phase 6 extraction from veilcore."
 license = "MIT OR Apache-2.0"

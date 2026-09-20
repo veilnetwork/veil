@@ -1,6 +1,6 @@
 [package]
 name = "veil-node-runtime"
-version = "0.11.37"
+version = "0.11.38"
 edition = "2024"
 description = "OVL1 node runtime — orchestration layer wiring dispatcher + session + DHT + identity + admin into a running daemon. Phase 4 of veilcore extraction."
 license = "MIT OR Apache-2.0"

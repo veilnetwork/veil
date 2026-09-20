@@ -1,6 +1,6 @@
 [package]
 name = "veil-adaptive"
-version = "0.11.37"
+version = "0.11.38"
 edition = "2024"
 description = "Network-size-aware adaptive parameter formulas (k-bucket size, gossip TTL, route-cache capacity, responder-proximity gate, PoW difficulty) for the Veil network."
 license = "MIT OR Apache-2.0"

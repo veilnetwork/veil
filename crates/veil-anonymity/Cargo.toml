@@ -1,6 +1,6 @@
 [package]
 name = "veil-anonymity"
-version = "0.11.37"
+version = "0.11.38"
 edition = "2024"
 description = "Veil network anonymity stack: onion routing, fixed-size cells, circuits, rendezvous points. Phase 4 extraction from veilcore."
 license = "MIT OR Apache-2.0"
