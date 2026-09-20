@@ -1,5 +1,77 @@
 # Changelog
 
+## v0.11.38 — 2026-09-20
+
+### Fixed
+
+- **A contact is an identity, and seven places routed by the device.** A
+  sovereign identity has one `node_id` and as many device keys as it has
+  devices. Peers know the identity — that is what an invite, a certificate and
+  a contact list all carry — while a session is registered under whichever
+  device is connected. Seven places asked the registry for the device id and
+  got nothing back, silently, because the caller had named an identity: peer
+  admission accepted only the device, so a contact with a live session measured
+  as not admitted; unicast sends resolved one peer id, so an identity with two
+  devices reached neither; the ratchet opened sealed payloads under the device,
+  so the sender it derived never matched the one that sealed them; and app
+  endpoints bound their `app_id` under the device, so every `app_id` a peer
+  derived from our published address named an endpoint that did not exist.
+  Measured on a two-device stand as both ends of a p2p call sitting in
+  `active tr=p2p` while every `XVSG` signalling frame was received, counted and
+  dropped with `routed=false`.
+
+  `FrameBroadcaster` gains `devices_of()` with an empty default and
+  `send_to_peer_or_identity()`, which fans out to every device of an identity
+  rather than resolving one. `IpcServer` keeps `node_id` as the DEVICE — local
+  clients look their embedded services up by it — and gains `bind_node_id` for
+  the address peers derive from. Both are logged side by side at `ipc.start`,
+  so a wrong one shows up as a wrong address instead of as silence.
+
+- **The build script for the macOS media engine resolved its own directory
+  after `cd`-ing elsewhere**, so a relative invocation died with
+  `cd: macos: No such file or directory` — a message about a missing directory
+  when the fault was a stale relative path.
+
+### Added
+
+- **Opus is configured for a lossy link**: `stereo=0`, `useinbandfec=1`,
+  `usedtx=1`. The format was built with no parameters at all, which takes
+  WebRTC's defaults — FEC off, DTX off. Inband FEC is the one that matters:
+  LBRR embeds a low-rate copy of the previous frame in each packet, so a lost
+  packet is reconstructed rather than concealed, and it costs bitrate only in
+  proportion to the loss the encoder is told about. Not a wire break: these are
+  encoder-side choices inside a self-describing Opus bitstream, and nothing
+  about what this build accepts has changed. `ptime` stays at 20 ms — a longer
+  frame would cut the packet rate further and add its own latency.
+
+- **The media ingress says why it dropped a cell.** `dispatch_inbound_auto`
+  returned early without a word both when no channel was registered for the
+  peer and when the seal failed to open, and `dispatch MISS` could not cover
+  either: it lives inside `dispatch_inbound`, which is reached only once the
+  key was found and the cell already opened. A key mismatch therefore left no
+  counter, no log, and nothing to tell it apart from "the wire delivered
+  nothing". Each drop now names its reason and prints what IS registered
+  instead, throttled. The arrival counter alongside matters as much: "no
+  mismatch was logged" reads as "the demux is fine" when it equally means
+  "nothing ever reached the demux".
+
+### Changed
+
+- **Relicensed to `MIT OR Apache-2.0`**, all 57 crates, with both licence texts
+  shipped so the choice means something. Every crate declared
+  `AGPL-3.0-or-later` and nothing in the history says why: `deny.toml` has
+  always demanded permissive licences of everything veil pulls in, and no crate
+  here carries copyleft code.
+
+- **The GPL dependency is gone.** `socks5-impl` is `GPL-3.0-or-later` and
+  reached veil through the vendored `tun2proxy`, under the `packet-tunnel`
+  feature. `src/socks5_proto.rs` replaces it with a clean-room codec written
+  from RFC 1928 and RFC 1929 — handshake and username/password exchanges,
+  `Request`/`Response`, the UDP header, `Address`, `UserKey` and the two stream
+  traits the rest of the crate is written against — with 28 tests, each one an
+  RFC clause the codec can get wrong. `deny.toml`'s exception list is now
+  empty.
+
 ## v0.11.37 — 2026-09-17
 
 ### Fixed
