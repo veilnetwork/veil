@@ -383,12 +383,12 @@ impl RuntimeMailboxCrypto {
         let identity = sovereign.document.node_id;
         let addressed_to_us = audience == MailboxAudience::MyOtherDevices
             || self.addresses_our_identity(recipient_node_id);
-        let crypto_recipient = if addressed_to_us {
+        let mut crypto_recipient = if addressed_to_us {
             identity
         } else {
             recipient_node_id
         };
-        let auth = sovereign.sign_auth_deliver(
+        let mut auth = sovereign.sign_auth_deliver(
             crypto_recipient,
             app_id,
             endpoint_id,
@@ -400,7 +400,7 @@ impl RuntimeMailboxCrypto {
         // Sealing to ourselves is a normal first-document operation. Never
         // depend on a DHT round-trip for our own certificate: the runtime owns
         // the exact DK seed and sovereign instance binding already.
-        let resolved: ResolvedCerts = if audience == MailboxAudience::MyOtherDevices {
+        let mut resolved: ResolvedCerts = if audience == MailboxAudience::MyOtherDevices {
             // OUR devices come from the document this runtime already holds,
             // not from a DHT walk about ourselves. Measured on a two-device
             // stand: the registry said instances=2 and resolving our own id
@@ -496,6 +496,58 @@ impl RuntimeMailboxCrypto {
                 .fetch_verified_certs(recipient_node_id)
                 .await
         };
+        // A DEVICE OUR DOCUMENT NAMES BUT THE NETWORK HAS NO KEY FOR UNDER OUR
+        // IDENTITY IS, FOR NOW, REACHABLE ONLY AS ITSELF.
+        //
+        // The link ceremony amends this document to name the new device BEFORE
+        // that device has adopted the identity — deliberately, so the registry
+        // we publish names it and the snapshot has somewhere to go. From that
+        // moment `addresses_our_identity` is true for it, so its certificate is
+        // sought under OUR identity. It is not there and cannot be: until it
+        // adopts, the device publishes under its OWN identity. And the thing
+        // that lets it adopt is the snapshot we are trying to seal.
+        //
+        // Measured end to end on a stand, every link in the chain: the sender's
+        // registry named the device, `1 device(s) of the recipient were asked
+        // about and none has a certificate on the network`, every deposit
+        // suppressed in `unresolved-peer backoff` — so no durable re-drive at
+        // all — and the snapshot's THIRTEEN live chunks arriving as nine. The
+        // receiver held 9/13 and answered `no bundle` twelve times over; it can
+        // never adopt, so the deadlock never breaks on its own.
+        //
+        // Falling back to the recipient's own published identity seals to a key
+        // that device controls and publishes — which is exactly who we mean —
+        // and it costs one resolve only on the path that was failing outright.
+        // The auth is re-signed because the opener reconstructs `dst` as the id
+        // it opened under: the binding and the auth must stay one choice.
+        if resolved.is_empty()
+            && addressed_to_us
+            && recipient_node_id != identity
+            && recipient_node_id != self.local_node_id
+        {
+            let as_itself = self
+                .mlkem_resolver()
+                .fetch_verified_certs(recipient_node_id)
+                .await;
+            if !as_itself.is_empty() {
+                log::info!(
+                    "mailbox_seal: {} has no certificate under our identity yet \
+                     (not adopted) — sealing to its own published identity",
+                    veil_util::hex_short(&recipient_node_id),
+                );
+                crypto_recipient = recipient_node_id;
+                auth = sovereign.sign_auth_deliver(
+                    crypto_recipient,
+                    app_id,
+                    endpoint_id,
+                    now,
+                    rand_core::OsRng.next_u64(),
+                    data.to_vec(),
+                    Vec::new(),
+                );
+                resolved = as_itself;
+            }
+        }
         if resolved.is_empty() {
             return Err(OfflineSealError::RecipientCertUnresolved(
                 resolved.unresolved(),
