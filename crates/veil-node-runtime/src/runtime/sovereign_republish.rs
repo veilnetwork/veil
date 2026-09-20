@@ -329,21 +329,37 @@ impl NodeRuntime {
                                 continue;
                             }
                             last_topology_publish_at = now;
-                            if let Err(e) = veil_identity::publish::publish_identity_document(
-                                &sov.document, &publisher,
-                            ).await {
-                                logger.debug(
-                                    "node.sovereign_identity.topology_republish_failed",
-                                    format!("node_id={} — topology-driven publish failed: {e}",
-                                        veil_util::bytes_to_hex(sov.node_id())),
-                                );
-                            } else {
-                                logger.debug(
-                                    "node.sovereign_identity.topology_republished",
-                                    format!("node_id={} — re-fanned IdentityDocument to K-closest after route_updated",
-                                        veil_util::bytes_to_hex(sov.node_id())),
-                                );
-                            }
+                            // THE WHOLE BUNDLE, not the document alone.
+                            //
+                            // This arm used to re-fan the `IdentityDocument`
+                            // and nothing else, which left the
+                            // `InstanceRegistry` and the `MlKemKeyCert` in this
+                            // node's own shard until the 6-hour tick. The
+                            // boot-time publish is local-only BY DESIGN — it
+                            // runs before the first peer is dialled, so its
+                            // fan-out is zero — and the first topology change
+                            // is the moment that gap can be closed.
+                            //
+                            // Measured on a stand, from the node's own log: a
+                            // fresh identity published document, registry and
+                            // cert at t+0.346s, said `bootstrap.none … node
+                            // stays offline` at t+0.352s, and registered its
+                            // first peer at t+0.421s. Six minutes later a peer
+                            // resolving it got the DOCUMENT (re-fanned here)
+                            // and then `1 device(s) of the recipient were asked
+                            // about and none has a certificate on the network`
+                            // — so nothing could be sealed for it and the
+                            // device-link ceremony could not finish. An earlier
+                            // run showed the same asymmetry one step out:
+                            // document resolved, registry did not.
+                            //
+                            // Pulling the interval arm forward rather than
+                            // duplicating its ~100 lines is the idiom this loop
+                            // already uses for the ML-KEM rotation arm above,
+                            // and it keeps the one publish path that is known
+                            // to cover every record. The debounce above still
+                            // bounds the cost under churn.
+                            interval.reset_immediately();
                         }
                         _ = on_change_tick.tick() => {
                             if let Some(m) = &drop_metrics {

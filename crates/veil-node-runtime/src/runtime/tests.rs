@@ -3999,6 +3999,63 @@ fn the_identity_selfcheck_is_owned_by_its_task() {
     );
 }
 
+/// A topology change republishes the WHOLE bundle, not the document alone.
+///
+/// The boot-time publish is local-only by design — it runs before the first
+/// peer is dialled, so its fan-out is zero. Measured on a stand from the node's
+/// own log: a fresh identity published document, registry and cert at t+0.346s,
+/// logged `bootstrap.none … node stays offline` at t+0.352s, and registered its
+/// first peer at t+0.421s. The first `route_updated` is therefore the moment
+/// that gap can be closed, and this arm closed it for the DOCUMENT only: six
+/// minutes later a peer resolving that identity got the document and then
+/// `1 device(s) of the recipient were asked about and none has a certificate on
+/// the network`, so nothing could be sealed for it. An earlier run showed the
+/// same asymmetry one step out — document resolved, registry did not.
+///
+/// Structural, like [`the_identity_selfcheck_is_owned_by_its_task`] above: the
+/// arm lives inside a `tokio::select!` several closures deep, and what is being
+/// pinned is WHICH publish path it reaches.
+#[test]
+fn a_topology_change_republishes_every_record() {
+    let src = include_str!("sovereign_republish.rs");
+    let at = src
+        .find("_ = route_updated.notified() => {")
+        .expect("the topology-driven republish arm is gone or was renamed");
+    // Bounded at the next arm so this reads THIS arm and not the file.
+    let rest = &src[at..];
+    let end = rest
+        .find("_ = on_change_tick.tick()")
+        .expect("the arm after the topology one is gone — the slice is unbounded");
+    let arm = &rest[..end];
+
+    assert!(
+        arm.contains("interval.reset_immediately()"),
+        "the topology arm no longer pulls the full publish forward, so a node \
+         whose boot publish reached nobody stays unresolvable until the 6h tick"
+    );
+    // CONTROL: and it must not go back to publishing one record by hand —
+    // that is exactly the shape that left the registry and the cert behind.
+    assert!(
+        !arm.contains("publish_identity_document("),
+        "the topology arm publishes the document by hand again; the registry \
+         and the ML-KEM cert do not travel with it"
+    );
+
+    // CONTROL for the guard itself: the arm it defers to still publishes all
+    // three records, or deferring to it proves nothing.
+    for record in [
+        "publish_identity_document(",
+        "publish_instance_registry(",
+        "publish_mlkem_cert(",
+    ] {
+        assert!(
+            src.contains(record),
+            "the interval arm no longer publishes {record} — the topology arm \
+             now defers to a path that does not cover it"
+        );
+    }
+}
+
 /// An anycast record this node publishes must name the IDENTITY, not the device.
 ///
 /// A resolver binds a record to an address before it will hand it out, and
