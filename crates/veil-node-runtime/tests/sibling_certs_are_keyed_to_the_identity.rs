@@ -41,7 +41,6 @@ fn the_my_devices_branch_resolves_under_the_identity() {
     );
 }
 
-
 /// A device our document names but that has NOT adopted the identity yet must
 /// still be sealable — as itself.
 ///
