@@ -326,6 +326,36 @@ impl RuntimeMailboxCrypto {
     /// mailbox blob — the caller owns the binding, the same fields the live
     /// onion `APP_DELIVER_AUTH` path binds — with the audience said out loud.
     /// See [`MailboxAudience`].
+    /// Whether `recipient` names THIS IDENTITY — this device, the identity's
+    /// own id, or any other device delegated in its document.
+    ///
+    /// ONE answer, because there were two of different completeness and the
+    /// narrow one decided the expensive branch. `seal_for` asked the full
+    /// question (it consults `identity_keys`) to pick the cryptographic
+    /// recipient, while the audience handed to it compared against
+    /// `local_node_id` alone. A sibling addressed by its DEVICE id — which is
+    /// exactly how the device-group broadcast addresses it — therefore came in
+    /// as `Recipient`, and the certificate resolution went looking on the
+    /// network for a device this runtime already holds in its own document.
+    /// Measured on a two-device stand 2026-09-20: `registry_published
+    /// instances=2` on both, `mlkem_cert_published` on both, a live direct
+    /// session between them, and every deposit still failing
+    /// `PeerUnresolved — none has a certificate on the network`.
+    fn addresses_our_identity(&self, recipient: [u8; 32]) -> bool {
+        if recipient == self.local_node_id {
+            return true;
+        }
+        let Some(sovereign) = self.sovereign.get() else {
+            return false;
+        };
+        sovereign.document.node_id == recipient
+            || sovereign
+                .document
+                .identity_keys
+                .iter()
+                .any(|key| key.device_id == recipient)
+    }
+
     pub async fn seal_for(
         &self,
         audience: MailboxAudience,
@@ -352,12 +382,7 @@ impl RuntimeMailboxCrypto {
         // dst as the id it opened under — the two must be one choice.
         let identity = sovereign.document.node_id;
         let addressed_to_us = audience == MailboxAudience::MyOtherDevices
-            || recipient_node_id == self.local_node_id
-            || sovereign
-                .document
-                .identity_keys
-                .iter()
-                .any(|key| key.device_id == recipient_node_id);
+            || self.addresses_our_identity(recipient_node_id);
         let crypto_recipient = if addressed_to_us {
             identity
         } else {
@@ -387,8 +412,18 @@ impl RuntimeMailboxCrypto {
             if others.is_empty() {
                 ResolvedCerts::default()
             } else {
+                // THE IDENTITY, not this device. The publisher writes each
+                // certificate at `dht_key(cert.node_id, instance_id)` where
+                // `cert.node_id` is the IDENTITY (see
+                // `identity_publish.rs` → `publish_mlkem_cert`), so asking
+                // under this device's own id computes a key nobody ever wrote
+                // to. Identical on a master, where the device id IS the
+                // identity — which is why this only ever failed on the
+                // multi-device case the branch exists to serve. Every other
+                // caller, this resolver's own tests included, passes the
+                // document's node id; this one did not.
                 self.mlkem_resolver()
-                    .certs_for_instances(self.local_node_id, &sovereign.document, &others, now)
+                    .certs_for_instances(identity, &sovereign.document, &others, now)
                     .await
             }
         } else if recipient_node_id == self.local_node_id {
@@ -625,7 +660,11 @@ impl veil_ipc::MailboxCryptoSink for RuntimeMailboxCrypto {
             //
             // The internal `seal` keeps addressing us alone; that path is the
             // first-document operation, which is genuinely about this device.
-            let audience = if recipient_node_id == self.local_node_id {
+            // ANY device of ours, not just this one: the device-group
+            // broadcast addresses a sibling by its device id, and answering
+            // "is that us?" with a comparison against `local_node_id` alone
+            // sent every such deposit down the stranger path.
+            let audience = if self.addresses_our_identity(recipient_node_id) {
                 MailboxAudience::MyOtherDevices
             } else {
                 MailboxAudience::Recipient
