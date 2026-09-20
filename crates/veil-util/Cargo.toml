@@ -1,6 +1,6 @@
 [package]
 name = "veil-util"
-version = "0.11.37"
+version = "0.11.38"
 edition = "2024"
 description = "Cross-cutting micro-utilities for the Veil network (atomic writes, hex encoding, retry helpers, leading-zero-bit counts)."
 license = "MIT OR Apache-2.0"

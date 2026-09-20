@@ -1,6 +1,6 @@
 [package]
 name = "veil-pex"
-version = "0.11.37"
+version = "0.11.38"
 edition = "2024"
 description = "Veil Peer Exchange (PEX) — random-walk peer discovery with PoW challenge + signed responses (Epic 436). Phase 6 extraction from veilcore."
 license = "MIT OR Apache-2.0"
