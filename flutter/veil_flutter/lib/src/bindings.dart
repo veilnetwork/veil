@@ -267,6 +267,41 @@ Pointer<VeilApp> veilBindNamed(
     _bindNamedNative(handle, namespace.cast<Uint8>(), namespace.length,
         name.cast<Uint8>(), name.length, endpointId, errOut);
 
+final Pointer<VeilApp> Function(
+  Pointer<VeilHandle>,
+  Pointer<Uint8>,
+  int,
+  Pointer<Uint8>,
+  int,
+  int,
+  Pointer<Pointer<Utf8>>,
+) _bindDeviceScopedNative = nativeLib
+    .lookup<
+        NativeFunction<
+            Pointer<VeilApp> Function(
+              Pointer<VeilHandle>,
+              Pointer<Uint8>,
+              IntPtr,
+              Pointer<Uint8>,
+              IntPtr,
+              Uint32,
+              Pointer<Pointer<Utf8>>,
+            )>>('veil_bind_device_scoped')
+    .asFunction();
+
+/// Bind a stable endpoint under this node's DEVICE id rather than the
+/// sovereign identity it publishes. Its own symbol rather than a flag on
+/// [veilBindNamed]: this ABI is positional.
+Pointer<VeilApp> veilBindDeviceScoped(
+  Pointer<VeilHandle> handle,
+  Pointer<Utf8> namespace,
+  Pointer<Utf8> name,
+  int endpointId,
+  Pointer<Pointer<Utf8>> errOut,
+) =>
+    _bindDeviceScopedNative(handle, namespace.cast<Uint8>(), namespace.length,
+        name.cast<Uint8>(), name.length, endpointId, errOut);
+
 final int Function(Pointer<VeilApp>, Pointer<Uint8>) veilAppGetAppId = nativeLib
     .lookup<
         NativeFunction<

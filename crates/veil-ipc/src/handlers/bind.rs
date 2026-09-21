@@ -15,12 +15,29 @@ use crate::frame_io::write_frame_wh;
 use crate::server::IpcClientState;
 use crate::transport::IpcWriteHalf;
 
+/// The two names this node answers to, as the bind handler sees them.
+///
+/// A node that has adopted a sovereign document HAS two, and which one an
+/// endpoint is derived from is the whole of what `DEVICE_SCOPED` decides.
+/// Passed as a pair rather than as two more positional arguments so the call
+/// site cannot swap them silently — they are the same type, and swapping them
+/// would move the address every contact holds.
+#[derive(Clone, Copy)]
+pub(crate) struct BindNames<'a> {
+    /// The address a CONTACT holds for us — `bind_node_id`. What an ordinary
+    /// named bind derives from.
+    pub identity: &'a [u8; 32],
+    /// This device, which routing, dedup and the session registry key on. The
+    /// only name a SIBLING device can address.
+    pub device: &'a [u8; 32],
+}
+
 pub(crate) async fn handle_bind(
     wh: &mut IpcWriteHalf,
     body: &[u8],
     client_state: &mut IpcClientState,
     app_registry: &AppEndpointRegistry,
-    node_id: &[u8; 32],
+    names: BindNames<'_>,
     client_token: &[u8; 16],
     app_socket_dir: Option<&Path>,
 ) -> std::io::Result<()> {
@@ -106,6 +123,7 @@ pub(crate) async fn handle_bind(
     };
     let ephemeral = bind.flags & veil_proto::ipc::ipc_bind_flags::EPHEMERAL != 0;
     let capability = bind.flags & veil_proto::ipc::ipc_bind_flags::CAPABILITY != 0;
+    let device_scoped = bind.flags & veil_proto::ipc::ipc_bind_flags::DEVICE_SCOPED != 0;
     if ephemeral && capability {
         let err = AppBindErrPayload {
             error_code: ipc_bind_err::INVALID_REQUEST,
@@ -119,12 +137,42 @@ pub(crate) async fn handle_bind(
         )
         .await;
     }
+    // CAPABILITY derives from no node id at all, so "which of my two names"
+    // has no answer to give it. Refused rather than silently ignored: a caller
+    // that asked for a device-scoped capability alias wanted something this
+    // node cannot produce, and handing back the capability address would be a
+    // different endpoint wearing the requested one's name.
+    if device_scoped && capability {
+        let err = AppBindErrPayload {
+            error_code: ipc_bind_err::INVALID_REQUEST,
+            detail: b"DEVICE_SCOPED and CAPABILITY bind flags are mutually exclusive".to_vec(),
+        };
+        return write_frame_wh(
+            wh,
+            FrameFamily::LocalApp as u8,
+            LocalAppMsg::AppBindErr as u16,
+            &err.encode(),
+        )
+        .await;
+    }
+    // WHICH OF THIS NODE'S TWO NAMES THIS ENDPOINT ANSWERS TO.
+    //
+    // `node_id` here is `bind_node_id` — the sovereign identity, because that
+    // is the address a contact holds for us. `device_node_id` is what routing,
+    // dedup and the session registry key on, and it is the ONLY name a sibling
+    // device can address: an identity is shared by every device of one person,
+    // so it cannot say which of them is meant.
+    let bind_under = if device_scoped {
+        names.device
+    } else {
+        names.identity
+    };
     let app_id = if ephemeral {
-        veil_app::address::ephemeral_app_id(node_id, client_token, namespace, name)
+        veil_app::address::ephemeral_app_id(bind_under, client_token, namespace, name)
     } else if capability {
         veil_app::address::capability_app_id(namespace, name)
     } else {
-        veil_app::address::app_id(node_id, namespace, name)
+        veil_app::address::app_id(bind_under, namespace, name)
     };
 
     // Phase E22 (2026-05-22): bumped from 64 to 4096 for match `[session]
