@@ -2417,7 +2417,7 @@ async fn handle_ipc_client(
                     Ok(LocalAppMsg::AppBind) => {
                         {
                             let token = client_state.client_token;
-                            handle_bind(&mut wh, &body, &mut client_state, &app_registry, &bind_node_id, &token, app_socket_dir.as_deref()).await?;
+                            handle_bind(&mut wh, &body, &mut client_state, &app_registry, crate::handlers::bind::BindNames { identity: &bind_node_id, device: &node_id }, &token, app_socket_dir.as_deref()).await?;
                         }
                     }
                     Ok(LocalAppMsg::AppUnbind) => {

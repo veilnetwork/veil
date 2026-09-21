@@ -879,6 +879,27 @@ impl VeilClient {
             .await
     }
 
+    /// Bind a well-known persistent endpoint under this node's DEVICE id
+    /// instead of the sovereign identity it publishes.
+    ///
+    /// For a node with no sovereign document the two ids are the same value
+    /// and this is [`Self::bind_named`] by another name. For one that HAS
+    /// adopted a document it is the only way to be addressable by a sibling
+    /// device: an identity is shared by every device of one person, so a frame
+    /// meant for one of them cannot be addressed to it.
+    ///
+    /// Bind this BESIDE the identity endpoint, not instead of it — a contact
+    /// still holds the identity address and nothing about that path changes.
+    pub async fn bind_device_scoped(
+        &self,
+        namespace: &str,
+        name: &str,
+        endpoint_id: u32,
+    ) -> Result<AppHandle, ClientError> {
+        self.bind_with_flags(namespace, name, endpoint_id, ipc_bind_flags::DEVICE_SCOPED)
+            .await
+    }
+
     async fn bind_with_flags(
         &self,
         namespace: &str,

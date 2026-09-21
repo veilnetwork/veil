@@ -371,6 +371,31 @@ pub mod ipc_bind_flags {
     /// high-entropy capability material; this is for secret aliases, not public
     /// well-known services.
     pub const CAPABILITY: u16 = 0x0002;
+
+    /// Device-scoped stable binding: derive `app_id` from this node's DEVICE
+    /// id rather than from the sovereign identity it publishes.
+    ///
+    /// A node that has adopted a sovereign document answers to two names. The
+    /// device is what routing, dedup and the session registry key on (see
+    /// `SessionInfo::sovereign_node_id`); the identity is the address a CONTACT
+    /// holds, which is why the ordinary named bind derives from it. One inbox
+    /// covers both only while nobody addresses the device — and a sibling
+    /// device has nothing else to address.
+    ///
+    /// Measured on a two-device stand 2026-09-21: with a live direct session up
+    /// and `admitted=true` on both sides, twenty of twenty frames sent to a
+    /// sibling's device id were dropped in silence — the transport accepted
+    /// each one in 0 ms and no endpoint was bound under
+    /// `app_id(device, ns, name)`. Every arrival came from the mailbox instead,
+    /// within ~10 ms of a drain, while an ordinary contact on the same machine
+    /// delivered 7 of 9 live. This flag is what gives that frame somewhere to
+    /// land.
+    ///
+    /// Additive by design: a device binds its identity inbox exactly as before
+    /// and this one BESIDE it, so no address a peer already holds changes.
+    /// Mutually exclusive with [`CAPABILITY`], which derives from no node id at
+    /// all.
+    pub const DEVICE_SCOPED: u16 = 0x0004;
 }
 
 /// Sent by the node when an `APP_BIND` cannot be honoured.

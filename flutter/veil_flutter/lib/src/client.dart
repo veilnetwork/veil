@@ -2364,6 +2364,31 @@ class VeilClient implements Finalizable {
         namespace: namespace, name: name, endpointId: endpointId, named: true);
   }
 
+  /// Bind a well-known persistent endpoint under this node's DEVICE id rather
+  /// than the sovereign identity it publishes.
+  ///
+  /// For a node with no sovereign document the two ids are the same value and
+  /// this is [bindNamed] by another name. For one that HAS adopted a document
+  /// it is the only way to be addressable by a SIBLING device: an identity is
+  /// shared by every device of one person, so a frame meant for one of them
+  /// cannot be addressed to it.
+  ///
+  /// Bind this BESIDE the identity endpoint, never instead of it — a contact
+  /// still holds the identity address and nothing about that path changes.
+  Future<AppHandle> bindDeviceScoped({
+    required String namespace,
+    required String name,
+    int endpointId = 0,
+  }) async {
+    return _bindCommon(
+      namespace: namespace,
+      name: name,
+      endpointId: endpointId,
+      named: true,
+      deviceScoped: true,
+    );
+  }
+
   /// Bind a secret stable capability alias. Unlike [bindNamed], its app id is
   /// independent of this node id and can therefore be shared by several
   /// sovereign devices hosting the same capability.
@@ -2390,6 +2415,7 @@ class VeilClient implements Finalizable {
     required String name,
     required int endpointId,
     required bool named,
+    bool deviceScoped = false,
   }) async {
     _ensureOpen();
     return Future(() {
@@ -2397,9 +2423,11 @@ class VeilClient implements Finalizable {
       final nameC = name.toNativeUtf8();
       final errOut = calloc<Pointer<Utf8>>();
       try {
-        final app = named
-            ? ffi.veilBindNamed(_handle, nsC, nameC, endpointId, errOut)
-            : ffi.veilBind(_handle, nsC, nameC, endpointId, errOut);
+        final app = deviceScoped
+            ? ffi.veilBindDeviceScoped(_handle, nsC, nameC, endpointId, errOut)
+            : named
+                ? ffi.veilBindNamed(_handle, nsC, nameC, endpointId, errOut)
+                : ffi.veilBind(_handle, nsC, nameC, endpointId, errOut);
         if (app == nullptr) {
           throw VeilException('bind failed: ${_readErrAndFree(errOut)}');
         }
