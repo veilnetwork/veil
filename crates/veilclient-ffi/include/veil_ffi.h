@@ -967,6 +967,28 @@ VeilApp *veil_bind_capability(VeilHandle *handle,
 ;
 
 /**
+ * Bind a well-known persistent endpoint under this node's DEVICE id rather
+ * than the sovereign identity it publishes. Returns NULL on failure.
+ *
+ * A NEW SYMBOL rather than a flag on `veil_bind_named`: this ABI is
+ * positional, and a caller built against the old signature that reaches a new
+ * library would read one argument past the end of what it passed.
+ *
+ * Bind this BESIDE the identity endpoint. A sibling device has no other name
+ * to address — an identity is shared by every device of one person — and
+ * nothing a contact holds changes.
+ */
+
+VeilApp *veil_bind_device_scoped(VeilHandle *handle,
+                                 const uint8_t *namespace_,
+                                 uintptr_t namespace_len,
+                                 const uint8_t *name,
+                                 uintptr_t name_len,
+                                 uint32_t endpoint_id,
+                                 char **err_out)
+;
+
+/**
  * Copy the bound `app_id` (32 bytes) into `out`.
  */
  int veil_app_get_app_id(const VeilApp *app, uint8_t *out) ;

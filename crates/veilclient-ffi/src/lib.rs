@@ -1146,6 +1146,7 @@ unsafe fn bind_internal(
     err_out: *mut *mut c_char,
     named: bool,
     capability: bool,
+    device_scoped: bool,
 ) -> *mut VeilApp {
     if unsafe { guard::ffi_prelude(err_out, "veil_bind") }.is_err() {
         return ptr::null_mut();
@@ -1179,6 +1180,8 @@ unsafe fn bind_internal(
         let client = bundle.client.lock().await;
         if capability {
             client.bind_capability(ns, nm, endpoint_id).await
+        } else if device_scoped {
+            client.bind_device_scoped(ns, nm, endpoint_id).await
         } else if named {
             client.bind_named(ns, nm, endpoint_id).await
         } else {
@@ -1239,6 +1242,7 @@ pub unsafe extern "C" fn veil_bind(
             err_out,
             false,
             false,
+            false,
         )
     }
 }
@@ -1266,6 +1270,7 @@ pub unsafe extern "C" fn veil_bind_named(
             err_out,
             true,
             false,
+            false,
         )
     }
 }
@@ -1291,6 +1296,43 @@ pub unsafe extern "C" fn veil_bind_capability(
             name_len,
             endpoint_id,
             err_out,
+            false,
+            true,
+            false,
+        )
+    }
+}
+
+/// Bind a well-known persistent endpoint under this node's DEVICE id rather
+/// than the sovereign identity it publishes. Returns NULL on failure.
+///
+/// A NEW SYMBOL rather than a flag on `veil_bind_named`: this ABI is
+/// positional, and a caller built against the old signature that reaches a new
+/// library would read one argument past the end of what it passed.
+///
+/// Bind this BESIDE the identity endpoint. A sibling device has no other name
+/// to address — an identity is shared by every device of one person — and
+/// nothing a contact holds changes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn veil_bind_device_scoped(
+    handle: *mut VeilHandle,
+    namespace: *const u8,
+    namespace_len: usize,
+    name: *const u8,
+    name_len: usize,
+    endpoint_id: u32,
+    err_out: *mut *mut c_char,
+) -> *mut VeilApp {
+    unsafe {
+        bind_internal(
+            handle,
+            namespace,
+            namespace_len,
+            name,
+            name_len,
+            endpoint_id,
+            err_out,
+            false,
             false,
             true,
         )

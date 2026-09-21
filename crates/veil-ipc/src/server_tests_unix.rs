@@ -2784,3 +2784,123 @@ async fn remote_stream_open_survives_the_teardown_guard_once_claimed() {
     let _ = shutdown_tx.send(true);
     let _ = sh.await;
 }
+
+// ── device-scoped bind: a sibling device has no other name to address ──────
+
+/// The identity a sovereign node publishes — what a CONTACT holds for it, and
+/// what `bind_node_id` is set to in production.
+fn sovereign_identity() -> [u8; 32] {
+    [0x02u8; 32]
+}
+
+/// A server whose two names DIFFER, which is the only shape these guards can
+/// see anything in: on a node with no sovereign document `bind_node_id` and
+/// `node_id` are the same value, so a test built on `make_server` would pass
+/// whichever id the handler picked.
+fn make_sovereign_server(
+    sock: PathBuf,
+) -> (IpcServer, watch::Sender<bool>, Arc<AppEndpointRegistry>) {
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let registry = Arc::new(AppEndpointRegistry::new());
+    let server = IpcServer::new(
+        IpcEndpoint::Unix(sock),
+        shutdown_rx,
+        Arc::clone(&registry),
+        node_id(),
+    )
+    .with_bind_node_id(sovereign_identity());
+    (server, shutdown_tx, registry)
+}
+
+async fn bind_and_read_app_id(
+    client: &mut UnixStream,
+    flags: u16,
+    endpoint_id: u32,
+) -> Result<[u8; 32], AppBindErrPayload> {
+    let bind = AppBindPayload {
+        endpoint_id,
+        flags,
+        namespace: b"veil.chat".to_vec(),
+        name: b"main".to_vec(),
+    };
+    send_ipc_frame(client, LocalAppMsg::AppBind as u16, &bind.encode()).await;
+    let (hdr, body) = recv_ipc_frame(client).await;
+    if hdr.msg_type == LocalAppMsg::AppBindOk as u16 {
+        Ok(AppBindOkPayload::decode(&body).unwrap().app_id)
+    } else {
+        Err(AppBindErrPayload::decode(&body).unwrap())
+    }
+}
+
+/// DEVICE_SCOPED derives the endpoint address from the DEVICE, and the
+/// ordinary named bind on the very same server still derives it from the
+/// identity.
+///
+/// The control is the point: without it this passes for a handler that ignores
+/// `bind_node_id` altogether and derives everything from the device, which
+/// would silently move the address every contact already holds.
+#[tokio::test]
+async fn device_scoped_bind_answers_to_the_device_and_named_still_to_the_identity() {
+    let sock = temp_socket_path();
+    let (mut server, shutdown_tx, _) = make_sovereign_server(sock.clone());
+    let sh = tokio::spawn(async move { server.run().await });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let mut client = connect_and_hello(&sock).await;
+    let device_app_id = bind_and_read_app_id(
+        &mut client,
+        veil_proto::ipc::ipc_bind_flags::DEVICE_SCOPED,
+        1,
+    )
+    .await
+    .expect("device-scoped bind refused");
+    let identity_app_id = bind_and_read_app_id(&mut client, 0, 2)
+        .await
+        .expect("named bind refused");
+
+    assert_eq!(
+        device_app_id,
+        veil_app::address::app_id(&node_id(), "veil.chat", "main"),
+        "DEVICE_SCOPED must derive from the device id — a sibling can address \
+         nothing else, because an identity is shared by every device of one person",
+    );
+    assert_eq!(
+        identity_app_id,
+        veil_app::address::app_id(&sovereign_identity(), "veil.chat", "main"),
+        "CONTROL: the ordinary named bind must still answer to the identity — \
+         this flag is additive and must not move the address contacts hold",
+    );
+    assert_ne!(
+        device_app_id, identity_app_id,
+        "the two inboxes must be distinct or the flag bought nothing",
+    );
+
+    drop(client);
+    let _ = shutdown_tx.send(true);
+    let _ = sh.await;
+}
+
+/// CAPABILITY derives from no node id at all, so "which of my two names" has no
+/// answer. Refused rather than quietly handed the capability address.
+#[tokio::test]
+async fn device_scoped_with_capability_is_refused() {
+    let sock = temp_socket_path();
+    let (mut server, shutdown_tx, _) = make_sovereign_server(sock.clone());
+    let sh = tokio::spawn(async move { server.run().await });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let mut client = connect_and_hello(&sock).await;
+    let err = bind_and_read_app_id(
+        &mut client,
+        veil_proto::ipc::ipc_bind_flags::DEVICE_SCOPED
+            | veil_proto::ipc::ipc_bind_flags::CAPABILITY,
+        1,
+    )
+    .await
+    .expect_err("a device-scoped capability alias is not a thing this node can produce");
+    assert_eq!(err.error_code, ipc_bind_err::INVALID_REQUEST);
+
+    drop(client);
+    let _ = shutdown_tx.send(true);
+    let _ = sh.await;
+}
