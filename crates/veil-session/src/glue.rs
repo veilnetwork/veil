@@ -113,6 +113,21 @@ impl veil_types::SessionInstanceLookup for SessionInstanceDirectory {
             // the peer's registry happened to list.
             .map(|v| v.active_instance_id)
     }
+
+    fn session_pairing(&self, peer_node_id: &[u8; 32]) -> Option<veil_types::SessionPairing> {
+        self.inner
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get_by_peer_id(&veil_cfg::NodeId::from(*peer_node_id))
+            .and_then(|e| e.validated_sovereign_identity.as_ref())
+            // Both from the SAME proof, so they cannot disagree: taking the
+            // identity from one place and the device from another is how the
+            // two halves of one formula ended up on different inputs before.
+            .map(|v| veil_types::SessionPairing {
+                identity: v.node_id,
+                instance: v.active_instance_id,
+            })
+    }
 }
 
 #[cfg(test)]
