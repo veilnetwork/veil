@@ -399,18 +399,36 @@ async fn try_ratchet_seal(
     // session's validated identity proof names the device it actually ends
     // at, so when the send is session-backed that instance — not the cache's
     // tie accident — is the authoritative pairing.
-    let session_instance = ctx
+    //
+    // AND UNDER WHICH NAME IS ITS CERTIFICATE PUBLISHED? Not necessarily the
+    // one this send addressed. A certificate lives at
+    // `dht_key(identity, instance_id)`, while a send names a transport
+    // destination — an identity for a contact, a DEVICE for a sibling or for
+    // any peer we reach by one of its devices. The two coincide on a
+    // single-device peer, which is why keying the lookup on the destination
+    // went unnoticed, and diverge on exactly the multi-device case. The same
+    // correction is already recorded in `offline_seal.rs` for our own
+    // devices: asking under a device id computes a key nobody ever wrote to.
+    //
+    // The session's proof carries BOTH names, from one validation, so they
+    // cannot disagree.
+    let pairing = ctx
         .session_instance_lookup
         .as_deref()
-        .and_then(|lookup| lookup.session_instance(dst_node_id));
+        .and_then(|lookup| lookup.session_pairing(dst_node_id));
+    let session_instance = pairing.map(|p| p.instance).or_else(|| {
+        ctx.session_instance_lookup
+            .as_deref()
+            .and_then(|lookup| lookup.session_instance(dst_node_id))
+    });
+    // What a CERTIFICATE is looked up under. The destination remains what the
+    // frame is routed to; only the key changes, and only when a session has
+    // proved an identity to change it to.
+    let cert_key = pairing.map_or(*dst_node_id, |p| p.identity);
     let paired = match session_instance {
-        Some(instance) => match resolver.resolve_cert_for_instance_cached(*dst_node_id, instance) {
+        Some(instance) => match resolver.resolve_cert_for_instance_cached(cert_key, instance) {
             Some(c) => Some(c),
-            None => {
-                resolver
-                    .resolve_cert_for_instance(*dst_node_id, instance)
-                    .await
-            }
+            None => resolver.resolve_cert_for_instance(cert_key, instance).await,
         },
         // No live session, or a legacy handshake that proved no instance:
         // nothing named a device, so the singular resolve below stays the
@@ -430,9 +448,9 @@ async fn try_ratchet_seal(
     // lose its sender proof.
     let cert = match paired {
         Some(c) => c,
-        None => match resolver.resolve_cert_cached(*dst_node_id) {
+        None => match resolver.resolve_cert_cached(cert_key) {
             Some(c) => c,
-            None => resolver.resolve_cert(*dst_node_id).await?,
+            None => resolver.resolve_cert(cert_key).await?,
         },
     };
 
@@ -1604,6 +1622,25 @@ mod ratchet_send_tests {
         }
     }
 
+    /// A session to a DEVICE whose handshake proved it belongs to `PEER`.
+    ///
+    /// The shape a multi-device peer actually produces, and the one a
+    /// single-device fixture cannot show: the transport destination and the
+    /// name the certificate is published under are DIFFERENT values.
+    struct PairedDevice {
+        device: [u8; 32],
+        pairing: veil_types::SessionPairing,
+    }
+
+    impl veil_types::SessionInstanceLookup for PairedDevice {
+        fn session_instance(&self, peer: &[u8; 32]) -> Option<[u8; 16]> {
+            (*peer == self.device).then_some(self.pairing.instance)
+        }
+        fn session_pairing(&self, peer: &[u8; 32]) -> Option<veil_types::SessionPairing> {
+            (*peer == self.device).then_some(self.pairing)
+        }
+    }
+
     /// A resolver holding one verified row per device of a peer — the steady
     /// state for a multi-device family after the fan-out paths have walked it.
     struct FamilyCerts(Vec<veil_types::VerifiedPeerCert>);
@@ -1638,6 +1675,8 @@ mod ratchet_send_tests {
     }
 
     struct Fixture {
+        /// When set, the session lookup proves that device belongs to `PEER`.
+        pairing_device: Option<[u8; 32]>,
         outbox: Arc<Outbox>,
         route_cache: Arc<RwLock<veil_routing::RouteCache>>,
         peer_mlkem: Arc<std::sync::RwLock<veil_e2e::PeerMlKemCache>>,
@@ -1705,6 +1744,7 @@ mod ratchet_send_tests {
             .or_default()
             .remember(MY_INSTANCE, my_ring.current_ratchet_pk(), u64::MAX);
         Fixture {
+            pairing_device: None,
             outbox: Arc::new(Outbox {
                 live: live_peers,
                 sent: Mutex::new(Vec::new()),
@@ -1775,13 +1815,30 @@ mod ratchet_send_tests {
                 // Always present, answering `self.session_instance`: `None`
                 // through it must behave exactly like no lookup at all, and
                 // every pre-existing test exercises that leg for free.
-                session_instance_lookup: Some(Arc::new(PinnedInstance(self.session_instance))),
+                session_instance_lookup: match self.pairing_device {
+                    Some(device) => Some(Arc::new(PairedDevice {
+                        device,
+                        pairing: veil_types::SessionPairing {
+                            identity: PEER,
+                            instance: PEER_INSTANCE,
+                        },
+                    })),
+                    None => Some(Arc::new(PinnedInstance(self.session_instance))),
+                },
             }
         }
 
         fn taken(&self) -> Vec<([u8; 32], Vec<u8>)> {
             std::mem::take(&mut lock!(self.outbox.sent))
         }
+    }
+
+    /// [`payload`] with the destination spelled out — the multi-device case
+    /// needs a destination that is NOT the name certificates live under.
+    fn payload_to(dst: [u8; 32], data: &[u8]) -> Vec<u8> {
+        let mut p = AppIpcSendPayload::decode(&payload(false, data)).expect("payload");
+        p.dst_node_id = dst;
+        p.encode()
     }
 
     fn payload(anonymous: bool, data: &[u8]) -> Vec<u8> {
@@ -1812,6 +1869,90 @@ mod ratchet_send_tests {
         Box::leak(Box::new(b));
         let (_r, w) = a.into_split();
         veil_local_transport::LocalWriteHalf::Unix(w)
+    }
+
+    /// A SEND ADDRESSED TO A DEVICE STILL FINDS ITS CERTIFICATE.
+    ///
+    /// A certificate lives at `dht_key(identity, instance_id)`; a send names a
+    /// TRANSPORT destination, which for anything reached by one of its devices
+    /// is that device. The two coincide on a single-device peer — which is why
+    /// keying the cert lookup on the destination went unnoticed for so long —
+    /// and diverge on exactly the multi-device case. Asking under a device id
+    /// computes a key nobody ever wrote to, and the same correction is already
+    /// recorded in `offline_seal.rs` for our own devices; this is the live
+    /// path's half of it.
+    ///
+    /// Positive assertion, not an absence: the peer OPENS what came out.
+    #[tokio::test]
+    async fn a_send_addressed_to_a_device_seals_under_the_identity() {
+        const PEER_DEVICE: [u8; 32] = [0xB7u8; 32];
+        let mut fx = fixture(vec![PEER_DEVICE, RELAY]);
+        fx.pairing_device = Some(PEER_DEVICE);
+
+        let mut wh = sink().await;
+        handle_ipc_send(
+            &mut SendReply::Inline(&mut wh),
+            &payload_to(PEER_DEVICE, b"addressed to a device"),
+            &fx.ctx(true),
+        )
+        .await
+        .expect("send");
+
+        let sent = fx.taken();
+        assert_eq!(sent.len(), 1);
+        let (peer, frame) = &sent[0];
+        assert_eq!(
+            peer, &PEER_DEVICE,
+            "the DEVICE is still what the frame is routed to — only the \
+             certificate lookup moves to the identity",
+        );
+        let hdr = veil_proto::codec::decode_header(frame).expect("header");
+        assert_eq!(
+            hdr.msg_type,
+            veil_proto::family::AppMsg::AppSendSealed as u16,
+            "with the cert resolved under the device id there is no cert at \
+             all, and the frame leaves unsealed — losing its sender proof",
+        );
+        let body = veil_proto::app::AppSendPayload::decode(&frame[veil_proto::HEADER_SIZE..])
+            .expect("body");
+        let opened = fx
+            .peer
+            .open_payload(&ME, &body.data, veil_util::unix_secs_now_u64())
+            .expect("the peer opens it");
+        assert_eq!(opened.plaintext, b"addressed to a device");
+        assert!(opened.authenticated);
+    }
+
+    /// CONTROL: with no session to prove an identity, the destination is still
+    /// what a certificate is looked up under.
+    ///
+    /// Without this the guard above also passes for an implementation that
+    /// ignores the destination entirely — and a peer we have never paired with
+    /// would then be sealed to whatever the last pairing happened to name.
+    #[tokio::test]
+    async fn without_a_pairing_the_destination_still_keys_the_lookup() {
+        let fx = fixture(vec![PEER, RELAY]);
+        assert!(
+            fx.pairing_device.is_none(),
+            "vacuity guard: this fixture must offer no pairing, or the \
+             control proves nothing",
+        );
+        let mut wh = sink().await;
+        handle_ipc_send(
+            &mut SendReply::Inline(&mut wh),
+            &payload(false, b"no pairing here"),
+            &fx.ctx(true),
+        )
+        .await
+        .expect("send");
+        let sent = fx.taken();
+        assert_eq!(sent.len(), 1);
+        let hdr = veil_proto::codec::decode_header(&sent[0].1).expect("header");
+        assert_eq!(
+            hdr.msg_type,
+            veil_proto::family::AppMsg::AppSendSealed as u16,
+            "the ordinary single-name peer must keep sealing exactly as before",
+        );
     }
 
     /// The blocker this slice existed for: a message to an ONLINE peer used to
