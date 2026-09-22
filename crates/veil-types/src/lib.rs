@@ -304,6 +304,37 @@ pub struct VerifiedPeerCert {
 /// identity-addressed behaviour for both.
 pub trait SessionInstanceLookup: Send + Sync {
     fn session_instance(&self, peer_node_id: &[u8; 32]) -> Option<[u8; 16]>;
+
+    /// BOTH names the handshake proved for the far end of this session: the
+    /// IDENTITY it belongs to and the DEVICE it terminates at.
+    ///
+    /// A send names a transport destination, which may be either — a contact
+    /// is published as an identity, a sibling is addressed as a device. A
+    /// CERTIFICATE, though, is only ever published under the identity, at
+    /// `dht_key(identity, instance_id)`. Resolving one under whatever the send
+    /// happened to name therefore computes a key nobody ever wrote to the
+    /// moment the two differ, which is exactly the multi-device case. The same
+    /// correction was already made for our own devices in the offline seal;
+    /// this is the live path's half of it.
+    ///
+    /// `None` when no session exists, or when one exists from a handshake that
+    /// proved no identity — a legacy peer. Callers then key on what the send
+    /// named, which is today's behaviour and exact for a single-device peer,
+    /// where the identity and the device are the same value.
+    fn session_pairing(&self, _peer_node_id: &[u8; 32]) -> Option<SessionPairing> {
+        None
+    }
+}
+
+/// The identity/device pair a live session proved. See
+/// [`SessionInstanceLookup::session_pairing`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SessionPairing {
+    /// The identity the far end proved it belongs to — what a certificate is
+    /// published under.
+    pub identity: [u8; 32],
+    /// Which of that identity's devices this session ends at.
+    pub instance: [u8; 16],
 }
 
 /// Reactively resolve a node's relay X25519 KEM public key by `node_id` over
