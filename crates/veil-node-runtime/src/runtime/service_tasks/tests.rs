@@ -3292,3 +3292,106 @@ fn epic481_4_dedup_drops_all_when_every_pubkey_known() {
         "every pubkey already known → nothing to add"
     );
 }
+
+/// Our end of a conversation store, holding one conversation with each of
+/// `peers` — what sealing a first message to each leaves behind.
+fn ratchet_with_conversations(peers: &[[u8; 32]]) -> veil_e2e::RatchetRuntime {
+    let seed_of = |tag: u8| [tag; veil_e2e::DK_SEED_BYTES];
+    let ring_of = |tag: u8| {
+        let (ek, _) = veil_e2e::keypair_from_dk_seed(&seed_of(tag)).expect("keypair");
+        Arc::new(veil_e2e::MlKemSeedRing::new(0, seed_of(tag), ek))
+    };
+    let us = veil_e2e::RatchetRuntime {
+        store: Arc::new(veil_e2e::RatchetStore::new()),
+        seed_ring: Arc::new(std::sync::RwLock::new(ring_of(0x01))),
+        local_node_id: Arc::new(std::sync::RwLock::new([0x01; 32])),
+        local_instance_id: Arc::new(std::sync::RwLock::new(Some([0x01; 16]))),
+        peer_ratchet_keys: Arc::new(std::sync::RwLock::new(veil_e2e::PeerRatchetKeyCache::new())),
+    };
+    for (i, peer) in peers.iter().enumerate() {
+        let ring = ring_of(0x40 + i as u8);
+        let (ek, pk) = (ring.current_ek(), ring.current_ratchet_pk());
+        us.seal_for(
+            veil_e2e::PeerRatchetKeys {
+                node_id: peer,
+                instance_id: &[0x40 + i as u8; 16],
+                mlkem_ek: &ek,
+                ratchet_pk: &pk,
+                authorized_until_unix: u64::MAX,
+            },
+            b"first",
+            veil_util::unix_secs_now_u64(),
+        )
+        .expect("seal");
+    }
+    us
+}
+
+/// Decision 3a, receiving end: a verified relayed "cannot open" reply drops
+/// our conversation under EVERY name the replier goes by — we sealed to its
+/// identity or to the one device that signed, and the reply cannot say which —
+/// and the cached certificate rows under both, and nobody else's.
+#[test]
+fn a_signed_unopenable_reply_forgets_the_replier_under_both_names_and_no_one_else() {
+    let (identity, device, bystander) = ([0x1D; 32], [0xDE; 32], [0xBE; 32]);
+    let ratchet = ratchet_with_conversations(&[identity, device, bystander]);
+    let mut dispatcher = veil_dispatcher::make_test_dispatcher(veil_cfg::NodeRole::Core);
+    dispatcher.crypto = Arc::new(veil_dispatcher::CryptoContext {
+        ratchet: Some(ratchet.clone()),
+        ..(*dispatcher.crypto).clone()
+    });
+    let invalidated = Arc::new(std::sync::Mutex::new(Vec::new()));
+    {
+        let invalidated = Arc::clone(&invalidated);
+        *dispatcher.peer_cert_invalidate.lock().unwrap() =
+            Some(Arc::new(move |peer: &[u8; 32]| {
+                invalidated.lock().unwrap().push(*peer)
+            }));
+    }
+    for peer in [identity, device, bystander] {
+        assert!(
+            ratchet.peer_entry_authenticated(&peer).is_some(),
+            "test premise: a conversation with {:02x} is held",
+            peer[0],
+        );
+    }
+
+    let logger = veil_observability::NodeLogger::new_noop();
+    let dropped = forget_after_signed_unopenable(&dispatcher, &logger, identity, device);
+
+    assert_eq!(dropped, 2);
+    assert!(ratchet.peer_entry_authenticated(&identity).is_none());
+    assert!(ratchet.peer_entry_authenticated(&device).is_none());
+    assert!(
+        ratchet.peer_entry_authenticated(&bystander).is_some(),
+        "a reply from one peer must not cost anyone else their conversation",
+    );
+    assert_eq!(*invalidated.lock().unwrap(), vec![identity, device]);
+}
+
+/// A replier whose signing device key IS its identity (a single-device
+/// identity) is one name, forgotten and invalidated once.
+#[test]
+fn a_single_device_replier_is_forgotten_once() {
+    let identity = [0x1D; 32];
+    let ratchet = ratchet_with_conversations(&[identity]);
+    let mut dispatcher = veil_dispatcher::make_test_dispatcher(veil_cfg::NodeRole::Core);
+    dispatcher.crypto = Arc::new(veil_dispatcher::CryptoContext {
+        ratchet: Some(ratchet.clone()),
+        ..(*dispatcher.crypto).clone()
+    });
+    let invalidated = Arc::new(std::sync::Mutex::new(Vec::new()));
+    {
+        let invalidated = Arc::clone(&invalidated);
+        *dispatcher.peer_cert_invalidate.lock().unwrap() =
+            Some(Arc::new(move |peer: &[u8; 32]| {
+                invalidated.lock().unwrap().push(*peer)
+            }));
+    }
+    let logger = veil_observability::NodeLogger::new_noop();
+    assert_eq!(
+        forget_after_signed_unopenable(&dispatcher, &logger, identity, identity),
+        1
+    );
+    assert_eq!(*invalidated.lock().unwrap(), vec![identity]);
+}

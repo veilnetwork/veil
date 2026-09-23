@@ -296,6 +296,13 @@ pub struct CryptoContext {
 /// resolver's crate.
 pub type PeerCertInvalidateFn = Arc<dyn Fn(&[u8; 32]) + Send + Sync>;
 
+/// Signs a relayed "cannot open" reply to the peer named by the argument, or
+/// `None` when this node has no identity to sign with (or its own limit says
+/// not now). Installed by the runtime into
+/// [`FrameDispatcher::unopenable_signer`].
+pub type UnopenableSignerFn =
+    Arc<dyn Fn(&[u8; 32]) -> Option<veil_proto::AuthAppDeliver> + Send + Sync>;
+
 // ── AbuseContext ──────────────────────────────────────────────────────────────
 
 /// Abuse-resistance state shared by all dispatcher clones.
@@ -893,6 +900,15 @@ pub struct FrameDispatcher {
     /// before it re-keyed keep arriving for the old conversation, and answering
     /// each would make it drop the NEW conversation it has only just begun.
     pub unopenable_replied: Arc<Mutex<std::collections::HashMap<[u8; 32], std::time::Instant>>>,
+
+    /// Signs the relayed form of that reply. A frame that arrived through a
+    /// relay has no session to name its sender, so the reply to it travels
+    /// back as a signed envelope instead of a bare frame (see
+    /// [`veil_proto::RATCHET_UNOPENABLE_APP_ID`]). The dispatcher holds no
+    /// identity key, so the runtime installs this after construction; `None`
+    /// means a relayed frame that does not open is answered with nothing,
+    /// which is how it was before.
+    pub unopenable_signer: Arc<Mutex<Option<UnopenableSignerFn>>>,
 
     // ── Routing gossip ─────────────────────────────────────────
     /// Gossip dedup set — shared across all concurrent sessions.
@@ -2001,6 +2017,7 @@ pub fn make_test_dispatcher(role: NodeRole) -> FrameDispatcher {
         session_registry: None,
         peer_cert_invalidate: Arc::new(Mutex::new(None)),
         unopenable_replied: Arc::new(Mutex::new(std::collections::HashMap::new())),
+        unopenable_signer: Arc::new(Mutex::new(None)),
         route_seen_set: Arc::new(Mutex::new(RouteSeenSet::new(
             std::time::Duration::from_secs(60),
             4096,
@@ -2868,6 +2885,7 @@ mod tests {
             session_registry: None, // test dispatcher — sovereign routing bypassed
             peer_cert_invalidate: Arc::new(Mutex::new(None)),
             unopenable_replied: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            unopenable_signer: Arc::new(Mutex::new(None)),
             route_seen_set: Arc::new(Mutex::new(RouteSeenSet::new(
                 std::time::Duration::from_secs(60),
                 4096,
@@ -4302,6 +4320,7 @@ mod tests {
             &mut src_app,
             &mut app,
             &mut eid,
+            veil_cfg::NodeId::from([0u8; 32]),
         );
         assert_eq!(
             opened.map(|d| d.payload).as_deref(),
@@ -4321,6 +4340,7 @@ mod tests {
                 &mut src_app,
                 &mut app,
                 &mut eid,
+                veil_cfg::NodeId::from([0u8; 32]),
             )
             .is_none(),
             "test premise: the message is not addressed to the current key"

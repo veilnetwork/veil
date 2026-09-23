@@ -166,6 +166,17 @@ impl NodeRuntime {
                 resolver.invalidate_peer(peer)
             }));
         }
+        // The relayed half of the same feedback: a frame that came through a
+        // relay and does not open is answered with a SIGNED reply, and the
+        // dispatcher has no key of its own to sign it with.
+        *self
+            .dispatcher
+            .unopenable_signer
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) =
+            Some(super::offline_seal::relayed_unopenable_signer(
+                self.identity.sovereign_identity.clone(),
+            ));
         let relay_key_resolver: Arc<dyn veil_types::RelayKeyResolver> =
             dht_key_resolver as Arc<dyn veil_types::RelayKeyResolver>;
         // Authenticated anonymous (onion/rendezvous) sender for the IPC

@@ -998,6 +998,67 @@ impl FrameDispatcher {
         false
     }
 
+    /// Answer a relayed ratchet frame that did not open, back through the
+    /// relay that brought it.
+    ///
+    /// The reply is a signed [`veil_proto::AuthAppDeliver`] to
+    /// [`veil_proto::RATCHET_UNOPENABLE_APP_ID`]: a relay names nobody, so an
+    /// unsigned reply would let anyone keep any pair re-keying. `via` is the
+    /// session the frame came in on, which just carried traffic from the
+    /// sender's side and is the likeliest way back; it forwards the reply
+    /// like any other envelope. Best-effort: no signer, no identity or no
+    /// session to `via` means no reply, the state before this existed.
+    pub(crate) fn send_relayed_unopenable(&self, peer: [u8; 32], via: NodeId) {
+        let signer = self
+            .unopenable_signer
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone();
+        let Some(signer) = signer else {
+            return;
+        };
+        let Some(auth) = signer(&peer) else {
+            return;
+        };
+        let frame = relayed_unopenable_frame(self.local_node_id, peer, *via.as_bytes(), &auth);
+        let sent = self.session_tx_registry.as_ref().is_some_and(|reg| {
+            rlock!(reg).send_to(
+                via.as_bytes(),
+                veil_proto::header::priority::INTERACTIVE,
+                frame,
+            )
+        });
+        self.logger.info(
+            "delivery.ratchet.unopenable_reply",
+            format!(
+                "told {} it cannot reach us under a conversation we do not hold, \
+                 signed, via {} (sent: {sent})",
+                veil_util::bytes_to_hex(&peer[..4]),
+                veil_util::bytes_to_hex(&via.as_bytes()[..4]),
+            ),
+        );
+    }
+
+    /// Hand a relayed "cannot open" reply to the runtime verify task. Only one
+    /// whose SIGNED addressee is also the reserved one: the outer `app_id` is
+    /// the sender's claim, and this must not become a side door delivering
+    /// other signed messages to apps.
+    fn enqueue_relayed_unopenable(&self, payload: &[u8]) {
+        match veil_proto::AuthAppDeliver::decode(payload) {
+            Ok(auth) if auth.app_id == veil_proto::RATCHET_UNOPENABLE_APP_ID => {
+                self.enqueue_auth_deliver(crate::AuthDeliverInbound::Full(Box::new(auth)));
+            }
+            Ok(_) => self.logger.info(
+                "delivery.ratchet.unopenable_reply_mislabelled",
+                "relayed unopenable reply signed for another addressee; dropped",
+            ),
+            Err(e) => self.logger.info(
+                "delivery.ratchet.unopenable_reply_bad",
+                format!("relayed unopenable reply does not decode: {e}"),
+            ),
+        }
+    }
+
     pub fn relay_forward(
         &self,
         payload: ForwardPayload,
@@ -1452,6 +1513,13 @@ impl FrameDispatcher {
             }
             return;
         }
+        // A signed "cannot open" reply is for the ratchet, never for an app.
+        // Only the runtime can check its signature (it needs the replier's
+        // identity document), so it goes to the verify task and nowhere else.
+        if envelope.app_id == veil_proto::RATCHET_UNOPENABLE_APP_ID {
+            self.enqueue_relayed_unopenable(&envelope.payload);
+            return;
+        }
         let first_byte = envelope.payload.first().copied();
 
         // Every decapsulation seed this envelope could legitimately be sealed
@@ -1500,6 +1568,7 @@ impl FrameDispatcher {
             &mut deliver_src_app_id,
             &mut deliver_app_id,
             &mut deliver_endpoint_id,
+            peer_id,
         ) else {
             return; // decrypt failed — metric already incremented.
         };
@@ -1666,6 +1735,9 @@ impl FrameDispatcher {
         deliver_src_app_id: &mut [u8; 32],
         deliver_app_id: &mut [u8; 32],
         deliver_endpoint_id: &mut u32,
+        // The session this envelope came in on — the relay that brought it,
+        // and so the way back to its sender when it will not open.
+        arrived_from: NodeId,
     ) -> Option<DecryptedForward> {
         // RATCHET_E2E_MARKER (0xE5): the hybrid ratchet — the only inbound
         // payload that carries its own proof of who wrote it. Tested first
@@ -1735,6 +1807,20 @@ impl FrameDispatcher {
                         .debug("delivery.ratchet.open_failed", format!("{e}"));
                     if let Some(m) = &self.metrics {
                         m.inc_decrypt_failures();
+                    }
+                    // The same three failures that earn a direct-session
+                    // sender `AppSendUnopenable` (see `dispatch_app`). A
+                    // relayed sender used to hear nothing at all, and kept
+                    // sealing into a conversation this side no longer holds
+                    // (owner's decision 3a, 2026-09-23).
+                    if matches!(
+                        e,
+                        veil_e2e::RatchetSpliceError::WedgedConversationDropped
+                            | veil_e2e::RatchetSpliceError::NotForThisDevice
+                            | veil_e2e::RatchetSpliceError::NoSession
+                    ) && self.unopenable_reply_due(envelope.sender_node_id)
+                    {
+                        self.send_relayed_unopenable(envelope.sender_node_id, arrived_from);
                     }
                     return None;
                 }
@@ -2175,6 +2261,44 @@ impl FrameDispatcher {
         }
         false
     }
+}
+
+/// The Forward frame carrying a signed "cannot open" reply to `peer`, handed
+/// to `next_hop` for relaying. An ordinary unsealed envelope: the signature
+/// inside is the whole of its authenticity, and the reserved `app_id` outside
+/// is only what lets the recipient route it without opening anything.
+pub(crate) fn relayed_unopenable_frame(
+    local_node_id: [u8; 32],
+    peer: [u8; 32],
+    next_hop: [u8; 32],
+    auth: &veil_proto::AuthAppDeliver,
+) -> Vec<u8> {
+    use rand_core::RngCore;
+    let mut content_id = [0u8; 32];
+    rand_core::OsRng.fill_bytes(&mut content_id);
+    let body = ForwardPayload {
+        next_hop_node_id: next_hop,
+        envelope: DeliveryEnvelope {
+            recipient: veil_proto::recipient::Recipient::any(peer),
+            sender_node_id: local_node_id,
+            src_app_id: [0u8; 32],
+            app_id: veil_proto::RATCHET_UNOPENABLE_APP_ID,
+            endpoint_id: 0,
+            content_id,
+            created_at: veil_util::unix_secs_now_u64(),
+            ttl_secs: 30,
+            payload: auth.encode(),
+            trace_id: 0,
+            require_ack: false,
+        },
+        relay_hops: 0,
+        delivery_attempt: None,
+        traffic_class: None,
+    }
+    .encode();
+    let mut hdr = FrameHeader::new(FrameFamily::Delivery as u8, DeliveryMsg::Forward as u16);
+    hdr.body_len = body.len() as u32;
+    veil_proto::codec::encode_frame(&hdr, &body)
 }
 
 #[cfg(test)]
@@ -4166,6 +4290,7 @@ mod ratchet_terminal_tests {
                 &mut sa,
                 &mut a,
                 &mut e,
+                NodeId::from([0u8; 32]),
             )
         };
 
@@ -4411,5 +4536,135 @@ mod ratchet_terminal_tests {
         let (hdr, body) = forward_frame([0x0Bu8; 32], b"plain".to_vec());
         disp.dispatch(&hdr, &body, NodeId::from(RELAY));
         assert_eq!(take(&mut rx).expect("delivered").2, b"plain");
+    }
+
+    /// What a test signer hands back: recognisable, and not a real signature —
+    /// the dispatcher only carries it, the runtime is what verifies.
+    fn fake_reply(peer: [u8; 32]) -> veil_proto::AuthAppDeliver {
+        veil_proto::AuthAppDeliver {
+            version: veil_proto::AuthAppDeliver::VERSION,
+            sender_node_id: BOB,
+            sig_key_idx: 0,
+            timestamp: 1_700_000_000,
+            nonce: 0x5151,
+            dst_node_id: peer,
+            app_id: veil_proto::RATCHET_UNOPENABLE_APP_ID,
+            endpoint_id: 0,
+            data: Vec::new(),
+            reply_blocks: Vec::new(),
+            signature: vec![0x51; 64],
+        }
+    }
+
+    /// A bare ratchet frame from Alice for a conversation Bob does not hold.
+    fn frame_for_no_conversation(bob: &Party) -> Vec<u8> {
+        // marker ‖ version ‖ kind=FRAME ‖ sender_instance ‖ OUR instance ‖ body
+        let mut sealed = vec![veil_proto::RATCHET_E2E_MARKER, 1, 1];
+        sealed.extend_from_slice(&[0xA1; 16]);
+        sealed.extend_from_slice(&bob.instance_id);
+        sealed.extend_from_slice(&[0x5A; 64]);
+        sealed
+    }
+
+    /// Decision 3a: a relayed sender used to hear NOTHING when its frame did
+    /// not open, so it kept sealing into a conversation Bob no longer held.
+    /// Now Bob answers — signed, since a relay names nobody — back through
+    /// the relay the frame came in on, and once per interval per peer.
+    #[test]
+    fn a_relayed_frame_for_a_conversation_we_do_not_hold_is_answered_signed_through_its_relay() {
+        use veil_proto::delivery::ForwardPayload;
+        use veil_session::SessionTxRegistry;
+
+        let bob = party(BOB, 0xB1);
+        let (mut disp, _handle, mut rx) = dispatcher_for(&bob);
+        let reg = Arc::new(RwLock::new(SessionTxRegistry::new()));
+        let mut relay_rx = reg.write().unwrap().register(RELAY);
+        disp.session_tx_registry = Some(Arc::clone(&reg));
+        let asked = Arc::new(std::sync::Mutex::new(Vec::new()));
+        {
+            let asked = Arc::clone(&asked);
+            *disp.unopenable_signer.lock().unwrap() = Some(Arc::new(move |peer: &[u8; 32]| {
+                asked.lock().unwrap().push(*peer);
+                Some(fake_reply(*peer))
+            }));
+        }
+
+        let (hdr, body) = forward_frame([0x01u8; 32], frame_for_no_conversation(&bob));
+        disp.dispatch(&hdr, &body, NodeId::from(RELAY));
+
+        assert_eq!(
+            *asked.lock().unwrap(),
+            vec![ALICE],
+            "signed for the claimed sender"
+        );
+        let (_, bytes) = relay_rx
+            .try_recv()
+            .expect("the reply goes back through the relay");
+        let reply_hdr = veil_proto::codec::decode_header(&bytes).expect("header");
+        assert_eq!(reply_hdr.family, FrameFamily::Delivery as u8);
+        assert_eq!(reply_hdr.msg_type, DeliveryMsg::Forward as u16);
+        let fwd = ForwardPayload::decode(&bytes[veil_proto::header::HEADER_SIZE..])
+            .expect("a Forward the relay can pass on");
+        assert_eq!(fwd.next_hop_node_id, RELAY);
+        assert_eq!(fwd.envelope.recipient_node_id(), ALICE);
+        assert_eq!(fwd.envelope.sender_node_id, BOB);
+        assert_eq!(fwd.envelope.app_id, veil_proto::RATCHET_UNOPENABLE_APP_ID);
+        let carried =
+            veil_proto::AuthAppDeliver::decode(&fwd.envelope.payload).expect("the signed reply");
+        assert_eq!(carried.signature, fake_reply(ALICE).signature);
+        assert_eq!(carried.app_id, veil_proto::RATCHET_UNOPENABLE_APP_ID);
+        assert!(take(&mut rx).is_none(), "nothing opened, nothing delivered");
+
+        // The frames Alice had in flight keep coming; answering each would
+        // kill the conversation she has only just re-keyed.
+        let (hdr, body) = forward_frame([0x02u8; 32], frame_for_no_conversation(&bob));
+        disp.dispatch(&hdr, &body, NodeId::from(RELAY));
+        assert!(
+            relay_rx.try_recv().is_err(),
+            "one reply per interval per peer"
+        );
+        assert_eq!(asked.lock().unwrap().len(), 1);
+    }
+
+    /// The receiving half: a relayed reply is for the ratchet and only the
+    /// runtime can check its signature, so it goes to the verify task and
+    /// never to an app. The outer `app_id` is only the sender's claim — an
+    /// envelope that says "reply" around a message signed for some app must
+    /// not become a side door into that app.
+    #[test]
+    fn a_relayed_unopenable_reply_goes_to_the_verify_task_and_never_to_an_app() {
+        let bob = party(BOB, 0xB1);
+        let (disp, _handle, mut rx) = dispatcher_for(&bob);
+        let (tx, mut verify_rx) = tokio::sync::mpsc::channel(4);
+        *lock!(disp.auth_deliver_tx) = Some(tx);
+        let deliver = |auth: &veil_proto::AuthAppDeliver| {
+            // Built by the same function the replying side uses, from Alice.
+            let bytes = relayed_unopenable_frame(ALICE, BOB, BOB, auth);
+            let hdr = veil_proto::codec::decode_header(&bytes).expect("header");
+            disp.dispatch(
+                &hdr,
+                &bytes[veil_proto::header::HEADER_SIZE..],
+                NodeId::from(RELAY),
+            );
+        };
+
+        deliver(&fake_reply(BOB));
+        match verify_rx.try_recv() {
+            Ok(crate::AuthDeliverInbound::Full(auth)) => {
+                assert_eq!(auth.app_id, veil_proto::RATCHET_UNOPENABLE_APP_ID);
+                assert_eq!(auth.nonce, 0x5151);
+            }
+            other => panic!("the reply must reach the verify task, got {other:?}"),
+        }
+        assert!(take(&mut rx).is_none(), "a reply is never an app message");
+
+        let mut for_an_app = fake_reply(BOB);
+        for_an_app.app_id = APP;
+        deliver(&for_an_app);
+        assert!(
+            verify_rx.try_recv().is_err(),
+            "a message signed for an app does not ride the reply lane",
+        );
+        assert!(take(&mut rx).is_none());
     }
 }
