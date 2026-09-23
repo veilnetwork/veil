@@ -308,6 +308,11 @@ pub const CONVERSATION_BLOB_MAGIC: [u8; 4] = *b"VRC1";
 /// Blob version. `2` carries the last-used timestamp `1` had no room for;
 /// there is no shim, because nothing has shipped.
 const CONVERSATION_BLOB_V2: u8 = 2;
+/// `3` is `2` with the authorization stamp made mandatory and the peer's
+/// newest send time appended — the same prefix byte for byte, so anything that
+/// reads a field at a fixed offset reads it where it always did. Written from
+/// here on; `2` is still read.
+const CONVERSATION_BLOB_V3: u8 = 3;
 
 /// The most conversations one PEER may hold that this device has never
 /// answered.
@@ -445,6 +450,20 @@ struct Entry {
     /// must not be able to keep it alive, or the eviction order becomes
     /// something an attacker writes.
     last_used_at: u64,
+    /// The newest send time the PEER stamped on anything of theirs that opened
+    /// here — its clock, not ours ([`SENT_AT_LEN`]). `0` when nothing stamped
+    /// has opened yet. Persisted: a replayed prologue after our restart must
+    /// meet the same bar as before it.
+    ///
+    /// A prologue may unseat a proven conversation only if it was sealed after
+    /// this. A peer that lost its state and started over did so after the last
+    /// thing it sent us; a recording of how it started before did not. Both
+    /// sides of the comparison are the peer's own clock, so ours being wrong
+    /// changes nothing.
+    peer_sent_at: u64,
+    /// When a prologue was last allowed to try unseating this conversation
+    /// ([`DISPLACE_TRY_INTERVAL_SECS`]). In memory only.
+    last_displace_try: u64,
 }
 
 impl Entry {
@@ -494,7 +513,7 @@ impl Entry {
         let mut out =
             Vec::with_capacity(4 + 1 + 32 + 1 + 8 + 1 + 2 + prologue.len() + 4 + session.len());
         out.extend_from_slice(&CONVERSATION_BLOB_MAGIC);
-        out.push(CONVERSATION_BLOB_V2);
+        out.push(CONVERSATION_BLOB_V3);
         out.extend_from_slice(&self.peer_ik);
         // The byte stays where it was, and still says only "was there ever
         // evidence" — a build that predates the stamp reads this file and gets
@@ -523,6 +542,8 @@ impl Entry {
         // Add one by bumping to a V3 tag and teaching THIS reader to accept
         // both — never by extending V2 again (report20 V18-M11).
         out.extend_from_slice(&self.authenticated_until.to_be_bytes());
+        // V3: the same layout, then this. The next field goes in a V4.
+        out.extend_from_slice(&self.peer_sent_at.to_be_bytes());
         Zeroizing::new(out)
     }
 
@@ -543,7 +564,7 @@ impl Entry {
             return Err(RatchetSpliceError::Malformed("bad conversation blob magic"));
         }
         let version = take(1)?[0];
-        if version != CONVERSATION_BLOB_V2 {
+        if version != CONVERSATION_BLOB_V2 && version != CONVERSATION_BLOB_V3 {
             return Err(RatchetSpliceError::UnsupportedVersion(version));
         }
         let mut peer_ik = [0u8; 32];
@@ -581,15 +602,31 @@ impl Entry {
         // restored able to decrypt and NOT proven: the next certificate in
         // hand fills the stamp in, and until then a sender is shown as what it
         // can be shown to be. Demoting is the direction that cannot be wrong.
-        // Last use of the reader, so the borrow it holds on the cursor ends
-        // here and the trailing-bytes check below can read it.
+        // The last reads of the cursor, so the borrow the reader holds on it
+        // ends below and the trailing-bytes check can read it.
         let stamp = take(8).ok().map(<[u8; 8]>::try_from);
         let authenticated_until = match stamp {
-            None => 0,
+            // Only a V2 blob may end before it.
+            None if version == CONVERSATION_BLOB_V2 => 0,
+            None => return Err(RatchetSpliceError::Malformed("authorization stamp")),
             Some(Ok(bytes)) => u64::from_be_bytes(bytes),
             Some(Err(_)) => {
                 return Err(RatchetSpliceError::Malformed("authorization stamp"));
             }
+        };
+        let peer_sent_at = if version == CONVERSATION_BLOB_V3 {
+            u64::from_be_bytes(
+                take(8)?
+                    .try_into()
+                    .map_err(|_| RatchetSpliceError::Malformed("peer send time"))?,
+            )
+        } else {
+            // Written before the peer's clock was kept. Our last use is the
+            // nearest thing held: a prologue sealed before it cannot be a
+            // restart the conversation has not already outlived. Our clock
+            // against theirs, once, at the upgrade — and an error there is on
+            // the side of refusing, which leaves the old recovery in place.
+            last_used_at
         };
         if at != bytes.len() {
             return Err(RatchetSpliceError::Malformed(
@@ -606,6 +643,8 @@ impl Entry {
             // Never encoded: a restart forgives a wedged conversation anyway.
             frame_failures: 0,
             accepted_prologue: None,
+            peer_sent_at,
+            last_displace_try: 0,
         })
     }
 }
@@ -1172,6 +1211,45 @@ fn encode_payload(
 /// inside the ciphertext.
 pub const ACK_KEY_LEN: usize = 32;
 
+/// How much of the ACK key is the sender's clock: its first eight bytes are
+/// the unix second the message was sealed, big-endian; the other 24 are
+/// random, which is what keeps the key a secret.
+///
+/// The one place a send time can travel without a new wire version. The field
+/// is inside the ciphertext, so nobody but the sender can write it, and a
+/// build that predates the stamp reads 32 bytes of ACK key exactly as before —
+/// and writes 32 random ones, which [`sent_at`] tells apart by range.
+///
+/// What it is for is telling a peer that STARTED OVER from a replay of how it
+/// started before (owner's decision 2д, 2026-09-23): see `fresher` in [`open`].
+pub const SENT_AT_LEN: usize = 8;
+
+/// Before this, a stamp is not a stamp but random bytes from an older sender
+/// (2020-09-13).
+const SENT_AT_FLOOR: u64 = 1_600_000_000;
+
+/// How far ahead of our clock a peer's may run and still be believed. A week
+/// covers any clock a person leaves wrong; past it the value is read as the
+/// random bytes of an older sender, and an ordinary 64-bit random value lands
+/// inside `[floor, now + week]` with odds of about 1 in 10^11.
+const SENT_AT_MAX_AHEAD_SECS: u64 = 7 * 24 * 60 * 60;
+
+/// The sender's clock out of an opened plaintext, when it carries one.
+fn sent_at(plaintext: &[u8], now_unix: u64) -> Option<u64> {
+    let stamp = u64::from_be_bytes(plaintext.get(..SENT_AT_LEN)?.try_into().ok()?);
+    (SENT_AT_FLOOR..=now_unix.saturating_add(SENT_AT_MAX_AHEAD_SECS))
+        .contains(&stamp)
+        .then_some(stamp)
+}
+
+/// The least time between two attempts to let a new prologue unseat a proven
+/// conversation. Deciding costs a full key agreement — the send time is inside
+/// the ciphertext — and a prologue that merely NAMES the peer's published key
+/// gets that far, so the attempts are rationed per conversation. A peer that
+/// genuinely started over re-attaches its prologue to every message, so the
+/// ration costs it at most one message's delay.
+pub const DISPLACE_TRY_INTERVAL_SECS: u64 = 10;
+
 /// Seal one message for `peer`, opening the conversation if this is the first.
 ///
 /// The whole first return value is the `DeliveryEnvelope.payload` (or the
@@ -1200,7 +1278,8 @@ pub fn seal(
     now_unix: u64,
 ) -> Result<(Vec<u8>, [u8; ACK_KEY_LEN]), RatchetSpliceError> {
     let mut ack_key = [0u8; ACK_KEY_LEN];
-    OsRatchetRng.fill_bytes(&mut ack_key);
+    ack_key[..SENT_AT_LEN].copy_from_slice(&now_unix.to_be_bytes());
+    OsRatchetRng.fill_bytes(&mut ack_key[SENT_AT_LEN..]);
     let mut plaintext = Zeroizing::new(Vec::with_capacity(ACK_KEY_LEN + app_payload.len()));
     plaintext.extend_from_slice(&ack_key);
     plaintext.extend_from_slice(app_payload);
@@ -1353,6 +1432,9 @@ fn seal_inner(
                     last_used_at: now_unix,
                     frame_failures: 0,
                     accepted_prologue: None,
+                    // Nothing of theirs has opened on it yet.
+                    peer_sent_at: 0,
+                    last_displace_try: 0,
                 },
             );
             (KIND_PROLOGUE, blob)
@@ -1414,6 +1496,13 @@ pub fn is_ratchet_payload(payload: &[u8]) -> bool {
 /// result comes back unauthenticated and displaces nothing, and a later frame
 /// on the same conversation will settle it once the certificate has been
 /// resolved.
+/// Count one frame that would not open against `entry`, answering whether
+/// that makes the conversation wedged ([`WEDGED_AFTER_FRAME_FAILURES`]).
+fn count_frame_failure(entry: &mut Entry) -> bool {
+    entry.frame_failures = entry.frame_failures.saturating_add(1);
+    entry.frame_failures >= WEDGED_AFTER_FRAME_FAILURES
+}
+
 pub fn open(
     store: &RatchetStore,
     me: &RatchetIdentity,
@@ -1528,6 +1617,25 @@ fn open_inner(
     let displaceable =
         |e: &Entry| proves_authorship && (!e.ever_proven() || e.pending_prologue.is_some());
 
+    // And a third, which needs the prologue OPENED to decide (owner's decision
+    // 2д, 2026-09-23): a proven, answered conversation, when the prologue was
+    // sealed after anything of the peer's that ever opened on it. That is a
+    // peer that lost its state and started over — without this it could not
+    // get back in until three of its messages had failed against the old
+    // session and wedged it. A replay of how the peer started before was
+    // sealed before what followed it, so it stays out, as a stranger's does.
+    //
+    // Deciding costs the key agreement below, so only a ration of prologues
+    // get that far against a proven conversation; see `DISPLACE_TRY_INTERVAL_SECS`.
+    let fresher = |e: &Entry, sealed_at: Option<u64>| {
+        proves_authorship && sealed_at.is_some_and(|t| t > e.peer_sent_at)
+    };
+    // Set when the key agreement below runs ONLY to ask `fresher`. A prologue
+    // that then turns out not to be fresher was never going to be read: it is
+    // refused with what the held session said, not handed up as a message —
+    // or a replayed prologue would deliver its first message twice.
+    let mut only_to_ask_fresher: Option<RatchetSpliceError> = None;
+
     // An established conversation is never re-keyed by an inbound prologue.
     // Anyone can produce one — a prologue is sealed to our *published* key —
     // so honouring a second one would let any stranger who names the right two
@@ -1548,6 +1656,10 @@ fn open_inner(
                     entry.pending_prologue = None;
                     // Opening again — whatever streak there was is history.
                     entry.frame_failures = 0;
+                    // After the tag verified, like everything else here.
+                    if let Some(t) = sent_at(&plaintext, now_unix) {
+                        entry.peer_sent_at = entry.peer_sent_at.max(t);
+                    }
                     // Only here, after the tag verified. A frame that failed
                     // moved nothing else and must not move this either, or the
                     // eviction order becomes something an attacker writes by
@@ -1597,16 +1709,32 @@ fn open_inner(
                             .accepted_prologue
                             .as_deref()
                             .is_some_and(|p| blob.len() >= p.len() && &blob[..p.len()] == p);
-                    if !is_replay_of_our_own {
-                        entry.frame_failures = entry.frame_failures.saturating_add(1);
-                        if entry.frame_failures >= WEDGED_AFTER_FRAME_FAILURES {
+                    // Whether this prologue gets to ask `fresher`. The very
+                    // prologue this conversation was built from is known on
+                    // sight and is never fresher.
+                    let may_try = !displaceable(entry)
+                        && kind == KIND_PROLOGUE
+                        && !is_replay_of_our_own
+                        && proves_authorship
+                        && now_unix.saturating_sub(entry.last_displace_try)
+                            >= DISPLACE_TRY_INTERVAL_SECS;
+                    if may_try {
+                        // Not counted yet: a peer that started over is not
+                        // evidence of a wedge, and counting it first let its
+                        // own restart wedge-drop the conversation and lose the
+                        // message that would have let it in. Counted below if
+                        // the answer is no.
+                        entry.last_displace_try = now_unix;
+                        only_to_ask_fresher = Some(RatchetSpliceError::Ratchet(e));
+                    } else {
+                        if !is_replay_of_our_own && count_frame_failure(entry) {
                             g.entries.remove(&key);
                             g.commit_change(key);
                             return Err(RatchetSpliceError::WedgedConversationDropped);
                         }
-                    }
-                    if !displaceable(entry) {
-                        return Err(RatchetSpliceError::Ratchet(e));
+                        if !displaceable(entry) {
+                            return Err(RatchetSpliceError::Ratchet(e));
+                        }
                     }
                 }
             }
@@ -1669,14 +1797,30 @@ fn open_inner(
                 // does not keep the session: the message opened and still goes
                 // up, because refusing to *read* a genuine message would be a
                 // worse answer than refusing to remember the conversation.
+                let sealed_at = sent_at(&plaintext, now_unix);
                 let admit = match g.entries.get(&key) {
                     // Replacing one we hold: allowed, and costs no room.
                     Some(e) if displaceable(e) => Some(true),
+                    // A peer that started over, after everything it sent here.
+                    Some(e) if fresher(e, sealed_at) => Some(true),
                     // Proven and answered. Untouchable, as it was before.
                     Some(_) => None,
                     // A conversation we do not have. This one has to fit.
                     None => Some(false),
                 };
+                if admit.is_none()
+                    && let Some(refusal) = only_to_ask_fresher
+                {
+                    // Opened, but only to ask whether it was newer, and it was
+                    // not. Refused as it would have been without asking — and
+                    // counted now, as it would have been.
+                    if g.entries.get_mut(&key).is_some_and(count_frame_failure) {
+                        g.entries.remove(&key);
+                        g.commit_change(key);
+                        return Err(RatchetSpliceError::WedgedConversationDropped);
+                    }
+                    return Err(refusal);
+                }
                 if let Some(replaces) = admit
                     && (replaces || g.make_room(&key, now_unix))
                 {
@@ -1693,6 +1837,9 @@ fn open_inner(
                             // Reached only down the prologue path, so this IS
                             // the prologue the conversation was built from.
                             accepted_prologue: Some(blob[..PQXDH_PROLOGUE_LEN].to_vec()),
+                            // The bar the NEXT prologue has to clear.
+                            peer_sent_at: sealed_at.unwrap_or(0),
+                            last_displace_try: 0,
                         },
                     );
                     g.commit_change(key);
@@ -2293,7 +2440,7 @@ mod tests {
 
         // A blob from a build that had only the bit: everything up to the
         // stamp, and the byte still says "yes, once".
-        let older = &blob[..blob.len() - 8];
+        let older = &blob_as_written_before_the_stamp(&blob);
         assert_eq!(older[4 + 1 + 32], 1, "premise: the bit says proven");
         let restored = Entry::decode(older).expect("an older blob still loads");
         assert_eq!(
@@ -2330,7 +2477,7 @@ mod tests {
             entry.encode()
         };
 
-        let older = &blob[..blob.len() - 8];
+        let older = &blob_as_written_before_the_stamp(&blob);
         assert_eq!(older[4 + 1 + 32], 1, "premise: the bit says proven");
         let restored = Entry::decode(older).expect("an older blob still loads");
 
@@ -2667,6 +2814,18 @@ mod tests {
         assert_eq!(opened.key.peer_node_id, a.node_id);
         assert_eq!(opened.key.peer_instance_id, a.instance_id);
         assert_eq!(opened.key.local_instance_id, b.instance_id);
+    }
+
+    /// A current blob as a build from before the authorization stamp wrote
+    /// it: tag 2, and neither the stamp nor anything after it.
+    fn blob_as_written_before_the_stamp(blob: &[u8]) -> Vec<u8> {
+        assert_eq!(
+            blob[4], CONVERSATION_BLOB_V3,
+            "test premise: a current blob"
+        );
+        let mut older = blob[..blob.len() - 16].to_vec();
+        older[4] = CONVERSATION_BLOB_V2;
+        older
     }
 
     /// Alice and Bob, established and answered, so Alice's frames are bare
@@ -4992,5 +5151,224 @@ mod tests {
             second.len(),
             HEADER_LEN + FRAME_OVERHEAD + 1088 + plaintext.len()
         );
+    }
+
+    // ── A peer that started over (owner's decision 2д) ──────────────────────
+
+    fn seal_at(from: &Device, to: &Device, msg: &[u8], at: u64) -> Vec<u8> {
+        let (ek, pk) = (to.ek(), to.ratchet_pk());
+        seal(&from.store, &from.me(), keys(to, &ek, &pk), msg, at)
+            .expect("seal")
+            .0
+    }
+
+    fn open_at(
+        to: &Device,
+        from: &Device,
+        payload: &[u8],
+        at: u64,
+    ) -> Result<Opened, RatchetSpliceError> {
+        let pk = from.ratchet_pk();
+        open(
+            &to.store,
+            &to.me(),
+            &from.node_id,
+            payload,
+            Some(&dev(from.instance_id, &pk)),
+            at,
+        )
+    }
+
+    /// The case this exists for. Alice and Bob are proven and answered; Alice
+    /// loses her state (a reinstall, a restore) and seals again from nothing.
+    /// Her new prologue used to be refused by the conversation Bob still held,
+    /// until three of her messages had failed against it and wedged it. It is
+    /// sealed after anything of hers Bob ever opened, so it is let in at once
+    /// — and the conversation it builds is the one both ends now hold.
+    #[test]
+    fn a_peer_that_started_over_is_let_back_in_at_once() {
+        let (a, b) = settled_pair(0xE1);
+        let a_again = device(0xE1);
+        assert_eq!(a_again.store.len(), 0, "test premise: Alice kept nothing");
+
+        let prologue = seal_at(&a_again, &b, b"it is me again", NOW + 60);
+        let opened = open_at(&b, &a_again, &prologue, NOW + 60)
+            .expect("a peer that started over is read at once");
+        assert_eq!(opened.plaintext, b"it is me again");
+        assert_eq!(b.store.len(), 1, "replaced, not added");
+
+        // Bob now answers on the NEW conversation, which only the new Alice
+        // can open; the old one would have answered where she has nothing.
+        let back = seal_at(&b, &a_again, b"welcome back", NOW + 61);
+        assert_eq!(
+            open_at(&a_again, &b, &back, NOW + 61)
+                .expect("the restarted Alice opens Bob's answer")
+                .plaintext,
+            b"welcome back"
+        );
+        drop(a);
+    }
+
+    /// The other half of the same rule: a recording of how Alice started
+    /// BEFORE was sealed before what followed it, so it never unseats the
+    /// conversation — and although it is now opened to find that out, its
+    /// message is not handed up a second time.
+    #[test]
+    fn an_old_prologue_replayed_is_refused_and_not_read_again() {
+        let (a, b) = (device(0xE2), device(0x1D));
+        let old_prologue = seal_at(&a, &b, b"first ever", NOW);
+        open_at(&b, &a, &old_prologue, NOW).expect("first contact");
+        // Bob answers, so the conversation is proven and answered.
+        let back = seal_at(&b, &a, b"ack", NOW);
+        open_at(&a, &b, &back, NOW).expect("Alice opens");
+
+        // Alice starts over, and that is let in; then talks on it.
+        let a_again = device(0xE2);
+        let restart = seal_at(&a_again, &b, b"restart", NOW + 30);
+        open_at(&b, &a_again, &restart, NOW + 30).expect("the restart is fresher");
+        let back = seal_at(&b, &a_again, b"ack 2", NOW + 31);
+        open_at(&a_again, &b, &back, NOW + 31).expect("answered");
+        let later = seal_at(&a_again, &b, b"later", NOW + 40);
+        open_at(&b, &a_again, &later, NOW + 40).expect("the new conversation carries on");
+
+        // The FIRST prologue, replayed. Not the one this conversation was
+        // built from, so it is not caught on sight — it has to be opened, and
+        // opening it must not deliver "first ever" again.
+        let version_before = b.store.version();
+        let replayed = open_at(&b, &a, &old_prologue, NOW + 100);
+        assert!(
+            replayed.is_err(),
+            "a replayed prologue is refused, not read: got {:?}",
+            replayed.map(|o| o.plaintext)
+        );
+        assert_eq!(b.store.version(), version_before, "nothing was replaced");
+        let still = seal_at(&a_again, &b, b"still here", NOW + 101);
+        assert_eq!(
+            open_at(&b, &a_again, &still, NOW + 101)
+                .expect("the live conversation is untouched")
+                .plaintext,
+            b"still here"
+        );
+    }
+
+    /// Asking costs a key agreement, and a prologue that merely NAMES the
+    /// peer's published key gets that far, so a proven conversation answers
+    /// the question once per interval. A peer that genuinely started over
+    /// re-attaches its prologue to every message, so it gets in on the next.
+    #[test]
+    fn a_proven_conversation_is_asked_at_most_once_per_interval() {
+        let (a, b) = settled_pair(0xE3);
+        // A stale prologue spends the ration at NOW + 50...
+        let stale = {
+            let a_stale = device(0xE3);
+            seal_at(&a_stale, &b, b"stale", NOW - 10)
+        };
+        assert!(open_at(&b, &a, &stale, NOW + 50).is_err());
+
+        // ...so a genuine restart one second later waits its turn,
+        let a_again = device(0xE3);
+        let restart = seal_at(&a_again, &b, b"restart", NOW + 51);
+        let refused = open_at(&b, &a_again, &restart, NOW + 51);
+        assert!(
+            matches!(refused, Err(RatchetSpliceError::Ratchet(_))),
+            "inside the interval the question is not asked again: {:?}",
+            refused.map(|o| o.plaintext),
+        );
+        // Still HELD. Refused, not wedged: had the prologues asking been
+        // counted as failures before the answer, this is where the peer's own
+        // restart would have thrown the conversation away — and the next
+        // message would then get in as a stranger's would, which reads the
+        // same from outside and is not the same thing.
+        assert_eq!(b.store.len(), 1, "the conversation is still held");
+        // and is let in once the interval has passed.
+        assert_eq!(
+            open_at(
+                &b,
+                &a_again,
+                &restart,
+                NOW + 50 + DISPLACE_TRY_INTERVAL_SECS
+            )
+            .expect("asked again after the interval")
+            .plaintext,
+            b"restart"
+        );
+    }
+
+    /// A build that predates the stamp puts 32 random bytes where the send
+    /// time now goes. They read as no time at all, and no time is never
+    /// fresher — so an older peer that starts over still takes the old way
+    /// back, and nothing it sends can be mistaken for a restart.
+    #[test]
+    fn an_unstamped_prologue_does_not_unseat_a_proven_conversation() {
+        let (_a, b) = settled_pair(0xE4);
+        let a_again = device(0xE4);
+        let (ek, pk) = (b.ek(), b.ratchet_pk());
+        // What an older build sealed: a wholly random ACK key in front.
+        let mut plaintext = vec![0xFFu8; ACK_KEY_LEN];
+        plaintext.extend_from_slice(b"from an older build");
+        let payload = seal_inner(
+            &a_again.store,
+            &a_again.me(),
+            keys(&b, &ek, &pk),
+            &plaintext,
+            NOW + 60,
+        )
+        .expect("seal");
+        assert_eq!(sent_at(&plaintext, NOW + 60), None, "test premise");
+        let version_before = b.store.version();
+        assert!(open_at(&b, &a_again, &payload, NOW + 60).is_err());
+        assert_eq!(b.store.version(), version_before);
+    }
+
+    /// The bar survives a restart of OURS: written as V3, read back the same,
+    /// or a replay after every app restart would meet no bar at all. A V2 blob
+    /// from before the field reads it as our last use of the conversation.
+    #[test]
+    fn the_peers_send_time_survives_the_blob_and_v2_reads_last_use() {
+        let (a, b) = settled_pair(0xE5);
+        let later = seal_at(&a, &b, b"later", NOW + 500);
+        open_at(&b, &a, &later, NOW + 500).expect("opens");
+        let key = b.store.keys()[0];
+        let blob = b.store.export(&key).expect("held");
+        assert_eq!(blob[4], CONVERSATION_BLOB_V3);
+        let entry = Entry::decode(&blob).expect("V3 decodes");
+        assert_eq!(entry.peer_sent_at, NOW + 500);
+
+        // The same conversation as a V2 build wrote it: tag 2, no send time.
+        let mut v2 = blob.to_vec();
+        v2[4] = CONVERSATION_BLOB_V2;
+        v2.truncate(v2.len() - 8);
+        let entry = Entry::decode(&v2).expect("V2 still decodes");
+        assert_eq!(entry.peer_sent_at, entry.last_used_at);
+        assert_eq!(entry.last_used_at, NOW + 500);
+
+        // And a V3 that lost its tail is not quietly read as a V2.
+        let mut short = blob.to_vec();
+        short.truncate(short.len() - 8);
+        assert!(Entry::decode(&short).is_err());
+    }
+
+    /// When WE opened the conversation, the only thing that sets the bar is
+    /// the peer's answer. A prologue of Alice's from an earlier era — a
+    /// conversation long gone, recorded by someone — was sealed before that
+    /// answer, and must not unseat the conversation Bob started.
+    #[test]
+    fn the_peers_answer_sets_the_bar_on_a_conversation_we_opened() {
+        let (a, b) = (device(0xE6), device(0x6E));
+        // An era ago: Alice to Bob, a conversation since lost on both ends.
+        let old_era = seal_at(&device(0xE6), &b, b"long ago", NOW - 1_000);
+
+        // Now Bob opens one, and Alice answers on it.
+        let first = seal_at(&b, &a, b"hello", NOW);
+        open_at(&a, &b, &first, NOW).expect("Alice opens");
+        let answer = seal_at(&a, &b, b"hi", NOW + 5);
+        open_at(&b, &a, &answer, NOW + 5).expect("Bob opens the answer");
+
+        let version_before = b.store.version();
+        assert!(
+            open_at(&b, &a, &old_era, NOW + 50).is_err(),
+            "a prologue from before the answer does not unseat the conversation",
+        );
+        assert_eq!(b.store.version(), version_before);
     }
 }
