@@ -85,6 +85,22 @@ pub const META_E2E_MARKER: u8 = 0xE3;
 /// independent ratchets, and merging them would deliver each other's replays.
 pub const RATCHET_E2E_MARKER: u8 = 0xE5;
 
+/// The reserved addressee of a relayed "cannot open" reply.
+///
+/// A relayed ratchet frame that does not open (the conversation is gone, was
+/// dropped as wedged, or was keyed to a sibling device) is answered with a
+/// signed [`crate::AuthAppDeliver`] carrying this `app_id`, sent back as an
+/// ordinary relayed envelope with the same `app_id` outside. The recipient
+/// verifies the signature against the replier's identity document and then
+/// drops its side of the conversation; nothing is delivered to an app. A node
+/// that predates it finds no app bound here and drops it, so the reply needs
+/// no negotiation.
+///
+/// The direct-session reply stays the bare `AppSendUnopenable` frame: there
+/// the session itself names the peer. A relay names nobody, so the relayed
+/// reply is signed or a stranger could keep any pair re-keying.
+pub const RATCHET_UNOPENABLE_APP_ID: [u8; 32] = *b"veil.ratchet.unopenable.reply.v1";
+
 /// E2E encryption envelope placed inside `DeliveryEnvelope.payload`.
 ///
 /// The full payload stored on wire is `[E2E_MARKER] ++ E2eEnvelope::encode`.

@@ -17,7 +17,7 @@ pub(crate) const UNOPENABLE_REPLY_INTERVAL: std::time::Duration =
 
 impl FrameDispatcher {
     /// Whether `peer` may be told `AppSendUnopenable` now, recording it if so.
-    fn unopenable_reply_due(&self, peer: [u8; 32]) -> bool {
+    pub(crate) fn unopenable_reply_due(&self, peer: [u8; 32]) -> bool {
         let now = std::time::Instant::now();
         let mut replied = self
             .unopenable_replied

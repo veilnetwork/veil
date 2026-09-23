@@ -172,6 +172,18 @@ async fn process_auth_deliver(
         return;
     }
 
+    // A relayed "cannot open" reply, now proven to come from a device of the
+    // identity it names. It is for our ratchet, not for an app.
+    if auth.app_id == veil_proto::RATCHET_UNOPENABLE_APP_ID {
+        forget_after_signed_unopenable(
+            &access.dispatcher,
+            logger,
+            auth.sender_node_id,
+            sender_device_id,
+        );
+        return;
+    }
+
     // Clear the sender-side stall streak ONLY when the peer answered through
     // one of OUR ephemeral reply circuits: a stashed (mailbox) copy of our
     // message carries no reply block, so a reply-circuit answer proves OUR
@@ -236,6 +248,51 @@ async fn process_auth_deliver(
             ),
         );
     }
+}
+
+/// Act on a VERIFIED relayed "cannot open" reply: drop our side of the
+/// conversation, as the direct-session `AppSendUnopenable` does, so the next
+/// send re-keys.
+///
+/// Under both names the replier goes by. We keyed the conversation under
+/// whatever address we sealed to, which is its identity or the one device that
+/// signed, and the reply cannot say which; the signature proves both. The
+/// cached certificate rows go too, or the re-key re-seals to the row that was
+/// just refused (defect №35).
+pub(crate) fn forget_after_signed_unopenable(
+    dispatcher: &veil_dispatcher::FrameDispatcher,
+    logger: &veil_observability::NodeLogger,
+    identity: [u8; 32],
+    device: [u8; 32],
+) -> usize {
+    let names: &[[u8; 32]] = if device == identity {
+        &[identity]
+    } else {
+        &[identity, device]
+    };
+    let dropped = dispatcher.crypto.ratchet.as_ref().map_or(0, |ratchet| {
+        names.iter().map(|n| ratchet.forget_peer(n)).sum()
+    });
+    let invalidate = dispatcher
+        .peer_cert_invalidate
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .clone();
+    if let Some(invalidate) = invalidate {
+        for name in names {
+            invalidate(name);
+        }
+    }
+    logger.warn(
+        "app.ratchet.peer_cannot_open",
+        format!(
+            "{} (device {}) cannot open our sealed frames, signed reply through a \
+             relay — dropped {dropped} conversation(s); the next send re-keys",
+            veil_util::hex_short(&identity),
+            veil_util::hex_short(&device),
+        ),
+    );
+    dropped
 }
 
 /// Decode and deliver one completely reassembled anonymous AppDeliver. The
