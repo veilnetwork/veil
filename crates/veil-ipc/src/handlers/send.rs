@@ -240,6 +240,50 @@ fn relay_hops_to_try(
     hops
 }
 
+/// Next hops for an ORDINARY (non-realtime) send that has no direct session.
+///
+/// The discovered route first, then its cached alternatives — as before. What
+/// is new is the tail: any live overlay session, XOR-closest to `dst` first,
+/// the same fallback the realtime path already takes. Measured on a two-device
+/// stand (2026-09-23): both devices held sessions with the same relays, the
+/// relays announced each to the other, and still an ordinary send between them
+/// answered NO_ROUTE whenever discovery came back empty inside its 500 ms —
+/// minutes, after both restarted — while the realtime lane crossed the same
+/// relays at once. A relay that holds a session with `dst` delivers straight
+/// to it (`relay_forward`); one that does not falls back to its own routing.
+///
+/// Only when the payload WILL be sealed end to end. A relay reads whatever it
+/// forwards, so a frame that would go in the clear is never handed to an
+/// arbitrary session on the strength of it being alive: `will_seal` false keeps
+/// exactly the old behaviour, including its NO_ROUTE.
+fn ordinary_relay_hops(
+    discovered: Option<[u8; 32]>,
+    dst: &[u8; 32],
+    route_cache: Option<&RwLock<veil_routing::RouteCache>>,
+    session_tx_registry: &dyn FrameBroadcaster,
+    will_seal: bool,
+) -> Vec<[u8; 32]> {
+    let mut hops = Vec::new();
+    if let Some(hop) = discovered {
+        hops.push(hop);
+    }
+    if let Some(cache) = route_cache {
+        for alt in rlock!(cache).lookup_all(dst) {
+            if &alt != dst && !hops.contains(&alt) {
+                hops.push(alt);
+            }
+        }
+    }
+    if will_seal {
+        for peer in relay_hops_to_try(dst, route_cache, session_tx_registry) {
+            if !hops.contains(&peer) {
+                hops.push(peer);
+            }
+        }
+    }
+    hops
+}
+
 /// Write an `APP_SEND_FAILED(RATE_LIMITED)` frame and return `true`.
 ///
 /// Returns `false` without writing anything when `rate_limiter` is `None`
@@ -731,12 +775,13 @@ pub(crate) async fn handle_ipc_send(
             let forced_relay_hops = if relay_realtime {
                 relay_hops_to_try(&send.dst_node_id, route_cache, reg)
             } else {
-                Vec::new()
-            };
-            let hop = if relay_realtime {
-                forced_relay_hops.first().copied()
-            } else {
-                try_lookup_or_discover(
+                // Sealed below whichever way it goes: by the ratchet already
+                // (`sealed`), verbatim when the media codec sealed it, or by
+                // the ML-KEM branch — which either seals or answers
+                // NO_E2E_KEY, never plaintext. Only the no-E2E-infrastructure
+                // node would relay in the clear, and it gets no fallback.
+                let will_seal = sealed.is_some() || relay_media_sealed || peer_mlkem_keys.is_some();
+                let discovered = try_lookup_or_discover(
                     &send.dst_node_id,
                     local_node_id,
                     route_cache,
@@ -745,10 +790,10 @@ pub(crate) async fn handle_ipc_send(
                     peer_mlkem_keys,
                     ctx.pending_recursive.as_deref(),
                 )
-                .await
+                .await;
+                ordinary_relay_hops(discovered, &send.dst_node_id, route_cache, reg, will_seal)
             };
-
-            if let Some(hop) = hop {
+            if !forced_relay_hops.is_empty() {
                 use veil_proto::delivery::DeliveryEnvelope;
                 use veil_proto::family::DeliveryMsg;
                 let now = std::time::SystemTime::now()
@@ -1015,19 +1060,9 @@ pub(crate) async fn handle_ipc_send(
                     let trace_bytes = trace_id.to_be_bytes();
 
                     // Candidate relay hops: primary then cached alternatives.
-                    let hops_to_try: Vec<[u8; 32]> = if relay_realtime {
-                        forced_relay_hops.clone()
-                    } else {
-                        let mut v = vec![hop];
-                        if let Some(cache) = route_cache {
-                            for alt in rlock!(cache).lookup_all(&send.dst_node_id) {
-                                if alt != hop {
-                                    v.push(alt);
-                                }
-                            }
-                        }
-                        v
-                    };
+                    // Primary then alternatives — computed once above, the
+                    // live-session tail included when the payload is sealed.
+                    let hops_to_try: Vec<[u8; 32]> = forced_relay_hops.clone();
 
                     // Build one relayable chunk-envelope Forward frame for `next_hop`.
                     let make_chunk_frame =
@@ -1171,19 +1206,9 @@ pub(crate) async fn handle_ipc_send(
                 };
 
                 // Try primary hop first; on failure fall back to cached alternatives.
-                let hops_to_try: Vec<[u8; 32]> = if relay_realtime {
-                    forced_relay_hops.clone()
-                } else {
-                    let mut v = vec![hop];
-                    if let Some(cache) = route_cache {
-                        for alt in rlock!(cache).lookup_all(&send.dst_node_id) {
-                            if alt != hop {
-                                v.push(alt);
-                            }
-                        }
-                    }
-                    v
-                };
+                // Primary then alternatives — computed once above, the
+                // live-session tail included when the payload is sealed.
+                let hops_to_try: Vec<[u8; 32]> = forced_relay_hops.clone();
                 let mut any_send_failed = false;
                 let mut any_compat_sent = false;
                 for (compat_attempts, next_hop) in hops_to_try.into_iter().enumerate() {
@@ -1549,6 +1574,51 @@ mod relay_hop_tests {
         assert_eq!(
             relay_hops_to_try(&dst, None, &peers),
             vec![nearest, farther]
+        );
+    }
+
+    /// An ordinary send with no route still has somewhere to go: any live
+    /// session, nearest first — but only for a payload that will be sealed.
+    #[test]
+    fn an_ordinary_send_falls_back_to_a_live_session_only_when_sealed() {
+        let dst = [0x10; 32];
+        let nearest = [0x11; 32];
+        let farther = [0x30; 32];
+        let peers = ActivePeers(vec![farther, nearest]);
+
+        assert_eq!(
+            ordinary_relay_hops(None, &dst, None, &peers, true),
+            vec![nearest, farther],
+            "no discovered route and no cache: the live sessions carry it",
+        );
+        assert!(
+            ordinary_relay_hops(None, &dst, None, &peers, false).is_empty(),
+            "a frame that would travel in the clear is never handed to an \
+             arbitrary session",
+        );
+    }
+
+    /// The discovered route and its cached alternatives keep their place in
+    /// front; the live-session tail only follows them.
+    #[test]
+    fn an_ordinary_send_tries_the_known_route_first() {
+        let dst = [0x10; 32];
+        let routed = [0x40; 32];
+        let cached = [0x50; 32];
+        let live = [0x11; 32];
+        let mut cache = veil_routing::RouteCache::new(Duration::from_secs(60));
+        cache.insert(dst, cached, 1, 2);
+        let cache = RwLock::new(cache);
+        let peers = ActivePeers(vec![live, dst]);
+
+        assert_eq!(
+            ordinary_relay_hops(Some(routed), &dst, Some(&cache), &peers, true),
+            vec![routed, cached, live],
+        );
+        assert_eq!(
+            ordinary_relay_hops(Some(routed), &dst, Some(&cache), &peers, false),
+            vec![routed, cached],
+            "unsealed keeps exactly the old list",
         );
     }
 }
@@ -2129,6 +2199,77 @@ mod ratchet_send_tests {
             .expect("the peer opens it");
         assert_eq!(opened.plaintext, b"through a relay");
         assert!(opened.authenticated);
+    }
+
+    /// NO ROUTE AT ALL, only a live session to some relay: the send still goes,
+    /// through that relay, sealed so the relay cannot read it and the peer
+    /// knows who sent it. Before, this answered NO_ROUTE and the frame waited
+    /// for a route that, between two devices that had both restarted, could
+    /// take minutes to be announced.
+    #[tokio::test]
+    async fn with_no_route_a_sealed_send_goes_through_a_live_session() {
+        let fx = fixture(vec![RELAY]);
+        wlock!(fx.route_cache).invalidate(&PEER);
+        let mut wh = sink().await;
+        handle_ipc_send(
+            &mut SendReply::Inline(&mut wh),
+            &payload(false, b"no route, one relay"),
+            &fx.ctx(true),
+        )
+        .await
+        .expect("send");
+
+        let forwards: Vec<_> = fx
+            .taken()
+            .into_iter()
+            .filter(|(_, frame)| {
+                veil_proto::codec::decode_header(frame).is_ok_and(|h| {
+                    h.family == veil_proto::family::FrameFamily::Delivery as u8
+                        && h.msg_type == veil_proto::family::DeliveryMsg::Forward as u16
+                })
+            })
+            .collect();
+        assert_eq!(forwards.len(), 1, "the send never went out");
+        let (hop, frame) = &forwards[0];
+        assert_eq!(hop, &RELAY);
+        let fwd = veil_proto::delivery::ForwardPayload::decode(&frame[veil_proto::HEADER_SIZE..])
+            .expect("forward");
+        let opened = fx
+            .peer
+            .open_payload(&ME, &fwd.envelope.payload, veil_util::unix_secs_now_u64())
+            .expect("sealed to the peer, not readable by the relay");
+        assert_eq!(opened.plaintext, b"no route, one relay");
+        assert!(opened.authenticated, "the peer can tell who sent it");
+    }
+
+    /// And never in the clear: a node with no end-to-end sealing at all does
+    /// not hand its frame to whichever session happens to be alive.
+    #[tokio::test]
+    async fn with_no_route_an_unsealed_send_is_not_relayed() {
+        let fx = fixture(vec![RELAY]);
+        wlock!(fx.route_cache).invalidate(&PEER);
+        let mut ctx = fx.ctx(false);
+        ctx.peer_mlkem_keys = None;
+        let mut wh = sink().await;
+        handle_ipc_send(
+            &mut SendReply::Inline(&mut wh),
+            &payload(false, b"would be plaintext"),
+            &ctx,
+        )
+        .await
+        .expect("send");
+
+        let forwards = fx
+            .taken()
+            .into_iter()
+            .filter(|(_, frame)| {
+                veil_proto::codec::decode_header(frame).is_ok_and(|h| {
+                    h.family == veil_proto::family::FrameFamily::Delivery as u8
+                        && h.msg_type == veil_proto::family::DeliveryMsg::Forward as u16
+                })
+            })
+            .count();
+        assert_eq!(forwards, 0, "a plaintext frame was handed to a relay");
     }
 
     /// The anonymous path is standard traffic and must keep working. Gating it
