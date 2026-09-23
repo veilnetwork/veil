@@ -147,6 +147,73 @@ pub(crate) fn select_own_device_instance(
     }
 }
 
+/// How many relayed "cannot open" replies this node signs per second, all
+/// peers together.
+///
+/// The dispatcher already answers each peer at most once per interval, but it
+/// keys that on the sender a relayed envelope CLAIMS, which costs nothing to
+/// vary. Without a node-wide ceiling a flood of junk frames under invented
+/// senders would buy one signature each. A real outage produces a reply per
+/// peer that lost its conversation, a handful at a time.
+pub(crate) const UNOPENABLE_SIGNS_PER_SECOND: u32 = 8;
+
+/// A fixed one-second window: `allow` answers whether one more signature fits.
+pub(crate) struct SignBudget {
+    window_start: std::time::Instant,
+    used: u32,
+}
+
+impl SignBudget {
+    pub(crate) fn new(now: std::time::Instant) -> Self {
+        Self {
+            window_start: now,
+            used: 0,
+        }
+    }
+
+    pub(crate) fn allow(&mut self, now: std::time::Instant) -> bool {
+        if now.duration_since(self.window_start) >= std::time::Duration::from_secs(1) {
+            self.window_start = now;
+            self.used = 0;
+        }
+        if self.used >= UNOPENABLE_SIGNS_PER_SECOND {
+            return false;
+        }
+        self.used += 1;
+        true
+    }
+}
+
+/// The signer the dispatcher calls for a relayed "cannot open" reply (see
+/// `FrameDispatcher::unopenable_signer`): signed by this device's key under
+/// our identity, addressed to `peer` exactly as it named itself, so its
+/// recipient binding verifies at the other end. Reads the identity at call
+/// time, so a promoted or reloaded identity signs from then on.
+pub(crate) fn relayed_unopenable_signer(
+    sovereign: super::identity_state::SovereignIdentityCell,
+) -> veil_dispatcher::UnopenableSignerFn {
+    let budget = Mutex::new(SignBudget::new(std::time::Instant::now()));
+    Arc::new(move |peer: &[u8; 32]| {
+        let sov = sovereign.get()?;
+        if !budget
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .allow(std::time::Instant::now())
+        {
+            return None;
+        }
+        Some(sov.sign_auth_deliver(
+            *peer,
+            veil_proto::RATCHET_UNOPENABLE_APP_ID,
+            0,
+            veil_util::unix_secs_now_u64(),
+            rand_core::OsRng.next_u64(),
+            Vec::new(),
+            Vec::new(),
+        ))
+    })
+}
+
 /// The session directory, plus our own devices named from our own document.
 ///
 /// What the live send path asks to key a ratchet conversation (see
@@ -1428,6 +1495,27 @@ mod audience_tests {
             valid_until_unix: 0,
             master_sig: Vec::new(),
         }
+    }
+
+    /// The node-wide ceiling on signing relayed "cannot open" replies: the
+    /// per-peer limit keys on a sender the envelope merely claims, so it is
+    /// this that stops a flood under invented names buying a signature each.
+    #[test]
+    fn the_unopenable_sign_budget_is_eight_a_second_for_everyone() {
+        let t0 = std::time::Instant::now();
+        let mut budget = super::SignBudget::new(t0);
+        for i in 0..8 {
+            assert!(budget.allow(t0), "signature {i} of the first second");
+        }
+        assert!(!budget.allow(t0), "the ninth in the same second is refused");
+        assert!(
+            !budget.allow(t0 + std::time::Duration::from_millis(999)),
+            "still the same second",
+        );
+        assert!(
+            budget.allow(t0 + std::time::Duration::from_secs(1)),
+            "a new second, a new allowance",
+        );
     }
 
     /// A sibling's device id pairs with OUR identity and ITS instance — the

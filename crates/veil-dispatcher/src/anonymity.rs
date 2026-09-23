@@ -403,7 +403,7 @@ impl FrameDispatcher {
     /// policy as an unbound endpoint. A full channel also drops (best-effort;
     /// the sender learns from an app-layer timeout, never a synchronous error —
     /// which would leak reachability).
-    fn enqueue_auth_deliver(&self, inbound: AuthDeliverInbound) {
+    pub(crate) fn enqueue_auth_deliver(&self, inbound: AuthDeliverInbound) {
         let Some(tx) = lock!(self.auth_deliver_tx).as_ref().cloned() else {
             self.logger.info(
                 "anonymity.relay_chain.auth.unwired",

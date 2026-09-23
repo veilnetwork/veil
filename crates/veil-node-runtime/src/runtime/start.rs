@@ -922,6 +922,8 @@ impl NodeRuntime {
             // runtime resolver exists (defect №35 sender-side feedback).
             peer_cert_invalidate: Arc::new(Mutex::new(None)),
             unopenable_replied: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            // Installed by the IPC wiring, beside `peer_cert_invalidate`.
+            unopenable_signer: Arc::new(Mutex::new(None)),
             route_seen_set: Arc::clone(&shared_route_seen_set),
             announce_seq: Arc::clone(&shared_announce_seq),
             listen_transports: Arc::clone(&listen_transports),
