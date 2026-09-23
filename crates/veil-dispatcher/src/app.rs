@@ -11,7 +11,31 @@ use veil_proto::{
 };
 use veil_util::lock;
 
+/// The least time between two `AppSendUnopenable` replies to one peer.
+pub(crate) const UNOPENABLE_REPLY_INTERVAL: std::time::Duration =
+    std::time::Duration::from_secs(10);
+
 impl FrameDispatcher {
+    /// Whether `peer` may be told `AppSendUnopenable` now, recording it if so.
+    fn unopenable_reply_due(&self, peer: [u8; 32]) -> bool {
+        let now = std::time::Instant::now();
+        let mut replied = self
+            .unopenable_replied
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        if let Some(at) = replied.get(&peer)
+            && now.duration_since(*at) < UNOPENABLE_REPLY_INTERVAL
+        {
+            return false;
+        }
+        // Bounded: entries past the interval carry no information.
+        if replied.len() >= 1024 {
+            replied.retain(|_, at| now.duration_since(*at) < UNOPENABLE_REPLY_INTERVAL);
+        }
+        replied.insert(peer, now);
+        true
+    }
+
     pub fn dispatch_app(
         &self,
         header: &FrameHeader,
@@ -287,11 +311,21 @@ impl FrameDispatcher {
                         // forever; this reply makes it drop the conversation
                         // AND the cached row, and the re-key resolves for the
                         // device its session actually ends at.
+                        //
+                        // `NoSession` earns it too. It is what every frame of
+                        // the OLD conversation gets once this side has given
+                        // it up — the common case after an outage — and in
+                        // silence the sender keeps sealing into a chain nobody
+                        // holds, never starting over (owner's decision 1a,
+                        // 2026-09-23). Rate-limited per peer, see
+                        // `unopenable_replied`.
                         if matches!(
                             e,
                             veil_e2e::RatchetSpliceError::WedgedConversationDropped
                                 | veil_e2e::RatchetSpliceError::NotForThisDevice
-                        ) {
+                                | veil_e2e::RatchetSpliceError::NoSession
+                        ) && self.unopenable_reply_due(sender)
+                        {
                             return DispatchResult::Response(crate::encode_response(
                                 header,
                                 veil_proto::family::FrameFamily::App as u8,
@@ -598,6 +632,67 @@ mod tests {
             reply_hdr.msg_type,
             AppMsg::AppSendUnopenable as u16,
             "the reply that makes the sender re-key instead of retrying forever"
+        );
+    }
+
+    /// A frame of a conversation we no longer hold — what every frame of the
+    /// old conversation gets once this side has given it up — earns the same
+    /// reply, so the sender starts over instead of sealing into a chain nobody
+    /// holds. Once per interval per peer: the frames it had in flight keep
+    /// coming, and answering each would kill the conversation it just began.
+    #[test]
+    fn a_frame_for_a_conversation_we_do_not_hold_earns_one_unopenable_reply() {
+        let us = [0xBBu8; 32];
+        let sender_id = [0xAAu8; 32];
+        let mut disp = crate::make_test_dispatcher(veil_cfg::NodeRole::Core);
+        disp.crypto = Arc::new(crate::CryptoContext {
+            ratchet: Some(ratchet_runtime(us, [0x0B; 16])),
+            ..(*disp.crypto).clone()
+        });
+
+        // marker ‖ version ‖ kind=FRAME ‖ sender_instance ‖ OUR instance ‖ body
+        let mut sealed = vec![veil_proto::RATCHET_E2E_MARKER, 1, 1];
+        sealed.extend_from_slice(&[0x0A; 16]);
+        sealed.extend_from_slice(&[0x0B; 16]);
+        sealed.extend_from_slice(&[0x5A; 64]);
+        let frame = |data: Vec<u8>| {
+            let body = veil_proto::app::AppSendPayload {
+                src_app_id: [0x11; 32],
+                app_id: [0x22; 32],
+                endpoint_id: 7,
+                data: veil_bufpool::pooled_shared_from_vec(data),
+            }
+            .encode();
+            let mut hdr = FrameHeader::new(FrameFamily::App as u8, AppMsg::AppSendSealed as u16);
+            hdr.body_len = body.len() as u32;
+            (hdr, body)
+        };
+
+        let (hdr, body) = frame(sealed.clone());
+        let crate::DispatchResult::Response(reply) = disp.dispatch(&hdr, &body, sender_id) else {
+            panic!("a frame for a dropped conversation must tell the sender to start over");
+        };
+        assert_eq!(
+            veil_proto::codec::decode_header(&reply)
+                .expect("hdr")
+                .msg_type,
+            AppMsg::AppSendUnopenable as u16,
+        );
+        let (hdr, body) = frame(sealed.clone());
+        assert!(
+            matches!(
+                disp.dispatch(&hdr, &body, sender_id),
+                crate::DispatchResult::NoResponse
+            ),
+            "the second in-flight frame must not be answered again at once",
+        );
+        let (hdr, body) = frame(sealed);
+        assert!(
+            matches!(
+                disp.dispatch(&hdr, &body, [0xCCu8; 32]),
+                crate::DispatchResult::Response(_)
+            ),
+            "the limit is per peer, not global",
         );
     }
 

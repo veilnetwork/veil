@@ -1164,6 +1164,8 @@ impl NodeRuntime {
             // fresh empty slot here would silently detach the №35 feedback
             // (peer says "unopenable" → nothing invalidates the cert cache).
             peer_cert_invalidate: Arc::clone(&self.dispatcher.peer_cert_invalidate),
+            // Carried over so a reload cannot reopen the per-peer reply window.
+            unopenable_replied: Arc::clone(&self.dispatcher.unopenable_replied),
             route_seen_set: Arc::new(Mutex::new(veil_dispatcher::RouteSeenSet::new(
                 std::time::Duration::from_secs(config.routing.route_seen_window_secs),
                 config.routing.route_seen_capacity,

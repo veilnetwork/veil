@@ -888,6 +888,12 @@ pub struct FrameDispatcher {
     /// share this slot, so an in-place set reaches every one.
     pub peer_cert_invalidate: Arc<Mutex<Option<PeerCertInvalidateFn>>>,
 
+    /// When each peer was last told `AppSendUnopenable`. One reply per peer
+    /// per [`UNOPENABLE_REPLY_INTERVAL`]: the frames a sender had in flight
+    /// before it re-keyed keep arriving for the old conversation, and answering
+    /// each would make it drop the NEW conversation it has only just begun.
+    pub unopenable_replied: Arc<Mutex<std::collections::HashMap<[u8; 32], std::time::Instant>>>,
+
     // ── Routing gossip ─────────────────────────────────────────
     /// Gossip dedup set — shared across all concurrent sessions.
     pub route_seen_set: Arc<Mutex<RouteSeenSet>>,
@@ -1994,6 +2000,7 @@ pub fn make_test_dispatcher(role: NodeRole) -> FrameDispatcher {
         rendezvous_weak: Arc::new(std::sync::Mutex::new(None)),
         session_registry: None,
         peer_cert_invalidate: Arc::new(Mutex::new(None)),
+        unopenable_replied: Arc::new(Mutex::new(std::collections::HashMap::new())),
         route_seen_set: Arc::new(Mutex::new(RouteSeenSet::new(
             std::time::Duration::from_secs(60),
             4096,
@@ -2860,6 +2867,7 @@ mod tests {
             rendezvous_weak: Arc::new(std::sync::Mutex::new(None)),
             session_registry: None, // test dispatcher — sovereign routing bypassed
             peer_cert_invalidate: Arc::new(Mutex::new(None)),
+            unopenable_replied: Arc::new(Mutex::new(std::collections::HashMap::new())),
             route_seen_set: Arc::new(Mutex::new(RouteSeenSet::new(
                 std::time::Duration::from_secs(60),
                 4096,
