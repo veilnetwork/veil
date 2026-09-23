@@ -147,6 +147,63 @@ pub(crate) fn select_own_device_instance(
     }
 }
 
+/// The session directory, plus our own devices named from our own document.
+///
+/// What the live send path asks to key a ratchet conversation (see
+/// `SessionInstanceLookup::own_device_pairing`). Sessions answer as they
+/// always did; a device of this identity with no live session is paired from
+/// the document and registry this runtime already holds — the same walk the
+/// offline seal uses, [`select_own_device_instance`].
+pub(crate) struct OwnDeviceAwareLookup {
+    pub(crate) sessions: veil_session::glue::SessionInstanceDirectory,
+    pub(crate) sovereign: super::identity_state::SovereignIdentityCell,
+}
+
+impl veil_types::SessionInstanceLookup for OwnDeviceAwareLookup {
+    fn session_instance(&self, peer_node_id: &[u8; 32]) -> Option<[u8; 16]> {
+        self.sessions.session_instance(peer_node_id)
+    }
+
+    fn session_pairing(&self, peer_node_id: &[u8; 32]) -> Option<veil_types::SessionPairing> {
+        self.sessions.session_pairing(peer_node_id)
+    }
+
+    fn own_device_pairing(&self, device_id: &[u8; 32]) -> Option<veil_types::SessionPairing> {
+        let sovereign = self.sovereign.get()?;
+        own_device_pairing_from(
+            sovereign.document.node_id,
+            sovereign.active_instance_id(),
+            &sovereign.all_instance_entries(),
+            &sovereign.document.identity_keys,
+            device_id,
+        )
+    }
+}
+
+/// The rule behind [`OwnDeviceAwareLookup::own_device_pairing`], pure.
+///
+/// Not the identity itself (that is not a device), never this device, and
+/// only a device the registry maps to exactly one instance.
+pub(crate) fn own_device_pairing_from(
+    identity: [u8; 32],
+    active_instance: [u8; 16],
+    entries: &[veil_proto::instance_registry::InstanceEntry],
+    identity_keys: &[veil_proto::identity_document::IdentityKey],
+    device_id: &[u8; 32],
+) -> Option<veil_types::SessionPairing> {
+    if *device_id == identity {
+        return None;
+    }
+    let entry = select_own_device_instance(entries, identity_keys, device_id)?;
+    if entry.instance_id == active_instance {
+        return None;
+    }
+    Some(veil_types::SessionPairing {
+        identity,
+        instance: entry.instance_id,
+    })
+}
+
 /// Why a seal could find no certificate to encrypt to.
 ///
 /// One error variant used to carry both, and the two want opposite responses.
@@ -1371,6 +1428,45 @@ mod audience_tests {
             valid_until_unix: 0,
             master_sig: Vec::new(),
         }
+    }
+
+    /// A sibling's device id pairs with OUR identity and ITS instance — the
+    /// names its frames come back under — and nothing else pairs at all.
+    #[test]
+    fn a_sibling_device_pairs_with_our_identity_and_its_instance() {
+        let identity = [0x8Du8; 32];
+        // The third device is a master whose device id IS the identity — the
+        // one case where "the identity" and "a device" are the same value.
+        let keys = vec![key_for(0x13), key_for(0xB7), key_for(0x8D)];
+        let entries = vec![
+            entry_bound(0xA1, 0),
+            entry_bound(0xB1, 1),
+            entry_bound(0xC1, 2),
+        ];
+        let me = [0xA1u8; 16];
+
+        assert_eq!(
+            own_device_pairing_from(identity, me, &entries, &keys, &[0xB7; 32]),
+            Some(veil_types::SessionPairing {
+                identity,
+                instance: [0xB1; 16],
+            }),
+        );
+        assert_eq!(
+            own_device_pairing_from(identity, me, &entries, &keys, &[0x13; 32]),
+            None,
+            "this device is not its own sibling",
+        );
+        assert_eq!(
+            own_device_pairing_from(identity, me, &entries, &keys, &identity),
+            None,
+            "the identity is not a device",
+        );
+        assert_eq!(
+            own_device_pairing_from(identity, me, &entries, &keys, &[0x55; 32]),
+            None,
+            "a device that is not ours pairs with nothing",
+        );
     }
 
     /// The point of the diet: a deposit addressed to ONE device seals for

@@ -460,10 +460,14 @@ async fn try_ratchet_seal(
     //
     // The session's proof carries BOTH names, from one validation, so they
     // cannot disagree.
-    let pairing = ctx
-        .session_instance_lookup
-        .as_deref()
-        .and_then(|lookup| lookup.session_pairing(dst_node_id));
+    // No live session: if the destination is one of OUR devices, the pair
+    // comes from our own document instead — the identity the sibling's frames
+    // arrive under, so the conversation we seal in is the one we open in.
+    let pairing = ctx.session_instance_lookup.as_deref().and_then(|lookup| {
+        lookup
+            .session_pairing(dst_node_id)
+            .or_else(|| lookup.own_device_pairing(dst_node_id))
+    });
     let session_instance = pairing.map(|p| p.instance).or_else(|| {
         ctx.session_instance_lookup
             .as_deref()
@@ -2341,6 +2345,61 @@ mod ratchet_send_tests {
             })
             .count();
         assert_eq!(forwards, 0, "a plaintext frame was handed to a relay");
+    }
+
+    /// What our own document says about one of our devices — no session.
+    struct OwnDevice {
+        device: [u8; 32],
+        pairing: veil_types::SessionPairing,
+    }
+
+    impl veil_types::SessionInstanceLookup for OwnDevice {
+        fn session_instance(&self, _peer: &[u8; 32]) -> Option<[u8; 16]> {
+            None
+        }
+        fn own_device_pairing(&self, device: &[u8; 32]) -> Option<veil_types::SessionPairing> {
+            (*device == self.device).then_some(self.pairing)
+        }
+    }
+
+    /// ONE CONVERSATION WITH A SIBLING, whatever path the frame takes. With no
+    /// session the sibling was sealed to under its DEVICE id, while its frames
+    /// come back under the IDENTITY: two conversations, and the one we sent in
+    /// never turned (26 240 steps on the stand, 2026-09-23).
+    #[tokio::test]
+    async fn a_sibling_with_no_session_is_sealed_under_the_identity() {
+        let sibling_device = [0xB9u8; 32];
+        let fx = fixture(vec![RELAY]);
+        let mut ctx = fx.ctx(true);
+        ctx.session_instance_lookup = Some(Arc::new(OwnDevice {
+            device: sibling_device,
+            pairing: veil_types::SessionPairing {
+                identity: PEER,
+                instance: PEER_INSTANCE,
+            },
+        }));
+        let mut wh = sink().await;
+        handle_ipc_send(
+            &mut SendReply::Inline(&mut wh),
+            &payload_to(sibling_device, b"to my other device"),
+            &ctx,
+        )
+        .await
+        .expect("send");
+
+        let keys = fx.me.store.keys();
+        assert!(
+            keys.contains(&veil_e2e::ConversationKey {
+                local_instance_id: MY_INSTANCE,
+                peer_node_id: PEER,
+                peer_instance_id: PEER_INSTANCE,
+            }),
+            "the conversation is not keyed by the identity: {keys:?}",
+        );
+        assert!(
+            keys.iter().all(|k| k.peer_node_id != sibling_device),
+            "a second conversation was keyed by the device id",
+        );
     }
 
     /// NOWHERE TO GO, NOTHING SPENT. With no session and no hop the frame goes
