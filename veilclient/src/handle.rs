@@ -36,6 +36,13 @@ pub struct IncomingMessage {
     /// repliable" (a plain send, or an authenticated send without a reply
     /// block). Single-use and TTL-bounded daemon-side (default 300 s).
     pub reply_id: u64,
+    /// The DEVICE this came from, when the node's carrying path proved one
+    /// (a direct session proves its peer device). [`Self::src_node_id`] names
+    /// an identity — a family of devices — and this names which member to
+    /// ANSWER, so an acknowledgement reaches the device waiting for it. For
+    /// replies only, never for authorization. `None` when the path cannot
+    /// say, or from a node that predates it.
+    pub src_device: Option<[u8; 32]>,
 }
 
 /// A remote peer opened a byte-stream to this endpoint.  Returned by

@@ -1557,6 +1557,7 @@ async fn full_delivery_channel_drops_frame_and_increments_counter() {
                 endpoint_id: 1,
                 data: veil_bufpool::pooled_shared_from_vec(vec![i]),
                 reply_id: 0,
+                origin_device: None,
             })
             .await
             .unwrap();
@@ -2903,4 +2904,54 @@ async fn device_scoped_with_capability_is_refused() {
     drop(client);
     let _ = shutdown_tx.send(true);
     let _ = sh.await;
+}
+
+// ── the device a direct frame came from reaches the client ─────────────────
+//
+// `origin_device` on `AppMessage::Deliver` is useless if the one place that
+// turns it into the client's frame drops it — which is exactly what that
+// place did with `sender_device_id`, by design. This one must ride.
+#[tokio::test]
+async fn a_delivery_names_its_origin_device_to_the_client() {
+    let (delivery_tx, mut delivery_rx) = mpsc::channel::<veil_bufpool::PooledShared>(4);
+    let (app_tx, app_rx) = mpsc::channel::<AppMessage>(4);
+    let fwd = tokio::spawn(async move {
+        forward_endpoint(
+            app_rx,
+            delivery_tx,
+            node_id(),
+            [0u8; 32],
+            0,
+            None,
+            std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
+            std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+        )
+        .await;
+    });
+    for device in [Some([0xD7u8; 32]), None] {
+        app_tx
+            .send(AppMessage::Deliver {
+                src_node_id: [0x1D; 32],
+                provenance: veil_proto::SenderProvenance::SessionPeer,
+                sender_device_id: None,
+                origin_device: device,
+                src_app_id: [0u8; 32],
+                app_id: [0u8; 32],
+                endpoint_id: 1,
+                data: veil_bufpool::pooled_shared_from_vec(b"x".to_vec()),
+                reply_id: 0,
+            })
+            .await
+            .unwrap();
+        let frame = tokio::time::timeout(Duration::from_secs(2), delivery_rx.recv())
+            .await
+            .expect("forwarded")
+            .expect("frame");
+        let body = &frame.as_ref()[veil_proto::header::HEADER_SIZE..];
+        let got = veil_proto::AppDeliverPayload::decode(body).expect("decode");
+        assert_eq!(got.origin_device, device);
+        assert_eq!(got.src_node_id, [0x1D; 32]);
+    }
+    drop(app_tx);
+    let _ = tokio::time::timeout(Duration::from_millis(100), fwd).await;
 }

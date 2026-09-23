@@ -801,6 +801,7 @@ impl NodeServices {
             reply_id: 0,
             // Sender-written; the receiver decides provenance itself.
             provenance: veil_proto::SenderProvenance::Claimed,
+            origin_device: None,
         };
         let app_deliver_bytes = app_deliver.encode();
 
@@ -942,6 +943,7 @@ impl NodeServices {
             reply_id: 0,
             // Sender-written; the receiver decides provenance itself.
             provenance: veil_proto::SenderProvenance::Claimed,
+            origin_device: None,
         };
         let deliver_bytes = deliver_payload.encode();
         let mut payload_bytes = Vec::with_capacity(1 + deliver_bytes.len());

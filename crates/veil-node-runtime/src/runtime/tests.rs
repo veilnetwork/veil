@@ -3807,6 +3807,7 @@ fn a_full_deposit_chunk_fits_one_anonymous_cell() {
         data: veil_bufpool::pooled_shared_from_vec(chunk),
         reply_id: 0,
         provenance: veil_proto::SenderProvenance::Claimed,
+        origin_device: None,
     }
     .encode();
     // The deposit path prepends one final-hop kind tag before the onion wrap.

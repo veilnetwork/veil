@@ -70,6 +70,16 @@ pub enum AppMessage {
         /// device_id); every other path has no signature to name one with and
         /// passes `None`. In-process only — this never rides the wire.
         sender_device_id: Option<[u8; 32]>,
+        /// The DEVICE this came from, when the carrying path proves one — for
+        /// ANSWERING, never for authorization (that is `sender_device_id`'s
+        /// job, and only a signature may fill it). A direct session proves its
+        /// peer device in the handshake, so it can say which member of the
+        /// family is waiting for the acknowledgement; without it every answer
+        /// to a multi-device identity went to whichever sibling routing picked,
+        /// and the device that sent kept re-sending. Unlike
+        /// `sender_device_id`, this one DOES reach the IPC client
+        /// ([`veil_proto::AppDeliverPayload::origin_device`]).
+        origin_device: Option<[u8; 32]>,
         src_app_id: [u8; 32],
         app_id: [u8; 32],
         endpoint_id: u32,
@@ -414,6 +424,33 @@ impl AppEndpointRegistry {
             src_node_id,
             provenance,
             None,
+            None,
+            src_app_id,
+            app_id,
+            endpoint_id,
+            data,
+            0,
+        )
+    }
+
+    /// Like [`Self::route_ipc_deliver`], for a path that proved which DEVICE
+    /// the frame came from (see `origin_device` on [`AppMessage::Deliver`]).
+    #[allow(clippy::too_many_arguments)]
+    pub fn route_ipc_deliver_from_device(
+        &self,
+        src_node_id: [u8; 32],
+        provenance: SenderProvenance,
+        origin_device: [u8; 32],
+        src_app_id: [u8; 32],
+        app_id: [u8; 32],
+        endpoint_id: u32,
+        data: veil_bufpool::PooledShared,
+    ) -> bool {
+        self.route_ipc_deliver_with_reply(
+            src_node_id,
+            provenance,
+            None,
+            Some(origin_device),
             src_app_id,
             app_id,
             endpoint_id,
@@ -436,6 +473,7 @@ impl AppEndpointRegistry {
         src_node_id: [u8; 32],
         provenance: SenderProvenance,
         sender_device_id: Option<[u8; 32]>,
+        origin_device: Option<[u8; 32]>,
         src_app_id: [u8; 32],
         app_id: [u8; 32],
         endpoint_id: u32,
@@ -452,6 +490,7 @@ impl AppEndpointRegistry {
                 src_node_id,
                 provenance,
                 sender_device_id,
+                origin_device,
                 src_app_id,
                 app_id,
                 endpoint_id,

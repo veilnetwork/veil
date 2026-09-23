@@ -2228,6 +2228,34 @@ pub type VeilRecvCb = Option<
     ),
 >;
 
+/// [`VeilRecvCb`] plus the DEVICE the node proved the datagram came from.
+///
+/// `src_node_id` names an identity — a family of devices. `src_device` names
+/// which member to ANSWER (the session peer of a direct session, whose key the
+/// handshake proved), so a host can send its acknowledgement to the device
+/// that is waiting for it rather than to whichever sibling routing picks.
+/// NULL when the carrying path could not say. For replies only, never for
+/// authorization — that is `provenance`.
+///
+/// Installed with [`veil_app_set_recv_handler_v2`]. The buffer contract
+/// differs from v1's: ONE owned buffer laid out
+/// `[src_node_id(32) | src_app_id(32) | src_device(32) | data]`, the pointers
+/// offsets into it (`src_device` points into it even when the device is
+/// unknown, and is then passed as NULL), freed with
+/// `veil_free_buf(src_node_id, 96 + len)`.
+pub type VeilRecvCbV2 = Option<
+    unsafe extern "C" fn(
+        user: *mut std::ffi::c_void,
+        src_node_id: *const u8, // 32 bytes
+        src_app_id: *const u8,  // 32 bytes
+        src_device: *const u8,  // 32 bytes, or NULL when unknown
+        provenance: u8,         // VEIL_PROVENANCE_* — unknown ⇒ CLAIMED
+        reply_id: u64,          // 0 = not repliable
+        data: *const u8,
+        len: size_t,
+    ),
+>;
+
 // ── Sender provenance (X/V-01) ───────────────────────────────────────────────
 //
 // The wire bytes of veil's `SenderProvenance`, restated at the C boundary so a
@@ -2259,16 +2287,40 @@ pub const VEIL_PROVENANCE_SIGNED: u8 = 3;
 /// held across the C callback.
 #[derive(Clone, Copy)]
 struct RecvCbSlot {
-    cb: unsafe extern "C" fn(
-        *mut std::ffi::c_void,
-        *const u8,
-        *const u8,
-        u8,
-        u64,
-        *const u8,
-        size_t,
-    ),
+    cb: RecvFn,
     user_addr: usize,
+}
+
+/// Which callback contract the installed handler speaks: they differ in one
+/// argument and in the layout (and so the free length) of the buffer.
+#[derive(Clone, Copy)]
+enum RecvFn {
+    /// [`VeilRecvCb`]: buffer `[node | app | data]`, freed as `64 + len`.
+    V1(
+        unsafe extern "C" fn(
+            *mut std::ffi::c_void,
+            *const u8,
+            *const u8,
+            u8,
+            u64,
+            *const u8,
+            size_t,
+        ),
+    ),
+    /// [`VeilRecvCbV2`]: buffer `[node | app | device | data]`, freed as
+    /// `96 + len`.
+    V2(
+        unsafe extern "C" fn(
+            *mut std::ffi::c_void,
+            *const u8,
+            *const u8,
+            *const u8,
+            u8,
+            u64,
+            *const u8,
+            size_t,
+        ),
+    ),
 }
 
 /// Install a recv handler that calls `cb` for every incoming datagram on this
@@ -2300,14 +2352,44 @@ pub unsafe extern "C" fn veil_app_set_recv_handler(
     if let Err(rc) = unsafe { guard::ffi_prelude(err_out, "veil_app_set_recv_handler") } {
         return rc;
     }
-    null_check!(err_out,
-        "app" => app,
-    );
     // audit: callback was retyped to `Option<fn>` so NULL
     // becomes a valid `None` representation that we can detect and
     // reject gracefully — pre-fix a raw `unsafe extern "C" fn` would
     // be silently dereferenced (segfault, NOT a panic, so catch_unwind
     // could not intercept).
+    unsafe { install_recv_handler(app, cb.map(RecvFn::V1), user, err_out) }
+}
+
+/// [`veil_app_set_recv_handler`] for a [`VeilRecvCbV2`] callback, which is
+/// also told the device the datagram came from. Same replace-on-every-call and
+/// `user`-lifetime contract; the buffer handed to the callback has the v2
+/// layout and MUST be freed as `veil_free_buf(src_node_id, 96 + len)`.
+///
+/// # Safety
+/// As [`veil_app_set_recv_handler`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn veil_app_set_recv_handler_v2(
+    app: *mut VeilApp,
+    cb: VeilRecvCbV2,
+    user: *mut std::ffi::c_void,
+    err_out: *mut *mut c_char,
+) -> c_int {
+    if let Err(rc) = unsafe { guard::ffi_prelude(err_out, "veil_app_set_recv_handler_v2") } {
+        return rc;
+    }
+    unsafe { install_recv_handler(app, cb.map(RecvFn::V2), user, err_out) }
+}
+
+/// The body both setters share, after each has checked its own prelude.
+unsafe fn install_recv_handler(
+    app: *mut VeilApp,
+    cb: Option<RecvFn>,
+    user: *mut std::ffi::c_void,
+    err_out: *mut *mut c_char,
+) -> c_int {
+    null_check!(err_out,
+        "app" => app,
+    );
     let cb_fn = match cb {
         Some(f) => f,
         None => {
@@ -2393,6 +2475,7 @@ async fn run_recv_dispatch_loop(
         src_app_id,
         data,
         reply_id,
+        src_device,
         ..
     }) = msg_rx.recv().await
     {
@@ -2429,29 +2512,57 @@ async fn run_recv_dispatch_loop(
         // out `[node_id(32) | app_id(32) | data]`; the three pointers are
         // offsets into it and it stays valid until the callee calls
         // `veil_free_buf(node_id_ptr, 64 + data_len)`.
+        //
+        // v2 inserts the 32-byte device after the app id — always, so the
+        // offsets and the free length are fixed — and passes NULL for it when
+        // the node could not say.
         let data_len = data.len();
-        let total_len = 64 + data_len;
+        let head = match cb {
+            RecvFn::V1(_) => 64,
+            RecvFn::V2(_) => 96,
+        };
+        let total_len = head + data_len;
         let mut combined: Vec<u8> = Vec::with_capacity(total_len);
         combined.extend_from_slice(&src_node_id);
         combined.extend_from_slice(&src_app_id);
+        if head == 96 {
+            combined.extend_from_slice(&src_device.unwrap_or([0u8; 32]));
+        }
         combined.extend_from_slice(&data);
         let base: *mut u8 = Box::into_raw(combined.into_boxed_slice()).cast();
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
-            cb(
-                user_ptr,
-                base.cast_const(),         // src_node_id (32 bytes)
-                base.add(32).cast_const(), // src_app_id  (32 bytes)
-                // X/V-01: the trust level the node decided for `src_node_id`,
-                // travelling BY VALUE (one byte, no lifetime) right beside the
-                // 32 bytes it qualifies. Everything upstream of here already
-                // carried it; this call is where it used to be dropped, which
-                // left every host treating an authenticated peer and a frame
-                // that merely named one as the same thing.
-                provenance.as_u8(),
-                reply_id,                  // 0 = not repliable
-                base.add(64).cast_const(), // data        (data_len bytes)
-                data_len,
-            );
+            match cb {
+                RecvFn::V1(cb) => cb(
+                    user_ptr,
+                    base.cast_const(),         // src_node_id (32 bytes)
+                    base.add(32).cast_const(), // src_app_id  (32 bytes)
+                    // X/V-01: the trust level the node decided for
+                    // `src_node_id`, travelling BY VALUE (one byte, no
+                    // lifetime) right beside the 32 bytes it qualifies.
+                    // Everything upstream of here already carried it; this
+                    // call is where it used to be dropped, which left every
+                    // host treating an authenticated peer and a frame that
+                    // merely named one as the same thing.
+                    provenance.as_u8(),
+                    reply_id,                  // 0 = not repliable
+                    base.add(64).cast_const(), // data        (data_len bytes)
+                    data_len,
+                ),
+                RecvFn::V2(cb) => cb(
+                    user_ptr,
+                    base.cast_const(),         // src_node_id (32 bytes)
+                    base.add(32).cast_const(), // src_app_id  (32 bytes)
+                    if src_device.is_some() {
+                        base.add(64).cast_const() // src_device (32 bytes)
+                    } else {
+                        std::ptr::null()
+                    },
+                    provenance.as_u8(),
+                    reply_id,                  // 0 = not repliable
+                    base.add(96).cast_const(), // data        (data_len bytes)
+                    data_len,
+                ),
+            }
         }));
         if result.is_err() {
             // The callee panicked before it could take ownership / free —

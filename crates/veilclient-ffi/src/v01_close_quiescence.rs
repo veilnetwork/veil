@@ -103,6 +103,7 @@ fn frame(n: u8) -> IncomingMessage {
         src_app_id: [n; 32],
         data: vec![n; 8],
         reply_id: 0,
+        src_device: None,
     }
 }
 
@@ -114,7 +115,7 @@ fn v01_control_live_slot_dispatches_every_frame() {
     let rt = build_runtime().expect("runtime");
     let probe = Box::new(CbProbe::new(Duration::ZERO));
     let cb_cell = Arc::new(StdMutex::new(Some(RecvCbSlot {
-        cb: probe_recv_cb,
+        cb: RecvFn::V1(probe_recv_cb),
         user_addr: (&*probe as *const CbProbe) as usize,
     })));
     let (tx, rx) = mpsc::channel::<IncomingMessage>(8);
@@ -154,7 +155,7 @@ fn v01_close_does_not_return_while_a_dispatch_is_in_flight() {
     let rt = build_runtime().expect("runtime");
     let probe = Box::new(CbProbe::new(DWELL));
     let cb_cell = Arc::new(StdMutex::new(Some(RecvCbSlot {
-        cb: probe_recv_cb,
+        cb: RecvFn::V1(probe_recv_cb),
         user_addr: (&*probe as *const CbProbe) as usize,
     })));
     let (tx, rx) = mpsc::channel::<IncomingMessage>(8);
@@ -240,7 +241,7 @@ fn v01_retired_slot_drops_frames_without_entering_the_trampoline() {
     let rt = build_runtime().expect("runtime");
     let probe = Box::new(CbProbe::new(Duration::ZERO));
     let cb_cell = Arc::new(StdMutex::new(Some(RecvCbSlot {
-        cb: probe_recv_cb,
+        cb: RecvFn::V1(probe_recv_cb),
         user_addr: (&*probe as *const CbProbe) as usize,
     })));
     let (tx, rx) = mpsc::channel::<IncomingMessage>(8);
@@ -342,7 +343,7 @@ fn v01_reentrant_caller_defers_instead_of_deadlocking() {
     let rt = build_runtime().expect("runtime");
     let probe = Box::new(CbProbe::new(Duration::ZERO));
     let cb_cell = Arc::new(StdMutex::new(Some(RecvCbSlot {
-        cb: probe_recv_cb,
+        cb: RecvFn::V1(probe_recv_cb),
         user_addr: (&*probe as *const CbProbe) as usize,
     })));
     let (tx, rx) = mpsc::channel::<IncomingMessage>(8);
@@ -389,4 +390,63 @@ fn v01_reentrant_caller_defers_instead_of_deadlocking() {
          deferred"
     );
     drop(tx);
+}
+
+/// What a v2 callback saw of one datagram.
+/// One datagram as a v2 host saw it: the origin device (or none), the data.
+type SeenWithDevice = (Option<[u8; 32]>, Vec<u8>);
+
+#[derive(Default)]
+struct V2Probe {
+    seen: StdMutex<Vec<SeenWithDevice>>,
+}
+
+unsafe extern "C" fn probe_recv_cb_v2(
+    user: *mut std::ffi::c_void,
+    node_id: *const u8,
+    _app_id: *const u8,
+    src_device: *const u8,
+    _provenance: u8,
+    _reply_id: u64,
+    data: *const u8,
+    data_len: size_t,
+) {
+    let probe = unsafe { &*(user as *const V2Probe) };
+    let device = (!src_device.is_null()).then(|| {
+        let mut d = [0u8; 32];
+        d.copy_from_slice(unsafe { std::slice::from_raw_parts(src_device, 32) });
+        d
+    });
+    let body = unsafe { std::slice::from_raw_parts(data, data_len) }.to_vec();
+    probe.seen.lock().unwrap().push((device, body));
+    // The v2 buffer is `[node_id | app_id | device | data]`: 96 + len.
+    unsafe { veil_free_buf(node_id as *mut u8, 96 + data_len) };
+}
+
+/// A v2 handler is told the device the node proved the datagram came from,
+/// and NULL when it could not say — with the data where the v2 layout puts
+/// it either way, so a host reads the payload, not the device, as data.
+#[test]
+fn a_v2_handler_is_told_the_origin_device_or_null() {
+    let rt = build_runtime().expect("runtime");
+    let probe = Box::new(V2Probe::default());
+    let cb_cell = Arc::new(StdMutex::new(Some(RecvCbSlot {
+        cb: RecvFn::V2(probe_recv_cb_v2),
+        user_addr: (&*probe as *const V2Probe) as usize,
+    })));
+    let (tx, rx) = mpsc::channel::<IncomingMessage>(8);
+    let task = rt.spawn(run_recv_dispatch_loop(rx, Arc::clone(&cb_cell)));
+    rt.block_on(async move {
+        let mut known = frame(1);
+        known.src_device = Some([0xDE; 32]);
+        tx.send(known).await.expect("send");
+        tx.send(frame(2)).await.expect("send");
+        drop(tx);
+    });
+    rt.block_on(task).expect("dispatch loop");
+    let seen = probe.seen.lock().unwrap();
+    assert_eq!(
+        *seen,
+        vec![(Some([0xDE; 32]), vec![1u8; 8]), (None, vec![2u8; 8])],
+    );
 }

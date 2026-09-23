@@ -2503,7 +2503,7 @@ class AppHandle implements Finalizable {
   bool _closed = false;
 
   StreamController<IncomingMessage>? _msgController;
-  NativeCallable<ffi.VeilRecvCbNative>? _recvCallable;
+  NativeCallable<ffi.VeilRecvCbV2Native>? _recvCallable;
 
   /// 32-byte deterministic identifier of this endpoint.
   Uint8List get appId => _appId;
@@ -2872,27 +2872,40 @@ class AppHandle implements Finalizable {
       return _msgController!.stream;
     }
     final controller = StreamController<IncomingMessage>.broadcast();
-    final callable = NativeCallable<ffi.VeilRecvCbNative>.listener(
-      (Pointer<Void> _, Pointer<Uint8> srcNode, Pointer<Uint8> srcApp,
-          int provenanceByte, int replyId, Pointer<Uint8> dataPtr, int len) {
+    final callable = NativeCallable<ffi.VeilRecvCbV2Native>.listener(
+      (
+        Pointer<Void> _,
+        Pointer<Uint8> srcNode,
+        Pointer<Uint8> srcApp,
+        Pointer<Uint8> srcDevicePtr,
+        int provenanceByte,
+        int replyId,
+        Pointer<Uint8> dataPtr,
+        int len,
+      ) {
         final src = Uint8List.fromList(srcNode.asTypedList(32));
         final app = Uint8List.fromList(srcApp.asTypedList(32));
+        final device = srcDevicePtr == nullptr
+            ? null
+            : Uint8List.fromList(srcDevicePtr.asTypedList(32));
         final data = len > 0
             ? Uint8List.fromList(dataPtr.asTypedList(len))
             : Uint8List(0);
         // cycle-7 H6: srcNode/srcApp/dataPtr are offsets into ONE callee-owned
-        // buffer ([nodeId(32) | appId(32) | data]); free it via the base
-        // pointer (srcNode) with the total length, after copying all three.
+        // buffer — v2's [nodeId(32) | appId(32) | device(32) | data], the
+        // device slot present even when srcDevicePtr is NULL; free it via the
+        // base pointer (srcNode) with the total length, after copying.
         // `replyId` and `provenanceByte` are by-value scalars (not in the
         // buffer) — nothing to free.
         // This callback runs on the isolate AFTER the Rust frame returned, so
         // reading these pointers was a use-after-free before they became owned.
-        ffi.veilFreeBuf(srcNode, 64 + len);
+        ffi.veilFreeBuf(srcNode, 96 + len);
         controller.add(IncomingMessage(
           srcNodeId: src,
           srcAppId: app,
           data: data,
           replyId: replyId,
+          srcDevice: device,
           // X/V-01: what the node knows about `src`. `fromWire` fails closed,
           // so a byte this build does not recognise arrives as
           // `SenderProvenance.claimed` — never as a level it cannot vouch for.
@@ -2902,7 +2915,7 @@ class AppHandle implements Finalizable {
     );
     final errOut = calloc<Pointer<Utf8>>();
     try {
-      final rc = ffi.veilAppSetRecvHandler(
+      final rc = ffi.veilAppSetRecvHandlerV2(
         _app,
         callable.nativeFunction,
         nullptr,

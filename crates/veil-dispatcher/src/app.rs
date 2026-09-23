@@ -165,9 +165,12 @@ impl FrameDispatcher {
                 // session this frame arrived on, not from the frame body, so
                 // it is a real identity — the one case that earns
                 // `SessionPeer` outright.
-                self.app_registry.route_ipc_deliver(
+                // And the session peer is the DEVICE, which is who waits for
+                // the answer (see `origin_device`).
+                self.app_registry.route_ipc_deliver_from_device(
                     sender,
                     veil_app::registry::SenderProvenance::SessionPeer,
+                    *node_id.as_bytes(),
                     payload.src_app_id,
                     payload.app_id,
                     payload.endpoint_id,
@@ -222,9 +225,12 @@ impl FrameDispatcher {
                         } else {
                             veil_app::registry::SenderProvenance::SessionPeer
                         };
-                        self.app_registry.route_ipc_deliver(
+                        // The session peer is the device that sealed it and
+                        // is waiting for the answer (see `origin_device`).
+                        self.app_registry.route_ipc_deliver_from_device(
                             sender,
                             provenance,
+                            *node_id.as_bytes(),
                             payload.src_app_id,
                             payload.app_id,
                             payload.endpoint_id,
@@ -633,6 +639,34 @@ mod tests {
             AppMsg::AppSendUnopenable as u16,
             "the reply that makes the sender re-key instead of retrying forever"
         );
+    }
+
+    /// A frame over a direct session reaches the app naming the DEVICE it
+    /// came from — the session peer, which the handshake proved — beside the
+    /// sender. That is who waits for the acknowledgement: answering the
+    /// identity instead let routing pick a sibling, and the device that sent
+    /// kept re-sending into a flood of misrouted acks.
+    #[test]
+    fn a_direct_frame_names_the_device_it_came_from() {
+        let device = [0xD7u8; 32];
+        let disp = crate::make_test_dispatcher(veil_cfg::NodeRole::Core);
+        let (_handle, mut rx) = disp.app_registry.register([0x22; 32], 7, 4);
+        let body = veil_proto::app::AppSendPayload {
+            src_app_id: [0x11; 32],
+            app_id: [0x22; 32],
+            endpoint_id: 7,
+            data: veil_bufpool::pooled_shared_from_vec(b"hi".to_vec()),
+        }
+        .encode();
+        let mut hdr = FrameHeader::new(FrameFamily::App as u8, AppMsg::AppSend as u16);
+        hdr.body_len = body.len() as u32;
+        disp.dispatch(&hdr, &body, device);
+        match rx.try_recv() {
+            Ok(veil_app::registry::AppMessage::Deliver { origin_device, .. }) => {
+                assert_eq!(origin_device, Some(device));
+            }
+            other => panic!("expected a Deliver, got {other:?}"),
+        }
     }
 
     /// A frame of a conversation we no longer hold — what every frame of the
