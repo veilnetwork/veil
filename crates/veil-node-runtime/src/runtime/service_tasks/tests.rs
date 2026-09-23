@@ -3095,6 +3095,58 @@ fn reply_path_picker_accepts_a_connected_anonymity_relay_without_its_rd() {
     );
 }
 
+/// A relay whose directory entry we hold is preferred as R over one we know
+/// only by its handshake flag: the path to R is built from that entry, and a
+/// draw on the other kind failed the registration with `NoRelays` — the onion
+/// sims' flake, 6 runs of 16, every one this branch. Asked many times, because
+/// the draw is random and one lucky pick proves nothing.
+#[test]
+fn reply_path_picker_prefers_a_relay_whose_directory_entry_is_held() {
+    use crate::types::{LinkId, NodeId, SessionInfo, SessionSource, SessionState};
+
+    let flag_only = [0x55u8; 32];
+    let with_entry = [0x66u8; 32];
+    let mut sessions = std::collections::BTreeMap::new();
+    for (idx, node) in [flag_only, with_entry].iter().enumerate() {
+        sessions.insert(
+            LinkId::new(idx as u64 + 1),
+            SessionInfo {
+                link_id: LinkId::new(idx as u64 + 1),
+                node_id: Some(NodeId::from(*node)),
+                sovereign_node_id: None,
+                nonce: None,
+                matched_peer_id: None,
+                source: SessionSource::Inbound(crate::types::ListenId::new(1)),
+                listener_handle: None,
+                state: SessionState::Active,
+                transport: "test".to_owned(),
+                remote_addr: None,
+                description: String::new(),
+            },
+        );
+    }
+    let live = Arc::new(std::sync::Mutex::new(sessions));
+    let dht = Arc::new(veil_dht::KademliaService::new([9u8; 32]));
+    dht.store_local(
+        veil_anonymity::directory::relay_directory_dht_key(&with_entry),
+        vec![1, 2, 3],
+    );
+    let both =
+        veil_proto::session::cap_flags::CAN_RELAY | veil_proto::session::cap_flags::ANONYMITY_RELAY;
+    let caps = Arc::new(std::sync::RwLock::new(std::collections::HashMap::from([
+        (flag_only, both),
+        (with_entry, both),
+    ])));
+
+    for draw in 0..64 {
+        assert_eq!(
+            pick_rendezvous_relay(&live, &dht, &caps, &[]),
+            Some(with_entry),
+            "draw {draw}: a relay we can build a path to beats one we cannot",
+        );
+    }
+}
+
 #[test]
 fn rendezvous_replica_picker_requires_anonymity_relay_capability() {
     use crate::types::{LinkId, NodeId, SessionInfo, SessionSource, SessionState};

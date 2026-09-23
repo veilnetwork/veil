@@ -493,9 +493,27 @@ pub(crate) fn pick_rendezvous_relay(
     if eligible.is_empty() {
         return None;
     }
+    // Among them, one whose directory entry we already hold, whenever there is
+    // one. The path to R is built from that entry (`select_onion_relay_path_to`
+    // refuses an R it cannot find), so a draw that landed on a relay known only
+    // by its handshake flag failed the registration outright — `NoRelays`,
+    // at random, one draw in however many relays were connected. Measured as 6
+    // of 16 runs of the onion-service sims, every one of them that branch. The
+    // handshake flag still counts when it is ALL there is: then no draw could
+    // do better, and the caller's own warm-up is what can.
+    let with_entry: Vec<[u8; 32]> = eligible
+        .iter()
+        .copied()
+        .filter(|c| rendezvous_relay_published(dht, c))
+        .collect();
+    let pool = if with_entry.is_empty() {
+        &eligible
+    } else {
+        &with_entry
+    };
     use rand_core::{OsRng, RngCore};
-    let idx = (OsRng.next_u64() % eligible.len() as u64) as usize;
-    Some(eligible[idx])
+    let idx = (OsRng.next_u64() % pool.len() as u64) as usize;
+    Some(pool[idx])
 }
 
 /// Derive the 16-byte rendezvous auth-cookie DETERMINISTICALLY from a node_id:
