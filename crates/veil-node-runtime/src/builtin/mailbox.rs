@@ -1230,6 +1230,7 @@ mod tests {
             endpoint_id: veil_mailbox::MAILBOX_WAKE_ENDPOINT_ID,
             data: veil_bufpool::pooled_shared_from_vec(Vec::new()),
             reply_id: 0,
+            origin_device: None,
         }
     }
 
@@ -1346,6 +1347,7 @@ mod tests {
             endpoint_id: MAILBOX_ACK_ENDPOINT_ID,
             data: veil_bufpool::pooled_shared_from_vec(data),
             reply_id: 0,
+            origin_device: None,
         }
     }
 
@@ -1521,6 +1523,7 @@ mod tests {
                 endpoint_id: MAILBOX_PUT_ENDPOINT_ID,
                 data: veil_bufpool::pooled_shared_from_vec(payload),
                 reply_id: 0,
+                origin_device: None,
             })
             .expect("send to PUT");
 
@@ -1569,6 +1572,7 @@ mod tests {
                 endpoint_id: MAILBOX_PUT_ENDPOINT_ID,
                 data: veil_bufpool::pooled_shared_from_vec(payload),
                 reply_id: 0,
+                origin_device: None,
             })
             .unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -1588,6 +1592,7 @@ mod tests {
                 endpoint_id: MAILBOX_PUT_ENDPOINT_ID,
                 data: veil_bufpool::pooled_shared_from_vec(dup),
                 reply_id: 0,
+                origin_device: None,
             })
             .unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -1617,6 +1622,7 @@ mod tests {
                 endpoint_id: veil_mailbox::MAILBOX_WAKE_ENDPOINT_ID,
                 data: veil_bufpool::pooled_shared_from_vec(Vec::new()),
                 reply_id: 0,
+                origin_device: None,
             })
             .unwrap();
         let ev = tokio::time::timeout(std::time::Duration::from_secs(1), events.recv())
@@ -1667,6 +1673,7 @@ mod tests {
                 endpoint_id: MAILBOX_PUT_ENDPOINT_ID,
                 data: veil_bufpool::pooled_shared_from_vec(payload),
                 reply_id: 0,
+                origin_device: None,
             })
             .unwrap();
 
@@ -1717,6 +1724,7 @@ mod tests {
                 endpoint_id: MAILBOX_PUT_ENDPOINT_ID,
                 data: veil_bufpool::pooled_shared_from_vec(payload),
                 reply_id: 0,
+                origin_device: None,
             })
             .unwrap();
         // Wait for the put to complete.
@@ -1751,6 +1759,7 @@ mod tests {
                 endpoint_id: MAILBOX_PUT_ENDPOINT_ID,
                 data: veil_bufpool::pooled_shared_from_vec(vec![0u8; 10]), // way too short for header
                 reply_id: 0,
+                origin_device: None,
             })
             .unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -1766,6 +1775,7 @@ mod tests {
                 endpoint_id: MAILBOX_PUT_ENDPOINT_ID,
                 data: veil_bufpool::pooled_shared_from_vec(valid),
                 reply_id: 0,
+                origin_device: None,
             })
             .unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -1806,6 +1816,7 @@ mod tests {
                 endpoint_id: MAILBOX_PUT_ENDPOINT_ID,
                 data: veil_bufpool::pooled_shared_from_vec(valid),
                 reply_id: 0,
+                origin_device: None,
             })
             .unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -1953,6 +1964,7 @@ mod tests {
             endpoint_id: MAILBOX_FETCH_ENDPOINT_ID,
             data: veil_bufpool::pooled_shared_from_vec(Vec::new()),
             reply_id: 99,
+            origin_device: None,
         };
         handle_fetch_message(&mailbox, Some(&sender), msg).await;
 
@@ -1987,6 +1999,7 @@ mod tests {
             endpoint_id: MAILBOX_FETCH_ENDPOINT_ID,
             data: veil_bufpool::pooled_shared_from_vec(Vec::new()),
             reply_id: 5,
+            origin_device: None,
         };
         handle_fetch_message(&mailbox, Some(&sender), anon).await;
         // No reply path (reply_id == 0): nowhere to answer → drop.
@@ -1999,6 +2012,7 @@ mod tests {
             endpoint_id: MAILBOX_FETCH_ENDPOINT_ID,
             data: veil_bufpool::pooled_shared_from_vec(Vec::new()),
             reply_id: 0,
+            origin_device: None,
         };
         handle_fetch_message(&mailbox, Some(&sender), noreply).await;
         assert!(
@@ -2033,6 +2047,7 @@ mod tests {
             endpoint_id: MAILBOX_FETCH_ENDPOINT_ID,
             data: veil_bufpool::pooled_shared_from_vec(Vec::new()),
             reply_id: 42,
+            origin_device: None,
         };
         handle_fetch_message(&mailbox, Some(&sender), spoofed).await;
         assert!(
@@ -2063,6 +2078,7 @@ mod tests {
                 endpoint_id: MAILBOX_ACK_ENDPOINT_ID,
                 data: veil_bufpool::pooled_shared_from_vec(content_id.to_vec()),
                 reply_id: 0,
+                origin_device: None,
             },
         );
         assert_eq!(
@@ -2084,6 +2100,7 @@ mod tests {
                 endpoint_id: MAILBOX_ACK_ENDPOINT_ID,
                 data: veil_bufpool::pooled_shared_from_vec(content_id.to_vec()),
                 reply_id: 0,
+                origin_device: None,
             },
         );
         assert!(
@@ -2122,6 +2139,7 @@ mod tests {
             endpoint_id: MAILBOX_FETCH_ENDPOINT_ID,
             data: veil_bufpool::pooled_shared_from_vec(Vec::new()),
             reply_id: 13,
+            origin_device: None,
         };
         handle_fetch_message(&mailbox, Some(&sender), msg).await;
 
@@ -2178,6 +2196,7 @@ mod tests {
             endpoint_id: MAILBOX_FETCH_ENDPOINT_ID,
             data: veil_bufpool::pooled_shared_from_vec(Vec::new()),
             reply_id: 55,
+            origin_device: None,
         };
         handle_fetch_message(&mailbox, Some(&sender), msg).await;
 
@@ -2221,6 +2240,7 @@ mod tests {
             endpoint_id: MAILBOX_SLICE_ENDPOINT_ID,
             data: veil_bufpool::pooled_shared_from_vec(req.encode()),
             reply_id: 34,
+            origin_device: None,
         };
         handle_slice_message(&mailbox, Some(&sender), msg).await;
 
@@ -2256,6 +2276,7 @@ mod tests {
             endpoint_id: MAILBOX_SLICE_ENDPOINT_ID,
             data: veil_bufpool::pooled_shared_from_vec(req2.encode()),
             reply_id: 35,
+            origin_device: None,
         };
         handle_slice_message(&mailbox, Some(&sender), msg2).await;
         let cap = captured.lock().unwrap();
@@ -2294,6 +2315,7 @@ mod tests {
             endpoint_id: MAILBOX_FETCH_ENDPOINT_ID,
             data: veil_bufpool::pooled_shared_from_vec(Vec::new()),
             reply_id: 21,
+            origin_device: None,
         };
         handle_fetch_message(&mailbox, Some(&sender), msg).await;
 
@@ -2338,6 +2360,7 @@ mod tests {
                 endpoint_id: MAILBOX_ACK_ENDPOINT_ID,
                 data: veil_bufpool::pooled_shared_from_vec(cid.to_vec()),
                 reply_id: 0,
+                origin_device: None,
             },
         );
         assert!(
@@ -2381,6 +2404,7 @@ mod tests {
             endpoint_id: MAILBOX_FETCH_ENDPOINT_ID,
             data: veil_bufpool::pooled_shared_from_vec(Vec::new()),
             reply_id: 7,
+            origin_device: None,
         };
         handle_fetch_message(&mailbox, Some(&sender), msg).await;
 
@@ -2447,6 +2471,7 @@ mod tests {
                     endpoint_id: MAILBOX_SLICE_ENDPOINT_ID,
                     data: veil_bufpool::pooled_shared_from_vec(req),
                     reply_id: 9,
+                    origin_device: None,
                 },
             )
             .await;
@@ -2505,6 +2530,7 @@ mod tests {
                     .encode(),
                 ),
                 reply_id: 9,
+                origin_device: None,
             },
         )
         .await;
@@ -2546,6 +2572,7 @@ mod tests {
                     .encode(),
                 ),
                 reply_id: 9,
+                origin_device: None,
             },
         )
         .await;
@@ -2732,6 +2759,7 @@ mod tests {
                     endpoint_id: MAILBOX_PUT_ENDPOINT_ID,
                     data: veil_bufpool::pooled_shared_from_vec(chunk),
                     reply_id: 0,
+                    origin_device: None,
                 },
             );
         }
@@ -2758,6 +2786,7 @@ mod tests {
                     endpoint_id: MAILBOX_PUT_ENDPOINT_ID,
                     data: veil_bufpool::pooled_shared_from_vec(chunk),
                     reply_id: 0,
+                    origin_device: None,
                 },
             );
         }
@@ -2802,6 +2831,7 @@ mod tests {
                     endpoint_id: MAILBOX_PUT_ENDPOINT_ID,
                     data: veil_bufpool::pooled_shared_from_vec(chunk),
                     reply_id: 0,
+                    origin_device: None,
                 },
             );
         }
@@ -2832,6 +2862,7 @@ mod tests {
                 endpoint_id: MAILBOX_PUT_ENDPOINT_ID,
                 data: veil_bufpool::pooled_shared_from_vec(ok),
                 reply_id: 0,
+                origin_device: None,
             },
         );
         let both = mb.fetch(recv).unwrap();

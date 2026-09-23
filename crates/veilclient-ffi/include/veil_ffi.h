@@ -691,6 +691,32 @@ typedef void (*VeilRecvCb)(void *user,
                            size_t len);
 
 /**
+ * [`VeilRecvCb`] plus the DEVICE the node proved the datagram came from.
+ *
+ * `src_node_id` names an identity — a family of devices. `src_device` names
+ * which member to ANSWER (the session peer of a direct session, whose key the
+ * handshake proved), so a host can send its acknowledgement to the device
+ * that is waiting for it rather than to whichever sibling routing picks.
+ * NULL when the carrying path could not say. For replies only, never for
+ * authorization — that is `provenance`.
+ *
+ * Installed with [`veil_app_set_recv_handler_v2`]. The buffer contract
+ * differs from v1's: ONE owned buffer laid out
+ * `[src_node_id(32) | src_app_id(32) | src_device(32) | data]`, the pointers
+ * offsets into it (`src_device` points into it even when the device is
+ * unknown, and is then passed as NULL), freed with
+ * `veil_free_buf(src_node_id, 96 + len)`.
+ */
+typedef void (*VeilRecvCbV2)(void *user,
+                             const uint8_t *src_node_id,
+                             const uint8_t *src_app_id,
+                             const uint8_t *src_device,
+                             uint8_t provenance,
+                             uint64_t reply_id,
+                             const uint8_t *data,
+                             size_t len);
+
+/**
  * Snapshot of the daemon's mobile/battery state, populated by
  * `veil_get_mobile_status`. All fields are scalar wire bytes;
  * apps interpret sentinels themselves (`battery_level_pct == 100`
@@ -1197,6 +1223,17 @@ int veil_send_reply(VeilApp *app,
  * now stated precisely.)
  */
  int veil_app_set_recv_handler(VeilApp *app, VeilRecvCb cb, void *user, char **err_out) ;
+
+/**
+ * [`veil_app_set_recv_handler`] for a [`VeilRecvCbV2`] callback, which is
+ * also told the device the datagram came from. Same replace-on-every-call and
+ * `user`-lifetime contract; the buffer handed to the callback has the v2
+ * layout and MUST be freed as `veil_free_buf(src_node_id, 96 + len)`.
+ *
+ * # Safety
+ * As [`veil_app_set_recv_handler`].
+ */
+ int veil_app_set_recv_handler_v2(VeilApp *app, VeilRecvCbV2 cb, void *user, char **err_out) ;
 
 /**
  * Open a reliable byte-stream to a remote endpoint.

@@ -131,7 +131,7 @@ async fn stamped_provenance_survives_from_the_delivery_layer_to_the_ffi_edge() {
 
     let probe = Box::new(EdgeProbe::default());
     let cb_cell = Arc::new(StdMutex::new(Some(RecvCbSlot {
-        cb: edge_cb,
+        cb: RecvFn::V1(edge_cb),
         user_addr: (&*probe as *const EdgeProbe) as usize,
     })));
     let dispatch_task = tokio::spawn(run_recv_dispatch_loop(msg_rx, Arc::clone(&cb_cell)));
@@ -371,4 +371,114 @@ fn provenance_byte_matches_core_enum() {
             "unknown level {unknown} must read as CLAIMED",
         );
     }
+}
+
+/// What a v2 host saw: the origin device (or none) and the payload.
+/// One datagram as a v2 host saw it: the origin device (or none), the data.
+type SeenWithDevice = (Option<[u8; 32]>, Vec<u8>);
+
+#[derive(Default)]
+struct DeviceProbe {
+    seen: StdMutex<Vec<SeenWithDevice>>,
+}
+
+unsafe extern "C" fn device_cb(
+    user: *mut std::ffi::c_void,
+    node_id: *const u8,
+    _app_id: *const u8,
+    src_device: *const u8,
+    _provenance: u8,
+    _reply_id: u64,
+    data: *const u8,
+    data_len: size_t,
+) {
+    let probe = unsafe { &*(user as *const DeviceProbe) };
+    let device = (!src_device.is_null()).then(|| {
+        <[u8; 32]>::try_from(unsafe { std::slice::from_raw_parts(src_device, 32) })
+            .expect("32-byte device")
+    });
+    let payload = unsafe { std::slice::from_raw_parts(data, data_len) }.to_vec();
+    probe
+        .seen
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push((device, payload));
+    // v2 buffer: `[node_id | app_id | device | data]`.
+    unsafe { veil_free_buf(node_id as *mut u8, 96 + data_len) };
+}
+
+/// The device a direct frame came from travels the whole way to a v2 host:
+/// delivery layer → IPC frame → SDK → FFI callback. Every hop had a way to
+/// drop it silently, and the one before it (`sender_device_id`) is dropped at
+/// the IPC hop by design; this is the check that this one is not.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_origin_device_survives_from_the_delivery_layer_to_a_v2_host() {
+    let sock = temp_socket();
+    let registry = Arc::new(veil_app::AppEndpointRegistry::new());
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let mut server = veil_ipc::IpcServer::new(
+        veil_ipc::IpcEndpoint::Unix(sock.clone()),
+        shutdown_rx,
+        Arc::clone(&registry),
+        NODE_ID,
+    );
+    let server_task = tokio::spawn(async move {
+        let _ = server.run().await;
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let client = veilclient::VeilClient::connect(&sock)
+        .await
+        .expect("connect to the test daemon");
+    let app_handle = client
+        .bind_named(NS, NAME, ENDPOINT)
+        .await
+        .expect("bind endpoint");
+    let (_sender, receiver) = app_handle.into_split();
+    let (msg_rx, _streams) = receiver.into_parts();
+    let probe = Box::new(DeviceProbe::default());
+    let cb_cell = Arc::new(StdMutex::new(Some(RecvCbSlot {
+        cb: RecvFn::V2(device_cb),
+        user_addr: (&*probe as *const DeviceProbe) as usize,
+    })));
+    let dispatch_task = tokio::spawn(run_recv_dispatch_loop(msg_rx, Arc::clone(&cb_cell)));
+
+    let app = veil_app::address::app_id(&NODE_ID, NS, NAME);
+    let device = [0xD7u8; 32];
+    assert!(registry.route_ipc_deliver_from_device(
+        CONTACT,
+        SenderProvenance::SessionPeer,
+        device,
+        [0xA1u8; 32],
+        app,
+        ENDPOINT,
+        veil_bufpool::pooled_shared_from_vec(b"from a device".to_vec()),
+    ));
+    assert!(registry.route_ipc_deliver(
+        CONTACT,
+        SenderProvenance::Claimed,
+        [0xA1u8; 32],
+        app,
+        ENDPOINT,
+        veil_bufpool::pooled_shared_from_vec(b"no device known".to_vec()),
+    ));
+    let t0 = Instant::now();
+    while probe.seen.lock().unwrap_or_else(|e| e.into_inner()).len() < 2 {
+        assert!(
+            t0.elapsed() < Duration::from_secs(10),
+            "deliveries never reached the FFI callback",
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let seen = probe.seen.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    assert_eq!(
+        seen,
+        vec![
+            (Some(device), b"from a device".to_vec()),
+            (None, b"no device known".to_vec()),
+        ],
+    );
+    dispatch_task.abort();
+    let _ = shutdown_tx.send(true);
+    let _ = tokio::time::timeout(Duration::from_secs(2), server_task).await;
+    let _ = std::fs::remove_file(&sock);
 }

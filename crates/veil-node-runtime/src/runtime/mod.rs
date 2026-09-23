@@ -2185,6 +2185,7 @@ impl NodeRuntime {
             // ignores this byte. Stated as `Claimed` so the wire never carries
             // a claim of proof.
             provenance: veil_proto::SenderProvenance::Claimed,
+            origin_device: None,
         };
         // Tag the sealed plaintext so the receiver can distinguish a plain
         // delivery from an authenticated one (`send_via_rendezvous_authenticated`

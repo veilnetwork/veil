@@ -348,6 +348,7 @@ mod tests {
                 endpoint_id: 42,
                 data: veil_bufpool::pooled_shared_from_vec(b"hello-builtin".to_vec()),
                 reply_id: 0,
+                origin_device: None,
             })
             .expect("send to registered endpoint");
 

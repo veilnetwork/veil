@@ -116,6 +116,22 @@ typedef VeilRecvCb = void Function(
   int len,
 );
 
+// v2 adds `srcDevice`: the DEVICE the node proved the datagram came from
+// (NULL when it could not say), so an answer can go to the member of the
+// sender's family that is waiting for it. The buffer is
+// `[srcNodeId(32) | srcAppId(32) | srcDevice(32) | data]`, freed as
+// `96 + len` — not v1's `64 + len`.
+typedef VeilRecvCbV2Native = Void Function(
+  Pointer<Void> user,
+  Pointer<Uint8> srcNodeId,
+  Pointer<Uint8> srcAppId,
+  Pointer<Uint8> srcDevice,
+  Uint8 provenance,
+  Uint64 replyId,
+  Pointer<Uint8> data,
+  IntPtr len,
+);
+
 // ── Sender provenance wire bytes (X/V-01) ───────────────────────────────────
 // Mirror of veil's `SenderProvenance` discriminants and of the
 // `VEIL_PROVENANCE_*` constants in veil_ffi.h. `SenderProvenance.fromWire`
@@ -543,6 +559,22 @@ final int Function(
               Pointer<Void>,
               Pointer<Pointer<Utf8>>,
             )>>('veil_app_set_recv_handler')
+    .asFunction();
+
+final int Function(
+  Pointer<VeilApp>,
+  Pointer<NativeFunction<VeilRecvCbV2Native>>,
+  Pointer<Void>,
+  Pointer<Pointer<Utf8>>,
+) veilAppSetRecvHandlerV2 = nativeLib
+    .lookup<
+        NativeFunction<
+            Int32 Function(
+              Pointer<VeilApp>,
+              Pointer<NativeFunction<VeilRecvCbV2Native>>,
+              Pointer<Void>,
+              Pointer<Pointer<Utf8>>,
+            )>>('veil_app_set_recv_handler_v2')
     .asFunction();
 
 final int Function(

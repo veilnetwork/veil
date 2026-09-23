@@ -751,6 +751,7 @@ async fn forward_endpoint(
                     endpoint_id: p.endpoint_id,
                     data: p.data,
                     reply_id: 0,
+                    origin_device: None,
                 };
                 encode_ipc_frame(LocalAppMsg::AppDeliver as u16, &deliver.encode())
             }
@@ -760,6 +761,8 @@ async fn forward_endpoint(
                 // Relay-internal (mailbox box authorization) — AppDeliverPayload
                 // has no field for it, deliberately: no wire change.
                 sender_device_id: _,
+                // Which device to answer: this one does ride to the client.
+                origin_device,
                 src_app_id,
                 app_id,
                 endpoint_id,
@@ -777,6 +780,7 @@ async fn forward_endpoint(
                     endpoint_id,
                     data,
                     reply_id,
+                    origin_device,
                 };
                 encode_ipc_frame(LocalAppMsg::AppDeliver as u16, &deliver.encode())
             }
@@ -791,6 +795,7 @@ async fn forward_endpoint(
                     endpoint_id: p.endpoint_id,
                     data: veil_bufpool::pooled_shared_from_vec(p.data),
                     reply_id: 0,
+                    origin_device: None,
                 };
                 encode_ipc_frame(LocalAppMsg::AppDeliver as u16, &deliver.encode())
             }
@@ -888,6 +893,7 @@ async fn forward_endpoint(
                     endpoint_id: payload.endpoint_id,
                     data: veil_bufpool::pooled_shared_from_vec(payload.payload),
                     reply_id: 0,
+                    origin_device: None,
                 };
                 encode_ipc_frame(LocalAppMsg::AppDeliver as u16, &deliver.encode())
             }
