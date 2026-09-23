@@ -240,6 +240,10 @@ fn relay_hops_to_try(
     hops
 }
 
+/// Relay hops found BEFORE the seal: what discovery returned, and the full
+/// ordered list built on it (see [`ordinary_relay_hops`]).
+type PlannedRelay = (Option<[u8; 32]>, Vec<[u8; 32]>);
+
 /// Next hops for an ORDINARY (non-realtime) send that has no direct session.
 ///
 /// The discovered route first, then its cached alternatives — as before. What
@@ -688,7 +692,66 @@ pub(crate) async fn handle_ipc_send(
     //   by the media codec; the whole point of that flag is to pass the cell
     //   through untouched.
     let ratchet_ok = !send.anonymous && !relay_realtime && !relay_media_sealed;
-    let sealed = if ratchet_ok && send.dst_node_id != *local_node_id {
+    let remote = send.dst_node_id != *local_node_id;
+
+    // THE PATH BEFORE THE SEAL. A ratchet seal spends a step of the sending
+    // chain and the host persists it, whether or not the frame then goes
+    // anywhere. It used to come first, so every send that ended in NO_ROUTE
+    // still burned a step — and an outbox re-driving a frame to an unreachable
+    // peer burned hundreds an hour. The receiver skips at most MAX_SKIP unseen
+    // steps; past that nothing opens and the conversation has to start over.
+    // Measured on a two-device stand (2026-09-23): one sending chain at 26 240
+    // after a day of re-drives into no route, the other side at single digits.
+    //
+    // So a send with no live direct session finds its relay hops FIRST, and
+    // one with none answers NO_ROUTE having sealed nothing. A direct session
+    // that dies between this check and the send still falls back to the relay
+    // with the very same sealed bytes, as before.
+    let direct_live = remote
+        && !relay_realtime
+        && session_tx_registry.is_some_and(|reg| {
+            let active = reg.active_node_ids();
+            let devices = reg.devices_of(&send.dst_node_id);
+            if devices.is_empty() {
+                active.contains(&send.dst_node_id)
+            } else {
+                devices.iter().any(|device| active.contains(device))
+            }
+        });
+    let mut planned: Option<PlannedRelay> = None;
+    if ratchet_ok
+        && remote
+        && !direct_live
+        && !send.my_other_devices
+        && let Some(reg) = session_tx_registry
+    {
+        let discovered = try_lookup_or_discover(
+            &send.dst_node_id,
+            local_node_id,
+            route_cache,
+            session_tx_registry,
+            route_updated,
+            peer_mlkem_keys,
+            ctx.pending_recursive.as_deref(),
+        )
+        .await;
+        // Tentatively sealed: the ratchet is about to seal it. If it then does
+        // not, the list is rebuilt below without the live-session tail.
+        let hops = ordinary_relay_hops(discovered, &send.dst_node_id, route_cache, reg, true);
+        if hops.is_empty() {
+            let mut hdr = FrameHeader::new(
+                FrameFamily::LocalApp as u8,
+                LocalAppMsg::AppSendFailed as u16,
+            );
+            hdr.body_len = 2;
+            let mut frame = codec::encode_header(&hdr).to_vec();
+            frame.extend_from_slice(&ipc_send_err::NO_ROUTE.to_be_bytes());
+            return sink.write_all(&frame).await;
+        }
+        planned = Some((discovered, hops));
+    }
+
+    let sealed = if ratchet_ok && remote {
         try_ratchet_seal(ctx, &send.dst_node_id, &send.data).await
     } else {
         None
@@ -772,7 +835,15 @@ pub(crate) async fn handle_ipc_send(
             // No direct session. Try relay via RouteCache next-hop.
             // If the cache is empty, attempt reactive route discovery:
             // flood a ROUTE_REQUEST and wait up to 500 ms for a response.
-            let forced_relay_hops = if relay_realtime {
+            let forced_relay_hops = if let Some((discovered, hops)) = planned.take() {
+                // Found before the seal. Kept as found only if the payload is
+                // in fact sealed; otherwise the live-session tail goes.
+                if sealed.is_some() || relay_media_sealed || peer_mlkem_keys.is_some() {
+                    hops
+                } else {
+                    ordinary_relay_hops(discovered, &send.dst_node_id, route_cache, reg, false)
+                }
+            } else if relay_realtime {
                 relay_hops_to_try(&send.dst_node_id, route_cache, reg)
             } else {
                 // Sealed below whichever way it goes: by the ratchet already
@@ -2272,7 +2343,34 @@ mod ratchet_send_tests {
         assert_eq!(forwards, 0, "a plaintext frame was handed to a relay");
     }
 
-    /// The anonymous path is standard traffic and must keep working. Gating it
+    /// NOWHERE TO GO, NOTHING SPENT. With no session and no hop the frame goes
+    /// nowhere, and it used to burn a step of the sending chain anyway: an
+    /// outbox re-driving into no route walked one conversation 26 240 steps
+    /// ahead of a receiver that can skip 1 000 (stand, 2026-09-23).
+    #[tokio::test]
+    async fn a_send_with_no_path_spends_no_ratchet_step() {
+        let fx = fixture(vec![]);
+        wlock!(fx.route_cache).invalidate(&PEER);
+        for _ in 0..3 {
+            let mut wh = sink().await;
+            handle_ipc_send(
+                &mut SendReply::Inline(&mut wh),
+                &payload(false, b"into the void"),
+                &fx.ctx(true),
+            )
+            .await
+            .expect("send");
+        }
+        assert!(fx.taken().is_empty(), "premise: nothing had anywhere to go");
+        assert_eq!(
+            fx.me.store.version(),
+            0,
+            "a send that went nowhere advanced the ratchet",
+        );
+        assert!(fx.me.store.is_empty(), "and opened no conversation either");
+    }
+
+    /// The anonymous path is standard traffic and must keep working. Gating it    /// The anonymous path is standard traffic and must keep working. Gating it
     /// behind the ratchet would have been the easy mistake: a ratchet is a
     /// NAMED two-party object, so running one here would put both device
     /// identities in front of the recipient and destroy the property the path
