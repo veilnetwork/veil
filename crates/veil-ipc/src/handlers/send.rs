@@ -755,6 +755,50 @@ pub(crate) async fn handle_ipc_send(
         planned = Some((discovered, hops));
     }
 
+    // ONE SEAL PER DEVICE when the address is an identity (defect №35, its
+    // identity-addressed half). The transport below hands one frame to EVERY
+    // live device of an identity, and a ratchet payload is keyed to exactly
+    // one of them: sealed once, it opened at one device and every other one
+    // refused it as `NotForThisDevice`, answered "cannot open", and the sender
+    // dropped the conversation that was working. Measured on a three-node
+    // stand (2026-09-24): 82 such refusals at one device in the three minutes
+    // after a restart. And the pairing that keeps a seal on the session's own
+    // device never applied here at all — it is looked up by the session's
+    // device id, which an identity is not — so even a single live device was
+    // sealed to whichever row the certificate cache happened to hold.
+    //
+    // Each device is sealed under the pairing its own handshake proved, so
+    // each frame opens where it lands. Only live devices: a seal spends a
+    // chain step, and a device that cannot be handed the frame must not cost
+    // one (see "the path before the seal" above). If none of them takes it,
+    // the ordinary path below still runs, relay and all.
+    if ratchet_ok
+        && remote
+        && ctx.ratchet.is_some()
+        && let Some(reg) = session_tx_registry
+    {
+        let active = reg.active_node_ids();
+        let devices: Vec<[u8; 32]> = reg
+            .devices_of(&send.dst_node_id)
+            .into_iter()
+            .filter(|d| active.contains(d))
+            .collect();
+        let mut any_sent = false;
+        for device in &devices {
+            let sealed = try_ratchet_seal(ctx, device, &send.data).await;
+            let frame = app_send_frame(&send, sealed.as_ref().map(|(p, _)| p.as_slice()));
+            if reg.send_to(device, veil_proto::header::priority::INTERACTIVE, frame) {
+                any_sent = true;
+                if sealed.is_some() {
+                    emit_e2e_plaintext_capture(capture_tx, local_node_id, device, &send.data);
+                }
+            }
+        }
+        if any_sent {
+            return app_send_ok(sink, send.require_ack).await;
+        }
+    }
+
     let sealed = if ratchet_ok && remote {
         try_ratchet_seal(ctx, &send.dst_node_id, &send.data).await
     } else {
@@ -796,32 +840,7 @@ pub(crate) async fn handle_ipc_send(
         // whole of its confidentiality, and it stopped at the far end of that
         // one link. The relay path was E2E-sealed and this one was not, which
         // is the opposite of where the traffic is.
-        let app_msg_type = match &sealed {
-            Some(_) => veil_proto::family::AppMsg::AppSendSealed,
-            None => veil_proto::family::AppMsg::AppSend,
-        };
-        let ovl1_payload = AppSendPayload {
-            src_app_id: send.src_app_id,
-            app_id: send.app_id,
-            endpoint_id: send.endpoint_id,
-            data: match &sealed {
-                Some((payload, _)) => veil_bufpool::pooled_shared_from_vec(payload.clone()),
-                None => send.data.clone(),
-            },
-        };
-        let payload_bytes = ovl1_payload.encode();
-        // before fragmenting large payloads, the session's
-        // `negotiated_caps.chunking` flag must be checked. When chunking is not
-        // negotiated, payloads exceeding the single-frame limit must be rejected
-        // with an error rather than silently truncated or forwarded oversized.
-        // This guard will be enforced here once introduces fragmentation.
-        let mut hdr = FrameHeader::new(
-            veil_proto::family::FrameFamily::App as u8,
-            app_msg_type as u16,
-        );
-        hdr.body_len = payload_bytes.len() as u32;
-        let mut frame = codec::encode_header(&hdr).to_vec();
-        frame.extend_from_slice(&payload_bytes);
+        let frame = app_send_frame(&send, sealed.as_ref().map(|(p, _)| p.as_slice()));
 
         // `dst_node_id` is whatever the APP addressed, and an app addresses a
         // contact — an identity. The session under it is registered by device.
@@ -1369,18 +1388,59 @@ pub(crate) async fn handle_ipc_send(
         }
     }
 
-    // APP_SEND_OK — fire-and-forget clients (e.g. ogate) skip the ack.
-    // Phase E24 (2026-05-22): writing AppSendOk per APP_SEND added a full
-    // IPC frame syscall round-trip per IP packet on the hot path —
-    // single-stream throughput cap measured ~150 Mbps (12K pps) before
-    // and after this fix.  Honoring `require_ack=false` halves the IPC
-    // syscall count per send and frees enough budget to push pps higher.
-    if send.require_ack {
+    app_send_ok(sink, send.require_ack).await
+}
+
+/// APP_SEND_OK — fire-and-forget clients (e.g. ogate) skip the ack.
+///
+/// Phase E24 (2026-05-22): writing AppSendOk per APP_SEND added a full
+/// IPC frame syscall round-trip per IP packet on the hot path —
+/// single-stream throughput cap measured ~150 Mbps (12K pps) before
+/// and after this fix.  Honoring `require_ack=false` halves the IPC
+/// syscall count per send and frees enough budget to push pps higher.
+async fn app_send_ok(sink: &mut SendReply<'_>, require_ack: bool) -> std::io::Result<()> {
+    if require_ack {
         let ok_hdr = FrameHeader::new(FrameFamily::LocalApp as u8, LocalAppMsg::AppSendOk as u16);
         sink.write_all(&codec::encode_header(&ok_hdr)).await
     } else {
         Ok(())
     }
+}
+
+/// The OVL1 frame one direct session is handed: APP_SEND_SEALED around a
+/// ratchet payload, or the app's bytes as a plain APP_SEND.
+///
+/// A distinct frame type rather than the same one carrying different bytes:
+/// `data` is whatever the application put there, so no marker byte inside it
+/// could be reserved without stealing a byte some app legitimately sends.
+fn app_send_frame(send: &AppIpcSendPayload, sealed: Option<&[u8]>) -> Vec<u8> {
+    let app_msg_type = match sealed {
+        Some(_) => veil_proto::family::AppMsg::AppSendSealed,
+        None => veil_proto::family::AppMsg::AppSend,
+    };
+    let ovl1_payload = AppSendPayload {
+        src_app_id: send.src_app_id,
+        app_id: send.app_id,
+        endpoint_id: send.endpoint_id,
+        data: match sealed {
+            Some(payload) => veil_bufpool::pooled_shared_from_vec(payload.to_vec()),
+            None => send.data.clone(),
+        },
+    };
+    let payload_bytes = ovl1_payload.encode();
+    // before fragmenting large payloads, the session's
+    // `negotiated_caps.chunking` flag must be checked. When chunking is not
+    // negotiated, payloads exceeding the single-frame limit must be rejected
+    // with an error rather than silently truncated or forwarded oversized.
+    // This guard will be enforced here once introduces fragmentation.
+    let mut hdr = FrameHeader::new(
+        veil_proto::family::FrameFamily::App as u8,
+        app_msg_type as u16,
+    );
+    hdr.body_len = payload_bytes.len() as u32;
+    let mut frame = codec::encode_header(&hdr).to_vec();
+    frame.extend_from_slice(&payload_bytes);
+    frame
 }
 
 // ── APP_RT_SEND handler ──────────────────────────────────────────────────────
@@ -1716,12 +1776,18 @@ mod ratchet_send_tests {
     const RELAY: [u8; 32] = [0xE0u8; 32];
     const PEER_INSTANCE: [u8; 16] = [0xB1u8; 16];
     const MY_INSTANCE: [u8; 16] = [0xA1u8; 16];
+    /// PEER's second device in [`family_fixture`].
+    const SIBLING_INSTANCE: [u8; 16] = [0xB2u8; 16];
 
     /// Captures everything the handler hands to a session.
     #[derive(Default)]
     struct Outbox {
         live: Vec<[u8; 32]>,
         sent: Mutex<Vec<([u8; 32], Vec<u8>)>>,
+        /// The devices the session layer knows under identity `PEER`. Empty
+        /// for every single-name fixture, which keeps them on the path they
+        /// always took.
+        family: Vec<[u8; 32]>,
     }
 
     impl FrameBroadcaster for Outbox {
@@ -1735,6 +1801,13 @@ mod ratchet_send_tests {
         fn send_to_all_with_priority(&self, _priority: u8, _bytes: Arc<[u8]>) {}
         fn active_node_ids(&self) -> Vec<[u8; 32]> {
             self.live.clone()
+        }
+        fn devices_of(&self, identity: &[u8; 32]) -> Vec<[u8; 32]> {
+            if *identity == PEER {
+                self.family.clone()
+            } else {
+                Vec::new()
+            }
         }
     }
 
@@ -1783,6 +1856,20 @@ mod ratchet_send_tests {
         }
         fn session_pairing(&self, peer: &[u8; 32]) -> Option<veil_types::SessionPairing> {
             (*peer == self.device).then_some(self.pairing)
+        }
+    }
+
+    /// Several live sessions, each to a device whose handshake proved it
+    /// belongs to `PEER` — what a person with two devices online looks like
+    /// from a contact's node.
+    struct FamilySessions(Vec<([u8; 32], veil_types::SessionPairing)>);
+
+    impl veil_types::SessionInstanceLookup for FamilySessions {
+        fn session_instance(&self, peer: &[u8; 32]) -> Option<[u8; 16]> {
+            self.session_pairing(peer).map(|p| p.instance)
+        }
+        fn session_pairing(&self, peer: &[u8; 32]) -> Option<veil_types::SessionPairing> {
+            self.0.iter().find(|(d, _)| d == peer).map(|(_, p)| *p)
         }
     }
 
@@ -1893,6 +1980,7 @@ mod ratchet_send_tests {
             outbox: Arc::new(Outbox {
                 live: live_peers,
                 sent: Mutex::new(Vec::new()),
+                family: Vec::new(),
             }),
             route_cache: Arc::new(route_cache),
             peer_mlkem: Arc::new(peer_mlkem),
@@ -1909,7 +1997,6 @@ mod ratchet_send_tests {
     /// mismatch, on purpose. Returns the fixture and the sibling's runtime so
     /// tests can prove where a frame is (and is not) openable.
     fn family_fixture() -> (Fixture, veil_e2e::RatchetRuntime) {
-        const SIBLING_INSTANCE: [u8; 16] = [0xB2u8; 16];
         let mut fx = fixture(vec![PEER, RELAY]);
         let sibling_ring = ring(0xC5);
         let peer_ring = std::sync::Arc::clone(&fx.peer.seed_ring.read().expect("ring"));
@@ -2191,6 +2278,83 @@ mod ratchet_send_tests {
             .expect("the device the session terminates at opens it");
         assert_eq!(opened.plaintext, b"to the device the session ends at");
         assert!(opened.authenticated);
+    }
+
+    /// Defect №35, the identity-addressed half. A contact addresses a PERSON,
+    /// and the transport hands the frame to every live device of that person.
+    /// Sealed once, it was keyed to one device — whichever row the certificate
+    /// cache held, since the session pairing is looked up by device id and an
+    /// identity is not one — so every other device refused it, said so, and
+    /// the sender dropped the conversation that worked. Measured on the stand
+    /// as 82 refusals in three minutes at one device.
+    ///
+    /// Proven where it matters: EACH device opens the frame it was handed.
+    #[tokio::test]
+    async fn an_identity_send_is_sealed_separately_for_each_live_device() {
+        const DEVICE_ONE: [u8; 32] = [0xB7u8; 32];
+        const DEVICE_TWO: [u8; 32] = [0xB8u8; 32];
+        let (mut fx, sibling) = family_fixture();
+        fx.outbox = Arc::new(Outbox {
+            live: vec![DEVICE_ONE, DEVICE_TWO, RELAY],
+            sent: Mutex::new(Vec::new()),
+            family: vec![DEVICE_ONE, DEVICE_TWO],
+        });
+        let mut ctx = fx.ctx(true);
+        ctx.session_instance_lookup = Some(Arc::new(FamilySessions(vec![
+            (
+                DEVICE_ONE,
+                veil_types::SessionPairing {
+                    identity: PEER,
+                    instance: PEER_INSTANCE,
+                },
+            ),
+            (
+                DEVICE_TWO,
+                veil_types::SessionPairing {
+                    identity: PEER,
+                    instance: SIBLING_INSTANCE,
+                },
+            ),
+        ])));
+
+        let mut wh = sink().await;
+        handle_ipc_send(
+            &mut SendReply::Inline(&mut wh),
+            &payload(false, b"to every device of a person"),
+            &ctx,
+        )
+        .await
+        .expect("send");
+
+        let sent = fx.taken();
+        let mut devices: Vec<[u8; 32]> = sent.iter().map(|(d, _)| *d).collect();
+        devices.sort_unstable();
+        assert_eq!(
+            devices,
+            vec![DEVICE_ONE, DEVICE_TWO],
+            "every live device of the person is still handed the message",
+        );
+        let now = veil_util::unix_secs_now_u64();
+        for (device, frame) in &sent {
+            let hdr = veil_proto::codec::decode_header(frame).expect("header");
+            assert_eq!(
+                hdr.msg_type,
+                veil_proto::family::AppMsg::AppSendSealed as u16,
+                "each copy is sealed, not sent in the clear to make it fit",
+            );
+            let body = veil_proto::app::AppSendPayload::decode(&frame[veil_proto::HEADER_SIZE..])
+                .expect("body");
+            let at = if *device == DEVICE_ONE {
+                &fx.peer
+            } else {
+                &sibling
+            };
+            let opened = at
+                .open_payload(&ME, &body.data, now)
+                .unwrap_or_else(|e| panic!("device {:02x} cannot open its copy: {e}", device[0]));
+            assert_eq!(opened.plaintext, b"to every device of a person");
+            assert!(opened.authenticated);
+        }
     }
 
     /// The fail-open half of the rule: no session-named instance (no live
