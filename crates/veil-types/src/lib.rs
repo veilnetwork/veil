@@ -324,6 +324,24 @@ pub trait SessionInstanceLookup: Send + Sync {
     fn session_pairing(&self, _peer_node_id: &[u8; 32]) -> Option<SessionPairing> {
         None
     }
+
+    /// The same pair for one of OUR OWN devices, from our own signed document
+    /// and instance registry rather than from a live session.
+    ///
+    /// Without a session, [`Self::session_pairing`] has nothing to say, and a
+    /// sibling addressed by its device id was sealed to a conversation keyed
+    /// by that device id — while every frame the sibling sends back arrives
+    /// under the IDENTITY and opens a conversation keyed by that. Two
+    /// conversations where there should be one, and the first never turns:
+    /// measured on a two-device stand (2026-09-23) as a sending chain at
+    /// 26 240 beside a live one at 7. Our own devices need no network to be
+    /// named: the document that delegates them is already ours.
+    ///
+    /// `None` for anyone who is not one of our devices, and whenever the
+    /// document and registry do not map the device to exactly one instance.
+    fn own_device_pairing(&self, _device_id: &[u8; 32]) -> Option<SessionPairing> {
+        None
+    }
 }
 
 /// The identity/device pair a live session proved. See

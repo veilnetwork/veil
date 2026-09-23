@@ -196,11 +196,15 @@ impl NodeRuntime {
             // whichever registry row the resolver's zero-valued freshness tie
             // happened to hand back. The session registry's validated
             // identities are the one place that knows the far device.
-            .with_session_instance_lookup(Arc::new(
-                veil_session::glue::SessionInstanceDirectory::new(Arc::clone(
+            .with_session_instance_lookup(Arc::new(super::offline_seal::OwnDeviceAwareLookup {
+                sessions: veil_session::glue::SessionInstanceDirectory::new(Arc::clone(
                     &self.session_registry,
                 )),
-            ))
+                // …and our own devices from our own document, so a
+                // sibling with no live session is keyed by the identity
+                // it answers under, not by the device id.
+                sovereign: self.identity.sovereign_identity.clone(),
+            }))
             .with_relay_key_resolver(relay_key_resolver)
             // The SAME conversations the frame dispatcher opens with. Two
             // stores would mean a session advanced on send and not on receive:
