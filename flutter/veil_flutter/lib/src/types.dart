@@ -710,6 +710,7 @@ class IncomingMessage {
     required this.data,
     this.replyId = 0,
     this.provenance = SenderProvenance.claimed,
+    this.srcDevice,
   });
 
   /// 32-byte BLAKE3 hash of the originating node's signing pubkey.
@@ -737,6 +738,13 @@ class IncomingMessage {
   /// send, or an authenticated send without a reply block). Single-use and
   /// TTL-bounded daemon-side.
   final int replyId;
+
+  /// The DEVICE this came from, when the node proved one (a direct session
+  /// proves its peer device). [srcNodeId] names an identity — a family of
+  /// devices; this names which member to ANSWER, so an acknowledgement reaches
+  /// the device waiting for it. For replies only, never for authorization.
+  /// Null when the path could not say.
+  final Uint8List? srcDevice;
 }
 
 /// Exception raised from the high-level Dart API on FFI failures.

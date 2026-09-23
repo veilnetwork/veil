@@ -2108,6 +2108,7 @@ mod tests {
             data: veil_bufpool::pooled_shared_from_vec(inner_data.clone()),
             reply_id: 0,
             provenance: veil_proto::SenderProvenance::Claimed,
+            origin_device: None,
         };
         // Final-hop payload now starts with a kind tag.
         let mut onion_payload = vec![final_hop_kind::APP_DELIVER];
@@ -2940,6 +2941,7 @@ mod tests {
             data: veil_bufpool::pooled_shared_from_vec(payload.clone()),
             reply_id: 0,
             provenance: veil_proto::SenderProvenance::Claimed,
+            origin_device: None,
         };
         let mut introduce_plain = vec![final_hop_kind::APP_DELIVER];
         introduce_plain.extend_from_slice(&deliver.encode());
@@ -3695,6 +3697,7 @@ mod tests {
             data: veil_bufpool::pooled_shared_from_vec(b"never-arrives".to_vec()),
             reply_id: 0,
             provenance: veil_proto::SenderProvenance::Claimed,
+            origin_device: None,
         };
         let mut onion_payload = vec![final_hop_kind::APP_DELIVER];
         onion_payload.extend_from_slice(&deliver.encode());

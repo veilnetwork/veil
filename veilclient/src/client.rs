@@ -2763,6 +2763,7 @@ async fn reader_task(
                             // returns when `p` drops at end of this arm.
                             data: p.data.to_vec(),
                             reply_id: p.reply_id,
+                            src_device: p.origin_device,
                         });
                     }
                 }

@@ -225,6 +225,8 @@ async fn process_auth_deliver(
         // The verified signer DEVICE (from the same signature) — the only
         // delivery path entitled to pass `Some` here.
         Some(sender_device_id),
+        // And therefore the device to answer.
+        Some(sender_device_id),
         [0u8; 32], // AuthAppDeliver carries no src_app_id in v1
         app_id,
         endpoint_id,

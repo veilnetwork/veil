@@ -577,7 +577,12 @@ impl SenderProvenance {
 /// [104..104+data_len] data bytes
 /// [.. +8] reply_id u64 BE
 /// [.. +1] provenance u8 ([`SenderProvenance`])
+/// [.. +33] OPTIONAL: ORIGIN_DEVICE_TAG u8 ‖ origin device [u8; 32]
 /// ```
+///
+/// The optional tail is read only when it is there. A decoder from before it
+/// checks a minimum length and never looked past `provenance`, so it reads a
+/// payload with the tail exactly as it read one without.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AppDeliverPayload {
     /// Originator's `node_id`.
@@ -601,10 +606,24 @@ pub struct AppDeliverPayload {
     /// decides this; the app must consult it before treating `src_node_id` as
     /// an identity rather than a claim.
     pub provenance: SenderProvenance,
+    /// The DEVICE this came from, when the carrying path proves one — the
+    /// session peer of a direct session, say, whose key the handshake proved.
+    /// `src_node_id` names an identity, a whole family of devices; this names
+    /// which member to ANSWER, so an acknowledgement reaches the device that
+    /// is waiting for it rather than whichever sibling routing picks.
+    ///
+    /// For replies only, never for authorization: that is what
+    /// `provenance` (and, in-process, a signature's device) is for. Only the
+    /// node's own delivery to its IPC client sets it; wherever this struct is
+    /// decoded from a REMOTE peer's bytes (the onion final hop) the value is
+    /// that peer's claim and must be ignored.
+    pub origin_device: Option<[u8; 32]>,
 }
 
 impl AppDeliverPayload {
     const FIXED_SIZE: usize = 32 + 32 + 32 + 4 + 4;
+    /// Marks the optional origin-device tail.
+    pub const ORIGIN_DEVICE_TAG: u8 = 0xD1;
 
     /// Encode to wire bytes.
     pub fn encode(&self) -> Vec<u8> {
@@ -620,6 +639,10 @@ impl AppDeliverPayload {
         // header/data offsets are unchanged for the plain path.
         buf.extend_from_slice(&self.reply_id.to_be_bytes());
         buf.push(self.provenance.as_u8());
+        if let Some(device) = &self.origin_device {
+            buf.push(Self::ORIGIN_DEVICE_TAG);
+            buf.extend_from_slice(device);
+        }
         buf
     }
 
@@ -660,6 +683,17 @@ impl AppDeliverPayload {
         let reply_id = super::read_u64_be(buf, total)?;
         // Unknown levels fail closed to `Claimed` — never up.
         let provenance = SenderProvenance::from_wire(buf[end - 1]);
+        // Anything else after `provenance` is not ours to read: a tail this
+        // version does not know stays ignored, as every older decoder ignores
+        // this one.
+        let origin_device = match buf.get(end..) {
+            Some([Self::ORIGIN_DEVICE_TAG, rest @ ..]) if rest.len() >= 32 => {
+                let mut device = [0u8; 32];
+                device.copy_from_slice(&rest[..32]);
+                Some(device)
+            }
+            _ => None,
+        };
         Ok(Self {
             src_node_id,
             src_app_id,
@@ -668,6 +702,7 @@ impl AppDeliverPayload {
             data: pooled.into_shared(),
             reply_id,
             provenance,
+            origin_device,
         })
     }
 }
@@ -6986,6 +7021,7 @@ mod tests {
             data: veil_bufpool::pooled_shared_from_vec(b"hello veil".to_vec()),
             reply_id: 0,
             provenance: SenderProvenance::SessionPeer,
+            origin_device: None,
         };
         let buf = p.encode();
         let d = AppDeliverPayload::decode(&buf).unwrap();
@@ -7011,6 +7047,7 @@ mod tests {
                 data: veil_bufpool::pooled_shared_from_vec(b"payload".to_vec()),
                 reply_id: 7,
                 provenance: level,
+                origin_device: None,
             };
             let d = AppDeliverPayload::decode(&p.encode()).expect("decode");
             assert_eq!(d.provenance, level, "provenance must survive the wire");
@@ -7027,6 +7064,7 @@ mod tests {
             data: veil_bufpool::pooled_shared_from_vec(b"payload".to_vec()),
             reply_id: 0,
             provenance: SenderProvenance::Signed,
+            origin_device: None,
         }
         .encode();
         let last = wire.len() - 1;
@@ -7042,6 +7080,60 @@ mod tests {
         }
     }
 
+    /// The origin device rides as an optional tail AFTER provenance, so
+    /// everything a decoder from before it read is where it always was: the
+    /// same bytes minus the tail decode to the same payload with no device.
+    #[test]
+    fn deliver_carries_the_origin_device_as_an_optional_tail() {
+        let base = AppDeliverPayload {
+            src_node_id: [0x01; 32],
+            src_app_id: [0xAA; 32],
+            app_id: [0x02; 32],
+            endpoint_id: 5,
+            data: veil_bufpool::pooled_shared_from_vec(b"payload".to_vec()),
+            reply_id: 7,
+            provenance: SenderProvenance::SessionPeer,
+            origin_device: None,
+        };
+        let with = AppDeliverPayload {
+            origin_device: Some([0xDE; 32]),
+            ..base.clone()
+        };
+        let plain = base.encode();
+        let tailed = with.encode();
+        assert_eq!(&tailed[..plain.len()], &plain[..], "a TAIL, nothing moved");
+        assert_eq!(tailed.len(), plain.len() + 33);
+
+        let d = AppDeliverPayload::decode(&tailed).expect("decode");
+        assert_eq!(d.origin_device, Some([0xDE; 32]));
+        assert_eq!(d.provenance, SenderProvenance::SessionPeer);
+        assert_eq!(d.reply_id, 7);
+        assert_eq!(d.data.as_ref(), b"payload");
+        assert_eq!(
+            AppDeliverPayload::decode(&plain)
+                .expect("decode")
+                .origin_device,
+            None
+        );
+
+        // A tail this version does not know, or one cut short, is not a device.
+        let mut unknown = plain.clone();
+        unknown.push(0x77);
+        unknown.extend_from_slice(&[0xDE; 32]);
+        assert_eq!(
+            AppDeliverPayload::decode(&unknown)
+                .expect("decode")
+                .origin_device,
+            None
+        );
+        assert_eq!(
+            AppDeliverPayload::decode(&tailed[..tailed.len() - 1])
+                .expect("decode")
+                .origin_device,
+            None,
+        );
+    }
+
     /// A payload truncated to exactly the pre-provenance length must be
     /// REJECTED, not silently read as `Claimed` off the reply_id's last byte.
     #[test]
@@ -7054,6 +7146,7 @@ mod tests {
             data: veil_bufpool::pooled_shared_from_vec(b"payload".to_vec()),
             reply_id: 0,
             provenance: SenderProvenance::Signed,
+            origin_device: None,
         }
         .encode();
         assert!(
@@ -7073,6 +7166,7 @@ mod tests {
             data: veil_bufpool::pooled_shared_from_vec(b"reply please".to_vec()),
             reply_id: 0xDEAD_BEEF_0000_0001,
             provenance: SenderProvenance::Signed,
+            origin_device: None,
         };
         let d = AppDeliverPayload::decode(&p.encode()).unwrap();
         assert_eq!(d, p);
@@ -7090,6 +7184,7 @@ mod tests {
             data: veil_bufpool::pooled_shared_from_vec(vec![]),
             reply_id: 0,
             provenance: SenderProvenance::Claimed,
+            origin_device: None,
         };
         let d = AppDeliverPayload::decode(&p.encode()).unwrap();
         assert_eq!(d, p);
