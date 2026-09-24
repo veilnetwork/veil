@@ -2271,6 +2271,9 @@ async fn handle_ipc_client(
     let spawn_sem = Arc::new(tokio::sync::Semaphore::new(
         MAX_SPAWNED_HANDLERS_PER_CONNECTION,
     ));
+    // Entered before `spawn_sem`, so one slow destination cannot hold the
+    // whole pool (see `send_gates`).
+    let destination_gates = Arc::new(crate::send_gates::DestinationGates::default());
 
     // Push-event subscription. Subscribe once per IPC
     // client; broadcast::Receiver::recv is cancel-safe so it composes
@@ -2497,8 +2500,29 @@ async fn handle_ipc_client(
                                 let body_owned = body;
                                 let reply_tx = reply_tx.clone();
                                 let sem = Arc::clone(&spawn_sem);
+                                let gates = Arc::clone(&destination_gates);
                                 tokio::spawn(async move {
+                                    // The destination's own turn first, holding
+                                    // no pool slot while it waits. A body that
+                                    // does not decode takes no turn: the handler
+                                    // drops it without sending anything.
+                                    let _turn = match veil_proto::AppIpcSendPayload::decode(
+                                        &body_owned,
+                                    ) {
+                                        Ok(send) => Some(gates.enter(send.dst_node_id).await),
+                                        Err(_) => None,
+                                    };
+                                    let waited = std::time::Instant::now();
                                     let _permit = sem.acquire_owned().await;
+                                    let waited_ms = waited.elapsed().as_millis();
+                                    if waited_ms >= 1_000 {
+                                        // Every send slot of this connection was
+                                        // busy: whatever holds them is the stall.
+                                        log::warn!(
+                                            "ipc.send_permit_wait at={} ms={waited_ms}",
+                                            veil_util::unix_secs_now_u64()
+                                        );
+                                    }
                                     let mut sink =
                                         crate::handlers::send::SendReply::Offloop(reply_tx);
                                     if let Err(e) =
