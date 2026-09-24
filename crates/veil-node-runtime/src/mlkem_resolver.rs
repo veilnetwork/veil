@@ -256,8 +256,10 @@ pub struct DhtMlKemEkResolver {
     /// One walk per device at a time: callers asking for the same device while
     /// a walk is running wait for it and read what it found.
     instance_walk_gates: Arc<Mutex<InstanceWalkGates>>,
-    /// Devices whose walk found nothing, and when. See [`INSTANCE_MISS_TTL`].
-    instance_walk_misses: Arc<RwLock<std::collections::HashMap<InstanceKey, std::time::Instant>>>,
+    /// Walks that found nothing: when the last one ended, and how many in a
+    /// row. See [`miss_window`].
+    instance_walk_misses:
+        Arc<RwLock<std::collections::HashMap<InstanceKey, (std::time::Instant, u32)>>>,
     /// How long a miss is believed. [`INSTANCE_MISS_TTL`] outside tests.
     instance_miss_ttl: Duration,
     /// Walks past both caches, for the tests that hold the gate to its word.
@@ -268,7 +270,9 @@ pub struct DhtMlKemEkResolver {
     instance_walk_delay: Duration,
 }
 
-type InstanceKey = ([u8; 32], [u8; 16]);
+/// What one certificate walk is for: a node, and the device of it when a
+/// device was named (`None` = the node's current certificate, whichever device).
+type InstanceKey = ([u8; 32], Option<[u8; 16]>);
 type InstanceWalkGates = std::collections::HashMap<InstanceKey, Arc<tokio::sync::Mutex<()>>>;
 
 /// How long a device whose certificate walk found nothing is left alone.
@@ -278,9 +282,31 @@ type InstanceWalkGates = std::collections::HashMap<InstanceKey, Arc<tokio::sync:
 /// walked again, in parallel with every other send to it. Measured on a stand
 /// right after a restart: thirty walks at once for one absent device, every one
 /// empty, filling the 32 send slots of the app's connection, while a message to
-/// a live device waited behind them for over a minute. Short, because a device
-/// that comes back must become sealable soon; long next to a walk.
-const INSTANCE_MISS_TTL: Duration = Duration::from_secs(30);
+/// a live device waited behind them for over a minute.
+///
+/// Ten seconds, not more: the node-wide resolve shares this memory, and right
+/// after a restart the DHT is cold enough that a LIVE peer's first walk can
+/// miss (measured twice on the stand). A long memory would leave a live peer
+/// unsealable for as long; ten seconds is still two or three walks' worth, so
+/// a node that publishes nothing costs one walk in ten seconds instead of
+/// thirty at once.
+const INSTANCE_MISS_TTL: Duration = Duration::from_secs(10);
+
+/// The longest a run of misses is believed before the node is walked again.
+const MAX_MISS_WINDOW: Duration = Duration::from_secs(5 * 60);
+
+/// How long the `streak`-th miss in a row is believed: the base window,
+/// doubling, up to [`MAX_MISS_WINDOW`].
+///
+/// A fixed window still walked an absent device every ten to fifteen seconds,
+/// and each walk (3–6 s) held every send to it waiting at the gate — measured
+/// at a 9 s median per send on the stand. A node that keeps finding nothing is
+/// asked less and less often; a live peer that missed once on a cold DHT is
+/// asked again after the base window, and its first success ends the run.
+fn miss_window(base: Duration, streak: u32) -> Duration {
+    let doublings = streak.saturating_sub(1).min(16);
+    base.saturating_mul(1u32 << doublings).min(MAX_MISS_WINDOW)
+}
 
 impl DhtMlKemEkResolver {
     /// New resolver bound to a node's runtime components.  `step_timeout`
@@ -539,19 +565,39 @@ impl DhtMlKemEkResolver {
         // (which walked the DHT on *every* seal) fast + resilient to a
         // transient DHT miss, since a live encrypt to the same peer will
         // have warmed this cache moments earlier.
+        if let Some(cert) = self.node_cache_hit(target_node_id) {
+            return Some(cert);
+        }
+        // The EK resolve of a relayed send and the fallback of a seal both land
+        // here, so a node that publishes nothing was walked twice per send.
+        self.walk_once(
+            (target_node_id, None),
+            || self.node_cache_hit(target_node_id),
+            || self.walk_cert(target_node_id),
+        )
+        .await
+    }
+
+    /// The node-keyed verified-cert cache, both clocks.
+    fn node_cache_hit(&self, target_node_id: [u8; 32]) -> Option<VerifiedMlkemCert> {
         let now_for_cache = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
-        if let Some((cert, ts)) = rlock!(self.cert_cache).get(&target_node_id)
-            && cert_is_still_usable(cert, ts, self.cert_ttl, now_for_cache)
-        {
-            let cert = cert.clone();
-            self.log_dbg("mlkem_resolver.cert.cache_hit", &target_node_id, "");
-            // A different lock from the one the `if let` still holds.
-            self.publish_ratchet_key(target_node_id, &cert);
-            return Some(cert);
-        }
+        let cert = {
+            let cache = rlock!(self.cert_cache);
+            let (cert, ts) = cache.get(&target_node_id)?;
+            if !cert_is_still_usable(cert, ts, self.cert_ttl, now_for_cache) {
+                return None;
+            }
+            cert.clone()
+        };
+        self.log_dbg("mlkem_resolver.cert.cache_hit", &target_node_id, "");
+        self.publish_ratchet_key(target_node_id, &cert);
+        Some(cert)
+    }
+
+    async fn walk_cert(&self, target_node_id: [u8; 32]) -> Option<VerifiedMlkemCert> {
         // ── Step 1: IdentityDocument ────────────────────────────────
         // ML-KEM resolves can target any third party (not necessarily a
         // connected peer), so keep the XOR-closest recursive walk.
@@ -692,29 +738,48 @@ impl DhtMlKemEkResolver {
         instance_id: [u8; 16],
     ) -> Option<VerifiedMlkemCert> {
         // ── Step 0: fast paths ──────────────────────────────────────
-        let key = (target_node_id, instance_id);
+        let key = (target_node_id, Some(instance_id));
         if let Some(cert) = self.instance_cache_hit(target_node_id, instance_id) {
             return Some(cert);
         }
+
+        self.walk_once(
+            key,
+            || self.instance_cache_hit(target_node_id, instance_id),
+            || self.walk_cert_for_instance(target_node_id, instance_id),
+        )
+        .await
+    }
+
+    /// One walk per key at a time, and a miss remembered.
+    ///
+    /// Whoever waited behind a walk asks the caches (`cached`) again first:
+    /// the walk it waited for has usually just answered. Every walk that does
+    /// run is logged with how long it took and how many were in flight.
+    async fn walk_once<W, F>(
+        &self,
+        key: InstanceKey,
+        cached: impl Fn() -> Option<VerifiedMlkemCert>,
+        walk: W,
+    ) -> Option<VerifiedMlkemCert>
+    where
+        W: FnOnce() -> F,
+        F: std::future::Future<Output = Option<VerifiedMlkemCert>>,
+    {
         if self.recently_missed(&key) {
             return None;
         }
-
-        // One walk per device at a time. Whoever waited behind a walk asks the
-        // caches again first: the walk it waited for has usually just answered.
         let gate = Arc::clone(
             lock!(self.instance_walk_gates)
                 .entry(key)
                 .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))),
         );
         let turn = gate.lock().await;
-        let out = if let Some(cert) = self.instance_cache_hit(target_node_id, instance_id) {
+        let out = if let Some(cert) = cached() {
             Some(cert)
         } else if self.recently_missed(&key) {
             None
         } else {
-            // Every walk past the caches, how long it took and how many were in
-            // flight at once.
             let walk_started = std::time::Instant::now();
             self.instance_walks
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -723,22 +788,23 @@ impl DhtMlKemEkResolver {
             if !self.instance_walk_delay.is_zero() {
                 tokio::time::sleep(self.instance_walk_delay).await;
             }
-            let found = self
-                .walk_cert_for_instance(target_node_id, instance_id)
-                .await;
+            let found = walk().await;
             INSTANCE_WALKS_IN_FLIGHT.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
             self.logger.info(
                 "mlkem_resolver.instance_cert.walked",
                 format!(
                     "target={} instance={} ms={} concurrent={concurrent} found={}",
-                    hex8(&target_node_id),
-                    veil_util::bytes_to_hex(&instance_id[..4]),
+                    hex8(&key.0),
+                    key.1
+                        .map_or_else(|| "any".to_owned(), |i| veil_util::bytes_to_hex(&i[..4])),
                     walk_started.elapsed().as_millis(),
                     found.is_some(),
                 ),
             );
             if found.is_none() {
                 self.remember_miss(key);
+            } else {
+                self.forget_misses(&key);
             }
             found
         };
@@ -791,17 +857,23 @@ impl DhtMlKemEkResolver {
     fn recently_missed(&self, key: &InstanceKey) -> bool {
         rlock!(self.instance_walk_misses)
             .get(key)
-            .is_some_and(|at| at.elapsed() < self.instance_miss_ttl)
+            .is_some_and(|(at, streak)| at.elapsed() < miss_window(self.instance_miss_ttl, *streak))
     }
 
     fn remember_miss(&self, key: InstanceKey) {
         let mut misses = wlock!(self.instance_walk_misses);
-        // Bounded by what is still believed: an expired miss decides nothing.
+        // Bounded: a run idle for longer than the longest window says nothing
+        // any more, not even how long it was.
         if misses.len() >= 1_024 {
-            let ttl = self.instance_miss_ttl;
-            misses.retain(|_, at| at.elapsed() < ttl);
+            misses.retain(|_, (at, _)| at.elapsed() < MAX_MISS_WINDOW * 2);
         }
-        misses.insert(key, std::time::Instant::now());
+        let streak = misses.get(&key).map_or(0, |(_, s)| *s).saturating_add(1);
+        misses.insert(key, (std::time::Instant::now(), streak));
+    }
+
+    /// A walk found what it looked for: the run of misses is over.
+    fn forget_misses(&self, key: &InstanceKey) {
+        wlock!(self.instance_walk_misses).remove(key);
     }
 
     /// Test seam: how long a miss is believed.
@@ -2423,6 +2495,81 @@ mod tests {
             resolver.instance_walk_count(),
             2,
             "the peer saying our material is wrong is reason to look again now"
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_asks_for_a_node_that_publishes_nothing_walk_once() {
+        // The node-wide resolve behind a relayed send's key and a seal's
+        // fallback: two walks per send to an absent device, every send.
+        let dht = Arc::new(KademliaService::new([1u8; 32]));
+        let target = [7u8; 32];
+        let resolver =
+            Arc::new(make_test_resolver(dht).with_instance_walk_delay(Duration::from_millis(50)));
+        let asks: Vec<_> = (0..10)
+            .map(|_| {
+                let r = Arc::clone(&resolver);
+                tokio::spawn(async move { r.fetch_verified_cert(target).await })
+            })
+            .collect();
+        for ask in asks {
+            assert_eq!(ask.await.expect("task"), None);
+        }
+        assert_eq!(
+            resolver.instance_walk_count(),
+            1,
+            "ten concurrent asks, one walk"
+        );
+        assert_eq!(resolver.fetch_verified_cert(target).await, None);
+        assert_eq!(
+            resolver.instance_walk_count(),
+            1,
+            "and the miss is remembered"
+        );
+        // A device-named ask for the same node is a different question.
+        assert_eq!(
+            resolver
+                .fetch_verified_cert_for_instance(target, [1; 16])
+                .await,
+            None
+        );
+        assert_eq!(resolver.instance_walk_count(), 2);
+    }
+
+    #[test]
+    fn a_run_of_misses_is_believed_longer_each_time() {
+        let base = Duration::from_secs(10);
+        assert_eq!(miss_window(base, 1), Duration::from_secs(10));
+        assert_eq!(miss_window(base, 2), Duration::from_secs(20));
+        assert_eq!(miss_window(base, 3), Duration::from_secs(40));
+        assert_eq!(miss_window(base, 60), MAX_MISS_WINDOW, "capped");
+
+        let resolver = make_test_resolver(Arc::new(KademliaService::new([1u8; 32])));
+        let key = ([9u8; 32], None);
+        resolver.remember_miss(key);
+        resolver.remember_miss(key);
+        assert_eq!(
+            rlock!(resolver.instance_walk_misses)[&key].1,
+            2,
+            "the run is counted"
+        );
+        resolver.forget_misses(&key);
+        resolver.remember_miss(key);
+        assert_eq!(
+            rlock!(resolver.instance_walk_misses)[&key].1,
+            1,
+            "a success ends the run, so the next miss starts over"
+        );
+
+        // And the window read back is the run's, not the base.
+        let short = make_test_resolver(Arc::new(KademliaService::new([1u8; 32])))
+            .with_instance_miss_ttl(Duration::from_millis(30));
+        short.remember_miss(key);
+        short.remember_miss(key);
+        std::thread::sleep(Duration::from_millis(40));
+        assert!(
+            short.recently_missed(&key),
+            "the second miss in a row is believed for twice the base window"
         );
     }
 
