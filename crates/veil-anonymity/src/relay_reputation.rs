@@ -343,22 +343,32 @@ mod tests {
         assert_eq!(rep.rtt_penalty_ms([0xCC; 32]), 0);
     }
 
+    /// Explicit instants, one millisecond apart. With `Instant::now()` the
+    /// four calls can land in one tick of the clock (about 41 ns on Apple
+    /// Silicon), the recency stamps tie, and the victim is whatever the map
+    /// iterates first — the test failed that way once in a workspace run.
     #[test]
     fn lru_evicts_oldest_when_over_cap() {
+        let t0 = Instant::now();
+        let at = |ms: u64| t0 + Duration::from_millis(ms);
         let rep = RelayReputation::with_capacity(3);
-        rep.record_failure([0x01; 32]);
-        rep.record_failure([0x02; 32]);
-        rep.record_failure([0x03; 32]);
+        rep.record_failure_at([0x01; 32], at(0));
+        rep.record_failure_at([0x02; 32], at(1));
+        rep.record_failure_at([0x03; 32], at(2));
         assert_eq!(rep.entry_count(), 3);
 
-        let _ = rep.rtt_penalty_ms([0x01; 32]); // touch 0x01
+        let _ = rep.rtt_penalty_ms_at([0x01; 32], at(3)); // touch 0x01
 
-        rep.record_failure([0x04; 32]); // over-cap insert
+        rep.record_failure_at([0x04; 32], at(4)); // over-cap insert
         assert_eq!(rep.entry_count(), 3);
-        assert!(rep.rtt_penalty_ms([0x01; 32]) > 0);
-        assert_eq!(rep.rtt_penalty_ms([0x02; 32]), 0, "0x02 was LRU victim");
-        assert!(rep.rtt_penalty_ms([0x03; 32]) > 0);
-        assert!(rep.rtt_penalty_ms([0x04; 32]) > 0);
+        assert!(rep.rtt_penalty_ms_at([0x01; 32], at(5)) > 0);
+        assert_eq!(
+            rep.rtt_penalty_ms_at([0x02; 32], at(5)),
+            0,
+            "0x02 was LRU victim"
+        );
+        assert!(rep.rtt_penalty_ms_at([0x03; 32], at(5)) > 0);
+        assert!(rep.rtt_penalty_ms_at([0x04; 32], at(5)) > 0);
     }
 
     #[test]
