@@ -96,6 +96,21 @@ strip = "debuginfo"
 # info but preserves the symbol table — binary grows ~1 MB but stack
 # traces stay readable.
 
+# The identity proof-of-work in a DEV build. Its loop is an Ed25519 signature
+# and a BLAKE3 hash per candidate, both in these crates; unoptimized, mining one
+# identity at the canonical 24 bits took 36–160 s, and it runs wherever a debug
+# library makes an identity — the app's debug builds and the Flutter native
+# tests that load libveilclient_ffi (one such test: 218 s). Only the crates in
+# that loop, so a dev build of everything else is unchanged.
+[profile.dev.package.curve25519-dalek]
+opt-level = 3
+[profile.dev.package.ed25519-dalek]
+opt-level = 3
+[profile.dev.package.sha2]
+opt-level = 3
+[profile.dev.package.blake3]
+opt-level = 3
+
 # Test profile: optimize crypto/PoW hot paths but keep fast compile.
 # opt-level = 1 gives ~3-5× speedup on Argon2id/BLAKE3/Ed25519 tests
 # with only ~30% slower compile vs dev.
