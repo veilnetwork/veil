@@ -2506,12 +2506,20 @@ async fn handle_ipc_client(
                                     // no pool slot while it waits. A body that
                                     // does not decode takes no turn: the handler
                                     // drops it without sending anything.
+                                    let turn_waited = std::time::Instant::now();
                                     let _turn = match veil_proto::AppIpcSendPayload::decode(
                                         &body_owned,
                                     ) {
                                         Ok(send) => Some(gates.enter(send.dst_node_id).await),
                                         Err(_) => None,
                                     };
+                                    let turn_ms = turn_waited.elapsed().as_millis();
+                                    if turn_ms >= 200 {
+                                        log::warn!(
+                                            "ipc.send_turn_wait at={} ms={turn_ms}",
+                                            veil_util::unix_secs_now_u64()
+                                        );
+                                    }
                                     let waited = std::time::Instant::now();
                                     let _permit = sem.acquire_owned().await;
                                     let waited_ms = waited.elapsed().as_millis();
