@@ -19,6 +19,7 @@ use zeroize::{Zeroize, Zeroizing};
 
 use crate::kdf::{kdf_ck, kdf_rk, zeroize_opt};
 use crate::pq::{ML_KEM_768_CT_LEN, ML_KEM_768_EK_LEN, PqEpoch, encapsulate_to};
+use crate::tree::{Holes, MAX_TREE_NODES_PER_CHAIN};
 use crate::{KEY_LEN, RatchetError, RatchetRng, random_array};
 
 /// How many message keys one arriving message may cause us to skip.
@@ -47,6 +48,29 @@ pub(crate) struct Header {
     pub(crate) pq_ek: Option<[u8; ML_KEM_768_EK_LEN]>,
     /// Sender's answer to the encapsulation key we announced.
     pub(crate) pq_ct: Option<[u8; ML_KEM_768_CT_LEN]>,
+    /// This message's chain is a key tree ([`crate::tree`]), not a hash chain.
+    ///
+    /// Set only by a sender whose peer announced it can open one, so a build
+    /// that predates trees — which refuses unknown header flags — never sees
+    /// it. Bound into the AEAD like the rest of the header: flipping it in
+    /// transit derives the wrong key and the frame does not open.
+    pub(crate) tree: bool,
+}
+
+/// How a sending chain derives its message keys.
+///
+/// Decided at the chain's FIRST use, not at its creation: a chain is created
+/// by an asymmetric step on the receive path, and the message that caused it
+/// is not yet decrypted then — its plaintext may be the very one that says the
+/// peer can open a tree.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SendMode {
+    /// Not used yet; becomes one of the other two on first use.
+    Undecided,
+    /// The hash chain, `kdf_ck` one step at a time.
+    Linear,
+    /// The key tree, held in [`RatchetCore::send_tree`].
+    Tree,
 }
 
 /// One end of a conversation.
@@ -91,6 +115,25 @@ pub(crate) struct RatchetCore {
     skipped: BTreeMap<([u8; 32], u32), Zeroizing<[u8; KEY_LEN]>>,
 
     pq: PqEpoch,
+
+    /// Whether the peer has said it can open a tree-mode chain. Learned from
+    /// inside an authenticated plaintext by the layer above, never from a
+    /// header, and never unlearned: a peer that goes back to an older build
+    /// refuses our frames, and that conversation is started over.
+    peer_tree: bool,
+    /// See [`SendMode`].
+    send_mode: SendMode,
+    /// The sending chain as a tree: the subtrees covering indices not yet
+    /// sent. `Some` exactly when `send_mode` is `Tree`; `cks` is then `None`.
+    send_tree: Option<Holes>,
+    /// Whether the CURRENT receiving chain is a tree. Its keys then live in
+    /// `tree_holes` under the peer's current ratchet key, and `ckr` is `None`.
+    recv_tree: bool,
+    /// `peer ratchet key → subtrees still wanted` for every receiving chain
+    /// that is a tree: the current one (future indices and any gaps behind the
+    /// highest received) and the one before it (only its gaps, cut at the `pn`
+    /// its successor announced). Aged by epoch exactly like `skipped`.
+    tree_holes: BTreeMap<[u8; 32], Holes>,
 
     /// Whether we have ever emitted a header. Once we have, the peer has seen
     /// an encapsulation key from us, so every asymmetric step they take must
@@ -158,6 +201,11 @@ impl RatchetCore {
             pn: 0,
             skipped: BTreeMap::new(),
             pq: PqEpoch::new(rng),
+            peer_tree: false,
+            send_mode: SendMode::Undecided,
+            send_tree: None,
+            recv_tree: false,
+            tree_holes: BTreeMap::new(),
             sent_any: false,
         })
     }
@@ -187,6 +235,11 @@ impl RatchetCore {
             pn: 0,
             skipped: BTreeMap::new(),
             pq: PqEpoch::new(rng),
+            peer_tree: false,
+            send_mode: SendMode::Undecided,
+            send_tree: None,
+            recv_tree: false,
+            tree_holes: BTreeMap::new(),
             sent_any: false,
         }
     }
@@ -197,11 +250,27 @@ impl RatchetCore {
 impl RatchetCore {
     /// Advance the sending chain by one and hand back the header and key.
     pub(crate) fn send_step(&mut self) -> Result<(Header, Zeroizing<[u8; KEY_LEN]>), RatchetError> {
-        let cks = self.cks.as_mut().ok_or(RatchetError::NoSendingChain)?;
-        let (next, mk) = kdf_ck(cks);
-        *cks = next;
-
         let n = self.ns;
+        let tree = self.fix_send_mode()?;
+        let mk = if tree {
+            let holes = self
+                .send_tree
+                .as_mut()
+                .ok_or(RatchetError::NoSendingChain)?;
+            let mk = holes
+                .take_leaf(n)
+                .ok_or(RatchetError::MessageKeyUnavailable)?;
+            // Nothing is left behind to erase: taking indices in order splits
+            // off only RIGHT siblings, and a recorded position that jumps ahead
+            // is cut in `skip_send_to`. What stays is one path, ≤ 32 nodes.
+            mk
+        } else {
+            let cks = self.cks.as_mut().ok_or(RatchetError::NoSendingChain)?;
+            let (next, mk) = kdf_ck(cks);
+            *cks = next;
+            mk
+        };
+
         self.ns = self.ns.saturating_add(1);
         self.sent_any = true;
 
@@ -212,9 +281,49 @@ impl RatchetCore {
                 n,
                 pq_ek: Some(*self.pq.ek()),
                 pq_ct: self.pq.pending_ct().copied(),
+                tree,
             },
             mk,
         ))
+    }
+
+    /// Settle how the current sending chain derives keys, at its first use.
+    ///
+    /// A tree only if the peer has said it can open one. Once settled it holds
+    /// for the life of the chain, so every frame of one chain carries the same
+    /// header flag and a receiver never has to guess.
+    fn fix_send_mode(&mut self) -> Result<bool, RatchetError> {
+        match self.send_mode {
+            SendMode::Tree => Ok(true),
+            SendMode::Linear => Ok(false),
+            SendMode::Undecided => {
+                let Some(mut cks) = self.cks else {
+                    return Err(RatchetError::NoSendingChain);
+                };
+                if self.peer_tree {
+                    self.send_tree = Some(Holes::root(&cks));
+                    cks.zeroize();
+                    zeroize_opt(&mut self.cks);
+                    self.cks = None;
+                    self.send_mode = SendMode::Tree;
+                    Ok(true)
+                } else {
+                    self.send_mode = SendMode::Linear;
+                    Ok(false)
+                }
+            }
+        }
+    }
+
+    /// The peer has said, inside an authenticated plaintext, that it can open
+    /// a tree-mode chain. Takes effect at our next NEW sending chain; the one
+    /// in use keeps the mode it started with.
+    pub(crate) fn note_peer_tree(&mut self) {
+        self.peer_tree = true;
+    }
+
+    pub(crate) fn peer_tree(&self) -> bool {
+        self.peer_tree
     }
 
     /// Where the sending chain stands: which chain, and the index the NEXT
@@ -223,7 +332,9 @@ impl RatchetCore {
     /// `None` when there is no sending chain yet (nothing has been sealed and
     /// no root step has run), because there is then no position to reserve.
     pub(crate) fn send_position(&self) -> Option<SendPosition> {
-        self.cks.as_ref()?;
+        if self.cks.is_none() && self.send_tree.is_none() {
+            return None;
+        }
         Some(SendPosition {
             chain: self.dh_pk,
             next: self.ns,
@@ -248,10 +359,18 @@ impl RatchetCore {
                 max: MAX_SEND_SKIP,
             });
         }
-        let cks = self.cks.as_mut().ok_or(RatchetError::NoSendingChain)?;
-        for _ in 0..count {
-            let (next, _burned) = kdf_ck(cks);
-            *cks = next;
+        if self.fix_send_mode()? {
+            // One cut, whatever the distance: nothing below the mark survives.
+            self.send_tree
+                .as_mut()
+                .ok_or(RatchetError::NoSendingChain)?
+                .retain(u64::from(to.next), 1u64 << 32);
+        } else {
+            let cks = self.cks.as_mut().ok_or(RatchetError::NoSendingChain)?;
+            for _ in 0..count {
+                let (next, _burned) = kdf_ck(cks);
+                *cks = next;
+            }
         }
         self.ns = to.next;
         // Not `sent_any`: nothing was emitted. That flag says the peer has
@@ -279,12 +398,62 @@ impl RatchetCore {
             None => true,
         };
 
+        // A straggler from an EARLIER chain that was a tree: its gaps are kept
+        // under that chain's key, and a tree never needs the epoch to turn
+        // back to reach one.
+        if is_new_epoch && let Some(holes) = self.tree_holes.get_mut(&header.dh_pk) {
+            if !header.tree {
+                return Err(RatchetError::MalformedFrame("chain mode changed mid-chain"));
+            }
+            let mk = holes
+                .take_leaf(header.n)
+                .ok_or(RatchetError::MessageKeyUnavailable)?;
+            self.check_tree_limits()?;
+            return Ok(mk);
+        }
+
         if is_new_epoch {
-            // Bank whatever is left of the chain the peer just abandoned.
+            // Keep whatever is left of the chain the peer just abandoned —
+            // banked key by key for a hash chain, cut to `0..pn` for a tree.
             if self.ckr.is_some() {
                 self.skip_message_keys(header.pn)?;
             }
+            if self.recv_tree
+                && let Some(ending) = self.dh_pk_remote
+                && let Some(holes) = self.tree_holes.get_mut(&ending)
+            {
+                holes.retain(0, u64::from(header.pn));
+            }
             self.asymmetric_step(header, rng)?;
+            // The chain just created is whatever its first arriving frame says.
+            // Every later frame of it must say the same.
+            self.recv_tree = header.tree;
+            if header.tree {
+                let mut ckr = self.ckr.take().expect("the step just derived it");
+                self.tree_holes.insert(header.dh_pk, Holes::root(&ckr));
+                ckr.zeroize();
+            }
+        }
+
+        if self.recv_tree != header.tree {
+            return Err(RatchetError::MalformedFrame("chain mode changed mid-chain"));
+        }
+        if self.recv_tree {
+            // Same ceiling a stored state is held to: past it a chain has run
+            // long enough that it should have been re-keyed.
+            if header.n > u32::MAX / 2 {
+                return Err(RatchetError::TooManySkipped(header.n as usize));
+            }
+            let holes = self
+                .tree_holes
+                .get_mut(&header.dh_pk)
+                .ok_or(RatchetError::MessageKeyUnavailable)?;
+            let mk = holes
+                .take_leaf(header.n)
+                .ok_or(RatchetError::MessageKeyUnavailable)?;
+            self.nr = self.nr.max(header.n + 1);
+            self.check_tree_limits()?;
+            return Ok(mk);
         }
 
         // Within an epoch, an index we have already passed is a replay: the
@@ -378,6 +547,11 @@ impl RatchetCore {
         let ending = self.dh_pk_remote;
         self.skipped
             .retain(|(pk, _), _| Some(*pk) == ending || *pk == header.dh_pk);
+        self.tree_holes
+            .retain(|pk, _| Some(*pk) == ending || *pk == header.dh_pk);
+        // A new sending chain: its mode is settled when it is first used.
+        self.send_tree = None;
+        self.send_mode = SendMode::Undecided;
         self.dh_pk_remote = Some(header.dh_pk);
         self.rk = rk2;
         self.ckr = Some(ckr);
@@ -415,6 +589,38 @@ impl RatchetCore {
         self.nr = until;
         Ok(())
     }
+
+    /// Hold the tree state to its bounds. See [`MAX_TREE_NODES_PER_CHAIN`].
+    ///
+    /// Per chain only. The conversation-wide bound follows from it: tree
+    /// chains age by epoch to the current one and the one before it (see
+    /// `asymmetric_step`), so two chains at their ceiling are the most there
+    /// can be — which is what [`MAX_TREE_NODES_TOTAL`](crate::MAX_TREE_NODES_TOTAL)
+    /// states, and `tree_chains_age_out_by_epoch` pins.
+    fn check_tree_limits(&self) -> Result<(), RatchetError> {
+        for holes in self.tree_holes.values() {
+            if holes.len() > MAX_TREE_NODES_PER_CHAIN {
+                return Err(RatchetError::TooManySkipped(holes.len()));
+            }
+        }
+        Ok(())
+    }
+
+    /// Tree nodes that stand for messages MISSED rather than messages still
+    /// to come: everything of an earlier chain, and of the current one only
+    /// what lies wholly behind the highest index received.
+    fn tree_banked(&self) -> usize {
+        self.tree_holes
+            .iter()
+            .map(|(pk, holes)| {
+                if self.recv_tree && Some(*pk) == self.dh_pk_remote {
+                    holes.len_below(self.nr)
+                } else {
+                    holes.len()
+                }
+            })
+            .sum()
+    }
 }
 
 // ── Persistence support ──────────────────────────────────────────────────────
@@ -434,6 +640,13 @@ impl RatchetCore {
             skipped: &self.skipped,
             pq_seed: *self.pq.seed(),
             pending_ct: self.pq.pending_ct().copied(),
+            tree: TreeParts {
+                peer_tree: self.peer_tree,
+                send_mode: self.send_mode,
+                send_tree: self.send_tree.clone(),
+                recv_tree: self.recv_tree,
+                tree_holes: self.tree_holes.clone(),
+            },
         }
     }
 
@@ -451,6 +664,7 @@ impl RatchetCore {
         skipped: BTreeMap<([u8; 32], u32), Zeroizing<[u8; KEY_LEN]>>,
         pq_seed: [u8; crate::pq::ML_KEM_768_SEED_LEN],
         pending_ct: Option<[u8; ML_KEM_768_CT_LEN]>,
+        tree: TreeParts,
     ) -> Self {
         let sk = StaticSecret::from(dh_sk);
         let dh_pk = *PublicKey::from(&sk).as_bytes();
@@ -466,6 +680,11 @@ impl RatchetCore {
             pn,
             skipped,
             pq: PqEpoch::restore(&pq_seed, pending_ct),
+            peer_tree: tree.peer_tree,
+            send_mode: tree.send_mode,
+            send_tree: tree.send_tree,
+            recv_tree: tree.recv_tree,
+            tree_holes: tree.tree_holes,
             sent_any,
         }
     }
@@ -481,7 +700,7 @@ impl RatchetCore {
     /// where the cut goes.
     #[must_use]
     pub fn skipped_len(&self) -> usize {
-        self.skipped.len()
+        self.skipped.len() + self.tree_banked()
     }
 
     /// Drop EVERY banked key. Returns how many went.
@@ -496,8 +715,17 @@ impl RatchetCore {
     /// only do this to a conversation it has never answered — for one it has,
     /// the same act would make a real correspondent unreadable.
     pub(crate) fn clear_skipped(&mut self) -> usize {
-        let n = self.skipped.len();
+        let n = self.skipped_len();
         self.skipped.clear();
+        // A tree chain's gaps go the same way; its path to what is still to
+        // come does not — that is the receiving chain itself, not a bank.
+        let current = self.dh_pk_remote.filter(|_| self.recv_tree);
+        self.tree_holes.retain(|pk, _| Some(*pk) == current);
+        if let Some(pk) = current
+            && let Some(holes) = self.tree_holes.get_mut(&pk)
+        {
+            holes.retain(u64::from(self.nr), 1u64 << 32);
+        }
         n
     }
 
@@ -516,14 +744,20 @@ impl RatchetCore {
     /// keeping every epoch forever. What it can cost is a straggler from the
     /// chain that ended before the restart — a message the peer must re-send.
     pub fn prune_skipped_to_current_epoch(&mut self) -> usize {
-        let before = self.skipped.len();
+        let before = self.skipped_len();
         match self.dh_pk_remote {
-            Some(cur) => self.skipped.retain(|(pk, _), _| *pk == cur),
+            Some(cur) => {
+                self.skipped.retain(|(pk, _), _| *pk == cur);
+                self.tree_holes.retain(|pk, _| *pk == cur);
+            }
             // No remote epoch yet: nothing has been received, so anything
             // banked cannot belong to a chain we are on.
-            None => self.skipped.clear(),
+            None => {
+                self.skipped.clear();
+                self.tree_holes.clear();
+            }
         }
-        before - self.skipped.len()
+        before - self.skipped_len()
     }
 
     /// How many distinct DH epochs the bank spans, and how many of its keys
@@ -537,11 +771,26 @@ impl RatchetCore {
     /// nothing. Counts only; no key material leaves.
     #[must_use]
     pub fn skipped_epochs(&self) -> (usize, usize) {
-        let epochs: std::collections::BTreeSet<[u8; 32]> =
+        let mut epochs: std::collections::BTreeSet<[u8; 32]> =
             self.skipped.keys().map(|(pk, _)| *pk).collect();
+        let current_tree = if self.recv_tree {
+            self.dh_pk_remote
+                .and_then(|cur| self.tree_holes.get(&cur))
+                .map_or(0, |h| h.len_below(self.nr))
+        } else {
+            0
+        };
+        for (pk, holes) in &self.tree_holes {
+            // The current tree chain always holds its path; only its gaps make
+            // it an epoch the bank spans.
+            let is_current = self.recv_tree && Some(*pk) == self.dh_pk_remote;
+            if !is_current || holes.len_below(self.nr) > 0 {
+                epochs.insert(*pk);
+            }
+        }
         let current = self.dh_pk_remote.map_or(0, |cur| {
             self.skipped.keys().filter(|(pk, _)| *pk == cur).count()
-        });
+        }) + current_tree;
         (epochs.len(), current)
     }
 
@@ -575,6 +824,35 @@ pub(crate) struct CoreParts<'a> {
     pub(crate) skipped: &'a BTreeMap<([u8; 32], u32), Zeroizing<[u8; KEY_LEN]>>,
     pub(crate) pq_seed: [u8; crate::pq::ML_KEM_768_SEED_LEN],
     pub(crate) pending_ct: Option<[u8; ML_KEM_768_CT_LEN]>,
+    pub(crate) tree: TreeParts,
+}
+
+/// The tree-mode half of a session's state (stored as of state version 2).
+#[derive(Clone, Debug)]
+pub(crate) struct TreeParts {
+    pub(crate) peer_tree: bool,
+    pub(crate) send_mode: SendMode,
+    pub(crate) send_tree: Option<Holes>,
+    pub(crate) recv_tree: bool,
+    pub(crate) tree_holes: BTreeMap<[u8; 32], Holes>,
+}
+
+impl TreeParts {
+    /// A state from before trees: every chain it holds is a hash chain, the
+    /// sending one included — it may already have been used as one.
+    pub(crate) fn linear(has_sending_chain: bool) -> Self {
+        Self {
+            peer_tree: false,
+            send_mode: if has_sending_chain {
+                SendMode::Linear
+            } else {
+                SendMode::Undecided
+            },
+            send_tree: None,
+            recv_tree: false,
+            tree_holes: BTreeMap::new(),
+        }
+    }
 }
 
 #[cfg(test)]
