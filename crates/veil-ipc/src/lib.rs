@@ -29,6 +29,7 @@ pub mod bridge;
 mod frame_io;
 mod handlers;
 pub mod path;
+mod send_gates;
 pub mod server;
 pub mod streams;
 pub mod transport;
