@@ -463,6 +463,10 @@ async fn try_ratchet_seal(
     // No live session: if the destination is one of OUR devices, the pair
     // comes from our own document instead — the identity the sibling's frames
     // arrive under, so the conversation we seal in is the one we open in.
+    // How long finding the recipient's certificate took. A send that has to
+    // walk the DHT for it waits seconds, and the sends behind it in the same
+    // burst wait too — a slow seal is logged so a stall has a name.
+    let resolve_started = std::time::Instant::now();
     let pairing = ctx.session_instance_lookup.as_deref().and_then(|lookup| {
         lookup
             .session_pairing(dst_node_id)
@@ -505,6 +509,14 @@ async fn try_ratchet_seal(
             None => resolver.resolve_cert(cert_key).await?,
         },
     };
+    let resolve_ms = resolve_started.elapsed().as_millis();
+    if resolve_ms >= 1_000 {
+        log::warn!(
+            "ratchet.seal_slow dst={} resolve_ms={resolve_ms} device_named={}",
+            veil_util::bytes_to_hex(&dst_node_id[..4]),
+            session_instance.is_some(),
+        );
+    }
 
     match ratchet.seal_for(
         veil_e2e::PeerRatchetKeys {
