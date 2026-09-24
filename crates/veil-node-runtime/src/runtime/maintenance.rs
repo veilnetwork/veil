@@ -94,6 +94,42 @@ fn ad_is_current(
     !veil_anonymity::rendezvous::rendezvous_ad_needs_refresh(ad_until, now_unix, effective_window)
 }
 
+/// Whether the ad now at one of our slots was written by ANOTHER device of the
+/// same identity, and is still good enough to leave where it is.
+///
+/// Every device of an identity advertises at the identity's address, under the
+/// same slot keys, and replication carries each device's write to the others.
+/// So each saw the other's ad in "its" slot, called it stale — it was not an
+/// exact projection of its own entry — and re-signed; the sibling then did the
+/// same. Measured on a three-node stand: two devices of one identity took
+/// strict turns (575 alternations in 638 writes), each re-signing and
+/// re-replicating six ads about every second for as long as both ran, and a
+/// sender resolving the identity got one device or the other depending on the
+/// second it asked.
+///
+/// The slot goes to whoever wrote it last and keeps it while that device keeps
+/// it fresh; once the holder stops (offline, or past half its window) the
+/// usual refresh lets another device take over. Only an ad the identity's own
+/// document vouches for counts: `ad_binding_ok` is the check a SENDER applies,
+/// so nothing a stranger writes at our address can hold a slot against us.
+fn held_by_a_sibling(
+    dht: &Arc<veil_dht::kademlia::KademliaService>,
+    ad: &veil_anonymity::rendezvous::RendezvousAd,
+    ad_node_id: &[u8; 32],
+    own_issuer_pk: &str,
+    now_unix: u64,
+) -> bool {
+    ad.receiver_node_id == *ad_node_id
+        && ad.issuer_pk != own_issuer_pk
+        && veil_anonymity::rendezvous::is_currently_valid(ad, now_unix).is_ok()
+        && !veil_anonymity::rendezvous::rendezvous_ad_needs_refresh(
+            ad.valid_until_unix,
+            now_unix,
+            ad.valid_until_unix.saturating_sub(ad.valid_from_unix),
+        )
+        && super::rendezvous_ad_binding::ad_binding_ok(dht, ad)
+}
+
 impl NodeRuntime {
     pub fn spawn_maintenance_tick(
         &mut self,
@@ -1063,6 +1099,14 @@ impl NodeRuntime {
                 let dht_key = rendezvous_ad_dht_key_at(&ad_node_id, idx as u8);
                 let existing_bytes = dht.get_local(&dht_key)?;
                 let ad = decode_rendezvous_ad(&existing_bytes).ok()?;
+                // A sibling device's ad in this slot is not ours to overwrite
+                // while it is fresh. Plain slots only: an ephemeral ad lives
+                // under a pseudo identity no sibling shares.
+                if entry.ephemeral_ad_identity.is_none()
+                    && held_by_a_sibling(dht, &ad, &ad_node_id, issuer_pk, now_unix)
+                {
+                    return Some(ad.valid_from_unix);
+                }
                 // The SAME rule the sender's resolver applies, so a node
                 // cannot sit re-signing an ad every tick that senders accept,
                 // nor keep one they refuse.

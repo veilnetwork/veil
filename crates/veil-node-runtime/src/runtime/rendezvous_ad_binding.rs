@@ -385,4 +385,182 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    /// Two devices of ONE identity do not fight over its slots.
+    ///
+    /// Both advertise at the identity's address under the same keys, and
+    /// replication hands each the other's write. Each used to call the
+    /// sibling's ad stale and re-sign — measured on the stand as strict
+    /// turns, about a write a second from each device, forever. A fresh ad
+    /// the identity's document vouches for is left in place.
+    ///
+    /// Control FIRST: with no document to vouch for the sibling, the same ad
+    /// is overwritten — a slot held by something we cannot verify is not
+    /// held.
+    #[test]
+    fn a_sibling_devices_fresh_ad_is_not_overwritten() {
+        use std::sync::{Arc, Mutex};
+
+        let dir = std::env::temp_dir().join(format!(
+            "rzv-sibling-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let created = veil_identity::sovereign_flow::create_identity(
+            veil_identity::sovereign_flow::CreateIdentityOptions {
+                veil_dir: dir.clone(),
+                save_encrypted_with_password: None,
+                argon2_params_override: Some((8, 1, 1)),
+                extra_entropy: None,
+                instance_label: "rzv".to_string(),
+                pow_difficulty: 0,
+                issued_at_unix: now,
+                valid_until_unix: now + 7 * 24 * 3600,
+                algo: veil_types::SignatureAlgorithm::Ed25519,
+            },
+        )
+        .expect("create_identity");
+        // A second device key, certified into the same document; the first
+        // stays valid beside it.
+        let rotated = veil_identity::sovereign_flow::rotate_identity(
+            veil_identity::sovereign_flow::RotateIdentityOptions {
+                veil_dir: dir.clone(),
+                master_seed: created.master_seed.clone(),
+                now_unix: now,
+                valid_until_unix: now + 7 * 24 * 3600,
+            },
+        )
+        .expect("rotate_identity");
+        let identity = created.node_id;
+
+        let handshake = |seed: [u8; 32]| {
+            let pk = ed25519_dalek::SigningKey::from_bytes(&seed)
+                .verifying_key()
+                .to_bytes();
+            let public_key = base64::engine::general_purpose::STANDARD.encode(pk);
+            crate::local_identity::HandshakeIdentity {
+                algo: veil_cfg::SignatureAlgorithm::Ed25519,
+                node_id: veil_cfg::NodeId::from_public_key(
+                    veil_cfg::SignatureAlgorithm::Ed25519,
+                    &public_key,
+                )
+                .unwrap(),
+                public_key,
+                private_key: base64::engine::general_purpose::STANDARD.encode(seed),
+                nonce: "AAAA".to_owned(),
+            }
+        };
+        let first = handshake(*created.identity_sk_seed.as_array());
+        let second = handshake(*rotated.new_identity_sk_seed.as_array());
+        assert_ne!(first.public_key, second.public_key, "fixture: two devices");
+
+        let entries = |relay: u8, window: u64| {
+            Arc::new(Mutex::new(vec![RendezvousPublisherEntry {
+                rendezvous_node_id: [relay; 32],
+                auth_cookie: [relay; 16],
+                validity_window_secs: window,
+                push_envelope: Vec::new(),
+                wake_hmac_envelope: Vec::new(),
+                rendezvous_kem_algo: 0,
+                rendezvous_kem_pk: Vec::new(),
+                ephemeral_ad_identity: None,
+                rendezvous_kem_valid_until_unix: 0,
+            }]))
+        };
+        let logger = Arc::new(NodeLogger::new_noop());
+        let x25519 = x25519_dalek::StaticSecret::random_from_rng(rand_core::OsRng);
+        let publish_for = |who: &crate::local_identity::HandshakeIdentity,
+                           relay: u8,
+                           window: u64,
+                           dht: &Arc<veil_dht::KademliaService>| {
+            crate::runtime::NodeRuntime::publish_rendezvous_ads_at(
+                &entries(relay, window),
+                &x25519,
+                who,
+                &identity,
+                dht,
+                &logger,
+                None,
+            )
+        };
+        let publish = |who: &crate::local_identity::HandshakeIdentity,
+                       relay: u8,
+                       dht: &Arc<veil_dht::KademliaService>| {
+            publish_for(who, relay, 3600, dht)
+        };
+        let issuer_at = |dht: &Arc<veil_dht::KademliaService>| {
+            decode_rendezvous_ad(&dht.get_local(&rendezvous_ad_dht_key(&identity)).unwrap())
+                .unwrap()
+                .issuer_pk
+        };
+
+        // Control: nothing vouches for the sibling, so its ad is overwritten.
+        let bare = Arc::new(veil_dht::KademliaService::new(*first.node_id.as_bytes()));
+        assert_eq!(
+            publish(&second, 0xA1, &bare),
+            1,
+            "the sibling writes the slot"
+        );
+        assert_eq!(publish(&first, 0xB1, &bare), 1, "unvouched: overwritten");
+        assert_eq!(issuer_at(&bare), first.public_key);
+
+        // With the document both devices hold, the sibling keeps the slot.
+        let dht = Arc::new(veil_dht::KademliaService::new(*first.node_id.as_bytes()));
+        dht.store_local(
+            veil_proto::identity_document::IdentityDocument::dht_key(&identity),
+            rotated.document.encode(),
+        );
+        assert_eq!(
+            publish(&second, 0xA1, &dht),
+            1,
+            "the sibling writes the slot"
+        );
+        assert_eq!(
+            publish(&first, 0xB1, &dht),
+            0,
+            "a fresh ad of another device of this identity is left in place"
+        );
+        assert_eq!(issuer_at(&dht), second.public_key);
+        assert_eq!(
+            publish(&second, 0xA1, &dht),
+            0,
+            "and the holder, finding its own ad fresh, writes nothing either"
+        );
+
+        // A holder that stops refreshing does not keep the slot: past half its
+        // window the sibling's ad is due, and another device takes over rather
+        // than leaving the identity advertised at a device that went quiet.
+        let aging = Arc::new(veil_dht::KademliaService::new(*first.node_id.as_bytes()));
+        aging.store_local(
+            veil_proto::identity_document::IdentityDocument::dht_key(&identity),
+            rotated.document.encode(),
+        );
+        assert_eq!(publish_for(&second, 0xA2, 2, &aging), 1);
+        let written =
+            decode_rendezvous_ad(&aging.get_local(&rendezvous_ad_dht_key(&identity)).unwrap())
+                .unwrap()
+                .valid_from_unix;
+        while std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            < written + 1
+        {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        assert_eq!(
+            publish(&first, 0xB2, &aging),
+            1,
+            "a sibling ad past half its window is taken over"
+        );
+        assert_eq!(issuer_at(&aging), first.public_key);
+    }
 }
