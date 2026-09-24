@@ -540,11 +540,51 @@ async fn try_ratchet_seal(
     }
 }
 
+/// Where the time of one send went, written when the send ends if it took a
+/// second or more. A burst of sends after a restart was measured waiting over a
+/// minute inside the node with nothing in the log to say which step held it.
+struct SendTiming {
+    started: std::time::Instant,
+    dst: std::cell::Cell<[u8; 4]>,
+    plan_ms: std::cell::Cell<u128>,
+    seal_ms: std::cell::Cell<u128>,
+    path: std::cell::Cell<&'static str>,
+}
+
+impl SendTiming {
+    fn new() -> Self {
+        Self {
+            started: std::time::Instant::now(),
+            dst: std::cell::Cell::new([0; 4]),
+            plan_ms: std::cell::Cell::new(0),
+            seal_ms: std::cell::Cell::new(0),
+            path: std::cell::Cell::new("unknown"),
+        }
+    }
+}
+
+impl Drop for SendTiming {
+    fn drop(&mut self) {
+        let total = self.started.elapsed().as_millis();
+        if total >= 1_000 {
+            log::warn!(
+                "ipc.send_slow at={} dst={} total_ms={total} plan_ms={} seal_ms={} path={}",
+                veil_util::unix_secs_now_u64(),
+                veil_util::bytes_to_hex(&self.dst.get()),
+                self.plan_ms.get(),
+                self.seal_ms.get(),
+                self.path.get(),
+            );
+        }
+    }
+}
+
 pub(crate) async fn handle_ipc_send(
     sink: &mut SendReply<'_>,
     body: &[u8],
     ctx: &IpcSendContext,
 ) -> std::io::Result<()> {
+    let timing = SendTiming::new();
     // Borrowed out of the now-owned context so the body below reads exactly as
     // it did when the context itself was borrowed.
     let app_registry = &*ctx.app_registry;
@@ -734,6 +774,10 @@ pub(crate) async fn handle_ipc_send(
                 devices.iter().any(|device| active.contains(device))
             }
         });
+    timing
+        .dst
+        .set(send.dst_node_id[..4].try_into().unwrap_or([0; 4]));
+    let plan_started = std::time::Instant::now();
     let mut planned: Option<PlannedRelay> = None;
     if ratchet_ok
         && remote
@@ -796,6 +840,8 @@ pub(crate) async fn handle_ipc_send(
             .filter(|d| active.contains(d))
             .collect();
         let mut any_sent = false;
+        timing.plan_ms.set(plan_started.elapsed().as_millis());
+        let seal_started = std::time::Instant::now();
         for device in &devices {
             let sealed = try_ratchet_seal(ctx, device, &send.data).await;
             let frame = app_send_frame(&send, sealed.as_ref().map(|(p, _)| p.as_slice()));
@@ -806,16 +852,28 @@ pub(crate) async fn handle_ipc_send(
                 }
             }
         }
+        timing.seal_ms.set(seal_started.elapsed().as_millis());
         if any_sent {
+            timing.path.set("identity_fanout");
             return app_send_ok(sink, send.require_ack).await;
         }
     }
 
+    if timing.plan_ms.get() == 0 {
+        timing.plan_ms.set(plan_started.elapsed().as_millis());
+    }
+    let seal_started = std::time::Instant::now();
     let sealed = if ratchet_ok && remote {
         try_ratchet_seal(ctx, &send.dst_node_id, &send.data).await
     } else {
         None
     };
+    timing.seal_ms.set(seal_started.elapsed().as_millis());
+    timing.path.set(if planned.is_some() {
+        "relay_planned"
+    } else {
+        "direct_or_fallback"
+    });
 
     if send.dst_node_id == *local_node_id && !send.my_other_devices {
         // Local delivery — route directly through the app registry. The
