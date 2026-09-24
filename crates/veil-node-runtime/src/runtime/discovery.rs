@@ -41,7 +41,8 @@ use super::{
     NodeRuntime, derive_node_id_from_bootstrap_peer, lock_state, lock_tasks, supervised_spawn,
 };
 
-/// The first retry after a remembered-peers pass that met nobody.
+/// The first retry after a remembered-peers pass in which an address did not
+/// answer.
 ///
 /// A pass right after a restart is the one most likely to fail, and for a
 /// reason that clears itself in seconds: a peer still holds the session of
@@ -50,21 +51,27 @@ use super::{
 /// Measured on a three-node stand: the seed let go of the stale session 32 s
 /// after the restart, and the node, having tried once at 0.3 s, then sat
 /// without a single seed for the full fifteen-minute cadence.
+///
+/// ANY address that did not answer, not "nobody answered": the first version
+/// of this retried only a pass that met no one, and on the stand the same
+/// pass met two neighbours and lost all three seeds — so it counted as a
+/// success and the seeds still waited fifteen minutes.
 const REMEMBERED_RETRY_FLOOR: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// How long until the next remembered-peers pass.
 ///
-/// The ordinary cadence once a pass has met somebody (or found nothing it
-/// still needed to try). After passes that tried and met nobody, a doubling
-/// ladder from [`REMEMBERED_RETRY_FLOOR`] up to that cadence: these are dials
-/// to a handful of addresses this node itself reached before, so asking
-/// again soon costs nobody else anything, while waiting costs a node with no
-/// other way in its whole connectivity.
-pub(crate) fn remembered_retry_after(empty_passes: u32) -> std::time::Duration {
-    if empty_passes == 0 {
+/// The ordinary cadence once a pass has reached every address it tried (or
+/// found nothing it still needed to try). After passes where some address did
+/// not answer, a doubling ladder from [`REMEMBERED_RETRY_FLOOR`] up to that
+/// cadence: these are dials to a handful of addresses this node itself
+/// reached before, so asking again soon costs nobody else anything, while
+/// waiting can cost a node its only way in. An address that is dead for good
+/// drives the ladder to the cadence within a few passes and stays there.
+pub(crate) fn remembered_retry_after(failing_passes: u32) -> std::time::Duration {
+    if failing_passes == 0 {
         return RENDEZVOUS_INTERVAL;
     }
-    let factor = 1u32 << (empty_passes - 1).min(16);
+    let factor = 1u32 << (failing_passes - 1).min(16);
     REMEMBERED_RETRY_FLOOR
         .saturating_mul(factor)
         .min(RENDEZVOUS_INTERVAL)
@@ -72,10 +79,11 @@ pub(crate) fn remembered_retry_after(empty_passes: u32) -> std::time::Duration {
 
 /// The count [`remembered_retry_after`] reads, after a pass that `tried`
 /// addresses and `taken` of them answered. A pass that tried nothing — every
-/// remembered address already held or not ours to dial — is not a failure.
-pub(crate) fn next_empty_passes(empty_passes: u32, tried: usize, taken: usize) -> u32 {
-    if tried > 0 && taken == 0 {
-        empty_passes.saturating_add(1)
+/// remembered address already held or not ours to dial — is not a failure,
+/// and neither is one where everything tried answered.
+pub(crate) fn next_failing_passes(failing_passes: u32, tried: usize, taken: usize) -> u32 {
+    if taken < tried {
+        failing_passes.saturating_add(1)
     } else {
         0
     }
@@ -716,11 +724,11 @@ impl NodeRuntime {
             // passes meet nobody, see `remembered_retry_after`. The point is
             // to be in session BEFORE the first meeting-point pass, so a
             // restart costs a dial rather than a discovery round.
-            let mut empty_passes = 0u32;
+            let mut failing_passes = 0u32;
             let mut first = true;
             loop {
                 if !first {
-                    tokio::time::sleep(remembered_retry_after(empty_passes)).await;
+                    tokio::time::sleep(remembered_retry_after(failing_passes)).await;
                 }
                 first = false;
                 let live_peers = lock!(live_sessions).len();
@@ -728,7 +736,7 @@ impl NodeRuntime {
                 // else and offers nothing, so the fallback policy asks only
                 // whether this node still needs peers.
                 if !policy.permits_looking(live_peers, want_peers, false) {
-                    empty_passes = 0;
+                    failing_passes = 0;
                     continue;
                 }
                 let (_, my_address) =
@@ -772,13 +780,13 @@ impl NodeRuntime {
                         }
                     }
                 }
-                empty_passes = next_empty_passes(empty_passes, tried, taken);
+                failing_passes = next_failing_passes(failing_passes, tried, taken);
                 logger.debug(
                     "remembered.pass",
                     format!(
                         "{} remembered address(es), {tried} tried, {taken} met; next pass in {}s",
                         remembered.len(),
-                        remembered_retry_after(empty_passes).as_secs()
+                        remembered_retry_after(failing_passes).as_secs()
                     ),
                 );
             }
@@ -1052,7 +1060,7 @@ impl NodeRuntime {
 
 #[cfg(test)]
 mod tests {
-    use super::{RENDEZVOUS_INTERVAL, next_empty_passes, remembered_retry_after};
+    use super::{RENDEZVOUS_INTERVAL, next_failing_passes, remembered_retry_after};
 
     /// After a restart the first pass fails for a reason that clears in
     /// seconds (a peer still holds the old process's session), so the next
@@ -1076,15 +1084,21 @@ mod tests {
             "capped, no overflow"
         );
 
-        assert_eq!(next_empty_passes(0, 3, 0), 1, "tried and met nobody");
-        assert_eq!(next_empty_passes(4, 3, 0), 5);
+        assert_eq!(next_failing_passes(0, 3, 0), 1, "tried and met nobody");
+        assert_eq!(next_failing_passes(4, 3, 0), 5);
         assert_eq!(
-            next_empty_passes(4, 3, 1),
-            0,
-            "met somebody: back to the cadence"
+            next_failing_passes(0, 5, 2),
+            1,
+            "met the neighbours and lost the seeds: still retry soon — the \
+             stand's own case, which a met-nobody rule counted as a success"
         );
         assert_eq!(
-            next_empty_passes(4, 0, 0),
+            next_failing_passes(4, 3, 3),
+            0,
+            "everything answered: back to the cadence"
+        );
+        assert_eq!(
+            next_failing_passes(4, 0, 0),
             0,
             "nothing left to try is not a failure — every address is held"
         );
@@ -1099,8 +1113,10 @@ mod tests {
             .find("pub fn spawn_remembered_peers_task")
             .expect("the task is gone; this guard is stale");
         let body = &src[at..at + src[at..].find("\n    }\n").unwrap_or(src.len() - at)];
-        assert!(body.contains("sleep(remembered_retry_after(empty_passes))"));
-        assert!(body.contains("empty_passes = next_empty_passes(empty_passes, tried, taken)"));
+        assert!(body.contains("sleep(remembered_retry_after(failing_passes))"));
+        assert!(
+            body.contains("failing_passes = next_failing_passes(failing_passes, tried, taken)")
+        );
         assert!(
             !body.contains("interval(RENDEZVOUS_INTERVAL)"),
             "a fixed fifteen-minute ticker is back in the remembered-peers loop"
