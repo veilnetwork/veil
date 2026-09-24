@@ -92,11 +92,13 @@ mod kdf;
 mod pq;
 mod ratchet;
 mod session;
+mod tree;
 
 pub use pq::{ML_KEM_768_CT_LEN, ML_KEM_768_EK_LEN, ML_KEM_768_SEED_LEN};
 pub use pqxdh::{InitialMessage, PQXDH_MAGIC, PROLOGUE_LEN as PQXDH_PROLOGUE_LEN};
 pub use ratchet::{MAX_SEND_SKIP, MAX_SKIP, MAX_SKIP_TOTAL, SendPosition};
 pub use session::{RATCHET_FRAME_MAGIC, RATCHET_STATE_MAGIC, RatchetSession};
+pub use tree::{MAX_TREE_NODES_PER_CHAIN, MAX_TREE_NODES_TOTAL};
 
 use zeroize::Zeroizing;
 

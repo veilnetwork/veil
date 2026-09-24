@@ -18,7 +18,8 @@ use zeroize::Zeroizing;
 
 use crate::kdf::message_keys;
 use crate::pq::{ML_KEM_768_CT_LEN, ML_KEM_768_EK_LEN, ML_KEM_768_SEED_LEN};
-use crate::ratchet::{Header, RatchetCore};
+use crate::ratchet::{Header, RatchetCore, SendMode, TreeParts};
+use crate::tree::{Holes, MAX_TREE_NODES_PER_CHAIN, MAX_TREE_NODES_TOTAL};
 use crate::{KEY_LEN, RatchetError, RatchetRng};
 
 /// Frame tag. `VR` for veil ratchet; the version byte follows.
@@ -33,6 +34,13 @@ pub const RATCHET_STATE_MAGIC: [u8; 4] = *b"VSR1";
 
 const FRAME_V1: u8 = 1;
 const STATE_V1: u8 = 1;
+/// Version 1 plus the tree-mode section at the END, so everything up to and
+/// including the pending ciphertext keeps its offset — a host reading the
+/// sending counter out of a stored state finds it where it always was.
+const STATE_V2: u8 = 2;
+
+/// One stored tree node: `start (4) | depth (1) | key (32)`.
+const TREE_NODE_LEN: usize = 4 + 1 + KEY_LEN;
 
 /// `magic(2) ‖ version(1) ‖ flags(1) ‖ dh_pk(32) ‖ pn(4) ‖ n(4)`
 const FRAME_FIXED_LEN: usize = 2 + 1 + 1 + 32 + 4 + 4;
@@ -40,6 +48,9 @@ const AEAD_TAG_LEN: usize = 16;
 
 const FLAG_EK: u8 = 0b01;
 const FLAG_CT: u8 = 0b10;
+/// This frame's chain is a key tree. Sent only to a peer that announced it can
+/// open one: a build that predates it refuses the frame on this bit alone.
+const FLAG_TREE: u8 = 0b100;
 
 /// One end of a ratcheted conversation.
 ///
@@ -216,21 +227,33 @@ impl RatchetSession {
     /// |   skipped_count × ( peer_dh_pk (32) | index (4) | message_key (32) )
     /// | pq_seed (64)
     /// | has_pending_ct (1) | [pending_ct (1088)]
+    /// — version 2 only, from here on:
+    /// | peer_tree (1) | send_mode (1: 0 undecided, 1 hash chain, 2 tree)
+    /// | recv_tree (1)
+    /// | send_node_count (4) | send_node_count × node
+    /// | tree_chain_count (4)
+    /// |   tree_chain_count × ( peer_dh_pk (32) | node_count (4) | node_count × node )
     /// ```
+    ///
+    /// where a node is `start (4) | depth (1) | key (32)`, in index order.
     ///
     /// Sizes, all pinned by
     /// [`state_blob_sizes_are_what_the_documentation_claims`](tests::state_blob_sizes_are_what_the_documentation_claims):
     ///
-    /// * 154 bytes — a freshly-constructed responder, nothing established.
-    /// * 218 bytes — an initiator straight out of key agreement.
-    /// * 1 338 bytes — an established session in either direction.
+    /// * 165 bytes — a freshly-constructed responder, nothing established.
+    /// * 229 bytes — an initiator straight out of key agreement.
+    /// * 1 349 bytes — an established session in either direction.
     /// * plus 68 bytes for each message key banked out of order (at most
     ///   [`MAX_SKIP_TOTAL`](crate::MAX_SKIP_TOTAL), so 137 kB in the worst
     ///   case).
+    /// * plus, for tree-mode chains, 37 bytes a node — about 32 nodes for a
+    ///   chain received in order, and at most
+    ///   [`MAX_TREE_NODES_TOTAL`](crate::MAX_TREE_NODES_TOTAL) across the
+    ///   conversation, so about 150 kB in the worst case.
     pub fn export_state(&self) -> Zeroizing<Vec<u8>> {
         let p = self.core.parts();
         // EXACTLY, not approximately. `1_300 + skipped * 68` is 38 bytes short
-        // of this format's own worst case — the doc above says 1 338 — so a
+        // of this format's own worst case — 1 338 bytes, as version 1 was — so a
         // session carrying all three optional keys AND a pending ML-KEM
         // ciphertext grew the buffer mid-write. A `Vec` that grows COPIES what
         // it already holds into a new allocation and abandons the old one, and
@@ -255,11 +278,20 @@ impl RatchetSession {
             + p.skipped.len() * (32 + 4 + KEY_LEN)
             + p.pq_seed.len()
             + 1
-            + usize::from(p.pending_ct.is_some()) * ML_KEM_768_CT_LEN;
+            + usize::from(p.pending_ct.is_some()) * ML_KEM_768_CT_LEN
+            + 3
+            + 4
+            + p.tree.send_tree.as_ref().map_or(0, Holes::len) * TREE_NODE_LEN
+            + 4
+            + p.tree
+                .tree_holes
+                .values()
+                .map(|h| 32 + 4 + h.len() * TREE_NODE_LEN)
+                .sum::<usize>();
         let mut out = Vec::with_capacity(exact);
 
         out.extend_from_slice(&RATCHET_STATE_MAGIC);
-        out.push(STATE_V1);
+        out.push(STATE_V2);
         out.extend_from_slice(&p.dh_sk);
         push_opt32(&mut out, p.dh_pk_remote.as_ref());
         out.extend_from_slice(&p.rk);
@@ -285,6 +317,23 @@ impl RatchetSession {
             }
             None => out.push(0),
         }
+
+        out.push(u8::from(p.tree.peer_tree));
+        out.push(match p.tree.send_mode {
+            SendMode::Undecided => 0,
+            SendMode::Linear => 1,
+            SendMode::Tree => 2,
+        });
+        out.push(u8::from(p.tree.recv_tree));
+        match &p.tree.send_tree {
+            Some(holes) => push_holes(&mut out, holes),
+            None => out.extend_from_slice(&0u32.to_be_bytes()),
+        }
+        out.extend_from_slice(&(p.tree.tree_holes.len() as u32).to_be_bytes());
+        for (peer_pk, holes) in &p.tree.tree_holes {
+            out.extend_from_slice(peer_pk);
+            push_holes(&mut out, holes);
+        }
         debug_assert_eq!(
             out.len(),
             exact,
@@ -306,7 +355,8 @@ impl RatchetSession {
         if r.take(4)? != RATCHET_STATE_MAGIC {
             return Err(RatchetError::MalformedState("bad magic"));
         }
-        if r.take_u8()? != STATE_V1 {
+        let version = r.take_u8()?;
+        if version != STATE_V1 && version != STATE_V2 {
             return Err(RatchetError::MalformedState("unsupported version"));
         }
 
@@ -352,6 +402,11 @@ impl RatchetSession {
             1 => Some(r.take_array::<ML_KEM_768_CT_LEN>()?),
             _ => return Err(RatchetError::MalformedState("bad boolean")),
         };
+        let tree = if version == STATE_V1 {
+            TreeParts::linear(cks.is_some())
+        } else {
+            take_tree_parts(&mut r, cks.is_some(), ckr.is_some(), dh_pk_remote)?
+        };
         r.finish()?;
 
         Ok(Self {
@@ -368,9 +423,115 @@ impl RatchetSession {
                 skipped,
                 pq_seed,
                 pending_ct,
+                tree,
             ),
         })
     }
+
+    /// The peer has said it can open tree-mode chains — see
+    /// [`RatchetCore::note_peer_tree`]. For the layer that reads it out of an
+    /// authenticated plaintext; nothing on the wire sets it.
+    pub fn note_peer_supports_tree(&mut self) {
+        self.core.note_peer_tree();
+    }
+
+    /// Whether [`note_peer_supports_tree`](Self::note_peer_supports_tree) has
+    /// been called on this conversation.
+    #[must_use]
+    pub fn peer_supports_tree(&self) -> bool {
+        self.core.peer_tree()
+    }
+}
+
+fn push_holes(out: &mut Vec<u8>, holes: &Holes) {
+    out.extend_from_slice(&(holes.len() as u32).to_be_bytes());
+    for (start, depth, key) in holes.nodes() {
+        out.extend_from_slice(&start.to_be_bytes());
+        out.push(depth);
+        out.extend_from_slice(key);
+    }
+}
+
+fn take_holes(r: &mut Reader<'_>, budget: &mut usize) -> Result<Holes, RatchetError> {
+    let count = r.take_u32()? as usize;
+    if count > MAX_TREE_NODES_PER_CHAIN || count > *budget {
+        return Err(RatchetError::MalformedState("tree over limit"));
+    }
+    *budget -= count;
+    let mut nodes = Vec::with_capacity(count);
+    for _ in 0..count {
+        let start = r.take_u32()?;
+        let depth = r.take_u8()?;
+        let key = r.take_array::<KEY_LEN>()?;
+        nodes.push((start, depth, key));
+    }
+    Holes::from_nodes(nodes).map_err(RatchetError::MalformedState)
+}
+
+/// The version-2 tail, held to the same shape the live session keeps: a tree
+/// sending chain has no hash-chain key beside it, and a tree receiving chain's
+/// holes are filed under the peer key it belongs to.
+fn take_tree_parts(
+    r: &mut Reader<'_>,
+    has_cks: bool,
+    has_ckr: bool,
+    dh_pk_remote: Option<[u8; 32]>,
+) -> Result<TreeParts, RatchetError> {
+    let take_bool = |r: &mut Reader<'_>| match r.take_u8()? {
+        0 => Ok(false),
+        1 => Ok(true),
+        _ => Err(RatchetError::MalformedState("bad boolean")),
+    };
+    let peer_tree = take_bool(r)?;
+    let send_mode = match r.take_u8()? {
+        0 => SendMode::Undecided,
+        1 => SendMode::Linear,
+        2 => SendMode::Tree,
+        _ => return Err(RatchetError::MalformedState("bad send mode")),
+    };
+    let recv_tree = take_bool(r)?;
+
+    let mut budget = MAX_TREE_NODES_TOTAL;
+    // A sender holds one path, never gaps; the per-chain bound is generous.
+    let send_holes = take_holes(r, &mut MAX_TREE_NODES_PER_CHAIN.clone())?;
+    let send_tree = match send_mode {
+        SendMode::Tree if !has_cks => Some(send_holes),
+        SendMode::Tree => {
+            return Err(RatchetError::MalformedState(
+                "tree chain beside a chain key",
+            ));
+        }
+        _ if !send_holes.is_empty() => {
+            return Err(RatchetError::MalformedState("tree nodes for a hash chain"));
+        }
+        _ => None,
+    };
+
+    let chains = r.take_u32()? as usize;
+    // The current chain and the one before it; the step ages out the rest.
+    if chains > 2 {
+        return Err(RatchetError::MalformedState("too many tree chains"));
+    }
+    let mut tree_holes = BTreeMap::new();
+    for _ in 0..chains {
+        let peer_pk = r.take_array::<32>()?;
+        let holes = take_holes(r, &mut budget)?;
+        if tree_holes.insert(peer_pk, holes).is_some() {
+            return Err(RatchetError::MalformedState("duplicate tree chain"));
+        }
+    }
+    if recv_tree && (has_ckr || dh_pk_remote.is_none_or(|pk| !tree_holes.contains_key(&pk))) {
+        return Err(RatchetError::MalformedState(
+            "tree receiving chain without its holes",
+        ));
+    }
+    Ok(TreeParts {
+        peer_tree,
+        send_mode,
+        send_tree,
+        recv_tree,
+        tree_holes,
+    })
 }
 
 // ── Frame codec ──────────────────────────────────────────────────────────────
@@ -382,6 +543,9 @@ fn encode_header(h: &Header) -> Vec<u8> {
     }
     if h.pq_ct.is_some() {
         flags |= FLAG_CT;
+    }
+    if h.tree {
+        flags |= FLAG_TREE;
     }
 
     let mut out = Vec::with_capacity(
@@ -416,7 +580,7 @@ fn decode_header(frame: &[u8]) -> Result<(Header, usize), RatchetError> {
         return Err(RatchetError::MalformedFrame("unsupported version"));
     }
     let flags = frame[3];
-    if flags & !(FLAG_EK | FLAG_CT) != 0 {
+    if flags & !(FLAG_EK | FLAG_CT | FLAG_TREE) != 0 {
         return Err(RatchetError::MalformedFrame("unknown flags"));
     }
 
@@ -458,6 +622,7 @@ fn decode_header(frame: &[u8]) -> Result<(Header, usize), RatchetError> {
             n,
             pq_ek,
             pq_ct,
+            tree: flags & FLAG_TREE != 0,
         },
         at,
     ))
@@ -1076,18 +1241,18 @@ mod tests {
         let bob_pk = *PublicKey::from(&StaticSecret::from(bob_sk)).as_bytes();
 
         let mut bob = RatchetSession::responder(&root, bob_sk, &mut brng);
-        assert_eq!(bob.export_state().len(), 154, "fresh responder");
+        assert_eq!(bob.export_state().len(), 165, "fresh responder");
 
         let mut alice = RatchetSession::initiator(&root, &bob_pk, &mut arng).expect("contributory");
-        assert_eq!(alice.export_state().len(), 218, "initiator after agreement");
+        assert_eq!(alice.export_state().len(), 229, "initiator after agreement");
 
         let f = alice.encrypt(b"hi", AD).expect("seal");
         bob.decrypt(&f, AD, &mut brng).expect("open");
-        assert_eq!(bob.export_state().len(), 1_338, "established session");
+        assert_eq!(bob.export_state().len(), 1_349, "established session");
 
         let f = bob.encrypt(b"back", AD).expect("seal");
         alice.decrypt(&f, AD, &mut arng).expect("open");
-        assert_eq!(alice.export_state().len(), 1_338, "established session");
+        assert_eq!(alice.export_state().len(), 1_349, "established session");
 
         // Each key banked out of order costs 32 + 4 + 32.
         let before = bob.export_state().len();
@@ -1096,5 +1261,438 @@ mod tests {
         drop(dropped);
         bob.decrypt(&arrived, AD, &mut brng).expect("open");
         assert_eq!(bob.export_state().len(), before + 68);
+    }
+
+    // ── Tree-mode chains ─────────────────────────────────────────────────────
+
+    fn has_tree_flag(frame: &[u8]) -> bool {
+        frame[3] & FLAG_TREE != 0
+    }
+
+    /// Both sides have heard "I can open trees", and one exchange has turned
+    /// each side's sending chain over — the steady state between two builds
+    /// that both carry trees. Returns the pair with `a` about to send on a
+    /// tree chain.
+    fn tree_pair() -> (RatchetSession, RatchetSession, TestRng, TestRng) {
+        let (mut a, mut b, mut ar, mut br) = pair();
+        let f = a.encrypt(b"hello", AD).expect("seal");
+        assert!(!has_tree_flag(&f), "the first chain is a hash chain");
+        b.decrypt(&f, AD, &mut br).expect("open");
+        b.note_peer_supports_tree();
+        let f = b.encrypt(b"hello back", AD).expect("seal");
+        assert!(
+            has_tree_flag(&f),
+            "b heard it before its chain was first used"
+        );
+        a.decrypt(&f, AD, &mut ar).expect("open");
+        a.note_peer_supports_tree();
+        (a, b, ar, br)
+    }
+
+    /// The transition needs no reset: a live conversation moves to trees at
+    /// each side's next new sending chain, and a chain already in use keeps
+    /// the mode it started with.
+    #[test]
+    fn a_conversation_moves_to_trees_at_the_next_chain_without_a_reset() {
+        let (mut a, mut b, mut ar, mut br) = pair();
+        let f = a.encrypt(b"one", AD).expect("seal");
+        b.decrypt(&f, AD, &mut br).expect("open");
+        a.note_peer_supports_tree();
+        let f = a.encrypt(b"two", AD).expect("seal");
+        assert!(
+            !has_tree_flag(&f),
+            "a chain already in use keeps its mode, or the receiver would have \
+             to guess mid-chain"
+        );
+        b.decrypt(&f, AD, &mut br).expect("open");
+
+        let (mut a, mut b, mut ar2, mut br2) = tree_pair();
+        for turn in 0..6u8 {
+            let f = a.encrypt(&[turn; 3], AD).expect("seal");
+            assert!(has_tree_flag(&f), "turn {turn}: a sends on a tree");
+            assert_eq!(b.decrypt(&f, AD, &mut br2).expect("open"), [turn; 3]);
+            let f = b.encrypt(&[turn; 5], AD).expect("seal");
+            assert!(has_tree_flag(&f), "turn {turn}: b sends on a tree");
+            assert_eq!(a.decrypt(&f, AD, &mut ar2).expect("open"), [turn; 5]);
+        }
+        let _ = (&mut ar, &mut br);
+    }
+
+    /// A peer that never said it can open trees never sees the bit — the
+    /// whole of the compatibility story, since an older build refuses a frame
+    /// on an unknown flag.
+    #[test]
+    fn a_peer_that_never_announced_trees_never_sees_the_flag() {
+        let (mut a, mut b, mut ar, mut br) = pair();
+        for turn in 0..8u8 {
+            let f = a.encrypt(&[turn], AD).expect("seal");
+            assert!(!has_tree_flag(&f));
+            b.decrypt(&f, AD, &mut br).expect("open");
+            let f = b.encrypt(&[turn], AD).expect("seal");
+            assert!(!has_tree_flag(&f));
+            a.decrypt(&f, AD, &mut ar).expect("open");
+        }
+    }
+
+    /// THE POINT OF THE TREE: a gap no hash chain survives. A million indices
+    /// burned between two frames — a mailbox holding a week of re-drives —
+    /// and the second one still opens, in one derivation walk.
+    #[test]
+    fn a_gap_of_a_million_opens_on_a_tree_chain() {
+        let (mut a, mut b, _ar, mut br) = tree_pair();
+        let f = a.encrypt(b"before", AD).expect("seal");
+        b.decrypt(&f, AD, &mut br).expect("open");
+
+        let start = a.send_position().expect("chain").next;
+        let mut next = start;
+        while next < start + 1_000_000 {
+            next += crate::MAX_SEND_SKIP;
+            a.skip_send_to(crate::SendPosition {
+                chain: a.send_position().expect("chain").chain,
+                next,
+            })
+            .expect("a tree skips in one cut");
+        }
+        let f = a.encrypt(b"after a million", AD).expect("seal");
+        assert_eq!(
+            b.decrypt(&f, AD, &mut br)
+                .expect("a tree chain opens across the gap"),
+            b"after a million"
+        );
+        assert!(
+            b.core.skipped_len() <= 64,
+            "the gap costs nodes per level, not a key per message: {}",
+            b.core.skipped_len()
+        );
+    }
+
+    /// CONTROL for the test above: the same gap on a hash chain is refused,
+    /// or that test proves nothing about trees.
+    #[test]
+    fn the_same_gap_on_a_hash_chain_is_refused() {
+        let (mut a, mut b, _ar, mut br) = pair();
+        let f = a.encrypt(b"before", AD).expect("seal");
+        b.decrypt(&f, AD, &mut br).expect("open");
+        for _ in 0..2 {
+            let pos = a.send_position().expect("chain");
+            a.skip_send_to(crate::SendPosition {
+                chain: pos.chain,
+                next: pos.next + crate::MAX_SEND_SKIP,
+            })
+            .expect("burn");
+        }
+        let f = a.encrypt(b"after", AD).expect("seal");
+        assert!(matches!(
+            b.decrypt(&f, AD, &mut br),
+            Err(RatchetError::TooManySkipped(_))
+        ));
+    }
+
+    #[test]
+    fn a_replay_on_a_tree_chain_is_refused_and_moves_nothing() {
+        let (mut a, mut b, _ar, mut br) = tree_pair();
+        let frames: Vec<_> = (0..4u8)
+            .map(|i| a.encrypt(&[i], AD).expect("seal"))
+            .collect();
+        b.decrypt(&frames[2], AD, &mut br).expect("open");
+        b.decrypt(&frames[0], AD, &mut br)
+            .expect("open, out of order");
+        let before = b.export_state();
+        for i in [2usize, 0] {
+            assert_eq!(
+                b.decrypt(&frames[i], AD, &mut br).unwrap_err(),
+                RatchetError::MessageKeyUnavailable,
+                "frame {i} a second time"
+            );
+        }
+        assert_eq!(*b.export_state(), *before);
+        b.decrypt(&frames[1], AD, &mut br)
+            .expect("the gap still opens");
+        b.decrypt(&frames[3], AD, &mut br)
+            .expect("and so does what follows");
+    }
+
+    /// The mode bit is part of the authenticated header: flipped in transit it
+    /// yields the wrong key, and the frame is refused without moving state.
+    #[test]
+    fn a_flipped_tree_flag_is_refused_both_ways() {
+        let (mut a, mut b, _ar, mut br) = tree_pair();
+        // The FIRST frame of a chain is what sets its mode, so a flip there is
+        // caught by the tag alone (the wrong mode derives the wrong key).
+        let mut first = a.encrypt(b"first", AD).expect("seal");
+        first[3] &= !FLAG_TREE;
+        let before = b.export_state();
+        assert_eq!(
+            b.decrypt(&first, AD, &mut br).unwrap_err(),
+            RatchetError::AuthFailed
+        );
+        assert_eq!(*b.export_state(), *before);
+        first[3] |= FLAG_TREE;
+        b.decrypt(&first, AD, &mut br)
+            .expect("the untouched frame opens");
+
+        let mut f = a.encrypt(b"tree", AD).expect("seal");
+        f[3] &= !FLAG_TREE;
+        let before = b.export_state();
+        // Past the first frame the chain's mode is known, and a frame naming
+        // the other one is refused BEFORE any key is derived in it.
+        assert_eq!(
+            b.decrypt(&f, AD, &mut br).unwrap_err(),
+            RatchetError::MalformedFrame("chain mode changed mid-chain"),
+            "tree read as a chain"
+        );
+        assert_eq!(*b.export_state(), *before);
+
+        let (mut a, mut b, _ar, mut br) = pair();
+        let mut f = a.encrypt(b"chain", AD).expect("seal");
+        f[3] |= FLAG_TREE;
+        let before = b.export_state();
+        assert!(b.decrypt(&f, AD, &mut br).is_err(), "chain read as a tree");
+        assert_eq!(*b.export_state(), *before);
+    }
+
+    /// A straggler from the tree chain the peer has since left still opens —
+    /// and nothing past the `pn` its successor announced does, because that
+    /// part of the old tree was erased when the epoch turned.
+    #[test]
+    fn a_straggler_from_the_previous_tree_chain_opens_after_the_epoch_turns() {
+        let (mut a, mut b, mut ar, mut br) = tree_pair();
+        let held: Vec<_> = (0..3u8)
+            .map(|i| a.encrypt(&[i], AD).expect("seal"))
+            .collect();
+        b.decrypt(&held[2], AD, &mut br).expect("open the last");
+
+        // The epoch turns both ways.
+        let f = b.encrypt(b"turn", AD).expect("seal");
+        a.decrypt(&f, AD, &mut ar).expect("open");
+        let f = a.encrypt(b"new chain", AD).expect("seal");
+        b.decrypt(&f, AD, &mut br).expect("open");
+
+        assert_eq!(b.decrypt(&held[0], AD, &mut br).expect("late"), [0u8]);
+        assert_eq!(b.decrypt(&held[1], AD, &mut br).expect("late"), [1u8]);
+        assert!(
+            b.core.skipped_len() == 0,
+            "the old chain is cut at pn, so once its gaps are filled nothing \
+             of it is left: {}",
+            b.core.skipped_len()
+        );
+    }
+
+    #[test]
+    fn a_tree_session_survives_a_restart_mid_gap() {
+        let (mut a, mut b, _ar, mut br) = tree_pair();
+        let frames: Vec<_> = (0..6u8)
+            .map(|i| a.encrypt(&[i; 4], AD).expect("seal"))
+            .collect();
+        b.decrypt(&frames[5], AD, &mut br).expect("open");
+        b.decrypt(&frames[1], AD, &mut br).expect("open");
+
+        let blob = b.export_state();
+        let mut b2 = RatchetSession::import_state(&blob).expect("reload");
+        assert_eq!(*b2.export_state(), *blob, "canonical through a reload");
+        assert!(b2.peer_supports_tree(), "what the peer announced is kept");
+        for i in [3usize, 0, 4, 2] {
+            assert_eq!(
+                b2.decrypt(&frames[i], AD, &mut br).expect("open"),
+                [i as u8; 4]
+            );
+        }
+
+        let blob = a.export_state();
+        let mut a2 = RatchetSession::import_state(&blob).expect("reload sender");
+        let f = a2.encrypt(b"after the sender restarted", AD).expect("seal");
+        assert!(has_tree_flag(&f));
+        b2.decrypt(&f, AD, &mut br).expect("open");
+    }
+
+    /// Version 1 — every stored conversation from before trees — is read as
+    /// hash chains and carries on exactly as it would have.
+    #[test]
+    fn a_version_1_state_is_read_as_hash_chains() {
+        let (mut a, mut b, mut ar, mut br) = pair();
+        let f = a.encrypt(b"x", AD).expect("seal");
+        b.decrypt(&f, AD, &mut br).expect("open");
+        let f = b.encrypt(b"y", AD).expect("seal");
+        a.decrypt(&f, AD, &mut ar).expect("open");
+
+        // A version-2 state with no tree in it is version 1 plus an 11-byte
+        // tail; cut the tail and relabel, and it is what a v1 build wrote.
+        let v2 = a.export_state();
+        let mut v1 = v2[..v2.len() - 11].to_vec();
+        v1[4] = STATE_V1;
+        let mut a1 = RatchetSession::import_state(&v1).expect("v1 is still read");
+        assert!(!a1.peer_supports_tree());
+        a1.note_peer_supports_tree();
+        let f = a1.encrypt(b"z", AD).expect("seal");
+        assert!(
+            !has_tree_flag(&f),
+            "a chain stored by v1 may already have been used as a hash chain"
+        );
+        assert_eq!(b.decrypt(&f, AD, &mut br).expect("open"), b"z");
+    }
+
+    /// Many separate runs of loss run into the node ceiling, and the frame
+    /// that would cross it is refused without moving the state.
+    #[test]
+    fn separate_gaps_hit_the_node_ceiling_and_leave_the_state_untouched() {
+        let (mut a, mut b, _ar, mut br) = tree_pair();
+        let mut refused = false;
+        for _ in 0..400 {
+            let pos = a.send_position().expect("chain");
+            a.skip_send_to(crate::SendPosition {
+                chain: pos.chain,
+                next: pos.next + 997,
+            })
+            .expect("skip");
+            let f = a.encrypt(b"g", AD).expect("seal");
+            let before = b.export_state();
+            match b.decrypt(&f, AD, &mut br) {
+                Ok(_) => {}
+                Err(RatchetError::TooManySkipped(n)) => {
+                    assert!(n > crate::MAX_TREE_NODES_PER_CHAIN);
+                    assert_eq!(*b.export_state(), *before);
+                    refused = true;
+                    break;
+                }
+                Err(e) => panic!("unexpected {e}"),
+            }
+        }
+        assert!(refused, "400 separate gaps never reached the ceiling");
+    }
+
+    /// The bank the host budgets is the GAPS, never the path to what is still
+    /// to come: clearing it must leave the chain able to receive.
+    #[test]
+    fn clearing_the_bank_keeps_a_tree_chain_alive() {
+        let (mut a, mut b, _ar, mut br) = tree_pair();
+        let frames: Vec<_> = (0..4u8)
+            .map(|i| a.encrypt(&[i], AD).expect("seal"))
+            .collect();
+        b.decrypt(&frames[3], AD, &mut br).expect("open");
+        assert!(
+            b.skipped_len() > 0,
+            "three gaps behind the highest received"
+        );
+        assert!(b.clear_skipped() > 0);
+        assert_eq!(b.skipped_len(), 0);
+        assert!(
+            b.decrypt(&frames[1], AD, &mut br).is_err(),
+            "the gap is gone"
+        );
+        let f = a.encrypt(b"next", AD).expect("seal");
+        assert_eq!(b.decrypt(&f, AD, &mut br).expect("chain alive"), b"next");
+    }
+
+    #[test]
+    fn inconsistent_version_2_states_are_refused() {
+        // A hash-chain sender whose state claims a tree: its tail is the bare
+        // 11 bytes (no nodes), so the send-mode byte sits 10 from the end.
+        let (mut h, _hb, _har, _hbr) = pair();
+        h.encrypt(b"a hash chain in use", AD).expect("seal");
+        let linear = h.export_state();
+        assert_eq!(
+            linear[linear.len() - 10],
+            1,
+            "vacuity guard: send mode Linear"
+        );
+        let mut claims_tree = linear.to_vec();
+        claims_tree[linear.len() - 10] = 2;
+        assert!(
+            RatchetSession::import_state(&claims_tree).is_err(),
+            "a tree sending chain beside a hash-chain key must not load"
+        );
+
+        let (mut a, _b, _ar, _br) = tree_pair();
+        a.encrypt(b"settles the mode", AD).expect("seal");
+        let good = a.export_state();
+        RatchetSession::import_state(&good).expect("the unmodified blob loads");
+        // The tail: peer_tree | send_mode | recv_tree | send nodes | chains.
+        // `a` is on a tree sending chain; claim it is a hash chain.
+        let tail_at = good.len()
+            - (3 + 4
+                + a.core.parts().tree.send_tree.as_ref().map_or(0, Holes::len) * TREE_NODE_LEN
+                + 4
+                + a.core
+                    .parts()
+                    .tree
+                    .tree_holes
+                    .values()
+                    .map(|h| 36 + h.len() * TREE_NODE_LEN)
+                    .sum::<usize>());
+        assert_eq!(good[tail_at + 1], 2, "vacuity guard: this is the send mode");
+        for (what, at, value) in [
+            ("send mode", tail_at + 1, 1u8),
+            ("mode byte", tail_at + 1, 7),
+            ("boolean", tail_at, 2),
+        ] {
+            let mut bad = good.to_vec();
+            bad[at] = value;
+            assert!(
+                RatchetSession::import_state(&bad).is_err(),
+                "a state with a bad {what} must not load"
+            );
+        }
+    }
+
+    /// Forward secrecy on the SENDING side: what has been sent, and what a
+    /// recorded position skipped, cannot be derived from anything kept.
+    #[test]
+    fn a_tree_sender_keeps_nothing_behind_it() {
+        let (mut a, _b, _ar, _br) = tree_pair();
+        for _ in 0..3 {
+            a.encrypt(b"sent", AD).expect("seal");
+        }
+        let held =
+            |a: &RatchetSession| a.core.parts().tree.send_tree.expect("a tree sending chain");
+        for used in 0..3u32 {
+            assert!(
+                held(&a).take_leaf(used).is_none(),
+                "sent index {used} is still derivable"
+            );
+        }
+        assert!(
+            held(&a).len() <= 32,
+            "a sender holds one path: {}",
+            held(&a).len()
+        );
+
+        let pos = a.send_position().expect("chain");
+        a.skip_send_to(crate::SendPosition {
+            chain: pos.chain,
+            next: pos.next + 500,
+        })
+        .expect("skip");
+        for skipped in [pos.next, pos.next + 499] {
+            assert!(
+                held(&a).take_leaf(skipped).is_none(),
+                "skipped index {skipped} is still derivable"
+            );
+        }
+        assert!(
+            held(&a).take_leaf(pos.next + 500).is_some(),
+            "the mark itself is kept"
+        );
+    }
+
+    /// Tree chains age by epoch like banked keys: the current one and the one
+    /// before it, never more.
+    #[test]
+    fn tree_chains_age_out_by_epoch() {
+        let (mut a, mut b, mut ar, mut br) = tree_pair();
+        for turn in 0..5u8 {
+            // Each turn leaves a gap in a's chain, so every chain b has seen
+            // still holds something.
+            let lost = a.encrypt(&[turn], AD).expect("seal");
+            drop(lost);
+            let f = a.encrypt(&[turn], AD).expect("seal");
+            b.decrypt(&f, AD, &mut br).expect("open");
+            let f = b.encrypt(&[turn], AD).expect("seal");
+            a.decrypt(&f, AD, &mut ar).expect("open");
+            assert!(
+                b.core.parts().tree.tree_holes.len() <= 2,
+                "turn {turn}: {} tree chains held",
+                b.core.parts().tree.tree_holes.len()
+            );
+        }
     }
 }

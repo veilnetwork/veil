@@ -1234,6 +1234,28 @@ const SENT_AT_FLOOR: u64 = 1_600_000_000;
 /// inside `[floor, now + week]` with odds of about 1 in 10^11.
 const SENT_AT_MAX_AHEAD_SECS: u64 = 7 * 24 * 60 * 60;
 
+/// "I can open a tree-mode chain", written into the ACK key right after the
+/// send-time stamp (bytes 8..12).
+///
+/// Inside the ciphertext for the same reason the stamp is: nobody but the
+/// sender writes it, and nobody on the path can strip it — a header bit could
+/// not carry it, because a build that predates trees refuses a frame with an
+/// unknown flag. A build that predates THIS reads those four bytes as part of
+/// a random key, which they otherwise still are: the key keeps 20 random
+/// bytes, 160 bits, which is all a DELIVERED MAC needs.
+///
+/// Believed only beside a stamp that reads as a time, so a random key from an
+/// older sender passes both only by chance — 2^-32 on top of about 10^-11.
+pub const TREE_CAPABLE_TAG: [u8; 4] = *b"VTR\x01";
+
+/// Whether an opened plaintext's ACK key announces trees. See
+/// [`TREE_CAPABLE_TAG`].
+fn announces_tree(plaintext: &[u8], now_unix: u64) -> bool {
+    sent_at(plaintext, now_unix).is_some()
+        && plaintext.get(SENT_AT_LEN..SENT_AT_LEN + TREE_CAPABLE_TAG.len())
+            == Some(TREE_CAPABLE_TAG.as_slice())
+}
+
 /// The sender's clock out of an opened plaintext, when it carries one.
 fn sent_at(plaintext: &[u8], now_unix: u64) -> Option<u64> {
     let stamp = u64::from_be_bytes(plaintext.get(..SENT_AT_LEN)?.try_into().ok()?);
@@ -1279,7 +1301,9 @@ pub fn seal(
 ) -> Result<(Vec<u8>, [u8; ACK_KEY_LEN]), RatchetSpliceError> {
     let mut ack_key = [0u8; ACK_KEY_LEN];
     ack_key[..SENT_AT_LEN].copy_from_slice(&now_unix.to_be_bytes());
-    OsRatchetRng.fill_bytes(&mut ack_key[SENT_AT_LEN..]);
+    let tag_end = SENT_AT_LEN + TREE_CAPABLE_TAG.len();
+    ack_key[SENT_AT_LEN..tag_end].copy_from_slice(&TREE_CAPABLE_TAG);
+    OsRatchetRng.fill_bytes(&mut ack_key[tag_end..]);
     let mut plaintext = Zeroizing::new(Vec::with_capacity(ACK_KEY_LEN + app_payload.len()));
     plaintext.extend_from_slice(&ack_key);
     plaintext.extend_from_slice(app_payload);
@@ -1660,6 +1684,11 @@ fn open_inner(
                     if let Some(t) = sent_at(&plaintext, now_unix) {
                         entry.peer_sent_at = entry.peer_sent_at.max(t);
                     }
+                    // Likewise only once the tag verified. Our next NEW
+                    // sending chain to them is then a tree.
+                    if announces_tree(&plaintext, now_unix) {
+                        entry.session.note_peer_supports_tree();
+                    }
                     // Only here, after the tag verified. A frame that failed
                     // moved nothing else and must not move this either, or the
                     // eviction order becomes something an attacker writes by
@@ -1777,7 +1806,10 @@ fn open_inner(
             &ad,
             &mut rng,
         ) {
-            Ok((plaintext, session)) => {
+            Ok((plaintext, mut session)) => {
+                if announces_tree(&plaintext, now_unix) {
+                    session.note_peer_supports_tree();
+                }
                 let peer_ik = *message.initiator_ik();
                 let authenticated_until = peer_devices
                     .and_then(|d| d.authorized_until(&sender_instance_id, &peer_ik))
@@ -5370,5 +5402,117 @@ mod tests {
             "a prologue from before the answer does not unseat the conversation",
         );
         assert_eq!(b.store.version(), version_before);
+    }
+
+    // ── Tree-mode chains: the announcement ──────────────────────────────────
+
+    /// The ratchet header's flag byte of a BARE frame (no prologue in front).
+    fn bare_frame_flags(payload: &[u8]) -> u8 {
+        assert_eq!(payload[2], KIND_FRAME, "test premise: a bare frame");
+        assert_eq!(&payload[HEADER_LEN..HEADER_LEN + 2], b"VR");
+        payload[HEADER_LEN + 3]
+    }
+
+    fn seal_to(a: &Device, b: &Device, msg: &[u8]) -> Vec<u8> {
+        let (ek, pk) = (b.ek(), b.ratchet_pk());
+        seal(&a.store, &a.me(), keys(b, &ek, &pk), msg, NOW)
+            .expect("seal")
+            .0
+    }
+
+    fn open_from(b: &Device, a: &Device, payload: &[u8]) -> Opened {
+        let a_pk = a.ratchet_pk();
+        open(
+            &b.store,
+            &b.me(),
+            &a.node_id,
+            payload,
+            Some(&dev(a.instance_id, &a_pk)),
+            NOW,
+        )
+        .expect("open")
+    }
+
+    fn peer_supports_tree(d: &Device) -> bool {
+        let g = d.store.lock();
+        assert_eq!(g.entries.len(), 1, "test premise: one conversation");
+        g.entries.values().all(|e| e.session.peer_supports_tree())
+    }
+
+    /// Two current builds put their conversation on trees within one exchange
+    /// and without starting it over: each learns the other can open one from
+    /// the first frame it opens, and its next new sending chain is a tree.
+    #[test]
+    fn two_current_builds_move_to_trees_within_one_exchange() {
+        let a = device(1);
+        let b = device(2);
+        open_from(&b, &a, &seal_to(&a, &b, b"hi"));
+        assert!(peer_supports_tree(&b), "b heard it from a's first frame");
+
+        let reply = seal_to(&b, &a, b"back");
+        assert_ne!(
+            bare_frame_flags(&reply) & 0b100,
+            0,
+            "b's first chain is a tree"
+        );
+        open_from(&a, &b, &reply);
+        assert!(peer_supports_tree(&a));
+
+        let next = seal_to(&a, &b, b"on a tree");
+        assert_ne!(
+            bare_frame_flags(&next) & 0b100,
+            0,
+            "a's next chain is a tree"
+        );
+        assert_eq!(open_from(&b, &a, &next).plaintext, b"on a tree");
+    }
+
+    /// A sender from before trees writes 24 random bytes after its stamp. It is
+    /// not taken for a tree build, so nothing it would refuse is ever sent to
+    /// it — the whole of the compatibility story.
+    #[test]
+    fn a_sender_from_before_trees_is_never_sent_one() {
+        let a = device(1);
+        let b = device(2);
+        // What a build without the tag seals: stamp, then random.
+        let mut old_ack = [0x5Au8; ACK_KEY_LEN];
+        old_ack[..SENT_AT_LEN].copy_from_slice(&NOW.to_be_bytes());
+        let mut plaintext = old_ack.to_vec();
+        plaintext.extend_from_slice(b"from an older build");
+        let (ek, pk) = (b.ek(), b.ratchet_pk());
+        let payload =
+            seal_inner(&a.store, &a.me(), keys(&b, &ek, &pk), &plaintext, NOW).expect("seal");
+        open_from(&b, &a, &payload);
+        assert!(!peer_supports_tree(&b));
+
+        for turn in 0..3u8 {
+            let reply = seal_to(&b, &a, &[turn]);
+            assert_eq!(
+                bare_frame_flags(&reply) & 0b100,
+                0,
+                "turn {turn}: an older build refuses a frame on this bit alone"
+            );
+            open_from(&a, &b, &reply);
+        }
+    }
+
+    #[test]
+    fn the_announcement_needs_the_tag_and_a_stamp_beside_it() {
+        let mut ack = [0u8; ACK_KEY_LEN];
+        ack[..SENT_AT_LEN].copy_from_slice(&NOW.to_be_bytes());
+        ack[SENT_AT_LEN..SENT_AT_LEN + 4].copy_from_slice(&TREE_CAPABLE_TAG);
+        assert!(announces_tree(&ack, NOW));
+
+        let mut no_tag = ack;
+        no_tag[SENT_AT_LEN + 3] ^= 1;
+        assert!(!announces_tree(&no_tag, NOW), "one bit off is random bytes");
+
+        let mut no_stamp = ack;
+        no_stamp[..SENT_AT_LEN].copy_from_slice(&u64::MAX.to_be_bytes());
+        assert!(
+            !announces_tree(&no_stamp, NOW),
+            "a tag without a believable stamp is an older sender's random key"
+        );
+        assert!(!announces_tree(&ack[..10], NOW), "too short to carry it");
     }
 }
