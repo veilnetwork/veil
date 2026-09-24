@@ -36,6 +36,40 @@ use veil_util::{lock, rlock, wlock};
 
 use crate::IpcMetrics;
 
+/// How long a discovery that found no route is believed.
+///
+/// Each discovery sends a query toward the destination and waits up to half a
+/// second for an answer, and nothing remembered an unanswered one: every send
+/// to a destination nobody can reach paid the half second and sent its query
+/// again. Measured on a stand as 0.5 s of every 6–15 s send to an absent
+/// device, for each of the hundreds the app re-drove after a restart. Short:
+/// a route that appears must be used soon, and a send inside the window still
+/// has the live-session relays to fall back on.
+const ROUTE_MISS_TTL: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// `(this node, destination) → when discovery last found nothing`. Keyed by
+/// the local node too, because several nodes share one process in tests and a
+/// miss is a fact about the asking node's view of the network.
+type RouteMisses = std::collections::HashMap<([u8; 32], [u8; 32]), std::time::Instant>;
+static ROUTE_MISSES: std::sync::LazyLock<std::sync::Mutex<RouteMisses>> =
+    std::sync::LazyLock::new(Default::default);
+
+fn route_recently_missed(local: &[u8; 32], dst: &[u8; 32]) -> bool {
+    ROUTE_MISSES
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .get(&(*local, *dst))
+        .is_some_and(|at| at.elapsed() < ROUTE_MISS_TTL)
+}
+
+fn note_route_miss(local: &[u8; 32], dst: &[u8; 32]) {
+    let mut misses = ROUTE_MISSES.lock().unwrap_or_else(|p| p.into_inner());
+    if misses.len() >= 4_096 {
+        misses.retain(|_, at| at.elapsed() < ROUTE_MISS_TTL);
+    }
+    misses.insert((*local, *dst), std::time::Instant::now());
+}
+
 async fn try_lookup_or_discover(
     dst: &[u8; 32],
     local_node_id: &[u8; 32],
@@ -75,6 +109,12 @@ async fn try_lookup_or_discover(
         && let Some(hop) = rlock!(cache).lookup(dst)
     {
         return Some(hop);
+    }
+
+    // A discovery that just found nothing is not repeated: the cache is what
+    // it would have filled, and it has been asked above.
+    if route_recently_missed(local_node_id, dst) {
+        return route_cache.and_then(|cache| rlock!(cache).lookup(dst));
     }
 
     // No route cached — try reactive discovery if we have the infrastructure.
@@ -190,6 +230,7 @@ async fn try_lookup_or_discover(
             elapsed.as_millis()
         );
     } else {
+        note_route_miss(local_node_id, dst);
         log::warn!(
             "route.discovery.miss dst={} elapsed_ms={}",
             veil_util::bytes_to_hex(&dst[..4]),
@@ -2425,6 +2466,64 @@ mod ratchet_send_tests {
             assert_eq!(opened.plaintext, b"to every device of a person");
             assert!(opened.authenticated);
         }
+    }
+
+    /// A discovery that found no route is not repeated at once: the next send
+    /// to the same unreachable destination neither waits the half second nor
+    /// sends another query.
+    #[tokio::test]
+    async fn an_unanswered_route_discovery_is_not_repeated_at_once() {
+        const NOWHERE: [u8; 32] = [0x4Du8; 32];
+        let fx = fixture(vec![RELAY]);
+        let notify = tokio::sync::Notify::new();
+        let reg: &dyn FrameBroadcaster = &*fx.outbox;
+        let ask = || {
+            try_lookup_or_discover(
+                &NOWHERE,
+                &ME,
+                Some(&*fx.route_cache),
+                Some(reg),
+                Some(&notify),
+                None,
+                None,
+            )
+        };
+        let started = std::time::Instant::now();
+        assert_eq!(ask().await, None);
+        assert!(started.elapsed() >= std::time::Duration::from_millis(400));
+        let queries = fx.taken().len();
+        assert!(queries >= 1, "vacuity: the first discovery sent its query");
+
+        let again = std::time::Instant::now();
+        assert_eq!(ask().await, None);
+        assert!(
+            again.elapsed() < std::time::Duration::from_millis(100),
+            "the second send did not wait out another discovery"
+        );
+        assert!(fx.taken().is_empty(), "and sent no second query");
+    }
+
+    /// A remembered miss lapses: a route that appears is looked for again.
+    #[test]
+    fn a_remembered_route_miss_lapses() {
+        let (local, dst) = ([0x5Au8; 32], [0x5Bu8; 32]);
+        note_route_miss(&local, &dst);
+        assert!(route_recently_missed(&local, &dst));
+        assert!(
+            !route_recently_missed(&[0x5Cu8; 32], &dst),
+            "per asking node"
+        );
+        let long_ago = std::time::Instant::now()
+            .checked_sub(ROUTE_MISS_TTL + std::time::Duration::from_secs(1))
+            .expect("the clock runs further back than the window");
+        ROUTE_MISSES
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert((local, dst), long_ago);
+        assert!(
+            !route_recently_missed(&local, &dst),
+            "past the window it is not believed"
+        );
     }
 
     /// The fail-open half of the rule: no session-named instance (no live
