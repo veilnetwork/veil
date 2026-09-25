@@ -26,8 +26,20 @@ impl FrameDispatcher {
                     Ok(p) => p,
                     Err(e) => return DispatchResult::Violation(format!("bad Attach: {e}")),
                 };
+                // A REFUSAL IS NOT A VIOLATION. The peer asks for a lease on
+                // what it believes of our role; "this node does not host" and
+                // "the table is full" are facts about us, not misconduct by it.
+                // Counted as violations they fed the ban escalation: between
+                // leaves that took each other for gateways on every session
+                // (the role byte was misread until f6e002f6), and — now that
+                // leaves do attach to real gateways — at any gateway past
+                // MAX_GATEWAY_ATTACHMENTS, against every honest client over
+                // the cap. A malformed payload above stays a violation.
                 if let Err(e) = self.gateway.handle_attach(*node_id.as_bytes(), &payload) {
-                    return DispatchResult::Violation(format!("Attach rejected: {e}"));
+                    self.logger.info(
+                        "dispatcher.attach_refused",
+                        format!("peer_id={} {e}", hex_short(node_id.as_bytes())),
+                    );
                 }
                 DispatchResult::NoResponse
             }
