@@ -24,12 +24,29 @@ pub enum RemoteRole {
     Unknown(u8),
 }
 
+/// Read the ATTACH role byte as the sender writes it: the role BITSET
+/// (`NodeRole::to_role_bits`, via `build_local_attach_bytes`), not a
+/// discriminant.
+///
+/// It was read as a discriminant — 0 leaf, 1..=3 core — while every sender
+/// wrote bits, leaf = 1 and core = 8. So every leaf read as a gateway and
+/// every gateway as unknown: a leaf opened a gateway lease and a keepalive
+/// loop on each leaf it dialled, which that leaf refused every tick ("node
+/// role does not allow gateway attachment hosting", 41 a pair per half hour
+/// on a stand), and never on the core nodes that can host one. No sender has
+/// ever written a discriminant, so reading the bits breaks nothing on the
+/// wire; 0 stays a leaf.
 impl From<u8> for RemoteRole {
     fn from(v: u8) -> Self {
-        match v {
-            0 => RemoteRole::Leaf,
-            1..=3 => RemoteRole::Core,
-            other => RemoteRole::Unknown(other),
+        use veil_types::role_bits;
+        if v == 0 {
+            RemoteRole::Leaf
+        } else if v & role_bits::CORE != 0 {
+            RemoteRole::Core
+        } else if v & role_bits::LEAF != 0 {
+            RemoteRole::Leaf
+        } else {
+            RemoteRole::Unknown(v)
         }
     }
 }
@@ -380,6 +397,25 @@ mod tests {
     use veil_proto::session::{
         AttachPayload, CapabilitiesPayload, IdentityPayload, cap_flags, role_bits,
     };
+
+    /// The role a node announces in its ATTACH reads back as that role —
+    /// written by the real writer, not by a hand-built byte, since it was the
+    /// writer and the reader disagreeing that made every leaf a gateway.
+    #[test]
+    fn an_announced_role_reads_back_as_that_role() {
+        for (role, expected) in [
+            (veil_types::NodeRole::Leaf, RemoteRole::Leaf),
+            (veil_types::NodeRole::Core, RemoteRole::Core),
+        ] {
+            let bytes = crate::handshake::build_local_attach_bytes(role, None, &[], None);
+            let attach = AttachPayload::decode(&bytes).expect("the writer's own ATTACH parses");
+            assert_eq!(
+                RemoteRole::from(attach.role),
+                expected,
+                "{role} announced itself and was read as something else"
+            );
+        }
+    }
 
     fn make_entry(seed: u8) -> SessionEntry {
         SessionEntry {
