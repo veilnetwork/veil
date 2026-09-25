@@ -6623,6 +6623,46 @@ mod tests {
 
     // ── tests ─────────────────────────────────────────────────────
 
+    /// An ATTACH this node cannot honour — it does not host, or its table is
+    /// full — is refused without counting against the peer; a malformed one
+    /// still does.
+    #[test]
+    fn a_refused_attach_is_not_a_violation_and_a_malformed_one_is() {
+        use veil_proto::{
+            family::{FrameFamily, SessionMsg},
+            session::{AttachPayload, role_bits},
+        };
+        let peer_id = [0xBCu8; 32];
+        let tx_reg = Arc::new(RwLock::new(veil_session::SessionTxRegistry::new()));
+        let mut dispatcher = make_gossip_dispatcher(
+            [0xAAu8; 32],
+            Arc::new(ed25519_dalek::SigningKey::from_bytes(&[0xAAu8; 32])),
+            Arc::clone(&tx_reg),
+            vec![],
+        );
+        // A node that does not host attachments.
+        dispatcher.gateway = Arc::new(GatewayService::new(NodeRole::Leaf));
+        let hdr = FrameHeader::new(FrameFamily::Session as u8, SessionMsg::Attach as u16);
+        let attach = AttachPayload {
+            role: role_bits::LEAF,
+            realm_id: 0,
+            attach_epoch: 0,
+            mailbox_preference_count: 0,
+            gateway_preference_count: 0,
+            flags: 0,
+        };
+        let refused = dispatcher.dispatch(&hdr, &attach.encode(), peer_id);
+        assert!(
+            matches!(refused, DispatchResult::NoResponse),
+            "a lease this node cannot give is not the peer's fault, got {refused:?}"
+        );
+        let malformed = dispatcher.dispatch(&hdr, &[0x01, 0x02], peer_id);
+        assert!(
+            matches!(malformed, DispatchResult::Violation(_)),
+            "a malformed ATTACH is still a violation, got {malformed:?}"
+        );
+    }
+
     /// A peer that declares GATEWAY role in AnnounceAttachment, but only
     /// advertised LEAF at handshake, must be rejected as a spoofing attempt.
     #[test]
