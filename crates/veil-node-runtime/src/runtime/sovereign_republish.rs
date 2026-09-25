@@ -104,6 +104,11 @@ impl NodeRuntime {
         // republish without requiring a node restart).
         let veil_dir = self.identity_dir.clone();
 
+        /// When the one-shot self-check asks the network for our certificate:
+        /// after the first REPLICATED republish (about two minutes in; the
+        /// startup publish is local-only), so there is something to find.
+        const SELFCHECK_DELAY: std::time::Duration = std::time::Duration::from_secs(180);
+
         /// Default republish cadence — matches the 6-hour TTL/freshness
         /// figure cited in `docs/identity-model.md`.
         const SOVEREIGN_REPUBLISH_INTERVAL: std::time::Duration =
@@ -137,7 +142,7 @@ impl NodeRuntime {
         // ate, and the search goes to the network every time.
         let drop_metrics = self.metrics.clone();
         let selfcheck_resolver = self.proxy_mlkem_ek_resolver();
-        let selfcheck_node_id = *self.identity.local_identity.node_id.as_bytes();
+        let selfcheck_cell = self.identity.sovereign_identity.clone();
         let selfcheck_ring = Arc::clone(&self.identity.mlkem_keys);
 
         let handle = supervised_spawn(
@@ -159,6 +164,7 @@ impl NodeRuntime {
                 let _selfcheck = {
                     let resolver = Arc::clone(&selfcheck_resolver);
                     let ring = Arc::clone(&selfcheck_ring);
+                    let cell = selfcheck_cell.clone();
                     let lg = Arc::clone(&logger);
                     // OWNED, not detached (report17 V17-L8). Aborting this
                     // republish task does not touch what it spawned, so a
@@ -169,24 +175,42 @@ impl NodeRuntime {
                     // The guard lives to the end of the task body, so the
                     // child goes when the task does — by return, by panic or
                     // by abort.
+                    //
+                    // ASKED AS A PEER ASKS, AND WHEN THERE IS SOMETHING TO FIND.
+                    // It asked for the DEVICE's own node id, 45 s in. The
+                    // certificate is published under the IDENTITY with this
+                    // device as its instance — the pair a peer resolves — and
+                    // the startup publish is local-only; the first replicated
+                    // one comes about two minutes in. So every sovereign node
+                    // warned "no peer can seal anything this node could open"
+                    // on every start while peers sealed to it fine (a stand,
+                    // 2026-09-25: three nodes, every restart, messages
+                    // delivered in a second).
                     crate::runtime::AbortOnDrop(tokio::spawn(async move {
-                        tokio::time::sleep(std::time::Duration::from_secs(45)).await;
+                        tokio::time::sleep(SELFCHECK_DELAY).await;
+                        let Some(sov) = cell.get() else { return };
                         let held_pk = veil_util::bytes_to_hex(&ring.current_ratchet_pk()[..4]);
                         let held_ek = veil_util::bytes_to_hex(&ring.current_ek()[..4]);
-                        match resolver.resolve_cert(selfcheck_node_id).await {
+                        match resolver
+                            .resolve_cert_for_instance(*sov.node_id(), sov.active_instance_id())
+                            .await
+                        {
                             Some(c) => {
                                 let net_pk = veil_util::bytes_to_hex(&c.ratchet_x25519_pk[..4]);
                                 let net_ek =
                                     veil_util::bytes_to_hex(&c.mlkem_ek[..4.min(c.mlkem_ek.len())]);
                                 let agree = net_pk == held_pk && net_ek == held_ek;
-                                lg.warn(
-                                    "node.identity.selfcheck",
-                                    format!(
-                                        "network returns ratchet_pk={net_pk} ek={net_ek}; \
-                                         we hold ratchet_pk={held_pk} ek={held_ek} — {}",
-                                        if agree { "AGREE" } else { "DISAGREE" }
-                                    ),
+                                let line = format!(
+                                    "network returns ratchet_pk={net_pk} ek={net_ek}; \
+                                     we hold ratchet_pk={held_pk} ek={held_ek} — {}",
+                                    if agree { "AGREE" } else { "DISAGREE" }
                                 );
+                                // A warning only when there is something wrong.
+                                if agree {
+                                    lg.info("node.identity.selfcheck", line);
+                                } else {
+                                    lg.warn("node.identity.selfcheck", line);
+                                }
                             }
                             None => lg.warn(
                                 "node.identity.selfcheck",
@@ -775,6 +799,34 @@ mod tests {
             savings_factor <= 0.5 + 1e-9,
             "dense nodes (2× density) must publish ≤ 50% as often \
              as base; savings_factor = {savings_factor}"
+        );
+    }
+
+    /// The self-check asks for our certificate the way a peer does — the
+    /// identity and this device's instance — and only once the first
+    /// replicated republish can have happened. Held in the source because the
+    /// check runs inside the node's own republish task.
+    #[test]
+    fn the_self_check_asks_for_the_certificate_a_peer_would_resolve() {
+        let src = include_str!("sovereign_republish.rs");
+        let body = &src[..src.find("#[cfg(test)]").expect("test module")];
+        assert!(
+            body.contains("resolve_cert_for_instance(*sov.node_id(), sov.active_instance_id())"),
+            "the self-check must resolve (identity, own instance)"
+        );
+        assert!(
+            !body.contains("resolver.resolve_cert(selfcheck_node_id)"),
+            "the device's own node id names no certificate"
+        );
+        let delay = body
+            .split("const SELFCHECK_DELAY: std::time::Duration = std::time::Duration::from_secs(")
+            .nth(1)
+            .and_then(|rest| rest.split(')').next())
+            .and_then(|secs| secs.trim().parse::<u64>().ok())
+            .expect("SELFCHECK_DELAY is a literal number of seconds");
+        assert!(
+            delay >= 150,
+            "before the first replicated republish there is nothing to find"
         );
     }
 }
