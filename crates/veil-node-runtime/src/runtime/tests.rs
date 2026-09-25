@@ -3329,6 +3329,90 @@ async fn nat_signaling_skips_tokenless_reply_and_uses_next_coordinator() {
     let _ = fs::remove_file(path);
 }
 
+/// A coordinator that cannot reach the target answers with a refusal — its
+/// own id, no token, no candidates — and the initiator asks the next
+/// coordinator AT ONCE rather than taking the refusal as the answer or
+/// waiting out the per-coordinator timeout.
+#[tokio::test(flavor = "current_thread")]
+async fn nat_signaling_moves_past_a_coordinator_refusal_at_once() {
+    use veil_proto::codec::decode_header;
+    use veil_proto::control::{NatProbeReplyPayload, NatProbeRequestPayload};
+    use veil_proto::family::ControlMsg;
+    use veil_proto::header::HEADER_SIZE;
+
+    let path = save_test_config("punch-refusal-next", runtime_config_with_listen()).unwrap();
+    let mut rt = NodeRuntime::start(&path, true).await.expect("start");
+    let services = rt.access();
+
+    let target = [0xBB; 32];
+    let mut refusing = target;
+    refusing[31] ^= 0x01; // nearest: asked first
+    let mut reaching = target;
+    reaching[0] ^= 0xF0;
+
+    let (mut refusing_rx, mut reaching_rx) = {
+        let mut guard = services.session_tx_registry.write().unwrap();
+        (guard.register(refusing), guard.register(reaching))
+    };
+    let waiters = Arc::clone(&services.dispatcher.nat_probe_waiters);
+    let responder = tokio::spawn(async move {
+        let answer =
+            |frame: Vec<u8>, reply_of: &dyn Fn(&NatProbeRequestPayload) -> NatProbeReplyPayload| {
+                let header = decode_header(&frame[..HEADER_SIZE]).unwrap();
+                assert_eq!(header.msg_type, ControlMsg::NatProbeRequest as u16);
+                let request = NatProbeRequestPayload::decode(&frame[HEADER_SIZE..]).unwrap();
+                let waiter = lock!(waiters)
+                    .remove(&request.session_token)
+                    .expect("waiter registered before the frame was sent");
+                waiter.send(reply_of(&request)).unwrap();
+            };
+        let (_, first) = refusing_rx
+            .recv()
+            .await
+            .expect("refusing coordinator asked");
+        answer(first.to_vec(), &|r| NatProbeReplyPayload {
+            responder_node_id: refusing,
+            final_target_node_id: r.initiator_node_id,
+            session_token: r.session_token,
+            punch_token: None,
+            candidates: vec![],
+        });
+        let (_, second) = reaching_rx.recv().await.expect("next coordinator asked");
+        answer(second.to_vec(), &|r| NatProbeReplyPayload {
+            responder_node_id: target,
+            final_target_node_id: r.initiator_node_id,
+            session_token: r.session_token,
+            punch_token: None,
+            candidates: vec![veil_proto::control::NatCandidate {
+                atyp: 4,
+                candidate_type: veil_proto::control::candidate_type::HOST,
+                priority: 1,
+                addr: vec![203, 0, 113, 7],
+                port: 4000,
+            }],
+        });
+    });
+
+    let started = std::time::Instant::now();
+    let reply = services
+        .try_nat_traversal(target, Vec::new(), Duration::from_secs(3))
+        .await
+        .expect("a refusal is not the answer");
+    assert_eq!(
+        reply.responder_node_id, target,
+        "the target's own answer, via the next coordinator"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "the refusal must not cost the per-coordinator wait (took {:?})",
+        started.elapsed()
+    );
+    responder.await.expect("both coordinators were consulted");
+
+    rt.stop().await.expect("stop");
+    let _ = fs::remove_file(path);
+}
+
 /// Two concurrent attempts for the SAME peer collapse into one: the second
 /// caller joins the in-flight attempt and observes its outcome instead of
 /// starting a second punch. Uses a silent local reflector so the shared
