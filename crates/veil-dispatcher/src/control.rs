@@ -182,6 +182,7 @@ impl FrameDispatcher {
                     // Snapshot the cache before the session registry to keep
                     // the canonical route_cache -> registry lock order.
                     let cached_hop = rlock!(self.route_cache).lookup(&request.target_node_id);
+                    let mut forwarded = false;
                     if let Some(ref reg_arc) = self.session_tx_registry {
                         let guard = wlock!(reg_arc);
                         // Forward the ORIGINAL body bytes, not a re-encode of
@@ -198,7 +199,8 @@ impl FrameDispatcher {
                         });
                         let routed = !direct
                             && routed_hop.is_some_and(|hop| guard.send_to(&hop, prio, frame));
-                        if direct || routed {
+                        forwarded = direct || routed;
+                        if forwarded {
                             self.logger.info(
                                 "nat.probe.forwarded",
                                 format!(
@@ -210,7 +212,12 @@ impl FrameDispatcher {
                                 ),
                             );
                         } else {
-                            self.logger.warn(
+                            // INFO, not WARN: the initiator picked this node
+                            // by XOR distance, a guess, and a guess that
+                            // misses is the ordinary outcome, not a fault
+                            // here. At WARN it was two thirds of a production
+                            // seed's log (24.08).
+                            self.logger.info(
                                 "nat.probe.forward_failed",
                                 format!(
                                     "no session to target={} for initiator={}",
@@ -219,6 +226,33 @@ impl FrameDispatcher {
                                 ),
                             );
                         }
+                    }
+                    // SAY SO, so the initiator can ask the next coordinator
+                    // now. A silent drop cost it the whole per-coordinator
+                    // wait — up to 1.5 s taken from a hole-punch budget that
+                    // the next coordinator might have succeeded within; on a
+                    // stand ~98% of forwards missed like this.
+                    //
+                    // Only for a punch-token request. That initiator already
+                    // treats a reply without its token as "try the next one"
+                    // (every build that sends a token does), so the refusal
+                    // is safe with old initiators. One without a token would
+                    // take the empty reply as the final answer and give up
+                    // early, so it keeps getting silence.
+                    if !forwarded && request.punch_token.is_some() {
+                        let refusal = NatProbeReplyPayload {
+                            responder_node_id: self.local_node_id,
+                            final_target_node_id: request.initiator_node_id,
+                            session_token: request.session_token,
+                            punch_token: None,
+                            candidates: Vec::new(),
+                        };
+                        return DispatchResult::Response(encode_response(
+                            header,
+                            FrameFamily::Control as u8,
+                            ControlMsg::NatProbeReply as u16,
+                            &refusal.encode(),
+                        ));
                     }
                     return DispatchResult::NoResponse;
                 }
