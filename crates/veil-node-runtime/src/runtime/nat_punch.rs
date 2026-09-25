@@ -97,6 +97,24 @@ impl NodeServices {
                 )
                 .await
             {
+                // A COORDINATOR'S REFUSAL: the coordinator itself answering,
+                // with neither our punch token nor a single candidate, is it
+                // saying it has no way to the target — sent at once instead
+                // of letting this wait run out. Ask the next one.
+                if reply.responder_node_id == coordinator
+                    && reply.punch_token.is_none()
+                    && reply.candidates.is_empty()
+                {
+                    self.logger.debug(
+                        "nat.udp_punch.coordinator_refused",
+                        format!(
+                            "coordinator {} has no way to {} — trying next",
+                            veil_util::hex_short(&coordinator),
+                            veil_util::hex_short(&target_node_id),
+                        ),
+                    );
+                    continue;
+                }
                 // Mixed-version resilience: a coordinator built before the
                 // punch-token wire extension decodes-then-re-encodes the
                 // frames and strips the token in flight, so the reply comes

@@ -6329,6 +6329,73 @@ mod tests {
         assert!(to_next_hop.try_recv().is_err());
     }
 
+    /// A coordinator with no way to the target answers a punch-token request
+    /// at once with a refusal addressed to the initiator — and stays silent
+    /// for a request without a token, whose sender would take an empty reply
+    /// as final.
+    #[test]
+    fn a_coordinator_that_cannot_forward_says_so_to_a_punch_request() {
+        use veil_proto::control::{NatProbeReplyPayload, NatProbeRequestPayload};
+
+        let initiator_id = [0xA1; 32];
+        let target_id = [0xB1; 32];
+        let coordinator_id = [0xC1; 32];
+        let mut coordinator = make_test_dispatcher(NodeRole::Core);
+        coordinator.local_node_id = coordinator_id;
+        coordinator.session_tx_registry = Some(Arc::new(RwLock::new(
+            veil_session::SessionTxRegistry::new(),
+        )));
+        let header = FrameHeader::new(
+            FrameFamily::Control as u8,
+            ControlMsg::NatProbeRequest as u16,
+        );
+
+        let request = NatProbeRequestPayload {
+            initiator_node_id: initiator_id,
+            target_node_id: target_id,
+            session_token: 0x0BAD_F00D,
+            punch_token: Some([0x42; 16]),
+            candidates: vec![],
+        };
+        let DispatchResult::Response(bytes) =
+            coordinator.dispatch(&header, &request.encode(), initiator_id)
+        else {
+            panic!("a punch request the coordinator cannot forward must be answered");
+        };
+        assert_eq!(
+            u16::from_be_bytes([bytes[6], bytes[7]]),
+            ControlMsg::NatProbeReply as u16
+        );
+        let refusal = NatProbeReplyPayload::decode(&bytes[HEADER_SIZE..]).unwrap();
+        assert_eq!(
+            refusal.responder_node_id, coordinator_id,
+            "not the target's answer"
+        );
+        assert_eq!(refusal.final_target_node_id, initiator_id);
+        assert_eq!(
+            refusal.session_token, 0x0BAD_F00D,
+            "it wakes the waiting initiator"
+        );
+        assert_eq!(
+            refusal.punch_token, None,
+            "an older initiator reads this as next-please"
+        );
+        assert!(refusal.candidates.is_empty());
+
+        let tokenless = NatProbeRequestPayload {
+            session_token: 0x0BAD_F00E,
+            punch_token: None,
+            ..request
+        };
+        assert!(
+            matches!(
+                coordinator.dispatch(&header, &tokenless.encode(), initiator_id),
+                DispatchResult::NoResponse
+            ),
+            "a tokenless initiator would take an empty reply as final"
+        );
+    }
+
     /// The response is independently routable to the initiator. It must use a
     /// cached next hop when the responder-side coordinator does not have a
     /// direct initiator session, with the same loop suppression as requests.
