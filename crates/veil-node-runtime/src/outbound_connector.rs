@@ -83,6 +83,43 @@ pub fn build_session_keepalive_frame() -> Vec<u8> {
 }
 
 /// Return `base` with ±20 % random jitter using `OsRng`.
+/// A session that ended this soon after its handshake was not lived; it was
+/// refused.
+///
+/// The far side closes a session it will not keep straight after the
+/// handshake — a seed still holding this node's session from before a crash
+/// rejects the new one as a duplicate until it reaps the old, which takes as
+/// long as the old link's idle timeout. The handshake itself succeeded, so the
+/// loop counted it a success, reset its backoff and dialled again at once.
+/// Measured on a stand after a restart: 784 sessions opened and closed inside
+/// twenty seconds by one node, 1 366 duplicate rejections at the three seeds
+/// for another — each a handshake and a PoW challenge on the seed.
+pub(crate) const STILLBORN_SESSION: Duration = Duration::from_secs(2);
+
+/// The longest pause between dials that keep being refused. Short: the old
+/// session goes within tens of seconds, and this bounds how long after that
+/// the next dial lands.
+pub(crate) const STILLBORN_BACKOFF_MAX: Duration = Duration::from_secs(8);
+
+/// After a session that lived `lived`: how long to wait before dialling
+/// again, and the pause to use if the next one is refused too.
+///
+/// A session that lived is followed by an immediate redial, as before — its
+/// loss is news, and the reconnect is what recovers it. One that was refused
+/// waits `pause`, and each refusal in a row doubles it up to
+/// [`STILLBORN_BACKOFF_MAX`].
+pub fn after_session_ended(
+    lived: Duration,
+    pause: Duration,
+    backoff_min: Duration,
+) -> (Option<Duration>, Duration) {
+    if lived >= STILLBORN_SESSION {
+        return (None, backoff_min);
+    }
+    let next = std::cmp::min(pause.saturating_mul(2), STILLBORN_BACKOFF_MAX);
+    (Some(std::cmp::min(pause, STILLBORN_BACKOFF_MAX)), next)
+}
+
 pub fn jittered(base: Duration) -> Duration {
     // OsRng is cryptographically secure and avoids the low-entropy bias of
     // SystemTime::subsec_nanos when many connections start simultaneously.
@@ -241,6 +278,10 @@ pub fn spawn_outbound_peers(
             let backoff_max = access.defaults.reconnect_backoff_max;
             let quiet_after = access.defaults.reconnect_quiet_after_failures;
             let mut backoff = backoff_min;
+            // The pause after a session refused straight after its handshake;
+            // see `after_session_ended`. Separate from `backoff`, which a
+            // successful handshake resets.
+            let mut stillborn_pause = backoff_min;
             // count consecutive failures so we can downgrade the
             // log level after `quiet_after` strikes (still retrying — the
             // peer might come back — just not spamming WARN every cycle).
@@ -856,6 +897,38 @@ pub fn spawn_outbound_peers(
                                     access.gateway_failover_notify.notify_waiters();
                                 }
 
+                                // A SESSION REFUSED IS NOT A SESSION LIVED.
+                                // See `after_session_ended`.
+                                let (pause, next_pause) = after_session_ended(
+                                    session_began.elapsed(),
+                                    stillborn_pause,
+                                    backoff_min,
+                                );
+                                stillborn_pause = next_pause;
+                                if let Some(pause) = pause {
+                                    access.logger.info(
+                                        "session.stillborn",
+                                        format!(
+                                            "peer={} lived_ms={} — refused straight after \
+                                             the handshake; next dial in {} ms",
+                                            veil_util::hex_short(attempt.node_id.as_bytes()),
+                                            session_began.elapsed().as_millis(),
+                                            pause.as_millis(),
+                                        ),
+                                    );
+                                    tokio::select! {
+                                        _ = shutdown_rx.changed() => break,
+                                        _ = tokio::time::sleep(jittered(pause)) => {}
+                                        _ = access.force_reconnect_notify.notified() => {
+                                            stillborn_pause = backoff_min;
+                                        }
+                                        changed = refresh_rx.changed() => {
+                                            if changed.is_err() { break; }
+                                            stillborn_pause = backoff_min;
+                                        }
+                                    }
+                                }
+
                                 // Phase E20-fix (2026-05-22): previously
                                 // `bootstrap_only` connectors broke after the
                                 // first session ended, relying on the
@@ -1335,6 +1408,49 @@ mod tests {
             source.contains("identity_mismatch_drops_record(peer.source)"),
             "the retirement rule is narrower than the rule that drops the row, \
              so a dropped Autodiscovered row keeps its dial forever"
+        );
+    }
+
+    /// A session refused straight after its handshake is followed by a
+    /// growing pause, not by another dial at once; one that lived is not.
+    #[test]
+    fn a_refused_session_backs_off_and_a_lived_one_does_not() {
+        let min = Duration::from_secs(1);
+        let refused = Duration::from_millis(3);
+        let mut pause = min;
+        let mut waits = Vec::new();
+        for _ in 0..6 {
+            let (wait, next) = after_session_ended(refused, pause, min);
+            waits.push(wait.expect("a refused session waits before the next dial"));
+            pause = next;
+        }
+        assert_eq!(
+            waits,
+            [1, 2, 4, 8, 8, 8].map(Duration::from_secs),
+            "doubling from the minimum, capped so a recovery is never far off"
+        );
+
+        let (wait, next) = after_session_ended(STILLBORN_SESSION, pause, min);
+        assert_eq!(wait, None, "a session that lived is redialled at once");
+        assert_eq!(next, min, "and the next refusal starts from the minimum");
+    }
+
+    /// The loop asks the question AFTER the session has run, on the path a
+    /// successful handshake takes. Held in the source because that path runs
+    /// only with a live peer on the other end.
+    #[test]
+    fn the_connector_consults_the_refusal_pause_after_a_session_ends() {
+        let src = include_str!("outbound_connector.rs");
+        let body = &src[..src.find("#[cfg(test)]").expect("test module")];
+        let run = body
+            .find("runner.run().await")
+            .expect("the session run moved");
+        let ask = body
+            .find("= after_session_ended(")
+            .expect("the connector no longer consults after_session_ended");
+        assert!(
+            ask > run,
+            "the pause is decided by how long the session lived"
         );
     }
 
