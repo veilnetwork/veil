@@ -1369,7 +1369,9 @@ where
     // held alive until this returns so the dir (and its secrets) persist for
     // the daemon's lifetime, then are scrubbed on graceful shutdown (the old
     // code leaked the dir to OS reap).
-    let result = run_foreground_with_shutdown(&config_path, true, external_shutdown).await;
+    // The stub's `[identity]` is the placeholder, and the file cannot carry
+    // that fact; it is passed alongside instead.
+    let result = run_foreground_marked(&config_path, true, external_shutdown, true).await;
     drop(tmp_dir);
     result
 }
@@ -1387,13 +1389,28 @@ pub async fn run_foreground_with_shutdown<F>(
 where
     F: std::future::Future<Output = ()> + Send + 'static,
 {
+    run_foreground_marked(config_path, foreground_mode, external_shutdown, false).await
+}
+
+/// The foreground loop, told whether the config's `[identity]` is the
+/// deferred boot's placeholder — which the file itself cannot say (see
+/// `NodeRuntime::start_marked`).
+async fn run_foreground_marked<F>(
+    config_path: impl AsRef<Path>,
+    foreground_mode: bool,
+    external_shutdown: F,
+    ephemeral_identity: bool,
+) -> Result<()>
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
     let config_path = config_path.as_ref().to_path_buf();
     let config = veil_cfg::load_config(&config_path)?;
     // Default runtime_dir = config file's parent. Multi-node setups are then
     // self-isolating: each node's config dir hosts its own admin sidecars.
     let endpoint = resolve_admin_endpoint(&config, config_path.parent())?;
     let runtime = Arc::new(Mutex::new(
-        NodeRuntime::start(&config_path, foreground_mode).await?,
+        NodeRuntime::start_marked(&config_path, foreground_mode, ephemeral_identity).await?,
     ));
 
     // Reload config on SIGHUP — Unix-only; the helper itself is gated and
