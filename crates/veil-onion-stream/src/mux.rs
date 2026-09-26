@@ -118,6 +118,18 @@ const OPEN_ID_PROBES: u32 = 64;
 /// ranged bulk pulls open a fresh stream per range and paid it every time.
 type BwCache = Arc<Mutex<HashMap<Peer, (u64, u32, Instant)>>>;
 
+/// Who may answer for whom: `answering node → the node a stream was opened to`.
+///
+/// A stream opened to an IDENTITY is answered by one of its DEVICES, and the
+/// answer names the device. Routes are keyed by the node the stream was opened
+/// to, so without this every SYN_ACK from a multi-device (or deferred-boot)
+/// identity missed its route and was dropped as junk: the open never
+/// completed, in either direction. The transport fills this from what it
+/// actually resolved (the ad a route was opened against names the device that
+/// signed it); the demux consults it only for a non-SYN cell with no route of
+/// its own, so a stream the device itself opens stays the device's.
+pub type PeerAliases = Arc<Mutex<HashMap<Peer, Peer>>>;
+
 /// Ignore cached delivery models older than this — path conditions drift and
 /// a warm seed is a head start, not a promise (the estimator's own windowed
 /// filters correct a stale seed within seconds either way).
@@ -246,6 +258,18 @@ impl<S: CellSender> StreamMux<S> {
         inbound: mpsc::Receiver<(Addr, Vec<u8>)>,
         cfg: Config,
     ) -> Self {
+        Self::new_with_aliases(me, sender, inbound, cfg, PeerAliases::default())
+    }
+
+    /// Like [`new`](Self::new), with the answering-node table the transport
+    /// fills (see [`PeerAliases`]).
+    pub fn new_with_aliases(
+        me: Peer,
+        sender: Arc<S>,
+        inbound: mpsc::Receiver<(Addr, Vec<u8>)>,
+        cfg: Config,
+        aliases: PeerAliases,
+    ) -> Self {
         let routes: Routes = Arc::new(Mutex::new(HashMap::new()));
         let bw_cache: BwCache = Arc::new(Mutex::new(HashMap::new()));
         let (accept_tx, accept_rx) = mpsc::channel(ACCEPT_BACKLOG);
@@ -256,6 +280,7 @@ impl<S: CellSender> StreamMux<S> {
             bw_cache.clone(),
             accept_tx,
             cfg,
+            aliases,
         ));
         StreamMux {
             me,
@@ -339,6 +364,7 @@ async fn demux<S: CellSender>(
     bw_cache: BwCache,
     accept_tx: mpsc::Sender<(OnionStream, Addr)>,
     cfg: Config,
+    aliases: PeerAliases,
 ) {
     let mut batch: Vec<(Addr, Vec<u8>)> = Vec::new();
     let mut new_streams: Vec<(Addr, Vec<u8>)> = Vec::new();
@@ -362,6 +388,15 @@ async fn demux<S: CellSender>(
                     let _ = tx.try_send(cell); // full → drop, ARQ recovers
                 } else if matches!(frame, Frame::Syn { .. }) {
                     new_streams.push((src, cell));
+                } else if let Some(tx) = aliases
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .get(&src.node)
+                    .and_then(|opened_to| routes_g.get(&(*opened_to, key.1)))
+                {
+                    // An answer from the device for a stream opened to its
+                    // identity (see `PeerAliases`).
+                    let _ = tx.try_send(cell);
                 }
             }
         }
@@ -684,5 +719,83 @@ mod tests {
         let _ = t2.await.unwrap();
         let ok = (g1 == d1 && g2 == d2) || (g1 == d2 && g2 == d1);
         assert!(ok, "two muxed streams crossed or corrupted");
+    }
+
+    /// A stream opened to an IDENTITY completes when a DEVICE answers it.
+    ///
+    /// The open is routed to whatever holds the identity's rendezvous slot,
+    /// and that device answers under its own id. Routes are keyed by the node
+    /// the stream was opened to, so the SYN_ACK missed and was dropped: on the
+    /// stand every anonymous stream to a desktop identity stalled in the
+    /// handshake, and no file above the datagram size arrived.
+    async fn transfer_to_identity_answered_by_device(aliases: PeerAliases) -> bool {
+        let (a, device, identity) = (addr(1), addr(2), addr(3));
+        let (bus, a_rx, d_rx) = wire_bus(a, device, 0);
+        // What the transport does: cells for the identity reach the device.
+        let d_tx = bus.lock().unwrap().get(&device.node).cloned().unwrap();
+        bus.lock().unwrap().insert(identity.node, d_tx);
+        let sa = Arc::new(BusSender {
+            me: a,
+            bus: bus.clone(),
+            loss: 0,
+            ctr: AtomicU32::new(0),
+        });
+        let sd = Arc::new(BusSender {
+            me: device,
+            bus: bus.clone(),
+            loss: 0,
+            ctr: AtomicU32::new(5),
+        });
+        let cfg = Config::default();
+        let mux_a = StreamMux::new_with_aliases(a.node, sa, a_rx, cfg, aliases);
+        let mux_d = StreamMux::new(device.node, sd, d_rx, cfg);
+
+        // The shape of a pull: a short request out, the file back.
+        let request = payload(48, 3);
+        let file = payload(20_000, 4);
+        let served = file.clone();
+        let server = tokio::spawn(async move {
+            let (mut s_d, src) = mux_d.accept().await.expect("accept");
+            assert_eq!(src, a);
+            let _request = read_all(&mut s_d, 48).await;
+            s_d.write_all(&served).await?;
+            s_d.finish().await
+        });
+        let pull = async {
+            let mut s_a = mux_a.open(identity);
+            s_a.write_all(&request).await.ok()?;
+            // Not `read_all`: a reset is this test's failure outcome, not a panic.
+            let mut out = Vec::new();
+            let mut buf = vec![0u8; 8192];
+            while out.len() < file.len() {
+                match s_a.read(&mut buf).await.ok()? {
+                    0 => break,
+                    k => out.extend_from_slice(&buf[..k]),
+                }
+            }
+            Some(out)
+        };
+        let got = tokio::time::timeout(Duration::from_secs(120), pull).await;
+        server.abort();
+        matches!(got, Ok(Some(bytes)) if bytes == file)
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn a_stream_to_an_identity_completes_when_its_device_answers() {
+        let aliases = PeerAliases::default();
+        aliases.lock().unwrap().insert(addr(2).node, addr(3).node);
+        assert!(
+            transfer_to_identity_answered_by_device(aliases).await,
+            "the device's answer must reach the stream opened to its identity"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn without_the_alias_the_devices_answer_is_lost() {
+        assert!(
+            !transfer_to_identity_answered_by_device(PeerAliases::default()).await,
+            "control: with no alias the open must not complete — otherwise the \
+             test above proves nothing about the alias"
+        );
     }
 }
