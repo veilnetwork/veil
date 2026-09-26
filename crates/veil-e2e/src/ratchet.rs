@@ -1551,6 +1551,24 @@ pub fn open(
     Ok(opened)
 }
 
+/// The (sender, recipient) instance ids a ratchet payload's header names,
+/// read without opening it; None when it is not a ratchet payload.
+///
+/// For the refusal log. `NotForThisDevice` said only that a frame was keyed to
+/// "another instance", and which one is the whole diagnosis: a sibling device
+/// of this identity, a stale instance of this one, or somebody else entirely
+/// each has a different fix.
+pub fn payload_instances(payload: &[u8]) -> Option<([u8; 16], [u8; 16])> {
+    if payload.len() <= HEADER_LEN || payload[0] != RATCHET_E2E_MARKER {
+        return None;
+    }
+    let mut sender = [0u8; 16];
+    sender.copy_from_slice(&payload[3..19]);
+    let mut recipient = [0u8; 16];
+    recipient.copy_from_slice(&payload[19..35]);
+    Some((sender, recipient))
+}
+
 fn open_inner(
     store: &RatchetStore,
     me: &RatchetIdentity,
@@ -3829,6 +3847,26 @@ mod tests {
         assert_eq!(
             open(&b.store, &me, &a.node_id, &payload, None, NOW).unwrap_err(),
             RatchetSpliceError::NotForThisDevice
+        );
+    }
+
+    /// The header names who sealed the frame and for whom, readable by
+    /// anyone holding the bytes — which is what a refusal log needs to say
+    /// whose frame it dropped. Anything that is not a ratchet payload is None.
+    #[test]
+    fn a_payload_names_its_sender_and_recipient_instances() {
+        let (a, b) = (device(0xA9), device(0xB9));
+        let (ek, pk) = (b.ek(), b.ratchet_pk());
+        let payload = seal(&a.store, &a.me(), keys(&b, &ek, &pk), b"x", NOW)
+            .expect("seal")
+            .0;
+        assert_eq!(
+            payload_instances(&payload),
+            Some((a.instance_id, b.instance_id))
+        );
+        assert_eq!(
+            payload_instances(b"not a ratchet payload at all, not one bit"),
+            None
         );
     }
 

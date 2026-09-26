@@ -295,7 +295,23 @@ impl FrameDispatcher {
                                         .map(|i| i.seed_ring.current_ek())
                                         .unwrap_or([0u8; veil_e2e::EK_BYTES])[..4]
                                 ),
-                            ),
+                            ) + &match veil_e2e::payload_instances(&payload.data) {
+                                // WHOSE frame it was. "Another instance" alone
+                                // cannot tell a sibling device's frame from one
+                                // keyed to a stale instance of this device.
+                                Some((from, to)) => format!(
+                                    " sealed-for={} from-instance={} we-are={}",
+                                    veil_util::bytes_to_hex(&to[..4]),
+                                    veil_util::bytes_to_hex(&from[..4]),
+                                    veil_util::bytes_to_hex(
+                                        &ratchet
+                                            .identity()
+                                            .map(|i| i.local_instance_id)
+                                            .unwrap_or([0u8; 16])[..4]
+                                    ),
+                                ),
+                                None => String::new(),
+                            },
                         );
                         // The conversation was given up, and the peer does not
                         // know: nothing on a send path reports that a frame did

@@ -33,7 +33,7 @@ pub mod seed_ring;
 pub use ratchet::{
     ACK_KEY_LEN, CONVERSATION_KEY_LEN, ConversationKey, MAX_CONVERSATIONS, Opened,
     PeerRatchetKeyCache, PeerRatchetKeys, RatchetIdentity, RatchetRuntime, RatchetSpliceError,
-    RatchetStore, UNPROVEN_TTL_SECS, is_ratchet_payload,
+    RatchetStore, UNPROVEN_TTL_SECS, is_ratchet_payload, payload_instances,
 };
 pub use seed_ring::{MLKEM_SEED_MIN_OVERLAP_SECS, MlKemSeedRing, RotateRejected};
 
