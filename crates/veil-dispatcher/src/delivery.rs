@@ -1634,13 +1634,29 @@ impl FrameDispatcher {
             wlock!(self.route_cache).insert(deliver_sender_node_id, *peer_id.as_bytes(), 1_000, 1);
         }
 
-        self.app_registry.route_ipc_deliver(
+        // A relayed ratchet frame names the app its IDENTITY and says which
+        // DEVICE sent it — the same pair a direct session reports. Without the
+        // device the app can only answer the identity, and anything that has to
+        // reach the device holding some state (a file offer's bytes live on the
+        // device that offered them) lands on whichever sibling owns the
+        // identity's rendezvous slots: measured on the stand, every 3 MB pull
+        // from a two-device identity went to the sibling without the file. The
+        // envelope's device is mapped to that identity by `ratchet_peer_of`, so
+        // at worst it names another device of the same identity. A hint for
+        // replies and routing, never for authorization.
+        let origin_device = decrypted_app_sender
+            .filter(|identity| *identity != deliver_sender_node_id)
+            .map(|_| deliver_sender_node_id);
+        self.app_registry.route_ipc_deliver_with_reply(
             decrypted_app_sender.unwrap_or(deliver_sender_node_id),
             provenance,
+            None,
+            origin_device,
             deliver_src_app_id,
             deliver_app_id,
             deliver_endpoint_id,
             veil_bufpool::pooled_shared_from_vec(app_payload),
+            0,
         );
 
         // send E2E delivery ACK back to the original sender, MAC'd with the
@@ -4226,20 +4242,60 @@ mod ratchet_terminal_tests {
                 .expect("sender field in the envelope");
             body[at..at + 32].copy_from_slice(&ALICE_DEVICE);
             disp.dispatch(&hdr, &body, NodeId::from(RELAY));
-            take(&mut rx)
+            match rx.try_recv() {
+                Ok(AppMessage::Deliver {
+                    src_node_id,
+                    provenance,
+                    origin_device,
+                    data,
+                    ..
+                }) => Some((
+                    src_node_id,
+                    provenance,
+                    data.as_ref().to_vec(),
+                    origin_device,
+                )),
+                Ok(other) => panic!("expected a Deliver, got {other:?}"),
+                Err(_) => None,
+            }
         };
 
         assert!(
             open_with(false).is_none(),
             "control: keyed by the device, the frame does not open"
         );
-        let (src, provenance, data) = open_with(true).expect("delivered");
+        let (src, provenance, data, origin_device) = open_with(true).expect("delivered");
         assert_eq!(
             src, ALICE,
             "the app is told the identity, as on a direct session"
         );
         assert_eq!(data, b"from a sibling device");
         assert_eq!(provenance, SenderProvenance::Signed);
+        // ...and, as on a direct session, which device sent it: the device is
+        // who holds whatever the message offers (a file's bytes).
+        assert_eq!(origin_device, Some(ALICE_DEVICE));
+    }
+
+    /// A frame the identity sent under its own id names no separate device.
+    #[test]
+    fn a_relayed_frame_from_the_identity_itself_names_no_device() {
+        let (alice, bob) = (party(ALICE, 0xA6), party(BOB, 0xB6));
+        learn(&bob, &alice);
+        let payload = seal(&alice, &bob, b"x");
+        let (disp, _h, mut rx) = dispatcher_for(&bob);
+        let (hdr, body) = forward_frame([0x06u8; 32], payload);
+        disp.dispatch(&hdr, &body, NodeId::from(RELAY));
+        match rx.try_recv() {
+            Ok(AppMessage::Deliver {
+                src_node_id,
+                origin_device,
+                ..
+            }) => {
+                assert_eq!(src_node_id, ALICE);
+                assert_eq!(origin_device, None);
+            }
+            other => panic!("expected a Deliver, got {other:?}"),
+        }
     }
 
     /// …and it still teaches no route. The ratchet proves who WROTE the
