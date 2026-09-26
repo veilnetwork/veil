@@ -3329,6 +3329,41 @@ async fn nat_signaling_skips_tokenless_reply_and_uses_next_coordinator() {
     let _ = fs::remove_file(path);
 }
 
+/// A node that hosts a mailbox serves it whether or not IPC is on: the
+/// mailbox answers deposits and fetches from the NETWORK. It used to be
+/// started only from inside the IPC server, after the `ipc.enabled` check, so
+/// a relay with the `config init` default (IPC off) and `mailbox.enabled =
+/// true` served nothing and dropped every deposit.
+#[tokio::test(flavor = "current_thread")]
+async fn a_mailbox_is_served_without_ipc() {
+    let mut config = runtime_config_with_listen();
+    config.mailbox.enabled = true;
+    config.ipc.enabled = false;
+    let path = save_test_config("mailbox-no-ipc", config).unwrap();
+    let mut rt = NodeRuntime::start(&path, true).await.expect("start");
+    let mut bound = false;
+    for _ in 0..40 {
+        if rt
+            .app_registry()
+            .get_sender(
+                veil_mailbox::MAILBOX_APP_ID,
+                veil_mailbox::MAILBOX_PUT_ENDPOINT_ID,
+            )
+            .is_some()
+        {
+            bound = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        bound,
+        "a mailbox relay with IPC off must still take deposits"
+    );
+    rt.stop().await.expect("stop");
+    let _ = fs::remove_file(path);
+}
+
 /// A coordinator that cannot reach the target answers with a refusal — its
 /// own id, no token, no candidates — and the initiator asks the next
 /// coordinator AT ONCE rather than taking the refusal as the answer or
