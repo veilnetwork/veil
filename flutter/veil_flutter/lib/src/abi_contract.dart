@@ -17,7 +17,7 @@
 /// Compare against `veil_abi_contract_hash()` from the loaded library
 /// BEFORE using it. See `native.dart`.
 const String veilAbiContractHash =
-    '4a89342791c6b1b6350bb989a96d7b12378238a128c2b81bd6e6c083a2304306';
+    '19401c825d1e020117aad9b8b875367980b51210f5a295ca432bde1d3503e1ea';
 
 // -- Constants lifted from the generated header --------------------------
 
@@ -129,6 +129,8 @@ const int veilCreateInviteNotConfigured = 1;
 const int veilCreateInviteBadPassword = 2;
 /// `VEIL_CREATE_INVITE_INTERNAL_ERROR`
 const int veilCreateInviteInternalError = 3;
+/// `VEIL_PEER_CAP_ANONYMITY_RELAY`
+const int veilPeerCapAnonymityRelay = 4;
 /// `VEIL_PEER_STATE_CONNECTING`
 const int veilPeerStateConnecting = 0;
 /// `VEIL_PEER_STATE_ACTIVE`

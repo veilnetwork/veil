@@ -516,7 +516,7 @@ List<VeilPeer> _peersWorker(int handleAddr) {
   // accumulate into `out` directly and return it (plain data, sendable back).
   final cb = NativeCallable<ffi.VeilPeerCbNative>.isolateLocal(
     (Pointer<Void> user, Pointer<Uint8> nodeId, int state, int direction,
-        Pointer<Uint8> transport, int transportLen) {
+        Pointer<Uint8> transport, int transportLen, int caps) {
       final id = Uint8List.fromList(nodeId.asTypedList(32));
       final uri = transportLen > 0
           ? utf8.decode(transport.asTypedList(transportLen),
@@ -527,6 +527,7 @@ List<VeilPeer> _peersWorker(int handleAddr) {
         state: VeilPeerState.fromWire(state),
         direction: VeilPeerDirection.fromWire(direction),
         transport: uri,
+        caps: caps < 0 ? null : caps,
       ));
     },
   );

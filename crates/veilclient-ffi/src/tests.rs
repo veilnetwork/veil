@@ -16,6 +16,12 @@ use super::*;
 // The families that moved to files of their own; the tests came with
 // neither, because they reach across several of them.
 use crate::mailbox::*;
+/// The peer-list capability bit is written as a literal so cbindgen can put
+/// its value in the header; this is what keeps it the handshake's bit.
+const _: () = assert!(
+    VEIL_PEER_CAP_ANONYMITY_RELAY == veil_proto::session::cap_flags::ANONYMITY_RELAY as i32
+);
+
 #[cfg(feature = "node-embedded")]
 use crate::media_ffi::direct_media_source_app;
 #[cfg(feature = "node-embedded")]
