@@ -18,17 +18,43 @@ use crate::types::{LinkId, SessionInfo, SessionSource, SessionState};
 /// Snapshots `live_sessions` on demand for IPC `GetPeers` queries.
 pub struct LiveSessionsPeerList {
     live_sessions: Arc<Mutex<BTreeMap<LinkId, SessionInfo>>>,
+    cap_flags: Option<PeerCapFlags>,
 }
+
+/// Handshake-advertised capability flags by node id (the dispatcher's
+/// `peer_cap_flags`).
+pub type PeerCapFlags = Arc<std::sync::RwLock<std::collections::HashMap<[u8; 32], u8>>>;
 
 impl LiveSessionsPeerList {
     pub fn new(live_sessions: Arc<Mutex<BTreeMap<LinkId, SessionInfo>>>) -> Self {
-        Self { live_sessions }
+        Self {
+            live_sessions,
+            cap_flags: None,
+        }
+    }
+
+    /// Report each peer's handshake capability flags alongside it.
+    ///
+    /// The app needs them to tell which of the peers the node found can carry
+    /// a mailbox. Without them it asked every one for a relay key, and a peer
+    /// that is not a relay does not answer "no" — the lookup runs to its 3 s
+    /// timeout, once per such peer, ahead of every drain while registration
+    /// keeps retrying (measured on the stand: median 3.01 s per miss).
+    pub fn with_cap_flags(mut self, cap_flags: PeerCapFlags) -> Self {
+        self.cap_flags = Some(cap_flags);
+        self
     }
 }
 
 impl PeerListProvider for LiveSessionsPeerList {
     fn list_peers(&self) -> PeersListPayload {
         let sessions = lock!(self.live_sessions);
+        // A peer missing from the map has flags we no longer hold (the cache
+        // is bounded and evicts) — unknown, not "advertised nothing".
+        let caps_of = |node_id: &[u8; 32]| -> Option<u8> {
+            let map = self.cap_flags.as_ref()?.read().ok()?;
+            map.get(node_id).copied()
+        };
         let mut peers = Vec::with_capacity(sessions.len().min(MAX_PEERS_LIST_ENTRIES));
 
         for session in sessions.values() {
@@ -69,6 +95,7 @@ impl PeerListProvider for LiveSessionsPeerList {
                 state: state_byte,
                 direction,
                 transport: session.transport.as_bytes().to_vec(),
+                caps: caps_of(node_id.as_bytes()),
             });
         }
 
@@ -168,6 +195,41 @@ mod tests {
             payload.peers.len(),
             1,
             "duplicate node_ids must be folded — UI displays per-peer not per-link"
+        );
+    }
+
+    /// A peer's handshake flags ride along with it, and a peer the cache no
+    /// longer holds reads as unknown — not as "advertised nothing", which the
+    /// app would take for "not a relay" and drop.
+    #[test]
+    fn each_peer_carries_its_handshake_flags_or_unknown() {
+        let mut map = BTreeMap::new();
+        map.insert(LinkId::new(1), make_session(1, 0x11, true, "tcp://a"));
+        map.insert(LinkId::new(2), make_session(2, 0x22, true, "tcp://b"));
+        map.insert(LinkId::new(3), make_session(3, 0x33, true, "tcp://c"));
+        let flags: PeerCapFlags = Arc::default();
+        {
+            let mut f = flags.write().unwrap();
+            f.insert([0x11; 32], veil_proto::session::cap_flags::ANONYMITY_RELAY);
+            f.insert([0x22; 32], 0);
+        }
+        let provider = LiveSessionsPeerList::new(Arc::new(Mutex::new(map))).with_cap_flags(flags);
+        let caps: Vec<([u8; 32], Option<u8>)> = provider
+            .list_peers()
+            .peers
+            .into_iter()
+            .map(|p| (p.node_id, p.caps))
+            .collect();
+        assert_eq!(
+            caps,
+            vec![
+                (
+                    [0x11; 32],
+                    Some(veil_proto::session::cap_flags::ANONYMITY_RELAY)
+                ),
+                ([0x22; 32], Some(0)),
+                ([0x33; 32], None),
+            ]
         );
     }
 

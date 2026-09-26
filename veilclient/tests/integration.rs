@@ -345,12 +345,14 @@ async fn get_peers_returns_provider_snapshot() {
                         state: peer_state::ACTIVE,
                         direction: peer_direction::OUTBOUND,
                         transport: b"tcp://1.2.3.4:5555".to_vec(),
+                        caps: Some(0b100),
                     },
                     PeersListEntry {
                         node_id: [0xBB; 32],
                         state: peer_state::CONNECTING,
                         direction: peer_direction::INBOUND,
                         transport: b"tcp://10.0.0.1:5555".to_vec(),
+                        caps: None,
                     },
                 ],
             }
@@ -378,6 +380,9 @@ async fn get_peers_returns_provider_snapshot() {
     assert_eq!(peers[0].transport, "tcp://1.2.3.4:5555");
     assert_eq!(peers[1].node_id, [0xBB; 32]);
     assert_eq!(peers[1].direction, peer_direction::INBOUND);
+    // The handshake flags cross the socket, and unknown stays unknown.
+    assert_eq!(peers[0].caps, Some(0b100));
+    assert_eq!(peers[1].caps, None);
 
     let _ = shutdown_tx.send(true);
     let _ = server_handle.await;

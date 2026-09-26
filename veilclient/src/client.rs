@@ -2575,6 +2575,11 @@ pub struct PeerEntry {
     pub direction: u8,
     /// Transport URI (e.g. `tcp://1.2.3.4:5555`).
     pub transport: String,
+    /// Capability flags the peer advertised in its handshake
+    /// (`veil_proto::session::cap_flags`); `None` when the daemon does not
+    /// know them. Unknown is not "none": a caller filtering on a flag should
+    /// keep a peer whose flags are unknown.
+    pub caps: Option<u8>,
 }
 
 /// Reply returned by [`VeilClient::mailbox_put`].
@@ -2948,6 +2953,7 @@ async fn reader_task(
                             // for that one peer rather than failing the
                             // whole list.
                             transport: String::from_utf8_lossy(&e.transport).into_owned(),
+                            caps: e.caps,
                         })
                         .collect();
                     let mut d = dispatch.lock().await;

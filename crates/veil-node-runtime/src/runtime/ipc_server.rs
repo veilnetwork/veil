@@ -484,7 +484,8 @@ impl NodeRuntime {
         // network I/O). Without it Flutter UI has to poll mobile_status
         // through admin socket, which requires admin-token (operator-only).
         let peer_list: Arc<dyn veil_ipc::PeerListProvider> = Arc::new(
-            crate::peer_list_provider::LiveSessionsPeerList::new(Arc::clone(&self.live_sessions)),
+            crate::peer_list_provider::LiveSessionsPeerList::new(Arc::clone(&self.live_sessions))
+                .with_cap_flags(Arc::clone(&self.dispatcher.crypto.peer_cap_flags)),
         );
         server = server.with_peer_list_provider(peer_list);
         // S2.A: P-Net status provider — surfaces verified cert state
