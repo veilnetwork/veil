@@ -4479,6 +4479,13 @@ pub struct PeersListEntry {
     /// Transport URI (e.g. `tcp://1.2.3.4:5555`). May be empty if the
     /// peer was matched without a known transport (rare).
     pub transport: Vec<u8>,
+    /// The capability flags the peer advertised in its handshake
+    /// (`session::cap_flags`), or `None` when they are not known — the daemon
+    /// no longer holds them, or it predates the field.
+    ///
+    /// Carried in the payload's trailer, not in the entry layout above: see
+    /// [`PeersListPayload`].
+    pub caps: Option<u8>,
 }
 
 impl PeersListEntry {
@@ -4534,6 +4541,7 @@ impl PeersListEntry {
                 state,
                 direction,
                 transport: buf[Self::FIXED_SIZE..total].to_vec(),
+                caps: None,
             },
             total,
         ))
@@ -4546,7 +4554,15 @@ impl PeersListEntry {
 /// ```text
 /// [0..2] count u16 BE (number of entries; ≤ MAX_PEERS_LIST_ENTRIES)
 /// [2..] entries sequence [`PeersListEntry`]
+/// [..] caps trailer: count × (known u8, caps u8), in entry order
 /// ```
+///
+/// The capability flags ride in a TRAILER because the decoder has always
+/// stopped after `count` entries and ignored whatever followed: a client that
+/// predates the trailer reads the list exactly as before, and a client reading
+/// a daemon that predates it finds no trailer and reports every peer's flags
+/// as unknown — never as "advertised nothing", which a caller filtering on a
+/// flag would take for a refusal.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct PeersListPayload {
     /// Active peer entries. Server side trims to `MAX_PEERS_LIST_ENTRIES`
@@ -4579,6 +4595,10 @@ impl PeersListPayload {
         for entry in &self.peers {
             entry.encode_into(&mut buf);
         }
+        for entry in &self.peers {
+            buf.push(u8::from(entry.caps.is_some()));
+            buf.push(entry.caps.unwrap_or(0));
+        }
         buf
     }
 
@@ -4610,6 +4630,11 @@ impl PeersListPayload {
             let (entry, consumed) = PeersListEntry::decode(&buf[offset..])?;
             offset += consumed;
             peers.push(entry);
+        }
+        if let Some(trailer) = buf.get(offset..offset + 2 * count) {
+            for (entry, pair) in peers.iter_mut().zip(trailer.chunks_exact(2)) {
+                entry.caps = (pair[0] != 0).then_some(pair[1]);
+            }
         }
         Ok(Self { peers })
     }
@@ -8550,12 +8575,14 @@ mod tests {
                     state: peer_state::ACTIVE,
                     direction: peer_direction::OUTBOUND,
                     transport: b"tcp://1.2.3.4:5555".to_vec(),
+                    caps: Some(0b101),
                 },
                 PeersListEntry {
                     node_id: [2u8; 32],
                     state: peer_state::CONNECTING,
                     direction: peer_direction::INBOUND,
                     transport: b"tcp://10.0.0.1:5555".to_vec(),
+                    caps: None,
                 },
             ],
         };
@@ -8572,11 +8599,52 @@ mod tests {
                 state: peer_state::ACTIVE,
                 direction: peer_direction::OUTBOUND,
                 transport: vec![], // matched-without-known-transport edge case
+                caps: Some(0),
             }],
         };
         let buf = p.encode();
         let d = PeersListPayload::decode(&buf).unwrap();
         assert_eq!(d, p);
+    }
+
+    /// A daemon that predates the caps trailer sends entries and nothing
+    /// after them. Its peers must read as "flags unknown", not as "advertised
+    /// no flags": a caller filtering candidates on a flag would otherwise drop
+    /// every peer an older daemon reports.
+    #[test]
+    fn peers_list_without_trailer_reads_caps_as_unknown() {
+        let entry = PeersListEntry {
+            node_id: [3u8; 32],
+            state: peer_state::ACTIVE,
+            direction: peer_direction::OUTBOUND,
+            transport: b"tcp://1.2.3.4:5555".to_vec(),
+            caps: None,
+        };
+        let mut legacy = 1u16.to_be_bytes().to_vec();
+        entry.encode_into(&mut legacy);
+        let d = PeersListPayload::decode(&legacy).unwrap();
+        assert_eq!(d.peers, vec![entry]);
+    }
+
+    /// The trailer is invisible to a client that predates it: that client
+    /// stopped after `count` entries, so it must find the entries exactly
+    /// where they always were.
+    #[test]
+    fn peers_list_trailer_leaves_the_entries_where_they_were() {
+        let p = PeersListPayload {
+            peers: vec![PeersListEntry {
+                node_id: [4u8; 32],
+                state: peer_state::ACTIVE,
+                direction: peer_direction::INBOUND,
+                transport: b"tcp://1.2.3.4:5555".to_vec(),
+                caps: Some(0xff),
+            }],
+        };
+        let buf = p.encode();
+        let (entry, consumed) = PeersListEntry::decode(&buf[2..]).unwrap();
+        assert_eq!(entry.node_id, [4u8; 32]);
+        assert_eq!(entry.transport, b"tcp://1.2.3.4:5555".to_vec());
+        assert_eq!(&buf[2 + consumed..], &[1, 0xff]);
     }
 
     #[test]
@@ -8637,6 +8705,7 @@ mod tests {
                     state: peer_state::ACTIVE,
                     direction: peer_direction::OUTBOUND,
                     transport: format!("tcp://10.0.0.{}:5555", i % 255).into_bytes(),
+                    caps: Some(i as u8),
                 })
                 .collect(),
         };

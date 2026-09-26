@@ -298,6 +298,13 @@
 #define VEIL_CREATE_INVITE_INTERNAL_ERROR 3
 
 /**
+ * Capability bit for `VeilPeerCb::caps`: the peer opted in to relaying
+ * anonymity circuits, so it can host a rendezvous — and with it a mailbox
+ * publisher. Mirrors `veil_proto::session::cap_flags::ANONYMITY_RELAY`.
+ */
+#define VEIL_PEER_CAP_ANONYMITY_RELAY 4
+
+/**
  * Wire-byte session-state values for `VeilPeerCb::state`.
  */
 #define VEIL_PEER_STATE_CONNECTING 0
@@ -768,6 +775,10 @@ typedef struct {
  * direction — wire-byte direction (see VEIL_PEER_DIR_*).
  * transport — UTF-8 transport URI (NOT null-terminated; use len).
  * transport_len — byte length of `transport`.
+ * caps — the capability flags the peer advertised in its handshake
+ * (see VEIL_PEER_CAP_*), or -1 when the daemon does not know them.
+ * Unknown is not "advertised nothing": a caller filtering on a flag
+ * should keep a peer whose flags are unknown.
  * wrapped in `Option<...>` for safe
  * NULL-pointer rejection at the FFI boundary. See [`VeilRecvCb`]
  * docs.
@@ -777,7 +788,8 @@ typedef void (*VeilPeerCb)(void *user,
                            uint8_t state,
                            uint8_t direction,
                            const uint8_t *transport,
-                           size_t transport_len);
+                           size_t transport_len,
+                           int32_t caps);
 
 /**
  * Push-event callback. Invoked from a tokio worker thread for every

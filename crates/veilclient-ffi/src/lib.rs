@@ -4426,6 +4426,10 @@ pub unsafe extern "C" fn veil_create_bootstrap_invite(
 /// direction — wire-byte direction (see VEIL_PEER_DIR_*).
 /// transport — UTF-8 transport URI (NOT null-terminated; use len).
 /// transport_len — byte length of `transport`.
+/// caps — the capability flags the peer advertised in its handshake
+/// (see VEIL_PEER_CAP_*), or -1 when the daemon does not know them.
+/// Unknown is not "advertised nothing": a caller filtering on a flag
+/// should keep a peer whose flags are unknown.
 /// wrapped in `Option<...>` for safe
 /// NULL-pointer rejection at the FFI boundary. See [`VeilRecvCb`]
 /// docs.
@@ -4437,8 +4441,14 @@ pub type VeilPeerCb = Option<
         direction: u8,
         transport: *const u8,
         transport_len: size_t,
+        caps: i32,
     ),
 >;
+
+/// Capability bit for `VeilPeerCb::caps`: the peer opted in to relaying
+/// anonymity circuits, so it can host a rendezvous — and with it a mailbox
+/// publisher. Mirrors `veil_proto::session::cap_flags::ANONYMITY_RELAY`.
+pub const VEIL_PEER_CAP_ANONYMITY_RELAY: i32 = 4;
 
 /// Wire-byte session-state values for `VeilPeerCb::state`.
 pub const VEIL_PEER_STATE_CONNECTING: u8 = 0;
@@ -4516,6 +4526,7 @@ pub unsafe extern "C" fn veil_peers_list(
                         entry.direction,
                         transport_bytes.as_ptr(),
                         transport_bytes.len(),
+                        entry.caps.map_or(-1, i32::from),
                     );
                 }));
                 if result.is_err() {

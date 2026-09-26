@@ -158,7 +158,8 @@ typedef VeilEventCb = void Function(
 // Per-peer iteration callback for `veil_peers_list`. Invoked synchronously,
 // once per peer, for the duration of the call only — copy out anything kept.
 // node_id is 32 bytes; state/direction are wire bytes (VEIL_PEER_STATE_* /
-// VEIL_PEER_DIR_*); transport is a UTF-8 URI (NOT NUL-terminated; use len).
+// VEIL_PEER_DIR_*); transport is a UTF-8 URI (NOT NUL-terminated; use len);
+// caps is the handshake capability bitset (VEIL_PEER_CAP_*) or -1 if unknown.
 typedef VeilPeerCbNative = Void Function(
   Pointer<Void> user,
   Pointer<Uint8> nodeId,
@@ -166,6 +167,7 @@ typedef VeilPeerCbNative = Void Function(
   Uint8 direction,
   Pointer<Uint8> transport,
   IntPtr transportLen,
+  Int32 caps,
 );
 typedef VeilPeerCb = void Function(
   Pointer<Void> user,
@@ -174,6 +176,7 @@ typedef VeilPeerCb = void Function(
   int direction,
   Pointer<Uint8> transport,
   int transportLen,
+  int caps,
 );
 
 // Wire-byte session-state values for VeilPeerCb.state (mirrors veil_ffi.h).
@@ -185,6 +188,9 @@ const int veilPeerStateUnknown = abi.veilPeerStateUnknown;
 // Wire-byte direction values for VeilPeerCb.direction.
 const int veilPeerDirInbound = abi.veilPeerDirInbound;
 const int veilPeerDirOutbound = abi.veilPeerDirOutbound;
+
+// Capability bit for VeilPeerCb.caps.
+const int veilPeerCapAnonymityRelay = abi.veilPeerCapAnonymityRelay;
 
 // ── C-function lookups ───────────────────────────────────────────────────────
 

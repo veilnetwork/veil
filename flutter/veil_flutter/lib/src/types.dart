@@ -68,12 +68,25 @@ class VeilPeer {
     required this.state,
     required this.direction,
     required this.transport,
+    this.caps,
   });
 
   final Uint8List nodeId;
   final VeilPeerState state;
   final VeilPeerDirection direction;
   final String transport;
+
+  /// The capability flags the peer advertised in its handshake, or null when
+  /// the daemon does not know them.
+  final int? caps;
+
+  /// Whether the peer opted in to relaying anonymity circuits — the ones that
+  /// can host a rendezvous, and so a mailbox publisher. Null when unknown,
+  /// which is not the same as false: keep a peer whose flags are unknown.
+  bool? get anonymityRelay {
+    final c = caps;
+    return c == null ? null : c & ffi.veilPeerCapAnonymityRelay != 0;
+  }
 }
 
 /// Push event kind — mirrors `veil_proto::event_kind`.
