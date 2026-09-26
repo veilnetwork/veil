@@ -301,6 +301,25 @@ type PlannedRelay = (Option<[u8; 32]>, Vec<[u8; 32]>);
 /// forwards, so a frame that would go in the clear is never handed to an
 /// arbitrary session on the strength of it being alive: `will_seal` false keeps
 /// exactly the old behaviour, including its NO_ROUTE.
+/// The instance a live DEVICE session is proven to end at, when the session
+/// named one; otherwise the one its id derives
+/// (`SovereignIdentity::active_instance_id`: the first sixteen bytes).
+fn device_instance(ctx: &IpcSendContext, device: &[u8; 32]) -> [u8; 16] {
+    ctx.session_instance_lookup
+        .as_deref()
+        .and_then(|lookup| {
+            lookup
+                .session_pairing(device)
+                .map(|p| p.instance)
+                .or_else(|| lookup.session_instance(device))
+        })
+        .unwrap_or_else(|| {
+            let mut prefix = [0u8; 16];
+            prefix.copy_from_slice(&device[..16]);
+            prefix
+        })
+}
+
 /// Hand `frame`, sealed for the instance `sealed_for`, to the device it is
 /// sealed for — and to no other.
 ///
@@ -315,6 +334,7 @@ fn hand_to_sealed_device(
     reg: &dyn FrameBroadcaster,
     dst: &[u8; 32],
     sealed_for: Option<[u8; 16]>,
+    instance_of: &dyn Fn(&[u8; 32]) -> [u8; 16],
     priority: u8,
     frame: Vec<u8>,
 ) -> bool {
@@ -325,9 +345,10 @@ fn hand_to_sealed_device(
     if devices.is_empty() {
         return reg.send_to_peer_or_identity(dst, priority, frame);
     }
-    // An instance id is the first sixteen bytes of its device id
-    // (`SovereignIdentity::active_instance_id`).
-    match devices.iter().find(|device| device[..16] == instance) {
+    match devices
+        .iter()
+        .find(|device| instance_of(device) == instance)
+    {
         Some(device) => reg.send_to(device, priority, frame),
         None => false,
     }
@@ -341,13 +362,14 @@ fn without_other_devices(
     reg: &dyn FrameBroadcaster,
     dst: &[u8; 32],
     sealed_for: Option<[u8; 16]>,
+    instance_of: &dyn Fn(&[u8; 32]) -> [u8; 16],
 ) -> Vec<[u8; 32]> {
     let Some(instance) = sealed_for else {
         return hops;
     };
     let devices = reg.devices_of(dst);
     hops.into_iter()
-        .filter(|hop| !devices.contains(hop) || hop[..16] == instance)
+        .filter(|hop| !devices.contains(hop) || instance_of(hop) == instance)
         .collect()
 }
 
@@ -935,6 +957,24 @@ pub(crate) async fn handle_ipc_send(
         let seal_started = std::time::Instant::now();
         for device in &devices {
             let sealed = try_ratchet_seal(ctx, device, &send.data).await;
+            // A copy sealed for another instance is not handed to this
+            // device: it could only refuse it. The seal follows the session's
+            // proven pairing when there is one; in the first seconds of a
+            // session there may not be, and the identity's cached row then
+            // named a sibling (a stand: six frames of a contact sealed for F,
+            // handed to E four seconds after E's session opened).
+            let copy_for = sealed
+                .as_ref()
+                .and_then(|(payload, _)| veil_e2e::payload_instances(payload))
+                .map(|(_, to)| to);
+            if copy_for.is_some_and(|to| to != device_instance(ctx, device)) {
+                log::info!(
+                    "ratchet.sealed_for_another_device dst={} device={} — copy not sent",
+                    veil_util::bytes_to_hex(&send.dst_node_id[..4]),
+                    veil_util::bytes_to_hex(&device[..4]),
+                );
+                continue;
+            }
             let frame = app_send_frame(&send, sealed.as_ref().map(|(p, _)| p.as_slice()));
             if reg.send_to(device, veil_proto::header::priority::INTERACTIVE, frame) {
                 any_sent = true;
@@ -1045,6 +1085,7 @@ pub(crate) async fn handle_ipc_send(
                 reg,
                 &send.dst_node_id,
                 sealed_for,
+                &|device| device_instance(ctx, device),
                 veil_proto::header::priority::INTERACTIVE,
                 frame,
             );
@@ -1085,8 +1126,13 @@ pub(crate) async fn handle_ipc_send(
                 .await;
                 ordinary_relay_hops(discovered, &send.dst_node_id, route_cache, reg, will_seal)
             };
-            let forced_relay_hops =
-                without_other_devices(forced_relay_hops, reg, &send.dst_node_id, sealed_for);
+            let forced_relay_hops = without_other_devices(
+                forced_relay_hops,
+                reg,
+                &send.dst_node_id,
+                sealed_for,
+                &|device| device_instance(ctx, device),
+            );
             if !forced_relay_hops.is_empty() {
                 use veil_proto::delivery::DeliveryEnvelope;
                 use veil_proto::family::DeliveryMsg;
@@ -2557,6 +2603,67 @@ mod ratchet_send_tests {
         }
     }
 
+    /// A fan-out copy whose seal fell back to another device's certificate is
+    /// not handed to the device it was meant for: that device could only refuse
+    /// it. Here the session proves DEVICE_ONE is `PEER_INSTANCE`, but only the
+    /// sibling's certificate is known, so its seal falls back to the sibling.
+    #[tokio::test]
+    async fn a_fan_out_copy_sealed_for_another_device_is_not_sent() {
+        const DEVICE_ONE: [u8; 32] = [0xB7u8; 32];
+        const DEVICE_TWO: [u8; 32] = [0xB8u8; 32];
+        let (mut fx, sibling) = family_fixture();
+        let sibling_row = {
+            let ring = sibling.seed_ring.read().expect("ring");
+            veil_types::VerifiedPeerCert {
+                node_id: PEER,
+                instance_id: SIBLING_INSTANCE,
+                mlkem_ek: ring.current_ek().to_vec(),
+                ratchet_x25519_pk: ring.current_ratchet_pk(),
+                cert_version: 1,
+                valid_until_unix: u64::MAX,
+            }
+        };
+        fx.certs = Arc::new(FamilyCerts(vec![sibling_row]));
+        fx.outbox = Arc::new(Outbox {
+            live: vec![DEVICE_ONE, DEVICE_TWO, RELAY],
+            sent: Mutex::new(Vec::new()),
+            family: vec![DEVICE_ONE, DEVICE_TWO],
+        });
+        let mut ctx = fx.ctx(true);
+        ctx.session_instance_lookup = Some(Arc::new(FamilySessions(vec![
+            (
+                DEVICE_ONE,
+                veil_types::SessionPairing {
+                    identity: PEER,
+                    instance: PEER_INSTANCE,
+                },
+            ),
+            (
+                DEVICE_TWO,
+                veil_types::SessionPairing {
+                    identity: PEER,
+                    instance: SIBLING_INSTANCE,
+                },
+            ),
+        ])));
+
+        let mut wh = sink().await;
+        handle_ipc_send(
+            &mut SendReply::Inline(&mut wh),
+            &payload(false, b"one copy, to the device it opens on"),
+            &ctx,
+        )
+        .await
+        .expect("send");
+
+        let devices: Vec<[u8; 32]> = fx.taken().iter().map(|(d, _)| *d).collect();
+        assert_eq!(
+            devices,
+            vec![DEVICE_TWO],
+            "the device whose copy was sealed for its sibling is not handed it"
+        );
+    }
+
     /// A frame sealed for one device of an identity goes to that device and to
     /// no other live one (defect №35, the fallback half); with that device
     /// offline it goes nowhere directly rather than to a sibling that can only
@@ -2567,6 +2674,11 @@ mod ratchet_send_tests {
         const F: [u8; 32] = [0xB8u8; 32];
         let f_instance = [0xB8u8; 16];
         let prio = veil_proto::header::priority::INTERACTIVE;
+        let prefix = |d: &[u8; 32]| {
+            let mut i = [0u8; 16];
+            i.copy_from_slice(&d[..16]);
+            i
+        };
         let both = Outbox {
             live: vec![E, F],
             sent: Mutex::new(Vec::new()),
@@ -2576,6 +2688,7 @@ mod ratchet_send_tests {
             &both,
             &PEER,
             Some(f_instance),
+            &prefix,
             prio,
             vec![1]
         ));
@@ -2591,6 +2704,7 @@ mod ratchet_send_tests {
             &only_e,
             &PEER,
             Some(f_instance),
+            &prefix,
             prio,
             vec![2]
         ));
@@ -2604,7 +2718,14 @@ mod ratchet_send_tests {
             sent: Mutex::new(Vec::new()),
             family: vec![E, F],
         };
-        assert!(hand_to_sealed_device(&unsealed, &PEER, None, prio, vec![3]));
+        assert!(hand_to_sealed_device(
+            &unsealed,
+            &PEER,
+            None,
+            &prefix,
+            prio,
+            vec![3]
+        ));
         assert_eq!(
             lock!(unsealed.sent).len(),
             2,
@@ -2627,11 +2748,11 @@ mod ratchet_send_tests {
             "a seal for this device must not be sent"
         );
         assert!(
-            handler.contains("&& hand_to_sealed_device("),
+            handler.contains("hand_to_sealed_device("),
             "the direct hand-off must go to the sealed device only"
         );
         assert!(
-            handler.contains("without_other_devices(forced_relay_hops,"),
+            handler.contains("without_other_devices("),
             "the relay must not go through a sibling"
         );
     }
@@ -2643,17 +2764,22 @@ mod ratchet_send_tests {
     fn a_sealed_frame_is_not_relayed_through_a_sibling() {
         const E: [u8; 32] = [0xB7u8; 32];
         const F: [u8; 32] = [0xB8u8; 32];
+        let prefix = |d: &[u8; 32]| {
+            let mut i = [0u8; 16];
+            i.copy_from_slice(&d[..16]);
+            i
+        };
         let reg = Outbox {
             live: vec![E, F, RELAY],
             sent: Mutex::new(Vec::new()),
             family: vec![E, F],
         };
         assert_eq!(
-            without_other_devices(vec![RELAY, E, F], &reg, &PEER, Some([0xB8u8; 16])),
+            without_other_devices(vec![RELAY, E, F], &reg, &PEER, Some([0xB8u8; 16]), &prefix),
             vec![RELAY, F]
         );
         assert_eq!(
-            without_other_devices(vec![RELAY, E, F], &reg, &PEER, None),
+            without_other_devices(vec![RELAY, E, F], &reg, &PEER, None, &prefix),
             vec![RELAY, E, F],
             "nothing sealed, nothing to steer"
         );
