@@ -24,8 +24,30 @@ use super::*;
 
 impl NodeRuntime {
     pub async fn start(config_path: impl AsRef<Path>, foreground_mode: bool) -> Result<Self> {
+        Self::start_marked(config_path, foreground_mode, false).await
+    }
+
+    /// [`Self::start`] for a config whose `[identity]` is a throwaway
+    /// placeholder when `ephemeral_identity` is true — the deferred boot.
+    ///
+    /// The marker cannot travel in the file: `Config::ephemeral_identity` is
+    /// `serde(skip)` precisely so no config on disk can claim a node's real
+    /// identity is a throwaway. The deferred boot saved its stub and started
+    /// from the file, so the marker was lost on every boot, and the guard that
+    /// keeps a standalone identity from being built out of the compiled-in
+    /// placeholder never ran: every embedded node built and published one under
+    /// the placeholder's node id (the same id on every device — measured on a
+    /// stand as `f309e1c5` on three macOS nodes and a phone) and derived its
+    /// ML-KEM and anonymity receive keys from a value published in the source
+    /// tree, until the real identity arrived moments later.
+    pub(crate) async fn start_marked(
+        config_path: impl AsRef<Path>,
+        foreground_mode: bool,
+        ephemeral_identity: bool,
+    ) -> Result<Self> {
         let config_path = config_path.as_ref().to_path_buf();
-        let config = veil_cfg::load_config(&config_path)?;
+        let mut config = veil_cfg::load_config(&config_path)?;
+        config.ephemeral_identity = ephemeral_identity;
 
         // Fail fast if the config has structural or identity issues. Under the
         // production-hardening profile (`[global].strict_config_validation`),

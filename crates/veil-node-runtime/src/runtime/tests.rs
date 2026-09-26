@@ -3329,6 +3329,69 @@ async fn nat_signaling_skips_tokenless_reply_and_uses_next_coordinator() {
     let _ = fs::remove_file(path);
 }
 
+/// The deferred boot's placeholder `[identity]` never becomes a published
+/// identity. The marker that says "placeholder" cannot be read from a file,
+/// so a boot that saves its stub and starts from it has to be told; untold
+/// (the control, and the old behaviour), the stub key is built into a
+/// standalone identity and published under the placeholder's node id.
+#[tokio::test(flavor = "current_thread")]
+async fn the_deferred_placeholder_is_never_published_as_an_identity() {
+    use veil_proto::identity_document::IdentityDocument;
+
+    let stub = veil_cfg::build_stub_config_with_ephemeral_identity(false).expect("stub");
+    let stub_id = *stub
+        .identity
+        .as_ref()
+        .and_then(|i| i.node_id.as_ref())
+        .expect("stub node id")
+        .as_bytes();
+
+    async fn document_published(stub: &veil_cfg::Config, stub_id: &[u8; 32], marked: bool) -> bool {
+        let dir = std::env::temp_dir().join(format!(
+            "veil-deferred-test-{}-{marked}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("node.toml");
+        veil_cfg::save_config(&path, stub).unwrap();
+        let mut rt = NodeRuntime::start_marked(&path, true, marked)
+            .await
+            .expect("start");
+        let published = rt
+            .debug_dht_raw_value(&IdentityDocument::dht_key(stub_id))
+            .is_some();
+        rt.stop().await.expect("stop");
+        let _ = fs::remove_dir_all(&dir);
+        published
+    }
+
+    assert!(
+        document_published(&stub, &stub_id, false).await,
+        "control: untold, the placeholder is built and published"
+    );
+    assert!(
+        !document_published(&stub, &stub_id, true).await,
+        "told, the placeholder never becomes an identity"
+    );
+}
+
+/// The deferred boot is the one caller that must say its identity is a
+/// placeholder. Held in the source: the boot runs a whole foreground node and
+/// its admin endpoint, which no unit test stands up.
+#[test]
+fn the_deferred_boot_marks_its_identity_as_a_placeholder() {
+    let src = include_str!("../admin.rs");
+    let deferred = &src[src
+        .find("pub async fn run_foreground_deferred_with_shutdown")
+        .expect("deferred boot")..];
+    let deferred = &deferred[..deferred.find("\n}\n").expect("end of fn")];
+    assert!(
+        deferred.contains("run_foreground_marked(") && deferred.contains(", true)"),
+        "the deferred boot must start its node with the placeholder marker"
+    );
+}
+
 /// A node that hosts a mailbox serves it whether or not IPC is on: the
 /// mailbox answers deposits and fetches from the NETWORK. It used to be
 /// started only from inside the IPC server, after the `ipc.enabled` check, so
