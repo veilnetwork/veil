@@ -1227,8 +1227,11 @@ async fn ovl1_abuse_pipeline_ban_and_rate_limit() {
         .expect("connects");
     complete_test_handshake(&mut stream).await;
 
-    // Wait for session to appear in runtime state.
-    timeout(Duration::from_secs(2), async {
+    // Wait for session to appear in runtime state. Both waits here are upper
+    // bounds that return the moment their condition holds; 2 s ran out once
+    // beside the Flutter suite (failed at 2.55 s, start-up included), so they
+    // are sized for a loaded machine, not an idle one.
+    timeout(Duration::from_secs(10), async {
         loop {
             if !runtime.sessions().is_empty() {
                 break;
@@ -1266,7 +1269,7 @@ async fn ovl1_abuse_pipeline_ban_and_rate_limit() {
     drop(stream);
 
     // Verify ban list records the peer.
-    timeout(Duration::from_secs(2), async {
+    timeout(Duration::from_secs(10), async {
         loop {
             let banned_count = runtime.runtime_summary.lock().unwrap().banned_peers;
             if banned_count > 0 {
@@ -3654,11 +3657,19 @@ async fn leaf_bandwidth_quota_is_attached_to_the_mesh_bridge() {
 /// the very `CircuitBuilt` ACK being waited for, so on a current-thread runtime
 /// the wait could not succeed by construction and cost a full second of frozen
 /// networking to fail. This asserts the shape that makes it work: the wait
-/// yields, so other tasks on the SAME single worker make progress while it runs.
+/// hands the worker back, again and again, while it runs.
+///
+/// Counted on the wait itself — each `Pending` is the worker returned to the
+/// executor — rather than by how often a co-scheduled task got to run. That
+/// proxy failed under load (2 of 3 runs beside the Flutter suite): the
+/// runtime's own start-up tasks share this single worker, and in a debug build
+/// under load their synchronous work alone could fill the second. A blocking
+/// wait never returns `Pending` at all, whatever else is scheduled.
 #[tokio::test(flavor = "current_thread")]
 async fn the_reply_circuit_wait_yields_to_the_single_worker() {
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+    use std::sync::atomic::AtomicBool;
+    use std::task::Poll;
 
     let path = save_test_config("node-runtime-reply-wait", runtime_config_with_metrics()).unwrap();
     let runtime = NodeRuntime::start(&path, true)
@@ -3669,27 +3680,22 @@ async fn the_reply_circuit_wait_yields_to_the_single_worker() {
     // Never set: the wait runs its full 1 s budget, which is the worst case.
     let confirmed = Arc::new(AtomicBool::new(false));
 
-    // Stands in for the inbound dispatch task that would carry the ACK. On a
-    // current-thread runtime it can only run if the waiter yields.
-    let ticks = Arc::new(AtomicU32::new(0));
-    let ticker = {
-        let ticks = Arc::clone(&ticks);
-        tokio::spawn(async move {
-            for _ in 0..20 {
-                ticks.fetch_add(1, Ordering::Relaxed);
-                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-            }
-        })
-    };
-
-    access.wait_reply_circuit_confirmed(&confirmed).await;
+    let mut wait = std::pin::pin!(access.wait_reply_circuit_confirmed(&confirmed));
+    let mut yields = 0u32;
+    std::future::poll_fn(|cx| match wait.as_mut().poll(cx) {
+        Poll::Ready(()) => Poll::Ready(()),
+        Poll::Pending => {
+            yields += 1;
+            Poll::Pending
+        }
+    })
+    .await;
 
     assert!(
-        ticks.load(Ordering::Relaxed) > 1,
-        "the co-scheduled task never ran — the wait blocked the only worker \
+        yields > 1,
+        "the wait returned Pending {yields} time(s) — it held the only worker \
          instead of yielding, which is exactly what starved the ACK",
     );
-    ticker.abort();
 
     let mut runtime = runtime;
     runtime.stop().await.expect("runtime stops");
