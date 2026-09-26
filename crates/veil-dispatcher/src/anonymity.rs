@@ -1440,6 +1440,9 @@ impl FrameDispatcher {
             return match origin.open_return(cell.seq, &cell.ciphertext) {
                 Ok(opened) => {
                     circuit_data_diag(|d| d.origin_open_ok = d.origin_open_ok.saturating_add(1));
+                    // Only a cell that OPENED counts: it is what starts a reply
+                    // circuit's served linger, after which we tear it down.
+                    origin.mark_returned(circuit_now_unix());
                     // onion-stream Phase 1c: a return cell on a REGISTERED stream
                     // circuit is delivered to its channel; any other id is a sealed
                     // introduce R forwarded down the circuit (path unchanged — no
@@ -2929,6 +2932,7 @@ mod tests {
                 created_unix: 0,
                 confirmed: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 is_reply: false,
+                last_return_unix: std::sync::Arc::default(),
             }));
 
         // The sealed introduce the sender produced (sealed to OUR anonymity key).
@@ -2984,6 +2988,21 @@ mod tests {
             }
             other => panic!("expected Deliver, got {other:?}"),
         }
+        // The opened return cell is what starts a reply circuit's served
+        // linger — without the stamp its originator would keep it for the
+        // full unserved lifetime.
+        let origin = d
+            .circuit_origin
+            .as_ref()
+            .unwrap()
+            .lookup(&r_id, origin_cid)
+            .unwrap();
+        assert_ne!(
+            origin
+                .last_return_unix
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0
+        );
     }
 
     /// onion-stream Phase 1c: a return `CircuitData` on a circuit registered in
@@ -3014,6 +3033,7 @@ mod tests {
                 created_unix: 0,
                 confirmed: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 is_reply: false,
+                last_return_unix: std::sync::Arc::default(),
             }));
 
         // Register a byte-stream sink for this circuit (what open_data_circuit does).
@@ -3096,6 +3116,7 @@ mod tests {
                 created_unix: 0,
                 confirmed: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 is_reply: false,
+                last_return_unix: std::sync::Arc::default(),
             }));
         let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(16);
         d.stream_recv.lock().unwrap().insert(origin_cid, tx);
@@ -3477,6 +3498,7 @@ mod tests {
                 created_unix: 0,
                 confirmed: std::sync::Arc::clone(&confirmed),
                 is_reply: false,
+                last_return_unix: std::sync::Arc::default(),
             }));
         assert!(!confirmed.load(std::sync::atomic::Ordering::Relaxed));
 
@@ -3537,6 +3559,7 @@ mod tests {
                     created_unix: 0,
                     confirmed: std::sync::Arc::clone(&confirmed),
                     is_reply: false,
+                    last_return_unix: std::sync::Arc::default(),
                 }));
 
             let body = CircuitBuiltPayload {
