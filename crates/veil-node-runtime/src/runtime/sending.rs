@@ -26,6 +26,17 @@ use std::sync::Arc;
 
 use super::*;
 
+/// One `RelayChain::<msg>` control frame, header and body.
+pub(crate) fn relay_chain_frame(msg: veil_proto::family::RelayChainMsg, body: &[u8]) -> Vec<u8> {
+    use veil_proto::{codec::encode_header, family::FrameFamily, header::FrameHeader};
+    let mut hdr = FrameHeader::new(FrameFamily::RelayChain as u8, msg as u16);
+    hdr.body_len = body.len() as u32;
+    hdr.set_priority(veil_proto::priority::INTERACTIVE);
+    let mut frame = encode_header(&hdr).to_vec();
+    frame.extend_from_slice(body);
+    frame
+}
+
 impl NodeServices {
     /// Build + enqueue one `RelayChain::<msg>` control frame to `peer`'s session.
     pub(crate) fn send_relay_chain_frame(
@@ -34,14 +45,12 @@ impl NodeServices {
         msg: veil_proto::family::RelayChainMsg,
         body: &[u8],
     ) -> std::result::Result<(), veil_session::SendToError> {
-        use veil_proto::{codec::encode_header, family::FrameFamily, header::FrameHeader};
-        let mut hdr = FrameHeader::new(FrameFamily::RelayChain as u8, msg as u16);
-        hdr.body_len = body.len() as u32;
-        hdr.set_priority(veil_proto::priority::INTERACTIVE);
-        let mut frame = encode_header(&hdr).to_vec();
-        frame.extend_from_slice(body);
         let guard = wlock!(self.session_tx_registry);
-        guard.send_to_result(peer, veil_proto::priority::INTERACTIVE, frame)
+        guard.send_to_result(
+            peer,
+            veil_proto::priority::INTERACTIVE,
+            relay_chain_frame(msg, body),
+        )
     }
 
     /// Authenticated rendezvous send (Epic 482 v1, "any recipient"): like

@@ -4406,3 +4406,200 @@ async fn an_anycast_record_names_the_identity_so_a_resolver_admits_it() {
     runtime.stop().await.expect("runtime stops");
     let _ = fs::remove_dir_all(&dir);
 }
+
+/// A reply circuit is torn down by its originator once due: dropped from the
+/// origin table and a `CircuitTeardown` naming its origin circuit id sent to
+/// its first hop — the frame that frees every hop on the path, the middle one
+/// included, which nothing else ever freed before its 300 s idle TTL.
+#[tokio::test(flavor = "current_thread")]
+async fn a_reply_circuit_is_torn_down_once_its_answer_has_lingered() {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use veil_anonymity::circuit_data::CircuitCellBytes;
+    use veil_anonymity::circuit_origin::{
+        OriginCircuitTable, OriginHop, REPLY_CIRCUIT_SERVED_LINGER_SECS, build_origin_circuit,
+    };
+    use veil_anonymity::circuit_wire::CircuitTeardownPayload;
+
+    let first_hop = [7u8; 32];
+    let hop = OriginHop {
+        node_id: first_hop,
+        pubkey: x25519_dalek::PublicKey::from(&x25519_dalek::StaticSecret::from([9u8; 32]))
+            .to_bytes(),
+    };
+    let t0 = 10_000;
+    let (_setup, mut origin) =
+        build_origin_circuit(&[hop], CircuitCellBytes::legacy(), b"", t0).unwrap();
+    origin.is_reply = true;
+    let cid = origin.origin_circuit_id;
+    let origin = Arc::new(origin);
+    let table = Arc::new(OriginCircuitTable::new());
+    assert!(table.insert(Arc::clone(&origin)));
+
+    let mut reg = veil_session::SessionTxRegistry::new();
+    let mut rx = reg.register(first_hop);
+    let sessions = Arc::new(std::sync::RwLock::new(reg));
+
+    // Answered right away; the clock is ours.
+    origin.mark_returned(t0 + 1);
+    let now = Arc::new(AtomicU64::new(t0 + 1));
+    let clock = Arc::clone(&now);
+    let task = tokio::spawn(super::node_services::tear_down_reply_circuit_when_due(
+        Arc::downgrade(&table),
+        Arc::downgrade(&sessions),
+        first_hop,
+        cid,
+        Duration::from_millis(10),
+        move || clock.load(Ordering::Relaxed),
+    ));
+
+    // Still inside the linger: polled, kept, nothing sent.
+    now.store(t0 + REPLY_CIRCUIT_SERVED_LINGER_SECS, Ordering::Relaxed);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(table.lookup(&first_hop, cid).is_some());
+    assert!(
+        rx.try_recv().is_err(),
+        "nothing is torn down inside the linger"
+    );
+
+    // Past it: gone from the table, and the first hop is told.
+    now.store(t0 + 1 + REPLY_CIRCUIT_SERVED_LINGER_SECS, Ordering::Relaxed);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    task.await.unwrap();
+    assert!(table.lookup(&first_hop, cid).is_none());
+    let (_, frame) = rx.try_recv().expect("teardown frame to the first hop");
+    let hdr = veil_proto::codec::decode_header(&frame[..veil_proto::HEADER_SIZE]).unwrap();
+    assert_eq!(
+        hdr.msg_type,
+        veil_proto::family::RelayChainMsg::CircuitTeardown as u16
+    );
+    assert_eq!(
+        CircuitTeardownPayload::decode(&frame[veil_proto::HEADER_SIZE..])
+            .unwrap()
+            .circuit_id,
+        cid
+    );
+}
+
+/// A circuit that left the origin table some other way (evicted for room,
+/// GC'd) is not torn down again: the task ends without a frame.
+#[tokio::test(flavor = "current_thread")]
+async fn a_reply_circuit_already_gone_is_not_torn_down_twice() {
+    use veil_anonymity::circuit_origin::OriginCircuitTable;
+
+    let first_hop = [8u8; 32];
+    let table = Arc::new(OriginCircuitTable::new());
+    let mut reg = veil_session::SessionTxRegistry::new();
+    let mut rx = reg.register(first_hop);
+    let sessions = Arc::new(std::sync::RwLock::new(reg));
+    super::node_services::tear_down_reply_circuit_when_due(
+        Arc::downgrade(&table),
+        Arc::downgrade(&sessions),
+        first_hop,
+        42,
+        Duration::from_millis(10),
+        || u64::MAX,
+    )
+    .await;
+    assert!(rx.try_recv().is_err());
+}
+
+/// The next `RelayChain::<want>` frame handed to a registered session, skipping
+/// whatever else the runtime sends a fresh session on its own.
+async fn next_relay_chain_frame(
+    rx: &mut tokio::sync::mpsc::Receiver<veil_session::PriorityFrame>,
+    want: veil_proto::family::RelayChainMsg,
+) -> Vec<u8> {
+    loop {
+        let (_, frame) = rx.recv().await.expect("session frame");
+        let hdr = veil_proto::codec::decode_header(&frame[..veil_proto::HEADER_SIZE]).unwrap();
+        if hdr.family == veil_proto::family::FrameFamily::RelayChain as u8
+            && hdr.msg_type == want as u16
+        {
+            return frame.to_vec();
+        }
+    }
+}
+
+/// Building a REPLY circuit is what schedules its teardown. The two tests above
+/// prove the task; this proves the call site starts it — without it every
+/// reply circuit would again hold its middle-hop slot for the full idle TTL.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn building_a_reply_circuit_schedules_its_teardown() {
+    use veil_anonymity::circuit_origin::REPLY_CIRCUIT_SERVED_LINGER_SECS;
+    use veil_anonymity::circuit_wire::CircuitTeardownPayload;
+    use veil_anonymity::directory::{relay_directory_dht_key, sign_entry};
+    use veil_crypto::generate_keypair;
+    use veil_proto::family::RelayChainMsg;
+    use veil_types::SignatureAlgorithm;
+
+    let mut config = runtime_config_with_metrics();
+    config.anonymity.relay_capable = true;
+    let path = save_test_config("node-runtime-reply-teardown", config).unwrap();
+    let runtime = NodeRuntime::start(&path, true)
+        .await
+        .expect("runtime starts");
+    let access = runtime.access();
+
+    // A first hop the node can build through: its directory entry in the
+    // local shard and a session to hand the frames to.
+    let hop_kp = generate_keypair(SignatureAlgorithm::Ed25519);
+    let hop_pk = base64::Engine::decode(
+        &base64::engine::general_purpose::STANDARD,
+        &hop_kp.public_key,
+    )
+    .unwrap();
+    let hop: [u8; 32] = *blake3::hash(&hop_pk).as_bytes();
+    let x25519 = x25519_dalek::PublicKey::from(&x25519_dalek::StaticSecret::from([3u8; 32]));
+    let entry = sign_entry(
+        hop,
+        x25519.to_bytes(),
+        1_000_000,
+        1,
+        &hop_kp.public_key,
+        &hop_kp.private_key,
+        SignatureAlgorithm::Ed25519,
+    )
+    .unwrap();
+    access.dht.store_local(relay_directory_dht_key(&hop), entry);
+    let mut rx = wlock!(access.session_tx_registry).register(hop);
+
+    let reg_kp = generate_keypair(SignatureAlgorithm::Ed25519);
+    let epoch = std::sync::atomic::AtomicU64::new(0);
+    access
+        .build_onion_circuit_once(&[hop], [5u8; 16], &reg_kp, &epoch, true)
+        .expect("reply circuit built");
+    next_relay_chain_frame(&mut rx, RelayChainMsg::CircuitBuild).await;
+
+    let origin_table = access.dispatcher.circuit_origin.clone().unwrap();
+    let mut circuit_id = None;
+    origin_table.for_each(|c| {
+        assert!(c.is_reply);
+        circuit_id = Some(c.origin_circuit_id);
+    });
+    let circuit_id = circuit_id.expect("the reply circuit is in the origin table");
+
+    // Its answer came long enough ago that the first poll finds it due.
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    origin_table.for_each(|c| c.mark_returned(now - REPLY_CIRCUIT_SERVED_LINGER_SECS - 1));
+
+    let teardown = tokio::time::timeout(
+        Duration::from_secs(15),
+        next_relay_chain_frame(&mut rx, RelayChainMsg::CircuitTeardown),
+    )
+    .await
+    .expect("teardown within one poll");
+    assert_eq!(
+        CircuitTeardownPayload::decode(&teardown[veil_proto::HEADER_SIZE..])
+            .unwrap()
+            .circuit_id,
+        circuit_id
+    );
+    assert!(origin_table.lookup(&hop, circuit_id).is_none());
+
+    let mut runtime = runtime;
+    runtime.stop().await.expect("runtime stops");
+    let _ = fs::remove_file(path);
+}

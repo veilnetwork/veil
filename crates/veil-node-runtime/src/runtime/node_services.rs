@@ -1362,6 +1362,7 @@ impl NodeServices {
         };
         origin.is_reply = is_reply;
         let first_hop = origin.first_hop;
+        let origin_circuit_id = origin.origin_circuit_id;
         // Δ2-d: share the circuit's confirmation flag with the caller so the
         // maintenance tick can tell whether the terminus ACK'd this path (and
         // re-select a fresh path if it never did).
@@ -1390,7 +1391,41 @@ impl NodeServices {
             );
             return Err(AnonOnionSendError::NoRelays);
         }
+        if is_reply {
+            self.schedule_reply_circuit_teardown(origin_table, first_hop, origin_circuit_id);
+        }
         Ok(confirmed)
+    }
+
+    /// Tear the reply circuit `(first_hop, circuit_id)` down once it is due
+    /// (see [`veil_anonymity::circuit_origin::reply_circuit_teardown_due`]).
+    ///
+    /// A task of its own rather than the maintenance tick: that tick runs once
+    /// a minute, twice the linger it would be enforcing. The task holds only
+    /// weak references, so it never keeps a stopped node's tables alive; it
+    /// ends when the circuit is torn down, evicted, or GC'd.
+    fn schedule_reply_circuit_teardown(
+        &self,
+        origin_table: &Arc<veil_anonymity::circuit_origin::OriginCircuitTable>,
+        first_hop: [u8; 32],
+        circuit_id: veil_anonymity::circuit_wire::CircuitId,
+    ) {
+        let Ok(rt) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        rt.spawn(tear_down_reply_circuit_when_due(
+            Arc::downgrade(origin_table),
+            Arc::downgrade(&self.session_tx_registry),
+            first_hop,
+            circuit_id,
+            REPLY_TEARDOWN_POLL,
+            || {
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0)
+            },
+        ));
     }
 
     /// Open a pinned [`DataCircuit`] through `relay_path` (`relay_path[0]` first
@@ -3214,5 +3249,58 @@ impl NodeServices {
                 }
             }
         }
+    }
+}
+
+/// How often a reply circuit's teardown task checks whether it is due.
+const REPLY_TEARDOWN_POLL: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Wait until the reply circuit `(first_hop, circuit_id)` is due, then drop it
+/// from the origin table and send `CircuitTeardown` to its first hop, which
+/// frees it hop by hop up to the terminus (and the terminus's cookie binding).
+///
+/// Returns without sending when the circuit is gone from the table already
+/// (evicted for room, or GC'd) or the node is (weak references fail).
+pub(crate) async fn tear_down_reply_circuit_when_due(
+    origin_table: std::sync::Weak<veil_anonymity::circuit_origin::OriginCircuitTable>,
+    sessions: std::sync::Weak<std::sync::RwLock<veil_session::SessionTxRegistry>>,
+    first_hop: [u8; 32],
+    circuit_id: veil_anonymity::circuit_wire::CircuitId,
+    poll: std::time::Duration,
+    now_unix: impl Fn() -> u64,
+) {
+    loop {
+        tokio::time::sleep(poll).await;
+        let Some(table) = origin_table.upgrade() else {
+            return;
+        };
+        let Some(origin) = table.lookup(&first_hop, circuit_id) else {
+            return;
+        };
+        if !origin.teardown_due(now_unix()) {
+            continue;
+        }
+        table.remove(&first_hop, circuit_id);
+        let Some(sessions) = sessions.upgrade() else {
+            return;
+        };
+        let body = veil_anonymity::circuit_wire::CircuitTeardownPayload { circuit_id }.encode();
+        let frame = super::sending::relay_chain_frame(
+            veil_proto::family::RelayChainMsg::CircuitTeardown,
+            &body,
+        );
+        let sent = wlock!(sessions)
+            .send_to_result(&first_hop, veil_proto::priority::INTERACTIVE, frame)
+            .is_ok();
+        log::debug!(
+            "anonymity.reply_circuit.torn_down first_hop={} circuit_id={circuit_id} \
+             served={} sent={sent}",
+            veil_util::hex_short(&first_hop),
+            origin
+                .last_return_unix
+                .load(std::sync::atomic::Ordering::Relaxed)
+                != 0,
+        );
+        return;
     }
 }

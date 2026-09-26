@@ -54,6 +54,10 @@ pub struct OriginCircuit {
     /// verified inbound only proves them→us). The sender-side stall detector
     /// keys off this. False for hosted-service / data circuits.
     pub is_reply: bool,
+    /// When the last return cell came down this circuit (unix secs), 0 if none
+    /// has. Drives when a reply circuit is torn down: see
+    /// [`reply_circuit_teardown_due`].
+    pub last_return_unix: std::sync::Arc<std::sync::atomic::AtomicU64>,
     /// Size of every data cell on this circuit — the number the originator
     /// chose and put in the setup, so every send down it pads to the same
     /// quantum the hops are enforcing.
@@ -84,6 +88,23 @@ impl OriginCircuit {
     /// Whether the establishment ACK has been seen.
     pub fn is_confirmed(&self) -> bool {
         self.confirmed.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Record that a return cell came down this circuit at `now_unix`.
+    pub fn mark_returned(&self, now_unix: u64) {
+        self.last_return_unix
+            .fetch_max(now_unix, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Whether this is a reply circuit its originator should now tear down.
+    pub fn teardown_due(&self, now_unix: u64) -> bool {
+        self.is_reply
+            && reply_circuit_teardown_due(
+                self.created_unix,
+                self.last_return_unix
+                    .load(std::sync::atomic::Ordering::Relaxed),
+                now_unix,
+            )
     }
 
     /// Open a return cell (introduce forwarded down the circuit): apply ALL N
@@ -203,9 +224,52 @@ pub fn build_origin_circuit(
         created_unix: now_unix,
         confirmed: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         is_reply: false, // callers building a REPLY circuit set this afterwards
+        last_return_unix: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
         cell_bytes: cell,
     };
     Ok((setup, origin))
+}
+
+/// How long a reply circuit is kept after the last return cell came down it.
+///
+/// The same grace the terminus gives a served binding
+/// ([`SERVED_LINGER_SECS`](crate::circuit_table::SERVED_LINGER_SECS)), for the
+/// same reason: one logical reply may arrive as several cells (sliced mailbox
+/// FETCH responses, `auth_deliver` fragments), and each one re-arms it.
+pub const REPLY_CIRCUIT_SERVED_LINGER_SECS: u64 = crate::circuit_table::SERVED_LINGER_SECS;
+
+/// How long a reply circuit is kept when no reply has come down it at all.
+///
+/// The replies it exists for are quick: a mailbox FETCH waits 5 s for its
+/// answer and a delivery ACK comes back within seconds. A reply later than
+/// this is not lost: the app answers a re-received message over its durable
+/// path instead of the reply block.
+pub const REPLY_CIRCUIT_UNSERVED_LIFETIME_SECS: u64 = 120;
+
+/// Whether a reply circuit built at `created_unix`, whose last return cell
+/// came at `last_return_unix` (0 = none), is due to be torn down at
+/// `now_unix`.
+///
+/// Why the originator tears them down at all: one reply circuit is built per
+/// reply-expecting send, and nobody else ends it. The terminus reclaims a
+/// served binding after [`SERVED_LINGER_SECS`], but a MIDDLE hop has no such
+/// signal and held each circuit for the full idle TTL (300 s) — 64 slots per
+/// link over 300 s is about one reply circuit every 5 s per neighbour. A burst
+/// of sends after a restart went past that, the middle hop refused the next
+/// installs (`PerLinkFull`), and the replies those circuits were built for —
+/// delivery ACKs, mailbox FETCH answers — were dropped at the rendezvous as
+/// `cookie_unknown`. Measured on the stand: 89 such drops in the 2–6 minutes
+/// after the apps restarted, every cookie never registered anywhere, against
+/// 71 `PerLinkFull` refusals at middle hops. A `CircuitTeardown` from the
+/// originator frees every hop on the path.
+///
+/// [`SERVED_LINGER_SECS`]: crate::circuit_table::SERVED_LINGER_SECS
+pub fn reply_circuit_teardown_due(created_unix: u64, last_return_unix: u64, now_unix: u64) -> bool {
+    if last_return_unix != 0 {
+        now_unix.saturating_sub(last_return_unix) >= REPLY_CIRCUIT_SERVED_LINGER_SECS
+    } else {
+        now_unix.saturating_sub(created_unix) >= REPLY_CIRCUIT_UNSERVED_LIFETIME_SECS
+    }
 }
 
 /// Bounded table of circuits THIS node originated, keyed by `(first_hop,
@@ -294,6 +358,18 @@ impl OriginCircuitTable {
 
     pub fn len(&self) -> usize {
         self.inner.lock().unwrap_or_else(|p| p.into_inner()).len()
+    }
+
+    /// Visit every originated circuit (under the table lock — keep `f` short).
+    pub fn for_each(&self, mut f: impl FnMut(&OriginCircuit)) {
+        for c in self
+            .inner
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .values()
+        {
+            f(c);
+        }
     }
 
     /// Capacity cap (max concurrently-originated circuits).
@@ -432,5 +508,59 @@ mod tests {
         // GC past TTL frees it.
         assert_eq!(t.gc(100 + 300), 1);
         assert!(t.is_empty());
+    }
+
+    /// An unanswered reply circuit lives its full unserved lifetime, and not a
+    /// second more; an answered one lives the served linger past its LAST
+    /// return, each return re-arming it.
+    #[test]
+    fn a_reply_circuit_is_due_after_its_linger_or_its_lifetime() {
+        let built = 1_000;
+        let unserved = REPLY_CIRCUIT_UNSERVED_LIFETIME_SECS;
+        let linger = REPLY_CIRCUIT_SERVED_LINGER_SECS;
+        assert!(!reply_circuit_teardown_due(built, 0, built + unserved - 1));
+        assert!(reply_circuit_teardown_due(built, 0, built + unserved));
+
+        let answered = built + 2;
+        assert!(!reply_circuit_teardown_due(
+            built,
+            answered,
+            answered + linger - 1
+        ));
+        assert!(reply_circuit_teardown_due(
+            built,
+            answered,
+            answered + linger
+        ));
+
+        // A later slice of the same reply keeps it open past the first one's
+        // linger — and past the unserved lifetime, which an answered circuit
+        // no longer goes by.
+        let late_slice = built + unserved;
+        assert!(!reply_circuit_teardown_due(
+            built,
+            late_slice,
+            late_slice + linger - 1
+        ));
+    }
+
+    /// Only a reply circuit is ever due: a hosted-service or stream circuit is
+    /// long-lived and its owner rebuilds it on its own schedule.
+    #[test]
+    fn only_a_reply_circuit_is_torn_down_by_its_originator() {
+        let (_s, h) = hop();
+        let (_env, mut origin) =
+            build_origin_circuit(&[h], CircuitCellBytes::legacy(), b"", 100).unwrap();
+        let late = 100 + REPLY_CIRCUIT_UNSERVED_LIFETIME_SECS;
+        assert!(!origin.teardown_due(late));
+        origin.is_reply = true;
+        assert!(origin.teardown_due(late));
+
+        origin.mark_returned(late);
+        assert!(!origin.teardown_due(late + 1));
+        // An older return cannot move the clock back.
+        origin.mark_returned(late - 50);
+        assert!(!origin.teardown_due(late + REPLY_CIRCUIT_SERVED_LINGER_SECS - 1));
+        assert!(origin.teardown_due(late + REPLY_CIRCUIT_SERVED_LINGER_SECS));
     }
 }
