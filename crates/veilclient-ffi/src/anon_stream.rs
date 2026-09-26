@@ -798,6 +798,9 @@ struct CircuitCells {
     /// outbound tag per peer for this hub; SYN/SYN_ACK introduces it once, and
     /// later route refreshes reuse it.
     outbound_peer_tags: SharedOutboundPeerTags,
+    /// Which device answers for which identity, learned from the ad each
+    /// outbound route was opened against (see [`veil_onion_stream::PeerAliases`]).
+    peer_aliases: veil_onion_stream::PeerAliases,
 }
 
 struct CircuitEntry {
@@ -2925,6 +2928,7 @@ impl CircuitCells {
         let outbound_opening = Arc::clone(&self.outbound_opening);
         let peer_tags = Arc::clone(&self.peer_tags);
         let outbound_peer_tags = Arc::clone(&self.outbound_peer_tags);
+        let peer_aliases = Arc::clone(&self.peer_aliases);
         let route_cooldowns = Arc::clone(&self.route_cooldowns);
         let first_hop_cooldowns = Arc::clone(&self.first_hop_cooldowns);
         let pool_target = self.outbound_pool_target_for(route_class);
@@ -2941,6 +2945,7 @@ impl CircuitCells {
                 outbound_circuits,
                 peer_tags,
                 outbound_peer_tags,
+                peer_aliases,
                 route_cooldowns,
                 first_hop_cooldowns,
                 pool_target,
@@ -2989,6 +2994,7 @@ impl CircuitCells {
                 Arc::clone(&self.outbound_circuits),
                 Arc::clone(&self.peer_tags),
                 Arc::clone(&self.outbound_peer_tags),
+                Arc::clone(&self.peer_aliases),
                 Arc::clone(&self.route_cooldowns),
                 Arc::clone(&self.first_hop_cooldowns),
                 self.outbound_pool_target_for(route_class),
@@ -3368,8 +3374,18 @@ impl AnonStreamHub {
             rack_reo_floor_ms,
             ..Config::default()
         };
+        let aliases = match &cells {
+            HubCells::Circuit(c) => Arc::clone(&c.peer_aliases),
+            HubCells::Anon(_) => veil_onion_stream::PeerAliases::default(),
+        };
         let cells = Arc::new(cells);
-        let mux = Arc::new(StreamMux::new(me, Arc::clone(&cells), in_rx, cfg));
+        let mux = Arc::new(StreamMux::new_with_aliases(
+            me,
+            Arc::clone(&cells),
+            in_rx,
+            cfg,
+            aliases,
+        ));
         AnonStreamHub {
             mux,
             cells,
@@ -3456,6 +3472,7 @@ fn try_open_circuit(
     let outbound_opening = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
     let peer_tags: SharedPeerTags = Arc::new(Mutex::new(HashMap::new()));
     let outbound_peer_tags: SharedOutboundPeerTags = Arc::new(Mutex::new(HashMap::new()));
+    let peer_aliases = veil_onion_stream::PeerAliases::default();
     let data_pace_interval = stream_data_pace_interval(true);
     let data_pacer = Arc::new(StreamDataPacer::new(data_pace_interval));
     let outbound_pool_target = env_or_android_usize(
@@ -3829,6 +3846,7 @@ fn try_open_circuit(
         stripe_rr: Arc::new(AtomicU64::new(0)),
         peer_tags,
         outbound_peer_tags,
+        peer_aliases,
     })
 }
 
@@ -3924,6 +3942,7 @@ async fn open_outbound_circuit(
     outbound_circuits: Arc<tokio::sync::Mutex<OutboundCircuitPool>>,
     peer_tags: SharedPeerTags,
     outbound_peer_tags: SharedOutboundPeerTags,
+    peer_aliases: veil_onion_stream::PeerAliases,
     route_cooldowns: RouteCooldowns,
     first_hop_cooldowns: FirstHopCooldowns,
     pool_target: usize,
@@ -3949,9 +3968,16 @@ async fn open_outbound_circuit(
     // here hands the message to the mailbox path instead, which is where it was
     // going to end up anyway.
     let mailbox_cookie = veil_node_runtime::NodeServices::mailbox_rendezvous_cookie(&dst_node);
+    // Under a DEVICE address the mailbox ads carry the IDENTITY's cookie, and
+    // every stream answer is addressed to the opener's device.
+    let identity_mailbox_cookie = services
+        .identity_of_device_local(&dst_node)
+        .map(|identity| veil_node_runtime::NodeServices::mailbox_rendezvous_cookie(&identity));
     let stream_ads = ads
         .iter()
-        .filter(|ad| ad.auth_cookie != mailbox_cookie)
+        .filter(|ad| {
+            ad.auth_cookie != mailbox_cookie && Some(ad.auth_cookie) != identity_mailbox_cookie
+        })
         .cloned()
         .collect::<Vec<_>>();
     if stream_ads.is_empty() {
@@ -4279,6 +4305,7 @@ async fn open_outbound_circuit(
             );
         }
 
+        note_answering_device(&peer_aliases, &ad, dst_node);
         opened_entries.push(CircuitEntry {
             circuit: Arc::clone(&candidate),
             rendezvous_node: ad.rendezvous_node_id,
@@ -4492,6 +4519,31 @@ fn spawn_circuit_feed(
     });
 }
 
+/// Record which device will answer a route opened to `dst_node` over `ad`.
+///
+/// The ad is signed by the device that registered its cookie, and that device
+/// answers under its own id, `BLAKE3(issuer_pk)` — the same binding the ad
+/// verifier checks. Opened to an identity, the answer names the device.
+fn note_answering_device(
+    aliases: &veil_onion_stream::PeerAliases,
+    ad: &veil_anonymity::rendezvous::RendezvousAd,
+    dst_node: [u8; 32],
+) {
+    use base64::Engine as _;
+    let Ok(issuer_pk) = base64::engine::general_purpose::STANDARD.decode(&ad.issuer_pk) else {
+        return;
+    };
+    let device = *blake3::hash(&issuer_pk).as_bytes();
+    if device == dst_node {
+        return;
+    }
+    let mut aliases = aliases.lock().unwrap_or_else(|p| p.into_inner());
+    if aliases.len() >= 4096 && !aliases.contains_key(&device) {
+        aliases.clear();
+    }
+    aliases.insert(device, dst_node);
+}
+
 fn mark_circuit_activity(activity: &Arc<Mutex<Instant>>) {
     *activity.lock().unwrap_or_else(|p| p.into_inner()) = Instant::now();
 }
@@ -4554,7 +4606,7 @@ mod tests {
         CIRCUIT_HEARTBEAT_INTERVAL, CIRCUIT_HEARTBEAT_MAX_SECS, CIRCUIT_INTRO_LEN,
         CIRCUIT_PEER_TAG_LEN, CircuitMode, DATAGRAM_AUTH_DELIVER_MAX, DATAGRAM_AUTH_SIGNATURE_MAX,
         DATAGRAM_MAX_CELL, DATAGRAM_MSS, circuit_env_max, circuit_env_value_mode,
-        circuit_heartbeat_wait, circuit_mss_for, media_batch_body_max,
+        circuit_heartbeat_wait, circuit_mss_for, media_batch_body_max, note_answering_device,
         parse_stream_peer_intro_plaintext, stream_peer_intro_plaintext,
     };
     use veil_anonymity::circuit_register::COOKIE_LEN;
@@ -4835,5 +4887,46 @@ mod tests {
         let mut wrong_domain = plaintext;
         wrong_domain[0] ^= 0x01;
         assert_eq!(parse_stream_peer_intro_plaintext(&tag, &wrong_domain), None);
+    }
+
+    fn ad_signed_by(
+        issuer_pk: &[u8],
+        receiver: [u8; 32],
+    ) -> veil_anonymity::rendezvous::RendezvousAd {
+        use base64::Engine as _;
+        veil_anonymity::rendezvous::RendezvousAd {
+            receiver_node_id: receiver,
+            rendezvous_node_id: [0x52; 32],
+            auth_cookie: [0x0C; 16],
+            receiver_x25519_pk: [0x25; 32],
+            valid_from_unix: 0,
+            valid_until_unix: 0,
+            issuer_pk: base64::engine::general_purpose::STANDARD.encode(issuer_pk),
+            issuer_algo: veil_types::SignatureAlgorithm::Ed25519,
+            signature: Vec::new(),
+            push_envelope: Vec::new(),
+            capability_token: Vec::new(),
+            wake_hmac_envelope: Vec::new(),
+            rendezvous_kem_algo: 0,
+            rendezvous_kem_pk: Vec::new(),
+            wire_version: 5,
+        }
+    }
+
+    /// A route opened to an identity over a device's ad is answered by that
+    /// device, under the id its key hashes to.
+    #[test]
+    fn a_route_to_an_identity_names_the_device_that_answers_it() {
+        let aliases = veil_onion_stream::PeerAliases::default();
+        let device_key = [0xD1u8; 32];
+        let device = *blake3::hash(&device_key).as_bytes();
+        let identity = [0x1Du8; 32];
+        note_answering_device(&aliases, &ad_signed_by(&device_key, identity), identity);
+        assert_eq!(aliases.lock().unwrap().get(&device), Some(&identity));
+
+        // A node that signs its own ad answers as itself: nothing to alias.
+        let solo = veil_onion_stream::PeerAliases::default();
+        note_answering_device(&solo, &ad_signed_by(&device_key, device), device);
+        assert!(solo.lock().unwrap().is_empty());
     }
 }

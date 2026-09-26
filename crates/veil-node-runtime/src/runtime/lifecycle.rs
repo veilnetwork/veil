@@ -546,6 +546,11 @@ impl NodeRuntime {
         } else {
             (None, None)
         };
+        // The ads are signed from `self.anonymity`, the introduces are opened
+        // with the dispatcher's key: both must be the re-derived one.
+        if let Some(sk) = &promoted_anonymity {
+            self.anonymity = Arc::new(self.anonymity.with_x25519_sk(Arc::clone(sk)));
+        }
 
         self.identity = Arc::new(super::identity_state::IdentityState::new(
             new_local_identity,
