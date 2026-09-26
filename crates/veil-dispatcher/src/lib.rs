@@ -807,6 +807,15 @@ pub use veil_session::dispatcher_sink::DispatchResult;
 
 // ── FrameDispatcher ───────────────────────────────────────────────────────────
 
+/// Per sender: when a failed decrypt was last logged, and how many since.
+pub type DecryptFailureLog =
+    Arc<Mutex<std::collections::HashMap<[u8; 32], (std::time::Instant, u64)>>>;
+
+/// Late-bound: the runtime fills it once it has a session directory and a
+/// sovereign identity to answer from.
+pub type SenderIdentityLookup =
+    Arc<std::sync::RwLock<Option<Arc<dyn veil_types::SessionInstanceLookup>>>>;
+
 /// Routes OVL1 frames from established sessions to the correct service plane.
 ///
 /// Clone-cheap: all contained handles are `Arc`.
@@ -900,6 +909,12 @@ pub struct FrameDispatcher {
     /// before it re-keyed keep arriving for the old conversation, and answering
     /// each would make it drop the NEW conversation it has only just begun.
     pub unopenable_replied: Arc<Mutex<std::collections::HashMap<[u8; 32], std::time::Instant>>>,
+    /// When a failed decrypt from each sender was last LOGGED, and how many
+    /// have failed since. See [`FrameDispatcher::note_decrypt_failure`].
+    pub decrypt_failure_log: DecryptFailureLog,
+    /// Maps a relayed sender's DEVICE id to the identity it answers under —
+    /// set once the runtime has one (see [`FrameDispatcher::ratchet_peer_of`]).
+    pub sender_identity_lookup: SenderIdentityLookup,
 
     /// Signs the relayed form of that reply. A frame that arrived through a
     /// relay has no session to name its sender, so the reply to it travels
@@ -2017,6 +2032,8 @@ pub fn make_test_dispatcher(role: NodeRole) -> FrameDispatcher {
         session_registry: None,
         peer_cert_invalidate: Arc::new(Mutex::new(None)),
         unopenable_replied: Arc::new(Mutex::new(std::collections::HashMap::new())),
+        decrypt_failure_log: Arc::new(Mutex::new(std::collections::HashMap::new())),
+        sender_identity_lookup: Arc::default(),
         unopenable_signer: Arc::new(Mutex::new(None)),
         route_seen_set: Arc::new(Mutex::new(RouteSeenSet::new(
             std::time::Duration::from_secs(60),
@@ -2885,6 +2902,8 @@ mod tests {
             session_registry: None, // test dispatcher — sovereign routing bypassed
             peer_cert_invalidate: Arc::new(Mutex::new(None)),
             unopenable_replied: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            decrypt_failure_log: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            sender_identity_lookup: Arc::default(),
             unopenable_signer: Arc::new(Mutex::new(None)),
             route_seen_set: Arc::new(Mutex::new(RouteSeenSet::new(
                 std::time::Duration::from_secs(60),
