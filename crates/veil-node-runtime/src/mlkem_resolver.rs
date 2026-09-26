@@ -914,13 +914,25 @@ impl DhtMlKemEkResolver {
         // in the singular walk (see the Step-3 comment there for why
         // first-replica-wins was a production message-loss path).
         let cert_key = MlKemKeyCert::dht_key(&target_node_id, &instance_id);
+        // Why a candidate was thrown away, kept for the miss line below: the
+        // filter drops every cert that does not verify, so a miss alone cannot
+        // tell "nobody holds it" from "it is there and our document does not
+        // vouch for it" — and the second is what a device linked after the
+        // document we hold looks like.
+        let rejected: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
         let from_dht = match self
             .dht_get_freshest(
                 cert_key,
                 |b| {
-                    MlKemKeyCert::decode(b)
-                        .ok()
-                        .filter(|c| verify_mlkem_cert(c, &doc, now_unix).is_ok())
+                    MlKemKeyCert::decode(b).ok().filter(|c| {
+                        match verify_mlkem_cert(c, &doc, now_unix) {
+                            Ok(_) => true,
+                            Err(e) => {
+                                *lock!(rejected) = Some(format!("{e:?}"));
+                                false
+                            }
+                        }
+                    })
                 },
                 |c| (c.cert_version, c.valid_from_unix),
             )
@@ -932,16 +944,37 @@ impl DhtMlKemEkResolver {
                     Some(verified)
                 }
                 Err(e) => {
-                    self.log_dbg(
+                    // INFO, not debug: this is what a sender sees when a
+                    // device was linked after the document it holds, and
+                    // debug hid it for a whole investigation.
+                    self.logger.info(
                         "mlkem_resolver.instance_cert.verify_failed",
-                        &target_node_id,
-                        &format!("{e:?}"),
+                        format!(
+                            "target={} instance={} {e:?}",
+                            hex8(&target_node_id),
+                            veil_util::bytes_to_hex(&instance_id[..4]),
+                        ),
                     );
                     None
                 }
             },
             None => {
-                self.log_dbg("mlkem_resolver.instance_cert.dht_miss", &target_node_id, "");
+                match lock!(rejected).take() {
+                    Some(why) => self.logger.info(
+                        "mlkem_resolver.instance_cert.rejected",
+                        format!(
+                            "target={} instance={} a cert was found and refused: {why} \
+                             (document issued_at={} keys={})",
+                            hex8(&target_node_id),
+                            veil_util::bytes_to_hex(&instance_id[..4]),
+                            doc.issued_at_unix,
+                            doc.identity_keys.len(),
+                        ),
+                    ),
+                    None => {
+                        self.log_dbg("mlkem_resolver.instance_cert.dht_miss", &target_node_id, "")
+                    }
+                }
                 None
             }
         };
