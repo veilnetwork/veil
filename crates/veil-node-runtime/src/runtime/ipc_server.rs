@@ -27,7 +27,216 @@ use super::rendezvous_resolver::{RendezvousResolverImpl, RuntimeAnonOnionSender}
 use super::{NodeRuntime, lock_tasks};
 
 impl NodeRuntime {
+    /// Start the mailbox relay service — push dispatch, the built-in mailbox
+    /// app that answers deposits and fetches from the network — when this
+    /// node hosts a mailbox. Independent of IPC (see `spawn_ipc_server`).
+    /// Returns the mailbox and the push channel for the IPC bridge.
+    fn start_mailbox_relay(
+        &mut self,
+        config: &veil_cfg::Config,
+    ) -> Option<(
+        Arc<veil_mailbox::Mailbox>,
+        tokio::sync::mpsc::Sender<PushTrigger>,
+    )> {
+        let mailbox = Arc::clone(self.mailbox_state.mailbox.as_ref()?);
+        // bounded channel. See
+        // `crate::builtin::mailbox::PUSH_TRIGGER_QUEUE_CAP`
+        // doc-comment for buffer-size rationale.
+        let (push_tx, push_rx) = tokio::sync::mpsc::channel::<PushTrigger>(
+            crate::builtin::mailbox::PUSH_TRIGGER_QUEUE_CAP,
+        );
+        // Clone the sender BEFORE moving into IPC bridge so the
+        // built-in app service (spawned below) gets the same
+        // channel — both put paths trigger pushes uniformly.
+        let push_tx_for_app = push_tx.clone();
+        //.4 P6: build push dispatcher from operator
+        // config. Falls back to LogOnly when no FCM/APNs creds
+        // are configured (default — daemon doesn't contact any
+        // third party). See `build_push_dispatcher` for
+        // per-provider error handling.
+        //
+        //.4 followup: wrap in HotReloadDispatcher so
+        // operators can rotate FCM/APNs credentials without
+        // restarting the daemon. The mtime-watch task spawned
+        // below polls credential paths every 60 s and swaps the
+        // inner dispatcher in-place when either file changes.
+        let initial_dispatcher = build_push_dispatcher(&config.mailbox.push);
+        let hot_reload = Arc::new(HotReloadDispatcher::new(initial_dispatcher));
+        let dispatcher: Arc<dyn veil_push::PushDispatcher> =
+            Arc::clone(&hot_reload) as Arc<dyn veil_push::PushDispatcher>;
+        // Spawn the cred-watch task — only when at least one
+        // provider is configured (otherwise mtime polling on
+        // empty paths is pointless and noisy).
+        if config.mailbox.push.fcm_enabled() || config.mailbox.push.apns_enabled() {
+            let watch_cfg = config.mailbox.push.clone();
+            // Only the credential watch needs the shutdown signal; without
+            // one it is skipped, and the mailbox itself still starts.
+            if let Some(watch_shutdown) = self.shutdown_tx.as_ref().map(|t| t.subscribe()) {
+                let watch_handle = tokio::spawn(push_creds_watch_task(
+                    watch_cfg,
+                    Arc::clone(&hot_reload),
+                    watch_shutdown,
+                ));
+                lock_tasks(&self.tasks).sessions.push(watch_handle);
+            }
+        }
+        // Push task only runs if the relay has an X25519 secret
+        // (otherwise unseal is impossible). Already guaranteed
+        // by `mailbox.enabled` requiring `anonymity.relay_capable`
+        // for sealing semantics — but we check defensively.
+        if let Some(sk) = self.dispatcher.anonymity_x25519_sk.as_ref() {
+            let sk_clone = Arc::clone(sk);
+            let require_wake_hmac = config.mailbox.push.require_wake_hmac;
+            if !require_wake_hmac {
+                // Startup advisory (audit cycle-2): with the gate off, the
+                // relay falls back to an UNauthenticated wake-only push for
+                // any receiver that hasn't uploaded a wake-HMAC envelope —
+                // forgeable by anyone who learns the push token. Operators
+                // who control their client fleet should enable the gate.
+                log::warn!(
+                    "veil-push: [mailbox.push] require_wake_hmac is OFF — unauthenticated \
+                     wake-only pushes are permitted (forgeable battery-drain/nuisance \
+                     vector); set require_wake_hmac = true once clients opt into wake-HMAC"
+                );
+            }
+            let push_handle = tokio::spawn(push_dispatch_task(
+                push_rx,
+                sk_clone,
+                dispatcher,
+                require_wake_hmac,
+            ));
+            lock_tasks(&self.tasks).sessions.push(push_handle);
+        }
+        //.4 P5b: spawn the mailbox built-in app
+        // service. Receives `MailboxPutPayload` from senders over
+        // the veil app-message channel (cross-node fanout path)
+        // and calls the same `Mailbox::put` the IPC bridge uses.
+        // Both paths share the push_trigger channel — the dispatch
+        // task drains regardless of source.
+        //
+        // Reuses `push_tx` cloned above so app-route puts trigger
+        // pushes the same way IPC-route puts do.
+        // Anonymous-reply egress for network FETCH (built BEFORE the mutable
+        // `builtin_app_host` borrow so `self.access()` is free to borrow).
+        // Gated on the relay X25519 secret like push: without it the node
+        // can't run the onion send the reply needs. hop_count is nominal —
+        // a reply routes over the requester's one-time reply path.
+        let mailbox_reply_sender: Option<Arc<dyn veil_types::AnonOnionSender>> =
+            self.dispatcher.anonymity_x25519_sk.is_some().then(|| {
+                Arc::new(RuntimeAnonOnionSender::new(self.access(), 2))
+                    as Arc<dyn veil_types::AnonOnionSender>
+            });
+        if let Some(host) = self.builtin_app_host.as_mut() {
+            let app_ctx = host.make_context(
+                *self.identity.local_identity.node_id.as_bytes(),
+                Arc::clone(&self.app_registry),
+            );
+            let push_tx_opt = if self.dispatcher.anonymity_x25519_sk.is_some() {
+                Some(push_tx_for_app)
+            } else {
+                // No relay X25519 secret = can't unseal envelopes
+                // anyway. Drop the cloned sender so push triggers
+                // from the app service silently no-op.
+                drop(push_tx_for_app);
+                None
+            };
+            // In-network deposit WAKE sender: on a stored deposit, send a
+            // tiny empty datagram to the receiver's wake endpoint over its
+            // LIVE direct session with this relay (SessionTxRegistry is the
+            // liveness test — no session, no frame). Debounced per receiver
+            // so a backlog flush can't storm a client; a dropped wake only
+            // costs latency (the poll schedule still drains). No new
+            // linkage: the relay already stores deposits addressed to R's
+            // public node_id AND authenticates R's session; the timing
+            // profile equals the live-introduce forward it performs anyway.
+            let wake_sender: crate::builtin::MailboxWakeSender = {
+                const WAKE_DEBOUNCE: std::time::Duration = std::time::Duration::from_secs(2);
+                const MAX_WAKE_DEBOUNCE_ENTRIES: usize = 1024;
+                // THE BROADCASTER, not the raw tx registry.
+                //
+                // A deposit is addressed to the receiver's IDENTITY, and
+                // the receiver's session with this relay is registered
+                // under a DEVICE of it — so `send_to(receiver)` on the raw
+                // registry found nothing and the wake was never sent, for
+                // every deposit, to every sovereign client. Measured on the
+                // stand 2026-09-19: receiver holding a live session with
+                // the very relay that stored the blob, zero wakes in its
+                // log, mail collected 103 s later on the cold poll.
+                //
+                // The broadcaster resolves the identity and offers the
+                // frame to EVERY live device — which is what a wake wants:
+                // any of them may be the instance about to poll.
+                let tx_registry: Arc<dyn veil_types::FrameBroadcaster> = Arc::new(
+                    veil_session::glue::SessionTxBroadcaster::new(Arc::clone(
+                        &self.session_tx_registry,
+                    ))
+                    .with_sessions(Arc::clone(&self.session_registry)),
+                );
+                let last_wake: std::sync::Mutex<
+                    std::collections::HashMap<[u8; 32], std::time::Instant>,
+                > = std::sync::Mutex::new(std::collections::HashMap::new());
+                Arc::new(move |receiver: &[u8; 32]| -> bool {
+                    {
+                        let mut m = last_wake.lock().unwrap_or_else(|p| p.into_inner());
+                        let now = std::time::Instant::now();
+                        if m.get(receiver)
+                            .is_some_and(|t| now.duration_since(*t) < WAKE_DEBOUNCE)
+                        {
+                            return false;
+                        }
+                        if m.len() >= MAX_WAKE_DEBOUNCE_ENTRIES {
+                            m.retain(|_, t| now.duration_since(*t) < WAKE_DEBOUNCE);
+                        }
+                        m.insert(*receiver, now);
+                    }
+                    let payload = veil_proto::AppSendPayload {
+                        src_app_id: veil_mailbox::MAILBOX_APP_ID,
+                        app_id: veil_mailbox::MAILBOX_APP_ID,
+                        endpoint_id: veil_mailbox::MAILBOX_WAKE_ENDPOINT_ID,
+                        data: veil_bufpool::pooled_shared_from_vec(Vec::new()),
+                    };
+                    let body = payload.encode();
+                    let mut hdr = veil_proto::header::FrameHeader::new(
+                        veil_proto::family::FrameFamily::App as u8,
+                        veil_proto::family::AppMsg::AppSend as u16,
+                    );
+                    hdr.body_len = body.len() as u32;
+                    hdr.set_priority(veil_proto::priority::INTERACTIVE);
+                    let mut frame = veil_proto::codec::encode_header(&hdr).to_vec();
+                    frame.extend_from_slice(&body);
+                    tx_registry.send_to_peer_or_identity(
+                        receiver,
+                        veil_proto::priority::INTERACTIVE,
+                        frame,
+                    )
+                })
+            };
+            crate::builtin::spawn_mailbox_app_service(
+                host,
+                app_ctx,
+                Arc::clone(&mailbox),
+                push_tx_opt,
+                mailbox_reply_sender,
+                Some(wake_sender),
+            );
+        }
+        Some((mailbox, push_tx))
+    }
+
     pub fn spawn_ipc_server(&mut self, config: &veil_cfg::Config) {
+        // THE MAILBOX FIRST, and whether or not there is an IPC server.
+        //
+        // It is a NETWORK service — deposits and fetches arrive from peers as
+        // app messages — and it was started only from inside this function,
+        // after the `ipc.enabled` check. A relay configured with
+        // `mailbox.enabled = true` and IPC off (the `config init` default)
+        // therefore served no mailbox at all: every deposit and fetch was
+        // dropped as `anonymity.auth_deliver.unbound` at INFO, and every
+        // client's drain reported the relay unreachable. Measured on a stand
+        // 2026-09-26: three such relays, zero messages delivered without a
+        // direct session in two minutes. The IPC bridge below is the only
+        // part that needs IPC.
+        let mailbox_relay = self.start_mailbox_relay(config);
         // b: IPC server now supports both Unix-domain socket and
         // TCP-loopback backends, so spawning it works on every platform.
         if !config.ipc.enabled {
@@ -467,196 +676,16 @@ impl NodeRuntime {
                 Arc::clone(&self.event_bus),
             );
         }
-        //.4 P2/P3: wire mailbox IPC bridge
-        // + push-dispatch task. Only present when operator opted in
-        // (`mailbox.enabled`). Without it, `MailboxPut/Fetch/Ack`
-        // reply with graceful "not a mailbox relay" / empty list / no-op.
-        if let Some(mailbox) = self.mailbox_state.mailbox.as_ref() {
-            // bounded channel. See
-            // `crate::builtin::mailbox::PUSH_TRIGGER_QUEUE_CAP`
-            // doc-comment for buffer-size rationale.
-            let (push_tx, push_rx) = tokio::sync::mpsc::channel::<PushTrigger>(
-                crate::builtin::mailbox::PUSH_TRIGGER_QUEUE_CAP,
-            );
-            // Clone the sender BEFORE moving into IPC bridge so the
-            // built-in app service (spawned below) gets the same
-            // channel — both put paths trigger pushes uniformly.
-            let push_tx_for_app = push_tx.clone();
+        //.4 P2/P3: wire mailbox IPC bridge (the service itself is started by
+        // `start_mailbox_relay`, before any of this, so it runs without IPC too)
+        if let Some((mailbox, push_tx)) = mailbox_relay {
             let bridge: Arc<dyn veil_ipc::MailboxBackend> = Arc::new(MailboxIpcBridge::new(
-                Arc::clone(mailbox),
+                mailbox,
                 self.dispatcher.mailbox_cookie_registry.clone(),
                 push_tx,
                 Some(Arc::clone(&self.event_bus)),
             ));
             server = server.with_mailbox_backend(bridge);
-            //.4 P6: build push dispatcher from operator
-            // config. Falls back to LogOnly when no FCM/APNs creds
-            // are configured (default — daemon doesn't contact any
-            // third party). See `build_push_dispatcher` for
-            // per-provider error handling.
-            //
-            //.4 followup: wrap in HotReloadDispatcher so
-            // operators can rotate FCM/APNs credentials without
-            // restarting the daemon. The mtime-watch task spawned
-            // below polls credential paths every 60 s and swaps the
-            // inner dispatcher in-place when either file changes.
-            let initial_dispatcher = build_push_dispatcher(&config.mailbox.push);
-            let hot_reload = Arc::new(HotReloadDispatcher::new(initial_dispatcher));
-            let dispatcher: Arc<dyn veil_push::PushDispatcher> =
-                Arc::clone(&hot_reload) as Arc<dyn veil_push::PushDispatcher>;
-            // Spawn the cred-watch task — only when at least one
-            // provider is configured (otherwise mtime polling on
-            // empty paths is pointless and noisy).
-            if config.mailbox.push.fcm_enabled() || config.mailbox.push.apns_enabled() {
-                let watch_cfg = config.mailbox.push.clone();
-                let watch_shutdown = shutdown_tx.subscribe();
-                let watch_handle = tokio::spawn(push_creds_watch_task(
-                    watch_cfg,
-                    Arc::clone(&hot_reload),
-                    watch_shutdown,
-                ));
-                lock_tasks(&self.tasks).sessions.push(watch_handle);
-            }
-            // Push task only runs if the relay has an X25519 secret
-            // (otherwise unseal is impossible). Already guaranteed
-            // by `mailbox.enabled` requiring `anonymity.relay_capable`
-            // for sealing semantics — but we check defensively.
-            if let Some(sk) = self.dispatcher.anonymity_x25519_sk.as_ref() {
-                let sk_clone = Arc::clone(sk);
-                let require_wake_hmac = config.mailbox.push.require_wake_hmac;
-                if !require_wake_hmac {
-                    // Startup advisory (audit cycle-2): with the gate off, the
-                    // relay falls back to an UNauthenticated wake-only push for
-                    // any receiver that hasn't uploaded a wake-HMAC envelope —
-                    // forgeable by anyone who learns the push token. Operators
-                    // who control their client fleet should enable the gate.
-                    log::warn!(
-                        "veil-push: [mailbox.push] require_wake_hmac is OFF — unauthenticated \
-                         wake-only pushes are permitted (forgeable battery-drain/nuisance \
-                         vector); set require_wake_hmac = true once clients opt into wake-HMAC"
-                    );
-                }
-                let push_handle = tokio::spawn(push_dispatch_task(
-                    push_rx,
-                    sk_clone,
-                    dispatcher,
-                    require_wake_hmac,
-                ));
-                lock_tasks(&self.tasks).sessions.push(push_handle);
-            }
-            //.4 P5b: spawn the mailbox built-in app
-            // service. Receives `MailboxPutPayload` from senders over
-            // the veil app-message channel (cross-node fanout path)
-            // and calls the same `Mailbox::put` the IPC bridge uses.
-            // Both paths share the push_trigger channel — the dispatch
-            // task drains regardless of source.
-            //
-            // Reuses `push_tx` cloned above so app-route puts trigger
-            // pushes the same way IPC-route puts do.
-            // Anonymous-reply egress for network FETCH (built BEFORE the mutable
-            // `builtin_app_host` borrow so `self.access()` is free to borrow).
-            // Gated on the relay X25519 secret like push: without it the node
-            // can't run the onion send the reply needs. hop_count is nominal —
-            // a reply routes over the requester's one-time reply path.
-            let mailbox_reply_sender: Option<Arc<dyn veil_types::AnonOnionSender>> =
-                self.dispatcher.anonymity_x25519_sk.is_some().then(|| {
-                    Arc::new(RuntimeAnonOnionSender::new(self.access(), 2))
-                        as Arc<dyn veil_types::AnonOnionSender>
-                });
-            if let Some(host) = self.builtin_app_host.as_mut() {
-                let app_ctx = host.make_context(
-                    *self.identity.local_identity.node_id.as_bytes(),
-                    Arc::clone(&self.app_registry),
-                );
-                let push_tx_opt = if self.dispatcher.anonymity_x25519_sk.is_some() {
-                    Some(push_tx_for_app)
-                } else {
-                    // No relay X25519 secret = can't unseal envelopes
-                    // anyway. Drop the cloned sender so push triggers
-                    // from the app service silently no-op.
-                    drop(push_tx_for_app);
-                    None
-                };
-                // In-network deposit WAKE sender: on a stored deposit, send a
-                // tiny empty datagram to the receiver's wake endpoint over its
-                // LIVE direct session with this relay (SessionTxRegistry is the
-                // liveness test — no session, no frame). Debounced per receiver
-                // so a backlog flush can't storm a client; a dropped wake only
-                // costs latency (the poll schedule still drains). No new
-                // linkage: the relay already stores deposits addressed to R's
-                // public node_id AND authenticates R's session; the timing
-                // profile equals the live-introduce forward it performs anyway.
-                let wake_sender: crate::builtin::MailboxWakeSender = {
-                    const WAKE_DEBOUNCE: std::time::Duration = std::time::Duration::from_secs(2);
-                    const MAX_WAKE_DEBOUNCE_ENTRIES: usize = 1024;
-                    // THE BROADCASTER, not the raw tx registry.
-                    //
-                    // A deposit is addressed to the receiver's IDENTITY, and
-                    // the receiver's session with this relay is registered
-                    // under a DEVICE of it — so `send_to(receiver)` on the raw
-                    // registry found nothing and the wake was never sent, for
-                    // every deposit, to every sovereign client. Measured on the
-                    // stand 2026-09-19: receiver holding a live session with
-                    // the very relay that stored the blob, zero wakes in its
-                    // log, mail collected 103 s later on the cold poll.
-                    //
-                    // The broadcaster resolves the identity and offers the
-                    // frame to EVERY live device — which is what a wake wants:
-                    // any of them may be the instance about to poll.
-                    let tx_registry: Arc<dyn veil_types::FrameBroadcaster> = Arc::new(
-                        veil_session::glue::SessionTxBroadcaster::new(Arc::clone(
-                            &self.session_tx_registry,
-                        ))
-                        .with_sessions(Arc::clone(&self.session_registry)),
-                    );
-                    let last_wake: std::sync::Mutex<
-                        std::collections::HashMap<[u8; 32], std::time::Instant>,
-                    > = std::sync::Mutex::new(std::collections::HashMap::new());
-                    Arc::new(move |receiver: &[u8; 32]| -> bool {
-                        {
-                            let mut m = last_wake.lock().unwrap_or_else(|p| p.into_inner());
-                            let now = std::time::Instant::now();
-                            if m.get(receiver)
-                                .is_some_and(|t| now.duration_since(*t) < WAKE_DEBOUNCE)
-                            {
-                                return false;
-                            }
-                            if m.len() >= MAX_WAKE_DEBOUNCE_ENTRIES {
-                                m.retain(|_, t| now.duration_since(*t) < WAKE_DEBOUNCE);
-                            }
-                            m.insert(*receiver, now);
-                        }
-                        let payload = veil_proto::AppSendPayload {
-                            src_app_id: veil_mailbox::MAILBOX_APP_ID,
-                            app_id: veil_mailbox::MAILBOX_APP_ID,
-                            endpoint_id: veil_mailbox::MAILBOX_WAKE_ENDPOINT_ID,
-                            data: veil_bufpool::pooled_shared_from_vec(Vec::new()),
-                        };
-                        let body = payload.encode();
-                        let mut hdr = veil_proto::header::FrameHeader::new(
-                            veil_proto::family::FrameFamily::App as u8,
-                            veil_proto::family::AppMsg::AppSend as u16,
-                        );
-                        hdr.body_len = body.len() as u32;
-                        hdr.set_priority(veil_proto::priority::INTERACTIVE);
-                        let mut frame = veil_proto::codec::encode_header(&hdr).to_vec();
-                        frame.extend_from_slice(&body);
-                        tx_registry.send_to_peer_or_identity(
-                            receiver,
-                            veil_proto::priority::INTERACTIVE,
-                            frame,
-                        )
-                    })
-                };
-                crate::builtin::spawn_mailbox_app_service(
-                    host,
-                    app_ctx,
-                    Arc::clone(mailbox),
-                    push_tx_opt,
-                    mailbox_reply_sender,
-                    Some(wake_sender),
-                );
-            }
         }
         //.4 P4: wire sender-side outbox
         // bridge. Always wired when outbox opened successfully —
