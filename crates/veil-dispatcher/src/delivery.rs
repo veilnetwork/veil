@@ -84,6 +84,11 @@ pub(crate) struct DecryptedForward {
     /// published key, so anyone who read that key can produce one naming
     /// anyone.
     pub(crate) sender_proven: bool,
+    /// Who the application is told the payload is from, when that is not the
+    /// envelope's sender: the IDENTITY a relayed device's ratchet frame was
+    /// sealed under. The envelope keeps the device, which is where
+    /// acknowledgements and routes have to go.
+    pub(crate) app_sender: Option<[u8; 32]>,
 }
 
 impl DecryptedForward {
@@ -94,6 +99,7 @@ impl DecryptedForward {
             payload,
             ack_key,
             sender_proven: false,
+            app_sender: None,
         }
     }
 }
@@ -1572,6 +1578,7 @@ impl FrameDispatcher {
         ) else {
             return; // decrypt failed — metric already incremented.
         };
+        let decrypted_app_sender = decrypted.app_sender;
         let (app_payload, ack_key) = (decrypted.payload, decrypted.ack_key);
 
         // What do we actually know about the sender we are about to name to the
@@ -1628,7 +1635,7 @@ impl FrameDispatcher {
         }
 
         self.app_registry.route_ipc_deliver(
-            deliver_sender_node_id,
+            decrypted_app_sender.unwrap_or(deliver_sender_node_id),
             provenance,
             deliver_src_app_id,
             deliver_app_id,
@@ -1707,6 +1714,40 @@ impl FrameDispatcher {
         }
     }
 
+    /// The peer a relayed ratchet frame was sealed by, as the ratchet names
+    /// it: the sender's IDENTITY.
+    ///
+    /// A relayed envelope names the sending DEVICE — its transport id, which is
+    /// where acknowledgements and routes go — while the ratchet binds both
+    /// ends' identities into every conversation (`pqxdh` peers). The two are
+    /// the same value only for a device that boots on its master key. For any
+    /// other device every relayed ratchet frame was opened under the wrong
+    /// initiator and failed: measured on the stand as `ratchet: authentication
+    /// failed` on each frame a source sent a newly linked sibling, the sibling
+    /// unable ever to join its own family. The direct path maps the session
+    /// peer the same way (`sovereign_sender_of`).
+    ///
+    /// Asked in order: a live session that proved the device's identity, then
+    /// our OWN document for a sibling of ours. Anything else is keyed as it
+    /// always was.
+    pub(crate) fn ratchet_peer_of(&self, sender: [u8; 32]) -> [u8; 32] {
+        let via_session = crate::app::sovereign_sender_of(
+            self.session_registry.as_deref(),
+            &NodeId::from(sender),
+        );
+        if via_session != sender {
+            return via_session;
+        }
+        let lookup = self
+            .sender_identity_lookup
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone();
+        lookup
+            .and_then(|l| l.own_device_pairing(&sender))
+            .map_or(sender, |pairing| pairing.identity)
+    }
+
     /// Decrypt the forward payload based on its leading marker byte. Returns
     /// `None` on decrypt failure (metric is incremented internally). For
     /// meta-E2E, updates the sender/app/endpoint out-params with the values
@@ -1766,8 +1807,10 @@ impl FrameDispatcher {
             // established conversation must not be rate-limited by a defence
             // against strangers, and proving one is exactly what an attacker
             // varying claimed ids cannot do.
+            // The identity the sender sealed under — see [`Self::ratchet_peer_of`].
+            let ratchet_peer = self.ratchet_peer_of(envelope.sender_node_id);
             let proven = ratchet
-                .peer_entry_authenticated(&envelope.sender_node_id)
+                .peer_entry_authenticated(&ratchet_peer)
                 .unwrap_or(false);
             if !proven {
                 let admitted = {
@@ -1791,34 +1834,28 @@ impl FrameDispatcher {
                 }
             }
             let now_unix = veil_util::unix_secs_now_u64();
-            match ratchet.open_payload(&envelope.sender_node_id, &envelope.payload, now_unix) {
+            match ratchet.open_payload(&ratchet_peer, &envelope.payload, now_unix) {
                 Ok(opened) => {
                     return Some(DecryptedForward {
                         payload: opened.plaintext,
                         ack_key: opened.ack_key,
                         sender_proven: opened.authenticated,
+                        app_sender: (ratchet_peer != envelope.sender_node_id)
+                            .then_some(ratchet_peer),
                     });
                 }
                 Err(e) => {
                     // Not a peer protocol violation: a conversation whose state
                     // the host has not restored yet, or a device of ours the
                     // frame was not addressed to, look exactly like this.
-                    self.logger
-                        .debug("delivery.ratchet.open_failed", format!("{e}"));
-                    if let Some(m) = &self.metrics {
-                        m.inc_decrypt_failures();
-                    }
+                    self.note_decrypt_failure(envelope.sender_node_id, &format!("ratchet: {e}"));
                     // The same three failures that earn a direct-session
                     // sender `AppSendUnopenable` (see `dispatch_app`). A
                     // relayed sender used to hear nothing at all, and kept
                     // sealing into a conversation this side no longer holds
                     // (owner's decision 3a, 2026-09-23).
-                    if matches!(
-                        e,
-                        veil_e2e::RatchetSpliceError::WedgedConversationDropped
-                            | veil_e2e::RatchetSpliceError::NotForThisDevice
-                            | veil_e2e::RatchetSpliceError::NoSession
-                    ) && self.unopenable_reply_due(envelope.sender_node_id)
+                    if crate::app::ratchet_failure_warrants_reply(&e)
+                        && self.unopenable_reply_due(envelope.sender_node_id)
                     {
                         self.send_relayed_unopenable(envelope.sender_node_id, arrived_from);
                     }
@@ -1844,9 +1881,10 @@ impl FrameDispatcher {
                 // is a follow-up).
                 return Some(DecryptedForward::unproven(plain, [0u8; 32]));
             }
-            if let Some(m) = &self.metrics {
-                m.inc_decrypt_failures();
-            }
+            self.note_decrypt_failure(
+                envelope.sender_node_id,
+                "meta-E2E: no mailbox key of ours opens it",
+            );
             return None;
         }
         // E2E_MARKER (0xE2): standard E2E — sender in outer envelope.
@@ -1877,9 +1915,10 @@ impl FrameDispatcher {
             // (e.g. a sender still using an EK we retired past its window), but
             // count it so operators can detect misconfiguration or active
             // key-mismatch attacks.
-            if let Some(m) = &self.metrics {
-                m.inc_decrypt_failures();
-            }
+            self.note_decrypt_failure(
+                envelope.sender_node_id,
+                "E2E: no mailbox key of ours opens it — sealed to a key we do not hold",
+            );
             return None;
         }
         // No E2E marker — plaintext envelope (legitimate inter-app traffic).
@@ -4148,6 +4187,59 @@ mod ratchet_terminal_tests {
              middle is irrelevant to the verdict"
         );
         assert!(provenance.is_authenticated());
+    }
+
+    /// A relayed envelope names the sending DEVICE; the ratchet was sealed
+    /// under its IDENTITY. For a device that does not boot on its master key
+    /// the two differ, and opening under the device failed every frame — a
+    /// newly linked sibling never admitted into its own family. With the
+    /// device mapped to the identity it opens, reaches the app under the
+    /// identity, and stays `Signed`.
+    #[test]
+    fn a_relayed_frame_from_a_device_opens_under_its_identity() {
+        const ALICE_DEVICE: [u8; 32] = [0xADu8; 32];
+        struct Siblings;
+        impl veil_types::SessionInstanceLookup for Siblings {
+            fn session_instance(&self, _peer: &[u8; 32]) -> Option<[u8; 16]> {
+                None
+            }
+            fn own_device_pairing(&self, device: &[u8; 32]) -> Option<veil_types::SessionPairing> {
+                (*device == ALICE_DEVICE).then_some(veil_types::SessionPairing {
+                    identity: ALICE,
+                    instance: [0xA3; 16],
+                })
+            }
+        }
+        let open_with = |lookup: bool| {
+            let (alice, bob) = (party(ALICE, 0xA3), party(BOB, 0xB3));
+            learn(&bob, &alice);
+            let payload = seal(&alice, &bob, b"from a sibling device");
+            let (disp, _h, mut rx) = dispatcher_for(&bob);
+            if lookup {
+                *disp.sender_identity_lookup.write().unwrap() = Some(Arc::new(Siblings));
+            }
+            let (hdr, mut body) = forward_frame([0x05u8; 32], payload);
+            // The envelope's sender, as a device relays it: its own id.
+            let at = body
+                .windows(32)
+                .position(|w| w == ALICE)
+                .expect("sender field in the envelope");
+            body[at..at + 32].copy_from_slice(&ALICE_DEVICE);
+            disp.dispatch(&hdr, &body, NodeId::from(RELAY));
+            take(&mut rx)
+        };
+
+        assert!(
+            open_with(false).is_none(),
+            "control: keyed by the device, the frame does not open"
+        );
+        let (src, provenance, data) = open_with(true).expect("delivered");
+        assert_eq!(
+            src, ALICE,
+            "the app is told the identity, as on a direct session"
+        );
+        assert_eq!(data, b"from a sibling device");
+        assert_eq!(provenance, SenderProvenance::Signed);
     }
 
     /// …and it still teaches no route. The ratchet proves who WROTE the

@@ -11,6 +11,36 @@ use veil_proto::{
 };
 use veil_util::lock;
 
+/// Whether a ratchet frame that would not open should earn its sender an
+/// "unopenable" reply — the one signal that makes it drop its side and key a
+/// fresh conversation.
+///
+/// Each variant here is a sender sealing into something this end does not
+/// hold (see the call sites for the history of the first three).
+/// `Ratchet(_)` joined them for the prologue that fails its key agreement: it
+/// was sealed to a device key this end no longer has. A device that joined an
+/// identity restarts under it and derives new keys, while its source goes on
+/// sealing first messages to the key it had before — measured on the stand as
+/// `ratchet: authentication failed` on every frame, the source told nothing,
+/// the new device never admitted into its own family. A failed prologue is
+/// not evidence against a session (starting over is what a prologue is for),
+/// but it is exactly the case where the sender has to hear that its keys are
+/// stale. Rate-limited per peer like the rest, and no new lever for a forger:
+/// a bare frame already earns a `NoSession` reply.
+pub(crate) fn ratchet_failure_warrants_reply(e: &veil_e2e::RatchetSpliceError) -> bool {
+    matches!(
+        e,
+        veil_e2e::RatchetSpliceError::WedgedConversationDropped
+            | veil_e2e::RatchetSpliceError::NotForThisDevice
+            | veil_e2e::RatchetSpliceError::NoSession
+            | veil_e2e::RatchetSpliceError::Ratchet(_)
+    )
+}
+
+/// The least time between two `delivery.decrypt_failed` lines for one sender.
+pub(crate) const DECRYPT_FAILURE_LOG_INTERVAL: std::time::Duration =
+    std::time::Duration::from_secs(60);
+
 /// The least time between two `AppSendUnopenable` replies to one peer.
 pub(crate) const UNOPENABLE_REPLY_INTERVAL: std::time::Duration =
     std::time::Duration::from_secs(10);
@@ -34,6 +64,48 @@ impl FrameDispatcher {
         }
         replied.insert(peer, now);
         true
+    }
+
+    /// Count a delivery that did not open, and say so — at most once a minute
+    /// per sender, with how many failed since the last line.
+    ///
+    /// This used to be a metric and nothing else, so a sender sealing to a key
+    /// this node no longer holds was invisible from both ends: on the stand a
+    /// newly linked device dropped 111 frames of its source device that way,
+    /// the source's log said each was sent, and nothing anywhere named the
+    /// device, the sender or the reason. Rate-limited because the sender is
+    /// whoever the envelope CLAIMS, and a flood of forged claims must not turn
+    /// into a flood of lines.
+    pub(crate) fn note_decrypt_failure(&self, sender: [u8; 32], what: &str) {
+        if let Some(m) = &self.metrics {
+            m.inc_decrypt_failures();
+        }
+        let now = std::time::Instant::now();
+        let mut log = self
+            .decrypt_failure_log
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        if log.len() >= 1024 {
+            log.retain(|_, (at, _)| now.duration_since(*at) < DECRYPT_FAILURE_LOG_INTERVAL);
+        }
+        let entry = log.entry(sender).or_insert((
+            now.checked_sub(DECRYPT_FAILURE_LOG_INTERVAL).unwrap_or(now),
+            0,
+        ));
+        entry.1 += 1;
+        if entry.1 > 1 && now.duration_since(entry.0) < DECRYPT_FAILURE_LOG_INTERVAL {
+            return;
+        }
+        let count = entry.1;
+        *entry = (now, 0);
+        drop(log);
+        self.logger.info(
+            "delivery.decrypt_failed",
+            format!(
+                "sender={} could not be opened ({what}); {count} such since the last line",
+                veil_util::hex_short(&sender),
+            ),
+        );
     }
 
     pub fn dispatch_app(
@@ -341,13 +413,7 @@ impl FrameDispatcher {
                         // holds, never starting over (owner's decision 1a,
                         // 2026-09-23). Rate-limited per peer, see
                         // `unopenable_replied`.
-                        if matches!(
-                            e,
-                            veil_e2e::RatchetSpliceError::WedgedConversationDropped
-                                | veil_e2e::RatchetSpliceError::NotForThisDevice
-                                | veil_e2e::RatchetSpliceError::NoSession
-                        ) && self.unopenable_reply_due(sender)
-                        {
+                        if ratchet_failure_warrants_reply(&e) && self.unopenable_reply_due(sender) {
                             return DispatchResult::Response(crate::encode_response(
                                 header,
                                 veil_proto::family::FrameFamily::App as u8,
@@ -654,6 +720,59 @@ mod tests {
             reply_hdr.msg_type,
             AppMsg::AppSendUnopenable as u16,
             "the reply that makes the sender re-key instead of retrying forever"
+        );
+    }
+
+    /// A first message sealed to keys this device no longer holds — its source
+    /// still sealing to the key a newly joined device had before it restarted
+    /// under the identity — must tell the sender, or it seals into nothing
+    /// forever. Measured on the stand as `ratchet: authentication failed` on
+    /// every frame and a device never admitted into its own family.
+    #[test]
+    fn a_prologue_sealed_to_keys_we_no_longer_hold_earns_the_unopenable_reply() {
+        let us = [0xBBu8; 32];
+        let sender_id = [0xAAu8; 32];
+        let mut disp = crate::make_test_dispatcher(veil_cfg::NodeRole::Core);
+        disp.crypto = Arc::new(crate::CryptoContext {
+            ratchet: Some(ratchet_runtime(us, [0x0B; 16])),
+            ..(*disp.crypto).clone()
+        });
+        // Our device, our instance — but the keys of the ring we had before.
+        let stale = ratchet_runtime(us, [0x0B; 16]);
+        let stale_ring = Arc::clone(&stale.seed_ring.read().expect("ring"));
+        let sender_rt = ratchet_runtime(sender_id, [0x0A; 16]);
+        let (ek, ratchet_pk) = (stale_ring.current_ek(), stale_ring.current_ratchet_pk());
+        let (sealed, _ack_key) = sender_rt
+            .seal_for(
+                veil_e2e::PeerRatchetKeys {
+                    node_id: &us,
+                    instance_id: &[0x0B; 16],
+                    mlkem_ek: &ek,
+                    ratchet_pk: &ratchet_pk,
+                    authorized_until_unix: u64::MAX,
+                },
+                b"sealed to yesterday's keys",
+                veil_util::unix_secs_now_u64(),
+            )
+            .expect("seal");
+        let body = veil_proto::app::AppSendPayload {
+            src_app_id: [0x11; 32],
+            app_id: [0x22; 32],
+            endpoint_id: 7,
+            data: veil_bufpool::pooled_shared_from_vec(sealed),
+        }
+        .encode();
+        let mut hdr = FrameHeader::new(FrameFamily::App as u8, AppMsg::AppSendSealed as u16);
+        hdr.body_len = body.len() as u32;
+
+        let crate::DispatchResult::Response(reply) = disp.dispatch(&hdr, &body, sender_id) else {
+            panic!("a prologue to stale keys must answer the sender, not drop in silence");
+        };
+        assert_eq!(
+            veil_proto::codec::decode_header(&reply)
+                .expect("hdr")
+                .msg_type,
+            AppMsg::AppSendUnopenable as u16,
         );
     }
 

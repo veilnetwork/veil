@@ -396,6 +396,24 @@ impl NodeRuntime {
                 self.access(),
                 config.anonymity.default_hop_count.unwrap_or(2).max(1) as usize,
             ));
+        // One lookup for both directions: the IPC seal path asks it which device
+        // of a family to key a frame for, and the frame dispatcher asks it which
+        // identity a relayed sibling's frame was sealed under.
+        let instance_lookup: Arc<dyn veil_types::SessionInstanceLookup> =
+            Arc::new(super::offline_seal::OwnDeviceAwareLookup {
+                sessions: veil_session::glue::SessionInstanceDirectory::new(Arc::clone(
+                    &self.session_registry,
+                )),
+                // …and our own devices from our own document, so a sibling with
+                // no live session is keyed by the identity it answers under, not
+                // by the device id.
+                sovereign: self.identity.sovereign_identity.clone(),
+            });
+        *self
+            .dispatcher
+            .sender_identity_lookup
+            .write()
+            .unwrap_or_else(|p| p.into_inner()) = Some(Arc::clone(&instance_lookup));
         let mut server = IpcServer::new(endpoint, shutdown_rx, app_registry, node_id)
             .with_bind_node_id(bind_node_id)
             .with_session_tx_registry(session_tx_broadcaster)
@@ -416,15 +434,7 @@ impl NodeRuntime {
             // whichever registry row the resolver's zero-valued freshness tie
             // happened to hand back. The session registry's validated
             // identities are the one place that knows the far device.
-            .with_session_instance_lookup(Arc::new(super::offline_seal::OwnDeviceAwareLookup {
-                sessions: veil_session::glue::SessionInstanceDirectory::new(Arc::clone(
-                    &self.session_registry,
-                )),
-                // …and our own devices from our own document, so a
-                // sibling with no live session is keyed by the identity
-                // it answers under, not by the device id.
-                sovereign: self.identity.sovereign_identity.clone(),
-            }))
+            .with_session_instance_lookup(Arc::clone(&instance_lookup))
             .with_relay_key_resolver(relay_key_resolver)
             // The SAME conversations the frame dispatcher opens with. Two
             // stores would mean a session advanced on send and not on receive:

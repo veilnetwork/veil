@@ -1166,6 +1166,8 @@ impl NodeRuntime {
             peer_cert_invalidate: Arc::clone(&self.dispatcher.peer_cert_invalidate),
             // Carried over so a reload cannot reopen the per-peer reply window.
             unopenable_replied: Arc::clone(&self.dispatcher.unopenable_replied),
+            decrypt_failure_log: Arc::clone(&self.dispatcher.decrypt_failure_log),
+            sender_identity_lookup: Arc::clone(&self.dispatcher.sender_identity_lookup),
             // A fresh empty slot would silently stop the relayed reply.
             unopenable_signer: Arc::clone(&self.dispatcher.unopenable_signer),
             route_seen_set: Arc::new(Mutex::new(veil_dispatcher::RouteSeenSet::new(
