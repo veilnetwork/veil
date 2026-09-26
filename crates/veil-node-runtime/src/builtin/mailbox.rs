@@ -102,10 +102,17 @@ pub type MailboxWakeSender = Arc<dyn Fn(&[u8; 32]) -> bool + Send + Sync>;
 /// the message itself).
 pub const PUSH_TRIGGER_QUEUE_CAP: usize = 512;
 
-/// Max concurrent in-flight deposit reassemblies (global RAM bound). Each holds
-/// ≤ `MAX_MAILBOX_PUT_CHUNKS` × the chunk size ≈ 60 KB, so the worst case is
-/// ~7.5 MB — and stale ones are evicted, so steady-state is far lower.
+/// Max concurrent in-flight deposit reassemblies.
 const MAX_INFLIGHT_PUT_REASSEMBLIES: usize = 128;
+
+/// Global RAM bound on chunk bytes held across all in-flight reassemblies.
+///
+/// This used to be implied by the count: 128 × `MAX_MAILBOX_PUT_CHUNKS` × the
+/// chunk size came to ~7.5 MB while the chunk cap was 8. The cap now admits a
+/// whole 1 MiB deposit, so the product would be ~128 MB and the bound has to be
+/// stated in bytes. 16 MiB holds any single deposit with room for ordinary
+/// concurrency; stale ones are evicted, so steady state is far lower.
+const MAX_INFLIGHT_PUT_BYTES: usize = 16 * 1024 * 1024;
 
 /// A partially-received deposit that has made no PROGRESS for this long is
 /// evicted. A real deposit's chunks all arrive within a few seconds, so this
@@ -130,6 +137,8 @@ struct PutReassembly {
     chunk_total: u16,
     chunks: Vec<Option<Vec<u8>>>,
     received: u16,
+    /// Chunk bytes held, for [`MAX_INFLIGHT_PUT_BYTES`].
+    bytes: usize,
     /// Last time a chunk we did not already hold arrived. A duplicate does not
     /// move this — replaying is not progress.
     last_progress: Instant,
@@ -211,6 +220,29 @@ impl PutChunkReassembler {
             self.inflight.remove(&victim);
         }
 
+        // The same policy for bytes: a NEW chunk that would push the held total
+        // past the budget displaces the least-advanced OTHER reassemblies until
+        // it fits. A duplicate adds nothing, so it never evicts anyone.
+        let is_new_chunk = self
+            .inflight
+            .get(&c.content_id)
+            .is_none_or(|r| r.chunks[c.chunk_index as usize].is_none());
+        if is_new_chunk {
+            loop {
+                let held: usize = self.inflight.values().map(|r| r.bytes).sum();
+                if held + c.chunk_data.len() <= MAX_INFLIGHT_PUT_BYTES {
+                    break;
+                }
+                let victim = *self
+                    .inflight
+                    .iter()
+                    .filter(|(k, _)| **k != c.content_id)
+                    .min_by_key(|(_, r)| (r.received, r.created))
+                    .map(|(k, _)| k)?;
+                self.inflight.remove(&victim);
+            }
+        }
+
         let complete = {
             let r = self
                 .inflight
@@ -219,12 +251,14 @@ impl PutChunkReassembler {
                     chunk_total: c.chunk_total,
                     chunks: vec![None; c.chunk_total as usize],
                     received: 0,
+                    bytes: 0,
                     last_progress: now,
                     created: now,
                 });
             let idx = c.chunk_index as usize;
             if r.chunks[idx].is_none() {
                 r.received += 1;
+                r.bytes += c.chunk_data.len();
                 r.chunks[idx] = Some(c.chunk_data);
                 // ONLY here. Re-sending a chunk we already hold used to push the
                 // idle timer forward too, which is what let one attacker keep a
@@ -2682,7 +2716,7 @@ mod tests {
                 MailboxPutChunkPayload {
                     content_id: slow,
                     chunk_index: 0,
-                    chunk_total: 200,
+                    chunk_total: MAX_MAILBOX_PUT_CHUNKS,
                     chunk_data: vec![0xDD; 16],
                 },
                 t0,
@@ -2698,17 +2732,98 @@ mod tests {
                 MailboxPutChunkPayload {
                     content_id: slow,
                     chunk_index: i,
-                    chunk_total: 200,
+                    chunk_total: MAX_MAILBOX_PUT_CHUNKS,
                     chunk_data: vec![0xDD; 16],
                 },
                 t,
             );
         }
+        // Without this the assertion below is empty: a `chunk_total` past the
+        // cap (it was a literal 200 against a cap of 8) is refused at the door,
+        // so the entry never existed and "evicted" passed for the wrong reason.
+        assert!(
+            ra.inflight.contains_key(&slow),
+            "the progressing reassembly must be alive before its deadline"
+        );
         let past_lifetime = t0 + PUT_REASSEMBLY_MAX_LIFETIME + Duration::from_secs(1);
         ra.accept(first_of_two(0x44), past_lifetime);
         assert!(
             !ra.inflight.contains_key(&slow),
             "the hard deadline must fire even on a reassembly still progressing"
+        );
+    }
+
+    #[test]
+    fn a_deposit_past_eight_chunks_reassembles() {
+        // Measured on the stand: a 2797-byte frame sealed to an identity with
+        // seven devices came to a 63722-byte blob. That is nine chunks, the cap
+        // was eight, and every relay refused it with `chunk_total 9 outside
+        // 1..=8` while the source logged `stash OK`. The store takes 1 MiB and
+        // the sender mirrors that, so the whole range up to it must get through.
+        for blob_len in [63_722, veil_proto::MAX_MAILBOX_BLOB_BYTES] {
+            let inner = mk_inner([0x71; 32], [0x72; 32], [0x73; 32], vec![0x5A; blob_len]);
+            let chunks = mk_chunks([0x72; 32], &inner);
+            assert!(chunks.len() > 8, "{blob_len}B must need more than 8 chunks");
+            let mut ra = PutChunkReassembler::default();
+            let t0 = Instant::now();
+            let mut assembled = None;
+            for raw in chunks {
+                let c = MailboxPutChunkPayload::decode(&raw).expect("the decoder admits it");
+                assembled = ra.accept(c, t0);
+            }
+            assert_eq!(
+                assembled.as_deref(),
+                Some(inner.as_slice()),
+                "{blob_len}B deposit must reassemble byte-for-byte"
+            );
+        }
+    }
+
+    #[test]
+    fn reassembly_memory_is_bounded_in_bytes() {
+        // The chunk cap now admits a whole 1 MiB deposit, so 128 reassemblies
+        // times the cap is ~128 MB; the byte budget is what bounds a relay now.
+        let mut ra = PutChunkReassembler::default();
+        let t0 = Instant::now();
+        let per_squatter = MAX_MAILBOX_PUT_CHUNKS - 1; // never completes
+        let squatters =
+            MAX_INFLIGHT_PUT_BYTES / (per_squatter as usize * MAILBOX_PUT_CHUNK_DATA_BYTES) + 2;
+        for id in 0..squatters {
+            for i in 0..per_squatter {
+                ra.accept(
+                    MailboxPutChunkPayload {
+                        content_id: [id as u8; 32],
+                        chunk_index: i,
+                        chunk_total: MAX_MAILBOX_PUT_CHUNKS,
+                        chunk_data: vec![0xAB; MAILBOX_PUT_CHUNK_DATA_BYTES],
+                    },
+                    t0,
+                );
+            }
+        }
+        let held: usize = ra.inflight.values().map(|r| r.bytes).sum();
+        assert!(
+            held <= MAX_INFLIGHT_PUT_BYTES,
+            "held {held}B past the {MAX_INFLIGHT_PUT_BYTES}B budget"
+        );
+        assert!(
+            ra.inflight.len() < squatters,
+            "the budget must have displaced someone"
+        );
+        // A newcomer still gets in and completes.
+        let honest = [0xEE; 32];
+        let done = ra.accept(
+            MailboxPutChunkPayload {
+                content_id: honest,
+                chunk_index: 0,
+                chunk_total: 1,
+                chunk_data: vec![0xCD; MAILBOX_PUT_CHUNK_DATA_BYTES],
+            },
+            t0,
+        );
+        assert!(
+            done.is_some(),
+            "a full budget must not lock every newcomer out"
         );
     }
 
