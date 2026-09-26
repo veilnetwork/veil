@@ -4008,12 +4008,14 @@ fn a_full_deposit_chunk_fits_one_anonymous_cell() {
          1-hop cell budget of {budget} B — deposits would fail to build"
     );
 
-    // Relay reassembly memory is the product, not either factor. Hold the
-    // ceiling it had at 256 x 240 so a bigger chunk cannot quietly buy a
-    // bigger buffer at every relay.
+    // The chunk cap must admit every deposit the store accepts. It used to be
+    // held at ~60 KB for relay memory, which silently refused everything
+    // between that and the 1 MiB the store (and the sender) allow. Relay
+    // memory is the reassembler's byte budget now, not this product.
     assert!(
-        MAILBOX_PUT_CHUNK_DATA_BYTES * MAX_MAILBOX_PUT_CHUNKS as usize <= 64 * 1024,
-        "reassembly ceiling grew past 64 KiB per in-flight deposit"
+        MAILBOX_PUT_CHUNK_DATA_BYTES * MAX_MAILBOX_PUT_CHUNKS as usize
+            >= veil_proto::MAX_MAILBOX_PUT_PAYLOAD_BYTES,
+        "a storable deposit needs more than {MAX_MAILBOX_PUT_CHUNKS} chunks"
     );
 }
 

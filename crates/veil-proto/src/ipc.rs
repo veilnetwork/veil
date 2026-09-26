@@ -2640,11 +2640,31 @@ pub const MAX_MAILBOX_CAPABILITY_TOKEN_BYTES: usize = 2048;
 /// `kMailboxPutChunkDataBytes`.
 pub const MAILBOX_PUT_CHUNK_DATA_BYTES: usize = 7680;
 
-/// Hard cap on `chunk_total`. The product with the chunk size is what bounds
-/// relay memory per in-flight deposit, and it is held at the same ~60 KB it
-/// was at 256 x 240 — the chunk grew 32x, so the count drops by the same
-/// factor. Still far above any deliverable blob, which is now one chunk.
-pub const MAX_MAILBOX_PUT_CHUNKS: u16 = 8;
+/// The largest encoded [`MailboxPutPayload`]: the fixed header, a blob at
+/// [`MAX_MAILBOX_BLOB_BYTES`], and all three trailers at their caps.
+pub const MAX_MAILBOX_PUT_PAYLOAD_BYTES: usize = 100
+    + MAX_MAILBOX_BLOB_BYTES
+    + 2
+    + MAX_PUSH_ENVELOPE_BYTES
+    + 2
+    + MAX_MAILBOX_CAPABILITY_TOKEN_BYTES
+    + 2
+    + MAX_WAKE_HMAC_ENVELOPE_BYTES;
+
+/// Hard cap on `chunk_total`: enough chunks for the largest deposit the store
+/// accepts, and no more.
+///
+/// It was 8 (≈ 60 KB), sized when "a deliverable blob is one chunk" was true.
+/// The slice endpoint made the store's own 1 MiB the deposit ceiling again, and
+/// the sender mirrors that ceiling — but this count stayed, so every deposit
+/// between ~60 KB and 1 MiB was dropped at the relay's door. The PUT is
+/// sender-anonymous, so nobody heard: measured on the stand, a 2797-byte frame
+/// sealed to an identity with seven devices came to 63722 bytes, the source
+/// logged `stash OK`, and each relay logged `chunk_total 9 outside 1..=8`.
+///
+/// Relay memory is bounded by the reassembler's byte budget, not by this count.
+pub const MAX_MAILBOX_PUT_CHUNKS: u16 =
+    MAX_MAILBOX_PUT_PAYLOAD_BYTES.div_ceil(MAILBOX_PUT_CHUNK_DATA_BYTES) as u16;
 
 /// One fragment of a chunked network mailbox deposit (app → relay PUT endpoint).
 ///
