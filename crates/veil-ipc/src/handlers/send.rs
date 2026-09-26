@@ -301,6 +301,56 @@ type PlannedRelay = (Option<[u8; 32]>, Vec<[u8; 32]>);
 /// forwards, so a frame that would go in the clear is never handed to an
 /// arbitrary session on the strength of it being alive: `will_seal` false keeps
 /// exactly the old behaviour, including its NO_ROUTE.
+/// Hand `frame`, sealed for the instance `sealed_for`, to the device it is
+/// sealed for — and to no other.
+///
+/// An identity-addressed send used to go to every live device of the
+/// identity (`send_to_peer_or_identity`), whatever the frame was sealed for;
+/// all but one could only refuse it. A frame with no seal, or one addressed to
+/// a device rather than an identity, keeps that path unchanged. The sealed
+/// device having no live session is `false`: the caller then relays it, and
+/// [`without_other_devices`] keeps the relay from taking it through a
+/// sibling.
+fn hand_to_sealed_device(
+    reg: &dyn FrameBroadcaster,
+    dst: &[u8; 32],
+    sealed_for: Option<[u8; 16]>,
+    priority: u8,
+    frame: Vec<u8>,
+) -> bool {
+    let Some(instance) = sealed_for else {
+        return reg.send_to_peer_or_identity(dst, priority, frame);
+    };
+    let devices = reg.devices_of(dst);
+    if devices.is_empty() {
+        return reg.send_to_peer_or_identity(dst, priority, frame);
+    }
+    // An instance id is the first sixteen bytes of its device id
+    // (`SovereignIdentity::active_instance_id`).
+    match devices.iter().find(|device| device[..16] == instance) {
+        Some(device) => reg.send_to(device, priority, frame),
+        None => false,
+    }
+}
+
+/// Relay hops for a frame sealed for one device of `dst`, without the
+/// identity's OTHER live devices: relayed through a sibling, the frame is
+/// delivered to that sibling as its own identity's, which refuses it.
+fn without_other_devices(
+    hops: Vec<[u8; 32]>,
+    reg: &dyn FrameBroadcaster,
+    dst: &[u8; 32],
+    sealed_for: Option<[u8; 16]>,
+) -> Vec<[u8; 32]> {
+    let Some(instance) = sealed_for else {
+        return hops;
+    };
+    let devices = reg.devices_of(dst);
+    hops.into_iter()
+        .filter(|hop| !devices.contains(hop) || hop[..16] == instance)
+        .collect()
+}
+
 fn ordinary_relay_hops(
     discovered: Option<[u8; 32]>,
     dst: &[u8; 32],
@@ -916,6 +966,41 @@ pub(crate) async fn handle_ipc_send(
         "direct_or_fallback"
     });
 
+    // WHICH DEVICE THIS SEAL IS FOR (defect №35, its fallback half). The
+    // per-device fan-out above did not take the frame, so it was sealed once,
+    // to whichever instance the identity's certificate lookup named — chosen
+    // with no regard for which devices are live to hand it to. Measured on a
+    // stand after a session between two sibling devices flapped: 160 frames a
+    // device had sealed to ITS OWN instance, handed to its sibling, which
+    // could only refuse them; and a contact's frames sealed to one device of
+    // an identity, handed to the other.
+    let sealed_for: Option<[u8; 16]> = sealed
+        .as_ref()
+        .and_then(|(payload, _)| veil_e2e::payload_instances(payload))
+        .map(|(_, to)| to);
+    let own_instance = ctx
+        .ratchet
+        .as_ref()
+        .and_then(|r| r.identity())
+        .map(|i| i.local_instance_id);
+    if sealed_for.is_some() && sealed_for == own_instance {
+        // Nobody but this device can open it. Refuse the send instead: the
+        // outbox keeps the frame and re-drives it, by which time the fan-out
+        // has a live device to seal for.
+        log::info!(
+            "ratchet.sealed_for_self dst={} — the fallback seal named this device; not sent",
+            veil_util::bytes_to_hex(&send.dst_node_id[..4])
+        );
+        let mut hdr = FrameHeader::new(
+            FrameFamily::LocalApp as u8,
+            LocalAppMsg::AppSendFailed as u16,
+        );
+        hdr.body_len = 2;
+        let mut frame = codec::encode_header(&hdr).to_vec();
+        frame.extend_from_slice(&ipc_send_err::NO_ROUTE.to_be_bytes());
+        return sink.write_all(&frame).await;
+    }
+
     if send.dst_node_id == *local_node_id && !send.my_other_devices {
         // Local delivery — route directly through the app registry. The
         // message never left this node: it came in over the local IPC socket
@@ -956,8 +1041,10 @@ pub(crate) async fn handle_ipc_send(
         // `dst_node_id` is whatever the APP addressed, and an app addresses a
         // contact — an identity. The session under it is registered by device.
         let sent = !relay_realtime
-            && reg.send_to_peer_or_identity(
+            && hand_to_sealed_device(
+                reg,
                 &send.dst_node_id,
+                sealed_for,
                 veil_proto::header::priority::INTERACTIVE,
                 frame,
             );
@@ -998,6 +1085,8 @@ pub(crate) async fn handle_ipc_send(
                 .await;
                 ordinary_relay_hops(discovered, &send.dst_node_id, route_cache, reg, will_seal)
             };
+            let forced_relay_hops =
+                without_other_devices(forced_relay_hops, reg, &send.dst_node_id, sealed_for);
             if !forced_relay_hops.is_empty() {
                 use veil_proto::delivery::DeliveryEnvelope;
                 use veil_proto::family::DeliveryMsg;
@@ -2466,6 +2555,108 @@ mod ratchet_send_tests {
             assert_eq!(opened.plaintext, b"to every device of a person");
             assert!(opened.authenticated);
         }
+    }
+
+    /// A frame sealed for one device of an identity goes to that device and to
+    /// no other live one (defect №35, the fallback half); with that device
+    /// offline it goes nowhere directly rather than to a sibling that can only
+    /// refuse it. A frame with no seal keeps the fan-out it always had.
+    #[test]
+    fn a_sealed_frame_is_handed_only_to_the_device_it_is_sealed_for() {
+        const E: [u8; 32] = [0xB7u8; 32];
+        const F: [u8; 32] = [0xB8u8; 32];
+        let f_instance = [0xB8u8; 16];
+        let prio = veil_proto::header::priority::INTERACTIVE;
+        let both = Outbox {
+            live: vec![E, F],
+            sent: Mutex::new(Vec::new()),
+            family: vec![E, F],
+        };
+        assert!(hand_to_sealed_device(
+            &both,
+            &PEER,
+            Some(f_instance),
+            prio,
+            vec![1]
+        ));
+        let to: Vec<[u8; 32]> = lock!(both.sent).iter().map(|(d, _)| *d).collect();
+        assert_eq!(to, vec![F], "only the device the frame is sealed for");
+
+        let only_e = Outbox {
+            live: vec![E],
+            sent: Mutex::new(Vec::new()),
+            family: vec![E],
+        };
+        assert!(!hand_to_sealed_device(
+            &only_e,
+            &PEER,
+            Some(f_instance),
+            prio,
+            vec![2]
+        ));
+        assert!(
+            lock!(only_e.sent).is_empty(),
+            "a sibling that cannot open it is not handed it"
+        );
+
+        let unsealed = Outbox {
+            live: vec![E, F],
+            sent: Mutex::new(Vec::new()),
+            family: vec![E, F],
+        };
+        assert!(hand_to_sealed_device(&unsealed, &PEER, None, prio, vec![3]));
+        assert_eq!(
+            lock!(unsealed.sent).len(),
+            2,
+            "no seal, every device, as before"
+        );
+    }
+
+    /// The send path itself uses both, and refuses a seal for this device. Held
+    /// in the source because the fallback they sit on runs only when the
+    /// per-device fan-out did not take the frame — a race no fixture drives.
+    #[test]
+    fn the_fallback_send_path_steers_its_seal() {
+        let src = include_str!("send.rs");
+        let handler = &src[src
+            .find("pub(crate) async fn handle_ipc_send(")
+            .expect("handler")
+            ..src.find("#[cfg(test)]").expect("tests")];
+        assert!(
+            handler.contains("sealed_for == own_instance"),
+            "a seal for this device must not be sent"
+        );
+        assert!(
+            handler.contains("&& hand_to_sealed_device("),
+            "the direct hand-off must go to the sealed device only"
+        );
+        assert!(
+            handler.contains("without_other_devices(forced_relay_hops,"),
+            "the relay must not go through a sibling"
+        );
+    }
+
+    /// Relayed, the same frame does not go through a sibling of the device it
+    /// is sealed for: delivered there as that sibling's own identity's, it is
+    /// refused.
+    #[test]
+    fn a_sealed_frame_is_not_relayed_through_a_sibling() {
+        const E: [u8; 32] = [0xB7u8; 32];
+        const F: [u8; 32] = [0xB8u8; 32];
+        let reg = Outbox {
+            live: vec![E, F, RELAY],
+            sent: Mutex::new(Vec::new()),
+            family: vec![E, F],
+        };
+        assert_eq!(
+            without_other_devices(vec![RELAY, E, F], &reg, &PEER, Some([0xB8u8; 16])),
+            vec![RELAY, F]
+        );
+        assert_eq!(
+            without_other_devices(vec![RELAY, E, F], &reg, &PEER, None),
+            vec![RELAY, E, F],
+            "nothing sealed, nothing to steer"
+        );
     }
 
     /// A discovery that found no route is not repeated at once: the next send
