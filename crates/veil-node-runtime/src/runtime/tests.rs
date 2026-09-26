@@ -380,6 +380,106 @@ async fn the_applied_config_is_what_puts_a_deferred_node_on_the_network() {
     let _ = fs::remove_file(path);
 }
 
+/// A device is traced to its identity through a document in the local shard.
+///
+/// Under a device's own address its mailbox ads carry the identity's cookie,
+/// and a stream sender has to know that identity to tell them from stream ads.
+#[test]
+fn a_device_is_traced_to_the_identity_whose_document_lists_it() {
+    use veil_proto::identity_document::{ALGO_ED25519, IdentityDocument, IdentityKey};
+    let key = |device: [u8; 32]| IdentityKey {
+        algo: ALGO_ED25519,
+        pubkey: vec![0xAA; 32],
+        device_id: device,
+        valid_from_unix: 1,
+        valid_until_unix: 2,
+        master_sig: vec![0xCC; 64],
+    };
+    let doc = |identity: [u8; 32], devices: &[[u8; 32]]| {
+        IdentityDocument {
+            node_id: identity,
+            master_algo: ALGO_ED25519,
+            master_pubkey: vec![0xAB; 32],
+            issued_at_unix: 1,
+            valid_until_unix: 2,
+            sig_key_idx: 0,
+            identity_keys: devices.iter().map(|d| key(*d)).collect(),
+            revoked_devices: Vec::new(),
+            document_sig: vec![0xDE; 64],
+        }
+        .encode()
+    };
+    let (identity, device, other) = ([0x1D; 32], [0xD1; 32], [0xD2; 32]);
+    let store = [
+        b"RA-not-a-document".to_vec(),
+        doc([0x2E; 32], &[other]),
+        doc(identity, &[other, device]),
+    ];
+    let values = || store.iter().map(Vec::as_slice);
+    assert_eq!(
+        super::node_services::identity_listing_device(values(), &device),
+        Some(identity)
+    );
+    assert_eq!(
+        super::node_services::identity_listing_device(values(), &[0xEE; 32]),
+        None,
+        "a device no document lists belongs to nobody we know"
+    );
+    // A standalone identity lists itself as its only device: it is not
+    // another identity's device.
+    let solo = [doc(identity, &[identity])];
+    assert_eq!(
+        super::node_services::identity_listing_device(solo.iter().map(Vec::as_slice), &identity),
+        None
+    );
+}
+
+/// A deferred node that takes on its real identity advertises the anonymity
+/// key it opens introduces with.
+///
+/// The reload re-derives that key for the dispatcher. The rendezvous ads are
+/// signed from `runtime.anonymity`, which kept the stub's key, so every sender
+/// sealed its stream intro to a public key whose secret the node no longer
+/// used. Measured on the stand as `intro-open FAILED` on every anonymous
+/// stream between two desktop apps: no file above the datagram size arrived.
+#[tokio::test(flavor = "current_thread")]
+async fn a_promoted_node_advertises_the_anonymity_key_it_opens_with() {
+    let stub = veil_cfg::build_stub_config_with_ephemeral_identity(true).unwrap();
+    let path = save_test_config("node-runtime-promote-anon-key", stub).unwrap();
+    let mut runtime = NodeRuntime::start(&path, true)
+        .await
+        .expect("the deferred stub starts");
+    let pk = |sk: &x25519_dalek::StaticSecret| x25519_dalek::PublicKey::from(sk).to_bytes();
+    let stub_key = pk(runtime
+        .dispatcher
+        .anonymity_x25519_sk
+        .as_ref()
+        .expect("an anonymous stub holds an anonymity key"));
+
+    let mut promoted = runtime_config_with_listen();
+    promoted.peers.clear();
+    veil_cfg::render_config(&path, &promoted).expect("write the promoted config");
+    runtime.reload().await.expect("apply-config style reload");
+
+    let opens_with = pk(runtime
+        .dispatcher
+        .anonymity_x25519_sk
+        .as_ref()
+        .expect("still holds one"));
+    assert_ne!(
+        opens_with, stub_key,
+        "control: the identity changed, so the dispatcher's key was re-derived"
+    );
+    assert_eq!(
+        pk(&runtime.anonymity.x25519_sk),
+        opens_with,
+        "the key the ads advertise must be the key introduces are opened with"
+    );
+
+    runtime.stop().await.expect("the promoted node shuts down");
+    let _ = fs::remove_file(path);
+}
+
 /// A node whose owner refused the shared seeds must come up OFFLINE AND
 /// ALIVE. This is the exact shape the app composes for a declining identity:
 /// `builtin_seed_policy = "never"`, no `peers`, no `[[bootstrap_peers]]`, no

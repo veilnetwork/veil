@@ -1241,6 +1241,24 @@ impl NodeServices {
         service_tasks::rendezvous_cookie_from_node_id(node_id)
     }
 
+    /// The identity whose document, held in the LOCAL shard, lists `device`.
+    ///
+    /// A device publishes its ads under its own address too, and the mailbox
+    /// ones there carry its IDENTITY's mailbox cookie — which is not the
+    /// cookie derived from the device address, so a stream sender that tells
+    /// the two classes apart by that derivation took them for stream ads and
+    /// addressed cells R would never splice. Every stream answer goes to the
+    /// opener's device address, so this is the path every reply takes.
+    ///
+    /// Unverified on purpose: the answer is only used to leave a cookie OUT,
+    /// and a forged document can only name an identity whose mailbox cookie
+    /// is not the device's stream cookie. Local only, like `ad_binding_ok`: a
+    /// resolve must not block on a DHT walk.
+    pub fn identity_of_device_local(&self, device: &[u8; 32]) -> Option<[u8; 32]> {
+        let values = self.dht.snapshot_values();
+        identity_listing_device(values.iter().map(|v| v.value.as_slice()), device)
+    }
+
     /// Register a LOCATION-anonymous service (onion-registration b5b-runtime):
     /// build an onion circuit whose terminus is the rendezvous relay R
     /// (`relay_path.last()`), and register `cookie` AT R over that circuit —
@@ -3303,4 +3321,21 @@ pub(crate) async fn tear_down_reply_circuit_when_due(
         );
         return;
     }
+}
+
+/// The identity whose document, among `values`, lists `device` as one of its
+/// devices (see [`NodeServices::identity_of_device_local`]).
+pub(crate) fn identity_listing_device<'a>(
+    values: impl IntoIterator<Item = &'a [u8]>,
+    device: &[u8; 32],
+) -> Option<[u8; 32]> {
+    use veil_proto::identity_document::{IDENTITY_DOCUMENT_MAGIC, IdentityDocument};
+    values
+        .into_iter()
+        .filter(|v| v.starts_with(&IDENTITY_DOCUMENT_MAGIC))
+        .filter_map(|v| IdentityDocument::decode(v).ok())
+        .find(|doc| {
+            doc.node_id != *device && doc.identity_keys.iter().any(|k| k.device_id == *device)
+        })
+        .map(|doc| doc.node_id)
 }

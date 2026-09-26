@@ -62,5 +62,5 @@ pub mod wire;
 
 pub use driver::{CellDuplex, End, OnionAbort, OnionReader, OnionStream, OnionWriter};
 pub use engine::{Config, Event, StreamEngine};
-pub use mux::{Addr, CellSender, Peer, StreamMux};
+pub use mux::{Addr, CellSender, Peer, PeerAliases, StreamMux};
 pub use wire::{Frame, MAX_CELL, MSS, SackRange};

@@ -824,6 +824,39 @@ impl AnonymityState {
             send_stall: Arc::new(AnonSendStallTracker::new()),
         }
     }
+
+    /// The same state under a different anonymity X25519 key.
+    ///
+    /// A reload that changes the identity re-derives this key for the
+    /// dispatcher, which is what opens every sealed introduce and stream intro.
+    /// This copy is what the rendezvous ads are signed from, and it kept the
+    /// deferred boot's stub key: ads advertised one public key while intros
+    /// were opened with another. Measured on the stand as `intro-open FAILED`
+    /// on every anonymous stream, in both directions, for every identity that
+    /// boots deferred — no file above the datagram size ever arrived.
+    ///
+    /// Everything else is shared, not copied: the publisher entries, caches
+    /// and registries are the same live objects either way.
+    pub fn with_x25519_sk(&self, x25519_sk: Arc<x25519_dalek::StaticSecret>) -> Self {
+        Self {
+            relay_capable: self.relay_capable,
+            advertised_bps: self.advertised_bps,
+            x25519_sk,
+            rendezvous_publisher_entries: Arc::clone(&self.rendezvous_publisher_entries),
+            rendezvous_resolve_cache: Arc::clone(&self.rendezvous_resolve_cache),
+            onion_resolve_cache: Arc::clone(&self.onion_resolve_cache),
+            relay_entry_verify_cache: Arc::clone(&self.relay_entry_verify_cache),
+            stream_relay_directory_warm_lock: Arc::clone(&self.stream_relay_directory_warm_lock),
+            relay_reputation: Arc::clone(&self.relay_reputation),
+            reply_block_store: Arc::clone(&self.reply_block_store),
+            auth_deliver_replay_cache: Arc::clone(&self.auth_deliver_replay_cache),
+            onion_services: Arc::clone(&self.onion_services),
+            pending_confirm_publishes: Arc::clone(&self.pending_confirm_publishes),
+            onion_service_hops: self.onion_service_hops,
+            pinned_rendezvous_relays: self.pinned_rendezvous_relays.clone(),
+            send_stall: Arc::clone(&self.send_stall),
+        }
+    }
 }
 
 #[cfg(test)]
