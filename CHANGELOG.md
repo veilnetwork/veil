@@ -1,5 +1,29 @@
 # Changelog
 
+## v0.11.39 — 2026-09-30
+
+### Added
+
+- A key-tree ratchet can recover an out-of-order message without exhausting a
+  fixed skipped-key window. Deliveries name their source device so replies can
+  return to the device that sent them.
+- Peer lists can identify anonymity relays and IPC can address a device by a
+  name known only to its sibling devices.
+
+### Fixed
+
+- Identity sends are sealed separately for each device. Relayed ratchet frames,
+  certificates, anonymous streams, and fallback sends now resolve the correct
+  identity and device, including after a device joins or an identity restarts.
+- Mailbox relays serve deposits without IPC; unreachable peers no longer hold
+  the send queue or cause repeated immediate redials. NAT failures and rejected
+  attachments report their actual outcome.
+- Sibling devices no longer overwrite each other's rendezvous slots, and
+  topology changes republish the complete identity document.
+
+The FFI ABI changed; applications must rebuild their veil bindings and native
+libraries together.
+
 ## v0.11.38 — 2026-09-20
 
 ### Fixed
