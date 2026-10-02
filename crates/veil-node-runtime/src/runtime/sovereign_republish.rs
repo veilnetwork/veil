@@ -79,6 +79,7 @@ impl NodeRuntime {
         // `IdentityDocument` / `NameClaim` are local-only and vanish
         // when the publisher goes offline.
         let session_tx_registry = Arc::clone(&self.session_tx_registry);
+        let sessions_for_first_publish = Arc::clone(&self.session_tx_registry);
         let local_node_id_for_replication = *self.identity.local_identity.node_id.as_bytes();
         // subscribe to routing-table-change notifications so
         // a freshly-joined closer-in-keyspace peer picks up replicas
@@ -253,6 +254,18 @@ impl NodeRuntime {
                 let mut next_republish_at = tokio::time::Instant::now() + REPUBLISH_WARMUP;
                 let mut interval = tokio::time::interval_at(next_republish_at, initial_interval);
                 interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                // The startup publish is local-only. A newly started phone can
+                // already have a session while its first contact is trying to
+                // resolve its document and mailbox certificate; waiting the
+                // full 120 s warmup makes that request look lost. Poll only
+                // until the first live session, then pull the complete bundle
+                // publish forward. The topology notification is not a reliable
+                // first-session signal (and used to be debounced at startup).
+                let mut first_network_publish_pending = true;
+                let mut first_network_tick = tokio::time::interval_at(
+                    tokio::time::Instant::now() + Duration::from_secs(5),
+                    Duration::from_secs(5),
+                );
 
                 // Cold-start warmup phase. The adaptive interval floors at 0.5×
                 // base (≈3h), so a republish that fires while the routing table
@@ -322,7 +335,7 @@ impl NodeRuntime {
                 #[cfg(not(any(test, feature = "test-low-difficulty")))]
                 const TOPOLOGY_REPUBLISH_DEBOUNCE: std::time::Duration =
                     std::time::Duration::from_secs(60);
-                let mut last_topology_publish_at = tokio::time::Instant::now();
+                let mut last_topology_publish_at: Option<tokio::time::Instant> = None;
 
                 loop {
                     tokio::select! {
@@ -339,6 +352,13 @@ impl NodeRuntime {
                         _ = mlkem_republish_now.notified() => {
                             interval.reset_immediately();
                         }
+                        _ = first_network_tick.tick(), if first_network_publish_pending => {
+                            if sessions_for_first_publish.read().is_ok_and(|reg| reg.len() > 0) {
+                                first_network_publish_pending = false;
+                                last_topology_publish_at = Some(tokio::time::Instant::now());
+                                interval.reset_immediately();
+                            }
+                        }
                         // topology-driven republish. When a new
                         // peer joins / leaves, the K-closest set for our
                         // identity dht_key may have shifted — re-fan the
@@ -347,12 +367,17 @@ impl NodeRuntime {
                         // waiting for the next 6 h tick.
                         _ = route_updated.notified() => {
                             let now = tokio::time::Instant::now();
-                            if now.duration_since(last_topology_publish_at)
-                                < TOPOLOGY_REPUBLISH_DEBOUNCE
-                            {
+                            if first_network_publish_pending {
+                                if !sessions_for_first_publish.read().is_ok_and(|reg| reg.len() > 0) {
+                                    continue;
+                                }
+                                first_network_publish_pending = false;
+                            } else if last_topology_publish_at.is_some_and(|last|
+                                now.duration_since(last) < TOPOLOGY_REPUBLISH_DEBOUNCE
+                            ) {
                                 continue;
                             }
-                            last_topology_publish_at = now;
+                            last_topology_publish_at = Some(now);
                             // THE WHOLE BUNDLE, not the document alone.
                             //
                             // This arm used to re-fan the `IdentityDocument`
@@ -482,6 +507,9 @@ impl NodeRuntime {
                             }
                         }
                         _ = interval.tick() => {
+                            if sessions_for_first_publish.read().is_ok_and(|reg| reg.len() > 0) {
+                                first_network_publish_pending = false;
+                            }
                             // Document.
                             match veil_identity::publish::publish_identity_document(
                                 &sov.document, &publisher,

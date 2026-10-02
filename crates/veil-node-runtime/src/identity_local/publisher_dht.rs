@@ -144,10 +144,6 @@ pub(crate) fn replicate_dht_value(
         .into_iter()
         .filter(|(n, _)| *n != local_node_id)
         .collect::<Vec<_>>();
-    if candidates_with_uri.is_empty() {
-        return;
-    }
-
     // anti-eclipse safeguard: warn (but still replicate) if the K-closest set
     // has ≥2 IPv4 peers all sharing one /24 prefix (potential sybil cluster).
     let prefixes: Vec<Option<[u8; 3]>> = candidates_with_uri
@@ -177,6 +173,13 @@ pub(crate) fn replicate_dht_value(
                 candidates.push(peer);
             }
         }
+    }
+    // A phone can connect to its first seed before its DHT routing table has
+    // learned that peer. The active session is already a valid STORE path;
+    // returning on an empty closest-set above left all startup identity and
+    // mailbox records local until the next republish.
+    if candidates.is_empty() {
+        return;
     }
 
     // Build the RecursiveQuery(STORE) frame once.
@@ -332,6 +335,27 @@ mod tests {
         // The DHT's local lookup must now return the stored bytes.
         let got = dht.get_local(&key).expect("value stored locally");
         assert_eq!(got, value);
+    }
+
+    #[tokio::test]
+    async fn put_replicates_to_a_live_seed_before_the_routing_table_warms() {
+        let dht = fresh_kademlia().await;
+        assert!(dht.routing_table_contacts().is_empty());
+        let peer = [0x02; 32];
+        let mut registry = SessionTxRegistry::new();
+        let mut received = registry.register(peer);
+        let publisher =
+            DhtBackedPublisher::with_replication(dht, Arc::new(RwLock::new(registry)), [0x01; 32]);
+
+        publisher
+            .put([0xAA; 32], b"identity document".to_vec())
+            .await
+            .unwrap();
+
+        assert!(
+            received.try_recv().is_ok(),
+            "the first live seed got no STORE"
+        );
     }
 
     #[tokio::test]
