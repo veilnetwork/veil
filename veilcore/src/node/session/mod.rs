@@ -148,6 +148,7 @@ mod integration_tests {
         let caps = CapabilitiesPayload {
             roles_supported: role_bits::LEAF,
             flags: cap_flags::CAN_RELAY,
+            extra_flags: 0,
             discovery_mode: 0,
         };
         write_frame(

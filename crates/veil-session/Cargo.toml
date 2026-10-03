@@ -7,6 +7,7 @@ license = "MIT OR Apache-2.0"
 
 [dependencies]
 veil-abuse = { path = "../veil-abuse" }
+veil-anonymity = { path = "../veil-anonymity" }
 veil-bufpool = { path = "../veil-bufpool" }
 veil-cfg = { path = "../veil-cfg" }
 veil-crypto = { path = "../veil-crypto" }

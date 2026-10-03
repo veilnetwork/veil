@@ -431,6 +431,7 @@ mod tests {
             remote_capabilities: CapabilitiesPayload {
                 roles_supported: role_bits::CORE,
                 flags: cap_flags::CAN_RELAY,
+                extra_flags: 0,
                 discovery_mode: 0,
             },
             remote_attach: AttachPayload {

@@ -219,7 +219,9 @@ impl FrameDispatcher {
             // over an established session (NOT fixed CELL_SIZE), so return before
             // the Hop cell-size check below.
             RelayChainMsg::CircuitBuild => return self.handle_circuit_build(body, node_id),
-            RelayChainMsg::CircuitData => return self.handle_circuit_data(body, node_id),
+            RelayChainMsg::CircuitData | RelayChainMsg::CircuitDatagram => {
+                return self.handle_circuit_data(body, node_id, msg);
+            }
             RelayChainMsg::CircuitTeardown => return self.handle_circuit_teardown(body, node_id),
             RelayChainMsg::CircuitBuilt => return self.handle_circuit_built(body, node_id),
         }
@@ -1160,7 +1162,12 @@ impl FrameDispatcher {
     /// the FORWARD index (arrived from `prev_link`) is unwrapped one layer and
     /// passed toward the terminus; a cell matching the BACKWARD index (arrived
     /// from `next_link`) gets ANOTHER layer and is passed toward the originator.
-    fn handle_circuit_data(&self, body: &[u8], node_id: NodeId) -> DispatchResult {
+    fn handle_circuit_data(
+        &self,
+        body: &[u8],
+        node_id: NodeId,
+        transport: RelayChainMsg,
+    ) -> DispatchResult {
         use veil_anonymity::circuit_data::{Direction, apply_layer, read_payload};
         use veil_anonymity::circuit_register::COOKIE_LEN;
         use veil_anonymity::circuit_wire::CircuitDataPayload;
@@ -1248,11 +1255,7 @@ impl FrameDispatcher {
                                 crate::service_budget::ServiceKind::RelayCircuit,
                                 b.len() as u64,
                             );
-                            let sent = self.send_relay_chain_msg(
-                                &NodeId::from(nl),
-                                RelayChainMsg::CircuitData,
-                                &b,
-                            );
+                            let sent = self.send_relay_chain_msg(&NodeId::from(nl), transport, &b);
                             circuit_data_diag(|d| {
                                 if sent {
                                     d.fwd_relay_ok = d.fwd_relay_ok.saturating_add(1);
@@ -1298,7 +1301,8 @@ impl FrameDispatcher {
                                 circuit_data_diag(|d| {
                                     d.splice_hit = d.splice_hit.saturating_add(1)
                                 });
-                                spliced = self.splice_stream_cell(&circuit, &p[COOKIE_LEN..]);
+                                spliced =
+                                    self.splice_stream_cell(&circuit, &p[COOKIE_LEN..], transport);
                             } else {
                                 circuit_data_diag(|d| {
                                     d.splice_miss = d.splice_miss.saturating_add(1);
@@ -1398,11 +1402,8 @@ impl FrameDispatcher {
                         crate::service_budget::ServiceKind::RelayCircuit,
                         b.len() as u64,
                     );
-                    let sent = self.send_relay_chain_msg(
-                        &NodeId::from(state.prev_link),
-                        RelayChainMsg::CircuitData,
-                        &b,
-                    );
+                    let sent =
+                        self.send_relay_chain_msg(&NodeId::from(state.prev_link), transport, &b);
                     circuit_data_diag(|d| {
                         if sent {
                             d.ret_relay_ok = d.ret_relay_ok.saturating_add(1);
@@ -1853,6 +1854,7 @@ impl FrameDispatcher {
         &self,
         circuit: &veil_anonymity::circuit_table::CircuitState,
         bytes: &[u8],
+        transport: RelayChainMsg,
     ) -> bool {
         use veil_anonymity::circuit_data::{Direction, apply_layer, wrap_payload};
         use veil_anonymity::circuit_wire::CircuitDataPayload;
@@ -1874,11 +1876,8 @@ impl FrameDispatcher {
             ciphertext: buf,
         };
         if let Ok(body) = cell.encode(circuit.cell_bytes) {
-            let sent = self.send_relay_chain_msg(
-                &NodeId::from(circuit.prev_link),
-                RelayChainMsg::CircuitData,
-                &body,
-            );
+            let sent =
+                self.send_relay_chain_msg(&NodeId::from(circuit.prev_link), transport, &body);
             circuit_data_diag(|d| {
                 if sent {
                     d.splice_ok = d.splice_ok.saturating_add(1);
@@ -2433,6 +2432,15 @@ mod tests {
     /// service budget exists to be (report14 V14-M2).
     #[test]
     fn a_relayed_cell_is_billed_in_both_directions() {
+        a_relayed_cell_is_billed_with_transport(RelayChainMsg::CircuitData);
+    }
+
+    #[test]
+    fn circuit_datagrams_retag_both_ways_with_equal_scheduling_and_cost() {
+        a_relayed_cell_is_billed_with_transport(RelayChainMsg::CircuitDatagram);
+    }
+
+    fn a_relayed_cell_is_billed_with_transport(transport: RelayChainMsg) {
         use veil_anonymity::circuit_setup::{CircuitSetupHop, build_circuit_setup};
         use veil_anonymity::circuit_table::CircuitTable;
         use veil_anonymity::circuit_wire::CircuitDataPayload;
@@ -2452,6 +2460,10 @@ mod tests {
         // circuit ends here and is our own inbound traffic, which is not what
         // the service budget is about.
         let next_id = [0xABu8; 32];
+        let mut tx_registry = veil_session::SessionTxRegistry::new();
+        let mut next_rx = tx_registry.register(next_id);
+        let mut prev_rx = tx_registry.register([0xEE; 32]);
+        d.session_tx_registry = Some(std::sync::Arc::new(std::sync::RwLock::new(tx_registry)));
         let cell_bytes = veil_anonymity::circuit_data::CircuitCellBytes::legacy();
         let setup = build_circuit_setup(
             &[
@@ -2488,6 +2500,21 @@ mod tests {
             "the fixture failed to install a relay"
         );
 
+        while next_rx.try_recv().is_ok() {}
+        let assert_relayed = |frame: &veil_bufpool::PooledShared, priority, cid| {
+            let header = veil_proto::codec::decode_header_with_limit(
+                &frame[..veil_proto::header::HEADER_SIZE],
+                65536,
+            )
+            .unwrap();
+            assert_eq!(priority, veil_proto::priority::INTERACTIVE);
+            assert_eq!(header.priority(), veil_proto::priority::INTERACTIVE);
+            assert_eq!(header.msg_type, transport as u16);
+            let cell =
+                CircuitDataPayload::decode(&frame[veil_proto::header::HEADER_SIZE..]).unwrap();
+            assert_eq!(cell.circuit_id, cid);
+            assert_eq!(cell.seq, 1);
+        };
         let cell = |circuit_id: u32| {
             CircuitDataPayload {
                 circuit_id,
@@ -2501,7 +2528,14 @@ mod tests {
         // FORWARD: arrives from prev tagged circuit_id_in.
         let (before, _, _) = d.abuse.service_budget.totals();
         let fwd = cell(42);
-        d.dispatch_relay_chain(&frame(RelayChainMsg::CircuitData, &fwd), &fwd, prev);
+        d.dispatch_relay_chain(&frame(transport, &fwd), &fwd, prev);
+        let (priority, forwarded) = next_rx.try_recv().expect("forward relay frame");
+        assert_relayed(&forwarded, priority, 1042);
+        d.dispatch_relay_chain(&frame(transport, &fwd), &fwd, prev);
+        assert!(
+            next_rx.try_recv().is_err(),
+            "forward replay must not be relayed twice"
+        );
         let (after_forward, _, _) = d.abuse.service_budget.totals();
         assert!(
             after_forward > before,
@@ -2512,10 +2546,13 @@ mod tests {
         // RETURN: arrives from next tagged circuit_id_out. Same relay, same
         // bytes, same cost.
         let ret = cell(1042);
-        d.dispatch_relay_chain(
-            &frame(RelayChainMsg::CircuitData, &ret),
-            &ret,
-            NodeId::from(next_id),
+        d.dispatch_relay_chain(&frame(transport, &ret), &ret, NodeId::from(next_id));
+        let (priority, returned) = prev_rx.try_recv().expect("return relay frame");
+        assert_relayed(&returned, priority, 42);
+        d.dispatch_relay_chain(&frame(transport, &ret), &ret, NodeId::from(next_id));
+        assert!(
+            prev_rx.try_recv().is_err(),
+            "return replay must not be relayed twice"
         );
         let (after_return, _, _) = d.abuse.service_budget.totals();
         assert!(
@@ -3010,6 +3047,15 @@ mod tests {
     /// path). Proves the recv-hook end of the stateful-circuit data plane.
     #[tokio::test]
     async fn circuit_return_routes_to_stream_recv() {
+        circuit_return_routes_to_stream_recv_with_transport(RelayChainMsg::CircuitData).await;
+    }
+
+    #[tokio::test]
+    async fn circuit_return_routes_to_stream_recv_datagram() {
+        circuit_return_routes_to_stream_recv_with_transport(RelayChainMsg::CircuitDatagram).await;
+    }
+
+    async fn circuit_return_routes_to_stream_recv_with_transport(transport: RelayChainMsg) {
         use veil_anonymity::circuit_data::{Direction, apply_layer, wrap_payload};
         use veil_anonymity::circuit_origin::{OriginCircuit, OriginCircuitTable};
         use veil_anonymity::circuit_wire::CircuitDataPayload;
@@ -3057,10 +3103,7 @@ mod tests {
         let body = cell
             .encode(veil_anonymity::circuit_data::CircuitCellBytes::legacy())
             .unwrap();
-        let mut hdr = FrameHeader::new(
-            FrameFamily::RelayChain as u8,
-            RelayChainMsg::CircuitData as u16,
-        );
+        let mut hdr = FrameHeader::new(FrameFamily::RelayChain as u8, transport as u16);
         hdr.body_len = body.len() as u32;
         d.dispatch_relay_chain(&hdr, &body, NodeId::from(r_id));
 
@@ -3166,6 +3209,23 @@ mod tests {
     /// circuits (not assumed) so the test is robust to key derivation.
     #[tokio::test]
     async fn circuit_forward_splices_to_registered_cookie_return() {
+        circuit_forward_splices_to_registered_cookie_return_with_transport(
+            RelayChainMsg::CircuitData,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn circuit_forward_splices_to_registered_cookie_return_datagram() {
+        circuit_forward_splices_to_registered_cookie_return_with_transport(
+            RelayChainMsg::CircuitDatagram,
+        )
+        .await;
+    }
+
+    async fn circuit_forward_splices_to_registered_cookie_return_with_transport(
+        transport: RelayChainMsg,
+    ) {
         use base64::Engine;
         use base64::engine::general_purpose::STANDARD;
         use veil_anonymity::circuit_data::{Direction, apply_layer, read_payload, wrap_payload};
@@ -3296,18 +3356,23 @@ mod tests {
         let fbody = fwd
             .encode(veil_anonymity::circuit_data::CircuitCellBytes::legacy())
             .unwrap();
-        let mut fhdr = FrameHeader::new(
-            FrameFamily::RelayChain as u8,
-            RelayChainMsg::CircuitData as u16,
-        );
+        let mut fhdr = FrameHeader::new(FrameFamily::RelayChain as u8, transport as u16);
         fhdr.body_len = fbody.len() as u32;
         d.dispatch_relay_chain(&fhdr, &fbody, NodeId::from(send_hop));
 
         // (4) R spliced a RETURN cell toward the receiver hop on recv_cid. Decode,
         //     peel the receiver circuit's return layer, unwrap → exactly the bytes.
-        let (_prio, frame) = recv_rx
+        let (prio, frame) = recv_rx
             .try_recv()
             .expect("splice must emit a return cell toward the receiver hop");
+        assert_eq!(prio, veil_proto::priority::INTERACTIVE);
+        let header = veil_proto::codec::decode_header_with_limit(
+            &frame[..veil_proto::header::HEADER_SIZE],
+            65536,
+        )
+        .unwrap();
+        assert_eq!(header.msg_type, transport as u16);
+        assert_eq!(header.priority(), veil_proto::priority::INTERACTIVE);
         let ret = CircuitDataPayload::decode(&frame[veil_proto::header::HEADER_SIZE..])
             .expect("decode spliced return CircuitData");
         assert_eq!(

@@ -187,6 +187,7 @@ struct RealtimeDatagramLane {
     /// derived at the handshake, which is what every peer without the
     /// capability expects to keep receiving under.
     peer_rotates: bool,
+    peer_circuit_datagrams: bool,
     tx: crate::datagram_flows::SessionDatagramTx,
     max_datagram_size: usize,
     logged_send_kinds: u8,
@@ -231,6 +232,7 @@ struct RealtimeReceiverContext {
 enum RealtimeLaneFrameKind {
     DirectApp,
     RelayForward,
+    CircuitDatagram,
 }
 
 impl RealtimeLaneFrameKind {
@@ -238,6 +240,7 @@ impl RealtimeLaneFrameKind {
         match self {
             Self::DirectApp => "app_rt_data",
             Self::RelayForward => "relay_forward",
+            Self::CircuitDatagram => "circuit_datagram",
         }
     }
 
@@ -245,13 +248,15 @@ impl RealtimeLaneFrameKind {
         match self {
             Self::DirectApp => 1,
             Self::RelayForward => 2,
+            Self::CircuitDatagram => 4,
         }
     }
 }
 
 /// Accept one complete loss-tolerant frame. Besides direct `AppRtData`, the
-/// lane admits only the canonical, unacknowledged, short-TTL REALTIME
-/// `Delivery::Forward` form. Everything else stays on the ordered stream, so
+/// lane admits the canonical, unacknowledged, short-TTL REALTIME
+/// `Delivery::Forward` form and explicitly loss-tolerant `CircuitDatagram`.
+/// Reliable circuit cells and every other frame stay on the ordered stream, so
 /// unknown extensions and reliable traffic cannot silently acquire lossy
 /// semantics or bypass its normal parser.
 fn decode_realtime_lane_frame(frame: &[u8]) -> Option<(FrameHeader, &[u8], RealtimeLaneFrameKind)> {
@@ -279,10 +284,30 @@ fn decode_realtime_lane_frame(frame: &[u8]) -> Option<(FrameHeader, &[u8], Realt
         && veil_proto::delivery::ForwardPayload::is_realtime_datagram_eligible(body)
     {
         RealtimeLaneFrameKind::RelayForward
+    } else if header.family == FrameFamily::RelayChain as u8
+        && header.msg_type == veil_proto::family::RelayChainMsg::CircuitDatagram as u16
+        && veil_anonymity::circuit_wire::CircuitDataPayload::validate(body).is_ok()
+    {
+        RealtimeLaneFrameKind::CircuitDatagram
     } else {
         return None;
     };
     Some((header, body, kind))
+}
+
+/// Stream fallback must be understood even by peers predating CircuitDatagram.
+fn circuit_datagram_stream_fallback(
+    frame: veil_bufpool::PooledShared,
+) -> veil_bufpool::PooledShared {
+    let Some((mut header, body, RealtimeLaneFrameKind::CircuitDatagram)) =
+        decode_realtime_lane_frame(&frame)
+    else {
+        return frame;
+    };
+    header.msg_type = veil_proto::family::RelayChainMsg::CircuitData as u16;
+    let mut bytes = encode_header(&header).to_vec();
+    bytes.extend_from_slice(body);
+    veil_bufpool::pooled_shared_from_vec(bytes)
 }
 
 /// Preserve lossy semantics even when the current transport has no QUIC
@@ -519,6 +544,8 @@ pub struct RealtimeLaneOffer {
     /// The peer negotiated generic opaque channels with independent replay
     /// and fragment state. No local queue class is sent on the wire.
     pub peer_flows: bool,
+    /// Explicitly negotiated generic loss-tolerant circuit-cell decoder.
+    pub peer_circuit_datagrams: bool,
 }
 
 /// Hot-standby transport-swap state for one session.
@@ -3347,6 +3374,7 @@ impl SessionRunner {
                     RealtimeDatagramLane {
                         handle: offer.handle,
                         peer_rotates: offer.peer_rotates,
+                        peer_circuit_datagrams: offer.peer_circuit_datagrams,
                         tx: crate::datagram_flows::SessionDatagramTx::new(
                             raw_tx_key,
                             session_id,
@@ -3794,9 +3822,12 @@ impl SessionRunner {
                 let mut disable_realtime_sender = false;
                 if let Some(lane) = realtime_lane.as_mut() {
                     for _ in 0..PQ_DRAIN_FRAMES_PER_PASS {
-                        let Some((outgoing_priority, outgoing)) =
-                            pq.pop_datagram_if(|frame| decode_realtime_lane_frame(frame).is_some())
-                        else {
+                        let Some((outgoing_priority, outgoing)) = pq.pop_datagram_if(|frame| {
+                            decode_realtime_lane_frame(frame).is_some_and(|(_, _, kind)| {
+                                kind != RealtimeLaneFrameKind::CircuitDatagram
+                                    || lane.peer_circuit_datagrams
+                            })
+                        }) else {
                             break;
                         };
                         let (_, _, lane_kind) = decode_realtime_lane_frame(&outgoing)
@@ -4029,6 +4060,10 @@ impl SessionRunner {
                     && let Some(outgoing) = pq.pop()
                 {
                     drained_this_pass += 1;
+                    // A stream-only / old peer must see the old discriminant.
+                    // Fallback is reliable for this hop; never reinterpret other
+                    // CircuitData (files, probes, introductions) as lossy.
+                    let outgoing = circuit_datagram_stream_fallback(outgoing);
                     // Capture the plaintext frame before any encryption.
                     self.dispatcher.capture_outbound(self.peer_id, &outgoing);
                     if self.crypto.tx_cipher.is_some() {
@@ -5291,6 +5326,83 @@ mod realtime_lane_frame_tests {
             assert!(
                 pq.pop_datagram_if(|bytes| decode_realtime_lane_frame(bytes).is_some())
                     .is_some()
+            );
+        }
+    }
+
+    #[test]
+    fn circuit_datagrams_are_generic_exact_and_reliable_cells_stay_ordered() {
+        use veil_anonymity::{circuit_data::CircuitCellBytes, circuit_wire::CircuitDataPayload};
+        use veil_proto::{family::RelayChainMsg, priority::INTERACTIVE};
+        for size in [1024, 2048, 16384] {
+            let cell = CircuitCellBytes::new(size).unwrap();
+            let body = CircuitDataPayload {
+                circuit_id: 42,
+                seq: 7,
+                ciphertext: vec![0x81; size],
+            }
+            .encode(cell)
+            .unwrap();
+            let mut header = FrameHeader::new(
+                FrameFamily::RelayChain as u8,
+                RelayChainMsg::CircuitDatagram as u16,
+            );
+            header.set_priority(INTERACTIVE);
+            header.body_len = body.len() as u32;
+            let mut bytes = encode_header(&header).to_vec();
+            bytes.extend_from_slice(&body);
+            let (_, decoded, kind) = decode_realtime_lane_frame(&bytes).unwrap();
+            assert_eq!(kind, RealtimeLaneFrameKind::CircuitDatagram);
+            assert_eq!(decoded, body);
+            let mut pq = PriorityQueue::with_default_weights();
+            assert!(enqueue_outbox_frame(
+                &mut pq,
+                INTERACTIVE,
+                veil_bufpool::pooled_shared_from_vec(bytes.clone())
+            ));
+            let fallback =
+                circuit_datagram_stream_fallback(veil_bufpool::pooled_shared_from_vec(bytes));
+            let header = decode_header(&fallback[..veil_proto::header::HEADER_SIZE]).unwrap();
+            assert_eq!(header.msg_type, RelayChainMsg::CircuitData as u16);
+            assert_eq!(header.priority(), INTERACTIVE);
+            assert_eq!(&fallback[veil_proto::header::HEADER_SIZE..], body);
+            assert!(decode_realtime_lane_frame(&fallback).is_none());
+            let reliable = frame(
+                FrameFamily::RelayChain,
+                RelayChainMsg::CircuitData as u16,
+                &body,
+            );
+            assert!(!enqueue_outbox_frame(
+                &mut pq,
+                INTERACTIVE,
+                veil_bufpool::pooled_shared_from_vec(reliable.clone())
+            ));
+            assert_eq!(
+                circuit_datagram_stream_fallback(veil_bufpool::pooled_shared_from_vec(
+                    reliable.clone()
+                ))
+                .as_ref(),
+                reliable
+            );
+            for malformed in [&body[..body.len() - 1], &[0u8; 10][..]] {
+                assert!(
+                    decode_realtime_lane_frame(&frame(
+                        FrameFamily::RelayChain,
+                        RelayChainMsg::CircuitDatagram as u16,
+                        malformed
+                    ))
+                    .is_none()
+                );
+            }
+            let mut trailing = body.clone();
+            trailing.push(0);
+            assert!(
+                decode_realtime_lane_frame(&frame(
+                    FrameFamily::RelayChain,
+                    RelayChainMsg::CircuitDatagram as u16,
+                    &trailing
+                ))
+                .is_none()
             );
         }
     }

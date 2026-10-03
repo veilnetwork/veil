@@ -1627,7 +1627,7 @@ impl CircuitCells {
             // Oversized (payload > one cell) — drop; callers batch to fit.
             Err(_) => return false,
         };
-        match self.services.send_circuit_cell_on_local_lane_detailed(
+        match self.services.send_circuit_datagram_on_local_lane_detailed(
             &route.circuit,
             &env,
             self.local_datagram_lane,

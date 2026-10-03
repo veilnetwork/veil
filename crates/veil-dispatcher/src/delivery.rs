@@ -3631,6 +3631,7 @@ mod tests {
             remote_capabilities: veil_proto::session::CapabilitiesPayload {
                 roles_supported: role_bits::CORE,
                 flags: cap_flags::SUPPORTS_SOVEREIGN_IDENTITY,
+                extra_flags: 0,
                 discovery_mode: 0,
             },
             remote_attach: veil_proto::session::AttachPayload {
@@ -3730,6 +3731,7 @@ mod tests {
             remote_capabilities: veil_proto::session::CapabilitiesPayload {
                 roles_supported: role_bits::CORE,
                 flags: cap_flags::SUPPORTS_SOVEREIGN_IDENTITY,
+                extra_flags: 0,
                 discovery_mode: 0,
             },
             remote_attach: veil_proto::session::AttachPayload {
@@ -3873,6 +3875,7 @@ mod tests {
             remote_capabilities: veil_proto::session::CapabilitiesPayload {
                 roles_supported: role_bits::CORE,
                 flags: cap_flags::SUPPORTS_SOVEREIGN_IDENTITY,
+                extra_flags: 0,
                 discovery_mode: 0,
             },
             remote_attach: veil_proto::session::AttachPayload {
@@ -4014,8 +4017,7 @@ mod tests {
         let tx_reg = Arc::new(RwLock::new(SessionTxRegistry::new()));
 
         // Register all 63 path entries upfront so forward sends never miss.
-        let mut rxs: Vec<tokio::sync::mpsc::Receiver<(u8, veil_bufpool::PooledShared)>> =
-            Vec::with_capacity(63);
+        let mut rxs: Vec<veil_session::FrameOutbox> = Vec::with_capacity(63);
         {
             let mut reg = tx_reg.write().unwrap();
             for id in &path {

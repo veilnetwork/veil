@@ -244,6 +244,7 @@ mod tests {
             remote_capabilities: veil_proto::session::CapabilitiesPayload {
                 roles_supported: veil_proto::session::role_bits::CORE,
                 flags: veil_proto::session::cap_flags::CAN_RELAY,
+                extra_flags: 0,
                 discovery_mode: 0,
             },
             remote_attach: veil_proto::session::AttachPayload {
