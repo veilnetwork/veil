@@ -54,6 +54,58 @@ type RouteMisses = std::collections::HashMap<([u8; 32], [u8; 32]), std::time::In
 static ROUTE_MISSES: std::sync::LazyLock<std::sync::Mutex<RouteMisses>> =
     std::sync::LazyLock::new(Default::default);
 
+// A missing media route is probed in the background, once per node/destination.
+// Never hold RTP/RTCP for the 500 ms discovery deadline, nor launch a walk for
+// each packet in the 50 Hz audio stream. Bound outstanding probes globally.
+type MediaProbeKey = ([u8; 32], [u8; 32]);
+static MEDIA_ROUTE_PROBES: std::sync::LazyLock<Mutex<std::collections::HashSet<MediaProbeKey>>> =
+    std::sync::LazyLock::new(Default::default);
+struct MediaRouteProbe(MediaProbeKey);
+
+impl Drop for MediaRouteProbe {
+    fn drop(&mut self) {
+        lock!(MEDIA_ROUTE_PROBES).remove(&self.0);
+    }
+}
+
+fn warm_media_route(ctx: &IpcSendContext, dst: [u8; 32]) {
+    let (Some(cache), Some(reg), Some(notify)) = (
+        ctx.route_cache.as_ref(),
+        ctx.session_tx_registry.as_ref(),
+        ctx.route_updated.as_ref(),
+    ) else {
+        return;
+    };
+    if rlock!(cache).lookup(&dst).is_some() || route_recently_missed(&ctx.local_node_id, &dst) {
+        return;
+    }
+    let key = (ctx.local_node_id, dst);
+    {
+        let mut probes = lock!(MEDIA_ROUTE_PROBES);
+        if probes.len() >= 128 || !probes.insert(key) {
+            return;
+        }
+    }
+    let probe = MediaRouteProbe(key);
+    let cache = Arc::clone(cache);
+    let reg = Arc::clone(reg);
+    let notify = Arc::clone(notify);
+    let pending = ctx.pending_recursive.clone();
+    tokio::spawn(async move {
+        let _probe = probe;
+        let _ = try_lookup_or_discover(
+            &dst,
+            &key.0,
+            Some(&cache),
+            Some(reg.as_ref()),
+            Some(&notify),
+            None, // the call cipher already sealed the packet
+            pending.as_deref(),
+        )
+        .await;
+    });
+}
+
 fn route_recently_missed(local: &[u8; 32], dst: &[u8; 32]) -> bool {
     ROUTE_MISSES
         .lock()
@@ -1192,22 +1244,9 @@ pub(crate) async fn handle_ipc_send(
                 }
             } else if relay_realtime {
                 if relay_media_sealed {
-                    // The media peer is a concrete device. Discover its signed
-                    // route once before choosing a relay; XOR proximity alone
-                    // says nothing about whether that relay can reach it.
-                    // Media has its own call cipher, so no ML-KEM lookup is
-                    // needed. Cached routes take the immediate path, and a
-                    // failed probe is throttled by the shared miss cache.
-                    let _ = try_lookup_or_discover(
-                        &send.dst_node_id,
-                        local_node_id,
-                        route_cache,
-                        session_tx_registry,
-                        route_updated,
-                        None,
-                        ctx.pending_recursive.as_deref(),
-                    )
-                    .await;
+                    // Use the current relay immediately. A discovered route
+                    // improves subsequent packets without pausing this one.
+                    warm_media_route(ctx, send.dst_node_id);
                 }
                 relay_hops_to_try(&send.dst_node_id, route_cache, reg)
             } else {
@@ -3118,7 +3157,7 @@ mod ratchet_send_tests {
     }
 
     #[tokio::test]
-    async fn relay_media_uses_discovered_route_instead_of_xor_neighbour() {
+    async fn relay_media_uses_a_discovered_route_without_holding_the_first_packet() {
         use std::time::Duration;
         const DEVICE: [u8; 32] = [0xB8; 32];
         const NEARBY: [u8; 32] = [0xB9; 32];
@@ -3142,7 +3181,11 @@ mod ratchet_send_tests {
         handle_ipc_send(&mut SendReply::Inline(&mut wh), &body, &ctx)
             .await
             .expect("send");
+        fx.taken(); // the first packet uses the available fallback immediately
         discovered.await.unwrap();
+        handle_ipc_send(&mut SendReply::Inline(&mut wh), &body, &ctx)
+            .await
+            .expect("send after discovery");
         let forwards: Vec<_> = fx
             .taken()
             .into_iter()
@@ -3159,6 +3202,49 @@ mod ratchet_send_tests {
             veil_proto::delivery::ForwardPayload::decode(&forwards[0].1[veil_proto::HEADER_SIZE..])
                 .unwrap();
         assert_eq!(fwd.envelope.payload, sealed);
+    }
+
+    #[tokio::test]
+    async fn stalled_media_discovery_does_not_hold_packets_or_start_a_query_per_packet() {
+        use std::time::Duration;
+        const DEVICE: [u8; 32] = [0xB7; 32];
+        let fx = fixture(vec![RELAY]);
+        let mut ctx = fx.ctx(false);
+        ctx.route_updated = Some(Arc::new(tokio::sync::Notify::new()));
+        let sealed = veil_proto::ipc::RELAY_MEDIA_SEALED_MAGIC.to_vec();
+        let mut body = payload_to(DEVICE, &sealed);
+        let flags = veil_proto::ipc::IPC_SEND_FLAG_RELAY_REALTIME
+            | veil_proto::ipc::IPC_SEND_FLAG_RELAY_MEDIA_SEALED;
+        body[100..104].copy_from_slice(&flags.to_be_bytes());
+        let mut wh = sink().await;
+        tokio::time::timeout(Duration::from_millis(100), async {
+            for _ in 0..25 {
+                handle_ipc_send(&mut SendReply::Inline(&mut wh), &body, &ctx)
+                    .await
+                    .unwrap();
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("media cannot wait for the half-second discovery timeout");
+        let frames = fx.taken();
+        let forwards = frames
+            .iter()
+            .filter(|(_, frame)| {
+                codec::decode_header(frame).is_ok_and(|h| h.family == FrameFamily::Delivery as u8)
+            })
+            .count();
+        let queries = frames
+            .iter()
+            .filter(|(_, frame)| {
+                codec::decode_header(frame).is_ok_and(|h| h.family == FrameFamily::Routing as u8)
+            })
+            .count();
+        assert_eq!(
+            forwards, 25,
+            "every packet leaves while discovery is pending"
+        );
+        assert_eq!(queries, 1, "one probe, not 25 parallel walks");
     }
 
     /// NO ROUTE AT ALL, only a live session to some relay: the send still goes,
