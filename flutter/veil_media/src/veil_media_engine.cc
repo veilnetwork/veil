@@ -163,6 +163,19 @@ webrtc::SdpAudioFormat VeilOpusSendFormat() {
 }
 
 #if defined(VEIL_MEDIA_HAVE_WEBRTC)
+// NetEq's default 200-packet buffer permits a 3-second target delay at our
+// 20-ms Opus cadence. Relay bursts on a cellular link made the receiver retain
+// over a second of audio even after packet delivery recovered. Keep enough
+// room for short bursts (600 ms), but bound the adaptive target to 450 ms
+// (NetEq uses at most 75% of the packet capacity) and let it shed excess delay
+// with fast time stretching. A longer outage should be concealed rather than
+// turning the rest of an interactive conversation into delayed playback.
+void configure_call_audio_receive(
+    webrtc::AudioReceiveStreamInterface::Config& config) {
+  config.jitter_buffer_max_packets = 30;
+  config.jitter_buffer_fast_accelerate = true;
+}
+
 constexpr int kVideoNackHistoryMs = 1000;
 // A 60-frame interval produced a full VP8 intra-frame burst every ~2 seconds
 // on the 30-fps physical cameras. Those bursts repeatedly filled the short
@@ -1660,6 +1673,7 @@ int veil_media_group_engine_add_peer(VeilGroupMediaEngine* engine,
     // failure path as a stream that failed to create.
     (void)run_on(ws->worker_tq.get(), [&]() {
       webrtc::AudioReceiveStreamInterface::Config rc;
+      configure_call_audio_receive(rc);
       rc.rtp.remote_ssrc = remote_ssrc;
       rc.rtcp_send_transport = peer->shim.get();
       rc.decoder_factory = webrtc::CreateBuiltinAudioDecoderFactory();
@@ -1793,6 +1807,7 @@ int veil_media_group_engine_start_audio(VeilGroupMediaEngine* engine) {
       GroupPeerState* peer = entry.second.get();
       if (peer->recv_stream) continue;
       webrtc::AudioReceiveStreamInterface::Config rc;
+      configure_call_audio_receive(rc);
       rc.rtp.remote_ssrc = peer->audio_ssrc;
       rc.rtcp_send_transport = peer->shim.get();
       rc.decoder_factory = webrtc::CreateBuiltinAudioDecoderFactory();
@@ -2281,6 +2296,7 @@ int veil_media_engine_start_audio(VeilMediaEngine* engine, int send, int recv) {
     }
     if (recv && ws->recv_stream == nullptr) {
       webrtc::AudioReceiveStreamInterface::Config rc;
+      configure_call_audio_receive(rc);
       rc.rtp.remote_ssrc = remote_ssrc;
       rc.rtcp_send_transport = ws->shim.get();
       rc.decoder_factory = webrtc::CreateBuiltinAudioDecoderFactory();
