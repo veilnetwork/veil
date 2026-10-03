@@ -1796,6 +1796,51 @@ fn to_peer_cert(cert: VerifiedMlkemCert) -> veil_types::VerifiedPeerCert {
 }
 
 impl MlKemEkResolver for DhtMlKemEkResolver {
+    fn resolve_device_certs_cached(
+        &self,
+        target: NodeIdBytes,
+    ) -> Vec<(NodeIdBytes, veil_types::VerifiedPeerCert)> {
+        let Some(doc) = self
+            .dht
+            .get_local(&IdentityDocument::dht_key(&target))
+            .and_then(|bytes| IdentityDocument::decode(&bytes).ok())
+        else {
+            return Vec::new();
+        };
+        if doc.node_id != target || verify_identity_document(&doc, unix_now()).is_err() {
+            return Vec::new();
+        }
+        let Some(reg) = self
+            .dht
+            .get_local(&InstanceRegistry::dht_key(&target))
+            .and_then(|bytes| InstanceRegistry::decode(&bytes).ok())
+        else {
+            return Vec::new();
+        };
+        if reg.node_id != target || !verify_instance_registry_sig(&reg, &doc) {
+            return Vec::new();
+        }
+        reg.instances
+            .iter()
+            .filter_map(|entry| {
+                let key = doc
+                    .identity_keys
+                    .get(entry.bound_identity_key_idx as usize)?;
+                if key.valid_from_unix > unix_now()
+                    || key.valid_until_unix < unix_now()
+                    || doc
+                        .revoked_devices
+                        .iter()
+                        .any(|r| r.device_id == key.device_id)
+                {
+                    return None;
+                }
+                let cert = self.cached_cert_for_instance(target, entry.instance_id)?;
+                Some((key.device_id, to_peer_cert(cert)))
+            })
+            .collect()
+    }
+
     fn resolve_cert_cached(
         &self,
         target_node_id: NodeIdBytes,
@@ -2401,6 +2446,59 @@ mod tests {
 
         assert_eq!(resolver.resolve_ek_cached(target), Some(vec![0x42; 32]));
         assert_eq!(resolver.resolve_ek_cached([8u8; 32]), None);
+    }
+
+    #[test]
+    fn resolve_device_certs_cached_verifies_the_device_address_and_registry() {
+        use crate::mlkem_cert_store::fixture::signer;
+        use ed25519_dalek::{Signer as _, SigningKey};
+        let seed = 0x29;
+        let mut s = signer(seed);
+        let target = s.doc.node_id;
+        let device = s.doc.identity_keys[0].device_id;
+        let instance: [u8; 16] = device[..16].try_into().unwrap();
+        let now = unix_now();
+        let sk = SigningKey::from_bytes(&[seed ^ 0xff; 32]);
+        s.doc.issued_at_unix = now - 60;
+        s.doc.valid_until_unix = now + 86_400;
+        let mut doc_msg = veil_proto::identity_document::DOC_SIG_CONTEXT.to_vec();
+        doc_msg.extend_from_slice(&s.doc.canonical_signing_bytes());
+        s.doc.document_sig = sk.sign(&doc_msg).to_bytes().to_vec();
+        IdentityDocument::decode(&s.doc.encode()).expect("fixture fits the wire freshness window");
+        verify_identity_document(&s.doc, now).expect("valid fixture document");
+        let dht = Arc::new(KademliaService::new([1u8; 32]));
+        dht.store_local(IdentityDocument::dht_key(&target), s.doc.encode());
+        let mut registry = InstanceRegistry {
+            node_id: target,
+            reg_version: 1,
+            signing_identity_key_idx: 0,
+            instances: vec![veil_proto::instance_registry::InstanceEntry {
+                instance_id: instance,
+                bound_identity_key_idx: 0,
+                label: String::new(),
+                last_seen_unix_ms: 0,
+            }],
+            sig: Vec::new(),
+        };
+        let mut msg = INSTANCE_REGISTRY_SIG_CONTEXT.to_vec();
+        msg.extend_from_slice(&registry.canonical_signing_bytes());
+        registry.sig = sk.sign(&msg).to_bytes().to_vec();
+        assert!(verify_instance_registry_sig(&registry, &s.doc));
+        dht.store_local(InstanceRegistry::dht_key(&target), registry.encode());
+        let cert = s.cert(instance, now - 60, now + 3600, 1);
+        verify_mlkem_cert(&cert, &s.doc, now).expect("valid fixture certificate");
+        dht.store_local(MlKemKeyCert::dht_key(&target, &instance), cert.encode());
+        let resolver = make_test_resolver(Arc::clone(&dht));
+        let pairs = resolver.resolve_device_certs_cached(target);
+        assert_eq!(pairs.len(), 1);
+        assert_eq!(pairs[0].0, device);
+        assert_eq!(pairs[0].1.instance_id, instance);
+        registry.sig[0] ^= 1;
+        dht.store_local(InstanceRegistry::dht_key(&target), registry.encode());
+        assert!(
+            resolver.resolve_device_certs_cached(target).is_empty(),
+            "a cached certificate does not authorize an unsigned device mapping"
+        );
     }
 
     // The whole certificate, not just the key inside it: key agreement needs
