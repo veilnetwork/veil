@@ -1159,6 +1159,17 @@ impl NodeRuntime {
                 ))),
             }),
             local_node_id: reload_node_id,
+            local_recipient: Some(Arc::new({
+                let identity = self.identity.sovereign_identity.clone();
+                move || {
+                    identity.get().map(|sov| {
+                        veil_proto::recipient::Recipient::specific(
+                            *sov.node_id(),
+                            sov.active_instance_id(),
+                        )
+                    })
+                }
+            })),
             session_tx_registry: Some(Arc::clone(&self.session_tx_registry)),
             // Preserve the existing rendezvous weak ref across reload so
             // in-flight handle_request tasks keep upgrading to the same
