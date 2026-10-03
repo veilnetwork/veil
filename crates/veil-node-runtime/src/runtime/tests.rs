@@ -4614,7 +4614,7 @@ async fn a_reply_circuit_already_gone_is_not_torn_down_twice() {
 /// The next `RelayChain::<want>` frame handed to a registered session, skipping
 /// whatever else the runtime sends a fresh session on its own.
 async fn next_relay_chain_frame(
-    rx: &mut tokio::sync::mpsc::Receiver<veil_session::PriorityFrame>,
+    rx: &mut veil_session::FrameOutbox,
     want: veil_proto::family::RelayChainMsg,
 ) -> Vec<u8> {
     loop {

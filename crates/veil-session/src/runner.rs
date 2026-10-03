@@ -128,7 +128,7 @@ pub enum NextInput {
 /// handles all optional-combination cases without duplication.
 async fn await_next_input(
     read_half: &mut tokio::io::ReadHalf<BoxIoStream>,
-    outbox: Option<&mut mpsc::Receiver<PriorityFrame>>,
+    outbox: Option<&mut crate::FrameOutbox>,
     rpc_outbox: Option<&mut mpsc::Receiver<OutboxRequest>>,
     swap_rx: Option<&mut mpsc::Receiver<BoxIoStream>>,
     sleep_until: Option<tokio::time::Instant>,
@@ -192,6 +192,15 @@ struct RealtimeDatagramLane {
     logged_send_kinds: u8,
     congestion_drops: u64,
     last_congestion_log: std::time::Instant,
+}
+
+/// Leave room for a local latency-sensitive producer before admitting ordinary
+/// throughput traffic. The choice is process-local; forwarded user packets at
+/// a relay all have INTERACTIVE priority and receive identical treatment.
+fn local_datagram_fits(priority: u8, wire_len: usize, available: usize) -> bool {
+    const LOCAL_RESERVE_BYTES: usize = 4096;
+    priority < veil_proto::priority::BULK
+        || wire_len.saturating_add(LOCAL_RESERVE_BYTES) <= available
 }
 
 /// Tokio join handles detach when dropped; realtime receivers must instead be
@@ -687,7 +696,7 @@ pub struct SessionRunner {
     pub crypto: CryptoState,
     /// Outbox — priority-tagged frames queued by the runtime to be sent to this
     /// peer. `None` if the runtime does not use the outbox mechanism.
-    pub outbox: Option<mpsc::Receiver<PriorityFrame>>,
+    pub outbox: Option<crate::FrameOutbox>,
     /// RPC request outbox — carries pre-encoded frames with response oneshots.
     /// The runner writes each frame to the wire, then fulfils the oneshot
     /// when a matching `FIND_NODE_RESPONSE` arrives.
@@ -1846,7 +1855,7 @@ impl SessionRunner {
     /// connection FINs cleanly, and banned peers stop receiving frames.
     fn drain_outbox_into_pq(
         &self,
-        outbox: &mut mpsc::Receiver<crate::tx_registry::PriorityFrame>,
+        outbox: &mut crate::FrameOutbox,
         pq: &mut crate::priority_queue::PriorityQueue,
         timers: &mut crate::timers::SessionTimers,
     ) -> std::ops::ControlFlow<()> {
@@ -3794,6 +3803,18 @@ impl SessionRunner {
                                 }
                             };
                         let planned_wire_len = datagrams.iter().map(Vec::len).sum::<usize>();
+                        if !local_datagram_fits(
+                            outgoing_priority,
+                            planned_wire_len,
+                            lane.handle.send_buffer_space(),
+                        ) {
+                            // Do not let a new local bulk cell make Quinn evict
+                            // older queued latency-sensitive cells. This whole
+                            // loss-tolerant cell is dropped before any fragment
+                            // enters the transport; no delayed replay follows.
+                            datagram_drained += 1;
+                            continue;
+                        }
                         if !self.dispatcher.allow_outbound_bandwidth(planned_wire_len) {
                             datagram_drained += 1;
                             continue;
@@ -5178,6 +5199,22 @@ mod m1_empty_frame_aead_tests {
 #[cfg(test)]
 mod realtime_lane_frame_tests {
     use super::*;
+
+    #[test]
+    fn local_bulk_datagrams_cannot_consume_the_reserved_transport_space() {
+        use veil_proto::priority::{BULK, INTERACTIVE, REALTIME};
+        assert!(!super::local_datagram_fits(BULK, 1300, 4096));
+        assert!(super::local_datagram_fits(BULK, 1300, 5396));
+        assert!(super::local_datagram_fits(REALTIME, 200, 4096));
+        // Relayed user traffic has the same neutral queue class for every
+        // application; it never receives the endpoint's content-dependent choice.
+        assert!(super::local_datagram_fits(INTERACTIVE, 1300, 4096));
+        assert!(!super::local_datagram_fits(
+            BULK,
+            usize::MAX,
+            usize::MAX - 1
+        ));
+    }
     use veil_proto::{
         delivery::{DeliveryEnvelope, FORWARD_REALTIME_MAX_PAYLOAD, ForwardPayload},
         recipient::Recipient,

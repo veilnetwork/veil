@@ -5024,7 +5024,7 @@ async fn auto_trigger_fires_on_primary_write_error() {
             peer_mlkem_keys: None,
             per_session_mlkem_dk: None,
         },
-        outbox: Some(outbox_rx),
+        outbox: Some(outbox_rx.into()),
         rpc_outbox: None,
         keepalive_interval: std::time::Duration::ZERO,
         idle_timeout: std::time::Duration::ZERO,
@@ -5220,7 +5220,7 @@ async fn rx_stall_fires_proactive_trigger_before_idle_timeout() {
             peer_mlkem_keys: None,
             per_session_mlkem_dk: None,
         },
-        outbox: Some(outbox_rx),
+        outbox: Some(outbox_rx.into()),
         rpc_outbox: None,
         // Very short timeouts so the test completes in ~100ms
         // instead of the default 90s. keepalive disabled so the
@@ -5357,7 +5357,7 @@ async fn keepalive_probe_timeout_fires_trigger_when_no_ack() {
             peer_mlkem_keys: None,
             per_session_mlkem_dk: None,
         },
-        outbox: Some(outbox_rx),
+        outbox: Some(outbox_rx.into()),
         rpc_outbox: None,
         // keepalive = 50ms → probe_timeout = 100ms
         // idle_timeout = 5s keeps rx_stall out of the picture.
@@ -6508,7 +6508,7 @@ fn make_mobility_blackhole_runner(outbox_rx: mpsc::Receiver<PriorityFrame>) -> S
             peer_mlkem_keys: None,
             per_session_mlkem_dk: None,
         },
-        outbox: Some(outbox_rx),
+        outbox: Some(outbox_rx.into()),
         rpc_outbox: None,
         // PRODUCTION defaults on purpose: the point is the real-world
         // detection latency, not a scaled-down toy timeline.

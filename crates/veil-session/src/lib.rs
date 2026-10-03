@@ -19,6 +19,7 @@ pub mod battery_adjusted_keepalive;
 pub mod cover_traffic;
 pub mod dispatcher_sink;
 pub mod frame_diag;
+pub mod frame_outbox;
 pub mod fsm;
 pub mod glue;
 pub mod handoff;
@@ -55,6 +56,7 @@ pub mod write_error_tracker;
 // transcript hash; wiring the FSM into it as a second barrier is a documented
 // deferral (see `handshake.rs`). Kept public so downstream test/sim code can
 // reuse the model.
+pub use frame_outbox::{FrameOutbox, FrameSender};
 pub use fsm::{SessionFsm, SessionHandshakeData, SessionPhase};
 pub use manager::{RemoteRole, SessionEntry, SessionId, SessionRegistry};
 pub use outbox::SessionOutbox;
