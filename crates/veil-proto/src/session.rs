@@ -368,6 +368,9 @@ pub mod cap_flags {
     /// the first rekey, which is why the capability exists rather than the
     /// behaviour simply changing (report12 V-M12).
     pub const SUPPORTS_REALTIME_REKEY: u8 = 1 << 6;
+    /// Peer understands opaque independent datagram channels (VDF1). The
+    /// identifier carries no application role or relay scheduling priority.
+    pub const SUPPORTS_DATAGRAM_FLOWS: u8 = 1 << 7;
     /// Peer asks NOT to be used as a DHT service candidate: do not pick it
     /// as a store/replication target, do not route walks through it, and do
     /// not return it to walkers as a closer node. It remains fully REACHABLE
@@ -516,6 +519,14 @@ impl CapabilitiesPayload {
     /// other unable to open anything past the first rekey.
     pub fn realtime_rekey_negotiated(&self, peer: &CapabilitiesPayload) -> bool {
         self.supports_realtime_rekey() && peer.supports_realtime_rekey()
+    }
+
+    pub fn supports_datagram_flows(&self) -> bool {
+        self.supports_realtime_datagrams() && self.flags & cap_flags::SUPPORTS_DATAGRAM_FLOWS != 0
+    }
+
+    pub fn datagram_flows_negotiated(&self, peer: &CapabilitiesPayload) -> bool {
+        self.supports_datagram_flows() && peer.supports_datagram_flows()
     }
 }
 
@@ -2314,6 +2325,30 @@ mod tests {
         assert!(modern.realtime_rekey_negotiated(&legacy));
     }
 
+    #[test]
+    fn opaque_datagram_flows_require_both_peers_and_a_datagram_lane() {
+        let mut modern = CapabilitiesPayload::from_node_role(veil_types::NodeRole::Core);
+        let mut legacy = modern.clone();
+        modern.flags |= cap_flags::SUPPORTS_DATAGRAM_FLOWS;
+        assert!(
+            !modern.supports_datagram_flows(),
+            "a channel flag alone cannot enable datagrams"
+        );
+        modern.flags |= cap_flags::SUPPORTS_REALTIME_DATAGRAMS;
+        legacy.flags |= cap_flags::SUPPORTS_REALTIME_DATAGRAMS;
+        assert!(modern.supports_datagram_flows());
+        assert!(!modern.datagram_flows_negotiated(&legacy));
+        assert!(!legacy.datagram_flows_negotiated(&modern));
+        legacy.flags |= cap_flags::SUPPORTS_DATAGRAM_FLOWS;
+        assert!(modern.datagram_flows_negotiated(&legacy));
+        let decoded = CapabilitiesPayload::decode(&modern.encode()).unwrap();
+        assert!(decoded.datagram_flows_negotiated(&legacy));
+        assert_eq!(
+            decoded.flags, modern.flags,
+            "the high bit survives serialization"
+        );
+    }
+
     /// It occupies its own bit and disturbs no other flag's meaning.
     #[test]
     fn the_no_service_bit_does_not_collide() {
@@ -2324,6 +2359,7 @@ mod tests {
             cap_flags::SUPPORTS_HYBRID_KEX,
             cap_flags::SUPPORTS_REALTIME_DATAGRAMS,
             cap_flags::SUPPORTS_REALTIME_REKEY,
+            cap_flags::SUPPORTS_DATAGRAM_FLOWS,
         ] {
             assert_eq!(
                 other & cap_flags::NO_DHT_SERVICE,

@@ -89,6 +89,8 @@ pub struct RemoteHandshakeInfo {
     /// Both sides must, or the one that does leaves the other unable to open
     /// anything past the first rekey (report12 V-M12).
     pub supports_realtime_rekey: bool,
+    /// Negotiated opaque datagram channels, with no application-role labels.
+    pub supports_datagram_flows: bool,
     /// Bounded UDP reflector port advertised by this authenticated peer.
     /// The runtime combines it with transport metadata only after all session
     /// admission gates pass.
@@ -850,6 +852,7 @@ pub async fn register_connection_session(
                             .remote_capabilities
                             .supports_realtime_datagrams(),
                         supports_realtime_rekey: r.remote_capabilities.supports_realtime_rekey(),
+                        supports_datagram_flows: r.remote_capabilities.supports_datagram_flows(),
                         sovereign_node_id,
                         udp_reflector_port,
                         shared_udp_reflectors,
@@ -1410,6 +1413,7 @@ pub async fn register_connection_session(
             .map(|handle| veil_session::runner::RealtimeLaneOffer {
                 handle,
                 peer_rotates: remote_identity.supports_realtime_rekey,
+                peer_flows: remote_identity.supports_datagram_flows,
             }),
         metrics: runtime.metrics.clone(),
         peer_id: remote_identity.node_id,
