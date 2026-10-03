@@ -165,6 +165,22 @@ pub struct HopAttrs {
 }
 
 impl FrameDispatcher {
+    fn is_local_delivery_recipient(&self, recipient: &veil_proto::recipient::Recipient) -> bool {
+        use veil_proto::recipient::InstanceTag;
+        let sovereign = self.local_recipient.as_ref().and_then(|current| current());
+        if recipient.node_id != self.local_node_id
+            && sovereign.as_ref().map(|r| r.node_id) != Some(recipient.node_id)
+        {
+            return false;
+        }
+        match recipient.instance_tag {
+            InstanceTag::Any | InstanceTag::All => true,
+            InstanceTag::Specific(instance) => {
+                sovereign.is_some_and(|r| r.instance_tag == InstanceTag::Specific(instance))
+            }
+        }
+    }
+
     /// resolve a sovereign [`Recipient`](veil_proto::recipient::Recipient)
     /// (`node_id` + `InstanceTag`) into the transport-level
     /// peer_ids the dispatcher should forward to, via the wired
@@ -1428,7 +1444,7 @@ impl FrameDispatcher {
             return DispatchResult::Violation("Forward: zero recipient_node_id".into());
         }
 
-        if payload.envelope.recipient_node_id() == self.local_node_id {
+        if self.is_local_delivery_recipient(&payload.envelope.recipient) {
             self.deliver_forward_locally(payload, peer_id);
             return DispatchResult::NoResponse;
         }
@@ -1641,9 +1657,10 @@ impl FrameDispatcher {
         // device that offered them) lands on whichever sibling owns the
         // identity's rendezvous slots: measured on the stand, every 3 MB pull
         // from a two-device identity went to the sibling without the file. The
-        // envelope's device is mapped to that identity by `ratchet_peer_of`, so
-        // at worst it names another device of the same identity. A hint for
-        // replies and routing, never for authorization.
+        // envelope's device is a hint for replies and routing, never for
+        // authorization. The ratchet proves the identity and instance inside
+        // its ciphertext; the outer transport address can be rewritten by a
+        // relay and must not be treated as that proof.
         let origin_device = decrypted_app_sender
             .filter(|identity| *identity != deliver_sender_node_id)
             .map(|_| deliver_sender_node_id);
@@ -1824,7 +1841,14 @@ impl FrameDispatcher {
             // against strangers, and proving one is exactly what an attacker
             // varying claimed ids cannot do.
             // The identity the sender sealed under — see [`Self::ratchet_peer_of`].
-            let ratchet_peer = self.ratchet_peer_of(envelope.sender_node_id);
+            let known_peer = self.ratchet_peer_of(envelope.sender_node_id);
+            let ratchet_peer = if known_peer != envelope.sender_node_id {
+                known_peer
+            } else {
+                ratchet
+                    .peer_identity_for_payload(&envelope.payload, veil_util::unix_secs_now_u64())
+                    .unwrap_or(known_peer)
+            };
             let proven = ratchet
                 .peer_entry_authenticated(&ratchet_peer)
                 .unwrap_or(false);
@@ -1882,9 +1906,11 @@ impl FrameDispatcher {
         // META_E2E_MARKER (0xE3): onion — sender identity is inside ciphertext.
         if first_byte == Some(veil_proto::META_E2E_MARKER) {
             for dk_seed in dk_seeds {
-                let Ok((snd, src_app, app, eid, plain)) =
-                    veil_e2e::meta_decrypt(dk_seed, &self.local_node_id, &envelope.payload)
-                else {
+                let Ok((snd, src_app, app, eid, plain)) = veil_e2e::meta_decrypt(
+                    dk_seed,
+                    &envelope.recipient_node_id(),
+                    &envelope.payload,
+                ) else {
                     continue;
                 };
                 *deliver_sender_node_id = snd;
@@ -1921,7 +1947,7 @@ impl FrameDispatcher {
                 if let Ok((plain, ack_key)) = veil_e2e::decrypt_with_ack(
                     dk_seed,
                     &envelope.sender_node_id,
-                    &self.local_node_id,
+                    &envelope.recipient_node_id(),
                     &e2e_env,
                 ) {
                     return Some(DecryptedForward::unproven(plain, ack_key));
@@ -2800,6 +2826,54 @@ mod tests {
             endpoint_rx.try_recv().is_err(),
             "replayed terminal Forward must NOT produce a second delivery",
         );
+    }
+
+    #[test]
+    fn sovereign_forward_delivers_to_identity_and_respects_instance_and_reload() {
+        use std::sync::Arc;
+        use veil_proto::recipient::Recipient;
+        use veil_util::wlock;
+        let identity = XV01_RECIPIENT;
+        let device = [0xD1; 32];
+        let instance = [0xD2; 16];
+        let (mut disp, _handle, mut rx) = xv01_dispatcher();
+        disp.local_node_id = device;
+        let current = Arc::new(std::sync::RwLock::new(Some(Recipient::specific(
+            identity, instance,
+        ))));
+        disp.local_recipient = Some(Arc::new({
+            let current = Arc::clone(&current);
+            move || *rlock!(current)
+        }));
+        let (ek, dk) = veil_e2e::generate_keypair();
+        disp.crypto = Arc::new(crate::CryptoContext {
+            mlkem_keys: Arc::new(veil_e2e::MlKemSeedRing::new(0, dk, ek)),
+            ..(*disp.crypto).clone()
+        });
+        // The encryption binds the sovereign recipient, not the transport device.
+        let sender = [0xA1; 32];
+        let plain = b"identity-addressed call control";
+        let sealed = veil_e2e::encrypt(&ek, &sender, &identity, plain).unwrap();
+        let mut payload = vec![veil_proto::E2E_MARKER];
+        payload.extend_from_slice(&sealed.encode());
+        let (hdr, body) = xv01_terminal_frame(sender, 1, [0x81; 32], payload);
+        disp.dispatch(&hdr, &body, [0xEE; 32]);
+        assert_eq!(xv01_take_delivery(&mut rx).2, plain);
+        disp.dispatch(&hdr, &body, [0xEE; 32]);
+        assert!(
+            rx.try_recv().is_err(),
+            "relay duplicates must stay deduplicated"
+        );
+        assert!(disp.is_local_delivery_recipient(&Recipient::any(identity)));
+        assert!(disp.is_local_delivery_recipient(&Recipient::all(identity)));
+        assert!(disp.is_local_delivery_recipient(&Recipient::specific(identity, instance)));
+        assert!(!disp.is_local_delivery_recipient(&Recipient::specific(identity, [0xD3; 16])));
+        assert!(!disp.is_local_delivery_recipient(&Recipient::any([0xF1; 32])));
+        // Promoting or changing the document updates the already-running dispatcher.
+        *wlock!(current) = Some(Recipient::specific([0xF1; 32], [0xF2; 16]));
+        assert!(!disp.is_local_delivery_recipient(&Recipient::any(identity)));
+        assert!(disp.is_local_delivery_recipient(&Recipient::specific([0xF1; 32], [0xF2; 16])));
+        assert!(disp.is_local_delivery_recipient(&Recipient::any(device)));
     }
 
     /// audit cycle-8 F9 — the replay-critical content_id dedup
@@ -4260,10 +4334,10 @@ mod ratchet_terminal_tests {
             }
         };
 
-        assert!(
-            open_with(false).is_none(),
-            "control: keyed by the device, the frame does not open"
-        );
+        let (src, provenance, _, _) =
+            open_with(false).expect("contact certificate maps relayed device");
+        assert_eq!(src, ALICE);
+        assert_eq!(provenance, SenderProvenance::Signed);
         let (src, provenance, data, origin_device) = open_with(true).expect("delivered");
         assert_eq!(
             src, ALICE,
@@ -4274,6 +4348,43 @@ mod ratchet_terminal_tests {
         // ...and, as on a direct session, which device sent it: the device is
         // who holds whatever the message offers (a file's bytes).
         assert_eq!(origin_device, Some(ALICE_DEVICE));
+    }
+
+    #[test]
+    fn relayed_sender_lookup_refuses_expired_and_ambiguous_certificates() {
+        let (alice, bob) = (party(ALICE, 0xA7), party(BOB, 0xB7));
+        let payload = seal(&alice, &bob, b"lookup is not authentication");
+        let now = veil_util::unix_secs_now_u64();
+        assert_eq!(bob.runtime.peer_identity_for_payload(&payload, now), None);
+        learn(&bob, &alice);
+        assert_eq!(
+            bob.runtime.peer_identity_for_payload(&payload, now),
+            Some(ALICE)
+        );
+        let mut cache = wlock!(bob.runtime.peer_ratchet_keys);
+        cache
+            .entry([0xFA; 32])
+            .or_default()
+            .remember(alice.instance_id, [0xFB; 32], now);
+        drop(cache);
+        assert_eq!(
+            bob.runtime.peer_identity_for_payload(&payload, now),
+            None,
+            "ambiguous instance cannot pick an identity"
+        );
+        assert_eq!(
+            bob.runtime.peer_identity_for_payload(&payload, now + 1),
+            Some(ALICE),
+            "expired certificate cannot supply a mapping"
+        );
+        wlock!(bob.runtime.peer_ratchet_keys)
+            .get_mut(&ALICE)
+            .unwrap()
+            .remember(alice.instance_id, alice.ring.current_ratchet_pk(), now);
+        assert_eq!(
+            bob.runtime.peer_identity_for_payload(&payload, now + 1),
+            None
+        );
     }
 
     /// A frame the identity sent under its own id names no separate device.

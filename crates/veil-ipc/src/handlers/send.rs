@@ -542,6 +542,7 @@ async fn try_ratchet_seal(
     ctx: &IpcSendContext,
     dst_node_id: &[u8; 32],
     data: &[u8],
+    cached_only: bool,
 ) -> Option<(Vec<u8>, [u8; 32])> {
     let ratchet = ctx.ratchet.as_ref()?;
     // Cheap gate before anything expensive: no device identity, no ratchet.
@@ -597,6 +598,7 @@ async fn try_ratchet_seal(
     let paired = match session_instance {
         Some(instance) => match resolver.resolve_cert_for_instance_cached(cert_key, instance) {
             Some(c) => Some(c),
+            None if cached_only => None,
             None => resolver.resolve_cert_for_instance(cert_key, instance).await,
         },
         // No live session, or a legacy handshake that proved no instance:
@@ -619,6 +621,7 @@ async fn try_ratchet_seal(
         Some(c) => c,
         None => match resolver.resolve_cert_cached(cert_key) {
             Some(c) => c,
+            None if cached_only => return None,
             None => resolver.resolve_cert(cert_key).await?,
         },
     };
@@ -854,13 +857,14 @@ pub(crate) async fn handle_ipc_send(
     //   supposed to work. A ratchet is a named two-party object; running one
     //   would put both device identities in front of the recipient and destroy
     //   the property the path exists for.
-    // * `relay_realtime` / `relay_control_compat` — call media and call
-    //   signalling, which are already sealed under their own per-call keys and
-    //   cannot afford a certificate resolve on the packet path.
+    // * `relay_wire_realtime` — call media is sealed under per-call keys.
+    //   Compatibility call control needs ratchet origin authentication too:
+    //   an ML-KEM-only offer is a claim and the app correctly refuses it.
+    //   That lane uses only cached certificates so it never waits for DHT.
     // * `relay_media_sealed` — already authenticated and encrypted end to end
     //   by the media codec; the whole point of that flag is to pass the cell
     //   through untouched.
-    let ratchet_ok = !send.anonymous && !relay_realtime && !relay_media_sealed;
+    let ratchet_ok = !send.anonymous && !relay_wire_realtime && !relay_media_sealed;
     let remote = send.dst_node_id != *local_node_id;
 
     // THE PATH BEFORE THE SEAL. A ratchet seal spends a step of the sending
@@ -898,16 +902,20 @@ pub(crate) async fn handle_ipc_send(
         && !send.my_other_devices
         && let Some(reg) = session_tx_registry
     {
-        let discovered = try_lookup_or_discover(
-            &send.dst_node_id,
-            local_node_id,
-            route_cache,
-            session_tx_registry,
-            route_updated,
-            peer_mlkem_keys,
-            ctx.pending_recursive.as_deref(),
-        )
-        .await;
+        let discovered = if relay_control_compat {
+            None
+        } else {
+            try_lookup_or_discover(
+                &send.dst_node_id,
+                local_node_id,
+                route_cache,
+                session_tx_registry,
+                route_updated,
+                peer_mlkem_keys,
+                ctx.pending_recursive.as_deref(),
+            )
+            .await
+        };
         // Tentatively sealed: the ratchet is about to seal it. If it then does
         // not, the list is rebuilt below without the live-session tail.
         let hops = ordinary_relay_hops(discovered, &send.dst_node_id, route_cache, reg, true);
@@ -956,7 +964,7 @@ pub(crate) async fn handle_ipc_send(
         timing.plan_ms.set(plan_started.elapsed().as_millis());
         let seal_started = std::time::Instant::now();
         for device in &devices {
-            let sealed = try_ratchet_seal(ctx, device, &send.data).await;
+            let sealed = try_ratchet_seal(ctx, device, &send.data, false).await;
             // A copy sealed for another instance is not handed to this
             // device: it could only refuse it. The seal follows the session's
             // proven pairing when there is one; in the first seconds of a
@@ -995,7 +1003,7 @@ pub(crate) async fn handle_ipc_send(
     }
     let seal_started = std::time::Instant::now();
     let sealed = if ratchet_ok && remote {
-        try_ratchet_seal(ctx, &send.dst_node_id, &send.data).await
+        try_ratchet_seal(ctx, &send.dst_node_id, &send.data, relay_control_compat).await
     } else {
         None
     };
@@ -1106,6 +1114,24 @@ pub(crate) async fn handle_ipc_send(
                     ordinary_relay_hops(discovered, &send.dst_node_id, route_cache, reg, false)
                 }
             } else if relay_realtime {
+                if relay_media_sealed {
+                    // The media peer is a concrete device. Discover its signed
+                    // route once before choosing a relay; XOR proximity alone
+                    // says nothing about whether that relay can reach it.
+                    // Media has its own call cipher, so no ML-KEM lookup is
+                    // needed. Cached routes take the immediate path, and a
+                    // failed probe is throttled by the shared miss cache.
+                    let _ = try_lookup_or_discover(
+                        &send.dst_node_id,
+                        local_node_id,
+                        route_cache,
+                        session_tx_registry,
+                        route_updated,
+                        None,
+                        ctx.pending_recursive.as_deref(),
+                    )
+                    .await;
+                }
                 relay_hops_to_try(&send.dst_node_id, route_cache, reg)
             } else {
                 // Sealed below whichever way it goes: by the ratchet already
@@ -2924,6 +2950,82 @@ mod ratchet_send_tests {
             .expect("the peer opens it");
         assert_eq!(opened.plaintext, b"through a relay");
         assert!(opened.authenticated);
+    }
+
+    #[tokio::test]
+    async fn relay_call_control_proves_its_sender_without_route_discovery() {
+        let fx = fixture(vec![RELAY]);
+        wlock!(fx.route_cache).invalidate(&PEER);
+        let mut body = payload(false, b"call offer");
+        let flags = u32::from_be_bytes(body[100..104].try_into().unwrap())
+            | veil_proto::ipc::IPC_SEND_FLAG_RELAY_CONTROL_COMPAT;
+        body[100..104].copy_from_slice(&flags.to_be_bytes());
+        let mut wh = sink().await;
+        handle_ipc_send(&mut SendReply::Inline(&mut wh), &body, &fx.ctx(true))
+            .await
+            .expect("send");
+        let sent = fx.taken();
+        assert_eq!(
+            sent.len(),
+            1,
+            "control must not wait for or emit route discovery"
+        );
+        let fwd =
+            veil_proto::delivery::ForwardPayload::decode(&sent[0].1[veil_proto::HEADER_SIZE..])
+                .expect("forward");
+        let opened = fx
+            .peer
+            .open_payload(&ME, &fwd.envelope.payload, veil_util::unix_secs_now_u64())
+            .expect("opens");
+        assert_eq!(opened.plaintext, b"call offer");
+        assert!(
+            opened.authenticated,
+            "a relay offer needs origin proof, not only confidentiality"
+        );
+    }
+
+    #[tokio::test]
+    async fn relay_media_uses_discovered_route_instead_of_xor_neighbour() {
+        use std::time::Duration;
+        const DEVICE: [u8; 32] = [0xB8; 32];
+        const NEARBY: [u8; 32] = [0xB9; 32];
+        let fx = fixture(vec![NEARBY, RELAY]);
+        let mut ctx = fx.ctx(false);
+        ctx.peer_mlkem_keys = None; // call media needs no encapsulation certificate
+        let notify = Arc::new(tokio::sync::Notify::new());
+        ctx.route_updated = Some(Arc::clone(&notify));
+        let cache = Arc::clone(&fx.route_cache);
+        let discovered = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            wlock!(cache).insert(DEVICE, RELAY, 10_000, 2);
+            notify.notify_waiters();
+        });
+        let sealed = veil_proto::ipc::RELAY_MEDIA_SEALED_MAGIC.to_vec();
+        let mut body = payload_to(DEVICE, &sealed);
+        let flags = veil_proto::ipc::IPC_SEND_FLAG_RELAY_REALTIME
+            | veil_proto::ipc::IPC_SEND_FLAG_RELAY_MEDIA_SEALED;
+        body[100..104].copy_from_slice(&flags.to_be_bytes());
+        let mut wh = sink().await;
+        handle_ipc_send(&mut SendReply::Inline(&mut wh), &body, &ctx)
+            .await
+            .expect("send");
+        discovered.await.unwrap();
+        let forwards: Vec<_> = fx
+            .taken()
+            .into_iter()
+            .filter(|(_, frame)| {
+                veil_proto::codec::decode_header(frame).is_ok_and(|h| {
+                    h.family == veil_proto::family::FrameFamily::Delivery as u8
+                        && h.msg_type == veil_proto::family::DeliveryMsg::Forward as u16
+                })
+            })
+            .collect();
+        assert_eq!(forwards.len(), 1);
+        assert_eq!(forwards[0].0, RELAY, "XOR-near is not the reachable route");
+        let fwd =
+            veil_proto::delivery::ForwardPayload::decode(&forwards[0].1[veil_proto::HEADER_SIZE..])
+                .unwrap();
+        assert_eq!(fwd.envelope.payload, sealed);
     }
 
     /// NO ROUTE AT ALL, only a live session to some relay: the send still goes,

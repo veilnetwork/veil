@@ -816,6 +816,10 @@ pub type DecryptFailureLog =
 pub type SenderIdentityLookup =
     Arc<std::sync::RwLock<Option<Arc<dyn veil_types::SessionInstanceLookup>>>>;
 
+/// Read the identity and instance currently owned by this runtime.
+pub type LocalRecipientLookup =
+    Arc<dyn Fn() -> Option<veil_proto::recipient::Recipient> + Send + Sync>;
+
 /// Routes OVL1 frames from established sessions to the correct service plane.
 ///
 /// Clone-cheap: all contained handles are `Arc`.
@@ -862,6 +866,9 @@ pub struct FrameDispatcher {
     /// The local node's identity bytes. Used to decide whether a
     /// `DELIVERY_FORWARD` frame is addressed to us or must be relayed onward.
     pub local_node_id: [u8; 32],
+    /// Current sovereign identity and instance, read at delivery time so a
+    /// promotion or document reload cannot leave the receive address stale.
+    pub local_recipient: Option<LocalRecipientLookup>,
     /// Session outbox registry used for multi-hop relay. When present, a
     /// `DELIVERY_FORWARD` frame whose final recipient is reachable (directly
     /// or via `RouteCache`) is forwarded to the next hop instead of being
@@ -2027,6 +2034,7 @@ pub fn make_test_dispatcher(role: NodeRole) -> FrameDispatcher {
             outbound_bandwidth: Arc::new(Mutex::new(veil_abuse::BandwidthGate::new(0))),
         }),
         local_node_id: [0u8; 32],
+        local_recipient: None,
         session_tx_registry: None,
         rendezvous_weak: Arc::new(std::sync::Mutex::new(None)),
         session_registry: None,
@@ -2897,6 +2905,7 @@ mod tests {
                 outbound_bandwidth: Arc::new(Mutex::new(veil_abuse::BandwidthGate::new(0))),
             }),
             local_node_id: local_id,
+            local_recipient: None,
             session_tx_registry: Some(tx_registry),
             rendezvous_weak: Arc::new(std::sync::Mutex::new(None)),
             session_registry: None, // test dispatcher — sovereign routing bypassed

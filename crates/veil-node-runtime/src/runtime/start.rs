@@ -937,6 +937,17 @@ impl NodeRuntime {
                 ))),
             }),
             local_node_id,
+            local_recipient: Some(Arc::new({
+                let identity = sovereign_cell.clone();
+                move || {
+                    identity.get().map(|sov| {
+                        veil_proto::recipient::Recipient::specific(
+                            *sov.node_id(),
+                            sov.active_instance_id(),
+                        )
+                    })
+                }
+            })),
             session_tx_registry: Some(Arc::clone(&shared_session_tx_registry)),
             rendezvous_weak: Arc::new(std::sync::Mutex::new(None)),
             session_registry: Some(Arc::clone(&shared_session_registry)),
