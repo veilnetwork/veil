@@ -23,6 +23,7 @@
 //! change is the whole of this commit — every line below is the line that was
 //! there, and the tests that read this source moved with it.
 
+use futures::{StreamExt, stream::FuturesUnordered};
 use std::sync::Arc;
 use veil_util::lock;
 
@@ -87,6 +88,44 @@ pub(crate) fn next_failing_passes(failing_passes: u32, tried: usize, taken: usiz
     } else {
         0
     }
+}
+
+/// Probe remembered addresses without letting stale mobile/UDP endpoints hold
+/// up a reachable relay. Preserve the random candidate order and both pass
+/// budgets. Count successes together with in-flight probes, so we never exceed
+/// the peer budget or cancel a dial that has already claimed a peer-table row.
+async fn dial_remembered_concurrently<F, Fut>(
+    candidates: Vec<String>,
+    mut start: F,
+) -> (usize, usize)
+where
+    F: FnMut(String) -> Option<Fut>,
+    Fut: std::future::Future<Output = bool>,
+{
+    let mut candidates = candidates.into_iter();
+    let mut seen = std::collections::HashSet::new();
+    let mut pending = FuturesUnordered::new();
+    let mut tried = 0;
+    let mut taken = 0;
+    loop {
+        while taken + pending.len() < MAX_RENDEZVOUS_PEERS && tried < MAX_RENDEZVOUS_ATTEMPTS {
+            let Some(transport) = candidates.next() else {
+                break;
+            };
+            if !seen.insert(transport.clone()) {
+                continue;
+            }
+            if let Some(probe) = start(transport) {
+                pending.push(probe);
+                tried += 1;
+            }
+        }
+        let Some(met) = pending.next().await else {
+            break;
+        };
+        taken += usize::from(met);
+    }
+    (tried, taken)
 }
 
 impl NodeRuntime {
@@ -741,45 +780,47 @@ impl NodeRuntime {
                 }
                 let (_, my_address) =
                     current_announcement(&state, &announce_config, &my_pubkey, &my_nonce);
-                let mut taken = 0usize;
-                let mut tried = 0usize;
-                for transport in nearest_first(&MeetingProbe::fresh(), remembered.clone()) {
-                    if taken >= MAX_RENDEZVOUS_PEERS || tried >= MAX_RENDEZVOUS_ATTEMPTS {
-                        break;
-                    }
-                    let transport = transport.as_str();
-                    if rendezvous_address_is_self(my_address.as_ref(), transport) {
-                        continue;
+                let candidates = nearest_first(&MeetingProbe::fresh(), remembered.clone());
+                let (tried, taken) = dial_remembered_concurrently(candidates, |transport| {
+                    if rendezvous_address_is_self(my_address.as_ref(), &transport) {
+                        return None;
                     }
                     let known: Vec<PeerConfigEntry> =
                         lock_state(&state).peers.values().cloned().collect();
                     let live =
                         addresses_we_already_hold(&live_sessions, &access.discovered_peers_cache);
-                    if !rendezvous_address_is_new(&known, &live, transport) {
-                        continue;
+                    if !rendezvous_address_is_new(&known, &live, &transport) {
+                        return None;
                     }
                     if !rendezvous_dial_is_ours(
                         announce_self,
                         &access.local_node_id,
                         &access.discovered_peers_cache,
-                        transport,
+                        &transport,
                     ) {
-                        continue;
+                        return None;
                     }
-                    tried += 1;
-                    match dial_and_learn(&access, &state, transport, &shutdown_tx).await {
-                        Ok(node) => {
-                            taken += 1;
-                            logger.info(
-                                "remembered.met",
-                                format!("met {node} at {transport}, remembered from before"),
-                            );
+                    let access = &access;
+                    let state = &state;
+                    let shutdown_tx = &shutdown_tx;
+                    let logger = &logger;
+                    Some(async move {
+                        match dial_and_learn(access, state, &transport, shutdown_tx).await {
+                            Ok(node) => {
+                                logger.info(
+                                    "remembered.met",
+                                    format!("met {node} at {transport}, remembered from before"),
+                                );
+                                true
+                            }
+                            Err(e) => {
+                                logger.debug("remembered.unreachable", format!("{transport}: {e}"));
+                                false
+                            }
                         }
-                        Err(e) => {
-                            logger.debug("remembered.unreachable", format!("{transport}: {e}"))
-                        }
-                    }
-                }
+                    })
+                })
+                .await;
                 failing_passes = next_failing_passes(failing_passes, tried, taken);
                 logger.debug(
                     "remembered.pass",
@@ -1060,7 +1101,65 @@ impl NodeRuntime {
 
 #[cfg(test)]
 mod tests {
-    use super::{RENDEZVOUS_INTERVAL, next_failing_passes, remembered_retry_after};
+    use super::{
+        MAX_RENDEZVOUS_ATTEMPTS, MAX_RENDEZVOUS_PEERS, RENDEZVOUS_INTERVAL,
+        dial_remembered_concurrently, next_failing_passes, remembered_retry_after,
+    };
+
+    #[tokio::test]
+    async fn a_reachable_remembered_relay_does_not_wait_for_stale_udp_addresses() {
+        let (met, wait_for_relay) = tokio::sync::watch::channel(false);
+        let probes = dial_remembered_concurrently(
+            ["stale1", "stale1", "stale2", "stale3", "relay"]
+                .into_iter()
+                .map(str::to_owned)
+                .collect(),
+            |address| {
+                let met = met.clone();
+                let mut wait_for_relay = wait_for_relay.clone();
+                Some(async move {
+                    if address == "relay" {
+                        met.send(true).unwrap();
+                        true
+                    } else {
+                        // These dials cannot finish until the relay is probed.
+                        // A serial scheduler therefore never reaches the relay.
+                        wait_for_relay.wait_for(|ready| *ready).await.unwrap();
+                        false
+                    }
+                })
+            },
+        );
+        let counts = tokio::time::timeout(std::time::Duration::from_secs(1), probes)
+            .await
+            .expect("stale addresses held up the reachable relay");
+        assert_eq!(counts, (4, 1));
+    }
+
+    #[tokio::test]
+    async fn concurrent_remembered_probes_preserve_attempt_and_peer_budgets() {
+        for succeeds in [false, true] {
+            let mut started = 0;
+            let counts = dial_remembered_concurrently(
+                (0..100).map(|n| n.to_string()).collect(),
+                |address| {
+                    if address == "0" {
+                        return None; // A known/self address consumes no budget.
+                    }
+                    started += 1;
+                    Some(std::future::ready(succeeds))
+                },
+            )
+            .await;
+            let expected = if succeeds {
+                (MAX_RENDEZVOUS_PEERS, MAX_RENDEZVOUS_PEERS)
+            } else {
+                (MAX_RENDEZVOUS_ATTEMPTS, 0)
+            };
+            assert_eq!(counts, expected);
+            assert_eq!(started, expected.0, "a probe was started then abandoned");
+        }
+    }
 
     /// After a restart the first pass fails for a reason that clears in
     /// seconds (a peer still holds the old process's session), so the next
