@@ -932,6 +932,83 @@ pub(crate) async fn handle_ipc_send(
         planned = Some((discovered, hops));
     }
 
+    // A relayed call must reach each device with that device's key. The
+    // singular certificate cache can pick an offline sibling after a restart;
+    // relaying that ciphertext to the online device never makes it readable.
+    // Use verified local records only, route each copy to its physical device,
+    // and keep the destination app addressed to the contact identity.
+    if relay_control_compat
+        && ratchet_ok
+        && remote
+        && !send.require_ack
+        && send.data.len() <= 4096
+        && let (Some(ratchet), Some(resolver), Some(reg)) = (
+            ctx.ratchet.as_ref(),
+            ctx.mlkem_ek_resolver.as_deref(),
+            session_tx_registry,
+        )
+        && ratchet.identity().is_some()
+    {
+        use veil_proto::delivery::DeliveryEnvelope;
+        use veil_proto::family::DeliveryMsg;
+        let mut any_sent = false;
+        let now = veil_util::unix_secs_now_u64();
+        for (device, cert) in resolver.resolve_device_certs_cached(send.dst_node_id) {
+            if device == *local_node_id || cert.node_id != send.dst_node_id {
+                continue;
+            }
+            let hops = ordinary_relay_hops(None, &device, route_cache, reg, true);
+            if hops.is_empty() {
+                continue;
+            }
+            let Ok((payload, _)) = ratchet.seal_for(
+                veil_e2e::PeerRatchetKeys {
+                    node_id: &cert.node_id,
+                    instance_id: &cert.instance_id,
+                    mlkem_ek: &cert.mlkem_ek,
+                    ratchet_pk: &cert.ratchet_x25519_pk,
+                    authorized_until_unix: cert.valid_until_unix,
+                },
+                &send.data,
+                now,
+            ) else {
+                continue;
+            };
+            let mut nonce = [0u8; 32];
+            use rand_core::RngCore;
+            rand_core::OsRng.fill_bytes(&mut nonce);
+            let envelope = DeliveryEnvelope {
+                recipient: veil_proto::recipient::Recipient::any(device),
+                sender_node_id: *local_node_id,
+                src_app_id: send.src_app_id,
+                app_id: send.app_id,
+                endpoint_id: send.endpoint_id,
+                content_id: *blake3::hash(&nonce).as_bytes(),
+                created_at: now,
+                ttl_secs: veil_proto::delivery::FORWARD_REALTIME_TTL_SECS,
+                payload,
+                trace_id: 0,
+                require_ack: false,
+            };
+            let bytes = envelope.encode();
+            for hop in hops.into_iter().take(3) {
+                let mut header =
+                    FrameHeader::new(FrameFamily::Delivery as u8, DeliveryMsg::Forward as u16);
+                header.body_len = (32 + bytes.len() + 8 + 1) as u32;
+                let mut frame = codec::encode_header(&header).to_vec();
+                frame.extend_from_slice(&hop);
+                frame.extend_from_slice(&bytes);
+                frame.extend_from_slice(&0u64.to_be_bytes());
+                frame.push(0);
+                any_sent |= reg.send_to(&hop, veil_proto::header::priority::REALTIME, frame);
+            }
+        }
+        if any_sent {
+            timing.path.set("call_device_fanout");
+            return app_send_ok(sink, false).await;
+        }
+    }
+
     // ONE SEAL PER DEVICE when the address is an identity (defect №35, its
     // identity-addressed half). The transport below hands one frame to EVERY
     // live device of an identity, and a ratchet payload is keyed to exactly
@@ -2150,6 +2227,21 @@ mod ratchet_send_tests {
     struct FamilyCerts(Vec<veil_types::VerifiedPeerCert>);
 
     impl veil_types::MlKemEkResolver for FamilyCerts {
+        fn resolve_device_certs_cached(
+            &self,
+            target: [u8; 32],
+        ) -> Vec<([u8; 32], veil_types::VerifiedPeerCert)> {
+            self.0
+                .iter()
+                .filter(|c| c.node_id == target)
+                .map(|c| {
+                    let mut device = [0u8; 32];
+                    device[..16].copy_from_slice(&c.instance_id);
+                    (device, c.clone())
+                })
+                .collect()
+        }
+
         fn resolve_cert_cached(&self, target: [u8; 32]) -> Option<veil_types::VerifiedPeerCert> {
             // The singular question has no honest answer for a family; the
             // production resolver's zero-valued freshness tie hands back an
@@ -2298,6 +2390,47 @@ mod ratchet_send_tests {
         // the session's device must differ for the test to say anything.
         fx.certs = Arc::new(FamilyCerts(vec![session_row, sibling_row]));
         (fx, sibling_rt)
+    }
+
+    #[tokio::test]
+    async fn relay_call_control_is_readable_on_each_devices_own_route() {
+        use veil_proto::delivery::DeliveryEnvelope;
+        let (mut fx, sibling) = family_fixture();
+        fx.outbox = Arc::new(Outbox {
+            live: vec![RELAY],
+            sent: Mutex::new(Vec::new()),
+            family: Vec::new(),
+        });
+        let mut body = payload(false, b"answer from the online phone");
+        body[100..104]
+            .copy_from_slice(&veil_proto::ipc::IPC_SEND_FLAG_RELAY_CONTROL_COMPAT.to_be_bytes());
+        let mut wh = sink().await;
+        handle_ipc_send(&mut SendReply::Inline(&mut wh), &body, &fx.ctx(true))
+            .await
+            .expect("send");
+        let frames = fx.taken();
+        assert_eq!(
+            frames.len(),
+            2,
+            "one copy per device even without P2P sessions"
+        );
+        for (hop, frame) in frames {
+            assert_eq!(hop, RELAY);
+            let (envelope, _) = DeliveryEnvelope::decode(&frame[veil_proto::HEADER_SIZE + 32..])
+                .expect("relay envelope");
+            let (_, instance) = veil_e2e::payload_instances(&envelope.payload).expect("sealed");
+            assert_eq!(&envelope.recipient.node_id[..16], &instance);
+            let receiver = if instance == PEER_INSTANCE {
+                &fx.peer
+            } else {
+                &sibling
+            };
+            let opened = receiver
+                .open_payload(&ME, &envelope.payload, veil_util::unix_secs_now_u64())
+                .expect("the device opens its own copy");
+            assert!(opened.authenticated);
+            assert_eq!(opened.plaintext, b"answer from the online phone");
+        }
     }
 
     impl Fixture {

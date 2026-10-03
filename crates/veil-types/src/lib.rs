@@ -190,6 +190,17 @@ pub trait MlKemEkResolver: Send + Sync {
         None
     }
 
+    /// Active devices from a locally verified identity document and registry,
+    /// paired with each device's own verified certificate. Never performs a
+    /// network lookup. A single identity-wide certificate cannot describe a
+    /// multi-device recipient of latency-critical call control.
+    fn resolve_device_certs_cached(
+        &self,
+        _target_node_id: [u8; 32],
+    ) -> Vec<([u8; 32], VerifiedPeerCert)> {
+        Vec::new()
+    }
+
     /// The certificate of ONE NAMED DEVICE of the recipient, local records
     /// only. See [`resolve_cert_for_instance`](Self::resolve_cert_for_instance).
     /// Implementations without a local cache keep the conservative miss.
