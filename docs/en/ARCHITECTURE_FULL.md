@@ -238,7 +238,7 @@ Peers that both advertise `SUPPORTS_DATAGRAM_FLOWS` use opaque `VDF1` datagram c
 
 The final end-to-end call seal also isolates the two local producers. Each owns a distinct random epoch salt, derived key, sequence counter and seal lock. The existing `VME1` format is unchanged and carries no producer role; old receivers already accept independent authenticated epochs. The existing bounded four-epoch receive cache covers both producers on two overlapping routes. Direct, Delivery and anonymous batches keep audio/RTCP separate from video, so a burst of video cannot advance the audio replay window. Receiver replay history survives route teardown, and an authenticated packet is still admitted at most once. Circuit forwarding in both directions and at rendezvous uses the ordinary `INTERACTIVE` queue for every cell, with no media-specific relay scheduling.
 
-Anonymous media has two independent native pumps and outbound circuit pools, separate from the reliable file-transfer pool. Opening debounce, route selection, cooldown and repair state are local to each producer. Each media pool opens one live route rather than delaying first delivery for a full file-transfer pool; video opens lazily on its first packet. A repair request fans out into two independently bounded queues, and channel close cancels both pumps. The originator queues audio/RTCP in its local reserve and video in its local bulk lane; `send_circuit_cell_on_local_lane_detailed` always encodes the same ordinary `CircuitData` header. The published receive registration, authenticated peer tags and inbound cookie remain hub-wide. Each outbound-only media candidate registers a fresh random key/cookie, distinct from the published receive cookie and from other candidates, and probes that exact cookie. Concurrent construction or repair therefore cannot move another producer's return binding or confirm the wrong circuit. Exclusive registration private keys are erased after setup. `CircuitData` still travels on the session's ordered stream, so neither this separation nor its local scheduling removes network head-of-line blocking or separates congestion budgets. Further network transport and inbound-route work is required before claiming end-to-end isolation.
+Anonymous media has two independent native pumps and outbound circuit pools, separate from the reliable file-transfer pool. Opening debounce, route selection, cooldown and repair state are local to each producer. Each media pool opens one live route rather than delaying first delivery for a full file-transfer pool; video opens lazily on its first packet. A repair request fans out into two independently bounded queues, and channel close cancels both pumps. The originator queues audio/RTCP in its local reserve and video in its local bulk lane; `send_circuit_datagram_on_local_lane_detailed` encodes the same ordinary-priority header for both local producers. The published receive registration, authenticated peer tags and inbound cookie remain hub-wide. Each outbound-only media candidate registers a fresh random key/cookie, distinct from the published receive cookie and from other candidates, and probes that exact cookie. Concurrent construction or repair therefore cannot move another producer's return binding or confirm the wrong circuit. Exclusive registration private keys are erased after setup. Reliable `CircuitData` (files, setup probes and introductions) stays on the ordered session stream. Generic loss-tolerant `CircuitDatagram` (RelayChain tag 9) uses the authenticated QUIC datagram plane when the next hop explicitly advertises support; forwarding, return re-tagging and rendezvous splicing preserve that property. Its body has the same fixed cell size and encryption as `CircuitData`, no audio/video role, and the relay always uses ordinary `INTERACTIVE` scheduling and the same service cost. Capability support is carried in a marker-prefixed optional extension after the legacy three-byte CAPABILITIES prefix, covered by the existing padded handshake transcript. The marker distinguishes it from old peers' random padding; the older opaque-flow flag alone never enables it. On any stream-only or unsupported hop, the session encodes the old `CircuitData` discriminant and uses reliable delivery for that hop. The datagram frame ceiling includes the outer headers of a maximum-size circuit cell; fragment count and retained assembly quotas remain bounded. A real two-runner QUIC test holds both ordered writers and verifies fragmented circuit delivery in both directions, while reliable cells stay held. The published inbound circuit and QUIC congestion budget remain shared; further inbound-route and transport-flow isolation is required before claiming end-to-end isolation.
 
 ### 5.3 Frame families
 
@@ -256,7 +256,7 @@ Anonymous media has two independent native pumps and outbound circuit pools, sep
 | 7 | Tunnel | IpPacket — TUN/TAP encapsulation |
 | 8 | Routing | RouteAnnounce/Withdraw, RouteRequest/Response, PowChallenge/Response/Accept, RouteAnnounceAliased/WithdrawAliased, RouteDiscover/Offer, RecursiveQuery/Response(0x10/0x11) |
 | 9 | Diag | Ping/Pong, TraceProbe, TraceHop |
-| 10 | RelayChain | Hop(0) — onion-encrypted chain, RegisterRendezvous(1), UnregisterRendezvous(2), ForwardIntroduce(3), CircuitBuild(4)/CircuitData(5)/CircuitTeardown(6)/CircuitBuilt(7) |
+| 10 | RelayChain | Hop(0) — onion-encrypted chain, RegisterRendezvous(1), UnregisterRendezvous(2), ForwardIntroduce(3), CircuitBuild(4)/CircuitData(5)/CircuitTeardown(6)/CircuitBuilt(7), RegisterMailboxCookie(8), CircuitDatagram(9) |
 | 11 | PeerExchange | Walk, Challenge, Response, Result |
 
 An unknown `family` yields `ProtoError::UnknownFamily`; an unknown `msg_type` yields `UnknownMsgType`. The dispatcher simply ignores such frames, which keeps old nodes forward-compatible with newer ones.
@@ -312,18 +312,24 @@ The client opens the OVL1 handshake. Frames stay in plaintext up to `SessionConf
 
 The pubkey always travels raw. The verifier confirms `BLAKE3(public_key) == node_id`.
 
-### 6.4 CapabilitiesPayload (3 bytes, wire v3)
+### 6.4 CapabilitiesPayload (legacy prefix plus optional extension)
 
-```
-[0]  roles_supported  u8  (role_bits bitmask: bit0=leaf, bit3=core)
-[1]  flags            u8  (cap_flags: CAN_RELAY=0x01, SUPPORTS_SOVEREIGN_IDENTITY=0x02,
-                         ANONYMITY_RELAY=0x04, SUPPORTS_HYBRID_KEX=0x08)
-[2]  discovery_mode   u8  (0=Public, 1=ContactsOnly)
+```text
+[0]     roles_supported  u8 (bit0=leaf, bit3=core)
+[1]     flags            u8 (cap_flags)
+[2]     discovery_mode   u8 (0=Public, 1=ContactsOnly, 2=IntroductionOnly)
+[3..19] optional marker  "VEIL-CAPS-EXT-01" (16 bytes)
+[19]    extra_flags      u8 (only after the exact marker)
 ```
 
-Wire v3 dropped the legacy 12-byte form (`transports_sup`, `max_frame_size`, `max_streams`,
-`ovl1_minor`). The decoder still accepts the 2-byte form (roles + flags), in which case
-`discovery_mode` defaults to `Public`.
+The decoder requires the three-byte prefix. Without the exact extension marker
+and its following byte, `extra_flags` is zero; arbitrary legacy random padding
+never substitutes for an explicit advertisement. `extra_flags` bit 0 advertises
+`SUPPORTS_CIRCUIT_DATAGRAMS`; the existing `SUPPORTS_REALTIME_DATAGRAMS` flag and
+a negotiated QUIC datagram handle are also required. A peer that supports only
+`SUPPORTS_DATAGRAM_FLOWS` is still given legacy `CircuitData` on the ordered
+stream. Older decoders read the prefix and ignore the extension. The complete
+padded capabilities body remains authenticated by the handshake transcript.
 
 ### 6.5 KeyAgreement + SessionKeys
 

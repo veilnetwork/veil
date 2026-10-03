@@ -1216,6 +1216,11 @@ pub enum RelayChainMsg {
     /// keyed by the authenticated session source (no receiver_id in the body —
     /// you can only register your own).
     RegisterMailboxCookie = 8,
+    /// Generic loss-tolerant circuit cell. Same padded/encrypted body as
+    /// CircuitData, no application role. Relays retain ordinary scheduling.
+    /// Only sent on a datagram lane when this peer advertised explicit support;
+    /// ordered-stream fallback uses the legacy CircuitData discriminant.
+    CircuitDatagram = 9,
 }
 
 impl RelayChainMsg {
@@ -1229,6 +1234,7 @@ impl RelayChainMsg {
             RelayChainMsg::ForwardIntroduce => "forward_introduce",
             RelayChainMsg::CircuitBuild => "circuit_build",
             RelayChainMsg::CircuitData => "circuit_data",
+            RelayChainMsg::CircuitDatagram => "circuit_datagram",
             RelayChainMsg::CircuitTeardown => "circuit_teardown",
             RelayChainMsg::CircuitBuilt => "circuit_built",
             RelayChainMsg::RegisterMailboxCookie => "register_mailbox_cookie",
@@ -1249,6 +1255,7 @@ impl TryFrom<u16> for RelayChainMsg {
             6 => Ok(RelayChainMsg::CircuitTeardown),
             7 => Ok(RelayChainMsg::CircuitBuilt),
             8 => Ok(RelayChainMsg::RegisterMailboxCookie),
+            9 => Ok(RelayChainMsg::CircuitDatagram),
             _ => Err(ProtoError::UnknownMsgType {
                 family: FrameFamily::RelayChain as u8,
                 msg_type: v,
@@ -1278,12 +1285,13 @@ mod tests {
             (RelayChainMsg::CircuitTeardown, 6),
             (RelayChainMsg::CircuitBuilt, 7),
             (RelayChainMsg::RegisterMailboxCookie, 8),
+            (RelayChainMsg::CircuitDatagram, 9),
         ];
         for (variant, disc) in all {
             assert_eq!(variant as u16, disc);
             assert_eq!(RelayChainMsg::try_from(disc).unwrap(), variant);
         }
-        assert!(RelayChainMsg::try_from(9).is_err());
+        assert!(RelayChainMsg::try_from(10).is_err());
     }
 
     #[test]

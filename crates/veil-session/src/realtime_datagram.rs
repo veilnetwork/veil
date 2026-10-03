@@ -24,8 +24,14 @@ const TAG_LEN: usize = 16;
 const MIN_DATAGRAM_LEN: usize = HEADER_LEN + TAG_LEN + 1;
 const KDF_CONTEXT: &str = "veil/session/realtime-datagram/v1";
 
-/// Realtime app/relay frames are capped well below the ordinary session ceiling.
-pub const MAX_REALTIME_FRAME: usize = 16 * 1024;
+/// A complete maximum-size circuit cell plus its two outer headers. The small
+/// overhead is needed because the negotiated cell size measures ciphertext,
+/// while this ceiling bounds a complete OVL1 frame (not just its body).
+/// CircuitDatagram is separately negotiated; legacy app/Delivery producers
+/// keep their existing wire budgets.
+pub const MAX_REALTIME_FRAME: usize = veil_anonymity::circuit_data::CIRCUIT_PAYLOAD_BYTES
+    + veil_anonymity::circuit_wire::CircuitDataPayload::HEADER_LEN
+    + veil_proto::header::HEADER_SIZE;
 /// A large batched media cell still fits without unbounded fragment fan-out.
 pub const MAX_FRAGMENTS: usize = 32;
 /// Incomplete messages retained per peer.

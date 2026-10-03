@@ -286,6 +286,8 @@ impl IdentityPayload {
 /// [1] flags u8 (CAN_RELAY, SUPPORTS_SOVEREIGN_IDENTITY)
 /// [2] discovery_mode u8 (0=Public, 1=ContactsOnly
 /// 2=IntroductionOnly)
+/// [3..19] optional marker "VEIL-CAPS-EXT-01"
+/// [19] extra_flags u8 (only present after the exact marker)
 /// ```
 ///
 /// The pre-audit layout carried six extra fields (`transports_supported`
@@ -305,6 +307,8 @@ pub struct CapabilitiesPayload {
     pub roles_supported: u8,
     /// Packed boolean flags — use [`cap_flags`] constants.
     pub flags: u8,
+    /// Optional authenticated capability extension; absent on legacy peers.
+    pub extra_flags: u8,
     /// peer's preferred DHT-discoverability — controls
     /// whether `handle_find_node_v2` includes the peer in responses.
     /// Values: 0 = Public (default), 1 = ContactsOnly, 2 = IntroductionOnly.
@@ -390,11 +394,22 @@ pub mod cap_flags {
     pub const NO_DHT_SERVICE: u8 = 1 << 5;
 }
 
+/// The original flags byte is full. This explicit marker distinguishes an
+/// extension from legacy handshake random padding. Old decoders consume only
+/// the three-byte prefix; the entire padded body remains transcript-bound.
+const CAPABILITIES_EXTENSION: &[u8; 16] = b"VEIL-CAPS-EXT-01";
+
+pub mod cap_extra_flags {
+    /// Generic loss-tolerant circuit cells, with no application-role label or
+    /// relay priority. Separate from the older VDF1 flow capability.
+    pub const SUPPORTS_CIRCUIT_DATAGRAMS: u8 = 1;
+}
+
 // c: role_bits moved to veil-types alongside NodeRole.
 pub use veil_types::role_bits;
 
 impl CapabilitiesPayload {
-    /// Fixed wire size: 1 byte roles + 1 byte flags + 1 byte discovery_mode.
+    /// Legacy prefix: 1 byte roles + 1 byte flags + 1 byte discovery_mode.
     pub const WIRE_SIZE: usize = 3;
 
     /// Build a capabilities advertisement from a configured `NodeRole`.
@@ -415,6 +430,7 @@ impl CapabilitiesPayload {
         Self {
             roles_supported: role.to_role_bits(),
             flags,
+            extra_flags: 0,
             discovery_mode: 0, // Public
         }
     }
@@ -441,12 +457,17 @@ impl CapabilitiesPayload {
         }
     }
 
-    /// Encode to the fixed 3-byte layout.
-    pub fn encode(&self) -> [u8; Self::WIRE_SIZE] {
-        [self.roles_supported, self.flags, self.discovery_mode]
+    /// Preserve the legacy prefix. Emit an extension only when needed.
+    pub fn encode(&self) -> Vec<u8> {
+        let mut bytes = vec![self.roles_supported, self.flags, self.discovery_mode];
+        if self.extra_flags != 0 {
+            bytes.extend_from_slice(CAPABILITIES_EXTENSION);
+            bytes.push(self.extra_flags);
+        }
+        bytes
     }
 
-    /// Parse from a 3-byte buffer.
+    /// Parse the legacy prefix and an explicitly marked extension, if present.
     pub fn decode(buf: &[u8]) -> Result<Self, ProtoError> {
         if buf.len() < Self::WIRE_SIZE {
             return Err(ProtoError::BufferTooShort {
@@ -457,8 +478,19 @@ impl CapabilitiesPayload {
         Ok(Self {
             roles_supported: buf[0],
             flags: buf[1],
+            extra_flags: if buf.get(3..19) == Some(CAPABILITIES_EXTENSION.as_slice()) {
+                buf.get(19).copied().unwrap_or(0)
+            } else {
+                0
+            },
             discovery_mode: buf[2],
         })
+    }
+
+    /// Both datagram transport support and the new message decoder are needed.
+    pub fn supports_circuit_datagrams(&self) -> bool {
+        self.supports_realtime_datagrams()
+            && self.extra_flags & cap_extra_flags::SUPPORTS_CIRCUIT_DATAGRAMS != 0
     }
 
     // ── Capability helpers ───────────────────────────────────────────────
@@ -2257,6 +2289,7 @@ mod tests {
         let p = CapabilitiesPayload {
             roles_supported: role_bits::LEAF | role_bits::CORE,
             flags: cap_flags::CAN_RELAY | cap_flags::SUPPORTS_SOVEREIGN_IDENTITY,
+            extra_flags: 0,
             discovery_mode: 1, // ContactsOnly
         };
         assert_eq!(CapabilitiesPayload::decode(&p.encode()).unwrap(), p);
@@ -2272,6 +2305,7 @@ mod tests {
         let silent = CapabilitiesPayload {
             roles_supported: role_bits::CORE,
             flags: 0,
+            extra_flags: 0,
             discovery_mode: 0,
         };
         assert!(silent.dht_service());
@@ -2287,6 +2321,7 @@ mod tests {
         let quiet = CapabilitiesPayload {
             roles_supported: role_bits::LEAF,
             flags: cap_flags::CAN_RELAY | cap_flags::NO_DHT_SERVICE,
+            extra_flags: 0,
             discovery_mode: 0,
         };
         let decoded = CapabilitiesPayload::decode(&quiet.encode()).unwrap();
@@ -2323,6 +2358,41 @@ mod tests {
 
         legacy.flags |= cap_flags::SUPPORTS_REALTIME_REKEY;
         assert!(modern.realtime_rekey_negotiated(&legacy));
+    }
+
+    #[test]
+    fn circuit_datagram_capability_is_explicit_and_padding_safe() {
+        let mut caps = CapabilitiesPayload::from_node_role(veil_types::NodeRole::Core);
+        caps.flags |= cap_flags::SUPPORTS_REALTIME_DATAGRAMS | cap_flags::SUPPORTS_DATAGRAM_FLOWS;
+        assert_eq!(caps.encode().len(), CapabilitiesPayload::WIRE_SIZE);
+        assert!(!caps.supports_circuit_datagrams());
+        // An older VDF1 peer's random handshake tail is not an extension.
+        for value in 0..=255 {
+            let mut padded = caps.encode();
+            padded.extend(vec![value; 2048]);
+            assert_eq!(CapabilitiesPayload::decode(&padded).unwrap(), caps);
+        }
+        caps.extra_flags = cap_extra_flags::SUPPORTS_CIRCUIT_DATAGRAMS;
+        let bytes = caps.encode();
+        assert_eq!(bytes.len(), 20);
+        assert_eq!(
+            &bytes[..3],
+            &[caps.roles_supported, caps.flags, caps.discovery_mode]
+        );
+        for len in 3..bytes.len() {
+            let truncated = CapabilitiesPayload::decode(&bytes[..len]).unwrap();
+            assert!(!truncated.supports_circuit_datagrams());
+        }
+        let mut padded = bytes.clone();
+        padded.extend(vec![0xff; 2048]);
+        assert_eq!(CapabilitiesPayload::decode(&padded).unwrap(), caps);
+        assert!(
+            CapabilitiesPayload::decode(&bytes)
+                .unwrap()
+                .supports_circuit_datagrams()
+        );
+        caps.flags &= !cap_flags::SUPPORTS_REALTIME_DATAGRAMS;
+        assert!(!caps.supports_circuit_datagrams());
     }
 
     #[test]
@@ -2378,6 +2448,7 @@ mod tests {
         let p = CapabilitiesPayload {
             roles_supported: role_bits::CORE,
             flags: 0,
+            extra_flags: 0,
             discovery_mode: 99, // unknown future value
         };
         let decoded = CapabilitiesPayload::decode(&p.encode()).unwrap();
