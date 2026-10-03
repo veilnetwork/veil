@@ -13,9 +13,21 @@
 //! that can move without the header noticing, and this checks that it did not.
 
 use super::{
+    MEDIA_BATCHING_COMPACT_RELAY, MEDIA_BATCHING_OFF, MEDIA_CHANNELS, MEDIA_NEXT_ID, MediaChannel,
+    MediaSenderSlot, MediaVideoIngress, RelayVideoFrame, drain_media_packets, drain_relay_video,
+    media_batched_cells, veil_media_close_channel, veil_media_send_datagram,
+};
+use super::{
     RELAY_VIDEO_FRAME_MAX_BYTES, RelayMediaStats, RelayVideoFrameAssembler, RelayVideoFramePush,
     media_cell_is_video, media_is_vp8_rtp, media_wire_cells, veil_media_repair_channel,
 };
+use crate::media::MediaCipher;
+use std::sync::{
+    Arc,
+    atomic::{AtomicU8, Ordering},
+};
+use std::time::{Duration, Instant};
+use tokio::sync::{Mutex, Notify, mpsc};
 
 fn video_packet(timestamp: u32, marker: bool, fill: u8) -> Vec<u8> {
     let mut packet = vec![0u8; 120];
@@ -178,4 +190,193 @@ fn relay_stats_separate_queue_lock_and_ipc_holds() {
     assert_eq!(snapshot.video_frame_ipc_holds_33ms, 1);
     assert_eq!(snapshot.ipc_cell_holds_16ms, 1);
     assert_eq!(snapshot.ipc_send_failures, 1);
+}
+
+// These are the production drain helpers and sender indirection, with only
+// their IPC sink replaced. Hold the secondary writer lock throughout audio
+// delivery to exercise the exact stall that a common sender used to cause.
+async fn audio_continues_while_video_writer_is_blocked(relay: bool) {
+    let peer = if relay { [0xf1; 32] } else { [0xf2; 32] };
+    let cipher = Arc::new(MediaCipher::new(&peer, &[1; 32], &[2; 32]).unwrap());
+    let receiver = MediaCipher::new(&peer, &[2; 32], &[1; 32]).unwrap();
+    let mode = Arc::new(AtomicU8::new(if relay {
+        MEDIA_BATCHING_COMPACT_RELAY
+    } else {
+        MEDIA_BATCHING_OFF
+    }));
+    let primary = Arc::new(Mutex::new(Some(())));
+    let secondary = Arc::new(Mutex::new(Some(())));
+    let slot = Arc::new(MediaSenderSlot::new(Arc::clone(&primary)));
+    slot.replace(Arc::clone(&secondary));
+    let held_writer = secondary.lock().await;
+    let entered = Arc::new(Notify::new());
+    let video_entered = Arc::clone(&entered);
+    let (sent_audio, mut received_audio) = mpsc::unbounded_channel();
+    let (sent_video, mut received_video) = mpsc::unbounded_channel();
+    let (audio_tx, audio_rx) = mpsc::channel(8);
+    let audio_task = tokio::spawn(drain_media_packets(
+        audio_rx,
+        Arc::clone(&mode),
+        Arc::clone(&cipher),
+        relay,
+        move |cell| {
+            let primary = Arc::clone(&primary);
+            let sent = sent_audio.clone();
+            async move {
+                let _guard = primary.lock().await;
+                sent.send(cell.sealed.into_vec()).unwrap();
+                true
+            }
+        },
+    ));
+    let sink = move |sealed: crate::media::SealedMediaCell| {
+        let writer = slot.current();
+        let entered = Arc::clone(&video_entered);
+        let sent = sent_video.clone();
+        async move {
+            entered.notify_one();
+            let _guard = writer.lock().await;
+            sent.send(sealed.into_vec()).unwrap();
+            true
+        }
+    };
+    let video = video_packet(7, true, 3);
+    let video_task = if relay {
+        let (tx, rx) = mpsc::channel(1);
+        tx.send(RelayVideoFrame {
+            packets: vec![video.clone()],
+            enqueued_at: Instant::now(),
+        })
+        .await
+        .unwrap();
+        drop(tx);
+        tokio::spawn(drain_relay_video(
+            rx,
+            Arc::clone(&mode),
+            Arc::clone(&cipher),
+            Arc::new(RelayMediaStats::default()),
+            sink,
+        ))
+    } else {
+        let (tx, rx) = mpsc::channel(1);
+        tx.send(video.clone()).await.unwrap();
+        drop(tx);
+        tokio::spawn(drain_media_packets(
+            rx,
+            Arc::clone(&mode),
+            Arc::clone(&cipher),
+            false,
+            move |cell| sink(cell.sealed),
+        ))
+    };
+    // The first sequence belongs to video: wait for sealing to complete and
+    // for that task to reach the blocked writer before sending the audio.
+    tokio::time::timeout(Duration::from_secs(1), entered.notified())
+        .await
+        .unwrap();
+    let audio = vec![0x80, 111, 1, 2, 3, 4];
+    audio_tx.send(audio.clone()).await.unwrap();
+    let sealed_audio = tokio::time::timeout(Duration::from_millis(100), received_audio.recv())
+        .await
+        .expect("audio must not wait for the video IPC writer")
+        .unwrap();
+    assert!(
+        received_video.try_recv().is_err(),
+        "video writer is still held"
+    );
+    drop(held_writer);
+    let sealed_video = tokio::time::timeout(Duration::from_secs(1), received_video.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_ne!(
+        &sealed_audio[12..20],
+        &sealed_video[12..20],
+        "shared cipher must never reuse a nonce"
+    );
+    assert_eq!(
+        &sealed_audio[4..12],
+        &sealed_video[4..12],
+        "both pumps share one epoch"
+    );
+    assert_eq!(receiver.open(&sealed_audio), Some(audio));
+    assert_eq!(receiver.open(&sealed_video), Some(video));
+    assert!(
+        receiver.open(&sealed_audio).is_none(),
+        "replay remains rejected"
+    );
+    drop(audio_tx);
+    tokio::time::timeout(Duration::from_secs(1), audio_task)
+        .await
+        .unwrap()
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(1), video_task)
+        .await
+        .unwrap()
+        .unwrap();
+}
+
+#[tokio::test]
+async fn direct_audio_does_not_wait_for_video_writer() {
+    audio_continues_while_video_writer_is_blocked(false).await;
+}
+
+#[tokio::test]
+async fn relay_audio_does_not_wait_for_video_writer() {
+    audio_continues_while_video_writer_is_blocked(true).await;
+}
+
+#[test]
+fn relay_audio_batches_respect_compact_size_and_packet_limits() {
+    let packets = vec![vec![0x80, 111, 1, 2, 3, 4]; 15];
+    let cells = media_batched_cells(packets.clone(), 22, 6);
+    assert!(cells.iter().all(|cell| cell.len() <= 23));
+    assert_eq!(expand_wire_cells(&cells), packets);
+    let cells = media_batched_cells(packets.clone(), 1000, 6);
+    assert_eq!(cells.len(), 3, "six + six + three");
+    assert_eq!(expand_wire_cells(&cells), packets);
+}
+
+#[tokio::test]
+async fn closing_channel_cancels_both_blocked_pumps() {
+    let task = tokio::spawn(std::future::pending::<()>());
+    let video_task = tokio::spawn(std::future::pending::<()>());
+    let abort_audio = task.abort_handle();
+    let abort_video = video_task.abort_handle();
+    let (tx_hi, _hi_rx) = mpsc::channel(1);
+    let (tx_video, _video_rx) = mpsc::channel(1);
+    let id = MEDIA_NEXT_ID.fetch_add(1, Ordering::Relaxed);
+    MEDIA_CHANNELS
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .insert(
+            id,
+            MediaChannel {
+                tx_hi,
+                video: MediaVideoIngress::Packets(tx_video),
+                repair_tx: None,
+                peer: [0xf3; 32],
+                task,
+                video_task: Some(video_task),
+                video_sender: None,
+                sender_app_id: None,
+                batching: None,
+                cipher: Arc::new(MediaCipher::new(&[0xf3; 32], &[1; 32], &[2; 32]).unwrap()),
+                relay_stats: None,
+            },
+        );
+    unsafe { veil_media_close_channel(id) };
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while !abort_audio.is_finished() || !abort_video.is_finished() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("close must cancel both pending tasks");
+    let packet = [0x80, 111, 1, 2];
+    assert_eq!(
+        unsafe { veil_media_send_datagram(id, packet.as_ptr(), packet.len()) },
+        -1
+    );
+    unsafe { veil_media_close_channel(id) }; // Idempotent.
 }
