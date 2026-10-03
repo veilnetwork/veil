@@ -999,6 +999,31 @@ fn media_drop_note(reason: &str, peer: [u8; 32], len: usize) {
     );
 }
 
+/// Match a sparse sealed-cell sample across the two phones without logging
+/// audio, keys, or adding a timestamp to the wire. The receiver calls this
+/// only AFTER authentication. Phone wall-clock offsets must be measured
+/// separately before comparing the log timestamps.
+pub(crate) fn trace_sealed_cell(stage: &str, peer: &[u8; 32], payload: &[u8]) {
+    if !veil_session::rt_trace::rt_trace_enabled()
+        || payload.len() < MEDIA_SEALED_HEADER_LEN
+        || !payload.starts_with(&MEDIA_SEALED_MAGIC)
+    {
+        return;
+    }
+    let epoch = u64::from_be_bytes(payload[4..12].try_into().unwrap());
+    let seq = u64::from_be_bytes(payload[12..20].try_into().unwrap());
+    if seq.is_multiple_of(50) {
+        log::info!(
+            "media.cell.sample stage={stage} peer={:02x}{:02x}{:02x}{:02x} epoch={epoch:016x} seq={seq} bytes={}",
+            peer[0],
+            peer[1],
+            peer[2],
+            peer[3],
+            payload.len(),
+        );
+    }
+}
+
 pub(crate) fn dispatch_inbound_auto(peer: [u8; 32], payload: &[u8]) {
     // Resolve the channel's cipher BEFORE looking at the packet, so the
     // decision comes from our state and not from bytes the sender chose.
@@ -1024,6 +1049,7 @@ pub(crate) fn dispatch_inbound_auto(peer: [u8; 32], payload: &[u8]) {
         media_drop_note("seal-open-failed", peer, payload.len());
         return;
     };
+    trace_sealed_cell("received", &peer, payload);
     if plaintext.first() == Some(&MEDIA_BATCH_MAGIC) {
         dispatch_inbound_batch(peer, &plaintext[1..]);
     } else {
