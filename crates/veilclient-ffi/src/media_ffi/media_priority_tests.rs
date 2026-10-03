@@ -15,7 +15,7 @@
 use super::{
     MEDIA_BATCHING_COMPACT_RELAY, MEDIA_BATCHING_OFF, MEDIA_CHANNELS, MEDIA_NEXT_ID, MediaChannel,
     MediaSenderSlot, MediaVideoIngress, RelayVideoFrame, drain_media_packets, drain_relay_video,
-    media_batched_cells, veil_media_close_channel, veil_media_send_datagram,
+    media_batched_cells, media_ready_batch, veil_media_close_channel, veil_media_send_datagram,
 };
 use super::{
     RELAY_VIDEO_FRAME_MAX_BYTES, RelayMediaStats, RelayVideoFrameAssembler, RelayVideoFramePush,
@@ -69,6 +69,30 @@ fn batching_never_puts_video_into_an_audio_cell() {
     );
     assert_eq!(expand_wire_cells(&cells), packets);
     assert!(!media_cell_is_video(&[crate::media::MEDIA_BATCH_MAGIC]));
+}
+
+#[test]
+fn anonymous_batch_preserves_other_producer_and_overflow() {
+    let (audio_tx, mut audio_rx) = mpsc::channel(4);
+    let (video_tx, mut video_rx) = mpsc::channel(4);
+    let audio = vec![0x80, 111, 1, 2, 3, 4];
+    let video = video_packet(7, false, 1);
+    audio_tx.try_send(audio.clone()).unwrap();
+    video_tx.try_send(video.clone()).unwrap();
+    video_tx.try_send(video.clone()).unwrap();
+    let max_body = 4 + 2 * (2 + video.len());
+    let (cell, overflow) = media_ready_batch(video.clone(), &mut video_rx, max_body);
+    let cell = cell.unwrap();
+    assert!(media_cell_is_video(&cell));
+    assert_eq!(
+        expand_wire_cells(&[cell]),
+        vec![video.clone(), video.clone()]
+    );
+    assert_eq!(overflow, Some(video));
+    assert_eq!(audio_rx.try_recv().unwrap(), audio);
+    let (cell, overflow) = media_ready_batch(audio.clone(), &mut audio_rx, max_body);
+    assert_eq!(cell, Some(audio));
+    assert!(overflow.is_none());
 }
 
 #[test]
@@ -269,7 +293,7 @@ async fn audio_continues_while_video_writer_is_blocked(relay: bool) {
             move |cell| sink(cell.sealed),
         ))
     };
-    // The first sequence belongs to video: wait for sealing to complete and
+    // Wait for video sealing to complete and
     // for that task to reach the blocked writer before sending the audio.
     tokio::time::timeout(Duration::from_secs(1), entered.notified())
         .await
@@ -290,14 +314,9 @@ async fn audio_continues_while_video_writer_is_blocked(relay: bool) {
         .unwrap()
         .unwrap();
     assert_ne!(
-        &sealed_audio[12..20],
-        &sealed_video[12..20],
-        "shared cipher must never reuse a nonce"
-    );
-    assert_eq!(
         &sealed_audio[4..12],
         &sealed_video[4..12],
-        "both pumps share one epoch"
+        "each producer must have an independent epoch key and replay window"
     );
     assert_eq!(receiver.open(&sealed_audio), Some(audio));
     assert_eq!(receiver.open(&sealed_video), Some(video));

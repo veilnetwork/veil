@@ -409,7 +409,7 @@ impl MediaCipherRx {
     }
 }
 
-/// Wire bytes produced by [`MediaCipher::seal`]. There is deliberately no other
+/// Wire bytes produced by [`MediaCipher::seal_on_plane`]. There is deliberately no other
 /// constructor: a send path that wants to put media on the wire has to obtain
 /// one of these, and the only way to obtain one is to seal.
 pub(crate) struct SealedMediaCell(Vec<u8>);
@@ -428,10 +428,19 @@ impl SealedMediaCell {
 /// fresh random epoch salt is mixed into the TX sub-key, so rebuilding a route
 /// during the same call can safely restart its sequence at one without nonce
 /// reuse. RX keeps a tiny bounded set of recent epochs for make-before-break
-/// overlap, shared per receive key (see [`RX_STATE`]).
+/// overlap, shared per peer (see [`REPLAY`]). The two local producers have
+/// independent epochs and counters, so a video burst cannot age delayed audio
+/// out of its replay window. Their wire salts are random and encode no role.
 pub(crate) struct MediaCipher {
-    tx: Mutex<MediaCipherTx>,
+    tx: [Mutex<MediaCipherTx>; 2],
     rx: Mutex<MediaCipherRx>,
+}
+
+/// Process-local selection only. Never serialized into a media cell.
+#[derive(Clone, Copy)]
+pub(crate) enum LocalMediaPlane {
+    Primary,
+    Secondary,
 }
 
 impl MediaCipher {
@@ -454,14 +463,32 @@ impl MediaCipher {
         {
             return None;
         }
+        let primary = MediaCipherTx::new(tx_key);
+        let mut secondary = MediaCipherTx::new(tx_key);
+        while secondary.salt == primary.salt {
+            secondary = MediaCipherTx::new(tx_key);
+        }
         Some(Self {
-            tx: Mutex::new(MediaCipherTx::new(tx_key)),
+            tx: [Mutex::new(primary), Mutex::new(secondary)],
             rx: Mutex::new(MediaCipherRx::new(peer, rx_key)),
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn seal(&self, plaintext: &[u8]) -> Option<SealedMediaCell> {
-        self.tx
+        self.seal_on_plane(LocalMediaPlane::Primary, plaintext)
+    }
+
+    pub(crate) fn seal_on_plane(
+        &self,
+        plane: LocalMediaPlane,
+        plaintext: &[u8],
+    ) -> Option<SealedMediaCell> {
+        let index = match plane {
+            LocalMediaPlane::Primary => 0,
+            LocalMediaPlane::Secondary => 1,
+        };
+        self.tx[index]
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .seal(plaintext)
@@ -1328,6 +1355,108 @@ mod tests {
             MediaCipher::new(&[0x9au8; 32], &[0xa1u8; 32], &[0xa2u8; 32]).expect("usable");
         let sealed = attacker.seal(plaintext).expect("attacker can seal");
         transport.ingress(peer, &transport.wire(sealed));
+    }
+
+    #[test]
+    fn video_flood_cannot_age_delayed_audio_out_on_any_transport() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        for (index, transport) in TRANSPORTS.into_iter().enumerate() {
+            let peer = [0xb0 + index as u8; 32];
+            let ours = cipher(peer, [0x71; 32], [0x72; 32]);
+            let theirs = peer_cipher([0x72; 32], [0x71; 32]);
+            set_recv_callback(peer, 900, record, std::ptr::null_mut(), Arc::clone(&ours));
+            RX_CALLS.store(0, Ordering::SeqCst);
+            let delayed = transport.wire(theirs.seal(&[0x80, 111, 1]).unwrap());
+            let mut last_video = Vec::new();
+            for _ in 0..4096 {
+                let video = theirs
+                    .seal_on_plane(LocalMediaPlane::Secondary, &[0x80, 96, 2])
+                    .unwrap();
+                last_video = transport.wire(video);
+                transport.ingress(peer, &last_video);
+            }
+            let later = transport.wire(theirs.seal(&[0x80, 111, 3]).unwrap());
+            transport.ingress(peer, &later);
+            transport.ingress(peer, &delayed);
+            assert_eq!(RX_CALLS.load(Ordering::SeqCst), 4098, "{transport:?}");
+            transport.ingress(peer, &delayed);
+            assert_eq!(RX_CALLS.load(Ordering::SeqCst), 4098, "reject replay");
+
+            // Route teardown must not erase either producer's replay history.
+            clear_recv_callback(peer, 900);
+            let rebuilt = cipher(peer, [0x71; 32], [0x72; 32]);
+            set_recv_callback(peer, 901, record, std::ptr::null_mut(), rebuilt);
+            transport.ingress(peer, &delayed);
+            transport.ingress(peer, &later);
+            transport.ingress(peer, &last_video);
+            assert_eq!(
+                RX_CALLS.load(Ordering::SeqCst),
+                4098,
+                "reject after rebuild"
+            );
+            clear_recv_callback(peer, 901);
+        }
+    }
+
+    #[test]
+    fn both_producers_survive_make_before_break_route_overlap() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let receiver = cipher([0xb3; 32], [0x73; 32], [0x74; 32]);
+        let old_route = peer_cipher([0x74; 32], [0x73; 32]);
+        let new_route = peer_cipher([0x74; 32], [0x73; 32]);
+        let mut delayed = Vec::new();
+        for sender in [&old_route, &new_route] {
+            for plane in [LocalMediaPlane::Primary, LocalMediaPlane::Secondary] {
+                delayed.push(sender.seal_on_plane(plane, b"delayed").unwrap());
+                let later = sender.seal_on_plane(plane, b"later").unwrap();
+                assert_eq!(receiver.open(later.as_bytes()), Some(b"later".to_vec()));
+            }
+        }
+        for cell in delayed {
+            assert_eq!(receiver.open(cell.as_bytes()), Some(b"delayed".to_vec()));
+            assert!(receiver.open(cell.as_bytes()).is_none());
+        }
+    }
+
+    #[test]
+    fn a_held_secondary_cipher_lock_does_not_block_primary() {
+        let sender = cipher([0xb4; 32], [0x75; 32], [0x76; 32]);
+        let held = sender.tx[1].lock().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker = {
+            let sender = Arc::clone(&sender);
+            std::thread::spawn(move || {
+                tx.send(sender.seal(b"primary").is_some()).unwrap();
+            })
+        };
+        let result = rx.recv_timeout(std::time::Duration::from_secs(1));
+        drop(held);
+        worker.join().unwrap();
+        assert!(result.unwrap());
+    }
+
+    #[test]
+    fn parallel_producers_use_distinct_keys_and_unique_sequences() {
+        let sender = cipher([0xb5; 32], [0x77; 32], [0x78; 32]);
+        let workers = [LocalMediaPlane::Primary, LocalMediaPlane::Secondary].map(|plane| {
+            let sender = Arc::clone(&sender);
+            std::thread::spawn(move || {
+                (0..512)
+                    .map(|_| sender.seal_on_plane(plane, b"packet").unwrap().into_vec())
+                    .collect::<Vec<_>>()
+            })
+        });
+        let [primary, secondary] = workers.map(|worker| worker.join().unwrap());
+        assert_ne!(&primary[0][4..12], &secondary[0][4..12]);
+        for cells in [primary, secondary] {
+            for (index, cell) in cells.iter().enumerate() {
+                assert_eq!(&cell[4..12], &cells[0][4..12]);
+                assert_eq!(
+                    u64::from_be_bytes(cell[12..20].try_into().unwrap()),
+                    index as u64 + 1
+                );
+            }
+        }
     }
 
     #[test]
