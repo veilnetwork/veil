@@ -1563,8 +1563,9 @@ impl NodeServices {
     /// minted its cookie independently of `reg_kp` would build a circuit whose
     /// registration is silently refused — no ACK, no cookie→circuit binding, and
     /// therefore no live path at all. Deriving it here from the key makes that
-    /// pairing unrepresentable. Callers that need the value use
-    /// [`Self::onion_stream_local_cookie`], which derives it the same way.
+    /// pairing unrepresentable. Callers derive the cookie from this same key;
+    /// the published hub uses [`Self::onion_stream_local_cookie`], whereas
+    /// private outbound candidates may use an independent registration key.
     pub fn open_stream_circuit(
         &self,
         relay_path: &[[u8; 32]],
@@ -2123,6 +2124,21 @@ impl NodeServices {
         circ: &DataCircuit,
         payload: &[u8],
     ) -> std::result::Result<(), DataCircuitSendError> {
+        self.send_circuit_cell_on_local_lane_detailed(
+            circ,
+            payload,
+            veil_proto::priority::INTERACTIVE,
+        )
+    }
+
+    /// Select an originator's local ingress lane without granting any priority
+    /// at a relay. The encoded CircuitData header remains INTERACTIVE.
+    pub fn send_circuit_cell_on_local_lane_detailed(
+        &self,
+        circ: &DataCircuit,
+        payload: &[u8],
+        local_lane: u8,
+    ) -> std::result::Result<(), DataCircuitSendError> {
         use veil_anonymity::circuit_data::{Direction, apply_layers, wrap_payload};
         use veil_anonymity::circuit_wire::CircuitDataPayload;
 
@@ -2139,10 +2155,11 @@ impl NodeServices {
         let enc = cell
             .encode(circ.cell_bytes)
             .map_err(|_| DataCircuitSendError::NoRelays)?;
-        self.send_relay_chain_frame(
+        self.send_relay_chain_frame_on_local_lane(
             &circ.first_hop,
             veil_proto::family::RelayChainMsg::CircuitData,
             &enc,
+            local_lane,
         )
         .map_err(|err| match err {
             veil_session::SendToError::Full => DataCircuitSendError::QueueFull,
