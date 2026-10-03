@@ -228,6 +228,10 @@ Bits in `flags`:
 
 The remaining bits are reserved and must be 0. Older docs list `encrypted` and `require_ack` as wire flags. They are not: encryption is a property of the whole session, and `require_ack` lives in the body of the `DeliveryEnvelope`.
 
+For relayed `Delivery::Forward`, neither these bits nor the sender's body hint grants scheduling priority. All forwarded user payloads enter the relay's `INTERACTIVE` queue, regardless of size or application. The legacy `0xA8/REALTIME` body extension is retained for compatibility and selects only canonical loss-tolerant datagram transport (bounded size, short TTL, no ACK). It carries no audio/video discriminator. Datagram selection consumes the ordinary scheduler's slots and cannot skip a reliable frame ahead of it in the same FIFO.
+
+The network policy permits preferential relay service only for PoW walk peer discovery, not for user calls. Call quality must come from P2P or an operator-controlled relay and endpoint scheduling. Separating audio, video/screen sharing, and other application traffic into independent Veil transport flows remains work in progress; the existing media datagram lane still shares one QUIC connection and its congestion budget. Flow separation must not introduce audio/video labels or user-selected priority at intermediary relays.
+
 ### 5.3 Frame families
 
 [`proto/family.rs`](../../crates/veil-proto/src/family.rs), enum `FrameFamily`:
