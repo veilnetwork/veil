@@ -119,6 +119,14 @@ uint64_t veil_media_open_relay_channel(VeilApp *app,
                                        const uint8_t *rx_key,
                                        char **err_out);
 
+/* Set a second local IPC sender for video before starting the engine. The
+ * app identity must match the primary sender; keep both apps alive until the
+ * channel closes. This local role is never included in network packets.
+ * Returns 0 on success, -1 on an invalid app/channel or anonymous channel. */
+int veil_media_channel_set_secondary_sender(uint64_t chan,
+                                            VeilApp *app,
+                                            char **err_out);
+
 /*
  * Drain inbound datagrams from `app` directly into the native media registry.
  * The claimed source node plus (`source_namespace`, `source_name`) must derive
