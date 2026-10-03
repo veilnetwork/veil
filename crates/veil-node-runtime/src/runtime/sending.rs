@@ -26,6 +26,43 @@ use std::sync::Arc;
 
 use super::*;
 
+#[cfg(test)]
+mod local_circuit_lanes_tests {
+    #[tokio::test]
+    async fn originating_circuit_lanes_are_local_and_relay_headers_stay_equal() {
+        use veil_proto::{
+            codec::decode_header_with_limit, family::RelayChainMsg, header::HEADER_SIZE, priority,
+        };
+        let peer = [0x8c; 32];
+        let mut registry = veil_session::SessionTxRegistry::default();
+        let mut rx = registry.register(peer);
+        super::enqueue_relay_chain_frame(
+            &registry,
+            &peer,
+            RelayChainMsg::CircuitData,
+            b"video",
+            priority::BULK,
+        )
+        .unwrap();
+        super::enqueue_relay_chain_frame(
+            &registry,
+            &peer,
+            RelayChainMsg::CircuitData,
+            b"audio",
+            priority::REALTIME,
+        )
+        .unwrap();
+        for (expected_lane, body) in [(priority::REALTIME, b"audio"), (priority::BULK, b"video")] {
+            let (local_lane, frame) = rx.recv().await.unwrap();
+            assert_eq!(local_lane, expected_lane);
+            let header = decode_header_with_limit(&frame[..HEADER_SIZE], 1024).unwrap();
+            assert_eq!(header.priority(), priority::INTERACTIVE);
+            assert_eq!(header.msg_type, RelayChainMsg::CircuitData as u16);
+            assert_eq!(&frame[HEADER_SIZE..], body);
+        }
+    }
+}
+
 /// One `RelayChain::<msg>` control frame, header and body.
 pub(crate) fn relay_chain_frame(msg: veil_proto::family::RelayChainMsg, body: &[u8]) -> Vec<u8> {
     use veil_proto::{codec::encode_header, family::FrameFamily, header::FrameHeader};
@@ -37,6 +74,18 @@ pub(crate) fn relay_chain_frame(msg: veil_proto::family::RelayChainMsg, body: &[
     frame
 }
 
+fn enqueue_relay_chain_frame(
+    registry: &veil_session::SessionTxRegistry,
+    peer: &[u8; 32],
+    msg: veil_proto::family::RelayChainMsg,
+    body: &[u8],
+    local_lane: u8,
+) -> std::result::Result<(), veil_session::SendToError> {
+    // The process-local lane is never written into the frame: every relay
+    // receives the same ordinary header regardless of the originating task.
+    registry.send_to_result(peer, local_lane, relay_chain_frame(msg, body))
+}
+
 impl NodeServices {
     /// Build + enqueue one `RelayChain::<msg>` control frame to `peer`'s session.
     pub(crate) fn send_relay_chain_frame(
@@ -45,12 +94,23 @@ impl NodeServices {
         msg: veil_proto::family::RelayChainMsg,
         body: &[u8],
     ) -> std::result::Result<(), veil_session::SendToError> {
-        let guard = wlock!(self.session_tx_registry);
-        guard.send_to_result(
+        self.send_relay_chain_frame_on_local_lane(
             peer,
+            msg,
+            body,
             veil_proto::priority::INTERACTIVE,
-            relay_chain_frame(msg, body),
         )
+    }
+
+    pub(crate) fn send_relay_chain_frame_on_local_lane(
+        &self,
+        peer: &[u8; 32],
+        msg: veil_proto::family::RelayChainMsg,
+        body: &[u8],
+        local_lane: u8,
+    ) -> std::result::Result<(), veil_session::SendToError> {
+        let guard = wlock!(self.session_tx_registry);
+        enqueue_relay_chain_frame(&guard, peer, msg, body, local_lane)
     }
 
     /// Authenticated rendezvous send (Epic 482 v1, "any recipient"): like

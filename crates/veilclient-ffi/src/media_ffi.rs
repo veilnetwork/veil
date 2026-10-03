@@ -88,6 +88,74 @@ fn media_ready_batch(
     (media::media_cell(packets, max_body), pending)
 }
 
+/// One anonymous producer per task: a blocked send or route repair cannot
+/// hold the other producer's queue. Video warms lazily on its first packet.
+#[cfg(feature = "node-embedded")]
+async fn drain_anonymous_media<S, SF, W, WF>(
+    mut rx: mpsc::Receiver<Vec<u8>>,
+    mut repair_rx: mpsc::Receiver<()>,
+    cipher: Arc<media::MediaCipher>,
+    plane: media::LocalMediaPlane,
+    mut send: S,
+    mut warm: W,
+) where
+    S: FnMut(media::SealedMediaCell) -> SF,
+    SF: std::future::Future<Output = bool>,
+    W: FnMut() -> WF,
+    WF: std::future::Future<Output = ()>,
+{
+    let mut active = matches!(plane, media::LocalMediaPlane::Primary);
+    if active {
+        warm().await;
+    }
+    let mut consecutive_drops = 0u32;
+    let mut pending = None;
+    loop {
+        let first = if let Some(packet) = pending.take() {
+            packet
+        } else {
+            tokio::select! {
+                biased;
+                Some(()) = repair_rx.recv() => {
+                    if active {
+                        warm().await;
+                    }
+                    continue;
+                }
+                packet = rx.recv() => match packet {
+                    Some(packet) => packet,
+                    None => break,
+                },
+                else => break,
+            }
+        };
+        if !active {
+            active = true;
+            warm().await;
+        }
+        let (cell, overflow) =
+            media_ready_batch(first, &mut rx, anon_stream::media_batch_body_max());
+        pending = overflow;
+        let Some(cell) = cell else {
+            continue;
+        };
+        let Some(sealed) = cipher.seal_on_plane(plane, &cell) else {
+            continue;
+        };
+        drop(cell);
+        if send(sealed).await {
+            consecutive_drops = 0;
+        } else {
+            consecutive_drops = consecutive_drops.saturating_add(1);
+            // Re-resolve absent/stale ads in the background instead of keeping
+            // an entire call on a black-holed route. Only this pool is repaired.
+            if consecutive_drops % 20 == 1 {
+                warm().await;
+            }
+        }
+    }
+}
+
 #[cfg(all(test, feature = "node-embedded"))]
 mod media_priority_tests;
 
@@ -278,7 +346,6 @@ pub unsafe extern "C" fn veil_media_open_channel(
     let Some(cipher) = (unsafe { media_cipher_from_keys(&peer, tx_key, rx_key, err_out) }) else {
         return 0;
     };
-    let cipher_task = Arc::clone(&cipher);
     let hub = match ensure_anon_hub(&handle_live.bundle, &handle_live.anon_hub) {
         Ok(h) => h,
         Err(e) => {
@@ -286,84 +353,30 @@ pub unsafe extern "C" fn veil_media_open_channel(
             return 0;
         }
     };
-    let (tx_hi, mut rx_hi) = mpsc::channel::<Vec<u8>>(MEDIA_TX_HI_QUEUE);
-    let (tx_video, mut rx_video) = mpsc::channel::<Vec<u8>>(MEDIA_TX_VIDEO_QUEUE);
-    let (repair_tx, mut repair_rx) = mpsc::channel::<()>(1);
-    let send_hub = hub.clone();
-    // One drain task per channel: warm the circuit, then pump queued datagrams
-    // into the lossy send. `send_datagram` itself drops on QueueFull/no-route,
-    // so a wedged circuit degrades to silent loss, never to a stall.
-    //
-    // Self-heal a stale route: the initial `media_open_channel` resolves the
-    // peer's rendezvous ONCE. If the channel is opened before the peer has
-    // (re)published a reachable rendezvous ad — e.g. a call whose callee is a
-    // just-woken NAT'd phone that registers seconds/minutes later — that resolve
-    // finds stale/absent ads, the circuit points nowhere, and EVERY datagram is
-    // silently dropped for the whole call (device-observed: desktop->phone media
-    // 0% while phone->desktop was fine). A run of no-route drops is the signal to
-    // re-resolve: re-call `media_open_channel` (ensure_outbound_opening rebuilds
-    // with a fresh resolve past its own dedup window), so we pick the peer up the
-    // moment it becomes reachable instead of staying dark. Healthy sends return
-    // true and reset the counter, so a flowing call pays nothing.
-    const MEDIA_REWARM_EVERY_DROPS: u32 = 20;
-    let task = handle_live.bundle.runtime.spawn(async move {
-        send_hub.media_open_channel(peer).await;
-        let mut consecutive_drops: u32 = 0;
-        let mut pending: Option<Vec<u8>> = None;
-        loop {
-            let (first, video) = if let Some(pkt) = pending.take() {
-                let video = media_is_vp8_rtp(&pkt);
-                (pkt, video)
-            } else {
-                tokio::select! {
-                    biased;
-                    Some(()) = repair_rx.recv() => {
-                        // The request is end-to-end evidence from the peer,
-                        // unlike a successful enqueue to our first hop. Force
-                        // a fresh rendezvous resolve/pool open. The opener is
-                        // make-before-break and preserves routes carrying live
-                        // reliable streams, so repairing a call cannot tear a
-                        // concurrent file transfer down.
-                        send_hub.media_open_channel(peer).await;
-                        continue;
-                    }
-                    Some(pkt) = rx_hi.recv() => (pkt, false),
-                    Some(pkt) = rx_video.recv() => (pkt, true),
-                    else => break,
-                }
-            };
-            // WebRTC emits a video frame as a tight RTP burst. Drain packets
-            // already queued at this instant into one padded onion cell; never
-            // wait for another packet, so batching adds no timer latency.
-            let rx = if video { &mut rx_video } else { &mut rx_hi };
-            let (cell, overflow) =
-                media_ready_batch(first, rx, anon_stream::media_batch_body_max());
-            pending = overflow;
-            // Fold to ONE cell and seal it. A cell that will not seal (the
-            // sequence space is exhausted) is dropped, never sent in the
-            // clear — the splice relay reads whatever goes down this circuit.
-            // Not a route problem either, so it must not arm the re-warm.
-            let Some(cell) = cell else {
-                continue;
-            };
-            let Some(sealed) = cipher_task.seal_on_plane(media_cell_plane(&cell), &cell) else {
-                continue;
-            };
-            // The plaintext is MOVED out of scope the moment it is sealed. No
-            // unit test can reach this drain (it needs a live embedded node),
-            // so the guarantee has to be one the compiler makes: a future edit
-            // that sends `cell` instead of `sealed` does not build.
-            drop(cell);
-            if send_hub.media_send_datagram(peer, &sealed).await {
-                consecutive_drops = 0;
-            } else {
-                consecutive_drops += 1;
-                if consecutive_drops % MEDIA_REWARM_EVERY_DROPS == 1 {
-                    send_hub.media_open_channel(peer).await;
-                }
-            }
-        }
-    });
+    let (tx_hi, rx_hi) = mpsc::channel::<Vec<u8>>(MEDIA_TX_HI_QUEUE);
+    let (tx_video, rx_video) = mpsc::channel::<Vec<u8>>(MEDIA_TX_VIDEO_QUEUE);
+    let (repair_hi_tx, repair_hi_rx) = mpsc::channel::<()>(1);
+    let (repair_video_tx, repair_video_rx) = mpsc::channel::<()>(1);
+    let spawn_producer = |rx, repair_rx, plane| {
+        let send_hub = Arc::clone(&hub);
+        let warm_hub = Arc::clone(&hub);
+        handle_live.bundle.runtime.spawn(drain_anonymous_media(
+            rx,
+            repair_rx,
+            Arc::clone(&cipher),
+            plane,
+            move |sealed| {
+                let hub = Arc::clone(&send_hub);
+                async move { hub.media_send_datagram(peer, plane, &sealed).await }
+            },
+            move || {
+                let hub = Arc::clone(&warm_hub);
+                async move { hub.media_open_channel(peer, plane).await }
+            },
+        ))
+    };
+    let task = spawn_producer(rx_hi, repair_hi_rx, media::LocalMediaPlane::Primary);
+    let video_task = spawn_producer(rx_video, repair_video_rx, media::LocalMediaPlane::Secondary);
     let id = MEDIA_NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     MEDIA_CHANNELS
         .lock()
@@ -373,10 +386,10 @@ pub unsafe extern "C" fn veil_media_open_channel(
             MediaChannel {
                 tx_hi,
                 video: MediaVideoIngress::Packets(tx_video),
-                repair_tx: Some(repair_tx),
+                repair_tx: Some([repair_hi_tx, repair_video_tx]),
                 peer,
                 task,
-                video_task: None,
+                video_task: Some(video_task),
                 video_sender: None,
                 sender_app_id: None,
                 batching: None,
@@ -877,10 +890,21 @@ pub unsafe extern "C" fn veil_media_repair_channel(chan: u64) -> c_int {
     let Some(repair_tx) = map.get(&chan).and_then(|ch| ch.repair_tx.as_ref()) else {
         return -1;
     };
-    match repair_tx.try_send(()) {
-        Ok(()) => 0,
-        Err(mpsc::error::TrySendError::Full(_)) => 1,
-        Err(mpsc::error::TrySendError::Closed(_)) => -1,
+    let mut queued = false;
+    let mut pending = false;
+    for tx in repair_tx {
+        match tx.try_send(()) {
+            Ok(()) => queued = true,
+            Err(mpsc::error::TrySendError::Full(_)) => pending = true,
+            Err(mpsc::error::TrySendError::Closed(_)) => {}
+        }
+    }
+    if queued {
+        0
+    } else if pending {
+        1
+    } else {
+        -1
     }
 }
 
@@ -1175,7 +1199,7 @@ struct MediaChannel {
     /// The receiver of the media asks the sender to refresh its outbound
     /// rendezvous pool when RTP/RTCP has gone dark even though signaling is
     /// still alive. Direct channels leave this `None`.
-    repair_tx: Option<mpsc::Sender<()>>,
+    repair_tx: Option<[mpsc::Sender<()>; 2]>,
     peer: [u8; 32],
     task: tokio::task::JoinHandle<()>,
     video_task: Option<tokio::task::JoinHandle<()>>,

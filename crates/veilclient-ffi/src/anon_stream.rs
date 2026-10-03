@@ -32,7 +32,7 @@ use veil_onion_stream::wire::Frame;
 use veil_onion_stream::{Addr, CellSender, Config, End, OnionStream, StreamMux};
 use veilclient::{AppSender, IncomingMessage};
 
-use crate::media::SealedMediaCell;
+use crate::media::{LocalMediaPlane, SealedMediaCell};
 
 /// Emit a one-line diagnostic that NEVER panics. `eprintln!` PANICS if the
 /// underlying stderr write fails — and under `flutter run` the desktop app's
@@ -730,7 +730,14 @@ impl CellSender for AnonCells {
 /// published mode the relay sees only `[target_cookie 16][peer_tag 32][cell]`;
 /// SYN/SYN_ACK prepend one encrypted peer-intro after `peer_tag` so only the
 /// receiver can map the opaque tag back to the sender's node id.
+#[derive(Clone)]
 struct CircuitCells {
+    /// Only lossy local sends use this lane; it is absent from circuit frames.
+    local_datagram_lane: u8,
+    /// Outbound-only producers use fresh unadvertised registrations per
+    /// candidate, so neither their peers nor route rebuilds move the hub's
+    /// published receive cookie to a different circuit.
+    private_outbound_registration: bool,
     services: veil_node_runtime::NodeServices,
     me: [u8; 32],
     mode: CircuitMode,
@@ -1480,6 +1487,34 @@ impl CellSender for CircuitCells {
 }
 
 impl CircuitCells {
+    /// Independent local circuit ownership for an out-of-band producer.
+    /// Published receive registration, feeds and authentication stay hub-wide;
+    /// the role of the producer is never added to a circuit frame.
+    fn isolated_producer(&self, plane: LocalMediaPlane) -> Self {
+        Self {
+            private_outbound_registration: true,
+            local_datagram_lane: match plane {
+                LocalMediaPlane::Primary => veil_proto::priority::REALTIME,
+                LocalMediaPlane::Secondary => veil_proto::priority::BULK,
+            },
+            outbound_circuits: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            stream_routes: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            next_outbound_route: Arc::new(Mutex::new(HashMap::new())),
+            outbound_opening: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            bulk_shed_marks: Arc::new(Mutex::new(HashMap::new())),
+            // Media does not use stream pacing or ACK striping. Keep its route
+            // health and repair local, too: a video route's failure must not
+            // cool an independently working audio/file circuit to the same R.
+            route_cooldowns: Arc::new(Mutex::new(HashMap::new())),
+            first_hop_cooldowns: Arc::new(Mutex::new(HashMap::new())),
+            // One independent live route per producer; do not delay the first
+            // packet while constructing a multi-route file-transfer pool.
+            outbound_pool_target: 1,
+            ack_outbound_pool_target: 1,
+            ..self.clone()
+        }
+    }
+
     /// Build the on-wire circuit envelope for `cell` over `route`:
     /// `[cookie][sender-or-peer-tag][optional sealed intro][cell]`.
     fn stream_envelope(
@@ -1592,10 +1627,11 @@ impl CircuitCells {
             // Oversized (payload > one cell) — drop; callers batch to fit.
             Err(_) => return false,
         };
-        match self
-            .services
-            .send_circuit_cell_detailed(&route.circuit, &env)
-        {
+        match self.services.send_circuit_cell_on_local_lane_detailed(
+            &route.circuit,
+            &env,
+            self.local_datagram_lane,
+        ) {
             Ok(()) => {
                 mark_circuit_activity(&self.activity);
                 self.mark_outbound_non_handshake(dst_node, &route).await;
@@ -2932,6 +2968,7 @@ impl CircuitCells {
         let route_cooldowns = Arc::clone(&self.route_cooldowns);
         let first_hop_cooldowns = Arc::clone(&self.first_hop_cooldowns);
         let pool_target = self.outbound_pool_target_for(route_class);
+        let private_registration = self.private_outbound_registration;
         tokio::spawn(async move {
             let opened = open_outbound_circuit(
                 services.clone(),
@@ -2949,6 +2986,7 @@ impl CircuitCells {
                 route_cooldowns,
                 first_hop_cooldowns,
                 pool_target,
+                private_registration,
             )
             .await;
             outbound_opening.lock().await.remove(&dst_node);
@@ -2998,6 +3036,7 @@ impl CircuitCells {
                 Arc::clone(&self.route_cooldowns),
                 Arc::clone(&self.first_hop_cooldowns),
                 self.outbound_pool_target_for(route_class),
+                self.private_outbound_registration,
             )
             .await;
             self.outbound_opening.lock().await.remove(&dst_node);
@@ -3112,6 +3151,9 @@ pub struct AnonStreamHub {
     /// Direct handle to the cell backend for out-of-band operations
     /// (outbound-pool pre-warm) that must not ride the stream path.
     cells: Arc<HubCells>,
+    /// Local producers have separate pools, repair and route-selection state.
+    /// They reuse the hub's registration and authenticated receive demux.
+    media_cells: Option<[CircuitCells; 2]>,
     _sender: Arc<AppSender>,
 }
 
@@ -3378,6 +3420,13 @@ impl AnonStreamHub {
             HubCells::Circuit(c) => Arc::clone(&c.peer_aliases),
             HubCells::Anon(_) => veil_onion_stream::PeerAliases::default(),
         };
+        let media_cells = match &cells {
+            HubCells::Circuit(c) => Some([
+                c.isolated_producer(LocalMediaPlane::Primary),
+                c.isolated_producer(LocalMediaPlane::Secondary),
+            ]),
+            HubCells::Anon(_) => None,
+        };
         let cells = Arc::new(cells);
         let mux = Arc::new(StreamMux::new_with_aliases(
             me,
@@ -3389,6 +3438,7 @@ impl AnonStreamHub {
         AnonStreamHub {
             mux,
             cells,
+            media_cells,
             _sender: sender,
         }
     }
@@ -3411,13 +3461,18 @@ impl AnonStreamHub {
         }
     }
 
-    /// Warm the outbound circuit for a media channel to `peer`. Media reuses the
-    /// reliable stream's rendezvous/pool (the hub already registers our inbound
-    /// cookie and resolves the peer's ad), so this just kicks a background open
-    /// of the shared bulk pool — no separate registration. No-op on the
-    /// datagram fallback (media requires the embedded circuit backend).
-    pub async fn media_open_channel(&self, peer: [u8; 32]) {
-        if let HubCells::Circuit(c) = self.cells.as_ref() {
+    fn media_producer(&self, plane: LocalMediaPlane) -> Option<&CircuitCells> {
+        let index = match plane {
+            LocalMediaPlane::Primary => 0,
+            LocalMediaPlane::Secondary => 1,
+        };
+        self.media_cells.as_ref().map(|cells| &cells[index])
+    }
+
+    /// Warm only this local producer's pool. Construction is in the background
+    /// and shares no opening debounce or route cache with the other producers.
+    pub(crate) async fn media_open_channel(&self, peer: [u8; 32], plane: LocalMediaPlane) {
+        if let Some(c) = self.media_producer(plane) {
             c.ensure_outbound_opening(peer, RouteClass::Bulk).await;
         }
     }
@@ -3428,8 +3483,13 @@ impl AnonStreamHub {
     /// path can read or rewrite). Returns `true` if it entered the first-hop TX
     /// queue, `false` if dropped (no route yet / stale route / `QueueFull` /
     /// datagram-fallback backend without a lossy path).
-    pub async fn media_send_datagram(&self, peer: [u8; 32], sealed: &SealedMediaCell) -> bool {
-        if let HubCells::Circuit(c) = self.cells.as_ref() {
+    pub(crate) async fn media_send_datagram(
+        &self,
+        peer: [u8; 32],
+        plane: LocalMediaPlane,
+        sealed: &SealedMediaCell,
+    ) -> bool {
+        if let Some(c) = self.media_producer(plane) {
             c.send_datagram(peer, sealed).await
         } else {
             false
@@ -3820,6 +3880,8 @@ fn try_open_circuit(
         }
     });
     Some(CircuitCells {
+        local_datagram_lane: veil_proto::priority::INTERACTIVE,
+        private_outbound_registration: false,
         services,
         me,
         mode,
@@ -3847,6 +3909,52 @@ fn try_open_circuit(
         peer_tags,
         outbound_peer_tags,
         peer_aliases,
+    })
+}
+
+struct OutboundRegistration {
+    keypair: Arc<veil_crypto::GeneratedKeyPair>,
+    epoch: Arc<AtomicU64>,
+    cookie: [u8; COOKIE_LEN],
+}
+
+impl Drop for OutboundRegistration {
+    fn drop(&mut self) {
+        // Fresh registration keys are needed only for setup, not for DATA.
+        // Shared hub keys stay owned by their backend; erase an exclusive one.
+        if let Some(keypair) = Arc::get_mut(&mut self.keypair) {
+            use zeroize::Zeroize;
+            keypair.private_key.zeroize();
+        }
+    }
+}
+
+fn outbound_registration(
+    shared_key: &Arc<veil_crypto::GeneratedKeyPair>,
+    shared_epoch: &Arc<AtomicU64>,
+    private: bool,
+) -> Result<OutboundRegistration, String> {
+    use base64::{Engine as _, engine::general_purpose::STANDARD};
+    let (keypair, epoch) = if private {
+        (
+            Arc::new(veil_crypto::generate_keypair(
+                veil_types::SignatureAlgorithm::Ed25519,
+            )),
+            Arc::new(AtomicU64::new(0)),
+        )
+    } else {
+        (Arc::clone(shared_key), Arc::clone(shared_epoch))
+    };
+    let public_key: [u8; 32] = STANDARD
+        .decode(&keypair.public_key)
+        .ok()
+        .and_then(|key| key.try_into().ok())
+        .ok_or_else(|| "invalid outbound registration public key".to_string())?;
+    let cookie = veil_anonymity::circuit_register::cookie_for_reg_pk(&public_key);
+    Ok(OutboundRegistration {
+        keypair,
+        epoch,
+        cookie,
     })
 }
 
@@ -3946,6 +4054,7 @@ async fn open_outbound_circuit(
     route_cooldowns: RouteCooldowns,
     first_hop_cooldowns: FirstHopCooldowns,
     pool_target: usize,
+    private_registration: bool,
 ) -> Result<(), String> {
     let desired_pool_target = pool_target.clamp(1, MAX_CIRCUIT_OUTBOUND_POOL);
     let mut ads = services
@@ -4201,11 +4310,12 @@ async fn open_outbound_circuit(
             break;
         }
         let started = Instant::now();
+        let registration = outbound_registration(&reg_kp, &epoch, private_registration)?;
         let (candidate, recv_rx) = match services
             .open_stream_circuit_to_rendezvous_relay(
                 ad.rendezvous_node_id,
-                &reg_kp,
-                &epoch,
+                &registration.keypair,
+                &registration.epoch,
                 CIRCUIT_HOPS,
             )
             .await
@@ -4240,9 +4350,7 @@ async fn open_outbound_circuit(
             Arc::clone(&peer_tags),
             Some(candidate.confirmed_flag()),
         );
-        if !confirm_circuit_with_probe(&services, &candidate, &services.onion_stream_local_cookie())
-            .await
-        {
+        if !confirm_circuit_with_probe(&services, &candidate, &registration.cookie).await {
             last_err = format!(
                 "R={} confirmation timed out after {}ms (no ACK, no probe echo)",
                 short_node(&ad.rendezvous_node_id),
@@ -4611,6 +4719,129 @@ mod tests {
     };
     use veil_anonymity::circuit_register::COOKIE_LEN;
     use veil_onion_stream::wire::{DATA_OVERHEAD, Frame, MAX_CELL};
+
+    #[test]
+    fn private_media_registrations_cannot_replace_other_producers_at_a_relay() {
+        use base64::{Engine as _, engine::general_purpose::STANDARD};
+        use std::sync::{Arc, atomic::AtomicU64};
+        use veil_anonymity::{
+            circuit_data::CircuitCellBytes,
+            circuit_register::{CircuitRegisterPayload, CircuitRendezvousRegistry},
+            circuit_setup::CircuitInstall,
+            circuit_table::CircuitTable,
+        };
+        let key = Arc::new(veil_crypto::generate_keypair(
+            veil_types::SignatureAlgorithm::Ed25519,
+        ));
+        let epoch = Arc::new(AtomicU64::new(0));
+        let published = super::outbound_registration(&key, &epoch, false).unwrap();
+        assert!(Arc::ptr_eq(&published.keypair, &key));
+        assert!(Arc::ptr_eq(&published.epoch, &epoch));
+        let audio = super::outbound_registration(&key, &epoch, true).unwrap();
+        let video = super::outbound_registration(&key, &epoch, true).unwrap();
+        let audio_repair = super::outbound_registration(&key, &epoch, true).unwrap();
+        let candidates = [&published, &audio, &video, &audio_repair];
+        let registry = CircuitRendezvousRegistry::with_params(8, 300);
+        let table = CircuitTable::new();
+        let link = [0x8d; 32];
+        for (index, registration) in candidates.iter().enumerate() {
+            let id = index as u32 + 1;
+            table
+                .install(
+                    &CircuitInstall {
+                        circuit_id_in: id,
+                        circuit_id_out: 0,
+                        circuit_key: [9; 32],
+                        cell_bytes: CircuitCellBytes::legacy(),
+                    },
+                    link,
+                    None,
+                    0,
+                )
+                .unwrap();
+            let reg_pk = STANDARD
+                .decode(&registration.keypair.public_key)
+                .unwrap()
+                .try_into()
+                .unwrap();
+            let bytes = CircuitRegisterPayload::signing_bytes(
+                &registration.cookie,
+                &reg_pk,
+                index as u64 + 1,
+            );
+            let signature = veil_crypto::sign_message(
+                veil_types::SignatureAlgorithm::Ed25519,
+                &registration.keypair.public_key,
+                &registration.keypair.private_key,
+                &bytes,
+            )
+            .unwrap();
+            let payload = CircuitRegisterPayload {
+                cookie: registration.cookie,
+                reg_pk,
+                epoch: index as u64 + 1,
+                signature,
+            };
+            registry
+                .register(&payload, table.lookup_forward(&link, id).unwrap(), 0)
+                .unwrap();
+        }
+        // The repaired audio route has its own cookie; neither video nor the
+        // published file/receive route is displaced by its higher generation.
+        assert_eq!(registry.len(), 4);
+        for (index, registration) in candidates.iter().enumerate() {
+            assert_eq!(
+                registry.lookup(&registration.cookie).unwrap().circuit_id_in,
+                index as u32 + 1
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn isolated_media_pools_do_not_wait_for_file_or_video_pool_locks() {
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        // Private offline fixture: no listeners, seeds, persistence or mining.
+        let mut config = veil_cfg::build_stub_config_with_ephemeral_identity(false).unwrap();
+        config.identity.as_mut().unwrap().role = veil_cfg::NodeRole::Leaf;
+        config.global.meeting_points = veil_cfg::MeetingPoints::Only(Vec::new());
+        config.anonymity.receive_anonymous = false;
+        veil_cfg::save_config(&path, &config).unwrap();
+        let mut runtime = veil_node_runtime::NodeRuntime::start(&path, true)
+            .await
+            .unwrap();
+        let me = runtime.access().local_node_id();
+        let (in_tx, _in_rx) = tokio::sync::mpsc::channel(4);
+        let files = super::try_open_circuit(me, in_tx, CircuitMode::PublishedRendezvous).unwrap();
+        let audio = files.isolated_producer(crate::media::LocalMediaPlane::Primary);
+        let video = files.isolated_producer(crate::media::LocalMediaPlane::Secondary);
+        assert!(!files.private_outbound_registration);
+        assert!(audio.private_outbound_registration && video.private_outbound_registration);
+        // Receive authentication remains common to all three local producers.
+        assert!(Arc::ptr_eq(&files.peer_tags, &audio.peer_tags));
+        assert!(Arc::ptr_eq(&files.peer_aliases, &video.peer_aliases));
+        let held_files = files.outbound_circuits.lock().await;
+        let held_video = video.outbound_circuits.lock().await;
+        let held_video_opening = video.outbound_opening.lock().await;
+        let sender = crate::media::cipher_for_test(&[0x8b; 32], &[1; 32], &[2; 32]).unwrap();
+        let sealed = sender.seal(b"offline fixture").unwrap();
+        let result = tokio::time::timeout(Duration::from_millis(100), async {
+            audio
+                .ensure_outbound_opening([0x8b; 32], super::RouteClass::Bulk)
+                .await;
+            audio.send_datagram([0x8b; 32], &sealed).await
+        })
+        .await;
+        drop((held_files, held_video, held_video_opening));
+        runtime.stop().await.unwrap();
+        assert!(
+            !result.unwrap(),
+            "no route on the offline fixture; no stall either"
+        );
+    }
 
     /// Install one circuit in a relay-side table and let `secs_between` seconds
     /// pass between touches, `touches` times, running the GC at every step the
