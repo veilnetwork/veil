@@ -2006,6 +2006,14 @@ impl PeerDeviceKeys {
             .map(|(_, _, until)| *until)
     }
 
+    /// Whether an unexpired verified certificate names this instance.
+    #[must_use]
+    pub fn names_instance(&self, instance: &[u8; 16], now_unix: u64) -> bool {
+        self.keys
+            .iter()
+            .any(|(i, _, until)| i == instance && now_unix <= *until)
+    }
+
     /// The most recently published key, for callers that need ONE — a
     /// diagnostic, or a readiness check.
     #[must_use]
@@ -2185,6 +2193,24 @@ impl RatchetRuntime {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get(peer_node_id)
             .cloned()
+    }
+
+    /// Find the identity whose verified certificates name the payload's sending
+    /// instance. This chooses a decryption context, never grants provenance:
+    /// `open_payload` must still authenticate the ciphertext and device key.
+    /// Ambiguous instance IDs fail closed rather than depend on map order.
+    pub fn peer_identity_for_payload(&self, payload: &[u8], now_unix: u64) -> Option<[u8; 32]> {
+        let (instance, _) = payload_instances(payload)?;
+        let keys = self
+            .peer_ratchet_keys
+            .read()
+            .unwrap_or_else(|p| p.into_inner());
+        let mut identities = keys
+            .iter()
+            .filter(|(_, devices)| devices.names_instance(&instance, now_unix))
+            .map(|(identity, _)| *identity);
+        let identity = identities.next()?;
+        identities.next().is_none().then_some(identity)
     }
 
     /// Seal for a peer whose certificate the caller has verified. See [`seal`].
