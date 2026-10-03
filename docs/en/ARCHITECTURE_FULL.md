@@ -232,6 +232,8 @@ For relayed `Delivery::Forward`, neither these bits nor the sender's body hint g
 
 The network policy permits preferential relay service only for PoW walk peer discovery, not for user calls. Call quality must come from P2P or an operator-controlled relay and endpoint scheduling. Separating audio, video/screen sharing, and other application traffic into independent Veil transport flows remains work in progress; the existing media datagram lane still shares one QUIC connection and its congestion budget. Flow separation must not introduce audio/video labels or user-selected priority at intermediary relays.
 
+Endpoint scheduling now has separate ordinary and reserved session ingress channels. Filling the ordinary queue cannot consume the small reserved queue. For direct/Delivery calls, native media sends audio/RTCP into the local reserved lane and video into the local bulk lane; those batches never combine the two. Anonymous circuit media still needs the same separation. The choice is carried only in the local IPC header and is stripped by network encoding. The sender also leaves 4 KiB free in its QUIC datagram buffer before admitting local bulk cells, so new video cannot evict queued latency-sensitive cells. Intermediate `Forward` processing uses the same neutral queue for both. This provides queue isolation, not separate physical audio/video connections; the common native sender and QUIC connection still need further separation.
+
 ### 5.3 Frame families
 
 [`proto/family.rs`](../../crates/veil-proto/src/family.rs), enum `FrameFamily`:

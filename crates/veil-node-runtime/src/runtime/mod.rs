@@ -463,7 +463,7 @@ pub struct AttachedDebugSession {
     /// receiver instead of calling `register` again — closing the
     /// TOCTOU window where two concurrent handshakes could both pass
     /// the dup-check and double-register.
-    pub reserved_outbox_rx: tokio::sync::mpsc::Receiver<veil_session::PriorityFrame>,
+    pub reserved_outbox_rx: veil_session::FrameOutbox,
     _guard: SessionGuard,
 }
 

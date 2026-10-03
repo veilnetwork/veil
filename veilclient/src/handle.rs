@@ -792,8 +792,28 @@ impl AppSender {
         dst_endpoint_id: u32,
         data: Vec<u8>,
     ) -> Result<(), ClientError> {
+        self.send_relay_media_sealed_on_local_lane_owned(
+            0,
+            dst_node_id,
+            dst_app_id,
+            dst_endpoint_id,
+            data,
+        )
+        .await
+    }
+
+    /// Select a process-local queue without exposing that choice to relays.
+    pub async fn send_relay_media_sealed_on_local_lane_owned(
+        &self,
+        local_priority: u8,
+        dst_node_id: [u8; 32],
+        dst_app_id: [u8; 32],
+        dst_endpoint_id: u32,
+        data: Vec<u8>,
+    ) -> Result<(), ClientError> {
         self.writer
-            .write_app_ipc_send_owned(
+            .write_app_ipc_send_on_local_lane_owned(
+                local_priority,
                 &dst_node_id,
                 &self.app_id,
                 &dst_app_id,
@@ -822,6 +842,34 @@ impl AppSender {
         payload_type: u32,
         data: &[u8],
     ) -> Result<(), ClientError> {
+        self.send_rt_data_on_local_lane(
+            0,
+            dst_node_id,
+            dst_app_id,
+            dst_endpoint_id,
+            seq,
+            timestamp_us,
+            marker,
+            payload_type,
+            data,
+        )
+        .await
+    }
+
+    /// The local queue choice is stripped by the daemon's network encoder.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn send_rt_data_on_local_lane(
+        &self,
+        local_priority: u8,
+        dst_node_id: [u8; 32],
+        dst_app_id: [u8; 32],
+        dst_endpoint_id: u32,
+        seq: u32,
+        timestamp_us: u64,
+        marker: u8,
+        payload_type: u32,
+        data: &[u8],
+    ) -> Result<(), ClientError> {
         let payload = AppIpcRtSendPayload {
             dst_node_id,
             src_app_id: self.app_id,
@@ -834,7 +882,11 @@ impl AppSender {
             data: data.to_vec(),
         };
         self.writer
-            .write_frame(LocalAppMsg::AppRtSend as u16, &payload.encode())
+            .write_frame_on_local_lane(
+                local_priority,
+                LocalAppMsg::AppRtSend as u16,
+                &payload.encode(),
+            )
             .await
     }
 

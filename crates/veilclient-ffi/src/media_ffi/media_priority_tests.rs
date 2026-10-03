@@ -14,7 +14,7 @@
 
 use super::{
     RELAY_VIDEO_FRAME_MAX_BYTES, RelayMediaStats, RelayVideoFrameAssembler, RelayVideoFramePush,
-    media_is_vp8_rtp, media_wire_cells, veil_media_repair_channel,
+    media_cell_is_video, media_is_vp8_rtp, media_wire_cells, veil_media_repair_channel,
 };
 
 fn video_packet(timestamp: u32, marker: bool, fill: u8) -> Vec<u8> {
@@ -34,6 +34,29 @@ fn media_priority_classifies_only_vp8_rtp_as_video() {
     assert!(!media_is_vp8_rtp(&[0x80, 72, 0, 1])); // RTCP mux range.
     assert!(!media_is_vp8_rtp(&[0x40, 96, 0, 1])); // Not RTP v2.
     assert!(!media_is_vp8_rtp(&[0x80]));
+}
+
+#[test]
+fn batching_never_puts_video_into_an_audio_cell() {
+    let audio = vec![0x80, 111, 1, 2, 3, 4];
+    let packets = vec![
+        audio.clone(),
+        audio.clone(),
+        video_packet(7, false, 1),
+        video_packet(7, true, 2),
+        audio,
+    ];
+    let cells = media_wire_cells(packets.clone(), true);
+    assert_eq!(cells.len(), 3);
+    assert_eq!(
+        cells
+            .iter()
+            .map(|cell| media_cell_is_video(cell))
+            .collect::<Vec<_>>(),
+        vec![false, true, false]
+    );
+    assert_eq!(expand_wire_cells(&cells), packets);
+    assert!(!media_cell_is_video(&[crate::media::MEDIA_BATCH_MAGIC]));
 }
 
 #[test]
