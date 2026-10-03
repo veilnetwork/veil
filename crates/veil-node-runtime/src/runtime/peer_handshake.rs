@@ -91,6 +91,7 @@ pub struct RemoteHandshakeInfo {
     pub supports_realtime_rekey: bool,
     /// Negotiated opaque datagram channels, with no application-role labels.
     pub supports_datagram_flows: bool,
+    pub supports_circuit_datagrams: bool,
     /// Bounded UDP reflector port advertised by this authenticated peer.
     /// The runtime combines it with transport metadata only after all session
     /// admission gates pass.
@@ -853,6 +854,9 @@ pub async fn register_connection_session(
                             .supports_realtime_datagrams(),
                         supports_realtime_rekey: r.remote_capabilities.supports_realtime_rekey(),
                         supports_datagram_flows: r.remote_capabilities.supports_datagram_flows(),
+                        supports_circuit_datagrams: r
+                            .remote_capabilities
+                            .supports_circuit_datagrams(),
                         sovereign_node_id,
                         udp_reflector_port,
                         shared_udp_reflectors,
@@ -1414,6 +1418,7 @@ pub async fn register_connection_session(
                 handle,
                 peer_rotates: remote_identity.supports_realtime_rekey,
                 peer_flows: remote_identity.supports_datagram_flows,
+                peer_circuit_datagrams: remote_identity.supports_circuit_datagrams,
             }),
         metrics: runtime.metrics.clone(),
         peer_id: remote_identity.node_id,

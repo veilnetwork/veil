@@ -664,6 +664,7 @@ where
                     let remote_capabilities = CapabilitiesPayload {
                         roles_supported: 0,
                         flags: 0,
+                        extra_flags: 0,
                         discovery_mode: 0,
                     };
                     return Ok(OvlHandshakeResult {
@@ -810,6 +811,7 @@ where
                 let remote_capabilities = CapabilitiesPayload {
                     roles_supported: 0,
                     flags: 0,
+                    extra_flags: 0,
                     discovery_mode: 0,
                 };
                 return Ok(OvlHandshakeResult {
@@ -1271,6 +1273,7 @@ where
     // bit keeps the static key it always had (report12 V-M12).
     caps.flags |= cap_flags::SUPPORTS_REALTIME_REKEY;
     caps.flags |= cap_flags::SUPPORTS_DATAGRAM_FLOWS;
+    caps.extra_flags |= veil_proto::session::cap_extra_flags::SUPPORTS_CIRCUIT_DATAGRAMS;
     let caps_bytes = caps.encode();
     let caps_wire =
         write_frame(stream, family, SessionMsg::Capabilities as u16, &caps_bytes).await?;
@@ -2347,6 +2350,9 @@ mod tests {
         let (r1, r2) = tokio::join!(t1, t2);
         let r1 = r1.unwrap();
         let r2 = r2.unwrap();
+
+        assert!(r1.remote_capabilities.supports_circuit_datagrams());
+        assert!(r2.remote_capabilities.supports_circuit_datagrams());
 
         // Node IDs are BLAKE3(verifying_key_bytes), not BLAKE3(seed).
         let id_a = test_identity(0xAA).node_id;

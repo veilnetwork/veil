@@ -39,6 +39,7 @@ veil-types = { path = "../veil-types" }
 veil-util = { path = "../veil-util" }
 
 [dev-dependencies]
+veil-anonymity = { path = "../veil-anonymity" }
 veil-app = { path = "../veil-app" }
 base64 = "0.22"
 blake3 = "1"

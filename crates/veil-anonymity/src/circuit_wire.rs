@@ -87,7 +87,22 @@ impl CircuitDataPayload {
     /// a legal size at all, and that the length field and the frame agree.
     /// The per-circuit check is [`Self::expect_cell`], applied by the caller the
     /// moment it knows which circuit this is.
+    /// Validate framing without allocating/copying the ciphertext. Session
+    /// queue classification calls this repeatedly on the same borrowed cell.
+    pub fn validate(blob: &[u8]) -> Result<(), CircuitError> {
+        Self::decode_header(blob).map(|_| ())
+    }
+
     pub fn decode(blob: &[u8]) -> Result<Self, CircuitError> {
+        let (circuit_id, seq, len) = Self::decode_header(blob)?;
+        Ok(Self {
+            circuit_id,
+            seq,
+            ciphertext: blob[Self::HEADER_LEN..Self::HEADER_LEN + len].to_vec(),
+        })
+    }
+
+    fn decode_header(blob: &[u8]) -> Result<(CircuitId, u32, usize), CircuitError> {
         if blob.len() < Self::HEADER_LEN {
             return Err(CircuitError::Malformed(format!(
                 "circuit data too short: {} < {}",
@@ -118,11 +133,7 @@ impl CircuitDataPayload {
                 Self::HEADER_LEN + len
             )));
         }
-        Ok(Self {
-            circuit_id,
-            seq,
-            ciphertext: blob[Self::HEADER_LEN..Self::HEADER_LEN + len].to_vec(),
-        })
+        Ok((circuit_id, seq, len))
     }
 
     /// Reject a cell that is not THIS circuit's size.

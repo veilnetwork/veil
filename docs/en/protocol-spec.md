@@ -176,7 +176,7 @@ Before two nodes exchange anything else, they run a *handshake* — a short open
 [..]                 mlkem_pk       bytes   (1184 B for ML-KEM-768)
 ```
 
-### 3.4 CapabilitiesPayload (3 bytes)
+### 3.4 CapabilitiesPayload (3-byte prefix, optional extension)
 
 ```text
 [0]     roles_supported      u8  (bit 0 = LEAF, bit 3 = CORE; the rest are reserved)
@@ -188,10 +188,23 @@ Before two nodes exchange anything else, they run a *handshake* — a short open
                                   forward-compat default)
 ```
 
-**Backward compatibility:** older peers send only 2 bytes, without the
-`discovery_mode` field. The decoder fills the missing byte with `0` (Public) —
-those peers predate opt-in privacy, so Public is the right default for them. Any
-payload of `>= 2` bytes is accepted.
+The current decoder requires the three-byte prefix. An optional extension is
+encoded as `["VEIL-CAPS-EXT-01" (16 bytes)][extra_flags u8]` immediately after it.
+A missing/truncated marker or marker byte mismatch leaves `extra_flags` zero,
+including old peers' arbitrary handshake padding. Older decoders consume the
+prefix and ignore trailing bytes. The entire padded body is included in the
+authenticated handshake transcript.
+
+`extra_flags` bit 0 is `SUPPORTS_CIRCUIT_DATAGRAMS`: generic loss-tolerant circuit
+cells (`RelayChain::CircuitDatagram`, type 9), carrying the same fixed padded
+ciphertext as `CircuitData` (type 5). It provides no application-role label or
+relay scheduling privilege. The next hop must advertise this bit and
+`SUPPORTS_REALTIME_DATAGRAMS`, and its transport must expose QUIC datagrams.
+Otherwise the session sends the cell as legacy `CircuitData` on the ordered
+stream. The older `SUPPORTS_DATAGRAM_FLOWS` bit alone is insufficient. Reliable
+files, introductions, setup probes and other control cells retain `CircuitData`.
+Relays preserve the generic datagram property through forward/return re-tagging
+and rendezvous splice, with ordinary priority and equal service accounting.
 
 **What `discovery_mode` means.** It controls how willing a peer is to be found by
 strangers:
