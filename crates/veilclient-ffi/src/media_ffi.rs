@@ -682,6 +682,7 @@ pub unsafe extern "C" fn veil_media_open_relay_channel(
                         continue;
                     };
                     drop(pkt); // plaintext moved out of scope; see the onion drain
+                    media::trace_sealed_cell("relay_send", &peer, sealed.as_bytes());
                     let ipc_started = std::time::Instant::now();
                     let result = sender
                         .send_relay_media_sealed_owned(
