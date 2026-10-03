@@ -40,7 +40,7 @@ fn media_is_vp8_rtp(payload: &[u8]) -> bool {
 
 // Local scheduling classification. This is computed before sealing and is
 // sent only to our IPC daemon; no audio/video class is added to relay frames.
-#[cfg(all(test, feature = "node-embedded"))]
+#[cfg(feature = "node-embedded")]
 fn media_cell_is_video(cell: &[u8]) -> bool {
     if cell.first() != Some(&media::MEDIA_BATCH_MAGIC) {
         return media_is_vp8_rtp(cell);
@@ -51,6 +51,41 @@ fn media_cell_is_video(cell: &[u8]) -> bool {
     let len = u16::from_be_bytes([len_bytes[0], len_bytes[1]]) as usize;
     cell.get(5..5usize.saturating_add(len))
         .is_some_and(media_is_vp8_rtp)
+}
+
+#[cfg(feature = "node-embedded")]
+fn media_cell_plane(cell: &[u8]) -> media::LocalMediaPlane {
+    if media_cell_is_video(cell) {
+        media::LocalMediaPlane::Secondary
+    } else {
+        media::LocalMediaPlane::Primary
+    }
+}
+
+/// Fold only packets already ready in this producer's queue. Overflow is kept
+/// for the next cell; the other producer is never drained into this epoch.
+#[cfg(feature = "node-embedded")]
+fn media_ready_batch(
+    first: Vec<u8>,
+    rx: &mut mpsc::Receiver<Vec<u8>>,
+    max_body: usize,
+) -> (Option<Vec<u8>>, Option<Vec<u8>>) {
+    let mut body_len = 2 + 2 + first.len();
+    let mut packets = vec![first];
+    let mut pending = None;
+    while packets.len() < 12 {
+        let Ok(packet) = rx.try_recv() else {
+            break;
+        };
+        let next_len = body_len.saturating_add(2 + packet.len());
+        if next_len > max_body {
+            pending = Some(packet);
+            break;
+        }
+        body_len = next_len;
+        packets.push(packet);
+    }
+    (media::media_cell(packets, max_body), pending)
 }
 
 #[cfg(all(test, feature = "node-embedded"))]
@@ -82,7 +117,7 @@ struct MediaOutboundCell {
 }
 
 /// Shared mechanics, independent instances: neither pump waits for the other.
-/// The only shared critical section is the synchronous cipher sequence/seal.
+/// Each producer also owns its cipher epoch and synchronous seal lock.
 #[cfg(feature = "node-embedded")]
 async fn drain_media_packets<F, Fut>(
     mut rx: mpsc::Receiver<Vec<u8>>,
@@ -119,7 +154,7 @@ async fn drain_media_packets<F, Fut>(
             } else {
                 (0, 0)
             };
-            let Some(sealed) = cipher.seal(&packet) else {
+            let Some(sealed) = cipher.seal_on_plane(media_cell_plane(&packet), &packet) else {
                 continue;
             };
             drop(packet);
@@ -152,7 +187,8 @@ async fn drain_relay_video<F, Fut>(
         let started = std::time::Instant::now();
         let legacy = batching.load(std::sync::atomic::Ordering::Relaxed) == MEDIA_BATCHING_LEGACY;
         for cell in media_wire_cells(frame.packets, legacy) {
-            let Some(sealed) = cipher.seal(&cell) else {
+            let Some(sealed) = cipher.seal_on_plane(media::LocalMediaPlane::Secondary, &cell)
+            else {
                 continue;
             };
             drop(cell);
@@ -275,8 +311,9 @@ pub unsafe extern "C" fn veil_media_open_channel(
         let mut consecutive_drops: u32 = 0;
         let mut pending: Option<Vec<u8>> = None;
         loop {
-            let first = if let Some(pkt) = pending.take() {
-                pkt
+            let (first, video) = if let Some(pkt) = pending.take() {
+                let video = media_is_vp8_rtp(&pkt);
+                (pkt, video)
             } else {
                 tokio::select! {
                     biased;
@@ -290,44 +327,26 @@ pub unsafe extern "C" fn veil_media_open_channel(
                         send_hub.media_open_channel(peer).await;
                         continue;
                     }
-                    Some(pkt) = rx_hi.recv() => pkt,
-                    Some(pkt) = rx_video.recv() => pkt,
+                    Some(pkt) = rx_hi.recv() => (pkt, false),
+                    Some(pkt) = rx_video.recv() => (pkt, true),
                     else => break,
                 }
             };
             // WebRTC emits a video frame as a tight RTP burst. Drain packets
             // already queued at this instant into one padded onion cell; never
             // wait for another packet, so batching adds no timer latency.
-            const MAX_BATCH_PACKETS: usize = 12;
-            let mut body_len = 2 + 2 + first.len();
-            let mut packets = vec![first];
-            while packets.len() < MAX_BATCH_PACKETS {
-                // The first packet above remains biased toward audio/RTCP, but
-                // once that real-time slot is secured, drain video first. Opus
-                // is effectively continuous; preferring `rx_hi` here as well
-                // could starve every VP8 keyframe while audio kept flowing.
-                // A batch therefore carries prompt audio plus as much of the
-                // already-queued video burst as fits in the same padded cell.
-                let next = rx_video.try_recv().or_else(|_| rx_hi.try_recv());
-                let Ok(pkt) = next else {
-                    break;
-                };
-                let next_len = body_len.saturating_add(2 + pkt.len());
-                if next_len > anon_stream::media_batch_body_max() {
-                    pending = Some(pkt);
-                    break;
-                }
-                body_len = next_len;
-                packets.push(pkt);
-            }
+            let rx = if video { &mut rx_video } else { &mut rx_hi };
+            let (cell, overflow) =
+                media_ready_batch(first, rx, anon_stream::media_batch_body_max());
+            pending = overflow;
             // Fold to ONE cell and seal it. A cell that will not seal (the
             // sequence space is exhausted) is dropped, never sent in the
             // clear — the splice relay reads whatever goes down this circuit.
             // Not a route problem either, so it must not arm the re-warm.
-            let Some(cell) = media::media_cell(packets, anon_stream::media_batch_body_max()) else {
+            let Some(cell) = cell else {
                 continue;
             };
-            let Some(sealed) = cipher_task.seal(&cell) else {
+            let Some(sealed) = cipher_task.seal_on_plane(media_cell_plane(&cell), &cell) else {
                 continue;
             };
             // The plaintext is MOVED out of scope the moment it is sealed. No

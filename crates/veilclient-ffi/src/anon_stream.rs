@@ -1582,7 +1582,7 @@ impl CircuitCells {
         // circuit the peer_tag is opaque, so without the intro the receiver
         // can't map peer_tag→our node and would mis-attribute the datagram.
         // Unlike the reliable stream, a call establishes NO prior handshake on
-        // this circuit (signaling rides the mailbox), so media must carry the
+        // this circuit (signaling uses a separate route), so media must carry the
         // intro itself. Each cell pads to a full circuit cell regardless, so the
         // intro bytes are effectively free; the only cost is a per-cell seal
         // (negligible at media rates — optimizable to first-cell-per-route once
