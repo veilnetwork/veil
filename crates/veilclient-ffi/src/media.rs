@@ -3,10 +3,11 @@
 //!
 //! Media (RTP/RTCP for calls) reaches a peer over one of three transports —
 //! the anonymous onion circuit (see [`crate::anon_stream`]), a direct P2P app
-//! datagram, or the ordinary Delivery relay. All three are lossy by design:
-//! a datagram is dropped rather than retransmitted on loss, which is exactly
-//! what a real-time codec wants (PLC/FEC absorb the gap and a stale packet is
-//! worthless anyway).
+//! datagram, or the ordinary Delivery relay. Direct/Delivery media can use the
+//! negotiated lossy datagram lane. Anonymous media drops at local enqueue
+//! failure and has no application ARQ, but its CircuitData cells still use the
+//! ordered hop transport. Separate circuit ownership alone does not remove
+//! that transport's retransmission delay and head-of-line blocking.
 //!
 //! # Every transport carries the SAME sealed cell
 //!
@@ -434,6 +435,19 @@ impl SealedMediaCell {
 pub(crate) struct MediaCipher {
     tx: [Mutex<MediaCipherTx>; 2],
     rx: Mutex<MediaCipherRx>,
+}
+
+/// Other transport fixtures create their ciphers under the same cache gate as
+/// the route-rebuild tests. They may otherwise evict the eight-peer history
+/// while those tests deliberately tear down and recreate a receiver.
+#[cfg(test)]
+pub(crate) fn cipher_for_test(
+    peer: &[u8; 32],
+    tx_key: &[u8; 32],
+    rx_key: &[u8; 32],
+) -> Option<MediaCipher> {
+    let _guard = tests::TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    MediaCipher::new(peer, tx_key, rx_key)
 }
 
 /// Process-local selection only. Never serialized into a media cell.
@@ -1114,7 +1128,7 @@ mod tests {
 
     static RX_CALLS: AtomicUsize = AtomicUsize::new(0);
     static RX_BYTES: AtomicUsize = AtomicUsize::new(0);
-    static TEST_LOCK: Mutex<()> = Mutex::new(());
+    pub(super) static TEST_LOCK: Mutex<()> = Mutex::new(());
 
     extern "C" fn record(_ctx: *mut c_void, _ptr: *const u8, len: usize) {
         RX_CALLS.fetch_add(1, Ordering::SeqCst);
@@ -1420,6 +1434,7 @@ mod tests {
 
     #[test]
     fn a_held_secondary_cipher_lock_does_not_block_primary() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let sender = cipher([0xb4; 32], [0x75; 32], [0x76; 32]);
         let held = sender.tx[1].lock().unwrap();
         let (tx, rx) = std::sync::mpsc::channel();
@@ -1437,6 +1452,7 @@ mod tests {
 
     #[test]
     fn parallel_producers_use_distinct_keys_and_unique_sequences() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let sender = cipher([0xb5; 32], [0x77; 32], [0x78; 32]);
         let workers = [LocalMediaPlane::Primary, LocalMediaPlane::Secondary].map(|plane| {
             let sender = Arc::clone(&sender);
@@ -1671,6 +1687,7 @@ mod tests {
 
     #[test]
     fn a_channel_cannot_be_opened_with_unusable_keys() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let peer = [0xf3u8; 32];
         assert!(MediaCipher::new(&peer, &[1u8; 32], &[2u8; 32]).is_some());
         assert!(
@@ -1946,9 +1963,7 @@ mod v01_quiescence_tests {
     }
 
     fn cipher() -> Arc<MediaCipher> {
-        Arc::new(
-            MediaCipher::new(&[0x33u8; 32], &[0xa1u8; 32], &[0xa2u8; 32]).expect("usable keys"),
-        )
+        Arc::new(cipher_for_test(&[0x33u8; 32], &[0xa1u8; 32], &[0xa2u8; 32]).expect("usable keys"))
     }
 
     /// Unregistering must not return while a dispatch is inside the callback.

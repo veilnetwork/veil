@@ -14,17 +14,18 @@
 
 use super::{
     MEDIA_BATCHING_COMPACT_RELAY, MEDIA_BATCHING_OFF, MEDIA_CHANNELS, MEDIA_NEXT_ID, MediaChannel,
-    MediaSenderSlot, MediaVideoIngress, RelayVideoFrame, drain_media_packets, drain_relay_video,
-    media_batched_cells, media_ready_batch, veil_media_close_channel, veil_media_send_datagram,
+    MediaSenderSlot, MediaVideoIngress, RelayVideoFrame, drain_anonymous_media,
+    drain_media_packets, drain_relay_video, media_batched_cells, media_ready_batch,
+    veil_media_close_channel, veil_media_send_datagram,
 };
 use super::{
     RELAY_VIDEO_FRAME_MAX_BYTES, RelayMediaStats, RelayVideoFrameAssembler, RelayVideoFramePush,
     media_cell_is_video, media_is_vp8_rtp, media_wire_cells, veil_media_repair_channel,
 };
-use crate::media::MediaCipher;
+use crate::media::{LocalMediaPlane, cipher_for_test};
 use std::sync::{
     Arc,
-    atomic::{AtomicU8, Ordering},
+    atomic::{AtomicU8, AtomicUsize, Ordering},
 };
 use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, Notify, mpsc};
@@ -221,8 +222,8 @@ fn relay_stats_separate_queue_lock_and_ipc_holds() {
 // delivery to exercise the exact stall that a common sender used to cause.
 async fn audio_continues_while_video_writer_is_blocked(relay: bool) {
     let peer = if relay { [0xf1; 32] } else { [0xf2; 32] };
-    let cipher = Arc::new(MediaCipher::new(&peer, &[1; 32], &[2; 32]).unwrap());
-    let receiver = MediaCipher::new(&peer, &[2; 32], &[1; 32]).unwrap();
+    let cipher = Arc::new(cipher_for_test(&peer, &[1; 32], &[2; 32]).unwrap());
+    let receiver = cipher_for_test(&peer, &[2; 32], &[1; 32]).unwrap();
     let mode = Arc::new(AtomicU8::new(if relay {
         MEDIA_BATCHING_COMPACT_RELAY
     } else {
@@ -336,6 +337,210 @@ async fn audio_continues_while_video_writer_is_blocked(relay: bool) {
 }
 
 #[tokio::test]
+async fn anonymous_audio_continues_during_blocked_video_send_or_warm() {
+    for block_warm in [false, true] {
+        let cipher = Arc::new(cipher_for_test(&[0x87; 32], &[1; 32], &[2; 32]).unwrap());
+        let receiver = cipher_for_test(&[0x88; 32], &[2; 32], &[1; 32]).unwrap();
+        let (audio_tx, audio_rx) = mpsc::channel(2);
+        let (video_tx, video_rx) = mpsc::channel(2);
+        let (audio_repair_tx, audio_repair_rx) = mpsc::channel(1);
+        let (video_repair_tx, video_repair_rx) = mpsc::channel(1);
+        let (received_tx, mut received_rx) = mpsc::channel(4);
+        let audio_received = received_tx.clone();
+        let audio_task = tokio::spawn(drain_anonymous_media(
+            audio_rx,
+            audio_repair_rx,
+            Arc::clone(&cipher),
+            LocalMediaPlane::Primary,
+            move |cell| {
+                let tx = audio_received.clone();
+                async move { tx.send(cell.into_vec()).await.is_ok() }
+            },
+            || async {},
+        ));
+        let entered = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let send_entered = Arc::clone(&entered);
+        let send_release = Arc::clone(&release);
+        let video_task = tokio::spawn(drain_anonymous_media(
+            video_rx,
+            video_repair_rx,
+            cipher,
+            LocalMediaPlane::Secondary,
+            move |cell| {
+                let tx = received_tx.clone();
+                let entered = Arc::clone(&send_entered);
+                let release = Arc::clone(&send_release);
+                async move {
+                    if !block_warm {
+                        entered.notify_one();
+                        release.notified().await;
+                    }
+                    tx.send(cell.into_vec()).await.is_ok()
+                }
+            },
+            {
+                let entered = Arc::clone(&entered);
+                let release = Arc::clone(&release);
+                move || {
+                    let entered = Arc::clone(&entered);
+                    let release = Arc::clone(&release);
+                    async move {
+                        if block_warm {
+                            entered.notify_one();
+                            release.notified().await;
+                        }
+                    }
+                }
+            },
+        ));
+        let video = video_packet(7, true, 1);
+        video_tx.send(video.clone()).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(1), entered.notified())
+            .await
+            .unwrap();
+        let audio = vec![0x80, 111, 1, 2, 3, 4];
+        audio_tx.send(audio.clone()).await.unwrap();
+        let cell = tokio::time::timeout(Duration::from_millis(100), received_rx.recv())
+            .await
+            .expect("anonymous audio must not wait for video")
+            .unwrap();
+        assert_eq!(receiver.open(&cell), Some(audio));
+        release.notify_one();
+        let cell = tokio::time::timeout(Duration::from_secs(1), received_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(receiver.open(&cell), Some(video));
+        drop((audio_tx, video_tx, audio_repair_tx, video_repair_tx));
+        for task in [audio_task, video_task] {
+            tokio::time::timeout(Duration::from_secs(1), task)
+                .await
+                .unwrap()
+                .unwrap();
+        }
+    }
+}
+
+#[tokio::test]
+async fn anonymous_active_producers_rewarm_on_repair_and_stop_with_closed_ingress() {
+    for plane in [LocalMediaPlane::Primary, LocalMediaPlane::Secondary] {
+        let cipher = Arc::new(cipher_for_test(&[0x8e; 32], &[1; 32], &[2; 32]).unwrap());
+        let receiver = cipher_for_test(&[0x8f; 32], &[2; 32], &[1; 32]).unwrap();
+        let (tx, rx) = mpsc::channel(1);
+        let (repair_tx, repair_rx) = mpsc::channel(1);
+        let (warm_tx, mut warm_rx) = mpsc::channel(4);
+        let (sent_tx, mut sent_rx) = mpsc::channel(1);
+        let task = tokio::spawn(drain_anonymous_media(
+            rx,
+            repair_rx,
+            cipher,
+            plane,
+            move |cell| {
+                let tx = sent_tx.clone();
+                async move { tx.send(cell.into_vec()).await.is_ok() }
+            },
+            move || {
+                let tx = warm_tx.clone();
+                async move {
+                    tx.send(()).await.unwrap();
+                }
+            },
+        ));
+        let packet = vec![0x80, 111, 1, 2];
+        tx.send(packet.clone()).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(1), warm_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let cell = tokio::time::timeout(Duration::from_secs(1), sent_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(receiver.open(&cell), Some(packet));
+        repair_tx.send(()).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(1), warm_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        drop(tx);
+        tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(warm_rx.try_recv().is_err(), "one warm per accepted repair");
+    }
+}
+
+#[tokio::test]
+async fn anonymous_video_does_not_construct_unused_routes() {
+    let cipher = Arc::new(cipher_for_test(&[0x89; 32], &[1; 32], &[2; 32]).unwrap());
+    let (tx, rx) = mpsc::channel(1);
+    let (repair_tx, repair_rx) = mpsc::channel(1);
+    let warms = Arc::new(AtomicUsize::new(0));
+    let task = tokio::spawn(drain_anonymous_media(
+        rx,
+        repair_rx,
+        cipher,
+        LocalMediaPlane::Secondary,
+        |_| async { true },
+        {
+            let warms = Arc::clone(&warms);
+            move || {
+                let warms = Arc::clone(&warms);
+                async move {
+                    warms.fetch_add(1, Ordering::SeqCst);
+                }
+            }
+        },
+    ));
+    repair_tx.send(()).await.unwrap();
+    // Closing ingress ends the task even if repair ingress is still alive.
+    drop(tx);
+    tokio::time::timeout(Duration::from_secs(1), task)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(warms.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn anonymous_repair_fans_out_with_independent_backpressure() {
+    let (tx_hi, _hi_rx) = mpsc::channel(1);
+    let (tx_video, _video_rx) = mpsc::channel(1);
+    let (repair_hi, mut repair_hi_rx) = mpsc::channel(1);
+    let (repair_video, mut repair_video_rx) = mpsc::channel(1);
+    let id = MEDIA_NEXT_ID.fetch_add(1, Ordering::Relaxed);
+    MEDIA_CHANNELS
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .insert(
+            id,
+            MediaChannel {
+                tx_hi,
+                video: MediaVideoIngress::Packets(tx_video),
+                repair_tx: Some([repair_hi, repair_video]),
+                peer: [0x8a; 32],
+                task: tokio::spawn(std::future::pending()),
+                video_task: Some(tokio::spawn(std::future::pending())),
+                video_sender: None,
+                sender_app_id: None,
+                batching: None,
+                cipher: Arc::new(cipher_for_test(&[0x8a; 32], &[1; 32], &[2; 32]).unwrap()),
+                relay_stats: None,
+            },
+        );
+    assert_eq!(unsafe { veil_media_repair_channel(id) }, 0);
+    assert_eq!(unsafe { veil_media_repair_channel(id) }, 1);
+    repair_hi_rx.try_recv().unwrap();
+    assert_eq!(unsafe { veil_media_repair_channel(id) }, 0);
+    repair_hi_rx.try_recv().unwrap();
+    repair_video_rx.try_recv().unwrap();
+    assert!(repair_video_rx.try_recv().is_err());
+    unsafe { veil_media_close_channel(id) };
+}
+
+#[tokio::test]
 async fn direct_audio_does_not_wait_for_video_writer() {
     audio_continues_while_video_writer_is_blocked(false).await;
 }
@@ -380,7 +585,7 @@ async fn closing_channel_cancels_both_blocked_pumps() {
                 video_sender: None,
                 sender_app_id: None,
                 batching: None,
-                cipher: Arc::new(MediaCipher::new(&[0xf3; 32], &[1; 32], &[2; 32]).unwrap()),
+                cipher: Arc::new(cipher_for_test(&[0xf3; 32], &[1; 32], &[2; 32]).unwrap()),
                 relay_stats: None,
             },
         );
