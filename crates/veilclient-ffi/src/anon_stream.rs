@@ -4528,6 +4528,30 @@ async fn confirm_circuit_with_probe(
 
 fn spawn_circuit_feed(
     services: veil_node_runtime::NodeServices,
+    recv_rx: mpsc::Receiver<Vec<u8>>,
+    in_tx: mpsc::Sender<(Addr, Vec<u8>)>,
+    activity: Option<Arc<Mutex<Instant>>>,
+    inbound_activity: Option<Arc<Mutex<Instant>>>,
+    peer_tags: SharedPeerTags,
+    confirmed: Option<Arc<std::sync::atomic::AtomicBool>>,
+) {
+    tokio::spawn(run_circuit_feed(
+        services,
+        recv_rx,
+        in_tx,
+        activity,
+        inbound_activity,
+        peer_tags,
+        confirmed,
+    ));
+}
+
+/// The cell carrier is best-effort even for reliable streams: their end-to-end
+/// ARQ repairs dropped cells. Never await a stream queue slot here, because the
+/// following cell can be media or a circuit probe. StreamMux already uses this
+/// same bounded/drop-on-full contract for its individual stream inboxes.
+async fn run_circuit_feed(
+    services: veil_node_runtime::NodeServices,
     mut recv_rx: mpsc::Receiver<Vec<u8>>,
     in_tx: mpsc::Sender<(Addr, Vec<u8>)>,
     activity: Option<Arc<Mutex<Instant>>>,
@@ -4535,96 +4559,114 @@ fn spawn_circuit_feed(
     peer_tags: SharedPeerTags,
     confirmed: Option<Arc<std::sync::atomic::AtomicBool>>,
 ) {
-    tokio::spawn(async move {
-        // Drain inbound bursts: the relay splice delivers many cells per
-        // scheduler turn, and one activity stamp per batch is enough.
-        let mut batch: Vec<Vec<u8>> = Vec::new();
-        'feed: loop {
-            batch.clear();
-            if recv_rx.recv_many(&mut batch, 256).await == 0 {
-                break;
+    let mut stream_queue_drops = 0u64;
+    // Drain inbound bursts: the relay splice delivers many cells per
+    // scheduler turn, and one activity stamp per batch is enough.
+    let mut batch: Vec<Vec<u8>> = Vec::new();
+    'feed: loop {
+        batch.clear();
+        if recv_rx.recv_many(&mut batch, 256).await == 0 {
+            break;
+        }
+        if let Some(activity) = activity.as_ref() {
+            mark_circuit_activity(activity);
+        }
+        // RECEIVE-only stamp for the inbound-starvation detector: sends
+        // also move `activity`, so it can't distinguish "network answers
+        // us" from "we keep shouting into a void".
+        if let Some(inbound) = inbound_activity.as_ref() {
+            mark_circuit_activity(inbound);
+        }
+        for framed in batch.drain(..) {
+            if veil_anonymity::circuit_data::is_probe_echo(&framed) {
+                // Loopback splice-probe echo: the terminus binding is
+                // proven live end-to-end — confirm the circuit and swallow
+                // the cell (it carries no data).
+                if let Some(flag) = confirmed.as_ref() {
+                    flag.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+                continue;
             }
-            if let Some(activity) = activity.as_ref() {
-                mark_circuit_activity(activity);
+            if framed.len() < CIRCUIT_PEER_TAG_LEN {
+                continue;
             }
-            // RECEIVE-only stamp for the inbound-starvation detector: sends
-            // also move `activity`, so it can't distinguish "network answers
-            // us" from "we keep shouting into a void".
-            if let Some(inbound) = inbound_activity.as_ref() {
-                mark_circuit_activity(inbound);
-            }
-            for framed in batch.drain(..) {
-                if veil_anonymity::circuit_data::is_probe_echo(&framed) {
-                    // Loopback splice-probe echo: the terminus binding is
-                    // proven live end-to-end — confirm the circuit and swallow
-                    // the cell (it carries no data).
-                    if let Some(flag) = confirmed.as_ref() {
-                        flag.store(true, std::sync::atomic::Ordering::Relaxed);
-                    }
+            let mut tag = [0u8; CIRCUIT_PEER_TAG_LEN];
+            tag.copy_from_slice(&framed[..CIRCUIT_PEER_TAG_LEN]);
+            let mut cell_offset = CIRCUIT_PEER_TAG_LEN;
+            let node = if framed.get(cell_offset) == Some(&CIRCUIT_INTRO_MARKER) {
+                if framed.len() < cell_offset + 1 + CIRCUIT_INTRO_LEN {
                     continue;
                 }
-                if framed.len() < CIRCUIT_PEER_TAG_LEN {
+                let sealed = &framed[cell_offset + 1..cell_offset + 1 + CIRCUIT_INTRO_LEN];
+                let Some(node) = open_stream_peer_intro(&services, &tag, sealed) else {
                     continue;
-                }
-                let mut tag = [0u8; CIRCUIT_PEER_TAG_LEN];
-                tag.copy_from_slice(&framed[..CIRCUIT_PEER_TAG_LEN]);
-                let mut cell_offset = CIRCUIT_PEER_TAG_LEN;
-                let node = if framed.get(cell_offset) == Some(&CIRCUIT_INTRO_MARKER) {
-                    if framed.len() < cell_offset + 1 + CIRCUIT_INTRO_LEN {
-                        continue;
-                    }
-                    let sealed = &framed[cell_offset + 1..cell_offset + 1 + CIRCUIT_INTRO_LEN];
-                    let Some(node) = open_stream_peer_intro(&services, &tag, sealed) else {
-                        continue;
-                    };
-                    {
-                        let mut tags = peer_tags.lock().unwrap_or_else(|p| p.into_inner());
-                        if tags.len() >= 4096 && !tags.contains_key(&tag) {
-                            tags.clear();
-                        }
-                        tags.insert(tag, node);
-                    }
-                    cell_offset += 1 + CIRCUIT_INTRO_LEN;
-                    node
-                } else if let Some(node) = peer_tags
-                    .lock()
-                    .unwrap_or_else(|p| p.into_inner())
-                    .get(&tag)
-                    .copied()
-                {
-                    node
-                } else {
-                    // Backward-compatible validation/legacy path: the first 32 bytes
-                    // are the clear sender node id rather than an opaque tag.
-                    tag
                 };
-                if framed.len() <= cell_offset {
-                    continue;
+                {
+                    let mut tags = peer_tags.lock().unwrap_or_else(|p| p.into_inner());
+                    if tags.len() >= 4096 && !tags.contains_key(&tag) {
+                        tags.clear();
+                    }
+                    tags.insert(tag, node);
                 }
-                // Lossy MEDIA datagram? A leading MEDIA_MAGIC (distinct from the
-                // stream `PROTO_VER`) means this cell bypasses the reliable
-                // demux: hand it to the media ingress, which opens it with the
-                // channel's own key before anything reaches the engine, then
-                // skip the stream path entirely. Stream and media coexist on
-                // one circuit, cleanly split by this first byte.
-                //
-                // `node` above is NOT a proof of who sent this: on the legacy
-                // clear-sender envelope it is simply the first 32 wire bytes,
-                // and the receive cookie is a function of a public node id, so
-                // the splice relay — or anyone who can reach it — can arrive
-                // under any name it likes. That is why the seal, and not this
-                // id, decides what plays.
-                if crate::media::dispatch_onion_cell(node, &framed[cell_offset..]) {
-                    continue;
+                cell_offset += 1 + CIRCUIT_INTRO_LEN;
+                node
+            } else if let Some(node) = peer_tags
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .get(&tag)
+                .copied()
+            {
+                node
+            } else {
+                // Backward-compatible validation/legacy path: the first 32 bytes
+                // are the clear sender node id rather than an opaque tag.
+                tag
+            };
+            if framed.len() <= cell_offset {
+                continue;
+            }
+            // Lossy MEDIA datagram? A leading MEDIA_MAGIC (distinct from the
+            // stream `PROTO_VER`) means this cell bypasses the reliable
+            // demux: hand it to the media ingress, which opens it with the
+            // channel's own key before anything reaches the engine, then
+            // skip the stream path entirely. Stream and media coexist on
+            // one circuit, cleanly split by this first byte.
+            //
+            // `node` above is NOT a proof of who sent this: on the legacy
+            // clear-sender envelope it is simply the first 32 wire bytes,
+            // and the receive cookie is a function of a public node id, so
+            // the splice relay — or anyone who can reach it — can arrive
+            // under any name it likes. That is why the seal, and not this
+            // id, decides what plays.
+            if crate::media::dispatch_onion_cell(node, &framed[cell_offset..]) {
+                continue;
+            }
+            match in_tx.try_reserve() {
+                Ok(permit) => {
+                    // Admit before deriving the app id or copying a large cell.
+                    // A congested stream must not spend media's receive time
+                    // allocating payloads that will immediately be discarded.
+                    let app = veil_app::address::app_id(&node, STREAM_NAMESPACE, STREAM_NAME);
+                    permit.send((Addr { node, app }, framed[cell_offset..].to_vec()));
                 }
-                let app = veil_app::address::app_id(&node, STREAM_NAMESPACE, STREAM_NAME);
-                let cell = framed[cell_offset..].to_vec();
-                if in_tx.send((Addr { node, app }, cell)).await.is_err() {
-                    break 'feed;
+                Err(mpsc::error::TrySendError::Full(_)) => {
+                    stream_queue_drops = stream_queue_drops.saturating_add(1);
+                    // Exponential sampling bounds diagnostics during a flood.
+                    // This is an endpoint queue decision; relays receive no
+                    // stream/media role or scheduling instruction.
+                    if stream_queue_drops.is_power_of_two() {
+                        diag_node_debug(
+                            &services.local_node_id(),
+                            &format!(
+                                "stream ingress full: dropped {stream_queue_drops} cells; end-to-end ARQ recovers",
+                            ),
+                        );
+                    }
                 }
+                Err(mpsc::error::TrySendError::Closed(_)) => break 'feed,
             }
         }
-    });
+    }
 }
 
 /// Record which device will answer a route opened to `dst_node` over `ad`.
@@ -4795,6 +4837,353 @@ mod tests {
                 index as u32 + 1
             );
         }
+    }
+
+    async fn offline_feed_fixture() -> (
+        tempfile::TempDir,
+        veil_node_runtime::NodeRuntime,
+        veil_node_runtime::NodeServices,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let mut config = veil_cfg::build_stub_config_with_ephemeral_identity(false).unwrap();
+        config.identity.as_mut().unwrap().role = veil_cfg::NodeRole::Leaf;
+        config.global.meeting_points = veil_cfg::MeetingPoints::Only(Vec::new());
+        config.anonymity.receive_anonymous = false;
+        veil_cfg::save_config(&path, &config).unwrap();
+        let runtime = veil_node_runtime::NodeRuntime::start(&path, true)
+            .await
+            .unwrap();
+        let services =
+            veil_node_runtime::embedded_services_for(&runtime.access().local_node_id()).unwrap();
+        (dir, runtime, services)
+    }
+
+    fn feed_envelope(tag: [u8; 32], cell: &[u8]) -> Vec<u8> {
+        let mut framed = tag.to_vec();
+        framed.extend_from_slice(cell);
+        framed
+    }
+
+    struct FeedMediaReceiver {
+        peer: [u8; 32],
+        chan: u64,
+        _context: Box<tokio::sync::mpsc::Sender<Vec<u8>>>,
+    }
+
+    impl Drop for FeedMediaReceiver {
+        fn drop(&mut self) {
+            // The callback's context must outlive every dispatch, even if a
+            // test assertion unwinds while the feed task is still running.
+            crate::media::clear_recv_callback(self.peer, self.chan);
+        }
+    }
+
+    extern "C" fn record_feed_media(ctx: *mut std::ffi::c_void, ptr: *const u8, len: usize) {
+        let tx = unsafe { &*(ctx as *const tokio::sync::mpsc::Sender<Vec<u8>>) };
+        let packet = unsafe { std::slice::from_raw_parts(ptr, len) };
+        let _ = tx.try_send(packet.to_vec());
+    }
+
+    fn feed_media_receiver(
+        peer: [u8; 32],
+        chan: u64,
+    ) -> (
+        FeedMediaReceiver,
+        tokio::sync::mpsc::Receiver<Vec<u8>>,
+        crate::media::MediaCipher,
+    ) {
+        let (tx, rx) = tokio::sync::mpsc::channel(8);
+        let mut context = Box::new(tx);
+        let cipher = std::sync::Arc::new(
+            crate::media::cipher_for_test(&peer, &[0x81; 32], &[0x82; 32]).unwrap(),
+        );
+        let sender = crate::media::cipher_for_test(&peer, &[0x82; 32], &[0x81; 32]).unwrap();
+        crate::media::set_recv_callback(
+            peer,
+            chan,
+            record_feed_media,
+            (&mut *context as *mut tokio::sync::mpsc::Sender<Vec<u8>>).cast(),
+            cipher,
+        );
+        (
+            FeedMediaReceiver {
+                peer,
+                chan,
+                _context: context,
+            },
+            rx,
+            sender,
+        )
+    }
+
+    fn feed_audio_packet() -> Vec<u8> {
+        let mut packet = vec![0x80, 111, 0, 1, 0, 0, 0, 2, 0, 0, 0, 3];
+        packet.extend([0x77; 40]);
+        packet
+    }
+
+    #[tokio::test]
+    async fn circuit_feed_media_and_probe_bypass_a_full_stream_ingress() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
+        use tokio::sync::mpsc;
+        let (_dir, mut runtime, services) = offline_feed_fixture().await;
+        let peer = [0xa9; 32];
+        let tag = [0xac; 32];
+        let tags = Arc::new(std::sync::Mutex::new(std::collections::HashMap::from([(
+            tag, peer,
+        )])));
+        let (registration, mut media_rx, sender) = feed_media_receiver(peer, 0xa901);
+        let before = crate::media::recv_count(peer);
+        let packet = feed_audio_packet();
+        let sealed = sender.seal(&packet).unwrap();
+        let mut media = vec![crate::media::MEDIA_MAGIC];
+        media.extend_from_slice(sealed.as_bytes());
+        let (stream_tx, mut stream_rx) = mpsc::channel(1);
+        stream_tx
+            .try_send((
+                veil_onion_stream::Addr {
+                    node: peer,
+                    app: [0; 32],
+                },
+                vec![0xff],
+            ))
+            .unwrap();
+        let (tx, rx) = mpsc::channel(8);
+        let confirmed = Arc::new(AtomicBool::new(false));
+        // One burst in FIFO order: file congestion, probe, corrupt media,
+        // genuine media, replay. A suspended file consumer stays suspended.
+        tx.try_send(feed_envelope(tag, b"file cell")).unwrap();
+        tx.try_send(veil_anonymity::circuit_data::CIRCUIT_PROBE_MAGIC.to_vec())
+            .unwrap();
+        tx.try_send(feed_envelope(tag, &[crate::media::MEDIA_MAGIC, 1, 2, 3]))
+            .unwrap();
+        tx.try_send(feed_envelope(tag, &media)).unwrap();
+        tx.try_send(feed_envelope(tag, &media)).unwrap();
+        drop(tx);
+        let feed = tokio::spawn(super::run_circuit_feed(
+            services,
+            rx,
+            stream_tx,
+            None,
+            None,
+            tags,
+            Some(Arc::clone(&confirmed)),
+        ));
+        let result = tokio::time::timeout(std::time::Duration::from_millis(300), async {
+            let got = media_rx.recv().await.unwrap();
+            feed.await.unwrap();
+            got
+        })
+        .await;
+        drop(registration);
+        runtime.stop().await.unwrap();
+        assert_eq!(result.unwrap(), packet, "audio cannot await the file queue");
+        assert!(
+            confirmed.load(Ordering::Relaxed),
+            "probe cannot await that queue either"
+        );
+        assert_eq!(crate::media::recv_count(peer), before + 1);
+        assert!(
+            media_rx.try_recv().is_err(),
+            "corrupt packets and replays never reach the callback"
+        );
+        assert_eq!(
+            stream_rx.try_recv().unwrap().1,
+            vec![0xff],
+            "the consumer never drained"
+        );
+        assert!(stream_rx.try_recv().is_err());
+    }
+
+    struct FeedBus {
+        me: [u8; 32],
+        tx: tokio::sync::mpsc::Sender<Vec<u8>>,
+        syns: std::sync::atomic::AtomicU64,
+        first_syn: tokio::sync::Notify,
+    }
+
+    impl veil_onion_stream::CellSender for FeedBus {
+        async fn send(&self, _dst: veil_onion_stream::Addr, cell: Vec<u8>) -> std::io::Result<()> {
+            let syn = matches!(Frame::decode(&cell), Some(Frame::Syn { .. }));
+            self.tx
+                .try_send(feed_envelope(self.me, &cell))
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::WouldBlock, e.to_string()))?;
+            if syn {
+                self.syns.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                self.first_syn.notify_one();
+            }
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn circuit_feed_media_passes_while_stream_arq_recovers_the_file() {
+        use std::sync::{Arc, atomic::Ordering};
+        use tokio::sync::mpsc;
+        use veil_onion_stream::{Addr, Config, StreamMux};
+        let (_dir, mut runtime, services) = offline_feed_fixture().await;
+        let a = [0xa8; 32];
+        let b = [0xaa; 32];
+        let (a_wire_tx, a_wire_rx) = mpsc::channel(128);
+        let (b_wire_tx, b_wire_rx) = mpsc::channel(128);
+        let (a_in_tx, a_in_rx) = mpsc::channel(16);
+        let (b_in_tx, mut b_in_rx) = mpsc::channel(1);
+        b_in_tx
+            .try_send((
+                Addr {
+                    node: a,
+                    app: [0; 32],
+                },
+                vec![0xff],
+            ))
+            .unwrap();
+        let feed_a = tokio::spawn(super::run_circuit_feed(
+            services.clone(),
+            a_wire_rx,
+            a_in_tx,
+            None,
+            None,
+            Arc::default(),
+            None,
+        ));
+        let feed_b = tokio::spawn(super::run_circuit_feed(
+            services,
+            b_wire_rx,
+            b_in_tx,
+            None,
+            None,
+            Arc::default(),
+            None,
+        ));
+        let sender_a = Arc::new(FeedBus {
+            me: a,
+            tx: b_wire_tx.clone(),
+            syns: Default::default(),
+            first_syn: Default::default(),
+        });
+        let sender_b = Arc::new(FeedBus {
+            me: b,
+            tx: a_wire_tx,
+            syns: Default::default(),
+            first_syn: Default::default(),
+        });
+        let cfg = Config {
+            mss: 512,
+            init_cwnd: 512,
+            recv_window: 128 * 1024,
+            init_rto_ms: 50,
+            min_rto_ms: 40,
+            max_rto_ms: 200,
+            handshake_rto_ms: 50,
+            ack_every: 1,
+            ack_delay_ms: 1,
+            max_retransmits: 32,
+            ..Config::default()
+        };
+        let mux_a = StreamMux::new(a, sender_a.clone(), a_in_rx, cfg);
+        let b_app = veil_app::address::app_id(&b, super::STREAM_NAMESPACE, super::STREAM_NAME);
+        let stream = mux_a.open(Addr {
+            node: b,
+            app: b_app,
+        });
+        // Non-periodic contents expose segment duplication/reordering as well
+        // as missing bytes; a repeating per-byte pattern would hide it.
+        let mut state = 0x7f31_9d25u32;
+        let bytes = (0..64 * 1024)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 17;
+                state ^= state << 5;
+                state as u8
+            })
+            .collect::<Vec<_>>();
+        let expected = bytes.clone();
+        let mut send_task = tokio::spawn(async move {
+            stream.write_all(&bytes).await.unwrap();
+            stream.finish().await.unwrap();
+            stream
+        });
+        let (registration, mut media_rx, media_sender) = feed_media_receiver(a, 0xa801);
+        let packet = feed_audio_packet();
+        let sealed = media_sender.seal(&packet).unwrap();
+        let mut media = vec![crate::media::MEDIA_MAGIC];
+        media.extend_from_slice(sealed.as_bytes());
+        let result = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            sender_a.first_syn.notified().await;
+            // The first SYN is ahead of this audio in the real feed's FIFO,
+            // and the stream queue is still occupied: that SYN must be shed.
+            b_wire_tx.send(feed_envelope(a, &media)).await.unwrap();
+            let got = tokio::time::timeout(std::time::Duration::from_millis(300), media_rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(got, packet);
+            assert_eq!(b_in_rx.try_recv().unwrap().1, vec![0xff]);
+            let mux_b = StreamMux::new(b, sender_b, b_in_rx, cfg);
+            let (mut incoming, addr) = mux_b.accept().await.unwrap();
+            assert_eq!(addr.node, a);
+            let mut received = Vec::new();
+            let mut buf = [0u8; 2048];
+            loop {
+                let n = incoming.read(&mut buf).await.unwrap();
+                if n == 0 {
+                    break;
+                }
+                received.extend_from_slice(&buf[..n]);
+            }
+            let _completed_sender = (&mut send_task).await.unwrap();
+            assert_eq!(
+                received, expected,
+                "ARQ must preserve the entire file and its order"
+            );
+            assert!(
+                sender_a.syns.load(Ordering::Relaxed) >= 2,
+                "a real handshake retransmit repaired ingress loss"
+            );
+        })
+        .await;
+        if !send_task.is_finished() {
+            send_task.abort();
+            let _ = send_task.await;
+        }
+        feed_a.abort();
+        let _ = feed_a.await;
+        feed_b.abort();
+        let _ = feed_b.await;
+        drop((registration, mux_a, b_wire_tx));
+        runtime.stop().await.unwrap();
+        result.expect("file recovery and media must finish within the test budget");
+    }
+
+    #[tokio::test]
+    async fn circuit_feed_stops_when_the_stream_mux_has_closed() {
+        let (_dir, mut runtime, services) = offline_feed_fixture().await;
+        let (stream_tx, stream_rx) = tokio::sync::mpsc::channel(1);
+        drop(stream_rx);
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        tx.try_send(feed_envelope([0x99; 32], b"stream cell"))
+            .unwrap();
+        // Leave the circuit sender open: only a closed mux can stop the feed.
+        let result = tokio::time::timeout(
+            std::time::Duration::from_millis(300),
+            super::run_circuit_feed(
+                services,
+                rx,
+                stream_tx,
+                None,
+                None,
+                Default::default(),
+                None,
+            ),
+        )
+        .await;
+        drop(tx);
+        runtime.stop().await.unwrap();
+        assert!(result.is_ok());
     }
 
     #[tokio::test]
