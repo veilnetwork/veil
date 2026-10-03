@@ -5315,6 +5315,7 @@ dependencies = [
  "blake3",
  "ed25519-dalek",
  "tokio",
+ "veil-app",
  "veil-bufpool",
  "veil-cfg",
  "veil-crypto",

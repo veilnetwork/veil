@@ -187,7 +187,7 @@ struct RealtimeDatagramLane {
     /// derived at the handshake, which is what every peer without the
     /// capability expects to keep receiving under.
     peer_rotates: bool,
-    tx: crate::realtime_datagram::RealtimeDatagramTx,
+    tx: crate::datagram_flows::SessionDatagramTx,
     max_datagram_size: usize,
     logged_send_kinds: u8,
     congestion_drops: u64,
@@ -329,7 +329,7 @@ pub(crate) type RealtimeRekey = ([u8; 32], [u8; 32]);
 /// arriving before the previous one is applied WINS rather than being lost —
 /// is about which key ends up in the cipher, not about datagram plumbing.
 fn apply_pending_rekey(
-    rx: &mut crate::realtime_datagram::RealtimeDatagramRx,
+    rx: &mut crate::datagram_flows::SessionDatagramRx,
     rekeys: &mut tokio::sync::watch::Receiver<Option<RealtimeRekey>>,
     now: std::time::Instant,
 ) {
@@ -341,7 +341,7 @@ fn apply_pending_rekey(
 
 fn spawn_realtime_receiver(
     handle: veil_transport::QuicDatagramHandle,
-    mut rx: crate::realtime_datagram::RealtimeDatagramRx,
+    mut rx: crate::datagram_flows::SessionDatagramRx,
     mut rekeys: tokio::sync::watch::Receiver<Option<RealtimeRekey>>,
     context: RealtimeReceiverContext,
 ) -> RealtimeReceiverTask {
@@ -516,6 +516,9 @@ pub struct RealtimeLaneOffer {
     /// open anything past the first rekey — which is why this is negotiated
     /// rather than assumed (report12 V-M12).
     pub peer_rotates: bool,
+    /// The peer negotiated generic opaque channels with independent replay
+    /// and fragment state. No local queue class is sent on the wire.
+    pub peer_flows: bool,
 }
 
 /// Hot-standby transport-swap state for one session.
@@ -3300,11 +3303,20 @@ impl SessionRunner {
             (Some(offer), Some((raw_tx_key, raw_rx_key, session_id))) => offer
                 .handle
                 .max_size()
-                // 24-byte lane header + 16-byte Poly1305 tag + ≥1 payload.
-                .filter(|size| *size > 40)
+                .filter(|size| {
+                    *size
+                        >= if offer.peer_flows {
+                            crate::datagram_flows::MIN_FLOW_DATAGRAM_SIZE
+                        } else {
+                            41
+                        }
+                })
                 .map(|max_datagram_size| {
-                    let rx =
-                        crate::realtime_datagram::RealtimeDatagramRx::new(raw_rx_key, session_id);
+                    let rx = crate::datagram_flows::SessionDatagramRx::new(
+                        raw_rx_key,
+                        session_id,
+                        offer.peer_flows,
+                    );
                     // The latest rotation, not a queue of them: a second
                     // before the first is applied overwrites it, which is what
                     // the receiver wants — the older one is already superseded
@@ -3327,15 +3339,18 @@ impl SessionRunner {
                     self.logger.info(
                         "session.realtime_datagram.enabled",
                         format!(
-                            "peer_id={} max_datagram_size={max_datagram_size}",
+                            "peer_id={} max_datagram_size={max_datagram_size} opaque_flows={}",
                             hex_short(&self.peer_id),
+                            offer.peer_flows,
                         ),
                     );
                     RealtimeDatagramLane {
                         handle: offer.handle,
                         peer_rotates: offer.peer_rotates,
-                        tx: crate::realtime_datagram::RealtimeDatagramTx::new(
-                            raw_tx_key, session_id,
+                        tx: crate::datagram_flows::SessionDatagramTx::new(
+                            raw_tx_key,
+                            session_id,
+                            offer.peer_flows,
                         ),
                         max_datagram_size,
                         logged_send_kinds: 0,
@@ -3786,22 +3801,25 @@ impl SessionRunner {
                         };
                         let (_, _, lane_kind) = decode_realtime_lane_frame(&outgoing)
                             .expect("realtime queue predicate accepted this frame");
-                        let datagrams =
-                            match lane.tx.encode_frame(&outgoing, lane.max_datagram_size) {
-                                Ok(datagrams) => datagrams,
-                                Err(error) => {
-                                    self.logger.debug(
-                                        "session.realtime_datagram.encode_fallback",
-                                        format!(
-                                            "peer_id={} frame_len={} error={error}",
-                                            hex_short(&self.peer_id),
-                                            outgoing.len(),
-                                        ),
-                                    );
-                                    pq.push_lossy_front(outgoing_priority, outgoing);
-                                    break;
-                                }
-                            };
+                        let datagrams = match lane.tx.encode_frame(
+                            u64::from(outgoing_priority),
+                            &outgoing,
+                            lane.max_datagram_size,
+                        ) {
+                            Ok(datagrams) => datagrams,
+                            Err(error) => {
+                                self.logger.debug(
+                                    "session.realtime_datagram.encode_fallback",
+                                    format!(
+                                        "peer_id={} frame_len={} error={error}",
+                                        hex_short(&self.peer_id),
+                                        outgoing.len(),
+                                    ),
+                                );
+                                pq.push_lossy_front(outgoing_priority, outgoing);
+                                break;
+                            }
+                        };
                         let planned_wire_len = datagrams.iter().map(Vec::len).sum::<usize>();
                         if !local_datagram_fits(
                             outgoing_priority,
@@ -5557,7 +5575,8 @@ mod reeval_teardown_tests {
 #[cfg(test)]
 mod realtime_rekey_delivery_tests {
     use super::*;
-    use crate::realtime_datagram::{RealtimeDatagramRx, RealtimeDatagramTx};
+    use crate::datagram_flows::SessionDatagramRx as RealtimeDatagramRx;
+    use crate::realtime_datagram::RealtimeDatagramTx;
     use std::time::Instant;
 
     const S0: [u8; 32] = [0x01; 32];
@@ -5585,7 +5604,7 @@ mod realtime_rekey_delivery_tests {
     /// real ciphers on both sides.
     #[test]
     fn a_rotation_landing_before_the_previous_is_applied_wins() {
-        let mut rx = RealtimeDatagramRx::new(&K0, &S0);
+        let mut rx = RealtimeDatagramRx::new(&K0, &S0, false);
         let (rekeys_tx, mut rekeys_rx) = tokio::sync::watch::channel(None);
 
         // Both land while the receiver is busy with a datagram.
@@ -5614,7 +5633,7 @@ mod realtime_rekey_delivery_tests {
     /// that costs, with the same two rotations and the same ciphers.
     #[test]
     fn applying_the_older_rotation_leaves_the_lane_deaf() {
-        let mut rx = RealtimeDatagramRx::new(&K0, &S0);
+        let mut rx = RealtimeDatagramRx::new(&K0, &S0, false);
         rx.rekey(&KA, &SA, Instant::now());
 
         let mut peer = RealtimeDatagramTx::new(&KB, &SB);
@@ -5628,7 +5647,7 @@ mod realtime_rekey_delivery_tests {
 
         // Vacuity guard: the fixture is capable of opening SOMETHING, so the
         // negative above is about the key and not about a broken encoder.
-        let mut right = RealtimeDatagramRx::new(&K0, &S0);
+        let mut right = RealtimeDatagramRx::new(&K0, &S0, false);
         right.rekey(&KB, &SB, Instant::now());
         assert_eq!(
             opened_by(&mut right, &sealed).as_deref(),

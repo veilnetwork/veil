@@ -6667,3 +6667,6 @@ fn aad_for_ciphertext(
     h.body_len = ciphertext_len as u32;
     veil_proto::codec::frame_aad(&h)
 }
+
+#[path = "runner_tests/opaque_datagram_tests.rs"]
+mod opaque_datagram_tests;

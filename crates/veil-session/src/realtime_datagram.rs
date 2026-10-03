@@ -55,6 +55,8 @@ pub enum RealtimeDatagramError {
     AssemblyConflict,
     #[error("realtime fragment assembly exceeds its declared length")]
     AssemblyOverflow,
+    #[error("session datagram flow limit reached")]
+    FlowCapacity,
 }
 
 fn derive_key(raw_key: &[u8; 32], session_id: &[u8; 32]) -> [u8; 32] {
@@ -282,6 +284,8 @@ pub struct RealtimeDatagramRx {
     replay: ReplayWindow,
     assemblies: HashMap<u32, Assembly>,
     assembly_bytes: usize,
+    max_assemblies: usize,
+    max_assembly_bytes: usize,
 }
 
 /// How long a datagram sealed under the pre-rekey key is still opened.
@@ -294,6 +298,17 @@ pub const REALTIME_REKEY_GRACE: Duration = Duration::from_secs(5);
 
 impl RealtimeDatagramRx {
     pub fn new(raw_rx_key: &[u8; 32], session_id: &[u8; 32]) -> Self {
+        Self::with_limits(raw_rx_key, session_id, MAX_ASSEMBLIES, MAX_ASSEMBLY_BYTES)
+    }
+
+    /// Subdivide the existing session budget between independent flows.
+    /// Limits cannot exceed the original session ceiling.
+    pub(crate) fn with_limits(
+        raw_rx_key: &[u8; 32],
+        session_id: &[u8; 32],
+        max_assemblies: usize,
+        max_assembly_bytes: usize,
+    ) -> Self {
         let mut key = derive_key(raw_rx_key, session_id);
         let cipher = ChaCha20Poly1305::new((&key).into());
         use zeroize::Zeroize;
@@ -304,6 +319,8 @@ impl RealtimeDatagramRx {
             replay: ReplayWindow::default(),
             assemblies: HashMap::new(),
             assembly_bytes: 0,
+            max_assemblies: max_assemblies.clamp(1, MAX_ASSEMBLIES),
+            max_assembly_bytes: max_assembly_bytes.clamp(MAX_REALTIME_FRAME, MAX_ASSEMBLY_BYTES),
         }
     }
 
@@ -434,7 +451,7 @@ impl RealtimeDatagramRx {
         Ok(Some(complete))
     }
 
-    fn prune(&mut self, now: Instant) {
+    pub(crate) fn prune(&mut self, now: Instant) {
         let expired: Vec<u32> = self
             .assemblies
             .iter()
@@ -448,8 +465,8 @@ impl RealtimeDatagramRx {
     }
 
     fn make_room(&mut self, protected: Option<u32>, incoming: usize, is_new: bool) {
-        while (is_new && self.assemblies.len() >= MAX_ASSEMBLIES)
-            || self.assembly_bytes.saturating_add(incoming) > MAX_ASSEMBLY_BYTES
+        while (is_new && self.assemblies.len() >= self.max_assemblies)
+            || self.assembly_bytes.saturating_add(incoming) > self.max_assembly_bytes
         {
             let Some(oldest) = self
                 .assemblies
@@ -471,7 +488,7 @@ impl RealtimeDatagramRx {
     }
 
     #[cfg(test)]
-    fn retained(&self) -> (usize, usize) {
+    pub(crate) fn retained(&self) -> (usize, usize) {
         (self.assemblies.len(), self.assembly_bytes)
     }
 }

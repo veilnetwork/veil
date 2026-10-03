@@ -1270,6 +1270,7 @@ where
     // present; whether it HAPPENS is the negotiation, and a peer without the
     // bit keeps the static key it always had (report12 V-M12).
     caps.flags |= cap_flags::SUPPORTS_REALTIME_REKEY;
+    caps.flags |= cap_flags::SUPPORTS_DATAGRAM_FLOWS;
     let caps_bytes = caps.encode();
     let caps_wire =
         write_frame(stream, family, SessionMsg::Capabilities as u16, &caps_bytes).await?;
