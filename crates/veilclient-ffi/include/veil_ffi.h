@@ -3545,6 +3545,16 @@ uint64_t veil_media_open_relay_channel(VeilApp *app,
 
 #if defined(VEIL_FFI_NODE_EMBEDDED)
 /**
+ * Set the channel's secondary local IPC sender before starting media. It must
+ * bind the same application identity as the primary sender. No sender role
+ * or local endpoint id is added to network packets. Returns 0 on success,
+ * -1 on an invalid channel/app or an anonymous channel without this plane.
+ */
+ int veil_media_channel_set_secondary_sender(uint64_t chan, VeilApp *app, char **err_out) ;
+#endif
+
+#if defined(VEIL_FFI_NODE_EMBEDDED)
+/**
  * Enqueue one media datagram (RTP/RTCP) on `chan`. NON-BLOCKING: returns 0 if
  * queued, 1 if dropped (queue full / channel closing) — the caller's real-time
  * media thread must never block. Returns -1 on a NULL/zero-length payload or an
@@ -3648,7 +3658,7 @@ int veil_media_start_direct_receiver(VeilApp *app,
 
 #if defined(VEIL_FFI_NODE_EMBEDDED)
 /**
- * Close a media channel: stops the drain task, drops the outbound queue, and
+ * Close a media channel: stops both drain tasks, drops the outbound queues, and
  * clears the peer's recv callback. Idempotent (unknown `chan` is a no-op).
  */
  void veil_media_close_channel(uint64_t chan) ;

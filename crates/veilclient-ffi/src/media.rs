@@ -468,7 +468,7 @@ impl MediaCipher {
             .map(SealedMediaCell)
     }
 
-    fn open(&self, sealed: &[u8]) -> Option<Vec<u8>> {
+    pub(crate) fn open(&self, sealed: &[u8]) -> Option<Vec<u8>> {
         self.rx
             .lock()
             .unwrap_or_else(|p| p.into_inner())

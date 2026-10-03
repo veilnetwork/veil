@@ -2119,6 +2119,16 @@ final int Function(
             )>>('veil_media_open_relay_channel')
     .asFunction();
 
+// A second local IPC sender with the same app identity. No role is sent to peers.
+final int Function(int, Pointer<VeilApp>, Pointer<Pointer<Utf8>>)
+    veilMediaChannelSetSecondarySender = nativeLib
+        .lookup<
+                NativeFunction<
+                    Int32 Function(
+                        Uint64, Pointer<VeilApp>, Pointer<Pointer<Utf8>>)>>(
+            'veil_media_channel_set_secondary_sender')
+        .asFunction();
+
 // start_direct_receiver(app, source_ns, ns_len, source_name, name_len, err)
 // -> VEIL_OK or error. Inbound RTP stays native and never crosses Dart.
 final int Function(
