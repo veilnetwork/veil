@@ -1164,11 +1164,8 @@ impl FrameDispatcher {
             // ── Acquire reg_guard only for the send window ────────────────────
             let reg_guard = rlock!(reg);
 
-            // Try direct session to recipient. Preserve the frame's own
-            // traffic class: a REALTIME media forward demoted to Interactive
-            // here queues behind bulk delivery chatter on a busy relay and
-            // arrives seconds late (device-measured RTT spikes with flat
-            // network pings on both physical legs).
+            // Forward to a directly connected recipient with the same neutral
+            // scheduling class as any other relay hop.
             let fwd_frame = make_fwd_frame(dst);
             if reg_guard.send_to(&dst, traffic_class, fwd_frame) {
                 return DispatchResult::NoResponse;
@@ -1449,11 +1446,9 @@ impl FrameDispatcher {
             return DispatchResult::NoResponse;
         }
 
-        // Queueing class comes from the payload's explicit traffic-class
-        // marker (size-capped for REALTIME), NOT from the frame header's
-        // 2-bit priority field: legacy senders never stamp that field, so it
-        // reads 0 (= REALTIME) for every frame and would let bulk delivery
-        // chatter ride — and starve — the media lane.
+        // Neither the header nor the sender's legacy transport hint grants
+        // relay priority. All forwarded user traffic uses one queue class;
+        // loss-tolerant datagram eligibility is a separate transport decision.
         let _ = header;
         let traffic_class = payload.relay_traffic_class();
         self.relay_forward(payload, peer_id, traffic_class)
@@ -2661,15 +2656,10 @@ mod tests {
         ));
     }
 
-    /// A relayed Forward carrying the REALTIME traffic-class marker must be
-    /// re-queued toward the recipient's direct session at REALTIME priority
-    /// (not the old hardcoded Interactive that let call media queue for
-    /// seconds behind bulk delivery chatter on a busy hop), and the re-encoded
-    /// frame must still carry the marker for any further hops. An unmarked
-    /// legacy Forward rides INTERACTIVE — the frame header's unset priority
-    /// bits (0 = REALTIME) must NOT be trusted.
+    /// A transport hint survives re-encoding for datagram compatibility, but
+    /// never changes relay scheduling priority, including at the final hop.
     #[test]
-    fn relay_preserves_realtime_traffic_class_and_marker() {
+    fn relay_preserves_transport_hint_without_granting_priority() {
         use crate::DispatchResult;
         use crate::make_test_dispatcher;
         use veil_proto::delivery::{DeliveryEnvelope, ForwardPayload};
@@ -2716,12 +2706,16 @@ mod tests {
             (hdr, body)
         };
 
-        // Marked REALTIME → REALTIME queue class + marker preserved on wire.
+        // Marked REALTIME → neutral queue class + transport hint preserved.
         let (hdr, body) = mk_frame(0x51, Some(veil_proto::header::priority::REALTIME));
         let r = disp.dispatch(&hdr, &body, sender_peer);
         assert!(matches!(r, DispatchResult::NoResponse), "got {r:?}");
         let (priority, bytes) = frame_rx.try_recv().expect("relayed frame expected");
-        assert_eq!(priority, veil_proto::header::priority::REALTIME);
+        assert_eq!(priority, veil_proto::header::priority::INTERACTIVE);
+        assert_eq!(
+            veil_proto::codec::decode_header(&bytes).unwrap().priority(),
+            veil_proto::header::priority::REALTIME, // legacy wire bits, not scheduler input
+        );
         let relayed = ForwardPayload::decode(&bytes[veil_proto::header::HEADER_SIZE..]).unwrap();
         assert_eq!(
             relayed.traffic_class,
@@ -2740,6 +2734,23 @@ mod tests {
         assert_eq!(priority, veil_proto::header::priority::INTERACTIVE);
         let relayed = ForwardPayload::decode(&bytes[veil_proto::header::HEADER_SIZE..]).unwrap();
         assert_eq!(relayed.traffic_class, None);
+
+        for class in 1..=3 {
+            let (hdr, body) = mk_frame(0x60 + class, Some(class));
+            assert!(matches!(
+                disp.dispatch(&hdr, &body, sender_peer),
+                DispatchResult::NoResponse,
+            ));
+            let (priority, bytes) = frame_rx.try_recv().expect("relayed frame expected");
+            assert_eq!(priority, veil_proto::header::priority::INTERACTIVE);
+            assert_eq!(
+                veil_proto::codec::decode_header(&bytes).unwrap().priority(),
+                veil_proto::header::priority::REALTIME, // legacy wire bits, not scheduler input
+            );
+            let relayed =
+                ForwardPayload::decode(&bytes[veil_proto::header::HEADER_SIZE..]).unwrap();
+            assert_eq!(relayed.traffic_class, Some(class));
+        }
     }
 
     /// Terminal DELIVERY_FORWARD replay guard: two identical terminal Forward

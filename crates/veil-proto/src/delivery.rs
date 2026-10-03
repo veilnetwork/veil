@@ -284,20 +284,14 @@ pub const FORWARD_DELIVERY_ATTEMPT_MARKER: u8 = 0xA7;
 /// Optional extension marker preceding the originator's traffic class in a
 /// [`ForwardPayload`]. Same backward-compatible tail contract as the
 /// delivery-attempt marker: legacy decoders ignore bytes after `relay_hops`.
-/// Without it a relay has no way to tell a real-time media datagram from
-/// bulk delivery chatter — the frame header's 2-bit priority field is unset
-/// (0 = REALTIME) by every legacy sender, so it cannot be trusted — and
-/// relays used to re-queue everything at one class, adding seconds of queue
-/// delay to live call media on a busy hop. Updated QUIC sessions additionally
-/// use this marker to move the canonical unacknowledged short-TTL form onto
-/// their independent loss-tolerant DATAGRAM lane; every other form retains
-/// ordered-stream semantics.
+/// Retained only to select the canonical unacknowledged short-TTL form for
+/// the loss-tolerant QUIC DATAGRAM transport. It does not identify the inner
+/// application content and grants no relay scheduling priority. Every other
+/// form retains ordered-stream semantics.
 pub const FORWARD_TRAFFIC_CLASS_MARKER: u8 = 0xA8;
 
-/// A REALTIME class hint is honored by relays only for payloads at or below
-/// this size. Real-time media datagrams are small (one RTP/RTCP packet plus
-/// E2E envelope overhead); anything larger claiming REALTIME is demoted to
-/// INTERACTIVE so bulk transfers cannot jump the media lane.
+/// Maximum payload eligible for loss-tolerant datagram transport. Larger
+/// payloads retain ordered-stream semantics, with the same relay priority.
 pub const FORWARD_REALTIME_MAX_PAYLOAD: usize = 8192;
 
 /// Maximum lifetime of a loss-tolerant relay frame. Keeping this beside the
@@ -334,10 +328,9 @@ pub struct ForwardPayload {
     /// wire form. Relays validate the bounded range and deduplicate each
     /// attempt separately; the final recipient deliberately ignores it.
     pub delivery_attempt: Option<u8>,
-    /// Originator's queueing-class hint ([`crate::header::priority`]).
-    /// `None` is the legacy wire form and queues as INTERACTIVE. Relays
-    /// preserve the marker when re-encoding and apply
-    /// [`Self::relay_traffic_class`], never the raw value.
+    /// Legacy transport hint ([`crate::header::priority`]). Relays preserve
+    /// it for wire compatibility and loss-tolerant datagram eligibility,
+    /// but it never grants queueing priority to forwarded user traffic.
     pub traffic_class: Option<u8>,
 }
 
@@ -486,23 +479,11 @@ impl ForwardPayload {
         })
     }
 
-    /// Queueing class a relay should apply to this forward. A REALTIME hint
-    /// is honored only for small payloads ([`FORWARD_REALTIME_MAX_PAYLOAD`])
-    /// so bulk transfers cannot jump the media lane; an explicit BULK hint is
-    /// respected; everything else — including legacy frames without the
-    /// marker and out-of-range values — rides INTERACTIVE.
+    /// All forwarded user traffic has the same queueing class. A sender's
+    /// hint selects transport semantics only; it cannot purchase priority
+    /// over other users, messages, or file transfers at a relay.
     pub fn relay_traffic_class(&self) -> u8 {
-        use crate::header::priority;
-        match self.traffic_class {
-            Some(p)
-                if p == priority::REALTIME
-                    && self.envelope.payload.len() <= FORWARD_REALTIME_MAX_PAYLOAD =>
-            {
-                p
-            }
-            Some(p) if p == priority::BULK => p,
-            _ => priority::INTERACTIVE,
-        }
+        crate::header::priority::INTERACTIVE
     }
 }
 
@@ -1365,7 +1346,7 @@ mod tests {
     }
 
     #[test]
-    fn relay_traffic_class_honors_small_realtime_and_demotes_abuse() {
+    fn relay_traffic_class_never_grants_sender_selected_priority() {
         use crate::header::priority;
         let mut payload = ForwardPayload {
             next_hop_node_id: [7u8; 32],
@@ -1374,19 +1355,18 @@ mod tests {
             delivery_attempt: None,
             traffic_class: Some(priority::REALTIME),
         };
-        // Small payload + REALTIME hint → honored.
+        // Transport hints cannot give small or large payloads an advantage.
         assert!(payload.envelope.payload.len() <= FORWARD_REALTIME_MAX_PAYLOAD);
-        assert_eq!(payload.relay_traffic_class(), priority::REALTIME);
+        assert_eq!(payload.relay_traffic_class(), priority::INTERACTIVE);
 
-        // Oversized payload claiming REALTIME → demoted to INTERACTIVE.
+        // Oversized payloads also use the same queue class.
         payload.envelope.payload = vec![0u8; FORWARD_REALTIME_MAX_PAYLOAD + 1];
         assert_eq!(payload.relay_traffic_class(), priority::INTERACTIVE);
 
-        // Explicit BULK is respected; junk and legacy ride INTERACTIVE.
-        payload.traffic_class = Some(priority::BULK);
-        assert_eq!(payload.relay_traffic_class(), priority::BULK);
-        payload.traffic_class = Some(0xFF);
-        assert_eq!(payload.relay_traffic_class(), priority::INTERACTIVE);
+        for class in 0..=u8::MAX {
+            payload.traffic_class = Some(class);
+            assert_eq!(payload.relay_traffic_class(), priority::INTERACTIVE);
+        }
         payload.traffic_class = None;
         assert_eq!(payload.relay_traffic_class(), priority::INTERACTIVE);
     }

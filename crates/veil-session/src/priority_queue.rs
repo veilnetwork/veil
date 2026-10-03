@@ -145,18 +145,34 @@ impl PriorityQueue {
     /// budget is full, discard the oldest media frame rather than letting a
     /// reliable-stream fallback replay obsolete RTP after congestion clears.
     pub fn push_lossy_realtime(&mut self, priority: u8, frame: veil_bufpool::PooledShared) {
-        if priority.min(3) != REALTIME {
+        if priority.min(3) == REALTIME {
+            self.push_lossy(priority, frame);
+        } else {
             self.push(priority, frame);
-            return;
         }
+    }
+
+    /// Loss tolerance is independent of queue priority. In particular relayed
+    /// datagrams share INTERACTIVE FIFO order with other forwarded user data.
+    pub fn push_lossy(&mut self, priority: u8, frame: veil_bufpool::PooledShared) {
         if self.lossy_realtime_len >= LOSSY_REALTIME_MAX_DEPTH
-            && let Some(index) = self.queues[REALTIME as usize]
+            && let Some((p, index, _)) = self
+                .queues
                 .iter()
-                .position(|queued| queued.lossy_realtime)
+                .enumerate()
+                .skip(priority.min(3) as usize)
+                .filter_map(|(p, queue)| {
+                    let index = queue.iter().position(|queued| queued.lossy_realtime)?;
+                    Some((p, index, queue[index].enqueued_at?))
+                })
+                .min_by_key(|(_, _, at)| *at)
         {
-            self.queues[REALTIME as usize].remove(index);
+            self.queues[p].remove(index);
             self.lossy_realtime_len -= 1;
             self.drops_total.fetch_add(1, Ordering::Relaxed);
+        } else if self.lossy_realtime_len >= LOSSY_REALTIME_MAX_DEPTH {
+            self.drops_total.fetch_add(1, Ordering::Relaxed);
+            return;
         }
         self.push_entry(priority, frame, true);
     }
@@ -323,12 +339,59 @@ impl PriorityQueue {
     /// The caller has just popped this same frame, so reinsertion cannot exceed
     /// the queue's prior bounded depth.
     pub fn push_realtime_front(&mut self, frame: veil_bufpool::PooledShared) {
-        self.queues[REALTIME as usize].push_front(QueuedFrame {
+        self.push_lossy_front(REALTIME, frame);
+    }
+
+    /// Restore a popped datagram to its original queue on transport failure.
+    pub fn push_lossy_front(&mut self, priority: u8, frame: veil_bufpool::PooledShared) {
+        self.queues[priority.min(3) as usize].push_front(QueuedFrame {
             frame,
             enqueued_at: Some(Instant::now()),
             lossy_realtime: true,
         });
         self.lossy_realtime_len += 1;
+    }
+
+    /// Select the next frame using the SAME WRR order as the ordered stream,
+    /// and remove it only if the datagram transport can carry it. Never search
+    /// past a reliable FIFO head for a later datagram: transport separation
+    /// must not grant relayed datagrams scheduling priority over other data.
+    pub fn pop_datagram_if(
+        &mut self,
+        predicate: impl FnOnce(&[u8]) -> bool,
+    ) -> Option<(u8, veil_bufpool::PooledShared)> {
+        for attempt in 0..2 {
+            for p in 0..4 {
+                if self.slots[p] == 0 {
+                    continue;
+                }
+                while self.queues[p].front().is_some_and(|queued| {
+                    queued.lossy_realtime
+                        && queued
+                            .enqueued_at
+                            .is_some_and(|at| at.elapsed() > LOSSY_REALTIME_MAX_AGE)
+                }) {
+                    self.queues[p].pop_front();
+                    self.lossy_realtime_len -= 1;
+                    self.drops_total.fetch_add(1, Ordering::Relaxed);
+                }
+                if let Some(head) = self.queues[p].front() {
+                    if !predicate(&head.frame) {
+                        return None;
+                    }
+                    let queued = self.queues[p].pop_front().expect("head checked above");
+                    self.slots[p] -= 1;
+                    if queued.lossy_realtime {
+                        self.lossy_realtime_len -= 1;
+                    }
+                    return Some((p as u8, queued.frame));
+                }
+            }
+            if attempt == 0 && !self.is_empty() {
+                self.reset_round();
+            }
+        }
+        None
     }
 }
 
@@ -340,6 +403,63 @@ mod tests {
 
     fn arc(bytes: &[u8]) -> veil_bufpool::PooledShared {
         veil_bufpool::pooled_shared_from_vec(bytes.to_vec())
+    }
+
+    #[test]
+    fn neutral_datagram_cannot_jump_past_reliable_fifo_head() {
+        let mut pq = PriorityQueue::with_default_weights();
+        pq.push(INTERACTIVE, arc(b"file"));
+        pq.push_lossy(INTERACTIVE, arc(b"datagram"));
+        assert!(pq.pop_datagram_if(|bytes| bytes == b"datagram").is_none());
+        assert_eq!(&*pq.pop().unwrap(), b"file");
+        let (priority, frame) = pq.pop_datagram_if(|bytes| bytes == b"datagram").unwrap();
+        assert_eq!(priority, INTERACTIVE);
+        assert_eq!(&*frame, b"datagram");
+        assert!(pq.is_empty());
+    }
+
+    #[test]
+    fn datagrams_consume_normal_scheduler_slots() {
+        let mut pq = PriorityQueue::new([1, 1, 1, 1]);
+        pq.push_lossy(INTERACTIVE, arc(b"datagram1"));
+        pq.push_lossy(INTERACTIVE, arc(b"datagram2"));
+        pq.push(BULK, arc(b"bulk"));
+        assert!(
+            pq.pop_datagram_if(|bytes| bytes.starts_with(b"datagram"))
+                .is_some()
+        );
+        assert!(
+            pq.pop_datagram_if(|bytes| bytes.starts_with(b"datagram"))
+                .is_none()
+        );
+        assert_eq!(&*pq.pop().unwrap(), b"bulk");
+        assert_eq!(&*pq.pop().unwrap(), b"datagram2");
+    }
+
+    #[test]
+    fn neutral_lossy_budget_preserves_reliable_frames() {
+        let mut pq = PriorityQueue::with_default_weights();
+        pq.push(INTERACTIVE, arc(b"reliable"));
+        for i in 0..=LOSSY_REALTIME_MAX_DEPTH {
+            pq.push_lossy(INTERACTIVE, arc(&[i as u8]));
+        }
+        assert_eq!(pq.len(), LOSSY_REALTIME_MAX_DEPTH + 1);
+        assert_eq!(pq.drops_total(), 1);
+        assert_eq!(&*pq.pop().unwrap(), b"reliable");
+        assert_eq!(&*pq.pop().unwrap(), &[1]);
+    }
+
+    #[test]
+    fn neutral_lossy_frame_expires_without_dropping_reliable_data() {
+        let mut pq = PriorityQueue::with_default_weights();
+        pq.push_lossy(INTERACTIVE, arc(b"stale"));
+        pq.queues[INTERACTIVE as usize][0].enqueued_at =
+            Some(Instant::now() - LOSSY_REALTIME_MAX_AGE - Duration::from_millis(1));
+        pq.push(INTERACTIVE, arc(b"reliable"));
+        assert!(pq.pop_datagram_if(|bytes| bytes == b"stale").is_none());
+        assert_eq!(&*pq.pop().unwrap(), b"reliable");
+        assert_eq!(pq.drops_total(), 1);
+        assert!(pq.is_empty());
     }
 
     #[test]

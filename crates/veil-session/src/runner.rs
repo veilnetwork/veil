@@ -256,24 +256,23 @@ fn decode_realtime_lane_frame(frame: &[u8]) -> Option<(FrameHeader, &[u8], Realt
     )
     .ok()?;
     let expected_len = HEADER_SIZE.checked_add(header.body_len as usize)?;
-    if header.header_len as usize != HEADER_SIZE
-        || expected_len != frame.len()
-        || header.priority() != veil_proto::priority::REALTIME
-    {
+    if header.header_len as usize != HEADER_SIZE || expected_len != frame.len() {
         return None;
     }
     let body = &frame[HEADER_SIZE..];
-    let kind =
-        if header.family == FrameFamily::App as u8 && header.msg_type == AppMsg::AppRtData as u16 {
-            RealtimeLaneFrameKind::DirectApp
-        } else if header.family == FrameFamily::Delivery as u8
-            && header.msg_type == DeliveryMsg::Forward as u16
-            && veil_proto::delivery::ForwardPayload::is_realtime_datagram_eligible(body)
-        {
-            RealtimeLaneFrameKind::RelayForward
-        } else {
-            return None;
-        };
+    let kind = if header.family == FrameFamily::App as u8
+        && header.msg_type == AppMsg::AppRtData as u16
+        && header.priority() == veil_proto::priority::REALTIME
+    {
+        RealtimeLaneFrameKind::DirectApp
+    } else if header.family == FrameFamily::Delivery as u8
+        && header.msg_type == DeliveryMsg::Forward as u16
+        && veil_proto::delivery::ForwardPayload::is_realtime_datagram_eligible(body)
+    {
+        RealtimeLaneFrameKind::RelayForward
+    } else {
+        return None;
+    };
     Some((header, body, kind))
 }
 
@@ -290,8 +289,8 @@ fn enqueue_outbox_frame(
     priority: u8,
     frame: veil_bufpool::PooledShared,
 ) -> bool {
-    if priority == veil_proto::priority::REALTIME && decode_realtime_lane_frame(&frame).is_some() {
-        pq.push_lossy_realtime(priority, frame);
+    if decode_realtime_lane_frame(&frame).is_some() {
+        pq.push_lossy(priority, frame);
         true
     } else {
         pq.push(priority, frame);
@@ -3764,17 +3763,15 @@ impl SessionRunner {
                 self.maybe_initiate_x25519_rekey(&mut rekey, &mut pq);
                 self.maybe_initiate_mlkem_rekey(&mut mlkem_rekey, &mut pq);
                 // ── Step 2: flush priority queue to the wire ─────────────────
-                // AppRtData gets first refusal on QUIC's independent unreliable
-                // lane. This runs BEFORE the ordered writer-capacity gate, so a
-                // queued chat/control/bulk frame cannot head-of-line block a
-                // newer video frame. Any failure restores the complete frame at
-                // the queue head for the existing reliable stream fallback.
+                // Select datagrams in the ordinary WRR/FIFO order. Separate
+                // transport prevents socket head-of-line blocking, but does
+                // not let relayed datagrams jump past queued reliable data.
                 let mut datagram_drained = 0usize;
                 let mut disable_realtime_sender = false;
                 if let Some(lane) = realtime_lane.as_mut() {
                     for _ in 0..PQ_DRAIN_FRAMES_PER_PASS {
-                        let Some(outgoing) =
-                            pq.pop_realtime_if(|frame| decode_realtime_lane_frame(frame).is_some())
+                        let Some((outgoing_priority, outgoing)) =
+                            pq.pop_datagram_if(|frame| decode_realtime_lane_frame(frame).is_some())
                         else {
                             break;
                         };
@@ -3792,7 +3789,7 @@ impl SessionRunner {
                                             outgoing.len(),
                                         ),
                                     );
-                                    pq.push_realtime_front(outgoing);
+                                    pq.push_lossy_front(outgoing_priority, outgoing);
                                     break;
                                 }
                             };
@@ -3872,7 +3869,7 @@ impl SessionRunner {
                                     sent_wire_len,
                                 ),
                             );
-                            pq.push_realtime_front(outgoing);
+                            pq.push_lossy_front(outgoing_priority, outgoing);
                             // Quinn's non-blocking send only errors for a lost
                             // connection, disabled/unsupported DATAGRAMs, or a
                             // path-MTU shrink. Stop retrying every media frame;
@@ -5213,6 +5210,33 @@ mod realtime_lane_frame_tests {
             relay_hops: 0,
             delivery_attempt: None,
             traffic_class: Some(veil_proto::priority::REALTIME),
+        }
+    }
+
+    #[test]
+    fn relayed_datagram_does_not_require_scheduling_priority() {
+        let encoded = frame(
+            FrameFamily::Delivery,
+            DeliveryMsg::Forward as u16,
+            &relay_forward().encode(),
+        );
+        for priority in 0..=3 {
+            let mut header = decode_header(&encoded[..veil_proto::header::HEADER_SIZE]).unwrap();
+            header.set_priority(priority);
+            let mut neutral = encode_header(&header).to_vec();
+            neutral.extend_from_slice(&encoded[veil_proto::header::HEADER_SIZE..]);
+            assert!(decode_realtime_lane_frame(&neutral).is_some());
+            let mut pq = PriorityQueue::with_default_weights();
+            assert!(enqueue_outbox_frame(
+                &mut pq,
+                priority,
+                veil_bufpool::pooled_shared_from_vec(neutral),
+            ));
+            assert_eq!(pq.peek_priority(), Some(priority));
+            assert!(
+                pq.pop_datagram_if(|bytes| decode_realtime_lane_frame(bytes).is_some())
+                    .is_some()
+            );
         }
     }
 
