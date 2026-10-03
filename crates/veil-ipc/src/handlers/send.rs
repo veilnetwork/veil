@@ -540,6 +540,8 @@ pub(crate) async fn rate_limited(
 /// Every field was ALREADY an `Arc` where the server keeps it, so this costs
 /// a refcount bump per send, not a copy of anything.
 pub(crate) struct IpcSendContext {
+    /// Sender scheduling only; never copied into a network header or payload.
+    pub local_priority: u8,
     pub(crate) app_registry: Arc<AppEndpointRegistry>,
     pub(crate) local_node_id: [u8; 32],
     pub(crate) session_tx_registry: Option<Arc<dyn FrameBroadcaster>>,
@@ -1700,7 +1702,9 @@ pub(crate) async fn handle_ipc_send(
                     let fwd_frame = make_fwd_frame(next_hop);
                     let relayed = reg.send_to(
                         &next_hop,
-                        if relay_realtime {
+                        if relay_wire_realtime && ctx.local_priority == veil_proto::priority::BULK {
+                            veil_proto::priority::BULK
+                        } else if relay_realtime {
                             veil_proto::header::priority::REALTIME
                         } else {
                             veil_proto::header::priority::INTERACTIVE
@@ -1847,6 +1851,7 @@ pub(crate) async fn handle_rt_send(
     session_tx_registry: Option<&dyn FrameBroadcaster>,
     metrics: Option<&dyn IpcMetrics>,
     rate_limiter: &mut Option<TokenBucket>,
+    local_priority: u8,
 ) -> std::io::Result<()> {
     // Rate check — shared bucket with APP_SEND to prevent RT flooding.
     if rate_limited(wh, rate_limiter).await? {
@@ -1895,11 +1900,7 @@ pub(crate) async fn handle_rt_send(
 
     // Same reason as the interactive path: the destination may name an
     // identity, and the session is registered under a device of it.
-    let sent = reg.send_to_peer_or_identity(
-        &send.dst_node_id,
-        veil_proto::header::priority::REALTIME,
-        frame,
-    );
+    let sent = reg.send_to_peer_or_identity(&send.dst_node_id, local_priority.min(3), frame);
 
     if sent {
         if let Some(m) = metrics {
@@ -2176,6 +2177,95 @@ mod ratchet_send_tests {
         /// for every single-name fixture, which keeps them on the path they
         /// always took.
         family: Vec<[u8; 32]>,
+    }
+
+    #[derive(Default)]
+    struct LaneCapture(Mutex<Vec<(u8, Vec<u8>)>>);
+
+    impl FrameBroadcaster for LaneCapture {
+        fn send_to(&self, _peer: &[u8; 32], priority: u8, bytes: Vec<u8>) -> bool {
+            lock!(self.0).push((priority, bytes));
+            true
+        }
+        fn send_to_all_with_priority(&self, _priority: u8, _bytes: Arc<[u8]>) {}
+        fn active_node_ids(&self) -> Vec<[u8; 32]> {
+            vec![RELAY]
+        }
+    }
+
+    #[tokio::test]
+    async fn relay_local_lane_does_not_change_the_inter_node_packet() {
+        let fx = fixture(vec![RELAY]);
+        let capture = Arc::new(LaneCapture::default());
+        let mut ctx = fx.ctx(false);
+        ctx.session_tx_registry = Some(Arc::clone(&capture) as Arc<dyn FrameBroadcaster>);
+        let sealed = [
+            veil_proto::ipc::RELAY_MEDIA_SEALED_MAGIC.as_slice(),
+            &[7; 48],
+        ]
+        .concat();
+        let mut body = payload_to(PEER, &sealed);
+        let flags = veil_proto::ipc::IPC_SEND_FLAG_RELAY_REALTIME
+            | veil_proto::ipc::IPC_SEND_FLAG_RELAY_MEDIA_SEALED;
+        body[100..104].copy_from_slice(&flags.to_be_bytes());
+        let mut wh = sink().await;
+        let mut previous = None;
+        for lane in [veil_proto::priority::REALTIME, veil_proto::priority::BULK] {
+            ctx.local_priority = lane;
+            handle_ipc_send(&mut SendReply::Inline(&mut wh), &body, &ctx)
+                .await
+                .unwrap();
+            let (priority, bytes) = lock!(capture.0).pop().expect("forward queued");
+            assert_eq!(
+                priority, lane,
+                "only the sender's local scheduler sees the choice"
+            );
+            let header = codec::decode_header(&bytes).unwrap();
+            assert_eq!(header.flags, 0, "no local priority bits on the relay wire");
+            let mut forward =
+                veil_proto::delivery::ForwardPayload::decode(&bytes[veil_proto::HEADER_SIZE..])
+                    .unwrap();
+            assert_eq!(forward.envelope.payload, sealed);
+            assert_eq!(forward.traffic_class, Some(veil_proto::priority::REALTIME));
+            // Delivery bookkeeping may vary; transport/application fields may not.
+            forward.envelope.content_id = [0; 32];
+            forward.envelope.created_at = 0;
+            if let Some(previous) = previous {
+                assert_eq!(forward, previous);
+            }
+            previous = Some(forward);
+        }
+    }
+
+    #[tokio::test]
+    async fn direct_local_lane_is_stripped_before_network_encoding() {
+        let capture = LaneCapture::default();
+        let mut wh = sink().await;
+        let send = AppIpcRtSendPayload {
+            dst_node_id: PEER,
+            src_app_id: [1; 32],
+            dst_app_id: [2; 32],
+            endpoint_id: 13,
+            seq: 9,
+            timestamp_us: 100,
+            marker: 0,
+            payload_type: 0,
+            data: vec![8; 64],
+        }
+        .encode();
+        let mut previous = None;
+        for lane in [veil_proto::priority::REALTIME, veil_proto::priority::BULK] {
+            handle_rt_send(&mut wh, &send, Some(&capture), None, &mut None, lane)
+                .await
+                .unwrap();
+            let (priority, bytes) = lock!(capture.0).pop().unwrap();
+            assert_eq!(priority, lane);
+            assert_eq!(codec::decode_header(&bytes).unwrap().flags, 0);
+            if let Some(previous) = previous {
+                assert_eq!(bytes, previous);
+            }
+            previous = Some(bytes);
+        }
     }
 
     impl FrameBroadcaster for Outbox {
@@ -2475,6 +2565,7 @@ mod ratchet_send_tests {
     impl Fixture {
         fn ctx(&self, with_ratchet: bool) -> IpcSendContext {
             IpcSendContext {
+                local_priority: veil_proto::priority::REALTIME,
                 app_registry: Arc::clone(&self.registry),
                 local_node_id: ME,
                 session_tx_registry: Some(Arc::clone(&self.outbox) as Arc<dyn FrameBroadcaster>),

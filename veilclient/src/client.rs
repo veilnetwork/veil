@@ -153,7 +153,22 @@ impl SharedWriter {
     }
 
     pub(crate) async fn write_frame(&self, msg_type: u16, body: &[u8]) -> Result<(), ClientError> {
-        let frame = encode_frame(msg_type, body);
+        self.write_frame_on_local_lane(0, msg_type, body).await
+    }
+
+    /// Scheduling metadata for the local daemon only. Its network encoder
+    /// creates a fresh header; this priority must not escape to relay peers.
+    pub(crate) async fn write_frame_on_local_lane(
+        &self,
+        local_priority: u8,
+        msg_type: u16,
+        body: &[u8],
+    ) -> Result<(), ClientError> {
+        let mut hdr = FrameHeader::new(FrameFamily::LocalApp as u8, msg_type);
+        hdr.body_len = body.len() as u32;
+        hdr.set_priority(local_priority.min(3));
+        let mut frame = codec::encode_header(&hdr).to_vec();
+        frame.extend_from_slice(body);
         self.tx
             .send(frame)
             .await
@@ -259,6 +274,29 @@ impl SharedWriter {
         flags: u32,
         data: &[u8],
     ) -> Result<(), ClientError> {
+        self.write_app_ipc_send_on_local_lane_owned(
+            0,
+            dst_node_id,
+            src_app_id,
+            dst_app_id,
+            endpoint_id,
+            flags,
+            data,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn write_app_ipc_send_on_local_lane_owned(
+        &self,
+        local_priority: u8,
+        dst_node_id: &[u8; 32],
+        src_app_id: &[u8; 32],
+        dst_app_id: &[u8; 32],
+        endpoint_id: u32,
+        flags: u32,
+        data: &[u8],
+    ) -> Result<(), ClientError> {
         use veil_proto::header::HEADER_SIZE;
         const FIXED_SIZE: usize = 32 + 32 + 32 + 4 + 4 + 4; // matches AppIpcSendPayload::FIXED_SIZE
         let body_len = FIXED_SIZE + data.len();
@@ -268,6 +306,7 @@ impl SharedWriter {
         // FrameHeader.
         let mut hdr = FrameHeader::new(FrameFamily::LocalApp as u8, LocalAppMsg::AppIpcSend as u16);
         hdr.body_len = body_len as u32;
+        hdr.set_priority(local_priority.min(3));
         frame.extend_from_slice(&codec::encode_header(&hdr));
 
         // AppIpcSendPayload fixed fields.
@@ -3566,6 +3605,37 @@ pub async fn connect_ipc_any(anchor: &Path) -> Result<IpcStream, ClientError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn local_lane_encoding_keeps_the_application_body_unchanged() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(2);
+        let writer = super::SharedWriter::new(tx);
+        let flags = veil_proto::ipc::IPC_SEND_FLAG_RELAY_REALTIME
+            | veil_proto::ipc::IPC_SEND_FLAG_RELAY_MEDIA_SEALED;
+        let data = b"opaque sealed payload";
+        writer
+            .write_app_ipc_send_on_local_lane_owned(
+                veil_proto::priority::BULK,
+                &[1; 32],
+                &[2; 32],
+                &[3; 32],
+                13,
+                flags,
+                data,
+            )
+            .await
+            .unwrap();
+        let mut bulk = rx.recv().await.unwrap();
+        writer
+            .write_app_ipc_send_owned(&[1; 32], &[2; 32], &[3; 32], 13, flags, data)
+            .await
+            .unwrap();
+        let legacy = rx.recv().await.unwrap();
+        let mut header = veil_proto::codec::decode_header(&bulk).unwrap();
+        assert_eq!(header.priority(), veil_proto::priority::BULK);
+        header.set_priority(veil_proto::priority::REALTIME);
+        bulk[..veil_proto::HEADER_SIZE].copy_from_slice(&veil_proto::codec::encode_header(&header));
+        assert_eq!(bulk, legacy);
+    }
 
     /// A write half that accepts nothing, ever — a peer that has stopped
     /// reading with its buffer full.

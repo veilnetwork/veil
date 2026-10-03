@@ -1,7 +1,8 @@
 //! Per-session outbox registry.
 //!
-//! `SessionTxRegistry` keeps one priority-tagged sender per active session
-//! (keyed by `peer_id`). Each frame is tagged with a `u8` priority level
+//! `SessionTxRegistry` keeps an ordinary queue and a small independent reserve
+//! for local latency-sensitive producers per active session. Each sender is
+//! keyed by `peer_id`. Each frame is tagged with a `u8` priority level
 //! (0=REALTIME … 3=BACKGROUND). The matching receiver is handed to the
 //! `SessionRunner`, which feeds a `PriorityQueue` for WRR draining.
 //!
@@ -48,6 +49,7 @@ use veil_cfg::NodeId;
 use veil_types::NodeIdBytes;
 
 use super::priority_queue::INTERACTIVE;
+use crate::frame_outbox::{FrameOutbox, FrameSender, frame_channel};
 
 /// A priority-tagged frame: `(priority, frame_bytes)`.
 ///
@@ -71,7 +73,7 @@ pub type SessionTxOwner = [u8; 32];
 
 #[derive(Debug)]
 struct SessionTxEntry {
-    tx: mpsc::Sender<PriorityFrame>,
+    tx: FrameSender,
     owner: Option<SessionTxOwner>,
 }
 
@@ -193,10 +195,10 @@ impl SessionTxRegistry {
     /// OVL1 sessions use [`Self::try_register_directional`] so late teardown
     /// can prove ownership. The channel is bounded to `tx_queue_depth` frames;
     /// `send_to*` methods drop frames when full rather than blocking.
-    pub fn register(&mut self, peer_id: impl Into<NodeId>) -> mpsc::Receiver<PriorityFrame> {
+    pub fn register(&mut self, peer_id: impl Into<NodeId>) -> FrameOutbox {
         let peer_id = *peer_id.into().as_bytes();
         self.prune_closed();
-        let (tx, rx) = mpsc::channel(self.capacity);
+        let (tx, rx) = frame_channel(self.capacity);
         self.senders
             .insert(peer_id, SessionTxEntry { tx, owner: None });
         self.last_active.insert(peer_id, AtomicU64::new(now_ms()));
@@ -209,10 +211,10 @@ impl SessionTxRegistry {
         &mut self,
         peer_id: impl Into<NodeId>,
         owner: SessionTxOwner,
-    ) -> mpsc::Receiver<PriorityFrame> {
+    ) -> FrameOutbox {
         let peer_id = *peer_id.into().as_bytes();
         self.prune_closed();
-        let (tx, rx) = mpsc::channel(self.capacity);
+        let (tx, rx) = frame_channel(self.capacity);
         self.senders.insert(
             peer_id,
             SessionTxEntry {
@@ -234,16 +236,13 @@ impl SessionTxRegistry {
     /// self` (taken via the outer `RwLock` write guard in the runtime)
     /// is the canonical commit point for "this peer has a live session";
     /// `unregister` is the canonical destroy point for these unowned entries.
-    pub fn try_register_unique(
-        &mut self,
-        peer_id: impl Into<NodeId>,
-    ) -> Option<mpsc::Receiver<PriorityFrame>> {
+    pub fn try_register_unique(&mut self, peer_id: impl Into<NodeId>) -> Option<FrameOutbox> {
         let peer_id = *peer_id.into().as_bytes();
         self.prune_closed();
         if self.senders.contains_key(&peer_id) {
             return None;
         }
-        let (tx, rx) = mpsc::channel(self.capacity);
+        let (tx, rx) = frame_channel(self.capacity);
         self.senders
             .insert(peer_id, SessionTxEntry { tx, owner: None });
         self.last_active.insert(peer_id, AtomicU64::new(now_ms()));
@@ -291,7 +290,7 @@ impl SessionTxRegistry {
         bypass_directional: bool,
         evict_open_on_dedup: bool,
         owner: SessionTxOwner,
-    ) -> Option<mpsc::Receiver<PriorityFrame>> {
+    ) -> Option<FrameOutbox> {
         let peer_id = *peer_id.into().as_bytes();
         self.prune_closed();
 
@@ -334,7 +333,7 @@ impl SessionTxRegistry {
         self.senders.remove(&peer_id);
         self.last_active.remove(&peer_id);
 
-        let (tx, rx) = mpsc::channel(self.capacity);
+        let (tx, rx) = frame_channel(self.capacity);
         self.senders.insert(
             peer_id,
             SessionTxEntry {
@@ -380,7 +379,7 @@ impl SessionTxRegistry {
     /// closed-channel stragglers that `prune_closed` hasn't reached yet.
     /// Without this filter the outbound-reconnect loop would observe a
     /// dead session as live and skip recovery indefinitely.
-    pub fn get_sender(&self, peer_id: &NodeIdBytes) -> Option<&mpsc::Sender<PriorityFrame>> {
+    pub fn get_sender(&self, peer_id: &NodeIdBytes) -> Option<&FrameSender> {
         self.senders
             .get(peer_id)
             .filter(|entry| !entry.tx.is_closed())
@@ -661,10 +660,7 @@ impl SessionTxRegistry {
     /// Computed as `capacity − remaining_capacity` per channel.
     /// Used by the congestion monitor to track TX queue pressure.
     pub fn total_queued(&self) -> usize {
-        self.senders
-            .values()
-            .map(|entry| self.capacity.saturating_sub(entry.tx.capacity()))
-            .sum()
+        self.senders.values().map(|entry| entry.tx.queued()).sum()
     }
 
     /// Evict the `n` least-recently-active sessions to free memory.
@@ -693,7 +689,7 @@ impl SessionTxRegistry {
     }
 
     /// Worst-case memory bound for capacity planning. Returns
-    /// `active_sessions × capacity × AVG_FRAME_BYTES`, where
+    /// `active_sessions × (capacity + reserved_capacity) × AVG_FRAME_BYTES`, where
     /// `AVG_FRAME_BYTES = 16 KiB` reflects a typical encrypted IPC chunk
     /// (frame header + ChaCha20-Poly1305 ciphertext for a ~12 KiB
     /// plaintext). Real frames range from ~64 B keepalives to ~60 KiB
@@ -706,7 +702,10 @@ impl SessionTxRegistry {
         // grows `capacity` to a huge value.
         self.senders
             .len()
-            .saturating_mul(self.capacity)
+            .saturating_mul(
+                self.capacity
+                    .saturating_add(self.capacity.min(crate::frame_outbox::RESERVED_QUEUE_DEPTH)),
+            )
             .saturating_mul(AVG_FRAME_BYTES)
     }
 }
@@ -714,6 +713,27 @@ impl SessionTxRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn full_bulk_ingress_still_accepts_a_local_latency_sensitive_frame() {
+        use veil_proto::priority::{BULK, REALTIME};
+        let mut registry = SessionTxRegistry::with_capacity(2);
+        let peer = [8; 32];
+        let mut receiver = registry.register(peer);
+        assert!(registry.send_to(&peer, BULK, vec![1]));
+        assert!(registry.send_to(&peer, BULK, vec![2]));
+        assert_eq!(
+            registry.send_to_result(&peer, BULK, vec![3]),
+            Err(SendToError::Full)
+        );
+        assert!(registry.send_to(&peer, REALTIME, vec![4]));
+        assert_eq!(registry.total_queued(), 3);
+        assert_eq!(registry.estimated_memory(), 4 * 16 * 1024);
+        assert_eq!(receiver.recv().await.unwrap().1[0], 4);
+        assert_eq!(receiver.try_recv().unwrap().1[0], 1);
+        assert_eq!(receiver.try_recv().unwrap().1[0], 2);
+        assert_eq!(registry.total_queued(), 0);
+    }
 
     /// A send from a session that no longer owns the slot goes nowhere.
     ///

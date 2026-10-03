@@ -3010,7 +3010,7 @@ mod tests {
         let pending = Arc::new(Mutex::new(std::collections::HashMap::new()));
 
         let spawn_answer =
-            |mut rx: tokio::sync::mpsc::Receiver<veil_session::PriorityFrame>,
+            |mut rx: veil_session::FrameOutbox,
              pending: Arc<Mutex<std::collections::HashMap<[u8; 16], PendingRecursive>>>,
              value: Vec<u8>| {
                 tokio::spawn(async move {

@@ -38,6 +38,21 @@ fn media_is_vp8_rtp(payload: &[u8]) -> bool {
     (payload[1] & 0x7f) == 96
 }
 
+// Local scheduling classification. This is computed before sealing and is
+// sent only to our IPC daemon; no audio/video class is added to relay frames.
+#[cfg(feature = "node-embedded")]
+fn media_cell_is_video(cell: &[u8]) -> bool {
+    if cell.first() != Some(&media::MEDIA_BATCH_MAGIC) {
+        return media_is_vp8_rtp(cell);
+    }
+    let Some(len_bytes) = cell.get(3..5) else {
+        return false;
+    };
+    let len = u16::from_be_bytes([len_bytes[0], len_bytes[1]]) as usize;
+    cell.get(5..5usize.saturating_add(len))
+        .is_some_and(media_is_vp8_rtp)
+}
+
 #[cfg(all(test, feature = "node-embedded"))]
 mod media_priority_tests;
 
@@ -451,6 +466,11 @@ pub unsafe extern "C" fn veil_media_open_direct_channel(
                 } else {
                     (0, 0)
                 };
+                let local_priority = if media_cell_is_video(&pkt) {
+                    veil_proto::priority::BULK
+                } else {
+                    veil_proto::priority::REALTIME
+                };
                 // Unsealable cell → drop it. There is no cleartext fallback.
                 let Some(sealed) = cipher_task.seal(&pkt) else {
                     continue;
@@ -461,7 +481,8 @@ pub unsafe extern "C" fn veil_media_open_direct_channel(
                 drop(pkt);
                 let timestamp_us = started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
                 let _ = sender
-                    .send_rt_data(
+                    .send_rt_data_on_local_lane(
+                        local_priority,
                         peer,
                         peer_app,
                         peer_endpoint_id,
@@ -729,7 +750,8 @@ pub unsafe extern "C" fn veil_media_open_relay_channel(
                         drop(cell); // plaintext moved out of scope; see the onion drain
                         let ipc_started = std::time::Instant::now();
                         let result = sender
-                            .send_relay_media_sealed_owned(
+                            .send_relay_media_sealed_on_local_lane_owned(
+                                veil_proto::priority::BULK,
                                 peer,
                                 peer_app,
                                 peer_endpoint_id,
@@ -1499,7 +1521,10 @@ fn media_wire_cells(frame: Vec<Vec<u8>>, batching: bool) -> Vec<Vec<u8>> {
             continue;
         }
         if !chunk.is_empty()
-            && (chunk.len() >= RELAY_VIDEO_BATCH_MAX_PACKETS
+            && (chunk
+                .first()
+                .is_some_and(|first| media_is_vp8_rtp(first) != media_is_vp8_rtp(&packet))
+                || chunk.len() >= RELAY_VIDEO_BATCH_MAX_PACKETS
                 || body_bytes.saturating_add(encoded_bytes) > RELAY_VIDEO_BATCH_BODY_MAX)
         {
             flush_media_batch_chunk(&mut chunk, &mut cells);
