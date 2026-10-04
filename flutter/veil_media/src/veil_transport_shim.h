@@ -51,6 +51,11 @@ struct AudioFeedbackSnapshot {
   int64_t rtt_ms = 0;
   int loss_pct = 0;
   int jitter_ms = 0;
+
+  bool fresh_at(int64_t now_us) const {
+    return arrived_us > 0 && arrived_us <= now_us &&
+           now_us - arrived_us <= 15'000'000;
+  }
 };
 
 struct VideoCadenceSnapshot {
