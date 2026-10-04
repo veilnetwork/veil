@@ -101,6 +101,18 @@ extern "C" int veil_media_test_blocked_audio_stats(
   return check(ctx, e->veil_chan, ssrc_of(e->peer), video_ssrc_of(e->peer));
 }
 
+extern "C" int veil_media_test_group_blocked_audio_stats(
+    VeilGroupMediaEngine* e, PlaneInjector check, void* ctx) {
+  auto* ws = e->ws.get();
+  HeldQueues held(ws->worker_tq.get(), ws->video_worker_tq.get());
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+  while (!held.first->entered.load() || !held.second->entered.load()) {
+    if (std::chrono::steady_clock::now() >= deadline) return 1;
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  return check(ctx, 0, 0, 0);
+}
+
 // Two engine generations reproduce starting/rebuilding an already-muted call.
 // The real AudioState, stream and Opus encoder run against a counting ADM.
 extern "C" int veil_media_test_muted_capture_lifecycle() {

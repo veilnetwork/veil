@@ -18,6 +18,7 @@ extern "C" int veil_media_test_direct_call_planes(VeilMediaEngine*, Injector, vo
 extern "C" int veil_media_test_blocked_audio_stats(VeilMediaEngine*, Injector, void*);
 extern "C" int veil_media_test_muted_capture_lifecycle();
 extern "C" int veil_media_test_group_call_planes(VeilGroupMediaEngine*, Injector, void*);
+extern "C" int veil_media_test_group_blocked_audio_stats(VeilGroupMediaEngine*, Injector, void*);
 extern "C" int veil_media_test_group_fanout_packet(VeilGroupMediaEngine*, int);
 extern "C" int veil_media_test_video_bandwidth(VeilMediaEngine*);
 struct Callback { void (*fn)(void*, const uint8_t*, size_t); void* ctx; };
@@ -146,6 +147,47 @@ static int inject_group(void* ctx, uint64_t chan, uint32_t audio, uint32_t video
     return 2;
   return std::chrono::steady_clock::now() - start < std::chrono::milliseconds(250) ? 0 : 3;
 }
+static int check_group_blocked_audio_stats(void* ctx, uint64_t, uint32_t, uint32_t) {
+  const auto start = std::chrono::steady_clock::now();
+  char* json = veil_media_group_engine_get_stats(static_cast<VeilGroupMediaEngine*>(ctx));
+  const bool valid = json && std::strstr(json, "\"worker_stalled\":1") &&
+                     std::strstr(json, "\"audio_rx_supported\":1") &&
+                     std::strstr(json, "\"audio_receivers\":{}");
+  veil_media_free_string(json);
+  return valid && std::chrono::steady_clock::now() - start <
+      std::chrono::milliseconds(250) ? 0 : 1;
+}
+static uint64_t group_audio_packets(VeilGroupMediaEngine* engine, const uint8_t peer[32]) {
+  constexpr char hex[] = "0123456789abcdef";
+  std::string id;
+  for (size_t i = 0; i < 32; ++i) {
+    id += hex[peer[i] >> 4]; id += hex[peer[i] & 15];
+  }
+  char* json = veil_media_group_engine_get_stats(engine);
+  assert(json && std::strstr(json, "\"audio_rx_supported\":1"));
+  const auto prefix = "\"" + id + "\":{\"audio_rx_pkts\":";
+  const char* at = std::strstr(json, prefix.c_str());
+  assert(at);
+  const auto packets = std::strtoull(at + prefix.size(), nullptr, 10);
+  veil_media_free_string(json);
+  return packets;
+}
+static void inject_non_audio(uint64_t chan, uint32_t audio, uint32_t video) {
+  Callback cb;
+  { std::lock_guard lock(callback_mu); cb = callbacks.at(chan); }
+  for (const uint32_t source : {audio ^ 1u, video}) {
+    for (uint16_t seq = 20; seq < 40; ++seq) {
+      std::array<uint8_t, 15> p{0x80, uint8_t(source == video ? 96 : 111)};
+      p[2] = seq >> 8; p[3] = seq;
+      for (int i = 0; i < 4; ++i) {
+        p[4 + i] = (uint32_t(seq) * 960) >> (24 - i * 8);
+        p[8 + i] = source >> (24 - i * 8);
+      }
+      p[12] = 0xf8; p[13] = 0xff; p[14] = 0xfe;
+      cb.fn(cb.ctx, p.data(), p.size());
+    }
+  }
+}
 static uint32_t group_ssrc(const uint8_t id[32], uint32_t domain = 0x47415544u) {
   uint32_t hash = 2166136261u;
   for (size_t i = 0; i < 32; ++i) { hash ^= id[i]; hash *= 16777619u; }
@@ -232,8 +274,17 @@ int main() {
     assert(veil_media_group_engine_start_video(e.get()) == VEIL_MEDIA_OK);
     const int result = veil_media_test_group_call_planes(e.get(), inject_group, e.get());
     if (result) { std::fprintf(stderr, "group isolation failed: %d\n", result); return 2; }
+    assert(group_audio_packets(e.get(), peer) == 4);
+    assert(veil_media_group_engine_peer_rx_packets(e.get(), peer) > 4);
+    inject_non_audio(22, group_ssrc(peer), group_ssrc(peer, 0x47564944u));
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    assert(group_audio_packets(e.get(), peer) == 4);
+    assert(veil_media_test_group_blocked_audio_stats(
+        e.get(), check_group_blocked_audio_stats, e.get()) == 0);
+    assert(group_audio_packets(e.get(), peer) == 4);
     assert(veil_media_group_engine_remove_peer(e.get(), peer) == VEIL_MEDIA_OK);
     assert(veil_media_group_engine_add_peer(e.get(), 23, peer) == VEIL_MEDIA_OK);
+    assert(group_audio_packets(e.get(), peer) == 0);
     assert(veil_media_group_engine_stop_video(e.get()) == VEIL_MEDIA_OK);
     assert(veil_media_group_engine_stop_audio(e.get()) == VEIL_MEDIA_OK);
   }
@@ -342,6 +393,16 @@ int main() {
     assert(group_stat(e.get(), "audio_feedback_reports") == 2);
     assert(group_stat(e.get(), "tx_loss_pct") == 13);
     assert(group_stat(e.get(), "tx_jitter_ms") == 100);
+    // Audio and video report blocks do not count as accepted audio. One
+    // participant's accepted packets cannot keep another participant alive.
+    assert(group_audio_packets(e.get(), peer) == 0);
+    assert(group_audio_packets(e.get(), other) == 0);
+    assert(inject(nullptr, 80, group_ssrc(peer), group_ssrc(peer, 0x47564944u)) == 0);
+    deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (group_audio_packets(e.get(), peer) != 4 && std::chrono::steady_clock::now() < deadline)
+      std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    assert(group_audio_packets(e.get(), peer) == 4);
+    assert(group_audio_packets(e.get(), other) == 0);
     assert(veil_media_group_engine_set_video_bitrate(e.get(), 45, 2) == VEIL_MEDIA_OK);
     assert(group_stat(e.get(), "max_fps") == 2);
     std::this_thread::sleep_for(std::chrono::milliseconds(500));
