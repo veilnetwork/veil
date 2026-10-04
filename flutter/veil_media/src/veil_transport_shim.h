@@ -28,6 +28,7 @@
 #pragma once
 
 #include <atomic>
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -52,17 +53,18 @@ struct VideoCadenceSnapshot {
   uint64_t holds_75ms = 0;
 };
 
-// Bridges one webrtc::Call to one veil media datagram channel. Construct after
-// the Call exists (needs Call* for OnSentPacket + Receiver()); register the
+// Bridges separate local audio/video Calls to one Veil media handle. Both
+// Calls and their queues must outlive the shim; register the
 // inbound callback via Start().
 class VeilTransportShim : public webrtc::Transport {
  public:
-  // `veil_chan` is a veil_media_open_channel id. `network_queue` is the
-  // TaskQueue WebRTC expects DeliverRtp/RtcpPacket to run on. `call` is used
-  // for OnSentPacket + Receiver(); it must outlive the shim.
+  // `veil_chan` is a veil_media_open_channel id. Each Call has its own
+  // network queue for DeliverRtp/RtcpPacket and its own sent-packet clock.
   VeilTransportShim(uint64_t veil_chan,
                     webrtc::Call* call,
-                    webrtc::TaskQueueBase* network_queue);
+                    webrtc::TaskQueueBase* network_queue,
+                    webrtc::Call* video_call,
+                    webrtc::TaskQueueBase* video_network_queue);
   ~VeilTransportShim() override;
 
   VeilTransportShim(const VeilTransportShim&) = delete;
@@ -127,9 +129,10 @@ class VeilTransportShim : public webrtc::Transport {
   static void OnVeilDatagram(void* ctx, const uint8_t* ptr, size_t len);
   // Post one bounded drain turn. The packet buffers stay in separate local
   // queues, allowing newly arrived audio to pass already queued video.
-  void PostInboundDrain();
-  // Runs on `network_queue_`: demux RTP vs RTCP and deliver into the Call.
-  void DeliverOnNetworkThread(std::span<const uint8_t> packet);
+  void PostInboundDrain(bool secondary);
+  // Runs on the selected local network queue and delivers into its Call.
+  void DeliverOnNetworkThread(std::span<const uint8_t> packet, bool secondary,
+                              int64_t arrived_us);
 
   // WHAT A QUEUED TASK IS ALLOWED TO TOUCH AFTER THIS OBJECT IS GONE.
   //
@@ -138,18 +141,21 @@ class VeilTransportShim : public webrtc::Transport {
   // network queue. That task must safely detect a destroyed shim before
   // touching any member (report27 V23).
   //
-  // The destructor takes this lock and clears the flag, so a task either
+  // Each lane has its own guard. The destructor clears both flags, so a task either
   // completes while the destructor waits, or sees `alive == false` and touches
   // nothing. Held across the delivery, which is bounded by one packet.
   struct TaskGuard {
     std::mutex mu;
     bool alive = true;
   };
-  const std::shared_ptr<TaskGuard> task_guard_ = std::make_shared<TaskGuard>();
+  const std::array<std::shared_ptr<TaskGuard>, 2> task_guards_ = {
+      std::make_shared<TaskGuard>(), std::make_shared<TaskGuard>()};
 
   const uint64_t veil_chan_;
   webrtc::Call* const call_;
   webrtc::TaskQueueBase* const network_queue_;
+  webrtc::Call* const video_call_;
+  webrtc::TaskQueueBase* const video_network_queue_;
   std::atomic<uint32_t> remote_video_ssrc_{0};
   std::atomic<bool> started_{false};
   InboundPacketQueue inbound_queue_;
