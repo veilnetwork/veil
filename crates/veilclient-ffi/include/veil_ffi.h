@@ -3556,9 +3556,9 @@ uint64_t veil_media_open_relay_channel(VeilApp *app,
 #if defined(VEIL_FFI_NODE_EMBEDDED)
 /**
  * Enqueue one media datagram (RTP/RTCP) on `chan`. NON-BLOCKING: returns 0 if
- * queued, 1 if dropped (queue full / channel closing) — the caller's real-time
+ * queued, 1 if dropped (full queue / busy ingress) — the caller's real-time
  * media thread must never block. Returns -1 on a NULL/zero-length payload or an
- * unknown `chan`.
+ * unknown/closed `chan`.
  */
  int veil_media_send_datagram(uint64_t chan, const uint8_t *ptr, size_t len) ;
 #endif
