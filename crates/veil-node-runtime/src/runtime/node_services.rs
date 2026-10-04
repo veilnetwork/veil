@@ -2214,6 +2214,29 @@ impl NodeServices {
         )
     }
 
+    /// Prepare only this endpoint's generic child transport, without a media
+    /// frame, role label or change to relay scheduling.
+    pub fn request_local_circuit_datagram(
+        &self,
+        circuit: &DataCircuit,
+        local_lane: u8,
+    ) -> veil_session::LocalDatagramChannelState {
+        rlock!(self.session_tx_registry)
+            .request_local_datagram_channel(&circuit.first_hop(), local_lane)
+    }
+
+    /// Whether this originator's negotiated duplex child is ready. The state
+    /// lives in the current local outbox and is reset on rekey/session exit.
+    /// It communicates nothing to a relay and never grants transit priority.
+    pub fn local_circuit_datagram_state(
+        &self,
+        circuit: &DataCircuit,
+        local_lane: u8,
+    ) -> veil_session::LocalDatagramChannelState {
+        rlock!(self.session_tx_registry)
+            .local_datagram_channel_state(&circuit.first_hop(), local_lane)
+    }
+
     /// Explicitly loss-tolerant data; reliable files/control use CircuitData.
     /// This generic transport property carries no audio/video role. A session
     /// without negotiated support encodes the old CircuitData on its stream.

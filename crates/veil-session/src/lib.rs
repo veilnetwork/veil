@@ -21,6 +21,8 @@ mod datagram_flows;
 pub mod dispatcher_sink;
 pub mod frame_diag;
 pub mod frame_outbox;
+mod local_datagram_status;
+pub use local_datagram_status::LocalDatagramChannelState;
 pub mod fsm;
 pub mod glue;
 pub mod handoff;

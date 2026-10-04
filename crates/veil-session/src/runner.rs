@@ -103,6 +103,8 @@ pub enum NextInput {
     RpcRequest(OutboxRequest),
     /// A timer (keepalive or idle-check) fired — caller should loop back.
     Timer,
+    /// A trusted local producer requested source-channel preparation.
+    LocalDatagramWarm,
     /// a replacement `BoxIoStream` arrived on `swap_rx`. The
     /// main loop swaps `self.stream` and loops back, keeping all AEAD
     /// state intact.
@@ -132,11 +134,18 @@ async fn await_next_input(
     swap_rx: Option<&mut mpsc::Receiver<BoxIoStream>>,
     sleep_until: Option<tokio::time::Instant>,
     wire_tx: &mpsc::Sender<veil_bufpool::PooledShared>,
+    local_datagram_status: Option<&crate::local_datagram_status::LocalDatagramStatus>,
 ) -> NextInput {
     use std::future::pending;
     use tokio::io::AsyncReadExt as _;
 
     tokio::select! {
+        _ = async {
+            match local_datagram_status {
+                Some(status) => status.notified().await,
+                None => pending::<()>().await,
+            }
+        } => NextInput::LocalDatagramWarm,
         r = read_half.read_u8() => match r {
             Ok(b)  => NextInput::Byte(b),
             Err(e) => NextInput::ReadClosed(e.to_string()),
@@ -3441,6 +3450,9 @@ impl SessionRunner {
         // will see TrySendError::Closed instead of silently queuing frames into a
         // dead channel that nobody reads (ghost-session window).
         let mut outbox = self.outbox.take();
+        let local_datagram_status = outbox
+            .as_ref()
+            .and_then(|outbox| outbox.local_datagram_status());
         let mut rpc_outbox = self.rpc_outbox.take();
         // hot-standby swap inbox, taken out for the same reason.
         let mut swap_rx = self.hot_standby.swap_rx.take();
@@ -3529,6 +3541,10 @@ impl SessionRunner {
                                         ban_list: Arc::clone(&self.ban_list),
                                         violation_tracker: Arc::clone(&self.violation_tracker),
                                     },
+                                    outbox
+                                        .as_ref()
+                                        .filter(|_| offer.peer_circuit_datagrams)
+                                        .and_then(|outbox| outbox.local_datagram_status()),
                                 )
                             }),
                     }
@@ -3956,6 +3972,23 @@ impl SessionRunner {
                         }
                     }
                 }
+                // A local receive-only producer can prepare its generic child
+                // without sending large fixed-size probe cells while TLS warms.
+                if let Some(status) = &local_datagram_status
+                    && let Some(parallel) = realtime_lane
+                        .as_mut()
+                        .and_then(|lane| lane.parallel.as_mut())
+                {
+                    let pending = status.pending();
+                    for (mask, lane) in [
+                        (1, veil_proto::priority::REALTIME),
+                        (2, veil_proto::priority::BULK),
+                    ] {
+                        if pending & mask != 0 {
+                            parallel.prepare(lane);
+                        }
+                    }
+                }
                 // Rekey-threshold checks — both no-op unless a fresh
                 // rekey is needed (X25519 cipher rotation +
                 // nonce-watermark, PQ E2E key rotation respectively).
@@ -4372,6 +4405,7 @@ impl SessionRunner {
                     swap_rx.as_mut(),
                     sleep_until,
                     &wire_tx,
+                    local_datagram_status.as_deref(),
                 )
                 .await
                 {
@@ -4432,6 +4466,7 @@ impl SessionRunner {
                         );
                         continue;
                     }
+                    NextInput::LocalDatagramWarm => continue,
                     // Timer fires for keepalive/idle checks; also evict stale RPC
                     // response slots so they don't accumulate during quiet periods
                     // when no new RPC requests arrive.
