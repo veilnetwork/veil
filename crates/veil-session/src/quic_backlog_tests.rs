@@ -285,12 +285,77 @@ struct ContinuousReport {
     secondary_sent: usize,
     secondary_dropped: usize,
     file_bytes: u64,
+    file_accepted: u64,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum StreamBudget {
+    Default,
+    Manual(u64),
+    LocalPrimary,
+    TransitPrimary,
+    ExpiredLocalPrimary,
+    DroppedLocalPrimary,
+}
+
+fn apply_stream_budget(
+    mode: StreamBudget,
+    tx: &veil_transport::QuicDatagramHandle,
+    admission: &mut super::local_reliable_admission::LocalReliableAdmission,
+) {
+    use super::local_reliable_admission::LocalReliableAdmission;
+    use veil_proto::priority::{INTERACTIVE, REALTIME};
+    let frame = circuit_frame(1, 0x11);
+    let now = std::time::Instant::now();
+    match mode {
+        StreamBudget::Default => {}
+        StreamBudget::Manual(bytes) => tx.set_reliable_send_window(bytes),
+        StreamBudget::LocalPrimary => admission.observe(REALTIME, &frame, now),
+        StreamBudget::TransitPrimary => {
+            // Neither an invalid local frame nor a forged wire priority may
+            // activate a source-only budget on an ordinary forwarding lane.
+            admission.observe(REALTIME, &[0; 8], now);
+            let mut header =
+                veil_proto::decode_header(&frame[..veil_proto::header::HEADER_SIZE]).unwrap();
+            header.set_priority(REALTIME);
+            let mut forged = frame;
+            forged[..veil_proto::header::HEADER_SIZE]
+                .copy_from_slice(&veil_proto::encode_header(&header));
+            admission.observe(INTERACTIVE, &forged, now);
+        }
+        StreamBudget::ExpiredLocalPrimary => {
+            admission.observe(REALTIME, &frame, now);
+            admission.expire(now + Duration::from_secs(3));
+        }
+        StreamBudget::DroppedLocalPrimary => {
+            let mut guard = LocalReliableAdmission::new(tx.clone());
+            guard.observe(REALTIME, &frame, now);
+            drop(guard);
+        }
+    }
 }
 
 async fn measure_continuous(
     file: bool,
     video_tick_period: Option<u32>,
     primary_tick_period: u32,
+) -> ContinuousReport {
+    measure_continuous_with_stream_budget(
+        file,
+        video_tick_period,
+        primary_tick_period,
+        StreamBudget::Default,
+        Duration::ZERO,
+    )
+    .await
+}
+
+async fn measure_continuous_with_stream_budget(
+    file: bool,
+    video_tick_period: Option<u32>,
+    primary_tick_period: u32,
+    stream_budget: StreamBudget,
+    file_lead: Duration,
 ) -> ContinuousReport {
     use crate::datagram_flows::{SessionDatagramRx, SessionDatagramTx};
     use veil_anonymity::circuit_wire::CircuitDataPayload;
@@ -328,6 +393,10 @@ async fn measure_continuous(
         .await
         .unwrap();
     let tx = local.quic_datagrams().unwrap();
+    let mut admission = super::local_reliable_admission::LocalReliableAdmission::new(tx.clone());
+    if file_lead.is_zero() {
+        apply_stream_budget(stream_budget, &tx, &mut admission);
+    }
     let mut local_stream = local.into_stream().unwrap();
     local_stream.write_all(b"stand").await.unwrap();
     let remote = remote.await.unwrap();
@@ -350,16 +419,26 @@ async fn measure_continuous(
             received_file.fetch_add(len as u64, Ordering::Relaxed);
         }
     });
+    let file_accepted = Arc::new(AtomicU64::new(0));
+    let accepted_file = Arc::clone(&file_accepted);
     let file_writer = tokio::spawn(async move {
         if file {
-            local_stream
-                .write_all(&vec![0xb2; 4 * 1024 * 1024])
-                .await
-                .unwrap();
+            let body = vec![0xb2; 4 * 1024 * 1024];
+            let mut offset = 0;
+            while offset < body.len() {
+                let len = local_stream.write(&body[offset..]).await.unwrap();
+                assert!(len > 0);
+                offset += len;
+                accepted_file.fetch_add(len as u64, Ordering::Relaxed);
+            }
         }
         std::future::pending::<()>().await;
         drop(local_stream);
     });
+    if !file_lead.is_zero() {
+        sleep(file_lead).await;
+        apply_stream_budget(stream_budget, &tx, &mut admission);
+    }
     let started = Instant::now();
     let (received_tx, mut received_rx) = mpsc::unbounded_channel();
     let media_reader = tokio::spawn(async move {
@@ -402,6 +481,20 @@ async fn measure_continuous(
                 .copy_from_slice(&(tick / primary_tick_period).to_be_bytes());
             primary[HEADER_SIZE + 10..HEADER_SIZE + 18]
                 .copy_from_slice(&(started.elapsed().as_nanos() as u64).to_be_bytes());
+            if matches!(
+                stream_budget,
+                StreamBudget::LocalPrimary | StreamBudget::TransitPrimary
+            ) {
+                admission.observe(
+                    if matches!(stream_budget, StreamBudget::LocalPrimary) {
+                        REALTIME
+                    } else {
+                        veil_proto::priority::INTERACTIVE
+                    },
+                    &primary,
+                    std::time::Instant::now(),
+                );
+            }
             let packets = cipher
                 .encode_frame(u64::from(REALTIME), &primary, ceiling)
                 .unwrap();
@@ -449,10 +542,12 @@ async fn measure_continuous(
     samples.sort_unstable();
     let p95 = samples.get(samples.len() * 95 / 100).copied();
     eprintln!(
-        "continuous: file={file} video_tick_period={video_tick_period:?} primary_tick_period={primary_tick_period} primary_sent={primary_sent} primary_received={} primary_p95_ms={:?} secondary_sent={secondary_sent} secondary_dropped={secondary_dropped} file_bytes={} neutral_udp_drops={}",
+        "continuous: file={file} video_tick_period={video_tick_period:?} primary_tick_period={primary_tick_period} stream_budget={stream_budget:?} file_lead_ms={} primary_sent={primary_sent} primary_received={} primary_p95_ms={:?} secondary_sent={secondary_sent} secondary_dropped={secondary_dropped} file_bytes={} file_accepted={} neutral_udp_drops={}",
+        file_lead.as_millis(),
         samples.len(),
         p95.map(|v| v.as_secs_f64() * 1000.0),
         file_bytes.load(Ordering::Relaxed),
+        file_accepted.load(Ordering::Relaxed),
         link.dropped.load(Ordering::Relaxed)
     );
     for task in [file_writer, file_reader, media_reader] {
@@ -466,6 +561,7 @@ async fn measure_continuous(
         secondary_sent,
         secondary_dropped,
         file_bytes: file_bytes.load(Ordering::Relaxed),
+        file_accepted: file_accepted.load(Ordering::Relaxed),
     }
 }
 
@@ -511,6 +607,54 @@ async fn characterize_continuous_primary_with_independent_competing_producers() 
         assert!(report.primary_received > 0);
         assert_eq!(report.file_bytes > 0, file);
         assert_eq!(report.secondary_sent > 0, video_period.is_some());
+    }
+}
+
+#[tokio::test]
+#[ignore = "Experimental endpoint stream budget matrix; run with --ignored --nocapture"]
+async fn characterize_local_reliable_admission_during_primary_delivery() {
+    for (budget, lead) in [
+        (StreamBudget::Default, Duration::ZERO),
+        (StreamBudget::LocalPrimary, Duration::ZERO),
+        (StreamBudget::Manual(2048), Duration::ZERO),
+        (StreamBudget::LocalPrimary, Duration::from_millis(250)),
+    ] {
+        let report = measure_continuous_with_stream_budget(true, None, 2, budget, lead).await;
+        assert_eq!(report.primary_sent, 100);
+        assert!(report.primary_received > 0);
+        assert!(report.file_bytes > 0);
+    }
+}
+
+#[tokio::test]
+async fn local_primary_bounds_new_file_admission_and_preserves_delivery() {
+    let report = measure_continuous_with_stream_budget(
+        true,
+        None,
+        2,
+        StreamBudget::LocalPrimary,
+        Duration::ZERO,
+    )
+    .await;
+    assert!(report.file_bytes > 0, "file must actually progress");
+    require_primary_quality(&report);
+}
+
+#[tokio::test]
+async fn transit_and_retired_local_producers_keep_normal_reliable_admission() {
+    for mode in [
+        StreamBudget::TransitPrimary,
+        StreamBudget::ExpiredLocalPrimary,
+        StreamBudget::DroppedLocalPrimary,
+    ] {
+        let report =
+            measure_continuous_with_stream_budget(true, None, 2, mode, Duration::ZERO).await;
+        assert_eq!(
+            report.file_accepted,
+            4 * 1024 * 1024,
+            "{mode:?}: admission must be restored or unchanged"
+        );
+        assert!(report.file_bytes > 0);
     }
 }
 

@@ -38,6 +38,10 @@ pub enum PunchedQuicRole {
 /// video.
 pub const REALTIME_DATAGRAM_BUFFER_BYTES: usize = 64 * 1024;
 
+/// Quinn's current reliable admission default, made explicit so a temporary
+/// endpoint bound can restore the same baseline after its producer stops.
+pub const DEFAULT_RELIABLE_SEND_WINDOW_BYTES: u64 = 10_000_000;
+
 /// Stable transport-level classification of Quinn DATAGRAM send failures.
 /// Session code needs to distinguish a path-MTU change (drop one lossy frame,
 /// refresh the ceiling and continue) from a permanently unavailable lane.
@@ -66,6 +70,11 @@ pub struct QuicDatagramHandle {
 }
 
 impl QuicDatagramHandle {
+    /// Local admission bound for reliable bytes. This neither changes remote
+    /// transport parameters nor retracts previously accepted stream bytes.
+    pub fn set_reliable_send_window(&self, bytes: u64) {
+        self.connection.set_send_window(bytes);
+    }
     /// Largest payload accepted by both QUIC endpoints, or `None` when the
     /// peer disabled DATAGRAM support.
     pub fn max_size(&self) -> Option<usize> {
@@ -338,7 +347,7 @@ fn effective_quic_alpn(alpn: Vec<Vec<u8>>) -> Vec<Vec<u8>> {
 // Note: quinn names some parameters differently from the IETF spec:
 // - `stream_receive_window`  ↔ `initial_max_stream_data_bidi_local`
 // - `receive_window`         ↔ `initial_max_data`
-// - `send_window` is a quinn-only knob; left at default (1 MiB) as
+// - `send_window` is a quinn-only knob; baseline is 10,000,000 bytes as
 //   it doesn't appear in the transport-param list sent on the wire.
 
 /// `initial_max_data` value Chrome 120+ stable advertises (≈ 15 MiB).
@@ -383,6 +392,7 @@ pub fn chrome_mimic_transport_config() -> quinn::TransportConfig {
     ));
     cfg.datagram_send_buffer_size(REALTIME_DATAGRAM_BUFFER_BYTES);
     cfg.datagram_receive_buffer_size(Some(REALTIME_DATAGRAM_BUFFER_BYTES));
+    cfg.send_window(DEFAULT_RELIABLE_SEND_WINDOW_BYTES);
     cfg
 }
 
