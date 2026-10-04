@@ -19,6 +19,8 @@
 #include "call/call.h"
 #include "call/packet_receiver.h"
 #include "modules/rtp_rtcp/include/rtp_rtcp_defines.h"  // kVideoPayloadTypeFrequency
+#include "modules/rtp_rtcp/include/rtp_header_extension_map.h"
+#include "modules/rtp_rtcp/source/rtp_header_extensions.h"
 #include "modules/rtp_rtcp/source/rtp_packet_received.h"
 #include "modules/rtp_rtcp/source/rtp_util.h"  // webrtc::IsRtcpPacket
 #include "rtc_base/copy_on_write_buffer.h"
@@ -264,7 +266,11 @@ void VeilTransportShim::DeliverOnNetworkThread(
   // demuxer BY the MediaType (not a hint) — so pick it from the SSRC. Audio and
   // video share this one datagram channel; the video SSRC is registered via
   // SetRemoteVideoSsrc when a video recv stream is created.
-  webrtc::RtpPacketReceived rtp;
+  webrtc::RtpHeaderExtensionMap extensions;
+  if (independent_transport_feedback()) {
+    extensions.Register<webrtc::TransportSequenceNumber>(webrtc::RtpHeaderExtensionId(1));
+  }
+  webrtc::RtpPacketReceived rtp(&extensions);
   if (!rtp.Parse(packet)) return;
   // The default is -infinity. Preserve ingress time rather than stamping the
   // later drain turn: local queueing is not network jitter.

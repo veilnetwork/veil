@@ -142,6 +142,12 @@ int veil_media_engine_start_video(VeilMediaEngine *engine, int send, int recv,
                                   int max_bitrate_kbps, int max_fps);
 int veil_media_engine_stop_video(VeilMediaEngine *engine);
 
+/* Configure before the first audio/video start. Both peers must advertise
+ * independent media transport feedback (xVeil call protocol v4). The default
+ * is disabled for peers with a shared audio/video transport sequence space. */
+int veil_media_engine_set_independent_transport_feedback(VeilMediaEngine *engine,
+                                                        int enabled);
+
 /* Set a route-specific RTP packet ceiling before starting video send. Zero
  * restores libwebrtc's default; nonzero values are clamped to 576..1460.
  * Compact relay mode uses 1000 so one sealed Delivery frame fits one QUIC

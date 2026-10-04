@@ -177,6 +177,18 @@ class VeilMediaEngine {
     return ffi.veilMediaEngineStopVideo(_ptr) == 0;
   }
 
+  /// Native support for independent audio/video feedback (call protocol v4).
+  static bool get supportsIndependentTransportFeedback =>
+      ffi.veilMediaEngineSetIndependentTransportFeedback != null;
+
+  /// Both endpoints must support independent transport counters. Configure
+  /// before starting audio or video. This changes congestion feedback only.
+  bool setIndependentTransportFeedback(bool enabled) {
+    _ensure();
+    final set = ffi.veilMediaEngineSetIndependentTransportFeedback;
+    return set == null ? !enabled : set(_ptr, enabled ? 1 : 0) == 0;
+  }
+
   /// Set the route-specific RTP packet ceiling before [startVideo]. Passing
   /// zero restores libwebrtc's default. Returns false after video send starts.
   bool setMaxRtpPacketSize(int bytes) {

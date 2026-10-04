@@ -90,4 +90,13 @@ extern "C" int veil_media_test_group_call_planes(
       peer->audio_ssrc, peer->video_ssrc, inject, ctx);
 }
 
+extern "C" int veil_media_test_video_bandwidth(VeilMediaEngine* e) {
+  int bandwidth = -1;
+  auto* ws = e->ws.get();
+  if (!veil_media::run_on_with_timeout(ws->video_worker_tq.get(), [&] {
+        bandwidth = ws->video_call->GetStats().send_bandwidth_bps;
+      }, std::chrono::seconds(1))) return -1;
+  return bandwidth;
+}
+
 #pragma GCC visibility pop
