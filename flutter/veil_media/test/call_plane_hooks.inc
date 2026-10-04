@@ -1,6 +1,13 @@
 // Compiled only into the stand dylib, never the production engine ABI.
 namespace {
 using PlaneInjector = int (*)(void*, uint64_t, uint32_t, uint32_t);
+uint64_t sent_audio_packets(WebrtcState* ws) {
+  uint64_t count = 0;
+  run_on(ws->worker_tq.get(), [&] {
+    if (ws->send_stream) count = ws->send_stream->GetStats().packets_sent;
+  });
+  return count;
+}
 struct HeldQueues {
   struct Gate {
     std::atomic<bool> entered{false};
@@ -92,6 +99,64 @@ extern "C" int veil_media_test_blocked_audio_stats(
     std::this_thread::sleep_for(std::chrono::milliseconds(1));
   }
   return check(ctx, e->veil_chan, ssrc_of(e->peer), video_ssrc_of(e->peer));
+}
+
+// Two engine generations reproduce starting/rebuilding an already-muted call.
+// The real AudioState, stream and Opus encoder run against a counting ADM.
+extern "C" int veil_media_test_muted_capture_lifecycle() {
+  struct ResetFactory {
+    ResetFactory() { g_call_plane_recording_adm = true; }
+    ~ResetFactory() { g_call_plane_recording_adm = false; }
+  } reset;
+  uint8_t local[32] = {0x61}, peer[32] = {0x62};
+  for (int generation = 0; generation < 2; ++generation) {
+    std::unique_ptr<VeilMediaEngine, decltype(&veil_media_engine_destroy)> e(
+        veil_media_engine_create(81, local, peer), veil_media_engine_destroy);
+    if (!e) return 1;
+    auto* device = static_cast<StandRecordingAdm*>(e->ws->adm.get());
+    if (veil_media_engine_set_mic_muted(e.get(), 1) != VEIL_MEDIA_OK ||
+        veil_media_engine_start_audio(e.get(), 1, 1) != VEIL_MEDIA_OK) return 2;
+    if (device->Recording() || device->recording_starts.load() != 0) return 3;
+    device->Capture(20);
+    if (sent_audio_packets(e->ws.get()) != 0) return 4;
+    if (veil_media_engine_set_mic_muted(e.get(), 0) != VEIL_MEDIA_OK ||
+        !device->Recording()) return 5;
+    device->Capture(60);
+    if (sent_audio_packets(e->ws.get()) == 0) return 6;
+    HeldQueues held(e->ws->worker_tq.get(), e->ws->video_worker_tq.get());
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+    while (!held.first->entered.load() || !held.second->entered.load()) {
+      if (std::chrono::steady_clock::now() >= deadline) return 7;
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    int mute_rc = VEIL_MEDIA_ERR_STATE;
+    std::thread muter([&] { mute_rc = veil_media_engine_set_mic_muted(e.get(), 1); });
+    deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(250);
+    while (device->Recording() && std::chrono::steady_clock::now() < deadline)
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    const bool stopped = !device->Recording();
+    held.Release();
+    muter.join();
+    if (!stopped || mute_rc != VEIL_MEDIA_OK) return 7;
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    const auto before = sent_audio_packets(e->ws.get());
+    device->Capture(20);
+    if (sent_audio_packets(e->ws.get()) != before) return 8;
+  }
+  for (int generation = 0; generation < 2; ++generation) {
+    std::unique_ptr<VeilGroupMediaEngine, decltype(&veil_media_group_engine_destroy)> e(
+        veil_media_group_engine_create(local), veil_media_group_engine_destroy);
+    if (!e) return 9;
+    auto* device = static_cast<StandRecordingAdm*>(e->ws->adm.get());
+    if (veil_media_group_engine_set_mic_muted(e.get(), 1) != VEIL_MEDIA_OK ||
+        veil_media_group_engine_start_audio(e.get()) != VEIL_MEDIA_OK) return 10;
+    if (device->Recording() || device->recording_starts.load() != 0) return 11;
+    if (veil_media_group_engine_set_mic_muted(e.get(), 0) != VEIL_MEDIA_OK ||
+        !device->Recording()) return 12;
+    if (veil_media_group_engine_set_mic_muted(e.get(), 1) != VEIL_MEDIA_OK ||
+        device->Recording()) return 13;
+  }
+  return 0;
 }
 
 extern "C" int veil_media_test_group_call_planes(

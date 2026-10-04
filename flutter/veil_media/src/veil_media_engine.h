@@ -262,6 +262,8 @@ int veil_media_engine_select_audio_output(VeilMediaEngine *engine,
  * stream, excluding video and RTCP. It is valid only with worker_stalled=0;
  * it does not measure decoded/played audio. Worker scheduling waits are 20 ms
  * each; an operation already started is waited out for lifetime safety.
+ * `audio_tx_pkts` counts audio RTP emitted by the send stream, with the same
+ * sample-validity rule. `mic_muted` is the native mute intent, not device state.
  * Heap JSON snapshot {"tx_pkts","rx_pkts","tx_bytes","rx_bytes",
  * "rtt_ms","jitter_ms","loss_pct","target_bitrate_bps",...} or NULL.
  * Free with veil_media_free_string. */
