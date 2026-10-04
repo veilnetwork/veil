@@ -282,6 +282,8 @@ async fn runner_channels_over_real_quic(
                 frame.extend(body);
                 let local_priority = if parallel && seq % 7 == 0 {
                     1
+                } else if parallel {
+                    [0, 2, 3][seq as usize % 3]
                 } else if seq % 2 == 0 {
                     0
                 } else {
@@ -316,6 +318,7 @@ async fn runner_channels_over_real_quic(
                     if seq >= 16
                         && diagnostics[direction].sent_this_generation(0) >= 8
                         && diagnostics[direction].sent_this_generation(2) >= 8
+                        && diagnostics[direction].sent_this_generation(3) >= 8
                         && (!rotate || diagnostics[direction].rekeys() >= 1)
                     {
                         break;
@@ -340,6 +343,10 @@ async fn runner_channels_over_real_quic(
                 observations.sent(2) >= 8,
                 "secondary must use its own connection too"
             );
+            assert!(
+                observations.sent(3) >= 8,
+                "additional source must use its own connection"
+            );
             assert_eq!(observations.sent(1), 0, "transit must remain neutral");
             if rotate {
                 assert!(
@@ -353,6 +360,10 @@ async fn runner_channels_over_real_quic(
                 assert!(
                     observations.sent_this_generation(2) >= 8,
                     "secondary did not rebind"
+                );
+                assert!(
+                    observations.sent_this_generation(3) >= 8,
+                    "additional source did not rebind"
                 );
             }
         }
@@ -369,7 +380,7 @@ async fn runner_channels_over_real_quic(
     }
     assert!(
         result.is_ok(),
-        "both local channels must deliver via QUIC datagrams"
+        "all local channels must deliver via QUIC datagrams"
     );
 }
 
@@ -817,10 +828,12 @@ async fn duplex_children_through_neutral_relay(rotate: bool) {
         for d in &source_observations {
             assert_eq!(d.sent(0), 0);
             assert_eq!(d.sent(2), 0);
+            assert_eq!(d.sent(3), 0);
         }
         for d in &relay_observations {
             assert_eq!(d.sent(0), 0);
             assert_eq!(d.sent(2), 0);
+            assert_eq!(d.sent(3), 0);
             assert_eq!(d.replies(), 0);
         }
         let mut first_epoch_done = false;
@@ -915,6 +928,7 @@ async fn duplex_children_through_neutral_relay(rotate: bool) {
                 for d in &source_observations {
                     assert_eq!(d.sent_this_generation(0), 0);
                     assert_eq!(d.sent_this_generation(2), 0);
+                    assert_eq!(d.sent_this_generation(3), 0);
                 }
             }
             tokio::time::sleep(Duration::from_millis(5)).await;
@@ -968,6 +982,7 @@ async fn duplex_children_through_neutral_relay(rotate: bool) {
         );
         assert_eq!(d.sent(0), 0, "relay cannot choose source priority channels");
         assert_eq!(d.sent(2), 0, "relay cannot choose source priority channels");
+        assert_eq!(d.sent(3), 0, "relay cannot choose source priority channels");
     }
 }
 
@@ -990,7 +1005,7 @@ async fn warm_receive_only_channels(senders: &[FrameSender]) {
                     sender.request_local_datagram_channel(1),
                     LocalDatagramChannelState::Unsupported
                 );
-                for lane in [0, 2] {
+                for lane in [0, 2, 3] {
                     ready &= sender.request_local_datagram_channel(lane)
                         == LocalDatagramChannelState::Ready;
                 }

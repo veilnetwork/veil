@@ -3,6 +3,12 @@
 use std::sync::{Arc, Mutex, Weak};
 use veil_util::lock;
 
+pub(crate) const LOCAL_DATAGRAM_PRIORITIES: [u8; 3] = [
+    veil_proto::priority::REALTIME,
+    veil_proto::priority::BULK,
+    veil_proto::priority::BACKGROUND,
+];
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LocalDatagramChannelState {
     Unsupported,
@@ -24,11 +30,10 @@ struct State {
 }
 
 fn bit(local_lane: u8) -> Option<u8> {
-    match local_lane {
-        veil_proto::priority::REALTIME => Some(1),
-        veil_proto::priority::BULK => Some(2),
-        _ => None,
-    }
+    LOCAL_DATAGRAM_PRIORITIES
+        .iter()
+        .position(|&lane| lane == local_lane)
+        .map(|index| 1 << index)
 }
 
 impl LocalDatagramStatus {
@@ -127,6 +132,10 @@ mod tests {
         let lease = status.activate();
         assert_eq!(status.state(0), Warming);
         assert_eq!(status.state(2), Warming);
+        assert_eq!(status.request(3), Warming);
+        assert_eq!(status.pending(), 4);
+        lease.mark(3, true);
+        assert_eq!(status.state(3), Ready);
         assert_eq!(status.request(1), Unsupported);
         assert_eq!(status.pending(), 0);
         assert_eq!(status.request(0), Warming);

@@ -18,6 +18,9 @@ struct Stand {
     services: Vec<NodeServices>,
     pipes: Vec<tokio::task::JoinHandle<()>>,
     delivered_cells: Arc<Mutex<HashMap<(usize, u32), usize>>>,
+    file_loss_budget: Arc<std::sync::atomic::AtomicUsize>,
+    file_dropped: Arc<std::sync::atomic::AtomicUsize>,
+    file_cells: Arc<std::sync::atomic::AtomicUsize>,
 }
 impl Drop for Stand {
     fn drop(&mut self) {
@@ -38,6 +41,9 @@ impl Stand {
             services: Vec::new(),
             pipes: Vec::new(),
             delivered_cells: Arc::new(Mutex::new(HashMap::new())),
+            file_loss_budget: Arc::default(),
+            file_dropped: Arc::default(),
+            file_cells: Arc::default(),
         };
         for _ in 0..middle_count + 3 {
             let dir = tempfile::tempdir().unwrap();
@@ -144,6 +150,9 @@ impl Stand {
         let src = self.services[from].local_node_id();
         let dest = self.services[to].clone();
         let delivered = Arc::clone(&self.delivered_cells);
+        let file_loss_budget = Arc::clone(&self.file_loss_budget);
+        let file_dropped = Arc::clone(&self.file_dropped);
+        let file_cells = Arc::clone(&self.file_cells);
         let mut rx = self.services[from]
             .session_tx_registry
             .write()
@@ -160,6 +169,23 @@ impl Stand {
                 assert_eq!(header.priority(), veil_proto::priority::INTERACTIVE);
                 if from >= 2 {
                     assert_eq!(priority, veil_proto::priority::INTERACTIVE);
+                }
+                if from < 2 && priority == veil_proto::priority::BACKGROUND {
+                    use std::sync::atomic::Ordering;
+                    assert_eq!(
+                        header.msg_type,
+                        veil_proto::family::RelayChainMsg::CircuitDatagram as u16
+                    );
+                    file_cells.fetch_add(1, Ordering::Relaxed);
+                    if file_loss_budget
+                        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |budget| {
+                            budget.checked_sub(1)
+                        })
+                        .is_ok()
+                    {
+                        file_dropped.fetch_add(1, Ordering::Relaxed);
+                        continue;
+                    }
                 }
                 dest.dispatcher.dispatch_relay_chain(
                     &header,
@@ -574,4 +600,51 @@ async fn private_media_paths_use_distinct_first_hops_when_alternatives_exist() {
         assert!(!pipe.is_finished(), "neutral forwarding must remain live");
     }
     stand.stop().await;
+}
+
+#[tokio::test]
+async fn recoverable_file_data_uses_its_own_local_lane_through_neutral_relays() {
+    use std::sync::atomic::Ordering;
+    let stand = Stand::new().await;
+    let a = stand.services[0].local_node_id();
+    let c = stand.services[1].local_node_id();
+    let mux_a = crate::anon_stream::circuit_stream_mux_for_test(a);
+    let mux_c = crate::anon_stream::circuit_stream_mux_for_test(c);
+    stand.file_loss_budget.store(4, Ordering::Release);
+    let expected: Vec<u8> = (0..64 * 1024).map(|index| (index % 251) as u8).collect();
+    let result = tokio::time::timeout(Duration::from_secs(30), async {
+        let outgoing = mux_a.open(veil_onion_stream::Addr {
+            node: c,
+            app: [0; 32],
+        });
+        let send = async {
+            outgoing.write_all(&expected).await.unwrap();
+            outgoing.finish().await.unwrap();
+        };
+        let receive = async {
+            let (mut incoming, _) = mux_c.accept().await.unwrap();
+            let mut bytes = Vec::new();
+            let mut buffer = [0u8; 4096];
+            loop {
+                let count = incoming.read(&mut buffer).await.unwrap();
+                if count == 0 {
+                    break;
+                }
+                bytes.extend_from_slice(&buffer[..count]);
+            }
+            assert_eq!(
+                bytes, expected,
+                "ARQ must restore the complete file after datagram loss"
+            );
+        };
+        tokio::join!(send, receive);
+    })
+    .await;
+    let dropped = stand.file_dropped.load(Ordering::Acquire);
+    let cells = stand.file_cells.load(Ordering::Acquire);
+    drop((mux_a, mux_c));
+    stand.stop().await;
+    result.expect("recoverable file must complete through both neutral relays");
+    assert_eq!(dropped, 4);
+    assert!(cells > 4);
 }
