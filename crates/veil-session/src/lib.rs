@@ -41,6 +41,7 @@ pub mod realtime_datagram;
 pub mod rekey_context;
 pub mod rekey_rx_grace_buffer;
 pub mod rendezvous;
+mod resume_capabilities;
 pub mod rotation_deadline;
 pub mod rt_trace;
 pub mod runner;
