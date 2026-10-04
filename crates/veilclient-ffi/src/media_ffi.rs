@@ -62,37 +62,77 @@ fn media_cell_plane(cell: &[u8]) -> media::LocalMediaPlane {
     }
 }
 
+// Endpoint freshness, not a wire TTL or a relay scheduling class. Do not
+// replay queued RTP/RTCP after local route construction or IPC stalls.
+#[cfg(feature = "node-embedded")]
+const MEDIA_LOCAL_QUEUE_AGE: std::time::Duration = std::time::Duration::from_millis(200);
+
+#[cfg(feature = "node-embedded")]
+#[derive(Debug)]
+struct QueuedMediaPacket {
+    payload: Vec<u8>,
+    deadline: tokio::time::Instant,
+}
+
+#[cfg(feature = "node-embedded")]
+impl From<Vec<u8>> for QueuedMediaPacket {
+    fn from(payload: Vec<u8>) -> Self {
+        Self {
+            payload,
+            deadline: tokio::time::Instant::now() + MEDIA_LOCAL_QUEUE_AGE,
+        }
+    }
+}
+
+#[cfg(feature = "node-embedded")]
+impl QueuedMediaPacket {
+    fn expired(&self) -> bool {
+        tokio::time::Instant::now() >= self.deadline
+    }
+}
+
 /// Fold only packets already ready in this producer's queue. Overflow is kept
 /// for the next cell; the other producer is never drained into this epoch.
 #[cfg(feature = "node-embedded")]
 fn media_ready_batch(
-    first: Vec<u8>,
-    rx: &mut mpsc::Receiver<Vec<u8>>,
+    first: QueuedMediaPacket,
+    rx: &mut mpsc::Receiver<QueuedMediaPacket>,
     max_body: usize,
-) -> (Option<Vec<u8>>, Option<Vec<u8>>) {
-    let mut body_len = 2 + 2 + first.len();
-    let mut packets = vec![first];
+) -> (Option<QueuedMediaPacket>, Option<QueuedMediaPacket>) {
+    if first.expired() {
+        return (None, None);
+    }
+    let mut deadline = first.deadline;
+    let mut body_len = 2 + 2 + first.payload.len();
+    let mut packets = vec![first.payload];
     let mut pending = None;
     while packets.len() < 12 {
         let Ok(packet) = rx.try_recv() else {
             break;
         };
-        let next_len = body_len.saturating_add(2 + packet.len());
+        if packet.expired() {
+            continue;
+        }
+        let next_len = body_len.saturating_add(2 + packet.payload.len());
         if next_len > max_body {
             pending = Some(packet);
             break;
         }
+        deadline = deadline.min(packet.deadline);
         body_len = next_len;
-        packets.push(packet);
+        packets.push(packet.payload);
     }
-    (media::media_cell(packets, max_body), pending)
+    (
+        media::media_cell(packets, max_body).map(|payload| QueuedMediaPacket { payload, deadline }),
+        pending,
+    )
 }
 
 /// One anonymous producer per task: a blocked send or route repair cannot
 /// hold the other producer's queue. Video warms lazily on its first packet.
 #[cfg(feature = "node-embedded")]
 async fn drain_anonymous_media<S, SF, W, WF>(
-    mut rx: mpsc::Receiver<Vec<u8>>,
+    mut rx: mpsc::Receiver<QueuedMediaPacket>,
     mut repair_rx: mpsc::Receiver<()>,
     cipher: Arc<media::MediaCipher>,
     plane: media::LocalMediaPlane,
@@ -139,10 +179,14 @@ async fn drain_anonymous_media<S, SF, W, WF>(
         let Some(cell) = cell else {
             continue;
         };
-        let Some(sealed) = cipher.seal_on_plane(plane, &cell) else {
+        let Some(sealed) = cipher.seal_on_plane(plane, &cell.payload) else {
             continue;
         };
+        let sealed = sealed.with_local_deadline(cell.deadline);
         drop(cell);
+        if sealed.locally_expired() {
+            continue;
+        }
         if send(sealed).await {
             consecutive_drops = 0;
         } else {
@@ -191,7 +235,7 @@ struct MediaOutboundCell {
 /// Each producer also owns its cipher epoch and synchronous seal lock.
 #[cfg(feature = "node-embedded")]
 async fn drain_media_packets<F, Fut>(
-    mut rx: mpsc::Receiver<Vec<u8>>,
+    mut rx: mpsc::Receiver<QueuedMediaPacket>,
     batching: Arc<std::sync::atomic::AtomicU8>,
     cipher: Arc<media::MediaCipher>,
     relay: bool,
@@ -201,25 +245,37 @@ async fn drain_media_packets<F, Fut>(
     Fut: std::future::Future<Output = bool>,
 {
     while let Some(first) = rx.recv().await {
+        if first.expired() {
+            continue;
+        }
         let mut burst = vec![first];
         while burst.len() < MEDIA_TX_BURST_MAX {
             let Ok(packet) = rx.try_recv() else {
                 break;
             };
-            burst.push(packet);
+            if !packet.expired() {
+                burst.push(packet);
+            }
         }
         let mode = batching.load(std::sync::atomic::Ordering::Relaxed);
-        let cells = if relay && mode != MEDIA_BATCHING_OFF {
-            let max_body = if mode == MEDIA_BATCHING_COMPACT_RELAY {
-                COMPACT_RELAY_MEDIA_CELL_MAX - 1
-            } else {
-                7168
-            };
-            media_batched_cells(burst, max_body, 6)
+        let (max_body, max_packets) = if relay && mode != MEDIA_BATCHING_OFF {
+            (
+                if mode == MEDIA_BATCHING_COMPACT_RELAY {
+                    COMPACT_RELAY_MEDIA_CELL_MAX - 1
+                } else {
+                    7168
+                },
+                6,
+            )
         } else {
-            media_wire_cells(burst, mode != MEDIA_BATCHING_OFF)
+            (RELAY_VIDEO_BATCH_BODY_MAX, RELAY_VIDEO_BATCH_MAX_PACKETS)
         };
-        for packet in cells {
+        let cells = timed_media_cells(burst, mode != MEDIA_BATCHING_OFF, max_body, max_packets);
+        for queued in cells {
+            if queued.expired() {
+                continue;
+            }
+            let packet = queued.payload;
             let (marker, payload_type) = if packet.len() >= 2 && packet[0] >> 6 == 2 {
                 ((packet[1] >> 7) & 1, u32::from(packet[1] & 0x7f))
             } else {
@@ -228,6 +284,7 @@ async fn drain_media_packets<F, Fut>(
             let Some(sealed) = cipher.seal_on_plane(media_cell_plane(&packet), &packet) else {
                 continue;
             };
+            let sealed = sealed.with_local_deadline(queued.deadline);
             drop(packet);
             if !send(MediaOutboundCell {
                 sealed,
@@ -257,11 +314,27 @@ async fn drain_relay_video<F, Fut>(
         stats.start_frame(frame.enqueued_at.elapsed());
         let started = std::time::Instant::now();
         let legacy = batching.load(std::sync::atomic::Ordering::Relaxed) == MEDIA_BATCHING_LEGACY;
-        for cell in media_wire_cells(frame.packets, legacy) {
+        let deadline = tokio::time::Instant::from_std(frame.enqueued_at) + MEDIA_LOCAL_QUEUE_AGE;
+        let packets = frame
+            .packets
+            .into_iter()
+            .map(|payload| QueuedMediaPacket { payload, deadline })
+            .collect();
+        for queued in timed_media_cells(
+            packets,
+            legacy,
+            RELAY_VIDEO_BATCH_BODY_MAX,
+            RELAY_VIDEO_BATCH_MAX_PACKETS,
+        ) {
+            if queued.expired() {
+                continue;
+            }
+            let cell = queued.payload;
             let Some(sealed) = cipher.seal_on_plane(media::LocalMediaPlane::Secondary, &cell)
             else {
                 continue;
             };
+            let sealed = sealed.with_local_deadline(queued.deadline);
             drop(cell);
             if !send(sealed).await {
                 return;
@@ -361,8 +434,8 @@ pub unsafe extern "C" fn veil_media_open_channel(
     if let Some(routes) = &routes {
         routes.start(handle_live.bundle.runtime.handle());
     }
-    let (tx_hi, rx_hi) = mpsc::channel::<Vec<u8>>(MEDIA_TX_HI_QUEUE);
-    let (tx_video, rx_video) = mpsc::channel::<Vec<u8>>(MEDIA_TX_VIDEO_QUEUE);
+    let (tx_hi, rx_hi) = mpsc::channel::<QueuedMediaPacket>(MEDIA_TX_HI_QUEUE);
+    let (tx_video, rx_video) = mpsc::channel::<QueuedMediaPacket>(MEDIA_TX_VIDEO_QUEUE);
     let (repair_hi_tx, repair_hi_rx) = mpsc::channel::<()>(1);
     let (repair_video_tx, repair_video_rx) = mpsc::channel::<()>(1);
     let spawn_producer = |rx, repair_rx, plane| {
@@ -556,8 +629,8 @@ pub unsafe extern "C" fn veil_media_open_direct_channel(
         }
     }
 
-    let (tx_hi, rx_hi) = mpsc::channel::<Vec<u8>>(MEDIA_TX_HI_QUEUE);
-    let (tx_video, rx_video) = mpsc::channel::<Vec<u8>>(MEDIA_TX_VIDEO_QUEUE);
+    let (tx_hi, rx_hi) = mpsc::channel::<QueuedMediaPacket>(MEDIA_TX_HI_QUEUE);
+    let (tx_video, rx_video) = mpsc::channel::<QueuedMediaPacket>(MEDIA_TX_VIDEO_QUEUE);
     let sender = Arc::clone(&app_ref.sender);
     let video_sender = Arc::new(MediaSenderSlot::new(Arc::clone(&sender)));
     let batching = Arc::new(std::sync::atomic::AtomicU8::new(MEDIA_BATCHING_OFF));
@@ -573,7 +646,9 @@ pub unsafe extern "C" fn veil_media_open_direct_channel(
             let sender = Arc::clone(&sender);
             let seq = Arc::clone(&seq_high);
             async move {
-                let guard = sender.lock().await;
+                let Some(guard) = cell.sealed.lock_while_fresh(&sender).await else {
+                    return true;
+                };
                 let Some(sender) = guard.as_ref() else {
                     return false;
                 };
@@ -605,7 +680,9 @@ pub unsafe extern "C" fn veil_media_open_direct_channel(
             let sender = video_source.current();
             let seq = Arc::clone(&transport_seq);
             async move {
-                let guard = sender.lock().await;
+                let Some(guard) = cell.sealed.lock_while_fresh(&sender).await else {
+                    return true;
+                };
                 let Some(sender) = guard.as_ref() else {
                     return false;
                 };
@@ -688,7 +765,7 @@ pub unsafe extern "C" fn veil_media_open_relay_channel(
         return 0;
     };
 
-    let (tx_hi, rx_hi) = mpsc::channel::<Vec<u8>>(MEDIA_TX_HI_QUEUE);
+    let (tx_hi, rx_hi) = mpsc::channel::<QueuedMediaPacket>(MEDIA_TX_HI_QUEUE);
     let (tx_video_frames, rx_video_frames) =
         mpsc::channel::<RelayVideoFrame>(RELAY_VIDEO_FRAME_QUEUE);
     let sender = Arc::clone(&app_ref.sender);
@@ -706,7 +783,9 @@ pub unsafe extern "C" fn veil_media_open_relay_channel(
             let stats = Arc::clone(&high_stats);
             async move {
                 let lock_started = std::time::Instant::now();
-                let guard = sender.lock().await;
+                let Some(guard) = cell.sealed.lock_while_fresh(&sender).await else {
+                    return true;
+                };
                 stats.observe_sender_lock(lock_started.elapsed());
                 let Some(sender) = guard.as_ref() else {
                     return false;
@@ -738,7 +817,9 @@ pub unsafe extern "C" fn veil_media_open_relay_channel(
             let stats = Arc::clone(&video_stats);
             async move {
                 let lock_started = std::time::Instant::now();
-                let guard = sender.lock().await;
+                let Some(guard) = sealed.lock_while_fresh(&sender).await else {
+                    return true;
+                };
                 stats.observe_sender_lock(lock_started.elapsed());
                 let Some(sender) = guard.as_ref() else {
                     return false;
@@ -829,12 +910,12 @@ pub unsafe extern "C" fn veil_media_send_datagram(chan: u64, ptr: *const u8, len
     if chan == 0 || ptr.is_null() || len == 0 {
         return -1;
     }
-    let payload = unsafe { std::slice::from_raw_parts(ptr, len) }.to_vec();
+    let payload = QueuedMediaPacket::from(unsafe { std::slice::from_raw_parts(ptr, len) }.to_vec());
     let mut map = MEDIA_CHANNELS.lock().unwrap_or_else(|p| p.into_inner());
     let Some(ch) = map.get_mut(&chan) else {
         return -1;
     };
-    if !media_is_vp8_rtp(&payload) {
+    if !media_is_vp8_rtp(&payload.payload) {
         return match ch.tx_hi.try_send(payload) {
             Ok(()) => 0,
             Err(mpsc::error::TrySendError::Full(_)) => 1,
@@ -851,7 +932,7 @@ pub unsafe extern "C" fn veil_media_send_datagram(chan: u64, ptr: *const u8, len
             tx,
             assembler,
             stats,
-        } => match assembler.push(payload) {
+        } => match assembler.push(payload.payload) {
             RelayVideoFramePush::Pending => 0,
             RelayVideoFramePush::Dropped => 1,
             RelayVideoFramePush::Complete(packets) => {
@@ -1222,7 +1303,7 @@ pub unsafe extern "C" fn veil_media_recv_count(peer_node_id: *const u8) -> u64 {
 /// media must drop rather than buffer when it outpaces the circuit.
 #[cfg(feature = "node-embedded")]
 struct MediaChannel {
-    tx_hi: mpsc::Sender<Vec<u8>>,
+    tx_hi: mpsc::Sender<QueuedMediaPacket>,
     video: MediaVideoIngress,
     /// Anonymous channels accept an out-of-band end-to-end repair request.
     /// The receiver of the media asks the sender to refresh its outbound
@@ -1280,7 +1361,7 @@ impl Drop for MediaChannel {
 /// frame instead: a frame is either admitted whole or dropped whole.
 #[cfg(feature = "node-embedded")]
 enum MediaVideoIngress {
-    Packets(mpsc::Sender<Vec<u8>>),
+    Packets(mpsc::Sender<QueuedMediaPacket>),
     RelayFrames {
         tx: mpsc::Sender<RelayVideoFrame>,
         assembler: RelayVideoFrameAssembler,
@@ -1549,28 +1630,70 @@ impl RelayVideoFrameAssembler {
 }
 
 #[cfg(feature = "node-embedded")]
-fn flush_media_batch_chunk(chunk: &mut Vec<Vec<u8>>, cells: &mut Vec<Vec<u8>>, max_body: usize) {
+fn flush_media_batch_chunk(
+    chunk: &mut Vec<Vec<u8>>,
+    cells: &mut Vec<(Vec<u8>, usize)>,
+    max_body: usize,
+) {
     let packets = std::mem::take(chunk);
     if packets.len() < 2 {
-        cells.extend(packets);
+        cells.extend(packets.into_iter().map(|packet| (packet, 1)));
         return;
     }
     if let Some(body) = media::encode_batch(&packets, max_body) {
         let mut cell = Vec::with_capacity(1 + body.len());
         cell.push(media::MEDIA_BATCH_MAGIC);
         cell.extend_from_slice(&body);
-        cells.push(cell);
+        cells.push((cell, packets.len()));
     } else {
         // Defensive fallback: never lose a frame because a future encoder
         // constraint changed. The packets are still sent in their RTP order.
-        cells.extend(packets);
+        cells.extend(packets.into_iter().map(|packet| (packet, 1)));
     }
+}
+
+#[cfg(feature = "node-embedded")]
+fn timed_media_cells(
+    packets: Vec<QueuedMediaPacket>,
+    batching: bool,
+    max_body: usize,
+    max_packets: usize,
+) -> Vec<QueuedMediaPacket> {
+    let (payloads, deadlines): (Vec<_>, Vec<_>) = packets
+        .into_iter()
+        .map(|packet| (packet.payload, packet.deadline))
+        .unzip();
+    let mut deadlines = deadlines.into_iter();
+    let cells = if batching {
+        media_batched_cells_with_counts(payloads, max_body, max_packets)
+    } else {
+        payloads.into_iter().map(|payload| (payload, 1)).collect()
+    };
+    cells
+        .into_iter()
+        .map(|(payload, count)| QueuedMediaPacket {
+            payload,
+            deadline: deadlines
+                .by_ref()
+                .take(count)
+                .min()
+                .expect("cell retains its packets' deadlines"),
+        })
+        .collect()
+}
+
+#[cfg(all(test, feature = "node-embedded"))]
+fn media_batched_cells(frame: Vec<Vec<u8>>, max_body: usize, max_packets: usize) -> Vec<Vec<u8>> {
+    media_batched_cells_with_counts(frame, max_body, max_packets)
+        .into_iter()
+        .map(|(cell, _)| cell)
+        .collect()
 }
 
 /// Convert one complete VP8 frame into relay wire cells. This is a capacity
 /// optimization, not a gather buffer: the frame is emitted immediately. Old
 /// peers get the original one-RTP-packet-per-cell representation.
-#[cfg(feature = "node-embedded")]
+#[cfg(all(test, feature = "node-embedded"))]
 fn media_wire_cells(frame: Vec<Vec<u8>>, batching: bool) -> Vec<Vec<u8>> {
     if !batching {
         return frame;
@@ -1583,7 +1706,11 @@ fn media_wire_cells(frame: Vec<Vec<u8>>, batching: bool) -> Vec<Vec<u8>> {
 }
 
 #[cfg(feature = "node-embedded")]
-fn media_batched_cells(frame: Vec<Vec<u8>>, max_body: usize, max_packets: usize) -> Vec<Vec<u8>> {
+fn media_batched_cells_with_counts(
+    frame: Vec<Vec<u8>>,
+    max_body: usize,
+    max_packets: usize,
+) -> Vec<(Vec<u8>, usize)> {
     let mut cells = Vec::with_capacity(frame.len().div_ceil(max_packets));
     let mut chunk = Vec::with_capacity(max_packets);
     let mut body_bytes = 2usize; // batch packet-count prefix
@@ -1591,7 +1718,7 @@ fn media_batched_cells(frame: Vec<Vec<u8>>, max_body: usize, max_packets: usize)
         let encoded_bytes = 2usize.saturating_add(packet.len());
         if encoded_bytes.saturating_add(2) > max_body {
             flush_media_batch_chunk(&mut chunk, &mut cells, max_body);
-            cells.push(packet);
+            cells.push((packet, 1));
             body_bytes = 2;
             continue;
         }
