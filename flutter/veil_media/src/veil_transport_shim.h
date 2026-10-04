@@ -35,6 +35,7 @@
 #include <span>
 
 #include "api/call/transport.h"  // webrtc::Transport, webrtc::PacketOptions
+#include "veil_inbound_packet_queue.h"
 
 namespace webrtc {
 class Call;
@@ -124,17 +125,18 @@ class VeilTransportShim : public webrtc::Transport {
 
   // C trampoline for veil_media_set_recv_callback(cb(ctx,ptr,len)).
   static void OnVeilDatagram(void* ctx, const uint8_t* ptr, size_t len);
+  // Post one bounded drain turn. The packet buffers stay in separate local
+  // queues, allowing newly arrived audio to pass already queued video.
+  void PostInboundDrain();
   // Runs on `network_queue_`: demux RTP vs RTCP and deliver into the Call.
   void DeliverOnNetworkThread(std::span<const uint8_t> packet);
 
   // WHAT A QUEUED TASK IS ALLOWED TO TOUCH AFTER THIS OBJECT IS GONE.
   //
-  // `OnVeilDatagram` copies a packet and posts it to the network queue with a
-  // raw `this`. `Stop` waits up to a second for the pending count to drain and
-  // then RETURNS ANYWAY — so a delayed task could run against a shim its owner
-  // had already freed, reading `started_` and decrementing counters that no
-  // longer exist (report27 V23). Waiting longer is not the fix: the task has
-  // to be able to find out, safely, that it must not run.
+  // A drain task holds a raw `this`. Stop clears the packet queues and fences
+  // a currently running delivery, but a posted task can remain on a stalled
+  // network queue. That task must safely detect a destroyed shim before
+  // touching any member (report27 V23).
   //
   // The destructor takes this lock and clears the flag, so a task either
   // completes while the destructor waits, or sees `alive == false` and touches
@@ -150,8 +152,7 @@ class VeilTransportShim : public webrtc::Transport {
   webrtc::TaskQueueBase* const network_queue_;
   std::atomic<uint32_t> remote_video_ssrc_{0};
   std::atomic<bool> started_{false};
-  std::atomic<size_t> inbound_pending_packets_{0};
-  std::atomic<size_t> inbound_pending_bytes_{0};
+  InboundPacketQueue inbound_queue_;
   std::atomic<uint64_t> inbound_dropped_overload_{0};
   std::atomic<uint64_t> inbound_packet_count_{0};
   std::atomic<uint64_t> inbound_byte_count_{0};
