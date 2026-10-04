@@ -403,6 +403,8 @@ pub mod cap_extra_flags {
     /// Generic loss-tolerant circuit cells, with no application-role label or
     /// relay priority. Separate from the older VDF1 flow capability.
     pub const SUPPORTS_CIRCUIT_DATAGRAMS: u8 = 1;
+    /// Generic independently authenticated transports, with no producer roles.
+    pub const SUPPORTS_PARALLEL_QUIC: u8 = 1 << 1;
 }
 
 // c: role_bits moved to veil-types alongside NodeRole.
@@ -491,6 +493,13 @@ impl CapabilitiesPayload {
     pub fn supports_circuit_datagrams(&self) -> bool {
         self.supports_realtime_datagrams()
             && self.extra_flags & cap_extra_flags::SUPPORTS_CIRCUIT_DATAGRAMS != 0
+    }
+
+    /// Requires the opaque datagram codec and coordinated key rotation too.
+    pub fn supports_parallel_quic(&self) -> bool {
+        self.supports_datagram_flows()
+            && self.supports_realtime_rekey()
+            && self.extra_flags & cap_extra_flags::SUPPORTS_PARALLEL_QUIC != 0
     }
 
     // ── Capability helpers ───────────────────────────────────────────────
@@ -2358,6 +2367,29 @@ mod tests {
 
         legacy.flags |= cap_flags::SUPPORTS_REALTIME_REKEY;
         assert!(modern.realtime_rekey_negotiated(&legacy));
+    }
+
+    #[test]
+    fn parallel_quic_requires_explicit_extension_flows_and_rekey() {
+        let mut caps = CapabilitiesPayload::from_node_role(veil_types::NodeRole::Leaf);
+        caps.extra_flags = cap_extra_flags::SUPPORTS_PARALLEL_QUIC;
+        assert!(!caps.supports_parallel_quic());
+        caps.flags = cap_flags::SUPPORTS_REALTIME_DATAGRAMS | cap_flags::SUPPORTS_DATAGRAM_FLOWS;
+        assert!(!caps.supports_parallel_quic());
+        caps.flags |= cap_flags::SUPPORTS_REALTIME_REKEY;
+        assert!(caps.supports_parallel_quic());
+        assert!(
+            CapabilitiesPayload::decode(&caps.encode())
+                .unwrap()
+                .supports_parallel_quic()
+        );
+        assert!(
+            !CapabilitiesPayload::decode(&caps.encode()[..3])
+                .unwrap()
+                .supports_parallel_quic()
+        );
+        caps.extra_flags = cap_extra_flags::SUPPORTS_CIRCUIT_DATAGRAMS;
+        assert!(!caps.supports_parallel_quic());
     }
 
     #[test]

@@ -182,19 +182,59 @@ async fn await_next_input(
 /// Session-scoped state for the independently encrypted, loss-tolerant media
 /// lane. It exists only after capability AND transport negotiation succeed.
 struct RealtimeDatagramLane {
-    handle: veil_transport::QuicDatagramHandle,
+    sender: RealtimeSender,
     local_reliable: local_reliable_admission::LocalReliableAdmission,
-    /// Whether the peer rotates its half too. False keeps the lane on the key
-    /// derived at the handshake, which is what every peer without the
-    /// capability expects to keep receiving under.
     peer_rotates: bool,
     peer_circuit_datagrams: bool,
+    parallel: Option<parallel_lanes::ParallelSession>,
+}
+
+struct RealtimeSender {
+    handle: veil_transport::QuicDatagramHandle,
     tx: crate::datagram_flows::SessionDatagramTx,
     max_datagram_size: usize,
     logged_send_kinds: u8,
     congestion_drops: u64,
     last_congestion_log: std::time::Instant,
+    broken: bool,
+    sent_counter: Option<(Arc<parallel_lanes::ParallelDiagnostics>, usize)>,
 }
+
+impl RealtimeSender {
+    fn new(
+        handle: veil_transport::QuicDatagramHandle,
+        tx: crate::datagram_flows::SessionDatagramTx,
+    ) -> Self {
+        Self {
+            max_datagram_size: handle.max_size().unwrap_or(0),
+            handle,
+            tx,
+            logged_send_kinds: 0,
+            congestion_drops: 0,
+            last_congestion_log: std::time::Instant::now(),
+            broken: false,
+            sent_counter: None,
+        }
+    }
+}
+
+impl RealtimeDatagramLane {
+    fn select_sender(&mut self, priority: u8) -> (&mut RealtimeSender, bool) {
+        let ready = self
+            .parallel
+            .as_mut()
+            .is_some_and(|parallel| parallel.prepare(priority));
+        if ready {
+            (self.parallel.as_mut().unwrap().sender(priority), true)
+        } else {
+            (&mut self.sender, false)
+        }
+    }
+}
+
+#[path = "parallel_lanes.rs"]
+mod parallel_lanes;
+pub use parallel_lanes::{ParallelDiagnostics, ParallelQuicOffer};
 
 const LOCAL_BULK_BACKLOG_BYTES: usize = 4 * 1024;
 
@@ -245,6 +285,7 @@ impl Drop for RealtimeReceiverTask {
 /// Keeping them together makes the task's ownership boundary explicit and
 /// prevents its spawn helper from growing a parallel copy of `SessionRunner`'s
 /// argument list as abuse handling and observability evolve.
+#[derive(Clone)]
 struct RealtimeReceiverContext {
     peer_id: NodeIdBytes,
     dispatcher: Arc<dyn crate::dispatcher_sink::DispatcherSink>,
@@ -586,6 +627,7 @@ pub struct RealtimeLaneOffer {
     pub peer_flows: bool,
     /// Explicitly negotiated generic loss-tolerant circuit-cell decoder.
     pub peer_circuit_datagrams: bool,
+    pub parallel: Option<ParallelQuicOffer>,
 }
 
 /// Hot-standby transport-swap state for one session.
@@ -1325,7 +1367,10 @@ impl SessionRunner {
             if let Some(lane) = realtime.lane
                 && lane.peer_rotates
             {
-                lane.tx.rekey(&new_keys.tx_key, &new_keys.session_id);
+                lane.sender.tx.rekey(&new_keys.tx_key, &new_keys.session_id);
+                if let Some(parallel) = lane.parallel.as_mut() {
+                    parallel.rekey(&new_keys.tx_key, &new_keys.rx_key, new_keys.session_id);
+                }
                 if let Some(tx) = realtime.receiver {
                     // Overwrites any rotation the receiver has not applied
                     // yet, which is the point: that one is stale the moment
@@ -2580,7 +2625,10 @@ impl SessionRunner {
             if let Some(lane) = realtime.lane
                 && lane.peer_rotates
             {
-                lane.tx.rekey(&new_keys.tx_key, &new_keys.session_id);
+                lane.sender.tx.rekey(&new_keys.tx_key, &new_keys.session_id);
+                if let Some(parallel) = lane.parallel.as_mut() {
+                    parallel.rekey(&new_keys.tx_key, &new_keys.rx_key, new_keys.session_id);
+                }
                 if let Some(tx) = realtime.receiver {
                     // Overwrites any rotation the receiver has not applied
                     // yet, which is the point: that one is stale the moment
@@ -3438,18 +3486,35 @@ impl SessionRunner {
                         local_reliable: local_reliable_admission::LocalReliableAdmission::new(
                             offer.handle.clone(),
                         ),
-                        handle: offer.handle,
+                        sender: RealtimeSender::new(
+                            offer.handle,
+                            crate::datagram_flows::SessionDatagramTx::new(
+                                raw_tx_key,
+                                session_id,
+                                offer.peer_flows,
+                            ),
+                        ),
                         peer_rotates: offer.peer_rotates,
                         peer_circuit_datagrams: offer.peer_circuit_datagrams,
-                        tx: crate::datagram_flows::SessionDatagramTx::new(
-                            raw_tx_key,
-                            session_id,
-                            offer.peer_flows,
-                        ),
-                        max_datagram_size,
-                        logged_send_kinds: 0,
-                        congestion_drops: 0,
-                        last_congestion_log: std::time::Instant::now(),
+                        parallel: offer
+                            .parallel
+                            .filter(|_| offer.peer_flows && offer.peer_rotates)
+                            .map(|parallel| {
+                                parallel_lanes::ParallelSession::new(
+                                    parallel,
+                                    raw_tx_key,
+                                    raw_rx_key,
+                                    *session_id,
+                                    RealtimeReceiverContext {
+                                        peer_id: self.peer_id,
+                                        dispatcher: Arc::clone(&self.dispatcher),
+                                        logger: Arc::clone(&self.logger),
+                                        metrics: self.metrics.clone(),
+                                        ban_list: Arc::clone(&self.ban_list),
+                                        violation_tracker: Arc::clone(&self.violation_tracker),
+                                    },
+                                )
+                            }),
                     }
                 }),
             _ => None,
@@ -3904,6 +3969,7 @@ impl SessionRunner {
                             &outgoing,
                             std::time::Instant::now(),
                         );
+                        let (lane, using_parallel) = lane.select_sender(outgoing_priority);
                         let datagrams = match lane.tx.encode_frame(
                             local_datagram_flow(outgoing_priority, body, lane_kind),
                             &outgoing,
@@ -4017,7 +4083,11 @@ impl SessionRunner {
                             // path-MTU shrink. Stop retrying every media frame;
                             // the independent receiver stays alive so the peer's
                             // opposite direction is not black-holed.
-                            disable_realtime_sender = true;
+                            if using_parallel {
+                                lane.broken = true;
+                            } else {
+                                disable_realtime_sender = true;
+                            }
                             break;
                         }
                         if lane.logged_send_kinds & lane_kind.bit() == 0 {
@@ -4031,6 +4101,9 @@ impl SessionRunner {
                                     datagrams.len(),
                                 ),
                             );
+                        }
+                        if let Some((counter, channel)) = lane.sent_counter.as_ref() {
+                            counter.note_sent(*channel);
                         }
                         datagram_drained += 1;
                     }

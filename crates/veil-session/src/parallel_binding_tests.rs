@@ -104,15 +104,13 @@ struct TestChild {
 async fn child_roundtrip(
     a_handle: &QuicParallelHandle,
     b_handle: &QuicParallelHandle,
-    ctx: &Arc<TransportContext>,
     a_parent: &ParallelParent,
     b_parent: &ParallelParent,
 ) -> TestChild {
     let b_handle = b_handle.clone();
-    let b_ctx = Arc::clone(ctx);
     let b_parent = b_parent.handle();
     let server = tokio::spawn(async move {
-        let connection = b_handle.accept(b_ctx).await.unwrap();
+        let connection = b_handle.accept().await.unwrap();
         let datagrams = connection.quic_datagrams().unwrap();
         let exporter = datagrams.channel_binding().unwrap();
         let mut stream = connection.into_stream().unwrap();
@@ -122,7 +120,7 @@ async fn child_roundtrip(
         stream.write_all(&ack).await.unwrap();
         (keys, stream, datagrams)
     });
-    let connection = a_handle.connect(Arc::clone(ctx)).await.unwrap();
+    let connection = a_handle.connect().await.unwrap();
     let raw = connection.quic_connection().unwrap();
     let close = Box::new(move || raw.close(0u32.into(), b"child retired"));
     let datagrams = connection.quic_datagrams().unwrap();
@@ -203,8 +201,8 @@ async fn actual_parallel_quic_has_fresh_keys_independent_queues_and_parent_lifet
         b_stream.read_exact(&mut main).await.unwrap();
         assert_eq!(&main, b"main");
         let (a_parent, b_parent) = parents();
-        let mut first = child_roundtrip(&a_handle, &b_handle, &ctx, &a_parent, &b_parent).await;
-        let mut second = child_roundtrip(&a_handle, &b_handle, &ctx, &a_parent, &b_parent).await;
+        let mut first = child_roundtrip(&a_handle, &b_handle, &a_parent, &b_parent).await;
+        let mut second = child_roundtrip(&a_handle, &b_handle, &a_parent, &b_parent).await;
         assert!(first.keys.tx_key() != second.keys.tx_key());
         assert!(first.keys.rx_key() != second.keys.rx_key());
         assert!(first.keys.tx_key() != &[2; 32]);
@@ -248,30 +246,20 @@ async fn actual_parallel_quic_has_fresh_keys_independent_queues_and_parent_lifet
         assert_eq!(&main, b"live");
         // Budget follows live QUIC connections, shared across handle clones.
         let mut others = Vec::new();
-        others.push(child_roundtrip(&b_handle, &a_handle, &ctx, &b_parent, &a_parent).await);
+        others.push(child_roundtrip(&b_handle, &a_handle, &b_parent, &a_parent).await);
         for _ in 0..5 {
-            others.push(child_roundtrip(&a_handle, &b_handle, &ctx, &a_parent, &b_parent).await);
+            others.push(child_roundtrip(&a_handle, &b_handle, &a_parent, &b_parent).await);
         }
-        let error = a_handle
-            .clone()
-            .connect(Arc::clone(&ctx))
-            .await
-            .err()
-            .unwrap();
+        let error = a_handle.clone().connect().await.err().unwrap();
         assert!(error.to_string().contains("budget exhausted"));
-        let error = b_handle
-            .clone()
-            .accept(Arc::clone(&ctx))
-            .await
-            .err()
-            .unwrap();
+        let error = b_handle.clone().accept().await.err().unwrap();
         assert!(error.to_string().contains("budget exhausted"));
         // Explicitly retiring one child must preserve every other channel and
         // release its slot for another independently keyed connection.
         (first.close)();
         assert!(first.b_datagrams.recv().await.is_err());
         tokio::task::yield_now().await;
-        let replacement = child_roundtrip(&a_handle, &b_handle, &ctx, &a_parent, &b_parent).await;
+        let replacement = child_roundtrip(&a_handle, &b_handle, &a_parent, &b_parent).await;
         assert_ne!(replacement.keys.session_id, first.keys.session_id);
         second.a_stream.write_all(b"kept").await.unwrap();
         second.b_stream.read_exact(&mut main).await.unwrap();
@@ -279,8 +267,8 @@ async fn actual_parallel_quic_has_fresh_keys_independent_queues_and_parent_lifet
         a_quic.close(0u32.into(), b"test finished");
         assert!(first.a_datagrams.recv().await.is_err());
         assert!(second.a_datagrams.recv().await.is_err());
-        assert!(a_handle.connect(Arc::clone(&ctx)).await.is_err());
-        assert!(b_handle.accept(Arc::clone(&ctx)).await.is_err());
+        assert!(a_handle.connect().await.is_err());
+        assert!(b_handle.accept().await.is_err());
         for child in &others {
             assert!(child.b_datagrams.recv().await.is_err());
         }

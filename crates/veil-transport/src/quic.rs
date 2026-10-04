@@ -83,6 +83,16 @@ impl QuicDatagramHandle {
             .map_err(|_| quic_error("QUIC channel exporter unavailable"))?;
         Ok(binding)
     }
+    /// Close this connection only; sibling connections on the endpoint survive.
+    pub fn close(&self) {
+        self.connection.close(0u32.into(), b"channel retired");
+    }
+
+    /// Wait for this connection's terminal state without exposing Quinn types.
+    pub async fn closed(&self) {
+        let _ = self.connection.closed().await;
+    }
+
     /// Local admission bound for reliable bytes. This neither changes remote
     /// transport parameters nor retracts previously accepted stream bytes.
     pub fn set_reliable_send_window(&self, bytes: u64) {
@@ -642,7 +652,12 @@ pub async fn promote_punched_quic(
         }
     };
     let peer_meta = native_quic_peer(uri, local_addr, Some(remote_addr));
-    let parallel = QuicParallelHandle::new(endpoint.clone(), connection.clone(), peer_meta.clone());
+    let parallel = QuicParallelHandle::new(
+        endpoint.clone(),
+        connection.clone(),
+        peer_meta.clone(),
+        Arc::clone(&ctx),
+    );
     let mut transport = QuicTransportConnection::new(peer_meta, endpoint, connection, stream);
     transport.parallel = Some(parallel);
     Ok(Box::new(transport))
