@@ -327,6 +327,9 @@ int main() {
     assert(veil_media_group_engine_add_peer(e.get(), 81, other) == VEIL_MEDIA_OK);
     assert(veil_media_group_engine_start_audio(e.get()) == VEIL_MEDIA_OK);
     assert(veil_media_group_engine_start_video(e.get()) == VEIL_MEDIA_OK);
+    // No audio feedback exists yet: do not fill the route with video first.
+    assert(group_stat(e.get(), "max_fps") == 1);
+    assert(group_stat(e.get(), "video_kbps") == 30);
     const auto report_time = std::chrono::steady_clock::now();
     // The good participant's later RR must not hide the bad participant.
     report(80, group_ssrc(peer), group_ssrc(local), 32, 4800);
