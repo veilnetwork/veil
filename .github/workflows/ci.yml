@@ -200,6 +200,11 @@ jobs:
             -o "${RUNNER_TEMP}/veil-media-diag-smoke"
           "${RUNNER_TEMP}/veil-media-diag-smoke"
 
+      - name: Audio ingress survives video congestion and concurrent feeds
+        env:
+          TMPDIR: ${{ runner.temp }}
+        run: ./flutter/veil_media/test/run_inbound_packet_queue_smoke.sh
+
       - name: Install cargo-audit
         # Phase 6.50.b audit-A2: `cargo audit` gates against the RustSec
         # advisory DB on every push to main.  Pinned minor (^0.22) for
