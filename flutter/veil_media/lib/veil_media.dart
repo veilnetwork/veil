@@ -604,6 +604,27 @@ class VeilGroupMediaEngine {
     return ffi.veilMediaGroupEngineStopVideo(_ptr) == 0;
   }
 
+  bool setVideoBitrate({required int maxBitrateKbps, required int maxFps}) {
+    _ensure();
+    final set = ffi.veilMediaGroupEngineSetVideoBitrate;
+    return set != null && set(_ptr, maxBitrateKbps, maxFps) == 0;
+  }
+
+  /// Fresh audio report maxima and independently sampled video telemetry.
+  Map<String, dynamic> getStats() {
+    _ensure();
+    final get = ffi.veilMediaGroupEngineGetStats;
+    if (get == null) return const {};
+    final json = get(_ptr);
+    if (json == nullptr) return const {};
+    try {
+      final decoded = jsonDecode(json.toDartString());
+      return decoded is Map<String, dynamic> ? decoded : const {};
+    } finally {
+      ffi.veilMediaFreeString(json);
+    }
+  }
+
   bool startCamera({int width = 352, int height = 198, int fps = 15}) {
     _ensure();
     return ffi.veilMediaGroupEngineStartCamera(_ptr, width, height, fps) == 0;

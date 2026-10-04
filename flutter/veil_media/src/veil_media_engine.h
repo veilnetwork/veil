@@ -100,12 +100,20 @@ uint64_t veil_media_group_engine_peer_rx_packets(
 
 /* ---- N-party video ------------------------------------------------------
  * One shared VP8 send stream/source is fanned out to every current peer. Each
- * peer owns an independent receive stream + latest-frame sink on the same
- * WebRTC Call as group audio. Video SSRCs are derived from the full node id in
+ * peer owns an independent receive stream + latest-frame sink on a separate
+ * WebRTC video Call. Video SSRCs are derived from the full node id in
  * a domain distinct from group audio; collisions reject the peer fail-closed.
  * RTP never crosses Dart. */
 int veil_media_group_engine_start_video(VeilGroupMediaEngine *engine);
 int veil_media_group_engine_stop_video(VeilGroupMediaEngine *engine);
+/* Local group video adaptation, 30..2500 kbit/s and 1..60 fps. No signaling
+ * or relay priority is added. The video-worker scheduling wait is 20 ms. */
+int veil_media_group_engine_set_video_bitrate(VeilGroupMediaEngine *engine,
+                                              int max_bitrate_kbps, int max_fps);
+/* Group audio quality: maxima over fresh RTCP audio report blocks (15 s).
+ * Video telemetry is sampled independently with a 20 ms scheduling wait.
+ * Free this JSON with veil_media_free_string. */
+char *veil_media_group_engine_get_stats(VeilGroupMediaEngine *engine);
 int veil_media_group_engine_start_camera(VeilGroupMediaEngine *engine,
                                          int width, int height, int fps);
 int veil_media_group_engine_stop_camera(VeilGroupMediaEngine *engine);
