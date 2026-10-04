@@ -20,6 +20,11 @@ const PREFIX_LEN: usize = 20;
 const MAX_FLOWS: usize = 16;
 const KDF_CONTEXT: &str = "veil/session/opaque-datagram-flow/v1";
 pub(crate) const MIN_FLOW_DATAGRAM_SIZE: usize = PREFIX_LEN + 41;
+/// A complete frame, including every permitted fragment's encryption/header
+/// and opaque-flow prefix. Also bounds the legacy codec without that prefix.
+pub(crate) const MAX_FRAME_WIRE_BYTES: usize = MAX_REALTIME_FRAME
+    + crate::realtime_datagram::MAX_FRAGMENTS
+        * (PREFIX_LEN + crate::realtime_datagram::FRAGMENT_OVERHEAD);
 
 type FlowId = [u8; 16];
 

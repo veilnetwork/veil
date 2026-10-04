@@ -199,9 +199,14 @@ struct RealtimeDatagramLane {
 /// throughput traffic. The choice is process-local; forwarded user packets at
 /// a relay all have INTERACTIVE priority and receive identical treatment.
 fn local_datagram_fits(priority: u8, wire_len: usize, available: usize) -> bool {
-    const LOCAL_RESERVE_BYTES: usize = 4096;
-    priority < veil_proto::priority::BULK
-        || wire_len.saturating_add(LOCAL_RESERVE_BYTES) <= available
+    let reserve = if priority >= veil_proto::priority::BULK {
+        crate::datagram_flows::MAX_FRAME_WIRE_BYTES
+    } else {
+        0
+    };
+    wire_len
+        .checked_add(reserve)
+        .is_some_and(|required| required <= available)
 }
 
 /// Tokio join handles detach when dropped; realtime receivers must instead be
@@ -3857,10 +3862,10 @@ impl SessionRunner {
                             planned_wire_len,
                             lane.handle.send_buffer_space(),
                         ) {
-                            // Do not let a new local bulk cell make Quinn evict
-                            // older queued latency-sensitive cells. This whole
-                            // loss-tolerant cell is dropped before any fragment
-                            // enters the transport; no delayed replay follows.
+                            // Admit complete frames only. Local bulk also leaves
+                            // room for one complete primary frame; relayed cells
+                            // all use the same neutral admission rule. Drop this
+                            // loss-tolerant cell before sending any fragments.
                             datagram_drained += 1;
                             continue;
                         }
@@ -5256,18 +5261,127 @@ mod realtime_lane_frame_tests {
     #[test]
     fn local_bulk_datagrams_cannot_consume_the_reserved_transport_space() {
         use veil_proto::priority::{BULK, INTERACTIVE, REALTIME};
+        let reserve = crate::datagram_flows::MAX_FRAME_WIRE_BYTES;
         assert!(!super::local_datagram_fits(BULK, 1300, 4096));
-        assert!(super::local_datagram_fits(BULK, 1300, 5396));
+        assert!(!super::local_datagram_fits(BULK, 1300, reserve + 1299));
+        assert!(super::local_datagram_fits(BULK, 1300, reserve + 1300));
         assert!(super::local_datagram_fits(REALTIME, 200, 4096));
+        assert!(!super::local_datagram_fits(REALTIME, 200, 199));
         // Relayed user traffic has the same neutral queue class for every
         // application; it never receives the endpoint's content-dependent choice.
         assert!(super::local_datagram_fits(INTERACTIVE, 1300, 4096));
+        assert!(!super::local_datagram_fits(INTERACTIVE, 1300, 1299));
         assert!(!super::local_datagram_fits(
             BULK,
             usize::MAX,
             usize::MAX - 1
         ));
     }
+    #[tokio::test]
+    async fn local_bulk_pressure_leaves_a_complete_primary_frame_in_quic() {
+        use std::{
+            sync::Arc,
+            time::{Duration, Instant},
+        };
+        use tokio::io::AsyncWriteExt;
+        use veil_proto::priority::{BULK, INTERACTIVE, REALTIME};
+        use veil_transport::{
+            context::TransportContext,
+            quic::{PunchedQuicRole, promote_punched_quic},
+        };
+        let left = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let right = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let left_addr = left.local_addr().unwrap();
+        let right_addr = right.local_addr().unwrap();
+        let ctx = Arc::new(TransportContext::for_debug().unwrap());
+        let remote_ctx = Arc::clone(&ctx);
+        let remote = tokio::spawn(async move {
+            promote_punched_quic(right, left_addr, remote_ctx, PunchedQuicRole::Responder)
+                .await
+                .unwrap()
+        });
+        let connection = promote_punched_quic(left, right_addr, ctx, PunchedQuicRole::Initiator)
+            .await
+            .unwrap();
+        let sender = connection.quic_datagrams().unwrap();
+        let mut stream = connection.into_stream().unwrap();
+        stream.write_all(b"veil").await.unwrap();
+        let connection = remote.await.unwrap();
+        let receiver = connection.quic_datagrams().unwrap();
+        let _remote_stream = connection.into_stream().unwrap();
+        let max_size = sender.max_size().unwrap();
+        let frame = |fill| {
+            let cell = veil_anonymity::circuit_wire::CircuitDataPayload {
+                circuit_id: 42,
+                seq: 1,
+                ciphertext: vec![fill; veil_anonymity::circuit_data::CIRCUIT_PAYLOAD_BYTES],
+            }
+            .encode(veil_anonymity::circuit_data::CircuitCellBytes::legacy())
+            .unwrap();
+            let mut header = FrameHeader::new(
+                FrameFamily::RelayChain as u8,
+                veil_proto::family::RelayChainMsg::CircuitDatagram as u16,
+            );
+            header.set_priority(INTERACTIVE);
+            header.body_len = cell.len() as u32;
+            let mut frame = encode_header(&header).to_vec();
+            frame.extend_from_slice(&cell);
+            frame
+        };
+        let bulk = frame(0xb2);
+        let primary = frame(0xa0);
+        let mut tx = crate::datagram_flows::SessionDatagramTx::new(&[7; 32], &[8; 32], true);
+        let bulk_packets = tx.encode_frame(u64::from(BULK), &bulk, max_size).unwrap();
+        let primary_packets = tx
+            .encode_frame(u64::from(REALTIME), &primary, max_size)
+            .unwrap();
+        let bulk_wire: usize = bulk_packets.iter().map(Vec::len).sum();
+        let primary_wire: usize = primary_packets.iter().map(Vec::len).sum();
+        let mut bulk_frames = 0;
+        // Current-thread runtime: no await in this admission burst, so the
+        // QUIC driver cannot silently drain the queue while it is inspected.
+        while super::local_datagram_fits(BULK, bulk_wire, sender.send_buffer_space()) {
+            // Fresh sequences for every accepted cell, including on one flow.
+            let packets = tx.encode_frame(u64::from(BULK), &bulk, max_size).unwrap();
+            for packet in &packets {
+                sender.send(packet).unwrap();
+            }
+            bulk_frames += 1;
+            assert!(bulk_frames < 100);
+        }
+        assert!(bulk_frames > 0);
+        assert!(
+            sender.send_buffer_space() >= primary_wire,
+            "bulk must leave room for all primary fragments, not just 4 KiB"
+        );
+        assert!(super::local_datagram_fits(
+            REALTIME,
+            primary_wire,
+            sender.send_buffer_space()
+        ));
+        for packet in &primary_packets {
+            sender.send(packet).unwrap();
+        }
+        let mut rx = crate::datagram_flows::SessionDatagramRx::new(&[7; 32], &[8; 32], true);
+        let mut received_bulk = 0;
+        let mut received_primary = false;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while received_bulk < bulk_frames || !received_primary {
+                let packet = receiver.recv().await.unwrap();
+                if let Some(frame) = rx.decode_datagram(&packet, Instant::now()).unwrap() {
+                    if frame == primary {
+                        received_primary = true;
+                    } else {
+                        assert_eq!(frame, bulk);
+                        received_bulk += 1;
+                    }
+                }
+            }
+        })
+        .await
+        .unwrap();
+    }
+
     use veil_proto::{
         delivery::{DeliveryEnvelope, FORWARD_REALTIME_MAX_PAYLOAD, ForwardPayload},
         recipient::Recipient,

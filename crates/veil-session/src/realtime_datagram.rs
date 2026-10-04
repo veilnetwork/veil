@@ -21,6 +21,7 @@ use chacha20poly1305::{
 const MAGIC: [u8; 4] = *b"VRT1";
 const HEADER_LEN: usize = 24;
 const TAG_LEN: usize = 16;
+pub(crate) const FRAGMENT_OVERHEAD: usize = HEADER_LEN + TAG_LEN;
 const MIN_DATAGRAM_LEN: usize = HEADER_LEN + TAG_LEN + 1;
 const KDF_CONTEXT: &str = "veil/session/realtime-datagram/v1";
 
