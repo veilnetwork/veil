@@ -599,10 +599,9 @@ async fn closing_channel_cancels_both_blocked_pumps() {
     .await
     .expect("close must cancel both pending tasks");
     let packet = [0x80, 111, 1, 2];
-    assert_eq!(
-        unsafe { veil_media_send_datagram(id, packet.as_ptr(), packet.len()) },
-        -1
-    );
+    // Other parallel fixtures deliberately hold the registry. Busy ingress
+    // returns 1 before lookup; once available, this closed handle must be gone.
+    assert_eq!(send_when_registry_available(id, &packet), -1);
     unsafe { veil_media_close_channel(id) }; // Idempotent.
 }
 

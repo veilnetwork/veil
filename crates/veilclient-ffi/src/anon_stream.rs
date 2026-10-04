@@ -1360,10 +1360,7 @@ impl CellSender for CircuitCells {
             self.send_ack_copies(dst.node, route.rendezvous_node, &cell, ack_copies)
                 .await;
         }
-        if let Err(e) = self
-            .services
-            .send_circuit_cell_detailed(&route.circuit, &env)
-        {
+        if let Err(e) = self.send_stream_envelope(&route.circuit, &env, is_data) {
             if e == veil_node_runtime::DataCircuitSendError::QueueFull {
                 // Local first-hop session TX queue is full. The encoded stream
                 // cell has not entered the transport, so surface backpressure to
@@ -1800,7 +1797,7 @@ impl CircuitCells {
             return Ok(());
         }
         self.data_pacer.wait_n(dst.node, run_len as u32).await;
-        // Route striping: the per-flow ceiling is the first-hop session TCP,
+        // Route striping: distribute the stream across distinct first hops,
         // so split a large run into contiguous chunks across additional
         // healthy pool routes with DISTINCT first hops. One engine keeps one
         // delivery model/reassembly; only the wire fans out. The pinned
@@ -1921,6 +1918,26 @@ impl CircuitCells {
         Ok(())
     }
 
+    /// Only DATA enters the recoverable stream's independent local transport.
+    /// SYN/ACK/FIN/RST, probes and introductions keep reliable delivery. Relays
+    /// receive the ordinary header; ARQ, not a relay priority, repairs loss.
+    fn send_stream_envelope(
+        &self,
+        circuit: &veil_node_runtime::DataCircuit,
+        envelope: &[u8],
+        recoverable_data: bool,
+    ) -> Result<(), veil_node_runtime::DataCircuitSendError> {
+        if recoverable_data {
+            self.services.send_circuit_datagram_on_local_lane_detailed(
+                circuit,
+                envelope,
+                veil_proto::priority::BACKGROUND,
+            )
+        } else {
+            self.services.send_circuit_cell_detailed(circuit, envelope)
+        }
+    }
+
     /// Send ONE already-decoded stream cell on `route`. `Ok(true)` = accepted,
     /// `Ok(false)` = route enqueue rejected (mark it), `Err(WouldBlock)` =
     /// local first-hop TX queue full (retry the exact cell).
@@ -1948,10 +1965,7 @@ impl CircuitCells {
         if env.len() > circuit_env_max() {
             return Err(io::Error::other("circuit stream envelope too large"));
         }
-        match self
-            .services
-            .send_circuit_cell_detailed(&route.circuit, &env)
-        {
+        match self.send_stream_envelope(&route.circuit, &env, true) {
             Ok(()) => {
                 if let Some(stats) = route.stats.as_ref() {
                     stats.record_send(true, data_payload_len);
@@ -2005,10 +2019,7 @@ impl CircuitCells {
                     circuit_env_max()
                 )));
             }
-            if let Err(e) = self
-                .services
-                .send_circuit_cell_detailed(&route.circuit, &env)
-            {
+            if let Err(e) = self.send_stream_envelope(&route.circuit, &env, true) {
                 if e == veil_node_runtime::DataCircuitSendError::QueueFull {
                     // Sent cells are gone; the failing cell and the rest of the
                     // run stay queued for the caller's WouldBlock retry.
@@ -3183,6 +3194,211 @@ pub struct AnonStreamHub {
     _sender: Arc<AppSender>,
 }
 
+fn stream_config(me: [u8; 32], cells: &HubCells, mss: usize) -> Config {
+    // The onion RTT is variable and relay queues can punish coarse bursts:
+    // keep the first RTO above normal jitter, pace the sender, and keep an
+    // explicit receive window instead of letting cwnd grow unbounded.
+    //
+    // The original 1-cell/ms pacer floor capped clean transfers at ~135 KiB/s.
+    // After converting both stream and circuit pacing to small millisecond
+    // batches, the autonomous embedded harness reliably moves 8 MiB over
+    // published rendezvous with 4 MiB × batch64 × 50us. A later 10s RTO
+    // floor proved too conservative for ranged pulls: with real SRTT around
+    // 150-800ms, a single lost/black-holed hole parked workers for 10→20s
+    // and looked like a stack-level stop-and-wait ceiling. Keep the circuit
+    // defaults quick enough to repair holes before the content-layer idle
+    // timer fires, while still overrideable for hostile WAN probes.
+    let is_circuit = matches!(cells, HubCells::Circuit(_));
+    let recv_window = match cells {
+        // Must cover the path BDP with probe headroom or the advertised
+        // window becomes the throughput cap: post-BBR-fix a single circuit
+        // stream sustains ~12 MB/s at ~150-300ms live RTT (~2-3.6 MiB of
+        // flight), and the 3x-BDP STARTUP probe brushed the old 4 MiB
+        // ceiling. BBR's 2x-BDP steady cap keeps the standing queue small,
+        // so the larger advert costs memory only when actually in flight.
+        HubCells::Circuit(_) => env_u32(
+            CIRCUIT_RECV_WINDOW_ENV,
+            8 * 1024 * 1024,
+            (64 * 1024) as u32,
+            (16 * 1024 * 1024) as u32,
+        ),
+        HubCells::Anon(_) => (1024 * mss) as u32,
+    };
+    let init_rto_ms = if is_circuit {
+        env_or_android_u64(
+            CIRCUIT_INIT_RTO_MS_ENV,
+            ANDROID_INIT_RTO_MS_PROP,
+            2_000,
+            1_000,
+            120_000,
+        )
+    } else {
+        12_000
+    };
+    let min_rto_ms = if is_circuit {
+        env_or_android_u64(
+            CIRCUIT_MIN_RTO_MS_ENV,
+            ANDROID_MIN_RTO_MS_PROP,
+            1_000,
+            500,
+            120_000,
+        )
+    } else {
+        10_000
+    };
+    let max_rto_ms = if is_circuit {
+        env_or_android_u64(
+            CIRCUIT_MAX_RTO_MS_ENV,
+            ANDROID_MAX_RTO_MS_PROP,
+            10_000,
+            min_rto_ms,
+            300_000,
+        )
+    } else {
+        60_000
+    };
+    let max_retransmits = if is_circuit {
+        env_or_android_u32(
+            CIRCUIT_MAX_RETRANSMITS_ENV,
+            ANDROID_MAX_RETRANSMITS_PROP,
+            5,
+            1,
+            30,
+        )
+    } else {
+        15
+    };
+    let init_cwnd_mss = if is_circuit {
+        env_or_android_usize(
+            CIRCUIT_INIT_CWND_MSS_ENV,
+            ANDROID_INIT_CWND_MSS_PROP,
+            DEFAULT_CIRCUIT_INIT_CWND_MSS,
+            1,
+            MAX_CIRCUIT_INIT_CWND_MSS,
+        )
+    } else {
+        32
+    };
+    let init_cwnd = ((init_cwnd_mss * mss).min(recv_window as usize)) as u32;
+    let max_pacing_batch = if is_circuit {
+        // Pacing uses millisecond ticks for scheduler realism, but on
+        // Android the driver timer coalesces well past 1ms, so one batch
+        // per wake quantizes the whole stream to batch/wake-interval
+        // (64 cells / ~12.5ms real wake = ~1.6 MiB/s live phone ceiling).
+        // 256 keeps a phone sender fed across coalesced wakes; the actual
+        // wire burst stays bounded by the shared circuit DATA pacer's
+        // token-bucket credit, not by this engine-side budget.
+        env_or_android_u32(
+            CIRCUIT_MAX_PACING_BATCH_ENV,
+            ANDROID_MAX_PACING_BATCH_PROP,
+            256,
+            1,
+            512,
+        )
+    } else {
+        4
+    };
+    let debug_summary_ms = if is_circuit {
+        env_or_android_u64(
+            DEBUG_SUMMARY_MS_ENV,
+            ANDROID_DEBUG_SUMMARY_MS_PROP,
+            0,
+            0,
+            60_000,
+        )
+    } else {
+        0
+    };
+    let loss_decrease_per_mille = if is_circuit { 750 } else { 500 };
+    // BBR-lite queue shaping (see engine Config::bbr). Circuit-only and
+    // default ON: the loss-free pinned circuit otherwise parks a full
+    // receive window in sender-side queues (live srtt ~2.3s of pure
+    // queueing), which slows RTO/loss detection and route failover.
+    let bbr = is_circuit && env_or_android_u32(CIRCUIT_BBR_ENV, ANDROID_BBR_PROP, 1, 0, 1) == 1;
+    // RACK loss detection (see CIRCUIT_RACK_ENV). The reorder floor
+    // defaults high when this hub stripes DATA across routes: adaptation
+    // alone pays a spurious-resend learning tax on the first flights.
+    let rack = is_circuit && env_or_android_u32(CIRCUIT_RACK_ENV, ANDROID_RACK_PROP, 1, 0, 1) == 1;
+    let stripe_active = match cells {
+        HubCells::Circuit(c) => c.stripe_routes > 1,
+        HubCells::Anon(_) => false,
+    };
+    let rack_reo_floor_ms = env_or_android_u32(
+        CIRCUIT_RACK_REO_FLOOR_MS_ENV,
+        ANDROID_RACK_REO_FLOOR_MS_PROP,
+        if stripe_active {
+            DEFAULT_STRIPE_RACK_REO_FLOOR_MS
+        } else {
+            0
+        },
+        0,
+        60_000,
+    );
+    if is_circuit {
+        let outbound_pool = match cells {
+            HubCells::Circuit(c) => c.outbound_pool_target,
+            HubCells::Anon(_) => 1,
+        };
+        let ack_pool = match cells {
+            HubCells::Circuit(c) => c.ack_outbound_pool_target,
+            HubCells::Anon(_) => 1,
+        };
+        let bulk_route_limit = match cells {
+            HubCells::Circuit(c) => c.bulk_route_active_limit,
+            HubCells::Anon(_) => 0,
+        };
+        diag_node(
+            &me,
+            &format!(
+                "circuit cfg mss={mss} rwnd={recv_window} \
+             init_cwnd={init_cwnd}({init_cwnd_mss}mss) \
+             batch={max_pacing_batch} rto={init_rto_ms}/{min_rto_ms}/{max_rto_ms}ms \
+             max_retx={max_retransmits} outbound_pool={outbound_pool} ack_pool={ack_pool} \
+             bulk_route_active_limit={bulk_route_limit} \
+             loss_beta={loss_decrease_per_mille}/1000 bbr={bbr} \
+             rack={rack} rack_reo_floor={rack_reo_floor_ms}ms \
+             debug_summary={debug_summary_ms}ms",
+            ),
+        );
+    }
+    Config {
+        mss,
+        init_rto_ms,
+        min_rto_ms,
+        max_rto_ms,
+        handshake_rto_ms: 6_000,
+        // On the pinned circuit path a no-ACK RTO usually means the
+        // current stream/circuit went black-hole, not that a little more
+        // exponential backoff will help. Fail fast and let the content layer
+        // resume on a fresh stream instead of waiting ~2 minutes for its
+        // payload-write idle timeout. The datagram path keeps the conservative
+        // retry budget.
+        max_retransmits,
+        recv_window,
+        init_cwnd,
+        max_pacing_batch,
+        rto_rewind_no_sack: is_circuit,
+        loss_decrease_per_mille,
+        bbr,
+        // Every ACK consumes the same fixed-size circuit cell as DATA.
+        // Cumulative ACKs can be
+        // thinned without delaying loss signalling: gaps and duplicates
+        // still ACK immediately, and the timer bounds tail latency.
+        ack_every: if is_circuit {
+            // A little more ACK traffic buys faster loss signalling and keeps
+            // SACK state fresh during relay-queue drops.
+            16
+        } else {
+            2
+        },
+        ack_delay_ms: 5,
+        debug_summary_ms,
+        rack,
+        rack_reo_floor_ms,
+        ..Config::default()
+    }
+}
+
 impl AnonStreamHub {
     /// Build over a freshly-bound stream endpoint's `sender` + raw inbound
     /// datagram channel `msg_rx`. `me` = this node id. MUST be called inside the
@@ -3239,209 +3455,7 @@ impl AnonStreamHub {
         };
         diag_node(&me, backend);
 
-        // The onion RTT is variable and relay queues can punish coarse bursts:
-        // keep the first RTO above normal jitter, pace the sender, and keep an
-        // explicit receive window instead of letting cwnd grow unbounded.
-        //
-        // The original 1-cell/ms pacer floor capped clean transfers at ~135 KiB/s.
-        // After converting both stream and circuit pacing to small millisecond
-        // batches, the autonomous embedded harness reliably moves 8 MiB over
-        // published rendezvous with 4 MiB × batch64 × 50us. A later 10s RTO
-        // floor proved too conservative for ranged pulls: with real SRTT around
-        // 150-800ms, a single lost/black-holed hole parked workers for 10→20s
-        // and looked like a stack-level stop-and-wait ceiling. Keep the circuit
-        // defaults quick enough to repair holes before the content-layer idle
-        // timer fires, while still overrideable for hostile WAN probes.
-        let is_circuit = matches!(&cells, HubCells::Circuit(_));
-        let recv_window = match &cells {
-            // Must cover the path BDP with probe headroom or the advertised
-            // window becomes the throughput cap: post-BBR-fix a single circuit
-            // stream sustains ~12 MB/s at ~150-300ms live RTT (~2-3.6 MiB of
-            // flight), and the 3x-BDP STARTUP probe brushed the old 4 MiB
-            // ceiling. BBR's 2x-BDP steady cap keeps the standing queue small,
-            // so the larger advert costs memory only when actually in flight.
-            HubCells::Circuit(_) => env_u32(
-                CIRCUIT_RECV_WINDOW_ENV,
-                8 * 1024 * 1024,
-                (64 * 1024) as u32,
-                (16 * 1024 * 1024) as u32,
-            ),
-            HubCells::Anon(_) => (1024 * mss) as u32,
-        };
-        let init_rto_ms = if is_circuit {
-            env_or_android_u64(
-                CIRCUIT_INIT_RTO_MS_ENV,
-                ANDROID_INIT_RTO_MS_PROP,
-                2_000,
-                1_000,
-                120_000,
-            )
-        } else {
-            12_000
-        };
-        let min_rto_ms = if is_circuit {
-            env_or_android_u64(
-                CIRCUIT_MIN_RTO_MS_ENV,
-                ANDROID_MIN_RTO_MS_PROP,
-                1_000,
-                500,
-                120_000,
-            )
-        } else {
-            10_000
-        };
-        let max_rto_ms = if is_circuit {
-            env_or_android_u64(
-                CIRCUIT_MAX_RTO_MS_ENV,
-                ANDROID_MAX_RTO_MS_PROP,
-                10_000,
-                min_rto_ms,
-                300_000,
-            )
-        } else {
-            60_000
-        };
-        let max_retransmits = if is_circuit {
-            env_or_android_u32(
-                CIRCUIT_MAX_RETRANSMITS_ENV,
-                ANDROID_MAX_RETRANSMITS_PROP,
-                5,
-                1,
-                30,
-            )
-        } else {
-            15
-        };
-        let init_cwnd_mss = if is_circuit {
-            env_or_android_usize(
-                CIRCUIT_INIT_CWND_MSS_ENV,
-                ANDROID_INIT_CWND_MSS_PROP,
-                DEFAULT_CIRCUIT_INIT_CWND_MSS,
-                1,
-                MAX_CIRCUIT_INIT_CWND_MSS,
-            )
-        } else {
-            32
-        };
-        let init_cwnd = ((init_cwnd_mss * mss).min(recv_window as usize)) as u32;
-        let max_pacing_batch = if is_circuit {
-            // Pacing uses millisecond ticks for scheduler realism, but on
-            // Android the driver timer coalesces well past 1ms, so one batch
-            // per wake quantizes the whole stream to batch/wake-interval
-            // (64 cells / ~12.5ms real wake = ~1.6 MiB/s live phone ceiling).
-            // 256 keeps a phone sender fed across coalesced wakes; the actual
-            // wire burst stays bounded by the shared circuit DATA pacer's
-            // token-bucket credit, not by this engine-side budget.
-            env_or_android_u32(
-                CIRCUIT_MAX_PACING_BATCH_ENV,
-                ANDROID_MAX_PACING_BATCH_PROP,
-                256,
-                1,
-                512,
-            )
-        } else {
-            4
-        };
-        let debug_summary_ms = if is_circuit {
-            env_or_android_u64(
-                DEBUG_SUMMARY_MS_ENV,
-                ANDROID_DEBUG_SUMMARY_MS_PROP,
-                0,
-                0,
-                60_000,
-            )
-        } else {
-            0
-        };
-        let loss_decrease_per_mille = if is_circuit { 750 } else { 500 };
-        // BBR-lite queue shaping (see engine Config::bbr). Circuit-only and
-        // default ON: the loss-free pinned circuit otherwise parks a full
-        // receive window in sender-side queues (live srtt ~2.3s of pure
-        // queueing), which slows RTO/loss detection and route failover.
-        let bbr = is_circuit && env_or_android_u32(CIRCUIT_BBR_ENV, ANDROID_BBR_PROP, 1, 0, 1) == 1;
-        // RACK loss detection (see CIRCUIT_RACK_ENV). The reorder floor
-        // defaults high when this hub stripes DATA across routes: adaptation
-        // alone pays a spurious-resend learning tax on the first flights.
-        let rack =
-            is_circuit && env_or_android_u32(CIRCUIT_RACK_ENV, ANDROID_RACK_PROP, 1, 0, 1) == 1;
-        let stripe_active = match &cells {
-            HubCells::Circuit(c) => c.stripe_routes > 1,
-            HubCells::Anon(_) => false,
-        };
-        let rack_reo_floor_ms = env_or_android_u32(
-            CIRCUIT_RACK_REO_FLOOR_MS_ENV,
-            ANDROID_RACK_REO_FLOOR_MS_PROP,
-            if stripe_active {
-                DEFAULT_STRIPE_RACK_REO_FLOOR_MS
-            } else {
-                0
-            },
-            0,
-            60_000,
-        );
-        if is_circuit {
-            let outbound_pool = match &cells {
-                HubCells::Circuit(c) => c.outbound_pool_target,
-                HubCells::Anon(_) => 1,
-            };
-            let ack_pool = match &cells {
-                HubCells::Circuit(c) => c.ack_outbound_pool_target,
-                HubCells::Anon(_) => 1,
-            };
-            let bulk_route_limit = match &cells {
-                HubCells::Circuit(c) => c.bulk_route_active_limit,
-                HubCells::Anon(_) => 0,
-            };
-            diag_node(
-                &me,
-                &format!(
-                    "circuit cfg mss={mss} rwnd={recv_window} \
-                 init_cwnd={init_cwnd}({init_cwnd_mss}mss) \
-                 batch={max_pacing_batch} rto={init_rto_ms}/{min_rto_ms}/{max_rto_ms}ms \
-                 max_retx={max_retransmits} outbound_pool={outbound_pool} ack_pool={ack_pool} \
-                 bulk_route_active_limit={bulk_route_limit} \
-                 loss_beta={loss_decrease_per_mille}/1000 bbr={bbr} \
-                 rack={rack} rack_reo_floor={rack_reo_floor_ms}ms \
-                 debug_summary={debug_summary_ms}ms",
-                ),
-            );
-        }
-        let cfg = Config {
-            mss,
-            init_rto_ms,
-            min_rto_ms,
-            max_rto_ms,
-            handshake_rto_ms: 6_000,
-            // On the pinned circuit path a no-ACK RTO usually means the
-            // current stream/circuit went black-hole, not that a little more
-            // exponential backoff will help. Fail fast and let the content layer
-            // resume on a fresh stream instead of waiting ~2 minutes for its
-            // payload-write idle timeout. The datagram path keeps the conservative
-            // retry budget.
-            max_retransmits,
-            recv_window,
-            init_cwnd,
-            max_pacing_batch,
-            rto_rewind_no_sack: is_circuit,
-            loss_decrease_per_mille,
-            bbr,
-            // Every ACK consumes the same fixed-size circuit cell as DATA.
-            // The pinned path is loss-free/in-order, so cumulative ACKs can be
-            // thinned without delaying loss signalling: gaps and duplicates
-            // still ACK immediately, and the timer bounds tail latency.
-            ack_every: if is_circuit {
-                // A little more ACK traffic buys faster loss signalling and keeps
-                // SACK state fresh during relay-queue drops.
-                16
-            } else {
-                2
-            },
-            ack_delay_ms: 5,
-            debug_summary_ms,
-            rack,
-            rack_reo_floor_ms,
-            ..Config::default()
-        };
+        let cfg = stream_config(me, &cells, mss);
         let aliases = match &cells {
             HubCells::Circuit(c) => Arc::clone(&c.peer_aliases),
             HubCells::Anon(_) => veil_onion_stream::PeerAliases::default(),
@@ -3532,6 +3546,36 @@ impl AnonStreamHub {
             false
         }
     }
+}
+
+#[cfg(all(test, feature = "test-low-difficulty"))]
+pub(crate) struct CircuitStreamMuxForTest(StreamMux<HubCells>);
+
+#[cfg(all(test, feature = "test-low-difficulty"))]
+impl CircuitStreamMuxForTest {
+    pub(crate) fn open(&self, peer: Addr) -> OnionStream {
+        self.0.open(peer)
+    }
+    pub(crate) async fn accept(&self) -> Option<(OnionStream, Addr)> {
+        self.0.accept().await
+    }
+}
+
+#[cfg(all(test, feature = "test-low-difficulty"))]
+pub(crate) fn circuit_stream_mux_for_test(me: [u8; 32]) -> CircuitStreamMuxForTest {
+    let (in_tx, in_rx) = mpsc::channel(256);
+    let cells = try_open_circuit(me, in_tx, CircuitMode::PublishedRendezvous).unwrap();
+    let aliases = Arc::clone(&cells.peer_aliases);
+    let mss = circuit_mss_for(veil_anonymity::circuit_origin::choose_cell_bytes());
+    let cells = HubCells::Circuit(Box::new(cells));
+    let cfg = stream_config(me, &cells, mss);
+    CircuitStreamMuxForTest(StreamMux::new_with_aliases(
+        me,
+        Arc::new(cells),
+        in_rx,
+        cfg,
+        aliases,
+    ))
 }
 
 /// Open the pinned inbound stream circuit, register this node's cookie, and spawn
