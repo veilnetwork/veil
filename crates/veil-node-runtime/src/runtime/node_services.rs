@@ -1547,6 +1547,23 @@ impl NodeServices {
         }
     }
 
+    /// Retire an exclusively owned data circuit immediately. Unlike dropping a
+    /// shared receive sink, this releases the origin slot and its relay chain;
+    /// repeated short calls must not exhaust the origin table before its TTL.
+    pub fn retire_data_circuit(&self, circuit: &DataCircuit) {
+        let id = circuit.origin_circuit_id();
+        self.close_data_circuit(id);
+        if let Some(table) = &self.dispatcher.circuit_origin {
+            table.remove(&circuit.first_hop(), id);
+        }
+        let body = veil_anonymity::circuit_wire::CircuitTeardownPayload { circuit_id: id }.encode();
+        let _ = self.send_relay_chain_frame(
+            &circuit.first_hop(),
+            veil_proto::family::RelayChainMsg::CircuitTeardown,
+            &body,
+        );
+    }
+
     /// Open a pinned stream circuit to a rendezvous relay R (`relay_path.last()`)
     /// and REGISTER this node's stream cookie at R, so the R-splice
     /// (`splice_stream_cell`) can forward a peer's `[cookie][bytes]` cells down
@@ -1692,6 +1709,16 @@ impl NodeServices {
     pub fn decrypt_stream_peer_intro(&self, ciphertext: &[u8]) -> Option<Vec<u8>> {
         let sk = self.dispatcher.anonymity_x25519_sk.as_ref()?;
         veil_anonymity::rendezvous::decrypt_introduce(ciphertext, sk.as_ref()).ok()
+    }
+
+    /// Public introduction key for an unadvertised circuit receive address.
+    /// This does not publish its registration cookie or make this endpoint a
+    /// relay. Return no key when this node cannot decrypt introductions.
+    pub fn stream_peer_intro_public_key(&self) -> Option<[u8; 32]> {
+        self.dispatcher
+            .anonymity_x25519_sk
+            .as_ref()
+            .map(|sk| x25519_dalek::PublicKey::from(sk.as_ref()).to_bytes())
     }
 
     /// Resolve the receiver's currently valid published rendezvous ads in the

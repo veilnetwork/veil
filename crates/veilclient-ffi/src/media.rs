@@ -1106,11 +1106,26 @@ pub(crate) fn dispatch_inbound_auto(peer: [u8; 32], payload: &[u8]) {
         media_drop_note("no-channel", peer, payload.len());
         return;
     };
+    dispatch_inbound_with_lease(peer, payload, lease);
+}
+
+fn dispatch_inbound_with_lease(peer: [u8; 32], payload: &[u8], lease: RecvLease) {
     let Some(plaintext) = lease.cipher.open(payload) else {
         media_drop_note("seal-open-failed", peer, payload.len());
         return;
     };
     trace_sealed_cell("received", &peer, payload);
+    #[cfg(feature = "node-embedded")]
+    if plaintext.starts_with(anon_stream_control_magic()) {
+        let map = RECV.lock().unwrap_or_else(|p| p.into_inner());
+        if map
+            .get(&peer)
+            .is_some_and(|c| c.chan == lease.chan && Arc::ptr_eq(&c.cipher, &lease.cipher))
+        {
+            crate::media_ffi::dispatch_route_control(peer, lease.chan, &lease.cipher, &plaintext);
+        }
+        return;
+    }
     if plaintext.first() == Some(&MEDIA_BATCH_MAGIC) {
         dispatch_inbound_batch(peer, &plaintext[1..], &lease);
     } else {
@@ -1127,6 +1142,25 @@ pub(crate) fn dispatch_onion_cell(peer: [u8; 32], cell: &[u8]) -> bool {
     }
     dispatch_inbound_auto(peer, &cell[1..]);
     true
+}
+
+#[cfg(feature = "node-embedded")]
+pub(crate) fn dispatch_private_onion_cell(
+    peer: [u8; 32],
+    channel: u64,
+    cipher: &Arc<MediaCipher>,
+    cell: &[u8],
+) {
+    if cell.first() == Some(&MEDIA_MAGIC) {
+        dispatch_inbound_with_lease(
+            peer,
+            &cell[1..],
+            RecvLease {
+                chan: channel,
+                cipher: Arc::clone(cipher),
+            },
+        );
+    }
 }
 
 /// Number of inbound media datagrams from `peer` that opened against the
@@ -1962,6 +1996,29 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "node-embedded")]
+    #[test]
+    fn private_receive_address_cannot_deliver_into_a_successor_call() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let peer = [0xc8; 32];
+        RX_CALLS.store(0, Ordering::SeqCst);
+        let old = cipher(peer, [0x35; 32], [0x36; 32]);
+        let new = cipher(peer, [0x37; 32], [0x38; 32]);
+        let sender = cipher(peer, [0x38; 32], [0x37; 32]);
+        set_recv_callback(peer, 2, record, std::ptr::null_mut(), Arc::clone(&new));
+        let mut cell = vec![MEDIA_MAGIC];
+        cell.extend_from_slice(sender.seal(&[0x80, 111, 1, 2]).unwrap().as_bytes());
+        dispatch_private_onion_cell(peer, 1, &old, &cell);
+        assert_eq!(RX_CALLS.load(Ordering::SeqCst), 0);
+        dispatch_private_onion_cell(peer, 2, &new, &cell);
+        assert_eq!(
+            RX_CALLS.load(Ordering::SeqCst),
+            1,
+            "old feed cannot consume new call's replay state"
+        );
+        clear_recv_callback(peer, 2);
+    }
+
     #[test]
     fn media_cipher_roundtrip_reorders_and_rejects_replay() {
         let key = [0x31u8; 32];
@@ -2363,4 +2420,9 @@ mod detached_singleton_lifetime_tests {
     fn the_media_foundation_owner_is_never_destroyed() {
         assert_never_destroyed("veil_mf_camera.cc", "MfPlatform& mf()", "MfPlatform");
     }
+}
+
+#[cfg(feature = "node-embedded")]
+fn anon_stream_control_magic() -> &'static [u8; 4] {
+    crate::anon_stream::MEDIA_ROUTE_CONTROL_MAGIC
 }
