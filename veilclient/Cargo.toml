@@ -44,6 +44,7 @@ test-low-difficulty = ["veilcore/test-low-difficulty"]
 tls-boring = ["veilcore/tls-boring"]
 
 [dev-dependencies]
+veil-types = { path = "../crates/veil-types" }
 # Integration tests construct an `IpcServer` directly + impl IPC trait
 # fixtures in-test, so they need both crate surfaces explicitly.
 veil-ipc = { path = "../crates/veil-ipc" }

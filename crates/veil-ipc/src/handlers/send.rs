@@ -851,7 +851,13 @@ pub(crate) async fn handle_ipc_send(
                     .await
             } else {
                 sender
-                    .send_authenticated(send.dst_node_id, send.app_id, send.endpoint_id, &send.data)
+                    .send_authenticated_on_local_lane(
+                        ctx.local_priority,
+                        send.dst_node_id,
+                        send.app_id,
+                        send.endpoint_id,
+                        &send.data,
+                    )
                     .await
             };
             match result {
@@ -1115,7 +1121,7 @@ pub(crate) async fn handle_ipc_send(
                 continue;
             }
             let frame = app_send_frame(&send, sealed.as_ref().map(|(p, _)| p.as_slice()));
-            if reg.send_to(device, veil_proto::header::priority::INTERACTIVE, frame) {
+            if reg.send_to(device, ctx.local_priority, frame) {
                 any_sent = true;
                 if sealed.is_some() {
                     emit_e2e_plaintext_capture(capture_tx, local_node_id, device, &send.data);
@@ -1225,7 +1231,7 @@ pub(crate) async fn handle_ipc_send(
                 &send.dst_node_id,
                 sealed_for,
                 &|device| device_instance(ctx, device),
-                veil_proto::header::priority::INTERACTIVE,
+                ctx.local_priority,
                 frame,
             );
         if sent && sealed.is_some() {
@@ -1604,13 +1610,9 @@ pub(crate) async fn handle_ipc_send(
                             .enumerate()
                             .map(|(i, piece)| make_chunk_frame(*next_hop, i as u32, piece))
                             .collect();
-                        let all_ok = frames.iter().all(|frame| {
-                            reg.send_to(
-                                next_hop,
-                                veil_proto::header::priority::INTERACTIVE,
-                                frame.clone(),
-                            )
-                        });
+                        let all_ok = frames
+                            .iter()
+                            .all(|frame| reg.send_to(next_hop, ctx.local_priority, frame.clone()));
                         if all_ok {
                             delivered = true;
                             if want_ack && let Some(tracker) = ctx.pending_ack.as_deref() {
@@ -1702,12 +1704,14 @@ pub(crate) async fn handle_ipc_send(
                     let fwd_frame = make_fwd_frame(next_hop);
                     let relayed = reg.send_to(
                         &next_hop,
-                        if relay_wire_realtime && ctx.local_priority == veil_proto::priority::BULK {
-                            veil_proto::priority::BULK
+                        if relay_wire_realtime
+                            && ctx.local_priority != veil_proto::priority::INTERACTIVE
+                        {
+                            ctx.local_priority
                         } else if relay_realtime {
                             veil_proto::header::priority::REALTIME
                         } else {
-                            veil_proto::header::priority::INTERACTIVE
+                            ctx.local_priority
                         },
                         fwd_frame.clone(),
                     );
@@ -2179,17 +2183,25 @@ mod ratchet_send_tests {
         family: Vec<[u8; 32]>,
     }
 
-    #[derive(Default)]
-    struct LaneCapture(Mutex<Vec<(u8, Vec<u8>)>>);
+    struct LaneCapture(Mutex<Vec<(u8, Vec<u8>)>>, Vec<[u8; 32]>);
+
+    impl Default for LaneCapture {
+        fn default() -> Self {
+            Self(Mutex::new(Vec::new()), vec![RELAY])
+        }
+    }
 
     impl FrameBroadcaster for LaneCapture {
-        fn send_to(&self, _peer: &[u8; 32], priority: u8, bytes: Vec<u8>) -> bool {
+        fn send_to(&self, peer: &[u8; 32], priority: u8, bytes: Vec<u8>) -> bool {
+            if !self.1.contains(peer) {
+                return false;
+            }
             lock!(self.0).push((priority, bytes));
             true
         }
         fn send_to_all_with_priority(&self, _priority: u8, _bytes: Arc<[u8]>) {}
         fn active_node_ids(&self) -> Vec<[u8; 32]> {
-            vec![RELAY]
+            self.1.clone()
         }
     }
 
@@ -2210,7 +2222,11 @@ mod ratchet_send_tests {
         body[100..104].copy_from_slice(&flags.to_be_bytes());
         let mut wh = sink().await;
         let mut previous = None;
-        for lane in [veil_proto::priority::REALTIME, veil_proto::priority::BULK] {
+        for lane in [
+            veil_proto::priority::REALTIME,
+            veil_proto::priority::BULK,
+            veil_proto::priority::BACKGROUND,
+        ] {
             ctx.local_priority = lane;
             handle_ipc_send(&mut SendReply::Inline(&mut wh), &body, &ctx)
                 .await
@@ -2238,8 +2254,87 @@ mod ratchet_send_tests {
     }
 
     #[tokio::test]
+    async fn background_application_send_keeps_sealing_on_direct_and_relay_routes() {
+        for direct in [true, false] {
+            let fx = fixture(if direct {
+                vec![PEER, RELAY]
+            } else {
+                vec![RELAY]
+            });
+            let capture = Arc::new(LaneCapture(Mutex::new(Vec::new()), fx.outbox.live.clone()));
+            let mut ctx = fx.ctx(true);
+            ctx.local_priority = veil_proto::priority::BACKGROUND;
+            ctx.session_tx_registry = Some(capture.clone() as Arc<dyn FrameBroadcaster>);
+            let mut wh = sink().await;
+            handle_ipc_send(
+                &mut SendReply::Inline(&mut wh),
+                &payload(false, b"file chunk"),
+                &ctx,
+            )
+            .await
+            .unwrap();
+            let sent = lock!(capture.0);
+            assert_eq!(sent.len(), 1);
+            let (priority, frame) = &sent[0];
+            assert_eq!(*priority, veil_proto::priority::BACKGROUND);
+            let header = codec::decode_header(frame).unwrap();
+            assert_eq!(header.flags, 0, "no lane sent to peers");
+            let sealed = if direct {
+                veil_proto::app::AppSendPayload::decode(&frame[veil_proto::HEADER_SIZE..])
+                    .unwrap()
+                    .data
+                    .to_vec()
+            } else {
+                let forward =
+                    veil_proto::delivery::ForwardPayload::decode(&frame[veil_proto::HEADER_SIZE..])
+                        .unwrap();
+                assert_ne!(
+                    forward.traffic_class,
+                    Some(veil_proto::priority::BACKGROUND)
+                );
+                forward.envelope.payload
+            };
+            let opened = fx
+                .peer
+                .open_payload(&ME, &sealed, veil_util::unix_secs_now_u64())
+                .unwrap();
+            assert!(opened.authenticated);
+            assert_eq!(opened.plaintext, b"file chunk");
+        }
+    }
+
+    #[tokio::test]
+    async fn background_anonymous_send_uses_only_the_onion_sender() {
+        let fx = fixture(vec![PEER, RELAY]);
+        let sender = Arc::new(super::direct_reply_sentinel_tests::RecordingSender::default());
+        let mut ctx = fx.ctx(true);
+        ctx.local_priority = veil_proto::priority::BACKGROUND;
+        ctx.anon_onion_sender = Some(sender.clone());
+        let mut body = AppIpcSendPayload::decode(&payload(false, b"private chunk")).unwrap();
+        body.anonymous_authenticated = true;
+        let mut wh = sink().await;
+        handle_ipc_send(&mut SendReply::Inline(&mut wh), &body.encode(), &ctx)
+            .await
+            .unwrap();
+        assert!(
+            fx.taken().is_empty(),
+            "no direct or ordinary relay fallback"
+        );
+        assert_eq!(
+            *sender.lanes.lock().unwrap(),
+            vec![(
+                veil_proto::priority::BACKGROUND,
+                PEER,
+                body.app_id,
+                body.endpoint_id,
+                b"private chunk".to_vec()
+            )]
+        );
+    }
+
+    #[tokio::test]
     async fn direct_local_lane_is_stripped_before_network_encoding() {
-        let capture = LaneCapture::default();
+        let capture = LaneCapture(Mutex::new(Vec::new()), vec![PEER]);
         let mut wh = sink().await;
         let send = AppIpcRtSendPayload {
             dst_node_id: PEER,
@@ -2565,7 +2660,7 @@ mod ratchet_send_tests {
     impl Fixture {
         fn ctx(&self, with_ratchet: bool) -> IpcSendContext {
             IpcSendContext {
-                local_priority: veil_proto::priority::REALTIME,
+                local_priority: veil_proto::priority::INTERACTIVE,
                 app_registry: Arc::clone(&self.registry),
                 local_node_id: ME,
                 session_tx_registry: Some(Arc::clone(&self.outbox) as Arc<dyn FrameBroadcaster>),
@@ -3615,11 +3710,26 @@ mod direct_reply_sentinel_tests {
     /// Records the `reply` argument of every direct send; every other method is
     /// off this path and panics rather than silently passing.
     #[derive(Default)]
-    struct RecordingSender {
+    pub(super) struct RecordingSender {
         replies: Mutex<Vec<ReplyPath>>,
+        pub(super) lanes: Mutex<Vec<(u8, [u8; 32], [u8; 32], u32, Vec<u8>)>>,
     }
 
     impl veil_types::AnonOnionSender for RecordingSender {
+        fn send_authenticated_on_local_lane<'a>(
+            &'a self,
+            lane: u8,
+            target: [u8; 32],
+            app: [u8; 32],
+            endpoint: u32,
+            data: &'a [u8],
+        ) -> AnonFut<'a> {
+            self.lanes
+                .lock()
+                .unwrap()
+                .push((lane, target, app, endpoint, data.to_vec()));
+            Box::pin(async { Ok(()) })
+        }
         fn send_authenticated_direct_with_reply<'a>(
             &'a self,
             _target_node_id: [u8; 32],

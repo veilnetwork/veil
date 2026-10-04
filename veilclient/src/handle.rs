@@ -714,6 +714,36 @@ impl AppSender {
             .await
     }
 
+    /// Select an endpoint queue for this send; no local lane enters a relay header.
+    pub async fn send_on_local_lane(
+        &self,
+        local_lane: u8,
+        dst_node_id: [u8; 32],
+        dst_app_id: [u8; 32],
+        dst_endpoint_id: u32,
+        data: &[u8],
+        anonymous_authenticated: bool,
+    ) -> Result<(), ClientError> {
+        if local_lane > 3 {
+            return Err(ClientError::Protocol("local lane must be in 0..3".into()));
+        }
+        self.writer
+            .write_app_ipc_send_on_local_lane_owned(
+                local_lane,
+                &dst_node_id,
+                &self.app_id,
+                &dst_app_id,
+                dst_endpoint_id,
+                if anonymous_authenticated {
+                    veil_proto::ipc::IPC_SEND_FLAG_ANONYMOUS_AUTHENTICATED
+                } else {
+                    0
+                },
+                data,
+            )
+            .await
+    }
+
     /// Zero-copy variant of [`Self::send`] that takes ownership of `data`.
     /// Use when the caller already owns the buffer (e.g. an ogate TUN-read
     /// `Vec<u8>`) to skip the slice→Vec copy `send` performs internally.

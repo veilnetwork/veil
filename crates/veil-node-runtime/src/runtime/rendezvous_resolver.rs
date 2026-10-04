@@ -411,6 +411,35 @@ impl veil_types::AnonOnionSender for RuntimeAnonOnionSender {
         })
     }
 
+    fn send_authenticated_on_local_lane<'a>(
+        &'a self,
+        local_lane: u8,
+        receiver_node_id: [u8; 32],
+        app_id: [u8; 32],
+        endpoint_id: u32,
+        data: &'a [u8],
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Result<(), veil_types::AnonOnionSendError>>
+                + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async move {
+            self.access
+                .send_anonymous_authenticated_to_on_local_lane(
+                    receiver_node_id,
+                    app_id,
+                    endpoint_id,
+                    data,
+                    self.hop_count,
+                    None,
+                    local_lane,
+                )
+                .await
+        })
+    }
+
     fn send_authenticated_with_reply<'a>(
         &'a self,
         receiver_node_id: [u8; 32],

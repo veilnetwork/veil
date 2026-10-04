@@ -439,6 +439,21 @@ pub trait AnonOnionSender: Send + Sync {
         Box<dyn std::future::Future<Output = Result<(), AnonOnionSendError>> + Send + 'a>,
     >;
 
+    /// Endpoint-only queue choice. Legacy implementations retain anonymous routing.
+    fn send_authenticated_on_local_lane<'a>(
+        &'a self,
+        local_lane: u8,
+        receiver_node_id: [u8; 32],
+        app_id: [u8; 32],
+        endpoint_id: u32,
+        data: &'a [u8],
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<(), AnonOnionSendError>> + Send + 'a>,
+    > {
+        let _ = local_lane;
+        self.send_authenticated(receiver_node_id, app_id, endpoint_id, data)
+    }
+
     /// Like [`Self::send_authenticated`], but additionally attach a one-time
     /// reply block addressed to `(reply_app_id, reply_endpoint_id)` on this node
     /// — letting the recipient reply WITHOUT either side publishing a public
