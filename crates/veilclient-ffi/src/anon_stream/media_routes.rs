@@ -305,7 +305,10 @@ impl MediaRoutes {
         }
         let i = plane_index(plane);
         let core = &self.cores[i];
-        let mut outgoing = self.outgoing[i].lock().await;
+        let Some(mut outgoing) = sealed.lock_while_fresh(&self.outgoing[i]).await else {
+            // Expiry at the endpoint must not look like a route failure.
+            return true;
+        };
         if outgoing.as_ref().is_some_and(|(_, route, generation)| {
             !route.is_live() || *generation != self.repair_generation[i].load(Ordering::Acquire)
         }) {

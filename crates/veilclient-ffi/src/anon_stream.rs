@@ -1583,14 +1583,29 @@ impl CircuitCells {
     /// the outbound pool + make-before-break refill that `circuit_for` already
     /// drives.
     ///
-    /// Returns `true` if the cell entered the first-hop TX queue, `false` if it
-    /// was dropped.
+    /// Returns `true` if the cell entered the first-hop TX queue or expired
+    /// locally (which must not trigger route repair), `false` on send failure.
     async fn send_datagram(&self, dst_node: [u8; 32], sealed: &SealedMediaCell) -> bool {
-        self.send_framed_datagram(dst_node, crate::media::MEDIA_MAGIC, sealed.as_bytes())
-            .await
+        self.send_framed_datagram(
+            dst_node,
+            crate::media::MEDIA_MAGIC,
+            sealed.as_bytes(),
+            sealed.local_deadline(),
+        )
+        .await
     }
 
-    async fn send_framed_datagram(&self, dst_node: [u8; 32], magic: u8, payload: &[u8]) -> bool {
+    async fn send_framed_datagram(
+        &self,
+        dst_node: [u8; 32],
+        magic: u8,
+        payload: &[u8],
+        deadline: Option<tokio::time::Instant>,
+    ) -> bool {
+        let expired = || deadline.is_some_and(|at| tokio::time::Instant::now() >= at);
+        if expired() {
+            return true;
+        }
         // Media only exists on the published-rendezvous circuit backend; the
         // validation/datagram fallbacks have no lossy path.
         if self.mode != CircuitMode::PublishedRendezvous {
@@ -1611,6 +1626,9 @@ impl CircuitCells {
             Ok(Some(route)) => route,
             _ => return false,
         };
+        if expired() {
+            return true;
+        }
         if self.route_session_stale(&route) {
             self.mark_route_stale(dst_node, &route).await;
             return false;
