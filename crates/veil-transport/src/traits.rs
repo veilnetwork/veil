@@ -207,6 +207,13 @@ pub trait TransportConnection: Send + Sync {
         None
     }
 
+    /// Independent QUIC connections on an exclusively owned punched UDP
+    /// endpoint. They still require session authentication. Shared listeners
+    /// return `None`, so this API cannot steal their ordinary accepts.
+    fn parallel_quic(&self) -> Option<super::quic::QuicParallelHandle> {
+        None
+    }
+
     /// Send a datagram (QUIC only). Default: `Unsupported`.
     fn send_datagram<'a>(&'a self, _payload: &'a [u8]) -> BoxFuture<'a, Result<()>> {
         Box::pin(ready(Err(TransportError::Unsupported(

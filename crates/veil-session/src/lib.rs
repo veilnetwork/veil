@@ -32,6 +32,7 @@ pub mod mlkem_rekey_context;
 pub mod once_trigger;
 pub mod outbound_batch_coalescer;
 pub mod outbox;
+pub mod parallel_binding;
 pub mod pending_response_table;
 pub mod priority_queue;
 pub mod realtime_datagram;
