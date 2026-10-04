@@ -1594,6 +1594,7 @@ VeilMediaEngine* veil_media_engine_create(uint64_t veil_chan,
   ws->shim = std::make_unique<veil_media::VeilTransportShim>(
       veil_chan, ws->call.get(), ws->network_tq.get(),
       ws->video_call.get(), ws->video_network_tq.get());
+  ws->shim->SetLocalAudioSsrc(ssrc_of(local_id));
   ws->shim->Start();
 
   ws->video_sink = std::make_unique<VeilVideoSink>();
@@ -2140,8 +2141,7 @@ char* veil_media_group_engine_get_stats(VeilGroupMediaEngine* engine) {
   const int64_t now_us = webrtc::TimeMicros();
   for (const auto& entry : ws->peers) {
     const auto report = entry.second->shim->audio_feedback();
-    if (report.arrived_us <= 0 || report.arrived_us > now_us ||
-        now_us - report.arrived_us > 15'000'000) continue;
+    if (!report.fresh_at(now_us)) continue;
     ++reports;
     loss = std::max(loss, report.loss_pct);
     jitter = std::max(jitter, report.jitter_ms);
@@ -3379,18 +3379,6 @@ char* veil_media_engine_get_stats(VeilMediaEngine* engine) {
         if (cs.rtt_ms >= 0) rtt_ms = cs.rtt_ms;
         pacer_delay_ms = cs.pacer_delay_ms;
       }
-      if (ws->send_stream) {
-        // Per-stream RTCP report-block RTT is fresher than the call-level
-        // aggregate when both are available. The report block also carries
-        // what the REMOTE receiver measured on our outbound leg — that is the
-        // signal the sender-side bitrate adaptation acts on.
-        const auto s = ws->send_stream->GetStats();
-        if (s.rtt_ms >= 0) rtt_ms = s.rtt_ms;
-        if (s.jitter_ms >= 0) tx_jitter_ms = s.jitter_ms;
-        if (s.fraction_lost >= 0.0f) {
-          tx_loss_pct = static_cast<int>(s.fraction_lost * 100.0f + 0.5f);
-        }
-      }
       if (ws->recv_stream) {
         const auto r =
             ws->recv_stream->GetStats(/*get_and_clear_legacy_stats=*/false);
@@ -3420,6 +3408,16 @@ char* veil_media_engine_get_stats(VeilMediaEngine* engine) {
             video_jb_ms = v.jitter_buffer_ms;
           }
         }, std::chrono::milliseconds(20));
+    // Cached WebRTC stats have no report age. Only an authenticated peer's
+    // fresh RR/SR block for our audio SSRC can drive outbound adaptation.
+    // Call-level RTT remains diagnostic when no such block is available.
+    const auto audio_report = ws->shim->audio_feedback();
+    const bool audio_feedback_available = audio_report.fresh_at(webrtc::TimeMicros());
+    if (audio_feedback_available) {
+      rtt_ms = audio_report.rtt_ms;
+      tx_loss_pct = audio_report.loss_pct;
+      tx_jitter_ms = audio_report.jitter_ms;
+    }
     if (rtt_ms < 0) rtt_ms = 0;  // unknown yet — keep the legacy "0" shape
     // Everything the closure above fills stays at its initialiser when the
     // worker queue never schedules, and a caller cannot tell a zero that was
@@ -3449,7 +3447,7 @@ char* veil_media_engine_get_stats(VeilMediaEngine* engine) {
         "{\"tx_pkts\":%llu,\"rx_pkts\":%llu,\"tx_bytes\":%llu,"
         "\"rx_bytes\":%llu,\"tx_drops\":%llu,\"rx_drops\":%llu,"
         "\"rtt_ms\":%lld,\"jitter_ms\":%u,\"loss_pct\":%d,"
-        "\"tx_jitter_ms\":%d,\"tx_loss_pct\":%d,"
+        "\"tx_jitter_ms\":%d,\"tx_loss_pct\":%d,\"audio_feedback_reports\":%d,"
         "\"audio_delay_ms\":%u,\"audio_jb_ms\":%u,"
         "\"video_delay_ms\":%d,\"video_jb_ms\":%d,"
         "\"pacer_delay_ms\":%lld,\"worker_stalled\":%d,\"video_worker_stalled\":%d,"
@@ -3478,7 +3476,8 @@ char* veil_media_engine_get_stats(VeilMediaEngine* engine) {
         static_cast<unsigned long long>(ws->shim->outbound_dropped_count()),
         static_cast<unsigned long long>(ws->shim->inbound_dropped_count()),
         static_cast<long long>(rtt_ms), jitter_ms, loss_pct, tx_jitter_ms,
-        tx_loss_pct, audio_delay_ms, audio_jb_ms, video_delay_ms, video_jb_ms,
+        tx_loss_pct, audio_feedback_available ? 1 : 0,
+        audio_delay_ms, audio_jb_ms, video_delay_ms, video_jb_ms,
         static_cast<long long>(pacer_delay_ms), sampled ? 0 : 1, video_sampled ? 0 : 1,
         static_cast<unsigned long long>(tx_video.frames),
         cadence_fps(tx_video),
@@ -3515,7 +3514,7 @@ char* veil_media_engine_get_stats(VeilMediaEngine* engine) {
   return dup_cstr(
       "{\"tx_pkts\":0,\"rx_pkts\":0,\"tx_bytes\":0,\"rx_bytes\":0,"
       "\"tx_drops\":0,\"rx_drops\":0,\"rtt_ms\":0,\"jitter_ms\":0,"
-      "\"loss_pct\":0,\"tx_jitter_ms\":0,\"tx_loss_pct\":0,"
+      "\"loss_pct\":0,\"tx_jitter_ms\":0,\"tx_loss_pct\":0,\"audio_feedback_reports\":0,"
       "\"video_tx_frames\":0,\"video_rx_arrival_frames\":0,"
       "\"video_rx_deliver_frames\":0,"
       "\"target_bitrate_bps\":0,\"max_fps\":0}");

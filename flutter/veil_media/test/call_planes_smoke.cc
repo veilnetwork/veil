@@ -194,6 +194,35 @@ int main() {
     assert(veil_media_group_engine_stop_video(e.get()) == VEIL_MEDIA_OK);
     assert(veil_media_group_engine_stop_audio(e.get()) == VEIL_MEDIA_OK);
   }
+  {
+    const uint64_t chan = 60;
+    std::unique_ptr<VeilMediaEngine, decltype(&veil_media_engine_destroy)> e(
+        veil_media_engine_create(chan, local, peer), veil_media_engine_destroy);
+    assert(e);
+    assert(veil_media_engine_set_mic_muted(e.get(), 1) == VEIL_MEDIA_OK);
+    assert(veil_media_engine_start_audio(e.get(), 1, 1) == VEIL_MEDIA_OK);
+    assert(stat(e.get(), "audio_feedback_reports") == 0);
+    // A video report must not create an audio-quality measurement.
+    constexpr uint32_t local_audio = 0x01000000u, peer_audio = 0x02000000u;
+    report(chan, peer_audio, local_audio ^ 0x000000FFu ^ 0x56440000u, 255, 900000);
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    assert(stat(e.get(), "audio_feedback_reports") == 0);
+    const auto report_time = std::chrono::steady_clock::now();
+    report(chan, peer_audio, local_audio, 32, 4800);
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (stat(e.get(), "audio_feedback_reports") == 0 && std::chrono::steady_clock::now() < deadline)
+      std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    assert(stat(e.get(), "audio_feedback_reports") == 1);
+    assert(stat(e.get(), "tx_loss_pct") == 13);
+    assert(stat(e.get(), "tx_jitter_ms") == 100);
+    // Cached WebRTC values can outlive the last peer report. The explicit
+    // freshness flag must expire instead of turning their zeros into health.
+    std::this_thread::sleep_until(report_time + std::chrono::milliseconds(15500));
+    assert(stat(e.get(), "audio_feedback_reports") == 0);
+    assert(stat(e.get(), "tx_loss_pct") == 0);
+    assert(stat(e.get(), "tx_jitter_ms") == 0);
+    std::printf("unicast audio feedback: absent, video-only, fresh RR and expired RR verified\n");
+  }
   setenv("VEIL_MEDIA_TEST_VIDEO", "1", 1);
   for (int enabled : {0, 1}) {
     std::unique_ptr<VeilMediaEngine, decltype(&veil_media_engine_destroy)> e(

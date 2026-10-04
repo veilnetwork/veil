@@ -479,6 +479,10 @@ class VeilMediaEngine {
       _select(id, ffi.veilMediaEngineSelectAudioOutput);
 
   /// Latest engine stats (packets/bytes tx/rx, rtt, jitter, loss, bitrate).
+  /// `audio_feedback_reports` is 1 only while an audio RR/SR report from the
+  /// peer is at most 15 seconds old; 0 means outbound quality is unknown.
+  /// Older libraries omit this field. Call-level RTT alone is not proof of
+  /// current outbound audio quality.
   Map<String, dynamic> getStats() {
     _ensure();
     final s = ffi.veilMediaEngineGetStats(_ptr);
