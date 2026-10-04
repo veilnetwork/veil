@@ -419,6 +419,14 @@ jobs:
             --features node-embedded,packet-tunnel \
             --lib --tests \
             --test-threads=2
+          # Four distinct validated identities for a two-hop media-route stand.
+          # Lower PoW only shortens fixture setup; relay/cipher paths are real.
+          cargo nextest run \
+            -p veilclient-ffi \
+            --no-default-features \
+            --features production-seeds,node-embedded,packet-tunnel,test-low-difficulty \
+            --lib \
+            -E 'test(private_routes_negotiate_splice_and_repair_while_video_ingress_is_stalled)'
           cargo nextest run \
             -p veil-ipc \
             --features veilcore-internals-test \
