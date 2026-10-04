@@ -603,7 +603,7 @@ async fn duplex_children_through_neutral_relay(rotate: bool) {
         }
         receivers.push(cell_receivers);
         let endpoint = Arc::new(endpoint);
-        let (out_tx, out_rx) = mpsc::channel::<PriorityFrame>(32);
+        let (out_tx, out_rx) = veil_session::frame_outbox::frame_channel(32);
         senders.push(out_tx);
         let client_key = [direction as u8 + 10; 32];
         let relay_session_key = [direction as u8 + 20; 32];
@@ -620,7 +620,7 @@ async fn duplex_children_through_neutral_relay(rotate: bool) {
                 client_datagrams,
                 client_offer,
                 endpoint,
-                out_rx.into(),
+                out_rx,
                 client_ids[direction],
                 relay_id,
                 client_key,
@@ -690,6 +690,18 @@ async fn duplex_children_through_neutral_relay(rotate: bool) {
         }
     }));
     let result = tokio::time::timeout(Duration::from_secs(15), async {
+        // Prepare both local receive channels with no data frame whatsoever.
+        // An idle runner must wake, bind and publish readiness on TLS adoption.
+        warm_receive_only_channels(&senders).await;
+        for d in &source_observations {
+            assert_eq!(d.sent(0), 0);
+            assert_eq!(d.sent(2), 0);
+        }
+        for d in &relay_observations {
+            assert_eq!(d.sent(0), 0);
+            assert_eq!(d.sent(2), 0);
+            assert_eq!(d.replies(), 0);
+        }
         let mut first_epoch_done = false;
         let mut replies_before = [0; 2];
         for seq in 1..=200u32 {
@@ -768,6 +780,21 @@ async fn duplex_children_through_neutral_relay(rotate: bool) {
                     }
                     tokio::time::sleep(Duration::from_millis(10)).await;
                 }
+                for sender in &senders {
+                    assert_eq!(
+                        sender.local_datagram_channel_state(0),
+                        LocalDatagramChannelState::Warming
+                    );
+                    assert_eq!(
+                        sender.local_datagram_channel_state(2),
+                        LocalDatagramChannelState::Warming
+                    );
+                }
+                warm_receive_only_channels(&senders).await;
+                for d in &source_observations {
+                    assert_eq!(d.sent_this_generation(0), 0);
+                    assert_eq!(d.sent_this_generation(2), 0);
+                }
             }
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
@@ -796,6 +823,16 @@ async fn duplex_children_through_neutral_relay(rotate: bool) {
     .await
     .expect("children survived their canonical sessions");
     assert!(result.is_ok(), "duplex relay path did not converge");
+    for sender in &senders {
+        assert_eq!(
+            sender.local_datagram_channel_state(0),
+            LocalDatagramChannelState::Unsupported
+        );
+        assert_eq!(
+            sender.local_datagram_channel_state(2),
+            LocalDatagramChannelState::Unsupported
+        );
+    }
     for d in source_observations {
         assert!(d.sent(0) >= 8 && d.sent(2) >= 8);
         if rotate {
@@ -821,4 +858,28 @@ async fn duplex_children_route_both_directions_through_neutral_relay() {
 #[tokio::test]
 async fn duplex_relay_children_rebind_after_canonical_rekey() {
     duplex_children_through_neutral_relay(true).await;
+}
+
+async fn warm_receive_only_channels(senders: &[FrameSender]) {
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let mut ready = true;
+            for sender in senders {
+                assert_eq!(
+                    sender.request_local_datagram_channel(1),
+                    LocalDatagramChannelState::Unsupported
+                );
+                for lane in [0, 2] {
+                    ready &= sender.request_local_datagram_channel(lane)
+                        == LocalDatagramChannelState::Ready;
+                }
+            }
+            if ready {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("receive-only source channels did not bind without data frames");
 }

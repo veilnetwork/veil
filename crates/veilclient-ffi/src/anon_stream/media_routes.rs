@@ -8,6 +8,7 @@ const ROUTE_BYTES: usize = 81;
 const REFRESH_AFTER: Duration = Duration::from_secs(240);
 const PRIVATE_RETIRE_GRACE: Duration = Duration::from_secs(30);
 const PROBE_STALE_AFTER: Duration = Duration::from_secs(12);
+const DATAGRAM_WARM_TIMEOUT: Duration = Duration::from_secs(3);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct ReceiveAddress {
@@ -119,6 +120,7 @@ struct PinnedRoute {
     close_generation: u64,
     last_echo: Mutex<Instant>,
     probe_echo: Arc<AtomicBool>,
+    local_datagram_lane: u8,
 }
 
 impl PinnedRoute {
@@ -136,12 +138,32 @@ impl PinnedRoute {
                 == self.close_generation
     }
 
+    async fn prepare_datagram(&self) {
+        let deadline = tokio::time::Instant::now() + DATAGRAM_WARM_TIMEOUT;
+        while self
+            .services
+            .request_local_circuit_datagram(&self.circuit, self.local_datagram_lane)
+            == veil_session::LocalDatagramChannelState::Warming
+            && tokio::time::Instant::now() < deadline
+        {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        // The first probe after readiness teaches the return route before this
+        // address is advertised. Older peers retain their ordinary fallback.
+        self.probe();
+    }
+
     fn probe(&self) {
-        let mut body = self.cookie.to_vec();
-        body.extend_from_slice(veil_anonymity::circuit_data::CIRCUIT_PROBE_MAGIC);
         let _ = self
             .services
-            .send_circuit_cell_detailed(&self.circuit, &body);
+            .request_local_circuit_datagram(&self.circuit, self.local_datagram_lane);
+        let mut body = self.cookie.to_vec();
+        body.extend_from_slice(veil_anonymity::circuit_data::CIRCUIT_PROBE_MAGIC);
+        let _ = self.services.send_circuit_datagram_on_local_lane_detailed(
+            &self.circuit,
+            &body,
+            self.local_datagram_lane,
+        );
     }
 }
 
@@ -199,10 +221,13 @@ async fn open_private_route(
         close_generation,
         last_echo: Mutex::new(Instant::now()),
         probe_echo,
+        local_datagram_lane: core.local_datagram_lane,
     };
-    confirm_circuit_with_probe(&core.services, &owned.circuit, &owned.cookie)
-        .await
-        .then_some(owned)
+    if !confirm_circuit_with_probe(&core.services, &owned.circuit, &owned.cookie).await {
+        return None;
+    }
+    owned.prepare_datagram().await;
+    owned.is_live().then_some(owned)
 }
 
 /// The fallback pools are used only while a peer is older or a private route
