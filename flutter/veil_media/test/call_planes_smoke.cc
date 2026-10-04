@@ -16,6 +16,7 @@
 using Injector = int (*)(void*, uint64_t, uint32_t, uint32_t);
 extern "C" int veil_media_test_direct_call_planes(VeilMediaEngine*, Injector, void*);
 extern "C" int veil_media_test_blocked_audio_stats(VeilMediaEngine*, Injector, void*);
+extern "C" int veil_media_test_muted_capture_lifecycle();
 extern "C" int veil_media_test_group_call_planes(VeilGroupMediaEngine*, Injector, void*);
 extern "C" int veil_media_test_group_fanout_packet(VeilGroupMediaEngine*, int);
 extern "C" int veil_media_test_video_bandwidth(VeilMediaEngine*);
@@ -164,6 +165,12 @@ static void report(uint64_t chan, uint32_t reporter, uint32_t source,
   callback.fn(callback.ctx, packet.data(), packet.size());
 }
 int main() {
+  const int capture_result = veil_media_test_muted_capture_lifecycle();
+  if (capture_result != 0) {
+    std::fprintf(stderr, "muted capture lifecycle failed: %d\n", capture_result);
+    return 1;
+  }
+  std::fprintf(stderr, "direct/group: muted start/rebuild opens no capture; unmute encodes Opus\n");
   uint8_t local[32] = {1}, peer[32] = {2};
   for (int enabled : {0, 1}) {
     const uint64_t chan = 21 + enabled;
