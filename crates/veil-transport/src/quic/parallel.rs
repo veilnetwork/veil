@@ -13,6 +13,7 @@ const MAX_CONNECTIONS: usize = 8;
 struct Inner {
     endpoint: quinn::Endpoint,
     parent: quinn::Connection,
+    context: Arc<TransportContext>,
     peer: PeerMeta,
     accept: Mutex<()>,
     slots: Arc<Semaphore>,
@@ -31,11 +32,13 @@ impl QuicParallelHandle {
         endpoint: quinn::Endpoint,
         parent: quinn::Connection,
         peer: PeerMeta,
+        context: Arc<TransportContext>,
     ) -> Self {
         Self(Arc::new(Inner {
             endpoint,
             parent,
             peer,
+            context,
             accept: Mutex::new(()),
             slots: Arc::new(Semaphore::new(MAX_CONNECTIONS)),
         }))
@@ -75,10 +78,8 @@ impl QuicParallelHandle {
     /// Open a sibling to the parent's current remote UDP address without DNS
     /// discovery or a new local socket. The first stream is advertised lazily;
     /// send the authentication preface before awaiting the remote accept.
-    pub async fn connect(
-        &self,
-        ctx: Arc<TransportContext>,
-    ) -> Result<Box<dyn TransportConnection>> {
+    pub async fn connect(&self) -> Result<Box<dyn TransportConnection>> {
+        let ctx = Arc::clone(&self.0.context);
         let permit = self.reserve()?;
         let operation = async {
             let (host, _, sni, alpn) = quic_connect_parts(&self.0.peer.uri)?;
@@ -114,7 +115,8 @@ impl QuicParallelHandle {
     /// This address filter is not authentication: the session must verify the
     /// exporter-bound proof before dispatching any frame or installing keys.
     /// The timeout includes lock, handshake and first-stream waits.
-    pub async fn accept(&self, ctx: Arc<TransportContext>) -> Result<Box<dyn TransportConnection>> {
+    pub async fn accept(&self) -> Result<Box<dyn TransportConnection>> {
+        let ctx = Arc::clone(&self.0.context);
         let permit = self.reserve()?;
         let operation = async {
             let _accept = self.0.accept.lock().await;

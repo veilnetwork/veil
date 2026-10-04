@@ -8,7 +8,7 @@ use veil_transport::{
     quic::{PunchedQuicRole, promote_punched_quic},
 };
 
-async fn runner_channels_over_real_quic(flows: bool) {
+async fn runner_channels_over_real_quic(flows: bool, parallel: bool, rotate: bool) {
     let a_socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let b_socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let a_addr = a_socket.local_addr().unwrap();
@@ -18,15 +18,22 @@ async fn runner_channels_over_real_quic(flows: bool) {
     let b_task = tokio::spawn(async move {
         promote_punched_quic(b_socket, a_addr, b_context, PunchedQuicRole::Responder).await
     });
-    let a = promote_punched_quic(a_socket, b_addr, context, PunchedQuicRole::Initiator)
-        .await
-        .unwrap();
+    let a = promote_punched_quic(
+        a_socket,
+        b_addr,
+        Arc::clone(&context),
+        PunchedQuicRole::Initiator,
+    )
+    .await
+    .unwrap();
     let a_datagrams = a.quic_datagrams().unwrap();
+    let a_parallel = a.parallel_quic().unwrap();
     let mut a_stream = a.into_stream().unwrap();
     // Advertise the first bidi stream before waiting for accept_bi.
     a_stream.write_all(b"test").await.unwrap();
     let b = b_task.await.unwrap().unwrap();
     let b_datagrams = b.quic_datagrams().unwrap();
+    let b_parallel = b.parallel_quic().unwrap();
     let mut b_stream = b.into_stream().unwrap();
     let mut prelude = [0u8; 4];
     b_stream.read_exact(&mut prelude).await.unwrap();
@@ -35,26 +42,55 @@ async fn runner_channels_over_real_quic(flows: bool) {
     let mut receivers = Vec::new();
     let mut senders = Vec::new();
     let mut endpoints = Vec::new();
+    let mut diagnostics = Vec::new();
     let app_id = [0xa0; 32];
-    for (stream, datagrams, tx_key, rx_key) in [
-        (a_stream, a_datagrams, [1; 32], [2; 32]),
-        (b_stream, b_datagrams, [2; 32], [1; 32]),
-    ] {
+    for (direction, device) in [
+        (a_stream, a_datagrams, [1; 32], [2; 32], a_parallel),
+        (b_stream, b_datagrams, [2; 32], [1; 32], b_parallel),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let (stream, datagrams, tx_key, rx_key, handle) = device;
         let (_, dummy) = tokio::io::duplex(64);
         let (mut runner, _) = make_swap_runner(dummy);
         let dispatcher = Arc::new(make_test_dispatcher(NodeRole::Core));
         let (endpoint, receiver) = dispatcher.app_registry.register(app_id, 1, 64);
         endpoints.push(endpoint);
         let (out_tx, out_rx) = mpsc::channel::<PriorityFrame>(32);
-        runner.stream = stream;
+        runner.stream = if parallel && !rotate {
+            Box::new(StoppedStreamWriter {
+                stream,
+                attempted: Arc::new(tokio::sync::Notify::new()),
+            })
+        } else {
+            stream
+        };
+        let offer = ParallelQuicOffer::new(handle);
+        diagnostics.push(offer.diagnostics());
         runner.quic_datagrams = Some(RealtimeLaneOffer {
             handle: datagrams,
             peer_rotates: true,
             peer_flows: flows,
             peer_circuit_datagrams: false,
+            parallel: parallel.then_some(offer),
         });
         runner.session_id = [3; 32];
         runner.raw_session_keys = Some((tx_key, rx_key, [3; 32]));
+        if rotate {
+            runner.local_node_id = [direction as u8 + 1; 32];
+            runner.peer_id = [2 - direction as u8; 32];
+            runner.crypto.tx_cipher = Some(veil_crypto::session_cipher::SessionCipher::new(
+                &tx_key, true,
+            ));
+            runner.crypto.rx_cipher = Some(veil_crypto::session_cipher::SessionCipher::new(
+                &rx_key, true,
+            ));
+            // Only A initiates; B exercises the actual responder rekey arm.
+            if direction == 0 {
+                runner.rekey.time_threshold_secs = 1;
+            }
+        }
         runner.outbox = Some(out_rx.into());
         runner.ban_list = Arc::clone(&dispatcher.abuse.ban_list);
         runner.violation_tracker = Arc::clone(&dispatcher.abuse.violation_tracker);
@@ -68,7 +104,13 @@ async fn runner_channels_over_real_quic(flows: bool) {
         // Exercise BOTH queue selections and both directions through actual
         // SessionRunners, QUIC DATAGRAM I/O, frame parsing and app dispatch.
         for direction in 0..2 {
-            for seq in 0..16 {
+            for seq in 0..if rotate {
+                400
+            } else if parallel {
+                200
+            } else {
+                16
+            } {
                 let data = vec![seq as u8; if seq % 2 == 0 { 160 } else { 1500 }];
                 let payload = AppRtDataPayload {
                     src_app_id: [0xb0; 32],
@@ -85,7 +127,13 @@ async fn runner_channels_over_real_quic(flows: bool) {
                 header.body_len = body.len() as u32;
                 let mut frame = encode_header(&header).to_vec();
                 frame.extend(body);
-                let local_priority = if seq % 2 == 0 { 0 } else { 2 };
+                let local_priority = if parallel && seq % 7 == 0 {
+                    1
+                } else if seq % 2 == 0 {
+                    0
+                } else {
+                    2
+                };
                 senders[direction]
                     .send((local_priority, veil_bufpool::pooled_shared_from_vec(frame)))
                     .await
@@ -95,11 +143,26 @@ async fn runner_channels_over_real_quic(flows: bool) {
                         src_node_id,
                         payload,
                     } => {
-                        assert_eq!(src_node_id, [1; 32]);
+                        assert_eq!(
+                            src_node_id,
+                            [if rotate { direction as u8 + 1 } else { 1 }; 32]
+                        );
                         assert_eq!(payload.seq, seq);
                         assert_eq!(payload.payload, data);
                     }
                     other => panic!("unexpected dispatched message {other:?}"),
+                }
+                if parallel {
+                    // Keep a paced producer while TLS binding
+                    // warms, then prove frames used BOTH independent senders.
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                    if seq >= 16
+                        && diagnostics[direction].sent_this_generation(0) >= 8
+                        && diagnostics[direction].sent_this_generation(2) >= 8
+                        && (!rotate || diagnostics[direction].rekeys() >= 1)
+                    {
+                        break;
+                    }
                 }
             }
         }
@@ -110,6 +173,43 @@ async fn runner_channels_over_real_quic(flows: bool) {
         task.abort();
         let _ = task.await;
     }
+    if parallel {
+        for observations in &diagnostics {
+            assert!(
+                observations.sent(0) >= 8,
+                "primary must leave the shared connection"
+            );
+            assert!(
+                observations.sent(2) >= 8,
+                "secondary must use its own connection too"
+            );
+            assert_eq!(observations.sent(1), 0, "transit must remain neutral");
+            if rotate {
+                assert!(
+                    observations.rekeys() >= 1,
+                    "canonical rekey did not complete"
+                );
+                assert!(
+                    observations.sent_this_generation(0) >= 8,
+                    "primary did not rebind"
+                );
+                assert!(
+                    observations.sent_this_generation(2) >= 8,
+                    "secondary did not rebind"
+                );
+            }
+        }
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while diagnostics
+                .iter()
+                .any(|observations| observations.active_connections() != 0)
+            {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("child tasks/connections survived their session");
+    }
     assert!(
         result.is_ok(),
         "both local channels must deliver via QUIC datagrams"
@@ -118,12 +218,12 @@ async fn runner_channels_over_real_quic(flows: bool) {
 
 #[tokio::test]
 async fn opaque_channels_run_bidirectionally_over_real_quic() {
-    runner_channels_over_real_quic(true).await;
+    runner_channels_over_real_quic(true, false, false).await;
 }
 
 #[tokio::test]
 async fn legacy_datagram_lane_still_runs_bidirectionally_over_real_quic() {
-    runner_channels_over_real_quic(false).await;
+    runner_channels_over_real_quic(false, false, false).await;
 }
 
 /// Stop the primary writer after QUIC setup, retaining the same connection's
@@ -267,6 +367,7 @@ async fn runner_circuit_datagrams_over_real_quic(
             peer_rotates: true,
             peer_flows: true,
             peer_circuit_datagrams: negotiated,
+            parallel: None,
         });
         runner.session_id = [3; 32];
         runner.raw_session_keys = Some((tx_key, rx_key, [3; 32]));
@@ -338,4 +439,14 @@ async fn older_opaque_flow_peer_receives_circuit_cells_via_legacy_stream() {
 #[tokio::test]
 async fn circuit_cells_preserve_stream_only_transport_fallback() {
     runner_circuit_datagrams_over_real_quic(true, false, false).await;
+}
+
+#[tokio::test]
+async fn independent_parallel_senders_deliver_through_actual_runners_with_stopped_main_writers() {
+    runner_channels_over_real_quic(true, true, false).await;
+}
+
+#[tokio::test]
+async fn independent_parallel_senders_rebind_after_actual_canonical_rekey() {
+    runner_channels_over_real_quic(true, true, true).await;
 }

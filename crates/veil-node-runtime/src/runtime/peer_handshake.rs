@@ -92,6 +92,7 @@ pub struct RemoteHandshakeInfo {
     /// Negotiated opaque datagram channels, with no application-role labels.
     pub supports_datagram_flows: bool,
     pub supports_circuit_datagrams: bool,
+    pub supports_parallel_quic: bool,
     /// Bounded UDP reflector port advertised by this authenticated peer.
     /// The runtime combines it with transport metadata only after all session
     /// admission gates pass.
@@ -547,6 +548,7 @@ pub async fn register_connection_session(
     // its primary byte stream. Non-QUIC transports return None and preserve
     // the ordered-stream-only behavior exactly.
     let quic_datagrams = connection.quic_datagrams();
+    let parallel_quic = connection.parallel_quic();
     let mut stream = match connection.into_stream() {
         Ok(stream) => stream,
         Err(err) => {
@@ -857,6 +859,7 @@ pub async fn register_connection_session(
                         supports_circuit_datagrams: r
                             .remote_capabilities
                             .supports_circuit_datagrams(),
+                        supports_parallel_quic: r.remote_capabilities.supports_parallel_quic(),
                         sovereign_node_id,
                         udp_reflector_port,
                         shared_udp_reflectors,
@@ -1419,6 +1422,9 @@ pub async fn register_connection_session(
                 peer_rotates: remote_identity.supports_realtime_rekey,
                 peer_flows: remote_identity.supports_datagram_flows,
                 peer_circuit_datagrams: remote_identity.supports_circuit_datagrams,
+                parallel: parallel_quic
+                    .filter(|_| remote_identity.supports_parallel_quic)
+                    .map(veil_session::runner::ParallelQuicOffer::new),
             }),
         metrics: runtime.metrics.clone(),
         peer_id: remote_identity.node_id,
