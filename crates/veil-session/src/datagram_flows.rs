@@ -5,7 +5,10 @@
 //! Intermediaries receive no instruction to schedule one channel over another.
 //! All channels still share the negotiated QUIC connection's congestion budget.
 
-use std::{collections::HashMap, time::Instant};
+use std::{
+    collections::{HashMap, VecDeque},
+    time::Instant,
+};
 
 use rand::{RngCore, rngs::OsRng};
 use zeroize::Zeroizing;
@@ -18,6 +21,9 @@ use crate::realtime_datagram::{
 const MAGIC: [u8; 4] = *b"VDF1";
 const PREFIX_LEN: usize = 20;
 const MAX_FLOWS: usize = 16;
+// Endpoint-only lanes. Circuit handles occupy a disjoint namespace, so every
+// transit circuit gets the same bounded LRU treatment, without a media role.
+const LOCAL_LANES: [u64; 2] = [0, 2];
 const KDF_CONTEXT: &str = "veil/session/opaque-datagram-flow/v1";
 pub(crate) const MIN_FLOW_DATAGRAM_SIZE: usize = PREFIX_LEN + 41;
 /// A complete frame, including every permitted fragment's encryption/header
@@ -45,6 +51,7 @@ pub(crate) struct FlowDatagramTx {
     key: Zeroizing<[u8; 32]>,
     session: [u8; 32],
     flows: HashMap<u64, TxFlow>,
+    reusable: VecDeque<u64>,
 }
 
 impl FlowDatagramTx {
@@ -53,6 +60,7 @@ impl FlowDatagramTx {
             key: Zeroizing::new(*key),
             session: *session,
             flows: HashMap::new(),
+            reusable: VecDeque::new(),
         }
     }
 
@@ -69,25 +77,45 @@ impl FlowDatagramTx {
             .checked_sub(PREFIX_LEN)
             .filter(|size| *size >= 41)
             .ok_or(RealtimeDatagramError::DatagramTooSmall(ceiling))?;
+        let fragment_count = frame
+            .len()
+            .div_ceil(inner_ceiling - crate::realtime_datagram::FRAGMENT_OVERHEAD);
+        if fragment_count > crate::realtime_datagram::MAX_FRAGMENTS {
+            return Err(RealtimeDatagramError::TooManyFragments(fragment_count));
+        }
         if !self.flows.contains_key(&local_flow) {
-            if self.flows.len() >= MAX_FLOWS {
-                return Err(RealtimeDatagramError::FlowCapacity);
-            }
-            let mut id = [0u8; 16];
-            loop {
-                OsRng.fill_bytes(&mut id);
-                if id != [0; 16] && self.flows.values().all(|flow| flow.id != id) {
-                    break;
+            let absent_lanes = LOCAL_LANES
+                .iter()
+                .filter(|lane| **lane != local_flow && !self.flows.contains_key(*lane))
+                .count();
+            let flow = if self.flows.len() >= MAX_FLOWS - absent_lanes {
+                let oldest = self
+                    .reusable
+                    .pop_front()
+                    .expect("capacity includes reusable slots");
+                // Rebind the local handle, retaining the wire id, AEAD key and
+                // all message/nonce counters. Never allocate a seventeenth id
+                // or reset a nonce when a circuit ends or a slot is reused.
+                self.flows.remove(&oldest).expect("LRU slot exists")
+            } else {
+                let mut id = [0u8; 16];
+                loop {
+                    OsRng.fill_bytes(&mut id);
+                    if id != [0; 16] && self.flows.values().all(|flow| flow.id != id) {
+                        break;
+                    }
                 }
-            }
-            let key = flow_key(&self.key, &self.session, &id);
-            self.flows.insert(
-                local_flow,
+                let key = flow_key(&self.key, &self.session, &id);
                 TxFlow {
                     id,
                     codec: RealtimeDatagramTx::new(&key, &self.session),
-                },
-            );
+                }
+            };
+            self.flows.insert(local_flow, flow);
+        }
+        if !LOCAL_LANES.contains(&local_flow) {
+            self.reusable.retain(|key| *key != local_flow);
+            self.reusable.push_back(local_flow);
         }
         let flow = self
             .flows

@@ -300,6 +300,20 @@ fn decode_realtime_lane_frame(frame: &[u8]) -> Option<(FrameHeader, &[u8], Realt
     Some((header, body, kind))
 }
 
+/// Circuit bodies have already passed `decode_realtime_lane_frame`. Separate
+/// transit circuits' fragment/replay state while keeping every one in the same
+/// INTERACTIVE queue. The per-link circuit id is already known to this hop;
+/// only an authenticated random flow id appears in VDF1 on the wire.
+fn local_datagram_flow(priority: u8, body: &[u8], kind: RealtimeLaneFrameKind) -> u64 {
+    if priority == veil_proto::priority::INTERACTIVE
+        && kind == RealtimeLaneFrameKind::CircuitDatagram
+    {
+        (1u64 << 32) | u64::from(u32::from_be_bytes(body[..4].try_into().unwrap()))
+    } else {
+        u64::from(priority)
+    }
+}
+
 /// Stream fallback must be understood even by peers predating CircuitDatagram.
 fn circuit_datagram_stream_fallback(
     frame: veil_bufpool::PooledShared,
@@ -3835,10 +3849,10 @@ impl SessionRunner {
                         }) else {
                             break;
                         };
-                        let (_, _, lane_kind) = decode_realtime_lane_frame(&outgoing)
+                        let (_, body, lane_kind) = decode_realtime_lane_frame(&outgoing)
                             .expect("realtime queue predicate accepted this frame");
                         let datagrams = match lane.tx.encode_frame(
-                            u64::from(outgoing_priority),
+                            local_datagram_flow(outgoing_priority, body, lane_kind),
                             &outgoing,
                             lane.max_datagram_size,
                         ) {
@@ -5442,6 +5456,72 @@ mod realtime_lane_frame_tests {
                     .is_some()
             );
         }
+    }
+
+    #[test]
+    fn neutral_circuits_have_independent_replay_and_fragment_state() {
+        use veil_anonymity::{circuit_data::CircuitCellBytes, circuit_wire::CircuitDataPayload};
+        use veil_proto::{
+            family::RelayChainMsg,
+            priority::{BULK, INTERACTIVE, REALTIME},
+        };
+        let cell = |circuit_id, size| {
+            let body = CircuitDataPayload {
+                circuit_id,
+                seq: 7,
+                ciphertext: vec![0x81; size],
+            }
+            .encode(CircuitCellBytes::new(size).unwrap())
+            .unwrap();
+            let mut header = FrameHeader::new(
+                FrameFamily::RelayChain as u8,
+                RelayChainMsg::CircuitDatagram as u16,
+            );
+            header.set_priority(INTERACTIVE);
+            header.body_len = body.len() as u32;
+            let mut frame = encode_header(&header).to_vec();
+            frame.extend_from_slice(&body);
+            frame
+        };
+        let selected = |frame: &[u8], priority| {
+            let (header, body, kind) = decode_realtime_lane_frame(frame).unwrap();
+            assert_eq!(header.priority(), INTERACTIVE);
+            super::local_datagram_flow(priority, body, kind)
+        };
+        let delayed = cell(0, 1500);
+        let other = cell(u32::MAX, 1024);
+        assert_eq!(selected(&delayed, REALTIME), u64::from(REALTIME));
+        assert_eq!(selected(&other, BULK), u64::from(BULK));
+        let mut tx = crate::datagram_flows::SessionDatagramTx::new(&[7; 32], &[8; 32], true);
+        let mut rx = crate::datagram_flows::SessionDatagramRx::new(&[7; 32], &[8; 32], true);
+        let now = std::time::Instant::now();
+        let pending = tx
+            .encode_frame(selected(&delayed, INTERACTIVE), &delayed, 1200)
+            .unwrap();
+        assert_eq!(rx.decode_datagram(&pending[0], now).unwrap(), None);
+        // Same neutral scheduling class, well beyond a shared replay window
+        // and assembly quota. No local priority or application role is used.
+        for _ in 0..4096 {
+            let packets = tx
+                .encode_frame(selected(&other, INTERACTIVE), &other, 1200)
+                .unwrap();
+            assert_eq!(
+                rx.decode_datagram(&packets[0], now).unwrap(),
+                Some(other.clone())
+            );
+        }
+        for _ in 0..128 {
+            let frame = cell(u32::MAX, 1500);
+            let packets = tx
+                .encode_frame(selected(&frame, INTERACTIVE), &frame, 1200)
+                .unwrap();
+            assert_eq!(rx.decode_datagram(&packets[0], now).unwrap(), None);
+        }
+        assert_eq!(rx.decode_datagram(&pending[1], now).unwrap(), Some(delayed));
+        assert_eq!(
+            rx.decode_datagram(&pending[0], now),
+            Err(crate::realtime_datagram::RealtimeDatagramError::Replay)
+        );
     }
 
     #[test]
