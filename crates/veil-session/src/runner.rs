@@ -251,7 +251,7 @@ pub use parallel_lanes::{
     ParallelDiagnostics, ParallelPeekOutcome, ParallelQuicOffer, ParallelRegistry,
 };
 
-const LOCAL_BULK_BACKLOG_BYTES: usize = 4 * 1024;
+const LOCAL_DATAGRAM_BACKLOG_BYTES: usize = 4 * 1024;
 
 /// Leave room for a local latency-sensitive producer before admitting ordinary
 /// throughput traffic. The choice is process-local; forwarded user packets at
@@ -272,10 +272,21 @@ fn local_datagram_fits(priority: u8, wire_len: usize, available: usize) -> bool 
     // kilobytes already accepted by Quinn. Bound local throughput backlog to
     // 4 KiB, admitting one larger complete cell only when that queue is empty.
     // Relay user cells all use INTERACTIVE and never enter this endpoint rule.
+    local_datagram_backlog_fits(wire_len, available)
+}
+
+/// A prepared primary sibling carries only this endpoint source, so it need
+/// not preserve old shared-lane capacity for an already queued large cell.
+/// Keep its admitted backlog fresh rather than filling all 64 KiB with audio.
+fn local_primary_datagram_fits(wire_len: usize, available: usize) -> bool {
+    wire_len <= available && local_datagram_backlog_fits(wire_len, available)
+}
+
+fn local_datagram_backlog_fits(wire_len: usize, available: usize) -> bool {
     let queued = veil_transport::REALTIME_DATAGRAM_BUFFER_BYTES.saturating_sub(available);
     queued
         .checked_add(wire_len)
-        .is_some_and(|bytes| bytes <= wire_len.max(LOCAL_BULK_BACKLOG_BYTES))
+        .is_some_and(|bytes| bytes <= wire_len.max(LOCAL_DATAGRAM_BACKLOG_BYTES))
 }
 
 #[cfg(test)]
@@ -4080,14 +4091,17 @@ impl SessionRunner {
                             }
                         };
                         let planned_wire_len = datagrams.iter().map(Vec::len).sum::<usize>();
-                        if !local_datagram_fits(
-                            outgoing_priority,
-                            planned_wire_len,
-                            lane.handle.send_buffer_space(),
-                        ) {
+                        let available = lane.handle.send_buffer_space();
+                        let primary_fits = outgoing_priority != veil_proto::priority::REALTIME
+                            || !using_parallel
+                            || local_primary_datagram_fits(planned_wire_len, available);
+                        if !primary_fits
+                            || !local_datagram_fits(outgoing_priority, planned_wire_len, available)
+                        {
                             // Admit complete frames only. Local bulk bounds
                             // backlog and reserves a complete primary frame;
-                            // relayed cells use neutral capacity admission. Drop this
+                            // independent primary also bounds its own backlog.
+                            // Relayed cells use neutral capacity admission. Drop this
                             // loss-tolerant cell before sending any fragments.
                             datagram_drained += 1;
                             continue;
@@ -5520,6 +5534,24 @@ mod realtime_lane_frame_tests {
             usize::MAX - 1
         ));
     }
+    #[test]
+    fn independent_primary_admission_bounds_stale_audio() {
+        let capacity = veil_transport::REALTIME_DATAGRAM_BUFFER_BYTES;
+        let maximum = crate::datagram_flows::MAX_FRAME_WIRE_BYTES;
+        assert!(super::local_primary_datagram_fits(200, capacity - 3896));
+        assert!(!super::local_primary_datagram_fits(200, capacity - 3897));
+        assert!(super::local_primary_datagram_fits(maximum, capacity));
+        assert!(!super::local_primary_datagram_fits(maximum, capacity - 1));
+        assert!(!super::local_primary_datagram_fits(capacity + 1, capacity));
+        // Shared/legacy paths still admit a complete primary behind a large
+        // secondary cell; that compatibility reserve must not be narrowed.
+        assert!(super::local_datagram_fits(
+            veil_proto::priority::REALTIME,
+            maximum,
+            capacity - maximum,
+        ));
+    }
+
     #[tokio::test]
     async fn local_bulk_pressure_leaves_a_complete_primary_frame_in_quic() {
         use std::{
