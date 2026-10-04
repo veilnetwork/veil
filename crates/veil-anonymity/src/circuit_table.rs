@@ -68,6 +68,10 @@ type Link = [u8; 32];
 /// One relay's view of a circuit passing through it.
 #[derive(Debug)]
 pub struct CircuitState {
+    /// Weak transport observations belong to this circuit incarnation. They
+    /// cannot keep a session alive or leak into a reused circuit id.
+    forward_carrier: Mutex<ObservedCarrier>,
+    backward_carrier: Mutex<ObservedCarrier>,
     /// Cached symmetric key for this hop's data-cell layer (b3).
     pub circuit_key: [u8; CIRCUIT_KEY_LEN],
     /// Neighbour the FORWARD cell arrived from / RETURN cell is sent to.
@@ -107,6 +111,12 @@ pub struct CircuitState {
     last_served_unix: AtomicU64,
 }
 
+#[derive(Debug, Default)]
+struct ObservedCarrier {
+    sequence: u32,
+    carrier: Option<crate::circuit_carrier::Carrier>,
+}
+
 impl Drop for CircuitState {
     fn drop(&mut self) {
         // diff-audit Δ2-j: scrub the per-circuit symmetric key on drop so it does
@@ -117,6 +127,40 @@ impl Drop for CircuitState {
 }
 
 impl CircuitState {
+    /// Call only after exact cell-size and replay admission. Out-of-order
+    /// packets cannot overwrite a newer route, and reliable control cells do
+    /// not reset this datagram observation.
+    pub fn observe_carrier(
+        &self,
+        forward: bool,
+        sequence: u32,
+        carrier: Option<&crate::circuit_carrier::Carrier>,
+    ) {
+        let slot = if forward {
+            &self.forward_carrier
+        } else {
+            &self.backward_carrier
+        };
+        let mut observed = slot.lock().unwrap_or_else(|e| e.into_inner());
+        if sequence > observed.sequence {
+            observed.sequence = sequence;
+            observed.carrier = carrier.cloned();
+        }
+    }
+
+    /// FORWARD destinations use the last admitted BACKWARD carrier and vice
+    /// versa. The weak reference is revalidated by the owning session at send.
+    pub fn destination_carrier(&self, forward: bool) -> Option<crate::circuit_carrier::Carrier> {
+        let slot = if forward {
+            &self.backward_carrier
+        } else {
+            &self.forward_carrier
+        };
+        slot.lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .carrier
+            .clone()
+    }
     fn from_install(
         install: &CircuitInstall,
         prev_link: Link,
@@ -124,6 +168,8 @@ impl CircuitState {
         now: u64,
     ) -> Self {
         Self {
+            forward_carrier: Mutex::default(),
+            backward_carrier: Mutex::default(),
             circuit_key: install.circuit_key,
             prev_link,
             circuit_id_in: install.circuit_id_in,
@@ -574,6 +620,66 @@ mod tests {
             t.len(),
             6,
             "len stays the total, the two answer differently"
+        );
+    }
+
+    struct TestCarrier;
+    impl crate::circuit_carrier::DatagramCarrier for TestCarrier {
+        fn try_send(
+            &self,
+            _: &[u8; 32],
+            _: &[u8],
+            _: &mut dyn FnMut(usize) -> bool,
+        ) -> crate::circuit_carrier::CarrierSend {
+            panic!("learning a route must not send traffic")
+        }
+    }
+
+    #[test]
+    fn carriers_follow_admitted_sequence_direction_and_circuit_incarnation() {
+        use std::sync::{Arc, Weak};
+        let t = CircuitTable::new();
+        let prev = [1; 32];
+        let next = [2; 32];
+        let state = t
+            .install(&inst(10, 11, 0xAA), prev, Some(next), 1000)
+            .unwrap();
+        let a: Arc<dyn crate::circuit_carrier::DatagramCarrier> = Arc::new(TestCarrier);
+        let b: Arc<dyn crate::circuit_carrier::DatagramCarrier> = Arc::new(TestCarrier);
+        let a_weak = Arc::downgrade(&a);
+        let b_weak = Arc::downgrade(&b);
+        state.observe_carrier(true, 10, Some(&a_weak));
+        state.observe_carrier(true, 9, Some(&b_weak));
+        state.observe_carrier(true, 10, None);
+        assert!(Weak::ptr_eq(
+            &state.destination_carrier(false).unwrap(),
+            &a_weak
+        ));
+        assert!(state.destination_carrier(true).is_none());
+        state.observe_carrier(false, 1, Some(&b_weak));
+        assert!(Weak::ptr_eq(
+            &state.destination_carrier(true).unwrap(),
+            &b_weak
+        ));
+        state.observe_carrier(true, 11, None);
+        assert!(
+            state.destination_carrier(false).is_none(),
+            "a newer canonical datagram resets the route"
+        );
+        state.observe_carrier(true, 12, Some(&a_weak));
+        t.remove(&prev, 10);
+        let replacement = t
+            .install(&inst(10, 11, 0xBB), prev, Some(next), 1001)
+            .unwrap();
+        assert!(replacement.destination_carrier(false).is_none());
+        assert!(replacement.destination_carrier(true).is_none());
+        drop(a);
+        assert!(
+            state
+                .destination_carrier(false)
+                .unwrap()
+                .upgrade()
+                .is_none()
         );
     }
 

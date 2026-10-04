@@ -12,14 +12,70 @@ use crate::PriorityFrame;
 pub const RESERVED_QUEUE_DEPTH: usize = 64;
 const MAX_RESERVED_BURST: usize = 8;
 
+/// Local transport metadata follows a frame through the ordinary queue. It
+/// never changes the wire header, priority, FIFO position or queue budget.
+#[derive(Debug)]
+pub struct FrameEnvelope {
+    pub frame: PriorityFrame,
+    pub carrier: Option<veil_anonymity::circuit_carrier::Carrier>,
+}
+
+impl From<PriorityFrame> for FrameEnvelope {
+    fn from(frame: PriorityFrame) -> Self {
+        Self {
+            frame,
+            carrier: None,
+        }
+    }
+}
+
+#[derive(Debug)]
+enum EnvelopeReceiver {
+    Live(mpsc::Receiver<FrameEnvelope>),
+    Legacy(mpsc::Receiver<PriorityFrame>),
+}
+
+impl EnvelopeReceiver {
+    fn len(&self) -> usize {
+        match self {
+            Self::Live(rx) => rx.len(),
+            Self::Legacy(rx) => rx.len(),
+        }
+    }
+    fn is_closed(&self) -> bool {
+        match self {
+            Self::Live(rx) => rx.is_closed(),
+            Self::Legacy(rx) => rx.is_closed(),
+        }
+    }
+    fn close(&mut self) {
+        match self {
+            Self::Live(rx) => rx.close(),
+            Self::Legacy(rx) => rx.close(),
+        }
+    }
+    fn poll_recv(&mut self, cx: &mut Context<'_>) -> Poll<Option<FrameEnvelope>> {
+        match self {
+            Self::Live(rx) => rx.poll_recv(cx),
+            Self::Legacy(rx) => rx.poll_recv(cx).map(|frame| frame.map(FrameEnvelope::from)),
+        }
+    }
+    fn try_recv(&mut self) -> Result<FrameEnvelope, mpsc::error::TryRecvError> {
+        match self {
+            Self::Live(rx) => rx.try_recv(),
+            Self::Legacy(rx) => rx.try_recv().map(FrameEnvelope::from),
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct FrameSender {
-    ordinary: mpsc::Sender<PriorityFrame>,
-    reserved: mpsc::Sender<PriorityFrame>,
+    ordinary: mpsc::Sender<FrameEnvelope>,
+    reserved: mpsc::Sender<FrameEnvelope>,
 }
 
 impl FrameSender {
-    fn lane(&self, frame: &PriorityFrame) -> &mpsc::Sender<PriorityFrame> {
+    fn lane(&self, frame: &PriorityFrame) -> &mpsc::Sender<FrameEnvelope> {
         if frame.0 == veil_proto::priority::REALTIME {
             &self.reserved
         } else {
@@ -31,14 +87,39 @@ impl FrameSender {
         &self,
         frame: PriorityFrame,
     ) -> Result<(), mpsc::error::TrySendError<PriorityFrame>> {
-        self.lane(&frame).try_send(frame)
+        self.lane(&frame)
+            .try_send(frame.into())
+            .map_err(|error| match error {
+                mpsc::error::TrySendError::Full(envelope) => {
+                    mpsc::error::TrySendError::Full(envelope.frame)
+                }
+                mpsc::error::TrySendError::Closed(envelope) => {
+                    mpsc::error::TrySendError::Closed(envelope.frame)
+                }
+            })
     }
 
     pub async fn send(
         &self,
         frame: PriorityFrame,
     ) -> Result<(), mpsc::error::SendError<PriorityFrame>> {
-        self.lane(&frame).send(frame).await
+        self.lane(&frame)
+            .send(frame.into())
+            .await
+            .map_err(|error| mpsc::error::SendError(error.0.frame))
+    }
+
+    /// A return carrier always uses the ordinary neutral FIFO; callers cannot
+    /// promote a routed cell by tagging its wire header or source queue.
+    pub(crate) fn try_send_on_carrier(
+        &self,
+        bytes: veil_bufpool::PooledShared,
+        carrier: veil_anonymity::circuit_carrier::Carrier,
+    ) -> Result<(), mpsc::error::TrySendError<FrameEnvelope>> {
+        self.ordinary.try_send(FrameEnvelope {
+            frame: (veil_proto::priority::INTERACTIVE, bytes),
+            carrier: Some(carrier),
+        })
     }
 
     pub fn is_closed(&self) -> bool {
@@ -60,8 +141,8 @@ impl FrameSender {
 
 #[derive(Debug)]
 pub struct FrameOutbox {
-    ordinary: mpsc::Receiver<PriorityFrame>,
-    reserved: Option<mpsc::Receiver<PriorityFrame>>,
+    ordinary: EnvelopeReceiver,
+    reserved: Option<EnvelopeReceiver>,
     reserved_burst: usize,
 }
 
@@ -75,8 +156,8 @@ pub fn frame_channel(capacity: usize) -> (FrameSender, FrameOutbox) {
             reserved: reserved_tx,
         },
         FrameOutbox {
-            ordinary,
-            reserved: Some(reserved),
+            ordinary: EnvelopeReceiver::Live(ordinary),
+            reserved: Some(EnvelopeReceiver::Live(reserved)),
             reserved_burst: 0,
         },
     )
@@ -86,7 +167,7 @@ pub fn frame_channel(capacity: usize) -> (FrameSender, FrameOutbox) {
 impl From<mpsc::Receiver<PriorityFrame>> for FrameOutbox {
     fn from(ordinary: mpsc::Receiver<PriorityFrame>) -> Self {
         Self {
-            ordinary,
+            ordinary: EnvelopeReceiver::Legacy(ordinary),
             reserved: None,
             reserved_burst: 0,
         }
@@ -95,10 +176,22 @@ impl From<mpsc::Receiver<PriorityFrame>> for FrameOutbox {
 
 impl FrameOutbox {
     pub async fn recv(&mut self) -> Option<PriorityFrame> {
-        std::future::poll_fn(|cx| self.poll_recv(cx)).await
+        self.recv_envelope().await.map(|envelope| envelope.frame)
     }
 
     pub fn poll_recv(&mut self, cx: &mut Context<'_>) -> Poll<Option<PriorityFrame>> {
+        self.poll_recv_envelope(cx)
+            .map(|frame| frame.map(|envelope| envelope.frame))
+    }
+
+    pub(crate) async fn recv_envelope(&mut self) -> Option<FrameEnvelope> {
+        std::future::poll_fn(|cx| self.poll_recv_envelope(cx)).await
+    }
+
+    pub(crate) fn poll_recv_envelope(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<FrameEnvelope>> {
         let Some(reserved) = self.reserved.as_mut() else {
             return self.ordinary.poll_recv(cx);
         };
@@ -134,6 +227,10 @@ impl FrameOutbox {
     }
 
     pub fn try_recv(&mut self) -> Result<PriorityFrame, mpsc::error::TryRecvError> {
+        self.try_recv_envelope().map(|envelope| envelope.frame)
+    }
+
+    pub(crate) fn try_recv_envelope(&mut self) -> Result<FrameEnvelope, mpsc::error::TryRecvError> {
         let Some(reserved) = self.reserved.as_mut() else {
             return self.ordinary.try_recv();
         };
@@ -171,7 +268,7 @@ impl FrameOutbox {
     }
 
     pub fn len(&self) -> usize {
-        self.ordinary.len() + self.reserved.as_ref().map_or(0, mpsc::Receiver::len)
+        self.ordinary.len() + self.reserved.as_ref().map_or(0, EnvelopeReceiver::len)
     }
 
     pub fn is_empty(&self) -> bool {
@@ -179,7 +276,11 @@ impl FrameOutbox {
     }
 
     pub fn is_closed(&self) -> bool {
-        self.ordinary.is_closed() && self.reserved.as_ref().is_none_or(mpsc::Receiver::is_closed)
+        self.ordinary.is_closed()
+            && self
+                .reserved
+                .as_ref()
+                .is_none_or(EnvelopeReceiver::is_closed)
     }
 
     pub fn close(&mut self) {
@@ -197,6 +298,58 @@ mod tests {
 
     fn frame(priority: u8, byte: u8) -> PriorityFrame {
         (priority, veil_bufpool::pooled_shared_from_vec(vec![byte]))
+    }
+
+    struct NoDirectSend;
+    impl veil_anonymity::circuit_carrier::DatagramCarrier for NoDirectSend {
+        fn try_send(
+            &self,
+            _: &[u8; 32],
+            _: &[u8],
+            _: &mut dyn FnMut(usize) -> bool,
+        ) -> veil_anonymity::circuit_carrier::CarrierSend {
+            panic!("queue admission must never transmit directly")
+        }
+    }
+
+    #[tokio::test]
+    async fn carrier_uses_ordinary_capacity_and_cannot_overtake_reliable_data() {
+        let carrier: std::sync::Arc<dyn veil_anonymity::circuit_carrier::DatagramCarrier> =
+            std::sync::Arc::new(NoDirectSend);
+        let weak = std::sync::Arc::downgrade(&carrier);
+        let (tx, mut rx) = frame_channel(1);
+        tx.try_send(frame(INTERACTIVE, 1)).unwrap();
+        assert!(matches!(
+            tx.try_send_on_carrier(frame(REALTIME, 2).1, weak.clone()),
+            Err(mpsc::error::TrySendError::Full(_))
+        ));
+        // The reserved capacity still exists; a carrier cannot spend it.
+        assert_eq!(tx.capacity(), 1);
+        let mut pq = crate::priority_queue::PriorityQueue::with_default_weights();
+        pq.push_envelope(rx.recv_envelope().await.unwrap(), false);
+        tx.try_send_on_carrier(frame(REALTIME, 2).1, weak.clone())
+            .unwrap();
+        let routed = rx.recv_envelope().await.unwrap();
+        assert_eq!(routed.frame.0, INTERACTIVE);
+        assert!(std::sync::Weak::ptr_eq(
+            routed.carrier.as_ref().unwrap(),
+            &weak
+        ));
+        pq.push_envelope(routed, true);
+        assert!(pq.pop_datagram_envelope_if(|bytes| bytes == [2]).is_none());
+        assert_eq!(&*pq.pop().unwrap(), &[1]);
+        let routed = pq.pop_datagram_envelope_if(|bytes| bytes == [2]).unwrap();
+        assert_eq!(routed.frame.0, INTERACTIVE);
+        assert_eq!(&*routed.frame.1, &[2]);
+        assert!(std::sync::Weak::ptr_eq(
+            routed.carrier.as_ref().unwrap(),
+            &weak
+        ));
+        drop(carrier);
+        assert!(
+            routed.carrier.unwrap().upgrade().is_none(),
+            "queued routes must not retain transports"
+        );
     }
 
     #[tokio::test]

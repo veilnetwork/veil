@@ -186,6 +186,16 @@ impl FrameDispatcher {
         body: &[u8],
         node_id: NodeId,
     ) -> DispatchResult {
+        self.dispatch_relay_chain_with_carrier(header, body, node_id, None)
+    }
+
+    pub(crate) fn dispatch_relay_chain_with_carrier(
+        &self,
+        header: &FrameHeader,
+        body: &[u8],
+        node_id: NodeId,
+        carrier: Option<&veil_anonymity::circuit_carrier::Carrier>,
+    ) -> DispatchResult {
         // Format checks first (cheap, leak-free). Crypto-key check
         // last (its outcome is the one that could leak relay-capability
         // to a sender probe).
@@ -220,7 +230,7 @@ impl FrameDispatcher {
             // the Hop cell-size check below.
             RelayChainMsg::CircuitBuild => return self.handle_circuit_build(body, node_id),
             RelayChainMsg::CircuitData | RelayChainMsg::CircuitDatagram => {
-                return self.handle_circuit_data(body, node_id, msg);
+                return self.handle_circuit_data(body, node_id, msg, carrier);
             }
             RelayChainMsg::CircuitTeardown => return self.handle_circuit_teardown(body, node_id),
             RelayChainMsg::CircuitBuilt => return self.handle_circuit_built(body, node_id),
@@ -1167,6 +1177,7 @@ impl FrameDispatcher {
         body: &[u8],
         node_id: NodeId,
         transport: RelayChainMsg,
+        carrier: Option<&veil_anonymity::circuit_carrier::Carrier>,
     ) -> DispatchResult {
         use veil_anonymity::circuit_data::{Direction, apply_layer, read_payload};
         use veil_anonymity::circuit_register::COOKIE_LEN;
@@ -1232,6 +1243,9 @@ impl FrameDispatcher {
                     );
                     return DispatchResult::NoResponse; // replay / too-old
                 }
+                if transport == RelayChainMsg::CircuitDatagram {
+                    state.observe_carrier(true, cell.seq, carrier);
+                }
                 state.touch(now);
                 let mut buf = cell.ciphertext.clone();
                 apply_layer(&state.circuit_key, Direction::Forward, cell.seq, &mut buf);
@@ -1255,7 +1269,12 @@ impl FrameDispatcher {
                                 crate::service_budget::ServiceKind::RelayCircuit,
                                 b.len() as u64,
                             );
-                            let sent = self.send_relay_chain_msg(&NodeId::from(nl), transport, &b);
+                            let sent = self.send_relay_chain_msg_on_carrier(
+                                &NodeId::from(nl),
+                                transport,
+                                &b,
+                                state.destination_carrier(true),
+                            );
                             circuit_data_diag(|d| {
                                 if sent {
                                     d.fwd_relay_ok = d.fwd_relay_ok.saturating_add(1);
@@ -1380,6 +1399,9 @@ impl FrameDispatcher {
                     );
                     return DispatchResult::NoResponse;
                 }
+                if transport == RelayChainMsg::CircuitDatagram {
+                    state.observe_carrier(false, cell.seq, carrier);
+                }
                 state.touch(now);
                 let mut buf = cell.ciphertext.clone();
                 apply_layer(&state.circuit_key, Direction::Return, cell.seq, &mut buf);
@@ -1402,8 +1424,12 @@ impl FrameDispatcher {
                         crate::service_budget::ServiceKind::RelayCircuit,
                         b.len() as u64,
                     );
-                    let sent =
-                        self.send_relay_chain_msg(&NodeId::from(state.prev_link), transport, &b);
+                    let sent = self.send_relay_chain_msg_on_carrier(
+                        &NodeId::from(state.prev_link),
+                        transport,
+                        &b,
+                        state.destination_carrier(false),
+                    );
                     circuit_data_diag(|d| {
                         if sent {
                             d.ret_relay_ok = d.ret_relay_ok.saturating_add(1);
@@ -1876,8 +1902,12 @@ impl FrameDispatcher {
             ciphertext: buf,
         };
         if let Ok(body) = cell.encode(circuit.cell_bytes) {
-            let sent =
-                self.send_relay_chain_msg(&NodeId::from(circuit.prev_link), transport, &body);
+            let sent = self.send_relay_chain_msg_on_carrier(
+                &NodeId::from(circuit.prev_link),
+                transport,
+                &body,
+                circuit.destination_carrier(false),
+            );
             circuit_data_diag(|d| {
                 if sent {
                     d.splice_ok = d.splice_ok.saturating_add(1);
@@ -1896,6 +1926,16 @@ impl FrameDispatcher {
     /// state machine for receiver↔rendezvous control frames AND
     /// for forwarding cells / introduces.
     fn send_relay_chain_msg(&self, node_id: &NodeId, msg: RelayChainMsg, body: &[u8]) -> bool {
+        self.send_relay_chain_msg_on_carrier(node_id, msg, body, None)
+    }
+
+    fn send_relay_chain_msg_on_carrier(
+        &self,
+        node_id: &NodeId,
+        msg: RelayChainMsg,
+        body: &[u8],
+        carrier: Option<veil_anonymity::circuit_carrier::Carrier>,
+    ) -> bool {
         use veil_proto::codec::encode_header;
         let Some(ref reg) = self.session_tx_registry else {
             self.logger.info(
@@ -1910,9 +1950,21 @@ impl FrameDispatcher {
         let mut frame = encode_header(&hdr).to_vec();
         frame.extend_from_slice(body);
         let guard = wlock!(reg);
-        if let Err(err) =
+        let sent = if msg == RelayChainMsg::CircuitDatagram {
+            match carrier {
+                Some(carrier) => {
+                    guard.send_to_on_carrier_result(node_id.as_bytes(), frame, carrier)
+                }
+                None => guard.send_to_result(
+                    node_id.as_bytes(),
+                    veil_proto::priority::INTERACTIVE,
+                    frame,
+                ),
+            }
+        } else {
             guard.send_to_result(node_id.as_bytes(), veil_proto::priority::INTERACTIVE, frame)
-        {
+        };
+        if let Err(err) = sent {
             circuit_data_diag(|d| match err {
                 veil_session::SendToError::Missing => {
                     d.send_missing = d.send_missing.saturating_add(1);
@@ -2438,6 +2490,140 @@ mod tests {
     #[test]
     fn circuit_datagrams_retag_both_ways_with_equal_scheduling_and_cost() {
         a_relayed_cell_is_billed_with_transport(RelayChainMsg::CircuitDatagram);
+    }
+
+    #[test]
+    fn relay_carrier_is_learned_only_after_known_cell_and_replay_admission() {
+        use std::sync::{Arc, Weak};
+        use veil_anonymity::circuit_carrier::{CarrierSend, DatagramCarrier};
+        use veil_anonymity::{
+            circuit_data::CircuitCellBytes, circuit_setup::CircuitInstall,
+            circuit_table::CircuitTable, circuit_wire::CircuitDataPayload,
+        };
+        struct QueueOnly;
+        impl DatagramCarrier for QueueOnly {
+            fn try_send(
+                &self,
+                _: &[u8; 32],
+                _: &[u8],
+                _: &mut dyn FnMut(usize) -> bool,
+            ) -> CarrierSend {
+                panic!("dispatch must enqueue into the ordinary FIFO")
+            }
+        }
+        let mut d = crate::make_test_dispatcher(veil_cfg::NodeRole::Core);
+        let table = Arc::new(CircuitTable::new());
+        let cell_bytes = CircuitCellBytes::new(4096).unwrap();
+        let prev = [0xAA; 32];
+        let next = [0xBB; 32];
+        let state = table
+            .install(
+                &CircuitInstall {
+                    circuit_id_in: 42,
+                    circuit_id_out: 43,
+                    circuit_key: [7; 32],
+                    cell_bytes,
+                },
+                prev,
+                Some(next),
+                0,
+            )
+            .unwrap();
+        d.circuit_table = Some(table);
+        let mut tx_registry = veil_session::SessionTxRegistry::new();
+        let mut next_rx = tx_registry.register(next);
+        let mut prev_rx = tx_registry.register(prev);
+        d.session_tx_registry = Some(Arc::new(std::sync::RwLock::new(tx_registry)));
+        let a: Arc<dyn DatagramCarrier> = Arc::new(QueueOnly);
+        let b: Arc<dyn DatagramCarrier> = Arc::new(QueueOnly);
+        let a_weak = Arc::downgrade(&a);
+        let b_weak = Arc::downgrade(&b);
+        let dispatch = |cid, seq, size, msg, peer, carrier| {
+            let body = CircuitDataPayload {
+                circuit_id: cid,
+                seq,
+                ciphertext: vec![0; size],
+            }
+            .encode(CircuitCellBytes::new(size).unwrap())
+            .unwrap();
+            let mut header = FrameHeader::new(FrameFamily::RelayChain as u8, msg as u16);
+            header.body_len = body.len() as u32;
+            d.dispatch_relay_chain_with_carrier(&header, &body, NodeId::from(peer), carrier)
+        };
+        dispatch(
+            42,
+            10,
+            4096,
+            RelayChainMsg::CircuitDatagram,
+            prev,
+            Some(&a_weak),
+        );
+        assert!(Weak::ptr_eq(
+            &state.destination_carrier(false).unwrap(),
+            &a_weak
+        ));
+        dispatch(
+            42,
+            10,
+            4096,
+            RelayChainMsg::CircuitDatagram,
+            prev,
+            Some(&b_weak),
+        ); // replay
+        dispatch(
+            42,
+            11,
+            2048,
+            RelayChainMsg::CircuitDatagram,
+            prev,
+            Some(&b_weak),
+        ); // wrong size
+        dispatch(
+            999,
+            11,
+            4096,
+            RelayChainMsg::CircuitDatagram,
+            prev,
+            Some(&b_weak),
+        ); // unknown
+        dispatch(
+            42,
+            9,
+            4096,
+            RelayChainMsg::CircuitDatagram,
+            prev,
+            Some(&b_weak),
+        ); // admitted, older
+        dispatch(42, 12, 4096, RelayChainMsg::CircuitData, prev, None); // control must not erase
+        assert!(Weak::ptr_eq(
+            &state.destination_carrier(false).unwrap(),
+            &a_weak
+        ));
+        dispatch(
+            43,
+            1,
+            4096,
+            RelayChainMsg::CircuitDatagram,
+            next,
+            Some(&b_weak),
+        );
+        assert!(Weak::ptr_eq(
+            &state.destination_carrier(true).unwrap(),
+            &b_weak
+        ));
+        // Forwarded cells are queued, with the same neutral wire/queue class
+        // even when a weak ingress route exists. No callback ran above.
+        let returned = prev_rx.try_recv().unwrap();
+        assert_eq!(returned.0, veil_proto::priority::INTERACTIVE);
+        assert_eq!(
+            veil_proto::codec::decode_header(&returned.1)
+                .unwrap()
+                .priority(),
+            veil_proto::priority::INTERACTIVE
+        );
+        assert!(next_rx.try_recv().is_ok());
+        dispatch(42, 13, 4096, RelayChainMsg::CircuitDatagram, prev, None);
+        assert!(state.destination_carrier(false).is_none());
     }
 
     fn a_relayed_cell_is_billed_with_transport(transport: RelayChainMsg) {

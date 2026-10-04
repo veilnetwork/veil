@@ -1276,6 +1276,7 @@ where
     caps.extra_flags |= veil_proto::session::cap_extra_flags::SUPPORTS_CIRCUIT_DATAGRAMS;
     caps.extra_flags |= veil_proto::session::cap_extra_flags::SUPPORTS_PARALLEL_QUIC;
     caps.extra_flags |= veil_proto::session::cap_extra_flags::SUPPORTS_SHARED_PARALLEL_QUIC;
+    caps.extra_flags |= veil_proto::session::cap_extra_flags::SUPPORTS_DUPLEX_PARALLEL_QUIC;
     let caps_bytes = caps.encode();
     let caps_wire =
         write_frame(stream, family, SessionMsg::Capabilities as u16, &caps_bytes).await?;

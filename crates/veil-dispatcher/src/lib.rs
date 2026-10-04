@@ -1669,6 +1669,16 @@ impl FrameDispatcher {
         body: &[u8],
         peer_id: impl Into<NodeId>,
     ) -> DispatchResult {
+        self.dispatch_with_carrier(header, body, peer_id, None)
+    }
+
+    pub fn dispatch_with_carrier(
+        &self,
+        header: &FrameHeader,
+        body: &[u8],
+        peer_id: impl Into<NodeId>,
+        carrier: Option<veil_anonymity::circuit_carrier::Carrier>,
+    ) -> DispatchResult {
         // Anchor for `BAN_DROP_PAD` (see const docstring) — measured at
         // the same entry point as non-banned frames so the constant-time
         // pad covers the full dispatch envelope, not just the tail after
@@ -1782,7 +1792,7 @@ impl FrameDispatcher {
                 // ChaCha20-Poly1305 + AAD-bound) and forwards or accepts
                 // depending on the next-hop sentinel. See
                 // `node/dispatcher/anonymity.rs` for full flow.
-                self.dispatch_relay_chain(header, body, peer_id)
+                self.dispatch_relay_chain_with_carrier(header, body, peer_id, carrier.as_ref())
             }
             FrameFamily::PeerExchange => {
                 if let Some(ref pex) = self.pex_dispatcher {

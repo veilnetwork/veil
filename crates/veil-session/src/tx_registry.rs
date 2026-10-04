@@ -519,12 +519,51 @@ impl SessionTxRegistry {
         priority: u8,
         frame: veil_bufpool::PooledShared,
     ) -> Result<(), SendToError> {
+        self.send_to_arc_with_carrier(peer_id, priority, frame, None)
+    }
+
+    /// A circuit return transport is local metadata in the SAME neutral FIFO.
+    /// It cannot reserve source ingress, change priority or bypass its budget.
+    pub fn send_to_on_carrier_result(
+        &self,
+        peer_id: &NodeIdBytes,
+        frame: Vec<u8>,
+        carrier: veil_anonymity::circuit_carrier::Carrier,
+    ) -> Result<(), SendToError> {
+        self.send_to_arc_with_carrier(
+            peer_id,
+            INTERACTIVE,
+            veil_bufpool::pooled_shared_from_vec(frame),
+            Some(carrier),
+        )
+    }
+
+    fn send_to_arc_with_carrier(
+        &self,
+        peer_id: &NodeIdBytes,
+        priority: u8,
+        frame: veil_bufpool::PooledShared,
+        carrier: Option<veil_anonymity::circuit_carrier::Carrier>,
+    ) -> Result<(), SendToError> {
         crate::frame_diag::note_outbound(peer_id, &frame, "tx_registry");
         let tx = match self.senders.get(peer_id) {
             Some(entry) => &entry.tx,
             None => return Err(SendToError::Missing),
         };
-        match tx.try_send((priority, frame)) {
+        let queued = match carrier {
+            Some(carrier) => tx
+                .try_send_on_carrier(frame, carrier)
+                .map_err(|error| match error {
+                    mpsc::error::TrySendError::Full(envelope) => {
+                        mpsc::error::TrySendError::Full(envelope.frame)
+                    }
+                    mpsc::error::TrySendError::Closed(envelope) => {
+                        mpsc::error::TrySendError::Closed(envelope.frame)
+                    }
+                }),
+            None => tx.try_send((priority, frame)),
+        };
+        match queued {
             Ok(_) => {
                 if let Some(ts) = self.last_active.get(peer_id) {
                     ts.store(now_ms(), Ordering::Relaxed);
