@@ -261,8 +261,7 @@ fn channel(me: [u8; 32], peer: [u8; 32], tx_key: [u8; 32], rx_key: [u8; 32]) -> 
     MEDIA_CHANNELS.lock().unwrap().insert(
         id,
         MediaChannel {
-            tx_hi,
-            video: MediaVideoIngress::Packets(tx_video),
+            ingress: MediaIngress::new(tx_hi, MediaVideoIngress::Packets(tx_video)),
             repair_tx: Some([repair_hi, repair_video]),
             peer,
             task,
@@ -430,7 +429,7 @@ async fn private_routes_negotiate_splice_and_repair_while_video_ingress_is_stall
         .insert(video_m.circuit_id_in, original);
     wait_until(|| {
         let channels = MEDIA_CHANNELS.lock().unwrap();
-        let MediaVideoIngress::Packets(tx) = &channels.get(&ca.id).unwrap().video else {
+        let MediaVideoIngress::Packets(tx) = &channels.get(&ca.id).unwrap().ingress.video else {
             panic!("anonymous channel must have a packet ingress")
         };
         tx.capacity() == MEDIA_TX_VIDEO_QUEUE

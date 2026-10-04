@@ -480,8 +480,7 @@ pub unsafe extern "C" fn veil_media_open_channel(
         .insert(
             id,
             MediaChannel {
-                tx_hi,
-                video: MediaVideoIngress::Packets(tx_video),
+                ingress: MediaIngress::new(tx_hi, MediaVideoIngress::Packets(tx_video)),
                 repair_tx: Some([repair_hi_tx, repair_video_tx]),
                 peer,
                 task,
@@ -711,8 +710,7 @@ pub unsafe extern "C" fn veil_media_open_direct_channel(
         .insert(
             id,
             MediaChannel {
-                tx_hi,
-                video: MediaVideoIngress::Packets(tx_video),
+                ingress: MediaIngress::new(tx_hi, MediaVideoIngress::Packets(tx_video)),
                 repair_tx: None,
                 peer,
                 task,
@@ -846,12 +844,10 @@ pub unsafe extern "C" fn veil_media_open_relay_channel(
         .insert(
             id,
             MediaChannel {
-                tx_hi,
-                video: MediaVideoIngress::RelayFrames {
-                    tx: tx_video_frames,
-                    assembler: RelayVideoFrameAssembler::default(),
-                    stats: Arc::clone(&relay_stats),
-                },
+                ingress: MediaIngress::new(
+                    tx_hi,
+                    MediaVideoIngress::relay_frames(tx_video_frames, Arc::clone(&relay_stats)),
+                ),
                 repair_tx: None,
                 peer,
                 task,
@@ -901,60 +897,30 @@ pub unsafe extern "C" fn veil_media_channel_set_secondary_sender(
 }
 
 /// Enqueue one media datagram (RTP/RTCP) on `chan`. NON-BLOCKING: returns 0 if
-/// queued, 1 if dropped (queue full / channel closing) — the caller's real-time
+/// queued, 1 if dropped (full queue / busy ingress) — the caller's real-time
 /// media thread must never block. Returns -1 on a NULL/zero-length payload or an
-/// unknown `chan`.
+/// unknown/closed `chan`.
 #[cfg(feature = "node-embedded")]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn veil_media_send_datagram(chan: u64, ptr: *const u8, len: size_t) -> c_int {
     if chan == 0 || ptr.is_null() || len == 0 {
         return -1;
     }
-    let payload = QueuedMediaPacket::from(unsafe { std::slice::from_raw_parts(ptr, len) }.to_vec());
-    let mut map = MEDIA_CHANNELS.lock().unwrap_or_else(|p| p.into_inner());
-    let Some(ch) = map.get_mut(&chan) else {
-        return -1;
-    };
-    if !media_is_vp8_rtp(&payload.payload) {
-        return match ch.tx_hi.try_send(payload) {
-            Ok(()) => 0,
-            Err(mpsc::error::TrySendError::Full(_)) => 1,
-            Err(mpsc::error::TrySendError::Closed(_)) => -1,
+    // Clone only ingress, never the channel/keys/pump owner. No registry guard
+    // can reach RTP classification, allocation or video frame assembly.
+    let ingress = {
+        let map = match MEDIA_CHANNELS.try_lock() {
+            Ok(map) => map,
+            Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => return 1,
         };
-    }
-    match &mut ch.video {
-        MediaVideoIngress::Packets(tx) => match tx.try_send(payload) {
-            Ok(()) => 0,
-            Err(mpsc::error::TrySendError::Full(_)) => 1,
-            Err(mpsc::error::TrySendError::Closed(_)) => -1,
-        },
-        MediaVideoIngress::RelayFrames {
-            tx,
-            assembler,
-            stats,
-        } => match assembler.push(payload.payload) {
-            RelayVideoFramePush::Pending => 0,
-            RelayVideoFramePush::Dropped => 1,
-            RelayVideoFramePush::Complete(packets) => {
-                stats.enqueue_frame();
-                let frame = RelayVideoFrame {
-                    packets,
-                    enqueued_at: std::time::Instant::now(),
-                };
-                match tx.try_send(frame) {
-                    Ok(()) => 0,
-                    Err(mpsc::error::TrySendError::Full(_)) => {
-                        stats.undo_enqueue_frame();
-                        1
-                    }
-                    Err(mpsc::error::TrySendError::Closed(_)) => {
-                        stats.undo_enqueue_frame();
-                        -1
-                    }
-                }
-            }
-        },
-    }
+        let Some(ch) = map.get(&chan) else {
+            return -1;
+        };
+        Arc::clone(&ch.ingress)
+    };
+    let payload = QueuedMediaPacket::from(unsafe { std::slice::from_raw_parts(ptr, len) }.to_vec());
+    ingress.enqueue(payload)
 }
 
 /// Snapshot per-channel relay drain diagnostics. Direct/onion channels return
@@ -1303,8 +1269,7 @@ pub unsafe extern "C" fn veil_media_recv_count(peer_node_id: *const u8) -> u64 {
 /// media must drop rather than buffer when it outpaces the circuit.
 #[cfg(feature = "node-embedded")]
 struct MediaChannel {
-    tx_hi: mpsc::Sender<QueuedMediaPacket>,
-    video: MediaVideoIngress,
+    ingress: Arc<MediaIngress>,
     /// Anonymous channels accept an out-of-band end-to-end repair request.
     /// The receiver of the media asks the sender to refresh its outbound
     /// rendezvous pool when RTP/RTCP has gone dark even though signaling is
@@ -1337,6 +1302,9 @@ struct MediaChannel {
 #[cfg(feature = "node-embedded")]
 impl MediaChannel {
     fn abort_pumps(&self) {
+        self.ingress
+            .closed
+            .store(true, std::sync::atomic::Ordering::Release);
         if let Some(routes) = &self.routes {
             routes.stop();
         }
@@ -1364,9 +1332,113 @@ enum MediaVideoIngress {
     Packets(mpsc::Sender<QueuedMediaPacket>),
     RelayFrames {
         tx: mpsc::Sender<RelayVideoFrame>,
-        assembler: RelayVideoFrameAssembler,
+        assembler: StdMutex<RelayVideoFrameAssembler>,
+        contended: std::sync::atomic::AtomicBool,
         stats: Arc<RelayMediaStats>,
     },
+}
+
+/// Send callbacks retain only this bounded plaintext ingress. Closing the
+/// owner marks it unavailable even while a callback/diagnostic clone survives.
+#[cfg(feature = "node-embedded")]
+struct MediaIngress {
+    tx_hi: mpsc::Sender<QueuedMediaPacket>,
+    video: MediaVideoIngress,
+    closed: std::sync::atomic::AtomicBool,
+}
+
+#[cfg(feature = "node-embedded")]
+impl MediaVideoIngress {
+    fn relay_frames(tx: mpsc::Sender<RelayVideoFrame>, stats: Arc<RelayMediaStats>) -> Self {
+        Self::RelayFrames {
+            tx,
+            assembler: StdMutex::new(RelayVideoFrameAssembler::default()),
+            contended: std::sync::atomic::AtomicBool::new(false),
+            stats,
+        }
+    }
+}
+
+#[cfg(feature = "node-embedded")]
+impl MediaIngress {
+    fn new(tx_hi: mpsc::Sender<QueuedMediaPacket>, video: MediaVideoIngress) -> Arc<Self> {
+        Arc::new(Self {
+            tx_hi,
+            video,
+            closed: std::sync::atomic::AtomicBool::new(false),
+        })
+    }
+
+    fn enqueue(&self, payload: QueuedMediaPacket) -> c_int {
+        use std::sync::atomic::Ordering::{AcqRel, Acquire};
+        if self.closed.load(Acquire) {
+            return -1;
+        }
+        if !media_is_vp8_rtp(&payload.payload) {
+            return Self::send_packet(&self.tx_hi, payload);
+        }
+        match &self.video {
+            MediaVideoIngress::Packets(tx) => Self::send_packet(tx, payload),
+            MediaVideoIngress::RelayFrames {
+                tx,
+                assembler,
+                contended,
+                stats,
+            } => {
+                let mut assembler = match assembler.try_lock() {
+                    Ok(assembler) => assembler,
+                    Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner(),
+                    Err(std::sync::TryLockError::WouldBlock) => {
+                        contended.store(true, std::sync::atomic::Ordering::Release);
+                        return 1;
+                    }
+                };
+                if contended.swap(false, AcqRel) {
+                    assembler.discard_after_contention();
+                }
+                let result = assembler.push(payload.payload);
+                if contended.swap(false, AcqRel) {
+                    // A concurrent callback dropped a fragment while this
+                    // callback was building the frame. Discard its prefix/tail.
+                    assembler.discard_after_contention();
+                    return 1;
+                }
+                if self.closed.load(Acquire) {
+                    return -1;
+                }
+                match result {
+                    RelayVideoFramePush::Pending => 0,
+                    RelayVideoFramePush::Dropped => 1,
+                    RelayVideoFramePush::Complete(packets) => {
+                        stats.enqueue_frame();
+                        let frame = RelayVideoFrame {
+                            packets,
+                            enqueued_at: std::time::Instant::now(),
+                        };
+                        match tx.try_send(frame) {
+                            Ok(()) => 0,
+                            Err(mpsc::error::TrySendError::Full(_)) => {
+                                stats.undo_enqueue_frame();
+                                1
+                            }
+                            Err(mpsc::error::TrySendError::Closed(_)) => {
+                                stats.undo_enqueue_frame();
+                                -1
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn send_packet(tx: &mpsc::Sender<QueuedMediaPacket>, payload: QueuedMediaPacket) -> c_int {
+        match tx.try_send(payload) {
+            Ok(()) => 0,
+            Err(mpsc::error::TrySendError::Full(_)) => 1,
+            Err(mpsc::error::TrySendError::Closed(_)) => -1,
+        }
+    }
 }
 
 #[cfg(feature = "node-embedded")]
@@ -1577,6 +1649,7 @@ const COMPACT_RELAY_MEDIA_CELL_MAX: usize = 1000;
 #[cfg(feature = "node-embedded")]
 #[derive(Default)]
 struct RelayVideoFrameAssembler {
+    discard_until_marker: bool,
     timestamp: Option<u32>,
     packets: Vec<Vec<u8>>,
     bytes: usize,
@@ -1594,6 +1667,12 @@ impl RelayVideoFrameAssembler {
     fn push(&mut self, packet: Vec<u8>) -> RelayVideoFramePush {
         if packet.len() < 8 || (packet[0] >> 6) != 2 {
             self.reset();
+            return RelayVideoFramePush::Dropped;
+        }
+        if self.discard_until_marker {
+            if packet[1] & 0x80 != 0 {
+                self.discard_until_marker = false;
+            }
             return RelayVideoFramePush::Dropped;
         }
         let timestamp = u32::from_be_bytes([packet[4], packet[5], packet[6], packet[7]]);
@@ -1620,6 +1699,11 @@ impl RelayVideoFrameAssembler {
         self.timestamp = None;
         self.bytes = 0;
         RelayVideoFramePush::Complete(std::mem::take(&mut self.packets))
+    }
+
+    fn discard_after_contention(&mut self) {
+        self.reset();
+        self.discard_until_marker = true;
     }
 
     fn reset(&mut self) {

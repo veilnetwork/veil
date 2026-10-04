@@ -144,8 +144,8 @@ int veil_media_start_direct_receiver(VeilApp *app,
 /*
  * Enqueue one media datagram (RTP/RTCP) on `chan`. NON-BLOCKING. Returns:
  *    0  queued
- *    1  dropped (queue full / channel closing)
- *   -1  invalid argument (NULL/zero-length payload, or unknown `chan`)
+ *    1  dropped (full queue / busy ingress)
+ *   -1  invalid argument (NULL/zero-length payload, or unknown/closed `chan`)
  */
 int veil_media_send_datagram(uint64_t chan, const uint8_t *ptr, size_t len);
 
