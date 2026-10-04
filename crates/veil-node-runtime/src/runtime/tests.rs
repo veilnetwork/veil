@@ -4717,3 +4717,61 @@ async fn building_a_reply_circuit_schedules_its_teardown() {
     runtime.stop().await.expect("runtime stops");
     let _ = fs::remove_file(path);
 }
+
+#[tokio::test]
+async fn retiring_owned_data_circuits_releases_slots_and_sends_ordinary_teardown() {
+    use veil_anonymity::circuit_wire::CircuitTeardownPayload;
+    use veil_anonymity::directory::{relay_directory_dht_key, sign_entry};
+    use veil_proto::family::RelayChainMsg;
+    let mut config = runtime_config_with_metrics();
+    config.anonymity.relay_capable = true;
+    let path = save_test_config("node-runtime-private-data-retire", config).unwrap();
+    let mut runtime = NodeRuntime::start(&path, true).await.unwrap();
+    let access = runtime.access();
+    let kp = veil_crypto::generate_keypair(veil_types::SignatureAlgorithm::Ed25519);
+    let pk =
+        base64::Engine::decode(&base64::engine::general_purpose::STANDARD, &kp.public_key).unwrap();
+    let hop = *blake3::hash(&pk).as_bytes();
+    let xpk = x25519_dalek::PublicKey::from(&x25519_dalek::StaticSecret::from([3; 32]));
+    access.dht.store_local(
+        relay_directory_dht_key(&hop),
+        sign_entry(
+            hop,
+            xpk.to_bytes(),
+            1_000_000,
+            1,
+            &kp.public_key,
+            &kp.private_key,
+            veil_types::SignatureAlgorithm::Ed25519,
+        )
+        .unwrap(),
+    );
+    let mut tx = wlock!(access.session_tx_registry).register(hop);
+    let table = access.dispatcher.circuit_origin.clone().unwrap();
+    // More consecutive calls than the origin table's usual 64-slot bound.
+    for _ in 0..80 {
+        let (circuit, mut inbound) = access.open_data_circuit(&[hop], b"private").unwrap();
+        let id = circuit.origin_circuit_id();
+        assert!(table.lookup(&hop, id).is_some());
+        next_relay_chain_frame(&mut tx, RelayChainMsg::CircuitBuild).await;
+        access.retire_data_circuit(&circuit);
+        assert!(table.lookup(&hop, id).is_none());
+        assert!(matches!(
+            inbound.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected)
+        ));
+        let frame = next_relay_chain_frame(&mut tx, RelayChainMsg::CircuitTeardown).await;
+        let header =
+            veil_proto::codec::decode_header_with_limit(&frame[..veil_proto::HEADER_SIZE], 65536)
+                .unwrap();
+        assert_eq!(header.priority(), veil_proto::priority::INTERACTIVE);
+        assert_eq!(
+            CircuitTeardownPayload::decode(&frame[veil_proto::HEADER_SIZE..])
+                .unwrap()
+                .circuit_id,
+            id
+        );
+    }
+    runtime.stop().await.unwrap();
+    let _ = fs::remove_file(path);
+}

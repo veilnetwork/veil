@@ -810,6 +810,9 @@ struct CircuitCells {
     peer_aliases: veil_onion_stream::PeerAliases,
 }
 
+pub(crate) mod media_routes;
+pub(crate) use media_routes::{CONTROL_MAGIC as MEDIA_ROUTE_CONTROL_MAGIC, MediaRoutes};
+
 struct CircuitEntry {
     circuit: Arc<veil_node_runtime::DataCircuit>,
     rendezvous_node: [u8; 32],
@@ -3461,6 +3464,17 @@ impl AnonStreamHub {
         }
     }
 
+    pub(crate) fn private_media_routes(
+        &self,
+        peer: [u8; 32],
+        channel: u64,
+        cipher: Arc<crate::media::MediaCipher>,
+    ) -> Option<Arc<MediaRoutes>> {
+        self.media_cells
+            .as_ref()
+            .map(|cores| MediaRoutes::new(peer, channel, cores.clone(), cipher))
+    }
+
     fn media_producer(&self, plane: LocalMediaPlane) -> Option<&CircuitCells> {
         let index = match plane {
             LocalMediaPlane::Primary => 0,
@@ -4543,13 +4557,27 @@ fn spawn_circuit_feed(
         inbound_activity,
         peer_tags,
         confirmed,
+        CircuitFeedMode::Streams,
     ));
+}
+
+enum CircuitFeedMode {
+    Streams,
+    Media {
+        peer: [u8; 32],
+        channel: u64,
+        cipher: Arc<crate::media::MediaCipher>,
+        probe_echo: Arc<std::sync::atomic::AtomicBool>,
+    },
 }
 
 /// The cell carrier is best-effort even for reliable streams: their end-to-end
 /// ARQ repairs dropped cells. Never await a stream queue slot here, because the
 /// following cell can be media or a circuit probe. StreamMux already uses this
 /// same bounded/drop-on-full contract for its individual stream inboxes.
+// Feed ownership includes an endpoint admission policy; all handles form one
+// coherent receive snapshot and must be passed together.
+#[allow(clippy::too_many_arguments)]
 async fn run_circuit_feed(
     services: veil_node_runtime::NodeServices,
     mut recv_rx: mpsc::Receiver<Vec<u8>>,
@@ -4558,6 +4586,7 @@ async fn run_circuit_feed(
     inbound_activity: Option<Arc<Mutex<Instant>>>,
     peer_tags: SharedPeerTags,
     confirmed: Option<Arc<std::sync::atomic::AtomicBool>>,
+    mode: CircuitFeedMode,
 ) {
     let mut stream_queue_drops = 0u64;
     // Drain inbound bursts: the relay splice delivers many cells per
@@ -4584,6 +4613,9 @@ async fn run_circuit_feed(
                 // the cell (it carries no data).
                 if let Some(flag) = confirmed.as_ref() {
                     flag.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+                if let CircuitFeedMode::Media { probe_echo, .. } = &mode {
+                    probe_echo.store(true, std::sync::atomic::Ordering::Release);
                 }
                 continue;
             }
@@ -4638,6 +4670,25 @@ async fn run_circuit_feed(
             // the splice relay — or anyone who can reach it — can arrive
             // under any name it likes. That is why the seal, and not this
             // id, decides what plays.
+            if let CircuitFeedMode::Media {
+                peer,
+                channel,
+                cipher,
+                ..
+            } = &mode
+            {
+                // This unadvertised receive address belongs to one call. It
+                // never bridges files or another group's peer into the hub.
+                if node == *peer || services.identity_of_device_local(&node) == Some(*peer) {
+                    crate::media::dispatch_private_onion_cell(
+                        *peer,
+                        *channel,
+                        cipher,
+                        &framed[cell_offset..],
+                    );
+                }
+                continue;
+            }
             if crate::media::dispatch_onion_cell(node, &framed[cell_offset..]) {
                 continue;
             }
@@ -4839,7 +4890,7 @@ mod tests {
         }
     }
 
-    async fn offline_feed_fixture() -> (
+    pub(super) async fn offline_feed_fixture() -> (
         tempfile::TempDir,
         veil_node_runtime::NodeRuntime,
         veil_node_runtime::NodeServices,
@@ -4868,6 +4919,7 @@ mod tests {
     struct FeedMediaReceiver {
         peer: [u8; 32],
         chan: u64,
+        cipher: std::sync::Arc<crate::media::MediaCipher>,
         _context: Box<tokio::sync::mpsc::Sender<Vec<u8>>>,
     }
 
@@ -4904,12 +4956,13 @@ mod tests {
             chan,
             record_feed_media,
             (&mut *context as *mut tokio::sync::mpsc::Sender<Vec<u8>>).cast(),
-            cipher,
+            std::sync::Arc::clone(&cipher),
         );
         (
             FeedMediaReceiver {
                 peer,
                 chan,
+                cipher,
                 _context: context,
             },
             rx,
@@ -4972,6 +5025,7 @@ mod tests {
             None,
             tags,
             Some(Arc::clone(&confirmed)),
+            super::CircuitFeedMode::Streams,
         ));
         let result = tokio::time::timeout(std::time::Duration::from_millis(300), async {
             let got = media_rx.recv().await.unwrap();
@@ -4997,6 +5051,51 @@ mod tests {
             "the consumer never drained"
         );
         assert!(stream_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn private_feed_admits_only_its_call_and_never_bridges_files() {
+        use std::sync::Arc;
+        let (_dir, mut node, services) = offline_feed_fixture().await;
+        let peer = [0xbb; 32];
+        let (registration, mut media_rx, sender) = feed_media_receiver(peer, 0xbb01);
+        let packet = feed_audio_packet();
+        let mut media = vec![crate::media::MEDIA_MAGIC];
+        media.extend_from_slice(sender.seal(&packet).unwrap().as_bytes());
+        let (stream_tx, mut stream_rx) = tokio::sync::mpsc::channel(1);
+        let (tx, rx) = tokio::sync::mpsc::channel(8);
+        tx.try_send(feed_envelope(peer, b"file cell")).unwrap();
+        tx.try_send(feed_envelope([0xbc; 32], &media)).unwrap();
+        tx.try_send(feed_envelope(peer, &media)).unwrap();
+        tx.try_send(feed_envelope(peer, &media)).unwrap();
+        drop(tx);
+        super::run_circuit_feed(
+            services,
+            rx,
+            stream_tx,
+            None,
+            None,
+            Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            None,
+            super::CircuitFeedMode::Media {
+                peer,
+                channel: registration.chan,
+                cipher: Arc::clone(&registration.cipher),
+                probe_echo: Arc::default(),
+            },
+        )
+        .await;
+        assert_eq!(media_rx.try_recv().unwrap(), packet);
+        assert!(
+            media_rx.try_recv().is_err(),
+            "foreign peers and replays are dropped"
+        );
+        assert!(
+            stream_rx.try_recv().is_err(),
+            "private addresses never route files"
+        );
+        drop(registration);
+        node.stop().await.unwrap();
     }
 
     struct FeedBus {
@@ -5049,6 +5148,7 @@ mod tests {
             None,
             Arc::default(),
             None,
+            super::CircuitFeedMode::Streams,
         ));
         let feed_b = tokio::spawn(super::run_circuit_feed(
             services,
@@ -5058,6 +5158,7 @@ mod tests {
             None,
             Arc::default(),
             None,
+            super::CircuitFeedMode::Streams,
         ));
         let sender_a = Arc::new(FeedBus {
             me: a,
@@ -5178,6 +5279,7 @@ mod tests {
                 None,
                 Default::default(),
                 None,
+                super::CircuitFeedMode::Streams,
             ),
         )
         .await;
