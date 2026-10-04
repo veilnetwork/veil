@@ -1301,6 +1301,9 @@ mod tests {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
 
         let before = ABANDONED_WORKERS.load(Ordering::Acquire);
+        // Other tests deliberately leave uninterruptible workers parked. This
+        // fixture's workers returning must restore that baseline, not zero it.
+        let stranded_before = stranded_now();
         // The gate reads what is parked NOW, so the fixture parks a group
         // rather than bumping the lifetime counter. A group is exactly what a
         // teardown leaves behind: a live-thread count that its threads
@@ -1341,7 +1344,7 @@ mod tests {
         parked.store(0, Ordering::Release);
         assert_eq!(
             stranded_now(),
-            0,
+            stranded_before,
             "threads that came back are still counted against the next start"
         );
         assert!(

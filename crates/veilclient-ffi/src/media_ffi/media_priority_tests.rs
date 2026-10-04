@@ -528,6 +528,7 @@ async fn anonymous_repair_fans_out_with_independent_backpressure() {
                 batching: None,
                 cipher: Arc::new(cipher_for_test(&[0x8a; 32], &[1; 32], &[2; 32]).unwrap()),
                 relay_stats: None,
+                routes: None,
             },
         );
     assert_eq!(unsafe { veil_media_repair_channel(id) }, 0);
@@ -587,6 +588,7 @@ async fn closing_channel_cancels_both_blocked_pumps() {
                 batching: None,
                 cipher: Arc::new(cipher_for_test(&[0xf3; 32], &[1; 32], &[2; 32]).unwrap()),
                 relay_stats: None,
+                routes: None,
             },
         );
     unsafe { veil_media_close_channel(id) };
@@ -603,4 +605,78 @@ async fn closing_channel_cancels_both_blocked_pumps() {
         -1
     );
     unsafe { veil_media_close_channel(id) }; // Idempotent.
+}
+
+#[tokio::test]
+async fn private_address_control_requires_call_aead_and_never_reaches_the_engine() {
+    extern "C" fn count(ctx: *mut std::ffi::c_void, _ptr: *const u8, _len: usize) {
+        unsafe { &*(ctx as *const AtomicUsize) }.fetch_add(1, Ordering::SeqCst);
+    }
+    let peer = [0xe9; 32];
+    let id = MEDIA_NEXT_ID.fetch_add(1, Ordering::Relaxed);
+    let cipher = Arc::new(cipher_for_test(&peer, &[0x61; 32], &[0x62; 32]).unwrap());
+    let sender = cipher_for_test(&peer, &[0x62; 32], &[0x61; 32]).unwrap();
+    let (_dir, mut node, routes) =
+        crate::anon_stream::media_routes::fixture(peer, id, Arc::clone(&cipher)).await;
+    struct CloseChannel(u64);
+    impl Drop for CloseChannel {
+        fn drop(&mut self) {
+            unsafe { veil_media_close_channel(self.0) };
+        }
+    }
+    let mut count_context = Box::new(AtomicUsize::new(0));
+    let before = crate::media::recv_count(peer);
+    let (tx_hi, _rx) = mpsc::channel(1);
+    let (tx_video, _video_rx) = mpsc::channel(1);
+    MEDIA_CHANNELS.lock().unwrap().insert(
+        id,
+        MediaChannel {
+            tx_hi,
+            video: MediaVideoIngress::Packets(tx_video),
+            repair_tx: None,
+            peer,
+            task: tokio::spawn(std::future::pending()),
+            video_task: None,
+            video_sender: None,
+            sender_app_id: None,
+            batching: None,
+            cipher: Arc::clone(&cipher),
+            relay_stats: None,
+            routes: Some(Arc::clone(&routes)),
+        },
+    );
+    crate::media::set_recv_callback(
+        peer,
+        id,
+        count,
+        (&mut *count_context as *mut AtomicUsize).cast(),
+        Arc::clone(&cipher),
+    );
+    let cleanup = CloseChannel(id);
+    let mut body = crate::anon_stream::MEDIA_ROUTE_CONTROL_MAGIC.to_vec();
+    body.extend_from_slice(&1u64.to_be_bytes());
+    body.extend_from_slice(&1u64.to_be_bytes());
+    body.extend_from_slice(&[1, 0]); // One primary address.
+    body.extend_from_slice(&[0x73; 32]);
+    body.extend_from_slice(&[0x74; 16]);
+    body.extend_from_slice(&[0x75; 32]);
+    let sealed = sender.seal(&body).unwrap().into_vec();
+    let mut forged = sealed.clone();
+    *forged.last_mut().unwrap() ^= 1;
+    crate::media::dispatch_inbound_auto(peer, &body);
+    crate::media::dispatch_inbound_auto(peer, &forged);
+    assert!(routes.received_offer_for_test().is_none());
+    crate::media::dispatch_inbound_auto(peer, &sealed);
+    assert_eq!(routes.received_offer_for_test(), Some(body));
+    assert_eq!(count_context.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        crate::media::recv_count(peer),
+        before,
+        "control is not media liveness"
+    );
+    let rtp = sender.seal(&[0x80, 111, 1, 2]).unwrap();
+    crate::media::dispatch_inbound_auto(peer, rtp.as_bytes());
+    assert_eq!(count_context.load(Ordering::SeqCst), 1);
+    drop(cleanup);
+    node.stop().await.unwrap();
 }

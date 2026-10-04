@@ -353,6 +353,11 @@ pub unsafe extern "C" fn veil_media_open_channel(
             return 0;
         }
     };
+    let id = MEDIA_NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let routes = hub.private_media_routes(peer, id, Arc::clone(&cipher));
+    if let Some(routes) = &routes {
+        routes.start(handle_live.bundle.runtime.handle());
+    }
     let (tx_hi, rx_hi) = mpsc::channel::<Vec<u8>>(MEDIA_TX_HI_QUEUE);
     let (tx_video, rx_video) = mpsc::channel::<Vec<u8>>(MEDIA_TX_VIDEO_QUEUE);
     let (repair_hi_tx, repair_hi_rx) = mpsc::channel::<()>(1);
@@ -360,6 +365,8 @@ pub unsafe extern "C" fn veil_media_open_channel(
     let spawn_producer = |rx, repair_rx, plane| {
         let send_hub = Arc::clone(&hub);
         let warm_hub = Arc::clone(&hub);
+        let send_routes = routes.clone();
+        let warm_routes = routes.clone();
         handle_live.bundle.runtime.spawn(drain_anonymous_media(
             rx,
             repair_rx,
@@ -367,17 +374,30 @@ pub unsafe extern "C" fn veil_media_open_channel(
             plane,
             move |sealed| {
                 let hub = Arc::clone(&send_hub);
-                async move { hub.media_send_datagram(peer, plane, &sealed).await }
+                let routes = send_routes.clone();
+                async move {
+                    if let Some(routes) = routes {
+                        routes.send(plane, &sealed).await
+                    } else {
+                        hub.media_send_datagram(peer, plane, &sealed).await
+                    }
+                }
             },
             move || {
                 let hub = Arc::clone(&warm_hub);
-                async move { hub.media_open_channel(peer, plane).await }
+                let routes = warm_routes.clone();
+                async move {
+                    if let Some(routes) = routes {
+                        routes.warm(plane).await
+                    } else {
+                        hub.media_open_channel(peer, plane).await
+                    }
+                }
             },
         ))
     };
     let task = spawn_producer(rx_hi, repair_hi_rx, media::LocalMediaPlane::Primary);
     let video_task = spawn_producer(rx_video, repair_video_rx, media::LocalMediaPlane::Secondary);
-    let id = MEDIA_NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     MEDIA_CHANNELS
         .lock()
         .unwrap_or_else(|p| p.into_inner())
@@ -395,6 +415,7 @@ pub unsafe extern "C" fn veil_media_open_channel(
                 batching: None,
                 cipher,
                 relay_stats: None,
+                routes,
             },
         );
     id
@@ -621,6 +642,7 @@ pub unsafe extern "C" fn veil_media_open_direct_channel(
                 batching: Some(batching),
                 cipher,
                 relay_stats: None,
+                routes: None,
             },
         );
     id
@@ -755,6 +777,7 @@ pub unsafe extern "C" fn veil_media_open_relay_channel(
                 batching: Some(batching),
                 cipher,
                 relay_stats: Some(relay_stats),
+                routes: None,
             },
         );
     id
@@ -900,6 +923,9 @@ pub unsafe extern "C" fn veil_media_repair_channel(chan: u64) -> c_int {
         }
     }
     if queued {
+        if let Some(routes) = map.get(&chan).and_then(|ch| ch.routes.as_ref()) {
+            routes.repair();
+        }
         0
     } else if pending {
         1
@@ -1221,11 +1247,15 @@ struct MediaChannel {
     /// non-blocking while letting the host distinguish a local queue stall
     /// from delay after the frame has entered the node/session path.
     relay_stats: Option<Arc<RelayMediaStats>>,
+    routes: Option<Arc<anon_stream::MediaRoutes>>,
 }
 
 #[cfg(feature = "node-embedded")]
 impl MediaChannel {
     fn abort_pumps(&self) {
+        if let Some(routes) = &self.routes {
+            routes.stop();
+        }
         self.task.abort();
         if let Some(video_task) = self.video_task.as_ref() {
             video_task.abort();
@@ -1577,4 +1607,21 @@ fn media_batched_cells(frame: Vec<Vec<u8>>, max_body: usize, max_packets: usize)
     }
     flush_media_batch_chunk(&mut chunk, &mut cells, max_body);
     cells
+}
+
+#[cfg(feature = "node-embedded")]
+pub(crate) fn dispatch_route_control(
+    peer: [u8; 32],
+    chan: u64,
+    cipher: &Arc<media::MediaCipher>,
+    body: &[u8],
+) {
+    let map = MEDIA_CHANNELS.lock().unwrap_or_else(|p| p.into_inner());
+    if let Some(ch) = map.get(&chan)
+        && ch.peer == peer
+        && Arc::ptr_eq(&ch.cipher, cipher)
+        && let Some(routes) = &ch.routes
+    {
+        routes.accept_control(body);
+    }
 }
