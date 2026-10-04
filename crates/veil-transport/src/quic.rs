@@ -3,6 +3,9 @@ use std::sync::Arc;
 use futures::future::BoxFuture;
 use tokio::time::timeout;
 
+mod parallel;
+pub use parallel::QuicParallelHandle;
+
 use super::{
     TransportContext,
     error::{Result, TransportError, connect_timeout, handshake_timeout, quic_error},
@@ -70,6 +73,16 @@ pub struct QuicDatagramHandle {
 }
 
 impl QuicDatagramHandle {
+    /// TLS exporter for authenticating a new, independent transport against
+    /// an existing OVL1 session. This is secret keying material, not a peer
+    /// identity or a wire field; callers must not log it.
+    pub fn channel_binding(&self) -> Result<[u8; 32]> {
+        let mut binding = [0; 32];
+        self.connection
+            .export_keying_material(&mut binding, b"veil/parallel-channel/v1", b"")
+            .map_err(|_| quic_error("QUIC channel exporter unavailable"))?;
+        Ok(binding)
+    }
     /// Local admission bound for reliable bytes. This neither changes remote
     /// transport parameters nor retracts previously accepted stream bytes.
     pub fn set_reliable_send_window(&self, bytes: u64) {
@@ -218,6 +231,7 @@ struct QuicTransportConnection {
     _endpoint: quinn::Endpoint,
     connection: quinn::Connection,
     stream: Option<BoxIoStream>,
+    parallel: Option<QuicParallelHandle>,
 }
 
 impl QuicTransportConnection {
@@ -233,6 +247,7 @@ impl QuicTransportConnection {
             _endpoint: endpoint,
             connection,
             stream: Some(stream),
+            parallel: None,
         }
     }
 }
@@ -627,9 +642,10 @@ pub async fn promote_punched_quic(
         }
     };
     let peer_meta = native_quic_peer(uri, local_addr, Some(remote_addr));
-    Ok(boxed_quic_connection(
-        peer_meta, endpoint, connection, stream,
-    ))
+    let parallel = QuicParallelHandle::new(endpoint.clone(), connection.clone(), peer_meta.clone());
+    let mut transport = QuicTransportConnection::new(peer_meta, endpoint, connection, stream);
+    transport.parallel = Some(parallel);
+    Ok(Box::new(transport))
 }
 
 fn build_server_endpoint(
@@ -704,6 +720,10 @@ impl TransportConnection for QuicTransportConnection {
         Some(QuicDatagramHandle {
             connection: self.connection.clone(),
         })
+    }
+
+    fn parallel_quic(&self) -> Option<QuicParallelHandle> {
+        self.parallel.clone()
     }
 
     fn send_datagram<'a>(&'a self, payload: &'a [u8]) -> BoxFuture<'a, Result<()>> {
