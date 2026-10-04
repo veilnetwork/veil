@@ -311,7 +311,8 @@ std::string node_key(const uint8_t id[32]) {
 // its pacer/BWE clock cannot be inflated by room size.
 class GroupFanoutTransport : public webrtc::Transport {
  public:
-  explicit GroupFanoutTransport(webrtc::Call* call) : call_(call) {}
+  GroupFanoutTransport(webrtc::Call* call, webrtc::Call* video_call)
+      : call_(call), video_call_(video_call) {}
 
   void Add(uint64_t chan) {
     std::lock_guard<std::mutex> lock(mu_);
@@ -334,7 +335,7 @@ class GroupFanoutTransport : public webrtc::Transport {
             any;
     }
     if (any && options.packet_id != -1) {
-      call_->OnSentPacket(
+      (veil_media::IsSecondaryInboundRtp(packet) ? video_call_ : call_)->OnSentPacket(
           webrtc::SentPacketInfo(options.packet_id, webrtc::TimeMillis()));
     }
     return any;
@@ -354,6 +355,7 @@ class GroupFanoutTransport : public webrtc::Transport {
 
  private:
   webrtc::Call* const call_;
+  webrtc::Call* const video_call_;
   std::mutex mu_;
   std::vector<uint64_t> channels_;
 };
@@ -904,10 +906,13 @@ struct WebrtcState {
   webrtc::Environment env;
   std::unique_ptr<webrtc::TaskQueueBase, webrtc::TaskQueueDeleter> worker_tq;
   std::unique_ptr<webrtc::TaskQueueBase, webrtc::TaskQueueDeleter> network_tq;
+  std::unique_ptr<webrtc::TaskQueueBase, webrtc::TaskQueueDeleter> video_worker_tq;
+  std::unique_ptr<webrtc::TaskQueueBase, webrtc::TaskQueueDeleter> video_network_tq;
   webrtc::scoped_refptr<webrtc::AudioDeviceModule> adm;
   webrtc::scoped_refptr<webrtc::AudioProcessing> apm;
   webrtc::scoped_refptr<webrtc::AudioState> audio_state;
-  std::unique_ptr<webrtc::Call> call;
+  std::unique_ptr<webrtc::Call> call;  // audio only
+  std::unique_ptr<webrtc::Call> video_call;
   std::unique_ptr<veil_media::VeilTransportShim> shim;
   webrtc::AudioSendStream* send_stream = nullptr;             // owned by Call
   webrtc::AudioReceiveStreamInterface* recv_stream = nullptr;  // owned by Call
@@ -997,10 +1002,13 @@ struct GroupWebrtcState {
   webrtc::Environment env;
   std::unique_ptr<webrtc::TaskQueueBase, webrtc::TaskQueueDeleter> worker_tq;
   std::unique_ptr<webrtc::TaskQueueBase, webrtc::TaskQueueDeleter> network_tq;
+  std::unique_ptr<webrtc::TaskQueueBase, webrtc::TaskQueueDeleter> video_worker_tq;
+  std::unique_ptr<webrtc::TaskQueueBase, webrtc::TaskQueueDeleter> video_network_tq;
   webrtc::scoped_refptr<webrtc::AudioDeviceModule> adm;
   webrtc::scoped_refptr<webrtc::AudioProcessing> apm;
   webrtc::scoped_refptr<webrtc::AudioState> audio_state;
-  std::unique_ptr<webrtc::Call> call;
+  std::unique_ptr<webrtc::Call> call;  // audio only
+  std::unique_ptr<webrtc::Call> video_call;
   std::unique_ptr<GroupFanoutTransport> fanout;
   webrtc::AudioSendStream* send_stream = nullptr;  // owned by Call
   std::unique_ptr<webrtc::VideoEncoderFactory> video_encoder_factory;
@@ -1117,7 +1125,7 @@ bool start_group_peer_video(GroupWebrtcState* ws, GroupPeerState* peer) {
   rc.renderer = peer->video_sink.get();
   rc.decoders.emplace_back(webrtc::SdpVideoFormat::VP8(),
                            kGroupVp8PayloadType);
-  peer->video_recv_stream = ws->call->CreateVideoReceiveStream(std::move(rc));
+  peer->video_recv_stream = ws->video_call->CreateVideoReceiveStream(std::move(rc));
   if (!peer->video_recv_stream) return false;
   peer->video_recv_stream->Start();
   peer->shim->SetRemoteVideoSsrc(peer->video_ssrc);
@@ -1128,7 +1136,7 @@ void stop_group_peer_video(GroupWebrtcState* ws, GroupPeerState* peer) {
   peer->shim->SetRemoteVideoSsrc(0);
   if (!peer->video_recv_stream) return;
   peer->video_recv_stream->Stop();
-  ws->call->DestroyVideoReceiveStream(peer->video_recv_stream);
+  ws->video_call->DestroyVideoReceiveStream(peer->video_recv_stream);
   peer->video_recv_stream = nullptr;
 }
 #endif
@@ -1490,9 +1498,13 @@ VeilMediaEngine* veil_media_engine_create(uint64_t veil_chan,
   // ops onto worker_tq for the device test; direct construction is fine to
   // compile and to run single-threaded in a release build (no DCHECKs).
   ws->worker_tq = ws->env.task_queue_factory().CreateTaskQueue(
-      "veil-worker", webrtc::TaskQueueFactory::Priority::kNormal);
+      "veil-audio-worker", webrtc::TaskQueueFactory::Priority::kHigh);
   ws->network_tq = ws->env.task_queue_factory().CreateTaskQueue(
       "veil-net", webrtc::TaskQueueFactory::Priority::kHigh);
+  ws->video_worker_tq = ws->env.task_queue_factory().CreateTaskQueue(
+      "veil-video-worker", webrtc::TaskQueueFactory::Priority::kNormal);
+  ws->video_network_tq = ws->env.task_queue_factory().CreateTaskQueue(
+      "veil-video-net", webrtc::TaskQueueFactory::Priority::kNormal);
 
   // Per-platform ADM selection lives in one helper so direct and group calls
   // cannot silently diverge. In particular, macOS uses WebRTC's CoreAudio HAL
@@ -1554,9 +1566,13 @@ VeilMediaEngine* veil_media_engine_create(uint64_t veil_chan,
                               ws->network_tq.get());
   call_cfg.audio_state = ws->audio_state;
   ws->call = webrtc::Call::Create(std::move(call_cfg));
+  webrtc::CallConfig video_cfg(ws->env, ws->video_worker_tq.get(),
+                                ws->video_network_tq.get());
+  ws->video_call = webrtc::Call::Create(std::move(video_cfg));
 
   ws->shim = std::make_unique<veil_media::VeilTransportShim>(
-      veil_chan, ws->call.get(), ws->network_tq.get());
+      veil_chan, ws->call.get(), ws->network_tq.get(),
+      ws->video_call.get(), ws->video_network_tq.get());
   ws->shim->Start();
 
   ws->video_sink = std::make_unique<VeilVideoSink>();
@@ -1585,6 +1601,7 @@ void veil_media_engine_destroy(VeilMediaEngine* engine) {
 #if defined(VEIL_MEDIA_HAVE_WEBRTC)
   if (engine->ws) {
     if (engine->ws->shim) engine->ws->shim->Stop();
+    engine->ws->video_call.reset();
     engine->ws->call.reset();  // after streams (stop_audio) + shim->Stop()
     if (engine->ws->adm) {
       auto* adm = engine->ws->adm.get();
@@ -1604,9 +1621,13 @@ VeilGroupMediaEngine* veil_media_group_engine_create(
   webrtc::Environment env = create_low_latency_environment();
   auto ws = std::make_unique<GroupWebrtcState>(env);
   ws->worker_tq = ws->env.task_queue_factory().CreateTaskQueue(
-      "veil-group-worker", webrtc::TaskQueueFactory::Priority::kNormal);
+      "veil-group-audio-worker", webrtc::TaskQueueFactory::Priority::kHigh);
   ws->network_tq = ws->env.task_queue_factory().CreateTaskQueue(
       "veil-group-net", webrtc::TaskQueueFactory::Priority::kHigh);
+  ws->video_worker_tq = ws->env.task_queue_factory().CreateTaskQueue(
+      "veil-group-video-worker", webrtc::TaskQueueFactory::Priority::kNormal);
+  ws->video_network_tq = ws->env.task_queue_factory().CreateTaskQueue(
+      "veil-group-video-net", webrtc::TaskQueueFactory::Priority::kNormal);
   ws->adm = create_audio_device(ws->env);
   if (ws->adm) run_on_adm_thread([&] { ws->adm->Init(); });
   ws->apm = webrtc::BuiltinAudioProcessingBuilder().Build(ws->env);
@@ -1621,7 +1642,10 @@ VeilGroupMediaEngine* veil_media_group_engine_create(
                               ws->network_tq.get());
   call_cfg.audio_state = ws->audio_state;
   ws->call = webrtc::Call::Create(std::move(call_cfg));
-  ws->fanout = std::make_unique<GroupFanoutTransport>(ws->call.get());
+  webrtc::CallConfig video_cfg(ws->env, ws->video_worker_tq.get(),
+                                ws->video_network_tq.get());
+  ws->video_call = webrtc::Call::Create(std::move(video_cfg));
+  ws->fanout = std::make_unique<GroupFanoutTransport>(ws->call.get(), ws->video_call.get());
   engine->ws = std::move(ws);
 #endif
   return engine.release();
@@ -1663,7 +1687,8 @@ int veil_media_group_engine_add_peer(VeilGroupMediaEngine* engine,
   peer->video_ssrc = remote_video_ssrc;
   std::memcpy(peer->id, peer_id, 32);
   peer->shim = std::make_unique<veil_media::VeilTransportShim>(
-      veil_chan, ws->call.get(), ws->network_tq.get());
+      veil_chan, ws->call.get(), ws->network_tq.get(),
+      ws->video_call.get(), ws->video_network_tq.get());
   peer->shim->Start();
   peer->video_sink = std::make_unique<VeilVideoSink>();
   ws->fanout->Add(veil_chan);
@@ -1690,7 +1715,7 @@ int veil_media_group_engine_add_peer(VeilGroupMediaEngine* engine,
   }
   if (engine->video_running.load()) {
     // Discarded for the same reason: `video_recv_stream` stays null.
-    (void)run_on(ws->worker_tq.get(), [&]() {
+    (void)run_on(ws->video_worker_tq.get(), [&]() {
       ensure_group_video_codecs(ws);
       start_group_peer_video(ws, peer.get());
     });
@@ -1748,15 +1773,17 @@ int veil_media_group_engine_remove_peer(VeilGroupMediaEngine* engine,
   ws->fanout->Remove(peer->chan);
   peer->shim->SetRemoteVideoSsrc(0);
   peer->shim->Stop();
-  const bool torn_down = run_on(ws->worker_tq.get(), [&]() {
+  const bool video_torn_down = run_on(ws->video_worker_tq.get(), [&]() {
     stop_group_peer_video(ws, peer);
+  });
+  const bool torn_down = run_on(ws->worker_tq.get(), [&]() {
     if (peer->recv_stream) {
       peer->recv_stream->Stop();
       ws->call->DestroyAudioReceiveStream(peer->recv_stream);
       peer->recv_stream = nullptr;
     }
   });
-  if (!torn_down) {
+  if (!torn_down || !video_torn_down) {
     // The worker queue never scheduled, so the receive streams are still
     // live — and `peer->shim` is the transport they were configured with
     // (`rc.rtcp_send_transport`). Erasing the peer here destroys that shim
@@ -1930,14 +1957,14 @@ int veil_media_group_engine_start_video(VeilGroupMediaEngine* engine) {
   if (engine == nullptr) return VEIL_MEDIA_ERR_ARG;
   if (engine->video_running.load()) return VEIL_MEDIA_OK;
 #if defined(VEIL_MEDIA_HAVE_WEBRTC)
-  if (!engine->ws || !engine->ws->call) return VEIL_MEDIA_ERR_STATE;
+  if (!engine->ws || !engine->ws->video_call) return VEIL_MEDIA_ERR_STATE;
   GroupWebrtcState* ws = engine->ws.get();
   const uint32_t local_ssrc = group_video_ssrc_of(engine->local);
   bool peers_ready = true;
   // Discarded: the `!ws->video_send_stream || !peers_ready` check below is
   // stricter — a queue that never scheduled leaves both untouched.
-  (void)run_on(ws->worker_tq.get(), [&]() {
-    ws->call->SignalChannelNetworkState(webrtc::MediaType::VIDEO,
+  (void)run_on(ws->video_worker_tq.get(), [&]() {
+    ws->video_call->SignalChannelNetworkState(webrtc::MediaType::VIDEO,
                                         webrtc::kNetworkUp);
     ensure_group_video_codecs(ws);
     if (ws->video_send_stream == nullptr) {
@@ -1975,7 +2002,7 @@ int veil_media_group_engine_start_video(VeilGroupMediaEngine* engine) {
       layer.max_qp = 63;
       ec.simulcast_layers.push_back(layer);
       ws->video_send_stream =
-          ws->call->CreateVideoSendStream(std::move(sc), std::move(ec));
+          ws->video_call->CreateVideoSendStream(std::move(sc), std::move(ec));
       if (ws->video_send_stream) {
         ws->video_send_stream->SetSource(
             ws->video_source.get(),
@@ -2042,11 +2069,11 @@ int veil_media_group_engine_stop_video(VeilGroupMediaEngine* engine) {
   }
   if (ws->test_video_run.exchange(false) && ws->test_video_thread.joinable())
     ws->test_video_thread.join();
-  if (ws->call) {
-    if (!run_on(ws->worker_tq.get(), [&]() {
+  if (ws->video_call) {
+    if (!run_on(ws->video_worker_tq.get(), [&]() {
           if (ws->video_send_stream) {
             ws->video_send_stream->Stop();
-            ws->call->DestroyVideoSendStream(ws->video_send_stream);
+            ws->video_call->DestroyVideoSendStream(ws->video_send_stream);
             ws->video_send_stream = nullptr;
           }
           for (auto& entry : ws->peers)
@@ -2255,6 +2282,7 @@ void veil_media_group_engine_destroy(VeilGroupMediaEngine* engine) {
       entry.second->shim->Stop();
     }
     engine->ws->peers.clear();
+    engine->ws->video_call.reset();
     engine->ws->call.reset();
     if (engine->ws->adm) {
       auto* adm = engine->ws->adm.get();
@@ -2456,15 +2484,15 @@ int veil_media_engine_start_video(VeilMediaEngine* engine, int send, int recv,
                                   int max_bitrate_kbps, int max_fps) {
   if (engine == nullptr) return VEIL_MEDIA_ERR_ARG;
 #if defined(VEIL_MEDIA_HAVE_WEBRTC)
-  if (!engine->ws || !engine->ws->call) return VEIL_MEDIA_ERR_STATE;
+  if (!engine->ws || !engine->ws->video_call) return VEIL_MEDIA_ERR_STATE;
   WebrtcState* ws = engine->ws.get();
   const uint32_t local_v = video_ssrc_of(engine->local);
   const uint32_t remote_v = video_ssrc_of(engine->peer);
   constexpr int kVp8Pt = 96;
 
-  const bool created = run_on(ws->worker_tq.get(), [&]() {
+  const bool created = run_on(ws->video_worker_tq.get(), [&]() {
     // Video has its own network state (defaults kNetworkDown); bring it up.
-    ws->call->SignalChannelNetworkState(webrtc::MediaType::VIDEO,
+    ws->video_call->SignalChannelNetworkState(webrtc::MediaType::VIDEO,
                                         webrtc::kNetworkUp);
     if (!ws->video_encoder_factory)
       ws->video_encoder_factory =
@@ -2532,8 +2560,8 @@ int veil_media_engine_start_video(VeilMediaEngine* engine, int send, int recv,
         // moves this whole anchor when it retunes.
         bs.min_bitrate_bps = bps;
         bs.start_bitrate_bps = bps;
-        bs.max_bitrate_bps = bps + 128'000;  // audio + RTCP headroom
-        ws->call->SetClientBitratePreferences(bs);
+        bs.max_bitrate_bps = bps + 128'000;  // video retransmission/RTCP headroom
+        ws->video_call->SetClientBitratePreferences(bs);
       }
       webrtc::VideoEncoderConfig ec;
       ec.codec_type = webrtc::kVideoCodecVP8;
@@ -2552,7 +2580,7 @@ int veil_media_engine_start_video(VeilMediaEngine* engine, int send, int recv,
       ec.simulcast_layers.push_back(layer);
 
       ws->video_send_stream =
-          ws->call->CreateVideoSendStream(std::move(sc), std::move(ec));
+          ws->video_call->CreateVideoSendStream(std::move(sc), std::move(ec));
       vlog("video: send stream=%p", (void*)ws->video_send_stream);
       if (ws->video_send_stream) {
         ws->video_send_stream->SetSource(
@@ -2569,7 +2597,7 @@ int veil_media_engine_start_video(VeilMediaEngine* engine, int send, int recv,
       rc.rtp.nack.rtp_history_ms = kVideoNackHistoryMs;
       rc.renderer = ws->video_sink.get();
       rc.decoders.emplace_back(webrtc::SdpVideoFormat::VP8(), kVp8Pt);
-      ws->video_recv_stream = ws->call->CreateVideoReceiveStream(std::move(rc));
+      ws->video_recv_stream = ws->video_call->CreateVideoReceiveStream(std::move(rc));
       if (ws->video_recv_stream) ws->video_recv_stream->Start();
     }
   });
@@ -2620,13 +2648,13 @@ int veil_media_engine_set_video_bitrate(VeilMediaEngine* engine,
                                         int max_bitrate_kbps, int max_fps) {
   if (engine == nullptr) return VEIL_MEDIA_ERR_ARG;
 #if defined(VEIL_MEDIA_HAVE_WEBRTC)
-  if (!engine->ws || !engine->ws->call) return VEIL_MEDIA_ERR_STATE;
+  if (!engine->ws || !engine->ws->video_call) return VEIL_MEDIA_ERR_STATE;
   WebrtcState* ws = engine->ws.get();
   // Discarded: `rc` starts at the failure and is only raised to OK by the
   // last line INSIDE the closure, so a queue that never scheduled returns the
   // failure by construction.
   int rc = VEIL_MEDIA_ERR_STATE;
-  (void)run_on(ws->worker_tq.get(), [&]() {
+  (void)run_on(ws->video_worker_tq.get(), [&]() {
     if (ws->video_send_stream == nullptr) return;
     // Same budget rules as start_video: the explicit debug pin wins, and the
     // clamps keep the encoder inside the padded-onion / direct envelopes.
@@ -2667,7 +2695,7 @@ int veil_media_engine_set_video_bitrate(VeilMediaEngine* engine,
       bs.min_bitrate_bps = bps;  // pinned floor — see start_video
       bs.start_bitrate_bps = bps;
       bs.max_bitrate_bps = bps + 128'000;
-      ws->call->SetClientBitratePreferences(bs);
+      ws->video_call->SetClientBitratePreferences(bs);
     }
     ws->video_target_bitrate_bps = bps;
     ws->video_max_fps.store(fps, std::memory_order_relaxed);
@@ -2699,16 +2727,16 @@ int veil_media_engine_stop_video(VeilMediaEngine* engine) {
   }
   if (ws->test_video_run.exchange(false) && ws->test_video_thread.joinable())
     ws->test_video_thread.join();
-  if (ws->call) {
-    if (!run_on(ws->worker_tq.get(), [&]() {
+  if (ws->video_call) {
+    if (!run_on(ws->video_worker_tq.get(), [&]() {
           if (ws->video_send_stream) {
             ws->video_send_stream->Stop();
-            ws->call->DestroyVideoSendStream(ws->video_send_stream);
+            ws->video_call->DestroyVideoSendStream(ws->video_send_stream);
             ws->video_send_stream = nullptr;
           }
           if (ws->video_recv_stream) {
             ws->video_recv_stream->Stop();
-            ws->call->DestroyVideoReceiveStream(ws->video_recv_stream);
+            ws->video_call->DestroyVideoReceiveStream(ws->video_recv_stream);
             ws->video_recv_stream = nullptr;
           }
         })) {
@@ -3246,12 +3274,19 @@ char* veil_media_engine_get_stats(VeilMediaEngine* engine) {
           }
         }
       }
-      if (ws->video_recv_stream) {
-        const auto v = ws->video_recv_stream->GetStats();
-        video_delay_ms = v.current_delay_ms;
-        video_jb_ms = v.jitter_buffer_ms;
-      }
     });
+    // A stalled video worker must not block audio telemetry or the UI's
+    // control loop for the ten-second stream-operation timeout.
+    const bool video_sampled = veil_media::run_on_with_timeout(
+        ws->video_worker_tq.get(), [&] {
+          if (ws->video_call)
+            pacer_delay_ms = ws->video_call->GetStats().pacer_delay_ms;
+          if (ws->video_recv_stream) {
+            const auto v = ws->video_recv_stream->GetStats();
+            video_delay_ms = v.current_delay_ms;
+            video_jb_ms = v.jitter_buffer_ms;
+          }
+        }, std::chrono::milliseconds(20));
     if (rtt_ms < 0) rtt_ms = 0;  // unknown yet — keep the legacy "0" shape
     // Everything the closure above fills stays at its initialiser when the
     // worker queue never schedules, and a caller cannot tell a zero that was
@@ -3284,7 +3319,7 @@ char* veil_media_engine_get_stats(VeilMediaEngine* engine) {
         "\"tx_jitter_ms\":%d,\"tx_loss_pct\":%d,"
         "\"audio_delay_ms\":%u,\"audio_jb_ms\":%u,"
         "\"video_delay_ms\":%d,\"video_jb_ms\":%d,"
-        "\"pacer_delay_ms\":%lld,\"worker_stalled\":%d,"
+        "\"pacer_delay_ms\":%lld,\"worker_stalled\":%d,\"video_worker_stalled\":%d,"
         "\"video_tx_frames\":%llu,\"video_tx_fps\":%.1f,"
         "\"video_tx_max_gap_ms\":%lld,\"video_tx_holds_75ms\":%llu,"
         "\"video_rx_arrival_frames\":%llu,\"video_rx_arrival_fps\":%.1f,"
@@ -3311,7 +3346,7 @@ char* veil_media_engine_get_stats(VeilMediaEngine* engine) {
         static_cast<unsigned long long>(ws->shim->inbound_dropped_count()),
         static_cast<long long>(rtt_ms), jitter_ms, loss_pct, tx_jitter_ms,
         tx_loss_pct, audio_delay_ms, audio_jb_ms, video_delay_ms, video_jb_ms,
-        static_cast<long long>(pacer_delay_ms), sampled ? 0 : 1,
+        static_cast<long long>(pacer_delay_ms), sampled ? 0 : 1, video_sampled ? 0 : 1,
         static_cast<unsigned long long>(tx_video.frames),
         cadence_fps(tx_video),
         static_cast<long long>(tx_video.max_gap_ns / 1000000),
@@ -3494,4 +3529,8 @@ Java_network_veil_xveil_NativeCallVideoRenderer_nativeRemoteVideoStats(
   if (result != nullptr) env->SetLongArrayRegion(result, 0, 15, values);
   return result;
 }
+#endif
+
+#if defined(VEIL_MEDIA_TEST_HOOKS) && defined(VEIL_MEDIA_HAVE_WEBRTC)
+#include "../test/call_plane_hooks.inc"
 #endif

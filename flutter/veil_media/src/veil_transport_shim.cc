@@ -49,8 +49,11 @@ void slog(const char* fmt, ...) {
 
 VeilTransportShim::VeilTransportShim(uint64_t veil_chan,
                                      webrtc::Call* call,
-                                     webrtc::TaskQueueBase* network_queue)
-    : veil_chan_(veil_chan), call_(call), network_queue_(network_queue) {}
+                                     webrtc::TaskQueueBase* network_queue,
+                                     webrtc::Call* video_call,
+                                     webrtc::TaskQueueBase* video_network_queue)
+    : veil_chan_(veil_chan), call_(call), network_queue_(network_queue),
+      video_call_(video_call), video_network_queue_(video_network_queue) {}
 
 VeilTransportShim::~VeilTransportShim() {
   Stop();
@@ -58,8 +61,10 @@ VeilTransportShim::~VeilTransportShim() {
   // Stop cleared its buffers. Clearing this flag makes that task harmless
   // — it either already finished (the destructor waited for it here) or it
   // will find `alive == false` and touch nothing (report27 V23).
-  std::lock_guard<std::mutex> lock(task_guard_->mu);
-  task_guard_->alive = false;
+  for (const auto& guard : task_guards_) {
+    std::lock_guard<std::mutex> lock(guard->mu);
+    guard->alive = false;
+  }
 }
 
 void VeilTransportShim::MarkVideoFrame(std::span<const uint8_t> packet,
@@ -129,7 +134,7 @@ void VeilTransportShim::Stop() {
   // Fence a delivery already in progress before the owner destroys Call.
   // Pending tasks need not run: release their packets here, with no one-second
   // wait on a busy WebRTC network queue.
-  std::lock_guard<std::mutex> lock(task_guard_->mu);
+  std::scoped_lock lock(task_guards_[0]->mu, task_guards_[1]->mu);
   inbound_queue_.Clear();
 }
 
@@ -161,7 +166,7 @@ bool VeilTransportShim::SendRtp(std::span<const uint8_t> packet,
   // Close the send-side GCC timing loop. Our datagram send is synchronous on
   // the network thread, so stamp "now" and report immediately.
   if (sent && options.packet_id != -1) {
-    call_->OnSentPacket(
+    (IsSecondaryInboundRtp(packet) ? video_call_ : call_)->OnSentPacket(
         webrtc::SentPacketInfo(options.packet_id, webrtc::TimeMillis()));
   }
   return sent;
@@ -191,51 +196,61 @@ void VeilTransportShim::OnVeilDatagram(void* ctx, const uint8_t* ptr,
   if (!self->started_.load(std::memory_order_acquire)) return;
   MarkVideoFrame(std::span<const uint8_t>(ptr, len),
                  &self->inbound_video_cadence_);
-  const auto admission =
-      self->inbound_queue_.Push(std::span<const uint8_t>(ptr, len));
-  if (admission == InboundPacketQueue::Admission::Dropped) {
-    const uint64_t dropped =
-        self->inbound_dropped_overload_.fetch_add(1, std::memory_order_relaxed) + 1;
-    if (dropped == 1 || dropped % 500 == 0) {
-      slog("shim drop inbound overload chan=%llu len=%zu drops=%llu",
-           (unsigned long long)self->veil_chan_, len, (unsigned long long)dropped);
+  const int64_t arrived_us = webrtc::TimeMicros();
+  const auto enqueue = [self, ptr, len, arrived_us](bool secondary) {
+    const auto admission = self->inbound_queue_.PushToLane(
+        std::span<const uint8_t>(ptr, len), secondary, arrived_us);
+    if (admission == InboundPacketQueue::Admission::Dropped) {
+      const auto dropped = self->inbound_dropped_overload_.fetch_add(
+          1, std::memory_order_relaxed) + 1;
+      if (dropped == 1 || dropped % 500 == 0)
+        slog("shim drop inbound overload chan=%llu len=%zu drops=%llu",
+             (unsigned long long)self->veil_chan_, len, (unsigned long long)dropped);
+      return false;
     }
-    return;
-  }
-  if (self->inbound_packet_count_.load(std::memory_order_relaxed) == 0) {
-    slog("shim first inbound chan=%llu len=%zu",
-         (unsigned long long)self->veil_chan_, len);
-  }
-  self->inbound_packet_count_.fetch_add(1, std::memory_order_relaxed);
-  self->inbound_byte_count_.fetch_add(len, std::memory_order_relaxed);
-  if (admission == InboundPacketQueue::Admission::ScheduleDrain) {
-    self->PostInboundDrain();
+    if (admission == InboundPacketQueue::Admission::ScheduleDrain)
+      self->PostInboundDrain(secondary);
+    return true;
+  };
+  const bool rtcp = webrtc::IsRtcpPacket(std::span<const uint8_t>(ptr, len));
+  const bool accepted = enqueue(IsSecondaryInboundRtp(std::span<const uint8_t>(ptr, len)));
+  // Each Call owns independent SSRC/TWCC state. The upstream RTCP receiver
+  // filters report blocks and transport feedback by its registered SSRCs.
+  // A slow video network/worker queue cannot hold the audio copy.
+  if (rtcp) enqueue(true);
+  if (accepted) {
+    if (self->inbound_packet_count_.load(std::memory_order_relaxed) == 0)
+      slog("shim first inbound chan=%llu len=%zu", (unsigned long long)self->veil_chan_, len);
+    self->inbound_packet_count_.fetch_add(1, std::memory_order_relaxed);
+    self->inbound_byte_count_.fetch_add(len, std::memory_order_relaxed);
   }
 }
 
-void VeilTransportShim::PostInboundDrain() {
-  network_queue_->PostTask(
-      [self = this, guard = task_guard_]() {
+void VeilTransportShim::PostInboundDrain(bool secondary) {
+  auto* queue = secondary ? video_network_queue_ : network_queue_;
+  queue->PostTask(
+      [self = this, secondary, guard = task_guards_[secondary]]() {
         // The guard outlives the shim; the shim does not outlive the guard's
         // flag. Everything below touches `self`, so all of it is inside.
         std::lock_guard<std::mutex> lock(guard->mu);
         if (!guard->alive) return;
-        auto packet = self->inbound_queue_.Pop();
+        auto packet = self->inbound_queue_.PopLane(secondary);
         if (!packet) return;
         if (self->started_.load(std::memory_order_acquire)) {
-          self->DeliverOnNetworkThread(std::span<const uint8_t>(*packet));
+          self->DeliverOnNetworkThread(std::span<const uint8_t>(packet->bytes),
+                                       secondary, packet->arrived_us);
         }
         // Yield after every packet so this shim cannot monopolize the shared
         // network queue or another peer in a group call. The guard also covers
         // posting the successor: no raw self access can outlive destruction.
-        self->PostInboundDrain();
+        self->PostInboundDrain(secondary);
       });
 }
 
 void VeilTransportShim::DeliverOnNetworkThread(
-    std::span<const uint8_t> packet) {
+    std::span<const uint8_t> packet, bool secondary, int64_t arrived_us) {
   MarkVideoFrame(packet, &delivered_video_cadence_);
-  webrtc::PacketReceiver* receiver = call_->Receiver();
+  webrtc::PacketReceiver* receiver = (secondary ? video_call_ : call_)->Receiver();
   if (receiver == nullptr) return;
 
   // rtcp-mux demux (RFC 5761): route by packet type.
@@ -251,8 +266,12 @@ void VeilTransportShim::DeliverOnNetworkThread(
   // SetRemoteVideoSsrc when a video recv stream is created.
   webrtc::RtpPacketReceived rtp;
   if (!rtp.Parse(packet)) return;
+  // The default is -infinity. Preserve ingress time rather than stamping the
+  // later drain turn: local queueing is not network jitter.
+  rtp.set_arrival_time(webrtc::Timestamp::Micros(arrived_us));
   const uint32_t vssrc = remote_video_ssrc_.load();
   const bool is_video = (vssrc != 0 && rtp.Ssrc() == vssrc);
+  if (secondary != is_video) return;
   if (is_video) {
     // Video RTP uses the fixed 90 kHz clock. The audio path gets its clock from
     // the registered Opus codec, but nothing sets it for video on our custom

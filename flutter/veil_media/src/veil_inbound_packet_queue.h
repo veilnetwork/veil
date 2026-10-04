@@ -24,21 +24,30 @@ inline bool IsSecondaryInboundRtp(std::span<const uint8_t> packet) {
 
 // Own the bounded packets separately from the WebRTC task queue: posting a
 // task for every video packet would still put audio behind that entire FIFO.
-// At most one drain task is outstanding. Pop releases that claim atomically
-// with observing both queues empty, so a concurrent producer cannot lose its
+// Each lane has one outstanding drain task. PopLane releases its claim
+// atomically with observing that lane empty, so a concurrent producer cannot lose its
 // wakeup. Admission and copying also share this lock: multiple circuit feeds
 // cannot collectively overshoot the memory limit.
 class InboundPacketQueue {
  public:
+  struct Packet {
+    std::vector<uint8_t> bytes;
+    int64_t arrived_us;
+  };
   enum class Admission { Dropped, Queued, ScheduleDrain };
   static constexpr size_t kPrimaryPackets = 64;
   static constexpr size_t kSecondaryPackets = 192;
   static constexpr size_t kPrimaryBytes = 64 * 1024;
   static constexpr size_t kSecondaryBytes = 4 * 1024 * 1024 - kPrimaryBytes;
-  static constexpr size_t kPrimaryBurst = 8;
 
-  Admission Push(std::span<const uint8_t> packet) {
-    const bool secondary = IsSecondaryInboundRtp(packet);
+  Admission Push(std::span<const uint8_t> packet, int64_t arrived_us = 0) {
+    return PushToLane(packet, IsSecondaryInboundRtp(packet), arrived_us);
+  }
+
+  // RTCP is copied to both local Calls, whose SSRC filters select their own
+  // reports. The secondary copy shares video's bound, not audio's reserve.
+  Admission PushToLane(std::span<const uint8_t> packet, bool secondary,
+                       int64_t arrived_us = 0) {
     std::lock_guard<std::mutex> lock(mu_);
     auto& lane = secondary ? secondary_ : primary_;
     const size_t max_packets = secondary ? kSecondaryPackets : kPrimaryPackets;
@@ -47,34 +56,25 @@ class InboundPacketQueue {
         packet.size() > max_bytes - lane.bytes) {
       return Admission::Dropped;
     }
-    lane.packets.emplace_back(packet.begin(), packet.end());
+    lane.packets.push_back(Packet{
+        std::vector<uint8_t>(packet.begin(), packet.end()), arrived_us});
     lane.bytes += packet.size();
-    if (scheduled_) return Admission::Queued;
-    scheduled_ = true;
+    if (lane.scheduled) return Admission::Queued;
+    lane.scheduled = true;
     return Admission::ScheduleDrain;
   }
 
-  // Called by the one scheduled consumer. Preserve FIFO within each lane and
-  // bound primary bursts so continuous audio/control cannot starve video.
-  std::optional<std::vector<uint8_t>> Pop() {
+  // Independent consumers never wait for work in the other local lane.
+  std::optional<Packet> PopLane(bool secondary) {
     std::lock_guard<std::mutex> lock(mu_);
-    if (primary_.packets.empty() && secondary_.packets.empty()) {
-      scheduled_ = false;
-      primary_burst_ = 0;
+    auto& lane = secondary ? secondary_ : primary_;
+    if (lane.packets.empty()) {
+      lane.scheduled = false;
       return std::nullopt;
     }
-    const bool secondary = !secondary_.packets.empty() &&
-                           (primary_.packets.empty() ||
-                            primary_burst_ >= kPrimaryBurst);
-    auto& lane = secondary ? secondary_ : primary_;
     auto packet = std::move(lane.packets.front());
     lane.packets.pop_front();
-    lane.bytes -= packet.size();
-    if (secondary) {
-      primary_burst_ = 0;
-    } else if (primary_burst_ < kPrimaryBurst) {
-      ++primary_burst_;
-    }
+    lane.bytes -= packet.bytes.size();
     return packet;
   }
 
@@ -85,19 +85,18 @@ class InboundPacketQueue {
     std::lock_guard<std::mutex> lock(mu_);
     primary_.packets.clear();
     secondary_.packets.clear();
-    primary_.bytes = secondary_.bytes = primary_burst_ = 0;
+    primary_.bytes = secondary_.bytes = 0;
   }
 
  private:
   struct Lane {
-    std::deque<std::vector<uint8_t>> packets;
+    std::deque<Packet> packets;
     size_t bytes = 0;
+    bool scheduled = false;
   };
   std::mutex mu_;
   Lane primary_;
   Lane secondary_;
-  size_t primary_burst_ = 0;
-  bool scheduled_ = false;
 };
 
 }  // namespace veil_media
