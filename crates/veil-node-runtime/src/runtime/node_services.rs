@@ -2237,7 +2237,8 @@ impl NodeServices {
             .local_datagram_channel_state(&circuit.first_hop(), local_lane)
     }
 
-    /// Explicitly loss-tolerant data; reliable files/control use CircuitData.
+    /// Explicitly loss-tolerant data, including stream DATA with end-to-end ARQ.
+    /// One-shot control and stream handshakes keep reliable CircuitData.
     /// This generic transport property carries no audio/video role. A session
     /// without negotiated support encodes the old CircuitData on its stream.
     pub fn send_circuit_datagram_on_local_lane_detailed(

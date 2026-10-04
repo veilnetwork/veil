@@ -294,6 +294,7 @@ async fn chain(rotate: bool) {
             if *node == 1 || *node == 2 {
                 assert_eq!(d.sent(0), 0, "relay selected a source priority channel");
                 assert_eq!(d.sent(2), 0, "relay selected a source priority channel");
+                assert_eq!(d.sent(3), 0, "relay selected a source priority channel");
             }
             if rotate {
                 assert!(d.rekeys() > 0);

@@ -3985,10 +3985,11 @@ impl SessionRunner {
                         .and_then(|lane| lane.parallel.as_mut())
                 {
                     let pending = status.pending();
-                    for (mask, lane) in [
-                        (1, veil_proto::priority::REALTIME),
-                        (2, veil_proto::priority::BULK),
-                    ] {
+                    for (index, lane) in crate::local_datagram_status::LOCAL_DATAGRAM_PRIORITIES
+                        .into_iter()
+                        .enumerate()
+                    {
+                        let mask = 1 << index;
                         if pending & mask != 0 {
                             parallel.prepare(lane);
                         }

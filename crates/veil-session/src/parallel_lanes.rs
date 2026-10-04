@@ -11,7 +11,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use veil_transport::QuicParallelHandle;
 
 const BIND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
-const SOURCE_SLOTS: usize = 2;
+const SOURCE_SLOTS: usize = crate::local_datagram_status::LOCAL_DATAGRAM_PRIORITIES.len();
 const TRANSIT_SLOTS: usize = 2;
 const TOTAL_SLOTS: usize = SOURCE_SLOTS + TRANSIT_SLOTS;
 
@@ -110,13 +110,10 @@ impl ParallelQuicOffer {
 }
 
 fn channel_index(priority: u8) -> Option<usize> {
-    match priority {
-        veil_proto::priority::REALTIME => Some(0),
-        veil_proto::priority::BULK => Some(1),
-        // Forwarded traffic uses INTERACTIVE: it never requests a local
-        // producer's connection or causes a relay to favor a user.
-        _ => None,
-    }
+    // INTERACTIVE/transit has no source slot and never requests one.
+    crate::local_datagram_status::LOCAL_DATAGRAM_PRIORITIES
+        .iter()
+        .position(|&lane| lane == priority)
 }
 
 struct Channel {
@@ -530,11 +527,7 @@ impl ParallelSession {
         if let Some(lease) = &self.readiness
             && index < SOURCE_SLOTS
         {
-            let priority = if index == 0 {
-                veil_proto::priority::REALTIME
-            } else {
-                veil_proto::priority::BULK
-            };
+            let priority = crate::local_datagram_status::LOCAL_DATAGRAM_PRIORITIES[index];
             lease.mark(priority, slot.ready.is_some());
         }
         if slot.ready.is_some() {
