@@ -115,6 +115,8 @@ pub enum NextInput {
     /// The dedicated writer task exited, usually because the socket write
     /// half returned an error or stalled.
     WriterClosed,
+    /// The writer freed the slots required by the pending ordered batch.
+    WriterReady,
 }
 
 /// Wait for the next interesting event:
@@ -135,11 +137,22 @@ async fn await_next_input(
     sleep_until: Option<tokio::time::Instant>,
     wire_tx: &mpsc::Sender<veil_bufpool::PooledShared>,
     local_datagram_status: Option<&crate::local_datagram_status::LocalDatagramStatus>,
+    wire_capacity_needed: Option<usize>,
 ) -> NextInput {
     use std::future::pending;
     use tokio::io::AsyncReadExt as _;
 
     tokio::select! {
+        result = async {
+            match wire_capacity_needed {
+                Some(count) => wire_tx.reserve_many(count).await,
+                None => pending().await,
+            }
+        } => match result {
+            // Release the reservation; the sole producer drains on the next pass.
+            Ok(permits) => { drop(permits); NextInput::WriterReady },
+            Err(_) => NextInput::WriterClosed,
+        },
         _ = async {
             match local_datagram_status {
                 Some(status) => status.notified().await,
@@ -298,6 +311,9 @@ mod quic_backlog_tests;
 #[path = "local_reliable_admission.rs"]
 mod local_reliable_admission;
 
+#[path = "local_source_stream_budget.rs"]
+mod local_source_stream_budget;
+
 /// Tokio join handles detach when dropped; realtime receivers must instead be
 /// cancelled with their owning session so they cannot retain a QUIC connection
 /// or key material after stream close/hot-swap.
@@ -441,6 +457,24 @@ fn enqueue_outbox_envelope(
     envelope: crate::frame_outbox::FrameEnvelope,
 ) -> bool {
     let lossy = decode_realtime_lane_frame(&envelope.frame.1).is_some();
+    // CircuitDatagram is downgraded before enqueueing for some legacy hops.
+    // Its source-only local slot still identifies the low-latency producer;
+    // forwarded CircuitData always arrives in the neutral INTERACTIVE slot.
+    let legacy_circuit = envelope
+        .frame
+        .1
+        .get(..veil_proto::header::HEADER_SIZE)
+        .and_then(|bytes| decode_header_with_limit(bytes, u32::MAX).ok())
+        .is_some_and(|header| {
+            header.family == FrameFamily::RelayChain as u8
+                && header.msg_type == veil_proto::family::RelayChainMsg::CircuitData as u16
+        });
+    if envelope.frame.0 == veil_proto::priority::REALTIME
+        && envelope.carrier.is_none()
+        && (lossy || legacy_circuit)
+    {
+        pq.note_local_primary(std::time::Instant::now());
+    }
     pq.push_envelope(envelope, lossy);
     lossy
 }
@@ -4297,6 +4331,9 @@ impl SessionRunner {
                 };
                 let mut encrypted_batch_frames = Vec::new();
                 let mut encrypted_batch_wire_len = 0usize;
+                let mut batch_has_local_source = false;
+                let local_primary_active = pq.local_primary_active(std::time::Instant::now());
+                let mut source_bulk_waiting_for_writer = false;
                 while !coalesce_active
                     && drained_this_pass < drain_cap
                     // Real-time latency bound: one encrypted batch becomes one
@@ -4314,9 +4351,24 @@ impl SessionRunner {
                     // a write failure below and tore down the whole obfs4/TCP
                     // session during a short bulk burst.
                     && wire_tx.capacity() > 0
-                    && let Some(outgoing) = pq.pop()
+                    && let Some(envelope) = pq.pop_envelope_if(|priority, frame| {
+                        let pending_blobs = wire_tx.max_capacity().saturating_sub(wire_tx.capacity());
+                        source_bulk_waiting_for_writer = local_primary_active
+                            && priority >= veil_proto::priority::BULK
+                            && pending_blobs != 0;
+                        local_source_stream_budget::fits(
+                            local_primary_active,
+                            priority,
+                            pending_blobs,
+                            encrypted_batch_wire_len,
+                            encrypted_wire_len(frame.len()).unwrap_or(usize::MAX),
+                            batch_has_local_source,
+                        )
+                    })
                 {
                     drained_this_pass += 1;
+                    batch_has_local_source |= envelope.frame.0 != veil_proto::priority::INTERACTIVE;
+                    let outgoing = envelope.frame.1;
                     // A stream-only / old peer must see the old discriminant.
                     // Fallback is reliable for this hop; never reinterpret other
                     // CircuitData (files, probes, introductions) as lossy.
@@ -4439,6 +4491,15 @@ impl SessionRunner {
                     sleep_until,
                     &wire_tx,
                     local_datagram_status.as_deref(),
+                    if !pq.is_empty() && !coalesce_active {
+                        Some(if source_bulk_waiting_for_writer {
+                            wire_tx.max_capacity()
+                        } else {
+                            1
+                        })
+                    } else {
+                        None
+                    },
                 )
                 .await
                 {
@@ -4499,7 +4560,7 @@ impl SessionRunner {
                         );
                         continue;
                     }
-                    NextInput::LocalDatagramWarm => continue,
+                    NextInput::LocalDatagramWarm | NextInput::WriterReady => continue,
                     // Timer fires for keepalive/idle checks; also evict stale RPC
                     // response slots so they don't accumulate during quiet periods
                     // when no new RPC requests arrive.
@@ -5511,6 +5572,36 @@ mod m1_empty_frame_aead_tests {
 #[cfg(test)]
 mod realtime_lane_frame_tests {
     use super::*;
+
+    #[test]
+    fn local_source_stream_budget_is_not_activated_by_neutral_transit() {
+        use veil_proto::family::RelayChainMsg;
+        let body = [0x81; 2048];
+        for msg_type in [
+            RelayChainMsg::CircuitData as u16,
+            RelayChainMsg::CircuitDatagram as u16,
+        ] {
+            let encoded = frame(FrameFamily::RelayChain, msg_type, &body);
+            let mut pq = PriorityQueue::with_default_weights();
+            enqueue_outbox_frame(
+                &mut pq,
+                veil_proto::priority::INTERACTIVE,
+                veil_bufpool::pooled_shared_from_vec(encoded),
+            );
+            assert!(!pq.local_primary_active(std::time::Instant::now()));
+        }
+        let mut pq = PriorityQueue::with_default_weights();
+        enqueue_outbox_frame(
+            &mut pq,
+            veil_proto::priority::REALTIME,
+            veil_bufpool::pooled_shared_from_vec(frame(
+                FrameFamily::RelayChain,
+                RelayChainMsg::CircuitData as u16,
+                &body,
+            )),
+        );
+        assert!(pq.local_primary_active(std::time::Instant::now()));
+    }
 
     #[test]
     fn local_bulk_datagrams_cannot_consume_the_reserved_transport_space() {

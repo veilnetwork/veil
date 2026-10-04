@@ -92,6 +92,7 @@ pub struct PriorityQueue {
     /// in Prometheus the same scrape cycle it happens.
     drops_total: Arc<AtomicU64>,
     lossy_realtime_len: usize,
+    local_primary_seen: Option<Instant>,
 }
 
 impl PriorityQueue {
@@ -126,6 +127,7 @@ impl PriorityQueue {
             max_depth,
             drops_total,
             lossy_realtime_len: 0,
+            local_primary_seen: None,
         }
     }
 
@@ -332,6 +334,15 @@ impl PriorityQueue {
         (0..4u8).find(|&p| !self.queues[p as usize].is_empty())
     }
 
+    pub(crate) fn note_local_primary(&mut self, now: Instant) {
+        self.local_primary_seen = Some(now);
+    }
+
+    pub(crate) fn local_primary_active(&self, now: Instant) -> bool {
+        self.local_primary_seen
+            .is_some_and(|at| now.saturating_duration_since(at) < Duration::from_secs(3))
+    }
+
     /// Pop the FIFO head of the REALTIME queue only when `predicate` accepts
     /// it. This does not consume a WRR slot: the frame leaves the ordered
     /// stream scheduler and is carried by an independent realtime lane.
@@ -450,6 +461,15 @@ impl PriorityQueue {
         &mut self,
         predicate: impl FnOnce(&[u8]) -> bool,
     ) -> Option<crate::frame_outbox::FrameEnvelope> {
+        self.pop_envelope_if(|_, frame| predicate(frame))
+    }
+
+    /// Rejecting the selected FIFO head leaves it and its WRR slot intact.
+    /// The stream batch can flush before trying this whole frame again.
+    pub(crate) fn pop_envelope_if(
+        &mut self,
+        predicate: impl FnOnce(u8, &[u8]) -> bool,
+    ) -> Option<crate::frame_outbox::FrameEnvelope> {
         for attempt in 0..2 {
             for p in 0..4 {
                 if self.slots[p] == 0 {
@@ -466,7 +486,7 @@ impl PriorityQueue {
                     self.drops_total.fetch_add(1, Ordering::Relaxed);
                 }
                 if let Some(head) = self.queues[p].front() {
-                    if !predicate(&head.frame) {
+                    if !predicate(p as u8, &head.frame) {
                         return None;
                     }
                     let queued = self.queues[p].pop_front().expect("head checked above");
@@ -492,6 +512,31 @@ impl PriorityQueue {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn rejected_stream_head_preserves_fifo_and_round() {
+        let mut pq = super::PriorityQueue::with_default_weights();
+        pq.push(3, veil_bufpool::pooled_shared_from_vec(vec![1]));
+        pq.push(3, veil_bufpool::pooled_shared_from_vec(vec![2]));
+        let slots = pq.slots;
+        assert!(pq.pop_envelope_if(|_, _| false).is_none());
+        assert_eq!(pq.slots, slots);
+        assert_eq!(pq.len(), 2);
+        let head = pq.pop_envelope_if(|p, b| p == 3 && b == [1]).unwrap();
+        assert_eq!(&*head.frame.1, &[1]);
+        assert_eq!(&*pq.pop().unwrap(), &[2]);
+    }
+
+    #[test]
+    fn local_primary_window_expires_and_refreshes() {
+        let mut pq = super::PriorityQueue::with_default_weights();
+        let now = std::time::Instant::now();
+        assert!(!pq.local_primary_active(now));
+        pq.note_local_primary(now);
+        assert!(pq.local_primary_active(now + std::time::Duration::from_millis(2999)));
+        assert!(!pq.local_primary_active(now + std::time::Duration::from_secs(3)));
+        pq.note_local_primary(now + std::time::Duration::from_secs(2));
+        assert!(pq.local_primary_active(now + std::time::Duration::from_secs(3)));
+    }
     use super::*;
 
     fn arc(bytes: &[u8]) -> veil_bufpool::PooledShared {
