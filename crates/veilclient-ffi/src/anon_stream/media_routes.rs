@@ -501,6 +501,58 @@ impl MediaRoutes {
     }
 }
 
+#[cfg(all(test, feature = "test-low-difficulty"))]
+pub(crate) struct RouteSnapshot {
+    pub plane: u8,
+    pub origin: u32,
+    pub destination_cookie: [u8; 16],
+    pub return_cookie: [u8; 16],
+}
+
+#[cfg(all(test, feature = "test-low-difficulty"))]
+impl MediaRoutes {
+    pub(crate) fn on_node_for_test(
+        me: [u8; 32],
+        peer: [u8; 32],
+        channel: u64,
+        cipher: Arc<crate::media::MediaCipher>,
+    ) -> (Arc<Self>, mpsc::Receiver<(Addr, Vec<u8>)>) {
+        let (tx, rx) = mpsc::channel(1);
+        let core = super::try_open_circuit(me, tx, CircuitMode::PublishedRendezvous).unwrap();
+        let cores = [
+            core.isolated_producer(LocalMediaPlane::Primary),
+            core.isolated_producer(LocalMediaPlane::Secondary),
+        ];
+        (Self::new(peer, channel, cores, cipher), rx)
+    }
+
+    pub(crate) fn receive_addresses_for_test(&self) -> Vec<(u8, [u8; 16])> {
+        self.incoming
+            .lock()
+            .unwrap()
+            .0
+            .iter()
+            .flatten()
+            .map(|r| (r.plane, r.cookie))
+            .collect()
+    }
+
+    pub(crate) async fn outgoing_for_test(&self) -> Vec<RouteSnapshot> {
+        let mut routes = Vec::new();
+        for i in 0..2 {
+            if let Some((address, route, _)) = self.outgoing[i].lock().await.as_ref() {
+                routes.push(RouteSnapshot {
+                    plane: i as u8,
+                    origin: route.circuit.origin_circuit_id(),
+                    destination_cookie: address.cookie,
+                    return_cookie: route.cookie,
+                });
+            }
+        }
+        routes
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

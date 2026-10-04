@@ -159,6 +159,9 @@ async fn drain_anonymous_media<S, SF, W, WF>(
 #[cfg(all(test, feature = "node-embedded"))]
 mod media_priority_tests;
 
+#[cfg(all(test, feature = "node-embedded", feature = "test-low-difficulty"))]
+mod media_route_network_tests;
+
 /// The secondary sender is a local IPC handle, never a network flow label.
 /// Cloning it before an await keeps the routing lock out of either pump.
 #[cfg(feature = "node-embedded")]
