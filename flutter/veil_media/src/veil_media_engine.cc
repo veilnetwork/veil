@@ -2164,8 +2164,32 @@ char* veil_media_group_engine_get_stats(VeilGroupMediaEngine* engine) {
     jitter = std::max(jitter, report.jitter_ms);
     rtt = std::max(rtt, report.rtt_ms);
   }
+  // Count packets accepted by each real audio receive stream. Shim ingress
+  // also includes video, RTCP and packets rejected by the audio demuxer; it
+  // must not keep a silent participant's audio watchdog alive.
+  std::string audio_receivers;
   const bool audio_sampled = veil_media::run_on_with_timeout(
-      ws->worker_tq.get(), [] {}, std::chrono::milliseconds(20));
+      ws->worker_tq.get(), [&] {
+        constexpr char hex[] = "0123456789abcdef";
+        for (const auto& entry : ws->peers) {
+          if (!entry.second->recv_stream) continue;
+          const auto sample = entry.second->recv_stream->GetStats(false);
+          char id[65];
+          for (size_t i = 0; i < 32; ++i) {
+            id[2 * i] = hex[entry.second->id[i] >> 4];
+            id[2 * i + 1] = hex[entry.second->id[i] & 15];
+          }
+          id[64] = '\0';
+          char receiver[192];
+          const int size = std::snprintf(receiver, sizeof(receiver),
+              "\"%s\":{\"audio_rx_pkts\":%llu,\"audio_delay_ms\":%u}", id,
+              static_cast<unsigned long long>(sample.packets_received),
+              sample.delay_estimate_ms);
+          if (size <= 0 || static_cast<size_t>(size) >= sizeof(receiver)) continue;
+          if (!audio_receivers.empty()) audio_receivers += ',';
+          audio_receivers.append(receiver, static_cast<size_t>(size));
+        }
+      }, std::chrono::milliseconds(20));
   const bool video_sampled = veil_media::run_on_with_timeout(ws->video_worker_tq.get(), [&] {
     if (ws->video_send_stream) video_frames = ws->video_send_stream->GetStats().frames_encoded;
     fps = ws->video_max_fps.load(std::memory_order_relaxed);
@@ -2180,7 +2204,14 @@ char* veil_media_group_engine_get_stats(VeilGroupMediaEngine* engine) {
       static_cast<unsigned long long>(ws->fanout->audio_drops()),
       static_cast<unsigned long long>(video_frames), fps, kbps,
       audio_sampled ? 0 : 1, video_sampled ? 0 : 1);
-  return written > 0 && static_cast<size_t>(written) < sizeof(json) ? dup_cstr(json) : nullptr;
+  if (written <= 0 || static_cast<size_t>(written) >= sizeof(json)) return nullptr;
+  // Capability remains explicit on a stalled worker: unknown audio never
+  // falls back to video ingress. These fields are endpoint-local JSON only.
+  std::string snapshot(json, static_cast<size_t>(written) - 1);
+  snapshot += ",\"audio_rx_supported\":1,\"audio_receivers\":{";
+  if (audio_sampled) snapshot += audio_receivers;
+  snapshot += "}}";
+  return dup_cstr(snapshot.c_str());
 #else
   return dup_cstr("{}");
 #endif
