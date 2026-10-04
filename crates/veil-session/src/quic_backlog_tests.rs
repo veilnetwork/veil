@@ -277,11 +277,21 @@ async fn endpoint_backlog_bound_keeps_primary_cells_fresh_on_a_neutral_slow_link
     );
 }
 
-// Deliberately retained as a failing characterization, not a passing quality
-// gate: one physical congestion budget still cannot sustain these producers.
-#[tokio::test]
-#[ignore = "Known shared-connection latency/loss under sustained load; run with --ignored --nocapture"]
-async fn continuous_primary_delivery_under_video_and_reliable_stream_load() {
+#[derive(Debug)]
+struct ContinuousReport {
+    primary_sent: usize,
+    primary_received: usize,
+    primary_p95: Option<Duration>,
+    secondary_sent: usize,
+    secondary_dropped: usize,
+    file_bytes: u64,
+}
+
+async fn measure_continuous(
+    file: bool,
+    video_tick_period: Option<u32>,
+    primary_tick_period: u32,
+) -> ContinuousReport {
     use crate::datagram_flows::{SessionDatagramRx, SessionDatagramTx};
     use veil_anonymity::circuit_wire::CircuitDataPayload;
     use veil_proto::{
@@ -341,10 +351,12 @@ async fn continuous_primary_delivery_under_video_and_reliable_stream_load() {
         }
     });
     let file_writer = tokio::spawn(async move {
-        local_stream
-            .write_all(&vec![0xb2; 4 * 1024 * 1024])
-            .await
-            .unwrap();
+        if file {
+            local_stream
+                .write_all(&vec![0xb2; 4 * 1024 * 1024])
+                .await
+                .unwrap();
+        }
         std::future::pending::<()>().await;
         drop(local_stream);
     });
@@ -383,10 +395,11 @@ async fn continuous_primary_delivery_under_video_and_reliable_stream_load() {
     for tick in 0..200u32 {
         sleep_until(started + Duration::from_millis(u64::from(tick) * 10)).await;
         let ceiling = tx.max_size().unwrap();
-        if tick % 2 == 0 {
+        if tick % primary_tick_period == 0 {
             let mut primary = circuit_frame(1, 0x11);
             // Circuit header is id:u32 + seq:u32 + ciphertext_len:u16.
-            primary[HEADER_SIZE + 4..HEADER_SIZE + 8].copy_from_slice(&(tick / 2).to_be_bytes());
+            primary[HEADER_SIZE + 4..HEADER_SIZE + 8]
+                .copy_from_slice(&(tick / primary_tick_period).to_be_bytes());
             primary[HEADER_SIZE + 10..HEADER_SIZE + 18]
                 .copy_from_slice(&(started.elapsed().as_nanos() as u64).to_be_bytes());
             let packets = cipher
@@ -402,6 +415,12 @@ async fn continuous_primary_delivery_under_video_and_reliable_stream_load() {
                 }
                 primary_sent += 1;
             }
+        }
+        // Low-cadence capture is an independent producer. Offset its compact
+        // frames by one tick instead of forcing every frame to coincide with
+        // primary admission (which can intentionally shed the whole frame).
+        if video_tick_period.is_none_or(|period| (tick + period - 1) % period != 0) {
+            continue;
         }
         let secondary = circuit_frame(2, 0x22);
         let packets = cipher
@@ -430,7 +449,7 @@ async fn continuous_primary_delivery_under_video_and_reliable_stream_load() {
     samples.sort_unstable();
     let p95 = samples.get(samples.len() * 95 / 100).copied();
     eprintln!(
-        "continuous: primary_sent={primary_sent} primary_received={} primary_p95_ms={:?} secondary_sent={secondary_sent} secondary_dropped={secondary_dropped} file_bytes={} neutral_udp_drops={}",
+        "continuous: file={file} video_tick_period={video_tick_period:?} primary_tick_period={primary_tick_period} primary_sent={primary_sent} primary_received={} primary_p95_ms={:?} secondary_sent={secondary_sent} secondary_dropped={secondary_dropped} file_bytes={} neutral_udp_drops={}",
         samples.len(),
         p95.map(|v| v.as_secs_f64() * 1000.0),
         file_bytes.load(Ordering::Relaxed),
@@ -440,16 +459,68 @@ async fn continuous_primary_delivery_under_video_and_reliable_stream_load() {
         task.abort();
         let _ = task.await;
     }
-    assert_eq!(primary_sent, 100);
-    assert!(secondary_sent > 0 && secondary_dropped > 0);
+    ContinuousReport {
+        primary_sent,
+        primary_received: samples.len(),
+        primary_p95: p95,
+        secondary_sent,
+        secondary_dropped,
+        file_bytes: file_bytes.load(Ordering::Relaxed),
+    }
+}
+
+fn require_primary_quality(report: &ContinuousReport) {
+    assert_eq!(report.primary_sent, 100);
     assert!(
-        file_bytes.load(Ordering::Relaxed) > 0,
-        "file must actually cross the link"
+        report.primary_received >= 95,
+        "too many primary cells lost: {report:?}"
     );
     assert!(
-        samples.len() >= 95,
-        "too many primary cells lost: {}",
-        samples.len()
+        report
+            .primary_p95
+            .is_some_and(|v| v < Duration::from_millis(200)),
+        "{report:?}"
     );
-    assert!(p95.unwrap() < Duration::from_millis(200), "{p95:?}");
+}
+
+#[tokio::test]
+async fn continuous_primary_delivery_on_a_neutral_link_without_competing_load() {
+    let report = measure_continuous(false, None, 2).await;
+    assert_eq!(report.file_bytes, 0);
+    assert_eq!((report.secondary_sent, report.secondary_dropped), (0, 0));
+    require_primary_quality(&report);
+}
+
+// A manual matrix characterizes the sustained-load root cause; it is not a
+// passing quality gate for the loaded configurations. Every case has fresh
+// connections and the same neutral FIFO, padding and authentication.
+#[tokio::test]
+#[ignore = "Manual shared-connection load matrix; run with --ignored --nocapture"]
+async fn characterize_continuous_primary_with_independent_competing_producers() {
+    for (file, video_period, period) in [
+        (false, None, 2),
+        (false, Some(1), 2),
+        (true, None, 2),
+        (true, Some(1), 2),
+        (true, Some(1), 4),
+        // Lowest anonymous video cadence: 2 padded frames/s, no file.
+        (false, Some(50), 2),
+    ] {
+        let report = measure_continuous(file, video_period, period).await;
+        assert_eq!(report.primary_sent as u32, 200 / period);
+        assert!(report.primary_received > 0);
+        assert_eq!(report.file_bytes > 0, file);
+        assert_eq!(report.secondary_sent > 0, video_period.is_some());
+    }
+}
+
+// Deliberately retained as a failing characterization, not a passing quality
+// gate: one physical congestion budget still cannot sustain these producers.
+#[tokio::test]
+#[ignore = "Known shared-connection latency/loss under sustained load; run with --ignored --nocapture"]
+async fn continuous_primary_delivery_under_video_and_reliable_stream_load() {
+    let report = measure_continuous(true, Some(1), 2).await;
+    assert!(report.secondary_sent > 0 && report.secondary_dropped > 0);
+    assert!(report.file_bytes > 0, "file must actually cross the link");
+    require_primary_quality(&report);
 }
