@@ -10,13 +10,10 @@
 #include "veil_diag_log.h"
 
 #include <atomic>
-#include <chrono>
 #include <cstdarg>
 #include <cstddef>
 #include <span>
-#include <thread>
 #include <utility>
-#include <vector>
 
 #include "api/task_queue/task_queue_base.h"
 #include "call/call.h"
@@ -39,8 +36,6 @@ int veil_media_set_recv_callback(uint64_t chan, VeilMediaRecvFn cb, void* ctx);
 
 namespace veil_media {
 namespace {
-constexpr size_t kMaxInboundPendingPackets = 256;
-constexpr size_t kMaxInboundPendingBytes = 4 * 1024 * 1024;
 constexpr uint8_t kVp8PayloadType = 96;
 constexpr int64_t kHoldThresholdNs = 75 * 1000 * 1000;
 
@@ -59,9 +54,8 @@ VeilTransportShim::VeilTransportShim(uint64_t veil_chan,
 
 VeilTransportShim::~VeilTransportShim() {
   Stop();
-  // AFTER Stop, and this is the part Stop cannot do: Stop gives up after a
-  // second and returns, so a task posted to the network queue may still be
-  // waiting to run. Clearing the flag under the lock makes that task harmless
+  // A task posted to the network queue may still be waiting to run after
+  // Stop cleared its buffers. Clearing this flag makes that task harmless
   // — it either already finished (the destructor waited for it here) or it
   // will find `alive == false` and touch nothing (report27 V23).
   std::lock_guard<std::mutex> lock(task_guard_->mu);
@@ -132,12 +126,11 @@ void VeilTransportShim::Stop() {
   if (!started_.compare_exchange_strong(expected, false)) return;
   veil_media_set_recv_callback(veil_chan_, nullptr, nullptr);
   slog("shim Stop chan=%llu recv_cb cleared", (unsigned long long)veil_chan_);
-  for (int i = 0; i < 200; ++i) {
-    if (inbound_pending_packets_.load(std::memory_order_acquire) == 0) return;
-    std::this_thread::sleep_for(std::chrono::milliseconds(5));
-  }
-  slog("shim Stop timed out with pending inbound packets=%zu bytes=%zu",
-       inbound_pending_packets_.load(), inbound_pending_bytes_.load());
+  // Fence a delivery already in progress before the owner destroys Call.
+  // Pending tasks need not run: release their packets here, with no one-second
+  // wait on a busy WebRTC network queue.
+  std::lock_guard<std::mutex> lock(task_guard_->mu);
+  inbound_queue_.Clear();
 }
 
 bool VeilTransportShim::SendRtp(std::span<const uint8_t> packet,
@@ -188,8 +181,9 @@ bool VeilTransportShim::SendRtcp(std::span<const uint8_t> packet,
   return false;
 }
 
-// static — invoked on a tokio worker thread (foreign to WebRTC). Copy the bytes
-// and hop to the network queue; the borrowed `ptr` is only valid for this call.
+// static — invoked on a tokio worker thread (foreign to WebRTC). Queue a copy;
+// the borrowed `ptr` is only valid for this call. Only authenticated plaintext
+// reaches this callback; lane selection is private to this endpoint.
 void VeilTransportShim::OnVeilDatagram(void* ctx, const uint8_t* ptr,
                                        size_t len) {
   auto* self = static_cast<VeilTransportShim*>(ctx);
@@ -197,42 +191,44 @@ void VeilTransportShim::OnVeilDatagram(void* ctx, const uint8_t* ptr,
   if (!self->started_.load(std::memory_order_acquire)) return;
   MarkVideoFrame(std::span<const uint8_t>(ptr, len),
                  &self->inbound_video_cadence_);
-  const size_t pending_packets =
-      self->inbound_pending_packets_.load(std::memory_order_relaxed);
-  const size_t pending_bytes =
-      self->inbound_pending_bytes_.load(std::memory_order_relaxed);
-  if (pending_packets >= kMaxInboundPendingPackets ||
-      pending_bytes + len > kMaxInboundPendingBytes) {
+  const auto admission =
+      self->inbound_queue_.Push(std::span<const uint8_t>(ptr, len));
+  if (admission == InboundPacketQueue::Admission::Dropped) {
     const uint64_t dropped =
         self->inbound_dropped_overload_.fetch_add(1, std::memory_order_relaxed) + 1;
     if (dropped == 1 || dropped % 500 == 0) {
-      slog("shim drop inbound overload chan=%llu pending=%zu bytes=%zu len=%zu drops=%llu",
-           (unsigned long long)self->veil_chan_, pending_packets,
-           pending_bytes, len, (unsigned long long)dropped);
+      slog("shim drop inbound overload chan=%llu len=%zu drops=%llu",
+           (unsigned long long)self->veil_chan_, len, (unsigned long long)dropped);
     }
     return;
   }
-  std::vector<uint8_t> owned(ptr, ptr + len);
   if (self->inbound_packet_count_.load(std::memory_order_relaxed) == 0) {
     slog("shim first inbound chan=%llu len=%zu",
          (unsigned long long)self->veil_chan_, len);
   }
   self->inbound_packet_count_.fetch_add(1, std::memory_order_relaxed);
   self->inbound_byte_count_.fetch_add(len, std::memory_order_relaxed);
-  self->inbound_pending_packets_.fetch_add(1, std::memory_order_release);
-  self->inbound_pending_bytes_.fetch_add(owned.size(), std::memory_order_release);
-  self->network_queue_->PostTask(
-      [self, guard = self->task_guard_, buf = std::move(owned)]() mutable {
+  if (admission == InboundPacketQueue::Admission::ScheduleDrain) {
+    self->PostInboundDrain();
+  }
+}
+
+void VeilTransportShim::PostInboundDrain() {
+  network_queue_->PostTask(
+      [self = this, guard = task_guard_]() {
         // The guard outlives the shim; the shim does not outlive the guard's
         // flag. Everything below touches `self`, so all of it is inside.
         std::lock_guard<std::mutex> lock(guard->mu);
         if (!guard->alive) return;
+        auto packet = self->inbound_queue_.Pop();
+        if (!packet) return;
         if (self->started_.load(std::memory_order_acquire)) {
-          self->DeliverOnNetworkThread(std::span<const uint8_t>(buf));
+          self->DeliverOnNetworkThread(std::span<const uint8_t>(*packet));
         }
-        self->inbound_pending_bytes_.fetch_sub(buf.size(),
-                                               std::memory_order_release);
-        self->inbound_pending_packets_.fetch_sub(1, std::memory_order_release);
+        // Yield after every packet so this shim cannot monopolize the shared
+        // network queue or another peer in a group call. The guard also covers
+        // posting the successor: no raw self access can outlive destruction.
+        self->PostInboundDrain();
       });
 }
 
