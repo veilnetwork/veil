@@ -160,6 +160,13 @@ async fn receive_primary(
 // Each case has a fresh real connection so a previous load's congestion
 // controller state cannot make the production case artificially faster.
 async fn measure(capacity_only: Option<bool>) -> (Option<Duration>, usize, usize) {
+    measure_burst(capacity_only, veil_proto::priority::BULK).await
+}
+
+async fn measure_burst(
+    capacity_only: Option<bool>,
+    burst_priority: u8,
+) -> (Option<Duration>, usize, usize) {
     use crate::datagram_flows::{MAX_FRAME_WIRE_BYTES, SessionDatagramRx, SessionDatagramTx};
     use veil_proto::priority::{BULK, REALTIME};
     let left = UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -202,7 +209,7 @@ async fn measure(capacity_only: Option<bool>) -> (Option<Duration>, usize, usize
     let mut cipher_rx = SessionDatagramRx::new(&[7; 32], &[8; 32], true);
     let ceiling = tx.max_size().unwrap();
     let secondary_wire = cipher_tx
-        .encode_frame(u64::from(BULK), &secondary, ceiling)
+        .encode_frame(u64::from(burst_priority), &secondary, ceiling)
         .unwrap()
         .iter()
         .map(Vec::len)
@@ -211,18 +218,25 @@ async fn measure(capacity_only: Option<bool>) -> (Option<Duration>, usize, usize
     if let Some(capacity_only) = capacity_only {
         // All admission and fragments run before yielding to Quinn's driver.
         // The regression side reproduces the previous production reserve.
-        loop {
+        for _ in 0..20 {
             let available = tx.send_buffer_space();
             let fits = if capacity_only {
-                secondary_wire + MAX_FRAME_WIRE_BYTES <= available
+                let reserve = if burst_priority == BULK {
+                    MAX_FRAME_WIRE_BYTES
+                } else {
+                    0
+                };
+                secondary_wire + reserve <= available
+            } else if burst_priority == REALTIME {
+                super::local_primary_datagram_fits(secondary_wire, available)
             } else {
-                super::local_datagram_fits(BULK, secondary_wire, available)
+                super::local_datagram_fits(burst_priority, secondary_wire, available)
             };
             if !fits {
                 break;
             }
             for packet in cipher_tx
-                .encode_frame(u64::from(BULK), &secondary, ceiling)
+                .encode_frame(u64::from(burst_priority), &secondary, ceiling)
                 .unwrap()
             {
                 tx.send(&packet).unwrap();
@@ -234,17 +248,34 @@ async fn measure(capacity_only: Option<bool>) -> (Option<Duration>, usize, usize
     let packets = cipher_tx
         .encode_frame(u64::from(REALTIME), &primary, ceiling)
         .unwrap();
+    // The paced producer may shed a full-buffer sample and try a fresh one
+    // on its next turn. Include this admission wait in the reported delay.
+    let admission_started = Instant::now();
+    if burst_priority == REALTIME && capacity_only == Some(false) {
+        timeout(Duration::from_secs(1), async {
+            while !super::local_primary_datagram_fits(
+                packets.iter().map(Vec::len).sum(),
+                tx.send_buffer_space(),
+            ) {
+                sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("primary backlog never drains");
+    }
     assert!(super::local_datagram_fits(
         REALTIME,
         packets.iter().map(Vec::len).sum(),
         tx.send_buffer_space(),
     ));
+    let admission_wait = admission_started.elapsed();
     for packet in packets {
         tx.send(&packet).unwrap();
     }
     let (elapsed, received) = receive_primary(&rx, &mut cipher_rx, &primary, &secondary).await;
+    let elapsed = elapsed.map(|elapsed| elapsed + admission_wait);
     eprintln!(
-        "capacity_only={capacity_only:?} queued_bytes={queued} secondary_received={received} primary_ms={:?} neutral_udp_drops={}",
+        "capacity_only={capacity_only:?} burst_priority={burst_priority} queued_bytes={queued} secondary_received={received} primary_ms={:?} neutral_udp_drops={}",
         elapsed.map(|v| v.as_secs_f64() * 1000.0),
         link.dropped.load(Ordering::Relaxed),
     );
@@ -274,6 +305,30 @@ async fn endpoint_backlog_bound_keeps_primary_cells_fresh_on_a_neutral_slow_link
     assert!(
         old.is_none_or(|old| old > current + Duration::from_millis(200)),
         "capacity-only admission must fail the same latency requirement: {old:?} vs {current:?}"
+    );
+}
+
+#[tokio::test]
+async fn primary_burst_cannot_replay_a_large_local_quic_backlog() {
+    use veil_proto::priority::REALTIME;
+    let (old, old_queued, old_received) = measure_burst(Some(true), REALTIME).await;
+    assert!(
+        old_queued > 32 * 1024,
+        "old primary must really queue a burst"
+    );
+    assert!(old_received > 4, "old primary samples must actually arrive");
+    let (current, current_queued, current_received) = measure_burst(Some(false), REALTIME).await;
+    assert!(current_queued > 0, "the source burst must not be omitted");
+    assert!(
+        current_queued < 8 * 1024,
+        "primary backlog={current_queued}"
+    );
+    assert!(current_received > 0);
+    let current = current.expect("fresh primary sample must arrive");
+    assert!(current < Duration::from_millis(200), "{current:?}");
+    assert!(
+        old.is_none_or(|old| old > current + Duration::from_millis(200)),
+        "capacity-only primary must demonstrate stale delivery: {old:?} vs {current:?}"
     );
 }
 
