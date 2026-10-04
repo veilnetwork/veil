@@ -111,7 +111,10 @@ int veil_media_group_engine_stop_video(VeilGroupMediaEngine *engine);
 int veil_media_group_engine_set_video_bitrate(VeilGroupMediaEngine *engine,
                                               int max_bitrate_kbps, int max_fps);
 /* Group audio quality: maxima over fresh RTCP audio report blocks (15 s).
- * Video telemetry is sampled independently with a 20 ms scheduling wait.
+ * `audio_receivers` maps peer-id hex to accepted `audio_rx_pkts` and the
+ * native `audio_delay_ms` estimate. `audio_rx_supported` stays 1 even when
+ * `worker_stalled` is 1 and the receiver map is empty (unknown, not healthy).
+ * Audio and video telemetry have separate 20 ms scheduling waits.
  * Free this JSON with veil_media_free_string. */
 char *veil_media_group_engine_get_stats(VeilGroupMediaEngine *engine);
 int veil_media_group_engine_start_camera(VeilGroupMediaEngine *engine,
