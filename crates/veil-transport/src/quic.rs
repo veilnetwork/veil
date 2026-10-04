@@ -273,6 +273,40 @@ fn boxed_quic_connection(
     )) as Box<dyn TransportConnection>
 }
 
+// Canonical connections alone may create siblings. Children use the plain
+// boxed constructor, preventing recursive budgets or endpoint accept loops.
+fn boxed_parallel_quic_connection(
+    peer: PeerMeta,
+    endpoint: quinn::Endpoint,
+    connection: quinn::Connection,
+    stream: BoxIoStream,
+    context: Arc<TransportContext>,
+    exclusive_accept: bool,
+) -> Box<dyn TransportConnection> {
+    let mut dial_peer = peer.clone();
+    if !exclusive_accept {
+        // An accepted peer's URI describes OUR listener. For reverse dial use
+        // the authenticated connection's remote socket, preserving explicit
+        // SNI/ALPN and the original TLS policy.
+        if let TransportUri::Quic { host, port, .. } = &mut dial_peer.uri {
+            let remote = connection.remote_address();
+            *host = remote.ip().to_string();
+            *port = remote.port();
+        }
+    }
+    let parallel = QuicParallelHandle::new(
+        endpoint.clone(),
+        connection.clone(),
+        dial_peer,
+        context,
+        exclusive_accept,
+        true,
+    );
+    let mut transport = QuicTransportConnection::new(peer, endpoint, connection, stream);
+    transport.parallel = Some(parallel);
+    Box::new(transport)
+}
+
 fn native_quic_peer(
     uri: TransportUri,
     local_addr: Option<std::net::SocketAddr>,
@@ -286,8 +320,13 @@ fn native_quic_peer(
 fn boxed_quic_listener(
     endpoint: quinn::Endpoint,
     bind_uri: TransportUri,
+    context: Arc<TransportContext>,
 ) -> Box<dyn TransportListener> {
-    Box::new(QuicTransportListener { endpoint, bind_uri }) as Box<dyn TransportListener>
+    Box::new(QuicTransportListener {
+        endpoint,
+        bind_uri,
+        context,
+    }) as Box<dyn TransportListener>
 }
 
 type QuicConnectParts<'a> = (&'a str, u16, Option<&'a str>, Vec<Vec<u8>>);
@@ -657,6 +696,8 @@ pub async fn promote_punched_quic(
         connection.clone(),
         peer_meta.clone(),
         Arc::clone(&ctx),
+        true,
+        false,
     );
     let mut transport = QuicTransportConnection::new(peer_meta, endpoint, connection, stream);
     transport.parallel = Some(parallel);
@@ -678,6 +719,7 @@ async fn connect_native_quic(
     alpn: Vec<Vec<u8>>,
 ) -> Result<(quinn::Endpoint, std::net::SocketAddr, quinn::Connection)> {
     let mut endpoint = build_client_endpoint(ctx.quic.bind_addr)?;
+    endpoint.set_server_config(Some(build_quic_server_config(ctx, alpn.clone())?));
     endpoint.set_default_client_config(build_quic_client_config(ctx, alpn)?);
     let remote_addrs = resolve_remote_addr(ctx, host, port).await?;
     // Try all resolved addresses (IPv4 + IPv6), not just the first.
@@ -775,6 +817,7 @@ impl TransportConnection for QuicTransportConnection {
 struct QuicTransportListener {
     endpoint: quinn::Endpoint,
     bind_uri: TransportUri,
+    context: Arc<TransportContext>,
 }
 
 /// Bound the QUIC handshake + first-stream accept (audit cycle-8 H2). The QUIC
@@ -813,11 +856,13 @@ impl TransportListener for QuicTransportListener {
                 Box::new(QuicBidiStream { recv, send })
             };
 
-            Ok(boxed_quic_connection(
+            Ok(boxed_parallel_quic_connection(
                 peer_meta,
                 self.endpoint.clone(),
                 connection,
                 stream,
+                Arc::clone(&self.context),
+                false,
             ))
         })
     }
@@ -838,6 +883,7 @@ impl TransportListener for QuicTransportListener {
             let remote_addr = incoming.remote_address();
             let bind_uri = self.bind_uri.clone();
             let endpoint = self.endpoint.clone();
+            let context = Arc::clone(&self.context);
             let finish: BoxFuture<'static, Result<Box<dyn TransportConnection>>> =
                 Box::pin(async move {
                     // See `accept()` above: consume Incoming once, then time
@@ -854,8 +900,8 @@ impl TransportListener for QuicTransportListener {
                                 .map_err(|_| quic_error("quic accept_bi timed out"))??;
                         Box::new(QuicBidiStream { recv, send })
                     };
-                    Ok(boxed_quic_connection(
-                        peer_meta, endpoint, connection, stream,
+                    Ok(boxed_parallel_quic_connection(
+                        peer_meta, endpoint, connection, stream, context, false,
                     ))
                 });
             Ok(RawInbound {
@@ -901,8 +947,8 @@ impl Transport for QuicTransport {
                 Box::new(QuicBidiStream { recv, send })
             };
 
-            Ok(boxed_quic_connection(
-                peer_meta, endpoint, connection, stream,
+            Ok(boxed_parallel_quic_connection(
+                peer_meta, endpoint, connection, stream, ctx, true,
             ))
         })
     }
@@ -915,7 +961,7 @@ impl Transport for QuicTransport {
         Box::pin(async move {
             let (host, port, alpn) = quic_bind_parts(uri)?;
             let endpoint = bind_native_quic(&ctx, host, port, alpn).await?;
-            Ok(boxed_quic_listener(endpoint, uri.clone()))
+            Ok(boxed_quic_listener(endpoint, uri.clone(), ctx))
         })
     }
 }

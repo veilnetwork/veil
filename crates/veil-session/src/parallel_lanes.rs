@@ -1,7 +1,11 @@
 //! Endpoint-only sibling selection. Remote accepts see only generic proofs;
 //! they dispatch through the canonical peer's existing budgets and identity.
 use super::*;
-use crate::parallel_binding::{HELLO_BYTES, ParallelParent, ParallelParentHandle};
+use crate::parallel_binding::{HELLO_BYTES, ParallelKeys, ParallelParent, ParallelParentHandle};
+
+#[path = "parallel_registry.rs"]
+mod registry;
+pub use registry::{ParallelPeekOutcome, ParallelRegistry};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use veil_transport::QuicParallelHandle;
@@ -39,12 +43,13 @@ impl ParallelDiagnostics {
     }
 }
 
-/// Offered only after peer capability and exclusive transport negotiation.
+/// Offered only after peer capability negotiation.
 /// Clones retain the endpoint, but do not own session authorization.
 #[derive(Clone)]
 pub struct ParallelQuicOffer {
     handle: QuicParallelHandle,
     diagnostics: Arc<ParallelDiagnostics>,
+    registry: Option<Arc<ParallelRegistry>>,
 }
 
 impl ParallelQuicOffer {
@@ -52,8 +57,15 @@ impl ParallelQuicOffer {
         Self {
             handle,
             diagnostics: Arc::default(),
+            registry: None,
         }
     }
+    /// Use the runtime's single shared-listener dispatcher.
+    pub fn with_registry(mut self, registry: Arc<ParallelRegistry>) -> Self {
+        self.registry = Some(registry);
+        self
+    }
+
     pub fn diagnostics(&self) -> Arc<ParallelDiagnostics> {
         Arc::clone(&self.diagnostics)
     }
@@ -72,7 +84,7 @@ fn channel_index(priority: u8) -> Option<usize> {
 struct Channel {
     handle: veil_transport::QuicDatagramHandle,
     stream: BoxIoStream,
-    diagnostics: Arc<ParallelDiagnostics>,
+    diagnostics: Option<Arc<ParallelDiagnostics>>,
 }
 
 impl Channel {
@@ -94,7 +106,7 @@ impl Channel {
         Ok(Self {
             handle,
             stream,
-            diagnostics,
+            diagnostics: Some(diagnostics),
         })
     }
 }
@@ -102,7 +114,9 @@ impl Channel {
 impl Drop for Channel {
     fn drop(&mut self) {
         self.handle.close();
-        self.diagnostics.active.fetch_sub(1, Ordering::AcqRel);
+        if let Some(diagnostics) = &self.diagnostics {
+            diagnostics.active.fetch_sub(1, Ordering::AcqRel);
+        }
     }
 }
 
@@ -182,6 +196,14 @@ async fn receive_child(
     let Ok(Some(keys)) = authenticated else {
         return;
     };
+    receive_authenticated(channel, keys, context).await;
+}
+
+async fn receive_authenticated(
+    channel: Channel,
+    keys: ParallelKeys,
+    context: RealtimeReceiverContext,
+) {
     let rx = crate::datagram_flows::SessionDatagramRx::new(keys.rx_key(), &keys.session_id, true);
     // These fixed child keys are retired as a whole at canonical rekey. They
     // never receive the parent's ordinary datagram codec rotations.
@@ -199,13 +221,29 @@ fn spawn_acceptor(
     offer: ParallelQuicOffer,
     parent: ParallelParentHandle,
     context: RealtimeReceiverContext,
+    mut incoming: tokio::sync::mpsc::Receiver<registry::BoundChild>,
 ) -> RealtimeReceiverTask {
     RealtimeReceiverTask(tokio::spawn(async move {
         let mut children = tokio::task::JoinSet::new();
         loop {
             tokio::select! {
                 _ = children.join_next(), if !children.is_empty() => {},
-                accepted = offer.handle.accept() => {
+                Some(mut child) = incoming.recv() => {
+                    let context = context.clone();
+                    children.spawn(async move {
+                        if !child.parent.is_active() {
+                            return;
+                        }
+                        if !matches!(tokio::time::timeout(BIND_TIMEOUT, child.channel.stream.write_all(&child.ack)).await, Ok(Ok(()))) {
+                            return;
+                        }
+                        if !child.parent.is_active() {
+                            return;
+                        }
+                        receive_authenticated(child.channel, child.keys, context).await;
+                    });
+                },
+                accepted = offer.handle.accept(), if offer.handle.has_exclusive_accept() => {
                     match accepted {
                         Ok(connection) => {
                             if let Ok(channel) = Channel::new(connection, Arc::clone(&offer.diagnostics)) {
@@ -214,7 +252,10 @@ fn spawn_acceptor(
                         }
                         Err(_) => tokio::time::sleep(RETRY_DELAY).await,
                     }
-                }
+                },
+                // A full registry or missing shared dispatcher leaves the
+                // ordinary lane available; there is no accept source to poll.
+                else => break,
             }
         }
     }))
@@ -225,6 +266,7 @@ pub(super) struct ParallelSession {
     context: RealtimeReceiverContext,
     parent: ParallelParent,
     _acceptor: RealtimeReceiverTask,
+    _registration: Option<registry::Registration>,
     slots: [Slot; 2],
 }
 
@@ -237,12 +279,18 @@ impl ParallelSession {
         context: RealtimeReceiverContext,
     ) -> Self {
         let parent = ParallelParent::new(sid, *tx, *rx);
-        let acceptor = spawn_acceptor(offer.clone(), parent.handle(), context.clone());
+        let (incoming_tx, incoming_rx) = tokio::sync::mpsc::channel(8);
+        let registration = offer
+            .registry
+            .as_ref()
+            .and_then(|registry| registry.register(sid, parent.handle(), &offer, incoming_tx));
+        let acceptor = spawn_acceptor(offer.clone(), parent.handle(), context.clone(), incoming_rx);
         Self {
             offer,
             context,
             parent,
             _acceptor: acceptor,
+            _registration: registration,
             slots: Default::default(),
         }
     }
@@ -255,6 +303,8 @@ impl ParallelSession {
             .diagnostics
             .rekeys
             .fetch_add(1, Ordering::Release);
+        self.parent.retire();
+        self._registration = None;
         *self = Self::new(self.offer.clone(), tx, rx, sid, self.context.clone());
     }
 

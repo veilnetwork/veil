@@ -1,8 +1,8 @@
-//! Independent QUIC connections on one exclusively owned punched endpoint.
+//! Independent QUIC connections sharing the parent's UDP endpoint.
 //!
-//! This is a transport primitive, not an OVL1 authenticated session. It is
-//! deliberately unavailable on shared listeners, whose central accept loop
-//! must retain ownership. No producer role, priority or QoS parameter travels
+//! This is a transport primitive, not an OVL1 authenticated session.
+//! Shared listeners retain their central accept loop; authenticated children
+//! are adopted through `track_incoming`. No producer role or QoS parameter travels
 //! on the wire. Application activation waits for the session binding layer.
 
 use super::*;
@@ -17,6 +17,8 @@ struct Inner {
     peer: PeerMeta,
     accept: Mutex<()>,
     slots: Arc<Semaphore>,
+    exclusive_accept: bool,
+    requires_shared_dispatch: bool,
 }
 
 /// Transport-only siblings with independent congestion control and reliable
@@ -33,6 +35,8 @@ impl QuicParallelHandle {
         parent: quinn::Connection,
         peer: PeerMeta,
         context: Arc<TransportContext>,
+        exclusive_accept: bool,
+        requires_shared_dispatch: bool,
     ) -> Self {
         Self(Arc::new(Inner {
             endpoint,
@@ -41,6 +45,8 @@ impl QuicParallelHandle {
             context,
             accept: Mutex::new(()),
             slots: Arc::new(Semaphore::new(MAX_CONNECTIONS)),
+            exclusive_accept,
+            requires_shared_dispatch,
         }))
     }
 
@@ -53,16 +59,8 @@ impl QuicParallelHandle {
             .map_err(|_| quic_error("parallel QUIC connection budget exhausted"))
     }
 
-    fn bind_child(
-        &self,
-        connection: quinn::Connection,
-        stream: BoxIoStream,
-        permit: OwnedSemaphorePermit,
-    ) -> Box<dyn TransportConnection> {
+    fn watch_child(&self, child: quinn::Connection, permit: OwnedSemaphorePermit) {
         let parent = self.0.parent.clone();
-        let child = connection.clone();
-        // The slot follows the actual QUIC lifetime, including raw connection
-        // and DATAGRAM clones, rather than only the first byte stream wrapper.
         tokio::spawn(async move {
             let _permit = permit;
             tokio::select! {
@@ -70,6 +68,38 @@ impl QuicParallelHandle {
                 _ = child.closed() => {},
             }
         });
+    }
+
+    /// Whether the session owns this endpoint's accept loop. A shared listener
+    /// must dispatch children centrally and never call `accept` on this handle.
+    pub fn has_exclusive_accept(&self) -> bool {
+        self.0.exclusive_accept
+    }
+
+    /// Ordinary QUIC peers need the newer central-dispatch capability. The
+    /// original parallel capability covered exclusively owned punched pairs.
+    pub fn requires_shared_dispatch(&self) -> bool {
+        self.0.requires_shared_dispatch
+    }
+
+    /// Adopt an already authenticated shared-listener child into the SAME
+    /// connection budget as outgoing siblings. The caller verifies the session
+    /// proof first and closes rejected children; TLS alone is not identity.
+    pub fn track_incoming(&self, child: &QuicDatagramHandle) -> Result<()> {
+        let permit = self.reserve()?;
+        self.watch_child(child.connection.clone(), permit);
+        Ok(())
+    }
+
+    fn bind_child(
+        &self,
+        connection: quinn::Connection,
+        stream: BoxIoStream,
+        permit: OwnedSemaphorePermit,
+    ) -> Box<dyn TransportConnection> {
+        // The slot follows the actual QUIC lifetime, including raw connection
+        // and DATAGRAM clones, rather than only the first byte stream wrapper.
+        self.watch_child(connection.clone(), permit);
         let mut peer = self.0.peer.clone();
         peer.remote_addr = Some(connection.remote_address());
         boxed_quic_connection(peer, self.0.endpoint.clone(), connection, stream)
@@ -116,6 +146,11 @@ impl QuicParallelHandle {
     /// exporter-bound proof before dispatching any frame or installing keys.
     /// The timeout includes lock, handshake and first-stream waits.
     pub async fn accept(&self) -> Result<Box<dyn TransportConnection>> {
+        if !self.has_exclusive_accept() {
+            return Err(TransportError::Unsupported(
+                "shared QUIC listener owns acceptance".to_owned(),
+            ));
+        }
         let ctx = Arc::clone(&self.0.context);
         let permit = self.reserve()?;
         let operation = async {

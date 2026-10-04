@@ -1,8 +1,7 @@
 //! Mutual binding of a generic auxiliary QUIC transport to a live session.
 //!
-//! This primitive is not yet negotiated or used by SessionRunner. Runtime
-//! integration must authenticate exactly once per connection, bound sibling
-//! slots, and drop/retire the owner on close/rekey/replacement. It must not install
+//! SessionRunner authenticates exactly once per connection, bounds sibling
+//! slots, and retires the owner on close/rekey/replacement. It must not install
 //! a sibling in the canonical peer registry or advertise it as another node.
 //! No audio/video role or scheduling request occurs in either proof.
 
@@ -14,7 +13,7 @@ use std::sync::{
 use subtle::ConstantTimeEq;
 use zeroize::Zeroizing;
 
-const PREFACE: &[u8; 8] = b"VPAUX001";
+pub(crate) const PREFACE: &[u8; 8] = b"VPAUX001";
 pub const HELLO_BYTES: usize = 104;
 
 struct Parent {
@@ -129,6 +128,9 @@ impl ParallelParent {
 }
 
 impl ParallelParentHandle {
+    pub(crate) fn is_active(&self) -> bool {
+        self.0.active.load(Ordering::Acquire)
+    }
     pub fn retire(&self) {
         self.0.active.store(false, Ordering::Release);
     }
