@@ -12,7 +12,7 @@ use std::{
 };
 
 use tokio::{
-    io::AsyncWriteExt,
+    io::{AsyncReadExt, AsyncWriteExt},
     net::UdpSocket,
     sync::mpsc,
     task::JoinHandle,
@@ -275,4 +275,181 @@ async fn endpoint_backlog_bound_keeps_primary_cells_fresh_on_a_neutral_slow_link
         old.is_none_or(|old| old > current + Duration::from_millis(200)),
         "capacity-only admission must fail the same latency requirement: {old:?} vs {current:?}"
     );
+}
+
+// Deliberately retained as a failing characterization, not a passing quality
+// gate: one physical congestion budget still cannot sustain these producers.
+#[tokio::test]
+#[ignore = "Known shared-connection latency/loss under sustained load; run with --ignored --nocapture"]
+async fn continuous_primary_delivery_under_video_and_reliable_stream_load() {
+    use crate::datagram_flows::{SessionDatagramRx, SessionDatagramTx};
+    use veil_anonymity::circuit_wire::CircuitDataPayload;
+    use veil_proto::{
+        header::HEADER_SIZE,
+        priority::{BULK, REALTIME},
+    };
+    let left = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let right = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let link = NeutralLink::new(
+        left.local_addr().unwrap(),
+        right.local_addr().unwrap(),
+        1_000_000,
+        Duration::from_millis(20),
+    )
+    .await;
+    // The initial RTT must include the same link as application traffic.
+    // A loopback handshake followed by an artificial RTT jump would bias a
+    // minimum-RTT congestion estimator towards an unrelated network path.
+    link.enabled.store(true, Ordering::Relaxed);
+    let context = Arc::new(TransportContext::for_debug().unwrap());
+    let remote_context = Arc::clone(&context);
+    let remote_addr = link.right_addr;
+    let remote = tokio::spawn(async move {
+        promote_punched_quic(
+            right,
+            remote_addr,
+            remote_context,
+            PunchedQuicRole::Responder,
+        )
+        .await
+        .unwrap()
+    });
+    let local = promote_punched_quic(left, link.left_addr, context, PunchedQuicRole::Initiator)
+        .await
+        .unwrap();
+    let tx = local.quic_datagrams().unwrap();
+    let mut local_stream = local.into_stream().unwrap();
+    local_stream.write_all(b"stand").await.unwrap();
+    let remote = remote.await.unwrap();
+    let rx = remote.quic_datagrams().unwrap();
+    let mut remote_stream = remote.into_stream().unwrap();
+    let mut prefix = [0; 5];
+    remote_stream.read_exact(&mut prefix).await.unwrap();
+    assert_eq!(&prefix, b"stand");
+    sleep(Duration::from_millis(100)).await;
+    link.enabled.store(true, Ordering::Relaxed);
+    let file_bytes = Arc::new(AtomicU64::new(0));
+    let received_file = Arc::clone(&file_bytes);
+    let file_reader = tokio::spawn(async move {
+        let mut buffer = [0; 16384];
+        while let Ok(len) = remote_stream.read(&mut buffer).await {
+            if len == 0 {
+                break;
+            }
+            assert!(buffer[..len].iter().all(|byte| *byte == 0xb2));
+            received_file.fetch_add(len as u64, Ordering::Relaxed);
+        }
+    });
+    let file_writer = tokio::spawn(async move {
+        local_stream
+            .write_all(&vec![0xb2; 4 * 1024 * 1024])
+            .await
+            .unwrap();
+        std::future::pending::<()>().await;
+        drop(local_stream);
+    });
+    let started = Instant::now();
+    let (received_tx, mut received_rx) = mpsc::unbounded_channel();
+    let media_reader = tokio::spawn(async move {
+        let mut cipher = SessionDatagramRx::new(&[7; 32], &[8; 32], true);
+        while let Ok(packet) = rx.recv().await {
+            if let Some(frame) = cipher
+                .decode_datagram(&packet, std::time::Instant::now())
+                .unwrap()
+            {
+                let cell = CircuitDataPayload::decode(&frame[HEADER_SIZE..]).unwrap();
+                if cell.circuit_id == 1 {
+                    let sent_ns = u64::from_be_bytes(cell.ciphertext[..8].try_into().unwrap());
+                    received_tx
+                        .send((
+                            cell.seq,
+                            started
+                                .elapsed()
+                                .saturating_sub(Duration::from_nanos(sent_ns)),
+                        ))
+                        .unwrap();
+                } else {
+                    assert_eq!(cell.circuit_id, 2);
+                }
+            }
+        }
+    });
+    let mut cipher = SessionDatagramTx::new(&[7; 32], &[8; 32], true);
+    let mut primary_sent = 0;
+    let mut secondary_sent = 0;
+    let mut secondary_dropped = 0;
+    // 50 primary cells/s and 100 secondary cells/s overload this link. The
+    // reliable stream is independent application traffic on the same QUIC.
+    for tick in 0..200u32 {
+        sleep_until(started + Duration::from_millis(u64::from(tick) * 10)).await;
+        let ceiling = tx.max_size().unwrap();
+        if tick % 2 == 0 {
+            let mut primary = circuit_frame(1, 0x11);
+            // Circuit header is id:u32 + seq:u32 + ciphertext_len:u16.
+            primary[HEADER_SIZE + 4..HEADER_SIZE + 8].copy_from_slice(&(tick / 2).to_be_bytes());
+            primary[HEADER_SIZE + 10..HEADER_SIZE + 18]
+                .copy_from_slice(&(started.elapsed().as_nanos() as u64).to_be_bytes());
+            let packets = cipher
+                .encode_frame(u64::from(REALTIME), &primary, ceiling)
+                .unwrap();
+            if super::local_datagram_fits(
+                REALTIME,
+                packets.iter().map(Vec::len).sum(),
+                tx.send_buffer_space(),
+            ) {
+                for packet in packets {
+                    tx.send(&packet).unwrap();
+                }
+                primary_sent += 1;
+            }
+        }
+        let secondary = circuit_frame(2, 0x22);
+        let packets = cipher
+            .encode_frame(u64::from(BULK), &secondary, ceiling)
+            .unwrap();
+        if super::local_datagram_fits(
+            BULK,
+            packets.iter().map(Vec::len).sum(),
+            tx.send_buffer_space(),
+        ) {
+            for packet in packets {
+                tx.send(&packet).unwrap();
+            }
+            secondary_sent += 1;
+        } else {
+            secondary_dropped += 1;
+        }
+    }
+    sleep(Duration::from_secs(1)).await;
+    let mut samples = Vec::new();
+    let mut sequences = std::collections::HashSet::new();
+    while let Ok((seq, delay)) = received_rx.try_recv() {
+        assert!(sequences.insert(seq), "duplicate primary cell");
+        samples.push(delay);
+    }
+    samples.sort_unstable();
+    let p95 = samples.get(samples.len() * 95 / 100).copied();
+    eprintln!(
+        "continuous: primary_sent={primary_sent} primary_received={} primary_p95_ms={:?} secondary_sent={secondary_sent} secondary_dropped={secondary_dropped} file_bytes={} neutral_udp_drops={}",
+        samples.len(),
+        p95.map(|v| v.as_secs_f64() * 1000.0),
+        file_bytes.load(Ordering::Relaxed),
+        link.dropped.load(Ordering::Relaxed)
+    );
+    for task in [file_writer, file_reader, media_reader] {
+        task.abort();
+        let _ = task.await;
+    }
+    assert_eq!(primary_sent, 100);
+    assert!(secondary_sent > 0 && secondary_dropped > 0);
+    assert!(
+        file_bytes.load(Ordering::Relaxed) > 0,
+        "file must actually cross the link"
+    );
+    assert!(
+        samples.len() >= 95,
+        "too many primary cells lost: {}",
+        samples.len()
+    );
+    assert!(p95.unwrap() < Duration::from_millis(200), "{p95:?}");
 }
