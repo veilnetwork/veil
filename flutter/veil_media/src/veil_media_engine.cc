@@ -2018,7 +2018,9 @@ int veil_media_group_engine_start_video(VeilGroupMediaEngine* engine) {
       sc.encoder_settings.bitrate_allocator_factory =
           ws->video_bitrate_alloc_factory.get();
 
-      int kbps = 150;
+      // A new room has no measured audio feedback yet. Keep its initial video
+      // load small; endpoint adaptation earns more only after healthy audio.
+      int kbps = 30;
       if (const char* value = std::getenv("VEIL_MEDIA_VIDEO_KBPS")) {
         const int configured = std::atoi(value);
         if (configured > 0) kbps = configured;
@@ -2037,7 +2039,7 @@ int veil_media_group_engine_start_video(VeilGroupMediaEngine* engine) {
       layer.min_bitrate_bps = 30000;
       layer.target_bitrate_bps = bps * 2 / 3;
       layer.max_bitrate_bps = bps;
-      layer.max_framerate = 15;
+      layer.max_framerate = 1;
       layer.max_qp = 63;
       ec.simulcast_layers.push_back(layer);
       ws->video_send_stream =
@@ -2048,7 +2050,7 @@ int veil_media_group_engine_start_video(VeilGroupMediaEngine* engine) {
             webrtc::DegradationPreference::MAINTAIN_FRAMERATE);
         ws->video_send_stream->Start();
         ws->video_target_bitrate_bps = bps;
-        ws->video_max_fps.store(15, std::memory_order_relaxed);
+        ws->video_max_fps.store(1, std::memory_order_relaxed);
         ws->video_last_encoded_frame_us.store(0, std::memory_order_relaxed);
       }
     }
