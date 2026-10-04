@@ -73,17 +73,17 @@ pub struct RemoteHandshakeInfo {
     /// False when the peer advertised `NO_DHT_SERVICE`: keep the session,
     /// keep it resolvable, but never pick it as a DHT candidate.
     ///
-    /// Meaningless unless [`Self::remote_caps_stated`] is true — a resumed
+    /// Meaningless unless [`Self::remote_caps_stated`] is true — a legacy resumed
     /// handshake synthesizes "serves" without asking the peer.
     pub remote_dht_service: bool,
     /// Whether [`Self::remote_discovery_mode`] and [`Self::remote_dht_service`]
-    /// were STATED by the peer in this handshake. False on the fast-resume
-    /// path, which invents a zero capabilities payload. Callers that write
-    /// these into shared state must leave the stored values alone when this is
-    /// false — see `veil_dht::routing::Contact::caps_known`.
+    /// were STATED by the peer in this handshake, including an authenticated
+    /// resume extension. False for legacy resumes without that extension.
+    /// Callers that write these into shared state must leave the stored values
+    /// alone when this is false — see `veil_dht::routing::Contact::caps_known`.
     pub remote_caps_stated: bool,
     /// Peer explicitly advertised the authenticated realtime DATAGRAM lane.
-    /// False on legacy and fast-resumed handshakes.
+    /// False on legacy peers and resumes without authenticated capability metadata.
     pub supports_realtime_datagrams: bool,
     /// Whether the peer rotates the realtime lane's key at a session rekey.
     /// Both sides must, or the one that does leaves the other unable to open
@@ -1440,8 +1440,8 @@ pub async fn register_connection_session(
         peer_algo: remote_identity.algo,
         peer_nonce: remote_identity.nonce.clone(),
         // Never send media into a side channel an older peer does not read.
-        // Fast-resumed handshakes currently synthesize zero capabilities, so
-        // they also preserve the ordered-stream fallback conservatively.
+        // Legacy fast resumes without authenticated capability metadata
+        // preserve ordered-stream fallback; upgraded peers restate support.
         // The lane at all needs both sides to speak it; rotating its key needs
         // both sides again, separately — a peer can understand the lane and
         // still keep the handshake-derived key for the session's life

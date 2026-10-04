@@ -1170,6 +1170,8 @@ pub fn decode_observed_addr(buf: &[u8]) -> Option<std::net::SocketAddr> {
 
 /// ATTACH-trailer TLV tag carrying the responder's per-resumption nonce.
 pub const RESUME_NONCE_TLV_TAG: u16 = 0x0015;
+/// Fresh-key-authenticated capabilities on resumed ATTACH (0x0016 is visibility).
+pub const RESUME_CAPABILITIES_TLV_TAG: u16 = 0x0017;
 /// Length of the resume-nonce TLV value (32-byte nonce).
 pub const RESUME_NONCE_TLV_LEN: usize = 32;
 
