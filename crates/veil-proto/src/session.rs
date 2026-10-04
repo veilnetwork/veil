@@ -407,6 +407,8 @@ pub mod cap_extra_flags {
     pub const SUPPORTS_PARALLEL_QUIC: u8 = 1 << 1;
     /// Ordinary QUIC/shared-listener dispatch, in addition to punched pairs.
     pub const SUPPORTS_SHARED_PARALLEL_QUIC: u8 = 1 << 2;
+    /// Reading and replying on a generic child connection in both directions.
+    pub const SUPPORTS_DUPLEX_PARALLEL_QUIC: u8 = 1 << 3;
 }
 
 // c: role_bits moved to veil-types alongside NodeRole.
@@ -509,6 +511,11 @@ impl CapabilitiesPayload {
     pub fn supports_shared_parallel_quic(&self) -> bool {
         self.supports_parallel_quic()
             && self.extra_flags & cap_extra_flags::SUPPORTS_SHARED_PARALLEL_QUIC != 0
+    }
+
+    pub fn supports_duplex_parallel_quic(&self) -> bool {
+        self.supports_parallel_quic()
+            && self.extra_flags & cap_extra_flags::SUPPORTS_DUPLEX_PARALLEL_QUIC != 0
     }
 
     // ── Capability helpers ───────────────────────────────────────────────
@@ -2410,6 +2417,38 @@ mod tests {
         caps.extra_flags |= cap_extra_flags::SUPPORTS_PARALLEL_QUIC;
         caps.flags &= !cap_flags::SUPPORTS_REALTIME_REKEY;
         assert!(!caps.supports_shared_parallel_quic());
+    }
+
+    #[test]
+    fn duplex_parallel_requires_explicit_marked_support() {
+        let mut caps = CapabilitiesPayload::from_node_role(veil_types::NodeRole::Core);
+        caps.flags = cap_flags::SUPPORTS_REALTIME_DATAGRAMS
+            | cap_flags::SUPPORTS_DATAGRAM_FLOWS
+            | cap_flags::SUPPORTS_REALTIME_REKEY;
+        caps.extra_flags = cap_extra_flags::SUPPORTS_PARALLEL_QUIC
+            | cap_extra_flags::SUPPORTS_SHARED_PARALLEL_QUIC;
+        assert!(!caps.supports_duplex_parallel_quic());
+        caps.extra_flags |= cap_extra_flags::SUPPORTS_DUPLEX_PARALLEL_QUIC;
+        assert!(
+            CapabilitiesPayload::decode(&caps.encode())
+                .unwrap()
+                .supports_duplex_parallel_quic()
+        );
+        assert!(
+            !CapabilitiesPayload::decode(&caps.encode()[..3])
+                .unwrap()
+                .supports_duplex_parallel_quic()
+        );
+        for missing in [
+            cap_flags::SUPPORTS_DATAGRAM_FLOWS,
+            cap_flags::SUPPORTS_REALTIME_REKEY,
+        ] {
+            let mut unsupported = caps.clone();
+            unsupported.flags &= !missing;
+            assert!(!unsupported.supports_duplex_parallel_quic());
+        }
+        caps.extra_flags = cap_extra_flags::SUPPORTS_DUPLEX_PARALLEL_QUIC;
+        assert!(!caps.supports_duplex_parallel_quic());
     }
 
     #[test]

@@ -96,6 +96,18 @@ pub trait DispatcherSink: Send + Sync {
     /// response / violation / etc.).
     fn dispatch(&self, header: &FrameHeader, body: &[u8], peer_id: NodeIdBytes) -> DispatchResult;
 
+    /// Authenticated ingress transport metadata, with the same admission and
+    /// service checks as ordinary dispatch. No producer class comes from it.
+    fn dispatch_with_carrier(
+        &self,
+        header: &FrameHeader,
+        body: &[u8],
+        peer_id: NodeIdBytes,
+        _carrier: Option<veil_anonymity::circuit_carrier::Carrier>,
+    ) -> DispatchResult {
+        self.dispatch(header, body, peer_id)
+    }
+
     /// Capture a plaintext outbound frame for debug-listener taps.
     /// No-op in production when no taps are attached.
     fn capture_outbound(&self, peer_id: NodeIdBytes, frame: &[u8]);

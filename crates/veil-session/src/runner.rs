@@ -36,7 +36,6 @@ use veil_types::NodeIdBytes;
 use crate::dispatcher_sink::DispatchResult;
 use crate::outbox::OutboxRequest;
 use crate::priority_queue::PriorityQueue;
-use crate::tx_registry::PriorityFrame;
 
 /// Shared map from peer node-id to ephemeral ML-KEM decapsulation-key seed
 /// (Phase 6 slice 6h).  Used by `SessionRunner` and
@@ -99,7 +98,7 @@ pub enum NextInput {
     /// First byte of the next incoming frame.
     Byte(u8),
     /// A priority-tagged frame was received from the outbox.
-    OutboxFrame(PriorityFrame),
+    OutboxFrame(crate::frame_outbox::FrameEnvelope),
     /// An RPC request arrived in the rpc_outbox while waiting.
     RpcRequest(OutboxRequest),
     /// A timer (keepalive or idle-check) fired — caller should loop back.
@@ -144,8 +143,8 @@ async fn await_next_input(
         },
         Some(frame) = async {
             match outbox {
-                Some(rx) => rx.recv().await,
-                None     => pending::<Option<PriorityFrame>>().await,
+                Some(rx) => rx.recv_envelope().await,
+                None     => pending::<Option<crate::frame_outbox::FrameEnvelope>>().await,
             }
         } => NextInput::OutboxFrame(frame),
         Some(req) = async {
@@ -182,7 +181,7 @@ async fn await_next_input(
 /// Session-scoped state for the independently encrypted, loss-tolerant media
 /// lane. It exists only after capability AND transport negotiation succeed.
 struct RealtimeDatagramLane {
-    sender: RealtimeSender,
+    sender: Arc<Mutex<RealtimeSender>>,
     local_reliable: local_reliable_admission::LocalReliableAdmission,
     peer_rotates: bool,
     peer_circuit_datagrams: bool,
@@ -219,7 +218,7 @@ impl RealtimeSender {
 }
 
 impl RealtimeDatagramLane {
-    fn select_sender(&mut self, priority: u8) -> (&mut RealtimeSender, bool) {
+    fn select_sender(&mut self, priority: u8) -> (std::sync::MutexGuard<'_, RealtimeSender>, bool) {
         let ready = self
             .parallel
             .as_mut()
@@ -227,7 +226,7 @@ impl RealtimeDatagramLane {
         if ready {
             (self.parallel.as_mut().unwrap().sender(priority), true)
         } else {
-            (&mut self.sender, false)
+            (lock!(self.sender), false)
         }
     }
 }
@@ -401,18 +400,22 @@ fn circuit_datagram_stream_fallback(
 /// Returns `true` when the frame took the lossy realtime lane — the caller
 /// feeds this into `SessionTimers::note_realtime_activity` so an active
 /// media flow arms the accelerated liveness cadence (mobility slice).
+#[cfg(test)]
 fn enqueue_outbox_frame(
     pq: &mut PriorityQueue,
     priority: u8,
     frame: veil_bufpool::PooledShared,
 ) -> bool {
-    if decode_realtime_lane_frame(&frame).is_some() {
-        pq.push_lossy(priority, frame);
-        true
-    } else {
-        pq.push(priority, frame);
-        false
-    }
+    enqueue_outbox_envelope(pq, (priority, frame).into())
+}
+
+fn enqueue_outbox_envelope(
+    pq: &mut PriorityQueue,
+    envelope: crate::frame_outbox::FrameEnvelope,
+) -> bool {
+    let lossy = decode_realtime_lane_frame(&envelope.frame.1).is_some();
+    pq.push_envelope(envelope, lossy);
+    lossy
 }
 
 /// A rekey handed to the realtime receiver: the session's new RX key and id.
@@ -452,6 +455,7 @@ fn spawn_realtime_receiver(
     mut rx: crate::datagram_flows::SessionDatagramRx,
     mut rekeys: tokio::sync::watch::Receiver<Option<RealtimeRekey>>,
     context: RealtimeReceiverContext,
+    carrier: Option<Arc<dyn veil_anonymity::circuit_carrier::DatagramCarrier>>,
 ) -> RealtimeReceiverTask {
     RealtimeReceiverTask(tokio::spawn(async move {
         let RealtimeReceiverContext {
@@ -513,7 +517,12 @@ fn spawn_realtime_receiver(
                     ),
                 );
             }
-            match dispatcher.dispatch(&header, body, peer_id) {
+            match dispatcher.dispatch_with_carrier(
+                &header,
+                body,
+                peer_id,
+                carrier.as_ref().map(Arc::downgrade),
+            ) {
                 DispatchResult::NoResponse | DispatchResult::RateLimited => {}
                 DispatchResult::Violation(reason) => {
                     logger.warn(
@@ -1369,7 +1378,9 @@ impl SessionRunner {
             if let Some(lane) = realtime.lane
                 && lane.peer_rotates
             {
-                lane.sender.tx.rekey(&new_keys.tx_key, &new_keys.session_id);
+                lock!(lane.sender)
+                    .tx
+                    .rekey(&new_keys.tx_key, &new_keys.session_id);
                 if let Some(parallel) = lane.parallel.as_mut() {
                     parallel.rekey(&new_keys.tx_key, &new_keys.rx_key, new_keys.session_id);
                 }
@@ -2003,11 +2014,11 @@ impl SessionRunner {
         use tokio::sync::mpsc::error::TryRecvError;
         let mut any_realtime = false;
         loop {
-            match outbox.try_recv() {
-                Ok((prio, frame)) => {
+            match outbox.try_recv_envelope() {
+                Ok(envelope) => {
                     // chunking is always supported (single protocol version),
                     // so no CHUNK-flag gating is needed here.
-                    any_realtime |= enqueue_outbox_frame(pq, prio, frame);
+                    any_realtime |= enqueue_outbox_envelope(pq, envelope);
                 }
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => {
@@ -2627,7 +2638,9 @@ impl SessionRunner {
             if let Some(lane) = realtime.lane
                 && lane.peer_rotates
             {
-                lane.sender.tx.rekey(&new_keys.tx_key, &new_keys.session_id);
+                lock!(lane.sender)
+                    .tx
+                    .rekey(&new_keys.tx_key, &new_keys.session_id);
                 if let Some(parallel) = lane.parallel.as_mut() {
                     parallel.rekey(&new_keys.tx_key, &new_keys.rx_key, new_keys.session_id);
                 }
@@ -3475,6 +3488,7 @@ impl SessionRunner {
                             ban_list: Arc::clone(&self.ban_list),
                             violation_tracker: Arc::clone(&self.violation_tracker),
                         },
+                        None,
                     ));
                     self.logger.info(
                         "session.realtime_datagram.enabled",
@@ -3488,14 +3502,14 @@ impl SessionRunner {
                         local_reliable: local_reliable_admission::LocalReliableAdmission::new(
                             offer.handle.clone(),
                         ),
-                        sender: RealtimeSender::new(
+                        sender: Arc::new(Mutex::new(RealtimeSender::new(
                             offer.handle,
                             crate::datagram_flows::SessionDatagramTx::new(
                                 raw_tx_key,
                                 session_id,
                                 offer.peer_flows,
                             ),
-                        ),
+                        ))),
                         peer_rotates: offer.peer_rotates,
                         peer_circuit_datagrams: offer.peer_circuit_datagrams,
                         parallel: offer
@@ -3956,7 +3970,7 @@ impl SessionRunner {
                 if let Some(lane) = realtime_lane.as_mut() {
                     lane.local_reliable.expire(std::time::Instant::now());
                     for _ in 0..PQ_DRAIN_FRAMES_PER_PASS {
-                        let Some((outgoing_priority, outgoing)) = pq.pop_datagram_if(|frame| {
+                        let Some(envelope) = pq.pop_datagram_envelope_if(|frame| {
                             decode_realtime_lane_frame(frame).is_some_and(|(_, _, kind)| {
                                 kind != RealtimeLaneFrameKind::CircuitDatagram
                                     || lane.peer_circuit_datagrams
@@ -3964,6 +3978,35 @@ impl SessionRunner {
                         }) else {
                             break;
                         };
+                        let (outgoing_priority, outgoing) = envelope.frame;
+                        if let Some(carrier) =
+                            envelope.carrier.and_then(|carrier| carrier.upgrade())
+                        {
+                            use veil_anonymity::circuit_carrier::CarrierSend;
+                            let result =
+                                carrier.try_send(&self.peer_id, &outgoing, &mut |wire_bytes| {
+                                    if !self.dispatcher.allow_outbound_bandwidth(wire_bytes) {
+                                        return false;
+                                    }
+                                    self.dispatcher.capture_outbound(self.peer_id, &outgoing);
+                                    true
+                                });
+                            match result {
+                                CarrierSend::Sent { wire_bytes }
+                                | CarrierSend::Dropped { wire_bytes } => {
+                                    if wire_bytes > 0 {
+                                        if let Some(m) = &self.metrics {
+                                            m.add_transport_bytes_tx(wire_bytes);
+                                        }
+                                        rekey.record_bytes(wire_bytes);
+                                        mlkem_rekey.record_bytes(wire_bytes);
+                                    }
+                                    datagram_drained += 1;
+                                    continue;
+                                }
+                                CarrierSend::Unavailable => {}
+                            }
+                        }
                         let (_, body, lane_kind) = decode_realtime_lane_frame(&outgoing)
                             .expect("realtime queue predicate accepted this frame");
                         lane.local_reliable.observe(
@@ -3971,11 +4014,12 @@ impl SessionRunner {
                             &outgoing,
                             std::time::Instant::now(),
                         );
-                        let (lane, using_parallel) = lane.select_sender(outgoing_priority);
+                        let (mut lane, using_parallel) = lane.select_sender(outgoing_priority);
+                        let max_datagram_size = lane.max_datagram_size;
                         let datagrams = match lane.tx.encode_frame(
                             local_datagram_flow(outgoing_priority, body, lane_kind),
                             &outgoing,
-                            lane.max_datagram_size,
+                            max_datagram_size,
                         ) {
                             Ok(datagrams) => datagrams,
                             Err(error) => {
@@ -4335,8 +4379,8 @@ impl SessionRunner {
                         first_byte = b;
                         break;
                     }
-                    NextInput::OutboxFrame((prio, frame)) => {
-                        if enqueue_outbox_frame(&mut pq, prio, frame) {
+                    NextInput::OutboxFrame(envelope) => {
+                        if enqueue_outbox_envelope(&mut pq, envelope) {
                             // Outbound media in flight — arm/refresh the
                             // accelerated liveness cadence (mobility slice).
                             timers.note_realtime_activity(tokio::time::Instant::now());
