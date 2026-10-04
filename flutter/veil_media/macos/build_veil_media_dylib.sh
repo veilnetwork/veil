@@ -42,13 +42,15 @@ TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
 # is the only reliable way to match WebRTC's compile environment.
 compile_tu() {  # $1=src  $2=out.o
   python3 - "$CC_JSON" "$1" "$2" "$SRCDIR" <<'PY' > "$TMP/tu.sh"
-import json,sys,re
+import json,sys,re,os
 cc=json.load(open(sys.argv[1])); src,out,shimdir=sys.argv[2],sys.argv[3],sys.argv[4]
 e=next(x for x in cc if x.get('file','').endswith('call/call.cc'))
 cmd=e['command'] if e.get('command') else ' '.join(e['arguments'])
 s=re.search(r'(\S*call/call\.cc)',cmd).group(1)
 cmd=cmd.replace(s,src); cmd=re.sub(r'-o\s+\S+','-o '+out,cmd)
 extra='-DVEIL_MEDIA_HAVE_WEBRTC=1 -I'+shimdir
+if src.endswith('veil_media_engine.cc') and os.environ.get('VEIL_MEDIA_TEST_HOOKS') == '1':
+    extra+=' -DVEIL_MEDIA_TEST_HOOKS=1'
 if src.endswith('.mm'): extra+=' -fobjc-arc'  # Objective-C++ (AVAudioEngine ADM)
 p=cmd.split(' ',1); cmd=p[0]+' '+extra+' '+p[1]
 open('/dev/stdout','w').write('cd "'+e['directory']+'"\n'+cmd+'\n')
