@@ -883,3 +883,6 @@ async fn warm_receive_only_channels(senders: &[FrameSender]) {
     .await
     .expect("receive-only source channels did not bind without data frames");
 }
+
+#[path = "neutral_chain_tests.rs"]
+mod neutral_chain_tests;

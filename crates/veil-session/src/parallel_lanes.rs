@@ -1,4 +1,4 @@
-//! Endpoint-only sibling selection. Remote accepts see only generic proofs;
+//! Bounded local sibling selection. Remote accepts see only generic proofs;
 //! they dispatch through the canonical peer's existing budgets and identity.
 use super::*;
 use crate::parallel_binding::{HELLO_BYTES, ParallelKeys, ParallelParent, ParallelParentHandle};
@@ -11,13 +11,17 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use veil_transport::QuicParallelHandle;
 
 const BIND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+const SOURCE_SLOTS: usize = 2;
+const TRANSIT_SLOTS: usize = 2;
+const TOTAL_SLOTS: usize = SOURCE_SLOTS + TRANSIT_SLOTS;
+
 const RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(500);
 
 /// Local observations, never wire fields or relay scheduling requests.
 #[derive(Default)]
 pub struct ParallelDiagnostics {
-    sent: [AtomicU64; 2],
-    epoch_sent: [AtomicU64; 2],
+    sent: [AtomicU64; TOTAL_SLOTS],
+    epoch_sent: [AtomicU64; TOTAL_SLOTS],
     rekeys: AtomicU64,
     active: AtomicUsize,
     replies: AtomicU64,
@@ -35,6 +39,27 @@ impl ParallelDiagnostics {
         channel_index(local_priority)
             .map_or(0, |index| self.epoch_sent[index].load(Ordering::Relaxed))
     }
+    /// Forwarded cells on neutral shards, separate from source queue hints.
+    pub fn transit_sent(&self) -> u64 {
+        self.sent[SOURCE_SLOTS..]
+            .iter()
+            .map(|counter| counter.load(Ordering::Relaxed))
+            .sum()
+    }
+    pub fn transit_sent_this_generation(&self) -> u64 {
+        self.epoch_sent[SOURCE_SLOTS..]
+            .iter()
+            .map(|counter| counter.load(Ordering::Relaxed))
+            .sum()
+    }
+
+    pub fn transit_shards_used_this_generation(&self) -> usize {
+        self.epoch_sent[SOURCE_SLOTS..]
+            .iter()
+            .filter(|counter| counter.load(Ordering::Relaxed) != 0)
+            .count()
+    }
+
     pub fn replies(&self) -> u64 {
         self.replies.load(Ordering::Relaxed)
     }
@@ -396,7 +421,8 @@ pub(super) struct ParallelSession {
     readiness: Option<crate::local_datagram_status::LocalDatagramLease>,
     _acceptor: RealtimeReceiverTask,
     _registration: Option<registry::Registration>,
-    slots: [Slot; 2],
+    slots: [Slot; TOTAL_SLOTS],
+    transit_salt: [u8; 32],
 }
 
 impl ParallelSession {
@@ -426,6 +452,7 @@ impl ParallelSession {
             _acceptor: acceptor,
             _registration: registration,
             slots: Default::default(),
+            transit_salt: blake3::derive_key("veil/transit-shard/v1", &sid),
         }
     }
 
@@ -456,6 +483,28 @@ impl ParallelSession {
         let Some(index) = channel_index(priority) else {
             return false;
         };
+        self.prepare_index(index)
+    }
+
+    /// Called only after the ordinary FIFO selects this frame. Every transit
+    /// circuit receives the same admission and service cost; its opaque per-link
+    /// ID picks one bounded shard, never an application role or queue priority.
+    pub(super) fn prepare_frame(
+        &mut self,
+        priority: u8,
+        body: &[u8],
+        kind: RealtimeLaneFrameKind,
+    ) -> Option<usize> {
+        let index = channel_index(priority).or_else(|| {
+            (self.offer.duplex
+                && priority == veil_proto::priority::INTERACTIVE
+                && kind == RealtimeLaneFrameKind::CircuitDatagram)
+                .then(|| transit_index(&self.transit_salt, body))
+        })?;
+        self.prepare_index(index).then_some(index)
+    }
+
+    fn prepare_index(&mut self, index: usize) -> bool {
         let slot = &mut self.slots[index];
         if slot
             .ready
@@ -478,7 +527,14 @@ impl ParallelSession {
                 Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {}
             }
         }
-        if let Some(lease) = &self.readiness {
+        if let Some(lease) = &self.readiness
+            && index < SOURCE_SLOTS
+        {
+            let priority = if index == 0 {
+                veil_proto::priority::REALTIME
+            } else {
+                veil_proto::priority::BULK
+            };
             lease.mark(priority, slot.ready.is_some());
         }
         if slot.ready.is_some() {
@@ -512,13 +568,52 @@ impl ParallelSession {
         false
     }
 
-    pub(super) fn sender(&self, priority: u8) -> std::sync::MutexGuard<'_, RealtimeSender> {
+    pub(super) fn sender(&self, index: usize) -> std::sync::MutexGuard<'_, RealtimeSender> {
         lock!(
-            self.slots[channel_index(priority).expect("prepared local channel")]
+            self.slots[index]
                 .ready
                 .as_ref()
                 .expect("prepared sender")
                 .sender
         )
+    }
+}
+
+// The caller has validated the CircuitDataPayload. Only its existing per-link
+// ID participates; ciphertext, sender hints and claimed priority never do.
+fn transit_index(salt: &[u8; 32], body: &[u8]) -> usize {
+    SOURCE_SLOTS + usize::from(blake3::keyed_hash(salt, &body[..4]).as_bytes()[0]) % TRANSIT_SLOTS
+}
+
+#[cfg(test)]
+mod transit_tests {
+    use super::*;
+
+    #[test]
+    fn neutral_shards_are_bounded_stable_and_ignore_contents() {
+        let salt = blake3::derive_key("veil/transit-shard/v1", &[7; 32]);
+        let mut seen = [false; TRANSIT_SLOTS];
+        for cid in 0..256u32 {
+            let mut body = cid.to_be_bytes().to_vec();
+            body.extend_from_slice(&[0; 128]);
+            let index = transit_index(&salt, &body);
+            assert!((SOURCE_SLOTS..TOTAL_SLOTS).contains(&index));
+            seen[index - SOURCE_SLOTS] = true;
+            body[4..].fill(255);
+            assert_eq!(transit_index(&salt, &body), index);
+        }
+        assert!(seen.into_iter().all(|present| present));
+        assert_eq!(channel_index(veil_proto::priority::INTERACTIVE), None);
+    }
+
+    #[test]
+    fn transit_observations_do_not_claim_source_channels() {
+        let diagnostics = ParallelDiagnostics::default();
+        diagnostics.note_sent(SOURCE_SLOTS);
+        diagnostics.note_sent(SOURCE_SLOTS + 1);
+        assert_eq!(diagnostics.transit_sent(), 2);
+        assert_eq!(diagnostics.transit_sent_this_generation(), 2);
+        assert_eq!(diagnostics.sent(0), 0);
+        assert_eq!(diagnostics.sent(2), 0);
     }
 }
