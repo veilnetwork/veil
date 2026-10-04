@@ -1464,8 +1464,16 @@ bool start_capture(webrtc::AudioDeviceModule* adm, const char* who) {
   return true;
 }
 
+#if defined(VEIL_MEDIA_TEST_HOOKS)
+#include "../test/recording_adm.inc"
+#endif
+
 webrtc::scoped_refptr<webrtc::AudioDeviceModule> create_audio_device(
     const webrtc::Environment& env) {
+#if defined(VEIL_MEDIA_TEST_HOOKS)
+  if (g_call_plane_recording_adm)
+    return webrtc::make_ref_counted<StandRecordingAdm>(env);
+#endif
 #if defined(_WIN32)
   webrtc::scoped_refptr<webrtc::AudioDeviceModule> adm;
   adm_host_thread().Run([&env, &adm] {
@@ -1836,6 +1844,10 @@ int veil_media_group_engine_start_audio(VeilGroupMediaEngine* engine) {
   // Discarded: `ws->send_stream == nullptr` below is the stricter check — a
   // queue that never scheduled leaves it null.
   (void)run_on(ws->worker_tq.get(), [&]() {
+    // AudioState can start the ADM implicitly from AudioSendStream::Start.
+    // Disable that path before registering an already-muted sender.
+    if (ws->audio_state && ws->adm)
+      ws->audio_state->SetRecording(!engine->mic_muted);
     ws->call->SignalChannelNetworkState(webrtc::MediaType::AUDIO,
                                         webrtc::kNetworkUp);
     if (ws->send_stream == nullptr) {
@@ -1938,17 +1950,20 @@ int veil_media_group_engine_set_mic_muted(VeilGroupMediaEngine* engine,
 #if defined(VEIL_MEDIA_HAVE_WEBRTC)
   if (engine->ws) {
     GroupWebrtcState* ws = engine->ws.get();
-    // Mute the RTP source before stopping capture. On unmute, do the inverse:
-    // make the device live first and only then expose its frames to the send
-    // stream. This prevents both a stale-frame leak and muted AudioRecord CPU.
-    if (engine->mic_muted) {
-      if (ws->send_stream) ws->send_stream->SetMuted(true);
-      if (engine->audio_running.load() && ws->adm) {
-        run_on_adm_thread([&] {
-          if (ws->adm->Recording()) ws->adm->StopRecording();
-        });
-      }
-    } else {
+    // Stop physical capture before waiting for a possibly busy audio worker.
+    // Source mute and implicit ADM control still belong to that worker.
+    if (engine->mic_muted && engine->audio_running.load() && ws->adm) {
+      run_on_adm_thread([&] {
+        if (ws->adm->Recording()) ws->adm->StopRecording();
+      });
+    }
+    const bool configured = run_on(ws->worker_tq.get(), [&] {
+      if (ws->send_stream) ws->send_stream->SetMuted(engine->mic_muted);
+      if (ws->audio_state && ws->adm)
+        ws->audio_state->SetRecording(!engine->mic_muted);
+    });
+    if (!engine->mic_muted) {
+      if (!configured) return VEIL_MEDIA_ERR_STATE;
       bool needs_start = false;
       if (engine->audio_running.load() && ws->adm) {
         run_on_adm_thread([&] { needs_start = !ws->adm->Recording(); });
@@ -1956,8 +1971,8 @@ int veil_media_group_engine_set_mic_muted(VeilGroupMediaEngine* engine,
       if (needs_start && !start_capture(ws->adm.get(), "mic unmute")) {
         return VEIL_MEDIA_ERR_DEVICE;
       }
-      if (ws->send_stream) ws->send_stream->SetMuted(false);
     }
+    if (!configured) return VEIL_MEDIA_ERR_STATE;
   }
 #endif
   return VEIL_MEDIA_OK;
@@ -2427,6 +2442,8 @@ int veil_media_engine_start_audio(VeilMediaEngine* engine, int send, int recv) {
 
   // Streams must be created on the Call's worker queue.
   const bool created = run_on(ws->worker_tq.get(), [&]() {
+    if (ws->audio_state && ws->adm)
+      ws->audio_state->SetRecording(!engine->mic_muted);
     // The Call's audio network state defaults to kNetworkDown, which makes the
     // send transport hold every RTP packet in the pacer (only RTCP leaks out on
     // its own path). Bring the audio channel up so mic audio actually flows.
@@ -2443,7 +2460,10 @@ int veil_media_engine_start_audio(VeilMediaEngine* engine, int send, int recv) {
       sc.send_codec_spec = webrtc::AudioSendStream::Config::SendCodecSpec(
           kOpusPayloadType, VeilOpusSendFormat());
       ws->send_stream = ws->call->CreateAudioSendStream(sc);
-      if (ws->send_stream) ws->send_stream->Start();
+      if (ws->send_stream) {
+        ws->send_stream->SetMuted(engine->mic_muted);
+        ws->send_stream->Start();
+      }
     }
     if (recv && ws->recv_stream == nullptr) {
       webrtc::AudioReceiveStreamInterface::Config rc;
@@ -3147,14 +3167,18 @@ int veil_media_engine_set_mic_muted(VeilMediaEngine* engine, int muted) {
 #if defined(VEIL_MEDIA_HAVE_WEBRTC)
   if (engine->ws) {
     WebrtcState* ws = engine->ws.get();
-    if (engine->mic_muted) {
-      if (ws->send_stream) ws->send_stream->SetMuted(true);
-      if (engine->audio_running.load() && ws->adm) {
-        run_on_adm_thread([&] {
-          if (ws->adm->Recording()) ws->adm->StopRecording();
-        });
-      }
-    } else {
+    if (engine->mic_muted && engine->audio_running.load() && ws->adm) {
+      run_on_adm_thread([&] {
+        if (ws->adm->Recording()) ws->adm->StopRecording();
+      });
+    }
+    const bool configured = run_on(ws->worker_tq.get(), [&] {
+      if (ws->send_stream) ws->send_stream->SetMuted(engine->mic_muted);
+      if (ws->audio_state && ws->adm)
+        ws->audio_state->SetRecording(!engine->mic_muted);
+    });
+    if (!engine->mic_muted) {
+      if (!configured) return VEIL_MEDIA_ERR_STATE;
       bool needs_start = false;
       if (engine->audio_running.load() && ws->adm) {
         run_on_adm_thread([&] { needs_start = !ws->adm->Recording(); });
@@ -3162,8 +3186,8 @@ int veil_media_engine_set_mic_muted(VeilMediaEngine* engine, int muted) {
       if (needs_start && !start_capture(ws->adm.get(), "mic unmute")) {
         return VEIL_MEDIA_ERR_DEVICE;
       }
-      if (ws->send_stream) ws->send_stream->SetMuted(false);
     }
+    if (!configured) return VEIL_MEDIA_ERR_STATE;
   }
 #endif
   return VEIL_MEDIA_OK;
@@ -3340,6 +3364,7 @@ char* veil_media_engine_get_stats(VeilMediaEngine* engine) {
     // measurements — NetEq's total audio path estimate (jitter buffer + ADM
     // playout) and the video render delay target.
     uint64_t audio_rx_pkts = 0;
+    uint64_t audio_tx_pkts = 0;
     uint32_t audio_delay_ms = 0;
     uint32_t audio_jb_ms = 0;
     int video_delay_ms = 0;
@@ -3379,6 +3404,8 @@ char* veil_media_engine_get_stats(VeilMediaEngine* engine) {
         ws->android420_stats.replaced.load(std::memory_order_relaxed);
 #endif
     const bool sampled = veil_media::run_on_with_timeout(ws->worker_tq.get(), [&] {
+      if (ws->send_stream)
+        audio_tx_pkts = ws->send_stream->GetStats().packets_sent;
       if (ws->call) {
         const auto cs = ws->call->GetStats();
         if (cs.rtt_ms >= 0) rtt_ms = cs.rtt_ms;
@@ -3450,7 +3477,8 @@ char* veil_media_engine_get_stats(VeilMediaEngine* engine) {
     char json[2048];
     const int written = std::snprintf(
         json, sizeof(json),
-        "{\"tx_pkts\":%llu,\"rx_pkts\":%llu,\"audio_rx_pkts\":%llu,\"tx_bytes\":%llu,"
+        "{\"tx_pkts\":%llu,\"rx_pkts\":%llu,\"audio_rx_pkts\":%llu,"
+        "\"audio_tx_pkts\":%llu,\"mic_muted\":%d,\"tx_bytes\":%llu,"
         "\"rx_bytes\":%llu,\"tx_drops\":%llu,\"rx_drops\":%llu,"
         "\"rtt_ms\":%lld,\"jitter_ms\":%u,\"loss_pct\":%d,"
         "\"tx_jitter_ms\":%d,\"tx_loss_pct\":%d,\"audio_feedback_reports\":%d,"
@@ -3478,6 +3506,7 @@ char* veil_media_engine_get_stats(VeilMediaEngine* engine) {
         static_cast<unsigned long long>(ws->shim->outbound_packet_count()),
         static_cast<unsigned long long>(ws->shim->inbound_packet_count()),
         static_cast<unsigned long long>(audio_rx_pkts),
+        static_cast<unsigned long long>(audio_tx_pkts), engine->mic_muted ? 1 : 0,
         static_cast<unsigned long long>(ws->shim->outbound_byte_count()),
         static_cast<unsigned long long>(ws->shim->inbound_byte_count()),
         static_cast<unsigned long long>(ws->shim->outbound_dropped_count()),
