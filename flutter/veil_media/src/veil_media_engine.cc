@@ -1144,6 +1144,8 @@ void stop_group_peer_video(GroupWebrtcState* ws, GroupPeerState* peer) {
 }  // namespace
 
 struct VeilMediaEngine {
+  std::mutex config_mu;
+  bool config_frozen = false;
   uint64_t veil_chan = 0;
   uint8_t local[32] = {0};
   uint8_t peer[32] = {0};
@@ -2295,6 +2297,10 @@ void veil_media_group_engine_destroy(VeilGroupMediaEngine* engine) {
 
 int veil_media_engine_start_audio(VeilMediaEngine* engine, int send, int recv) {
   if (engine == nullptr) return VEIL_MEDIA_ERR_ARG;
+  {
+    std::lock_guard<std::mutex> lock(engine->config_mu);
+    engine->config_frozen = true;
+  }
   if (engine->audio_running.load()) return VEIL_MEDIA_OK;  // idempotent
 #if defined(VEIL_MEDIA_HAVE_WEBRTC)
   if (!engine->ws || !engine->ws->call) return VEIL_MEDIA_ERR_STATE;
@@ -2455,6 +2461,20 @@ int veil_media_engine_stop_audio(VeilMediaEngine* engine) {
   return VEIL_MEDIA_OK;
 }
 
+int veil_media_engine_set_independent_transport_feedback(VeilMediaEngine* engine,
+                                                         int enabled) {
+  if (!engine || (enabled != 0 && enabled != 1)) return VEIL_MEDIA_ERR_ARG;
+  std::lock_guard<std::mutex> lock(engine->config_mu);
+  if (engine->config_frozen) return VEIL_MEDIA_ERR_STATE;
+#if defined(VEIL_MEDIA_HAVE_WEBRTC)
+  if (!engine->ws || !engine->ws->shim) return VEIL_MEDIA_ERR_STATE;
+  engine->ws->shim->SetIndependentTransportFeedback(enabled != 0);
+  return VEIL_MEDIA_OK;
+#else
+  return VEIL_MEDIA_ERR_STATE;
+#endif
+}
+
 int veil_media_engine_set_max_rtp_packet_size(VeilMediaEngine* engine,
                                               int max_packet_size) {
   if (engine == nullptr || max_packet_size < 0) return VEIL_MEDIA_ERR_ARG;
@@ -2483,6 +2503,10 @@ int veil_media_engine_set_max_rtp_packet_size(VeilMediaEngine* engine,
 int veil_media_engine_start_video(VeilMediaEngine* engine, int send, int recv,
                                   int max_bitrate_kbps, int max_fps) {
   if (engine == nullptr) return VEIL_MEDIA_ERR_ARG;
+  {
+    std::lock_guard<std::mutex> lock(engine->config_mu);
+    engine->config_frozen = true;
+  }
 #if defined(VEIL_MEDIA_HAVE_WEBRTC)
   if (!engine->ws || !engine->ws->video_call) return VEIL_MEDIA_ERR_STATE;
   WebrtcState* ws = engine->ws.get();
@@ -2542,23 +2566,15 @@ int veil_media_engine_start_video(VeilMediaEngine* engine, int send, int recv,
       ws->video_target_bitrate_bps = bps;
       ws->video_max_fps.store(fps, std::memory_order_relaxed);
       ws->video_last_encoded_frame_us.store(0, std::memory_order_relaxed);
-      // Anchor the Call's bandwidth estimate to the route budget. Without
-      // this the BWE starts at webrtc's 300 kbps default and — on the veil
-      // datagram channel, where no transport feedback ever raises it — the
-      // PACER budget stays pinned near that default while the encoder runs
-      // at the profile rate. The overshoot then stands in the pacer queue:
-      // live-observed as video (audio has pacer priority, RTCP bypasses it)
-      // arriving a stable 2-3 s late with every RTCP metric clean.
+      // Start at the route budget. Negotiated feedback subsequently owns the
+      // estimate; older peers still need the profile floor to keep the encoder
+      // and pacer budgets aligned without usable transport feedback.
       {
         webrtc::BitrateSettings bs;
-        // Pin min = start: anchoring only the START is not enough — the
-        // delay-based BWE then sags below the profile on the TCP-like veil
-        // channel (it reacts to the queue it itself builds) and the pacer
-        // budget drops under the encoder rate again (live-measured 1.4-1.6 s
-        // standing pacer queue with a 900 kbps profile). Congestion response
-        // on this transport belongs to the app's own bitrate ladder, which
-        // moves this whole anchor when it retunes.
-        bs.min_bitrate_bps = bps;
+        // Negotiated feedback lets GCC lower video below the profile under
+        // congestion. Older peers supply no usable split transport feedback;
+        // retain their profile floor and app-level adaptation.
+        bs.min_bitrate_bps = ws->shim->independent_transport_feedback() ? 30'000 : bps;
         bs.start_bitrate_bps = bps;
         bs.max_bitrate_bps = bps + 128'000;  // video retransmission/RTCP headroom
         ws->video_call->SetClientBitratePreferences(bs);
@@ -2687,13 +2703,12 @@ int veil_media_engine_set_video_bitrate(VeilMediaEngine* engine,
     layer.max_qp = 63;
     ec.simulcast_layers.push_back(layer);
     ws->video_send_stream->ReconfigureVideoEncoder(std::move(ec));
-    // Move the Call-level estimate anchor WITH the retune (see start_video):
-    // the pacer budget must track the encoder budget in both directions, or
-    // an upward retune re-opens the standing-queue gap.
+    // Update bounds without resetting GCC's current estimate on a profile
+    // change. The legacy no-feedback mode still tracks the whole profile.
     {
       webrtc::BitrateSettings bs;
-      bs.min_bitrate_bps = bps;  // pinned floor — see start_video
-      bs.start_bitrate_bps = bps;
+      bs.min_bitrate_bps = ws->shim->independent_transport_feedback() ? 30'000 : bps;
+      if (!ws->shim->independent_transport_feedback()) bs.start_bitrate_bps = bps;
       bs.max_bitrate_bps = bps + 128'000;
       ws->video_call->SetClientBitratePreferences(bs);
     }

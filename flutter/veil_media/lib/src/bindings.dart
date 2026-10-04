@@ -859,3 +859,23 @@ final void Function(Pointer<Uint8>) veilMediaFreeWav = nativeLib
     .lookup<NativeFunction<Void Function(Pointer<Uint8>)>>(
         'veil_media_free_wav')
     .asFunction();
+
+// Optional: old native engines must never advertise independent feedback.
+int Function(Pointer<VeilMediaEngineHandle>, int)?
+    _lookupIndependentTransportFeedback() {
+  try {
+    return nativeLib
+        .lookup<
+            NativeFunction<
+                Int32 Function(Pointer<VeilMediaEngineHandle>, Int32)>>(
+          'veil_media_engine_set_independent_transport_feedback',
+        )
+        .asFunction();
+  } on ArgumentError {
+    return null;
+  }
+}
+
+final int Function(Pointer<VeilMediaEngineHandle>, int)?
+    veilMediaEngineSetIndependentTransportFeedback =
+    _lookupIndependentTransportFeedback();

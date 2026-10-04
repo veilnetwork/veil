@@ -88,6 +88,15 @@ class VeilTransportShim : public webrtc::Transport {
   // media type — a wrong type black-holes the packet). 0 = no video (all audio).
   void SetRemoteVideoSsrc(uint32_t ssrc) { remote_video_ssrc_.store(ssrc); }
 
+  // Enable only when both endpoints have independent audio/video counters.
+  // Older engines used one sequence space and cannot consume split feedback.
+  void SetIndependentTransportFeedback(bool enabled) {
+    independent_transport_feedback_.store(enabled);
+  }
+  bool independent_transport_feedback() const {
+    return independent_transport_feedback_.load();
+  }
+
   // Monotonic count of accepted inbound datagrams. Group-call control uses it
   // as a per-peer media-liveness signal without moving packet bytes into Dart.
   uint64_t inbound_packet_count() const {
@@ -157,6 +166,7 @@ class VeilTransportShim : public webrtc::Transport {
   webrtc::Call* const video_call_;
   webrtc::TaskQueueBase* const video_network_queue_;
   std::atomic<uint32_t> remote_video_ssrc_{0};
+  std::atomic<bool> independent_transport_feedback_{false};
   std::atomic<bool> started_{false};
   InboundPacketQueue inbound_queue_;
   std::atomic<uint64_t> inbound_dropped_overload_{0};
