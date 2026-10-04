@@ -1501,6 +1501,7 @@ impl NodeServices {
         .map_err(|_| AnonOnionSendError::NoRelays)?;
         // Snapshot what the handle needs BEFORE the origin moves into the table.
         let circ = DataCircuit {
+            _local_path: None,
             first_hop: origin.first_hop,
             relay_path: relay_path.to_vec(),
             origin_circuit_id: origin.origin_circuit_id,
@@ -1965,6 +1966,29 @@ impl NodeServices {
         (DataCircuit, tokio::sync::mpsc::Receiver<Vec<u8>>),
         veil_types::AnonOnionSendError,
     > {
+        self.open_stream_circuit_to_rendezvous_relay_in_group(
+            rendezvous_node_id,
+            reg_kp,
+            last_epoch,
+            hop_count,
+            None,
+        )
+        .await
+    }
+
+    /// Prefer a separate first-hop session for this local producer. The group
+    /// never appears in circuit setup, cell headers or relay scheduling.
+    pub async fn open_stream_circuit_to_rendezvous_relay_in_group(
+        &self,
+        rendezvous_node_id: [u8; 32],
+        reg_kp: &veil_crypto::GeneratedKeyPair,
+        last_epoch: &std::sync::atomic::AtomicU64,
+        hop_count: usize,
+        group: Option<&LocalCircuitPathGroup>,
+    ) -> std::result::Result<
+        (DataCircuit, tokio::sync::mpsc::Receiver<Vec<u8>>),
+        veil_types::AnonOnionSendError,
+    > {
         let relay_path = match self.select_onion_relay_path_to(rendezvous_node_id, hop_count) {
             Ok(path) => path,
             Err(_) => {
@@ -2005,6 +2029,22 @@ impl NodeServices {
                 }
             }
         };
+        if let Some(group) = group {
+            // Warming above may await; selection + reservation below never do.
+            let ((mut circuit, rx), reservation) = group.select(|excluded, preferred| {
+                let path = self.select_onion_relay_path_to_avoiding(
+                    rendezvous_node_id,
+                    hop_count,
+                    excluded,
+                    preferred,
+                )?;
+                let opened = self.open_stream_circuit(&path, reg_kp, last_epoch)?;
+                let first_hop = opened.0.first_hop();
+                Ok::<_, veil_types::AnonOnionSendError>((opened, first_hop))
+            })?;
+            circuit._local_path = Some(reservation);
+            return Ok((circuit, rx));
+        }
         self.open_stream_circuit(&relay_path, reg_kp, last_epoch)
     }
 
@@ -2279,6 +2319,16 @@ impl NodeServices {
         r: [u8; 32],
         hop_count: usize,
     ) -> std::result::Result<Vec<[u8; 32]>, veil_types::AnonOnionSendError> {
+        self.select_onion_relay_path_to_avoiding(r, hop_count, &[], &[])
+    }
+
+    fn select_onion_relay_path_to_avoiding(
+        &self,
+        r: [u8; 32],
+        hop_count: usize,
+        excluded_first_hops: &[[u8; 32]],
+        preferred_first_hops: &[[u8; 32]],
+    ) -> std::result::Result<Vec<[u8; 32]>, veil_types::AnonOnionSendError> {
         use veil_anonymity::directory::{
             DEFAULT_FRESHNESS_WINDOW_SECS, discover_relay_hops_cached, relay_directory_dht_key,
         };
@@ -2373,23 +2423,22 @@ impl NodeServices {
         // through a relay we already transport to is not an anonymity loss — the
         // first hop always observes our origin session regardless.
         {
+            // Use the actual write registry, as circuit enqueue/liveness does.
+            // Administrative session rows can lag establishment or teardown.
             let session_peers: std::collections::HashSet<[u8; 32]> = {
-                let sessions = lock!(self.live_sessions);
-                sessions
-                    .values()
-                    .filter(|i| i.state == crate::types::SessionState::Active)
-                    .filter_map(|i| i.node_id.as_ref().map(|n| *n.as_bytes()))
+                let registry = rlock!(self.session_tx_registry);
+                discovered
+                    .iter()
+                    .filter(|n| registry.has_session(n))
+                    .copied()
                     .collect()
             };
-            if !discovered.is_empty()
-                && !session_peers.contains(&discovered[0])
-                && let Some(pos) = discovered.iter().position(|n| session_peers.contains(n))
-            {
-                discovered.swap(0, pos);
-                // else: no discovered middle is session-backed — the build's
-                // CircuitBuild send will fail NoRelays, the honest outcome (we
-                // hold no session to reach any usable first hop right now).
-            }
+            local_circuit_paths::prefer_first_hop(
+                &mut discovered,
+                &session_peers,
+                excluded_first_hops,
+                preferred_first_hops,
+            );
         }
         let mids: Vec<[u8; 32]> = discovered.into_iter().take(hop_count - 1).collect();
         let mut relay_path = mids;

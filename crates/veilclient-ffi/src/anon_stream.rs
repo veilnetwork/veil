@@ -732,6 +732,7 @@ impl CellSender for AnonCells {
 /// receiver can map the opaque tag back to the sender's node id.
 #[derive(Clone)]
 struct CircuitCells {
+    path_group: veil_node_runtime::LocalCircuitPathGroup,
     /// Only lossy local sends use this lane; it is absent from circuit frames.
     local_datagram_lane: u8,
     /// Outbound-only producers use fresh unadvertised registrations per
@@ -1495,6 +1496,7 @@ impl CircuitCells {
     /// the role of the producer is never added to a circuit frame.
     fn isolated_producer(&self, plane: LocalMediaPlane) -> Self {
         Self {
+            path_group: self.path_group.isolated(),
             private_outbound_registration: true,
             local_datagram_lane: match plane {
                 LocalMediaPlane::Primary => veil_proto::priority::REALTIME,
@@ -2990,6 +2992,7 @@ impl CircuitCells {
         let first_hop_cooldowns = Arc::clone(&self.first_hop_cooldowns);
         let pool_target = self.outbound_pool_target_for(route_class);
         let private_registration = self.private_outbound_registration;
+        let path_group = self.path_group.clone();
         tokio::spawn(async move {
             let opened = open_outbound_circuit(
                 services.clone(),
@@ -3008,6 +3011,7 @@ impl CircuitCells {
                 first_hop_cooldowns,
                 pool_target,
                 private_registration,
+                path_group,
             )
             .await;
             outbound_opening.lock().await.remove(&dst_node);
@@ -3058,6 +3062,7 @@ impl CircuitCells {
                 Arc::clone(&self.first_hop_cooldowns),
                 self.outbound_pool_target_for(route_class),
                 self.private_outbound_registration,
+                self.path_group.clone(),
             )
             .await;
             self.outbound_opening.lock().await.remove(&dst_node);
@@ -3627,6 +3632,8 @@ fn try_open_circuit(
     // more likely than in-flight cells.
     let circuit_slot = Arc::clone(&inbound_circuits);
     let services_bg = services.clone();
+    let path_group = veil_node_runtime::LocalCircuitPathGroup::default();
+    let path_group_bg = path_group.clone();
     let reg_kp_bg = Arc::clone(&reg_kp);
     let epoch_bg = Arc::clone(&epoch);
     let in_tx_bg = in_tx.clone();
@@ -3652,18 +3659,26 @@ fn try_open_circuit(
         let mut early_refresh_streak = 0u32;
         loop {
             attempt += 1;
-            let opened =
-                match open_inbound_circuits(&services_bg, me, &reg_kp_bg, &epoch_bg, mode).await {
-                    Ok(opened) => opened,
-                    Err(e) => {
-                        if attempt == 1 || attempt.is_multiple_of(15) {
-                            diag_node(&me, &format!("circuit open retry #{attempt}: {e:?}"));
-                        }
-                        tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
-                        backoff_ms = backoff_ms.saturating_mul(2).min(8_000);
-                        continue;
+            let opened = match open_inbound_circuits(
+                &services_bg,
+                me,
+                &reg_kp_bg,
+                &epoch_bg,
+                mode,
+                &path_group_bg,
+            )
+            .await
+            {
+                Ok(opened) => opened,
+                Err(e) => {
+                    if attempt == 1 || attempt.is_multiple_of(15) {
+                        diag_node(&me, &format!("circuit open retry #{attempt}: {e:?}"));
                     }
-                };
+                    tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
+                    backoff_ms = backoff_ms.saturating_mul(2).min(8_000);
+                    continue;
+                }
+            };
 
             let mut confirmed = Vec::with_capacity(opened.len());
             let mut confirmed_relays = Vec::with_capacity(opened.len());
@@ -3912,6 +3927,7 @@ fn try_open_circuit(
         }
     });
     Some(CircuitCells {
+        path_group,
         local_datagram_lane: veil_proto::priority::INTERACTIVE,
         private_outbound_registration: false,
         services,
@@ -4002,6 +4018,7 @@ async fn open_inbound_circuits(
     reg_kp: &veil_crypto::GeneratedKeyPair,
     epoch: &AtomicU64,
     mode: CircuitMode,
+    path_group: &veil_node_runtime::LocalCircuitPathGroup,
 ) -> Result<Vec<OpenedInboundCircuit>, veil_types::AnonOnionSendError> {
     use veil_types::AnonOnionSendError;
 
@@ -4032,7 +4049,13 @@ async fn open_inbound_circuits(
             let mut last_err = AnonOnionSendError::NoRelays;
             for relay in relays {
                 match services
-                    .open_stream_circuit_to_rendezvous_relay(relay, reg_kp, epoch, CIRCUIT_HOPS)
+                    .open_stream_circuit_to_rendezvous_relay_in_group(
+                        relay,
+                        reg_kp,
+                        epoch,
+                        CIRCUIT_HOPS,
+                        Some(path_group),
+                    )
                     .await
                 {
                     Ok((circuit, rx)) => opened.push((Some(relay), circuit, rx)),
@@ -4087,6 +4110,7 @@ async fn open_outbound_circuit(
     first_hop_cooldowns: FirstHopCooldowns,
     pool_target: usize,
     private_registration: bool,
+    path_group: veil_node_runtime::LocalCircuitPathGroup,
 ) -> Result<(), String> {
     let desired_pool_target = pool_target.clamp(1, MAX_CIRCUIT_OUTBOUND_POOL);
     let mut ads = services
@@ -4344,11 +4368,12 @@ async fn open_outbound_circuit(
         let started = Instant::now();
         let registration = outbound_registration(&reg_kp, &epoch, private_registration)?;
         let (candidate, recv_rx) = match services
-            .open_stream_circuit_to_rendezvous_relay(
+            .open_stream_circuit_to_rendezvous_relay_in_group(
                 ad.rendezvous_node_id,
                 &registration.keypair,
                 &registration.epoch,
                 CIRCUIT_HOPS,
+                Some(&path_group),
             )
             .await
         {

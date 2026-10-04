@@ -25,6 +25,7 @@ mod ipc_bridges;
 mod ipc_server;
 mod key_rotation;
 mod lifecycle;
+mod local_circuit_paths;
 mod mailbox_state;
 mod maintenance;
 mod mesh_gateway;
@@ -33,6 +34,7 @@ mod nat_punch;
 mod nat_traversal;
 pub mod nickname;
 mod node_services;
+pub use local_circuit_paths::LocalCircuitPathGroup;
 mod offline_seal;
 mod p_net_ban_sync;
 pub(crate) mod peer_handshake;
@@ -4133,6 +4135,7 @@ fn map_sender_err(e: veil_anonymity::sender::SenderError) -> veil_types::AnonOni
 /// sends FORWARD cells toward the terminus and opens RETURN cells via the
 /// dispatcher origin table. ADDITIVE — no existing anonymous-send path changes.
 pub struct DataCircuit {
+    _local_path: Option<local_circuit_paths::Reservation>,
     first_hop: [u8; 32],
     relay_path: Vec<[u8; 32]>,
     origin_circuit_id: u32,

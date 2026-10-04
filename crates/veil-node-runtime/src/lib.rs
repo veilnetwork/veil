@@ -44,7 +44,7 @@ pub use runtime::nickname::NicknameMasterKey;
 pub use runtime::services::{
     embedded_services, embedded_services_for, publish_embedded_services, withdraw_embedded_services,
 };
-pub use runtime::{DataCircuit, DataCircuitSendError, NodeServices};
+pub use runtime::{DataCircuit, DataCircuitSendError, LocalCircuitPathGroup, NodeServices};
 pub use state::NodeState;
 pub use types::{
     LinkId, ListenConfigEntry, ListenId, ListenerHandle, NodeId, NodeIdBytes, NodeSummary,

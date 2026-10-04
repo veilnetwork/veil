@@ -162,11 +162,12 @@ async fn open_private_route(
     let registration = outbound_registration(&core.reg_kp, &core.epoch, true).ok()?;
     let (circuit, rx) = core
         .services
-        .open_stream_circuit_to_rendezvous_relay(
+        .open_stream_circuit_to_rendezvous_relay_in_group(
             relay,
             &registration.keypair,
             &registration.epoch,
             CIRCUIT_HOPS,
+            Some(&core.path_group),
         )
         .await
         .ok()?;
@@ -508,6 +509,7 @@ impl MediaRoutes {
 pub(crate) struct RouteSnapshot {
     pub plane: u8,
     pub origin: u32,
+    pub first_hop: [u8; 32],
     pub destination_cookie: [u8; 16],
     pub return_cookie: [u8; 16],
 }
@@ -547,6 +549,7 @@ impl MediaRoutes {
                 routes.push(RouteSnapshot {
                     plane: i as u8,
                     origin: route.circuit.origin_circuit_id(),
+                    first_hop: route.circuit.first_hop(),
                     destination_cookie: address.cookie,
                     return_cookie: route.cookie,
                 });
