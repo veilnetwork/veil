@@ -522,6 +522,32 @@ impl SessionTxRegistry {
         self.send_to_arc_with_carrier(peer_id, priority, frame, None)
     }
 
+    /// Warm a source-only channel without enqueueing any user/control frame.
+    pub fn request_local_datagram_channel(
+        &self,
+        peer_id: &NodeIdBytes,
+        local_lane: u8,
+    ) -> crate::LocalDatagramChannelState {
+        self.senders
+            .get(peer_id)
+            .map_or(crate::LocalDatagramChannelState::Unsupported, |entry| {
+                entry.tx.request_local_datagram_channel(local_lane)
+            })
+    }
+
+    /// Local endpoint readiness only; never a relay role or service request.
+    pub fn local_datagram_channel_state(
+        &self,
+        peer_id: &NodeIdBytes,
+        local_lane: u8,
+    ) -> crate::LocalDatagramChannelState {
+        self.senders
+            .get(peer_id)
+            .map_or(crate::LocalDatagramChannelState::Unsupported, |entry| {
+                entry.tx.local_datagram_channel_state(local_lane)
+            })
+    }
+
     /// A circuit return transport is local metadata in the SAME neutral FIFO.
     /// It cannot reserve source ingress, change priority or bypass its budget.
     pub fn send_to_on_carrier_result(

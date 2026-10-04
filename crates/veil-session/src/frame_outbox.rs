@@ -71,10 +71,22 @@ impl EnvelopeReceiver {
 #[derive(Clone, Debug)]
 pub struct FrameSender {
     ordinary: mpsc::Sender<FrameEnvelope>,
+    status: std::sync::Arc<crate::local_datagram_status::LocalDatagramStatus>,
     reserved: mpsc::Sender<FrameEnvelope>,
 }
 
 impl FrameSender {
+    pub fn request_local_datagram_channel(
+        &self,
+        local_lane: u8,
+    ) -> crate::LocalDatagramChannelState {
+        self.status.request(local_lane)
+    }
+
+    pub fn local_datagram_channel_state(&self, local_lane: u8) -> crate::LocalDatagramChannelState {
+        self.status.state(local_lane)
+    }
+
     fn lane(&self, frame: &PriorityFrame) -> &mpsc::Sender<FrameEnvelope> {
         if frame.0 == veil_proto::priority::REALTIME {
             &self.reserved
@@ -142,21 +154,25 @@ impl FrameSender {
 #[derive(Debug)]
 pub struct FrameOutbox {
     ordinary: EnvelopeReceiver,
+    status: Option<std::sync::Arc<crate::local_datagram_status::LocalDatagramStatus>>,
     reserved: Option<EnvelopeReceiver>,
     reserved_burst: usize,
 }
 
 /// Keep the existing ordinary budget; add a small independent reserve.
 pub fn frame_channel(capacity: usize) -> (FrameSender, FrameOutbox) {
+    let status = std::sync::Arc::default();
     let (ordinary_tx, ordinary) = mpsc::channel(capacity);
     let (reserved_tx, reserved) = mpsc::channel(capacity.min(RESERVED_QUEUE_DEPTH));
     (
         FrameSender {
             ordinary: ordinary_tx,
+            status: std::sync::Arc::clone(&status),
             reserved: reserved_tx,
         },
         FrameOutbox {
             ordinary: EnvelopeReceiver::Live(ordinary),
+            status: Some(status),
             reserved: Some(EnvelopeReceiver::Live(reserved)),
             reserved_burst: 0,
         },
@@ -168,6 +184,7 @@ impl From<mpsc::Receiver<PriorityFrame>> for FrameOutbox {
     fn from(ordinary: mpsc::Receiver<PriorityFrame>) -> Self {
         Self {
             ordinary: EnvelopeReceiver::Legacy(ordinary),
+            status: None,
             reserved: None,
             reserved_burst: 0,
         }
@@ -175,6 +192,12 @@ impl From<mpsc::Receiver<PriorityFrame>> for FrameOutbox {
 }
 
 impl FrameOutbox {
+    pub(crate) fn local_datagram_status(
+        &self,
+    ) -> Option<std::sync::Arc<crate::local_datagram_status::LocalDatagramStatus>> {
+        self.status.clone()
+    }
+
     pub async fn recv(&mut self) -> Option<PriorityFrame> {
         self.recv_envelope().await.map(|envelope| envelope.frame)
     }

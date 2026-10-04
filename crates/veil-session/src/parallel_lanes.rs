@@ -393,6 +393,7 @@ pub(super) struct ParallelSession {
     offer: ParallelQuicOffer,
     context: RealtimeReceiverContext,
     parent: ParallelParent,
+    readiness: Option<crate::local_datagram_status::LocalDatagramLease>,
     _acceptor: RealtimeReceiverTask,
     _registration: Option<registry::Registration>,
     slots: [Slot; 2],
@@ -405,7 +406,11 @@ impl ParallelSession {
         rx: &[u8; 32],
         sid: [u8; 32],
         context: RealtimeReceiverContext,
+        status: Option<Arc<crate::local_datagram_status::LocalDatagramStatus>>,
     ) -> Self {
+        let readiness = status
+            .filter(|_| offer.duplex)
+            .map(|status| status.activate());
         let parent = ParallelParent::new(sid, *tx, *rx);
         let (incoming_tx, incoming_rx) = tokio::sync::mpsc::channel(8);
         let registration = offer
@@ -417,6 +422,7 @@ impl ParallelSession {
             offer,
             context,
             parent,
+            readiness,
             _acceptor: acceptor,
             _registration: registration,
             slots: Default::default(),
@@ -433,7 +439,15 @@ impl ParallelSession {
             .fetch_add(1, Ordering::Release);
         self.parent.retire();
         self._registration = None;
-        *self = Self::new(self.offer.clone(), tx, rx, sid, self.context.clone());
+        let status = self.readiness.as_ref().map(|lease| lease.status());
+        *self = Self::new(
+            self.offer.clone(),
+            tx,
+            rx,
+            sid,
+            self.context.clone(),
+            status,
+        );
     }
 
     /// Poll readiness and initiate warming without awaiting on the main
@@ -464,6 +478,9 @@ impl ParallelSession {
                 Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {}
             }
         }
+        if let Some(lease) = &self.readiness {
+            lease.mark(priority, slot.ready.is_some());
+        }
         if slot.ready.is_some() {
             return true;
         }
@@ -475,6 +492,7 @@ impl ParallelSession {
             let offer = self.offer.clone();
             let parent = self.parent.handle();
             let context = self.context.clone();
+            let status = self.readiness.as_ref().map(|lease| lease.status());
             let (tx, rx) = tokio::sync::oneshot::channel();
             let task = RealtimeReceiverTask(tokio::spawn(async move {
                 if let Ok(Ok(ready)) = tokio::time::timeout(
@@ -484,6 +502,9 @@ impl ParallelSession {
                 .await
                 {
                     let _ = tx.send(ready);
+                }
+                if let Some(status) = status {
+                    status.wake();
                 }
             }));
             slot.warm = Some((rx, task));
