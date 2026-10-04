@@ -1,14 +1,14 @@
 // Compiled only into the stand dylib, never the production engine ABI.
 namespace {
 using PlaneInjector = int (*)(void*, uint64_t, uint32_t, uint32_t);
-struct HeldVideoQueues {
+struct HeldQueues {
   struct Gate {
     std::atomic<bool> entered{false};
     std::atomic<bool> released{false};
   };
-  std::shared_ptr<Gate> network = std::make_shared<Gate>();
-  std::shared_ptr<Gate> worker = std::make_shared<Gate>();
-  HeldVideoQueues(webrtc::TaskQueueBase* net, webrtc::TaskQueueBase* work) {
+  std::shared_ptr<Gate> first = std::make_shared<Gate>();
+  std::shared_ptr<Gate> second = std::make_shared<Gate>();
+  HeldQueues(webrtc::TaskQueueBase* net, webrtc::TaskQueueBase* work) {
     const auto hold = [](webrtc::TaskQueueBase* q, std::shared_ptr<Gate> g) {
       q->PostTask([g] {
         g->entered.store(true);
@@ -16,14 +16,14 @@ struct HeldVideoQueues {
           std::this_thread::sleep_for(std::chrono::milliseconds(1));
       });
     };
-    hold(net, network);
-    hold(work, worker);
+    hold(net, first);
+    hold(work, second);
   }
   void Release() {
-    network->released.store(true);
-    worker->released.store(true);
+    first->released.store(true);
+    second->released.store(true);
   }
-  ~HeldVideoQueues() { Release(); }
+  ~HeldQueues() { Release(); }
 };
 int check_call_planes(webrtc::Call* audio, webrtc::Call* video,
                       webrtc::TaskQueueBase* audio_worker,
@@ -41,9 +41,9 @@ int check_call_planes(webrtc::Call* audio, webrtc::Call* video,
         before = recv->GetStats(false).packets_received;
       }, std::chrono::seconds(1))) return 2;
   const auto video_before = shim->delivered_video_cadence().frames;
-  HeldVideoQueues held(video_net, video_worker);
+  HeldQueues held(video_net, video_worker);
   auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(1);
-  while (!held.network->entered.load() || !held.worker->entered.load()) {
+  while (!held.first->entered.load() || !held.second->entered.load()) {
     if (std::chrono::steady_clock::now() >= deadline) return 3;
     std::this_thread::sleep_for(std::chrono::milliseconds(1));
   }
@@ -80,6 +80,20 @@ extern "C" int veil_media_test_direct_call_planes(
       ws->video_network_tq.get(), ws->recv_stream, ws->shim.get(), e->veil_chan,
       ssrc_of(e->peer), video_ssrc_of(e->peer), inject, ctx);
 }
+// The same stats API must remain usable when the audio worker itself stops.
+// Both holds are released even if the checker reports an error.
+extern "C" int veil_media_test_blocked_audio_stats(
+    VeilMediaEngine* e, PlaneInjector check, void* ctx) {
+  auto* ws = e->ws.get();
+  HeldQueues held(ws->worker_tq.get(), ws->video_worker_tq.get());
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+  while (!held.first->entered.load() || !held.second->entered.load()) {
+    if (std::chrono::steady_clock::now() >= deadline) return 1;
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  return check(ctx, e->veil_chan, ssrc_of(e->peer), video_ssrc_of(e->peer));
+}
+
 extern "C" int veil_media_test_group_call_planes(
     VeilGroupMediaEngine* e, PlaneInjector inject, void* ctx) {
   auto* ws = e->ws.get();

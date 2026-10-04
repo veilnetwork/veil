@@ -3339,6 +3339,7 @@ char* veil_media_engine_get_stats(VeilMediaEngine* engine) {
     // delay accumulates in the RECEIVE pipeline, so export the direct playout
     // measurements — NetEq's total audio path estimate (jitter buffer + ADM
     // playout) and the video render delay target.
+    uint64_t audio_rx_pkts = 0;
     uint32_t audio_delay_ms = 0;
     uint32_t audio_jb_ms = 0;
     int video_delay_ms = 0;
@@ -3377,7 +3378,7 @@ char* veil_media_engine_get_stats(VeilMediaEngine* engine) {
     android420_replaced =
         ws->android420_stats.replaced.load(std::memory_order_relaxed);
 #endif
-    const bool sampled = run_on(ws->worker_tq.get(), [&] {
+    const bool sampled = veil_media::run_on_with_timeout(ws->worker_tq.get(), [&] {
       if (ws->call) {
         const auto cs = ws->call->GetStats();
         if (cs.rtt_ms >= 0) rtt_ms = cs.rtt_ms;
@@ -3386,6 +3387,7 @@ char* veil_media_engine_get_stats(VeilMediaEngine* engine) {
       if (ws->recv_stream) {
         const auto r =
             ws->recv_stream->GetStats(/*get_and_clear_legacy_stats=*/false);
+        audio_rx_pkts = r.packets_received;
         jitter_ms = r.jitter_ms;
         audio_delay_ms = r.delay_estimate_ms;
         audio_jb_ms = r.jitter_buffer_ms;
@@ -3399,7 +3401,7 @@ char* veil_media_engine_get_stats(VeilMediaEngine* engine) {
           }
         }
       }
-    });
+    }, std::chrono::milliseconds(20));
     // A stalled video worker must not block audio telemetry or the UI's
     // control loop for the ten-second stream-operation timeout.
     const bool video_sampled = veil_media::run_on_with_timeout(
@@ -3445,10 +3447,10 @@ char* veil_media_engine_get_stats(VeilMediaEngine* engine) {
     // silence, and a truncated object is not a smaller answer — it is one the
     // Dart side cannot parse at all, so the return is checked below rather
     // than trusted.
-    char json[1792];
+    char json[2048];
     const int written = std::snprintf(
         json, sizeof(json),
-        "{\"tx_pkts\":%llu,\"rx_pkts\":%llu,\"tx_bytes\":%llu,"
+        "{\"tx_pkts\":%llu,\"rx_pkts\":%llu,\"audio_rx_pkts\":%llu,\"tx_bytes\":%llu,"
         "\"rx_bytes\":%llu,\"tx_drops\":%llu,\"rx_drops\":%llu,"
         "\"rtt_ms\":%lld,\"jitter_ms\":%u,\"loss_pct\":%d,"
         "\"tx_jitter_ms\":%d,\"tx_loss_pct\":%d,\"audio_feedback_reports\":%d,"
@@ -3475,6 +3477,7 @@ char* veil_media_engine_get_stats(VeilMediaEngine* engine) {
         "\"target_bitrate_bps\":%d,\"max_fps\":%d}",
         static_cast<unsigned long long>(ws->shim->outbound_packet_count()),
         static_cast<unsigned long long>(ws->shim->inbound_packet_count()),
+        static_cast<unsigned long long>(audio_rx_pkts),
         static_cast<unsigned long long>(ws->shim->outbound_byte_count()),
         static_cast<unsigned long long>(ws->shim->inbound_byte_count()),
         static_cast<unsigned long long>(ws->shim->outbound_dropped_count()),

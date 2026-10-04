@@ -15,6 +15,7 @@
 
 using Injector = int (*)(void*, uint64_t, uint32_t, uint32_t);
 extern "C" int veil_media_test_direct_call_planes(VeilMediaEngine*, Injector, void*);
+extern "C" int veil_media_test_blocked_audio_stats(VeilMediaEngine*, Injector, void*);
 extern "C" int veil_media_test_group_call_planes(VeilGroupMediaEngine*, Injector, void*);
 extern "C" int veil_media_test_group_fanout_packet(VeilGroupMediaEngine*, int);
 extern "C" int veil_media_test_video_bandwidth(VeilMediaEngine*);
@@ -109,6 +110,19 @@ static int inject(void* ctx, uint64_t chan, uint32_t audio, uint32_t video) {
   }
   return 0;
 }
+static int check_blocked_audio_stats(void* ctx, uint64_t, uint32_t, uint32_t) {
+  const auto start = std::chrono::steady_clock::now();
+  char* json = veil_media_engine_get_stats(static_cast<VeilMediaEngine*>(ctx));
+  const auto elapsed = std::chrono::steady_clock::now() - start;
+  const bool valid = json && std::strstr(json, "\"worker_stalled\":1") &&
+                     std::strstr(json, "\"video_worker_stalled\":1") &&
+                     std::strstr(json, "\"audio_rx_pkts\":0");
+  std::free(json);
+  std::fprintf(stderr, "blocked audio stats: %.1f ms\n",
+               std::chrono::duration<double, std::milli>(elapsed).count());
+  return valid && elapsed < std::chrono::milliseconds(250) ? 0 : 2;
+}
+
 static uint64_t group_stat(VeilGroupMediaEngine* engine, const char* name) {
   char* json = veil_media_group_engine_get_stats(engine);
   assert(json);
@@ -162,6 +176,15 @@ int main() {
     assert(veil_media_engine_start_video(e.get(), 1, 1, 150, 15) == VEIL_MEDIA_OK);
     const int result = veil_media_test_direct_call_planes(e.get(), inject, e.get());
     if (result) { std::fprintf(stderr, "direct isolation failed: %d\n", result); return 1; }
+    if (veil_media_test_blocked_audio_stats(e.get(), check_blocked_audio_stats, e.get()) != 0) {
+      std::fprintf(stderr, "audio statistics blocked the host control loop\n");
+      return 1;
+    }
+    // Shim ingress includes video/RTCP; the new counter counts only packets
+    // accepted by the real audio receive stream. A blocked sample above must
+    // report unknown via worker_stalled rather than reuse a cached success.
+    assert(stat(e.get(), "audio_rx_pkts") == 4);
+    assert(stat(e.get(), "rx_pkts") > stat(e.get(), "audio_rx_pkts"));
     // The abandoned retune must not run after the held queue is released.
     // An explicit retry may then update both bitrate and source cadence.
     assert(stat(e.get(), "max_fps") == 15);
@@ -226,6 +249,8 @@ int main() {
     while (stat(e.get(), "audio_feedback_reports") == 0 && std::chrono::steady_clock::now() < deadline)
       std::this_thread::sleep_for(std::chrono::milliseconds(10));
     assert(stat(e.get(), "audio_feedback_reports") == 1);
+    assert(stat(e.get(), "audio_rx_pkts") == 0);  // reports are not received audio
+
     assert(stat(e.get(), "tx_loss_pct") == 13);
     assert(stat(e.get(), "tx_jitter_ms") == 100);
     // Cached WebRTC values can outlive the last peer report. The explicit

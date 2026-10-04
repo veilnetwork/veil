@@ -258,6 +258,10 @@ int veil_media_engine_select_audio_output(VeilMediaEngine *engine,
                                           const char *id);
 
 /* ---- Stats ---------------------------------------------------------------
+ * Additive `audio_rx_pkts` counts RTP packets accepted by the audio receive
+ * stream, excluding video and RTCP. It is valid only with worker_stalled=0;
+ * it does not measure decoded/played audio. Worker scheduling waits are 20 ms
+ * each; an operation already started is waited out for lifetime safety.
  * Heap JSON snapshot {"tx_pkts","rx_pkts","tx_bytes","rx_bytes",
  * "rtt_ms","jitter_ms","loss_pct","target_bitrate_bps",...} or NULL.
  * Free with veil_media_free_string. */
