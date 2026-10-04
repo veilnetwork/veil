@@ -202,7 +202,7 @@ async fn runner_circuit_datagrams_over_real_quic(
     let cell_bytes = CircuitCellBytes::legacy(); // 16 KiB: real fragmentation
     let circuit_key = [0x44; 32];
     let circuit_id = 4242;
-    let circuit_frame = |seq, msg| {
+    let circuit_frame = |circuit_id, seq, msg| {
         let bytes = vec![seq as u8; 250];
         let mut cipher = wrap_payload(&bytes, cell_bytes).unwrap();
         apply_layer(&circuit_key, Direction::Return, seq, &mut cipher);
@@ -235,26 +235,26 @@ async fn runner_circuit_datagrams_over_real_quic(
         let (mut runner, _) = make_swap_runner(dummy);
         let mut dispatcher = make_test_dispatcher(NodeRole::Core);
         dispatcher.circuit_origin = Some(Arc::new(OriginCircuitTable::new()));
-        dispatcher
-            .circuit_origin
-            .as_ref()
-            .unwrap()
-            .insert(Arc::new(OriginCircuit {
-                cell_bytes,
-                circuit_keys: vec![circuit_key],
-                first_hop: [1; 32],
-                origin_circuit_id: circuit_id,
-                created_unix: 0,
-                confirmed: Arc::default(),
-                is_reply: false,
-                last_return_unix: Arc::default(),
-            }));
-        let (recv_tx, recv_rx) = mpsc::channel(32);
-        dispatcher
-            .stream_recv
-            .lock()
-            .unwrap()
-            .insert(circuit_id, recv_tx);
+        let mut circuit_receivers = Vec::new();
+        for id in [circuit_id, circuit_id + 1] {
+            dispatcher
+                .circuit_origin
+                .as_ref()
+                .unwrap()
+                .insert(Arc::new(OriginCircuit {
+                    cell_bytes,
+                    circuit_keys: vec![circuit_key],
+                    first_hop: [1; 32],
+                    origin_circuit_id: id,
+                    created_unix: 0,
+                    confirmed: Arc::default(),
+                    is_reply: false,
+                    last_return_unix: Arc::default(),
+                }));
+            let (recv_tx, recv_rx) = mpsc::channel(32);
+            dispatcher.stream_recv.lock().unwrap().insert(id, recv_tx);
+            circuit_receivers.push(recv_rx);
+        }
         let attempted = Arc::new(tokio::sync::Notify::new());
         stopped.push(Arc::clone(&attempted));
         runner.stream = if stop_writer {
@@ -279,29 +279,39 @@ async fn runner_circuit_datagrams_over_real_quic(
         runner.dispatcher = dispatcher;
         tasks.push(tokio::spawn(async move { runner.run().await }));
         senders.push(out_tx);
-        receivers.push(recv_rx);
+        receivers.push(circuit_receivers);
     }
     let result = tokio::time::timeout(Duration::from_secs(5), async {
         for direction in 0..2 {
             if stop_writer {
                 // Reliable control/file cells are already held by the writer.
                 senders[direction]
-                    .send(circuit_frame(1, RelayChainMsg::CircuitData))
+                    .send(circuit_frame(circuit_id, 1, RelayChainMsg::CircuitData))
                     .await
                     .unwrap();
                 stopped[direction].notified().await;
-                assert!(receivers[1 - direction].try_recv().is_err());
+                assert!(
+                    receivers[1 - direction]
+                        .iter_mut()
+                        .all(|rx| rx.try_recv().is_err())
+                );
             }
             for seq in 2..=7 {
-                senders[direction]
-                    .send(circuit_frame(seq, RelayChainMsg::CircuitDatagram))
-                    .await
-                    .unwrap();
-                let got = receivers[1 - direction].recv().await.unwrap();
-                assert_eq!(got, vec![seq as u8; 250]);
+                for (index, id) in [circuit_id, circuit_id + 1].into_iter().enumerate() {
+                    senders[direction]
+                        .send(circuit_frame(id, seq, RelayChainMsg::CircuitDatagram))
+                        .await
+                        .unwrap();
+                    let got = receivers[1 - direction][index].recv().await.unwrap();
+                    assert_eq!(got, vec![seq as u8; 250]);
+                }
             }
             // Reliable seq=1 never rode the datagram lane.
-            assert!(receivers[1 - direction].try_recv().is_err());
+            assert!(
+                receivers[1 - direction]
+                    .iter_mut()
+                    .all(|rx| rx.try_recv().is_err())
+            );
         }
     })
     .await;
