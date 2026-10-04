@@ -129,6 +129,7 @@ pub enum NextInput {
 /// Returns immediately with whichever event fires first. Uses
 /// `std::future::pending` for absent sources so a single `tokio::select!`
 /// handles all optional-combination cases without duplication.
+#[allow(clippy::too_many_arguments)]
 async fn await_next_input(
     read_half: &mut tokio::io::ReadHalf<BoxIoStream>,
     outbox: Option<&mut crate::FrameOutbox>,

@@ -935,6 +935,37 @@ void _sendWorker(int appAddr, Uint8List dstNodeId, Uint8List dstAppId,
   }
 }
 
+void _sendOnLocalLaneWorker(
+    int appAddr,
+    Uint8List dstNodeId,
+    Uint8List dstAppId,
+    int dstEndpointId,
+    Uint8List data,
+    int localLane,
+    bool anonymous) {
+  final app = Pointer<ffi.VeilApp>.fromAddress(appAddr);
+  final dstNode = calloc<Uint8>(32);
+  final dstApp = calloc<Uint8>(32);
+  final dataPtr = data.isNotEmpty ? calloc<Uint8>(data.length) : nullptr;
+  final errOut = calloc<Pointer<Utf8>>();
+  try {
+    dstNode.asTypedList(32).setAll(0, dstNodeId);
+    dstApp.asTypedList(32).setAll(0, dstAppId);
+    if (data.isNotEmpty) dataPtr.asTypedList(data.length).setAll(0, data);
+    final rc = ffi.veilSendOnLocalLane(app, dstNode, dstApp, dstEndpointId,
+        dataPtr, data.length, localLane, anonymous ? 1 : 0, errOut);
+    if (rc != ffi.veilOk) {
+      throw VeilException('local-lane send failed: ${_readErrAndFree(errOut)}',
+          code: rc);
+    }
+  } finally {
+    calloc.free(dstNode);
+    calloc.free(dstApp);
+    if (dataPtr != nullptr) calloc.free(dataPtr);
+    calloc.free(errOut);
+  }
+}
+
 /// Off-isolate body of [AppHandle.sendRealtime]. This is the native
 /// APP_RT_SEND path: it only uses an already-active direct peer session and
 /// fails promptly when none exists, allowing the caller's durable fallback to
@@ -2555,6 +2586,28 @@ class AppHandle implements Finalizable {
     final appAddr = _app.address;
     return Isolate.run(
         () => _sendWorker(appAddr, dstNodeId, dstAppId, dstEndpointId, data));
+  }
+
+  /// Choose this endpoint's queue (0..3), without a relay priority or role.
+  /// [anonymous] preserves authenticated onion-only routing.
+  Future<void> sendOnLocalLane({
+    required Uint8List dstNodeId,
+    required Uint8List dstAppId,
+    required int dstEndpointId,
+    required Uint8List data,
+    required int localLane,
+    bool anonymous = false,
+  }) async {
+    _ensureOpen();
+    if (dstNodeId.length != 32 || dstAppId.length != 32) {
+      throw ArgumentError('dst_node_id and dst_app_id must be 32 bytes');
+    }
+    if (localLane < 0 || localLane > 3) {
+      throw RangeError.range(localLane, 0, 3, 'localLane');
+    }
+    final appAddr = _app.address;
+    return Isolate.run(() => _sendOnLocalLaneWorker(appAddr, dstNodeId,
+        dstAppId, dstEndpointId, data, localLane, anonymous));
   }
 
   /// Send to the OTHER DEVICES of this identity.

@@ -396,6 +396,33 @@ final int Function(
             )>>('veil_send')
     .asFunction();
 
+/// Process-local source lane; it is stripped at the daemon boundary.
+final int Function(
+  Pointer<VeilApp>,
+  Pointer<Uint8>,
+  Pointer<Uint8>,
+  int,
+  Pointer<Uint8>,
+  int,
+  int,
+  int,
+  Pointer<Pointer<Utf8>>,
+) veilSendOnLocalLane = nativeLib
+    .lookup<
+        NativeFunction<
+            Int32 Function(
+              Pointer<VeilApp>,
+              Pointer<Uint8>,
+              Pointer<Uint8>,
+              Uint32,
+              Pointer<Uint8>,
+              IntPtr,
+              Uint8,
+              Uint8,
+              Pointer<Pointer<Utf8>>,
+            )>>('veil_send_on_local_lane')
+    .asFunction();
+
 final int Function(
   Pointer<VeilApp>,
   Pointer<Uint8>,

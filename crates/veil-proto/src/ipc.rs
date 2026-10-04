@@ -1154,6 +1154,19 @@ impl AuthDeliverFragment {
 
 // ── AppIpcSendPayload ─────────────────────────────────────────────────────── // STABLE v1
 
+/// AppIpcSend header-only source queue hint. A zero legacy header has no
+/// explicit choice and ordinary sends retain the interactive source queue.
+/// This bit and the lane are never copied to an inter-node header.
+pub const IPC_HEADER_EXPLICIT_LOCAL_LANE: u16 = 0x0004;
+
+pub fn ipc_local_source_lane(header: &crate::FrameHeader) -> u8 {
+    if header.flags & IPC_HEADER_EXPLICIT_LOCAL_LANE != 0 || header.priority() != 0 {
+        header.priority()
+    } else {
+        crate::priority::INTERACTIVE
+    }
+}
+
 /// Flag bit for `AppIpcSendPayload.flags`: request end-to-end delivery ACK.
 pub const IPC_SEND_FLAG_REQUIRE_ACK: u32 = 0x0000_0001;
 
