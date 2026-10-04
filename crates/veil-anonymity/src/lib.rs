@@ -38,6 +38,7 @@ pub mod blinded_descriptor;
 pub mod cell;
 pub mod circuit;
 pub mod circuit_builder;
+pub mod circuit_carrier;
 pub mod circuit_data;
 pub mod circuit_origin;
 pub mod circuit_register;

@@ -24,6 +24,16 @@ impl DispatcherSink for FrameDispatcher {
         FrameDispatcher::dispatch(self, header, body, peer_id)
     }
 
+    fn dispatch_with_carrier(
+        &self,
+        header: &FrameHeader,
+        body: &[u8],
+        peer_id: NodeIdBytes,
+        carrier: Option<veil_anonymity::circuit_carrier::Carrier>,
+    ) -> DispatchResult {
+        FrameDispatcher::dispatch_with_carrier(self, header, body, peer_id, carrier)
+    }
+
     fn capture_outbound(&self, peer_id: NodeIdBytes, frame: &[u8]) {
         FrameDispatcher::capture_outbound(self, peer_id, frame)
     }

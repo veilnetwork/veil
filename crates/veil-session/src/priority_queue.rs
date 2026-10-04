@@ -68,6 +68,7 @@ struct QueuedFrame {
     frame: veil_bufpool::PooledShared,
     enqueued_at: Option<Instant>,
     lossy_realtime: bool,
+    carrier: Option<veil_anonymity::circuit_carrier::Carrier>,
 }
 
 // ── PriorityQueue ─────────────────────────────────────────────────────────────
@@ -138,7 +139,7 @@ impl PriorityQueue {
     /// expense of BULK/BACKGROUND. Drops increment `drops_total` so the
     /// runner can forward them to Prometheus.
     pub fn push(&mut self, priority: u8, frame: veil_bufpool::PooledShared) {
-        self.push_entry(priority, frame, false);
+        self.push_entry(priority, frame, false, None);
     }
 
     /// Enqueue a canonical loss-tolerant realtime frame. When its dedicated
@@ -155,6 +156,28 @@ impl PriorityQueue {
     /// Loss tolerance is independent of queue priority. In particular relayed
     /// datagrams share INTERACTIVE FIFO order with other forwarded user data.
     pub fn push_lossy(&mut self, priority: u8, frame: veil_bufpool::PooledShared) {
+        self.push_lossy_with_carrier(priority, frame, None);
+    }
+
+    pub(crate) fn push_envelope(
+        &mut self,
+        envelope: crate::frame_outbox::FrameEnvelope,
+        lossy: bool,
+    ) {
+        let (priority, frame) = envelope.frame;
+        if lossy {
+            self.push_lossy_with_carrier(priority, frame, envelope.carrier);
+        } else {
+            self.push_entry(priority, frame, false, envelope.carrier);
+        }
+    }
+
+    fn push_lossy_with_carrier(
+        &mut self,
+        priority: u8,
+        frame: veil_bufpool::PooledShared,
+        carrier: Option<veil_anonymity::circuit_carrier::Carrier>,
+    ) {
         if self.lossy_realtime_len >= LOSSY_REALTIME_MAX_DEPTH
             && let Some((p, index, _)) = self
                 .queues
@@ -174,7 +197,7 @@ impl PriorityQueue {
             self.drops_total.fetch_add(1, Ordering::Relaxed);
             return;
         }
-        self.push_entry(priority, frame, true);
+        self.push_entry(priority, frame, true, carrier);
     }
 
     fn push_entry(
@@ -182,6 +205,7 @@ impl PriorityQueue {
         priority: u8,
         frame: veil_bufpool::PooledShared,
         lossy_realtime: bool,
+        carrier: Option<veil_anonymity::circuit_carrier::Carrier>,
     ) {
         let p = priority.min(3) as usize;
         if self.len() >= self.max_depth {
@@ -218,6 +242,7 @@ impl PriorityQueue {
             frame,
             enqueued_at: lossy_realtime.then(Instant::now),
             lossy_realtime,
+            carrier,
         });
         if lossy_realtime {
             self.lossy_realtime_len += 1;
@@ -348,6 +373,7 @@ impl PriorityQueue {
             frame,
             enqueued_at: Some(Instant::now()),
             lossy_realtime: true,
+            carrier: None,
         });
         self.lossy_realtime_len += 1;
     }
@@ -360,6 +386,14 @@ impl PriorityQueue {
         &mut self,
         predicate: impl FnOnce(&[u8]) -> bool,
     ) -> Option<(u8, veil_bufpool::PooledShared)> {
+        self.pop_datagram_envelope_if(predicate)
+            .map(|envelope| envelope.frame)
+    }
+
+    pub(crate) fn pop_datagram_envelope_if(
+        &mut self,
+        predicate: impl FnOnce(&[u8]) -> bool,
+    ) -> Option<crate::frame_outbox::FrameEnvelope> {
         for attempt in 0..2 {
             for p in 0..4 {
                 if self.slots[p] == 0 {
@@ -384,7 +418,10 @@ impl PriorityQueue {
                     if queued.lossy_realtime {
                         self.lossy_realtime_len -= 1;
                     }
-                    return Some((p as u8, queued.frame));
+                    return Some(crate::frame_outbox::FrameEnvelope {
+                        frame: (p as u8, queued.frame),
+                        carrier: queued.carrier,
+                    });
                 }
             }
             if attempt == 0 && !self.is_empty() {

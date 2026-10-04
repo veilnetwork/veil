@@ -20,6 +20,7 @@ pub struct ParallelDiagnostics {
     epoch_sent: [AtomicU64; 2],
     rekeys: AtomicU64,
     active: AtomicUsize,
+    replies: AtomicU64,
 }
 
 impl ParallelDiagnostics {
@@ -34,6 +35,10 @@ impl ParallelDiagnostics {
         channel_index(local_priority)
             .map_or(0, |index| self.epoch_sent[index].load(Ordering::Relaxed))
     }
+    pub fn replies(&self) -> u64 {
+        self.replies.load(Ordering::Relaxed)
+    }
+
     pub fn active_connections(&self) -> usize {
         self.active.load(Ordering::Acquire)
     }
@@ -50,6 +55,7 @@ pub struct ParallelQuicOffer {
     handle: QuicParallelHandle,
     diagnostics: Arc<ParallelDiagnostics>,
     registry: Option<Arc<ParallelRegistry>>,
+    duplex: bool,
 }
 
 impl ParallelQuicOffer {
@@ -58,11 +64,18 @@ impl ParallelQuicOffer {
             handle,
             diagnostics: Arc::default(),
             registry: None,
+            duplex: false,
         }
     }
     /// Use the runtime's single shared-listener dispatcher.
     pub fn with_registry(mut self, registry: Arc<ParallelRegistry>) -> Self {
         self.registry = Some(registry);
+        self
+    }
+
+    /// Enable only after the peer explicitly negotiates duplex children.
+    pub fn with_duplex(mut self) -> Self {
+        self.duplex = true;
         self
     }
 
@@ -121,7 +134,8 @@ impl Drop for Channel {
 }
 
 struct ReadySender {
-    sender: RealtimeSender,
+    sender: Arc<Mutex<RealtimeSender>>,
+    _receiver: Option<RealtimeReceiverTask>,
     _channel: Channel,
 }
 
@@ -139,6 +153,7 @@ async fn connect_sender(
     offer: ParallelQuicOffer,
     parent: ParallelParentHandle,
     index: usize,
+    context: RealtimeReceiverContext,
 ) -> Result<ReadySender, String> {
     let connection = offer
         .handle
@@ -173,8 +188,13 @@ async fn connect_sender(
     let tx = crate::datagram_flows::SessionDatagramTx::new(keys.tx_key(), &keys.session_id, true);
     let mut sender = RealtimeSender::new(channel.handle.clone(), tx);
     sender.sent_counter = Some((Arc::clone(&offer.diagnostics), index));
+    let sender = Arc::new(Mutex::new(sender));
+    let receiver = offer
+        .duplex
+        .then(|| spawn_child_receiver(&channel, &keys, parent, context, Arc::clone(&sender)));
     Ok(ReadySender {
         sender,
+        _receiver: receiver,
         _channel: channel,
     })
 }
@@ -183,6 +203,7 @@ async fn receive_child(
     mut channel: Channel,
     parent: ParallelParentHandle,
     context: RealtimeReceiverContext,
+    duplex: bool,
 ) {
     let authenticated = tokio::time::timeout(BIND_TIMEOUT, async {
         let mut hello = [0; HELLO_BYTES];
@@ -196,25 +217,131 @@ async fn receive_child(
     let Ok(Some(keys)) = authenticated else {
         return;
     };
-    receive_authenticated(channel, keys, context).await;
+    receive_authenticated(channel, keys, parent, context, duplex).await;
 }
 
 async fn receive_authenticated(
     channel: Channel,
     keys: ParallelKeys,
+    parent: ParallelParentHandle,
     context: RealtimeReceiverContext,
+    duplex: bool,
 ) {
     let rx = crate::datagram_flows::SessionDatagramRx::new(keys.rx_key(), &keys.session_id, true);
-    // These fixed child keys are retired as a whole at canonical rekey. They
-    // never receive the parent's ordinary datagram codec rotations.
     let (_hold_tx, rekey_rx) = tokio::sync::watch::channel(None);
-    let mut receiver = spawn_realtime_receiver(channel.handle.clone(), rx, rekey_rx, context);
+    let sender = duplex.then(|| {
+        Arc::new(Mutex::new(RealtimeSender::new(
+            channel.handle.clone(),
+            crate::datagram_flows::SessionDatagramTx::new(keys.tx_key(), &keys.session_id, true),
+        )))
+    });
+    let carrier = sender.map(|sender| make_carrier(&channel, sender, parent, context.peer_id));
+    let mut receiver =
+        spawn_realtime_receiver(channel.handle.clone(), rx, rekey_rx, context, carrier);
     tokio::select! {
         _ = channel.handle.closed() => {},
         _ = &mut receiver.0 => {},
     }
-    // Channel Drop closes QUIC even when this future is cancelled. The
-    // receiver guard aborts its task and releases child key/assembly state.
+}
+
+fn spawn_child_receiver(
+    channel: &Channel,
+    keys: &ParallelKeys,
+    parent: ParallelParentHandle,
+    context: RealtimeReceiverContext,
+    sender: Arc<Mutex<RealtimeSender>>,
+) -> RealtimeReceiverTask {
+    let rx = crate::datagram_flows::SessionDatagramRx::new(keys.rx_key(), &keys.session_id, true);
+    let (_hold_tx, rekey_rx) = tokio::sync::watch::channel(None);
+    let carrier = make_carrier(channel, sender, parent, context.peer_id);
+    spawn_realtime_receiver(channel.handle.clone(), rx, rekey_rx, context, Some(carrier))
+}
+
+fn make_carrier(
+    channel: &Channel,
+    sender: Arc<Mutex<RealtimeSender>>,
+    parent: ParallelParentHandle,
+    peer: NodeIdBytes,
+) -> Arc<dyn veil_anonymity::circuit_carrier::DatagramCarrier> {
+    Arc::new(ChildCarrier {
+        sender,
+        parent,
+        peer,
+        diagnostics: Arc::clone(channel.diagnostics.as_ref().expect("owned child")),
+    })
+}
+
+struct ChildCarrier {
+    sender: Arc<Mutex<RealtimeSender>>,
+    parent: ParallelParentHandle,
+    peer: NodeIdBytes,
+    diagnostics: Arc<ParallelDiagnostics>,
+}
+
+impl veil_anonymity::circuit_carrier::DatagramCarrier for ChildCarrier {
+    fn try_send(
+        &self,
+        peer: &NodeIdBytes,
+        frame: &[u8],
+        admit: &mut dyn FnMut(usize) -> bool,
+    ) -> veil_anonymity::circuit_carrier::CarrierSend {
+        use veil_anonymity::circuit_carrier::CarrierSend;
+        if peer != &self.peer || !self.parent.is_active() {
+            return CarrierSend::Unavailable;
+        }
+        let Some((header, body, RealtimeLaneFrameKind::CircuitDatagram)) =
+            decode_realtime_lane_frame(frame)
+        else {
+            return CarrierSend::Unavailable;
+        };
+        if header.priority() != veil_proto::priority::INTERACTIVE {
+            return CarrierSend::Unavailable;
+        }
+        let mut sender = lock!(self.sender);
+        if sender.broken {
+            return CarrierSend::Unavailable;
+        }
+        let max_size = sender.max_datagram_size;
+        let datagrams = match sender.tx.encode_frame(
+            local_datagram_flow(
+                veil_proto::priority::INTERACTIVE,
+                body,
+                RealtimeLaneFrameKind::CircuitDatagram,
+            ),
+            frame,
+            max_size,
+        ) {
+            Ok(datagrams) => datagrams,
+            Err(_) => return CarrierSend::Unavailable,
+        };
+        let planned = datagrams.iter().map(Vec::len).sum::<usize>();
+        if !local_datagram_fits(
+            veil_proto::priority::INTERACTIVE,
+            planned,
+            sender.handle.send_buffer_space(),
+        ) || !admit(planned)
+        {
+            return CarrierSend::Dropped { wire_bytes: 0 };
+        }
+        let mut wire_bytes = 0;
+        for datagram in &datagrams {
+            if let Err(error) = sender.handle.send(datagram) {
+                if matches!(error, veil_transport::QuicDatagramSendError::TooLarge) {
+                    if let Some(size) = sender.handle.max_size().filter(|size| *size > 40) {
+                        sender.max_datagram_size = size;
+                    }
+                } else {
+                    sender.broken = true;
+                }
+                // Admission already spent the shared budget, possibly sent a
+                // prefix. Never duplicate this frame on the canonical channel.
+                return CarrierSend::Dropped { wire_bytes };
+            }
+            wire_bytes += datagram.len() as u64;
+        }
+        self.diagnostics.replies.fetch_add(1, Ordering::Relaxed);
+        CarrierSend::Sent { wire_bytes }
+    }
 }
 
 fn spawn_acceptor(
@@ -230,6 +357,7 @@ fn spawn_acceptor(
                 _ = children.join_next(), if !children.is_empty() => {},
                 Some(mut child) = incoming.recv() => {
                     let context = context.clone();
+                    let duplex = offer.duplex;
                     children.spawn(async move {
                         if !child.parent.is_active() {
                             return;
@@ -240,14 +368,14 @@ fn spawn_acceptor(
                         if !child.parent.is_active() {
                             return;
                         }
-                        receive_authenticated(child.channel, child.keys, context).await;
+                        receive_authenticated(child.channel, child.keys, child.parent, context, duplex).await;
                     });
                 },
                 accepted = offer.handle.accept(), if offer.handle.has_exclusive_accept() => {
                     match accepted {
                         Ok(connection) => {
                             if let Ok(channel) = Channel::new(connection, Arc::clone(&offer.diagnostics)) {
-                                children.spawn(receive_child(channel, parent.clone(), context.clone()));
+                                children.spawn(receive_child(channel, parent.clone(), context.clone(), offer.duplex));
                             }
                         }
                         Err(_) => tokio::time::sleep(RETRY_DELAY).await,
@@ -315,7 +443,11 @@ impl ParallelSession {
             return false;
         };
         let slot = &mut self.slots[index];
-        if slot.ready.as_ref().is_some_and(|ready| ready.sender.broken) {
+        if slot
+            .ready
+            .as_ref()
+            .is_some_and(|ready| lock!(ready.sender).broken)
+        {
             slot.ready = None;
             slot.retry_after = Some(std::time::Instant::now() + RETRY_DELAY);
         }
@@ -342,10 +474,14 @@ impl ParallelSession {
         {
             let offer = self.offer.clone();
             let parent = self.parent.handle();
+            let context = self.context.clone();
             let (tx, rx) = tokio::sync::oneshot::channel();
             let task = RealtimeReceiverTask(tokio::spawn(async move {
-                if let Ok(Ok(ready)) =
-                    tokio::time::timeout(BIND_TIMEOUT, connect_sender(offer, parent, index)).await
+                if let Ok(Ok(ready)) = tokio::time::timeout(
+                    BIND_TIMEOUT,
+                    connect_sender(offer, parent, index, context),
+                )
+                .await
                 {
                     let _ = tx.send(ready);
                 }
@@ -355,11 +491,13 @@ impl ParallelSession {
         false
     }
 
-    pub(super) fn sender(&mut self, priority: u8) -> &mut RealtimeSender {
-        &mut self.slots[channel_index(priority).expect("prepared local channel")]
-            .ready
-            .as_mut()
-            .expect("prepared sender")
-            .sender
+    pub(super) fn sender(&self, priority: u8) -> std::sync::MutexGuard<'_, RealtimeSender> {
+        lock!(
+            self.slots[channel_index(priority).expect("prepared local channel")]
+                .ready
+                .as_ref()
+                .expect("prepared sender")
+                .sender
+        )
     }
 }

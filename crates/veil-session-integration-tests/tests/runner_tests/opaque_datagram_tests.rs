@@ -501,3 +501,324 @@ async fn shared_listener_parallel_senders_deliver_with_stopped_main_writers() {
 async fn shared_listener_parallel_senders_rebind_after_actual_canonical_rekey() {
     runner_channels_over_real_quic(true, true, true, true).await;
 }
+
+/// Two clients share one relay listener. Replies must use the authenticated
+/// ingress child through the relay's existing neutral outbox, never source
+/// priority slots. Real QUIC sockets and the actual dispatcher/runner are used.
+async fn duplex_children_through_neutral_relay(rotate: bool) {
+    use veil_anonymity::{
+        circuit_data::{CircuitCellBytes, Direction, apply_layer, wrap_payload},
+        circuit_origin::{OriginCircuit, OriginCircuitTable},
+        circuit_setup::CircuitInstall,
+        circuit_table::CircuitTable,
+        circuit_wire::CircuitDataPayload,
+    };
+    use veil_proto::family::RelayChainMsg;
+    let context = Arc::new(TransportContext::for_debug().unwrap());
+    let uri: TransportUri = "quic://127.0.0.1:0".parse().unwrap();
+    let listener: Arc<dyn TransportListener> = Arc::from(
+        QuicTransport
+            .bind(&uri, Arc::clone(&context))
+            .await
+            .unwrap(),
+    );
+    let uri: TransportUri = format!("quic://{}", listener.local_addr()).parse().unwrap();
+    let registry = Arc::new(ParallelRegistry::default());
+    let cell_bytes = CircuitCellBytes::new(4096).unwrap(); // fragmented real datagrams
+    let relay_key = [0x44; 32];
+    let receiver_key = [0x55; 32];
+    let relay_id = [2; 32];
+    let client_ids = [[1; 32], [3; 32]];
+    let mut relay = make_test_dispatcher(NodeRole::Core);
+    relay.circuit_table = Some(Arc::new(CircuitTable::new()));
+    for cid in [42, 142] {
+        relay
+            .circuit_table
+            .as_ref()
+            .unwrap()
+            .install(
+                &CircuitInstall {
+                    circuit_id_in: cid,
+                    circuit_id_out: cid + 1,
+                    circuit_key: relay_key,
+                    cell_bytes,
+                },
+                client_ids[0],
+                Some(client_ids[1]),
+                0,
+            )
+            .unwrap();
+    }
+    let mut tx_registry = SessionTxRegistry::new();
+    let relay_outboxes = client_ids.map(|peer| tx_registry.register(peer));
+    relay.session_tx_registry = Some(Arc::new(RwLock::new(tx_registry)));
+    let relay = Arc::new(relay);
+    let mut tasks = Vec::new();
+    let mut senders = Vec::new();
+    let mut receivers = Vec::new();
+    let mut source_observations = Vec::new();
+    let mut relay_observations = Vec::new();
+    for (direction, relay_outbox) in relay_outboxes.into_iter().enumerate() {
+        let acceptor = Arc::clone(&listener);
+        let accepted = tokio::spawn(async move { acceptor.accept().await });
+        let client = QuicTransport
+            .connect(&uri, Arc::clone(&context))
+            .await
+            .unwrap();
+        let client_datagrams = client.quic_datagrams().unwrap();
+        let client_parallel = client.parallel_quic().unwrap();
+        let mut client_stream = client.into_stream().unwrap();
+        client_stream.write_all(b"test").await.unwrap();
+        let connection = accepted.await.unwrap().unwrap();
+        let relay_datagrams = connection.quic_datagrams().unwrap();
+        let relay_parallel = connection.parallel_quic().unwrap();
+        let mut relay_stream = connection.into_stream().unwrap();
+        relay_stream.read_exact(&mut [0; 4]).await.unwrap();
+        let mut endpoint = make_test_dispatcher(NodeRole::Core);
+        endpoint.circuit_origin = Some(Arc::new(OriginCircuitTable::new()));
+        let mut cell_receivers = Vec::new();
+        for cid in [42, 142] {
+            let cid = cid + direction as u32;
+            endpoint
+                .circuit_origin
+                .as_ref()
+                .unwrap()
+                .insert(Arc::new(OriginCircuit {
+                    cell_bytes,
+                    circuit_keys: vec![if direction == 0 {
+                        relay_key
+                    } else {
+                        receiver_key
+                    }],
+                    first_hop: relay_id,
+                    origin_circuit_id: cid,
+                    created_unix: 0,
+                    confirmed: Arc::default(),
+                    is_reply: false,
+                    last_return_unix: Arc::default(),
+                }));
+            let (tx, rx) = mpsc::channel(32);
+            endpoint.stream_recv.lock().unwrap().insert(cid, tx);
+            cell_receivers.push(rx);
+        }
+        receivers.push(cell_receivers);
+        let endpoint = Arc::new(endpoint);
+        let (out_tx, out_rx) = mpsc::channel::<PriorityFrame>(32);
+        senders.push(out_tx);
+        let client_key = [direction as u8 + 10; 32];
+        let relay_session_key = [direction as u8 + 20; 32];
+        let sid = [direction as u8 + 30; 32];
+        let client_offer = ParallelQuicOffer::new(client_parallel).with_duplex();
+        source_observations.push(client_offer.diagnostics());
+        let relay_offer = ParallelQuicOffer::new(relay_parallel)
+            .with_registry(Arc::clone(&registry))
+            .with_duplex();
+        relay_observations.push(relay_offer.diagnostics());
+        for (stream, datagrams, offer, dispatcher, outbox, local, peer, tx, rx) in [
+            (
+                client_stream,
+                client_datagrams,
+                client_offer,
+                endpoint,
+                out_rx.into(),
+                client_ids[direction],
+                relay_id,
+                client_key,
+                relay_session_key,
+            ),
+            (
+                relay_stream,
+                relay_datagrams,
+                relay_offer,
+                Arc::clone(&relay),
+                relay_outbox,
+                relay_id,
+                client_ids[direction],
+                relay_session_key,
+                client_key,
+            ),
+        ] {
+            let (_, dummy) = tokio::io::duplex(64);
+            let (mut runner, _) = make_swap_runner(dummy);
+            // Stop all ordered writers. The bidirectional relay path must
+            // retain its datagrams without creating canonical peer sessions.
+            runner.stream = if rotate {
+                stream
+            } else {
+                Box::new(StoppedStreamWriter {
+                    stream,
+                    attempted: Arc::new(tokio::sync::Notify::new()),
+                })
+            };
+            runner.quic_datagrams = Some(RealtimeLaneOffer {
+                handle: datagrams,
+                peer_rotates: true,
+                peer_flows: true,
+                peer_circuit_datagrams: true,
+                parallel: Some(offer),
+            });
+            runner.local_node_id = local;
+            runner.peer_id = peer;
+            runner.session_id = sid;
+            runner.raw_session_keys = Some((tx, rx, sid));
+            if rotate {
+                runner.crypto.tx_cipher =
+                    Some(veil_crypto::session_cipher::SessionCipher::new(&tx, true));
+                runner.crypto.rx_cipher =
+                    Some(veil_crypto::session_cipher::SessionCipher::new(&rx, true));
+                if local < peer {
+                    runner.rekey.time_threshold_secs = 1;
+                }
+            }
+            runner.outbox = Some(outbox);
+            runner.ban_list = Arc::clone(&dispatcher.abuse.ban_list);
+            runner.violation_tracker = Arc::clone(&dispatcher.abuse.violation_tracker);
+            runner.logger = Arc::clone(&dispatcher.logger);
+            runner.dispatcher = dispatcher;
+            tasks.push(tokio::spawn(async move { runner.run().await }));
+        }
+    }
+    tasks.push(tokio::spawn(async move {
+        loop {
+            let connection = listener.accept().await.unwrap();
+            let datagrams = connection.quic_datagrams();
+            let stream = connection.into_stream().unwrap();
+            assert!(matches!(
+                registry.peek_and_dispatch(stream, datagrams).await,
+                ParallelPeekOutcome::Bound | ParallelPeekOutcome::Drop(_)
+            ));
+        }
+    }));
+    let result = tokio::time::timeout(Duration::from_secs(15), async {
+        let mut first_epoch_done = false;
+        let mut replies_before = [0; 2];
+        for seq in 1..=200u32 {
+            for direction in 0..2 {
+                for (index, cid) in [42, 142].into_iter().enumerate() {
+                    let payload = vec![seq as u8, index as u8, direction as u8];
+                    let mut cipher = wrap_payload(&payload, cell_bytes).unwrap();
+                    if direction == 0 {
+                        apply_layer(&receiver_key, Direction::Return, seq, &mut cipher);
+                        apply_layer(&relay_key, Direction::Forward, seq, &mut cipher);
+                    }
+                    let body = CircuitDataPayload {
+                        circuit_id: cid + direction as u32,
+                        seq,
+                        ciphertext: cipher,
+                    }
+                    .encode(cell_bytes)
+                    .unwrap();
+                    let mut header = FrameHeader::new(
+                        FrameFamily::RelayChain as u8,
+                        RelayChainMsg::CircuitDatagram as u16,
+                    );
+                    header.set_priority(veil_proto::priority::INTERACTIVE);
+                    header.body_len = body.len() as u32;
+                    let mut frame = encode_header(&header).to_vec();
+                    frame.extend(body);
+                    senders[direction]
+                        .send((
+                            if index == 0 { 0 } else { 2 },
+                            veil_bufpool::pooled_shared_from_vec(frame),
+                        ))
+                        .await
+                        .unwrap();
+                    assert_eq!(
+                        receivers[1 - direction][index].recv().await.unwrap(),
+                        payload
+                    );
+                }
+            }
+            let ready = source_observations
+                .iter()
+                .all(|d| d.sent_this_generation(0) >= 8 && d.sent_this_generation(2) >= 8)
+                && relay_observations
+                    .iter()
+                    .enumerate()
+                    .all(|(i, d)| d.replies() >= replies_before[i] + 16);
+            if ready {
+                if !rotate || first_epoch_done {
+                    break;
+                }
+                first_epoch_done = true;
+                replies_before = [
+                    relay_observations[0].replies(),
+                    relay_observations[1].replies(),
+                ];
+                // Quiesce the producers across credential retirement. In-flight
+                // loss-tolerant cells are allowed to expire during rekey.
+                while source_observations
+                    .iter()
+                    .chain(&relay_observations)
+                    .any(|d| d.rekeys() == 0)
+                {
+                    // This fixture disables idle/keepalive timers. Wake the
+                    // real canonical loops with ordinary encrypted control
+                    // traffic while circuit producers remain quiescent.
+                    let ping =
+                        FrameHeader::new(FrameFamily::Control as u8, ControlMsg::Ping as u16);
+                    for sender in &senders {
+                        sender
+                            .send((
+                                veil_proto::priority::INTERACTIVE,
+                                veil_bufpool::pooled_shared_from_vec(encode_header(&ping).to_vec()),
+                            ))
+                            .await
+                            .unwrap();
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(
+            receivers
+                .iter_mut()
+                .flatten()
+                .all(|rx| rx.try_recv().is_err()),
+            "no duplicates"
+        );
+    })
+    .await;
+    for task in tasks {
+        task.abort();
+        let _ = task.await;
+    }
+    let all_observations = source_observations.iter().chain(&relay_observations);
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while all_observations
+            .clone()
+            .any(|d| d.active_connections() != 0)
+        {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("children survived their canonical sessions");
+    assert!(result.is_ok(), "duplex relay path did not converge");
+    for d in source_observations {
+        assert!(d.sent(0) >= 8 && d.sent(2) >= 8);
+        if rotate {
+            assert!(d.rekeys() >= 1);
+            assert!(d.sent_this_generation(0) >= 8 && d.sent_this_generation(2) >= 8);
+        }
+    }
+    for d in relay_observations {
+        assert!(
+            d.replies() >= 16,
+            "relay must reuse admitted generic ingress children"
+        );
+        assert_eq!(d.sent(0), 0, "relay cannot choose source priority channels");
+        assert_eq!(d.sent(2), 0, "relay cannot choose source priority channels");
+    }
+}
+
+#[tokio::test]
+async fn duplex_children_route_both_directions_through_neutral_relay() {
+    duplex_children_through_neutral_relay(false).await;
+}
+
+#[tokio::test]
+async fn duplex_relay_children_rebind_after_canonical_rekey() {
+    duplex_children_through_neutral_relay(true).await;
+}

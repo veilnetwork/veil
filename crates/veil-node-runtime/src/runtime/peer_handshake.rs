@@ -94,6 +94,7 @@ pub struct RemoteHandshakeInfo {
     pub supports_circuit_datagrams: bool,
     pub supports_parallel_quic: bool,
     pub supports_shared_parallel_quic: bool,
+    pub supports_duplex_parallel_quic: bool,
     /// Bounded UDP reflector port advertised by this authenticated peer.
     /// The runtime combines it with transport metadata only after all session
     /// admission gates pass.
@@ -887,6 +888,9 @@ pub async fn register_connection_session(
                         supports_shared_parallel_quic: r
                             .remote_capabilities
                             .supports_shared_parallel_quic(),
+                        supports_duplex_parallel_quic: r
+                            .remote_capabilities
+                            .supports_duplex_parallel_quic(),
                         sovereign_node_id,
                         udp_reflector_port,
                         shared_udp_reflectors,
@@ -1456,8 +1460,13 @@ pub async fn register_connection_session(
                                 || remote_identity.supports_shared_parallel_quic)
                     })
                     .map(|handle| {
-                        veil_session::runner::ParallelQuicOffer::new(handle)
-                            .with_registry(Arc::clone(&runtime.handoff.parallel))
+                        let offer = veil_session::runner::ParallelQuicOffer::new(handle)
+                            .with_registry(Arc::clone(&runtime.handoff.parallel));
+                        if remote_identity.supports_duplex_parallel_quic {
+                            offer.with_duplex()
+                        } else {
+                            offer
+                        }
                     }),
             }),
         metrics: runtime.metrics.clone(),
