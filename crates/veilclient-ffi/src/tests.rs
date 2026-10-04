@@ -40,6 +40,33 @@ use std::ffi::CStr;
 /// generator hashed, so a stale header hashes consistently and passes here
 /// while the cbindgen diff fails.
 #[test]
+fn local_lane_send_rejects_invalid_hints_before_inputs() {
+    for (lane, anonymous) in [(4, 0), (0, 2), (255, 255)] {
+        let mut err = ptr::null_mut();
+        let rc = unsafe {
+            veil_send_on_local_lane(
+                ptr::null_mut(),
+                ptr::null(),
+                ptr::null(),
+                0,
+                ptr::null(),
+                usize::MAX,
+                lane,
+                anonymous,
+                &mut err,
+            )
+        };
+        assert_eq!(rc, VEIL_ERR_INVALID_ARG);
+        assert!(!err.is_null());
+        let message = unsafe { CStr::from_ptr(err) }.to_str().unwrap();
+        assert!(message.contains("invalid local lane"));
+        unsafe {
+            veil_free_string(err);
+        }
+    }
+}
+
+#[test]
 fn abi_contract_hash_is_the_hash_of_the_committed_header() {
     use sha2::{Digest, Sha256};
     let header = include_bytes!("../include/veil_ffi.h");

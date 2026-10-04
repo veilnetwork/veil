@@ -72,6 +72,81 @@ async fn start_server(sock: PathBuf) -> (watch::Sender<bool>, tokio::task::JoinH
 // ── 35.6: echo server + client, single datagram round-trip ───────────────────
 
 #[tokio::test]
+async fn source_lane_survives_sdk_ipc_but_is_absent_from_network_frame() {
+    const PEER: [u8; 32] = [0xB9; 32];
+    struct Capture(tokio::sync::mpsc::UnboundedSender<(u8, Vec<u8>)>);
+    impl veil_types::FrameBroadcaster for Capture {
+        fn send_to(&self, peer: &[u8; 32], lane: u8, frame: Vec<u8>) -> bool {
+            *peer == PEER && self.0.send((lane, frame)).is_ok()
+        }
+        fn send_to_all_with_priority(&self, _: u8, _: Arc<[u8]>) {}
+        fn active_node_ids(&self) -> Vec<[u8; 32]> {
+            vec![PEER]
+        }
+    }
+    let sock = temp_socket();
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut server = IpcServer::new(
+        IpcEndpoint::Unix(sock.clone()),
+        shutdown_rx,
+        Arc::new(AppEndpointRegistry::new()),
+        node_id(),
+    )
+    .with_session_tx_registry(Arc::new(Capture(tx)));
+    let task = tokio::spawn(async move {
+        server.run().await.unwrap();
+    });
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    let client = veilclient::VeilClient::connect(&sock).await.unwrap();
+    let app = client
+        .bind_named("test.source-lane", "sender", 31)
+        .await
+        .unwrap();
+    let (sender, _receiver) = app.into_split();
+    sender
+        .send(PEER, [0xAA; 32], 9, b"same encrypted application bytes")
+        .await
+        .unwrap();
+    let (lane, original) = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        lane,
+        veil_proto::priority::INTERACTIVE,
+        "ordinary SDK send keeps its old queue"
+    );
+    assert_eq!(
+        veil_proto::codec::decode_header(&original).unwrap().flags,
+        0
+    );
+    for lane in [0, 2, 3] {
+        sender
+            .send_on_local_lane(
+                lane,
+                PEER,
+                [0xAA; 32],
+                9,
+                b"same encrypted application bytes",
+                false,
+            )
+            .await
+            .unwrap();
+        let (queued, frame) = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(queued, lane);
+        assert_eq!(frame, original, "no source hint on the inter-node wire");
+    }
+    sender.close().await;
+    let _ = shutdown_tx.send(true);
+    task.await.unwrap();
+    let _ = std::fs::remove_file(sock);
+}
+
+#[tokio::test]
 async fn echo_roundtrip_via_veilclient() {
     let sock = temp_socket();
     let (shutdown_tx, server_handle) = start_server(sock.clone()).await;

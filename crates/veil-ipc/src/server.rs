@@ -2460,7 +2460,7 @@ async fn handle_ipc_client(
                             // leave this loop instead of holding it for the
                             // length of a DHT key resolve.
                             let ctx = IpcSendContext {
-                                local_priority: hdr.priority(),
+                                local_priority: veil_proto::ipc::ipc_local_source_lane(&hdr),
                                 app_registry:        Arc::clone(&app_registry),
                                 local_node_id:       node_id,
                                 session_tx_registry: session_tx_registry.clone(),

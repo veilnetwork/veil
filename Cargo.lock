@@ -5464,6 +5464,7 @@ dependencies = [
  "veil-bufpool",
  "veil-ipc",
  "veil-proto",
+ "veil-types",
  "veilcore",
 ]
 

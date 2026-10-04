@@ -1533,6 +1533,140 @@ pub unsafe extern "C" fn veil_send(
     }
 }
 
+/// Send with a process-local queue (0..3). The lane is never a relay priority.
+/// `anonymous_authenticated=1` retains authenticated onion-only routing; 0 is
+/// the ordinary sealed delivery path. IDs must each address 32 readable bytes.
+/// Invalid lanes/flags fail before touching the app or input pointers.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn veil_send_on_local_lane(
+    app: *mut VeilApp,
+    dst_node_id: *const u8,
+    dst_app_id: *const u8,
+    dst_endpoint_id: u32,
+    data: *const u8,
+    len: size_t,
+    local_lane: u8,
+    anonymous_authenticated: u8,
+    err_out: *mut *mut c_char,
+) -> c_int {
+    if let Err(rc) = unsafe { guard::ffi_prelude(err_out, "veil_send_on_local_lane") } {
+        return rc;
+    }
+    if local_lane > 3 || anonymous_authenticated > 1 {
+        unsafe {
+            write_err(err_out, "invalid local lane or anonymity flag");
+        }
+        return VEIL_ERR_INVALID_ARG;
+    }
+    null_check!(err_out,
+        "app" => app,
+        "dst_node_id" => dst_node_id,
+        "dst_app_id" => dst_app_id,
+    );
+    if data.is_null() && len > 0 {
+        unsafe {
+            write_err(err_out, "data is NULL but len > 0");
+        }
+        return VEIL_ERR_INVALID_ARG;
+    }
+    // bounds-check caller-supplied len BEFORE any
+    // allocation. An untrusted caller passing usize::MAX would
+    // trigger a 16 EiB Vec::with_capacity, OOM-killing the host.
+    if len > VEIL_MAX_DATA_LEN {
+        unsafe {
+            write_err(
+                err_out,
+                format!("data len {len} exceeds VEIL_MAX_DATA_LEN ({VEIL_MAX_DATA_LEN})"),
+            );
+        }
+        return VEIL_ERR_INVALID_ARG;
+    }
+    get_or_return!(
+        app_ref,
+        app_table(),
+        app,
+        err_out,
+        VEIL_ERR_INVALID_ARG,
+        "VeilApp"
+    );
+    let mut dst_node = [0u8; 32];
+    let mut dst_app = [0u8; 32];
+    // SAFETY: caller MUST guarantee that
+    // `dst_node_id` and `dst_app_id` each point to a readable region
+    // of at least 32 bytes. Both pointers are NULL-checked above;
+    // the size contract is documented in the C header. Passing
+    // shorter buffers is undefined behaviour — Dart wrappers (see
+    // veil_flutter/lib/src/client.dart) always pass 32-byte
+    // buffers obtained from `Uint8List(32)`.
+    unsafe {
+        ptr::copy_nonoverlapping(dst_node_id, dst_node.as_mut_ptr(), 32);
+        ptr::copy_nonoverlapping(dst_app_id, dst_app.as_mut_ptr(), 32);
+    }
+    let payload: Vec<u8> = if len == 0 {
+        Vec::new()
+    } else {
+        unsafe { std::slice::from_raw_parts(data, len) }.to_vec()
+    };
+    // send through the persistent `sender` half — set_recv_handler
+    // only takes the receiver, so the sender stays addressable for the entire
+    // app lifetime.
+    // Where a send's half-second goes.
+    //
+    // A file serve is one of these per chunk and each was measured at ~500 ms
+    // on a phone, which is the whole of a 200 KB transfer taking 21 s. From
+    // outside this call the three candidates are indistinguishable: entering
+    // the runtime, waiting for the sender mutex, or the queue write itself.
+    // Time them apart, and say so only when the call was actually slow — a
+    // healthy send must stay silent.
+    let call_started = std::time::Instant::now();
+    let mut lock_micros: u128 = 0;
+    let send_res: Result<(), ClientError> = app_ref.bundle.runtime.block_on(async {
+        let entered = std::time::Instant::now();
+        let inner_guard = app_ref.sender.lock().await;
+        lock_micros = entered.elapsed().as_micros();
+        let Some(sender) = inner_guard.as_ref() else {
+            return Err(ClientError::Protocol("app already closed".to_string()));
+        };
+        sender
+            .send_on_local_lane(
+                local_lane,
+                dst_node,
+                dst_app,
+                dst_endpoint_id,
+                &payload,
+                anonymous_authenticated != 0,
+            )
+            .await
+    });
+    let total_micros = call_started.elapsed().as_micros();
+    if total_micros >= 50_000 {
+        log::warn!(
+            "veil_send_on_local_lane SLOW: total {}ms lock {}ms bytes {}",
+            total_micros / 1000,
+            lock_micros / 1000,
+            payload.len()
+        );
+    }
+    match send_res {
+        Ok(()) => VEIL_OK,
+        Err(e) => {
+            let s = e.to_string();
+            unsafe {
+                write_err(err_out, format!("send failed: {s}"));
+            }
+            // `ClientError::Protocol` renders as "protocol error: {msg}", so an
+            // exact `==` never matched the closed sentinel and the signal
+            // silently degraded to VEIL_ERR. Use substring match, consistent
+            // with the stream-close paths (`.contains("stream already closed")`).
+            if s.contains("app already closed") {
+                VEIL_ERR_CLOSED
+            } else {
+                VEIL_ERR
+            }
+        }
+    }
+}
+
 /// Send to the OTHER DEVICES of this identity.
 ///
 /// `my_node_id` is our own identity address. Every device of an identity

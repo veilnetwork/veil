@@ -1063,6 +1063,24 @@ int veil_send(VeilApp *app,
 ;
 
 /**
+ * Send with a process-local queue (0..3). The lane is never a relay priority.
+ * `anonymous_authenticated=1` retains authenticated onion-only routing; 0 is
+ * the ordinary sealed delivery path. IDs must each address 32 readable bytes.
+ * Invalid lanes/flags fail before touching the app or input pointers.
+ */
+
+int veil_send_on_local_lane(VeilApp *app,
+                            const uint8_t *dst_node_id,
+                            const uint8_t *dst_app_id,
+                            uint32_t dst_endpoint_id,
+                            const uint8_t *data,
+                            size_t len,
+                            uint8_t local_lane,
+                            uint8_t anonymous_authenticated,
+                            char **err_out)
+;
+
+/**
  * Send to the OTHER DEVICES of this identity.
  *
  * `my_node_id` is our own identity address. Every device of an identity

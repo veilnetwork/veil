@@ -117,6 +117,56 @@ impl NodeServices {
         // signature below still binds the REAL `ad.receiver_node_id`.
         circuit_backed: bool,
     ) -> std::result::Result<(), veil_anonymity::sender::SenderError> {
+        self.send_via_rendezvous_authenticated_on_local_lane(
+            ad,
+            extra_relays,
+            target_app_id,
+            target_endpoint_id,
+            data,
+            hop_count,
+            reply,
+            redundancy,
+            circuit_backed,
+            veil_proto::priority::INTERACTIVE,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn send_via_rendezvous_authenticated_on_local_lane(
+        &self,
+        ad: &veil_anonymity::rendezvous::RendezvousAd,
+        // Additional DISTINCT-relay ads for the SAME recipient (it registered on
+        // several rendezvous relays). When non-empty, fragments are ROUND-ROBINED
+        // across `[ad] + these` — independent endpoint relays carry different
+        // fragments, so the recipient's aggregate receive throughput scales with
+        // the relay count instead of funneling `redundancy` copies of every
+        // fragment through ONE relay. Empty → the classic single-relay path with
+        // `redundancy` retransmit. No new exposure: the recipient already
+        // registered the SAME cookie at each of these relays.
+        extra_relays: &[veil_anonymity::rendezvous::RendezvousAd],
+        target_app_id: [u8; 32],
+        target_endpoint_id: u32,
+        data: &[u8],
+        hop_count: usize,
+        // When `Some((reply_app_id, reply_endpoint_id))`, attach a one-time
+        // reply block so the recipient can reply WITHOUT us publishing a public
+        // ad (presence-leak mitigation): we register R-locally with a rendezvous
+        // relay under a fresh cookie and embed the sealed reply path.
+        reply: Option<([u8; 32], u32)>,
+        // Send each fragment this many times over independent circuits (bounded
+        // retransmit). The recipient's fragment reassembler de-dups by
+        // `(msg_id, frag_idx)`, so duplicates collapse → exactly-once delivery at
+        // higher odds. 1 = no redundancy (forward sends); >1 for fire-and-forget
+        // replies that have no end-to-end ack.
+        redundancy: usize,
+        // True for a circuit-backed / location-anonymous recipient: the introduce
+        // cleartext receiver_node_id is replaced by a cookie-derived pseudo-id so
+        // R cannot learn the recipient's transport node_id (L3). The AuthDeliver
+        // signature below still binds the REAL `ad.receiver_node_id`.
+        circuit_backed: bool,
+        local_lane: u8,
+    ) -> std::result::Result<(), veil_anonymity::sender::SenderError> {
         use rand_core::RngCore;
         use veil_anonymity::rendezvous::final_hop_kind;
 
@@ -313,12 +363,24 @@ impl NodeServices {
                 // R→recipient cell loss falls back to the mailbox-drain hot
                 // window, same as bulk fragments.
                 let relay = relays[idx % relays.len()];
-                self.send_sealed_introduce(relay, &sealed_plaintext, hop_count, circuit_backed)?;
+                self.send_sealed_introduce_on_local_lane(
+                    relay,
+                    &sealed_plaintext,
+                    hop_count,
+                    circuit_backed,
+                    local_lane,
+                )?;
             } else {
                 // Bounded retransmit: send the fragment `redundancy` times over
                 // independent circuits; the recipient de-dups by (msg_id, frag_idx).
                 for _ in 0..redundancy.max(1) {
-                    self.send_sealed_introduce(ad, &sealed_plaintext, hop_count, circuit_backed)?;
+                    self.send_sealed_introduce_on_local_lane(
+                        ad,
+                        &sealed_plaintext,
+                        hop_count,
+                        circuit_backed,
+                        local_lane,
+                    )?;
                 }
             }
         }
@@ -501,6 +563,31 @@ impl NodeServices {
         // `Some((reply_app_id, reply_endpoint_id))` attaches a one-time reply
         // block (see `send_via_rendezvous_authenticated`).
         reply: Option<([u8; 32], u32)>,
+    ) -> std::result::Result<(), veil_types::AnonOnionSendError> {
+        self.send_anonymous_authenticated_to_on_local_lane(
+            receiver_node_id,
+            target_app_id,
+            target_endpoint_id,
+            data,
+            hop_count,
+            reply,
+            veil_proto::priority::INTERACTIVE,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn send_anonymous_authenticated_to_on_local_lane(
+        &self,
+        receiver_node_id: [u8; 32],
+        target_app_id: [u8; 32],
+        target_endpoint_id: u32,
+        data: &[u8],
+        hop_count: usize,
+        // `Some((reply_app_id, reply_endpoint_id))` attaches a one-time reply
+        // block (see `send_via_rendezvous_authenticated`).
+        reply: Option<([u8; 32], u32)>,
+        local_lane: u8,
     ) -> std::result::Result<(), veil_types::AnonOnionSendError> {
         use veil_types::AnonOnionSendError;
 
@@ -716,7 +803,7 @@ impl NodeServices {
         )
         .await;
 
-        self.send_via_rendezvous_authenticated(
+        self.send_via_rendezvous_authenticated_on_local_lane(
             &chosen[0],
             &chosen[1..], // extra distinct-relay endpoints → round-robin parallelism
             target_app_id,
@@ -726,6 +813,7 @@ impl NodeServices {
             reply,
             1,     // forward sends: no redundancy (the recipient is reachable via its ad)
             false, // by-node_id: recipient may be session-backed → keep real id (L3)
+            local_lane,
         )
         .await
         .map_err(|e| match e {
@@ -1693,6 +1781,27 @@ impl NodeServices {
         // signature still binds the real id inside the seal.
         circuit_backed: bool,
     ) -> std::result::Result<(), veil_anonymity::sender::SenderError> {
+        self.send_sealed_introduce_on_local_lane(
+            ad,
+            sealed_plaintext,
+            hop_count,
+            circuit_backed,
+            veil_proto::priority::INTERACTIVE,
+        )
+    }
+
+    pub(crate) fn send_sealed_introduce_on_local_lane(
+        &self,
+        ad: &veil_anonymity::rendezvous::RendezvousAd,
+        sealed_plaintext: &[u8],
+        hop_count: usize,
+        // When true (circuit-backed / location-anonymous service), the cleartext
+        // `receiver_node_id` R reads is replaced by a cookie-derived pseudo-id so
+        // R never learns the service's transport node_id (L3). The AuthDeliver
+        // signature still binds the real id inside the seal.
+        circuit_backed: bool,
+        local_lane: u8,
+    ) -> std::result::Result<(), veil_anonymity::sender::SenderError> {
         use veil_anonymity::rendezvous::{IntroducePayload, encrypt_introduce, final_hop_kind};
 
         // Step 2: seal to receiver_x25519_pk. Rendezvous cannot read
@@ -1895,8 +2004,7 @@ impl NodeServices {
         frame.extend_from_slice(&cell[..]);
         if let Some(ref reg) = self.dispatcher.session_tx_registry {
             let guard = wlock!(reg);
-            let sent =
-                guard.send_to_result(&first_hop_node_id, veil_proto::priority::INTERACTIVE, frame);
+            let sent = guard.send_to_result(&first_hop_node_id, local_lane, frame);
             drop(guard);
             if let Err(e) = sent {
                 // Introduce lost. Rare with the liveness guard above (session
