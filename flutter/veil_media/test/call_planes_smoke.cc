@@ -9,6 +9,7 @@
 #include <memory>
 #include <mutex>
 #include <set>
+#include <string>
 #include <thread>
 
 using Injector = int (*)(void*, uint64_t, uint32_t, uint32_t);
@@ -42,6 +43,16 @@ extern "C" int veil_media_set_recv_callback(
   if (cb) callbacks[chan] = {cb, ctx};
   else callbacks.erase(chan);
   return 0;
+}
+static uint64_t stat(VeilMediaEngine* engine, const char* name) {
+  char* json = veil_media_engine_get_stats(engine);
+  assert(json);
+  const std::string key = std::string("\"") + name + "\":";
+  const char* at = std::strstr(json, key.c_str());
+  assert(at);
+  const uint64_t value = std::strtoull(at + key.size(), nullptr, 10);
+  std::free(json);
+  return value;
 }
 static int inject(void* ctx, uint64_t chan, uint32_t audio, uint32_t video) {
   Callback cb;
@@ -151,6 +162,33 @@ int main() {
     std::printf("video estimate enabled=%d: %d -> %d after 900-kbit profile\n", enabled, before, after);
     if (enabled) assert(after > 0 && after <= 200000);
     else assert(after >= 900000);
+  }
+  {
+    std::unique_ptr<VeilMediaEngine, decltype(&veil_media_engine_destroy)> e(
+        veil_media_engine_create(70, local, peer), veil_media_engine_destroy);
+    assert(e);
+    assert(veil_media_engine_start_video(e.get(), 1, 0, 150, 2) == VEIL_MEDIA_OK);
+    assert(stat(e.get(), "max_fps") == 2);
+    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    const auto before = stat(e.get(), "video_tx_frames");
+    std::this_thread::sleep_for(std::chrono::milliseconds(2200));
+    const auto low = stat(e.get(), "video_tx_frames") - before;
+    assert(low >= 1 && low <= 6);
+    assert(veil_media_engine_set_video_bitrate(e.get(), 150, 12) == VEIL_MEDIA_OK);
+    assert(stat(e.get(), "max_fps") == 12);
+    const auto recovered_start = stat(e.get(), "video_tx_frames");
+    std::this_thread::sleep_for(std::chrono::milliseconds(1200));
+    const auto recovered = stat(e.get(), "video_tx_frames") - recovered_start;
+    assert(recovered >= 8);
+    assert(veil_media_engine_set_video_bitrate(e.get(), 150, 1) == VEIL_MEDIA_OK);
+    assert(stat(e.get(), "max_fps") == 1);
+    const auto floor_start = stat(e.get(), "video_tx_frames");
+    std::this_thread::sleep_for(std::chrono::milliseconds(2200));
+    const auto floor = stat(e.get(), "video_tx_frames") - floor_start;
+    assert(floor >= 1 && floor <= 3);
+    std::printf("actual encoded video frames: 2-fps=%llu/2.2s, recovered=%llu/1.2s, 1-fps=%llu/2.2s\n",
+        static_cast<unsigned long long>(low), static_cast<unsigned long long>(recovered),
+        static_cast<unsigned long long>(floor));
   }
   unsetenv("VEIL_MEDIA_TEST_VIDEO");
   assert(callbacks.empty());
