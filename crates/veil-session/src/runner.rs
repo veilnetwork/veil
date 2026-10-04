@@ -4001,20 +4001,24 @@ impl SessionRunner {
                 self.maybe_initiate_x25519_rekey(&mut rekey, &mut pq);
                 self.maybe_initiate_mlkem_rekey(&mut mlkem_rekey, &mut pq);
                 // ── Step 2: flush priority queue to the wire ─────────────────
-                // Select datagrams in the ordinary WRR/FIFO order. Separate
-                // transport prevents socket head-of-line blocking, but does
-                // not let relayed datagrams jump past queued reliable data.
+                // Preserve ordinary WRR/FIFO first. If a reliable head blocks
+                // it, independently transported local sources may progress in
+                // their own round. Relayed cells never use that local bypass.
                 let mut datagram_drained = 0usize;
                 let mut disable_realtime_sender = false;
                 if let Some(lane) = realtime_lane.as_mut() {
                     lane.local_reliable.expire(std::time::Instant::now());
                     for _ in 0..PQ_DRAIN_FRAMES_PER_PASS {
-                        let Some(envelope) = pq.pop_datagram_envelope_if(|frame| {
+                        let supported = |frame: &[u8]| {
                             decode_realtime_lane_frame(frame).is_some_and(|(_, _, kind)| {
                                 kind != RealtimeLaneFrameKind::CircuitDatagram
                                     || lane.peer_circuit_datagrams
                             })
-                        }) else {
+                        };
+                        let Some(envelope) = pq
+                            .pop_datagram_envelope_if(supported)
+                            .or_else(|| pq.pop_local_datagram_envelope_if(supported))
+                        else {
                             break;
                         };
                         let (outgoing_priority, outgoing) = envelope.frame;
