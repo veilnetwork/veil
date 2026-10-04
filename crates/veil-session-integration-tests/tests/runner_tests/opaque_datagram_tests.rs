@@ -9,7 +9,13 @@ use veil_transport::{
     quic::{PunchedQuicRole, promote_punched_quic},
 };
 
-async fn runner_channels_over_real_quic(flows: bool, parallel: bool, rotate: bool, shared: bool) {
+async fn runner_channels_over_real_quic(
+    flows: bool,
+    parallel: bool,
+    rotate: bool,
+    shared: bool,
+    resumed: bool,
+) {
     let context = Arc::new(TransportContext::for_debug().unwrap());
     let registry = Arc::new(ParallelRegistry::default());
     let listener: Option<Arc<dyn TransportListener>> = if shared {
@@ -58,6 +64,108 @@ async fn runner_channels_over_real_quic(flows: bool, parallel: bool, rotate: boo
     let mut prelude = [0u8; 4];
     b_stream.read_exact(&mut prelude).await.unwrap();
 
+    let mut keys = [([1; 32], [2; 32]), ([2; 32], [1; 32])];
+    let mut node_ids = [[1; 32], [2; 32]];
+    let mut resumed_caps = None;
+    if resumed {
+        use base64::Engine as _;
+        use veil_node_runtime::local_identity::HandshakeIdentity;
+        use veil_session::handshake::perform_ovl1_handshake;
+        use veil_session::ticket::{TicketIssuer, TicketKey};
+        let identities = [0xAA, 0xBB].map(|seed| {
+            let sk = ed25519_dalek::SigningKey::from_bytes(&[seed; 32]);
+            let public_key =
+                base64::engine::general_purpose::STANDARD.encode(sk.verifying_key().to_bytes());
+            HandshakeIdentity {
+                algo: veil_cfg::SignatureAlgorithm::Ed25519,
+                node_id: veil_cfg::NodeId::from_public_key(
+                    veil_cfg::SignatureAlgorithm::Ed25519,
+                    &public_key,
+                )
+                .unwrap(),
+                public_key,
+                private_key: base64::engine::general_purpose::STANDARD.encode([seed; 32]),
+                nonce: format!("resume-test-{seed}"),
+            }
+        });
+        node_ids = identities
+            .each_ref()
+            .map(|identity| *identity.node_id.as_bytes());
+        let issuer = Arc::new(std::sync::Mutex::new(TicketIssuer::new(
+            TicketKey::generate(),
+        )));
+        let blob = issuer.lock().unwrap().issue_for_instance(
+            [3; 32],
+            node_ids[0],
+            [5; 16],
+            [2; 32],
+            [1; 32],
+        );
+        let ticket = veil_proto::session::ClientTicketEntry {
+            blob,
+            tx_key: [1; 32],
+            rx_key: [2; 32],
+            session_id: [3; 32],
+            peer_public_key: identities[1].public_key.clone(),
+            peer_nonce: identities[1].nonce.clone(),
+            issued_at: std::time::Instant::now(),
+        };
+        let (a_result, b_result) = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(
+                perform_ovl1_handshake(
+                    &mut a_stream,
+                    &identities[0],
+                    NodeRole::Core,
+                    veil_cfg::DiscoveryMode::Public,
+                    None,
+                    None,
+                    None,
+                    Some(node_ids[1]),
+                    Some(ticket),
+                    None,
+                    None,
+                    &[],
+                    false,
+                    true,
+                    None,
+                    None,
+                    None,
+                ),
+                perform_ovl1_handshake(
+                    &mut b_stream,
+                    &identities[1],
+                    NodeRole::Core,
+                    veil_cfg::DiscoveryMode::Public,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some(issuer),
+                    None,
+                    &[],
+                    false,
+                    true,
+                    None,
+                    None,
+                    None,
+                ),
+            )
+        })
+        .await
+        .expect("resumption over real QUIC timed out");
+        let results = [a_result.unwrap(), b_result.unwrap()];
+        for (index, result) in results.iter().enumerate() {
+            assert!(result.remote_caps_stated);
+            assert!(result.remote_capabilities.supports_shared_parallel_quic());
+            assert!(result.remote_capabilities.supports_duplex_parallel_quic());
+            assert_ne!(result.session_keys.tx_key, keys[index].0);
+            assert_ne!(result.session_keys.rx_key, keys[index].1);
+            keys[index] = (result.session_keys.tx_key, result.session_keys.rx_key);
+        }
+        resumed_caps = Some(results.map(|result| result.remote_capabilities));
+    }
+
     let mut tasks = Vec::new();
     if let Some(listener) = listener {
         let registry = Arc::clone(&registry);
@@ -82,8 +190,8 @@ async fn runner_channels_over_real_quic(flows: bool, parallel: bool, rotate: boo
     let mut diagnostics = Vec::new();
     let app_id = [0xa0; 32];
     for (direction, device) in [
-        (a_stream, a_datagrams, [1; 32], [2; 32], a_parallel),
-        (b_stream, b_datagrams, [2; 32], [1; 32], b_parallel),
+        (a_stream, a_datagrams, keys[0].0, keys[0].1, a_parallel),
+        (b_stream, b_datagrams, keys[1].0, keys[1].1, b_parallel),
     ]
     .into_iter()
     .enumerate()
@@ -109,24 +217,28 @@ async fn runner_channels_over_real_quic(flows: bool, parallel: bool, rotate: boo
             ParallelQuicOffer::new(handle).with_registry(Arc::clone(&registry))
         };
         diagnostics.push(offer.diagnostics());
+        let caps = resumed_caps.as_ref().map(|caps| &caps[direction]);
         runner.quic_datagrams = Some(RealtimeLaneOffer {
             handle: datagrams,
-            peer_rotates: true,
-            peer_flows: flows,
-            peer_circuit_datagrams: false,
-            parallel: parallel.then_some(offer),
+            peer_rotates: caps.is_none_or(|caps| caps.supports_realtime_rekey()),
+            peer_flows: caps.map_or(flows, |caps| caps.supports_datagram_flows()),
+            peer_circuit_datagrams: caps.is_some_and(|caps| caps.supports_circuit_datagrams()),
+            parallel: (parallel && caps.is_none_or(|caps| caps.supports_parallel_quic()))
+                .then_some(offer),
         });
         runner.session_id = [3; 32];
         runner.raw_session_keys = Some((tx_key, rx_key, [3; 32]));
-        if rotate {
-            runner.local_node_id = [direction as u8 + 1; 32];
-            runner.peer_id = [2 - direction as u8; 32];
+        if rotate || resumed {
+            runner.local_node_id = node_ids[direction];
+            runner.peer_id = node_ids[1 - direction];
             runner.crypto.tx_cipher = Some(veil_crypto::session_cipher::SessionCipher::new(
                 &tx_key, true,
             ));
             runner.crypto.rx_cipher = Some(veil_crypto::session_cipher::SessionCipher::new(
                 &rx_key, true,
             ));
+        }
+        if rotate {
             // Only A initiates; B exercises the actual responder rekey arm.
             if direction == 0 {
                 runner.rekey.time_threshold_secs = 1;
@@ -186,7 +298,11 @@ async fn runner_channels_over_real_quic(flows: bool, parallel: bool, rotate: boo
                     } => {
                         assert_eq!(
                             src_node_id,
-                            [if rotate { direction as u8 + 1 } else { 1 }; 32]
+                            if resumed {
+                                node_ids[direction]
+                            } else {
+                                [if rotate { direction as u8 + 1 } else { 1 }; 32]
+                            }
                         );
                         assert_eq!(payload.seq, seq);
                         assert_eq!(payload.payload, data);
@@ -258,13 +374,18 @@ async fn runner_channels_over_real_quic(flows: bool, parallel: bool, rotate: boo
 }
 
 #[tokio::test]
+async fn resumed_shared_quic_sessions_keep_both_independent_senders() {
+    runner_channels_over_real_quic(true, true, false, true, true).await;
+}
+
+#[tokio::test]
 async fn opaque_channels_run_bidirectionally_over_real_quic() {
-    runner_channels_over_real_quic(true, false, false, false).await;
+    runner_channels_over_real_quic(true, false, false, false, false).await;
 }
 
 #[tokio::test]
 async fn legacy_datagram_lane_still_runs_bidirectionally_over_real_quic() {
-    runner_channels_over_real_quic(false, false, false, false).await;
+    runner_channels_over_real_quic(false, false, false, false, false).await;
 }
 
 /// Stop the primary writer after QUIC setup, retaining the same connection's
@@ -484,22 +605,22 @@ async fn circuit_cells_preserve_stream_only_transport_fallback() {
 
 #[tokio::test]
 async fn independent_parallel_senders_deliver_through_actual_runners_with_stopped_main_writers() {
-    runner_channels_over_real_quic(true, true, false, false).await;
+    runner_channels_over_real_quic(true, true, false, false, false).await;
 }
 
 #[tokio::test]
 async fn independent_parallel_senders_rebind_after_actual_canonical_rekey() {
-    runner_channels_over_real_quic(true, true, true, false).await;
+    runner_channels_over_real_quic(true, true, true, false, false).await;
 }
 
 #[tokio::test]
 async fn shared_listener_parallel_senders_deliver_with_stopped_main_writers() {
-    runner_channels_over_real_quic(true, true, false, true).await;
+    runner_channels_over_real_quic(true, true, false, true, false).await;
 }
 
 #[tokio::test]
 async fn shared_listener_parallel_senders_rebind_after_actual_canonical_rekey() {
-    runner_channels_over_real_quic(true, true, true, true).await;
+    runner_channels_over_real_quic(true, true, true, true, false).await;
 }
 
 /// Two clients share one relay listener. Replies must use the authenticated

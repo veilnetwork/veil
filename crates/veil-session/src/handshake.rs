@@ -184,7 +184,8 @@ pub struct OvlHandshakeResult {
     /// Whether [`Self::remote_capabilities`] is what the peer SAID, or what
     /// this side had to invent because no CAPABILITIES frame was exchanged.
     ///
-    /// The fast-resume path returns `flags = 0, discovery_mode = 0`, and every
+    /// A legacy fast-resume peer without authenticated capability metadata
+    /// returns `flags = 0, discovery_mode = 0`, and every
     /// accessor on `CapabilitiesPayload` reads zero as an ordinary answer:
     /// `dht_service()` is `flags & NO_DHT_SERVICE == 0`, so a synthesized
     /// payload says "serves" in exactly the words a peer would use to say it.
@@ -196,8 +197,9 @@ pub struct OvlHandshakeResult {
     /// the moment resumption replaced the full handshake.
     ///
     /// `false` therefore means "not news": consumers must leave whatever they
-    /// already know about this peer alone. A future versioned ticket that
-    /// carries the capability flags would set this back to `true`.
+    /// already know about this peer alone. Upgraded resume peers restate their
+    /// current capabilities in a fresh-key-authenticated ATTACH extension and
+    /// set this to `true`; cached ticket flags are never guessed.
     pub remote_caps_stated: bool,
     /// Raw payload received during ATTACH exchange.
     pub remote_attach: AttachPayload,
@@ -607,6 +609,28 @@ where
                         &mut fp_attach_bytes,
                         &server_resume_nonce,
                     );
+                    let session_keys = veil_crypto::session_kdf::derive_resume_keys(
+                        &ticket.tx_key,
+                        &ticket.rx_key,
+                        &ticket.session_id,
+                        &peer_resume_nonce,
+                        &server_resume_nonce,
+                        &local_node_id_bytes,
+                        &remote_id,
+                    );
+                    crate::resume_capabilities::append(
+                        &mut fp_attach_bytes,
+                        &local_capabilities(
+                            role,
+                            discovery_mode,
+                            sovereign_ctx.as_ref(),
+                            anonymity_relay_capable,
+                            dht_service,
+                        ),
+                        &session_keys.tx_key,
+                        &local_node_id_bytes,
+                        &remote_id,
+                    );
                     write_frame(stream, family, SessionMsg::Attach as u16, &fp_attach_bytes)
                         .await?;
                     if let Some(f) = capture {
@@ -632,25 +656,7 @@ where
                     }
 
                     let node_id = node_id_from_bytes(remote_id)?;
-                    log::info!(
-                        "resume.server.success peer={} — ticket accepted, fast-path (no ML-KEM/Falcon)",
-                        veil_util::hex_short(&remote_id),
-                    );
                     let remote_role = RemoteRole::from(remote_attach.role);
-                    // Derive FRESH session keys from the ticket's original keys +
-                    // both resumption nonces (client's from HELLO, ours from the
-                    // ATTACH trailer). NEVER restore the originals into a
-                    // counter-0 cipher — that was the audit cycle-2 CRITICAL
-                    // (identical (key, nonce) per frame across the two sessions).
-                    let session_keys = veil_crypto::session_kdf::derive_resume_keys(
-                        &ticket.tx_key,
-                        &ticket.rx_key,
-                        &ticket.session_id,
-                        &peer_resume_nonce,
-                        &server_resume_nonce,
-                        &local_node_id_bytes,
-                        &remote_id,
-                    );
                     // Synthesize a minimal IdentityPayload — IDENTITY was not exchanged.
                     let remote_identity_payload = IdentityPayload {
                         algo: 0,
@@ -659,14 +665,24 @@ where
                         node_id: remote_id,
                         mlkem_pubkey: None,
                     };
-                    // Synthesized, not received — CAPABILITIES was not
-                    // exchanged. See `remote_caps_stated`.
-                    let remote_capabilities = CapabilitiesPayload {
+                    let stated_caps = crate::resume_capabilities::verify(
+                        &body,
+                        &session_keys.rx_key,
+                        &remote_id,
+                        &local_node_id_bytes,
+                    )
+                    .map_err(|e| HandshakeError(e.into()))?;
+                    log::info!(
+                        "resume.server.success peer={} — ticket accepted, fast-path (no ML-KEM/Falcon)",
+                        veil_util::hex_short(&remote_id),
+                    );
+                    let remote_caps_stated = stated_caps.is_some();
+                    let remote_capabilities = stated_caps.unwrap_or(CapabilitiesPayload {
                         roles_supported: 0,
                         flags: 0,
                         extra_flags: 0,
                         discovery_mode: 0,
-                    };
+                    });
                     return Ok(OvlHandshakeResult {
                         node_id,
                         public_key: String::new(),
@@ -674,7 +690,7 @@ where
                         session_keys,
                         remote_identity_payload,
                         remote_capabilities,
-                        remote_caps_stated: false,
+                        remote_caps_stated,
                         remote_attach,
                         remote_role,
                         remote_vivaldi,
@@ -751,12 +767,44 @@ where
                     veil_proto::session::decode_advertised_transports_from_attach(&body);
                 let remote_role = RemoteRole::from(remote_attach.role);
 
+                let client_nonce = client_resume_nonce
+                    .expect("client_resume_nonce is Some whenever resume_ticket is Some");
+                let session_keys = veil_crypto::session_kdf::derive_resume_keys(
+                    &entry.tx_key,
+                    &entry.rx_key,
+                    &entry.session_id,
+                    &client_nonce,
+                    &server_resume_nonce,
+                    &local_node_id_bytes,
+                    &remote_id,
+                );
+                let stated_caps = crate::resume_capabilities::verify(
+                    &body,
+                    &session_keys.rx_key,
+                    &remote_id,
+                    &local_node_id_bytes,
+                )
+                .map_err(|e| HandshakeError(e.into()))?;
+                let remote_caps_stated = stated_caps.is_some();
                 // Send our ATTACH.
-                let fp_attach_bytes = build_local_attach_bytes(
+                let mut fp_attach_bytes = build_local_attach_bytes(
                     role,
                     vivaldi,
                     local_advertised_transports,
                     peer_observed_addr,
+                );
+                crate::resume_capabilities::append(
+                    &mut fp_attach_bytes,
+                    &local_capabilities(
+                        role,
+                        discovery_mode,
+                        sovereign_ctx.as_ref(),
+                        anonymity_relay_capable,
+                        dht_service,
+                    ),
+                    &session_keys.tx_key,
+                    &local_node_id_bytes,
+                    &remote_id,
                 );
                 write_frame(stream, family, SessionMsg::Attach as u16, &fp_attach_bytes).await?;
                 if let Some(f) = capture {
@@ -773,21 +821,6 @@ where
                 log::info!(
                     "resume.client.success peer={} — server ATTACH, fast-path resumed (1-RTT, fit under 10s)",
                     veil_util::hex_short(&remote_id),
-                );
-                // Derive FRESH keys from our stored original keys + both
-                // resumption nonces (ours from the HELLO, the responder's from
-                // its ATTACH). NEVER restore the originals into a counter-0
-                // cipher — that was the audit cycle-2 CRITICAL.
-                let client_nonce = client_resume_nonce
-                    .expect("client_resume_nonce is Some whenever resume_ticket is Some");
-                let session_keys = veil_crypto::session_kdf::derive_resume_keys(
-                    &entry.tx_key,
-                    &entry.rx_key,
-                    &entry.session_id,
-                    &client_nonce,
-                    &server_resume_nonce,
-                    &local_node_id_bytes,
-                    &remote_id,
                 );
                 // Synthesize IdentityPayload from stored peer identity.
                 let nonce_bytes = entry.peer_nonce.as_bytes().to_vec();
@@ -806,14 +839,12 @@ where
                     node_id: remote_id,
                     mlkem_pubkey: None,
                 };
-                // Synthesized, not received — CAPABILITIES was not exchanged.
-                // See `remote_caps_stated`.
-                let remote_capabilities = CapabilitiesPayload {
+                let remote_capabilities = stated_caps.unwrap_or(CapabilitiesPayload {
                     roles_supported: 0,
                     flags: 0,
                     extra_flags: 0,
                     discovery_mode: 0,
-                };
+                });
                 return Ok(OvlHandshakeResult {
                     node_id,
                     public_key: entry.peer_public_key.clone(),
@@ -821,7 +852,7 @@ where
                     session_keys,
                     remote_identity_payload,
                     remote_capabilities,
-                    remote_caps_stated: false,
+                    remote_caps_stated,
                     remote_attach,
                     remote_role,
                     remote_vivaldi,
@@ -1147,6 +1178,63 @@ pub fn sign_ephemeral_pubkey(
     .unwrap_or_default()
 }
 
+/// Build the same current advertisement for full and resumed handshakes.
+fn local_capabilities(
+    role: NodeRole,
+    discovery_mode: veil_cfg::DiscoveryMode,
+    sovereign_ctx: Option<&SovereignHandshakeCtx<'_>>,
+    anonymity_relay_capable: bool,
+    dht_service: bool,
+) -> CapabilitiesPayload {
+    let mut caps = CapabilitiesPayload::from_node_role(role).with_discovery_mode(discovery_mode);
+    // advertise SUPPORTS_SOVEREIGN_IDENTITY iff we have
+    // local sovereign material to back it up. Peers that also set
+    // the bit will trigger the IdentityProof-frame exchange below.
+    if sovereign_ctx.is_some() {
+        caps.flags |= cap_flags::SUPPORTS_SOVEREIGN_IDENTITY;
+    }
+    // advertise ANONYMITY_RELAY iff the operator opted in
+    // via `[anonymity].relay_capable = true`. Without the bit set
+    // remote peers' relay-directory lookups will skip
+    // us as a circuit candidate.
+    if anonymity_relay_capable {
+        caps.flags |= cap_flags::ANONYMITY_RELAY;
+    }
+    // ask peers not to spend DHT work on us when the operator (or the
+    // app's platform default) turned serving off. Reachability is not
+    // affected — see the bit's own doc.
+    if !dht_service {
+        caps.flags |= cap_flags::NO_DHT_SERVICE;
+    }
+    // advertise SUPPORTS_HYBRID_KEX iff we
+    // have ML-KEM material to back it up (local DK seed for
+    // decapsulation when we're the receiver, AND we know the peer's
+    // mlkem_pubkey will be carried in IDENTITY). Negotiation is
+    // double-sided: peers without the bit fall through to the
+    // classical X25519-only path unchanged.
+    let local_mlkem_dk_seed: Option<&[u8; 64]> =
+        sovereign_ctx.as_ref().and_then(|c| c.local_mlkem_dk_seed);
+    if local_mlkem_dk_seed.is_some() {
+        caps.flags |= cap_flags::SUPPORTS_HYBRID_KEX;
+    }
+    // The session crate implements an authenticated, bounded realtime lane on
+    // QUIC DATAGRAMs. Advertising support is transport-independent; the
+    // runtime additionally requires the selected transport to expose a
+    // negotiated DATAGRAM handle before enabling it.
+    caps.flags |= cap_flags::SUPPORTS_REALTIME_DATAGRAMS;
+    // And that this build re-derives the lane's key when the session rekeys.
+    // Advertised unconditionally because the code that does it is always
+    // present; whether it HAPPENS is the negotiation, and a peer without the
+    // bit keeps the static key it always had (report12 V-M12).
+    caps.flags |= cap_flags::SUPPORTS_REALTIME_REKEY;
+    caps.flags |= cap_flags::SUPPORTS_DATAGRAM_FLOWS;
+    caps.extra_flags |= veil_proto::session::cap_extra_flags::SUPPORTS_CIRCUIT_DATAGRAMS;
+    caps.extra_flags |= veil_proto::session::cap_extra_flags::SUPPORTS_PARALLEL_QUIC;
+    caps.extra_flags |= veil_proto::session::cap_extra_flags::SUPPORTS_SHARED_PARALLEL_QUIC;
+    caps.extra_flags |= veil_proto::session::cap_extra_flags::SUPPORTS_DUPLEX_PARALLEL_QUIC;
+    caps
+}
+
 /// Drive the full handshake tail: CAPABILITIES → KEY_AGREEMENT → SESSION_CONFIRM
 /// → ATTACH → build `OvlHandshakeResult`. Called by both the normal handshake
 /// path and the C6 fallback (which has already exchanged IDENTITY out of order).
@@ -1229,54 +1317,15 @@ where
     remote_transcript.update(remote_identity_bytes);
 
     //CAPABILITIES ---------------------------------------------------------
-    let mut caps = CapabilitiesPayload::from_node_role(role).with_discovery_mode(discovery_mode);
-    // advertise SUPPORTS_SOVEREIGN_IDENTITY iff we have
-    // local sovereign material to back it up. Peers that also set
-    // the bit will trigger the IdentityProof-frame exchange below.
-    if sovereign_ctx.is_some() {
-        caps.flags |= cap_flags::SUPPORTS_SOVEREIGN_IDENTITY;
-    }
-    // advertise ANONYMITY_RELAY iff the operator opted in
-    // via `[anonymity].relay_capable = true`. Without the bit set
-    // remote peers' relay-directory lookups will skip
-    // us as a circuit candidate.
-    if anonymity_relay_capable {
-        caps.flags |= cap_flags::ANONYMITY_RELAY;
-    }
-    // ask peers not to spend DHT work on us when the operator (or the
-    // app's platform default) turned serving off. Reachability is not
-    // affected — see the bit's own doc.
-    if !dht_service {
-        caps.flags |= cap_flags::NO_DHT_SERVICE;
-    }
-    // advertise SUPPORTS_HYBRID_KEX iff we
-    // have ML-KEM material to back it up (local DK seed for
-    // decapsulation when we're the receiver, AND we know the peer's
-    // mlkem_pubkey will be carried in IDENTITY). Negotiation is
-    // double-sided: peers without the bit fall through to the
-    // classical X25519-only path unchanged. Cache the dk_seed
-    // pointer up-front because `sovereign_ctx` gets moved later
-    // when the IDENTITY_PROOF branch consumes it.
     let local_mlkem_dk_seed: Option<&[u8; 64]> =
         sovereign_ctx.as_ref().and_then(|c| c.local_mlkem_dk_seed);
-    if local_mlkem_dk_seed.is_some() {
-        caps.flags |= cap_flags::SUPPORTS_HYBRID_KEX;
-    }
-    // The session crate implements an authenticated, bounded realtime lane on
-    // QUIC DATAGRAMs. Advertising support is transport-independent; the
-    // runtime additionally requires the selected transport to expose a
-    // negotiated DATAGRAM handle before enabling it.
-    caps.flags |= cap_flags::SUPPORTS_REALTIME_DATAGRAMS;
-    // And that this build re-derives the lane's key when the session rekeys.
-    // Advertised unconditionally because the code that does it is always
-    // present; whether it HAPPENS is the negotiation, and a peer without the
-    // bit keeps the static key it always had (report12 V-M12).
-    caps.flags |= cap_flags::SUPPORTS_REALTIME_REKEY;
-    caps.flags |= cap_flags::SUPPORTS_DATAGRAM_FLOWS;
-    caps.extra_flags |= veil_proto::session::cap_extra_flags::SUPPORTS_CIRCUIT_DATAGRAMS;
-    caps.extra_flags |= veil_proto::session::cap_extra_flags::SUPPORTS_PARALLEL_QUIC;
-    caps.extra_flags |= veil_proto::session::cap_extra_flags::SUPPORTS_SHARED_PARALLEL_QUIC;
-    caps.extra_flags |= veil_proto::session::cap_extra_flags::SUPPORTS_DUPLEX_PARALLEL_QUIC;
+    let caps = local_capabilities(
+        role,
+        discovery_mode,
+        sovereign_ctx.as_ref(),
+        anonymity_relay_capable,
+        dht_service,
+    );
     let caps_bytes = caps.encode();
     let caps_wire =
         write_frame(stream, family, SessionMsg::Capabilities as u16, &caps_bytes).await?;
@@ -1919,6 +1968,7 @@ fn reject_incompatible_major(remote_major: u16) -> Result<()> {
 #[cfg(test)]
 #[allow(deprecated)] // a few fixtures use the legacy `TicketIssuer::issue` shim
 mod tests {
+    mod resume_compat_tests;
     use tokio::io::duplex;
 
     use super::*;
@@ -3046,7 +3096,7 @@ mod tests {
                 Some(issuer2),
                 None,
                 &[],
-                false,
+                true, // operator enabled relay since the full handshake
                 true, // dht_service: a test node serves, like any default node
                 None,
                 None, // P-Net: no network gate in test fixture
@@ -3073,7 +3123,7 @@ mod tests {
                     None,
                     &[],
                     false,
-                    true, // dht_service: a test node serves, like any default node
+                    false, // current preference changed since the ticket was issued
                     None,
                     None, // P-Net: no network gate in test fixture
                     None, // S3: no peer_observed_addr in test fixture
@@ -3086,6 +3136,20 @@ mod tests {
         let (srv2, cli2) = tokio::join!(srv_task2, cli_task2);
         let srv2 = srv2.unwrap();
         let cli2 = cli2.unwrap();
+
+        // Fresh authenticated statements retain independent transports on
+        // reconnect and reflect settings changed after the ticket was issued.
+        assert!(srv2.remote_caps_stated && cli2.remote_caps_stated);
+        for result in [&srv2, &cli2] {
+            assert!(result.remote_capabilities.supports_circuit_datagrams());
+            assert!(result.remote_capabilities.supports_shared_parallel_quic());
+            assert!(result.remote_capabilities.supports_duplex_parallel_quic());
+        }
+        assert!(!srv2.remote_capabilities.dht_service());
+        assert_ne!(
+            cli2.remote_capabilities.flags & cap_flags::ANONYMITY_RELAY,
+            0
+        );
 
         // ── Step 4: verify the resumed session ────────────────────────────────
         // CRITICAL (audit cycle-2): the resumed session must NOT reuse the

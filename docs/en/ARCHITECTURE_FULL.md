@@ -457,6 +457,8 @@ Implementation: [`crypto/session_kdf.rs::derive_rekey_keys`](../../crates/veil-c
 
 After a successful handshake, the server hands the client an encrypted `SessionTicket`. The client can present it in the TLV (type-length-value) extension of `HelloPayload` to resume a session quickly, skipping the full handshake.
 
+Upgraded peers restate their current capabilities on the fast path in an optional ATTACH TLV (`0x0017`, explicit version marker). A directional keyed BLAKE3 proof binds the capabilities, preceding ATTACH fields and both node IDs to the fresh resumed-session key derived from both nonces. This preserves negotiated circuit datagrams and independent/shared/duplex QUIC transports after reconnect without another round trip. Neither endpoint guesses capabilities from an old ticket. Recognized malformed, duplicated or invalid proofs reject resumption; a legacy peer without metadata keeps zero transport capabilities and `remote_caps_stated = false`, preserving stored routing preferences and ordinary transport fallback. The extension carries generic capabilities, no media role or relay priority. Tests cover changed preferences after ticket issuance, field/prefix/proof tampering, wrong keys and peers, reflection, duplicate/truncated extensions, random padding, and actual fast-path compatibility with legacy clients and servers. A real shared-listener QUIC stand resumes the handshake, uses the fresh keys and authenticated capability gates in both runners, stops their ordered writers and verifies both independent senders and cleanup.
+
 - `SESSION_TICKET_TTL_SECS = 3600` (1 hour) — the normal lifetime.
 - `SESSION_TICKET_MAX_AGE_SECS = 7200` — the hard age limit, with a grace window for clock skew.
 

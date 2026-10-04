@@ -447,10 +447,10 @@ pub struct AttachedDebugSession {
     /// Only meaningful when [`Self::remote_caps_stated`] is true.
     pub remote_dht_service: bool,
     /// Whether the two fields above came from the peer's own CAPABILITIES
-    /// frame. False on a fast-resumed handshake, which synthesizes a zero
-    /// payload that reads as "Public, serves" — the ordinary answer, not a
-    /// missing one. Anything writing these into the routing table must treat
-    /// false as "no news" and leave the stored stamps alone.
+    /// frame or fresh-key-authenticated resume extension. Legacy resumes
+    /// synthesize a zero payload that reads as "Public, serves" — the ordinary
+    /// answer, not a missing one. Anything writing these into the routing table
+    /// must treat false as "no news" and leave the stored stamps alone.
     pub remote_caps_stated: bool,
     /// True when this session was accepted INTO the referral headroom above
     /// `max_concurrent` (the node was already at its data ceiling). Such a
