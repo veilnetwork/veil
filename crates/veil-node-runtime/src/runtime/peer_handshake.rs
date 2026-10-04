@@ -93,6 +93,7 @@ pub struct RemoteHandshakeInfo {
     pub supports_datagram_flows: bool,
     pub supports_circuit_datagrams: bool,
     pub supports_parallel_quic: bool,
+    pub supports_shared_parallel_quic: bool,
     /// Bounded UDP reflector port advertised by this authenticated peer.
     /// The runtime combines it with transport metadata only after all session
     /// admission gates pass.
@@ -520,25 +521,6 @@ pub async fn register_connection_session(
     let remote_addr = peer.remote_addr.map(|addr| addr.to_string());
     let description = peer.description.clone();
 
-    // Per-source-IP session limit — applies only to inbound connections.
-    let source_ip: Option<std::net::IpAddr> = if matches!(source, SessionSource::Inbound(_)) {
-        peer.remote_addr.map(|sa| sa.ip())
-    } else {
-        None
-    };
-    if let Some(ip) = source_ip
-        && let Err(err) = check_and_reserve_ip_slot(&runtime, ip, link_id)
-    {
-        drop(connection);
-        return Err(err);
-    }
-
-    // Arm the RAII guard so a future cancellation between
-    // `check_and_reserve_ip_slot` and `SessionGuard` construction cannot
-    // leak the slot.
-    let mut _ip_slot_guard =
-        source_ip.map(|ip| IpSlotGuard::arm(ip, Arc::clone(&runtime.sessions_per_ip)));
-
     runtime.logger.debug(
         "handshake.start",
         format!("link_id={} source={}", link_id, source),
@@ -595,6 +577,48 @@ pub async fn register_connection_session(
             }
         }
     }
+
+    // Shared QUIC listeners dispatch generic siblings through a live parent.
+    // No new peer, OVL1 handshake or canonical IP slot is created for a child.
+    if matches!(source, SessionSource::Inbound(_)) {
+        use veil_session::runner::ParallelPeekOutcome;
+        match runtime
+            .handoff
+            .parallel
+            .peek_and_dispatch(stream, quic_datagrams.clone())
+            .await
+        {
+            ParallelPeekOutcome::Bound => return Ok(None),
+            ParallelPeekOutcome::Handshake(new_stream) => stream = new_stream,
+            ParallelPeekOutcome::Drop(reason) => {
+                return Err(NodeError::Handshake(format!(
+                    "parallel peek rejected connection: {reason}"
+                )));
+            }
+        }
+    }
+
+    // Per-source-IP session limit — applies only to inbound connections.
+    let source_ip: Option<std::net::IpAddr> = if matches!(source, SessionSource::Inbound(_)) {
+        peer.remote_addr.map(|sa| sa.ip())
+    } else {
+        None
+    };
+    if let Some(ip) = source_ip
+        && let Err(err) = check_and_reserve_ip_slot(&runtime, ip, link_id)
+    {
+        if let Some(handle) = &quic_datagrams {
+            handle.close();
+        }
+        drop(stream);
+        return Err(err);
+    }
+
+    // Arm the RAII guard so a future cancellation between
+    // `check_and_reserve_ip_slot` and `SessionGuard` construction cannot
+    // leak the slot.
+    let mut _ip_slot_guard =
+        source_ip.map(|ip| IpSlotGuard::arm(ip, Arc::clone(&runtime.sessions_per_ip)));
 
     // `pending_peer_state` is derived during the handshake but published —
     // per-peer caches and the `session_registry` entry alike — only after the
@@ -860,6 +884,9 @@ pub async fn register_connection_session(
                             .remote_capabilities
                             .supports_circuit_datagrams(),
                         supports_parallel_quic: r.remote_capabilities.supports_parallel_quic(),
+                        supports_shared_parallel_quic: r
+                            .remote_capabilities
+                            .supports_shared_parallel_quic(),
                         sovereign_node_id,
                         udp_reflector_port,
                         shared_udp_reflectors,
@@ -1423,8 +1450,15 @@ pub async fn register_connection_session(
                 peer_flows: remote_identity.supports_datagram_flows,
                 peer_circuit_datagrams: remote_identity.supports_circuit_datagrams,
                 parallel: parallel_quic
-                    .filter(|_| remote_identity.supports_parallel_quic)
-                    .map(veil_session::runner::ParallelQuicOffer::new),
+                    .filter(|handle| {
+                        remote_identity.supports_parallel_quic
+                            && (!handle.requires_shared_dispatch()
+                                || remote_identity.supports_shared_parallel_quic)
+                    })
+                    .map(|handle| {
+                        veil_session::runner::ParallelQuicOffer::new(handle)
+                            .with_registry(Arc::clone(&runtime.handoff.parallel))
+                    }),
             }),
         metrics: runtime.metrics.clone(),
         peer_id: remote_identity.node_id,

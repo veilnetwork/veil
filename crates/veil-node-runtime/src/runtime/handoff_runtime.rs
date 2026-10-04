@@ -44,6 +44,9 @@ use super::hot_standby::HotStandbyController;
 /// [`crate::node::NodeRuntime`] and cloned (Arc) into `NodeServices` /
 /// `SessionRuntimeContext` at boundary builds.
 pub struct HandoffRuntime {
+    /// Generic auxiliary transports attached to canonical sessions. The shared
+    /// listener retains sole ownership of acceptance; no media role is exposed.
+    pub parallel: Arc<veil_session::runner::ParallelRegistry>,
     /// stage (d) Task 3: hot-standby handoff registry. Shared
     /// with every `SessionRunner` this runtime spawns so inbound
     /// `HandoffInit` frames register a `PendingHandoff` here; the
@@ -83,6 +86,7 @@ impl HandoffRuntime {
         auto_trigger_after_write_errors: u32,
     ) -> Self {
         Self {
+            parallel: Arc::default(),
             registry,
             swap_registry,
             ack_waiters,

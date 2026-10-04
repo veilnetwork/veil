@@ -4,28 +4,48 @@ use tokio::io::AsyncReadExt;
 use veil_app::registry::AppMessage;
 use veil_proto::{AppRtDataPayload, family::AppMsg};
 use veil_transport::{
-    TransportContext,
+    Transport, TransportContext, TransportListener, TransportUri,
+    quic::QuicTransport,
     quic::{PunchedQuicRole, promote_punched_quic},
 };
 
-async fn runner_channels_over_real_quic(flows: bool, parallel: bool, rotate: bool) {
-    let a_socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
-    let b_socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
-    let a_addr = a_socket.local_addr().unwrap();
-    let b_addr = b_socket.local_addr().unwrap();
+async fn runner_channels_over_real_quic(flows: bool, parallel: bool, rotate: bool, shared: bool) {
     let context = Arc::new(TransportContext::for_debug().unwrap());
-    let b_context = Arc::clone(&context);
-    let b_task = tokio::spawn(async move {
-        promote_punched_quic(b_socket, a_addr, b_context, PunchedQuicRole::Responder).await
-    });
-    let a = promote_punched_quic(
-        a_socket,
-        b_addr,
-        Arc::clone(&context),
-        PunchedQuicRole::Initiator,
-    )
-    .await
-    .unwrap();
+    let registry = Arc::new(ParallelRegistry::default());
+    let listener: Option<Arc<dyn TransportListener>> = if shared {
+        let uri: TransportUri = "quic://127.0.0.1:0".parse().unwrap();
+        Some(Arc::from(
+            QuicTransport
+                .bind(&uri, Arc::clone(&context))
+                .await
+                .unwrap(),
+        ))
+    } else {
+        None
+    };
+    let (a, b_task) = if let Some(listener) = &listener {
+        let uri: TransportUri = format!("quic://{}", listener.local_addr()).parse().unwrap();
+        let listener = Arc::clone(listener);
+        let accepted = tokio::spawn(async move { listener.accept().await });
+        let a = QuicTransport
+            .connect(&uri, Arc::clone(&context))
+            .await
+            .unwrap();
+        (a, accepted)
+    } else {
+        let a_socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let b_socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let a_addr = a_socket.local_addr().unwrap();
+        let b_addr = b_socket.local_addr().unwrap();
+        let b_context = Arc::clone(&context);
+        let b_task = tokio::spawn(async move {
+            promote_punched_quic(b_socket, a_addr, b_context, PunchedQuicRole::Responder).await
+        });
+        let a = promote_punched_quic(a_socket, b_addr, context, PunchedQuicRole::Initiator)
+            .await
+            .unwrap();
+        (a, b_task)
+    };
     let a_datagrams = a.quic_datagrams().unwrap();
     let a_parallel = a.parallel_quic().unwrap();
     let mut a_stream = a.into_stream().unwrap();
@@ -39,6 +59,23 @@ async fn runner_channels_over_real_quic(flows: bool, parallel: bool, rotate: boo
     b_stream.read_exact(&mut prelude).await.unwrap();
 
     let mut tasks = Vec::new();
+    if let Some(listener) = listener {
+        let registry = Arc::clone(&registry);
+        tasks.push(tokio::spawn(async move {
+            loop {
+                let connection = listener.accept().await.unwrap();
+                let datagrams = connection.quic_datagrams();
+                let stream = connection.into_stream().unwrap();
+                match registry.peek_and_dispatch(stream, datagrams).await {
+                    ParallelPeekOutcome::Bound => {}
+                    ParallelPeekOutcome::Drop(_) => {} // rekey can retire a proof in flight
+                    ParallelPeekOutcome::Handshake(_) => {
+                        panic!("child created a new canonical peer")
+                    }
+                }
+            }
+        }));
+    }
     let mut receivers = Vec::new();
     let mut senders = Vec::new();
     let mut endpoints = Vec::new();
@@ -66,7 +103,11 @@ async fn runner_channels_over_real_quic(flows: bool, parallel: bool, rotate: boo
         } else {
             stream
         };
-        let offer = ParallelQuicOffer::new(handle);
+        let offer = if handle.has_exclusive_accept() {
+            ParallelQuicOffer::new(handle)
+        } else {
+            ParallelQuicOffer::new(handle).with_registry(Arc::clone(&registry))
+        };
         diagnostics.push(offer.diagnostics());
         runner.quic_datagrams = Some(RealtimeLaneOffer {
             handle: datagrams,
@@ -218,12 +259,12 @@ async fn runner_channels_over_real_quic(flows: bool, parallel: bool, rotate: boo
 
 #[tokio::test]
 async fn opaque_channels_run_bidirectionally_over_real_quic() {
-    runner_channels_over_real_quic(true, false, false).await;
+    runner_channels_over_real_quic(true, false, false, false).await;
 }
 
 #[tokio::test]
 async fn legacy_datagram_lane_still_runs_bidirectionally_over_real_quic() {
-    runner_channels_over_real_quic(false, false, false).await;
+    runner_channels_over_real_quic(false, false, false, false).await;
 }
 
 /// Stop the primary writer after QUIC setup, retaining the same connection's
@@ -443,10 +484,20 @@ async fn circuit_cells_preserve_stream_only_transport_fallback() {
 
 #[tokio::test]
 async fn independent_parallel_senders_deliver_through_actual_runners_with_stopped_main_writers() {
-    runner_channels_over_real_quic(true, true, false).await;
+    runner_channels_over_real_quic(true, true, false, false).await;
 }
 
 #[tokio::test]
 async fn independent_parallel_senders_rebind_after_actual_canonical_rekey() {
-    runner_channels_over_real_quic(true, true, true).await;
+    runner_channels_over_real_quic(true, true, true, false).await;
+}
+
+#[tokio::test]
+async fn shared_listener_parallel_senders_deliver_with_stopped_main_writers() {
+    runner_channels_over_real_quic(true, true, false, true).await;
+}
+
+#[tokio::test]
+async fn shared_listener_parallel_senders_rebind_after_actual_canonical_rekey() {
+    runner_channels_over_real_quic(true, true, true, true).await;
 }
