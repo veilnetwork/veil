@@ -602,6 +602,24 @@ struct RecvCb {
     cipher: Arc<MediaCipher>,
 }
 
+// Keep the cipher allocation alive while opening a cell, and bind every
+// resulting packet to that exact channel/cipher pair. Re-resolving only the
+// peer after AEAD would send old-call plaintext into a successor's callback.
+struct RecvLease {
+    chan: u64,
+    cipher: Arc<MediaCipher>,
+}
+
+fn recv_lease(peer: &[u8; 32]) -> Option<RecvLease> {
+    RECV.lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .get(peer)
+        .map(|entry| RecvLease {
+            chan: entry.chan,
+            cipher: Arc::clone(&entry.cipher),
+        })
+}
+
 /// Inbound recv callbacks keyed by PEER node id. Each transport's feed resolves
 /// the sender node per cell, so dispatch is by-peer — one entry per open
 /// channel.
@@ -640,8 +658,8 @@ thread_local! {
 /// Bounded rather than unbounded on purpose: a callback that never returns
 /// would otherwise wedge teardown, which is a worse failure than the one this
 /// closes and the exact shape of a bug this project has already been bitten by.
-/// The host's own drain waits one second; this waits longer, because it is the
-/// half that actually knows whether a call is in progress.
+/// The native shim fences its running delivery and discards queued packets;
+/// this gate tracks callbacks already executing across the FFI boundary.
 const QUIESCE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// Wait until no dispatch for `chan` is inside a host callback.
@@ -849,22 +867,20 @@ fn note_arrival_gap() {
     );
 }
 
-fn dispatch_inbound(peer: [u8; 32], payload: &[u8]) {
-    {
-        let mut counts = RECV_COUNT.lock().unwrap_or_else(|p| p.into_inner());
-        *counts.entry(peer).or_insert(0) += 1;
-    }
-    note_arrival_gap();
+fn dispatch_inbound(peer: [u8; 32], payload: &[u8], lease: &RecvLease) {
     // `hits` counts within the CURRENT registration (reset by set), so the
     // trace shows whether each nominally-live window actually delivered into
     // the engine — the process-lifetime counters could not (a healthy first
     // window exhausted the "first 5" quota for the whole call).
     let target = {
         let mut map = RECV.lock().unwrap_or_else(|p| p.into_inner());
-        let found = map.get_mut(&peer).map(|c| {
-            c.hits += 1;
-            (c.cb, c.ctx, c.chan, c.hits)
-        });
+        let found = map
+            .get_mut(&peer)
+            .filter(|c| c.chan == lease.chan && Arc::ptr_eq(&c.cipher, &lease.cipher))
+            .map(|c| {
+                c.hits += 1;
+                (c.cb, c.ctx, c.chan, c.hits)
+            });
         // Counted while the registry is still held, so a clear either removes
         // the entry before this (and there is no call to wait for) or waits for
         // this call to finish. There is no third order.
@@ -924,6 +940,13 @@ fn dispatch_inbound(peer: [u8; 32], payload: &[u8]) {
         }
     }
     if let Some((cb, ctx, chan, _)) = target {
+        // Count only media admitted to the cipher/channel that opened it.
+        // A straggler must not establish the successor's liveness.
+        {
+            let mut counts = RECV_COUNT.lock().unwrap_or_else(|p| p.into_inner());
+            *counts.entry(peer).or_insert(0) += 1;
+        }
+        note_arrival_gap();
         let previous = DISPATCHING.with(|c| c.replace(Some(chan)));
         cb(ctx as *mut c_void, payload.as_ptr(), payload.len());
         DISPATCHING.with(|c| c.set(previous));
@@ -943,7 +966,7 @@ fn dispatch_inbound(peer: [u8; 32], payload: &[u8]) {
 /// Fan out one OPENED batch cell. The entire cell is dropped on malformed
 /// length/count data; partial delivery would make corruption depend on packet
 /// position and complicate loss accounting.
-fn dispatch_inbound_batch(peer: [u8; 32], body: &[u8]) {
+fn dispatch_inbound_batch(peer: [u8; 32], body: &[u8], lease: &RecvLease) {
     if body.len() < 2 {
         return;
     }
@@ -975,7 +998,7 @@ fn dispatch_inbound_batch(peer: [u8; 32], body: &[u8]) {
         return;
     }
     for packet in packets {
-        dispatch_inbound(peer, packet);
+        dispatch_inbound(peer, packet, lease);
     }
 }
 
@@ -1068,10 +1091,7 @@ pub(crate) fn trace_sealed_cell(stage: &str, peer: &[u8; 32], payload: &[u8]) {
 pub(crate) fn dispatch_inbound_auto(peer: [u8; 32], payload: &[u8]) {
     // Resolve the channel's cipher BEFORE looking at the packet, so the
     // decision comes from our state and not from bytes the sender chose.
-    let cipher = {
-        let map = RECV.lock().unwrap_or_else(|p| p.into_inner());
-        map.get(&peer).map(|entry| Arc::clone(&entry.cipher))
-    };
+    let lease = recv_lease(&peer);
     // No open channel for this peer: nothing to open the cell with, and the
     // engine has nowhere to put it either. Drop.
     //
@@ -1082,19 +1102,19 @@ pub(crate) fn dispatch_inbound_auto(peer: [u8; 32], payload: &[u8]) {
     // counter, no log and no difference from "the wire delivered nothing"
     // (measured on the stand 2026-09-19: rx_pkts=0 with recv_count=0 on BOTH
     // sides of a live p2p call).
-    let Some(cipher) = cipher else {
+    let Some(lease) = lease else {
         media_drop_note("no-channel", peer, payload.len());
         return;
     };
-    let Some(plaintext) = cipher.open(payload) else {
+    let Some(plaintext) = lease.cipher.open(payload) else {
         media_drop_note("seal-open-failed", peer, payload.len());
         return;
     };
     trace_sealed_cell("received", &peer, payload);
     if plaintext.first() == Some(&MEDIA_BATCH_MAGIC) {
-        dispatch_inbound_batch(peer, &plaintext[1..]);
+        dispatch_inbound_batch(peer, &plaintext[1..], &lease);
     } else {
-        dispatch_inbound(peer, &plaintext);
+        dispatch_inbound(peer, &plaintext, &lease);
     }
 }
 
@@ -1306,6 +1326,124 @@ mod tests {
     }
 
     const TRANSPORTS: [Transport; 3] = [Transport::Onion, Transport::Direct, Transport::Relay];
+
+    #[test]
+    fn a_cell_opened_for_a_replaced_channel_never_reaches_its_successor() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        for (index, transport) in TRANSPORTS.into_iter().enumerate() {
+            // A different channel sharing the old cipher and a different cipher
+            // registered under the same channel id both require a fresh lease.
+            for same_channel in [false, true] {
+                let peer = [0x94 + index as u8; 32];
+                let old = cipher(peer, [0x21; 32], [0x22; 32]);
+                let old_sender = peer_cipher([0x22; 32], [0x21; 32]);
+                let new = if same_channel {
+                    cipher(peer, [0x23; 32], [0x24; 32])
+                } else {
+                    Arc::clone(&old)
+                };
+                let next_chan = if same_channel { 940 } else { 941 };
+                set_recv_callback(peer, 940, record, std::ptr::null_mut(), old);
+                RX_CALLS.store(0, Ordering::SeqCst);
+                let before = recv_count(peer);
+                let replacement = Arc::clone(&new);
+                AFTER_AEAD.with(|hook| {
+                    *hook.borrow_mut() = Some(Box::new(move || {
+                        set_recv_callback(
+                            peer,
+                            next_chan,
+                            record,
+                            std::ptr::null_mut(),
+                            replacement,
+                        );
+                    }));
+                });
+                transport.ingress(peer, &transport.wire(old_sender.seal(b"old call").unwrap()));
+                assert_eq!(
+                    RX_CALLS.load(Ordering::SeqCst),
+                    0,
+                    "{transport:?}: old plaintext was retargeted"
+                );
+                assert_eq!(
+                    recv_count(peer),
+                    before,
+                    "stale media cannot establish successor liveness"
+                );
+
+                let fresh = if same_channel {
+                    peer_cipher([0x24; 32], [0x23; 32])
+                        .seal(b"new call")
+                        .unwrap()
+                } else {
+                    old_sender.seal(b"same call, new channel").unwrap()
+                };
+                transport.ingress(peer, &transport.wire(fresh));
+                assert_eq!(RX_CALLS.load(Ordering::SeqCst), 1);
+                clear_recv_callback(peer, next_chan);
+            }
+        }
+    }
+
+    struct ReplaceOnFirstPacket {
+        peer: [u8; 32],
+        cipher: Arc<MediaCipher>,
+        calls: AtomicUsize,
+    }
+
+    extern "C" fn replace_on_first_packet(ctx: *mut c_void, _ptr: *const u8, _len: usize) {
+        let ctx = unsafe { &*(ctx as *const ReplaceOnFirstPacket) };
+        ctx.calls.fetch_add(1, Ordering::SeqCst);
+        set_recv_callback(
+            ctx.peer,
+            951,
+            record,
+            std::ptr::null_mut(),
+            Arc::clone(&ctx.cipher),
+        );
+    }
+
+    #[test]
+    fn replacing_a_receiver_inside_a_batch_does_not_retarget_remaining_packets() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        for (index, transport) in TRANSPORTS.into_iter().enumerate() {
+            let peer = [0x98 + index as u8; 32];
+            let old = cipher(peer, [0x25; 32], [0x26; 32]);
+            let old_sender = peer_cipher([0x26; 32], [0x25; 32]);
+            let mut ctx = Box::new(ReplaceOnFirstPacket {
+                peer,
+                cipher: cipher(peer, [0x27; 32], [0x28; 32]),
+                calls: AtomicUsize::new(0),
+            });
+            set_recv_callback(
+                peer,
+                950,
+                replace_on_first_packet,
+                (&mut *ctx as *mut ReplaceOnFirstPacket).cast(),
+                old,
+            );
+            RX_CALLS.store(0, Ordering::SeqCst);
+            let before = recv_count(peer);
+            let cell = media_cell(
+                vec![b"first".to_vec(), b"second".to_vec(), b"third".to_vec()],
+                1024,
+            )
+            .unwrap();
+            transport.ingress(peer, &transport.wire(old_sender.seal(&cell).unwrap()));
+            assert_eq!(ctx.calls.load(Ordering::SeqCst), 1);
+            assert_eq!(
+                RX_CALLS.load(Ordering::SeqCst),
+                0,
+                "{transport:?}: old batch entered successor"
+            );
+            assert_eq!(recv_count(peer), before + 1);
+            let fresh = peer_cipher([0x28; 32], [0x27; 32])
+                .seal(b"new call")
+                .unwrap();
+            transport.ingress(peer, &transport.wire(fresh));
+            assert_eq!(RX_CALLS.load(Ordering::SeqCst), 1);
+            clear_recv_callback(peer, 951);
+        }
+    }
 
     impl Transport {
         /// The exact bytes this transport puts on the wire for one media cell.
@@ -1984,7 +2122,7 @@ mod v01_quiescence_tests {
         set_recv_callback(peer, chan, slow_cb, std::ptr::null_mut(), cipher());
 
         let dispatcher = std::thread::spawn(move || {
-            dispatch_inbound(peer, b"payload");
+            dispatch_inbound(peer, b"payload", &recv_lease(&peer).unwrap());
         });
         // Wait until the callback is genuinely inside; without this the clear
         // could win the race for a reason that has nothing to do with the fix.
