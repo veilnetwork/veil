@@ -8,14 +8,34 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <set>
+#include <thread>
 
 using Injector = int (*)(void*, uint64_t, uint32_t, uint32_t);
 extern "C" int veil_media_test_direct_call_planes(VeilMediaEngine*, Injector, void*);
 extern "C" int veil_media_test_group_call_planes(VeilGroupMediaEngine*, Injector, void*);
+extern "C" int veil_media_test_video_bandwidth(VeilMediaEngine*);
 struct Callback { void (*fn)(void*, const uint8_t*, size_t); void* ctx; };
 static std::mutex callback_mu;
 static std::map<uint64_t, Callback> callbacks;
-extern "C" int veil_media_send_datagram(uint64_t, const uint8_t*, size_t) { return 0; }
+static std::map<uint64_t, std::set<std::pair<uint32_t, uint16_t>>> feedback;
+static std::map<uint64_t, std::pair<uint32_t, uint32_t>> expected_ssrcs;
+extern "C" int veil_media_send_datagram(uint64_t chan, const uint8_t* p, size_t len) {
+  std::lock_guard lock(callback_mu);
+  for (size_t offset = 0; offset + 4 <= len;) {
+    const uint8_t* b = p + offset;
+    const size_t size = 4 * (size_t(b[2]) * 256 + b[3] + 1);
+    if ((b[0] >> 6) != 2 || size < 4 || size > len - offset) break;
+    if (b[1] == 205 && (b[0] & 31) == 15 && size >= 20) {
+      const uint32_t ssrc = uint32_t(b[8]) << 24 | uint32_t(b[9]) << 16 |
+                            uint32_t(b[10]) << 8 | b[11];
+      const uint16_t base = uint16_t(b[12]) << 8 | b[13];
+      feedback[chan].insert({ssrc, base});
+    }
+    offset += size;
+  }
+  return 0;
+}
 extern "C" int veil_media_set_recv_callback(
     uint64_t chan, void (*cb)(void*, const uint8_t*, size_t), void* ctx) {
   std::lock_guard lock(callback_mu);
@@ -28,9 +48,10 @@ static int inject(void* ctx, uint64_t chan, uint32_t audio, uint32_t video) {
   {
     std::lock_guard lock(callback_mu);
     cb = callbacks.at(chan);
+    expected_ssrcs[chan] = {audio, video};
   }
   const auto feed = [&](bool secondary, uint16_t seq) {
-    std::array<uint8_t, 15> p{0x80, uint8_t(secondary ? 0xe0 : 111)};
+    std::array<uint8_t, 23> p{0x90, uint8_t(secondary ? 0xe0 : 111)};
     p[2] = seq >> 8; p[3] = seq;
     const uint32_t timestamp = seq * 960;
     const uint32_t ssrc = secondary ? video : audio;
@@ -39,7 +60,11 @@ static int inject(void* ctx, uint64_t chan, uint32_t audio, uint32_t video) {
       p[8+i] = ssrc >> (24-i*8);
     }
     // Opus silence; video uses a small invalid payload (decoder must drop it).
-    p[12] = 0xf8; p[13] = 0xff; p[14] = 0xfe;
+    p[12] = 0xbe; p[13] = 0xde; p[14] = 0; p[15] = 1;
+    p[16] = 0x11; // extension id 1, two-byte transport sequence
+    const uint16_t transport_seq = (secondary ? 2000 : 1000) + seq;
+    p[17] = transport_seq >> 8; p[18] = transport_seq; p[19] = 0;
+    p[20] = 0xf8; p[21] = 0xff; p[22] = 0xfe;
     cb.fn(cb.ctx, p.data(), p.size());
   };
   for (uint16_t i = 0; i < 20; ++i) feed(true, i);
@@ -57,15 +82,38 @@ static int inject(void* ctx, uint64_t chan, uint32_t audio, uint32_t video) {
 }
 int main() {
   uint8_t local[32] = {1}, peer[32] = {2};
-  {
+  for (int enabled : {0, 1}) {
+    const uint64_t chan = 21 + enabled;
     std::unique_ptr<VeilMediaEngine, decltype(&veil_media_engine_destroy)> e(
-        veil_media_engine_create(21, local, peer), veil_media_engine_destroy);
+        veil_media_engine_create(chan, local, peer), veil_media_engine_destroy);
     assert(e);
+    assert(veil_media_engine_set_independent_transport_feedback(e.get(), enabled) == VEIL_MEDIA_OK);
     assert(veil_media_engine_set_mic_muted(e.get(), 1) == VEIL_MEDIA_OK);
     assert(veil_media_engine_start_audio(e.get(), 0, 1) == VEIL_MEDIA_OK);
     assert(veil_media_engine_start_video(e.get(), 0, 1, 150, 15) == VEIL_MEDIA_OK);
     const int result = veil_media_test_direct_call_planes(e.get(), inject, e.get());
     if (result) { std::fprintf(stderr, "direct isolation failed: %d\n", result); return 1; }
+    assert(veil_media_engine_set_independent_transport_feedback(e.get(), !enabled) == VEIL_MEDIA_ERR_STATE);
+    bool audio_feedback = false, video_feedback = false;
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    do {
+      {
+        std::lock_guard lock(callback_mu);
+        const auto [audio, video] = expected_ssrcs.at(chan);
+        for (const auto& [ssrc, base] : feedback[chan]) {
+          audio_feedback |= ssrc == audio && base >= 1000 && base < 1004;
+          video_feedback |= ssrc == video && base >= 2000 && base < 2020;
+        }
+      }
+      if (enabled && audio_feedback && video_feedback) break;
+      std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    } while (std::chrono::steady_clock::now() < deadline);
+    if (enabled) {
+      assert(audio_feedback && video_feedback);
+    } else {
+      std::lock_guard lock(callback_mu);
+      assert(feedback[chan].empty());
+    }
   }
   {
     std::unique_ptr<VeilGroupMediaEngine, decltype(&veil_media_group_engine_destroy)> e(
@@ -82,6 +130,30 @@ int main() {
     assert(veil_media_group_engine_stop_video(e.get()) == VEIL_MEDIA_OK);
     assert(veil_media_group_engine_stop_audio(e.get()) == VEIL_MEDIA_OK);
   }
+  setenv("VEIL_MEDIA_TEST_VIDEO", "1", 1);
+  for (int enabled : {0, 1}) {
+    std::unique_ptr<VeilMediaEngine, decltype(&veil_media_engine_destroy)> e(
+        veil_media_engine_create(50 + enabled, local, peer), veil_media_engine_destroy);
+    assert(e);
+    assert(veil_media_engine_set_independent_transport_feedback(e.get(), enabled) == VEIL_MEDIA_OK);
+    assert(veil_media_engine_start_video(e.get(), 1, 0, 150, 15) == VEIL_MEDIA_OK);
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    int before = 0;
+    while (before == 0 && std::chrono::steady_clock::now() < deadline) {
+      before = veil_media_test_video_bandwidth(e.get());
+      assert(before >= 0);
+      std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    assert(before > 0 && before <= 200000);
+    assert(veil_media_engine_set_video_bitrate(e.get(), 900, 15) == VEIL_MEDIA_OK);
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+    const int after = veil_media_test_video_bandwidth(e.get());
+    std::printf("video estimate enabled=%d: %d -> %d after 900-kbit profile\n", enabled, before, after);
+    if (enabled) assert(after > 0 && after <= 200000);
+    else assert(after >= 900000);
+  }
+  unsetenv("VEIL_MEDIA_TEST_VIDEO");
   assert(callbacks.empty());
+  std::puts("unicast: negotiated TWCC confirms separate audio/video SSRCs and counters; legacy mode sends none");
   std::puts("direct/group: Opus delivered with both video queues stalled; telemetry bounded; restart/teardown ok");
 }
