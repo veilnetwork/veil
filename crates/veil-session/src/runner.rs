@@ -201,7 +201,9 @@ struct RealtimeSender {
     handle: veil_transport::QuicDatagramHandle,
     tx: crate::datagram_flows::SessionDatagramTx,
     max_datagram_size: usize,
-    logged_send_kinds: u8,
+    // A shared fallback can carry several source slots. Observe each slot
+    // independently so its first send cannot hide a later producer's path.
+    logged_send_kinds: [u8; 4],
     congestion_drops: u64,
     last_congestion_log: std::time::Instant,
     broken: bool,
@@ -217,7 +219,7 @@ impl RealtimeSender {
             max_datagram_size: handle.max_size().unwrap_or(0),
             handle,
             tx,
-            logged_send_kinds: 0,
+            logged_send_kinds: [0; 4],
             congestion_drops: 0,
             last_congestion_log: std::time::Instant::now(),
             broken: false,
@@ -3521,9 +3523,11 @@ impl SessionRunner {
                     self.logger.info(
                         "session.realtime_datagram.enabled",
                         format!(
-                            "peer_id={} max_datagram_size={max_datagram_size} opaque_flows={}",
+                            "peer_id={} max_datagram_size={max_datagram_size} opaque_flows={} independent_available={} circuit_datagrams={}",
                             hex_short(&self.peer_id),
                             offer.peer_flows,
+                            offer.parallel.is_some() && offer.peer_flows && offer.peer_rotates,
+                            offer.peer_circuit_datagrams,
                         ),
                     );
                     RealtimeDatagramLane {
@@ -4194,12 +4198,16 @@ impl SessionRunner {
                             }
                             break;
                         }
-                        if lane.logged_send_kinds & lane_kind.bit() == 0 {
-                            lane.logged_send_kinds |= lane_kind.bit();
+                        if let Some(logged) = lane
+                            .logged_send_kinds
+                            .get_mut(usize::from(outgoing_priority))
+                            && *logged & lane_kind.bit() == 0
+                        {
+                            *logged |= lane_kind.bit();
                             self.logger.info(
                                 "session.realtime_datagram.first_send",
                                 format!(
-                                    "peer_id={} kind={} fragments={} wire_bytes={sent_wire_len}",
+                                    "peer_id={} kind={} fragments={} wire_bytes={sent_wire_len} local_slot={outgoing_priority} independent={using_parallel}",
                                     hex_short(&self.peer_id),
                                     lane_kind.label(),
                                     datagrams.len(),
