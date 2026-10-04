@@ -183,6 +183,7 @@ async fn await_next_input(
 /// lane. It exists only after capability AND transport negotiation succeed.
 struct RealtimeDatagramLane {
     handle: veil_transport::QuicDatagramHandle,
+    local_reliable: local_reliable_admission::LocalReliableAdmission,
     /// Whether the peer rotates its half too. False keeps the lane on the key
     /// derived at the handshake, which is what every peer without the
     /// capability expects to keep receiving under.
@@ -225,6 +226,9 @@ fn local_datagram_fits(priority: u8, wire_len: usize, available: usize) -> bool 
 #[cfg(test)]
 #[path = "quic_backlog_tests.rs"]
 mod quic_backlog_tests;
+
+#[path = "local_reliable_admission.rs"]
+mod local_reliable_admission;
 
 /// Tokio join handles detach when dropped; realtime receivers must instead be
 /// cancelled with their owning session so they cannot retain a QUIC connection
@@ -962,7 +966,8 @@ pub const WIRE_CHANNEL_CAPACITY: usize = 8;
 /// writer task — owns the `WriteHalf<BoxIoStream>` and
 /// drains pre-encrypted/pre-coalesced wire bytes pushed onto it from
 /// the runner's main loop. Each `write_all` is wrapped in a
-/// [`WRITE_PROGRESS_TIMEOUT`] deadline; on expiry the task exits, its
+/// [`WRITE_PROGRESS_TIMEOUT`] idle deadline, renewed by each successful
+/// partial write; on expiry the task exits, its
 /// `wire_rx` drops, and the runner sees `wire_tx.try_send` return Err
 /// on its next push — at which point the main loop closes the session
 /// via `on_primary_write_error`.
@@ -986,7 +991,7 @@ async fn writer_task(
         let wire_len = bytes.len();
         let trace_started = crate::rt_trace::rt_trace_enabled().then(std::time::Instant::now);
         let queued_behind = wire_rx.len();
-        match tokio::time::timeout(WRITE_PROGRESS_TIMEOUT, write_half.write_all(&bytes)).await {
+        match write_with_progress_timeout(&mut write_half, &bytes, WRITE_PROGRESS_TIMEOUT).await {
             Ok(Ok(())) => {
                 if let Some(started) = trace_started {
                     let elapsed = started.elapsed();
@@ -1016,7 +1021,7 @@ async fn writer_task(
                 logger.warn(
                     "session.writer.stalled",
                     format!(
-                        "peer_id={peer_id_short} write_all exceeded {:?} — closing writer; \
+                        "peer_id={peer_id_short} write made no progress for {:?} — closing writer; \
                          main loop will see wire channel disconnect on next push",
                         WRITE_PROGRESS_TIMEOUT,
                     ),
@@ -1030,6 +1035,28 @@ async fn writer_task(
     // unblocks; session teardown proceeds.
     let _ = write_half.shutdown().await;
 }
+
+/// Preserve the complete ordered blob even when a small admission window
+/// requires many RTTs. A progressing writer must not be treated as stalled.
+async fn write_with_progress_timeout<W: tokio::io::AsyncWrite + Unpin>(
+    writer: &mut W,
+    bytes: &[u8],
+    idle: std::time::Duration,
+) -> Result<std::io::Result<()>, tokio::time::error::Elapsed> {
+    let mut written = 0;
+    while written < bytes.len() {
+        match tokio::time::timeout(idle, writer.write(&bytes[written..])).await? {
+            Ok(0) => return Ok(Err(std::io::ErrorKind::WriteZero.into())),
+            Ok(len) => written += len,
+            Err(error) => return Ok(Err(error)),
+        }
+    }
+    Ok(Ok(()))
+}
+
+#[cfg(test)]
+#[path = "writer_progress_tests.rs"]
+mod writer_progress_tests;
 
 /// Spawn a writer task tied to one `WriteHalf<BoxIoStream>` + one
 /// `wire_rx`. Returns the JoinHandle so the main loop can `await` it
@@ -3408,6 +3435,9 @@ impl SessionRunner {
                         ),
                     );
                     RealtimeDatagramLane {
+                        local_reliable: local_reliable_admission::LocalReliableAdmission::new(
+                            offer.handle.clone(),
+                        ),
                         handle: offer.handle,
                         peer_rotates: offer.peer_rotates,
                         peer_circuit_datagrams: offer.peer_circuit_datagrams,
@@ -3857,6 +3887,7 @@ impl SessionRunner {
                 let mut datagram_drained = 0usize;
                 let mut disable_realtime_sender = false;
                 if let Some(lane) = realtime_lane.as_mut() {
+                    lane.local_reliable.expire(std::time::Instant::now());
                     for _ in 0..PQ_DRAIN_FRAMES_PER_PASS {
                         let Some((outgoing_priority, outgoing)) = pq.pop_datagram_if(|frame| {
                             decode_realtime_lane_frame(frame).is_some_and(|(_, _, kind)| {
@@ -3868,6 +3899,11 @@ impl SessionRunner {
                         };
                         let (_, body, lane_kind) = decode_realtime_lane_frame(&outgoing)
                             .expect("realtime queue predicate accepted this frame");
+                        lane.local_reliable.observe(
+                            outgoing_priority,
+                            &outgoing,
+                            std::time::Instant::now(),
+                        );
                         let datagrams = match lane.tx.encode_frame(
                             local_datagram_flow(outgoing_priority, body, lane_kind),
                             &outgoing,
