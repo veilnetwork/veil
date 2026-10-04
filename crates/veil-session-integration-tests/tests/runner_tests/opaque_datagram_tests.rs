@@ -16,7 +16,7 @@ async fn runner_channels_over_real_quic(
     shared: bool,
     resumed: bool,
 ) {
-    runner_channels_with_backlog(flows, parallel, rotate, shared, resumed, false).await;
+    runner_channels_with_backlog(flows, parallel, rotate, shared, resumed, None).await;
 }
 
 async fn runner_channels_with_backlog(
@@ -25,8 +25,9 @@ async fn runner_channels_with_backlog(
     rotate: bool,
     shared: bool,
     resumed: bool,
-    blocked_reliable: bool,
+    reliable_priority: Option<u8>,
 ) {
+    let blocked_reliable = reliable_priority.is_some();
     let context = Arc::new(TransportContext::for_debug().unwrap());
     let registry = Arc::new(ParallelRegistry::default());
     let listener: Option<Arc<dyn TransportListener>> = if shared {
@@ -362,7 +363,10 @@ async fn runner_channels_with_backlog(
                                     let mut frame = encode_header(&header).to_vec();
                                     frame.extend(body);
                                     senders[direction]
-                                        .send((1, veil_bufpool::pooled_shared_from_vec(frame)))
+                                        .send((
+                                            reliable_priority.unwrap(),
+                                            veil_bufpool::pooled_shared_from_vec(frame),
+                                        ))
                                         .await
                                         .unwrap();
                                 }
@@ -446,7 +450,22 @@ async fn runner_channels_with_backlog(
 
 #[tokio::test]
 async fn local_sources_keep_sending_with_a_full_reliable_writer_queue() {
-    runner_channels_with_backlog(true, true, false, true, false, true).await;
+    runner_channels_with_backlog(true, true, false, true, false, Some(1)).await;
+}
+
+#[tokio::test]
+async fn local_sources_bypass_reliable_primary_backlog() {
+    runner_channels_with_backlog(true, true, false, true, false, Some(0)).await;
+}
+
+#[tokio::test]
+async fn local_sources_bypass_reliable_secondary_backlog() {
+    runner_channels_with_backlog(true, true, false, true, false, Some(2)).await;
+}
+
+#[tokio::test]
+async fn local_sources_bypass_reliable_background_backlog() {
+    runner_channels_with_backlog(true, true, false, true, false, Some(3)).await;
 }
 
 #[tokio::test]
