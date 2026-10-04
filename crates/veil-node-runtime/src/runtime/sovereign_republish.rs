@@ -353,7 +353,7 @@ impl NodeRuntime {
                             interval.reset_immediately();
                         }
                         _ = first_network_tick.tick(), if first_network_publish_pending => {
-                            if sessions_for_first_publish.read().is_ok_and(|reg| reg.len() > 0) {
+                            if sessions_for_first_publish.read().is_ok_and(|reg| !reg.is_empty()) {
                                 first_network_publish_pending = false;
                                 last_topology_publish_at = Some(tokio::time::Instant::now());
                                 interval.reset_immediately();
@@ -368,7 +368,7 @@ impl NodeRuntime {
                         _ = route_updated.notified() => {
                             let now = tokio::time::Instant::now();
                             if first_network_publish_pending {
-                                if !sessions_for_first_publish.read().is_ok_and(|reg| reg.len() > 0) {
+                                if !sessions_for_first_publish.read().is_ok_and(|reg| !reg.is_empty()) {
                                     continue;
                                 }
                                 first_network_publish_pending = false;
@@ -507,7 +507,7 @@ impl NodeRuntime {
                             }
                         }
                         _ = interval.tick() => {
-                            if sessions_for_first_publish.read().is_ok_and(|reg| reg.len() > 0) {
+                            if sessions_for_first_publish.read().is_ok_and(|reg| !reg.is_empty()) {
                                 first_network_publish_pending = false;
                             }
                             // Document.

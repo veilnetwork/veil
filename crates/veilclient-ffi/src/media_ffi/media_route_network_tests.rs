@@ -28,6 +28,10 @@ impl Drop for Stand {
 }
 impl Stand {
     async fn new() -> Self {
+        Self::with_middle_count(1).await
+    }
+    async fn with_middle_count(middle_count: usize) -> Self {
+        assert!(middle_count >= 1);
         let mut s = Self {
             _dirs: Vec::new(),
             nodes: Vec::new(),
@@ -35,7 +39,7 @@ impl Stand {
             pipes: Vec::new(),
             delivered_cells: Arc::new(Mutex::new(HashMap::new())),
         };
-        for _ in 0..4 {
+        for _ in 0..middle_count + 3 {
             let dir = tempfile::tempdir().unwrap();
             let path = dir.path().join("config.toml");
             let mut cfg = veil_cfg::build_stub_config_with_ephemeral_identity(false).unwrap();
@@ -87,15 +91,18 @@ impl Stand {
         }
         // A(0) and C(1) -> middle(2) -> rendezvous(3). Relays use ordinary
         // priority for every cell; producer lanes are endpoint-local.
-        for (a, b) in [(0, 2), (1, 2), (2, 3)] {
-            s.connect(a, b);
-            s.connect(b, a);
+        let middles: Vec<_> = std::iter::once(2).chain(4..middle_count + 3).collect();
+        for &middle in &middles {
+            for (a, b) in [(0, middle), (1, middle), (middle, 3)] {
+                s.connect(a, b);
+                s.connect(b, a);
+            }
         }
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_secs();
-        for index in [2, 3] {
+        for index in middles.iter().copied().chain(std::iter::once(3)) {
             let relay = &s.services[index];
             let id = relay.local_node_id();
             let identity = &relay.identity.local_identity;
@@ -118,10 +125,12 @@ impl Stand {
         }
         for index in [0, 1] {
             let svc = &s.services[index];
-            svc.dht.add_contact(veil_dht::routing::Contact::new(
-                s.services[2].local_node_id(),
-                "tcp://127.0.0.1:1",
-            ));
+            for &middle in &middles {
+                svc.dht.add_contact(veil_dht::routing::Contact::new(
+                    s.services[middle].local_node_id(),
+                    "tcp://127.0.0.1:1",
+                ));
+            }
             svc.publish_stream_rendezvous_ad(
                 s.services[3].local_node_id(),
                 svc.onion_stream_local_cookie(),
@@ -317,6 +326,21 @@ async fn expect_packet(rx: &mut mpsc::Receiver<Received>, wanted: &[u8]) -> Inst
     .await
     .unwrap()
 }
+async fn expect_packets(rx: &mut mpsc::Receiver<Received>, wanted: &[Vec<u8>]) {
+    let mut received = vec![false; wanted.len()];
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while received.iter().any(|seen| !seen) {
+            let packet = rx.recv().await.unwrap().packet;
+            if let Some(index) = wanted.iter().position(|expected| *expected == packet) {
+                assert!(!received[index], "duplicate media packet");
+                received[index] = true;
+            }
+        }
+    })
+    .await
+    .unwrap();
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn private_routes_negotiate_splice_and_repair_while_video_ingress_is_stalled() {
     let stand = Stand::new().await;
@@ -464,6 +488,91 @@ async fn private_routes_negotiate_splice_and_repair_while_video_ingress_is_stall
             !pipe.is_finished(),
             "ordinary relay forwarding must stay live"
         );
+    }
+    stand.stop().await;
+}
+
+/// Distinct local producers select different real first-hop sessions when
+/// three middles exist. The same relay-header/queue assertions as the scarce
+/// four-node stand apply to every forwarded build, probe and media cell.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn private_media_paths_use_distinct_first_hops_when_alternatives_exist() {
+    let stand = Stand::with_middle_count(3).await;
+    let a = &stand.services[0];
+    let c = &stand.services[1];
+    let rendezvous = &stand.services[3];
+    let mut ca = channel(a.local_node_id(), c.local_node_id(), [0xa1; 32], [0xc1; 32]);
+    let mut cc = channel(c.local_node_id(), a.local_node_id(), [0xc1; 32], [0xa1; 32]);
+    let registry = rendezvous.dispatcher.circuit_rendezvous.as_ref().unwrap();
+    wait_until(|| {
+        registry.lookup(&a.onion_stream_local_cookie()).is_some()
+            && registry.lookup(&c.onion_stream_local_cookie()).is_some()
+    })
+    .await;
+    stand.copy_ads(0, 1);
+    stand.copy_ads(1, 0);
+    ca.routes.start(&tokio::runtime::Handle::current());
+    cc.routes.start(&tokio::runtime::Handle::current());
+    tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            if ca.routes.outgoing_for_test().await.len() == 2
+                && cc.routes.outgoing_for_test().await.len() == 2
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    for (routes, endpoint) in [(&ca.routes, a), (&cc.routes, c)] {
+        let outgoing = routes.outgoing_for_test().await;
+        let file_first_hop = registry
+            .lookup(&endpoint.onion_stream_local_cookie())
+            .unwrap()
+            .prev_link;
+        assert_ne!(outgoing[0].first_hop, outgoing[1].first_hop);
+        assert_ne!(outgoing[0].first_hop, file_first_hop);
+        assert_ne!(outgoing[1].first_hop, file_first_hop);
+    }
+    for seq in 0..12 {
+        let audio = packet(111, seq);
+        let video = packet(96, seq);
+        assert_eq!(send(ca.id, &audio), 0);
+        assert_eq!(send(ca.id, &video), 0);
+        expect_packets(&mut cc.rx, &[audio.clone(), video.clone()]).await;
+        assert_eq!(send(cc.id, &audio), 0);
+        assert_eq!(send(cc.id, &video), 0);
+        expect_packets(&mut ca.rx, &[audio, video]).await;
+    }
+    // Rebuilding retains first-hop isolation while circuit ids change.
+    let before = ca.routes.outgoing_for_test().await;
+    unsafe {
+        veil_media_repair_channel(ca.id);
+    }
+    tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            let after = ca.routes.outgoing_for_test().await;
+            if after.len() == 2
+                && after
+                    .iter()
+                    .all(|r| r.origin != before[r.plane as usize].origin)
+            {
+                assert_ne!(after[0].first_hop, after[1].first_hop);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let after = packet(111, 0x79);
+    assert_eq!(send(ca.id, &after), 0);
+    expect_packet(&mut cc.rx, &after).await;
+    drop(ca);
+    drop(cc);
+    for pipe in &stand.pipes {
+        assert!(!pipe.is_finished(), "neutral forwarding must remain live");
     }
     stand.stop().await;
 }
