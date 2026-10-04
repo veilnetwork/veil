@@ -256,3 +256,26 @@ fn opaque_prefix_is_included_in_mtu_budget_and_bad_frames_do_not_allocate_channe
     }
     assert_eq!(complete, Some(frame.to_vec()));
 }
+
+#[test]
+fn complete_frame_wire_bound_covers_legacy_and_opaque_fragmentation() {
+    for flows in [false, true] {
+        for ceiling in [
+            MAX_REALTIME_FRAME.div_ceil(MAX_FRAGMENTS)
+                + PREFIX_LEN
+                + crate::realtime_datagram::FRAGMENT_OVERHEAD,
+            1200,
+            MAX_REALTIME_FRAME + PREFIX_LEN + crate::realtime_datagram::FRAGMENT_OVERHEAD,
+        ] {
+            let mut tx = SessionDatagramTx::new(&KEY, &SESSION, flows);
+            let datagrams = tx
+                .encode_frame(0, &vec![7; MAX_REALTIME_FRAME], ceiling)
+                .unwrap();
+            let wire_bytes: usize = datagrams.iter().map(Vec::len).sum();
+            assert!(wire_bytes <= MAX_FRAME_WIRE_BYTES);
+            if flows && datagrams.len() == MAX_FRAGMENTS {
+                assert_eq!(wire_bytes, MAX_FRAME_WIRE_BYTES);
+            }
+        }
+    }
+}
