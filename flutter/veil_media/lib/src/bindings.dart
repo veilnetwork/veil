@@ -879,3 +879,36 @@ int Function(Pointer<VeilMediaEngineHandle>, int)?
 final int Function(Pointer<VeilMediaEngineHandle>, int)?
     veilMediaEngineSetIndependentTransportFeedback =
     _lookupIndependentTransportFeedback();
+
+// Additive group adaptation ABI: older bundled engines keep their fixed budget.
+int Function(Pointer<VeilGroupMediaEngineHandle>, int, int)?
+    _lookupGroupVideoBitrate() {
+  try {
+    return nativeLib
+        .lookup<
+            NativeFunction<
+                Int32 Function(Pointer<VeilGroupMediaEngineHandle>, Int32,
+                    Int32)>>('veil_media_group_engine_set_video_bitrate')
+        .asFunction();
+  } on ArgumentError {
+    return null;
+  }
+}
+
+Pointer<Utf8> Function(Pointer<VeilGroupMediaEngineHandle>)?
+    _lookupGroupStats() {
+  try {
+    return nativeLib
+        .lookup<
+                NativeFunction<
+                    Pointer<Utf8> Function(
+                        Pointer<VeilGroupMediaEngineHandle>)>>(
+            'veil_media_group_engine_get_stats')
+        .asFunction();
+  } on ArgumentError {
+    return null;
+  }
+}
+
+final veilMediaGroupEngineSetVideoBitrate = _lookupGroupVideoBitrate();
+final veilMediaGroupEngineGetStats = _lookupGroupStats();

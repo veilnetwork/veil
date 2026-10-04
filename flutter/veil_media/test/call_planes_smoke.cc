@@ -1,5 +1,6 @@
 #include "veil_media_engine.h"
 #include <array>
+#include <atomic>
 #include <cassert>
 #include <chrono>
 #include <cstdio>
@@ -15,13 +16,25 @@
 using Injector = int (*)(void*, uint64_t, uint32_t, uint32_t);
 extern "C" int veil_media_test_direct_call_planes(VeilMediaEngine*, Injector, void*);
 extern "C" int veil_media_test_group_call_planes(VeilGroupMediaEngine*, Injector, void*);
+extern "C" int veil_media_test_group_fanout_packet(VeilGroupMediaEngine*, int);
 extern "C" int veil_media_test_video_bandwidth(VeilMediaEngine*);
 struct Callback { void (*fn)(void*, const uint8_t*, size_t); void* ctx; };
+static std::atomic<bool> hold_fanout_video{false};
+static std::atomic<bool> fanout_video_entered{false};
+static std::atomic<bool> fanout_audio_passed{false};
 static std::mutex callback_mu;
 static std::map<uint64_t, Callback> callbacks;
 static std::map<uint64_t, std::set<std::pair<uint32_t, uint16_t>>> feedback;
 static std::map<uint64_t, std::pair<uint32_t, uint32_t>> expected_ssrcs;
 extern "C" int veil_media_send_datagram(uint64_t chan, const uint8_t* p, size_t len) {
+  if (chan == 90 && len >= 12) {
+    if ((p[1] & 0x7f) == 96 && hold_fanout_video.load()) {
+      fanout_video_entered.store(true);
+      while (hold_fanout_video.load()) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    } else if ((p[1] & 0x7f) == 111) {
+      fanout_audio_passed.store(true);
+    }
+  }
   std::lock_guard lock(callback_mu);
   for (size_t offset = 0; offset + 4 <= len;) {
     const uint8_t* b = p + offset;
@@ -91,6 +104,46 @@ static int inject(void* ctx, uint64_t chan, uint32_t audio, uint32_t video) {
   }
   return 0;
 }
+static uint64_t group_stat(VeilGroupMediaEngine* engine, const char* name) {
+  char* json = veil_media_group_engine_get_stats(engine);
+  assert(json);
+  const std::string key = std::string("\"") + name + "\":";
+  const char* at = std::strstr(json, key.c_str());
+  assert(at);
+  const uint64_t value = std::strtoull(at + key.size(), nullptr, 10);
+  veil_media_free_string(json);
+  return value;
+}
+static int inject_group(void* ctx, uint64_t chan, uint32_t audio, uint32_t video) {
+  if (inject(nullptr, chan, audio, video) != 0) return 1;
+  auto* engine = static_cast<VeilGroupMediaEngine*>(ctx);
+  const auto start = std::chrono::steady_clock::now();
+  char* json = veil_media_group_engine_get_stats(engine);
+  const bool valid = json && std::strstr(json, "\"worker_stalled\":0") &&
+                     std::strstr(json, "\"video_worker_stalled\":1");
+  veil_media_free_string(json);
+  if (!valid || veil_media_group_engine_set_video_bitrate(engine, 100, 8) != VEIL_MEDIA_ERR_STATE)
+    return 2;
+  return std::chrono::steady_clock::now() - start < std::chrono::milliseconds(250) ? 0 : 3;
+}
+static uint32_t group_ssrc(const uint8_t id[32], uint32_t domain = 0x47415544u) {
+  uint32_t hash = 2166136261u;
+  for (size_t i = 0; i < 32; ++i) { hash ^= id[i]; hash *= 16777619u; }
+  hash ^= domain;
+  return hash == 0 ? 1 : hash;
+}
+static void report(uint64_t chan, uint32_t reporter, uint32_t source,
+                   uint8_t lost, uint32_t jitter) {
+  std::array<uint8_t, 32> packet{0x81, 201, 0, 7};
+  const auto word = [&](size_t at, uint32_t value) {
+    for (int i = 0; i < 4; ++i) packet[at+i] = value >> (24-i*8);
+  };
+  word(4, reporter); word(8, source); packet[12] = lost;
+  word(16, 100); word(20, jitter);
+  Callback callback;
+  { std::lock_guard lock(callback_mu); callback = callbacks.at(chan); }
+  callback.fn(callback.ctx, packet.data(), packet.size());
+}
 int main() {
   uint8_t local[32] = {1}, peer[32] = {2};
   for (int enabled : {0, 1}) {
@@ -134,7 +187,7 @@ int main() {
     assert(veil_media_group_engine_add_peer(e.get(), 22, peer) == VEIL_MEDIA_OK);
     assert(veil_media_group_engine_start_audio(e.get()) == VEIL_MEDIA_OK);
     assert(veil_media_group_engine_start_video(e.get()) == VEIL_MEDIA_OK);
-    const int result = veil_media_test_group_call_planes(e.get(), inject, nullptr);
+    const int result = veil_media_test_group_call_planes(e.get(), inject_group, e.get());
     if (result) { std::fprintf(stderr, "group isolation failed: %d\n", result); return 2; }
     assert(veil_media_group_engine_remove_peer(e.get(), peer) == VEIL_MEDIA_OK);
     assert(veil_media_group_engine_add_peer(e.get(), 23, peer) == VEIL_MEDIA_OK);
@@ -189,6 +242,82 @@ int main() {
     std::printf("actual encoded video frames: 2-fps=%llu/2.2s, recovered=%llu/1.2s, 1-fps=%llu/2.2s\n",
         static_cast<unsigned long long>(low), static_cast<unsigned long long>(recovered),
         static_cast<unsigned long long>(floor));
+  }
+  {
+    uint8_t other[32] = {3};
+    std::unique_ptr<VeilGroupMediaEngine, decltype(&veil_media_group_engine_destroy)> e(
+        veil_media_group_engine_create(local), veil_media_group_engine_destroy);
+    assert(e);
+    assert(veil_media_group_engine_set_mic_muted(e.get(), 1) == VEIL_MEDIA_OK);
+    assert(veil_media_group_engine_add_peer(e.get(), 80, peer) == VEIL_MEDIA_OK);
+    assert(veil_media_group_engine_add_peer(e.get(), 81, other) == VEIL_MEDIA_OK);
+    assert(veil_media_group_engine_start_audio(e.get()) == VEIL_MEDIA_OK);
+    assert(veil_media_group_engine_start_video(e.get()) == VEIL_MEDIA_OK);
+    const auto report_time = std::chrono::steady_clock::now();
+    // The good participant's later RR must not hide the bad participant.
+    report(80, group_ssrc(peer), group_ssrc(local), 32, 4800);
+    report(81, group_ssrc(other), group_ssrc(local), 0, 48);
+    // A video report cannot inflate the audio quality sample.
+    report(81, group_ssrc(other, 0x47564944u), group_ssrc(local, 0x47564944u), 255, 900000);
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (group_stat(e.get(), "audio_feedback_reports") != 2 && std::chrono::steady_clock::now() < deadline)
+      std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    assert(group_stat(e.get(), "audio_feedback_reports") == 2);
+    assert(group_stat(e.get(), "tx_loss_pct") == 13);
+    assert(group_stat(e.get(), "tx_jitter_ms") == 100);
+    assert(veil_media_group_engine_set_video_bitrate(e.get(), 45, 2) == VEIL_MEDIA_OK);
+    assert(group_stat(e.get(), "max_fps") == 2);
+    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    const auto before = group_stat(e.get(), "video_tx_frames");
+    std::this_thread::sleep_for(std::chrono::milliseconds(2200));
+    const auto low = group_stat(e.get(), "video_tx_frames") - before;
+    assert(low >= 1 && low <= 6);
+    assert(veil_media_group_engine_set_video_bitrate(e.get(), 150, 12) == VEIL_MEDIA_OK);
+    // Reconfigure is asynchronous inside WebRTC; let earlier encoder work
+    // drain before measuring the steady capture cadence of the new target.
+    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    const auto recovered_start = group_stat(e.get(), "video_tx_frames");
+    std::this_thread::sleep_for(std::chrono::milliseconds(1200));
+    const auto recovered = group_stat(e.get(), "video_tx_frames") - recovered_start;
+    assert(recovered >= 8);
+    assert(veil_media_group_engine_set_video_bitrate(e.get(), 30, 1) == VEIL_MEDIA_OK);
+    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    const auto floor_start = group_stat(e.get(), "video_tx_frames");
+    std::this_thread::sleep_for(std::chrono::milliseconds(2200));
+    const auto floor = group_stat(e.get(), "video_tx_frames") - floor_start;
+    assert(floor >= 1 && floor <= 3);
+    std::printf("group actual encoded frames: 2-fps=%llu/2.2s, 12-fps=%llu/1.2s, 1-fps=%llu/2.2s\n",
+        static_cast<unsigned long long>(low), static_cast<unsigned long long>(recovered),
+        static_cast<unsigned long long>(floor));
+    // No repeated reports were injected. Cached poor quality must expire.
+    std::this_thread::sleep_until(report_time + std::chrono::milliseconds(15500));
+    assert(group_stat(e.get(), "audio_feedback_reports") == 0);
+    assert(veil_media_group_engine_stop_video(e.get()) == VEIL_MEDIA_OK);
+    assert(veil_media_group_engine_set_video_bitrate(e.get(), 150, 15) == VEIL_MEDIA_ERR_STATE);
+  }
+  {
+    std::unique_ptr<VeilGroupMediaEngine, decltype(&veil_media_group_engine_destroy)> e(
+        veil_media_group_engine_create(local), veil_media_group_engine_destroy);
+    assert(e);
+    assert(veil_media_group_engine_add_peer(e.get(), 90, peer) == VEIL_MEDIA_OK);
+    hold_fanout_video.store(true);
+    int video_result = -1, audio_result = -1;
+    std::thread video([&] { video_result = veil_media_test_group_fanout_packet(e.get(), 1); });
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+    while (!fanout_video_entered.load() && std::chrono::steady_clock::now() < deadline)
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    const bool video_held = fanout_video_entered.load();
+    std::thread audio([&] { audio_result = veil_media_test_group_fanout_packet(e.get(), 0); });
+    deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(200);
+    while (!fanout_audio_passed.load() && std::chrono::steady_clock::now() < deadline)
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    const bool audio_while_held = fanout_audio_passed.load();
+    hold_fanout_video.store(false);
+    video.join(); audio.join();
+    assert(video_held && audio_while_held && video_result == 0 && audio_result == 0);
+    assert(veil_media_group_engine_remove_peer(e.get(), peer) == VEIL_MEDIA_OK);
+    assert(veil_media_test_group_fanout_packet(e.get(), 0) != 0);
+    std::puts("group fanout: audio passed while video send was held; removed peer excluded");
   }
   unsetenv("VEIL_MEDIA_TEST_VIDEO");
   assert(callbacks.empty());

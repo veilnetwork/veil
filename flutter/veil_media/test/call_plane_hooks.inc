@@ -99,4 +99,13 @@ extern "C" int veil_media_test_video_bandwidth(VeilMediaEngine* e) {
   return bandwidth;
 }
 
+// Exercises the production fanout independently of codec pacing. The mocked
+// Veil callback can stall video while a second thread submits audio.
+extern "C" int veil_media_test_group_fanout_packet(VeilGroupMediaEngine* e,
+                                                   int secondary) {
+  std::array<uint8_t, 15> packet{0x80, uint8_t(secondary ? 96 : 111)};
+  webrtc::PacketOptions options;
+  return e->ws->fanout->SendRtp(packet, options) ? 0 : 1;
+}
+
 #pragma GCC visibility pop

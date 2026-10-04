@@ -328,11 +328,16 @@ class GroupFanoutTransport : public webrtc::Transport {
 
   bool SendRtp(std::span<const uint8_t> packet,
                const webrtc::PacketOptions& options) override {
-    std::lock_guard<std::mutex> lock(mu_);
+    // Membership is caller-owned opaque handles, not raw engine pointers.
+    // Snapshot under a short lock; video/RTCP sends must not hold audio here.
+    // A removed/closed handle rejects a late already-selected send in Veil.
+    const auto channels = Snapshot();
     bool any = false;
-    for (const uint64_t chan : channels_) {
-      any = veil_media_send_datagram(chan, packet.data(), packet.size()) == 0 ||
-            any;
+    for (const uint64_t chan : channels) {
+      const bool sent = veil_media_send_datagram(chan, packet.data(), packet.size()) == 0;
+      if (!sent && !veil_media::IsSecondaryInboundRtp(packet))
+        audio_drops_.fetch_add(1, std::memory_order_relaxed);
+      any = sent || any;
     }
     if (any && options.packet_id != -1) {
       (veil_media::IsSecondaryInboundRtp(packet) ? video_call_ : call_)->OnSentPacket(
@@ -344,16 +349,26 @@ class GroupFanoutTransport : public webrtc::Transport {
   bool SendRtcp(std::span<const uint8_t> packet,
                 const webrtc::PacketOptions& options) override {
     (void)options;
-    std::lock_guard<std::mutex> lock(mu_);
+    // Membership is caller-owned opaque handles, not raw engine pointers.
+    // Snapshot under a short lock; video/RTCP sends must not hold audio here.
+    // A removed/closed handle rejects a late already-selected send in Veil.
+    const auto channels = Snapshot();
     bool any = false;
-    for (const uint64_t chan : channels_) {
+    for (const uint64_t chan : channels) {
       any = veil_media_send_datagram(chan, packet.data(), packet.size()) == 0 ||
             any;
     }
     return any;
   }
 
+  uint64_t audio_drops() const { return audio_drops_.load(std::memory_order_relaxed); }
+
  private:
+  std::vector<uint64_t> Snapshot() {
+    std::lock_guard<std::mutex> lock(mu_);
+    return channels_;
+  }
+  std::atomic<uint64_t> audio_drops_{0};
   webrtc::Call* const call_;
   webrtc::Call* const video_call_;
   std::mutex mu_;
@@ -952,7 +967,8 @@ struct WebrtcState {
 #endif
 };
 
-bool should_encode_video_frame(WebrtcState* ws) {
+template <typename VideoState>
+bool should_encode_video_frame(VideoState* ws) {
   if (ws == nullptr) return false;
   const int fps = ws->video_max_fps.load(std::memory_order_relaxed);
   if (fps <= 0) return true;
@@ -1020,6 +1036,9 @@ struct GroupWebrtcState {
   webrtc::VideoSendStream* video_send_stream = nullptr;
   std::thread test_video_thread;
   std::atomic<bool> test_video_run{false};
+  int video_target_bitrate_bps = 0;
+  std::atomic<int> video_max_fps{0};
+  std::atomic<int64_t> video_last_encoded_frame_us{0};
   std::unique_ptr<veil_media::CameraCapturer> camera;
   std::unique_ptr<veil_media::ScreenCapturer> screen;
   std::map<std::string, std::unique_ptr<GroupPeerState>> peers;
@@ -1691,6 +1710,7 @@ int veil_media_group_engine_add_peer(VeilGroupMediaEngine* engine,
   peer->shim = std::make_unique<veil_media::VeilTransportShim>(
       veil_chan, ws->call.get(), ws->network_tq.get(),
       ws->video_call.get(), ws->video_network_tq.get());
+  peer->shim->SetLocalAudioSsrc(local_audio_ssrc);
   peer->shim->Start();
   peer->video_sink = std::make_unique<VeilVideoSink>();
   ws->fanout->Add(veil_chan);
@@ -1987,6 +2007,7 @@ int veil_media_group_engine_start_video(VeilGroupMediaEngine* engine) {
         const int configured = std::atoi(value);
         if (configured > 0) kbps = configured;
       }
+      kbps = std::clamp(kbps, 30, 2500);
       const int bps = kbps * 1000;
       webrtc::VideoEncoderConfig ec;
       ec.codec_type = webrtc::kVideoCodecVP8;
@@ -2010,6 +2031,9 @@ int veil_media_group_engine_start_video(VeilGroupMediaEngine* engine) {
             ws->video_source.get(),
             webrtc::DegradationPreference::MAINTAIN_FRAMERATE);
         ws->video_send_stream->Start();
+        ws->video_target_bitrate_bps = bps;
+        ws->video_max_fps.store(15, std::memory_order_relaxed);
+        ws->video_last_encoded_frame_us.store(0, std::memory_order_relaxed);
       }
     }
     for (auto& entry : ws->peers) {
@@ -2040,8 +2064,9 @@ int veil_media_group_engine_start_video(VeilGroupMediaEngine* engine) {
             y[row * width + col] =
                 static_cast<uint8_t>(row + col + frame);
         std::fill(v.begin(), v.end(), static_cast<uint8_t>(128 + frame));
-        push_i420(ws->video_source.get(), y.data(), u.data(), v.data(), width,
-                  height, width, chroma_width, chroma_width, 0);
+        if (should_encode_video_frame(ws))
+          push_i420(ws->video_source.get(), y.data(), u.data(), v.data(), width,
+                    height, width, chroma_width, chroma_width, 0);
         ++frame;
         std::this_thread::sleep_for(std::chrono::milliseconds(66));
       }
@@ -2052,6 +2077,95 @@ int veil_media_group_engine_start_video(VeilGroupMediaEngine* engine) {
   return VEIL_MEDIA_OK;
 #else
   return VEIL_MEDIA_ERR_STATE;
+#endif
+}
+
+int veil_media_group_engine_set_video_bitrate(VeilGroupMediaEngine* engine,
+                                               int max_bitrate_kbps, int max_fps) {
+  if (!engine) return VEIL_MEDIA_ERR_ARG;
+#if defined(VEIL_MEDIA_HAVE_WEBRTC)
+  if (!engine->ws || !engine->video_running.load()) return VEIL_MEDIA_ERR_STATE;
+  GroupWebrtcState* ws = engine->ws.get();
+  int rc = VEIL_MEDIA_ERR_STATE;
+  const bool scheduled = veil_media::run_on_with_timeout(ws->video_worker_tq.get(), [&] {
+    if (!ws->video_send_stream) return;
+    int kbps = max_bitrate_kbps > 0 ? max_bitrate_kbps : 150;
+    if (const char* value = std::getenv("VEIL_MEDIA_VIDEO_KBPS")) {
+      const int configured = std::atoi(value);
+      if (configured > 0) kbps = configured;
+    }
+    kbps = std::clamp(kbps, 30, 2500);
+    const int fps = std::clamp(max_fps > 0 ? max_fps : 15, 1, 60);
+    const int bps = kbps * 1000;
+    if (ws->video_target_bitrate_bps != bps || ws->video_max_fps.load() != fps) {
+      webrtc::VideoEncoderConfig ec;
+      ec.codec_type = webrtc::kVideoCodecVP8;
+      ec.video_format = webrtc::SdpVideoFormat::VP8();
+      ec.encoder_specific_settings = resilient_vp8_settings();
+      ec.content_type = webrtc::VideoEncoderConfig::ContentType::kRealtimeVideo;
+      ec.number_of_streams = 1;
+      ec.max_bitrate_bps = bps;
+      webrtc::VideoStream layer;
+      layer.active = true;
+      layer.min_bitrate_bps = 30000;
+      layer.target_bitrate_bps = bps * 2 / 3;
+      layer.max_bitrate_bps = bps;
+      layer.max_framerate = fps;
+      layer.max_qp = 63;
+      ec.simulcast_layers.push_back(layer);
+      ws->video_send_stream->ReconfigureVideoEncoder(std::move(ec));
+      ws->video_target_bitrate_bps = bps;
+      ws->video_max_fps.store(fps, std::memory_order_relaxed);
+      ws->video_last_encoded_frame_us.store(0, std::memory_order_relaxed);
+    }
+    rc = VEIL_MEDIA_OK;
+  }, std::chrono::milliseconds(20));
+  return scheduled ? rc : VEIL_MEDIA_ERR_STATE;
+#else
+  (void)max_bitrate_kbps;
+  (void)max_fps;
+  return VEIL_MEDIA_ERR_STATE;
+#endif
+}
+
+char* veil_media_group_engine_get_stats(VeilGroupMediaEngine* engine) {
+  if (!engine) return nullptr;
+#if defined(VEIL_MEDIA_HAVE_WEBRTC)
+  if (!engine->ws) return nullptr;
+  GroupWebrtcState* ws = engine->ws.get();
+  int reports = 0, loss = 0, jitter = 0;
+  int64_t rtt = 0;
+  uint64_t video_frames = 0;
+  int fps = 0, kbps = 0;
+  const int64_t now_us = webrtc::TimeMicros();
+  for (const auto& entry : ws->peers) {
+    const auto report = entry.second->shim->audio_feedback();
+    if (report.arrived_us <= 0 || report.arrived_us > now_us ||
+        now_us - report.arrived_us > 15'000'000) continue;
+    ++reports;
+    loss = std::max(loss, report.loss_pct);
+    jitter = std::max(jitter, report.jitter_ms);
+    rtt = std::max(rtt, report.rtt_ms);
+  }
+  const bool audio_sampled = veil_media::run_on_with_timeout(
+      ws->worker_tq.get(), [] {}, std::chrono::milliseconds(20));
+  const bool video_sampled = veil_media::run_on_with_timeout(ws->video_worker_tq.get(), [&] {
+    if (ws->video_send_stream) video_frames = ws->video_send_stream->GetStats().frames_encoded;
+    fps = ws->video_max_fps.load(std::memory_order_relaxed);
+    kbps = ws->video_target_bitrate_bps / 1000;
+  }, std::chrono::milliseconds(20));
+  char json[512];
+  const int written = std::snprintf(json, sizeof(json),
+      "{\"audio_feedback_reports\":%d,\"rtt_ms\":%lld,\"tx_loss_pct\":%d,"
+      "\"tx_jitter_ms\":%d,\"tx_drops\":%llu,\"video_tx_frames\":%llu,"
+      "\"max_fps\":%d,\"video_kbps\":%d,\"worker_stalled\":%d,\"video_worker_stalled\":%d}",
+      reports, static_cast<long long>(rtt), loss, jitter,
+      static_cast<unsigned long long>(ws->fanout->audio_drops()),
+      static_cast<unsigned long long>(video_frames), fps, kbps,
+      audio_sampled ? 0 : 1, video_sampled ? 0 : 1);
+  return written > 0 && static_cast<size_t>(written) < sizeof(json) ? dup_cstr(json) : nullptr;
+#else
+  return dup_cstr("{}");
 #endif
 }
 
@@ -2120,12 +2234,13 @@ int veil_media_group_engine_start_camera(VeilGroupMediaEngine* engine,
   webrtc::VideoBroadcaster* source = ws->video_source.get();
   VeilVideoSink* local_sink = ws->local_video_sink.get();
   ws->camera.reset(veil_media::CreatePlatformCamera(
-      [source, local_sink](const uint8_t* y, const uint8_t* u,
+      [ws, source, local_sink](const uint8_t* y, const uint8_t* u,
                            const uint8_t* v, int w, int h, int sy, int su,
                            int sv, int64_t ts_us) {
         if (local_sink)
           local_sink->store_i420(y, u, v, w, h, sy, su, sv);
-        push_i420(source, y, u, v, w, h, sy, su, sv, ts_us);
+        if (should_encode_video_frame(ws))
+          push_i420(source, y, u, v, w, h, sy, su, sv, ts_us);
       }));
   if (!ws->camera || !ws->camera->Start(width, height, fps)) {
     ws->camera.reset();
@@ -2174,12 +2289,13 @@ int veil_media_group_engine_start_screen_source(VeilGroupMediaEngine* engine,
   webrtc::VideoBroadcaster* source = ws->video_source.get();
   VeilVideoSink* local_sink = ws->local_video_sink.get();
   ws->screen.reset(veil_media::CreatePlatformScreen(
-      [source, local_sink](const uint8_t* y, const uint8_t* u,
+      [ws, source, local_sink](const uint8_t* y, const uint8_t* u,
                            const uint8_t* v, int w, int h, int sy, int su,
                            int sv, int64_t ts_us) {
         if (local_sink)
           local_sink->store_i420(y, u, v, w, h, sy, su, sv);
-        push_i420(source, y, u, v, w, h, sy, su, sv, ts_us);
+        if (should_encode_video_frame(ws))
+          push_i420(source, y, u, v, w, h, sy, su, sv, ts_us);
       },
       source_id));
   if (!ws->screen || !ws->screen->Start(width, fps)) {
@@ -2225,8 +2341,9 @@ int veil_media_group_engine_push_video_frame(
   if (engine->ws->local_video_sink)
     engine->ws->local_video_sink->store_i420(
         y, u, v, width, height, stride_y, stride_u, stride_v);
-  push_i420(engine->ws->video_source.get(), y, u, v, width, height, stride_y,
-            stride_u, stride_v, ts_us);
+  if (should_encode_video_frame(engine->ws.get()))
+    push_i420(engine->ws->video_source.get(), y, u, v, width, height, stride_y,
+              stride_u, stride_v, ts_us);
   return VEIL_MEDIA_OK;
 #else
   (void)width;

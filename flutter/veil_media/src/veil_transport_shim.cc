@@ -21,6 +21,11 @@
 #include "modules/rtp_rtcp/include/rtp_rtcp_defines.h"  // kVideoPayloadTypeFrequency
 #include "modules/rtp_rtcp/include/rtp_header_extension_map.h"
 #include "modules/rtp_rtcp/source/rtp_header_extensions.h"
+#include "modules/rtp_rtcp/source/ntp_time_util.h"
+#include "modules/rtp_rtcp/source/rtcp_packet/common_header.h"
+#include "modules/rtp_rtcp/source/rtcp_packet/receiver_report.h"
+#include "modules/rtp_rtcp/source/rtcp_packet/sender_report.h"
+#include "system_wrappers/include/clock.h"
 #include "modules/rtp_rtcp/source/rtp_packet_received.h"
 #include "modules/rtp_rtcp/source/rtp_util.h"  // webrtc::IsRtcpPacket
 #include "rtc_base/copy_on_write_buffer.h"
@@ -249,6 +254,55 @@ void VeilTransportShim::PostInboundDrain(bool secondary) {
       });
 }
 
+AudioFeedbackSnapshot VeilTransportShim::audio_feedback() const {
+  if (!started_.load(std::memory_order_acquire)) return {};
+  std::lock_guard lock(audio_feedback_mu_);
+  return audio_feedback_;
+}
+
+void VeilTransportShim::ObserveAudioFeedback(std::span<const uint8_t> packet,
+                                             int64_t arrived_us) {
+  const uint32_t local = local_audio_ssrc_.load(std::memory_order_relaxed);
+  if (local == 0) return;
+  AudioFeedbackSnapshot candidate;
+  const auto observe = [&](const auto& blocks) {
+    for (const auto& block : blocks) {
+      if (block.source_ssrc() != local) continue;
+      candidate.arrived_us = arrived_us;
+      candidate.loss_pct = (int(block.fraction_lost()) * 100 + 128) / 256;
+      candidate.jitter_ms = static_cast<int>(uint64_t(block.jitter()) * 1000 / 48000);
+      if (block.last_sr() != 0) {
+        auto* clock = webrtc::Clock::GetRealTimeClock();
+        const uint32_t now = webrtc::CompactNtp(clock->ConvertTimestampToNtpTime(
+            webrtc::Timestamp::Micros(arrived_us)));
+        candidate.rtt_ms = webrtc::CompactNtpRttToTimeDelta(
+            now - block.delay_since_last_sr() - block.last_sr()).ms();
+      }
+    }
+  };
+  // Parse the entire compound packet before publishing any observation. The
+  // channel, rather than the claimed RTCP sender SSRC, identifies the peer.
+  for (size_t offset = 0; offset < packet.size();) {
+    webrtc::rtcp::CommonHeader header;
+    if (!header.Parse(packet.data() + offset, packet.size() - offset)) return;
+    if (header.type() == webrtc::rtcp::ReceiverReport::kPacketType) {
+      webrtc::rtcp::ReceiverReport report;
+      if (!report.Parse(header)) return;
+      observe(report.report_blocks());
+    } else if (header.type() == webrtc::rtcp::SenderReport::kPacketType) {
+      webrtc::rtcp::SenderReport report;
+      if (!report.Parse(header)) return;
+      observe(report.report_blocks());
+    }
+    offset += header.packet_size();
+  }
+  if (candidate.arrived_us > 0) {
+    std::lock_guard lock(audio_feedback_mu_);
+    if (candidate.arrived_us >= audio_feedback_.arrived_us)
+      audio_feedback_ = candidate;
+  }
+}
+
 void VeilTransportShim::DeliverOnNetworkThread(
     std::span<const uint8_t> packet, bool secondary, int64_t arrived_us) {
   MarkVideoFrame(packet, &delivered_video_cadence_);
@@ -257,6 +311,7 @@ void VeilTransportShim::DeliverOnNetworkThread(
 
   // rtcp-mux demux (RFC 5761): route by packet type.
   if (webrtc::IsRtcpPacket(packet)) {
+    if (!secondary) ObserveAudioFeedback(packet, arrived_us);
     receiver->DeliverRtcpPacket(
         webrtc::CopyOnWriteBuffer(packet.data(), packet.size()));
     return;
