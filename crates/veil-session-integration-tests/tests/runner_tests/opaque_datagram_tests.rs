@@ -16,6 +16,17 @@ async fn runner_channels_over_real_quic(
     shared: bool,
     resumed: bool,
 ) {
+    runner_channels_with_backlog(flows, parallel, rotate, shared, resumed, false).await;
+}
+
+async fn runner_channels_with_backlog(
+    flows: bool,
+    parallel: bool,
+    rotate: bool,
+    shared: bool,
+    resumed: bool,
+    blocked_reliable: bool,
+) {
     let context = Arc::new(TransportContext::for_debug().unwrap());
     let registry = Arc::new(ParallelRegistry::default());
     let listener: Option<Arc<dyn TransportListener>> = if shared {
@@ -188,6 +199,7 @@ async fn runner_channels_over_real_quic(
     let mut senders = Vec::new();
     let mut endpoints = Vec::new();
     let mut diagnostics = Vec::new();
+    let mut writer_attempts = Vec::new();
     let app_id = [0xa0; 32];
     for (direction, device) in [
         (a_stream, a_datagrams, keys[0].0, keys[0].1, a_parallel),
@@ -203,11 +215,10 @@ async fn runner_channels_over_real_quic(
         let (endpoint, receiver) = dispatcher.app_registry.register(app_id, 1, 64);
         endpoints.push(endpoint);
         let (out_tx, out_rx) = mpsc::channel::<PriorityFrame>(32);
+        let attempted = Arc::new(tokio::sync::Notify::new());
+        writer_attempts.push(Arc::clone(&attempted));
         runner.stream = if parallel && !rotate {
-            Box::new(StoppedStreamWriter {
-                stream,
-                attempted: Arc::new(tokio::sync::Notify::new()),
-            })
+            Box::new(StoppedStreamWriter { stream, attempted })
         } else {
             stream
         };
@@ -257,6 +268,7 @@ async fn runner_channels_over_real_quic(
         // Exercise BOTH queue selections and both directions through actual
         // SessionRunners, QUIC DATAGRAM I/O, frame parsing and app dispatch.
         for direction in 0..2 {
+            let mut backlog_start: Option<[u64; 3]> = None;
             for seq in 0..if rotate {
                 400
             } else if parallel {
@@ -280,7 +292,13 @@ async fn runner_channels_over_real_quic(
                 header.body_len = body.len() as u32;
                 let mut frame = encode_header(&header).to_vec();
                 frame.extend(body);
-                let local_priority = if parallel && seq % 7 == 0 {
+                let local_priority = if let Some([primary, _, _]) = backlog_start {
+                    if diagnostics[direction].sent(0) < primary + 24 {
+                        0
+                    } else {
+                        [0, 2, 3][seq as usize % 3]
+                    }
+                } else if parallel && seq % 7 == 0 {
                     1
                 } else if parallel {
                     [0, 2, 3][seq as usize % 3]
@@ -321,6 +339,44 @@ async fn runner_channels_over_real_quic(
                         && diagnostics[direction].sent_this_generation(3) >= 8
                         && (!rotate || diagnostics[direction].rekeys() >= 1)
                     {
+                        if blocked_reliable {
+                            if backlog_start.is_none() {
+                                backlog_start =
+                                    Some([0, 2, 3].map(|lane| diagnostics[direction].sent(lane)));
+                                // Fill the eight-frame writer channel and retain
+                                // a reliable FIFO backlog in the actual runner.
+                                // Audio must continue for multiple source rounds.
+                                for reliable_seq in 0..32 {
+                                    let body = veil_proto::AppDataPayload {
+                                        app_id,
+                                        endpoint_id: 1,
+                                        seq: reliable_seq,
+                                        data: vec![0x55; 4096],
+                                    }
+                                    .encode();
+                                    let mut header = FrameHeader::new(
+                                        FrameFamily::App as u8,
+                                        AppMsg::AppData as u16,
+                                    );
+                                    header.body_len = body.len() as u32;
+                                    let mut frame = encode_header(&header).to_vec();
+                                    frame.extend(body);
+                                    senders[direction]
+                                        .send((1, veil_bufpool::pooled_shared_from_vec(frame)))
+                                        .await
+                                        .unwrap();
+                                }
+                                writer_attempts[direction].notified().await;
+                                continue;
+                            }
+                            let [primary, secondary, additional] = backlog_start.unwrap();
+                            if diagnostics[direction].sent(0) < primary + 24
+                                || diagnostics[direction].sent(2) < secondary + 8
+                                || diagnostics[direction].sent(3) < additional + 8
+                            {
+                                continue;
+                            }
+                        }
                         break;
                     }
                 }
@@ -333,6 +389,14 @@ async fn runner_channels_over_real_quic(
         task.abort();
         let _ = task.await;
     }
+    assert!(
+        result.is_ok(),
+        "local QUIC channels stalled (blocked_reliable={blocked_reliable}); sent={:?}",
+        diagnostics
+            .iter()
+            .map(|observations| [0, 2, 3].map(|lane| observations.sent(lane)))
+            .collect::<Vec<_>>()
+    );
     if parallel {
         for observations in &diagnostics {
             assert!(
@@ -378,10 +442,11 @@ async fn runner_channels_over_real_quic(
         .await
         .expect("child tasks/connections survived their session");
     }
-    assert!(
-        result.is_ok(),
-        "all local channels must deliver via QUIC datagrams"
-    );
+}
+
+#[tokio::test]
+async fn local_sources_keep_sending_with_a_full_reliable_writer_queue() {
+    runner_channels_with_backlog(true, true, false, true, false, true).await;
 }
 
 #[tokio::test]
