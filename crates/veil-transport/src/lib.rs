@@ -58,8 +58,8 @@ pub use context::{
 pub use error::{Result, TransportError};
 pub use hint_registry::{SchemeCounters, TransportHintRegistry};
 pub use quic::{
-    PunchedQuicRole, QuicDatagramHandle, QuicDatagramSendError, REALTIME_DATAGRAM_BUFFER_BYTES,
-    promote_punched_quic,
+    DEFAULT_RELIABLE_SEND_WINDOW_BYTES, PunchedQuicRole, QuicDatagramHandle, QuicDatagramSendError,
+    REALTIME_DATAGRAM_BUFFER_BYTES, promote_punched_quic,
 };
 pub use registry::{TransportHintSink, TransportRegistry};
 pub use traits::{
