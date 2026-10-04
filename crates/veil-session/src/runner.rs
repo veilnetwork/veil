@@ -234,7 +234,9 @@ impl RealtimeDatagramLane {
 
 #[path = "parallel_lanes.rs"]
 mod parallel_lanes;
-pub use parallel_lanes::{ParallelDiagnostics, ParallelQuicOffer};
+pub use parallel_lanes::{
+    ParallelDiagnostics, ParallelPeekOutcome, ParallelQuicOffer, ParallelRegistry,
+};
 
 const LOCAL_BULK_BACKLOG_BYTES: usize = 4 * 1024;
 

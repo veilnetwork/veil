@@ -207,9 +207,9 @@ pub trait TransportConnection: Send + Sync {
         None
     }
 
-    /// Independent QUIC connections on an exclusively owned punched UDP
-    /// endpoint. They still require session authentication. Shared listeners
-    /// return `None`, so this API cannot steal their ordinary accepts.
+    /// Independent QUIC connections on the parent's UDP endpoint. They still
+    /// require session authentication. Shared listeners retain central
+    /// acceptance; non-QUIC transports return `None`.
     fn parallel_quic(&self) -> Option<super::quic::QuicParallelHandle> {
         None
     }

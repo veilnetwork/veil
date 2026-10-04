@@ -405,6 +405,8 @@ pub mod cap_extra_flags {
     pub const SUPPORTS_CIRCUIT_DATAGRAMS: u8 = 1;
     /// Generic independently authenticated transports, with no producer roles.
     pub const SUPPORTS_PARALLEL_QUIC: u8 = 1 << 1;
+    /// Ordinary QUIC/shared-listener dispatch, in addition to punched pairs.
+    pub const SUPPORTS_SHARED_PARALLEL_QUIC: u8 = 1 << 2;
 }
 
 // c: role_bits moved to veil-types alongside NodeRole.
@@ -500,6 +502,13 @@ impl CapabilitiesPayload {
         self.supports_datagram_flows()
             && self.supports_realtime_rekey()
             && self.extra_flags & cap_extra_flags::SUPPORTS_PARALLEL_QUIC != 0
+    }
+
+    /// The earlier parallel bit alone must never activate shared-listener
+    /// children: those peers would mistake the preface for an invalid OVL1.
+    pub fn supports_shared_parallel_quic(&self) -> bool {
+        self.supports_parallel_quic()
+            && self.extra_flags & cap_extra_flags::SUPPORTS_SHARED_PARALLEL_QUIC != 0
     }
 
     // ── Capability helpers ───────────────────────────────────────────────
@@ -2367,6 +2376,40 @@ mod tests {
 
         legacy.flags |= cap_flags::SUPPORTS_REALTIME_REKEY;
         assert!(modern.realtime_rekey_negotiated(&legacy));
+    }
+
+    #[test]
+    fn shared_parallel_quic_requires_its_own_marked_capability() {
+        let mut caps = CapabilitiesPayload::from_node_role(veil_types::NodeRole::Leaf);
+        caps.flags = cap_flags::SUPPORTS_REALTIME_DATAGRAMS
+            | cap_flags::SUPPORTS_DATAGRAM_FLOWS
+            | cap_flags::SUPPORTS_REALTIME_REKEY;
+        caps.extra_flags = cap_extra_flags::SUPPORTS_PARALLEL_QUIC;
+        assert!(caps.supports_parallel_quic());
+        assert!(
+            !caps.supports_shared_parallel_quic(),
+            "punched-only peer must retain fallback"
+        );
+        caps.extra_flags |= cap_extra_flags::SUPPORTS_SHARED_PARALLEL_QUIC;
+        assert!(caps.supports_shared_parallel_quic());
+        assert!(
+            CapabilitiesPayload::decode(&caps.encode())
+                .unwrap()
+                .supports_shared_parallel_quic()
+        );
+        assert!(
+            !CapabilitiesPayload::decode(&caps.encode()[..3])
+                .unwrap()
+                .supports_shared_parallel_quic()
+        );
+        caps.extra_flags = cap_extra_flags::SUPPORTS_SHARED_PARALLEL_QUIC;
+        assert!(
+            !caps.supports_shared_parallel_quic(),
+            "shared flag alone lacks parent support"
+        );
+        caps.extra_flags |= cap_extra_flags::SUPPORTS_PARALLEL_QUIC;
+        caps.flags &= !cap_flags::SUPPORTS_REALTIME_REKEY;
+        assert!(!caps.supports_shared_parallel_quic());
     }
 
     #[test]
