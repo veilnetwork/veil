@@ -195,6 +195,8 @@ struct RealtimeDatagramLane {
     last_congestion_log: std::time::Instant,
 }
 
+const LOCAL_BULK_BACKLOG_BYTES: usize = 4 * 1024;
+
 /// Leave room for a local latency-sensitive producer before admitting ordinary
 /// throughput traffic. The choice is process-local; forwarded user packets at
 /// a relay all have INTERACTIVE priority and receive identical treatment.
@@ -204,10 +206,25 @@ fn local_datagram_fits(priority: u8, wire_len: usize, available: usize) -> bool 
     } else {
         0
     };
-    wire_len
+    let fits = wire_len
         .checked_add(reserve)
-        .is_some_and(|required| required <= available)
+        .is_some_and(|required| required <= available);
+    if !fits || priority < veil_proto::priority::BULK {
+        return fits;
+    }
+    // Reserving capacity alone still leaves a primary packet behind tens of
+    // kilobytes already accepted by Quinn. Bound local throughput backlog to
+    // 4 KiB, admitting one larger complete cell only when that queue is empty.
+    // Relay user cells all use INTERACTIVE and never enter this endpoint rule.
+    let queued = veil_transport::REALTIME_DATAGRAM_BUFFER_BYTES.saturating_sub(available);
+    queued
+        .checked_add(wire_len)
+        .is_some_and(|bytes| bytes <= wire_len.max(LOCAL_BULK_BACKLOG_BYTES))
 }
+
+#[cfg(test)]
+#[path = "quic_backlog_tests.rs"]
+mod quic_backlog_tests;
 
 /// Tokio join handles detach when dropped; realtime receivers must instead be
 /// cancelled with their owning session so they cannot retain a QUIC connection
@@ -3876,9 +3893,9 @@ impl SessionRunner {
                             planned_wire_len,
                             lane.handle.send_buffer_space(),
                         ) {
-                            // Admit complete frames only. Local bulk also leaves
-                            // room for one complete primary frame; relayed cells
-                            // all use the same neutral admission rule. Drop this
+                            // Admit complete frames only. Local bulk bounds
+                            // backlog and reserves a complete primary frame;
+                            // relayed cells use neutral capacity admission. Drop this
                             // loss-tolerant cell before sending any fragments.
                             datagram_drained += 1;
                             continue;
@@ -5278,7 +5295,18 @@ mod realtime_lane_frame_tests {
         let reserve = crate::datagram_flows::MAX_FRAME_WIRE_BYTES;
         assert!(!super::local_datagram_fits(BULK, 1300, 4096));
         assert!(!super::local_datagram_fits(BULK, 1300, reserve + 1299));
-        assert!(super::local_datagram_fits(BULK, 1300, reserve + 1300));
+        assert!(!super::local_datagram_fits(BULK, 1300, reserve + 1300));
+        let capacity = veil_transport::REALTIME_DATAGRAM_BUFFER_BYTES;
+        assert!(super::local_datagram_fits(BULK, 1300, capacity));
+        assert!(super::local_datagram_fits(BULK, 1000, capacity - 3096));
+        assert!(!super::local_datagram_fits(BULK, 1000, capacity - 3097));
+        assert!(super::local_datagram_fits(BULK, reserve, capacity));
+        assert!(!super::local_datagram_fits(BULK, reserve, capacity - 1));
+        assert!(super::local_datagram_fits(
+            INTERACTIVE,
+            reserve,
+            capacity - 1
+        ));
         assert!(super::local_datagram_fits(REALTIME, 200, 4096));
         assert!(!super::local_datagram_fits(REALTIME, 200, 199));
         // Relayed user traffic has the same neutral queue class for every
