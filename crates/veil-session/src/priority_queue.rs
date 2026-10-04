@@ -409,31 +409,35 @@ impl PriorityQueue {
                 if self.local_datagram_slots[p] == 0 {
                     continue;
                 }
-                while self.queues[p].front().is_some_and(|queued| {
-                    queued.lossy_realtime
-                        && queued
-                            .enqueued_at
-                            .is_some_and(|at| at.elapsed() > LOSSY_REALTIME_MAX_AGE)
-                }) {
-                    self.queues[p].pop_front();
+                // Reliable writes and datagrams use separate transports even
+                // when the producer gave them the same local queue class.
+                // Find only the first local lossy entry; never overtake another
+                // local datagram or a relayed cell's ordinary FIFO.
+                while let Some(index) = self.queues[p]
+                    .iter()
+                    .position(|queued| queued.lossy_realtime && queued.carrier.is_none())
+                {
+                    let head = &self.queues[p][index];
+                    if head
+                        .enqueued_at
+                        .is_some_and(|at| at.elapsed() > LOSSY_REALTIME_MAX_AGE)
+                    {
+                        self.queues[p].remove(index);
+                        self.lossy_realtime_len -= 1;
+                        self.drops_total.fetch_add(1, Ordering::Relaxed);
+                        continue;
+                    }
+                    if !predicate(&head.frame) {
+                        break;
+                    }
+                    let queued = self.queues[p].remove(index).expect("entry checked above");
+                    self.local_datagram_slots[p] -= 1;
                     self.lossy_realtime_len -= 1;
-                    self.drops_total.fetch_add(1, Ordering::Relaxed);
+                    return Some(crate::frame_outbox::FrameEnvelope {
+                        frame: (priority, queued.frame),
+                        carrier: queued.carrier,
+                    });
                 }
-                let Some(head) = self.queues[p].front() else {
-                    continue;
-                };
-                // Never jump over a reliable source head or use an incoming
-                // carrier as evidence of locally produced traffic.
-                if !head.lossy_realtime || head.carrier.is_some() || !predicate(&head.frame) {
-                    continue;
-                }
-                let queued = self.queues[p].pop_front().expect("head checked above");
-                self.local_datagram_slots[p] -= 1;
-                self.lossy_realtime_len -= 1;
-                return Some(crate::frame_outbox::FrameEnvelope {
-                    frame: (priority, queued.frame),
-                    carrier: queued.carrier,
-                });
             }
             if attempt == 0 {
                 self.local_datagram_slots = self.weights;
@@ -541,30 +545,41 @@ mod tests {
     }
 
     #[test]
-    fn local_datagram_round_preserves_each_source_fifo() {
+    fn local_datagram_round_separates_sources_from_reliable_fifo() {
         let mut pq = PriorityQueue::with_default_weights();
-        pq.push(REALTIME, arc(b"reliable control"));
-        pq.push_lossy(REALTIME, arc(b"primary"));
+        pq.push(REALTIME, arc(b"control1"));
+        pq.push_lossy(REALTIME, arc(b"primary1"));
+        pq.push(REALTIME, arc(b"control2"));
+        pq.push_lossy(REALTIME, arc(b"primary2"));
         pq.push_lossy(BULK, arc(b"secondary"));
-        let envelope = pq.pop_local_datagram_envelope_if(|_| true).unwrap();
-        assert_eq!(envelope.frame.0, BULK);
-        assert!(pq.pop_local_datagram_envelope_if(|_| true).is_none());
-        assert_eq!(&*pq.pop().unwrap(), b"reliable control");
+        // A refused datagram head may not be skipped for another accepted
+        // datagram in that source; other sources still get their own turn.
+        let envelope = pq
+            .pop_local_datagram_envelope_if(|bytes| bytes != b"primary1")
+            .unwrap();
+        assert_eq!(&*envelope.frame.1, b"secondary");
         assert!(
-            pq.pop_local_datagram_envelope_if(|bytes| bytes != b"primary")
+            pq.pop_local_datagram_envelope_if(|bytes| bytes != b"primary1")
                 .is_none()
         );
-        assert_eq!(pq.len(), 1);
-        let envelope = pq.pop_local_datagram_envelope_if(|_| true).unwrap();
-        assert_eq!(&*envelope.frame.1, b"primary");
+        for expected in [b"primary1", b"primary2"] {
+            let envelope = pq.pop_local_datagram_envelope_if(|_| true).unwrap();
+            assert_eq!(&*envelope.frame.1, expected);
+        }
+        // Bypassing the independent reliable transport must neither drop nor
+        // reorder its controls. The ordinary round remains untouched.
+        assert_eq!(pq.slots, DEFAULT_WEIGHTS);
+        assert_eq!(&*pq.pop().unwrap(), b"control1");
+        assert_eq!(&*pq.pop().unwrap(), b"control2");
+        assert!(pq.is_empty());
     }
 
     #[test]
     fn local_datagram_round_discards_expired_source_heads() {
         let mut pq = PriorityQueue::with_default_weights();
-        pq.push(INTERACTIVE, arc(b"reliable"));
+        pq.push(REALTIME, arc(b"reliable"));
         pq.push_lossy(REALTIME, arc(b"stale"));
-        pq.queues[REALTIME as usize][0].enqueued_at =
+        pq.queues[REALTIME as usize][1].enqueued_at =
             Some(Instant::now() - LOSSY_REALTIME_MAX_AGE - Duration::from_millis(1));
         pq.push_lossy(BULK, arc(b"fresh"));
         let envelope = pq.pop_local_datagram_envelope_if(|_| true).unwrap();
