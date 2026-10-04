@@ -26,43 +26,6 @@ use std::sync::Arc;
 
 use super::*;
 
-#[cfg(test)]
-mod local_circuit_lanes_tests {
-    #[tokio::test]
-    async fn originating_circuit_lanes_are_local_and_relay_headers_stay_equal() {
-        use veil_proto::{
-            codec::decode_header_with_limit, family::RelayChainMsg, header::HEADER_SIZE, priority,
-        };
-        let peer = [0x8c; 32];
-        let mut registry = veil_session::SessionTxRegistry::default();
-        let mut rx = registry.register(peer);
-        super::enqueue_relay_chain_frame(
-            &registry,
-            &peer,
-            RelayChainMsg::CircuitData,
-            b"video",
-            priority::BULK,
-        )
-        .unwrap();
-        super::enqueue_relay_chain_frame(
-            &registry,
-            &peer,
-            RelayChainMsg::CircuitData,
-            b"audio",
-            priority::REALTIME,
-        )
-        .unwrap();
-        for (expected_lane, body) in [(priority::REALTIME, b"audio"), (priority::BULK, b"video")] {
-            let (local_lane, frame) = rx.recv().await.unwrap();
-            assert_eq!(local_lane, expected_lane);
-            let header = decode_header_with_limit(&frame[..HEADER_SIZE], 1024).unwrap();
-            assert_eq!(header.priority(), priority::INTERACTIVE);
-            assert_eq!(header.msg_type, RelayChainMsg::CircuitData as u16);
-            assert_eq!(&frame[HEADER_SIZE..], body);
-        }
-    }
-}
-
 /// One `RelayChain::<msg>` control frame, header and body.
 pub(crate) fn relay_chain_frame(msg: veil_proto::family::RelayChainMsg, body: &[u8]) -> Vec<u8> {
     use veil_proto::{codec::encode_header, family::FrameFamily, header::FrameHeader};
@@ -1957,5 +1920,42 @@ impl NodeServices {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod local_circuit_lanes_tests {
+    #[tokio::test]
+    async fn originating_circuit_lanes_are_local_and_relay_headers_stay_equal() {
+        use veil_proto::{
+            codec::decode_header_with_limit, family::RelayChainMsg, header::HEADER_SIZE, priority,
+        };
+        let peer = [0x8c; 32];
+        let mut registry = veil_session::SessionTxRegistry::default();
+        let mut rx = registry.register(peer);
+        super::enqueue_relay_chain_frame(
+            &registry,
+            &peer,
+            RelayChainMsg::CircuitData,
+            b"video",
+            priority::BULK,
+        )
+        .unwrap();
+        super::enqueue_relay_chain_frame(
+            &registry,
+            &peer,
+            RelayChainMsg::CircuitData,
+            b"audio",
+            priority::REALTIME,
+        )
+        .unwrap();
+        for (expected_lane, body) in [(priority::REALTIME, b"audio"), (priority::BULK, b"video")] {
+            let (local_lane, frame) = rx.recv().await.unwrap();
+            assert_eq!(local_lane, expected_lane);
+            let header = decode_header_with_limit(&frame[..HEADER_SIZE], 1024).unwrap();
+            assert_eq!(header.priority(), priority::INTERACTIVE);
+            assert_eq!(header.msg_type, RelayChainMsg::CircuitData as u16);
+            assert_eq!(&frame[HEADER_SIZE..], body);
+        }
     }
 }
