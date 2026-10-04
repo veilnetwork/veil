@@ -2561,7 +2561,7 @@ int veil_media_engine_start_video(VeilMediaEngine* engine, int send, int recv,
         if (v > 0) kbps = v;
       }
       kbps = std::clamp(kbps, 30, 2500);
-      const int fps = std::clamp(max_fps > 0 ? max_fps : 15, 5, 60);
+      const int fps = std::clamp(max_fps > 0 ? max_fps : 15, 1, 60);
       const int bps = kbps * 1000;
       ws->video_target_bitrate_bps = bps;
       ws->video_max_fps.store(fps, std::memory_order_relaxed);
@@ -2644,8 +2644,9 @@ int veil_media_engine_start_video(VeilMediaEngine* engine, int send, int recv,
             yb[j * w + i] = static_cast<uint8_t>(i + j + f);
         std::fill(ub.begin(), ub.end(), static_cast<uint8_t>(128));
         std::fill(vb.begin(), vb.end(), static_cast<uint8_t>(128 + f));
-        push_i420(ws->video_source.get(), yb.data(), ub.data(), vb.data(), w, h,
-                  w, cw, cw, 0);
+        if (should_encode_video_frame(ws))
+          push_i420(ws->video_source.get(), yb.data(), ub.data(), vb.data(), w, h,
+                    w, cw, cw, 0);
         if ((f % 60) == 0) vlog("test video: pushed %u frames", f);
         ++f;
         std::this_thread::sleep_for(std::chrono::milliseconds(33));
@@ -2680,7 +2681,7 @@ int veil_media_engine_set_video_bitrate(VeilMediaEngine* engine,
       if (v > 0) kbps = v;
     }
     kbps = std::clamp(kbps, 30, 2500);
-    const int fps = std::clamp(max_fps > 0 ? max_fps : 15, 5, 60);
+    const int fps = std::clamp(max_fps > 0 ? max_fps : 15, 1, 60);
     const int bps = kbps * 1000;
     if (bps == ws->video_target_bitrate_bps &&
         fps == ws->video_max_fps.load(std::memory_order_relaxed)) {
