@@ -13,10 +13,11 @@
 //! that can move without the header noticing, and this checks that it did not.
 
 use super::{
-    MEDIA_BATCHING_COMPACT_RELAY, MEDIA_BATCHING_OFF, MEDIA_CHANNELS, MEDIA_NEXT_ID, MediaChannel,
-    MediaSenderSlot, MediaVideoIngress, RelayVideoFrame, drain_anonymous_media,
-    drain_media_packets, drain_relay_video, media_batched_cells, media_ready_batch,
-    veil_media_close_channel, veil_media_send_datagram,
+    MEDIA_BATCHING_COMPACT_RELAY, MEDIA_BATCHING_OFF, MEDIA_CHANNELS, MEDIA_LOCAL_QUEUE_AGE,
+    MEDIA_NEXT_ID, MediaChannel, MediaSenderSlot, MediaVideoIngress, QueuedMediaPacket,
+    RelayVideoFrame, drain_anonymous_media, drain_media_packets, drain_relay_video,
+    media_batched_cells, media_ready_batch, timed_media_cells, veil_media_close_channel,
+    veil_media_send_datagram,
 };
 use super::{
     RELAY_VIDEO_FRAME_MAX_BYTES, RelayMediaStats, RelayVideoFrameAssembler, RelayVideoFramePush,
@@ -74,25 +75,25 @@ fn batching_never_puts_video_into_an_audio_cell() {
 
 #[test]
 fn anonymous_batch_preserves_other_producer_and_overflow() {
-    let (audio_tx, mut audio_rx) = mpsc::channel(4);
+    let (audio_tx, mut audio_rx) = mpsc::channel::<QueuedMediaPacket>(4);
     let (video_tx, mut video_rx) = mpsc::channel(4);
     let audio = vec![0x80, 111, 1, 2, 3, 4];
     let video = video_packet(7, false, 1);
-    audio_tx.try_send(audio.clone()).unwrap();
-    video_tx.try_send(video.clone()).unwrap();
-    video_tx.try_send(video.clone()).unwrap();
+    audio_tx.try_send(audio.clone().into()).unwrap();
+    video_tx.try_send(video.clone().into()).unwrap();
+    video_tx.try_send(video.clone().into()).unwrap();
     let max_body = 4 + 2 * (2 + video.len());
-    let (cell, overflow) = media_ready_batch(video.clone(), &mut video_rx, max_body);
-    let cell = cell.unwrap();
+    let (cell, overflow) = media_ready_batch(video.clone().into(), &mut video_rx, max_body);
+    let cell = cell.unwrap().payload;
     assert!(media_cell_is_video(&cell));
     assert_eq!(
         expand_wire_cells(&[cell]),
         vec![video.clone(), video.clone()]
     );
-    assert_eq!(overflow, Some(video));
-    assert_eq!(audio_rx.try_recv().unwrap(), audio);
-    let (cell, overflow) = media_ready_batch(audio.clone(), &mut audio_rx, max_body);
-    assert_eq!(cell, Some(audio));
+    assert_eq!(overflow.map(|packet| packet.payload), Some(video));
+    assert_eq!(audio_rx.try_recv().unwrap().payload, audio);
+    let (cell, overflow) = media_ready_batch(audio.clone().into(), &mut audio_rx, max_body);
+    assert_eq!(cell.map(|packet| packet.payload), Some(audio));
     assert!(overflow.is_none());
 }
 
@@ -284,7 +285,7 @@ async fn audio_continues_while_video_writer_is_blocked(relay: bool) {
         ))
     } else {
         let (tx, rx) = mpsc::channel(1);
-        tx.send(video.clone()).await.unwrap();
+        tx.send(video.clone().into()).await.unwrap();
         drop(tx);
         tokio::spawn(drain_media_packets(
             rx,
@@ -300,7 +301,7 @@ async fn audio_continues_while_video_writer_is_blocked(relay: bool) {
         .await
         .unwrap();
     let audio = vec![0x80, 111, 1, 2, 3, 4];
-    audio_tx.send(audio.clone()).await.unwrap();
+    audio_tx.send(audio.clone().into()).await.unwrap();
     let sealed_audio = tokio::time::timeout(Duration::from_millis(100), received_audio.recv())
         .await
         .expect("audio must not wait for the video IPC writer")
@@ -395,12 +396,12 @@ async fn anonymous_audio_continues_during_blocked_video_send_or_warm() {
             },
         ));
         let video = video_packet(7, true, 1);
-        video_tx.send(video.clone()).await.unwrap();
+        video_tx.send(video.clone().into()).await.unwrap();
         tokio::time::timeout(Duration::from_secs(1), entered.notified())
             .await
             .unwrap();
         let audio = vec![0x80, 111, 1, 2, 3, 4];
-        audio_tx.send(audio.clone()).await.unwrap();
+        audio_tx.send(audio.clone().into()).await.unwrap();
         let cell = tokio::time::timeout(Duration::from_millis(100), received_rx.recv())
             .await
             .expect("anonymous audio must not wait for video")
@@ -448,7 +449,7 @@ async fn anonymous_active_producers_rewarm_on_repair_and_stop_with_closed_ingres
             },
         ));
         let packet = vec![0x80, 111, 1, 2];
-        tx.send(packet.clone()).await.unwrap();
+        tx.send(packet.clone().into()).await.unwrap();
         tokio::time::timeout(Duration::from_secs(1), warm_rx.recv())
             .await
             .unwrap()
@@ -679,4 +680,214 @@ async fn private_address_control_requires_call_aead_and_never_reaches_the_engine
     assert_eq!(count_context.load(Ordering::SeqCst), 1);
     drop(cleanup);
     node.stop().await.unwrap();
+}
+
+#[tokio::test]
+async fn route_warm_stall_drops_old_audio_and_keeps_current_audio_and_control() {
+    let peer = [0xc1; 32];
+    let cipher = Arc::new(cipher_for_test(&peer, &[1; 32], &[2; 32]).unwrap());
+    let receiver = cipher_for_test(&peer, &[2; 32], &[1; 32]).unwrap();
+    let (tx, rx) = mpsc::channel(8);
+    let (repair_tx, repair_rx) = mpsc::channel(1);
+    let (sent_tx, mut sent_rx) = mpsc::unbounded_channel();
+    let entered = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    tx.send(vec![0x80, 111, 1, 9].into()).await.unwrap();
+    let warm_entered = Arc::clone(&entered);
+    let warm_release = Arc::clone(&release);
+    let task = tokio::spawn(drain_anonymous_media(
+        rx,
+        repair_rx,
+        cipher,
+        LocalMediaPlane::Primary,
+        move |cell| {
+            let tx = sent_tx.clone();
+            async move { tx.send(cell.into_vec()).is_ok() }
+        },
+        move || {
+            let entered = Arc::clone(&warm_entered);
+            let release = Arc::clone(&warm_release);
+            async move {
+                entered.notify_one();
+                release.notified().await;
+            }
+        },
+    ));
+    entered.notified().await;
+    tokio::time::sleep(MEDIA_LOCAL_QUEUE_AGE + Duration::from_millis(20)).await;
+    let current = vec![0x80, 111, 2, 9];
+    let control = vec![0x80, 200, 0, 1];
+    tx.send(current.clone().into()).await.unwrap();
+    tx.send(control.clone().into()).await.unwrap();
+    drop(tx);
+    drop(repair_tx);
+    release.notify_one();
+    task.await.unwrap();
+    let mut actual = Vec::new();
+    while let Some(cell) = sent_rx.recv().await {
+        actual.extend(expand_wire_cells(&[receiver.open(&cell).unwrap()]));
+    }
+    assert_eq!(actual, vec![current, control]);
+}
+
+#[tokio::test]
+async fn a_dequeued_burst_expires_while_its_first_ipc_request_finishes_normally() {
+    for (relay, mode) in [
+        (false, MEDIA_BATCHING_OFF),
+        (false, super::MEDIA_BATCHING_LEGACY),
+        (true, MEDIA_BATCHING_COMPACT_RELAY),
+    ] {
+        let peer = [0xc2; 32];
+        let cipher = Arc::new(cipher_for_test(&peer, &[1; 32], &[2; 32]).unwrap());
+        let receiver = cipher_for_test(&peer, &[2; 32], &[1; 32]).unwrap();
+        let (tx, rx) = mpsc::channel(16);
+        let (sent_tx, mut sent_rx) = mpsc::unbounded_channel();
+        let ack = Arc::new(Notify::new());
+        let pending_ack = Arc::clone(&ack);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let sink_calls = Arc::clone(&calls);
+        let packets: Vec<_> = (0..8).map(|seq| vec![0x80, 111, seq, 9]).collect();
+        for packet in &packets {
+            tx.send(packet.clone().into()).await.unwrap();
+        }
+        let task = tokio::spawn(drain_media_packets(
+            rx,
+            Arc::new(AtomicU8::new(mode)),
+            cipher,
+            relay,
+            move |cell| {
+                let tx = sent_tx.clone();
+                let ack = Arc::clone(&pending_ack);
+                let calls = Arc::clone(&sink_calls);
+                async move {
+                    let first = calls.fetch_add(1, Ordering::SeqCst) == 0;
+                    // Bytes have been written. Expiry must not cancel an ACK
+                    // wait or truncate the already-started IPC request.
+                    tx.send(cell.sealed.into_vec()).unwrap();
+                    if first {
+                        ack.notified().await;
+                    }
+                    true
+                }
+            },
+        ));
+        let first = sent_rx.recv().await.unwrap();
+        tokio::time::sleep(MEDIA_LOCAL_QUEUE_AGE + Duration::from_millis(20)).await;
+        assert!(
+            !task.is_finished(),
+            "expiry must not cancel in-progress IPC"
+        );
+        let current = vec![0x80, 111, 99, 9];
+        tx.send(current.clone().into()).await.unwrap();
+        drop(tx);
+        ack.notify_one();
+        task.await.unwrap();
+        let mut actual = expand_wire_cells(&[receiver.open(&first).unwrap()]);
+        while let Some(cell) = sent_rx.recv().await {
+            actual.extend(expand_wire_cells(&[receiver.open(&cell).unwrap()]));
+        }
+        let first_count = if mode == MEDIA_BATCHING_OFF {
+            1
+        } else if relay {
+            6
+        } else {
+            4
+        };
+        let mut expected = packets[..first_count].to_vec();
+        expected.push(current);
+        assert_eq!(actual, expected, "mode={mode} relay={relay}");
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+}
+
+#[tokio::test]
+async fn sealed_cell_expires_while_waiting_for_a_writer_without_changing_wire_bytes() {
+    let peer = [0xc3; 32];
+    let cipher = cipher_for_test(&peer, &[1; 32], &[2; 32]).unwrap();
+    let receiver = cipher_for_test(&peer, &[2; 32], &[1; 32]).unwrap();
+    let packet = [0x80, 111, 9, 1];
+    let cell = cipher.seal(&packet).unwrap();
+    let wire = cell.as_bytes().to_vec();
+    let cell = cell.with_local_deadline(tokio::time::Instant::now() + Duration::from_millis(20));
+    let writer = Mutex::new(());
+    let held = writer.lock().await;
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), cell.lock_while_fresh(&writer))
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        writer.try_lock().is_err(),
+        "the existing writer still owns the lock"
+    );
+    assert_eq!(cell.as_bytes(), wire);
+    assert_eq!(receiver.open(&wire), Some(packet.to_vec()));
+    drop(held);
+    assert!(
+        cell.lock_while_fresh(&writer).await.is_none(),
+        "an expired cell must not start a write after release"
+    );
+}
+
+#[tokio::test]
+async fn anonymous_overflow_preserves_the_original_deadline() {
+    let (tx, mut rx) = mpsc::channel(1);
+    let first: QueuedMediaPacket = vec![0x80, 111, 1, 9].into();
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(20);
+    tx.send(QueuedMediaPacket {
+        payload: vec![0x80, 111, 2, 9],
+        deadline,
+    })
+    .await
+    .unwrap();
+    let (cell, overflow) = media_ready_batch(first, &mut rx, 4);
+    assert!(cell.is_some());
+    let pending = overflow.unwrap();
+    assert_eq!(pending.deadline, deadline);
+    tokio::time::sleep(Duration::from_millis(25)).await;
+    assert!(media_ready_batch(pending, &mut rx, 4).0.is_none());
+}
+
+#[test]
+fn timed_cell_deadlines_follow_actual_batches_and_raw_fallback_packets() {
+    let now = tokio::time::Instant::now();
+    let packets = vec![
+        QueuedMediaPacket {
+            payload: vec![0x80; 700],
+            deadline: now + Duration::from_millis(10),
+        },
+        QueuedMediaPacket {
+            payload: vec![0x80, 111, 1, 9],
+            deadline: now + Duration::from_millis(20),
+        },
+        QueuedMediaPacket {
+            payload: vec![0x80, 111, 2, 9],
+            deadline: now + Duration::from_millis(30),
+        },
+        QueuedMediaPacket {
+            payload: vec![0x80; 700],
+            deadline: now + Duration::from_millis(40),
+        },
+    ];
+    let cells = timed_media_cells(packets, true, 500, 6);
+    assert_eq!(cells.len(), 3);
+    assert_eq!(
+        cells.iter().map(|cell| cell.deadline).collect::<Vec<_>>(),
+        vec![
+            now + Duration::from_millis(10),
+            now + Duration::from_millis(20),
+            now + Duration::from_millis(40)
+        ]
+    );
+    assert_eq!(
+        expand_wire_cells(
+            &cells
+                .into_iter()
+                .map(|cell| cell.payload)
+                .collect::<Vec<_>>()
+        )
+        .len(),
+        4
+    );
 }

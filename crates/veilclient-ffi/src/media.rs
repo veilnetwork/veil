@@ -413,15 +413,54 @@ impl MediaCipherRx {
 /// Wire bytes produced by [`MediaCipher::seal_on_plane`]. There is deliberately no other
 /// constructor: a send path that wants to put media on the wire has to obtain
 /// one of these, and the only way to obtain one is to seal.
-pub(crate) struct SealedMediaCell(Vec<u8>);
+pub(crate) struct SealedMediaCell {
+    bytes: Vec<u8>,
+    // Endpoint-local queue deadline. Never part of the AEAD or network bytes.
+    local_deadline: Option<tokio::time::Instant>,
+}
 
 impl SealedMediaCell {
+    pub(crate) fn with_local_deadline(mut self, deadline: tokio::time::Instant) -> Self {
+        self.local_deadline = Some(deadline);
+        self
+    }
+
+    pub(crate) fn local_deadline(&self) -> Option<tokio::time::Instant> {
+        self.local_deadline
+    }
+
+    pub(crate) fn locally_expired(&self) -> bool {
+        self.local_deadline
+            .is_some_and(|at| tokio::time::Instant::now() >= at)
+    }
+
+    /// Only lock acquisition may be cancelled. Once IPC writing begins its
+    /// future must complete, so a timeout can never truncate a protocol frame.
+    pub(crate) async fn lock_while_fresh<'a, T>(
+        &self,
+        lock: &'a tokio::sync::Mutex<T>,
+    ) -> Option<tokio::sync::MutexGuard<'a, T>> {
+        if self.locally_expired() {
+            return None;
+        }
+        let guard = if let Some(at) = self.local_deadline {
+            tokio::time::timeout_at(at, lock.lock()).await.ok()?
+        } else {
+            lock.lock().await
+        };
+        if self.locally_expired() {
+            None
+        } else {
+            Some(guard)
+        }
+    }
+
     pub(crate) fn as_bytes(&self) -> &[u8] {
-        &self.0
+        &self.bytes
     }
 
     pub(crate) fn into_vec(self) -> Vec<u8> {
-        self.0
+        self.bytes
     }
 }
 
@@ -506,7 +545,10 @@ impl MediaCipher {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .seal(plaintext)
-            .map(SealedMediaCell)
+            .map(|bytes| SealedMediaCell {
+                bytes,
+                local_deadline: None,
+            })
     }
 
     pub(crate) fn open(&self, sealed: &[u8]) -> Option<Vec<u8>> {
