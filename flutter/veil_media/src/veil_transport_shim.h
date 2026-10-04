@@ -45,6 +45,14 @@ class TaskQueueBase;
 
 namespace veil_media {
 
+// Endpoint-local audio RR/SR observation for this authenticated peer channel.
+struct AudioFeedbackSnapshot {
+  int64_t arrived_us = 0;
+  int64_t rtt_ms = 0;
+  int loss_pct = 0;
+  int jitter_ms = 0;
+};
+
 struct VideoCadenceSnapshot {
   uint64_t frames = 0;
   int64_t first_ns = 0;
@@ -87,6 +95,11 @@ class VeilTransportShim : public webrtc::Transport {
   // with MediaType::VIDEO (the Call routes to the audio vs video demuxer BY the
   // media type — a wrong type black-holes the packet). 0 = no video (all audio).
   void SetRemoteVideoSsrc(uint32_t ssrc) { remote_video_ssrc_.store(ssrc); }
+
+  // Group calls use one send SSRC for all peers. Keep their reports separate
+  // before WebRTC's per-source cache overwrites one participant with another.
+  void SetLocalAudioSsrc(uint32_t ssrc) { local_audio_ssrc_.store(ssrc); }
+  AudioFeedbackSnapshot audio_feedback() const;
 
   // Enable only when both endpoints have independent audio/video counters.
   // Older engines used one sequence space and cannot consume split feedback.
@@ -139,6 +152,7 @@ class VeilTransportShim : public webrtc::Transport {
   // Post one bounded drain turn. The packet buffers stay in separate local
   // queues, allowing newly arrived audio to pass already queued video.
   void PostInboundDrain(bool secondary);
+  void ObserveAudioFeedback(std::span<const uint8_t> packet, int64_t arrived_us);
   // Runs on the selected local network queue and delivers into its Call.
   void DeliverOnNetworkThread(std::span<const uint8_t> packet, bool secondary,
                               int64_t arrived_us);
@@ -166,6 +180,9 @@ class VeilTransportShim : public webrtc::Transport {
   webrtc::Call* const video_call_;
   webrtc::TaskQueueBase* const video_network_queue_;
   std::atomic<uint32_t> remote_video_ssrc_{0};
+  std::atomic<uint32_t> local_audio_ssrc_{0};
+  mutable std::mutex audio_feedback_mu_;
+  AudioFeedbackSnapshot audio_feedback_;
   std::atomic<bool> independent_transport_feedback_{false};
   std::atomic<bool> started_{false};
   InboundPacketQueue inbound_queue_;
