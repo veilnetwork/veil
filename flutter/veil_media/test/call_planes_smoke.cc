@@ -101,6 +101,11 @@ static int inject(void* ctx, uint64_t chan, uint32_t audio, uint32_t video) {
     std::free(stats);
     if (!valid || std::chrono::steady_clock::now() - start >
         std::chrono::milliseconds(250)) return 1;
+    const auto retune_start = std::chrono::steady_clock::now();
+    if (veil_media_engine_set_video_bitrate(
+            static_cast<VeilMediaEngine*>(ctx), 45, 2) != VEIL_MEDIA_ERR_STATE ||
+        std::chrono::steady_clock::now() - retune_start >
+            std::chrono::milliseconds(250)) return 2;
   }
   return 0;
 }
@@ -154,9 +159,17 @@ int main() {
     assert(veil_media_engine_set_independent_transport_feedback(e.get(), enabled) == VEIL_MEDIA_OK);
     assert(veil_media_engine_set_mic_muted(e.get(), 1) == VEIL_MEDIA_OK);
     assert(veil_media_engine_start_audio(e.get(), 0, 1) == VEIL_MEDIA_OK);
-    assert(veil_media_engine_start_video(e.get(), 0, 1, 150, 15) == VEIL_MEDIA_OK);
+    assert(veil_media_engine_start_video(e.get(), 1, 1, 150, 15) == VEIL_MEDIA_OK);
     const int result = veil_media_test_direct_call_planes(e.get(), inject, e.get());
     if (result) { std::fprintf(stderr, "direct isolation failed: %d\n", result); return 1; }
+    // The abandoned retune must not run after the held queue is released.
+    // An explicit retry may then update both bitrate and source cadence.
+    assert(stat(e.get(), "max_fps") == 15);
+    assert(stat(e.get(), "target_bitrate_bps") == 150000);
+    assert(veil_media_engine_set_video_bitrate(e.get(), 45, 2) == VEIL_MEDIA_OK);
+    assert(stat(e.get(), "max_fps") == 2);
+    assert(stat(e.get(), "target_bitrate_bps") == 45000);
+    assert(veil_media_engine_set_video_bitrate(e.get(), 150, 15) == VEIL_MEDIA_OK);
     assert(veil_media_engine_set_independent_transport_feedback(e.get(), !enabled) == VEIL_MEDIA_ERR_STATE);
     bool audio_feedback = false, video_feedback = false;
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);

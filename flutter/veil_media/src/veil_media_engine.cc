@@ -2788,7 +2788,11 @@ int veil_media_engine_set_video_bitrate(VeilMediaEngine* engine,
   // last line INSIDE the closure, so a queue that never scheduled returns the
   // failure by construction.
   int rc = VEIL_MEDIA_ERR_STATE;
-  (void)run_on(ws->video_worker_tq.get(), [&]() {
+  // This is a per-second control-loop operation, not stream teardown. A busy
+  // video worker must not park the UI/audio control loop for ten seconds.
+  // Abandon before execution with the existing lifetime-safe handshake; the
+  // host retries the latest budget. Work that already started is waited out.
+  (void)veil_media::run_on_with_timeout(ws->video_worker_tq.get(), [&]() {
     if (ws->video_send_stream == nullptr) return;
     // Same budget rules as start_video: the explicit debug pin wins, and the
     // clamps keep the encoder inside the padded-onion / direct envelopes.
@@ -2835,7 +2839,7 @@ int veil_media_engine_set_video_bitrate(VeilMediaEngine* engine,
     ws->video_last_encoded_frame_us.store(0, std::memory_order_relaxed);
     vlog("video: retuned to %d kbps @ %d fps", kbps, fps);
     rc = VEIL_MEDIA_OK;
-  });
+  }, std::chrono::milliseconds(20));
   return rc;
 #else
   (void)max_bitrate_kbps;
