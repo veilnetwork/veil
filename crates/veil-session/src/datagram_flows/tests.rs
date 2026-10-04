@@ -122,11 +122,15 @@ fn total_assembly_budget_does_not_multiply_by_channel_count() {
     assert!(count <= MAX_ASSEMBLIES);
     assert!(bytes <= MAX_ASSEMBLY_BYTES);
     assert!(bytes > 0);
-    // No flow can steal another flow's quota; excess channel ids are refused.
-    assert_eq!(
-        tx.encode_frame(MAX_FLOWS as u64, &[1], 1200),
-        Err(RealtimeDatagramError::FlowCapacity)
-    );
+    // A new local handle reuses an existing wire slot without expanding quotas.
+    let reused = tx
+        .encode_frame(MAX_FLOWS as u64, &[1], 1200)
+        .unwrap()
+        .remove(0);
+    assert_eq!(rx.decode_datagram(&reused, now).unwrap(), Some(vec![1]));
+    assert_eq!(tx.flows.len(), MAX_FLOWS);
+    assert_eq!(rx.flows.len(), MAX_FLOWS);
+    // A genuinely new authenticated wire id still cannot expand RX quotas.
     let mut other = FlowDatagramTx::new(&KEY, &SESSION);
     let excess = other.encode_frame(0, &[1], 1200).unwrap().remove(0);
     assert_eq!(
@@ -278,4 +282,122 @@ fn complete_frame_wire_bound_covers_legacy_and_opaque_fragmentation() {
             }
         }
     }
+}
+
+#[test]
+fn circuit_churn_reuses_bounded_slots_without_resetting_nonces_or_local_lanes() {
+    let now = Instant::now();
+    let mut tx = FlowDatagramTx::new(&KEY, &SESSION);
+    let mut rx = FlowDatagramRx::new(&KEY, &SESSION);
+    let pending = tx.encode_frame(0, &[7; 1500], 1200).unwrap();
+    assert_eq!(rx.decode_datagram(&pending[0], now).unwrap(), None);
+    let mut sequences = HashMap::new();
+    for circuit in 0..2048u64 {
+        let packets = tx
+            .encode_frame((1u64 << 32) | circuit, &[5; 1500], 1200)
+            .unwrap();
+        for (index, packet) in packets.iter().enumerate() {
+            let id: FlowId = packet[4..PREFIX_LEN].try_into().unwrap();
+            let sequence = u64::from_be_bytes(packet[36..44].try_into().unwrap());
+            if let Some(previous) = sequences.insert(id, sequence) {
+                assert!(
+                    sequence > previous,
+                    "slot reuse must never reset an AEAD nonce"
+                );
+            }
+            let frame = rx.decode_datagram(packet, now).unwrap();
+            if index + 1 == packets.len() {
+                assert_eq!(frame, Some(vec![5; 1500]));
+            } else {
+                assert_eq!(frame, None);
+            }
+        }
+        assert!(tx.flows.len() <= MAX_FLOWS);
+        assert!(rx.flows.len() <= MAX_FLOWS);
+        assert!(tx.reusable.len() <= MAX_FLOWS - LOCAL_LANES.len());
+    }
+    assert_eq!(sequences.len(), MAX_FLOWS - LOCAL_LANES.len());
+    // The second endpoint lane was not present during churn; its slot remains
+    // available without allocating a new wire id past the receiver's cap.
+    let secondary = tx.encode_frame(2, &[9], 1200).unwrap().remove(0);
+    assert_eq!(rx.decode_datagram(&secondary, now).unwrap(), Some(vec![9]));
+    assert_eq!(tx.flows.len(), MAX_FLOWS);
+    assert_eq!(rx.flows.len(), MAX_FLOWS);
+    assert_eq!(
+        rx.decode_datagram(&pending[1], now).unwrap(),
+        Some(vec![7; 1500])
+    );
+    assert_eq!(
+        rx.decode_datagram(&pending[0], now),
+        Err(RealtimeDatagramError::Replay)
+    );
+    let primary = tx.encode_frame(0, &[8], 1200).unwrap().remove(0);
+    assert_eq!(&pending[0][4..PREFIX_LEN], &primary[4..PREFIX_LEN]);
+    assert_eq!(rx.decode_datagram(&primary, now).unwrap(), Some(vec![8]));
+}
+
+#[test]
+fn rebound_slot_keeps_inflight_messages_separate_and_rekeys_without_nonce_reset() {
+    let now = Instant::now();
+    let mut tx = FlowDatagramTx::new(&KEY, &SESSION);
+    let mut rx = FlowDatagramRx::new(&KEY, &SESSION);
+    let old = tx.encode_frame(1u64 << 32, &[7; 1500], 1200).unwrap();
+    assert_eq!(rx.decode_datagram(&old[0], now).unwrap(), None);
+    for circuit in 1..(MAX_FLOWS - LOCAL_LANES.len()) as u64 {
+        let p = tx
+            .encode_frame((1u64 << 32) | circuit, &[3], 1200)
+            .unwrap()
+            .remove(0);
+        assert_eq!(rx.decode_datagram(&p, now).unwrap(), Some(vec![3]));
+    }
+    let reused = tx
+        .encode_frame((1u64 << 32) | 999, &[8; 1500], 1200)
+        .unwrap();
+    assert_eq!(&old[0][4..PREFIX_LEN], &reused[0][4..PREFIX_LEN]);
+    assert_ne!(&old[0][24..28], &reused[0][24..28]);
+    assert_eq!(rx.decode_datagram(&reused[0], now).unwrap(), None);
+    assert_eq!(
+        rx.decode_datagram(&old[1], now).unwrap(),
+        Some(vec![7; 1500])
+    );
+    tx.rekey(&[8; 32], &[9; 32]);
+    rx.rekey(&[8; 32], &[9; 32], now);
+    assert_eq!(
+        rx.decode_datagram(&reused[1], now).unwrap(),
+        Some(vec![8; 1500])
+    );
+    let fresh = tx
+        .encode_frame((1u64 << 32) | 999, &[9], 1200)
+        .unwrap()
+        .remove(0);
+    assert_eq!(&reused[0][4..PREFIX_LEN], &fresh[4..PREFIX_LEN]);
+    let seq = |packet: &[u8]| u64::from_be_bytes(packet[36..44].try_into().unwrap());
+    assert!(seq(&fresh) > seq(&reused[1]));
+    assert_eq!(rx.decode_datagram(&fresh, now).unwrap(), Some(vec![9]));
+    assert_eq!(
+        rx.decode_datagram(&old[0], now),
+        Err(RealtimeDatagramError::Replay)
+    );
+}
+
+#[test]
+fn rejected_fragment_count_never_rebinds_a_slot_or_changes_reuse_order() {
+    let mut tx = FlowDatagramTx::new(&KEY, &SESSION);
+    for id in 0..32u64 {
+        tx.encode_frame((1u64 << 32) | id, &[1], 1200).unwrap();
+    }
+    let order = tx.reusable.clone();
+    let ids: HashMap<_, _> = tx.flows.iter().map(|(key, flow)| (*key, flow.id)).collect();
+    assert_eq!(
+        tx.encode_frame((1u64 << 32) | 999, &[1; 64], MIN_FLOW_DATAGRAM_SIZE),
+        Err(RealtimeDatagramError::TooManyFragments(64))
+    );
+    assert_eq!(tx.reusable, order);
+    assert_eq!(
+        tx.flows
+            .iter()
+            .map(|(key, flow)| (*key, flow.id))
+            .collect::<HashMap<_, _>>(),
+        ids
+    );
 }
