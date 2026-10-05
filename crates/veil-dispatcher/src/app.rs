@@ -28,6 +28,11 @@ use veil_util::lock;
 /// stale. Rate-limited per peer like the rest, and no new lever for a forger:
 /// a bare frame already earns a `NoSession` reply.
 pub(crate) fn ratchet_failure_warrants_reply(e: &veil_e2e::RatchetSpliceError) -> bool {
+    // Ordinary retransmission is not evidence of lost state. A reset reply
+    // would discard the sender's healthy chain and make in-flight frames fail.
+    if e.is_unavailable_message_key() {
+        return false;
+    }
     matches!(
         e,
         veil_e2e::RatchetSpliceError::WedgedConversationDropped
