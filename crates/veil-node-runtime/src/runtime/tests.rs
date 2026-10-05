@@ -3363,6 +3363,132 @@ async fn attempt_hole_punch_registered_peer_without_reflector() {
     let _ = fs::remove_file(path);
 }
 
+/// Exercise the actual punched-runner spawn boundary, where precise async
+/// capture used to drop registration before the future's first poll.
+#[tokio::test(flavor = "current_thread")]
+async fn punched_outbound_registration_lives_with_runner_and_cancellation() {
+    for cancel_before_poll in [false, true] {
+        let mut config = runtime_config_with_listen();
+        let configured = config.peers.remove(0);
+        let path = save_test_config("punched-runner-lifetime", config).unwrap();
+        let mut rt = NodeRuntime::start(&path, true).await.unwrap();
+        let services = rt.access();
+        let ctx = services.make_session_context();
+        let peer_node = [0xee; 32];
+        let sid = [0x17; 32];
+        let link = LinkId::new(0xeeee);
+        let peer = crate::types::PeerConfigEntry {
+            peer_id: configured.peer_id,
+            node_id: peer_node.into(),
+            public_key: configured.public_key.clone(),
+            nonce: configured.nonce.clone(),
+            transport: "tcp://127.0.0.1:9".into(),
+            algo: configured.algo,
+            tls_cert: None,
+            tls_key: None,
+            tls_ca_cert: None,
+            bootstrap_only: false,
+            source: crate::types::PeerSource::Configured,
+        };
+        let outbox = ctx
+            .session_tx_registry
+            .write()
+            .unwrap()
+            .register_owned(peer_node, sid);
+        ctx.live_sessions.lock().unwrap().insert(
+            link,
+            SessionInfo {
+                link_id: link,
+                node_id: Some(peer_node.into()),
+                sovereign_node_id: None,
+                nonce: None,
+                matched_peer_id: None,
+                source: SessionSource::Outbound(peer.peer_id),
+                listener_handle: None,
+                state: SessionState::Active,
+                transport: peer.transport.clone(),
+                remote_addr: None,
+                description: String::new(),
+            },
+        );
+        let guard = SessionGuard::new(
+            ctx.live_sessions.clone(),
+            link,
+            ctx.logger.clone(),
+            None,
+            sid,
+            ctx.session_registry.clone(),
+            None,
+            ctx.sessions_per_ip.clone(),
+            peer_node,
+            ctx.session_tx_registry.clone(),
+            None,
+            ctx.event_bus.clone(),
+            None,
+        );
+        let (stream, remote) = tokio::io::duplex(8192);
+        let session = AttachedDebugSession {
+            link_id: link,
+            source: SessionSource::Outbound(peer.peer_id),
+            stream: Box::new(stream),
+            quic_datagrams: None,
+            metrics: None,
+            peer_id: peer_node.into(),
+            peer_public_key: peer.public_key.clone(),
+            peer_nonce: peer.nonce.clone(),
+            peer_algo: Some(peer.algo),
+            peer_instance_id: None,
+            session_keys: veil_crypto::session_kdf::SessionKeys {
+                tx_key: [1; 32],
+                rx_key: [2; 32],
+                session_id: sid,
+            },
+            observed_addr: None,
+            udp_reflector_port: None,
+            shared_udp_reflectors: Vec::new(),
+            public_key: peer.public_key.clone(),
+            nonce: peer.nonce.clone(),
+            remote_discovery_mode: Default::default(),
+            remote_dht_service: false,
+            remote_caps_stated: false,
+            referral: false,
+            reserved_outbox_rx: outbox,
+            _guard: guard,
+        };
+        services.spawn_punched_outbound(session, &peer);
+        assert!(
+            services.has_live_session(&peer_node),
+            "spawn dropped an active registration before runner start"
+        );
+        assert!(ctx.live_sessions.lock().unwrap().contains_key(&link));
+        if !cancel_before_poll {
+            tokio::task::yield_now().await;
+            assert!(services.has_live_session(&peer_node));
+            drop(remote);
+            timeout(Duration::from_secs(2), async {
+                while services.has_live_session(&peer_node) {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+        } else {
+            let handle = lock_tasks(&services.tasks).sessions.pop().unwrap();
+            handle.abort();
+            assert!(handle.await.unwrap_err().is_cancelled());
+            assert!(!services.has_live_session(&peer_node));
+            drop(remote);
+        }
+        rt.stop().await.unwrap();
+        assert!(
+            !services.has_live_session(&peer_node),
+            "runner shutdown retained registration"
+        );
+        assert!(!ctx.live_sessions.lock().unwrap().contains_key(&link));
+        let _ = fs::remove_file(path);
+    }
+}
+
 /// Mixed-version network: a coordinator built before the punch-token wire
 /// extension strips the token in flight, so the initiator's reply comes back
 /// without it. Such a reply must NOT terminate the coordinator ladder — the
