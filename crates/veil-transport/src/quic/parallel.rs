@@ -113,7 +113,17 @@ impl QuicParallelHandle {
         let permit = self.reserve()?;
         let operation = async {
             let (host, _, sni, alpn) = quic_connect_parts(&self.0.peer.uri)?;
-            let config = build_quic_client_config(&ctx, alpn)?;
+            let mut config = build_quic_client_config(&ctx, alpn)?;
+            // Siblings use the parent's current UDP path. Its measured RTT is
+            // a better initial loss-timer estimate than a cold-connect default.
+            // This local rule applies to every generic sibling and changes no
+            // transport parameter, role metadata or receiver admission.
+            let mut transport = chrome_mimic_transport_config();
+            transport.initial_rtt(self.0.parent.rtt().clamp(
+                std::time::Duration::from_millis(50),
+                std::time::Duration::from_secs(1),
+            ));
+            config.transport_config(Arc::new(transport));
             let connection = self
                 .0
                 .endpoint
@@ -144,44 +154,62 @@ impl QuicParallelHandle {
     /// Accept only a connection from the parent's current remote UDP address.
     /// This address filter is not authentication: the session must verify the
     /// exporter-bound proof before dispatching any frame or installing keys.
-    /// The timeout includes lock, handshake and first-stream waits.
+    /// Idle endpoint waits remain cancellable by the parent. The timeout starts
+    /// after dequeuing an incoming connection and bounds TLS/first-stream waits.
     pub async fn accept(&self) -> Result<Box<dyn TransportConnection>> {
         if !self.has_exclusive_accept() {
             return Err(TransportError::Unsupported(
                 "shared QUIC listener owns acceptance".to_owned(),
             ));
         }
+        if self.0.parent.close_reason().is_some() {
+            return Err(quic_error("parallel QUIC parent closed"));
+        }
+        if self.0.slots.available_permits() == 0 {
+            return Err(quic_error("parallel QUIC connection budget exhausted"));
+        }
         let ctx = Arc::clone(&self.0.context);
-        let permit = self.reserve()?;
         let operation = async {
-            let _accept = self.0.accept.lock().await;
-            let connection = loop {
-                let incoming = self
-                    .0
-                    .endpoint
-                    .accept()
-                    .await
-                    .ok_or_else(|| quic_error("parallel QUIC endpoint closed"))?;
+            // Serialize only the endpoint dequeue. TLS and the lazily opened
+            // first stream must not prevent another bounded accept from making
+            // progress. Empty accepts consume no connection permit.
+            let incoming = loop {
+                let incoming = {
+                    let _accept = self.0.accept.lock().await;
+                    self.0
+                        .endpoint
+                        .accept()
+                        .await
+                        .ok_or_else(|| quic_error("parallel QUIC endpoint closed"))?
+                };
                 if incoming.remote_address() != self.0.parent.remote_address() {
                     incoming.refuse();
                     continue;
                 }
-                break incoming.accept().map_err(quic_error)?.await?;
+                break incoming;
             };
-            let (send, recv) = match connection.accept_bi().await {
-                Ok(streams) => streams,
-                Err(error) => {
-                    connection.close(0u32.into(), b"stream failed");
-                    return Err(error.into());
-                }
-            };
-            Ok(self.bind_child(connection, Box::new(QuicBidiStream { recv, send }), permit))
+            let permit = self.reserve()?;
+            timeout(ctx.quic.handshake_timeout, async {
+                let connection = incoming.accept().map_err(quic_error)?.await?;
+                let (send, recv) = match connection.accept_bi().await {
+                    Ok(streams) => streams,
+                    Err(error) => {
+                        connection.close(0u32.into(), b"stream failed");
+                        return Err(error.into());
+                    }
+                };
+                Ok(self.bind_child(connection, Box::new(QuicBidiStream { recv, send }), permit))
+            })
+            .await
+            .map_err(|_| handshake_timeout(ctx.quic.handshake_timeout))?
         };
         tokio::select! {
             _ = self.0.parent.closed() => Err(quic_error("parallel QUIC parent closed")),
-            result = timeout(ctx.quic.handshake_timeout, operation) => {
-                result.map_err(|_| handshake_timeout(ctx.quic.handshake_timeout))?
-            }
+            result = operation => result,
         }
     }
 }
+
+#[cfg(test)]
+#[path = "parallel_accept_tests.rs"]
+mod parallel_accept_tests;
