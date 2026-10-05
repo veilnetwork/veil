@@ -383,3 +383,27 @@ field-trial view now allows 1 kbit/s; per-stream explicit layer constraints
 remain authoritative. Final 8-kbit/s allocations were 7,840/8,000 bps.
 This stand mocks the plaintext Veil boundary and does not verify acoustic
 latency, physical Android capture or independent live relay flows.
+
+Loss-tolerant queue admission is now independent per process-local class
+(64 frames each). The previous single 64-frame pool could evict older primary
+packets when a later primary burst arrived after secondary/neutral traffic.
+Each class sheds only its own oldest lossy entry at that limit, retaining
+reliable entries and other classes' queued work. Forwarded users still all
+share the same INTERACTIVE class, 64-frame cap and FIFO; there is no relay
+role, user priority, wire field or per-remote service distinction. The common
+aggregate queue cap and 500-ms lossy age bound remain; up to 256 lossy frames
+can now be admitted across four local classes instead of 64 total.
+
+Counter regressions cover ordinary/conditional pops, expiry, datagram restore,
+aggregate shedding, and neutral reliable FIFO preservation. An encrypted
+stream-only SessionRunner test queues two primary bursts around secondary,
+background and neutral circuit bursts, then decrypts every received frame and
+checks completeness, exact bytes, per-class order, direct wire metadata and
+neutral circuit fallback priority. Restoring the former shared admission
+policy reproduces missing primary packets 0..31, retaining only 32/32/0/0
+frames across the four classes; the separated policy delivers 64/64/64/64.
+Final gates: 363 session unit tests (3 existing ignored), 2 encrypted-stream
+checks and 18 real-QUIC opaque-flow/parallel/rekey checks passed. Production
+session Clippy with warnings denied and Android ARM64 Rust compilation passed.
+This is source admission isolation; it does not claim physical acoustic quality
+or independent connections on the old live relay hops.

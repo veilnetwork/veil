@@ -92,3 +92,146 @@ async fn local_source_stream_budget_limits_committed_bulk_and_resumes_without_in
         "writer capacity did not resume the pending file without external input"
     );
 }
+
+/// Real queue admission, encrypted writer and stream fallback. Each local
+/// source fits its own lossy budget; a shared 64-frame pool used to discard
+/// older primary frames when the second primary burst arrived. The neutral
+/// circuit source must also retain its ordinary FIFO and wire priority.
+#[tokio::test]
+async fn local_lossy_sources_keep_complete_bursts_on_an_encrypted_stream_hop() {
+    use veil_anonymity::{circuit_data::CircuitCellBytes, circuit_wire::CircuitDataPayload};
+    use veil_proto::{AppRtDataPayload, family::RelayChainMsg};
+    use veil_session::priority_queue::LOSSY_REALTIME_MAX_DEPTH;
+
+    const COUNT: u32 = LOSSY_REALTIME_MAX_DEPTH as u32;
+    let (tx, rx) = mpsc::channel::<PriorityFrame>(4 * COUNT as usize + 1);
+    let app_frame = |seq| {
+        let payload = AppRtDataPayload {
+            src_app_id: [0xa1; 32],
+            app_id: [0xb2; 32],
+            endpoint_id: 13,
+            seq,
+            timestamp_us: 0,
+            marker: 0,
+            payload_type: 0,
+            payload: vec![seq as u8; 128],
+        }
+        .encode();
+        let mut header = FrameHeader::new(FrameFamily::App as u8, AppMsg::AppRtData as u16);
+        header.body_len = payload.len() as u32;
+        let mut frame = encode_header(&header).to_vec();
+        frame.extend(payload);
+        veil_bufpool::pooled_shared_from_vec(frame)
+    };
+    // All four sources are queued before the runner's drain pass. No producer
+    // needs further input for the writer to finish the admitted bursts.
+    for seq in 0..COUNT / 2 {
+        tx.try_send((0, app_frame(seq))).unwrap();
+    }
+    for seq in COUNT / 2..COUNT / 2 + COUNT {
+        tx.try_send((2, app_frame(seq))).unwrap();
+    }
+    for seq in COUNT / 2 + COUNT..COUNT / 2 + 2 * COUNT {
+        tx.try_send((3, app_frame(seq))).unwrap();
+    }
+    let cell = CircuitCellBytes::new(1024).unwrap();
+    for seq in 0..COUNT {
+        let body = CircuitDataPayload {
+            circuit_id: 4242,
+            seq,
+            ciphertext: vec![seq as u8; cell.get()],
+        }
+        .encode(cell)
+        .unwrap();
+        let mut header = FrameHeader::new(
+            FrameFamily::RelayChain as u8,
+            RelayChainMsg::CircuitDatagram as u16,
+        );
+        header.set_priority(veil_proto::priority::INTERACTIVE);
+        header.body_len = body.len() as u32;
+        let mut frame = encode_header(&header).to_vec();
+        frame.extend(body);
+        tx.try_send((1, veil_bufpool::pooled_shared_from_vec(frame)))
+            .unwrap();
+    }
+    for seq in COUNT / 2 + 2 * COUNT..3 * COUNT {
+        tx.try_send((0, app_frame(seq))).unwrap();
+    }
+    let (stream, mut receiver) = tokio::io::duplex(4096);
+    let key = [0x43; 32];
+    let mut runner = make_mobility_blackhole_runner(rx);
+    runner.stream = Box::new(stream);
+    runner.crypto.tx_cipher = Some(SessionCipher::new(&key, true));
+    let task = tokio::spawn(async move { runner.run().await });
+    let mut sources: [Vec<u32>; 4] = Default::default();
+    let result = tokio::time::timeout(Duration::from_secs(3), async {
+        let mut cipher = SessionCipher::new(&key, true);
+        while sources.iter().map(Vec::len).sum::<usize>() < 4 * COUNT as usize {
+            let mut header_bytes = [0u8; HEADER_SIZE];
+            receiver.read_exact(&mut header_bytes).await.unwrap();
+            let header = decode_header(&header_bytes).unwrap();
+            let mut encrypted = vec![0; header.body_len as usize];
+            receiver.read_exact(&mut encrypted).await.unwrap();
+            let body = cipher
+                .open(&encrypted, &veil_proto::codec::frame_aad(&header))
+                .unwrap();
+            if header.family == FrameFamily::Session as u8 {
+                assert_eq!(header.msg_type, SessionMsg::Padding as u16);
+                continue;
+            }
+            if header.family == FrameFamily::Control as u8 {
+                assert_eq!(header.msg_type, ControlMsg::Keepalive as u16);
+                continue;
+            }
+            if header.family == FrameFamily::RelayChain as u8 {
+                assert_eq!(header.msg_type, RelayChainMsg::CircuitData as u16);
+                assert_eq!(header.priority(), veil_proto::priority::INTERACTIVE);
+                let circuit = CircuitDataPayload::decode(&body).unwrap();
+                assert_eq!(circuit.circuit_id, 4242);
+                assert_eq!(circuit.ciphertext, vec![circuit.seq as u8; cell.get()]);
+                sources[1].push(circuit.seq);
+            } else {
+                assert_eq!(header.family, FrameFamily::App as u8);
+                assert_eq!(header.msg_type, AppMsg::AppRtData as u16);
+                // No local source class is copied into this direct wire frame.
+                assert_eq!(header.priority(), veil_proto::priority::REALTIME);
+                let data = AppRtDataPayload::decode(&body).unwrap();
+                assert_eq!(data.marker, 0);
+                assert_eq!(data.payload_type, 0);
+                assert_eq!(data.payload, vec![data.seq as u8; 128]);
+                let source = if (COUNT / 2..COUNT / 2 + COUNT).contains(&data.seq) {
+                    2
+                } else if (COUNT / 2 + COUNT..COUNT / 2 + 2 * COUNT).contains(&data.seq) {
+                    3
+                } else {
+                    0
+                };
+                sources[source].push(data.seq);
+            }
+        }
+        assert_eq!(
+            sources[0],
+            (0..COUNT / 2)
+                .chain(COUNT / 2 + 2 * COUNT..3 * COUNT)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(sources[1], (0..COUNT).collect::<Vec<_>>());
+        assert_eq!(
+            sources[2],
+            (COUNT / 2..COUNT / 2 + COUNT).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            sources[3],
+            (COUNT / 2 + COUNT..COUNT / 2 + 2 * COUNT).collect::<Vec<_>>()
+        );
+    })
+    .await;
+    task.abort();
+    assert!(task.await.unwrap_err().is_cancelled());
+    assert!(
+        result.is_ok(),
+        "shared lossy admission lost a complete source burst: {result:?}; counts={:?}, primary={:?}",
+        sources.each_ref().map(Vec::len),
+        sources[0]
+    );
+}
