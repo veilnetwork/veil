@@ -858,6 +858,7 @@ async fn measure_primary_blackout(
     large_cells: bool,
     link_delay: Duration,
     expiry: bool,
+    blackout_duration: Duration,
 ) -> BlackoutReport {
     use crate::datagram_flows::{SessionDatagramRx, SessionDatagramTx};
     use std::collections::HashSet;
@@ -870,7 +871,7 @@ async fn measure_primary_blackout(
 
     // Warm the congestion controller on the actual link before loss.
     let blackout_start = Duration::from_secs(6);
-    let blackout_end = blackout_start + Duration::from_secs(2);
+    let blackout_end = blackout_start + blackout_duration;
     let total_ticks = 900;
     let left = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let right = UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -948,8 +949,8 @@ async fn measure_primary_blackout(
     let mut max_queued_bytes = 0;
     for tick in 0u32..total_ticks {
         sleep_until(started + Duration::from_millis(u64::from(tick) * 20)).await;
-        // Both directions lose every packet, including ACKs, for exactly
-        // two seconds. Handshake and steady-state RTT use the same FIFO.
+        // Both directions lose every packet, including ACKs, for the chosen
+        // interval. Handshake and steady-state RTT use the same FIFO.
         link.blackout.store(
             (blackout_start..blackout_end).contains(&started.elapsed()),
             Ordering::Relaxed,
@@ -1034,7 +1035,8 @@ async fn measure_primary_blackout(
         }
     }
     eprintln!(
-        "blackout expiry={expiry} large_cells={large_cells} link_delay_ms={} accepted={accepted} admission_drops={admission_drops} pre={pre_blackout} post={post_blackout} first_fresh_ms={:?} max_post_age_ms={} max_post_gap_ms={} latest_seq={latest_seq} duplicates={duplicates} max_queued_bytes={max_queued_bytes} neutral_drops={} tx={:?} rx={:?}",
+        "blackout expiry={expiry} large_cells={large_cells} blackout_ms={} link_delay_ms={} accepted={accepted} admission_drops={admission_drops} pre={pre_blackout} post={post_blackout} first_fresh_ms={:?} max_post_age_ms={} max_post_gap_ms={} latest_seq={latest_seq} duplicates={duplicates} max_queued_bytes={max_queued_bytes} neutral_drops={} tx={:?} rx={:?}",
+        blackout_duration.as_millis(),
         link_delay.as_millis(),
         first_fresh.map(|v| v.as_millis()),
         max_post_age.as_millis(),
@@ -1071,7 +1073,9 @@ async fn characterize_primary_datagram_recovery_after_neutral_udp_blackout() {
             (false, Duration::from_secs(1)),
             (true, Duration::from_secs(1)),
         ] {
-            let report = measure_primary_blackout(large_cells, link_delay, expiry).await;
+            let report =
+                measure_primary_blackout(large_cells, link_delay, expiry, Duration::from_secs(2))
+                    .await;
             assert!(report.first_fresh.is_some());
         }
     }
@@ -1081,8 +1085,20 @@ async fn characterize_primary_datagram_recovery_after_neutral_udp_blackout() {
 async fn prepared_primary_expires_stale_packets_after_neutral_udp_loss() {
     // The unchanged admission/capacity policy alone keeps old packets for
     // seconds. Same link/loss/frame sizes, fresh real connections in both cases.
-    let old = measure_primary_blackout(false, Duration::from_millis(20), false).await;
-    let fresh = measure_primary_blackout(false, Duration::from_millis(20), true).await;
+    let old = measure_primary_blackout(
+        false,
+        Duration::from_millis(20),
+        false,
+        Duration::from_secs(2),
+    )
+    .await;
+    let fresh = measure_primary_blackout(
+        false,
+        Duration::from_millis(20),
+        true,
+        Duration::from_secs(2),
+    )
+    .await;
     assert!(
         old.max_post_age > Duration::from_secs(1),
         "control must reproduce stale delivery"
@@ -1096,6 +1112,24 @@ async fn prepared_primary_expires_stale_packets_after_neutral_udp_loss() {
         "200 ms sender deadline plus link delay must replace stale backlog: {:?}",
         fresh.max_post_age
     );
+}
+
+#[tokio::test]
+#[ignore = "Manual four-second phone-like neutral outage attribution; run with --ignored --nocapture"]
+async fn characterize_prepared_primary_recovery_after_four_second_neutral_outage() {
+    // Match the duration independently observed on Poco's network path, with
+    // source audio-sized and opaque circuit-sized cells. Neither neutral FIFO
+    // identifies their role. This reports transport recovery, not phone quality.
+    for large_cells in [false, true] {
+        let report = measure_primary_blackout(
+            large_cells,
+            Duration::from_millis(20),
+            true,
+            Duration::from_secs(4),
+        )
+        .await;
+        assert!(report.first_fresh.is_some());
+    }
 }
 
 struct BoundTestLane {
