@@ -28,6 +28,29 @@ async fn runner_channels_with_backlog(
     reliable_priority: Option<u8>,
     idle_probe: Option<Duration>,
 ) {
+    runner_channels_with_partial_read(
+        flows,
+        parallel,
+        rotate,
+        shared,
+        resumed,
+        reliable_priority,
+        idle_probe,
+        None,
+    )
+    .await;
+}
+
+async fn runner_channels_with_partial_read(
+    flows: bool,
+    parallel: bool,
+    rotate: bool,
+    shared: bool,
+    resumed: bool,
+    reliable_priority: Option<u8>,
+    idle_probe: Option<Duration>,
+    partial: Option<usize>,
+) {
     let blocked_reliable = reliable_priority.is_some();
     let context = Arc::new(TransportContext::for_debug().unwrap());
     let registry = Arc::new(ParallelRegistry::default());
@@ -179,6 +202,17 @@ async fn runner_channels_with_backlog(
         resumed_caps = Some(results.map(|result| result.remote_capabilities));
     }
 
+    if let Some(bytes) = partial {
+        assert!(!rotate && !resumed);
+        let mut header = FrameHeader::new(FrameFamily::App as u8, AppMsg::AppData as u16);
+        header.body_len = 4096;
+        let mut unfinished = encode_header(&header).to_vec();
+        unfinished.extend_from_slice(&[0x55; 32]);
+        a_stream.write_all(&unfinished[..bytes]).await.unwrap();
+        b_stream.write_all(&unfinished[..bytes]).await.unwrap();
+        // Neither peer completes this ordered frame during the probe. Both
+        // must still dequeue local sources onto real independent connections.
+    }
     let mut tasks = Vec::new();
     let mut runner_indices = Vec::new();
     if let Some(listener) = listener {
@@ -1290,6 +1324,26 @@ async fn authenticated_independent_datagrams_keep_parent_alive_then_silence_reap
         false,
         None,
         Some(Duration::from_millis(800)),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn independent_sources_continue_while_ordered_frame_header_is_incomplete() {
+    runner_channels_with_partial_read(true, true, false, false, false, None, None, Some(3)).await;
+}
+
+#[tokio::test]
+async fn independent_sources_continue_while_ordered_frame_body_is_incomplete() {
+    runner_channels_with_partial_read(
+        true,
+        true,
+        false,
+        false,
+        false,
+        None,
+        None,
+        Some(veil_proto::header::HEADER_SIZE + 16),
     )
     .await;
 }
