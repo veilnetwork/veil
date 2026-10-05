@@ -6,10 +6,12 @@
 //! fixes that by running `veil-onion-stream` (end-to-end ARQ + AIMD congestion
 //! control) over a [`CellSender`]. Two backends:
 //!
-//! - DEFAULT (`AnonCells`): each cell rides `send_anonymous_authenticated` — a
+//! - DEFAULT (`AnonCells`): each cell rides an authenticated anonymous send — a
 //!   FRESH onion circuit + per-cell signature/verify. Reliable, but the per-cell
 //!   circuit build inflates the RTT and the varying paths cause reordering →
 //!   spurious recoveries → ~42 KB/s (device-measured).
+//!   DATA selects the endpoint's background source lane; controls keep their
+//!   ordinary lane. The source choice is absent from relay frames.
 //! - PINNED CIRCUIT (`CircuitCells`, opt-in `VEIL_ONION_STREAM_CIRCUIT=1`): a
 //!   build-once inbound stateful circuit to this node's published rendezvous relay
 //!   plus lazy per-peer outbound circuits to each receiver's published R; cheap XOR
@@ -707,7 +709,7 @@ fn open_stream_peer_intro(
     parse_stream_peer_intro_plaintext(peer_tag, &plaintext)
 }
 
-/// [`CellSender`] over `send_anonymous_authenticated` — the default datagram path.
+/// [`CellSender`] over authenticated anonymous sends — the datagram fallback.
 struct AnonCells {
     sender: Arc<AppSender>,
     data_pacer: Arc<StreamDataPacer>,
@@ -715,13 +717,25 @@ struct AnonCells {
 
 impl CellSender for AnonCells {
     async fn send(&self, dst: Addr, cell: Vec<u8>) -> io::Result<()> {
-        if matches!(Frame::decode(&cell), Some(Frame::Data { .. })) {
+        let is_data = matches!(Frame::decode(&cell), Some(Frame::Data { .. }));
+        let sent = if is_data {
             self.data_pacer.wait(dst.node).await;
-        }
-        self.sender
-            .send_anonymous_authenticated(dst.node, dst.app, STREAM_ENDPOINT_ID, &cell)
-            .await
-            .map_err(|e| io::Error::other(format!("anon stream send: {e}")))
+            self.sender
+                .send_on_local_lane(
+                    veil_proto::priority::BACKGROUND,
+                    dst.node,
+                    dst.app,
+                    STREAM_ENDPOINT_ID,
+                    &cell,
+                    true,
+                )
+                .await
+        } else {
+            self.sender
+                .send_anonymous_authenticated(dst.node, dst.app, STREAM_ENDPOINT_ID, &cell)
+                .await
+        };
+        sent.map_err(|e| io::Error::other(format!("anon stream send: {e}")))
     }
 }
 
@@ -4887,6 +4901,10 @@ fn retire_circuits_later(
         });
     }
 }
+
+#[cfg(all(test, unix))]
+#[path = "anon_stream/source_lane_tests.rs"]
+mod source_lane_tests;
 
 #[cfg(test)]
 mod tests {

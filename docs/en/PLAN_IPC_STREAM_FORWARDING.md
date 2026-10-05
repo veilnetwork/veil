@@ -349,3 +349,18 @@ wire priority, final close order and bridge cleanup. Reverting either source
 lane or SDK frame size makes that integration fail. Acoustic quality under
 loaded two-phone calls and independent flow support on older first-hop relays
 still require live verification.
+
+The anonymous datagram fallback in `AnonCells` also selects background source
+lane 3 for valid stream DATA cells, including ARQ retransmissions. Its existing
+DATA pacer still runs; SYN/SYN_ACK/ACK/FIN/RST and undecodable cells retain the
+ordinary authenticated anonymous send path. Selection uses the local stream
+cell decoder and leaves destination, endpoint and protected cell bytes intact.
+The pinned-circuit backend already selects this lane for recoverable DATA.
+
+The fallback regression drives the real CellSender/SDK/Unix IPC chain into the
+daemon's authenticated anonymous-send boundary. It verifies DATA and repeat
+DATA on lane 3 and every control on the ordinary lane, with unchanged bytes
+and address. Reverting DATA to the ordinary lane makes this test fail. A real
+StreamMux/driver fault test deliberately delivers FIN ahead of held DATA and
+verifies complete ordered bytes followed by clean EOF, protecting the control
+lane's ability to pass DATA that is waiting in the background queue.
