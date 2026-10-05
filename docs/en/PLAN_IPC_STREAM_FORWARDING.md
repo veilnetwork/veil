@@ -364,3 +364,22 @@ and address. Reverting DATA to the ordinary lane makes this test fail. A real
 StreamMux/driver fault test deliberately delivers FIN ahead of held DATA and
 verifies complete ordered bytes followed by clean EOF, protecting the control
 lane's ability to pass DATA that is waiting in the background queue.
+
+The sender video controller's low-rate policy has a separate optional native
+`set_video_budget` ABI for unicast and groups. It accepts 1..2500 kbit/s and
+fractional 0.02..60 fps; the shared source gate sheds encoder input while
+preserving local preview. VP8 layer/Call minima no longer force low-rate
+allocations back to 30 kbit/s, and stats distinguish requested bitrate from
+WebRTC's `video_encoder_target_bps`. Existing integer setters retain defaults
+and 30-kbit/s floor. This is endpoint pacing/allocation only: media bytes,
+routes, relay neutrality and opaque flow negotiation remain unchanged.
+
+The real WebRTC Call/queue gate measures actual encoder target allocation,
+sparse encoded-frame output, live local preview, accepted Opus input, recovery,
+legacy defaults and bounded failed-worker retunes in unicast and groups.
+It caught a remaining 30-kbit/s WebRTC registration floor even after the VP8
+layer/Call constraints were lowered. The endpoint's video-only min-bitrate
+field-trial view now allows 1 kbit/s; per-stream explicit layer constraints
+remain authoritative. Final 8-kbit/s allocations were 7,840/8,000 bps.
+This stand mocks the plaintext Veil boundary and does not verify acoustic
+latency, physical Android capture or independent live relay flows.

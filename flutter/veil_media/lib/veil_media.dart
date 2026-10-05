@@ -159,17 +159,24 @@ class VeilMediaEngine {
     bool send = true,
     bool recv = true,
     int maxBitrateKbps = 150,
-    int maxFps = 15,
+    num maxFps = 15,
   }) {
     _ensure();
-    return ffi.veilMediaEngineStartVideo(
+    _validateVideoCadence(maxFps);
+    final started = ffi.veilMediaEngineStartVideo(
           _ptr,
           send ? 1 : 0,
           recv ? 1 : 0,
           maxBitrateKbps,
-          maxFps,
+          maxFps.ceil().clamp(1, 60),
         ) ==
         0;
+    if (started && send && supportsLowRateVideo) {
+      // Retune before the caller opens capture. A busy worker is retried by
+      // the host policy; a mounted receive stream remains available.
+      setVideoBitrate(maxBitrateKbps: maxBitrateKbps, maxFps: maxFps);
+    }
+    return started;
   }
 
   bool stopVideo() {
@@ -198,12 +205,22 @@ class VeilMediaEngine {
     return setPacketSize != null && setPacketSize(_ptr, bytes) == 0;
   }
 
+  /// Native support for budgets below 30 kbit/s and fractional fps.
+  bool get supportsLowRateVideo => ffi.veilMediaEngineSetVideoBudget != null;
+
   /// Retune the running video send stream to a new bitrate/fps budget without
   /// restarting it (link-quality adaptation). Returns false when video send
   /// isn't running.
-  bool setVideoBitrate({required int maxBitrateKbps, required int maxFps}) {
+  bool setVideoBitrate({required int maxBitrateKbps, required num maxFps}) {
     _ensure();
-    return ffi.veilMediaEngineSetVideoBitrate(_ptr, maxBitrateKbps, maxFps) ==
+    _validateVideoCadence(maxFps);
+    final set = ffi.veilMediaEngineSetVideoBudget;
+    if (set != null) return set(_ptr, maxBitrateKbps, maxFps.toDouble()) == 0;
+    return ffi.veilMediaEngineSetVideoBitrate(
+          _ptr,
+          maxBitrateKbps,
+          maxFps.ceil().clamp(1, 60),
+        ) ==
         0;
   }
 
@@ -608,10 +625,19 @@ class VeilGroupMediaEngine {
     return ffi.veilMediaGroupEngineStopVideo(_ptr) == 0;
   }
 
-  bool setVideoBitrate({required int maxBitrateKbps, required int maxFps}) {
+  /// Native support for budgets below 30 kbit/s and fractional fps.
+  bool get supportsLowRateVideo =>
+      ffi.veilMediaGroupEngineSetVideoBudget != null;
+
+  bool setVideoBitrate({required int maxBitrateKbps, required num maxFps}) {
     _ensure();
+    _validateVideoCadence(maxFps);
+    final budget = ffi.veilMediaGroupEngineSetVideoBudget;
+    if (budget != null)
+      return budget(_ptr, maxBitrateKbps, maxFps.toDouble()) == 0;
     final set = ffi.veilMediaGroupEngineSetVideoBitrate;
-    return set != null && set(_ptr, maxBitrateKbps, maxFps) == 0;
+    return set != null &&
+        set(_ptr, maxBitrateKbps, maxFps.ceil().clamp(1, 60)) == 0;
   }
 
   /// Fresh audio report maxima and independently sampled video telemetry.
@@ -1281,4 +1307,8 @@ class VeilAudioPlayer {
       _buf = null;
     }
   }
+}
+
+void _validateVideoCadence(num fps) {
+  if (!fps.isFinite || fps <= 0) throw ArgumentError.value(fps, 'maxFps');
 }
