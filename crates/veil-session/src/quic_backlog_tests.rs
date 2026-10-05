@@ -1668,3 +1668,258 @@ async fn primary_ack_blackout_limits_secondary_before_rtt_or_expiry_changes() {
         "primary PTO shrank reliable control admission"
     );
 }
+
+#[tokio::test]
+async fn independent_primary_expiry_keeps_parent_control_admission() {
+    use crate::parallel_binding::ParallelParent;
+    use veil_proto::priority::{BULK, REALTIME};
+    let left = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let right = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let link = NeutralLink::new(
+        left.local_addr().unwrap(),
+        right.local_addr().unwrap(),
+        1_000_000,
+        Duration::from_millis(20),
+    )
+    .await;
+    link.enabled.store(true, Ordering::Relaxed);
+    let ctx = Arc::new(TransportContext::for_debug().unwrap());
+    let remote = tokio::spawn(promote_punched_quic(
+        right,
+        link.right_addr,
+        Arc::clone(&ctx),
+        PunchedQuicRole::Responder,
+    ));
+    let local = promote_punched_quic(left, link.left_addr, ctx, PunchedQuicRole::Initiator)
+        .await
+        .unwrap();
+    let close = local.quic_connection().unwrap();
+    let canonical = local.quic_datagrams().unwrap();
+    let a_parallel = local.parallel_quic().unwrap();
+    let mut stream = local.into_stream().unwrap();
+    stream.write_all(b"control").await.unwrap();
+    let remote = remote.await.unwrap().unwrap();
+    let b_parallel = remote.parallel_quic().unwrap();
+    let mut remote_stream = remote.into_stream().unwrap();
+    let mut prefix = [0; 7];
+    remote_stream.read_exact(&mut prefix).await.unwrap();
+    assert_eq!(&prefix, b"control");
+    let a_parent = ParallelParent::new([1; 32], [2; 32], [3; 32]);
+    let b_parent = ParallelParent::new([1; 32], [3; 32], [2; 32]);
+    let mut primary = bind_test_lane(&a_parallel, &b_parallel, &a_parent, &b_parent).await;
+    assert_ne!(
+        canonical.channel_binding().unwrap(),
+        primary.tx.channel_binding().unwrap()
+    );
+    sleep(Duration::from_millis(100)).await;
+    let mut admission =
+        super::local_reliable_admission::LocalReliableAdmission::new(canonical.clone());
+    let frame = primary_test_frame(false, 0, 0);
+    admission.observe(REALTIME, &frame, std::time::Instant::now(), true);
+    link.blackout.store(true, Ordering::Relaxed);
+    timeout(Duration::from_secs(3), async {
+        loop {
+            let packets = primary
+                .tx_cipher
+                .encode_frame(u64::from(REALTIME), &frame, primary.tx.max_size().unwrap())
+                .unwrap();
+            if super::local_primary_datagram_fits(
+                packets.iter().map(Vec::len).sum(),
+                primary.tx.send_buffer_space(),
+            ) {
+                let expiry =
+                    super::local_primary_datagram_expiry(REALTIME, true, std::time::Instant::now())
+                        .unwrap();
+                for packet in packets {
+                    primary.tx.send_before(&packet, expiry).unwrap();
+                }
+            }
+            if primary.tx.path_stats().expired_outgoing_datagrams > 0 {
+                break;
+            }
+            sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let pressure = primary.tx.path_stats();
+    assert!(pressure.expired_outgoing_datagrams > 0 && pressure.pto_count > 0);
+    let now = std::time::Instant::now();
+    admission.observe_primary_path(&primary.tx, now);
+    admission.observe(REALTIME, &frame, now, true);
+    let probe = admission.allow_secondary(BULK, now);
+    let burst = admission.allow_secondary(BULK, now + Duration::from_millis(1));
+    // The production writer must hold its control lease across partial writes
+    // and a simultaneous primary-pressure update in the runner.
+    let (partial_tx, partial_rx) = tokio::sync::oneshot::channel();
+    let (resume_tx, resume_rx) = tokio::sync::oneshot::channel();
+    let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+    let observed_bytes = Arc::new(AtomicU64::new(0));
+    let observed: veil_transport::BoxIoStream = Box::new(ObservedControlStream {
+        stream,
+        observed_bytes: Arc::clone(&observed_bytes),
+        written: 0,
+        partial: Some(partial_tx),
+        resume: Some(resume_rx),
+        done: Some(done_tx),
+    });
+    let (_read, write) = tokio::io::split(observed);
+    let (wire_tx, wire_rx) = mpsc::channel(2);
+    let mut writer = tokio::spawn(super::writer_task(
+        write,
+        wire_rx,
+        Some(admission.writer_admission()),
+        None,
+        Arc::new(veil_observability::NodeLogger::new_noop()),
+        "control-gate".into(),
+    ));
+    super::SessionRunner::push_wire_classified(
+        &wire_tx,
+        veil_bufpool::pooled_shared_from_vec(vec![0x33; 12 * 1024]),
+        &None,
+        true,
+    )
+    .unwrap();
+    let partial = timeout(Duration::from_millis(100), partial_rx)
+        .await
+        .is_ok();
+    let now = std::time::Instant::now();
+    admission.observe_primary_path(&primary.tx, now);
+    admission.observe(REALTIME, &frame, now, true);
+    let _ = resume_tx.send(());
+    let admitted = timeout(Duration::from_millis(100), done_rx)
+        .await
+        .is_ok_and(|r| r.is_ok());
+    // A following neutral transit blob must not inherit the finished control
+    // lease. Under the same primary pressure its bulk window stays at 1 KiB.
+    super::SessionRunner::push_wire_classified(
+        &wire_tx,
+        veil_bufpool::pooled_shared_from_vec(vec![0x44; 2 * 1024]),
+        &None,
+        false,
+    )
+    .unwrap();
+    sleep(Duration::from_millis(50)).await;
+    let neutral_blocked = observed_bytes.load(Ordering::Relaxed) == 12 * 1024;
+    link.blackout.store(false, Ordering::Relaxed);
+    let received = if admitted {
+        let mut payload = vec![0; 12 * 1024];
+        timeout(
+            Duration::from_secs(3),
+            remote_stream.read_exact(&mut payload),
+        )
+        .await
+        .is_ok_and(|r| r.is_ok())
+            && payload.iter().all(|b| *b == 0x33)
+    } else {
+        false
+    };
+    let mut neutral = vec![0; 2 * 1024];
+    let neutral_received = admitted
+        && timeout(
+            Duration::from_secs(3),
+            remote_stream.read_exact(&mut neutral),
+        )
+        .await
+        .is_ok_and(|r| r.is_ok())
+        && neutral.iter().all(|b| *b == 0x44);
+    drop(wire_tx);
+    close.close(0u32.into(), b"independent control expiry gate complete");
+    if timeout(Duration::from_secs(1), &mut writer).await.is_err() {
+        writer.abort();
+        let _ = writer.await;
+    }
+    assert!(partial, "writer did not make its first partial write");
+    assert!(
+        admitted,
+        "independent primary expiry shrank parent control admission: {pressure:?}"
+    );
+
+    assert!(neutral_blocked, "neutral transit inherited a control lease");
+    assert!(
+        neutral_received,
+        "neutral transit did not recover with the link"
+    );
+    assert!(
+        probe && !burst,
+        "primary expiry must still suppress video bursts"
+    );
+    assert!(
+        received,
+        "admitted control bytes did not arrive after network recovery"
+    );
+}
+
+/// Real QUIC stream with a test-only pause after the first partial write.
+/// The pause lets the runner observe child pressure while the writer owns
+/// the same ordered blob; it never changes or classifies UDP packets.
+struct ObservedControlStream {
+    stream: veil_transport::BoxIoStream,
+    written: usize,
+    observed_bytes: Arc<AtomicU64>,
+    partial: Option<tokio::sync::oneshot::Sender<()>>,
+    resume: Option<tokio::sync::oneshot::Receiver<()>>,
+    done: Option<tokio::sync::oneshot::Sender<()>>,
+}
+
+impl tokio::io::AsyncRead for ObservedControlStream {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.stream).poll_read(cx, buf)
+    }
+}
+
+impl tokio::io::AsyncWrite for ObservedControlStream {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        use std::{future::Future, pin::Pin, task::Poll};
+        if self.written > 0 {
+            if let Some(resume) = &mut self.resume {
+                if Pin::new(resume).poll(cx).is_pending() {
+                    return Poll::Pending;
+                }
+                self.resume = None;
+            }
+        }
+        let bytes = if self.written == 0 {
+            &buf[..buf.len().min(1024)]
+        } else {
+            buf
+        };
+        let result = Pin::new(&mut self.stream).poll_write(cx, bytes);
+        if let Poll::Ready(Ok(len)) = result {
+            self.written += len;
+            self.observed_bytes
+                .store(self.written as u64, Ordering::Relaxed);
+            if let Some(partial) = self.partial.take() {
+                let _ = partial.send(());
+            }
+            if self.written == 12 * 1024 {
+                if let Some(done) = self.done.take() {
+                    let _ = done.send(());
+                }
+            }
+        }
+        result
+    }
+
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.stream).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.stream).poll_shutdown(cx)
+    }
+}
