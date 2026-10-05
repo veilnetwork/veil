@@ -2257,11 +2257,12 @@ impl RatchetRuntime {
     }
 
     /// Find the identity whose verified certificates name the payload's sending
-    /// instance. This chooses a decryption context, never grants provenance:
+    /// instance, or an existing conversation for a bare frame after restart.
+    /// This chooses a decryption context, never grants provenance:
     /// `open_payload` must still authenticate the ciphertext and device key.
     /// Ambiguous instance IDs fail closed rather than depend on map order.
     pub fn peer_identity_for_payload(&self, payload: &[u8], now_unix: u64) -> Option<[u8; 32]> {
-        let (instance, _) = payload_instances(payload)?;
+        let (instance, recipient_instance) = payload_instances(payload)?;
         let keys = self
             .peer_ratchet_keys
             .read()
@@ -2270,8 +2271,28 @@ impl RatchetRuntime {
             .iter()
             .filter(|(_, devices)| devices.names_instance(&instance, now_unix))
             .map(|(identity, _)| *identity);
-        let identity = identities.next()?;
-        identities.next().is_none().then_some(identity)
+        if let Some(identity) = identities.next() {
+            return identities.next().is_none().then_some(identity);
+        }
+        drop(keys);
+        // The host restores ratchet state before ephemeral certificate/session
+        // caches. Relayed envelopes name physical devices, whereas conversation
+        // keys and AEAD associated data name identities. Without this lookup a
+        // valid resumed frame gets NoSession under the physical address, and
+        // the signed error makes the sender destroy its correct conversation.
+        // Only select a held bare-frame context: this cannot create a session,
+        // authorize a device, refresh a certificate, or teach a route. The
+        // exact local instance and sending instance must match uniquely, and
+        // open_payload still verifies the tag under that identity's keys.
+        if payload[2] != KIND_FRAME || self.identity()?.local_instance_id != recipient_instance {
+            return None;
+        }
+        let held = self.store.lock();
+        let mut contexts = held.entries.keys().filter(|key| {
+            key.local_instance_id == recipient_instance && key.peer_instance_id == instance
+        });
+        let identity = contexts.next()?.peer_node_id;
+        contexts.next().is_none().then_some(identity)
     }
 
     /// Seal for a peer whose certificate the caller has verified. See [`seal`].
@@ -4285,6 +4306,61 @@ mod tests {
             .plaintext,
             b"four"
         );
+    }
+
+    #[test]
+    fn restored_context_selection_does_not_restore_expired_device_authorization() {
+        use std::sync::{Arc, RwLock};
+        let (a, b) = (device(0xAE), device(0xBE));
+        a_to_b(&a, &b, b"initial").unwrap();
+        let answer = seal(
+            &b.store,
+            &b.me(),
+            keys(&a, &a.ek(), &a.ratchet_pk()),
+            b"answer",
+            NOW,
+        )
+        .unwrap()
+        .0;
+        open(&a.store, &a.me(), &b.node_id, &answer, None, NOW).unwrap();
+        let next = seal(
+            &a.store,
+            &a.me(),
+            keys(&b, &b.ek(), &b.ratchet_pk()),
+            b"resumed",
+            NOW,
+        )
+        .unwrap()
+        .0;
+        assert_eq!(next[2], KIND_FRAME);
+        let key = b.store.keys()[0];
+        b.store
+            .lock()
+            .entries
+            .get_mut(&key)
+            .unwrap()
+            .authenticated_until = NOW - 1;
+        let blob = b.store.export(&key).unwrap();
+        let restored = Arc::new(RatchetStore::new());
+        restored.import(&key, &blob, NOW).unwrap();
+        let runtime = RatchetRuntime {
+            store: restored,
+            seed_ring: Arc::new(RwLock::new(b.ring.clone())),
+            local_node_id: Arc::new(RwLock::new(b.node_id)),
+            local_instance_id: Arc::new(RwLock::new(Some(b.instance_id))),
+            peer_ratchet_keys: Arc::new(RwLock::new(PeerRatchetKeyCache::new())),
+        };
+        let identity = runtime.peer_identity_for_payload(&next, NOW).unwrap();
+        assert_eq!(identity, a.node_id);
+        let opened = runtime.open_payload(&identity, &next, NOW).unwrap();
+        assert_eq!(opened.plaintext, b"resumed");
+        assert!(!opened.authenticated);
+        assert_eq!(opened.sender_device_id, None);
+        let mut other_device = key;
+        other_device.local_instance_id = [0xEF; 16];
+        runtime.store.forget(&key);
+        runtime.store.import(&other_device, &blob, NOW).unwrap();
+        assert_eq!(runtime.peer_identity_for_payload(&next, NOW), None);
     }
 
     #[test]
