@@ -548,7 +548,9 @@ pub(crate) fn send_app_close(
 }
 
 /// Build the `[header || body]` wire frame for an App-family message on
-/// `wire_stream_id` and hand it to the broadcaster at INTERACTIVE priority.
+/// `wire_stream_id`. Reliable byte streams use the endpoint's background source
+/// lane, while the wire header stays neutral. Open/data/close MUST share a lane:
+/// a faster close would overtake data still waiting in the source queue.
 fn send_app_frame(
     broadcaster: &dyn FrameBroadcaster,
     dst: &[u8; 32],
@@ -562,13 +564,93 @@ fn send_app_frame(
     hdr.set_priority(priority::INTERACTIVE);
     let mut frame = encode_header(&hdr).to_vec();
     frame.extend_from_slice(body);
-    broadcaster.send_to(dst, priority::INTERACTIVE, frame)
+    broadcaster.send_to(dst, priority::BACKGROUND, frame)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use veil_proto::{StreamClosePayload, StreamDataPayload, header::HEADER_SIZE};
+
+    #[test]
+    fn reliable_stream_lifecycle_uses_one_local_lane_and_neutral_wire_headers() {
+        use std::sync::Mutex;
+        use veil_session::priority_queue::PriorityQueue;
+
+        #[derive(Default)]
+        struct Source(Mutex<Vec<(u8, Vec<u8>)>>);
+        impl FrameBroadcaster for Source {
+            fn send_to(&self, _: &[u8; 32], lane: u8, frame: Vec<u8>) -> bool {
+                self.0.lock().unwrap().push((lane, frame));
+                true
+            }
+            fn send_to_all_with_priority(&self, _: u8, _: Arc<[u8]>) {}
+            fn active_node_ids(&self) -> Vec<[u8; 32]> {
+                Vec::new()
+            }
+        }
+        let source = Source::default();
+        let dst = [9; 32];
+        let app = [7; 32];
+        assert!(send_app_open(&source, &dst, 41, app, 5));
+        let payload: Vec<_> = (0..33 * 2048 + 19).map(|n| (n % 251) as u8).collect();
+        for chunk in payload.chunks(2048) {
+            assert!(send_app_data(&source, &dst, 41, app, 5, chunk.to_vec()));
+        }
+        assert!(send_app_close(&source, &dst, 41, app, 5));
+
+        let mut queue = PriorityQueue::with_default_weights();
+        for (lane, frame) in source.0.into_inner().unwrap() {
+            let header = veil_proto::codec::decode_header(&frame).unwrap();
+            assert_eq!(
+                lane,
+                priority::BACKGROUND,
+                "a stream frame escaped the source budget"
+            );
+            assert_eq!(
+                header.priority(),
+                priority::INTERACTIVE,
+                "local lane leaked onto the wire"
+            );
+            assert_eq!(header.stream_id, 41);
+            queue.push(lane, veil_bufpool::pooled_shared_from_vec(frame));
+        }
+        // A new local primary may pass all queued stream bytes. Afterwards the
+        // entire open/data/close lifecycle must still be in its original order.
+        queue.push(
+            priority::REALTIME,
+            veil_bufpool::pooled_shared_from_vec(vec![0xEE]),
+        );
+        assert_eq!(&*queue.pop().unwrap(), &[0xEE]);
+        let mut opened = false;
+        let mut closed = false;
+        let mut bytes = Vec::new();
+        while let Some(frame) = queue.pop() {
+            let header = veil_proto::codec::decode_header(&frame).unwrap();
+            let body = &frame[HEADER_SIZE..];
+            match AppMsg::try_from(header.msg_type).unwrap() {
+                AppMsg::AppOpen => {
+                    assert!(!opened && !closed);
+                    assert_eq!(AppOpenPayload::decode(body).unwrap().app_id, app);
+                    opened = true;
+                }
+                AppMsg::AppData => {
+                    assert!(opened && !closed);
+                    let data = AppDataPayload::decode(body).unwrap();
+                    assert_eq!(data.app_id, app);
+                    assert_eq!(data.endpoint_id, 5);
+                    bytes.extend(data.data);
+                }
+                AppMsg::AppClose => {
+                    assert!(opened && !closed);
+                    closed = true;
+                }
+                _ => panic!("unexpected stream frame"),
+            }
+        }
+        assert!(opened && closed);
+        assert_eq!(bytes, payload, "loss, duplication or close overtaking data");
+    }
 
     /// Test `FrameBroadcaster` that captures every `(peer, frame)` sent so a
     /// test can assert e.g. that a wire `AppClose` went out on teardown.
