@@ -651,6 +651,7 @@ pub unsafe extern "C" fn veil_media_open_direct_channel(
                 let Some(sender) = guard.as_ref() else {
                     return false;
                 };
+                media::trace_sealed_cell("direct_send", &peer, cell.sealed.as_bytes());
                 let timestamp_us = started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
                 let _ = sender
                     .send_rt_data_on_local_lane_before(
