@@ -12,6 +12,7 @@
 #include <set>
 #include <string>
 #include <thread>
+#include <vector>
 
 using Injector = int (*)(void*, uint64_t, uint32_t, uint32_t);
 extern "C" int veil_media_test_direct_call_planes(VeilMediaEngine*, Injector, void*);
@@ -19,6 +20,7 @@ extern "C" int veil_media_test_blocked_audio_stats(VeilMediaEngine*, Injector, v
 extern "C" int veil_media_test_muted_capture_lifecycle();
 extern "C" int veil_media_test_group_call_planes(VeilGroupMediaEngine*, Injector, void*);
 extern "C" int veil_media_test_group_blocked_audio_stats(VeilGroupMediaEngine*, Injector, void*);
+extern "C" int veil_media_test_group_emit_rtcp(VeilGroupMediaEngine*);
 extern "C" int veil_media_test_group_fanout_packet(VeilGroupMediaEngine*, int);
 extern "C" int veil_media_test_video_bandwidth(VeilMediaEngine*);
 struct Callback { void (*fn)(void*, const uint8_t*, size_t); void* ctx; };
@@ -29,6 +31,7 @@ static std::mutex callback_mu;
 static std::map<uint64_t, Callback> callbacks;
 static std::map<uint64_t, std::set<std::pair<uint32_t, uint16_t>>> feedback;
 static std::map<uint64_t, std::pair<uint32_t, uint32_t>> expected_ssrcs;
+static std::map<uint64_t, std::vector<uint8_t>> playout_wire;
 extern "C" int veil_media_send_datagram(uint64_t chan, const uint8_t* p, size_t len) {
   if (chan == 90 && len >= 12) {
     if ((p[1] & 0x7f) == 96 && hold_fanout_video.load()) {
@@ -49,6 +52,8 @@ extern "C" int veil_media_send_datagram(uint64_t chan, const uint8_t* p, size_t 
       const uint16_t base = uint16_t(b[12]) << 8 | b[13];
       feedback[chan].insert({ssrc, base});
     }
+    if (b[1] == 204 && size == 28 && std::memcmp(b + 8, "VAP1", 4) == 0)
+      playout_wire[chan] = std::vector<uint8_t>(p, p + len);
     offset += size;
   }
   return 0;
@@ -206,6 +211,33 @@ static void report(uint64_t chan, uint32_t reporter, uint32_t source,
   { std::lock_guard lock(callback_mu); callback = callbacks.at(chan); }
   callback.fn(callback.ctx, packet.data(), packet.size());
 }
+static void inject_raw(uint64_t chan, const std::vector<uint8_t>& packet) {
+  Callback cb;
+  { std::lock_guard lock(callback_mu); cb = callbacks.at(chan); }
+  cb.fn(cb.ctx, packet.data(), packet.size());
+}
+static std::vector<uint8_t> playout_report(uint32_t target, uint64_t seq,
+                                          uint32_t delay) {
+  std::vector<uint8_t> p(36);
+  p[0] = 0x80; p[1] = 201; p[3] = 1;  // original empty RR
+  p[8] = 0x80; p[9] = 204; p[11] = 6;
+  std::memcpy(p.data() + 16, "VAP1", 4);
+  const auto word = [&](size_t at, uint32_t value) {
+    for (int i = 0; i < 4; ++i) p[at + i] = value >> (24 - i * 8);
+  };
+  word(20, target); word(24, static_cast<uint32_t>(seq >> 32));
+  word(28, static_cast<uint32_t>(seq)); word(32, delay);
+  return p;
+}
+static void wait_playout(VeilGroupMediaEngine* e, uint64_t reports, uint64_t delay) {
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+  while ((group_stat(e, "audio_playout_reports") != reports ||
+          (reports && group_stat(e, "audio_playout_ms") != delay)) &&
+         std::chrono::steady_clock::now() < deadline)
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  assert(group_stat(e, "audio_playout_reports") == reports);
+  if (reports) assert(group_stat(e, "audio_playout_ms") == delay);
+}
 int main() {
   const int capture_result = veil_media_test_muted_capture_lifecycle();
   if (capture_result != 0) {
@@ -276,17 +308,87 @@ int main() {
     if (result) { std::fprintf(stderr, "group isolation failed: %d\n", result); return 2; }
     assert(group_audio_packets(e.get(), peer) == 4);
     assert(veil_media_group_engine_peer_rx_packets(e.get(), peer) > 4);
+    std::unique_ptr<VeilGroupMediaEngine, decltype(&veil_media_group_engine_destroy)> receiver(
+        veil_media_group_engine_create(peer), veil_media_group_engine_destroy);
+    assert(receiver);
+    assert(veil_media_group_engine_set_mic_muted(receiver.get(), 1) == VEIL_MEDIA_OK);
+    assert(veil_media_group_engine_add_peer(receiver.get(), 24, local) == VEIL_MEDIA_OK);
+    assert(veil_media_group_engine_start_audio(receiver.get()) == VEIL_MEDIA_OK);
+    assert(group_stat(receiver.get(), "audio_playout_peers") == 0); // legacy starts unknown
+    assert(veil_media_test_group_emit_rtcp(e.get()) == 0);
+    std::vector<uint8_t> measured;
+    { std::lock_guard lock(callback_mu); measured = playout_wire.at(22); }
+    assert(measured.size() >= 28);
+    const size_t delay_at = measured.size() - 4;
+    const uint32_t measured_delay = uint32_t(measured[delay_at]) << 24 |
+        uint32_t(measured[delay_at + 1]) << 16 | uint32_t(measured[delay_at + 2]) << 8 |
+        measured[delay_at + 3];
+    assert(measured_delay <= 60000); // measured from real accepted Opus
+    inject_raw(24, measured);
+    wait_playout(receiver.get(), 1, measured_delay);
+    assert(group_stat(receiver.get(), "audio_playout_peers") == 1);
     inject_non_audio(22, group_ssrc(peer), group_ssrc(peer, 0x47564944u));
     std::this_thread::sleep_for(std::chrono::milliseconds(50));
     assert(group_audio_packets(e.get(), peer) == 4);
     assert(veil_media_test_group_blocked_audio_stats(
         e.get(), check_group_blocked_audio_stats, e.get()) == 0);
+    assert(veil_media_test_group_emit_rtcp(e.get()) == 0);
+    std::vector<uint8_t> unknown;
+    { std::lock_guard lock(callback_mu); unknown = playout_wire.at(22); }
+    inject_raw(24, unknown);
+    wait_playout(receiver.get(), 0, 0);
+    inject_raw(24, measured); // replay cannot restore a superseded measurement
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    assert(group_stat(receiver.get(), "audio_playout_reports") == 0);
+    assert(group_stat(receiver.get(), "audio_playout_peers") == 1);
     assert(group_audio_packets(e.get(), peer) == 4);
     assert(veil_media_group_engine_remove_peer(e.get(), peer) == VEIL_MEDIA_OK);
     assert(veil_media_group_engine_add_peer(e.get(), 23, peer) == VEIL_MEDIA_OK);
     assert(group_audio_packets(e.get(), peer) == 0);
     assert(veil_media_group_engine_stop_video(e.get()) == VEIL_MEDIA_OK);
     assert(veil_media_group_engine_stop_audio(e.get()) == VEIL_MEDIA_OK);
+  }
+  {
+    std::unique_ptr<VeilGroupMediaEngine, decltype(&veil_media_group_engine_destroy)> e(
+        veil_media_group_engine_create(local), veil_media_group_engine_destroy);
+    assert(e);
+    assert(veil_media_group_engine_set_mic_muted(e.get(), 1) == VEIL_MEDIA_OK);
+    assert(veil_media_group_engine_add_peer(e.get(), 125, peer) == VEIL_MEDIA_OK);
+    assert(veil_media_group_engine_start_audio(e.get()) == VEIL_MEDIA_OK);
+    const uint32_t target = group_ssrc(local);
+    // Wrong target, invalid delay, malformed compound and unsupported subtype
+    // must not advertise support or manufacture healthy estimates.
+    inject_raw(125, playout_report(target ^ 1u, 1, 150));
+    inject_raw(125, playout_report(target, 2, 60001));
+    auto malformed = playout_report(target, 3, 150); malformed.push_back(0);
+    inject_raw(125, malformed);
+    auto subtype = playout_report(target, 4, 150); subtype[8] = 0x81;
+    inject_raw(125, subtype);
+    auto old_app = playout_report(target, 5, 150); old_app[19] = '2';
+    inject_raw(125, old_app);
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    assert(group_stat(e.get(), "audio_playout_peers") == 0);
+    constexpr uint64_t sequence = 0x100000010ull;
+    inject_raw(125, playout_report(target, sequence, 450));
+    wait_playout(e.get(), 1, 450);
+    inject_raw(125, playout_report(target, sequence, 0));
+    inject_raw(125, playout_report(target, sequence - 1, 0));
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    assert(group_stat(e.get(), "audio_playout_ms") == 450);
+    inject_raw(125, playout_report(target, sequence + 1, UINT32_MAX));
+    wait_playout(e.get(), 0, 0);
+    assert(group_stat(e.get(), "audio_playout_peers") == 1);
+    inject_raw(125, playout_report(target, sequence + 2, 140));
+    wait_playout(e.get(), 1, 140);
+    const auto received = std::chrono::steady_clock::now();
+    std::this_thread::sleep_until(received + std::chrono::seconds(6));
+    inject_raw(125, playout_report(target, sequence + 2, 140));
+    std::this_thread::sleep_until(received + std::chrono::milliseconds(12100));
+    assert(group_stat(e.get(), "audio_playout_reports") == 0);
+    assert(group_stat(e.get(), "audio_playout_peers") == 1);
+    assert(veil_media_group_engine_remove_peer(e.get(), peer) == VEIL_MEDIA_OK);
+    assert(group_stat(e.get(), "audio_playout_peers") == 0);
+    std::puts("group playout: real receive sample/unknown worker, target binding, replay and expiry verified");
   }
   {
     const uint64_t chan = 60;
@@ -393,6 +495,13 @@ int main() {
     assert(group_stat(e.get(), "audio_feedback_reports") == 2);
     assert(group_stat(e.get(), "tx_loss_pct") == 13);
     assert(group_stat(e.get(), "tx_jitter_ms") == 100);
+    inject_raw(80, playout_report(group_ssrc(local), 1, 400));
+    inject_raw(81, playout_report(group_ssrc(local), 1, 120));
+    wait_playout(e.get(), 2, 400);
+    assert(group_stat(e.get(), "audio_playout_peers") == 2);
+    inject_raw(80, playout_report(group_ssrc(local), 2, UINT32_MAX));
+    wait_playout(e.get(), 1, 120);
+    assert(group_stat(e.get(), "audio_playout_peers") == 2);
     // Audio and video report blocks do not count as accepted audio. One
     // participant's accepted packets cannot keep another participant alive.
     assert(group_audio_packets(e.get(), peer) == 0);

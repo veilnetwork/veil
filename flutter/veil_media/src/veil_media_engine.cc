@@ -1009,6 +1009,8 @@ struct GroupPeerState {
   uint32_t video_ssrc = 0;
   std::unique_ptr<veil_media::VeilTransportShim> shim;
   webrtc::AudioReceiveStreamInterface* recv_stream = nullptr;  // owned by Call
+  uint64_t sampled_audio_packets = 0;
+  int64_t last_audio_packet_us = 0;
   std::unique_ptr<VeilVideoSink> video_sink;
   webrtc::VideoReceiveStreamInterface* video_recv_stream = nullptr;
 };
@@ -1042,6 +1044,7 @@ struct GroupWebrtcState {
   std::unique_ptr<veil_media::CameraCapturer> camera;
   std::unique_ptr<veil_media::ScreenCapturer> screen;
   std::map<std::string, std::unique_ptr<GroupPeerState>> peers;
+  uint64_t audio_sample_sequence = 0;
 };
 
 constexpr int kGroupVp8PayloadType = 96;
@@ -2152,11 +2155,18 @@ char* veil_media_group_engine_get_stats(VeilGroupMediaEngine* engine) {
   if (!engine->ws) return nullptr;
   GroupWebrtcState* ws = engine->ws.get();
   int reports = 0, loss = 0, jitter = 0;
+  int playout_peers = 0, playout_reports = 0, playout_ms = -1;
   int64_t rtt = 0;
   uint64_t video_frames = 0;
   int fps = 0, kbps = 0;
   const int64_t now_us = webrtc::TimeMicros();
   for (const auto& entry : ws->peers) {
+    const auto playout = entry.second->shim->audio_playout_feedback();
+    if (playout.supported) ++playout_peers;
+    if (playout.fresh_at(now_us)) {
+      ++playout_reports;
+      playout_ms = std::max(playout_ms, playout.delay_ms);
+    }
     const auto report = entry.second->shim->audio_feedback();
     if (!report.fresh_at(now_us)) continue;
     ++reports;
@@ -2168,12 +2178,22 @@ char* veil_media_group_engine_get_stats(VeilGroupMediaEngine* engine) {
   // also includes video, RTCP and packets rejected by the audio demuxer; it
   // must not keep a silent participant's audio watchdog alive.
   std::string audio_receivers;
+  const uint64_t sample_sequence = ++ws->audio_sample_sequence;
   const bool audio_sampled = veil_media::run_on_with_timeout(
       ws->worker_tq.get(), [&] {
         constexpr char hex[] = "0123456789abcdef";
         for (const auto& entry : ws->peers) {
           if (!entry.second->recv_stream) continue;
           const auto sample = entry.second->recv_stream->GetStats(false);
+          auto* peer = entry.second.get();
+          if (sample.packets_received > peer->sampled_audio_packets)
+            peer->last_audio_packet_us = now_us;
+          peer->sampled_audio_packets = sample.packets_received;
+          const bool active = sample.packets_received > 0 &&
+              peer->last_audio_packet_us > 0 && peer->last_audio_packet_us <= now_us &&
+              now_us - peer->last_audio_packet_us <= 3'000'000;
+          peer->shim->SetLocalAudioPlayout(peer->audio_ssrc, sample_sequence,
+              active ? static_cast<int>(sample.delay_estimate_ms) : -1, now_us);
           char id[65];
           for (size_t i = 0; i < 32; ++i) {
             id[2 * i] = hex[entry.second->id[i] >> 4];
@@ -2190,6 +2210,11 @@ char* veil_media_group_engine_get_stats(VeilGroupMediaEngine* engine) {
           audio_receivers.append(receiver, static_cast<size_t>(size));
         }
       }, std::chrono::milliseconds(20));
+  if (!audio_sampled) {
+    for (const auto& entry : ws->peers)
+      entry.second->shim->SetLocalAudioPlayout(
+          entry.second->audio_ssrc, sample_sequence, -1, now_us);
+  }
   const bool video_sampled = veil_media::run_on_with_timeout(ws->video_worker_tq.get(), [&] {
     if (ws->video_send_stream) video_frames = ws->video_send_stream->GetStats().frames_encoded;
     fps = ws->video_max_fps.load(std::memory_order_relaxed);
@@ -2208,6 +2233,9 @@ char* veil_media_group_engine_get_stats(VeilGroupMediaEngine* engine) {
   // Capability remains explicit on a stalled worker: unknown audio never
   // falls back to video ingress. These fields are endpoint-local JSON only.
   std::string snapshot(json, static_cast<size_t>(written) - 1);
+  snapshot += ",\"audio_playout_peers\":" + std::to_string(playout_peers) +
+              ",\"audio_playout_reports\":" + std::to_string(playout_reports) +
+              ",\"audio_playout_ms\":" + std::to_string(playout_ms);
   snapshot += ",\"audio_rx_supported\":1,\"audio_receivers\":{";
   if (audio_sampled) snapshot += audio_receivers;
   snapshot += "}}";

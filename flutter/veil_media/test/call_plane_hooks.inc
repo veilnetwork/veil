@@ -113,6 +113,16 @@ extern "C" int veil_media_test_group_blocked_audio_stats(
   return check(ctx, 0, 0, 0);
 }
 
+// Exercise the production RTCP encoder using the real cached receive sample,
+// without waiting for WebRTC's randomized report timer.
+extern "C" int veil_media_test_group_emit_rtcp(VeilGroupMediaEngine* e) {
+  std::array<uint8_t, 8> packet{0x80, 201, 0, 1};
+  const uint32_t source = group_audio_ssrc_of(e->local);
+  for (int i = 0; i < 4; ++i) packet[4 + i] = source >> (24 - i * 8);
+  webrtc::PacketOptions options;
+  return e->ws->peers.begin()->second->shim->SendRtcp(packet, options) ? 0 : 1;
+}
+
 // Two engine generations reproduce starting/rebuilding an already-muted call.
 // The real AudioState, stream and Opus encoder run against a counting ADM.
 extern "C" int veil_media_test_muted_capture_lifecycle() {
