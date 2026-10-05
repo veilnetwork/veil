@@ -13,6 +13,9 @@
 //! that can move without the header noticing, and this checks that it did not.
 
 use super::*;
+#[cfg(unix)]
+#[path = "stream_sender_isolation_tests.rs"]
+mod stream_sender_isolation_tests;
 // The families that moved to files of their own; the tests came with
 // neither, because they reach across several of them.
 use crate::mailbox::*;
