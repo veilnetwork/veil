@@ -77,7 +77,7 @@ const DEFAULT_STEP_TIMEOUT: Duration = Duration::from_secs(3);
 /// window sits far inside. So the TTL is a freshness/bandwidth trade — one DHT
 /// walk shared across an active conversation's live-E2E encrypts AND its
 /// offline mailbox seals — not a correctness boundary.
-const CERT_CACHE_TTL: Duration = Duration::from_secs(30 * 60);
+pub(crate) const CERT_CACHE_TTL: Duration = Duration::from_secs(30 * 60);
 
 /// `node_id → (verified cert, when-resolved)`. Shared across the live-E2E and
 /// offline-mailbox-seal resolver instances (both built over `self.identity`),
@@ -397,11 +397,14 @@ impl DhtMlKemEkResolver {
         // publishes two of these; overwriting meant whichever sibling resolved
         // last was the only one the receive path could authenticate
         // (report14 V14-M6).
-        keys.entry(target_node_id).or_default().remember(
-            cert.instance_id,
-            cert.ratchet_x25519_pubkey,
-            cert.valid_until_unix,
-        );
+        keys.entry(target_node_id)
+            .or_default()
+            .remember_with_device(
+                cert.instance_id,
+                cert.ratchet_x25519_pubkey,
+                cert.valid_until_unix,
+                cert.device_id,
+            );
     }
 
     /// The remembered certificate of one device, for a walk that came back
@@ -1985,6 +1988,7 @@ mod tests {
         let fresh = Instant::now();
 
         let mut cert = VerifiedMlkemCert {
+            device_id: None,
             node_id: [1u8; 32],
             instance_id: [2u8; 16],
             mlkem_algo: 1,
@@ -2408,6 +2412,7 @@ mod tests {
 
     fn dummy_cert_with_instance(node_id: [u8; 32], instance_id: [u8; 16]) -> VerifiedMlkemCert {
         VerifiedMlkemCert {
+            device_id: None,
             node_id,
             instance_id,
             mlkem_algo: 1,

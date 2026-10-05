@@ -352,6 +352,7 @@ mod tests {
         let node_id = [0xBBu8; 32];
         let instance_id = [0x77u8; 16];
         let cert = VerifiedMlkemCert {
+            device_id: None,
             node_id,
             instance_id,
             mlkem_algo: ALGO_ML_KEM_768,
@@ -371,6 +372,7 @@ mod tests {
         let instance_id = [instance_byte; 16];
         (
             VerifiedMlkemCert {
+                device_id: None,
                 node_id: [0xBBu8; 32],
                 instance_id,
                 mlkem_algo: ALGO_ML_KEM_768,
